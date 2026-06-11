@@ -31,6 +31,13 @@ def test_chat_page_and_apis(tmp_path):
     assert html.status_code == 200
     assert "/v1/chat/completions" in html.text
     assert "metadata" in html.text
+    assert "chat-shell" in html.text
+    assert "session-drawer" in html.text
+    assert "debug-drawer" in html.text
+    assert "openSessionDrawer" in html.text
+    assert "openDebugDrawer" in html.text
+    assert "Session Summary" in html.text
+    assert "Tool Calls" in html.text
     assert sessions.json()[0]["id"] == "s1"
     assert detail.json()["summary"]["summary"] == "summary"
     assert tool_calls.json()[0]["tool_name"] == "calculator"
@@ -58,4 +65,22 @@ def test_chat_send_creates_session_when_none_selected(tmp_path):
 
     assert "async function ensureSession()" in html.text
     assert "await ensureSession();" in html.text
+    assert "textarea" in html.text
+    assert "handleComposerKeydown" in html.text
+    assert "event.shiftKey" in html.text
+    assert "setSending(true)" in html.text
     assert "if (!text) return;" in html.text
+
+
+def test_chat_page_uses_safe_text_rendering(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    app = FastAPI()
+    app.include_router(create_dashboard_router(SessionService(store)))
+    client = TestClient(app)
+
+    html = client.get("/chat")
+
+    assert "function appendText" in html.text
+    assert ".textContent" in html.text
+    assert "insertAdjacentHTML" not in html.text
+    assert "msgs.innerHTML +=" not in html.text

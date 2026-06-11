@@ -1,0 +1,25 @@
+<!-- SUMMARY: Agent MVP 与后续完整 Agent 能力相关术语定义 -->
+# 术语表
+
+- Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
+- AgentRun：一次 Agent 运行的领域对象，包含会话、输入消息、运行状态、迭代计数、错误和结束原因。
+- AgentState：Agent Runtime 在运行过程中传递的状态，包含工作消息、待执行工具调用、工具结果、摘要、状态和迭代次数。
+- Application Layer：应用层，负责编排用例和 LangGraph 状态图，依赖 Domain 端口，不依赖 Infrastructure 具体实现。
+- ChatEvent：Application 层输出的聊天运行事件，供 Interfaces 层编码为 OpenAI-compatible SSE chunk 或非流式响应。
+- Domain Layer：领域层，定义核心业务模型、值对象、领域规则和端口协议，不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或工具 handler。
+- Domain Port：领域层定义的外部能力协议，如 LLMProvider、ToolExecutor、MemoryStore、Summarizer，由 Infrastructure 实现。
+- Evolution Baseline：演进基线。MVP 只实现当前验收范围，但架构边界必须支持后续完整 Agent 能力持续扩展。
+- Infrastructure Layer：基础设施层，实现 Domain 端口和外部依赖细节，如 Provider SDK、SQLite store、工具 handler、配置加载。
+- Interfaces Layer：接口层，实现 FastAPI、OpenAI-compatible API、Dashboard、SSE 编码和错误映射，只调用 Application 用例。
+- LLM Adapter：模型适配层，通过 LLMProvider 端口屏蔽不同模型 Provider 的协议差异。
+- LLMProvider：领域端口，定义模型列表、聊天调用、流式事件和工具支持能力的统一接口。
+- Memory/Context：Agent 的会话历史、消息、工具调用、任务状态、摘要和上下文预算管理能力。
+- MemoryStore：领域端口，定义会话、消息、工具调用、任务状态和摘要的读写接口。
+- OpenAI-compatible API：对外兼容 OpenAI Chat Completions 风格的 HTTP API，用于接入 Open-WebUI 等客户端。
+- Open-WebUI：使用 OpenAI-compatible API 接入模型或 Agent 服务的 Web UI 客户端。
+- Provider：具体 LLM 服务提供方或协议实现，如 OpenAI-compatible endpoint、Claude、Ollama、OpenRouter。
+- Summarizer：领域端口，定义上下文摘要生成能力，MVP 可用启发式摘要，后续可替换为模型驱动压缩。
+- Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。
+- ToolDefinition：工具定义值对象，描述工具名称、说明、输入 schema、风险等级、权限、超时和启用状态，不包含具体 handler。
+- ToolExecutor：领域端口，定义工具调用执行接口，具体工具 handler 由 Infrastructure 实现。
+- Toolset：工具集合或能力分组，用于后续按场景启用、禁用、检查依赖和控制权限。

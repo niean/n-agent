@@ -24,7 +24,6 @@ secrets.json
 .clinerules/
 .superpowers/
 .claude/
-.harness/
 
 # Project-Common
 locals/*
