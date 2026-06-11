@@ -29,7 +29,11 @@
 
 `ToolCallRequest`（`app/domain/tool.py`）：工具执行请求，字段包括 id、name、arguments。
 
-`ToolResult`（`app/domain/tool.py`）：工具执行结果，字段包括 tool_call_id、tool_name、status、content、duration_ms。
+`ToolResultStatus`（`app/domain/tool.py`）：工具执行状态枚举，取值包括 success、error、permission_denied、timeout。
+
+`PermissionDecision`（`app/domain/tool.py`）：权限判定值对象，字段包括 allowed、reason。
+
+`ToolResult`（`app/domain/tool.py`）：工具执行结果，字段包括 tool_call_id、tool_name、status、content、duration_ms，其中 status 使用 ToolResultStatus。
 
 ## 端口协议
 

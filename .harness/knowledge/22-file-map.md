@@ -36,7 +36,7 @@
 ## Interfaces Layer
 
 - OpenAI-compatible HTTP API：`app/interfaces/http/openai.py`，实现 `/health`、`/v1/models`、`/v1/chat/completions`、OpenAI JSON 和 SSE 编码
-- Dashboard API：`app/interfaces/http/dashboard.py`，实现 `/dashboard`、`/dashboard/sessions`、`/dashboard/sessions/{session_id}`、`/dashboard/sessions/{session_id}/tool-calls`
+- Dashboard API：`app/interfaces/http/dashboard.py`，实现 `/chat`、`/chat/sessions`、`/chat/sessions/{session_id}`、`/chat/sessions/{session_id}/tool-calls`
 - Chat 页面：`app/interfaces/http/static/dashboard.html`，全屏聊天 UI，使用 `/v1/chat/completions` 流式接口发送消息，通过会话抽屉管理 session，并通过调试抽屉展示 summary、task state 和 tool calls
 
 ## Docker 与部署
@@ -44,6 +44,8 @@
 - 镜像构建：`Dockerfile`，使用 Python 3.11 slim 镜像，安装项目并以 Uvicorn 启动 8201 端口
 - Compose 部署：`docker-compose.yml`，定义 `n-agent` service、可选 `.env`、端口 `8201:8201`、locals/workspace volume
 - Docker 构建忽略：`.dockerignore`，排除 `.claude`、`.harness`、`.git`、缓存、venv、locals、workspace
+- 本地重建脚本：`start.sh`，执行 Docker Compose down 后重新 build 并后台启动服务
+- 本地产物：`locals/`、`.pytest_cache/`、`__pycache__/`、`*.pyc`、`*.egg-info/` 是运行、测试或构建缓存产物，不作为功能文件映射对象
 
 ## 测试
 

@@ -22,4 +22,6 @@
 - Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。
 - ToolDefinition：工具定义值对象，描述工具名称、说明、输入 schema、风险等级、权限、超时和启用状态，不包含具体 handler。
 - ToolExecutor：领域端口，定义工具调用执行接口，具体工具 handler 由 Infrastructure 实现。
+- ToolResultStatus：工具执行结果状态枚举，描述成功、错误、权限拒绝和超时等标准状态。
+- PermissionDecision：权限判定值对象，描述工具或动作是否允许执行以及拒绝原因。
 - Toolset：工具集合或能力分组，用于后续按场景启用、禁用、检查依赖和控制权限。

@@ -122,7 +122,9 @@ curl http://127.0.0.1:8201/v1/models
 
 - 不主动创建 README，除非用户明确要求
 - 不自主删除项目文件
-- `n_agent.egg-info/` 是本地 editable install 生成物，应由 `.gitignore` 忽略，不需要提交
+- `locals/`、`logs/`、`data/`、`.pytest_cache/`、`*.pyc`、`*.egg-info/` 是本地运行、测试或构建产物，应由 `.gitignore` 忽略，不需要提交
+- `start.sh` 是本地 Docker Compose 重建辅助脚本，按当前 `.gitignore` 不作为提交文件要求
+- `docker-compose.yml` 当前也在 `.gitignore` 中，修改部署配置前需确认提交边界
 - `.harness/prd/` 是 AI-READONLY，不能自动修改
 - `.harness/knowledge/` 是实现后知识回填目标，可按 Harness 流程更新
 

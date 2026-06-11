@@ -8,6 +8,51 @@
 - 工具：支持可插拔工具框架，留好权限和风险控制的接口
 - 记忆：持久化会话记录，支持长任务上下文续跑
 
+## Agent 架构图
+
+```text
++------------------+     +----------------------+     +-------------------------+
+|      Client      |     |   Interfaces Layer   |     |    Application Layer    |
+|------------------|     |----------------------|     |-------------------------|
+| Open-WebUI       | --> | /v1/chat/completions | --> | ChatCompletionService   |
+| curl / API       | --> | /v1/models /health   |     |                         |
+| /chat Dashboard  | --> | /chat /chat/sessions | --> | SessionService          |
++------------------+     +----------------------+     +------------+------------+
+                                                                 |
+                                                                 v
+                         +---------------------------------------+----------------+
+                         |            AgentGraphRunner                           |
+                         | load_context -> call_llm -> execute_tools             |
+                         |       -> update_memory -> finalize                    |
+                         +-----------+----------------+--------------------------+
+                                     |                |
+                                     v                v
++------------------------------------+--+          +--+------------------------------------+
+|             Domain Layer              |          |         Infrastructure Layer          |
+|---------------------------------------|          |---------------------------------------|
+| Agent / AgentState                    |          | OpenAICompatibleProvider             |
+| Session / Message / ToolCall /Summary |          | SQLiteMemoryStore                    |
+| ToolDefinition / ToolResult           |          | HeuristicSummarizer                  |
+| LLMProvider Port                      |          | BuiltinToolExecutor                  |
+| MemoryStore / Summarizer Ports        |          | Settings                             |
++-------------------+-------------------+          +-------------------+-------------------+
+                    ^                                                  |
+                    | implements                                       | uses
+                    |                                                  v
+                    |                              +-------------------+-------------------+
+                    |                              |          External Resources           |
+                    |                              |---------------------------------------|
+                    +------------------------------| LLM Provider                          |
+                                                   | SQLite DB                             |
+                                                   | Workspace                             |
+                                                   +---------------------------------------+
+```
+
+- 依赖方向保持外层依赖内层：Interfaces / Application / Infrastructure 依赖 Domain，Domain 不依赖 FastAPI、LangGraph、SQLite 或 Provider SDK。
+- Agent Runtime 使用 LangGraph 编排 `load_context -> call_llm -> execute_tools -> update_memory -> finalize`。
+- Tool Registry 只暴露服务端注册的工具；`safe` 默认允许，`dangerous` 默认不暴露给 LLM。
+- Chat Dashboard 是本地调试入口，用于观察 session、summary、task state 和 tool calls，不替代 Open-WebUI。
+
 ## 迭代规划
 本次 MVP 是完整 Agent 能力的第一阶段，设计必须保证后续能力可以在现有边界内继续演进，而不是推倒重来。参考 Hermes-Agent 当前能力，本项目在 MVP 之后需要逐步补齐以下能力。
 

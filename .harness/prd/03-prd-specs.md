@@ -1,4 +1,4 @@
-<!-- SUMMARY: {{概述该文件内容的一句话}} -->
+<!-- SUMMARY: N-Agent 的迭代需求池，记录 Agent MVP、Chat 修复、System Prompt、模型名隐藏和 /chat 交互优化需求 -->
 # 产品需求 - 迭代演进
 
 ## 约束
