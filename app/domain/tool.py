@@ -1,0 +1,56 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Protocol
+
+
+class RiskLevel(str, Enum):
+    SAFE = "safe"
+    CONFIRM = "confirm"
+    DANGEROUS = "dangerous"
+
+
+class ToolResultStatus(str, Enum):
+    SUCCESS = "success"
+    ERROR = "error"
+    PERMISSION_DENIED = "permission_denied"
+    TIMEOUT = "timeout"
+
+
+@dataclass(frozen=True)
+class PermissionDecision:
+    allowed: bool
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    risk_level: RiskLevel = RiskLevel.SAFE
+    permissions: tuple[str, ...] = ()
+    timeout_seconds: int = 10
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ToolCallRequest:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    tool_call_id: str
+    tool_name: str
+    status: ToolResultStatus
+    content: Any
+    duration_ms: int = 0
+
+
+class ToolExecutor(Protocol):
+    async def execute(self, request: ToolCallRequest) -> ToolResult:
+        ...

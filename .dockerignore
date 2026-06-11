@@ -1,0 +1,9 @@
+.claude
+.harness
+.git
+.pytest_cache
+__pycache__
+*.pyc
+.venv
+locals
+workspace

@@ -1,0 +1,45 @@
+# Common
+.DS_Store
+.DS_Store?
+*.log
+*.tmp
+*.temp
+~$*.xlsx
+~$*.xls
+*~
+*.tar.gz
+.gitversion
+
+# Secrets
+config_prod.json
+secrets.json
+*.key
+*.pem
+.env
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+.clinerules/
+.superpowers/
+.claude/
+.harness/
+
+# Project-Common
+locals/*
+!locals/.gitkeep
+logs/*
+!logs/.gitkeep
+data/*
+!data/.gitkeep
+
+.env
+.venv
+.pytest_cache
+*.pyc
+*.egg-info/
+app/__pycache__
+docker-compose.yml
+start.sh
+

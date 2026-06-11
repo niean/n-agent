@@ -1,0 +1,57 @@
+import sqlite3
+
+import pytest
+
+from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
+from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
+from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+
+
+@pytest.mark.asyncio
+async def test_sqlite_store_initializes_schema_and_indexes(tmp_path):
+    db_path = tmp_path / "agent.db"
+    SQLiteMemoryStore(db_path)
+
+    conn = sqlite3.connect(db_path)
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+
+    assert {"sessions", "messages", "tool_calls", "task_states", "summaries"}.issubset(tables)
+    assert "idx_messages_session_created_at" in indexes
+    assert "idx_tool_calls_session_created_at" in indexes
+
+
+@pytest.mark.asyncio
+async def test_sqlite_store_persists_session_context(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    session = await store.create_session(ConversationSession(id="s1", title="Session 1"))
+    message = await store.append_message("s1", ConversationMessage(role="user", content="hello"))
+    tool_call = await store.save_tool_call(
+        ToolCall(
+            id="call-1",
+            session_id="s1",
+            message_id=message.id,
+            tool_name="calculator",
+            arguments={"expression": "1+1"},
+            result={"result": 2},
+            status="success",
+        )
+    )
+    task_state = await store.save_task_state(TaskState(session_id="s1", status="completed", iteration_count=1))
+    summary = await store.save_summary(Summary(session_id="s1", summary="summary"))
+    context = await store.get_context("s1")
+
+    assert session.id == "s1"
+    assert context["messages"][0].content == "hello"
+    assert context["tool_calls"][0].id == tool_call.id
+    assert context["task_state"].status == task_state.status
+    assert context["summary"].summary == summary.summary
+
+
+@pytest.mark.asyncio
+async def test_heuristic_summarizer_marks_truncated_summary():
+    summarizer = HeuristicSummarizer(max_chars=10)
+
+    result = await summarizer.summarize([{"role": "user", "content": "a" * 50}])
+
+    assert result.startswith("heuristic summary:")
