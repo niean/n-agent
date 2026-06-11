@@ -40,5 +40,4 @@ data/*
 *.egg-info/
 app/__pycache__
 docker-compose.yml
-start.sh
 
