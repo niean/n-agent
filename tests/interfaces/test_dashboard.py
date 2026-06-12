@@ -8,7 +8,7 @@ from app.interfaces.http.dashboard import create_dashboard_router
 
 
 def test_chat_page_and_apis(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     import asyncio
 
     async def seed():
@@ -44,7 +44,7 @@ def test_chat_page_and_apis(tmp_path):
 
 
 def test_chat_can_create_session(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     app = FastAPI()
     app.include_router(create_dashboard_router(SessionService(store)))
     client = TestClient(app)
@@ -56,7 +56,7 @@ def test_chat_can_create_session(tmp_path):
 
 
 def test_chat_send_creates_session_when_none_selected(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     app = FastAPI()
     app.include_router(create_dashboard_router(SessionService(store)))
     client = TestClient(app)
@@ -73,7 +73,7 @@ def test_chat_send_creates_session_when_none_selected(tmp_path):
 
 
 def test_chat_page_uses_safe_text_rendering(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     app = FastAPI()
     app.include_router(create_dashboard_router(SessionService(store)))
     client = TestClient(app)

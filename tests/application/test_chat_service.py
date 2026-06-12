@@ -29,7 +29,7 @@ class ErrorProvider(FakeProvider):
 
 @pytest.mark.asyncio
 async def test_chat_service_non_stream_returns_message(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     runner = AgentGraphRunner(
         FakeProvider(),
         ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
@@ -48,7 +48,7 @@ async def test_chat_service_non_stream_returns_message(tmp_path):
 
 @pytest.mark.asyncio
 async def test_chat_service_stream_produces_events(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     runner = AgentGraphRunner(
         FakeProvider(),
         ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
@@ -69,7 +69,7 @@ async def test_chat_service_stream_produces_events(tmp_path):
 
 @pytest.mark.asyncio
 async def test_chat_service_binds_session_id(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     runner = AgentGraphRunner(
         FakeProvider(),
         ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),

@@ -108,7 +108,7 @@ Dashboard 使用 `metadata.session_id` 绑定会话。
 
 只考虑 Docker Compose 运行时，容器内路径为：
 
-- SQLite：`/app/locals/agent.db`
+- SQLite：`/app/locals/sessions.db`
 - workspace：`/workspace`
 
 当前 compose 挂载策略：
@@ -121,7 +121,7 @@ volumes:
 
 因此：
 
-- SQLite 数据保存在宿主机 `/Users/niean/install/n-agent/locals/agent.db`
+- SQLite 数据保存在宿主机 `/Users/niean/install/n-agent/locals/sessions.db`
 - 文件工具只能访问宿主机 `/Users/niean/install/n-agent/workspace` 对应的容器路径 `/workspace`
 
 ## 边界约定

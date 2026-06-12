@@ -12,7 +12,7 @@ N-Agent 是面向 Open-WebUI 和本地调试的 Python Agent MVP，通过 FastAP
 - Agent Runtime：LangGraph，位于 Application 层
 - 模型适配：OpenAI Python SDK，MVP 默认 OpenAI-compatible Provider
 - 配置：pydantic-settings，从 `.env` 和环境变量读取，前缀为 `N_AGENT_`
-- 存储：SQLite 标准库，默认容器路径 `/app/locals/agent.db`
+- 存储：SQLite 标准库，默认容器路径 `/app/locals/sessions.db`
 - 测试：pytest、pytest-asyncio、httpx/TestClient
 - 部署：Dockerfile + Docker Compose，服务端口当前为 8201
 
@@ -44,7 +44,7 @@ COMPOSE_PROJECT_NAME=n-agent
 N_AGENT_PROVIDER_BASE_URL=<openai-compatible-base-url>
 N_AGENT_PROVIDER_API_KEY=<api-key>
 N_AGENT_PROVIDER_MODEL=<model>
-N_AGENT_SQLITE_PATH=/app/locals/agent.db
+N_AGENT_SQLITE_PATH=/app/locals/sessions.db
 N_AGENT_WORKSPACE_ROOT=/workspace
 N_AGENT_AGENT_ITERATION_LIMIT=5
 ```
@@ -54,7 +54,7 @@ N_AGENT_AGENT_ITERATION_LIMIT=5
 - 宿主机 `/Users/niean/install/n-agent/locals` -> 容器 `/app/locals`
 - 宿主机 `/Users/niean/install/n-agent/workspace` -> 容器 `/workspace`
 
-因此 SQLite 文件持久化在宿主机 `locals/agent.db`，文件工具只能访问宿主机 workspace 对应目录。
+因此 SQLite 文件持久化在宿主机 `locals/sessions.db`，文件工具只能访问宿主机 workspace 对应目录。
 
 ## 文档与规则
 

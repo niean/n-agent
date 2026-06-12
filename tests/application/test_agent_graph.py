@@ -82,7 +82,7 @@ class CapturingSummarizer(HeuristicSummarizer):
 
 @pytest.mark.asyncio
 async def test_agent_graph_executes_tool_loop_and_finalizes(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))
     runner = AgentGraphRunner(
         FakeProvider(),
@@ -100,7 +100,7 @@ async def test_agent_graph_executes_tool_loop_and_finalizes(tmp_path):
 
 @pytest.mark.asyncio
 async def test_agent_graph_injects_system_prompt_without_persisting_message(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))
     provider = DirectProvider()
     runner = AgentGraphRunner(
@@ -121,7 +121,7 @@ async def test_agent_graph_injects_system_prompt_without_persisting_message(tmp_
 
 @pytest.mark.asyncio
 async def test_agent_graph_excludes_system_prompt_from_summary(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))
     provider = DirectProvider()
     summarizer = CapturingSummarizer()
@@ -143,7 +143,7 @@ async def test_agent_graph_excludes_system_prompt_from_summary(tmp_path):
 
 @pytest.mark.asyncio
 async def test_agent_graph_reports_iteration_limit(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))
     runner = AgentGraphRunner(
         LoopProvider(),
@@ -160,7 +160,7 @@ async def test_agent_graph_reports_iteration_limit(tmp_path):
 
 @pytest.mark.asyncio
 async def test_agent_graph_streams_chat_events(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))
     runner = AgentGraphRunner(
         FakeProvider(),

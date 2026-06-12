@@ -9,7 +9,7 @@ from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 
 @pytest.mark.asyncio
 async def test_sqlite_store_initializes_schema_and_indexes(tmp_path):
-    db_path = tmp_path / "agent.db"
+    db_path = tmp_path / "sessions.db"
     SQLiteMemoryStore(db_path)
 
     conn = sqlite3.connect(db_path)
@@ -23,7 +23,7 @@ async def test_sqlite_store_initializes_schema_and_indexes(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sqlite_store_persists_session_context(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     session = await store.create_session(ConversationSession(id="s1", title="Session 1"))
     message = await store.append_message("s1", ConversationMessage(role="user", content="hello"))
     tool_call = await store.save_tool_call(

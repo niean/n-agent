@@ -5,6 +5,7 @@
 本文仅供自然人使用，未经人工确认、禁止AI阅读或修改。
 
 ## 需求列表
+无论何时，你都必须遵循DDD分层规范。
 
 [20260611]
 - FR
@@ -19,6 +20,25 @@
     - LLM：System，参考Hermes、设置system提示词，特别的：你的名字叫 N-Agent(Niean's Agent MVP)
     - LLM：Model，对外的OpenAI-Compatible接口不暴露底层真实模型名，所有模型统一展示为N-Agent
     - Chat：参考Open-WebUI的对话功能，完善下`/chat`页面和交互
+
+[20260612]
+- FR
+    - 知识：LlamaIndex(rag)，Qdrant(vdb)，Ollama+BGE-M3(embedding)，使用这个组件组合，搭建N-Agent的知识检索功能。
+        - Ollama+BGE-M3(embedding)已经搭建好，访问验证通过：
+```
+curl -fsS http://localhost:11434/api/embed \
+  -H "Content-Type: application/json" \
+  -d '{"model":"bge-m3","input":"hello world"}' | jq .
+```
+        - Qdrant已经搭建好，访问验证通过：
+```
+niean@~/code/github.com/niean/n-agent: curl -fsS http://localhost:6333/ | jq .
+{
+  "title": "qdrant - vector search engine",
+  "version": "1.18.2",
+  "commit": "44ad62f8cd69642be5afa6441612525e24a0d063"
+}
+```
 
 ---
 

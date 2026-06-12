@@ -76,7 +76,7 @@
 ### 3.6 部署与配置
 - 默认运行方式为 Docker Compose。
 - 服务端口为 `8201:8201`。
-- 容器内 SQLite 路径为 `/app/locals/agent.db`。
+- 容器内 SQLite 路径为 `/app/locals/sessions.db`。
 - 容器内 workspace 路径为 `/workspace`。
 - 配置通过 `.env` 或环境变量读取，前缀为 `N_AGENT_`。
 - `.env.example` 只保留占位值或空值，不写真实密钥。

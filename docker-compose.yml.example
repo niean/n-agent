@@ -7,10 +7,25 @@ services:
       - path: .env
         required: false
     environment:
-      N_AGENT_SQLITE_PATH: /app/locals/agent.db
+      N_AGENT_SQLITE_PATH: /app/locals/sessions.db
       N_AGENT_WORKSPACE_ROOT: /workspace
     ports:
       - "8201:8201"
     volumes:
       - ~/app/locals:/app/locals
       - ~/workspace:/workspace
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ~/ollama:/root/.ollama
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ~/qdrant/storage:/qdrant/storage

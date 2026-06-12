@@ -47,7 +47,7 @@ class FakeProvider:
 
 def build_client(tmp_path):
     provider = FakeProvider()
-    store = SQLiteMemoryStore(tmp_path / "agent.db")
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
     runner = AgentGraphRunner(
         provider,
         ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),

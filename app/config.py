@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     provider_base_url: str = Field(default="http://localhost:11434/v1")
     provider_api_key: str = Field(default="")
     provider_model: str = Field(default="qwen2.5")
-    sqlite_path: Path = Field(default=Path("locals/agent.db"))
+    sqlite_path: Path = Field(default=Path("locals/sessions.db"))
     workspace_root: Path = Field(default=Path.cwd())
     agent_iteration_limit: int = Field(default=5, ge=1, le=20)
 

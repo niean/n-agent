@@ -75,7 +75,7 @@ Docker Compose 项目隔离使用：
 
 只考虑 Docker Compose 运行时，推荐容器内路径：
 
-- `N_AGENT_SQLITE_PATH=/app/locals/agent.db`
+- `N_AGENT_SQLITE_PATH=/app/locals/sessions.db`
 - `N_AGENT_WORKSPACE_ROOT=/workspace`
 
 宿主机目录通过 `docker-compose.yml` volume 映射到容器路径，避免容器内状态丢失。
