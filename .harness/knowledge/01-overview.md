@@ -49,7 +49,7 @@ N_AGENT_WORKSPACE_ROOT=/workspace
 N_AGENT_AGENT_ITERATION_LIMIT=5
 ```
 
-`docker-compose.yml` 当前挂载：
+`docker/docker-compose.yml` 当前挂载：
 
 - 宿主机 `/Users/niean/install/n-agent/locals` -> 容器 `/app/locals`
 - 宿主机 `/Users/niean/install/n-agent/workspace` -> 容器 `/workspace`

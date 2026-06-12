@@ -1,3 +1,4 @@
+<!-- SUMMARY: N-Agent 的 DDD 领域模型细化说明，包括子域划分、聚合实体、应用服务调用流和 SQLite Memory 数据关系 -->
 # DDD 领域模型
 
 ## 分层边界

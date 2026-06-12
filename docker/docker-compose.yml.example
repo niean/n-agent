@@ -1,0 +1,18 @@
+name: n-agent
+
+services:
+  n-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      N_AGENT_SQLITE_PATH: /app/locals/sessions.db
+      N_AGENT_WORKSPACE_ROOT: /workspace
+    ports:
+      - "8201:8201"
+    volumes:
+      - ~/app/locals:/app/locals
+      - ~/workspace:/workspace

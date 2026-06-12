@@ -41,10 +41,10 @@
 
 ## Docker 与部署
 
-- 镜像构建：`Dockerfile`，使用 Python 3.11 slim 镜像，安装项目并以 Uvicorn 启动 8201 端口
-- Compose 部署：`docker-compose.yml`，定义 `n-agent` service、可选 `.env`、端口 `8201:8201`、locals/workspace volume
-- Docker 构建忽略：`.dockerignore`，排除 `.claude`、`.harness`、`.git`、缓存、venv、locals、workspace
-- 本地重建脚本：`start.sh`，执行 Docker Compose down 后重新 build 并后台启动服务
+- 镜像构建：`docker/Dockerfile`，使用 Python 3.11 slim 镜像，安装项目并以 Uvicorn 启动 8201 端口
+- Compose 部署：`docker/docker-compose.yml`，定义 `n-agent` service、可选根目录 `.env`、端口 `8201:8201`、locals/workspace volume
+- Docker 构建忽略：`docker/Dockerfile.dockerignore`，排除 `.claude`、`.harness`、`.git`、缓存、venv、locals、workspace
+- 本地重建脚本：`docker/restart-nagent.sh`，在 docker 目录执行 Docker Compose 重建并后台启动服务
 - 本地产物：`locals/`、`.pytest_cache/`、`__pycache__/`、`*.pyc`、`*.egg-info/` 是运行、测试或构建缓存产物，不作为功能文件映射对象
 
 ## 测试
@@ -67,5 +67,6 @@
 - 设计 spec：`.harness/specs/active/spec-260611-agent-mvp.md`
 - 实现 plan：`.harness/plans/active/plan-260611-agent-mvp.md`
 - 架构知识：`.harness/knowledge/02-architecture.md`
+- DDD 领域模型：`.harness/knowledge/06-domain-model.md`
 - 关键模式：`.harness/knowledge/05-key-patterns.md`
 - 术语表：`.harness/knowledge/21-glossary.md`

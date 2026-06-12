@@ -22,28 +22,17 @@
     - Chat：参考Open-WebUI的对话功能，完善下`/chat`页面和交互
 
 [20260612]
+- NFR
+    - 源码：整理DDD文档
+    - 治理：部署相关的文件，移动到目录 docker/
 - FR
-    - 知识：LlamaIndex(rag)，Qdrant(vdb)，Ollama+BGE-M3(embedding)，使用这个组件组合，搭建N-Agent的知识检索功能。
-        - Ollama+BGE-M3(embedding)已经搭建好，访问验证通过：
-```
-curl -fsS http://localhost:11434/api/embed \
-  -H "Content-Type: application/json" \
-  -d '{"model":"bge-m3","input":"hello world"}' | jq .
-```
-        - Qdrant已经搭建好，访问验证通过：
-```
-niean@~/code/github.com/niean/n-agent: curl -fsS http://localhost:6333/ | jq .
-{
-  "title": "qdrant - vector search engine",
-  "version": "1.18.2",
-  "commit": "44ad62f8cd69642be5afa6441612525e24a0d063"
-}
-```
 
 ---
 
 [待办]
 - Issue
-- FR
 - NFR
+- FR
+    - RunTime：Sandbox(docker)
+    - 治理：身份，护栏
 

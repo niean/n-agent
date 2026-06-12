@@ -9,7 +9,7 @@
 
 项目严格遵循领域驱动设计 DDD，采用外层依赖内层的方向：Interfaces -> Application -> Domain。Infrastructure 只实现 Domain 定义的端口，并在应用启动时注入。
 
-- Domain 层：定义 Agent、Session、Message、Tool、Provider、Memory 等核心领域模型和值对象，定义 LLMProvider、ToolExecutor、MemoryStore、Summarizer 等端口协议。
+- Domain 层：定义 Agent、Session、Message、Tool、Provider、Memory 等核心领域模型和值对象，定义 LLMProvider、ToolExecutor、MemoryStore、Summarizer 等端口协议。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
 - Application 层：编排用例和 Agent Runtime。LangGraph 属于本层，只负责状态图和运行流程编排。
 - Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、配置加载等。
 - Interfaces 层：实现 FastAPI、OpenAI-compatible API、Dashboard 和协议转换。

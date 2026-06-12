@@ -78,7 +78,7 @@ Docker Compose 项目隔离使用：
 - `N_AGENT_SQLITE_PATH=/app/locals/sessions.db`
 - `N_AGENT_WORKSPACE_ROOT=/workspace`
 
-宿主机目录通过 `docker-compose.yml` volume 映射到容器路径，避免容器内状态丢失。
+宿主机目录通过 `docker/docker-compose.yml` volume 映射到容器路径，避免容器内状态丢失。
 本项目面向 Docker Desktop 本地访问时使用端口映射 `8201:8201`，不使用 `network_mode: host`。
 
 ## 密钥
@@ -111,7 +111,7 @@ Docker Compose 项目隔离使用：
 
 ```bash
 python -m pytest -v
-docker compose config
+docker compose -f docker/docker-compose.yml config >/dev/null
 curl http://127.0.0.1:8201/health
 curl http://127.0.0.1:8201/v1/models
 ```
@@ -123,8 +123,8 @@ curl http://127.0.0.1:8201/v1/models
 - 不主动创建 README，除非用户明确要求
 - 不自主删除项目文件
 - `locals/`、`logs/`、`data/`、`.pytest_cache/`、`*.pyc`、`*.egg-info/` 是本地运行、测试或构建产物，应由 `.gitignore` 忽略，不需要提交
-- `start.sh` 是本地 Docker Compose 重建辅助脚本，按当前 `.gitignore` 不作为提交文件要求
-- `docker-compose.yml` 当前也在 `.gitignore` 中，修改部署配置前需确认提交边界
+- `docker/restart-nagent.sh` 是本地 Docker Compose 重建辅助脚本
+- `docker/docker-compose.yml` 当前在 `.gitignore` 中，修改部署配置前需确认提交边界
 - `.harness/prd/` 是 AI-READONLY，不能自动修改
 - `.harness/knowledge/` 是实现后知识回填目标，可按 Harness 流程更新
 
