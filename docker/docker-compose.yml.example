@@ -6,13 +6,22 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     env_file:
-      - path: ../.env
+      - path: ./.env
         required: false
     environment:
       N_AGENT_SQLITE_PATH: /app/locals/sessions.db
       N_AGENT_WORKSPACE_ROOT: /workspace
+      N_AGENT_AGENT_ITERATION_LIMIT: 5
     ports:
       - "8201:8201"
     volumes:
       - ~/app/locals:/app/locals
       - ~/workspace:/workspace
+    networks:
+      - default
+      - n-kb
+
+networks:
+  n-kb:
+    name: n-kb_default
+    external: true

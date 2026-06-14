@@ -10,6 +10,9 @@ from typing import Any
 from app.domain.tool import ToolCallRequest, ToolExecutor, ToolResult, ToolResultStatus
 
 
+BUILTIN_TOOL_NAMES = frozenset({"get_current_time", "calculator", "list_directory", "read_text_file"})
+
+
 class BuiltinToolExecutor:
     def __init__(self, workspace_root: Path):
         self.workspace_root = workspace_root.resolve()

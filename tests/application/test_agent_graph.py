@@ -2,13 +2,15 @@ import pytest
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.events import ChatEventType
-from app.application.tool_service import ToolService, builtin_tool_definitions
+from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.domain.agent import AgentState
 from app.domain.provider import LLMResult, ModelInfo
+from app.domain.tool import ToolCallRequest, ToolResult, ToolResultStatus
 from app.domain.session import ConversationSession
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.tools.builtin import build_builtin_tool_executor
+from app.infrastructure.tools.composite import CompositeToolExecutor
 
 
 class FakeProvider:
@@ -71,6 +73,37 @@ class DirectProvider(FakeProvider):
         return LLMResult(message={"role": "assistant", "content": "hello"}, finish_reason="stop")
 
 
+class KnowledgeProvider(FakeProvider):
+    async def chat(self, messages, tools, stream, model, options):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-kb-1",
+                            "type": "function",
+                            "function": {"name": "search_knowledge", "arguments": '{"query":"python"}'},
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+            )
+        return LLMResult(message={"role": "assistant", "content": "Python answer from snippets"}, finish_reason="stop")
+
+
+class FakeKnowledgeExecutor:
+    async def execute(self, request: ToolCallRequest) -> ToolResult:
+        return ToolResult(
+            request.id,
+            request.name,
+            ToolResultStatus.SUCCESS,
+            {"site": "N-KB", "query": request.arguments["query"], "results": [{"snippet": "Python snippet"}]},
+        )
+
+
 class CapturingSummarizer(HeuristicSummarizer):
     def __init__(self):
         self.messages = []
@@ -99,6 +132,39 @@ async def test_agent_graph_executes_tool_loop_and_finalizes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_graph_calls_knowledge_tool_and_persists_tool_call(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    builtin = build_builtin_tool_executor(tmp_path)
+    kb = FakeKnowledgeExecutor()
+    runner = AgentGraphRunner(
+        KnowledgeProvider(),
+        ToolService(
+            CompositeToolExecutor(
+                {
+                    "get_current_time": builtin,
+                    "calculator": builtin,
+                    "list_directory": builtin,
+                    "read_text_file": builtin,
+                    "search_knowledge": kb,
+                }
+            ),
+            builtin_tool_definitions() + knowledge_tool_definitions(),
+        ),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    state = await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "search kb"}]), "test")
+    tool_calls = await store.list_tool_calls("s1")
+
+    assert state.final_message["content"] == "Python answer from snippets"
+    assert tool_calls[0].tool_name == "search_knowledge"
+    assert tool_calls[0].status == "success"
+
+
+@pytest.mark.asyncio
 async def test_agent_graph_injects_system_prompt_without_persisting_message(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))
@@ -115,6 +181,7 @@ async def test_agent_graph_injects_system_prompt_without_persisting_message(tmp_
 
     assert provider.last_messages[0]["role"] == "system"
     assert "N-Agent(Niean's Agent MVP)" in provider.last_messages[0]["content"]
+    assert "search_knowledge" in provider.last_messages[0]["content"]
     persisted_messages = await store.list_messages("s1")
     assert [message.role for message in persisted_messages] == ["assistant"]
 

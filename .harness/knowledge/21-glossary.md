@@ -15,9 +15,11 @@
 - LLMProvider：领域端口，定义模型列表、聊天调用、流式事件和工具支持能力的统一接口。
 - Memory/Context：Agent 的会话历史、消息、工具调用、任务状态、摘要和上下文预算管理能力。
 - MemoryStore：领域端口，定义会话、消息、工具调用、任务状态和摘要的读写接口。
+- N-KB：独立知识库服务，N-Agent 通过 HTTP 检索接口消费其通用知识，不把索引和文档管理能力嵌入自身。
 - OpenAI-compatible API：对外兼容 OpenAI Chat Completions 风格的 HTTP API，用于接入 Open-WebUI 等客户端。
 - Open-WebUI：使用 OpenAI-compatible API 接入模型或 Agent 服务的 Web UI 客户端。
 - Provider：具体 LLM 服务提供方或协议实现，如 OpenAI-compatible endpoint、Claude、Ollama、OpenRouter。
+- search_knowledge：N-Agent 暴露给 LLM 的 safe tool，用于按需调用 N-KB 通用知识检索。
 - Summarizer：领域端口，定义上下文摘要生成能力，MVP 可用启发式摘要，后续可替换为模型驱动压缩。
 - Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。
 - ToolDefinition：工具定义值对象，描述工具名称、说明、输入 schema、风险等级、权限、超时和启用状态，不包含具体 handler。

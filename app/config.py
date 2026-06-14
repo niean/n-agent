@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     sqlite_path: Path = Field(default=Path("locals/sessions.db"))
     workspace_root: Path = Field(default=Path.cwd())
     agent_iteration_limit: int = Field(default=5, ge=1, le=20)
+    kb_enabled: bool = Field(default=False)
+    kb_base_url: str = Field(default="")
+    kb_default_top_k: int = Field(default=5, ge=1, le=50)
+    kb_default_min_score: float = Field(default=0.5, ge=0, le=1)
+    kb_timeout_seconds: float = Field(default=10, gt=0)
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 

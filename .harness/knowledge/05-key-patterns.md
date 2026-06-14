@@ -71,11 +71,24 @@ Agent 实际可执行工具只来自服务端 Tool Registry。客户端传入 to
 规则：
 - ToolDefinition 是领域值对象，包含 name、description、input_schema、risk_level、permissions、timeout_seconds、enabled，不包含具体 handler。
 - 工具 handler 属于 Infrastructure，通过 Application 层 ToolService 绑定执行。
+- 多个工具 handler 通过 Infrastructure 的组合 executor 按工具名路由；ToolService 只处理定义、风险等级和 enabled 语义。
 - 风险等级至少包含 safe、confirm、dangerous。
 - safe 默认允许执行；confirm 在 MVP 默认拒绝自动执行并返回 permission_denied；dangerous 默认不暴露给 LLM。
 - 文件类工具必须限制在配置 workspace 根目录内，拒绝路径穿越和软链接逃逸。
 
 陷阱：把 handler 放进 Domain，或让 API handler 直接执行工具，会破坏权限审计和后续审批流。
+
+## 模式十：外部知识服务通过工具消费
+
+N-KB 是独立知识服务，N-Agent 只通过 `search_knowledge` safe tool 消费其 HTTP 检索接口。
+
+规则：
+- N-Agent 不复制 N-KB 的索引、文档管理或站点管理能力。
+- N-KB HTTP client 和响应映射属于 Infrastructure，不能进入 Domain 或 Application 用例模型。
+- `search_knowledge` 的启用由配置控制；未配置或禁用时不向 LLM 暴露，异常调用返回 permission_denied。
+- Docker Compose 中访问 N-KB 时不能使用指向容器自身的 localhost，应使用服务名、共享网络或宿主机网关地址。
+
+陷阱：把 N-KB 作为内部子域嵌入 N-Agent，或在 ChatService 前置固定检索，会让普通对话链路被 RAG 编排污染。
 
 ## 模式七：Memory/Context 通过端口访问
 

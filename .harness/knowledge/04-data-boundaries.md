@@ -57,6 +57,11 @@
 - sqlite_path
 - workspace_root
 - agent_iteration_limit
+- kb_enabled
+- kb_base_url
+- kb_default_top_k
+- kb_default_min_score
+- kb_timeout_seconds
 
 Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPOSE_PROJECT_NAME`。
 
@@ -125,6 +130,8 @@ volumes:
 
 - SQLite 数据保存在宿主机 `/Users/niean/install/n-agent/locals/sessions.db`
 - 文件工具只能访问宿主机 `/Users/niean/install/n-agent/workspace` 对应的容器路径 `/workspace`
+- N-KB 是外部独立服务，容器内配置 `N_AGENT_KB_BASE_URL` 时不能使用指向 N-Agent 容器自身的 localhost，应使用 Compose service name、共享 network 或宿主机网关地址
+- N-Agent compose 必须把 n-agent 容器加入 N-KB 所在 Docker 网络（`n-kb_default`，external），并以 `N_AGENT_KB_BASE_URL=http://n-kb:8212` 通过 service name 直连。否则 hostname 会被 Docker Desktop 内部 DNS 解析到不可达代理地址，TCP 表面 connect 成功但 HTTP 响应被丢弃，httpx 抛 RemoteProtocolError
 
 ## 边界约定
 

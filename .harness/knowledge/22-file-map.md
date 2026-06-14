@@ -24,7 +24,7 @@
 - Chat 用例：`app/application/chat_service.py`，定义 `ChatCompletionInput`、`ChatCompletionResult`、`ChatCompletionService`
 - 模型列表用例：`app/application/model_service.py`，定义 `ModelService`
 - 会话查询用例：`app/application/session_service.py`，定义 `SessionService`
-- 工具服务：`app/application/tool_service.py`，定义 `ToolService` 和 `builtin_tool_definitions`
+- 工具服务：`app/application/tool_service.py`，定义 `ToolService`、`builtin_tool_definitions` 和 `knowledge_tool_definitions`
 
 ## Infrastructure Layer
 
@@ -32,6 +32,8 @@
 - SQLite MemoryStore：`app/infrastructure/memory/sqlite_store.py`，实现 Domain `MemoryStore`，初始化 schema 和索引
 - 启发式摘要器：`app/infrastructure/memory/heuristic_summarizer.py`，实现 Domain `Summarizer`
 - 内置工具 handler：`app/infrastructure/tools/builtin.py`，实现时间、计算、目录列表、文本读取和 workspace 路径安全
+- 工具路由 executor：`app/infrastructure/tools/composite.py`，按工具名将 ToolCallRequest 分发给具体 ToolExecutor
+- N-KB 知识检索工具：`app/infrastructure/tools/kb.py`，通过 httpx.AsyncClient 调用 N-KB `/retrieval/search` 并映射为 ToolResult
 
 ## Interfaces Layer
 
@@ -58,6 +60,8 @@
 - ChatService 测试：`tests/application/test_chat_service.py`
 - SQLite store 测试：`tests/infrastructure/test_sqlite_store.py`
 - 内置工具测试：`tests/infrastructure/test_builtin_tools.py`
+- 工具路由测试：`tests/infrastructure/test_composite_tools.py`
+- N-KB 知识检索工具测试：`tests/infrastructure/test_kb_tools.py`
 - OpenAI-compatible Provider 测试：`tests/infrastructure/test_openai_compatible_provider.py`
 - OpenAI API 测试：`tests/interfaces/test_openai_api.py`
 - Dashboard 测试：`tests/interfaces/test_dashboard.py`

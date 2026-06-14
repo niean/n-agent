@@ -36,6 +36,26 @@ class ToolService:
         return await self.executor.execute(request)
 
 
+def knowledge_tool_definitions(enabled: bool = True) -> list[ToolDefinition]:
+    return [
+        ToolDefinition(
+            name="search_knowledge",
+            description="Search the N-KB general knowledge base for relevant snippets.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 50},
+                    "min_score": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            enabled=enabled,
+        )
+    ]
+
+
 def builtin_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(

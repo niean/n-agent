@@ -33,11 +33,10 @@ logs/*
 data/*
 !data/.gitkeep
 
-.env
 .venv
 .pytest_cache
 *.pyc
 *.egg-info/
 app/__pycache__
 docker/docker-compose.yml
-
+docker/.env

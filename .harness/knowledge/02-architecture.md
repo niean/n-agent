@@ -11,7 +11,7 @@
 
 - Domain 层：定义 Agent、Session、Message、Tool、Provider、Memory 等核心领域模型和值对象，定义 LLMProvider、ToolExecutor、MemoryStore、Summarizer 等端口协议。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
 - Application 层：编排用例和 Agent Runtime。LangGraph 属于本层，只负责状态图和运行流程编排。
-- Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、配置加载等。
+- Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、N-KB 知识检索 HTTP client、配置加载等。
 - Interfaces 层：实现 FastAPI、OpenAI-compatible API、Dashboard 和协议转换。
 
 ## 模块边界
@@ -27,7 +27,8 @@
 
 - Agent Runtime：内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件。运行流程可使用 LangGraph 表达，但领域状态和规则不能被 LangGraph 类型污染。
 - LLM Adapter：模型 Provider 端口，屏蔽 OpenAI-compatible、Claude、Ollama、OpenRouter 等 Provider 差异。
-- Tool Registry：工具定义、schema、风险等级、权限要求和执行入口。Agent 实际可执行工具只来自服务端注册表。
+- Tool Registry：工具定义、schema、风险等级、权限要求和执行入口。Agent 实际可执行工具只来自服务端注册表；多个工具 executor 通过 Infrastructure 组合路由分发。
+- Knowledge Retrieval：N-Agent 通过 safe tool `search_knowledge` 调用独立 N-KB HTTP 检索服务，N-KB 不嵌入 N-Agent，Domain 不感知 N-KB 协议。
 - Memory/Context：通过 MemoryStore 与 Summarizer 端口访问，会话、消息、工具调用、任务状态和摘要的持久化细节属于 Infrastructure。
 - OpenAI-compatible API：对外兼容 Open-WebUI 的协议层，不等同于内部 Agent 模型。
 - Chat Dashboard：调试和演示入口，查看会话、流式输出、工具调用、摘要和任务状态，不替代 Open-WebUI。

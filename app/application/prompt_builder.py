@@ -17,6 +17,11 @@ SAFETY_GUIDANCE = (
     "Use the current context and persisted conversation history, but do not invent history that is not present."
 )
 
+KNOWLEDGE_GUIDANCE = (
+    "When the user asks for general knowledge, factual lookup, or information that may benefit from the knowledge base, "
+    "use the search_knowledge tool when it is available, then ground your answer in the returned snippets."
+)
+
 
 def build_system_prompt() -> str:
-    return "\n\n".join((DEFAULT_AGENT_IDENTITY, REACT_GUIDANCE, SAFETY_GUIDANCE))
+    return "\n\n".join((DEFAULT_AGENT_IDENTITY, REACT_GUIDANCE, KNOWLEDGE_GUIDANCE, SAFETY_GUIDANCE))
