@@ -33,7 +33,8 @@
         - 功测：错误，提示 knowledge search failed
     - 前端：重构前端页面，左导按照领域功能分菜单。前端规范，参见 .harness/framework/guides/10-guidelines-fe.md；真实样例，参考 /Users/niean/code/github.com/niean/n-kb/app/interfaces/http/static
     - 模型：页面需要展示真实Provider(管理员视角)，而当前展示N-Agent为脱敏后的信息(系普通用户视角)，需要提供两套接口
-    - 模型：Dashboard支持编辑Provider
+    - 模型：Dash支持编辑模型Provider
+    - 会话：Dash支持编辑Title和删除
 
 
 ---
@@ -42,10 +43,9 @@
 - Issue
 - NFR
 - FR
-    - 会话：Title支持编辑，会话支持删除
     - RunTime：Sandbox(docker)
     - 定时任务
-    - 治理：身份，护栏
+    - 治理：IAM，安全护栏
     - 交互：飞书IM接入
 
 

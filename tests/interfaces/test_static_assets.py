@@ -89,20 +89,43 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'metadata' in chat_js
     assert "'[DONE]'" in chat_js or 'data: [DONE]' in chat_js
     assert 'if (!text) return' in chat_js
+    assert 'renameSession' in chat_js
+    assert 'deleteSession' in chat_js
+    assert 'window.confirm(' in chat_js
     api_js = client.get('/static/management-api.js').text
     assert '/chat/tools' in api_js
     assert '/chat/health/dependencies' in api_js
     assert '/v1/models' in api_js
     assert '/chat/models' in api_js
+    assert '/chat/providers' in api_js
+    assert 'activateProvider' in api_js
+    assert 'deleteProvider' in api_js
+    assert 'renameSession' in api_js
+    assert 'deleteSession' in api_js
     models_js = client.get('/static/models.js').text
     assert '/chat/models' in models_js or 'getAdminModels' in models_js
     assert '/v1/models' not in models_js
     assert 'Display Name' in models_js
     assert 'Default' in models_js
+    assert 'listProviders' in models_js
+    assert 'activateProvider' in models_js
+    assert 'api_key_present' in models_js
     nav_js = client.get('/static/management-navigation.js').text
     assert 'pushState' in nav_js
     assert "'/summary'" in nav_js
     assert "'/status'" in nav_js
+
+
+def test_models_page_renders_provider_admin_controls(tmp_path):
+    client = _client(tmp_path)
+    html = client.get('/models').text
+    assert 'id="providers-list"' in html
+    assert 'id="providers-form"' in html
+    assert 'id="provider-name"' in html
+    assert 'id="provider-base-url"' in html
+    assert 'id="provider-model"' in html
+    assert 'id="provider-api-key"' in html
+    assert 'id="providers-new"' in html
 
 
 def test_static_assets_use_safe_text_rendering(tmp_path):

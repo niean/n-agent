@@ -3,12 +3,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
 from app.application.model_service import ModelService
+from app.application.provider_service import ProviderCreateInput, ProviderService, ProviderUpdateInput
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.provider import ModelInfo
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.domain.tool import ToolCallRequest, ToolExecutor, ToolResult, ToolResultStatus
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 
 
@@ -42,7 +44,7 @@ def _default_health() -> dict:
     }
 
 
-def _build_app(store, health=None, model_service=None):
+def _build_app(store, health=None, model_service=None, provider_service=None):
     tool_service = ToolService(_StubExecutor(), builtin_tool_definitions())
     model_service = model_service or ModelService(_StubProvider(), "real-1")
     app = FastAPI()
@@ -52,8 +54,17 @@ def _build_app(store, health=None, model_service=None):
         tool_service,
         model_service,
         health or _default_health,
+        provider_service=provider_service,
     ))
     return app
+
+
+class _StubHolder:
+    def __init__(self):
+        self.swaps = []
+
+    async def swap(self, cfg, api_key):
+        self.swaps.append((cfg.id, api_key))
 
 
 def test_chat_page_and_apis(tmp_path):
@@ -157,3 +168,138 @@ def test_admin_models_endpoint_returns_real_provider_models(tmp_path):
     assert by_id["real-1"]["supports_tools"] is True
     assert by_id["real-2"]["is_default"] is False
     assert by_id["real-2"]["supports_tools"] is False
+
+
+def _build_provider_app(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    registry = SQLiteProviderRegistry(tmp_path / "sessions.db")
+    holder = _StubHolder()
+    provider_service = ProviderService(registry, holder)
+    app = _build_app(store, provider_service=provider_service)
+    return app, holder
+
+
+def test_provider_routes_full_lifecycle(tmp_path):
+    app, holder = _build_provider_app(tmp_path)
+    client = TestClient(app)
+
+    create = client.post(
+        "/chat/providers",
+        json={"name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1"},
+    )
+    assert create.status_code == 200
+    body = create.json()
+    assert "api_key" not in body
+    assert body["api_key_present"] is True
+    pid = body["id"]
+
+    listed = client.get("/chat/providers").json()
+    assert len(listed) == 1 and listed[0]["id"] == pid
+    assert "api_key" not in listed[0]
+
+    activated = client.post(f"/chat/providers/{pid}/activate")
+    assert activated.status_code == 200
+    assert activated.json()["is_active"] is True
+    assert holder.swaps and holder.swaps[-1][0] == pid
+
+    delete_active = client.delete(f"/chat/providers/{pid}")
+    assert delete_active.status_code == 409
+    assert delete_active.json()["error"]["code"] == "provider_in_use"
+
+    patched = client.patch(f"/chat/providers/{pid}", json={"model": "m2"})
+    assert patched.status_code == 200
+    assert patched.json()["model"] == "m2"
+    assert "api_key" not in patched.json()
+    assert holder.swaps[-1][0] == pid
+
+
+def test_provider_create_validation(tmp_path):
+    app, _ = _build_provider_app(tmp_path)
+    client = TestClient(app)
+
+    invalid = client.post(
+        "/chat/providers",
+        json={"name": "", "base_url": "http://x", "model": "m", "api_key": "k"},
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "provider_invalid"
+
+    missing = client.get("/chat/providers/does-not-exist")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "provider_not_found"
+
+
+def test_provider_duplicate_name_returns_409(tmp_path):
+    app, _ = _build_provider_app(tmp_path)
+    client = TestClient(app)
+    payload = {"name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1"}
+    assert client.post("/chat/providers", json=payload).status_code == 200
+    dup = client.post("/chat/providers", json=payload)
+    assert dup.status_code == 409
+    assert dup.json()["error"]["code"] == "provider_duplicate"
+
+
+def test_chat_session_can_be_renamed(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+
+    async def seed():
+        await store.create_session(ConversationSession(id="s-rename"))
+
+    asyncio.run(seed())
+    client = TestClient(_build_app(store))
+
+    response = client.patch("/chat/sessions/s-rename", json={"title": "  新标题  "})
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "新标题"
+
+
+def test_chat_session_rename_validates_title(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+
+    asyncio.run(store.create_session(ConversationSession(id="s1")))
+    client = TestClient(_build_app(store))
+
+    response = client.patch("/chat/sessions/s1", json={"title": "   "})
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "session_title_invalid"
+
+
+def test_chat_session_rename_returns_404_when_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store))
+
+    response = client.patch("/chat/sessions/missing", json={"title": "x"})
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "session_not_found"
+
+
+def test_chat_session_can_be_deleted_with_cascade(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+
+    async def seed():
+        await store.create_session(ConversationSession(id="s-del"))
+        await store.append_message("s-del", ConversationMessage(role="user", content="hi"))
+
+    asyncio.run(seed())
+    client = TestClient(_build_app(store))
+
+    response = client.delete("/chat/sessions/s-del")
+
+    assert response.status_code == 204
+    assert client.get("/chat/sessions/s-del").json()["session"] is None
+
+
+def test_chat_session_delete_returns_404_when_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store))
+
+    response = client.delete("/chat/sessions/missing")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "session_not_found"

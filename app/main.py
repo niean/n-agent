@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.chat_service import ChatCompletionService
 from app.application.model_service import ModelService
+from app.application.provider_service import ProviderCreateInput, ProviderService
+from app.application.runtime_provider import ActiveProviderHolder
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.config import Settings
+from app.domain.provider import ProviderConfig
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
@@ -20,15 +26,44 @@ from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 from app.interfaces.http.openai import create_openai_router
 
 
+def _provider_factory(cfg: ProviderConfig, api_key: str) -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(cfg.base_url, api_key, cfg.model)
+
+
+async def _seed_and_activate(
+    registry: SQLiteProviderRegistry,
+    holder: ActiveProviderHolder,
+    settings: Settings,
+) -> None:
+    existing = await registry.list_providers()
+    if not existing and settings.provider_base_url and settings.provider_model:
+        service = ProviderService(registry, holder)
+        await service.create_provider(
+            ProviderCreateInput(
+                name="default",
+                base_url=settings.provider_base_url,
+                model=settings.provider_model,
+                api_key=settings.provider_api_key or "seed",
+            )
+        )
+    active = await registry.get_active()
+    if active is None:
+        all_providers = await registry.list_providers()
+        if all_providers:
+            active = await registry.set_active(all_providers[0].id)
+    if active is not None:
+        secret = await registry.get_secret(active.id) or ""
+        await holder.swap(active, secret)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     memory_store = SQLiteMemoryStore(settings.sqlite_path)
     summarizer = HeuristicSummarizer()
-    provider = OpenAICompatibleProvider(
-        settings.provider_base_url,
-        settings.provider_api_key,
-        settings.provider_model,
-    )
+    registry = SQLiteProviderRegistry(settings.sqlite_path)
+    holder = ActiveProviderHolder(_provider_factory)
+    asyncio.run(_seed_and_activate(registry, holder, settings))
+    provider_service = ProviderService(registry, holder)
     builtin_executor = build_builtin_tool_executor(settings.workspace_root)
     kb_enabled = settings.kb_enabled and bool(settings.kb_base_url.strip())
     kb_client = KnowledgeSearchClient(settings.kb_base_url, settings.kb_timeout_seconds) if kb_enabled else None
@@ -44,7 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     tool_definitions = builtin_tool_definitions() + knowledge_tool_definitions(enabled=kb_enabled)
     tool_service = ToolService(tool_executor, tool_definitions)
     graph_runner = AgentGraphRunner(
-        provider,
+        holder,
         tool_service,
         memory_store,
         summarizer,
@@ -52,10 +87,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     session_service = SessionService(
         memory_store,
-        title_generator=LLMTitleGenerator(provider, settings.provider_model),
+        title_generator=LLMTitleGenerator(holder, lambda: holder.current_model),
     )
     chat_service = ChatCompletionService(memory_store, graph_runner, session_service)
-    model_service = ModelService(provider, settings.provider_model)
+    model_service = ModelService(holder, lambda: holder.current_model)
 
     app = FastAPI(title="N-Agent")
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -68,12 +103,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings.sqlite_path.touch(exist_ok=True)
         except Exception as exc:
             memory_status = f"error: {exc}"
-        provider_configured = bool(settings.provider_base_url and settings.provider_api_key)
+        active = holder.current_config
+        provider_configured = active is not None and active.api_key_present
         return {
             "provider": {
                 "status": "ok" if provider_configured else "warn",
-                "base_url": settings.provider_base_url,
-                "model": settings.provider_model,
+                "base_url": active.base_url if active else "",
+                "model": active.model if active else "",
             },
             "memory": {"status": memory_status, "path": str(settings.sqlite_path)},
             "knowledge": {
@@ -83,7 +119,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
         }
 
-    app.include_router(create_dashboard_router(session_service, tool_service, model_service, health_snapshot))
+    app.include_router(
+        create_dashboard_router(
+            session_service,
+            tool_service,
+            model_service,
+            health_snapshot,
+            provider_service=provider_service,
+        )
+    )
     return app
 
 

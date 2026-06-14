@@ -19,6 +19,9 @@
 - OpenAI-compatible API：对外兼容 OpenAI Chat Completions 风格的 HTTP API，用于接入 Open-WebUI 等客户端。
 - Open-WebUI：使用 OpenAI-compatible API 接入模型或 Agent 服务的 Web UI 客户端。
 - Provider：具体 LLM 服务提供方或协议实现，如 OpenAI-compatible endpoint、Claude、Ollama、OpenRouter。
+- ProviderConfig：Provider 注册表中的脱敏配置实体，描述 id、name、provider_type、base_url、model、api_key_present、is_active 等字段，永不包含 api_key 明文。
+- ProviderRegistry：领域端口，定义多 Provider 配置的 CRUD、active 切换、明文 api_key 单独读取（仅供 Infrastructure 工厂调用）。
+- ActiveProviderHolder：Application 层适配器，实现 LLMProvider 协议；通过工厂回调懒加载底层 Provider 实例并以 asyncio.Lock 保护 swap，使下游服务无感知地热切换 active provider。
 - search_knowledge：N-Agent 暴露给 LLM 的 safe tool，用于按需调用 N-KB 通用知识检索。
 - Summarizer：领域端口，定义上下文摘要生成能力，MVP 可用启发式摘要，后续可替换为模型驱动压缩。
 - Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from app.domain.provider import LLMProvider, LLMResult
 
 
@@ -9,11 +11,20 @@ _PROMPT = (
 )
 
 
+ModelResolver = str | Callable[[], str]
+
+
 class LLMTitleGenerator:
-    def __init__(self, provider: LLMProvider, model: str, max_chars: int = 16):
+    def __init__(self, provider: LLMProvider, model: ModelResolver, max_chars: int = 16):
         self.provider = provider
-        self.model = model
+        self._model = model
         self.max_chars = max_chars
+
+    @property
+    def model(self) -> str:
+        if callable(self._model):
+            return self._model() or ""
+        return self._model or ""
 
     async def generate(self, user_message: str) -> str:
         text = (user_message or "").strip()

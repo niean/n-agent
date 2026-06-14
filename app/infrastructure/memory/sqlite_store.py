@@ -63,6 +63,20 @@ class SQLiteMemoryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_session_created_at ON messages(session_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_session_created_at ON tool_calls(session_id, created_at);
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    provider_type TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    api_key TEXT,
+                    extra_headers_json TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_active
+                    ON providers(is_active) WHERE is_active = 1;
                 """
             )
 
@@ -225,6 +239,15 @@ class SQLiteMemoryStore:
         if row is None:
             return None
         return Summary(session_id=row["session_id"], summary=row["summary"], source_message_id=row["source_message_id"])
+
+    async def delete_session(self, session_id: str) -> bool:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM task_states WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+            cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return cursor.rowcount > 0
 
     async def get_context(self, session_id: str) -> dict[str, Any]:
         return {

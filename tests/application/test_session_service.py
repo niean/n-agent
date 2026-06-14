@@ -3,7 +3,11 @@ import asyncio
 import pytest
 
 from app.application.session_service import SessionService
-from app.domain.session import ConversationSession
+from app.domain.session import (
+    ConversationSession,
+    SessionNotFoundError,
+    SessionValidationError,
+)
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 
 
@@ -93,3 +97,68 @@ async def test_ensure_title_handles_generator_failure(tmp_path):
 
     session = await store.get_session("s1")
     assert session.has_default_title()
+
+
+@pytest.mark.asyncio
+async def test_rename_session_updates_title(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    service = SessionService(store)
+
+    result = await service.rename_session("s1", "  我的会话  ")
+
+    assert result.title == "我的会话"
+    persisted = await store.get_session("s1")
+    assert persisted.title == "我的会话"
+
+
+@pytest.mark.asyncio
+async def test_rename_session_truncates_to_60_chars(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    service = SessionService(store)
+
+    long = "标题" * 50
+    result = await service.rename_session("s1", long)
+
+    assert len(result.title) == 60
+    assert result.title == long[:60]
+
+
+@pytest.mark.asyncio
+async def test_rename_session_rejects_blank_title(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    service = SessionService(store)
+
+    with pytest.raises(SessionValidationError):
+        await service.rename_session("s1", "   ")
+
+
+@pytest.mark.asyncio
+async def test_rename_session_raises_when_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = SessionService(store)
+
+    with pytest.raises(SessionNotFoundError):
+        await service.rename_session("nope", "x")
+
+
+@pytest.mark.asyncio
+async def test_delete_session_removes_session(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    service = SessionService(store)
+
+    await service.delete_session("s1")
+
+    assert await store.get_session("s1") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_raises_when_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = SessionService(store)
+
+    with pytest.raises(SessionNotFoundError):
+        await service.delete_session("nope")

@@ -79,3 +79,30 @@ async def test_heuristic_summarizer_returns_existing_for_empty_messages():
     result = await summarizer.summarize([], existing_summary="prev")
 
     assert result == "prev"
+
+
+@pytest.mark.asyncio
+async def test_delete_session_cascades_related_rows(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-del"))
+    msg = await store.append_message("s-del", ConversationMessage(role="user", content="hi"))
+    await store.save_tool_call(
+        ToolCall(id="tc-del", session_id="s-del", message_id=msg.id, tool_name="calc", arguments={}, status="success")
+    )
+    await store.save_task_state(TaskState(session_id="s-del", status="idle", iteration_count=0))
+    await store.save_summary(Summary(session_id="s-del", summary="x"))
+
+    deleted = await store.delete_session("s-del")
+
+    assert deleted is True
+    assert await store.get_session("s-del") is None
+    assert await store.list_messages("s-del") == []
+    assert await store.list_tool_calls("s-del") == []
+    assert await store.get_task_state("s-del") is None
+    assert await store.get_summary("s-del") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_returns_false_when_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    assert await store.delete_session("nope") is False

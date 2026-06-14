@@ -1,22 +1,34 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from app.domain.provider import LLMProvider, ModelInfo
 
 
+ModelResolver = str | Callable[[], str]
+
+
 class ModelService:
-    def __init__(self, provider: LLMProvider, default_model: str):
+    def __init__(self, provider: LLMProvider, default_model: ModelResolver):
         self.provider = provider
-        self.default_model = default_model
+        self._default_model = default_model
+
+    @property
+    def default_model(self) -> str:
+        if callable(self._default_model):
+            return self._default_model() or ""
+        return self._default_model or ""
 
     async def list_models(self) -> list[ModelInfo]:
         try:
             models = await self.provider.list_models()
         except Exception:
             models = []
+        default = self.default_model
         return models or [
             ModelInfo(
-                id=self.default_model,
-                display_name=self.default_model,
+                id=default,
+                display_name=default,
                 provider="configured",
                 supports_tools=True,
                 supports_streaming=True,

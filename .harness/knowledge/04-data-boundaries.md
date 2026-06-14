@@ -23,6 +23,8 @@
 
 `ModelInfo`（`app/domain/provider.py`）：模型能力描述，字段包括 id、display_name、provider、supports_tools、supports_streaming。
 
+`ProviderConfig`（`app/domain/provider.py`）：Provider 注册表的脱敏配置实体（frozen dataclass），字段包括 id、name、provider_type、base_url、model、api_key_present、is_active、extra_headers、created_at、updated_at。**永远不包含 api_key 明文字段**；明文 api_key 通过 `ProviderRegistry.get_secret(id)` 单独读取且仅供 Infrastructure 工厂调用。
+
 `LLMResult`（`app/domain/provider.py`）：非流式模型结果，字段包括 message、finish_reason、usage、raw。
 
 `LLMEvent`（`app/domain/provider.py`）：流式模型事件，类型包括 message_start、content_delta、tool_call_delta、message_done、error。
@@ -39,7 +41,9 @@
 
 ## 端口协议
 
-`LLMProvider`（`app/domain/provider.py`）：定义 list_models、chat、supports_tools。Infrastructure 的 OpenAI-compatible Provider 实现该端口。
+`LLMProvider`（`app/domain/provider.py`）：定义 list_models、chat、supports_tools。Infrastructure 的 OpenAI-compatible Provider 实现该端口；运行时由 Application 层 `ActiveProviderHolder` 适配实现热切换。
+
+`ProviderRegistry`（`app/domain/provider.py`）：定义 list_providers、get_provider、create_provider、update_provider、delete_provider、set_active、get_active、get_secret 接口。Infrastructure 的 SQLiteProviderRegistry 实现该端口；`get_secret` 只供 ActiveProviderHolder 工厂调用，不通过 HTTP 暴露。
 
 `MemoryStore`（`app/domain/memory.py`）：定义 session、message、tool_call、task_state、summary 的读写接口。Infrastructure 的 SQLiteMemoryStore 实现该端口。
 
@@ -75,7 +79,16 @@ messages(id, session_id, role, content_json, created_at, provider_message_id, to
 tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at)
 task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
+providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_headers_json, is_active, created_at, updated_at)
 ```
+
+providers 表唯一索引：
+
+```sql
+CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active = 1
+```
+
+该 partial unique index 保证全表至多一条 active 记录，由 `SQLiteProviderRegistry.set_active` 通过先 `UPDATE is_active=0 WHERE is_active=1` 再 `UPDATE is_active=1 WHERE id=?` 实现切换；`api_key` 列以明文形式落地 `locals/sessions.db`，依赖 Docker volume 持久化与文件系统隔离保护，不通过 HTTP 暴露、不写入日志。
 
 索引：
 
@@ -90,6 +103,8 @@ JSON 边界：
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
+
+会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序 DELETE messages → tool_calls → task_states → summaries → sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。
 
 ## OpenAI-compatible 协议边界
 

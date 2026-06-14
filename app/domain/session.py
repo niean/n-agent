@@ -68,3 +68,13 @@ class ConversationSession:
 class TitleGenerator(Protocol):
     async def generate(self, user_message: str) -> str:
         ...
+
+
+class SessionNotFoundError(Exception):
+    def __init__(self, session_id: str):
+        super().__init__(f"session not found: {session_id}")
+        self.session_id = session_id
+
+
+class SessionValidationError(Exception):
+    pass

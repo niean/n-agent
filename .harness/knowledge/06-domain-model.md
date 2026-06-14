@@ -57,9 +57,11 @@ load_context -> call_llm -> execute_tools -> update_memory -> finalize
 | 实体 | ToolCall | 工具调用记录 |
 | 实体 | TaskState | 当前任务运行状态 |
 | 实体 | Summary | 会话摘要 |
+| 实体 | ProviderConfig | Provider 注册表脱敏配置（id、name、provider_type、base_url、model、api_key_present、is_active、extra_headers、created_at、updated_at），不含 api_key 明文 |
 | 值对象 | RiskLevel | 工具或动作的风险等级 |
 | 值对象 | PermissionDecision | 工具或动作是否允许执行的判定结果 |
 | 端口 | LLMProvider | 屏蔽具体模型服务 |
+| 端口 | ProviderRegistry | Provider 配置注册表（CRUD + active 切换 + 明文 api_key 单独读取） |
 | 端口 | MemoryStore | 屏蔽 SQLite 等存储实现 |
 | 端口 | ToolExecutor | 屏蔽具体工具 handler |
 | 端口 | Summarizer | 屏蔽摘要生成策略 |

@@ -4,7 +4,12 @@ import asyncio
 import logging
 
 from app.domain.memory import MemoryStore
-from app.domain.session import ConversationSession, TitleGenerator
+from app.domain.session import (
+    ConversationSession,
+    SessionNotFoundError,
+    SessionValidationError,
+    TitleGenerator,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -32,6 +37,25 @@ class SessionService:
 
     async def list_tool_calls(self, session_id: str):
         return await self.memory_store.list_tool_calls(session_id)
+
+    async def rename_session(self, session_id: str, title: str) -> ConversationSession:
+        if title is None:
+            raise SessionValidationError("title is required")
+        cleaned = title.strip()
+        if not cleaned:
+            raise SessionValidationError("title must not be blank")
+        cleaned = cleaned[:60]
+        session = await self.memory_store.get_session(session_id)
+        if session is None:
+            raise SessionNotFoundError(session_id)
+        await self.memory_store.update_session_title(session_id, cleaned)
+        refreshed = await self.memory_store.get_session(session_id)
+        return refreshed if refreshed is not None else session
+
+    async def delete_session(self, session_id: str) -> None:
+        deleted = await self.memory_store.delete_session(session_id)
+        if not deleted:
+            raise SessionNotFoundError(session_id)
 
     async def ensure_title(self, session_id: str, user_message: str) -> None:
         if not self.title_generator or not user_message:

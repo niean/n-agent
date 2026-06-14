@@ -75,18 +75,100 @@
       const sessions = await api.listSessions();
       clearNode(list);
       if (!sessions.length) { ui.renderEmpty(list, '暂无会话'); return; }
-      sessions.forEach((session) => {
-        const item = document.createElement('button');
-        item.className = `session-item${session.id === currentSessionId ? ' active' : ''}`;
-        item.type = 'button';
-        item.addEventListener('click', () => selectSession(session.id));
-        item.textContent = session.title || session.id;
-        list.appendChild(item);
-      });
+      sessions.forEach((session) => list.appendChild(buildSessionItem(session)));
     } catch (error) {
       clearNode(list);
       ui.renderError(list, '加载会话失败: ' + error.message);
     }
+  }
+
+  function buildSessionItem(session) {
+    const item = document.createElement('div');
+    item.className = `session-item${session.id === currentSessionId ? ' active' : ''}`;
+
+    const titleBtn = document.createElement('button');
+    titleBtn.type = 'button';
+    titleBtn.className = 'session-item__title';
+    titleBtn.textContent = session.title || session.id;
+    titleBtn.addEventListener('click', () => selectSession(session.id));
+
+    const actions = document.createElement('span');
+    actions.className = 'session-item__actions';
+
+    const renameBtn = document.createElement('button');
+    renameBtn.type = 'button';
+    renameBtn.className = 'session-item__action';
+    renameBtn.setAttribute('aria-label', '编辑会话标题');
+    renameBtn.textContent = '✎';
+    renameBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      enterRenameMode(item, session);
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'session-item__action';
+    deleteBtn.setAttribute('aria-label', '删除会话');
+    deleteBtn.textContent = '🗑';
+    deleteBtn.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await handleDelete(session);
+    });
+
+    actions.append(renameBtn, deleteBtn);
+    item.append(titleBtn, actions);
+    return item;
+  }
+
+  function enterRenameMode(item, session) {
+    clearNode(item);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'session-item__input';
+    input.value = session.title || '';
+    input.setAttribute('aria-label', '会话标题');
+    item.appendChild(input);
+    let committed = false;
+    const commit = async () => {
+      if (committed) return;
+      committed = true;
+      const next = input.value.trim();
+      if (!next || next === session.title) {
+        await loadSessions();
+        return;
+      }
+      try {
+        await api.renameSession(session.id, next);
+      } catch (error) {
+        setStatusMessage('重命名失败: ' + error.message, 'error');
+      }
+      await loadSessions();
+    };
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') { event.preventDefault(); commit(); }
+      if (event.key === 'Escape') { committed = true; loadSessions(); }
+    });
+    input.addEventListener('blur', commit);
+    input.focus();
+    input.select();
+  }
+
+  async function handleDelete(session) {
+    const label = session.title || session.id;
+    if (!window.confirm(`确定删除会话「${label}」？关联消息将一并删除`)) return;
+    try {
+      await api.deleteSession(session.id);
+    } catch (error) {
+      setStatusMessage('删除失败: ' + error.message, 'error');
+      return;
+    }
+    if (currentSessionId === session.id) {
+      currentSessionId = null;
+      setHeader(null);
+      showEmptyState();
+      updateInfo({});
+    }
+    await loadSessions();
   }
 
   async function selectSession(id) {
