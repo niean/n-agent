@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
+
+
+DEFAULT_SESSION_TITLE = "New Session"
 
 
 def utc_now() -> datetime:
@@ -53,7 +56,15 @@ class TaskState:
 @dataclass(frozen=True)
 class ConversationSession:
     id: str
-    title: str = "New Session"
+    title: str = DEFAULT_SESSION_TITLE
     source: str = "api"
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+
+    def has_default_title(self) -> bool:
+        return self.title == DEFAULT_SESSION_TITLE
+
+
+class TitleGenerator(Protocol):
+    async def generate(self, user_message: str) -> str:
+        ...

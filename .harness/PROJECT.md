@@ -84,7 +84,7 @@
 | .harness/knowledge/03-conventions.md | {{查阅场景}} |
 | .harness/knowledge/04-data-boundaries.md | {{查阅场景}} |
 | .harness/knowledge/05-key-patterns.md | {{查阅场景}} |
-| .harness/knowledge/06-domain-model.md | 需要查看 DDD 子域、聚合、实体、值对象、端口和应用服务调用流时 |
+| .harness/knowledge/06-domain-model.md | 需要快速了解 DDD 业务架构、子域、核心流程、关键模型和外部边界时 |
 | .harness/knowledge/21-glossary.md | 对术语不清楚时 |
 | .harness/knowledge/22-file-map.md | 确定功能对应源文件时 |
 | .harness/prd/02-prd-baseline.md | 确认功能需求与产品约束时 |

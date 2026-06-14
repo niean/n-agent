@@ -28,9 +28,12 @@
 
 [20260614]
 - FR
-    - 知识：新增知识检索功能，接入方式http api，能被Chat、任务等使用。本次新增1个知识站点`N-KB`，定位`通用知识`，接口定义参见代码 /Users/niean/code/github.com/niean/n-kb/app/interfaces/http
+    - 知识：[KF]新增知识检索功能，接入方式http api，能被Chat、任务等使用。本次新增1个知识站点`N-KB`，定位`通用知识`，接口定义参见代码 /Users/niean/code/github.com/niean/n-kb/app/interfaces/http
         - 审阅：Spec spec-260614-kb-tool.md，发现其中的严重问题
         - 功测：错误，提示 knowledge search failed
+    - 前端：重构前端页面，左导按照领域功能分菜单。前端规范，参见 .harness/framework/guides/10-guidelines-fe.md；真实样例，参考 /Users/niean/code/github.com/niean/n-kb/app/interfaces/http/static
+    - 模型：页面需要展示真实Provider(管理员视角)，而当前展示N-Agent为脱敏后的信息(系普通用户视角)，需要提供两套接口
+    - 模型：Dashboard支持编辑Provider
 
 
 ---
@@ -39,6 +42,14 @@
 - Issue
 - NFR
 - FR
+    - 会话：Title支持编辑，会话支持删除
     - RunTime：Sandbox(docker)
+    - 定时任务
     - 治理：身份，护栏
     - 交互：飞书IM接入
+
+
+---
+
+[待验证]
+- 会话：Title自动生成

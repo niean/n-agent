@@ -55,3 +55,27 @@ async def test_heuristic_summarizer_marks_truncated_summary():
     result = await summarizer.summarize([{"role": "user", "content": "a" * 50}])
 
     assert result.startswith("heuristic summary:")
+
+
+@pytest.mark.asyncio
+async def test_heuristic_summarizer_generates_brief_for_short_dialog():
+    summarizer = HeuristicSummarizer()
+
+    result = await summarizer.summarize(
+        [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "在的"},
+        ]
+    )
+
+    assert "用户" in result and "你好" in result
+    assert "助手" in result and "在的" in result
+
+
+@pytest.mark.asyncio
+async def test_heuristic_summarizer_returns_existing_for_empty_messages():
+    summarizer = HeuristicSummarizer()
+
+    result = await summarizer.summarize([], existing_summary="prev")
+
+    assert result == "prev"

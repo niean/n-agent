@@ -248,3 +248,35 @@ async def test_agent_graph_streams_chat_events(tmp_path):
     assert events[0].type == ChatEventType.MESSAGE_START
     assert any(event.type == ChatEventType.CONTENT_DELTA for event in events)
     assert events[-1].type == ChatEventType.DONE
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_persists_tool_message_content_as_string(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "calc"}]), "test")
+
+    persisted = await store.list_messages("s1")
+    tool_messages = [message for message in persisted if message.role == "tool"]
+    assert tool_messages, "tool message must be persisted"
+    assert all(isinstance(message.content, str) for message in tool_messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_serializes_legacy_dict_tool_content_to_provider(tmp_path):
+    from app.application.agent_graph import _message_to_provider
+    from app.domain.session import ConversationMessage
+
+    legacy = ConversationMessage(role="tool", content={"status": "success", "content": {"a": 1}}, tool_call_id="x")
+    payload = _message_to_provider(legacy)
+    assert isinstance(payload["content"], str)
+    assert "success" in payload["content"]
+

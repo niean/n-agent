@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.events import ChatEvent
+from app.application.session_service import SessionService
 from app.domain.agent import AgentState
 from app.domain.memory import MemoryStore
 from app.domain.session import ConversationMessage, ConversationSession
@@ -32,19 +33,30 @@ class ChatCompletionResult:
 
 
 class ChatCompletionService:
-    def __init__(self, memory_store: MemoryStore, graph_runner: AgentGraphRunner):
+    def __init__(
+        self,
+        memory_store: MemoryStore,
+        graph_runner: AgentGraphRunner,
+        session_service: SessionService,
+    ):
         self.memory_store = memory_store
         self.graph_runner = graph_runner
+        self.session_service = session_service
 
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
         session_id = request.session_id or request.metadata.get("session_id") or f"tmp-{uuid4()}"
         await self.memory_store.create_session(ConversationSession(id=session_id, source="api"))
+        first_user_message = next(
+            (message.get("content", "") for message in request.messages if message.get("role") == "user"),
+            "",
+        )
         for message in request.messages:
             if message.get("role") == "user":
                 await self.memory_store.append_message(
                     session_id,
                     ConversationMessage(role="user", content=message.get("content", "")),
                 )
+        await self.session_service.ensure_title(session_id, str(first_user_message))
         state = AgentState(session_id=session_id, input_messages=request.messages)
         if request.stream:
             return self.graph_runner.stream_events(state, request.model, request.options)

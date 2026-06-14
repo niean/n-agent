@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="N-Agent">
+  <rect width="64" height="64" rx="16" fill="#409EFF"/>
+  <path d="M16 16h32v32H16z" fill="#ffffff" opacity="0.16"/>
+  <text x="32" y="40" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#ffffff">NA</text>
+  <path d="M16 14h32M16 50h32" stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.9"/>
+</svg>

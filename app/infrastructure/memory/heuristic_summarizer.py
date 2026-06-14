@@ -9,6 +9,15 @@ class HeuristicSummarizer:
 
     async def summarize(self, messages: list[dict[str, Any]], existing_summary: str = "") -> str:
         text = "\n".join(f"{message.get('role', 'unknown')}: {message.get('content', '')}" for message in messages)
-        if len(text) <= self.max_chars:
+        if len(text) > self.max_chars:
+            return "heuristic summary: " + text[-self.max_chars :]
+        user_messages = [message for message in messages if message.get("role") == "user" and message.get("content")]
+        assistant_messages = [message for message in messages if message.get("role") == "assistant" and message.get("content")]
+        if not user_messages and not assistant_messages:
             return existing_summary
-        return "heuristic summary: " + text[-self.max_chars :]
+        parts: list[str] = []
+        if user_messages:
+            parts.append("用户: " + str(user_messages[0].get("content", ""))[:200])
+        if assistant_messages:
+            parts.append("助手: " + str(assistant_messages[-1].get("content", ""))[:200])
+        return " | ".join(parts)

@@ -4,7 +4,8 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY app ./app
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple .
+#RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple .
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .
 
 EXPOSE 8201
 

@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <title>N-Agent</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <aside class="sidebar" id="app-sidebar" aria-label="主导航">
+    <button class="sidebar__toggle" id="sidebar-toggle" type="button" aria-label="展开导航" aria-expanded="false">
+      <span class="sidebar__brand"><span class="sidebar__brand-icon">NA</span><span>N-Agent</span></span>
+      <span class="sidebar__toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+    </button>
+    <nav class="sidebar__nav" aria-label="N-Agent 导航">
+      <a class="sidebar__item" href="/summary" data-tab="summary">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">概览</span>
+      </a>
+      <a class="sidebar__item" href="/chat" data-tab="chat">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4V6Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">对话</span>
+      </a>
+      <a class="sidebar__item" href="/sessions" data-tab="sessions">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">会话</span>
+      </a>
+      <a class="sidebar__item" href="/tools" data-tab="tools">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M14.7 6.3a4 4 0 1 1-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 1 5.4-5.4l-2 2 2 2 2-2-2-2 2-2-2-2-2 2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">工具</span>
+      </a>
+      <a class="sidebar__item" href="/models" data-tab="models">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke-width="2"/><path d="M19 12c0 3.9-3.1 7-7 7s-7-3.1-7-7 3.1-7 7-7M19 5l-7 7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">模型</span>
+      </a>
+      <a class="sidebar__item" href="/status" data-tab="status">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 13h4l2-7 4 12 2-5h4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">健康</span>
+      </a>
+    </nav>
+  </aside>
+
+  <header class="topbar">
+    <span class="topbar__title" id="topbar-title">概览</span>
+    <span class="last-update" id="last-update"></span>
+  </header>
+
+  <main class="main-content">
+    <div class="tab-content" id="tab-summary">
+      <div class="stats-bar" id="summary-stats"></div>
+      <section class="status-panel">
+        <div class="panel-header"><span>功能入口</span><button class="btn" id="summary-refresh" type="button">刷新</button></div>
+        <div class="panel-body"><div class="summary-entries" id="summary-entries"></div></div>
+      </section>
+    </div>
+
+    <div class="tab-content" id="tab-chat">
+      <div class="chat-shell">
+        <section class="status-panel">
+          <div class="panel-header"><span>会话</span><button class="btn" id="chat-new" type="button">+ 新建</button></div>
+          <div class="panel-body"><div id="chat-session-list" class="session-list"></div></div>
+        </section>
+        <section class="chat-stack" aria-label="对话区">
+          <header class="panel-header">
+            <strong id="chat-header">N-Agent Chat</strong>
+            <span class="muted">Enter 发送 / Shift+Enter 换行</span>
+          </header>
+          <div class="chat-stack__messages" id="chat-messages" aria-live="polite">
+            <div class="message-stack" id="chat-message-stack"></div>
+          </div>
+          <div class="chat-stack__composer">
+            <textarea id="chat-input" placeholder="Message N-Agent..."></textarea>
+            <div class="chat-stack__send-row">
+              <button class="btn btn--primary" id="chat-send" type="button">Send</button>
+            </div>
+            <div class="chat-stack__hint">通过 /v1/chat/completions 发送，metadata.session_id 绑定会话。</div>
+          </div>
+        </section>
+        <section class="status-panel">
+          <div class="panel-header">调试信息</div>
+          <div class="panel-body">
+            <div class="debug-section"><h4>Session Summary</h4><pre id="chat-summary">暂未选择会话</pre></div>
+            <div class="debug-section"><h4>Task State</h4><div id="chat-task-state">暂未选择会话</div></div>
+            <div class="debug-section"><h4>Tool Calls</h4><div id="chat-tool-calls">暂未选择会话</div></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-sessions">
+      <section class="status-panel">
+        <div class="panel-header"><span>会话列表</span><button class="btn" id="sessions-refresh" type="button">刷新</button></div>
+        <div class="panel-body" id="sessions-list"></div>
+      </section>
+      <section class="status-panel">
+        <div class="panel-header">会话详情</div>
+        <div class="panel-body" id="sessions-detail">点击列表中的「查看」加载详情</div>
+      </section>
+    </div>
+
+    <div class="tab-content" id="tab-tools">
+      <section class="status-panel">
+        <div class="panel-header"><span>工具列表</span><button class="btn" id="tools-refresh" type="button">刷新</button></div>
+        <div class="panel-body" id="tools-list"></div>
+      </section>
+    </div>
+
+    <div class="tab-content" id="tab-models">
+      <section class="status-panel">
+        <div class="panel-header"><span>模型列表</span><button class="btn" id="models-refresh" type="button">刷新</button></div>
+        <div class="panel-body" id="models-list"></div>
+      </section>
+    </div>
+
+    <div class="tab-content" id="tab-status">
+      <div class="stats-bar" id="health-stats"></div>
+      <section class="status-panel">
+        <div class="panel-header"><span>依赖健康</span><button class="btn" id="health-refresh" type="button">刷新</button></div>
+        <div class="panel-body" id="health-detail"></div>
+      </section>
+    </div>
+  </main>
+
+  <script src="/static/management-ui.js"></script>
+  <script src="/static/management-api.js"></script>
+  <script src="/static/management-navigation.js"></script>
+  <script src="/static/summary.js"></script>
+  <script src="/static/chat.js"></script>
+  <script src="/static/sessions.js"></script>
+  <script src="/static/tools.js"></script>
+  <script src="/static/models.js"></script>
+  <script src="/static/health.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

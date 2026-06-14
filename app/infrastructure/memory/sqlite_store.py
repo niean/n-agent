@@ -94,6 +94,10 @@ class SQLiteMemoryStore:
             rows = conn.execute("SELECT * FROM sessions ORDER BY updated_at DESC").fetchall()
         return [ConversationSession(id=row["id"], title=row["title"], source=row["source"]) for row in rows]
 
+    async def update_session_title(self, session_id: str, title: str) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
+
     async def append_message(self, session_id: str, message: ConversationMessage) -> ConversationMessage:
         await self.create_session(ConversationSession(id=session_id))
         with self._connect() as conn:

@@ -15,6 +15,9 @@ class MemoryStore(Protocol):
     async def list_sessions(self) -> list[ConversationSession]:
         ...
 
+    async def update_session_title(self, session_id: str, title: str) -> None:
+        ...
+
     async def append_message(self, session_id: str, message: ConversationMessage) -> ConversationMessage:
         ...
 

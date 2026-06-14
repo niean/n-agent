@@ -170,7 +170,7 @@ class AgentGraphRunner:
                 state.session_id,
                 ConversationMessage(
                     role="tool",
-                    content=result,
+                    content=json.dumps(result),
                     tool_call_id=result.get("tool_call_id"),
                     name=result.get("name"),
                 ),
@@ -234,7 +234,10 @@ def llm_events_to_chat_events(events: AsyncIterator) -> AsyncIterator[ChatEvent]
 
 
 def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
-    data = {"role": message.role, "content": message.content}
+    content = message.content
+    if message.role == "tool" and not isinstance(content, str):
+        content = json.dumps(content)
+    data = {"role": message.role, "content": content}
     if message.tool_call_id:
         data["tool_call_id"] = message.tool_call_id
     if message.name:

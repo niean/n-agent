@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from app.application.agent_graph import AgentGraphRunner
 from app.application.chat_service import ChatCompletionService
 from app.application.model_service import ModelService
+from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.domain.provider import LLMResult, ModelInfo
 from app.domain.tool import ToolCallRequest, ToolResult, ToolResultStatus
@@ -71,7 +72,7 @@ def build_client(tmp_path, provider=None, tool_service=None):
         store,
         HeuristicSummarizer(),
     )
-    chat = ChatCompletionService(store, runner)
+    chat = ChatCompletionService(store, runner, SessionService(store))
     models = ModelService(provider, "test-model")
     from fastapi import FastAPI
 
@@ -89,20 +90,6 @@ def test_health_and_models(tmp_path):
     assert models["object"] == "list"
     assert models["data"][0]["id"] == "N-Agent"
     assert models["data"][0]["owned_by"] == "n-agent"
-
-
-def test_root_welcome_page(tmp_path):
-    client, _ = build_client(tmp_path)
-
-    response = client.get("/")
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/html")
-    assert "N-Agent" in response.text
-    assert "Chat" in response.text
-    assert "/chat" in response.text
-    assert "/dashboard" not in response.text
-    assert "/v1/chat/completions" in response.text
 
 
 def test_non_streaming_chat_completion_and_session_header(tmp_path):

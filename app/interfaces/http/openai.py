@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Header
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
@@ -40,40 +40,6 @@ class ChatCompletionRequest(BaseModel):
 
 def create_openai_router(chat_service: ChatCompletionService, model_service: ModelService) -> APIRouter:
     router = APIRouter()
-
-    @router.get("/", response_class=HTMLResponse)
-    async def welcome():
-        return """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>N-Agent</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background: #f6f7f9; color: #1f2937; }
-    main { max-width: 760px; margin: 12vh auto; padding: 32px; background: white; border-radius: 16px; box-shadow: 0 12px 32px rgba(0,0,0,.08); }
-    h1 { margin: 0 0 12px; font-size: 36px; }
-    p { line-height: 1.6; }
-    a { color: #1565c0; font-weight: 600; }
-    code { background: #f1f5f9; padding: 2px 6px; border-radius: 5px; }
-    ul { line-height: 2; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>N-Agent</h1>
-    <p>Welcome to N-Agent, an OpenAI-compatible local Agent service.</p>
-    <ul>
-      <li><a href="/chat">Chat</a></li>
-      <li><a href="/health">Health</a></li>
-      <li><a href="/v1/models">Models</a></li>
-      <li><code>POST /v1/chat/completions</code></li>
-    </ul>
-  </main>
-</body>
-</html>
-"""
 
     @router.get("/health")
     async def health():

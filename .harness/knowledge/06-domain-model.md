@@ -1,284 +1,132 @@
-<!-- SUMMARY: N-Agent 的 DDD 领域模型细化说明，包括子域划分、聚合实体、应用服务调用流和 SQLite Memory 数据关系 -->
-# DDD 领域模型
+<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界 -->
+# Agent 领域模型
 
-## Runtime
+N-Agent 是一款类似 Hermes 的 Agent Runtime。业务核心是接收对话请求，加载会话上下文，调用模型，按需执行工具，更新记忆，并返回同步或流式结果。
+
+## 子域划分
 
 ```text
 Agent Runtime
-│
-├── Loop
-│   ├── FSM
-│   ├── Scheduler
-│   └── Retry
-│
-├── Agent
-│   ├── LLM
-│   ├── Prompt
-│   ├── Reasoning
-│   └── Planning
-│
-├── Memory
-│   ├── Message
-│   ├── Session
-│   └── Long-term Memory
-│
-├── Action
-│   ├── Tool
-│   ├── Skill
-│   └── Workflow
-│
-└── Environment
-    ├── Sandbox
-    ├── Browser
-    ├── OS
-    ├── FileSystem
-    └── Network
+├── Loop：运行状态推进、工具调用回环、结束判断
+├── AgentCore：模型调用、上下文组织、推理结果承接
+├── Memory：消息、会话、工具调用记录、运行状态和摘要
+├── Action：把模型 tool_calls 转换为受控工具执行
+├── Policy：工具权限、风险等级、执行约束和安全决策
+└── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
-## Runtime 边界
-
-N-Agent 按 DDD 分层组织代码，Agent Runtime 位于 Application 层，依赖 Domain 定义的模型和值对象，通过端口使用 LLM、Memory、Tool 等外部能力。
+## 分层边界
 
 ```text
 Interfaces -> Application -> Domain
 Infrastructure -> Domain
 ```
 
-- Domain：定义 Agent、Session、Message、Tool、Provider、Memory 等领域模型、值对象和端口协议。
-- Application：承载 Agent Runtime、用例编排、Prompt 构建、ToolService 调度和会话流程控制。
-- Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具和配置加载。
-- Interfaces：实现 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
+- Domain：定义 Agent、Session、Message、Tool、Policy、Provider、Memory 等领域模型、值对象和端口协议。
+- Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
+- Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、N-KB 检索工具和配置加载。
+- Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
 
-Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或任何 Infrastructure 具体实现。LangGraph 是 Runtime Loop 的实现细节，只能出现在 Application 层。
+Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层的 Runtime Loop 实现细节。
 
-## Loop
-
-Loop 负责一次 Agent 运行的状态推进、步骤调度、工具调用回环和结束判断。当前实现由 `AgentGraphRunner` 使用 LangGraph 编排。
+## 核心业务流程
 
 ```text
-ChatCompletionService
-  ├── create ConversationSession
-  ├── append user ConversationMessage
-  └── create AgentState
-        |
-        v
-AgentGraphRunner
-  ├── load_context
-  |     ├── MemoryStore.list_messages(session_id)
-  |     └── MemoryStore.get_summary(session_id)
-  |
-  ├── call_llm
-  |     ├── LLMProvider.chat(...)
-  |     └── ToolService.list_openai_tools()
-  |
-  ├── execute_tools
-  |     ├── ToolService.execute(ToolCallRequest)
-  |     ├── ToolExecutor.execute(...)
-  |     └── MemoryStore.save_tool_call(ToolCall)
-  |
-  ├── update_memory
-  |     ├── MemoryStore.append_message(ConversationMessage)
-  |     ├── MemoryStore.save_task_state(TaskState)
-  |     ├── Summarizer.summarize(...)
-  |     └── MemoryStore.save_summary(Summary)
-  |
-  └── finalize
-        └── MemoryStore.save_task_state(TaskState)
+客户端请求
+  -> ChatCompletionService 创建/读取会话并写入用户消息
+  -> AgentGraphRunner 加载历史消息和摘要
+  -> LLMProvider 调用模型
+  -> ToolService 校验 Policy 并执行模型请求的工具
+  -> MemoryStore 写入助手消息、工具调用、任务状态和摘要
+  -> 返回 ChatCompletion 或 SSE 事件
 ```
 
-当前 Loop 的 DDD 对应关系：
-
-- Runtime State：`AgentState`
-- Entity：`AgentRun`
-- Value：`RunStatus`、`EndReason`
-- Application Service：`AgentGraphRunner`
-- Flow：`load_context -> call_llm -> execute_tools -> update_memory -> finalize`
-
-FSM、Scheduler、Retry 在当前 MVP 中处于基础形态：
-
-- FSM：由 LangGraph 节点和条件边表达运行状态流转。
-- Scheduler：当前以单次请求触发的同步/流式运行调度为主，尚未独立抽象后台任务调度器。
-- Retry：当前主要依赖 Provider、HTTP 和测试层的错误传播，不在 Domain 中建模统一重试策略。
-
-## Agent
-
-Agent 负责构造上下文、调用模型、接收模型输出、形成推理和计划的运行状态。当前 Agent 的持久状态与一次运行状态分离。
+当前 Runtime Loop 对应 LangGraph 节点：
 
 ```text
-AgentState
-  ├── session_id -> ConversationSession.id
-  ├── input_messages
-  ├── working_messages
-  ├── pending_tool_calls
-  ├── tool_results
-  ├── summary
-  ├── run_status
-  ├── iteration_count
-  ├── final_message
-  └── finish_reason
+load_context -> call_llm -> execute_tools -> update_memory -> finalize
 ```
 
-Agent 相关模型：
+## 关键领域模型
 
-- 运行状态：`AgentState`
-- 运行实体：`AgentRun`
-- LLM 端口：`LLMProvider`
-- LLM 值对象：`ModelInfo`、`LLMResult`、`LLMEvent`、`LLMEventType`
-- 应用服务：`ChatCompletionService`、`AgentGraphRunner`、`ModelService`
-- 基础设施实现：`OpenAICompatibleProvider`
+| 类型 | 模型 | 说明 |
+|------|------|------|
+| 聚合根 | ConversationSession | 会话主实体，串联消息、工具调用、任务状态和摘要 |
+| 运行状态 | AgentState | 单次 Agent 运行中的上下文、工具结果、状态和最终输出 |
+| 实体 | ConversationMessage | 用户、助手、工具消息 |
+| 实体 | ToolCall | 工具调用记录 |
+| 实体 | TaskState | 当前任务运行状态 |
+| 实体 | Summary | 会话摘要 |
+| 值对象 | RiskLevel | 工具或动作的风险等级 |
+| 值对象 | PermissionDecision | 工具或动作是否允许执行的判定结果 |
+| 端口 | LLMProvider | 屏蔽具体模型服务 |
+| 端口 | MemoryStore | 屏蔽 SQLite 等存储实现 |
+| 端口 | ToolExecutor | 屏蔽具体工具 handler |
+| 端口 | Summarizer | 屏蔽摘要生成策略 |
+| 端口 | TitleGenerator | 屏蔽会话标题生成策略，归属 Session 子域 |
 
-Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不进入 Domain。Reasoning 和 Planning 当前主要由模型能力、系统提示词和 Loop 中的工具回环共同驱动，尚未抽象为独立 Domain 聚合。
+Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 
-## Memory
-
-Memory 负责会话、消息、工具调用记录、任务状态和摘要的上下文保存与读取。当前持久化核心是 `ConversationSession`，`AgentState` 更像一次运行中的状态聚合，不作为 SQLite 聚合根直接保存。
+## Memory 业务关系
 
 ```text
 ConversationSession
-  ├── ConversationMessage  1:N
-  ├── ToolCall             1:N
-  ├── TaskState            1:0..1
-  └── Summary              1:0..1
+├── ConversationMessage  1:N
+├── ToolCall             1:N
+├── TaskState            1:0..1
+└── Summary              1:0..1
 ```
 
-Memory 相关模型：
+SQLite Memory 默认使用 `sessions.db`。业务上以 session 为中心保存对话上下文；`AgentState` 只表示单次运行状态，不作为 SQLite 聚合根直接持久化。
 
-- 聚合根：`ConversationSession`
-- 实体：`ConversationMessage`、`ToolCall`、`TaskState`、`Summary`
-- 领域端口：`MemoryStore`、`Summarizer`
-- 基础设施实现：`SQLiteMemoryStore`、`HeuristicSummarizer`
+Long-term Memory 当前由历史消息和 Summary 提供基础能力，后续可在 `MemoryStore` 端口下扩展。
 
-SQLite Memory 默认使用 `sessions.db`，以 session 为核心实体，围绕 session 持久化消息、工具调用、任务状态和摘要。
-
-```text
-sessions
-  ├── messages      1:N    对话消息
-  ├── tool_calls    1:N    工具调用记录
-  ├── task_states   1:0..1 Agent 运行状态
-  └── summaries     1:0..1 上下文摘要
-```
-
-当前 SQL 中显式声明的外键包括：
-
-```text
-messages.session_id -> sessions.id
-tool_calls.session_id -> sessions.id
-```
-
-逻辑关联但未声明外键的字段包括：
-
-```text
-task_states.session_id -> sessions.id
-summaries.session_id -> sessions.id
-tool_calls.message_id -> messages.id
-summaries.source_message_id -> messages.id
-```
-
-Long-term Memory 当前由 Summary 和历史消息提供基础能力，后续可在 `MemoryStore` 端口下扩展为更完整的长期记忆能力。
-
-## Action
-
-Action 负责把模型意图转换为可执行能力，并记录执行结果。当前应用内落地的是 Tool 能力，Skill 和 Workflow 属于 Harness 体系和后续 Agent Runtime 演进方向。
+## Action 业务关系
 
 ```text
 LLM tool_calls
-  └── ToolCallRequest
-        ├── ToolService.execute(...)
-        ├── ToolExecutor.execute(...)            # 端口
-        |     └── CompositeToolExecutor          # 按 tool name 路由
-        |           ├── BuiltinToolExecutor      # get_current_time / calculator / list_directory / read_text_file
-        |           └── KnowledgeToolExecutor    # search_knowledge -> KnowledgeSearchClient -> N-KB HTTP
-        ├── ToolResult
-        └── ToolCall persisted by MemoryStore
+  -> ToolCallRequest
+  -> Policy 判定
+  -> ToolService
+  -> ToolExecutor
+  -> ToolResult
+  -> ToolCall 持久化
 ```
 
-Action 相关模型：
+当前工具能力包括：
 
-- 实体：`ToolDefinition`、`ToolCallRequest`、`ToolCall`
-- 值对象：`RiskLevel`、`ToolResultStatus`、`PermissionDecision`、`ToolResult`
-- 领域端口：`ToolExecutor`
-- 应用服务：`ToolService`
-- 基础设施实现：`CompositeToolExecutor`（路由）、`BuiltinToolExecutor`（内置工具）、`KnowledgeToolExecutor` + `KnowledgeSearchClient`（N-KB 检索工具）
+- 内置工具：时间、计算、目录列表、文本读取。
+- 知识库工具：`search_knowledge`，通过 N-KB HTTP API 检索知识。
 
-当前 Tool Registry 暴露服务端 safe 工具 schema：内置工具集 + `search_knowledge`（按 `kb_enabled` 动态启用）。模型返回 tool_calls 后由 `ToolService` 统一调度，`CompositeToolExecutor` 按工具名分发到具体 Executor，结果写入 tool message 和 tool_calls 表。`KnowledgeToolExecutor` 通过 `httpx.AsyncClient` 调用 N-KB 的 `POST /retrieval/search`，所有异常归一为 generic ERROR 不向 LLM 泄露细节，详情仅入服务端 logger.warning。N-KB 不属于 N-Agent 领域，仅作为外部独立服务通过 HTTP 端口消费。
+N-KB 是外部独立服务，不属于 N-Agent 领域模型。N-Agent 只通过工具端口消费它。
 
-Skill 和 Workflow 不属于当前应用源码的 Domain 实体，当前主要存在于 `.harness/` 文档与执行框架中；后续若产品化为 Agent Runtime 能力，应保持与 Tool 相同的端口抽象和权限边界。
+## Policy 业务关系
 
-## Environment
+Policy 负责决定动作是否允许执行，避免把权限、安全和风险规则散落在 Tool handler 或 HTTP 接口里。
 
-Environment 负责承载 Runtime 与外部世界的交互边界，包括执行沙箱、浏览器、操作系统、文件系统和网络。
+当前 Policy 主要覆盖：
 
-当前 Environment 的落地状态：
+- 工具是否启用。
+- 工具风险等级：safe、confirm、dangerous。
+- 工具执行权限判定：允许、拒绝、拒绝原因。
+- 文件、网络等外部资源访问的安全约束。
 
-- Sandbox：当前主要由 Docker Compose、容器路径和 workspace 根目录约束提供运行边界。
-- Browser：当前没有独立浏览器自动化 Runtime，Dashboard 只作为 Interfaces 层的用户界面。
-- OS：当前不直接暴露通用 OS 执行能力，仅通过受控内置工具和容器运行环境间接接触。
-- FileSystem：当前由内置文件工具围绕 workspace 根目录提供路径安全访问。
-- Network：当前主要用于 OpenAI-compatible Provider 调用、N-KB 知识检索 HTTP 调用以及 FastAPI HTTP/SSE 服务。
+当前 MVP 以服务端 safe 工具为主；后续审批流、多 Agent、自动化任务和更完整的沙箱能力，都应优先扩展 Policy，而不是把规则写进具体工具实现。
 
-Environment 不应污染 Domain。所有外部资源访问都应通过 Infrastructure 实现端口，或由 Interfaces 层进行协议适配。
+## 外部边界
 
-## DDD 分类
+- Provider：只能通过 `LLMProvider` 端口访问，Runtime 不直接依赖具体 SDK。
+- Storage：只能通过 `MemoryStore` 和 `Summarizer` 端口访问，SQLite 属于 Infrastructure。
+- Tool：Application 层处理工具定义和执行编排，具体 handler 属于 Infrastructure。
+- Policy：工具启用状态、风险等级、权限判定和资源访问约束属于业务规则，不下沉到具体 handler。
+- FileSystem：文件工具必须围绕 workspace 根目录做路径安全约束。
+- Network：主要用于模型调用、N-KB 检索、FastAPI HTTP/SSE 服务。
 
-```text
-聚合根
-- ConversationSession
+## 快速判断规则
 
-运行状态
-- AgentState
-
-实体
-- ConversationMessage
-- ToolCall
-- TaskState
-- Summary
-- AgentRun
-- ToolDefinition
-- ToolCallRequest
-
-值对象
-- RunStatus
-- EndReason
-- RiskLevel
-- ToolResultStatus
-- PermissionDecision
-- ToolResult
-- ModelInfo
-- LLMResult
-- LLMEvent
-- LLMEventType
-
-领域端口
-- MemoryStore
-- Summarizer
-- LLMProvider
-- ToolExecutor
-
-应用服务
-- ChatCompletionService
-- AgentGraphRunner
-- ToolService
-- SessionService
-- ModelService
-
-基础设施实现
-- SQLiteMemoryStore
-- HeuristicSummarizer
-- OpenAICompatibleProvider
-- BuiltinToolExecutor
-- CompositeToolExecutor
-- KnowledgeToolExecutor
-- KnowledgeSearchClient
-```
-
-## 当前边界判断
-
-当前设计符合 DDD 的关键点：
-
-- Runtime 的 Loop、Agent、Memory 和 Action 编排位于 Application 层。
-- 领域模型位于 Domain 层，不被 FastAPI、LangGraph、SQLite 或 Provider SDK 污染。
-- Application 通过端口依赖 LLM、Memory、Tool 等能力。
-- Infrastructure 只负责实现端口和外部资源访问。
-- Interfaces 只做协议适配，不直接访问 SQLite 或执行工具。
-
-后续扩展多 Provider、长期 Memory、审批流、多 Agent、自动化任务、Skill/Workflow 产品化或更完整 Environment 能力时，应继续沿用端口抽象和外层依赖内层的方向。
+- 业务模型和值对象放 Domain。
+- 用例编排、Prompt、LangGraph Runtime 放 Application。
+- FastAPI、Dashboard、OpenAI-compatible 协议适配放 Interfaces。
+- SQLite、HTTP Client、具体工具 handler、Provider Adapter 放 Infrastructure。
+- 权限、风险等级和执行约束优先归 Policy。
+- 新增外部能力时先定义端口，再实现 Infrastructure Adapter。
