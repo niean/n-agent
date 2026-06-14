@@ -332,6 +332,18 @@
     }
   }
 
+  function bindDebugToggle() {
+    const panel = ui.byId('chat-debug-panel');
+    const toggle = ui.byId('chat-debug-toggle');
+    const shell = ui.byId('chat-shell');
+    if (!panel || !toggle) return;
+    toggle.addEventListener('click', () => {
+      const collapsed = panel.classList.toggle('collapsed');
+      if (shell) shell.classList.toggle('chat-shell--debug-collapsed', collapsed);
+      toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    });
+  }
+
   function init() {
     if (initialized) return;
     initialized = true;
@@ -341,6 +353,7 @@
     if (sendBtn) sendBtn.addEventListener('click', send);
     if (input) input.addEventListener('keydown', handleComposerKeydown);
     if (newBtn) newBtn.addEventListener('click', newSession);
+    bindDebugToggle();
     showEmptyState();
     updateInfo({});
     loadSessions();

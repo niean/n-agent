@@ -56,7 +56,7 @@
     </div>
 
     <div class="tab-content" id="tab-chat">
-      <div class="chat-shell">
+      <div class="chat-shell chat-shell--debug-collapsed" id="chat-shell">
         <section class="status-panel">
           <div class="panel-header"><span>会话</span><button class="btn" id="chat-new" type="button">+ 新建</button></div>
           <div class="panel-body"><div id="chat-session-list" class="session-list"></div></div>
@@ -77,9 +77,12 @@
             <div class="chat-stack__hint">通过 /v1/chat/completions 发送，metadata.session_id 绑定会话。</div>
           </div>
         </section>
-        <section class="status-panel">
-          <div class="panel-header">调试信息</div>
-          <div class="panel-body">
+        <section class="status-panel status-panel--collapsible chat-debug-panel collapsed" id="chat-debug-panel">
+          <button class="panel-header" type="button" id="chat-debug-toggle" aria-expanded="false" aria-controls="chat-debug-body">
+            <span>调试信息</span>
+            <span class="panel-header__chevron" aria-hidden="true">▶</span>
+          </button>
+          <div class="panel-body" id="chat-debug-body">
             <div class="debug-section"><h4>Session Summary</h4><pre id="chat-summary">暂未选择会话</pre></div>
             <div class="debug-section"><h4>Task State</h4><div id="chat-task-state">暂未选择会话</div></div>
             <div class="debug-section"><h4>Tool Calls</h4><div id="chat-tool-calls">暂未选择会话</div></div>

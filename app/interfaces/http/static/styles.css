@@ -129,6 +129,7 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 
 /* Chat tab */
 .chat-shell { display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 2fr) minmax(280px, 0.9fr); gap: 16px; align-items: start; }
+.chat-shell.chat-shell--debug-collapsed { grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 5fr) 40px; }
 .chat-stack { display: flex; flex-direction: column; height: calc(100vh - 110px); background: var(--color-bg-white); border: 1px solid var(--color-border-muted); border-radius: var(--radius-md); box-shadow: var(--shadow-card); overflow: hidden; }
 .chat-stack__messages { flex: 1; overflow-y: auto; padding: 16px; }
 .chat-stack__composer { padding: 12px; border-top: 1px solid var(--color-border-muted); background: var(--color-bg-subtle); }
@@ -156,6 +157,14 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .session-item__input { flex: 1; padding: 4px 6px; background: var(--color-bg-default); border: 1px solid var(--color-border-default); border-radius: 6px; color: var(--color-fg-default); font: inherit; }
 .debug-section { margin-bottom: 14px; }
 .debug-section h4 { margin-bottom: 6px; color: var(--color-fg-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+.status-panel--collapsible > .panel-header { width: 100%; cursor: pointer; background: transparent; border: 0; color: inherit; font: inherit; text-align: left; }
+.status-panel--collapsible > .panel-header:hover { color: var(--color-primary-strong); }
+.panel-header__chevron { transition: transform 0.15s ease; }
+.status-panel.collapsed > .panel-body { display: none; }
+.status-panel.collapsed .panel-header__chevron { transform: rotate(180deg); }
+.chat-debug-panel.collapsed { writing-mode: vertical-rl; }
+.chat-debug-panel.collapsed > .panel-header { padding: 12px 8px; justify-content: flex-start; gap: 12px; }
+.chat-debug-panel.collapsed .panel-header__chevron { writing-mode: horizontal-tb; }
 .status-badge { display: inline-block; padding: 3px 8px; border-radius: var(--radius-pill); font-size: 11px; }
 .status-badge.running { color: #0369a1; background: #e0f2fe; }
 .status-badge.completed { color: var(--color-success-fg); background: var(--color-success-bg); }
