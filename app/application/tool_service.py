@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from app.domain.tool import RiskLevel, ToolCallRequest, ToolDefinition, ToolExecutor, ToolResult, ToolResultStatus
+from app.domain.tool import RiskLevel, ToolCallRequest, ToolDefinition, ToolExecutor, ToolResult, ToolResultStatus, ToolSourceType
 
 
 class ToolService:
@@ -52,6 +52,8 @@ def knowledge_tool_definitions(enabled: bool = True) -> list[ToolDefinition]:
                 "additionalProperties": False,
             },
             enabled=enabled,
+            source_type=ToolSourceType.KNOWLEDGE,
+            toolset="knowledge",
         )
     ]
 
@@ -62,6 +64,8 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             name="get_current_time",
             description="Get the current UTC time.",
             input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            source_type=ToolSourceType.BUILTIN,
+            toolset="system",
         ),
         ToolDefinition(
             name="calculator",
@@ -72,6 +76,8 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "required": ["expression"],
                 "additionalProperties": False,
             },
+            source_type=ToolSourceType.BUILTIN,
+            toolset="math",
         ),
         ToolDefinition(
             name="list_directory",
@@ -82,6 +88,8 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "required": ["path"],
                 "additionalProperties": False,
             },
+            source_type=ToolSourceType.BUILTIN,
+            toolset="file",
         ),
         ToolDefinition(
             name="read_text_file",
@@ -92,5 +100,7 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
                 "required": ["path"],
                 "additionalProperties": False,
             },
+            source_type=ToolSourceType.BUILTIN,
+            toolset="file",
         ),
     ]

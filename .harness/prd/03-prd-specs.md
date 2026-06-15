@@ -41,6 +41,9 @@
 - FR
     - 模型：Active状态使用绿色对号图标
     - 模型：新增、修改模型，改为弹出框页面
+    - 工具：[KF]Tool完善抽象，除运行时外的其它能力
+    - 工具：工具列表，Schema查看改为弹出框
+    - 工具：[KF]新增MCP站点，前端系管理页面，后端按照DDD分层实现
 
 
 ---
@@ -53,7 +56,13 @@
     - 定时任务
     - 治理：IAM，安全护栏
     - 交互：飞书IM接入
-
+    - 工具：相比Hermes，还缺少如下功能
+        不连接 MCP server，不做 mcp_{server}_{tool} 动态发现。
+        不实现 Skill 目录扫描、skills_list、skill_view。
+        不实现 plugin system。
+        不实现 toolset enable/disable 组合解析。
+        不实现 agent-loop 特殊工具，比如 delegate_task、memory、todo。
+        不实现 pre/post tool hook。
 
 ---
 

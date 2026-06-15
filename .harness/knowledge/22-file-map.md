@@ -12,7 +12,7 @@
 
 - Agent 运行模型：`app/domain/agent.py`，定义 `AgentRun`、`AgentState`、`RunStatus`、`EndReason`
 - 会话与消息模型：`app/domain/session.py`，定义 `ConversationSession`（`has_default_title` 领域行为、`DEFAULT_SESSION_TITLE` 常量）、`ConversationMessage`、`ToolCall`、`TaskState`、`Summary`、`TitleGenerator` 端口、`SessionNotFoundError`、`SessionValidationError`
-- 工具领域模型：`app/domain/tool.py`，定义 `RiskLevel`、`ToolDefinition`、`ToolCallRequest`、`ToolResult`、`ToolExecutor`
+- 工具领域模型：`app/domain/tool.py`，定义 `RiskLevel`、`ToolSourceType`、`ToolDefinition`、`ToolCallRequest`、`ToolResult`、`ToolExecutor`
 - Provider 领域模型：`app/domain/provider.py`，定义 `ModelInfo`、`LLMEvent`、`LLMResult`、`LLMProvider`、`ProviderConfig`、`ProviderRegistry` 端口及 `ProviderNotFoundError`/`DuplicateProviderError`/`ProviderInUseError`/`ProviderValidationError`
 - Memory 端口：`app/domain/memory.py`，定义 `MemoryStore`、`Summarizer`
 
@@ -47,7 +47,7 @@
 - Dashboard 样式：`app/interfaces/http/static/styles.css`，Design Token + Sidebar/Topbar/Tab/卡片/表格/状态/消息气泡/概览入口卡片 全量样式
 - Dashboard favicon：`app/interfaces/http/static/favicon.svg`，蓝底圆角矩形 + NA monogram
 - Dashboard 共享模块：`app/interfaces/http/static/management-ui.js`（NAGENT.ui DOM helper）、`management-api.js`（NAGENT.api HTTP 封装，提供 listModels 调 `/v1/models`、getAdminModels 调 `/chat/models`，及 listProviders/createProvider/updateProvider/deleteProvider/activateProvider 操作 `/chat/providers*`）、`management-navigation.js`（NAGENT.navigation sidebar 折叠 + pathname 路径路由 + tab 切换 via history.pushState/popstate）
-- Dashboard tab 模块：`app/interfaces/http/static/summary.js`（概览 stats-bar + 入口卡片）、`chat.js`（对话 + SSE 流式 + 会话/调试面板）、`sessions.js`（会话表格 + 详情）、`tools.js`（工具只读表格）、`models.js`（Provider 管理 CRUD + activate + 当前 active provider 真实模型只读列表，调用 `/chat/providers*` 与 `/chat/models`，全 textContent 渲染）、`health.js`（依赖健康 stats-bar + 行项，模块名 NAGENT.status）
+- Dashboard tab 模块：`app/interfaces/http/static/summary.js`（概览 stats-bar + 入口卡片）、`chat.js`（对话 + SSE 流式 + 会话/调试面板）、`sessions.js`（会话表格 + 详情）、`tools.js`（工具只读表格，展示名称、source_type、toolset、风险等级、启用状态和 schema）、`models.js`（Provider 管理 CRUD + activate + 当前 active provider 真实模型只读列表，调用 `/chat/providers*` 与 `/chat/models`，全 textContent 渲染）、`health.js`（依赖健康 stats-bar + 行项，模块名 NAGENT.status）
 - Dashboard 启动入口：`app/interfaces/http/static/app.js`，绑定 NAGENT.app.onTabActivated 调度，调用 NAGENT.navigation.initNavigation
 
 ## Docker 与部署

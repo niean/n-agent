@@ -295,6 +295,8 @@ def _tool_call_to_dict(tool_call: ToolCall) -> dict:
 def _tool_definition_to_dict(definition: ToolDefinition) -> dict:
     return {
         "name": definition.name,
+        "source_type": definition.source_type.value,
+        "toolset": definition.toolset,
         "description": definition.description,
         "risk_level": definition.risk_level.value,
         "enabled": definition.enabled,

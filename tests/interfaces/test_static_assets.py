@@ -102,6 +102,11 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'deleteProvider' in api_js
     assert 'renameSession' in api_js
     assert 'deleteSession' in api_js
+    tools_js = client.get('/static/tools.js').text
+    assert "'类型'" in tools_js
+    assert "'分组'" in tools_js
+    assert 'tool.source_type' in tools_js
+    assert 'tool.toolset' in tools_js
     models_js = client.get('/static/models.js').text
     assert '/chat/models' in models_js or 'getAdminModels' in models_js
     assert '/v1/models' not in models_js

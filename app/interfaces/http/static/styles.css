@@ -188,3 +188,6 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .providers-form__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .providers-form__hint { font-size: 12px; }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.tools-schema-content { padding: 20px; }
+.tools-schema-content h4 { margin: 0; }
+.tools-schema-content pre { max-height: min(620px, calc(100vh - 150px)); }

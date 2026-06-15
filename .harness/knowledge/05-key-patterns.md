@@ -83,9 +83,10 @@ Agent Runtime 只依赖 LLMProvider 端口，不直接依赖具体 Provider SDK�
 Agent 实际可执行工具只来自服务端 Tool Registry。客户端传入 tools 不代表服务端必须执行。
 
 规则：
-- ToolDefinition 是领域值对象，包含 name、description、input_schema、risk_level、permissions、timeout_seconds、enabled，不包含具体 handler。
+- ToolDefinition 是领域值对象，包含 name、description、input_schema、risk_level、permissions、timeout_seconds、enabled、source_type、toolset，不包含具体 handler。
+- source_type 表示工具来源大类，当前已使用 builtin、knowledge，并预留 skill、mcp、plugin、agent；toolset 表示能力分组，参考 Hermes 的工具集概念，用于展示和后续按组治理。
 - 工具 handler 属于 Infrastructure，通过 Application 层 ToolService 绑定执行。
-- 多个工具 handler 通过 Infrastructure 的组合 executor 按工具名路由；ToolService 只处理定义、风险等级和 enabled 语义。
+- 多个工具 handler 通过 Infrastructure 的组合 executor 按工具名路由；ToolService 只处理定义、风险等级、enabled 和 OpenAI schema 暴露语义。
 - 风险等级至少包含 safe、confirm、dangerous。
 - safe 默认允许执行；confirm 在 MVP 默认拒绝自动执行并返回 permission_denied；dangerous 默认不暴露给 LLM。
 - 文件类工具必须限制在配置 workspace 根目录内，拒绝路径穿越和软链接逃逸。

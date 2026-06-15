@@ -117,6 +117,8 @@ def test_chat_tools_endpoint_returns_definitions(tmp_path):
     names = [item["name"] for item in payload]
     assert "get_current_time" in names
     sample = next(item for item in payload if item["name"] == "calculator")
+    assert sample["source_type"] == "builtin"
+    assert sample["toolset"] == "math"
     assert "description" in sample and "risk_level" in sample
     assert "enabled" in sample and "input_schema" in sample
 

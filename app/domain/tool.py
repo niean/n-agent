@@ -11,6 +11,15 @@ class RiskLevel(str, Enum):
     DANGEROUS = "dangerous"
 
 
+class ToolSourceType(str, Enum):
+    BUILTIN = "builtin"
+    KNOWLEDGE = "knowledge"
+    SKILL = "skill"
+    MCP = "mcp"
+    PLUGIN = "plugin"
+    AGENT = "agent"
+
+
 class ToolResultStatus(str, Enum):
     SUCCESS = "success"
     ERROR = "error"
@@ -33,6 +42,8 @@ class ToolDefinition:
     permissions: tuple[str, ...] = ()
     timeout_seconds: int = 10
     enabled: bool = True
+    source_type: ToolSourceType = ToolSourceType.BUILTIN
+    toolset: str = "builtin"
 
 
 @dataclass(frozen=True)

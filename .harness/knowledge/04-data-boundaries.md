@@ -29,7 +29,7 @@
 
 `LLMEvent`（`app/domain/provider.py`）：流式模型事件，类型包括 message_start、content_delta、tool_call_delta、message_done、error。
 
-`ToolDefinition`（`app/domain/tool.py`）：工具定义值对象，字段包括 name、description、input_schema、risk_level、permissions、timeout_seconds、enabled，不包含 handler。
+`ToolDefinition`（`app/domain/tool.py`）：工具定义值对象，字段包括 name、description、input_schema、risk_level、permissions、timeout_seconds、enabled、source_type、toolset，不包含 handler。source_type 表示工具来源（builtin、knowledge、skill、mcp、plugin、agent），toolset 表示能力分组；执行风险仍由 risk_level 表达，不能与来源混用。
 
 `ToolCallRequest`（`app/domain/tool.py`）：工具执行请求，字段包括 id、name、arguments。
 
