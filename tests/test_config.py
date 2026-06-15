@@ -37,6 +37,40 @@ def test_settings_has_kb_defaults(tmp_path: Path):
     assert settings.kb_timeout_seconds == 10
 
 
+def test_settings_has_gateway_and_feishu_defaults(tmp_path: Path):
+    settings = Settings(
+        provider_base_url="https://example.test/v1",
+        provider_api_key="test-key",
+        provider_model="test-model",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+
+    assert settings.gateway_enabled is True
+    assert settings.feishu_enabled is False
+    assert settings.feishu_app_id == ""
+    assert settings.feishu_app_secret == ""
+    assert settings.feishu_tenant_key == ""
+    assert settings.feishu_allowed_open_ids == []
+    assert settings.feishu_allowed_chat_ids == []
+
+
+def test_settings_parses_feishu_allowlists(tmp_path: Path):
+    settings = Settings(
+        provider_base_url="https://example.test/v1",
+        provider_api_key="test-key",
+        provider_model="test-model",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        feishu_allowed_open_ids="ou_1, ou_2",
+        feishu_allowed_chat_ids="oc_1,oc_2",
+    )
+
+    assert settings.feishu_allowed_open_ids == ["ou_1", "ou_2"]
+    assert settings.feishu_allowed_chat_ids == ["oc_1", "oc_2"]
+
+
 @pytest.mark.parametrize("top_k", [0, 51])
 def test_settings_validates_kb_default_top_k_range(tmp_path: Path, top_k: int):
     with pytest.raises(ValidationError):

@@ -1,0 +1,111 @@
+import json
+
+from app.domain.gateway import InteractionMessage, InteractionResponse
+from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
+
+
+class FakeFeishuClient:
+    def __init__(self, payload=None):
+        self.payload = payload
+        self.sent: list[tuple[str, str]] = []
+        self.events = []
+
+    def verify_long_connection_event(self, payload):
+        self.events.append(payload)
+        return self.payload or payload
+
+    async def send_text(self, receive_id, text):
+        self.sent.append((receive_id, text))
+
+    async def listen_events(self, handler):
+        await handler(self.payload)
+
+
+class FakeGatewayService:
+    def __init__(self, duplicate=False):
+        self.events: list[InteractionMessage] = []
+        self.duplicate = duplicate
+
+    async def handle_message(self, event):
+        self.events.append(event)
+        if self.duplicate:
+            return InteractionResponse(session_id="", messages=[], metadata={"duplicate": True})
+        from app.domain.gateway import GatewayOutboundMessage
+
+        return InteractionResponse(session_id="s1", messages=[GatewayOutboundMessage("reply")])
+
+
+def text_payload(text="hello", chat_type="p2p"):
+    return {
+        "schema": "2.0",
+        "header": {"event_id": "event-1", "app_id": "app-1"},
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_1"}, "sender_type": "user"},
+            "message": {
+                "message_id": "msg-1",
+                "chat_id": "oc_1",
+                "chat_type": chat_type,
+                "message_type": "text",
+                "content": json.dumps({"text": text}),
+            },
+        },
+    }
+
+
+async def test_long_connection_start_listens_and_handles_event():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(text_payload("hello"))
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.start()
+
+    assert gateway.events[0].text == "hello"
+    assert client.sent == [("oc_1", "reply")]
+
+
+async def test_long_connection_non_text_message_returns_unsupported_without_gateway_call():
+    payload = text_payload()
+    payload["event"]["message"]["message_type"] = "image"
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(payload)
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event(payload)
+
+    assert gateway.events == []
+    assert client.sent == [("oc_1", "不支持该消息类型")]
+
+
+async def test_long_connection_group_message_without_mention_is_ignored():
+    payload = text_payload(chat_type="group")
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(payload)
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event(payload)
+
+    assert gateway.events == []
+    assert client.sent == []
+
+
+async def test_long_connection_text_message_calls_gateway_and_replies():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(text_payload("<at user_id=\"bot\">bot</at> hello", chat_type="group"))
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events[0].text.endswith("hello")
+    assert gateway.events[0].metadata["message_id"] == "msg-1"
+    assert client.sent == [("oc_1", "reply")]
+
+
+async def test_long_connection_duplicate_gateway_response_does_not_send_reply():
+    gateway = FakeGatewayService(duplicate=True)
+    client = FakeFeishuClient(text_payload("hello"))
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert len(gateway.events) == 1
+    assert client.sent == []

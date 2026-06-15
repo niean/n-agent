@@ -19,6 +19,10 @@
 
 `Summary`（`app/domain/session.py`）：摘要记录，字段包括 session_id、summary、source_message_id、updated_at。
 
+`GatewaySessionKey` / `InteractionMessage` / `GatewayOutboundMessage` / `InteractionResponse`（`app/domain/gateway.py`）：交互入口标准化模型，用于把 CLI、飞书等平台消息转换为 Application 层可处理的统一事件和回复；不包含 FastAPI、飞书 SDK 或传输对象。
+
+`GatewaySessionLink`（`app/domain/gateway.py`）：外部 conversation 与内部 session 的映射记录，字段包括 conversation_id、session_id、display_name、created_at、updated_at、id。
+
 ## Provider 与工具模型
 
 `ModelInfo`（`app/domain/provider.py`）：模型能力描述，字段包括 id、display_name、provider、supports_tools、supports_streaming。
@@ -47,6 +51,8 @@
 
 `MemoryStore`（`app/domain/memory.py`）：定义 session、message、tool_call、task_state、summary 的读写接口。Infrastructure 的 SQLiteMemoryStore 实现该端口。
 
+`GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射和飞书事件幂等。
+
 `Summarizer`（`app/domain/memory.py`）：定义摘要生成接口。MVP 默认 HeuristicSummarizer 实现。
 
 `ToolExecutor`（`app/domain/tool.py`）：定义工具执行接口。Infrastructure 的 BuiltinToolExecutor 实现具体 handler。
@@ -66,6 +72,13 @@
 - kb_default_top_k
 - kb_default_min_score
 - kb_timeout_seconds
+- gateway_enabled
+- feishu_enabled
+- feishu_app_id
+- feishu_app_secret
+- feishu_tenant_key
+- feishu_allowed_open_ids
+- feishu_allowed_chat_ids
 
 Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPOSE_PROJECT_NAME`。
 
@@ -80,6 +93,9 @@ tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, s
 task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
 providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_headers_json, is_active, created_at, updated_at)
+gateway_conversations(id, source_type, source_id, thread_id, display_name, active_session_id, created_at, updated_at)
+gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
+gateway_processed_events(id, source_type, event_id, message_id, created_at)
 ```
 
 providers 表唯一索引：
@@ -104,7 +120,7 @@ JSON 边界：
 - `tool_calls.result_json` 存储工具结果
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
 
-会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序 DELETE messages → tool_calls → task_states → summaries → sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。
+会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。
 
 ## OpenAI-compatible 协议边界
 

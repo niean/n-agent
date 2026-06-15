@@ -95,6 +95,22 @@ def test_chat_page_and_apis(tmp_path):
     assert tool_calls.json()[0]["tool_name"] == "calculator"
 
 
+def test_chat_sessions_includes_feishu_gateway_sessions(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+
+    async def seed():
+        await store.create_session(ConversationSession(id="feishu-session", title="飞书会话", source="feishu"))
+
+    asyncio.run(seed())
+    client = TestClient(_build_app(store))
+
+    response = client.get("/chat/sessions")
+
+    assert response.status_code == 200
+    assert {item["id"]: item["source"] for item in response.json()}["feishu-session"] == "feishu"
+
+
 def test_chat_can_create_session(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     client = TestClient(_build_app(store))

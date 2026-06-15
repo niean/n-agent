@@ -2,9 +2,11 @@ import sqlite3
 
 import pytest
 
+from app.domain.gateway import GatewaySessionKey, InteractionSourceType
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
 
 
 @pytest.mark.asyncio
@@ -16,7 +18,16 @@ async def test_sqlite_store_initializes_schema_and_indexes(tmp_path):
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
 
-    assert {"sessions", "messages", "tool_calls", "task_states", "summaries"}.issubset(tables)
+    assert {
+        "sessions",
+        "messages",
+        "tool_calls",
+        "task_states",
+        "summaries",
+        "gateway_conversations",
+        "gateway_session_links",
+        "gateway_processed_events",
+    }.issubset(tables)
     assert "idx_messages_session_created_at" in indexes
     assert "idx_tool_calls_session_created_at" in indexes
 
@@ -83,9 +94,13 @@ async def test_heuristic_summarizer_returns_existing_for_empty_messages():
 
 @pytest.mark.asyncio
 async def test_delete_session_cascades_related_rows(tmp_path):
-    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    db_path = tmp_path / "sessions.db"
+    store = SQLiteMemoryStore(db_path)
+    gateway_registry = SQLiteGatewaySessionRegistry(db_path)
     await store.create_session(ConversationSession(id="s-del"))
     msg = await store.append_message("s-del", ConversationMessage(role="user", content="hi"))
+    key = GatewaySessionKey(InteractionSourceType.CLI, "local")
+    await gateway_registry.create_session_link(key, "s-del")
     await store.save_tool_call(
         ToolCall(id="tc-del", session_id="s-del", message_id=msg.id, tool_name="calc", arguments={}, status="success")
     )
@@ -100,6 +115,8 @@ async def test_delete_session_cascades_related_rows(tmp_path):
     assert await store.list_tool_calls("s-del") == []
     assert await store.get_task_state("s-del") is None
     assert await store.get_summary("s-del") is None
+    assert await gateway_registry.get_active_session(key) is None
+    assert await gateway_registry.list_session_links(key) == []
 
 
 @pytest.mark.asyncio

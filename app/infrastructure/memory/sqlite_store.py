@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
+from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
 
 
 class SQLiteMemoryStore:
@@ -79,6 +80,7 @@ class SQLiteMemoryStore:
                     ON providers(is_active) WHERE is_active = 1;
                 """
             )
+            _initialize_gateway_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -242,6 +244,8 @@ class SQLiteMemoryStore:
 
     async def delete_session(self, session_id: str) -> bool:
         with self._connect() as conn:
+            conn.execute("DELETE FROM gateway_session_links WHERE session_id = ?", (session_id,))
+            conn.execute("UPDATE gateway_conversations SET active_session_id = NULL WHERE active_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM task_states WHERE session_id = ?", (session_id,))

@@ -2,6 +2,7 @@ from dataclasses import fields
 
 from app.domain.agent import AgentState
 from app.domain.provider import ModelInfo
+from app.domain.gateway import GatewayOutboundMessage, GatewaySessionKey, InteractionMessage, InteractionSourceType
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 
 
@@ -57,3 +58,26 @@ def test_model_info_describes_capabilities():
 
     assert model.supports_tools is True
     assert model.supports_streaming is False
+
+
+def test_gateway_session_key_normalizes_thread_id():
+    key = GatewaySessionKey(InteractionSourceType.FEISHU, "chat-1")
+
+    assert key.thread_id == ""
+    assert key.conversation_parts == ("feishu", "chat-1", "")
+
+
+def test_interaction_message_defaults_metadata():
+    message = InteractionMessage(
+        id="event-1",
+        session_key=GatewaySessionKey(InteractionSourceType.CLI, "local"),
+        text="hello",
+    )
+
+    assert message.metadata == {}
+
+
+def test_gateway_outbound_message_defaults_metadata():
+    message = GatewayOutboundMessage(content="done")
+
+    assert message.metadata == {}
