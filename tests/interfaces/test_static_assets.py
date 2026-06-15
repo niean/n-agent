@@ -148,6 +148,48 @@ def test_models_page_renders_provider_admin_controls(tmp_path):
     assert 'id="providers-new"' in html
 
 
+def test_chat_debug_panel_is_collapsed_by_default(tmp_path):
+    client = _client(tmp_path)
+    html = client.get('/chat').text
+    assert 'chat-shell chat-shell--debug-collapsed' in html
+    assert 'status-panel status-panel--collapsible chat-debug-panel collapsed' in html
+    assert 'id="chat-debug-toggle" aria-expanded="false" aria-controls="chat-debug-body"' in html
+
+
+def test_tool_messages_are_collapsed_by_default(tmp_path):
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    assert "message.role === 'tool'" in chat_js
+    assert "document.createElement('details')" in chat_js
+    assert "document.createElement('summary')" in chat_js
+    assert "工具调用调试信息" in chat_js
+
+
+def test_tool_debug_json_strings_are_formatted(tmp_path):
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    assert 'function formatDebugJson(value)' in chat_js
+    assert 'JSON.parse(value)' in chat_js
+    assert 'JSON.stringify(parsed, null, 2)' in chat_js
+    assert 'appendDebugJson(content, message.content || \'\')' in chat_js
+
+
+def test_current_session_refresh_renders_persisted_messages(tmp_path):
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    refresh_start = chat_js.index('async function refreshCurrentSession()')
+    refresh_end = chat_js.index('async function send()', refresh_start)
+    refresh_body = chat_js[refresh_start:refresh_end]
+    assert 'renderSessionMessages(detail)' in refresh_body
+
+
+def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    assert 'grid-template-columns: 280px minmax(360px, 2fr) minmax(280px, 0.9fr)' in css
+    assert 'grid-template-columns: 280px minmax(360px, 5fr) 40px' in css
+
+
 def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',

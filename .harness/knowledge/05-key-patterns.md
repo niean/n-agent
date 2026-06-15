@@ -116,8 +116,9 @@ N-KB 是独立知识服务，N-Agent 只通过 `search_knowledge` safe tool 消�
 - Application 通过端口读写上下文和摘要。
 - SQLite 是 Infrastructure 实现，不能泄漏到 Application 用例和 Interfaces。
 - 摘要策略先简单可替换，后续可升级为模型驱动压缩、session search 和长期 Memory。
+- AgentGraph 中用于跨节点传递的一次性状态（如 tool_results）在写入 MemoryStore 后必须清空，避免后续节点循环重复持久化同一运行事件。
 
-陷阱：直接在 LangGraph 节点或 FastAPI handler 中写 SQLite 查询，会让存储实现侵入运行编排和协议层。
+陷阱：直接在 LangGraph 节点或 FastAPI handler 中写 SQLite 查询，会让存储实现侵入运行编排和协议层；临时运行状态不清空会造成 Dashboard 会话历史重复展示。
 
 ## 模式八：System Prompt 属于 Application Runtime 上下文
 

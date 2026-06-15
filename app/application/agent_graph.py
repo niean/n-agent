@@ -180,6 +180,7 @@ class AgentGraphRunner:
                     name=result.get("name"),
                 ),
             )
+        state.tool_results = []
         await self.memory_store.save_task_state(
             TaskState(
                 session_id=state.session_id,

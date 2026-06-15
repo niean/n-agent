@@ -266,7 +266,7 @@ async def test_agent_graph_persists_tool_message_content_as_string(tmp_path):
 
     persisted = await store.list_messages("s1")
     tool_messages = [message for message in persisted if message.role == "tool"]
-    assert tool_messages, "tool message must be persisted"
+    assert len(tool_messages) == 1
     assert all(isinstance(message.content, str) for message in tool_messages)
 
 

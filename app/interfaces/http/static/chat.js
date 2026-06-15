@@ -11,6 +11,20 @@
     parent.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   }
 
+  function formatDebugJson(value) {
+    if (typeof value !== 'string') return JSON.stringify(value, null, 2);
+    try {
+      const parsed = JSON.parse(value);
+      return JSON.stringify(parsed, null, 2);
+    } catch (error) {
+      return value;
+    }
+  }
+
+  function appendDebugJson(parent, value) {
+    parent.textContent = formatDebugJson(value);
+  }
+
   function clearNode(node) { ui.clear(node); }
 
   function setSending(next) {
@@ -53,6 +67,16 @@
   function createMessageElement(message) {
     const el = document.createElement('div');
     el.className = `msg ${message.role || 'assistant'}`;
+    if (message.role === 'tool') {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      const content = document.createElement('pre');
+      summary.textContent = '工具调用调试信息';
+      appendDebugJson(content, message.content || '');
+      details.append(summary, content);
+      el.appendChild(details);
+      return el;
+    }
     appendText(el, message.content || '');
     return el;
   }
@@ -66,6 +90,15 @@
     stack.appendChild(el);
     scrollToBottom();
     return el;
+  }
+
+  function renderSessionMessages(detail) {
+    const stack = ui.byId('chat-message-stack');
+    if (!stack) return;
+    clearNode(stack);
+    const messages = detail.messages || [];
+    if (!messages.length) showEmptyState();
+    messages.forEach((message) => stack.appendChild(createMessageElement(message)));
   }
 
   async function loadSessions() {
@@ -176,13 +209,7 @@
     setHeader(id);
     try {
       const detail = await api.getSessionDetail(id);
-      const stack = ui.byId('chat-message-stack');
-      if (stack) {
-        clearNode(stack);
-        const messages = detail.messages || [];
-        if (!messages.length) showEmptyState();
-        messages.forEach((message) => stack.appendChild(createMessageElement(message)));
-      }
+      renderSessionMessages(detail);
       updateInfo(detail);
       await loadSessions();
       scrollToBottom();
@@ -251,7 +278,7 @@
       calls.forEach((call) => {
         const el = document.createElement('div');
         el.className = 'tool-call';
-        appendText(el, `${call.tool_name}: ${JSON.stringify(call.arguments)} → ${call.status} (${call.duration_ms}ms)`);
+        appendText(el, `${call.tool_name} → ${call.status} (${call.duration_ms}ms)\n${formatDebugJson(call.arguments)}`);
         target.appendChild(el);
       });
     } catch (error) {
@@ -270,6 +297,7 @@
     if (!currentSessionId) return;
     try {
       const detail = await api.getSessionDetail(currentSessionId);
+      renderSessionMessages(detail);
       updateInfo(detail);
       await loadSessions();
     } catch (error) {
