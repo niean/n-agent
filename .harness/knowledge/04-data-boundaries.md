@@ -37,6 +37,8 @@
 
 `ToolCallRequest`（`app/domain/tool.py`）：工具执行请求，字段包括 id、name、arguments。
 
+`ToolExecutionContext`（`app/domain/tool.py`）：单轮工具执行上下文，当前用于服务端从本轮用户消息推导 confirm 工具授权；不来自客户端 metadata、模型输出或工具参数本身，不持久化、不跨轮复用。
+
 `ToolResultStatus`（`app/domain/tool.py`）：工具执行状态枚举，取值包括 success、error、permission_denied、timeout。
 
 `PermissionDecision`（`app/domain/tool.py`）：权限判定值对象，字段包括 allowed、reason。
@@ -52,6 +54,8 @@
 `MemoryStore`（`app/domain/memory.py`）：定义 session、message、tool_call、task_state、summary 的读写接口。Infrastructure 的 SQLiteMemoryStore 实现该端口。
 
 `GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射和飞书事件幂等。
+
+`McpSiteRegistry`（`app/domain/mcp.py`）：定义 MCP 站点和工具映射的 list/get/create/update/delete、replace_site_tools、update_probe_status、update_tool_enabled 接口。Infrastructure 的 SQLiteMcpSiteRegistry 实现该端口；Application 只依赖该端口和 McpClient 协议。
 
 `Summarizer`（`app/domain/memory.py`）：定义摘要生成接口。MVP 默认 HeuristicSummarizer 实现。
 
@@ -72,6 +76,11 @@
 - kb_default_top_k
 - kb_default_min_score
 - kb_timeout_seconds
+- mcp_connect_timeout_seconds
+- mcp_max_tools
+- mcp_max_schema_bytes
+- mcp_max_result_bytes
+- mcp_allow_private_hosts
 - gateway_enabled
 - feishu_enabled
 - feishu_app_id
@@ -96,6 +105,8 @@ providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_header
 gateway_conversations(id, source_type, source_id, thread_id, display_name, active_session_id, created_at, updated_at)
 gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
 gateway_processed_events(id, source_type, event_id, message_id, created_at)
+mcp_sites(id, name UNIQUE, transport_type, url, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
+mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
 ```
 
 providers 表唯一索引：
@@ -118,6 +129,7 @@ JSON 边界：
 - `messages.content_json` 存储消息内容
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果
+- `mcp_tools.input_schema_json` 存储 MCP 远端工具 schema
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
 
 会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。

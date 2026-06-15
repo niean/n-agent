@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from app.application.agent_graph import AgentGraphRunner
 from app.application.chat_service import ChatCompletionService
 from app.application.gateway_service import GatewayService
+from app.application.mcp_service import McpManagementToolExecutor, McpService, McpToolExecutor, mcp_management_tool_definitions
 from app.application.model_service import ModelService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
@@ -21,8 +22,10 @@ from app.domain.provider import ProviderConfig
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
+from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
+from app.infrastructure.registry.sqlite_mcp_registry import SQLiteMcpSiteRegistry
 from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
@@ -71,6 +74,7 @@ class ApplicationServices:
     provider_holder: ActiveProviderHolder
     provider_service: ProviderService
     tool_service: ToolService
+    mcp_service: McpService
     chat_service: ChatCompletionService
     session_service: SessionService
     model_service: ModelService
@@ -97,11 +101,32 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         default_top_k=settings.kb_default_top_k,
         default_min_score=settings.kb_default_min_score,
     )
+    mcp_registry = SQLiteMcpSiteRegistry(settings.sqlite_path)
+    mcp_client = McpSdkClient(
+        McpClientLimits(
+            connect_timeout_seconds=settings.mcp_connect_timeout_seconds,
+            max_tools=settings.mcp_max_tools,
+            max_schema_bytes=settings.mcp_max_schema_bytes,
+            max_result_bytes=settings.mcp_max_result_bytes,
+            allow_private_hosts=settings.mcp_allow_private_hosts,
+        )
+    )
     routes = {tool_name: builtin_executor for tool_name in BUILTIN_TOOL_NAMES}
     routes["search_knowledge"] = kb_executor
-    tool_executor = CompositeToolExecutor(routes)
-    tool_definitions = builtin_tool_definitions() + knowledge_tool_definitions(enabled=kb_enabled)
-    tool_service = ToolService(tool_executor, tool_definitions)
+    tool_definitions = builtin_tool_definitions() + knowledge_tool_definitions(enabled=kb_enabled) + mcp_management_tool_definitions()
+    tool_service = ToolService(CompositeToolExecutor(routes), tool_definitions)
+    mcp_service = McpService(mcp_registry, mcp_client, tool_service)
+    mcp_management_executor = McpManagementToolExecutor(mcp_service)
+    for definition in mcp_management_tool_definitions():
+        routes[definition.name] = mcp_management_executor
+    tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
+    try:
+        asyncio.run(mcp_service.refresh_registered_tool_surface())
+        mcp_status = "ok"
+        mcp_error = ""
+    except Exception as exc:
+        mcp_status = "error"
+        mcp_error = str(exc)
     graph_runner = AgentGraphRunner(
         holder,
         tool_service,
@@ -137,6 +162,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 "base_url": settings.kb_base_url,
                 "enabled": kb_enabled,
             },
+            "mcp": {"status": mcp_status, "error": mcp_error},
             "gateway": {"status": "ok" if settings.gateway_enabled else "disabled"},
         }
 
@@ -155,6 +181,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         provider_holder=holder,
         provider_service=provider_service,
         tool_service=tool_service,
+        mcp_service=mcp_service,
         chat_service=chat_service,
         session_service=session_service,
         model_service=model_service,
@@ -202,6 +229,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             services.model_service,
             services.health_snapshot,
             provider_service=services.provider_service,
+            mcp_service=services.mcp_service,
         )
     )
     return app

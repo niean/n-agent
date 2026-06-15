@@ -13,7 +13,7 @@ from app.domain.agent import AgentState, RunStatus
 from app.domain.memory import MemoryStore, Summarizer
 from app.domain.provider import LLMEventType, LLMProvider, LLMResult
 from app.domain.session import ConversationMessage, Summary, TaskState, ToolCall
-from app.domain.tool import ToolCallRequest
+from app.domain.tool import ToolCallRequest, ToolExecutionContext
 
 
 class AgentGraphRunner:
@@ -113,8 +113,13 @@ class AgentGraphRunner:
             state.finish_reason = "error"
         return state
 
-    async def execute_tools(self, state: AgentState) -> AgentState:
+    async def execute_tools(self, state: AgentState, config: dict | None = None) -> AgentState:
         state.tool_results = []
+        context = None
+        if config:
+            raw_context = (config.get("configurable", {}).get("options") or {}).get("tool_execution_context")
+            if isinstance(raw_context, ToolExecutionContext):
+                context = raw_context
         for tool_call in state.pending_tool_calls:
             function = tool_call.get("function", {})
             arguments = function.get("arguments") or "{}"
@@ -127,7 +132,7 @@ class AgentGraphRunner:
                 name=function.get("name", ""),
                 arguments=parsed_arguments,
             )
-            result = await self.tool_service.execute(request)
+            result = await self.tool_service.execute(request, context)
             result_payload = {
                 "tool_call_id": result.tool_call_id,
                 "name": result.tool_name,

@@ -88,7 +88,9 @@ Agent 实际可执行工具只来自服务端 Tool Registry。客户端传入 to
 - 工具 handler 属于 Infrastructure，通过 Application 层 ToolService 绑定执行。
 - 多个工具 handler 通过 Infrastructure 的组合 executor 按工具名路由；ToolService 只处理定义、风险等级、enabled 和 OpenAI schema 暴露语义。
 - 风险等级至少包含 safe、confirm、dangerous。
-- safe 默认允许执行；confirm 在 MVP 默认拒绝自动执行并返回 permission_denied；dangerous 默认不暴露给 LLM。
+- safe 默认允许执行；confirm 默认拒绝自动执行并返回 permission_denied；仅当 Application 从当前用户消息推导出的 ToolExecutionContext 明确授权且关键参数匹配时，confirm 工具可在本轮执行。
+- MCP 站点管理工具 mcp_site_probe/mcp_site_add/mcp_site_refresh 是 confirm，mcp_site_list 是 safe；模型不能直接写配置或 SQLite，只能调用受控管理工具。
+- MCP 远端工具通过 ToolService 动态定义源暴露，source_type=mcp，禁用站点、禁用工具、名称冲突或非 object schema 不暴露；执行时由 Application 薄 executor 调 McpService，再进入 Infrastructure MCP client。
 - 文件类工具必须限制在配置 workspace 根目录内，拒绝路径穿越和软链接逃逸。
 
 陷阱：把 handler 放进 Domain，或让 API handler 直接执行工具，会破坏权限审计和后续审批流。

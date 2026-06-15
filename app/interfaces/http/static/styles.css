@@ -191,3 +191,5 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .tools-schema-content { padding: 20px; }
 .tools-schema-content h4 { margin: 0; }
 .tools-schema-content pre { max-height: min(620px, calc(100vh - 150px)); }
+.mcp-tool-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(160px, 2fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--color-border-light); }
+.mcp-tool-row:last-child { border-bottom: 0; }

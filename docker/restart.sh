@@ -7,12 +7,12 @@ cd "$SCRIPT_DIR"
 # restart
 docker compose stop n-agent
 docker compose rm -f n-agent
-docker compose up -d --build --force-recreate n-agent
+docker compose up -d --build --force-recreate --remove-orphans n-agent
 echo
 
 # status
 sleep 2
-echo "compose ps n-kb"
+echo "compose ps n-agent"
 docker compose ps n-agent
 echo
 

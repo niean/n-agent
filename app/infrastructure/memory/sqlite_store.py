@@ -7,6 +7,7 @@ from typing import Any
 
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
+from app.infrastructure.registry.sqlite_mcp_registry import _initialize_mcp_schema
 
 
 class SQLiteMemoryStore:
@@ -81,6 +82,7 @@ class SQLiteMemoryStore:
                 """
             )
             _initialize_gateway_schema(conn)
+            _initialize_mcp_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)

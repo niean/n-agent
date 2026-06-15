@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.domain.tool import ToolCallRequest, ToolExecutor, ToolResult, ToolResultStatus
+from app.domain.tool import ToolCallRequest, ToolExecutionContext, ToolExecutor, ToolResult, ToolResultStatus
 
 
 BUILTIN_TOOL_NAMES = frozenset({"get_current_time", "calculator", "list_directory", "read_text_file"})
@@ -17,7 +17,7 @@ class BuiltinToolExecutor:
     def __init__(self, workspace_root: Path):
         self.workspace_root = workspace_root.resolve()
 
-    async def execute(self, request: ToolCallRequest) -> ToolResult:
+    async def execute(self, request: ToolCallRequest, context: ToolExecutionContext | None = None) -> ToolResult:
         start = time.monotonic()
         try:
             content = self._execute(request)

@@ -54,6 +54,11 @@ class ToolCallRequest:
 
 
 @dataclass(frozen=True)
+class ToolExecutionContext:
+    allowed_confirm_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ToolResult:
     tool_call_id: str
     tool_name: str
@@ -63,5 +68,5 @@ class ToolResult:
 
 
 class ToolExecutor(Protocol):
-    async def execute(self, request: ToolCallRequest) -> ToolResult:
+    async def execute(self, request: ToolCallRequest, context: ToolExecutionContext | None = None) -> ToolResult:
         ...

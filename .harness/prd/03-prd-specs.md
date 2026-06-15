@@ -43,12 +43,11 @@
     - 模型：新增、修改模型，改为弹出框页面
     - 工具：[KF]Tool完善抽象，除运行时外的其它能力
     - 工具：工具列表，Schema查看改为弹出框
-    - 管理：[KF]交互入口，除了Dashboard，还应该支持CLI、飞书IM机器人等方式Gateway。参考HermesAgent，设计并实现
-        - 收窄：本次不做飞书 WebSocket、卡片审批、Drive 评论、跨频道主动投递，也不做 /rename、/delete 等破坏性 Gateway 命令。
-    - 交互：飞书，使用长连接接入N-Agent
-        - 迭代：会话列表，应包含飞书Session
+    - 交互：[KF]支持飞书Bot入口。除了Dashboard还应该支持CLI等方式，Gateway。参考HermesAgent，设计并实现
+        - 迭代：飞书接入，使用长连接，会话列表也应包含飞书Session
     - 工具：[KF]新增MCP站点管理能力，前端系管理页面，后端按照DDD分层实现
         - 迭代：管理页面，MCP站点管理独立为左导二级菜单
+    - 工具：MCP支持stdio类型
 
 
 ---
@@ -57,6 +56,7 @@
 - Issue
 - NFR
 - FR
+    - 交互：飞书接入，支持卡片审批、Drive评论、跨频道主动投递，以及/new、/rename、/delete 等破坏性Gateway 命令
     - RunTime：Sandbox(docker)
     - 定时任务
     - 治理：IAM，安全护栏

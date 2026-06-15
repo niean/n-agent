@@ -41,6 +41,31 @@
   const deleteProvider = (id) => fetchJson(`/chat/providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
   const activateProvider = (id) => fetchJson(`/chat/providers/${encodeURIComponent(id)}/activate`, { method: 'POST' });
 
+  const listMcpSites = () => fetchJson('/chat/mcp/sites');
+  const probeMcpSite = (payload) => fetchJson('/chat/mcp/sites/probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const createMcpSite = (payload) => fetchJson('/chat/mcp/sites', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const updateMcpSite = (id, payload) => fetchJson(`/chat/mcp/sites/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const deleteMcpSite = (id) => fetchJson(`/chat/mcp/sites/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  const refreshMcpSite = (id) => fetchJson(`/chat/mcp/sites/${encodeURIComponent(id)}/refresh`, { method: 'POST' });
+  const listMcpSiteTools = (id) => fetchJson(`/chat/mcp/sites/${encodeURIComponent(id)}/tools`);
+  const updateMcpTool = (siteId, toolId, payload) => fetchJson(`/chat/mcp/sites/${encodeURIComponent(siteId)}/tools/${encodeURIComponent(toolId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+
   global.NAGENT = namespace;
   global.NAGENT.api = {
     fetchJson,
@@ -60,5 +85,13 @@
     updateProvider,
     deleteProvider,
     activateProvider,
+    listMcpSites,
+    probeMcpSite,
+    createMcpSite,
+    updateMcpSite,
+    deleteMcpSite,
+    refreshMcpSite,
+    listMcpSiteTools,
+    updateMcpTool,
   };
 }(window));

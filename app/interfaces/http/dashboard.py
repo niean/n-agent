@@ -6,6 +6,7 @@ from typing import Callable
 from fastapi import APIRouter, Body
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from app.application.mcp_service import McpService, McpSiteInput
 from app.application.model_service import ModelService
 from app.application.provider_service import (
     ProviderCreateInput,
@@ -14,6 +15,7 @@ from app.application.provider_service import (
 )
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService
+from app.domain.mcp import McpProbeError, McpSite, McpSiteNotFoundError, McpSiteValidationError, McpTool, McpTransportType
 from app.domain.provider import (
     DuplicateProviderError,
     ModelInfo,
@@ -46,6 +48,7 @@ def create_dashboard_router(
     model_service: ModelService,
     health_provider: HealthProvider,
     provider_service: ProviderService | None = None,
+    mcp_service: McpService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -121,6 +124,8 @@ def create_dashboard_router(
 
     if provider_service is not None:
         _register_provider_routes(router, provider_service)
+    if mcp_service is not None:
+        _register_mcp_routes(router, mcp_service)
 
     return router
 
@@ -140,6 +145,17 @@ def _session_error_response(exc: Exception) -> JSONResponse:
         status_code=500,
         content={"error": {"code": "session_error", "message": str(exc)}},
     )
+
+
+def _mcp_error_response(exc: Exception, refresh: bool = False) -> JSONResponse:
+    if isinstance(exc, McpSiteNotFoundError):
+        return JSONResponse(status_code=404, content={"error": {"code": "mcp_site_not_found", "message": str(exc)}})
+    if isinstance(exc, McpSiteValidationError):
+        return JSONResponse(status_code=422, content={"error": {"code": "mcp_site_invalid", "message": str(exc)}})
+    if isinstance(exc, McpProbeError):
+        code = "mcp_refresh_failed" if refresh else "mcp_probe_failed"
+        return JSONResponse(status_code=502, content={"error": {"code": code, "message": str(exc)}})
+    return JSONResponse(status_code=500, content={"error": {"code": "mcp_error", "message": str(exc)}})
 
 
 def _provider_error_response(exc: Exception) -> JSONResponse:
@@ -182,6 +198,68 @@ def _provider_to_dict(cfg: ProviderConfig) -> dict:
         "created_at": cfg.created_at.isoformat(),
         "updated_at": cfg.updated_at.isoformat(),
     }
+
+
+def _register_mcp_routes(router: APIRouter, mcp_service: McpService) -> None:
+    @router.get("/chat/mcp/sites")
+    async def list_mcp_sites():
+        return [_mcp_site_to_dict(site) for site in await mcp_service.list_sites()]
+
+    @router.post("/chat/mcp/sites/probe")
+    async def probe_mcp_site(payload: dict = Body(...)):
+        try:
+            result = await mcp_service.probe_site(_mcp_input(payload))
+        except (McpSiteValidationError, McpProbeError) as exc:
+            return _mcp_error_response(exc)
+        return {"tools": [{"name": tool.name, "description": tool.description, "input_schema": tool.input_schema} for tool in result.tools]}
+
+    @router.post("/chat/mcp/sites")
+    async def create_mcp_site(payload: dict = Body(...)):
+        try:
+            site = await mcp_service.create_site_with_probe(_mcp_input(payload), payload.get("tool_include"))
+        except (McpSiteValidationError, McpProbeError) as exc:
+            return _mcp_error_response(exc)
+        return _mcp_site_to_dict(site)
+
+    @router.patch("/chat/mcp/sites/{site_id}")
+    async def update_mcp_site(site_id: str, payload: dict = Body(...)):
+        try:
+            site = await mcp_service.update_site(site_id, _mcp_input(payload))
+        except (McpSiteNotFoundError, McpSiteValidationError) as exc:
+            return _mcp_error_response(exc)
+        return _mcp_site_to_dict(site)
+
+    @router.delete("/chat/mcp/sites/{site_id}")
+    async def delete_mcp_site(site_id: str):
+        try:
+            await mcp_service.delete_site(site_id)
+        except McpSiteNotFoundError as exc:
+            return _mcp_error_response(exc)
+        return Response(status_code=204)
+
+    @router.post("/chat/mcp/sites/{site_id}/refresh")
+    async def refresh_mcp_site(site_id: str):
+        try:
+            tools = await mcp_service.refresh_site_tools(site_id)
+        except (McpSiteNotFoundError, McpSiteValidationError, McpProbeError) as exc:
+            return _mcp_error_response(exc, refresh=True)
+        return [_mcp_tool_to_dict(tool) for tool in tools]
+
+    @router.get("/chat/mcp/sites/{site_id}/tools")
+    async def list_mcp_site_tools(site_id: str):
+        try:
+            tools = await mcp_service.list_site_tools(site_id)
+        except McpSiteNotFoundError as exc:
+            return _mcp_error_response(exc)
+        return [_mcp_tool_to_dict(tool) for tool in tools]
+
+    @router.patch("/chat/mcp/sites/{site_id}/tools/{tool_id}")
+    async def toggle_mcp_tool(site_id: str, tool_id: str, payload: dict = Body(...)):
+        try:
+            tool = await mcp_service.set_tool_enabled(site_id, tool_id, bool(payload.get("enabled")))
+        except (McpSiteNotFoundError, McpSiteValidationError) as exc:
+            return _mcp_error_response(exc)
+        return _mcp_tool_to_dict(tool)
 
 
 def _register_provider_routes(router: APIRouter, provider_service: ProviderService) -> None:
@@ -301,6 +379,43 @@ def _tool_definition_to_dict(definition: ToolDefinition) -> dict:
         "risk_level": definition.risk_level.value,
         "enabled": definition.enabled,
         "input_schema": definition.input_schema,
+    }
+
+
+def _mcp_input(payload: dict) -> McpSiteInput:
+    return McpSiteInput(
+        name=payload.get("name", ""),
+        url=payload.get("url", ""),
+        transport_type=McpTransportType(payload.get("transport_type", "streamable_http")),
+        enabled=bool(payload.get("enabled", True)),
+    )
+
+
+def _mcp_site_to_dict(site: McpSite) -> dict:
+    return {
+        "id": site.id,
+        "name": site.name,
+        "transport_type": site.transport_type.value,
+        "url": site.url,
+        "enabled": site.enabled,
+        "last_probe_status": site.last_probe_status.value,
+        "last_probe_error": site.last_probe_error,
+        "last_probed_at": site.last_probed_at.isoformat() if site.last_probed_at else None,
+        "created_at": site.created_at.isoformat(),
+        "updated_at": site.updated_at.isoformat(),
+    }
+
+
+def _mcp_tool_to_dict(tool: McpTool) -> dict:
+    return {
+        "id": tool.id,
+        "site_id": tool.site_id,
+        "remote_name": tool.remote_name,
+        "local_name": tool.local_name,
+        "description": tool.description,
+        "input_schema": tool.input_schema,
+        "enabled": tool.enabled,
+        "last_seen_at": tool.last_seen_at.isoformat(),
     }
 
 

@@ -2,11 +2,18 @@
   const namespace = global.NAGENT || {};
   const ui = namespace.ui;
   const api = namespace.api;
+  let selectedSite = null;
 
   function riskBadge(level) {
     if (level === 'dangerous') return 'danger';
     if (level === 'confirm') return 'warning';
     return 'success';
+  }
+
+  function statusBadge(status) {
+    if (status === 'success') return 'success';
+    if (status === 'failed') return 'danger';
+    return 'warning';
   }
 
   function closeSchemaModal() {
@@ -34,7 +41,7 @@
     header.className = 'modal-header';
     const title = document.createElement('h4');
     title.id = 'tools-schema-title';
-    title.textContent = `${tool.name} Schema`;
+    title.textContent = `${tool.name || tool.local_name || tool.remote_name} Schema`;
     const close = document.createElement('button');
     close.type = 'button';
     close.className = 'modal-close';
@@ -55,7 +62,7 @@
     close.focus();
   }
 
-  async function refresh() {
+  async function refreshTools() {
     const list = ui.byId('tools-list');
     if (!list) return;
     ui.clear(list);
@@ -103,9 +110,238 @@
     }
   }
 
+  async function refreshMcpSites() {
+    const list = ui.byId('mcp-sites-list');
+    if (!list) return;
+    ui.clear(list);
+    ui.renderLoading(list, '加载 MCP 站点...');
+    try {
+      const sites = await api.listMcpSites();
+      ui.clear(list);
+      if (!sites.length) { ui.renderEmpty(list, '暂无 MCP 站点'); return; }
+      const table = document.createElement('table');
+      table.className = 'document-table';
+      const thead = document.createElement('thead');
+      const headerRow = document.createElement('tr');
+      ['名称', '传输', 'URL', '启用', '状态', '最近探测', '操作'].forEach((label) => {
+        const th = document.createElement('th'); th.textContent = label; headerRow.appendChild(th);
+      });
+      thead.appendChild(headerRow);
+      const tbody = document.createElement('tbody');
+      sites.forEach((site) => tbody.appendChild(siteRow(site)));
+      table.append(thead, tbody);
+      list.appendChild(table);
+    } catch (error) {
+      ui.clear(list);
+      ui.renderError(list, error.message);
+    }
+  }
+
+  function siteRow(site) {
+    const tr = document.createElement('tr');
+    const name = document.createElement('td'); name.textContent = site.name;
+    const transport = document.createElement('td'); transport.textContent = site.transport_type;
+    const url = document.createElement('td'); url.textContent = site.url;
+    const enabled = document.createElement('td'); enabled.textContent = site.enabled ? '是' : '否';
+    const status = document.createElement('td');
+    const badge = document.createElement('span');
+    badge.className = `badge badge--${statusBadge(site.last_probe_status)}`;
+    badge.textContent = site.last_probe_status;
+    status.appendChild(badge);
+    if (site.last_probe_error) {
+      const err = document.createElement('div');
+      err.className = 'muted';
+      err.textContent = site.last_probe_error;
+      status.appendChild(err);
+    }
+    const probed = document.createElement('td'); probed.textContent = site.last_probed_at || '-';
+    const actions = document.createElement('td');
+    const group = document.createElement('div');
+    group.className = 'row-actions';
+    const edit = actionButton('编辑', () => openSiteModal(site));
+    const refresh = actionButton('刷新工具', async () => { await api.refreshMcpSite(site.id); await refreshMcpSites(); await refreshTools(); });
+    const tools = actionButton('查看工具', () => openSiteTools(site));
+    const remove = actionButton('删除', async () => {
+      if (!window.confirm(`删除 MCP 站点 ${site.name}？`)) return;
+      await api.deleteMcpSite(site.id);
+      await refreshMcpSites();
+      await refreshTools();
+    });
+    group.append(edit, refresh, tools, remove);
+    actions.appendChild(group);
+    tr.append(name, transport, url, enabled, status, probed, actions);
+    return tr;
+  }
+
+  function actionButton(label, handler) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn';
+    button.textContent = label;
+    button.addEventListener('click', handler);
+    return button;
+  }
+
+  function openSiteModal(site) {
+    closeSchemaModal();
+    selectedSite = site || null;
+    const backdrop = document.createElement('div');
+    backdrop.id = 'tools-schema-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const form = document.createElement('form');
+    form.className = 'providers-form';
+    const header = document.createElement('div');
+    header.className = 'modal-header';
+    const title = document.createElement('h4');
+    title.textContent = site ? '编辑 MCP 站点' : '新增 MCP 站点';
+    const close = actionButton('×', closeSchemaModal);
+    close.className = 'modal-close';
+    header.append(title, close);
+    const name = field('名称', 'text', site ? site.name : '');
+    const url = field('URL', 'text', site ? site.url : '');
+    const transport = document.createElement('label');
+    transport.textContent = '传输类型';
+    const select = document.createElement('select');
+    ['streamable_http', 'sse'].forEach((value) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      if ((site ? site.transport_type : 'streamable_http') === value) option.selected = true;
+      select.appendChild(option);
+    });
+    transport.appendChild(select);
+    const enabled = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = site ? site.enabled : true;
+    enabled.textContent = '启用';
+    enabled.appendChild(checkbox);
+    const actions = document.createElement('div');
+    actions.className = 'providers-form__actions';
+    const probe = actionButton('探测', async () => {
+      const result = await api.probeMcpSite(sitePayload(name.input, url.input, select, checkbox));
+      openProbeResult(result.tools || []);
+    });
+    const save = document.createElement('button');
+    save.type = 'submit';
+    save.className = 'btn btn--primary';
+    save.textContent = '保存';
+    actions.append(probe, save, actionButton('取消', closeSchemaModal));
+    form.append(header, name.label, url.label, transport, enabled, actions);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (selectedSite) await api.updateMcpSite(selectedSite.id, sitePayload(name.input, url.input, select, checkbox));
+      else await api.createMcpSite(sitePayload(name.input, url.input, select, checkbox));
+      closeSchemaModal();
+      await refreshMcpSites();
+      await refreshTools();
+    });
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+    name.input.focus();
+  }
+
+  function field(labelText, type, value) {
+    const label = document.createElement('label');
+    label.textContent = labelText;
+    const input = document.createElement('input');
+    input.type = type;
+    input.value = value;
+    label.appendChild(input);
+    return { label, input };
+  }
+
+  function sitePayload(name, url, transport, enabled) {
+    return { name: name.value, url: url.value, transport_type: transport.value, enabled: enabled.checked };
+  }
+
+  function openProbeResult(tools) {
+    closeSchemaModal();
+    const backdrop = document.createElement('div');
+    backdrop.id = 'tools-schema-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog tools-schema-dialog';
+    const content = document.createElement('div');
+    content.className = 'tools-schema-content';
+    const header = document.createElement('div');
+    header.className = 'modal-header';
+    const title = document.createElement('h4');
+    title.textContent = '探测到的 MCP 工具';
+    header.append(title, actionButton('×', closeSchemaModal));
+    content.appendChild(header);
+    if (!tools.length) ui.renderEmpty(content, '未探测到工具');
+    tools.forEach((tool) => {
+      const row = document.createElement('div');
+      row.className = 'mcp-tool-row';
+      const name = document.createElement('strong'); name.textContent = tool.name;
+      const desc = document.createElement('span'); desc.textContent = tool.description || '-';
+      const schema = actionButton('Schema', () => openSchemaModal(tool));
+      row.append(name, desc, schema);
+      content.appendChild(row);
+    });
+    dialog.appendChild(content);
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+  }
+
+  async function openSiteTools(site) {
+    const tools = await api.listMcpSiteTools(site.id);
+    closeSchemaModal();
+    const backdrop = document.createElement('div');
+    backdrop.id = 'tools-schema-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog tools-schema-dialog';
+    const content = document.createElement('div');
+    content.className = 'tools-schema-content';
+    const header = document.createElement('div');
+    header.className = 'modal-header';
+    const title = document.createElement('h4');
+    title.textContent = `${site.name} 工具`;
+    header.append(title, actionButton('×', closeSchemaModal));
+    content.appendChild(header);
+    if (!tools.length) ui.renderEmpty(content, '暂无工具');
+    tools.forEach((tool) => {
+      const row = document.createElement('div');
+      row.className = 'mcp-tool-row';
+      const name = document.createElement('strong'); name.textContent = tool.local_name;
+      const remote = document.createElement('span'); remote.textContent = tool.remote_name;
+      const enabled = document.createElement('label');
+      const toggle = document.createElement('input');
+      toggle.type = 'checkbox';
+      toggle.checked = tool.enabled;
+      toggle.addEventListener('change', async () => {
+        await api.updateMcpTool(site.id, tool.id, { enabled: toggle.checked });
+        await refreshTools();
+      });
+      enabled.textContent = '启用';
+      enabled.appendChild(toggle);
+      row.append(name, remote, enabled, actionButton('Schema', () => openSchemaModal(tool)));
+      content.appendChild(row);
+    });
+    dialog.appendChild(content);
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+  }
+
+  async function refresh() {
+    await refreshTools();
+    await refreshMcpSites();
+  }
+
   function init() {
     const refreshBtn = ui.byId('tools-refresh');
-    if (refreshBtn) refreshBtn.addEventListener('click', refresh);
+    if (refreshBtn) refreshBtn.addEventListener('click', refreshTools);
+    const mcpRefresh = ui.byId('mcp-sites-refresh');
+    if (mcpRefresh) mcpRefresh.addEventListener('click', refreshMcpSites);
+    const mcpNew = ui.byId('mcp-site-new');
+    if (mcpNew) mcpNew.addEventListener('click', () => openSiteModal(null));
     refresh();
   }
 

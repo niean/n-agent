@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from app.domain.tool import ToolCallRequest, ToolResult, ToolResultStatus
+from app.domain.tool import ToolCallRequest, ToolExecutionContext, ToolResult, ToolResultStatus
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class KnowledgeToolExecutor:
         self.default_top_k = default_top_k
         self.default_min_score = default_min_score
 
-    async def execute(self, request: ToolCallRequest) -> ToolResult:
+    async def execute(self, request: ToolCallRequest, context: ToolExecutionContext | None = None) -> ToolResult:
         start = time.monotonic()
         if request.name != "search_knowledge":
             return self._result(request, ToolResultStatus.ERROR, {"error": "tool not found"}, start)
