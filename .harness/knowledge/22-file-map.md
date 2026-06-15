@@ -43,7 +43,7 @@
 - LLM 标题生成器：`app/infrastructure/session/llm_title_generator.py`，实现 Domain `TitleGenerator`，调用 LLMProvider 一次小请求生成会话标题；`model` 参数支持静态字符串或 `Callable[[], str]` 以反射 active provider
 - SQLite Provider Registry：`app/infrastructure/registry/sqlite_provider_registry.py`，实现 Domain `ProviderRegistry`，与 sessions.db 共享 path 但独立 `_connect()`，自带 schema 兜底初始化；`get_secret(id)` 返回明文 api_key，仅供 holder 工厂调用，外部接口一律返回脱敏 `ProviderConfig`
 - SQLite MCP Registry：`app/infrastructure/registry/sqlite_mcp_registry.py`，实现 Domain `McpSiteRegistry`，持久化 mcp_sites/mcp_tools，支持工具刷新保留 enabled 状态和站点删除级联清理
-- MCP SDK Client：`app/infrastructure/mcp/sdk_client.py`，实现 Application `McpClient` 协议，使用官方 MCP SDK 进行 streamable_http/SSE 短连接探测和调用，并执行 URL 安全校验与大小限制
+- MCP SDK Client：`app/infrastructure/mcp/sdk_client.py`，实现 Application `McpClient` 协议，使用官方 MCP SDK 进行 streamable_http/SSE/stdio 短连接探测和调用；HTTP 类传输执行 URL 安全校验，stdio 使用 argv 启动本地进程并继承/覆盖环境变量，所有传输共享大小限制
 - SQLite Gateway Registry：`app/infrastructure/registry/sqlite_gateway_registry.py`，实现 Domain `GatewaySessionRegistry`，持久化 gateway_conversations、gateway_session_links、gateway_processed_events 并提供事件幂等
 - 飞书 Client：`app/infrastructure/feishu/client.py`，封装飞书官方长连接 SDK 事件接收、事件校验、allowlist、tenant_access_token 获取和文本发送
 
@@ -74,7 +74,7 @@
 - DDD 边界测试：`tests/test_architecture_boundaries.py`
 - Docker Compose 配置测试：`tests/test_docker_compose_config.py`
 - Domain 模型测试：`tests/domain/test_models.py`
-- MCP Domain 模型测试：`tests/domain/test_mcp_models.py`
+- MCP Domain 模型测试：`tests/domain/test_mcp_models.py`，覆盖 MCP 站点/工具模型和 stdio 配置字段
 - ToolService 测试：`tests/application/test_tool_service.py`
 - GatewayService 测试：`tests/application/test_gateway_service.py`，覆盖 session 映射、重复事件幂等、/new、/switch、/sessions、/tools、/models、/status
 - McpService 测试：`tests/application/test_mcp_service.py`，覆盖站点探测/创建、动态工具定义、禁用站点阻断、远端工具调用和 MCP 管理工具定义风险等级
@@ -87,7 +87,7 @@
 - Provider Registry 测试：`tests/infrastructure/test_sqlite_provider_registry.py`，覆盖 CRUD + 唯一约束 + active 唯一索引 + get_secret + 缺失 id 处理
 - Gateway Registry 测试：`tests/infrastructure/test_sqlite_gateway_registry.py`，覆盖 gateway conversation/session link/active session 与 processed event 幂等
 - MCP Registry 测试：`tests/infrastructure/test_sqlite_mcp_registry.py`，覆盖 mcp_sites/mcp_tools CRUD、刷新保留 disabled 状态和级联删除
-- MCP SDK Client 测试：`tests/infrastructure/test_mcp_sdk_client.py`，覆盖 URL 安全校验和 MCP client 限制配置
+- MCP SDK Client 测试：`tests/infrastructure/test_mcp_sdk_client.py`，覆盖 URL 安全校验、MCP client 限制配置、stdio 分支和环境变量合并
 - 内置工具测试：`tests/infrastructure/test_builtin_tools.py`
 - 工具路由测试：`tests/infrastructure/test_composite_tools.py`
 - N-KB 知识检索工具测试：`tests/infrastructure/test_kb_tools.py`
@@ -97,7 +97,7 @@
 - CLI 测试：`tests/interfaces/test_cli.py`，覆盖 status、chat 和 help
 - 飞书长连接测试：`tests/interfaces/test_feishu_long_connection.py`，覆盖长连接事件接收、非 text、群聊 @ 过滤、成功回复和 duplicate response
 - Dashboard 测试：`tests/interfaces/test_dashboard.py`，覆盖 `/chat` 外壳、`/chat/sessions*`、`/chat/tools`、`/chat/health/dependencies`、`/chat/models`（管理员视角真实模型列表 + is_default + default_model）、`/chat/providers*`（CRUD/activate 全生命周期 + 校验/未找到/重名错误编码）
-- MCP Dashboard 测试：`tests/interfaces/test_mcp_dashboard.py`，覆盖 `/chat/mcp/sites*` 站点探测、创建、列表、工具查看、启停、刷新和删除
+- MCP Dashboard 测试：`tests/interfaces/test_mcp_dashboard.py`，覆盖 `/chat/mcp/sites*` 站点探测、创建、列表、工具查看、启停、刷新、删除和 stdio payload 输入输出
 - Seed Provider 测试：`tests/test_seed_provider.py`，验证空表时按 .env 写入 default 并自动 activate；表非空时跳过 seed；.env 不全时不写入
 - MCP Config 测试：`tests/test_mcp_config.py`，验证 MCP timeout、工具数量、schema/result 大小限制环境变量加载
 - 静态资产测试：`tests/interfaces/test_static_assets.py`，校验 /chat 返回 index.html、/static/* 资产可访问、JS 内容关键逻辑（SSE/Shift+Enter/空消息拦截、models.js 调 `/chat/models` 而非 `/v1/models`）和安全文本渲染（无 innerHTML/insertAdjacentHTML，含 textContent）

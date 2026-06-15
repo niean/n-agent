@@ -388,6 +388,9 @@ def _mcp_input(payload: dict) -> McpSiteInput:
         url=payload.get("url", ""),
         transport_type=McpTransportType(payload.get("transport_type", "streamable_http")),
         enabled=bool(payload.get("enabled", True)),
+        command=payload.get("command"),
+        args=payload.get("args"),
+        env=payload.get("env"),
     )
 
 
@@ -397,6 +400,9 @@ def _mcp_site_to_dict(site: McpSite) -> dict:
         "name": site.name,
         "transport_type": site.transport_type.value,
         "url": site.url,
+        "command": site.command,
+        "args": site.args,
+        "env": site.env,
         "enabled": site.enabled,
         "last_probe_status": site.last_probe_status.value,
         "last_probe_error": site.last_probe_error,

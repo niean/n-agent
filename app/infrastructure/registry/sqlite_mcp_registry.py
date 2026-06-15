@@ -16,6 +16,9 @@ def _initialize_mcp_schema(conn: sqlite3.Connection) -> None:
             name TEXT NOT NULL UNIQUE,
             transport_type TEXT NOT NULL,
             url TEXT NOT NULL,
+            command TEXT,
+            args_json TEXT NOT NULL DEFAULT '[]',
+            env_json TEXT NOT NULL DEFAULT '{}',
             enabled INTEGER NOT NULL DEFAULT 1,
             last_probe_status TEXT NOT NULL,
             last_probe_error TEXT,
@@ -38,6 +41,13 @@ def _initialize_mcp_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_mcp_tools_site_id ON mcp_tools(site_id);
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(mcp_sites)").fetchall()}
+    if "command" not in columns:
+        conn.execute("ALTER TABLE mcp_sites ADD COLUMN command TEXT")
+    if "args_json" not in columns:
+        conn.execute("ALTER TABLE mcp_sites ADD COLUMN args_json TEXT NOT NULL DEFAULT '[]'")
+    if "env_json" not in columns:
+        conn.execute("ALTER TABLE mcp_sites ADD COLUMN env_json TEXT NOT NULL DEFAULT '{}'")
 
 
 class SQLiteMcpSiteRegistry(McpSiteRegistry):
@@ -71,8 +81,8 @@ class SQLiteMcpSiteRegistry(McpSiteRegistry):
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO mcp_sites(id, name, transport_type, url, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO mcp_sites(id, name, transport_type, url, command, args_json, env_json, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 _site_params(site),
             )
@@ -84,6 +94,9 @@ class SQLiteMcpSiteRegistry(McpSiteRegistry):
             name=site.name,
             transport_type=site.transport_type,
             url=site.url,
+            command=site.command,
+            args=site.args,
+            env=site.env,
             enabled=site.enabled,
             last_probe_status=site.last_probe_status,
             last_probe_error=site.last_probe_error,
@@ -95,13 +108,16 @@ class SQLiteMcpSiteRegistry(McpSiteRegistry):
             cursor = conn.execute(
                 """
                 UPDATE mcp_sites
-                SET name = ?, transport_type = ?, url = ?, enabled = ?, last_probe_status = ?, last_probe_error = ?, last_probed_at = ?, updated_at = ?
+                SET name = ?, transport_type = ?, url = ?, command = ?, args_json = ?, env_json = ?, enabled = ?, last_probe_status = ?, last_probe_error = ?, last_probed_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     updated.name,
                     updated.transport_type.value,
                     updated.url,
+                    updated.command,
+                    json.dumps(updated.args),
+                    json.dumps(updated.env),
                     int(updated.enabled),
                     updated.last_probe_status.value,
                     updated.last_probe_error,
@@ -192,6 +208,9 @@ def _site_params(site: McpSite) -> tuple:
         site.name,
         site.transport_type.value,
         site.url,
+        site.command,
+        json.dumps(site.args),
+        json.dumps(site.env),
         int(site.enabled),
         site.last_probe_status.value,
         site.last_probe_error,
@@ -220,6 +239,9 @@ def _site_from_row(row: sqlite3.Row) -> McpSite:
         name=row["name"],
         transport_type=McpTransportType(row["transport_type"]),
         url=row["url"],
+        command=row["command"],
+        args=json.loads(row["args_json"] or "[]"),
+        env=json.loads(row["env_json"] or "{}"),
         enabled=bool(row["enabled"]),
         last_probe_status=McpProbeStatus(row["last_probe_status"]),
         last_probe_error=row["last_probe_error"],

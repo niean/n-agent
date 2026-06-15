@@ -107,6 +107,11 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert "'分组'" in tools_js
     assert 'tool.source_type' in tools_js
     assert 'tool.toolset' in tools_js
+    assert "'stdio'" in tools_js
+    assert 'Command' in tools_js
+    assert 'Args' in tools_js
+    assert 'Env' in tools_js
+    assert 'Endpoint' in tools_js
     models_js = client.get('/static/models.js').text
     assert '/chat/models' in models_js or 'getAdminModels' in models_js
     assert '/v1/models' not in models_js

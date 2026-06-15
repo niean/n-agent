@@ -2,8 +2,8 @@ import socket
 
 import pytest
 
-from app.domain.mcp import McpSite
-from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient, McpUrlValidationError, validate_mcp_url
+from app.domain.mcp import McpSite, McpTransportType
+from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient, McpUrlValidationError, merge_stdio_env, validate_mcp_url
 
 
 @pytest.mark.asyncio
@@ -52,3 +52,47 @@ def test_mcp_client_limits_are_configurable():
 
     assert client.limits.max_tools == 2
     assert client.limits.allow_private_hosts is True
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_dispatches_stdio_without_url_validation(monkeypatch):
+    client = McpSdkClient(McpClientLimits(connect_timeout_seconds=1))
+    calls = []
+
+    async def fake_probe(site):
+        calls.append(("probe", site.command, site.args, site.env))
+        return []
+
+    async def fake_call(site, remote_name, arguments):
+        calls.append(("call", remote_name, arguments))
+        return {"ok": True}
+
+    monkeypatch.setattr(client, "_probe_stdio", fake_probe)
+    monkeypatch.setattr(client, "_call_stdio", fake_call)
+    site = McpSite(
+        name="local",
+        transport_type=McpTransportType.STDIO,
+        command="uvx",
+        args=["server"],
+        env={"A": "override"},
+    )
+
+    await client.probe_tools(site)
+    result = await client.call_tool(site, "search", {"q": "x"})
+
+    assert calls == [
+        ("probe", "uvx", ["server"], {"A": "override"}),
+        ("call", "search", {"q": "x"}),
+    ]
+    assert result == {"ok": True}
+
+
+def test_merge_stdio_env_inherits_and_overrides(monkeypatch):
+    monkeypatch.setenv("A", "base")
+    monkeypatch.setenv("KEEP", "yes")
+
+    merged = merge_stdio_env({"A": "override", "B": "new"})
+
+    assert merged["A"] == "override"
+    assert merged["B"] == "new"
+    assert merged["KEEP"] == "yes"

@@ -40,9 +40,12 @@ class McpClient(Protocol):
 @dataclass(frozen=True)
 class McpSiteInput:
     name: str
-    url: str
+    url: str = ""
     transport_type: McpTransportType = McpTransportType.STREAMABLE_HTTP
     enabled: bool = True
+    command: str | None = None
+    args: list[Any] | None = None
+    env: dict[Any, Any] | None = None
 
 
 class McpService:
@@ -62,6 +65,7 @@ class McpService:
 
     async def probe_site(self, payload: McpSiteInput) -> McpProbeResult:
         site = _site_from_input(payload)
+        self._validate_site(site)
         try:
             return await self.client.probe_tools(site)
         except Exception as exc:
@@ -89,6 +93,9 @@ class McpService:
             name=payload.name.strip(),
             transport_type=payload.transport_type,
             url=payload.url.strip(),
+            command=payload.command.strip() if payload.command else None,
+            args=payload.args if payload.args is not None else [],
+            env=payload.env if payload.env is not None else {},
             enabled=payload.enabled,
             last_probe_status=current.last_probe_status,
             last_probe_error=current.last_probe_error,
@@ -173,6 +180,14 @@ class McpService:
     def _validate_site(self, site: McpSite) -> None:
         if not site.name.strip():
             raise McpSiteValidationError("name required")
+        if site.transport_type is McpTransportType.STDIO:
+            if not (site.command or "").strip():
+                raise McpSiteValidationError("command required")
+            if not isinstance(site.args, list) or any(not isinstance(arg, str) for arg in site.args):
+                raise McpSiteValidationError("args must be strings")
+            if not isinstance(site.env, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in site.env.items()):
+                raise McpSiteValidationError("env must be string pairs")
+            return
         if not site.url.strip():
             raise McpSiteValidationError("url required")
         if not site.url.startswith(("http://", "https://")):
@@ -267,9 +282,12 @@ def mcp_management_tool_definitions() -> list[ToolDefinition]:
         "properties": {
             "name": {"type": "string"},
             "url": {"type": "string"},
-            "transport_type": {"type": "string", "enum": ["streamable_http", "sse"]},
+            "transport_type": {"type": "string", "enum": ["streamable_http", "sse", "stdio"]},
+            "command": {"type": "string"},
+            "args": {"type": "array", "items": {"type": "string"}},
+            "env": {"type": "object", "additionalProperties": {"type": "string"}},
         },
-        "required": ["name", "url"],
+        "required": ["name"],
         "additionalProperties": False,
     }
     add_schema = json.loads(json.dumps(base_schema))
@@ -294,6 +312,9 @@ def _site_from_input(payload: McpSiteInput, probe_status: McpProbeStatus = McpPr
         name=payload.name.strip(),
         transport_type=payload.transport_type,
         url=payload.url.strip(),
+        command=payload.command.strip() if payload.command else None,
+        args=payload.args if payload.args is not None else [],
+        env=payload.env if payload.env is not None else {},
         enabled=payload.enabled,
         last_probe_status=probe_status,
     )
@@ -305,6 +326,9 @@ def _input_from_args(args: dict[str, Any]) -> McpSiteInput:
         url=str(args.get("url", "")),
         transport_type=McpTransportType(str(args.get("transport_type") or McpTransportType.STREAMABLE_HTTP.value)),
         enabled=bool(args.get("enabled", True)),
+        command=str(args["command"]) if args.get("command") is not None else None,
+        args=args.get("args"),
+        env=args.get("env"),
     )
 
 
@@ -337,6 +361,9 @@ def _site_to_dict(site: McpSite) -> dict[str, Any]:
         "name": site.name,
         "transport_type": site.transport_type.value,
         "url": site.url,
+        "command": site.command,
+        "args": site.args,
+        "env": site.env,
         "enabled": site.enabled,
         "last_probe_status": site.last_probe_status.value,
         "last_probe_error": site.last_probe_error,

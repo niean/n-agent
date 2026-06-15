@@ -55,7 +55,7 @@
 
 `GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射和飞书事件幂等。
 
-`McpSiteRegistry`（`app/domain/mcp.py`）：定义 MCP 站点和工具映射的 list/get/create/update/delete、replace_site_tools、update_probe_status、update_tool_enabled 接口。Infrastructure 的 SQLiteMcpSiteRegistry 实现该端口；Application 只依赖该端口和 McpClient 协议。
+`McpSiteRegistry`（`app/domain/mcp.py`）：定义 MCP 站点和工具映射的 list/get/create/update/delete、replace_site_tools、update_probe_status、update_tool_enabled 接口。站点支持 streamable_http、sse 和 stdio 传输；stdio 配置包含 command、args、env。Infrastructure 的 SQLiteMcpSiteRegistry 实现该端口；Application 只依赖该端口和 McpClient 协议。
 
 `Summarizer`（`app/domain/memory.py`）：定义摘要生成接口。MVP 默认 HeuristicSummarizer 实现。
 
@@ -105,7 +105,7 @@ providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_header
 gateway_conversations(id, source_type, source_id, thread_id, display_name, active_session_id, created_at, updated_at)
 gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
 gateway_processed_events(id, source_type, event_id, message_id, created_at)
-mcp_sites(id, name UNIQUE, transport_type, url, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
+mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
 ```
 
@@ -130,6 +130,7 @@ JSON 边界：
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果
 - `mcp_tools.input_schema_json` 存储 MCP 远端工具 schema
+- `mcp_sites.args_json` 和 `mcp_sites.env_json` 存储 stdio MCP server 的参数数组和环境变量映射
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
 
 会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。

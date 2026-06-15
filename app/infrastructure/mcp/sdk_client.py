@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import os
 import socket
 from dataclasses import dataclass
 from typing import Any
@@ -29,21 +30,27 @@ class McpSdkClient:
         self.limits = limits or McpClientLimits()
 
     async def probe_tools(self, site: McpSite) -> McpProbeResult:
-        await validate_mcp_url(site.url, allow_private_hosts=self.limits.allow_private_hosts)
         async with asyncio.timeout(self.limits.connect_timeout_seconds):
-            if site.transport_type is McpTransportType.SSE:
-                tools = await self._probe_sse(site)
+            if site.transport_type is McpTransportType.STDIO:
+                tools = await self._probe_stdio(site)
             else:
-                tools = await self._probe_streamable_http(site)
+                await validate_mcp_url(site.url, allow_private_hosts=self.limits.allow_private_hosts)
+                if site.transport_type is McpTransportType.SSE:
+                    tools = await self._probe_sse(site)
+                else:
+                    tools = await self._probe_streamable_http(site)
         return McpProbeResult(tools=tools)
 
     async def call_tool(self, site: McpSite, remote_name: str, arguments: dict[str, Any]) -> Any:
-        await validate_mcp_url(site.url, allow_private_hosts=self.limits.allow_private_hosts)
         async with asyncio.timeout(self.limits.connect_timeout_seconds):
-            if site.transport_type is McpTransportType.SSE:
-                result = await self._call_sse(site, remote_name, arguments)
+            if site.transport_type is McpTransportType.STDIO:
+                result = await self._call_stdio(site, remote_name, arguments)
             else:
-                result = await self._call_streamable_http(site, remote_name, arguments)
+                await validate_mcp_url(site.url, allow_private_hosts=self.limits.allow_private_hosts)
+                if site.transport_type is McpTransportType.SSE:
+                    result = await self._call_sse(site, remote_name, arguments)
+                else:
+                    result = await self._call_streamable_http(site, remote_name, arguments)
         content = _to_jsonable(result)
         if _json_size(content) > self.limits.max_result_bytes:
             return {"error": "mcp result too large"}
@@ -69,6 +76,17 @@ class McpSdkClient:
                 response = await session.list_tools()
         return self._map_tools(response)
 
+    async def _probe_stdio(self, site: McpSite) -> list[McpRemoteTool]:
+        from mcp import ClientSession
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+
+        server = StdioServerParameters(command=site.command or "", args=site.args, env=merge_stdio_env(site.env))
+        async with stdio_client(server) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                response = await session.list_tools()
+        return self._map_tools(response)
+
     async def _call_streamable_http(self, site: McpSite, remote_name: str, arguments: dict[str, Any]) -> Any:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
@@ -83,6 +101,16 @@ class McpSdkClient:
         from mcp.client.sse import sse_client
 
         async with sse_client(_connection_url(site.url), timeout=self.limits.connect_timeout_seconds) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                return await session.call_tool(remote_name, arguments)
+
+    async def _call_stdio(self, site: McpSite, remote_name: str, arguments: dict[str, Any]) -> Any:
+        from mcp import ClientSession
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+
+        server = StdioServerParameters(command=site.command or "", args=site.args, env=merge_stdio_env(site.env))
+        async with stdio_client(server) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 return await session.call_tool(remote_name, arguments)
@@ -102,6 +130,10 @@ class McpSdkClient:
                 continue
             tools.append(McpRemoteTool(name=name, description=description, input_schema=schema))
         return tools
+
+
+def merge_stdio_env(env: dict[str, str]) -> dict[str, str]:
+    return {**os.environ, **env}
 
 
 async def validate_mcp_url(url: str, allow_private_hosts: bool = False) -> str:

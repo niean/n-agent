@@ -2,7 +2,7 @@ import pytest
 
 from app.application.mcp_service import McpClient, McpService, McpSiteInput, mcp_management_tool_definitions
 from app.application.tool_service import ToolService, builtin_tool_definitions
-from app.domain.mcp import McpProbeResult, McpRemoteTool, McpSiteValidationError
+from app.domain.mcp import McpProbeResult, McpRemoteTool, McpSiteValidationError, McpTransportType
 from app.domain.tool import ToolCallRequest, ToolResult, ToolResultStatus
 from app.infrastructure.registry.sqlite_mcp_registry import SQLiteMcpSiteRegistry
 
@@ -12,7 +12,7 @@ class FakeClient(McpClient):
         self.calls = []
 
     async def probe_tools(self, site):
-        self.calls.append(("probe", site.url))
+        self.calls.append(("probe", site.url, site.command, site.args, site.env))
         return McpProbeResult([McpRemoteTool("search", "Search", {"type": "object", "properties": {}})])
 
     async def call_tool(self, site, remote_name, arguments):
@@ -75,6 +75,59 @@ async def test_mcp_service_blocks_disabled_site(tmp_path):
     assert await service.list_mcp_tool_definitions() == []
     with pytest.raises(McpSiteValidationError):
         await service.call_tool("mcp_docs_search", {})
+
+
+@pytest.mark.asyncio
+async def test_mcp_service_preserves_stdio_config_on_create_and_update(tmp_path):
+    registry = SQLiteMcpSiteRegistry(tmp_path / "sessions.db")
+    service = McpService(registry, FakeClient(), None)
+
+    site = await service.create_site_with_probe(
+        McpSiteInput(
+            "local",
+            "",
+            transport_type=McpTransportType.STDIO,
+            command="uvx",
+            args=["server"],
+            env={"TOKEN": "x"},
+        ),
+        None,
+    )
+    updated = await service.update_site(
+        site.id,
+        McpSiteInput(
+            "local",
+            "",
+            transport_type=McpTransportType.STDIO,
+            command="npx",
+            args=["other"],
+            env={"TOKEN": "y"},
+        ),
+    )
+
+    assert site.command == "uvx"
+    assert site.args == ["server"]
+    assert site.env == {"TOKEN": "x"}
+    assert updated.command == "npx"
+    assert updated.args == ["other"]
+    assert updated.env == {"TOKEN": "y"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_service_validates_stdio_config(tmp_path):
+    registry = SQLiteMcpSiteRegistry(tmp_path / "sessions.db")
+    service = McpService(registry, FakeClient(), None)
+
+    with pytest.raises(McpSiteValidationError):
+        await service.probe_site(McpSiteInput("local", "", transport_type=McpTransportType.STDIO))
+    with pytest.raises(McpSiteValidationError):
+        await service.probe_site(McpSiteInput("local", "", transport_type=McpTransportType.STDIO, command="uvx", args=[1]))
+    with pytest.raises(McpSiteValidationError):
+        await service.probe_site(McpSiteInput("local", "", transport_type=McpTransportType.STDIO, command="uvx", args="server"))
+    with pytest.raises(McpSiteValidationError):
+        await service.probe_site(McpSiteInput("local", "", transport_type=McpTransportType.STDIO, command="uvx", env={"TOKEN": 1}))
+    with pytest.raises(McpSiteValidationError):
+        await service.probe_site(McpSiteInput("local", "", transport_type=McpTransportType.STDIO, command="uvx", env=["TOKEN=x"]))
 
 
 @pytest.mark.asyncio

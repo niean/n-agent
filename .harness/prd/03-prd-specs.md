@@ -55,6 +55,7 @@
 [待办]
 - Issue
 - NFR
+    - 源码：LangGraph实现的AgentLoop
 - FR
     - 交互：飞书接入，支持卡片审批、Drive评论、跨频道主动投递，以及/new、/rename、/delete 等破坏性Gateway 命令
     - RunTime：Sandbox(docker)
@@ -72,4 +73,4 @@
 ---
 
 [待验证]
-- 会话：Title自动生成
+- 工具：MCP支持stdio类型

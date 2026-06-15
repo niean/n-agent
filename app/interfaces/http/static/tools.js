@@ -123,7 +123,7 @@
       table.className = 'document-table';
       const thead = document.createElement('thead');
       const headerRow = document.createElement('tr');
-      ['名称', '传输', 'URL', '启用', '状态', '最近探测', '操作'].forEach((label) => {
+      ['名称', '传输', 'Endpoint', '启用', '状态', '最近探测', '操作'].forEach((label) => {
         const th = document.createElement('th'); th.textContent = label; headerRow.appendChild(th);
       });
       thead.appendChild(headerRow);
@@ -141,7 +141,7 @@
     const tr = document.createElement('tr');
     const name = document.createElement('td'); name.textContent = site.name;
     const transport = document.createElement('td'); transport.textContent = site.transport_type;
-    const url = document.createElement('td'); url.textContent = site.url;
+    const url = document.createElement('td'); url.textContent = site.transport_type === 'stdio' ? `${site.command || '-'} (${(site.args || []).length} args)` : site.url;
     const enabled = document.createElement('td'); enabled.textContent = site.enabled ? '是' : '否';
     const status = document.createElement('td');
     const badge = document.createElement('span');
@@ -203,10 +203,13 @@
     header.append(title, close);
     const name = field('名称', 'text', site ? site.name : '');
     const url = field('URL', 'text', site ? site.url : '');
+    const command = field('Command', 'text', site ? (site.command || '') : '');
+    const args = textareaField('Args', site ? (site.args || []).join('\n') : '');
+    const env = textareaField('Env', site ? Object.entries(site.env || {}).map(([key, value]) => `${key}=${value}`).join('\n') : '');
     const transport = document.createElement('label');
     transport.textContent = '传输类型';
     const select = document.createElement('select');
-    ['streamable_http', 'sse'].forEach((value) => {
+    ['streamable_http', 'sse', 'stdio'].forEach((value) => {
       const option = document.createElement('option');
       option.value = value;
       option.textContent = value;
@@ -220,10 +223,19 @@
     checkbox.checked = site ? site.enabled : true;
     enabled.textContent = '启用';
     enabled.appendChild(checkbox);
+    const updateTransportFields = () => {
+      const isStdio = select.value === 'stdio';
+      url.label.style.display = isStdio ? 'none' : '';
+      command.label.style.display = isStdio ? '' : 'none';
+      args.label.style.display = isStdio ? '' : 'none';
+      env.label.style.display = isStdio ? '' : 'none';
+    };
+    select.addEventListener('change', updateTransportFields);
+    updateTransportFields();
     const actions = document.createElement('div');
     actions.className = 'providers-form__actions';
     const probe = actionButton('探测', async () => {
-      const result = await api.probeMcpSite(sitePayload(name.input, url.input, select, checkbox));
+      const result = await api.probeMcpSite(sitePayload(name.input, url.input, select, checkbox, command.input, args.input, env.input));
       openProbeResult(result.tools || []);
     });
     const save = document.createElement('button');
@@ -231,11 +243,11 @@
     save.className = 'btn btn--primary';
     save.textContent = '保存';
     actions.append(probe, save, actionButton('取消', closeSchemaModal));
-    form.append(header, name.label, url.label, transport, enabled, actions);
+    form.append(header, name.label, transport, url.label, command.label, args.label, env.label, enabled, actions);
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      if (selectedSite) await api.updateMcpSite(selectedSite.id, sitePayload(name.input, url.input, select, checkbox));
-      else await api.createMcpSite(sitePayload(name.input, url.input, select, checkbox));
+      if (selectedSite) await api.updateMcpSite(selectedSite.id, sitePayload(name.input, url.input, select, checkbox, command.input, args.input, env.input));
+      else await api.createMcpSite(sitePayload(name.input, url.input, select, checkbox, command.input, args.input, env.input));
       closeSchemaModal();
       await refreshMcpSites();
       await refreshTools();
@@ -256,8 +268,35 @@
     return { label, input };
   }
 
-  function sitePayload(name, url, transport, enabled) {
-    return { name: name.value, url: url.value, transport_type: transport.value, enabled: enabled.checked };
+  function textareaField(labelText, value) {
+    const label = document.createElement('label');
+    label.textContent = labelText;
+    const input = document.createElement('textarea');
+    input.value = value;
+    label.appendChild(input);
+    return { label, input };
+  }
+
+  function sitePayload(name, url, transport, enabled, command, args, env) {
+    const payload = { name: name.value, url: url.value, transport_type: transport.value, enabled: enabled.checked };
+    if (transport.value === 'stdio') {
+      payload.command = command.value;
+      payload.args = args.value.split('\n').map((item) => item.trim()).filter(Boolean);
+      payload.env = parseEnv(env.value);
+    }
+    return payload;
+  }
+
+  function parseEnv(value) {
+    const result = {};
+    value.split('\n').forEach((line) => {
+      const index = line.indexOf('=');
+      if (index <= 0) return;
+      const key = line.slice(0, index).trim();
+      if (!key) return;
+      result[key] = line.slice(index + 1);
+    });
+    return result;
   }
 
   function openProbeResult(tools) {

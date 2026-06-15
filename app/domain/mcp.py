@@ -10,6 +10,7 @@ from uuid import uuid4
 class McpTransportType(str, Enum):
     STREAMABLE_HTTP = "streamable_http"
     SSE = "sse"
+    STDIO = "stdio"
 
 
 class McpProbeStatus(str, Enum):
@@ -21,9 +22,12 @@ class McpProbeStatus(str, Enum):
 @dataclass(frozen=True)
 class McpSite:
     name: str
-    url: str
+    url: str = ""
     id: str = field(default_factory=lambda: str(uuid4()))
     transport_type: McpTransportType = McpTransportType.STREAMABLE_HTTP
+    command: str | None = None
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
     last_probe_status: McpProbeStatus = McpProbeStatus.NEVER
     last_probe_error: str | None = None
