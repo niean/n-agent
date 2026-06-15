@@ -31,14 +31,16 @@
   function showForm(provider) {
     editing = provider || null;
     fillForm(provider);
-    const form = document.getElementById('providers-form');
-    if (form) form.hidden = false;
+    const modal = document.getElementById('providers-modal');
+    if (modal) modal.hidden = false;
+    const nameInput = document.getElementById('provider-name');
+    if (nameInput) nameInput.focus();
   }
 
   function hideForm() {
     editing = null;
-    const form = document.getElementById('providers-form');
-    if (form) form.hidden = true;
+    const modal = document.getElementById('providers-modal');
+    if (modal) modal.hidden = true;
   }
 
   function makeButton(label, variant, onClick) {
@@ -68,7 +70,15 @@
       const td3 = document.createElement('td'); td3.textContent = p.base_url || '-';
       const td4 = document.createElement('td'); td4.textContent = p.model || '-';
       const td5 = document.createElement('td'); td5.textContent = p.api_key_present ? '已配置' : '未配置';
-      const td6 = document.createElement('td'); td6.textContent = p.is_active ? '✓' : '-';
+      const td6 = document.createElement('td');
+      if (p.is_active) {
+        const badge = document.createElement('span');
+        badge.className = 'badge badge--success';
+        badge.textContent = '✓';
+        td6.appendChild(badge);
+      } else {
+        td6.textContent = '-';
+      }
       const actions = document.createElement('td');
       actions.className = 'row-actions';
       actions.appendChild(makeButton('编辑', '', () => showForm(p)));
@@ -189,6 +199,12 @@
     if (newBtn) newBtn.addEventListener('click', () => showForm(null));
     const cancelBtn = ui.byId('providers-form-cancel');
     if (cancelBtn) cancelBtn.addEventListener('click', hideForm);
+    const closeBtn = ui.byId('providers-form-close');
+    if (closeBtn) closeBtn.addEventListener('click', hideForm);
+    const modal = ui.byId('providers-modal');
+    if (modal) modal.addEventListener('click', (event) => {
+      if (event.target === modal) hideForm();
+    });
     const form = ui.byId('providers-form');
     if (form) form.addEventListener('submit', handleSubmit);
     refreshProviders();

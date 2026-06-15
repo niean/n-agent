@@ -110,6 +110,12 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'listProviders' in models_js
     assert 'activateProvider' in models_js
     assert 'api_key_present' in models_js
+    assert "document.createElement('span')" in models_js
+    assert "badge.className = 'badge badge--success'" in models_js
+    assert "badge.textContent = '✓'" in models_js
+    assert 'td6.appendChild(badge)' in models_js
+    assert "td6.textContent = '-'" in models_js
+    assert "model.is_default === true ? '✓' : '-'" in models_js
     nav_js = client.get('/static/management-navigation.js').text
     assert 'pushState' in nav_js
     assert "'/summary'" in nav_js
@@ -120,7 +126,11 @@ def test_models_page_renders_provider_admin_controls(tmp_path):
     client = _client(tmp_path)
     html = client.get('/models').text
     assert 'id="providers-list"' in html
+    assert 'id="providers-modal"' in html
+    assert 'role="dialog"' in html
+    assert 'aria-modal="true"' in html
     assert 'id="providers-form"' in html
+    assert 'id="providers-form-close"' in html
     assert 'id="provider-name"' in html
     assert 'id="provider-base-url"' in html
     assert 'id="provider-model"' in html

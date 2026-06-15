@@ -119,31 +119,36 @@
           </span>
         </div>
         <div class="panel-body">
-          <div class="providers-shell">
-            <div class="providers-list" id="providers-list"></div>
-            <form class="providers-form" id="providers-form" hidden>
-              <h4 id="providers-form-title">新增 Provider</h4>
-              <input type="hidden" id="provider-id">
-              <label>名称 <input type="text" id="provider-name" required></label>
-              <label>类型
-                <select id="provider-type">
-                  <option value="openai-compatible">openai-compatible</option>
-                </select>
-              </label>
-              <label>Base URL <input type="text" id="provider-base-url" required placeholder="http://..."></label>
-              <label>Model <input type="text" id="provider-model" required></label>
-              <label>API Key <input type="password" id="provider-api-key" placeholder="留空保持不变；输入空格清空"></label>
-              <div class="providers-form__actions">
-                <button class="btn btn--primary" type="submit" id="providers-form-save">保存</button>
-                <button class="btn" type="button" id="providers-form-cancel">取消</button>
-              </div>
-              <div class="providers-form__hint muted" id="providers-form-hint"></div>
-            </form>
+          <div class="providers-list" id="providers-list"></div>
+          <div class="modal-backdrop" id="providers-modal" hidden>
+            <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="providers-form-title">
+              <form class="providers-form" id="providers-form">
+                <div class="modal-header">
+                  <h4 id="providers-form-title">新增 Provider</h4>
+                  <button class="modal-close" id="providers-form-close" type="button" aria-label="关闭">×</button>
+                </div>
+                <input type="hidden" id="provider-id">
+                <label>名称 <input type="text" id="provider-name" required></label>
+                <label>类型
+                  <select id="provider-type">
+                    <option value="openai-compatible">openai-compatible</option>
+                  </select>
+                </label>
+                <label>Base URL <input type="text" id="provider-base-url" required placeholder="http://..."></label>
+                <label>Model <input type="text" id="provider-model" required></label>
+                <label>API Key <input type="password" id="provider-api-key" placeholder="留空保持不变；输入空格清空"></label>
+                <div class="providers-form__hint muted" id="providers-form-hint"></div>
+                <div class="providers-form__actions">
+                  <button class="btn btn--primary" type="submit" id="providers-form-save">保存</button>
+                  <button class="btn" type="button" id="providers-form-cancel">取消</button>
+                </div>
+              </form>
+            </div>
           </div>
         </div>
       </section>
       <section class="status-panel">
-        <div class="panel-header"><span>当前 Provider 模型列表</span><button class="btn" id="models-refresh" type="button">刷新</button></div>
+        <div class="panel-header"><span>模型列表（当前Provider）</span><button class="btn" id="models-refresh" type="button">刷新</button></div>
         <div class="panel-body" id="models-list"></div>
       </section>
     </div>
