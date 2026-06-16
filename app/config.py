@@ -1,4 +1,5 @@
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,12 @@ class Settings(BaseSettings):
     mcp_max_result_bytes: int = Field(default=262144, ge=1024)
     mcp_allow_private_hosts: bool = Field(default=False)
     gateway_enabled: bool = Field(default=True)
+    scheduler_enabled: bool = Field(default=True)
+    scheduler_tick_seconds: float = Field(default=30, gt=0)
+    scheduler_max_due_per_tick: int = Field(default=5, ge=1, le=100)
+    scheduler_missed_grace_seconds: int = Field(default=300, ge=0)
+    scheduler_lease_seconds: int = Field(default=900, ge=30)
+    scheduler_timezone: str = Field(default="Asia/Shanghai")
     feishu_enabled: bool = Field(default=False)
     feishu_app_id: str = Field(default="")
     feishu_app_secret: str = Field(default="")
@@ -40,6 +47,15 @@ class Settings(BaseSettings):
     @classmethod
     def resolve_workspace(cls, value: Path) -> Path:
         return value.resolve()
+
+    @field_validator("scheduler_timezone")
+    @classmethod
+    def validate_scheduler_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except Exception as exc:
+            raise ValueError(f"invalid scheduler timezone: {value}") from exc
+        return value
 
     @field_validator("feishu_allowed_open_ids", "feishu_allowed_chat_ids", mode="before")
     @classmethod

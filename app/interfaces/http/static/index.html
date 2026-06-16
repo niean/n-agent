@@ -38,6 +38,10 @@
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 13h4l2-7 4 12 2-5h4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">健康</span>
       </a>
+      <a class="sidebar__item" href="/scheduled-tasks" data-tab="scheduled-tasks">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 3v3M17 3v3M4 9h16M6 5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">任务</span>
+      </a>
     </nav>
   </aside>
 
@@ -170,6 +174,13 @@
         <div class="panel-body" id="health-detail"></div>
       </section>
     </div>
+
+    <div class="tab-content" id="tab-scheduled-tasks">
+      <section class="status-panel">
+        <div class="panel-header"><span>任务</span><button class="btn" id="scheduled-tasks-refresh" type="button">刷新</button></div>
+        <div class="panel-body" id="scheduled-tasks-list"></div>
+      </section>
+    </div>
   </main>
 
   <script src="/static/management-ui.js"></script>
@@ -181,6 +192,7 @@
   <script src="/static/tools.js"></script>
   <script src="/static/models.js"></script>
   <script src="/static/health.js"></script>
+  <script src="/static/scheduled-tasks.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

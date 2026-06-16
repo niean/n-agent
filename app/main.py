@@ -15,6 +15,10 @@ from app.application.mcp_service import McpManagementToolExecutor, McpService, M
 from app.application.model_service import ModelService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
+from app.application.schedule_run_service import ScheduleRunService
+from app.application.schedule_service import ScheduleService
+from app.application.scheduled_agent_executor import ScheduledAgentExecutor
+from app.application.scheduler_runner import SchedulerRunner
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.config import Settings
@@ -27,6 +31,10 @@ from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
 from app.infrastructure.registry.sqlite_mcp_registry import SQLiteMcpSiteRegistry
 from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
+from app.infrastructure.registry.sqlite_schedule_registry import SQLiteScheduledTaskRegistry
+from app.infrastructure.schedule.croniter_calculator import CroniterScheduleCalculator
+from app.infrastructure.schedule.outbound import ScheduleOutboundDelivery
+from app.infrastructure.schedule.prompt_safety import DeterministicPromptSafetyScanner
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
@@ -80,6 +88,8 @@ class ApplicationServices:
     model_service: ModelService
     gateway_registry: SQLiteGatewaySessionRegistry
     gateway_service: GatewayService
+    schedule_service: ScheduleService
+    scheduler_runner: SchedulerRunner
     health_snapshot: Callable[[], dict]
 
 
@@ -140,6 +150,38 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     )
     chat_service = ChatCompletionService(memory_store, graph_runner, session_service)
     model_service = ModelService(holder, lambda: holder.current_model)
+    schedule_calculator = CroniterScheduleCalculator()
+    schedule_scanner = DeterministicPromptSafetyScanner()
+    feishu_client = FeishuClient(
+        FeishuConfig(
+            app_id=settings.feishu_app_id,
+            app_secret=settings.feishu_app_secret,
+            tenant_key=settings.feishu_tenant_key,
+            allowed_open_ids=settings.feishu_allowed_open_ids,
+            allowed_chat_ids=settings.feishu_allowed_chat_ids,
+        )
+    ) if settings.feishu_enabled else None
+    schedule_registry = SQLiteScheduledTaskRegistry(
+        settings.sqlite_path,
+        schedule_calculator,
+        missed_grace_seconds=settings.scheduler_missed_grace_seconds,
+    )
+    scheduled_agent_executor = ScheduledAgentExecutor(chat_service, schedule_scanner)
+    schedule_run_service = ScheduleRunService(
+        schedule_registry,
+        scheduled_agent_executor,
+        ScheduleOutboundDelivery(feishu_client),
+        max_due_per_tick=settings.scheduler_max_due_per_tick,
+        lease_seconds=settings.scheduler_lease_seconds,
+    )
+    schedule_service = ScheduleService(
+        schedule_registry,
+        schedule_calculator,
+        schedule_scanner,
+        session_service,
+        schedule_run_service.run_now,
+    )
+    scheduler_runner = SchedulerRunner(schedule_run_service, settings.scheduler_tick_seconds)
 
     def health_snapshot() -> dict:
         memory_status = "ok"
@@ -164,6 +206,11 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             },
             "mcp": {"status": mcp_status, "error": mcp_error},
             "gateway": {"status": "ok" if settings.gateway_enabled else "disabled"},
+            "scheduler": {
+                "status": "ok" if settings.scheduler_enabled else "disabled",
+                "tick_seconds": settings.scheduler_tick_seconds,
+                "timezone": settings.scheduler_timezone,
+            },
         }
 
     gateway_service = GatewayService(
@@ -173,7 +220,9 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         tool_service,
         model_service,
         health_snapshot,
+        schedule_service=schedule_service,
     )
+    session_service.on_session_deleted = schedule_service.handle_session_deleted
     return ApplicationServices(
         settings=settings,
         memory_store=memory_store,
@@ -187,6 +236,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         model_service=model_service,
         gateway_registry=gateway_registry,
         gateway_service=gateway_service,
+        schedule_service=schedule_service,
+        scheduler_runner=scheduler_runner,
         health_snapshot=health_snapshot,
     )
 
@@ -197,6 +248,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         feishu_task: asyncio.Task | None = None
+        scheduler_task: asyncio.Task | None = None
+        if services.settings.scheduler_enabled:
+            scheduler_task = asyncio.create_task(services.scheduler_runner.run())
         if services.settings.feishu_enabled:
             feishu_client = FeishuClient(
                 FeishuConfig(
@@ -212,6 +266,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            if scheduler_task is not None:
+                services.scheduler_runner.stop()
+                scheduler_task.cancel()
+                try:
+                    await scheduler_task
+                except asyncio.CancelledError:
+                    pass
             if feishu_task is not None:
                 feishu_task.cancel()
                 try:
@@ -230,6 +291,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             services.health_snapshot,
             provider_service=services.provider_service,
             mcp_service=services.mcp_service,
+            schedule_service=services.schedule_service,
         )
     )
     return app

@@ -13,7 +13,7 @@ from app.domain.agent import AgentState, RunStatus
 from app.domain.memory import MemoryStore, Summarizer
 from app.domain.provider import LLMEventType, LLMProvider, LLMResult
 from app.domain.session import ConversationMessage, Summary, TaskState, ToolCall
-from app.domain.tool import ToolCallRequest, ToolExecutionContext
+from app.domain.tool import RiskLevel, ToolCallRequest, ToolExecutionContext
 
 
 class AgentGraphRunner:
@@ -56,7 +56,8 @@ class AgentGraphRunner:
         return graph.compile()
 
     async def run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
-        result = await self.graph.ainvoke(state, {"configurable": {"model": model, "options": options or {}}})
+        state.run_options = dict(options or {})
+        result = await self.graph.ainvoke(state, {"configurable": {"model": model, "options": state.run_options}})
         return AgentState(**result) if isinstance(result, dict) else result
 
     async def stream_events(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AsyncIterator[ChatEvent]:
@@ -90,11 +91,14 @@ class AgentGraphRunner:
             return state
         configurable = (config or {}).get("configurable", {})
         model = configurable.get("model", "")
-        options = configurable.get("options", {})
+        options = configurable.get("options") or state.run_options
         try:
+            tools = self.tool_service.list_openai_tools(
+                RiskLevel.SAFE if options.get("tool_exposure_policy") == "safe_only" else None
+            )
             result = await self.llm_provider.chat(
                 state.working_messages,
-                self.tool_service.list_openai_tools(),
+                tools,
                 False,
                 model,
                 options,

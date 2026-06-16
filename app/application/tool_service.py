@@ -45,7 +45,7 @@ class ToolService:
                 return dynamic[name]
         return None
 
-    def list_openai_tools(self) -> list[dict]:
+    def list_openai_tools(self, risk_level: RiskLevel | None = None) -> list[dict]:
         return [
             {
                 "type": "function",
@@ -57,7 +57,7 @@ class ToolService:
             }
             for definition in self.list_definitions()
             if definition.enabled
-            and definition.risk_level is not RiskLevel.DANGEROUS
+            and (definition.risk_level is risk_level if risk_level else definition.risk_level is not RiskLevel.DANGEROUS)
             and isinstance(definition.input_schema, dict)
             and definition.input_schema.get("type") == "object"
         ]

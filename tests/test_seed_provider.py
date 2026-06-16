@@ -6,7 +6,9 @@ import pytest
 from app.application.runtime_provider import ActiveProviderHolder
 from app.config import Settings
 from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
-from app.main import _provider_factory, _seed_and_activate
+from fastapi.testclient import TestClient
+
+from app.main import _provider_factory, _seed_and_activate, build_application_services, create_app
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -73,3 +75,40 @@ def test_seed_noop_when_settings_incomplete(tmp_path: Path, monkeypatch: pytest.
     providers = asyncio.run(registry.list_providers())
     assert providers == []
     assert holder.current_config is None
+
+
+def test_build_application_services_wires_scheduler(tmp_path: Path):
+    settings = Settings(
+        provider_base_url="",
+        provider_api_key="",
+        provider_model="",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        scheduler_enabled=False,
+        feishu_enabled=False,
+    )
+
+    services = build_application_services(settings)
+
+    assert services.schedule_service is not None
+    assert services.scheduler_runner is not None
+    assert services.session_service.on_session_deleted == services.schedule_service.handle_session_deleted
+    assert services.health_snapshot()["scheduler"]["status"] == "disabled"
+
+
+def test_create_app_exposes_scheduled_task_routes(tmp_path: Path):
+    settings = Settings(
+        provider_base_url="",
+        provider_api_key="",
+        provider_model="",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        scheduler_enabled=False,
+        feishu_enabled=False,
+    )
+    client = TestClient(create_app(settings))
+
+    response = client.get("/chat/scheduled-tasks")
+
+    assert response.status_code == 200
+    assert response.json() == []

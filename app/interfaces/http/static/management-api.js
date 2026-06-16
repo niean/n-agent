@@ -41,6 +41,24 @@
   const deleteProvider = (id) => fetchJson(`/chat/providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
   const activateProvider = (id) => fetchJson(`/chat/providers/${encodeURIComponent(id)}/activate`, { method: 'POST' });
 
+  const listScheduledTasks = () => fetchJson('/chat/scheduled-tasks');
+  const getScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}`);
+  const createScheduledTask = (payload) => fetchJson('/chat/scheduled-tasks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const updateScheduledTask = (id, payload) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const listScheduledTaskExecutions = (id, limit) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/executions?limit=${encodeURIComponent(limit || 10)}`);
+  const runScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/run`, { method: 'POST' });
+  const pauseScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/pause`, { method: 'POST' });
+  const resumeScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+  const deleteScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
+
   const listMcpSites = () => fetchJson('/chat/mcp/sites');
   const probeMcpSite = (payload) => fetchJson('/chat/mcp/sites/probe', {
     method: 'POST',
@@ -85,6 +103,15 @@
     updateProvider,
     deleteProvider,
     activateProvider,
+    listScheduledTasks,
+    getScheduledTask,
+    createScheduledTask,
+    updateScheduledTask,
+    listScheduledTaskExecutions,
+    runScheduledTask,
+    pauseScheduledTask,
+    resumeScheduledTask,
+    deleteScheduledTask,
     listMcpSites,
     probeMcpSite,
     createMcpSite,

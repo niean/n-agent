@@ -45,3 +45,4 @@ class AgentState:
     error: str | None = None
     final_message: dict[str, Any] | None = None
     finish_reason: str | None = None
+    run_options: dict[str, Any] = field(default_factory=dict)

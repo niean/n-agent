@@ -1,6 +1,6 @@
 (function (global) {
   const namespace = global.NAGENT || {};
-  const initialized = { summary: false, chat: false, sessions: false, tools: false, models: false, status: false };
+  const initialized = { summary: false, chat: false, sessions: false, tools: false, models: false, status: false, 'scheduled-tasks': false };
 
   function onTabActivated(tab) {
     const module = namespace[tab];

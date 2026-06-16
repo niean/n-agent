@@ -55,7 +55,7 @@ def test_chat_returns_index_html(tmp_path):
 
 def test_all_tab_paths_return_shell(tmp_path):
     client = _client(tmp_path)
-    for path in ("/", "/summary", "/chat", "/sessions", "/tools", "/models", "/status"):
+    for path in ("/", "/summary", "/chat", "/sessions", "/tools", "/models", "/status", "/scheduled-tasks"):
         response = client.get(path)
         assert response.status_code == 200, f"missing shell at {path}"
         assert 'id="app-sidebar"' in response.text, f"shell incomplete at {path}"
@@ -75,6 +75,7 @@ def test_static_assets_served(tmp_path):
         "/static/tools.js",
         "/static/models.js",
         "/static/health.js",
+        "/static/scheduled-tasks.js",
         "/static/favicon.svg",
     )
     for path in paths:
@@ -130,6 +131,32 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'pushState' in nav_js
     assert "'/summary'" in nav_js
     assert "'/status'" in nav_js
+
+
+def test_scheduled_tasks_static_assets_contain_management_ui(tmp_path):
+    client = _client(tmp_path)
+    api_js = client.get('/static/management-api.js').text
+    for expected in (
+        'getScheduledTask',
+        'createScheduledTask',
+        'updateScheduledTask',
+        'listScheduledTaskExecutions',
+    ):
+        assert expected in api_js
+
+    scheduled_js = client.get('/static/scheduled-tasks.js').text
+    for expected in (
+        'scheduled-modal-grid',
+        'openTaskForm',
+        'openTaskDetail',
+        'listScheduledTaskExecutions',
+        'confirmDeleteTask',
+        'document.createElement',
+        '.textContent',
+    ):
+        assert expected in scheduled_js
+    assert 'innerHTML =' not in scheduled_js
+    assert 'insertAdjacentHTML' not in scheduled_js
 
 
 def test_models_page_renders_provider_admin_controls(tmp_path):
@@ -193,7 +220,7 @@ def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
 def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',
-                 '/static/models.js', '/static/health.js', '/static/summary.js'):
+                 '/static/models.js', '/static/health.js', '/static/summary.js', '/static/scheduled-tasks.js'):
         body = client.get(path).text
         assert 'innerHTML =' not in body, f"{path} contains innerHTML assignment"
         assert 'insertAdjacentHTML' not in body, f"{path} uses insertAdjacentHTML"
@@ -215,11 +242,12 @@ def test_index_html_links_assets(tmp_path):
         '/static/tools.js',
         '/static/models.js',
         '/static/health.js',
+        '/static/scheduled-tasks.js',
         '/static/favicon.svg',
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '工具', '模型', '健康'):
+    for tab in ('概览', '对话', '会话', '工具', '模型', '健康', '任务'):
         assert tab in html, f"index.html missing menu label {tab}"
-    for path in ('/summary', '/chat', '/sessions', '/tools', '/models', '/status'):
+    for path in ('/summary', '/chat', '/sessions', '/tools', '/models', '/status', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"

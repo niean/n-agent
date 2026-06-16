@@ -156,6 +156,22 @@ async def test_delete_session_removes_session(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_session_notifies_after_delete(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    deleted_sessions = []
+
+    async def on_deleted(session_id: str) -> None:
+        deleted_sessions.append(session_id)
+
+    service = SessionService(store, on_session_deleted=on_deleted)
+
+    await service.delete_session("s1")
+
+    assert deleted_sessions == ["s1"]
+
+
+@pytest.mark.asyncio
 async def test_delete_session_raises_when_missing(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     service = SessionService(store)

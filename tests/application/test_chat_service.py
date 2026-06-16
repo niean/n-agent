@@ -28,6 +28,20 @@ class ErrorProvider(FakeProvider):
         raise RuntimeError("provider failure")
 
 
+class RecordingRunner:
+    def __init__(self):
+        self.options = None
+
+    async def run(self, state, model, options=None):
+        self.options = dict(options or {})
+        state.final_message = {"role": "assistant", "content": "ok"}
+        state.finish_reason = "stop"
+        return state
+
+    def stream_events(self, state, model, options=None):
+        raise AssertionError("stream not used")
+
+
 def _build_service(store, tmp_path):
     runner = AgentGraphRunner(
         FakeProvider(),
@@ -65,6 +79,42 @@ async def test_chat_service_stream_produces_events(tmp_path):
     assert events[0].type == ChatEventType.MESSAGE_START
     assert events[-1].type == ChatEventType.DONE
     assert any(event.type == ChatEventType.CONTENT_DELTA for event in events)
+
+
+@pytest.mark.asyncio
+async def test_chat_service_realtime_infers_confirm_context(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "新增 MCP 站点 https://example.com"}],
+            stream=False,
+        )
+    )
+
+    assert "tool_execution_context" in runner.options
+
+
+@pytest.mark.asyncio
+async def test_chat_service_unattended_disables_confirm_context_and_uses_safe_only(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "新增 MCP 站点 https://example.com"}],
+            stream=False,
+            options={"execution_context_mode": "unattended"},
+        )
+    )
+
+    assert "tool_execution_context" not in runner.options
+    assert runner.options["tool_exposure_policy"] == "safe_only"
 
 
 @pytest.mark.asyncio

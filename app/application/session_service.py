@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 
 from app.domain.memory import MemoryStore
 from app.domain.session import (
@@ -15,10 +16,19 @@ from app.domain.session import (
 logger = logging.getLogger(__name__)
 
 
+SessionDeletedHandler = Callable[[str], Awaitable[object]]
+
+
 class SessionService:
-    def __init__(self, memory_store: MemoryStore, title_generator: TitleGenerator | None = None):
+    def __init__(
+        self,
+        memory_store: MemoryStore,
+        title_generator: TitleGenerator | None = None,
+        on_session_deleted: SessionDeletedHandler | None = None,
+    ):
         self.memory_store = memory_store
         self.title_generator = title_generator
+        self.on_session_deleted = on_session_deleted
 
     async def create_session(self, session_id: str, source: str = "dashboard") -> ConversationSession:
         session = ConversationSession(id=session_id, source=source)
@@ -56,6 +66,8 @@ class SessionService:
         deleted = await self.memory_store.delete_session(session_id)
         if not deleted:
             raise SessionNotFoundError(session_id)
+        if self.on_session_deleted is not None:
+            await self.on_session_deleted(session_id)
 
     async def ensure_title(self, session_id: str, user_message: str) -> None:
         if not self.title_generator or not user_message:

@@ -15,6 +15,26 @@ Agent Runtime
 └── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
+## Loop FSM
+```mermaid
+stateDiagram-v2
+  [*] --> load_context
+  load_context --> call_llm
+  call_llm --> execute_tools: pending_tool_calls
+  call_llm --> update_memory: no tool calls
+  call_llm --> finalize: error
+  execute_tools --> update_memory
+  update_memory --> call_llm: continue
+  update_memory --> finalize: error / final_message / iteration_limit reached
+  finalize --> [*]
+```
+库：LangGraph.Graph.StateGraph
+
+
+
+---
+---
+
 ## 分层边界
 
 ```text
@@ -30,7 +50,6 @@ Infrastructure -> Domain
 Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层的 Runtime Loop 实现细节。
 
 ## 核心业务流程
-
 ```text
 客户端请求
   -> ChatCompletionService 创建/读取会话并写入用户消息
@@ -39,12 +58,6 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
   -> ToolService 校验 Policy 并执行模型请求的工具
   -> MemoryStore 写入助手消息、工具调用、任务状态和摘要
   -> 返回 ChatCompletion 或 SSE 事件
-```
-
-当前 Runtime Loop 对应 LangGraph 节点：
-
-```text
-load_context -> call_llm -> execute_tools -> update_memory -> finalize
 ```
 
 ## 关键领域模型

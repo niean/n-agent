@@ -5,7 +5,7 @@ from app.application.events import ChatEventType
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.domain.agent import AgentState
 from app.domain.provider import LLMResult, ModelInfo
-from app.domain.tool import ToolCallRequest, ToolResult, ToolResultStatus
+from app.domain.tool import RiskLevel, ToolCallRequest, ToolDefinition, ToolResult, ToolResultStatus
 from app.domain.session import ConversationSession
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
@@ -92,6 +92,17 @@ class KnowledgeProvider(FakeProvider):
                 finish_reason="tool_calls",
             )
         return LLMResult(message={"role": "assistant", "content": "Python answer from snippets"}, finish_reason="stop")
+
+
+class CapturingToolsProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.tools = []
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.tools = list(tools)
+        self.calls += 1
+        return LLMResult(message={"role": "assistant", "content": "hello"}, finish_reason="stop")
 
 
 class FakeKnowledgeExecutor:
@@ -206,6 +217,34 @@ async def test_agent_graph_excludes_system_prompt_from_summary(tmp_path):
     summary = await store.get_summary("s1")
     assert summary is not None
     assert "N-Agent(Niean's Agent MVP)" not in summary.summary
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_uses_safe_only_tool_surface_when_requested(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    provider = CapturingToolsProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(
+            build_builtin_tool_executor(tmp_path),
+            builtin_tool_definitions()
+            + [ToolDefinition("confirm_tool", "confirm", {"type": "object"}, RiskLevel.CONFIRM)],
+        ),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    await runner.run(
+        AgentState(session_id="s1", input_messages=[{"role": "user", "content": "hi"}]),
+        "test",
+        {"tool_exposure_policy": "safe_only"},
+    )
+
+    names = {schema["function"]["name"] for schema in provider.tools}
+    assert "confirm_tool" not in names
+    assert "calculator" in names
 
 
 @pytest.mark.asyncio

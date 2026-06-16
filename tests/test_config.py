@@ -37,6 +37,58 @@ def test_settings_has_kb_defaults(tmp_path: Path):
     assert settings.kb_timeout_seconds == 10
 
 
+def test_settings_has_scheduler_defaults(tmp_path: Path):
+    settings = Settings(
+        provider_base_url="https://example.test/v1",
+        provider_api_key="test-key",
+        provider_model="test-model",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+
+    assert settings.scheduler_enabled is True
+    assert settings.scheduler_tick_seconds == 30
+    assert settings.scheduler_max_due_per_tick == 5
+    assert settings.scheduler_missed_grace_seconds == 300
+    assert settings.scheduler_lease_seconds == 900
+    assert settings.scheduler_timezone == "Asia/Shanghai"
+
+
+@pytest.mark.parametrize("timezone", ["Not/AZone", ""])
+def test_settings_validates_scheduler_timezone(tmp_path: Path, timezone: str):
+    with pytest.raises(ValidationError):
+        Settings(
+            provider_base_url="https://example.test/v1",
+            provider_api_key="test-key",
+            provider_model="test-model",
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            scheduler_timezone=timezone,
+            _env_file=None,
+        )
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"scheduler_tick_seconds": 0},
+    {"scheduler_max_due_per_tick": 0},
+    {"scheduler_missed_grace_seconds": -1},
+    {"scheduler_lease_seconds": 10},
+])
+def test_settings_validates_scheduler_bounds(tmp_path: Path, kwargs: dict):
+    with pytest.raises(ValidationError):
+        Settings(
+            provider_base_url="https://example.test/v1",
+            provider_api_key="test-key",
+            provider_model="test-model",
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            **kwargs,
+        )
+
+
+
 def test_settings_has_gateway_and_feishu_defaults(tmp_path: Path):
     settings = Settings(
         provider_base_url="https://example.test/v1",

@@ -86,13 +86,51 @@ class FakeModelService:
         return [ModelInfo("model-a", "Model A", "test", True, True)]
 
 
+class FakeScheduleService:
+    def __init__(self):
+        self.created = []
+        self.run_ids = []
+
+    async def create(self, request):
+        self.created.append(request)
+        from app.domain.schedule import DeliveryTarget, ScheduledTask, ScheduleExpression, ScheduleTimezone
+        from datetime import datetime, timezone
+
+        return ScheduledTask(
+            id="sched-1",
+            name=request.name,
+            prompt=request.prompt,
+            schedule=ScheduleExpression(request.cron_expression),
+            timezone=ScheduleTimezone(request.timezone),
+            session_id="session-1",
+            delivery_target=DeliveryTarget.dashboard(),
+            next_run_at=datetime(2026, 6, 16, tzinfo=timezone.utc),
+        )
+
+    async def list(self):
+        return []
+
+    async def pause(self, task_id):
+        return None
+
+    async def resume(self, task_id):
+        return None
+
+    async def run_now(self, task_id):
+        self.run_ids.append(task_id)
+        return {"status": "ok"}
+
+    async def delete(self, task_id):
+        return True
+
+
 @dataclass
 class Harness:
     registry: FakeGatewayRegistry = field(default_factory=FakeGatewayRegistry)
     session_service: FakeSessionService = field(default_factory=FakeSessionService)
     chat_service: FakeChatService = field(default_factory=FakeChatService)
 
-    def service(self):
+    def service(self, schedule_service=None):
         return GatewayService(
             self.registry,
             self.chat_service,
@@ -100,6 +138,7 @@ class Harness:
             FakeToolService(),
             FakeModelService(),
             lambda: {"provider": {"status": "ok"}, "gateway": {"status": "ok"}},
+            schedule_service=schedule_service,
         )
 
 
@@ -169,6 +208,34 @@ async def test_gateway_service_tools_models_and_status_commands():
     assert "calculator" in tools.messages[0].content
     assert "model-a" in models.messages[0].content
     assert "provider" in status.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_gateway_schedule_add_uses_origin_metadata():
+    harness = Harness()
+    schedule = FakeScheduleService()
+    service = harness.service(schedule)
+    event = message("/schedule add */5 * * * * summarize", "event-schedule")
+    event.metadata.update({"receive_id": "oc_1", "receive_id_type": "chat_id", "capabilities": ["active_text_delivery"]})
+
+    response = await service.handle_message(event)
+
+    assert "sched-1" in response.messages[0].content
+    assert schedule.created[0].cron_expression == "*/5 * * * *"
+    assert schedule.created[0].prompt == "summarize"
+    assert schedule.created[0].origin["receive_id"] == "oc_1"
+
+
+@pytest.mark.asyncio
+async def test_gateway_schedule_run_delegates_to_schedule_service():
+    harness = Harness()
+    schedule = FakeScheduleService()
+    service = harness.service(schedule)
+
+    response = await service.handle_message(message("/schedule run sched-1", "event-run"))
+
+    assert schedule.run_ids == ["sched-1"]
+    assert "ok" in response.messages[0].content
 
 
 @pytest.mark.asyncio

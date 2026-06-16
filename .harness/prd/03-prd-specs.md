@@ -38,6 +38,8 @@
     - 会话：调试信息，默认收起到右侧，支持点击展开，留下的空间给到对话区
 
 [20260615]
+- NFR
+    - 源码：LangGraph实现的AgentLoop
 - FR
     - 模型：Active状态使用绿色对号图标
     - 模型：新增、修改模型，改为弹出框页面
@@ -51,6 +53,12 @@
     - 对话：对话框中，调试信息默认收起不展开，可点击展开
     - 对话：调试信息展开时，会话会变宽，期望的效果是会话宽度不变
 
+[20260616]
+- FR
+    - 任务：[KF]新增任务。要求：①严格遵循DDD分层架构，②优先使用流行代码库，③借鉴Hermes-Agent的实现/Users/niean/code/github.com/niean/hermes-agent
+        - 审阅：Spec spec-260615-scheduled-tasks.md，发现其中的严重问题
+        - 审阅：Plan plan-260615-scheduled-tasks.md，发现其中的严重问题
+        - 迭代：Dashboard，任务没有页面，补全完整功能
 
 
 ---
@@ -58,13 +66,12 @@
 [待办]
 - Issue
 - NFR
-    - 源码：LangGraph实现的AgentLoop
+    - 源码：AgentCore
+    - 治理：IAM，安全护栏
 - FR
     - 交互：飞书接入，支持卡片审批、Drive评论、跨频道主动投递，以及/new、/rename、/delete 等破坏性Gateway 命令
-    - RunTime：Sandbox(docker)
-    - 定时任务
-    - 治理：IAM，安全护栏
-    - 交互：飞书IM接入
+    - 工具：Skill
+    - 工具：Sandbox(docker)
     - 工具：相比Hermes，还缺少如下功能
         不连接 MCP server，不做 mcp_{server}_{tool} 动态发现。
         不实现 Skill 目录扫描、skills_list、skill_view。

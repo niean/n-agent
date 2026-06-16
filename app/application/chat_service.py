@@ -60,9 +60,12 @@ class ChatCompletionService:
         await self.session_service.ensure_title(session_id, str(first_user_message))
         state = AgentState(session_id=session_id, input_messages=request.messages)
         options = dict(request.options)
-        context = _mcp_tool_execution_context(str(first_user_message))
-        if context.allowed_confirm_tools:
-            options["tool_execution_context"] = context
+        if options.get("execution_context_mode") == "unattended":
+            options["tool_exposure_policy"] = "safe_only"
+        else:
+            context = _mcp_tool_execution_context(str(first_user_message))
+            if context.allowed_confirm_tools:
+                options["tool_execution_context"] = context
         if request.stream:
             return self.graph_runner.stream_events(state, request.model, options)
         final_state = await self.graph_runner.run(state, request.model, options)

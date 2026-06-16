@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.application.model_service import ModelService
 from app.application.provider_service import ProviderCreateInput, ProviderService, ProviderUpdateInput
+from app.application.schedule_service import ScheduledTaskNotFoundError, ScheduleValidationError
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.provider import ModelInfo
@@ -44,7 +45,102 @@ def _default_health() -> dict:
     }
 
 
-def _build_app(store, health=None, model_service=None, provider_service=None):
+class _FakeScheduleService:
+    def __init__(self):
+        self.tasks = []
+        self.created_requests = []
+        self.updated_requests = []
+        self.run_errors = {}
+
+    async def list(self):
+        return self.tasks
+
+    async def create(self, request):
+        from app.domain.schedule import DeliveryTarget, ScheduledTask, ScheduleExpression, ScheduleTimezone
+        from datetime import datetime, timezone
+
+        self.created_requests.append(request)
+        task = ScheduledTask(
+            id=f"sched-{len(self.tasks) + 1}",
+            name=request.name,
+            prompt=request.prompt,
+            schedule=ScheduleExpression(request.cron_expression),
+            timezone=ScheduleTimezone(request.timezone),
+            session_id=request.session_id or "session-1",
+            delivery_target=DeliveryTarget.silent() if request.delivery_target == "silent" else DeliveryTarget.dashboard(),
+            next_run_at=datetime(2026, 6, 16, tzinfo=timezone.utc),
+            created_at=datetime(2026, 6, 15, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 6, 15, tzinfo=timezone.utc),
+        )
+        self.tasks.append(task)
+        return task
+
+    async def get(self, task_id):
+        for task in self.tasks:
+            if task.id == task_id:
+                return task
+        raise ScheduledTaskNotFoundError(task_id)
+
+    async def update(self, task_id, request):
+        from app.domain.schedule import DeliveryTarget, ScheduledTask, ScheduleExpression, ScheduleTimezone
+
+        task = await self.get(task_id)
+        self.updated_requests.append(request)
+        updated = ScheduledTask(
+            **{
+                **task.__dict__,
+                "name": request.name if request.name is not None else task.name,
+                "prompt": request.prompt if request.prompt is not None else task.prompt,
+                "schedule": ScheduleExpression(request.cron_expression or task.schedule.value),
+                "timezone": ScheduleTimezone(request.timezone or task.timezone.value),
+                "session_id": request.session_id if request.session_id is not None else task.session_id,
+                "delivery_target": DeliveryTarget.silent() if request.delivery_target == "silent" else task.delivery_target,
+            }
+        )
+        self.tasks = [updated if item.id == task_id else item for item in self.tasks]
+        return updated
+
+    async def list_executions(self, task_id, limit=10):
+        from app.domain.schedule import ScheduledTaskExecution, ScheduledTaskExecutionStatus
+        from datetime import datetime, timezone
+
+        await self.get(task_id)
+        if limit < 1 or limit > 50:
+            raise ScheduleValidationError("invalid limit")
+        return [
+            ScheduledTaskExecution(
+                id="execution-1",
+                task_id=task_id,
+                session_id="session-1",
+                claim_id="claim-1",
+                lease_owner="owner-1",
+                status=ScheduledTaskExecutionStatus.SUCCEEDED,
+                started_at=datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc),
+                completed_at=datetime(2026, 6, 16, 0, 1, tzinfo=timezone.utc),
+                output="done",
+                delivery_status="success",
+                created_at=datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc),
+            )
+        ][:limit]
+
+    async def pause(self, task_id):
+        return await self.get(task_id)
+
+    async def resume(self, task_id):
+        return await self.get(task_id)
+
+    async def run_now(self, task_id):
+        if task_id in self.run_errors:
+            raise self.run_errors[task_id]
+        return {"status": "ok"}
+
+    async def delete(self, task_id):
+        await self.get(task_id)
+        return True
+
+
+
+def _build_app(store, health=None, model_service=None, provider_service=None, schedule_service=None):
     tool_service = ToolService(_StubExecutor(), builtin_tool_definitions())
     model_service = model_service or ModelService(_StubProvider(), "real-1")
     app = FastAPI()
@@ -55,6 +151,7 @@ def _build_app(store, health=None, model_service=None, provider_service=None):
         model_service,
         health or _default_health,
         provider_service=provider_service,
+        schedule_service=schedule_service,
     ))
     return app
 
@@ -109,6 +206,128 @@ def test_chat_sessions_includes_feishu_gateway_sessions(tmp_path):
 
     assert response.status_code == 200
     assert {item["id"]: item["source"] for item in response.json()}["feishu-session"] == "feishu"
+
+
+def test_scheduled_tasks_routes(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    client = TestClient(_build_app(store, schedule_service=schedule))
+
+    shell = client.get("/scheduled-tasks")
+    created = client.post("/chat/scheduled-tasks", json={"name": "Daily", "prompt": "summarize", "cron_expression": "*/5 * * * *", "timezone": "Asia/Shanghai"})
+    listed = client.get("/chat/scheduled-tasks")
+    run = client.post("/chat/scheduled-tasks/sched-1/run")
+
+    assert shell.status_code == 200
+    assert created.json()["id"] == "sched-1"
+    assert listed.json()[0]["timezone"] == "Asia/Shanghai"
+    assert run.json()["status"] == "ok"
+
+
+
+def test_scheduled_task_update_and_execution_routes(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    client = TestClient(_build_app(store, schedule_service=schedule))
+    created = client.post("/chat/scheduled-tasks", json={"name": "Daily", "prompt": "summarize", "cron_expression": "*/5 * * * *"}).json()
+
+    patched = client.patch(f"/chat/scheduled-tasks/{created['id']}", json={"name": "Updated", "delivery_target": "silent", "session_id": "session-2"})
+    executions = client.get(f"/chat/scheduled-tasks/{created['id']}/executions?limit=10")
+    invalid = client.get(f"/chat/scheduled-tasks/{created['id']}/executions?limit=0")
+
+    assert patched.status_code == 200
+    assert patched.json()["name"] == "Updated"
+    assert patched.json()["delivery_target"] == "silent"
+    assert patched.json()["session_id"] == "session-2"
+    assert executions.status_code == 200
+    assert executions.json()[0]["id"] == "execution-1"
+    assert invalid.status_code == 422
+
+
+def test_scheduled_task_origin_payloads_are_protected(tmp_path):
+    from app.domain.schedule import DeliveryTarget, ScheduledTask, ScheduleExpression, ScheduleTimezone
+    from datetime import datetime, timezone
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    origin_task = ScheduledTask(
+        id="origin-1",
+        name="Origin",
+        prompt="prompt",
+        schedule=ScheduleExpression("0 9 * * *"),
+        timezone=ScheduleTimezone("Asia/Shanghai"),
+        session_id="session-origin",
+        delivery_target=DeliveryTarget.origin({"receive_id": "chat-1", "receive_id_type": "chat_id"}),
+        origin={"receive_id": "chat-1", "receive_id_type": "chat_id"},
+        next_run_at=datetime(2026, 6, 16, tzinfo=timezone.utc),
+    )
+    schedule.tasks.append(origin_task)
+    client = TestClient(_build_app(store, schedule_service=schedule))
+
+    create_origin = client.post("/chat/scheduled-tasks", json={"name": "x", "prompt": "p", "cron_expression": "* * * * *", "delivery_target": "origin"})
+    create_context = client.post("/chat/scheduled-tasks", json={"name": "x", "prompt": "p", "cron_expression": "* * * * *", "origin": {"receive_id": "x"}})
+    patched = client.patch(
+        "/chat/scheduled-tasks/origin-1",
+        json={"name": "Renamed", "delivery_target": "silent", "session_id": "changed", "origin": {"receive_id": "changed"}, "delivery_context": {"receive_id": "changed"}},
+    )
+
+    assert create_origin.status_code == 422
+    assert create_origin.json()["error"]["code"] == "scheduled_task_delivery_context_invalid"
+    assert create_context.status_code == 422
+    assert patched.status_code == 200
+    assert schedule.updated_requests[-1].name == "Renamed"
+    assert schedule.updated_requests[-1].delivery_target is None
+    assert schedule.updated_requests[-1].session_id is None
+    assert schedule.updated_requests[-1].origin is None
+
+
+def test_scheduled_task_errors_are_mapped(tmp_path):
+    class ErrorSchedule(_FakeScheduleService):
+        async def get(self, task_id):
+            raise ScheduledTaskNotFoundError(task_id)
+
+        async def create(self, request):
+            raise ScheduleValidationError("bad")
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store, schedule_service=ErrorSchedule()))
+
+    missing = client.get("/chat/scheduled-tasks/missing")
+    invalid = client.post("/chat/scheduled-tasks", json={"name": "x"})
+
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "scheduled_task_not_found"
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "scheduled_task_invalid"
+
+
+def test_scheduled_task_run_now_error_contract(tmp_path):
+    from app.application.schedule_service import ScheduledTaskNotRunnableError
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    client = TestClient(_build_app(store, schedule_service=schedule))
+    created = client.post("/chat/scheduled-tasks", json={"name": "Daily", "prompt": "summarize", "cron_expression": "*/5 * * * *"}).json()
+    schedule.run_errors["missing"] = ScheduledTaskNotFoundError("missing")
+    schedule.run_errors["paused"] = ScheduledTaskNotRunnableError("scheduled_task_paused")
+    schedule.run_errors["session-missing"] = ScheduledTaskNotRunnableError("scheduled_task_session_missing")
+    schedule.run_errors["claimed"] = ScheduledTaskNotRunnableError("scheduled_task_claim_conflict")
+
+    ok = client.post(f"/chat/scheduled-tasks/{created['id']}/run")
+    missing = client.post("/chat/scheduled-tasks/missing/run")
+    paused = client.post("/chat/scheduled-tasks/paused/run")
+    session_missing = client.post("/chat/scheduled-tasks/session-missing/run")
+    claimed = client.post("/chat/scheduled-tasks/claimed/run")
+
+    assert ok.status_code == 200
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "scheduled_task_not_found"
+    assert paused.status_code == 409
+    assert paused.json()["error"]["code"] == "scheduled_task_paused"
+    assert session_missing.status_code == 409
+    assert session_missing.json()["error"]["code"] == "scheduled_task_session_missing"
+    assert claimed.status_code == 409
+    assert claimed.json()["error"]["code"] == "scheduled_task_claim_conflict"
 
 
 def test_chat_can_create_session(tmp_path):

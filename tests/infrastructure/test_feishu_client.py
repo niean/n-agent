@@ -85,6 +85,24 @@ def test_send_text_posts_with_cached_token_without_exposing_token():
     assert message_request.headers["Authorization"] == "Bearer tenant-token"
     assert b"tenant-token" not in message_request.content
     assert json.loads(message_request.content)["receive_id"] == "oc_1"
+    assert dict(message_request.url.params)["receive_id_type"] == "chat_id"
+
+
+def test_send_text_can_use_open_id_receive_type():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200})
+        return httpx.Response(200, json={"code": 0})
+
+    feishu = client(allowed_open_ids=[], allowed_chat_ids=[])
+    feishu.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://open.feishu.cn")
+
+    asyncio.run(feishu.send_text("ou_1", "hello", receive_id_type="open_id"))
+
+    assert dict(requests[1].url.params)["receive_id_type"] == "open_id"
 
 
 def test_event_to_dict_supports_sdk_raw_payload():

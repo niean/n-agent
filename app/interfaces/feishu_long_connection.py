@@ -10,7 +10,7 @@ from app.domain.gateway import GatewaySessionKey, InteractionMessage, Interactio
 class FeishuEventClient(Protocol):
     def verify_long_connection_event(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
-    async def send_text(self, receive_id: str, text: str) -> None: ...
+    async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None: ...
 
     async def listen_events(self, handler) -> None: ...
 
@@ -37,16 +37,28 @@ class FeishuLongConnectionGateway:
             return
         content = _strip_at(content).strip()
         sender = event.get("sender", {}).get("sender_id", {})
+        source_id = chat_id or sender.get("open_id", "")
         response = await self.gateway_service.handle_message(
             InteractionMessage(
                 id=verified.get("header", {}).get("event_id") or message.get("message_id", ""),
                 session_key=GatewaySessionKey(
                     InteractionSourceType.FEISHU,
-                    chat_id or sender.get("open_id", ""),
+                    source_id,
+                    thread_id=message.get("thread_id", ""),
                     display_name=sender.get("open_id", ""),
                 ),
                 text=content,
-                metadata={"message_id": message.get("message_id", "")},
+                metadata={
+                    "source_type": "feishu",
+                    "source_id": source_id,
+                    "conversation_id": chat_id,
+                    "message_id": message.get("message_id", ""),
+                    "receive_id": chat_id or sender.get("open_id", ""),
+                    "receive_id_type": "chat_id" if chat_id else "open_id",
+                    "thread_id": message.get("thread_id", ""),
+                    "display_name": sender.get("open_id", ""),
+                    "capabilities": ["active_text_delivery"],
+                },
             )
         )
         if response.metadata.get("duplicate"):

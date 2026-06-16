@@ -76,6 +76,20 @@ async def test_tool_service_denies_confirm_and_hides_dangerous_tools():
     assert dangerous.status == ToolResultStatus.PERMISSION_DENIED
 
 
+def test_list_openai_tools_can_filter_safe_only():
+    definitions = [
+        ToolDefinition("safe_tool", "safe", {"type": "object"}, RiskLevel.SAFE),
+        ToolDefinition("confirm_tool", "confirm", {"type": "object"}, RiskLevel.CONFIRM),
+        ToolDefinition("dangerous_tool", "dangerous", {"type": "object"}, RiskLevel.DANGEROUS),
+    ]
+    service = ToolService(FakeExecutor(), definitions)
+
+    names = {schema["function"]["name"] for schema in service.list_openai_tools(risk_level=RiskLevel.SAFE)}
+
+    assert names == {"safe_tool"}
+
+
+
 def test_kb_tool_definition_enabled_when_configured():
     definitions = builtin_tool_definitions() + knowledge_tool_definitions(enabled=True)
     service = ToolService(FakeExecutor(), definitions)

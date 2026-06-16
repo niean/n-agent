@@ -49,11 +49,11 @@ class FeishuClient:
         client = lark.ws.Client(self.config.app_id, self.config.app_secret, event_handler=lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message).build())
         await asyncio.to_thread(client.start)
 
-    async def send_text(self, receive_id: str, text: str) -> None:
+    async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
         tenant_access_token = await self.get_tenant_access_token()
         response = await self.http_client.post(
             "/open-apis/im/v1/messages",
-            params={"receive_id_type": "chat_id"},
+            params={"receive_id_type": receive_id_type},
             headers={"Authorization": f"Bearer {tenant_access_token}"},
             json={
                 "receive_id": receive_id,
