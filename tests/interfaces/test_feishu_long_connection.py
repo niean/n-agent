@@ -14,8 +14,8 @@ class FakeFeishuClient:
         self.events.append(payload)
         return self.payload or payload
 
-    async def send_text(self, receive_id, text):
-        self.sent.append((receive_id, text))
+    async def send_text(self, receive_id, text, receive_id_type="chat_id"):
+        self.sent.append((receive_id, text, receive_id_type))
 
     async def listen_events(self, handler):
         await handler(self.payload)
@@ -60,7 +60,7 @@ async def test_long_connection_start_listens_and_handles_event():
     await adapter.start()
 
     assert gateway.events[0].text == "hello"
-    assert client.sent == [("oc_1", "reply")]
+    assert client.sent == [("oc_1", "reply", "chat_id")]
 
 
 async def test_long_connection_non_text_message_returns_unsupported_without_gateway_call():
@@ -73,7 +73,7 @@ async def test_long_connection_non_text_message_returns_unsupported_without_gate
     await adapter.handle_event(payload)
 
     assert gateway.events == []
-    assert client.sent == [("oc_1", "不支持该消息类型")]
+    assert client.sent == [("oc_1", "不支持该消息类型", "chat_id")]
 
 
 async def test_long_connection_group_message_without_mention_is_ignored():
@@ -101,7 +101,35 @@ async def test_long_connection_text_message_calls_gateway_and_replies():
     assert gateway.events[0].metadata["receive_id"] == "oc_1"
     assert gateway.events[0].metadata["receive_id_type"] == "chat_id"
     assert "active_text_delivery" in gateway.events[0].metadata["capabilities"]
-    assert client.sent == [("oc_1", "reply")]
+    assert client.sent == [("oc_1", "reply", "chat_id")]
+
+
+async def test_long_connection_p2p_without_chat_id_replies_to_open_id():
+    payload = text_payload("hello")
+    payload["event"]["message"]["chat_id"] = ""
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(payload)
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events[0].session_key.source_id == "ou_1"
+    assert gateway.events[0].metadata["receive_id"] == "ou_1"
+    assert gateway.events[0].metadata["receive_id_type"] == "open_id"
+    assert client.sent == [("ou_1", "reply", "open_id")]
+
+
+async def test_long_connection_normalizes_null_thread_id():
+    payload = text_payload("hello")
+    payload["event"]["message"]["thread_id"] = None
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(payload)
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events[0].session_key.thread_id == ""
+    assert gateway.events[0].metadata["thread_id"] == ""
 
 
 async def test_long_connection_duplicate_gateway_response_does_not_send_reply():

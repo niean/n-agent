@@ -1,6 +1,14 @@
 FROM python:3.11-slim
 
+ENV TZ=Asia/Shanghai
+
 WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
 COPY app ./app

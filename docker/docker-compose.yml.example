@@ -9,6 +9,7 @@ services:
       - path: ./.env
         required: false
     environment:
+      TZ: Asia/Shanghai
       N_AGENT_SQLITE_PATH: /app/locals/sessions.db
       N_AGENT_WORKSPACE_ROOT: /workspace
       N_AGENT_AGENT_ITERATION_LIMIT: 5

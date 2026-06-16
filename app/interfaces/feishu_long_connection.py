@@ -27,7 +27,7 @@ class FeishuLongConnectionGateway:
         verified = self.feishu_client.verify_long_connection_event(payload)
         event = verified.get("event", {})
         message = event.get("message", {})
-        chat_id = message.get("chat_id", "")
+        chat_id = _clean_text(message.get("chat_id"))
         if message.get("message_type") != "text":
             if chat_id:
                 await self.feishu_client.send_text(chat_id, "不支持该消息类型")
@@ -37,26 +37,31 @@ class FeishuLongConnectionGateway:
             return
         content = _strip_at(content).strip()
         sender = event.get("sender", {}).get("sender_id", {})
-        source_id = chat_id or sender.get("open_id", "")
+        open_id = _clean_text(sender.get("open_id"))
+        thread_id = _clean_text(message.get("thread_id"))
+        message_id = _clean_text(message.get("message_id"))
+        receive_id = chat_id or open_id
+        receive_id_type = "chat_id" if chat_id else "open_id"
+        source_id = receive_id
         response = await self.gateway_service.handle_message(
             InteractionMessage(
-                id=verified.get("header", {}).get("event_id") or message.get("message_id", ""),
+                id=_clean_text(verified.get("header", {}).get("event_id")) or message_id,
                 session_key=GatewaySessionKey(
                     InteractionSourceType.FEISHU,
                     source_id,
-                    thread_id=message.get("thread_id", ""),
-                    display_name=sender.get("open_id", ""),
+                    thread_id=thread_id,
+                    display_name=open_id,
                 ),
                 text=content,
                 metadata={
                     "source_type": "feishu",
                     "source_id": source_id,
                     "conversation_id": chat_id,
-                    "message_id": message.get("message_id", ""),
-                    "receive_id": chat_id or sender.get("open_id", ""),
-                    "receive_id_type": "chat_id" if chat_id else "open_id",
-                    "thread_id": message.get("thread_id", ""),
-                    "display_name": sender.get("open_id", ""),
+                    "message_id": message_id,
+                    "receive_id": receive_id,
+                    "receive_id_type": receive_id_type,
+                    "thread_id": thread_id,
+                    "display_name": open_id,
                     "capabilities": ["active_text_delivery"],
                 },
             )
@@ -64,12 +69,16 @@ class FeishuLongConnectionGateway:
         if response.metadata.get("duplicate"):
             return
         for outbound in response.messages:
-            await self.feishu_client.send_text(chat_id, outbound.content)
+            await self.feishu_client.send_text(receive_id, outbound.content, receive_id_type)
+
+
+def _clean_text(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 def _text_content(raw: str | dict[str, Any]) -> str:
     if isinstance(raw, dict):
-        return str(raw.get("text", ""))
+        return _clean_text(raw.get("text"))
     try:
         payload = json.loads(raw)
     except (TypeError, json.JSONDecodeError):

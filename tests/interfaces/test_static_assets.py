@@ -131,6 +131,15 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'pushState' in nav_js
     assert "'/summary'" in nav_js
     assert "'/status'" in nav_js
+    assert "'/scheduled-tasks'" in nav_js
+    assert "'scheduled-tasks'" in nav_js
+    assert 'pathByTab' in nav_js
+    assert nav_js.index("tab: 'chat'") < nav_js.index("tab: 'scheduled-tasks'") < nav_js.index("tab: 'sessions'")
+    summary_js = client.get('/static/summary.js').text
+    assert "'scheduled-tasks'" in summary_js
+    assert 'listScheduledTasks' in summary_js
+    assert '任务数' in summary_js
+    assert summary_js.index("tab: 'chat'") < summary_js.index("tab: 'scheduled-tasks'") < summary_js.index("tab: 'sessions'")
 
 
 def test_scheduled_tasks_static_assets_contain_management_ui(tmp_path):
@@ -251,3 +260,5 @@ def test_index_html_links_assets(tmp_path):
         assert tab in html, f"index.html missing menu label {tab}"
     for path in ('/summary', '/chat', '/sessions', '/tools', '/models', '/status', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"
+    assert html.index('href="/chat"') < html.index('href="/scheduled-tasks"') < html.index('href="/sessions"')
+    assert html.index('id="tab-chat"') < html.index('id="tab-scheduled-tasks"') < html.index('id="tab-sessions"')

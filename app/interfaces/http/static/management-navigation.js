@@ -3,6 +3,7 @@
   const tabConfig = [
     { tab: 'summary', path: '/summary', label: '概览' },
     { tab: 'chat', path: '/chat', label: '对话' },
+    { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '任务' },
     { tab: 'sessions', path: '/sessions', label: '会话' },
     { tab: 'tools', path: '/tools', label: '工具' },
     { tab: 'models', path: '/models', label: '模型' },
@@ -63,5 +64,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.navigation = { initNavigation, navigateTo, switchTab: navigateTo, tabNames };
+  global.NAGENT.navigation = { initNavigation, navigateTo, switchTab: navigateTo, tabNames, pathByTab };
 }(window));

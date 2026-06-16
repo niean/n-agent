@@ -5,6 +5,7 @@
 
   const ENTRIES = [
     { tab: 'chat', label: '对话', desc: '发起新一轮对话或恢复会话' },
+    { tab: 'scheduled-tasks', label: '任务', desc: '管理定时任务与查看最近执行结果' },
     { tab: 'sessions', label: '会话', desc: '查看历史会话与详细消息' },
     { tab: 'tools', label: '工具', desc: '查看已注册的工具与风险等级' },
     { tab: 'models', label: '模型', desc: '查看对外暴露的统一模型' },
@@ -21,6 +22,7 @@
       { label: '会话数', value: counts.sessions },
       { label: '工具数', value: counts.tools },
       { label: '模型数', value: counts.models },
+      { label: '任务数', value: counts.scheduledTasks },
     ];
     cards.forEach((s) => {
       const card = document.createElement('div'); card.className = 'stat-card';
@@ -36,7 +38,9 @@
     ENTRIES.forEach((entry) => {
       const card = document.createElement('a');
       card.className = 'summary-entry';
-      card.href = `/${entry.tab === 'status' ? 'status' : entry.tab}`;
+      card.href = namespace.navigation && namespace.navigation.pathByTab && namespace.navigation.pathByTab[entry.tab]
+        ? namespace.navigation.pathByTab[entry.tab]
+        : `/${entry.tab === 'status' ? 'status' : entry.tab}`;
       card.dataset.tab = entry.tab;
       card.addEventListener('click', (event) => {
         event.preventDefault();
@@ -69,17 +73,19 @@
     ui.clear(stats);
     ui.renderLoading(stats, '加载概览...');
     try {
-      const [service, dependencies, sessionsCount, toolsCount, modelsCount] = await Promise.all([
+      const [service, dependencies, sessionsCount, toolsCount, modelsCount, scheduledTasksCount] = await Promise.all([
         api.getHealth().catch(() => ({ status: 'error' })),
         api.getDependencyHealth().catch(() => ({})),
         safeCount(api.listSessions()),
         safeCount(api.listTools()),
         safeCount(api.listModels()),
+        safeCount(api.listScheduledTasks()),
       ]);
       renderStats(stats, service || {}, dependencies || {}, {
         sessions: sessionsCount,
         tools: toolsCount,
         models: modelsCount,
+        scheduledTasks: scheduledTasksCount,
       });
       renderEntries(entries);
     } catch (error) {

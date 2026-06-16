@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 import asyncio
 from typing import Any, Awaitable, Callable
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 class FeishuVerificationError(Exception):
@@ -44,7 +47,7 @@ class FeishuClient:
 
         def on_message(payload: Any) -> None:
             data = _event_to_dict(payload)
-            asyncio.run_coroutine_threadsafe(handler(data), loop)
+            _submit_event_handler(handler, data, loop)
 
         client = lark.ws.Client(self.config.app_id, self.config.app_secret, event_handler=lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message).build())
         await asyncio.to_thread(client.start)
@@ -98,6 +101,21 @@ class FeishuClient:
             raise FeishuVerificationError("open id not allowed")
         if self.config.allowed_chat_ids and chat_id not in self.config.allowed_chat_ids:
             raise FeishuVerificationError("chat id not allowed")
+
+
+def _submit_event_handler(
+    handler: Callable[[dict[str, Any]], Awaitable[None]], payload: dict[str, Any], loop: asyncio.AbstractEventLoop
+):
+    future = asyncio.run_coroutine_threadsafe(handler(payload), loop)
+
+    def log_failure(done):
+        try:
+            done.result()
+        except Exception:
+            logger.exception("feishu event handler failed")
+
+    future.add_done_callback(log_failure)
+    return future
 
 
 def _event_to_dict(payload: Any) -> dict[str, Any]:

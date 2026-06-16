@@ -120,7 +120,7 @@ class SQLiteGatewaySessionRegistry:
                     INSERT INTO gateway_processed_events(id, source_type, event_id, message_id, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (str(uuid4()), source_type.value, event_id, message_id, _now()),
+                    (str(uuid4()), source_type.value, event_id, message_id or None, _now()),
                 )
             except sqlite3.IntegrityError:
                 return False
@@ -128,6 +128,7 @@ class SQLiteGatewaySessionRegistry:
 
 
 def _initialize_gateway_schema(conn: sqlite3.Connection) -> None:
+    _migrate_processed_events_message_id_nullable(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS gateway_conversations (
@@ -156,11 +157,34 @@ def _initialize_gateway_schema(conn: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY,
             source_type TEXT NOT NULL,
             event_id TEXT NOT NULL,
-            message_id TEXT NOT NULL DEFAULT '',
+            message_id TEXT,
             created_at TEXT NOT NULL,
             UNIQUE(source_type, event_id),
             UNIQUE(source_type, message_id)
         );
+        """
+    )
+
+
+def _migrate_processed_events_message_id_nullable(conn: sqlite3.Connection) -> None:
+    table = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'gateway_processed_events'").fetchone()
+    if table is None or "message_id TEXT NOT NULL" not in str(table["sql"]):
+        return
+    conn.executescript(
+        """
+        ALTER TABLE gateway_processed_events RENAME TO gateway_processed_events_old;
+        CREATE TABLE gateway_processed_events (
+            id TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            message_id TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(source_type, event_id),
+            UNIQUE(source_type, message_id)
+        );
+        INSERT OR IGNORE INTO gateway_processed_events(id, source_type, event_id, message_id, created_at)
+        SELECT id, source_type, event_id, NULLIF(message_id, ''), created_at FROM gateway_processed_events_old;
+        DROP TABLE gateway_processed_events_old;
         """
     )
 

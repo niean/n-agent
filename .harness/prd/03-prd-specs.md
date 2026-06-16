@@ -54,11 +54,14 @@
     - 对话：调试信息展开时，会话会变宽，期望的效果是会话宽度不变
 
 [20260616]
+- Issue
+    - 交互：飞书，收不到飞书IM发来的消息了，新建session能成功
 - FR
     - 任务：[KF]新增任务。要求：①严格遵循DDD分层架构，②优先使用流行代码库，③借鉴Hermes-Agent的实现/Users/niean/code/github.com/niean/hermes-agent
         - 审阅：Spec spec-260615-scheduled-tasks.md，发现其中的严重问题
         - 审阅：Plan plan-260615-scheduled-tasks.md，发现其中的严重问题
-        - 迭代：Dashboard，任务没有页面，补全完整功能
+        - 迭代：Dashboard，任务页面无法加载页面，概览页面有没任务
+
 
 
 ---
@@ -69,7 +72,8 @@
     - 源码：AgentCore
     - 治理：IAM，安全护栏
 - FR
-    - 交互：飞书接入，支持卡片审批、Drive评论、跨频道主动投递，以及/new、/rename、/delete 等破坏性Gateway 命令
+    - 交互：飞书接入，支持卡片审批、Drive评论、跨频道主动投递，以及/new、/rename、/delete 等破坏性Gateway 命令。参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent
+    - 交互：飞书，N-Agent收到消息后、给一个提示，比如给用户的飞书消息加一个表情(参考Hermes)
     - 工具：Skill
     - 工具：Sandbox(docker)
     - 工具：相比Hermes，还缺少如下功能

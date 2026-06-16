@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -118,6 +119,24 @@ def test_event_to_dict_supports_sdk_to_dict_payload():
             return {"event": {"message": {"chat_id": "oc_1"}}}
 
     assert _event_to_dict(Event())["event"]["message"]["chat_id"] == "oc_1"
+
+
+def test_handle_callback_failure_logs_exception(caplog):
+    async def failing_handler(payload):
+        raise RuntimeError("gateway failed")
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(_run_callback_failure(failing_handler))
+
+    assert "feishu event handler failed" in caplog.text
+    assert "gateway failed" in caplog.text
+
+
+async def _run_callback_failure(handler):
+    from app.infrastructure.feishu.client import _submit_event_handler
+
+    _submit_event_handler(handler, {"event": {}}, asyncio.get_running_loop())
+    await asyncio.sleep(0)
 
 
 def test_event_to_dict_supports_sdk_attribute_payload():
