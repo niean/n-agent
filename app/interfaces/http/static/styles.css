@@ -211,3 +211,15 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .scheduled-detail-block { display: flex; flex-direction: column; gap: 6px; }
 .scheduled-history { display: flex; flex-direction: column; gap: 8px; }
 .scheduled-history-table td { max-width: 220px; word-break: break-word; }
+
+/* 二级菜单（tools 父项） */
+.sidebar__group { display: flex; flex-direction: column; gap: 4px; }
+.sidebar__item--parent { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 10px; color: var(--color-fg-muted); white-space: nowrap; background: transparent; border: 0; border-radius: 10px; text-align: left; }
+.sidebar__item--parent:hover { color: var(--color-sidebar-hover-fg); background: var(--color-bg-hover); }
+.sidebar__item--parent-open { color: var(--color-primary-strong); }
+.sidebar__item-chevron { display: none; margin-left: auto; color: var(--color-fg-subtle); transition: transform 0.2s ease; }
+body.sidebar-expanded .sidebar__item-chevron { display: inline; }
+.sidebar__item--parent-open .sidebar__item-chevron { transform: rotate(90deg); color: var(--color-primary-strong); }
+.sidebar__submenu { display: none; flex-direction: column; gap: 2px; padding-left: 12px; }
+body.sidebar-expanded .sidebar__submenu.sidebar__submenu--open { display: flex; }
+.sidebar__item--child { padding: 8px 10px 8px 18px; font-size: var(--font-size-sm); }

@@ -7,7 +7,11 @@
     { tab: 'chat', label: '对话', desc: '发起新一轮对话或恢复会话' },
     { tab: 'scheduled-tasks', label: '任务', desc: '管理定时任务与查看最近执行结果' },
     { tab: 'sessions', label: '会话', desc: '查看历史会话与详细消息' },
-    { tab: 'tools', label: '工具', desc: '查看已注册的工具与风险等级' },
+    { tab: 'tools-knowledge', label: '知识', desc: '查看 search_knowledge 工具与 N-KB 依赖健康' },
+    { tab: 'tools-mcp', label: 'MCP', desc: '管理 MCP 站点与远端工具' },
+    { tab: 'tools-skill', label: 'Skill', desc: '查看 Skill 列表与启停' },
+    { tab: 'tools-plugin', label: 'Plugin', desc: 'Plugin 子系统（待实现）' },
+    { tab: 'tools-builtin', label: '内置工具', desc: '查看已注册的工具与风险等级' },
     { tab: 'models', label: '模型', desc: '查看对外暴露的统一模型' },
     { tab: 'status', label: '健康', desc: '检查 Provider/Memory/Knowledge 状态' },
   ];

@@ -5,30 +5,57 @@
     { tab: 'chat', path: '/chat', label: '对话' },
     { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '任务' },
     { tab: 'sessions', path: '/sessions', label: '会话' },
-    { tab: 'tools', path: '/tools', label: '工具' },
+    { tab: 'tools', label: '工具', parent: true, children: ['tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin'] },
+    { tab: 'tools-knowledge', path: '/tools/knowledge', label: '知识', parentTab: 'tools' },
+    { tab: 'tools-mcp', path: '/tools/mcp', label: 'MCP', parentTab: 'tools' },
+    { tab: 'tools-skill', path: '/tools/skill', label: 'Skill', parentTab: 'tools' },
+    { tab: 'tools-plugin', path: '/tools/plugin', label: 'Plugin', parentTab: 'tools' },
+    { tab: 'tools-builtin', path: '/tools/builtin', label: '内置', parentTab: 'tools' },
     { tab: 'models', path: '/models', label: '模型' },
     { tab: 'status', path: '/status', label: '健康' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
-  const tabByPath = Object.fromEntries(tabConfig.map((c) => [c.path, c.tab]));
+  const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));
   const labelByTab = Object.fromEntries(tabConfig.map((c) => [c.tab, c.label]));
-  const pathByTab = Object.fromEntries(tabConfig.map((c) => [c.tab, c.path]));
+  const pathByTab = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.tab, c.path]));
+  const parentByChild = Object.fromEntries(
+    tabConfig.filter((c) => c.parentTab).map((c) => [c.tab, c.parentTab]),
+  );
+  const TOOLS_DEFAULT_CHILD = 'tools-knowledge';
+
+  function isParent(name) {
+    const cfg = tabConfig.find((c) => c.tab === name);
+    return cfg && cfg.parent === true;
+  }
 
   function selectedTabFromPath() {
     const path = window.location.pathname;
     if (tabByPath[path]) return tabByPath[path];
+    if (path === '/tools') return TOOLS_DEFAULT_CHILD;
     if (path === '/' || path === '') return 'summary';
     return 'summary';
   }
 
   function applyTab(name) {
-    const next = tabNames.includes(name) ? name : 'summary';
+    let next = tabNames.includes(name) ? name : 'summary';
+    if (isParent(next)) next = TOOLS_DEFAULT_CHILD;
     document.querySelectorAll('.tab-content').forEach((tab) => tab.classList.remove('active'));
-    document.querySelectorAll('.sidebar__item').forEach((item) => item.classList.remove('sidebar__item--active'));
+    document.querySelectorAll('.sidebar__item').forEach((item) => {
+      item.classList.remove('sidebar__item--active');
+      item.classList.remove('sidebar__item--parent-open');
+    });
+    document.querySelectorAll('.sidebar__submenu').forEach((sub) => sub.classList.remove('sidebar__submenu--open'));
     const target = document.getElementById(`tab-${next}`);
     if (target) target.classList.add('active');
     const nav = document.querySelector(`[data-tab="${next}"]`);
     if (nav) nav.classList.add('sidebar__item--active');
+    const parentTab = parentByChild[next];
+    if (parentTab) {
+      const parentNav = document.querySelector(`[data-tab="${parentTab}"]`);
+      if (parentNav) parentNav.classList.add('sidebar__item--parent-open');
+      const submenu = document.querySelector(`[data-submenu-of="${parentTab}"]`);
+      if (submenu) submenu.classList.add('sidebar__submenu--open');
+    }
     const title = document.getElementById('topbar-title');
     if (title) title.textContent = labelByTab[next] || next;
     if (global.NAGENT && global.NAGENT.app && typeof global.NAGENT.app.onTabActivated === 'function') {
@@ -37,6 +64,18 @@
   }
 
   function navigateTo(name) {
+    if (isParent(name)) {
+      if (!document.body.classList.contains('sidebar-expanded')) {
+        document.body.classList.add('sidebar-expanded');
+        const toggle = document.getElementById('sidebar-toggle');
+        if (toggle) toggle.setAttribute('aria-expanded', 'true');
+      }
+      const submenu = document.querySelector(`[data-submenu-of="${name}"]`);
+      if (submenu) submenu.classList.toggle('sidebar__submenu--open');
+      const parentNav = document.querySelector(`[data-tab="${name}"]`);
+      if (parentNav) parentNav.classList.toggle('sidebar__item--parent-open');
+      return;
+    }
     const path = pathByTab[name];
     if (!path) return;
     if (window.location.pathname !== path) {

@@ -55,10 +55,29 @@ def test_chat_returns_index_html(tmp_path):
 
 def test_all_tab_paths_return_shell(tmp_path):
     client = _client(tmp_path)
-    for path in ("/", "/summary", "/chat", "/sessions", "/tools", "/models", "/status", "/scheduled-tasks"):
+    paths = (
+        "/", "/summary", "/chat", "/sessions",
+        "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
+        "/models", "/status", "/scheduled-tasks",
+    )
+    for path in paths:
         response = client.get(path)
         assert response.status_code == 200, f"missing shell at {path}"
         assert 'id="app-sidebar"' in response.text, f"shell incomplete at {path}"
+
+
+def test_tools_submenu_url_routing(tmp_path):
+    client = _client(tmp_path)
+    for sub in ("builtin", "knowledge", "mcp", "skill", "plugin"):
+        res = client.get(f"/tools/{sub}")
+        assert res.status_code == 200, f"missing /tools/{sub}"
+        assert 'id="app-sidebar"' in res.text
+
+
+def test_old_skills_path_removed(tmp_path):
+    client = _client(tmp_path)
+    res = client.get("/skills")
+    assert res.status_code == 404
 
 
 def test_static_assets_served(tmp_path):
@@ -76,6 +95,9 @@ def test_static_assets_served(tmp_path):
         "/static/models.js",
         "/static/health.js",
         "/static/scheduled-tasks.js",
+        "/static/skills.js",
+        "/static/knowledge.js",
+        "/static/plugin.js",
         "/static/favicon.svg",
     )
     for path in paths:
@@ -140,6 +162,13 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'listScheduledTasks' in summary_js
     assert '任务数' in summary_js
     assert summary_js.index("tab: 'chat'") < summary_js.index("tab: 'scheduled-tasks'") < summary_js.index("tab: 'sessions'")
+    assert (
+        summary_js.index("tab: 'tools-knowledge'")
+        < summary_js.index("tab: 'tools-mcp'")
+        < summary_js.index("tab: 'tools-skill'")
+        < summary_js.index("tab: 'tools-plugin'")
+        < summary_js.index("tab: 'tools-builtin'")
+    )
 
 
 def test_scheduled_tasks_static_assets_contain_management_ui(tmp_path):
@@ -229,7 +258,8 @@ def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
 def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',
-                 '/static/models.js', '/static/health.js', '/static/summary.js', '/static/scheduled-tasks.js'):
+                 '/static/models.js', '/static/health.js', '/static/summary.js', '/static/scheduled-tasks.js',
+                 '/static/skills.js', '/static/knowledge.js', '/static/plugin.js'):
         body = client.get(path).text
         assert 'innerHTML =' not in body, f"{path} contains innerHTML assignment"
         assert 'insertAdjacentHTML' not in body, f"{path} uses insertAdjacentHTML"
@@ -252,13 +282,136 @@ def test_index_html_links_assets(tmp_path):
         '/static/models.js',
         '/static/health.js',
         '/static/scheduled-tasks.js',
+        '/static/skills.js',
+        '/static/knowledge.js',
+        '/static/plugin.js',
         '/static/favicon.svg',
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '工具', '模型', '健康', '任务'):
+    for tab in ('概览', '对话', '会话', '工具', '模型', '健康', '任务', '知识', 'MCP', 'Skill', 'Plugin', '内置'):
         assert tab in html, f"index.html missing menu label {tab}"
-    for path in ('/summary', '/chat', '/sessions', '/tools', '/models', '/status', '/scheduled-tasks'):
+    for path in ('/summary', '/chat', '/sessions', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/models', '/status', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"
     assert html.index('href="/chat"') < html.index('href="/scheduled-tasks"') < html.index('href="/sessions"')
+    assert (
+        html.index('href="/tools/knowledge"')
+        < html.index('href="/tools/mcp"')
+        < html.index('href="/tools/skill"')
+        < html.index('href="/tools/plugin"')
+        < html.index('href="/tools/builtin"')
+    )
+    assert (
+        html.index('id="tab-tools-knowledge"')
+        < html.index('id="tab-tools-mcp"')
+        < html.index('id="tab-tools-skill"')
+        < html.index('id="tab-tools-plugin"')
+        < html.index('id="tab-tools-builtin"')
+    )
     assert html.index('id="tab-chat"') < html.index('id="tab-scheduled-tasks"') < html.index('id="tab-sessions"')
+
+
+def test_management_ui_exports_el_helper(tmp_path):
+    client = _client(tmp_path)
+    body = client.get('/static/management-ui.js').text
+    assert 'el,' in body or 'el }' in body or 'el:' in body
+    assert 'createElement' in body
+
+
+def test_skills_js_present_and_safe(tmp_path):
+    client = _client(tmp_path)
+    res = client.get('/static/skills.js')
+    assert res.status_code == 200
+    body = res.text
+    assert '/chat/skills' in body or 'listSkills' in body
+    assert 'innerHTML =' not in body
+    assert '.textContent' in body
+
+
+def test_skills_js_only_uses_documented_ui_helpers(tmp_path):
+    client = _client(tmp_path)
+    ui_body = client.get('/static/management-ui.js').text
+    skills_body = client.get('/static/skills.js').text
+    import re
+    used = set(re.findall(r"\bui\.([A-Za-z_][A-Za-z0-9_]*)", skills_body))
+    documented = {
+        'byId', 'clear', 'appendText', 'appendBadge', 'renderJson',
+        'renderEmpty', 'renderLoading', 'renderError', 'el',
+    }
+    missing = used - documented
+    assert not missing, f"skills.js uses undocumented ui helpers: {missing}"
+    for name in used:
+        assert name in ui_body, f"ui.{name} referenced but not defined in management-ui.js"
+
+
+def test_index_links_skills_module(tmp_path):
+    client = _client(tmp_path)
+    html = client.get('/chat').text
+    assert 'skills.js' in html
+    assert 'tab-tools-skill' in html
+    assert 'href="/tools/skill"' in html
+
+
+def test_skills_static_served(tmp_path):
+    client = _client(tmp_path)
+    api_js = client.get('/static/management-api.js').text
+    for fn in ('listSkills', 'getSkill', 'setSkillEnabled', 'refreshSkills'):
+        assert fn in api_js
+    nav_js = client.get('/static/management-navigation.js').text
+    assert "tab: 'tools-skill'" in nav_js
+    assert "'/tools/skill'" in nav_js
+
+
+def test_tools_submenu_nav(tmp_path):
+    client = _client(tmp_path)
+    nav_js = client.get('/static/management-navigation.js').text
+    assert "tab: 'tools'" in nav_js
+    assert "parent: true" in nav_js
+    assert "children:" in nav_js
+    order_keys = ["'tools-knowledge'", "'tools-mcp'", "'tools-skill'", "'tools-plugin'", "'tools-builtin'"]
+    last = -1
+    for key in order_keys:
+        idx = nav_js.index(key)
+        assert idx > last, f"order broken at {key}"
+        last = idx
+    for path in ("'/tools/knowledge'", "'/tools/mcp'", "'/tools/skill'", "'/tools/plugin'", "'/tools/builtin'"):
+        assert path in nav_js, f"missing {path}"
+    assert "tab: 'tools', path: '/tools'" not in nav_js
+
+
+def test_knowledge_js_present_and_safe(tmp_path):
+    client = _client(tmp_path)
+    res = client.get('/static/knowledge.js')
+    assert res.status_code == 200
+    body = res.text
+    assert 'NAGENT.knowledge' in body or 'namespace.knowledge' in body
+    assert 'search_knowledge' in body
+    assert 'getDependencyHealth' in body or '/chat/health/dependencies' in body
+    assert 'innerHTML =' not in body
+    assert 'insertAdjacentHTML' not in body
+    assert '.textContent' in body
+
+
+def test_knowledge_js_only_uses_documented_ui_helpers(tmp_path):
+    client = _client(tmp_path)
+    ui_body = client.get('/static/management-ui.js').text
+    body = client.get('/static/knowledge.js').text
+    import re
+    used = set(re.findall(r"\bui\.([A-Za-z_][A-Za-z0-9_]*)", body))
+    documented = {'byId', 'clear', 'appendText', 'appendBadge', 'renderJson', 'renderEmpty', 'renderLoading', 'renderError', 'el'}
+    assert not (used - documented), f"undocumented: {used - documented}"
+    for name in used:
+        assert name in ui_body
+
+
+def test_plugin_js_present_and_safe(tmp_path):
+    client = _client(tmp_path)
+    res = client.get('/static/plugin.js')
+    assert res.status_code == 200
+    body = res.text
+    assert 'NAGENT.plugin' in body or 'namespace.plugin' in body
+    assert 'Plugin' in body
+    assert '待实现' in body
+    assert 'innerHTML =' not in body
+    assert 'insertAdjacentHTML' not in body
+    assert '.textContent' in body

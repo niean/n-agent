@@ -24,6 +24,7 @@ from app.application.schedule_service import (
     ScheduleValidationError,
 )
 from app.application.session_service import SessionService
+from app.application.skill_service import SkillScanReport, SkillScanWarning, SkillService
 from app.application.tool_service import ToolService
 from app.domain.mcp import McpProbeError, McpSite, McpSiteNotFoundError, McpSiteValidationError, McpTool, McpTransportType
 from app.domain.provider import (
@@ -43,6 +44,7 @@ from app.domain.session import (
     TaskState,
     ToolCall,
 )
+from app.domain.skill import SkillNotFoundError, SkillValidationError
 from app.domain.tool import ToolDefinition
 
 
@@ -60,6 +62,7 @@ def create_dashboard_router(
     provider_service: ProviderService | None = None,
     mcp_service: McpService | None = None,
     schedule_service: ScheduleService | None = None,
+    skill_service: SkillService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -68,6 +71,11 @@ def create_dashboard_router(
     @router.get("/chat", response_class=HTMLResponse)
     @router.get("/sessions", response_class=HTMLResponse)
     @router.get("/tools", response_class=HTMLResponse)
+    @router.get("/tools/builtin", response_class=HTMLResponse)
+    @router.get("/tools/knowledge", response_class=HTMLResponse)
+    @router.get("/tools/mcp", response_class=HTMLResponse)
+    @router.get("/tools/skill", response_class=HTMLResponse)
+    @router.get("/tools/plugin", response_class=HTMLResponse)
     @router.get("/models", response_class=HTMLResponse)
     @router.get("/status", response_class=HTMLResponse)
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
@@ -140,6 +148,8 @@ def create_dashboard_router(
         _register_mcp_routes(router, mcp_service)
     if schedule_service is not None:
         _register_schedule_routes(router, schedule_service)
+    if skill_service is not None:
+        _register_skill_routes(router, skill_service)
 
     return router
 
@@ -422,6 +432,85 @@ def _register_schedule_routes(router: APIRouter, schedule_service: ScheduleServi
         except ScheduleServiceError as exc:
             return _schedule_error_response(exc)
         return Response(status_code=204)
+
+
+def _skill_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, SkillNotFoundError):
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "skill_not_found", "message": str(exc)}},
+        )
+    if isinstance(exc, SkillValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "skill_invalid", "message": str(exc)}},
+        )
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"code": "skill_scan_failed", "message": str(exc)}},
+    )
+
+
+def _skill_to_dict(skill) -> dict:
+    return {
+        "id": skill.id,
+        "name": skill.name,
+        "description": skill.description,
+        "relative_path": skill.relative_path,
+        "platforms": skill.platforms,
+        "enabled": skill.enabled,
+        "readiness": skill.readiness.value,
+        "last_scan_status": skill.last_scan_status,
+        "last_scan_error": skill.last_scan_error,
+        "frontmatter": skill.frontmatter.raw,
+    }
+
+
+def _register_skill_routes(router: APIRouter, skill_service: SkillService) -> None:
+    @router.get("/chat/skills")
+    async def list_skills():
+        items = await skill_service.list_skills(include_disabled=True)
+        return {"skills": [_skill_to_dict(s) for s in items]}
+
+    @router.get("/chat/skills/{name}")
+    async def get_skill(name: str):
+        try:
+            skill = await skill_service.get(name)
+        except SkillNotFoundError as exc:
+            return _skill_error_response(exc)
+        view = await skill_service.render_view(name)
+        return {
+            "skill": _skill_to_dict(skill),
+            "content": view.get("content", ""),
+            "linked_files": view.get("linked_files", {}),
+        }
+
+    @router.patch("/chat/skills/{name}")
+    async def patch_skill(name: str, payload: dict = Body(...)):
+        try:
+            skill = await skill_service.set_enabled(name, bool(payload.get("enabled")))
+        except SkillNotFoundError as exc:
+            return _skill_error_response(exc)
+        return _skill_to_dict(skill)
+
+    @router.post("/chat/skills/refresh")
+    async def refresh_skills():
+        try:
+            report = await skill_service.scan_now()
+        except Exception as exc:
+            return _skill_error_response(exc)
+        return {
+            "skills_count": report.skills_count,
+            "warnings": [
+                {
+                    "relative_path": w.relative_path,
+                    "reason": w.reason,
+                    "detail": w.detail,
+                    "first_path": w.first_path,
+                }
+                for w in report.warnings
+            ],
+        }
 
 
 
