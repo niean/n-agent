@@ -180,3 +180,30 @@ def test_create_app_with_enabled_kb_configuration(tmp_path: Path, monkeypatch: p
     )
 
     assert app.title == "N-Agent"
+
+
+def test_skill_subsystem_defaults(monkeypatch: pytest.MonkeyPatch):
+    for key in (
+        "N_AGENT_SKILLS_ROOT",
+        "N_AGENT_SKILLS_INLINE_SHELL_ENABLED",
+        "N_AGENT_SKILLS_INLINE_SHELL_TIMEOUT",
+        "N_AGENT_SKILLS_MAX_VIEW_BYTES",
+        "N_AGENT_SKILLS_MAX_COUNT",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    s = Settings(_env_file=None)
+    assert str(s.skills_root) == "/workspace/skills"
+    assert s.skills_inline_shell_enabled is False
+    assert s.skills_inline_shell_timeout == 10
+    assert s.skills_max_view_bytes == 131072
+    assert s.skills_max_count == 200
+
+
+def test_skill_subsystem_env_override(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("N_AGENT_SKILLS_ROOT", "/tmp/skills")
+    monkeypatch.setenv("N_AGENT_SKILLS_INLINE_SHELL_ENABLED", "true")
+    monkeypatch.setenv("N_AGENT_SKILLS_INLINE_SHELL_TIMEOUT", "30")
+    s = Settings(_env_file=None)
+    assert str(s.skills_root) == "/tmp/skills"
+    assert s.skills_inline_shell_enabled is True
+    assert s.skills_inline_shell_timeout == 30

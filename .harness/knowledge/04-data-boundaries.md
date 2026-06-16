@@ -57,7 +57,7 @@
 
 `McpSiteRegistry`（`app/domain/mcp.py`）：定义 MCP 站点和工具映射的 list/get/create/update/delete、replace_site_tools、update_probe_status、update_tool_enabled 接口。站点支持 streamable_http、sse 和 stdio 传输；stdio 配置包含 command、args、env。Infrastructure 的 SQLiteMcpSiteRegistry 实现该端口；Application 只依赖该端口和 McpClient 协议。
 
-`Summarizer`（`app/domain/memory.py`）：定义摘要生成接口。MVP 默认 HeuristicSummarizer 实现。
+`Summarizer`（`app/domain/memory.py`）：定义摘要生成接口。默认 HeuristicSummarizer 实现。
 
 `ToolExecutor`（`app/domain/tool.py`）：定义工具执行接口。Infrastructure 的 BuiltinToolExecutor 实现具体 handler。
 

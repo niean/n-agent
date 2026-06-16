@@ -130,6 +130,7 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert "'分组'" in tools_js
     assert 'tool.source_type' in tools_js
     assert 'tool.toolset' in tools_js
+    assert "source_type === 'builtin'" in tools_js
     assert "'stdio'" in tools_js
     assert 'Command' in tools_js
     assert 'Args' in tools_js
@@ -385,8 +386,11 @@ def test_knowledge_js_present_and_safe(tmp_path):
     assert res.status_code == 200
     body = res.text
     assert 'NAGENT.knowledge' in body or 'namespace.knowledge' in body
-    assert 'search_knowledge' in body
-    assert 'getDependencyHealth' in body or '/chat/health/dependencies' in body
+    assert 'listTools' in body
+    assert "source_type === 'knowledge'" in body
+    assert 'document-table' in body
+    assert 'getDependencyHealth' not in body
+    assert '/chat/health/dependencies' not in body
     assert 'innerHTML =' not in body
     assert 'insertAdjacentHTML' not in body
     assert '.textContent' in body

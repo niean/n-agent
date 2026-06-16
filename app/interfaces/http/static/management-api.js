@@ -84,6 +84,15 @@
     body: JSON.stringify(payload || {}),
   });
 
+  const listSkills = () => fetchJson('/chat/skills');
+  const getSkill = (name) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`);
+  const setSkillEnabled = (name, enabled) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: !!enabled }),
+  });
+  const refreshSkills = () => fetchJson('/chat/skills/refresh', { method: 'POST' });
+
   global.NAGENT = namespace;
   global.NAGENT.api = {
     fetchJson,
@@ -120,5 +129,9 @@
     refreshMcpSite,
     listMcpSiteTools,
     updateMcpTool,
+    listSkills,
+    getSkill,
+    setSkillEnabled,
+    refreshSkills,
   };
 }(window));

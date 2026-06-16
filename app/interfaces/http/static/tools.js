@@ -69,45 +69,66 @@
     ui.renderLoading(list, '加载工具列表...');
     try {
       const tools = await api.listTools();
+      const builtinTools = (tools || []).filter((tool) => tool.source_type === 'builtin');
       ui.clear(list);
-      if (!tools.length) { ui.renderEmpty(list, '暂无工具'); return; }
-      const table = document.createElement('table');
-      table.className = 'document-table';
-      const thead = document.createElement('thead');
-      const headerRow = document.createElement('tr');
-      ['名称', '类型', '分组', '描述', '风险等级', '启用', 'Schema'].forEach((label) => {
-        const th = document.createElement('th'); th.textContent = label; headerRow.appendChild(th);
-      });
-      thead.appendChild(headerRow);
-      const tbody = document.createElement('tbody');
-      tools.forEach((tool) => {
-        const tr = document.createElement('tr');
-        const td1 = document.createElement('td'); td1.textContent = tool.name;
-        const td2 = document.createElement('td'); td2.textContent = tool.source_type || '-';
-        const td3 = document.createElement('td'); td3.textContent = tool.toolset || '-';
-        const td4 = document.createElement('td'); td4.textContent = tool.description || '-';
-        const td5 = document.createElement('td');
-        const badge = document.createElement('span');
-        badge.className = `badge badge--${riskBadge(tool.risk_level)}`;
-        badge.textContent = tool.risk_level;
-        td5.appendChild(badge);
-        const td6 = document.createElement('td'); td6.textContent = tool.enabled ? '是' : '否';
-        const td7 = document.createElement('td');
-        const schemaBtn = document.createElement('button');
-        schemaBtn.type = 'button';
-        schemaBtn.className = 'btn';
-        schemaBtn.textContent = '查看 schema';
-        schemaBtn.addEventListener('click', () => openSchemaModal(tool));
-        td7.appendChild(schemaBtn);
-        tr.append(td1, td2, td3, td4, td5, td6, td7);
-        tbody.appendChild(tr);
-      });
-      table.append(thead, tbody);
-      list.appendChild(table);
+      renderToolsTable(list, builtinTools, '暂无内置工具');
     } catch (error) {
       ui.clear(list);
       ui.renderError(list, error.message);
     }
+  }
+
+  async function refreshMcpTools() {
+    const list = ui.byId('mcp-tools-list');
+    if (!list) return;
+    ui.clear(list);
+    ui.renderLoading(list, '加载 MCP 工具...');
+    try {
+      const tools = await api.listTools();
+      const mcpTools = (tools || []).filter((tool) => tool.source_type === 'mcp');
+      ui.clear(list);
+      renderToolsTable(list, mcpTools, '暂无 MCP 工具');
+    } catch (error) {
+      ui.clear(list);
+      ui.renderError(list, error.message);
+    }
+  }
+
+  function renderToolsTable(container, tools, emptyText) {
+    if (!tools.length) { ui.renderEmpty(container, emptyText); return; }
+    const table = document.createElement('table');
+    table.className = 'document-table';
+    const thead = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    ['名称', '类型', '分组', '描述', '风险等级', '启用', 'Schema'].forEach((label) => {
+      const th = document.createElement('th'); th.textContent = label; headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow);
+    const tbody = document.createElement('tbody');
+    tools.forEach((tool) => {
+      const tr = document.createElement('tr');
+      const td1 = document.createElement('td'); td1.textContent = tool.name;
+      const td2 = document.createElement('td'); td2.textContent = tool.source_type || '-';
+      const td3 = document.createElement('td'); td3.textContent = tool.toolset || '-';
+      const td4 = document.createElement('td'); td4.textContent = tool.description || '-';
+      const td5 = document.createElement('td');
+      const badge = document.createElement('span');
+      badge.className = `badge badge--${riskBadge(tool.risk_level)}`;
+      badge.textContent = tool.risk_level;
+      td5.appendChild(badge);
+      const td6 = document.createElement('td'); td6.textContent = tool.enabled ? '是' : '否';
+      const td7 = document.createElement('td');
+      const schemaBtn = document.createElement('button');
+      schemaBtn.type = 'button';
+      schemaBtn.className = 'btn';
+      schemaBtn.textContent = '查看 schema';
+      schemaBtn.addEventListener('click', () => openSchemaModal(tool));
+      td7.appendChild(schemaBtn);
+      tr.append(td1, td2, td3, td4, td5, td6, td7);
+      tbody.appendChild(tr);
+    });
+    table.append(thead, tbody);
+    container.appendChild(table);
   }
 
   async function refreshMcpSites() {
@@ -159,13 +180,14 @@
     const group = document.createElement('div');
     group.className = 'row-actions';
     const edit = actionButton('编辑', () => openSiteModal(site));
-    const refresh = actionButton('刷新工具', async () => { await api.refreshMcpSite(site.id); await refreshMcpSites(); await refreshTools(); });
+    const refresh = actionButton('刷新工具', async () => { await api.refreshMcpSite(site.id); await refreshMcpSites(); await refreshTools(); await refreshMcpTools(); });
     const tools = actionButton('查看工具', () => openSiteTools(site));
     const remove = actionButton('删除', async () => {
       if (!window.confirm(`删除 MCP 站点 ${site.name}？`)) return;
       await api.deleteMcpSite(site.id);
       await refreshMcpSites();
       await refreshTools();
+      await refreshMcpTools();
     });
     group.append(edit, refresh, tools, remove);
     actions.appendChild(group);
@@ -251,6 +273,7 @@
       closeSchemaModal();
       await refreshMcpSites();
       await refreshTools();
+      await refreshMcpTools();
     });
     dialog.appendChild(form);
     backdrop.appendChild(dialog);
@@ -358,6 +381,7 @@
       toggle.addEventListener('change', async () => {
         await api.updateMcpTool(site.id, tool.id, { enabled: toggle.checked });
         await refreshTools();
+        await refreshMcpTools();
       });
       enabled.textContent = '启用';
       enabled.appendChild(toggle);
@@ -372,6 +396,7 @@
   async function refresh() {
     await refreshTools();
     await refreshMcpSites();
+    await refreshMcpTools();
   }
 
   function init() {
@@ -379,6 +404,8 @@
     if (refreshBtn) refreshBtn.addEventListener('click', refreshTools);
     const mcpRefresh = ui.byId('mcp-sites-refresh');
     if (mcpRefresh) mcpRefresh.addEventListener('click', refreshMcpSites);
+    const mcpToolsRefresh = ui.byId('mcp-tools-refresh');
+    if (mcpToolsRefresh) mcpToolsRefresh.addEventListener('click', refreshMcpTools);
     const mcpNew = ui.byId('mcp-site-new');
     if (mcpNew) mcpNew.addEventListener('click', () => openSiteModal(null));
     refresh();

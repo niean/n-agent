@@ -12,6 +12,7 @@ Agent Runtime
 ├── Memory：消息、会话、工具调用记录、运行状态和摘要
 ├── Action：把模型 tool_calls 转换为受控工具执行
 ├── Policy：工具权限、风险等级、执行约束和安全决策
+├── Skill：本地 SKILL.md 包扫描、元数据持久化、按需 view 渲染、宏预处理（${HERMES_SKILL_DIR}/${HERMES_SESSION_ID}）；通过 safe 工具 skills_list/skill_view 暴露给 LLM 自助使用
 └── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
@@ -79,6 +80,8 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | 端口 | ToolExecutor | 屏蔽具体工具 handler |
 | 端口 | Summarizer | 屏蔽摘要生成策略 |
 | 端口 | TitleGenerator | 屏蔽会话标题生成策略，归属 Session 子域 |
+| 实体 | Skill | 本地 SKILL.md 包：name、description、frontmatter、platforms、enabled、readiness、last_scan_status |
+| 端口 | SkillRegistry | Skill 元数据持久化端口（list/get/upsert/set_enabled/delete），重扫保留 enabled 状态 |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 
@@ -126,7 +129,7 @@ Policy 负责决定动作是否允许执行，避免把权限、安全和风险�
 - 工具执行权限判定：允许、拒绝、拒绝原因。
 - 文件、网络等外部资源访问的安全约束。
 
-当前 MVP 以服务端 safe 工具为主；后续审批流、多 Agent、自动化任务和更完整的沙箱能力，都应优先扩展 Policy，而不是把规则写进具体工具实现。
+当前以服务端 safe 工具为主；后续审批流、多 Agent、自动化任务和更完整的沙箱能力，都应优先扩展 Policy，而不是把规则写进具体工具实现。
 
 ## 外部边界
 

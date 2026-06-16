@@ -42,9 +42,7 @@
     document.querySelectorAll('.tab-content').forEach((tab) => tab.classList.remove('active'));
     document.querySelectorAll('.sidebar__item').forEach((item) => {
       item.classList.remove('sidebar__item--active');
-      item.classList.remove('sidebar__item--parent-open');
     });
-    document.querySelectorAll('.sidebar__submenu').forEach((sub) => sub.classList.remove('sidebar__submenu--open'));
     const target = document.getElementById(`tab-${next}`);
     if (target) target.classList.add('active');
     const nav = document.querySelector(`[data-tab="${next}"]`);
@@ -63,16 +61,17 @@
     }
   }
 
+  function closeAllPopouts() {
+    document.querySelectorAll('.sidebar__submenu').forEach((sub) => sub.classList.remove('sidebar__submenu--open'));
+    document.querySelectorAll('.sidebar__item--parent').forEach((p) => p.classList.remove('sidebar__item--parent-open'));
+  }
+
   function navigateTo(name) {
     if (isParent(name)) {
-      if (!document.body.classList.contains('sidebar-expanded')) {
-        document.body.classList.add('sidebar-expanded');
-        const toggle = document.getElementById('sidebar-toggle');
-        if (toggle) toggle.setAttribute('aria-expanded', 'true');
-      }
+      if (!document.body.classList.contains('sidebar-expanded')) return;
       const submenu = document.querySelector(`[data-submenu-of="${name}"]`);
-      if (submenu) submenu.classList.toggle('sidebar__submenu--open');
       const parentNav = document.querySelector(`[data-tab="${name}"]`);
+      if (submenu) submenu.classList.toggle('sidebar__submenu--open');
       if (parentNav) parentNav.classList.toggle('sidebar__item--parent-open');
       return;
     }
@@ -90,13 +89,18 @@
       toggle.addEventListener('click', () => {
         const expanded = document.body.classList.toggle('sidebar-expanded');
         toggle.setAttribute('aria-expanded', String(expanded));
+        closeAllPopouts();
       });
     }
     document.querySelectorAll('.sidebar__item').forEach((link) => {
       link.addEventListener('click', (event) => {
         event.preventDefault();
+        event.stopPropagation();
         navigateTo(link.dataset.tab);
       });
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') closeAllPopouts();
     });
     window.addEventListener('popstate', () => applyTab(selectedTabFromPath()));
     applyTab(selectedTabFromPath());

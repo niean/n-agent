@@ -46,22 +46,38 @@ class FeishuClient:
         return payload
 
     async def listen_events(self, handler: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
-        try:
-            import lark_oapi as lark
-        except ImportError as exc:
-            raise RuntimeError("lark-oapi is required for Feishu long connection") from exc
-
         loop = asyncio.get_running_loop()
 
-        def on_message(payload: Any) -> None:
-            data = _event_to_dict(payload)
-            _submit_event_handler(handler, data, loop)
+        def run_lark() -> None:
+            # lark-oapi binds to ``asyncio.get_event_loop()`` at module import
+            # time. Importing it here, inside a dedicated thread that has just
+            # installed a fresh loop, keeps lark off uvicorn's running loop —
+            # otherwise lark schedules its receive-loop / reconnect tasks onto
+            # the server loop and locks request dispatch.
+            thread_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(thread_loop)
+            try:
+                import lark_oapi as lark
+            except ImportError as exc:
+                raise RuntimeError("lark-oapi is required for Feishu long connection") from exc
 
-        builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message)
-        if hasattr(builder, "register_p2_card_action_trigger"):
-            builder = builder.register_p2_card_action_trigger(on_message)
-        client = lark.ws.Client(self.config.app_id, self.config.app_secret, event_handler=builder.build())
-        await asyncio.to_thread(client.start)
+            def on_message(payload: Any) -> None:
+                data = _event_to_dict(payload)
+                _submit_event_handler(handler, data, loop)
+
+            try:
+                builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message)
+                if hasattr(builder, "register_p2_card_action_trigger"):
+                    builder = builder.register_p2_card_action_trigger(on_message)
+                client = lark.ws.Client(self.config.app_id, self.config.app_secret, event_handler=builder.build())
+                client.start()
+            finally:
+                try:
+                    thread_loop.close()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(run_lark)
 
     async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
         tenant_access_token = await self.get_tenant_access_token()

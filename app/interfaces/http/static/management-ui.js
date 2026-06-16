@@ -41,6 +41,12 @@
   const renderLoading = (parent, message) => renderState(parent, message || '加载中...', 'muted loading-state');
   const renderError = (parent, message) => renderState(parent, message || '加载失败', 'muted error-state');
 
+  function el(tag, className) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    return node;
+  }
+
   global.NAGENT = namespace;
-  global.NAGENT.ui = { byId, clear, appendText, appendBadge, renderJson, renderEmpty, renderLoading, renderError };
+  global.NAGENT.ui = { byId, clear, appendText, appendBadge, renderJson, renderEmpty, renderLoading, renderError, el };
 }(window));

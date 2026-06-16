@@ -1,16 +1,16 @@
-<!-- SUMMARY: N-Agent 是 Python Agent MVP，提供 OpenAI-compatible HTTP API、LangGraph Agent Runtime、SQLite Memory、Tool Registry、Dashboard 和 Docker Compose 部署 -->
+<!-- SUMMARY: N-Agent 是 Python Agent 服务，提供 OpenAI-compatible HTTP API、LangGraph Agent Runtime、SQLite Memory、Tool Registry、Dashboard 和 Docker Compose 部署 -->
 # 项目概览
 
 ## 一句话
 
-N-Agent 是面向 Open-WebUI 和本地调试的 Python Agent MVP，通过 FastAPI 提供 OpenAI-compatible API，内部使用 LangGraph 编排 Agent Loop，并以 DDD 分层、LLM Adapter、Tool Registry、SQLite Memory 和 Docker Compose 部署作为后续完整 Agent 能力的演进基线。
+N-Agent 是面向 Open-WebUI 和本地调试的 Python Agent 服务，通过 FastAPI 提供 OpenAI-compatible API，内部使用 LangGraph 编排 Agent Loop，并以 DDD 分层、LLM Adapter、Tool Registry、SQLite Memory 和 Docker Compose 部署作为后续完整 Agent 能力的演进基线。
 
 ## 技术栈
 
 - 语言与版本：Python 3.11+
 - Web 框架：FastAPI、Uvicorn
 - Agent Runtime：LangGraph，位于 Application 层
-- 模型适配：OpenAI Python SDK，MVP 默认 OpenAI-compatible Provider
+- 模型适配：OpenAI Python SDK，默认 OpenAI-compatible Provider
 - 配置：pydantic-settings，从 `.env` 和环境变量读取，前缀为 `N_AGENT_`
 - 存储：SQLite 标准库，默认容器路径 `/app/locals/sessions.db`
 - 测试：pytest、pytest-asyncio、httpx/TestClient

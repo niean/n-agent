@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Callable
@@ -20,6 +22,7 @@ from app.application.schedule_service import ScheduleService
 from app.application.scheduled_agent_executor import ScheduledAgentExecutor
 from app.application.scheduler_runner import SchedulerRunner
 from app.application.session_service import SessionService
+from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.config import Settings
 from app.domain.provider import ProviderConfig
@@ -32,16 +35,21 @@ from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySes
 from app.infrastructure.registry.sqlite_mcp_registry import SQLiteMcpSiteRegistry
 from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
 from app.infrastructure.registry.sqlite_schedule_registry import SQLiteScheduledTaskRegistry
+from app.infrastructure.registry.sqlite_skill_registry import SQLiteSkillRegistry
 from app.infrastructure.schedule.croniter_calculator import CroniterScheduleCalculator
 from app.infrastructure.schedule.outbound import ScheduleOutboundDelivery
 from app.infrastructure.schedule.prompt_safety import DeterministicPromptSafetyScanner
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
+from app.infrastructure.skill.file_loader import SkillFileLoader, SkillFileLoaderConfig
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.kb import KnowledgeSearchClient, KnowledgeToolExecutor
 from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 from app.interfaces.http.openai import create_openai_router
+
+
+logger = logging.getLogger(__name__)
 
 
 def _provider_factory(cfg: ProviderConfig, api_key: str) -> OpenAICompatibleProvider:
@@ -90,6 +98,7 @@ class ApplicationServices:
     gateway_service: GatewayService
     schedule_service: ScheduleService
     scheduler_runner: SchedulerRunner
+    skill_service: SkillService
     health_snapshot: Callable[[], dict]
 
 
@@ -129,6 +138,22 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     mcp_management_executor = McpManagementToolExecutor(mcp_service)
     for definition in mcp_management_tool_definitions():
         routes[definition.name] = mcp_management_executor
+
+    skill_registry = SQLiteSkillRegistry(settings.sqlite_path)
+    skill_loader = SkillFileLoader(SkillFileLoaderConfig(
+        root=settings.skills_root,
+        current_platform=sys.platform,
+        inline_shell_enabled=settings.skills_inline_shell_enabled,
+        inline_shell_timeout=settings.skills_inline_shell_timeout,
+        max_view_bytes=settings.skills_max_view_bytes,
+        max_count=settings.skills_max_count,
+    ))
+    skill_service = SkillService(skill_registry, skill_loader)
+    skill_executor = SkillToolExecutor(skill_service)
+    for definition in skill_tool_definitions():
+        routes[definition.name] = skill_executor
+    tool_service.set_dynamic_definitions("skill", skill_tool_definitions())
+
     tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
     try:
         asyncio.run(mcp_service.refresh_registered_tool_surface())
@@ -238,6 +263,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         gateway_service=gateway_service,
         schedule_service=schedule_service,
         scheduler_runner=scheduler_runner,
+        skill_service=skill_service,
         health_snapshot=health_snapshot,
     )
 
@@ -249,6 +275,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         feishu_task: asyncio.Task | None = None
         scheduler_task: asyncio.Task | None = None
+        try:
+            report = await services.skill_service.scan_now()
+            logger.info(
+                "skill startup scan ok skills=%s warnings=%s",
+                report.skills_count,
+                len(report.warnings),
+            )
+        except Exception:
+            logger.exception("skill startup scan failed; dashboard refresh available as fallback")
         if services.settings.scheduler_enabled:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
         if services.settings.feishu_enabled:
@@ -292,6 +327,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             provider_service=services.provider_service,
             mcp_service=services.mcp_service,
             schedule_service=services.schedule_service,
+            skill_service=services.skill_service,
         )
     )
     return app

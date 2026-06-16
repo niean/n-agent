@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 from uuid import uuid4
 
 from app.domain.gateway import GatewaySessionKey, InteractionMessage, InteractionSourceType
 from app.main import build_application_services
+
+
+def _load_skill_service():
+    return build_application_services().skill_service
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,12 +24,27 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("sessions")
     subparsers.add_parser("status")
 
+    skill_parser = subparsers.add_parser("skill")
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_command")
+    skill_subparsers.add_parser("list")
+    skill_view_parser = skill_subparsers.add_parser("view")
+    skill_view_parser.add_argument("name")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0)
     if args.command is None:
         parser.print_help()
+        return 0
+
+    if args.command == "skill":
+        service = _load_skill_service()
+        if args.skill_command == "list":
+            return _cmd_skill_list(args, service)
+        if args.skill_command == "view":
+            return _cmd_skill_view(args, service)
+        skill_parser.print_help()
         return 0
 
     services = build_application_services()
@@ -41,6 +61,23 @@ def main(argv: list[str] | None = None) -> int:
             _print_response(response)
             return 0
         return _interactive_chat(services.gateway_service, args.session_source)
+    return 0
+
+
+def _cmd_skill_list(args, service) -> int:
+    skills = asyncio.run(service.list_skills(include_disabled=True))
+    for s in skills:
+        readiness = s.readiness.value if hasattr(s.readiness, "value") else str(s.readiness)
+        print(f"{s.name}\t{readiness}\t{'on' if s.enabled else 'off'}\t{s.description}")
+    return 0
+
+
+def _cmd_skill_view(args, service) -> int:
+    payload = asyncio.run(service.render_view(args.name))
+    if not payload.get("success"):
+        print(json.dumps(payload, ensure_ascii=False))
+        return 1
+    print(payload.get("content", ""))
     return 0
 
 

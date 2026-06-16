@@ -36,3 +36,21 @@ def test_application_does_not_import_infrastructure():
 
 def test_interfaces_do_not_import_infrastructure_or_sqlite():
     assert_no_forbidden_imports("app/interfaces", ("sqlite3", "app.infrastructure"))
+
+
+def test_skill_domain_pure():
+    text = open("app/domain/skill.py").read()
+    for forbidden in (
+        "import sqlite3",
+        "import fastapi",
+        "import langgraph",
+        "import openai",
+        "from app.infrastructure",
+        "from app.interfaces",
+    ):
+        assert forbidden not in text, f"forbidden import in domain/skill.py: {forbidden}"
+
+
+def test_skill_application_no_infrastructure():
+    text = open("app/application/skill_service.py").read()
+    assert "from app.infrastructure" not in text

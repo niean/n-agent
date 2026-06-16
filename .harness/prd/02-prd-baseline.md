@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent MVP 的稳定产品需求，包括 OpenAI-compatible API、Chat Dashboard、Agent Runtime、工具、记忆和部署约束 -->
+<!-- SUMMARY: N-Agent 的稳定产品需求，包括 OpenAI-compatible API、Chat Dashboard、Agent Runtime、工具、记忆和部署约束 -->
 # 产品需求 - 稳定固化(不频繁变更)
 
 ## 1. 极简摘要
@@ -58,7 +58,7 @@
 - 达到迭代上限时应 finalize，并记录 last_error。
 
 ### 3.4 Tool Registry 与内置工具
-- MVP 内置 safe 工具：`get_current_time`、`calculator`、`list_directory`、`read_text_file`。
+- 内置 safe 工具：`get_current_time`、`calculator`、`list_directory`、`read_text_file`。
 - `safe` 工具默认允许执行。
 - `confirm` 工具默认拒绝自动执行，返回 `permission_denied`。
 - `dangerous` 工具默认不暴露给 LLM，也不可自动执行。
@@ -90,7 +90,7 @@
 - 安全：Provider API Key 只通过环境变量注入，不写入镜像、测试、日志或文档。
 - 数据：SQLite 和 workspace 均通过 Docker Compose volume 持久化到宿主机目录。
 - 测试：新增 Domain、Application、Infrastructure、Interfaces 能力时补充对应测试；涉及 DDD 边界时运行边界测试。
-- 范围：MVP 只实现当前对话、工具、记忆、调试和部署闭环，不提前实现完整多 Agent、审批流、Cron、远程运行环境或消息网关。
+- 范围：当前阶段只实现既定对话、工具、记忆、调试和部署闭环，不提前实现完整多 Agent、审批流、Cron、远程运行环境或消息网关。
 
 ---
 

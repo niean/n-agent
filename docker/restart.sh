@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # restart
-docker compose stop n-agent
+docker compose down n-agent
 docker compose rm -f n-agent
 docker compose up -d --build --force-recreate --remove-orphans n-agent
 echo
@@ -16,6 +16,7 @@ echo "compose ps n-agent"
 docker compose ps n-agent
 echo
 
+# health
 sleep 2
 echo "curl -fsS http://nagent.localhost/health"
 curl -fsS http://nagent.localhost/health | jq .

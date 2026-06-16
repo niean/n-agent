@@ -1,9 +1,9 @@
-<!-- SUMMARY: Agent MVP 与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则 -->
+<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则 -->
 # 架构与模块边界
 
 ## 架构定位
 
-本项目的 Agent MVP 是后续持续迭代到完整 Agent 能力的架构基线，不是一次性 demo。MVP 只实现当前验收范围，但领域模型、端口和模块边界必须支持后续扩展 Provider、工具生态、长期 Memory、权限审批、多 Agent、自动化任务、可观测性和部署运行环境。
+本项目当前阶段是后续持续迭代到完整 Agent 能力的架构基线，不是一次性 demo。当前阶段只实现既定验收范围，但领域模型、端口和模块边界必须支持后续扩展 Provider、工具生态、长期 Memory、权限审批、多 Agent、自动化任务、可观测性和部署运行环境。
 
 ## 分层
 
@@ -34,6 +34,7 @@
 - OpenAI-compatible API：对外兼容 Open-WebUI 的协议层，不等同于内部 Agent 模型。
 - Interaction Gateway：CLI、飞书 IM 等非 Dashboard 入口通过 Application 层 GatewayService 标准化为 InteractionMessage，再复用 ChatCompletionService、SessionService、ToolService 和 MemoryStore；Gateway 破坏性命令确认由 Application 层 pending confirmation 管理，飞书使用 interactive card 作为展示和回调通道。飞书使用长连接接收事件，平台适配只做协议解析、消息类型过滤、卡片渲染、回调路由和消息收发。
 - Chat Dashboard：调试和演示入口，查看会话、流式输出、工具调用、摘要和任务状态，不替代 Open-WebUI。
+- Skill 子系统：独立 DDD 子域。Domain 定义 Skill 模型与 SkillRegistry 端口；Application SkillService 负责扫描、列表、view 渲染、启停切换、宏预处理（`${HERMES_SKILL_DIR}` / `${HERMES_SESSION_ID}`）和 safe 工具 (`skills_list`、`skill_view`) 的动态定义；Infrastructure 提供 SkillFileLoader 扫描本地 SKILLS_ROOT（默认 `/workspace/skills`，复用 path_security 防遍历/symlink）与 SQLite SkillRegistry 元数据持久化（启用状态在重扫间保留）；Interfaces 提供 Dashboard `/chat/skills*` 管理 API + 前端 skills.js 与 CLI `n-agent skill list/view`。LLM 通过 safe 工具自助按需读取，不暴露 `skill_run`。
 
 ## 演进边界
 
@@ -49,4 +50,4 @@
 8. 子 Agent、并行执行、delegate 和结果汇总。
 9. 多平台 Messaging Gateway、远程运行环境和部署安装体系。
 
-本次 MVP 实现计划不得提前实现上述完整能力；只保留清晰扩展点。
+当前阶段实现计划不得提前实现上述完整能力；只保留清晰扩展点。

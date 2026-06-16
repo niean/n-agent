@@ -35,10 +35,15 @@ class Settings(BaseSettings):
     feishu_tenant_key: str = Field(default="")
     feishu_allowed_open_ids: list[str] | str = Field(default_factory=list)
     feishu_allowed_chat_ids: list[str] | str = Field(default_factory=list)
+    skills_root: Path = Field(default=Path("/workspace/skills"))
+    skills_inline_shell_enabled: bool = Field(default=False)
+    skills_inline_shell_timeout: int = Field(default=10, ge=1, le=120)
+    skills_max_view_bytes: int = Field(default=131072, ge=1024)
+    skills_max_count: int = Field(default=200, ge=1, le=2000)
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
-    @field_validator("sqlite_path", "workspace_root", mode="before")
+    @field_validator("sqlite_path", "workspace_root", "skills_root", mode="before")
     @classmethod
     def expand_path(cls, value: str | Path) -> Path:
         return Path(value).expanduser()

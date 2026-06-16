@@ -1,4 +1,4 @@
-<!-- SUMMARY: Agent MVP 与后续完整 Agent 能力相关术语定义 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -8,7 +8,7 @@
 - ChatEvent：Application 层输出的聊天运行事件，供 Interfaces 层编码为 OpenAI-compatible SSE chunk 或非流式响应。
 - Domain Layer：领域层，定义核心业务模型、值对象、领域规则和端口协议，不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或工具 handler。
 - Domain Port：领域层定义的外部能力协议，如 LLMProvider、ToolExecutor、MemoryStore、Summarizer，由 Infrastructure 实现。
-- Evolution Baseline：演进基线。MVP 只实现当前验收范围，但架构边界必须支持后续完整 Agent 能力持续扩展。
+- Evolution Baseline：演进基线。当前阶段只实现既定验收范围，但架构边界必须支持后续完整 Agent 能力持续扩展。
 - Infrastructure Layer：基础设施层，实现 Domain 端口和外部依赖细节，如 Provider SDK、SQLite store、工具 handler、配置加载。
 - Interfaces Layer：接口层，实现 FastAPI、OpenAI-compatible API、Dashboard、SSE 编码和错误映射，只调用 Application 用例。
 - LLM Adapter：模型适配层，通过 LLMProvider 端口屏蔽不同模型 Provider 的协议差异。
@@ -23,7 +23,7 @@
 - ProviderRegistry：领域端口，定义多 Provider 配置的 CRUD、active 切换、明文 api_key 单独读取（仅供 Infrastructure 工厂调用）。
 - ActiveProviderHolder：Application 层适配器，实现 LLMProvider 协议；通过工厂回调懒加载底层 Provider 实例并以 asyncio.Lock 保护 swap，使下游服务无感知地热切换 active provider。
 - search_knowledge：N-Agent 暴露给 LLM 的 safe tool，用于按需调用 N-KB 通用知识检索。
-- Summarizer：领域端口，定义上下文摘要生成能力，MVP 可用启发式摘要，后续可替换为模型驱动压缩。
+- Summarizer：领域端口，定义上下文摘要生成能力，当前可用启发式摘要，后续可替换为模型驱动压缩。
 - Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。
 - ToolDefinition：工具定义值对象，描述工具名称、说明、输入 schema、风险等级、权限、超时和启用状态，不包含具体 handler。
 - ToolExecutor：领域端口，定义工具调用执行接口，具体工具 handler 由 Infrastructure 实现。
