@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -10,7 +11,11 @@ from app.application.schedule_service import ScheduledTaskCreateInput, ScheduleS
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService
 from app.domain.gateway import (
+    GatewayConfirmationAction,
+    GatewayConfirmationChoice,
+    GatewayConfirmationRequest,
     GatewayOutboundMessage,
+    GatewaySessionKey,
     GatewaySessionRegistry,
     InteractionMessage,
     InteractionResponse,
@@ -35,6 +40,45 @@ class GatewayCommandService:
         self.model_service = model_service
         self.health_provider = health_provider
         self.schedule_service = schedule_service
+        self.pending_confirmations: dict[str, GatewayConfirmationRequest] = {}
+        self.trusted_actors: set[tuple[str, str, str, str]] = set()
+        self.confirmation_ttl = timedelta(minutes=15)
+
+    async def handle_destructive_preflight(self, event: InteractionMessage) -> InteractionResponse | None:
+        parsed = self._parse_destructive_command(event.text)
+        if parsed is None:
+            return None
+        action, args = parsed
+        active = await self.registry.get_active_session(event.session_key)
+        if action is not GatewayConfirmationAction.NEW and active is None:
+            return _response("", "没有当前会话，请先发送普通消息或使用 /new 创建会话")
+        session_id = active.session_id if active is not None else ""
+        actor_value = event.metadata.get("actor_id")
+        if actor_value is None and action is GatewayConfirmationAction.NEW:
+            return await self._execute_new(event)
+        actor_id = str(actor_value if actor_value is not None else event.session_key.display_name or event.session_key.source_id)
+        if self._trust_key(event.session_key, actor_id) in self.trusted_actors:
+            return await self._execute(action, event, session_id, args)
+        now = datetime.now(timezone.utc)
+        self._cleanup_expired(now)
+        confirmation = GatewayConfirmationRequest(
+            id=f"confirm-{uuid4()}",
+            session_key=event.session_key,
+            actor_id=actor_id,
+            session_id=session_id,
+            target_session_id=session_id,
+            action=action,
+            command=event.text.strip(),
+            args=args,
+            created_at=now,
+            expires_at=now + self.confirmation_ttl,
+        )
+        self.pending_confirmations[confirmation.id] = confirmation
+        return _response(
+            session_id,
+            f"请确认执行 {confirmation.command}",
+            {"confirmation": _confirmation_metadata(confirmation)},
+        )
 
     async def handle(self, event: InteractionMessage, session_id: str) -> InteractionResponse | None:
         text = event.text.strip()
@@ -42,12 +86,9 @@ class GatewayCommandService:
             return None
         command, _, arg = text.partition(" ")
         if command == "/help":
-            return _response(session_id, "可用命令: /help, /new, /switch <session_id>, /sessions, /tools, /models, /status, /schedule help")
-        if command == "/new":
-            new_session_id = f"gateway-{uuid4()}"
-            await self.session_service.create_session(new_session_id, source=event.session_key.source_type.value)
-            await self.registry.create_session_link(event.session_key, new_session_id)
-            return _response(new_session_id, f"已创建新会话 {new_session_id}")
+            return _response(session_id, "可用命令: /help, /new, /rename <title>, /delete, /switch <session_id>, /sessions, /tools, /models, /status, /schedule help")
+        if command == "/rename" and not arg.strip():
+            return _response(session_id, "用法: /rename <title>")
         if command == "/switch":
             target = arg.strip()
             if not target:
@@ -72,6 +113,33 @@ class GatewayCommandService:
         if command == "/schedule":
             return await self._handle_schedule(arg, event, session_id)
         return _response(session_id, "未知命令，输入 /help 查看可用命令")
+
+    async def handle_confirmation(
+        self,
+        session_key: GatewaySessionKey,
+        actor_id: str,
+        confirmation_id: str,
+        choice: GatewayConfirmationChoice,
+    ) -> InteractionResponse:
+        now = datetime.now(timezone.utc)
+        self._cleanup_expired(now)
+        confirmation = self.pending_confirmations.get(confirmation_id)
+        if confirmation is None or confirmation.expires_at <= now:
+            self.pending_confirmations.pop(confirmation_id, None)
+            return _response("", "确认已失效")
+        if confirmation.session_key.conversation_parts != session_key.conversation_parts:
+            return _response(confirmation.session_id, "确认已失效")
+        if confirmation.actor_id != actor_id:
+            return _response(confirmation.session_id, "只有命令发起者可以确认")
+        self.pending_confirmations.pop(confirmation_id, None)
+        if choice is GatewayConfirmationChoice.CANCEL:
+            return _response(confirmation.session_id, "已取消")
+        if choice is GatewayConfirmationChoice.TRUST_SESSION:
+            self.trusted_actors.add(self._trust_key(session_key, actor_id))
+        return await self._execute(confirmation.action, InteractionMessage("", session_key, confirmation.command), confirmation.session_id, confirmation.args)
+
+    def discard_confirmation(self, confirmation_id: str) -> None:
+        self.pending_confirmations.pop(confirmation_id, None)
 
     async def _handle_schedule(self, arg: str, event: InteractionMessage, session_id: str) -> InteractionResponse:
         if self.schedule_service is None:
@@ -108,10 +176,63 @@ class GatewayCommandService:
         if action == "run":
             result = await self.schedule_service.run_now(rest.strip())
             return _response(session_id, str(result))
-        if action == "remove":
-            await self.schedule_service.delete(rest.strip())
-            return _response(session_id, "已删除")
+        if action == "remove" and not rest.strip():
+            return _response(session_id, "用法: /schedule remove <id>")
         return _response(session_id, "未知 /schedule 命令")
+
+    def _parse_destructive_command(self, text: str) -> tuple[GatewayConfirmationAction, dict[str, Any]] | None:
+        command, _, arg = text.strip().partition(" ")
+        if command == "/new":
+            return GatewayConfirmationAction.NEW, {}
+        if command == "/rename":
+            title = arg.strip()
+            if not title:
+                return None
+            return GatewayConfirmationAction.RENAME, {"title": title}
+        if command == "/delete":
+            return GatewayConfirmationAction.DELETE, {}
+        if command == "/schedule":
+            action, _, rest = arg.strip().partition(" ")
+            if action == "remove" and rest.strip():
+                return GatewayConfirmationAction.SCHEDULE_REMOVE, {"task_id": rest.strip()}
+        return None
+
+    async def _execute(
+        self,
+        action: GatewayConfirmationAction,
+        event: InteractionMessage,
+        session_id: str,
+        args: dict[str, Any],
+    ) -> InteractionResponse:
+        if action is GatewayConfirmationAction.NEW:
+            return await self._execute_new(event)
+        if action is GatewayConfirmationAction.RENAME:
+            await self.session_service.rename_session(session_id, str(args["title"]))
+            return _response(session_id, f"已重命名为 {args['title']}")
+        if action is GatewayConfirmationAction.DELETE:
+            await self.registry.delete_session_link(session_id)
+            await self.session_service.delete_session(session_id)
+            return await self._execute_new(event)
+        if action is GatewayConfirmationAction.SCHEDULE_REMOVE:
+            if self.schedule_service is None:
+                return _response(session_id, "任务服务未启用")
+            await self.schedule_service.delete(str(args["task_id"]))
+            return _response(session_id, "已删除")
+        raise ValueError(f"unsupported confirmation action: {action}")
+
+    async def _execute_new(self, event: InteractionMessage) -> InteractionResponse:
+        new_session_id = f"gateway-{uuid4()}"
+        await self.session_service.create_session(new_session_id, source=event.session_key.source_type.value)
+        await self.registry.create_session_link(event.session_key, new_session_id)
+        return _response(new_session_id, f"已创建新会话 {new_session_id}")
+
+    def _trust_key(self, session_key: GatewaySessionKey, actor_id: str) -> tuple[str, str, str, str]:
+        return (*session_key.conversation_parts, actor_id)
+
+    def _cleanup_expired(self, now: datetime) -> None:
+        expired = [key for key, value in self.pending_confirmations.items() if value.expires_at <= now]
+        for key in expired:
+            self.pending_confirmations.pop(key, None)
 
 
 class GatewayService:
@@ -143,6 +264,10 @@ class GatewayService:
         if not processed:
             return InteractionResponse(session_id="", messages=[], metadata={"duplicate": True})
 
+        preflight = await self.command_service.handle_destructive_preflight(event)
+        if preflight is not None:
+            return preflight
+
         session_id = await self._resolve_session_id(event)
         command_response = await self.command_service.handle(event, session_id)
         if command_response is not None:
@@ -166,6 +291,18 @@ class GatewayService:
         assert isinstance(result, ChatCompletionResult)
         return _response(result.session_id, str(result.message.get("content", "")))
 
+    async def handle_confirmation(
+        self,
+        session_key: GatewaySessionKey,
+        actor_id: str,
+        confirmation_id: str,
+        choice: GatewayConfirmationChoice,
+    ) -> InteractionResponse:
+        return await self.command_service.handle_confirmation(session_key, actor_id, confirmation_id, choice)
+
+    def discard_confirmation(self, confirmation_id: str) -> None:
+        self.command_service.discard_confirmation(confirmation_id)
+
     async def _resolve_session_id(self, event: InteractionMessage) -> str:
         link = await self.registry.get_active_session(event.session_key)
         if link is not None:
@@ -187,9 +324,20 @@ def _parse_schedule_add(rest: str) -> tuple[str, str] | None:
 
 
 
+def _confirmation_metadata(confirmation: GatewayConfirmationRequest) -> dict[str, Any]:
+    return {
+        "id": confirmation.id,
+        "action": confirmation.action.value,
+        "command": confirmation.command,
+        "expires_at": confirmation.expires_at.isoformat(),
+        "source_id": confirmation.session_key.source_id,
+        "thread_id": confirmation.session_key.thread_id,
+    }
+
+
+
 def _response(session_id: str, content: str, metadata: dict[str, Any] | None = None) -> InteractionResponse:
     return InteractionResponse(
         session_id=session_id,
-        messages=[GatewayOutboundMessage(content=content)],
-        metadata=metadata or {},
+        messages=[GatewayOutboundMessage(content=content, metadata=metadata or {})],
     )

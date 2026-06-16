@@ -37,6 +37,14 @@ class FeishuClient:
         self._verify_allowlist(payload)
         return payload
 
+    def verify_card_action_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._verify_payload(payload)
+        event = payload.get("event", {})
+        open_id = event.get("operator", {}).get("open_id", "")
+        chat_id = event.get("context", {}).get("open_chat_id", "")
+        self._verify_actor_allowlist(open_id, chat_id)
+        return payload
+
     async def listen_events(self, handler: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
         try:
             import lark_oapi as lark
@@ -49,7 +57,10 @@ class FeishuClient:
             data = _event_to_dict(payload)
             _submit_event_handler(handler, data, loop)
 
-        client = lark.ws.Client(self.config.app_id, self.config.app_secret, event_handler=lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message).build())
+        builder = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(on_message)
+        if hasattr(builder, "register_p2_card_action_trigger"):
+            builder = builder.register_p2_card_action_trigger(on_message)
+        client = lark.ws.Client(self.config.app_id, self.config.app_secret, event_handler=builder.build())
         await asyncio.to_thread(client.start)
 
     async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
@@ -63,6 +74,29 @@ class FeishuClient:
                 "msg_type": "text",
                 "content": json.dumps({"text": text}, ensure_ascii=False),
             },
+        )
+        response.raise_for_status()
+
+    async def send_interactive_card(self, receive_id: str, card: dict[str, Any], receive_id_type: str = "chat_id") -> None:
+        tenant_access_token = await self.get_tenant_access_token()
+        response = await self.http_client.post(
+            "/open-apis/im/v1/messages",
+            params={"receive_id_type": receive_id_type},
+            headers={"Authorization": f"Bearer {tenant_access_token}"},
+            json={
+                "receive_id": receive_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            },
+        )
+        response.raise_for_status()
+
+    async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> None:
+        tenant_access_token = await self.get_tenant_access_token()
+        response = await self.http_client.post(
+            f"/open-apis/im/v1/messages/{message_id}/reactions",
+            headers={"Authorization": f"Bearer {tenant_access_token}"},
+            json={"reaction_type": {"emoji_type": emoji_type}},
         )
         response.raise_for_status()
 
@@ -97,6 +131,9 @@ class FeishuClient:
         open_id = sender_id.get("open_id", "")
         message = event.get("message", {})
         chat_id = message.get("chat_id", "")
+        self._verify_actor_allowlist(open_id, chat_id)
+
+    def _verify_actor_allowlist(self, open_id: str, chat_id: str) -> None:
         if self.config.allowed_open_ids and open_id not in self.config.allowed_open_ids:
             raise FeishuVerificationError("open id not allowed")
         if self.config.allowed_chat_ids and chat_id not in self.config.allowed_chat_ids:

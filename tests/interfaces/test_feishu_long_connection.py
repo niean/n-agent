@@ -1,6 +1,6 @@
 import json
 
-from app.domain.gateway import InteractionMessage, InteractionResponse
+from app.domain.gateway import GatewayOutboundMessage, InteractionMessage, InteractionResponse
 from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
 
 
@@ -8,14 +8,26 @@ class FakeFeishuClient:
     def __init__(self, payload=None):
         self.payload = payload
         self.sent: list[tuple[str, str]] = []
+        self.cards: list[tuple[str, dict, str]] = []
+        self.reactions: list[tuple[str, str]] = []
         self.events = []
 
     def verify_long_connection_event(self, payload):
         self.events.append(payload)
         return self.payload or payload
 
+    def verify_card_action_event(self, payload):
+        self.events.append(payload)
+        return self.payload or payload
+
     async def send_text(self, receive_id, text, receive_id_type="chat_id"):
         self.sent.append((receive_id, text, receive_id_type))
+
+    async def send_interactive_card(self, receive_id, card, receive_id_type="chat_id"):
+        self.cards.append((receive_id, card, receive_id_type))
+
+    async def add_reaction(self, message_id, emoji_type="Typing"):
+        self.reactions.append((message_id, emoji_type))
 
     async def listen_events(self, handler):
         await handler(self.payload)
@@ -24,15 +36,23 @@ class FakeFeishuClient:
 class FakeGatewayService:
     def __init__(self, duplicate=False):
         self.events: list[InteractionMessage] = []
+        self.confirmations = []
+        self.discarded = []
         self.duplicate = duplicate
+        self.response: InteractionResponse | None = None
 
     async def handle_message(self, event):
         self.events.append(event)
         if self.duplicate:
             return InteractionResponse(session_id="", messages=[], metadata={"duplicate": True})
-        from app.domain.gateway import GatewayOutboundMessage
+        return self.response or InteractionResponse(session_id="s1", messages=[GatewayOutboundMessage("reply")])
 
-        return InteractionResponse(session_id="s1", messages=[GatewayOutboundMessage("reply")])
+    async def handle_confirmation(self, session_key, actor_id, confirmation_id, choice):
+        self.confirmations.append((session_key, actor_id, confirmation_id, choice))
+        return InteractionResponse(session_id="s1", messages=[GatewayOutboundMessage("confirmed")])
+
+    def discard_confirmation(self, confirmation_id):
+        self.discarded.append(confirmation_id)
 
 
 def text_payload(text="hello", chat_type="p2p"):
@@ -48,6 +68,18 @@ def text_payload(text="hello", chat_type="p2p"):
                 "message_type": "text",
                 "content": json.dumps({"text": text}),
             },
+        },
+    }
+
+
+def card_payload(choice="once"):
+    return {
+        "schema": "2.0",
+        "header": {"event_id": "card-event-1", "app_id": "app-1"},
+        "event": {
+            "operator": {"open_id": "ou_1"},
+            "context": {"open_chat_id": "oc_1"},
+            "action": {"value": {"confirmation_id": "confirm-1", "choice": choice, "source_id": "oc_1", "thread_id": ""}},
         },
     }
 
@@ -85,6 +117,7 @@ async def test_long_connection_group_message_without_mention_is_ignored():
     await adapter.handle_event(payload)
 
     assert gateway.events == []
+    assert client.reactions == []
     assert client.sent == []
 
 
@@ -101,6 +134,7 @@ async def test_long_connection_text_message_calls_gateway_and_replies():
     assert gateway.events[0].metadata["receive_id"] == "oc_1"
     assert gateway.events[0].metadata["receive_id_type"] == "chat_id"
     assert "active_text_delivery" in gateway.events[0].metadata["capabilities"]
+    assert client.reactions == [("msg-1", "Typing")]
     assert client.sent == [("oc_1", "reply", "chat_id")]
 
 
@@ -117,6 +151,22 @@ async def test_long_connection_p2p_without_chat_id_replies_to_open_id():
     assert gateway.events[0].metadata["receive_id"] == "ou_1"
     assert gateway.events[0].metadata["receive_id_type"] == "open_id"
     assert client.sent == [("ou_1", "reply", "open_id")]
+
+
+async def test_long_connection_reaction_failure_does_not_block_reply():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(text_payload("hello"))
+
+    async def fail_reaction(*args, **kwargs):
+        raise RuntimeError("reaction failed")
+
+    client.add_reaction = fail_reaction
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events[0].text == "hello"
+    assert client.sent == [("oc_1", "reply", "chat_id")]
 
 
 async def test_long_connection_normalizes_null_thread_id():
@@ -141,3 +191,60 @@ async def test_long_connection_duplicate_gateway_response_does_not_send_reply():
 
     assert len(gateway.events) == 1
     assert client.sent == []
+
+
+async def test_long_connection_text_message_sets_actor_id_metadata():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(text_payload("hello"))
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events[0].metadata["actor_id"] == "ou_1"
+
+
+async def test_long_connection_sends_confirmation_as_interactive_card():
+    gateway = FakeGatewayService()
+    gateway.response = InteractionResponse(
+        session_id="s1",
+        messages=[GatewayOutboundMessage("需要确认", metadata={"confirmation": {"id": "confirm-1", "action": "new", "command": "/new"}})],
+    )
+    client = FakeFeishuClient(text_payload("/new"))
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert client.cards[0][0] == "oc_1"
+    assert client.sent == []
+
+
+async def test_long_connection_card_send_failure_discards_pending_and_sends_retry_text():
+    gateway = FakeGatewayService()
+    gateway.response = InteractionResponse(
+        session_id="s1",
+        messages=[GatewayOutboundMessage("需要确认", metadata={"confirmation": {"id": "confirm-1", "action": "new", "command": "/new"}})],
+    )
+    client = FakeFeishuClient(text_payload("/new"))
+
+    async def fail_card(*args, **kwargs):
+        raise RuntimeError("card failed")
+
+    client.send_interactive_card = fail_card
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.discarded == ["confirm-1"]
+    assert "稍后重试" in client.sent[0][1]
+
+
+async def test_long_connection_card_action_routes_confirmation():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(card_payload())
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    await adapter.handle_event(card_payload())
+
+    assert gateway.confirmations[0][1] == "ou_1"
+    assert gateway.confirmations[0][2] == "confirm-1"
+    assert client.sent == [("oc_1", "confirmed", "chat_id")]

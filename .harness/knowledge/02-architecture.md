@@ -32,7 +32,7 @@
 - Knowledge Retrieval：N-Agent 通过 safe tool `search_knowledge` 调用独立 N-KB HTTP 检索服务，N-KB 不嵌入 N-Agent，Domain 不感知 N-KB 协议。
 - Memory/Context：通过 MemoryStore 与 Summarizer 端口访问，会话、消息、工具调用、任务状态和摘要的持久化细节属于 Infrastructure。
 - OpenAI-compatible API：对外兼容 Open-WebUI 的协议层，不等同于内部 Agent 模型。
-- Interaction Gateway：CLI、飞书 IM 等非 Dashboard 入口通过 Application 层 GatewayService 标准化为 InteractionMessage，再复用 ChatCompletionService、SessionService、ToolService 和 MemoryStore；飞书使用长连接接收事件，平台适配只做协议解析、消息类型过滤和消息收发。
+- Interaction Gateway：CLI、飞书 IM 等非 Dashboard 入口通过 Application 层 GatewayService 标准化为 InteractionMessage，再复用 ChatCompletionService、SessionService、ToolService 和 MemoryStore；Gateway 破坏性命令确认由 Application 层 pending confirmation 管理，飞书使用 interactive card 作为展示和回调通道。飞书使用长连接接收事件，平台适配只做协议解析、消息类型过滤、卡片渲染、回调路由和消息收发。
 - Chat Dashboard：调试和演示入口，查看会话、流式输出、工具调用、摘要和任务状态，不替代 Open-WebUI。
 
 ## 演进边界

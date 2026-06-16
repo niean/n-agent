@@ -14,6 +14,19 @@ class InteractionSourceType(str, Enum):
     API = "api"
 
 
+class GatewayConfirmationChoice(str, Enum):
+    ONCE = "once"
+    TRUST_SESSION = "trust_session"
+    CANCEL = "cancel"
+
+
+class GatewayConfirmationAction(str, Enum):
+    NEW = "new"
+    RENAME = "rename"
+    DELETE = "delete"
+    SCHEDULE_REMOVE = "schedule_remove"
+
+
 @dataclass(frozen=True)
 class GatewaySessionKey:
     source_type: InteractionSourceType
@@ -55,6 +68,20 @@ class GatewaySessionLink:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     id: str = field(default_factory=lambda: str(uuid4()))
+
+
+@dataclass(frozen=True)
+class GatewayConfirmationRequest:
+    id: str
+    session_key: GatewaySessionKey
+    actor_id: str
+    session_id: str
+    target_session_id: str
+    action: GatewayConfirmationAction
+    command: str
+    args: dict[str, Any]
+    created_at: datetime
+    expires_at: datetime
 
 
 class GatewaySessionRegistry(Protocol):

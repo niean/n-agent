@@ -24,6 +24,14 @@ def event_payload(**event):
     return {"schema": "2.0", "header": {"app_id": "app-1", "tenant_key": "tenant-1"}, "event": event}
 
 
+def card_action_payload(open_id="ou_1", chat_id="oc_1"):
+    return event_payload(
+        operator={"open_id": open_id},
+        context={"open_chat_id": chat_id},
+        action={"value": {"confirmation_id": "confirm-1", "choice": "once"}},
+    )
+
+
 def test_verify_long_connection_event_accepts_valid_allowed_event():
     feishu = client()
     payload = event_payload(sender={"sender_id": {"open_id": "ou_1"}}, message={"chat_id": "oc_1"})
@@ -49,6 +57,22 @@ def test_verify_long_connection_event_rejects_allowlist_mismatch():
 
     with pytest.raises(FeishuVerificationError):
         feishu.verify_long_connection_event(payload)
+
+
+def test_verify_card_action_event_accepts_operator_and_context_allowlist():
+    verified = client().verify_card_action_event(card_action_payload())
+
+    assert verified["event"]["operator"]["open_id"] == "ou_1"
+
+
+def test_verify_card_action_event_rejects_operator_allowlist_mismatch():
+    with pytest.raises(FeishuVerificationError):
+        client().verify_card_action_event(card_action_payload(open_id="ou_bad"))
+
+
+def test_verify_card_action_event_rejects_chat_allowlist_mismatch():
+    with pytest.raises(FeishuVerificationError):
+        client().verify_card_action_event(card_action_payload(chat_id="oc_bad"))
 
 
 def test_get_tenant_access_token_caches_token():
@@ -87,6 +111,45 @@ def test_send_text_posts_with_cached_token_without_exposing_token():
     assert b"tenant-token" not in message_request.content
     assert json.loads(message_request.content)["receive_id"] == "oc_1"
     assert dict(message_request.url.params)["receive_id_type"] == "chat_id"
+
+
+def test_send_interactive_card_posts_interactive_message():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200})
+        return httpx.Response(200, json={"code": 0})
+
+    feishu = client(allowed_open_ids=[], allowed_chat_ids=[])
+    feishu.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://open.feishu.cn")
+
+    asyncio.run(feishu.send_interactive_card("oc_1", {"type": "template", "data": {}}))
+
+    body = json.loads(requests[1].content)
+    assert body["msg_type"] == "interactive"
+    assert json.loads(body["content"])["type"] == "template"
+
+
+def test_add_reaction_posts_message_reaction():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200})
+        return httpx.Response(200, json={"code": 0})
+
+    feishu = client(allowed_open_ids=[], allowed_chat_ids=[])
+    feishu.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://open.feishu.cn")
+
+    asyncio.run(feishu.add_reaction("msg-1"))
+
+    reaction_request = requests[1]
+    assert reaction_request.url.path == "/open-apis/im/v1/messages/msg-1/reactions"
+    assert reaction_request.headers["Authorization"] == "Bearer tenant-token"
+    assert json.loads(reaction_request.content) == {"reaction_type": {"emoji_type": "Typing"}}
 
 
 def test_send_text_can_use_open_id_receive_type():

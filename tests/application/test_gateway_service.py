@@ -1,10 +1,11 @@
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 import pytest
 
 from app.application.gateway_service import GatewayService
 from app.application.chat_service import ChatCompletionResult
-from app.domain.gateway import GatewaySessionKey, GatewaySessionLink, InteractionMessage, InteractionSourceType
+from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, GatewaySessionLink, InteractionMessage, InteractionSourceType
 from app.domain.provider import ModelInfo
 from app.domain.session import ConversationSession
 from app.domain.tool import ToolDefinition
@@ -52,11 +53,20 @@ class FakeGatewayRegistry:
 class FakeSessionService:
     def __init__(self):
         self.created: list[ConversationSession] = []
+        self.renamed = []
+        self.deleted = []
 
     async def create_session(self, session_id: str, source: str = "dashboard"):
         session = ConversationSession(id=session_id, source=source)
         self.created.append(session)
         return session
+
+    async def rename_session(self, session_id: str, title: str):
+        self.renamed.append((session_id, title))
+        return ConversationSession(id=session_id, title=title)
+
+    async def delete_session(self, session_id: str):
+        self.deleted.append(session_id)
 
 
 class FakeChatService:
@@ -90,6 +100,7 @@ class FakeScheduleService:
     def __init__(self):
         self.created = []
         self.run_ids = []
+        self.deleted_ids = []
 
     async def create(self, request):
         self.created.append(request)
@@ -121,6 +132,7 @@ class FakeScheduleService:
         return {"status": "ok"}
 
     async def delete(self, task_id):
+        self.deleted_ids.append(task_id)
         return True
 
 
@@ -148,6 +160,12 @@ def message(text="hello", event_id="event-1"):
         session_key=GatewaySessionKey(InteractionSourceType.CLI, "local", display_name="Local"),
         text=text,
     )
+
+
+def test_confirmation_choice_values_are_stable():
+    assert GatewayConfirmationChoice.ONCE.value == "once"
+    assert GatewayConfirmationChoice.TRUST_SESSION.value == "trust_session"
+    assert GatewayConfirmationChoice.CANCEL.value == "cancel"
 
 
 @pytest.mark.asyncio
@@ -183,6 +201,267 @@ async def test_gateway_service_new_command_creates_new_active_session():
 
     assert response.messages[0].content.startswith("已创建新会话")
     assert harness.session_service.created[0].source == "cli"
+
+
+@pytest.mark.asyncio
+async def test_gateway_new_requires_confirmation_before_create():
+    harness = Harness()
+    service = harness.service()
+    event = message("/new")
+    event.metadata["actor_id"] = "ou_1"
+
+    response = await service.handle_message(event)
+
+    assert response.messages[0].metadata["confirmation"]["action"] == "new"
+    assert harness.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_confirmation_once_executes_pending_new():
+    harness = Harness()
+    service = harness.service()
+    event = message("/new")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    response = await service.handle_confirmation(
+        event.session_key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert response.messages[0].content.startswith("已创建新会话")
+    assert len(harness.session_service.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_confirmation_cancel_does_not_execute_pending_new():
+    harness = Harness()
+    service = harness.service()
+    event = message("/new")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    response = await service.handle_confirmation(
+        event.session_key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.CANCEL,
+    )
+
+    assert "已取消" in response.messages[0].content
+    assert harness.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_confirmation_trust_session_skips_next_destructive_command():
+    harness = Harness()
+    service = harness.service()
+    first = message("/new")
+    first.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(first)
+
+    await service.handle_confirmation(
+        first.session_key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.TRUST_SESSION,
+    )
+    second = message("/new", "event-new-2")
+    second.metadata["actor_id"] = "ou_1"
+    response = await service.handle_message(second)
+
+    assert "confirmation" not in response.messages[0].metadata
+    assert response.messages[0].content.startswith("已创建新会话")
+
+
+@pytest.mark.asyncio
+async def test_gateway_confirmation_rejects_different_actor():
+    harness = Harness()
+    service = harness.service()
+    event = message("/new")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    response = await service.handle_confirmation(
+        event.session_key,
+        "ou_2",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert "只有命令发起者可以确认" in response.messages[0].content
+    assert harness.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_confirmation_expires_after_ttl():
+    harness = Harness()
+    service = harness.service()
+    service.command_service.confirmation_ttl = timedelta(seconds=0)
+    event = message("/new")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    response = await service.handle_confirmation(
+        event.session_key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert "确认已失效" in response.messages[0].content
+    assert harness.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_rename_confirmation_executes_against_captured_session():
+    harness = Harness()
+    key = message().session_key
+    await harness.registry.create_session_link(key, "session-1")
+    service = harness.service()
+    event = message("/rename New Title")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    await service.handle_confirmation(
+        key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert harness.session_service.renamed == [("session-1", "New Title")]
+
+
+@pytest.mark.asyncio
+async def test_gateway_delete_confirmation_deletes_link_session_and_creates_replacement_session():
+    harness = Harness()
+    key = message().session_key
+    await harness.registry.create_session_link(key, "session-1")
+    service = harness.service()
+    event = message("/delete")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    response = await service.handle_confirmation(
+        key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert harness.session_service.deleted == ["session-1"]
+    assert response.session_id != "session-1"
+    assert "session-1" not in [link.session_id for links in harness.registry.links.values() for link in links]
+    assert harness.registry.active[key.conversation_parts] == response.session_id
+
+
+@pytest.mark.asyncio
+async def test_gateway_schedule_remove_requires_confirmation():
+    harness = Harness()
+    key = message().session_key
+    await harness.registry.create_session_link(key, "session-1")
+    schedule = FakeScheduleService()
+    service = harness.service(schedule)
+    event = message("/schedule remove sched-1")
+    event.metadata["actor_id"] = "ou_1"
+
+    pending = await service.handle_message(event)
+
+    assert pending.messages[0].metadata["confirmation"]["action"] == "schedule_remove"
+    assert schedule.deleted_ids == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_schedule_remove_confirmation_deletes_task():
+    harness = Harness()
+    key = message().session_key
+    await harness.registry.create_session_link(key, "session-1")
+    schedule = FakeScheduleService()
+    service = harness.service(schedule)
+    event = message("/schedule remove sched-1")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    await service.handle_confirmation(
+        key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert schedule.deleted_ids == ["sched-1"]
+
+
+@pytest.mark.asyncio
+async def test_destructive_commands_without_active_session_do_not_create_session():
+    harness = Harness()
+    service = harness.service(FakeScheduleService())
+    event = message("/delete")
+    event.metadata["actor_id"] = "ou_1"
+
+    response = await service.handle_message(event)
+
+    assert "没有当前会话" in response.messages[0].content
+    assert harness.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_rename_without_title_returns_usage_without_confirmation():
+    harness = Harness()
+    key = message().session_key
+    await harness.registry.create_session_link(key, "session-1")
+    service = harness.service()
+    event = message("/rename")
+    event.metadata["actor_id"] = "ou_1"
+
+    response = await service.handle_message(event)
+
+    assert "用法" in response.messages[0].content
+    assert "confirmation" not in response.messages[0].metadata
+
+
+@pytest.mark.asyncio
+async def test_rename_without_active_session_does_not_create_session():
+    harness = Harness()
+    service = harness.service()
+    event = message("/rename New Title")
+    event.metadata["actor_id"] = "ou_1"
+
+    response = await service.handle_message(event)
+
+    assert "没有当前会话" in response.messages[0].content
+    assert harness.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_remove_without_active_session_does_not_create_session():
+    harness = Harness()
+    service = harness.service(FakeScheduleService())
+    event = message("/schedule remove sched-1")
+    event.metadata["actor_id"] = "ou_1"
+
+    response = await service.handle_message(event)
+
+    assert "没有当前会话" in response.messages[0].content
+    assert harness.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_remove_without_task_id_returns_usage_without_confirmation():
+    harness = Harness()
+    key = message().session_key
+    await harness.registry.create_session_link(key, "session-1")
+    service = harness.service(FakeScheduleService())
+    event = message("/schedule remove")
+    event.metadata["actor_id"] = "ou_1"
+
+    response = await service.handle_message(event)
+
+    assert "用法" in response.messages[0].content
+    assert "confirmation" not in response.messages[0].metadata
 
 
 @pytest.mark.asyncio
