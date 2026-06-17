@@ -33,6 +33,7 @@ from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, Plat
 from app.domain.provider import ProviderConfig
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
 from app.infrastructure.knowledge.http_adapters import HttpKnowledgeRetrieverConfig, KnowledgeHttpRetrieverFactory
+from app.infrastructure.llm.anthropic_provider import AnthropicProvider
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient
@@ -62,8 +63,12 @@ from app.interfaces.http.platforms import create_platforms_router
 logger = logging.getLogger(__name__)
 
 
-def _provider_factory(cfg: ProviderConfig, api_key: str) -> OpenAICompatibleProvider:
-    return OpenAICompatibleProvider(cfg.base_url, api_key, cfg.model)
+def _provider_factory(cfg: ProviderConfig, api_key: str):
+    if cfg.provider_type == "openai-compatible":
+        return OpenAICompatibleProvider(cfg.base_url, api_key, cfg.model)
+    if cfg.provider_type == "anthropic":
+        return AnthropicProvider(cfg.base_url, api_key, cfg.model, cfg.extra_headers)
+    raise RuntimeError(f"unsupported provider_type: {cfg.provider_type}")
 
 
 def _run_sync(coro):

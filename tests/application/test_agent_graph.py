@@ -105,6 +105,48 @@ class CapturingToolsProvider(FakeProvider):
         return LLMResult(message={"role": "assistant", "content": "hello"}, finish_reason="stop")
 
 
+class CapturingReplayProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.messages_by_call = []
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.messages_by_call.append(list(messages))
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "calculator", "arguments": '{"expression":"1+2"}'},
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {"name": "calculator", "arguments": '{"expression":"2+3"}'},
+                        },
+                    ],
+                },
+                finish_reason="tool_calls",
+            )
+        return LLMResult(message={"role": "assistant", "content": "done"}, finish_reason="stop")
+
+
+class InspectingProvider(FakeProvider):
+    def __init__(self):
+        super().__init__()
+        self.messages = []
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.messages = list(messages)
+        self.calls += 1
+        return LLMResult(message={"role": "assistant", "content": "next"}, finish_reason="stop")
+
+
 class FakeKnowledgeExecutor:
     async def execute(self, request: ToolCallRequest) -> ToolResult:
         return ToolResult(
@@ -307,6 +349,44 @@ async def test_agent_graph_persists_tool_message_content_as_string(tmp_path):
     tool_messages = [message for message in persisted if message.role == "tool"]
     assert len(tool_messages) == 1
     assert all(isinstance(message.content, str) for message in tool_messages)
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_preserves_assistant_tool_calls_for_replay(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    provider = CapturingReplayProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "calc"}]), "test")
+
+    second_call_messages = provider.messages_by_call[1]
+    assistant_messages = [message for message in second_call_messages if message["role"] == "assistant"]
+    assert assistant_messages[-1]["tool_calls"][0]["id"] == "call-1"
+    assert len(assistant_messages[-1]["tool_calls"]) == 2
+    persisted = await store.list_messages("s1")
+    persisted_assistant = next(message for message in persisted if message.role == "assistant")
+    assert persisted_assistant.content["tool_calls"][1]["id"] == "call-2"
+
+    inspecting = InspectingProvider()
+    replay_runner = AgentGraphRunner(
+        inspecting,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    await replay_runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "again"}]), "test")
+
+    replayed_assistant = [message for message in inspecting.messages if message["role"] == "assistant"][0]
+    assert replayed_assistant["tool_calls"][0]["id"] == "call-1"
+    assert len(replayed_assistant["tool_calls"]) == 2
 
 
 @pytest.mark.asyncio

@@ -247,6 +247,7 @@ def test_models_page_renders_provider_admin_controls(tmp_path):
     assert 'id="provider-model"' in html
     assert 'id="provider-api-key"' in html
     assert 'id="providers-new"' in html
+    assert 'value="anthropic"' in html
 
 
 def test_chat_debug_panel_is_collapsed_by_default(tmp_path):
@@ -273,6 +274,9 @@ def test_tool_debug_json_strings_are_formatted(tmp_path):
     assert 'JSON.parse(value)' in chat_js
     assert 'JSON.stringify(parsed, null, 2)' in chat_js
     assert 'appendDebugJson(content, message.content || \'\')' in chat_js
+    assert 'message.tool_calls && message.tool_calls.length' in chat_js
+    assert 'appendDebugJson(content, message.tool_calls)' in chat_js
+    assert "typeof message.content === 'string' ? message.content : ''" in chat_js
 
 
 def test_current_session_refresh_renders_persisted_messages(tmp_path):

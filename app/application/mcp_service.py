@@ -348,7 +348,8 @@ def _safe_error(exc: Exception) -> str:
     children = getattr(exc, "exceptions", None)
     if children:
         return _safe_error(children[0])
-    return str(exc).splitlines()[0][:300]
+    lines = str(exc).splitlines()
+    return (lines[0] if lines else type(exc).__name__)[:300]
 
 
 def _tool_result(request: ToolCallRequest, status: ToolResultStatus, content: Any, start: float) -> ToolResult:

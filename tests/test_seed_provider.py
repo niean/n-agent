@@ -5,6 +5,9 @@ import pytest
 
 from app.application.runtime_provider import ActiveProviderHolder
 from app.config import Settings
+from app.domain.provider import ProviderConfig
+from app.infrastructure.llm.anthropic_provider import AnthropicProvider
+from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
 from fastapi.testclient import TestClient
 
@@ -19,6 +22,35 @@ def _settings(tmp_path: Path) -> Settings:
         sqlite_path=str(tmp_path / "sessions.db"),
         workspace_root=str(tmp_path),
     )
+
+
+def test_provider_factory_dispatches_by_provider_type(monkeypatch: pytest.MonkeyPatch):
+    from datetime import datetime, timezone
+
+    def fake_anthropic_init(self, base_url, api_key, default_model, extra_headers=None, client=None):
+        self.base_url = base_url
+        self.default_model = default_model
+        self.client = client
+
+    monkeypatch.setattr(AnthropicProvider, "__init__", fake_anthropic_init)
+    now = datetime.now(timezone.utc)
+    base = dict(
+        id="p",
+        name="P",
+        base_url="http://x",
+        model="m",
+        api_key_present=True,
+        is_active=False,
+        extra_headers={"x-test": "1"},
+        created_at=now,
+        updated_at=now,
+    )
+
+    assert isinstance(_provider_factory(ProviderConfig(provider_type="openai-compatible", **base), "k"), OpenAICompatibleProvider)
+    assert isinstance(_provider_factory(ProviderConfig(provider_type="anthropic", **base), "k"), AnthropicProvider)
+    with pytest.raises(RuntimeError, match="unsupported provider_type"):
+        _provider_factory(ProviderConfig(provider_type="foo", **base), "k")
+
 
 
 def test_seed_creates_default_provider_when_empty(tmp_path: Path):

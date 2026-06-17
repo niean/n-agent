@@ -77,7 +77,17 @@
       el.appendChild(details);
       return el;
     }
-    appendText(el, message.content || '');
+    const contentText = typeof message.content === 'string' ? message.content : '';
+    if (contentText) appendText(el, contentText || '');
+    if (message.tool_calls && message.tool_calls.length) {
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      const content = document.createElement('pre');
+      summary.textContent = '工具调用调试信息';
+      appendDebugJson(content, message.tool_calls);
+      details.append(summary, content);
+      el.appendChild(details);
+    }
     return el;
   }
 

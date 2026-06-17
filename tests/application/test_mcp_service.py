@@ -1,6 +1,6 @@
 import pytest
 
-from app.application.mcp_service import McpClient, McpService, McpSiteInput, mcp_management_tool_definitions
+from app.application.mcp_service import McpClient, McpService, McpSiteInput, McpToolExecutor, mcp_management_tool_definitions
 from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.mcp import McpProbeResult, McpRemoteTool, McpSiteValidationError, McpTransportType
 from app.domain.tool import ToolCallRequest, ToolResult, ToolResultStatus
@@ -23,6 +23,11 @@ class FakeClient(McpClient):
 class FailingClient(McpClient):
     async def probe_tools(self, site):
         raise ExceptionGroup("unhandled errors in a TaskGroup", [RuntimeError("HTTP 404: not found")])
+
+
+class TimeoutCallClient(FakeClient):
+    async def call_tool(self, site, remote_name, arguments):
+        raise TimeoutError
 
 
 class FakeExecutor:
@@ -139,6 +144,19 @@ async def test_mcp_service_probe_error_unwraps_exception_group(tmp_path):
         await service.probe_site(McpSiteInput("docs", "https://example.com/mcp"))
 
     assert "HTTP 404: not found" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_executor_handles_empty_error_message(tmp_path):
+    registry = SQLiteMcpSiteRegistry(tmp_path / "sessions.db")
+    service = McpService(registry, TimeoutCallClient(), None)
+    await service.create_site_with_probe(McpSiteInput("docs", "https://example.com/mcp"), None)
+    executor = McpToolExecutor(service)
+
+    result = await executor.execute(ToolCallRequest("call-1", "mcp_docs_search", {"q": "x"}))
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.content == {"error": "TimeoutError"}
 
 
 @pytest.mark.asyncio

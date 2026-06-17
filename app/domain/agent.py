@@ -38,6 +38,7 @@ class AgentState:
     input_messages: list[dict[str, Any]] = field(default_factory=list)
     working_messages: list[dict[str, Any]] = field(default_factory=list)
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    assistant_tool_messages: list[dict[str, Any]] = field(default_factory=list)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     summary: str = ""
     run_status: RunStatus = RunStatus.PENDING

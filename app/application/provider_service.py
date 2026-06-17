@@ -13,6 +13,9 @@ from app.domain.provider import (
 )
 
 
+SUPPORTED_PROVIDER_TYPES = {"openai-compatible", "anthropic"}
+
+
 @dataclass
 class ProviderCreateInput:
     name: str
@@ -50,14 +53,15 @@ class ProviderService:
         return await self.registry.get_provider(provider_id)
 
     async def create_provider(self, payload: ProviderCreateInput) -> ProviderConfig:
-        self._validate(payload.name, payload.base_url, payload.model)
+        provider_type = payload.provider_type or "openai-compatible"
+        self._validate(payload.name, payload.base_url, payload.model, provider_type)
         if not payload.api_key:
             raise ProviderValidationError("api_key is required for new provider")
         now = datetime.now(timezone.utc)
         cfg = ProviderConfig(
             id="",
             name=payload.name.strip(),
-            provider_type=payload.provider_type or "openai-compatible",
+            provider_type=provider_type,
             base_url=payload.base_url.strip(),
             model=payload.model.strip(),
             api_key_present=False,
@@ -75,7 +79,8 @@ class ProviderService:
         name = patch.name if patch.name is not None else existing.name
         base_url = patch.base_url if patch.base_url is not None else existing.base_url
         model = patch.model if patch.model is not None else existing.model
-        self._validate(name, base_url, model)
+        provider_type = patch.provider_type if patch.provider_type is not None else existing.provider_type
+        self._validate(name, base_url, model, provider_type)
         clear_key = patch.api_key == ""
         api_key_value = patch.api_key if (patch.api_key is not None and patch.api_key != "") else None
         cfg = await self.registry.update_provider(
@@ -102,13 +107,17 @@ class ProviderService:
         await self.registry.delete_provider(provider_id)
 
     async def activate_provider(self, provider_id: str) -> ProviderConfig:
+        existing = await self.registry.get_provider(provider_id)
+        if existing is None:
+            raise ProviderNotFoundError(provider_id)
+        self._validate_provider_type(existing.provider_type)
         cfg = await self.registry.set_active(provider_id)
         secret = await self.registry.get_secret(provider_id) or ""
         await self.holder.swap(cfg, secret)
         return cfg
 
     @staticmethod
-    def _validate(name: str, base_url: str, model: str) -> None:
+    def _validate(name: str, base_url: str, model: str, provider_type: str) -> None:
         if not (name and name.strip()):
             raise ProviderValidationError("name is required")
         if not (model and model.strip()):
@@ -117,6 +126,12 @@ class ProviderService:
             raise ProviderValidationError("base_url is required")
         if not (base_url.startswith("http://") or base_url.startswith("https://")):
             raise ProviderValidationError("base_url must start with http:// or https://")
+        ProviderService._validate_provider_type(provider_type)
+
+    @staticmethod
+    def _validate_provider_type(provider_type: str) -> None:
+        if provider_type not in SUPPORTED_PROVIDER_TYPES:
+            raise ProviderValidationError("provider_type is unsupported")
 
 
 __all__ = [

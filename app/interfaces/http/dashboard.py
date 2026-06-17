@@ -513,7 +513,7 @@ def _register_provider_routes(router: APIRouter, provider_service: ProviderServi
     async def activate_provider(provider_id: str):
         try:
             cfg = await provider_service.activate_provider(provider_id)
-        except ProviderNotFoundError as exc:
+        except (ProviderNotFoundError, ProviderValidationError) as exc:
             return _provider_error_response(exc)
         return _provider_to_dict(cfg)
 
@@ -757,13 +757,21 @@ def _session_to_dict(session: ConversationSession) -> dict:
 
 
 def _message_to_dict(message: ConversationMessage) -> dict:
-    return {
+    content = message.content
+    tool_calls = None
+    if message.role == "assistant" and isinstance(content, dict) and "tool_calls" in content:
+        tool_calls = content.get("tool_calls") or []
+        content = content.get("content", "")
+    data = {
         "id": message.id,
         "role": message.role,
-        "content": message.content,
+        "content": content,
         "tool_call_id": message.tool_call_id,
         "name": message.name,
     }
+    if tool_calls:
+        data["tool_calls"] = tool_calls
+    return data
 
 
 def _summary_to_dict(summary: Summary) -> dict:

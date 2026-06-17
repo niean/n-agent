@@ -137,6 +137,12 @@ def test_create_validation_errors():
                 ProviderCreateInput(name="A", base_url="http://x", model="m", api_key="")
             )
         )
+    with pytest.raises(ProviderValidationError):
+        asyncio.run(
+            service.create_provider(
+                ProviderCreateInput(name="A", base_url="http://x", model="m", api_key="k", provider_type="foo")
+            )
+        )
 
 
 def test_update_api_key_three_states():
@@ -154,6 +160,21 @@ def test_update_api_key_three_states():
     assert registry.secrets[cfg.id] is None
 
 
+
+def test_update_rejects_unsupported_provider_type_without_changing_existing():
+    service, registry, _ = _service()
+    cfg = asyncio.run(
+        service.create_provider(
+            ProviderCreateInput(name="A", base_url="http://x", model="m", api_key="k")
+        )
+    )
+
+    with pytest.raises(ProviderValidationError):
+        asyncio.run(service.update_provider(cfg.id, ProviderUpdateInput(provider_type="foo")))
+
+    assert registry.items[cfg.id].provider_type == "openai-compatible"
+
+
 def test_activate_triggers_holder_swap():
     service, _, holder = _service()
     cfg = asyncio.run(
@@ -163,6 +184,31 @@ def test_activate_triggers_holder_swap():
     )
     asyncio.run(service.activate_provider(cfg.id))
     assert holder.swaps and holder.swaps[-1][0] == cfg.id
+
+
+
+def test_activate_rejects_existing_unsupported_provider_type_without_swapping():
+    service, registry, holder = _service()
+    now = datetime.now(timezone.utc)
+    registry.items["bad"] = ProviderConfig(
+        id="bad",
+        name="Bad",
+        provider_type="foo",
+        base_url="http://x",
+        model="m",
+        api_key_present=True,
+        is_active=False,
+        extra_headers=None,
+        created_at=now,
+        updated_at=now,
+    )
+    registry.secrets["bad"] = "k"
+
+    with pytest.raises(ProviderValidationError):
+        asyncio.run(service.activate_provider("bad"))
+
+    assert holder.swaps == []
+    assert registry.items["bad"].is_active is False
 
 
 def test_delete_active_rejected():

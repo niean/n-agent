@@ -111,6 +111,8 @@ class AgentGraphRunner:
             state.final_message = result.message
             state.finish_reason = result.finish_reason
             state.pending_tool_calls = result.message.get("tool_calls") or []
+            if state.pending_tool_calls:
+                state.assistant_tool_messages.append(result.message)
             state.working_messages.append(result.message)
         except Exception as exc:
             state.error = str(exc)
@@ -173,11 +175,19 @@ class AgentGraphRunner:
         return state
 
     async def update_memory(self, state: AgentState) -> AgentState:
+        assistant_messages = [*state.assistant_tool_messages]
         if state.final_message:
+            assistant_messages.append(state.final_message)
+        for assistant_message in assistant_messages:
+            content = assistant_message.get("content", "")
+            tool_calls = assistant_message.get("tool_calls") or []
+            if tool_calls:
+                content = {"content": content, "tool_calls": tool_calls}
             await self.memory_store.append_message(
                 state.session_id,
-                ConversationMessage(role="assistant", content=state.final_message.get("content", "")),
+                ConversationMessage(role="assistant", content=content),
             )
+        state.assistant_tool_messages = []
         for result in state.tool_results:
             await self.memory_store.append_message(
                 state.session_id,
@@ -249,9 +259,15 @@ def llm_events_to_chat_events(events: AsyncIterator) -> AsyncIterator[ChatEvent]
 
 def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
     content = message.content
+    tool_calls = None
+    if message.role == "assistant" and isinstance(content, dict) and "tool_calls" in content:
+        tool_calls = content.get("tool_calls") or []
+        content = content.get("content", "")
     if message.role == "tool" and not isinstance(content, str):
         content = json.dumps(content)
     data = {"role": message.role, "content": content}
+    if tool_calls:
+        data["tool_calls"] = tool_calls
     if message.tool_call_id:
         data["tool_call_id"] = message.tool_call_id
     if message.name:

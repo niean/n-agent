@@ -7,7 +7,7 @@ from app.application.provider_service import ProviderCreateInput, ProviderServic
 from app.application.schedule_service import ScheduledTaskNotFoundError, ScheduleValidationError
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
-from app.domain.provider import ModelInfo
+from app.domain.provider import ModelInfo, ProviderConfig
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.domain.tool import ToolCallRequest, ToolExecutor, ToolResult, ToolResultStatus
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
@@ -171,6 +171,22 @@ def test_chat_page_and_apis(tmp_path):
     async def seed():
         await store.create_session(ConversationSession(id="s1", title="S1"))
         await store.append_message("s1", ConversationMessage(role="user", content="hello"))
+        await store.append_message(
+            "s1",
+            ConversationMessage(
+                role="assistant",
+                content={
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "calculator", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ),
+        )
         await store.save_summary(Summary(session_id="s1", summary="summary"))
         await store.save_task_state(TaskState(session_id="s1", status="completed", iteration_count=1))
         await store.save_tool_call(ToolCall(id="call-1", session_id="s1", tool_name="calculator", arguments={}, status="success"))
@@ -188,7 +204,11 @@ def test_chat_page_and_apis(tmp_path):
     assert "<aside" in html.text and "sidebar" in html.text
     assert "/static/app.js" in html.text
     assert sessions.json()[0]["id"] == "s1"
-    assert detail.json()["summary"]["summary"] == "summary"
+    detail_body = detail.json()
+    assert detail_body["summary"]["summary"] == "summary"
+    assistant = next(message for message in detail_body["messages"] if message["role"] == "assistant")
+    assert assistant["content"] == ""
+    assert assistant["tool_calls"][0]["id"] == "call-1"
     assert tool_calls.json()[0]["tool_name"] == "calculator"
 
 
@@ -413,11 +433,11 @@ def _build_provider_app(tmp_path):
     holder = _StubHolder()
     provider_service = ProviderService(registry, holder)
     app = _build_app(store, provider_service=provider_service)
-    return app, holder
+    return app, holder, registry
 
 
 def test_provider_routes_full_lifecycle(tmp_path):
-    app, holder = _build_provider_app(tmp_path)
+    app, holder, _ = _build_provider_app(tmp_path)
     client = TestClient(app)
 
     create = client.post(
@@ -451,7 +471,7 @@ def test_provider_routes_full_lifecycle(tmp_path):
 
 
 def test_provider_create_validation(tmp_path):
-    app, _ = _build_provider_app(tmp_path)
+    app, _, _ = _build_provider_app(tmp_path)
     client = TestClient(app)
 
     invalid = client.post(
@@ -461,19 +481,55 @@ def test_provider_create_validation(tmp_path):
     assert invalid.status_code == 422
     assert invalid.json()["error"]["code"] == "provider_invalid"
 
+    invalid_type = client.post(
+        "/chat/providers",
+        json={"name": "P", "base_url": "http://x", "model": "m", "api_key": "k", "provider_type": "foo"},
+    )
+    assert invalid_type.status_code == 422
+    assert invalid_type.json()["error"]["code"] == "provider_invalid"
+
     missing = client.get("/chat/providers/does-not-exist")
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "provider_not_found"
 
 
 def test_provider_duplicate_name_returns_409(tmp_path):
-    app, _ = _build_provider_app(tmp_path)
+    app, _, _ = _build_provider_app(tmp_path)
     client = TestClient(app)
     payload = {"name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1"}
     assert client.post("/chat/providers", json=payload).status_code == 200
     dup = client.post("/chat/providers", json=payload)
     assert dup.status_code == 409
     assert dup.json()["error"]["code"] == "provider_duplicate"
+
+
+
+def test_provider_activate_invalid_provider_type_returns_422(tmp_path):
+    import asyncio
+    from datetime import datetime, timezone
+
+    app, holder, registry = _build_provider_app(tmp_path)
+    now = datetime.now(timezone.utc)
+    cfg = ProviderConfig(
+        id="",
+        name="Bad",
+        provider_type="foo",
+        base_url="http://x",
+        model="m",
+        api_key_present=False,
+        is_active=False,
+        extra_headers=None,
+        created_at=now,
+        updated_at=now,
+    )
+    bad = asyncio.run(registry.create_provider(cfg, "k"))
+    client = TestClient(app)
+
+    response = client.post(f"/chat/providers/{bad.id}/activate")
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "provider_invalid"
+    assert holder.swaps == []
 
 
 def test_chat_session_can_be_renamed(tmp_path):
