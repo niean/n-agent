@@ -6,6 +6,12 @@ from typing import Callable
 from fastapi import APIRouter, Body
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from app.application.knowledge_service import (
+    KnowledgeBaseCreateInput,
+    KnowledgeBaseUpdateInput,
+    KnowledgeProbeInput,
+    KnowledgeService,
+)
 from app.application.mcp_service import McpService, McpSiteInput
 from app.application.model_service import ModelService
 from app.application.provider_service import (
@@ -26,6 +32,14 @@ from app.application.schedule_service import (
 from app.application.session_service import SessionService
 from app.application.skill_service import SkillScanReport, SkillScanWarning, SkillService
 from app.application.tool_service import ToolService
+from app.domain.knowledge import (
+    DuplicateKnowledgeBaseError,
+    KnowledgeBase,
+    KnowledgeBaseNotFoundError,
+    KnowledgeBaseType,
+    KnowledgeBaseValidationError,
+    KnowledgeProbeError,
+)
 from app.domain.mcp import McpProbeError, McpSite, McpSiteNotFoundError, McpSiteValidationError, McpTool, McpTransportType
 from app.domain.provider import (
     DuplicateProviderError,
@@ -63,6 +77,7 @@ def create_dashboard_router(
     mcp_service: McpService | None = None,
     schedule_service: ScheduleService | None = None,
     skill_service: SkillService | None = None,
+    knowledge_service: KnowledgeService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -150,6 +165,8 @@ def create_dashboard_router(
         _register_schedule_routes(router, schedule_service)
     if skill_service is not None:
         _register_skill_routes(router, skill_service)
+    if knowledge_service is not None:
+        _register_knowledge_routes(router, knowledge_service, tool_service)
 
     return router
 
@@ -222,6 +239,151 @@ def _provider_to_dict(cfg: ProviderConfig) -> dict:
         "created_at": cfg.created_at.isoformat(),
         "updated_at": cfg.updated_at.isoformat(),
     }
+
+
+def _knowledge_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, KnowledgeBaseNotFoundError):
+        return JSONResponse(status_code=404, content={"error": {"code": "knowledge_base_not_found", "message": str(exc)}})
+    if isinstance(exc, KnowledgeBaseValidationError):
+        return JSONResponse(status_code=422, content={"error": {"code": "knowledge_base_invalid", "message": str(exc)}})
+    if isinstance(exc, DuplicateKnowledgeBaseError):
+        return JSONResponse(status_code=409, content={"error": {"code": "knowledge_base_duplicate", "message": str(exc)}})
+    if isinstance(exc, KnowledgeProbeError):
+        return JSONResponse(status_code=502, content={"error": {"code": "knowledge_probe_failed", "message": str(exc)}})
+    return JSONResponse(status_code=500, content={"error": {"code": "knowledge_base_error", "message": str(exc)}})
+
+
+def _knowledge_base_to_dict(base: KnowledgeBase) -> dict:
+    return {
+        "id": base.id,
+        "name": base.name,
+        "description": base.description,
+        "base_type": base.base_type.value,
+        "base_url": base.base_url,
+        "dataset_id": base.dataset_id,
+        "api_key_present": base.api_key_present,
+        "enabled": base.enabled,
+        "default_top_k": base.default_top_k,
+        "default_min_score": base.default_min_score,
+        "last_probe_status": base.last_probe_status.value,
+        "last_probe_error": base.last_probe_error,
+        "last_probed_at": base.last_probed_at.isoformat() if base.last_probed_at else None,
+        "created_at": base.created_at.isoformat(),
+        "updated_at": base.updated_at.isoformat(),
+    }
+
+
+def _knowledge_create_input(payload: dict) -> KnowledgeBaseCreateInput:
+    return KnowledgeBaseCreateInput(
+        id=payload.get("id", ""),
+        name=payload.get("name", ""),
+        description=payload.get("description", ""),
+        base_type=KnowledgeBaseType(payload.get("base_type", "n_kb")),
+        base_url=payload.get("base_url", ""),
+        dataset_id=payload.get("dataset_id", ""),
+        api_key=payload.get("api_key"),
+        enabled=bool(payload.get("enabled", True)),
+        default_top_k=payload.get("default_top_k"),
+        default_min_score=payload.get("default_min_score"),
+    )
+
+
+def _knowledge_update_input(payload: dict) -> KnowledgeBaseUpdateInput:
+    base_type = payload.get("base_type")
+    return KnowledgeBaseUpdateInput(
+        name=payload.get("name"),
+        description=payload.get("description"),
+        base_type=KnowledgeBaseType(base_type) if base_type is not None else None,
+        base_url=payload.get("base_url"),
+        dataset_id=payload.get("dataset_id"),
+        api_key=payload.get("api_key"),
+        enabled=payload.get("enabled"),
+        default_top_k=payload.get("default_top_k"),
+        default_min_score=payload.get("default_min_score"),
+        clear_default_top_k=bool(payload.get("clear_default_top_k", False)),
+        clear_default_min_score=bool(payload.get("clear_default_min_score", False)),
+    )
+
+
+def _knowledge_probe_input(payload: dict) -> KnowledgeProbeInput:
+    return KnowledgeProbeInput(
+        name=payload.get("name", ""),
+        description=payload.get("description", ""),
+        base_type=KnowledgeBaseType(payload.get("base_type", "n_kb")),
+        base_url=payload.get("base_url", ""),
+        dataset_id=payload.get("dataset_id", ""),
+        api_key=payload.get("api_key"),
+        default_top_k=payload.get("default_top_k"),
+        default_min_score=payload.get("default_min_score"),
+    )
+
+
+async def _refresh_knowledge_tool_definition(knowledge_service: KnowledgeService, tool_service: ToolService) -> ToolDefinition:
+    definition = await knowledge_service.knowledge_tool_definition()
+    tool_service.definitions[definition.name] = definition
+    return definition
+
+
+def _register_knowledge_routes(router: APIRouter, knowledge_service: KnowledgeService, tool_service: ToolService) -> None:
+    @router.get("/chat/knowledge/bases")
+    async def list_knowledge_bases():
+        return [_knowledge_base_to_dict(base) for base in await knowledge_service.list_bases()]
+
+    @router.get("/chat/knowledge/bases/{kb_id}")
+    async def get_knowledge_base(kb_id: str):
+        try:
+            base = await knowledge_service.get_base(kb_id)
+        except KnowledgeBaseNotFoundError as exc:
+            return _knowledge_error_response(exc)
+        return _knowledge_base_to_dict(base)
+
+    @router.post("/chat/knowledge/tools/refresh")
+    async def refresh_knowledge_tool():
+        definition = await _refresh_knowledge_tool_definition(knowledge_service, tool_service)
+        return _tool_definition_to_dict(definition)
+
+    @router.post("/chat/knowledge/bases")
+    async def create_knowledge_base(payload: dict = Body(...)):
+        try:
+            base = await knowledge_service.create_base(_knowledge_create_input(payload))
+            await _refresh_knowledge_tool_definition(knowledge_service, tool_service)
+        except (KnowledgeBaseNotFoundError, KnowledgeBaseValidationError, DuplicateKnowledgeBaseError, KnowledgeProbeError) as exc:
+            return _knowledge_error_response(exc)
+        return _knowledge_base_to_dict(base)
+
+    @router.patch("/chat/knowledge/bases/{kb_id}")
+    async def update_knowledge_base(kb_id: str, payload: dict = Body(...)):
+        try:
+            base = await knowledge_service.update_base(kb_id, _knowledge_update_input(payload))
+            await _refresh_knowledge_tool_definition(knowledge_service, tool_service)
+        except (KnowledgeBaseNotFoundError, KnowledgeBaseValidationError, DuplicateKnowledgeBaseError) as exc:
+            return _knowledge_error_response(exc)
+        return _knowledge_base_to_dict(base)
+
+    @router.delete("/chat/knowledge/bases/{kb_id}")
+    async def delete_knowledge_base(kb_id: str):
+        try:
+            await knowledge_service.delete_base(kb_id)
+            await _refresh_knowledge_tool_definition(knowledge_service, tool_service)
+        except KnowledgeBaseNotFoundError as exc:
+            return _knowledge_error_response(exc)
+        return Response(status_code=204)
+
+    @router.post("/chat/knowledge/bases/probe")
+    async def probe_unsaved_knowledge_base(payload: dict = Body(...)):
+        try:
+            await knowledge_service.probe_unsaved(_knowledge_probe_input(payload))
+        except (KnowledgeBaseValidationError, KnowledgeProbeError) as exc:
+            return _knowledge_error_response(exc)
+        return {"status": "success"}
+
+    @router.post("/chat/knowledge/bases/{kb_id}/probe")
+    async def probe_saved_knowledge_base(kb_id: str):
+        try:
+            await knowledge_service.probe_base(kb_id)
+        except (KnowledgeBaseNotFoundError, KnowledgeProbeError) as exc:
+            return _knowledge_error_response(exc)
+        return {"status": "success"}
 
 
 def _register_mcp_routes(router: APIRouter, mcp_service: McpService) -> None:

@@ -9,9 +9,9 @@
 
 项目严格遵循领域驱动设计 DDD，采用外层依赖内层的方向：Interfaces -> Application -> Domain。Infrastructure 只实现 Domain 定义的端口，并在应用启动时注入。
 
-- Domain 层：定义 Agent、Session、Message、Tool、Provider、Memory 等核心领域模型和值对象，定义 LLMProvider、ToolExecutor、MemoryStore、Summarizer 等端口协议。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
+- Domain 层：定义 Agent、Session、Message、Tool、Provider、Memory、Knowledge 等核心领域模型和值对象，定义 LLMProvider、ToolExecutor、MemoryStore、Summarizer、KnowledgeBaseRegistry、KnowledgeRetriever 等端口协议。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
 - Application 层：编排用例和 Agent Runtime。LangGraph 属于本层，只负责状态图和运行流程编排。
-- Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、N-KB 知识检索 HTTP client、配置加载等。
+- Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、Knowledge HTTP adapter、配置加载等。
 - Interfaces 层：实现 FastAPI、OpenAI-compatible API、Dashboard 和协议转换。
 
 ## 模块边界
@@ -29,7 +29,7 @@
 - LLM Adapter：模型 Provider 端口，屏蔽 OpenAI-compatible、Claude、Ollama、OpenRouter 等 Provider 差异。运行时由 Application 层 `ActiveProviderHolder` 适配，结合 SQLite 持久化的 `ProviderRegistry`（多 Provider 注册表 + 单一 active）实现 Dashboard 在线 CRUD 与热切换；下游用例只依赖 Domain LLMProvider 端口，不感知 holder 与 registry 的存在。
 - Tool Registry：工具定义、schema、来源类型、能力分组、风险等级、权限要求和执行入口。Agent 实际可执行工具只来自服务端注册表；多个工具 executor 通过 Infrastructure 组合路由分发。MCP 远端工具通过本地动态 ToolDefinition 暴露，运行时由 Application 层 McpToolExecutor 薄适配 McpService，再由 Infrastructure MCP client 访问远端站点。
 - MCP Sites：MCP 站点管理采用“配置注册表 + 探测优先 + 动态工具面”模式。Domain 定义站点、工具映射和 registry 端口；Application McpService 负责 CRUD、探测、刷新、动态工具定义和调用解析；Infrastructure 实现 SQLite registry 与 MCP SDK client，并支持 streamable_http、SSE 和 stdio 三类传输；Interfaces 只提供 Dashboard API 和静态页面交互。stdio 站点保存 command/args/env，执行时通过 argv 启动本地 MCP server，不走 shell。
-- Knowledge Retrieval：N-Agent 通过 safe tool `search_knowledge` 调用独立 N-KB HTTP 检索服务，N-KB 不嵌入 N-Agent，Domain 不感知 N-KB 协议。
+- Knowledge Retrieval：N-Agent 定义知识检索 SPI，通过 safe tool `search_knowledge` 消费多个已注册 KB 后端。Domain 只定义 KB 值对象、注册表端口和检索端口；Application 的 KnowledgeService 编排 KB CRUD、probe、search 和动态工具定义；Infrastructure 用 SQLite registry 保存 KB 配置，用 HTTP adapter 适配 N-KB/Ragflow 协议；Interfaces 提供 Dashboard KB 管理 API 和前端页面。N-KB、Ragflow 都只是后端协议类型，不嵌入 N-Agent 领域模型。
 - Memory/Context：通过 MemoryStore 与 Summarizer 端口访问，会话、消息、工具调用、任务状态和摘要的持久化细节属于 Infrastructure。
 - OpenAI-compatible API：对外兼容 Open-WebUI 的协议层，不等同于内部 Agent 模型。
 - Interaction Gateway：CLI、飞书 IM 等非 Dashboard 入口通过 Application 层 GatewayService 标准化为 InteractionMessage，再复用 ChatCompletionService、SessionService、ToolService 和 MemoryStore；Gateway 破坏性命令确认由 Application 层 pending confirmation 管理，飞书使用 interactive card 作为展示和回调通道。飞书使用长连接接收事件，平台适配只做协议解析、消息类型过滤、卡片渲染、回调路由和消息收发。

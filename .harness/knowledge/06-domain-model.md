@@ -13,6 +13,7 @@ Agent Runtime
 ├── Action：把模型 tool_calls 转换为受控工具执行
 ├── Policy：工具权限、风险等级、执行约束和安全决策
 ├── Skill：本地 SKILL.md 包扫描、元数据持久化、按需 view 渲染、宏预处理（${HERMES_SKILL_DIR}/${HERMES_SESSION_ID}）；通过 safe 工具 skills_list/skill_view 暴露给 LLM 自助使用
+├── Knowledge：KB 后端实例注册、探测、检索 SPI 和 search_knowledge 工具定义；通过 kb_id 显式路由到 N-KB/Ragflow 等协议 adapter
 └── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
@@ -45,7 +46,7 @@ Infrastructure -> Domain
 
 - Domain：定义 Agent、Session、Message、Tool、Policy、Provider、Memory 等领域模型、值对象和端口协议。
 - Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
-- Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、N-KB 检索工具和配置加载。
+- Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
 
 Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层的 Runtime Loop 实现细节。
@@ -82,6 +83,12 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | 端口 | TitleGenerator | 屏蔽会话标题生成策略，归属 Session 子域 |
 | 实体 | Skill | 本地 SKILL.md 包：name、description、frontmatter、platforms、enabled、readiness、last_scan_status |
 | 端口 | SkillRegistry | Skill 元数据持久化端口（list/get/upsert/set_enabled/delete），重扫保留 enabled 状态 |
+| 实体 | KnowledgeBase | KB 后端实例脱敏配置：id、name、description、base_type、base_url、dataset_id、api_key_present、enabled、默认检索参数和 probe 状态 |
+| 值对象 | KnowledgeBaseSecret | KB 明文密钥，只在 probe/search 时从 registry 单独读取 |
+| 值对象 | KnowledgeSearchRequest | LLM 工具侧检索请求，kb_id 与 query 必填，不支持默认 KB |
+| 值对象 | KnowledgeSnippet / KnowledgeSearchResult | 跨 N-KB/Ragflow 的标准检索结果 |
+| 端口 | KnowledgeBaseRegistry | KB 配置注册表端口（CRUD + get_secret + probe 状态更新） |
+| 端口 | KnowledgeRetriever / KnowledgeRetrieverFactory | KB 检索与探测 SPI，Infrastructure adapter 按 base_type 实现协议差异 |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 
@@ -114,9 +121,9 @@ LLM tool_calls
 当前工具能力包括：
 
 - 内置工具：时间、计算、目录列表、文本读取。
-- 知识库工具：`search_knowledge`，通过 N-KB HTTP API 检索知识。
+- 知识库工具：`search_knowledge`，按必填 kb_id 检索已注册 KB 后端。
 
-N-KB 是外部独立服务，不属于 N-Agent 领域模型。N-Agent 只通过工具端口消费它。
+Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置。N-KB、Ragflow 是外部独立服务和协议类型，不属于 N-Agent 内部业务模型；N-Agent 通过 KnowledgeRetriever adapter 消费它们。
 
 ## Policy 业务关系
 
@@ -138,7 +145,7 @@ Policy 负责决定动作是否允许执行，避免把权限、安全和风险�
 - Tool：Application 层处理工具定义和执行编排，具体 handler 属于 Infrastructure。
 - Policy：工具启用状态、风险等级、权限判定和资源访问约束属于业务规则，不下沉到具体 handler。
 - FileSystem：文件工具必须围绕 workspace 根目录做路径安全约束。
-- Network：主要用于模型调用、N-KB 检索、FastAPI HTTP/SSE 服务。
+- Network：主要用于模型调用、KB 后端检索、FastAPI HTTP/SSE 服务。
 
 ## 快速判断规则
 

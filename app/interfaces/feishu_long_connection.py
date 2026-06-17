@@ -80,7 +80,6 @@ class FeishuLongConnectionGateway:
                     "thread_id": thread_id,
                     "display_name": open_id,
                     "actor_id": open_id,
-                    "capabilities": ["active_text_delivery"],
                 },
             )
         )

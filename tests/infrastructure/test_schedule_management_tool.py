@@ -173,6 +173,7 @@ async def test_create_uses_trusted_origin_and_session():
     assert fake.created.session_id == "s1"
     assert fake.created.delivery_target == "origin"
     assert fake.created.origin == {
+        "source_type": "feishu",
         "receive_id": "oc_a",
         "receive_id_type": "chat_id",
         "thread_id": "",

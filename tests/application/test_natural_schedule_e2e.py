@@ -287,7 +287,6 @@ async def test_feishu_natural_language_creates_scheduled_task(tmp_path: Path):
             "receive_id": "oc_a",
             "receive_id_type": "chat_id",
             "thread_id": "",
-            "capabilities": ["active_text_delivery"],
         },
     )
 
@@ -311,6 +310,7 @@ async def test_feishu_natural_language_creates_scheduled_task(tmp_path: Path):
     assert captured.cron_expression == "0 9 * * *"
     assert captured.delivery_target == "origin"
     assert captured.origin == {
+        "source_type": "feishu",
         "receive_id": "oc_a",
         "receive_id_type": "chat_id",
         "thread_id": "",

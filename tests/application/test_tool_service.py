@@ -81,6 +81,7 @@ def test_knowledge_tool_definition_uses_knowledge_source_and_toolset():
     assert definition.name == "search_knowledge"
     assert definition.source_type is ToolSourceType.KNOWLEDGE
     assert definition.toolset == "knowledge"
+    assert definition.input_schema["required"] == ["kb_id", "query"]
 
 
 def test_openai_tool_schemas_exclude_n_agent_metadata():
@@ -142,7 +143,7 @@ async def test_disabled_kb_tool_is_hidden_and_denied():
     service = ToolService(FakeExecutor(), definitions)
 
     schemas = service.list_openai_tools()
-    result = await service.execute(ToolCallRequest(id="1", name="search_knowledge", arguments={"query": "x"}))
+    result = await service.execute(ToolCallRequest(id="1", name="search_knowledge", arguments={"kb_id": "kb-1", "query": "x"}))
 
     assert schemas == []
     assert result.status == ToolResultStatus.PERMISSION_DENIED

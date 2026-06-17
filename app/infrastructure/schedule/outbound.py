@@ -13,14 +13,18 @@ class ScheduleOutboundDelivery:
         if target.target_type is DeliveryTargetType.DASHBOARD:
             return DeliveryResult("success")
         context = target.context
-        if "active_text_delivery" not in context.get("capabilities", []):
-            return DeliveryResult("failed", "origin does not support active_text_delivery")
-        if context.get("source_type") == "feishu":
+        source_type = context.get("source_type")
+        if not source_type and context.get("receive_id") and context.get("receive_id_type"):
+            source_type = "feishu"
+        if source_type == "feishu":
             if self.feishu_client is None:
                 return DeliveryResult("failed", "feishu client is not configured")
+            receive_id = context.get("receive_id", "")
+            if not receive_id:
+                return DeliveryResult("failed", "feishu origin missing receive_id")
             try:
                 await self.feishu_client.send_text(
-                    context.get("receive_id", ""),
+                    receive_id,
                     content,
                     context.get("receive_id_type", "chat_id"),
                 )

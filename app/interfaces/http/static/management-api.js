@@ -27,6 +27,26 @@
   const getHealth = () => fetchJson('/health');
   const getDependencyHealth = () => fetchJson('/chat/health/dependencies');
 
+  const listKnowledgeBases = () => fetchJson('/chat/knowledge/bases');
+  const createKnowledgeBase = (payload) => fetchJson('/chat/knowledge/bases', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const updateKnowledgeBase = (id, payload) => fetchJson(`/chat/knowledge/bases/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const deleteKnowledgeBase = (id) => fetchJson(`/chat/knowledge/bases/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  const probeKnowledgeBase = (payload) => fetchJson('/chat/knowledge/bases/probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const probeSavedKnowledgeBase = (id) => fetchJson(`/chat/knowledge/bases/${encodeURIComponent(id)}/probe`, { method: 'POST' });
+  const refreshKnowledgeTool = () => fetchJson('/chat/knowledge/tools/refresh', { method: 'POST' });
+
   const listProviders = () => fetchJson('/chat/providers');
   const createProvider = (payload) => fetchJson('/chat/providers', {
     method: 'POST',
@@ -107,6 +127,13 @@
     getAdminModels,
     getHealth,
     getDependencyHealth,
+    listKnowledgeBases,
+    createKnowledgeBase,
+    updateKnowledgeBase,
+    deleteKnowledgeBase,
+    probeKnowledgeBase,
+    probeSavedKnowledgeBase,
+    refreshKnowledgeTool,
     listProviders,
     createProvider,
     updateProvider,

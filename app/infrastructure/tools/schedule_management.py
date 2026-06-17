@@ -194,7 +194,9 @@ def _origin_from_trusted(trusted: dict[str, Any]) -> dict[str, str] | None:
     receive_id_type = trusted.get("receive_id_type")
     if not receive_id or not receive_id_type:
         return None
+    source_type = str(trusted.get("source_type") or trusted.get("gateway.source_type") or "")
     return {
+        "source_type": source_type,
         "receive_id": str(receive_id),
         "receive_id_type": str(receive_id_type),
         "thread_id": str(trusted.get("thread_id") or ""),

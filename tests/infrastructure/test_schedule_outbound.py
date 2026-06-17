@@ -37,7 +37,7 @@ async def test_dashboard_delivery_records_success_without_platform_send():
 async def test_feishu_origin_delivery_sends_receive_id_type():
     feishu = FakeFeishuClient()
     target = DeliveryTarget.origin(
-        {"source_type": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id", "capabilities": ["active_text_delivery"]}
+        {"source_type": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id"}
     )
 
     result = await ScheduleOutboundDelivery(feishu).deliver(target, "done")
@@ -47,9 +47,22 @@ async def test_feishu_origin_delivery_sends_receive_id_type():
 
 
 @pytest.mark.asyncio
-async def test_origin_without_capability_fails():
+async def test_feishu_origin_without_source_type_falls_back_to_feishu():
+    feishu = FakeFeishuClient()
+    target = DeliveryTarget.origin(
+        {"receive_id": "ou_1", "receive_id_type": "open_id"}
+    )
+
+    result = await ScheduleOutboundDelivery(feishu).deliver(target, "done")
+
+    assert result.status == "success"
+    assert feishu.calls == [("ou_1", "done", "open_id")]
+
+
+@pytest.mark.asyncio
+async def test_origin_without_receive_id_fails():
     result = await ScheduleOutboundDelivery(FakeFeishuClient()).deliver(
-        DeliveryTarget.origin({"source_type": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id"}),
+        DeliveryTarget.origin({"source_type": "feishu", "receive_id_type": "open_id"}),
         "done",
     )
 
@@ -60,7 +73,7 @@ async def test_origin_without_capability_fails():
 async def test_feishu_send_exception_returns_failed_result():
     result = await ScheduleOutboundDelivery(FakeFeishuClient(fail=True)).deliver(
         DeliveryTarget.origin(
-            {"source_type": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id", "capabilities": ["active_text_delivery"]}
+            {"source_type": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id"}
         ),
         "done",
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Callable
@@ -13,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from app.application.agent_graph import AgentGraphRunner
 from app.application.chat_service import ChatCompletionService
 from app.application.gateway_service import GatewayService
+from app.application.knowledge_service import KnowledgeBaseCreateInput, KnowledgeService, KnowledgeToolExecutor
 from app.application.mcp_service import McpManagementToolExecutor, McpService, McpToolExecutor, mcp_management_tool_definitions
 from app.application.model_service import ModelService
 from app.application.provider_service import ProviderCreateInput, ProviderService
@@ -23,15 +25,18 @@ from app.application.scheduled_agent_executor import ScheduledAgentExecutor
 from app.application.scheduler_runner import SchedulerRunner
 from app.application.session_service import SessionService
 from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
-from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions, schedule_tool_definitions
+from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
 from app.config import Settings
+from app.domain.knowledge import KnowledgeBaseType
 from app.domain.provider import ProviderConfig
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
+from app.infrastructure.knowledge.http_adapters import HttpKnowledgeRetrieverConfig, KnowledgeHttpRetrieverFactory
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
+from app.infrastructure.registry.sqlite_knowledge_registry import SQLiteKnowledgeBaseRegistry
 from app.infrastructure.registry.sqlite_mcp_registry import SQLiteMcpSiteRegistry
 from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
 from app.infrastructure.registry.sqlite_schedule_registry import SQLiteScheduledTaskRegistry
@@ -44,7 +49,6 @@ from app.infrastructure.skill.file_loader import SkillFileLoader, SkillFileLoade
 from app.infrastructure.skill.seed_runner import seed_default_skills
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
-from app.infrastructure.tools.kb import KnowledgeSearchClient, KnowledgeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
 from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
@@ -56,6 +60,46 @@ logger = logging.getLogger(__name__)
 
 def _provider_factory(cfg: ProviderConfig, api_key: str) -> OpenAICompatibleProvider:
     return OpenAICompatibleProvider(cfg.base_url, api_key, cfg.model)
+
+
+def _run_sync(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    result = {}
+
+    def runner():
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    thread.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+async def _seed_legacy_knowledge_base(service: KnowledgeService, settings: Settings) -> None:
+    existing = await service.list_bases()
+    if existing or not (settings.kb_enabled and settings.kb_base_url.strip()):
+        return
+    await service.create_base(
+        KnowledgeBaseCreateInput(
+            id="legacy-n-kb",
+            name="Legacy N-KB",
+            description="Legacy N-KB seeded from N_AGENT_KB_* settings.",
+            base_type=KnowledgeBaseType.N_KB,
+            base_url=settings.kb_base_url,
+            dataset_id="",
+            enabled=True,
+            default_top_k=settings.kb_default_top_k,
+            default_min_score=settings.kb_default_min_score,
+        )
+    )
 
 
 async def _seed_and_activate(
@@ -101,6 +145,7 @@ class ApplicationServices:
     schedule_service: ScheduleService
     scheduler_runner: SchedulerRunner
     skill_service: SkillService
+    knowledge_service: KnowledgeService
     health_snapshot: Callable[[], dict]
 
 
@@ -111,17 +156,16 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     registry = SQLiteProviderRegistry(settings.sqlite_path)
     gateway_registry = SQLiteGatewaySessionRegistry(settings.sqlite_path)
     holder = ActiveProviderHolder(_provider_factory)
-    asyncio.run(_seed_and_activate(registry, holder, settings))
+    _run_sync(_seed_and_activate(registry, holder, settings))
     provider_service = ProviderService(registry, holder)
     builtin_executor = build_builtin_tool_executor(settings.workspace_root)
-    kb_enabled = settings.kb_enabled and bool(settings.kb_base_url.strip())
-    kb_client = KnowledgeSearchClient(settings.kb_base_url, settings.kb_timeout_seconds) if kb_enabled else None
-    kb_executor = KnowledgeToolExecutor(
-        kb_client,
-        enabled=kb_enabled,
-        default_top_k=settings.kb_default_top_k,
-        default_min_score=settings.kb_default_min_score,
+    knowledge_registry = SQLiteKnowledgeBaseRegistry(settings.sqlite_path)
+    knowledge_factory = KnowledgeHttpRetrieverFactory(
+        HttpKnowledgeRetrieverConfig(timeout_seconds=settings.kb_timeout_seconds)
     )
+    knowledge_service = KnowledgeService(knowledge_registry, knowledge_factory)
+    _run_sync(_seed_legacy_knowledge_base(knowledge_service, settings))
+    kb_executor = KnowledgeToolExecutor(knowledge_service)
     mcp_registry = SQLiteMcpSiteRegistry(settings.sqlite_path)
     mcp_client = McpSdkClient(
         McpClientLimits(
@@ -134,9 +178,10 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     )
     routes = {tool_name: builtin_executor for tool_name in BUILTIN_TOOL_NAMES}
     routes["search_knowledge"] = kb_executor
+    knowledge_definition = _run_sync(knowledge_service.knowledge_tool_definition())
     tool_definitions = (
         builtin_tool_definitions()
-        + knowledge_tool_definitions(enabled=kb_enabled)
+        + [knowledge_definition]
         + mcp_management_tool_definitions()
         + schedule_tool_definitions()
     )
@@ -164,7 +209,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
 
     tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
     try:
-        asyncio.run(mcp_service.refresh_registered_tool_surface())
+        _run_sync(mcp_service.refresh_registered_tool_surface())
         mcp_status = "ok"
         mcp_error = ""
     except Exception as exc:
@@ -230,6 +275,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             memory_status = f"error: {exc}"
         active = holder.current_config
         provider_configured = active is not None and active.api_key_present
+        knowledge_bases = _run_sync(knowledge_service.list_bases())
+        knowledge_enabled_count = sum(1 for base in knowledge_bases if base.enabled)
         return {
             "provider": {
                 "status": "ok" if provider_configured else "warn",
@@ -238,9 +285,9 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             },
             "memory": {"status": memory_status, "path": str(settings.sqlite_path)},
             "knowledge": {
-                "status": "ok" if kb_enabled else "disabled",
-                "base_url": settings.kb_base_url,
-                "enabled": kb_enabled,
+                "status": "ok" if knowledge_enabled_count else "disabled",
+                "enabled_count": knowledge_enabled_count,
+                "total_count": len(knowledge_bases),
             },
             "mcp": {"status": mcp_status, "error": mcp_error},
             "gateway": {"status": "ok" if settings.gateway_enabled else "disabled"},
@@ -277,6 +324,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         schedule_service=schedule_service,
         scheduler_runner=scheduler_runner,
         skill_service=skill_service,
+        knowledge_service=knowledge_service,
         health_snapshot=health_snapshot,
     )
 
@@ -341,6 +389,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             mcp_service=services.mcp_service,
             schedule_service=services.schedule_service,
             skill_service=services.skill_service,
+            knowledge_service=services.knowledge_service,
         )
     )
     return app

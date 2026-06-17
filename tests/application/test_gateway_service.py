@@ -535,7 +535,7 @@ async def test_gateway_schedule_add_uses_origin_metadata():
     schedule = FakeScheduleService()
     service = harness.service(schedule)
     event = message("/schedule add */5 * * * * summarize", "event-schedule")
-    event.metadata.update({"receive_id": "oc_1", "receive_id_type": "chat_id", "capabilities": ["active_text_delivery"]})
+    event.metadata.update({"receive_id": "oc_1", "receive_id_type": "chat_id"})
 
     response = await service.handle_message(event)
 
@@ -584,7 +584,6 @@ async def test_handle_message_propagates_trusted_metadata_to_chat_input():
             "receive_id_type": "chat_id",
             "thread_id": "",
             "actor_id": "ou_x",
-            "capabilities": ["active_text_delivery"],
         },
     )
 
@@ -592,10 +591,11 @@ async def test_handle_message_propagates_trusted_metadata_to_chat_input():
 
     request = harness.chat_service.requests[-1]
     assert request.trusted_metadata["gateway.source_type"] == "feishu"
+    assert request.trusted_metadata["source_type"] == "feishu"
     assert request.trusted_metadata["receive_id"] == "oc_a"
     assert request.trusted_metadata["receive_id_type"] == "chat_id"
     assert request.trusted_metadata["actor_id"] == "ou_x"
-    assert request.trusted_metadata["capabilities"] == ["active_text_delivery"]
+    assert "capabilities" not in request.trusted_metadata
     assert request.metadata.get("gateway", {}).get("source_type") == "feishu"
 
 

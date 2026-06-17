@@ -95,17 +95,20 @@ Agent 实际可执行工具只来自服务端 Tool Registry。客户端传入 to
 
 陷阱：把 handler 放进 Domain，或让 API handler 直接执行工具，会破坏权限审计和后续审批流。
 
-## 模式十：外部知识服务通过工具消费
+## 模式十：知识检索 SPI 通过工具消费外部 KB
 
-N-KB 是独立知识服务，N-Agent 只通过 `search_knowledge` safe tool 消费其 HTTP 检索接口。
+N-Agent 拥有知识检索 SPI，`search_knowledge` safe tool 按 LLM 显式传入的 `kb_id` 路由到已注册 KB 后端；N-KB、Ragflow 都只是外部 KB 协议类型。
 
 规则：
-- N-Agent 不复制 N-KB 的索引、文档管理或站点管理能力。
-- N-KB HTTP client 和响应映射属于 Infrastructure，不能进入 Domain 或 Application 用例模型。
-- `search_knowledge` 的启用由配置控制；未配置或禁用时不向 LLM 暴露，异常调用返回 permission_denied。
-- Docker Compose 中访问 N-KB 时不能使用指向容器自身的 localhost，应使用服务名、共享网络或宿主机网关地址。
+- N-Agent 不复制 KB 后端的索引、文档管理或站点管理能力，Dashboard 只管理 N-Agent 侧的 KB 后端实例配置。
+- Domain 定义 KnowledgeBase、KnowledgeBaseRegistry、KnowledgeRetriever、KnowledgeRetrieverFactory 等端口和值对象，不包含 N-KB/Ragflow HTTP 协议细节。
+- Application 的 KnowledgeService 负责 KB CRUD、probe、search 和动态 `search_knowledge` ToolDefinition；ToolDefinition 必须要求 `kb_id` 与 `query`，不支持默认 KB。
+- Tool description 动态列出 enabled KB 的 id/name/description，LLM 依据描述选择合适 kb_id；disabled KB 不出现在描述中，也不可检索。
+- Infrastructure 的 SQLiteKnowledgeBaseRegistry 负责配置和 api_key 存储，HTTP adapters 负责 N-KB/Ragflow 请求与响应归一化；api_key 只通过 get_secret 在 probe/search 时读取，HTTP 响应只暴露 `api_key_present`。
+- Legacy `N_AGENT_KB_*` 只在 knowledge_bases 表为空时 seed 一条 `legacy-n-kb`，后续以 registry 为准。
+- Docker Compose 中访问 KB 后端时不能使用指向 N-Agent 容器自身的 localhost，应使用服务名、共享网络或宿主机网关地址。
 
-陷阱：把 N-KB 作为内部子域嵌入 N-Agent，或在 ChatService 前置固定检索，会让普通对话链路被 RAG 编排污染。
+陷阱：把某个 KB 产品作为内部子域嵌入 N-Agent，或在 ChatService 前置固定检索，会让普通对话链路被 RAG 编排污染，并破坏 `kb_id` 显式选择语义。
 
 ## 模式七：Memory/Context 通过端口访问
 
@@ -169,8 +172,20 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - ChatCompletionService.complete 在每次调用时构造 ToolExecutionContext，把 trusted_metadata 拷贝进去，并通过 `_compute_permitted_managed_tools(mode, trusted_metadata)` 决定 `permitted_managed_tools`。当前规则：mode=realtime 且 `trusted_metadata.gateway.source_type` 为合法 Gateway（feishu）才返回 `{"manage_schedule"}`，否则空集。
 - 上下文通过 LangGraph `configurable.options["tool_execution_context"]` 传递；执行节点（call_llm/execute_tools）必须在 config 缺失时回退到 `state.run_options`，避免 LangGraph 框架精简 config 导致 context 丢失。
 - ToolService.execute 对 `definition.managed=True` 强制检查 `request.name in context.permitted_managed_tools`，否则返回 `permission_denied`，不调用 handler。
-- 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。
+- 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 source_type/receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。`_origin_from_trusted` 把这四个字段一并写入 `ScheduledTask.origin` 与 `DeliveryTarget.context`，由 outbound 按 `source_type` 路由投递。
 - 删除等需要确认的破坏性动作不允许 Agent 直接执行；自然语言删除要返回 confirmation_required 文案，引导用户走 `/schedule remove <id>`。Gateway 破坏性命令 preflight 时把当前飞书 trusted_metadata 写入 `GatewayConfirmationRequest.trusted_metadata`，handle_confirmation 还原后再校验 task.origin 一致性。
 - 不可信模式（unattended/safe_only、定时任务执行）时 `list_openai_tools` 必须过滤 source_type=AGENT 的工具，避免调度器递归调用自己。
 
 陷阱：把 OpenAI HTTP 客户端 metadata 直接当 trusted_metadata 用，或者只在 ToolExecutionContext 里塞 metadata 不区分 trusted/untrusted，会让伪造 `gateway.source_type=feishu` 的 OpenAI 客户端获得飞书会话的 schedule 操作权限。
+
+## 模式十三：平台主动外发按 source_type 路由
+
+后台任务（定时任务等）回投到 IM 平台时，按 `DeliveryTarget.context.source_type` 路由到对应平台 client，不引入 per-message capability 字段。
+
+规则：
+- `ScheduleOutboundDelivery.deliver` 只判断 `source_type`：feishu 则调用注入的 FeishuClient.send_text；未知 source 返回 failed。
+- 平台支持主动文本外发是 platform 固有能力（由是否注入对应 client 决定），不在每条 metadata 里重复声明。新增平台时扩展 deliver 分支即可，不引入新的 capability 抽象。
+- Gateway `_build_trusted_metadata` 必须把 `event.session_key.source_type.value` 写入 `trusted_metadata.source_type`；Tool 落库 origin 时一并保存 source_type/receive_id/receive_id_type/thread_id 四元组。
+- 历史上曾用 `capabilities=["active_text_delivery"]` 表达同一含义，已废弃；outbound 对缺失 source_type 但带 receive_id+receive_id_type 的旧任务向后兼容当作 feishu。
+
+陷阱：把"平台能力"放进每条消息的 capability 列表，意味着任何中间层漏传一次都会让正常功能变成 fail-closed；把能力归到 platform 注册（feishu_client 是否注入）才是单一来源。

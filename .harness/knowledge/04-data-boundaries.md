@@ -45,6 +45,20 @@
 
 `ToolResult`（`app/domain/tool.py`）：工具执行结果，字段包括 tool_call_id、tool_name、status、content、duration_ms，其中 status 使用 ToolResultStatus。
 
+## Knowledge 模型
+
+`KnowledgeBase`（`app/domain/knowledge.py`）：KB 后端实例的脱敏配置实体，字段包括 id、name、description、base_type、base_url、dataset_id、api_key_present、enabled、default_top_k、default_min_score、last_probe_status、last_probe_error、last_probed_at、created_at、updated_at。该模型不包含 api_key 明文字段。
+
+`KnowledgeBaseSecret`（`app/domain/knowledge.py`）：KB 密钥值对象，字段包括 kb_id、api_key，仅供 probe/search 时从 registry 单独读取。
+
+`KnowledgeSearchRequest`（`app/domain/knowledge.py`）：LLM 工具侧检索请求，字段包括 kb_id、query、top_k、min_score。`kb_id` 必填，不支持默认 KB。
+
+`KnowledgeBackendSearchRequest`（`app/domain/knowledge.py`）：后端 adapter 检索请求，字段包括 query、top_k、min_score；已解析的 KnowledgeBase 与 secret 由 Application 显式传入 adapter。
+
+`KnowledgeSnippet` / `KnowledgeSearchResult`（`app/domain/knowledge.py`）：检索结果标准形态，用于屏蔽 N-KB、Ragflow 等后端响应差异。
+
+`KnowledgeBaseType` 支持 `n_kb` 与 `ragflow`，表示通信协议类型，不表示独立业务子域。`KnowledgeProbeStatus` 支持 unknown、success、failed。
+
 ## 端口协议
 
 `LLMProvider`（`app/domain/provider.py`）：定义 list_models、chat、supports_tools。Infrastructure 的 OpenAI-compatible Provider 实现该端口；运行时由 Application 层 `ActiveProviderHolder` 适配实现热切换。
@@ -56,6 +70,10 @@
 `GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射和飞书事件幂等。
 
 `McpSiteRegistry`（`app/domain/mcp.py`）：定义 MCP 站点和工具映射的 list/get/create/update/delete、replace_site_tools、update_probe_status、update_tool_enabled 接口。站点支持 streamable_http、sse 和 stdio 传输；stdio 配置包含 command、args、env。Infrastructure 的 SQLiteMcpSiteRegistry 实现该端口；Application 只依赖该端口和 McpClient 协议。
+
+`KnowledgeBaseRegistry`（`app/domain/knowledge.py`）：定义 KB 后端实例的 list/get/create/update/delete、get_secret、update_probe_status 接口。Infrastructure 的 SQLiteKnowledgeBaseRegistry 实现该端口；api_key 明文只通过 get_secret 单独读取，不通过 HTTP 或 ToolDefinition 暴露。
+
+`KnowledgeRetriever` / `KnowledgeRetrieverFactory`（`app/domain/knowledge.py`）：定义检索和探测端口。Infrastructure 的 Knowledge HTTP adapters 根据 KnowledgeBaseType 选择 N-KB 或 Ragflow 协议实现，Application 只依赖端口，不 import 具体 HTTP client。
 
 `Summarizer`（`app/domain/memory.py`）：定义摘要生成接口。默认 HeuristicSummarizer 实现。
 
@@ -76,6 +94,8 @@
 - kb_default_top_k
 - kb_default_min_score
 - kb_timeout_seconds
+
+`N_AGENT_KB_*` 当前作为 legacy seed 配置：当 knowledge_bases 表为空且 `kb_enabled=True`、`kb_base_url` 非空时，启动时写入一条 `legacy-n-kb`；表非空后以 SQLite registry 为准，配置不覆盖已有 KB。
 - mcp_connect_timeout_seconds
 - mcp_max_tools
 - mcp_max_schema_bytes
@@ -107,6 +127,7 @@ gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
 gateway_processed_events(id, source_type, event_id, message_id, created_at)
 mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
+knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 ```
 
 providers 表唯一索引：
@@ -115,7 +136,7 @@ providers 表唯一索引：
 CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active = 1
 ```
 
-该 partial unique index 保证全表至多一条 active 记录，由 `SQLiteProviderRegistry.set_active` 通过先 `UPDATE is_active=0 WHERE is_active=1` 再 `UPDATE is_active=1 WHERE id=?` 实现切换；`api_key` 列以明文形式落地 `locals/sessions.db`，依赖 Docker volume 持久化与文件系统隔离保护，不通过 HTTP 暴露、不写入日志。
+该 partial unique index 保证全表至多一条 active 记录，由 `SQLiteProviderRegistry.set_active` 通过先 `UPDATE is_active=0 WHERE is_active=1` 再 `UPDATE is_active=1 WHERE id=?` 实现切换；providers.api_key 与 knowledge_bases.api_key 列以明文形式落地 `locals/sessions.db`，依赖 Docker volume 持久化与文件系统隔离保护，不通过 HTTP 暴露、不写入日志。KnowledgeBase 更新中 `api_key=None` 表示保持不变，空字符串表示清空，非空字符串表示覆盖。
 
 索引：
 
@@ -174,8 +195,8 @@ volumes:
 
 - SQLite 数据保存在宿主机 `/Users/niean/install/n-agent/locals/sessions.db`
 - 文件工具只能访问宿主机 `/Users/niean/install/n-agent/workspace` 对应的容器路径 `/workspace`
-- N-KB 是外部独立服务，容器内配置 `N_AGENT_KB_BASE_URL` 时不能使用指向 N-Agent 容器自身的 localhost，应使用 Compose service name、共享 network 或宿主机网关地址
-- N-Agent compose 必须把 n-agent 容器加入 N-KB 所在 Docker 网络（`n-kb_default`，external），并以 `N_AGENT_KB_BASE_URL=http://n-kb:8212` 通过 service name 直连。否则 hostname 会被 Docker Desktop 内部 DNS 解析到不可达代理地址，TCP 表面 connect 成功但 HTTP 响应被丢弃，httpx 抛 RemoteProtocolError
+- KB 后端是外部独立服务，Dashboard 中每条 knowledge_bases 记录的 base_url 必须从 N-Agent 运行环境可达；容器内不能使用指向 N-Agent 容器自身的 localhost，应使用 Compose service name、共享 network 或宿主机网关地址
+- N-Agent compose 访问 N-KB 时应把 n-agent 容器加入 N-KB 所在 Docker 网络（`n-kb_default`，external），并以 KB base_url `http://n-kb:8212` 通过 service name 直连。否则 hostname 会被 Docker Desktop 内部 DNS 解析到不可达代理地址，TCP 表面 connect 成功但 HTTP 响应被丢弃，httpx 抛 RemoteProtocolError
 
 ## 边界约定
 

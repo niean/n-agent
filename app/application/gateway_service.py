@@ -360,11 +360,11 @@ def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:
     return {
         "gateway.source_type": event.session_key.source_type.value,
         "gateway.source_id": event.session_key.source_id,
+        "source_type": event.session_key.source_type.value,
         "thread_id": str(md.get("thread_id") or event.session_key.thread_id or ""),
         "actor_id": str(md.get("actor_id") or ""),
         "receive_id": str(md.get("receive_id") or ""),
         "receive_id_type": str(md.get("receive_id_type") or ""),
-        "capabilities": list(md.get("capabilities") or []),
     }
 
 

@@ -76,26 +76,30 @@
         - 审阅：Spec spec-260616-feishu-natural-schedule.md，发现其中的严重问题
 
 [20260617]
+- Issue
+    - 交互：飞书消息投递失败
 - FR
-    - 知识：知识检索，支持多个知识库KB，Dashboard支持KB的增删改查
+    - 工具：manage_schedule，agent管理工具，需要暴露到Dashboard上
+    - 知识：[KF]检索支持多KB。抽象知识库SPI，支持多种KB类型，包括N-KB、Ragflow；Dashboard支持KB的增删改查
+    - 平台：[KF]抽象平台功能，纳管当前的飞书IM，后续还要支持钉钉、微信等IM；Dashboard上，左导增加一级菜单`平台`，展示平台信息(如platform、session id、thread等) 
+        - 审阅：发现严重问题，Spec spec-260617-platform-aggregate.md
+
+
 
 
 ---
 
 [待办]
 - Issue
+    - 任务：定时任务sched-a406eae127164f3a970f63dbfab24c5d，只有第一个周期执行了，之后都是skipped_missed
 - NFR
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 源码：AgentCore
     - 治理：IAM，安全护栏
 - FR
-    - 工具：manage_schedule，agent管理工具，需要暴露到Dashboard上
     - 工具：Sandbox
     - 工具：相比Hermes，还缺少如下功能
-        不连接 MCP server，不做 mcp_{server}_{tool} 动态发现。
-        不实现 Skill 目录扫描、skills_list、skill_view。
         不实现 plugin system。
-        不实现 toolset enable/disable 组合解析。
         不实现 agent-loop 特殊工具，比如 delegate_task、memory、todo。
         不实现 pre/post tool hook。
 

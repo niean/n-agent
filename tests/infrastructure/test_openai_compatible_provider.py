@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.domain.provider import LLMEventType
+from app.domain.tool import ToolExecutionContext
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 
 
@@ -17,7 +18,11 @@ class FakeModels:
 
 
 class FakeCompletions:
+    def __init__(self):
+        self.kwargs = None
+
     async def create(self, **kwargs):
+        self.kwargs = kwargs
         if kwargs.get("stream"):
             async def gen():
                 yield SimpleNamespace(
@@ -36,7 +41,8 @@ class FakeCompletions:
 class FakeClient:
     def __init__(self, fail_models=False):
         self.models = FakeModels(fail_models)
-        self.chat = SimpleNamespace(completions=FakeCompletions())
+        self.completions = FakeCompletions()
+        self.chat = SimpleNamespace(completions=self.completions)
 
 
 @pytest.mark.asyncio
@@ -64,6 +70,30 @@ async def test_provider_non_streaming_chat_returns_llm_result():
 
     assert result.message["content"] == "hello"
     assert result.finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_provider_strips_internal_runtime_options():
+    client = FakeClient()
+    provider = OpenAICompatibleProvider("http://test", "key", "default", client=client)
+
+    await provider.chat(
+        [],
+        [],
+        False,
+        "model-a",
+        {
+            "temperature": 0.2,
+            "tool_execution_context": ToolExecutionContext(),
+            "tool_exposure_policy": "safe_only",
+            "execution_context_mode": "unattended",
+        },
+    )
+
+    assert client.completions.kwargs["temperature"] == 0.2
+    assert "tool_execution_context" not in client.completions.kwargs
+    assert "tool_exposure_policy" not in client.completions.kwargs
+    assert "execution_context_mode" not in client.completions.kwargs
 
 
 @pytest.mark.asyncio

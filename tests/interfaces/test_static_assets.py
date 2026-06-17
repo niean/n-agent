@@ -125,6 +125,8 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'deleteProvider' in api_js
     assert 'renameSession' in api_js
     assert 'deleteSession' in api_js
+    for fn in ('listKnowledgeBases', 'createKnowledgeBase', 'updateKnowledgeBase', 'deleteKnowledgeBase', 'probeKnowledgeBase', 'refreshKnowledgeTool'):
+        assert fn in api_js
     tools_js = client.get('/static/tools.js').text
     assert "'类型'" in tools_js
     assert "'分组'" in tools_js
@@ -388,8 +390,16 @@ def test_knowledge_js_present_and_safe(tmp_path):
     body = res.text
     assert 'NAGENT.knowledge' in body or 'namespace.knowledge' in body
     assert 'listTools' in body
+    assert 'listKnowledgeBases' in body
     assert "source_type === 'knowledge'" in body
     assert 'document-table' in body
+    assert '知识工具' in body
+    assert '知识库管理' in body
+    assert '+ 新增 KB' in body
+    assert "step: '0.01'" in body
+    assert 'max: 1' in body
+    for field in ('kb_id', 'name', 'description', 'base_type', 'base_url', 'dataset_id', 'api_key', 'default_top_k', 'default_min_score', 'enabled'):
+        assert field in body
     assert 'getDependencyHealth' not in body
     assert '/chat/health/dependencies' not in body
     assert 'innerHTML =' not in body

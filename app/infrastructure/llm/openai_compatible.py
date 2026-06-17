@@ -57,7 +57,7 @@ class OpenAICompatibleProvider:
             "model": model or self.default_model,
             "messages": messages,
             "stream": stream,
-            **options,
+            **_provider_options(options),
         }
         if tools:
             kwargs["tools"] = tools
@@ -91,6 +91,14 @@ class OpenAICompatibleProvider:
                     yield LLMEvent(LLMEventType.MESSAGE_DONE, finish_reason=choice.finish_reason)
         except Exception as exc:
             yield LLMEvent(LLMEventType.ERROR, error=str(exc))
+
+
+def _provider_options(options: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in options.items()
+        if key not in {"tool_execution_context", "tool_exposure_policy", "execution_context_mode"}
+    }
 
 
 def _message_to_dict(message: Any) -> dict[str, Any]:

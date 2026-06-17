@@ -105,15 +105,16 @@ def knowledge_tool_definitions(enabled: bool = True) -> list[ToolDefinition]:
     return [
         ToolDefinition(
             name="search_knowledge",
-            description="Search the N-KB general knowledge base for relevant snippets.",
+            description="Search a configured knowledge base by kb_id.",
             input_schema={
                 "type": "object",
                 "properties": {
+                    "kb_id": {"type": "string", "minLength": 1, "maxLength": 128},
                     "query": {"type": "string", "minLength": 1, "maxLength": 2000},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 50},
                     "min_score": {"type": "number", "minimum": 0, "maximum": 1},
                 },
-                "required": ["query"],
+                "required": ["kb_id", "query"],
                 "additionalProperties": False,
             },
             enabled=enabled,

@@ -45,3 +45,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：外部事件入口不能依赖 dict.get 的默认值处理 null；get 只在 key 缺失时生效，字段存在但值为 null 时仍会透传 None。飞书入口所有进入 Domain/SQLite 的可选字符串字段（chat_id/open_id/thread_id/message_id/event_id/content.text）必须先归一化为字符串。
 
 来源：bug fix 260616 飞书 thread_id null 导致长连接处理失败
+
+### P005: 平台主动外发能力不该用 per-message capability 抽象
+
+现象：飞书会话里通过自然语言创建的定时任务到点执行成功（LLM 输出正常），但飞书投递阶段全部 fail-closed 失败：`origin does not support active_text_delivery`。
+
+根因：origin 字段从飞书入口（feishu_long_connection.py）→ Gateway `_build_trusted_metadata` → 工具 `_origin_from_trusted` → ScheduleService → SQLite 链路上，`capabilities=["active_text_delivery"]` 被工具层 `_origin_from_trusted` 丢弃；ScheduleOutboundDelivery 用 `capabilities` 守门，落库的 origin 缺字段就投递失败。同时 trusted_metadata 用 `gateway.source_type` 命名而 origin/outbound 期望的是 `source_type`，工具层也未做映射，导致整个链路双重断点。
+
+教训：把"平台是否支持主动文本外发"这种 platform-级固有能力，放进每条消息 metadata 让中间层逐跳搬运，会变成"任意一环漏传就 fail-closed"的隐式契约。正确做法是按 platform 注册（feishu_client 是否注入）作为单一来源，outbound 只按 `source_type` 路由。所有"携带语义在多层间穿梭、又只在末端校验"的字段，要么去掉中间环节、要么作为类型化值对象（不是裸 dict）保证字段不丢；裸 dict 透传 + 末端 fail-closed 是组合反模式。
+
+来源：bug fix 260617 飞书定时任务投递失败

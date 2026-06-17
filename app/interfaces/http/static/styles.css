@@ -193,6 +193,7 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .document-table .btn { padding: 0; color: var(--color-primary-strong); background: transparent; border: 0; border-radius: 0; }
 .document-table .btn:hover, .document-table .btn--primary, .document-table .btn--danger { color: var(--color-primary-strong); background: transparent; border-color: transparent; text-decoration: underline; }
 .document-table td > .btn + .btn { margin-left: 10px; }
+.knowledge-tool-table th:nth-child(4), .knowledge-tool-table td:nth-child(4) { width: 32%; max-width: 460px; white-space: normal; word-break: break-word; }
 .tools-schema-content { padding: 20px; }
 .tools-schema-content h4 { margin: 0; }
 .tools-schema-content pre { max-height: min(620px, calc(100vh - 150px)); }

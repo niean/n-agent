@@ -133,7 +133,7 @@ async def test_long_connection_text_message_calls_gateway_and_replies():
     assert gateway.events[0].metadata["source_type"] == "feishu"
     assert gateway.events[0].metadata["receive_id"] == "oc_1"
     assert gateway.events[0].metadata["receive_id_type"] == "chat_id"
-    assert "active_text_delivery" in gateway.events[0].metadata["capabilities"]
+    assert "capabilities" not in gateway.events[0].metadata
     assert client.reactions == [("msg-1", "Typing")]
     assert client.sent == [("oc_1", "reply", "chat_id")]
 
