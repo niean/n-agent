@@ -80,7 +80,7 @@
     - 交互：飞书消息投递失败
     - 任务：定时任务sched-a406eae127164f3a970f63dbfab24c5d，只有第1个周期执行了，之后都是skipped_missed，且调度周期是15分钟(不是预期的5分钟)
 - NFR
-    - 源码：AgentCore
+    - 源码：AgentCore，整理DDD文档
 - FR
     - 工具：manage_schedule，agent管理工具，需要暴露到Dashboard上
     - 知识：[KF]检索支持多KB。抽象知识库SPI，支持多种KB类型，包括N-KB、Ragflow；Dashboard支持KB的增删改查
@@ -91,6 +91,7 @@
     - 模型：[KF]支持Anthropic的API协议，按照DDD规范、做好领域抽象。参考DDD文档`## AgentCore`章节，也参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent
         - 审阅：发现严重问题，spec-260617-anthropic-provider.md
     - 对话：一轮对话、多次调用工具时，结果放到一个`工具调用调试信息`气泡中（当前是每个工具调用 一个气泡）
+    - 工具：新增内置工具web_fetch
 
 
 
@@ -99,10 +100,13 @@
 [待办]
 - Issue
 - NFR
+    - 源码：Memory，整理DDD文档
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 治理：IAM，安全护栏
 - FR
+    - 工具：Skill，自定义Skill冒烟成功
     - 工具：Sandbox
+    - 工具：Plugin
     - 工具：相比Hermes，还缺少如下功能
         不实现 plugin system。
         不实现 agent-loop 特殊工具，比如 delegate_task、memory、todo。

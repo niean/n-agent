@@ -30,11 +30,49 @@ def test_settings_has_kb_defaults(tmp_path: Path):
         workspace_root=str(tmp_path),
     )
 
+    assert settings.agent_iteration_limit == 10
     assert settings.kb_enabled is False
     assert settings.kb_base_url == ""
     assert settings.kb_default_top_k == 5
     assert settings.kb_default_min_score == 0.5
     assert settings.kb_timeout_seconds == 10
+
+
+def test_settings_has_web_fetch_defaults(tmp_path: Path):
+    settings = Settings(
+        provider_base_url="https://example.test/v1",
+        provider_api_key="test-key",
+        provider_model="test-model",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+
+    assert settings.web_fetch_enabled is True
+    assert settings.web_fetch_timeout_seconds == 10
+    assert settings.web_fetch_max_bytes == 131072
+    assert settings.web_fetch_allow_private_urls is False
+
+
+def test_settings_web_fetch_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("N_AGENT_WEB_FETCH_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_WEB_FETCH_TIMEOUT_SECONDS", "3")
+    monkeypatch.setenv("N_AGENT_WEB_FETCH_MAX_BYTES", "4096")
+    monkeypatch.setenv("N_AGENT_WEB_FETCH_ALLOW_PRIVATE_URLS", "true")
+
+    settings = Settings(
+        provider_base_url="https://example.test/v1",
+        provider_api_key="test-key",
+        provider_model="test-model",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+
+    assert settings.web_fetch_enabled is False
+    assert settings.web_fetch_timeout_seconds == 3
+    assert settings.web_fetch_max_bytes == 4096
+    assert settings.web_fetch_allow_private_urls is True
 
 
 def test_settings_has_scheduler_defaults(tmp_path: Path):

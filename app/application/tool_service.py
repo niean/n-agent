@@ -124,7 +124,7 @@ def knowledge_tool_definitions(enabled: bool = True) -> list[ToolDefinition]:
     ]
 
 
-def builtin_tool_definitions() -> list[ToolDefinition]:
+def builtin_tool_definitions(web_fetch_enabled: bool = True) -> list[ToolDefinition]:
     return [
         ToolDefinition(
             name="get_current_time",
@@ -168,6 +168,22 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             },
             source_type=ToolSourceType.BUILTIN,
             toolset="file",
+        ),
+        ToolDefinition(
+            name="web_fetch",
+            description="Fetch a public HTTP/HTTPS URL with SSRF protection and return text or parsed JSON content.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "minLength": 1},
+                    "format": {"type": "string", "enum": ["text", "json"]},
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+            enabled=web_fetch_enabled,
+            source_type=ToolSourceType.BUILTIN,
+            toolset="web",
         ),
     ]
 

@@ -48,7 +48,7 @@
 - `safe` 工具默认允许执行
 - `confirm` 工具默认拒绝自动执行，返回 `permission_denied`
 - `dangerous` 工具默认不暴露给 LLM，也不可自动执行
-- 内置 safe 工具：`get_current_time`、`calculator`、`list_directory`、`read_text_file`
+- 内置 safe 工具：`get_current_time`、`calculator`、`list_directory`、`read_text_file`、`web_fetch`
 - 文件工具必须通过真实路径解析限制在 workspace 根目录内，拒绝路径穿越和软链接逃逸
 - calculator 使用 AST 白名单，只允许安全算术表达式
 
@@ -66,6 +66,10 @@
 - `N_AGENT_SQLITE_PATH`
 - `N_AGENT_WORKSPACE_ROOT`
 - `N_AGENT_AGENT_ITERATION_LIMIT`
+- `N_AGENT_WEB_FETCH_ENABLED`
+- `N_AGENT_WEB_FETCH_TIMEOUT_SECONDS`
+- `N_AGENT_WEB_FETCH_MAX_BYTES`
+- `N_AGENT_WEB_FETCH_ALLOW_PRIVATE_URLS`
 
 Docker Compose 项目隔离使用：
 
@@ -133,7 +137,8 @@ curl http://127.0.0.1:8201/v1/models
 # 五、安全约定
 
 - 文件工具默认只能访问配置的 workspace 根目录
-- Shell、写文件、patch、网络抓取等工具不属于默认工具集
+- `web_fetch` 是唯一默认内置网络读取工具，仅支持受控 HTTP/HTTPS GET，并阻断 localhost、private IP、link-local、CGNAT、reserved、metadata hostname/IP；公开域名解析到 198.18.0.0/15 benchmark/proxy 网段时允许通过，但直接访问该网段 IP 仍拒绝；不提供 `curl` 或通用 Shell 能力
+- Shell、写文件、patch 等工具不属于默认工具集
 - Docker Compose 挂载的 workspace 是文件工具边界，不应挂载过大的敏感目录
 - Provider API Key 只通过环境变量注入，不写入镜像
 - Docker build 可使用国内 PyPI 镜像加速，但不得在镜像层写入密钥

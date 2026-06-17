@@ -58,6 +58,7 @@ async def test_tool_service_lists_openai_tools_and_executes_safe_tools():
         "calculator",
         "list_directory",
         "read_text_file",
+        "web_fetch",
     }
     assert result.status == ToolResultStatus.SUCCESS
 
@@ -73,6 +74,17 @@ def test_builtin_tool_definitions_include_source_and_toolset_metadata():
     assert definitions["list_directory"].toolset == "file"
     assert definitions["read_text_file"].source_type is ToolSourceType.BUILTIN
     assert definitions["read_text_file"].toolset == "file"
+    assert definitions["web_fetch"].source_type is ToolSourceType.BUILTIN
+    assert definitions["web_fetch"].toolset == "web"
+    assert definitions["web_fetch"].risk_level is RiskLevel.SAFE
+
+
+def test_web_fetch_definition_can_be_disabled():
+    service = ToolService(FakeExecutor(), builtin_tool_definitions(web_fetch_enabled=False))
+
+    names = {schema["function"]["name"] for schema in service.list_openai_tools()}
+
+    assert "web_fetch" not in names
 
 
 def test_knowledge_tool_definition_uses_knowledge_source_and_toolset():

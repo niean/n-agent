@@ -33,7 +33,7 @@
 - Provider 管理用例：`app/application/provider_service.py`，定义 `ProviderService`、`ProviderCreateInput`、`ProviderUpdateInput`，封装 list/get/create/update/delete/activate；create 强制 `api_key` 非空，update 中 `api_key=None` 表示不变、`""` 清空、非空覆盖；delete active 抛 `ProviderInUseError`；active 切换或当前条目修改后通过注入的 holder.swap 触发底层 client 重建
 - Active provider 适配器：`app/application/runtime_provider.py`，定义 `ActiveProviderHolder`，实现 Domain `LLMProvider` 协议，通过 `Callable[[ProviderConfig, str], LLMProvider]` 工厂懒加载底层 provider 并以 `asyncio.Lock` 保护 swap；`current_model`/`current_config` 暴露当前 active 状态
 - 会话查询用例：`app/application/session_service.py`，定义 `SessionService`，注入 `TitleGenerator` 端口并提供 `ensure_title`（仅当会话仍为 `DEFAULT_SESSION_TITLE` 且消息非空时 fire-and-forget 生成）；提供 `rename_session`（trim+长度<=60+不存在抛 `SessionNotFoundError`，空白抛 `SessionValidationError`）和 `delete_session`（端口级联删除，缺失抛 `SessionNotFoundError`）
-- 工具服务：`app/application/tool_service.py`，定义 `ToolService`、`builtin_tool_definitions` 和兼容用 `knowledge_tool_definitions`，支持动态工具定义源和单轮 confirm 授权上下文
+- 工具服务：`app/application/tool_service.py`，定义 `ToolService`、`builtin_tool_definitions` 和兼容用 `knowledge_tool_definitions`，支持动态工具定义源和单轮 confirm 授权上下文；内置工具面包含 `web_fetch` safe 工具并通过 `web_fetch_enabled` 控制暴露
 - Knowledge 用例：`app/application/knowledge_service.py`，定义 `KnowledgeService`、`KnowledgeBaseCreateInput`、`KnowledgeBaseUpdateInput`、`KnowledgeProbeInput` 和 `KnowledgeToolExecutor`，编排 KB CRUD、probe、search、动态 `search_knowledge` ToolDefinition；`search_knowledge` 必须要求 `kb_id` 与 `query`，不支持默认 KB
 - MCP 管理用例：`app/application/mcp_service.py`，定义 `McpService`、MCP 管理工具定义、McpManagementToolExecutor 和 McpToolExecutor，编排站点 CRUD、探测、刷新、动态工具面和远端工具调用解析
 - Skill 用例：`app/application/skill_service.py`，定义 `SkillService`、`SkillToolExecutor`、`skill_tool_definitions`（`skills_list`/`skill_view` safe 工具）、`SkillScanReport`、`SkillScanWarning`，编排扫描/列表/查看/启停/刷新；macro 预处理 `${HERMES_SKILL_DIR}`/`${HERMES_SESSION_ID}`，linked file 不预处理；platform 过滤使用 PLATFORM_MAP 映射 `sys.platform`，空 platforms 视为全平台；启用状态在重扫间保留
@@ -43,7 +43,7 @@
 - OpenAI-compatible Provider：`app/infrastructure/llm/openai_compatible.py`，实现 Domain `LLMProvider`
 - SQLite MemoryStore：`app/infrastructure/memory/sqlite_store.py`，实现 Domain `MemoryStore`，初始化 schema 和索引；`delete_session` 在单次连接内顺序 DELETE messages/tool_calls/task_states/summaries/sessions，返回 sessions 受影响行数 > 0
 - 启发式摘要器：`app/infrastructure/memory/heuristic_summarizer.py`，实现 Domain `Summarizer`
-- 内置工具 handler：`app/infrastructure/tools/builtin.py`，实现时间、计算、目录列表、文本读取和 workspace 路径安全
+- 内置工具 handler：`app/infrastructure/tools/builtin.py`，实现时间、计算、目录列表、文本读取、workspace 路径安全和 `web_fetch` 受控 HTTP/HTTPS GET；`web_fetch` 参考 HermesAgent URL 安全边界阻断内网/元数据地址并限制响应大小，同时允许公开域名解析到 198.18.0.0/15 benchmark/proxy 网段
 - 工具路由 executor：`app/infrastructure/tools/composite.py`，按工具名将 ToolCallRequest 分发给具体 ToolExecutor
 - Knowledge HTTP adapters：`app/infrastructure/knowledge/http_adapters.py`，实现 `NkbKnowledgeRetriever`、`RagflowKnowledgeRetriever` 和 `KnowledgeHttpRetrieverFactory`，将 N-KB `/retrieval/search` 与 Ragflow `/api/v1/retrieval` 协议归一化为 Domain `KnowledgeSearchResult`
 - 旧 N-KB 工具兼容模块：`app/infrastructure/tools/kb.py`，仅保留兼容 import 或迁移遗留引用；新检索路径由 `KnowledgeToolExecutor` + Knowledge adapter 承担
@@ -92,7 +92,7 @@
 - Domain 模型测试：`tests/domain/test_models.py`
 - Knowledge Domain 模型测试：`tests/domain/test_knowledge_models.py`，覆盖 KnowledgeBaseType、KnowledgeProbeStatus、KB slug 校验、api_key 脱敏和 backend request 分离
 - MCP Domain 模型测试：`tests/domain/test_mcp_models.py`，覆盖 MCP 站点/工具模型和 stdio 配置字段
-- ToolService 测试：`tests/application/test_tool_service.py`
+- ToolService 测试：`tests/application/test_tool_service.py`，覆盖内置工具 schema、toolset 元数据、confirm/dangerous/managed 权限和 `web_fetch` 启停暴露
 - KnowledgeService 测试：`tests/application/test_knowledge_service.py`，覆盖 KB CRUD/probe/search、动态 `search_knowledge` schema、kb_id 必填、禁用/缺失 KB 错误和 ToolExecutor 输出
 - GatewayService 测试：`tests/application/test_gateway_service.py`，覆盖 session 映射、重复事件幂等、/new、/rename、/delete、/switch、/sessions、/tools、/models、/status、/schedule add/run/remove、破坏性命令确认、actor mismatch、trust scope 和 pending TTL
 - PlatformService 测试：`tests/application/test_platform_service.py`，覆盖状态合成、include_local 过滤、平台详情 active_sessions 和平台会话分页
@@ -109,7 +109,7 @@
 - Gateway Registry 测试：`tests/infrastructure/test_sqlite_gateway_registry.py`，覆盖 gateway conversation/session link/active session、processed event 幂等、legacy 列迁移和平台 conversation 统计
 - MCP Registry 测试：`tests/infrastructure/test_sqlite_mcp_registry.py`，覆盖 mcp_sites/mcp_tools CRUD、刷新保留 disabled 状态和级联删除
 - MCP SDK Client 测试：`tests/infrastructure/test_mcp_sdk_client.py`，覆盖 URL 安全校验、MCP client 限制配置、stdio 分支和环境变量合并
-- 内置工具测试：`tests/infrastructure/test_builtin_tools.py`
+- 内置工具测试：`tests/infrastructure/test_builtin_tools.py`，覆盖时间/计算/文件工具安全，以及 `web_fetch` 文本/JSON 抓取、响应大小限制、私网/metadata/重定向阻断
 - 工具路由测试：`tests/infrastructure/test_composite_tools.py`
 - Knowledge HTTP adapter 测试：`tests/infrastructure/test_knowledge_adapters.py`，覆盖 N-KB/Ragflow 请求映射、响应归一化、安全错误、probe 和 factory 路由
 - 飞书 Client 测试：`tests/infrastructure/test_feishu_client.py`，覆盖长连接普通消息与 card action 的 app/tenant/allowlist 校验、tenant_access_token 缓存、文本发送和 interactive card 发送

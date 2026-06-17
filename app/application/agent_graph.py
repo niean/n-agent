@@ -23,7 +23,7 @@ class AgentGraphRunner:
         tool_service: ToolService,
         memory_store: MemoryStore,
         summarizer: Summarizer,
-        iteration_limit: int = 5,
+        iteration_limit: int = 10,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service

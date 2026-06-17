@@ -174,7 +174,12 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     holder = ActiveProviderHolder(_provider_factory)
     _run_sync(_seed_and_activate(registry, holder, settings))
     provider_service = ProviderService(registry, holder)
-    builtin_executor = build_builtin_tool_executor(settings.workspace_root)
+    builtin_executor = build_builtin_tool_executor(
+        settings.workspace_root,
+        web_fetch_timeout_seconds=settings.web_fetch_timeout_seconds,
+        web_fetch_max_bytes=settings.web_fetch_max_bytes,
+        web_fetch_allow_private_urls=settings.web_fetch_allow_private_urls,
+    )
     knowledge_registry = SQLiteKnowledgeBaseRegistry(settings.sqlite_path)
     knowledge_factory = KnowledgeHttpRetrieverFactory(
         HttpKnowledgeRetrieverConfig(timeout_seconds=settings.kb_timeout_seconds)
@@ -196,7 +201,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     routes["search_knowledge"] = kb_executor
     knowledge_definition = _run_sync(knowledge_service.knowledge_tool_definition())
     tool_definitions = (
-        builtin_tool_definitions()
+        builtin_tool_definitions(settings.web_fetch_enabled)
         + [knowledge_definition]
         + mcp_management_tool_definitions()
         + schedule_tool_definitions()
