@@ -130,7 +130,8 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert "'分组'" in tools_js
     assert 'tool.source_type' in tools_js
     assert 'tool.toolset' in tools_js
-    assert "source_type === 'builtin'" in tools_js
+    assert "'builtin', 'agent'" in tools_js
+    assert "tool.source_type === 'builtin'" not in tools_js
     assert "'stdio'" in tools_js
     assert 'Command' in tools_js
     assert 'Args' in tools_js

@@ -72,8 +72,11 @@
         - 知识：页面调整，只保留知识检索、去掉N-KB依赖，知识检索采用`工具列表`一样的组件构成
         - MCP：页面调整，自上而下依次为 MCP站点、MCP工具，MCP工具采用`工具列表`一样的组件构成、筛选其中类型为mcp的工具
         - 内置：页面调整，工具列表只展示类型为builtin的工具；skills_list、skill_view建议调整类型为builtin
-- NFR
-    - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
+    - 工具：通过自然语言(来源如飞书IM消息)、管理定时任务，补全对应的Agent工具
+        - 审阅：Spec spec-260616-feishu-natural-schedule.md，发现其中的严重问题
+
+[20260617]
+- FR
 
 
 
@@ -82,12 +85,11 @@
 [待办]
 - Issue
 - NFR
-    - 前端：使用Element UI组件，重构前端，保持功能一致、最大限度的复用Element UI库
+    - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 源码：AgentCore
     - 治理：IAM，安全护栏
 - FR
-    - 工具：通过自然语言(来源如飞书IM消息)、管理定时任务，补全对应的Agent工具
-        - 审阅：Spec spec-260616-feishu-natural-schedule.md，发现其中的严重问题
+    - 工具：manage_schedule，agent管理工具，需要暴露到Dashboard上
     - 工具：Sandbox
     - 工具：相比Hermes，还缺少如下功能
         不连接 MCP server，不做 mcp_{server}_{tool} 动态发现。

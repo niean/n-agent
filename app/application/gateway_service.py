@@ -58,7 +58,7 @@ class GatewayCommandService:
             return await self._execute_new(event)
         actor_id = str(actor_value if actor_value is not None else event.session_key.display_name or event.session_key.source_id)
         if self._trust_key(event.session_key, actor_id) in self.trusted_actors:
-            return await self._execute(action, event, session_id, args)
+            return await self._execute(action, event, session_id, args, _build_trusted_metadata(event))
         now = datetime.now(timezone.utc)
         self._cleanup_expired(now)
         confirmation = GatewayConfirmationRequest(
@@ -72,6 +72,7 @@ class GatewayCommandService:
             args=args,
             created_at=now,
             expires_at=now + self.confirmation_ttl,
+            trusted_metadata=_build_trusted_metadata(event),
         )
         self.pending_confirmations[confirmation.id] = confirmation
         return _response(
@@ -136,7 +137,13 @@ class GatewayCommandService:
             return _response(confirmation.session_id, "已取消")
         if choice is GatewayConfirmationChoice.TRUST_SESSION:
             self.trusted_actors.add(self._trust_key(session_key, actor_id))
-        return await self._execute(confirmation.action, InteractionMessage("", session_key, confirmation.command), confirmation.session_id, confirmation.args)
+        return await self._execute(
+            confirmation.action,
+            InteractionMessage("", session_key, confirmation.command),
+            confirmation.session_id,
+            confirmation.args,
+            confirmation.trusted_metadata,
+        )
 
     def discard_confirmation(self, confirmation_id: str) -> None:
         self.pending_confirmations.pop(confirmation_id, None)
@@ -203,6 +210,7 @@ class GatewayCommandService:
         event: InteractionMessage,
         session_id: str,
         args: dict[str, Any],
+        trusted_metadata: dict[str, Any] | None = None,
     ) -> InteractionResponse:
         if action is GatewayConfirmationAction.NEW:
             return await self._execute_new(event)
@@ -214,11 +222,34 @@ class GatewayCommandService:
             await self.session_service.delete_session(session_id)
             return await self._execute_new(event)
         if action is GatewayConfirmationAction.SCHEDULE_REMOVE:
-            if self.schedule_service is None:
-                return _response(session_id, "任务服务未启用")
-            await self.schedule_service.delete(str(args["task_id"]))
-            return _response(session_id, "已删除")
+            return await self._execute_schedule_remove(session_id, args, trusted_metadata or {})
         raise ValueError(f"unsupported confirmation action: {action}")
+
+    async def _execute_schedule_remove(
+        self,
+        session_id: str,
+        args: dict[str, Any],
+        trusted_metadata: dict[str, Any],
+    ) -> InteractionResponse:
+        if self.schedule_service is None:
+            return _response(session_id, "任务服务未启用")
+        task_id = str(args.get("task_id") or "")
+        expected_receive_id = str(trusted_metadata.get("receive_id") or "")
+        expected_type = str(trusted_metadata.get("receive_id_type") or "")
+        expected_thread = str(trusted_metadata.get("thread_id") or "")
+        try:
+            task = await self.schedule_service.get(task_id)
+        except Exception:
+            return _response(session_id, "任务不存在")
+        origin = task.origin or {}
+        if (
+            str(origin.get("receive_id") or "") != expected_receive_id
+            or str(origin.get("receive_id_type") or "") != expected_type
+            or str(origin.get("thread_id") or "") != expected_thread
+        ):
+            return _response(session_id, "任务不存在")
+        await self.schedule_service.delete(task_id)
+        return _response(session_id, "已删除")
 
     async def _execute_new(self, event: InteractionMessage) -> InteractionResponse:
         new_session_id = f"gateway-{uuid4()}"
@@ -285,6 +316,7 @@ class GatewayService:
                         "thread_id": event.session_key.thread_id,
                     }
                 },
+                trusted_metadata=_build_trusted_metadata(event),
                 session_id=session_id,
             )
         )
@@ -321,6 +353,19 @@ def _parse_schedule_add(rest: str) -> tuple[str, str] | None:
     if len(parts) < 6:
         return None
     return " ".join(parts[:5]), " ".join(parts[5:])
+
+
+def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:
+    md = dict(event.metadata)
+    return {
+        "gateway.source_type": event.session_key.source_type.value,
+        "gateway.source_id": event.session_key.source_id,
+        "thread_id": str(md.get("thread_id") or event.session_key.thread_id or ""),
+        "actor_id": str(md.get("actor_id") or ""),
+        "receive_id": str(md.get("receive_id") or ""),
+        "receive_id_type": str(md.get("receive_id_type") or ""),
+        "capabilities": list(md.get("capabilities") or []),
+    }
 
 
 

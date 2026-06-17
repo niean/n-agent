@@ -51,6 +51,9 @@
 - SQLite Skill Registry：`app/infrastructure/registry/sqlite_skill_registry.py`，实现 Domain `SkillRegistry`，持久化 skills 表，重扫保留 enabled 状态
 - Skill 文件加载器：`app/infrastructure/skill/file_loader.py`，扫描 `SKILLS_ROOT`（默认 `/workspace/skills`），解析 SKILL.md frontmatter+body，处理 dirname fallback、平台过滤、Hermes 风格 EXCLUDED_SKILL_DIRS，记录 `last_scan_error`
 - 路径安全工具：`app/infrastructure/path_security.py`，提供 SKILLS_ROOT 内路径 resolve 与遍历/symlink 拒绝，供 Skill 子系统与内置工具复用
+- 调度任务管理工具执行器：`app/infrastructure/tools/schedule_management.py`，实现 `manage_schedule` / `schedule_query` 两个 Agent 工具，按 trusted_metadata 校验 origin（receive_id/receive_id_type/thread_id），dispatch 到 `ScheduleService` create/update/pause/resume/run/list/get；`remove` 短路返回 confirmation_required 文案，引导走 `/schedule remove <id>` 确认卡
+- Skill 出厂 seed runner：`app/infrastructure/skill/seed_runner.py`，幂等拷贝 `app/infrastructure/skill/seeds/` 下目录到 `SKILLS_ROOT`，已存在文件不覆盖，OSError 容错只记录 warning
+- Skill 出厂模板：`app/infrastructure/skill/seeds/n-agent/SKILL.md`，frontmatter（name=n-agent, tags=[n-agent, manual]）+ "## Cron Jobs / 定时任务" 章节，承载 cron 语法/timezone/prompt 自包含等长知识，避免污染系统提示词
 
 ## Interfaces Layer
 

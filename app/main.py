@@ -23,7 +23,7 @@ from app.application.scheduled_agent_executor import ScheduledAgentExecutor
 from app.application.scheduler_runner import SchedulerRunner
 from app.application.session_service import SessionService
 from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
-from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
+from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions, schedule_tool_definitions
 from app.config import Settings
 from app.domain.provider import ProviderConfig
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
@@ -41,9 +41,11 @@ from app.infrastructure.schedule.outbound import ScheduleOutboundDelivery
 from app.infrastructure.schedule.prompt_safety import DeterministicPromptSafetyScanner
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
 from app.infrastructure.skill.file_loader import SkillFileLoader, SkillFileLoaderConfig
+from app.infrastructure.skill.seed_runner import seed_default_skills
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.kb import KnowledgeSearchClient, KnowledgeToolExecutor
+from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
 from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 from app.interfaces.http.openai import create_openai_router
@@ -132,7 +134,12 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     )
     routes = {tool_name: builtin_executor for tool_name in BUILTIN_TOOL_NAMES}
     routes["search_knowledge"] = kb_executor
-    tool_definitions = builtin_tool_definitions() + knowledge_tool_definitions(enabled=kb_enabled) + mcp_management_tool_definitions()
+    tool_definitions = (
+        builtin_tool_definitions()
+        + knowledge_tool_definitions(enabled=kb_enabled)
+        + mcp_management_tool_definitions()
+        + schedule_tool_definitions()
+    )
     tool_service = ToolService(CompositeToolExecutor(routes), tool_definitions)
     mcp_service = McpService(mcp_registry, mcp_client, tool_service)
     mcp_management_executor = McpManagementToolExecutor(mcp_service)
@@ -148,6 +155,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         max_view_bytes=settings.skills_max_view_bytes,
         max_count=settings.skills_max_count,
     ))
+    seed_default_skills(settings.skills_root)
     skill_service = SkillService(skill_registry, skill_loader)
     skill_executor = SkillToolExecutor(skill_service)
     for definition in skill_tool_definitions():
@@ -207,6 +215,11 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         schedule_run_service.run_now,
     )
     scheduler_runner = SchedulerRunner(schedule_run_service, settings.scheduler_tick_seconds)
+
+    schedule_management_executor = ScheduleManagementToolExecutor(schedule_service)
+    routes["manage_schedule"] = schedule_management_executor
+    routes["schedule_query"] = schedule_management_executor
+    tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
 
     def health_snapshot() -> dict:
         memory_status = "ok"

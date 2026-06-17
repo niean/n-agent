@@ -7,6 +7,7 @@ from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.agent import AgentState
 from app.domain.provider import LLMResult, ModelInfo
+from app.domain.tool import ToolExecutionContext
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.tools.builtin import build_builtin_tool_executor
@@ -113,7 +114,82 @@ async def test_chat_service_unattended_disables_confirm_context_and_uses_safe_on
         )
     )
 
-    assert "tool_execution_context" not in runner.options
+    ctx = runner.options["tool_execution_context"]
+    assert isinstance(ctx, ToolExecutionContext)
+    assert ctx.execution_context_mode == "unattended"
+    assert ctx.allowed_confirm_tools == {}
+    assert ctx.permitted_managed_tools == set()
+    assert runner.options["tool_exposure_policy"] == "safe_only"
+
+
+@pytest.mark.asyncio
+async def test_complete_injects_tool_execution_context_with_trusted_metadata(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            trusted_metadata={
+                "gateway.source_type": "feishu",
+                "receive_id": "oc_a",
+                "receive_id_type": "chat_id",
+            },
+            session_id="s1",
+        )
+    )
+
+    ctx = runner.options["tool_execution_context"]
+    assert isinstance(ctx, ToolExecutionContext)
+    assert ctx.session_id == "s1"
+    assert ctx.trusted_metadata["gateway.source_type"] == "feishu"
+    assert ctx.execution_context_mode == "realtime"
+    assert ctx.permitted_managed_tools == {"manage_schedule"}
+
+
+@pytest.mark.asyncio
+async def test_complete_no_trusted_metadata_means_no_managed_tools(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            metadata={"gateway.source_type": "feishu"},
+            session_id="s2",
+        )
+    )
+
+    ctx = runner.options["tool_execution_context"]
+    assert ctx.permitted_managed_tools == set()
+
+
+@pytest.mark.asyncio
+async def test_complete_unattended_mode_has_no_managed_tools(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            options={"execution_context_mode": "unattended"},
+            trusted_metadata={"gateway.source_type": "feishu"},
+            session_id="s3",
+        )
+    )
+
+    ctx = runner.options["tool_execution_context"]
+    assert ctx.execution_context_mode == "unattended"
+    assert ctx.permitted_managed_tools == set()
     assert runner.options["tool_exposure_policy"] == "safe_only"
 
 

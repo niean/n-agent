@@ -26,6 +26,10 @@
 - Summarizer：领域端口，定义上下文摘要生成能力，当前可用启发式摘要，后续可替换为模型驱动压缩。
 - Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。
 - ToolDefinition：工具定义值对象，描述工具名称、说明、输入 schema、风险等级、权限、超时和启用状态，不包含具体 handler。
+- ToolDefinition.managed：布尔字段，标记需要服务端 ChatCompletionService 显式授权才能执行的工具；当前 `manage_schedule` 是唯一 managed 工具，必须 `risk_level=CONFIRM` 且来源为 AGENT。
+- ToolExecutionContext.trusted_metadata：服务端注入的 metadata 字典，仅 GatewayService/Feishu 长连接适配器在 ChatCompletionInput 中写入；OpenAI HTTP 客户端 metadata 不进入此字段，作为 managed-tool 授权的事实来源。
+- permitted_managed_tools：ToolExecutionContext 字段，记录当前请求允许执行的 managed 工具集合；非 realtime 模式或非可信 Gateway 来源时为空集，managed 工具被 fail-closed 拒绝。
+- manage_schedule / schedule_query：Agent 定时任务管理 / 查询工具，source_type=AGENT、toolset=schedule；前者 managed=True 仅飞书 trusted_metadata 触发，后者 SAFE 但在 unattended（safe_only）模式仍被过滤避免调度器递归。
 - ToolExecutor：领域端口，定义工具调用执行接口，具体工具 handler 由 Infrastructure 实现。
 - ToolResultStatus：工具执行结果状态枚举，描述成功、错误、权限拒绝和超时等标准状态。
 - PermissionDecision：权限判定值对象，描述工具或动作是否允许执行以及拒绝原因。

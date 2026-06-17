@@ -22,6 +22,7 @@ class ChatCompletionInput:
     metadata: dict[str, Any] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
+    trusted_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -60,12 +61,20 @@ class ChatCompletionService:
         await self.session_service.ensure_title(session_id, str(first_user_message))
         state = AgentState(session_id=session_id, input_messages=request.messages)
         options = dict(request.options)
-        if options.get("execution_context_mode") == "unattended":
+        mode = options.get("execution_context_mode") or "realtime"
+        if mode == "unattended":
             options["tool_exposure_policy"] = "safe_only"
-        else:
-            context = _mcp_tool_execution_context(str(first_user_message))
-            if context.allowed_confirm_tools:
-                options["tool_execution_context"] = context
+        mcp_ctx = _mcp_tool_execution_context(str(first_user_message)) if mode == "realtime" else ToolExecutionContext()
+        permitted = self._compute_permitted_managed_tools(mode, request.trusted_metadata)
+        ctx = ToolExecutionContext(
+            allowed_confirm_tools=dict(mcp_ctx.allowed_confirm_tools),
+            session_id=session_id,
+            metadata=dict(request.metadata),
+            trusted_metadata=dict(request.trusted_metadata),
+            execution_context_mode=mode,
+            permitted_managed_tools=permitted,
+        )
+        options["tool_execution_context"] = ctx
         if request.stream:
             return self.graph_runner.stream_events(state, request.model, options)
         final_state = await self.graph_runner.run(state, request.model, options)
@@ -82,6 +91,15 @@ class ChatCompletionService:
             message=final_state.final_message or {"role": "assistant", "content": ""},
             finish_reason=final_state.finish_reason or "stop",
         )
+
+    @staticmethod
+    def _compute_permitted_managed_tools(mode: str, trusted_metadata: dict[str, Any]) -> set[str]:
+        if mode != "realtime":
+            return set()
+        gateway_source_type = trusted_metadata.get("gateway.source_type")
+        if gateway_source_type in ("feishu",):
+            return {"manage_schedule"}
+        return set()
 
 
 def _mcp_tool_execution_context(user_message: str) -> ToolExecutionContext:

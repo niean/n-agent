@@ -82,6 +82,7 @@ class GatewayConfirmationRequest:
     args: dict[str, Any]
     created_at: datetime
     expires_at: datetime
+    trusted_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class GatewaySessionRegistry(Protocol):

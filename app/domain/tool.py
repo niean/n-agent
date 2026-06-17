@@ -44,6 +44,7 @@ class ToolDefinition:
     enabled: bool = True
     source_type: ToolSourceType = ToolSourceType.BUILTIN
     toolset: str = "builtin"
+    managed: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,11 @@ class ToolCallRequest:
 @dataclass(frozen=True)
 class ToolExecutionContext:
     allowed_confirm_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    session_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    trusted_metadata: dict[str, Any] = field(default_factory=dict)
+    execution_context_mode: str = "realtime"
+    permitted_managed_tools: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)

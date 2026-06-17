@@ -14,6 +14,11 @@ from app.domain.tool import (
 
 class ToolService:
     def __init__(self, executor: ToolExecutor, definitions: list[ToolDefinition]):
+        for definition in definitions:
+            if definition.managed and definition.risk_level is not RiskLevel.CONFIRM:
+                raise ValueError(
+                    f"managed tool {definition.name!r} must declare risk_level=CONFIRM"
+                )
         self.executor = executor
         self.definitions = {definition.name: definition for definition in definitions}
         self.dynamic_definitions: dict[str, dict[str, ToolDefinition]] = {}
@@ -58,6 +63,10 @@ class ToolService:
             for definition in self.list_definitions()
             if definition.enabled
             and (definition.risk_level is risk_level if risk_level else definition.risk_level is not RiskLevel.DANGEROUS)
+            and not (
+                risk_level is RiskLevel.SAFE
+                and definition.source_type is ToolSourceType.AGENT
+            )
             and isinstance(definition.input_schema, dict)
             and definition.input_schema.get("type") == "object"
         ]
@@ -66,8 +75,12 @@ class ToolService:
         definition = self._definition(request.name)
         if definition is None:
             return ToolResult(request.id, request.name, ToolResultStatus.ERROR, {"error": "tool not found"})
-        if definition.risk_level is RiskLevel.CONFIRM and not _is_confirm_allowed(request, context):
-            return ToolResult(request.id, request.name, ToolResultStatus.PERMISSION_DENIED, {"error": "permission_denied"})
+        if definition.risk_level is RiskLevel.CONFIRM:
+            if definition.managed:
+                if context is None or request.name not in context.permitted_managed_tools:
+                    return ToolResult(request.id, request.name, ToolResultStatus.PERMISSION_DENIED, {"error": "permission_denied"})
+            elif not _is_confirm_allowed(request, context):
+                return ToolResult(request.id, request.name, ToolResultStatus.PERMISSION_DENIED, {"error": "permission_denied"})
         if definition.risk_level is RiskLevel.DANGEROUS or not definition.enabled:
             return ToolResult(request.id, request.name, ToolResultStatus.PERMISSION_DENIED, {"error": "permission_denied"})
         try:
@@ -154,5 +167,59 @@ def builtin_tool_definitions() -> list[ToolDefinition]:
             },
             source_type=ToolSourceType.BUILTIN,
             toolset="file",
+        ),
+    ]
+
+
+def schedule_tool_definitions() -> list[ToolDefinition]:
+    manage_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "update", "pause", "resume", "run", "remove"],
+            },
+            "task_id": {"type": "string"},
+            "name": {"type": "string"},
+            "prompt": {"type": "string"},
+            "cron_expression": {"type": "string"},
+            "timezone": {"type": "string"},
+            "delivery_target": {
+                "type": "string",
+                "enum": ["origin", "dashboard", "silent"],
+            },
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+    query_schema = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["list", "get"]},
+            "task_id": {"type": "string"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    }
+    return [
+        ToolDefinition(
+            name="manage_schedule",
+            description=(
+                "Manage scheduled tasks (create/update/pause/resume/run/remove). "
+                "Consult skill_view('n-agent') for cron syntax and self-contained prompt rules."
+            ),
+            input_schema=manage_schema,
+            risk_level=RiskLevel.CONFIRM,
+            source_type=ToolSourceType.AGENT,
+            toolset="schedule",
+            managed=True,
+        ),
+        ToolDefinition(
+            name="schedule_query",
+            description="Query scheduled tasks visible to the current Feishu origin or session.",
+            input_schema=query_schema,
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="schedule",
         ),
     ]

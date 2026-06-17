@@ -120,10 +120,14 @@ class AgentGraphRunner:
     async def execute_tools(self, state: AgentState, config: dict | None = None) -> AgentState:
         state.tool_results = []
         context = None
+        options = None
         if config:
-            raw_context = (config.get("configurable", {}).get("options") or {}).get("tool_execution_context")
-            if isinstance(raw_context, ToolExecutionContext):
-                context = raw_context
+            options = (config.get("configurable", {}) or {}).get("options")
+        if not options:
+            options = state.run_options
+        raw_context = (options or {}).get("tool_execution_context")
+        if isinstance(raw_context, ToolExecutionContext):
+            context = raw_context
         for tool_call in state.pending_tool_calls:
             function = tool_call.get("function", {})
             arguments = function.get("arguments") or "{}"

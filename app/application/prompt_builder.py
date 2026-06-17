@@ -22,6 +22,21 @@ KNOWLEDGE_GUIDANCE = (
     "use the search_knowledge tool when it is available, then ground your answer in the returned snippets."
 )
 
+MANAGED_TOOL_GUIDANCE = (
+    "When the user asks to create, modify, view, pause, resume, run, or delete managed resources "
+    "(currently scheduled tasks; future: MCP sites etc.), first call skills_list / skill_view(\"n-agent\") "
+    "to load the relevant chapter, then call the corresponding manage_schedule / schedule_query tool with self-contained parameters. "
+    "Never schedule tasks that recursively manage N-Agent itself."
+)
+
 
 def build_system_prompt() -> str:
-    return "\n\n".join((DEFAULT_AGENT_IDENTITY, REACT_GUIDANCE, KNOWLEDGE_GUIDANCE, SAFETY_GUIDANCE))
+    return "\n\n".join(
+        (
+            DEFAULT_AGENT_IDENTITY,
+            REACT_GUIDANCE,
+            KNOWLEDGE_GUIDANCE,
+            MANAGED_TOOL_GUIDANCE,
+            SAFETY_GUIDANCE,
+        )
+    )

@@ -1,12 +1,49 @@
 import pytest
 
-from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
-from app.domain.tool import RiskLevel, ToolCallRequest, ToolDefinition, ToolResult, ToolResultStatus, ToolSourceType
+from app.application.tool_service import (
+    ToolService,
+    builtin_tool_definitions,
+    knowledge_tool_definitions,
+    schedule_tool_definitions,
+)
+from app.domain.tool import (
+    RiskLevel,
+    ToolCallRequest,
+    ToolDefinition,
+    ToolExecutionContext,
+    ToolResult,
+    ToolResultStatus,
+    ToolSourceType,
+)
 
 
 class FakeExecutor:
     async def execute(self, request: ToolCallRequest) -> ToolResult:
         return ToolResult(request.id, request.name, ToolResultStatus.SUCCESS, {"ok": True})
+
+
+class RecordingExecutor:
+    def __init__(self):
+        self.calls: list[ToolCallRequest] = []
+
+    async def execute(self, request: ToolCallRequest, context=None) -> ToolResult:
+        self.calls.append(request)
+        return ToolResult(request.id, request.name, ToolResultStatus.SUCCESS, {"ok": True})
+
+
+def _managed_def() -> ToolDefinition:
+    return ToolDefinition(
+        name="manage_schedule",
+        description="",
+        input_schema={
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+        },
+        risk_level=RiskLevel.CONFIRM,
+        source_type=ToolSourceType.AGENT,
+        toolset="schedule",
+        managed=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -109,3 +146,92 @@ async def test_disabled_kb_tool_is_hidden_and_denied():
 
     assert schemas == []
     assert result.status == ToolResultStatus.PERMISSION_DENIED
+
+
+@pytest.mark.asyncio
+async def test_tool_service_managed_tool_allowed_when_in_permitted_set():
+    executor = RecordingExecutor()
+    service = ToolService(executor, [_managed_def()])
+    ctx = ToolExecutionContext(permitted_managed_tools={"manage_schedule"})
+    result = await service.execute(
+        ToolCallRequest(id="1", name="manage_schedule", arguments={"action": "list"}),
+        ctx,
+    )
+    assert result.status is ToolResultStatus.SUCCESS
+    assert executor.calls and executor.calls[0].name == "manage_schedule"
+
+
+@pytest.mark.asyncio
+async def test_tool_service_managed_tool_denied_when_not_permitted():
+    service = ToolService(RecordingExecutor(), [_managed_def()])
+    ctx = ToolExecutionContext()
+    result = await service.execute(
+        ToolCallRequest(id="1", name="manage_schedule", arguments={"action": "list"}),
+        ctx,
+    )
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+
+
+@pytest.mark.asyncio
+async def test_tool_service_managed_does_not_use_allowed_confirm_tools():
+    service = ToolService(RecordingExecutor(), [_managed_def()])
+    ctx = ToolExecutionContext(
+        allowed_confirm_tools={"manage_schedule": {"action": "list"}},
+        permitted_managed_tools=set(),
+    )
+    result = await service.execute(
+        ToolCallRequest(id="1", name="manage_schedule", arguments={"action": "list"}),
+        ctx,
+    )
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+
+
+def test_tool_service_rejects_managed_with_non_confirm_risk():
+    bad = ToolDefinition(
+        name="bad",
+        description="",
+        input_schema={"type": "object"},
+        risk_level=RiskLevel.SAFE,
+        managed=True,
+    )
+    with pytest.raises(ValueError, match="managed"):
+        ToolService(RecordingExecutor(), [bad])
+
+
+def test_safe_only_hides_agent_source_tools():
+    agent_def = ToolDefinition(
+        name="schedule_query",
+        description="",
+        input_schema={"type": "object"},
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.AGENT,
+        toolset="schedule",
+    )
+    service = ToolService(RecordingExecutor(), [agent_def])
+    schemas = service.list_openai_tools(risk_level=RiskLevel.SAFE)
+    assert all(schema["function"]["name"] != "schedule_query" for schema in schemas)
+
+
+def test_schedule_tool_definitions_shape():
+    defs = {d.name: d for d in schedule_tool_definitions()}
+    assert set(defs) == {"manage_schedule", "schedule_query"}
+
+    manage = defs["manage_schedule"]
+    assert manage.risk_level is RiskLevel.CONFIRM
+    assert manage.managed is True
+    assert manage.source_type is ToolSourceType.AGENT
+    assert manage.toolset == "schedule"
+    props = manage.input_schema["properties"]
+    assert props["action"]["enum"] == ["create", "update", "pause", "resume", "run", "remove"]
+    assert "cron_expression" in props
+    assert "prompt" in props
+    assert "task_id" in props
+    assert "timezone" in props
+    assert "delivery_target" in props
+    assert manage.input_schema["required"] == ["action"]
+
+    query = defs["schedule_query"]
+    assert query.risk_level is RiskLevel.SAFE
+    assert query.managed is False
+    assert query.source_type is ToolSourceType.AGENT
+    assert query.input_schema["properties"]["action"]["enum"] == ["list", "get"]

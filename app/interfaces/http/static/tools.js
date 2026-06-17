@@ -69,7 +69,8 @@
     ui.renderLoading(list, '加载工具列表...');
     try {
       const tools = await api.listTools();
-      const builtinTools = (tools || []).filter((tool) => tool.source_type === 'builtin');
+      const allowedSources = ['builtin', 'agent'];
+      const builtinTools = (tools || []).filter((tool) => allowedSources.includes(tool.source_type));
       ui.clear(list);
       renderToolsTable(list, builtinTools, '暂无内置工具');
     } catch (error) {

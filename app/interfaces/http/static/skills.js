@@ -33,10 +33,10 @@
       return;
     }
 
-    const table = ui.el('table', 'data-table');
+    const table = ui.el('table', 'document-table');
     const thead = ui.el('thead');
     const trh = ui.el('tr');
-    ['Name', 'Description', 'Platforms', 'Readiness', 'Enabled', 'Status', 'Actions'].forEach((h) => {
+    ['名称', '描述', '平台', '就绪状态', '启用', '扫描状态', '操作'].forEach((h) => {
       const th = ui.el('th');
       th.textContent = h;
       trh.appendChild(th);

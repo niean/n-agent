@@ -59,29 +59,21 @@
     close.focus();
   }
 
-  function buildHeader(node) {
-    const headerPanel = ui.el('section', 'status-panel');
-    const headerBar = ui.el('div', 'panel-header');
+  function buildPanel(node) {
+    const panel = ui.el('section', 'status-panel');
+    const header = ui.el('div', 'panel-header');
     const title = ui.el('span');
     title.textContent = '知识检索';
     const refreshBtn = ui.el('button', 'btn');
     refreshBtn.type = 'button';
     refreshBtn.textContent = '刷新';
     refreshBtn.addEventListener('click', load);
-    headerBar.append(title, refreshBtn);
-    const headerBody = ui.el('div', 'panel-body');
-    headerBody.textContent = '知识检索类工具列表';
-    headerPanel.append(headerBar, headerBody);
-    node.appendChild(headerPanel);
-  }
-
-  function buildListPanel(node) {
-    const panel = ui.el('section', 'status-panel');
-    const list = ui.el('div');
-    list.id = 'knowledge-tools-list';
-    panel.appendChild(list);
+    header.append(title, refreshBtn);
+    const body = ui.el('div', 'panel-body');
+    body.id = 'knowledge-tools-list';
+    panel.append(header, body);
     node.appendChild(panel);
-    return list;
+    return body;
   }
 
   async function fillList(list) {
@@ -140,9 +132,8 @@
     const node = root();
     if (!node) return;
     node.replaceChildren();
-    buildHeader(node);
-    const list = buildListPanel(node);
-    await fillList(list);
+    const body = buildPanel(node);
+    await fillList(body);
   }
 
   namespace.knowledge = { init: load, refresh: load, load: load };
