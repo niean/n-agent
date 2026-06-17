@@ -273,10 +273,27 @@ def test_tool_debug_json_strings_are_formatted(tmp_path):
     assert 'function formatDebugJson(value)' in chat_js
     assert 'JSON.parse(value)' in chat_js
     assert 'JSON.stringify(parsed, null, 2)' in chat_js
-    assert 'appendDebugJson(content, message.content || \'\')' in chat_js
-    assert 'message.tool_calls && message.tool_calls.length' in chat_js
-    assert 'appendDebugJson(content, message.tool_calls)' in chat_js
-    assert "typeof message.content === 'string' ? message.content : ''" in chat_js
+    assert 'function formatToolDebugContent(content)' in chat_js
+    assert "if (!Array.isArray(content)) return formatDebugJson(content)" in chat_js
+    assert "content.map((item, index) => `#${index + 1}\\n${formatDebugJson(item)}`).join('\\n\\n')" in chat_js
+    assert "appendToolDebugContent(content, message.content || '')" in chat_js
+    assert 'function hasVisibleContent(value)' in chat_js
+    assert "if (hasVisibleContent(message.content)) appendText(el, message.content)" in chat_js
+
+
+def test_assistant_tool_calls_are_not_rendered_as_chat_messages(tmp_path):
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    assert 'function shouldRenderMessage(message)' in chat_js
+    assert "if (message.role === 'tool') return true" in chat_js
+    assert 'function groupToolMessages(messages)' in chat_js
+    assert "if (message.role === 'tool' && previous && previous.role === 'tool')" in chat_js
+    assert "previous.content.push(message.content || '')" in chat_js
+    assert "grouped.push({ ...message, content: [message.content || ''] })" in chat_js
+    assert 'const visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage))' in chat_js
+    assert 'appendDebugJson(content, message.tool_calls)' not in chat_js
+    assert "if (Array.isArray(value)) return value.length > 0" in chat_js
+    assert "if (typeof value === 'object') return Object.keys(value).length > 0" in chat_js
 
 
 def test_current_session_refresh_renders_persisted_messages(tmp_path):

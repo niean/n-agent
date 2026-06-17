@@ -304,6 +304,9 @@ async def test_agent_graph_reports_iteration_limit(tmp_path):
     state = await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "loop"}]), "test")
 
     assert state.error == "iteration limit reached"
+    messages = await store.list_messages("s1")
+    assert messages[-1].role == "assistant"
+    assert "工具调用上限" in messages[-1].content
 
 
 @pytest.mark.asyncio
@@ -398,4 +401,3 @@ async def test_agent_graph_serializes_legacy_dict_tool_content_to_provider(tmp_p
     payload = _message_to_provider(legacy)
     assert isinstance(payload["content"], str)
     assert "success" in payload["content"]
-

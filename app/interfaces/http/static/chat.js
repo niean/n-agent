@@ -25,6 +25,23 @@
     parent.textContent = formatDebugJson(value);
   }
 
+  function formatToolDebugContent(content) {
+    if (!Array.isArray(content)) return formatDebugJson(content);
+    return content.map((item, index) => `#${index + 1}\n${formatDebugJson(item)}`).join('\n\n');
+  }
+
+  function appendToolDebugContent(parent, content) {
+    parent.textContent = formatToolDebugContent(content);
+  }
+
+  function hasVisibleContent(value) {
+    if (typeof value === 'string') return value.length > 0;
+    if (value === null || typeof value === 'undefined') return false;
+    if (Array.isArray(value)) return value.length > 0;
+    if (typeof value === 'object') return Object.keys(value).length > 0;
+    return true;
+  }
+
   function clearNode(node) { ui.clear(node); }
 
   function setSending(next) {
@@ -72,23 +89,35 @@
       const summary = document.createElement('summary');
       const content = document.createElement('pre');
       summary.textContent = '工具调用调试信息';
-      appendDebugJson(content, message.content || '');
+      appendToolDebugContent(content, message.content || '');
       details.append(summary, content);
       el.appendChild(details);
       return el;
     }
-    const contentText = typeof message.content === 'string' ? message.content : '';
-    if (contentText) appendText(el, contentText || '');
-    if (message.tool_calls && message.tool_calls.length) {
-      const details = document.createElement('details');
-      const summary = document.createElement('summary');
-      const content = document.createElement('pre');
-      summary.textContent = '工具调用调试信息';
-      appendDebugJson(content, message.tool_calls);
-      details.append(summary, content);
-      el.appendChild(details);
-    }
+    if (hasVisibleContent(message.content)) appendText(el, message.content);
     return el;
+  }
+
+  function shouldRenderMessage(message) {
+    if (message.role === 'tool') return true;
+    return hasVisibleContent(message.content);
+  }
+
+  function groupToolMessages(messages) {
+    const grouped = [];
+    messages.forEach((message) => {
+      const previous = grouped[grouped.length - 1];
+      if (message.role === 'tool' && previous && previous.role === 'tool') {
+        previous.content.push(message.content || '');
+        return;
+      }
+      if (message.role === 'tool') {
+        grouped.push({ ...message, content: [message.content || ''] });
+        return;
+      }
+      grouped.push(message);
+    });
+    return grouped;
   }
 
   function appendMessage(role, content) {
@@ -106,9 +135,9 @@
     const stack = ui.byId('chat-message-stack');
     if (!stack) return;
     clearNode(stack);
-    const messages = detail.messages || [];
-    if (!messages.length) showEmptyState();
-    messages.forEach((message) => stack.appendChild(createMessageElement(message)));
+    const visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage));
+    if (!visibleMessages.length) showEmptyState();
+    visibleMessages.forEach((message) => stack.appendChild(createMessageElement(message)));
   }
 
   async function loadSessions() {

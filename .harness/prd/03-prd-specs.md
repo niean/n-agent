@@ -90,6 +90,7 @@
     - 前端：弹出框支持ESC键退出
     - 模型：[KF]支持Anthropic的API协议，按照DDD规范、做好领域抽象。参考DDD文档`## AgentCore`章节，也参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent
         - 审阅：发现严重问题，spec-260617-anthropic-provider.md
+    - 对话：一轮对话、多次调用工具时，结果放到一个`工具调用调试信息`气泡中（当前是每个工具调用 一个气泡）
 
 
 

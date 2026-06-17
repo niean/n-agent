@@ -218,6 +218,12 @@ class AgentGraphRunner:
             state.error = "iteration limit reached"
             state.finish_reason = "length"
         state.run_status = RunStatus.FAILED if state.error else RunStatus.COMPLETED
+        if state.error and not state.final_message:
+            state.final_message = {"role": "assistant", "content": _error_message_for_user(state)}
+            await self.memory_store.append_message(
+                state.session_id,
+                ConversationMessage(role="assistant", content=state.final_message["content"]),
+            )
         await self.memory_store.save_task_state(
             TaskState(
                 session_id=state.session_id,
@@ -273,3 +279,35 @@ def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
     if message.name:
         data["name"] = message.name
     return data
+
+
+def _error_message_for_user(state: AgentState) -> str:
+    if state.error == "iteration limit reached":
+        content = _latest_tool_result_summary(state.working_messages)
+        if content:
+            return f"已达到工具调用上限，模型没有生成最终回答。最近一次工具调用已返回以下结果：\n\n{content}"
+        return "已达到工具调用上限，模型没有生成最终回答。请查看工具调用调试信息，或缩小问题后重试。"
+    return state.error or "error"
+
+
+def _latest_tool_result_summary(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            continue
+        raw = message.get("content", "")
+        try:
+            payload = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            return str(raw)[:1200]
+        content = payload.get("content") if isinstance(payload, dict) else None
+        if isinstance(content, dict) and isinstance(content.get("results"), list):
+            snippets = []
+            for index, item in enumerate(content["results"][:3], start=1):
+                title = item.get("title") or item.get("source") or item.get("id") or f"结果 {index}"
+                text = str(item.get("content") or item.get("snippet") or "").strip()
+                if len(text) > 600:
+                    text = text[:600].rstrip() + "..."
+                snippets.append(f"{index}. {title}\n{text}")
+            return "\n\n".join(snippets)
+        return json.dumps(content if content is not None else payload, ensure_ascii=False, indent=2)[:1200]
+    return ""
