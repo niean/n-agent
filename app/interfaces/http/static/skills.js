@@ -61,6 +61,7 @@
       tr.appendChild(td);
     });
     const td = ui.el('td');
+    td.className = 'row-actions';
     const viewBtn = ui.el('button', 'btn');
     viewBtn.type = 'button';
     viewBtn.textContent = '查看';
@@ -96,6 +97,11 @@
     await load();
   }
 
+  function closeDetail() {
+    const existing = ui.byId ? ui.byId('skill-detail-modal') : document.getElementById('skill-detail-modal');
+    if (existing) existing.remove();
+  }
+
   async function openDetail(name) {
     let data;
     try {
@@ -104,17 +110,38 @@
       window.alert('获取详情失败: ' + (err && err.message ? err.message : err));
       return;
     }
-    const drawer = ui.el('div', 'skill-drawer');
-    const close = ui.el('button', 'btn');
+    closeDetail();
+    const backdrop = ui.el('div', 'modal-backdrop');
+    backdrop.id = 'skill-detail-modal';
+    backdrop.setAttribute('role', 'presentation');
+
+    const dialog = ui.el('section', 'modal-dialog tools-schema-dialog');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'skill-detail-title');
+
+    const content = ui.el('div', 'tools-schema-content');
+    const header = ui.el('div', 'modal-header');
+    const title = ui.el('h4');
+    title.id = 'skill-detail-title';
+    title.textContent = (data && data.skill && data.skill.name) || name;
+    const close = ui.el('button', 'modal-close');
     close.type = 'button';
-    close.textContent = '关闭';
-    close.addEventListener('click', () => drawer.remove());
-    const heading = ui.el('h3');
-    heading.textContent = (data && data.skill && data.skill.name) || name;
+    close.setAttribute('aria-label', '关闭 Skill 详情弹出框');
+    close.textContent = '×';
+    close.addEventListener('click', closeDetail);
+    header.append(title, close);
+
     const pre = ui.el('pre');
     pre.textContent = (data && data.content) || '';
-    drawer.append(close, heading, pre);
-    document.body.appendChild(drawer);
+    content.append(header, pre);
+    dialog.appendChild(content);
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeDetail();
+    });
+    document.body.appendChild(backdrop);
+    close.focus();
   }
 
   async function load() {

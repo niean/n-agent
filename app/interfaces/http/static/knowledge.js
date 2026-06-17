@@ -114,7 +114,7 @@
         const schemaBtn = document.createElement('button');
         schemaBtn.type = 'button';
         schemaBtn.className = 'btn';
-        schemaBtn.textContent = '查看 schema';
+        schemaBtn.textContent = '查看';
         schemaBtn.addEventListener('click', () => openSchemaModal(tool));
         td7.appendChild(schemaBtn);
         tr.append(td1, td2, td3, td4, td5, td6, td7);

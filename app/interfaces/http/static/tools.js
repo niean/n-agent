@@ -122,7 +122,7 @@
       const schemaBtn = document.createElement('button');
       schemaBtn.type = 'button';
       schemaBtn.className = 'btn';
-      schemaBtn.textContent = '查看 schema';
+      schemaBtn.textContent = '查看';
       schemaBtn.addEventListener('click', () => openSchemaModal(tool));
       td7.appendChild(schemaBtn);
       tr.append(td1, td2, td3, td4, td5, td6, td7);
@@ -181,8 +181,8 @@
     const group = document.createElement('div');
     group.className = 'row-actions';
     const edit = actionButton('编辑', () => openSiteModal(site));
-    const refresh = actionButton('刷新工具', async () => { await api.refreshMcpSite(site.id); await refreshMcpSites(); await refreshTools(); await refreshMcpTools(); });
-    const tools = actionButton('查看工具', () => openSiteTools(site));
+    const refresh = actionButton('刷新', async () => { await api.refreshMcpSite(site.id); await refreshMcpSites(); await refreshTools(); await refreshMcpTools(); });
+    const tools = actionButton('查看', () => openSiteTools(site));
     const remove = actionButton('删除', async () => {
       if (!window.confirm(`删除 MCP 站点 ${site.name}？`)) return;
       await api.deleteMcpSite(site.id);

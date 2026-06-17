@@ -189,7 +189,10 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .providers-form input, .providers-form select { padding: 8px 10px; color: var(--color-fg-default); background: var(--color-bg-default); border: 1px solid var(--color-border-default); border-radius: 6px; font-size: 13px; }
 .providers-form__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .providers-form__hint { font-size: 12px; }
-.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.document-table .btn { padding: 0; color: var(--color-primary-strong); background: transparent; border: 0; border-radius: 0; }
+.document-table .btn:hover, .document-table .btn--primary, .document-table .btn--danger { color: var(--color-primary-strong); background: transparent; border-color: transparent; text-decoration: underline; }
+.document-table td > .btn + .btn { margin-left: 10px; }
 .tools-schema-content { padding: 20px; }
 .tools-schema-content h4 { margin: 0; }
 .tools-schema-content pre { max-height: min(620px, calc(100vh - 150px)); }
