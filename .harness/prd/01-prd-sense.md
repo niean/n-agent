@@ -30,10 +30,10 @@ N-Agent 是一款类似Hermes的Agent产品。
 ## 体验原则
 
 - 协议兼容优先：对外优先兼容 OpenAI-compatible API，降低 Open-WebUI 和现有客户端接入成本。
-- 本地可观察：Dashboard 必须能帮助开发者观察会话、摘要、任务状态和工具调用，不替代 Open-WebUI。
-- 工具安全默认：服务端 Tool Registry 决定可执行工具，文件工具限制在 workspace 内，危险能力默认不暴露。
-- 架构可演进：当前阶段只实现既定闭环，但 Domain 端口、Application 编排和 Infrastructure 实现必须便于后续扩展。
-- 最小可用闭环：优先保证对话、工具、记忆、流式响应和部署链路可运行，再增加复杂能力。
+- 本地可观察：Dashboard 必须能帮助开发者观察会话、摘要、任务状态、工具调用、知识库、任务、平台和外部入口状态，不替代 Open-WebUI。
+- 工具安全默认：服务端 Tool Registry 决定可执行工具，文件、知识、MCP、Skill、任务和平台能力均受服务端权限与风险等级控制。
+- 架构可演进：当前阶段已进入正式功能扩展，Domain 端口、Application 编排和 Infrastructure 实现必须便于后续扩展。
+- 本地闭环优先：优先保证对话、工具、记忆、知识、任务、平台、流式响应和部署链路可运行、可观察、可恢复，再增加生产级平台能力。
 
 ---
 
@@ -41,21 +41,22 @@ N-Agent 是一款类似Hermes的Agent产品。
 
 按优先级排序：
 
-1. OpenAI-compatible 对话链路是否能稳定服务 Open-WebUI、curl 和 Dashboard。
-2. Agent Runtime 是否保持清晰边界，避免 Provider、SQLite、FastAPI 或 LangGraph 细节污染 Domain。
-3. 工具调用、会话持久化和调试信息是否可观察、可追踪、可恢复。
-4. 新能力是否符合当前阶段范围，是否只保留扩展点而非提前实现完整平台能力。
+1. OpenAI-compatible 对话链路是否能稳定服务 Open-WebUI、curl、Dashboard 和外部 Gateway。
+2. Agent Runtime 是否保持清晰边界，避免 Provider、SQLite、FastAPI、LangGraph、知识库、MCP 或平台 SDK 细节污染 Domain。
+3. 工具调用、会话持久化、知识检索、任务执行、平台会话和调试信息是否可观察、可追踪、可恢复。
+4. 新能力是否符合本地 Agent 服务的正式扩展阶段，是否通过清晰端口接入而非堆叠临时入口。
 
-优先级低的未来能力即使技术可行，也应推迟到对应迭代，避免破坏当前阶段的简洁性和可验证性。
+优先级低的未来能力即使技术可行，也应推迟到对应迭代，避免破坏当前阶段的边界清晰性和可验证性。
 
 ---
 
 ## 不做什么
 
-- 不在当前阶段提前实现完整多 Agent 编排、后台任务平台、Cron、远程运行环境或消息网关。
-- 不让 Dashboard 替代 Open-WebUI 或承载生产级权限系统。
+- 不在当前阶段提前实现完整多 Agent 编排、远程运行环境或生产级权限系统。
+- 不让 Dashboard 替代 Open-WebUI 或承载生产级 IAM。
 - 不让客户端传入的 tools 绕过服务端 Tool Registry 和风险等级控制。
-- 不把系统提示词、Provider SDK 对象、SQLite row 或 FastAPI 请求对象作为内部领域模型。
+- 不让知识库、MCP、Skill、任务或平台入口绕过服务端权限与审计边界。
+- 不把系统提示词、Provider SDK 对象、SQLite row、FastAPI 请求对象、外部 KB/MCP/IM SDK 对象作为内部领域模型。
 
 ---
 
