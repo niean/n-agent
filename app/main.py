@@ -17,6 +17,7 @@ from app.application.gateway_service import GatewayService
 from app.application.knowledge_service import KnowledgeBaseCreateInput, KnowledgeService, KnowledgeToolExecutor
 from app.application.mcp_service import McpManagementToolExecutor, McpService, McpToolExecutor, mcp_management_tool_definitions
 from app.application.model_service import ModelService
+from app.application.platform_service import PlatformService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
 from app.application.schedule_run_service import ScheduleRunService
@@ -28,6 +29,7 @@ from app.application.skill_service import SkillService, SkillToolExecutor, skill
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
 from app.config import Settings
 from app.domain.knowledge import KnowledgeBaseType
+from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, PlatformRegistry
 from app.domain.provider import ProviderConfig
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
 from app.infrastructure.knowledge.http_adapters import HttpKnowledgeRetrieverConfig, KnowledgeHttpRetrieverFactory
@@ -35,6 +37,7 @@ from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+from app.infrastructure.registry.in_memory_platform_registry import InMemoryPlatformRegistry
 from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
 from app.infrastructure.registry.sqlite_knowledge_registry import SQLiteKnowledgeBaseRegistry
 from app.infrastructure.registry.sqlite_mcp_registry import SQLiteMcpSiteRegistry
@@ -53,6 +56,7 @@ from app.infrastructure.tools.schedule_management import ScheduleManagementToolE
 from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 from app.interfaces.http.openai import create_openai_router
+from app.interfaces.http.platforms import create_platforms_router
 
 
 logger = logging.getLogger(__name__)
@@ -81,6 +85,10 @@ def _run_sync(coro):
     if "error" in result:
         raise result["error"]
     return result.get("value")
+
+
+def _mask_app_id(app_id: str) -> str:
+    return f"{app_id[:4]}****" if len(app_id) > 4 else "****"
 
 
 async def _seed_legacy_knowledge_base(service: KnowledgeService, settings: Settings) -> None:
@@ -146,6 +154,9 @@ class ApplicationServices:
     scheduler_runner: SchedulerRunner
     skill_service: SkillService
     knowledge_service: KnowledgeService
+    feishu_long_connection_gateway: FeishuLongConnectionGateway | None
+    platform_registry: PlatformRegistry
+    platform_service: PlatformService
     health_snapshot: Callable[[], dict]
 
 
@@ -307,6 +318,29 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         health_snapshot,
         schedule_service=schedule_service,
     )
+    feishu_long_connection_gateway = (
+        FeishuLongConnectionGateway(gateway_service, feishu_client) if feishu_client is not None else None
+    )
+    descriptors = [PlatformDescriptor(Platform.CLI, "CLI", PlatformKind.LOCAL, {})]
+    lifecycles = {}
+    if settings.feishu_enabled:
+        descriptors.append(
+            PlatformDescriptor(
+                Platform.FEISHU,
+                "飞书",
+                PlatformKind.IM,
+                {
+                    "app_id_suffix": _mask_app_id(settings.feishu_app_id),
+                    "tenant_key": settings.feishu_tenant_key,
+                    "allowed_open_id_count": len(settings.feishu_allowed_open_ids),
+                    "allowed_chat_id_count": len(settings.feishu_allowed_chat_ids),
+                },
+            )
+        )
+        if feishu_long_connection_gateway is not None:
+            lifecycles[Platform.FEISHU] = feishu_long_connection_gateway
+    platform_registry = InMemoryPlatformRegistry(descriptors, lifecycles)
+    platform_service = PlatformService(platform_registry, gateway_registry)
     session_service.on_session_deleted = schedule_service.handle_session_deleted
     return ApplicationServices(
         settings=settings,
@@ -325,6 +359,9 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         scheduler_runner=scheduler_runner,
         skill_service=skill_service,
         knowledge_service=knowledge_service,
+        feishu_long_connection_gateway=feishu_long_connection_gateway,
+        platform_registry=platform_registry,
+        platform_service=platform_service,
         health_snapshot=health_snapshot,
     )
 
@@ -347,18 +384,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.exception("skill startup scan failed; dashboard refresh available as fallback")
         if services.settings.scheduler_enabled:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
-        if services.settings.feishu_enabled:
-            feishu_client = FeishuClient(
-                FeishuConfig(
-                    app_id=services.settings.feishu_app_id,
-                    app_secret=services.settings.feishu_app_secret,
-                    tenant_key=services.settings.feishu_tenant_key,
-                    allowed_open_ids=services.settings.feishu_allowed_open_ids,
-                    allowed_chat_ids=services.settings.feishu_allowed_chat_ids,
-                )
-            )
-            gateway = FeishuLongConnectionGateway(services.gateway_service, feishu_client)
-            feishu_task = asyncio.create_task(gateway.start())
+        if services.feishu_long_connection_gateway is not None:
+            feishu_task = asyncio.create_task(services.feishu_long_connection_gateway.start())
         try:
             yield
         finally:
@@ -379,6 +406,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="N-Agent", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.include_router(create_openai_router(services.chat_service, services.model_service))
+    app.include_router(create_platforms_router(services.platform_service))
     app.include_router(
         create_dashboard_router(
             services.session_service,

@@ -56,7 +56,7 @@ class GatewayCommandService:
         actor_value = event.metadata.get("actor_id")
         if actor_value is None and action is GatewayConfirmationAction.NEW:
             return await self._execute_new(event)
-        actor_id = str(actor_value if actor_value is not None else event.session_key.display_name or event.session_key.source_id)
+        actor_id = str(actor_value if actor_value is not None else event.session_key.display_name or event.session_key.platform_session_id)
         if self._trust_key(event.session_key, actor_id) in self.trusted_actors:
             return await self._execute(action, event, session_id, args, _build_trusted_metadata(event))
         now = datetime.now(timezone.utc)
@@ -159,13 +159,16 @@ class GatewayCommandService:
             if parsed is None:
                 return _response(session_id, "用法: /schedule add <cron> <prompt>")
             cron_expression, prompt = parsed
+            origin = dict(event.metadata)
+            origin["platform"] = event.session_key.platform.value
+            origin.setdefault("thread_id", event.session_key.thread_id)
             task = await self.schedule_service.create(
                 ScheduledTaskCreateInput(
                     name=prompt[:40] or "Scheduled Task",
                     prompt=prompt,
                     cron_expression=cron_expression,
                     delivery_target="origin",
-                    origin=dict(event.metadata),
+                    origin=origin,
                     session_id=session_id,
                 )
             )
@@ -234,6 +237,7 @@ class GatewayCommandService:
         if self.schedule_service is None:
             return _response(session_id, "任务服务未启用")
         task_id = str(args.get("task_id") or "")
+        expected_platform = str(trusted_metadata.get("platform") or trusted_metadata.get("gateway.platform") or "")
         expected_receive_id = str(trusted_metadata.get("receive_id") or "")
         expected_type = str(trusted_metadata.get("receive_id_type") or "")
         expected_thread = str(trusted_metadata.get("thread_id") or "")
@@ -243,7 +247,8 @@ class GatewayCommandService:
             return _response(session_id, "任务不存在")
         origin = task.origin or {}
         if (
-            str(origin.get("receive_id") or "") != expected_receive_id
+            str(origin.get("platform") or "") != expected_platform
+            or str(origin.get("receive_id") or "") != expected_receive_id
             or str(origin.get("receive_id_type") or "") != expected_type
             or str(origin.get("thread_id") or "") != expected_thread
         ):
@@ -253,7 +258,7 @@ class GatewayCommandService:
 
     async def _execute_new(self, event: InteractionMessage) -> InteractionResponse:
         new_session_id = f"gateway-{uuid4()}"
-        await self.session_service.create_session(new_session_id, source=event.session_key.source_type.value)
+        await self.session_service.create_session(new_session_id, source=event.session_key.platform.value)
         await self.registry.create_session_link(event.session_key, new_session_id)
         return _response(new_session_id, f"已创建新会话 {new_session_id}")
 
@@ -291,7 +296,7 @@ class GatewayService:
 
     async def handle_message(self, event: InteractionMessage) -> InteractionResponse:
         message_id = str(event.metadata.get("message_id", ""))
-        processed = await self.registry.mark_event_processed(event.session_key.source_type, event.id, message_id)
+        processed = await self.registry.mark_event_processed(event.session_key.platform, event.id, message_id)
         if not processed:
             return InteractionResponse(session_id="", messages=[], metadata={"duplicate": True})
 
@@ -311,8 +316,8 @@ class GatewayService:
                 stream=False,
                 metadata={
                     "gateway": {
-                        "source_type": event.session_key.source_type.value,
-                        "source_id": event.session_key.source_id,
+                        "platform": event.session_key.platform.value,
+                        "platform_session_id": event.session_key.platform_session_id,
                         "thread_id": event.session_key.thread_id,
                     }
                 },
@@ -340,7 +345,7 @@ class GatewayService:
         if link is not None:
             return link.session_id
         session_id = f"gateway-{uuid4()}"
-        await self.session_service.create_session(session_id, source=event.session_key.source_type.value)
+        await self.session_service.create_session(session_id, source=event.session_key.platform.value)
         await self.registry.create_session_link(event.session_key, session_id)
         return session_id
 
@@ -358,9 +363,9 @@ def _parse_schedule_add(rest: str) -> tuple[str, str] | None:
 def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:
     md = dict(event.metadata)
     return {
-        "gateway.source_type": event.session_key.source_type.value,
-        "gateway.source_id": event.session_key.source_id,
-        "source_type": event.session_key.source_type.value,
+        "gateway.platform": event.session_key.platform.value,
+        "gateway.platform_session_id": event.session_key.platform_session_id,
+        "platform": event.session_key.platform.value,
         "thread_id": str(md.get("thread_id") or event.session_key.thread_id or ""),
         "actor_id": str(md.get("actor_id") or ""),
         "receive_id": str(md.get("receive_id") or ""),
@@ -375,7 +380,7 @@ def _confirmation_metadata(confirmation: GatewayConfirmationRequest) -> dict[str
         "action": confirmation.action.value,
         "command": confirmation.command,
         "expires_at": confirmation.expires_at.isoformat(),
-        "source_id": confirmation.session_key.source_id,
+        "platform_session_id": confirmation.session_key.platform_session_id,
         "thread_id": confirmation.session_key.thread_id,
     }
 

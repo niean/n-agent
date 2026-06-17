@@ -19,7 +19,9 @@
 
 `Summary`（`app/domain/session.py`）：摘要记录，字段包括 session_id、summary、source_message_id、updated_at。
 
-`GatewaySessionKey` / `InteractionMessage` / `GatewayOutboundMessage` / `InteractionResponse`（`app/domain/gateway.py`）：交互入口标准化模型，用于把 CLI、飞书等平台消息转换为 Application 层可处理的统一事件和回复；不包含 FastAPI、飞书 SDK 或传输对象。
+`Platform` / `PlatformKind` / `PlatformDescriptor` / `PlatformLifecycle` / `PlatformRegistry`（`app/domain/platform.py`）：平台聚合的领域枚举、描述和生命周期端口，用于表达 CLI、飞书、钉钉、企微等交互平台及其 configured/connected/disconnected/fatal 状态，不包含具体 SDK、HTTP 或长连接对象。
+
+`GatewaySessionKey` / `InteractionMessage` / `GatewayOutboundMessage` / `InteractionResponse`（`app/domain/gateway.py`）：交互入口标准化模型，用于把 CLI、飞书等平台消息转换为 Application 层可处理的统一事件和回复；GatewaySessionKey 使用 `platform` 与 `platform_session_id` 组成外部 conversation 标识，不包含 FastAPI、飞书 SDK 或传输对象。
 
 `GatewaySessionLink`（`app/domain/gateway.py`）：外部 conversation 与内部 session 的映射记录，字段包括 conversation_id、session_id、display_name、created_at、updated_at、id。
 
@@ -67,7 +69,9 @@
 
 `MemoryStore`（`app/domain/memory.py`）：定义 session、message、tool_call、task_state、summary 的读写接口。Infrastructure 的 SQLiteMemoryStore 实现该端口。
 
-`GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射和飞书事件幂等。
+`GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed、list_conversations、count_conversations、get_last_active 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射、事件幂等和 PlatformService 会话统计。
+
+`PlatformRegistry`（`app/domain/platform.py`）：定义 list、get、get_lifecycle 接口。Infrastructure 的 InMemoryPlatformRegistry 实现该端口，应用启动时由 main.py 基于配置与已装配 lifecycle 单例构建；Application 的 PlatformService 只依赖该端口和 GatewaySessionRegistry。
 
 `McpSiteRegistry`（`app/domain/mcp.py`）：定义 MCP 站点和工具映射的 list/get/create/update/delete、replace_site_tools、update_probe_status、update_tool_enabled 接口。站点支持 streamable_http、sse 和 stdio 传输；stdio 配置包含 command、args、env。Infrastructure 的 SQLiteMcpSiteRegistry 实现该端口；Application 只依赖该端口和 McpClient 协议。
 
@@ -122,9 +126,9 @@ tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, s
 task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
 providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_headers_json, is_active, created_at, updated_at)
-gateway_conversations(id, source_type, source_id, thread_id, display_name, active_session_id, created_at, updated_at)
+gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at)
 gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
-gateway_processed_events(id, source_type, event_id, message_id, created_at)
+gateway_processed_events(id, platform, event_id, message_id, created_at)
 mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
 knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)

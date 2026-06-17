@@ -18,6 +18,10 @@
 - N-KB：独立知识库服务，N-Agent 通过 HTTP 检索接口消费其通用知识，不把索引和文档管理能力嵌入自身。
 - OpenAI-compatible API：对外兼容 OpenAI Chat Completions 风格的 HTTP API，用于接入 Open-WebUI 等客户端。
 - Open-WebUI：使用 OpenAI-compatible API 接入模型或 Agent 服务的 Web UI 客户端。
+- Platform：交互平台领域枚举，当前包括 cli、feishu、dingtalk、wecom；用于 Gateway conversation key、trusted_metadata、任务 origin 和 Dashboard 平台视图。
+- PlatformLifecycle：平台运行态端口，提供 is_connected 与 fatal_error；当前 FeishuLongConnectionGateway 实现该端口并由 PlatformRegistry 暴露给 PlatformService。
+- PlatformRegistry：平台注册端口，提供平台 descriptor 与 lifecycle 查询；当前由 InMemoryPlatformRegistry 在 main.py 启动装配时构建。
+- PlatformService：Application 层平台只读用例，组合 PlatformRegistry 与 GatewaySessionRegistry，输出平台状态、配置摘要、会话统计和会话分页。
 - Provider：具体 LLM 服务提供方或协议实现，如 OpenAI-compatible endpoint、Claude、Ollama、OpenRouter。
 - ProviderConfig：Provider 注册表中的脱敏配置实体，描述 id、name、provider_type、base_url、model、api_key_present、is_active 等字段，永不包含 api_key 明文。
 - ProviderRegistry：领域端口，定义多 Provider 配置的 CRUD、active 切换、明文 api_key 单独读取（仅供 Infrastructure 工厂调用）。

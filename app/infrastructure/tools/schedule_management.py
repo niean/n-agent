@@ -194,9 +194,11 @@ def _origin_from_trusted(trusted: dict[str, Any]) -> dict[str, str] | None:
     receive_id_type = trusted.get("receive_id_type")
     if not receive_id or not receive_id_type:
         return None
-    source_type = str(trusted.get("source_type") or trusted.get("gateway.source_type") or "")
+    platform = trusted.get("platform") or trusted.get("gateway.platform")
+    if not platform:
+        raise _ScheduleAccessDenied("trusted_origin_missing_platform")
     return {
-        "source_type": source_type,
+        "platform": str(platform),
         "receive_id": str(receive_id),
         "receive_id_type": str(receive_id_type),
         "thread_id": str(trusted.get("thread_id") or ""),
@@ -207,7 +209,8 @@ def _origin_matches(origin: dict[str, Any], expected: dict[str, str]) -> bool:
     if not origin:
         return False
     return (
-        str(origin.get("receive_id") or "") == expected["receive_id"]
+        str(origin.get("platform") or "") == expected["platform"]
+        and str(origin.get("receive_id") or "") == expected["receive_id"]
         and str(origin.get("receive_id_type") or "") == expected["receive_id_type"]
         and str(origin.get("thread_id") or "") == expected["thread_id"]
     )

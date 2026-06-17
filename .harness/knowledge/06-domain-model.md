@@ -14,6 +14,7 @@ Agent Runtime
 ├── Policy：工具权限、风险等级、执行约束和安全决策
 ├── Skill：本地 SKILL.md 包扫描、元数据持久化、按需 view 渲染、宏预处理（${HERMES_SKILL_DIR}/${HERMES_SESSION_ID}）；通过 safe 工具 skills_list/skill_view 暴露给 LLM 自助使用
 ├── Knowledge：KB 后端实例注册、探测、检索 SPI 和 search_knowledge 工具定义；通过 kb_id 显式路由到 N-KB/Ragflow 等协议 adapter
+├── Platform/Gateway：CLI、飞书等交互平台抽象、conversation 映射、平台 lifecycle 和 Dashboard 只读平台视图
 └── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
@@ -44,7 +45,7 @@ Interfaces -> Application -> Domain
 Infrastructure -> Domain
 ```
 
-- Domain：定义 Agent、Session、Message、Tool、Policy、Provider、Memory 等领域模型、值对象和端口协议。
+- Domain：定义 Agent、Session、Message、Tool、Policy、Provider、Memory、Platform/Gateway 等领域模型、值对象和端口协议。
 - Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
 - Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
@@ -87,6 +88,10 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | 值对象 | KnowledgeBaseSecret | KB 明文密钥，只在 probe/search 时从 registry 单独读取 |
 | 值对象 | KnowledgeSearchRequest | LLM 工具侧检索请求，kb_id 与 query 必填，不支持默认 KB |
 | 值对象 | KnowledgeSnippet / KnowledgeSearchResult | 跨 N-KB/Ragflow 的标准检索结果 |
+| 值对象 | Platform / PlatformKind / PlatformDescriptor | 交互平台枚举、平台类型和脱敏配置摘要 |
+| 值对象 | GatewaySessionKey / GatewayConversation | 平台 conversation key 与 Dashboard 平台会话视图 |
+| 端口 | PlatformRegistry / PlatformLifecycle | 平台 descriptor 与运行态查询端口 |
+| 端口 | GatewaySessionRegistry | 平台 conversation 与内部 session 映射、事件幂等和平台统计查询端口 |
 | 端口 | KnowledgeBaseRegistry | KB 配置注册表端口（CRUD + get_secret + probe 状态更新） |
 | 端口 | KnowledgeRetriever / KnowledgeRetrieverFactory | KB 检索与探测 SPI，Infrastructure adapter 按 base_type 实现协议差异 |
 
@@ -144,6 +149,7 @@ Policy 负责决定动作是否允许执行，避免把权限、安全和风险�
 - Storage：只能通过 `MemoryStore` 和 `Summarizer` 端口访问，SQLite 属于 Infrastructure。
 - Tool：Application 层处理工具定义和执行编排，具体 handler 属于 Infrastructure。
 - Policy：工具启用状态、风险等级、权限判定和资源访问约束属于业务规则，不下沉到具体 handler。
+- Platform：平台描述、lifecycle 和 Gateway 会话统计通过 PlatformRegistry/GatewaySessionRegistry 端口进入 Application；飞书 SDK、长连接、HTTP 发送属于 Infrastructure/Interfaces 细节。
 - FileSystem：文件工具必须围绕 workspace 根目录做路径安全约束。
 - Network：主要用于模型调用、KB 后端检索、FastAPI HTTP/SSE 服务。
 

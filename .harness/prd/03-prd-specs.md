@@ -83,6 +83,7 @@
     - 知识：[KF]检索支持多KB。抽象知识库SPI，支持多种KB类型，包括N-KB、Ragflow；Dashboard支持KB的增删改查
     - 平台：[KF]抽象平台功能，纳管当前的飞书IM，后续还要支持钉钉、微信等IM；Dashboard上，左导增加一级菜单`平台`，展示平台信息(如platform、session id、thread等) 
         - 审阅：发现严重问题，Spec spec-260617-platform-aggregate.md
+    - 前端：Dashboard，左导一级菜单，平台放到模型之下、健康之上，健康改名为观测
 
 
 
@@ -91,7 +92,7 @@
 
 [待办]
 - Issue
-    - 任务：定时任务sched-a406eae127164f3a970f63dbfab24c5d，只有第一个周期执行了，之后都是skipped_missed
+    - 任务：定时任务sched-a406eae127164f3a970f63dbfab24c5d，只有第1个周期执行了，之后都是skipped_missed，且调度周期是15分钟(不是预期的5分钟)
 - NFR
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 源码：AgentCore

@@ -58,7 +58,7 @@ def test_all_tab_paths_return_shell(tmp_path):
     paths = (
         "/", "/summary", "/chat", "/sessions",
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
-        "/models", "/status", "/scheduled-tasks",
+        "/models", "/status", "/scheduled-tasks", "/platforms",
     )
     for path in paths:
         response = client.get(path)
@@ -95,6 +95,7 @@ def test_static_assets_served(tmp_path):
         "/static/models.js",
         "/static/health.js",
         "/static/scheduled-tasks.js",
+        "/static/platforms.js",
         "/static/skills.js",
         "/static/knowledge.js",
         "/static/plugin.js",
@@ -127,6 +128,8 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'deleteSession' in api_js
     for fn in ('listKnowledgeBases', 'createKnowledgeBase', 'updateKnowledgeBase', 'deleteKnowledgeBase', 'probeKnowledgeBase', 'refreshKnowledgeTool'):
         assert fn in api_js
+    for fn in ('listPlatforms', 'getPlatform', 'listPlatformSessions'):
+        assert fn in api_js
     tools_js = client.get('/static/tools.js').text
     assert "'类型'" in tools_js
     assert "'分组'" in tools_js
@@ -158,9 +161,11 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert "'/summary'" in nav_js
     assert "'/status'" in nav_js
     assert "'/scheduled-tasks'" in nav_js
+    assert "'/platforms'" in nav_js
     assert "'scheduled-tasks'" in nav_js
+    assert "'platforms'" in nav_js
     assert 'pathByTab' in nav_js
-    assert nav_js.index("tab: 'chat'") < nav_js.index("tab: 'scheduled-tasks'") < nav_js.index("tab: 'sessions'")
+    assert nav_js.index("tab: 'models'") < nav_js.index("tab: 'platforms'") < nav_js.index("tab: 'status'")
     summary_js = client.get('/static/summary.js').text
     assert "'scheduled-tasks'" in summary_js
     assert 'listScheduledTasks' in summary_js
@@ -173,6 +178,27 @@ def test_static_assets_contain_expected_logic(tmp_path):
         < summary_js.index("tab: 'tools-plugin'")
         < summary_js.index("tab: 'tools-builtin'")
     )
+
+
+def test_platforms_static_assets_contain_readonly_ui(tmp_path):
+    client = _client(tmp_path)
+    html = client.get('/platforms').text
+    assert 'data-tab="platforms"' in html
+    assert 'id="platforms-list"' in html
+    assert 'id="platforms-sessions"' in html
+
+    platforms_js = client.get('/static/platforms.js').text
+    for expected in (
+        'listPlatforms',
+        'getPlatform',
+        'listPlatformSessions',
+        'platform_session_id',
+        'document.createElement',
+        '.textContent',
+    ):
+        assert expected in platforms_js
+    assert 'innerHTML =' not in platforms_js
+    assert 'insertAdjacentHTML' not in platforms_js
 
 
 def test_scheduled_tasks_static_assets_contain_management_ui(tmp_path):
@@ -293,11 +319,11 @@ def test_index_html_links_assets(tmp_path):
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '工具', '模型', '健康', '任务', '知识', 'MCP', 'Skill', 'Plugin', '内置'):
+    for tab in ('概览', '对话', '会话', '工具', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', '内置'):
         assert tab in html, f"index.html missing menu label {tab}"
-    for path in ('/summary', '/chat', '/sessions', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/models', '/status', '/scheduled-tasks'):
+    for path in ('/summary', '/chat', '/sessions', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/models', '/platforms', '/status', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"
-    assert html.index('href="/chat"') < html.index('href="/scheduled-tasks"') < html.index('href="/sessions"')
+    assert html.index('href="/models"') < html.index('href="/platforms"') < html.index('href="/status"')
     assert (
         html.index('href="/tools/knowledge"')
         < html.index('href="/tools/mcp"')

@@ -1,4 +1,7 @@
+import asyncio
 import json
+
+import pytest
 
 from app.domain.gateway import GatewayOutboundMessage, InteractionMessage, InteractionResponse
 from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
@@ -79,7 +82,7 @@ def card_payload(choice="once"):
         "event": {
             "operator": {"open_id": "ou_1"},
             "context": {"open_chat_id": "oc_1"},
-            "action": {"value": {"confirmation_id": "confirm-1", "choice": choice, "source_id": "oc_1", "thread_id": ""}},
+            "action": {"value": {"confirmation_id": "confirm-1", "choice": choice, "platform_session_id": "oc_1", "thread_id": ""}},
         },
     }
 
@@ -93,6 +96,49 @@ async def test_long_connection_start_listens_and_handles_event():
 
     assert gateway.events[0].text == "hello"
     assert client.sent == [("oc_1", "reply", "chat_id")]
+    assert adapter.is_connected() is False
+    assert adapter.fatal_error() is None
+
+
+async def test_long_connection_start_marks_fatal_on_listen_error():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(text_payload("hello"))
+
+    async def fail_listen(handler):
+        raise RuntimeError("boom")
+
+    client.listen_events = fail_listen
+    adapter = FeishuLongConnectionGateway(gateway, client)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await adapter.start()
+
+    assert adapter.is_connected() is False
+    assert adapter.fatal_error() == ("feishu_listen_error", "boom")
+
+
+async def test_long_connection_start_marks_connected_while_listening():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(text_payload("hello"))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def listen(handler):
+        entered.set()
+        await release.wait()
+
+    client.listen_events = listen
+    adapter = FeishuLongConnectionGateway(gateway, client)
+    task = asyncio.create_task(adapter.start())
+    await entered.wait()
+
+    assert adapter.is_connected() is True
+    assert adapter.fatal_error() is None
+
+    release.set()
+    await task
+    assert adapter.is_connected() is False
+    assert adapter.fatal_error() is None
 
 
 async def test_long_connection_non_text_message_returns_unsupported_without_gateway_call():
@@ -130,7 +176,7 @@ async def test_long_connection_text_message_calls_gateway_and_replies():
 
     assert gateway.events[0].text.endswith("hello")
     assert gateway.events[0].metadata["message_id"] == "msg-1"
-    assert gateway.events[0].metadata["source_type"] == "feishu"
+    assert gateway.events[0].metadata["platform"] == "feishu"
     assert gateway.events[0].metadata["receive_id"] == "oc_1"
     assert gateway.events[0].metadata["receive_id_type"] == "chat_id"
     assert "capabilities" not in gateway.events[0].metadata
@@ -147,7 +193,7 @@ async def test_long_connection_p2p_without_chat_id_replies_to_open_id():
 
     await adapter.handle_event({})
 
-    assert gateway.events[0].session_key.source_id == "ou_1"
+    assert gateway.events[0].session_key.platform_session_id == "ou_1"
     assert gateway.events[0].metadata["receive_id"] == "ou_1"
     assert gateway.events[0].metadata["receive_id_type"] == "open_id"
     assert client.sent == [("ou_1", "reply", "open_id")]

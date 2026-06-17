@@ -12,7 +12,8 @@
     { tab: 'tools-plugin', path: '/tools/plugin', label: 'Plugin', parentTab: 'tools' },
     { tab: 'tools-builtin', path: '/tools/builtin', label: '内置', parentTab: 'tools' },
     { tab: 'models', path: '/models', label: '模型' },
-    { tab: 'status', path: '/status', label: '健康' },
+    { tab: 'platforms', path: '/platforms', label: '平台' },
+    { tab: 'status', path: '/status', label: '观测' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
   const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.domain.platform import Platform
 from app.domain.schedule import DeliveryResult, DeliveryTarget, DeliveryTargetType
 
 
@@ -13,10 +14,14 @@ class ScheduleOutboundDelivery:
         if target.target_type is DeliveryTargetType.DASHBOARD:
             return DeliveryResult("success")
         context = target.context
-        source_type = context.get("source_type")
-        if not source_type and context.get("receive_id") and context.get("receive_id_type"):
-            source_type = "feishu"
-        if source_type == "feishu":
+        platform_value = context.get("platform")
+        if not platform_value:
+            return DeliveryResult("failed", "origin missing platform")
+        try:
+            platform = Platform(platform_value)
+        except ValueError:
+            return DeliveryResult("failed", f"unsupported platform: {platform_value}")
+        if platform is Platform.FEISHU:
             if self.feishu_client is None:
                 return DeliveryResult("failed", "feishu client is not configured")
             receive_id = context.get("receive_id", "")
@@ -31,4 +36,4 @@ class ScheduleOutboundDelivery:
             except Exception as exc:
                 return DeliveryResult("failed", str(exc))
             return DeliveryResult("success")
-        return DeliveryResult("failed", "unsupported origin source")
+        return DeliveryResult("failed", f"unsupported platform: {platform.value}")

@@ -38,6 +38,13 @@ def _task(
     status: ScheduledTaskStatus = ScheduledTaskStatus.ACTIVE,
 ) -> ScheduledTask:
     now = datetime.now(timezone.utc)
+    default_origin = {
+        "platform": "feishu",
+        "receive_id": "oc_a",
+        "receive_id_type": "chat_id",
+        "thread_id": "",
+    }
+    origin = dict(origin or default_origin)
     return ScheduledTask(
         id=task_id,
         name=name,
@@ -45,11 +52,11 @@ def _task(
         schedule=ScheduleExpression(cron),
         timezone=ScheduleTimezone("Asia/Shanghai"),
         session_id=session_id,
-        delivery_target=DeliveryTarget.origin(origin or {"receive_id": "oc_a", "receive_id_type": "chat_id"}),
+        delivery_target=DeliveryTarget.origin(origin),
         next_run_at=now,
         enabled=True,
         status=status,
-        origin=dict(origin or {"receive_id": "oc_a", "receive_id_type": "chat_id", "thread_id": ""}),
+        origin=dict(origin),
         created_at=now,
         updated_at=now,
     )
@@ -132,15 +139,18 @@ def _trusted_ctx(
     session_id: str = "s1",
     mode: str = "realtime",
     permitted: set[str] | None = None,
+    platform: str = "feishu",
 ) -> ToolExecutionContext:
+    metadata: dict[str, Any] = {
+        "receive_id": receive_id,
+        "receive_id_type": receive_id_type,
+        "thread_id": thread_id,
+    }
+    if platform:
+        metadata["gateway.platform"] = platform
     return ToolExecutionContext(
         session_id=session_id,
-        trusted_metadata={
-            "gateway.source_type": "feishu",
-            "receive_id": receive_id,
-            "receive_id_type": receive_id_type,
-            "thread_id": thread_id,
-        },
+        trusted_metadata=metadata,
         execution_context_mode=mode,
         permitted_managed_tools=permitted or {"manage_schedule"},
     )
@@ -173,7 +183,7 @@ async def test_create_uses_trusted_origin_and_session():
     assert fake.created.session_id == "s1"
     assert fake.created.delivery_target == "origin"
     assert fake.created.origin == {
-        "source_type": "feishu",
+        "platform": "feishu",
         "receive_id": "oc_a",
         "receive_id_type": "chat_id",
         "thread_id": "",
@@ -202,7 +212,7 @@ async def test_fail_closed_when_mode_not_realtime():
     executor = ScheduleManagementToolExecutor(fake)
     ctx = ToolExecutionContext(
         session_id="s3",
-        trusted_metadata={"gateway.source_type": "feishu", "receive_id": "x", "receive_id_type": "chat_id"},
+        trusted_metadata={"gateway.platform": "feishu", "receive_id": "x", "receive_id_type": "chat_id"},
         execution_context_mode="unattended",
     )
     result = await executor.execute(
@@ -217,11 +227,34 @@ async def test_fail_closed_when_mode_not_realtime():
 
 
 @pytest.mark.asyncio
+async def test_fail_closed_when_trusted_origin_missing_platform():
+    fake = FakeScheduleService()
+    executor = ScheduleManagementToolExecutor(fake)
+    ctx = ToolExecutionContext(
+        session_id="s4",
+        trusted_metadata={"receive_id": "oc_a", "receive_id_type": "chat_id"},
+        execution_context_mode="realtime",
+        permitted_managed_tools={"manage_schedule"},
+    )
+    result = await executor.execute(
+        ToolCallRequest(
+            id="1",
+            name="manage_schedule",
+            arguments={"action": "create", "prompt": "x", "cron_expression": "0 9 * * *"},
+        ),
+        ctx,
+    )
+    payload = _payload(result)
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert payload["error"] == "trusted_origin_missing_platform"
+
+
+@pytest.mark.asyncio
 async def test_list_only_returns_origin_matching_tasks():
     fake = FakeScheduleService(
         tasks=[
-            _task("sched-a", origin={"receive_id": "oc_a", "receive_id_type": "chat_id", "thread_id": ""}),
-            _task("sched-b", origin={"receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""}),
+            _task("sched-a", origin={"platform": "feishu", "receive_id": "oc_a", "receive_id_type": "chat_id", "thread_id": ""}),
+            _task("sched-b", origin={"platform": "feishu", "receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""}),
         ]
     )
     executor = ScheduleManagementToolExecutor(fake)
@@ -239,7 +272,7 @@ async def test_list_only_returns_origin_matching_tasks():
 @pytest.mark.asyncio
 async def test_query_get_cross_origin_returns_not_found():
     fake = FakeScheduleService(
-        tasks=[_task("sched-b", origin={"receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""})]
+        tasks=[_task("sched-b", origin={"platform": "feishu", "receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""})]
     )
     executor = ScheduleManagementToolExecutor(fake)
     ctx = _trusted_ctx(receive_id="oc_a")
@@ -255,7 +288,7 @@ async def test_query_get_cross_origin_returns_not_found():
 @pytest.mark.asyncio
 async def test_update_pause_resume_run_check_origin_ownership():
     fake = FakeScheduleService(
-        tasks=[_task("sched-b", origin={"receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""})]
+        tasks=[_task("sched-b", origin={"platform": "feishu", "receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""})]
     )
     executor = ScheduleManagementToolExecutor(fake)
     ctx = _trusted_ctx(receive_id="oc_a")
@@ -281,7 +314,7 @@ async def test_update_pause_resume_run_check_origin_ownership():
 @pytest.mark.asyncio
 async def test_remove_short_circuits_to_confirmation_required():
     fake = FakeScheduleService(
-        tasks=[_task("sched-1", origin={"receive_id": "oc_a", "receive_id_type": "chat_id", "thread_id": ""})]
+        tasks=[_task("sched-1", origin={"platform": "feishu", "receive_id": "oc_a", "receive_id_type": "chat_id", "thread_id": ""})]
     )
     executor = ScheduleManagementToolExecutor(fake)
     ctx = _trusted_ctx(receive_id="oc_a")
@@ -298,7 +331,7 @@ async def test_remove_short_circuits_to_confirmation_required():
 @pytest.mark.asyncio
 async def test_remove_cross_origin_returns_not_found_without_existence_leak():
     fake = FakeScheduleService(
-        tasks=[_task("sched-b", origin={"receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""})]
+        tasks=[_task("sched-b", origin={"platform": "feishu", "receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""})]
     )
     executor = ScheduleManagementToolExecutor(fake)
     ctx = _trusted_ctx(receive_id="oc_a")

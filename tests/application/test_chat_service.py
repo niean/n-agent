@@ -134,7 +134,7 @@ async def test_complete_injects_tool_execution_context_with_trusted_metadata(tmp
             messages=[{"role": "user", "content": "hi"}],
             stream=False,
             trusted_metadata={
-                "gateway.source_type": "feishu",
+                "gateway.platform": "feishu",
                 "receive_id": "oc_a",
                 "receive_id_type": "chat_id",
             },
@@ -145,7 +145,7 @@ async def test_complete_injects_tool_execution_context_with_trusted_metadata(tmp
     ctx = runner.options["tool_execution_context"]
     assert isinstance(ctx, ToolExecutionContext)
     assert ctx.session_id == "s1"
-    assert ctx.trusted_metadata["gateway.source_type"] == "feishu"
+    assert ctx.trusted_metadata["gateway.platform"] == "feishu"
     assert ctx.execution_context_mode == "realtime"
     assert ctx.permitted_managed_tools == {"manage_schedule"}
 
@@ -161,7 +161,7 @@ async def test_complete_no_trusted_metadata_means_no_managed_tools(tmp_path):
             model="test",
             messages=[{"role": "user", "content": "hi"}],
             stream=False,
-            metadata={"gateway.source_type": "feishu"},
+            metadata={"gateway.platform": "feishu"},
             session_id="s2",
         )
     )
@@ -182,7 +182,7 @@ async def test_complete_unattended_mode_has_no_managed_tools(tmp_path):
             messages=[{"role": "user", "content": "hi"}],
             stream=False,
             options={"execution_context_mode": "unattended"},
-            trusted_metadata={"gateway.source_type": "feishu"},
+            trusted_metadata={"gateway.platform": "feishu"},
             session_id="s3",
         )
     )

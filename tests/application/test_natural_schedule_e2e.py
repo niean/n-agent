@@ -20,7 +20,8 @@ from app.application.tool_service import (
     builtin_tool_definitions,
     schedule_tool_definitions,
 )
-from app.domain.gateway import GatewaySessionKey, InteractionMessage, InteractionSourceType
+from app.domain.gateway import GatewaySessionKey, InteractionMessage
+from app.domain.platform import Platform
 from app.domain.provider import LLMResult, ModelInfo
 from app.domain.schedule import PromptSafetyResult
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
@@ -190,8 +191,8 @@ class _FakeGatewayRegistry:
     async def delete_session_link(self, session_id):
         return None
 
-    async def mark_event_processed(self, source_type, event_id, message_id=""):
-        marker = (source_type.value, event_id)
+    async def mark_event_processed(self, platform, event_id, message_id=""):
+        marker = (platform.value, event_id)
         if marker in self.processed:
             return False
         self.processed.add(marker)
@@ -277,7 +278,7 @@ async def test_feishu_natural_language_creates_scheduled_task(tmp_path: Path):
         schedule_service=schedule_service,
     )
 
-    feishu_key = GatewaySessionKey(InteractionSourceType.FEISHU, "oc_a", thread_id="")
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_a", thread_id="")
     event = InteractionMessage(
         id="evt-natural-1",
         session_key=feishu_key,
@@ -310,7 +311,7 @@ async def test_feishu_natural_language_creates_scheduled_task(tmp_path: Path):
     assert captured.cron_expression == "0 9 * * *"
     assert captured.delivery_target == "origin"
     assert captured.origin == {
-        "source_type": "feishu",
+        "platform": "feishu",
         "receive_id": "oc_a",
         "receive_id_type": "chat_id",
         "thread_id": "",

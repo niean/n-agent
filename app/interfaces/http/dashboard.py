@@ -94,6 +94,7 @@ def create_dashboard_router(
     @router.get("/models", response_class=HTMLResponse)
     @router.get("/status", response_class=HTMLResponse)
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
+    @router.get("/platforms", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 

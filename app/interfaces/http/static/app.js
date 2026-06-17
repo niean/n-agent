@@ -7,6 +7,7 @@
     models: false,
     status: false,
     'scheduled-tasks': false,
+    platforms: false,
     'tools-builtin': false,
     'tools-mcp': false,
     'tools-knowledge': false,

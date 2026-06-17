@@ -5,7 +5,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from app.domain.gateway import GatewaySessionKey, GatewaySessionLink, InteractionSourceType
+from app.domain.gateway import GatewayConversation, GatewaySessionKey, GatewaySessionLink
+from app.domain.platform import Platform
 
 
 class SQLiteGatewaySessionRegistry:
@@ -112,35 +113,79 @@ class SQLiteGatewaySessionRegistry:
                 (session_id,),
             )
 
-    async def mark_event_processed(self, source_type: InteractionSourceType, event_id: str, message_id: str = "") -> bool:
+    async def mark_event_processed(self, platform: Platform, event_id: str, message_id: str = "") -> bool:
         with self._connect() as conn:
             try:
                 conn.execute(
                     """
-                    INSERT INTO gateway_processed_events(id, source_type, event_id, message_id, created_at)
+                    INSERT INTO gateway_processed_events(id, platform, event_id, message_id, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (str(uuid4()), source_type.value, event_id, message_id or None, _now()),
+                    (str(uuid4()), platform.value, event_id, message_id or None, _now()),
                 )
             except sqlite3.IntegrityError:
                 return False
         return True
 
+    async def list_conversations(
+        self, platform: Platform | None = None, limit: int = 100, offset: int = 0
+    ) -> list[GatewayConversation]:
+        with self._connect() as conn:
+            if platform is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM gateway_conversations
+                    ORDER BY updated_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM gateway_conversations
+                    WHERE platform = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (platform.value, limit, offset),
+                ).fetchall()
+        return [_conversation_from_row(row) for row in rows]
+
+    async def count_conversations(self, platform: Platform) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(1) AS c FROM gateway_conversations WHERE platform = ?",
+                (platform.value,),
+            ).fetchone()
+        return int(row["c"]) if row is not None else 0
+
+    async def get_last_active(self, platform: Platform) -> datetime | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(updated_at) AS ts FROM gateway_conversations WHERE platform = ?",
+                (platform.value,),
+            ).fetchone()
+        if row is None or row["ts"] is None:
+            return None
+        return datetime.fromisoformat(row["ts"])
+
 
 def _initialize_gateway_schema(conn: sqlite3.Connection) -> None:
     _migrate_processed_events_message_id_nullable(conn)
+    _migrate_legacy_source_columns(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS gateway_conversations (
             id TEXT PRIMARY KEY,
-            source_type TEXT NOT NULL,
-            source_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            platform_session_id TEXT NOT NULL,
             thread_id TEXT NOT NULL DEFAULT '',
             display_name TEXT NOT NULL,
             active_session_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            UNIQUE(source_type, source_id, thread_id),
+            UNIQUE(platform, platform_session_id, thread_id),
             FOREIGN KEY(active_session_id) REFERENCES sessions(id)
         );
         CREATE TABLE IF NOT EXISTS gateway_session_links (
@@ -155,38 +200,66 @@ def _initialize_gateway_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE TABLE IF NOT EXISTS gateway_processed_events (
             id TEXT PRIMARY KEY,
-            source_type TEXT NOT NULL,
+            platform TEXT NOT NULL,
             event_id TEXT NOT NULL,
             message_id TEXT,
             created_at TEXT NOT NULL,
-            UNIQUE(source_type, event_id),
-            UNIQUE(source_type, message_id)
+            UNIQUE(platform, event_id),
+            UNIQUE(platform, message_id)
         );
         """
     )
 
 
 def _migrate_processed_events_message_id_nullable(conn: sqlite3.Connection) -> None:
-    table = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'gateway_processed_events'").fetchone()
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'gateway_processed_events'"
+    ).fetchone()
     if table is None or "message_id TEXT NOT NULL" not in str(table["sql"]):
         return
+    sql = str(table["sql"])
+    has_legacy_column = "source_type" in sql
+    column_decl = "source_type TEXT NOT NULL" if has_legacy_column else "platform TEXT NOT NULL"
+    unique_event = "UNIQUE(source_type, event_id)" if has_legacy_column else "UNIQUE(platform, event_id)"
+    unique_message = "UNIQUE(source_type, message_id)" if has_legacy_column else "UNIQUE(platform, message_id)"
+    select_columns = (
+        "id, source_type, event_id, NULLIF(message_id, ''), created_at"
+        if has_legacy_column
+        else "id, platform, event_id, NULLIF(message_id, ''), created_at"
+    )
     conn.executescript(
-        """
+        f"""
         ALTER TABLE gateway_processed_events RENAME TO gateway_processed_events_old;
         CREATE TABLE gateway_processed_events (
             id TEXT PRIMARY KEY,
-            source_type TEXT NOT NULL,
+            {column_decl},
             event_id TEXT NOT NULL,
             message_id TEXT,
             created_at TEXT NOT NULL,
-            UNIQUE(source_type, event_id),
-            UNIQUE(source_type, message_id)
+            {unique_event},
+            {unique_message}
         );
-        INSERT OR IGNORE INTO gateway_processed_events(id, source_type, event_id, message_id, created_at)
-        SELECT id, source_type, event_id, NULLIF(message_id, ''), created_at FROM gateway_processed_events_old;
+        INSERT OR IGNORE INTO gateway_processed_events SELECT {select_columns} FROM gateway_processed_events_old;
         DROP TABLE gateway_processed_events_old;
         """
     )
+
+
+def _migrate_legacy_source_columns(conn: sqlite3.Connection) -> None:
+    """Rename source_type/source_id columns to platform/platform_session_id (fail-fast)."""
+    try:
+        conv_cols = {row["name"] for row in conn.execute("PRAGMA table_info(gateway_conversations)").fetchall()}
+        if conv_cols and "source_type" in conv_cols:
+            conn.execute("ALTER TABLE gateway_conversations RENAME COLUMN source_type TO platform")
+        if conv_cols and "source_id" in conv_cols:
+            conn.execute("ALTER TABLE gateway_conversations RENAME COLUMN source_id TO platform_session_id")
+        proc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(gateway_processed_events)").fetchall()}
+        if proc_cols and "source_type" in proc_cols:
+            conn.execute("ALTER TABLE gateway_processed_events RENAME COLUMN source_type TO platform")
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            f"failed to migrate gateway legacy source columns: {exc}; SQLite >= 3.34 required"
+        ) from exc
 
 
 def _ensure_conversation(conn: sqlite3.Connection, key: GatewaySessionKey, now: str) -> str:
@@ -200,10 +273,10 @@ def _ensure_conversation(conn: sqlite3.Connection, key: GatewaySessionKey, now: 
     conversation_id = str(uuid4())
     conn.execute(
         """
-        INSERT INTO gateway_conversations(id, source_type, source_id, thread_id, display_name, active_session_id, created_at, updated_at)
+        INSERT INTO gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
         """,
-        (conversation_id, key.source_type.value, key.source_id, key.thread_id, key.display_name, now, now),
+        (conversation_id, key.platform.value, key.platform_session_id, key.thread_id, key.display_name, now, now),
     )
     return conversation_id
 
@@ -212,7 +285,7 @@ def _get_conversation(conn: sqlite3.Connection, key: GatewaySessionKey) -> sqlit
     return conn.execute(
         """
         SELECT * FROM gateway_conversations
-        WHERE source_type = ? AND source_id = ? AND thread_id = ?
+        WHERE platform = ? AND platform_session_id = ? AND thread_id = ?
         """,
         key.conversation_parts,
     ).fetchone()
@@ -236,6 +309,19 @@ def _link_from_row(row: sqlite3.Row) -> GatewaySessionLink:
         conversation_id=row["conversation_id"],
         session_id=row["session_id"],
         display_name=row["display_name"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _conversation_from_row(row: sqlite3.Row) -> GatewayConversation:
+    return GatewayConversation(
+        id=row["id"],
+        platform=Platform(row["platform"]),
+        platform_session_id=row["platform_session_id"],
+        thread_id=row["thread_id"],
+        display_name=row["display_name"],
+        active_session_id=row["active_session_id"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )

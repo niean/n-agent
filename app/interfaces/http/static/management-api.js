@@ -79,6 +79,10 @@
   const resumeScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/resume`, { method: 'POST' });
   const deleteScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' });
 
+  const listPlatforms = (includeLocal) => fetchJson(`/chat/gateways?include_local=${includeLocal ? 'true' : 'false'}`);
+  const getPlatform = (platform) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}`);
+  const listPlatformSessions = (platform, limit, offset) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}/sessions?limit=${encodeURIComponent(limit || 20)}&offset=${encodeURIComponent(offset || 0)}`);
+
   const listMcpSites = () => fetchJson('/chat/mcp/sites');
   const probeMcpSite = (payload) => fetchJson('/chat/mcp/sites/probe', {
     method: 'POST',
@@ -148,6 +152,9 @@
     pauseScheduledTask,
     resumeScheduledTask,
     deleteScheduledTask,
+    listPlatforms,
+    getPlatform,
+    listPlatformSessions,
     listMcpSites,
     probeMcpSite,
     createMcpSite,

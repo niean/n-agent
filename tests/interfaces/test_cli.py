@@ -52,7 +52,7 @@ def test_cli_chat_sends_message(monkeypatch, capsys):
     assert exit_code == 0
     assert "reply" in output
     assert services.gateway_service.events[0].text == "hello"
-    assert services.gateway_service.events[0].session_key.source_id == "cli-test"
+    assert services.gateway_service.events[0].session_key.platform_session_id == "cli-test"
 
 
 def test_cli_help(capsys):

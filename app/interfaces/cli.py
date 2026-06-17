@@ -5,7 +5,8 @@ import asyncio
 import json
 from uuid import uuid4
 
-from app.domain.gateway import GatewaySessionKey, InteractionMessage, InteractionSourceType
+from app.domain.gateway import GatewaySessionKey, InteractionMessage
+from app.domain.platform import Platform
 from app.main import build_application_services
 
 
@@ -81,7 +82,7 @@ def _cmd_skill_view(args, service) -> int:
     return 0
 
 
-def _interactive_chat(gateway_service, source_id: str) -> int:
+def _interactive_chat(gateway_service, platform_session_id: str) -> int:
     while True:
         try:
             text = input("> ").strip()
@@ -91,14 +92,14 @@ def _interactive_chat(gateway_service, source_id: str) -> int:
             return 0
         if not text:
             continue
-        response = asyncio.run(_send(gateway_service, text, source_id))
+        response = asyncio.run(_send(gateway_service, text, platform_session_id))
         _print_response(response)
 
 
-async def _send(gateway_service, text: str, source_id: str):
+async def _send(gateway_service, text: str, platform_session_id: str):
     event = InteractionMessage(
         id=f"cli-{uuid4()}",
-        session_key=GatewaySessionKey(InteractionSourceType.CLI, source_id, display_name=source_id),
+        session_key=GatewaySessionKey(Platform.CLI, platform_session_id, display_name=platform_session_id),
         text=text,
     )
     return await gateway_service.handle_message(event)

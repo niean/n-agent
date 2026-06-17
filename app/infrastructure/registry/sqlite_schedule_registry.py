@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from app.domain.schedule import (
     DeliveryTarget,
@@ -477,6 +480,31 @@ def _initialize_schedule_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_scheduled_executions_task_created ON scheduled_task_executions(task_id, created_at);
         """
     )
+    _migrate_origin_json_source_type_to_platform(conn)
+
+
+def _migrate_origin_json_source_type_to_platform(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT id, origin_json FROM scheduled_tasks WHERE origin_json LIKE '%\"source_type\"%'"
+    ).fetchall()
+    if not rows:
+        return
+    affected = 0
+    for row in rows:
+        try:
+            origin = json.loads(row["origin_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(origin, dict) or "source_type" not in origin:
+            continue
+        origin["platform"] = origin.pop("source_type")
+        conn.execute(
+            "UPDATE scheduled_tasks SET origin_json = ? WHERE id = ?",
+            (json.dumps(origin), row["id"]),
+        )
+        affected += 1
+    if affected:
+        logger.info("scheduled_tasks origin_json source_type→platform migrated rows=%d", affected)
 
 
 def _now() -> datetime:

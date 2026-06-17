@@ -96,8 +96,8 @@ class ChatCompletionService:
     def _compute_permitted_managed_tools(mode: str, trusted_metadata: dict[str, Any]) -> set[str]:
         if mode != "realtime":
             return set()
-        gateway_source_type = trusted_metadata.get("gateway.source_type")
-        if gateway_source_type in ("feishu",):
+        gateway_platform = trusted_metadata.get("gateway.platform")
+        if gateway_platform in ("feishu",):
             return {"manage_schedule"}
         return set()
 

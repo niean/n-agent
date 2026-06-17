@@ -37,10 +37,10 @@ def test_tool_execution_context_carries_trusted_metadata():
     ctx = ToolExecutionContext(
         session_id="s1",
         trusted_metadata={
-            "gateway.source_type": "feishu",
+            "gateway.platform": "feishu",
             "receive_id": "oc_x",
         },
         permitted_managed_tools={"manage_schedule"},
     )
-    assert ctx.trusted_metadata["gateway.source_type"] == "feishu"
+    assert ctx.trusted_metadata["gateway.platform"] == "feishu"
     assert "manage_schedule" in ctx.permitted_managed_tools

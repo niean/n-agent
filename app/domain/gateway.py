@@ -6,12 +6,7 @@ from enum import Enum
 from typing import Any, Protocol
 from uuid import uuid4
 
-
-class InteractionSourceType(str, Enum):
-    CLI = "cli"
-    FEISHU = "feishu"
-    DASHBOARD = "dashboard"
-    API = "api"
+from app.domain.platform import Platform
 
 
 class GatewayConfirmationChoice(str, Enum):
@@ -29,14 +24,14 @@ class GatewayConfirmationAction(str, Enum):
 
 @dataclass(frozen=True)
 class GatewaySessionKey:
-    source_type: InteractionSourceType
-    source_id: str
+    platform: Platform
+    platform_session_id: str
     thread_id: str = ""
     display_name: str = ""
 
     @property
     def conversation_parts(self) -> tuple[str, str, str]:
-        return (self.source_type.value, self.source_id, self.thread_id)
+        return (self.platform.value, self.platform_session_id, self.thread_id)
 
 
 @dataclass(frozen=True)
@@ -71,6 +66,18 @@ class GatewaySessionLink:
 
 
 @dataclass(frozen=True)
+class GatewayConversation:
+    id: str
+    platform: Platform
+    platform_session_id: str
+    thread_id: str
+    display_name: str
+    active_session_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
 class GatewayConfirmationRequest:
     id: str
     session_key: GatewaySessionKey
@@ -101,5 +108,16 @@ class GatewaySessionRegistry(Protocol):
     async def delete_session_link(self, session_id: str) -> None:
         ...
 
-    async def mark_event_processed(self, source_type: InteractionSourceType, event_id: str, message_id: str = "") -> bool:
+    async def mark_event_processed(self, platform: Platform, event_id: str, message_id: str = "") -> bool:
+        ...
+
+    async def list_conversations(
+        self, platform: Platform | None = None, limit: int = 100, offset: int = 0
+    ) -> list[GatewayConversation]:
+        ...
+
+    async def count_conversations(self, platform: Platform) -> int:
+        ...
+
+    async def get_last_active(self, platform: Platform) -> datetime | None:
         ...

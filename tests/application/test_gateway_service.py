@@ -5,7 +5,8 @@ import pytest
 
 from app.application.gateway_service import GatewayService
 from app.application.chat_service import ChatCompletionResult
-from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, GatewaySessionLink, InteractionMessage, InteractionSourceType
+from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, GatewaySessionLink, InteractionMessage
+from app.domain.platform import Platform
 from app.domain.provider import ModelInfo
 from app.domain.session import ConversationSession
 from app.domain.tool import ToolDefinition
@@ -42,8 +43,8 @@ class FakeGatewayRegistry:
             if self.active.get(key) == session_id:
                 self.active.pop(key)
 
-    async def mark_event_processed(self, source_type, event_id, message_id=""):
-        marker = (source_type.value, event_id)
+    async def mark_event_processed(self, platform, event_id, message_id=""):
+        marker = (platform.value, event_id)
         if marker in self.processed:
             return False
         self.processed.add(marker)
@@ -145,7 +146,7 @@ class FakeScheduleService:
         return True
 
 
-def _schedule_task(task_id: str, *, receive_id: str, receive_id_type: str = "chat_id", thread_id: str = ""):
+def _schedule_task(task_id: str, *, receive_id: str, receive_id_type: str = "chat_id", thread_id: str = "", platform: str = "feishu"):
     from datetime import datetime, timezone
 
     from app.domain.schedule import (
@@ -155,7 +156,7 @@ def _schedule_task(task_id: str, *, receive_id: str, receive_id_type: str = "cha
         ScheduleTimezone,
     )
 
-    origin = {"receive_id": receive_id, "receive_id_type": receive_id_type, "thread_id": thread_id}
+    origin = {"platform": platform, "receive_id": receive_id, "receive_id_type": receive_id_type, "thread_id": thread_id}
     return ScheduledTask(
         id=task_id,
         name="demo",
@@ -190,7 +191,7 @@ class Harness:
 def message(text="hello", event_id="event-1"):
     return InteractionMessage(
         id=event_id,
-        session_key=GatewaySessionKey(InteractionSourceType.CLI, "local", display_name="Local"),
+        session_key=GatewaySessionKey(Platform.CLI, "local", display_name="Local"),
         text=text,
     )
 
@@ -397,7 +398,7 @@ async def test_gateway_schedule_remove_requires_confirmation():
     key = message().session_key
     await harness.registry.create_session_link(key, "session-1")
     schedule = FakeScheduleService(
-        tasks={"sched-1": _schedule_task("sched-1", receive_id=key.source_id, thread_id=key.thread_id)}
+        tasks={"sched-1": _schedule_task("sched-1", receive_id=key.platform_session_id, thread_id=key.thread_id)}
     )
     service = harness.service(schedule)
     event = message("/schedule remove sched-1")
@@ -415,12 +416,12 @@ async def test_gateway_schedule_remove_confirmation_deletes_task():
     key = message().session_key
     await harness.registry.create_session_link(key, "session-1")
     schedule = FakeScheduleService(
-        tasks={"sched-1": _schedule_task("sched-1", receive_id=key.source_id, thread_id=key.thread_id)}
+        tasks={"sched-1": _schedule_task("sched-1", receive_id=key.platform_session_id, thread_id=key.thread_id, platform=key.platform.value)}
     )
     service = harness.service(schedule)
     event = message("/schedule remove sched-1")
     event.metadata["actor_id"] = "ou_1"
-    event.metadata["receive_id"] = key.source_id
+    event.metadata["receive_id"] = key.platform_session_id
     event.metadata["receive_id_type"] = "chat_id"
     event.metadata["thread_id"] = key.thread_id
     pending = await service.handle_message(event)
@@ -574,7 +575,7 @@ async def test_gateway_service_switch_command_sets_active_session():
 async def test_handle_message_propagates_trusted_metadata_to_chat_input():
     harness = Harness()
     service = harness.service()
-    feishu_key = GatewaySessionKey(InteractionSourceType.FEISHU, "oc_a", thread_id="")
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_a", thread_id="")
     event = InteractionMessage(
         id="evt-trust",
         session_key=feishu_key,
@@ -590,19 +591,19 @@ async def test_handle_message_propagates_trusted_metadata_to_chat_input():
     await service.handle_message(event)
 
     request = harness.chat_service.requests[-1]
-    assert request.trusted_metadata["gateway.source_type"] == "feishu"
-    assert request.trusted_metadata["source_type"] == "feishu"
+    assert request.trusted_metadata["gateway.platform"] == "feishu"
+    assert request.trusted_metadata["platform"] == "feishu"
     assert request.trusted_metadata["receive_id"] == "oc_a"
     assert request.trusted_metadata["receive_id_type"] == "chat_id"
     assert request.trusted_metadata["actor_id"] == "ou_x"
     assert "capabilities" not in request.trusted_metadata
-    assert request.metadata.get("gateway", {}).get("source_type") == "feishu"
+    assert request.metadata.get("gateway", {}).get("platform") == "feishu"
 
 
 @pytest.mark.asyncio
 async def test_schedule_remove_confirmation_rejects_cross_origin_tasks():
     harness = Harness()
-    feishu_key = GatewaySessionKey(InteractionSourceType.FEISHU, "oc_a", thread_id="")
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_a", thread_id="")
     await harness.registry.create_session_link(feishu_key, "session-1")
     schedule = FakeScheduleService(
         tasks={"sched-1": _schedule_task("sched-1", receive_id="oc_b")}
@@ -636,7 +637,7 @@ async def test_schedule_remove_confirmation_rejects_cross_origin_tasks():
 @pytest.mark.asyncio
 async def test_schedule_remove_confirmation_deletes_when_origin_matches():
     harness = Harness()
-    feishu_key = GatewaySessionKey(InteractionSourceType.FEISHU, "oc_a", thread_id="")
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_a", thread_id="")
     await harness.registry.create_session_link(feishu_key, "session-1")
     schedule = FakeScheduleService(
         tasks={"sched-1": _schedule_task("sched-1", receive_id="oc_a")}

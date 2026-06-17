@@ -5,6 +5,7 @@
 | D001 | `docker compose config` 会展开本地 `.env` 中的 Provider API Key，运行验收命令时可能在终端输出敏感配置。 | medium | plan-260611-chat-fullscreen.md | 2026-06-11 | open |
 | D002 | `tests/test_docker_compose_config.py` 期望 `docker/.env.example` 包含 `http://n-kb:8212`，但当前示例配置为空值，导致全量 pytest 失败。 | medium | plan-260615-provider-active-check.md | 2026-06-15 | open |
 | D003 | GatewayConfirmation 持久化：`GatewayCommandService.pending_confirmations` 保持为进程内 dict，多副本部署或进程重启会丢失未确认请求；待未来需要多副本时设计 Domain `GatewayConfirmationRegistry` 端口与 SQLite 实现。 | low | plan-260616-feishu-natural-schedule.md | 2026-06-17 | open |
+| D004 | Gateway 与定时任务 origin 曾存在 `source_type/source_id` 命名债，与 Hermes 平台抽象不一致；本计划已一次性迁移为 platform/platform_session_id，并移除业务 fallback。 | medium | plan-260617-platform-aggregate.md | 2026-06-17 | resolved |
 
 ---
 

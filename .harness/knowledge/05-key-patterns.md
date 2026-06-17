@@ -169,23 +169,25 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 
 规则：
 - ChatCompletionInput 同时携带 `metadata`（untrusted，可由 OpenAI HTTP 客户端写入）与 `trusted_metadata`（trusted，仅 GatewayService/Feishu 长连接适配器写入）。
-- ChatCompletionService.complete 在每次调用时构造 ToolExecutionContext，把 trusted_metadata 拷贝进去，并通过 `_compute_permitted_managed_tools(mode, trusted_metadata)` 决定 `permitted_managed_tools`。当前规则：mode=realtime 且 `trusted_metadata.gateway.source_type` 为合法 Gateway（feishu）才返回 `{"manage_schedule"}`，否则空集。
+- ChatCompletionService.complete 在每次调用时构造 ToolExecutionContext，把 trusted_metadata 拷贝进去，并通过 `_compute_permitted_managed_tools(mode, trusted_metadata)` 决定 `permitted_managed_tools`。当前规则：mode=realtime 且 `trusted_metadata.gateway.platform` 为合法 Gateway（feishu）才返回 `{"manage_schedule"}`，否则空集。
 - 上下文通过 LangGraph `configurable.options["tool_execution_context"]` 传递；执行节点（call_llm/execute_tools）必须在 config 缺失时回退到 `state.run_options`，避免 LangGraph 框架精简 config 导致 context 丢失。
 - ToolService.execute 对 `definition.managed=True` 强制检查 `request.name in context.permitted_managed_tools`，否则返回 `permission_denied`，不调用 handler。
-- 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 source_type/receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。`_origin_from_trusted` 把这四个字段一并写入 `ScheduledTask.origin` 与 `DeliveryTarget.context`，由 outbound 按 `source_type` 路由投递。
+- 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 platform/receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。`_origin_from_trusted` 把这四个字段一并写入 `ScheduledTask.origin` 与 `DeliveryTarget.context`，由 outbound 按 `platform` 路由投递。
 - 删除等需要确认的破坏性动作不允许 Agent 直接执行；自然语言删除要返回 confirmation_required 文案，引导用户走 `/schedule remove <id>`。Gateway 破坏性命令 preflight 时把当前飞书 trusted_metadata 写入 `GatewayConfirmationRequest.trusted_metadata`，handle_confirmation 还原后再校验 task.origin 一致性。
 - 不可信模式（unattended/safe_only、定时任务执行）时 `list_openai_tools` 必须过滤 source_type=AGENT 的工具，避免调度器递归调用自己。
 
-陷阱：把 OpenAI HTTP 客户端 metadata 直接当 trusted_metadata 用，或者只在 ToolExecutionContext 里塞 metadata 不区分 trusted/untrusted，会让伪造 `gateway.source_type=feishu` 的 OpenAI 客户端获得飞书会话的 schedule 操作权限。
+陷阱：把 OpenAI HTTP 客户端 metadata 直接当 trusted_metadata 用，或者只在 ToolExecutionContext 里塞 metadata 不区分 trusted/untrusted，会让伪造 `gateway.platform=feishu` 的 OpenAI 客户端获得飞书会话的 schedule 操作权限。
 
-## 模式十三：平台主动外发按 source_type 路由
+## 模式十三：平台聚合与主动外发按 platform 路由
 
-后台任务（定时任务等）回投到 IM 平台时，按 `DeliveryTarget.context.source_type` 路由到对应平台 client，不引入 per-message capability 字段。
+后台任务（定时任务等）回投到 IM 平台时，按 `DeliveryTarget.context.platform` 路由到对应平台 client；Dashboard 平台页通过 PlatformService 读取 PlatformRegistry 与 GatewaySessionRegistry，不直接读 SQLite。
 
 规则：
-- `ScheduleOutboundDelivery.deliver` 只判断 `source_type`：feishu 则调用注入的 FeishuClient.send_text；未知 source 返回 failed。
-- 平台支持主动文本外发是 platform 固有能力（由是否注入对应 client 决定），不在每条 metadata 里重复声明。新增平台时扩展 deliver 分支即可，不引入新的 capability 抽象。
-- Gateway `_build_trusted_metadata` 必须把 `event.session_key.source_type.value` 写入 `trusted_metadata.source_type`；Tool 落库 origin 时一并保存 source_type/receive_id/receive_id_type/thread_id 四元组。
-- 历史上曾用 `capabilities=["active_text_delivery"]` 表达同一含义，已废弃；outbound 对缺失 source_type 但带 receive_id+receive_id_type 的旧任务向后兼容当作 feishu。
+- `Platform` 是 CLI、feishu、dingtalk、wecom 的统一领域枚举；GatewaySessionKey 使用 platform/platform_session_id/thread_id 作为 conversation key。
+- `PlatformRegistry` 提供 descriptor 与 lifecycle；Application 的 PlatformService 合成 status、session_count、last_active_at、active_sessions 等只读视图。
+- `FeishuLongConnectionGateway` 是飞书入口适配器，同时实现 PlatformLifecycle；start() 先标记 connected，listen_events 正常返回后标记 disconnected，异常时写入 fatal("feishu_listen_error", message) 并继续抛出。
+- `ScheduleOutboundDelivery.deliver` 只判断 `platform`：feishu 则调用注入的 FeishuClient.send_text；缺失或未知 platform 返回 failed，不做 receive_id 启发式回退。
+- Gateway `_build_trusted_metadata` 必须写入 `gateway.platform` 与顶级 `platform`；Tool 落库 origin 时一并保存 platform/receive_id/receive_id_type/thread_id 四元组，跨 origin 操作统一返回 task not found。
+- 启动期 SQLite migration 负责把历史 gateway 列 source_type/source_id 改为 platform/platform_session_id，并把 scheduled_tasks.origin_json 中的 source_type 改为 platform；业务代码不保留 source_type fallback。
 
-陷阱：把"平台能力"放进每条消息的 capability 列表，意味着任何中间层漏传一次都会让正常功能变成 fail-closed；把能力归到 platform 注册（feishu_client 是否注入）才是单一来源。
+陷阱：把"平台能力"放进每条消息的 capability 列表，意味着任何中间层漏传一次都会让正常功能变成 fail-closed；把能力归到 platform 注册（client/lifecycle 是否注入）才是单一来源。

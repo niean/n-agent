@@ -13,7 +13,8 @@
     { tab: 'tools-plugin', label: 'Plugin', desc: 'Plugin 子系统（待实现）' },
     { tab: 'tools-builtin', label: '内置工具', desc: '查看已注册的工具与风险等级' },
     { tab: 'models', label: '模型', desc: '查看对外暴露的统一模型' },
-    { tab: 'status', label: '健康', desc: '检查 Provider/Memory/Knowledge 状态' },
+    { tab: 'platforms', label: '平台', desc: '查看接入平台与平台会话' },
+    { tab: 'status', label: '观测', desc: '检查 Provider/Memory/Knowledge 状态' },
   ];
 
   function renderStats(stats, service, dependencies, counts) {

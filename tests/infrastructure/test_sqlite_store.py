@@ -2,7 +2,8 @@ import sqlite3
 
 import pytest
 
-from app.domain.gateway import GatewaySessionKey, InteractionSourceType
+from app.domain.gateway import GatewaySessionKey
+from app.domain.platform import Platform
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
@@ -99,7 +100,7 @@ async def test_delete_session_cascades_related_rows(tmp_path):
     gateway_registry = SQLiteGatewaySessionRegistry(db_path)
     await store.create_session(ConversationSession(id="s-del"))
     msg = await store.append_message("s-del", ConversationMessage(role="user", content="hi"))
-    key = GatewaySessionKey(InteractionSourceType.CLI, "local")
+    key = GatewaySessionKey(Platform.CLI, "local")
     await gateway_registry.create_session_link(key, "s-del")
     await store.save_tool_call(
         ToolCall(id="tc-del", session_id="s-del", message_id=msg.id, tool_name="calc", arguments={}, status="success")

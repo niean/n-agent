@@ -4,7 +4,8 @@ import json
 from typing import Any, Protocol
 
 from app.application.gateway_service import GatewayService
-from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, InteractionMessage, InteractionResponse, InteractionSourceType
+from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, InteractionMessage, InteractionResponse
+from app.domain.platform import Platform
 
 
 class FeishuEventClient(Protocol):
@@ -25,9 +26,34 @@ class FeishuLongConnectionGateway:
     def __init__(self, gateway_service: GatewayService, feishu_client: FeishuEventClient):
         self.gateway_service = gateway_service
         self.feishu_client = feishu_client
+        self._connected = False
+        self._fatal: tuple[str, str] | None = None
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def fatal_error(self) -> tuple[str, str] | None:
+        return self._fatal
+
+    def _mark_connected(self) -> None:
+        self._connected = True
+        self._fatal = None
+
+    def _mark_disconnected(self) -> None:
+        self._connected = False
+
+    def _set_fatal_error(self, code: str, message: str) -> None:
+        self._connected = False
+        self._fatal = (code, message)
 
     async def start(self) -> None:
-        await self.feishu_client.listen_events(self.handle_event)
+        self._mark_connected()
+        try:
+            await self.feishu_client.listen_events(self.handle_event)
+            self._mark_disconnected()
+        except Exception as exc:
+            self._set_fatal_error("feishu_listen_error", str(exc))
+            raise
 
     async def handle_event(self, payload: dict[str, Any]) -> None:
         if _is_card_action(payload):
@@ -59,20 +85,20 @@ class FeishuLongConnectionGateway:
                 pass
         receive_id = chat_id or open_id
         receive_id_type = "chat_id" if chat_id else "open_id"
-        source_id = receive_id
+        platform_session_id = receive_id
         response = await self.gateway_service.handle_message(
             InteractionMessage(
                 id=_clean_text(verified.get("header", {}).get("event_id")) or message_id,
                 session_key=GatewaySessionKey(
-                    InteractionSourceType.FEISHU,
-                    source_id,
+                    Platform.FEISHU,
+                    platform_session_id,
                     thread_id=thread_id,
                     display_name=open_id,
                 ),
                 text=content,
                 metadata={
-                    "source_type": "feishu",
-                    "source_id": source_id,
+                    "platform": "feishu",
+                    "platform_session_id": platform_session_id,
                     "conversation_id": chat_id,
                     "message_id": message_id,
                     "receive_id": receive_id,
@@ -85,7 +111,7 @@ class FeishuLongConnectionGateway:
         )
         if response.metadata.get("duplicate"):
             return
-        await self._send_response(response, receive_id, receive_id_type, source_id, thread_id)
+        await self._send_response(response, receive_id, receive_id_type, platform_session_id, thread_id)
 
     async def _handle_card_action(self, payload: dict[str, Any]) -> None:
         verified = self.feishu_client.verify_card_action_event(payload)
@@ -95,22 +121,22 @@ class FeishuLongConnectionGateway:
         value = event.get("action", {}).get("value", {})
         actor_id = _clean_text(operator.get("open_id"))
         chat_id = _clean_text(context.get("open_chat_id"))
-        source_id = _clean_text(value.get("source_id")) or chat_id
+        platform_session_id = _clean_text(value.get("platform_session_id")) or chat_id
         thread_id = _clean_text(value.get("thread_id"))
         response = await self.gateway_service.handle_confirmation(
-            GatewaySessionKey(InteractionSourceType.FEISHU, source_id, thread_id=thread_id, display_name=actor_id),
+            GatewaySessionKey(Platform.FEISHU, platform_session_id, thread_id=thread_id, display_name=actor_id),
             actor_id,
             _clean_text(value.get("confirmation_id")),
             GatewayConfirmationChoice(_clean_text(value.get("choice"))),
         )
-        await self._send_response(response, chat_id, "chat_id", source_id, thread_id)
+        await self._send_response(response, chat_id, "chat_id", platform_session_id, thread_id)
 
     async def _send_response(
         self,
         response: InteractionResponse,
         receive_id: str,
         receive_id_type: str,
-        source_id: str,
+        platform_session_id: str,
         thread_id: str,
     ) -> None:
         for outbound in response.messages:
@@ -119,7 +145,7 @@ class FeishuLongConnectionGateway:
                 try:
                     await self.feishu_client.send_interactive_card(
                         receive_id,
-                        _confirmation_card(confirmation, source_id, thread_id),
+                        _confirmation_card(confirmation, platform_session_id, thread_id),
                         receive_id_type,
                     )
                 except Exception:
@@ -134,7 +160,7 @@ def _is_card_action(payload: dict[str, Any]) -> bool:
     return bool(value.get("confirmation_id"))
 
 
-def _confirmation_card(confirmation: dict[str, Any], source_id: str, thread_id: str) -> dict[str, Any]:
+def _confirmation_card(confirmation: dict[str, Any], platform_session_id: str, thread_id: str) -> dict[str, Any]:
     command = _clean_text(confirmation.get("command"))
     confirmation_id = _clean_text(confirmation.get("id"))
     return {
@@ -144,16 +170,16 @@ def _confirmation_card(confirmation: dict[str, Any], source_id: str, thread_id: 
             {
                 "tag": "action",
                 "actions": [
-                    _confirmation_button("执行一次", confirmation_id, "once", source_id, thread_id),
-                    _confirmation_button("本会话信任", confirmation_id, "trust_session", source_id, thread_id),
-                    _confirmation_button("取消", confirmation_id, "cancel", source_id, thread_id),
+                    _confirmation_button("执行一次", confirmation_id, "once", platform_session_id, thread_id),
+                    _confirmation_button("本会话信任", confirmation_id, "trust_session", platform_session_id, thread_id),
+                    _confirmation_button("取消", confirmation_id, "cancel", platform_session_id, thread_id),
                 ],
             },
         ],
     }
 
 
-def _confirmation_button(label: str, confirmation_id: str, choice: str, source_id: str, thread_id: str) -> dict[str, Any]:
+def _confirmation_button(label: str, confirmation_id: str, choice: str, platform_session_id: str, thread_id: str) -> dict[str, Any]:
     return {
         "tag": "button",
         "text": {"tag": "plain_text", "content": label},
@@ -161,7 +187,7 @@ def _confirmation_button(label: str, confirmation_id: str, choice: str, source_i
         "value": {
             "confirmation_id": confirmation_id,
             "choice": choice,
-            "source_id": source_id,
+            "platform_session_id": platform_session_id,
             "thread_id": thread_id,
         },
     }

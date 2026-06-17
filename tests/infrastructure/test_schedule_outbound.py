@@ -37,7 +37,7 @@ async def test_dashboard_delivery_records_success_without_platform_send():
 async def test_feishu_origin_delivery_sends_receive_id_type():
     feishu = FakeFeishuClient()
     target = DeliveryTarget.origin(
-        {"source_type": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id"}
+        {"platform": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id"}
     )
 
     result = await ScheduleOutboundDelivery(feishu).deliver(target, "done")
@@ -47,22 +47,32 @@ async def test_feishu_origin_delivery_sends_receive_id_type():
 
 
 @pytest.mark.asyncio
-async def test_feishu_origin_without_source_type_falls_back_to_feishu():
+async def test_origin_without_platform_fails_without_fallback():
     feishu = FakeFeishuClient()
-    target = DeliveryTarget.origin(
-        {"receive_id": "ou_1", "receive_id_type": "open_id"}
-    )
+    target = DeliveryTarget.origin({"receive_id": "ou_1", "receive_id_type": "open_id"})
 
     result = await ScheduleOutboundDelivery(feishu).deliver(target, "done")
 
-    assert result.status == "success"
-    assert feishu.calls == [("ou_1", "done", "open_id")]
+    assert result.status == "failed"
+    assert "platform" in result.error
+    assert feishu.calls == []
+
+
+@pytest.mark.asyncio
+async def test_origin_with_unknown_platform_fails():
+    result = await ScheduleOutboundDelivery(FakeFeishuClient()).deliver(
+        DeliveryTarget.origin({"platform": "telegram", "receive_id": "u_1", "receive_id_type": "chat_id"}),
+        "done",
+    )
+
+    assert result.status == "failed"
+    assert "telegram" in result.error
 
 
 @pytest.mark.asyncio
 async def test_origin_without_receive_id_fails():
     result = await ScheduleOutboundDelivery(FakeFeishuClient()).deliver(
-        DeliveryTarget.origin({"source_type": "feishu", "receive_id_type": "open_id"}),
+        DeliveryTarget.origin({"platform": "feishu", "receive_id_type": "open_id"}),
         "done",
     )
 
@@ -73,7 +83,7 @@ async def test_origin_without_receive_id_fails():
 async def test_feishu_send_exception_returns_failed_result():
     result = await ScheduleOutboundDelivery(FakeFeishuClient(fail=True)).deliver(
         DeliveryTarget.origin(
-            {"source_type": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id"}
+            {"platform": "feishu", "receive_id": "ou_1", "receive_id_type": "open_id"}
         ),
         "done",
     )

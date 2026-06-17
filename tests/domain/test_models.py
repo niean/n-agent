@@ -2,7 +2,8 @@ from dataclasses import fields
 
 from app.domain.agent import AgentState
 from app.domain.provider import ModelInfo
-from app.domain.gateway import GatewayOutboundMessage, GatewaySessionKey, InteractionMessage, InteractionSourceType
+from app.domain.gateway import GatewayOutboundMessage, GatewaySessionKey, InteractionMessage
+from app.domain.platform import Platform
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 
 
@@ -61,7 +62,7 @@ def test_model_info_describes_capabilities():
 
 
 def test_gateway_session_key_normalizes_thread_id():
-    key = GatewaySessionKey(InteractionSourceType.FEISHU, "chat-1")
+    key = GatewaySessionKey(Platform.FEISHU, "chat-1")
 
     assert key.thread_id == ""
     assert key.conversation_parts == ("feishu", "chat-1", "")
@@ -70,7 +71,7 @@ def test_gateway_session_key_normalizes_thread_id():
 def test_interaction_message_defaults_metadata():
     message = InteractionMessage(
         id="event-1",
-        session_key=GatewaySessionKey(InteractionSourceType.CLI, "local"),
+        session_key=GatewaySessionKey(Platform.CLI, "local"),
         text="hello",
     )
 
