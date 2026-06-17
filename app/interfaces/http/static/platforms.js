@@ -137,7 +137,7 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'btn';
-    button.textContent = '查看会话';
+    button.textContent = '查看';
     button.addEventListener('click', () => selectPlatform(platform.platform));
     actions.appendChild(button);
     row.appendChild(actions);
@@ -187,7 +187,7 @@
     table.className = 'document-table';
     const thead = document.createElement('thead');
     const header = document.createElement('tr');
-    ['平台会话', '线程', '显示名', '当前会话', '更新时间'].forEach((label) => appendText(header, 'th', label));
+    ['会话', '线程', '显示名', '当前会话', '更新时间'].forEach((label) => appendText(header, 'th', label));
     thead.appendChild(header);
     table.appendChild(thead);
     const tbody = document.createElement('tbody');

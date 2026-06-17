@@ -107,6 +107,54 @@ async def test_run_now_and_due_claim_share_lease(registry):
 
 
 @pytest.mark.asyncio
+async def test_run_now_can_reclaim_completed_lease(registry):
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now + timedelta(hours=1)))
+    first = await registry.claim_task_for_run_now("task-1", now, lease_seconds=900)
+    assert first is not None
+    execution = ScheduledTaskExecution(
+        id="execution-1",
+        task_id="task-1",
+        session_id="session-1",
+        claim_id=first.claim_id,
+        lease_owner=first.lease_owner,
+        status=ScheduledTaskExecutionStatus.SUCCEEDED,
+        claimed_next_run_at=first.claimed_next_run_at,
+        started_at=now,
+        completed_at=now,
+    )
+    await registry.record_execution_started(execution)
+
+    second = await registry.claim_task_for_run_now("task-1", now + timedelta(minutes=1), lease_seconds=900)
+
+    assert second is not None
+    assert second.claim_id != first.claim_id
+
+
+@pytest.mark.asyncio
+async def test_run_now_does_not_reclaim_running_lease(registry):
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now + timedelta(hours=1)))
+    first = await registry.claim_task_for_run_now("task-1", now, lease_seconds=900)
+    assert first is not None
+    execution = ScheduledTaskExecution(
+        id="execution-1",
+        task_id="task-1",
+        session_id="session-1",
+        claim_id=first.claim_id,
+        lease_owner=first.lease_owner,
+        status=ScheduledTaskExecutionStatus.RUNNING,
+        claimed_next_run_at=first.claimed_next_run_at,
+        started_at=now,
+    )
+    await registry.record_execution_started(execution)
+
+    second = await registry.claim_task_for_run_now("task-1", now + timedelta(minutes=1), lease_seconds=900)
+
+    assert second is None
+
+
+@pytest.mark.asyncio
 async def test_skipped_missed_claim_fast_forwards_without_executable_work(registry):
     now = datetime(2026, 6, 16, 1, 0, tzinfo=timezone.utc)
     await registry.create(_task(next_run_at=now - timedelta(hours=1)))
@@ -147,6 +195,37 @@ async def test_completion_and_delivery_require_current_claim(registry):
     assert await registry.record_execution_completed(completed) is True
     delivered = ScheduledTaskExecution(**{**completed.__dict__, "delivery_status": "success"})
     assert await registry.record_delivery_result(delivered) is True
+
+
+@pytest.mark.asyncio
+async def test_completed_due_claim_releases_lease_for_next_interval(registry):
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now))
+    claim = (await registry.claim_due_tasks(now, limit=5, lease_seconds=900))[0]
+    execution = ScheduledTaskExecution(
+        id="execution-1",
+        task_id="task-1",
+        session_id="session-1",
+        claim_id=claim.claim_id,
+        lease_owner=claim.lease_owner,
+        status=ScheduledTaskExecutionStatus.RUNNING,
+        claimed_next_run_at=claim.claimed_next_run_at,
+        started_at=now,
+    )
+    await registry.record_execution_started(execution)
+    completed = ScheduledTaskExecution(
+        **{**execution.__dict__, "status": ScheduledTaskExecutionStatus.SUCCEEDED, "completed_at": now, "output": "done"}
+    )
+
+    assert await registry.record_execution_completed(completed) is True
+    task = await registry.get("task-1")
+    assert task is not None
+    assert task.lease_until is None
+
+    next_claims = await registry.claim_due_tasks(now + timedelta(minutes=5, seconds=1), limit=5, lease_seconds=900)
+
+    assert len(next_claims) == 1
+    assert next_claims[0].skipped_missed is False
 
 
 @pytest.mark.asyncio

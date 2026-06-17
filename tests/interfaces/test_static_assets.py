@@ -319,7 +319,7 @@ def test_index_html_links_assets(tmp_path):
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '工具', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', '内置'):
+    for tab in ('概览', '对话', '会话', '工具', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin'):
         assert tab in html, f"index.html missing menu label {tab}"
     for path in ('/summary', '/chat', '/sessions', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/models', '/platforms', '/status', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"

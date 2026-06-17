@@ -191,3 +191,15 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - 启动期 SQLite migration 负责把历史 gateway 列 source_type/source_id 改为 platform/platform_session_id，并把 scheduled_tasks.origin_json 中的 source_type 改为 platform；业务代码不保留 source_type fallback。
 
 陷阱：把"平台能力"放进每条消息的 capability 列表，意味着任何中间层漏传一次都会让正常功能变成 fail-closed；把能力归到 platform 注册（client/lifecycle 是否注入）才是单一来源。
+
+## 模式十四：定时任务 claim lease 只保护正在执行的单次触发
+
+定时任务由 SQLiteScheduledTaskRegistry 负责原子 claim、推进 next_run_at 和记录执行；ScheduleRunService 负责执行与投递。
+
+规则：
+- claim 时设置 claim_id、lease_owner、lease_until，并立即按 cron 推进 next_run_at，避免同一触发被并发 runner 重复领取。
+- lease 只表示当前 claim 的执行保护期，不表示整个任务的冷却周期；执行完成后必须释放 lease_until，否则短周期任务会被旧 lease 阻塞。
+- record_execution_completed 仍按 claim_id/lease_owner 校验当前 claim，防止过期执行覆盖新 claim；释放 lease 不应清空 claim_id/lease_owner，因为后续 delivery result 仍需要一致性校验。
+- skipped_missed 只用于 runner 长时间未运行或任务确实错过宽限窗口；不能由正常执行留下的 lease 触发。
+
+陷阱：把 lease_seconds 当作调度间隔或执行后保留 lease，会让 */5 任务被默认 900 秒 lease 卡成 15 分钟一次，并在 missed_grace_seconds 后持续 skipped_missed。

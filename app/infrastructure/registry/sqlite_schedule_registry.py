@@ -153,9 +153,17 @@ class SQLiteScheduledTaskRegistry:
             row = conn.execute(
                 """
                 SELECT * FROM scheduled_tasks
-                WHERE id=? AND enabled=1 AND status=? AND (lease_until IS NULL OR lease_until < ?)
+                WHERE id=? AND enabled=1 AND status=? AND (
+                    lease_until IS NULL OR lease_until < ? OR EXISTS(
+                        SELECT 1 FROM scheduled_task_executions e
+                        WHERE e.task_id=scheduled_tasks.id
+                          AND e.claim_id=scheduled_tasks.claim_id
+                          AND e.lease_owner=scheduled_tasks.lease_owner
+                          AND e.status != ?
+                    )
+                )
                 """,
-                (task_id, ScheduledTaskStatus.ACTIVE.value, _iso(now)),
+                (task_id, ScheduledTaskStatus.ACTIVE.value, _iso(now), ScheduledTaskExecutionStatus.RUNNING.value),
             ).fetchone()
             if row is None:
                 conn.commit()
@@ -165,7 +173,15 @@ class SQLiteScheduledTaskRegistry:
             cursor = conn.execute(
                 """
                 UPDATE scheduled_tasks SET lease_until=?, lease_owner=?, claim_id=?, updated_at=?
-                WHERE id=? AND enabled=1 AND status=? AND (lease_until IS NULL OR lease_until < ?)
+                WHERE id=? AND enabled=1 AND status=? AND (
+                    lease_until IS NULL OR lease_until < ? OR EXISTS(
+                        SELECT 1 FROM scheduled_task_executions e
+                        WHERE e.task_id=scheduled_tasks.id
+                          AND e.claim_id=scheduled_tasks.claim_id
+                          AND e.lease_owner=scheduled_tasks.lease_owner
+                          AND e.status != ?
+                    )
+                )
                 """,
                 (
                     _iso(claim.lease_until),
@@ -175,6 +191,7 @@ class SQLiteScheduledTaskRegistry:
                     task.id,
                     ScheduledTaskStatus.ACTIVE.value,
                     _iso(now),
+                    ScheduledTaskExecutionStatus.RUNNING.value,
                 ),
             )
             conn.commit()
@@ -217,7 +234,7 @@ class SQLiteScheduledTaskRegistry:
             if cursor.rowcount:
                 conn.execute(
                     """
-                    UPDATE scheduled_tasks SET last_run_at=?, last_status=?, last_error=?, updated_at=?
+                    UPDATE scheduled_tasks SET last_run_at=?, last_status=?, last_error=?, lease_until=NULL, updated_at=?
                     WHERE id=? AND claim_id=? AND lease_owner=?
                     """,
                     (

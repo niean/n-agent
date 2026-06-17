@@ -78,6 +78,7 @@
 [20260617]
 - Issue
     - 交互：飞书消息投递失败
+    - 任务：定时任务sched-a406eae127164f3a970f63dbfab24c5d，只有第1个周期执行了，之后都是skipped_missed，且调度周期是15分钟(不是预期的5分钟)
 - FR
     - 工具：manage_schedule，agent管理工具，需要暴露到Dashboard上
     - 知识：[KF]检索支持多KB。抽象知识库SPI，支持多种KB类型，包括N-KB、Ragflow；Dashboard支持KB的增删改查
@@ -87,12 +88,10 @@
 
 
 
-
 ---
 
 [待办]
 - Issue
-    - 任务：定时任务sched-a406eae127164f3a970f63dbfab24c5d，只有第1个周期执行了，之后都是skipped_missed，且调度周期是15分钟(不是预期的5分钟)
 - NFR
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 源码：AgentCore

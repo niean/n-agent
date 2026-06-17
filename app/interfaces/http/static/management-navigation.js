@@ -10,7 +10,7 @@
     { tab: 'tools-mcp', path: '/tools/mcp', label: 'MCP', parentTab: 'tools' },
     { tab: 'tools-skill', path: '/tools/skill', label: 'Skill', parentTab: 'tools' },
     { tab: 'tools-plugin', path: '/tools/plugin', label: 'Plugin', parentTab: 'tools' },
-    { tab: 'tools-builtin', path: '/tools/builtin', label: '内置', parentTab: 'tools' },
+    { tab: 'tools-builtin', path: '/tools/builtin', label: 'Builtin', parentTab: 'tools' },
     { tab: 'models', path: '/models', label: '模型' },
     { tab: 'platforms', path: '/platforms', label: '平台' },
     { tab: 'status', path: '/status', label: '观测' },

@@ -72,7 +72,7 @@
       const allowedSources = ['builtin', 'agent'];
       const builtinTools = (tools || []).filter((tool) => allowedSources.includes(tool.source_type));
       ui.clear(list);
-      renderToolsTable(list, builtinTools, '暂无内置工具');
+      renderToolsTable(list, builtinTools, '暂无Builtin工具');
     } catch (error) {
       ui.clear(list);
       ui.renderError(list, error.message);
