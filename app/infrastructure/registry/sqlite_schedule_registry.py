@@ -497,31 +497,44 @@ def _initialize_schedule_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_scheduled_executions_task_created ON scheduled_task_executions(task_id, created_at);
         """
     )
-    _migrate_origin_json_source_type_to_platform(conn)
+    _migrate_origin_source_type_to_platform(conn)
 
 
-def _migrate_origin_json_source_type_to_platform(conn: sqlite3.Connection) -> None:
+def _migrate_origin_source_type_to_platform(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        "SELECT id, origin_json FROM scheduled_tasks WHERE origin_json LIKE '%\"source_type\"%'"
+        """
+        SELECT id, origin_json, delivery_context_json
+        FROM scheduled_tasks
+        WHERE origin_json LIKE '%"source_type"%'
+           OR delivery_context_json LIKE '%"source_type"%'
+        """
     ).fetchall()
     if not rows:
         return
     affected = 0
     for row in rows:
-        try:
-            origin = json.loads(row["origin_json"] or "{}")
-        except json.JSONDecodeError:
+        origin, origin_changed = _normalize_origin_platform(row["origin_json"])
+        delivery_context, delivery_changed = _normalize_origin_platform(row["delivery_context_json"])
+        if not origin_changed and not delivery_changed:
             continue
-        if not isinstance(origin, dict) or "source_type" not in origin:
-            continue
-        origin["platform"] = origin.pop("source_type")
         conn.execute(
-            "UPDATE scheduled_tasks SET origin_json = ? WHERE id = ?",
-            (json.dumps(origin), row["id"]),
+            "UPDATE scheduled_tasks SET origin_json = ?, delivery_context_json = ? WHERE id = ?",
+            (json.dumps(origin), json.dumps(delivery_context), row["id"]),
         )
         affected += 1
     if affected:
-        logger.info("scheduled_tasks origin_json source_type→platform migrated rows=%d", affected)
+        logger.info("scheduled_tasks origin source_type→platform migrated rows=%d", affected)
+
+
+def _normalize_origin_platform(raw_value: str) -> tuple[dict, bool]:
+    try:
+        value = json.loads(raw_value or "{}")
+    except json.JSONDecodeError:
+        return {}, False
+    if not isinstance(value, dict) or "source_type" not in value:
+        return value if isinstance(value, dict) else {}, False
+    value["platform"] = value.pop("source_type")
+    return value, True
 
 
 def _now() -> datetime:

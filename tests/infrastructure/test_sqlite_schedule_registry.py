@@ -267,7 +267,7 @@ async def test_list_executions_returns_recent_history(registry):
     assert executions[0].output == "output-2"
 
 
-def _seed_legacy_origin_row(db_path, task_id: str, origin: dict) -> None:
+def _seed_legacy_origin_row(db_path, task_id: str, origin: dict, delivery_context: dict | None = None) -> None:
     SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -275,10 +275,15 @@ def _seed_legacy_origin_row(db_path, task_id: str, origin: dict) -> None:
             INSERT INTO scheduled_tasks(id, name, prompt, cron_expression, timezone, enabled, status,
                 session_id, origin_json, delivery_target, delivery_context_json, execution_policy_json,
                 next_run_at, created_at, updated_at)
-            VALUES (?, 'n', 'p', '*/5 * * * *', 'UTC', 1, ?, 'session-1', ?, 'dashboard', '{}', '{}',
+            VALUES (?, 'n', 'p', '*/5 * * * *', 'UTC', 1, ?, 'session-1', ?, 'origin', ?, '{}',
                 '2026-06-16T00:00:00+00:00', '2026-06-16T00:00:00+00:00', '2026-06-16T00:00:00+00:00')
             """,
-            (task_id, ScheduledTaskStatus.ACTIVE.value, json.dumps(origin)),
+            (
+                task_id,
+                ScheduledTaskStatus.ACTIVE.value,
+                json.dumps(origin),
+                json.dumps(delivery_context if delivery_context is not None else origin),
+            ),
         )
 
 
@@ -294,10 +299,13 @@ def test_origin_json_source_type_migrated_to_platform(tmp_path, caplog):
         SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
 
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute("SELECT origin_json FROM scheduled_tasks WHERE id = 'task-legacy'").fetchone()
+        row = conn.execute("SELECT origin_json, delivery_context_json FROM scheduled_tasks WHERE id = 'task-legacy'").fetchone()
     origin = json.loads(row[0])
+    delivery_context = json.loads(row[1])
     assert "source_type" not in origin
     assert origin["platform"] == "feishu"
+    assert "source_type" not in delivery_context
+    assert delivery_context["platform"] == "feishu"
     assert any("source_type→platform" in record.message for record in caplog.records)
 
 
@@ -312,9 +320,11 @@ def test_origin_json_migration_skips_already_migrated_rows(tmp_path):
     SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
 
     with sqlite3.connect(db_path) as conn:
-        row = conn.execute("SELECT origin_json FROM scheduled_tasks WHERE id = 'task-modern'").fetchone()
+        row = conn.execute("SELECT origin_json, delivery_context_json FROM scheduled_tasks WHERE id = 'task-modern'").fetchone()
     origin = json.loads(row[0])
+    delivery_context = json.loads(row[1])
     assert origin == {"platform": "feishu", "receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""}
+    assert delivery_context == {"platform": "feishu", "receive_id": "oc_b", "receive_id_type": "chat_id", "thread_id": ""}
 
 
 def test_origin_json_migration_is_idempotent_with_no_legacy_rows(tmp_path, caplog):

@@ -67,6 +67,16 @@
     document.querySelectorAll('.sidebar__item--parent').forEach((p) => p.classList.remove('sidebar__item--parent-open'));
   }
 
+  function closeTopModal() {
+    const modals = Array.from(document.querySelectorAll('.modal-backdrop')).filter((modal) => !modal.hidden);
+    const modal = modals[modals.length - 1];
+    if (!modal) return false;
+    const close = modal.querySelector('.modal-close');
+    if (close) close.click();
+    else modal.remove();
+    return true;
+  }
+
   function navigateTo(name) {
     if (isParent(name)) {
       if (!document.body.classList.contains('sidebar-expanded')) return;
@@ -101,7 +111,9 @@
       });
     });
     document.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') closeAllPopouts();
+      if (event.key !== 'Escape') return;
+      if (closeTopModal()) return;
+      closeAllPopouts();
     });
     window.addEventListener('popstate', () => applyTab(selectedTabFromPath()));
     applyTab(selectedTabFromPath());

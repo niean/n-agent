@@ -165,6 +165,12 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert "'scheduled-tasks'" in nav_js
     assert "'platforms'" in nav_js
     assert 'pathByTab' in nav_js
+    assert 'closeTopModal' in nav_js
+    assert "event.key !== 'Escape'" in nav_js
+    assert "querySelectorAll('.modal-backdrop')" in nav_js
+    assert "modal.querySelector('.modal-close')" in nav_js
+    keydown_handler = nav_js[nav_js.index("event.key !== 'Escape'"):]
+    assert keydown_handler.index('closeTopModal()') < keydown_handler.index('closeAllPopouts()')
     assert nav_js.index("tab: 'models'") < nav_js.index("tab: 'platforms'") < nav_js.index("tab: 'status'")
     summary_js = client.get('/static/summary.js').text
     assert "'scheduled-tasks'" in summary_js

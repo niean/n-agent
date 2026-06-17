@@ -85,6 +85,7 @@
     - 平台：[KF]抽象平台功能，纳管当前的飞书IM，后续还要支持钉钉、微信等IM；Dashboard上，左导增加一级菜单`平台`，展示平台信息(如platform、session id、thread等) 
         - 审阅：发现严重问题，Spec spec-260617-platform-aggregate.md
     - 前端：Dashboard，左导一级菜单，平台放到模型之下、健康之上，健康改名为观测
+    - 前端：弹出框支持ESC键退出
 
 
 

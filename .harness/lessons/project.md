@@ -55,3 +55,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：把"平台是否支持主动文本外发"这种 platform-级固有能力，放进每条消息 metadata 让中间层逐跳搬运，会变成"任意一环漏传就 fail-closed"的隐式契约。正确做法是按 platform 注册（feishu_client 是否注入）作为单一来源，outbound 只按 `source_type` 路由。所有"携带语义在多层间穿梭、又只在末端校验"的字段，要么去掉中间环节、要么作为类型化值对象（不是裸 dict）保证字段不丢；裸 dict 透传 + 末端 fail-closed 是组合反模式。
 
 来源：bug fix 260617 飞书定时任务投递失败
+
+### P006: 冗余落库上下文字段必须成对迁移
+
+现象：定时任务 `sched-a406eae127164f3a970f63dbfab24c5d` 每 5 分钟执行成功，LLM 输出正常，但飞书投递全部失败，执行记录显示 `delivery_status=failed`、`delivery_error=origin missing platform`。
+
+根因：旧数据里 `origin_json.source_type` 和 `delivery_context_json.source_type` 同时存在。此前迁移只把 `origin_json.source_type` 改为 `platform`，但实际投递路径 `ScheduleOutboundDelivery.deliver` 读取的是 `delivery_target.context`，也就是 `delivery_context_json`。因此 Dashboard/任务详情看到 origin 已经有 platform，但 outbound 仍从 delivery context 读不到 platform。
+
+教训：同一业务上下文如果为了展示/执行分别冗余存两份，字段改名或 schema 迁移必须覆盖所有读取路径对应的列，并用一条回归测试同时断言展示侧字段和执行侧字段。排查时不要只看 `origin_json` 这类语义主字段，要顺着实际调用链确认运行时读的是哪一份持久化数据。
+
+来源：bug fix 260617 飞书消息投递失败 origin missing platform
