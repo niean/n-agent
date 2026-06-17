@@ -7,18 +7,31 @@ N-Agent 是一款类似 Hermes 的 Agent Runtime。业务核心是接收对话�
 
 ```text
 Agent Runtime
-├── Loop：运行状态推进、工具调用回环、结束判断
-├── AgentCore：模型调用、上下文组织、推理结果承接
-├── Memory：消息、会话、工具调用记录、运行状态和摘要
-├── Action：把模型 tool_calls 转换为受控工具执行
-├── Policy：工具权限、风险等级、执行约束和安全决策
-├── Skill：本地 SKILL.md 包扫描、元数据持久化、按需 view 渲染、宏预处理（${HERMES_SKILL_DIR}/${HERMES_SESSION_ID}）；通过 safe 工具 skills_list/skill_view 暴露给 LLM 自助使用
-├── Knowledge：KB 后端实例注册、探测、检索 SPI 和 search_knowledge 工具定义；通过 kb_id 显式路由到 N-KB/Ragflow 等协议 adapter
-├── Platform/Gateway：CLI、飞书等交互平台抽象、conversation 映射、平台 lifecycle 和 Dashboard 只读平台视图
-└── Environment：模型、存储、文件、网络等外部资源边界
+├── 核心子域
+│   ├── Loop：运行状态推进、工具调用回环、结束判断
+│   ├── AgentCore：模型调用、上下文组织、推理结果承接
+│   ├── Memory：消息、会话、工具调用记录、运行状态和摘要
+│   ├── Action：把模型 tool_calls 转换为受控工具执行
+│   └── Policy：工具权限、风险等级、执行约束和安全决策
+├── 支撑子域
+│   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
+│   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
+│   └── Platform/Gateway：CLI、飞书等交互的平台抽象、生命周期管理
+└── 通用子域
+    └── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
 ## Loop FSM
+```text
+User Message
+    ↓
+AgentCore
+    ↓
+Tool Calls?
+    ├─ Yes → Execute Tool → Observation → AgentCore
+    └─ No  → Final Answer
+```
+
 ```mermaid
 stateDiagram-v2
   [*] --> load_context
@@ -33,7 +46,86 @@ stateDiagram-v2
 ```
 库：LangGraph.Graph.StateGraph
 
+## AgentCore
+AgentCore: Single-Turn Inference Engine(单轮推理引擎)
 
+```text
+Input
+├── Runtime State
+│     ├── History
+│     ├── Current Input
+│     ├── Summary
+│     ├── Memory
+│     └── Optional Retrieved Context
+├── Runtime Capabilities
+│     └── Tool Registry
+├── Runtime Constraints
+│     └── Policies
+└── Model Configuration
+
+        ↓
+
+AgentCore
+
+        ↓
+
+Output
+├── Assistant Message
+├── Tool Calls
+├── Finish Reason
+├── Usage
+└── Reasoning Metadata
+```
+
+```text
+AgentCore
+│
+├── Context Assembly: produces Message Context
+│     ├── History
+│     ├── Current Input
+│     ├── Summary
+│     ├── Memory
+│     └── Optional Retrieved Context
+│
+├── Prompt Builder: produces System Context
+│     ├── Identity
+│     ├── Instruction
+│     ├── Safety / Policy Guidance
+│     ├── Platform Guidance
+│     └── Prompt Composition
+│
+├── Tool Assembly: produces Tool Context
+│     ├── Tool Selection
+│     ├── Authorization
+│     ├── Schema Normalization
+│     └── Tool Choice
+│
+├── Request Normalization: produces Provider-Agnostic Inference Request
+│     ├── System Context
+│     ├── Message Context
+│     ├── Tool Context
+│     └── Generation Parameters
+│
+├── Provider Adapter
+│     ├── adapts to Provider API Request
+│     ├── invokes Provider
+│     └── receives Raw Provider Response
+│
+├── Response Normalization: produces Normalized Inference Result
+│     ├── Content
+│     ├── Tool Calls
+│     ├── Finish Reason
+│     ├── Usage
+│     ├── Reasoning Metadata
+│     └── Raw Response
+│
+└── Inference Handoff: produces Agent Runtime Output
+      ├── Assistant Message
+      ├── Tool Calls
+      ├── Finish Reason
+      ├── Usage
+      └── Reasoning Metadata
+```
 
 ---
 ---
