@@ -84,15 +84,21 @@
 - FR
     - 工具：manage_schedule，agent管理工具，需要暴露到Dashboard上
     - 知识：[KF]检索支持多KB。抽象知识库SPI，支持多种KB类型，包括N-KB、Ragflow；Dashboard支持KB的增删改查
-    - 平台：[KF]抽象平台功能，纳管当前的飞书IM，后续还要支持钉钉、微信等IM；Dashboard上，左导增加一级菜单`平台`，展示平台信息(如platform、session id、thread等) 
+    - 平台：[KF]抽象平台功能，纳管飞书IM，后续还要支持钉钉、微信等IM；Dashboard上，左导增加一级菜单`平台`，展示平台信息(如platform、session id、thread等) 
         - 审阅：发现严重问题，Spec spec-260617-platform-aggregate.md
     - 前端：Dashboard，左导一级菜单，平台放到模型之下、健康之上，健康改名为观测
     - 前端：弹出框支持ESC键退出
     - 模型：[KF]支持Anthropic的API协议，按照DDD规范、做好领域抽象。参考DDD文档`## AgentCore`章节，也参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent
         - 审阅：发现严重问题，spec-260617-anthropic-provider.md
     - 对话：一轮对话、多次调用工具时，结果放到一个`工具调用调试信息`气泡中（当前是每个工具调用 一个气泡）
-    - 工具：新增内置工具web_fetch
+    - 工具：新增内置工具web_fetch => 天气查看Skill冒烟成功
 
+[20260624]
+- Issue
+    - 任务：sched-a406eae127164f3a970f63dbfab24c5d，session_missing
+        - 参考Hermes的做法：飞书Chat支持设置sethome，定时任务通知自动锁定home chat。HermesAgent源码 /Users/niean/code/github.com/niean/hermes-agent
+- NFR
+- FR
 
 
 ---
@@ -104,8 +110,7 @@
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 治理：IAM，安全护栏
 - FR
-    - 工具：Skill，自定义Skill冒烟成功
-    - 工具：Sandbox
+    - 工具：Sandbox，Pod运行时
     - 工具：Plugin
     - 工具：相比Hermes，还缺少如下功能
         不实现 plugin system。

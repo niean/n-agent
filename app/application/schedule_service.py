@@ -86,10 +86,11 @@ class ScheduleService:
         expression = ScheduleExpression(request.cron_expression)
         timezone_value = ScheduleTimezone(request.timezone)
         self._validate(expression, timezone_value, request.prompt)
-        session_id = request.session_id or f"schedule-{uuid4()}"
-        if request.session_id is None:
-            await self.session_service.create_session(session_id, source="schedule")
         target = self._delivery_target(request.delivery_target, request.origin)
+        session_id = request.session_id
+        if session_id is None or target.target_type is DeliveryTargetType.ORIGIN:
+            session_id = f"schedule-{uuid4()}"
+            await self.session_service.create_session(session_id, source="schedule")
         now = datetime.now(timezone.utc)
         task = ScheduledTask(
             id=f"sched-{uuid4().hex}",
@@ -163,6 +164,7 @@ class ScheduleService:
         return await self.registry.delete(task_id)
 
     async def run_now(self, task_id: str) -> Any:
+        await self.recover_missing_origin_sessions()
         task = await self.get(task_id)
         if task.status is ScheduledTaskStatus.PAUSED or not task.enabled:
             raise ScheduledTaskNotRunnableError("scheduled_task_paused")
@@ -184,6 +186,24 @@ class ScheduleService:
     async def handle_session_deleted(self, session_id: str) -> int:
         return await self.registry.mark_session_missing(session_id)
 
+    async def recover_missing_origin_sessions(self) -> int:
+        recovered = 0
+        for task in await self.registry.list_recoverable_origin_tasks():
+            session_id = f"schedule-{uuid4()}"
+            await self.session_service.create_session(session_id, source="schedule")
+            await self.registry.update(
+                ScheduledTask(
+                    **{
+                        **task.__dict__,
+                        "session_id": session_id,
+                        "enabled": True,
+                        "status": ScheduledTaskStatus.ACTIVE,
+                    }
+                )
+            )
+            recovered += 1
+        return recovered
+
     def _validate(self, expression: ScheduleExpression, timezone_value: ScheduleTimezone, prompt: str) -> None:
         try:
             self.calculator.validate(expression, timezone_value)
@@ -196,7 +216,7 @@ class ScheduleService:
     def _delivery_target(self, target: str, origin: dict[str, Any]) -> DeliveryTarget:
         target_type = DeliveryTargetType(target)
         if target_type is DeliveryTargetType.ORIGIN:
-            if not origin.get("receive_id") or not origin.get("receive_id_type"):
+            if origin.get("target") != "home" and (not origin.get("receive_id") or not origin.get("receive_id_type")):
                 raise ScheduleDeliveryContextError("origin delivery requires receive_id and receive_id_type")
             return DeliveryTarget.origin(origin)
         if target_type is DeliveryTargetType.SILENT:

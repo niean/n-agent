@@ -25,6 +25,8 @@
 
 `GatewaySessionLink`（`app/domain/gateway.py`）：外部 conversation 与内部 session 的映射记录，字段包括 conversation_id、session_id、display_name、created_at、updated_at、id。
 
+`GatewayHomeTarget`（`app/domain/gateway.py`）：平台级 home chat 投递目标，字段包括 platform、receive_id、receive_id_type、thread_id、display_name、updated_at。定时任务的 Feishu origin 通知可以保存 `target=home` 逻辑引用，发送时动态解析当前 home target，因此 home chat 切换后既有任务自动跟随新目标。
+
 ## Provider 与工具模型
 
 `ModelInfo`（`app/domain/provider.py`）：模型能力描述，字段包括 id、display_name、provider、supports_tools、supports_streaming。
@@ -69,7 +71,7 @@
 
 `MemoryStore`（`app/domain/memory.py`）：定义 session、message、tool_call、task_state、summary 的读写接口。Infrastructure 的 SQLiteMemoryStore 实现该端口。
 
-`GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed、list_conversations、count_conversations、get_last_active 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射、事件幂等和 PlatformService 会话统计。
+`GatewaySessionRegistry`（`app/domain/gateway.py`）：定义 get_active_session、create_session_link、set_active_session、list_session_links、delete_session_link、mark_event_processed、set_home_target、get_home_target、list_conversations、count_conversations、get_last_active 接口。Infrastructure 的 SQLiteGatewaySessionRegistry 实现该端口，用于多入口 conversation 与内部 session 的映射、平台级 home chat、事件幂等和 PlatformService 会话统计。
 
 `PlatformRegistry`（`app/domain/platform.py`）：定义 list、get、get_lifecycle 接口。Infrastructure 的 InMemoryPlatformRegistry 实现该端口，应用启动时由 main.py 基于配置与已装配 lifecycle 单例构建；Application 的 PlatformService 只依赖该端口和 GatewaySessionRegistry。
 
@@ -129,6 +131,7 @@ providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_header
 gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at)
 gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
 gateway_processed_events(id, platform, event_id, message_id, created_at)
+gateway_home_targets(platform, receive_id, receive_id_type, thread_id, display_name, updated_at)
 mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
 knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)

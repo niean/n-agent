@@ -78,6 +78,16 @@ class GatewayConversation:
 
 
 @dataclass(frozen=True)
+class GatewayHomeTarget:
+    platform: Platform
+    receive_id: str
+    receive_id_type: str
+    thread_id: str = ""
+    display_name: str = ""
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(frozen=True)
 class GatewayConfirmationRequest:
     id: str
     session_key: GatewaySessionKey
@@ -109,6 +119,12 @@ class GatewaySessionRegistry(Protocol):
         ...
 
     async def mark_event_processed(self, platform: Platform, event_id: str, message_id: str = "") -> bool:
+        ...
+
+    async def set_home_target(self, target: GatewayHomeTarget) -> GatewayHomeTarget:
+        ...
+
+    async def get_home_target(self, platform: Platform) -> GatewayHomeTarget | None:
         ...
 
     async def list_conversations(

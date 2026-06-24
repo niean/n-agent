@@ -269,7 +269,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     schedule_run_service = ScheduleRunService(
         schedule_registry,
         scheduled_agent_executor,
-        ScheduleOutboundDelivery(feishu_client),
+        ScheduleOutboundDelivery(feishu_client, gateway_registry.get_home_target),
         max_due_per_tick=settings.scheduler_max_due_per_tick,
         lease_seconds=settings.scheduler_lease_seconds,
     )
@@ -280,6 +280,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         session_service,
         schedule_run_service.run_now,
     )
+    schedule_run_service.recover_missing_origin_sessions = schedule_service.recover_missing_origin_sessions
     scheduler_runner = SchedulerRunner(schedule_run_service, settings.scheduler_tick_seconds)
 
     schedule_management_executor = ScheduleManagementToolExecutor(schedule_service)

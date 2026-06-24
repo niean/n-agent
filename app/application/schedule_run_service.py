@@ -21,22 +21,30 @@ class ScheduleRunService:
         outbound_delivery: OutboundDelivery,
         max_due_per_tick: int = 5,
         lease_seconds: int = 900,
+        recover_missing_origin_sessions=None,
     ):
         self.registry = registry
         self.executor = executor
         self.outbound_delivery = outbound_delivery
         self.max_due_per_tick = max_due_per_tick
         self.lease_seconds = lease_seconds
+        self.recover_missing_origin_sessions = recover_missing_origin_sessions
 
     async def run_now(self, task_id: str) -> dict:
+        await self._recover_missing_origin_sessions()
         claim = await self.registry.claim_task_for_run_now(task_id, datetime.now(timezone.utc), self.lease_seconds)
         if claim is None:
             return {"task_id": task_id, "status": "not_claimed"}
         return await self.run_claim(claim)
 
     async def run_due_claims(self, now: datetime | None = None) -> list[dict]:
+        await self._recover_missing_origin_sessions()
         claims = await self.registry.claim_due_tasks(now or datetime.now(timezone.utc), self.max_due_per_tick, self.lease_seconds)
         return [await self.run_claim(claim) for claim in claims]
+
+    async def _recover_missing_origin_sessions(self) -> None:
+        if self.recover_missing_origin_sessions is not None:
+            await self.recover_missing_origin_sessions()
 
     async def run_claim(self, claim: ScheduledTaskClaim) -> dict:
         started_at = datetime.now(timezone.utc)

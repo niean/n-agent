@@ -5,7 +5,7 @@ import pytest
 
 from app.application.gateway_service import GatewayService
 from app.application.chat_service import ChatCompletionResult
-from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, GatewaySessionLink, InteractionMessage
+from app.domain.gateway import GatewayConfirmationChoice, GatewayHomeTarget, GatewaySessionKey, GatewaySessionLink, InteractionMessage
 from app.domain.platform import Platform
 from app.domain.provider import ModelInfo
 from app.domain.session import ConversationSession
@@ -17,6 +17,7 @@ class FakeGatewayRegistry:
         self.active: dict[tuple[str, str, str], str] = {}
         self.links: dict[tuple[str, str, str], list[GatewaySessionLink]] = {}
         self.processed: set[tuple[str, str]] = set()
+        self.home_targets: dict[Platform, GatewayHomeTarget] = {}
 
     async def get_active_session(self, key):
         session_id = self.active.get(key.conversation_parts)
@@ -49,6 +50,13 @@ class FakeGatewayRegistry:
             return False
         self.processed.add(marker)
         return True
+
+    async def set_home_target(self, target):
+        self.home_targets[target.platform] = target
+        return target
+
+    async def get_home_target(self, platform):
+        return self.home_targets.get(platform)
 
 
 class FakeSessionService:
@@ -544,6 +552,61 @@ async def test_gateway_schedule_add_uses_origin_metadata():
     assert schedule.created[0].cron_expression == "*/5 * * * *"
     assert schedule.created[0].prompt == "summarize"
     assert schedule.created[0].origin["receive_id"] == "oc_1"
+    assert schedule.created[0].origin["platform"] == "cli"
+    assert schedule.created[0].session_id is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_sethome_switches_future_schedule_home_reference():
+    harness = Harness()
+    service = harness.service(FakeScheduleService())
+    first = message("/sethome", "event-home-1")
+    first.metadata.update({"receive_id": "oc_old", "receive_id_type": "chat_id"})
+    second = message("/sethome", "event-home-2")
+    second.metadata.update({"receive_id": "oc_new", "receive_id_type": "chat_id"})
+
+    await service.handle_message(first)
+    await service.handle_message(second)
+
+    assert harness.registry.home_targets[Platform.CLI].receive_id == "oc_new"
+
+
+@pytest.mark.asyncio
+async def test_feishu_schedule_add_uses_existing_home_reference_without_overwriting():
+    harness = Harness()
+    schedule = FakeScheduleService()
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_current", display_name="Current")
+    await harness.registry.set_home_target(GatewayHomeTarget(Platform.FEISHU, "oc_home", "chat_id"))
+    service = harness.service(schedule)
+    event = InteractionMessage(
+        id="event-schedule-home",
+        session_key=feishu_key,
+        text="/schedule add */5 * * * * summarize",
+        metadata={"receive_id": "oc_current", "receive_id_type": "chat_id"},
+    )
+
+    await service.handle_message(event)
+
+    assert schedule.created[0].origin == {"platform": "feishu", "target": "home"}
+    assert harness.registry.home_targets[Platform.FEISHU].receive_id == "oc_home"
+
+
+@pytest.mark.asyncio
+async def test_feishu_schedule_add_auto_sets_home_when_missing():
+    harness = Harness()
+    schedule = FakeScheduleService()
+    service = harness.service(schedule)
+    event = InteractionMessage(
+        id="event-schedule-auto-home",
+        session_key=GatewaySessionKey(Platform.FEISHU, "oc_auto", display_name="Auto"),
+        text="/schedule add */5 * * * * summarize",
+        metadata={"receive_id": "oc_auto", "receive_id_type": "chat_id"},
+    )
+
+    await service.handle_message(event)
+
+    assert schedule.created[0].origin == {"platform": "feishu", "target": "home"}
+    assert harness.registry.home_targets[Platform.FEISHU].receive_id == "oc_auto"
 
 
 @pytest.mark.asyncio

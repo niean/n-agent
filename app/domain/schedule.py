@@ -219,3 +219,6 @@ class ScheduledTaskRegistry(Protocol):
 
     async def mark_session_missing(self, session_id: str) -> int:
         ...
+
+    async def list_recoverable_origin_tasks(self) -> list[ScheduledTask]:
+        ...

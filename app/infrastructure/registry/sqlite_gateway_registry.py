@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from app.domain.gateway import GatewayConversation, GatewaySessionKey, GatewaySessionLink
+from app.domain.gateway import GatewayConversation, GatewayHomeTarget, GatewaySessionKey, GatewaySessionLink
 from app.domain.platform import Platform
 
 
@@ -127,6 +127,38 @@ class SQLiteGatewaySessionRegistry:
                 return False
         return True
 
+    async def set_home_target(self, target: GatewayHomeTarget) -> GatewayHomeTarget:
+        now = _now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_home_targets(platform, receive_id, receive_id_type, thread_id, display_name, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform) DO UPDATE SET
+                    receive_id=excluded.receive_id,
+                    receive_id_type=excluded.receive_id_type,
+                    thread_id=excluded.thread_id,
+                    display_name=excluded.display_name,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    target.platform.value,
+                    target.receive_id,
+                    target.receive_id_type,
+                    target.thread_id,
+                    target.display_name,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM gateway_home_targets WHERE platform = ?", (target.platform.value,)).fetchone()
+        assert row is not None
+        return _home_target_from_row(row)
+
+    async def get_home_target(self, platform: Platform) -> GatewayHomeTarget | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM gateway_home_targets WHERE platform = ?", (platform.value,)).fetchone()
+        return _home_target_from_row(row) if row is not None else None
+
     async def list_conversations(
         self, platform: Platform | None = None, limit: int = 100, offset: int = 0
     ) -> list[GatewayConversation]:
@@ -206,6 +238,14 @@ def _initialize_gateway_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             UNIQUE(platform, event_id),
             UNIQUE(platform, message_id)
+        );
+        CREATE TABLE IF NOT EXISTS gateway_home_targets (
+            platform TEXT PRIMARY KEY,
+            receive_id TEXT NOT NULL,
+            receive_id_type TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            display_name TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
         );
         """
     )
@@ -323,6 +363,17 @@ def _conversation_from_row(row: sqlite3.Row) -> GatewayConversation:
         display_name=row["display_name"],
         active_session_id=row["active_session_id"],
         created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+    )
+
+
+def _home_target_from_row(row: sqlite3.Row) -> GatewayHomeTarget:
+    return GatewayHomeTarget(
+        platform=Platform(row["platform"]),
+        receive_id=row["receive_id"],
+        receive_id_type=row["receive_id_type"],
+        thread_id=row["thread_id"],
+        display_name=row["display_name"],
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )
 

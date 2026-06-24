@@ -10,7 +10,7 @@ from app.application.schedule_service import (
     ScheduledTaskUpdateInput,
     ScheduleValidationError,
 )
-from app.domain.schedule import DeliveryTargetType, PromptSafetyResult, ScheduledTaskStatus
+from app.domain.schedule import DeliveryTarget, DeliveryTargetType, PromptSafetyResult, ScheduledTaskStatus
 
 
 class FakeRegistry:
@@ -44,6 +44,14 @@ class FakeRegistry:
 
     async def list_executions(self, task_id, limit):
         return self.executions[:limit]
+
+    async def list_recoverable_origin_tasks(self):
+        return [
+            task
+            for task in self.tasks.values()
+            if task.status is ScheduledTaskStatus.SESSION_MISSING
+            and task.delivery_target.target_type is DeliveryTargetType.ORIGIN
+        ]
 
     async def mark_session_missing(self, session_id):
         self.missing_session = session_id
@@ -173,6 +181,57 @@ async def test_schedule_service_list_executions_validates_task_and_limit():
         await service.list_executions(task.id, 51)
     with pytest.raises(ScheduledTaskNotFoundError):
         await service.list_executions("missing", 10)
+
+
+@pytest.mark.asyncio
+async def test_schedule_service_origin_task_uses_independent_schedule_session():
+    service, _, _ = _service()
+
+    task = await service.create(
+        ScheduledTaskCreateInput(
+            name="origin",
+            prompt="ok",
+            cron_expression="* * * * *",
+            delivery_target="origin",
+            origin={"receive_id": "chat-1", "receive_id_type": "chat_id"},
+            session_id="gateway-session-1",
+        )
+    )
+
+    assert task.session_id.startswith("schedule-")
+    assert service.session_service.created == [(task.session_id, "schedule")]
+
+
+@pytest.mark.asyncio
+async def test_schedule_service_recovers_missing_origin_sessions():
+    service, registry, _ = _service()
+    task = await service.create(
+        ScheduledTaskCreateInput(
+            name="origin",
+            prompt="ok",
+            cron_expression="* * * * *",
+            delivery_target="origin",
+            origin={"platform": "feishu", "target": "home"},
+        )
+    )
+    missing = type(task)(
+        **{
+            **task.__dict__,
+            "session_id": "deleted-session",
+            "enabled": False,
+            "status": ScheduledTaskStatus.SESSION_MISSING,
+        }
+    )
+    registry.tasks[task.id] = missing
+
+    recovered = await service.recover_missing_origin_sessions()
+
+    updated = registry.tasks[task.id]
+    assert recovered == 1
+    assert updated.status is ScheduledTaskStatus.ACTIVE
+    assert updated.enabled is True
+    assert updated.session_id.startswith("schedule-")
+    assert service.session_service.created[-1] == (updated.session_id, "schedule")
 
 
 @pytest.mark.asyncio

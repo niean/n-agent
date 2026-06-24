@@ -229,6 +229,11 @@ def test_scheduled_tasks_static_assets_contain_management_ui(tmp_path):
         '.textContent',
     ):
         assert expected in scheduled_js
+    row_start = scheduled_js.index('function renderTaskRow(task)')
+    row_end = scheduled_js.index('function openTaskForm(task)', row_start)
+    row_body = scheduled_js[row_start:row_end]
+    assert "badge(text(task.last_status), statusKind(task.last_status))" in row_body
+    assert 'task.last_completed_at' not in row_body
     assert 'innerHTML =' not in scheduled_js
     assert 'insertAdjacentHTML' not in scheduled_js
 

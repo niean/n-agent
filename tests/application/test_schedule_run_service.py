@@ -85,6 +85,26 @@ class FakeDelivery:
 
 
 @pytest.mark.asyncio
+async def test_run_due_claims_recovers_missing_origin_sessions_before_claiming():
+    registry = FakeRegistry(_claim())
+    recovered = []
+
+    async def recover():
+        recovered.append(True)
+
+    service = ScheduleRunService(
+        registry,
+        FakeExecutor(ScheduledAgentResult(status=ScheduledTaskExecutionStatus.SUCCEEDED, output="done")),
+        FakeDelivery(),
+        recover_missing_origin_sessions=recover,
+    )
+
+    await service.run_due_claims()
+
+    assert recovered == [True]
+
+
+@pytest.mark.asyncio
 async def test_run_now_claims_and_runs_shared_path():
     registry = FakeRegistry(_claim())
     delivery = FakeDelivery()

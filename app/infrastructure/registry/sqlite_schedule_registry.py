@@ -324,6 +324,18 @@ class SQLiteScheduledTaskRegistry:
             )
             return cursor.rowcount
 
+    async def list_recoverable_origin_tasks(self) -> list[ScheduledTask]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM scheduled_tasks
+                WHERE status = ? AND delivery_target = ?
+                ORDER BY next_run_at ASC
+                """,
+                (ScheduledTaskStatus.SESSION_MISSING.value, DeliveryTargetType.ORIGIN.value),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
     def _claim(
         self,
         task: ScheduledTask,

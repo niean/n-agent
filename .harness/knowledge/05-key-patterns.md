@@ -188,7 +188,9 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - `FeishuLongConnectionGateway` 是飞书入口适配器，同时实现 PlatformLifecycle；start() 先标记 connected，listen_events 正常返回后标记 disconnected，异常时写入 fatal("feishu_listen_error", message) 并继续抛出。
 - `ScheduleOutboundDelivery.deliver` 只判断 `platform`：feishu 则调用注入的 FeishuClient.send_text；缺失或未知 platform 返回 failed，不做 receive_id 启发式回退。
 - Gateway `_build_trusted_metadata` 必须写入 `gateway.platform` 与顶级 `platform`；Tool 落库 origin 时一并保存 platform/receive_id/receive_id_type/thread_id 四元组，跨 origin 操作统一返回 task not found。
-- 启动期 SQLite migration 负责把历史 gateway 列 source_type/source_id 改为 platform/platform_session_id，并把 scheduled_tasks.origin_json 中的 source_type 改为 platform；业务代码不保留 source_type fallback。
+- Gateway 支持平台级 home target：`/sethome` 更新 GatewaySessionRegistry 中当前 platform 的 home chat；`/schedule add` 创建 Feishu/平台 origin 任务时保存 `target=home` 逻辑引用而不是固定当前聊天会话。
+- ScheduleOutboundDelivery 在投递 Feishu origin 时如注入 home resolver，则发送前动态读取当前 home target；即使历史任务仍保存旧 receive_id，只要当前 platform 配置了 home target，通知也会切到最新 home chat。
+- origin 定时任务的执行 session 必须是 schedule-owned session，不能绑定 Gateway 当前会话；当 origin 任务因历史绑定会话删除进入 `session_missing` 时，ScheduleService 在 run_now/runner claim 前创建新的 schedule session 并恢复 ACTIVE。
 
 陷阱：把"平台能力"放进每条消息的 capability 列表，意味着任何中间层漏传一次都会让正常功能变成 fail-closed；把能力归到 platform 注册（client/lifecycle 是否注入）才是单一来源。
 

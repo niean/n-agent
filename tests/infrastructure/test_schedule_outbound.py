@@ -1,5 +1,7 @@
 import pytest
 
+from app.domain.gateway import GatewayHomeTarget
+from app.domain.platform import Platform
 from app.domain.schedule import DeliveryTarget
 from app.infrastructure.schedule.outbound import ScheduleOutboundDelivery
 
@@ -44,6 +46,53 @@ async def test_feishu_origin_delivery_sends_receive_id_type():
 
     assert result.status == "success"
     assert feishu.calls == [("ou_1", "done", "open_id")]
+
+
+@pytest.mark.asyncio
+async def test_feishu_home_delivery_resolves_current_home_target():
+    feishu = FakeFeishuClient()
+    homes = {Platform.FEISHU: GatewayHomeTarget(Platform.FEISHU, "oc_new", "chat_id")}
+
+    async def resolve_home(platform):
+        return homes.get(platform)
+
+    result = await ScheduleOutboundDelivery(feishu, resolve_home).deliver(
+        DeliveryTarget.origin({"platform": "feishu", "target": "home"}),
+        "done",
+    )
+
+    assert result.status == "success"
+    assert feishu.calls == [("oc_new", "done", "chat_id")]
+
+
+@pytest.mark.asyncio
+async def test_feishu_home_delivery_fails_without_home_target():
+    async def resolve_home(platform):
+        return None
+
+    result = await ScheduleOutboundDelivery(FakeFeishuClient(), resolve_home).deliver(
+        DeliveryTarget.origin({"platform": "feishu", "target": "home"}),
+        "done",
+    )
+
+    assert result.status == "failed"
+    assert "home" in result.error
+
+
+@pytest.mark.asyncio
+async def test_feishu_origin_delivery_uses_current_home_when_resolver_has_target():
+    feishu = FakeFeishuClient()
+
+    async def resolve_home(platform):
+        return GatewayHomeTarget(Platform.FEISHU, "oc_home", "chat_id")
+
+    result = await ScheduleOutboundDelivery(feishu, resolve_home).deliver(
+        DeliveryTarget.origin({"platform": "feishu", "receive_id": "oc_old", "receive_id_type": "chat_id"}),
+        "done",
+    )
+
+    assert result.status == "success"
+    assert feishu.calls == [("oc_home", "done", "chat_id")]
 
 
 @pytest.mark.asyncio

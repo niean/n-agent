@@ -31,7 +31,8 @@ tags:
 - 不允许在 prompt 中引用 `刚才`、`上面`、`这个任务` 等隐含上下文。
 
 ### Delivery target
-- 飞书会话内创建任务，默认 `delivery_target="origin"`，由系统自动注入飞书 receive_id 等参数。
+- 飞书会话内创建任务，默认 `delivery_target="origin"`，系统会自动注入飞书投递目标。
+- 定时任务执行时，Agent 只需要返回要通知用户的最终内容；不要要求用户提供飞书 Webhook，也不要声称缺少飞书 IM 发送工具。最终内容会由调度器自动投递到飞书 home chat 或其他已配置目标。
 
 ### 删除任务
 - 自然语言"删除任务"不会直接删除：`manage_schedule(action="remove", task_id=...)` 返回 confirmation_required，

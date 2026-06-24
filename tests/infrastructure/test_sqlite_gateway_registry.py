@@ -3,9 +3,23 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.domain.gateway import GatewaySessionKey
+from app.domain.gateway import GatewayHomeTarget, GatewaySessionKey
 from app.domain.platform import Platform
 from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
+
+
+@pytest.mark.asyncio
+async def test_gateway_registry_persists_and_switches_home_target(tmp_path):
+    registry = SQLiteGatewaySessionRegistry(tmp_path / "sessions.db")
+
+    await registry.set_home_target(GatewayHomeTarget(Platform.FEISHU, "oc_old", "chat_id", display_name="Old"))
+    await registry.set_home_target(GatewayHomeTarget(Platform.FEISHU, "oc_new", "chat_id", thread_id="thread-1", display_name="New"))
+
+    target = await registry.get_home_target(Platform.FEISHU)
+    assert target is not None
+    assert target.receive_id == "oc_new"
+    assert target.thread_id == "thread-1"
+    assert target.display_name == "New"
 
 
 @pytest.mark.asyncio

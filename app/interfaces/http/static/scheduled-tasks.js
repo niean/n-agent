@@ -194,7 +194,6 @@
 
     const lastCell = document.createElement('td');
     lastCell.appendChild(badge(text(task.last_status), statusKind(task.last_status)));
-    appendText(lastCell, 'div', formatDate(task.last_completed_at), 'muted scheduled-small');
     row.appendChild(lastCell);
 
     const actionCell = document.createElement('td');
@@ -204,7 +203,7 @@
     actions.appendChild(button('编辑', 'btn', () => openTaskForm(task)));
     actions.appendChild(button('立即运行', 'btn', () => runTask(task)));
     actions.appendChild(button(task.status === 'paused' || task.enabled === false ? '恢复' : '暂停', 'btn', () => toggleTask(task)));
-    actions.appendChild(button('删除', 'btn btn--danger', () => confirmDeleteTask(task)));
+    actions.appendChild(button('删除', 'btn', () => confirmDeleteTask(task)));
     actionCell.appendChild(actions);
     row.appendChild(actionCell);
     return row;

@@ -14,12 +14,14 @@ from app.domain.gateway import (
     GatewayConfirmationAction,
     GatewayConfirmationChoice,
     GatewayConfirmationRequest,
+    GatewayHomeTarget,
     GatewayOutboundMessage,
     GatewaySessionKey,
     GatewaySessionRegistry,
     InteractionMessage,
     InteractionResponse,
 )
+from app.domain.platform import Platform
 
 HealthProvider = Callable[[], dict[str, Any]]
 
@@ -87,7 +89,11 @@ class GatewayCommandService:
             return None
         command, _, arg = text.partition(" ")
         if command == "/help":
-            return _response(session_id, "可用命令: /help, /new, /rename <title>, /delete, /switch <session_id>, /sessions, /tools, /models, /status, /schedule help")
+            return _response(session_id, "可用命令: /help, /new, /rename <title>, /delete, /switch <session_id>, /sessions, /tools, /models, /status, /sethome, /schedule help")
+        if command == "/sethome":
+            target = _home_target_from_event(event)
+            await self.registry.set_home_target(target)
+            return _response(session_id, f"已设置 {target.platform.value} home chat: {target.receive_id}")
         if command == "/rename" and not arg.strip():
             return _response(session_id, "用法: /rename <title>")
         if command == "/switch":
@@ -159,9 +165,7 @@ class GatewayCommandService:
             if parsed is None:
                 return _response(session_id, "用法: /schedule add <cron> <prompt>")
             cron_expression, prompt = parsed
-            origin = dict(event.metadata)
-            origin["platform"] = event.session_key.platform.value
-            origin.setdefault("thread_id", event.session_key.thread_id)
+            origin = await self._schedule_origin(event)
             task = await self.schedule_service.create(
                 ScheduledTaskCreateInput(
                     name=prompt[:40] or "Scheduled Task",
@@ -169,7 +173,6 @@ class GatewayCommandService:
                     cron_expression=cron_expression,
                     delivery_target="origin",
                     origin=origin,
-                    session_id=session_id,
                 )
             )
             return _response(session_id, f"已创建任务 {task.id}")
@@ -189,6 +192,20 @@ class GatewayCommandService:
         if action == "remove" and not rest.strip():
             return _response(session_id, "用法: /schedule remove <id>")
         return _response(session_id, "未知 /schedule 命令")
+
+    async def _schedule_origin(self, event: InteractionMessage) -> dict[str, Any]:
+        if event.session_key.platform is Platform.FEISHU:
+            target = await self.registry.get_home_target(event.session_key.platform)
+            if target is None:
+                target = await self.registry.set_home_target(_home_target_from_event(event))
+            return {
+                "platform": target.platform.value,
+                "target": "home",
+            }
+        origin = dict(event.metadata)
+        origin["platform"] = event.session_key.platform.value
+        origin.setdefault("thread_id", event.session_key.thread_id)
+        return origin
 
     def _parse_destructive_command(self, text: str) -> tuple[GatewayConfirmationAction, dict[str, Any]] | None:
         command, _, arg = text.strip().partition(" ")
@@ -358,6 +375,17 @@ def _parse_schedule_add(rest: str) -> tuple[str, str] | None:
     if len(parts) < 6:
         return None
     return " ".join(parts[:5]), " ".join(parts[5:])
+
+
+def _home_target_from_event(event: InteractionMessage) -> GatewayHomeTarget:
+    md = dict(event.metadata)
+    return GatewayHomeTarget(
+        platform=event.session_key.platform,
+        receive_id=str(md.get("receive_id") or event.session_key.platform_session_id),
+        receive_id_type=str(md.get("receive_id_type") or "chat_id"),
+        thread_id=str(md.get("thread_id") or event.session_key.thread_id or ""),
+        display_name=event.session_key.display_name,
+    )
 
 
 def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:

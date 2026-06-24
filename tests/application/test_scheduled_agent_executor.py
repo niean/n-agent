@@ -1,7 +1,7 @@
 import pytest
 
 from app.application.chat_service import ChatCompletionResult
-from app.application.scheduled_agent_executor import ScheduledAgentExecutor
+from app.application.scheduled_agent_executor import SCHEDULED_EXECUTION_PROMPT, ScheduledAgentExecutor
 from app.domain.schedule import DeliveryTarget, PromptSafetyResult, ScheduledTask, ScheduledTaskExecutionStatus, ScheduleExpression, ScheduleTimezone
 from datetime import datetime, timezone
 
@@ -44,6 +44,8 @@ async def test_executor_uses_unattended_safe_only_options():
     assert result.status is ScheduledTaskExecutionStatus.SUCCEEDED
     assert chat.requests[0].options == {"execution_context_mode": "unattended", "tool_exposure_policy": "safe_only"}
     assert chat.requests[0].session_id == "session-1"
+    assert chat.requests[0].messages[0] == {"role": "system", "content": SCHEDULED_EXECUTION_PROMPT}
+    assert chat.requests[0].messages[1] == {"role": "user", "content": "summarize"}
 
 
 @pytest.mark.asyncio
