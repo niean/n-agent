@@ -7,6 +7,7 @@
     { tab: 'chat', label: '对话', desc: '发起新一轮对话或恢复会话' },
     { tab: 'scheduled-tasks', label: '任务', desc: '管理定时任务与查看最近执行结果' },
     { tab: 'sessions', label: '会话', desc: '查看历史会话与详细消息' },
+    { tab: 'tools-external-memory', label: '记忆', desc: '管理项目记忆，配置全局默认启用' },
     { tab: 'tools-knowledge', label: '知识', desc: '查看 search_knowledge 工具与 N-KB 依赖健康' },
     { tab: 'tools-mcp', label: 'MCP', desc: '管理 MCP 站点与远端工具' },
     { tab: 'tools-skill', label: 'Skill', desc: '查看 Skill 列表与启停' },
@@ -24,10 +25,10 @@
       { label: 'Provider', value: (dependencies.provider || {}).status || 'unknown' },
       { label: 'Memory', value: (dependencies.memory || {}).status || 'unknown' },
       { label: 'Knowledge', value: (dependencies.knowledge || {}).status || 'unknown' },
+      { label: '任务数', value: counts.scheduledTasks },
       { label: '会话数', value: counts.sessions },
       { label: '工具数', value: counts.tools },
       { label: '模型数', value: counts.models },
-      { label: '任务数', value: counts.scheduledTasks },
     ];
     cards.forEach((s) => {
       const card = document.createElement('div'); card.className = 'stat-card';

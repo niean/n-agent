@@ -6,6 +6,10 @@
   let currentSessionId = null;
   let isSending = false;
   let initialized = false;
+  let externalMemoryProviders = [];
+  let externalMemoryExpanded = false;
+  // 存储每个会话的外置记忆配置
+  let sessionExternalMemoryConfig = {};
 
   function appendText(parent, value) {
     parent.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -248,6 +252,8 @@
     setHeader(id);
     try {
       const detail = await api.getSessionDetail(id);
+      applySessionExternalMemoryState(detail);
+      renderExternalMemoryUI();
       renderSessionMessages(detail);
       updateInfo(detail);
       await loadSessions();
@@ -263,6 +269,8 @@
     await api.createSession(id);
     currentSessionId = id;
     setHeader(id);
+    // Chat 会话默认开启 builtin 记忆，外置记忆需用户手动勾选。
+    renderExternalMemoryUI();
     showEmptyState();
     updateInfo({});
     await loadSessions();
@@ -336,6 +344,8 @@
     if (!currentSessionId) return;
     try {
       const detail = await api.getSessionDetail(currentSessionId);
+      applySessionExternalMemoryState(detail);
+      renderExternalMemoryUI();
       renderSessionMessages(detail);
       updateInfo(detail);
       await loadSessions();
@@ -365,6 +375,9 @@
           messages: [{ role: 'user', content: text }],
           stream: true,
           metadata: { session_id: currentSessionId },
+          options: {
+            external_memory_enabled: getExternalMemoryEnabled(),
+          },
         }),
       });
       const reader = res.body.getReader();
@@ -411,6 +424,165 @@
     });
   }
 
+  function loadExternalMemoryProviders() {
+    fetch('/chat/external-memory/providers')
+      .then(res => res.json())
+      .then(data => {
+        externalMemoryProviders = data.providers || [];
+        renderExternalMemoryUI();
+      })
+      .catch(err => {
+        console.warn('Failed to load external memory providers:', err);
+      });
+  }
+
+  function toggleExternalMemory() {
+    externalMemoryExpanded = !externalMemoryExpanded;
+    renderExternalMemoryUI();
+  }
+
+  function renderExternalMemoryUI() {
+    const container = document.getElementById('chat-external-memory');
+    if (!container) return;
+    container.replaceChildren();
+
+    // 标题区域 - 可点击展开/收起
+    const header = document.createElement('div');
+    header.className = 'chat-external-memory__header';
+    header.addEventListener('click', toggleExternalMemory);
+
+    const title = document.createElement('div');
+    title.className = 'chat-external-memory__title';
+    title.textContent = '外置记忆（当前会话）';
+
+    const expandIcon = document.createElement('span');
+    expandIcon.className = 'chat-external-memory__expand-icon';
+    expandIcon.textContent = externalMemoryExpanded ? '▼' : '▲';
+
+    header.appendChild(title);
+    header.appendChild(expandIcon);
+    container.appendChild(header);
+
+    // 内容区域 - 收起时隐藏
+    const content = document.createElement('div');
+    content.className = externalMemoryExpanded
+      ? 'chat-external-memory__content'
+      : 'chat-external-memory__content chat-external-memory__content--collapsed';
+
+    const desc = document.createElement('div');
+    desc.className = 'chat-external-memory__desc';
+    const sessionConfig = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : null;
+    const locked = sessionConfig?.locked === true;
+    desc.textContent = locked
+      ? '此会话的外置记忆已锁定。切换项目记忆请新建会话'
+      : '此配置首轮发送后锁定。builtin 默认开启，项目记忆最多选择 1 个';
+
+    const checkboxes = document.createElement('div');
+    checkboxes.className = 'chat-external-memory__checkboxes';
+
+    const useSessionConfig = sessionConfig?.modified === true;
+    const enabledProviders = useSessionConfig ? sessionConfig.providers : ['builtin'];
+
+    externalMemoryProviders.forEach(p => {
+      // 过滤停用状态的外置记忆：builtin 始终显示，其他项目记忆仅在全局启用或会话已选中时显示
+      if (p.name !== 'builtin' && !p.enabled_global && !enabledProviders.includes(p.name)) {
+        return;
+      }
+
+      const div = document.createElement('label');
+      div.className = 'chat-external-memory__item';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.dataset.providerName = p.name;
+      cb.disabled = locked;
+
+      // 根据配置设置选中状态
+      if (useSessionConfig) {
+        cb.checked = enabledProviders.includes(p.name);
+      } else {
+        cb.checked = p.name === 'builtin';
+      }
+
+      div.appendChild(cb);
+      div.appendChild(document.createTextNode(' ' + p.name));
+
+      cb.addEventListener('change', () => {
+        if (!currentSessionId) return;
+        if (cb.checked && cb.dataset.providerName !== 'builtin') {
+          document.querySelectorAll('#chat-external-memory input[type="checkbox"]').forEach(checkbox => {
+            if (checkbox !== cb && checkbox.checked && checkbox.dataset.providerName !== 'builtin') {
+              checkbox.checked = false;
+            }
+          });
+        }
+        // 保存当前会话的配置
+        const checked = [];
+        document.querySelectorAll('#chat-external-memory input[type="checkbox"]').forEach(checkbox => {
+          if (checkbox.checked && checkbox.dataset.providerName) {
+            checked.push(checkbox.dataset.providerName);
+          }
+        });
+        sessionExternalMemoryConfig[currentSessionId] = {
+          providers: checked,
+          modified: true
+        };
+      });
+
+      checkboxes.appendChild(div);
+    });
+
+    content.appendChild(desc);
+    content.appendChild(checkboxes);
+
+    // 添加重置按钮
+    if (useSessionConfig && !locked) {
+      const resetBtn = document.createElement('button');
+      resetBtn.className = 'btn';
+      resetBtn.textContent = '重置为默认配置';
+      resetBtn.style.marginTop = '8px';
+      resetBtn.addEventListener('click', () => {
+        if (currentSessionId) {
+          delete sessionExternalMemoryConfig[currentSessionId];
+          renderExternalMemoryUI();
+        }
+      });
+      content.appendChild(resetBtn);
+    }
+
+    container.appendChild(content);
+  }
+
+  function getExternalMemoryEnabled() {
+    if (!currentSessionId) return ['builtin'];
+    const config = sessionExternalMemoryConfig[currentSessionId];
+    if (!config?.modified) return ['builtin'];
+    return config.providers;
+  }
+
+  function applySessionExternalMemoryState(detail) {
+    const session = detail && detail.session;
+    if (!session || !session.id) return;
+    const messageCount = Array.isArray(detail.messages) ? detail.messages.length : 0;
+    const locked = messageCount > 0;
+    if (Array.isArray(session.external_memory_enabled)) {
+      sessionExternalMemoryConfig[session.id] = {
+        providers: session.external_memory_enabled,
+        modified: true,
+        locked
+      };
+      return;
+    }
+    if (locked) {
+      sessionExternalMemoryConfig[session.id] = {
+        providers: ['builtin'],
+        modified: true,
+        locked: true
+      };
+      return;
+    }
+    delete sessionExternalMemoryConfig[session.id];
+  }
+
   function init() {
     if (initialized) return;
     initialized = true;
@@ -421,6 +593,15 @@
     if (input) input.addEventListener('keydown', handleComposerKeydown);
     if (newBtn) newBtn.addEventListener('click', newSession);
     bindDebugToggle();
+    // External memory session-level checkboxes
+    const chatComposer = document.querySelector('.chat-stack__composer');
+    const emContainer = document.createElement('div');
+    emContainer.id = 'chat-external-memory';
+    emContainer.className = 'chat-external-memory';
+    if (chatComposer) {
+      chatComposer.insertBefore(emContainer, chatComposer.firstChild);
+      loadExternalMemoryProviders();
+    }
     showEmptyState();
     updateInfo({});
     loadSessions();

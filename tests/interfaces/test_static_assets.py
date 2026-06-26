@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
+import shutil
+import subprocess
 
 from app.application.model_service import ModelService
 from app.application.session_service import SessionService
@@ -58,6 +60,7 @@ def test_all_tab_paths_return_shell(tmp_path):
     paths = (
         "/", "/summary", "/chat", "/sessions",
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
+        "/tools/external-memory",
         "/models", "/status", "/scheduled-tasks", "/platforms",
     )
     for path in paths:
@@ -72,6 +75,9 @@ def test_tools_submenu_url_routing(tmp_path):
         res = client.get(f"/tools/{sub}")
         assert res.status_code == 200, f"missing /tools/{sub}"
         assert 'id="app-sidebar"' in res.text
+    res = client.get("/tools/external-memory")
+    assert res.status_code == 200
+    assert 'id="app-sidebar"' in res.text
 
 
 def test_old_skills_path_removed(tmp_path):
@@ -99,11 +105,31 @@ def test_static_assets_served(tmp_path):
         "/static/skills.js",
         "/static/knowledge.js",
         "/static/plugin.js",
+        "/static/external-memory.js",
         "/static/favicon.svg",
     )
     for path in paths:
         response = client.get(path)
         assert response.status_code == 200, f"missing {path}"
+
+
+def test_external_memory_static_asset_is_plain_javascript(tmp_path):
+    client = _client(tmp_path)
+    body = client.get('/static/external-memory.js').text
+    assert 'namespace.externalMemory' in body
+    assert '/chat/external-memory/providers' in body
+    assert 'api.fetchJson' in body
+    assert ': string' not in body
+    assert '| null' not in body
+    node = shutil.which('node')
+    if node is not None:
+        result = subprocess.run(
+            [node, '--check', str(STATIC_DIR / 'external-memory.js')],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 def test_static_assets_contain_expected_logic(tmp_path):
@@ -310,6 +336,73 @@ def test_current_session_refresh_renders_persisted_messages(tmp_path):
     assert 'renderSessionMessages(detail)' in refresh_body
 
 
+def test_chat_builtin_memory_is_enabled_and_project_memory_is_disabled_by_default(tmp_path):
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    render_start = chat_js.index('function renderExternalMemoryUI()')
+    render_end = chat_js.index('function getExternalMemoryEnabled()', render_start)
+    render_body = chat_js[render_start:render_end]
+    getter_start = chat_js.index('function getExternalMemoryEnabled()')
+    getter_end = chat_js.index('function init()', getter_start)
+    getter_body = chat_js[getter_start:getter_end]
+
+    assert 'builtin 默认开启' in render_body
+    assert '项目记忆最多选择 1 个' in render_body
+    assert '首轮发送后锁定' in render_body
+    assert '此会话的外置记忆已锁定' in render_body
+    assert "cb.checked = p.name === 'builtin'" in render_body
+    assert 'cb.disabled = locked' in render_body
+    assert "cb.checked && cb.dataset.providerName !== 'builtin'" in render_body
+    assert "checkbox !== cb && checkbox.checked && checkbox.dataset.providerName !== 'builtin'" in render_body
+    assert 'cb.checked = p.enabled_global' not in render_body
+    assert '重置为默认配置' in render_body
+    assert "if (!config?.modified) return ['builtin']" in getter_body
+    assert 'function applySessionExternalMemoryState(detail)' in chat_js
+
+
+def test_chat_disabled_external_memory_is_not_shown_in_checkboxes(tmp_path):
+    """停用状态的外置记忆不会在会话选择界面展示。"""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    render_start = chat_js.index('function renderExternalMemoryUI()')
+    render_end = chat_js.index('function getExternalMemoryEnabled()', render_start)
+    render_body = chat_js[render_start:render_end]
+
+    # 验证过滤逻辑存在：builtin 始终显示，项目记忆仅在全局启用或会话已选中时显示
+    assert "p.name !== 'builtin' && !p.enabled_global && !enabledProviders.includes(p.name)" in render_body
+    # 验证过滤在 render 循环开始时执行（在创建 checkbox 之前）
+    for_each_idx = render_body.index('externalMemoryProviders.forEach(p => {')
+    filter_idx = render_body.index('p.name !== ' + "'builtin'")
+    create_checkbox_idx = render_body.index("const cb = document.createElement('input')")
+    assert for_each_idx < filter_idx < create_checkbox_idx
+
+
+def test_chat_external_memory_collapsed_by_default(tmp_path):
+    """外置记忆默认收起，点击展开图标后可编辑，再点击收起。"""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    css = client.get('/static/styles.css').text
+
+    # 验证状态变量存在
+    assert 'externalMemoryExpanded = false' in chat_js
+    # 验证切换函数存在
+    assert 'function toggleExternalMemory()' in chat_js
+    # 验证 header 区域和点击事件
+    assert "header.className = 'chat-external-memory__header'" in chat_js
+    assert 'header.addEventListener' in chat_js
+    # 验证展开图标：展开时 ▼，收起时 ▲
+    assert 'chat-external-memory__expand-icon' in chat_js
+    assert "externalMemoryExpanded ? '▼' : '▲'" in chat_js
+    # 验证 content 区域有收起样式
+    assert 'chat-external-memory__content--collapsed' in chat_js
+
+    # CSS 验证
+    assert '.chat-external-memory__header' in css
+    assert 'cursor: pointer' in css  # 可点击
+    assert '.chat-external-memory__content--collapsed' in css
+    assert 'max-height: 0' in css  # 收起时高度为 0
+
+
 def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
     client = _client(tmp_path)
     css = client.get('/static/styles.css').text
@@ -321,7 +414,7 @@ def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',
                  '/static/models.js', '/static/health.js', '/static/summary.js', '/static/scheduled-tasks.js',
-                 '/static/skills.js', '/static/knowledge.js', '/static/plugin.js'):
+                 '/static/skills.js', '/static/knowledge.js', '/static/plugin.js', '/static/external-memory.js'):
         body = client.get(path).text
         assert 'innerHTML =' not in body, f"{path} contains innerHTML assignment"
         assert 'insertAdjacentHTML' not in body, f"{path} uses insertAdjacentHTML"
@@ -347,17 +440,19 @@ def test_index_html_links_assets(tmp_path):
         '/static/skills.js',
         '/static/knowledge.js',
         '/static/plugin.js',
+        '/static/external-memory.js',
         '/static/favicon.svg',
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '工具', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin'):
+    for tab in ('概览', '对话', '会话', '工具', '模型', '观测', '任务', '平台', '记忆', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin'):
         assert tab in html, f"index.html missing menu label {tab}"
-    for path in ('/summary', '/chat', '/sessions', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/models', '/platforms', '/status', '/scheduled-tasks'):
+    for path in ('/summary', '/chat', '/sessions', '/tools/external-memory', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/models', '/platforms', '/status', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"
     assert html.index('href="/models"') < html.index('href="/platforms"') < html.index('href="/status"')
     assert (
-        html.index('href="/tools/knowledge"')
+        html.index('href="/tools/external-memory"')
+        < html.index('href="/tools/knowledge"')
         < html.index('href="/tools/mcp"')
         < html.index('href="/tools/skill"')
         < html.index('href="/tools/plugin"')
@@ -369,6 +464,7 @@ def test_index_html_links_assets(tmp_path):
         < html.index('id="tab-tools-skill"')
         < html.index('id="tab-tools-plugin"')
         < html.index('id="tab-tools-builtin"')
+        < html.index('id="tab-tools-external-memory"')
     )
     assert html.index('id="tab-chat"') < html.index('id="tab-scheduled-tasks"') < html.index('id="tab-sessions"')
 

@@ -1,5 +1,7 @@
+from app.application.external_memory_manager import ExternalMemoryManager
+
 DEFAULT_AGENT_IDENTITY = (
-    "You are N-Agent(Niean's Agent MVP), an intelligent, direct, and reliable AI agent. "
+    "You are N-Agent(Niean's Agent), an intelligent, direct, and reliable AI agent. "
     "You help users by understanding their goal, deciding whether to answer directly or use tools, "
     "and continuing from tool results based on facts. "
     "Communicate clearly, admit uncertainty when appropriate, and prioritize useful outcomes over verbosity."
@@ -30,13 +32,19 @@ MANAGED_TOOL_GUIDANCE = (
 )
 
 
-def build_system_prompt() -> str:
-    return "\n\n".join(
-        (
-            DEFAULT_AGENT_IDENTITY,
-            REACT_GUIDANCE,
-            KNOWLEDGE_GUIDANCE,
-            MANAGED_TOOL_GUIDANCE,
-            SAFETY_GUIDANCE,
-        )
-    )
+def build_system_prompt(
+    external_memory_manager: ExternalMemoryManager | None = None,
+    enabled_override: list[str] | None = None
+) -> str:
+    blocks = [
+        DEFAULT_AGENT_IDENTITY,
+        REACT_GUIDANCE,
+        KNOWLEDGE_GUIDANCE,
+        MANAGED_TOOL_GUIDANCE,
+        SAFETY_GUIDANCE,
+    ]
+    if external_memory_manager:
+        ext_block = external_memory_manager.build_system_prompt(enabled_override=enabled_override)
+        if ext_block:
+            blocks.append(ext_block)
+    return "\n\n".join(blocks)

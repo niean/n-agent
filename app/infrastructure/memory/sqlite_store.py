@@ -25,7 +25,8 @@ class SQLiteMemoryStore:
                     title TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    source TEXT NOT NULL
+                    source TEXT NOT NULL,
+                    external_memory_enabled_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
@@ -81,6 +82,7 @@ class SQLiteMemoryStore:
                     ON providers(is_active) WHERE is_active = 1;
                 """
             )
+            self._ensure_sessions_external_memory_column(conn)
             _initialize_gateway_schema(conn)
             _initialize_mcp_schema(conn)
 
@@ -93,10 +95,17 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO sessions(id, title, created_at, updated_at, source)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO sessions(id, title, created_at, updated_at, source, external_memory_enabled_json)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session.id, session.title, session.created_at.isoformat(), session.updated_at.isoformat(), session.source),
+                (
+                    session.id,
+                    session.title,
+                    session.created_at.isoformat(),
+                    session.updated_at.isoformat(),
+                    session.source,
+                    json.dumps(session.external_memory_enabled) if session.external_memory_enabled is not None else None,
+                ),
             )
         return session
 
@@ -105,16 +114,33 @@ class SQLiteMemoryStore:
             row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
         if row is None:
             return None
-        return ConversationSession(id=row["id"], title=row["title"], source=row["source"])
+        return self._session_from_row(row)
 
     async def list_sessions(self) -> list[ConversationSession]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM sessions ORDER BY updated_at DESC").fetchall()
-        return [ConversationSession(id=row["id"], title=row["title"], source=row["source"]) for row in rows]
+        return [self._session_from_row(row) for row in rows]
 
     async def update_session_title(self, session_id: str, title: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
+
+    async def lock_session_external_memory(self, session_id: str, enabled: list[str]) -> list[str]:
+        await self.create_session(ConversationSession(id=session_id))
+        normalized = [str(name) for name in enabled]
+        encoded = json.dumps(normalized)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT external_memory_enabled_json FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is not None and row["external_memory_enabled_json"] is not None:
+                return json.loads(row["external_memory_enabled_json"])
+            conn.execute(
+                "UPDATE sessions SET external_memory_enabled_json = ? WHERE id = ?",
+                (encoded, session_id),
+            )
+        return normalized
 
     async def append_message(self, session_id: str, message: ConversationMessage) -> ConversationMessage:
         await self.create_session(ConversationSession(id=session_id))
@@ -263,3 +289,15 @@ class SQLiteMemoryStore:
             "task_state": await self.get_task_state(session_id),
             "summary": await self.get_summary(session_id),
         }
+
+    @staticmethod
+    def _ensure_sessions_external_memory_column(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "external_memory_enabled_json" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN external_memory_enabled_json TEXT")
+
+    @staticmethod
+    def _session_from_row(row: sqlite3.Row) -> ConversationSession:
+        enabled_json = row["external_memory_enabled_json"]
+        enabled = json.loads(enabled_json) if enabled_json is not None else None
+        return ConversationSession(id=row["id"], title=row["title"], source=row["source"], external_memory_enabled=enabled)

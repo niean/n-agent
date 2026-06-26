@@ -157,7 +157,7 @@
       button('编辑', 'btn', () => openKbForm(base)),
       button(base.enabled ? '停用' : '启用', 'btn', () => toggleKb(base)),
       button('Probe', 'btn', () => probeSaved(base)),
-      button('删除', 'btn btn--danger', () => deleteKb(base)),
+      button('删除', 'btn', () => deleteKb(base)),
     );
     tr.appendChild(actions);
     return tr;

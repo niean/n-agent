@@ -34,6 +34,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    options: dict[str, Any] = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="allow")
 
@@ -63,13 +64,12 @@ def create_openai_router(chat_service: ChatCompletionService, model_service: Mod
 
     @router.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest, x_session_id: str | None = Header(default=None)):
-        options = request.model_dump(exclude={"model", "messages", "stream", "tools", "tool_choice", "metadata"}, exclude_none=True)
         app_input = ChatCompletionInput(
             model=request.model,
             messages=[message.model_dump() for message in request.messages],
             stream=request.stream,
             metadata=request.metadata,
-            options=options,
+            options=request.options,
             session_id=x_session_id,
         )
         result = await chat_service.complete(app_input)

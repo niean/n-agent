@@ -13,6 +13,7 @@
     'tools-knowledge': false,
     'tools-skill': false,
     'tools-plugin': false,
+    'tools-external-memory': false,
   };
 
   function resolveModule(tab) {
@@ -21,6 +22,7 @@
     if (tab === 'tools-skill') return namespace.skills;
     if (tab === 'tools-knowledge') return namespace.knowledge;
     if (tab === 'tools-plugin') return namespace.plugin;
+    if (tab === 'tools-external-memory') return namespace.externalMemory;
     return null;
   }
 

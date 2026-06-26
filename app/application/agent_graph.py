@@ -7,6 +7,7 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 
 from app.application.events import ChatEvent, ChatEventType
+from app.application.external_memory_manager import ExternalMemoryManager
 from app.application.prompt_builder import build_system_prompt
 from app.application.tool_service import ToolService
 from app.domain.agent import AgentState, RunStatus
@@ -14,6 +15,7 @@ from app.domain.memory import MemoryStore, Summarizer
 from app.domain.provider import LLMEventType, LLMProvider, LLMResult
 from app.domain.session import ConversationMessage, Summary, TaskState, ToolCall
 from app.domain.tool import RiskLevel, ToolCallRequest, ToolExecutionContext
+from app.utils.memory_scrubber import scrub_memory_context
 
 
 class AgentGraphRunner:
@@ -24,12 +26,14 @@ class AgentGraphRunner:
         memory_store: MemoryStore,
         summarizer: Summarizer,
         iteration_limit: int = 10,
+        external_memory_manager: ExternalMemoryManager | None = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
         self.memory_store = memory_store
         self.summarizer = summarizer
         self.iteration_limit = iteration_limit
+        self.external_memory_manager = external_memory_manager
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -60,23 +64,51 @@ class AgentGraphRunner:
         result = await self.graph.ainvoke(state, {"configurable": {"model": model, "options": state.run_options}})
         return AgentState(**result) if isinstance(result, dict) else result
 
+    def _split_content_for_streaming(self, content: str) -> list[str]:
+        """Split content into small chunks for streaming.
+        Matches existing streaming pattern used in other code paths.
+        """
+        chunks: list[str] = []
+        line_len = 0
+        current = []
+        for line in content.splitlines(keepends=True):
+            current.append(line)
+            line_len += len(line)
+            if line_len >= 20:
+                chunks.append("".join(current))
+                current = []
+                line_len = 0
+        if current:
+            chunks.append("".join(current))
+        return chunks
+
     async def stream_events(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AsyncIterator[ChatEvent]:
+        from app.utils.memory_scrubber import StreamingContextScrubber
         yield ChatEvent(ChatEventType.MESSAGE_START)
+        scrubber = StreamingContextScrubber()
         result = await self.run(state, model, options)
         if result.error:
             yield ChatEvent(ChatEventType.ERROR, error=result.error, finish_reason="error")
         elif result.final_message:
             content = str(result.final_message.get("content") or "")
             if content:
-                yield ChatEvent(ChatEventType.CONTENT_DELTA, content=content)
+                # scrub each chunk in streaming
+                for chunk in self._split_content_for_streaming(content):
+                    scrubbed = scrubber.feed(chunk)
+                    if scrubbed:
+                        yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed)
+                scrubbed_final = scrubber.flush()
+                if scrubbed_final:
+                    yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed_final)
             yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason=result.finish_reason or "stop")
         yield ChatEvent(ChatEventType.DONE)
 
     async def load_context(self, state: AgentState) -> AgentState:
         messages = await self.memory_store.list_messages(state.session_id)
         summary = await self.memory_store.get_summary(state.session_id)
+        enabled_override = state.run_options.get("external_memory_enabled")
         state.working_messages = [
-            {"role": "system", "content": build_system_prompt()},
+            {"role": "system", "content": build_system_prompt(self.external_memory_manager, enabled_override)},
             *[_message_to_provider(message) for message in messages],
             *state.input_messages,
         ]
@@ -96,8 +128,31 @@ class AgentGraphRunner:
             tools = self.tool_service.list_openai_tools(
                 RiskLevel.SAFE if options.get("tool_exposure_policy") == "safe_only" else None
             )
+
+            # ----- 新增：外置记忆动态预取注入（临时构造 api_messages，不修改 state）-----
+            if self.external_memory_manager and len(state.working_messages) > 0:
+                last_idx = len(state.working_messages) - 1
+                last_msg = state.working_messages[last_idx]
+                api_messages = state.working_messages.copy()
+                enabled_override: list[str] | None = state.run_options.get("external_memory_enabled")
+                if last_msg["role"] == "user":
+                    memory_context = self.external_memory_manager.prefetch_all(
+                        str(last_msg["content"]),
+                        session_id=state.session_id,
+                        enabled_override=enabled_override,
+                    )
+                    if memory_context:
+                        last_msg_copy = last_msg.copy()
+                        new_content = memory_context + "\n\n" + last_msg["content"]
+                        last_msg_copy["content"] = new_content
+                        api_messages[last_idx] = last_msg_copy
+                working_messages_for_call = api_messages
+            else:
+                working_messages_for_call = state.working_messages
+            # ----- 结束新增 -----
+
             result = await self.llm_provider.chat(
-                state.working_messages,
+                working_messages_for_call,
                 tools,
                 False,
                 model,
@@ -109,6 +164,16 @@ class AgentGraphRunner:
                 return state
             state.iteration_count += 1
             state.final_message = result.message
+
+            # ----- 新增：立即清理 final_message 内容，防止持久化脏数据 -----
+            # 如果模型回显 <memory-context>，这里清理后再 append 到 state.working_messages
+            # 保证 SQLite/summary 永远不会收到脏内容
+            if self.external_memory_manager and state.final_message:
+                content = state.final_message.get("content", "")
+                if isinstance(content, str):
+                    state.final_message["content"] = scrub_memory_context(content)
+            # ----- 结束新增 -----
+
             state.finish_reason = result.finish_reason
             state.pending_tool_calls = result.message.get("tool_calls") or []
             if state.pending_tool_calls:
@@ -213,6 +278,23 @@ class AgentGraphRunner:
             await self.memory_store.save_summary(Summary(session_id=state.session_id, summary=summary))
         return state
 
+    def _extract_user_content(self, input_messages: list[dict[str, Any]]) -> str:
+        """Extract concatenated user content from input_messages."""
+        contents: list[str] = []
+        for msg in input_messages:
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    contents.append(content)
+        return "\n".join(contents)
+
+    def _extract_assistant_content(self, final_message: dict[str, Any]) -> str:
+        """Extract assistant content from final_message."""
+        content = final_message.get("content", "")
+        if isinstance(content, str):
+            return content
+        return str(content)
+
     async def finalize(self, state: AgentState) -> AgentState:
         if not state.error and not state.final_message and state.iteration_count >= self.iteration_limit:
             state.error = "iteration limit reached"
@@ -220,10 +302,34 @@ class AgentGraphRunner:
         state.run_status = RunStatus.FAILED if state.error else RunStatus.COMPLETED
         if state.error and not state.final_message:
             state.final_message = {"role": "assistant", "content": _error_message_for_user(state)}
+            # error message also needs cleaning if it contains any tags
+            content = state.final_message.get("content", "")
+            if isinstance(content, str):
+                state.final_message["content"] = scrub_memory_context(content)
             await self.memory_store.append_message(
                 state.session_id,
                 ConversationMessage(role="assistant", content=state.final_message["content"]),
             )
+
+        # ----- 新增：外置记忆同步 -----
+        # call_llm 已经清理过 final_message，这里同步的是干净内容
+        if self.external_memory_manager and state.final_message:
+            user_content = self._extract_user_content(state.input_messages)
+            assistant_content = self._extract_assistant_content(state.final_message)
+            agent_context = "unattended"  # fail-closed default
+            enabled_override = None
+            tool_ctx = state.run_options.get("tool_execution_context")
+            if tool_ctx is not None and isinstance(tool_ctx, ToolExecutionContext):
+                agent_context = tool_ctx.trusted_metadata.get("agent_context", "unattended")
+                enabled_override = tool_ctx.enabled_override
+            self.external_memory_manager.sync_all(
+                user_content, assistant_content,
+                session_id=state.session_id,
+                agent_context=agent_context,
+                enabled_override=enabled_override,
+            )
+        # ----- 结束新增 -----
+
         await self.memory_store.save_task_state(
             TaskState(
                 session_id=state.session_id,

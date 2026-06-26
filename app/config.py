@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     skills_max_view_bytes: int = Field(default=131072, ge=1024)
     skills_max_count: int = Field(default=200, ge=1, le=2000)
 
+    # 外置记忆配置
+    external_memory_provider: str | None = None
+    external_memory_enabled_providers: list[str] | None = None
+    external_memory_path: str = "./locals/external-memory"
+    external_memory_memory_limit: int = 4000
+    external_memory_user_limit: int = 2000
+    # project_root 复用 workspace_root，不需要新增配置
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @field_validator("sqlite_path", "workspace_root", "skills_root", mode="before")

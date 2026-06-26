@@ -68,6 +68,9 @@ DependencySnapshot = dict
 HealthProvider = Callable[[], DependencySnapshot]
 
 
+from app.application.external_memory_service import ExternalMemoryService
+
+
 def create_dashboard_router(
     session_service: SessionService,
     tool_service: ToolService,
@@ -78,6 +81,7 @@ def create_dashboard_router(
     schedule_service: ScheduleService | None = None,
     skill_service: SkillService | None = None,
     knowledge_service: KnowledgeService | None = None,
+    external_memory_service: ExternalMemoryService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -91,6 +95,7 @@ def create_dashboard_router(
     @router.get("/tools/mcp", response_class=HTMLResponse)
     @router.get("/tools/skill", response_class=HTMLResponse)
     @router.get("/tools/plugin", response_class=HTMLResponse)
+    @router.get("/tools/external-memory", response_class=HTMLResponse)
     @router.get("/models", response_class=HTMLResponse)
     @router.get("/status", response_class=HTMLResponse)
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
@@ -168,6 +173,168 @@ def create_dashboard_router(
         _register_skill_routes(router, skill_service)
     if knowledge_service is not None:
         _register_knowledge_routes(router, knowledge_service, tool_service)
+
+    if external_memory_service is not None:
+        @router.get("/chat/external-memory/providers")
+        async def list_providers():
+            return {"providers": external_memory_service.list_providers()}
+
+        @router.post("/chat/external-memory/set-enabled")
+        async def set_enabled(payload: dict = Body(...)):
+            enabled = payload.get("enabled", [])
+            if not isinstance(enabled, list):
+                return JSONResponse(
+                    status_code=422,
+                    content={"error": {"code": "invalid_input", "message": "enabled must be a list"}},
+                )
+            external_memory_service.save_global_enabled([str(n) for n in enabled])
+            return {"status": "ok"}
+
+        @router.post("/chat/external-memory/projects/create")
+        async def create_project(payload: dict = Body(...)):
+            name = payload.get("name", "")
+            if not isinstance(name, str) or not name:
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "name is required"},
+                )
+            # Validate name pattern
+            import re
+            if not re.match(r'^[A-Za-z0-9_-]+$', name):
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "name can only contain letters, numbers, hyphens and underscores"},
+                )
+            ok = external_memory_service.create_project(name)
+            if ok:
+                return {"success": True}
+            else:
+                return JSONResponse(
+                    status_code=409,
+                    content={"success": False, "error": "project already exists or cannot create directory"},
+                )
+
+        @router.post("/chat/external-memory/projects/delete")
+        async def delete_project(payload: dict = Body(...)):
+            name = payload.get("name", "")
+            if not isinstance(name, str) or not name:
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "name is required"},
+                )
+            ok = external_memory_service.delete_project(name)
+            if ok:
+                return {"success": True}
+            else:
+                return JSONResponse(
+                    status_code=404,
+                    content={"success": False, "error": "project does not exist or cannot delete"},
+                )
+
+        @router.get("/chat/external-memory/projects/{project_name}/memory")
+        async def get_external_memory(project_name: str, target: str = "memory"):
+            if target not in ["memory", "user"]:
+                return JSONResponse(
+                    status_code=422,
+                    content={"error": {"code": "invalid_target", "message": "target must be memory or user"}},
+                )
+            content = external_memory_service.get_external_memory(project_name, target)
+            return {"project": project_name, "target": target, "content": content}
+
+        @router.get("/chat/external-memory/projects/{project_name}/entries")
+        async def list_project_entries(project_name: str, target: str = "memory"):
+            if target not in ["memory", "user"]:
+                return JSONResponse(
+                    status_code=422,
+                    content={"error": {"code": "invalid_target", "message": "target must be memory or user"}},
+                )
+            entries = external_memory_service.list_project_entries(project_name, target)
+            return {"project": project_name, "target": target, "entries": entries}
+
+        @router.put("/chat/external-memory/projects/{project_name}/memory")
+        async def save_external_memory(project_name: str, payload: dict = Body(...)):
+            content = payload.get("content", "")
+            target = payload.get("target", "memory")
+            if target not in ["memory", "user"]:
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "target must be memory or user"},
+                )
+            if not isinstance(content, str):
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "content must be a string"},
+                )
+            ok = external_memory_service.save_external_memory(project_name, content, target)
+            if ok:
+                return {"success": True}
+            else:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "error": "failed to save external memory"},
+                )
+
+        @router.post("/chat/external-memory/projects/{project_name}/entries")
+        async def add_project_entry(project_name: str, payload: dict = Body(...)):
+            content = payload.get("content", "")
+            target = payload.get("target", "memory")
+            if target not in ["memory", "user"]:
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "target must be memory or user"},
+                )
+            if not isinstance(content, str) or not content.strip():
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "content is required"},
+                )
+            ok = external_memory_service.add_project_entry(project_name, content.strip(), target)
+            if ok:
+                return {"success": True}
+            else:
+                return JSONResponse(
+                    status_code=400,
+                    content={"success": False, "error": "failed to add entry"},
+                )
+
+        @router.patch("/chat/external-memory/projects/{project_name}/entries/{entry_index}")
+        async def update_project_entry(project_name: str, entry_index: int, payload: dict = Body(...)):
+            content = payload.get("content", "")
+            target = payload.get("target", "memory")
+            if target not in ["memory", "user"]:
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "target must be memory or user"},
+                )
+            if not isinstance(content, str) or not content.strip():
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "content is required"},
+                )
+            ok = external_memory_service.update_project_entry(project_name, entry_index, content.strip(), target)
+            if ok:
+                return {"success": True}
+            else:
+                return JSONResponse(
+                    status_code=404,
+                    content={"success": False, "error": "entry not found or failed to update"},
+                )
+
+        @router.delete("/chat/external-memory/projects/{project_name}/entries/{entry_index}")
+        async def delete_project_entry(project_name: str, entry_index: int, target: str = "memory"):
+            if target not in ["memory", "user"]:
+                return JSONResponse(
+                    status_code=422,
+                    content={"success": False, "error": "target must be memory or user"},
+                )
+            ok = external_memory_service.delete_project_entry(project_name, entry_index, target)
+            if ok:
+                return {"success": True}
+            else:
+                return JSONResponse(
+                    status_code=404,
+                    content={"success": False, "error": "entry not found or failed to delete"},
+                )
 
     return router
 
@@ -753,7 +920,12 @@ def _schedule_error_response(exc: Exception) -> JSONResponse:
 
 
 def _session_to_dict(session: ConversationSession) -> dict:
-    return {"id": session.id, "title": session.title, "source": session.source}
+    return {
+        "id": session.id,
+        "title": session.title,
+        "source": session.source,
+        "external_memory_enabled": session.external_memory_enabled,
+    }
 
 
 def _message_to_dict(message: ConversationMessage) -> dict:

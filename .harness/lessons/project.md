@@ -65,3 +65,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：同一业务上下文如果为了展示/执行分别冗余存两份，字段改名或 schema 迁移必须覆盖所有读取路径对应的列，并用一条回归测试同时断言展示侧字段和执行侧字段。排查时不要只看 `origin_json` 这类语义主字段，要顺着实际调用链确认运行时读的是哪一份持久化数据。
 
 来源：bug fix 260617 飞书消息投递失败 origin missing platform
+
+### P007: Docker Desktop published port 卡死要区分容器内健康与宿主端口健康
+
+现象：执行 `docker/restart.sh` 后，容器内访问 `http://127.0.0.1:8201/health` 返回 200，但宿主 `curl http://nagent.localhost/health` 长时间卡住，最终 nginx 返回 504。
+
+根因：`nagent.localhost` 先进入宿主 nginx，再反代到 Docker published port `127.0.0.1:8201`。Docker Desktop 的 port proxy 在 `docker compose up --force-recreate` 后偶发进入半坏状态：TCP 可建连，但请求没有被正确转发/回写；此时应用和容器网络都正常，重启 service 会刷新 port proxy。
+
+教训：本地 Compose 重启脚本必须分别检查容器内 health、宿主端口 health 和 public nginx health，并给所有 curl 设置硬超时。若容器内 health 通过但宿主端口无响应，应自动 `docker compose restart <service>` 刷新 Docker Desktop port proxy，而不是继续等待 nginx 504 或误判为应用启动慢。
+
+来源：bug fix 260626 restart 后 nagent.localhost health 偶发卡死

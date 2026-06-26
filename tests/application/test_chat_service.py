@@ -7,6 +7,7 @@ from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.agent import AgentState
 from app.domain.provider import LLMResult, ModelInfo
+from app.domain.session import ConversationMessage, ConversationSession
 from app.domain.tool import ToolExecutionContext
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
@@ -32,9 +33,11 @@ class ErrorProvider(FakeProvider):
 class RecordingRunner:
     def __init__(self):
         self.options = None
+        self.calls = []
 
     async def run(self, state, model, options=None):
         self.options = dict(options or {})
+        self.calls.append({"state": state, "model": model, "options": self.options})
         state.final_message = {"role": "assistant", "content": "ok"}
         state.finish_reason = "stop"
         return state
@@ -205,6 +208,63 @@ async def test_chat_service_binds_session_id(tmp_path):
     assert result.session_id == "my-session"
     messages = await store.list_messages("my-session")
     assert len(messages) >= 1
+
+
+@pytest.mark.asyncio
+async def test_chat_service_locks_external_memory_on_first_turn(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="s-memory",
+            options={"external_memory_enabled": ["builtin", "project_memory_1"]},
+        )
+    )
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "switch"}],
+            stream=False,
+            session_id="s-memory",
+            options={"external_memory_enabled": ["builtin", "project_memory_2"]},
+        )
+    )
+
+    session = await store.get_session("s-memory")
+    assert session is not None
+    assert session.external_memory_enabled == ["builtin", "project_memory_1"]
+    assert runner.calls[0]["options"]["external_memory_enabled"] == ["builtin", "project_memory_1"]
+    assert runner.calls[1]["options"]["external_memory_enabled"] == ["builtin", "project_memory_1"]
+    assert runner.calls[1]["options"]["tool_execution_context"].enabled_override == ["builtin", "project_memory_1"]
+
+
+@pytest.mark.asyncio
+async def test_chat_service_locks_legacy_session_to_builtin(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-legacy"))
+    await store.append_message("s-legacy", ConversationMessage(role="user", content="old"))
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "new"}],
+            stream=False,
+            session_id="s-legacy",
+            options={"external_memory_enabled": ["builtin", "project_memory_1"]},
+        )
+    )
+
+    session = await store.get_session("s-legacy")
+    assert session is not None
+    assert session.external_memory_enabled == ["builtin"]
+    assert runner.options["external_memory_enabled"] == ["builtin"]
 
 
 class StubTitleGenerator:

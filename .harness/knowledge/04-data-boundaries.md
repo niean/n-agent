@@ -9,7 +9,7 @@
 
 `AgentRun`（`app/domain/agent.py`）：一次 Agent 运行的领域对象，包含 session_id、input_messages、id、status、iteration_count、error、end_reason。
 
-`ConversationSession`（`app/domain/session.py`）：会话聚合根，字段包括 id、title、source、created_at、updated_at。
+`ConversationSession`（`app/domain/session.py`）：会话聚合根，字段包括 id、title、source、external_memory_enabled、created_at、updated_at。external_memory_enabled 是会话级外部记忆 profile 锁定值，首轮消息前可由 Chat/Dashboard 选择，首轮后不可变；未锁定的新会话为 null，发送首轮时写入规范化列表。
 
 `ConversationMessage`（`app/domain/session.py`）：会话消息值对象，字段包括 id、role、content、tool_call_id、name、created_at。role 支持 user、assistant、tool 等 Provider 消息角色。
 
@@ -122,7 +122,7 @@ Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPO
 SQLite store 位于 `app/infrastructure/memory/sqlite_store.py`，初始化以下表：
 
 ```sql
-sessions(id, title, created_at, updated_at, source)
+sessions(id, title, created_at, updated_at, source, external_memory_enabled_json)
 messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name)
 tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at)
 task_states(session_id, status, iteration_count, last_error, updated_at)
@@ -154,6 +154,7 @@ idx_tool_calls_session_created_at ON tool_calls(session_id, created_at)
 
 JSON 边界：
 
+- `sessions.external_memory_enabled_json` 存储会话级外部记忆 profile 的 JSON 数组；null 表示尚未锁定，非 null 表示该 Chat Session 后续所有轮次必须使用同一 profile
 - `messages.content_json` 存储消息内容
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果
@@ -182,6 +183,8 @@ Interfaces 层请求模型位于 `app/interfaces/http/openai.py`，仅作为外�
 3. 自动创建 `tmp-{uuid}` 临时持久化 session
 
 Dashboard 使用 `metadata.session_id` 绑定会话。
+
+Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息时锁定：请求未提供时默认 `["builtin"]`；提供列表时会去重，并至多保留一个非 builtin 项目记忆。已有历史消息但缺少锁定值的 legacy session 首次触达时锁定到 `["builtin"]`，避免升级后出现中途切换项目记忆。后续轮次即使客户端继续传入不同的 `external_memory_enabled`，Application 也必须使用 sessions 表里的锁定值。
 
 ## Docker Compose 数据边界
 

@@ -32,6 +32,9 @@ async def test_sqlite_store_initializes_schema_and_indexes(tmp_path):
     assert "idx_messages_session_created_at" in indexes
     assert "idx_tool_calls_session_created_at" in indexes
 
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+    assert "external_memory_enabled_json" in columns
+
 
 @pytest.mark.asyncio
 async def test_sqlite_store_persists_session_context(tmp_path):
@@ -58,6 +61,20 @@ async def test_sqlite_store_persists_session_context(tmp_path):
     assert context["tool_calls"][0].id == tool_call.id
     assert context["task_state"].status == task_state.status
     assert context["summary"].summary == summary.summary
+
+
+@pytest.mark.asyncio
+async def test_sqlite_store_locks_session_external_memory_once(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+
+    first = await store.lock_session_external_memory("s-memory", ["builtin", "project_memory_1"])
+    second = await store.lock_session_external_memory("s-memory", ["builtin", "project_memory_2"])
+    session = await store.get_session("s-memory")
+
+    assert first == ["builtin", "project_memory_1"]
+    assert second == ["builtin", "project_memory_1"]
+    assert session is not None
+    assert session.external_memory_enabled == ["builtin", "project_memory_1"]
 
 
 @pytest.mark.asyncio

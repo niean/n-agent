@@ -12,6 +12,8 @@ def test_docker_compose_config():
 
     assert "n-agent:" in compose
     assert '"8201:8201"' in compose
+    assert "healthcheck:" in compose
+    assert "http://127.0.0.1:8201/health" in compose
     assert "network_mode: host" not in compose
     assert "build:" in compose
     assert "context: .." in compose

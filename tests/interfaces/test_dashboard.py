@@ -170,6 +170,7 @@ def test_chat_page_and_apis(tmp_path):
 
     async def seed():
         await store.create_session(ConversationSession(id="s1", title="S1"))
+        await store.lock_session_external_memory("s1", ["builtin", "project_memory_1"])
         await store.append_message("s1", ConversationMessage(role="user", content="hello"))
         await store.append_message(
             "s1",
@@ -205,6 +206,7 @@ def test_chat_page_and_apis(tmp_path):
     assert "/static/app.js" in html.text
     assert sessions.json()[0]["id"] == "s1"
     detail_body = detail.json()
+    assert detail_body["session"]["external_memory_enabled"] == ["builtin", "project_memory_1"]
     assert detail_body["summary"]["summary"] == "summary"
     assistant = next(message for message in detail_body["messages"] if message["role"] == "assistant")
     assert assistant["content"] == ""

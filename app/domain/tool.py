@@ -62,6 +62,7 @@ class ToolExecutionContext:
     trusted_metadata: dict[str, Any] = field(default_factory=dict)
     execution_context_mode: str = "realtime"
     permitted_managed_tools: set[str] = field(default_factory=set)
+    enabled_override: list[str] | None = None
 
 
 @dataclass(frozen=True)

@@ -97,7 +97,7 @@ def _provider_options(options: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in options.items()
-        if key not in {"tool_execution_context", "tool_exposure_policy", "execution_context_mode"}
+        if key not in {"tool_execution_context", "tool_exposure_policy", "execution_context_mode", "external_memory_enabled"}
     }
 
 

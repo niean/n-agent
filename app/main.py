@@ -54,6 +54,12 @@ from app.infrastructure.skill.seed_runner import seed_default_skills
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
+from app.domain.external_memory import ExternalMemoryConfigRegistry
+from app.application.external_memory_manager import ExternalMemoryManager
+from app.application.external_memory_service import ExternalMemoryService
+from app.application.external_memory_tool_executor import ExternalMemoryToolExecutor
+from app.infrastructure.memory.builtin_project import BuiltinProjectMemory
+from app.infrastructure.registry.sqlite_external_memory_config import SQLiteExternalMemoryConfig
 from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 from app.interfaces.http.openai import create_openai_router
@@ -159,6 +165,7 @@ class ApplicationServices:
     scheduler_runner: SchedulerRunner
     skill_service: SkillService
     knowledge_service: KnowledgeService
+    external_memory_service: ExternalMemoryService | None
     feishu_long_connection_gateway: FeishuLongConnectionGateway | None
     platform_registry: PlatformRegistry
     platform_service: PlatformService
@@ -228,6 +235,47 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         routes[definition.name] = skill_executor
     tool_service.set_dynamic_definitions("skill", skill_tool_definitions())
 
+    # External memory setup
+    external_memory_manager = ExternalMemoryManager()
+    # Keep original builtin for backward compatibility
+    builtin_project_memory = BuiltinProjectMemory(
+        project_root=settings.workspace_root,
+        memory_path=settings.external_memory_path,
+        memory_char_limit=settings.external_memory_memory_limit,
+        user_char_limit=settings.external_memory_user_limit,
+    )
+    builtin_project_memory.initialize(session_id="", project_root=str(settings.workspace_root))
+    external_memory_manager.add_provider(builtin_project_memory)
+    # Multi-external-memory supports multiple independent external memory sets
+    from app.infrastructure.memory.multi_project import MultiProjectMemory
+    multi_project_memory = MultiProjectMemory(
+        project_root=settings.workspace_root,
+        memory_base_path=settings.external_memory_path,
+        memory_char_limit=settings.external_memory_memory_limit,
+        user_char_limit=settings.external_memory_user_limit,
+    )
+    multi_project_memory.initialize(session_id="")
+    external_memory_manager.add_provider(multi_project_memory)
+
+    tool_service.set_dynamic_definitions(
+        "external_memory",
+        external_memory_manager.get_tool_definitions(),
+    )
+    memory_executor = ExternalMemoryToolExecutor(external_memory_manager)
+    for tool_def in external_memory_manager.get_tool_definitions():
+        routes[tool_def.name] = memory_executor
+
+    # External memory global config
+    external_memory_config: ExternalMemoryConfigRegistry = SQLiteExternalMemoryConfig(settings.sqlite_path)
+    external_memory_config.create_tables()
+    external_memory_base_dir = settings.workspace_root / settings.external_memory_path
+    external_memory_service = ExternalMemoryService(
+        external_memory_manager=external_memory_manager,
+        config_registry=external_memory_config,
+        settings_default=settings.external_memory_enabled_providers,
+        base_dir=external_memory_base_dir,
+    )
+
     tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
     try:
         _run_sync(mcp_service.refresh_registered_tool_surface())
@@ -242,6 +290,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         memory_store,
         summarizer,
         settings.agent_iteration_limit,
+        external_memory_manager=external_memory_manager,
     )
     session_service = SessionService(
         memory_store,
@@ -370,6 +419,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         scheduler_runner=scheduler_runner,
         skill_service=skill_service,
         knowledge_service=knowledge_service,
+        external_memory_service=external_memory_service,
         feishu_long_connection_gateway=feishu_long_connection_gateway,
         platform_registry=platform_registry,
         platform_service=platform_service,
@@ -429,6 +479,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             schedule_service=services.schedule_service,
             skill_service=services.skill_service,
             knowledge_service=services.knowledge_service,
+            external_memory_service=services.external_memory_service,
         )
     )
     return app

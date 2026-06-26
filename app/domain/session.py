@@ -58,6 +58,7 @@ class ConversationSession:
     id: str
     title: str = DEFAULT_SESSION_TITLE
     source: str = "api"
+    external_memory_enabled: list[str] | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 

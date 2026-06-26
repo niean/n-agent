@@ -48,6 +48,14 @@ class ChatCompletionService:
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
         session_id = request.session_id or request.metadata.get("session_id") or f"tmp-{uuid4()}"
         await self.memory_store.create_session(ConversationSession(id=session_id, source="api"))
+        session = await self.memory_store.get_session(session_id)
+        existing_messages = await self.memory_store.list_messages(session_id)
+        requested_memory = self._normalize_external_memory_enabled(request.options.get("external_memory_enabled"))
+        if session is not None and session.external_memory_enabled is not None:
+            locked_external_memory = session.external_memory_enabled
+        else:
+            initial_memory = ["builtin"] if existing_messages else requested_memory
+            locked_external_memory = await self.memory_store.lock_session_external_memory(session_id, initial_memory)
         first_user_message = next(
             (message.get("content", "") for message in request.messages if message.get("role") == "user"),
             "",
@@ -61,9 +69,20 @@ class ChatCompletionService:
         await self.session_service.ensure_title(session_id, str(first_user_message))
         state = AgentState(session_id=session_id, input_messages=request.messages)
         options = dict(request.options)
+        options["external_memory_enabled"] = locked_external_memory
         mode = options.get("execution_context_mode") or "realtime"
         if mode == "unattended":
             options["tool_exposure_policy"] = "safe_only"
+
+        # If caller didn't set agent_context, derive from execution_context_mode
+        if "agent_context" not in request.trusted_metadata:
+            if mode == "realtime":
+                # Interactive realtime conversation -> primary allows writes
+                request.trusted_metadata["agent_context"] = "primary"
+            else:
+                # unattended/cron/subagent -> non-primary prohibits writes
+                request.trusted_metadata["agent_context"] = "unattended"
+
         mcp_ctx = _mcp_tool_execution_context(str(first_user_message)) if mode == "realtime" else ToolExecutionContext()
         permitted = self._compute_permitted_managed_tools(mode, request.trusted_metadata)
         ctx = ToolExecutionContext(
@@ -73,6 +92,7 @@ class ChatCompletionService:
             trusted_metadata=dict(request.trusted_metadata),
             execution_context_mode=mode,
             permitted_managed_tools=permitted,
+            enabled_override=locked_external_memory,
         )
         options["tool_execution_context"] = ctx
         if request.stream:
@@ -100,6 +120,24 @@ class ChatCompletionService:
         if gateway_platform in ("feishu",):
             return {"manage_schedule"}
         return set()
+
+    @staticmethod
+    def _normalize_external_memory_enabled(value: Any) -> list[str]:
+        if value is None:
+            return ["builtin"]
+        if not isinstance(value, list):
+            return ["builtin"]
+        names: list[str] = []
+        for item in value:
+            name = str(item).strip()
+            if name and name not in names:
+                names.append(name)
+        projects = [name for name in names if name != "builtin"][:1]
+        enabled: list[str] = []
+        if "builtin" in names:
+            enabled.append("builtin")
+        enabled.extend(projects)
+        return enabled
 
 
 def _mcp_tool_execution_context(user_message: str) -> ToolExecutionContext:

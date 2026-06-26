@@ -15,6 +15,12 @@ services:
       N_AGENT_AGENT_ITERATION_LIMIT: 5
     ports:
       - "8201:8201"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8201/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     volumes:
       - ~/app/locals:/app/locals
       - ~/workspace:/workspace
