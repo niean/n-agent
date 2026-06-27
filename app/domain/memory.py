@@ -18,7 +18,9 @@ class MemoryStore(Protocol):
     async def update_session_title(self, session_id: str, title: str) -> None:
         ...
 
-    async def lock_session_external_memory(self, session_id: str, enabled: list[str]) -> list[str]:
+    async def lock_session_external_memory(
+        self, session_id: str, enabled: list[str], slots: dict[str, str] | None = None,
+    ) -> list[str]:
         ...
 
     async def delete_session(self, session_id: str) -> bool:

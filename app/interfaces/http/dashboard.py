@@ -68,7 +68,15 @@ DependencySnapshot = dict
 HealthProvider = Callable[[], DependencySnapshot]
 
 
+from app.application.external_memory_provider_service import ExternalMemoryProviderService
 from app.application.external_memory_service import ExternalMemoryService
+from app.domain.external_memory_provider import (
+    DuplicateExternalMemoryProviderError,
+    ExternalMemoryProviderConfig,
+    ExternalMemoryProviderNotFoundError,
+    ExternalMemoryProviderType,
+    ExternalMemoryProviderValidationError,
+)
 
 
 def create_dashboard_router(
@@ -82,6 +90,7 @@ def create_dashboard_router(
     skill_service: SkillService | None = None,
     knowledge_service: KnowledgeService | None = None,
     external_memory_service: ExternalMemoryService | None = None,
+    external_memory_provider_service: ExternalMemoryProviderService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -175,9 +184,17 @@ def create_dashboard_router(
         _register_knowledge_routes(router, knowledge_service, tool_service)
 
     if external_memory_service is not None:
-        @router.get("/chat/external-memory/providers")
-        async def list_providers():
+        @router.get("/chat/external-memory/memory-providers")
+        async def list_memory_providers():
             return {"providers": external_memory_service.list_providers()}
+
+        # Only register the legacy /chat/external-memory/providers list route
+        # when the new ExternalMemoryProviderService is not wired; otherwise the
+        # new provider CRUD routes own this path.
+        if external_memory_provider_service is None:
+            @router.get("/chat/external-memory/providers")
+            async def list_providers():
+                return {"providers": external_memory_service.list_providers()}
 
         @router.post("/chat/external-memory/set-enabled")
         async def set_enabled(payload: dict = Body(...)):
@@ -336,6 +353,9 @@ def create_dashboard_router(
                     content={"success": False, "error": "entry not found or failed to delete"},
                 )
 
+    if external_memory_provider_service is not None:
+        _register_external_memory_provider_routes(router, external_memory_provider_service)
+
     return router
 
 
@@ -407,6 +427,129 @@ def _provider_to_dict(cfg: ProviderConfig) -> dict:
         "created_at": cfg.created_at.isoformat(),
         "updated_at": cfg.updated_at.isoformat(),
     }
+
+
+def _external_provider_to_dict(cfg: ExternalMemoryProviderConfig) -> dict:
+    """Serialize an ExternalMemoryProviderConfig. Never expose api_key plaintext."""
+    return {
+        "id": cfg.id,
+        "name": cfg.name,
+        "provider_type": cfg.provider_type.value,
+        "base_url": cfg.base_url,
+        "api_key_present": cfg.api_key_present,
+        "enabled": cfg.enabled,
+        "extra_config": cfg.extra_config,
+        "probe_status": cfg.probe_status.value if cfg.probe_status else None,
+        "last_probe_error": cfg.last_probe_error,
+        "last_probed_at": cfg.last_probed_at.isoformat() if cfg.last_probed_at else None,
+        "created_at": cfg.created_at,
+        "updated_at": cfg.updated_at,
+    }
+
+
+def _external_provider_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, ExternalMemoryProviderNotFoundError):
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "provider_not_found", "message": str(exc)}},
+        )
+    if isinstance(exc, DuplicateExternalMemoryProviderError):
+        return JSONResponse(
+            status_code=409,
+            content={"error": {"code": "provider_duplicate", "message": str(exc)}},
+        )
+    if isinstance(exc, ExternalMemoryProviderValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "provider_invalid", "message": str(exc)}},
+        )
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "provider_invalid", "message": str(exc)}},
+    )
+
+
+def _register_external_memory_provider_routes(
+    router: APIRouter, service: ExternalMemoryProviderService,
+) -> None:
+    @router.get("/chat/external-memory/providers")
+    async def list_external_providers():
+        return {"providers": [_external_provider_to_dict(cfg) for cfg in service.list()]}
+
+    @router.get("/chat/external-memory/providers/{provider_id}")
+    async def get_external_provider(provider_id: str):
+        try:
+            cfg = service.get(provider_id)
+        except ExternalMemoryProviderNotFoundError as exc:
+            return _external_provider_error_response(exc)
+        return _external_provider_to_dict(cfg)
+
+    @router.post("/chat/external-memory/providers")
+    async def create_external_provider(payload: dict = Body(...)):
+        try:
+            provider_type = ExternalMemoryProviderType(payload["provider_type"])
+            cfg = service.create(
+                name=payload["name"],
+                provider_type=provider_type,
+                base_url=payload.get("base_url", ""),
+                api_key=payload.get("api_key"),
+                extra_config=payload.get("extra_config", {}),
+            )
+        except (DuplicateExternalMemoryProviderError, ExternalMemoryProviderValidationError) as exc:
+            return _external_provider_error_response(exc)
+        except (KeyError, ValueError, TypeError) as exc:
+            return _external_provider_error_response(exc)
+        return JSONResponse(content=_external_provider_to_dict(cfg), status_code=201)
+
+    @router.patch("/chat/external-memory/providers/{provider_id}")
+    async def update_external_provider(provider_id: str, payload: dict = Body(...)):
+        # api_key 三态：null 不变 / "" 清空 / 非空覆盖
+        api_key = payload.get("api_key", None)
+        clear_api_key = api_key == ""
+        api_key_value = api_key if (api_key is not None and api_key != "") else None
+        try:
+            cfg, refresh_failed = service.update(
+                provider_id,
+                name=payload.get("name"),
+                base_url=payload.get("base_url"),
+                api_key=api_key_value,
+                clear_api_key=clear_api_key,
+                extra_config=payload.get("extra_config"),
+            )
+        except (ExternalMemoryProviderNotFoundError, DuplicateExternalMemoryProviderError, ExternalMemoryProviderValidationError) as exc:
+            return _external_provider_error_response(exc)
+        except (KeyError, ValueError, TypeError) as exc:
+            return _external_provider_error_response(exc)
+        data = _external_provider_to_dict(cfg)
+        data["tool_surface_refresh_failed"] = refresh_failed
+        return data
+
+    @router.delete("/chat/external-memory/providers/{provider_id}")
+    async def delete_external_provider(provider_id: str):
+        try:
+            service.delete(provider_id)
+        except ExternalMemoryProviderNotFoundError as exc:
+            return _external_provider_error_response(exc)
+        return {"deleted": True}
+
+    @router.post("/chat/external-memory/providers/{provider_id}/activate")
+    async def activate_external_provider(provider_id: str):
+        try:
+            result = service.activate(provider_id)
+        except ExternalMemoryProviderNotFoundError as exc:
+            return _external_provider_error_response(exc)
+        data = _external_provider_to_dict(result.config)
+        data["tool_surface_refresh_failed"] = result.tool_surface_refresh_failed
+        return data
+
+    @router.post("/chat/external-memory/providers/{provider_id}/probe")
+    async def probe_external_provider(provider_id: str):
+        try:
+            status = service.probe(provider_id)
+            cfg = service.get(provider_id)
+        except ExternalMemoryProviderNotFoundError as exc:
+            return _external_provider_error_response(exc)
+        return {"probe_status": status.value, "last_probe_error": cfg.last_probe_error}
 
 
 def _knowledge_error_response(exc: Exception) -> JSONResponse:
@@ -925,6 +1068,7 @@ def _session_to_dict(session: ConversationSession) -> dict:
         "title": session.title,
         "source": session.source,
         "external_memory_enabled": session.external_memory_enabled,
+        "external_memory_slots": session.external_memory_slots,
     }
 
 

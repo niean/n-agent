@@ -86,13 +86,14 @@
   function buildPage(node) {
     const systemPanel = ui.el('section', 'status-panel');
     const systemHeader = ui.el('div', 'panel-header');
-    const systemTitle = document.createElement('span');
-    systemTitle.textContent = '系统提供者';
-    systemHeader.append(systemTitle);
+    const systemTitleGroup = ui.el('div', 'panel-title-group');
+    const systemTitle = ui.el('span', 'panel-title');
+    systemTitle.textContent = '系统记忆';
+    const systemTips = ui.el('span', 'panel-tips muted');
+    systemTips.textContent = '内置系统记忆。builtin 是单组全局系统记忆。';
+    systemTitleGroup.append(systemTitle, systemTips);
+    systemHeader.append(systemTitleGroup);
     const systemBody = ui.el('div', 'panel-body');
-    const systemDesc = ui.el('p', 'muted');
-    systemDesc.textContent = '内置系统提供者。builtin 是单组全局外置记忆。';
-    systemBody.appendChild(systemDesc);
     const systemList = ui.el('div', '');
     systemList.id = 'system-providers-list';
     systemBody.appendChild(systemList);
@@ -101,18 +102,19 @@
 
     const projectPanel = ui.el('section', 'status-panel');
     const projectHeader = ui.el('div', 'panel-header');
-    const projectTitle = document.createElement('span');
-    projectTitle.textContent = '外置记忆';
+    const projectTitleGroup = ui.el('div', 'panel-title-group');
+    const projectTitle = ui.el('span', 'panel-title');
+    projectTitle.textContent = '文件记忆';
+    const projectTips = ui.el('span', 'panel-tips muted');
+    projectTips.textContent = '每个子目录对应一组独立的文件记忆，可以分别勾选启用。点击文件记忆名称编辑记忆内容。';
+    projectTitleGroup.append(projectTitle, projectTips);
     const projectActions = ui.el('span', 'panel-actions');
     projectActions.append(
-      button('+ 新建外置记忆', 'btn', () => openProjectForm()),
+      button('+ 新建', 'btn', () => openProjectForm()),
       button('刷新', 'btn', load)
     );
-    projectHeader.append(projectTitle, projectActions);
+    projectHeader.append(projectTitleGroup, projectActions);
     const projectBody = ui.el('div', 'panel-body');
-    const projectDesc = ui.el('p', 'muted');
-    projectDesc.textContent = '每个子目录对应一组独立的外置记忆，可以分别勾选启用。点击外置记忆名称编辑记忆内容。';
-    projectBody.appendChild(projectDesc);
     const projectList = ui.el('div', '');
     projectList.id = 'external-memory-list';
     projectBody.appendChild(projectList);
@@ -127,7 +129,7 @@
     ui.clear(node);
     const { system } = splitProviders();
     if (!system.length) {
-      ui.renderEmpty(node, '暂无系统提供者');
+      ui.renderEmpty(node, '暂无系统记忆');
       return;
     }
     const table = document.createElement('table');
@@ -149,16 +151,19 @@
   function renderSystemRow(provider) {
     const tr = document.createElement('tr');
     appendCell(tr, provider.name);
-    appendCell(tr, '系统内置');
+    appendCell(tr, '系统记忆');
     // 详情列 - builtin 也显示内存预览
     appendCell(tr, (provider.description || '').trim().substring(0, 256) + ((provider.description || '').length > 256 ? '...' : ''));
     appendBadgeCell(tr, provider.enabled_global ? '启用' : '停用', provider.enabled_global ? 'success' : 'warning');
     const actions = document.createElement('td');
-    actions.className = 'row-actions';
-    actions.append(
+    actions.className = 'row-actions-cell';
+    const actionGroup = document.createElement('div');
+    actionGroup.className = 'row-actions row-actions--memory';
+    actionGroup.append(
       button('查看', 'btn', () => openViewProjectForm(provider)),
       button('编辑', 'btn', () => openProjectForm(provider))
     );
+    actions.appendChild(actionGroup);
     tr.appendChild(actions);
     return tr;
   }
@@ -167,7 +172,7 @@
     ui.clear(node);
     const { projects } = splitProviders();
     if (!projects.length) {
-      ui.renderEmpty(node, '暂无外置记忆');
+      ui.renderEmpty(node, '暂无文件记忆');
       return;
     }
     const table = document.createElement('table');
@@ -189,7 +194,7 @@
   function renderProjectRow(provider) {
     const tr = document.createElement('tr');
     appendCell(tr, provider.name);
-    appendCell(tr, '外置记忆');
+    appendCell(tr, '文件记忆');
     // 详情列 - 显示记忆内容预览
     const descTd = document.createElement('td');
     let preview = (provider.description || '').trim();
@@ -200,12 +205,15 @@
     tr.appendChild(descTd);
     appendBadgeCell(tr, provider.enabled_global ? '启用' : '停用', provider.enabled_global ? 'success' : 'warning');
     const actions = document.createElement('td');
-    actions.className = 'row-actions';
-    actions.append(
+    actions.className = 'row-actions-cell';
+    const actionGroup = document.createElement('div');
+    actionGroup.className = 'row-actions row-actions--memory';
+    actionGroup.append(
       button('查看', 'btn', () => openViewProjectForm(provider)),
       button('编辑', 'btn', () => openProjectForm(provider)),
       button('删除', 'btn', () => deleteProject(provider))
     );
+    actions.appendChild(actionGroup);
     tr.appendChild(actions);
     return tr;
   }
@@ -214,8 +222,10 @@
     const system = [];
     const projects = [];
     providers.forEach((provider) => {
-      if (provider.name === 'builtin') system.push(provider);
-      else projects.push(provider);
+      const slot = provider.slot || (provider.name === 'builtin' ? 'builtin' : 'multi-project');
+      if (slot === 'builtin') system.push(provider);
+      else if (slot === 'multi-project') projects.push(provider);
+      // external-query 不属于本页，由检索记忆页管理
     });
     return { system, projects };
   }
@@ -254,7 +264,7 @@
     form.className = 'providers-form';
     const header = ui.el('div', 'modal-header');
     const title = document.createElement('h4');
-    title.textContent = '查看' + (isSystem ? '系统提供者' : '外置记忆') + ': ' + provider.name;
+    title.textContent = '查看' + (isSystem ? '系统记忆' : '文件记忆') + ': ' + provider.name;
     const close = button('×', 'modal-close', closeViewProjectForm);
     close.setAttribute('aria-label', '关闭表单');
     header.append(title, close);
@@ -281,7 +291,7 @@
 
       // 与编辑框保持相同的要素
       if (!isSystem) {
-        field(form, 'project_name', '外置记忆名称', provider.name, { disabled: true });
+        field(form, 'project_name', '文件记忆名称', provider.name, { disabled: true });
       }
       // 显示启用状态
       const enabledDiv = document.createElement('div');
@@ -356,20 +366,20 @@
     form.className = 'providers-form';
     const header = ui.el('div', 'modal-header');
     const title = document.createElement('h4');
-    title.textContent = isEdit ? (isSystem ? '编辑系统提供者' : '编辑外置记忆') : '新建外置记忆';
+    title.textContent = isEdit ? (isSystem ? '编辑系统记忆' : '编辑文件记忆') : '新建文件记忆';
     const close = button('×', 'modal-close', closeProjectForm);
     close.setAttribute('aria-label', '关闭表单');
     header.append(title, close);
     form.appendChild(header);
 
     if (!isSystem) {
-      field(form, 'project_name', '外置记忆名称', provider ? provider.name : '', { disabled: isEdit, placeholder: '仅允许字母、数字、连字符、下划线' });
+      field(form, 'project_name', '文件记忆名称', provider ? provider.name : '', { disabled: isEdit, placeholder: '仅允许字母、数字、连字符、下划线' });
     }
     // 新建和编辑都显示"全局启用"复选框
     const enabledChecked = isEdit ? provider.enabled_global : true;
     checkbox(form, 'enabled', '全局启用', enabledChecked);
     // 新建和编辑都允许编辑记忆内容
-    const contentField = field(form, 'initial_content', '记忆内容', '', { type: 'textarea', rows: 10, placeholder: '记忆内容会作为外置记忆保存' });
+    const contentField = field(form, 'initial_content', '记忆内容', '', { type: 'textarea', rows: 10, placeholder: '记忆内容会作为文件记忆保存' });
     // 编辑时加载完整内容和条目列表
     let entriesData = { entries: [] };
     if (isEdit) {
@@ -385,10 +395,10 @@
         ui.clear(form);
         form.appendChild(header);
         if (!isSystem) {
-          field(form, 'project_name', '外置记忆名称', provider ? provider.name : '', { disabled: isEdit, placeholder: '仅允许字母、数字、连字符、下划线' });
+          field(form, 'project_name', '文件记忆名称', provider ? provider.name : '', { disabled: isEdit, placeholder: '仅允许字母、数字、连字符、下划线' });
         }
         checkbox(form, 'enabled', '全局启用', enabledChecked);
-        contentField = field(form, 'initial_content', '记忆内容', contentRes.content || '', { type: 'textarea', rows: 8, placeholder: '记忆内容会作为外置记忆保存' });
+        contentField = field(form, 'initial_content', '记忆内容', contentRes.content || '', { type: 'textarea', rows: 8, placeholder: '记忆内容会作为文件记忆保存' });
       } catch (err) {
         contentField.value = provider.description || '';
       }
@@ -478,7 +488,7 @@
         const nameRe = /^[A-Za-z0-9_-]+$/;
         if (!nameRe.test(name)) {
           message.className = 'providers-form__hint badge badge--danger';
-          message.textContent = '外置记忆名称仅允许字母、数字、连字符(-)和下划线(_)';
+          message.textContent = '文件记忆名称仅允许字母、数字、连字符(-)和下划线(_)';
           return;
         }
         await api.fetchJson('/chat/external-memory/projects/create', {
@@ -659,7 +669,7 @@
   }
 
   async function deleteProject(provider) {
-    if (!window.confirm('确认删除外置记忆 ' + provider.name + '？')) return;
+    if (!window.confirm('确认删除文件记忆 ' + provider.name + '？')) return;
     try {
       await api.fetchJson('/chat/external-memory/projects/delete', {
         method: 'POST',
@@ -693,7 +703,7 @@
     node.replaceChildren();
     ui.renderLoading(node, '加载中...');
     try {
-      const data = await api.fetchJson('/chat/external-memory/providers');
+      const data = await api.fetchJson('/chat/external-memory/memory-providers');
       providers = data.providers || [];
       node.replaceChildren();
       buildPage(node);

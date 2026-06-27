@@ -129,7 +129,7 @@ class AgentGraphRunner:
                 RiskLevel.SAFE if options.get("tool_exposure_policy") == "safe_only" else None
             )
 
-            # ----- 新增：外置记忆动态预取注入（临时构造 api_messages，不修改 state）-----
+            # ----- 新增：外部记忆动态预取注入（临时构造 api_messages，不修改 state）-----
             if self.external_memory_manager and len(state.working_messages) > 0:
                 last_idx = len(state.working_messages) - 1
                 last_msg = state.working_messages[last_idx]
@@ -273,7 +273,17 @@ class AgentGraphRunner:
             )
         )
         summary_messages = [message for message in state.working_messages if message.get("role") != "system"]
+        rescued_context = ""
+        if self.external_memory_manager:
+            enabled_override = state.run_options.get("external_memory_enabled")
+            rescued_context = self.external_memory_manager.pre_compress_all(
+                summary_messages,
+                session_id=state.session_id,
+                enabled_override=enabled_override,
+            )
         summary = await self.summarizer.summarize(summary_messages, state.summary)
+        if rescued_context:
+            summary = f"{rescued_context}\n\n{summary}".strip() if summary else rescued_context
         if summary:
             await self.memory_store.save_summary(Summary(session_id=state.session_id, summary=summary))
         return state
@@ -311,7 +321,7 @@ class AgentGraphRunner:
                 ConversationMessage(role="assistant", content=state.final_message["content"]),
             )
 
-        # ----- 新增：外置记忆同步 -----
+        # ----- 新增：外部记忆同步 -----
         # call_llm 已经清理过 final_message，这里同步的是干净内容
         if self.external_memory_manager and state.final_message:
             user_content = self._extract_user_content(state.input_messages)

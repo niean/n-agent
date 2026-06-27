@@ -178,3 +178,104 @@ async def test_delete_session_raises_when_missing(tmp_path):
 
     with pytest.raises(SessionNotFoundError):
         await service.delete_session("nope")
+
+
+class _HookCapturingManager:
+    """Test double for ExternalMemoryManager capturing session lifecycle hooks."""
+
+    def __init__(self):
+        self.switch_calls: list[tuple[str, dict]] = []
+        self.end_calls: list[str] = []
+
+    def on_session_switch(self, new_session_id: str, **kwargs) -> None:
+        self.switch_calls.append((new_session_id, dict(kwargs)))
+
+    def on_session_end(self, session_id: str) -> None:
+        self.end_calls.append(session_id)
+
+
+@pytest.mark.asyncio
+async def test_create_session_fires_on_session_switch_for_new_session(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    manager = _HookCapturingManager()
+    service = SessionService(store, external_memory_manager=manager)
+
+    await service.create_session("s1", source="dashboard")
+
+    assert manager.switch_calls == [("s1", {})]
+    assert manager.end_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_session_skips_hook_when_session_exists(tmp_path):
+    """Idempotent create_session on an existing session must not re-fire on_session_switch."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    manager = _HookCapturingManager()
+    service = SessionService(store, external_memory_manager=manager)
+
+    await service.create_session("s1", source="dashboard")
+
+    assert manager.switch_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_session_fires_on_session_end_before_deletion(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    manager = _HookCapturingManager()
+    service = SessionService(store, external_memory_manager=manager)
+
+    await service.delete_session("s1")
+
+    assert manager.end_calls == ["s1"]
+    assert await store.get_session("s1") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_does_not_fire_hook_when_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    manager = _HookCapturingManager()
+    service = SessionService(store, external_memory_manager=manager)
+
+    with pytest.raises(SessionNotFoundError):
+        await service.delete_session("nope")
+
+    assert manager.end_calls == []
+
+
+@pytest.mark.asyncio
+async def test_delete_session_still_notifies_on_session_deleted_after_hook(tmp_path):
+    """on_session_end fires before on_session_deleted callback."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    manager = _HookCapturingManager()
+    deleted_order: list[str] = []
+
+    async def on_deleted(session_id: str) -> None:
+        deleted_order.append(f"deleted:{session_id}")
+
+    service = SessionService(
+        store,
+        external_memory_manager=manager,
+        on_session_deleted=on_deleted,
+    )
+
+    await service.delete_session("s1")
+
+    assert manager.end_calls == ["s1"]
+    assert deleted_order == ["deleted:s1"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_without_manager_does_not_error(tmp_path):
+    """Sessions work unchanged when no external_memory_manager is wired."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = SessionService(store)
+
+    session = await service.create_session("s1", source="api")
+
+    assert session.id == "s1"
+    persisted = await store.get_session("s1")
+    assert persisted is not None
+

@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Any, Callable
 
 from app.domain.external_memory import ExternalMemoryConfigRegistry
 from app.application.external_memory_manager import ExternalMemoryManager
@@ -16,12 +17,25 @@ class ExternalMemoryService:
         config_registry: ExternalMemoryConfigRegistry,
         settings_default: list[str] | None,
         base_dir: Path,
+        external_query_catalog: Callable[[], list[Any]] | None = None,
     ) -> None:
         self._manager = external_memory_manager
         self._config_registry = config_registry
         self._settings_default = settings_default
         self._base_dir = base_dir
+        self._external_query_catalog = external_query_catalog
         self._initialize()
+
+    def set_external_query_catalog(
+        self, catalog: Callable[[], list[Any]] | None,
+    ) -> None:
+        """延迟绑定检索记忆 provider catalog（registry 全量配置）。
+
+        历史会话锁定 profile 引用的检索 provider 可能已非 active 或已从 registry
+        删除，catalog 提供 registry 全量配置，list_providers 据此合并 inactive 条目，
+        供前端忠实展示历史选择。
+        """
+        self._external_query_catalog = catalog
 
     def _initialize(self) -> None:
         saved = self._config_registry.get_enabled()
@@ -42,6 +56,23 @@ class ExternalMemoryService:
             if len(preview) > 256:
                 preview = preview[:256] + "..."
             p["description"] = preview
+        # 合并 registry 中未装载的检索 provider（inactive），供历史会话忠实展示
+        if self._external_query_catalog is not None:
+            existing_names = {p["name"] for p in providers}
+            try:
+                catalog_entries = self._external_query_catalog()
+            except Exception:
+                catalog_entries = []
+            for cfg in catalog_entries:
+                cfg_name = getattr(cfg, "name", None)
+                if cfg_name and cfg_name not in existing_names:
+                    providers.append({
+                        "name": cfg_name,
+                        "enabled_global": False,
+                        "slot": "external-query",
+                        "active": False,
+                    })
+                    existing_names.add(cfg_name)
         return providers
 
     def save_global_enabled(self, provider_names: list[str]) -> None:
@@ -169,3 +200,7 @@ class ExternalMemoryService:
         entries[entry_index] = new_content
         new_content = "\n---\n".join(entries)
         return self.save_external_memory(project_name, new_content, target)
+
+    def shutdown(self) -> None:
+        """Forward to manager so the FastAPI lifespan can flush provider state."""
+        self._manager.shutdown_all()

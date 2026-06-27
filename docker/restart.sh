@@ -7,7 +7,13 @@ cd "$SCRIPT_DIR"
 HOST_HEALTH_URL="${N_AGENT_HOST_HEALTH_URL:-http://127.0.0.1:8201/health}"
 PUBLIC_HEALTH_URL="${N_AGENT_PUBLIC_HEALTH_URL:-http://nagent.localhost/health}"
 COMPOSE_STOP_TIMEOUT="${N_AGENT_COMPOSE_STOP_TIMEOUT:-1}"
-CURL_TIMEOUT_ARGS=(--connect-timeout 2 --max-time 5)
+CONTAINER_HEALTH_ATTEMPTS="${N_AGENT_CONTAINER_HEALTH_ATTEMPTS:-30}"
+HOST_HEALTH_ATTEMPTS="${N_AGENT_HOST_HEALTH_ATTEMPTS:-6}"
+PUBLIC_HEALTH_ATTEMPTS="${N_AGENT_PUBLIC_HEALTH_ATTEMPTS:-6}"
+HTTP_WAIT_TIMEOUT_SECONDS="${N_AGENT_HTTP_WAIT_TIMEOUT_SECONDS:-1}"
+HTTP_FINAL_TIMEOUT_SECONDS="${N_AGENT_HTTP_FINAL_TIMEOUT_SECONDS:-5}"
+CURL_WAIT_ARGS=(--connect-timeout "$HTTP_WAIT_TIMEOUT_SECONDS" --max-time "$HTTP_WAIT_TIMEOUT_SECONDS")
+CURL_FINAL_ARGS=(--connect-timeout "$HTTP_FINAL_TIMEOUT_SECONDS" --max-time "$HTTP_FINAL_TIMEOUT_SECONDS")
 
 container_health() {
   docker compose exec -T n-agent python - <<'PY' >/dev/null 2>&1
@@ -20,22 +26,24 @@ PY
 }
 
 host_health() {
-  curl -fsS "${CURL_TIMEOUT_ARGS[@]}" "$1" >/dev/null 2>&1
+  curl -fsS "${CURL_WAIT_ARGS[@]}" "$1" >/dev/null 2>&1
 }
 
 wait_until() {
   local label="$1"
-  shift
+  local attempts="$2"
+  shift 2
 
-  for attempt in $(seq 1 30); do
+  for attempt in $(seq 1 "$attempts"); do
     if "$@"; then
       echo "$label ready"
       return 0
     fi
+    echo "$label waiting ($attempt/$attempts)"
     sleep 1
   done
 
-  echo "$label did not become ready in 30s" >&2
+  echo "$label did not become ready after $attempts attempts" >&2
   return 1
 }
 
@@ -51,8 +59,8 @@ recover_stale_port_proxy() {
 
   echo "container is healthy but host port is not responding; restarting service to refresh Docker Desktop port proxy"
   docker compose restart --timeout "$COMPOSE_STOP_TIMEOUT" n-agent
-  wait_until "container health" container_health
-  wait_until "host port health" host_health "$HOST_HEALTH_URL"
+  wait_until "container health" "$CONTAINER_HEALTH_ATTEMPTS" container_health
+  wait_until "host port health" "$HOST_HEALTH_ATTEMPTS" host_health "$HOST_HEALTH_URL"
 }
 
 # restart
@@ -68,14 +76,14 @@ docker compose ps n-agent
 echo
 
 # health
-wait_until "container health" container_health
+wait_until "container health" "$CONTAINER_HEALTH_ATTEMPTS" container_health
 recover_stale_port_proxy
-wait_until "public health" host_health "$PUBLIC_HEALTH_URL"
+wait_until "public health" "$PUBLIC_HEALTH_ATTEMPTS" host_health "$PUBLIC_HEALTH_URL"
 
 echo "curl -fsS ${PUBLIC_HEALTH_URL}"
 if command -v jq >/dev/null 2>&1; then
-  curl -fsS "${CURL_TIMEOUT_ARGS[@]}" "$PUBLIC_HEALTH_URL" | jq .
+  curl -fsS "${CURL_FINAL_ARGS[@]}" "$PUBLIC_HEALTH_URL" | jq .
 else
-  curl -fsS "${CURL_TIMEOUT_ARGS[@]}" "$PUBLIC_HEALTH_URL"
+  curl -fsS "${CURL_FINAL_ARGS[@]}" "$PUBLIC_HEALTH_URL"
   echo
 fi

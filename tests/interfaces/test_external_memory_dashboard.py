@@ -4,9 +4,9 @@ from app.main import app
 client = TestClient(app)
 
 
-def test_list_providers():
-    """List providers returns 200 with empty or populated list."""
-    response = client.get("/chat/external-memory/providers")
+def test_list_memory_providers():
+    """List builtin/project memory providers returns 200 with provider list."""
+    response = client.get("/chat/external-memory/memory-providers")
     assert response.status_code == 200
     data = response.json()
     assert "providers" in data

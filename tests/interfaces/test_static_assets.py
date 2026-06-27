@@ -117,7 +117,7 @@ def test_external_memory_static_asset_is_plain_javascript(tmp_path):
     client = _client(tmp_path)
     body = client.get('/static/external-memory.js').text
     assert 'namespace.externalMemory' in body
-    assert '/chat/external-memory/providers' in body
+    assert '/chat/external-memory/memory-providers' in body
     assert 'api.fetchJson' in body
     assert ': string' not in body
     assert '| null' not in body
@@ -135,6 +135,7 @@ def test_external_memory_static_asset_is_plain_javascript(tmp_path):
 def test_static_assets_contain_expected_logic(tmp_path):
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
+    assert '/chat/external-memory/memory-providers' in chat_js
     assert 'event.shiftKey' in chat_js
     assert 'metadata' in chat_js
     assert "'[DONE]'" in chat_js or 'data: [DONE]' in chat_js
@@ -142,6 +143,10 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'renameSession' in chat_js
     assert 'deleteSession' in chat_js
     assert 'window.confirm(' in chat_js
+    assert "p.active === true" in chat_js
+    assert 'phantom' in chat_js
+    assert 'enabledProviders.includes(p.name)' in chat_js
+    assert "'removed'" in chat_js
     api_js = client.get('/static/management-api.js').text
     assert '/chat/tools' in api_js
     assert '/chat/health/dependencies' in api_js
@@ -347,21 +352,41 @@ def test_chat_builtin_memory_is_enabled_and_project_memory_is_disabled_by_defaul
     getter_body = chat_js[getter_start:getter_end]
 
     assert 'builtin 默认开启' in render_body
-    assert '项目记忆最多选择 1 个' in render_body
+    assert '文件记忆最多选择 1 个' in render_body
     assert '首轮发送后锁定' in render_body
-    assert '此会话的外置记忆已锁定' in render_body
+    assert '此会话的外部记忆已锁定' in render_body
     assert "cb.checked = p.name === 'builtin'" in render_body
     assert 'cb.disabled = locked' in render_body
-    assert "cb.checked && cb.dataset.providerName !== 'builtin'" in render_body
-    assert "checkbox !== cb && checkbox.checked && checkbox.dataset.providerName !== 'builtin'" in render_body
+    assert "cb.dataset.slot = p.slot" in render_body
+    assert 'draftExternalMemoryConfig' in chat_js
+    assert 'if (!currentSessionId) return' not in render_body
+    assert "cb.checked && cb.dataset.slot === 'multi-project'" in render_body
+    assert "checkbox !== cb && checkbox.checked && checkbox.dataset.slot === 'multi-project'" in render_body
     assert 'cb.checked = p.enabled_global' not in render_body
     assert '重置为默认配置' in render_body
+    assert "const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig" in getter_body
     assert "if (!config?.modified) return ['builtin']" in getter_body
     assert 'function applySessionExternalMemoryState(detail)' in chat_js
 
 
+def test_chat_external_memory_draft_selection_is_carried_into_new_session(tmp_path):
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    ensure_start = chat_js.index('async function ensureSession()')
+    ensure_end = chat_js.index('async function newSession()', ensure_start)
+    ensure_body = chat_js[ensure_start:ensure_end]
+    render_start = chat_js.index('function renderExternalMemoryUI()')
+    render_end = chat_js.index('function getExternalMemoryEnabled()', render_start)
+    render_body = chat_js[render_start:render_end]
+
+    assert 'draftExternalMemoryConfig?.modified === true' in ensure_body
+    assert 'sessionExternalMemoryConfig[id]' in ensure_body
+    assert 'externalMemoryTouched = true' in ensure_body
+    assert 'draftExternalMemoryConfig = nextConfig' in render_body
+
+
 def test_chat_disabled_external_memory_is_not_shown_in_checkboxes(tmp_path):
-    """停用状态的外置记忆不会在会话选择界面展示。"""
+    """停用状态的外部记忆不会在会话选择界面展示。"""
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
     render_start = chat_js.index('function renderExternalMemoryUI()')
@@ -370,15 +395,36 @@ def test_chat_disabled_external_memory_is_not_shown_in_checkboxes(tmp_path):
 
     # 验证过滤逻辑存在：builtin 始终显示，项目记忆仅在全局启用或会话已选中时显示
     assert "p.name !== 'builtin' && !p.enabled_global && !enabledProviders.includes(p.name)" in render_body
-    # 验证过滤在 render 循环开始时执行（在创建 checkbox 之前）
-    for_each_idx = render_body.index('externalMemoryProviders.forEach(p => {')
+    # 验证过滤在创建 checkbox 之前执行
     filter_idx = render_body.index('p.name !== ' + "'builtin'")
     create_checkbox_idx = render_body.index("const cb = document.createElement('input')")
-    assert for_each_idx < filter_idx < create_checkbox_idx
+    assert filter_idx < create_checkbox_idx
+
+
+def test_chat_deleted_external_memory_uses_legacy_slot_inference(tmp_path):
+    """旧会话无 slot 快照时，已删除 provider 仍按历史类型分组展示。"""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    infer_start = chat_js.index('function inferPhantomExternalMemorySlot')
+    infer_end = chat_js.index('function renderExternalMemoryUI()', infer_start)
+    infer_body = chat_js[infer_start:infer_end]
+    render_start = chat_js.index('function renderExternalMemoryUI()')
+    render_end = chat_js.index('function getExternalMemoryEnabled()', render_start)
+    render_body = chat_js[render_start:render_end]
+
+    assert 'sessionSlots && sessionSlots[name]' in infer_body
+    assert "/^external_memory_\\d+$/.test(name)" in infer_body
+    assert "/^project_memory_\\d+$/.test(name)" in infer_body
+    assert "return 'multi-project'" in infer_body
+    assert "const externalQueryPrefixes = ['mem0', 'holographic', 'honcho']" in infer_body
+    assert "name === prefix || name.startsWith(prefix + '-') || name.startsWith(prefix + '_')" in infer_body
+    assert "return 'external-query'" in infer_body
+    assert "return 'removed'" in infer_body
+    assert 'slot: inferPhantomExternalMemorySlot(name, sessionSlots)' in render_body
 
 
 def test_chat_external_memory_collapsed_by_default(tmp_path):
-    """外置记忆默认收起，点击展开图标后可编辑，再点击收起。"""
+    """外部记忆默认收起，点击展开图标后可编辑，再点击收起。"""
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
     css = client.get('/static/styles.css').text
@@ -584,3 +630,44 @@ def test_plugin_js_present_and_safe(tmp_path):
     assert 'innerHTML =' not in body
     assert 'insertAdjacentHTML' not in body
     assert '.textContent' in body
+
+
+def test_external_memory_provider_actions_keep_table_cell_layout(tmp_path):
+    client = _client(tmp_path)
+    memory_js = client.get('/static/external-memory.js').text
+    providers_js = client.get('/static/external-memory-providers.js').text
+    css_body = client.get('/static/styles.css').text
+
+    assert memory_js.count("actions.className = 'row-actions-cell'") >= 2
+    assert memory_js.count("actionGroup.className = 'row-actions row-actions--memory'") >= 2
+    assert "actions.className = 'row-actions-cell'" in providers_js
+    assert "actionGroup.className = 'row-actions row-actions--memory'" in providers_js
+    assert '.row-actions--memory' in css_body
+    assert 'min-width: 150px' in css_body
+
+
+def test_honcho_form_includes_workspace_id(tmp_path):
+    client = _client(tmp_path)
+    body = client.get('/static/external-memory-providers.js').text
+    # honcho 表单应含 workspace_id 字段（v3 API 必需）
+    assert "workspace_id" in body
+    # honcho 应有独立的 recall_mode select
+    assert "recall_mode" in body
+    assert "hybrid" in body and "context" in body and "tools" in body
+    # honcho 应有 session_strategy select
+    assert "session_strategy" in body
+    assert "per-session" in body and "persistent" in body
+    # honcho 应有 ai_peer_id 字段
+    assert "ai_peer_id" in body
+
+
+def test_retrieval_table_has_recall_mode_column_with_tip(tmp_path):
+    client = _client(tmp_path)
+    body = client.get('/static/external-memory-providers.js').text
+    # 检索记忆列表应有"召回模式"列
+    assert '召回模式' in body
+    # 列名带 tooltip（复用 panel-title-group / panel-tips 统一样式）
+    assert 'panel-tips' in body
+    assert 'hybrid' in body and 'context' in body and 'tools' in body
+    # 行渲染应调用 recallModeOf
+    assert 'recallModeOf' in body

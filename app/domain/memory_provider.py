@@ -4,7 +4,7 @@ from typing import Any, Protocol
 
 
 class ExternalMemoryProvider(Protocol):
-    """外置记忆提供者抽象基类。
+    """外部记忆提供者抽象基类。
 
     生命周期：
     - initialize() — 启动初始化，连接、创建资源
@@ -33,6 +33,10 @@ class ExternalMemoryProvider(Protocol):
 
         kwargs 可能包含：
         - agent_context: "primary", "subagent", "cron", "unattended" — 决定是否允许写入
+          subagent 隐含 skip_memory=True：不注入 system_prompt_block、不调用 prefetch、
+          不调用 sync_turn、工具调用一律拒绝写入。当前 N-Agent 多 Agent 编排尚未落地，
+          subagent 读取路径的跳过逻辑待编排层接入时实现；写入闸门已由
+          ``agent_context != "primary"`` 守护。
         - agent_identity: 配置名，用于多profile隔离
         - user_id: 平台用户标识（gateway 会话）
         """
@@ -41,8 +45,8 @@ class ExternalMemoryProvider(Protocol):
     def system_prompt_block(self) -> str:
         """返回静态文本注入 system prompt。
 
-        内置提供者在这里输出 frozen snapshot 稳定知识。
-        外置提供者在这里输出使用说明。
+        系统记忆提供者在这里输出 frozen snapshot 稳定知识。
+        外部记忆提供者在这里输出使用说明。
         返回空字符串跳过。
         """
         ...
@@ -113,6 +117,13 @@ class ExternalMemoryProvider(Protocol):
         """
         pass
 
+    def on_session_end(self, session_id: str) -> None:
+        """会话结束通知。
+
+        在会话被删除前调用，提供者可做会话级清理、摘要落盘、上下文交接。
+        """
+        pass
+
     def on_memory_write(
         self,
         action: str,
@@ -120,5 +131,33 @@ class ExternalMemoryProvider(Protocol):
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        """内置 memory 写入通知，外置提供者可镜像写入。"""
+        """系统记忆写入通知，外部记忆提供者可镜像写入。"""
+        pass
+
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str | None:
+        """压缩前抢救钩子。
+
+        在 HeuristicSummarizer 触发压缩前调用，入参为待压缩的消息列表。
+        provider 可从中提取要点返回字符串，返回值会回填到 summary 作为补充上下文。
+        返回 None 或空字符串表示不抢救。
+        """
+        return None
+
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """子 Agent 完成回调（父侧观察）。
+
+        子 Agent 完成任务后，在父会话的 provider 上调用，把子任务 prompt 与
+        子 Agent 最终回复作为观察交给父会话。子 Agent 自身不持有 provider 会话
+        （skip_memory=True），其工作产出通过此钩子回流到父会话。
+
+        事件源待定：依赖 N-Agent 多 Agent 编排落地。当前为接口占位，provider
+        可空实现。
+        """
         pass

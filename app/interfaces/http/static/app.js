@@ -26,16 +26,30 @@
     return null;
   }
 
-  function onTabActivated(tab) {
+  // 部分 tab 存在次级模块：主模块完成渲染（可能清空 tab 节点）后再初始化次级模块，
+  // 避免次级模块的容器被主模块的清空操作覆盖。
+  function resolveSecondaryModule(tab) {
+    if (tab === 'tools-external-memory') return namespace.externalMemoryProviders;
+    return null;
+  }
+
+  async function onTabActivated(tab) {
     const module = resolveModule(tab);
     if (!module) return;
+    const secondary = resolveSecondaryModule(tab);
     if (!initialized[tab] && typeof module.init === 'function') {
-      module.init();
+      await Promise.resolve(module.init());
+      if (secondary && typeof secondary.init === 'function') {
+        await Promise.resolve(secondary.init());
+      }
       initialized[tab] = true;
       return;
     }
     if (tab !== 'chat' && typeof module.refresh === 'function') {
-      module.refresh();
+      await Promise.resolve(module.refresh());
+      if (secondary && typeof secondary.refresh === 'function') {
+        await Promise.resolve(secondary.refresh());
+      }
     }
   }
 

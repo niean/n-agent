@@ -326,6 +326,29 @@
 * Error
 * Unknown
 
+## Tooltip / Tips
+
+用于对标题、列名等提供补充说明，统一采用 panel-title-group + panel-title + panel-tips 三件套结构。
+
+结构：
+
+* 容器：.panel-title-group（position: relative；inline-flex；承载 title 与 tips 两个 span）
+* 标题：.panel-title（带 dashed 下划线，作为可悬停的可视提示）
+* 说明：.panel-tips（绝对定位浮层，默认隐藏，hover/focus-within 容器时显示）
+
+样式约束：
+
+* 浮层左对齐于容器（left: 0），箭头固定在 left: 14px
+* 最大宽度 480px，按文本宽度自适应
+* 文案使用普通文本，禁止 emoji/加粗/斜体
+* 通过 hover 与 focus-within 触发显示，保证键盘可访问
+
+复用规则：
+
+* 任何需要标题补充说明的场景（面板标题、表头列名等）一律复用本组件
+* 禁止为表头、按钮等场景另造异构 tooltip 实现
+* 文案以纯文本写入 .panel-tips 的 textContent，禁止 innerHTML
+
 ---
 
 # 六、视觉规范

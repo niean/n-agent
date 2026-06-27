@@ -14,7 +14,7 @@ from .external_memory_manager import ExternalMemoryManager
 class ExternalMemoryToolExecutor(ToolExecutor):
     """适配 ExternalMemory 工具到 N-Agent 工具执行体系。
 
-    所有外置记忆工具路由到此，再由 ExternalMemoryManager 分发给提供者。
+    所有外部记忆工具路由到此，再由 ExternalMemoryManager 分发给提供者。
     """
 
     def __init__(self, memory_manager: ExternalMemoryManager):

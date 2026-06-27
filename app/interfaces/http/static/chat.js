@@ -8,8 +8,14 @@
   let initialized = false;
   let externalMemoryProviders = [];
   let externalMemoryExpanded = false;
-  // 存储每个会话的外置记忆配置
+  // 存储每个会话的外部记忆配置
   let sessionExternalMemoryConfig = {};
+  // 尚未创建会话时，允许用户先勾选首轮要使用的外部记忆。
+  let draftExternalMemoryConfig = null;
+  // 用户是否在本会话中操作过外部记忆勾选；
+  // 仅当为 true 时才向 /v1/chat/completions 携带 options.external_memory_enabled，
+  // 未操作时不发送该字段，由后端按会话默认 profile 派生。
+  let externalMemoryTouched = false;
 
   function appendText(parent, value) {
     parent.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -249,7 +255,10 @@
 
   async function selectSession(id) {
     currentSessionId = id;
+    draftExternalMemoryConfig = null;
     setHeader(id);
+    // 会话切换：重置外部记忆操作标记，避免沿用上一会话的 options 注入
+    externalMemoryTouched = false;
     try {
       const detail = await api.getSessionDetail(id);
       applySessionExternalMemoryState(detail);
@@ -269,7 +278,19 @@
     await api.createSession(id);
     currentSessionId = id;
     setHeader(id);
-    // Chat 会话默认开启 builtin 记忆，外置记忆需用户手动勾选。
+    if (draftExternalMemoryConfig?.modified === true) {
+      sessionExternalMemoryConfig[id] = {
+        providers: draftExternalMemoryConfig.providers,
+        modified: true,
+        locked: false
+      };
+      draftExternalMemoryConfig = null;
+      externalMemoryTouched = true;
+    } else {
+      // 新建会话：重置外部记忆操作标记，后续请求由后端按默认 profile 派生
+      externalMemoryTouched = false;
+    }
+    // Chat 会话默认开启 builtin 记忆，外部记忆需用户手动勾选。
     renderExternalMemoryUI();
     showEmptyState();
     updateInfo({});
@@ -279,6 +300,7 @@
 
   async function newSession() {
     currentSessionId = null;
+    draftExternalMemoryConfig = null;
     await ensureSession();
   }
 
@@ -340,6 +362,21 @@
     }
   }
 
+  function buildChatRequestBody(text) {
+    const body = {
+      model: 'model',
+      messages: [{ role: 'user', content: text }],
+      stream: true,
+      metadata: { session_id: currentSessionId },
+    };
+    // 仅当用户在本会话中操作过外部记忆勾选时才携带 options.external_memory_enabled；
+    // 未操作时不发送该字段，由后端按会话默认 profile 派生（builtin 默认开启）。
+    if (externalMemoryTouched) {
+      body.options = { external_memory_enabled: getExternalMemoryEnabled() };
+    }
+    return body;
+  }
+
   async function refreshCurrentSession() {
     if (!currentSessionId) return;
     try {
@@ -370,15 +407,7 @@
       const res = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'model',
-          messages: [{ role: 'user', content: text }],
-          stream: true,
-          metadata: { session_id: currentSessionId },
-          options: {
-            external_memory_enabled: getExternalMemoryEnabled(),
-          },
-        }),
+        body: JSON.stringify(buildChatRequestBody(text)),
       });
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -425,7 +454,7 @@
   }
 
   function loadExternalMemoryProviders() {
-    fetch('/chat/external-memory/providers')
+    fetch('/chat/external-memory/memory-providers')
       .then(res => res.json())
       .then(data => {
         externalMemoryProviders = data.providers || [];
@@ -441,6 +470,18 @@
     renderExternalMemoryUI();
   }
 
+  function inferPhantomExternalMemorySlot(name, sessionSlots) {
+    if (sessionSlots && sessionSlots[name]) return sessionSlots[name];
+    if (/^external_memory_\d+$/.test(name) || /^project_memory_\d+$/.test(name)) {
+      return 'multi-project';
+    }
+    const externalQueryPrefixes = ['mem0', 'holographic', 'honcho'];
+    if (externalQueryPrefixes.some(prefix => name === prefix || name.startsWith(prefix + '-') || name.startsWith(prefix + '_'))) {
+      return 'external-query';
+    }
+    return 'removed';
+  }
+
   function renderExternalMemoryUI() {
     const container = document.getElementById('chat-external-memory');
     if (!container) return;
@@ -453,7 +494,7 @@
 
     const title = document.createElement('div');
     title.className = 'chat-external-memory__title';
-    title.textContent = '外置记忆（当前会话）';
+    title.textContent = '外部记忆';
 
     const expandIcon = document.createElement('span');
     expandIcon.className = 'chat-external-memory__expand-icon';
@@ -471,11 +512,11 @@
 
     const desc = document.createElement('div');
     desc.className = 'chat-external-memory__desc';
-    const sessionConfig = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : null;
+    const sessionConfig = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig;
     const locked = sessionConfig?.locked === true;
     desc.textContent = locked
-      ? '此会话的外置记忆已锁定。切换项目记忆请新建会话'
-      : '此配置首轮发送后锁定。builtin 默认开启，项目记忆最多选择 1 个';
+      ? '此会话的外部记忆已锁定。切换文件记忆请新建会话'
+      : '此配置首轮发送后锁定。builtin 默认开启，文件记忆最多选择 1 个';
 
     const checkboxes = document.createElement('div');
     checkboxes.className = 'chat-external-memory__checkboxes';
@@ -483,20 +524,56 @@
     const useSessionConfig = sessionConfig?.modified === true;
     const enabledProviders = useSessionConfig ? sessionConfig.providers : ['builtin'];
 
-    externalMemoryProviders.forEach(p => {
-      // 过滤停用状态的外置记忆：builtin 始终显示，其他项目记忆仅在全局启用或会话已选中时显示
-      if (p.name !== 'builtin' && !p.enabled_global && !enabledProviders.includes(p.name)) {
-        return;
+    // 按 slot 过滤出可见 provider，保留原始顺序
+    const visibleProviders = externalMemoryProviders.filter(p => {
+      if (p.slot === 'external-query') {
+        // active 的检索 provider 始终展示（可勾选）；
+        // 非 active 的仅在历史会话锁定 profile 引用时展示（忠实展示）
+        if (p.active === true) return true;
+        if (useSessionConfig && enabledProviders.includes(p.name)) return true;
+        return false;
       }
+      if (p.name !== 'builtin' && !p.enabled_global && !enabledProviders.includes(p.name)) {
+        return false;
+      }
+      return true;
+    });
 
+    // phantom 兜底：历史会话 profile 引用但既不在 manager 也不在 registry 的 provider（已删除）。
+    // slot 优先取锁定时持久化的 external_memory_slots；旧会话无 slot 快照时按历史命名兼容推断。
+    const sessionSlots = (useSessionConfig && sessionConfig?.slots) ? sessionConfig.slots : null;
+    if (useSessionConfig) {
+      const knownNames = new Set(visibleProviders.map(p => p.name));
+      enabledProviders.forEach(name => {
+        if (name !== 'builtin' && !knownNames.has(name)) {
+          visibleProviders.push({
+            name,
+            slot: inferPhantomExternalMemorySlot(name, sessionSlots),
+            active: false,
+            phantom: true,
+          });
+        }
+      });
+    }
+
+    // 分组顺序: 系统(builtin) -> 文件(multi-project) -> 检索(external-query) -> 已移除(removed)
+    const GROUP_ORDER = ['builtin', 'multi-project', 'external-query', 'removed'];
+    const GROUP_LABELS = {
+      'builtin': '系统',
+      'multi-project': '文件',
+      'external-query': '检索',
+      'removed': '已移除',
+    };
+
+    const buildCheckbox = (p) => {
       const div = document.createElement('label');
       div.className = 'chat-external-memory__item';
       const cb = document.createElement('input');
       cb.type = 'checkbox';
       cb.dataset.providerName = p.name;
+      cb.dataset.slot = p.slot || '';
       cb.disabled = locked;
 
-      // 根据配置设置选中状态
       if (useSessionConfig) {
         cb.checked = enabledProviders.includes(p.name);
       } else {
@@ -504,13 +581,19 @@
       }
 
       div.appendChild(cb);
-      div.appendChild(document.createTextNode(' ' + p.name));
+      const label_text = (function () {
+        // phantom: provider 已删除；非 active 检索 provider: 已禁用（adapter 未装载）
+        if (p.phantom === true) return p.name + ' (已删除)';
+        if (p.slot === 'external-query' && p.active === false) return p.name + ' (已禁用)';
+        return p.name;
+      })();
+      div.appendChild(document.createTextNode(' ' + label_text));
 
       cb.addEventListener('change', () => {
-        if (!currentSessionId) return;
-        if (cb.checked && cb.dataset.providerName !== 'builtin') {
+        // 仅 multi-project slot 互斥（文件记忆最多 1 个）；external-query 与 multi-project 可共存
+        if (cb.checked && cb.dataset.slot === 'multi-project') {
           document.querySelectorAll('#chat-external-memory input[type="checkbox"]').forEach(checkbox => {
-            if (checkbox !== cb && checkbox.checked && checkbox.dataset.providerName !== 'builtin') {
+            if (checkbox !== cb && checkbox.checked && checkbox.dataset.slot === 'multi-project') {
               checkbox.checked = false;
             }
           });
@@ -522,13 +605,43 @@
             checked.push(checkbox.dataset.providerName);
           }
         });
-        sessionExternalMemoryConfig[currentSessionId] = {
+        const nextConfig = {
           providers: checked,
           modified: true
         };
+        if (currentSessionId) {
+          sessionExternalMemoryConfig[currentSessionId] = nextConfig;
+        } else {
+          draftExternalMemoryConfig = nextConfig;
+        }
+        // 标记用户已操作外部记忆勾选，后续请求需显式携带 options.external_memory_enabled
+        externalMemoryTouched = true;
       });
 
-      checkboxes.appendChild(div);
+      return div;
+    };
+
+    GROUP_ORDER.forEach(slot => {
+      const providers = visibleProviders.filter(p => (p.slot || '') === slot);
+      if (providers.length === 0) return;
+
+      // external-query 组统一命名为"检索"（槽位内 provider 互斥，至多 1 个 active）
+      const groupLabel = GROUP_LABELS[slot] || providers[0].name;
+
+      const group = document.createElement('div');
+      group.className = 'chat-external-memory__group';
+
+      const label = document.createElement('div');
+      label.className = 'chat-external-memory__group-label';
+      label.textContent = groupLabel;
+
+      const items = document.createElement('div');
+      items.className = 'chat-external-memory__group-items';
+      providers.forEach(p => items.appendChild(buildCheckbox(p)));
+
+      group.appendChild(label);
+      group.appendChild(items);
+      checkboxes.appendChild(group);
     });
 
     content.appendChild(desc);
@@ -543,8 +656,11 @@
       resetBtn.addEventListener('click', () => {
         if (currentSessionId) {
           delete sessionExternalMemoryConfig[currentSessionId];
-          renderExternalMemoryUI();
+        } else {
+          draftExternalMemoryConfig = null;
         }
+        externalMemoryTouched = false;
+        renderExternalMemoryUI();
       });
       content.appendChild(resetBtn);
     }
@@ -553,8 +669,7 @@
   }
 
   function getExternalMemoryEnabled() {
-    if (!currentSessionId) return ['builtin'];
-    const config = sessionExternalMemoryConfig[currentSessionId];
+    const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig;
     if (!config?.modified) return ['builtin'];
     return config.providers;
   }
@@ -567,6 +682,8 @@
     if (Array.isArray(session.external_memory_enabled)) {
       sessionExternalMemoryConfig[session.id] = {
         providers: session.external_memory_enabled,
+        slots: (session.external_memory_slots && typeof session.external_memory_slots === 'object')
+          ? session.external_memory_slots : null,
         modified: true,
         locked
       };
@@ -575,6 +692,7 @@
     if (locked) {
       sessionExternalMemoryConfig[session.id] = {
         providers: ['builtin'],
+        slots: null,
         modified: true,
         locked: true
       };

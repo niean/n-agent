@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from app.application.agent_graph import AgentGraphRunner
@@ -10,8 +10,12 @@ from app.application.events import ChatEvent
 from app.application.session_service import SessionService
 from app.domain.agent import AgentState
 from app.domain.memory import MemoryStore
-from app.domain.session import ConversationMessage, ConversationSession
+from app.domain.session import ConversationMessage
 from app.domain.tool import ToolExecutionContext
+
+
+class ActiveExternalMemoryReader(Protocol):
+    def get_active_provider_names(self) -> list[str]: ...
 
 
 @dataclass(frozen=True)
@@ -40,22 +44,34 @@ class ChatCompletionService:
         memory_store: MemoryStore,
         graph_runner: AgentGraphRunner,
         session_service: SessionService,
+        external_memory_reader: "ActiveExternalMemoryReader | None" = None,
+        slot_resolver: "Callable[[str], str | None] | None" = None,
     ):
         self.memory_store = memory_store
         self.graph_runner = graph_runner
         self.session_service = session_service
+        self._external_memory_reader = external_memory_reader
+        self._slot_resolver = slot_resolver
 
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
         session_id = request.session_id or request.metadata.get("session_id") or f"tmp-{uuid4()}"
-        await self.memory_store.create_session(ConversationSession(id=session_id, source="api"))
+        await self.session_service.create_session(session_id, source="api")
         session = await self.memory_store.get_session(session_id)
         existing_messages = await self.memory_store.list_messages(session_id)
+        has_override = "external_memory_enabled" in request.options
         requested_memory = self._normalize_external_memory_enabled(request.options.get("external_memory_enabled"))
         if session is not None and session.external_memory_enabled is not None:
             locked_external_memory = session.external_memory_enabled
+        elif existing_messages:
+            locked_external_memory = ["builtin"]
+        elif has_override:
+            locked_external_memory = requested_memory
         else:
-            initial_memory = ["builtin"] if existing_messages else requested_memory
-            locked_external_memory = await self.memory_store.lock_session_external_memory(session_id, initial_memory)
+            locked_external_memory = ["builtin"]
+
+        locked_external_memory = await self.memory_store.lock_session_external_memory(
+            session_id, locked_external_memory, slots=self._build_slot_map(locked_external_memory),
+        )
         first_user_message = next(
             (message.get("content", "") for message in request.messages if message.get("role") == "user"),
             "",
@@ -121,8 +137,30 @@ class ChatCompletionService:
             return {"manage_schedule"}
         return set()
 
-    @staticmethod
-    def _normalize_external_memory_enabled(value: Any) -> list[str]:
+    def _active_external_memory_names(self) -> set[str]:
+        if self._external_memory_reader is None:
+            return set()
+        try:
+            return {str(name).strip() for name in self._external_memory_reader.get_active_provider_names() if str(name).strip()}
+        except Exception:
+            return set()
+
+    def _build_slot_map(self, names: list[str]) -> dict[str, str] | None:
+        """构建 provider name -> slot 映射，供历史会话忠实分组展示。
+
+        仅在 slot_resolver 可用时构建；resolver 无法解析的 name 不计入（前端
+        会回退到 phantom 兜底）。
+        """
+        if self._slot_resolver is None:
+            return None
+        slots: dict[str, str] = {}
+        for name in names:
+            slot = self._slot_resolver(name)
+            if slot:
+                slots[name] = slot
+        return slots or None
+
+    def _normalize_external_memory_enabled(self, value: Any) -> list[str]:
         if value is None:
             return ["builtin"]
         if not isinstance(value, list):
@@ -132,11 +170,14 @@ class ChatCompletionService:
             name = str(item).strip()
             if name and name not in names:
                 names.append(name)
-        projects = [name for name in names if name != "builtin"][:1]
+        active_external_names = self._active_external_memory_names()
+        external_query = [name for name in names if name in active_external_names]
+        projects = [name for name in names if name != "builtin" and name not in active_external_names][:1]
         enabled: list[str] = []
         if "builtin" in names:
             enabled.append("builtin")
         enabled.extend(projects)
+        enabled.extend(external_query)
         return enabled
 
 

@@ -55,7 +55,9 @@ from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_t
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
 from app.domain.external_memory import ExternalMemoryConfigRegistry
+from app.domain.external_memory_provider import ExternalMemoryProviderType
 from app.application.external_memory_manager import ExternalMemoryManager
+from app.application.external_memory_provider_service import ExternalMemoryProviderService
 from app.application.external_memory_service import ExternalMemoryService
 from app.application.external_memory_tool_executor import ExternalMemoryToolExecutor
 from app.infrastructure.memory.builtin_project import BuiltinProjectMemory
@@ -166,6 +168,7 @@ class ApplicationServices:
     skill_service: SkillService
     knowledge_service: KnowledgeService
     external_memory_service: ExternalMemoryService | None
+    external_memory_provider_service: ExternalMemoryProviderService | None
     feishu_long_connection_gateway: FeishuLongConnectionGateway | None
     platform_registry: PlatformRegistry
     platform_service: PlatformService
@@ -276,6 +279,76 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         base_dir=external_memory_base_dir,
     )
 
+    # External memory provider registry (mem0/holographic/honcho) -- minimal wiring.
+    # Full tool-surface callback registration and startup active-provider load happen in T12.
+    from app.infrastructure.registry.sqlite_external_memory_provider_registry import (
+        SQLiteExternalMemoryProviderRegistry,
+    )
+    from app.infrastructure.memory.external.http_client import ExternalMemoryHttpClient
+    from app.infrastructure.memory.external.mem0 import Mem0Adapter
+    from app.infrastructure.memory.external.holographic import HolographicAdapter
+    from app.infrastructure.memory.external.honcho import HonchoAdapter
+
+    external_provider_registry = SQLiteExternalMemoryProviderRegistry(settings.sqlite_path)
+    external_provider_registry.create_tables()
+
+    external_http_client = ExternalMemoryHttpClient()
+    external_factories = {
+        ExternalMemoryProviderType.MEM0: lambda cfg, secret: Mem0Adapter.factory(
+            http_client=external_http_client, config=cfg, secret=secret),
+        ExternalMemoryProviderType.HOLOGRAPHIC: lambda cfg, secret: HolographicAdapter.factory(
+            config=cfg, secret=secret),
+        ExternalMemoryProviderType.HONCHO: lambda cfg, secret: HonchoAdapter.factory(
+            http_client=external_http_client, config=cfg, secret=secret),
+    }
+    external_memory_provider_service = ExternalMemoryProviderService(
+        registry=external_provider_registry,
+        manager=external_memory_manager,
+        factories=external_factories,
+        workspace_root=settings.workspace_root,
+    )
+
+    # 延迟绑定检索记忆 provider catalog：list_providers 据此合并 inactive 条目，
+    # 供历史会话忠实展示当时选择的检索记忆 Provider（即使现已非 active）。
+    external_memory_service.set_external_query_catalog(
+        external_memory_provider_service.list
+    )
+
+    # 注册工具面回调：swap 后刷新 ToolService + Composite routes
+    def _refresh_external_memory_tools():
+        tool_defs = external_memory_manager.get_tool_definitions()
+        tool_service.set_dynamic_definitions("external_memory", tool_defs)
+        memory_executor_local = ExternalMemoryToolExecutor(external_memory_manager)
+        # 先移除不再存在的 external memory 工具路由（避免 stale 路由堆积）
+        current_names = {d.name for d in tool_defs}
+        stale = [n for n in list(routes) if n not in current_names and _is_external_memory_tool_name(n)]
+        for name in stale:
+            routes.pop(name, None)
+        for tool_def in tool_defs:
+            routes[tool_def.name] = memory_executor_local
+
+    def _is_external_memory_tool_name(name: str) -> bool:
+        """识别 external memory 域的工具名（builtin/multi-project/external-query 三类 slot）。"""
+        return name in {
+            "external_memory", "multi_external_memory",
+            "mem0_profile", "mem0_search", "mem0_conclude",
+            "fact_store", "fact_feedback",
+            "honcho_profile", "honcho_search", "honcho_reasoning",
+            "honcho_context", "honcho_conclude",
+        }
+
+    external_memory_manager.register_tool_surface_callback(_refresh_external_memory_tools)
+
+    # 启动时装载 active external-query provider（至多一个）
+    for cfg in external_provider_registry.list_providers():
+        if cfg.enabled:
+            secret = external_provider_registry.get_secret(cfg.id)
+            factory = external_factories[cfg.provider_type]
+            adapter = factory(dict(cfg.extra_config), secret.api_key if secret else None)
+            adapter.initialize(session_id="", project_root=str(settings.workspace_root))
+            external_memory_manager.swap_external_query_provider(adapter)
+            break
+
     tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
     try:
         _run_sync(mcp_service.refresh_registered_tool_surface())
@@ -295,8 +368,15 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     session_service = SessionService(
         memory_store,
         title_generator=LLMTitleGenerator(holder, lambda: holder.current_model),
+        external_memory_manager=external_memory_manager,
     )
-    chat_service = ChatCompletionService(memory_store, graph_runner, session_service)
+    chat_service = ChatCompletionService(
+        memory_store,
+        graph_runner,
+        session_service,
+        external_memory_reader=external_memory_provider_service,
+        slot_resolver=external_memory_manager.resolve_provider_slot,
+    )
     model_service = ModelService(holder, lambda: holder.current_model)
     schedule_calculator = CroniterScheduleCalculator()
     schedule_scanner = DeterministicPromptSafetyScanner()
@@ -420,6 +500,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         skill_service=skill_service,
         knowledge_service=knowledge_service,
         external_memory_service=external_memory_service,
+        external_memory_provider_service=external_memory_provider_service,
         feishu_long_connection_gateway=feishu_long_connection_gateway,
         platform_registry=platform_registry,
         platform_service=platform_service,
@@ -463,6 +544,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await feishu_task
                 except asyncio.CancelledError:
                     pass
+            if services.external_memory_service is not None:
+                try:
+                    services.external_memory_service.shutdown()
+                except Exception:
+                    logger.exception("external memory shutdown failed")
 
     app = FastAPI(title="N-Agent", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -480,6 +566,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             skill_service=services.skill_service,
             knowledge_service=services.knowledge_service,
             external_memory_service=services.external_memory_service,
+            external_memory_provider_service=services.external_memory_provider_service,
         )
     )
     return app

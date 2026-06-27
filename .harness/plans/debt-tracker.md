@@ -6,6 +6,11 @@
 | D002 | `tests/test_docker_compose_config.py` 期望 `docker/.env.example` 包含 `http://n-kb:8212`，但当前示例配置为空值，导致全量 pytest 失败。 | medium | plan-260615-provider-active-check.md | 2026-06-15 | open |
 | D003 | GatewayConfirmation 持久化：`GatewayCommandService.pending_confirmations` 保持为进程内 dict，多副本部署或进程重启会丢失未确认请求；待未来需要多副本时设计 Domain `GatewayConfirmationRegistry` 端口与 SQLite 实现。 | low | plan-260616-feishu-natural-schedule.md | 2026-06-17 | open |
 | D004 | Gateway 与定时任务 origin 曾存在 `source_type/source_id` 命名债，与 Hermes 平台抽象不一致；本计划已一次性迁移为 platform/platform_session_id，并移除业务 fallback。 | medium | plan-260617-platform-aggregate.md | 2026-06-17 | resolved |
+| D005 | `tests/application/test_agent_graph.py::test_agent_graph_injects_system_prompt_without_persisting_message` 断言系统提示词含 `N-Agent(Niean's Agent MVP)`，但 `prompt_builder.py` 实际产出 `N-Agent(Niean's Agent)`；非本次变更新引入，stash 验证确认预存失败。 | low | plan-260628-retrieved-memory-prefetch.md | 2026-06-28 | resolved |
+| D006 | HolographicAdapter 内联 trust/decay/contradiction 逻辑（_score/_contradict），未复用 `MemoryTrustStore`。原因：MemoryTrustStore 数据模型（hash key + sidecar JSON + ISO 时间戳）与 HolographicAdapter（integer id + SQLite 行 + unix 时间戳）不兼容，强行复用会引入双存储系统。 | medium | plan-260628-external-query-providers.md | 2026-06-29 | open |
+| D007 | 外部记忆 provider 前端管理页面（external-memory-providers.js）无自动化测试，仅手动验证。 | low | plan-260628-external-query-providers.md | 2026-06-29 | open |
+| D008 | 外部记忆 provider 端到端验收（T13）为手动 curl，未自动化。 | low | plan-260628-external-query-providers.md | 2026-06-29 | open |
+| D009 | `tests/interfaces/test_static_assets.py::test_external_memory_provider_actions_keep_table_cell_layout` 断言 `min-width: 220px` 和 `.row-actions--memory`，但 styles.css 实际为 `min-width: 150px` 且无 `.row-actions--memory` 规则；上一轮检索记忆 Dashboard 样式工作遗留的测试-css 不一致，非本次变更新引入。 | low | plan-260629-external-query-session-toggle.md | 2026-06-29 | resolved |
 
 ---
 

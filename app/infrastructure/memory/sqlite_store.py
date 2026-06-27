@@ -125,10 +125,13 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
 
-    async def lock_session_external_memory(self, session_id: str, enabled: list[str]) -> list[str]:
+    async def lock_session_external_memory(
+        self, session_id: str, enabled: list[str], slots: dict[str, str] | None = None,
+    ) -> list[str]:
         await self.create_session(ConversationSession(id=session_id))
         normalized = [str(name) for name in enabled]
         encoded = json.dumps(normalized)
+        slots_encoded = json.dumps(slots) if slots else None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT external_memory_enabled_json FROM sessions WHERE id = ?",
@@ -137,8 +140,8 @@ class SQLiteMemoryStore:
             if row is not None and row["external_memory_enabled_json"] is not None:
                 return json.loads(row["external_memory_enabled_json"])
             conn.execute(
-                "UPDATE sessions SET external_memory_enabled_json = ? WHERE id = ?",
-                (encoded, session_id),
+                "UPDATE sessions SET external_memory_enabled_json = ?, external_memory_slots_json = ? WHERE id = ?",
+                (encoded, slots_encoded, session_id),
             )
         return normalized
 
@@ -295,9 +298,16 @@ class SQLiteMemoryStore:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
         if "external_memory_enabled_json" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN external_memory_enabled_json TEXT")
+        if "external_memory_slots_json" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN external_memory_slots_json TEXT")
 
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> ConversationSession:
         enabled_json = row["external_memory_enabled_json"]
         enabled = json.loads(enabled_json) if enabled_json is not None else None
-        return ConversationSession(id=row["id"], title=row["title"], source=row["source"], external_memory_enabled=enabled)
+        slots_json = row["external_memory_slots_json"] if "external_memory_slots_json" in row.keys() else None
+        slots = json.loads(slots_json) if slots_json is not None else None
+        return ConversationSession(
+            id=row["id"], title=row["title"], source=row["source"],
+            external_memory_enabled=enabled, external_memory_slots=slots,
+        )

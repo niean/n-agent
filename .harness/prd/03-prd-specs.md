@@ -116,8 +116,52 @@
     - 对话：对话框，外置记忆默认收起，点击展开图标后可编辑，再点击收起图标后恢复到默认的收起
 
 [20260627]
+- NFR
     - 源码：整理Memory体系，输出到DDD文档的`## Memory`章节，要求言简意赅
     - 源码：Context Frame 的真实样例
+
+[20260628]
+- FR
+    - 记忆：实现G1 retrieved memory 实际召回。创建新的spec文件，原始需求来自spec-260628-memory-context-gaps-vs-hermes.md
+        - 审阅：发现严重问题，spec-260628-retrieved-memory-prefetch.md。外部 provider如mem0（服务端事实库）、holographic（HRR 向量库）、honcho（用户建模 dialectic 库），数据不是 Markdown 文本、无法做"静态快照字符串"，只能通过 query 走向量/语义检索拿回相关片段。类似情况，本次spec要能优雅支持
+    - 记忆：修复G2 流式 SSE 路径的 `<memory-context>` scrubber 缺失，原始需求来自spec-260628-memory-context-gaps-vs-hermes.md
+    - 记忆：修复G3 `on_pre_compress` 钩子缺失，原始需求来自spec-260628-memory-context-gaps-vs-hermes.md
+    - 记忆：修复G4 sync_turn真实落地，原始需求来自spec-260628-memory-context-gaps-vs-hermes.md
+    - 记忆：修复G5`on_session_switch` / `on_session_end` 钩子缺失，原始需求来自spec-260628-memory-context-gaps-vs-hermes.md
+    - 记忆：修复G6：trust 评分 / 时间衰减 / 矛盾检测缺失，原始需求来自spec-260628-memory-context-gaps-vs-hermes.md
+        - 审阅：发现严重问题，spec-260628-memory-g6-trust-decay-contradiction.md
+    - 记忆：修复G7`on_delegation` + subagent skip_memory 缺失
+    - 记忆：修复G8 provider 失败熔断缺失
+    - 记忆：修复G10 单外部 provider 互斥约束未明确，原始需求来自spec-260628-memory-context-gaps-vs-hermes.md
+
+[20260629]
+- NFR
+    - 治理：外置记忆，更名为系统、文件、检索记忆(从载体出发)，检索记忆Provider互斥、只能有1个Active
+- FR
+    - 记忆：支持非本地Markdown文本的外部provider，如holographic（HRR 向量库）、mem0（服务端事实库）、honcho（用户建模 dialectic 库），只能通过query走向量/语义检索拿回相关片段。参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent
+        - 审阅：发现严重问题，spec-260628-external-query-providers.md
+        - 修复：Dashboard，记忆页面的系统提供者、外置记忆被改没了
+    - 记忆：完善和验收HoloGraphic记忆功能
+        - 迭代：记忆管理，检索记忆Dashboard支持CRUD，样式要跟`文件记忆`完全对齐
+        - 迭代：对话页勾选区，纳管检索记忆，默认不勾、用户可主动勾选，跟文件记忆保持一致；纳管检索、文件记忆可同时选中不冲突，但同类Provider只允许选择1个(类型如系统记忆、文件记忆、holographic)
+        - 迭代：我的对话框勾选了holographic，对话过程中没用上，首轮对话后holographic的勾选被去掉了
+    - 对话：对话框，外置记忆在UI上做分组，如系统、文件、检索，分组效果可以是一个简洁的、不突兀的圆角矩形
+    - 对话：历史对话框忠实展示当时的外置记忆Provider，不受active筛选条件影响，检索Provider不正确
+    - 记忆：完善和验收mem0记忆功能
+        - 检索记忆 Dashboard 是否支持 mem0 的 CRUD、样式与"文件记忆"对齐
+        - 对话页勾选区是否纳管 mem0、默认不勾、同类 provider 互斥
+        - 实际对话中首轮后 mem0 勾选是否被去掉 / 是否真正生效（这是 holographic 已暴露的 bug，mem0 很可能同样存在）
+
+[20260630]
+- FR
+    - 记忆：外置记忆描述改为标题Tips
+    - 记忆：完善和验收honcho记忆
+        - 补充：使用云端honcho，workspace、apikey、peer已经申请好
+        - 迭代：记忆管理页，检索记忆列表增加列`召回模式`，放到详情后、列宽10%(从详情出)，每行Provider正确展示列取值，同时列名称添加Tips、展示三种模式的含义
+    - 记忆：优化holographic召回模式，同时支持上下文注入、tools安全调用
+        - 审阅：发现严重问题，spec-260630-holographic-recall-mode.md
+        - 已交付 2026-06-30：recall_mode 三模式（hybrid默认/context/tools）+ 拆出 fact_search 只读检索工具收敛信任边界 + 修复 active provider 编辑静默不生效
+    - 记忆：检索记忆，编辑时无法修改名称，需要支持改名
 
 
 ---
@@ -125,8 +169,9 @@
 [待办]
 - Issue
 - NFR
-    - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 治理：IAM，安全护栏
+    - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
+    - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
 - FR
     - 工具：Sandbox，Pod运行时
     - 工具：Plugin
@@ -134,6 +179,7 @@
         不实现 plugin system。
         不实现 agent-loop 特殊工具，比如 delegate_task、memory、todo。
         不实现 pre/post tool hook。
+    - 工具：Skill自进化
 
 ---
 

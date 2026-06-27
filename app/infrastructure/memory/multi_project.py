@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.domain.memory_provider import ExternalMemoryProvider
+from app.infrastructure.memory.retriever import MemoryRetriever
 
 
 logger = logging.getLogger(__name__)
@@ -28,13 +29,13 @@ ENTRY_SEPARATOR = "\n---\n"
 
 
 class MultiProjectMemory(ExternalMemoryProvider):
-    """多外置记忆提供者。
+    """文件记忆提供者。
 
     存储结构: {project_root}/{memory_base_path}/{name}/
-    - memory.md — 该外置记忆的稳定知识：架构约定、编码规范、常见问题、经验教训
-    - user.md — 该外置记忆的用户偏好（沟通风格、工作习惯，可选）
+    - memory.md — 该文件记忆的稳定知识：架构约定、编码规范、常见问题、经验教训
+    - user.md — 该文件记忆的用户偏好（沟通风格、工作习惯，可选）
 
-    每个子目录对应一组独立的外置记忆，用户在对话页面勾选启用。
+    每个子目录对应一组独立的文件记忆，用户在对话页面勾选启用。
     """
 
     def __init__(
@@ -60,7 +61,7 @@ class MultiProjectMemory(ExternalMemoryProvider):
         return True
 
     def list_projects(self) -> list[str]:
-        """列出所有可用的外置记忆。排除 builtin，因为它是单独注册的系统提供者。"""
+        """列出所有可用的文件记忆。排除 builtin，因为它是单独注册的系统记忆。"""
         if not self._base_dir.exists():
             return []
         projects: list[str] = []
@@ -102,15 +103,54 @@ class MultiProjectMemory(ExternalMemoryProvider):
         return "\n\n".join(blocks)
 
     def prefetch(self, query: str, *, session_id: str) -> str:
-        """Multi-project uses frozen snapshot in system prompt, no dynamic prefetch."""
-        return ""
+        """Retrieve relevant entries across enabled projects based on query."""
+        if not query or not self._enabled_projects:
+            return ""
+        retriever = MemoryRetriever(max_results=3, min_score=0.3)
+        # Gather (project_name, entry, score) across all enabled projects.
+        # Each project contributes its own top-K, then we merge globally.
+        cross_project: list[tuple[str, str, float]] = []
+        for project_name in sorted(self._enabled_projects):
+            memory_content, _ = self._get_cached(project_name)
+            entries = self._split_entries(memory_content)
+            if not entries:
+                continue
+            for entry, score in retriever.retrieve(query, entries):
+                cross_project.append((project_name, entry, score))
+        if not cross_project:
+            return ""
+        # Global top-K by score
+        cross_project.sort(key=lambda triple: triple[2], reverse=True)
+        top = cross_project[: retriever.max_results]
+        # Group by project, emit single prefix per project
+        by_project: dict[str, list[str]] = {}
+        order: list[str] = []
+        for project_name, entry, _ in top:
+            if project_name not in by_project:
+                by_project[project_name] = []
+                order.append(project_name)
+            by_project[project_name].append(entry)
+        parts: list[str] = []
+        for project_name in order:
+            entries_text = "\n---\n".join(by_project[project_name])
+            parts.append(f"## Project: {project_name}\n{entries_text}")
+        return "\n---\n".join(parts)
 
     def queue_prefetch(self, query: str, *, session_id: str) -> None:
         """No-op for multi-project."""
         pass
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str) -> None:
-        """Multi-project doesn't sync full turns, only explicit tool writes."""
+        """Intentional no-op.
+
+        Multi-project memory follows the Hermes holographic pattern: stable
+        facts are stored via explicit tool writes (multi_external_memory), not
+        auto-synced from each turn. Auto-syncing would also be ambiguous here —
+        there is no single "current project" to write to across multiple
+        concurrently enabled memories. BuiltinProjectMemory carries the
+        per-turn observation persistence for the session; multi-project
+        defers all writes to the LLM-driven tool path.
+        """
         pass
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -245,6 +285,10 @@ class MultiProjectMemory(ExternalMemoryProvider):
         """No-op for multi-project."""
         pass
 
+    def on_session_end(self, session_id: str) -> None:
+        """No-op for multi-project; interface in place per G5."""
+        pass
+
     def on_memory_write(
         self,
         action: str,
@@ -253,6 +297,21 @@ class MultiProjectMemory(ExternalMemoryProvider):
         metadata: dict[str, Any] | None = None,
     ) -> None:
         """No-op."""
+        pass
+
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str | None:
+        """No-op for multi-project; interface in place per G3."""
+        return None
+
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """No-op for multi-project; interface in place per G7."""
         pass
 
     def shutdown(self) -> None:

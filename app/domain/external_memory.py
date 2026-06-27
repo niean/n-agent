@@ -4,7 +4,7 @@ from typing import Protocol
 
 
 class ExternalMemoryConfigRegistry(Protocol):
-    """全局外置记忆激活配置持久化端口."""
+    """全局外部记忆激活配置持久化端口."""
 
     def get_enabled(self) -> set[str] | None:
         """返回当前保存的激活提供者集合.

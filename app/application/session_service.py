@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from app.domain.memory import MemoryStore
 from app.domain.session import (
@@ -11,6 +12,10 @@ from app.domain.session import (
     SessionValidationError,
     TitleGenerator,
 )
+
+
+if TYPE_CHECKING:
+    from app.application.external_memory_manager import ExternalMemoryManager
 
 
 logger = logging.getLogger(__name__)
@@ -25,14 +30,28 @@ class SessionService:
         memory_store: MemoryStore,
         title_generator: TitleGenerator | None = None,
         on_session_deleted: SessionDeletedHandler | None = None,
+        external_memory_manager: "ExternalMemoryManager | None" = None,
     ):
         self.memory_store = memory_store
         self.title_generator = title_generator
         self.on_session_deleted = on_session_deleted
+        self.external_memory_manager = external_memory_manager
 
     async def create_session(self, session_id: str, source: str = "dashboard") -> ConversationSession:
+        existing = await self.memory_store.get_session(session_id)
+        is_new = existing is None
         session = ConversationSession(id=session_id, source=source)
-        return await self.memory_store.create_session(session)
+        created = await self.memory_store.create_session(session)
+        if is_new and self.external_memory_manager is not None:
+            try:
+                self.external_memory_manager.on_session_switch(session_id)
+            except Exception as exc:
+                logger.warning(
+                    "memory provider session-switch hook failed for %s: %s",
+                    session_id,
+                    exc,
+                )
+        return created
 
     async def list_sessions(self) -> list[ConversationSession]:
         return await self.memory_store.list_sessions()
@@ -63,6 +82,18 @@ class SessionService:
         return refreshed if refreshed is not None else session
 
     async def delete_session(self, session_id: str) -> None:
+        existing = await self.memory_store.get_session(session_id)
+        if existing is None:
+            raise SessionNotFoundError(session_id)
+        if self.external_memory_manager is not None:
+            try:
+                self.external_memory_manager.on_session_end(session_id)
+            except Exception as exc:
+                logger.warning(
+                    "memory provider session-end hook failed for %s: %s",
+                    session_id,
+                    exc,
+                )
         deleted = await self.memory_store.delete_session(session_id)
         if not deleted:
             raise SessionNotFoundError(session_id)

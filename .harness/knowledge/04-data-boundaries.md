@@ -41,7 +41,7 @@
 
 `ToolCallRequest`（`app/domain/tool.py`）：工具执行请求，字段包括 id、name、arguments。
 
-`ToolExecutionContext`（`app/domain/tool.py`）：单轮工具执行上下文，字段包括 allowed_confirm_tools、session_id、metadata、trusted_metadata、execution_context_mode、permitted_managed_tools、enabled_override。metadata 可来自客户端但不可信；trusted_metadata 只由 Gateway/服务端可信入口写入，用于 managed tool 授权和外置记忆写入权限判断；该对象不持久化、不跨轮复用、不进入 provider request。
+`ToolExecutionContext`（`app/domain/tool.py`）：单轮工具执行上下文，字段包括 allowed_confirm_tools、session_id、metadata、trusted_metadata、execution_context_mode、permitted_managed_tools、enabled_override。metadata 可来自客户端但不可信；trusted_metadata 只由 Gateway/服务端可信入口写入，用于 managed tool 授权和外部记忆写入权限判断；该对象不持久化、不跨轮复用、不进入 provider request。
 
 `ToolResultStatus`（`app/domain/tool.py`）：工具执行状态枚举，取值包括 success、error、permission_denied、timeout。
 
@@ -135,6 +135,7 @@ gateway_home_targets(platform, receive_id, receive_id_type, thread_id, display_n
 mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
 knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
+external_memory_providers(id, name UNIQUE, provider_type, base_url, api_key, enabled, extra_config, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 ```
 
 providers 表唯一索引：
@@ -143,7 +144,7 @@ providers 表唯一索引：
 CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active = 1
 ```
 
-该 partial unique index 保证全表至多一条 active 记录，由 `SQLiteProviderRegistry.set_active` 通过先 `UPDATE is_active=0 WHERE is_active=1` 再 `UPDATE is_active=1 WHERE id=?` 实现切换；providers.api_key 与 knowledge_bases.api_key 列以明文形式落地 `locals/sessions.db`，依赖 Docker volume 持久化与文件系统隔离保护，不通过 HTTP 暴露、不写入日志。KnowledgeBase 更新中 `api_key=None` 表示保持不变，空字符串表示清空，非空字符串表示覆盖。
+该 partial unique index 保证全表至多一条 active 记录，由 `SQLiteProviderRegistry.set_active` 通过先 `UPDATE is_active=0 WHERE is_active=1` 再 `UPDATE is_active=1 WHERE id=?` 实现切换；providers.api_key 与 knowledge_bases.api_key 列以明文形式落地 `locals/sessions.db`，依赖 Docker volume 持久化与文件系统隔离保护，不通过 HTTP 暴露、不写入日志。KnowledgeBase 更新中 `api_key=None` 表示保持不变，空字符串表示清空，非空字符串表示覆盖。external_memory_providers 表存储 mem0/holographic/honcho 三类检索记忆 provider 配置，`at-most-one-enabled` 约束由 `SQLiteExternalMemoryProviderRegistry._assert_no_other_enabled` 在 create/update enabled=True 时校验；api_key 三态更新同 providers/knowledge_bases；holographic adapter 的 facts 数据存储在 extra_config.db_path 指向的独立 SQLite 文件（默认 `locals/external-memory/holographic.db`），不与 sessions.db 共享。
 
 索引：
 
@@ -184,7 +185,7 @@ Interfaces 层请求模型位于 `app/interfaces/http/openai.py`，仅作为外�
 
 Dashboard 使用 `metadata.session_id` 绑定会话。
 
-Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息时锁定：请求未提供时默认 `["builtin"]`；提供列表时会去重，并至多保留一个非 builtin 项目记忆。已有历史消息但缺少锁定值的 legacy session 首次触达时锁定到 `["builtin"]`，避免升级后出现中途切换项目记忆。后续轮次即使客户端继续传入不同的 `external_memory_enabled`，Application 也必须使用 sessions 表里的锁定值。
+Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息时锁定，锁定逻辑按优先级：(1) session 已有锁定值 → 沿用；(2) 已有历史消息但无锁定值的 legacy session → `["builtin"]`；(3) 请求显式传 `options.external_memory_enabled`（字段存在性判断，区分"未传"与"显式传 ['builtin']"）→ 归一化后使用；(4) 请求未传字段 → `["builtin", *active_external_query_provider_names]`，其中 active 检索记忆 provider 名称由 `ActiveExternalMemoryReader` 端口（由 `ExternalMemoryProviderService` 实现，读 `ExternalMemoryManager` 内存状态、无 IO）提供。启用检索记忆 provider 后，新会话首轮不传字段即可自动纳入该 provider。后续轮次即使客户端继续传入不同的 `external_memory_enabled`，Application 也必须使用 sessions 表里的锁定值。
 
 ## Docker Compose 数据边界
 

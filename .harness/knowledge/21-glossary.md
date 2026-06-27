@@ -38,3 +38,13 @@
 - ToolResultStatus：工具执行结果状态枚举，描述成功、错误、权限拒绝和超时等标准状态。
 - PermissionDecision：权限判定值对象，描述工具或动作是否允许执行以及拒绝原因。
 - Toolset：工具集合或能力分组，用于后续按场景启用、禁用、检查依赖和控制权限。
+- ExternalMemoryProvider：外部记忆提供者领域端口（SPI），定义 prefetch/sync_turn/system_prompt_block/handle_tool_call + 生命周期钩子（on_session_switch/on_session_end/on_pre_compress/on_delegation/shutdown）；三类实现：系统记忆（builtin，Markdown 文件存储）、文件记忆（multi-project，多项目 Markdown CRUD）、检索记忆（external-query，mem0/holographic/honcho 等 query-only provider）。
+- Memory Slot：ExternalMemoryManager 的三槽模型。系统记忆槽（builtin，全局内置）、文件记忆槽（multi-project，多项目 Markdown CRUD）、检索记忆槽（external-query，至多一个 query-only provider）。三槽共存，activate mem0 不会替换文件记忆。`add_provider` 按 provider name 分类槽位，`swap_external_query_provider` 仅替换检索记忆槽。
+- 系统记忆（builtin slot）：ExternalMemoryManager 的 builtin 槽位中文名，对应槽位常量 `_BUILTIN_SLOT`。全局内置 Markdown 记忆，由 `BuiltinProjectMemory` 实现，存储 `{project_root}/locals/external-memory/{memory,user}.md` + sidecar `memory.meta.json`；含 trust 评分、时间衰减、矛盾检测机制，是唯一内置可信度体系的槽位。
+- 文件记忆（multi-project slot）：ExternalMemoryManager 的 multi-project 槽位中文名，对应槽位常量 `_MULTI_PROJECT_SLOT`。按项目子目录管理多组 `{memory,user}.md`，由 `MultiProjectMemory` 实现；通过 `set_enabled_projects` 选择启用项，跨 enabled project 合并打分取全局 top-K，返回文本用 `## Project: {name}` 前缀区分来源。
+- 检索记忆（external-query slot）：ExternalMemoryManager 的 external-query 槽位中文名，对应槽位常量 `_EXTERNAL_QUERY_SLOT`。该槽位承载 query-only provider（mem0/holographic/honcho），at-most-one 约束，由 `swap_external_query_provider` 单独替换，不影响系统记忆/文件记忆槽。
+- 检索记忆 provider（external-query provider）：外部记忆 SPI 中 query-only 的实现，数据非本地 Markdown 文本、无法做静态快照，只能通过 query 走向量/语义检索拿回相关片段。当前支持 mem0（服务端事实库 HTTP）、holographic（本地 SQLite + MemoryRetriever）、honcho（用户建模 dialectic 库 HTTP）。at-most-one 约束：至多一个检索记忆 provider 同时启用。
+- ActiveExternalMemoryReader：Application 层只读端口，`get_active_provider_names() -> list[str]`，读 ExternalMemoryManager 内存状态、无 IO；由 ExternalMemoryProviderService 实现，注入 ChatCompletionService 用于会话默认 profile 派生（未传 external_memory_enabled 时纳入 active 检索记忆 provider）。
+- tool_surface_refresh_failed：activate/swap 返回的布尔标志，标记工具面回调（刷新 ToolService dynamic_definitions + Composite routes）是否失败。回调在 swap_lock 内同步执行，异常不阻塞 swap 本身，仅置标志供 API 响应透传。
+- provider_swapping：ExternalMemoryManager.handle_tool_call 在 swap_lock 持有期间对检索记忆槽工具返回的错误，避免 swap 进行中路由到不一致的工具实现。
+- has_override：ChatCompletionService 首轮 profile 派生时的字段存在性判断（`"external_memory_enabled" in request.options`），区分"客户端未传字段"与"客户端显式传 ['builtin']"。前端 chat.js 维护 `externalMemoryTouched` 标志，未操作时不发送该字段，使后端能派生含 active 检索记忆 provider 的默认 profile。

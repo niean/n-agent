@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口和演进基线 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override 和演进基线 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -121,11 +121,95 @@ N-Agent 拥有知识检索 SPI，`search_knowledge` safe tool 按 LLM 显式传�
 - 摘要策略先简单可替换，后续可升级为模型驱动压缩、session search 和长期 Memory。
 - AgentGraph 中用于跨节点传递的一次性状态（如 tool_results）在写入 MemoryStore 后必须清空，避免后续节点循环重复持久化同一运行事件。
 - Chat Session 的外部记忆选择是上下文契约，不是普通 UI 偏好：首轮发送前可选择，首轮后由 `sessions.external_memory_enabled_json` 锁定，后续轮次必须使用同一 profile。
-- 默认 profile 是 `["builtin"]`；项目记忆最多选择一个，可与 builtin 同时启用。已有历史消息但没有锁定值的 legacy session 首次触达时锁定到 `["builtin"]`。
-- 锁定原因：外部记忆会进入 system prompt 或当前轮 memory context，若同一 session 中途切换，会改变 provider message 前缀，降低 LLM prefix cache 命中率，并让历史回答与新项目记忆混用。
+- 默认 profile 是 `["builtin"]`；文件记忆最多选择一个，可与系统记忆（builtin）同时启用。已有历史消息但没有锁定值的 legacy session 首次触达时锁定到 `["builtin"]`。
+- 锁定原因：外部记忆会进入 system prompt 或当前轮 memory context，若同一 session 中途切换，会改变 provider message 前缀，降低 LLM prefix cache 命中率，并让历史回答与新文件记忆混用。
 - 前端可以禁用 checkbox 做体验约束，但不能作为可信来源；真正的锁定必须在 Application/MemoryStore 边界执行，Dashboard 刷新或多 tab 也必须以服务端 session detail 为准。
 
-陷阱：直接在 LangGraph 节点或 FastAPI handler 中写 SQLite 查询，会让存储实现侵入运行编排和协议层；临时运行状态不清空会造成 Dashboard 会话历史重复展示。同一 Chat Session 内允许随时切换项目记忆，会破坏上下文稳定性和 prefix cache 友好度；正确做法是新建或 fork 会话。
+陷阱：直接在 LangGraph 节点或 FastAPI handler 中写 SQLite 查询，会让存储实现侵入运行编排和协议层；临时运行状态不清空会造成 Dashboard 会话历史重复展示。同一 Chat Session 内允许随时切换文件记忆，会破坏上下文稳定性和 prefix cache 友好度；正确做法是新建或 fork 会话。
+
+## 模式七（扩展）：系统记忆 trust/decay/contradiction 内建于 builtin provider
+
+系统记忆（builtin）的 trust 评分、时间衰减、矛盾检测是 provider 内部实现，不外溢到 Domain SPI 或文件记忆（multi-project）provider。
+
+规则：
+- sidecar `memory.meta.json` 与 memory.md 并列，存 entry 级 trust/created_at/last_hit_at；memory.md 保持人类可读 Markdown，meta 不污染 system prompt 注入。
+- `system_prompt_block` 与 `prefetch` 都必须按 trust×decay 过滤/排序——只改 prefetch 不改 system prompt 会让低 trust 条目仍以"稳定记忆"身份进入 prompt，trust 形同虚设。
+- 矛盾检测必须在文件锁内完成（`_update_file_locked` 的 update 回调内读取 current content 做 Jaccard），锁外检测会在并发 add 下漏检并写坏 meta。
+- 命中反馈持久化不能押在 shutdown 落盘上——FastAPI lifespan 退出路径必须显式调用 `ExternalMemoryManager.shutdown_all()`（经 `ExternalMemoryService.shutdown()` 转发），且 prefetch 路径要有 dirty flag + 节流落盘作为主路径。
+- `initialize` 时必须对 memory.md 现有 entry 做 ensure（不只是 prune stale），否则 demote/boost_on_hit 对未注册 entry 是 no-op，后续 ensure 又重置为 default_trust。
+
+陷阱：把 trust 体系外溢到 ExternalMemoryProvider SPI 会迫使 mem0/holographic/honcho 等检索记忆 provider 被迫实现无关概念；正确做法是 trust 留在系统记忆（builtin）内部，检索记忆 provider 自带各自的可信度机制。
+
+## 模式七（扩展二）：外部记忆 provider 生命周期钩子 fan-out
+
+`ExternalMemoryProvider` SPI 的生命周期钩子（`on_session_switch` / `on_session_end` / `on_pre_compress` / `on_memory_write` / `on_delegation`）由 `ExternalMemoryManager` 统一 fan-out，单个 provider 失败不阻塞其他 provider。
+
+规则：
+- 钩子在 SPI 上以 no-op 默认实现声明（`return None` / `pass`），provider 按需覆写；系统记忆/文件记忆通常 no-op，接口先行以保形态稳定。
+- Manager fan-out 必须 per-provider try/except，失败仅记 warning日志并 continue；钩子属于旁路通知，不允许阻塞主流程（finalize、压缩、会话切换）。
+- `on_delegation(task, result, *, child_session_id)` 在父会话触发，把子 Agent 任务与产出交给父会话 provider；子 Agent 自身 `skip_memory=True`，不持有 provider 会话。事件源依赖多 Agent 编排落地，当前为接口占位。
+- subagent 上下文隐含 `skip_memory=True`：不注入 system_prompt_block、不调用 prefetch/sync_turn、工具调用一律拒绝写入。N-Agent 多 Agent 编排尚未落地时，写入闸门已由 `agent_context != "primary"` 守护，读取路径跳过待编排层接入时实现。
+
+陷阱：把钩子做成同步阻塞主流程会让 provider 故障传染到 Chat 主路径；把 subagent 当 primary 暴露 prefetch 会让子 Agent 读到父会话记忆、破坏隔离。事件源未落地时跳过接口占位会让未来编排层反复改 SPI，应先定接口再接事件源。
+
+## 模式七（扩展三）：外部记忆 provider 熔断器
+
+`ExternalMemoryManager` 为每个 provider 维护 per-provider 熔断器（`_ProviderCircuitBreaker`），连续失败超阈值（默认 5 次）进入冷却态（默认 120s），冷却期内跳过调用，冷却到期后允许一次重试，成功重置失败计数、失败重新触发冷却。
+
+规则：
+- 熔断器保护每轮调用的 5 条路径：`system_prompt_block` / `prefetch` / `sync_turn` / `on_pre_compress` / `handle_tool_call`；调用前 `is_open` 跳过并记 info 日志，成功 `record_success`、异常 `record_failure`。
+- 生命周期钩子（`on_session_switch` / `on_session_end` / `on_delegation` / `shutdown`）不经过熔断器——这些是一次性事件，跳过会丢失语义状态，已有 try/except 隔离足够。
+- 熔断器构造参数（threshold / cooldown_secs / clock）通过 `ExternalMemoryManager.__init__` 注入，便于测试用 fake clock 验证冷却恢复。
+- `handle_tool_call` 熔断跳过时返回 `{"success": false, "error": "provider in cooldown"}`，区别于工具不存在的 `tool not found` 与 provider 禁用的 `provider not enabled`。
+
+陷阱：把生命周期钩子也接入熔断器会让 `on_session_end` 在 provider 持续故障时永远不调用、丢失清理时机；用 wall clock 测试冷却恢复会让测试等待真实时间，应注入 fake clock；只保护 `sync_turn` 一条路径会让其他路径的故障 provider 每轮重试，违背 G8 验收。
+
+## 模式七（扩展四）：Memory Slot 三槽模型与工具面同步
+
+不变式：检索记忆槽（external-query）全局至多 1 个 active provider，mem0 / holographic / honcho 互斥，激活其一自动 deactivate 其他。理由：多后端并存导致工具面 schema 膨胀、system prompt 指令冲突、新会话默认 profile 派生歧义。约束继承自 Hermes `MemoryManager` 单 external provider 限制。系统记忆（builtin）、文件记忆（multi-project）不受此约束，三槽共存。
+
+`ExternalMemoryManager` 采用三槽模型管理外部记忆 provider：系统记忆（builtin，全局内置 Markdown 记忆）、文件记忆（multi-project，多项目 Markdown CRUD）、检索记忆（external-query，query-only provider，至多一个）。三槽共存，activate mem0 不会替换文件记忆。
+
+规则：
+- `add_provider(provider)` 按 provider name 调用 `_classify_slot` 分类槽位：name=="builtin" → 系统记忆槽（builtin）、name=="multi-project" → 文件记忆槽（multi-project）、其余 → 检索记忆槽（external-query）。系统记忆/文件记忆始终接受并 append 到 `_providers`；检索记忆槽至多一个，第二个记录 warning 并拒绝。
+- `swap_external_query_provider(new_provider)` 仅替换检索记忆槽（external-query），不动系统记忆/文件记忆。返回 `{"swapped": bool, "tool_surface_refresh_failed": bool}`。不调用 `new_provider.initialize()`——遵循 add_provider 模式，由调用方（service.activate 或 main.py startup）负责 initialize，避免 HolographicAdapter 等 adapter 被 double-initialize 导致 SQLite 连接泄漏。
+- 工具面回调在 `swap_lock` 锁内同步执行：`_fire_tool_surface_callbacks()` 在 `with self._swap_lock:` 块内调用，保证 activate 返回时 ToolService dynamic_definitions 与 Composite routes 已一致。回调异常不阻塞 swap，记录 warning 并返回 `tool_surface_refresh_failed=True`。
+- 持锁期间工具调用返回 `provider_swapping`：`handle_tool_call` 在检索记忆槽工具上检测 `_swap_lock.locked()` 时直接返回 `{"success": False, "error": "provider_swapping"}`，避免 swap 进行中路由到不一致的工具实现。
+- main.py 注册工具面回调 `_refresh_external_memory_tools`：swap 后刷新 `tool_service.set_dynamic_definitions("external_memory", ...)` + Composite routes。清理 stale 路由（用 `_is_external_memory_tool_name` 识别 external memory 域工具名，不在当前 tool_defs 中的移除）再添加新路由，避免路由表单调增长。
+- 启动时遍历 registry.list_providers()，对 enabled=True 的检索记忆 provider 调用 factory + initialize + swap 装载（至多一个，break）。
+
+陷阱：用 `name != "builtin"` 判断 external 会让文件记忆（multi-project）占据检索记忆槽、activate mem0 被拒绝；在锁外触发回调会让另一线程在 swap 返回前看到不一致的工具面；swap 内调用 initialize 会让 HolographicAdapter double-initialize 泄漏 SQLite 连接；回调只加路由不清 stale 会让 routes dict 单调增长（功能上 dynamic_definitions 已无该工具，execute 会返回 "tool not found"，但内存泄漏）。
+
+规则：active 检索记忆 provider 配置变更必须复用 activate 装配路径重建 adapter。`ExternalMemoryProviderService.update()` 在写完 registry 后，若 `cfg.enabled` 为 True（at-most-one-enabled 语义下即 active），读最新 cfg + secret，调 factory 构建 adapter，`adapter.initialize(session_id="", project_root=workspace_root)`，再 `manager.swap_external_query_provider(adapter)` 重建槽位并刷新工具面；返回 `tuple[cfg, tool_surface_refresh_failed: bool | None]`，非 active 时第二项为 None。initialize 或 swap 异常 catch 后返回 `refresh_failed=True` 并保留旧 adapter（registry 已先写、无法回滚 enabled，保留旧 adapter 保证运行时可用）。Dashboard PATCH 路由解包 tuple 并把 `tool_surface_refresh_failed` 加入响应（与 activate 响应对齐）。
+
+陷阱：用 `manager.get_active_external_query_provider_name()` 匹配判定 active 会在同次 update 修改 name 字段时失效（manager 槽位仍持旧 name adapter）导致 silent-no-op，应直接用 `cfg.enabled` 判定；update 只写 registry 不 reload 会让已激活 provider 的 recall_mode/base_url/extra_config 编辑静默不生效（UI 展示新值但运行时仍是旧配置）；reload 失败时抛异常到调用方会让 active 槽位空置，应 catch 保留旧 adapter。
+
+## 模式七（扩展五）：会话默认 profile 派生与 has_override
+
+ChatCompletionService 首轮锁定 `external_memory_enabled` 时，需区分"客户端未传字段"与"客户端显式传 ['builtin']"。检索记忆 provider 的 active（装载 adapter）与 enabled（per-session 使用）解耦：active 是使用前提但不自动启用，是否使用交给对话页 per-session 勾选。
+
+规则：
+- 派生优先级：(1) session 已有锁定值 → 沿用；(2) legacy session（已有历史消息但无锁定值）→ `["builtin"]`；(3) `has_override=True`（`options` 中存在 `external_memory_enabled` 键）→ 归一化 requested_memory；(4) 未传字段 → `["builtin"]`。未传字段不再自动纳入 active external-query provider，统一默认 builtin。
+- `has_override` 用字段存在性判断（`"external_memory_enabled" in request.options`），不能依赖 `_normalize_external_memory_enabled(None)` 与 `_normalize_external_memory_enabled(["builtin"])` 返回值相同来区分——两者都返回 `["builtin"]`，会丢失"未传"信号。
+- `ActiveExternalMemoryReader` 端口保留（`ExternalMemoryProviderService.get_active_provider_names` 读 manager 内存、无 IO），但不再消费于默认 profile 派生；接口留存供未来别处使用。
+- 检索记忆 provider 的 per-session 启用复用现有 `enabled_override` 机制：`_is_enabled(name, override)` 当 override 含 external-query provider 名时返回 True，无需改 SPI。
+- `ExternalMemoryManager.list_providers()` 对 external-query slot 的 active provider 输出 `{"name", "enabled_global": False, "slot": "external-query", "active": True}`；`enabled_global` 恒为 False（不走 global_config），`active` 表示 adapter 已装载。builtin/multi-project 不输出 `active` 字段。
+- 前端 chat.js 勾选区：external-query slot 的 provider 仅当 `active` 时显示（不依赖 `enabled_global`），默认不勾；互斥按 slot 分组，仅 multi-project 之间互斥（文件记忆最多 1 个），external-query 与 multi-project 可共存。checkbox 带 `data-slot` 属性。`externalMemoryTouched` 标志：用户未操作时不发送 `options.external_memory_enabled` 字段，操作后发送显式值。
+
+陷阱：让 active 自动纳入默认 profile 会混淆"装载"与"使用"，用户既看不见也关不掉检索记忆 provider；前端用 `enabled_global` 过滤 external-query provider 会导致其永不显示（不走 global_config）；检索记忆与文件记忆纳入同一互斥规则会阻止两者共存，违背 fact 库与 markdown 知识各司其职的设计。
+
+## 模式七（扩展六）：历史会话忠实展示外置记忆 Provider
+
+历史会话锁定的 `external_memory_enabled` profile 可能引用当前已非 active 的检索记忆 provider（被另一同类 provider 替换 active、或已从 registry 删除）。对话页勾选区必须忠实展示当时选择，不受当前 active 筛选影响。
+
+规则：
+- `ExternalMemoryService.list_providers()` 通过可选注入的 `external_query_catalog`（延迟绑定 `ExternalMemoryProviderService.list`，返回 registry 全量 `ExternalMemoryProviderConfig`）合并 inactive 检索 provider：catalog 中 name 未出现在 manager 输出的，追加 `{"name", "enabled_global": False, "slot": "external-query", "active": False}`。catalog 为 None 或抛异常时退化为现状（仅 manager 输出），向后兼容。
+- 前端 chat.js `visibleProviders` 过滤：external-query slot 的 provider 满足 `active === true` 或（`useSessionConfig && enabledProviders.includes(name)`）即展示；其他 slot 维持原 `enabled_global` 过滤。
+- phantom 兜底：`useSessionConfig` 为 true 时，遍历 `enabledProviders`，name 既不在 `externalMemoryProviders` 响应中又非 `builtin` 的，合成 phantom 条目并入 `visibleProviders`。slot 优先取锁定时持久化的 `external_memory_slots` 映射（见下条），缺失才回退到 `'removed'` 分组。phantom 条目渲染为 checked+disabled，label 追加"(已删除)"；非 active 检索 provider（`active: false`）label 追加"(已禁用)"。
+- slot 持久化：`ChatCompletionService.complete` 锁定 profile 时，通过注入的 `slot_resolver`（`ExternalMemoryManager.resolve_provider_slot`，基于当前已装载 provider 解析 name→slot，无 IO）构建 `{name: slot}` 映射，随 `lock_session_external_memory` 一并写入 `sessions.external_memory_slots_json` 列。session detail 响应含 `external_memory_slots`，前端据此将已删除 provider 归入其原 slot 分组（文件/检索），而非统一塞进"已移除"。`resolve_provider_slot` 对 builtin/multi-project 项目名/external-query active provider 名返回对应 slot，对未装载 name 返回 None（不入映射）。
+- 锁定会话的 checkbox `disabled = locked`，checked 由 `enabledProviders.includes(name)` 决定；active 但未选中的检索 provider 展示为 unchecked+disabled。
+
+陷阱：仅靠 manager `list_providers()` 无法展示 inactive provider（external-query slot 至多装载一个 active adapter，未 active 的不在 `_providers`）；前端只按 `active === true` 过滤会丢弃历史 profile 引用；不补 phantom 兜底会导致已删除 provider 的历史会话勾选状态丢失。phantom 硬编码 slot（如统一 `'external-query'`）会把已删除的文件记忆误归检索分组——必须持久化 slot 映射，按原 slot 分组展示。
 
 ## 模式八：System Prompt 属于 Application Runtime 上下文
 
@@ -209,3 +293,15 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - skipped_missed 只用于 runner 长时间未运行或任务确实错过宽限窗口；不能由正常执行留下的 lease 触发。
 
 陷阱：把 lease_seconds 当作调度间隔或执行后保留 lease，会让 */5 任务被默认 900 秒 lease 卡成 15 分钟一次，并在 missed_grace_seconds 后持续 skipped_missed。
+
+## 模式十五：检索记忆 Provider base_url 装配链路
+
+检索记忆 provider（mem0/honcho）的 `base_url` 是 provider 顶层字段（SQLite `external_memory_providers.base_url` 列，由 Dashboard CRUD 保存），而 adapter 从 config dict 读 base_url。Application 层构造 adapter 时必须显式合入 base_url，否则 Dashboard 配置被静默忽略。
+
+规则：
+- `ExternalMemoryProviderService._build_adapter_config(cfg)` 返回 `{"base_url": cfg.base_url, **cfg.extra_config}`，activate/probe 统一调用此方法构造 config dict 传给 factory。
+- adapter 从 config dict 读 base_url 时提供默认值（mem0 默认 `https://api.mem0.ai/v3`），但默认值只在 base_url 缺失/空串时生效；Dashboard 显式配置必须能覆盖默认值。
+- holographic 不受此约束（db_path 等配置走 extra_config，无顶层 base_url）。
+- base_url 空串是合法值（holographic 创建时 base_url=""），adapter 各自处理空串回退。
+
+陷阱：`factory(dict(cfg.extra_config), ...)` 只传 extra_config 会让 mem0 回退默认地址、honcho 回退空串，Dashboard 填写的自建 mem0 实例地址被静默忽略，probe/activate/sync/search 全部走错地址且无报错。此 bug 同时影响 mem0 + honcho，根因在共享装配路径，需在 service 层统一修复而非各 adapter 单独处理。

@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     skills_max_view_bytes: int = Field(default=131072, ge=1024)
     skills_max_count: int = Field(default=200, ge=1, le=2000)
 
-    # 外置记忆配置
+    # 外部记忆配置
     external_memory_provider: str | None = None
     external_memory_enabled_providers: list[str] | None = None
     external_memory_path: str = "./locals/external-memory"
