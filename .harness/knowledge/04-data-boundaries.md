@@ -41,7 +41,7 @@
 
 `ToolCallRequest`（`app/domain/tool.py`）：工具执行请求，字段包括 id、name、arguments。
 
-`ToolExecutionContext`（`app/domain/tool.py`）：单轮工具执行上下文，当前用于服务端从本轮用户消息推导 confirm 工具授权；不来自客户端 metadata、模型输出或工具参数本身，不持久化、不跨轮复用。
+`ToolExecutionContext`（`app/domain/tool.py`）：单轮工具执行上下文，字段包括 allowed_confirm_tools、session_id、metadata、trusted_metadata、execution_context_mode、permitted_managed_tools、enabled_override。metadata 可来自客户端但不可信；trusted_metadata 只由 Gateway/服务端可信入口写入，用于 managed tool 授权和外置记忆写入权限判断；该对象不持久化、不跨轮复用、不进入 provider request。
 
 `ToolResultStatus`（`app/domain/tool.py`）：工具执行状态枚举，取值包括 success、error、permission_denied、timeout。
 

@@ -10,7 +10,7 @@ Agent Runtime
 ├── 核心子域
 │   ├── Loop：运行状态推进、工具调用回环、结束判断
 │   ├── AgentCore：模型调用、上下文组织、推理结果承接
-│   ├── Memory：消息、会话、工具调用记录、运行状态和摘要
+│   ├── Memory：消息、会话、工具调用、任务状态、滚动摘要，以及外置记忆
 │   ├── Action：把模型 tool_calls 转换为受控工具执行
 │   └── Policy：工具权限、风险等级、执行约束和安全决策
 ├── 支撑子域
@@ -127,7 +127,187 @@ AgentCore
       └── Reasoning Metadata
 ```
 
----
+## Memory
+
+### Memory Type
+Memory 子域负责让 Agent 在单轮推理之外保留上下文，按生命周期分如下两类。
+
+```text
+Memory
+├─ 会话记忆（SQLite持久化，session内有效）
+│  ├─ 会话 ConversationSession
+│  ├─ 消息 ConversationMessage
+│  ├─ 工具调用 ToolCall
+│  ├─ 任务状态 TaskState
+│  └─ 滚动摘要 Summary
+└─ 外置记忆（Markdown文件，跨session持久）
+   ├─ builtin：当前工作区的 {memory,user}.md
+   └─ multi-project：按项目目录拆分的多组 {memory,user}.md
+```
+
+### Context Frame（Memory In Context）
+
+完整上下文可以理解为一次模型调用前组装出的 Context Frame，从稳定上下文、到本轮临时上下文逐层合成。Memory 不是单独追加的一段文本，而是根据特征进入稳定层、会话层、本轮层。最终发给模型的是 Provider Request(provider-agnostic request)，返回后再拆成 assistant message、tool calls、usage 和推理元数据。
+
+```text
+Context Frame（上下文来源分层）
+├─ 1. Stable Context
+│  ├─ System Context（静态常量，平台无关；多项拼为单条 system message）
+│  │  ├─ identity: DEFAULT_AGENT_IDENTITY
+│  │  ├─ instruction: REACT_GUIDANCE + KNOWLEDGE_GUIDANCE + MANAGED_TOOL_GUIDANCE
+│  │  ├─ safety: SAFETY_GUIDANCE
+│  │  └─ *外置记忆*静态快照：builtin / multi-project 的 {memory,user}.md
+│  └─ Capability Context
+│     └─ tool definitions: name + description + parameters
+│
+├─ 2. Session Context（*会话记忆*）
+│  ├─ 消息 ConversationMessage: 历史消息，包括 user / assistant / tool
+│  ├─ 会话 ConversationSession: id + title + source + external_memory_enabled（持久化但不进入Provider Request）
+│  ├─ 工具调用 ToolCall: 工具执行记录（持久化但不进入Provider Request，工具结果已包含在role=tool的消息中）
+│  ├─ 任务状态 TaskState: 任务运行状态（持久化但不进入Provider Request）
+│  └─ 滚动摘要 Summary（持久化但不进入Provider Request）
+│
+├─ 3. Turn Context
+│  ├─ input: latest user messages
+│  ├─ *外置记忆*动态检索（retrieved memory）: temporary <memory-context>
+│  └─ run options: external_memory_enabled + tool_exposure_policy + tool_execution_context + execution_context_mode（控制信号，不进入Provider Request）
+│
+└─ 4. Execution Context（执行现场，不进入Provider Request）
+   ├─ tool filtering: safe_only / default
+   ├─ ToolExecutionContext: 工具授权 + execution_context_mode + enabled_override + trusted_metadata
+   ├─ agent_context（trusted_metadata 内）: primary / subagent / cron / unattended（控制外置记忆写入权限）
+   └─ 运行进度: AgentState.run_status / iteration_count / error（控制 finalize）
+
+       │ 组装
+       ▼
+
+Provider Request
+├─ messages  ← 1.System Context + 2.消息ConversationMessage + 3.input&retrieved memory
+├─ tools     ← 1.Capability Context（经 4.tool filtering 过滤）
+├─ tool choice: 默认
+└─ generation params: temperature / top_p / top_k / max_tokens / stop_sequences / thinking / cache_control 等
+```
+
+
+用一轮真实对话，举例说明Context Frame，如下：
+
+```text
+## 对话
+>> User：现在几点了？打印下UTC时间。
+>> Tool：
+{
+  "tool_call_id": "call_u8usl364ddpffrw3q5758dk3",
+  "name": "get_current_time",
+  "status": "success",
+  "content": {
+    "now": "2026-06-27T15:52:06.344631+00:00"
+  },
+  "duration_ms": 0
+}
+>> Assistant：外部记忆1：当前的UTC时间是2026年06月27日 15:52:06.344631。
+
+
+## Context Frame
+
+会话事实：source=dashboard（primary），external_memory_enabled=["builtin","external_memory_1"]，
+builtin/memory.md 为空，external_memory_1/memory.md = `所有的回复，必须以"外部记忆1："开头儿。`。
+共 2 次 LLM 推理（iteration_count=2）：第 1 次产出 tool_calls，第 2 次产出 final。
+
+=== 第 1 次推理 ===
+1. Stable Context
+   ├─ System Context
+   │  ├─ identity / instruction / safety（静态常量）
+   │  └─ *外置记忆*静态快照:
+   │     ├─ builtin/memory.md → ""（空文件仍注入）
+   │     └─ external_memory_1/memory.md → "所有的回复，必须以"外部记忆1："开头儿。"
+   └─ Capability Context: tool definitions（含 get_current_time）
+2. Session Context（首轮 history 为空）
+3. Turn Context
+   ├─ input: "现在几点了？打印下UTC时间。"
+   └─ *外置记忆*动态检索: ""（builtin prefetch 返回空，SPI 预留）
+4. Execution Context: agent_context=primary，tool filtering=default
+   │ 组装
+   ▼
+Provider Request #1
+├─ messages: [system(含外置记忆静态快照), user("现在几点了？...")]
+└─ tools: [get_current_time, ...]
+→ LLM 返回: tool_calls=[get_current_time(id=call_u8us...)]
+
+--- 中间落盘（execute_tools + update_memory #1）---
+ToolCall 持久化: call_u8us..., get_current_time, success, result={now:2026-06-27T15:52:06.344631+00:00}
+消息 ConversationMessage:
+  ├─ append(role=assistant, content="", tool_calls=[...])
+  └─ append(role=tool, tool_call_id=call_u8us..., content=result)  ← 工具结果经 role=tool 消息回流
+TaskState: status=running, iteration_count=1
+Summary: HeuristicSummarizer 覆盖（未达阈值，仍持久化；不进 Provider Request）
+*外置记忆*自动更新: 本轮 LLM 未调用 external_memory 工具 → 文件未变
+
+=== 第 2 次推理 ===
+1. Stable Context（同 #1，外置记忆静态快照再次注入）
+2. Session Context（首轮历史已落盘）
+   ├─ 消息 ConversationMessage history:
+   │  ├─ user("现在几点了？打印下UTC时间。")
+   │  ├─ assistant(content="", tool_calls=[get_current_time])
+   │  └─ tool(content={now:...})  ← 工具结果通过 role=tool 消息进入 history
+   ├─ 工具调用 ToolCall: 已持久化（不进请求，结果已在 role=tool 消息中）
+   ├─ 任务状态 TaskState: running（不进请求）
+   └─ 滚动摘要 Summary: 已持久化（不进请求，仅作下次 summarize 入参）
+3. Turn Context
+   ├─ input: （无新 user 输入，本轮由 tool 结果驱动）
+   └─ *外置记忆*动态检索: ""
+4. Execution Context: iteration_count=1→2
+   │ 组装
+   ▼
+Provider Request #2
+├─ messages: [system(含外置记忆静态快照), user, assistant(tool_calls), tool(result)]
+└─ tools: [get_current_time, ...]
+→ LLM 返回: final="外部记忆1：当前的UTC时间是2026年06月27日 15:52:06.344631。"
+   ↑ 前缀严格遵循 external_memory_1 静态快照指令 —— 证明外置记忆经 Stable Context 生效
+
+--- finalize ---
+消息 ConversationMessage: append(role=assistant, final)  ← scrub_memory_context 剥离 <memory-context>（本轮无此标签）
+TaskState: status=completed, iteration_count=2
+Summary: 覆盖为 "用户: 现在几点了？... | 助手: 外部记忆1：..."
+*外置记忆*消息同步: sync_all(primary) → builtin/external_memory_1 的 sync_turn 均为 pass（no-op）
+
+```
+
+
+### 单轮写入时序
+
+`ChatCompletionService.complete` → `AgentGraphRunner`（LangGraph）：
+
+```text
+complete
+  ├─ 会话 ConversationSession: create_session (INSERT OR IGNORE)
+  ├─ 会话 ConversationSession.external_memory_enabled: lock_session_external_memory（首写获胜）
+  ├─ 消息 ConversationMessage: append_message(role=user) × N
+  └─ 会话 ConversationSession.title: ensure_title（异步后台）
+load_context（装配本轮 Provider Request 的 Session Context 部分）
+  ├─ 消息 ConversationMessage: list_messages → 历史消息 history
+  └─ 滚动摘要 Summary: get_summary → existing_summary（不进 messages，仅作下次 summarize 入参）
+call_llm（装配 Stable + Turn Context，发出 Provider Request）
+  ├─ *外置记忆*静态快照: 随 system prompt 注入（Stable Context）
+  ├─ *外置记忆*动态检索: prefetch_all → <memory-context> 临时拼到 user 消息副本（Turn Context，不污染 state）
+  ├─ llm.chat → Provider Request
+  └─ scrub_memory_context(final_message)  # 剥离回声，防写回 消息 ConversationMessage
+execute_tools
+  ├─ 工具调用 ToolCall: save_tool_call 持久化工具执行事实
+  └─ *外置记忆*自动更新: LLM 主动调用工具external_memory，更新外置记忆 Markdown 文件
+update_memory（更新*会话记忆*）
+  ├─ 消息 ConversationMessage: append_message(role=assistant, content 含 tool_calls)
+  ├─ 消息 ConversationMessage: append_message(role=tool, tool_call_id, name)
+  ├─ 任务状态 TaskState: save_task_state(status=running|failed)
+  └─ 滚动摘要 Summary: summarize → save_summary（覆盖最新值）
+finalize
+  ├─ 消息 ConversationMessage: 错误兜底 append_message(role=assistant, 错误文案)
+  ├─ *外置记忆*消息同步: sync_all，同步本轮对话内容、给外部记忆provider，由provider自己决定要做什么
+  └─ 任务状态 TaskState: save_task_state(status=run_status)
+```
+
+关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外置记忆由 `ExternalMemoryManager` 路由到 provider，通过工具写入 Markdown 文件。LLM 回声中的 `<memory-context>` 在持久化前被剥离，避免把 Turn Context 的临时召回内容写回 消息 ConversationMessage。
+
+
 ---
 
 ## 分层边界

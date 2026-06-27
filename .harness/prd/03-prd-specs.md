@@ -115,13 +115,16 @@
     - 对话：停用状态的外置记忆，也会被展示出来，不符合预期
     - 对话：对话框，外置记忆默认收起，点击展开图标后可编辑，再点击收起图标后恢复到默认的收起
 
+[20260627]
+    - 源码：整理Memory体系，输出到DDD文档的`## Memory`章节，要求言简意赅
+    - 源码：Context Frame 的真实样例
+
 
 ---
 
 [待办]
 - Issue
 - NFR
-    - 源码：Memory，整理Memory体系，输出到DDD文档，要求输出保持简洁
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 治理：IAM，安全护栏
 - FR
