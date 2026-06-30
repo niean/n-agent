@@ -33,3 +33,7 @@ dev = [
 asyncio_mode = "auto"
 pythonpath = ["."]
 testpaths = ["tests"]
+filterwarnings = [
+  "ignore:The default value of `allowed_objects` will change in a future version:langchain_core._api.deprecation.LangChainPendingDeprecationWarning",
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]

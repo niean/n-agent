@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 
@@ -141,3 +142,44 @@ async def test_delete_session_cascades_related_rows(tmp_path):
 async def test_delete_session_returns_false_when_missing(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     assert await store.delete_session("nope") is False
+
+
+@pytest.mark.asyncio
+async def test_list_recent_tool_calls_filters_by_name_and_orders_desc(tmp_path):
+    """Dashboard execute-code history relies on this for session_id=None queries."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    await store.create_session(ConversationSession(id="s2"))
+    first_created_at = datetime(2026, 7, 1, 10, 0, 0, tzinfo=timezone.utc)
+    second_created_at = datetime(2026, 7, 1, 10, 0, 5, tzinfo=timezone.utc)
+    third_created_at = datetime(2026, 7, 1, 10, 0, 10, tzinfo=timezone.utc)
+    await store.save_tool_call(ToolCall(
+        id="tc1", session_id="s1", tool_name="execute_code",
+        arguments={"code_hash": "aaa"}, status="success", duration_ms=10,
+        created_at=first_created_at,
+    ))
+    await store.save_tool_call(ToolCall(
+        id="tc2", session_id="s2", tool_name="search_knowledge",
+        arguments={"q": "x"}, status="success", duration_ms=5,
+        created_at=second_created_at,
+    ))
+    await store.save_tool_call(ToolCall(
+        id="tc3", session_id="s2", tool_name="execute_code",
+        arguments={"code_hash": "bbb"}, status="error", duration_ms=20,
+        created_at=third_created_at,
+    ))
+
+    # Filter by execute_code, limit 50
+    history = await store.list_recent_tool_calls(tool_name="execute_code", limit=50)
+    assert [tc.id for tc in history] == ["tc3", "tc1"]  # DESC by created_at
+    assert [tc.created_at for tc in history] == [third_created_at, first_created_at]
+
+    # No filter, limit 2
+    recent = await store.list_recent_tool_calls(limit=2)
+    assert len(recent) == 2
+    assert recent[0].id == "tc3"  # most recent first
+    assert recent[0].created_at == third_created_at
+
+    # No filter, limit 50 returns all
+    all_calls = await store.list_recent_tool_calls(limit=50)
+    assert len(all_calls) == 3

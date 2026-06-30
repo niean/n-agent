@@ -17,13 +17,13 @@
   }
 
   // 确保容器存在：外部记忆 tab 由 external-memory.js 接管渲染并在刷新时清空节点，
-  // 因此本模块在初始化时若找不到容器则自行创建并追加到 tab-tools-external-memory。
+  // 因此本模块在初始化时若找不到容器则自行创建并追加到 tab-memory。
   function ensureContainer() {
     let container = root();
     if (container) return container;
     container = document.createElement('div');
     container.id = 'external-memory-providers-list';
-    const tab = ui.byId ? ui.byId('tab-tools-external-memory') : document.getElementById('tab-tools-external-memory');
+    const tab = ui.byId ? ui.byId('tab-memory') : document.getElementById('tab-memory');
     if (tab) tab.appendChild(container);
     return container;
   }

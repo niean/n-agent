@@ -136,6 +136,8 @@ mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, en
 mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
 knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 external_memory_providers(id, name UNIQUE, provider_type, base_url, api_key, enabled, extra_config, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
+sandbox_released_history(id, session_id, sandbox_type, sandbox_id, created_at, released_at, reason)
+sandbox_execution_history(id, session_id, code_hash, code, result_json, status, duration_ms, authorized_callback_tools_json, created_at)
 ```
 
 providers 表唯一索引：
@@ -151,6 +153,9 @@ CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active
 ```sql
 idx_messages_session_created_at ON messages(session_id, created_at)
 idx_tool_calls_session_created_at ON tool_calls(session_id, created_at)
+idx_sandbox_released_history_released_at ON sandbox_released_history(released_at)
+idx_sandbox_execution_history_created_at ON sandbox_execution_history(created_at)
+idx_sandbox_execution_history_session_created_at ON sandbox_execution_history(session_id, created_at)
 ```
 
 JSON 边界：
@@ -159,11 +164,12 @@ JSON 边界：
 - `messages.content_json` 存储消息内容
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果
+- `sandbox_execution_history.result_json` 存储 execute_code 沙盒执行结果，`authorized_callback_tools_json` 存储本次实际授权的 callback tool 名称列表
 - `mcp_tools.input_schema_json` 存储 MCP 远端工具 schema
 - `mcp_sites.args_json` 和 `mcp_sites.env_json` 存储 stdio MCP server 的参数数组和环境变量映射
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
 
-会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。
+会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。沙盒审计数据不属于 Chat Session 级联删除范围：`sandbox_released_history` 与 `sandbox_execution_history` 由沙盒 Dashboard 显式删除动作或运维清理策略处理，释放沙盒和删除会话均不应自动删除这些长期历史。
 
 ## OpenAI-compatible 协议边界
 
@@ -205,6 +211,8 @@ volumes:
 因此：
 
 - SQLite 数据保存在宿主机 `/Users/niean/install/n-agent/locals/sessions.db`
+- 废弃沙盒历史保存在同一 SQLite 的 `sandbox_released_history` 表；释放沙盒会删除 scratch 运行目录，但不会删除该历史表记录
+- execute_code 执行历史保存在同一 SQLite 的 `sandbox_execution_history` 表；Dashboard 兼容读取旧 `tool_calls` 记录，但长期保存以沙盒历史表为准，删除 Chat Session 不会清理该表
 - 文件工具只能访问宿主机 `/Users/niean/install/n-agent/workspace` 对应的容器路径 `/workspace`
 - KB 后端是外部独立服务，Dashboard 中每条 knowledge_bases 记录的 base_url 必须从 N-Agent 运行环境可达；容器内不能使用指向 N-Agent 容器自身的 localhost，应使用 Compose service name、共享 network 或宿主机网关地址
 - N-Agent compose 访问 N-KB 时应把 n-agent 容器加入 N-KB 所在 Docker 网络（`n-kb_default`，external），并以 KB base_url `http://n-kb:8212` 通过 service name 直连。否则 hostname 会被 Docker Desktop 内部 DNS 解析到不可达代理地址，TCP 表面 connect 成功但 HTTP 响应被丢弃，httpx 抛 RemoteProtocolError

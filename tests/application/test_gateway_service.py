@@ -220,6 +220,7 @@ async def test_gateway_service_creates_source_session_and_runs_chat():
     assert response.messages[0].content == "pong"
     assert harness.session_service.created[0].source == "cli"
     assert harness.chat_service.requests[0].session_id == response.session_id
+    assert harness.chat_service.requests[0].model == "model-a"
 
 
 @pytest.mark.asyncio

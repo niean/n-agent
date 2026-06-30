@@ -75,3 +75,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：本地 Compose 重启脚本必须分别检查容器内 health、宿主端口 health 和 public nginx health，并给所有 curl 设置硬超时。若容器内 health 通过但宿主端口无响应，应自动 `docker compose restart <service>` 刷新 Docker Desktop port proxy，而不是继续等待 nginx 504 或误判为应用启动慢。
 
 来源：bug fix 260626 restart 后 nagent.localhost health 偶发卡死
+
+### P008: 沙盒审计历史不能复用会话 tool_calls 作为唯一持久源
+
+现象：沙盒废弃/释放后，Dashboard 虽能看到释放记录，但 execute_code 执行历史仍会在删除 Chat Session 或清理会话消息后消失，用户感知为“SQLite 存储了但长期保存没达成”。
+
+根因：上一次只把废弃沙盒生命周期写入 `sandbox_released_history`，执行历史仍从 MemoryStore 的 `tool_calls` 表读取。`tool_calls` 属于 Chat Session 上下文，会被 `MemoryStore.delete_session` 级联删除，不适合作为沙盒审计记录的唯一来源。
+
+教训：审计/运维历史如果要求长期保存，必须有独立于业务会话生命周期的 registry/table，并在 Dashboard 读路径上优先使用该表；兼容旧数据可以合并 legacy 表，但不能继续把 legacy 表当作权威来源。
+
+来源：bug fix 260701 沙盒执行历史长期保存

@@ -8,12 +8,13 @@
     status: false,
     'scheduled-tasks': false,
     platforms: false,
+    memory: false,
+    sandbox: false,
     'tools-builtin': false,
     'tools-mcp': false,
     'tools-knowledge': false,
     'tools-skill': false,
     'tools-plugin': false,
-    'tools-external-memory': false,
   };
 
   function resolveModule(tab) {
@@ -22,14 +23,15 @@
     if (tab === 'tools-skill') return namespace.skills;
     if (tab === 'tools-knowledge') return namespace.knowledge;
     if (tab === 'tools-plugin') return namespace.plugin;
-    if (tab === 'tools-external-memory') return namespace.externalMemory;
+    if (tab === 'memory') return namespace.externalMemory;
+    if (tab === 'sandbox') return namespace.sandbox;
     return null;
   }
 
   // 部分 tab 存在次级模块：主模块完成渲染（可能清空 tab 节点）后再初始化次级模块，
   // 避免次级模块的容器被主模块的清空操作覆盖。
   function resolveSecondaryModule(tab) {
-    if (tab === 'tools-external-memory') return namespace.externalMemoryProviders;
+    if (tab === 'memory') return namespace.externalMemoryProviders;
     return null;
   }
 

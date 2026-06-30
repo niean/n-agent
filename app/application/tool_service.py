@@ -50,7 +50,11 @@ class ToolService:
                 return dynamic[name]
         return None
 
-    def list_openai_tools(self, risk_level: RiskLevel | None = None) -> list[dict]:
+    def list_openai_tools(
+        self,
+        risk_level: RiskLevel | None = None,
+        context: ToolExecutionContext | None = None,
+    ) -> list[dict]:
         return [
             {
                 "type": "function",

@@ -16,6 +16,10 @@ from app.application.model_service import ModelService
 
 
 EXTERNAL_MODEL_ID = "N-Agent"
+# 客户端可能用 /v1/models 广告的占位 id（EXTERNAL_MODEL_ID）或空 model 字段发请求；
+# 这些值不是后端 provider 的真实模型 id，需要回退到 ModelService.default_model。
+# 直接透传会导致 provider 拒绝（如 Ark "does not support agent plan feature"）。
+PLACEHOLDER_MODEL_IDS = {EXTERNAL_MODEL_ID, "model", ""}
 
 
 class ChatMessage(BaseModel):
@@ -64,8 +68,9 @@ def create_openai_router(chat_service: ChatCompletionService, model_service: Mod
 
     @router.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest, x_session_id: str | None = Header(default=None)):
+        resolved_model = request.model if request.model not in PLACEHOLDER_MODEL_IDS else model_service.default_model
         app_input = ChatCompletionInput(
-            model=request.model,
+            model=resolved_model,
             messages=[message.model_dump() for message in request.messages],
             stream=request.stream,
             metadata=request.metadata,

@@ -1,5 +1,14 @@
 name: n-agent
 
+# 沙盒 Docker 后端开启说明（sandbox_type=docker）：
+#   1) 取消下方 docker.sock 挂载注释；
+#   2) 容器内 docker CLI 可用（见 docker/Dockerfile 中 docker-ce-cli 安装）；
+#   3) 配置 N_AGENT_SANDBOX_DOCKER_HOST_WORKSPACE_ROOT 与
+#      N_AGENT_SANDBOX_DOCKER_HOST_LOCALS_ROOT 指向宿主路径，须与下方 volumes
+#      挂载源一致（workspace 与 locals 的宿主路径），否则兄弟沙盒容器 -v 挂载
+#      到不存在的宿主目录。scratch 默认复用 locals/sandbox-scratch。
+#   注：宿主路径以实际部署机为准。
+
 services:
   n-agent:
     build:
@@ -24,6 +33,8 @@ services:
     volumes:
       - ~/app/locals:/app/locals
       - ~/workspace:/workspace
+      # 沙盒 Docker 后端：sandbox_type=docker 时取消注释，并确保容器内 docker CLI 可用（见 Dockerfile）
+      # - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - default
       - n-kb

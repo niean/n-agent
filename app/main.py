@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import sys
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -66,9 +67,56 @@ from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 from app.interfaces.http.openai import create_openai_router
 from app.interfaces.http.platforms import create_platforms_router
+from app.infrastructure.sandbox.callback_tools import (
+    PatchTool,
+    ReadFileTool,
+    SearchFilesTool,
+    WebExtractTool,
+    WebSearchTool,
+    WriteFileTool,
+)
+from app.infrastructure.sandbox.history_registry import SQLiteSandboxExecutionHistoryRegistry
+from app.infrastructure.sandbox.manager import SandboxManager
+from app.infrastructure.sandbox.released_registry import SQLiteReleasedSandboxRegistry
+from app.infrastructure.sandbox.registry import InMemorySandboxCallbackToolRegistry
+from app.infrastructure.sandbox.search_provider import DuckDuckGoHtmlSearchProvider
+from app.application.sandbox_dashboard_service import SandboxDashboardService
+from app.application.sandbox_tool_executor import SandboxToolExecutor
+from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
+
+if TYPE_CHECKING:
+    from app.infrastructure.sandbox.manager import SandboxManager as _SandboxManager
 
 
 logger = logging.getLogger(__name__)
+
+
+class _BuiltinWebFetcherAdapter:
+    """WebFetcher shim that reuses BuiltinToolExecutor's _web_fetch impl."""
+
+    def __init__(
+        self,
+        workspace_root,
+        timeout_seconds: float,
+        max_bytes: int,
+        allow_private_urls: bool,
+    ) -> None:
+        from app.infrastructure.tools.builtin import BuiltinToolExecutor
+
+        self._executor = BuiltinToolExecutor(
+            workspace_root,
+            web_fetch_timeout_seconds=timeout_seconds,
+            web_fetch_max_bytes=max_bytes,
+            web_fetch_allow_private_urls=allow_private_urls,
+        )
+
+    async def fetch(self, url: str) -> dict:
+        try:
+            return self._executor._web_fetch(url, "text")
+        except PermissionError as exc:
+            return {"status": "error", "error": str(exc)}
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
 
 
 def _provider_factory(cfg: ProviderConfig, api_key: str):
@@ -173,6 +221,8 @@ class ApplicationServices:
     platform_registry: PlatformRegistry
     platform_service: PlatformService
     health_snapshot: Callable[[], dict]
+    sandbox_dashboard_service: "SandboxDashboardService | None" = None
+    sandbox_manager: "_SandboxManager | None" = None
 
 
 def build_application_services(settings: Settings | None = None) -> ApplicationServices:
@@ -417,6 +467,151 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     routes["schedule_query"] = schedule_management_executor
     tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
 
+    # Sandbox assembly (T24)
+    sandbox_callback_registry = InMemorySandboxCallbackToolRegistry()
+    sandbox_search_provider = DuckDuckGoHtmlSearchProvider()
+    sandbox_web_fetcher = _BuiltinWebFetcherAdapter(
+        settings.workspace_root,
+        timeout_seconds=settings.web_fetch_timeout_seconds,
+        max_bytes=settings.web_fetch_max_bytes,
+        allow_private_urls=settings.web_fetch_allow_private_urls,
+    )
+    sandbox_callback_tool_instances = {
+        "read_file": ReadFileTool(name="read_file"),
+        "write_file": WriteFileTool(name="write_file"),
+        "search_files": SearchFilesTool(name="search_files"),
+        "patch": PatchTool(name="patch"),
+        "web_extract": WebExtractTool(fetcher=sandbox_web_fetcher),
+        "web_search": WebSearchTool(provider=sandbox_search_provider),
+    }
+    desired_callback_tools = set(settings.sandbox_callback_tools or [])
+    for name, tool in sandbox_callback_tool_instances.items():
+        if name not in desired_callback_tools:
+            continue
+        if name == "web_extract" and not settings.web_fetch_enabled:
+            continue
+        if name == "web_search" and not (
+            settings.sandbox_web_search_enabled and sandbox_search_provider.is_available()
+        ):
+            continue
+        tool.enabled = True
+        sandbox_callback_registry.register(tool)
+
+    sandbox_released_registry = SQLiteReleasedSandboxRegistry(settings.sqlite_path)
+    sandbox_history_registry = SQLiteSandboxExecutionHistoryRegistry(settings.sqlite_path)
+    sandbox_scratch_root = (
+        settings.sandbox_scratch_root
+        or (settings.workspace_root.parent / "locals" / "sandbox-scratch")
+    )
+    # host_scratch_root: 容器化部署时宿主可见的 scratch 路径。
+    # 若用户配置了 sandbox_docker_host_locals_root，scratch 挂在其下 sandbox-scratch 子目录；
+    # 否则默认与 scratch_root 相同（n-agent 直接跑宿主机时成立）。
+    if settings.sandbox_docker_host_locals_root is not None:
+        sandbox_host_scratch_root = settings.sandbox_docker_host_locals_root / "sandbox-scratch"
+    else:
+        sandbox_host_scratch_root = sandbox_scratch_root
+    sandbox_manager = SandboxManager(
+        sandbox_type=settings.sandbox_type,
+        workspace_root=settings.workspace_root,
+        idle_seconds=settings.sandbox_idle_seconds,
+        settings=settings,
+        callback_registry=sandbox_callback_registry,
+        scratch_root=sandbox_scratch_root,
+        release_wait_timeout_seconds=settings.sandbox_release_wait_timeout_seconds,
+        host_workspace_root=settings.sandbox_docker_host_workspace_root or settings.workspace_root,
+        host_scratch_root=sandbox_host_scratch_root,
+        released_registry=sandbox_released_registry,
+    )
+    sandbox_tool_executor = SandboxToolExecutor(
+        sandbox_manager=sandbox_manager,
+        callback_registry=sandbox_callback_registry,
+        settings=settings,
+        history_registry=sandbox_history_registry,
+        summary_max_stdout=settings.sandbox_summary_max_stdout_bytes,
+        summary_max_stderr=settings.sandbox_summary_max_stderr_bytes,
+    )
+    sandbox_dashboard_service = SandboxDashboardService(
+        sandbox_manager=sandbox_manager,
+        memory_store=memory_store,
+        settings=settings,
+        history_registry=sandbox_history_registry,
+    )
+
+    # Register execute_code tool when sandbox enabled
+    sandbox_docker_available = False
+    if settings.sandbox_enabled:
+        if settings.sandbox_type == "local":
+            logger.warning(
+                "sandbox_type=local is trusted-dev only, not a security sandbox; "
+                "use docker for production"
+            )
+        elif settings.sandbox_type == "docker":
+            docker_path = shutil.which("docker")
+            if not docker_path:
+                logger.warning(
+                    "sandbox_type=docker but docker CLI not found on PATH; "
+                    "sandbox will report docker_unavailable"
+                )
+            else:
+                import subprocess as _sb
+                try:
+                    proc = _sb.run(
+                        ["docker", "info"],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    if proc.returncode == 0:
+                        sandbox_docker_available = True
+                    else:
+                        logger.warning(
+                            "sandbox_type=docker but `docker info` exited %d; "
+                            "sandbox will report docker_unavailable "
+                            "(is docker.sock mounted?)",
+                            proc.returncode,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "sandbox_type=docker but `docker info` failed: %s; "
+                        "sandbox will report docker_unavailable",
+                        exc,
+                    )
+
+    if settings.sandbox_enabled:
+        enabled_tool_names = sorted(
+            t.name for t in sandbox_callback_registry.list_enabled()
+        )
+        execute_code_description = (
+            "Execute Python code in a sandboxed Python 3.11 environment. "
+            "Sandbox constraints: NO network access (socket/urllib/requests will fail), "
+            "workspace mounted read-only, write only to cwd (scratch). "
+            "To access external resources, use callback tools via bare function calls "
+            f"(imported automatically): {', '.join(enabled_tool_names) or 'none'}. "
+            "Example: web_extract(url='https://...') or web_search(query='...')."
+        )
+        execute_code_definition = ToolDefinition(
+            name="execute_code",
+            description=execute_code_description,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "enabled_tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["code"],
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="sandbox",
+            managed=False,
+            enabled=True,
+        )
+        tool_service.set_dynamic_definitions("sandbox", [execute_code_definition])
+        routes["execute_code"] = sandbox_tool_executor
+        tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
+
     def health_snapshot() -> dict:
         memory_status = "ok"
         try:
@@ -446,6 +641,19 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 "status": "ok" if settings.scheduler_enabled else "disabled",
                 "tick_seconds": settings.scheduler_tick_seconds,
                 "timezone": settings.scheduler_timezone,
+            },
+            "sandbox": {
+                "status": (
+                    "disabled" if not settings.sandbox_enabled else (
+                        "ok" if settings.sandbox_type == "docker" and sandbox_docker_available else
+                        "warn" if settings.sandbox_type == "local" else
+                        "docker_unavailable"
+                    )
+                ),
+                "type": settings.sandbox_type,
+                "docker_available": sandbox_docker_available if settings.sandbox_type == "docker" else None,
+                "enabled": settings.sandbox_enabled,
+                "idle_seconds": settings.sandbox_idle_seconds,
             },
         }
 
@@ -481,7 +689,11 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             lifecycles[Platform.FEISHU] = feishu_long_connection_gateway
     platform_registry = InMemoryPlatformRegistry(descriptors, lifecycles)
     platform_service = PlatformService(platform_registry, gateway_registry)
-    session_service.on_session_deleted = schedule_service.handle_session_deleted
+    session_service.add_session_deleted_handler(schedule_service.handle_session_deleted)
+    if settings.sandbox_enabled:
+        async def _release_sandbox_on_session_deleted(session_id: str) -> None:
+            await sandbox_manager.release(session_id, reason="session")
+        session_service.add_session_deleted_handler(_release_sandbox_on_session_deleted)
     return ApplicationServices(
         settings=settings,
         memory_store=memory_store,
@@ -505,6 +717,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         platform_registry=platform_registry,
         platform_service=platform_service,
         health_snapshot=health_snapshot,
+        sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
+        sandbox_manager=sandbox_manager if settings.sandbox_enabled else None,
     )
 
 
@@ -528,6 +742,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
         if services.feishu_long_connection_gateway is not None:
             feishu_task = asyncio.create_task(services.feishu_long_connection_gateway.start())
+        if services.sandbox_manager is not None:
+            try:
+                await services.sandbox_manager.cleanup_orphan_containers()
+            except Exception:
+                logger.exception("sandbox orphan cleanup failed at startup")
+            services.sandbox_manager.start_reaper()
         try:
             yield
         finally:
@@ -544,6 +764,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await feishu_task
                 except asyncio.CancelledError:
                     pass
+            if services.sandbox_manager is not None:
+                try:
+                    await services.sandbox_manager.stop_reaper()
+                except Exception:
+                    logger.exception("sandbox reaper stop failed")
             if services.external_memory_service is not None:
                 try:
                     services.external_memory_service.shutdown()
@@ -567,6 +792,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             knowledge_service=services.knowledge_service,
             external_memory_service=services.external_memory_service,
             external_memory_provider_service=services.external_memory_provider_service,
+            sandbox_dashboard_service=services.sandbox_dashboard_service,
         )
     )
     return app

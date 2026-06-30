@@ -16,6 +16,9 @@
   // 仅当为 true 时才向 /v1/chat/completions 携带 options.external_memory_enabled，
   // 未操作时不发送该字段，由后端按会话默认 profile 派生。
   let externalMemoryTouched = false;
+  // 后端真实默认模型 id，启动时从 /chat/models 拉取；硬编码占位符会导致
+  // provider 拒绝 tool 调用（如 Ark "does not support agent plan feature"）。
+  let defaultModel = '';
 
   function appendText(parent, value) {
     parent.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -364,7 +367,7 @@
 
   function buildChatRequestBody(text) {
     const body = {
-      model: 'model',
+      model: defaultModel || 'model',
       messages: [{ role: 'user', content: text }],
       stream: true,
       metadata: { session_id: currentSessionId },
@@ -723,6 +726,16 @@
     showEmptyState();
     updateInfo({});
     loadSessions();
+    loadDefaultModel();
+  }
+
+  async function loadDefaultModel() {
+    try {
+      const data = await api.getAdminModels();
+      defaultModel = (data && data.default_model) ? data.default_model : '';
+    } catch (err) {
+      defaultModel = '';
+    }
   }
 
   global.NAGENT = namespace;

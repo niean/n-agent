@@ -162,6 +162,43 @@
         - 审阅：发现严重问题，spec-260630-holographic-recall-mode.md
         - 已交付 2026-06-30：recall_mode 三模式（hybrid默认/context/tools）+ 拆出 fact_search 只读检索工具收敛信任边界 + 修复 active provider 编辑静默不生效
     - 记忆：检索记忆，编辑时无法修改名称，需要支持改名
+    - 沙盒：[KF]实现执行沙盒Sandbox，至少包括Local和Docker
+        - 要求：参照HermesAgent，源码/Users/niean/code/github.com/niean/hermes-agent
+        - 审阅：发现严重问题(20个)，spec-260630-tool-sandbox.md
+        - 审阅：发现严重问题(20个)，plan-260630-tool-sandbox.md
+        - 约束：相比HermesAgent，spec做了哪些裁剪、折中，明确List出来、写到spec文件
+        - 迭代：沙盒Dashboard，活跃沙盒、待确认、已确认代码、执行历史改用List表格，页面元素遵从HE
+        - 迭代：沙盒Dashboard，配置sector改用表格，docker类型为一行、local类型也可为一行，公共列
+        - 验收：①飞书IM端到端测试，发一条让LLM调execute_code的消息，验证confirmation card → 用户点确认 → execute_confirmed 的完整链路；
+        - 验收：②飞书里连续两次发同样的代码请求，第二次应直接执行（无确认卡），fast-path免再确认；
+        - 验收：③Dashboard管控操作，如释放沙盒；
+        - 验收：④回调工具在沙盒内真实可用；
+        - 验收：⑤沙盒内network隔离；
+        - 验证：⑥workspace只读保护；
+        - 验证：⑦执行超时强杀；
+        - 验证：⑧空闲回收；
+        - 验证：⑨Session沙盒生命周期跟随Session；
+
+[20260701]
+- FR
+    - 沙盒：实现执行沙盒Sandbox，验收和收尾
+        - 前端：概述，补全沙盒Sandbox信息
+        - 沙盒：待确认、已确认、执行历史的代码，操作列新增代码按钮、点击后弹框展示代码，弹框风格要跟`记忆`页的弹框保持一致
+        - 飞书：执行一次，点击后Disable、防止错误点两次
+        - 沙盒：执行历史，操作列支持查看详情
+        - 沙盒：配置，docker干掉最长存活、保留空闲回收
+        - 沙盒：活跃沙盒，要展示pod唯一标志如name；新增废弃沙盒列表，放在活跃沙盒下方，展示已经废弃的沙盒，列表风格跟活跃沙盒一致
+        - 沙盒：废弃沙盒，标注废弃的原因，如手动释放、空闲到期
+        - 沙盒：沙盒列表，类型列放到Pod名称列之前，包括活跃、废弃
+        - 沙盒：执行历史，操作支持删除
+        - 沙盒：废弃沙盒，历史数据会被删除，希望长期保存
+        - 沙盒：沙盒，Pod名称列改名为`沙盒标识`，解除对docker类型的耦合
+        - 沙盒：执行历史，代码合并到详情弹出框展示，干掉代码按钮、详情放到删除右侧
+        - 沙盒：Dashboard，刷新按钮只刷新UI容器、不要刷新整个页面
+    - 沙盒：记忆、沙盒调整为一级菜单，跟工具并列
+    - 沙盒：execute_code抽象为通用领域能力，支持从Dashboard Chat、Gateway等`所有通道`；核心哲学是execute_code不需要确认，沙盒即安全边界。要求参照HermesAgent，源码/Users/niean/code/github.com/niean/hermes-agent。
+        - 审阅：发现并修复严重问题(20个)，spec-260701-execute-code-direct.md
+        - 验证：Chat、CLI、飞书IM、OpenWebUI，execute_code执行验证通过
 
 
 ---
@@ -169,17 +206,18 @@
 [待办]
 - Issue
 - NFR
+    - 文档：Sandbox执行链路，DDD
+    - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
+    - 工具：相比Hermes，还缺少哪些功能？明确List出来
 - FR
-    - 工具：Sandbox，Pod运行时
+    - 沙盒：支持Terminal命令，需要危险命令确认
     - 工具：Plugin
-    - 工具：相比Hermes，还缺少如下功能
-        不实现 plugin system。
-        不实现 agent-loop 特殊工具，比如 delegate_task、memory、todo。
-        不实现 pre/post tool hook。
     - 工具：Skill自进化
+    - 平台：ACP，级联VsCode
+    - 平台：CLI，对标Hermes
 
 ---
 

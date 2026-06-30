@@ -12,6 +12,7 @@ class FakeFeishuClient:
         self.payload = payload
         self.sent: list[tuple[str, str]] = []
         self.cards: list[tuple[str, dict, str]] = []
+        self.updates: list[tuple[str, dict]] = []
         self.reactions: list[tuple[str, str]] = []
         self.events = []
 
@@ -28,6 +29,9 @@ class FakeFeishuClient:
 
     async def send_interactive_card(self, receive_id, card, receive_id_type="chat_id"):
         self.cards.append((receive_id, card, receive_id_type))
+
+    async def update_card(self, message_id, card):
+        self.updates.append((message_id, card))
 
     async def add_reaction(self, message_id, emoji_type="Typing"):
         self.reactions.append((message_id, emoji_type))
@@ -81,7 +85,7 @@ def card_payload(choice="once"):
         "header": {"event_id": "card-event-1", "app_id": "app-1"},
         "event": {
             "operator": {"open_id": "ou_1"},
-            "context": {"open_chat_id": "oc_1"},
+            "context": {"open_chat_id": "oc_1", "open_message_id": "card-msg-1"},
             "action": {"value": {"confirmation_id": "confirm-1", "choice": choice, "platform_session_id": "oc_1", "thread_id": ""}},
         },
     }

@@ -1,0 +1,255 @@
+"""DockerSandbox — docker CLI + UDS RPC via bind-mount socket.
+
+Security posture (per spec):
+- cap-drop ALL + no-new-privileges + pids-limit + network=none + tmpfs /tmp
+- workspace mounted :ro (writes must go through callback tools, not direct fs)
+- scratch mounted :rw (per-call staging)
+- sibling container per session, reused across calls; killed on release
+
+UDS RPC (not file-based): the socket file is bind-mounted into the sibling
+container at the same path, so host and container share it. The sandboxed
+code is a pure UDS client and cannot forge server responses.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import shutil
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from uuid import uuid4
+
+from app.domain.sandbox import (
+    Sandbox,
+    SandboxCallbackContext,
+    SandboxExecutionRequest,
+    SandboxExecutionResult,
+    SandboxStatus,
+)
+from app.infrastructure.sandbox.rpc_server import SandboxRpcServer
+from app.infrastructure.sandbox.stub_generator import generate_stub
+
+
+logger = logging.getLogger(__name__)
+
+_SECRET_RE = re.compile(r"(api[_-]?key|token|secret|password|bearer)", re.IGNORECASE)
+
+
+def _redact_secrets(text: str) -> str:
+    return _SECRET_RE.sub("****", text)
+
+
+class DockerSandbox(Sandbox):
+    def __init__(
+        self,
+        registry,
+        workspace_root: Path,
+        image: str,
+        cpus: float,
+        memory_mb: int,
+        session_container_name: str,
+        network: bool = False,
+        host_workspace_root: Path | None = None,
+        host_scratch_root: Path | None = None,
+    ) -> None:
+        self.registry = registry
+        self.workspace_root = workspace_root
+        self.image = image
+        self.cpus = cpus
+        self.memory_mb = memory_mb
+        self.session_container_name = session_container_name
+        self.network = network
+        self.host_workspace_root = host_workspace_root or workspace_root
+        self.host_scratch_root = host_scratch_root or workspace_root
+        self.container_status: str | None = None  # None = not running
+
+    def is_available(self) -> bool:
+        if shutil.which("docker") is None:
+            return False
+        try:
+            r = asyncio.run(self._run_docker(["info"]))
+            return r == 0
+        except Exception:
+            return False
+
+    async def _run_docker(self, args: list[str], timeout: float = 30.0) -> int:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        return proc.returncode if proc.returncode is not None else -1
+
+    async def _ensure_container(self) -> None:
+        if self.container_status == "running":
+            # Verify still alive
+            rc = await self._run_docker(["inspect", "-f", "{{.State.Running}}", self.session_container_name])
+            if rc == 0:
+                return
+            self.container_status = None
+        network_flag = "--network=none" if not self.network else ""
+        args = [
+            "run", "-d", "--init",
+            "--name", self.session_container_name,
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--pids-limit", "256",
+            "--memory", f"{self.memory_mb}m",
+            "--cpus", str(self.cpus),
+            "--tmpfs", "/tmp:rw,nosuid,size=512m",
+        ]
+        if not self.network:
+            args.append("--network=none")
+        args.extend([
+            "-v", f"{self.host_workspace_root}:/workspace:ro",
+            "-v", f"{self.host_scratch_root}:/scratch",
+            "-w", "/scratch",
+            self.image, "sleep", "infinity",
+        ])
+        rc = await self._run_docker(args)
+        if rc != 0:
+            raise RuntimeError(f"docker run failed for {self.session_container_name} (rc={rc})")
+        self.container_status = "running"
+
+    async def execute(self, request: SandboxExecutionRequest) -> SandboxExecutionResult:
+        start = datetime.now(timezone.utc)
+        staging = request.scratch_dir
+        staging.mkdir(parents=True, exist_ok=True)
+        # staging.name is "call-<uuid>" set by SandboxManager.new_call_staging;
+        # reuse it so container_staging path matches the host staging directory.
+        call_uuid = staging.name  # call-<uuid>
+        # Container-side paths (host staging is bind-mounted to /scratch)
+        safe_session = staging.parent.name  # sess-<safe>
+        container_staging = f"/scratch/{safe_session}/{call_uuid}"
+        container_sock = f"{container_staging}/rpc.sock"
+        stub_path = staging / "nagent_tools.py"
+        script_basename = f"script-{staging.name.removeprefix('call-')}.py"
+        script_path = staging / script_basename
+        enabled = sorted(request.enabled_callback_tools)
+        stub_path.write_text(generate_stub(enabled, rpc_socket_path=container_sock), encoding="utf-8")
+        script_path.write_text(
+            "import sys; sys.path.insert(0, %r)\nfrom nagent_tools import *\n" % container_staging
+            + "NAGENT_TIMEOUT = %d\n" % request.timeout_seconds
+            + "import threading, os, time\n"
+            + "def _watchdog():\n"
+            + "    time.sleep(NAGENT_TIMEOUT); os._exit(124)\n"
+            + "threading.Thread(target=_watchdog, daemon=True).start()\n"
+            + request.code,
+            encoding="utf-8",
+        )
+        # Host-side socket path mirrors container-side (bind-mount same path)
+        host_sock = str(staging / "rpc.sock")
+        ctx = SandboxCallbackContext(
+            workspace_root=request.workspace_root,
+            trusted_metadata=request.trusted_metadata,
+            session_id=request.session_id,
+            scratch_dir=staging,
+        )
+        server = SandboxRpcServer(
+            registry=self.registry,
+            socket_path=host_sock,
+            workspace_root=request.workspace_root,
+            scratch_dir=staging,
+            trusted_metadata=request.trusted_metadata,
+            session_id=request.session_id,
+            max_tool_calls=request.max_tool_calls,
+            callback_context=ctx,
+        )
+        await server.start_async()
+        try:
+            await self._ensure_container()
+        except RuntimeError as exc:
+            await server.stop()
+            end = datetime.now(timezone.utc)
+            return SandboxExecutionResult(
+                status=SandboxStatus.ERROR,
+                stdout="", stderr=f"container start failed: {exc}",
+                returncode=-1, tool_calls_made=0,
+                duration_seconds=(end - start).total_seconds(),
+                tool_call_log=[],
+            )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", "-w", container_staging,
+                self.session_container_name, "python", "-u", script_basename,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            await server.stop()
+            end = datetime.now(timezone.utc)
+            return SandboxExecutionResult(
+                status=SandboxStatus.ERROR,
+                stdout="", stderr=f"docker exec failed: {exc}",
+                returncode=-1, tool_calls_made=server.tool_calls_made,
+                duration_seconds=(end - start).total_seconds(),
+                tool_call_log=server.tool_call_log,
+            )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=request.timeout_seconds
+            )
+            returncode = proc.returncode if proc.returncode is not None else -1
+            status = SandboxStatus.SUCCESS if returncode == 0 else SandboxStatus.ERROR
+            if returncode == 124:
+                status = SandboxStatus.TIMEOUT
+        except asyncio.TimeoutError:
+            # Kill by unique script name — avoid clobbering other scripts in the same container
+            await self._run_docker(
+                ["exec", self.session_container_name, "pkill", "-9", "-f", script_basename],
+                timeout=5,
+            )
+            # Drain whatever the subprocess already wrote before it died,
+            # so timeout diagnostics aren't silently lost.
+            stdout_b = b""
+            stderr_b = b""
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2)
+            except asyncio.TimeoutError:
+                # Force-kill the container; mark for rebuild
+                await self._run_docker(["kill", self.session_container_name], timeout=10)
+                await self._run_docker(["rm", "-f", self.session_container_name], timeout=10)
+                self.container_status = None
+            await server.stop()
+            end = datetime.now(timezone.utc)
+            partial_stdout = _redact_secrets(stdout_b.decode("utf-8", errors="replace")[:50000])
+            partial_stderr = _redact_secrets(stderr_b.decode("utf-8", errors="replace")[:10000])
+            return SandboxExecutionResult(
+                status=SandboxStatus.TIMEOUT,
+                stdout=partial_stdout,
+                stderr=f"execution timed out after {request.timeout_seconds}s\n--- partial stderr ---\n{partial_stderr}",
+                returncode=124,
+                tool_calls_made=server.tool_calls_made,
+                duration_seconds=(end - start).total_seconds(),
+                tool_call_log=server.tool_call_log,
+            )
+        await server.stop()
+        end = datetime.now(timezone.utc)
+        stdout = _redact_secrets(stdout_b.decode("utf-8", errors="replace")[:50000])
+        stderr = _redact_secrets(stderr_b.decode("utf-8", errors="replace")[:10000])
+        return SandboxExecutionResult(
+            status=status,
+            stdout=stdout, stderr=stderr,
+            returncode=returncode,
+            tool_calls_made=server.tool_calls_made,
+            duration_seconds=(end - start).total_seconds(),
+            tool_call_log=server.tool_call_log,
+        )
+
+    async def cleanup_container(self) -> None:
+        if self.container_status is None and not self.session_container_name:
+            return
+        for args in (["kill", self.session_container_name], ["rm", "-f", self.session_container_name]):
+            try:
+                await self._run_docker(args, timeout=15)
+            except Exception:
+                continue
+        self.container_status = None

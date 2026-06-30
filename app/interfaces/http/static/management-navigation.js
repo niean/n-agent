@@ -5,13 +5,14 @@
     { tab: 'chat', path: '/chat', label: '对话' },
     { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '任务' },
     { tab: 'sessions', path: '/sessions', label: '会话' },
-    { tab: 'tools', label: '工具', parent: true, children: ['tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin', 'tools-external-memory'] },
-    { tab: 'tools-external-memory', path: '/tools/external-memory', label: '记忆', parentTab: 'tools' },
+    { tab: 'memory', path: '/memory', label: '记忆' },
+    { tab: 'tools', label: '工具', parent: true, children: ['tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin'] },
     { tab: 'tools-knowledge', path: '/tools/knowledge', label: '知识', parentTab: 'tools' },
     { tab: 'tools-mcp', path: '/tools/mcp', label: 'MCP', parentTab: 'tools' },
     { tab: 'tools-skill', path: '/tools/skill', label: 'Skill', parentTab: 'tools' },
     { tab: 'tools-plugin', path: '/tools/plugin', label: 'Plugin', parentTab: 'tools' },
     { tab: 'tools-builtin', path: '/tools/builtin', label: 'Builtin', parentTab: 'tools' },
+    { tab: 'sandbox', path: '/sandbox', label: '沙盒' },
     { tab: 'models', path: '/models', label: '模型' },
     { tab: 'platforms', path: '/platforms', label: '平台' },
     { tab: 'status', path: '/status', label: '观测' },
@@ -33,6 +34,8 @@
   function selectedTabFromPath() {
     const path = window.location.pathname;
     if (tabByPath[path]) return tabByPath[path];
+    if (path === '/tools/external-memory') return 'memory';
+    if (path === '/tools/sandbox') return 'sandbox';
     if (path === '/tools') return TOOLS_DEFAULT_CHILD;
     if (path === '/' || path === '') return 'summary';
     return 'summary';

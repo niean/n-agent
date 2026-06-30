@@ -38,6 +38,14 @@ class MemoryStore(Protocol):
     async def list_tool_calls(self, session_id: str) -> list[ToolCall]:
         ...
 
+    async def list_recent_tool_calls(
+        self, tool_name: str | None = None, limit: int = 50,
+    ) -> list[ToolCall]:
+        ...
+
+    async def delete_tool_call(self, tool_call_id: str) -> bool:
+        ...
+
     async def save_task_state(self, task_state: TaskState) -> TaskState:
         ...
 

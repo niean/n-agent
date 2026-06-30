@@ -53,11 +53,54 @@ class Settings(BaseSettings):
     external_memory_user_limit: int = 2000
     # project_root 复用 workspace_root，不需要新增配置
 
+    # 沙盒配置
+    sandbox_enabled: bool = Field(default=False)
+    sandbox_type: str = Field(default="docker")
+    sandbox_timeout_seconds: int = Field(default=300, gt=0)
+    sandbox_max_tool_calls: int = Field(default=50, ge=1)
+    sandbox_max_stdout_bytes: int = Field(default=50000, ge=1024)
+    sandbox_max_stderr_bytes: int = Field(default=10000, ge=1024)
+    sandbox_summary_max_stdout_bytes: int = Field(default=2000, ge=256)
+    sandbox_summary_max_stderr_bytes: int = Field(default=500, ge=128)
+    sandbox_docker_image: str = Field(default="python:3.11-slim")
+    sandbox_docker_cpus: float = Field(default=1.0, gt=0)
+    sandbox_docker_memory_mb: int = Field(default=512, ge=64)
+    sandbox_docker_network: bool = Field(default=False)
+    sandbox_callback_tools: list[str] | str = Field(
+        default_factory=lambda: [
+            "read_file", "write_file", "search_files", "patch",
+            "web_extract", "web_search",
+        ]
+    )
+    sandbox_web_search_enabled: bool = Field(default=True)
+    sandbox_search_provider: str = Field(default="duckduckgo")
+    sandbox_idle_seconds: int = Field(default=900, gt=0)
+    sandbox_release_wait_timeout_seconds: int = Field(default=30, gt=0)
+    sandbox_docker_host_workspace_root: Path | None = Field(default=None)
+    sandbox_docker_host_locals_root: Path | None = Field(default=None)
+    sandbox_scratch_root: Path | None = Field(default=None)
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
-    @field_validator("sqlite_path", "workspace_root", "skills_root", mode="before")
+    @field_validator("sandbox_type")
     @classmethod
-    def expand_path(cls, value: str | Path) -> Path:
+    def validate_sandbox_type(cls, value: str) -> str:
+        if value not in ("local", "docker"):
+            raise ValueError(
+                f"invalid sandbox_type: {value!r} (must be 'local' or 'docker')"
+            )
+        return value
+
+    @field_validator(
+        "sqlite_path", "workspace_root", "skills_root",
+        "sandbox_docker_host_workspace_root", "sandbox_docker_host_locals_root",
+        "sandbox_scratch_root",
+        mode="before",
+    )
+    @classmethod
+    def expand_path(cls, value: str | Path | None) -> Path | None:
+        if value is None or value == "":
+            return None
         return Path(value).expanduser()
 
     @field_validator("workspace_root")
@@ -74,7 +117,7 @@ class Settings(BaseSettings):
             raise ValueError(f"invalid scheduler timezone: {value}") from exc
         return value
 
-    @field_validator("feishu_allowed_open_ids", "feishu_allowed_chat_ids", mode="before")
+    @field_validator("feishu_allowed_open_ids", "feishu_allowed_chat_ids", "sandbox_callback_tools", mode="before")
     @classmethod
     def parse_csv_list(cls, value: list[str] | str) -> list[str]:
         if isinstance(value, str):

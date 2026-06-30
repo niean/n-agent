@@ -117,6 +117,28 @@
   });
   const refreshSkills = () => fetchJson('/chat/skills/refresh', { method: 'POST' });
 
+  // Sandbox dashboard endpoints — paths align with sandbox_routes.py / spec
+  const getSandboxConfig = () => fetchJson('/chat/sandbox/config');
+  const listSandboxActive = () => fetchJson('/chat/sandbox/active');
+  const listSandboxReleased = () => fetchJson('/chat/sandbox/released');
+  const listSandboxHistory = (sessionId, limit) => fetchJson(
+    `/chat/sandbox/execute-code-history?${new URLSearchParams({ ...(sessionId ? { session_id: sessionId } : {}), ...(limit ? { limit: String(limit) } : {}) })}`,
+  );
+  const deleteSandboxHistory = (toolCallId) => fetchJson(
+    `/chat/sandbox/execute-code-history/${encodeURIComponent(toolCallId)}`, { method: 'DELETE' },
+  );
+  const releaseSandbox = (sessionId) => fetchJson(
+    `/chat/sandbox/active/${encodeURIComponent(sessionId)}/release`, { method: 'POST' },
+  );
+  const sandbox = {
+    getConfig: getSandboxConfig,
+    listActive: listSandboxActive,
+    listReleased: listSandboxReleased,
+    listHistory: listSandboxHistory,
+    deleteHistory: deleteSandboxHistory,
+    releaseSandbox,
+  };
+
   global.NAGENT = namespace;
   global.NAGENT.api = {
     fetchJson,
@@ -167,5 +189,6 @@
     getSkill,
     setSkillEnabled,
     refreshSkills,
+    sandbox,
   };
 }(window));

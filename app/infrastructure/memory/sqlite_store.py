@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -212,19 +213,45 @@ class SQLiteMemoryStore:
                 "SELECT * FROM tool_calls WHERE session_id = ? ORDER BY created_at ASC",
                 (session_id,),
             ).fetchall()
-        return [
-            ToolCall(
-                id=row["id"],
-                session_id=row["session_id"],
-                message_id=row["message_id"],
-                tool_name=row["tool_name"],
-                arguments=json.loads(row["arguments_json"]),
-                result=json.loads(row["result_json"]) if row["result_json"] else None,
-                status=row["status"],
-                duration_ms=row["duration_ms"],
+        return [self._row_to_tool_call(row) for row in rows]
+
+    async def list_recent_tool_calls(
+        self, tool_name: str | None = None, limit: int = 50,
+    ) -> list[ToolCall]:
+        with self._connect() as conn:
+            if tool_name is not None:
+                rows = conn.execute(
+                    "SELECT * FROM tool_calls WHERE tool_name = ? ORDER BY created_at DESC LIMIT ?",
+                    (tool_name, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tool_calls ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._row_to_tool_call(row) for row in rows]
+
+    async def delete_tool_call(self, tool_call_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM tool_calls WHERE id = ?",
+                (tool_call_id,),
             )
-            for row in rows
-        ]
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _row_to_tool_call(row) -> ToolCall:
+        return ToolCall(
+            id=row["id"],
+            session_id=row["session_id"],
+            message_id=row["message_id"],
+            tool_name=row["tool_name"],
+            arguments=json.loads(row["arguments_json"]),
+            result=json.loads(row["result_json"]) if row["result_json"] else None,
+            status=row["status"],
+            duration_ms=row["duration_ms"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
 
     async def save_task_state(self, task_state: TaskState) -> TaskState:
         with self._connect() as conn:

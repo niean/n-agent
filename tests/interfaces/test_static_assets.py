@@ -59,8 +59,9 @@ def test_all_tab_paths_return_shell(tmp_path):
     client = _client(tmp_path)
     paths = (
         "/", "/summary", "/chat", "/sessions",
+        "/memory", "/sandbox",
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
-        "/tools/external-memory",
+        "/tools/external-memory", "/tools/sandbox",
         "/models", "/status", "/scheduled-tasks", "/platforms",
     )
     for path in paths:
@@ -75,9 +76,10 @@ def test_tools_submenu_url_routing(tmp_path):
         res = client.get(f"/tools/{sub}")
         assert res.status_code == 200, f"missing /tools/{sub}"
         assert 'id="app-sidebar"' in res.text
-    res = client.get("/tools/external-memory")
-    assert res.status_code == 200
-    assert 'id="app-sidebar"' in res.text
+    for path in ("/memory", "/sandbox", "/tools/external-memory", "/tools/sandbox"):
+        res = client.get(path)
+        assert res.status_code == 200
+        assert 'id="app-sidebar"' in res.text
 
 
 def test_old_skills_path_removed(tmp_path):
@@ -491,26 +493,35 @@ def test_index_html_links_assets(tmp_path):
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '工具', '模型', '观测', '任务', '平台', '记忆', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin'):
+    for tab in ('概览', '对话', '会话', '记忆', '工具', '沙盒', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin'):
         assert tab in html, f"index.html missing menu label {tab}"
-    for path in ('/summary', '/chat', '/sessions', '/tools/external-memory', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/models', '/platforms', '/status', '/scheduled-tasks'):
+    for path in ('/summary', '/chat', '/sessions', '/memory', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/sandbox', '/models', '/platforms', '/status', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"
-    assert html.index('href="/models"') < html.index('href="/platforms"') < html.index('href="/status"')
     assert (
-        html.index('href="/tools/external-memory"')
-        < html.index('href="/tools/knowledge"')
+        html.index('href="/sessions"')
+        < html.index('href="/memory"')
+        < html.index('data-tab-group="tools"')
+        < html.index('href="/sandbox"')
+        < html.index('href="/models"')
+        < html.index('href="/platforms"')
+        < html.index('href="/status"')
+    )
+    assert (
+        html.index('href="/tools/knowledge"')
         < html.index('href="/tools/mcp"')
         < html.index('href="/tools/skill"')
         < html.index('href="/tools/plugin"')
         < html.index('href="/tools/builtin"')
     )
     assert (
-        html.index('id="tab-tools-knowledge"')
+        html.index('id="tab-sessions"')
+        < html.index('id="tab-memory"')
+        < html.index('id="tab-tools-knowledge"')
         < html.index('id="tab-tools-mcp"')
         < html.index('id="tab-tools-skill"')
         < html.index('id="tab-tools-plugin"')
         < html.index('id="tab-tools-builtin"')
-        < html.index('id="tab-tools-external-memory"')
+        < html.index('id="tab-sandbox"')
     )
     assert html.index('id="tab-chat"') < html.index('id="tab-scheduled-tasks"') < html.index('id="tab-sessions"')
 

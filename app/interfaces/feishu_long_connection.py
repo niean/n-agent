@@ -17,6 +17,8 @@ class FeishuEventClient(Protocol):
 
     async def send_interactive_card(self, receive_id: str, card: dict[str, Any], receive_id_type: str = "chat_id") -> None: ...
 
+    async def update_card(self, message_id: str, card: dict[str, Any]) -> None: ...
+
     async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> None: ...
 
     async def listen_events(self, handler) -> None: ...
@@ -28,6 +30,9 @@ class FeishuLongConnectionGateway:
         self.feishu_client = feishu_client
         self._connected = False
         self._fatal: tuple[str, str] | None = None
+        # confirmation_id -> confirmation dict last rendered to a card, so we
+        # can rebuild the card with disabled buttons after a click.
+        self._last_confirmations: dict[str, dict[str, Any]] = {}
 
     def is_connected(self) -> bool:
         return self._connected
@@ -121,13 +126,36 @@ class FeishuLongConnectionGateway:
         value = event.get("action", {}).get("value", {})
         actor_id = _clean_text(operator.get("open_id"))
         chat_id = _clean_text(context.get("open_chat_id"))
+        card_message_id = _clean_text(context.get("open_message_id"))
         platform_session_id = _clean_text(value.get("platform_session_id")) or chat_id
         thread_id = _clean_text(value.get("thread_id"))
+        confirmation_id = _clean_text(value.get("confirmation_id"))
+        choice = _clean_text(value.get("choice"))
+        # Disable buttons on the original card immediately to prevent the user
+        # from double-clicking while the destructive command is in flight.
+        if card_message_id and confirmation_id:
+            stored = self._last_confirmations.get(confirmation_id)
+            if stored is not None:
+                try:
+                    await self.feishu_client.update_card(
+                        card_message_id,
+                        _confirmation_card(
+                            stored,
+                            platform_session_id,
+                            thread_id,
+                            disabled=True,
+                            status_text=_status_text_for_choice(choice),
+                        ),
+                    )
+                except Exception:
+                    # Best-effort: gateway-side pending_confirmations pop is the
+                    # ultimate guard against double execution.
+                    pass
         response = await self.gateway_service.handle_confirmation(
             GatewaySessionKey(Platform.FEISHU, platform_session_id, thread_id=thread_id, display_name=actor_id),
             actor_id,
-            _clean_text(value.get("confirmation_id")),
-            GatewayConfirmationChoice(_clean_text(value.get("choice"))),
+            confirmation_id,
+            GatewayConfirmationChoice(choice),
         )
         await self._send_response(response, chat_id, "chat_id", platform_session_id, thread_id)
 
@@ -142,6 +170,9 @@ class FeishuLongConnectionGateway:
         for outbound in response.messages:
             confirmation = outbound.metadata.get("confirmation")
             if confirmation is not None:
+                confirmation_id = _clean_text(confirmation.get("id"))
+                if confirmation_id:
+                    self._last_confirmations[confirmation_id] = dict(confirmation)
                 try:
                     await self.feishu_client.send_interactive_card(
                         receive_id,
@@ -149,7 +180,7 @@ class FeishuLongConnectionGateway:
                         receive_id_type,
                     )
                 except Exception:
-                    self.gateway_service.discard_confirmation(_clean_text(confirmation.get("id")))
+                    self.gateway_service.discard_confirmation(confirmation_id)
                     await self.feishu_client.send_text(receive_id, "确认卡片发送失败，请稍后重试", receive_id_type)
                 continue
             await self.feishu_client.send_text(receive_id, outbound.content, receive_id_type)
@@ -160,27 +191,41 @@ def _is_card_action(payload: dict[str, Any]) -> bool:
     return bool(value.get("confirmation_id"))
 
 
-def _confirmation_card(confirmation: dict[str, Any], platform_session_id: str, thread_id: str) -> dict[str, Any]:
+def _confirmation_card(
+    confirmation: dict[str, Any],
+    platform_session_id: str,
+    thread_id: str,
+    *,
+    disabled: bool = False,
+    status_text: str = "",
+) -> dict[str, Any]:
     command = _clean_text(confirmation.get("command"))
     confirmation_id = _clean_text(confirmation.get("id"))
-    return {
-        "config": {"wide_screen_mode": True},
-        "elements": [
-            {"tag": "div", "text": {"tag": "lark_md", "content": f"请确认执行：{command}"}},
-            {
-                "tag": "action",
-                "actions": [
-                    _confirmation_button("执行一次", confirmation_id, "once", platform_session_id, thread_id),
-                    _confirmation_button("本会话信任", confirmation_id, "trust_session", platform_session_id, thread_id),
-                    _confirmation_button("取消", confirmation_id, "cancel", platform_session_id, thread_id),
-                ],
-            },
+    action = _clean_text(confirmation.get("action"))
+    elements: list[dict[str, Any]] = []
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"请确认执行：{command}"}})
+    if status_text:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": status_text}})
+    elements.append({
+        "tag": "action",
+        "actions": [
+            _confirmation_button("执行一次", confirmation_id, "once", platform_session_id, thread_id, disabled),
+            _confirmation_button("本会话信任", confirmation_id, "trust_session", platform_session_id, thread_id, disabled),
+            _confirmation_button("取消", confirmation_id, "cancel", platform_session_id, thread_id, disabled),
         ],
-    }
+    })
+    return {"config": {"wide_screen_mode": True}, "elements": elements}
 
 
-def _confirmation_button(label: str, confirmation_id: str, choice: str, platform_session_id: str, thread_id: str) -> dict[str, Any]:
-    return {
+def _confirmation_button(
+    label: str,
+    confirmation_id: str,
+    choice: str,
+    platform_session_id: str,
+    thread_id: str,
+    disabled: bool = False,
+) -> dict[str, Any]:
+    button: dict[str, Any] = {
         "tag": "button",
         "text": {"tag": "plain_text", "content": label},
         "type": "primary" if choice != "cancel" else "default",
@@ -191,6 +236,19 @@ def _confirmation_button(label: str, confirmation_id: str, choice: str, platform
             "thread_id": thread_id,
         },
     }
+    if disabled:
+        button["disabled"] = True
+    return button
+
+
+def _status_text_for_choice(choice: str) -> str:
+    if choice == "once":
+        return "**已点击「执行一次」，正在处理...**"
+    if choice == "trust_session":
+        return "**已点击「本会话信任」，正在处理...**"
+    if choice == "cancel":
+        return "**已点击「取消」，正在处理...**"
+    return ""
 
 
 def _clean_text(value: Any) -> str:

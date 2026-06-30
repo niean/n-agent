@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from app.domain.memory import MemoryStore
 from app.domain.session import (
@@ -21,7 +22,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-SessionDeletedHandler = Callable[[str], Awaitable[object]]
+# A session-deleted handler may be sync (e.g. cleanup_session on in-memory
+# registries) or async (e.g. SandboxManager.release). Both must be callable.
+SessionDeletedHandler = Callable[[str], Any]
 
 
 class SessionService:
@@ -30,12 +33,37 @@ class SessionService:
         memory_store: MemoryStore,
         title_generator: TitleGenerator | None = None,
         on_session_deleted: SessionDeletedHandler | None = None,
+        on_session_deleted_handlers: list[SessionDeletedHandler] | None = None,
         external_memory_manager: "ExternalMemoryManager | None" = None,
     ):
         self.memory_store = memory_store
         self.title_generator = title_generator
-        self.on_session_deleted = on_session_deleted
         self.external_memory_manager = external_memory_manager
+        self._on_session_deleted_handlers: list[SessionDeletedHandler] = list(
+            on_session_deleted_handlers or []
+        )
+        # Backward-compat: legacy single-handler assignment still works via the
+        # on_session_deleted property (setter appends to the handler list).
+        if on_session_deleted is not None:
+            self._on_session_deleted_handlers.append(on_session_deleted)
+
+    @property
+    def on_session_deleted(self) -> SessionDeletedHandler | None:
+        # Return the first handler if any (legacy callers may read this);
+        # None when no handlers are registered.
+        return self._on_session_deleted_handlers[0] if self._on_session_deleted_handlers else None
+
+    @on_session_deleted.setter
+    def on_session_deleted(self, handler: SessionDeletedHandler | None) -> None:
+        # Legacy single-handler assignment REPLACES the list (old behavior).
+        # New code should use add_session_deleted_handler to append.
+        if handler is None:
+            self._on_session_deleted_handlers = []
+        else:
+            self._on_session_deleted_handlers = [handler]
+
+    def add_session_deleted_handler(self, handler: SessionDeletedHandler) -> None:
+        self._on_session_deleted_handlers.append(handler)
 
     async def create_session(self, session_id: str, source: str = "dashboard") -> ConversationSession:
         existing = await self.memory_store.get_session(session_id)
@@ -97,8 +125,20 @@ class SessionService:
         deleted = await self.memory_store.delete_session(session_id)
         if not deleted:
             raise SessionNotFoundError(session_id)
-        if self.on_session_deleted is not None:
-            await self.on_session_deleted(session_id)
+        await self._invoke_session_deleted_handlers(session_id)
+
+    async def _invoke_session_deleted_handlers(self, session_id: str) -> None:
+        # Handlers may be sync or async; invoke in registration order.
+        # A failure in one handler does not block subsequent handlers.
+        for handler in list(self._on_session_deleted_handlers):
+            try:
+                result = handler(session_id)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning(
+                    "session-deleted handler failed for %s", session_id, exc_info=True,
+                )
 
     async def ensure_title(self, session_id: str, user_message: str) -> None:
         if not self.title_generator or not user_message:

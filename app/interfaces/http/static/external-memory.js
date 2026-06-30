@@ -9,7 +9,7 @@
   let currentFullContent = '';
 
   function root() {
-    return ui.byId ? ui.byId('tab-tools-external-memory') : document.getElementById('tab-tools-external-memory');
+    return ui.byId ? ui.byId('external-memory-files') : document.getElementById('external-memory-files');
   }
 
   function appendCell(row, value) {

@@ -328,7 +328,7 @@ class GatewayService:
 
         result = await self.chat_service.complete(
             ChatCompletionInput(
-                model="N-Agent",
+                model=self.command_service.model_service.default_model,
                 messages=[{"role": "user", "content": event.text}],
                 stream=False,
                 metadata={
@@ -403,7 +403,7 @@ def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:
 
 
 def _confirmation_metadata(confirmation: GatewayConfirmationRequest) -> dict[str, Any]:
-    return {
+    meta = {
         "id": confirmation.id,
         "action": confirmation.action.value,
         "command": confirmation.command,
@@ -411,6 +411,7 @@ def _confirmation_metadata(confirmation: GatewayConfirmationRequest) -> dict[str
         "platform_session_id": confirmation.session_key.platform_session_id,
         "thread_id": confirmation.session_key.thread_id,
     }
+    return meta
 
 
 

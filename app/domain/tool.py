@@ -25,6 +25,7 @@ class ToolResultStatus(str, Enum):
     ERROR = "error"
     PERMISSION_DENIED = "permission_denied"
     TIMEOUT = "timeout"
+    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)

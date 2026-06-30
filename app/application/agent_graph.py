@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Optional
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 
 from app.application.events import ChatEvent, ChatEventType
@@ -14,7 +15,7 @@ from app.domain.agent import AgentState, RunStatus
 from app.domain.memory import MemoryStore, Summarizer
 from app.domain.provider import LLMEventType, LLMProvider, LLMResult
 from app.domain.session import ConversationMessage, Summary, TaskState, ToolCall
-from app.domain.tool import RiskLevel, ToolCallRequest, ToolExecutionContext
+from app.domain.tool import RiskLevel, ToolCallRequest, ToolExecutionContext, ToolResultStatus
 from app.utils.memory_scrubber import scrub_memory_context
 
 
@@ -116,7 +117,7 @@ class AgentGraphRunner:
         state.run_status = RunStatus.RUNNING
         return state
 
-    async def call_llm(self, state: AgentState, config: dict | None = None) -> AgentState:
+    async def call_llm(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
         if state.iteration_count >= self.iteration_limit:
             state.error = "iteration limit reached"
             state.finish_reason = "length"
@@ -126,7 +127,8 @@ class AgentGraphRunner:
         options = configurable.get("options") or state.run_options
         try:
             tools = self.tool_service.list_openai_tools(
-                RiskLevel.SAFE if options.get("tool_exposure_policy") == "safe_only" else None
+                RiskLevel.SAFE if options.get("tool_exposure_policy") == "safe_only" else None,
+                context=options.get("tool_execution_context") if isinstance(options, dict) else None,
             )
 
             # ----- 新增：外部记忆动态预取注入（临时构造 api_messages，不修改 state）-----
@@ -184,7 +186,7 @@ class AgentGraphRunner:
             state.finish_reason = "error"
         return state
 
-    async def execute_tools(self, state: AgentState, config: dict | None = None) -> AgentState:
+    async def execute_tools(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
         state.tool_results = []
         context = None
         options = None

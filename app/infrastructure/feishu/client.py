@@ -107,6 +107,18 @@ class FeishuClient:
         )
         response.raise_for_status()
 
+    async def update_card(self, message_id: str, card: dict[str, Any]) -> None:
+        tenant_access_token = await self.get_tenant_access_token()
+        response = await self.http_client.patch(
+            f"/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {tenant_access_token}"},
+            json={
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            },
+        )
+        response.raise_for_status()
+
     async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> None:
         tenant_access_token = await self.get_tenant_access_token()
         response = await self.http_client.post(

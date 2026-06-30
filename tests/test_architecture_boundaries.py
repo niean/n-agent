@@ -39,7 +39,7 @@ def test_interfaces_do_not_import_infrastructure_or_sqlite():
 
 
 def test_skill_domain_pure():
-    text = open("app/domain/skill.py").read()
+    text = (ROOT / "app/domain/skill.py").read_text()
     for forbidden in (
         "import sqlite3",
         "import fastapi",
@@ -52,5 +52,5 @@ def test_skill_domain_pure():
 
 
 def test_skill_application_no_infrastructure():
-    text = open("app/application/skill_service.py").read()
+    text = (ROOT / "app/application/skill_service.py").read_text()
     assert "from app.infrastructure" not in text

@@ -91,6 +91,7 @@ def create_dashboard_router(
     knowledge_service: KnowledgeService | None = None,
     external_memory_service: ExternalMemoryService | None = None,
     external_memory_provider_service: ExternalMemoryProviderService | None = None,
+    sandbox_dashboard_service=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -98,6 +99,7 @@ def create_dashboard_router(
     @router.get("/summary", response_class=HTMLResponse)
     @router.get("/chat", response_class=HTMLResponse)
     @router.get("/sessions", response_class=HTMLResponse)
+    @router.get("/memory", response_class=HTMLResponse)
     @router.get("/tools", response_class=HTMLResponse)
     @router.get("/tools/builtin", response_class=HTMLResponse)
     @router.get("/tools/knowledge", response_class=HTMLResponse)
@@ -105,12 +107,18 @@ def create_dashboard_router(
     @router.get("/tools/skill", response_class=HTMLResponse)
     @router.get("/tools/plugin", response_class=HTMLResponse)
     @router.get("/tools/external-memory", response_class=HTMLResponse)
+    @router.get("/tools/sandbox", response_class=HTMLResponse)
+    @router.get("/sandbox", response_class=HTMLResponse)
     @router.get("/models", response_class=HTMLResponse)
     @router.get("/status", response_class=HTMLResponse)
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    if sandbox_dashboard_service is not None:
+        from app.interfaces.http.sandbox_routes import register_sandbox_routes
+        register_sandbox_routes(router, sandbox_dashboard_service)
 
     @router.get("/chat/sessions")
     async def sessions():

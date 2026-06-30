@@ -30,6 +30,10 @@
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">会话</span>
       </a>
+      <a class="sidebar__item" href="/memory" data-tab="memory">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3a7 7 0 0 0-7 7v2a5 5 0 0 0 5 5h1v4h2v-4h1a5 5 0 0 0 5-5v-2a7 7 0 0 0-7-7Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 10h6M9 14h6" stroke-width="2" stroke-linecap="round"/></svg></span>
+        <span class="sidebar__item-label">记忆</span>
+      </a>
       <div class="sidebar__group" data-tab-group="tools">
         <button class="sidebar__item sidebar__item--parent" type="button" data-tab="tools" aria-expanded="false">
           <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M14.7 6.3a4 4 0 1 1-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 1 5.4-5.4l-2 2 2 2 2-2-2-2 2-2-2-2-2 2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
@@ -37,7 +41,6 @@
           <span class="sidebar__item-chevron" aria-hidden="true">▸</span>
         </button>
         <div class="sidebar__submenu" data-submenu-of="tools">
-          <a class="sidebar__item sidebar__item--child" href="/tools/external-memory" data-tab="tools-external-memory"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">记忆</span></a>
           <a class="sidebar__item sidebar__item--child" href="/tools/knowledge" data-tab="tools-knowledge"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">知识</span></a>
           <a class="sidebar__item sidebar__item--child" href="/tools/mcp" data-tab="tools-mcp"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">MCP</span></a>
           <a class="sidebar__item sidebar__item--child" href="/tools/skill" data-tab="tools-skill"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">Skill</span></a>
@@ -45,6 +48,10 @@
           <a class="sidebar__item sidebar__item--child" href="/tools/builtin" data-tab="tools-builtin"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">Builtin</span></a>
         </div>
       </div>
+      <a class="sidebar__item" href="/sandbox" data-tab="sandbox">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7l8-4 8 4-8 4-8-4Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 7v10l8 4 8-4V7M12 11v10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">沙盒</span>
+      </a>
       <a class="sidebar__item" href="/models" data-tab="models">
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke-width="2"/><path d="M19 12c0 3.9-3.1 7-7 7s-7-3.1-7-7 3.1-7 7-7M19 5l-7 7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">模型</span>
@@ -69,7 +76,7 @@
     <div class="tab-content" id="tab-summary">
       <div class="stats-bar" id="summary-stats"></div>
       <section class="status-panel">
-        <div class="panel-header"><span>功能入口</span><button class="btn" id="summary-refresh" type="button">刷新</button></div>
+        <div class="panel-header"><span>功能入口</span></div>
         <div class="panel-body"><div class="summary-entries" id="summary-entries"></div></div>
       </section>
     </div>
@@ -139,6 +146,11 @@
       </section>
     </div>
 
+    <div class="tab-content" id="tab-memory">
+      <div id="external-memory-files"></div>
+      <div id="external-memory-providers-list"></div>
+    </div>
+
     <div class="tab-content" id="tab-tools-knowledge"></div>
 
     <div class="tab-content" id="tab-tools-mcp">
@@ -169,9 +181,7 @@
       </section>
     </div>
 
-    <div class="tab-content" id="tab-tools-external-memory">
-      <div id="external-memory-providers-list"></div>
-    </div>
+    <div class="tab-content" id="tab-sandbox"></div>
 
     <div class="tab-content" id="tab-models">
       <section class="status-panel">
@@ -243,6 +253,7 @@
   <script src="/static/skills.js"></script>
   <script src="/static/external-memory.js"></script>
   <script src="/static/external-memory-providers.js"></script>
+  <script src="/static/sandbox.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
