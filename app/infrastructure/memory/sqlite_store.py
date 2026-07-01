@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
 from app.infrastructure.registry.sqlite_mcp_registry import _initialize_mcp_schema
+
+logger = logging.getLogger(__name__)
 
 
 class SQLiteMemoryStore:
@@ -328,6 +331,17 @@ class SQLiteMemoryStore:
         if "external_memory_slots_json" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN external_memory_slots_json TEXT")
 
+    def migrate_session_id_prefixes(self) -> None:
+        """Migrate historical session_id prefixes and source values to new format.
+
+        Must be called after all session_id-referencing tables exist (sessions, messages,
+        tool_calls, task_states, summaries, sandbox_execution_history, sandbox_released_history,
+        scheduled_tasks, scheduled_task_executions, gateway_session_links, gateway_conversations).
+        """
+        with self._connect() as conn:
+            _migrate_session_id_prefixes(conn)
+
+
     @staticmethod
     def _session_from_row(row: sqlite3.Row) -> ConversationSession:
         enabled_json = row["external_memory_enabled_json"]
@@ -338,3 +352,93 @@ class SQLiteMemoryStore:
             id=row["id"], title=row["title"], source=row["source"],
             external_memory_enabled=enabled, external_memory_slots=slots,
         )
+
+
+_IM_PLATFORMS = {"feishu", "dingtalk", "wecom"}
+
+
+def _compute_new_session_id_and_source(old_id: str, source: str) -> tuple[str, str]:
+    # Step 1: normalize source
+    new_source = source
+    if source == "local":
+        new_source = "cli"
+    elif source in _IM_PLATFORMS:
+        new_source = f"gw/{source}"
+
+    # Step 2: normalize id prefix based on new_source
+    new_id = old_id
+    if new_source == "dashboard" and old_id.startswith("session-"):
+        new_id = "dashboard-" + old_id[len("session-"):]
+    elif new_source == "api" and old_id.startswith("tmp-"):
+        new_id = "api-" + old_id[len("tmp-"):]
+    elif new_source == "cli":
+        if old_id.startswith("gateway-"):
+            new_id = "cli-" + old_id[len("gateway-"):]
+        elif not old_id.startswith("cli-"):
+            new_id = f"cli-{old_id}"
+    elif new_source.startswith("gw/") and old_id.startswith("gateway-"):
+        new_id = "gw-" + old_id[len("gateway-"):]
+
+    return (new_id, new_source)
+
+
+def _migrate_session_id_prefixes(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("SELECT id, source FROM sessions").fetchall()
+    if not rows:
+        return
+
+    existing_tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    session_id_tables = [
+        "messages", "tool_calls", "task_states", "summaries",
+        "sandbox_execution_history", "sandbox_released_history",
+        "scheduled_tasks", "scheduled_task_executions",
+        "gateway_session_links",
+    ]
+    available_tables = [t for t in session_id_tables if t in existing_tables]
+    has_gateway_conversations = "gateway_conversations" in existing_tables
+
+    updates: list[tuple[str, str, str]] = []
+    for row in rows:
+        old_id = row["id"]
+        source = row["source"]
+        new_id, new_source = _compute_new_session_id_and_source(old_id, source)
+        if new_id != old_id or new_source != source:
+            existing = conn.execute(
+                "SELECT 1 FROM sessions WHERE id=? AND id<>?", (new_id, old_id)
+            ).fetchone()
+            if existing is not None:
+                logger.warning(
+                    "skip session_id migration: collision old=%s new=%s source=%s",
+                    old_id, new_id, source,
+                )
+                continue
+            updates.append((old_id, new_id, new_source))
+
+    if not updates:
+        return
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        for old_id, new_id, new_source in updates:
+            if new_id != old_id:
+                conn.execute("UPDATE sessions SET id=? WHERE id=?", (new_id, old_id))
+                for table in available_tables:
+                    conn.execute(
+                        f"UPDATE {table} SET session_id=? WHERE session_id=?",
+                        (new_id, old_id),
+                    )
+                if has_gateway_conversations:
+                    conn.execute(
+                        "UPDATE gateway_conversations SET active_session_id=? WHERE active_session_id=?",
+                        (new_id, old_id),
+                    )
+            conn.execute(
+                "UPDATE sessions SET source=? WHERE id=?", (new_source, new_id)
+            )
+        conn.commit()
+        logger.info("session_id prefix migrated rows=%d", len(updates))
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+

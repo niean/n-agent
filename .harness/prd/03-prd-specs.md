@@ -196,9 +196,13 @@
         - 沙盒：执行历史，代码合并到详情弹出框展示，干掉代码按钮、详情放到删除右侧
         - 沙盒：Dashboard，刷新按钮只刷新UI容器、不要刷新整个页面
     - 沙盒：记忆、沙盒调整为一级菜单，跟工具并列
-    - 沙盒：execute_code抽象为通用领域能力，支持从Dashboard Chat、Gateway等`所有通道`；核心哲学是execute_code不需要确认，沙盒即安全边界。要求参照HermesAgent，源码/Users/niean/code/github.com/niean/hermes-agent。
+    - 沙盒：沙盒execute_code抽象为通用领域能力，支持从Chat、Http、CLI、IM等`所有通道`；核心哲学是execute_code不需要确认，沙盒即安全边界。要求参照HermesAgent，源码/Users/niean/code/github.com/niean/hermes-agent。
         - 审阅：发现并修复严重问题(20个)，spec-260701-execute-code-direct.md
         - 验证：Chat、CLI、飞书IM、OpenWebUI，execute_code执行验证通过
+
+[20260702]
+- FR
+    - 会话：会话列表，来源格式明确为`{一级}[/{二级}]`，其中一级包括dashboard、api、cli、gw、schedule，二级有gw/feishu；会话ID的前缀，应该体现出且对应第一级
 
 
 ---
@@ -214,6 +218,7 @@
     - 工具：相比Hermes，还缺少哪些功能？明确List出来
 - FR
     - 沙盒：支持Terminal命令，需要危险命令确认
+    - 沙盒：沙盒execute_code尚未支持定时任务入口
     - 工具：Plugin
     - 工具：Skill自进化
     - 平台：ACP，级联VsCode

@@ -694,6 +694,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         async def _release_sandbox_on_session_deleted(session_id: str) -> None:
             await sandbox_manager.release(session_id, reason="session")
         session_service.add_session_deleted_handler(_release_sandbox_on_session_deleted)
+    memory_store.migrate_session_id_prefixes()
     return ApplicationServices(
         settings=settings,
         memory_store=memory_store,

@@ -274,8 +274,9 @@ class GatewayCommandService:
         return _response(session_id, "已删除")
 
     async def _execute_new(self, event: InteractionMessage) -> InteractionResponse:
-        new_session_id = f"gateway-{uuid4()}"
-        await self.session_service.create_session(new_session_id, source=event.session_key.platform.value)
+        prefix, source = _session_id_prefix_and_source(event.session_key.platform)
+        new_session_id = f"{prefix}-{uuid4()}"
+        await self.session_service.create_session(new_session_id, source=source)
         await self.registry.create_session_link(event.session_key, new_session_id)
         return _response(new_session_id, f"已创建新会话 {new_session_id}")
 
@@ -286,6 +287,12 @@ class GatewayCommandService:
         expired = [key for key, value in self.pending_confirmations.items() if value.expires_at <= now]
         for key in expired:
             self.pending_confirmations.pop(key, None)
+
+
+def _session_id_prefix_and_source(platform: Platform) -> tuple[str, str]:
+    if platform is Platform.CLI:
+        return ("cli", "cli")
+    return ("gw", f"gw/{platform.value}")
 
 
 class GatewayService:
@@ -361,8 +368,9 @@ class GatewayService:
         link = await self.registry.get_active_session(event.session_key)
         if link is not None:
             return link.session_id
-        session_id = f"gateway-{uuid4()}"
-        await self.session_service.create_session(session_id, source=event.session_key.platform.value)
+        prefix, source = _session_id_prefix_and_source(event.session_key.platform)
+        session_id = f"{prefix}-{uuid4()}"
+        await self.session_service.create_session(session_id, source=source)
         await self.registry.create_session_link(event.session_key, session_id)
         return session_id
 

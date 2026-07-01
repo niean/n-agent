@@ -277,7 +277,7 @@
 
   async function ensureSession() {
     if (currentSessionId) return currentSessionId;
-    const id = 'session-' + Date.now();
+    const id = 'dashboard-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
     await api.createSession(id);
     currentSessionId = id;
     setHeader(id);

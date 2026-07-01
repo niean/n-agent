@@ -54,7 +54,7 @@ class ChatCompletionService:
         self._slot_resolver = slot_resolver
 
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
-        session_id = request.session_id or request.metadata.get("session_id") or f"tmp-{uuid4()}"
+        session_id = request.session_id or request.metadata.get("session_id") or f"api-{uuid4()}"
         await self.session_service.create_session(session_id, source="api")
         session = await self.memory_store.get_session(session_id)
         existing_messages = await self.memory_store.list_messages(session_id)
