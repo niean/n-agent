@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override 和演进基线 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -305,3 +305,38 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - base_url 空串是合法值（holographic 创建时 base_url=""），adapter 各自处理空串回退。
 
 陷阱：`factory(dict(cfg.extra_config), ...)` 只传 extra_config 会让 mem0 回退默认地址、honcho 回退空串，Dashboard 填写的自建 mem0 实例地址被静默忽略，probe/activate/sync/search 全部走错地址且无报错。此 bug 同时影响 mem0 + honcho，根因在共享装配路径，需在 service 层统一修复而非各 adapter 单独处理。
+
+## 模式十六：会话来源与 ID 前缀命名规则
+
+会话 `source` 字段和 `session_id` 前缀必须一一对应，体现入口/触发方式。来源格式 `{一级}[/{二级}]`，一级表示触发方式（5 类），二级仅 `gw` 一级展开表示 IM 平台适配器。
+
+一级来源：
+
+| 一级 | 含义 | source 取值 | session_id 前缀 |
+|------|------|------------|----------------|
+| dashboard | Web 控制台 | dashboard | dashboard- |
+| api | 非 dashboard 的 HTTP API（如 OpenWebUI 兼容接口） | api | api- |
+| cli | 本地命令行 | cli | cli- |
+| gw | IM 网关通道 | gw/{平台} | gw- |
+| schedule | 定时触发 | schedule | schedule- |
+
+二级来源（仅 gw）：`gw/feishu`、`gw/dingtalk`、`gw/wecom`。二级不进 session_id 前缀，只在 source 字段体现。
+
+规则：
+- session_id 前缀严格等于一级名，UUID 跟在连字符后（如 `dashboard-{uuid}`、`gw-{uuid}`）。
+- CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 `gw/`。GatewayService 通过 `_session_id_prefix_and_source(platform)` 分流：`Platform.CLI` → (`cli`, `cli`)，其它 IM 平台 → (`gw`, `gw/{platform.value}`)。
+- 二级只在 `gw` 下展开。`schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
+- Dashboard 前端生成 session_id 用 `crypto.randomUUID()`（fallback `Date.now()+random`），不用 `Date.now()` 时间戳（碰撞风险）。
+
+历史数据迁移：
+- `SQLiteMemoryStore.migrate_session_id_prefixes()` 在 `build_application_services` 末尾（所有 registry 初始化后）调用，幂等。
+- 旧 → 新映射：`session-`→`dashboard-`(source=dashboard)、`tmp-`→`api-`(source=api)、source `local`→`cli`(id 补 `cli-` 前缀)、source `feishu/dingtalk/wecom`→`gw/{platform}`(id `gateway-`→`gw-`)、`schedule` 不变。
+- 级联更新 11 张 session_id 引用表：messages、tool_calls、task_states、summaries、sandbox_execution_history、sandbox_released_history、scheduled_tasks、scheduled_task_executions、gateway_session_links、gateway_conversations(active_session_id)。
+- 碰撞保护：新 id 已被其它 session 占用时跳过该条并 warning。
+- 外部记忆服务（honcho/mem0）按旧 session_id 索引的上下文不迁移，迁移后旧会话的外部记忆上下文丢失，新会话不受影响。
+
+陷阱：
+- 把 schedule 当成 `http` 的二级（`http/schedule`）会混淆"触发方式"和"IM 平台"两个维度，扩展到 `http/openwebui`、`http/webhook`、`gw/wx` 时维度越来越乱。正确做法：一级只放触发方式，二级只放 IM 平台。
+- session_id 前缀与 source 脱节（如 dashboard 用 `session-`、api 用 `tmp-`、gw 用 `gateway-`）会导致会话列表无法直接从 id 归因入口，必须查 source 字段。前缀严格等于一级名即可。
+- `delete_session` 级联未覆盖 `scheduled_task_executions`、`sandbox_execution_history`、`sandbox_released_history`，删 session 后这 3 张表会留下孤儿行（与命名规则无关，但同属 session_id 引用完整性问题）。
+

@@ -33,7 +33,7 @@
         btn.className = 'btn';
         btn.type = 'button';
         btn.textContent = '查看';
-        btn.addEventListener('click', () => showDetail(session.id));
+        btn.addEventListener('click', () => openSessionDetailModal(session.id));
         td4.appendChild(btn);
         tr.append(td1, td2, td3, td4);
         tbody.appendChild(tr);
@@ -46,36 +46,86 @@
     }
   }
 
-  async function showDetail(sessionId) {
-    const detail = ui.byId('sessions-detail');
-    if (!detail) return;
-    ui.clear(detail);
-    ui.renderLoading(detail, '加载会话详情...');
+  function closeSessionDetailModal() {
+    const modal = document.getElementById('sessions-detail-modal');
+    if (modal) modal.remove();
+  }
+
+  async function openSessionDetailModal(sessionId) {
+    closeSessionDetailModal();
+    const backdrop = document.createElement('div');
+    backdrop.id = 'sessions-detail-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const form = document.createElement('form');
+    form.className = 'providers-form';
+    const header = ui.el('div', 'modal-header');
+    const titleEl = document.createElement('h4');
+    titleEl.textContent = '查看会话: ' + sessionId;
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'modal-close';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '关闭会话详情弹框');
+    closeBtn.addEventListener('click', closeSessionDetailModal);
+    header.append(titleEl, closeBtn);
+    form.appendChild(header);
+
+    const body = ui.el('div', 'sessions-detail-modal-body');
+    ui.renderLoading(body, '加载会话详情...');
+    form.appendChild(body);
+
+    const actions = ui.el('div', 'providers-form__actions');
+    const closeAction = document.createElement('button');
+    closeAction.type = 'button';
+    closeAction.className = 'btn';
+    closeAction.textContent = '关闭';
+    closeAction.addEventListener('click', closeSessionDetailModal);
+    actions.appendChild(closeAction);
+    form.appendChild(actions);
+
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeSessionDetailModal();
+    });
+    document.body.appendChild(backdrop);
+    closeBtn.focus();
+
     try {
       const [info, calls] = await Promise.all([
         api.getSessionDetail(sessionId),
         api.getSessionToolCalls(sessionId),
       ]);
-      ui.clear(detail);
-      ui.appendText(detail, '会话 ID:', info.session ? info.session.id : sessionId);
-      ui.appendText(detail, '标题:', info.session ? info.session.title : '-');
-      ui.appendText(detail, '来源:', info.session ? info.session.source : '-');
-      ui.appendText(detail, '消息数:', (info.messages || []).length);
-      const summarySection = document.createElement('div');
-      summarySection.className = 'debug-section';
+      ui.clear(body);
+
+      const infoSection = ui.el('div', 'debug-section');
+      const iH = document.createElement('h4'); iH.textContent = '基本信息';
+      const iList = ui.el('div', 'session-info-list');
+      ui.appendText(iList, '会话 ID:', info.session ? info.session.id : sessionId);
+      ui.appendText(iList, '标题:', info.session ? info.session.title : '-');
+      ui.appendText(iList, '来源:', info.session ? info.session.source : '-');
+      ui.appendText(iList, '消息数:', (info.messages || []).length);
+      infoSection.append(iH, iList);
+      body.appendChild(infoSection);
+
+      const summarySection = ui.el('div', 'debug-section');
       const sH = document.createElement('h4'); sH.textContent = 'Summary';
       const sP = document.createElement('pre'); sP.textContent = info.summary ? info.summary.summary : '暂无摘要';
       summarySection.append(sH, sP);
-      detail.appendChild(summarySection);
-      const taskSection = document.createElement('div');
-      taskSection.className = 'debug-section';
+      body.appendChild(summarySection);
+
+      const taskSection = ui.el('div', 'debug-section');
       const tH = document.createElement('h4'); tH.textContent = 'Task State';
       const tP = document.createElement('pre');
       tP.textContent = info.task_state ? JSON.stringify(info.task_state, null, 2) : '暂无任务状态';
       taskSection.append(tH, tP);
-      detail.appendChild(taskSection);
-      const toolSection = document.createElement('div');
-      toolSection.className = 'debug-section';
+      body.appendChild(taskSection);
+
+      const toolSection = ui.el('div', 'debug-section');
       const cH = document.createElement('h4'); cH.textContent = `Tool Calls (${calls.length})`;
       toolSection.appendChild(cH);
       if (!calls.length) {
@@ -89,10 +139,10 @@
           toolSection.appendChild(el);
         });
       }
-      detail.appendChild(toolSection);
+      body.appendChild(toolSection);
     } catch (error) {
-      ui.clear(detail);
-      ui.renderError(detail, error.message);
+      ui.clear(body);
+      ui.renderError(body, error.message);
     }
   }
 

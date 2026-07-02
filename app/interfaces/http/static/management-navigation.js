@@ -47,6 +47,7 @@
     document.querySelectorAll('.tab-content').forEach((tab) => tab.classList.remove('active'));
     document.querySelectorAll('.sidebar__item').forEach((item) => {
       item.classList.remove('sidebar__item--active');
+      item.classList.remove('sidebar__item--parent-selected');
     });
     const target = document.getElementById(`tab-${next}`);
     if (target) target.classList.add('active');
@@ -54,10 +55,9 @@
     if (nav) nav.classList.add('sidebar__item--active');
     const parentTab = parentByChild[next];
     if (parentTab) {
+      applySubmenuState(parentTab, readSubmenuPref(parentTab));
       const parentNav = document.querySelector(`[data-tab="${parentTab}"]`);
-      if (parentNav) parentNav.classList.add('sidebar__item--parent-open');
-      const submenu = document.querySelector(`[data-submenu-of="${parentTab}"]`);
-      if (submenu) submenu.classList.add('sidebar__submenu--open');
+      if (parentNav) parentNav.classList.add('sidebar__item--parent-selected');
     }
     const title = document.getElementById('topbar-title');
     if (title) title.textContent = labelByTab[next] || next;
@@ -85,9 +85,9 @@
     if (isParent(name)) {
       if (!document.body.classList.contains('sidebar-expanded')) return;
       const submenu = document.querySelector(`[data-submenu-of="${name}"]`);
-      const parentNav = document.querySelector(`[data-tab="${name}"]`);
-      if (submenu) submenu.classList.toggle('sidebar__submenu--open');
-      if (parentNav) parentNav.classList.toggle('sidebar__item--parent-open');
+      const open = !(submenu && submenu.classList.contains('sidebar__submenu--open'));
+      applySubmenuState(name, open);
+      writeSubmenuPref(name, open);
       return;
     }
     const path = pathByTab[name];
@@ -98,13 +98,66 @@
     applyTab(name);
   }
 
+  const SIDEBAR_PREF_KEY = 'nagent.sidebar.expanded';
+  const SUBMENU_PREF_PREFIX = 'nagent.sidebar.submenu.';
+
+  function readSidebarPref() {
+    try {
+      const value = localStorage.getItem(SIDEBAR_PREF_KEY);
+      if (value === '0') return false;
+      if (value === '1') return true;
+    } catch (_) { /* localStorage 不可用时回落默认 */ }
+    return true;
+  }
+
+  function writeSidebarPref(expanded) {
+    try { localStorage.setItem(SIDEBAR_PREF_KEY, expanded ? '1' : '0'); } catch (_) { /* ignore */ }
+  }
+
+  function applySidebarExpanded(expanded) {
+    const toggle = document.getElementById('sidebar-toggle');
+    document.body.classList.toggle('sidebar-expanded', expanded);
+    if (toggle) toggle.setAttribute('aria-expanded', String(expanded));
+  }
+
+  function readSubmenuPref(parentTab) {
+    try {
+      const value = localStorage.getItem(SUBMENU_PREF_PREFIX + parentTab);
+      if (value === '0') return false;
+      if (value === '1') return true;
+    } catch (_) { /* localStorage 不可用时回落默认 */ }
+    return true;
+  }
+
+  function writeSubmenuPref(parentTab, open) {
+    try { localStorage.setItem(SUBMENU_PREF_PREFIX + parentTab, open ? '1' : '0'); } catch (_) { /* ignore */ }
+  }
+
+  function applySubmenuState(parentTab, open) {
+    const submenu = document.querySelector(`[data-submenu-of="${parentTab}"]`);
+    const parentNav = document.querySelector(`[data-tab="${parentTab}"]`);
+    if (submenu) submenu.classList.toggle('sidebar__submenu--open', open);
+    if (parentNav) parentNav.classList.toggle('sidebar__item--parent-open', open);
+  }
+
   function initNavigation() {
+    applySidebarExpanded(readSidebarPref());
+    tabConfig.filter((c) => c.parent).forEach((c) => {
+      applySubmenuState(c.tab, readSubmenuPref(c.tab));
+    });
     const toggle = document.getElementById('sidebar-toggle');
     if (toggle) {
       toggle.addEventListener('click', () => {
         const expanded = document.body.classList.toggle('sidebar-expanded');
         toggle.setAttribute('aria-expanded', String(expanded));
-        closeAllPopouts();
+        writeSidebarPref(expanded);
+        if (expanded) {
+          tabConfig.filter((c) => c.parent).forEach((c) => {
+            applySubmenuState(c.tab, readSubmenuPref(c.tab));
+          });
+        } else {
+          closeAllPopouts();
+        }
       });
     }
     document.querySelectorAll('.sidebar__item').forEach((link) => {

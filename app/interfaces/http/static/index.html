@@ -8,8 +8,9 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+  <script>(function(){try{var v=localStorage.getItem('nagent.sidebar.expanded');var ex=v==='0'?false:true;document.body.classList.toggle('sidebar-expanded',ex);var t=document.getElementById('sidebar-toggle');if(t)t.setAttribute('aria-expanded',String(ex));}catch(_){document.body.classList.add('sidebar-expanded');}})();</script>
   <aside class="sidebar" id="app-sidebar" aria-label="主导航">
-    <button class="sidebar__toggle" id="sidebar-toggle" type="button" aria-label="展开导航" aria-expanded="false">
+    <button class="sidebar__toggle" id="sidebar-toggle" type="button" aria-label="展开导航" aria-expanded="true">
       <span class="sidebar__brand"><span class="sidebar__brand-icon">NA</span><span>N-Agent</span></span>
       <span class="sidebar__toggle-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M9 6l6 6-6 6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
     </button>
@@ -139,10 +140,6 @@
       <section class="status-panel">
         <div class="panel-header"><span>会话列表</span><button class="btn" id="sessions-refresh" type="button">刷新</button></div>
         <div class="panel-body" id="sessions-list"></div>
-      </section>
-      <section class="status-panel">
-        <div class="panel-header">会话详情</div>
-        <div class="panel-body" id="sessions-detail">点击列表中的「查看」加载详情</div>
       </section>
     </div>
 

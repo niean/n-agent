@@ -8,7 +8,7 @@
     { tab: 'scheduled-tasks', label: '任务', desc: '管理定时任务与查看最近执行结果' },
     { tab: 'sessions', label: '会话', desc: '查看历史会话与详细消息' },
     { tab: 'memory', label: '记忆', desc: '管理项目记忆，配置全局默认启用' },
-    { tab: 'tools-knowledge', label: '知识', desc: '查看 search_knowledge 工具与 N-KB 依赖健康' },
+    { tab: 'tools-knowledge', label: '知识', desc: '知识管理' },
     { tab: 'tools-mcp', label: 'MCP', desc: '管理 MCP 站点与远端工具' },
     { tab: 'tools-skill', label: 'Skill', desc: '查看 Skill 列表与启停' },
     { tab: 'tools-plugin', label: 'Plugin', desc: 'Plugin 子系统（待实现）' },
@@ -16,7 +16,7 @@
     { tab: 'sandbox', label: '沙盒', desc: '查看沙盒配置、活跃实例与执行历史' },
     { tab: 'models', label: '模型', desc: '查看对外暴露的统一模型' },
     { tab: 'platforms', label: '平台', desc: '查看接入平台与平台会话' },
-    { tab: 'status', label: '观测', desc: '检查 Provider/Memory/Knowledge 状态' },
+    { tab: 'status', label: '观测', desc: '检查状态' },
   ];
 
   function renderStats(stats, service, dependencies, counts) {
