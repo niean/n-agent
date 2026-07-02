@@ -206,6 +206,19 @@
     - 会话：会话列表，查看按钮改为弹出框，风格跟`记忆`弹出框保持一致
     - 前端：左导菜单折叠状态控制，刷新浏览器时默认使用上次状态、没有上次状态则默认展开，一级、二级均如此；一级菜单展开时，二级菜单应使用上次状态
         - 工具：二次菜单展开后，`工具`持续是选中样式，如果此时选中其它一级菜单、造成困扰。请修复`工具`样式
+    - 沙盒：execute_code支持定时任务入口。看下HermesAgent是怎么做的，源码/Users/niean/code/github.com/niean/hermes-agent(结论：定时任务走ChatCompletion能触发execute_code)
+    - 文档：按照DDD原则，整理Sandbox模型、执行链路等到DDD文档的 ##Sandbox章节
+    - 任务：修复模型占位符问题
+    - 任务：补全任务详情页(URL可达)，任务列表点`立即执行`后弹框、告知触发成功，弹框上详情按钮跳转任务详情页
+
+[20260703]
+- FR
+    - 工具：Skill走"目录扫描 + SQLite元数据"，跟MCP等未对齐(SQLite 做CRUD)，对齐之
+    - 工具：[KF]实现Plugin功能。Follow Hermes plugins生态、可零成本移植。
+        - 要求：参照HermesAgent，源码/Users/niean/code/github.com/niean/hermes-agent
+        - 待办：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明、多分类目录、plugin沙盒化
+        - 审阅：发现并修复严重问题(20个)，spec-260703-plugin-subsystem.md
+
 
 
 ---
@@ -213,19 +226,17 @@
 [待办]
 - Issue
 - NFR
-    - 文档：Sandbox执行链路，DDD
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
-    - 工具：相比Hermes，还缺少哪些功能？明确List出来
 - FR
-    - 沙盒：支持Terminal命令，需要危险命令确认
-    - 沙盒：沙盒execute_code尚未支持定时任务入口
-    - 工具：Plugin
     - 工具：Skill自进化
     - 平台：ACP，级联VsCode
     - 平台：CLI，对标Hermes
+    - 沙盒：支持Terminal命令执行，危险命令确认(对标Hermes)
+    - 架构：MoA，对标Hermes
+    - 工具：相比Hermes，还缺少哪些功能？明确List出来
 
 ---
 

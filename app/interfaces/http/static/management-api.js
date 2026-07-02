@@ -110,11 +110,22 @@
 
   const listSkills = () => fetchJson('/chat/skills');
   const getSkill = (name) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`);
+  const createSkill = (payload) => fetchJson('/chat/skills', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+  const updateSkill = (name, payload) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
   const setSkillEnabled = (name, enabled) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: !!enabled }),
   });
+  const deleteSkill = (name) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
   const refreshSkills = () => fetchJson('/chat/skills/refresh', { method: 'POST' });
 
   // Sandbox dashboard endpoints — paths align with sandbox_routes.py / spec
@@ -187,7 +198,10 @@
     updateMcpTool,
     listSkills,
     getSkill,
+    createSkill,
+    updateSkill,
     setSkillEnabled,
+    deleteSkill,
     refreshSkills,
     sandbox,
   };

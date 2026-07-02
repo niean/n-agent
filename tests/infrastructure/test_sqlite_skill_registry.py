@@ -38,6 +38,15 @@ async def test_set_enabled(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_skill(tmp_path):
+    registry = SQLiteSkillRegistry(tmp_path / "s.db")
+    await registry.upsert_skill(_skill("a"))
+    assert await registry.delete_skill("a") is True
+    assert await registry.get_skill("a") is None
+    assert await registry.delete_skill("a") is False
+
+
+@pytest.mark.asyncio
 async def test_replace_all_preserves_enabled(tmp_path):
     registry = SQLiteSkillRegistry(tmp_path / "s.db")
     await registry.upsert_skill(_skill("a"))

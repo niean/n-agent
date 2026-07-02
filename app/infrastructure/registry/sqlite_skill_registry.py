@@ -6,7 +6,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from app.domain.skill import Skill, SkillFrontmatter, SkillNotFoundError, SkillReadiness, SkillRegistry
+from app.domain.skill import (
+    Skill,
+    SkillFrontmatter,
+    SkillNotFoundError,
+    SkillReadiness,
+    SkillRegistry,
+    SkillValidationError,
+)
 
 
 def _initialize_skill_schema(conn: sqlite3.Connection) -> None:
@@ -59,44 +66,47 @@ class SQLiteSkillRegistry(SkillRegistry):
 
     async def upsert_skill(self, skill: Skill) -> Skill:
         now = datetime.now(timezone.utc)
-        with self._connect() as conn:
-            existing = conn.execute(
-                "SELECT id, created_at FROM skills WHERE name = ?", (skill.name,)
-            ).fetchone()
-            if existing:
-                conn.execute(
-                    """
-                    UPDATE skills
-                    SET relative_path = ?, description = ?, platforms_json = ?, frontmatter_json = ?,
-                        enabled = ?, readiness = ?, last_scan_status = ?, last_scan_error = ?,
-                        last_seen_at = ?, updated_at = ?
-                    WHERE name = ?
-                    """,
-                    (
-                        skill.relative_path, skill.description,
-                        json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
-                        int(skill.enabled), skill.readiness.value,
-                        skill.last_scan_status, skill.last_scan_error,
-                        _dt_str(skill.last_seen_at), now.isoformat(),
-                        skill.name,
-                    ),
-                )
-            else:
-                created_at = skill.created_at or now
-                conn.execute(
-                    """
-                    INSERT INTO skills(id, name, relative_path, description, platforms_json, frontmatter_json,
-                        enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        skill.id, skill.name, skill.relative_path, skill.description,
-                        json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
-                        int(skill.enabled), skill.readiness.value,
-                        skill.last_scan_status, skill.last_scan_error,
-                        _dt_str(skill.last_seen_at), created_at.isoformat(), now.isoformat(),
-                    ),
-                )
+        try:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT id, created_at FROM skills WHERE name = ?", (skill.name,)
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE skills
+                        SET relative_path = ?, description = ?, platforms_json = ?, frontmatter_json = ?,
+                            enabled = ?, readiness = ?, last_scan_status = ?, last_scan_error = ?,
+                            last_seen_at = ?, updated_at = ?
+                        WHERE name = ?
+                        """,
+                        (
+                            skill.relative_path, skill.description,
+                            json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
+                            int(skill.enabled), skill.readiness.value,
+                            skill.last_scan_status, skill.last_scan_error,
+                            _dt_str(skill.last_seen_at), now.isoformat(),
+                            skill.name,
+                        ),
+                    )
+                else:
+                    created_at = skill.created_at or now
+                    conn.execute(
+                        """
+                        INSERT INTO skills(id, name, relative_path, description, platforms_json, frontmatter_json,
+                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            skill.id, skill.name, skill.relative_path, skill.description,
+                            json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
+                            int(skill.enabled), skill.readiness.value,
+                            skill.last_scan_status, skill.last_scan_error,
+                            _dt_str(skill.last_seen_at), created_at.isoformat(), now.isoformat(),
+                        ),
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise SkillValidationError("skill name already exists") from exc
         result = await self.get_skill(skill.name)
         assert result is not None
         return result

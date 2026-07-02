@@ -5,7 +5,7 @@ import math
 from collections.abc import AsyncIterator
 from typing import Any
 
-from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo
+from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
 
 _INTERNAL_OPTION_KEYS = {"tool_execution_context", "tool_exposure_policy", "execution_context_mode"}
 _ALLOWED_OPTION_KEYS = {"temperature", "top_p", "top_k", "stop_sequences", "cache_control", "thinking", "output_config"}
@@ -72,7 +72,7 @@ class AnthropicProvider:
         model: str,
         options: dict[str, Any],
     ) -> LLMResult | AsyncIterator[LLMEvent]:
-        selected_model = model or self.default_model
+        selected_model = resolve_model(model, self.default_model)
         system, anthropic_messages = _convert_messages(messages)
         kwargs = {
             "model": selected_model,

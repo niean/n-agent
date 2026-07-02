@@ -44,7 +44,7 @@
 - 文件记忆（multi-project slot）：ExternalMemoryManager 的 multi-project 槽位中文名，对应槽位常量 `_MULTI_PROJECT_SLOT`。按项目子目录管理多组 `{memory,user}.md`，由 `MultiProjectMemory` 实现；通过 `set_enabled_projects` 选择启用项，跨 enabled project 合并打分取全局 top-K，返回文本用 `## Project: {name}` 前缀区分来源。
 - 检索记忆（external-query slot）：ExternalMemoryManager 的 external-query 槽位中文名，对应槽位常量 `_EXTERNAL_QUERY_SLOT`。该槽位承载 query-only provider（mem0/holographic/honcho），at-most-one 约束，由 `swap_external_query_provider` 单独替换，不影响系统记忆/文件记忆槽。
 - 检索记忆 provider（external-query provider）：外部记忆 SPI 中 query-only 的实现，数据非本地 Markdown 文本、无法做静态快照，只能通过 query 走向量/语义检索拿回相关片段。当前支持 mem0（服务端事实库 HTTP）、holographic（本地 SQLite + MemoryRetriever）、honcho（用户建模 dialectic 库 HTTP）。at-most-one 约束：至多一个检索记忆 provider 同时启用。
-- ActiveExternalMemoryReader：Application 层只读端口，`get_active_provider_names() -> list[str]`，读 ExternalMemoryManager 内存状态、无 IO；由 ExternalMemoryProviderService 实现，注入 ChatCompletionService 用于会话默认 profile 派生（未传 external_memory_enabled 时纳入 active 检索记忆 provider）。
+- ActiveExternalMemoryReader：Application 层只读端口，`get_active_provider_names() -> list[str]`，读 ExternalMemoryManager 内存状态、无 IO；由 ExternalMemoryProviderService 实现。当前不消费于默认 profile 派生（未传 `external_memory_enabled` 时统一默认 `["builtin"]`，不自动纳入 active 检索记忆 provider），接口留存供未来别处使用。
 - tool_surface_refresh_failed：activate/swap 返回的布尔标志，标记工具面回调（刷新 ToolService dynamic_definitions + Composite routes）是否失败。回调在 swap_lock 内同步执行，异常不阻塞 swap 本身，仅置标志供 API 响应透传。
 - provider_swapping：ExternalMemoryManager.handle_tool_call 在 swap_lock 持有期间对检索记忆槽工具返回的错误，避免 swap 进行中路由到不一致的工具实现。
 - has_override：ChatCompletionService 首轮 profile 派生时的字段存在性判断（`"external_memory_enabled" in request.options`），区分"客户端未传字段"与"客户端显式传 ['builtin']"。前端 chat.js 维护 `externalMemoryTouched` 标志，未操作时不发送该字段，使后端能派生含 active 检索记忆 provider 的默认 profile。

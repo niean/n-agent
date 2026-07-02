@@ -5,7 +5,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo
+from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
 
 
 class OpenAICompatibleProvider:
@@ -54,7 +54,7 @@ class OpenAICompatibleProvider:
         options: dict[str, Any],
     ) -> LLMResult | AsyncIterator[LLMEvent]:
         kwargs = {
-            "model": model or self.default_model,
+            "model": resolve_model(model, self.default_model),
             "messages": messages,
             "stream": stream,
             **_provider_options(options),

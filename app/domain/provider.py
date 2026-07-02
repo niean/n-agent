@@ -59,6 +59,20 @@ class LLMProvider(Protocol):
         ...
 
 
+# 占位 model id：上层（HTTP 接口、定时任务、子 Agent 等）可能用这些值而非真实
+# provider 模型 id 发请求。直接透传会导致 provider 拒绝（如 Ark
+# "does not support agent plan feature"）。所有 provider 在 chat() 入口处
+# 必须通过 resolve_model 回退到 default_model。
+PLACEHOLDER_MODEL_IDS = {"n-agent", "model", ""}
+
+
+def resolve_model(model: str | None, default_model: str) -> str:
+    """Return default_model when model is a placeholder or empty; otherwise model."""
+    if not model or model.lower() in PLACEHOLDER_MODEL_IDS:
+        return default_model
+    return model
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     id: str

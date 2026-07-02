@@ -1,9 +1,9 @@
-<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界 -->
+<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
 N-Agent 是一款类似 Hermes 的 Agent Runtime。业务核心是接收对话请求，加载会话上下文，调用模型，按需执行工具，更新记忆，并返回同步或流式结果。
 
-## 子域划分
+## 领域划分
 
 ```text
 Agent Runtime
@@ -16,12 +16,36 @@ Agent Runtime
 ├── 支撑子域
 │   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
 │   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
-│   └── Platform/Gateway：CLI、飞书等交互的平台抽象、生命周期管理
+│   ├── MCP：MCP site 注册与工具同步，把远程 MCP server 工具暴露给 LLM 调用
+│   ├── Plugin：预留工具适配入口
+│   ├── Platform/Gateway：CLI、飞书等交互的平台抽象、生命周期管理
+│   └── Sandbox：受控Python代码执行子域execute_code
 └── 通用子域
     └── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
-## Loop FSM
+## 概念架构
+- Skill：结构化Prompt，控制LLM怎么想、怎么说，进而完成功能。Skill定义**业务功能**，**主决策**而非执行，这是和工具的主要区别
+- Plugin：特化工具为LLM定制的**点对点适配**，将外部工具能力、封装为LLM可调用函数FC。Plugin是本地部署的工具适配层，而非工具本身
+- MCP：面向LLM的标准协议，用于统一外部工具、资源、上下文的访问方式，类似总线协议、SPI
+
+```mermaid
+graph TD
+
+Skill --> AgentCore
+AgentCore --> Knowledge
+AgentCore --> MCP
+AgentCore --> Plugin
+
+Knowledge --> FC
+MCP --> FC
+Plugin --> FC
+
+FC --> externals
+```
+
+
+## Loop
 ```text
 User Message
     ↓
@@ -31,6 +55,9 @@ Tool Calls?
     ├─ Yes → Execute Tool → Observation → AgentCore
     └─ No  → Final Answer
 ```
+
+<details>
+<summary>Loop FSM</summary>
 
 ```mermaid
 stateDiagram-v2
@@ -45,6 +72,8 @@ stateDiagram-v2
   finalize --> [*]
 ```
 库：LangGraph.Graph.StateGraph
+</details>
+
 
 ## AgentCore
 AgentCore: Single-Turn Inference Engine(单轮推理引擎)
@@ -76,6 +105,9 @@ Output
 ├── Usage
 └── Reasoning Metadata
 ```
+
+<details>
+<summary>AgentCore详情</summary>
 
 ```text
 AgentCore
@@ -126,11 +158,11 @@ AgentCore
       ├── Usage
       └── Reasoning Metadata
 ```
+</details>
 
 ## Memory
 
-### Memory Type
-Memory 子域负责让 Agent 在单轮推理之外保留上下文，按生命周期分如下两类。
+Memory 子域负责让 Agent 在单轮推理之外保留上下文。按生命周期，记忆分类如下：
 
 ```text
 Memory
@@ -153,7 +185,8 @@ Memory
         └─ honcho：用户建模 dialectic 库（HTTP）
 ```
 
-### Context Frame（Memory In Context）
+<details>
+<summary>Context Frame: Memory In Context</summary>
 
 完整上下文可以理解为一次模型调用前组装出的 Context Frame，从稳定上下文、到本轮临时上下文逐层合成。Memory 不是单独追加的一段文本，而是根据特征进入稳定层、会话层、本轮层。最终发给模型的是 Provider Request(provider-agnostic request)，返回后再拆成 assistant message、tool calls、usage 和推理元数据。
 
@@ -195,9 +228,10 @@ Provider Request
 ├─ tool choice: 默认
 └─ generation params: temperature / top_p / top_k / max_tokens / stop_sequences / thinking / cache_control 等
 ```
+</details>
 
-
-用一轮真实对话，举例说明Context Frame，如下：
+<details>
+<summary>真实对话示例</summary>
 
 ```text
 ## 对话
@@ -277,11 +311,11 @@ Provider Request #2
 TaskState: status=completed, iteration_count=2
 Summary: 覆盖为 "用户: 现在几点了？... | 助手: 外部记忆1：..."
 *外部记忆*消息同步: sync_all(primary) → 系统记忆（builtin）.sync_turn 抽取关键词写入 observations.md；external_memory_1（文件记忆）.sync_turn 为 no-op
-
 ```
+</details>
 
-
-### 单轮写入时序
+<details>
+<summary>单轮写入时序</summary>
 
 `ChatCompletionService.complete` → `AgentGraphRunner`（LangGraph）：
 
@@ -313,10 +347,73 @@ finalize
   └─ 任务状态 TaskState: save_task_state(status=run_status)
 ```
 
-关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider，写入路径有两条——LLM 主动调用 external_memory / multi_external_memory 工具（execute_tools 阶段），以及 finalize 阶段 sync_all 自动同步（系统记忆（builtin）写 observations.md，文件记忆（multi-project）/检索记忆（external-query）no-op。LLM 回声中的 `<memory-context>` 在 call_llm 内立即被 scrub_memory_context 剥离，避免把 Turn Context 的临时召回内容写回 消息 ConversationMessage。
+关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用 external_memory / multi_external_memory 工具（execute_tools），以及 finalize 阶段 sync_all（builtin 写 observations.md，multi-project / external-query 为 no-op）。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
+</details>
 
+
+
+## Sandbox
+
+Sandbox 子域承载 `execute_code`：为模型生成的 Python 代码提供隔离执行、受控文件/网络能力和独立审计。后端支持 Docker 与 Local，生产语义以 Docker 隔离为准。
+
+模型调用 `execute_code` 的执行链路如下，所有入口统一走 ToolService：
+
+```text
+Interface/Gateway -> ChatCompletionService -> AgentGraphRunner.execute_tools
+  -> ToolService.execute -> SandboxToolExecutor.execute
+       ├─ 会话锁
+       ├─ get_or_create(session_id)       # session 级复用
+       ├─ new_call_staging(session_id)    # per-call scratch
+       └─ sandbox.execute(request)
+  -> record_history
+  -> ToolResult 回流 AgentGraph，写 role=tool 消息
+```
+
+`safe_only` 策略隐藏 `ToolSourceType.AGENT` 来源工具，unattended/scheduler 默认不暴露 `execute_code`；交互通道不受影响。
+
+Dashboard API/CLI 的直接执行不经模型 tool_calls，但复用 `SandboxToolExecutor` 和同一沙盒边界。
+
+<details>
+<summary>生命周期</summary>
+
+Sandbox 生命周期如下。release 由 idle 到期或 session 删除触发；manual force 由 Dashboard 手动触发（docker kill -f）。
+
+```mermaid
+stateDiagram-v2
+  [*] --> active: get_or_create
+  active --> executing: execute
+  executing --> active: done
+  active --> releasing: release
+  executing --> releasing: force
+  active --> releasing: force
+  releasing --> [*]: cleanup
+```
+</details>
+
+<details>
+<summary>业务关系</summary>
+
+```mermaid
+erDiagram
+  ConversationSession ||--o| Sandbox : "1:1 session级复用"
+  Sandbox ||--o{ SandboxExecutionHistoryEntry : "1:N 每次执行一条审计"
+  Sandbox ||--o| ReleasedSandboxInfo : "1:0..1 释放时一条"
+```
+</details>
+
+<details>
+<summary>安全边界</summary>
+
+`execute_code` 是 `RiskLevel.SAFE` 工具，无 confirmation gate，不依赖 trusted_metadata。安全边界在 sandbox 内部：
+
+- 隔离：workspace 只读，scratch 可写；Docker 后端禁网络、降权、限制进程和临时目录。
+- 外部能力：代码只能通过注入的 UDS RPC stub 调 callback tool；父进程按 allowlist 与 max_tool_calls 派发。
+- 审计：每次执行写入 SandboxExecutionHistoryRegistry，含 code_hash、状态、结果和授权工具。
+- 失败语义：sandbox 异常转成 `ToolResult(ERROR)`，不打断 AgentGraph。
+</details>
 
 ---
+待整理分界线
 
 ## 分层边界
 
@@ -332,7 +429,7 @@ Infrastructure -> Domain
 
 Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层的 Runtime Loop 实现细节。
 
-## 核心业务流程
+## 请求链路
 ```text
 客户端请求
   -> ChatCompletionService 创建/读取会话并写入用户消息
@@ -343,7 +440,7 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
   -> 返回 ChatCompletion 或 SSE 事件
 ```
 
-## 关键领域模型
+## 领域模型
 
 | 类型 | 模型 | 说明 |
 |------|------|------|
@@ -374,6 +471,13 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | 端口 | GatewaySessionRegistry | 平台 conversation 与内部 session 映射、事件幂等和平台统计查询端口 |
 | 端口 | KnowledgeBaseRegistry | KB 配置注册表端口（CRUD + get_secret + probe 状态更新） |
 | 端口 | KnowledgeRetriever / KnowledgeRetrieverFactory | KB 检索与探测 SPI，Infrastructure adapter 按 base_type 实现协议差异 |
+| 实体 | SandboxExecutionHistoryEntry | execute_code 执行审计：id、session_id、code_hash、code、result、status、duration_ms、authorized_callback_tools、created_at |
+| 值对象 | SandboxExecutionRequest / SandboxExecutionResult | 沙盒执行入参与结果（code、timeout、max_tool_calls、enabled_callback_tools、workspace_root、scratch_dir / status、stdout、stderr、returncode、tool_calls_made、tool_call_log） |
+| 值对象 | ActiveSandboxInfo / ReleasedSandboxInfo | 活跃沙盒只读视图与废弃沙盒审计记录（含 reason: idle/session/manual） |
+| 端口 | Sandbox | 沙盒执行端口，execute(request) -> result，屏蔽 Docker/Local 差异 |
+| 端口 | SandboxCallbackTool / SandboxCallbackToolRegistry | 沙盒回调工具及注册表，list_enabled 决定可调用工具集 |
+| 端口 | SandboxExecutionHistoryRegistry / ReleasedSandboxRegistry | 执行历史与废弃沙盒历史持久化，独立于 Chat Session 生命周期 |
+| 端口 | SearchProvider | Web 搜索后端 SPI，供 web_extract/web_search 回调工具调用 |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 
@@ -389,7 +493,7 @@ ConversationSession
 
 SQLite Memory 默认使用 `sessions.db`。业务上以 session 为中心保存对话上下文；`AgentState` 只表示单次运行状态，不作为 SQLite 聚合根直接持久化。
 
-Long-term Memory 当前由历史消息和 Summary 提供基础能力，后续可在 `MemoryStore` 端口下扩展。
+外部记忆已由 `ExternalMemoryManager` 管理三槽：builtin、multi-project、external-query。新会话默认只启用 builtin，检索记忆需显式勾选。
 
 ## Action 业务关系
 

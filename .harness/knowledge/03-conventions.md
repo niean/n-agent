@@ -98,7 +98,7 @@ Docker Compose 项目隔离使用：
 ## 测试
 
 - 测试命令：`python -m pytest -v`
-- 当前全量测试覆盖 33 项
+- 当前全量测试覆盖 789 项
 - 新增 Domain、Application、Infrastructure、Interfaces 能力时必须补对应测试
 - 涉及 DDD 边界变更时必须运行 `tests/test_architecture_boundaries.py`
 - 涉及 Docker Compose 变更时必须运行 `tests/test_docker_compose_config.py` 和 `docker compose config`
@@ -127,7 +127,7 @@ curl http://127.0.0.1:8201/v1/models
 - 不主动创建 README，除非用户明确要求
 - 不自主删除项目文件
 - `locals/`、`logs/`、`data/`、`.pytest_cache/`、`*.pyc`、`*.egg-info/` 是本地运行、测试或构建产物，应由 `.gitignore` 忽略，不需要提交
-- `docker/restart-nagent.sh` 是本地 Docker Compose 重建辅助脚本
+- `docker/restart.sh` 是本地 Docker Compose 重建辅助脚本
 - `docker/docker-compose.yml` 当前在 `.gitignore` 中，修改部署配置前需确认提交边界
 - `.harness/prd/` 是 AI-READONLY，不能自动修改
 - `.harness/knowledge/` 是实现后知识回填目标，可按 Harness 流程更新

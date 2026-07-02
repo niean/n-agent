@@ -4,9 +4,11 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+from uuid import uuid4
 
 from app.domain.skill import (
     Skill,
+    SkillFrontmatter,
     SkillNotFoundError,
     SkillReadiness,
     SkillRegistry,
@@ -38,6 +40,17 @@ class SkillScanReport:
     warnings: list[SkillScanWarning] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class SkillInput:
+    name: str
+    relative_path: str
+    description: str = ""
+    platforms: list[str] = field(default_factory=list)
+    enabled: bool = True
+    readiness: SkillReadiness = SkillReadiness.AVAILABLE
+    frontmatter: dict[str, Any] = field(default_factory=dict)
+
+
 class SkillFileLoaderProtocol(Protocol):
     async def scan(self) -> tuple[list[Skill], list[Any]]: ...
     async def render(self, skill: Skill, session_id: str = "") -> str: ...
@@ -64,6 +77,26 @@ class SkillService:
         if skill is None:
             raise SkillNotFoundError(name)
         return skill
+
+    async def create_skill(self, payload: SkillInput) -> Skill:
+        existing = await self.registry.get_skill(payload.name.strip())
+        if existing is not None:
+            raise SkillValidationError("skill name already exists")
+        skill = _skill_from_input(payload)
+        return await self.registry.upsert_skill(skill)
+
+    async def update_skill(self, name: str, payload: SkillInput) -> Skill:
+        current = await self.registry.get_skill(name)
+        if current is None:
+            raise SkillNotFoundError(name)
+        if payload.name.strip() != name:
+            raise SkillValidationError("skill name cannot be changed")
+        updated = _skill_from_input(payload, current=current)
+        return await self.registry.upsert_skill(updated)
+
+    async def delete_skill(self, name: str) -> None:
+        if not await self.registry.delete_skill(name):
+            raise SkillNotFoundError(name)
 
     async def set_enabled(self, name: str, enabled: bool) -> Skill:
         skill = await self.registry.get_skill(name)
@@ -144,6 +177,68 @@ def _normalize_warning(w: Any) -> SkillScanWarning:
         detail=getattr(w, "detail", None),
         first_path=getattr(w, "first_path", None),
     )
+
+
+def _skill_from_input(payload: SkillInput, current: Skill | None = None) -> Skill:
+    name = payload.name.strip()
+    relative_path = payload.relative_path.strip()
+    _validate_skill_input(name, relative_path, payload.platforms, payload.frontmatter)
+    raw = dict(payload.frontmatter or {})
+    raw["name"] = name
+    raw["description"] = payload.description
+    raw["platforms"] = list(payload.platforms)
+    fm = SkillFrontmatter(
+        name=name,
+        description=payload.description,
+        version=str(raw.get("version") or ""),
+        platforms=list(payload.platforms),
+        tags=list(raw.get("tags") or []),
+        related_skills=list(raw.get("related_skills") or []),
+        author=str(raw.get("author") or ""),
+        license=str(raw.get("license") or ""),
+        setup_help=raw.get("setup_help"),
+        required_env_vars=list(raw.get("required_env_vars") or []),
+        raw=raw,
+    )
+    return Skill(
+        id=current.id if current else str(uuid4()),
+        name=name,
+        relative_path=relative_path,
+        description=payload.description,
+        platforms=list(payload.platforms),
+        frontmatter=fm,
+        enabled=payload.enabled,
+        readiness=payload.readiness,
+        last_scan_status=current.last_scan_status if current else "manual",
+        last_scan_error=current.last_scan_error if current else None,
+        last_seen_at=current.last_seen_at if current else None,
+        created_at=current.created_at if current else None,
+        updated_at=current.updated_at if current else None,
+    )
+
+
+def _validate_skill_input(
+    name: str,
+    relative_path: str,
+    platforms: list[str],
+    frontmatter: dict[str, Any],
+) -> None:
+    if not name:
+        raise SkillValidationError("name required")
+    if "/" in name or "\\" in name:
+        raise SkillValidationError("name must not contain path separators")
+    if not relative_path:
+        raise SkillValidationError("relative_path required")
+    normalized = relative_path.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    if normalized.startswith("/") or normalized.startswith("../") or ".." in parts:
+        raise SkillValidationError("relative_path must stay under skills_root")
+    if not normalized.endswith("SKILL.md"):
+        raise SkillValidationError("relative_path must point to SKILL.md")
+    if not isinstance(platforms, list) or any(not isinstance(item, str) for item in platforms):
+        raise SkillValidationError("platforms must be a string list")
+    if not isinstance(frontmatter, dict):
+        raise SkillValidationError("frontmatter must be an object")
 
 
 def _skill_category(skill: Skill) -> str:

@@ -5,6 +5,8 @@
     tasks: [],
     loading: false,
     error: '',
+    view: 'list',
+    detail: null,
     modal: null,
   };
 
@@ -44,6 +46,17 @@
     node.className = className || 'btn';
     node.textContent = label;
     node.addEventListener('click', onClick);
+    return node;
+  }
+
+  // 新标签页打开的链接按钮，用于详情等需要独立 URL 的页面。
+  function linkButton(label, className, href) {
+    const node = document.createElement('a');
+    node.className = className || 'btn';
+    node.href = href;
+    node.target = '_blank';
+    node.rel = 'noopener';
+    node.textContent = label;
     return node;
   }
 
@@ -90,6 +103,11 @@
     const root = getRoot();
     if (!root) return;
     clear(root);
+    if (state.view === 'detail') {
+      renderDetailPage(root);
+      renderModal(root);
+      return;
+    }
     root.appendChild(renderHeader());
     if (state.error) appendText(root, 'div', state.error, 'error-state');
     if (state.loading) {
@@ -199,7 +217,7 @@
     const actionCell = document.createElement('td');
     const actions = document.createElement('div');
     actions.className = 'row-actions';
-    actions.appendChild(button('详情', 'btn', () => openTaskDetail(task.id)));
+    actions.appendChild(linkButton('详情', 'btn', `/scheduled-tasks/${encodeURIComponent(task.id)}`));
     actions.appendChild(button('编辑', 'btn', () => openTaskForm(task)));
     actions.appendChild(button('立即运行', 'btn', () => runTask(task)));
     actions.appendChild(button(task.status === 'paused' || task.enabled === false ? '恢复' : '暂停', 'btn', () => toggleTask(task)));
@@ -214,17 +232,37 @@
     render();
   }
 
-  async function openTaskDetail(id) {
-    state.modal = { type: 'detail', loading: true, task: null, executions: [], error: '' };
+  // 详情作为独立页面视图，URL 形如 /scheduled-tasks/{task_id}。
+  function openTaskDetail(id) {
+    state.view = 'detail';
+    state.detail = { loading: true, task: null, executions: [], error: '' };
     render();
-    try {
-      const detail = await api.getScheduledTask(id);
-      const executions = await api.listScheduledTaskExecutions(id, 10);
-      state.modal = { type: 'detail', loading: false, task: detail, executions, error: '' };
-    } catch (error) {
-      state.modal = { type: 'detail', loading: false, task: null, executions: [], error: error.message || 'scheduled_task_detail_failed' };
+    (async () => {
+      try {
+        const detail = await api.getScheduledTask(id);
+        const executions = await api.listScheduledTaskExecutions(id, 10);
+        state.detail = { loading: false, task: detail, executions, error: '' };
+      } catch (error) {
+        state.detail = { loading: false, task: null, executions: [], error: error.message || 'scheduled_task_detail_failed' };
+      }
+      render();
+    })();
+  }
+
+  function backToList() {
+    const path = '/scheduled-tasks';
+    if (window.location.pathname !== path) {
+      history.pushState({ tab: 'scheduled-tasks' }, '', path);
     }
+    state.view = 'list';
+    state.detail = null;
     render();
+  }
+
+  function pendingTaskIdFromPath() {
+    const match = window.location.pathname.match(/^\/scheduled-tasks\/([^/]+)$/);
+    if (!match) return null;
+    try { return decodeURIComponent(match[1]); } catch (_) { return null; }
   }
 
   function confirmDeleteTask(task) {
@@ -244,8 +282,8 @@
     const dialog = document.createElement('div');
     dialog.className = 'modal-dialog scheduled-modal';
     if (state.modal.type === 'form') renderTaskForm(dialog);
-    if (state.modal.type === 'detail') renderTaskDetail(dialog);
     if (state.modal.type === 'delete') renderDeleteConfirm(dialog);
+    if (state.modal.type === 'run_result') renderRunResult(dialog);
     backdrop.appendChild(dialog);
     root.appendChild(backdrop);
   }
@@ -356,21 +394,49 @@
     return { label, input };
   }
 
-  function renderTaskDetail(parent) {
+  function renderDetailPage(root) {
     const wrapper = document.createElement('div');
-    wrapper.className = 'providers-form scheduled-detail';
-    renderModalHeader(wrapper, '任务详情');
-    if (state.modal.loading) {
+    wrapper.className = 'scheduled-detail-page';
+
+    const header = document.createElement('div');
+    header.className = 'scheduled-page-header';
+    const copy = document.createElement('div');
+    appendText(copy, 'h3', '任务详情');
+    appendText(copy, 'p', '查看任务配置与最近执行历史。', 'muted');
+    header.appendChild(copy);
+
+    const actions = document.createElement('div');
+    actions.className = 'panel-actions';
+    actions.appendChild(button('← 返回列表', 'btn', backToList));
+    const detail = state.detail || {};
+    if (detail.task) {
+      actions.appendChild(button('刷新', 'btn', () => openTaskDetail(detail.task.id)));
+      actions.appendChild(button('立即运行', 'btn', () => runTask(detail.task)));
+    }
+    header.appendChild(actions);
+    wrapper.appendChild(header);
+
+    if (!detail || detail.loading) {
       appendText(wrapper, 'div', '加载中...', 'loading-state');
-      parent.appendChild(wrapper);
+      root.appendChild(wrapper);
       return;
     }
-    if (state.modal.error) {
-      appendText(wrapper, 'div', state.modal.error, 'error-state');
-      parent.appendChild(wrapper);
+    if (detail.error) {
+      appendText(wrapper, 'div', detail.error, 'error-state');
+      root.appendChild(wrapper);
       return;
     }
-    const task = state.modal.task;
+
+    const task = detail.task;
+    const card = document.createElement('div');
+    card.className = 'status-panel scheduled-detail';
+    const cardHeader = document.createElement('div');
+    cardHeader.className = 'panel-header';
+    appendText(cardHeader, 'span', text(task.name, task.id));
+    card.appendChild(cardHeader);
+
+    const cardBody = document.createElement('div');
+    cardBody.className = 'panel-body';
     const grid = document.createElement('div');
     grid.className = 'scheduled-modal-grid';
     [
@@ -385,12 +451,15 @@
       ['创建时间', formatDate(task.created_at)],
       ['更新时间', formatDate(task.updated_at)],
     ].forEach(([key, value]) => grid.appendChild(detailItem(key, value)));
-    wrapper.appendChild(grid);
-    wrapper.appendChild(detailBlock('Prompt', task.prompt));
-    wrapper.appendChild(detailBlock('Origin', JSON.stringify(task.origin || {}, null, 2)));
-    wrapper.appendChild(detailBlock('Delivery Context', JSON.stringify(task.delivery_context || {}, null, 2)));
-    wrapper.appendChild(renderExecutions(state.modal.executions));
-    parent.appendChild(wrapper);
+    cardBody.appendChild(grid);
+    cardBody.appendChild(detailBlock('Prompt', task.prompt));
+    cardBody.appendChild(detailBlock('Origin', JSON.stringify(task.origin || {}, null, 2)));
+    cardBody.appendChild(detailBlock('Delivery Context', JSON.stringify(task.delivery_context || {}, null, 2)));
+    cardBody.appendChild(renderExecutions(detail.executions));
+    card.appendChild(cardBody);
+    wrapper.appendChild(card);
+
+    root.appendChild(wrapper);
   }
 
   function detailItem(key, value) {
@@ -413,7 +482,7 @@
     const section = document.createElement('div');
     section.className = 'scheduled-history';
     appendText(section, 'h5', '最近执行历史');
-    if (!executions.length) {
+    if (!executions || !executions.length) {
       appendText(section, 'div', '暂无执行记录', 'empty-state');
       return section;
     }
@@ -455,6 +524,9 @@
       try {
         await api.deleteScheduledTask(state.modal.task.id);
         closeModal();
+        if (state.view === 'detail' && state.detail && state.detail.task && state.detail.task.id === state.modal.task.id) {
+          backToList();
+        }
         await refresh();
       } catch (error) {
         state.modal.error = error.message || 'scheduled_task_delete_failed';
@@ -465,10 +537,43 @@
     parent.appendChild(wrapper);
   }
 
+  const RUN_RESULT_MESSAGES = {
+    triggered: { title: '任务已触发', detail: '任务执行请求已受理，正在后台运行。可在执行历史中查看结果。', kind: 'info' },
+    not_claimed: { title: '任务正在运行', detail: '任务已被其他实例锁定或正在运行中，请稍后重试。', kind: 'warning' },
+  };
+
+  function renderRunResult(parent) {
+    const { task, result } = state.modal;
+    const status = String(result.status || '').toLowerCase();
+    const message = RUN_RESULT_MESSAGES[status] || { title: '任务已提交', detail: '任务执行请求已受理。', kind: 'info' };
+    const wrapper = document.createElement('div');
+    wrapper.className = 'providers-form';
+    renderModalHeader(wrapper, message.title);
+    appendText(wrapper, 'p', `任务：${text(task.name, task.id)}`);
+    appendText(wrapper, 'p', message.detail);
+    const actions = document.createElement('div');
+    actions.className = 'providers-form__actions';
+    if (state.view === 'detail' && state.detail && state.detail.task && state.detail.task.id === task.id) {
+      // 已在详情页：关闭弹框并刷新本页执行历史
+      actions.appendChild(button('刷新执行历史', 'btn btn--primary', async () => {
+        closeModal();
+        await openTaskDetail(task.id);
+      }));
+    } else {
+      // 在列表页：新标签页打开任务详情
+      actions.appendChild(linkButton('查看执行历史', 'btn btn--primary', `/scheduled-tasks/${encodeURIComponent(task.id)}`));
+    }
+    actions.appendChild(button('关闭', 'btn', closeModal));
+    wrapper.appendChild(actions);
+    parent.appendChild(wrapper);
+  }
+
   async function runTask(task) {
     try {
-      await api.runScheduledTask(task.id);
-      await refresh();
+      const result = await api.runScheduledTask(task.id);
+      state.modal = { type: 'run_result', task, result: result || {} };
+      render();
+      refresh();
     } catch (error) {
       showError(error.message || 'scheduled_task_run_failed');
     }
@@ -485,9 +590,25 @@
   }
 
   function init() {
-    const refreshButton = document.getElementById('scheduled-tasks-refresh');
-    if (refreshButton) refreshButton.addEventListener('click', refresh);
-    refresh();
+    window.addEventListener('popstate', handlePathChange);
+    refresh().then(() => {
+      const pendingId = pendingTaskIdFromPath();
+      if (pendingId) openTaskDetail(pendingId);
+    });
+  }
+
+  function handlePathChange() {
+    const pendingId = pendingTaskIdFromPath();
+    if (pendingId) {
+      const current = state.detail && state.detail.task ? state.detail.task.id : null;
+      if (current !== pendingId) {
+        openTaskDetail(pendingId);
+      }
+    } else if (state.view === 'detail') {
+      state.view = 'list';
+      state.detail = null;
+      render();
+    }
   }
 
   namespace.scheduledTasks = { init, refresh, openTaskForm, openTaskDetail, confirmDeleteTask };

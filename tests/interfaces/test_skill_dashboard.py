@@ -48,6 +48,29 @@ class _FakeSkillService:
             "linked_files": {},
         }
 
+    async def create_skill(self, payload):
+        self.skills[payload.name] = _skill(
+            payload.name,
+            enabled=payload.enabled,
+            readiness=payload.readiness,
+        )
+        return self.skills[payload.name]
+
+    async def update_skill(self, name, payload):
+        if name not in self.skills:
+            raise SkillNotFoundError(name)
+        self.skills[name] = _skill(
+            payload.name,
+            enabled=payload.enabled,
+            readiness=payload.readiness,
+        )
+        return self.skills[name]
+
+    async def delete_skill(self, name):
+        if name not in self.skills:
+            raise SkillNotFoundError(name)
+        del self.skills[name]
+
     async def set_enabled(self, name, enabled):
         if name not in self.skills:
             raise SkillNotFoundError(name)
@@ -114,6 +137,34 @@ def test_patch_skill_enabled():
     res = client.patch("/chat/skills/alpha", json={"enabled": False})
     assert res.status_code == 200
     assert res.json()["enabled"] is False
+
+
+def test_create_update_delete_skill_metadata():
+    client = _build_app(_FakeSkillService())
+    created = client.post(
+        "/chat/skills",
+        json={"name": "beta", "relative_path": "beta/SKILL.md", "description": "Beta"},
+    )
+    assert created.status_code == 200
+    assert created.json()["name"] == "beta"
+
+    patched = client.patch(
+        "/chat/skills/beta",
+        json={
+            "name": "beta",
+            "relative_path": "beta/SKILL.md",
+            "description": "Beta 2",
+            "enabled": False,
+            "readiness": "setup_needed",
+        },
+    )
+    assert patched.status_code == 200
+    assert patched.json()["enabled"] is False
+    assert patched.json()["readiness"] == "setup_needed"
+
+    deleted = client.delete("/chat/skills/beta")
+    assert deleted.status_code == 204
+    assert client.get("/chat/skills/beta").status_code == 404
 
 
 def test_refresh_skills_returns_warnings():

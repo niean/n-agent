@@ -102,6 +102,7 @@
 - kb_timeout_seconds
 
 `N_AGENT_KB_*` 当前作为 legacy seed 配置：当 knowledge_bases 表为空且 `kb_enabled=True`、`kb_base_url` 非空时，启动时写入一条 `legacy-n-kb`；表非空后以 SQLite registry 为准，配置不覆盖已有 KB。
+
 - mcp_connect_timeout_seconds
 - mcp_max_tools
 - mcp_max_schema_bytes
@@ -136,6 +137,10 @@ mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, en
 mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema_json, enabled, last_seen_at)
 knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 external_memory_providers(id, name UNIQUE, provider_type, base_url, api_key, enabled, extra_config, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
+external_memory_global_config(id INTEGER PRIMARY KEY CHECK (id = 1), enabled_providers TEXT, updated_at)
+skills(id, name UNIQUE, relative_path, description, platforms_json, frontmatter_json, enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at)
+scheduled_tasks(id, name, prompt, cron_expression, timezone, enabled, status, session_id, origin_json, delivery_target, delivery_context_json, execution_policy_json, next_run_at, lease_until, lease_owner, claim_id, last_run_at, last_status, last_error, last_delivery_error, unread_count, created_at, updated_at)
+scheduled_task_executions(id, task_id, session_id, claim_id, lease_owner, claimed_next_run_at, started_at, completed_at, status, output, error, delivery_status, delivery_error, created_at)
 sandbox_released_history(id, session_id, sandbox_type, sandbox_id, created_at, released_at, reason)
 sandbox_execution_history(id, session_id, code_hash, code, result_json, status, duration_ms, authorized_callback_tools_json, created_at)
 ```
@@ -153,6 +158,10 @@ CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active
 ```sql
 idx_messages_session_created_at ON messages(session_id, created_at)
 idx_tool_calls_session_created_at ON tool_calls(session_id, created_at)
+idx_skills_enabled ON skills(enabled)
+idx_scheduled_tasks_due ON scheduled_tasks(enabled, status, next_run_at)
+idx_scheduled_tasks_session ON scheduled_tasks(session_id)
+idx_scheduled_executions_task_created ON scheduled_task_executions(task_id, created_at)
 idx_sandbox_released_history_released_at ON sandbox_released_history(released_at)
 idx_sandbox_execution_history_created_at ON sandbox_execution_history(created_at)
 idx_sandbox_execution_history_session_created_at ON sandbox_execution_history(session_id, created_at)
@@ -167,6 +176,9 @@ JSON 边界：
 - `sandbox_execution_history.result_json` 存储 execute_code 沙盒执行结果，`authorized_callback_tools_json` 存储本次实际授权的 callback tool 名称列表
 - `mcp_tools.input_schema_json` 存储 MCP 远端工具 schema
 - `mcp_sites.args_json` 和 `mcp_sites.env_json` 存储 stdio MCP server 的参数数组和环境变量映射
+- `scheduled_tasks.origin_json` 存储任务来源上下文（platform、receive_id 等），`delivery_context_json` 存储投递目标上下文，`execution_policy_json` 存储执行策略（mode、tool_exposure_policy、allow_confirm_tools）
+- `skills.platforms_json` 存储适用平台列表，`frontmatter_json` 存储 skill 文件 frontmatter 元数据
+- `external_memory_global_config.enabled_providers` 存储全局启用的外部记忆 provider 名称列表
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
 
 会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。沙盒审计数据不属于 Chat Session 级联删除范围：`sandbox_released_history` 与 `sandbox_execution_history` 由沙盒 Dashboard 显式删除动作或运维清理策略处理，释放沙盒和删除会话均不应自动删除这些长期历史。
@@ -191,7 +203,7 @@ Interfaces 层请求模型位于 `app/interfaces/http/openai.py`，仅作为外�
 
 Dashboard 使用 `metadata.session_id` 绑定会话。
 
-Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息时锁定，锁定逻辑按优先级：(1) session 已有锁定值 → 沿用；(2) 已有历史消息但无锁定值的 legacy session → `["builtin"]`；(3) 请求显式传 `options.external_memory_enabled`（字段存在性判断，区分"未传"与"显式传 ['builtin']"）→ 归一化后使用；(4) 请求未传字段 → `["builtin", *active_external_query_provider_names]`，其中 active 检索记忆 provider 名称由 `ActiveExternalMemoryReader` 端口（由 `ExternalMemoryProviderService` 实现，读 `ExternalMemoryManager` 内存状态、无 IO）提供。启用检索记忆 provider 后，新会话首轮不传字段即可自动纳入该 provider。后续轮次即使客户端继续传入不同的 `external_memory_enabled`，Application 也必须使用 sessions 表里的锁定值。
+Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息时锁定，优先级：(1) session 已锁定 → 沿用；(2) legacy session → `["builtin"]`；(3) 显式传 `options.external_memory_enabled` → 归一化值；(4) 未传字段 → `["builtin"]`。active 检索记忆 provider 不自动纳入默认 profile，需在会话首轮显式启用。后续轮次即使客户端传入不同值，也必须使用 sessions 表里的锁定值。
 
 ## Docker Compose 数据边界
 

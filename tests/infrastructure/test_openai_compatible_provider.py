@@ -106,3 +106,16 @@ async def test_provider_streaming_chat_returns_llm_events():
     assert events[0].type == LLMEventType.MESSAGE_START
     assert events[1].type == LLMEventType.CONTENT_DELTA
     assert events[-1].type == LLMEventType.MESSAGE_DONE
+
+
+@pytest.mark.parametrize("placeholder", ["", "N-Agent", "n-agent", "model"])
+@pytest.mark.asyncio
+async def test_provider_falls_back_to_default_when_model_is_placeholder(placeholder):
+    # 占位 id（如定时任务硬编码的 "N-Agent"）透传会导致 Ark 等 provider 报
+    # "does not support agent plan feature"。provider 层必须回退到 default_model。
+    client = FakeClient()
+    provider = OpenAICompatibleProvider("http://test", "key", "real-model", client=client)
+
+    await provider.chat([], [], False, placeholder, {})
+
+    assert client.completions.kwargs["model"] == "real-model"

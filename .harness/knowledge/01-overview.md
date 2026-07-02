@@ -21,7 +21,7 @@ N-Agent 是面向 Open-WebUI 和本地调试的 Python Agent 服务，通过 Fas
 - 应用入口：`app/main.py`，提供 `create_app(settings: Settings | None = None)` 和模块级 `app`
 - 依赖组装：`create_app` 组装 Settings、SQLiteMemoryStore、HeuristicSummarizer、OpenAICompatibleProvider、BuiltinToolExecutor、ToolService、AgentGraphRunner、ChatCompletionService、ModelService、SessionService
 - HTTP 入口：`app/interfaces/http/openai.py` 提供 `/health`、`/v1/models`、`/v1/chat/completions`
-- Dashboard 入口：`/chat`，静态页面位于 `app/interfaces/http/static/dashboard.html`，调试 API 位于 `/chat/sessions`、`/chat/sessions/{session_id}`、`/chat/sessions/{session_id}/tool-calls`
+- Dashboard 入口：`/chat`，静态页面位于 `app/interfaces/http/static/index.html`，调试 API 位于 `/chat/sessions`、`/chat/sessions/{session_id}`、`/chat/sessions/{session_id}/tool-calls`
 - Agent 根状态：`app/domain/agent.py` 的 `AgentState`，包含 session_id、input_messages、working_messages、pending_tool_calls、tool_results、summary、run_status、iteration_count、error、final_message、finish_reason
 
 ## 核心流程

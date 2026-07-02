@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -11,6 +13,9 @@ from app.domain.schedule import (
     ScheduledTaskExecutionStatus,
     ScheduledTaskRegistry,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ScheduleRunService:
@@ -35,7 +40,14 @@ class ScheduleRunService:
         claim = await self.registry.claim_task_for_run_now(task_id, datetime.now(timezone.utc), self.lease_seconds)
         if claim is None:
             return {"task_id": task_id, "status": "not_claimed"}
-        return await self.run_claim(claim)
+        asyncio.create_task(self._run_claim_safe(claim))
+        return {"task_id": task_id, "status": "triggered", "claim_id": claim.claim_id}
+
+    async def _run_claim_safe(self, claim: ScheduledTaskClaim) -> None:
+        try:
+            await self.run_claim(claim)
+        except Exception:
+            logger.exception("scheduled task run failed: task_id=%s", claim.task.id)
 
     async def run_due_claims(self, now: datetime | None = None) -> list[dict]:
         await self._recover_missing_origin_sessions()

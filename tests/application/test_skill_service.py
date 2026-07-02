@@ -3,6 +3,7 @@ import pytest
 from datetime import datetime, timezone
 
 from app.application.skill_service import (
+    SkillInput,
     SkillService,
     SkillScanReport,
     SkillScanWarning,
@@ -156,6 +157,48 @@ async def test_set_enabled_updates_registry():
     service = SkillService(registry, loader)
     updated = await service.set_enabled("a", False)
     assert updated.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_create_update_delete_skill_metadata():
+    registry, loader = FakeRegistry(), FakeLoader()
+    service = SkillService(registry, loader)
+    created = await service.create_skill(
+        SkillInput(
+            name="manual",
+            relative_path="manual/SKILL.md",
+            description="Manual skill",
+            platforms=["linux"],
+            frontmatter={"tags": ["ops"]},
+        )
+    )
+    assert created.name == "manual"
+    assert created.frontmatter.raw["tags"] == ["ops"]
+
+    updated = await service.update_skill(
+        "manual",
+        SkillInput(
+            name="manual",
+            relative_path="manual/SKILL.md",
+            description="Updated",
+            platforms=["linux", "darwin"],
+            enabled=False,
+        )
+    )
+    assert updated.description == "Updated"
+    assert updated.enabled is False
+    assert updated.platforms == ["linux", "darwin"]
+
+    await service.delete_skill("manual")
+    assert await registry.get_skill("manual") is None
+
+
+@pytest.mark.asyncio
+async def test_create_skill_rejects_path_traversal():
+    registry, loader = FakeRegistry(), FakeLoader()
+    service = SkillService(registry, loader)
+    with pytest.raises(Exception):
+        await service.create_skill(SkillInput(name="bad", relative_path="../SKILL.md"))
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@
   function selectedTabFromPath() {
     const path = window.location.pathname;
     if (tabByPath[path]) return tabByPath[path];
+    if (path.startsWith('/scheduled-tasks/')) return 'scheduled-tasks';
     if (path === '/tools/external-memory') return 'memory';
     if (path === '/tools/sandbox') return 'sandbox';
     if (path === '/tools') return TOOLS_DEFAULT_CHILD;
@@ -92,7 +93,10 @@
     }
     const path = pathByTab[name];
     if (!path) return;
-    if (window.location.pathname !== path) {
+    // 当前已在目标 tab 的路径或其子路径上时，不覆盖 URL（保留子路径状态，如
+    // /scheduled-tasks/{task_id}），只切换 tab 高亮。
+    const current = window.location.pathname;
+    if (current !== path && !current.startsWith(path + '/')) {
       history.pushState({ tab: name }, '', path);
     }
     applyTab(name);

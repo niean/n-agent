@@ -30,7 +30,7 @@ from app.application.schedule_service import (
     ScheduleValidationError,
 )
 from app.application.session_service import SessionService
-from app.application.skill_service import SkillScanReport, SkillScanWarning, SkillService
+from app.application.skill_service import SkillInput, SkillScanReport, SkillScanWarning, SkillService
 from app.application.tool_service import ToolService
 from app.domain.knowledge import (
     DuplicateKnowledgeBaseError,
@@ -58,7 +58,7 @@ from app.domain.session import (
     TaskState,
     ToolCall,
 )
-from app.domain.skill import SkillNotFoundError, SkillValidationError
+from app.domain.skill import SkillNotFoundError, SkillReadiness, SkillValidationError
 from app.domain.tool import ToolDefinition
 
 
@@ -112,6 +112,7 @@ def create_dashboard_router(
     @router.get("/models", response_class=HTMLResponse)
     @router.get("/status", response_class=HTMLResponse)
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
+    @router.get("/scheduled-tasks/{task_id}", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -947,11 +948,57 @@ def _skill_to_dict(skill) -> dict:
     }
 
 
+def _skill_input_from_payload(payload: dict, current=None) -> SkillInput:
+    readiness_value = payload.get(
+        "readiness",
+        getattr(current.readiness, "value", "available") if current else "available",
+    )
+    try:
+        readiness = SkillReadiness(readiness_value)
+    except ValueError as exc:
+        raise SkillValidationError("invalid readiness") from exc
+    raw_frontmatter = payload.get("frontmatter")
+    if raw_frontmatter is None and current is not None:
+        raw_frontmatter = dict(current.frontmatter.raw)
+    elif raw_frontmatter is None:
+        raw_frontmatter = {}
+    enabled = payload.get("enabled", current.enabled if current else True)
+    if not isinstance(enabled, bool):
+        raise SkillValidationError("enabled must be boolean")
+    return SkillInput(
+        name=str(payload.get("name", current.name if current else "") or ""),
+        relative_path=str(payload.get("relative_path", current.relative_path if current else "") or ""),
+        description=str(payload.get("description", current.description if current else "") or ""),
+        platforms=_skill_platforms_from_payload(payload.get("platforms", current.platforms if current else [])),
+        enabled=enabled,
+        readiness=readiness,
+        frontmatter=raw_frontmatter,
+    )
+
+
+def _skill_platforms_from_payload(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise SkillValidationError("platforms must be a string list")
+
+
 def _register_skill_routes(router: APIRouter, skill_service: SkillService) -> None:
     @router.get("/chat/skills")
     async def list_skills():
         items = await skill_service.list_skills(include_disabled=True)
         return {"skills": [_skill_to_dict(s) for s in items]}
+
+    @router.post("/chat/skills")
+    async def create_skill(payload: dict = Body(...)):
+        try:
+            skill = await skill_service.create_skill(_skill_input_from_payload(payload))
+        except Exception as exc:
+            return _skill_error_response(exc)
+        return _skill_to_dict(skill)
 
     @router.get("/chat/skills/{name}")
     async def get_skill(name: str):
@@ -969,10 +1016,25 @@ def _register_skill_routes(router: APIRouter, skill_service: SkillService) -> No
     @router.patch("/chat/skills/{name}")
     async def patch_skill(name: str, payload: dict = Body(...)):
         try:
-            skill = await skill_service.set_enabled(name, bool(payload.get("enabled")))
-        except SkillNotFoundError as exc:
+            if set(payload.keys()) <= {"enabled"}:
+                enabled = payload.get("enabled")
+                if not isinstance(enabled, bool):
+                    raise SkillValidationError("enabled must be boolean")
+                skill = await skill_service.set_enabled(name, enabled)
+            else:
+                current = await skill_service.get(name)
+                skill = await skill_service.update_skill(name, _skill_input_from_payload(payload, current))
+        except Exception as exc:
             return _skill_error_response(exc)
         return _skill_to_dict(skill)
+
+    @router.delete("/chat/skills/{name}")
+    async def delete_skill(name: str):
+        try:
+            await skill_service.delete_skill(name)
+        except Exception as exc:
+            return _skill_error_response(exc)
+        return Response(status_code=204)
 
     @router.post("/chat/skills/refresh")
     async def refresh_skills():
