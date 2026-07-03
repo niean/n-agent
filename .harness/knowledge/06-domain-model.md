@@ -1,7 +1,7 @@
 <!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
-N-Agent 是一款类似 Hermes 的 Agent Runtime。业务核心是接收对话请求，加载会话上下文，调用模型，按需执行工具，更新记忆，并返回同步或流式结果。
+N-Agent 是一款类似 Hermes 的 Agent Runtime。核心流程是：接收对话请求，加载会话上下文，循环"调用模型→按需执行工具"直至产出最终回答，更新会话与外部记忆，返回同步或流式结果。
 
 ## 领域划分
 
@@ -11,7 +11,7 @@ Agent Runtime
 │   ├── Loop：运行状态推进、工具调用回环、结束判断
 │   ├── AgentCore：模型调用、上下文组织、推理结果承接
 │   ├── Memory：消息、会话、工具调用、任务状态、滚动摘要，以及外部记忆
-│   ├── Action：把模型 tool_calls 转换为受控工具执行
+│   ├── Action：把模型 tool_calls 转换为受控工具执行，工具由支撑子域实现
 │   └── Policy：工具权限、风险等级、执行约束和安全决策
 ├── 支撑子域
 │   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
@@ -234,7 +234,7 @@ Provider Request
 <summary>真实对话示例</summary>
 
 ```text
-## 对话
+#### 对话
 >> User：现在几点了？打印下UTC时间。
 >> Tool：
 {
@@ -249,7 +249,7 @@ Provider Request
 >> Assistant：外部记忆1：当前的UTC时间是2026年06月27日 15:52:06.344631。
 
 
-## Context Frame
+#### Context Frame
 
 会话事实：source=dashboard（primary），external_memory_enabled=["builtin","external_memory_1"]，
 builtin/memory.md 为空，external_memory_1/memory.md = `所有的回复，必须以"外部记忆1："开头儿。`。
@@ -350,6 +350,72 @@ finalize
 关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用 external_memory / multi_external_memory 工具（execute_tools），以及 finalize 阶段 sync_all（builtin 写 observations.md，multi-project / external-query 为 no-op）。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
 </details>
 
+
+
+## Action
+
+Action 子域把 LLM tool_calls 转换为受控工具执行。所有工具共享公共链路，在 ToolExecutor执行器 层按工具来源分化。
+
+#### 工具执行
+工具执行的公共链路，如下，
+
+```text
+LLM tool_calls
+  -> AgentGraphRunner.execute_tools
+  -> ToolCallRequest(id, name, arguments)
+  -> ToolService.execute
+       ├─ lookup ToolDefinition
+       ├─ Policy 判定（enabled / risk_level / managed / permitted_managed_tools）
+       └─ CompositeToolExecutor.execute
+            └─ routes[name] -> ToolExecutor， 不同Tool在执行器上分化
+  -> ToolResult(tool_call_id, tool_name, status, content)
+  -> AgentGraphRunner写 role=tool 消息，回流给LLM
+  -> LLM 接收 tool result，继续推理
+```
+
+- ToolDefinition 统一工具描述，包括 name/description/parameters/risk_level/source_type
+- ToolResult 统一工具调用结果
+- CompositeToolExecutor.routes将不同类型tool、路由到不同的执行器ToolExecutor
+
+<details>
+<summary>工具执行器分化</summary>
+
+工具执行器ToolExecutor按工具来源分化，主要实现包括Builtin/Knowledge/Mcp/Plugin/Skill等。核心执行器如下：
+
+```text
+Knowledge
+  KnowledgeToolExecutor -> KnowledgeService.search(kb_id, query)
+    ├─ registry.get(kb_id) + get_secret(kb_id)
+    ├─ retriever_factory.create(config, secret)
+    └─ retriever.search -> normalize -> KnowledgeSearchResult
+
+MCP
+  McpToolExecutor（兼 CompositeToolExecutor.fallback）
+    -> McpService.call_tool(site_id, remote_name, args)
+    -> McpClient(SDK) -> 远端 MCP server（streamable_http / SSE / stdio）
+
+Plugin
+  PluginToolExecutor -> PluginService.call_tool(name, args, context, tool_call_id)
+    ├─ lookup PluginToolRegistration + check_fn
+    ├─ 注入 plugin_config / secret_config / session_id / metadata 为 kwargs
+    └─ handler(args, **kwargs) -> dict 包装
+
+Skill
+  SkillToolExecutor -> SkillService.list_skills / render_view(name)
+    └─ 读 SKILL.md frontmatter+body
+```
+</details>
+
+#### 工具注入
+
+```text
+ToolService.definitions         <- 静态内置工具（BUILTIN）
+ToolService.dynamic_definitions <- 动态工具面，按 source_type 分槽
+  ├─ "skill"     <- SkillService（skills_list / skill_view）
+  ├─ "knowledge" <- KnowledgeService（search_knowledge）
+  ├─ "mcp"       <- McpService（site probe 后注入远端工具）
+  └─ "plugin"    <- PluginService（register(ctx) 后注入 plugin 工具）
+```
 
 
 ## Sandbox
@@ -509,10 +575,13 @@ LLM tool_calls
 
 当前工具能力包括：
 
-- 内置工具：时间、计算、目录列表、文本读取。
+- 内置工具：时间、计算、目录列表、文本读取、web_fetch。
 - 知识库工具：`search_knowledge`，按必填 kb_id 检索已注册 KB 后端。
+- Skill 工具：`skills_list` / `skill_view`，SAFE 只读，LLM 自助发现本地 SKILL.md。
+- MCP 工具：站点 probe 后动态注入远端工具，走 McpToolExecutor（兼 CompositeToolExecutor.fallback）。
+- Plugin 工具：`register(ctx)` 后动态注入，走 PluginToolExecutor，secret 独立 plugin_secrets 表存储。
 
-Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置。N-KB、Ragflow 是外部独立服务和协议类型，不属于 N-Agent 内部业务模型；N-Agent 通过 KnowledgeRetriever adapter 消费它们。
+四类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Action` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
 
 ## Policy 业务关系
 
