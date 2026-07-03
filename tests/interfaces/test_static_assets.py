@@ -637,7 +637,6 @@ def test_plugin_js_present_and_safe(tmp_path):
     body = res.text
     assert 'NAGENT.plugin' in body or 'namespace.plugin' in body
     assert 'Plugin' in body
-    assert '待实现' in body
     assert 'innerHTML =' not in body
     assert 'insertAdjacentHTML' not in body
     assert '.textContent' in body

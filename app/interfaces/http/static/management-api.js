@@ -128,6 +128,21 @@
   const deleteSkill = (name) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
   const refreshSkills = () => fetchJson('/chat/skills/refresh', { method: 'POST' });
 
+  // Plugin dashboard endpoints
+  const listPlugins = () => fetchJson('/chat/plugins');
+  const getPlugin = (key) => fetchJson(`/chat/plugins/${encodeURIComponent(key)}`);
+  const refreshPlugins = () => fetchJson('/chat/plugins:refresh', { method: 'POST' });
+  const setPluginEnabled = (key, enabled) => fetchJson(`/chat/plugins/${encodeURIComponent(key)}/enabled`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: !!enabled }),
+  });
+  const updatePluginConfig = (key, payload) => fetchJson(`/chat/plugins/${encodeURIComponent(key)}/config`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {}),
+  });
+
   // Sandbox dashboard endpoints — paths align with sandbox_routes.py / spec
   const getSandboxConfig = () => fetchJson('/chat/sandbox/config');
   const listSandboxActive = () => fetchJson('/chat/sandbox/active');
@@ -203,6 +218,11 @@
     setSkillEnabled,
     deleteSkill,
     refreshSkills,
+    listPlugins,
+    getPlugin,
+    refreshPlugins,
+    setPluginEnabled,
+    updatePluginConfig,
     sandbox,
   };
 }(window));

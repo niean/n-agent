@@ -48,3 +48,11 @@
 - tool_surface_refresh_failed：activate/swap 返回的布尔标志，标记工具面回调（刷新 ToolService dynamic_definitions + Composite routes）是否失败。回调在 swap_lock 内同步执行，异常不阻塞 swap 本身，仅置标志供 API 响应透传。
 - provider_swapping：ExternalMemoryManager.handle_tool_call 在 swap_lock 持有期间对检索记忆槽工具返回的错误，避免 swap 进行中路由到不一致的工具实现。
 - has_override：ChatCompletionService 首轮 profile 派生时的字段存在性判断（`"external_memory_enabled" in request.options`），区分"客户端未传字段"与"客户端显式传 ['builtin']"。前端 chat.js 维护 `externalMemoryTouched` 标志，未操作时不发送该字段，使后端能派生含 active 检索记忆 provider 的默认 profile。
+- Plugin：N-Agent 的插件子系统领域聚合，遵循 Hermes plugin 模式（`plugin.yaml` + `register(ctx)` entrypoint），支持零成本移植开源插件生态。Plugin 聚合包含 key/name/version/kind/source/enabled/config/secret_refs/capabilities/manifest 等字段，`to_public_view` 输出 secret_refs 为 `{field: bool}` 占位标记（不含明文）。
+- PluginManifest：Plugin 的值对象，由 `plugin.yaml` 解析而来，包含 name/version/kind/provides_tools/requires_env/config_schema 等字段；`from_yaml(raw, source, key, path)` 接受显式 key 参数（不从路径推导）。
+- PluginContext：Application 层提供给 plugin `register(ctx)` 的上下文对象，`register_tool(name, toolset, schema, handler, check_fn, requires_env, is_async, description, emoji, override)` 与 Hermes 签名兼容；P1/P2 unsupported stub（register_hook/register_cli_command/register_platform 等）记录到 unsupported_capabilities 但不崩扫描。
+- PluginKind：插件类型枚举，standalone（独立工具插件，本期唯一支持扫描注册的 kind）/backend/exclusive/platform/model_provider（后四类本期仅识别不执行）。
+- PluginSource：插件来源枚举，bundled（出厂 seeds）/user（PLUGINS_ROOT 用户目录）/project（项目内插件，需 enable_project_plugins）/entry_point（Python entry points，需 enable_plugin_entrypoints）。
+- PluginToolRegistration：Application 层工具注册值对象，封装 plugin 暴露的工具定义（name/toolset/schema/handler/check_fn/requires_env/is_async/description/emoji/override）+ plugin_config/secret_config 缓存，供 PluginToolExecutor 执行时使用。
+- PluginToolExecutor：Application 层 ToolExecutor 实现，将 plugin 工具调用委托给 PluginService.call_tool；在 main.py 中通过 `CompositeToolExecutor(routes, fallback=McpToolExecutor)` 显式路由 plugin 工具名，MCP fallback 不回归。
+- secret_refs：Plugin 的 secret 字段占位标记，`{field: bool}` 形式，由 SQLitePluginRegistry 查询 plugin_secrets 表填充；API 响应永不返回 secret 明文，前端据此显示"已设置，留空保持不变"提示。

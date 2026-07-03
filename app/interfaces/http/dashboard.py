@@ -92,6 +92,7 @@ def create_dashboard_router(
     external_memory_service: ExternalMemoryService | None = None,
     external_memory_provider_service: ExternalMemoryProviderService | None = None,
     sandbox_dashboard_service=None,
+    plugin_service=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -189,6 +190,9 @@ def create_dashboard_router(
         _register_schedule_routes(router, schedule_service)
     if skill_service is not None:
         _register_skill_routes(router, skill_service)
+    if plugin_service is not None:
+        from app.interfaces.http.plugin_routes import register_plugin_routes
+        register_plugin_routes(router, plugin_service)
     if knowledge_service is not None:
         _register_knowledge_routes(router, knowledge_service, tool_service)
 

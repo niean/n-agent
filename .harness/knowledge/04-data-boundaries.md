@@ -139,6 +139,8 @@ knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, a
 external_memory_providers(id, name UNIQUE, provider_type, base_url, api_key, enabled, extra_config, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 external_memory_global_config(id INTEGER PRIMARY KEY CHECK (id = 1), enabled_providers TEXT, updated_at)
 skills(id, name UNIQUE, relative_path, description, platforms_json, frontmatter_json, enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at)
+plugins(id, key UNIQUE, name, version, description, author, kind, source, source_path, enabled, config_json, capabilities_json, manifest_json, last_scan_status, last_scan_error, last_scanned_at, created_at, updated_at)
+plugin_secrets(plugin_key, field_name, secret_value, updated_at, PRIMARY KEY(plugin_key, field_name), FOREIGN KEY(plugin_key) REFERENCES plugins(key) ON DELETE CASCADE)
 scheduled_tasks(id, name, prompt, cron_expression, timezone, enabled, status, session_id, origin_json, delivery_target, delivery_context_json, execution_policy_json, next_run_at, lease_until, lease_owner, claim_id, last_run_at, last_status, last_error, last_delivery_error, unread_count, created_at, updated_at)
 scheduled_task_executions(id, task_id, session_id, claim_id, lease_owner, claimed_next_run_at, started_at, completed_at, status, output, error, delivery_status, delivery_error, created_at)
 sandbox_released_history(id, session_id, sandbox_type, sandbox_id, created_at, released_at, reason)
@@ -159,6 +161,7 @@ CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active
 idx_messages_session_created_at ON messages(session_id, created_at)
 idx_tool_calls_session_created_at ON tool_calls(session_id, created_at)
 idx_skills_enabled ON skills(enabled)
+idx_plugins_enabled ON plugins(enabled)
 idx_scheduled_tasks_due ON scheduled_tasks(enabled, status, next_run_at)
 idx_scheduled_tasks_session ON scheduled_tasks(session_id)
 idx_scheduled_executions_task_created ON scheduled_task_executions(task_id, created_at)
@@ -178,6 +181,7 @@ JSON 边界：
 - `mcp_sites.args_json` 和 `mcp_sites.env_json` 存储 stdio MCP server 的参数数组和环境变量映射
 - `scheduled_tasks.origin_json` 存储任务来源上下文（platform、receive_id 等），`delivery_context_json` 存储投递目标上下文，`execution_policy_json` 存储执行策略（mode、tool_exposure_policy、allow_confirm_tools）
 - `skills.platforms_json` 存储适用平台列表，`frontmatter_json` 存储 skill 文件 frontmatter 元数据
+- `plugins.config_json` 存储非敏感配置（明文），`plugins.capabilities_json` 存储 provides_tools/unsupported 能力声明，`plugins.manifest_json` 存储 plugin.yaml 完整 manifest；`plugin_secrets.secret_value` 存储 secret 明文（与 providers.api_key 同等保护级别，依赖文件系统隔离，不通过 HTTP 暴露、不写入日志）；`Plugin.to_public_view().secret_refs` 仅返回 `{field: bool}` 占位标记，由 registry 查询 plugin_secrets 表填充
 - `external_memory_global_config.enabled_providers` 存储全局启用的外部记忆 provider 名称列表
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
 

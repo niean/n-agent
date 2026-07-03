@@ -1,0 +1,7 @@
+name: hello
+version: 1.0.0
+description: Hello plugin - minimal example
+author: N-Agent
+kind: standalone
+provides_tools:
+  - hello

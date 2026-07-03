@@ -45,6 +45,15 @@ class Settings(BaseSettings):
     skills_max_view_bytes: int = Field(default=131072, ge=1024)
     skills_max_count: int = Field(default=200, ge=1, le=2000)
 
+    # Plugin 配置
+    plugins_root: Path = Field(default=Path("/workspace/plugins"))
+    plugins_enabled: list[str] | str = Field(default_factory=lambda: ["hello"])
+    plugins_disabled: list[str] | str = Field(default_factory=list)
+    plugins_safe_mode: bool = Field(default=False)
+    enable_project_plugins: bool = Field(default=False)
+    enable_plugin_entrypoints: bool = Field(default=False)
+    plugin_tool_timeout_seconds: int = Field(default=30, ge=1, le=300)
+
     # 外部记忆配置
     external_memory_provider: str | None = None
     external_memory_enabled_providers: list[str] | None = None
@@ -92,7 +101,7 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
-        "sqlite_path", "workspace_root", "skills_root",
+        "sqlite_path", "workspace_root", "skills_root", "plugins_root",
         "sandbox_docker_host_workspace_root", "sandbox_docker_host_locals_root",
         "sandbox_scratch_root",
         mode="before",
@@ -117,7 +126,7 @@ class Settings(BaseSettings):
             raise ValueError(f"invalid scheduler timezone: {value}") from exc
         return value
 
-    @field_validator("feishu_allowed_open_ids", "feishu_allowed_chat_ids", "sandbox_callback_tools", mode="before")
+    @field_validator("feishu_allowed_open_ids", "feishu_allowed_chat_ids", "sandbox_callback_tools", "plugins_enabled", "plugins_disabled", mode="before")
     @classmethod
     def parse_csv_list(cls, value: list[str] | str) -> list[str]:
         if isinstance(value, str):

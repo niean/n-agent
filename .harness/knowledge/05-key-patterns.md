@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -339,4 +339,36 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - 把 schedule 当成 `http` 的二级（`http/schedule`）会混淆"触发方式"和"IM 平台"两个维度，扩展到 `http/openwebui`、`http/webhook`、`gw/wx` 时维度越来越乱。正确做法：一级只放触发方式，二级只放 IM 平台。
 - session_id 前缀与 source 脱节（如 dashboard 用 `session-`、api 用 `tmp-`、gw 用 `gateway-`）会导致会话列表无法直接从 id 归因入口，必须查 source 字段。前缀严格等于一级名即可。
 - `delete_session` 级联未覆盖 `scheduled_task_executions`、`sandbox_execution_history`、`sandbox_released_history`，删 session 后这 3 张表会留下孤儿行（与命名规则无关，但同属 session_id 引用完整性问题）。
+
+## 模式十七：Plugin 子系统 Hermes 兼容装配与工具面路由
+
+Plugin 子系统遵循 Hermes plugin 模式（`plugin.yaml` + `register(ctx)`），通过四层装配实现零成本移植开源插件生态。
+
+装配链路：
+1. `build_application_services`（app/main.py）创建 `SQLitePluginRegistry` + `PluginFileLoader`（bundled_root 指向 `app/infrastructure/plugin/seeds`）+ `PluginService`，同步执行 `plugin_service.scan()` 完成首批工具面注入
+2. `PluginToolExecutor(service)` 持有 service 引用，通过 `plugin_tool_executor_holder["executor"]` 字典在 `ToolService` 构造前先占位、构造后回填，避免循环依赖
+3. `CompositeToolExecutor(routes, fallback=McpToolExecutor)` 中 plugin 工具名走显式 routes（`route_refresher` 用 `_is_plugin_tool_name` identity check 过滤，仅 plugin 工具名触发 routes 重建），MCP fallback 不回归
+4. lifespan 启动期再 `await plugin_service.scan()` 一次（兜底，build_application_services 已扫描则幂等）
+5. `PluginService.scan()` 用 `asyncio.Lock` 串行化，防止并发 refresh 导致 `_registrations`/`_plugin_registrations` 字典竞态
+
+工具面注入：
+- `PluginService._refresh_tool_surface` 调 `ToolService.set_dynamic_definitions("plugin", defs)`，plugin 工具 `source_type=PLUGIN`，与 builtin（BUILTIN）/skill（SKILL）/mcp（MCP）/knowledge（KNOWLEDGE）区分
+- 全局冲突检测：扫描 `ToolService.list_definitions()` 中 `source_type != PLUGIN` 的工具名，若 plugin 工具名与之冲突标记 unavailable（`override=True` 仍标记 unavailable，因静态工具替换本期未实现，仅 gate 不执行）
+
+Plugin 文件加载：
+- `PluginFileLoader` 扫描三源（bundled < user < project 优先级，后者覆盖前者），支持扁平（`<root>/<plugin>/plugin.yaml`）和两级（`<root>/<category>/<plugin>/plugin.yaml`）目录结构
+- 稳定包 import：创建父包 `n_agent_plugins`（`__path__=[]`），用 `spec_from_file_location`+`submodule_search_locations` 加载 plugin `__init__.py`，重载前清理 `sys.modules` 中 `n_agent_plugins.<key>.*` 全部子模块避免污染（仅删 top-level 模块会残留 schemas/tools 等子模块导致 AttributeError）
+- 仅 `PluginKind.STANDALONE` 且在 `plugins_enabled` 列表中的 plugin 才执行 `register(ctx)`；非 STANDALONE kind 仅识别不加载
+
+Secret 隔离：
+- `plugin_secrets` 表独立于 `plugins.config_json`，FK ON DELETE CASCADE 跟随 plugin 删除
+- `Plugin.to_public_view().secret_refs` 仅返回 `{field: bool}` 占位，由 registry 查询 plugin_secrets 填充
+- 前端 `plugin.js` 配置编辑 modal 中，`config_schema` 标记 `secret: true` 的字段用 `secret:` 前缀命名，submit handler 据此路由到 `secret_updates` 而非 `config`，避免明文落入 `plugins.config_json`
+- `requires_env` 字段同样走 `secret:` 前缀路由
+
+陷阱：
+- `ApplicationServices` 是 `frozen=True` dataclass，不能在构造后注入 `plugin_service`，必须在构造器中一次性传入
+- `route_refresher` 必须用 identity check（`_is_plugin_tool_name(name)`）而非"工具名以某前缀开头"等模式匹配，否则误触发 MCP routes 重建导致 fallback 回归
+- `/chat/plugins:refresh` 路由必须在 `/chat/plugins/{key:path}` catch-all 之前注册，否则 refresh 被 catch-all 吞噬
+- `replace_all_plugins` 不能 DELETE 缺失的 plugin 行，只能标记 `last_scan_status='missing'`+`enabled=0`，保留历史 config/secrets 供 plugin 恢复后复用
 

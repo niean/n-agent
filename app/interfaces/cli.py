@@ -14,6 +14,10 @@ def _load_skill_service():
     return build_application_services().skill_service
 
 
+def _load_plugin_service():
+    return build_application_services().plugin_service
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="n-agent")
     subparsers = parser.add_subparsers(dest="command")
@@ -31,6 +35,12 @@ def main(argv: list[str] | None = None) -> int:
     skill_view_parser = skill_subparsers.add_parser("view")
     skill_view_parser.add_argument("name")
 
+    plugin_parser = subparsers.add_parser("plugin")
+    plugin_subparsers = plugin_parser.add_subparsers(dest="plugin_command")
+    plugin_subparsers.add_parser("list")
+    plugin_view_parser = plugin_subparsers.add_parser("view")
+    plugin_view_parser.add_argument("name")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -46,6 +56,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.skill_command == "view":
             return _cmd_skill_view(args, service)
         skill_parser.print_help()
+        return 0
+
+    if args.command == "plugin":
+        service = _load_plugin_service()
+        if args.plugin_command == "list":
+            return _cmd_plugin_list(args, service)
+        if args.plugin_command == "view":
+            return _cmd_plugin_view(args, service)
+        plugin_parser.print_help()
         return 0
 
     services = build_application_services()
@@ -79,6 +98,22 @@ def _cmd_skill_view(args, service) -> int:
         print(json.dumps(payload, ensure_ascii=False))
         return 1
     print(payload.get("content", ""))
+    return 0
+
+
+def _cmd_plugin_list(args, service) -> int:
+    plugins = asyncio.run(service.list_plugins())
+    for p in plugins:
+        print(f"{p.key}\t{p.kind.value}\t{p.source.value}\t{'on' if p.enabled else 'off'}\t{p.description}")
+    return 0
+
+
+def _cmd_plugin_view(args, service) -> int:
+    plugin = asyncio.run(service.get_plugin(args.name))
+    if plugin is None:
+        print(json.dumps({"success": False, "error": "plugin not found"}, ensure_ascii=False))
+        return 1
+    print(json.dumps(plugin.to_public_view(), ensure_ascii=False))
     return 0
 
 

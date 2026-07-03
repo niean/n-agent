@@ -7,6 +7,7 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from fastapi import FastAPI
@@ -27,6 +28,7 @@ from app.application.scheduled_agent_executor import ScheduledAgentExecutor
 from app.application.scheduler_runner import SchedulerRunner
 from app.application.session_service import SessionService
 from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
+from app.application.plugin_service import PluginService, PluginToolExecutor
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
 from app.config import Settings
 from app.domain.knowledge import KnowledgeBaseType
@@ -52,6 +54,9 @@ from app.infrastructure.schedule.prompt_safety import DeterministicPromptSafetyS
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
 from app.infrastructure.skill.file_loader import SkillFileLoader, SkillFileLoaderConfig
 from app.infrastructure.skill.seed_runner import seed_default_skills
+from app.infrastructure.plugin.file_loader import PluginFileLoader, PluginFileLoaderConfig
+from app.infrastructure.plugin.seed_runner import seed_default_plugins
+from app.infrastructure.registry.sqlite_plugin_registry import SQLitePluginRegistry
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
@@ -214,6 +219,7 @@ class ApplicationServices:
     schedule_service: ScheduleService
     scheduler_runner: SchedulerRunner
     skill_service: SkillService
+    plugin_service: PluginService
     knowledge_service: KnowledgeService
     external_memory_service: ExternalMemoryService | None
     external_memory_provider_service: ExternalMemoryProviderService | None
@@ -287,6 +293,48 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     for definition in skill_tool_definitions():
         routes[definition.name] = skill_executor
     tool_service.set_dynamic_definitions("skill", skill_tool_definitions())
+
+    # Plugin 装配
+    seed_default_plugins(settings.plugins_root)
+    plugin_registry = SQLitePluginRegistry(settings.sqlite_path)
+    plugin_loader = PluginFileLoader(PluginFileLoaderConfig(
+        bundled_root=Path(__file__).resolve().parent / "infrastructure" / "plugin" / "seeds",
+        user_root=settings.plugins_root,
+        project_root=settings.workspace_root / ".hermes" / "plugins",
+        enable_entrypoints=settings.enable_plugin_entrypoints,
+        enable_project=settings.enable_project_plugins,
+        safe_mode=settings.plugins_safe_mode,
+    ))
+    plugin_tool_executor_holder: dict[str, PluginToolExecutor | None] = {"executor": None}
+
+    def _is_plugin_tool_name(name: str) -> bool:
+        executor = plugin_tool_executor_holder["executor"]
+        return executor is not None and routes.get(name) is executor
+
+    def plugin_route_refresher(tool_names: set[str]) -> None:
+        executor = plugin_tool_executor_holder["executor"]
+        if executor is None:
+            return
+        for name in list(routes.keys()):
+            if routes.get(name) is executor and name not in tool_names:
+                del routes[name]
+        for name in tool_names:
+            routes[name] = executor
+
+    plugin_service = PluginService(
+        registry=plugin_registry,
+        loader=plugin_loader,
+        tool_service=tool_service,
+        route_refresher=plugin_route_refresher,
+        settings=settings,
+    )
+    plugin_tool_executor = PluginToolExecutor(service=plugin_service)
+    plugin_tool_executor_holder["executor"] = plugin_tool_executor
+    try:
+        _run_sync(plugin_service.scan())
+        logger.info("plugin startup scan ok")
+    except Exception:
+        logger.exception("plugin startup scan failed; dashboard refresh available as fallback")
 
     # External memory setup
     external_memory_manager = ExternalMemoryManager()
@@ -711,6 +759,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         schedule_service=schedule_service,
         scheduler_runner=scheduler_runner,
         skill_service=skill_service,
+        plugin_service=plugin_service,
         knowledge_service=knowledge_service,
         external_memory_service=external_memory_service,
         external_memory_provider_service=external_memory_provider_service,
@@ -739,6 +788,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except Exception:
             logger.exception("skill startup scan failed; dashboard refresh available as fallback")
+        try:
+            await services.plugin_service.scan()
+            logger.info("plugin lifespan scan ok")
+        except Exception:
+            logger.exception("plugin lifespan scan failed; dashboard refresh available as fallback")
         if services.settings.scheduler_enabled:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
         if services.feishu_long_connection_gateway is not None:
@@ -790,6 +844,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             mcp_service=services.mcp_service,
             schedule_service=services.schedule_service,
             skill_service=services.skill_service,
+            plugin_service=services.plugin_service,
             knowledge_service=services.knowledge_service,
             external_memory_service=services.external_memory_service,
             external_memory_provider_service=services.external_memory_provider_service,

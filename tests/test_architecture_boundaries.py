@@ -54,3 +54,21 @@ def test_skill_domain_pure():
 def test_skill_application_no_infrastructure():
     text = (ROOT / "app/application/skill_service.py").read_text()
     assert "from app.infrastructure" not in text
+
+
+def test_plugin_domain_pure():
+    text = (ROOT / "app/domain/plugin.py").read_text()
+    for forbidden in (
+        "import sqlite3",
+        "import fastapi",
+        "import langgraph",
+        "import openai",
+        "from app.infrastructure",
+        "from app.interfaces",
+    ):
+        assert forbidden not in text, f"forbidden import in domain/plugin.py: {forbidden}"
+
+
+def test_plugin_application_no_infrastructure():
+    text = (ROOT / "app/application/plugin_service.py").read_text()
+    assert "from app.infrastructure" not in text

@@ -11,6 +11,13 @@
 | D007 | 外部记忆 provider 前端管理页面（external-memory-providers.js）无自动化测试，仅手动验证。 | low | plan-260628-external-query-providers.md | 2026-06-29 | open |
 | D008 | 外部记忆 provider 端到端验收（T13）为手动 curl，未自动化。 | low | plan-260628-external-query-providers.md | 2026-06-29 | open |
 | D009 | `tests/interfaces/test_static_assets.py::test_external_memory_provider_actions_keep_table_cell_layout` 断言 `min-width: 220px` 和 `.row-actions--memory`，但 styles.css 实际为 `min-width: 150px` 且无 `.row-actions--memory` 规则；上一轮检索记忆 Dashboard 样式工作遗留的测试-css 不一致，非本次变更新引入。 | low | plan-260629-external-query-session-toggle.md | 2026-06-29 | resolved |
+| D010 | Plugin 模块名碰撞：`_safe_module_name` 将所有非字母数字字符替换为 `_`，key `foo/bar` 与 `foo_bar` 产生相同模块名 `n_agent_plugins.foo_bar`，交替扫描时互相覆盖 sys.modules。影响：两个仅分隔符不同的插件无法共存。 | low | plan-260703-plugin-subsystem.md | 2026-07-03 | open |
+| D011 | Plugin config 保存为整体替换：`SQLitePluginRegistry.update_config` 覆盖整个 `config_json`，前端跳过空值输入，导致用户清空字段时字段被删除而非置空；config_schema 未渲染的字段（如插件升级后移除的字段）也会丢失。 | low | plan-260703-plugin-subsystem.md | 2026-07-03 | open |
+| D012 | `_apply_settings_enabled_state` 内 `next(p for p in plugins if p.key == key)` 在 enabled/disabled 循环中 O(N*M)，且 scan() 调用 list_plugins 两次；插件数量大时有性能开销。 | low | plan-260703-plugin-subsystem.md | 2026-07-03 | open |
+| D013 | Plugin `is_async` 声明与 handler 实际类型不一致时错误信息不友好：sync handler 配 `is_async=True` 报 TypeError，async handler 配 `is_async=False` 返回 coroutine 对象作为 content。可在 register_tool 时自动检测 `asyncio.iscoroutinefunction` 覆盖声明。 | low | plan-260703-plugin-subsystem.md | 2026-07-03 | open |
+| D014 | Plugin `_validate_config` 仅校验顶层 type=object 和 required 字段存在，未校验各字段类型、未拒绝 config_schema 标记为 secret 的字段进入 config（defense-in-depth 缺口，B2 已在前端修复，后端无兜底）。 | medium | plan-260703-plugin-subsystem.md | 2026-07-03 | open |
+| D015 | `tests/application/test_chat_service.py::test_chat_service_non_stream_returns_message` 断言 session_id 前缀失败，非本次插件变更引入（git stash 验证确认）。 | low | N/A | 2026-07-03 | open |
+| D016 | `tests/application/test_schedule_run_service.py::test_run_now_claims_and_runs_shared_path` 断言 status='succeeded' 但实际为 'triggered'，非本次插件变更引入（git stash 验证确认）。 | low | N/A | 2026-07-03 | open |
 
 ---
 
