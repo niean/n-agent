@@ -1,7 +1,12 @@
 from __future__ import annotations
 
-import json
 from typing import Any
+
+from app.interfaces.cli.render import (
+    make_console,
+    render_data,
+    resolve_format,
+)
 
 
 def _build_services() -> Any:
@@ -13,5 +18,5 @@ def _build_services() -> Any:
 def run(args) -> int:
     services = _build_services()
     payload = services.health_snapshot()
-    print(json.dumps(payload, ensure_ascii=False))
+    render_data(payload, make_console(), fmt=resolve_format(args))
     return 0

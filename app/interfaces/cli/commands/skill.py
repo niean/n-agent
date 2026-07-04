@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
+
+from app.interfaces.cli.render import (
+    make_console,
+    render_action,
+    render_data,
+    render_markdown,
+    resolve_format,
+)
 
 
 def _load_skill_service() -> Any:
@@ -20,6 +27,7 @@ def run(args) -> int:
 
 
 def _cmd_list(args) -> int:
+    fmt = resolve_format(args)
     service = _load_skill_service()
     skills = asyncio.run(service.list_skills(include_disabled=True))
     rows = [
@@ -31,15 +39,19 @@ def _cmd_list(args) -> int:
         }
         for s in skills
     ]
-    print(json.dumps(rows, ensure_ascii=False))
+    render_data(rows, make_console(), fmt=fmt, headers=["name", "readiness", "enabled", "description"])
     return 0
 
 
 def _cmd_view(args) -> int:
+    fmt = resolve_format(args)
     service = _load_skill_service()
     payload = asyncio.run(service.render_view(args.name))
     if not payload.get("success"):
+        render_action(payload or {"success": False, "error": "skill not found"}, make_console(), fmt=fmt)
         return 1
-    from app.interfaces.cli.render import make_console, render_markdown
-    render_markdown(payload.get("content", ""), make_console())
+    if fmt == "form":
+        render_markdown(payload.get("content", ""), make_console())
+        return 0
+    render_data(payload, make_console(), fmt=fmt)
     return 0

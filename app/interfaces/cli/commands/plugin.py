@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
+
+from app.interfaces.cli.render import (
+    make_console,
+    render_action,
+    render_data,
+    resolve_format,
+)
 
 
 def _load_plugin_service() -> Any:
@@ -20,6 +26,7 @@ def run(args) -> int:
 
 
 def _cmd_list(args) -> int:
+    fmt = resolve_format(args)
     service = _load_plugin_service()
     plugins = asyncio.run(service.list_plugins())
     rows = [
@@ -32,15 +39,16 @@ def _cmd_list(args) -> int:
         }
         for p in plugins
     ]
-    print(json.dumps(rows, ensure_ascii=False))
+    render_data(rows, make_console(), fmt=fmt, headers=["key", "kind", "source", "enabled", "description"])
     return 0
 
 
 def _cmd_view(args) -> int:
+    fmt = resolve_format(args)
     service = _load_plugin_service()
     plugin = asyncio.run(service.get_plugin(args.name))
     if plugin is None:
-        print(json.dumps({"success": False, "error": "plugin not found"}, ensure_ascii=False))
+        render_action({"success": False, "error": "plugin not found"}, make_console(), fmt=fmt)
         return 1
-    print(json.dumps(plugin.to_public_view(), ensure_ascii=False))
+    render_data(plugin.to_public_view(), make_console(), fmt=fmt)
     return 0

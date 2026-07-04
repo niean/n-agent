@@ -60,7 +60,7 @@ N_AGENT_WORKSPACE_ROOT=/workspace
 
 ## CLI
 
-`n-agent` 是命令行入口，支持单次消息、REPL 交互和查询子命令。
+`n-agent` 是命令行入口。所有功能命令均可在 Chat REPL 中以 slash 命令（`/cmd`）使用；单次执行命令（`n-agent <cmd>`，如 `n-agent provider list`、`n-agent skill list`）与 REPL slash 命令一一对应，仅作为 shell 自动化/脚本场景的快捷入口。本文档仅介绍 chat slash cmd，单次执行命令的参数与 slash 命令完全一致。
 
 ### 单次消息
 
@@ -84,29 +84,72 @@ REPL 内支持 Slash 命令，Tab 补全命令名，Ctrl+D / Ctrl+C 退出。
 | /help | 显示命令帮助 |
 | /exit | 退出 REPL |
 | /clear | 清屏 |
-| /status | 输出状态 |
+| /history | 显示历史文件路径 |
+| /confirm once | 确认上一个破坏性命令（仅一次） |
+| /confirm trust | 信任当前会话，后续破坏性命令不再确认 |
+| /cancel | 取消上一个破坏性命令 |
+
+Gateway 命令（转发到 gateway 处理）：
+
+| 命令 | 说明 |
+|------|------|
 | /new | 新建会话（需 /confirm） |
 | /rename | 重命名会话 |
 | /delete | 删除会话（需 /confirm） |
 | /switch | 切换会话 |
 | /sethome | 设置主会话 |
-| /confirm once | 确认上一个破坏性命令（仅一次） |
-| /confirm trust | 信任当前会话，后续破坏性命令不再确认 |
-| /sessions | 列出当前会话 |
 | /tools | 列出工具 |
 | /models | 列出模型 |
-| /schedule | 定时任务管理 |
 
-### 查询子命令
+Management 命令（本地直接调用 service）：
+
+| 命令 | 说明 |
+|------|------|
+| /provider list\|get\|create\|update\|delete\|activate | Provider 管理 |
+| /knowledge list\|get\|create\|update\|delete\|probe | 知识库管理 |
+| /mcp list\|get\|create\|update\|delete\|probe\|refresh\|tools\|toggle | MCP 站点管理 |
+| /schedule list\|get\|create\|update\|pause\|resume\|run\|delete\|executions | 定时任务管理 |
+| /sandbox list-active\|list-released\|list-history\|release\|delete-history\|config | 沙盒管理 |
+| /memory list-providers\|create-provider\|activate-provider\|... | 外部记忆管理（见 --help） |
+| /platform list\|get\|sessions | 平台管理 |
+| /skill list\|view \<name\> | Skill 查看 |
+| /plugin list\|view \<name\> | Plugin 查看 |
+| /status | 本地健康快照 |
+| /sessions [--browse [--pick \<id\>]] | 列出当前会话的 sessions |
+| /doctor [--probe] | 健康检查 |
+| /config [--section] | 运行配置（脱敏） |
+| /logs sandbox\|tools\|scheduled\|runs | 日志查询 |
+
+任何 management 命令追加 `--help` 查看详细参数（如 `/provider create --help`）。
+
+### 输出格式
+
+所有 management/查询命令默认输出 JSON，可通过 flag 切换：
+
+| Flag | 说明 |
+|------|------|
+| (默认) | JSON 格式，适合脚本解析 |
+| `--json` | 显式 JSON（与默认一致，向后兼容） |
+| `--form` | 人类可读形式：表格(list) / key-value(dict) / markdown(skill view) / doctor report |
+| `--yaml` | YAML 格式 |
 
 ```bash
-n-agent status                          # health snapshot JSON
-n-agent sessions                        # 会话列表
-n-agent skill list                      # skill 列表 JSON
-n-agent skill view <name>               # 查看 skill 内容
-n-agent plugin list                     # plugin 列表 JSON
-n-agent plugin view <key>               # 查看 plugin 详情 JSON
+n-agent provider list              # JSON 数组
+n-agent provider list --form       # 表格
+n-agent provider list --yaml       # YAML
+n-agent provider get p1 --form     # key-value 详情
+n-agent doctor --form              # 彩色状态表
 ```
+
+例外（不适用格式 flag）：
+
+- `chat`：流式输出，格式 flag 不适用
+- `sessions --browse`：交互式 picker，格式 flag 不适用（非交互模式仍可用）
+
+例外（REPL 不支持，需从 shell 执行）：
+
+- `/sessions --browse` 交互式 picker 与 REPL 的 prompt_toolkit 会话冲突，REPL 中强制降级为表格输出；如需 picker，从 shell 执行 `n-agent sessions --browse`。
+- `/chat` 即 REPL 本身，递归无意义。
 
 ## 文档
 

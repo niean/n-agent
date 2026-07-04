@@ -580,3 +580,26 @@
 3. 临时兼容代码
 4. 与业务强绑定实现
 5. 不必要工程体系
+
+---
+
+# 十三、TUI/CLI 设计规范
+
+本节适用于终端用户界面（TUI）与命令行接口（CLI），涵盖 Chat REPL（交互式）与单次执行命令（`<cmd>` 从 shell 执行）两种界面形态。Web FE 与 TUI/CLI 同属"用户面"规范，复用一致性、信息架构、安全边界等通用原则。
+
+## 双界面等价原则
+
+项目同时提供 Chat REPL 与单次执行 CLI 时，两者命令集必须等价：chat 囊括所有 cmd，单次执行仅作为 shell 自动化/脚本场景的快捷入口。
+
+实现顺序上，先 chat slash cmd，再单次执行 cmd，禁止反向，确保Chat REPL是全集。
+
+如遇例外，如某命令无法在 REPL 中实现，必须经用户确认、在验收文档中留档；禁止静默遗漏，禁止以"技术困难"为由跳过 REPL 支持而不留档。
+
+## 输出格式
+
+CLI 命令输出默认 JSON，可通过 flag 切换：
+
+* (默认) JSON 格式，适合脚本解析
+* `--json` 显式 JSON（与默认一致，向后兼容，no-op）
+* `--form` 人类可读形式：表格(list) / key-value(dict) / markdown(skill view) / doctor report
+* `--yaml` YAML 格式

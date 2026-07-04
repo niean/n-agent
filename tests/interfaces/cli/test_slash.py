@@ -18,8 +18,10 @@ def test_local_commands_listed():
 
 
 def test_gateway_commands_listed():
-    for cmd in ("/new", "/rename", "/delete", "/sessions", "/tools", "/models", "/status", "/schedule", "/switch", "/sethome"):
+    for cmd in ("/new", "/rename", "/delete", "/tools", "/models", "/switch", "/sethome"):
         assert cmd in GATEWAY_COMMANDS
+    for cmd in ("/sessions", "/status", "/schedule"):
+        assert cmd not in GATEWAY_COMMANDS
 
 
 def test_is_local_command():
@@ -30,7 +32,10 @@ def test_is_local_command():
     assert is_local_command("/confirm once")
     assert is_local_command("/cancel")
     assert not is_local_command("/new")
-    assert not is_local_command("/sessions")
+    assert is_local_command("/sessions")
+    assert is_local_command("/status")
+    assert is_local_command("/schedule")
+    assert is_local_command("/provider list")
 
 
 def test_handle_local_command_help_returns_zero(fake_console):

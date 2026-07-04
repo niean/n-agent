@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -396,6 +396,45 @@ CLI REPL TUI 隔离：
 - prompt_toolkit 与 rich 直接同时写 stdout 会乱屏，REPL 整个 loop body（prompt + handle_input + rich 输出）必须在 `patch_stdout()` 上下文内
 - 流式消费运行在 `asyncio.create_task` 包裹的 cancellable task 中，Ctrl+C 时 cancel task 并 `aclose` async iterator
 - 非 TTY 降级用 `input()` 循环（catch EOFError），避免 prompt_toolkit 在管道/CI 环境异常
+
+## 模式十九：CLI 子命令扩展与 _load_xxx_service indirection
+
+7 领域 CRUD 子命令（provider/knowledge/mcp/schedule/sandbox/memory/platform）+ 3 运维子命令（doctor/config/logs）+ sessions `--browse` picker 复用统一扩展模式，确保 DDD 边界、测试隔离与 secret 脱敏。
+
+`_load_xxx_service()` indirection：
+- 每个命令模块顶部定义 `_load_xxx_service()`，函数体 `from app.main import build_application_services; return build_application_services().xxx_service`
+- 命令函数通过 `_load_xxx_service()` 取 service，不直接 import `build_application_services`
+- 测试 monkeypatch `_load_xxx_service` 返回 FakeService，避免触发真实 SQLite/loader/网络初始化
+- skill/plugin 子命令已在 spec-260704-cli-experience.md 建立该模式，本期 10 个新子命令沿用
+
+async/sync service 调用约定：
+- async service（Provider/Knowledge/MCP/Schedule/Sandbox/Platform/Session）：用 `asyncio.run(service.method(...))`
+- sync service（ExternalMemoryProviderService/ExternalMemoryService）：禁止 `await`/`asyncio.run`，直接 `service.method(...)`
+- `_load_xxx_service()` 可能返回 None（sandbox/external_memory 在 disabled 时），命令必须检测 None 并返回 disabled/WARN/错误码
+
+secret 脱敏约定：
+- Provider/Knowledge/ExternalMemory list/get 输出 `api_key_present: bool`，不输出明文；service 已返回脱敏领域对象，CLI 层不得读 `get_secret()`
+- MCP env 输出按 key 名兜底脱敏（key 含 token/password/secret/key 时 value 替换为 `***`）
+- config 子命令遍历 Settings 字段，字段名含 `api_key`/`secret`/`password`/`token` 或以 `_key` 结尾时输出 `{field}_present: bool`
+
+sessions `--browse` picker：
+- TTY + 无 `--pick`：调 `gateway_registry.list_session_links(GatewaySessionKey(Platform.CLI, conversation_id))` 取结构化 `GatewaySessionLink` 列表，prompt_toolkit Application + fuzzy filter，选中后调 `session_service.get_session_detail(id)` 渲染
+- 非 TTY 或 `--no-interactive`：降级为 rich 表格输出 session link 列表
+- `--pick <id>`：跳过 picker，直接 `get_session_detail(id)` 渲染
+- Ctrl+C → rc=130
+- 不从 `GatewayCliClient.send("/sessions")` 的 markdown 文本中反解析 session id
+
+doctor 检查模式：
+- 8 项检查独立 try/except，每项返回 PASS/WARN/FAIL dict（dimension/status/detail）
+- `--probe` flag 默认 off；off 时只做 registry/config 检查，不发网络 probe
+- on 时 Knowledge 调 `probe_base(id)`、MCP 调 `probe_site(payload)`（先 get_site 构造 payload）、ExternalMemory 同步调 `probe(id)`
+- sandbox disabled → WARN（不解引用 None）
+- 退出码：有 FAIL → 1，全 PASS/WARN → 0
+
+logs 范围限制：
+- 不读 SQLite 表，只调 Application Service 已暴露的方法
+- 4 子动作：sandbox（`SandboxDashboardService.list_execute_code_history`，sandbox disabled 时 rc=0）/tools（`SessionService.list_tool_calls`，CLI 本地截断 limit）/scheduled（`ScheduleService.list_executions`，limit 1..50）/runs（`SessionService.get_session_detail`，输出 task_state）
+- 不支持"全局最近 N 条运行历史"（无对应 service 方法）
 
 陷阱：
 - `ChatEvent` 是 `frozen=True` dataclass，`metadata` 必须用 `field(default_factory=dict)` 否则共享可变状态

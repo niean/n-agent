@@ -251,7 +251,7 @@ AI 自主维护教训库，人工可通过提示或建议触发新增/修正。
 |------|---------|
 | .harness/framework/guides/00-harness-desc.md | 了解 Harness 体系描述时 |
 | .harness/framework/guides/02-harness-dev.md | 了解 Harness 开发流程时 |
-| .harness/framework/guides/10-guidelines-fe.md | 了解前端项目规范，包括组件、布局、视觉、交互和安全渲染时 |
+| .harness/framework/guides/10-guidelines-fe.md | 了解前端项目规范，包括组件、布局、视觉、交互、安全渲染和 TUI/CLI 双界面设计时 |
 | .harness/framework/lessons/general.md | 用户指令或当前根因与 SUMMARY 高度相关时按需读取 |
 
 注意：00-harness-desc.md 与 FRAMEWORK.md 有内容重叠（能力模型、阶段命名等），AI 已从 FRAMEWORK.md 获取执行规则时无需再读 00-harness-desc.md，除非用户明确要求。

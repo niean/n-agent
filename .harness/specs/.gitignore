@@ -4,3 +4,6 @@ completed/*
 
 active/*
 !active/.gitkeep
+
+verify/*
+!verify/.gitkeep

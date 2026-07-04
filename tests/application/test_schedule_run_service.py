@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -116,7 +117,9 @@ async def test_run_now_claims_and_runs_shared_path():
 
     result = await service.run_now("task-1")
 
-    assert result["status"] == "succeeded"
+    await _wait_for(lambda: bool(registry.completed))
+    assert result["status"] == "triggered"
+    assert result["claim_id"] == "claim-1"
     assert registry.started
     assert registry.completed[0].status is ScheduledTaskExecutionStatus.SUCCEEDED
     assert delivery.contents == ["done"]
@@ -166,3 +169,11 @@ async def test_stale_completion_does_not_deliver():
     await service.run_due_claims()
 
     assert delivery.contents == []
+
+
+async def _wait_for(predicate, attempts: int = 20) -> None:
+    for _ in range(attempts):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("background scheduled task did not finish")

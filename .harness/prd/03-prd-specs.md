@@ -229,10 +229,22 @@
 [20260704]
 - FR
     - 平台：[KF]实现生产级TUI功能，对标Hermes
-        - 参考：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
-        - 待办：领域能力管理子命令（provider/knowledge/mcp/schedule/sandbox/memory/platform CRUD CLI）、运维子命令（doctor/config/logs）、ACP 服务端、TUI 全屏、sessions browse picker、CLI 端破坏性命令确认 UI
+        - 要求：参照HermesAgent实现，源码/Users/niean/code/github.com/niean/hermes-agent
         - 审阅：发现并修复严重问题(20个)，spec-260704-cli-experience.md
         - 验收：我应该如何验收TUI(CLI)？给出功能验收的列表
+    - 平台：TUI补全领域命令。包括领域能力管理子命令（provider/knowledge/mcp/schedule/sandbox/memory/platform CRUD CLI）、运维子命令（doctor/config/logs）、sessions browse picker
+        - 要求：参照HermesAgent实现，源码/Users/niean/code/github.com/niean/hermes-agent
+        - 审阅：发现并修复严重问题(20个)，spec-260704-cli-commands.md
+            - < spec文件已修改，请审阅
+            - < 确认。plan写好后，需要我再次确认
+            - < Write file(特别是plan) 已经出错N次了，请记录`项目教训`避免再犯
+        - 审阅：发现并修复严重问题(20个)，plan-260704-cli-commands.md(需求spec-260704-cli-commands.md)
+            - < plan文件已修改，请审阅
+        - 验收：生成验收事项和文件，spec/verify/verify-260704-cli-commands.md，要求 ①只包含端到端的人工、半人工验收项 ②分组List ③去掉视觉效果格式如加粗强调emoji表情
+        - 迭代：新增的cmd，大部分只能单次执行；要求所有命令必须支持chat REPL slash cmd
+        - 迭代：cmd输出结果格式，默认json，可通过flag指定 --json(no-op) --form --yaml
+        - 迭代：chat slash cmd输入第一个字母后就没有动态提示了，二级子命令则能多单次补全
+        - 文档：README.md，声明`单次执行cmd`都有对应的`chat slash cmd`，只介绍chat slash cmd
 
 
 ---
@@ -240,12 +252,14 @@
 [待办]
 - Issue
 - NFR
+    - 文档：TUI执行链路
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
     - HE：修改HarnessWF，补充`人工验收项`到plan文件，章节命名`## 人工验收`、放到`## 变更记录`上方，要求仅保留`人工/半人工验收项`
 - FR
+    - TUI：TUI 全屏，ACP 服务端（Pod部署vs本机访问）
     - 工具：Skill自进化
     - 平台：ACP，提供ACP服务端能力，打通VsCode ACP CLIENT
     - 沙盒：支持Terminal命令执行，危险命令确认(对标Hermes)

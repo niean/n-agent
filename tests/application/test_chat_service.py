@@ -67,7 +67,7 @@ async def test_chat_service_non_stream_returns_message(tmp_path):
     )
 
     assert result.message["content"] == "hello"
-    assert result.session_id.startswith("tmp-")
+    assert result.session_id.startswith("api-")
 
 
 @pytest.mark.asyncio

@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from prompt_toolkit.document import Document
 
-from app.interfaces.cli.repl import ReplRunner
+from app.interfaces.cli.repl import ReplRunner, build_slash_completer
 
 
 def _eof_input() -> None:
@@ -47,3 +48,22 @@ async def test_repl_confirm_after_destructive(monkeypatch, fake_console, fake_ga
     rc = await ReplRunner(fake_gateway_client, fake_console, conversation_id="conv-1", is_tty=False).run()
     assert rc == 0
     assert fake_gateway_client.last_confirm_id == "c1"
+
+
+def test_slash_completer_filters_root_commands_after_slash_prefix():
+    completer = build_slash_completer()
+
+    completions = list(completer.get_completions(Document("/p", cursor_position=2), None))
+    texts = {completion.text for completion in completions}
+
+    assert "/provider" in texts
+    assert "/platform" in texts
+
+
+def test_slash_completer_keeps_nested_subcommand_completion():
+    completer = build_slash_completer()
+
+    completions = list(completer.get_completions(Document("/provider l", cursor_position=11), None))
+    texts = {completion.text for completion in completions}
+
+    assert "list" in texts

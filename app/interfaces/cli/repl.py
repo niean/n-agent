@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from app.interfaces.cli.management import is_management_command, run_management_command
 from app.interfaces.cli.render import render_markdown, render_status
 from app.interfaces.cli.slash import (
     GATEWAY_COMMANDS,
@@ -15,6 +16,57 @@ from app.interfaces.cli.streaming import consume_stream
 
 HISTORY_DIR = Path.home() / ".n-agent"
 HISTORY_FILE = HISTORY_DIR / "cli_history"
+
+
+def build_slash_completer() -> Any:
+    from prompt_toolkit.completion import Completer, NestedCompleter, WordCompleter
+    from prompt_toolkit.document import Document
+
+    from app.interfaces.cli.management import get_management_completions
+
+    class SlashNestedCompleter(NestedCompleter):
+        @classmethod
+        def from_nested_dict(cls, data: dict[str, Any]) -> "SlashNestedCompleter":
+            options: dict[str, Completer | None] = {}
+            for key, value in data.items():
+                if isinstance(value, Completer):
+                    options[key] = value
+                elif isinstance(value, dict):
+                    options[key] = cls.from_nested_dict(value)
+                elif isinstance(value, set):
+                    options[key] = cls.from_nested_dict(dict.fromkeys(value))
+                else:
+                    assert value is None
+                    options[key] = None
+            return cls(options)
+
+        def get_completions(self, document: Document, complete_event: Any) -> Any:
+            text = document.text_before_cursor.lstrip()
+            stripped_len = len(document.text_before_cursor) - len(text)
+
+            if " " in text:
+                first_term = text.split()[0]
+                completer = self.options.get(first_term)
+                if completer is not None:
+                    remaining_text = text[len(first_term) :].lstrip()
+                    move_cursor = len(text) - len(remaining_text) + stripped_len
+                    new_document = Document(
+                        remaining_text,
+                        cursor_position=document.cursor_position - move_cursor,
+                    )
+                    yield from completer.get_completions(new_document, complete_event)
+                return
+
+            completer = WordCompleter(
+                list(self.options.keys()),
+                ignore_case=self.ignore_case,
+                WORD=r"[^\s]+",
+            )
+            yield from completer.get_completions(document, complete_event)
+
+    nested = {cmd: None for cmd in GATEWAY_COMMANDS + LOCAL_COMMANDS}
+    nested.update(get_management_completions())
+    return SlashNestedCompleter.from_nested_dict(nested)
 
 
 class ReplRunner:
@@ -54,14 +106,12 @@ class ReplRunner:
 
     async def _run_tty(self) -> int:
         from prompt_toolkit import PromptSession
-        from prompt_toolkit.completion import WordCompleter
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.patch_stdout import patch_stdout
 
-        completer = WordCompleter(GATEWAY_COMMANDS + LOCAL_COMMANDS, pattern=None)
         self._prompt_session = PromptSession(
             history=FileHistory(self._history_file),
-            completer=completer,
+            completer=build_slash_completer(),
         )
         while True:
             try:
@@ -78,6 +128,12 @@ class ReplRunner:
 
     async def _handle_input(self, text: str) -> bool:
         """Return True if REPL should exit."""
+        if is_management_command(text):
+            text = self._rewrite_sessions_command(text)
+            rc = await asyncio.to_thread(run_management_command, text)
+            if rc != 0:
+                render_status(f"command exited with code {rc}", "warning", self._console)
+            return False
         if is_local_command(text):
             if text.startswith("/confirm"):
                 await self._handle_confirm(text)
@@ -92,6 +148,18 @@ class ReplRunner:
 
         await self._send_stream(text)
         return False
+
+    def _rewrite_sessions_command(self, text: str) -> str:
+        """Inject conversation_id for /sessions in REPL."""
+        stripped = text.strip()
+        if stripped != "/sessions" and not stripped.startswith("/sessions "):
+            return text
+        tokens = stripped.split()
+        has_conversation_id = "--conversation-id" in tokens or "--session-source" in tokens
+        parts = [stripped]
+        if not has_conversation_id:
+            parts.append(f"--conversation-id {self._conversation_id}")
+        return " ".join(parts)
 
     async def _send_stream(self, text: str) -> None:
         def on_confirmation(metadata: dict[str, Any]) -> None:
