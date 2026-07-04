@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -441,4 +441,43 @@ logs 范围限制：
 - CLI 构造 `InteractionMessage` 时必须注入 `actor_id=cli:{conversation_id}`，否则 `/new` 等破坏性命令会绕过 confirmation 直接执行（actor_id 为空时 preflight 视为无 actor 不需要确认）
 - CLI `trusted_metadata.gateway.platform` 必须为 `"cli"`，`ChatCompletionService._compute_permitted_managed_tools` 据此决定 managed tool 权限，CLI 不得获得 Feishu 专属 managed tool（如 `manage_schedule`）
 - `app.interfaces.cli:main` console script 入口由 `__init__.py` re-export `main`，迁移单文件为 package 时必须删除旧 `cli.py` 避免同名冲突
+
+## 模式二十：ACP stdio 服务端 stdout 纯净性与路径映射
+
+N-Agent 内置 ACP（Agent Client Protocol）stdio JSON-RPC 服务端，让 VsCode/Zed 等 ACP 兼容客户端通过 `docker exec -i n-agent-n-agent-1 n-agent acp` 或 `kubectl exec -i <pod> -- n-agent acp` 接入容器内 Agent。stdout 承载纯 JSON-RPC 帧，所有日志/诊断走 stderr，路径映射由环境变量配置。
+
+stdout 纯净性规则：
+- `n-agent acp` 主循环由 `acp.run_agent(agent, use_unstable_protocol=True)` 驱动，stdout 是 JSON-RPC 帧通道；任何 stdout 污染（日志、提示文案、import warning）都会破坏协议帧解析
+- `_configure_logging()` 在进入主循环前清空 root logger 的所有 handler，重新挂载单个 `StreamHandler(sys.stderr)`，并附加 `_BenignMethodNotFoundFilter` 抑制 ACP SDK 通过 `logging.exception` 记录的 benign ping/health method-not-found 噪声
+- `_run_check()` 与 `_run_setup()` 把诊断/引导信息全部 `print(..., file=sys.stderr)`，stdout 留空；测试用 subprocess + 临时文件捕获 stdout 验证纯净性（不能直接用 PIPE，因 ACP SDK asyncio write transport 与 subprocess pipe 交互可能导致挂起）
+- 第三方库（langchain deprecation warning、seed runner 日志）的 stdout 噪声由 `_configure_cli_env()` 在 CLI 入口处 `warnings.filterwarnings` + `logging.getLogger(...).setLevel(ERROR)` 抑制
+
+路径映射规则：
+- ACP cwd 来自宿主/editor，N-Agent 文件工具运行在容器/Pod，必须通过 `N_AGENT_ACP_HOST_WORKSPACE_ROOT` + `N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT` 环境变量配置映射；未配置 host root 时所有宿主 cwd 都不可映射，`session/new` 拒绝
+- 映射优先级（`path_mapping.map_cwd`）：(1) cwd 在 host root 下时替换前缀为 container root；(2) cwd 已在 container root 下时原样使用；(3) cwd 为空时使用 container root；(4) cwd 不可映射时返回 None，`session/new`/`resume_session` 抛 ValueError 返回协议错误，禁止回退到 `Path.cwd()`（回退会让 host 路径泄漏到容器内 metadata，破坏后续文件工具调用）
+- 开发环境通常 host root 设为宿主项目目录、container root 设为容器内挂载点（与 docker-compose volumes 挂载源一致）；K8s 部署的 Pod 名动态生成，VsCode 客户端配置需用 `kubectl get pods -l app=n-agent` 查询实际名称填入
+
+ApprovalDecider 桥接规则：
+- Domain `ApprovalDecider` 端口定义 `decide(request: ApprovalRequest) -> ApprovalDecision` 接口；ACP 服务端通过 `ACPPermissionBridge` 实现，把 N-Agent confirm 工具授权请求转换为 ACP `PermissionOption`（allow_once/allow_always/reject_once/reject_always）
+- `ChatCompletionInput` 增加可选 `approval_decider` 与 `allowed_confirm_tools_override` 字段，`ChatCompletionService.complete` 通过 `dataclasses.replace(ctx, approval_decider=..., allowed_confirm_tools=...)` 注入到 `ToolExecutionContext`（frozen dataclass 必须用 replace 不可直接赋值）
+- `ACPPermissionBridge._persist_session` 把 allow_always/reject_always 决策持久化到 `sessions.acp_metadata_json`，best-effort 持久化（metadata_updater 异常 try/except: pass，不阻塞工具执行主路径）
+- `reject_once` 返回 `scope="deny"`（非 "once"），与其他拒绝路径一致；ACP `PermissionOption` 构造接受 `option_id`（snake_case）并 alias `optionId`
+
+ACP session 桥接规则：
+- ACP session 与 N-Agent session 通过 `ACPSessionBridge` 桥接：`create` 新建 N-Agent session（source="acp"）并写 acp_metadata；`load` 读取已有 session 与 metadata；`resume` 复用 session 并更新 cwd；`fork` 创建子会话继承父上下文；`list` 返回最近会话（cursor 分页，删除 session 时 cursor_found flag 处理边界）；`close` 调用可选 cleanup_callback（sync 或 async，`inspect.isawaitable` 判定）
+- ACP 客户端重连时通过 `session/load` 恢复会话，元数据从 `sessions.acp_metadata_json` 读取，避免 cwd 丢失
+- `AgentGraphRunner` 支持 task state interrupt 注册与查询，cancel 时通过 `asyncio.CancelledError` 中断 prompt；`stream_events` 节点捕获 CancelledError 后 yield ERROR+DONE，prompt 节点 re-raise
+
+ACP event bridge 规则：
+- `ACPEventBridge` 把 N-Agent `ChatEvent` 转换为 ACP session update（user_message_chunk/agent_message_chunk/tool_call/tool_call_update）；用 `getattr(update, "session_update", None)` 做 type discrimination（不能用 isinstance，因 SDK 类型在 conftest sys.modules workaround 后可能未被稳定引用）
+- `replay_history` 在 `session/load` 时把历史 messages 重放为 user_message_chunk + agent_message_chunk，让 ACP 客户端看到完整对话上下文
+- 工具调用事件通过 `acp.start_tool_call` / `acp.update_tool_call` SDK helper 发射，ToolCallStatus 取 pending/in_progress/completed/failed
+
+陷阱：
+- ACP 包名 `acp` 与项目内任何同名模块冲突时会被 `sys.modules` 遮蔽；`tests/interfaces/cli/commands/acp/conftest.py` 用 sys.modules workaround 在测试导入前临时 pop 项目内 `acp` 模块、import SDK `acp.schema` 后再恢复，使 SDK 子模块缓存稳定存活
+- `resume_session` 中 `map_cwd(cwd, self.settings) or cwd` 会让 host cwd 在映射失败时原样泄漏到 metadata，破坏 T7 不变式；必须 `mapped = map_cwd(...); if mapped is None: raise ValueError(...)`
+- `except asyncio.CancelledError: stop_reason = "cancelled"; raise` 的赋值是死代码（raise 跳过 return），删除赋值只保留 raise
+- ACP SDK `update_tool_call` 返回 `ToolCallProgress`（`ToolCallUpdate` 子类），`Client.request_permission(tool_call: ToolCallUpdate)` 接受该返回值；不要用 `isinstance(update, ToolCallUpdate)` 做类型判断，SDK 类型在 conftest workaround 后可能不稳定
+- stdout 纯净性测试用 subprocess PIPE 捕获会因 ACP SDK asyncio write transport 与 pipe 交互挂起，必须用临时文件捕获 stdout
+- `ChatCompletionInput` 扩展新字段必须用 additive defaults（`None`），避免破坏既有调用方；`approval_decider=None` 时 `ChatCompletionService` 不覆盖 ctx.approval_decider
 

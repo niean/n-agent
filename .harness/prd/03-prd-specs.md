@@ -227,6 +227,9 @@
         - 验证：HermesAgent插件平移，零改造
 
 [20260704]
+- NFR
+    - 知识：Dashboard，知识工具干掉按钮`刷新描述`
+    - 网关：Dashboard，平台改名为网关(Gateway)，Dashboard、代码、文档等所有地方彻底修改
 - FR
     - 平台：[KF]实现生产级TUI功能，对标Hermes
         - 要求：参照HermesAgent实现，源码/Users/niean/code/github.com/niean/hermes-agent
@@ -245,12 +248,24 @@
         - 迭代：cmd输出结果格式，默认json，可通过flag指定 --json(no-op) --form --yaml
         - 迭代：chat slash cmd输入第一个字母后就没有动态提示了，二级子命令则能多单次补全
         - 文档：README.md，声明`单次执行cmd`都有对应的`chat slash cmd`，只介绍chat slash cmd
+    - 平台：[KF]支持ACP服务端(Agent Client Protocol)，注意 N-Agent在Pod部署、访问发起方VsCode插件在宿主
+        - 要求：参照HermesAgent实现，源码/Users/niean/code/github.com/niean/hermes-agent
+        - 配置：vscode配置 docker exec -i n-agent-n-agent-1 n-agent acp
+        - 审阅：发现并修复严重问题(20+个)，spec-260704-acp-server.md
+            - < spec文件已修改，请审阅
+            - < 确认。plan写好后，需要我再次确认
+        - 审阅：发现并修复严重问题(20+个)，plan-260704-acp-server.md(需求spec-260704-acp-server.md)
+            - < plan文件已修改，请审阅
+        - 验收：生成验收事项和文件，spec/verify/verify-260704-acp-server.md，要求 ①只包含端到端的人工验收项，禁止已自动验收项 ②分组List ③禁用视觉效果格式如加粗强调emoji表情
+        - 迭代：acp的session id 25e0b02ecf8c46daa7c7bf4baca34dbd，违反命名规范、修正之
+
 
 
 ---
 
 [待办]
 - Issue
+    - 知识：ragflow-kb，probe失败，帮修复
 - NFR
     - 文档：TUI执行链路
     - 知识：UDS，详细原理、Go样例
@@ -259,14 +274,13 @@
     - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
     - HE：修改HarnessWF，补充`人工验收项`到plan文件，章节命名`## 人工验收`、放到`## 变更记录`上方，要求仅保留`人工/半人工验收项`
 - FR
-    - TUI：TUI 全屏，ACP 服务端（Pod部署vs本机访问）
+    - 对话：Chat，支持开启追问(Follow-Up Questions)，借鉴OpenWebUI
     - 工具：Skill自进化
-    - 平台：ACP，提供ACP服务端能力，打通VsCode ACP CLIENT
     - 沙盒：支持Terminal命令执行，危险命令确认(对标Hermes)
     - 架构：MoA，对标Hermes
-    - 工具：相比Hermes，还缺少哪些功能？明确List出来
     - 治理：能力分层，平台是提供方视角(管理员)、业务是使用方视角(用户)。以Skill为例，Skill系平台能力、Workflow是业务能力，两者复用领域层
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明、多分类目录、plugin沙盒化
+    - 工具：相比Hermes，还缺少哪些功能？明确List出来
 
 ---
 

@@ -606,7 +606,8 @@ def test_knowledge_js_present_and_safe(tmp_path):
     assert 'document-table' in body
     assert '知识工具' in body
     assert '知识库管理' in body
-    assert '+ 新增 KB' in body
+    assert '新增' in body
+    assert '刷新描述' not in body
     assert "step: '0.01'" in body
     assert 'max: 1' in body
     for field in ('kb_id', 'name', 'description', 'base_type', 'base_url', 'dataset_id', 'api_key', 'default_top_k', 'default_min_score', 'enabled'):

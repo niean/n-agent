@@ -89,6 +89,10 @@ class Settings(BaseSettings):
     sandbox_docker_host_locals_root: Path | None = Field(default=None)
     sandbox_scratch_root: Path | None = Field(default=None)
 
+    # ACP 配置
+    acp_host_workspace_root: Path | None = Field(default=None)
+    acp_container_workspace_root: Path | None = Field(default=None)
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @field_validator("sandbox_type")
@@ -104,6 +108,7 @@ class Settings(BaseSettings):
         "sqlite_path", "workspace_root", "skills_root", "plugins_root",
         "sandbox_docker_host_workspace_root", "sandbox_docker_host_locals_root",
         "sandbox_scratch_root",
+        "acp_host_workspace_root", "acp_container_workspace_root",
         mode="before",
     )
     @classmethod

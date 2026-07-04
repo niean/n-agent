@@ -5,6 +5,7 @@ import logging
 import warnings
 
 from .commands import (
+    acp,
     chat,
     config,
     doctor,
@@ -371,6 +372,12 @@ def _build_platform_parser(subparsers) -> None:
     _add_format_flags(sessions_p)
 
 
+def _build_acp_parser(subparsers) -> None:
+    parser = subparsers.add_parser("acp", help="Run ACP stdio server")
+    parser.add_argument("--check", action="store_true", help="Verify ACP dependencies and exit")
+    parser.add_argument("--setup", action="store_true", help="Show provider setup instructions and exit")
+
+
 def _build_doctor_parser(subparsers) -> None:
     parser = subparsers.add_parser("doctor", help="Run health checks")
     parser.add_argument("--probe", action="store_true", help="Run network probes")
@@ -454,6 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_doctor_parser(subparsers)
     _build_config_parser(subparsers)
     _build_logs_parser(subparsers)
+    _build_acp_parser(subparsers)
 
     return parser
 
@@ -474,6 +482,7 @@ _DISPATCH = {
     "doctor": doctor.run,
     "config": config.run,
     "logs": logs.run,
+    "acp": acp.run,
 }
 
 

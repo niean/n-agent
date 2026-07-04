@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+import inspect
 
-from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
+from app.domain.memory import MemoryStore
+from app.domain.session import ConversationSession, Summary, TaskState, ToolCall, ConversationMessage
 
 
-class MemoryStore(Protocol):
+class _StubMemoryStore:
     async def create_session(self, session: ConversationSession) -> ConversationSession:
         ...
 
@@ -59,7 +60,7 @@ class MemoryStore(Protocol):
         ...
 
     async def update_session_acp_metadata(
-        self, session_id: str, metadata: dict[str, Any],
+        self, session_id: str, metadata: dict[str, object],
     ) -> None:
         ...
 
@@ -74,6 +75,32 @@ class MemoryStore(Protocol):
         ...
 
 
-class Summarizer(Protocol):
-    async def summarize(self, messages: list[dict[str, Any]], existing_summary: str = "") -> str:
-        ...
+def test_memory_store_declares_update_session_acp_metadata():
+    assert hasattr(MemoryStore, "update_session_acp_metadata")
+    sig = inspect.signature(MemoryStore.update_session_acp_metadata)
+    params = list(sig.parameters)
+    assert params == ["self", "session_id", "metadata"]
+
+
+def test_memory_store_declares_list_sessions_by_source():
+    assert hasattr(MemoryStore, "list_sessions_by_source")
+    sig = inspect.signature(MemoryStore.list_sessions_by_source)
+    params = list(sig.parameters)
+    assert params == ["self", "source", "cwd", "cursor", "limit"]
+    assert sig.parameters["cwd"].default is None
+    assert sig.parameters["cursor"].default is None
+    assert sig.parameters["limit"].default == 50
+
+
+def test_memory_store_declares_clone_session():
+    assert hasattr(MemoryStore, "clone_session")
+    sig = inspect.signature(MemoryStore.clone_session)
+    params = list(sig.parameters)
+    assert params == ["self", "source_session_id", "target_session_id"]
+
+
+def test_stub_implements_new_methods():
+    stub = _StubMemoryStore()
+    assert callable(stub.update_session_acp_metadata)
+    assert callable(stub.list_sessions_by_source)
+    assert callable(stub.clone_session)

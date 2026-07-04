@@ -52,7 +52,6 @@
     toolTitle.textContent = '知识工具';
     const toolActions = ui.el('span', 'panel-actions');
     toolActions.append(
-      button('刷新描述', 'btn', refreshToolDescription),
       button('刷新', 'btn', load),
     );
     toolHeader.append(toolTitle, toolActions);
@@ -67,7 +66,7 @@
     kbTitle.textContent = '知识库管理';
     const actions = ui.el('span', 'panel-actions');
     actions.append(
-      button('+ 新增 KB', 'btn', () => openKbForm()),
+      button('新增', 'btn', () => openKbForm()),
       button('刷新', 'btn', load),
     );
     kbHeader.append(kbTitle, actions);
@@ -342,11 +341,6 @@
   async function deleteKb(base) {
     if (!window.confirm('确认删除 KB ' + base.id + '？')) return;
     await api.deleteKnowledgeBase(base.id);
-    await load();
-  }
-
-  async function refreshToolDescription() {
-    await api.refreshKnowledgeTool();
     await load();
   }
 

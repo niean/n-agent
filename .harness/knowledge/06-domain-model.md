@@ -595,6 +595,7 @@ Policy 负责决定动作是否允许执行，避免把权限、安全和风险�
 - 工具风险等级：safe、confirm、dangerous。
 - 工具执行权限判定：允许、拒绝、拒绝原因。
 - 文件、网络等外部资源访问的安全约束。
+- confirm 工具的运行时审批：通过 `ApprovalDecider` 端口（`app/domain/tool.py`）把授权决策外包给调用方。ACP stdio 服务端通过 `ACPPermissionBridge` 实现该端口，把 N-Agent 的 confirm 工具授权请求转换为 ACP `PermissionOption`（allow_once/allow_always/reject_once/reject_always）让用户在编辑器侧决策；allow_always/reject_always 持久化到 `sessions.acp_metadata_json`，后续轮次自动复用。
 
 当前以服务端 safe 工具为主；后续审批流、多 Agent、自动化任务和更完整的沙盒能力，都应优先扩展 Policy，而不是把规则写进具体工具实现。
 

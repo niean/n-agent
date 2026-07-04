@@ -42,13 +42,16 @@ class ToolService:
             definitions.extend(dynamic.values())
         return definitions
 
-    def _definition(self, name: str) -> ToolDefinition | None:
+    def get_definition(self, name: str) -> ToolDefinition | None:
         if name in self.definitions:
             return self.definitions[name]
         for dynamic in self.dynamic_definitions.values():
             if name in dynamic:
                 return dynamic[name]
         return None
+
+    def _definition(self, name: str) -> ToolDefinition | None:
+        return self.get_definition(name)
 
     def list_openai_tools(
         self,

@@ -9,7 +9,7 @@
 
 `AgentRun`（`app/domain/agent.py`）：一次 Agent 运行的领域对象，包含 session_id、input_messages、id、status、iteration_count、error、end_reason。
 
-`ConversationSession`（`app/domain/session.py`）：会话聚合根，字段包括 id、title、source、external_memory_enabled、created_at、updated_at。external_memory_enabled 是会话级外部记忆 profile 锁定值，首轮消息前可由 Chat/Dashboard 选择，首轮后不可变；未锁定的新会话为 null，发送首轮时写入规范化列表。
+`ConversationSession`（`app/domain/session.py`）：会话聚合根，字段包括 id、title、source、external_memory_enabled、created_at、updated_at、acp_metadata。external_memory_enabled 是会话级外部记忆 profile 锁定值，首轮消息前可由 Chat/Dashboard 选择，首轮后不可变；未锁定的新会话为 null，发送首轮时写入规范化列表。acp_metadata 是 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入，其他来源会话为 null。
 
 `ConversationMessage`（`app/domain/session.py`）：会话消息值对象，字段包括 id、role、content、tool_call_id、name、created_at。role 支持 user、assistant、tool 等 Provider 消息角色。
 
@@ -123,7 +123,7 @@ Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPO
 SQLite store 位于 `app/infrastructure/memory/sqlite_store.py`，初始化以下表：
 
 ```sql
-sessions(id, title, created_at, updated_at, source, external_memory_enabled_json)
+sessions(id, title, created_at, updated_at, source, external_memory_enabled_json, acp_metadata_json)
 messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name)
 tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at)
 task_states(session_id, status, iteration_count, last_error, updated_at)
@@ -173,6 +173,7 @@ idx_sandbox_execution_history_session_created_at ON sandbox_execution_history(se
 JSON 边界：
 
 - `sessions.external_memory_enabled_json` 存储会话级外部记忆 profile 的 JSON 数组；null 表示尚未锁定，非 null 表示该 Chat Session 后续所有轮次必须使用同一 profile
+- `sessions.acp_metadata_json` 存储 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入；其他来源会话为 null。ACP stdio 服务端在 `session/new` 时写入，`session/load` 时读取复用，用于在 ACP 客户端重连后恢复会话上下文与 cwd 映射
 - `messages.content_json` 存储消息内容
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果

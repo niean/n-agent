@@ -221,3 +221,35 @@ def test_cli_commands_no_infrastructure_import():
                     assert not alias.name.startswith(forbidden), f"{path.name} imports {alias.name}"
             elif isinstance(node, ast.ImportFrom) and node.module:
                 assert not node.module.startswith(forbidden), f"{path.name} imports {node.module}"
+
+
+def test_acp_dispatch_registered():
+    from app.interfaces.cli.main import _DISPATCH, build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["acp", "--check"])
+    assert args.command == "acp"
+    assert args.check is True
+    assert args.setup is False
+    args = parser.parse_args(["acp", "--setup"])
+    assert args.setup is True
+    assert "acp" in _DISPATCH
+    assert callable(_DISPATCH["acp"])
+
+
+def test_acp_check_returns_zero():
+    from app.interfaces.cli.commands.acp import command
+
+    args = SimpleNamespace(check=True, setup=False)
+    assert command.run(args) == 0
+
+
+def test_acp_setup_returns_zero(capsys):
+    from app.interfaces.cli.commands.acp import command
+
+    args = SimpleNamespace(check=False, setup=True)
+    assert command.run(args) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ACP provider setup" in captured.err
+

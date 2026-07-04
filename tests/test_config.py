@@ -245,3 +245,19 @@ def test_skill_subsystem_env_override(monkeypatch: pytest.MonkeyPatch):
     assert str(s.skills_root) == "/tmp/skills"
     assert s.skills_inline_shell_enabled is True
     assert s.skills_inline_shell_timeout == 30
+
+
+def test_acp_workspace_settings(tmp_path: Path):
+    settings = Settings(
+        provider_base_url="https://example.test/v1",
+        provider_api_key="test-key",
+        provider_model="test-model",
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        acp_host_workspace_root=str(tmp_path / "host"),
+        acp_container_workspace_root="/workspace",
+        _env_file=None,
+    )
+
+    assert settings.acp_host_workspace_root == tmp_path / "host"
+    assert settings.acp_container_workspace_root == Path("/workspace")

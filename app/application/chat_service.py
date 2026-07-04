@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
@@ -11,7 +12,7 @@ from app.application.session_service import SessionService
 from app.domain.agent import AgentState
 from app.domain.memory import MemoryStore
 from app.domain.session import ConversationMessage
-from app.domain.tool import ToolExecutionContext
+from app.domain.tool import ApprovalDecider, ToolExecutionContext
 
 
 class ActiveExternalMemoryReader(Protocol):
@@ -27,6 +28,8 @@ class ChatCompletionInput:
     options: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
     trusted_metadata: dict[str, Any] = field(default_factory=dict)
+    approval_decider: ApprovalDecider | None = None
+    allowed_confirm_tools_override: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,11 @@ class ChatCompletionService:
             permitted_managed_tools=permitted,
             enabled_override=locked_external_memory,
         )
+        if request.approval_decider is not None:
+            ctx = dataclasses.replace(ctx, approval_decider=request.approval_decider)
+        if request.allowed_confirm_tools_override:
+            merged = {**ctx.allowed_confirm_tools, **request.allowed_confirm_tools_override}
+            ctx = dataclasses.replace(ctx, allowed_confirm_tools=merged)
         options["tool_execution_context"] = ctx
         if request.stream:
             return self.graph_runner.stream_events(state, request.model, options)

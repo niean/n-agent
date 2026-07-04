@@ -62,6 +62,7 @@ class ConversationSession:
     external_memory_slots: dict[str, str] | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    acp_metadata: dict[str, Any] | None = None
 
     def has_default_title(self) -> bool:
         return self.title == DEFAULT_SESSION_TITLE

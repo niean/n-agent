@@ -151,6 +151,59 @@ n-agent doctor --form              # 彩色状态表
 - `/sessions --browse` 交互式 picker 与 REPL 的 prompt_toolkit 会话冲突，REPL 中强制降级为表格输出；如需 picker，从 shell 执行 `n-agent sessions --browse`。
 - `/chat` 即 REPL 本身，递归无意义。
 
+## ACP 远程接入
+
+N-Agent 内置 ACP（Agent Client Protocol）stdio 服务端，支持 VsCode/Zed 等 ACP 兼容客户端通过 `docker exec` 或 `kubectl exec` 接入容器内的 Agent。容器内运行 `n-agent acp`，stdout 承载 JSON-RPC 帧，所有日志走 stderr。
+
+### VsCode ACP Client 配置（Docker）
+
+```json
+{
+  "command": "docker",
+  "args": ["exec", "-i", "n-agent-n-agent-1", "n-agent", "acp"]
+}
+```
+
+容器名 `n-agent-n-agent-1` 由 compose project `n-agent` + service `n-agent` + replica `1` 拼接，实际名称可用 `docker compose ps` 确认。
+
+### VsCode ACP Client 配置（K8s）
+
+```json
+{
+  "command": "kubectl",
+  "args": ["exec", "-i", "pod/n-agent-xxxx-yyyy", "--", "n-agent", "acp"]
+}
+```
+
+Pod 名由 K8s 动态生成（Deployment + ReplicaSet + Pod hash），部署后用 `kubectl get pods -l app=n-agent` 查询实际名称并填入。生产环境建议用 ServiceAccount + 自动注入脚本生成客户端配置，避免手工维护 Pod 名。
+
+### 路径映射
+
+ACP cwd 来自宿主/editor，N-Agent 文件工具运行在容器/Pod。容器部署必须配置两个环境变量（写入 docker-compose `environment` 或 K8s Pod env）：
+
+```env
+N_AGENT_ACP_HOST_WORKSPACE_ROOT=/Users/<user>/projects
+N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT=/workspace
+```
+
+映射规则：
+
+1. cwd 在 host root 下时，替换前缀为 container root。
+2. cwd 已在 container root 下时原样使用。
+3. cwd 为空时使用 container root。
+4. cwd 不可映射时 `session/new` 拒绝并返回协议错误，不回退到 `Path.cwd()`。
+
+未配置 host root 时，所有宿主 cwd 都不可映射，session/new 会拒绝。开发环境通常将 host root 设为宿主项目目录、container root 设为容器内挂载点（与 docker-compose volumes 挂载源一致）。
+
+### 辅助命令
+
+```bash
+docker exec -it n-agent-n-agent-1 n-agent acp --check    # 验证 ACP 依赖可导入
+docker exec -it n-agent-n-agent-1 n-agent acp --setup    # 输出 provider 配置提示
+```
+
+`--setup` 不进入 JSON-RPC 主循环，仅向 stderr 输出 provider 创建/激活步骤。首次部署未配置 Provider 时用此命令查看引导。
+
 ## 文档
 
 - DDD 领域模型：[.harness/knowledge/06-domain-model.md](.harness/knowledge/06-domain-model.md)

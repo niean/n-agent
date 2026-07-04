@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -18,7 +19,14 @@ from app.domain.agent import AgentState, RunStatus
 from app.domain.memory import MemoryStore, Summarizer
 from app.domain.provider import LLMEventType, LLMProvider, LLMResult
 from app.domain.session import ConversationMessage, Summary, TaskState, ToolCall
-from app.domain.tool import RiskLevel, ToolCallRequest, ToolExecutionContext, ToolResultStatus
+from app.domain.tool import (
+    ApprovalRequest,
+    RiskLevel,
+    ToolCallRequest,
+    ToolExecutionContext,
+    ToolResult,
+    ToolResultStatus,
+)
 from app.utils.memory_scrubber import scrub_memory_context
 
 
@@ -39,6 +47,31 @@ class AgentGraphRunner:
         self.iteration_limit = iteration_limit
         self.external_memory_manager = external_memory_manager
         self.graph = self._build_graph()
+        self._running_tasks: dict[str, asyncio.Task] = {}
+        self._cancel_events: dict[str, asyncio.Event] = {}
+
+    def register_run(self, session_id: str, task: asyncio.Task) -> None:
+        self._running_tasks[session_id] = task
+        self._cancel_events[session_id] = asyncio.Event()
+
+    def interrupt(self, session_id: str) -> bool:
+        if session_id not in self._running_tasks:
+            return False
+        event = self._cancel_events.get(session_id)
+        if event is not None:
+            event.set()
+        task = self._running_tasks.get(session_id)
+        if task is not None and not task.done():
+            task.cancel()
+        return True
+
+    def is_cancelled(self, session_id: str) -> bool:
+        event = self._cancel_events.get(session_id)
+        return event is not None and event.is_set()
+
+    def clear_run(self, session_id: str) -> None:
+        self._running_tasks.pop(session_id, None)
+        self._cancel_events.pop(session_id, None)
 
     def _build_graph(self):
         graph = StateGraph(AgentState)
@@ -98,6 +131,8 @@ class AgentGraphRunner:
 
         stream_options["stream_event_sink"] = emit_tool_event
         run_task = asyncio.create_task(self.run(state, model, stream_options))
+        self.register_run(state.session_id, run_task)
+        result = None
         try:
             while not run_task.done():
                 try:
@@ -107,28 +142,35 @@ class AgentGraphRunner:
             result = await run_task
             while not tool_event_queue.empty():
                 yield tool_event_queue.get_nowait()
+        except asyncio.CancelledError:
+            yield ChatEvent(ChatEventType.ERROR, error="cancelled", finish_reason="cancelled")
+            result = None
         finally:
             if not run_task.done():
                 run_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await run_task
-        if result.error:
-            yield ChatEvent(ChatEventType.ERROR, error=result.error, finish_reason="error")
-        elif result.final_message:
-            content = str(result.final_message.get("content") or "")
-            if content:
-                # scrub each chunk in streaming
-                for chunk in self._split_content_for_streaming(content):
-                    scrubbed = scrubber.feed(chunk)
-                    if scrubbed:
-                        yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed)
-                scrubbed_final = scrubber.flush()
-                if scrubbed_final:
-                    yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed_final)
-            yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason=result.finish_reason or "stop")
+            self.clear_run(state.session_id)
+        if result is not None:
+            if result.error:
+                yield ChatEvent(ChatEventType.ERROR, error=result.error, finish_reason="error")
+            elif result.final_message:
+                content = str(result.final_message.get("content") or "")
+                if content:
+                    # scrub each chunk in streaming
+                    for chunk in self._split_content_for_streaming(content):
+                        scrubbed = scrubber.feed(chunk)
+                        if scrubbed:
+                            yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed)
+                    scrubbed_final = scrubber.flush()
+                    if scrubbed_final:
+                        yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed_final)
+                yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason=result.finish_reason or "stop")
         yield ChatEvent(ChatEventType.DONE)
 
     async def load_context(self, state: AgentState) -> AgentState:
+        if self.is_cancelled(state.session_id):
+            raise asyncio.CancelledError()
         messages = await self.memory_store.list_messages(state.session_id)
         summary = await self.memory_store.get_summary(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
@@ -142,6 +184,8 @@ class AgentGraphRunner:
         return state
 
     async def call_llm(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
+        if self.is_cancelled(state.session_id):
+            raise asyncio.CancelledError()
         if state.iteration_count >= self.iteration_limit:
             state.error = "iteration limit reached"
             state.finish_reason = "length"
@@ -211,6 +255,8 @@ class AgentGraphRunner:
         return state
 
     async def execute_tools(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
+        if self.is_cancelled(state.session_id):
+            raise asyncio.CancelledError()
         state.tool_results = []
         context = None
         options = None
@@ -248,7 +294,68 @@ class AgentGraphRunner:
                 name=tool_name,
                 arguments=parsed_arguments,
             )
-            result = await self.tool_service.execute(request, context)
+
+            # Approval gate: ask the decider BEFORE calling ToolService.execute.
+            # Only CONFIRM-level tools with a configured decider trigger this path.
+            # allow_once: create a per-iteration copy via dataclasses.replace so
+            # ToolService.execute permits this single call. The original context
+            # stays unchanged for the next tool_call (S 6). allow_session: the
+            # ACP agent is responsible for persisting the permission into context
+            # before constructing this runner; the runner does NOT write metadata
+            # here (S 7).
+            result: ToolResult | None = None
+            effective_context = context
+            definition = self.tool_service.get_definition(tool_name)
+            if (
+                definition is not None
+                and definition.risk_level is RiskLevel.CONFIRM
+                and effective_context is not None
+                and effective_context.approval_decider is not None
+            ):
+                approval_request = ApprovalRequest(
+                    session_id=effective_context.session_id or state.session_id,
+                    tool_call_id=tool_id,
+                    tool_name=tool_name,
+                    arguments=parsed_arguments,
+                    description=definition.description,
+                    risk_level=definition.risk_level,
+                )
+                raw_decision = effective_context.approval_decider(approval_request)
+                if isawaitable(raw_decision):
+                    raw_decision = await raw_decision
+                decision = raw_decision
+
+                if not decision.allowed:
+                    result = ToolResult(
+                        tool_call_id=tool_id,
+                        tool_name=tool_name,
+                        status=ToolResultStatus.PERMISSION_DENIED,
+                        content={"error": "permission_denied", "reason": decision.reason},
+                    )
+                elif decision.scope == "once":
+                    if definition.managed:
+                        new_permitted = set(effective_context.permitted_managed_tools)
+                        new_permitted.add(tool_name)
+                        effective_context = dataclasses.replace(
+                            effective_context,
+                            permitted_managed_tools=new_permitted,
+                        )
+                    else:
+                        # For non-managed CONFIRM tools, _is_confirm_allowed
+                        # iterates expected.items() and checks
+                        # request.arguments[key] == value. An empty dict means
+                        # no keys to check -> allowed for any arguments.
+                        new_allowed = dict(effective_context.allowed_confirm_tools)
+                        new_allowed[tool_name] = {}
+                        effective_context = dataclasses.replace(
+                            effective_context,
+                            allowed_confirm_tools=new_allowed,
+                        )
+                # scope == "session": context is already set up by the ACP
+                # permission bridge/agent; no-op here.
+
+            if result is None:
+                result = await self.tool_service.execute(request, effective_context)
 
             # 工具执行后 - success/error 事件
             tool_status = "success" if result.status == ToolResultStatus.SUCCESS else "error"
@@ -305,6 +412,8 @@ class AgentGraphRunner:
         await asyncio.sleep(0.001)
 
     async def update_memory(self, state: AgentState) -> AgentState:
+        if self.is_cancelled(state.session_id):
+            raise asyncio.CancelledError()
         assistant_messages = [*state.assistant_tool_messages]
         if state.final_message:
             assistant_messages.append(state.final_message)

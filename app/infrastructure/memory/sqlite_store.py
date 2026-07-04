@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
@@ -87,6 +88,7 @@ class SQLiteMemoryStore:
                 """
             )
             self._ensure_sessions_external_memory_column(conn)
+            self._ensure_sessions_acp_metadata_column(conn)
             _initialize_gateway_schema(conn)
             _initialize_mcp_schema(conn)
 
@@ -99,8 +101,8 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO sessions(id, title, created_at, updated_at, source, external_memory_enabled_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO sessions(id, title, created_at, updated_at, source, external_memory_enabled_json, acp_metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session.id,
@@ -109,6 +111,7 @@ class SQLiteMemoryStore:
                     session.updated_at.isoformat(),
                     session.source,
                     json.dumps(session.external_memory_enabled) if session.external_memory_enabled is not None else None,
+                    json.dumps(session.acp_metadata) if session.acp_metadata is not None else None,
                 ),
             )
         return session
@@ -314,6 +317,174 @@ class SQLiteMemoryStore:
             cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return cursor.rowcount > 0
 
+    async def update_session_acp_metadata(self, session_id: str, metadata: dict[str, Any]) -> None:
+        # No-op if session does not exist; session bridge (T10) verifies existence before calling.
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET acp_metadata_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(metadata), datetime.now(timezone.utc).isoformat(), session_id),
+            )
+
+    async def list_sessions_by_source(
+        self, source: str, cwd: str | None = None, cursor: str | None = None, limit: int = 50,
+    ) -> tuple[list[ConversationSession], str | None]:
+        # ACP sessions are expected to be few (per-user, per-workspace); fetch all
+        # source-matching rows, Python-filter by cwd, then paginate. This keeps
+        # the cwd filter correct without SQL JSON queries.
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE source = ? ORDER BY updated_at DESC, id DESC",
+                (source,),
+            ).fetchall()
+        sessions = [self._session_from_row(row) for row in rows]
+        if cwd is not None:
+            sessions = [
+                s for s in sessions
+                if s.acp_metadata is not None and s.acp_metadata.get("cwd") == cwd
+            ]
+        # Cursor format: "{updated_at_iso}|{id}" — points at the last item already returned.
+        start_idx = 0
+        if cursor is not None:
+            try:
+                cursor_updated_at, cursor_id = cursor.split("|", 1)
+            except ValueError:
+                return [], None
+            cursor_found = False
+            for idx, s in enumerate(sessions):
+                if s.updated_at.isoformat() == cursor_updated_at and s.id == cursor_id:
+                    start_idx = idx + 1
+                    cursor_found = True
+                    break
+            if not cursor_found:
+                # Cursor points at a session no longer present (e.g., deleted
+                # between page fetches); treat as end-of-pagination to avoid
+                # silently re-returning page 1.
+                return [], None
+        page = sessions[start_idx:start_idx + limit]
+        next_cursor = None
+        if start_idx + limit < len(sessions) and page:
+            last = page[-1]
+            next_cursor = f"{last.updated_at.isoformat()}|{last.id}"
+        return page, next_cursor
+
+    async def clone_session(self, source_session_id: str, target_session_id: str) -> None:
+        # Single-connection transaction: sqlite3 context manager commits on success,
+        # rolls back on exception. Source session existence is verified by the
+        # session bridge (T10); if missing here, return silently.
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?", (source_session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            new_ts = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                """
+                INSERT INTO sessions(id, title, created_at, updated_at, source,
+                    external_memory_enabled_json, external_memory_slots_json, acp_metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    target_session_id,
+                    row["title"],
+                    new_ts,
+                    new_ts,
+                    "acp",
+                    row["external_memory_enabled_json"] if "external_memory_enabled_json" in row.keys() else None,
+                    row["external_memory_slots_json"] if "external_memory_slots_json" in row.keys() else None,
+                    row["acp_metadata_json"] if "acp_metadata_json" in row.keys() else None,
+                ),
+            )
+            # Clone messages: regenerate ids, record old->new mapping for tool_call linkage.
+            msg_rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+                (source_session_id,),
+            ).fetchall()
+            msg_id_map: dict[str, str] = {}
+            for mrow in msg_rows:
+                new_msg_id = str(uuid4())
+                msg_id_map[mrow["id"]] = new_msg_id
+                conn.execute(
+                    """
+                    INSERT INTO messages(id, session_id, role, content_json, created_at,
+                        provider_message_id, tool_call_id, name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_msg_id,
+                        target_session_id,
+                        mrow["role"],
+                        mrow["content_json"],
+                        mrow["created_at"],
+                        mrow["provider_message_id"],
+                        mrow["tool_call_id"],
+                        mrow["name"],
+                    ),
+                )
+            # Clone tool_calls: regenerate ids, rebuild message_id linkage via msg_id_map.
+            tc_rows = conn.execute(
+                "SELECT * FROM tool_calls WHERE session_id = ? ORDER BY created_at ASC",
+                (source_session_id,),
+            ).fetchall()
+            for trow in tc_rows:
+                new_tc_id = str(uuid4())
+                old_msg_id = trow["message_id"]
+                new_msg_id = msg_id_map.get(old_msg_id) if old_msg_id is not None else None
+                conn.execute(
+                    """
+                    INSERT INTO tool_calls(id, session_id, message_id, tool_name,
+                        arguments_json, result_json, status, duration_ms, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_tc_id,
+                        target_session_id,
+                        new_msg_id,
+                        trow["tool_name"],
+                        trow["arguments_json"],
+                        trow["result_json"],
+                        trow["status"],
+                        trow["duration_ms"],
+                        trow["created_at"],
+                    ),
+                )
+            # Clone task_states: session_id is PK, just insert with target id.
+            ts_rows = conn.execute(
+                "SELECT * FROM task_states WHERE session_id = ?", (source_session_id,),
+            ).fetchall()
+            for tsrow in ts_rows:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO task_states(session_id, status, iteration_count,
+                        last_error, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        target_session_id,
+                        tsrow["status"],
+                        tsrow["iteration_count"],
+                        tsrow["last_error"],
+                        tsrow["updated_at"],
+                    ),
+                )
+            # Clone summaries: session_id is PK, just insert with target id.
+            sum_rows = conn.execute(
+                "SELECT * FROM summaries WHERE session_id = ?", (source_session_id,),
+            ).fetchall()
+            for srow in sum_rows:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO summaries(session_id, summary, source_message_id, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        target_session_id,
+                        srow["summary"],
+                        srow["source_message_id"],
+                        srow["updated_at"],
+                    ),
+                )
+
     async def get_context(self, session_id: str) -> dict[str, Any]:
         return {
             "session": await self.get_session(session_id),
@@ -330,6 +501,12 @@ class SQLiteMemoryStore:
             conn.execute("ALTER TABLE sessions ADD COLUMN external_memory_enabled_json TEXT")
         if "external_memory_slots_json" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN external_memory_slots_json TEXT")
+
+    @staticmethod
+    def _ensure_sessions_acp_metadata_column(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "acp_metadata_json" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN acp_metadata_json TEXT")
 
     def migrate_session_id_prefixes(self) -> None:
         """Migrate historical session_id prefixes and source values to new format.
@@ -348,9 +525,15 @@ class SQLiteMemoryStore:
         enabled = json.loads(enabled_json) if enabled_json is not None else None
         slots_json = row["external_memory_slots_json"] if "external_memory_slots_json" in row.keys() else None
         slots = json.loads(slots_json) if slots_json is not None else None
+        acp_metadata_json = row["acp_metadata_json"] if "acp_metadata_json" in row.keys() else None
+        acp_metadata = json.loads(acp_metadata_json) if acp_metadata_json is not None else None
+        created_at = datetime.fromisoformat(row["created_at"])
+        updated_at = datetime.fromisoformat(row["updated_at"])
         return ConversationSession(
             id=row["id"], title=row["title"], source=row["source"],
             external_memory_enabled=enabled, external_memory_slots=slots,
+            created_at=created_at, updated_at=updated_at,
+            acp_metadata=acp_metadata,
         )
 
 

@@ -311,3 +311,26 @@ async def test_chat_service_delegates_title_generation_to_session_service(tmp_pa
     assert session is not None
     assert session.title == "如何新增预单"
     assert title_generator.calls == ["新增预单的流程"]
+
+
+@pytest.mark.asyncio
+async def test_complete_preserves_existing_acp_session_source(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+    await store.create_session(ConversationSession(id="s1", source="acp"))
+
+    stream = await service.complete(
+        ChatCompletionInput(
+            model="test",
+            session_id="s1",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+    )
+    events = [event async for event in stream]
+
+    assert events[0].type == ChatEventType.MESSAGE_START
+    assert events[-1].type == ChatEventType.DONE
+    session = await store.get_session("s1")
+    assert session is not None
+    assert session.source == "acp"

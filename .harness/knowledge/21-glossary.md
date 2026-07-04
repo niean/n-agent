@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、GatewayCliClient、patch_stdout 等 CLI 交互相关术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、GatewayCliClient、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -60,3 +60,11 @@
 - PluginToolRegistration：Application 层工具注册值对象，封装 plugin 暴露的工具定义（name/toolset/schema/handler/check_fn/requires_env/is_async/description/emoji/override）+ plugin_config/secret_config 缓存，供 PluginToolExecutor 执行时使用。
 - PluginToolExecutor：Application 层 ToolExecutor 实现，将 plugin 工具调用委托给 PluginService.call_tool；在 main.py 中通过 `CompositeToolExecutor(routes, fallback=McpToolExecutor)` 显式路由 plugin 工具名，MCP fallback 不回归。
 - secret_refs：Plugin 的 secret 字段占位标记，`{field: bool}` 形式，由 SQLitePluginRegistry 查询 plugin_secrets 表填充；API 响应永不返回 secret 明文，前端据此显示"已设置，留空保持不变"提示。
+- ACP (Agent Client Protocol)：Zed Industries 提出的开放协议，基于 JSON-RPC 2.0 over stdio，让编辑器/IDE（VsCode/Zed 等）以 stdio 方式接入外部 Agent runtime。N-Agent 通过 `agent-client-protocol` PyPI 包实现服务端，stdout 承载 JSON-RPC 帧，stderr 走日志。
+- ACP stdio 服务端：N-Agent 内置的 ACP 服务端入口，由 `n-agent acp` 命令启动（无 flag 进入 JSON-RPC 主循环，`--check` 验证依赖可导入，`--setup` 输出 provider 配置提示）。VsCode ACP Client 通过 `docker exec -i n-agent-n-agent-1 n-agent acp` 或 `kubectl exec -i <pod> -- n-agent acp` 接入容器内 Agent。
+- NAgentACPAgent：`app/interfaces/cli/commands/acp/agent.py` 中实现 `acp.Agent` 的类，提供 13 个 SDK 方法（initialize/authenticate/session/new/prompt/load/list/fork/cancel/close_session 等），桥接 ACP 协议与 N-Agent ChatCompletionService。
+- 路径映射 (path mapping)：ACP cwd 来自宿主/editor，N-Agent 文件工具运行在容器/Pod，必须通过 `N_AGENT_ACP_HOST_WORKSPACE_ROOT` + `N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT` 环境变量配置映射。映射规则：(1) cwd 在 host root 下时替换前缀为 container root；(2) cwd 已在 container root 下时原样使用；(3) cwd 为空时使用 container root；(4) cwd 不可映射时 `session/new` 拒绝并返回协议错误，不回退到 `Path.cwd()`。
+- ApprovalDecider：Domain 端口（`app/domain/tool.py`），定义工具调用审批决策接口；ACP 服务端通过 `ACPPermissionBridge` 实现，将 N-Agent 的 confirm 工具授权请求转换为 ACP `PermissionOption`（allow_once/allow_always/reject_once/reject_always）让用户在编辑器侧决策。
+- ApprovalRequest / ApprovalDecision：ApprovalDecider 的输入/输出值对象。ApprovalRequest 携带 session_id、tool_name、tool_call_id、arguments 等上下文；ApprovalDecision 携带 allowed 与 scope（once/always/deny）。
+- ACP session metadata：`sessions.acp_metadata_json` 列存储的 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入；ACP 服务端在 `session/new` 时写入，`session/load` 时读取复用，用于在 ACP 客户端重连后恢复会话上下文与 cwd 映射。
+- _BenignMethodNotFoundFilter：`app/interfaces/cli/commands/acp/command.py` 中的 logging.Filter，抑制 ACP SDK 通过 `logging.exception` 记录的 benign method-not-found 错误（code=-32601 且 method 为 `_ping`/`_health`/`ping`/`health`），避免 stderr 被客户端探测噪声污染；非 benign 方法（如 `session/prompt`）的异常仍透传。

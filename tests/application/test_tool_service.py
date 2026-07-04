@@ -63,6 +63,30 @@ async def test_tool_service_lists_openai_tools_and_executes_safe_tools():
     assert result.status == ToolResultStatus.SUCCESS
 
 
+def test_tool_service_get_definition_returns_static_and_dynamic():
+    from app.domain.tool import ToolDefinition, RiskLevel, ToolSourceType
+    static_def = ToolDefinition(
+        name="static_tool",
+        description="",
+        input_schema={"type": "object"},
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.BUILTIN,
+    )
+    dynamic_def = ToolDefinition(
+        name="dynamic_tool",
+        description="",
+        input_schema={"type": "object"},
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.MCP,
+    )
+    service = ToolService(RecordingExecutor(), [static_def])
+    service.set_dynamic_definitions("mcp-1", [dynamic_def])
+
+    assert service.get_definition("static_tool") is static_def
+    assert service.get_definition("dynamic_tool") is dynamic_def
+    assert service.get_definition("missing_tool") is None
+
+
 def test_builtin_tool_definitions_include_source_and_toolset_metadata():
     definitions = {definition.name: definition for definition in builtin_tool_definitions()}
 
