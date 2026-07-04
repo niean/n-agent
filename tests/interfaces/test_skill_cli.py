@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 
 from app.domain.skill import Skill, SkillFrontmatter, SkillReadiness
+from app.interfaces.cli import main
+from app.interfaces.cli.commands import skill as skill_cmd
 
 
 def _skill(name):
@@ -35,18 +37,16 @@ class _FakeSkillService:
 
 
 def test_cli_skill_list_outputs_names(monkeypatch, capsys):
-    from app.interfaces import cli as cli_module
-    monkeypatch.setattr(cli_module, "_load_skill_service", lambda: _FakeSkillService())
-    rc = cli_module.main(["skill", "list"])
+    monkeypatch.setattr(skill_cmd, "_load_skill_service", lambda: _FakeSkillService())
+    rc = main(["skill", "list"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "alpha" in out and "beta" in out
 
 
 def test_cli_skill_view_prints_content(monkeypatch, capsys):
-    from app.interfaces import cli as cli_module
-    monkeypatch.setattr(cli_module, "_load_skill_service", lambda: _FakeSkillService())
-    rc = cli_module.main(["skill", "view", "alpha"])
+    monkeypatch.setattr(skill_cmd, "_load_skill_service", lambda: _FakeSkillService())
+    rc = main(["skill", "view", "alpha"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "BODY-alpha" in out

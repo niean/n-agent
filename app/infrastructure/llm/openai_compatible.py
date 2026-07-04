@@ -7,6 +7,14 @@ from openai import AsyncOpenAI
 
 from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
 
+_INTERNAL_OPTION_KEYS = {
+    "tool_execution_context",
+    "tool_exposure_policy",
+    "execution_context_mode",
+    "external_memory_enabled",
+    "stream_event_sink",
+}
+
 
 class OpenAICompatibleProvider:
     def __init__(self, base_url: str, api_key: str, default_model: str, client: Any | None = None):
@@ -94,11 +102,7 @@ class OpenAICompatibleProvider:
 
 
 def _provider_options(options: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in options.items()
-        if key not in {"tool_execution_context", "tool_exposure_policy", "execution_context_mode", "external_memory_enabled"}
-    }
+    return {key: value for key, value in options.items() if key not in _INTERNAL_OPTION_KEYS}
 
 
 def _message_to_dict(message: Any) -> dict[str, Any]:

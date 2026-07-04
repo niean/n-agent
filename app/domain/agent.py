@@ -47,3 +47,4 @@ class AgentState:
     final_message: dict[str, Any] | None = None
     finish_reason: str | None = None
     run_options: dict[str, Any] = field(default_factory=dict)
+    stream_tool_events: list[Any] = field(default_factory=list)

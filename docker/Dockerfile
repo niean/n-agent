@@ -24,4 +24,4 @@ RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .
 
 EXPOSE 8201
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8201"]
+CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8201"]

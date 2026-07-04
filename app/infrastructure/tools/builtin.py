@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import ipaddress
 import json
@@ -48,7 +49,7 @@ class BuiltinToolExecutor:
     async def execute(self, request: ToolCallRequest, context: ToolExecutionContext | None = None) -> ToolResult:
         start = time.monotonic()
         try:
-            content = self._execute(request)
+            content = await asyncio.to_thread(self._execute, request)
             status = ToolResultStatus.SUCCESS
         except PermissionError as exc:
             content = {"error": str(exc)}

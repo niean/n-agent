@@ -32,7 +32,7 @@ def test_docker_compose_config():
     assert "ENV TZ=Asia/Shanghai" in dockerfile
     assert "tzdata" in dockerfile
     assert "/etc/localtime" in dockerfile
-    assert '"uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8201"' in dockerfile
+    assert '"uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8201"' in dockerfile
     assert "N_AGENT_KB_ENABLED" in env
     assert "N_AGENT_KB_BASE_URL" in env
     assert "http://n-kb:8212" in env

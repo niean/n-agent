@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
+from app.application.events import ChatEvent, ChatEventType
 from app.application.model_service import ModelService
 from app.application.schedule_service import ScheduledTaskCreateInput, ScheduleService
 from app.application.session_service import SessionService
@@ -116,7 +118,7 @@ class GatewayCommandService:
             content = "\n".join(model.id for model in models) or "暂无模型"
             return _response(session_id, content)
         if command == "/status":
-            return _response(session_id, str(self.health_provider()))
+            return _response(session_id, json.dumps(self.health_provider(), ensure_ascii=False))
         if command == "/schedule":
             return await self._handle_schedule(arg, event, session_id)
         return _response(session_id, "未知命令，输入 /help 查看可用命令")
@@ -361,6 +363,67 @@ class GatewayService:
     ) -> InteractionResponse:
         return await self.command_service.handle_confirmation(session_key, actor_id, confirmation_id, choice)
 
+    async def handle_message_stream(self, event: InteractionMessage) -> AsyncIterator[ChatEvent]:
+        """流式版本：复用幂等、destructive preflight、session 解析、Slash 分流。"""
+        message_id = str(event.metadata.get("message_id", ""))
+        processed = await self.registry.mark_event_processed(
+            event.session_key.platform, event.id, message_id,
+        )
+        if not processed:
+            yield ChatEvent(ChatEventType.DONE, metadata={"duplicate": True})
+            return
+
+        preflight = await self.command_service.handle_destructive_preflight(event)
+        if preflight is not None:
+            outbound_meta = preflight.messages[0].metadata if preflight.messages else {}
+            yield ChatEvent(
+                ChatEventType.MESSAGE_DONE,
+                content=_first_message_content(preflight),
+                finish_reason="confirmation_required",
+                metadata=dict(outbound_meta),
+            )
+            yield ChatEvent(ChatEventType.DONE)
+            return
+
+        session_id = await self._resolve_session_id(event)
+        command_response = await self.command_service.handle(event, session_id)
+        if command_response is not None:
+            for msg in command_response.messages:
+                yield ChatEvent(
+                    ChatEventType.MESSAGE_DONE,
+                    content=msg.content,
+                    finish_reason="stop",
+                    metadata=dict(msg.metadata or {}),
+                )
+            yield ChatEvent(ChatEventType.DONE)
+            return
+
+        stream = await self.chat_service.complete(
+            ChatCompletionInput(
+                model=self.command_service.model_service.default_model,
+                messages=[{"role": "user", "content": event.text}],
+                stream=True,
+                metadata={
+                    "gateway": {
+                        "platform": event.session_key.platform.value,
+                        "platform_session_id": event.session_key.platform_session_id,
+                        "thread_id": event.session_key.thread_id,
+                    }
+                },
+                trusted_metadata=_build_trusted_metadata(event),
+                session_id=session_id,
+            )
+        )
+        if isinstance(stream, ChatCompletionResult):
+            yield ChatEvent(
+                ChatEventType.ERROR,
+                error="chat service did not return stream iterator",
+            )
+            yield ChatEvent(ChatEventType.DONE)
+            return
+        async for evt in stream:
+            yield evt
+
     def discard_confirmation(self, confirmation_id: str) -> None:
         self.command_service.discard_confirmation(confirmation_id)
 
@@ -428,3 +491,7 @@ def _response(session_id: str, content: str, metadata: dict[str, Any] | None = N
         session_id=session_id,
         messages=[GatewayOutboundMessage(content=content, metadata=metadata or {})],
     )
+
+
+def _first_message_content(response: InteractionResponse) -> str:
+    return response.messages[0].content if response.messages else ""

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -21,3 +21,4 @@ class ChatEvent:
     tool_call: dict[str, Any] | None = None
     finish_reason: str | None = None
     error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)

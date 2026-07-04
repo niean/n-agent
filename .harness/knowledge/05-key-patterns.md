@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -371,4 +371,35 @@ Secret 隔离：
 - `route_refresher` 必须用 identity check（`_is_plugin_tool_name(name)`）而非"工具名以某前缀开头"等模式匹配，否则误触发 MCP routes 重建导致 fallback 回归
 - `/chat/plugins:refresh` 路由必须在 `/chat/plugins/{key:path}` catch-all 之前注册，否则 refresh 被 catch-all 吞噬
 - `replace_all_plugins` 不能 DELETE 缺失的 plugin 行，只能标记 `last_scan_status='missing'`+`enabled=0`，保留历史 config/secrets 供 plugin 恢复后复用
+
+## 模式十八：Gateway 流式接口与 ChatEvent 消费
+
+Gateway 同时提供非流式 `handle_message` 与流式 `handle_message_stream` 两个入口，两者必须共享同一套幂等、destructive preflight、session 解析、Slash 分流、默认模型和 trusted metadata 逻辑，差异仅在最终产出形态（InteractionResponse vs AsyncIterator[ChatEvent]）。
+
+流式接口契约：
+- `handle_message_stream(event) -> AsyncIterator[ChatEvent]` 复用 `mark_event_processed(platform, event_id, message_id)` 幂等检查；重复事件 yield `DONE(metadata={"duplicate": True})` 后结束
+- destructive preflight 命中时 yield `MESSAGE_DONE(content=提示文案, finish_reason="confirmation_required", metadata=GatewayOutboundMessage.metadata)`，metadata 含 `confirmation.id` 供 CLI 发起 `/confirm` 回调
+- Slash 命令通过 `command_service.handle` 处理，每个 outbound message 转一个 `MESSAGE_DONE`，最后 yield `DONE`
+- 普通消息调用 `ChatCompletionService.complete(stream=True)`，返回值必须是 async iterator；若返回 `ChatCompletionResult` 则 yield `ERROR`
+
+ChatEvent.metadata 用途：
+- 携带 Gateway confirmation metadata（`confirmation.id`），避免 CLI 解析中文提示文案提取 id
+- 携带 `duplicate` 标记，CLI 据此输出 warning 而非正常内容
+- 未来扩展 session_id 等事件级信息
+
+AgentGraph 工具事件回放：
+- `execute_tools` 节点在工具执行前向 `state.stream_tool_events` 追加 `TOOL_CALL_DELTA(status="pending")`，执行后追加 `TOOL_CALL_DELTA(status="success"|"error", duration_ms=...)`
+- `stream_events` 在 `await self.run()` 完成后回放 `state.stream_tool_events`，再输出 `CONTENT_DELTA`
+- 当前 graph 仍先完成一次完整 run 再分块输出 content（非 token 级流式），provider token 级流式需改 `LLMProvider.chat(stream=True)` 与 graph call_llm，本期未做
+
+CLI REPL TUI 隔离：
+- prompt_toolkit 与 rich 直接同时写 stdout 会乱屏，REPL 整个 loop body（prompt + handle_input + rich 输出）必须在 `patch_stdout()` 上下文内
+- 流式消费运行在 `asyncio.create_task` 包裹的 cancellable task 中，Ctrl+C 时 cancel task 并 `aclose` async iterator
+- 非 TTY 降级用 `input()` 循环（catch EOFError），避免 prompt_toolkit 在管道/CI 环境异常
+
+陷阱：
+- `ChatEvent` 是 `frozen=True` dataclass，`metadata` 必须用 `field(default_factory=dict)` 否则共享可变状态
+- CLI 构造 `InteractionMessage` 时必须注入 `actor_id=cli:{conversation_id}`，否则 `/new` 等破坏性命令会绕过 confirmation 直接执行（actor_id 为空时 preflight 视为无 actor 不需要确认）
+- CLI `trusted_metadata.gateway.platform` 必须为 `"cli"`，`ChatCompletionService._compute_permitted_managed_tools` 据此决定 managed tool 权限，CLI 不得获得 Feishu 专属 managed tool（如 `manage_schedule`）
+- `app.interfaces.cli:main` console script 入口由 `__init__.py` re-export `main`，迁移单文件为 package 时必须删除旧 `cli.py` 避免同名冲突
 

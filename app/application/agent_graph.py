@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import suppress
+from inspect import isawaitable
 from typing import Any, Optional
 
 from langchain_core.runnables import RunnableConfig
@@ -87,7 +90,28 @@ class AgentGraphRunner:
         from app.utils.memory_scrubber import StreamingContextScrubber
         yield ChatEvent(ChatEventType.MESSAGE_START)
         scrubber = StreamingContextScrubber()
-        result = await self.run(state, model, options)
+        stream_options = dict(options or {})
+        tool_event_queue: asyncio.Queue[ChatEvent] = asyncio.Queue()
+
+        async def emit_tool_event(event: ChatEvent) -> None:
+            await tool_event_queue.put(event)
+
+        stream_options["stream_event_sink"] = emit_tool_event
+        run_task = asyncio.create_task(self.run(state, model, stream_options))
+        try:
+            while not run_task.done():
+                try:
+                    yield await asyncio.wait_for(tool_event_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+            result = await run_task
+            while not tool_event_queue.empty():
+                yield tool_event_queue.get_nowait()
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await run_task
         if result.error:
             yield ChatEvent(ChatEventType.ERROR, error=result.error, finish_reason="error")
         elif result.final_message:
@@ -204,12 +228,42 @@ class AgentGraphRunner:
                 parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
             except json.JSONDecodeError:
                 parsed_arguments = {}
+            tool_id = tool_call.get("id", "")
+            tool_name = function.get("name", "")
+
+            # 工具执行前 - pending 事件
+            state.stream_tool_events.append(ChatEvent(
+                ChatEventType.TOOL_CALL_DELTA,
+                tool_call={
+                    "id": tool_id,
+                    "name": tool_name,
+                    "arguments": parsed_arguments,
+                    "status": "pending",
+                },
+            ))
+            await self._emit_stream_tool_event(state.stream_tool_events[-1], options)
+
             request = ToolCallRequest(
-                id=tool_call.get("id", ""),
-                name=function.get("name", ""),
+                id=tool_id,
+                name=tool_name,
                 arguments=parsed_arguments,
             )
             result = await self.tool_service.execute(request, context)
+
+            # 工具执行后 - success/error 事件
+            tool_status = "success" if result.status == ToolResultStatus.SUCCESS else "error"
+            state.stream_tool_events.append(ChatEvent(
+                ChatEventType.TOOL_CALL_DELTA,
+                tool_call={
+                    "id": tool_id,
+                    "name": result.tool_name,
+                    "arguments": parsed_arguments,
+                    "status": tool_status,
+                    "duration_ms": result.duration_ms,
+                },
+            ))
+            await self._emit_stream_tool_event(state.stream_tool_events[-1], options)
+
             result_payload = {
                 "tool_call_id": result.tool_call_id,
                 "name": result.tool_name,
@@ -240,6 +294,15 @@ class AgentGraphRunner:
         state.pending_tool_calls = []
         state.final_message = None
         return state
+
+    async def _emit_stream_tool_event(self, event: ChatEvent, options: dict[str, Any] | None) -> None:
+        sink = (options or {}).get("stream_event_sink")
+        if not callable(sink):
+            return
+        result = sink(event)
+        if isawaitable(result):
+            await result
+        await asyncio.sleep(0.001)
 
     async def update_memory(self, state: AgentState) -> AgentState:
         assistant_messages = [*state.assistant_tool_messages]

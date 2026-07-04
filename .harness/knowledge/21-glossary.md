@@ -1,11 +1,15 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、GatewayCliClient、patch_stdout 等 CLI 交互相关术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
 - AgentRun：一次 Agent 运行的领域对象，包含会话、输入消息、运行状态、迭代计数、错误和结束原因。
 - AgentState：Agent Runtime 在运行过程中传递的状态，包含工作消息、待执行工具调用、工具结果、摘要、状态和迭代次数。
 - Application Layer：应用层，负责编排用例和 LangGraph 状态图，依赖 Domain 端口，不依赖 Infrastructure 具体实现。
-- ChatEvent：Application 层输出的聊天运行事件，供 Interfaces 层编码为 OpenAI-compatible SSE chunk 或非流式响应。
+- ChatEvent：Application 层输出的聊天运行事件，供 Interfaces 层编码为 OpenAI-compatible SSE chunk 或非流式响应；含 `metadata: dict[str, Any]` 字段携带 Gateway confirmation/duplicate 等事件元信息，避免 CLI 解析中文提示文案提取结构化数据。
+- ChatEventType：聊天事件类型枚举，包括 MESSAGE_START、CONTENT_DELTA、TOOL_CALL_DELTA、MESSAGE_DONE、ERROR、DONE；AgentGraphRunner.stream_events 按此顺序产出事件流。
+- GatewayService.handle_message_stream：Gateway 流式接口，`async def handle_message_stream(event) -> AsyncIterator[ChatEvent]`，与 `handle_message` 共享幂等、destructive preflight、session 解析、Slash 分流、默认模型和 trusted metadata 逻辑；destructive preflight 命中时 yield MESSAGE_DONE(finish_reason="confirmation_required", metadata=confirmation) 供 CLI 发起 /confirm 回调。
+- GatewayCliClient：CLI Interfaces 层的 Gateway 客户端，构造 InteractionMessage（注入 `actor_id=cli:{conversation_id}`）并委托 GatewayService.handle_message_stream/handle_message/handle_confirmation；CLI REPL/单次消息/确认操作均通过此客户端。
+- patch_stdout：prompt_toolkit 提供的 stdout 重定向上下文管理器，REPL 内 rich console.print 必须在 patch_stdout 内执行，避免与 prompt_toolkit 抢占 TTY 导致 TUI 乱屏。
 - Domain Layer：领域层，定义核心业务模型、值对象、领域规则和端口协议，不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或工具 handler。
 - Domain Port：领域层定义的外部能力协议，如 LLMProvider、ToolExecutor、MemoryStore、Summarizer，由 Infrastructure 实现。
 - Evolution Baseline：演进基线。当前阶段只实现既定验收范围，但架构边界必须支持后续完整 Agent 能力持续扩展。

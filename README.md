@@ -58,11 +58,54 @@ N_AGENT_SQLITE_PATH=/app/locals/sessions.db
 N_AGENT_WORKSPACE_ROOT=/workspace
 ```
 
-CLI 入口：
+## CLI
+
+`n-agent` 是命令行入口，支持单次消息、REPL 交互和查询子命令。
+
+### 单次消息
 
 ```bash
-n-agent status
-n-agent chat "你好"
+n-agent chat "你好"                      # 流式输出回复
+n-agent chat "你好" --no-stream          # 非流式整体输出
+```
+
+### REPL交互
+
+```bash
+n-agent chat                            # 进入 > prompt
+```
+
+REPL 内支持 Slash 命令，Tab 补全命令名，Ctrl+D / Ctrl+C 退出。
+
+本地命令：
+
+| 命令 | 说明 |
+|------|------|
+| /help | 显示命令帮助 |
+| /exit | 退出 REPL |
+| /clear | 清屏 |
+| /status | 输出状态 |
+| /new | 新建会话（需 /confirm） |
+| /rename | 重命名会话 |
+| /delete | 删除会话（需 /confirm） |
+| /switch | 切换会话 |
+| /sethome | 设置主会话 |
+| /confirm once | 确认上一个破坏性命令（仅一次） |
+| /confirm trust | 信任当前会话，后续破坏性命令不再确认 |
+| /sessions | 列出当前会话 |
+| /tools | 列出工具 |
+| /models | 列出模型 |
+| /schedule | 定时任务管理 |
+
+### 查询子命令
+
+```bash
+n-agent status                          # health snapshot JSON
+n-agent sessions                        # 会话列表
+n-agent skill list                      # skill 列表 JSON
+n-agent skill view <name>               # 查看 skill 内容
+n-agent plugin list                     # plugin 列表 JSON
+n-agent plugin view <key>               # 查看 plugin 详情 JSON
 ```
 
 ## 文档

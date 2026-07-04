@@ -7,7 +7,13 @@ from typing import Any
 
 from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
 
-_INTERNAL_OPTION_KEYS = {"tool_execution_context", "tool_exposure_policy", "execution_context_mode"}
+_INTERNAL_OPTION_KEYS = {
+    "tool_execution_context",
+    "tool_exposure_policy",
+    "execution_context_mode",
+    "external_memory_enabled",
+    "stream_event_sink",
+}
 _ALLOWED_OPTION_KEYS = {"temperature", "top_p", "top_k", "stop_sequences", "cache_control", "thinking", "output_config"}
 _FINISH_REASON_MAP = {
     "end_turn": "stop",

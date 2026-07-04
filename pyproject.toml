@@ -17,10 +17,19 @@ dependencies = [
   "mcp>=1,<2",
   "croniter>=2,<7",
   "pyyaml>=6,<7",
+  "prompt_toolkit>=3.0,<4",
+  "rich>=13,<14",
 ]
 
 [project.scripts]
 n-agent = "app.interfaces.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+"app.interfaces.http" = ["static/**/*"]
 
 [project.optional-dependencies]
 dev = [

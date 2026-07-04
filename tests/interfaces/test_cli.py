@@ -1,7 +1,13 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from app.application.events import ChatEvent, ChatEventType
 from app.domain.gateway import InteractionMessage
-from app.interfaces import cli
+from app.interfaces.cli import main
+from app.interfaces.cli.commands import chat as chat_cmd
+from app.interfaces.cli.commands import status as status_cmd
 
 
 @dataclass
@@ -24,17 +30,26 @@ class FakeGatewayService:
         self.events.append(event)
         return FakeResponse("session-1", [FakeOutbound("reply")], {})
 
+    async def handle_message_stream(self, event: InteractionMessage) -> AsyncIterator[ChatEvent]:
+        self.events.append(event)
+        yield ChatEvent(ChatEventType.MESSAGE_START)
+        yield ChatEvent(ChatEventType.CONTENT_DELTA, content="reply")
+        yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop")
+        yield ChatEvent(ChatEventType.DONE)
+
 
 class FakeServices:
     def __init__(self):
         self.gateway_service = FakeGatewayService()
-        self.health_snapshot = lambda: {"provider": {"status": "ok"}, "gateway": {"status": "ok"}}
+
+    def health_snapshot(self):
+        return {"provider": {"status": "ok"}, "gateway": {"status": "ok"}}
 
 
 def test_cli_status_prints_health(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "build_application_services", lambda: FakeServices())
+    monkeypatch.setattr(status_cmd, "_build_services", lambda: FakeServices())
 
-    exit_code = cli.main(["status"])
+    exit_code = main(["status"])
 
     output = capsys.readouterr().out
     assert exit_code == 0
@@ -44,9 +59,9 @@ def test_cli_status_prints_health(monkeypatch, capsys):
 
 def test_cli_chat_sends_message(monkeypatch, capsys):
     services = FakeServices()
-    monkeypatch.setattr(cli, "build_application_services", lambda: services)
+    monkeypatch.setattr(chat_cmd, "_build_services", lambda: services)
 
-    exit_code = cli.main(["chat", "hello", "--session-source", "cli-test"])
+    exit_code = main(["chat", "hello", "--session-source", "cli-test"])
 
     output = capsys.readouterr().out
     assert exit_code == 0
@@ -56,7 +71,7 @@ def test_cli_chat_sends_message(monkeypatch, capsys):
 
 
 def test_cli_help(capsys):
-    exit_code = cli.main(["--help"])
+    exit_code = main(["--help"])
 
     output = capsys.readouterr().out
     assert exit_code == 0

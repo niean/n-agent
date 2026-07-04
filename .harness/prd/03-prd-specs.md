@@ -217,16 +217,22 @@
     - 工具：Skill走"目录扫描 + SQLite元数据"，跟MCP等未对齐(SQLite 做CRUD)，对齐之
     - 工具：[KF]实现Plugin功能。Follow Hermes plugins生态、可零成本移植。
         - 要求：参照HermesAgent，源码/Users/niean/code/github.com/niean/hermes-agent
-        - 待办：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明、多分类目录、plugin沙盒化
         - 审阅：发现并修复严重问题(20个)，spec-260703-plugin-subsystem.md
         - 审阅：发现并修复严重问题(20个)，plan-260703-plugin-subsystem.md(需求spec-260703-plugin-subsystem.md)
         - 迭代：Plugins，详情、配置使用弹出框交互，风格跟记忆弹出框保持一致
         - 迭代：飞书IM，tool_call_id为空、导致无结果
-        - 验收：我应该如何验收Plugin？给出功能验收的列表
         - 验证：CLI，python -m app.interfaces.cli plugin list
         - 验证：Dashboard UI，Http API
         - 验证：Chat、飞书IM，端到端测试
         - 验证：HermesAgent插件平移，零改造
+
+[20260704]
+- FR
+    - 平台：[KF]实现生产级TUI功能，对标Hermes
+        - 参考：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
+        - 待办：领域能力管理子命令（provider/knowledge/mcp/schedule/sandbox/memory/platform CRUD CLI）、运维子命令（doctor/config/logs）、ACP 服务端、TUI 全屏、sessions browse picker、CLI 端破坏性命令确认 UI
+        - 审阅：发现并修复严重问题(20个)，spec-260704-cli-experience.md
+        - 验收：我应该如何验收TUI(CLI)？给出功能验收的列表
 
 
 ---
@@ -238,14 +244,15 @@
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
+    - HE：修改HarnessWF，补充`人工验收项`到plan文件，章节命名`## 人工验收`、放到`## 变更记录`上方，要求仅保留`人工/半人工验收项`
 - FR
-    - 平台：CLI，对标Hermes、实现生产级CLI功能
     - 工具：Skill自进化
     - 平台：ACP，提供ACP服务端能力，打通VsCode ACP CLIENT
     - 沙盒：支持Terminal命令执行，危险命令确认(对标Hermes)
     - 架构：MoA，对标Hermes
     - 工具：相比Hermes，还缺少哪些功能？明确List出来
     - 治理：能力分层，平台是提供方视角(管理员)、业务是使用方视角(用户)。以Skill为例，Skill系平台能力、Workflow是业务能力，两者复用领域层
+    - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明、多分类目录、plugin沙盒化
 
 ---
 
