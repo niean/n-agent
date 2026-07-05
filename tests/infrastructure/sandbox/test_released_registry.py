@@ -100,3 +100,45 @@ def test_released_sandbox_history_migrates_legacy_container_name(tmp_path):
 
     assert rows[0].session_id == "s-legacy"
     assert rows[0].sandbox_id == "nagent-sandbox-legacy"
+
+
+def test_released_sandbox_history_list_returns_id(tmp_path):
+    registry = SQLiteReleasedSandboxRegistry(tmp_path / "sessions.db")
+    registry.record(ReleasedSandboxInfo(
+        session_id="s1",
+        sandbox_type="docker",
+        sandbox_id="nagent-sandbox-s1",
+        created_at=datetime(2026, 7, 1, 1, 0, tzinfo=timezone.utc),
+        released_at=datetime(2026, 7, 1, 1, 10, tzinfo=timezone.utc),
+        reason="manual",
+    ))
+
+    rows = registry.list_recent(limit=10)
+    assert len(rows) == 1
+    assert rows[0].id is not None
+
+
+def test_released_sandbox_history_delete_removes_row(tmp_path):
+    registry = SQLiteReleasedSandboxRegistry(tmp_path / "sessions.db")
+    registry.record(ReleasedSandboxInfo(
+        session_id="s1",
+        sandbox_type="docker",
+        sandbox_id="nagent-sandbox-s1",
+        created_at=datetime(2026, 7, 1, 1, 0, tzinfo=timezone.utc),
+        released_at=datetime(2026, 7, 1, 1, 10, tzinfo=timezone.utc),
+        reason="manual",
+    ))
+    target_id = registry.list_recent(limit=10)[0].id
+
+    deleted = registry.delete(target_id)
+
+    assert deleted is True
+    assert registry.list_recent(limit=10) == []
+
+
+def test_released_sandbox_history_delete_unknown_id_returns_false(tmp_path):
+    registry = SQLiteReleasedSandboxRegistry(tmp_path / "sessions.db")
+
+    deleted = registry.delete("nonexistent-id")
+
+    assert deleted is False

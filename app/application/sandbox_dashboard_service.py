@@ -61,6 +61,17 @@ class SandboxDashboardService:
             return []
         return [_released_to_dict(info) for info in self.sandbox_manager.list_released()]
 
+    async def delete_released_sandbox(self, entry_id: str) -> dict[str, Any]:
+        if self.sandbox_manager is None:
+            return {"ok": False, "error": "sandbox not enabled"}
+        if not entry_id:
+            return {"ok": False, "error": "entry_id required"}
+        try:
+            ok = self.sandbox_manager.delete_released(entry_id)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": ok}
+
     async def list_execute_code_history(self, session_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         merged: list[Any] = []
         seen: set[str] = set()
@@ -132,6 +143,7 @@ def _active_to_dict(info) -> dict[str, Any]:
 
 def _released_to_dict(info) -> dict[str, Any]:
     return {
+        "id": info.id,
         "session_id": info.session_id,
         "sandbox_type": info.sandbox_type,
         "sandbox_id": info.sandbox_id,

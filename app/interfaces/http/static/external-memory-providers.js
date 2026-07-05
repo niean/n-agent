@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = (namespace.ui || {});
   const api = (namespace.api || {});
+  const modal = (namespace.modal || {});
 
   let providers = [];
   let initialized = false;
@@ -153,8 +154,7 @@
     titleGroup.append(title, tips);
     const actions = ui.el('span', 'panel-actions');
     actions.append(
-      button('+ 新建', 'btn', () => openForm()),
-      button('刷新', 'btn', load)
+      button('新增', 'btn', () => openForm())
     );
     panelHeader.append(titleGroup, actions);
     panel.appendChild(panelHeader);
@@ -245,7 +245,7 @@
     const enabled = provider.enabled === true;
     const enabledBadge = document.createElement('span');
     enabledBadge.className = 'badge badge--' + statusKind(enabled);
-    enabledBadge.textContent = enabled ? '已激活' : '停用';
+    enabledBadge.textContent = enabled ? '启用' : '停用';
     enabledTd.appendChild(enabledBadge);
     tr.appendChild(enabledTd);
 
@@ -254,14 +254,16 @@
     actions.className = 'row-actions-cell';
     const actionGroup = document.createElement('div');
     actionGroup.className = 'row-actions row-actions--memory';
-    if (!enabled) {
-      actionGroup.append(button('激活', 'btn', () => activateProvider(provider.id)));
+    const enableBtn = button('启用', 'btn', () => activateProvider(provider.id));
+    if (enabled) {
+      enableBtn.disabled = true;
     }
+    actionGroup.append(enableBtn);
     actionGroup.append(
-      button('探测', 'btn', () => probeProvider(provider.id)),
-      button('查看', 'btn', () => openViewForm(provider)),
+      button('探活', 'btn', () => probeProvider(provider.id)),
       button('编辑', 'btn', () => openForm(provider)),
-      button('删除', 'btn', () => deleteProvider(provider))
+      button('删除', 'btn', () => deleteProvider(provider)),
+      button('详情', 'btn', () => openViewForm(provider))
     );
     actions.appendChild(actionGroup);
     tr.appendChild(actions);
@@ -424,7 +426,7 @@
     form.className = 'providers-form';
     const header = ui.el('div', 'modal-header');
     const title = document.createElement('h4');
-    title.textContent = isEdit ? '编辑检索记忆' : '新建检索记忆';
+    title.textContent = isEdit ? '编辑检索记忆' : '新增检索记忆';
     const close = button('×', 'modal-close', closeModal);
     close.setAttribute('aria-label', '关闭表单');
     header.append(title, close);
@@ -610,11 +612,11 @@
         method: 'POST',
       });
       if (result && result.tool_surface_refresh_failed) {
-        window.alert('Provider 已激活，但工具面刷新失败，请稍后重试或检查日志');
+        await modal.alert('Provider 已激活，但工具面刷新失败，请稍后重试或检查日志');
       }
       await load();
     } catch (err) {
-      window.alert('激活失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('激活失败: ' + (err && err.message ? err.message : err));
     }
   }
 
@@ -626,22 +628,22 @@
       await load();
       if (!result || result.probe_status !== 'ok') {
         const detail = result && result.last_probe_error ? result.last_probe_error : (result && result.probe_status || 'unknown');
-        window.alert('探测失败: ' + detail);
+        await modal.alert('探测失败: ' + detail);
       }
     } catch (err) {
-      window.alert('探测失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('探测失败: ' + (err && err.message ? err.message : err));
     }
   }
 
   async function deleteProvider(provider) {
-    if (!window.confirm('确认删除 Provider ' + provider.name + '？')) return;
+    if (!(await modal.confirm('确认删除 Provider ' + provider.name + '？'))) return;
     try {
       await api.fetchJson('/chat/external-memory/providers/' + encodeURIComponent(provider.id), {
         method: 'DELETE',
       });
       await load();
     } catch (err) {
-      window.alert('删除失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('删除失败: ' + (err && err.message ? err.message : err));
     }
   }
 

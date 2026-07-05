@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = (namespace.ui || {});
   const api = (namespace.api || {});
+  const modal = (namespace.modal || {});
   let state = { config: null, active: [], released: [], history: [] };
 
   function root() {
@@ -174,14 +175,12 @@
     );
   }
 
-  function buildPanel(title, bodyId, onRefresh) {
+  function buildPanel(title, bodyId) {
     const panel = ui.el('section', 'status-panel');
     const header = ui.el('div', 'panel-header');
     const titleSpan = document.createElement('span');
     titleSpan.textContent = title;
-    const actions = ui.el('span', 'panel-actions');
-    actions.append(button('刷新', 'btn', onRefresh));
-    header.append(titleSpan, actions);
+    header.append(titleSpan);
     const body = ui.el('div', 'panel-body');
     body.id = bodyId;
     panel.append(header, body);
@@ -193,9 +192,7 @@
     const header = ui.el('div', 'panel-header');
     const titleSpan = document.createElement('span');
     titleSpan.textContent = '配置';
-    const actions = ui.el('span', 'panel-actions');
-    actions.append(button('刷新', 'btn', refreshConfig));
-    header.append(titleSpan, actions);
+    header.append(titleSpan);
     const body = ui.el('div', 'panel-body');
     body.id = 'sandbox-config-card';
     panel.append(header, body);
@@ -204,19 +201,19 @@
   }
 
   function buildActivePanel() {
-    const panel = buildPanel('活跃沙盒', 'sandbox-active-card', refreshActive);
+    const panel = buildPanel('活跃沙盒', 'sandbox-active-card');
     renderActiveTable(panel.querySelector('.panel-body'));
     return panel;
   }
 
   function buildReleasedPanel() {
-    const panel = buildPanel('废弃沙盒', 'sandbox-released-card', refreshReleased);
+    const panel = buildPanel('废弃沙盒', 'sandbox-released-card');
     renderReleasedTable(panel.querySelector('.panel-body'));
     return panel;
   }
 
   function buildHistoryPanel() {
-    const panel = buildPanel('执行历史', 'sandbox-history-card', refreshHistory);
+    const panel = buildPanel('执行历史', 'sandbox-history-card');
     renderHistoryTable(panel.querySelector('.panel-body'));
     return panel;
   }
@@ -301,7 +298,7 @@
     table.className = 'document-table sandbox-released-table';
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['Session', '类型', '沙盒标识', '创建时间', '废弃时间', '原因'].forEach((label) => {
+    ['Session', '类型', '沙盒标识', '创建时间', '废弃时间', '原因', '操作'].forEach((label) => {
       const th = document.createElement('th');
       th.textContent = label;
       headerRow.appendChild(th);
@@ -315,7 +312,11 @@
       appendCell(tr, it.sandbox_id || '-');
       appendCell(tr, formatTime(it.created_at));
       appendCell(tr, formatTime(it.released_at));
-      appendBadgeCell(tr, releaseReasonLabel(it.reason), releaseReasonBadge(it.reason));
+      appendCell(tr, releaseReasonLabel(it.reason));
+      const actions = document.createElement('td');
+      actions.className = 'row-actions';
+      actions.append(button('删除', 'btn', () => deleteReleased(it.id)));
+      tr.appendChild(actions);
       tbody.appendChild(tr);
     });
     table.append(thead, tbody);
@@ -447,61 +448,49 @@
   }
 
   async function releaseSandbox(sessionId) {
-    if (!window.confirm(`确认释放沙盒 ${sessionId}？容器将被销毁，scratch 被清理。`)) return;
+    if (!(await modal.confirm(`确认释放沙盒 ${sessionId}？容器将被销毁，scratch 被清理。`))) return;
     try {
       await sandboxApi().releaseSandbox(sessionId);
       await load();
     } catch (err) {
-      window.alert(`释放失败：${err && err.message ? err.message : err}`);
+      await modal.alert(`释放失败：${err && err.message ? err.message : err}`);
     }
   }
 
   async function deleteHistory(toolCallId) {
     if (!toolCallId) {
-      window.alert('缺少记录ID');
+      await modal.alert('缺少记录ID');
       return;
     }
-    if (!window.confirm(`确认删除执行历史 ${toolCallId}？`)) return;
+    if (!(await modal.confirm(`确认删除执行历史 ${toolCallId}？`))) return;
     try {
       const res = await sandboxApi().deleteHistory(toolCallId);
       if (res && res.ok === false) {
-        window.alert(`删除失败：${res.error || '未知错误'}`);
+        await modal.alert(`删除失败：${res.error || '未知错误'}`);
         return;
       }
       await load();
     } catch (err) {
-      window.alert(`删除失败：${err && err.message ? err.message : err}`);
+      await modal.alert(`删除失败：${err && err.message ? err.message : err}`);
     }
   }
 
-  async function refreshPanel(bodyId, fetchFn, stateKey, renderFn, loadingText, errorText) {
-    const body = document.getElementById(bodyId);
-    if (!body) return;
-    const sbx = sandboxApi();
-    if (!sbx) return;
-    ui.clear(body);
-    ui.renderLoading(body, loadingText);
+  async function deleteReleased(entryId) {
+    if (!entryId) {
+      await modal.alert('缺少记录ID');
+      return;
+    }
+    if (!(await modal.confirm(`确认删除废弃沙盒记录 ${entryId}？`))) return;
     try {
-      const data = await fetchFn(sbx);
-      state[stateKey] = data;
-      renderFn(body);
+      const res = await sandboxApi().deleteReleased(entryId);
+      if (res && res.ok === false) {
+        await modal.alert(`删除失败：${res.error || '未知错误'}`);
+        return;
+      }
+      await load();
     } catch (err) {
-      ui.clear(body);
-      ui.renderError(body, errorText + ': ' + (err && err.message ? err.message : err));
+      await modal.alert(`删除失败：${err && err.message ? err.message : err}`);
     }
-  }
-
-  function refreshConfig() {
-    return refreshPanel('sandbox-config-card', (s) => s.getConfig(), 'config', renderConfigTable, '加载配置...', '加载配置失败');
-  }
-  function refreshActive() {
-    return refreshPanel('sandbox-active-card', (s) => s.listActive(), 'active', renderActiveTable, '加载活跃沙盒...', '加载活跃沙盒失败');
-  }
-  function refreshReleased() {
-    return refreshPanel('sandbox-released-card', (s) => s.listReleased(), 'released', renderReleasedTable, '加载废弃沙盒...', '加载废弃沙盒失败');
-  }
-  function refreshHistory() {
-    return refreshPanel('sandbox-history-card', (s) => s.listHistory(), 'history', renderHistoryTable, '加载执行历史...', '加载执行历史失败');
   }
 
   async function load() {

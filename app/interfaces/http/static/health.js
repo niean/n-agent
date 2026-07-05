@@ -61,8 +61,6 @@
   }
 
   function init() {
-    const refreshBtn = ui.byId('health-refresh');
-    if (refreshBtn) refreshBtn.addEventListener('click', refresh);
     refresh();
   }
 

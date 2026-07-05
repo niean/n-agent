@@ -121,6 +121,7 @@ textarea { min-height: 90px; resize: vertical; }
 .btn { padding: var(--space-4) var(--space-7); color: var(--color-fg-muted); background: var(--color-on-primary); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); transition: all 0.2s; }
 .btn:hover, .btn--primary { color: var(--color-on-primary); background: var(--color-primary); border-color: var(--color-primary); }
 .btn--danger { color: var(--color-on-primary); background: var(--color-danger); border-color: var(--color-danger); }
+.btn:disabled, .btn:disabled:hover { color: var(--color-fg-subtle); background: var(--color-bg-subtle); border-color: var(--color-border-muted); cursor: not-allowed; opacity: 0.6; }
 .document-table { width: 100%; border-collapse: collapse; font-size: var(--font-size-md); }
 .document-table th, .document-table td { padding: var(--space-6); border-bottom: 1px solid var(--color-border-light); text-align: left; vertical-align: middle; }
 .document-table th { color: var(--color-fg-muted); background: var(--color-bg-subtle); font-weight: 600; }
@@ -190,6 +191,7 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
 .modal-close { width: 32px; height: 32px; color: var(--color-fg-subtle); background: transparent; border: 0; border-radius: var(--radius-sm); font-size: 22px; line-height: 1; }
 .modal-close:hover { color: var(--color-fg-default); background: var(--color-bg-hover); }
+.modal-message { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .providers-form { display: flex; flex-direction: column; gap: 12px; padding: 20px; background: var(--color-bg-white); }
 .providers-form h4 { margin: 0; }
 .providers-form label { display: flex; flex-direction: column; gap: 4px; color: var(--color-fg-muted); font-size: 12px; }
@@ -199,9 +201,10 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .row-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .row-actions-cell { white-space: normal; }
 .row-actions--memory { display: inline-flex; justify-content: flex-start; gap: 8px; max-width: 240px; }
-.document-table .btn { padding: 0; color: var(--color-primary-strong); background: transparent; border: 0; border-radius: 0; }
-.document-table .btn:hover, .document-table .btn--primary { color: var(--color-primary-strong); background: transparent; border-color: transparent; text-decoration: underline; }
+.document-table .btn { padding: 0; color: var(--color-primary-strong); background: transparent; border: 0; border-radius: 0; text-decoration: none; }
+.document-table .btn:hover, .document-table .btn--primary { color: var(--color-primary-strong); background: transparent; border-color: transparent; }
 .document-table .btn--danger { color: var(--color-on-primary); background: var(--color-danger); border-color: var(--color-danger); }
+.document-table .btn:disabled, .document-table .btn:disabled:hover { color: var(--color-fg-subtle); background: transparent; border-color: transparent; cursor: not-allowed; opacity: 0.6; text-decoration: none; }
 /* Memory table column widths - 名称、类型、详情、启用、操作 (5列布局 - 文件记忆) */
 .memory-table th:nth-child(1), .memory-table td:nth-child(1) { width: 10%; min-width: 100px; } /* 名称 */
 .memory-table th:nth-child(2), .memory-table td:nth-child(2) { width: 10%; min-width: 100px; }  /* 类型 */
@@ -216,6 +219,9 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .memory-table--retrieval th:nth-child(7), .memory-table--retrieval td:nth-child(7) { width: 15%; min-width: 150px; } /* 操作 */
 .document-table td > .btn + .btn { margin-left: 5px; }
 .knowledge-tool-table th:nth-child(4), .knowledge-tool-table td:nth-child(4) { width: 32%; max-width: 460px; white-space: normal; word-break: break-word; }
+/* 工具列表 7列布局 - 名称、类型、分组、描述、风险等级、启用、操作 */
+.tools-list-table th:nth-child(6), .tools-list-table td:nth-child(6) { width: 8%; min-width: 88px; text-align: center; } /* 启用 */
+.tools-list-table th:nth-child(7), .tools-list-table td:nth-child(7) { width: 10%; min-width: 96px; } /* 操作 */
 .sandbox-history-table th:nth-child(5), .sandbox-history-table td:nth-child(5) { text-align: right; }
 .tools-schema-content { padding: 20px; }
 .tools-schema-content h4 { margin: 0; }

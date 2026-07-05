@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.application.sandbox_dashboard_service import SandboxDashboardService
-from app.domain.sandbox import SandboxExecutionHistoryEntry
+from app.domain.sandbox import ReleasedSandboxInfo, SandboxExecutionHistoryEntry
 from app.domain.session import ConversationMessage, ConversationSession, ToolCall
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.sandbox.history_registry import SQLiteSandboxExecutionHistoryRegistry
@@ -94,3 +94,104 @@ async def test_delete_execute_code_history_deletes_sandbox_history_and_legacy_to
 
     assert result == {"ok": True}
     assert await service.list_execute_code_history(limit=50) == []
+
+
+@pytest.mark.asyncio
+async def test_list_released_sandboxes_returns_id(tmp_path):
+    now = datetime.now(timezone.utc)
+    info = ReleasedSandboxInfo(
+        session_id="s1",
+        sandbox_type="docker",
+        sandbox_id="nagent-sandbox-s1",
+        created_at=now,
+        released_at=now,
+        reason="manual",
+        id="rec-1",
+    )
+    manager = SimpleNamespace(
+        list_released=lambda: [info],
+        delete_released=lambda entry_id: entry_id == "rec-1",
+    )
+    service = SandboxDashboardService(
+        sandbox_manager=manager,
+        memory_store=None,
+        settings=SimpleNamespace(),
+        history_registry=None,
+    )
+
+    rows = await service.list_released_sandboxes()
+    assert rows == [{
+        "id": "rec-1",
+        "session_id": "s1",
+        "sandbox_type": "docker",
+        "sandbox_id": "nagent-sandbox-s1",
+        "created_at": now.isoformat(),
+        "released_at": now.isoformat(),
+        "reason": "manual",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_delete_released_sandbox_delegates_to_manager(tmp_path):
+    deleted_args = []
+
+    def fake_delete(entry_id):
+        deleted_args.append(entry_id)
+        return entry_id == "rec-1"
+
+    manager = SimpleNamespace(delete_released=fake_delete)
+    service = SandboxDashboardService(
+        sandbox_manager=manager,
+        memory_store=None,
+        settings=SimpleNamespace(),
+        history_registry=None,
+    )
+
+    result = await service.delete_released_sandbox("rec-1")
+
+    assert result == {"ok": True}
+    assert deleted_args == ["rec-1"]
+
+
+@pytest.mark.asyncio
+async def test_delete_released_sandbox_unknown_id_returns_ok_false(tmp_path):
+    manager = SimpleNamespace(delete_released=lambda entry_id: False)
+    service = SandboxDashboardService(
+        sandbox_manager=manager,
+        memory_store=None,
+        settings=SimpleNamespace(),
+        history_registry=None,
+    )
+
+    result = await service.delete_released_sandbox("nonexistent")
+
+    assert result == {"ok": False}
+
+
+@pytest.mark.asyncio
+async def test_delete_released_sandbox_without_manager_returns_error(tmp_path):
+    service = SandboxDashboardService(
+        sandbox_manager=None,
+        memory_store=None,
+        settings=SimpleNamespace(),
+        history_registry=None,
+    )
+
+    result = await service.delete_released_sandbox("rec-1")
+
+    assert result == {"ok": False, "error": "sandbox not enabled"}
+
+
+@pytest.mark.asyncio
+async def test_delete_released_sandbox_rejects_empty_id(tmp_path):
+    manager = SimpleNamespace(delete_released=lambda entry_id: True)
+    service = SandboxDashboardService(
+        sandbox_manager=manager,
+        memory_store=None,
+        settings=SimpleNamespace(),
+        history_registry=None,
+    )
+
+    result = await service.delete_released_sandbox("")
+
+    assert result == {"ok": False, "error": "entry_id required"}

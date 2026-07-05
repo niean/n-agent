@@ -144,7 +144,7 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'if (!text) return' in chat_js
     assert 'renameSession' in chat_js
     assert 'deleteSession' in chat_js
-    assert 'window.confirm(' in chat_js
+    assert 'modal.confirm(' in chat_js
     assert "p.active === true" in chat_js
     assert 'phantom' in chat_js
     assert 'enabledProviders.includes(p.name)' in chat_js
@@ -184,10 +184,9 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'activateProvider' in models_js
     assert 'api_key_present' in models_js
     assert "document.createElement('span')" in models_js
-    assert "badge.className = 'badge badge--success'" in models_js
-    assert "badge.textContent = '✓'" in models_js
-    assert 'td6.appendChild(badge)' in models_js
-    assert "td6.textContent = '-'" in models_js
+    assert "badge badge--${p.is_active ? 'success' : 'warning'}" in models_js
+    assert "p.is_active ? '启用' : '停用'" in models_js
+    assert 'td6.appendChild(activeBadge)' in models_js
     assert "model.is_default === true ? '✓' : '-'" in models_js
     nav_js = client.get('/static/management-navigation.js').text
     assert 'pushState' in nav_js
@@ -224,7 +223,6 @@ def test_platforms_static_assets_contain_readonly_ui(tmp_path):
     html = client.get('/platforms').text
     assert 'data-tab="platforms"' in html
     assert 'id="platforms-list"' in html
-    assert 'id="platforms-sessions"' in html
 
     platforms_js = client.get('/static/platforms.js').text
     for expected in (

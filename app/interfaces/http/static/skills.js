@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = (namespace.ui || {});
   const api = (namespace.api || {});
+  const modal = (namespace.modal || {});
 
   function root() {
     return ui.byId ? ui.byId('tab-tools-skill') : document.getElementById('tab-tools-skill');
@@ -63,7 +64,23 @@
     ['name', 'description', 'platforms', 'readiness', 'enabled', 'last_scan_status'].forEach((key) => {
       const td = ui.el('td');
       const v = s[key];
-      td.textContent = Array.isArray(v) ? v.join(',') : (v === null || v === undefined ? '' : String(v));
+      if (key === 'enabled') {
+        const badge = ui.el('span', 'badge badge--' + (s.enabled ? 'success' : 'warning'));
+        badge.textContent = s.enabled ? '启用' : '停用';
+        td.appendChild(badge);
+      } else if (key === 'readiness') {
+        const isOk = v === 'available';
+        const badge = ui.el('span', 'badge badge--' + (isOk ? 'success' : 'warning'));
+        badge.textContent = v == null ? '' : String(v);
+        td.appendChild(badge);
+      } else if (key === 'last_scan_status') {
+        const isOk = v === 'ok' || v === 'manual' || v == null || v === '';
+        const badge = ui.el('span', 'badge badge--' + (isOk ? 'success' : 'warning'));
+        badge.textContent = v == null || v === '' ? '未扫描' : String(v);
+        td.appendChild(badge);
+      } else {
+        td.textContent = Array.isArray(v) ? v.join(',') : (v === null || v === undefined ? '' : String(v));
+      }
       tr.appendChild(td);
     });
     const td = ui.el('td');
@@ -71,7 +88,7 @@
     const group = ui.el('div', 'row-actions');
     const viewBtn = ui.el('button', 'btn');
     viewBtn.type = 'button';
-    viewBtn.textContent = '查看';
+    viewBtn.textContent = '详情';
     viewBtn.addEventListener('click', () => openDetail(s.name));
     const editBtn = ui.el('button', 'btn');
     editBtn.type = 'button';
@@ -79,13 +96,13 @@
     editBtn.addEventListener('click', () => openForm(s));
     const toggle = ui.el('button', 'btn');
     toggle.type = 'button';
-    toggle.textContent = s.enabled ? '禁用' : '启用';
+    toggle.textContent = s.enabled ? '停用' : '启用';
     toggle.addEventListener('click', () => toggleEnabled(s.name, !s.enabled));
     const del = ui.el('button', 'btn');
     del.type = 'button';
     del.textContent = '删除';
     del.addEventListener('click', () => deleteSkill(s.name));
-    group.append(viewBtn, editBtn, toggle, del);
+    group.append(toggle, editBtn, del, viewBtn);
     td.appendChild(group);
     tr.appendChild(td);
     return tr;
@@ -96,10 +113,10 @@
       const res = await api.refreshSkills();
       if (res && res.warnings && res.warnings.length) {
         const lines = res.warnings.map((w) => (w.reason || 'warn') + ': ' + (w.relative_path || ''));
-        window.alert('扫描完成，警告:\n' + lines.join('\n'));
+        await modal.alert('扫描完成，警告:\n' + lines.join('\n'));
       }
     } catch (err) {
-      window.alert('扫描失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('扫描失败: ' + (err && err.message ? err.message : err));
     }
     await load();
   }
@@ -108,17 +125,17 @@
     try {
       await api.setSkillEnabled(name, enabled);
     } catch (err) {
-      window.alert('更新失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('更新失败: ' + (err && err.message ? err.message : err));
     }
     await load();
   }
 
   async function deleteSkill(name) {
-    if (!window.confirm(`删除 Skill 元数据 ${name}？`)) return;
+    if (!(await modal.confirm(`删除 Skill 元数据 ${name}？`))) return;
     try {
       await api.deleteSkill(name);
     } catch (err) {
-      window.alert('删除失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('删除失败: ' + (err && err.message ? err.message : err));
     }
     await load();
   }
@@ -240,7 +257,7 @@
         closeForm();
         await load();
       } catch (err) {
-        window.alert('保存失败: ' + (err && err.message ? err.message : err));
+        await modal.alert('保存失败: ' + (err && err.message ? err.message : err));
       }
     });
     dialog.appendChild(form);
@@ -257,7 +274,7 @@
     try {
       data = await api.getSkill(name);
     } catch (err) {
-      window.alert('获取详情失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('获取详情失败: ' + (err && err.message ? err.message : err));
       return;
     }
     closeDetail();

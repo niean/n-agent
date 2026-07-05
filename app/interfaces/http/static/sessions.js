@@ -2,6 +2,30 @@
   const namespace = global.NAGENT || {};
   const ui = namespace.ui;
   const api = namespace.api;
+  const modal = namespace.modal;
+
+  function button(label, className, onClick) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = className || 'btn';
+    btn.textContent = label;
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  async function deleteSession(sessionId) {
+    if (!sessionId) {
+      await modal.alert('缺少会话ID');
+      return;
+    }
+    if (!(await modal.confirm(`确认删除会话 ${sessionId}？此操作将级联删除消息、工具调用、摘要和任务状态，不可恢复。`))) return;
+    try {
+      await api.deleteSession(sessionId);
+      await refresh();
+    } catch (err) {
+      await modal.alert(`删除失败：${err && err.message ? err.message : err}`);
+    }
+  }
 
   async function refresh() {
     const list = ui.byId('sessions-list');
@@ -29,12 +53,9 @@
         const td2 = document.createElement('td'); td2.textContent = session.source || '-';
         const td3 = document.createElement('td'); td3.textContent = session.id;
         const td4 = document.createElement('td');
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.type = 'button';
-        btn.textContent = '查看';
-        btn.addEventListener('click', () => openSessionDetailModal(session.id));
-        td4.appendChild(btn);
+        td4.className = 'row-actions';
+        td4.append(button('删除', 'btn', () => deleteSession(session.id)));
+        td4.append(button('详情', 'btn', () => openSessionDetailModal(session.id)));
         tr.append(td1, td2, td3, td4);
         tbody.appendChild(tr);
       });
@@ -147,8 +168,6 @@
   }
 
   function init() {
-    const refreshBtn = ui.byId('sessions-refresh');
-    if (refreshBtn) refreshBtn.addEventListener('click', refresh);
     refresh();
   }
 

@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = (namespace.ui || {});
   const api = (namespace.api || {});
+  const modal = (namespace.modal || {});
 
   function root() {
     return ui.byId ? ui.byId('tab-tools-plugin') : document.getElementById('tab-tools-plugin');
@@ -56,19 +57,22 @@
 
   function renderRow(p) {
     const tr = ui.el('tr');
-    const cells = [
-      p.key,
-      p.name,
-      p.version,
-      p.description,
-      p.kind,
-      p.source,
-      p.enabled ? 'on' : 'off',
-      p.last_scan_status || '',
-    ];
-    cells.forEach((v) => {
+    const columns = ['key', 'name', 'version', 'description', 'kind', 'source', 'enabled', 'last_scan_status'];
+    columns.forEach((key) => {
       const td = ui.el('td');
-      td.textContent = v === null || v === undefined ? '' : String(v);
+      const v = p[key];
+      if (key === 'enabled') {
+        const badge = ui.el('span', 'badge badge--' + (p.enabled ? 'success' : 'warning'));
+        badge.textContent = p.enabled ? '启用' : '停用';
+        td.appendChild(badge);
+      } else if (key === 'last_scan_status') {
+        const isOk = v === 'ok';
+        const badge = ui.el('span', 'badge badge--' + (isOk ? 'success' : 'warning'));
+        badge.textContent = v == null || v === '' ? '未扫描' : String(v);
+        td.appendChild(badge);
+      } else {
+        td.textContent = v === null || v === undefined ? '' : String(v);
+      }
       tr.appendChild(td);
     });
     const td = ui.el('td');
@@ -80,13 +84,13 @@
     viewBtn.addEventListener('click', () => openDetail(p.key));
     const configBtn = ui.el('button', 'btn');
     configBtn.type = 'button';
-    configBtn.textContent = '配置';
+    configBtn.textContent = '编辑';
     configBtn.addEventListener('click', () => openConfig(p));
     const toggle = ui.el('button', 'btn');
     toggle.type = 'button';
-    toggle.textContent = p.enabled ? '禁用' : '启用';
+    toggle.textContent = p.enabled ? '停用' : '启用';
     toggle.addEventListener('click', () => toggleEnabled(p.key, !p.enabled));
-    group.append(viewBtn, configBtn, toggle);
+    group.append(toggle, configBtn, viewBtn);
     td.appendChild(group);
     tr.appendChild(td);
     return tr;
@@ -107,7 +111,7 @@
       await api.refreshPlugins();
       await load();
     } catch (exc) {
-      window.alert('Plugin 扫描失败: ' + (exc && exc.message ? exc.message : exc));
+      await modal.alert('Plugin 扫描失败: ' + (exc && exc.message ? exc.message : exc));
     }
   }
 
@@ -116,7 +120,7 @@
       await api.setPluginEnabled(key, enabled);
       await load();
     } catch (exc) {
-      window.alert('切换状态失败: ' + (exc && exc.message ? exc.message : exc));
+      await modal.alert('切换状态失败: ' + (exc && exc.message ? exc.message : exc));
     }
   }
 
@@ -277,7 +281,7 @@
         backdrop.remove();
         await load();
       } catch (exc) {
-        window.alert('保存失败: ' + (exc && exc.message ? exc.message : exc));
+        await modal.alert('保存失败: ' + (exc && exc.message ? exc.message : exc));
       }
     });
     actions.append(cancelBtn, submitBtn);

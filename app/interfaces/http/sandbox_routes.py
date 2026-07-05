@@ -22,6 +22,10 @@ def register_sandbox_routes(router: APIRouter, service) -> None:
     async def sandbox_released():
         return await service.list_released_sandboxes()
 
+    @router.delete("/chat/sandbox/released/{entry_id}")
+    async def sandbox_released_delete(entry_id: str):
+        return await service.delete_released_sandbox(entry_id)
+
     @router.get("/chat/sandbox/execute-code-history")
     async def sandbox_history(session_id: str | None = None, limit: int = 50):
         return await service.list_execute_code_history(session_id, limit)

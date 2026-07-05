@@ -93,9 +93,18 @@ class SQLiteReleasedSandboxRegistry:
             ).fetchall()
         return [self._row_to_info(row) for row in rows]
 
+    def delete(self, entry_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM sandbox_released_history WHERE id = ?",
+                (entry_id,),
+            )
+            return cur.rowcount > 0
+
     @staticmethod
     def _row_to_info(row: sqlite3.Row) -> ReleasedSandboxInfo:
         return ReleasedSandboxInfo(
+            id=row["id"],
             session_id=row["session_id"],
             sandbox_type=row["sandbox_type"],
             sandbox_id=row["sandbox_id"],

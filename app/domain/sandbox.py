@@ -93,11 +93,13 @@ class ReleasedSandboxInfo:
     created_at: datetime
     released_at: datetime
     reason: str  # "idle" | "force" | "session" | "release"
+    id: str | None = None
 
 
 class ReleasedSandboxRegistry(Protocol):
     def record(self, info: ReleasedSandboxInfo) -> None: ...
     def list_recent(self, limit: int = 100) -> list[ReleasedSandboxInfo]: ...
+    def delete(self, entry_id: str) -> bool: ...
 
 
 @dataclass(frozen=True)

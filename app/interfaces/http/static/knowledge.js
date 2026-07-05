@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = (namespace.ui || {});
   const api = (namespace.api || {});
+  const modal = (namespace.modal || {});
   let state = { tools: [], bases: [] };
 
   function root() {
@@ -50,11 +51,7 @@
     const toolHeader = ui.el('div', 'panel-header');
     const toolTitle = document.createElement('span');
     toolTitle.textContent = '知识工具';
-    const toolActions = ui.el('span', 'panel-actions');
-    toolActions.append(
-      button('刷新', 'btn', load),
-    );
-    toolHeader.append(toolTitle, toolActions);
+    toolHeader.append(toolTitle);
     const toolBody = ui.el('div', 'panel-body');
     toolBody.id = 'knowledge-tool-card';
     toolPanel.append(toolHeader, toolBody);
@@ -67,7 +64,6 @@
     const actions = ui.el('span', 'panel-actions');
     actions.append(
       button('新增', 'btn', () => openKbForm()),
-      button('刷新', 'btn', load),
     );
     kbHeader.append(kbTitle, actions);
     const kbBody = ui.el('div', 'panel-body');
@@ -109,7 +105,7 @@
       badge.textContent = tool.risk_level || 'safe';
       risk.appendChild(badge);
       tr.appendChild(risk);
-      appendCell(tr, tool.enabled ? '是' : '否');
+      appendBadgeCell(tr, tool.enabled ? '启用' : '停用', tool.enabled ? 'success' : 'warning');
       appendCell(tr, ((tool.input_schema || {}).required || []).join(', ') || '-');
       tbody.appendChild(tr);
     });
@@ -153,10 +149,11 @@
     const actions = document.createElement('td');
     actions.className = 'row-actions';
     actions.append(
-      button('编辑', 'btn', () => openKbForm(base)),
       button(base.enabled ? '停用' : '启用', 'btn', () => toggleKb(base)),
-      button('Probe', 'btn', () => probeSaved(base)),
+      button('探活', 'btn', () => probeSaved(base)),
+      button('编辑', 'btn', () => openKbForm(base)),
       button('删除', 'btn', () => deleteKb(base)),
+      button('详情', 'btn', () => openKbViewForm(base)),
     );
     tr.appendChild(actions);
     return tr;
@@ -165,6 +162,72 @@
   function closeKbForm() {
     const modal = document.getElementById('knowledge-kb-modal');
     if (modal) modal.remove();
+  }
+
+  function closeKbViewForm() {
+    const modal = document.getElementById('knowledge-kb-view-modal');
+    if (modal) modal.remove();
+  }
+
+  // 只读详情弹框，对齐记忆页 openViewForm 风格：
+  // 与编辑表单共享要素布局，区别为 readOnly + 无保存按钮、底部仅"关闭"
+  function openKbViewForm(base) {
+    closeKbViewForm();
+    const backdrop = document.createElement('div');
+    backdrop.id = 'knowledge-kb-view-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog knowledge-modal';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const form = document.createElement('form');
+    form.className = 'providers-form knowledge-form';
+    const header = ui.el('div', 'modal-header');
+    const title = document.createElement('h4');
+    title.textContent = '查看 KB: ' + (base ? base.name : '');
+    const close = button('×', 'modal-close', closeKbViewForm);
+    close.setAttribute('aria-label', '关闭详情');
+    header.append(title, close);
+    form.appendChild(header);
+
+    field(form, 'kb_id', 'kb_id', base ? base.id : '', { disabled: true });
+    field(form, 'name', 'name', base ? base.name : '', { disabled: true });
+    field(form, 'description', 'description', base ? base.description : '', { type: 'textarea', disabled: true });
+    field(form, 'base_type', 'base_type', base ? base.base_type : '', { disabled: true });
+    field(form, 'base_url', 'base_url', base ? base.base_url : '', { disabled: true });
+    field(form, 'dataset_id', 'dataset_id', base ? base.dataset_id : '', { disabled: true });
+    field(form, 'api_key', 'api_key', base && base.api_key_present ? '已配置' : '未配置', { disabled: true });
+    field(form, 'default_top_k', 'default_top_k', base && base.default_top_k != null ? base.default_top_k : '', { type: 'number', disabled: true });
+    field(form, 'default_min_score', 'default_min_score', base && base.default_min_score != null ? base.default_min_score : '', { type: 'number', disabled: true });
+
+    const enabledDiv = document.createElement('div');
+    enabledDiv.style.marginBottom = 'var(--space-6)';
+    const enabledLabel = document.createElement('label');
+    const enabledSpan = document.createElement('span');
+    enabledSpan.textContent = ' 启用: ' + (base && base.enabled ? '是' : '否');
+    enabledLabel.appendChild(enabledSpan);
+    enabledDiv.appendChild(enabledLabel);
+    form.appendChild(enabledDiv);
+
+    const probeDiv = document.createElement('div');
+    probeDiv.style.marginBottom = 'var(--space-6)';
+    const probeLabel = document.createElement('label');
+    const probeSpan = document.createElement('span');
+    probeSpan.textContent = ' 探测状态: ' + (base ? (base.last_probe_status || 'unknown') : 'unknown');
+    probeLabel.appendChild(probeSpan);
+    probeDiv.appendChild(probeLabel);
+    form.appendChild(probeDiv);
+
+    const actions = ui.el('div', 'providers-form__actions');
+    actions.append(button('关闭', 'btn', closeKbViewForm));
+    form.appendChild(actions);
+
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeKbViewForm();
+    });
+    document.body.appendChild(backdrop);
   }
 
   function field(form, name, labelText, value, options) {
@@ -251,7 +314,7 @@
     form.appendChild(message);
     const actions = ui.el('div', 'providers-form__actions');
     actions.append(
-      button('Probe', 'btn', () => probeForm(form, message)),
+      button('探活', 'btn', () => probeForm(form, message)),
       button('取消', 'btn', closeKbForm),
     );
     const submit = document.createElement('button');
@@ -334,12 +397,12 @@
       await api.probeSavedKnowledgeBase(base.id);
       await load();
     } catch (err) {
-      window.alert('Probe 失败: ' + (err && err.message ? err.message : err));
+      await modal.alert('Probe 失败: ' + (err && err.message ? err.message : err));
     }
   }
 
   async function deleteKb(base) {
-    if (!window.confirm('确认删除 KB ' + base.id + '？')) return;
+    if (!(await modal.confirm('确认删除 KB ' + base.id + '？'))) return;
     await api.deleteKnowledgeBase(base.id);
     await load();
   }

@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = (namespace.ui || {});
   const api = (namespace.api || {});
+  const modal = (namespace.modal || {});
   let providers = [];
   let selectedProject = null;
   let currentTarget = 'memory';
@@ -110,8 +111,7 @@
     projectTitleGroup.append(projectTitle, projectTips);
     const projectActions = ui.el('span', 'panel-actions');
     projectActions.append(
-      button('+ 新建', 'btn', () => openProjectForm()),
-      button('刷新', 'btn', load)
+      button('新增', 'btn', () => openProjectForm())
     );
     projectHeader.append(projectTitleGroup, projectActions);
     const projectBody = ui.el('div', 'panel-body');
@@ -160,8 +160,8 @@
     const actionGroup = document.createElement('div');
     actionGroup.className = 'row-actions row-actions--memory';
     actionGroup.append(
-      button('查看', 'btn', () => openViewProjectForm(provider)),
-      button('编辑', 'btn', () => openProjectForm(provider))
+      button('编辑', 'btn', () => openProjectForm(provider)),
+      button('详情', 'btn', () => openViewProjectForm(provider))
     );
     actions.appendChild(actionGroup);
     tr.appendChild(actions);
@@ -209,9 +209,9 @@
     const actionGroup = document.createElement('div');
     actionGroup.className = 'row-actions row-actions--memory';
     actionGroup.append(
-      button('查看', 'btn', () => openViewProjectForm(provider)),
       button('编辑', 'btn', () => openProjectForm(provider)),
-      button('删除', 'btn', () => deleteProject(provider))
+      button('删除', 'btn', () => deleteProject(provider)),
+      button('详情', 'btn', () => openViewProjectForm(provider))
     );
     actions.appendChild(actionGroup);
     tr.appendChild(actions);
@@ -366,7 +366,7 @@
     form.className = 'providers-form';
     const header = ui.el('div', 'modal-header');
     const title = document.createElement('h4');
-    title.textContent = isEdit ? (isSystem ? '编辑系统记忆' : '编辑文件记忆') : '新建文件记忆';
+    title.textContent = isEdit ? (isSystem ? '编辑系统记忆' : '编辑文件记忆') : '新增文件记忆';
     const close = button('×', 'modal-close', closeProjectForm);
     close.setAttribute('aria-label', '关闭表单');
     header.append(title, close);
@@ -669,7 +669,7 @@
   }
 
   async function deleteProject(provider) {
-    if (!window.confirm('确认删除文件记忆 ' + provider.name + '？')) return;
+    if (!(await modal.confirm('确认删除文件记忆 ' + provider.name + '？'))) return;
     try {
       await api.fetchJson('/chat/external-memory/projects/delete', {
         method: 'POST',
@@ -681,19 +681,19 @@
       }
       await load();
     } catch (err) {
-      alert('删除失败: ' + err.message);
+      await modal.alert('删除失败: ' + err.message);
     }
   }
 
   async function deleteEntryFn(index) {
     if (!selectedProject) return;
-    if (!window.confirm('确认删除这个条目？')) return;
+    if (!(await modal.confirm('确认删除这个条目？'))) return;
     try {
       await api.fetchJson('/chat/external-memory/projects/' + encodeURIComponent(selectedProject) + '/entries/' + index + '?target=' + currentTarget, {
         method: 'DELETE',
       });
     } catch (err) {
-      alert('删除失败: ' + err.message);
+      await modal.alert('删除失败: ' + err.message);
     }
   }
 

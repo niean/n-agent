@@ -1,11 +1,9 @@
 (function (global) {
   const namespace = global.NAGENT || {};
+  const ui = namespace.ui;
   const api = namespace.api;
   const state = {
     platforms: [],
-    selected: '',
-    detail: null,
-    sessions: null,
     loading: false,
     error: '',
   };
@@ -52,10 +50,6 @@
     return document.getElementById('platforms-list');
   }
 
-  function getSessionsRoot() {
-    return document.getElementById('platforms-sessions');
-  }
-
   async function refresh() {
     const root = getListRoot();
     if (!root) return;
@@ -71,21 +65,6 @@
       state.loading = false;
       render();
     }
-  }
-
-  async function selectPlatform(platform) {
-    state.selected = platform;
-    state.detail = null;
-    state.sessions = null;
-    renderSessions();
-    try {
-      state.detail = await api.getPlatform(platform);
-      state.sessions = await api.listPlatformSessions(platform, 20, 0);
-    } catch (error) {
-      state.error = error.message || 'platform_load_failed';
-    }
-    render();
-    renderSessions();
   }
 
   function render() {
@@ -137,8 +116,8 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'btn';
-    button.textContent = '查看';
-    button.addEventListener('click', () => selectPlatform(platform.platform));
+    button.textContent = '详情';
+    button.addEventListener('click', () => openDetailModal(platform.platform));
     actions.appendChild(button);
     row.appendChild(actions);
     return row;
@@ -150,30 +129,22 @@
     return entries.map(([key, value]) => `${key}: ${value}`).join(' / ');
   }
 
-  function renderSessions() {
-    const root = getSessionsRoot();
-    if (!root) return;
-    clear(root);
-    if (!state.selected) {
-      appendText(root, 'div', '点击平台查看会话', 'empty-state');
-      return;
-    }
-    appendText(root, 'h3', state.selected);
-    if (!state.detail || !state.sessions) {
-      appendText(root, 'div', '加载中...', 'loading-state');
-      return;
-    }
-    const detail = document.createElement('div');
-    detail.className = 'scheduled-stats';
-    [['总会话', state.detail.total_sessions], ['活跃会话', state.detail.active_sessions]].forEach(([label, value]) => {
-      const card = document.createElement('div');
-      card.className = 'stat-card';
-      appendText(card, 'div', label, 'label');
-      appendText(card, 'div', value, 'value');
-      detail.appendChild(card);
-    });
-    root.appendChild(detail);
-    root.appendChild(renderSessionTable(state.sessions.items || []));
+  function closeDetailModal() {
+    const existing = document.getElementById('platforms-detail-modal');
+    if (existing) existing.remove();
+  }
+
+  function field(form, labelText, value) {
+    const label = document.createElement('label');
+    const span = document.createElement('span');
+    span.textContent = labelText;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = value == null || value === '' ? '-' : String(value);
+    input.disabled = true;
+    label.append(span, input);
+    form.appendChild(label);
+    return input;
   }
 
   function renderSessionTable(items) {
@@ -204,9 +175,103 @@
     return table;
   }
 
+  async function openDetailModal(platformId) {
+    closeDetailModal();
+    const platform = state.platforms.find((p) => p.platform === platformId);
+
+    const backdrop = document.createElement('div');
+    backdrop.id = 'platforms-detail-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const form = document.createElement('form');
+    form.className = 'providers-form';
+    const header = document.createElement('div');
+    header.className = 'modal-header';
+    const title = document.createElement('h4');
+    title.textContent = '平台详情: ' + (platform ? text(platform.display_name, platform.platform) : platformId);
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'modal-close';
+    close.setAttribute('aria-label', '关闭详情弹框');
+    close.textContent = '×';
+    close.addEventListener('click', closeDetailModal);
+    header.append(title, close);
+    form.appendChild(header);
+
+    const loading = document.createElement('div');
+    loading.textContent = '加载中...';
+    form.appendChild(loading);
+
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeDetailModal();
+    });
+    document.body.appendChild(backdrop);
+    close.focus();
+
+    try {
+      const [detail, sessions] = await Promise.all([
+        api.getPlatform(platformId),
+        api.listPlatformSessions(platformId, 20, 0),
+      ]);
+      form.textContent = '';
+      form.appendChild(header);
+
+      field(form, '平台', detail.platform);
+      field(form, '显示名', detail.display_name);
+      field(form, '类型', detail.kind);
+      field(form, '状态', detail.status);
+      field(form, '错误信息', detail.error_message);
+      field(form, '会话数', detail.session_count);
+      field(form, '总会话', detail.total_sessions);
+      field(form, '活跃会话', detail.active_sessions);
+      field(form, '最近活跃', formatDate(detail.last_active_at));
+      field(form, '配置', formatConfig(detail.config_summary));
+
+      const sessionsLabel = document.createElement('label');
+      const sessionsSpan = document.createElement('span');
+      sessionsSpan.textContent = '会话列表';
+      sessionsLabel.appendChild(sessionsSpan);
+      const sessionsWrap = document.createElement('div');
+      sessionsWrap.style.maxHeight = '240px';
+      sessionsWrap.style.overflowY = 'auto';
+      sessionsWrap.appendChild(renderSessionTable(sessions.items || []));
+      sessionsLabel.appendChild(sessionsWrap);
+      form.appendChild(sessionsLabel);
+
+      const actions = document.createElement('div');
+      actions.className = 'providers-form__actions';
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'btn';
+      closeBtn.textContent = '关闭';
+      closeBtn.addEventListener('click', closeDetailModal);
+      actions.appendChild(closeBtn);
+      form.appendChild(actions);
+    } catch (err) {
+      form.textContent = '';
+      form.appendChild(header);
+      const error = document.createElement('div');
+      error.className = 'badge badge--danger';
+      error.textContent = '加载失败: ' + (err && err.message ? err.message : err);
+      form.appendChild(error);
+      const actions = document.createElement('div');
+      actions.className = 'providers-form__actions';
+      const closeBtn = document.createElement('button');
+      closeBtn.type = 'button';
+      closeBtn.className = 'btn';
+      closeBtn.textContent = '关闭';
+      closeBtn.addEventListener('click', closeDetailModal);
+      actions.appendChild(closeBtn);
+      form.appendChild(actions);
+    }
+  }
+
   function init() {
-    const refreshButton = document.getElementById('platforms-refresh');
-    if (refreshButton) refreshButton.addEventListener('click', refresh);
     refresh();
   }
 

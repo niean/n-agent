@@ -142,6 +142,53 @@ async def test_released_sandbox_history_uses_persistent_registry(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_delete_released_delegates_to_persistent_registry(tmp_path: Path):
+    registry = SQLiteReleasedSandboxRegistry(tmp_path / "sessions.db")
+    mgr = SandboxManager(
+        sandbox_type="local",
+        workspace_root=tmp_path,
+        idle_seconds=900,
+        settings=_make_settings(),
+        callback_registry=SimpleNamespace(),
+        scratch_root=tmp_path / "scratch",
+        released_registry=registry,
+    )
+    now = datetime.now(timezone.utc)
+    sandbox = _FakeSandbox()
+    _seed_session(
+        mgr,
+        "sess-delete",
+        sandbox,
+        created=now - timedelta(minutes=5),
+        last_used=now - timedelta(minutes=30),
+    )
+    await mgr.release("sess-delete", reason="manual")
+
+    target_id = mgr.list_released()[0].id
+
+    deleted = mgr.delete_released(target_id)
+
+    assert deleted is True
+    assert mgr.list_released() == []
+
+
+def test_delete_released_unknown_id_returns_false(tmp_path: Path):
+    registry = SQLiteReleasedSandboxRegistry(tmp_path / "sessions.db")
+    mgr = SandboxManager(
+        sandbox_type="local",
+        workspace_root=tmp_path,
+        idle_seconds=900,
+        settings=_make_settings(),
+        callback_registry=SimpleNamespace(),
+        scratch_root=tmp_path / "scratch",
+        released_registry=registry,
+    )
+
+    assert mgr.delete_released("nonexistent-id") is False
+    assert mgr.delete_released("") is False
+
+
+@pytest.mark.asyncio
 async def test_reaper_skips_active_sandbox_under_idle_threshold(tmp_path: Path):
     mgr = _make_manager(tmp_path, idle_seconds=900)
     now = datetime.now(timezone.utc)

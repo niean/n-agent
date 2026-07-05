@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = namespace.ui;
   const api = namespace.api;
+  const modal = namespace.modal;
 
   function flagText(value) {
     return value === true ? '✓' : value === false ? '-' : '-';
@@ -53,12 +54,12 @@
   }
 
   function renderProvidersTable(parent, providers) {
-    if (!providers.length) { ui.renderEmpty(parent, '暂无 Provider，点击「+ 新增」创建'); return; }
+    if (!providers.length) { ui.renderEmpty(parent, '暂无 Provider，点击「新增」创建'); return; }
     const table = document.createElement('table');
     table.className = 'document-table';
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['名称', '类型', 'Base URL', 'Model', 'Key', 'Active', '操作'].forEach((label) => {
+    ['名称', '类型', 'Base URL', 'Model', 'Key', '启用', '操作'].forEach((label) => {
       const th = document.createElement('th'); th.textContent = label; headerRow.appendChild(th);
     });
     thead.appendChild(headerRow);
@@ -71,28 +72,26 @@
       const td4 = document.createElement('td'); td4.textContent = p.model || '-';
       const td5 = document.createElement('td'); td5.textContent = p.api_key_present ? '已配置' : '未配置';
       const td6 = document.createElement('td');
-      if (p.is_active) {
-        const badge = document.createElement('span');
-        badge.className = 'badge badge--success';
-        badge.textContent = '✓';
-        td6.appendChild(badge);
-      } else {
-        td6.textContent = '-';
-      }
+      const activeBadge = document.createElement('span');
+      activeBadge.className = `badge badge--${p.is_active ? 'success' : 'warning'}`;
+      activeBadge.textContent = p.is_active ? '启用' : '停用';
+      td6.appendChild(activeBadge);
       const actions = document.createElement('td');
       actions.className = 'row-actions';
+      const enableBtn = makeButton('启用', 'primary', async () => {
+        try { await api.activateProvider(p.id); await refreshProviders(); refreshModels(); }
+        catch (err) { await modal.alert(`启用失败：${err.message}`); }
+      });
+      if (p.is_active) enableBtn.disabled = true;
+      actions.appendChild(enableBtn);
       actions.appendChild(makeButton('编辑', '', () => showForm(p)));
-      if (!p.is_active) {
-        actions.appendChild(makeButton('启用', 'primary', async () => {
-          try { await api.activateProvider(p.id); await refreshProviders(); refreshModels(); }
-          catch (err) { alert(`启用失败：${err.message}`); }
-        }));
-        actions.appendChild(makeButton('删除', '', async () => {
-          if (!confirm(`确认删除 Provider「${p.name}」？`)) return;
-          try { await api.deleteProvider(p.id); await refreshProviders(); }
-          catch (err) { alert(`删除失败：${err.message}`); }
-        }));
-      }
+      const deleteBtn = makeButton('删除', '', async () => {
+        if (!(await modal.confirm(`确认删除 Provider「${p.name}」？`))) return;
+        try { await api.deleteProvider(p.id); await refreshProviders(); }
+        catch (err) { await modal.alert(`删除失败：${err.message}`); }
+      });
+      if (p.is_active) deleteBtn.disabled = true;
+      actions.appendChild(deleteBtn);
       tr.append(td1, td2, td3, td4, td5, td6, actions);
       tbody.appendChild(tr);
     });
@@ -148,7 +147,7 @@
       await refreshProviders();
       refreshModels();
     } catch (err) {
-      alert(`保存失败：${err.message}`);
+      await modal.alert(`保存失败：${err.message}`);
     }
   }
 
@@ -191,10 +190,6 @@
   }
 
   function init() {
-    const refreshModelsBtn = ui.byId('models-refresh');
-    if (refreshModelsBtn) refreshModelsBtn.addEventListener('click', refreshModels);
-    const refreshProvidersBtn = ui.byId('providers-refresh');
-    if (refreshProvidersBtn) refreshProvidersBtn.addEventListener('click', refreshProviders);
     const newBtn = ui.byId('providers-new');
     if (newBtn) newBtn.addEventListener('click', () => showForm(null));
     const cancelBtn = ui.byId('providers-form-cancel');

@@ -153,6 +153,9 @@
   const deleteSandboxHistory = (toolCallId) => fetchJson(
     `/chat/sandbox/execute-code-history/${encodeURIComponent(toolCallId)}`, { method: 'DELETE' },
   );
+  const deleteSandboxReleased = (entryId) => fetchJson(
+    `/chat/sandbox/released/${encodeURIComponent(entryId)}`, { method: 'DELETE' },
+  );
   const releaseSandbox = (sessionId) => fetchJson(
     `/chat/sandbox/active/${encodeURIComponent(sessionId)}/release`, { method: 'POST' },
   );
@@ -162,6 +165,7 @@
     listReleased: listSandboxReleased,
     listHistory: listSandboxHistory,
     deleteHistory: deleteSandboxHistory,
+    deleteReleased: deleteSandboxReleased,
     releaseSandbox,
   };
 

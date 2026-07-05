@@ -167,6 +167,21 @@ class SandboxManager:
                 logger.warning("list released sandbox history failed", exc_info=True)
         return list(self._released)
 
+    def delete_released(self, entry_id: str) -> bool:
+        if not entry_id:
+            return False
+        if self.released_registry is not None:
+            try:
+                return self.released_registry.delete(entry_id)
+            except Exception:
+                logger.warning("delete released sandbox history failed", exc_info=True)
+                return False
+        for i, info in enumerate(self._released):
+            if info.id == entry_id:
+                del self._released[i]
+                return True
+        return False
+
     def _record_release(self, session_id: str, sandbox, reason: str) -> None:
         created = self._created_at.get(session_id)
         if created is None:

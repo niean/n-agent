@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = namespace.ui;
   const api = namespace.api;
+  const modal = namespace.modal;
 
   let currentSessionId = null;
   let isSending = false;
@@ -240,7 +241,7 @@
 
   async function handleDelete(session) {
     const label = session.title || session.id;
-    if (!window.confirm(`确定删除会话「${label}」？关联消息将一并删除`)) return;
+    if (!(await modal.confirm(`确定删除会话「${label}」？关联消息将一并删除`))) return;
     try {
       await api.deleteSession(session.id);
     } catch (error) {

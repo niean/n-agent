@@ -127,12 +127,6 @@
     appendText(copy, 'h3', '任务');
     appendText(copy, 'p', '管理 Dashboard 任务，并查看最近执行结果。', 'muted');
     header.appendChild(copy);
-
-    const actions = document.createElement('div');
-    actions.className = 'panel-actions';
-    actions.appendChild(button('刷新', 'btn', refresh));
-    actions.appendChild(button('新建任务', 'btn btn--primary', () => openTaskForm()));
-    header.appendChild(actions);
     return header;
   }
 
@@ -165,12 +159,16 @@
     const header = document.createElement('div');
     header.className = 'panel-header';
     appendText(header, 'span', '任务列表');
+    const actions = document.createElement('div');
+    actions.className = 'panel-actions';
+    actions.appendChild(button('新增', 'btn', () => openTaskForm()));
+    header.appendChild(actions);
     panel.appendChild(header);
 
     const body = document.createElement('div');
     body.className = 'panel-body scheduled-table-wrap';
     if (!state.tasks.length) {
-      appendText(body, 'div', '暂无任务，点击“新建任务”开始。', 'empty-state');
+      appendText(body, 'div', '暂无任务，点击“新增”开始。', 'empty-state');
       panel.appendChild(body);
       return panel;
     }
@@ -179,7 +177,7 @@
     table.className = 'document-table scheduled-table';
     const thead = document.createElement('thead');
     const headRow = document.createElement('tr');
-    ['任务', '调度', '状态', '下次运行', '最近结果', '操作'].forEach((label) => appendText(headRow, 'th', label));
+    ['任务', '调度', '启用', '下次运行', '最近结果', '操作'].forEach((label) => appendText(headRow, 'th', label));
     thead.appendChild(headRow);
     table.appendChild(thead);
 
@@ -204,8 +202,8 @@
     row.appendChild(scheduleCell);
 
     const statusCell = document.createElement('td');
-    statusCell.appendChild(badge(text(task.status), statusKind(task.status)));
-    if (task.enabled === false) statusCell.appendChild(badge('disabled', 'warning'));
+    const isEnabled = !(task.status === 'paused' || task.enabled === false);
+    statusCell.appendChild(badge(isEnabled ? '启用' : '停用', isEnabled ? 'success' : 'warning'));
     row.appendChild(statusCell);
 
     appendText(row, 'td', formatDate(task.next_run_at));
@@ -217,11 +215,11 @@
     const actionCell = document.createElement('td');
     const actions = document.createElement('div');
     actions.className = 'row-actions';
-    actions.appendChild(linkButton('详情', 'btn', `/scheduled-tasks/${encodeURIComponent(task.id)}`));
+    actions.appendChild(button(task.status === 'paused' || task.enabled === false ? '启用' : '停用', 'btn', () => toggleTask(task)));
+    actions.appendChild(button('执行', 'btn', () => runTask(task)));
     actions.appendChild(button('编辑', 'btn', () => openTaskForm(task)));
-    actions.appendChild(button('立即运行', 'btn', () => runTask(task)));
-    actions.appendChild(button(task.status === 'paused' || task.enabled === false ? '恢复' : '暂停', 'btn', () => toggleTask(task)));
     actions.appendChild(button('删除', 'btn', () => confirmDeleteTask(task)));
+    actions.appendChild(linkButton('详情', 'btn', `/scheduled-tasks/${encodeURIComponent(task.id)}`));
     actionCell.appendChild(actions);
     row.appendChild(actionCell);
     return row;
@@ -302,7 +300,7 @@
     const isOrigin = task && task.delivery_target === 'origin';
     const form = document.createElement('form');
     form.className = 'providers-form scheduled-task-form';
-    renderModalHeader(form, isEdit ? '编辑任务' : '新建任务');
+    renderModalHeader(form, isEdit ? '编辑任务' : '新增任务');
     if (state.modal.error) appendText(form, 'div', state.modal.error, 'error-state');
 
     const grid = document.createElement('div');
@@ -411,7 +409,7 @@
     const detail = state.detail || {};
     if (detail.task) {
       actions.appendChild(button('刷新', 'btn', () => openTaskDetail(detail.task.id)));
-      actions.appendChild(button('立即运行', 'btn', () => runTask(detail.task)));
+      actions.appendChild(button('执行', 'btn', () => runTask(detail.task)));
     }
     header.appendChild(actions);
     wrapper.appendChild(header);
@@ -519,8 +517,8 @@
     appendText(wrapper, 'p', `确认删除“${text(state.modal.task.name, state.modal.task.id)}”？删除后不可恢复。`);
     const actions = document.createElement('div');
     actions.className = 'providers-form__actions';
-    actions.appendChild(button('取消', 'btn', closeModal));
-    actions.appendChild(button('确认删除', 'btn btn--danger', async () => {
+    const cancelBtn = button('取消', 'btn', closeModal);
+    const confirmBtn = button('确认', 'btn', async () => {
       try {
         await api.deleteScheduledTask(state.modal.task.id);
         closeModal();
@@ -532,9 +530,11 @@
         state.modal.error = error.message || 'scheduled_task_delete_failed';
         render();
       }
-    }));
+    });
+    actions.append(cancelBtn, confirmBtn);
     wrapper.appendChild(actions);
     parent.appendChild(wrapper);
+    requestAnimationFrame(() => cancelBtn.focus());
   }
 
   const RUN_RESULT_MESSAGES = {

@@ -2,6 +2,7 @@
   const namespace = global.NAGENT || {};
   const ui = namespace.ui;
   const api = namespace.api;
+  const modal = namespace.modal;
   let selectedSite = null;
 
   function riskBadge(level) {
@@ -98,10 +99,10 @@
   function renderToolsTable(container, tools, emptyText) {
     if (!tools.length) { ui.renderEmpty(container, emptyText); return; }
     const table = document.createElement('table');
-    table.className = 'document-table';
+    table.className = 'document-table tools-list-table';
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['名称', '类型', '分组', '描述', '风险等级', '启用', 'Schema'].forEach((label) => {
+    ['名称', '类型', '分组', '描述', '风险等级', '启用', '操作'].forEach((label) => {
       const th = document.createElement('th'); th.textContent = label; headerRow.appendChild(th);
     });
     thead.appendChild(headerRow);
@@ -117,12 +118,16 @@
       badge.className = `badge badge--${riskBadge(tool.risk_level)}`;
       badge.textContent = tool.risk_level;
       td5.appendChild(badge);
-      const td6 = document.createElement('td'); td6.textContent = tool.enabled ? '是' : '否';
+      const td6 = document.createElement('td');
+      const enabledBadge = document.createElement('span');
+      enabledBadge.className = `badge badge--${tool.enabled ? 'success' : 'warning'}`;
+      enabledBadge.textContent = tool.enabled ? '启用' : '停用';
+      td6.appendChild(enabledBadge);
       const td7 = document.createElement('td');
       const schemaBtn = document.createElement('button');
       schemaBtn.type = 'button';
       schemaBtn.className = 'btn';
-      schemaBtn.textContent = '查看';
+      schemaBtn.textContent = '详情';
       schemaBtn.addEventListener('click', () => openSchemaModal(tool));
       td7.appendChild(schemaBtn);
       tr.append(td1, td2, td3, td4, td5, td6, td7);
@@ -164,7 +169,11 @@
     const name = document.createElement('td'); name.textContent = site.name;
     const transport = document.createElement('td'); transport.textContent = site.transport_type;
     const url = document.createElement('td'); url.textContent = site.transport_type === 'stdio' ? `${site.command || '-'} (${(site.args || []).length} args)` : site.url;
-    const enabled = document.createElement('td'); enabled.textContent = site.enabled ? '是' : '否';
+    const enabled = document.createElement('td');
+    const enabledBadge = document.createElement('span');
+    enabledBadge.className = `badge badge--${site.enabled ? 'success' : 'warning'}`;
+    enabledBadge.textContent = site.enabled ? '启用' : '停用';
+    enabled.appendChild(enabledBadge);
     const status = document.createElement('td');
     const badge = document.createElement('span');
     badge.className = `badge badge--${statusBadge(site.last_probe_status)}`;
@@ -182,15 +191,33 @@
     group.className = 'row-actions';
     const edit = actionButton('编辑', () => openSiteModal(site));
     const refresh = actionButton('刷新', async () => { await api.refreshMcpSite(site.id); await refreshMcpSites(); await refreshTools(); await refreshMcpTools(); });
-    const tools = actionButton('查看', () => openSiteTools(site));
+    const toggle = actionButton(site.enabled ? '停用' : '启用', async () => {
+      try {
+        await api.updateMcpSite(site.id, {
+          name: site.name,
+          url: site.url || '',
+          transport_type: site.transport_type,
+          enabled: !site.enabled,
+          command: site.command || null,
+          args: site.args || [],
+          env: site.env || {},
+        });
+        await refreshMcpSites();
+        await refreshTools();
+        await refreshMcpTools();
+      } catch (err) {
+        await modal.alert(`切换失败：${err.message}`);
+      }
+    });
+    const tools = actionButton('详情', () => openSiteTools(site));
     const remove = actionButton('删除', async () => {
-      if (!window.confirm(`删除 MCP 站点 ${site.name}？`)) return;
+      if (!(await modal.confirm(`删除 MCP 站点 ${site.name}？`))) return;
       await api.deleteMcpSite(site.id);
       await refreshMcpSites();
       await refreshTools();
       await refreshMcpTools();
     });
-    group.append(edit, refresh, tools, remove);
+    group.append(toggle, refresh, edit, remove, tools);
     actions.appendChild(group);
     tr.append(name, transport, url, enabled, status, probed, actions);
     return tr;
@@ -257,7 +284,7 @@
     updateTransportFields();
     const actions = document.createElement('div');
     actions.className = 'providers-form__actions';
-    const probe = actionButton('探测', async () => {
+    const probe = actionButton('探活', async () => {
       const result = await api.probeMcpSite(sitePayload(name.input, url.input, select, checkbox, command.input, args.input, env.input));
       openProbeResult(result.tools || []);
     });
@@ -401,12 +428,6 @@
   }
 
   function init() {
-    const refreshBtn = ui.byId('tools-refresh');
-    if (refreshBtn) refreshBtn.addEventListener('click', refreshTools);
-    const mcpRefresh = ui.byId('mcp-sites-refresh');
-    if (mcpRefresh) mcpRefresh.addEventListener('click', refreshMcpSites);
-    const mcpToolsRefresh = ui.byId('mcp-tools-refresh');
-    if (mcpToolsRefresh) mcpToolsRefresh.addEventListener('click', refreshMcpTools);
     const mcpNew = ui.byId('mcp-site-new');
     if (mcpNew) mcpNew.addEventListener('click', () => openSiteModal(null));
     refresh();
