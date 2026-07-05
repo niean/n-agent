@@ -21,8 +21,8 @@ def create_platforms_router(platform_service: PlatformService) -> APIRouter:
     router = APIRouter()
 
     @router.get("/chat/gateways")
-    async def list_platforms(include_local: bool = False):
-        return {"platforms": [_view_to_dict(view) for view in await platform_service.list_platforms(include_local)]}
+    async def list_platforms():
+        return {"platforms": [_view_to_dict(view) for view in await platform_service.list_platforms()]}
 
     @router.get("/chat/gateways/{platform}")
     async def get_platform(platform: str):

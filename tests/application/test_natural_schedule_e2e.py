@@ -191,8 +191,8 @@ class _FakeGatewayRegistry:
     async def delete_session_link(self, session_id):
         return None
 
-    async def mark_event_processed(self, platform, event_id, message_id=""):
-        marker = (platform.value, event_id)
+    async def mark_event_processed(self, source, event_id, message_id=""):
+        marker = (source, event_id)
         if marker in self.processed:
             return False
         self.processed.add(marker)

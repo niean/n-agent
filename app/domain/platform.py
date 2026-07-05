@@ -6,7 +6,6 @@ from typing import Any, Protocol
 
 
 class Platform(str, Enum):
-    CLI = "cli"
     FEISHU = "feishu"
     DINGTALK = "dingtalk"
     WECOM = "wecom"
@@ -14,7 +13,6 @@ class Platform(str, Enum):
 
 class PlatformKind(str, Enum):
     IM = "im"
-    LOCAL = "local"
 
 
 @dataclass(frozen=True)

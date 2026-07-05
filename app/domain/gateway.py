@@ -24,14 +24,25 @@ class GatewayConfirmationAction(str, Enum):
 
 @dataclass(frozen=True)
 class GatewaySessionKey:
-    platform: Platform
+    source: str | Platform
     platform_session_id: str
     thread_id: str = ""
     display_name: str = ""
 
     @property
+    def source_value(self) -> str:
+        return self.source.value if isinstance(self.source, Platform) else str(self.source)
+
+    @property
+    def platform(self) -> Platform | None:
+        try:
+            return Platform(self.source_value)
+        except ValueError:
+            return None
+
+    @property
     def conversation_parts(self) -> tuple[str, str, str]:
-        return (self.platform.value, self.platform_session_id, self.thread_id)
+        return (self.source_value, self.platform_session_id, self.thread_id)
 
 
 @dataclass(frozen=True)
@@ -118,7 +129,7 @@ class GatewaySessionRegistry(Protocol):
     async def delete_session_link(self, session_id: str) -> None:
         ...
 
-    async def mark_event_processed(self, platform: Platform, event_id: str, message_id: str = "") -> bool:
+    async def mark_event_processed(self, source: str, event_id: str, message_id: str = "") -> bool:
         ...
 
     async def set_home_target(self, target: GatewayHomeTarget) -> GatewayHomeTarget:

@@ -43,7 +43,7 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-def create_openai_router(chat_service: ChatCompletionService, model_service: ModelService) -> APIRouter:
+def create_openai_compatible_router(chat_service: ChatCompletionService, model_service: ModelService) -> APIRouter:
     router = APIRouter()
 
     @router.get("/health")

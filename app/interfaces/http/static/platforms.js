@@ -63,7 +63,7 @@
     state.error = '';
     render();
     try {
-      const payload = await api.listPlatforms(true);
+      const payload = await api.listPlatforms();
       state.platforms = payload.platforms || [];
     } catch (error) {
       state.error = error.message || 'platforms_load_failed';

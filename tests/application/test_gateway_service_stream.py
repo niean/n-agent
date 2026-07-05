@@ -48,8 +48,8 @@ class _FakeRegistry:
             if self.active.get(key) == session_id:
                 self.active.pop(key)
 
-    async def mark_event_processed(self, platform: Platform, event_id: str, message_id: str = "") -> bool:
-        marker = (platform.value, event_id)
+    async def mark_event_processed(self, source: str, event_id: str, message_id: str = "") -> bool:
+        marker = (source, event_id)
         if marker in self.processed:
             return False
         self.processed.add(marker)
@@ -141,7 +141,7 @@ class _Harness:
 def _cli_event(text: str, event_id: str = "evt-1") -> InteractionMessage:
     return InteractionMessage(
         id=event_id,
-        session_key=GatewaySessionKey(Platform.CLI, "conv-1", display_name="conv-1"),
+        session_key=GatewaySessionKey("cli", "conv-1", display_name="conv-1"),
         text=text,
         metadata={"actor_id": "cli:conv-1"},
     )
@@ -181,7 +181,7 @@ async def test_handle_message_stream_slash_command_yields_message_done(gateway_s
 @pytest.mark.asyncio
 async def test_handle_message_stream_destructive_yields_confirmation_metadata(gateway_service_with_fake_registry):
     svc, _ = gateway_service_with_fake_registry
-    key = GatewaySessionKey(Platform.CLI, "conv-1", display_name="conv-1")
+    key = GatewaySessionKey("cli", "conv-1", display_name="conv-1")
     await svc.registry.create_session_link(key, "session-1")
     event = _cli_event("/delete", "evt-3")
 
@@ -210,6 +210,43 @@ async def test_handle_message_stream_cli_trusted_metadata_no_feishu_managed(gate
 
     await svc.handle_message_stream(event).__anext__()
     tm = fake_chat.last_trusted_metadata
-    assert tm.get("gateway.platform") == "cli"
+    assert tm.get("gateway.source") == "cli"
+    assert "gateway.platform" not in tm
     permitted = fake_chat.last_permitted_managed_tools or set()
     assert "manage_schedule" not in permitted
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_applies_caller_overrides(gateway_service_with_fake_registry):
+    svc, fake_chat = gateway_service_with_fake_registry
+    key = GatewaySessionKey("acp", "acp-1", display_name="acp-1")
+    await svc.registry.create_session_link(key, "acp-1")
+    event = InteractionMessage(
+        id="acp-event-1",
+        session_key=key,
+        text="hello",
+        metadata={"actor_id": "acp:acp-1"},
+    )
+    approval_decider = object()
+
+    events = [
+        e async for e in svc.handle_message_stream(
+            event,
+            model_override="acp-model",
+            options_override={"execution_context_mode": "realtime"},
+            trusted_metadata_override={"acp.cwd": "/workspace", "agent_context": "primary"},
+            approval_decider=approval_decider,
+            allowed_confirm_tools_override={"manage_schedule": "session"},
+        )
+    ]
+
+    assert events[-1].type == ChatEventType.DONE
+    request = fake_chat.requests[0]
+    assert request.model == "acp-model"
+    assert request.session_id == "acp-1"
+    assert request.options == {"execution_context_mode": "realtime"}
+    assert request.trusted_metadata["gateway.source"] == "acp"
+    assert request.trusted_metadata["acp.cwd"] == "/workspace"
+    assert request.trusted_metadata["agent_context"] == "primary"
+    assert request.approval_decider is approval_decider
+    assert request.allowed_confirm_tools_override == {"manage_schedule": "session"}

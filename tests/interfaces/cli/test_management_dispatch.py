@@ -163,7 +163,7 @@ def test_get_management_completions_includes_all_domains():
 def test_repl_rewrite_sessions_injects_conversation_id():
     from app.interfaces.cli.repl import ReplRunner
 
-    runner = ReplRunner(gateway_client=None, console=None, conversation_id="conv-123", is_tty=False)
+    runner = ReplRunner(chat_adapter=None, console=None, conversation_id="conv-123", is_tty=False)
     assert runner._rewrite_sessions_command("/sessions") == "/sessions --conversation-id conv-123"
     assert runner._rewrite_sessions_command("/sessions --browse") == "/sessions --browse --conversation-id conv-123"
 
@@ -171,7 +171,7 @@ def test_repl_rewrite_sessions_injects_conversation_id():
 def test_repl_rewrite_sessions_preserves_explicit_conversation_id():
     from app.interfaces.cli.repl import ReplRunner
 
-    runner = ReplRunner(gateway_client=None, console=None, conversation_id="conv-123", is_tty=False)
+    runner = ReplRunner(chat_adapter=None, console=None, conversation_id="conv-123", is_tty=False)
     result = runner._rewrite_sessions_command("/sessions --conversation-id other-conv")
     assert result == "/sessions --conversation-id other-conv"
 
@@ -179,7 +179,7 @@ def test_repl_rewrite_sessions_preserves_explicit_conversation_id():
 def test_repl_rewrite_sessions_preserves_explicit_no_interactive():
     from app.interfaces.cli.repl import ReplRunner
 
-    runner = ReplRunner(gateway_client=None, console=None, conversation_id="conv-123", is_tty=False)
+    runner = ReplRunner(chat_adapter=None, console=None, conversation_id="conv-123", is_tty=False)
     result = runner._rewrite_sessions_command("/sessions --browse --no-interactive")
     assert "--conversation-id conv-123" in result
     assert result.count("--no-interactive") == 1
@@ -188,7 +188,7 @@ def test_repl_rewrite_sessions_preserves_explicit_no_interactive():
 def test_repl_rewrite_sessions_does_not_touch_other_commands():
     from app.interfaces.cli.repl import ReplRunner
 
-    runner = ReplRunner(gateway_client=None, console=None, conversation_id="conv-123", is_tty=False)
+    runner = ReplRunner(chat_adapter=None, console=None, conversation_id="conv-123", is_tty=False)
     assert runner._rewrite_sessions_command("/provider list") == "/provider list"
     assert runner._rewrite_sessions_command("/status") == "/status"
     assert runner._rewrite_sessions_command("/skill list") == "/skill list"

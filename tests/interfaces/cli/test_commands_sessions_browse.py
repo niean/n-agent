@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from app.domain.gateway import GatewaySessionLink
-from app.domain.platform import Platform
 from app.interfaces.cli.commands import sessions
 
 
@@ -61,14 +60,15 @@ def test_sessions_browse_no_links_prints_empty(monkeypatch, capsys):
     assert out.strip() == "[]"
 
 
-def test_sessions_browse_calls_list_session_links_with_cli_platform(monkeypatch):
+def test_sessions_browse_calls_list_session_links_with_cli_source(monkeypatch):
     services = _FakeServices([_link()])
     monkeypatch.setattr(sessions, "_build_services", lambda: services)
     rc = sessions.run(_make_args(browse=True, no_interactive=True))
     assert rc == 0
     assert len(services.gateway_registry.calls) == 1
     key = services.gateway_registry.calls[0]
-    assert key.platform is Platform.CLI
+    assert key.source_value == "cli"
+    assert key.platform is None
     assert key.platform_session_id == "local"
 
 

@@ -230,12 +230,13 @@
 - NFR
     - 知识：Dashboard，知识工具干掉按钮`刷新描述`
     - 网关：Dashboard，平台改名为网关(Gateway)，Dashboard、代码、文档等所有地方彻底修改
+    - 知识：ragflow-kb，probe失败，帮修复(原因：Ragflow资源被限制、无法启动)
 - FR
-    - 平台：[KF]实现生产级TUI功能，对标Hermes
+    - TUI：[KF]实现生产级TUI功能，对标Hermes
         - 要求：参照HermesAgent实现，源码/Users/niean/code/github.com/niean/hermes-agent
         - 审阅：发现并修复严重问题(20个)，spec-260704-cli-experience.md
         - 验收：我应该如何验收TUI(CLI)？给出功能验收的列表
-    - 平台：TUI补全领域命令。包括领域能力管理子命令（provider/knowledge/mcp/schedule/sandbox/memory/platform CRUD CLI）、运维子命令（doctor/config/logs）、sessions browse picker
+    - TUI：TUI补全领域命令。包括领域能力管理子命令（provider/knowledge/mcp/schedule/sandbox/memory/platform CRUD CLI）、运维子命令（doctor/config/logs）、sessions browse picker
         - 要求：参照HermesAgent实现，源码/Users/niean/code/github.com/niean/hermes-agent
         - 审阅：发现并修复严重问题(20个)，spec-260704-cli-commands.md
             - < spec文件已修改，请审阅
@@ -248,7 +249,7 @@
         - 迭代：cmd输出结果格式，默认json，可通过flag指定 --json(no-op) --form --yaml
         - 迭代：chat slash cmd输入第一个字母后就没有动态提示了，二级子命令则能多单次补全
         - 文档：README.md，声明`单次执行cmd`都有对应的`chat slash cmd`，只介绍chat slash cmd
-    - 平台：[KF]支持ACP服务端(Agent Client Protocol)，注意 N-Agent在Pod部署、访问发起方VsCode插件在宿主
+    - ACP：[KF]支持ACP服务端(Agent Client Protocol)，注意 N-Agent在Pod部署、访问发起方VsCode插件在宿主
         - 要求：参照HermesAgent实现，源码/Users/niean/code/github.com/niean/hermes-agent
         - 配置：vscode配置 docker exec -i n-agent-n-agent-1 n-agent acp
         - 审阅：发现并修复严重问题(20+个)，spec-260704-acp-server.md
@@ -259,15 +260,22 @@
         - 验收：生成验收事项和文件，spec/verify/verify-260704-acp-server.md，要求 ①只包含端到端的人工验收项，禁止已自动验收项 ②分组List ③禁用视觉效果格式如加粗强调emoji表情
         - 迭代：acp的session id 25e0b02ecf8c46daa7c7bf4baca34dbd，违反命名规范、修正之
 
-
+[20260705]
+- NFR
+    - 治理：入口适配器改名，对齐DDD规范
+    - 平台：Dashboard平台，全面干掉CLI(Local)、不要这个概念/抽闲了，混淆太严重
+    - 会话：来源gw/feishu改为feishu，代码、文档、数据库都要修改
+    - 对话：Chat，默认关闭系统builtin记忆
+- FR
+    - ACP：验收和迭代
+        - 迭代：ACP，用户消息session/prompt等走GatewayService → ChatCompletionService链路，ACP协议生命周期保留在ACP适配器，对齐飞书IM、TUI
 
 ---
 
 [待办]
 - Issue
-    - 知识：ragflow-kb，probe失败，帮修复
 - NFR
-    - 文档：TUI执行链路
+    - 文档：TUI链路，ACP链路
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe

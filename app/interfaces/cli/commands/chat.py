@@ -4,7 +4,7 @@ import asyncio
 import sys
 from typing import Any
 
-from app.interfaces.cli.gateway_client import GatewayCliClient
+from app.interfaces.cli.cli_chat_adapter import CliChatAdapter
 from app.interfaces.cli.render import make_console, render_markdown, render_status
 from app.interfaces.cli.repl import ReplRunner
 from app.interfaces.cli.streaming import consume_stream
@@ -24,7 +24,7 @@ def run(args) -> int:
 
     services = _build_services()
     console = make_console()
-    client = GatewayCliClient(services.gateway_service)
+    client = CliChatAdapter(services.gateway_service)
 
     if args.message:
         return asyncio.run(_send_once(client, args.message, conversation_id, args.no_stream, console))
@@ -39,7 +39,7 @@ def run(args) -> int:
     return asyncio.run(_run_repl(client, console, conversation_id))
 
 
-async def _send_once(client: GatewayCliClient, text: str, conversation_id: str, no_stream: bool, console: Any) -> int:
+async def _send_once(client: CliChatAdapter, text: str, conversation_id: str, no_stream: bool, console: Any) -> int:
     if no_stream:
         resp = await client.send(text, conversation_id)
         for msg in resp.messages:
@@ -49,6 +49,6 @@ async def _send_once(client: GatewayCliClient, text: str, conversation_id: str, 
     return await consume_stream(stream, console)
 
 
-async def _run_repl(client: GatewayCliClient, console: Any, conversation_id: str) -> int:
+async def _run_repl(client: CliChatAdapter, console: Any, conversation_id: str) -> int:
     runner = ReplRunner(client, console, conversation_id=conversation_id, is_tty=sys.stdout.isatty())
     return await runner.run()

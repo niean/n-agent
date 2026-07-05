@@ -293,7 +293,7 @@
       // 新建会话：重置外部记忆操作标记，后续请求由后端按默认 profile 派生
       externalMemoryTouched = false;
     }
-    // Chat 会话默认开启 builtin 记忆，外部记忆需用户手动勾选。
+    // Chat 会话默认关闭 builtin 记忆，外部记忆需用户手动勾选。
     renderExternalMemoryUI();
     showEmptyState();
     updateInfo({});
@@ -373,7 +373,7 @@
       metadata: { session_id: currentSessionId },
     };
     // 仅当用户在本会话中操作过外部记忆勾选时才携带 options.external_memory_enabled；
-    // 未操作时不发送该字段，由后端按会话默认 profile 派生（builtin 默认开启）。
+    // 未操作时不发送该字段，由后端按会话默认 profile 派生（builtin 默认关闭）。
     if (externalMemoryTouched) {
       body.options = { external_memory_enabled: getExternalMemoryEnabled() };
     }
@@ -519,13 +519,13 @@
     const locked = sessionConfig?.locked === true;
     desc.textContent = locked
       ? '此会话的外部记忆已锁定。切换文件记忆请新建会话'
-      : '此配置首轮发送后锁定。builtin 默认开启，文件记忆最多选择 1 个';
+      : '此配置首轮发送后锁定。builtin 默认关闭，文件记忆最多选择 1 个';
 
     const checkboxes = document.createElement('div');
     checkboxes.className = 'chat-external-memory__checkboxes';
 
     const useSessionConfig = sessionConfig?.modified === true;
-    const enabledProviders = useSessionConfig ? sessionConfig.providers : ['builtin'];
+    const enabledProviders = useSessionConfig ? sessionConfig.providers : [];
 
     // 按 slot 过滤出可见 provider，保留原始顺序
     const visibleProviders = externalMemoryProviders.filter(p => {
@@ -580,7 +580,7 @@
       if (useSessionConfig) {
         cb.checked = enabledProviders.includes(p.name);
       } else {
-        cb.checked = p.name === 'builtin';
+        cb.checked = false;
       }
 
       div.appendChild(cb);
@@ -673,7 +673,7 @@
 
   function getExternalMemoryEnabled() {
     const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig;
-    if (!config?.modified) return ['builtin'];
+    if (!config?.modified) return [];
     return config.providers;
   }
 
@@ -694,7 +694,7 @@
     }
     if (locked) {
       sessionExternalMemoryConfig[session.id] = {
-        providers: ['builtin'],
+        providers: [],
         slots: null,
         modified: true,
         locked: true

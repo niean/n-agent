@@ -244,7 +244,7 @@ async def test_chat_service_locks_external_memory_on_first_turn(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_chat_service_locks_legacy_session_to_builtin(tmp_path):
+async def test_chat_service_locks_legacy_session_to_empty_profile(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s-legacy"))
     await store.append_message("s-legacy", ConversationMessage(role="user", content="old"))
@@ -263,8 +263,8 @@ async def test_chat_service_locks_legacy_session_to_builtin(tmp_path):
 
     session = await store.get_session("s-legacy")
     assert session is not None
-    assert session.external_memory_enabled == ["builtin"]
-    assert runner.options["external_memory_enabled"] == ["builtin"]
+    assert session.external_memory_enabled == []
+    assert runner.options["external_memory_enabled"] == []
 
 
 class StubTitleGenerator:

@@ -20,7 +20,7 @@ Agent Runtime
 │   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
 │   ├── MCP：MCP site 注册与工具同步，把远程 MCP server 工具暴露给 LLM 调用
 │   ├── Plugin：预留工具适配入口
-│   ├── Platform/Gateway：CLI、飞书等交互的平台抽象、生命周期管理
+│   ├── Platform/Gateway：飞书等外部消息平台抽象、生命周期管理；CLI/TUI 仅作为终端聊天入口来源
 │   └── Sandbox：受控Python代码执行子域execute_code
 └── 通用子域
     └── Environment：模型、存储、文件、网络等外部资源边界
@@ -480,8 +480,25 @@ erDiagram
 - 失败语义：sandbox 异常转成 `ToolResult(ERROR)`，不打断 AgentGraph。
 </details>
 
+## 用户接口
+
+#### 入口类型
+
+N-Agent 入口类型有如下几类。其中，管理API不进入 Agent Runtime 应用层；OpenAI 兼容对话 API 直接进入 ChatCompletionService；飞书 IM、TUI/CLI、ACP 的用户消息先经 GatewayService 统一做入口会话、消息管理，再进入 ChatCompletionService。ACP协议生命周期保留在 NAgentACPAgent 中。定时任务执行由 SchedulerRunner 定时触发，并通过 ScheduleRunService->ScheduledAgentExecutor 直接调用 ChatCompletionService，执行结果再由 ScheduleOutboundDelivery 投递。
+
+| 入口  | 传输协议 | 编码协议 | 适配器 | 应用层 | 适配器源文件 |
+|------|---------|----------|-------|-------|------------|
+| Dashboard 管理 API | HTTP | JSON | create_*\_router / register_*\_routes | 不进入 Agent Runtime | app/interfaces/http/ |
+| OpenAI 兼容对话 API | HTTP/SSE | JSON | create_openai_compatible_router | ChatCompletionService | app/interfaces/http/openai_compatible.py |
+| 飞书 IM 长连接 | WebSocket | JSON | FeishuImAdapter | GatewayService → ChatCompletionService | app/interfaces/feishu_im_adapter.py |
+| TUI/CLI Chat | Stdio | 行式文本 | CliChatAdapter | GatewayService → ChatCompletionService | app/interfaces/cli/ |
+| ACP Agent | Stdio | JSON | NAgentACPAgent | GatewayService → ChatCompletionService | app/interfaces/cli/commands/acp/ |
+| 定时任务执行 | - | - | SchedulerRunner | ScheduleRunService → ChatCompletionService | app/application/scheduler_runner.py |
+
+
 ---
 待整理分界线
+
 
 ## 分层边界
 
@@ -561,7 +578,7 @@ ConversationSession
 
 SQLite Memory 默认使用 `sessions.db`。业务上以 session 为中心保存对话上下文；`AgentState` 只表示单次运行状态，不作为 SQLite 聚合根直接持久化。
 
-外部记忆已由 `ExternalMemoryManager` 管理三槽：builtin、multi-project、external-query。新会话默认只启用 builtin，检索记忆需显式勾选。
+外部记忆已由 `ExternalMemoryManager` 管理三槽：builtin、multi-project、external-query。新会话默认不启用任何外部记忆；builtin、文件记忆和检索记忆都需显式勾选。
 
 ## Action 业务关系
 

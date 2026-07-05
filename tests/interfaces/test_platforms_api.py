@@ -63,7 +63,6 @@ class FakeGatewayRegistry:
 def _client():
     platform_registry = InMemoryPlatformRegistry(
         [
-            PlatformDescriptor(Platform.CLI, "CLI", PlatformKind.LOCAL, {}),
             PlatformDescriptor(Platform.FEISHU, "飞书", PlatformKind.IM, {"app_id_suffix": "cli_****"}),
         ],
         {Platform.FEISHU: FakeLifecycle(connected=True)},
@@ -83,11 +82,11 @@ def test_list_gateways_excludes_local_by_default():
     assert payload["platforms"][0]["session_count"] == 2
 
 
-def test_list_gateways_can_include_local():
-    response = _client().get("/chat/gateways?include_local=true")
+def test_list_gateways_returns_only_registered_external_platforms():
+    response = _client().get("/chat/gateways")
 
     assert response.status_code == 200
-    assert {item["platform"] for item in response.json()["platforms"]} == {"cli", "feishu"}
+    assert [item["platform"] for item in response.json()["platforms"]] == ["feishu"]
 
 
 def test_get_gateway_detail_and_sessions_mask_platform_session_id():

@@ -121,7 +121,7 @@ N-Agent 拥有知识检索 SPI，`search_knowledge` safe tool 按 LLM 显式传�
 - 摘要策略先简单可替换，后续可升级为模型驱动压缩、session search 和长期 Memory。
 - AgentGraph 中用于跨节点传递的一次性状态（如 tool_results）在写入 MemoryStore 后必须清空，避免后续节点循环重复持久化同一运行事件。
 - Chat Session 的外部记忆选择是上下文契约，不是普通 UI 偏好：首轮发送前可选择，首轮后由 `sessions.external_memory_enabled_json` 锁定，后续轮次必须使用同一 profile。
-- 默认 profile 是 `["builtin"]`；文件记忆最多选择一个，可与系统记忆（builtin）同时启用。已有历史消息但没有锁定值的 legacy session 首次触达时锁定到 `["builtin"]`。
+- 默认 profile 是 `[]`；系统记忆（builtin）和文件记忆都需首轮前显式勾选。文件记忆最多选择一个，可与系统记忆（builtin）同时启用。已有历史消息但没有锁定值的 legacy session 首次触达时锁定到 `[]`。
 - 锁定原因：外部记忆会进入 system prompt 或当前轮 memory context，若同一 session 中途切换，会改变 provider message 前缀，降低 LLM prefix cache 命中率，并让历史回答与新文件记忆混用。
 - 前端可以禁用 checkbox 做体验约束，但不能作为可信来源；真正的锁定必须在 Application/MemoryStore 边界执行，Dashboard 刷新或多 tab 也必须以服务端 session detail 为准。
 
@@ -189,12 +189,12 @@ N-Agent 拥有知识检索 SPI，`search_knowledge` safe tool 按 LLM 显式传�
 ChatCompletionService 首轮锁定 `external_memory_enabled` 时，需区分"客户端未传字段"与"客户端显式传 ['builtin']"。检索记忆 provider 的 active（装载 adapter）与 enabled（per-session 使用）解耦：active 是使用前提但不自动启用，是否使用交给对话页 per-session 勾选。
 
 规则：
-- 派生优先级：(1) session 已有锁定值 → 沿用；(2) legacy session（已有历史消息但无锁定值）→ `["builtin"]`；(3) `has_override=True`（`options` 中存在 `external_memory_enabled` 键）→ 归一化 requested_memory；(4) 未传字段 → `["builtin"]`。未传字段不再自动纳入 active external-query provider，统一默认 builtin。
-- `has_override` 用字段存在性判断（`"external_memory_enabled" in request.options`），不能依赖 `_normalize_external_memory_enabled(None)` 与 `_normalize_external_memory_enabled(["builtin"])` 返回值相同来区分——两者都返回 `["builtin"]`，会丢失"未传"信号。
+- 派生优先级：(1) session 已有锁定值 → 沿用；(2) legacy session（已有历史消息但无锁定值）→ `[]`；(3) `has_override=True`（`options` 中存在 `external_memory_enabled` 键）→ 归一化 requested_memory；(4) 未传字段 → `[]`。未传字段不自动启用 builtin，也不自动纳入 active external-query provider。
+- `has_override` 用字段存在性判断（`"external_memory_enabled" in request.options`），区分"未传字段"与"显式传空数组/显式传 ['builtin']"，避免把 UI 默认状态误当作用户选择。
 - `ActiveExternalMemoryReader` 端口保留（`ExternalMemoryProviderService.get_active_provider_names` 读 manager 内存、无 IO），但不再消费于默认 profile 派生；接口留存供未来别处使用。
 - 检索记忆 provider 的 per-session 启用复用现有 `enabled_override` 机制：`_is_enabled(name, override)` 当 override 含 external-query provider 名时返回 True，无需改 SPI。
 - `ExternalMemoryManager.list_providers()` 对 external-query slot 的 active provider 输出 `{"name", "enabled_global": False, "slot": "external-query", "active": True}`；`enabled_global` 恒为 False（不走 global_config），`active` 表示 adapter 已装载。builtin/multi-project 不输出 `active` 字段。
-- 前端 chat.js 勾选区：external-query slot 的 provider 仅当 `active` 时显示（不依赖 `enabled_global`），默认不勾；互斥按 slot 分组，仅 multi-project 之间互斥（文件记忆最多 1 个），external-query 与 multi-project 可共存。checkbox 带 `data-slot` 属性。`externalMemoryTouched` 标志：用户未操作时不发送 `options.external_memory_enabled` 字段，操作后发送显式值。
+- 前端 chat.js 勾选区：builtin 与 external-query slot 的 provider 默认都不勾选；external-query 仅当 `active` 时显示（不依赖 `enabled_global`）。互斥按 slot 分组，仅 multi-project 之间互斥（文件记忆最多 1 个），external-query 与 multi-project 可共存。checkbox 带 `data-slot` 属性。`externalMemoryTouched` 标志：用户未操作时不发送 `options.external_memory_enabled` 字段，操作后发送显式值。
 
 陷阱：让 active 自动纳入默认 profile 会混淆"装载"与"使用"，用户既看不见也关不掉检索记忆 provider；前端用 `enabled_global` 过滤 external-query provider 会导致其永不显示（不走 global_config）；检索记忆与文件记忆纳入同一互斥规则会阻止两者共存，违背 fact 库与 markdown 知识各司其职的设计。
 
@@ -271,9 +271,9 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 后台任务（定时任务等）回投到 IM 平台时，按 `DeliveryTarget.context.platform` 路由到对应平台 client；Dashboard 平台页通过 PlatformService 读取 PlatformRegistry 与 GatewaySessionRegistry，不直接读 SQLite。
 
 规则：
-- `Platform` 是 CLI、feishu、dingtalk、wecom 的统一领域枚举；GatewaySessionKey 使用 platform/platform_session_id/thread_id 作为 conversation key。
+- `Platform` 面向 feishu、dingtalk、wecom 等外部消息平台；GatewaySessionKey 使用 source/platform_session_id/thread_id 作为 conversation key。CLI/TUI 终端聊天使用 source=`cli`，不进入 PlatformRegistry，也不出现在 Dashboard 平台页。
 - `PlatformRegistry` 提供 descriptor 与 lifecycle；Application 的 PlatformService 合成 status、session_count、last_active_at、active_sessions 等只读视图。
-- `FeishuLongConnectionGateway` 是飞书入口适配器，同时实现 PlatformLifecycle；start() 先标记 connected，listen_events 正常返回后标记 disconnected，异常时写入 fatal("feishu_listen_error", message) 并继续抛出。
+- `FeishuImAdapter` 是飞书入口适配器，同时实现 PlatformLifecycle；start() 先标记 connected，listen_events 正常返回后标记 disconnected，异常时写入 fatal("feishu_listen_error", message) 并继续抛出。
 - `ScheduleOutboundDelivery.deliver` 只判断 `platform`：feishu 则调用注入的 FeishuClient.send_text；缺失或未知 platform 返回 failed，不做 receive_id 启发式回退。
 - Gateway `_build_trusted_metadata` 必须写入 `gateway.platform` 与顶级 `platform`；Tool 落库 origin 时一并保存 platform/receive_id/receive_id_type/thread_id 四元组，跨 origin 操作统一返回 task not found。
 - Gateway 支持平台级 home target：`/sethome` 更新 GatewaySessionRegistry 中当前 platform 的 home chat；`/schedule add` 创建 Feishu/平台 origin 任务时保存 `target=home` 逻辑引用而不是固定当前聊天会话。
@@ -308,7 +308,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 
 ## 模式十六：会话来源与 ID 前缀命名规则
 
-会话 `source` 字段和 `session_id` 前缀必须一一对应，体现入口/触发方式。来源格式 `{一级}[/{二级}]`，一级表示触发方式（5 类），二级仅 `gw` 一级展开表示 IM 平台适配器。
+会话 `source` 字段和 `session_id` 前缀必须一一对应，体现入口/触发方式。来源格式为单一一级，无二级；IM 平台直接作为一级来源，与其它入口同级。
 
 一级来源：
 
@@ -317,27 +317,34 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 | dashboard | Web 控制台 | dashboard | dashboard- |
 | api | 非 dashboard 的 HTTP API（如 OpenWebUI 兼容接口） | api | api- |
 | cli | 本地命令行 | cli | cli- |
-| gw | IM 网关通道 | gw/{平台} | gw- |
+| feishu | 飞书 IM | feishu | feishu- |
+| dingtalk | 钉钉 IM | dingtalk | dingtalk- |
+| wecom | 企业微信 IM | wecom | wecom- |
+| acp | ACP stdio 客户端 | acp | acp- |
 | schedule | 定时触发 | schedule | schedule- |
 
-二级来源（仅 gw）：`gw/feishu`、`gw/dingtalk`、`gw/wecom`。二级不进 session_id 前缀，只在 source 字段体现。
-
 规则：
-- session_id 前缀严格等于一级名，UUID 跟在连字符后（如 `dashboard-{uuid}`、`gw-{uuid}`）。
-- CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 `gw/`。GatewayService 通过 `_session_id_prefix_and_source(platform)` 分流：`Platform.CLI` → (`cli`, `cli`)，其它 IM 平台 → (`gw`, `gw/{platform.value}`)。
-- 二级只在 `gw` 下展开。`schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
+- session_id 前缀严格等于一级名，UUID 跟在连字符后（如 `dashboard-{uuid}`、`feishu-{uuid}`）。
+- CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 IM 平台一级。GatewayService 通过 GatewaySessionKey.platform 分流：source=`cli` → (`cli`, `cli`)，真实 IM 平台 → (`{platform.value}`, `{platform.value}`)。
+- `schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
 - Dashboard 前端生成 session_id 用 `crypto.randomUUID()`（fallback `Date.now()+random`），不用 `Date.now()` 时间戳（碰撞风险）。
 
 历史数据迁移：
 - `SQLiteMemoryStore.migrate_session_id_prefixes()` 在 `build_application_services` 末尾（所有 registry 初始化后）调用，幂等。
-- 旧 → 新映射：`session-`→`dashboard-`(source=dashboard)、`tmp-`→`api-`(source=api)、source `local`→`cli`(id 补 `cli-` 前缀)、source `feishu/dingtalk/wecom`→`gw/{platform}`(id `gateway-`→`gw-`)、`schedule` 不变。
+- 旧 → 新映射：
+  - `session-`→`dashboard-`(source=dashboard)
+  - `tmp-`→`api-`(source=api)
+  - source `local`→`cli`(id 补 `cli-` 前缀)
+  - source `feishu/dingtalk/wecom`+id `gateway-`→`{platform}-`(source={platform})（更早格式）
+  - source `gw/feishu`/`gw/dingtalk`/`gw/wecom`+id `gw-`→`{platform}-`(source={platform})（spec-260702 格式）
+  - `schedule`/`acp` 不变
 - 级联更新 11 张 session_id 引用表：messages、tool_calls、task_states、summaries、sandbox_execution_history、sandbox_released_history、scheduled_tasks、scheduled_task_executions、gateway_session_links、gateway_conversations(active_session_id)。
 - 碰撞保护：新 id 已被其它 session 占用时跳过该条并 warning。
 - 外部记忆服务（honcho/mem0）按旧 session_id 索引的上下文不迁移，迁移后旧会话的外部记忆上下文丢失，新会话不受影响。
 
 陷阱：
-- 把 schedule 当成 `http` 的二级（`http/schedule`）会混淆"触发方式"和"IM 平台"两个维度，扩展到 `http/openwebui`、`http/webhook`、`gw/wx` 时维度越来越乱。正确做法：一级只放触发方式，二级只放 IM 平台。
-- session_id 前缀与 source 脱节（如 dashboard 用 `session-`、api 用 `tmp-`、gw 用 `gateway-`）会导致会话列表无法直接从 id 归因入口，必须查 source 字段。前缀严格等于一级名即可。
+- 把 IM 平台归入 `gw/` 二级会混淆"触发方式"和"IM 平台"两个维度，扩展到 `gw/webhook`、`gw/wx` 时维度越来越乱。正确做法：IM 平台直接作为一级，与 dashboard/api/cli/acp/schedule 同级。
+- session_id 前缀与 source 脱节（如 dashboard 用 `session-`、api 用 `tmp-`、IM 用 `gateway-`）会导致会话列表无法直接从 id 归因入口，必须查 source 字段。前缀严格等于一级名即可。
 - `delete_session` 级联未覆盖 `scheduled_task_executions`、`sandbox_execution_history`、`sandbox_released_history`，删 session 后这 3 张表会留下孤儿行（与命名规则无关，但同属 session_id 引用完整性问题）。
 
 ## 模式十七：Plugin 子系统 Hermes 兼容装配与工具面路由
@@ -418,11 +425,11 @@ secret 脱敏约定：
 - config 子命令遍历 Settings 字段，字段名含 `api_key`/`secret`/`password`/`token` 或以 `_key` 结尾时输出 `{field}_present: bool`
 
 sessions `--browse` picker：
-- TTY + 无 `--pick`：调 `gateway_registry.list_session_links(GatewaySessionKey(Platform.CLI, conversation_id))` 取结构化 `GatewaySessionLink` 列表，prompt_toolkit Application + fuzzy filter，选中后调 `session_service.get_session_detail(id)` 渲染
+- TTY + 无 `--pick`：调 `gateway_registry.list_session_links(GatewaySessionKey("cli", conversation_id))` 取结构化 `GatewaySessionLink` 列表，prompt_toolkit Application + fuzzy filter，选中后调 `session_service.get_session_detail(id)` 渲染
 - 非 TTY 或 `--no-interactive`：降级为 rich 表格输出 session link 列表
 - `--pick <id>`：跳过 picker，直接 `get_session_detail(id)` 渲染
 - Ctrl+C → rc=130
-- 不从 `GatewayCliClient.send("/sessions")` 的 markdown 文本中反解析 session id
+- 不从 `CliChatAdapter.send("/sessions")` 的 markdown 文本中反解析 session id
 
 doctor 检查模式：
 - 8 项检查独立 try/except，每项返回 PASS/WARN/FAIL dict（dimension/status/detail）
@@ -439,7 +446,7 @@ logs 范围限制：
 陷阱：
 - `ChatEvent` 是 `frozen=True` dataclass，`metadata` 必须用 `field(default_factory=dict)` 否则共享可变状态
 - CLI 构造 `InteractionMessage` 时必须注入 `actor_id=cli:{conversation_id}`，否则 `/new` 等破坏性命令会绕过 confirmation 直接执行（actor_id 为空时 preflight 视为无 actor 不需要确认）
-- CLI `trusted_metadata.gateway.platform` 必须为 `"cli"`，`ChatCompletionService._compute_permitted_managed_tools` 据此决定 managed tool 权限，CLI 不得获得 Feishu 专属 managed tool（如 `manage_schedule`）
+- CLI `trusted_metadata.gateway.source` 必须为 `"cli"`，且不得写入 `gateway.platform`；`ChatCompletionService._compute_permitted_managed_tools` 只认可真实平台 `gateway.platform=feishu`，CLI 不得获得 Feishu 专属 managed tool（如 `manage_schedule`）
 - `app.interfaces.cli:main` console script 入口由 `__init__.py` re-export `main`，迁移单文件为 package 时必须删除旧 `cli.py` 避免同名冲突
 
 ## 模式二十：ACP stdio 服务端 stdout 纯净性与路径映射
@@ -468,8 +475,14 @@ ACP session 桥接规则：
 - ACP 客户端重连时通过 `session/load` 恢复会话，元数据从 `sessions.acp_metadata_json` 读取，避免 cwd 丢失
 - `AgentGraphRunner` 支持 task state interrupt 注册与查询，cancel 时通过 `asyncio.CancelledError` 中断 prompt；`stream_events` 节点捕获 CancelledError 后 yield ERROR+DONE，prompt 节点 re-raise
 
+ACP 用户消息桥接规则：
+- `session/prompt` 不直接调用 `ChatCompletionService.complete`；`NAgentACPAgent.prompt` 先把 ACP session 绑定到 `GatewaySessionKey("acp", session_id)`，再构造 `InteractionMessage` 调用 `GatewayService.handle_message_stream`
+- `GatewayService.handle_message_stream` 的 model/options/trusted_metadata/approval override 只用于保留 ACP session metadata 中的 model/mode/cwd、`ACPPermissionBridge` 和 `allowed_confirm_tools`，不把 ACP initialize/auth/session lifecycle 下沉到 GatewayService
+- Gateway session id 前缀/来源映射需显式识别 `source="acp"` 为 `("acp", "acp")`，避免 ACP 内部 `/new` 等 Gateway 命令误建 `cli-*` 会话
+
 ACP event bridge 规则：
 - `ACPEventBridge` 把 N-Agent `ChatEvent` 转换为 ACP session update（user_message_chunk/agent_message_chunk/tool_call/tool_call_update）；用 `getattr(update, "session_update", None)` 做 type discrimination（不能用 isinstance，因 SDK 类型在 conftest sys.modules workaround 后可能未被稳定引用）
+- `MESSAGE_DONE` 默认表示完成状态不发 update；但当 Gateway slash/destructive preflight 在 `MESSAGE_DONE.content` 携带用户可见文案时，必须转成 ACP agent_message_chunk，否则 ACP 客户端看不到命令响应或确认提示
 - `replay_history` 在 `session/load` 时把历史 messages 重放为 user_message_chunk + agent_message_chunk，让 ACP 客户端看到完整对话上下文
 - 工具调用事件通过 `acp.start_tool_call` / `acp.update_tool_call` SDK helper 发射，ToolCallStatus 取 pending/in_progress/completed/failed
 
@@ -480,4 +493,3 @@ ACP event bridge 规则：
 - ACP SDK `update_tool_call` 返回 `ToolCallProgress`（`ToolCallUpdate` 子类），`Client.request_permission(tool_call: ToolCallUpdate)` 接受该返回值；不要用 `isinstance(update, ToolCallUpdate)` 做类型判断，SDK 类型在 conftest workaround 后可能不稳定
 - stdout 纯净性测试用 subprocess PIPE 捕获会因 ACP SDK asyncio write transport 与 pipe 交互挂起，必须用临时文件捕获 stdout
 - `ChatCompletionInput` 扩展新字段必须用 additive defaults（`None`），避免破坏既有调用方；`approval_decider=None` 时 `ChatCompletionService` 不覆盖 ctx.approval_decider
-

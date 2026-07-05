@@ -25,13 +25,11 @@ def _settings(tmp_path: Path, *, feishu_enabled: bool) -> Settings:
     )
 
 
-def test_build_application_services_wires_cli_only_platform_when_feishu_disabled(tmp_path: Path):
+def test_build_application_services_wires_no_platform_when_feishu_disabled(tmp_path: Path):
     services = build_application_services(_settings(tmp_path, feishu_enabled=False))
 
-    assert services.feishu_long_connection_gateway is None
-    platforms = services.platform_registry.list()
-    assert [descriptor.platform for descriptor in platforms] == [Platform.CLI]
-    assert platforms[0].kind is PlatformKind.LOCAL
+    assert services.feishu_im_adapter is None
+    assert services.platform_registry.list() == []
     assert services.platform_registry.get_lifecycle(Platform.FEISHU) is None
 
 
@@ -47,5 +45,5 @@ def test_build_application_services_wires_feishu_lifecycle_singleton(tmp_path: P
         "allowed_open_id_count": 2,
         "allowed_chat_id_count": 1,
     }
-    assert services.feishu_long_connection_gateway is not None
-    assert services.platform_registry.get_lifecycle(Platform.FEISHU) is services.feishu_long_connection_gateway
+    assert services.feishu_im_adapter is not None
+    assert services.platform_registry.get_lifecycle(Platform.FEISHU) is services.feishu_im_adapter

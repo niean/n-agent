@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、GatewayCliClient、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、CliChatAdapter、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -7,8 +7,8 @@
 - Application Layer：应用层，负责编排用例和 LangGraph 状态图，依赖 Domain 端口，不依赖 Infrastructure 具体实现。
 - ChatEvent：Application 层输出的聊天运行事件，供 Interfaces 层编码为 OpenAI-compatible SSE chunk 或非流式响应；含 `metadata: dict[str, Any]` 字段携带 Gateway confirmation/duplicate 等事件元信息，避免 CLI 解析中文提示文案提取结构化数据。
 - ChatEventType：聊天事件类型枚举，包括 MESSAGE_START、CONTENT_DELTA、TOOL_CALL_DELTA、MESSAGE_DONE、ERROR、DONE；AgentGraphRunner.stream_events 按此顺序产出事件流。
-- GatewayService.handle_message_stream：Gateway 流式接口，`async def handle_message_stream(event) -> AsyncIterator[ChatEvent]`，与 `handle_message` 共享幂等、destructive preflight、session 解析、Slash 分流、默认模型和 trusted metadata 逻辑；destructive preflight 命中时 yield MESSAGE_DONE(finish_reason="confirmation_required", metadata=confirmation) 供 CLI 发起 /confirm 回调。
-- GatewayCliClient：CLI Interfaces 层的 Gateway 客户端，构造 InteractionMessage（注入 `actor_id=cli:{conversation_id}`）并委托 GatewayService.handle_message_stream/handle_message/handle_confirmation；CLI REPL/单次消息/确认操作均通过此客户端。
+- GatewayService.handle_message_stream：Gateway 流式接口，`async def handle_message_stream(event, *, model_override=None, options_override=None, trusted_metadata_override=None, approval_decider=None, allowed_confirm_tools_override=None) -> AsyncIterator[ChatEvent]`，与 `handle_message` 共享幂等、destructive preflight、session 解析、Slash 分流、默认模型和 trusted metadata 逻辑；ACP `session/prompt` 通过 override 保留 ACP model/mode/cwd/permission bridge 语义后复用 Gateway → ChatCompletionService 链路；destructive preflight 命中时 yield MESSAGE_DONE(finish_reason="confirmation_required", metadata=confirmation) 供 CLI 发起 /confirm 回调。
+- CliChatAdapter：CLI Interfaces 层的聊天入口适配器，构造 InteractionMessage（注入 `actor_id=cli:{conversation_id}`）并委托 GatewayService.handle_message_stream/handle_message/handle_confirmation；CLI REPL/单次消息/确认操作均通过此适配器。
 - patch_stdout：prompt_toolkit 提供的 stdout 重定向上下文管理器，REPL 内 rich console.print 必须在 patch_stdout 内执行，避免与 prompt_toolkit 抢占 TTY 导致 TUI 乱屏。
 - Domain Layer：领域层，定义核心业务模型、值对象、领域规则和端口协议，不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或工具 handler。
 - Domain Port：领域层定义的外部能力协议，如 LLMProvider、ToolExecutor、MemoryStore、Summarizer，由 Infrastructure 实现。
@@ -22,8 +22,8 @@
 - N-KB：独立知识库服务，N-Agent 通过 HTTP 检索接口消费其通用知识，不把索引和文档管理能力嵌入自身。
 - OpenAI-compatible API：对外兼容 OpenAI Chat Completions 风格的 HTTP API，用于接入 Open-WebUI 等客户端。
 - Open-WebUI：使用 OpenAI-compatible API 接入模型或 Agent 服务的 Web UI 客户端。
-- Platform：交互平台领域枚举，当前包括 cli、feishu、dingtalk、wecom；用于 Gateway conversation key、trusted_metadata、任务 origin 和 Dashboard 平台视图。
-- PlatformLifecycle：平台运行态端口，提供 is_connected 与 fatal_error；当前 FeishuLongConnectionGateway 实现该端口并由 PlatformRegistry 暴露给 PlatformService。
+- Platform：交互平台领域枚举，面向 feishu、dingtalk、wecom 等外部消息平台；用于真实平台的 trusted_metadata、任务 origin 和 Dashboard 平台视图。CLI/TUI 终端聊天使用 GatewaySessionKey.source=`cli`，不进入 Platform 枚举或 PlatformRegistry。
+- PlatformLifecycle：平台运行态端口，提供 is_connected 与 fatal_error；当前 FeishuImAdapter 实现该端口并由 PlatformRegistry 暴露给 PlatformService。
 - PlatformRegistry：平台注册端口，提供平台 descriptor 与 lifecycle 查询；当前由 InMemoryPlatformRegistry 在 main.py 启动装配时构建。
 - PlatformService：Application 层平台只读用例，组合 PlatformRegistry 与 GatewaySessionRegistry，输出平台状态、配置摘要、会话统计和会话分页。
 - Provider：具体 LLM 服务提供方或协议实现，如 OpenAI-compatible endpoint、Claude、Ollama、OpenRouter。
@@ -48,10 +48,10 @@
 - 文件记忆（multi-project slot）：ExternalMemoryManager 的 multi-project 槽位中文名，对应槽位常量 `_MULTI_PROJECT_SLOT`。按项目子目录管理多组 `{memory,user}.md`，由 `MultiProjectMemory` 实现；通过 `set_enabled_projects` 选择启用项，跨 enabled project 合并打分取全局 top-K，返回文本用 `## Project: {name}` 前缀区分来源。
 - 检索记忆（external-query slot）：ExternalMemoryManager 的 external-query 槽位中文名，对应槽位常量 `_EXTERNAL_QUERY_SLOT`。该槽位承载 query-only provider（mem0/holographic/honcho），at-most-one 约束，由 `swap_external_query_provider` 单独替换，不影响系统记忆/文件记忆槽。
 - 检索记忆 provider（external-query provider）：外部记忆 SPI 中 query-only 的实现，数据非本地 Markdown 文本、无法做静态快照，只能通过 query 走向量/语义检索拿回相关片段。当前支持 mem0（服务端事实库 HTTP）、holographic（本地 SQLite + MemoryRetriever）、honcho（用户建模 dialectic 库 HTTP）。at-most-one 约束：至多一个检索记忆 provider 同时启用。
-- ActiveExternalMemoryReader：Application 层只读端口，`get_active_provider_names() -> list[str]`，读 ExternalMemoryManager 内存状态、无 IO；由 ExternalMemoryProviderService 实现。当前不消费于默认 profile 派生（未传 `external_memory_enabled` 时统一默认 `["builtin"]`，不自动纳入 active 检索记忆 provider），接口留存供未来别处使用。
+- ActiveExternalMemoryReader：Application 层只读端口，`get_active_provider_names() -> list[str]`，读 ExternalMemoryManager 内存状态、无 IO；由 ExternalMemoryProviderService 实现。当前不消费于默认 profile 派生（未传 `external_memory_enabled` 时统一默认 `[]`，不自动启用 builtin 或 active 检索记忆 provider），接口留存供未来别处使用。
 - tool_surface_refresh_failed：activate/swap 返回的布尔标志，标记工具面回调（刷新 ToolService dynamic_definitions + Composite routes）是否失败。回调在 swap_lock 内同步执行，异常不阻塞 swap 本身，仅置标志供 API 响应透传。
 - provider_swapping：ExternalMemoryManager.handle_tool_call 在 swap_lock 持有期间对检索记忆槽工具返回的错误，避免 swap 进行中路由到不一致的工具实现。
-- has_override：ChatCompletionService 首轮 profile 派生时的字段存在性判断（`"external_memory_enabled" in request.options`），区分"客户端未传字段"与"客户端显式传 ['builtin']"。前端 chat.js 维护 `externalMemoryTouched` 标志，未操作时不发送该字段，使后端能派生含 active 检索记忆 provider 的默认 profile。
+- has_override：ChatCompletionService 首轮 profile 派生时的字段存在性判断（`"external_memory_enabled" in request.options`），区分"客户端未传字段"与"客户端显式传 []/['builtin']"。前端 chat.js 维护 `externalMemoryTouched` 标志，未操作时不发送该字段，使后端派生默认空 profile；操作后发送用户显式选择。
 - Plugin：N-Agent 的插件子系统领域聚合，遵循 Hermes plugin 模式（`plugin.yaml` + `register(ctx)` entrypoint），支持零成本移植开源插件生态。Plugin 聚合包含 key/name/version/kind/source/enabled/config/secret_refs/capabilities/manifest 等字段，`to_public_view` 输出 secret_refs 为 `{field: bool}` 占位标记（不含明文）。
 - PluginManifest：Plugin 的值对象，由 `plugin.yaml` 解析而来，包含 name/version/kind/provides_tools/requires_env/config_schema 等字段；`from_yaml(raw, source, key, path)` 接受显式 key 参数（不从路径推导）。
 - PluginContext：Application 层提供给 plugin `register(ctx)` 的上下文对象，`register_tool(name, toolset, schema, handler, check_fn, requires_env, is_async, description, emoji, override)` 与 Hermes 签名兼容；P1/P2 unsupported stub（register_hook/register_cli_command/register_platform 等）记录到 unsupported_capabilities 但不崩扫描。
@@ -62,7 +62,7 @@
 - secret_refs：Plugin 的 secret 字段占位标记，`{field: bool}` 形式，由 SQLitePluginRegistry 查询 plugin_secrets 表填充；API 响应永不返回 secret 明文，前端据此显示"已设置，留空保持不变"提示。
 - ACP (Agent Client Protocol)：Zed Industries 提出的开放协议，基于 JSON-RPC 2.0 over stdio，让编辑器/IDE（VsCode/Zed 等）以 stdio 方式接入外部 Agent runtime。N-Agent 通过 `agent-client-protocol` PyPI 包实现服务端，stdout 承载 JSON-RPC 帧，stderr 走日志。
 - ACP stdio 服务端：N-Agent 内置的 ACP 服务端入口，由 `n-agent acp` 命令启动（无 flag 进入 JSON-RPC 主循环，`--check` 验证依赖可导入，`--setup` 输出 provider 配置提示）。VsCode ACP Client 通过 `docker exec -i n-agent-n-agent-1 n-agent acp` 或 `kubectl exec -i <pod> -- n-agent acp` 接入容器内 Agent。
-- NAgentACPAgent：`app/interfaces/cli/commands/acp/agent.py` 中实现 `acp.Agent` 的类，提供 13 个 SDK 方法（initialize/authenticate/session/new/prompt/load/list/fork/cancel/close_session 等），桥接 ACP 协议与 N-Agent ChatCompletionService。
+- NAgentACPAgent：`app/interfaces/cli/commands/acp/agent.py` 中实现 `acp.Agent` 的类，提供 13 个 SDK 方法（initialize/authenticate/session/new/prompt/load/list/fork/cancel/close_session 等）；ACP 协议生命周期留在此 adapter，`session/prompt` 用户消息转换为 InteractionMessage 后经 GatewayService → ChatCompletionService。
 - 路径映射 (path mapping)：ACP cwd 来自宿主/editor，N-Agent 文件工具运行在容器/Pod，必须通过 `N_AGENT_ACP_HOST_WORKSPACE_ROOT` + `N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT` 环境变量配置映射。映射规则：(1) cwd 在 host root 下时替换前缀为 container root；(2) cwd 已在 container root 下时原样使用；(3) cwd 为空时使用 container root；(4) cwd 不可映射时 `session/new` 拒绝并返回协议错误，不回退到 `Path.cwd()`。
 - ApprovalDecider：Domain 端口（`app/domain/tool.py`），定义工具调用审批决策接口；ACP 服务端通过 `ACPPermissionBridge` 实现，将 N-Agent 的 confirm 工具授权请求转换为 ACP `PermissionOption`（allow_once/allow_always/reject_once/reject_always）让用户在编辑器侧决策。
 - ApprovalRequest / ApprovalDecision：ApprovalDecider 的输入/输出值对象。ApprovalRequest 携带 session_id、tool_name、tool_call_id、arguments 等上下文；ApprovalDecision 携带 allowed 与 scope（once/always/deny）。

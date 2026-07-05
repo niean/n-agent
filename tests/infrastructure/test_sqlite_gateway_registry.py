@@ -25,7 +25,7 @@ async def test_gateway_registry_persists_and_switches_home_target(tmp_path):
 @pytest.mark.asyncio
 async def test_gateway_registry_creates_and_switches_active_session(tmp_path):
     registry = SQLiteGatewaySessionRegistry(tmp_path / "sessions.db")
-    key = GatewaySessionKey(Platform.CLI, "local", display_name="Local CLI")
+    key = GatewaySessionKey("cli", "local", display_name="Local CLI")
 
     first = await registry.create_session_link(key, "session-1")
     second = await registry.create_session_link(key, "session-2")
@@ -142,23 +142,20 @@ async def test_gateway_registry_legacy_migration_is_idempotent(tmp_path):
 async def test_gateway_registry_lists_and_counts_conversations_by_platform(tmp_path):
     registry = SQLiteGatewaySessionRegistry(tmp_path / "sessions.db")
     feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_a", display_name="A")
-    cli_key = GatewaySessionKey(Platform.CLI, "local")
+    cli_key = GatewaySessionKey("cli", "local")
 
     await registry.create_session_link(feishu_key, "s-1")
     await registry.create_session_link(GatewaySessionKey(Platform.FEISHU, "oc_b"), "s-2")
     await registry.create_session_link(cli_key, "s-3")
 
     feishu_convs = await registry.list_conversations(Platform.FEISHU)
-    cli_convs = await registry.list_conversations(Platform.CLI)
     all_convs = await registry.list_conversations()
 
     assert {c.platform_session_id for c in feishu_convs} == {"oc_a", "oc_b"}
     assert {c.platform for c in feishu_convs} == {Platform.FEISHU}
-    assert [c.platform_session_id for c in cli_convs] == ["local"]
-    assert len(all_convs) == 3
+    assert len(all_convs) == 2
 
     assert await registry.count_conversations(Platform.FEISHU) == 2
-    assert await registry.count_conversations(Platform.CLI) == 1
     assert await registry.count_conversations(Platform.DINGTALK) == 0
 
 
@@ -176,7 +173,7 @@ async def test_gateway_registry_get_last_active_returns_max_updated_at(tmp_path)
 @pytest.mark.asyncio
 async def test_gateway_registry_deletes_session_link_and_clears_active(tmp_path):
     registry = SQLiteGatewaySessionRegistry(tmp_path / "sessions.db")
-    key = GatewaySessionKey(Platform.CLI, "local")
+    key = GatewaySessionKey("cli", "local")
     await registry.create_session_link(key, "session-1")
 
     await registry.delete_session_link("session-1")

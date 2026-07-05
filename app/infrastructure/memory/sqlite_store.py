@@ -545,8 +545,12 @@ def _compute_new_session_id_and_source(old_id: str, source: str) -> tuple[str, s
     new_source = source
     if source == "local":
         new_source = "cli"
-    elif source in _IM_PLATFORMS:
-        new_source = f"gw/{source}"
+    elif source.startswith("gw/"):
+        # legacy spec-260702 format: gw/{platform}
+        platform_str = source[len("gw/"):]
+        if platform_str in _IM_PLATFORMS:
+            new_source = platform_str
+    # source already in _IM_PLATFORMS (e.g. "feishu") stays as-is (new format)
 
     # Step 2: normalize id prefix based on new_source
     new_id = old_id
@@ -559,8 +563,13 @@ def _compute_new_session_id_and_source(old_id: str, source: str) -> tuple[str, s
             new_id = "cli-" + old_id[len("gateway-"):]
         elif not old_id.startswith("cli-"):
             new_id = f"cli-{old_id}"
-    elif new_source.startswith("gw/") and old_id.startswith("gateway-"):
-        new_id = "gw-" + old_id[len("gateway-"):]
+    elif new_source in _IM_PLATFORMS:
+        if old_id.startswith("gateway-"):
+            new_id = f"{new_source}-" + old_id[len("gateway-"):]
+        elif old_id.startswith("gw-"):
+            new_id = f"{new_source}-" + old_id[len("gw-"):]
+        elif not old_id.startswith(f"{new_source}-"):
+            new_id = f"{new_source}-{old_id}"
 
     return (new_id, new_source)
 

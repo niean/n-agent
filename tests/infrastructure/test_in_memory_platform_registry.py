@@ -20,16 +20,16 @@ def _feishu_descriptor() -> PlatformDescriptor:
     return PlatformDescriptor(Platform.FEISHU, "飞书", PlatformKind.IM, {"app_id_suffix": "abcd****"})
 
 
-def _cli_descriptor() -> PlatformDescriptor:
-    return PlatformDescriptor(Platform.CLI, "CLI", PlatformKind.LOCAL, {})
+def _dingtalk_descriptor() -> PlatformDescriptor:
+    return PlatformDescriptor(Platform.DINGTALK, "钉钉", PlatformKind.IM, {})
 
 
 def test_list_returns_registered_descriptors():
-    registry = InMemoryPlatformRegistry([_feishu_descriptor(), _cli_descriptor()])
+    registry = InMemoryPlatformRegistry([_feishu_descriptor(), _dingtalk_descriptor()])
 
     platforms = {d.platform for d in registry.list()}
 
-    assert platforms == {Platform.FEISHU, Platform.CLI}
+    assert platforms == {Platform.FEISHU, Platform.DINGTALK}
 
 
 def test_get_returns_specific_descriptor():

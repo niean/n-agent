@@ -24,7 +24,7 @@ def chat_service():
     )
 
 
-def test_no_override_defaults_builtin_only(chat_service):
+def test_no_override_defaults_empty_profile(chat_service):
     # 未传 external_memory_enabled 字段，即使有 active provider 也不纳入
     from app.application.chat_service import ChatCompletionInput
     request = ChatCompletionInput(
@@ -34,7 +34,7 @@ def test_no_override_defaults_builtin_only(chat_service):
     import asyncio
     asyncio.run(chat_service.complete(request))
     args = chat_service.memory_store.lock_session_external_memory.call_args
-    assert args.args[1] == ["builtin"]
+    assert args.args[1] == []
 
 
 def test_explicit_builtin_stays_builtin(chat_service):
@@ -89,7 +89,7 @@ def test_explicit_project_and_external_query_provider_are_both_kept():
     assert args.args[1] == ["builtin", "project_memory_1", "holographic"]
 
 
-def test_no_active_provider_defaults_builtin_only():
+def test_no_active_provider_defaults_empty_profile():
     memory_store = AsyncMock()
     memory_store.lock_session_external_memory = AsyncMock(side_effect=lambda sid, mem, slots=None: mem)
     memory_store.get_session = AsyncMock(return_value=None)
@@ -110,4 +110,4 @@ def test_no_active_provider_defaults_builtin_only():
     import asyncio
     asyncio.run(svc.complete(request))
     args = memory_store.lock_session_external_memory.call_args
-    assert args.args[1] == ["builtin"]
+    assert args.args[1] == []

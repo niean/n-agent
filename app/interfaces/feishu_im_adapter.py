@@ -24,7 +24,7 @@ class FeishuEventClient(Protocol):
     async def listen_events(self, handler) -> None: ...
 
 
-class FeishuLongConnectionGateway:
+class FeishuImAdapter:
     def __init__(self, gateway_service: GatewayService, feishu_client: FeishuEventClient):
         self.gateway_service = gateway_service
         self.feishu_client = feishu_client

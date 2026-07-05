@@ -358,7 +358,6 @@ def _build_platform_parser(subparsers) -> None:
     sub = parser.add_subparsers(dest="platform_command", required=True)
 
     list_p = sub.add_parser("list", help="List platforms")
-    list_p.add_argument("--include-local", action="store_true")
     _add_format_flags(list_p)
 
     get_p = sub.add_parser("get", help="Show a platform")

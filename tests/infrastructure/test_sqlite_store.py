@@ -118,7 +118,7 @@ async def test_delete_session_cascades_related_rows(tmp_path):
     gateway_registry = SQLiteGatewaySessionRegistry(db_path)
     await store.create_session(ConversationSession(id="s-del"))
     msg = await store.append_message("s-del", ConversationMessage(role="user", content="hi"))
-    key = GatewaySessionKey(Platform.CLI, "local")
+    key = GatewaySessionKey("cli", "local")
     await gateway_registry.create_session_link(key, "s-del")
     await store.save_tool_call(
         ToolCall(id="tc-del", session_id="s-del", message_id=msg.id, tool_name="calc", arguments={}, status="success")
@@ -183,3 +183,72 @@ async def test_list_recent_tool_calls_filters_by_name_and_orders_desc(tmp_path):
     # No filter, limit 50 returns all
     all_calls = await store.list_recent_tool_calls(limit=50)
     assert len(all_calls) == 3
+
+
+def test_migrate_session_id_prefixes_flattens_gw_feishu(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    store = SQLiteMemoryStore(db_path)
+
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("gw-abc123", "Old Feishu", "gw/feishu", "2026-07-01T00:00:00+00:00", "2026-07-01T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("msg-1", "gw-abc123", "user", '"hi"', "2026-07-01T00:00:00+00:00"),
+        )
+        conn.commit()
+
+    store.migrate_session_id_prefixes()
+
+    with store._connect() as conn:
+        session = conn.execute("SELECT id, source FROM sessions WHERE id = ?", ("feishu-abc123",)).fetchone()
+        assert session is not None
+        assert session["source"] == "feishu"
+        msg = conn.execute("SELECT session_id FROM messages WHERE id = ?", ("msg-1",)).fetchone()
+        assert msg["session_id"] == "feishu-abc123"
+        old = conn.execute("SELECT 1 FROM sessions WHERE id = ?", ("gw-abc123",)).fetchone()
+        assert old is None
+
+
+def test_migrate_session_id_prefixes_idempotent_on_flattened_format(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    store = SQLiteMemoryStore(db_path)
+
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("feishu-abc123", "New Feishu", "feishu", "2026-07-05T00:00:00+00:00", "2026-07-05T00:00:00+00:00"),
+        )
+        conn.commit()
+
+    store.migrate_session_id_prefixes()
+
+    with store._connect() as conn:
+        session = conn.execute("SELECT id, source FROM sessions WHERE id = ?", ("feishu-abc123",)).fetchone()
+        assert session is not None
+        assert session["source"] == "feishu"
+
+
+def test_migrate_session_id_prefixes_handles_legacy_feishu_with_gateway_prefix(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    store = SQLiteMemoryStore(db_path)
+
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO sessions (id, title, source, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("gateway-xyz", "Legacy Feishu", "feishu", "2026-06-15T00:00:00+00:00", "2026-06-15T00:00:00+00:00"),
+        )
+        conn.commit()
+
+    store.migrate_session_id_prefixes()
+
+    with store._connect() as conn:
+        session = conn.execute("SELECT id, source FROM sessions").fetchone()
+        assert session["id"] == "feishu-xyz"
+        assert session["source"] == "feishu"

@@ -27,7 +27,7 @@ class _FakePlatform:
         self.got: list[str] = []
         self.sessions_called: list[tuple[str, int, int]] = []
 
-    async def list_platforms(self, include_local=False):
+    async def list_platforms(self):
         self.listed = True
         return [_make_view()]
 
@@ -51,7 +51,7 @@ class _FakePlatform:
 
 def _args(**kw):
     base = {"platform_command": None, "json": False, "form": False, "yaml": False, "platform": None,
-            "include_local": False, "limit": None, "offset": None}
+            "limit": None, "offset": None}
     base.update(kw)
     return SimpleNamespace(**base)
 

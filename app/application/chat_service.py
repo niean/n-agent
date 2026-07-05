@@ -66,11 +66,11 @@ class ChatCompletionService:
         if session is not None and session.external_memory_enabled is not None:
             locked_external_memory = session.external_memory_enabled
         elif existing_messages:
-            locked_external_memory = ["builtin"]
+            locked_external_memory = []
         elif has_override:
             locked_external_memory = requested_memory
         else:
-            locked_external_memory = ["builtin"]
+            locked_external_memory = []
 
         locked_external_memory = await self.memory_store.lock_session_external_memory(
             session_id, locked_external_memory, slots=self._build_slot_map(locked_external_memory),
@@ -170,9 +170,9 @@ class ChatCompletionService:
 
     def _normalize_external_memory_enabled(self, value: Any) -> list[str]:
         if value is None:
-            return ["builtin"]
+            return []
         if not isinstance(value, list):
-            return ["builtin"]
+            return []
         names: list[str] = []
         for item in value:
             name = str(item).strip()

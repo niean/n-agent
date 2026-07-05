@@ -70,8 +70,8 @@ def build_slash_completer() -> Any:
 
 
 class ReplRunner:
-    def __init__(self, gateway_client: Any, console: Any, conversation_id: str, is_tty: bool = True) -> None:
-        self._client = gateway_client
+    def __init__(self, chat_adapter: Any, console: Any, conversation_id: str, is_tty: bool = True) -> None:
+        self._client = chat_adapter
         self._console = console
         self._conversation_id = conversation_id
         self._is_tty = is_tty

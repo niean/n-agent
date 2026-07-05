@@ -27,8 +27,10 @@ from acp.schema import (
 )
 
 from app.application.events import ChatEvent, ChatEventType
+from app.application.chat_service import ChatCompletionInput
 from app.application.session_service import SessionService
 from app.config import Settings
+from app.domain.gateway import GatewaySessionKey, GatewaySessionLink
 from app.domain.session import ConversationMessage, ConversationSession
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.interfaces.cli.commands.acp.agent import NAgentACPAgent
@@ -93,6 +95,38 @@ class FakeGraphRunner:
         return True
 
 
+class FakeGatewayRegistry:
+    def __init__(self) -> None:
+        self.active: dict[tuple[str, str, str], str] = {}
+
+    async def set_active_session(self, key: GatewaySessionKey, session_id: str) -> GatewaySessionLink:
+        self.active[key.conversation_parts] = session_id
+        return GatewaySessionLink(key.platform_session_id, session_id, key.display_name)
+
+
+class FakeGatewayService:
+    def __init__(self, chat_service: FakeChatService) -> None:
+        self.chat_service = chat_service
+        self.calls: list[dict[str, Any]] = []
+
+    async def handle_message_stream(self, event, **kwargs):
+        self.calls.append({"event": event, "kwargs": kwargs})
+        stream = await self.chat_service.complete(
+            ChatCompletionInput(
+                model=kwargs.get("model_override") or "test-model",
+                messages=[{"role": "user", "content": event.text}],
+                stream=True,
+                session_id=event.session_key.platform_session_id,
+                trusted_metadata=dict(kwargs.get("trusted_metadata_override") or {}),
+                options=dict(kwargs.get("options_override") or {}),
+                approval_decider=kwargs.get("approval_decider"),
+                allowed_confirm_tools_override=kwargs.get("allowed_confirm_tools_override"),
+            )
+        )
+        async for evt in stream:
+            yield evt
+
+
 class FakeProviderHolder:
     def __init__(self) -> None:
         self.current_model = "test-model"
@@ -118,6 +152,12 @@ class FakeServices:
     memory_store: SQLiteMemoryStore = None  # type: ignore[assignment]
     provider_holder: FakeProviderHolder = field(default_factory=FakeProviderHolder)
     provider_service: FakeProviderService = field(default_factory=FakeProviderService)
+    gateway_registry: FakeGatewayRegistry = field(default_factory=FakeGatewayRegistry)
+    gateway_service: FakeGatewayService = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.gateway_service is None:
+            self.gateway_service = FakeGatewayService(self.chat_service)
 
 
 @pytest.fixture
@@ -298,6 +338,11 @@ async def test_prompt_streams_events_and_returns_end_turn(agent, services, conn,
 
     assert response.stop_reason == "end_turn"
     # chat_service should have been called with the user text
+    assert len(services.gateway_service.calls) == 1
+    gateway_call = services.gateway_service.calls[0]
+    assert gateway_call["event"].session_key.source_value == "acp"
+    assert gateway_call["event"].session_key.platform_session_id == sid
+    assert services.gateway_registry.active[("acp", sid, "")] == sid
     assert len(services.chat_service.inputs) == 1
     chat_input = services.chat_service.inputs[0]
     assert chat_input.messages == [{"role": "user", "content": "hello world"}]

@@ -343,7 +343,7 @@ def test_current_session_refresh_renders_persisted_messages(tmp_path):
     assert 'renderSessionMessages(detail)' in refresh_body
 
 
-def test_chat_builtin_memory_is_enabled_and_project_memory_is_disabled_by_default(tmp_path):
+def test_chat_builtin_memory_is_disabled_by_default(tmp_path):
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
     render_start = chat_js.index('function renderExternalMemoryUI()')
@@ -353,11 +353,11 @@ def test_chat_builtin_memory_is_enabled_and_project_memory_is_disabled_by_defaul
     getter_end = chat_js.index('function init()', getter_start)
     getter_body = chat_js[getter_start:getter_end]
 
-    assert 'builtin 默认开启' in render_body
+    assert 'builtin 默认关闭' in render_body
     assert '文件记忆最多选择 1 个' in render_body
     assert '首轮发送后锁定' in render_body
     assert '此会话的外部记忆已锁定' in render_body
-    assert "cb.checked = p.name === 'builtin'" in render_body
+    assert 'cb.checked = false' in render_body
     assert 'cb.disabled = locked' in render_body
     assert "cb.dataset.slot = p.slot" in render_body
     assert 'draftExternalMemoryConfig' in chat_js
@@ -367,7 +367,7 @@ def test_chat_builtin_memory_is_enabled_and_project_memory_is_disabled_by_defaul
     assert 'cb.checked = p.enabled_global' not in render_body
     assert '重置为默认配置' in render_body
     assert "const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig" in getter_body
-    assert "if (!config?.modified) return ['builtin']" in getter_body
+    assert "if (!config?.modified) return []" in getter_body
     assert 'function applySessionExternalMemoryState(detail)' in chat_js
 
 

@@ -91,6 +91,17 @@ async def test_emit_event_content_delta_skips_empty_text():
 
 
 @pytest.mark.asyncio
+async def test_emit_event_message_done_with_content_sends_agent_message_chunk():
+    conn = FakeConn()
+    bridge = ACPEventBridge(conn, "s1")
+
+    await bridge.emit_event(ChatEvent(ChatEventType.MESSAGE_DONE, content="command response", finish_reason="stop"))
+
+    assert len(conn.updates) == 1
+    assert _update_type(conn.updates[0][1]) == "agent_message_chunk"
+
+
+@pytest.mark.asyncio
 async def test_emit_event_tool_call_pending_sends_tool_call_start():
     conn = FakeConn()
     bridge = ACPEventBridge(conn, "s1")

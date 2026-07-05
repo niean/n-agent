@@ -67,7 +67,13 @@ class ACPEventBridge:
             update = update_agent_message_text(f"[error] {error_text}")
             await self.conn.session_update(session_id=self.session_id, update=update)
             return
-        # MESSAGE_DONE and DONE: no update sent (completion signaled by prompt return)
+        if event.type is ChatEventType.MESSAGE_DONE:
+            text = event.content or ""
+            if text:
+                update = update_agent_message_text(text)
+                await self.conn.session_update(session_id=self.session_id, update=update)
+            return
+        # DONE: no update sent (completion signaled by prompt return)
 
     async def _emit_tool_call_delta(self, event: ChatEvent) -> None:
         tool_call = event.tool_call or {}

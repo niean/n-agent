@@ -6,7 +6,6 @@ from app.domain.platform import Platform, PlatformDescriptor, PlatformKind
 
 
 def test_platform_enum_values():
-    assert Platform.CLI.value == "cli"
     assert Platform.FEISHU.value == "feishu"
     assert Platform.DINGTALK.value == "dingtalk"
     assert Platform.WECOM.value == "wecom"
@@ -14,7 +13,6 @@ def test_platform_enum_values():
 
 def test_platform_kind_values():
     assert PlatformKind.IM.value == "im"
-    assert PlatformKind.LOCAL.value == "local"
 
 
 def test_platform_descriptor_immutable():
@@ -33,5 +31,5 @@ def test_platform_descriptor_immutable():
 
 
 def test_platform_descriptor_default_config_summary():
-    descriptor = PlatformDescriptor(Platform.CLI, "CLI", PlatformKind.LOCAL)
+    descriptor = PlatformDescriptor(Platform.FEISHU, "飞书", PlatformKind.IM)
     assert descriptor.config_summary == {}

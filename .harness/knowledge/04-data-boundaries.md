@@ -19,9 +19,9 @@
 
 `Summary`（`app/domain/session.py`）：摘要记录，字段包括 session_id、summary、source_message_id、updated_at。
 
-`Platform` / `PlatformKind` / `PlatformDescriptor` / `PlatformLifecycle` / `PlatformRegistry`（`app/domain/platform.py`）：平台聚合的领域枚举、描述和生命周期端口，用于表达 CLI、飞书、钉钉、企微等交互平台及其 configured/connected/disconnected/fatal 状态，不包含具体 SDK、HTTP 或长连接对象。
+`Platform` / `PlatformKind` / `PlatformDescriptor` / `PlatformLifecycle` / `PlatformRegistry`（`app/domain/platform.py`）：平台聚合的领域枚举、描述和生命周期端口，用于表达飞书、钉钉、企微等外部消息平台及其 configured/connected/disconnected/fatal 状态，不包含具体 SDK、HTTP 或长连接对象。CLI/TUI 终端聊天只使用 GatewaySessionKey.source=`cli`，不进入 Platform。
 
-`GatewaySessionKey` / `InteractionMessage` / `GatewayOutboundMessage` / `InteractionResponse`（`app/domain/gateway.py`）：交互入口标准化模型，用于把 CLI、飞书等平台消息转换为 Application 层可处理的统一事件和回复；GatewaySessionKey 使用 `platform` 与 `platform_session_id` 组成外部 conversation 标识，不包含 FastAPI、飞书 SDK 或传输对象。
+`GatewaySessionKey` / `InteractionMessage` / `GatewayOutboundMessage` / `InteractionResponse`（`app/domain/gateway.py`）：交互入口标准化模型，用于把 CLI、飞书等入口消息转换为 Application 层可处理的统一事件和回复；GatewaySessionKey 使用 `source` 与 `platform_session_id` 组成外部 conversation 标识，不包含 FastAPI、飞书 SDK 或传输对象。
 
 `GatewaySessionLink`（`app/domain/gateway.py`）：外部 conversation 与内部 session 的映射记录，字段包括 conversation_id、session_id、display_name、created_at、updated_at、id。
 
@@ -190,7 +190,7 @@ JSON 边界：
 
 ## OpenAI-compatible 协议边界
 
-Interfaces 层请求模型位于 `app/interfaces/http/openai.py`，仅作为外部协议适配：
+Interfaces 层请求模型位于 `app/interfaces/http/openai_compatible.py`，仅作为外部协议适配：
 
 - `ChatCompletionRequest` 支持 model、messages、stream、tools、tool_choice、temperature、max_tokens、metadata，并允许额外字段
 - `ChatMessage` 支持 role、content，并允许额外字段
@@ -208,7 +208,7 @@ Interfaces 层请求模型位于 `app/interfaces/http/openai.py`，仅作为外�
 
 Dashboard 使用 `metadata.session_id` 绑定会话。
 
-Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息时锁定，优先级：(1) session 已锁定 → 沿用；(2) legacy session → `["builtin"]`；(3) 显式传 `options.external_memory_enabled` → 归一化值；(4) 未传字段 → `["builtin"]`。active 检索记忆 provider 不自动纳入默认 profile，需在会话首轮显式启用。后续轮次即使客户端传入不同值，也必须使用 sessions 表里的锁定值。
+Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息时锁定，优先级：(1) session 已锁定 → 沿用；(2) legacy session → `[]`；(3) 显式传 `options.external_memory_enabled` → 归一化值；(4) 未传字段 → `[]`。系统记忆 builtin 与 active 检索记忆 provider 都不自动纳入默认 profile，需在会话首轮显式启用。后续轮次即使客户端传入不同值，也必须使用 sessions 表里的锁定值。
 
 ## Docker Compose 数据边界
 

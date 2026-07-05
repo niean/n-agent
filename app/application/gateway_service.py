@@ -93,6 +93,8 @@ class GatewayCommandService:
         if command == "/help":
             return _response(session_id, "可用命令: /help, /new, /rename <title>, /delete, /switch <session_id>, /sessions, /tools, /models, /status, /sethome, /schedule help")
         if command == "/sethome":
+            if event.session_key.platform is None:
+                return _response(session_id, "当前入口不支持 home chat")
             target = _home_target_from_event(event)
             await self.registry.set_home_target(target)
             return _response(session_id, f"已设置 {target.platform.value} home chat: {target.receive_id}")
@@ -196,8 +198,9 @@ class GatewayCommandService:
         return _response(session_id, "未知 /schedule 命令")
 
     async def _schedule_origin(self, event: InteractionMessage) -> dict[str, Any]:
-        if event.session_key.platform is Platform.FEISHU:
-            target = await self.registry.get_home_target(event.session_key.platform)
+        platform = event.session_key.platform
+        if platform is Platform.FEISHU:
+            target = await self.registry.get_home_target(platform)
             if target is None:
                 target = await self.registry.set_home_target(_home_target_from_event(event))
             return {
@@ -205,7 +208,10 @@ class GatewayCommandService:
                 "target": "home",
             }
         origin = dict(event.metadata)
-        origin["platform"] = event.session_key.platform.value
+        if platform is not None:
+            origin["platform"] = platform.value
+        else:
+            origin["source"] = event.session_key.source_value
         origin.setdefault("thread_id", event.session_key.thread_id)
         return origin
 
@@ -276,7 +282,7 @@ class GatewayCommandService:
         return _response(session_id, "已删除")
 
     async def _execute_new(self, event: InteractionMessage) -> InteractionResponse:
-        prefix, source = _session_id_prefix_and_source(event.session_key.platform)
+        prefix, source = _session_id_prefix_and_source(event.session_key)
         new_session_id = f"{prefix}-{uuid4()}"
         await self.session_service.create_session(new_session_id, source=source)
         await self.registry.create_session_link(event.session_key, new_session_id)
@@ -291,10 +297,13 @@ class GatewayCommandService:
             self.pending_confirmations.pop(key, None)
 
 
-def _session_id_prefix_and_source(platform: Platform) -> tuple[str, str]:
-    if platform is Platform.CLI:
+def _session_id_prefix_and_source(key: GatewaySessionKey) -> tuple[str, str]:
+    if key.source_value == "acp":
+        return ("acp", "acp")
+    platform = key.platform
+    if platform is None:
         return ("cli", "cli")
-    return ("gw", f"gw/{platform.value}")
+    return (platform.value, platform.value)
 
 
 class GatewayService:
@@ -322,7 +331,7 @@ class GatewayService:
 
     async def handle_message(self, event: InteractionMessage) -> InteractionResponse:
         message_id = str(event.metadata.get("message_id", ""))
-        processed = await self.registry.mark_event_processed(event.session_key.platform, event.id, message_id)
+        processed = await self.registry.mark_event_processed(event.session_key.source_value, event.id, message_id)
         if not processed:
             return InteractionResponse(session_id="", messages=[], metadata={"duplicate": True})
 
@@ -341,11 +350,7 @@ class GatewayService:
                 messages=[{"role": "user", "content": event.text}],
                 stream=False,
                 metadata={
-                    "gateway": {
-                        "platform": event.session_key.platform.value,
-                        "platform_session_id": event.session_key.platform_session_id,
-                        "thread_id": event.session_key.thread_id,
-                    }
+                    "gateway": _gateway_metadata(event),
                 },
                 trusted_metadata=_build_trusted_metadata(event),
                 session_id=session_id,
@@ -363,11 +368,20 @@ class GatewayService:
     ) -> InteractionResponse:
         return await self.command_service.handle_confirmation(session_key, actor_id, confirmation_id, choice)
 
-    async def handle_message_stream(self, event: InteractionMessage) -> AsyncIterator[ChatEvent]:
+    async def handle_message_stream(
+        self,
+        event: InteractionMessage,
+        *,
+        model_override: str | None = None,
+        options_override: dict[str, Any] | None = None,
+        trusted_metadata_override: dict[str, Any] | None = None,
+        approval_decider: Any | None = None,
+        allowed_confirm_tools_override: dict[str, Any] | None = None,
+    ) -> AsyncIterator[ChatEvent]:
         """流式版本：复用幂等、destructive preflight、session 解析、Slash 分流。"""
         message_id = str(event.metadata.get("message_id", ""))
         processed = await self.registry.mark_event_processed(
-            event.session_key.platform, event.id, message_id,
+            event.session_key.source_value, event.id, message_id,
         )
         if not processed:
             yield ChatEvent(ChatEventType.DONE, metadata={"duplicate": True})
@@ -398,20 +412,22 @@ class GatewayService:
             yield ChatEvent(ChatEventType.DONE)
             return
 
+        trusted_metadata = _build_trusted_metadata(event)
+        if trusted_metadata_override:
+            trusted_metadata.update(trusted_metadata_override)
         stream = await self.chat_service.complete(
             ChatCompletionInput(
-                model=self.command_service.model_service.default_model,
+                model=model_override or self.command_service.model_service.default_model,
                 messages=[{"role": "user", "content": event.text}],
                 stream=True,
                 metadata={
-                    "gateway": {
-                        "platform": event.session_key.platform.value,
-                        "platform_session_id": event.session_key.platform_session_id,
-                        "thread_id": event.session_key.thread_id,
-                    }
+                    "gateway": _gateway_metadata(event),
                 },
-                trusted_metadata=_build_trusted_metadata(event),
+                trusted_metadata=trusted_metadata,
                 session_id=session_id,
+                options=dict(options_override or {}),
+                approval_decider=approval_decider,
+                allowed_confirm_tools_override=allowed_confirm_tools_override,
             )
         )
         if isinstance(stream, ChatCompletionResult):
@@ -431,7 +447,7 @@ class GatewayService:
         link = await self.registry.get_active_session(event.session_key)
         if link is not None:
             return link.session_id
-        prefix, source = _session_id_prefix_and_source(event.session_key.platform)
+        prefix, source = _session_id_prefix_and_source(event.session_key)
         session_id = f"{prefix}-{uuid4()}"
         await self.session_service.create_session(session_id, source=source)
         await self.registry.create_session_link(event.session_key, session_id)
@@ -450,8 +466,11 @@ def _parse_schedule_add(rest: str) -> tuple[str, str] | None:
 
 def _home_target_from_event(event: InteractionMessage) -> GatewayHomeTarget:
     md = dict(event.metadata)
+    platform = event.session_key.platform
+    if platform is None:
+        raise ValueError(f"source does not support home target: {event.session_key.source_value}")
     return GatewayHomeTarget(
-        platform=event.session_key.platform,
+        platform=platform,
         receive_id=str(md.get("receive_id") or event.session_key.platform_session_id),
         receive_id_type=str(md.get("receive_id_type") or "chat_id"),
         thread_id=str(md.get("thread_id") or event.session_key.thread_id or ""),
@@ -461,16 +480,31 @@ def _home_target_from_event(event: InteractionMessage) -> GatewayHomeTarget:
 
 def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:
     md = dict(event.metadata)
-    return {
-        "gateway.platform": event.session_key.platform.value,
+    trusted = {
+        "gateway.source": event.session_key.source_value,
         "gateway.platform_session_id": event.session_key.platform_session_id,
-        "platform": event.session_key.platform.value,
         "thread_id": str(md.get("thread_id") or event.session_key.thread_id or ""),
         "actor_id": str(md.get("actor_id") or ""),
         "receive_id": str(md.get("receive_id") or ""),
         "receive_id_type": str(md.get("receive_id_type") or ""),
     }
+    platform = event.session_key.platform
+    if platform is not None:
+        trusted["gateway.platform"] = platform.value
+        trusted["platform"] = platform.value
+    return trusted
 
+
+def _gateway_metadata(event: InteractionMessage) -> dict[str, str]:
+    metadata = {
+        "source": event.session_key.source_value,
+        "platform_session_id": event.session_key.platform_session_id,
+        "thread_id": event.session_key.thread_id,
+    }
+    platform = event.session_key.platform
+    if platform is not None:
+        metadata["platform"] = platform.value
+    return metadata
 
 
 def _confirmation_metadata(confirmation: GatewayConfirmationRequest) -> dict[str, Any]:

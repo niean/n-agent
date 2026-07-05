@@ -113,7 +113,7 @@ class SQLiteGatewaySessionRegistry:
                 (session_id,),
             )
 
-    async def mark_event_processed(self, platform: Platform, event_id: str, message_id: str = "") -> bool:
+    async def mark_event_processed(self, source: str, event_id: str, message_id: str = "") -> bool:
         with self._connect() as conn:
             try:
                 conn.execute(
@@ -121,7 +121,7 @@ class SQLiteGatewaySessionRegistry:
                     INSERT INTO gateway_processed_events(id, platform, event_id, message_id, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     """,
-                    (str(uuid4()), platform.value, event_id, message_id or None, _now()),
+                    (str(uuid4()), source, event_id, message_id or None, _now()),
                 )
             except sqlite3.IntegrityError:
                 return False
@@ -182,7 +182,8 @@ class SQLiteGatewaySessionRegistry:
                     """,
                     (platform.value, limit, offset),
                 ).fetchall()
-        return [_conversation_from_row(row) for row in rows]
+        conversations = [_conversation_from_row(row) for row in rows]
+        return [conversation for conversation in conversations if conversation is not None]
 
     async def count_conversations(self, platform: Platform) -> int:
         with self._connect() as conn:
@@ -316,7 +317,7 @@ def _ensure_conversation(conn: sqlite3.Connection, key: GatewaySessionKey, now: 
         INSERT INTO gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
         """,
-        (conversation_id, key.platform.value, key.platform_session_id, key.thread_id, key.display_name, now, now),
+        (conversation_id, key.source_value, key.platform_session_id, key.thread_id, key.display_name, now, now),
     )
     return conversation_id
 
@@ -354,10 +355,14 @@ def _link_from_row(row: sqlite3.Row) -> GatewaySessionLink:
     )
 
 
-def _conversation_from_row(row: sqlite3.Row) -> GatewayConversation:
+def _conversation_from_row(row: sqlite3.Row) -> GatewayConversation | None:
+    try:
+        platform = Platform(row["platform"])
+    except ValueError:
+        return None
     return GatewayConversation(
         id=row["id"],
-        platform=Platform(row["platform"]),
+        platform=platform,
         platform_session_id=row["platform_session_id"],
         thread_id=row["thread_id"],
         display_name=row["display_name"],

@@ -64,7 +64,7 @@ _SESSION_HEADERS = ["platform_session_id", "active_session_id", "updated_at"]
 
 def _cmd_list(args) -> int:
     service = _load_platform_service()
-    views = asyncio.run(service.list_platforms(args.include_local))
+    views = asyncio.run(service.list_platforms())
     rows = [_view_to_dict(v) for v in views]
     render_data(rows, make_console(), fmt=resolve_format(args), headers=_LIST_HEADERS)
     return 0

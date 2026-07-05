@@ -68,9 +68,9 @@ from app.application.external_memory_service import ExternalMemoryService
 from app.application.external_memory_tool_executor import ExternalMemoryToolExecutor
 from app.infrastructure.memory.builtin_project import BuiltinProjectMemory
 from app.infrastructure.registry.sqlite_external_memory_config import SQLiteExternalMemoryConfig
-from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
+from app.interfaces.feishu_im_adapter import FeishuImAdapter
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
-from app.interfaces.http.openai import create_openai_router
+from app.interfaces.http.openai_compatible import create_openai_compatible_router
 from app.interfaces.http.platforms import create_platforms_router
 from app.infrastructure.sandbox.callback_tools import (
     PatchTool,
@@ -223,7 +223,7 @@ class ApplicationServices:
     knowledge_service: KnowledgeService
     external_memory_service: ExternalMemoryService | None
     external_memory_provider_service: ExternalMemoryProviderService | None
-    feishu_long_connection_gateway: FeishuLongConnectionGateway | None
+    feishu_im_adapter: FeishuImAdapter | None
     platform_registry: PlatformRegistry
     platform_service: PlatformService
     health_snapshot: Callable[[], dict]
@@ -714,10 +714,10 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         health_snapshot,
         schedule_service=schedule_service,
     )
-    feishu_long_connection_gateway = (
-        FeishuLongConnectionGateway(gateway_service, feishu_client) if feishu_client is not None else None
+    feishu_im_adapter = (
+        FeishuImAdapter(gateway_service, feishu_client) if feishu_client is not None else None
     )
-    descriptors = [PlatformDescriptor(Platform.CLI, "CLI", PlatformKind.LOCAL, {})]
+    descriptors = []
     lifecycles = {}
     if settings.feishu_enabled:
         descriptors.append(
@@ -733,8 +733,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 },
             )
         )
-        if feishu_long_connection_gateway is not None:
-            lifecycles[Platform.FEISHU] = feishu_long_connection_gateway
+        if feishu_im_adapter is not None:
+            lifecycles[Platform.FEISHU] = feishu_im_adapter
     platform_registry = InMemoryPlatformRegistry(descriptors, lifecycles)
     platform_service = PlatformService(platform_registry, gateway_registry)
     session_service.add_session_deleted_handler(schedule_service.handle_session_deleted)
@@ -763,7 +763,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         knowledge_service=knowledge_service,
         external_memory_service=external_memory_service,
         external_memory_provider_service=external_memory_provider_service,
-        feishu_long_connection_gateway=feishu_long_connection_gateway,
+        feishu_im_adapter=feishu_im_adapter,
         platform_registry=platform_registry,
         platform_service=platform_service,
         health_snapshot=health_snapshot,
@@ -795,8 +795,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.exception("plugin lifespan scan failed; dashboard refresh available as fallback")
         if services.settings.scheduler_enabled:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
-        if services.feishu_long_connection_gateway is not None:
-            feishu_task = asyncio.create_task(services.feishu_long_connection_gateway.start())
+        if services.feishu_im_adapter is not None:
+            feishu_task = asyncio.create_task(services.feishu_im_adapter.start())
         if services.sandbox_manager is not None:
             try:
                 await services.sandbox_manager.cleanup_orphan_containers()
@@ -832,7 +832,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="N-Agent", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    app.include_router(create_openai_router(services.chat_service, services.model_service))
+    app.include_router(create_openai_compatible_router(services.chat_service, services.model_service))
     app.include_router(create_platforms_router(services.platform_service))
     app.include_router(
         create_dashboard_router(

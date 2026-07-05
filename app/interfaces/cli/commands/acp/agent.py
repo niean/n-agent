@@ -1,9 +1,9 @@
 """NAgentACPAgent -- ACP Agent binding N-Agent runtime to the ACP JSON-RPC server.
 
 T12 integration point: ties together T7-T11 (path mapping, auth, event bridge,
-session bridge, permission bridge) and the ApplicationServices.chat_service for
-LLM execution. The ACP SDK's ``acp.run_agent`` drives the stdio JSON-RPC loop
-and dispatches requests to this agent's coroutine methods.
+session bridge, permission bridge) and the ApplicationServices.gateway_service
+for user prompt execution. The ACP SDK's ``acp.run_agent`` drives the stdio
+JSON-RPC loop and dispatches requests to this agent's coroutine methods.
 
 Design invariants:
 - ``prompt`` is serialized per-session via ``_session_locks``; concurrent
@@ -15,11 +15,9 @@ Design invariants:
   they do NOT swap providers or invoke ProviderService.
 - ``cancel`` delegates to ``chat_service.graph_runner.interrupt(session_id)``
   (T5) which cancels the running stream task.
-- ``approval_decider`` is injected via ``ChatCompletionInput`` (Option 1 from
-  the T12 plan) so chat_service.complete() builds the ToolExecutionContext
-  with the bridge attached. ``allowed_confirm_tools`` from session metadata
-  is merged into the context's pre-approved set so already-session-approved
-  CONFIRM tools skip the bridge entirely.
+- ``session/prompt`` is routed through GatewayService so ACP user messages
+  share the same interaction path as Feishu IM and CLI/TUI. ACP protocol
+  lifecycle, session bridge, event bridge, and permission bridge stay here.
 """
 
 from __future__ import annotations
@@ -27,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any
+from uuid import uuid4
 
 from acp.interfaces import Agent, Client
 from acp.meta import PROTOCOL_VERSION
@@ -58,9 +57,9 @@ from acp.schema import (
     TextContentBlock,
 )
 
-from app.application.chat_service import ChatCompletionInput
 from app.application.events import ChatEventType
 from app.config import Settings
+from app.domain.gateway import GatewaySessionKey, InteractionMessage
 from app.interfaces.cli.commands.acp.auth import (
     ProviderSnapshot,
     authenticate as auth_authenticate,
@@ -384,23 +383,32 @@ class NAgentACPAgent(Agent):
                 "execution_context_mode": "realtime",
                 "tool_exposure_policy": "safe_only" if mode == "safe_only" else "all",
             }
-            chat_input = ChatCompletionInput(
-                model=model,
-                messages=[{"role": "user", "content": text}],
-                stream=True,
-                session_id=session_id,
-                trusted_metadata={
+            session_key = GatewaySessionKey("acp", session_id, display_name=session_id)
+            await self.services.gateway_registry.set_active_session(session_key, session_id)
+            interaction = InteractionMessage(
+                id=message_id or f"acp-{uuid4()}",
+                session_key=session_key,
+                text=text,
+                metadata={
+                    "actor_id": f"acp:{session_id}",
+                    "message_id": message_id or "",
                     "acp.cwd": mapped_cwd,
-                    "agent_context": "primary",
                 },
-                options=options,
-                approval_decider=self._permission_bridge,
-                allowed_confirm_tools_override=allowed_confirm,
             )
 
             stop_reason = "end_turn"
             try:
-                stream = await self.services.chat_service.complete(chat_input)
+                stream = self.services.gateway_service.handle_message_stream(
+                    interaction,
+                    model_override=model,
+                    options_override=options,
+                    trusted_metadata_override={
+                        "acp.cwd": mapped_cwd,
+                        "agent_context": "primary",
+                    },
+                    approval_decider=self._permission_bridge,
+                    allowed_confirm_tools_override=allowed_confirm,
+                )
                 async for event in stream:
                     if event.type is ChatEventType.ERROR:
                         if event.finish_reason == "cancelled":

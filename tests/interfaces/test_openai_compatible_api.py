@@ -13,7 +13,7 @@ from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.tools.builtin import build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
-from app.interfaces.http.openai import create_openai_router
+from app.interfaces.http.openai_compatible import create_openai_compatible_router
 
 
 class FakeProvider:
@@ -77,7 +77,7 @@ def build_client(tmp_path, provider=None, tool_service=None):
     from fastapi import FastAPI
 
     app = FastAPI()
-    app.include_router(create_openai_router(chat, models))
+    app.include_router(create_openai_compatible_router(chat, models))
     return TestClient(app), store
 
 

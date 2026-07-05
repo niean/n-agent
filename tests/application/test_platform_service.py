@@ -76,19 +76,16 @@ def _conversation(platform: Platform, platform_session_id: str, *, active_sessio
 
 
 @pytest.mark.asyncio
-async def test_list_platforms_excludes_local_by_default_and_includes_counts():
+async def test_list_platforms_returns_registered_external_platform_counts():
     registry = InMemoryPlatformRegistry([
-        _descriptor(Platform.CLI, PlatformKind.LOCAL),
         _descriptor(Platform.FEISHU),
     ])
     gateway = FakeGatewayRegistry([_conversation(Platform.FEISHU, "oc_a")])
     service = PlatformService(registry, gateway)
 
     visible = await service.list_platforms()
-    all_platforms = await service.list_platforms(include_local=True)
 
     assert [view.platform for view in visible] == [Platform.FEISHU]
-    assert {view.platform for view in all_platforms} == {Platform.CLI, Platform.FEISHU}
     assert visible[0].status == "configured"
     assert visible[0].session_count == 1
     assert visible[0].last_active_at is not None
@@ -123,7 +120,7 @@ async def test_get_platform_returns_detail_with_active_session_count():
     conversations = [
         _conversation(Platform.FEISHU, "oc_a", active_session_id="s1"),
         _conversation(Platform.FEISHU, "oc_b", active_session_id=None),
-        _conversation(Platform.CLI, "local", active_session_id="s3"),
+        _conversation(Platform.DINGTALK, "ding-a", active_session_id="s3"),
     ]
     service = PlatformService(InMemoryPlatformRegistry([_descriptor()]), FakeGatewayRegistry(conversations))
 

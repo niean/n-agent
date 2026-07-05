@@ -38,7 +38,7 @@ class _FakeScheduleService:
 
 
 class _FakePlatformService:
-    async def list_platforms(self, include_local: bool = False):
+    async def list_platforms(self):
         return []
 
 
@@ -131,7 +131,7 @@ def test_sandbox_isolation_with_service(monkeypatch):
 
 def test_platform_isolation(monkeypatch):
     monkeypatch.setattr(platform, "_load_platform_service", lambda: _FakePlatformService())
-    args = SimpleNamespace(platform_command="list", include_local=False, json=True)
+    args = SimpleNamespace(platform_command="list", json=True)
     assert platform.run(args) == 0
 
 
@@ -252,4 +252,3 @@ def test_acp_setup_returns_zero(capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "ACP provider setup" in captured.err
-

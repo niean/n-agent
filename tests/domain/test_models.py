@@ -71,7 +71,7 @@ def test_gateway_session_key_normalizes_thread_id():
 def test_interaction_message_defaults_metadata():
     message = InteractionMessage(
         id="event-1",
-        session_key=GatewaySessionKey(Platform.CLI, "local"),
+        session_key=GatewaySessionKey("cli", "local"),
         text="hello",
     )
 

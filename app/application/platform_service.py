@@ -57,11 +57,9 @@ class PlatformService:
         self.platform_registry = platform_registry
         self.gateway_registry = gateway_registry
 
-    async def list_platforms(self, include_local: bool = False) -> list[PlatformView]:
+    async def list_platforms(self) -> list[PlatformView]:
         views = []
         for descriptor in self.platform_registry.list():
-            if not include_local and descriptor.kind is PlatformKind.LOCAL:
-                continue
             views.append(await self._view(descriptor))
         return views
 

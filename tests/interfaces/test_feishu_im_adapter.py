@@ -4,7 +4,7 @@ import json
 import pytest
 
 from app.domain.gateway import GatewayOutboundMessage, InteractionMessage, InteractionResponse
-from app.interfaces.feishu_long_connection import FeishuLongConnectionGateway
+from app.interfaces.feishu_im_adapter import FeishuImAdapter
 
 
 class FakeFeishuClient:
@@ -94,7 +94,7 @@ def card_payload(choice="once"):
 async def test_long_connection_start_listens_and_handles_event():
     gateway = FakeGatewayService()
     client = FakeFeishuClient(text_payload("hello"))
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.start()
 
@@ -112,7 +112,7 @@ async def test_long_connection_start_marks_fatal_on_listen_error():
         raise RuntimeError("boom")
 
     client.listen_events = fail_listen
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     with pytest.raises(RuntimeError, match="boom"):
         await adapter.start()
@@ -132,7 +132,7 @@ async def test_long_connection_start_marks_connected_while_listening():
         await release.wait()
 
     client.listen_events = listen
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
     task = asyncio.create_task(adapter.start())
     await entered.wait()
 
@@ -150,7 +150,7 @@ async def test_long_connection_non_text_message_returns_unsupported_without_gate
     payload["event"]["message"]["message_type"] = "image"
     gateway = FakeGatewayService()
     client = FakeFeishuClient(payload)
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event(payload)
 
@@ -162,7 +162,7 @@ async def test_long_connection_group_message_without_mention_is_ignored():
     payload = text_payload(chat_type="group")
     gateway = FakeGatewayService()
     client = FakeFeishuClient(payload)
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event(payload)
 
@@ -174,7 +174,7 @@ async def test_long_connection_group_message_without_mention_is_ignored():
 async def test_long_connection_text_message_calls_gateway_and_replies():
     gateway = FakeGatewayService()
     client = FakeFeishuClient(text_payload("<at user_id=\"bot\">bot</at> hello", chat_type="group"))
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -193,7 +193,7 @@ async def test_long_connection_p2p_without_chat_id_replies_to_open_id():
     payload["event"]["message"]["chat_id"] = ""
     gateway = FakeGatewayService()
     client = FakeFeishuClient(payload)
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -211,7 +211,7 @@ async def test_long_connection_reaction_failure_does_not_block_reply():
         raise RuntimeError("reaction failed")
 
     client.add_reaction = fail_reaction
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -224,7 +224,7 @@ async def test_long_connection_normalizes_null_thread_id():
     payload["event"]["message"]["thread_id"] = None
     gateway = FakeGatewayService()
     client = FakeFeishuClient(payload)
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -235,7 +235,7 @@ async def test_long_connection_normalizes_null_thread_id():
 async def test_long_connection_duplicate_gateway_response_does_not_send_reply():
     gateway = FakeGatewayService(duplicate=True)
     client = FakeFeishuClient(text_payload("hello"))
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -246,7 +246,7 @@ async def test_long_connection_duplicate_gateway_response_does_not_send_reply():
 async def test_long_connection_text_message_sets_actor_id_metadata():
     gateway = FakeGatewayService()
     client = FakeFeishuClient(text_payload("hello"))
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -260,7 +260,7 @@ async def test_long_connection_sends_confirmation_as_interactive_card():
         messages=[GatewayOutboundMessage("需要确认", metadata={"confirmation": {"id": "confirm-1", "action": "new", "command": "/new"}})],
     )
     client = FakeFeishuClient(text_payload("/new"))
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -280,7 +280,7 @@ async def test_long_connection_card_send_failure_discards_pending_and_sends_retr
         raise RuntimeError("card failed")
 
     client.send_interactive_card = fail_card
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event({})
 
@@ -291,7 +291,7 @@ async def test_long_connection_card_send_failure_discards_pending_and_sends_retr
 async def test_long_connection_card_action_routes_confirmation():
     gateway = FakeGatewayService()
     client = FakeFeishuClient(card_payload())
-    adapter = FeishuLongConnectionGateway(gateway, client)
+    adapter = FeishuImAdapter(gateway, client)
 
     await adapter.handle_event(card_payload())
 

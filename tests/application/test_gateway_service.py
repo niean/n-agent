@@ -44,8 +44,8 @@ class FakeGatewayRegistry:
             if self.active.get(key) == session_id:
                 self.active.pop(key)
 
-    async def mark_event_processed(self, platform, event_id, message_id=""):
-        marker = (platform.value, event_id)
+    async def mark_event_processed(self, source, event_id, message_id=""):
+        marker = (source, event_id)
         if marker in self.processed:
             return False
         self.processed.add(marker)
@@ -199,7 +199,7 @@ class Harness:
 def message(text="hello", event_id="event-1"):
     return InteractionMessage(
         id=event_id,
-        session_key=GatewaySessionKey(Platform.CLI, "local", display_name="Local"),
+        session_key=GatewaySessionKey("cli", "local", display_name="Local"),
         text=text,
     )
 
@@ -425,7 +425,7 @@ async def test_gateway_schedule_remove_confirmation_deletes_task():
     key = message().session_key
     await harness.registry.create_session_link(key, "session-1")
     schedule = FakeScheduleService(
-        tasks={"sched-1": _schedule_task("sched-1", receive_id=key.platform_session_id, thread_id=key.thread_id, platform=key.platform.value)}
+        tasks={"sched-1": _schedule_task("sched-1", receive_id=key.platform_session_id, thread_id=key.thread_id, platform="")}
     )
     service = harness.service(schedule)
     event = message("/schedule remove sched-1")
@@ -553,7 +553,8 @@ async def test_gateway_schedule_add_uses_origin_metadata():
     assert schedule.created[0].cron_expression == "*/5 * * * *"
     assert schedule.created[0].prompt == "summarize"
     assert schedule.created[0].origin["receive_id"] == "oc_1"
-    assert schedule.created[0].origin["platform"] == "cli"
+    assert schedule.created[0].origin["source"] == "cli"
+    assert "platform" not in schedule.created[0].origin
     assert schedule.created[0].session_id is None
 
 
@@ -561,15 +562,23 @@ async def test_gateway_schedule_add_uses_origin_metadata():
 async def test_gateway_sethome_switches_future_schedule_home_reference():
     harness = Harness()
     service = harness.service(FakeScheduleService())
-    first = message("/sethome", "event-home-1")
+    first = InteractionMessage(
+        id="event-home-1",
+        session_key=GatewaySessionKey(Platform.FEISHU, "oc_current", display_name="Current"),
+        text="/sethome",
+    )
     first.metadata.update({"receive_id": "oc_old", "receive_id_type": "chat_id"})
-    second = message("/sethome", "event-home-2")
+    second = InteractionMessage(
+        id="event-home-2",
+        session_key=GatewaySessionKey(Platform.FEISHU, "oc_current", display_name="Current"),
+        text="/sethome",
+    )
     second.metadata.update({"receive_id": "oc_new", "receive_id_type": "chat_id"})
 
     await service.handle_message(first)
     await service.handle_message(second)
 
-    assert harness.registry.home_targets[Platform.CLI].receive_id == "oc_new"
+    assert harness.registry.home_targets[Platform.FEISHU].receive_id == "oc_new"
 
 
 @pytest.mark.asyncio
@@ -729,3 +738,42 @@ async def test_schedule_remove_confirmation_deletes_when_origin_matches():
     )
 
     assert schedule.deleted_ids == ["sched-1"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_new_session_feishu_uses_flattened_source_and_prefix():
+    harness = Harness()
+    service = harness.service()
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_feishu", display_name="Feishu Chat")
+    event = InteractionMessage(
+        id="event-feishu-new",
+        session_key=feishu_key,
+        text="/new",
+        metadata={},
+    )
+
+    response = await service.handle_message(event)
+
+    assert response.messages[0].content.startswith("已创建新会话")
+    created = harness.session_service.created[-1]
+    assert created.source == "feishu"
+    assert created.id.startswith("feishu-")
+
+
+def test_session_id_prefix_and_source_flattens_im_platforms():
+    from app.application.gateway_service import _session_id_prefix_and_source
+
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_x")
+    assert _session_id_prefix_and_source(feishu_key) == ("feishu", "feishu")
+
+    dingtalk_key = GatewaySessionKey(Platform.DINGTALK, "oc_y")
+    assert _session_id_prefix_and_source(dingtalk_key) == ("dingtalk", "dingtalk")
+
+    wecom_key = GatewaySessionKey(Platform.WECOM, "oc_z")
+    assert _session_id_prefix_and_source(wecom_key) == ("wecom", "wecom")
+
+    cli_key = GatewaySessionKey("cli", "conv-1")
+    assert _session_id_prefix_and_source(cli_key) == ("cli", "cli")
+
+    acp_key = GatewaySessionKey("acp", "acp-session-1")
+    assert _session_id_prefix_and_source(acp_key) == ("acp", "acp")

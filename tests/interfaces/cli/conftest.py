@@ -53,8 +53,8 @@ class _FakeRegistry:
             if self.active.get(key) == session_id:
                 self.active.pop(key)
 
-    async def mark_event_processed(self, platform: Platform, event_id: str, message_id: str = "") -> bool:
-        marker = (platform.value, event_id)
+    async def mark_event_processed(self, source: str, event_id: str, message_id: str = "") -> bool:
+        marker = (source, event_id)
         if marker in self.processed:
             return False
         self.processed.add(marker)
@@ -196,8 +196,8 @@ def fake_console():
 
 
 @dataclass
-class _FakeGatewayClient:
-    """Fake GatewayCliClient for REPL tests. Records calls + returns scripted stream responses."""
+class _FakeCliChatAdapter:
+    """Fake CliChatAdapter for REPL tests. Records calls + returns scripted stream responses."""
 
     stream_responses: list[list[tuple[str, dict[str, Any]]]] = field(default_factory=list)
     last_confirm_id: str | None = None
@@ -237,5 +237,5 @@ class _FakeGatewayClient:
 
 
 @pytest.fixture
-def fake_gateway_client() -> _FakeGatewayClient:
-    return _FakeGatewayClient()
+def fake_chat_adapter() -> _FakeCliChatAdapter:
+    return _FakeCliChatAdapter()
