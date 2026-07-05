@@ -282,3 +282,26 @@ async def test_allow_session_swallows_metadata_updater_exception():
 
     assert decision.allowed is True
     assert decision.scope == "session"
+
+
+@pytest.mark.asyncio
+async def test_call_delegates_to_request():
+    # ApprovalDecider port is Callable[[ApprovalRequest], Awaitable[ApprovalDecision]].
+    # agent_graph invokes the bridge as ``context.approval_decider(req)`` -- this
+    # regression test pins the ``__call__`` delegation so a future refactor that
+    # drops ``__call__`` fails fast instead of raising ``object is not callable``
+    # at runtime inside a real ACP session.
+    conn = FakeConn(
+        RequestPermissionResponse(
+            outcome=AllowedOutcome(option_id="allow_once", outcome="selected")
+        )
+    )
+    bridge = ACPPermissionBridge(conn)
+
+    raw = bridge(_make_request())
+    assert asyncio.iscoroutine(raw)
+    decision = await raw
+
+    assert decision.allowed is True
+    assert decision.scope == "once"
+    assert len(conn.calls) == 1

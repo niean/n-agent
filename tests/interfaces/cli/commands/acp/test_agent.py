@@ -355,9 +355,12 @@ async def test_prompt_streams_events_and_returns_end_turn(agent, services, conn,
     # allowed_confirm_tools_override defaults to empty dict (session has none)
     assert chat_input.allowed_confirm_tools_override == {}
 
-    # UserMessageChunk + AgentMessageChunk updates emitted
+    # Only AgentMessageChunk updates emitted during prompt; UserMessageChunk is
+    # NOT emitted here because VsCode ACP clients optimistically render the
+    # prompt text on send -- a server-side UserMessageChunk would duplicate it.
+    # UserMessageChunk is reserved for replay_history (session/load).
     update_types = [getattr(u, "session_update", None) for _, u in conn.updates]
-    assert "user_message_chunk" in update_types
+    assert "user_message_chunk" not in update_types
     assert "agent_message_chunk" in update_types
 
 

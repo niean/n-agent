@@ -377,7 +377,11 @@ class NAgentACPAgent(Agent):
                 return PromptResponse(stop_reason="refusal")
 
             event_bridge = ACPEventBridge(self._conn, session_id)
-            await event_bridge.emit_user_message(text)
+            # Do NOT emit_user_message here: VsCode ACP clients optimistically
+            # render the prompt text on send, so a server-side UserMessageChunk
+            # duplicates it ("123" -> "123123"). UserMessageChunk is only needed
+            # in replay_history (session/load), where the client has no local
+            # copy and must reconstruct the transcript from server updates.
 
             options: dict[str, Any] = {
                 "execution_context_mode": "realtime",

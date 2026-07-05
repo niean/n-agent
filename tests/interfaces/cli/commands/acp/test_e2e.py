@@ -151,7 +151,21 @@ async def test_acp_e2e_full_protocol_flow(tmp_path: Path) -> None:
             use_unstable_protocol=True,
         )
 
-        stderr_task = asyncio.create_task(_drain_stream(process.stderr))
+        stderr_chunks: list[bytes] = []
+
+        async def _drain_stderr() -> None:
+            if process.stderr is None:
+                return
+            while True:
+                try:
+                    chunk = await process.stderr.read(4096)
+                except (asyncio.CancelledError, Exception):
+                    break
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+
+        stderr_task = asyncio.create_task(_drain_stderr())
 
         try:
             init_resp = await asyncio.wait_for(
@@ -222,6 +236,9 @@ async def test_acp_e2e_full_protocol_flow(tmp_path: Path) -> None:
     stdout_bytes = bytes(tee.captured)
     _assert_stdout_purity(stdout_bytes)
 
+    stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+    _assert_stderr_has_logs(stderr_text)
+
     _assert_sqlite_state(tmp_path / "sessions.db", session_id, container_workspace)
 
 
@@ -240,6 +257,13 @@ def _assert_stdout_purity(stdout_bytes: bytes) -> None:
             json.loads(line)
         except (json.JSONDecodeError, ValueError):
             pytest.fail(f"stdout line is not valid JSON-RPC: {line!r}")
+
+
+def _assert_stderr_has_logs(stderr_text: str) -> None:
+    # 验收 3.2.2: stderr 含日志输出（INFO/WARNING/ERROR 等），证明日志走 stderr
+    assert any(lvl in stderr_text for lvl in ("INFO", "WARNING", "ERROR")), (
+        f"stderr should contain log output (INFO/WARNING/ERROR), got: {stderr_text!r}"
+    )
 
 
 def _assert_sqlite_state(
@@ -269,19 +293,3 @@ def _assert_sqlite_state(
     assert "host-workspace" not in cwd, (
         f"cwd {cwd!r} should be container path, not host path"
     )
-
-
-async def _drain_stream(stream: Any) -> str:
-    """Drain a subprocess stream into a string, preventing pipe buffer deadlock."""
-    if stream is None:
-        return ""
-    chunks: list[bytes] = []
-    while True:
-        try:
-            chunk = await stream.read(4096)
-        except (asyncio.CancelledError, Exception):
-            break
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b"".join(chunks).decode("utf-8", errors="replace")

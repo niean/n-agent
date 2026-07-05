@@ -41,3 +41,4 @@ data/*
 app/__pycache__
 docker/docker-compose.yml
 docker/.env
+docker/locals/*

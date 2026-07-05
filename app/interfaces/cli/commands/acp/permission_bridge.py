@@ -103,6 +103,11 @@ class ACPPermissionBridge:
 
         return ApprovalDecision(allowed=False, scope="deny", reason="unknown option")
 
+    def __call__(self, req: ApprovalRequest) -> Awaitable[ApprovalDecision]:
+        # ApprovalDecider port is Callable[[ApprovalRequest], Awaitable[ApprovalDecision]].
+        # Delegate to ``request`` so agent_graph can invoke the bridge as a plain callable.
+        return self.request(req)
+
     async def _persist_session(self, req: ApprovalRequest) -> None:
         # Persistence is best-effort: the user already granted permission via the
         # ACP client, so a storage failure must not revoke that grant. The graph

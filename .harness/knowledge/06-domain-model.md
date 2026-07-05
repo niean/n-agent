@@ -4,7 +4,6 @@
 本文介绍自研Agent套装[N-Agent](https://github.com/niean/n-agent)，一款类似Hermes的Agent Runtime。
 核心流程：接收对话请求，加载会话上下文，循环"调用模型→按需执行工具"直至产出最终回答，更新会话与外部记忆，返回同步或流式结果。
 
-
 ## 领域划分
 
 ```text
@@ -31,6 +30,9 @@ Agent Runtime
 - Plugin：特化工具为LLM定制的**点对点适配**，将外部工具能力、封装为LLM可调用函数FC。Plugin是本地部署的工具适配层，而非工具本身
 - MCP：面向LLM的标准协议，用于统一外部工具、资源、上下文的访问方式，类似总线协议、SPI
 
+<details>
+<summary>概念架构图</summary>
+
 ```mermaid
 graph TD
 
@@ -45,7 +47,7 @@ Plugin --> FC
 
 FC --> externals
 ```
-
+</details>
 
 ## Loop
 ```text
@@ -482,23 +484,30 @@ erDiagram
 
 ## 用户接口
 
-#### 入口类型
+N-Agent 入口类型，有如下几类：
 
-N-Agent 入口类型有如下几类。其中，管理API不进入 Agent Runtime 应用层；OpenAI 兼容对话 API 直接进入 ChatCompletionService；飞书 IM、TUI/CLI、ACP 的用户消息先经 GatewayService 统一做入口会话、消息管理，再进入 ChatCompletionService。ACP协议生命周期保留在 NAgentACPAgent 中。定时任务执行由 SchedulerRunner 定时触发，并通过 ScheduleRunService->ScheduledAgentExecutor 直接调用 ChatCompletionService，执行结果再由 ScheduleOutboundDelivery 投递。
+| 入口  | 传输+编码协议 | 适配器 | 应用层 | 适配器源文件 |
+|:-----|:------------|:------|:------|:-----------|
+| Dashboard 管理 API | HTTP+JSON | create_*\_router / register_*\_routes | 不进入 Agent Runtime | app/interfaces/http/ |
+| OpenAI 兼容对话 API | HTTP/SSE+JSON | create_openai_compatible_router | ChatCompletionService | app/interfaces/http/openai_compatible.py |
+| 飞书 IM 长连接 | WebSocket+JSON | FeishuImAdapter | GatewayService → ChatCompletionService | app/interfaces/feishu_im_adapter.py |
+| TUI/CLI Chat | Stdio+行式文本 | CliChatAdapter | GatewayService → ChatCompletionService | app/interfaces/cli/ |
+| ACP Agent | Stdio+JSON | NAgentACPAgent | GatewayService → ChatCompletionService | app/interfaces/cli/commands/acp/ |
+| 定时任务执行 | - | SchedulerRunner | ScheduleRunService → ChatCompletionService | app/application/scheduler_runner.py |
 
-| 入口  | 传输协议 | 编码协议 | 适配器 | 应用层 | 适配器源文件 |
-|------|---------|----------|-------|-------|------------|
-| Dashboard 管理 API | HTTP | JSON | create_*\_router / register_*\_routes | 不进入 Agent Runtime | app/interfaces/http/ |
-| OpenAI 兼容对话 API | HTTP/SSE | JSON | create_openai_compatible_router | ChatCompletionService | app/interfaces/http/openai_compatible.py |
-| 飞书 IM 长连接 | WebSocket | JSON | FeishuImAdapter | GatewayService → ChatCompletionService | app/interfaces/feishu_im_adapter.py |
-| TUI/CLI Chat | Stdio | 行式文本 | CliChatAdapter | GatewayService → ChatCompletionService | app/interfaces/cli/ |
-| ACP Agent | Stdio | JSON | NAgentACPAgent | GatewayService → ChatCompletionService | app/interfaces/cli/commands/acp/ |
-| 定时任务执行 | - | - | SchedulerRunner | ScheduleRunService → ChatCompletionService | app/application/scheduler_runner.py |
+其中，
+
+- 管理API不进入 Agent Runtime 应用层；
+- OpenAI 兼容对话 API 直接进入 ChatCompletionService；
+- 飞书 IM、TUI/CLI、ACP 的用户消息先经 GatewayService 统一做入口会话、消息管理，再进入 ChatCompletionService。
+- ACP协议生命周期保留在 NAgentACPAgent 中。
+- 定时任务执行由 SchedulerRunner 定时触发，并通过 ScheduleRunService->ScheduledAgentExecutor 直接调用 ChatCompletionService，执行结果再由 ScheduleOutboundDelivery 投递。
 
 
----
-待整理分界线
+# 待整理分界线
 
+<details>
+<summary>待整理</summary>
 
 ## 分层边界
 
@@ -634,3 +643,10 @@ Policy 负责决定动作是否允许执行，避免把权限、安全和风险�
 - SQLite、HTTP Client、具体工具 handler、Provider Adapter 放 Infrastructure。
 - 权限、风险等级和执行约束优先归 Policy。
 - 新增外部能力时先定义端口，再实现 Infrastructure Adapter。
+
+## 概念
+- REPL：Read → Evaluate → Print → Loop，交互式即时解释终端环境，输入一行代码 / 指令立刻执行、马上出反馈，循环等待你下一次输入
+- 
+
+
+</details>

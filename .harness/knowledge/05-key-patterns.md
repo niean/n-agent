@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射、TUI 一次会话完整执行链路 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -493,3 +493,79 @@ ACP event bridge 规则：
 - ACP SDK `update_tool_call` 返回 `ToolCallProgress`（`ToolCallUpdate` 子类），`Client.request_permission(tool_call: ToolCallUpdate)` 接受该返回值；不要用 `isinstance(update, ToolCallUpdate)` 做类型判断，SDK 类型在 conftest workaround 后可能不稳定
 - stdout 纯净性测试用 subprocess PIPE 捕获会因 ACP SDK asyncio write transport 与 pipe 交互挂起，必须用临时文件捕获 stdout
 - `ChatCompletionInput` 扩展新字段必须用 additive defaults（`None`），避免破坏既有调用方；`approval_decider=None` 时 `ChatCompletionService` 不覆盖 ctx.approval_decider
+
+## 模式二十一：TUI 一次会话完整执行链路
+
+`n-agent chat`（无 `--message`、stdin 是 TTY）进入 REPL，一次用户输入到 assistant 回复输出完成端到端链路。本模式串联模式十八（Gateway 流式）/十九（CLI 子命令）/三（LangGraph 编排）/七（Memory 端口）/十二（trusted_metadata），作为 TUI 入口的总结篇；细节不重复，仅给端到端顺序与关键交接点。
+
+链路（正常流式分支，破坏性命令分支见末尾）：
+
+1. REPL 启动（`app/interfaces/cli/commands/chat.py:run` → `ReplRunner._run_tty`）
+   - `build_application_services()` 组装服务，构造 `CliChatAdapter(gateway_service)`
+   - `conversation_id` 默认 `"local"`，可由 `--conversation-id` 覆盖
+   - prompt_toolkit `PromptSession` + `SlashNestedCompleter` + `FileHistory(~/.n-agent/cli_history)`，整个 loop body 在 `patch_stdout()` 内（详见模式十八）
+
+2. 用户输入分发（`ReplRunner._handle_input`）
+   - management 命令（`/provider`、`/sessions`、`/status` 等 10 类）→ `run_management_command` 直接调本地 service，不走 Gateway（详见模式十九）
+   - local 命令（`/help`、`/exit`、`/clear`、`/history`、`/confirm`、`/cancel`）→ 本地处理；`/confirm` 与 `/cancel` 走破坏性命令确认回路
+   - 其他文本 → `_send_stream(text)` 走 Gateway 流式
+
+3. 构造 InteractionMessage（`CliChatAdapter._build_event`）
+   - `InteractionMessage(id=f"cli-{uuid4()}", session_key=GatewaySessionKey("cli", conversation_id), text, metadata={"actor_id": f"cli:{conversation_id}"})`
+   - `actor_id` 必填，否则破坏性命令 preflight 视为无 actor 跳过确认（详见模式十八陷阱）
+
+4. Gateway 流式处理（`GatewayService.handle_message_stream`，详见模式十八）
+   - 幂等：`registry.mark_event_processed("cli", event.id, message_id)`，重复 yield `DONE(metadata={"duplicate": True})`
+   - 破坏性 preflight：`/new`/`/rename`/`/delete`/`/schedule remove` 且非 trusted actor → 创建 pending confirmation（15 分钟 TTL），yield `MESSAGE_DONE(finish_reason="confirmation_required", metadata={"confirmation": {...}})`
+   - 会话解析 `_resolve_session_id`：先 `registry.get_active_session(session_key)` 命中复用；未命中 `session_service.create_session("cli-{uuid4()}", source="cli")` + `registry.create_session_link`
+   - Slash 分流 `command_service.handle`：`/help`/`/sethome`/`/rename`/`/switch`/`/sessions`/`/tools`/`/models`/`/status`/`/schedule add|list|pause|resume|run` 命中即 yield `MESSAGE_DONE` + `DONE` 返回
+   - 构造 `trusted_metadata`：`gateway.source="cli"`、`actor_id`、`thread_id`、`receive_id` 等；CLI 无 `gateway.platform`，故 `_compute_permitted_managed_tools` 返回空 set（详见模式十二）
+   - 调 `chat_service.complete(ChatCompletionInput(stream=True, model=default_model, messages=[{role:user,content:text}], session_id, trusted_metadata, options={}))`
+
+5. ChatCompletionService.complete（`app/application/chat_service.py`）
+   - 会话已存在则 `create_session` 空操作；`memory_store.get_session` + `list_messages` 取历史
+   - 外部记忆 profile 锁定（首轮派生：已锁定→沿用 / 已有消息→`[]` / 显式 override→归一化 / 未传→`[]`），`memory_store.lock_session_external_memory` 持久化（详见模式七扩展五）
+   - `memory_store.append_message(role="user", content=text)` 落库
+   - `session_service.ensure_title(session_id, first_user_message)` fire-and-forget 触发标题生成
+   - 构造 `ToolExecutionContext`：`mode="realtime"`、`permitted_managed_tools`（CLI 空 set）、`allowed_confirm_tools`（`_mcp_tool_execution_context` 启发式从用户消息提取 URL + "探测/添加/刷新 mcp" 关键词）、`enabled_override=locked_external_memory`
+   - `stream=True` → 返回 `graph_runner.stream_events(state, model, options)`
+
+6. AgentGraphRunner.stream_events（`app/application/agent_graph.py`）
+   - yield `MESSAGE_START`；构造 `StreamingContextScrubber`（流式 scrub `<memory-context>` 块）
+   - `tool_event_queue` + `emit_tool_event` 注入 `stream_options["stream_event_sink"]`
+   - 后台 `run_task = asyncio.create_task(self.run(state, model, stream_options))`，`register_run(session_id, task)` 支持 cancel
+   - 主循环：`while not run_task.done()` 从 queue 取 tool 事件 yield（50ms 轮询）；run_task 完成后 drain 剩余
+   - 结果处理：`result.error` → yield `ERROR`；`result.final_message` 按 20 行 chunk 切分，逐块 `scrubber.feed` 后 yield `CONTENT_DELTA`，`flush` 剩余 → yield `MESSAGE_DONE(finish_reason)`
+   - yield `DONE` 结束；`finally` 清理 `_running_tasks`/`_cancel_events`
+
+7. LangGraph Agent Loop（`AgentGraphRunner.run` → `graph.ainvoke`，详见模式三）
+   - `load_context`：`memory_store.list_messages` + `get_summary` 构造 `working_messages=[system_prompt, ...history, ...input]`；`build_system_prompt(external_memory_manager, enabled_override)` 生成 system prompt
+   - `call_llm`：检查 `iteration_count >= iteration_limit`（默认 10）；`tool_service.list_openai_tools(safe_only?, context)`；外部记忆 `prefetch_all` 把记忆上下文拼到本次 user message 前（不修改 state）；`llm_provider.chat(api_messages, tools, False, model, options)`；`scrub_memory_context(final_message.content)` 清理回显；`pending_tool_calls = result.message.tool_calls or []`
+   - `_after_llm` 路由：error→finalize / pending_tool_calls→execute_tools / 否则→update_memory
+   - `execute_tools`：每个 tool_call 先 yield `TOOL_CALL_DELTA(pending)`；Approval gate（CONFIRM 风险 + `approval_decider` 注入时触发，CLI 默认无 decider）；`tool_service.execute(request, effective_context)`；yield `TOOL_CALL_DELTA(success|error, duration_ms)`；`memory_store.save_tool_call` 持久化；tool result append 到 `working_messages`
+   - `update_memory`：assistant message（含 tool_calls）+ tool result 落库；`save_task_state(running|failed, iteration_count)`；外部记忆 `pre_compress_all` 提取 rescued_context；`summarizer.summarize` → `save_summary`
+   - `_after_memory` 路由：error/final_message/iteration_limit→finalize / 否则 continue→call_llm
+   - `finalize`：error 处理（生成友好错误消息落库）；`external_memory_manager.sync_all(user, assistant, session_id, agent_context, enabled_override)` 同步外部记忆；`save_task_state(completed|failed)`
+
+8. CLI 流式消费（`app/interfaces/cli/streaming.consume_stream`）
+   - `MESSAGE_START` → 清空 accumulated
+   - `CONTENT_DELTA` → `console.print(content, end="")` + `flush_console`（rich patch_stdout 下必须显式 flush，详见记忆 feedback-rich-patch-stdout-flush）
+   - `TOOL_CALL_DELTA` → `render_tool_call`（rich 渲染工具调用框）
+   - `MESSAGE_DONE` → 若 `evt.content` 与 accumulated 不一致则 `render_markdown`；`finish_reason="confirmation_required"` → 触发 `on_confirmation(metadata)` 回调，REPL 记录 `last_confirmation_id` 并提示 `/confirm once|trust` 或 `/cancel`
+   - `ERROR` → `render_status` + 返回 1
+   - `DONE` → `metadata.duplicate` 时 warning，break
+
+破坏性命令确认回路（分支，由步骤 4 preflight 触发或步骤 8 用户主动发起）：
+- 用户输入 `/confirm once` / `/confirm trust` / `/cancel` → `ReplRunner._handle_confirm`/`_handle_cancel`
+- `CliChatAdapter.confirm(confirmation_id, choice, conversation_id)` → `gateway_service.handle_confirmation(session_key, actor_id, confirmation_id, choice_enum)`
+- `command_service.handle_confirmation`：校验 confirmation 存在/未过期/conversation 一致/actor 一致 → `CANCEL` 返回"已取消"；`TRUST_SESSION` 加入 `trusted_actors` set（同会话后续破坏性命令免确认）；`ONCE` 直接执行
+- `_execute(action, ...)`：`NEW`→create_session+link；`RENAME`→`session_service.rename_session`；`DELETE`→delete_session_link+delete_session+new session；`SCHEDULE_REMOVE`→校验 origin 与 trusted_metadata 一致后 `schedule_service.delete`（跨 origin/会话统一返回"任务不存在"，不暴露存在性差异）
+- 返回 `InteractionResponse`，CLI `render_markdown` 输出；`last_confirmation_id` 清空
+
+陷阱：
+- 步骤 3 `actor_id` 留空会让 `/new` 等破坏性命令绕过 confirmation（preflight 视为无 actor 不需要确认）
+- 步骤 4 CLI 不得写入 `gateway.platform`；`_compute_permitted_managed_tools` 只认可 `gateway.platform=feishu`，CLI 不得获得 Feishu 专属 managed tool
+- 步骤 6 `stream_events` 的 50ms 轮询 timeout 是为了在 run_task 完成前及时 yield 工具事件；timeout 过长会让工具事件延迟显示，过短会空转浪费 CPU
+- 步骤 7 `call_llm` 的 `prefetch_all` 注入是临时构造 `api_messages`，不修改 `state.working_messages`；否则记忆上下文会被持久化到 SQLite 造成脏数据
+- 步骤 7 `scrub_memory_context(final_message.content)` 必须在 `call_llm` 内立即执行，否则 `<memory-context>` 块会被 `update_memory` 落库污染历史
+- 步骤 8 `consume_stream` 的 `on_confirmation` 回调是同步函数，不能 `await`；通过闭包写入 `self._last_confirmation_id`

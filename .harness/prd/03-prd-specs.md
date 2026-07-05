@@ -277,12 +277,17 @@
     - ACP：验收和迭代
         - 迭代：ACP，用户消息session/prompt等走GatewayService → ChatCompletionService链路，ACP协议生命周期保留在ACP适配器，对齐飞书IM、TUI
 
+[20260706]
+- FR
+    - 文档：TUI，整理一次会话的完整执行链路，简洁输出
+
+
 ---
 
 [待办]
 - Issue
 - NFR
-    - 文档：TUI链路，ACP链路
+    - 文档：ACP链路
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
