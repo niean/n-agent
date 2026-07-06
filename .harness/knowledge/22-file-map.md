@@ -44,6 +44,7 @@
 - 外部记忆服务：`app/application/external_memory_service.py`，定义 `ExternalMemoryService`，组合 `ExternalMemoryManager` + `ExternalMemoryConfigRegistry` + 可选 `external_query_catalog`（延迟绑定 `ExternalMemoryProviderService.list`），暴露 `list_providers`（合并 registry 全量检索 provider，inactive 标 `active: False`，供历史会话忠实展示）、global enabled 持久化、文件记忆 project CRUD/entries 读写；catalog 为 None 或抛异常时退化为仅 manager 输出，向后兼容
 - 沙盒工具执行器：`app/application/sandbox_tool_executor.py`，定义 `SandboxToolExecutor`，execute_code 为 SAFE 工具，直接执行无 confirmation gate；`execute` 在会话锁内 per-call 构造 SandboxExecutionRequest 并通过 `_run_sandbox` 执行，sandbox 本身是安全边界（workspace :ro + scratch :rw + UDS RPC + callback allowlist + max_tool_calls + timeout）；`_resolve_enabled_tools` 取 registry.list_enabled 与请求 enabled_tools 的交集；sandbox 异常被捕获返回 `ToolResult(ERROR)` 不打断 AgentGraph；成功/失败/超时/异常全部写入 SandboxExecutionHistoryRegistry 作为审计历史，code_hash 一并记录
 - 沙盒 Dashboard 服务：`app/application/sandbox_dashboard_service.py`，定义 `SandboxDashboardService`，委托 manager/memory_store/history_registry 输出 config/active/released/history 只读视图与 release 管控，不读取内部 dict；执行历史优先读取 SandboxExecutionHistoryRegistry，并兼容合并旧 MemoryStore tool_calls 记录，删除历史时同时尝试删除沙盒历史和 legacy tool_call
+- Vision 工具执行器：`app/application/vision_tool_executor.py`，定义 `VisionAnalyzeToolExecutor`，实现 `vision_analyze` safe 工具（toolset=vision）；execute 校验 image_url（经 `content_utils.validate_image_url`），检查 active provider 的 `supports_vision`，调用 `provider.chat([], [], False, current_model(), {})` 无工具无递归地分析图片，返回 `ToolResult` SUCCESS/ERROR；不支持 vision 或 URL 非法时返回 ERROR 友好提示而非异常
 
 ## Infrastructure Layer
 
@@ -86,6 +87,7 @@
 ## Utils Layer
 
 - 记忆上下文 scrubber：`app/utils/memory_scrubber.py`，提供 `scrub_memory_context`（一次性正则，剥离完整 `<memory-context>...</memory-context>` 块）和 `StreamingContextScrubber`（有状态机，跨 chunk 维护 in_span/buf，处理流式分块边界的标签截断，未闭合 span 在 `flush()` 丢弃）；`call_llm` 用前者在 finalize 前清理 `final_message`，`stream_events` 用后者对 SSE chunk 逐块 scrub
+- 多模态内容工具：`app/utils/content_utils.py`，提供 `validate_image_url`（data URL 校验：MIME 白名单 image/png|jpeg|gif|webp + 20MB 上限 + base64 验证；http(s) 透传）、`parse_data_url`（data URL 拆分为 media_type+data）、`normalize_content`（将用户 content 归一化为 str 或 OpenAI 风格 `[{type:text},{type:image_url}]` 数组，非法 part 抛 ValueError）、`extract_text`（从 str/list content 提取纯文本，供摘要/标题/外部记忆 prefetch 使用，避免 base64 泄漏）、`has_image_part`、`prepend_text_part`；被 Domain/Application/Infrastructure/Interfaces 各层共享，不依赖任何外层模块
 
 ## Interfaces Layer
 

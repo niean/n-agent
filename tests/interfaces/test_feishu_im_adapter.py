@@ -8,13 +8,17 @@ from app.interfaces.feishu_im_adapter import FeishuImAdapter
 
 
 class FakeFeishuClient:
-    def __init__(self, payload=None):
+    def __init__(self, payload=None, image_bytes: bytes | None = None, image_mime: str = "image/png", download_error: Exception | None = None):
         self.payload = payload
         self.sent: list[tuple[str, str]] = []
         self.cards: list[tuple[str, dict, str]] = []
         self.updates: list[tuple[str, dict]] = []
         self.reactions: list[tuple[str, str]] = []
         self.events = []
+        self.image_bytes = image_bytes
+        self.image_mime = image_mime
+        self.download_error = download_error
+        self.download_calls: list[tuple[str, str]] = []
 
     def verify_long_connection_event(self, payload):
         self.events.append(payload)
@@ -38,6 +42,12 @@ class FakeFeishuClient:
 
     async def listen_events(self, handler):
         await handler(self.payload)
+
+    async def download_image(self, message_id, image_key):
+        self.download_calls.append((message_id, image_key))
+        if self.download_error is not None:
+            raise self.download_error
+        return self.image_bytes or b"\x89PNG\r\n\x1a\n", self.image_mime
 
 
 class FakeGatewayService:
@@ -145,9 +155,9 @@ async def test_long_connection_start_marks_connected_while_listening():
     assert adapter.fatal_error() is None
 
 
-async def test_long_connection_non_text_message_returns_unsupported_without_gateway_call():
+async def test_long_connection_unsupported_message_type_returns_unsupported_without_gateway_call():
     payload = text_payload()
-    payload["event"]["message"]["message_type"] = "image"
+    payload["event"]["message"]["message_type"] = "file"
     gateway = FakeGatewayService()
     client = FakeFeishuClient(payload)
     adapter = FeishuImAdapter(gateway, client)
@@ -156,6 +166,78 @@ async def test_long_connection_non_text_message_returns_unsupported_without_gate
 
     assert gateway.events == []
     assert client.sent == [("oc_1", "不支持该消息类型", "chat_id")]
+
+
+def image_payload(chat_type="p2p", image_key="img_key_1"):
+    return {
+        "schema": "2.0",
+        "header": {"event_id": "event-img-1", "app_id": "app-1"},
+        "event": {
+            "sender": {"sender_id": {"open_id": "ou_1"}, "sender_type": "user"},
+            "message": {
+                "message_id": "msg-img-1",
+                "chat_id": "oc_1",
+                "chat_type": chat_type,
+                "message_type": "image",
+                "content": json.dumps({"image_key": image_key}),
+            },
+        },
+    }
+
+
+async def test_long_connection_p2p_image_message_calls_gateway_with_data_url():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(image_payload(), image_bytes=b"\x89PNG\r\n\x1a\n")
+    adapter = FeishuImAdapter(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert client.download_calls == [("msg-img-1", "img_key_1")]
+    assert gateway.events
+    event = gateway.events[0]
+    assert event.text == ""
+    assert len(event.images) == 1
+    assert event.images[0].startswith("data:image/png;base64,")
+
+
+async def test_long_connection_image_download_failure_replies_retry_without_gateway_call():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(
+        image_payload(),
+        download_error=RuntimeError("feishu 500"),
+    )
+    adapter = FeishuImAdapter(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events == []
+    assert client.sent == [("oc_1", "图片下载失败，请重试", "chat_id")]
+
+
+async def test_long_connection_image_invalid_format_replies_invalid_without_gateway_call():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(
+        image_payload(),
+        download_error=ValueError("non-image content type"),
+    )
+    adapter = FeishuImAdapter(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events == []
+    assert client.sent == [("oc_1", "图片格式无效或过大", "chat_id")]
+
+
+async def test_long_connection_group_image_message_is_ignored():
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(image_payload(chat_type="group"), image_bytes=b"\x89PNG\r\n\x1a\n")
+    adapter = FeishuImAdapter(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert gateway.events == []
+    assert client.download_calls == []
+    assert client.sent == []
 
 
 async def test_long_connection_group_message_without_mention_is_ignored():

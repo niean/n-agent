@@ -195,6 +195,9 @@ class Harness:
             schedule_service=schedule_service,
         )
 
+    def command_service_pending_confirmations(self):
+        return self.service().command_service.pending_confirmations
+
 
 def message(text="hello", event_id="event-1"):
     return InteractionMessage(
@@ -777,3 +780,83 @@ def test_session_id_prefix_and_source_flattens_im_platforms():
 
     acp_key = GatewaySessionKey("acp", "acp-session-1")
     assert _session_id_prefix_and_source(acp_key) == ("acp", "acp")
+
+
+@pytest.mark.asyncio
+async def test_gateway_handle_message_text_and_images_constructs_content_array():
+    harness = Harness()
+    service = harness.service()
+
+    event = InteractionMessage(
+        id="evt-img-1",
+        session_key=GatewaySessionKey("cli", "local", display_name="Local"),
+        text="看这张图",
+        images=["data:image/png;base64,aGVsbG8="],
+    )
+    await service.handle_message(event)
+
+    request = harness.chat_service.requests[0]
+    content = request.messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "看这张图"}
+    assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+
+
+@pytest.mark.asyncio
+async def test_gateway_handle_message_image_only_constructs_image_only_content_array():
+    harness = Harness()
+    service = harness.service()
+
+    event = InteractionMessage(
+        id="evt-img-2",
+        session_key=GatewaySessionKey("cli", "local", display_name="Local"),
+        text="",
+        images=["data:image/png;base64,aGVsbG8="],
+    )
+    await service.handle_message(event)
+
+    request = harness.chat_service.requests[0]
+    content = request.messages[0]["content"]
+    assert isinstance(content, list)
+    assert len(content) == 1
+    assert content[0]["type"] == "image_url"
+
+
+@pytest.mark.asyncio
+async def test_gateway_handle_message_slash_with_images_rejected_without_confirmation():
+    harness = Harness()
+    service = harness.service()
+
+    event = InteractionMessage(
+        id="evt-slash-img",
+        session_key=GatewaySessionKey("cli", "local", display_name="Local"),
+        text="/new",
+        images=["data:image/png;base64,aGVsbG8="],
+        metadata={"actor_id": "cli:local"},
+    )
+    response = await service.handle_message(event)
+
+    assert harness.command_service_pending_confirmations() == {}
+    assert response.messages
+    assert "图片" in response.messages[0].content or "不支持" in response.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_gateway_handle_message_destructive_slash_with_images_rejected_without_confirmation():
+    harness = Harness()
+    service = harness.service()
+    await harness.registry.create_session_link(
+        GatewaySessionKey("cli", "local", display_name="Local"), "sess-existing"
+    )
+
+    event = InteractionMessage(
+        id="evt-slash-img-del",
+        session_key=GatewaySessionKey("cli", "local", display_name="Local"),
+        text="/delete",
+        images=["data:image/png;base64,aGVsbG8="],
+        metadata={"actor_id": "cli:local"},
+    )
+    response = await service.handle_message(event)
+
+    assert harness.command_service_pending_confirmations() == {}
+    assert response.messages

@@ -4,7 +4,7 @@ import pytest
 
 from app.domain.provider import LLMEventType
 from app.domain.tool import ToolExecutionContext
-from app.infrastructure.llm.anthropic_provider import AnthropicProvider
+from app.infrastructure.llm.anthropic_provider import AnthropicProvider, _content_to_blocks
 
 
 class FakeModels:
@@ -247,3 +247,85 @@ async def test_streaming_chat_returns_llm_events():
     assert any(event.type == LLMEventType.CONTENT_DELTA for event in events)
     assert any(event.type == LLMEventType.TOOL_CALL_DELTA for event in events)
     assert events[-1].type == LLMEventType.MESSAGE_DONE
+
+
+def test_content_to_blocks_text_part_becomes_text_block():
+    blocks = _content_to_blocks([{"type": "text", "text": "hello"}])
+    assert blocks == [{"type": "text", "text": "hello"}]
+
+
+def test_content_to_blocks_data_url_becomes_anthropic_image_block():
+    blocks = _content_to_blocks(
+        [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}]
+    )
+    assert blocks == [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+        }
+    ]
+
+
+def test_content_to_blocks_mixed_text_and_image():
+    blocks = _content_to_blocks(
+        [
+            {"type": "text", "text": "看这张图"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}},
+        ]
+    )
+    assert blocks == [
+        {"type": "text", "text": "看这张图"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"},
+        },
+    ]
+
+
+def test_content_to_blocks_http_image_url_raises_value_error():
+    with pytest.raises(ValueError, match="anthropic http image_url not supported"):
+        _content_to_blocks(
+            [{"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}]
+        )
+
+
+def test_content_to_blocks_string_content_returns_string():
+    assert _content_to_blocks("hi") == "hi"
+
+
+def test_content_to_blocks_none_returns_empty_string():
+    assert _content_to_blocks(None) == ""
+
+
+@pytest.mark.asyncio
+async def test_provider_converts_user_data_url_image_to_anthropic_block():
+    client = FakeClient()
+    provider = AnthropicProvider("http://test", "key", "default", client=client)
+
+    await provider.chat(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "分析图"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+                    },
+                ],
+            }
+        ],
+        [],
+        False,
+        "claude-opus-4-6",
+        {},
+    )
+
+    messages = client.messages.kwargs["messages"]
+    assert messages[0]["content"] == [
+        {"type": "text", "text": "分析图"},
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+        },
+    ]

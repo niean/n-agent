@@ -14,6 +14,7 @@ from app.application.chat_service import ChatCompletionInput, ChatCompletionResu
 from app.application.events import ChatEvent, ChatEventType
 from app.application.model_service import ModelService
 from app.domain.provider import resolve_model
+from app.utils.content_utils import has_image_part, normalize_content
 
 
 EXTERNAL_MODEL_ID = "N-Agent"
@@ -69,9 +70,30 @@ def create_openai_compatible_router(chat_service: ChatCompletionService, model_s
     @router.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest, x_session_id: str | None = Header(default=None)):
         resolved_model = resolve_model(request.model, model_service.default_model)
+        normalized_messages: list[dict[str, Any]] = []
+        for message in request.messages:
+            raw = message.model_dump()
+            role = raw.get("role")
+            content = raw.get("content", "")
+            if role == "user":
+                try:
+                    raw["content"] = normalize_content(content)
+                except ValueError as exc:
+                    code = str(exc) or "unsupported_content_type"
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": {"code": code, "message": code}},
+                    )
+            elif role in ("system", "tool"):
+                if has_image_part(content):
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": {"code": "unsupported_content_type", "message": "unsupported_content_type"}},
+                    )
+            normalized_messages.append(raw)
         app_input = ChatCompletionInput(
             model=resolved_model,
-            messages=[message.model_dump() for message in request.messages],
+            messages=normalized_messages,
             stream=request.stream,
             metadata=request.metadata,
             options=request.options,

@@ -34,6 +34,7 @@ from acp.schema import (
     AuthenticateResponse,
     CloseSessionResponse,
     ForkSessionResponse,
+    ImageContentBlock,
     Implementation,
     InitializeResponse,
     ListSessionsResponse,
@@ -146,7 +147,7 @@ class NAgentACPAgent(Agent):
             ),
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                prompt_capabilities=PromptCapabilities(image=False),
+                prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
                     fork=SessionForkCapabilities(),
                     list=SessionListCapabilities(),
@@ -369,8 +370,8 @@ class NAgentACPAgent(Agent):
             model = metadata.get("model") or self.services.provider_holder.current_model or "default"
             allowed_confirm = dict(metadata.get("allowed_confirm_tools") or {})
 
-            text = self._extract_text(prompt)
-            if not text:
+            text, images = self._content_from_prompt(prompt)
+            if not text and not images:
                 return PromptResponse(stop_reason="end_turn")
 
             if self._conn is None:
@@ -393,6 +394,7 @@ class NAgentACPAgent(Agent):
                 id=message_id or f"acp-{uuid4()}",
                 session_key=session_key,
                 text=text,
+                images=images,
                 metadata={
                     "actor_id": f"acp:{session_id}",
                     "message_id": message_id or "",
@@ -451,12 +453,23 @@ class NAgentACPAgent(Agent):
         await bridge.replay_history(messages, tool_calls)
 
     @staticmethod
-    def _extract_text(prompt: list[Any]) -> str:
-        parts: list[str] = []
+    def _content_from_prompt(prompt: list[Any]) -> tuple[str, list[str]]:
+        """Extract text and image data URLs from an ACP prompt block list.
+
+        Returns (text, images) where images is a list of data URLs
+        (``data:{mime_type};base64,{data}``). ImageContentBlock carries
+        base64 data per ACP SDK contract; http(s) URLs are not represented
+        as image blocks and are skipped here.
+        """
+        text_parts: list[str] = []
+        images: list[str] = []
         for block in prompt:
             if isinstance(block, TextContentBlock) and block.text:
-                parts.append(block.text)
-        return "\n".join(parts).strip()
+                text_parts.append(block.text)
+            elif isinstance(block, ImageContentBlock) and block.data:
+                mime = block.mime_type or "image/png"
+                images.append(f"data:{mime};base64,{block.data}")
+        return "\n".join(text_parts).strip(), images
 
     def _build_model_state(self) -> SessionModelState:
         holder = self.services.provider_holder

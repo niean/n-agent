@@ -92,17 +92,24 @@
         <section class="chat-stack" aria-label="对话区">
           <header class="panel-header">
             <strong id="chat-header">N-Agent Chat</strong>
-            <span class="muted">Enter 发送 / Shift+Enter 换行</span>
           </header>
           <div class="chat-stack__messages" id="chat-messages" aria-live="polite">
             <div class="message-stack" id="chat-message-stack"></div>
           </div>
           <div class="chat-stack__composer">
-            <textarea id="chat-input" placeholder="Message N-Agent..."></textarea>
-            <div class="chat-stack__send-row">
-              <button class="btn btn--primary" id="chat-send" type="button">Send</button>
+            <div class="chat-composer" id="chat-composer">
+              <div id="chat-image-previews" class="chat-image-previews"></div>
+              <textarea id="chat-input" placeholder="给 N-Agent 发送消息..." rows="1"></textarea>
+              <div class="chat-composer__bar">
+                <button class="chat-composer__icon-btn" id="chat-image-button" type="button" aria-label="上传图片" title="上传图片">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <input type="file" id="chat-image-input" accept="image/*" multiple hidden>
+                <button class="chat-composer__send" id="chat-send" type="button" aria-label="发送" title="发送">
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </div>
             </div>
-            <div class="chat-stack__hint">通过 /v1/chat/completions 发送，metadata.session_id 绑定会话。</div>
           </div>
         </section>
         <section class="status-panel status-panel--collapsible chat-debug-panel collapsed" id="chat-debug-panel">
@@ -203,6 +210,7 @@
                 <label>Base URL <input type="text" id="provider-base-url" required placeholder="http://..."></label>
                 <label>Model <input type="text" id="provider-model" required></label>
                 <label>API Key <input type="password" id="provider-api-key" placeholder="留空保持不变；输入空格清空"></label>
+                <label class="providers-form__checkbox"><input type="checkbox" id="provider-supports-vision"> 支持 Vision（图片输入）</label>
                 <div class="providers-form__hint muted" id="providers-form-hint"></div>
                 <div class="providers-form__actions">
                   <button class="btn btn--primary" type="submit" id="providers-form-save">保存</button>

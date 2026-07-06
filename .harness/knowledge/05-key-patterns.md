@@ -569,3 +569,44 @@ ACP event bridge 规则：
 - 步骤 7 `call_llm` 的 `prefetch_all` 注入是临时构造 `api_messages`，不修改 `state.working_messages`；否则记忆上下文会被持久化到 SQLite 造成脏数据
 - 步骤 7 `scrub_memory_context(final_message.content)` 必须在 `call_llm` 内立即执行，否则 `<memory-context>` 块会被 `update_memory` 落库污染历史
 - 步骤 8 `consume_stream` 的 `on_confirmation` 回调是同步函数，不能 `await`；通过闭包写入 `self._last_confirmation_id`
+
+## 模式二十一：多模态内容归一化与 vision 能力守卫
+
+多模态图片输入横跨 4 个入口（OpenAI HTTP API、Dashboard、飞书 IM、ACP）和 4 个 DDD 层，必须有一套统一的 content 归一化合同和 vision 能力守卫，避免 base64 泄漏到摘要/标题、避免不支持 vision 的 provider 收到图片导致 HTTP 500。
+
+归一化合同（`app/utils/content_utils.py`）：
+- `normalize_content(content)`：将用户 content 归一化为 `str`（纯文本）或 `list[dict]`（OpenAI 风格 `[{type:text},{type:image_url}]` 数组）；非法 part 类型抛 `ValueError("unsupported_content_type")`，data URL 不合法抛 `ValueError("invalid_image_url"|"image_too_large")`。被 `ChatCompletionService`（构造归一化消息，不修改 request.messages）和 OpenAI HTTP 路由（预验证 + 400）共享调用。
+- `validate_image_url(url)`：data URL 校验 MIME 白名单（image/png|jpeg|gif|webp）+ 20MB 上限 + base64 合法性；http(s) 透传（由 provider 自行 fetch）；其他 scheme 拒绝。
+- `extract_text(content)`：从 str/list content 提取纯文本，list 时只取 `type:text` 的 text 字段拼接，image_url part 被跳过。被 `HeuristicSummarizer`（摘要）、`ChatCompletionService`（首条用户消息→标题生成）、`AgentGraphRunner`（外部记忆 prefetch query）共享调用，避免 base64 写入摘要或外部记忆检索 query。
+- `parse_data_url(url)`：data URL 拆分为 (media_type, data)，被 ACP `event_bridge._replay_user_message_blocks` 和 Anthropic provider 共享调用。
+
+入口归一化路径：
+- OpenAI HTTP API（`openai_compatible.py`）：路由层对 user 消息 `normalize_content` 预验证，非法返回 400 + `error.code`；system/tool 消息带 image part 返回 400（不支持）；`ChatCompletionService` 二次归一化（幂等）。
+- Dashboard（`chat.js`）：前端构造 `[{type:text},{type:image_url}]` 数组或纯文本；`buildChatRequestBody` 根据 pendingImages 决定 content 类型；fetch 检查 `res.ok`，非 2xx 读 JSON error 展示。
+- 飞书 IM（`feishu_im_adapter.py`）：`_handle_image_message` 下载图片（`FeishuClient.download_image`，15MB 上限 + Content-Type 校验），base64 编码为 data URL，构造 `InteractionMessage(images=[data_url])`；GatewayService `_content_from_interaction` 将 text+images 合成 content array。
+- ACP（`agent.py`）：`_content_from_prompt(prompt)` 从 ACP prompt block list 提取 (text, images)，ImageContentBlock 的 data+mime_type 转 data URL，构造 `InteractionMessage(images=...)`。
+
+vision 能力守卫（`AgentGraphRunner.call_llm`）：
+- preflight 检查：若 `working_messages` 最后一条是 user 消息且 `has_image_part(content)` 且 `vision_capability()` 返回 False，直接设置 `state.final_message` 为友好提示（"当前模型不支持图片输入，请切换到支持 vision 的模型后再试"），`finish_reason="stop"`，不调用 provider。避免不支持 vision 的 provider 收到图片导致 HTTP 500。
+- `vision_capability` 由 `main.py` 注入 `lambda: bool(holder.current_config and holder.current_config.supports_vision)`，运行时反射 active provider 配置。
+
+Provider 转换：
+- OpenAI-compatible：content array 原样透传给 provider API。
+- Anthropic（`anthropic_provider.py`）：`_content_to_blocks` 将 OpenAI 风格 image_url 转换为 Anthropic 风格 `{"type":"image","source":{"type":"base64","media_type":...,"data":...}}`；http(s) image_url 抛 ValueError（保守路径，Anthropic SDK 支持 url source 但本期不依赖）。
+
+vision_analyze 工具（`VisionAnalyzeToolExecutor`）：
+- safe 工具（toolset=vision），LLM 主动调用，传入 image_url + question。
+- executor 校验 URL（`validate_image_url`），检查 `vision_capability()`，调用 `provider.chat([], [], False, current_model(), {})` 无工具无递归地分析图片。
+- 不支持 vision 或 URL 非法时返回 `ToolResult(ERROR)` 友好提示，不抛异常打断 AgentGraph。
+
+ACP 历史回放（`event_bridge._replay_user_message_blocks`）：
+- list content 逐 part 发送 session_update：text part → `update_user_message_text`；image_url data URL → `update_user_message(image_block(data, mime_type))`；http(s) image_url → `[图片]` 文本占位（ACP 协议无 http image URL 传输，避免崩溃）。
+- 严禁 `str(list)` 渲染（会显示 base64 JSON 原文）。
+
+陷阱：
+- `HeuristicSummarizer` 必须用 `extract_text` 而非 `str(content)`，否则 list content 会被 `str()` 渲染为 `"[{'type': 'text', ...}]"` 写入摘要，base64 可能泄漏。
+- `AgentGraphRunner` 外部记忆 prefetch query 必须用 `extract_text`，否则 base64 会作为检索 query 污染外部记忆。
+- OpenAI HTTP 路由必须 try/except `normalize_content` 的 ValueError 并返回 400，否则 ValueError 会传播为 500。
+- GatewayService 必须在 destructive preflight 前拒绝 slash+images 组合，否则会为带图片的 slash 命令创建 confirmation。
+- ACP `prompt()` 的 `if not text and not images: return end_turn` 必须同时检查 images，否则 image-only prompt 被当空消息拒绝。
+- Anthropic provider 的 http(s) image_url 必须抛 ValueError 而非静默跳过，否则图片被静默丢弃用户无感知。

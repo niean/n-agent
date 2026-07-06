@@ -201,10 +201,52 @@ def _convert_tool_messages(messages: list[dict[str, Any]], expected_ids: set[str
 
 def _content_to_blocks(content: Any) -> str | list[dict[str, Any]]:
     if isinstance(content, list):
-        return content
+        return [_convert_content_part(part) for part in content]
     if content is None:
         return ""
     return str(content)
+
+
+def _convert_content_part(part: dict[str, Any]) -> dict[str, Any]:
+    part_type = part.get("type")
+    if part_type == "image_url":
+        return _convert_image_url_part(part)
+    return part
+
+
+def _convert_image_url_part(part: dict[str, Any]) -> dict[str, Any]:
+    image_url = part.get("image_url") or {}
+    url = image_url.get("url") if isinstance(image_url, dict) else None
+    if not url:
+        return part
+    if url.startswith("data:"):
+        media_type, data = _parse_data_url(url)
+        if media_type is None:
+            return part
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }
+    if url.startswith("http://") or url.startswith("https://"):
+        raise ValueError("anthropic http image_url not supported")
+    return part
+
+
+def _parse_data_url(url: str) -> tuple[str | None, str]:
+    # 格式：data:<mime>;base64,<data>
+    if not url.startswith("data:"):
+        return None, ""
+    comma_idx = url.find(",")
+    if comma_idx < 0:
+        return None, ""
+    header = url[5:comma_idx]
+    data = url[comma_idx + 1 :]
+    if ";base64" not in header:
+        return None, ""
+    media_type = header.split(";")[0]
+    if not media_type.startswith("image/"):
+        return None, ""
+    return media_type, data
 
 
 def _parse_arguments(arguments: Any) -> dict[str, Any]:

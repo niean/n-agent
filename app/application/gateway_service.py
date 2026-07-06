@@ -335,6 +335,10 @@ class GatewayService:
         if not processed:
             return InteractionResponse(session_id="", messages=[], metadata={"duplicate": True})
 
+        slash_with_images = event.text.strip().startswith("/") and bool(event.images)
+        if slash_with_images:
+            return _response("", "slash 命令不支持附带图片")
+
         preflight = await self.command_service.handle_destructive_preflight(event)
         if preflight is not None:
             return preflight
@@ -347,7 +351,7 @@ class GatewayService:
         result = await self.chat_service.complete(
             ChatCompletionInput(
                 model=self.command_service.model_service.default_model,
-                messages=[{"role": "user", "content": event.text}],
+                messages=[{"role": "user", "content": _content_from_interaction(event)}],
                 stream=False,
                 metadata={
                     "gateway": _gateway_metadata(event),
@@ -387,6 +391,16 @@ class GatewayService:
             yield ChatEvent(ChatEventType.DONE, metadata={"duplicate": True})
             return
 
+        slash_with_images = event.text.strip().startswith("/") and bool(event.images)
+        if slash_with_images:
+            yield ChatEvent(
+                ChatEventType.MESSAGE_DONE,
+                content="slash 命令不支持附带图片",
+                finish_reason="stop",
+            )
+            yield ChatEvent(ChatEventType.DONE)
+            return
+
         preflight = await self.command_service.handle_destructive_preflight(event)
         if preflight is not None:
             outbound_meta = preflight.messages[0].metadata if preflight.messages else {}
@@ -418,7 +432,7 @@ class GatewayService:
         stream = await self.chat_service.complete(
             ChatCompletionInput(
                 model=model_override or self.command_service.model_service.default_model,
-                messages=[{"role": "user", "content": event.text}],
+                messages=[{"role": "user", "content": _content_from_interaction(event)}],
                 stream=True,
                 metadata={
                     "gateway": _gateway_metadata(event),
@@ -529,3 +543,14 @@ def _response(session_id: str, content: str, metadata: dict[str, Any] | None = N
 
 def _first_message_content(response: InteractionResponse) -> str:
     return response.messages[0].content if response.messages else ""
+
+
+def _content_from_interaction(event: InteractionMessage) -> str | list[dict[str, Any]]:
+    if not event.images:
+        return event.text
+    parts: list[dict[str, Any]] = []
+    if event.text:
+        parts.append({"type": "text", "text": event.text})
+    for url in event.images:
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts

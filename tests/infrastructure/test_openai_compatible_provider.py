@@ -119,3 +119,27 @@ async def test_provider_falls_back_to_default_when_model_is_placeholder(placehol
     await provider.chat([], [], False, placeholder, {})
 
     assert client.completions.kwargs["model"] == "real-model"
+
+
+@pytest.mark.asyncio
+async def test_provider_passes_through_multimodal_content_array():
+    # 多模态内容（content array）必须原样透传，不能被字符串化
+    client = FakeClient()
+    provider = OpenAICompatibleProvider("http://test", "key", "default", client=client)
+
+    content = [
+        {"type": "text", "text": "看这张图"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+    ]
+    await provider.chat(
+        [{"role": "user", "content": content}],
+        [],
+        False,
+        "model-a",
+        {},
+    )
+
+    messages = client.completions.kwargs["messages"]
+    assert messages[0]["content"] is content
+    assert isinstance(messages[0]["content"], list)
+    assert messages[0]["content"][1]["type"] == "image_url"

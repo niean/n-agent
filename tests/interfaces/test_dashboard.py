@@ -472,6 +472,71 @@ def test_provider_routes_full_lifecycle(tmp_path):
     assert holder.swaps[-1][0] == pid
 
 
+def test_provider_create_supports_vision_default_true_for_openai_compatible(tmp_path):
+    app, _, _ = _build_provider_app(tmp_path)
+    client = TestClient(app)
+    create = client.post(
+        "/chat/providers",
+        json={"name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1"},
+    )
+    assert create.status_code == 200
+    assert create.json()["supports_vision"] is True
+
+
+def test_provider_create_supports_vision_explicit_false(tmp_path):
+    app, _, _ = _build_provider_app(tmp_path)
+    client = TestClient(app)
+    create = client.post(
+        "/chat/providers",
+        json={
+            "name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1",
+            "supports_vision": False,
+        },
+    )
+    assert create.status_code == 200
+    assert create.json()["supports_vision"] is False
+
+
+def test_provider_create_supports_vision_string_rejected(tmp_path):
+    """字符串 'false' 不能被误当 False，必须 422。"""
+    app, _, _ = _build_provider_app(tmp_path)
+    client = TestClient(app)
+    create = client.post(
+        "/chat/providers",
+        json={
+            "name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1",
+            "supports_vision": "false",
+        },
+    )
+    assert create.status_code == 422
+
+
+def test_provider_update_supports_vision(tmp_path):
+    app, _, _ = _build_provider_app(tmp_path)
+    client = TestClient(app)
+    pid = client.post(
+        "/chat/providers",
+        json={"name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1"},
+    ).json()["id"]
+    patched = client.patch(
+        f"/chat/providers/{pid}",
+        json={"supports_vision": False},
+    )
+    assert patched.status_code == 200
+    assert patched.json()["supports_vision"] is False
+
+
+def test_provider_list_includes_supports_vision(tmp_path):
+    app, _, _ = _build_provider_app(tmp_path)
+    client = TestClient(app)
+    client.post(
+        "/chat/providers",
+        json={"name": "P1", "base_url": "http://x", "model": "m1", "api_key": "k1"},
+    )
+    listed = client.get("/chat/providers").json()
+    assert "supports_vision" in listed[0]
+
+
 def test_provider_create_validation(tmp_path):
     app, _, _ = _build_provider_app(tmp_path)
     client = TestClient(app)

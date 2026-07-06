@@ -280,27 +280,43 @@
 [20260706]
 - FR
     - 文档：TUI，整理一次会话的完整执行链路，简洁输出
+    - ACP：相比Hermes，ACP还缺少哪些功能？明确List出来
 
+[20260707]
+- FR
+    - 对话：[KF]多模态支持图片输入，vision_analyze，覆盖入口包括 API、飞书IM、ACP等
+        - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
+        - 审阅：发现并修复严重问题(20+个)，spec-260706-multimodal-vision.md
+            - < spec文件已修改，请审阅
+            - < 确认。plan写好后，需要我再次确认
+        - 审阅：发现并修复严重问题(20+个)，plan-260706-multimodal-vision.md(需求spec-260706-multimodal-vision.md)
+            - < plan文件已修改，请审阅
+        - 验收：生成验收事项和文件，spec/verify/verify-260706-multimodal-vision.md，要求 ①只包含端到端的人工验收项，禁止已自动验收项 ②分组List ③禁用视觉效果格式如加粗强调emoji表情
+    - 对话：多模态支持图片输入，验收、优化
+        - 对话：Chat，我发送的照片，AI回复后就看不到了；发送按钮，去掉蓝底色、改为普通底色
+        - 对话：Chat，外部记忆改名为记忆，点击记忆按钮后弹出Popover气泡卡片、选择记忆类型
+        - 对话：Chat，图片在对话框的渲染，小蓝边太宽了、很难看
+        - 对话：Chat，图片在对话框中，支持点击后弹出框预览
+- HE
+    - HE：修改Harness Workflow，①Phase2 spec生成后，引入Third模型、审阅修改spec文件，然后交回给主流程模型加载和审阅；②Phase3 plan生成后，引入Third模型、审阅修改plan文件，然后交回给主流程模型加载和审阅。我希望在现有的 .harness框架上做修改，且希望IDE无关(claudecode codex均能支持)
 
 ---
 
 [待办]
-- Issue
+- HE
+    - HE：补充`人工验收项`到plan文件，章节命名`## 人工验收`、放到`## 变更记录`上方，要求仅保留`人工/半人工验收项`
+    - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
 - NFR
-    - 文档：ACP链路
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
+    - 治理：能力分层，平台是提供方视角(管理员)、业务是使用方视角(用户)。以Skill为例，Skill系平台能力、Workflow是业务能力，两者复用领域层
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
-    - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
-    - HE：修改HarnessWF，补充`人工验收项`到plan文件，章节命名`## 人工验收`、放到`## 变更记录`上方，要求仅保留`人工/半人工验收项`
 - FR
-    - 对话：Chat，支持开启追问(Follow-Up Questions)，借鉴OpenWebUI
+    - 架构：MoA，对标Hermes
     - 工具：Skill自进化
     - 沙盒：支持Terminal命令执行，危险命令确认(对标Hermes)
-    - 架构：MoA，对标Hermes
-    - 治理：能力分层，平台是提供方视角(管理员)、业务是使用方视角(用户)。以Skill为例，Skill系平台能力、Workflow是业务能力，两者复用领域层
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明、多分类目录、plugin沙盒化
-    - 工具：相比Hermes，还缺少哪些功能？明确List出来
+    - 观测：Token计量
 
 ---
 

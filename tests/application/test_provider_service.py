@@ -45,6 +45,7 @@ class FakeRegistry:
             extra_headers=config.extra_headers,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
+            supports_vision=config.supports_vision,
         )
         self.items[pid] = cfg
         self.secrets[pid] = api_key or None
@@ -234,3 +235,64 @@ def test_update_active_refreshes_holder():
     holder.swaps.clear()
     asyncio.run(service.update_provider(cfg.id, ProviderUpdateInput(model="m2")))
     assert holder.swaps and holder.swaps[-1][0] == cfg.id
+
+
+def test_create_openai_compatible_default_supports_vision_true():
+    service, _, _ = _service()
+    cfg = asyncio.run(
+        service.create_provider(
+            ProviderCreateInput(name="A", base_url="http://x", model="m", api_key="k")
+        )
+    )
+    assert cfg.supports_vision is True
+
+
+def test_create_anthropic_default_supports_vision_false():
+    service, _, _ = _service()
+    cfg = asyncio.run(
+        service.create_provider(
+            ProviderCreateInput(
+                name="A", base_url="http://x", model="m", api_key="k", provider_type="anthropic"
+            )
+        )
+    )
+    assert cfg.supports_vision is False
+
+
+def test_create_explicit_supports_vision_overrides_default():
+    service, _, _ = _service()
+    cfg = asyncio.run(
+        service.create_provider(
+            ProviderCreateInput(
+                name="A", base_url="http://x", model="m", api_key="k", supports_vision=False
+            )
+        )
+    )
+    assert cfg.supports_vision is False
+
+
+def test_update_supports_vision_none_keeps_value():
+    service, _, _ = _service()
+    cfg = asyncio.run(
+        service.create_provider(
+            ProviderCreateInput(name="A", base_url="http://x", model="m", api_key="k")
+        )
+    )
+    updated = asyncio.run(service.update_provider(cfg.id, ProviderUpdateInput()))
+    assert updated.supports_vision is True
+
+
+def test_update_supports_vision_true_persists():
+    service, _, _ = _service()
+    cfg = asyncio.run(
+        service.create_provider(
+            ProviderCreateInput(
+                name="A", base_url="http://x", model="m", api_key="k", provider_type="anthropic"
+            )
+        )
+    )
+    assert cfg.supports_vision is False
+    updated = asyncio.run(
+        service.update_provider(cfg.id, ProviderUpdateInput(supports_vision=True))
+    )
+    assert updated.supports_vision is True

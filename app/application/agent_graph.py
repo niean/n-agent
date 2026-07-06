@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from inspect import isawaitable
 from typing import Any, Optional
@@ -27,6 +27,7 @@ from app.domain.tool import (
     ToolResult,
     ToolResultStatus,
 )
+from app.utils.content_utils import extract_text, has_image_part, prepend_text_part
 from app.utils.memory_scrubber import scrub_memory_context
 
 
@@ -39,6 +40,7 @@ class AgentGraphRunner:
         summarizer: Summarizer,
         iteration_limit: int = 10,
         external_memory_manager: ExternalMemoryManager | None = None,
+        vision_capability: Optional[Callable[[], bool]] = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -46,6 +48,7 @@ class AgentGraphRunner:
         self.summarizer = summarizer
         self.iteration_limit = iteration_limit
         self.external_memory_manager = external_memory_manager
+        self.vision_capability = vision_capability
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -199,6 +202,23 @@ class AgentGraphRunner:
                 context=options.get("tool_execution_context") if isinstance(options, dict) else None,
             )
 
+            # ----- vision preflight: 不支持 vision 时返回友好消息，不调用 provider -----
+            if (
+                state.working_messages
+                and self.vision_capability is not None
+                and not self.vision_capability()
+            ):
+                last_msg = state.working_messages[-1]
+                if last_msg.get("role") == "user" and has_image_part(last_msg.get("content")):
+                    state.iteration_count += 1
+                    state.final_message = {
+                        "role": "assistant",
+                        "content": "当前模型不支持图片输入，请切换到支持 vision 的模型后再试。",
+                    }
+                    state.finish_reason = "stop"
+                    state.pending_tool_calls = []
+                    return state
+
             # ----- 新增：外部记忆动态预取注入（临时构造 api_messages，不修改 state）-----
             if self.external_memory_manager and len(state.working_messages) > 0:
                 last_idx = len(state.working_messages) - 1
@@ -206,15 +226,15 @@ class AgentGraphRunner:
                 api_messages = state.working_messages.copy()
                 enabled_override: list[str] | None = state.run_options.get("external_memory_enabled")
                 if last_msg["role"] == "user":
+                    query_text = extract_text(last_msg["content"])
                     memory_context = self.external_memory_manager.prefetch_all(
-                        str(last_msg["content"]),
+                        query_text,
                         session_id=state.session_id,
                         enabled_override=enabled_override,
                     )
                     if memory_context:
                         last_msg_copy = last_msg.copy()
-                        new_content = memory_context + "\n\n" + last_msg["content"]
-                        last_msg_copy["content"] = new_content
+                        last_msg_copy["content"] = prepend_text_part(last_msg["content"], memory_context + "\n\n")
                         api_messages[last_idx] = last_msg_copy
                 working_messages_for_call = api_messages
             else:
@@ -467,17 +487,16 @@ class AgentGraphRunner:
         contents: list[str] = []
         for msg in input_messages:
             if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    contents.append(content)
+                text = extract_text(msg.get("content", ""))
+                if text:
+                    contents.append(text)
+                elif has_image_part(msg.get("content")):
+                    contents.append("[用户发送了图片]")
         return "\n".join(contents)
 
     def _extract_assistant_content(self, final_message: dict[str, Any]) -> str:
         """Extract assistant content from final_message."""
-        content = final_message.get("content", "")
-        if isinstance(content, str):
-            return content
-        return str(content)
+        return extract_text(final_message.get("content", ""))
 
     async def finalize(self, state: AgentState) -> AgentState:
         if not state.error and not state.final_message and state.iteration_count >= self.iteration_limit:

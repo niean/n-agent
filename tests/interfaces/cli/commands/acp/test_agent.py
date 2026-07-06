@@ -20,6 +20,7 @@ import pytest
 from acp.interfaces import Client
 from acp.schema import (
     AuthenticateResponse,
+    ImageContentBlock,
     InitializeResponse,
     NewSessionResponse,
     PromptResponse,
@@ -198,6 +199,10 @@ def _text_block(text: str) -> TextContentBlock:
     return TextContentBlock(text=text, type="text")
 
 
+def _image_block(data: str = "aGVsbG8=", mime_type: str = "image/png") -> ImageContentBlock:
+    return ImageContentBlock(type="image", data=data, mime_type=mime_type)
+
+
 # ---- S 1: on_connect is sync ------------------------------------------------
 
 
@@ -220,6 +225,7 @@ async def test_initialize_returns_response_with_capabilities(agent):
     assert response.agent_info.name == "n-agent"
     caps = response.agent_capabilities
     assert caps.load_session is True
+    assert caps.prompt_capabilities.image is True
     assert caps.session_capabilities is not None
     assert caps.session_capabilities.fork is not None
     assert caps.session_capabilities.list is not None
@@ -362,6 +368,46 @@ async def test_prompt_streams_events_and_returns_end_turn(agent, services, conn,
     update_types = [getattr(u, "session_update", None) for _, u in conn.updates]
     assert "user_message_chunk" not in update_types
     assert "agent_message_chunk" in update_types
+
+
+@pytest.mark.asyncio
+async def test_prompt_with_text_and_image_passes_images_to_gateway(agent, services, conn, settings):
+    agent.on_connect(conn)
+    host_root = settings.acp_host_workspace_root
+    new_resp = await agent.new_session(cwd=str(host_root / "project"))
+    sid = new_resp.session_id
+
+    response = await agent.prompt(
+        prompt=[_text_block("看这张图"), _image_block(data="aGVsbG8=", mime_type="image/png")],
+        session_id=sid,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert len(services.gateway_service.calls) == 1
+    gateway_event = services.gateway_service.calls[0]["event"]
+    assert gateway_event.text == "看这张图"
+    assert len(gateway_event.images) == 1
+    assert gateway_event.images[0] == "data:image/png;base64,aGVsbG8="
+
+
+@pytest.mark.asyncio
+async def test_prompt_with_image_only_not_treated_as_empty(agent, services, conn, settings):
+    agent.on_connect(conn)
+    host_root = settings.acp_host_workspace_root
+    new_resp = await agent.new_session(cwd=str(host_root / "project"))
+    sid = new_resp.session_id
+
+    response = await agent.prompt(
+        prompt=[_image_block(data="aGVsbG8=", mime_type="image/png")],
+        session_id=sid,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert len(services.gateway_service.calls) == 1
+    gateway_event = services.gateway_service.calls[0]["event"]
+    assert gateway_event.text == ""
+    assert len(gateway_event.images) == 1
+    assert gateway_event.images[0] == "data:image/png;base64,aGVsbG8="
 
 
 # ---- S 4: concurrent prompt on same session returns refusal -----------------

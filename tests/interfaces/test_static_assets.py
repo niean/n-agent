@@ -141,7 +141,7 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'event.shiftKey' in chat_js
     assert 'metadata' in chat_js
     assert "'[DONE]'" in chat_js or 'data: [DONE]' in chat_js
-    assert 'if (!text) return' in chat_js
+    assert 'if (!text && !pendingImages.length) return' in chat_js
     assert 'renameSession' in chat_js
     assert 'deleteSession' in chat_js
     assert 'modal.confirm(' in chat_js
@@ -314,7 +314,7 @@ def test_tool_debug_json_strings_are_formatted(tmp_path):
     assert "content.map((item, index) => `#${index + 1}\\n${formatDebugJson(item)}`).join('\\n\\n')" in chat_js
     assert "appendToolDebugContent(content, message.content || '')" in chat_js
     assert 'function hasVisibleContent(value)' in chat_js
-    assert "if (hasVisibleContent(message.content)) appendText(el, message.content)" in chat_js
+    assert "if (hasVisibleContent(content)) appendText(el, content)" in chat_js
 
 
 def test_assistant_tool_calls_are_not_rendered_as_chat_messages(tmp_path):
@@ -351,18 +351,25 @@ def test_chat_builtin_memory_is_disabled_by_default(tmp_path):
     getter_end = chat_js.index('function init()', getter_start)
     getter_body = chat_js[getter_start:getter_end]
 
+    # 描述文案：未锁定提示默认关闭+互斥+锁定语义；锁定后提示已锁定
     assert 'builtin 默认关闭' in render_body
     assert '文件记忆最多选择 1 个' in render_body
     assert '首轮发送后锁定' in render_body
-    assert '此会话的外部记忆已锁定' in render_body
-    assert 'cb.checked = false' in render_body
-    assert 'cb.disabled = locked' in render_body
-    assert "cb.dataset.slot = p.slot" in render_body
+    assert '此会话的记忆已锁定' in render_body
+    # 药丸默认不激活：active 状态由 useSessionConfig && enabledProviders.includes 决定，
+    # 未操作时 useSessionConfig=false，药丸不带 active class
+    assert 'const isActive = useSessionConfig && enabledProviders.includes(p.name)' in render_body
+    assert 'if (isActive) pill.classList.add(\'active\')' in render_body
+    # 锁定时药丸禁用
+    assert 'pill.disabled = locked' in render_body
+    assert "pill.dataset.slot = p.slot" in render_body
     assert 'draftExternalMemoryConfig' in chat_js
     assert 'if (!currentSessionId) return' not in render_body
-    assert "cb.checked && cb.dataset.slot === 'multi-project'" in render_body
-    assert "checkbox !== cb && checkbox.checked && checkbox.dataset.slot === 'multi-project'" in render_body
-    assert 'cb.checked = p.enabled_global' not in render_body
+    # multi-project slot 互斥：激活时取消其他同 slot 药丸
+    assert "nextActive && pill.dataset.slot === 'multi-project'" in render_body
+    assert "other !== pill && other.classList.contains('active') && other.dataset.slot === 'multi-project'" in render_body
+    # active 状态不直接取 p.enabled_global（仅用于可见性过滤）
+    assert 'pill.classList.add(\'active\')' in render_body
     assert '重置为默认配置' in render_body
     assert "const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig" in getter_body
     assert "if (!config?.modified) return []" in getter_body
@@ -385,8 +392,8 @@ def test_chat_external_memory_draft_selection_is_carried_into_new_session(tmp_pa
     assert 'draftExternalMemoryConfig = nextConfig' in render_body
 
 
-def test_chat_disabled_external_memory_is_not_shown_in_checkboxes(tmp_path):
-    """停用状态的外部记忆不会在会话选择界面展示。"""
+def test_chat_disabled_external_memory_is_not_shown_as_pills(tmp_path):
+    """停用状态的外部记忆不会在记忆药丸行展示。"""
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
     render_start = chat_js.index('function renderExternalMemoryUI()')
@@ -395,10 +402,10 @@ def test_chat_disabled_external_memory_is_not_shown_in_checkboxes(tmp_path):
 
     # 验证过滤逻辑存在：builtin 始终显示，项目记忆仅在全局启用或会话已选中时显示
     assert "p.name !== 'builtin' && !p.enabled_global && !enabledProviders.includes(p.name)" in render_body
-    # 验证过滤在创建 checkbox 之前执行
+    # 验证过滤在创建药丸之前执行
     filter_idx = render_body.index('p.name !== ' + "'builtin'")
-    create_checkbox_idx = render_body.index("const cb = document.createElement('input')")
-    assert filter_idx < create_checkbox_idx
+    create_pill_idx = render_body.index("const pill = document.createElement('button')")
+    assert filter_idx < create_pill_idx
 
 
 def test_chat_deleted_external_memory_uses_legacy_slot_inference(tmp_path):
@@ -423,30 +430,60 @@ def test_chat_deleted_external_memory_uses_legacy_slot_inference(tmp_path):
     assert 'slot: inferPhantomExternalMemorySlot(name, sessionSlots)' in render_body
 
 
-def test_chat_external_memory_collapsed_by_default(tmp_path):
-    """外部记忆默认收起，点击展开图标后可编辑，再点击收起。"""
+def test_chat_memory_uses_toolbar_popover_grouped_picker(tmp_path):
+    """记忆入口位于 composer 工具栏；点击"记忆"按钮弹出 Popover，
+    Popover 内按系统/文件/检索/已移除分组选择。"""
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
     css = client.get('/static/styles.css').text
 
-    # 验证状态变量存在
-    assert 'externalMemoryExpanded = false' in chat_js
-    # 验证切换函数存在
-    assert 'function toggleExternalMemory()' in chat_js
-    # 验证 header 区域和点击事件
-    assert "header.className = 'chat-external-memory__header'" in chat_js
-    assert 'header.addEventListener' in chat_js
-    # 验证展开图标：展开时 ▼，收起时 ▲
-    assert 'chat-external-memory__expand-icon' in chat_js
-    assert "externalMemoryExpanded ? '▼' : '▲'" in chat_js
-    # 验证 content 区域有收起样式
-    assert 'chat-external-memory__content--collapsed' in chat_js
+    # 折叠/展开机制已移除
+    assert 'externalMemoryExpanded' not in chat_js
+    assert 'function toggleExternalMemory()' not in chat_js
+    assert "chat-external-memory__header" not in chat_js
+    assert "chat-external-memory__content--collapsed" not in chat_js
+    assert "externalMemoryExpanded ? '▼' : '▲'" not in chat_js
 
-    # CSS 验证
-    assert '.chat-external-memory__header' in css
-    assert 'cursor: pointer' in css  # 可点击
-    assert '.chat-external-memory__content--collapsed' in css
-    assert 'max-height: 0' in css  # 收起时高度为 0
+    # 触发按钮改名为"记忆"
+    assert "trigger.textContent = '记忆'" in chat_js
+    assert "title.textContent = '外部记忆'" not in chat_js
+
+    # 工具栏按钮 + Popover 结构
+    assert "const composerBar = document.querySelector('.chat-composer__bar')" in chat_js
+    assert 'composerBar.insertBefore(emContainer, sendBtn)' in chat_js
+    assert "bar.className = 'chat-memory-bar'" in chat_js
+    assert "trigger.className = 'chat-memory-trigger'" in chat_js
+    assert "popover.className = 'chat-memory-popover'" in chat_js
+    assert "pill.className = 'chat-memory-option'" in chat_js
+    assert "memoryPopoverOpen = !memoryPopoverOpen" in chat_js
+    assert "document.addEventListener('click', handleMemoryDocumentClick)" in chat_js
+
+    # Popover 分组恢复：系统 / 文件 / 检索 / 已移除
+    assert "const GROUP_ORDER = ['builtin', 'multi-project', 'external-query', 'removed']" in chat_js
+    assert "'builtin': '系统'" in chat_js
+    assert "'multi-project': '文件'" in chat_js
+    assert "'external-query': '检索'" in chat_js
+    assert "'removed': '已移除'" in chat_js
+    assert "group.className = 'chat-memory-popover__group'" in chat_js
+    assert "groupTitle.className = 'chat-memory-popover__group-title'" in chat_js
+
+    # CSS：trigger + popover + option active 主色
+    assert '.chat-memory-bar' in css
+    assert '.chat-memory-trigger' in css
+    assert '.chat-memory-popover' in css
+    assert '.chat-memory-popover__group' in css
+    assert '.chat-memory-popover__group-title' in css
+    assert '.chat-memory-option' in css
+    assert 'border-radius: 999px' in css
+    assert '.chat-memory-option.active' in css
+    assert 'var(--color-primary)' in css
+    assert 'var(--color-on-primary)' in css
+    assert '.chat-memory-popover__reset' in css
+
+    # 旧折叠 CSS 已移除
+    assert '.chat-external-memory__header' not in css
+    assert '.chat-external-memory__content--collapsed' not in css
+    assert '.chat-external-memory__checkboxes' not in css
 
 
 def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
@@ -680,3 +717,145 @@ def test_retrieval_table_has_recall_mode_column_with_tip(tmp_path):
     assert 'hybrid' in body and 'context' in body and 'tools' in body
     # 行渲染应调用 recallModeOf
     assert 'recallModeOf' in body
+
+
+def test_chat_supports_image_upload_paste_and_rendering(tmp_path):
+    """S1-S4: Dashboard chat supports image upload, paste, preview, image-only sends,
+    list content rendering with img elements, and fetch error handling."""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    html = client.get('/chat').text
+
+    # S1: image upload/paste infrastructure
+    assert 'pendingImages' in chat_js
+    assert 'FileReader' in chat_js
+    assert 'readAsDataURL' in chat_js
+    assert "addEventListener('paste'" in chat_js
+    assert 'chat-image-input' in chat_js
+    assert 'image_url' in chat_js
+
+    # S2: image-only not blocked (old `if (!text) return` replaced)
+    assert 'if (!text && !pendingImages.length) return' in chat_js
+    assert 'buildChatRequestBody(text, sentImages)' in chat_js
+    assert 'const outgoingImages = images || pendingImages' in chat_js
+
+    # S3: list content rendering uses img element, no innerHTML
+    assert "document.createElement('img')" in chat_js
+    assert 'innerHTML =' not in chat_js
+
+    # S4: fetch checks res.ok and handles non-2xx errors
+    assert 'res.ok' in chat_js
+
+    # HTML: composer has image button, hidden file input, preview container
+    assert 'id="chat-image-button"' in html
+    assert 'id="chat-image-input"' in html
+    assert 'id="chat-image-previews"' in html
+
+
+def test_provider_form_includes_supports_vision_checkbox(tmp_path):
+    """S5: Provider form includes supports_vision checkbox."""
+    client = _client(tmp_path)
+    html = client.get('/models').text
+    assert 'id="provider-supports-vision"' in html
+
+
+def test_models_js_reads_writes_supports_vision(tmp_path):
+    """S9: models.js reads/writes supports_vision and shows Vision column."""
+    client = _client(tmp_path)
+    models_js = client.get('/static/models.js').text
+    assert 'provider-supports-vision' in models_js
+    assert 'supports_vision' in models_js
+    assert 'Vision' in models_js
+
+
+def test_chat_composer_uses_doubao_style_rounded_container(tmp_path):
+    """Chat composer redesigned to Doubao style: rounded container holding
+    previews + textarea + icon button bar. Memory mode switcher lives in the toolbar."""
+    client = _client(tmp_path)
+    html = client.get('/chat').text
+    css = client.get('/static/styles.css').text
+    chat_js = client.get('/static/chat.js').text
+
+    # HTML: composer wrapped in .chat-composer rounded container
+    assert 'class="chat-composer"' in html or 'class="chat-composer ' in html
+    assert 'id="chat-composer"' in html
+    # Image previews live inside the composer container, above textarea
+    composer_start = html.index('id="chat-composer"')
+    previews_idx = html.index('id="chat-image-previews"', composer_start)
+    textarea_idx = html.index('id="chat-input"', composer_start)
+    bar_idx = html.index('chat-composer__bar', composer_start)
+    assert previews_idx < textarea_idx < bar_idx
+
+    # HTML: image button is icon button (no text label), send button is icon (no "Send" text)
+    assert 'chat-composer__icon-btn' in html
+    assert 'chat-composer__send' in html
+    assert '<svg' in html
+    # Old text labels gone
+    assert '>图片<' not in html
+    assert '>Send<' not in html
+
+    # CSS: composer has rounded border, focus state
+    assert '.chat-composer {' in css or '.chat-composer{' in css
+    assert 'border-radius: 18px' in css
+    assert '.chat-composer:focus-within' in css
+    # CSS: icon buttons are circular
+    assert '.chat-composer__icon-btn' in css
+    assert '.chat-composer__send' in css
+    assert 'border-radius: 50%' in css
+    assert '.chat-composer__bar' in css
+    assert 'gap: 8px' in css
+    # CSS: send button uses primary color (standalone rule, not the combined selector)
+    # Find the standalone `.chat-composer__send {` rule (preceded by `}` or start of line)
+    import re as _re
+    send_matches = list(_re.finditer(r'\.chat-composer__send\s*\{[^}]*\}', css))
+    send_rules = [m.group(0) for m in send_matches]
+    standalone = [r for r in send_rules if 'var(--color-primary)' in r]
+    assert standalone, f"no .chat-composer__send rule with var(--color-primary): {send_rules}"
+    assert any('var(--color-on-primary)' in r for r in standalone)
+    # CSS: image previews styled as thumbnails with remove button
+    assert '.chat-image-preview {' in css or '.chat-image-preview{' in css
+    assert '.chat-image-preview__remove' in css
+    # CSS: messages have Doubao-style rounded bubbles, images constrained
+    assert '.msg img {' in css or '.msg img{' in css
+    assert 'max-width' in css
+    assert 'border-bottom-right-radius: 4px' in css  # user bubble tail
+    assert 'border-bottom-left-radius: 4px' in css   # assistant bubble tail
+
+    # JS: setSending no longer swaps textContent (icon button keeps SVG)
+    setSending_start = chat_js.index('function setSending(next)')
+    setSending_end = chat_js.index('function setStatusMessage', setSending_start)
+    setSending_body = chat_js[setSending_start:setSending_end]
+    assert 'textContent' not in setSending_body
+    assert 'btn.disabled = next' in setSending_body
+
+
+def test_chat_message_images_render_after_refresh(tmp_path):
+    """Bug fix (PRD 03-prd-specs line 295): user-sent images must remain visible
+    after AI replies. renderSessionMessages re-renders all messages from server
+    data, including user messages whose content is a list with image_url parts."""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+
+    # createMessageElement handles array content with image_url parts
+    create_start = chat_js.index('function createMessageElement(message)')
+    create_end = chat_js.index('function shouldRenderMessage(message)', create_start)
+    create_body = chat_js[create_start:create_end]
+    assert "Array.isArray(content)" in create_body
+    assert "part.type === 'image_url'" in create_body
+    assert "part.image_url.url" in create_body
+    assert "document.createElement('img')" in create_body
+    assert "imgEl.src = part.image_url.url" in create_body
+
+    # renderSessionMessages clears and re-renders from server detail.messages
+    render_start = chat_js.index('function renderSessionMessages(detail)')
+    render_end = chat_js.index('async function loadSessions()', render_start)
+    render_body = chat_js[render_start:render_end]
+    assert 'clearNode(stack)' in render_body
+    assert 'detail.messages' in render_body
+    assert 'createMessageElement(message)' in render_body
+
+    # refreshCurrentSession calls renderSessionMessages(detail) after stream ends
+    refresh_start = chat_js.index('async function refreshCurrentSession()')
+    refresh_end = chat_js.index('async function send()', refresh_start)
+    refresh_body = chat_js[refresh_start:refresh_end]
+    assert 'renderSessionMessages(detail)' in refresh_body

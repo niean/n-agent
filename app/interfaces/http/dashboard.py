@@ -439,6 +439,7 @@ def _provider_to_dict(cfg: ProviderConfig) -> dict:
         "extra_headers": cfg.extra_headers,
         "created_at": cfg.created_at.isoformat(),
         "updated_at": cfg.updated_at.isoformat(),
+        "supports_vision": cfg.supports_vision,
     }
 
 
@@ -787,6 +788,9 @@ def _register_provider_routes(router: APIRouter, provider_service: ProviderServi
 
     @router.post("/chat/providers")
     async def create_provider(payload: dict = Body(...)):
+        supports_vision_raw = payload.get("supports_vision")
+        if supports_vision_raw is not None and not isinstance(supports_vision_raw, bool):
+            return _provider_error_response(ProviderValidationError("supports_vision must be a boolean"))
         try:
             cfg = await provider_service.create_provider(
                 ProviderCreateInput(
@@ -796,6 +800,7 @@ def _register_provider_routes(router: APIRouter, provider_service: ProviderServi
                     api_key=payload.get("api_key", ""),
                     provider_type=payload.get("provider_type", "openai-compatible"),
                     extra_headers=payload.get("extra_headers"),
+                    supports_vision=supports_vision_raw,
                 )
             )
         except (ProviderValidationError, DuplicateProviderError) as exc:
@@ -804,6 +809,9 @@ def _register_provider_routes(router: APIRouter, provider_service: ProviderServi
 
     @router.patch("/chat/providers/{provider_id}")
     async def update_provider(provider_id: str, payload: dict = Body(...)):
+        supports_vision_raw = payload.get("supports_vision")
+        if supports_vision_raw is not None and not isinstance(supports_vision_raw, bool):
+            return _provider_error_response(ProviderValidationError("supports_vision must be a boolean"))
         try:
             cfg = await provider_service.update_provider(
                 provider_id,
@@ -814,6 +822,7 @@ def _register_provider_routes(router: APIRouter, provider_service: ProviderServi
                     provider_type=payload.get("provider_type"),
                     api_key=payload.get("api_key"),
                     extra_headers=payload.get("extra_headers"),
+                    supports_vision=supports_vision_raw,
                 ),
             )
         except (

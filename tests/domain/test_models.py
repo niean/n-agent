@@ -1,7 +1,9 @@
 from dataclasses import fields
+from datetime import datetime, timezone
+import inspect
 
 from app.domain.agent import AgentState
-from app.domain.provider import ModelInfo
+from app.domain.provider import ModelInfo, ProviderConfig, ProviderRegistry
 from app.domain.gateway import GatewayOutboundMessage, GatewaySessionKey, InteractionMessage
 from app.domain.platform import Platform
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
@@ -82,3 +84,67 @@ def test_gateway_outbound_message_defaults_metadata():
     message = GatewayOutboundMessage(content="done")
 
     assert message.metadata == {}
+
+
+def _provider_config_kwargs(**overrides):
+    now = datetime.now(timezone.utc)
+    base = dict(
+        id="p1",
+        name="n",
+        provider_type="openai-compatible",
+        base_url="http://example.test/v1",
+        model="m",
+        api_key_present=True,
+        is_active=True,
+        extra_headers=None,
+        created_at=now,
+        updated_at=now,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_provider_config_supports_vision_defaults_false():
+    cfg = ProviderConfig(**_provider_config_kwargs())
+    assert cfg.supports_vision is False
+
+
+def test_provider_config_supports_vision_explicit_true():
+    cfg = ProviderConfig(**_provider_config_kwargs(supports_vision=True))
+    assert cfg.supports_vision is True
+
+
+def test_provider_registry_update_provider_signature_has_supports_vision():
+    sig = inspect.signature(ProviderRegistry.update_provider)
+    assert "supports_vision" in sig.parameters
+
+
+def test_interaction_message_images_defaults_empty():
+    message = InteractionMessage(
+        id="event-1",
+        session_key=GatewaySessionKey("cli", "local"),
+        text="hello",
+    )
+    assert message.images == []
+
+
+def test_interaction_message_images_explicit():
+    message = InteractionMessage(
+        id="event-1",
+        session_key=GatewaySessionKey("cli", "local"),
+        text="",
+        images=["data:image/png;base64,aGVsbG8="],
+    )
+    assert len(message.images) == 1
+    assert message.images[0] == "data:image/png;base64,aGVsbG8="
+
+
+def test_interaction_message_positional_construction_still_works():
+    """旧位置参数构造不被 images 字段破坏。"""
+    message = InteractionMessage(
+        "event-1",
+        GatewaySessionKey("cli", "local"),
+        "hello",
+    )
+    assert message.text == "hello"
+    assert message.images == []

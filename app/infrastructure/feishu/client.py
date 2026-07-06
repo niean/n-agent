@@ -145,6 +145,22 @@ class FeishuClient:
         self._tenant_access_token_expires_at = time.time() + max(expire - 60, 0)
         return token
 
+    async def download_image(self, message_id: str, image_key: str) -> tuple[bytes, str | None]:
+        tenant_access_token = await self.get_tenant_access_token()
+        response = await self.http_client.get(
+            f"/open-apis/im/v1/messages/{message_id}/resources/{image_key}",
+            params={"type": "image"},
+            headers={"Authorization": f"Bearer {tenant_access_token}"},
+        )
+        response.raise_for_status()
+        data = response.content
+        if len(data) > 15 * 1024 * 1024:
+            raise ValueError("image too large")
+        mime = response.headers.get("Content-Type")
+        if mime and not mime.startswith("image/"):
+            raise ValueError("non-image content type")
+        return data, mime
+
     def _verify_payload(self, payload: dict[str, Any]) -> None:
         header = payload.get("header", {})
         if self.config.app_id and header.get("app_id", self.config.app_id) != self.config.app_id:

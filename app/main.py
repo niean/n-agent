@@ -30,6 +30,7 @@ from app.application.session_service import SessionService
 from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
 from app.application.plugin_service import PluginService, PluginToolExecutor
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
+from app.application.vision_tool_executor import VisionAnalyzeToolExecutor
 from app.config import Settings
 from app.domain.knowledge import KnowledgeBaseType
 from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, PlatformRegistry
@@ -265,6 +266,12 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     )
     routes = {tool_name: builtin_executor for tool_name in BUILTIN_TOOL_NAMES}
     routes["search_knowledge"] = kb_executor
+    vision_executor = VisionAnalyzeToolExecutor(
+        provider=holder,
+        vision_capability=lambda: bool(holder.current_config and holder.current_config.supports_vision),
+        current_model=lambda: holder.current_model,
+    )
+    routes["vision_analyze"] = vision_executor
     knowledge_definition = _run_sync(knowledge_service.knowledge_tool_definition())
     tool_definitions = (
         builtin_tool_definitions(settings.web_fetch_enabled)
@@ -462,6 +469,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         summarizer,
         settings.agent_iteration_limit,
         external_memory_manager=external_memory_manager,
+        vision_capability=lambda: bool(holder.current_config and holder.current_config.supports_vision),
     )
     session_service = SessionService(
         memory_store,

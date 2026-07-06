@@ -31,7 +31,8 @@ class SQLiteProviderRegistry(ProviderRegistry):
                     extra_headers_json TEXT,
                     is_active INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    supports_vision INTEGER NOT NULL DEFAULT 0
                 )
                 """
             )
@@ -39,6 +40,21 @@ class SQLiteProviderRegistry(ProviderRegistry):
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_providers_active "
                 "ON providers(is_active) WHERE is_active = 1"
             )
+            self._ensure_supports_vision_column(conn)
+
+    def _ensure_supports_vision_column(self, conn: sqlite3.Connection) -> None:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(providers)")}
+        if "supports_vision" not in cols:
+            try:
+                conn.execute(
+                    "ALTER TABLE providers ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.execute(
+                    "UPDATE providers SET supports_vision = 1 WHERE provider_type = ?",
+                    ("openai-compatible",),
+                )
+            except sqlite3.OperationalError:
+                pass  # 列已存在
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -63,8 +79,8 @@ class SQLiteProviderRegistry(ProviderRegistry):
                 conn.execute(
                     """
                     INSERT INTO providers(id, name, provider_type, base_url, model, api_key,
-                        extra_headers_json, is_active, created_at, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        extra_headers_json, is_active, created_at, updated_at, supports_vision)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         provider_id,
@@ -77,6 +93,7 @@ class SQLiteProviderRegistry(ProviderRegistry):
                         1 if config.is_active else 0,
                         now.isoformat(),
                         now.isoformat(),
+                        1 if config.supports_vision else 0,
                     ),
                 )
         except sqlite3.IntegrityError as exc:
@@ -96,6 +113,7 @@ class SQLiteProviderRegistry(ProviderRegistry):
         extra_headers: dict[str, str] | None = None,
         api_key: str | None = None,
         clear_api_key: bool = False,
+        supports_vision: bool | None = None,
     ) -> ProviderConfig:
         existing = await self.get_provider(provider_id)
         if existing is None:
@@ -122,6 +140,9 @@ class SQLiteProviderRegistry(ProviderRegistry):
         elif api_key is not None:
             sets.append("api_key = ?")
             params.append(api_key)
+        if supports_vision is not None:
+            sets.append("supports_vision = ?")
+            params.append(1 if supports_vision else 0)
         sets.append("updated_at = ?")
         params.append(datetime.now(timezone.utc).isoformat())
         params.append(provider_id)
@@ -180,4 +201,5 @@ class SQLiteProviderRegistry(ProviderRegistry):
             extra_headers=json.loads(row["extra_headers_json"]) if row["extra_headers_json"] else None,
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+            supports_vision=bool(row["supports_vision"]) if "supports_vision" in row.keys() else False,
         )

@@ -85,6 +85,7 @@ class ProviderConfig:
     extra_headers: dict[str, str] | None
     created_at: datetime
     updated_at: datetime
+    supports_vision: bool = False
 
 
 class ProviderNotFoundError(Exception):
@@ -124,6 +125,7 @@ class ProviderRegistry(Protocol):
         extra_headers: dict[str, str] | None = None,
         api_key: str | None = None,
         clear_api_key: bool = False,
+        supports_vision: bool | None = None,
     ) -> ProviderConfig:
         ...
 

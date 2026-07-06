@@ -334,3 +334,111 @@ async def test_complete_preserves_existing_acp_session_source(tmp_path):
     session = await store.get_session("s1")
     assert session is not None
     assert session.source == "acp"
+
+
+@pytest.mark.asyncio
+async def test_chat_service_normalizes_input_image_to_image_url_when_persisted(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看这张图"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+                    ],
+                }
+            ],
+            stream=False,
+            session_id="s-vision",
+        )
+    )
+
+    messages = await store.list_messages("s-vision")
+    user_msgs = [m for m in messages if m.role == "user"]
+    assert user_msgs
+    content = user_msgs[0].content
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "看这张图"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_chat_service_title_receives_text_only_without_image_data(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    title_generator = StubTitleGenerator("图片问答")
+    session_service = SessionService(store, title_generator=title_generator)
+    service = ChatCompletionService(store, runner, session_service)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "帮我分析图"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                }
+            ],
+            stream=False,
+            session_id="s-title-img",
+        )
+    )
+
+    import asyncio
+
+    for _ in range(20):
+        session = await store.get_session("s-title-img")
+        if session and not session.has_default_title():
+            break
+        await asyncio.sleep(0.05)
+
+    assert title_generator.calls
+    title_input = title_generator.calls[0]
+    assert "data:image" not in title_input
+    assert "image_url" not in title_input
+    assert "[" not in title_input
+    assert title_input == "帮我分析图"
+
+
+@pytest.mark.asyncio
+async def test_chat_service_image_only_message_persisted_and_not_dropped(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                }
+            ],
+            stream=False,
+            session_id="s-img-only",
+        )
+    )
+
+    messages = await store.list_messages("s-img-only")
+    user_msgs = [m for m in messages if m.role == "user"]
+    assert user_msgs
+    content = user_msgs[0].content
+    assert isinstance(content, list)
+    assert len(content) == 1
+    assert content[0]["type"] == "image_url"

@@ -192,6 +192,21 @@ def builtin_tool_definitions(web_fetch_enabled: bool = True) -> list[ToolDefinit
             source_type=ToolSourceType.BUILTIN,
             toolset="web",
         ),
+        ToolDefinition(
+            name="vision_analyze",
+            description="Analyze an image using the active provider's vision capability. Accepts data URL or http(s) URL.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "image_url": {"type": "string", "minLength": 1},
+                    "question": {"type": "string", "minLength": 1},
+                },
+                "required": ["image_url", "question"],
+                "additionalProperties": False,
+            },
+            source_type=ToolSourceType.BUILTIN,
+            toolset="vision",
+        ),
     ]
 
 

@@ -413,3 +413,65 @@ async def test_replay_history_assistant_with_text_and_tool_calls_emits_both():
     types = [_update_type(u[1]) for u in conn.updates]
     assert "agent_message_chunk" in types
     assert "tool_call" in types
+
+
+@pytest.mark.asyncio
+async def test_replay_history_user_message_with_list_content_sends_per_block_updates():
+    conn = FakeConn()
+    bridge = ACPEventBridge(conn, "s1")
+
+    messages = [
+        ConversationMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "看这张图"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+            ],
+        ),
+    ]
+
+    await bridge.replay_history(messages, [])
+
+    assert len(conn.updates) == 2
+    assert _update_type(conn.updates[0][1]) == "user_message_chunk"
+    assert _update_type(conn.updates[1][1]) == "user_message_chunk"
+
+
+@pytest.mark.asyncio
+async def test_replay_history_user_message_with_image_only_sends_single_image_update():
+    conn = FakeConn()
+    bridge = ACPEventBridge(conn, "s1")
+
+    messages = [
+        ConversationMessage(
+            role="user",
+            content=[
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+            ],
+        ),
+    ]
+
+    await bridge.replay_history(messages, [])
+
+    assert len(conn.updates) == 1
+    assert _update_type(conn.updates[0][1]) == "user_message_chunk"
+
+
+@pytest.mark.asyncio
+async def test_replay_history_user_message_with_http_image_url_sends_placeholder_text():
+    conn = FakeConn()
+    bridge = ACPEventBridge(conn, "s1")
+
+    messages = [
+        ConversationMessage(
+            role="user",
+            content=[
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+            ],
+        ),
+    ]
+
+    await bridge.replay_history(messages, [])
+
+    assert len(conn.updates) == 1
+    assert _update_type(conn.updates[0][1]) == "user_message_chunk"

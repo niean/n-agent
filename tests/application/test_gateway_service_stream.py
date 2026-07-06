@@ -250,3 +250,42 @@ async def test_handle_message_stream_applies_caller_overrides(gateway_service_wi
     assert request.trusted_metadata["agent_context"] == "primary"
     assert request.approval_decider is approval_decider
     assert request.allowed_confirm_tools_override == {"manage_schedule": "session"}
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_text_and_images_constructs_content_array(gateway_service_with_fake_registry):
+    svc, fake_chat = gateway_service_with_fake_registry
+    event = InteractionMessage(
+        id="evt-stream-img",
+        session_key=GatewaySessionKey("cli", "conv-1", display_name="conv-1"),
+        text="分析图",
+        images=["data:image/png;base64,aGVsbG8="],
+        metadata={"actor_id": "cli:conv-1"},
+    )
+
+    events = [e async for e in svc.handle_message_stream(event)]
+
+    assert events[-1].type == ChatEventType.DONE
+    request = fake_chat.requests[0]
+    content = request.messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "分析图"}
+    assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_slash_with_images_rejected_without_confirmation(gateway_service_with_fake_registry):
+    svc, fake_chat = gateway_service_with_fake_registry
+    event = InteractionMessage(
+        id="evt-stream-slash-img",
+        session_key=GatewaySessionKey("cli", "conv-1", display_name="conv-1"),
+        text="/new",
+        images=["data:image/png;base64,aGVsbG8="],
+        metadata={"actor_id": "cli:conv-1"},
+    )
+
+    events = [e async for e in svc.handle_message_stream(event)]
+
+    assert svc.command_service.pending_confirmations == {}
+    assert fake_chat.requests == []
+    assert any(e.type == ChatEventType.MESSAGE_DONE for e in events)

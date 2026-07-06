@@ -59,6 +59,7 @@ async def test_tool_service_lists_openai_tools_and_executes_safe_tools():
         "list_directory",
         "read_text_file",
         "web_fetch",
+        "vision_analyze",
     }
     assert result.status == ToolResultStatus.SUCCESS
 
@@ -101,6 +102,32 @@ def test_builtin_tool_definitions_include_source_and_toolset_metadata():
     assert definitions["web_fetch"].source_type is ToolSourceType.BUILTIN
     assert definitions["web_fetch"].toolset == "web"
     assert definitions["web_fetch"].risk_level is RiskLevel.SAFE
+    assert definitions["vision_analyze"].source_type is ToolSourceType.BUILTIN
+    assert definitions["vision_analyze"].toolset == "vision"
+    assert definitions["vision_analyze"].risk_level is RiskLevel.SAFE
+
+
+def test_vision_analyze_definition_schema_rejects_additional_properties():
+    definitions = {definition.name: definition for definition in builtin_tool_definitions()}
+    schema = definitions["vision_analyze"].input_schema
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"image_url", "question"}
+
+
+def test_vision_analyze_exposed_as_safe_builtin_tool():
+    service = ToolService(FakeExecutor(), builtin_tool_definitions())
+
+    schemas = service.list_openai_tools(risk_level=RiskLevel.SAFE)
+    names = {schema["function"]["name"] for schema in schemas}
+
+    assert "vision_analyze" in names
+
+
+def test_vision_analyze_not_in_builtin_tool_names_constant():
+    from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES
+
+    assert "vision_analyze" not in BUILTIN_TOOL_NAMES
 
 
 def test_web_fetch_definition_can_be_disabled():

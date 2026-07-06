@@ -169,3 +169,204 @@ def test_openai_chat_completion_can_call_knowledge_tool(tmp_path):
     tool_calls = asyncio.run(store.list_tool_calls("s-kb"))
     assert tool_calls[0].tool_name == "search_knowledge"
     assert tool_calls[0].status == "success"
+
+
+def test_openai_chat_completion_accepts_valid_content_array(tmp_path):
+    client, _ = build_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "metadata": {"session_id": "s-valid"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看这张图"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+
+
+def test_openai_chat_completion_normalizes_input_image_to_image_url(tmp_path):
+    client, _ = build_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "metadata": {"session_id": "s-input-image"},
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "分析"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="},
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+
+
+def test_openai_chat_completion_rejects_unknown_part_type(tmp_path):
+    client, _ = build_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "audio_url", "audio_url": {"url": "x"}}],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "unsupported_content_type"
+
+
+def test_openai_chat_completion_rejects_invalid_data_url(tmp_path):
+    client, _ = build_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,!!!not-base64!!!"}}
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_image_url"
+
+
+def test_openai_chat_completion_rejects_oversized_data_url(tmp_path):
+    client, _ = build_client(tmp_path)
+    huge = "A" * (21 * 1024 * 1024)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{huge}"}}
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "image_too_large"
+
+
+def test_openai_chat_completion_rejects_system_message_with_image(tmp_path):
+    client, _ = build_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "sys"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                },
+                {"role": "user", "content": "hi"},
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_content_type"
+
+
+def test_openai_chat_completion_rejects_tool_message_with_image(tmp_path):
+    client, _ = build_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}
+                    ],
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_content_type"
+
+
+def test_openai_chat_completion_provider_error_returns_500_not_400(tmp_path):
+    from app.domain.provider import LLMResult, ModelInfo
+
+    class ErrorProvider:
+        async def list_models(self):
+            return [ModelInfo("test-model", "test-model", "fake")]
+
+        async def supports_tools(self, model):
+            return True
+
+        async def chat(self, messages, tools, stream, model, options):
+            raise RuntimeError("provider failure")
+
+    client, _ = build_client(tmp_path, provider=ErrorProvider())
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 500

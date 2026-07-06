@@ -24,6 +24,7 @@ class ProviderCreateInput:
     api_key: str
     provider_type: str = "openai-compatible"
     extra_headers: dict[str, str] | None = None
+    supports_vision: bool | None = None
 
 
 @dataclass
@@ -34,6 +35,7 @@ class ProviderUpdateInput:
     provider_type: str | None = None
     api_key: str | None = None
     extra_headers: dict[str, str] | None = None
+    supports_vision: bool | None = None
 
 
 class _ActiveSwapper(Protocol):
@@ -57,6 +59,10 @@ class ProviderService:
         self._validate(payload.name, payload.base_url, payload.model, provider_type)
         if not payload.api_key:
             raise ProviderValidationError("api_key is required for new provider")
+        if payload.supports_vision is not None:
+            supports_vision = payload.supports_vision
+        else:
+            supports_vision = provider_type == "openai-compatible"
         now = datetime.now(timezone.utc)
         cfg = ProviderConfig(
             id="",
@@ -69,6 +75,7 @@ class ProviderService:
             extra_headers=payload.extra_headers,
             created_at=now,
             updated_at=now,
+            supports_vision=supports_vision,
         )
         return await self.registry.create_provider(cfg, payload.api_key)
 
@@ -92,6 +99,7 @@ class ProviderService:
             extra_headers=patch.extra_headers,
             api_key=api_key_value,
             clear_api_key=clear_key,
+            supports_vision=patch.supports_vision,
         )
         if cfg.is_active:
             secret = await self.registry.get_secret(provider_id) or ""

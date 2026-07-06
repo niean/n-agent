@@ -92,6 +92,56 @@ def test_get_tenant_access_token_caches_token():
     assert json.loads(requests[0].content) == {"app_id": "app-1", "app_secret": "secret"}
 
 
+def test_download_image_returns_bytes_and_content_type():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200})
+        return httpx.Response(200, content=b"\x89PNG\r\n\x1a\n", headers={"Content-Type": "image/png"})
+
+    feishu = client(allowed_open_ids=[], allowed_chat_ids=[])
+    feishu.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://open.feishu.cn")
+
+    data, mime = asyncio.run(feishu.download_image("msg-1", "img_key_1"))
+
+    assert data == b"\x89PNG\r\n\x1a\n"
+    assert mime == "image/png"
+    image_request = requests[-1]
+    assert image_request.headers["Authorization"] == "Bearer tenant-token"
+    assert "msg-1" in image_request.url.path
+    assert "img_key_1" in image_request.url.path
+
+
+def test_download_image_rejects_non_image_content_type():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200})
+        return httpx.Response(200, content=b"plain", headers={"Content-Type": "text/plain"})
+
+    feishu = client(allowed_open_ids=[], allowed_chat_ids=[])
+    feishu.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://open.feishu.cn")
+
+    with pytest.raises(ValueError, match="non-image"):
+        asyncio.run(feishu.download_image("msg-1", "img_key_1"))
+
+
+def test_download_image_rejects_oversized_payload():
+    huge = b"\x00" * (15 * 1024 * 1024 + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200})
+        return httpx.Response(200, content=huge, headers={"Content-Type": "image/png"})
+
+    feishu = client(allowed_open_ids=[], allowed_chat_ids=[])
+    feishu.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://open.feishu.cn")
+
+    with pytest.raises(ValueError, match="too large"):
+        asyncio.run(feishu.download_image("msg-1", "img_key_1"))
+
+
 def test_send_text_posts_with_cached_token_without_exposing_token():
     requests: list[httpx.Request] = []
 

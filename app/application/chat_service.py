@@ -13,6 +13,7 @@ from app.domain.agent import AgentState
 from app.domain.memory import MemoryStore
 from app.domain.session import ConversationMessage
 from app.domain.tool import ApprovalDecider, ToolExecutionContext
+from app.utils.content_utils import extract_text, normalize_content
 
 
 class ActiveExternalMemoryReader(Protocol):
@@ -75,18 +76,25 @@ class ChatCompletionService:
         locked_external_memory = await self.memory_store.lock_session_external_memory(
             session_id, locked_external_memory, slots=self._build_slot_map(locked_external_memory),
         )
+        normalized_messages: list[dict[str, Any]] = []
+        for message in request.messages:
+            new_message = dict(message)
+            if new_message.get("role") == "user":
+                new_message["content"] = normalize_content(new_message.get("content", ""))
+            normalized_messages.append(new_message)
         first_user_message = next(
-            (message.get("content", "") for message in request.messages if message.get("role") == "user"),
+            (extract_text(message.get("content", ""))
+             for message in normalized_messages if message.get("role") == "user"),
             "",
         )
-        for message in request.messages:
+        for message in normalized_messages:
             if message.get("role") == "user":
                 await self.memory_store.append_message(
                     session_id,
                     ConversationMessage(role="user", content=message.get("content", "")),
                 )
         await self.session_service.ensure_title(session_id, str(first_user_message))
-        state = AgentState(session_id=session_id, input_messages=request.messages)
+        state = AgentState(session_id=session_id, input_messages=normalized_messages)
         options = dict(request.options)
         options["external_memory_enabled"] = locked_external_memory
         mode = options.get("execution_context_mode") or "realtime"

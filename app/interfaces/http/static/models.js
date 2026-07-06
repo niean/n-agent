@@ -17,6 +17,8 @@
     document.getElementById('provider-base-url').value = provider ? provider.base_url : '';
     document.getElementById('provider-model').value = provider ? provider.model : '';
     document.getElementById('provider-api-key').value = '';
+    const visionCheckbox = document.getElementById('provider-supports-vision');
+    if (visionCheckbox) visionCheckbox.checked = provider ? !!provider.supports_vision : true;
     const title = document.getElementById('providers-form-title');
     if (title) title.textContent = provider ? `编辑 Provider: ${provider.name}` : '新增 Provider';
     const hint = document.getElementById('providers-form-hint');
@@ -59,7 +61,7 @@
     table.className = 'document-table';
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['名称', '类型', 'Base URL', 'Model', 'Key', '启用', '操作'].forEach((label) => {
+    ['名称', '类型', 'Base URL', 'Model', 'Key', 'Vision', '启用', '操作'].forEach((label) => {
       const th = document.createElement('th'); th.textContent = label; headerRow.appendChild(th);
     });
     thead.appendChild(headerRow);
@@ -71,6 +73,7 @@
       const td3 = document.createElement('td'); td3.textContent = p.base_url || '-';
       const td4 = document.createElement('td'); td4.textContent = p.model || '-';
       const td5 = document.createElement('td'); td5.textContent = p.api_key_present ? '已配置' : '未配置';
+      const tdVision = document.createElement('td'); tdVision.textContent = p.supports_vision ? '✓' : '-';
       const td6 = document.createElement('td');
       const activeBadge = document.createElement('span');
       activeBadge.className = `badge badge--${p.is_active ? 'success' : 'warning'}`;
@@ -92,7 +95,7 @@
       });
       if (p.is_active) deleteBtn.disabled = true;
       actions.appendChild(deleteBtn);
-      tr.append(td1, td2, td3, td4, td5, td6, actions);
+      tr.append(td1, td2, td3, td4, td5, tdVision, td6, actions);
       tbody.appendChild(tr);
     });
     table.append(thead, tbody);
@@ -121,6 +124,8 @@
       base_url: document.getElementById('provider-base-url').value.trim(),
       model: document.getElementById('provider-model').value.trim(),
     };
+    const visionCheckbox = document.getElementById('provider-supports-vision');
+    if (visionCheckbox) payload.supports_vision = visionCheckbox.checked;
     const rawKey = document.getElementById('provider-api-key').value;
     if (isEdit) {
       if (rawKey === '') {

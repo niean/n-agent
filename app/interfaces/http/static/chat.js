@@ -8,7 +8,7 @@
   let isSending = false;
   let initialized = false;
   let externalMemoryProviders = [];
-  let externalMemoryExpanded = false;
+  let memoryPopoverOpen = false;
   // 存储每个会话的外部记忆配置
   let sessionExternalMemoryConfig = {};
   // 尚未创建会话时，允许用户先勾选首轮要使用的外部记忆。
@@ -20,6 +20,8 @@
   // 后端真实默认模型 id，启动时从 /chat/models 拉取；硬编码占位符会导致
   // provider 拒绝 tool 调用（如 Ark "does not support agent plan feature"）。
   let defaultModel = '';
+  // 待发送的图片列表，每项 {dataUrl, name}；发送后清空。
+  let pendingImages = [];
 
   function appendText(parent, value) {
     parent.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -62,7 +64,7 @@
     isSending = next;
     const btn = ui.byId('chat-send');
     const input = ui.byId('chat-input');
-    if (btn) { btn.disabled = next; btn.textContent = next ? 'Sending' : 'Send'; }
+    if (btn) btn.disabled = next;
     if (input) input.disabled = next;
   }
 
@@ -108,7 +110,27 @@
       el.appendChild(details);
       return el;
     }
-    if (hasVisibleContent(message.content)) appendText(el, message.content);
+    const content = message.content;
+    if (Array.isArray(content)) {
+      let hasText = false;
+      let hasImage = false;
+      content.forEach((part) => {
+        if (!part || typeof part !== 'object') return;
+        if (part.type === 'text' && part.text) {
+          hasText = true;
+          el.appendChild(document.createTextNode(part.text));
+        } else if (part.type === 'image_url' && part.image_url && part.image_url.url) {
+          hasImage = true;
+          const imgEl = document.createElement('img');
+          imgEl.src = part.image_url.url;
+          imgEl.alt = '';
+          el.appendChild(imgEl);
+        }
+      });
+      if (hasImage && !hasText) el.classList.add('msg--image-only');
+      return el;
+    }
+    if (hasVisibleContent(content)) appendText(el, content);
     return el;
   }
 
@@ -366,10 +388,72 @@
     }
   }
 
-  function buildChatRequestBody(text) {
+  function handlePaste(event) {
+    const items = (event.clipboardData && event.clipboardData.items) || [];
+    for (const item of items) {
+      if (item.kind === 'file' && item.type && item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) addPendingImage(file);
+      }
+    }
+  }
+
+  function handleFileSelect(event) {
+    const files = event.target.files || [];
+    for (const file of files) {
+      if (file.type && file.type.startsWith('image/')) addPendingImage(file);
+    }
+    event.target.value = '';
+  }
+
+  function addPendingImage(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      pendingImages.push({ dataUrl: e.target.result, name: file.name });
+      renderImagePreviews();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function renderImagePreviews() {
+    const container = ui.byId('chat-image-previews');
+    if (!container) return;
+    clearNode(container);
+    pendingImages.forEach((img, index) => {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'chat-image-preview';
+      const thumb = document.createElement('img');
+      thumb.src = img.dataUrl;
+      thumb.alt = img.name || '';
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'chat-image-preview__remove';
+      removeBtn.textContent = '×';
+      removeBtn.setAttribute('aria-label', '移除图片');
+      removeBtn.addEventListener('click', () => {
+        pendingImages.splice(index, 1);
+        renderImagePreviews();
+      });
+      wrapper.append(thumb, removeBtn);
+      container.appendChild(wrapper);
+    });
+  }
+
+  function buildChatRequestBody(text, images) {
+    const outgoingImages = images || pendingImages;
+    let content;
+    if (outgoingImages.length > 0) {
+      content = [];
+      if (text) content.push({ type: 'text', text });
+      for (const img of outgoingImages) {
+        content.push({ type: 'image_url', image_url: { url: img.dataUrl } });
+      }
+    } else {
+      content = text;
+    }
     const body = {
       model: defaultModel || 'model',
-      messages: [{ role: 'user', content: text }],
+      messages: [{ role: 'user', content }],
       stream: true,
       metadata: { session_id: currentSessionId },
     };
@@ -401,18 +485,39 @@
     const input = ui.byId('chat-input');
     if (!input) return;
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && !pendingImages.length) return;
     await ensureSession();
     input.value = '';
-    appendMessage('user', text);
+    const sentImages = pendingImages.slice();
+    pendingImages = [];
+    renderImagePreviews();
+    const userContent = sentImages.length > 0
+      ? [
+          ...(text ? [{ type: 'text', text }] : []),
+          ...sentImages.map((img) => ({ type: 'image_url', image_url: { url: img.dataUrl } })),
+        ]
+      : text;
+    appendMessage('user', userContent);
     const streaming = appendMessage('assistant', '');
     setSending(true);
     try {
       const res = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildChatRequestBody(text)),
+        body: JSON.stringify(buildChatRequestBody(text, sentImages)),
       });
+      if (!res.ok) {
+        let errMsg = 'HTTP ' + res.status;
+        try {
+          const errJson = await res.json();
+          if (errJson && errJson.error && errJson.error.message) errMsg = errJson.error.message;
+        } catch (parseErr) { /* ignore */ }
+        if (streaming) {
+          streaming.className = 'msg error';
+          streaming.textContent = '[Error: ' + errMsg + ']';
+        }
+        return;
+      }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       while (true) {
@@ -469,11 +574,6 @@
       });
   }
 
-  function toggleExternalMemory() {
-    externalMemoryExpanded = !externalMemoryExpanded;
-    renderExternalMemoryUI();
-  }
-
   function inferPhantomExternalMemorySlot(name, sessionSlots) {
     if (sessionSlots && sessionSlots[name]) return sessionSlots[name];
     if (/^external_memory_\d+$/.test(name) || /^project_memory_\d+$/.test(name)) {
@@ -491,42 +591,33 @@
     if (!container) return;
     container.replaceChildren();
 
-    // 标题区域 - 可点击展开/收起
-    const header = document.createElement('div');
-    header.className = 'chat-external-memory__header';
-    header.addEventListener('click', toggleExternalMemory);
-
-    const title = document.createElement('div');
-    title.className = 'chat-external-memory__title';
-    title.textContent = '外部记忆';
-
-    const expandIcon = document.createElement('span');
-    expandIcon.className = 'chat-external-memory__expand-icon';
-    expandIcon.textContent = externalMemoryExpanded ? '▼' : '▲';
-
-    header.appendChild(title);
-    header.appendChild(expandIcon);
-    container.appendChild(header);
-
-    // 内容区域 - 收起时隐藏
-    const content = document.createElement('div');
-    content.className = externalMemoryExpanded
-      ? 'chat-external-memory__content'
-      : 'chat-external-memory__content chat-external-memory__content--collapsed';
-
-    const desc = document.createElement('div');
-    desc.className = 'chat-external-memory__desc';
+    // 豆包风格 mode switcher：工具栏按钮 + Popover 分组选择卡片。
     const sessionConfig = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig;
     const locked = sessionConfig?.locked === true;
-    desc.textContent = locked
-      ? '此会话的外部记忆已锁定。切换文件记忆请新建会话'
-      : '此配置首轮发送后锁定。builtin 默认关闭，文件记忆最多选择 1 个';
-
-    const checkboxes = document.createElement('div');
-    checkboxes.className = 'chat-external-memory__checkboxes';
-
     const useSessionConfig = sessionConfig?.modified === true;
     const enabledProviders = useSessionConfig ? sessionConfig.providers : [];
+
+    // 描述文案（作为 label 的 title tooltip，同时保留字符串供锁定提示）
+    const descText = locked
+      ? '外部记忆已锁定'
+      : '请选择外部记忆';
+
+    const bar = document.createElement('div');
+    bar.className = 'chat-memory-bar';
+
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'chat-memory-trigger';
+    trigger.title = descText;
+    trigger.setAttribute('aria-haspopup', 'dialog');
+    trigger.setAttribute('aria-expanded', memoryPopoverOpen ? 'true' : 'false');
+    trigger.innerHTML = '<svg class="chat-memory-trigger__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="chat-memory-trigger__label">记忆</span>';
+    if (enabledProviders.length > 0) trigger.classList.add('active');
+    trigger.addEventListener('click', (event) => {
+      event.stopPropagation();
+      memoryPopoverOpen = !memoryPopoverOpen;
+      renderExternalMemoryUI();
+    });
 
     // 按 slot 过滤出可见 provider，保留原始顺序
     const visibleProviders = externalMemoryProviders.filter(p => {
@@ -560,116 +651,141 @@
       });
     }
 
-    // 分组顺序: 系统(builtin) -> 文件(multi-project) -> 检索(external-query) -> 已移除(removed)
-    const GROUP_ORDER = ['builtin', 'multi-project', 'external-query', 'removed'];
-    const GROUP_LABELS = {
-      'builtin': '系统',
-      'multi-project': '文件',
-      'external-query': '检索',
-      'removed': '已移除',
+    const saveSelectionFromPopover = () => {
+      const checked = [];
+      document.querySelectorAll('#chat-external-memory .chat-memory-option').forEach(optionEl => {
+        if (optionEl.classList.contains('active') && optionEl.dataset.providerName) {
+          checked.push(optionEl.dataset.providerName);
+        }
+      });
+      const nextConfig = {
+        providers: checked,
+        modified: true
+      };
+      if (currentSessionId) {
+        sessionExternalMemoryConfig[currentSessionId] = nextConfig;
+      } else {
+        draftExternalMemoryConfig = nextConfig;
+      }
+      externalMemoryTouched = true;
     };
 
-    const buildCheckbox = (p) => {
-      const div = document.createElement('label');
-      div.className = 'chat-external-memory__item';
-      const cb = document.createElement('input');
-      cb.type = 'checkbox';
-      cb.dataset.providerName = p.name;
-      cb.dataset.slot = p.slot || '';
-      cb.disabled = locked;
+    const buildOption = (p) => {
+      const pill = document.createElement('button');
+      pill.type = 'button';
+      pill.className = 'chat-memory-option';
+      pill.dataset.providerName = p.name;
+      pill.dataset.slot = p.slot || '';
+      pill.disabled = locked;
 
-      if (useSessionConfig) {
-        cb.checked = enabledProviders.includes(p.name);
-      } else {
-        cb.checked = false;
-      }
+      const isActive = useSessionConfig && enabledProviders.includes(p.name);
+      if (isActive) pill.classList.add('active');
+      if (p.phantom === true) pill.classList.add('chat-memory-option--phantom');
+      if (p.slot === 'external-query' && p.active === false) pill.classList.add('chat-memory-option--disabled-slot');
 
-      div.appendChild(cb);
-      const label_text = (function () {
-        // phantom: provider 已删除；非 active 检索 provider: 已禁用（adapter 未装载）
+      // phantom: provider 已删除；非 active 检索 provider: 已禁用（adapter 未装载）
+      const labelText = (function () {
         if (p.phantom === true) return p.name + ' (已删除)';
         if (p.slot === 'external-query' && p.active === false) return p.name + ' (已禁用)';
         return p.name;
       })();
-      div.appendChild(document.createTextNode(' ' + label_text));
+      pill.textContent = labelText;
+      pill.title = labelText;
 
-      cb.addEventListener('change', () => {
+      pill.addEventListener('click', () => {
+        if (pill.disabled) return;
+        const nextActive = !pill.classList.contains('active');
         // 仅 multi-project slot 互斥（文件记忆最多 1 个）；external-query 与 multi-project 可共存
-        if (cb.checked && cb.dataset.slot === 'multi-project') {
-          document.querySelectorAll('#chat-external-memory input[type="checkbox"]').forEach(checkbox => {
-            if (checkbox !== cb && checkbox.checked && checkbox.dataset.slot === 'multi-project') {
-              checkbox.checked = false;
+        if (nextActive && pill.dataset.slot === 'multi-project') {
+          document.querySelectorAll('#chat-external-memory .chat-memory-option').forEach(other => {
+            if (other !== pill && other.classList.contains('active') && other.dataset.slot === 'multi-project') {
+              other.classList.remove('active');
             }
           });
         }
-        // 保存当前会话的配置
-        const checked = [];
-        document.querySelectorAll('#chat-external-memory input[type="checkbox"]').forEach(checkbox => {
-          if (checkbox.checked && checkbox.dataset.providerName) {
-            checked.push(checkbox.dataset.providerName);
-          }
-        });
-        const nextConfig = {
-          providers: checked,
-          modified: true
-        };
-        if (currentSessionId) {
-          sessionExternalMemoryConfig[currentSessionId] = nextConfig;
-        } else {
-          draftExternalMemoryConfig = nextConfig;
-        }
-        // 标记用户已操作外部记忆勾选，后续请求需显式携带 options.external_memory_enabled
-        externalMemoryTouched = true;
+        pill.classList.toggle('active', nextActive);
+        // 标记用户已操作记忆勾选，后续请求需显式携带 options.external_memory_enabled
+        saveSelectionFromPopover();
       });
 
-      return div;
+      return pill;
     };
 
-    GROUP_ORDER.forEach(slot => {
-      const providers = visibleProviders.filter(p => (p.slot || '') === slot);
-      if (providers.length === 0) return;
+    bar.appendChild(trigger);
+    container.appendChild(bar);
 
-      // external-query 组统一命名为"检索"（槽位内 provider 互斥，至多 1 个 active）
-      const groupLabel = GROUP_LABELS[slot] || providers[0].name;
+    if (memoryPopoverOpen) {
+      const popover = document.createElement('div');
+      popover.className = 'chat-memory-popover';
+      popover.setAttribute('role', 'dialog');
+      popover.setAttribute('aria-label', '选择记忆');
+      popover.addEventListener('click', event => event.stopPropagation());
 
-      const group = document.createElement('div');
-      group.className = 'chat-external-memory__group';
+      const desc = document.createElement('div');
+      desc.className = 'chat-memory-popover__desc';
+      desc.textContent = descText;
+      popover.appendChild(desc);
 
-      const label = document.createElement('div');
-      label.className = 'chat-external-memory__group-label';
-      label.textContent = groupLabel;
+      const GROUP_ORDER = ['builtin', 'multi-project', 'external-query', 'removed'];
+      const GROUP_LABELS = {
+        'builtin': '系统',
+        'multi-project': '文件',
+        'external-query': '检索',
+        'removed': '已移除',
+      };
 
-      const items = document.createElement('div');
-      items.className = 'chat-external-memory__group-items';
-      providers.forEach(p => items.appendChild(buildCheckbox(p)));
+      GROUP_ORDER.forEach(slot => {
+        const providers = visibleProviders.filter(p => (p.slot || '') === slot);
+        if (providers.length === 0) return;
 
-      group.appendChild(label);
-      group.appendChild(items);
-      checkboxes.appendChild(group);
-    });
+        const group = document.createElement('section');
+        group.className = 'chat-memory-popover__group';
 
-    content.appendChild(desc);
-    content.appendChild(checkboxes);
+        const groupTitle = document.createElement('div');
+        groupTitle.className = 'chat-memory-popover__group-title';
+        groupTitle.textContent = GROUP_LABELS[slot] || slot;
 
-    // 添加重置按钮
-    if (useSessionConfig && !locked) {
-      const resetBtn = document.createElement('button');
-      resetBtn.className = 'btn';
-      resetBtn.textContent = '重置为默认配置';
-      resetBtn.style.marginTop = '8px';
-      resetBtn.addEventListener('click', () => {
-        if (currentSessionId) {
-          delete sessionExternalMemoryConfig[currentSessionId];
-        } else {
-          draftExternalMemoryConfig = null;
-        }
-        externalMemoryTouched = false;
-        renderExternalMemoryUI();
+        const groupItems = document.createElement('div');
+        groupItems.className = 'chat-memory-popover__group-items';
+        providers.forEach(p => groupItems.appendChild(buildOption(p)));
+
+        group.append(groupTitle, groupItems);
+        popover.appendChild(group);
       });
-      content.appendChild(resetBtn);
-    }
 
-    container.appendChild(content);
+      if (!visibleProviders.length) {
+        const empty = document.createElement('div');
+        empty.className = 'chat-memory-popover__empty';
+        empty.textContent = '暂无可用记忆';
+        popover.appendChild(empty);
+      }
+
+      if (useSessionConfig && !locked) {
+        const resetBtn = document.createElement('button');
+        resetBtn.className = 'chat-memory-popover__reset';
+        resetBtn.type = 'button';
+        resetBtn.textContent = '重置为默认配置';
+        resetBtn.addEventListener('click', () => {
+          if (currentSessionId) {
+            delete sessionExternalMemoryConfig[currentSessionId];
+          } else {
+            draftExternalMemoryConfig = null;
+          }
+          externalMemoryTouched = false;
+          renderExternalMemoryUI();
+        });
+        popover.appendChild(resetBtn);
+      }
+
+      container.appendChild(popover);
+    }
+  }
+
+  function handleMemoryDocumentClick(event) {
+    const container = document.getElementById('chat-external-memory');
+    if (!memoryPopoverOpen || (container && container.contains(event.target))) return;
+    memoryPopoverOpen = false;
+    renderExternalMemoryUI();
   }
 
   function getExternalMemoryEnabled() {
@@ -705,6 +821,44 @@
     delete sessionExternalMemoryConfig[session.id];
   }
 
+  let imagePreviewModal = null;
+  function ensureImagePreviewModal() {
+    if (imagePreviewModal) return imagePreviewModal;
+    const modalEl = document.createElement('div');
+    modalEl.className = 'image-preview-modal';
+    modalEl.hidden = true;
+    modalEl.setAttribute('role', 'dialog');
+    modalEl.setAttribute('aria-modal', 'true');
+    modalEl.setAttribute('aria-label', '图片预览');
+    const img = document.createElement('img');
+    img.className = 'image-preview-modal__img';
+    img.alt = '';
+    modalEl.appendChild(img);
+    modalEl.addEventListener('click', () => { modalEl.hidden = true; });
+    document.body.appendChild(modalEl);
+    imagePreviewModal = modalEl;
+    return modalEl;
+  }
+  function openImagePreview(src) {
+    const modalEl = ensureImagePreviewModal();
+    modalEl.querySelector('.image-preview-modal__img').src = src;
+    modalEl.hidden = false;
+  }
+  function initImagePreview() {
+    document.addEventListener('click', (e) => {
+      const target = e.target;
+      if (!target || target.tagName !== 'IMG') return;
+      if (!target.closest('.msg')) return;
+      e.stopPropagation();
+      openImagePreview(target.src);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && imagePreviewModal && !imagePreviewModal.hidden) {
+        imagePreviewModal.hidden = true;
+      }
+    });
+  }
+
   function init() {
     if (initialized) return;
     initialized = true;
@@ -712,16 +866,31 @@
     const input = ui.byId('chat-input');
     const newBtn = ui.byId('chat-new');
     if (sendBtn) sendBtn.addEventListener('click', send);
-    if (input) input.addEventListener('keydown', handleComposerKeydown);
+    if (input) {
+      input.addEventListener('keydown', handleComposerKeydown);
+      input.addEventListener('paste', handlePaste);
+    }
     if (newBtn) newBtn.addEventListener('click', newSession);
+    const imageBtn = ui.byId('chat-image-button');
+    const imageInput = ui.byId('chat-image-input');
+    if (imageBtn && imageInput) {
+      imageBtn.addEventListener('click', () => imageInput.click());
+      imageInput.addEventListener('change', handleFileSelect);
+    }
     bindDebugToggle();
-    // External memory session-level checkboxes
-    const chatComposer = document.querySelector('.chat-stack__composer');
+    document.addEventListener('click', handleMemoryDocumentClick);
+    initImagePreview();
+    // Memory mode switcher lives in the composer toolbar, before the send button.
+    const composerBar = document.querySelector('.chat-composer__bar');
     const emContainer = document.createElement('div');
     emContainer.id = 'chat-external-memory';
     emContainer.className = 'chat-external-memory';
-    if (chatComposer) {
-      chatComposer.insertBefore(emContainer, chatComposer.firstChild);
+    if (composerBar) {
+      if (sendBtn) {
+        composerBar.insertBefore(emContainer, sendBtn);
+      } else {
+        composerBar.appendChild(emContainer);
+      }
       loadExternalMemoryProviders();
     }
     showEmptyState();

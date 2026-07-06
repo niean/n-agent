@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from typing import Any, Protocol
 
@@ -22,6 +24,8 @@ class FeishuEventClient(Protocol):
     async def add_reaction(self, message_id: str, emoji_type: str = "Typing") -> None: ...
 
     async def listen_events(self, handler) -> None: ...
+
+    async def download_image(self, message_id: str, image_key: str) -> tuple[bytes, str | None]: ...
 
 
 class FeishuImAdapter:
@@ -71,7 +75,13 @@ class FeishuImAdapter:
         event = verified.get("event", {})
         message = event.get("message", {})
         chat_id = _clean_text(message.get("chat_id"))
-        if message.get("message_type") != "text":
+        message_type = message.get("message_type")
+        if message_type == "image":
+            if message.get("chat_type") == "group":
+                return
+            await self._handle_image_message(verified, event, message, chat_id)
+            return
+        if message_type != "text":
             if chat_id:
                 await self.feishu_client.send_text(chat_id, "不支持该消息类型")
             return
@@ -101,6 +111,75 @@ class FeishuImAdapter:
                     display_name=open_id,
                 ),
                 text=content,
+                metadata={
+                    "platform": "feishu",
+                    "platform_session_id": platform_session_id,
+                    "conversation_id": chat_id,
+                    "message_id": message_id,
+                    "receive_id": receive_id,
+                    "receive_id_type": receive_id_type,
+                    "thread_id": thread_id,
+                    "display_name": open_id,
+                    "actor_id": open_id,
+                },
+            )
+        )
+        if response.metadata.get("duplicate"):
+            return
+        await self._send_response(response, receive_id, receive_id_type, platform_session_id, thread_id)
+
+    async def _handle_image_message(
+        self,
+        verified: dict[str, Any],
+        event: dict[str, Any],
+        message: dict[str, Any],
+        chat_id: str,
+    ) -> None:
+        message_id = _clean_text(message.get("message_id"))
+        image_key = _image_key(message.get("content", ""))
+        if not image_key:
+            if chat_id:
+                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+            return
+        try:
+            data, mime = await self.feishu_client.download_image(message_id, image_key)
+        except ValueError:
+            if chat_id:
+                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+            return
+        except Exception:
+            if chat_id:
+                await self.feishu_client.send_text(chat_id, "图片下载失败，请重试")
+            return
+        media_type = mime or "image/png"
+        if not media_type.startswith("image/"):
+            if chat_id:
+                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+            return
+        try:
+            encoded = base64.b64encode(data).decode("ascii")
+        except (binascii.Error, ValueError):
+            if chat_id:
+                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+            return
+        data_url = f"data:{media_type};base64,{encoded}"
+        sender = event.get("sender", {}).get("sender_id", {})
+        open_id = _clean_text(sender.get("open_id"))
+        thread_id = _clean_text(message.get("thread_id"))
+        receive_id = chat_id or open_id
+        receive_id_type = "chat_id" if chat_id else "open_id"
+        platform_session_id = receive_id
+        response = await self.gateway_service.handle_message(
+            InteractionMessage(
+                id=_clean_text(verified.get("header", {}).get("event_id")) or message_id,
+                session_key=GatewaySessionKey(
+                    Platform.FEISHU,
+                    platform_session_id,
+                    thread_id=thread_id,
+                    display_name=open_id,
+                ),
+                text="",
+                images=[data_url],
                 metadata={
                     "platform": "feishu",
                     "platform_session_id": platform_session_id,
@@ -263,6 +342,16 @@ def _text_content(raw: str | dict[str, Any]) -> str:
     except (TypeError, json.JSONDecodeError):
         return str(raw)
     return str(payload.get("text", ""))
+
+
+def _image_key(raw: str | dict[str, Any]) -> str:
+    if isinstance(raw, dict):
+        return _clean_text(raw.get("image_key"))
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    return _clean_text(payload.get("image_key"))
 
 
 def _strip_at(text: str) -> str:

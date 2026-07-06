@@ -11,7 +11,7 @@
 
 `ConversationSession`（`app/domain/session.py`）：会话聚合根，字段包括 id、title、source、external_memory_enabled、created_at、updated_at、acp_metadata。external_memory_enabled 是会话级外部记忆 profile 锁定值，首轮消息前可由 Chat/Dashboard 选择，首轮后不可变；未锁定的新会话为 null，发送首轮时写入规范化列表。acp_metadata 是 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入，其他来源会话为 null。
 
-`ConversationMessage`（`app/domain/session.py`）：会话消息值对象，字段包括 id、role、content、tool_call_id、name、created_at。role 支持 user、assistant、tool 等 Provider 消息角色。
+`ConversationMessage`（`app/domain/session.py`）：会话消息值对象，字段包括 id、role、content、tool_call_id、name、created_at。role 支持 user、assistant、tool 等 Provider 消息角色。content 类型为 `str | list[dict] | dict`：str 为纯文本；list 为 OpenAI 风格多模态内容数组（`[{type:text,text:...},{type:image_url,image_url:{url:...}}]`），user 消息支持 text+image_url 混合，assistant 消息支持 `{content,tool_calls}` dict；持久化前由 `content_utils.normalize_content` 归一化，摘要/标题/外部记忆 prefetch 通过 `content_utils.extract_text` 提取纯文本避免 base64 泄漏。
 
 `ToolCall`（`app/domain/session.py`）：工具调用记录，字段包括 id、session_id、message_id、tool_name、arguments、result、status、duration_ms、created_at。
 
@@ -21,7 +21,7 @@
 
 `Platform` / `PlatformKind` / `PlatformDescriptor` / `PlatformLifecycle` / `PlatformRegistry`（`app/domain/platform.py`）：平台聚合的领域枚举、描述和生命周期端口，用于表达飞书、钉钉、企微等外部消息平台及其 configured/connected/disconnected/fatal 状态，不包含具体 SDK、HTTP 或长连接对象。CLI/TUI 终端聊天只使用 GatewaySessionKey.source=`cli`，不进入 Platform。
 
-`GatewaySessionKey` / `InteractionMessage` / `GatewayOutboundMessage` / `InteractionResponse`（`app/domain/gateway.py`）：交互入口标准化模型，用于把 CLI、飞书等入口消息转换为 Application 层可处理的统一事件和回复；GatewaySessionKey 使用 `source` 与 `platform_session_id` 组成外部 conversation 标识，不包含 FastAPI、飞书 SDK 或传输对象。
+`GatewaySessionKey` / `InteractionMessage` / `GatewayOutboundMessage` / `InteractionResponse`（`app/domain/gateway.py`）：交互入口标准化模型，用于把 CLI、飞书、ACP 等入口消息转换为 Application 层可处理的统一事件和回复；GatewaySessionKey 使用 `source` 与 `platform_session_id` 组成外部 conversation 标识，不包含 FastAPI、飞书 SDK 或传输对象。`InteractionMessage` 字段包括 id、session_key、text、images（`list[str]`，data URL 列表，可选）、metadata；`GatewayService` 在无 images 时直接使用 text，有 images 时通过 `content_utils` 风格构造 OpenAI content array 传给 ChatCompletionService；slash 命令附带 images 时被拒绝。
 
 `GatewaySessionLink`（`app/domain/gateway.py`）：外部 conversation 与内部 session 的映射记录，字段包括 conversation_id、session_id、display_name、created_at、updated_at、id。
 
@@ -31,7 +31,7 @@
 
 `ModelInfo`（`app/domain/provider.py`）：模型能力描述，字段包括 id、display_name、provider、supports_tools、supports_streaming。
 
-`ProviderConfig`（`app/domain/provider.py`）：Provider 注册表的脱敏配置实体（frozen dataclass），字段包括 id、name、provider_type、base_url、model、api_key_present、is_active、extra_headers、created_at、updated_at。**永远不包含 api_key 明文字段**；明文 api_key 通过 `ProviderRegistry.get_secret(id)` 单独读取且仅供 Infrastructure 工厂调用。
+`ProviderConfig`（`app/domain/provider.py`）：Provider 注册表的脱敏配置实体（frozen dataclass），字段包括 id、name、provider_type、base_url、model、api_key_present、is_active、extra_headers、created_at、updated_at、supports_vision。**永远不包含 api_key 明文字段**；明文 api_key 通过 `ProviderRegistry.get_secret(id)` 单独读取且仅供 Infrastructure 工厂调用。`supports_vision` 表示 provider 是否支持图片输入：openai-compatible 类型默认 True，anthropic 类型默认 False；由 `ProviderService.create_provider`/`update_provider` 按 `ProviderCreateInput`/`ProviderUpdateInput` 传入值设置，Dashboard 可在线编辑；`AgentGraphRunner.call_llm` 在 vision preflight 中通过 `ActiveProviderHolder.current_config.supports_vision` 判断，不支持 vision 时遇到 image content 直接返回友好 assistant 消息而非调用 provider。
 
 `LLMResult`（`app/domain/provider.py`）：非流式模型结果，字段包括 message、finish_reason、usage、raw。
 
@@ -128,7 +128,7 @@ messages(id, session_id, role, content_json, created_at, provider_message_id, to
 tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at)
 task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
-providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_headers_json, is_active, created_at, updated_at)
+providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_headers_json, is_active, supports_vision, created_at, updated_at)
 gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at)
 gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
 gateway_processed_events(id, platform, event_id, message_id, created_at)

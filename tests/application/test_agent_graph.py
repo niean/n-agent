@@ -577,3 +577,185 @@ async def test_agent_graph_prepends_rescued_context_to_summary(tmp_path):
     summary = await store.get_summary("s1")
     assert summary is not None
     assert "RESCUED_FACT" in summary.summary
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_non_vision_provider_image_message_returns_friendly_message(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    provider = DirectProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        vision_capability=lambda: False,
+    )
+
+    state = await runner.run(
+        AgentState(
+            session_id="s1",
+            input_messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "看这张图"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                }
+            ],
+        ),
+        "test",
+    )
+
+    assert state.error is None
+    assert state.finish_reason == "stop"
+    assert isinstance(state.final_message, dict)
+    content = state.final_message.get("content", "")
+    assert "不支持图片输入" in content
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_non_vision_provider_image_only_message_returns_friendly_message(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    provider = DirectProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        vision_capability=lambda: False,
+    )
+
+    state = await runner.run(
+        AgentState(
+            session_id="s1",
+            input_messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                }
+            ],
+        ),
+        "test",
+    )
+
+    assert state.error is None
+    assert state.finish_reason == "stop"
+    assert isinstance(state.final_message, dict)
+    assert "不支持图片输入" in state.final_message.get("content", "")
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_vision_provider_preserves_image_part_in_messages(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    provider = InspectingProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        vision_capability=lambda: True,
+    )
+
+    await runner.run(
+        AgentState(
+            session_id="s1",
+            input_messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "分析图"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                }
+            ],
+        ),
+        "test",
+    )
+
+    user_msg = next(m for m in provider.messages if m.get("role") == "user")
+    assert isinstance(user_msg["content"], list)
+    assert user_msg["content"][0] == {"type": "text", "text": "分析图"}
+    assert user_msg["content"][1]["type"] == "image_url"
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_external_memory_prefetch_uses_text_only_and_preserves_image(tmp_path):
+    from app.application.external_memory_manager import ExternalMemoryManager
+
+    class CapturingProvider:
+        def __init__(self):
+            self.last_messages = None
+            self.last_query = None
+
+        async def list_models(self):
+            return [ModelInfo("test", "test", "fake")]
+
+        async def supports_tools(self, model):
+            return True
+
+        async def chat(self, messages, tools, stream, model, options):
+            self.last_messages = list(messages)
+            return LLMResult(message={"role": "assistant", "content": "ok"}, finish_reason="stop")
+
+        def prefetch(self, query, *, session_id, enabled_override=None):
+            self.last_query = query
+            return ""
+
+        def sync(self, user_text, assistant_text, *, session_id, agent_context, enabled_override=None):
+            return None
+
+        def pre_compress(self, messages, *, session_id, enabled_override=None):
+            return ""
+
+        @property
+        def name(self):
+            return "capturing"
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    capturing = CapturingProvider()
+    manager = ExternalMemoryManager()
+    manager.add_provider(capturing)
+    provider = CapturingProvider()
+    # Replace manager's internal provider with the same instance to capture prefetch
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        external_memory_manager=manager,
+        vision_capability=lambda: True,
+    )
+
+    await runner.run(
+        AgentState(
+            session_id="s1",
+            input_messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "查相关笔记"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                    ],
+                }
+            ],
+        ),
+        "test",
+    )
+
+    # provider received list content with image_url preserved
+    user_msg = next(m for m in provider.last_messages if m.get("role") == "user")
+    assert isinstance(user_msg["content"], list)
+    assert any(part.get("type") == "image_url" for part in user_msg["content"])
