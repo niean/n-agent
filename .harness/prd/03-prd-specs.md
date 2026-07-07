@@ -283,6 +283,8 @@
     - ACP：相比Hermes，ACP还缺少哪些功能？明确List出来
 
 [20260707]
+- HE
+    - HE：修改Harness Workflow，①Phase2 spec生成后，引入Third模型、审阅修改spec文件，然后交回给主流程模型加载和审阅；②Phase3 plan生成后，引入Third模型、审阅修改plan文件，然后交回给主流程模型加载和审阅。我希望在现有的 .harness框架上做修改，且希望IDE无关(claudecode codex均能支持)
 - FR
     - 对话：[KF]多模态支持图片输入，vision_analyze，覆盖入口包括 API、飞书IM、ACP等
         - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
@@ -297,8 +299,8 @@
         - 对话：Chat，外部记忆改名为记忆，点击记忆按钮后弹出Popover气泡卡片、选择记忆类型
         - 对话：Chat，图片在对话框的渲染，小蓝边太宽了、很难看
         - 对话：Chat，图片在对话框中，支持点击后弹出框预览
-- HE
-    - HE：修改Harness Workflow，①Phase2 spec生成后，引入Third模型、审阅修改spec文件，然后交回给主流程模型加载和审阅；②Phase3 plan生成后，引入Third模型、审阅修改plan文件，然后交回给主流程模型加载和审阅。我希望在现有的 .harness框架上做修改，且希望IDE无关(claudecode codex均能支持)
+    - 会话：会话列表，来源字段大多hardcode，请修改为公共枚举、方便治理
+
 
 ---
 
