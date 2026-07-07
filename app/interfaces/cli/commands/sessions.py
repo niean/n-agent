@@ -5,6 +5,7 @@ import sys
 from typing import Any
 
 from app.domain.gateway import GatewaySessionKey
+from app.domain.session import SessionSource
 from app.interfaces.cli.cli_chat_adapter import CliChatAdapter
 from app.interfaces.cli.render import (
     make_console,
@@ -47,7 +48,7 @@ async def _send(services: Any, conversation_id: str, args) -> int:
 def _run_browse(services: Any, conversation_id: str, args) -> int:
     fmt = resolve_format(args)
     registry = services.gateway_registry
-    session_key = GatewaySessionKey("cli", conversation_id, display_name=conversation_id)
+    session_key = GatewaySessionKey(SessionSource.CLI.value, conversation_id, display_name=conversation_id)
     links = asyncio.run(registry.list_session_links(session_key))
     pick = getattr(args, "pick", None)
     if pick:

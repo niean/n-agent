@@ -18,6 +18,7 @@
 | D014 | Plugin `_validate_config` 仅校验顶层 type=object 和 required 字段存在，未校验各字段类型、未拒绝 config_schema 标记为 secret 的字段进入 config（defense-in-depth 缺口，B2 已在前端修复，后端无兜底）。 | medium | plan-260703-plugin-subsystem.md | 2026-07-03 | open |
 | D015 | `tests/application/test_chat_service.py::test_chat_service_non_stream_returns_message` 断言 session_id 前缀失败，非本次插件变更引入（git stash 验证确认）。 | low | N/A | 2026-07-03 | open |
 | D016 | `tests/application/test_schedule_run_service.py::test_run_now_claims_and_runs_shared_path` 断言 status='succeeded' 但实际为 'triggered'，非本次插件变更引入（git stash 验证确认）。 | low | N/A | 2026-07-03 | open |
+| D017 | `tests/interfaces/test_static_assets.py` 5 项失败（test_chat_builtin_memory_is_disabled_by_default / test_chat_memory_uses_toolbar_popover_grouped_picker / test_static_assets_use_safe_text_rendering / test_chat_supports_image_upload_paste_and_rendering / test_chat_composer_uses_doubao_style_rounded_container），涉及 chat.js innerHTML 赋值、memory toolbar popover、图片上传渲染、chat-composer 样式；来自近期前端提交（18d4639 对话: [KF]多模态支持图片输入、ca28d23 前端: 确认框和列表操作样式归一）和工作树未提交前端变更，非 terminal-in-sandbox 任务引入。 | low | N/A | 2026-07-07 | open |
 
 ---
 

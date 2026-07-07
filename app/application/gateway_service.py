@@ -24,6 +24,7 @@ from app.domain.gateway import (
     InteractionResponse,
 )
 from app.domain.platform import Platform
+from app.domain.session import SessionSource
 
 HealthProvider = Callable[[], dict[str, Any]]
 
@@ -298,11 +299,11 @@ class GatewayCommandService:
 
 
 def _session_id_prefix_and_source(key: GatewaySessionKey) -> tuple[str, str]:
-    if key.source_value == "acp":
-        return ("acp", "acp")
+    if key.source_value == SessionSource.ACP.value:
+        return (SessionSource.ACP.value, SessionSource.ACP.value)
     platform = key.platform
     if platform is None:
-        return ("cli", "cli")
+        return (SessionSource.CLI.value, SessionSource.CLI.value)
     return (platform.value, platform.value)
 
 

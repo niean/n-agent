@@ -112,7 +112,7 @@ class FeishuImAdapter:
                 ),
                 text=content,
                 metadata={
-                    "platform": "feishu",
+                    "platform": Platform.FEISHU.value,
                     "platform_session_id": platform_session_id,
                     "conversation_id": chat_id,
                     "message_id": message_id,
@@ -181,7 +181,7 @@ class FeishuImAdapter:
                 text="",
                 images=[data_url],
                 metadata={
-                    "platform": "feishu",
+                    "platform": Platform.FEISHU.value,
                     "platform_session_id": platform_session_id,
                     "conversation_id": chat_id,
                     "message_id": message_id,

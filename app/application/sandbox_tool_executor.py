@@ -112,6 +112,7 @@ class SandboxToolExecutor:
                 duration_ms=result.duration_ms,
                 authorized_callback_tools=result_dict["authorized_callback_tools"],
                 created_at=datetime.now(timezone.utc),
+                execution_type="execute_code",
             ))
         except Exception:
             pass

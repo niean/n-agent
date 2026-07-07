@@ -27,10 +27,12 @@ class SQLiteSandboxExecutionHistoryRegistry:
                     status TEXT NOT NULL,
                     duration_ms INTEGER NOT NULL,
                     authorized_callback_tools_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    execution_type TEXT NOT NULL DEFAULT 'execute_code'
                 )
                 """
             )
+            self._migrate_add_execution_type(conn)
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_sandbox_execution_history_created_at
@@ -44,6 +46,17 @@ class SQLiteSandboxExecutionHistoryRegistry:
                 """
             )
 
+    @staticmethod
+    def _migrate_add_execution_type(conn: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(sandbox_execution_history)").fetchall()
+        }
+        if "execution_type" not in columns:
+            conn.execute(
+                "ALTER TABLE sandbox_execution_history ADD COLUMN execution_type TEXT NOT NULL DEFAULT 'execute_code'"
+            )
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
@@ -55,9 +68,9 @@ class SQLiteSandboxExecutionHistoryRegistry:
                 """
                 INSERT OR REPLACE INTO sandbox_execution_history(
                     id, session_id, code_hash, code, result_json, status,
-                    duration_ms, authorized_callback_tools_json, created_at
+                    duration_ms, authorized_callback_tools_json, created_at, execution_type
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.id,
@@ -69,6 +82,7 @@ class SQLiteSandboxExecutionHistoryRegistry:
                     entry.duration_ms,
                     json.dumps(entry.authorized_callback_tools),
                     entry.created_at.isoformat(),
+                    entry.execution_type,
                 ),
             )
 
@@ -117,4 +131,5 @@ class SQLiteSandboxExecutionHistoryRegistry:
             duration_ms=row["duration_ms"],
             authorized_callback_tools=json.loads(row["authorized_callback_tools_json"]),
             created_at=datetime.fromisoformat(row["created_at"]),
+            execution_type=row["execution_type"] or "execute_code",
         )

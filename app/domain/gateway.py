@@ -31,7 +31,9 @@ class GatewaySessionKey:
 
     @property
     def source_value(self) -> str:
-        return self.source.value if isinstance(self.source, Platform) else str(self.source)
+        if isinstance(self.source, Enum):
+            return self.source.value
+        return str(self.source)
 
     @property
     def platform(self) -> Platform | None:

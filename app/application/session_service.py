@@ -10,6 +10,7 @@ from app.domain.memory import MemoryStore
 from app.domain.session import (
     ConversationSession,
     SessionNotFoundError,
+    SessionSource,
     SessionValidationError,
     TitleGenerator,
 )
@@ -65,7 +66,7 @@ class SessionService:
     def add_session_deleted_handler(self, handler: SessionDeletedHandler) -> None:
         self._on_session_deleted_handlers.append(handler)
 
-    async def create_session(self, session_id: str, source: str = "dashboard") -> ConversationSession:
+    async def create_session(self, session_id: str, source: str = SessionSource.DASHBOARD.value) -> ConversationSession:
         existing = await self.memory_store.get_session(session_id)
         is_new = existing is None
         session = ConversationSession(id=session_id, source=source)

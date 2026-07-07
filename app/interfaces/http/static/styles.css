@@ -152,8 +152,8 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .chat-composer__bar { display: flex; align-items: center; gap: 8px; padding: 4px 2px 2px; min-width: 0; }
 .chat-composer__icon-btn, .chat-composer__send { display: inline-flex; align-items: center; justify-content: center; border: 0; background: transparent; cursor: pointer; padding: 0; width: 32px; height: 32px; border-radius: 50%; color: var(--color-fg-muted); transition: background 0.15s ease, color 0.15s ease; }
 .chat-composer__icon-btn:hover { background: var(--color-bg-hover); color: var(--color-fg-default); }
-.chat-composer__send { margin-left: auto; width: 34px; height: 34px; flex-shrink: 0; }
-.chat-composer__send:hover { background: var(--color-bg-hover); color: var(--color-fg-default); }
+.chat-composer__send { margin-left: auto; width: 34px; height: 34px; flex-shrink: 0; background: var(--color-primary); color: var(--color-on-primary); }
+.chat-composer__send:hover { background: var(--color-primary-strong); color: var(--color-on-primary); }
 .chat-composer__send:disabled { opacity: 0.5; cursor: not-allowed; }
 .chat-composer__send svg, .chat-composer__icon-btn svg { width: 18px; height: 18px; }
 
@@ -254,7 +254,14 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 /* 工具列表 7列布局 - 名称、类型、分组、描述、风险等级、启用、操作 */
 .tools-list-table th:nth-child(6), .tools-list-table td:nth-child(6) { width: 8%; min-width: 88px; text-align: center; } /* 启用 */
 .tools-list-table th:nth-child(7), .tools-list-table td:nth-child(7) { width: 10%; min-width: 96px; } /* 操作 */
-.sandbox-history-table th:nth-child(5), .sandbox-history-table td:nth-child(5) { text-align: right; }
+.sandbox-history-table { table-layout: fixed; }
+.sandbox-history-table th:nth-child(1), .sandbox-history-table td:nth-child(1) { width: 15%; min-width: 150px; } /* 时间 */
+.sandbox-history-table th:nth-child(2), .sandbox-history-table td:nth-child(2) { width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* Session */
+.sandbox-history-table th:nth-child(3), .sandbox-history-table td:nth-child(3) { width: 10%; min-width: 100px; } /* code_hash */
+.sandbox-history-table th:nth-child(4), .sandbox-history-table td:nth-child(4) { width: 10%; min-width: 100px; } /* 工具名称 */
+.sandbox-history-table th:nth-child(5), .sandbox-history-table td:nth-child(5) { width: 10%; min-width: 100px; } /* 状态 */
+.sandbox-history-table th:nth-child(6), .sandbox-history-table td:nth-child(6) { width: 10%; min-width: 100px; text-align: right; white-space: nowrap; } /* 耗时 */
+.sandbox-history-table th:nth-child(7), .sandbox-history-table td:nth-child(7) { width: 15%; min-width: 150px; } /* 操作 */
 .tools-schema-content { padding: 20px; }
 .tools-schema-content h4 { margin: 0; }
 .tools-schema-content pre { max-height: min(620px, calc(100vh - 150px)); }
@@ -347,8 +354,6 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
   color: var(--color-primary-strong);
   background: var(--color-bg-active);
 }
-.chat-memory-trigger__icon { width: 16px; height: 16px; flex-shrink: 0; }
-.chat-memory-trigger__icon svg { width: 100%; height: 100%; display: block; }
 .chat-memory-popover {
   position: absolute;
   left: 0;

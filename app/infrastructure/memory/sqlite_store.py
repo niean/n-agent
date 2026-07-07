@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
+from app.domain.session import ConversationMessage, ConversationSession, SessionSource, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
 from app.infrastructure.registry.sqlite_mcp_registry import _initialize_mcp_schema
 
@@ -389,7 +389,7 @@ class SQLiteMemoryStore:
                     row["title"],
                     new_ts,
                     new_ts,
-                    "acp",
+                    SessionSource.ACP.value,
                     row["external_memory_enabled_json"] if "external_memory_enabled_json" in row.keys() else None,
                     row["external_memory_slots_json"] if "external_memory_slots_json" in row.keys() else None,
                     row["acp_metadata_json"] if "acp_metadata_json" in row.keys() else None,
@@ -537,14 +537,14 @@ class SQLiteMemoryStore:
         )
 
 
-_IM_PLATFORMS = {"feishu", "dingtalk", "wecom"}
+_IM_PLATFORMS = SessionSource.im_platforms()
 
 
 def _compute_new_session_id_and_source(old_id: str, source: str) -> tuple[str, str]:
     # Step 1: normalize source
     new_source = source
     if source == "local":
-        new_source = "cli"
+        new_source = SessionSource.CLI.value
     elif source.startswith("gw/"):
         # legacy spec-260702 format: gw/{platform}
         platform_str = source[len("gw/"):]
@@ -554,11 +554,11 @@ def _compute_new_session_id_and_source(old_id: str, source: str) -> tuple[str, s
 
     # Step 2: normalize id prefix based on new_source
     new_id = old_id
-    if new_source == "dashboard" and old_id.startswith("session-"):
+    if new_source == SessionSource.DASHBOARD.value and old_id.startswith("session-"):
         new_id = "dashboard-" + old_id[len("session-"):]
-    elif new_source == "api" and old_id.startswith("tmp-"):
+    elif new_source == SessionSource.API.value and old_id.startswith("tmp-"):
         new_id = "api-" + old_id[len("tmp-"):]
-    elif new_source == "cli":
+    elif new_source == SessionSource.CLI.value:
         if old_id.startswith("gateway-"):
             new_id = "cli-" + old_id[len("gateway-"):]
         elif not old_id.startswith("cli-"):

@@ -103,6 +103,26 @@ class SandboxManager:
             self._locks[session_id] = asyncio.Lock()
         return self._locks[session_id]
 
+    def default_workdir(self, session_id: str) -> str:
+        """Return the default workdir for the terminal tool, before sandbox creation.
+
+        Reuses `_safe_session_segment` so the path is path-safe and bounded.
+        Callable BEFORE `get_or_create()` — terminal tool may resolve a workdir
+        first, then acquire the session lock and call `get_or_create()`.
+
+        - Docker: returns container path `/scratch/<safe>`. Also ensures the
+          host-side `scratch_root / safe` exists so the bind-mounted scratch
+          subdir is present (avoids Docker creating it as root-owned).
+        - Local: returns host absolute path `str(scratch_root / safe)` and
+          creates the directory.
+        """
+        safe = _safe_session_segment(session_id)
+        host_session_scratch = self.scratch_root / safe
+        host_session_scratch.mkdir(parents=True, exist_ok=True)
+        if self.sandbox_type == "docker":
+            return f"/scratch/{safe}"
+        return str(host_session_scratch)
+
     async def get_or_create(self, session_id: str) -> Sandbox:
         if session_id in self._releasing:
             raise RuntimeError(f"session {session_id} is being released")
@@ -123,11 +143,15 @@ class SandboxManager:
                 network=self.settings.sandbox_docker_network,
                 host_workspace_root=self.host_workspace_root,
                 host_scratch_root=self.host_scratch_root,
+                max_stdout_bytes=self.settings.sandbox_max_stdout_bytes,
+                max_stderr_bytes=self.settings.sandbox_max_stderr_bytes,
             )
         else:
             sandbox = LocalSandbox(
                 registry=self.callback_registry,
                 workspace_root=self.workspace_root,
+                max_stdout_bytes=self.settings.sandbox_max_stdout_bytes,
+                max_stderr_bytes=self.settings.sandbox_max_stderr_bytes,
             )
         self._sandboxes[session_id] = sandbox
         self._scratch_roots[session_id] = session_scratch

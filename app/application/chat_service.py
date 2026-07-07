@@ -11,7 +11,7 @@ from app.application.events import ChatEvent
 from app.application.session_service import SessionService
 from app.domain.agent import AgentState
 from app.domain.memory import MemoryStore
-from app.domain.session import ConversationMessage
+from app.domain.session import ConversationMessage, SessionSource
 from app.domain.tool import ApprovalDecider, ToolExecutionContext
 from app.utils.content_utils import extract_text, normalize_content
 
@@ -59,7 +59,7 @@ class ChatCompletionService:
 
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
         session_id = request.session_id or request.metadata.get("session_id") or f"api-{uuid4()}"
-        await self.session_service.create_session(session_id, source="api")
+        await self.session_service.create_session(session_id, source=SessionSource.API.value)
         session = await self.memory_store.get_session(session_id)
         existing_messages = await self.memory_store.list_messages(session_id)
         has_override = "external_memory_enabled" in request.options
@@ -149,7 +149,9 @@ class ChatCompletionService:
         if mode != "realtime":
             return set()
         gateway_platform = trusted_metadata.get("gateway.platform")
-        if gateway_platform in ("feishu",):
+        from app.domain.platform import Platform
+
+        if gateway_platform == Platform.FEISHU.value:
             return {"manage_schedule"}
         return set()
 

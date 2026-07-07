@@ -18,6 +18,7 @@ from app.domain.schedule import (
     ScheduleExpression,
     ScheduleTimezone,
 )
+from app.domain.session import SessionSource
 
 
 class ScheduleServiceError(Exception):
@@ -90,7 +91,7 @@ class ScheduleService:
         session_id = request.session_id
         if session_id is None or target.target_type is DeliveryTargetType.ORIGIN:
             session_id = f"schedule-{uuid4()}"
-            await self.session_service.create_session(session_id, source="schedule")
+            await self.session_service.create_session(session_id, source=SessionSource.SCHEDULE.value)
         now = datetime.now(timezone.utc)
         task = ScheduledTask(
             id=f"sched-{uuid4().hex}",
@@ -190,7 +191,7 @@ class ScheduleService:
         recovered = 0
         for task in await self.registry.list_recoverable_origin_tasks():
             session_id = f"schedule-{uuid4()}"
-            await self.session_service.create_session(session_id, source="schedule")
+            await self.session_service.create_session(session_id, source=SessionSource.SCHEDULE.value)
             await self.registry.update(
                 ScheduledTask(
                     **{

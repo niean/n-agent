@@ -334,7 +334,7 @@
     table.className = 'document-table sandbox-history-table';
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['时间', 'Session', 'code_hash', '状态', '耗时(ms)', '授权工具', '操作'].forEach((label) => {
+    ['时间', 'Session', 'code_hash', '工具名称', '状态', '耗时(ms)', '操作'].forEach((label) => {
       const th = document.createElement('th');
       th.textContent = label;
       headerRow.appendChild(th);
@@ -344,14 +344,13 @@
     items.forEach((it) => {
       const result = it.result || {};
       const args = it.arguments || {};
-      const authorized = (result.authorized_callback_tools || []).join(', ');
       const tr = document.createElement('tr');
       appendCell(tr, formatTime(it.created_at));
       appendCell(tr, it.session_id);
       appendCell(tr, shortHash(args.code_hash || ''));
+      appendCell(tr, it.tool_name || it.execution_type || 'execute_code');
       appendBadgeCell(tr, it.status || '-', statusBadge(it.status));
       appendCell(tr, it.duration_ms);
-      appendCell(tr, authorized);
       const actions = document.createElement('td');
       actions.className = 'row-actions';
       actions.append(button('删除', 'btn', () => deleteHistory(it.id)));
@@ -403,7 +402,7 @@
       chainSection.appendChild(logTable);
     } else {
       const empty = document.createElement('div');
-      empty.className = 'muted';
+      empty.className = 'sandbox-detail-meta';
       empty.textContent = '无 callback 调用';
       chainSection.appendChild(empty);
     }
@@ -424,6 +423,26 @@
     metaList.textContent = metaItems.join('  ·  ');
     metaSection.appendChild(metaList);
     wrap.appendChild(metaSection);
+
+    const authSection = document.createElement('div');
+    authSection.className = 'sandbox-detail-section';
+    const authTitle = document.createElement('div');
+    authTitle.className = 'sandbox-detail-section__title';
+    const authTools = result.authorized_callback_tools || [];
+    authTitle.textContent = `授权工具 (${authTools.length})`;
+    authSection.appendChild(authTitle);
+    if (authTools.length) {
+      const authList = document.createElement('div');
+      authList.className = 'sandbox-detail-meta';
+      authList.textContent = authTools.join('  ·  ');
+      authSection.appendChild(authList);
+    } else {
+      const empty = document.createElement('div');
+      empty.className = 'sandbox-detail-meta';
+      empty.textContent = '无';
+      authSection.appendChild(empty);
+    }
+    wrap.appendChild(authSection);
 
     return wrap;
   }

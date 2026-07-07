@@ -88,6 +88,7 @@ from app.infrastructure.sandbox.registry import InMemorySandboxCallbackToolRegis
 from app.infrastructure.sandbox.search_provider import DuckDuckGoHtmlSearchProvider
 from app.application.sandbox_dashboard_service import SandboxDashboardService
 from app.application.sandbox_tool_executor import SandboxToolExecutor
+from app.application.terminal_tool_executor import TerminalToolExecutor
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 
 if TYPE_CHECKING:
@@ -586,6 +587,11 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         summary_max_stdout=settings.sandbox_summary_max_stdout_bytes,
         summary_max_stderr=settings.sandbox_summary_max_stderr_bytes,
     )
+    terminal_tool_executor = TerminalToolExecutor(
+        sandbox_manager=sandbox_manager,
+        settings=settings,
+        history_registry=sandbox_history_registry,
+    )
     sandbox_dashboard_service = SandboxDashboardService(
         sandbox_manager=sandbox_manager,
         memory_store=memory_store,
@@ -664,8 +670,37 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             managed=False,
             enabled=True,
         )
-        tool_service.set_dynamic_definitions("sandbox", [execute_code_definition])
+        terminal_description = (
+            "Execute a shell command in the session sandbox. "
+            "Docker backend: no network, workspace mounted read-only, scratch writable. "
+            "Local backend: trusted-dev only, NOT a security boundary. "
+            "Use workdir to run in /scratch/<session> (default) or /workspace/<path>. "
+            "Non-zero exit code means the command ran but failed (still returns success)."
+        )
+        terminal_definition = ToolDefinition(
+            name="terminal",
+            description=terminal_description,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1},
+                    "workdir": {"type": "string"},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="sandbox",
+            managed=False,
+            enabled=True,
+        )
+        tool_service.set_dynamic_definitions(
+            "sandbox", [execute_code_definition, terminal_definition]
+        )
         routes["execute_code"] = sandbox_tool_executor
+        routes["terminal"] = terminal_tool_executor
         tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
 
     def health_snapshot() -> dict:

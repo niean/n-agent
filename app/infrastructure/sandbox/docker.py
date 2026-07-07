@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import posixpath
 import re
 import shutil
 import time
@@ -27,6 +28,7 @@ from app.domain.sandbox import (
     SandboxCallbackContext,
     SandboxExecutionRequest,
     SandboxExecutionResult,
+    SandboxExecResult,
     SandboxStatus,
 )
 from app.infrastructure.sandbox.rpc_server import SandboxRpcServer
@@ -54,6 +56,8 @@ class DockerSandbox(Sandbox):
         network: bool = False,
         host_workspace_root: Path | None = None,
         host_scratch_root: Path | None = None,
+        max_stdout_bytes: int = 50000,
+        max_stderr_bytes: int = 10000,
     ) -> None:
         self.registry = registry
         self.workspace_root = workspace_root
@@ -64,6 +68,8 @@ class DockerSandbox(Sandbox):
         self.network = network
         self.host_workspace_root = host_workspace_root or workspace_root
         self.host_scratch_root = host_scratch_root or workspace_root
+        self.max_stdout_bytes = max_stdout_bytes
+        self.max_stderr_bytes = max_stderr_bytes
         self.container_status: str | None = None  # None = not running
 
     def is_available(self) -> bool:
@@ -243,6 +249,179 @@ class DockerSandbox(Sandbox):
             duration_seconds=(end - start).total_seconds(),
             tool_call_log=server.tool_call_log,
         )
+
+    async def exec_command(
+        self, command: str, workdir: str, timeout_seconds: int
+    ) -> SandboxExecResult:
+        """Execute a shell command inside the existing sandbox container.
+
+        The command is written to /tmp/cmd-<uuid>.sh via `docker exec -i ...
+        cat > /tmp/cmd-<uuid>.sh` with the command fed as stdin (avoids shell
+        escaping), then executed via `docker exec -w <workdir> <container>
+        sh /tmp/cmd-<uuid>.sh`.
+
+        Status semantics (shell): a non-zero returncode still maps to
+        SandboxStatus.SUCCESS — the command ran, it just failed. Only timeout
+        returns TIMEOUT; only spawn/write errors return ERROR.
+        """
+        start = datetime.now(timezone.utc)
+        # S6: ensure container first; let exceptions propagate to executor
+        # so it can uniformly map them to "sandbox unavailable".
+        await self._ensure_container()
+
+        # S7: mkdir -p for /scratch or /scratch/... only (scratch is rw mount).
+        # /workspace or /workspace/... is read-only; let docker exec -w fail
+        # at the command level rather than silently creating directories.
+        norm = posixpath.normpath(workdir)
+        if norm == "/scratch" or norm.startswith("/scratch/"):
+            await self._run_docker(
+                ["exec", self.session_container_name, "mkdir", "-p", workdir]
+            )
+
+        # S8: unique script name; write command via stdin to avoid shell escaping.
+        script_name = f"cmd-{uuid4().hex}.sh"
+        script_path = f"/tmp/{script_name}"
+
+        try:
+            # Write step: `docker exec -i <container> sh -c "cat > /tmp/cmd-*.sh"`
+            try:
+                write_proc = await asyncio.create_subprocess_exec(
+                    "docker", "exec", "-i", self.session_container_name,
+                    "sh", "-c", f"cat > {script_path}",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                end = datetime.now(timezone.utc)
+                return SandboxExecResult(
+                    status=SandboxStatus.ERROR,
+                    stdout="",
+                    stderr=f"docker exec write spawn failed: {exc}",
+                    returncode=-1,
+                    duration_seconds=(end - start).total_seconds(),
+                )
+
+            # Feed command as stdin; this completes the `cat > /tmp/cmd-*.sh`.
+            try:
+                await write_proc.communicate(input=command.encode("utf-8"))
+            except Exception as exc:
+                end = datetime.now(timezone.utc)
+                return SandboxExecResult(
+                    status=SandboxStatus.ERROR,
+                    stdout="",
+                    stderr=f"script write communicate failed: {exc}",
+                    returncode=-1,
+                    duration_seconds=(end - start).total_seconds(),
+                )
+
+            if write_proc.returncode not in (0, None):
+                end = datetime.now(timezone.utc)
+                return SandboxExecResult(
+                    status=SandboxStatus.ERROR,
+                    stdout="",
+                    stderr=(
+                        f"docker exec script write failed (rc={write_proc.returncode})"
+                    ),
+                    returncode=(
+                        write_proc.returncode
+                        if write_proc.returncode is not None
+                        else -1
+                    ),
+                    duration_seconds=(end - start).total_seconds(),
+                )
+
+            # S9: execute via `docker exec -w <workdir> <container> sh /tmp/cmd-*.sh`
+            try:
+                exec_proc = await asyncio.create_subprocess_exec(
+                    "docker", "exec", "-w", workdir, self.session_container_name,
+                    "sh", script_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as exc:
+                end = datetime.now(timezone.utc)
+                return SandboxExecResult(
+                    status=SandboxStatus.ERROR,
+                    stdout="",
+                    stderr=f"docker exec failed: {exc}",
+                    returncode=-1,
+                    duration_seconds=(end - start).total_seconds(),
+                )
+
+            # S9: command completion returns SUCCESS regardless of returncode.
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    exec_proc.communicate(), timeout=timeout_seconds
+                )
+                returncode = (
+                    exec_proc.returncode if exec_proc.returncode is not None else -1
+                )
+                status = SandboxStatus.SUCCESS
+            except asyncio.TimeoutError:
+                # S10: kill by unique script name, drain partial output, return TIMEOUT.
+                await self._run_docker(
+                    [
+                        "exec", self.session_container_name,
+                        "pkill", "-9", "-f", script_name,
+                    ],
+                    timeout=5,
+                )
+                stdout_b = b""
+                stderr_b = b""
+                try:
+                    stdout_b, stderr_b = await asyncio.wait_for(
+                        exec_proc.communicate(), timeout=2
+                    )
+                except asyncio.TimeoutError:
+                    stderr_b = b"failed to drain subprocess output after timeout"
+                    try:
+                        exec_proc.kill()
+                        await exec_proc.wait()
+                    except ProcessLookupError:
+                        pass
+                end = datetime.now(timezone.utc)
+                partial_stdout = _redact_secrets(
+                    stdout_b.decode("utf-8", errors="replace")[: self.max_stdout_bytes]
+                )
+                partial_stderr = _redact_secrets(
+                    stderr_b.decode("utf-8", errors="replace")[: self.max_stderr_bytes]
+                )
+                return SandboxExecResult(
+                    status=SandboxStatus.TIMEOUT,
+                    stdout=partial_stdout,
+                    stderr=(
+                        f"execution timed out after {timeout_seconds}s\n"
+                        f"--- partial stderr ---\n{partial_stderr}"
+                    ),
+                    returncode=124,
+                    duration_seconds=(end - start).total_seconds(),
+                )
+
+            # S12: UTF-8 replace decode, _redact_secrets, truncate by config.
+            end = datetime.now(timezone.utc)
+            stdout = _redact_secrets(
+                stdout_b.decode("utf-8", errors="replace")[: self.max_stdout_bytes]
+            )
+            stderr = _redact_secrets(
+                stderr_b.decode("utf-8", errors="replace")[: self.max_stderr_bytes]
+            )
+            return SandboxExecResult(
+                status=status,
+                stdout=stdout,
+                stderr=stderr,
+                returncode=returncode,
+                duration_seconds=(end - start).total_seconds(),
+            )
+        finally:
+            # S11: best-effort cleanup regardless of success/failure/timeout.
+            # rm -f is safe even if the script was never written.
+            try:
+                await self._run_docker(
+                    ["exec", self.session_container_name, "rm", "-f", script_path]
+                )
+            except Exception:
+                pass
 
     async def cleanup_container(self) -> None:
         if self.container_status is None and not self.session_container_name:

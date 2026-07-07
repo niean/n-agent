@@ -144,7 +144,7 @@ plugin_secrets(plugin_key, field_name, secret_value, updated_at, PRIMARY KEY(plu
 scheduled_tasks(id, name, prompt, cron_expression, timezone, enabled, status, session_id, origin_json, delivery_target, delivery_context_json, execution_policy_json, next_run_at, lease_until, lease_owner, claim_id, last_run_at, last_status, last_error, last_delivery_error, unread_count, created_at, updated_at)
 scheduled_task_executions(id, task_id, session_id, claim_id, lease_owner, claimed_next_run_at, started_at, completed_at, status, output, error, delivery_status, delivery_error, created_at)
 sandbox_released_history(id, session_id, sandbox_type, sandbox_id, created_at, released_at, reason)
-sandbox_execution_history(id, session_id, code_hash, code, result_json, status, duration_ms, authorized_callback_tools_json, created_at)
+sandbox_execution_history(id, session_id, code_hash, code, result_json, status, duration_ms, authorized_callback_tools_json, created_at, execution_type)
 ```
 
 providers 表唯一索引：
@@ -177,7 +177,7 @@ JSON 边界：
 - `messages.content_json` 存储消息内容
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果
-- `sandbox_execution_history.result_json` 存储 execute_code 沙盒执行结果，`authorized_callback_tools_json` 存储本次实际授权的 callback tool 名称列表
+- `sandbox_execution_history.result_json` 存储 execute_code 沙盒执行结果，`authorized_callback_tools_json` 存储本次实际授权的 callback tool 名称列表，`execution_type` 区分执行类型（`execute_code` 或 `terminal`，默认 `execute_code`，由 `SQLiteSandboxExecutionHistoryRegistry._migrate_add_execution_type` 为旧库补列）
 - `mcp_tools.input_schema_json` 存储 MCP 远端工具 schema
 - `mcp_sites.args_json` 和 `mcp_sites.env_json` 存储 stdio MCP server 的参数数组和环境变量映射
 - `scheduled_tasks.origin_json` 存储任务来源上下文（platform、receive_id 等），`delivery_context_json` 存储投递目标上下文，`execution_policy_json` 存储执行策略（mode、tool_exposure_policy、allow_confirm_tools）

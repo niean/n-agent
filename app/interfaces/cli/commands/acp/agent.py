@@ -61,6 +61,7 @@ from acp.schema import (
 from app.application.events import ChatEventType
 from app.config import Settings
 from app.domain.gateway import GatewaySessionKey, InteractionMessage
+from app.domain.session import SessionSource
 from app.interfaces.cli.commands.acp.auth import (
     ProviderSnapshot,
     authenticate as auth_authenticate,
@@ -117,7 +118,7 @@ class NAgentACPAgent(Agent):
         """
         async def _apply() -> None:
             session = await self.services.memory_store.get_session(session_id)
-            if session is None or session.source != "acp":
+            if session is None or session.source != SessionSource.ACP.value:
                 return
             metadata = dict(session.acp_metadata or {})
             allowed = dict(metadata.get("allowed_confirm_tools") or {})
@@ -327,7 +328,7 @@ class NAgentACPAgent(Agent):
         **kwargs: Any,
     ) -> SetSessionConfigOptionResponse | None:
         session = await self.services.memory_store.get_session(session_id)
-        if session is None or session.source != "acp":
+        if session is None or session.source != SessionSource.ACP.value:
             return None
         metadata = dict(session.acp_metadata or {})
         options = dict(metadata.get("config_options") or {})
@@ -339,7 +340,7 @@ class NAgentACPAgent(Agent):
 
     async def _update_metadata(self, session_id: str, patch: dict[str, Any]) -> None:
         session = await self.services.memory_store.get_session(session_id)
-        if session is None or session.source != "acp":
+        if session is None or session.source != SessionSource.ACP.value:
             return
         metadata = dict(session.acp_metadata or {})
         metadata.update(patch)
@@ -388,7 +389,7 @@ class NAgentACPAgent(Agent):
                 "execution_context_mode": "realtime",
                 "tool_exposure_policy": "safe_only" if mode == "safe_only" else "all",
             }
-            session_key = GatewaySessionKey("acp", session_id, display_name=session_id)
+            session_key = GatewaySessionKey(SessionSource.ACP.value, session_id, display_name=session_id)
             await self.services.gateway_registry.set_active_session(session_key, session_id)
             interaction = InteractionMessage(
                 id=message_id or f"acp-{uuid4()}",

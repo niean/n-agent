@@ -160,10 +160,25 @@ def _history_to_dict(tc) -> dict[str, Any]:
             "code": getattr(tc, "code", ""),
             "code_hash": getattr(tc, "code_hash", ""),
         }
+    # tool_name 优先从 result.tool_name 提取（terminal 写入时显式加了），
+    # fallback 到顶层 tool_name（memory_store 路径的 ToolCall），
+    # 再 fallback 到 execution_type（history_registry 路径），
+    # 最后 "execute_code"。这样旧数据（execution_type=execute_code 但
+    # result.tool_name=terminal）也能正确识别为 terminal。
+    result = getattr(tc, "result", None)
+    tool_name = None
+    if isinstance(result, dict):
+        tool_name = result.get("tool_name")
+    if not tool_name:
+        tool_name = getattr(tc, "tool_name", None)
+    if not tool_name:
+        tool_name = getattr(tc, "execution_type", None) or "execute_code"
+    execution_type = getattr(tc, "execution_type", None) or tool_name
     return {
         "id": tc.id,
         "session_id": tc.session_id,
-        "tool_name": getattr(tc, "tool_name", "execute_code"),
+        "tool_name": tool_name,
+        "execution_type": execution_type,
         "arguments": arguments,
         "result": getattr(tc, "result", None),
         "status": tc.status,

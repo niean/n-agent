@@ -21,6 +21,7 @@ from app.domain.sandbox import (
     SandboxCallbackContext,
     SandboxExecutionRequest,
     SandboxExecutionResult,
+    SandboxExecResult,
     SandboxStatus,
 )
 from app.infrastructure.sandbox.rpc_server import SandboxRpcServer
@@ -53,9 +54,17 @@ def _redact_secrets(text: str) -> str:
 
 
 class LocalSandbox(Sandbox):
-    def __init__(self, registry, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        registry,
+        workspace_root: Path,
+        max_stdout_bytes: int = 50000,
+        max_stderr_bytes: int = 10000,
+    ) -> None:
         self.registry = registry
         self.workspace_root = workspace_root
+        self.max_stdout_bytes = max_stdout_bytes
+        self.max_stderr_bytes = max_stderr_bytes
         self.container_status = "local"
 
     async def execute(self, request: SandboxExecutionRequest) -> SandboxExecutionResult:
@@ -161,4 +170,94 @@ class LocalSandbox(Sandbox):
             tool_calls_made=server.tool_calls_made,
             duration_seconds=(end - start).total_seconds(),
             tool_call_log=server.tool_call_log,
+        )
+
+    async def exec_command(
+        self, command: str, workdir: str, timeout_seconds: int
+    ) -> SandboxExecResult:
+        """Execute a shell command on the host via `sh -c`.
+
+        Trusted-dev only — NOT a security boundary. The command runs in a
+        new session (start_new_session=True) so timeout cleanup can kill the
+        entire process group via os.killpg.
+
+        Status semantics (shell): a non-zero returncode still maps to
+        SandboxStatus.SUCCESS — the command ran, it just failed. Only
+        timeout returns TIMEOUT; only spawn failures or nonexistent workdir
+        return ERROR.
+        """
+        start = datetime.now(timezone.utc)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sh", "-c", command,
+                cwd=workdir,
+                env=_scrub_env(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            end = datetime.now(timezone.utc)
+            return SandboxExecResult(
+                status=SandboxStatus.ERROR,
+                stdout="",
+                stderr=f"subprocess spawn failed: {exc}",
+                returncode=-1,
+                duration_seconds=(end - start).total_seconds(),
+            )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_seconds
+            )
+            returncode = proc.returncode if proc.returncode is not None else -1
+            status = SandboxStatus.SUCCESS
+        except asyncio.TimeoutError:
+            # Kill the whole process group (shell + any child processes)
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            # Drain whatever the subprocess already wrote before it died,
+            # so timeout diagnostics aren't silently lost.
+            stdout_b = b""
+            stderr_b = b""
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=2)
+            except asyncio.TimeoutError:
+                stderr_b = b"failed to drain subprocess output after timeout"
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+            end = datetime.now(timezone.utc)
+            partial_stdout = _redact_secrets(
+                stdout_b.decode("utf-8", errors="replace")[: self.max_stdout_bytes]
+            )
+            partial_stderr = _redact_secrets(
+                stderr_b.decode("utf-8", errors="replace")[: self.max_stderr_bytes]
+            )
+            return SandboxExecResult(
+                status=SandboxStatus.TIMEOUT,
+                stdout=partial_stdout,
+                stderr=(
+                    f"execution timed out after {timeout_seconds}s\n"
+                    f"--- partial stderr ---\n{partial_stderr}"
+                ),
+                returncode=124,
+                duration_seconds=(end - start).total_seconds(),
+            )
+        end = datetime.now(timezone.utc)
+        stdout = _redact_secrets(
+            stdout_b.decode("utf-8", errors="replace")[: self.max_stdout_bytes]
+        )
+        stderr = _redact_secrets(
+            stderr_b.decode("utf-8", errors="replace")[: self.max_stderr_bytes]
+        )
+        return SandboxExecResult(
+            status=status,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=returncode,
+            duration_seconds=(end - start).total_seconds(),
         )

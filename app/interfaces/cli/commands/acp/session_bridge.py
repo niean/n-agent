@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from app.application.session_service import SessionService
 from app.domain.memory import MemoryStore
-from app.domain.session import ConversationSession
+from app.domain.session import ConversationSession, SessionSource
 
 CleanupCallback = Callable[[str], Any]
 ACP_SESSION_ID_PREFIX = "acp-"
@@ -50,7 +50,7 @@ class ACPSessionBridge:
         config_options: dict[str, Any] | None = None,
         allowed_confirm_tools: dict[str, str] | None = None,
     ) -> ConversationSession:
-        session = await self.session_service.create_session(session_id, source="acp")
+        session = await self.session_service.create_session(session_id, source=SessionSource.ACP.value)
         metadata: dict[str, Any] = {
             "cwd": cwd,
             "mode": mode,
@@ -68,7 +68,7 @@ class ACPSessionBridge:
 
     async def load(self, session_id: str) -> ConversationSession | None:
         session = await self.memory_store.get_session(session_id)
-        if session is None or session.source != "acp":
+        if session is None or session.source != SessionSource.ACP.value:
             return None
         return session
 
@@ -84,7 +84,7 @@ class ACPSessionBridge:
     ) -> ConversationSession | None:
         existing = await self.memory_store.get_session(session_id)
         if existing is not None:
-            if existing.source == "acp":
+            if existing.source == SessionSource.ACP.value:
                 return existing
             return None
         return await self.create(
@@ -104,7 +104,7 @@ class ACPSessionBridge:
         limit: int = 50,
     ) -> tuple[list[ConversationSession], str | None]:
         return await self.memory_store.list_sessions_by_source(
-            "acp", cwd=cwd, cursor=cursor, limit=limit,
+            SessionSource.ACP.value, cwd=cwd, cursor=cursor, limit=limit,
         )
 
     async def fork(
@@ -113,7 +113,7 @@ class ACPSessionBridge:
         target_session_id: str | None = None,
     ) -> str | None:
         source = await self.memory_store.get_session(source_session_id)
-        if source is None or source.source != "acp":
+        if source is None or source.source != SessionSource.ACP.value:
             return None
         if target_session_id is None:
             target_session_id = new_acp_session_id()

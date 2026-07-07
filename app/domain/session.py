@@ -2,11 +2,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Protocol
 from uuid import uuid4
 
 
 DEFAULT_SESSION_TITLE = "New Session"
+
+
+class SessionSource(str, Enum):
+    # 会话来源（一级），与 session_id 前缀一一对应；详见 .harness/knowledge/05-key-patterns.md 模式十六
+    DASHBOARD = "dashboard"
+    API = "api"
+    CLI = "cli"
+    FEISHU = "feishu"
+    DINGTALK = "dingtalk"
+    WECOM = "wecom"
+    ACP = "acp"
+    SCHEDULE = "schedule"
+
+    @classmethod
+    def im_platforms(cls) -> set[str]:
+        # IM 平台来源字符串集合，供 SQLite 迁移与边界判断复用
+        return {cls.FEISHU.value, cls.DINGTALK.value, cls.WECOM.value}
 
 
 def utc_now() -> datetime:
@@ -57,7 +75,7 @@ class TaskState:
 class ConversationSession:
     id: str
     title: str = DEFAULT_SESSION_TITLE
-    source: str = "api"
+    source: str = SessionSource.API.value
     external_memory_enabled: list[str] | None = None
     external_memory_slots: dict[str, str] | None = None
     created_at: datetime = field(default_factory=utc_now)

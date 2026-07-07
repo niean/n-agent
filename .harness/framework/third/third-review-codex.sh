@@ -105,6 +105,9 @@ if [[ ! -f "$prompt_template" ]]; then
   exit 1
 fi
 
+target_basename="$(basename "$target_file")"
+session_title="HarnessReview-${target_basename%.md}"
+
 tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/harness-third-review.XXXXXX.md")"
 cleanup() {
   rm -f "$tmp_prompt"
@@ -112,6 +115,11 @@ cleanup() {
 trap cleanup EXIT
 
 {
+  printf '# %s\n\n' "$session_title"
+  printf 'SESSION_TITLE: %s\n' "$session_title"
+  printf 'PROJECT_ROOT: %s\n' "$repo_root"
+  printf 'RECORD_VISIBILITY: 本次审阅对话记录由 Codex exec 持久化为当前项目会话；禁止为审阅记录在 .harness 下新建文件或目录。\n'
+  printf '\n---\n\n'
   cat "$prompt_template"
   printf '\n---\n\n'
   printf 'DOC_TYPE: %s\n' "$doc_type"
@@ -127,8 +135,14 @@ trap cleanup EXIT
 PROMPT
 } > "$tmp_prompt"
 
-"$codex_bin" exec \
-  --cd "$repo_root" \
-  --sandbox workspace-write \
-  "${model_args[@]}" \
-  - < "$tmp_prompt"
+codex_cmd=(
+  "$codex_bin" exec
+  --cd "$repo_root"
+  --sandbox workspace-write
+)
+if (( ${#model_args[@]} > 0 )); then
+  codex_cmd+=("${model_args[@]}")
+fi
+codex_cmd+=(-)
+
+"${codex_cmd[@]}" < "$tmp_prompt"

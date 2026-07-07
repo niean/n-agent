@@ -59,6 +59,59 @@ async def test_execute_code_history_survives_session_delete(tmp_path):
     assert [row["id"] for row in rows] == ["tc-1"]
     assert rows[0]["arguments"] == {"code": "print(1)", "code_hash": "hash-1"}
     assert rows[0]["result"] == {"status": "success"}
+    assert rows[0]["execution_type"] == "execute_code"
+
+
+@pytest.mark.asyncio
+async def test_execute_code_history_distinguishes_terminal_and_execute_code(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    memory_store = SQLiteMemoryStore(db_path)
+    history_registry = SQLiteSandboxExecutionHistoryRegistry(db_path)
+    service = _service(tmp_path, memory_store, history_registry)
+    created_at = datetime.now(timezone.utc)
+    await memory_store.create_session(ConversationSession(id="s1"))
+    msg = await memory_store.append_message("s1", ConversationMessage(role="user", content="run"))
+    await memory_store.save_tool_call(ToolCall(
+        id="tc-legacy",
+        session_id="s1",
+        message_id=msg.id,
+        tool_name="execute_code",
+        arguments={"code": "print(1)", "code_hash": "hash-legacy"},
+        result={"status": "success"},
+        status="success",
+        duration_ms=10,
+        created_at=created_at,
+    ))
+    history_registry.record(SandboxExecutionHistoryEntry(
+        id="tc-code",
+        session_id="s1",
+        code_hash="hash-code",
+        code="print(2)",
+        result={"status": "success"},
+        status="success",
+        duration_ms=12,
+        authorized_callback_tools=[],
+        created_at=created_at,
+        execution_type="execute_code",
+    ))
+    history_registry.record(SandboxExecutionHistoryEntry(
+        id="tc-term",
+        session_id="s1",
+        code_hash="hash-term",
+        code="ls /workspace",
+        result={"status": "success"},
+        status="success",
+        duration_ms=5,
+        authorized_callback_tools=[],
+        created_at=created_at,
+        execution_type="terminal",
+    ))
+
+    rows = await service.list_execute_code_history(limit=50)
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["tc-code"]["execution_type"] == "execute_code"
+    assert by_id["tc-term"]["execution_type"] == "terminal"
+    assert by_id["tc-legacy"]["execution_type"] == "execute_code"
 
 
 @pytest.mark.asyncio

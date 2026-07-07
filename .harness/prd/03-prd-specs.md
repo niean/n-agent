@@ -284,7 +284,8 @@
 
 [20260707]
 - HE
-    - HE：修改Harness Workflow，①Phase2 spec生成后，引入Third模型、审阅修改spec文件，然后交回给主流程模型加载和审阅；②Phase3 plan生成后，引入Third模型、审阅修改plan文件，然后交回给主流程模型加载和审阅。我希望在现有的 .harness框架上做修改，且希望IDE无关(claudecode codex均能支持)
+    - HE：修改Harness Workflow，①Phase2 spec生成后，引入Third模型、审阅修改spec文件，然后交回给主流程模型加载和审阅；②Phase3 plan生成后，引入Third模型、审阅修改plan文件，然后交回给主流程模型加载和审阅。我希望在现有的 .harness框架上做修改，且希望IDE无关(claudecode codex均能支持)，Third审阅交互在Codex IDE可见
+    - HE：修改Harness Workflow iterate-feature、refine-feature，任务最后一个Phase结束后，允许执行自定义hook命令、未定义hook则跳过；hook放在 .harness/framework/hooks/after-finish.sh
 - FR
     - 对话：[KF]多模态支持图片输入，vision_analyze，覆盖入口包括 API、飞书IM、ACP等
         - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
@@ -300,6 +301,15 @@
         - 对话：Chat，图片在对话框的渲染，小蓝边太宽了、很难看
         - 对话：Chat，图片在对话框中，支持点击后弹出框预览
     - 会话：会话列表，来源字段大多hardcode，请修改为公共枚举、方便治理
+    - 沙盒：支持Terminal命令执行，危险命令确认(对标Hermes)
+        - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
+        - 验收：生成验收事项和文件，spec/verify/verify-260707-terminal-in-sandbox.md，要求 ①只包含端到端的人工验收项，禁止已自动验收项 ②分组List ③禁用视觉效果格式如加粗强调emoji表情
+
+[20260708]
+- FR
+    - 沙盒：支持Terminal命令执行，验收、优化
+        - 沙盒：Dashboard执行历史，区分`工具名称`execute_code|terminal，放在code_hash列之后、状态列之前
+        - 沙盒：Dashboard执行历史，授权工具放到详情、表格删除该列，同时`耗时(ms)`列修正为右对齐、状态列修正为左对齐
 
 
 ---
@@ -307,7 +317,6 @@
 [待办]
 - HE
     - HE：补充`人工验收项`到plan文件，章节命名`## 人工验收`、放到`## 变更记录`上方，要求仅保留`人工/半人工验收项`
-    - HE：Harness工作流优化，修改代码后自动重启服务，且平台无关(如CC、Codex都能支持)
 - NFR
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
@@ -316,9 +325,9 @@
 - FR
     - 架构：MoA，对标Hermes
     - 工具：Skill自进化
-    - 沙盒：支持Terminal命令执行，危险命令确认(对标Hermes)
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明、多分类目录、plugin沙盒化
-    - 观测：Token计量
+    - 观测：支持Token、上下文统计等统计信息
+        - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
 
 ---
 

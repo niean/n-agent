@@ -36,8 +36,20 @@ class SandboxExecutionResult:
     tool_call_log: list[dict] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class SandboxExecResult:
+    status: SandboxStatus
+    stdout: str
+    stderr: str
+    returncode: int
+    duration_seconds: float
+
+
 class Sandbox(Protocol):
     async def execute(self, request: SandboxExecutionRequest) -> SandboxExecutionResult: ...
+    async def exec_command(
+        self, command: str, workdir: str, timeout_seconds: int
+    ) -> SandboxExecResult: ...
 
 
 @dataclass(frozen=True)
@@ -113,6 +125,7 @@ class SandboxExecutionHistoryEntry:
     duration_ms: int
     authorized_callback_tools: list[str]
     created_at: datetime
+    execution_type: str = "execute_code"
 
 
 class SandboxExecutionHistoryRegistry(Protocol):

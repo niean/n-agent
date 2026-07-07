@@ -10,6 +10,7 @@ from app.domain.gateway import (
     InteractionMessage,
     InteractionResponse,
 )
+from app.domain.session import SessionSource
 
 
 class CliChatAdapter:
@@ -32,14 +33,14 @@ class CliChatAdapter:
         conversation_id: str,
     ) -> InteractionResponse:
         choice_enum = GatewayConfirmationChoice(choice)
-        session_key = GatewaySessionKey("cli", conversation_id, display_name=conversation_id)
+        session_key = GatewaySessionKey(SessionSource.CLI.value, conversation_id, display_name=conversation_id)
         actor_id = f"cli:{conversation_id}"
         return await self._svc.handle_confirmation(session_key, actor_id, confirmation_id, choice_enum)
 
     def _build_event(self, text: str, conversation_id: str) -> InteractionMessage:
         return InteractionMessage(
             id=f"cli-{uuid4()}",
-            session_key=GatewaySessionKey("cli", conversation_id, display_name=conversation_id),
+            session_key=GatewaySessionKey(SessionSource.CLI.value, conversation_id, display_name=conversation_id),
             text=text,
             metadata={"actor_id": f"cli:{conversation_id}"},
         )
