@@ -36,6 +36,14 @@
 3. 遵守 `[GATE]` 门禁（见下方 GATE 规则），在 GATE 点等待用户确认后再继续
 4. 按 Phase 定义的消息输出格式输出，不简化、不改动
 
+## Workflow 完成 Hook
+
+- 支持在 Workflow 最后一个 Phase 成功结束后执行自定义收尾命令，统一入口为 `.harness/framework/hooks/after-finish.sh`
+- Hook 仅在 Workflow 明确声明时执行；当前适用 Workflow：`iterate-feature`、`refine-feature`
+- Hook 文件不存在时视为未定义，直接跳过；不得因为未定义 Hook 中断或降级 Workflow
+- Hook 文件存在时执行：`sh .harness/framework/hooks/after-finish.sh`
+- Hook 失败不回滚已完成 Phase；必须在最终输出中标注失败命令和退出码，等待用户决策
+
 ## Skill 执行
 
 1. 读取定义：立即读取对应的 Skill 文件（如 `.harness/framework/skills/harness/load-knowledge.md`）
@@ -257,6 +265,7 @@ AI 自主维护教训库，人工可通过提示或建议触发新增/修正。
 .harness/framework/
   FRAMEWORK.md         -- 通用规范入口（本文件）
   agents/              -- Agent 角色模板（Orchestrator、Designer、Planner、Coder、Reviewer）
+  hooks/               -- Workflow 完成后可选自定义 Hook（如 after-finish.sh）
   workflows/           -- Workflow 端到端编排（迭代功能、修复Bug、迭代文档）
     harness-ops/       -- Harness 运维类 Workflow（治理代码-人工、治理技能-人工）
   third/               -- Third Review 外部审阅通道

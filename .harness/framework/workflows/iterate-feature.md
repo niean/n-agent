@@ -82,9 +82,10 @@ Workflow Progress:
 
 ## Phase 7: 任务总结
 - Agent: Orchestrator
-- 执行顺序：`Skill: 归档任务文件`（输入：Phase 2 spec 文件路径 + Phase 3 plan 文件路径）-> `Skill: 总结任务` -> 结束任务，在同一条回复中完成
+- 执行顺序：`Skill: 归档任务文件`（输入：Phase 2 spec 文件路径 + Phase 3 plan 文件路径）-> `Skill: 总结任务` -> Phase 7 结束 -> 执行 after-finish Hook -> 结束任务，在同一条回复中完成
+- after-finish Hook：若 `.harness/framework/hooks/after-finish.sh` 存在，执行 `sh .harness/framework/hooks/after-finish.sh`；若文件不存在则跳过。Hook 失败不回滚 Phase 7，但必须在最终输出中标注失败命令和退出码
 
-检查点：`[Phase 7 任务总结] 归档: spec+plan, 状态: 完成`
+检查点：`[Phase 7 任务总结] 归档: spec+plan, hook: executed/skipped/failed, 状态: 完成`
 
 ---
 
