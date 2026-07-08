@@ -131,6 +131,7 @@ CLAUDE.md              -- Claude Code 入口
   specs/               -- 设计文档
     active/
     completed/
+    verify/            -- 人工端到端验收文件
   plans/               -- 实现计划
     active/
     completed/

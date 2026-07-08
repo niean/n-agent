@@ -17,7 +17,7 @@ description: 功能迭代端到端工作流，编排 Designer/Planner/Coder/Revi
 Workflow Progress:
 - [ ] Phase 1: 知识加载（知识库加载、约束确认）
 - [ ] Phase 2: 需求探索与设计（spec 落盘）[GATE]
-- [ ] Phase 3: 计划制定（plan 落盘）[GATE-ENTRY]
+- [ ] Phase 3: 计划制定（plan 落盘 + verify 落盘）[GATE-ENTRY]
 - [ ] Phase 4: 代码实现（按 plan 逐 task）
 - [ ] Phase 5: 结果验收（构建 + 扫描 + 验收标准）
 - [ ] Phase 6: 知识回填
@@ -56,6 +56,7 @@ Workflow Progress:
   2. 执行 Third Review：优先执行 `${HARNESS_THIRD_REVIEW_CMD:-.harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`；可通过 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型；Third Review 可直接修改 plan 文件，但只能修改该 plan，禁止修改 spec
   3. Third Review 完成后，主流程模型必须重新读取 plan 文件，并按关联 spec 复审是否破坏 spec、Harness 模板、Phase/GATE 边界、任务可执行性和验收可验证性
   4. Third Review 命令不可用或失败时，跳过 Third Review 和后续 Third 修改复审，不再执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`
+- plan 经 Plan Review Loop、Third Review 和主流程复审后，执行 `Skill: writing-verify`（`.harness/framework/skills/superpowers/writing-verify.md`），输入 Phase 2 spec 文件路径和 Phase 3 plan 文件路径，生成独立旁路人工验收文件 `.harness/specs/verify/verify-{YYMMDD}-{desc}.md`
 - plan 经 Plan Review Loop、Third Review 和主流程复审后，确定执行方式（Subagent-Driven / Inline Execution）后直接进入 Phase 4：若用户在输入指令中明确指定了执行方式则遵从；否则 AI 按任务规模自主决策，plan 中 task <= 3 个时使用 Inline Execution，其余使用 Subagent-Driven，无需人工确认。禁止中断回复等待确认 -- 本 Phase 无 [GATE] 标记，plan 复审后必须自主推进
 
 检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: codex/skipped, 执行方式: subagent/inline`
@@ -82,7 +83,7 @@ Workflow Progress:
 
 ## Phase 7: 任务总结
 - Agent: Orchestrator
-- 执行顺序：`Skill: 归档任务文件`（输入：Phase 2 spec 文件路径 + Phase 3 plan 文件路径）-> `Skill: 总结任务` -> Phase 7 结束 -> 执行 after-finish Hook -> 结束任务，在同一条回复中完成
+- 执行顺序：`Skill: 归档任务文件`（输入：Phase 2 spec 文件路径 + Phase 3 plan 文件路径）-> `Skill: 总结任务` -> Phase 7 结束 -> 执行 after-finish Hook -> 提醒人工验收 -> 结束任务，在同一条回复中完成
 - after-finish Hook：若 `.harness/framework/hooks/after-finish.sh` 存在，执行 `sh .harness/framework/hooks/after-finish.sh`；若文件不存在则跳过。Hook 失败不回滚 Phase 7，但必须在最终输出中标注失败命令和退出码
 
 检查点：`[Phase 7 任务总结] 归档: spec+plan, hook: executed/skipped/failed, 状态: 完成`

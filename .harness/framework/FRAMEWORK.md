@@ -216,19 +216,21 @@ AI 通过 `.harness/specs/` 和 `.harness/plans/` 自主管理设计文档和实
 
 - Spec 命名：`spec-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/brainstorming.md`
 - Plan 命名：`plan-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/writing-plans.md`
+- Verify 命名：`verify-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/writing-verify.md`
 - Spec 触发：默认必须产出 spec；用户显式要求跳过、或指令显式要求跳过时，可省略 spec
 - Spec 是一次性产物，实现完成后持久性知识通过 Phase 5 回填 knowledge/
 - 同一窗口内第 2+ 次迭代复用同一计划文件
 
 ### 生命周期
 
-同一 Task 允许 1 spec + 1 plan；不同 Task 的文件可在 active/ 中并行。
+同一 Task 允许 1 spec + 1 plan + 1 verify；不同 Task 的文件可在 active/ 中并行。
 
 | 阶段 | 操作 | 规则 |
 |------|------|------|
 | Phase 1 知识加载 | 检测 active/ | 按文件名日期和描述匹配当前任务，匹配则复用；不匹配视为其他 Task 文件，后续 Phase 新建。completed/ 中有匹配则移回 active/ 复用；均无则后续 Phase 创建 |
 | Phase 2 需求探索 | 写入 spec | spec -> `specs/active/`（仅迭代功能） |
 | Phase 3 计划制定 | 写入 plan | plan -> `plans/active/`（仅迭代功能） |
+| Phase 3 计划制定 | 写入 verify | verify -> `specs/verify/`（仅迭代功能） |
 | 任务执行中 | 更新 plan | 更新检查清单、记录变更和技术债 |
 | 任务总结 | 归档 | 状态改 completed，移到 `completed/` |
 
