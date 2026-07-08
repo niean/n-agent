@@ -7,7 +7,7 @@ description: Use after an implementation plan is approved, before touching code,
 
 ## Overview
 
-Write a standalone manual acceptance file for end-to-end human or semi-human verification. The file is created after the plan is written and reviewed, before code implementation starts.
+Write a standalone manual acceptance checklist for end-to-end human or semi-human verification. The file is created after the plan is written and reviewed, before code implementation starts.
 
 Announce at start: "I'm using the writing-verify skill to create the manual acceptance checklist."
 
@@ -39,38 +39,27 @@ Save verify files to: `.harness/specs/verify/verify-{YYMMDD}-{desc}.md`
 Every verify file must use this exact section order:
 
 ```markdown
-# {Feature Name} Manual Verify
+<!-- SUMMARY: {feature} 人工端到端验收清单，覆盖 {major workflows} -->
+# 验收清单：{Feature Name}（人工端到端部分）
 
-- 创建时间: YYYY-MM-DD HH:MM
-- 状态: active | completed
-- 关联 spec: spec-{YYMMDD}-{desc}.md
-- 关联 plan: plan-{YYMMDD}-{desc}.md
+对应 spec：spec-{YYMMDD}-{desc}.md
+对应 plan：plan-{YYMMDD}-{desc}.md
 
-## 验收范围
-- {one end-to-end capability or workflow}
+仅保留必须人工端到端验证的项。可脚本化/已自动化的项（{automatic coverage summary}）由自动化测试覆盖，不在本清单。
 
-## 验收前置
-- {environment, account, service, fixture data, or command required before verification}
+前置准备：{environment, account, service, fixture data, command access, or external dependency required before verification}。
 
-## 验收项
+---
 
-### {Group Name}
-- 场景: {what user workflow is being verified}
-  前置: {specific prerequisite for this item, or "无"}
-  操作: {exact human or semi-human steps}
-  预期: {observable expected result}
+## 1. {Group Name}
 
-## 不纳入人工验收
-- {automatic check or internal behavior intentionally excluded}: {reason}
-
-## 变更记录
-| 时间 | 变更内容 |
-|------|---------|
+- [ ] 1.1 {entrypoint or workflow}：{human action} -> {observable expected result}
+- [ ] 1.2 {entrypoint or workflow}：{human action} -> {observable expected result}
 ```
 
 ## Stable Output Rules
 
-- Use grouped lists under `## 验收项`.
+- Use numbered group headings and checkbox items. Each checkbox is one acceptance item.
 - Group by user entrypoint or workflow, not by code module.
 - Keep each acceptance item independent. A failed item should identify one workflow gap.
 - Use plain text only. Do not use emoji, bold, italic, decorative icons, or visual emphasis.
@@ -78,8 +67,10 @@ Every verify file must use this exact section order:
 - Use exact commands, URLs, UI names, protocol names, and payload examples when the plan provides them.
 - If the plan uses placeholders, keep the placeholder explicit and human-readable, for example `{session_id}`.
 - Keep expected results observable: UI content, command output, HTTP status/body, protocol response, database row, log line, or external service state.
-- If an item requires semi-manual inspection, name the inspection target and expected evidence.
+- If an item requires semi-manual inspection, name the inspection target and expected evidence in the same checkbox line.
 - Avoid broad items such as "feature works" or "no regression". Split them into concrete workflows.
+- Avoid field-style items such as 场景/前置/操作/预期. Put the action and expected result in one readable checkbox line.
+- Use checked boxes `[x]` only when the item has already been manually verified in the current task. New checklists should default to `[ ]`.
 
 ## Generation Steps
 
@@ -92,7 +83,8 @@ Every verify file must use this exact section order:
 7. Validate the result:
    - verify file exists at the expected path.
    - verify file contains only manual or semi-manual items.
-   - each item has 场景, 前置, 操作, 预期.
+   - each acceptance item is a checkbox line.
+   - each checkbox line contains both human action and observable expected result.
    - verify file uses spec/plan filenames only, without `active/` or `completed/` directory paths.
    - plan file is not modified by this skill.
 

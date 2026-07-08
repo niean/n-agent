@@ -60,6 +60,38 @@
 
   function clearNode(node) { ui.clear(node); }
 
+  function createSvgElement(tag, attrs) {
+    const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    Object.entries(attrs || {}).forEach(([key, value]) => el.setAttribute(key, value));
+    return el;
+  }
+
+  function createMemoryTriggerIcon() {
+    const svg = createSvgElement('svg', {
+      class: 'chat-memory-trigger__icon',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      'aria-hidden': 'true',
+    });
+    svg.append(
+      createSvgElement('path', {
+        d: 'M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 0 0 12 18a3 3 0 0 0 0-6 3 3 0 0 0 0-6Z',
+        stroke: 'currentColor',
+        'stroke-width': '2',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+      }),
+      createSvgElement('path', {
+        d: 'M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 0 1 12 18',
+        stroke: 'currentColor',
+        'stroke-width': '2',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+      })
+    );
+    return svg;
+  }
+
   function setSending(next) {
     isSending = next;
     const btn = ui.byId('chat-send');
@@ -611,7 +643,10 @@
     trigger.title = descText;
     trigger.setAttribute('aria-haspopup', 'dialog');
     trigger.setAttribute('aria-expanded', memoryPopoverOpen ? 'true' : 'false');
-    trigger.textContent = '记忆';
+    const triggerLabel = document.createElement('span');
+    triggerLabel.className = 'chat-memory-trigger__label';
+    triggerLabel.textContent = '记忆';
+    trigger.append(createMemoryTriggerIcon(), triggerLabel);
     if (enabledProviders.length > 0) trigger.classList.add('active');
     trigger.addEventListener('click', (event) => {
       event.stopPropagation();

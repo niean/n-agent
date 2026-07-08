@@ -27,6 +27,7 @@ from app.domain.plugin import (
 logger = logging.getLogger(__name__)
 
 PLUGIN_YAML = "plugin.yaml"
+PLUGIN_YML = "plugin.yml"
 PLUGIN_INIT = "__init__.py"
 PLUGIN_NAMESPACE_PREFIX = "n_agent_plugins"
 MAX_PLUGINS_PER_SOURCE = 200
@@ -41,6 +42,7 @@ class PluginFileLoaderConfig:
     enable_project: bool = False
     safe_mode: bool = False
     max_plugins: int = MAX_PLUGINS_PER_SOURCE
+    skip_names: frozenset[str] = frozenset({"platforms"})
 
 
 class PluginFileLoader:
@@ -134,8 +136,6 @@ class PluginFileLoader:
         source: PluginSource,
         warnings: list[PluginScanWarning],
     ) -> list[PluginManifest]:
-        from app.infrastructure.path_security import validate_within_dir
-
         root = Path(root)
         if not root.exists():
             return []
@@ -144,60 +144,78 @@ class PluginFileLoader:
         except OSError as exc:
             warnings.append(PluginScanWarning(relative_path=str(root), reason="mkdir_failed", detail=str(exc)))
             return []
+        state = {"count": 0, "max_warned": False, "stop": False}
+        return self._scan_directory_level(
+            root, source, root, self.config.skip_names, "", 0, state, warnings
+        )
+
+    def _scan_directory_level(
+        self,
+        path: Path,
+        source: PluginSource,
+        root: Path,
+        skip_names: frozenset[str],
+        prefix: str,
+        depth: int,
+        state: dict,
+        warnings: list[PluginScanWarning],
+    ) -> list[PluginManifest]:
+        from app.infrastructure.path_security import validate_within_dir
+
         manifests: list[PluginManifest] = []
-        count = 0
         try:
-            entries = sorted(root.iterdir(), key=lambda p: p.name)
+            entries = sorted(path.iterdir(), key=lambda p: p.name)
         except OSError as exc:
-            warnings.append(PluginScanWarning(relative_path=str(root), reason="iterdir_failed", detail=str(exc)))
-            return []
-        for category_dir in entries:
-            if not category_dir.is_dir():
+            warnings.append(PluginScanWarning(relative_path=str(path), reason="iterdir_failed", detail=str(exc)))
+            return manifests
+        for child in entries:
+            if state["stop"]:
+                break
+            if not child.is_dir():
                 continue
-            if category_dir.name.startswith(".") or category_dir.name in {"__pycache__"}:
+            if child.name.startswith(".") or child.name in {"__pycache__"}:
                 continue
-            if count >= self.config.max_plugins:
-                warnings.append(PluginScanWarning(relative_path=str(root), reason="max_plugins_exceeded"))
+            if depth == 0 and child.name in skip_names:
+                continue
+            if state["count"] >= self.config.max_plugins:
+                if not state["max_warned"]:
+                    warnings.append(PluginScanWarning(relative_path=str(root), reason="max_plugins_exceeded"))
+                    state["max_warned"] = True
+                state["stop"] = True
                 break
             try:
-                validate_within_dir(category_dir, root)
+                err = validate_within_dir(child, root)
             except Exception as exc:
-                warnings.append(PluginScanWarning(relative_path=str(category_dir), reason="path_escape", detail=str(exc)))
+                warnings.append(PluginScanWarning(relative_path=str(child), reason="path_escape", detail=str(exc)))
                 continue
-            plugin_yaml = category_dir / PLUGIN_YAML
-            if plugin_yaml.is_file():
-                manifest = self._parse_manifest(plugin_yaml, source, category_dir.name, category_dir, warnings)
+            if err:
+                warnings.append(PluginScanWarning(relative_path=str(child), reason="path_escape", detail=err))
+                continue
+            manifest_path = self._manifest_path_for(child)
+            if manifest_path is not None:
+                key = f"{prefix}/{child.name}" if prefix else child.name
+                manifest = self._parse_manifest(manifest_path, source, key, child, warnings)
                 if manifest is not None:
                     manifests.append(manifest)
-                    count += 1
+                    state["count"] += 1
                 continue
-            try:
-                plugin_entries = sorted(category_dir.iterdir(), key=lambda p: p.name)
-            except OSError as exc:
-                warnings.append(PluginScanWarning(relative_path=str(category_dir), reason="iterdir_failed", detail=str(exc)))
-                continue
-            for plugin_dir in plugin_entries:
-                if not plugin_dir.is_dir():
-                    continue
-                if plugin_dir.name.startswith(".") or plugin_dir.name in {"__pycache__"}:
-                    continue
-                if count >= self.config.max_plugins:
-                    warnings.append(PluginScanWarning(relative_path=str(root), reason="max_plugins_exceeded"))
-                    break
-                try:
-                    validate_within_dir(plugin_dir, root)
-                except Exception as exc:
-                    warnings.append(PluginScanWarning(relative_path=str(plugin_dir), reason="path_escape", detail=str(exc)))
-                    continue
-                plugin_yaml = plugin_dir / PLUGIN_YAML
-                if not plugin_yaml.is_file():
-                    continue
-                key = f"{category_dir.name}/{plugin_dir.name}"
-                manifest = self._parse_manifest(plugin_yaml, source, key, plugin_dir, warnings)
-                if manifest is not None:
-                    manifests.append(manifest)
-                    count += 1
+            if depth < 1:
+                child_prefix = f"{prefix}/{child.name}" if prefix else child.name
+                manifests.extend(
+                    self._scan_directory_level(
+                        child, source, root, skip_names, child_prefix, depth + 1, state, warnings
+                    )
+                )
         return manifests
+
+    def _manifest_path_for(self, plugin_dir: Path) -> Path | None:
+        yaml_path = plugin_dir / PLUGIN_YAML
+        if yaml_path.is_file():
+            return yaml_path
+        yml_path = plugin_dir / PLUGIN_YML
+        if yml_path.is_file():
+            return yml_path
+        return None
 
     def _parse_manifest(
         self,

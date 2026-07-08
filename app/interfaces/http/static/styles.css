@@ -354,6 +354,15 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
   color: var(--color-primary-strong);
   background: var(--color-bg-active);
 }
+.chat-memory-trigger__icon {
+  display: block;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+.chat-memory-trigger__label {
+  line-height: 1;
+}
 .chat-memory-popover {
   position: absolute;
   left: 0;

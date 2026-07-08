@@ -444,8 +444,14 @@ def test_chat_memory_uses_toolbar_popover_grouped_picker(tmp_path):
     assert "chat-external-memory__content--collapsed" not in chat_js
     assert "externalMemoryExpanded ? '▼' : '▲'" not in chat_js
 
-    # 触发按钮改名为"记忆"
-    assert "trigger.textContent = '记忆'" in chat_js
+    # 触发按钮保留图标样式，使用 DOM API 创建 SVG，避免 innerHTML
+    assert "function createMemoryTriggerIcon()" in chat_js
+    assert "document.createElementNS('http://www.w3.org/2000/svg'" in chat_js
+    assert "class: 'chat-memory-trigger__icon'" in chat_js
+    assert "triggerLabel.className = 'chat-memory-trigger__label'" in chat_js
+    assert "triggerLabel.textContent = '记忆'" in chat_js
+    assert "trigger.append(createMemoryTriggerIcon(), triggerLabel)" in chat_js
+    assert "trigger.textContent = '记忆'" not in chat_js
     assert "title.textContent = '外部记忆'" not in chat_js
 
     # 工具栏按钮 + Popover 结构
@@ -470,6 +476,8 @@ def test_chat_memory_uses_toolbar_popover_grouped_picker(tmp_path):
     # CSS：trigger + popover + option active 主色
     assert '.chat-memory-bar' in css
     assert '.chat-memory-trigger' in css
+    assert '.chat-memory-trigger__icon' in css
+    assert '.chat-memory-trigger__label' in css
     assert '.chat-memory-popover' in css
     assert '.chat-memory-popover__group' in css
     assert '.chat-memory-popover__group-title' in css
