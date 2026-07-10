@@ -115,6 +115,17 @@
 - feishu_tenant_key
 - feishu_allowed_open_ids
 - feishu_allowed_chat_ids
+- context_compression_enabled (bool, 默认 True)
+- context_length (int, 默认 32000, ge=1024)
+- context_compression_threshold (float, 默认 0.50, gt=0, le=1)
+- context_compression_target_ratio (float, 默认 0.20, gt=0, le=1)
+- context_compression_protect_first_n (int, 默认 3, ge=0)
+- context_compression_protect_last_n (int, 默认 20, ge=0)
+- context_compression_cooldown_seconds (int, 默认 300, ge=0)
+
+跨字段校验：`context_compression_target_ratio` 必须 < `context_compression_threshold`，由 `Settings._validate_context_compression_ratios` model_validator(mode="after") 强制，违反抛 ValueError。
+
+上下文压缩 summary 持久化边界（增量压缩 + 摘要持久化）：`messages` 表新增 `is_summary INTEGER NOT NULL DEFAULT 0` 列（迁移函数 `_migrate_add_is_summary_column` 幂等）；`summaries` 表 schema 不变。`ContextCompressor.compress` 返回 `ContextCompressionResult`，`result.messages` 含恰好 1 条 `role="user"` + `content` 以 `CONTEXT_SUMMARY_PREFIX`（`"[CONTEXT SUMMARY]: "`，定义在 `app/domain/context.py`）开头的摘要消息。`compress_context` 节点在 `result.compressed=True` 时按 a-f 顺序：识别摘要消息 -> 构造 `ConversationMessage(is_summary=True)` -> 调 `replace_summary_message`（单连接事务 DELETE 旧 is_summary=1 + INSERT 新）-> 调 `save_summary(source_message_id=新摘要消息 id)` -> 更新 state。双写失败降级：`replace_summary_message` 失败时 state 不变；`save_summary` 失败时 messages 表已更新，summaries 表滞后一轮（Dashboard 降级），不回滚。
 
 Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPOSE_PROJECT_NAME`。
 
@@ -124,7 +135,7 @@ SQLite store 位于 `app/infrastructure/memory/sqlite_store.py`，初始化以�
 
 ```sql
 sessions(id, title, created_at, updated_at, source, external_memory_enabled_json, acp_metadata_json)
-messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name)
+messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary)
 tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at)
 task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
@@ -159,6 +170,7 @@ CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active
 
 ```sql
 idx_messages_session_created_at ON messages(session_id, created_at)
+idx_messages_summary_session ON messages(session_id) WHERE is_summary = 1
 idx_tool_calls_session_created_at ON tool_calls(session_id, created_at)
 idx_skills_enabled ON skills(enabled)
 idx_plugins_enabled ON plugins(enabled)

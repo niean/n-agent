@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、CliChatAdapter、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、CliChatAdapter、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语，ContextEngine/ContextCompressor/ContextCompressionResult/compress_context/三段式压缩/增量压缩/CONTEXT_SUMMARY_PREFIX/is_summary 双标记/Cooldown 等上下文短期记忆压缩相关术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -32,6 +32,15 @@
 - ActiveProviderHolder：Application 层适配器，实现 LLMProvider 协议；通过工厂回调懒加载底层 Provider 实例并以 asyncio.Lock 保护 swap，使下游服务无感知地热切换 active provider。
 - search_knowledge：N-Agent 暴露给 LLM 的 safe tool，用于按需调用 N-KB 通用知识检索。
 - Summarizer：领域端口，定义上下文摘要生成能力，当前可用启发式摘要，后续可替换为模型驱动压缩。
+- ContextEngine：Domain 端口（`app/domain/context.py`），定义上下文短期记忆压缩能力；协议方法 `should_compress(messages, *, prompt_tokens, force)` 判定是否需压缩，`compress(messages, *, current_tokens, force, existing_summary)` 返回 `ContextCompressionResult`。由 Infrastructure 的 `ContextCompressor` 实现。
+- ContextCompressor：Infrastructure 实现类（`app/infrastructure/context/context_compressor.py`），实现 `ContextEngine`；提供 token 估算、cooldown 防抖、三段式压缩（head `protect_first_n` 保护 + 中段 LLM 摘要 + tail `protect_last_n` + token 预算分配）、增量压缩（`_find_latest_context_summary` 定位上次摘要切点，middle 只取新增消息）、工具组完整性对齐、sanitize 剥离未配对 tool 消息、LLM 摘要失败回退到 `fallback_summarizer`。
+- CONTEXT_SUMMARY_PREFIX：Domain 常量（`app/domain/context.py`），值为 `"[CONTEXT SUMMARY]: "`；运行时识别摘要消息的 content 前缀，ContextCompressor 用它在 messages 中定位上次摘要切点，compress_context 用它识别 result.messages 中的摘要消息。
+- ContextCompressionResult：frozen dataclass（`app/domain/context.py`），字段包括 messages（压缩后的消息列表）、summary（生成的摘要文本）、compressed（是否实际压缩）、skipped_reason（跳过原因，如 cooldown/threshold/empty/summary_in_tail）、original_tokens、compressed_tokens。
+- compress_context：LangGraph 节点（`app/application/agent_graph.py`），位于 `load_context` 与 `call_llm` 之间；调用 `ContextEngine.should_compress` 判定，超阈值时调 `compress` 执行增量三段式压缩，按 a-f 顺序持久化（识别摘要消息 -> 构造 ConversationMessage(is_summary=True) -> replace_summary_message -> save_summary -> 更新 state）；仅在真正压缩时调 `external_memory_manager.pre_compress_all` 提取 rescued_context，rescued_context 拼入 state.summary 但不进入摘要消息 content。
+- Three-segment compression（三段式压缩）：ContextCompressor 的压缩策略；head 段保留前 `protect_first_n` 条消息（含 system prompt + 早期关键上下文），中段送入 LLM 生成结构化摘要，tail 段保留最后 `protect_last_n` 条消息并按 token 预算分配；工具组完整性对齐避免截断 assistant tool_calls 与对应 tool 消息，sanitize 剥离未配对的 tool_calls/tool 消息。
+- Incremental compression（增量压缩）：ContextCompressor 对齐 HermesAgent 的压缩方法；`_find_latest_context_summary` 从后往前扫描 messages 定位最后一个 content 以 `CONTEXT_SUMMARY_PREFIX` 开头的 user 消息，middle 只取该摘要之后的新增消息，`_generate_summary` 分首次路径（空 existing_summary + FIRST 模板）和迭代路径（previous_summary=body + ITERATIVE 模板）两条 prompt 路径。
+- is_summary（双标记摘要持久化）：`ConversationMessage.is_summary`（Domain 为 bool）和 `messages.is_summary`（SQLite 为 INTEGER）字段；compress_context 通过 `replace_summary_message` 在单连接事务内 DELETE 旧 is_summary=1 消息 + INSERT 新摘要消息，保证同一 session 最多 1 条 is_summary=1 消息；`_message_to_provider` 不传递 is_summary 到 provider 格式，Dashboard API 和 chat.js 用 is_summary 做特殊渲染。
+- Cooldown（压缩冷却）：ContextCompressor 内存中的 monotonic 时间戳（`_last_compressed_at`），防止在 `cooldown_seconds` 窗口内重复压缩同一会话上下文造成抖动；`should_compress` 检测 cooldown 未到期时返回 False（force=True 可绕过）。
 - Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。
 - ToolDefinition：工具定义值对象，描述工具名称、说明、输入 schema、风险等级、权限、超时和启用状态，不包含具体 handler。
 - ToolDefinition.managed：布尔字段，标记需要服务端 ChatCompletionService 显式授权才能执行的工具；当前 `manage_schedule` 是唯一 managed 工具，必须 `risk_level=CONFIRM` 且来源为 AGENT。

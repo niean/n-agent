@@ -39,6 +39,7 @@ class ConversationMessage:
     tool_call_id: str | None = None
     name: str | None = None
     created_at: datetime = field(default_factory=utc_now)
+    is_summary: bool = False
 
 
 @dataclass(frozen=True)

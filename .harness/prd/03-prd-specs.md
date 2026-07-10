@@ -316,15 +316,27 @@
         - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
     - 对话：Chat框，记忆popover按钮 图标改为`大脑`形状
     - 左导：记忆，一级菜单图标、改为和Chat记忆popover按钮一致的`大脑`形状，大小控制遵循左导菜单规范
+
+[20260709]
+- HE
+    - HE：修改Third Review，总结时要给出具体的修改数量，现状是笼统的20+
+    - 文档：短期记忆上下文，压缩原理
+- FR
     - 记忆：上下文实现短期记忆压缩，从而节省Token消耗
         - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
+        - 迭代：改造N-Agent上下文压缩，对齐HermesAgent增量压缩方法；N-Agent中，摘要信息也可以持久化，只要做好标签/逻辑隔离。增量压缩：本次摘要 = llm_summary(上次摘要 + 新增消息)
+    - 记忆：上下文实现短期记忆压缩，验收、优化
+        - 对话：支持通过 ①slash命令 ②对话时的要求，这两种方式触发消息压缩
+        - 会话：持久化messages表保留所有摘要记录，上下文只使用最新的摘要，Dashboard Chat渲染所有历史摘要、方便用户观测压缩行为
+        - 对话：Dashboard Chat，摘要渲染改用`工具调用调试信息`的样式，默认折叠可展开、黄底色等，标题`对话摘要`
+
+[20260711]
 
 
 ---
 
 [待办]
 - HE
-    - 文档：短期记忆上下文，压缩原理
 - NFR
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏

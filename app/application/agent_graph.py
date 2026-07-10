@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from inspect import isawaitable
@@ -16,6 +17,7 @@ from app.application.external_memory_manager import ExternalMemoryManager
 from app.application.prompt_builder import build_system_prompt
 from app.application.tool_service import ToolService
 from app.domain.agent import AgentState, RunStatus
+from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextEngine
 from app.domain.memory import MemoryStore, Summarizer
 from app.domain.provider import LLMEventType, LLMProvider, LLMResult
 from app.domain.session import ConversationMessage, Summary, TaskState, ToolCall
@@ -31,6 +33,9 @@ from app.utils.content_utils import extract_text, has_image_part, prepend_text_p
 from app.utils.memory_scrubber import scrub_memory_context
 
 
+logger = logging.getLogger(__name__)
+
+
 class AgentGraphRunner:
     def __init__(
         self,
@@ -41,6 +46,7 @@ class AgentGraphRunner:
         iteration_limit: int = 10,
         external_memory_manager: ExternalMemoryManager | None = None,
         vision_capability: Optional[Callable[[], bool]] = None,
+        context_engine: ContextEngine | None = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -49,6 +55,7 @@ class AgentGraphRunner:
         self.iteration_limit = iteration_limit
         self.external_memory_manager = external_memory_manager
         self.vision_capability = vision_capability
+        self.context_engine = context_engine
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -79,12 +86,14 @@ class AgentGraphRunner:
     def _build_graph(self):
         graph = StateGraph(AgentState)
         graph.add_node("load_context", self.load_context)
+        graph.add_node("compress_context", self.compress_context)
         graph.add_node("call_llm", self.call_llm)
         graph.add_node("execute_tools", self.execute_tools)
         graph.add_node("update_memory", self.update_memory)
         graph.add_node("finalize", self.finalize)
         graph.set_entry_point("load_context")
-        graph.add_edge("load_context", "call_llm")
+        graph.add_edge("load_context", "compress_context")
+        graph.add_edge("compress_context", "call_llm")
         graph.add_conditional_edges(
             "call_llm",
             self._after_llm,
@@ -103,6 +112,28 @@ class AgentGraphRunner:
         state.run_options = dict(options or {})
         result = await self.graph.ainvoke(state, {"configurable": {"model": model, "options": state.run_options}})
         return AgentState(**result) if isinstance(result, dict) else result
+
+    async def compress_session(self, session_id: str) -> dict[str, Any]:
+        """Force compress a session's context without LLM call.
+
+ Used by slash command `/compress` and conversational trigger. Loads existing
+ messages, forces compression via run_options, persists summary, returns status.
+ Does NOT call LLM, does NOT save user message, does NOT run the full graph.
+ """
+        if self.context_engine is None:
+            return {"compressed": False, "reason": "context_engine_unavailable"}
+        state = AgentState(session_id=session_id, input_messages=[])
+        state.run_options = {"force_compress": True}
+        state = await self.load_context(state)
+        state.run_options = {"force_compress": True}
+        before_count = len(state.working_messages)
+        before_summary = state.summary
+        state = await self.compress_context(state)
+        after_count = len(state.working_messages)
+        after_summary = state.summary
+        if after_count < before_count or after_summary != before_summary:
+            return {"compressed": True, "reason": None}
+        return {"compressed": False, "reason": "no_change"}
 
     def _split_content_for_streaming(self, content: str) -> list[str]:
         """Split content into small chunks for streaming.
@@ -177,13 +208,104 @@ class AgentGraphRunner:
         messages = await self.memory_store.list_messages(state.session_id)
         summary = await self.memory_store.get_summary(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
+        context_messages = _filter_to_latest_summary(messages)
         state.working_messages = [
             {"role": "system", "content": build_system_prompt(self.external_memory_manager, enabled_override)},
-            *[_message_to_provider(message) for message in messages],
+            *[_message_to_provider(message) for message in context_messages],
             *state.input_messages,
         ]
         state.summary = summary.summary if summary else ""
         state.run_status = RunStatus.RUNNING
+        return state
+
+    async def compress_context(self, state: AgentState) -> AgentState:
+        if self.is_cancelled(state.session_id):
+            raise asyncio.CancelledError()
+        if self.context_engine is None:
+            return state
+        # Separate leading system messages from non-system messages
+        leading_system = []
+        idx = 0
+        while idx < len(state.working_messages) and state.working_messages[idx].get("role") == "system":
+            leading_system.append(state.working_messages[idx])
+            idx += 1
+        non_system = state.working_messages[idx:]
+        force = bool(state.run_options.get("force_compress", False))
+        if not self.context_engine.should_compress(non_system, force=force):
+            return state
+        # External memory pre_compress_all (only when actually compressing)
+        rescued_context = ""
+        if self.external_memory_manager:
+            enabled_override = state.run_options.get("external_memory_enabled")
+            rescued_context = self.external_memory_manager.pre_compress_all(
+                non_system,
+                session_id=state.session_id,
+                enabled_override=enabled_override,
+            )
+        result = await self.context_engine.compress(
+            non_system, existing_summary=state.summary, force=force,
+        )
+        if not result.compressed:
+            return state
+
+        # b. 先从 result.messages 里识别摘要消息（恰好 1 条），再更新 state
+        # spec Error Handling #7 要求 summary count != 1 时保持 state.summary 不变
+        summary_dicts = [
+            m for m in result.messages
+            if m.get("role") == "user"
+            and isinstance(m.get("content"), str)
+            and m["content"].startswith(CONTEXT_SUMMARY_PREFIX)
+        ]
+        if len(summary_dicts) != 1:
+            logger.error(
+                "compress_context: expected exactly 1 summary message in result.messages, got %d",
+                len(summary_dicts),
+            )
+            return state
+
+        # a. 计算 next_summary（不立即写入 state；replace 失败时保持 state 不变）
+        if rescued_context:
+            next_summary = f"{rescued_context}\n\n{result.summary}".strip()
+        else:
+            next_summary = result.summary
+
+        # c. 构造 ConversationMessage(is_summary=True)
+        summary_dict = summary_dicts[0]
+        summary_message = ConversationMessage(
+            role="user",
+            content=summary_dict["content"],
+            is_summary=True,
+        )
+
+        # d. append_summary_message（仅 INSERT，保留所有摘要记录供 Dashboard 渲染）
+        try:
+            returned_message = await self.memory_store.append_summary_message(
+                state.session_id, summary_message,
+            )
+        except Exception as exc:
+            logger.error("compress_context: append_summary_message failed: %s", exc)
+            return state
+
+        # e. save_summary（source_message_id 关联新摘要消息 id；单行表，仅存最新摘要）
+        if next_summary:
+            try:
+                await self.memory_store.save_summary(
+                    Summary(
+                        session_id=state.session_id,
+                        summary=next_summary,
+                        source_message_id=returned_message.id,
+                    )
+                )
+            except Exception as exc:
+                # 降级：messages 表已更新，summaries 表滞后一轮，不回滚
+                logger.warning(
+                    "compress_context: save_summary failed, dashboard may lag one round: %s",
+                    exc,
+                )
+
+        # f. 更新 state（replace 成功后才写入）
+        state.summary = next_summary
+        state.working_messages = leading_system + result.messages
         return state
 
     async def call_llm(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
@@ -466,20 +588,6 @@ class AgentGraphRunner:
                 last_error=state.error,
             )
         )
-        summary_messages = [message for message in state.working_messages if message.get("role") != "system"]
-        rescued_context = ""
-        if self.external_memory_manager:
-            enabled_override = state.run_options.get("external_memory_enabled")
-            rescued_context = self.external_memory_manager.pre_compress_all(
-                summary_messages,
-                session_id=state.session_id,
-                enabled_override=enabled_override,
-            )
-        summary = await self.summarizer.summarize(summary_messages, state.summary)
-        if rescued_context:
-            summary = f"{rescued_context}\n\n{summary}".strip() if summary else rescued_context
-        if summary:
-            await self.memory_store.save_summary(Summary(session_id=state.session_id, summary=summary))
         return state
 
     def _extract_user_content(self, input_messages: list[dict[str, Any]]) -> str:
@@ -588,6 +696,22 @@ def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
     if message.name:
         data["name"] = message.name
     return data
+
+
+def _filter_to_latest_summary(messages: list[ConversationMessage]) -> list[ConversationMessage]:
+    """保留最新一条摘要 + 其后的所有消息；更早的消息（含旧摘要）由摘要代表，不进入上下文。
+
+    messages 表持久化所有摘要记录供 Dashboard 渲染；上下文只使用最新摘要。
+    无摘要时返回全部消息。
+    """
+    latest_summary_idx = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        if messages[idx].is_summary:
+            latest_summary_idx = idx
+            break
+    if latest_summary_idx == -1:
+        return list(messages)
+    return list(messages[latest_summary_idx:])
 
 
 def _error_message_for_user(state: AgentState) -> str:

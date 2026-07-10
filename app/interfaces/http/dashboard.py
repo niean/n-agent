@@ -1167,6 +1167,7 @@ def _message_to_dict(message: ConversationMessage) -> dict:
         "content": content,
         "tool_call_id": message.tool_call_id,
         "name": message.name,
+        "is_summary": message.is_summary,
     }
     if tool_calls:
         data["tool_calls"] = tool_calls

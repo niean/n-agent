@@ -131,7 +131,7 @@ trap cleanup EXIT
   cat <<'PROMPT'
 
 请先读取目标文件；plan 审阅还必须读取关联 spec。完成审阅后，直接修改 TARGET_FILE。
-最终回复只给出状态、修改摘要、剩余风险。
+最终回复只给出状态、修改数量、修改摘要、剩余风险；修改数量必须是具体数字，禁止编造问题、禁止写成 20+。
 PROMPT
 } > "$tmp_prompt"
 

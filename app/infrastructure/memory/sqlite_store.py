@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.domain.context import CONTEXT_SUMMARY_PREFIX
 from app.domain.session import ConversationMessage, ConversationSession, SessionSource, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
 from app.infrastructure.registry.sqlite_mcp_registry import _initialize_mcp_schema
@@ -42,6 +43,7 @@ class SQLiteMemoryStore:
                     provider_message_id TEXT,
                     tool_call_id TEXT,
                     name TEXT,
+                    is_summary INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
                 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -89,6 +91,7 @@ class SQLiteMemoryStore:
             )
             self._ensure_sessions_external_memory_column(conn)
             self._ensure_sessions_acp_metadata_column(conn)
+            self._migrate_add_is_summary_column(conn)
             _initialize_gateway_schema(conn)
             _initialize_mcp_schema(conn)
 
@@ -157,8 +160,8 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -169,6 +172,7 @@ class SQLiteMemoryStore:
                     None,
                     message.tool_call_id,
                     message.name,
+                    1 if message.is_summary else 0,
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (message.created_at.isoformat(), session_id))
@@ -187,6 +191,8 @@ class SQLiteMemoryStore:
                 content=json.loads(row["content_json"]),
                 tool_call_id=row["tool_call_id"],
                 name=row["name"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                is_summary=bool(row["is_summary"]),
             )
             for row in rows
         ]
@@ -305,6 +311,51 @@ class SQLiteMemoryStore:
         if row is None:
             return None
         return Summary(session_id=row["session_id"], summary=row["summary"], source_message_id=row["source_message_id"])
+
+    async def delete_summary_messages(self, session_id: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND is_summary = 1",
+                (session_id,),
+            )
+            return cur.rowcount
+
+    async def append_summary_message(
+        self, session_id: str, message: ConversationMessage,
+    ) -> ConversationMessage:
+        if not message.is_summary:
+            raise ValueError("append_summary_message requires is_summary=True")
+        if message.role != "user":
+            raise ValueError("summary message role must be 'user'")
+        if not isinstance(message.content, str):
+            raise ValueError("summary message content must be str")
+        if not message.content.startswith(CONTEXT_SUMMARY_PREFIX):
+            raise ValueError(f"summary message content must start with {CONTEXT_SUMMARY_PREFIX!r}")
+        await self.create_session(ConversationSession(id=session_id))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO messages(id, session_id, role, content_json, created_at,
+                    provider_message_id, tool_call_id, name, is_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message.id,
+                    session_id,
+                    message.role,
+                    json.dumps(message.content),
+                    message.created_at.isoformat(),
+                    None,
+                    message.tool_call_id,
+                    message.name,
+                    1,
+                ),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (message.created_at.isoformat(), session_id),
+            )
+        return message
 
     async def delete_session(self, session_id: str) -> bool:
         with self._connect() as conn:
@@ -507,6 +558,16 @@ class SQLiteMemoryStore:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
         if "acp_metadata_json" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN acp_metadata_json TEXT")
+
+    @staticmethod
+    def _migrate_add_is_summary_column(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "is_summary" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN is_summary INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_summary_session "
+            "ON messages(session_id) WHERE is_summary = 1"
+        )
 
     def migrate_session_id_prefixes(self) -> None:
         """Migrate historical session_id prefixes and source values to new format.

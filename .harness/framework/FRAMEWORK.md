@@ -123,6 +123,7 @@ Third Review 输出规则：
 - Third Review 可直接修改目标 spec/plan 文件，禁止修改无关文件
 - 默认 Third Review 命令通过 `codex exec --cd <repo_root>` 启动，不使用 `--ephemeral`，审阅对话记录由 Codex 自身保存为当前项目的非交互会话；禁止为审阅记录在 `.harness` 下新建文件或目录
 - Third Review 以发现并修复 20+ 个问题为目标；若实际问题不足 20 个，禁止编造问题，但必须说明已覆盖的审阅维度
+- Third Review 完成摘要必须给出实际修改数量，格式为 `修改数量: N 项`；禁止编造问题数量，也禁止用 `20+` 代替真实数量
 - Third Review 前，必须先完成对应 Skill 自带 Review Loop 并修正目标文件
 - Third Review 完成后，主流程模型必须重新读取目标文件，审阅 Third 是否破坏用户原始需求、Harness 模板、Phase/GATE 边界、spec/plan 一致性和可验证性
 - Third Review 命令不可用、执行失败或指定模型不可用时，跳过 Third Review 和后续 Third 修改复审；因为目标文件未被 Third 修改，不再执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`

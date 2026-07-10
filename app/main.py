@@ -40,6 +40,7 @@ from app.infrastructure.knowledge.http_adapters import HttpKnowledgeRetrieverCon
 from app.infrastructure.llm.anthropic_provider import AnthropicProvider
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
+from app.infrastructure.context.context_compressor import ContextCompressor
 from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.registry.in_memory_platform_registry import InMemoryPlatformRegistry
@@ -463,6 +464,19 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     except Exception as exc:
         mcp_status = "error"
         mcp_error = str(exc)
+    context_engine = None
+    if settings.context_compression_enabled:
+        context_engine = ContextCompressor(
+            llm_provider=holder,
+            model=lambda: holder.current_model,
+            context_length=settings.context_length,
+            threshold_percent=settings.context_compression_threshold,
+            protect_first_n=settings.context_compression_protect_first_n,
+            protect_last_n=settings.context_compression_protect_last_n,
+            summary_target_ratio=settings.context_compression_target_ratio,
+            cooldown_seconds=settings.context_compression_cooldown_seconds,
+            fallback_summarizer=summarizer,
+        )
     graph_runner = AgentGraphRunner(
         holder,
         tool_service,
@@ -471,6 +485,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         settings.agent_iteration_limit,
         external_memory_manager=external_memory_manager,
         vision_capability=lambda: bool(holder.current_config and holder.current_config.supports_vision),
+        context_engine=context_engine,
     )
     session_service = SessionService(
         memory_store,

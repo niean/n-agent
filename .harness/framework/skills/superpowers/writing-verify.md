@@ -31,6 +31,8 @@ Save verify files to: `.harness/specs/verify/verify-{YYMMDD}-{desc}.md`
 - Do not include implementation-internal checks unless the only reliable verification is semi-manual inspection of logs, database records, or external service state.
 - Each item must be executable by a human without reading source code.
 - Each item must have clear setup, action, and expected result.
+- The total number of checkbox acceptance items must be 10 or fewer.
+- If more than 10 manual workflows appear necessary, keep the highest-risk and highest-value end-to-end workflows, and merge closely related checks without making them vague.
 - Do not invent capabilities that are not present in the spec or plan.
 - If a required manual verification is blocked by missing environment, credentials, external account, hardware, or human action, keep the item and mark the setup as required; do not silently omit it.
 
@@ -60,6 +62,7 @@ Every verify file must use this exact section order:
 ## Stable Output Rules
 
 - Use numbered group headings and checkbox items. Each checkbox is one acceptance item.
+- Keep the whole checklist to at most 10 checkbox items.
 - Group by user entrypoint or workflow, not by code module.
 - Keep each acceptance item independent. A failed item should identify one workflow gap.
 - Use plain text only. Do not use emoji, bold, italic, decorative icons, or visual emphasis.
@@ -79,10 +82,12 @@ Every verify file must use this exact section order:
 3. Extract all implementation tasks, automatic tests, commands, and verification steps from the plan.
 4. Remove items covered by automatic verification unless a human-visible end-to-end workflow still needs manual confirmation.
 5. Group remaining manual or semi-manual workflows by entrypoint.
-6. Write the verify file using the template.
-7. Validate the result:
+6. If the grouped checklist exceeds 10 checkbox items, reduce it to 10 or fewer by prioritizing Blocking-level user-visible workflows, externally observable persistence/side effects, and cross-entrypoint integration paths.
+7. Write the verify file using the template.
+8. Validate the result:
    - verify file exists at the expected path.
    - verify file contains only manual or semi-manual items.
+   - verify file contains 10 or fewer checkbox acceptance items.
    - each acceptance item is a checkbox line.
    - each checkbox line contains both human action and observable expected result.
    - verify file uses spec/plan filenames only, without `active/` or `completed/` directory paths.
@@ -94,5 +99,6 @@ After writing the verify file:
 
 1. Re-read the spec, plan, and verify file.
 2. Check for missing manual workflows, automatic-only items, vague expected results, and stale paths.
-3. Fix all issues before continuing to implementation.
-4. If uncertainty remains about whether an item is manual or automatic, keep it only when a human-visible end-to-end result must still be confirmed.
+3. Count checkbox acceptance items and reduce to 10 or fewer if needed.
+4. Fix all issues before continuing to implementation.
+5. If uncertainty remains about whether an item is manual or automatic, keep it only when a human-visible end-to-end result must still be confirmed.

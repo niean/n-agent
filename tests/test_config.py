@@ -261,3 +261,55 @@ def test_acp_workspace_settings(tmp_path: Path):
 
     assert settings.acp_host_workspace_root == tmp_path / "host"
     assert settings.acp_container_workspace_root == Path("/workspace")
+
+
+def test_context_compression_defaults():
+    settings = Settings(_env_file=None)
+    assert settings.context_compression_enabled is True
+    assert settings.context_length == 32000
+    assert settings.context_compression_threshold == 0.50
+    assert settings.context_compression_target_ratio == 0.20
+    assert settings.context_compression_protect_first_n == 3
+    assert settings.context_compression_protect_last_n == 20
+    assert settings.context_compression_cooldown_seconds == 300
+
+
+def test_context_compression_env_mapping(monkeypatch):
+    monkeypatch.setenv("N_AGENT_CONTEXT_LENGTH", "64000")
+    monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_THRESHOLD", "0.6")
+    monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_TARGET_RATIO", "0.15")
+    monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_PROTECT_FIRST_N", "5")
+    monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_PROTECT_LAST_N", "30")
+    monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_COOLDOWN_SECONDS", "600")
+    monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_ENABLED", "false")
+    settings = Settings(_env_file=None)
+    assert settings.context_length == 64000
+    assert settings.context_compression_threshold == 0.6
+    assert settings.context_compression_target_ratio == 0.15
+    assert settings.context_compression_protect_first_n == 5
+    assert settings.context_compression_protect_last_n == 30
+    assert settings.context_compression_cooldown_seconds == 600
+    assert settings.context_compression_enabled is False
+
+
+def test_context_compression_target_ratio_must_be_less_than_threshold():
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            context_compression_threshold=0.3,
+            context_compression_target_ratio=0.3,
+        )
+
+
+def test_context_compression_target_ratio_equal_threshold_rejected():
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            context_compression_threshold=0.5,
+            context_compression_target_ratio=0.5,
+        )
+
+
+def test_context_length_min_value():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, context_length=100)  # < 1024

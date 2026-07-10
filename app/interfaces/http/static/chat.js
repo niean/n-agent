@@ -130,6 +130,20 @@
   }
 
   function createMessageElement(message) {
+    if (message.is_summary) {
+      const el = document.createElement('div');
+      el.className = 'msg msg--summary';
+      const details = document.createElement('details');
+      const summary = document.createElement('summary');
+      const content = document.createElement('pre');
+      summary.textContent = '对话摘要调试信息';
+      const prefix = '[CONTEXT SUMMARY]: ';
+      const raw = typeof message.content === 'string' ? message.content : String(message.content || '');
+      content.textContent = raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+      details.append(summary, content);
+      el.appendChild(details);
+      return el;
+    }
     const el = document.createElement('div');
     el.className = `msg ${message.role || 'assistant'}`;
     if (message.role === 'tool') {
@@ -167,6 +181,7 @@
   }
 
   function shouldRenderMessage(message) {
+    if (message.is_summary) return true;
     if (message.role === 'tool') return true;
     return hasVisibleContent(message.content);
   }

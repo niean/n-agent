@@ -7,7 +7,7 @@ from typing import Any, Callable, Protocol
 from uuid import uuid4
 
 from app.application.agent_graph import AgentGraphRunner
-from app.application.events import ChatEvent
+from app.application.events import ChatEvent, ChatEventType
 from app.application.session_service import SessionService
 from app.domain.agent import AgentState
 from app.domain.memory import MemoryStore
@@ -57,6 +57,14 @@ class ChatCompletionService:
         self._external_memory_reader = external_memory_reader
         self._slot_resolver = slot_resolver
 
+    async def compress_session(self, session_id: str) -> dict[str, Any]:
+        """Force compress a session's context without LLM call.
+
+ Delegates to AgentGraphRunner.compress_session. Used by slash command
+ `/compress` (Gateway + Dashboard paths) and conversational trigger.
+ """
+        return await self.graph_runner.compress_session(session_id)
+
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
         session_id = request.session_id or request.metadata.get("session_id") or f"api-{uuid4()}"
         await self.session_service.create_session(session_id, source=SessionSource.API.value)
@@ -87,6 +95,18 @@ class ChatCompletionService:
              for message in normalized_messages if message.get("role") == "user"),
             "",
         )
+        # Detect /compress slash command: compress directly without saving user message or calling LLM
+        if _is_compress_slash(first_user_message):
+            status = await self.compress_session(session_id)
+            content = _format_compress_status(status)
+            if request.stream:
+                return _compress_status_stream(content)
+            return ChatCompletionResult(
+                session_id=session_id,
+                model=request.model,
+                message={"role": "assistant", "content": content},
+                finish_reason="stop",
+            )
         for message in normalized_messages:
             if message.get("role") == "user":
                 await self.memory_store.append_message(
@@ -96,6 +116,8 @@ class ChatCompletionService:
         await self.session_service.ensure_title(session_id, str(first_user_message))
         state = AgentState(session_id=session_id, input_messages=normalized_messages)
         options = dict(request.options)
+        if _detect_conversational_compress(first_user_message):
+            options["force_compress"] = True
         options["external_memory_enabled"] = locked_external_memory
         mode = options.get("execution_context_mode") or "realtime"
         if mode == "unattended":
@@ -246,3 +268,35 @@ def _extract_transport_type(text: str) -> str | None:
     if "sse" in text:
         return "sse"
     return None
+
+
+def _is_compress_slash(text: str) -> bool:
+    stripped = text.strip()
+    return stripped == "/compress" or stripped.startswith("/compress ")
+
+
+def _detect_conversational_compress(text: str) -> bool:
+    lowered = text.lower()
+    has_cn = "压缩" in text and "上下文" in text
+    has_en = "compress" in lowered and "context" in lowered
+    return has_cn or has_en
+
+
+def _format_compress_status(status: dict[str, Any]) -> str:
+    if status.get("compressed"):
+        return "已压缩上下文"
+    reason = str(status.get("reason") or "")
+    if reason == "context_engine_unavailable":
+        return "上下文压缩未启用"
+    if reason == "no_change":
+        return "上下文无需压缩（消息过少或已在保护范围内）"
+    if reason:
+        return f"压缩未执行: {reason}"
+    return "压缩未执行"
+
+
+async def _compress_status_stream(content: str) -> AsyncIterator[ChatEvent]:
+    yield ChatEvent(ChatEventType.MESSAGE_START)
+    yield ChatEvent(ChatEventType.CONTENT_DELTA, content=content)
+    yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop")
+    yield ChatEvent(ChatEventType.DONE)

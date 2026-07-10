@@ -1,7 +1,7 @@
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -93,6 +93,15 @@ class Settings(BaseSettings):
     acp_host_workspace_root: Path | None = Field(default=None)
     acp_container_workspace_root: Path | None = Field(default=None)
 
+    # 上下文压缩配置
+    context_compression_enabled: bool = True
+    context_length: int = Field(default=32000, ge=1024)
+    context_compression_threshold: float = Field(default=0.50, gt=0, le=1)
+    context_compression_target_ratio: float = Field(default=0.20, gt=0, le=1)
+    context_compression_protect_first_n: int = Field(default=3, ge=0)
+    context_compression_protect_last_n: int = Field(default=20, ge=0)
+    context_compression_cooldown_seconds: int = Field(default=300, ge=0)
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @field_validator("sandbox_type")
@@ -103,6 +112,15 @@ class Settings(BaseSettings):
                 f"invalid sandbox_type: {value!r} (must be 'local' or 'docker')"
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_context_compression_ratios(self) -> "Settings":
+        if self.context_compression_target_ratio >= self.context_compression_threshold:
+            raise ValueError(
+                "context_compression_target_ratio must be less than "
+                "context_compression_threshold"
+            )
+        return self
 
     @field_validator(
         "sqlite_path", "workspace_root", "skills_root", "plugins_root",

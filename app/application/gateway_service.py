@@ -38,6 +38,7 @@ class GatewayCommandService:
         model_service: ModelService,
         health_provider: HealthProvider,
         schedule_service: ScheduleService | None = None,
+        chat_service: "ChatCompletionService | None" = None,
     ):
         self.registry = registry
         self.session_service = session_service
@@ -45,6 +46,7 @@ class GatewayCommandService:
         self.model_service = model_service
         self.health_provider = health_provider
         self.schedule_service = schedule_service
+        self.chat_service = chat_service
         self.pending_confirmations: dict[str, GatewayConfirmationRequest] = {}
         self.trusted_actors: set[tuple[str, str, str, str]] = set()
         self.confirmation_ttl = timedelta(minutes=15)
@@ -92,7 +94,7 @@ class GatewayCommandService:
             return None
         command, _, arg = text.partition(" ")
         if command == "/help":
-            return _response(session_id, "可用命令: /help, /new, /rename <title>, /delete, /switch <session_id>, /sessions, /tools, /models, /status, /sethome, /schedule help")
+            return _response(session_id, "可用命令: /help, /new, /rename <title>, /delete, /switch <session_id>, /sessions, /tools, /models, /status, /compress, /sethome, /schedule help")
         if command == "/sethome":
             if event.session_key.platform is None:
                 return _response(session_id, "当前入口不支持 home chat")
@@ -122,6 +124,8 @@ class GatewayCommandService:
             return _response(session_id, content)
         if command == "/status":
             return _response(session_id, json.dumps(self.health_provider(), ensure_ascii=False))
+        if command == "/compress":
+            return await self._handle_compress(session_id)
         if command == "/schedule":
             return await self._handle_schedule(arg, event, session_id)
         return _response(session_id, "未知命令，输入 /help 查看可用命令")
@@ -197,6 +201,21 @@ class GatewayCommandService:
         if action == "remove" and not rest.strip():
             return _response(session_id, "用法: /schedule remove <id>")
         return _response(session_id, "未知 /schedule 命令")
+
+    async def _handle_compress(self, session_id: str) -> InteractionResponse:
+        if self.chat_service is None:
+            return _response(session_id, "上下文压缩未启用")
+        status = await self.chat_service.compress_session(session_id)
+        if status.get("compressed"):
+            return _response(session_id, "已压缩上下文")
+        reason = str(status.get("reason") or "")
+        if reason == "context_engine_unavailable":
+            return _response(session_id, "上下文压缩未启用")
+        if reason == "no_change":
+            return _response(session_id, "上下文无需压缩（消息过少或已在保护范围内）")
+        if reason:
+            return _response(session_id, f"压缩未执行: {reason}")
+        return _response(session_id, "压缩未执行")
 
     async def _schedule_origin(self, event: InteractionMessage) -> dict[str, Any]:
         platform = event.session_key.platform
@@ -328,6 +347,7 @@ class GatewayService:
             model_service,
             health_provider,
             schedule_service,
+            chat_service,
         )
 
     async def handle_message(self, event: InteractionMessage) -> InteractionResponse:

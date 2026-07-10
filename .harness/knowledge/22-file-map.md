@@ -3,8 +3,8 @@
 
 ## 应用入口与配置
 
-- FastAPI 应用入口：`app/main.py`，提供 `create_app`，组装 Infrastructure 具体实现并注册 HTTP/Dashboard 路由
-- 配置模型：`app/config.py`，定义 `Settings`，从 `.env` 和环境变量读取 `N_AGENT_` 配置
+- FastAPI 应用入口：`app/main.py`，提供 `create_app`，组装 Infrastructure 具体实现并注册 HTTP/Dashboard 路由；当 `settings.context_compression_enabled=True` 时构造 `ContextCompressor`（注入 LLMProvider/model callable/context_length/threshold/protect_first_n/protect_last_n/summary_target_ratio/cooldown_seconds）并注入 `AgentGraphRunner.context_engine`
+- 配置模型：`app/config.py`，定义 `Settings`，从 `.env` 和环境变量读取 `N_AGENT_` 配置；含 7 个上下文压缩字段（`context_compression_enabled`/`context_length`/`context_compression_threshold`/`context_compression_target_ratio`/`context_compression_protect_first_n`/`context_compression_protect_last_n`/`context_compression_cooldown_seconds`）及跨字段校验 `target_ratio < threshold`
 - Python 依赖：`pyproject.toml`，定义运行依赖、dev 依赖和 pytest 配置
 - 环境变量模板：`.env.example`，不包含真实密钥；当前仓库可能不存在该文件，不能改写包含本地密钥的 `.env` 作为替代
 
@@ -18,6 +18,7 @@
 - Gateway 领域模型：`app/domain/gateway.py`，定义 `GatewaySessionKey`、`InteractionMessage`、`GatewayOutboundMessage`、`InteractionResponse`、`GatewaySessionLink`、`GatewayConversation`、`GatewayConfirmationChoice`、`GatewayConfirmationAction`、`GatewayConfirmationRequest`、`GatewaySessionRegistry` 端口
 - Provider 领域模型：`app/domain/provider.py`，定义 `ModelInfo`、`LLMEvent`、`LLMResult`、`LLMProvider`、`ProviderConfig`、`ProviderRegistry` 端口及 `ProviderNotFoundError`/`DuplicateProviderError`/`ProviderInUseError`/`ProviderValidationError`
 - Memory 端口：`app/domain/memory.py`，定义 `MemoryStore`、`Summarizer`
+- Context 压缩端口与结果模型：`app/domain/context.py`，定义 `ContextEngine` Protocol（`should_compress`/`compress`）、`ContextCompressionResult` frozen dataclass（messages/summary/compressed/skipped_reason/original_tokens/compressed_tokens）和 `CONTEXT_SUMMARY_PREFIX` 常量（`"[CONTEXT SUMMARY]: "`，运行时识别摘要消息的 content 前缀）
 - Skill 领域模型：`app/domain/skill.py`，定义 `Skill`、`SkillFrontmatter`、`SkillReadiness`、`SkillRegistry` 端口与 `SkillNotFoundError`/`SkillValidationError` 等异常，纯领域不依赖框架/IO
 - Knowledge 领域模型：`app/domain/knowledge.py`，定义 `KnowledgeBaseType`、`KnowledgeProbeStatus`、`KnowledgeBase`、`KnowledgeBaseSecret`、`KnowledgeSearchRequest`、`KnowledgeBackendSearchRequest`、`KnowledgeSnippet`、`KnowledgeSearchResult`、`KnowledgeBaseRegistry`、`KnowledgeRetriever`、`KnowledgeRetrieverFactory` 和 Knowledge 相关异常；Domain 只定义 SPI，不包含 N-KB/Ragflow HTTP 协议细节
 - 外部记忆 Provider 领域模型：`app/domain/external_memory_provider.py`，定义 `ExternalMemoryProviderType`(mem0/holographic/honcho)、`ExternalMemoryProbeStatus`、`ExternalMemoryProviderConfig`(frozen, api_key 脱敏)、`ExternalMemoryProviderSecret`、`ExternalMemoryProviderRegistry` 端口和 `ExternalMemoryProviderNotFoundError`/`DuplicateExternalMemoryProviderError`/`ExternalMemoryProviderInUseError`/`ExternalMemoryProviderValidationError` 异常；与 `external_memory.py` 的全局 enabled config registry 分离，专责检索记忆 provider 的 CRUD/secret/probe 状态
@@ -26,7 +27,7 @@
 ## Application Layer
 
 - 应用运行事件：`app/application/events.py`，定义 `ChatEvent`（含 `metadata: dict[str, Any]` 字段，携带 Gateway confirmation/duplicate 等事件元信息）和 `ChatEventType`
-- Agent Runtime：`app/application/agent_graph.py`，使用 LangGraph 编排 `load_context`、`call_llm`、`execute_tools`、`update_memory`、`finalize`；`execute_tools` 在工具执行前后向 `state.stream_tool_events` 追加 `TOOL_CALL_DELTA`（pending/success/error），`stream_events` 在 run 完成后回放工具事件再输出 content
+- Agent Runtime：`app/application/agent_graph.py`，使用 LangGraph 编排 `load_context`、`compress_context`（上下文短期记忆压缩，位于 load_context 与 call_llm 之间；仅在真正压缩时调 `external_memory_manager.pre_compress_all` 提取 rescued_context）、`call_llm`、`execute_tools`、`update_memory`（不再生成 summary，摘要职责已迁移至 compress_context）、`finalize`；`execute_tools` 在工具执行前后向 `state.stream_tool_events` 追加 `TOOL_CALL_DELTA`（pending/success/error），`stream_events` 在 run 完成后回放工具事件再输出 content
 - 系统提示词构建：`app/application/prompt_builder.py`，定义 N-Agent 默认 identity、ReAct 指引、安全指引和 `build_system_prompt`
 - Chat 用例：`app/application/chat_service.py`，定义 `ChatCompletionInput`、`ChatCompletionResult`、`ChatCompletionService`，处理首条用户消息后调用 `SessionService.ensure_title` 触发标题生成；负责规范化并锁定会话级 `external_memory_enabled`，确保同一 Chat Session 后续轮次使用稳定外部记忆 profile；首轮默认 profile 派生按优先级：session 已锁定 → 沿用 / legacy session → `[]` / 显式 override → 归一化值 / 未传字段 → `[]`（builtin 与检索记忆 provider 的 active 都不自动纳入默认 profile）；`ActiveExternalMemoryReader` 端口保留但不消费于默认派生
 - Gateway 用例：`app/application/gateway_service.py`，定义 `GatewayService` 和 `GatewayCommandService`，将 CLI/飞书/ACP 等入口消息映射到稳定 session 并复用 ChatCompletionService、SessionService、ToolService、ModelService；`GatewayService.handle_message` 为非流式接口，`GatewayService.handle_message_stream` 为流式接口（AsyncIterator[ChatEvent]），两者共享幂等、destructive preflight、session 解析、Slash 分流、默认模型和 trusted metadata 逻辑；流式接口支持 model/options/trusted_metadata/approval override，供 ACP `session/prompt` 保留 cwd、mode、permission bridge 与 session-approved confirm tools 后进入 ChatCompletionService；破坏性 Gateway 命令 /new、/rename、/delete、/schedule remove 通过内存 pending confirmation、actor 绑定、15 分钟 TTL 和本会话信任控制执行
@@ -52,6 +53,8 @@
 - OpenAI-compatible Provider：`app/infrastructure/llm/openai_compatible.py`，实现 Domain `LLMProvider`
 - SQLite MemoryStore：`app/infrastructure/memory/sqlite_store.py`，实现 Domain `MemoryStore`，初始化 schema 和索引；sessions 表保存 `external_memory_enabled_json` 作为 Chat Session 外部记忆 profile 锁定值；`delete_session` 在单次连接内顺序 DELETE messages/tool_calls/task_states/summaries/sessions，返回 sessions 受影响行数 > 0
 - 启发式摘要器：`app/infrastructure/memory/heuristic_summarizer.py`，实现 Domain `Summarizer`
+- Context 压缩子包初始化：`app/infrastructure/context/__init__.py`，空 init 标记 context 压缩子包
+- Context 压缩器：`app/infrastructure/context/context_compressor.py`，实现 `ContextCompressor`（Domain `ContextEngine`）；提供 token 估算（str/list content/image_url 1500 token 估算 + tool_calls/name/tool_call_id 计入）、`should_compress`（cooldown + threshold 判定）、`compress`（增量三段式：head `protect_first_n` 保护 + 中段 LLM 摘要 + tail `protect_last_n` + token 预算分配；`_find_latest_context_summary` 定位上次摘要切点，middle 只取新增消息；`_generate_summary` 分首次/迭代两条 prompt 路径）、工具组完整性对齐（避免截断 assistant tool_calls 与对应 tool 消息）、`sanitize`（剥离未配对 tool_calls/tool 消息）、LLM 摘要失败回退到 `fallback_summarizer`、cooldown 防抖（内存 monotonic 时间戳）
 - Memory 检索器：`app/infrastructure/memory/retriever.py`，提供 `MemoryRetriever` 类，对 Markdown entry 做字级 bigram 分词 + Jaccard 相似度 + 词频加权打分，返回 top-K；`retrieve(query, entries: list[str]) -> list[tuple[str, float]]` 签名；`jaccard(a, b)` 静态方法供 HolographicAdapter `_contradict` 复用；仅服务于系统记忆/文件记忆 等 Markdown 文件 provider 和 holographic 本地 SQLite adapter，不泄漏到 Domain SPI，不约束 mem0/honcho 等 HTTP 检索记忆 provider
 - Memory trust 存储：`app/infrastructure/memory/trust.py`，提供 `MemoryTrustStore`（sidecar `memory.meta.json` 存 entry 级 trust/created_at/last_hit_at）+ `entry_hash`/`_now_iso` 辅助；支持 `score`（relevance×trust×temporal_decay）、`detect_contradiction`（Jaccard 重叠度判定 add/duplicate/contradict）、`boost_on_hit`/`demote`/`prune` 与节流落盘 `maybe_flush`；仅依赖 stdlib + retriever，不跨层
 - 系统记忆（builtin）：`app/infrastructure/memory/builtin_project.py`，实现 `BuiltinProjectMemory`（ExternalMemoryProvider），存储 `{project_root}/locals/external-memory/{memory,user}.md` + sidecar `memory.meta.json`，entry 用 `\n---\n` 分隔；`system_prompt_block` 按 `system_prompt_min_trust` 过滤并按 trust×decay 排序后注入（低 trust/被矛盾降级条目剔除），`prefetch` 用 `MemoryRetriever` 召回后按 trust×decay 重排并 boost 命中条目，`add` 在文件锁内做矛盾检测（duplicate 拒绝/contradict 降级旧条目），`external_memory` 工具支持 add/replace/remove
@@ -206,6 +209,13 @@
 - ACP Domain 模型测试：`tests/domain/test_session_acp_metadata.py` 覆盖 ConversationSession.acp_metadata 字段，`tests/domain/test_tool_approval.py` 覆盖 ApprovalDecider 端口与 ApprovalRequest/Decision 模型，`tests/domain/test_memory_port_acp.py` 覆盖 MemoryStore ACP metadata 读写扩展
 - ACP SQLite schema 测试：`tests/infrastructure/test_sqlite_store_acp_metadata.py`，覆盖 `acp_metadata_json` 列迁移与读写
 - AgentGraph approval/interrupt 测试：`tests/application/test_agent_graph_approval.py` 覆盖 approval_decider 注入与 confirm 工具授权路径，`tests/application/test_agent_graph_interrupt.py` 覆盖 task state interrupt 注册与查询
+- Context 压缩 Domain 端口测试：`tests/domain/test_context.py`，覆盖 `ContextCompressionResult` frozen dataclass 与 `ContextEngine` Protocol 形态
+- ContextCompressor 单元测试：`tests/infrastructure/test_context_compressor.py`，覆盖 token 估算、should_compress 阈值与 cooldown、增量三段式压缩（head/tail 保护 + 中段摘要 + `_find_latest_context_summary` 定位 + middle 4 种分支）、工具组完整性对齐、sanitize 剥离未配对 tool 消息、LLM 摘要首次/迭代两条路径与 fallback 回退、insert_summary 注入（`[CONTEXT SUMMARY]: ` 前缀）、skipped_reason 标记
+- compress_context 节点测试：`tests/application/test_agent_graph_compress_context.py`，覆盖 LangGraph 节点顺序（load_context -> compress_context -> call_llm）、a-f 顺序持久化（识别摘要消息 -> replace_summary_message -> save_summary -> 更新 state）、replace 失败 state 不变、save_summary 失败不回滚、result.messages 摘要消息数量校验、实际压缩时触发 `pre_compress_all` 提取 rescued_context、跳过压缩时不触发 pre_compress_all、update_memory 不再生成 summary
+- SQLite is_summary 测试：`tests/infrastructure/test_sqlite_store_is_summary.py`，覆盖 messages 表 is_summary 列、迁移幂等、append/list 还原 is_summary + created_at、replace_summary_message 单事务删旧插新、delete_summary_messages 返回计数、普通消息带前缀 is_summary=False 不触发 replace
+- 增量压缩集成测试：`tests/application/test_incremental_compression_integration.py`，端到端验证第 2 次压缩走迭代路径（middle 只含新增消息）和多次压缩后 messages 表 is_summary=1 消息只有 1 条
+- Dashboard 摘要渲染测试：`tests/interfaces/test_dashboard_session_detail.py`，覆盖会话详情 API 响应 messages 列表含 is_summary 字段
+- Context 压缩装配测试：`tests/test_main_context_compression_wiring.py`，验证 `context_compression_enabled=True` 时 `ContextCompressor` 被构造并注入 `AgentGraphRunner.context_engine`，disabled 时不注入
 
 ## Harness 任务文件
 

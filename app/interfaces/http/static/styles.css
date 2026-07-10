@@ -179,6 +179,9 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .msg.assistant img { max-width: 320px; max-height: 320px; }
 .msg--image-only { padding: 0; background: transparent; border: 0; box-shadow: none; }
 .msg--image-only img { margin: 0; border-radius: 12px; }
+.msg--summary { align-self: flex-start; max-width: 92%; background: var(--color-warning-bg); border: 1px solid var(--color-warning-border); color: var(--color-warning-fg); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+.msg--summary summary { cursor: pointer; font-family: var(--font-family-base); font-weight: 600; }
+.msg--summary pre { margin-top: 8px; background: rgba(255, 255, 255, 0.55); white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 
 /* Image preview lightbox */
 .image-preview-modal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15,23,42,.85); cursor: zoom-out; }

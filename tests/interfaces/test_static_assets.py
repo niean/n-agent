@@ -867,3 +867,46 @@ def test_chat_message_images_render_after_refresh(tmp_path):
     refresh_end = chat_js.index('async function send()', refresh_start)
     refresh_body = chat_js[refresh_start:refresh_end]
     assert 'renderSessionMessages(detail)' in refresh_body
+
+
+def test_chat_js_renders_summary_messages_specially(tmp_path):
+    """is_summary 消息渲染为折叠的 details 卡片，标题"对话摘要"，剥离 [CONTEXT SUMMARY]: 前缀后展示正文。"""
+    from app.domain.context import CONTEXT_SUMMARY_PREFIX
+
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+
+    create_start = chat_js.index('function createMessageElement(message)')
+    create_end = chat_js.index('function shouldRenderMessage(message)', create_start)
+    create_body = chat_js[create_start:create_end]
+    assert 'message.is_summary' in create_body
+    assert 'msg--summary' in create_body
+    assert "createElement('details')" in create_body
+    assert "createElement('summary')" in create_body
+    assert "createElement('pre')" in create_body
+    assert '对话摘要' in create_body
+    assert CONTEXT_SUMMARY_PREFIX in create_body
+    assert 'startsWith(prefix)' in create_body
+    assert 'slice(prefix.length)' in create_body
+
+
+def test_chat_js_keeps_summary_messages_renderable(tmp_path):
+    """shouldRenderMessage 对 is_summary 消息直接返回 true，不被普通过滤逻辑排除。"""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+
+    should_start = chat_js.index('function shouldRenderMessage(message)')
+    should_end = chat_js.index('function groupToolMessages', should_start)
+    should_body = chat_js[should_start:should_end]
+    assert 'message.is_summary' in should_body
+    assert 'return true' in should_body
+
+
+def test_styles_css_contains_summary_message_styles(tmp_path):
+    """styles.css 包含摘要卡片的折叠样式（msg--summary + details/summary/pre，黄底色）。"""
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    assert '.msg--summary' in css
+    assert '.msg--summary summary' in css
+    assert '.msg--summary pre' in css
+    assert '--color-warning-bg' in css

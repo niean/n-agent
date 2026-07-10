@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射、TUI 一次会话完整执行链路 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射、TUI 一次会话完整执行链路、多模态内容归一化与 vision 能力守卫、上下文短期记忆增量压缩与摘要持久化（双标记 + a-f 顺序 + replace_summary_message 单事务 + 双写降级） -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -610,3 +610,54 @@ ACP 历史回放（`event_bridge._replay_user_message_blocks`）：
 - GatewayService 必须在 destructive preflight 前拒绝 slash+images 组合，否则会为带图片的 slash 命令创建 confirmation。
 - ACP `prompt()` 的 `if not text and not images: return end_turn` 必须同时检查 images，否则 image-only prompt 被当空消息拒绝。
 - Anthropic provider 的 http(s) image_url 必须抛 ValueError 而非静默跳过，否则图片被静默丢弃用户无感知。
+
+## 模式二十二：上下文短期记忆增量压缩与摘要持久化
+
+Agent Runtime 在多轮对话中 token 消耗持续增长，需在超过阈值时把历史压缩为结构化摘要，控制后续 LLM 调用成本。压缩能力通过 DDD 四层装配实现，避免把压缩逻辑散落到 LangGraph 节点或 Infrastructure 细节中。对齐 HermesAgent 增量压缩方法：摘要消息持久化到 messages 表（is_summary=1），通过 content 前缀定位上次摘要切点，middle 只取新增消息。
+
+装配链路：
+1. Domain 端口（`app/domain/context.py`）：`ContextEngine` Protocol 定义 `should_compress` 与 `compress`；`ContextCompressionResult` frozen dataclass 携带 messages/summary/compressed/skipped_reason/original_tokens/compressed_tokens；`CONTEXT_SUMMARY_PREFIX`（`"[CONTEXT SUMMARY]: "`）常量定义运行时摘要消息识别前缀
+2. Infrastructure 实现（`app/infrastructure/context/context_compressor.py`）：`ContextCompressor` 实现 `ContextEngine`，注入 LLMProvider/model callable/context_length/threshold/protect_first_n/protect_last_n/summary_target_ratio/cooldown_seconds/可选 fallback_summarizer；`_find_latest_context_summary` 从后往前扫描 messages 定位最后一个 content 以 `CONTEXT_SUMMARY_PREFIX` 开头的 user 消息；`_generate_summary` 分首次路径（FIRST 模板，空 existing_summary）和迭代路径（ITERATIVE 模板，previous_summary=body）
+3. Application 节点（`app/application/agent_graph.py`）：`compress_context` 节点位于 `load_context` 与 `call_llm` 之间，调用 `context_engine.should_compress` 判定，超阈值时调 `compress` 执行压缩，按 a-f 顺序持久化（b 识别摘要消息 -> a 计算 next_summary -> c 构造 ConversationMessage(is_summary=True) -> d replace_summary_message -> e save_summary -> f 更新 state）
+4. main.py 装配（`app/main.py`）：当 `settings.context_compression_enabled=True` 时构造 `ContextCompressor` 并注入 `AgentGraphRunner.context_engine`；disabled 时 `context_engine=None`，compress_context 节点跳过压缩
+
+增量三段式压缩规则：
+- head 段保留前 `protect_first_n` 条消息（含 system prompt + 早期关键上下文）
+- 中段送入 LLM 生成结构化摘要（目标/进展/决策/文件/待办 5 节），按 `summary_target_ratio × context_length` 预算约束
+- tail 段保留最后 `protect_last_n` 条消息，按 token 预算分配
+- 增量压缩：`_find_latest_context_summary` 定位上次摘要消息（content 以 `CONTEXT_SUMMARY_PREFIX` 开头），middle 4 种分支处理：无摘要（首次路径）/ summary_idx<head_end（首次路径，移除旧摘要）/ head_end<=summary_idx<tail_start-1（正常增量，middle 从 summary_idx+1 开始）/ summary_idx>=tail_start-1（跳过，skipped_reason="summary_in_tail"）
+- previous_summary 用 body（剥离前缀的纯摘要），不用 state.summary（含 rescued_context）
+- 工具组完整性对齐：避免在 assistant tool_calls 与对应 tool 消息之间截断，`sanitize` 剥离未配对的 tool_calls/tool 消息，保证压缩后 messages 对 provider API 合法
+- token 估算：str content 按 `len//4` 估算，list content 逐 part 估算（text 按 len//4，image_url 固定 1500，其他 json.dumps//4），tool_calls/name/tool_call_id 一并计入；单条消息异常不中断估算
+
+cooldown 防抖：
+- `ContextCompressor` 内存维护 `_last_compressed_at`（monotonic 时间戳），`should_compress` 检测 cooldown 未到期时返回 False
+- force=True 可绕过 cooldown（供测试或显式触发使用）
+- cooldown 防止同一会话连续多轮触发压缩造成抖动和重复 LLM 摘要调用
+
+LLM 摘要失败回退：
+- LLM 摘要调用异常时回退到注入的 `fallback_summarizer`（通常为 `HeuristicSummarizer`），保证压缩路径不因 LLM 故障中断
+- 回退仍失败时 `skipped_reason` 标记原因，messages 原样返回不压缩
+
+外部记忆 pre_compress_all 迁移：
+- `pre_compress_all` 从 `update_memory` 迁移到 `compress_context`，仅在真正压缩时调用提取 rescued_context
+- `update_memory` 不再生成 summary（摘要职责迁移至 compress_context），避免双路径重复生成
+- `prefetch_all` 仍留在 `call_llm` 节点做临时注入，不修改 state.working_messages
+
+摘要持久化边界（双标记 + 双写降级）：
+- `messages` 表新增 `is_summary INTEGER NOT NULL DEFAULT 0` 列 + partial index `idx_messages_summary_session`；`ConversationMessage.is_summary` 为 bool
+- `compress_context` 在 `result.compressed=True` 时从 result.messages 识别恰好 1 条摘要消息（role=user + content 以 `CONTEXT_SUMMARY_PREFIX` 开头），数量 != 1 时保持 state 不变
+- `replace_summary_message`（MemoryStore 端口）：单连接事务内 DELETE 旧 is_summary=1 消息 + INSERT 新摘要消息，保证同一 session 最多 1 条 is_summary=1 消息
+- `save_summary`：写入 summaries 表，`source_message_id` 关联新摘要消息 id；`summaries.summary` 保存 state.summary（含 rescued_context），`messages` 摘要 content 保存 result.summary（纯 LLM 摘要，不含 rescued_context）
+- 双写降级：`replace_summary_message` 失败时 state 不变（state.summary 和 state.working_messages 都不更新）；`save_summary` 失败时 messages 表已更新，summaries 表滞后一轮（Dashboard 降级），不回滚
+- `_message_to_provider` 不传递 is_summary 到 provider 格式，provider 调用时消息只含 role/content/tool_calls 等标准字段
+- Dashboard API `_message_to_dict` 返回 is_summary 字段，chat.js 对 is_summary=1 消息特殊渲染（摘要 badge + 灰色卡片，剥离前缀后展示正文）
+
+陷阱：
+- 在 `compress_context` 节点直接修改 `state.working_messages` 会污染后续 `update_memory` 落库的历史，应通过 LangGraph state 返回新值让框架替换
+- 增量压缩未做 previous_summary 提取（用 state.summary 而非 body）会把 rescued_context 混入 LLM 摘要输入，导致摘要质量退化
+- 三段式压缩未做工具组完整性对齐会在 assistant tool_calls 与 tool 消息之间截断，导致 provider API 报错（tool_calls 无对应 tool result）
+- LLM 摘要无 fallback 回退会让 LLM 故障直接中断 AgentGraph 主路径，应注入 `HeuristicSummarizer` 作为 fallback
+- cooldown 用 wall clock 会让测试等待真实时间，应注入 `_clock` callable 用 fake clock 验证
+- `replace_summary_message` 非单事务实现会在 DELETE 后 INSERT 之间因进程崩溃遗留 0 条或多条摘要消息，破坏"最多 1 条"不变量
+- `save_summary` 失败时回滚 messages 表会让下次 load_context 加载到新摘要但 summaries 表无对应记录，Dashboard 显示滞后；正确降级是接受 Dashboard 滞后一轮不回滚

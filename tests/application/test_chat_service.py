@@ -34,6 +34,7 @@ class RecordingRunner:
     def __init__(self):
         self.options = None
         self.calls = []
+        self.compress_calls = []
 
     async def run(self, state, model, options=None):
         self.options = dict(options or {})
@@ -42,8 +43,17 @@ class RecordingRunner:
         state.finish_reason = "stop"
         return state
 
+    async def compress_session(self, session_id):
+        self.compress_calls.append(session_id)
+        return {"compressed": True, "reason": None}
+
     def stream_events(self, state, model, options=None):
         raise AssertionError("stream not used")
+
+
+def _build_service_with_runner(store, runner):
+    session_service = SessionService(store)
+    return ChatCompletionService(store, runner, session_service)
 
 
 def _build_service(store, tmp_path):
@@ -442,3 +452,106 @@ async def test_chat_service_image_only_message_persisted_and_not_dropped(tmp_pat
     assert isinstance(content, list)
     assert len(content) == 1
     assert content[0]["type"] == "image_url"
+
+
+@pytest.mark.asyncio
+async def test_chat_service_compress_slash_command_skips_llm(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    result = await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "/compress"}],
+            stream=False,
+            session_id="s-compress",
+        )
+    )
+
+    assert result.finish_reason == "stop"
+    assert "已压缩上下文" in result.message["content"]
+    assert runner.compress_calls == ["s-compress"]
+    assert runner.calls == []
+    messages = await store.list_messages("s-compress")
+    assert all(m.role != "user" for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_chat_service_compress_slash_command_stream(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    stream = await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "/compress"}],
+            stream=True,
+            session_id="s-compress-stream",
+        )
+    )
+
+    events = [e async for e in stream]
+    content_events = [e for e in events if e.type is ChatEventType.CONTENT_DELTA]
+    assert content_events
+    assert "已压缩上下文" in content_events[0].content
+    assert runner.compress_calls == ["s-compress-stream"]
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_chat_service_conversational_compress_sets_force_option(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "请帮我压缩上下文"}],
+            stream=False,
+            session_id="s-conv-compress",
+        )
+    )
+
+    assert runner.calls
+    assert runner.options.get("force_compress") is True
+
+
+@pytest.mark.asyncio
+async def test_chat_service_conversational_compress_english_keyword(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "please compress context for me"}],
+            stream=False,
+            session_id="s-conv-en",
+        )
+    )
+
+    assert runner.calls
+    assert runner.options.get("force_compress") is True
+
+
+@pytest.mark.asyncio
+async def test_chat_service_no_force_for_unrelated_message(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "上下文太长了"}],
+            stream=False,
+            session_id="s-no-force",
+        )
+    )
+
+    assert runner.calls
+    assert "force_compress" not in runner.options

@@ -73,6 +73,17 @@ class MemoryStore(Protocol):
     ) -> None:
         ...
 
+    async def delete_summary_messages(self, session_id: str) -> int:
+        """删除指定 session 的所有 is_summary=1 消息，返回删除行数。"""
+
+    async def append_summary_message(
+        self, session_id: str, message: ConversationMessage,
+    ) -> ConversationMessage:
+        """追加摘要消息(is_summary=1)到 messages 表，不删除旧摘要。
+
+        保留所有摘要记录供 Dashboard 渲染历史摘要；上下文构建时仅取最新一条。
+        """
+
 
 class Summarizer(Protocol):
     async def summarize(self, messages: list[dict[str, Any]], existing_summary: str = "") -> str:

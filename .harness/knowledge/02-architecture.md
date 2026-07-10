@@ -9,7 +9,7 @@
 
 项目严格遵循领域驱动设计 DDD，采用外层依赖内层的方向：Interfaces -> Application -> Domain。Infrastructure 只实现 Domain 定义的端口，并在应用启动时注入。
 
-- Domain 层：定义 Agent、Session、Message、Tool、Provider、Memory、Knowledge、Platform/Gateway 等核心领域模型和值对象，定义 LLMProvider、ToolExecutor、MemoryStore、Summarizer、KnowledgeBaseRegistry、KnowledgeRetriever、PlatformRegistry、GatewaySessionRegistry 等端口协议。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
+- Domain 层：定义 Agent、Session、Message、Tool、Provider、Memory、Knowledge、Platform/Gateway 等核心领域模型和值对象，定义 LLMProvider、ToolExecutor、MemoryStore、Summarizer、ContextEngine、KnowledgeBaseRegistry、KnowledgeRetriever、PlatformRegistry、GatewaySessionRegistry 等端口协议。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
 - Application 层：编排用例和 Agent Runtime。LangGraph 属于本层，只负责状态图和运行流程编排。
 - Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、Knowledge HTTP adapter、配置加载等。
 - Interfaces 层：实现 FastAPI、OpenAI-compatible API、Dashboard 和协议转换。
@@ -25,12 +25,12 @@
 
 ## 核心模块
 
-- Agent Runtime：内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件。运行流程可使用 LangGraph 表达，但领域状态和规则不能被 LangGraph 类型污染。
+- Agent Runtime：内部运行机制，负责加载上下文、压缩短期记忆、调用 LLM、执行工具、更新 Memory、判断结束条件。LangGraph 节点顺序为 `load_context -> compress_context -> call_llm -> execute_tools -> update_memory -> call_llm/finalize`；`compress_context` 位于 load_context 与 call_llm 之间，token 估算超阈值时按增量三段式（head 保护 + 中段 LLM 摘要 + tail 保护，`_find_latest_context_summary` 定位上次摘要切点）压缩历史，cooldown 防抖；`update_memory` 不再生成 summary，摘要职责迁移至 `compress_context`，`pre_compress_all` 也仅在实际压缩时调用提取 rescued_context。运行流程可使用 LangGraph 表达，但领域状态和规则不能被 LangGraph 类型污染。
 - LLM Adapter：模型 Provider 端口，屏蔽 OpenAI-compatible、Claude、Ollama、OpenRouter 等 Provider 差异。运行时由 Application 层 `ActiveProviderHolder` 适配，结合 SQLite 持久化的 `ProviderRegistry`（多 Provider 注册表 + 单一 active）实现 Dashboard 在线 CRUD 与热切换；下游用例只依赖 Domain LLMProvider 端口，不感知 holder 与 registry 的存在。
 - Tool Registry：工具定义、schema、来源类型、能力分组、风险等级、权限要求和执行入口。Agent 实际可执行工具只来自服务端注册表；多个工具 executor 通过 Infrastructure 组合路由分发。MCP 远端工具通过本地动态 ToolDefinition 暴露，运行时由 Application 层 McpToolExecutor 薄适配 McpService，再由 Infrastructure MCP client 访问远端站点。
 - MCP Sites：MCP 站点管理采用“配置注册表 + 探测优先 + 动态工具面”模式。Domain 定义站点、工具映射和 registry 端口；Application McpService 负责 CRUD、探测、刷新、动态工具定义和调用解析；Infrastructure 实现 SQLite registry 与 MCP SDK client，并支持 streamable_http、SSE 和 stdio 三类传输；Interfaces 只提供 Dashboard API 和静态页面交互。stdio 站点保存 command/args/env，执行时通过 argv 启动本地 MCP server，不走 shell。
 - Knowledge Retrieval：N-Agent 定义知识检索 SPI，通过 safe tool `search_knowledge` 消费多个已注册 KB 后端。Domain 只定义 KB 值对象、注册表端口和检索端口；Application 的 KnowledgeService 编排 KB CRUD、probe、search 和动态工具定义；Infrastructure 用 SQLite registry 保存 KB 配置，用 HTTP adapter 适配 N-KB/Ragflow 协议；Interfaces 提供 Dashboard KB 管理 API 和前端页面。N-KB、Ragflow 都只是后端协议类型，不嵌入 N-Agent 领域模型。
-- Memory/Context：通过 MemoryStore 与 Summarizer 端口访问，会话、消息、工具调用、任务状态、摘要和会话级外部记忆配置的持久化细节属于 Infrastructure。Chat Session 的外部记忆 profile 必须首轮后锁定，避免同一会话内切换文件记忆导致 system prompt 前缀变化、LLM prefix cache 失效和历史语义混用。
+- Memory/Context：通过 MemoryStore 与 Summarizer 端口访问，会话、消息、工具调用、任务状态、摘要和会话级外部记忆配置的持久化细节属于 Infrastructure。Chat Session 的外部记忆 profile 必须首轮后锁定，避免同一会话内切换文件记忆导致 system prompt 前缀变化、LLM prefix cache 失效和历史语义混用。Context 短期记忆压缩通过 `ContextEngine` 端口（`app/domain/context.py`）定义，Infrastructure 的 `ContextCompressor`（`app/infrastructure/context/context_compressor.py`）实现增量压缩（`_find_latest_context_summary` 定位上次摘要切点，middle 只取新增消息）；摘要消息通过双标记持久化（`messages.is_summary=1` + content 以 `CONTEXT_SUMMARY_PREFIX` 开头），`compress_context` 节点按 a-f 顺序调 `replace_summary_message`（单事务删旧插新，保证最多 1 条）+ `save_summary`（source_message_id 关联），双写失败降级不回滚。
 - OpenAI-compatible API：对外兼容 Open-WebUI 的协议层，不等同于内部 Agent 模型。
 - Platform Aggregate / Interaction Gateway：`Platform` 面向飞书、钉钉、企微等外部消息平台；Domain 定义 PlatformRegistry 与 PlatformLifecycle 端口，Application 的 PlatformService 组合平台 descriptor、lifecycle、Gateway 会话统计并向 Dashboard 提供只读视图。CLI/TUI 终端聊天仍可通过 GatewayService 标准化为 InteractionMessage，但只作为 `source=cli` 的入口来源，不注册进 PlatformRegistry，也不出现在 Dashboard 平台页。飞书 IM 等平台入口复用 ChatCompletionService、SessionService、ToolService 和 MemoryStore；Gateway 破坏性命令确认由 Application 层 pending confirmation 管理，飞书使用 interactive card 作为展示和回调通道。飞书使用长连接接收事件，平台适配只做协议解析、消息类型过滤、卡片渲染、回调路由和消息收发，FeishuImAdapter 同时实现 PlatformLifecycle，用 start() 进入 connected/正常返回 disconnected/异常 fatal 的事件驱动状态。
 - Chat Dashboard：调试和演示入口，查看会话、流式输出、工具调用、摘要和任务状态，不替代 Open-WebUI。

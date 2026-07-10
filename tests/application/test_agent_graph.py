@@ -6,6 +6,7 @@ from app.application.agent_graph import AgentGraphRunner
 from app.application.events import ChatEventType
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.domain.agent import AgentState
+from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextCompressionResult
 from app.domain.provider import LLMResult, ModelInfo
 from app.domain.tool import RiskLevel, ToolCallRequest, ToolDefinition, ToolResult, ToolResultStatus
 from app.domain.session import ConversationSession
@@ -168,6 +169,28 @@ class CapturingSummarizer(HeuristicSummarizer):
         return " | ".join(str(message.get("content", "")) for message in messages)
 
 
+class AlwaysCompressEngine:
+    """Fake ContextEngine that always triggers compression and captures messages."""
+
+    def __init__(self, summary_text: str = "generated summary"):
+        self._summary_text = summary_text
+        self.compress_messages: list[dict] | None = None
+
+    def should_compress(self, messages, *, prompt_tokens=None, force=False):
+        return True
+
+    async def compress(self, messages, *, current_tokens=None, force=False, existing_summary=""):
+        self.compress_messages = list(messages)
+        return ContextCompressionResult(
+            messages=[{"role": "user", "content": f"{CONTEXT_SUMMARY_PREFIX}{self._summary_text}"}],
+            summary=self._summary_text,
+            compressed=True,
+            skipped_reason=None,
+            original_tokens=100,
+            compressed_tokens=10,
+        )
+
+
 @pytest.mark.asyncio
 async def test_agent_graph_executes_tool_loop_and_finalizes(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -246,18 +269,21 @@ async def test_agent_graph_excludes_system_prompt_from_summary(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))
     provider = DirectProvider()
-    summarizer = CapturingSummarizer()
+    engine = AlwaysCompressEngine(summary_text="generated summary")
     runner = AgentGraphRunner(
         provider,
         ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
         store,
-        summarizer,
+        HeuristicSummarizer(),
         iteration_limit=3,
+        context_engine=engine,
     )
 
     await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "hi"}]), "test")
 
-    assert all(message.get("role") != "system" for message in summarizer.messages)
+    # system prompt excluded from compress input
+    assert engine.compress_messages is not None
+    assert all(message.get("role") != "system" for message in engine.compress_messages)
     summary = await store.get_summary("s1")
     assert summary is not None
     assert "N-Agent(Niean's Agent)" not in summary.summary
@@ -526,7 +552,7 @@ class PreCompressCapturingProvider:
 
 @pytest.mark.asyncio
 async def test_agent_graph_calls_on_pre_compress_before_summary(tmp_path):
-    """on_pre_compress is invoked with non-system messages before summarizer runs."""
+    """on_pre_compress is invoked with non-system messages before context_engine.compress."""
     from app.application.external_memory_manager import ExternalMemoryManager
 
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -534,6 +560,7 @@ async def test_agent_graph_calls_on_pre_compress_before_summary(tmp_path):
     capturing = PreCompressCapturingProvider()
     manager = ExternalMemoryManager()
     manager.add_provider(capturing)
+    engine = AlwaysCompressEngine()
     runner = AgentGraphRunner(
         FakeProvider(),
         ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
@@ -541,6 +568,7 @@ async def test_agent_graph_calls_on_pre_compress_before_summary(tmp_path):
         HeuristicSummarizer(),
         iteration_limit=3,
         external_memory_manager=manager,
+        context_engine=engine,
     )
 
     await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "hi"}]), "test")
@@ -563,6 +591,7 @@ async def test_agent_graph_prepends_rescued_context_to_summary(tmp_path):
     capturing = PreCompressCapturingProvider(rescue="RESCUED_FACT")
     manager = ExternalMemoryManager()
     manager.add_provider(capturing)
+    engine = AlwaysCompressEngine(summary_text="LLM_SUMMARY")
     runner = AgentGraphRunner(
         FakeProvider(),
         ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
@@ -570,6 +599,7 @@ async def test_agent_graph_prepends_rescued_context_to_summary(tmp_path):
         HeuristicSummarizer(),
         iteration_limit=3,
         external_memory_manager=manager,
+        context_engine=engine,
     )
 
     await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "hi"}]), "test")

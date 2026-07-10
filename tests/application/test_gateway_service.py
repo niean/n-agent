@@ -81,6 +81,7 @@ class FakeSessionService:
 class FakeChatService:
     def __init__(self):
         self.requests = []
+        self.compress_calls = []
 
     async def complete(self, request):
         self.requests.append(request)
@@ -89,6 +90,10 @@ class FakeChatService:
             model=request.model,
             message={"role": "assistant", "content": "pong"},
         )
+
+    async def compress_session(self, session_id):
+        self.compress_calls.append(session_id)
+        return {"compressed": True, "reason": None}
 
 
 class FakeToolService:
@@ -527,6 +532,40 @@ async def test_gateway_service_sessions_command_lists_links():
     response = await service.handle_message(message("/sessions"))
 
     assert "session-1" in response.messages[0].content
+
+
+@pytest.mark.asyncio
+async def test_gateway_service_compress_command_calls_compress_session():
+    harness = Harness()
+    service = harness.service()
+
+    response = await service.handle_message(message("/compress", "event-compress"))
+
+    assert "已压缩上下文" in response.messages[0].content
+    assert harness.chat_service.compress_calls == [response.session_id]
+
+
+@pytest.mark.asyncio
+async def test_gateway_service_compress_command_without_chat_service():
+    from app.application.gateway_service import GatewayCommandService
+    from app.domain.gateway import GatewaySessionKey, InteractionMessage
+
+    cmd = GatewayCommandService(
+        registry=None,
+        session_service=None,
+        tool_service=None,
+        model_service=None,
+        health_provider=lambda: {},
+        schedule_service=None,
+        chat_service=None,
+    )
+    event = InteractionMessage(
+        id="evt-1",
+        session_key=GatewaySessionKey("cli", "local", display_name="Local"),
+        text="/compress",
+    )
+    response = await cmd.handle(event, "session-1")
+    assert "上下文压缩未启用" in response.messages[0].content
 
 
 @pytest.mark.asyncio
