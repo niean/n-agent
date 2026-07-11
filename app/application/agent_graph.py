@@ -225,9 +225,12 @@ class AgentGraphRunner:
         messages = await self.memory_store.list_messages(state.session_id)
         summary = await self.memory_store.get_summary(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
-        # 过滤掉已被摘要吸收的原始消息（is_summarized=1），避免 middle + summary 冗余。
-        unsummarized = [m for m in messages if not m.is_summarized]
-        context_messages = _filter_to_latest_summary(unsummarized)
+        # 过滤掉已被摘要吸收的原始消息（is_summarized=1），并按压缩契约重建
+        # head + latest summary + tail。summary 持久化时是 append 到 messages 表末尾，
+        # 不能直接按 created_at 顺序注入，否则会变成 head + tail + summary。
+        context_messages = _sanitize_conversation_tool_pairs(
+            _build_latest_compressed_context(messages)
+        )
         # Deduplicate: callers (ChatCompletionService) persist user messages to
         # memory_store before invoking the graph, so the same messages may
         # appear both in context_messages (loaded from history) and in
@@ -854,12 +857,69 @@ def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
     return data
 
 
-def _filter_to_latest_summary(messages: list[ConversationMessage]) -> list[ConversationMessage]:
-    """保留全部非摘要消息 + 仅最新一条摘要；旧摘要从上下文剔除。
+def _assistant_tool_calls(message: ConversationMessage) -> list[dict[str, Any]]:
+    if message.role != "assistant" or not isinstance(message.content, dict):
+        return []
+    raw = message.content.get("tool_calls") or []
+    return raw if isinstance(raw, list) else []
 
-    前置条件：调用方已过滤 is_summarized=1 的消息（middle 段已被标记）。
-    本函数只处理摘要消息：保留最新一条 summary，丢弃旧 summary。
-    非摘要消息（head + tail + new_msgs）全部保留。
+
+def _assistant_content_without_tool_calls(message: ConversationMessage) -> Any:
+    if not isinstance(message.content, dict):
+        return message.content
+    return message.content.get("content", "")
+
+
+def _sanitize_conversation_tool_pairs(messages: list[ConversationMessage]) -> list[ConversationMessage]:
+    """Remove incomplete assistant/tool groups before sending history to a provider."""
+    result: list[ConversationMessage] = []
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        tool_calls = _assistant_tool_calls(message)
+        if tool_calls:
+            ids = {tc.get("id") for tc in tool_calls if isinstance(tc, dict) and tc.get("id")}
+            contiguous_tools: list[ConversationMessage] = []
+            j = i + 1
+            while j < len(messages) and messages[j].role == "tool":
+                if messages[j].tool_call_id in ids:
+                    contiguous_tools.append(messages[j])
+                j += 1
+
+            result_ids = {tool.tool_call_id for tool in contiguous_tools}
+            kept_calls = [
+                tc for tc in tool_calls
+                if isinstance(tc, dict) and tc.get("id") in result_ids
+            ]
+            if kept_calls:
+                content = _assistant_content_without_tool_calls(message)
+                result.append(
+                    dataclasses.replace(
+                        message,
+                        content={"content": content, "tool_calls": kept_calls},
+                    )
+                )
+                result.extend(contiguous_tools)
+            else:
+                content = _assistant_content_without_tool_calls(message)
+                if content:
+                    result.append(dataclasses.replace(message, content=content))
+            i = j
+        elif message.role == "tool":
+            i += 1
+        else:
+            result.append(message)
+            i += 1
+    return result
+
+
+def _build_latest_compressed_context(messages: list[ConversationMessage]) -> list[ConversationMessage]:
+    """Build provider context with latest summary between protected head and tail.
+
+    SQLite keeps all messages in append order so Dashboard can show the real
+    audit trail. A new summary row is appended after the tail, while the LLM
+    context contract is head + summary + tail. Use is_summarized markers to
+    recover that boundary when loading context.
     """
     latest_summary_idx = -1
     for idx in range(len(messages) - 1, -1, -1):
@@ -867,11 +927,32 @@ def _filter_to_latest_summary(messages: list[ConversationMessage]) -> list[Conve
             latest_summary_idx = idx
             break
     if latest_summary_idx == -1:
-        return list(messages)
-    return [
-        m for idx, m in enumerate(messages)
-        if not m.is_summary or idx == latest_summary_idx
+        return [m for m in messages if not m.is_summarized]
+
+    latest_summary = messages[latest_summary_idx]
+    first_summarized_idx = -1
+    for idx, message in enumerate(messages[:latest_summary_idx]):
+        if message.is_summarized and not message.is_summary:
+            first_summarized_idx = idx
+            break
+
+    kept_non_summary = [
+        m for m in messages
+        if not m.is_summary and not m.is_summarized
     ]
+    if first_summarized_idx == -1:
+        return [
+            m for idx, m in enumerate(messages)
+            if not m.is_summary or idx == latest_summary_idx
+        ]
+
+    head = [
+        m for m in messages[:first_summarized_idx]
+        if not m.is_summary and not m.is_summarized
+    ]
+    head_ids = {m.id for m in head}
+    tail = [m for m in kept_non_summary if m.id not in head_ids]
+    return [*head, latest_summary, *tail]
 
 
 def _msg_role_content_key(msg: Any) -> tuple[str, str]:

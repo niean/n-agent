@@ -72,6 +72,7 @@ class ContextCompressor(ContextEngine):
         protect_last_n: int,
         summary_target_ratio: float,
         cooldown_seconds: int,
+        tail_budget_enabled: bool = False,
         fallback_summarizer: Summarizer | None = None,
         _clock: Callable[[], float] = time.monotonic,
     ):
@@ -82,6 +83,7 @@ class ContextCompressor(ContextEngine):
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = summary_target_ratio
+        self.tail_budget_enabled = tail_budget_enabled
         self.cooldown_seconds = cooldown_seconds
         self.fallback_summarizer = fallback_summarizer
         self._clock = _clock
@@ -203,8 +205,11 @@ class ContextCompressor(ContextEngine):
         try:
             # Three-segment: head + middle(to summarize) + tail
             head_end = self._align_boundary_forward(messages, self.protect_first_n)
-            tail_budget = max(1, int(self.context_length * self.summary_target_ratio))
-            tail_start = self._find_tail_cut_by_tokens(messages, head_end, tail_budget)
+            if self.tail_budget_enabled:
+                tail_budget = max(1, int(self.context_length * self.summary_target_ratio))
+                tail_start = self._find_tail_cut_by_tokens(messages, head_end, tail_budget)
+            else:
+                tail_start = self._find_tail_cut_by_count(messages, head_end)
             tail_start = self._align_boundary_backward(messages, tail_start)
             if tail_start <= head_end:
                 return ContextCompressionResult(
@@ -307,6 +312,13 @@ class ContextCompressor(ContextEngine):
         # If the walk placed everything in the tail, force the oldest tail
         # message back into middle. Align forward to avoid splitting a tool
         # group that starts at head_end.
+        if tail_start <= head_end:
+            tail_start = self._align_boundary_forward(messages, head_end + 1)
+        return max(head_end + 1, tail_start)
+
+    def _find_tail_cut_by_count(self, messages: list[dict[str, Any]], head_end: int) -> int:
+        tail_start = max(head_end + 1, len(messages) - self.protect_last_n)
+        tail_start = self._align_boundary_backward(messages, tail_start)
         if tail_start <= head_end:
             tail_start = self._align_boundary_forward(messages, head_end + 1)
         return max(head_end + 1, tail_start)

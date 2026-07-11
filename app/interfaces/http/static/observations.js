@@ -28,6 +28,13 @@
     return pct.toFixed(1) + '%';
   }
 
+  function formatCacheHitRate(item) {
+    const read = Number((item && item.cache_read_tokens) || 0);
+    const write = Number((item && item.cache_write_tokens) || 0);
+    const input = Number((item && item.input_tokens) || 0);
+    return formatPercent(read, input + read + write);
+  }
+
   function formatTime(value) {
     if (!value) return '-';
     const d = new Date(value);
@@ -87,7 +94,9 @@
       { label: '会话总数', value: formatNumber(stats.session_count) },
       { label: '输入 Token', value: formatNumber(stats.input_tokens) },
       { label: '输出 Token', value: formatNumber(stats.output_tokens) },
-      { label: '缓存 Token', value: formatNumber((stats.cache_read_tokens || 0) + (stats.cache_write_tokens || 0)) },
+      { label: '缓存读', value: formatNumber(stats.cache_read_tokens) },
+      { label: '缓存写', value: formatNumber(stats.cache_write_tokens) },
+      { label: '缓存命中率', value: formatCacheHitRate(stats) },
       { label: '总 Token', value: formatNumber(stats.total_tokens) },
       { label: '成本 (USD)', value: formatCost(stats.estimated_cost_usd) },
       { label: 'API 调用数', value: formatNumber(stats.api_call_count) },
@@ -250,7 +259,9 @@
     const cards = [
       { label: '输入 Token', value: formatNumber(stats.input_tokens) },
       { label: '输出 Token', value: formatNumber(stats.output_tokens) },
-      { label: '缓存 Token', value: formatNumber((stats.cache_read_tokens || 0) + (stats.cache_write_tokens || 0)) },
+      { label: '缓存读', value: formatNumber(stats.cache_read_tokens) },
+      { label: '缓存写', value: formatNumber(stats.cache_write_tokens) },
+      { label: '缓存命中率', value: formatCacheHitRate(stats) },
       { label: '总 Token', value: formatNumber(stats.total_tokens) },
       { label: '成本 (USD)', value: formatCost(stats.estimated_cost_usd) },
       { label: 'API 调用数', value: formatNumber(stats.api_call_count) },
@@ -339,18 +350,37 @@
     return section;
   }
 
-  function buildJsonSection(title, subtitle, jsonValue, emptyHint) {
-    const section = ui.el('div');
-    section.style.marginTop = '16px';
-    const t = ui.el('div');
-    t.style.fontSize = '13px';
-    t.style.fontWeight = '600';
-    t.style.marginBottom = '6px';
-    t.textContent = title + (subtitle ? ' · ' + subtitle : '');
-    section.appendChild(t);
+  function buildJsonSection(title, subtitle, jsonValue, emptyHint, options) {
+    const opts = options || {};
+    const section = ui.el('div', 'observations-json-section');
+    const titleText = title + (subtitle ? ' · ' + subtitle : '');
+    const t = opts.collapsible ? ui.el('button', 'observations-json-section__toggle') : ui.el('div', 'observations-json-section__title');
+    if (opts.collapsible) {
+      t.type = 'button';
+      t.setAttribute('aria-expanded', opts.defaultCollapsed ? 'false' : 'true');
+      const label = ui.el('span');
+      label.textContent = titleText;
+      const icon = ui.el('span', 'observations-json-section__icon');
+      icon.setAttribute('aria-hidden', 'true');
+      icon.textContent = '›';
+      t.append(label, icon);
+    } else {
+      t.textContent = titleText;
+    }
     const pre = ui.el('pre', 'sandbox-detail-output');
     pre.style.maxHeight = '280px';
     pre.textContent = jsonValue ? JSON.stringify(jsonValue, null, 2) : emptyHint;
+    if (opts.collapsible) {
+      pre.hidden = !!opts.defaultCollapsed;
+      section.classList.toggle('observations-json-section--collapsed', !!opts.defaultCollapsed);
+      t.addEventListener('click', () => {
+        const collapsed = !pre.hidden;
+        pre.hidden = collapsed;
+        section.classList.toggle('observations-json-section--collapsed', collapsed);
+        t.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      });
+    }
+    section.appendChild(t);
     section.appendChild(pre);
     return section;
   }
@@ -415,7 +445,8 @@
       '工具定义 (Capability Context)',
       toolsJson ? toolsCount + ' 个' : '',
       toolsData,
-      '(无记录或本次调用未启用工具)'
+      '(无记录或本次调用未启用工具)',
+      { collapsible: true, defaultCollapsed: true }
     ));
 
     // Sector 4: 输入
@@ -463,7 +494,7 @@
     const table = ui.el('table', 'document-table');
     const thead = ui.el('thead');
     const trh = ui.el('tr');
-    ['时间', '模型', '调起类型', '输入', '输出', '缓存', '总计', '成本', '延迟', '操作'].forEach((h) => {
+    ['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '总计', '成本', '延迟', '操作'].forEach((h) => {
       const th = ui.el('th');
       th.textContent = h;
       trh.appendChild(th);
@@ -498,7 +529,9 @@
       [
         formatNumber(r.input_tokens),
         formatNumber(r.output_tokens),
-        formatNumber((r.cache_read_tokens || 0) + (r.cache_write_tokens || 0)),
+        formatNumber(r.cache_read_tokens),
+        formatNumber(r.cache_write_tokens),
+        formatCacheHitRate(r),
         formatNumber(r.total_tokens),
         formatCost(r.estimated_cost_usd),
         r.latency_ms != null ? r.latency_ms + 'ms' : '-',
@@ -658,7 +691,8 @@
     },
     goToDetail(sessionId) {
       const url = '/chat/observations/' + encodeURIComponent(sessionId);
-      window.open(url, '_blank', 'noopener');
+      history.pushState({ tab: 'observations' }, '', url);
+      this.render();
     },
     goToIndex() {
       history.pushState({ tab: 'observations' }, '', '/chat/observations');

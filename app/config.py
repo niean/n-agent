@@ -98,8 +98,9 @@ class Settings(BaseSettings):
     context_length: int = Field(default=32000, ge=1024)
     context_compression_threshold: float = Field(default=0.50, gt=0, le=1)
     context_compression_target_ratio: float = Field(default=0.20, gt=0, le=1)
+    context_compression_tail_budget_enabled: bool = False
     context_compression_protect_first_n: int = Field(default=3, ge=0)
-    context_compression_protect_last_n: int = Field(default=20, ge=0)
+    context_compression_protect_last_n: int = Field(default=10, ge=0)
     context_compression_cooldown_seconds: int = Field(default=300, ge=0)
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")

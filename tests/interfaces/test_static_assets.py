@@ -332,6 +332,17 @@ def test_assistant_tool_calls_are_not_rendered_as_chat_messages(tmp_path):
     assert "if (typeof value === 'object') return Object.keys(value).length > 0" in chat_js
 
 
+def test_observations_cache_metrics_split_read_and_write(tmp_path):
+    client = _client(tmp_path)
+    observations_js = client.get('/static/observations.js').text
+    assert 'function formatCacheHitRate(item)' in observations_js
+    assert 'return formatPercent(read, input + read + write)' in observations_js
+    assert "{ label: '缓存读', value: formatNumber(stats.cache_read_tokens) },\n      { label: '缓存写', value: formatNumber(stats.cache_write_tokens) }" in observations_js
+    assert "['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '总计', '成本', '延迟', '操作']" in observations_js
+    assert "formatNumber(r.cache_read_tokens),\n        formatNumber(r.cache_write_tokens),\n        formatCacheHitRate(r)" in observations_js
+    assert '缓存 Token' not in observations_js
+
+
 def test_current_session_refresh_renders_persisted_messages(tmp_path):
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text

@@ -483,6 +483,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             protect_first_n=settings.context_compression_protect_first_n,
             protect_last_n=settings.context_compression_protect_last_n,
             summary_target_ratio=settings.context_compression_target_ratio,
+            tail_budget_enabled=settings.context_compression_tail_budget_enabled,
             cooldown_seconds=settings.context_compression_cooldown_seconds,
             fallback_summarizer=summarizer,
         )

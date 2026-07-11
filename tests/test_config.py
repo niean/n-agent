@@ -269,8 +269,9 @@ def test_context_compression_defaults():
     assert settings.context_length == 32000
     assert settings.context_compression_threshold == 0.50
     assert settings.context_compression_target_ratio == 0.20
+    assert settings.context_compression_tail_budget_enabled is False
     assert settings.context_compression_protect_first_n == 3
-    assert settings.context_compression_protect_last_n == 20
+    assert settings.context_compression_protect_last_n == 10
     assert settings.context_compression_cooldown_seconds == 300
 
 
@@ -278,6 +279,7 @@ def test_context_compression_env_mapping(monkeypatch):
     monkeypatch.setenv("N_AGENT_CONTEXT_LENGTH", "64000")
     monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_THRESHOLD", "0.6")
     monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_TARGET_RATIO", "0.15")
+    monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_TAIL_BUDGET_ENABLED", "true")
     monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_PROTECT_FIRST_N", "5")
     monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_PROTECT_LAST_N", "30")
     monkeypatch.setenv("N_AGENT_CONTEXT_COMPRESSION_COOLDOWN_SECONDS", "600")
@@ -286,6 +288,7 @@ def test_context_compression_env_mapping(monkeypatch):
     assert settings.context_length == 64000
     assert settings.context_compression_threshold == 0.6
     assert settings.context_compression_target_ratio == 0.15
+    assert settings.context_compression_tail_budget_enabled is True
     assert settings.context_compression_protect_first_n == 5
     assert settings.context_compression_protect_last_n == 30
     assert settings.context_compression_cooldown_seconds == 600

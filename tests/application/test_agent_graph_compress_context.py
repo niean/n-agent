@@ -604,20 +604,20 @@ async def test_load_context_keeps_all_non_summary_messages_and_latest_summary_on
 
 @pytest.mark.asyncio
 async def test_load_context_preserves_head_messages_when_summary_appended_last():
-    """regression: 摘要 append 在 DB 末尾时，head（protect_first_n）不能被丢弃。
+    """regression: 摘要 append 在 DB 末尾时，上下文仍按 head + summary + tail 注入。
 
-    用户报告：压缩后 head 3 消失。根因是 _filter_to_latest_summary 曾按"摘要+其后"
-    过滤，丢弃了摘要之前的 head/middle/tail。修复后应保留 head。
+    用户报告：压缩后只是把摘要加到了消息尾部，没有保留为
+    head 3 + [CONTEXT SUMMARY] + tail 3 的顺序。
     """
     history = [
         # head (protect_first_n=3)
         ConversationMessage(role="user", content="head msg 1"),
         ConversationMessage(role="assistant", content="head reply 1"),
         ConversationMessage(role="user", content="head msg 2"),
-        # middle (would be summarized, but DB retains them)
-        ConversationMessage(role="assistant", content="middle reply"),
-        ConversationMessage(role="user", content="middle msg"),
-        # tail (protect_last_n=20)
+        # middle (summarized, but DB retains them for audit history)
+        ConversationMessage(role="assistant", content="middle reply", is_summarized=True),
+        ConversationMessage(role="user", content="middle msg", is_summarized=True),
+        # tail (protect_last_n default is 10; this sample only needs one tail message)
         ConversationMessage(role="assistant", content="tail reply"),
         # summary appended last by append_summary_message
         ConversationMessage(
@@ -644,10 +644,19 @@ async def test_load_context_preserves_head_messages_when_summary_appended_last()
     assert "head msg 1" in contents
     assert "head reply 1" in contents
     assert "head msg 2" in contents
+    assert "middle reply" not in contents
+    assert "middle msg" not in contents
     # tail must survive
     assert "tail reply" in contents
     # summary must be present
     assert f"{CONTEXT_SUMMARY_PREFIX}compressed summary" in contents
+    assert contents[1:] == [
+        "head msg 1",
+        "head reply 1",
+        "head msg 2",
+        f"{CONTEXT_SUMMARY_PREFIX}compressed summary",
+        "tail reply",
+    ]
 
 
 @pytest.mark.asyncio
@@ -716,7 +725,7 @@ async def test_load_context_filters_is_summarized_messages():
     )
     new_state = await runner.load_context(state)
     contents = [str(m.get("content", "")) for m in new_state.working_messages]
-    # head + tail + summary + new all preserved
+    # head + summary + tail + new all preserved
     assert "head q" in contents
     assert "tail r" in contents
     assert f"{CONTEXT_SUMMARY_PREFIX}summary" in contents
@@ -724,6 +733,85 @@ async def test_load_context_filters_is_summarized_messages():
     # middle (is_summarized=True) filtered out
     assert "middle r" not in contents
     assert "middle q" not in contents
+    assert contents[1:] == [
+        "head q",
+        f"{CONTEXT_SUMMARY_PREFIX}summary",
+        "tail r",
+        "new q",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_context_drops_orphan_tool_messages():
+    """History loaded for a new Chat turn must not contain orphan tool messages."""
+    history = [
+        ConversationMessage(role="user", content="head q"),
+        ConversationMessage(
+            role="tool",
+            content='{"status":"success"}',
+            tool_call_id="call-orphan",
+            name="schedule_query",
+        ),
+        ConversationMessage(role="user", content="latest q"),
+    ]
+    memory_store = FakeMemoryStoreWithHistory(history=history)
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=FakeToolServiceForLLM(),
+        memory_store=memory_store,
+        summarizer=None,
+        context_engine=None,
+    )
+    state = await runner.load_context(AgentState(session_id="s1"))
+    assert [m.get("role") for m in state.working_messages] == ["system", "user", "user"]
+    assert not any(m.get("role") == "tool" for m in state.working_messages)
+
+
+@pytest.mark.asyncio
+async def test_load_context_sanitizes_tool_pair_split_by_summary_reorder():
+    """Summary reordering can separate an old assistant tool_call from its tool result."""
+    tool_call = {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "schedule_query", "arguments": "{}"},
+    }
+    history = [
+        ConversationMessage(role="user", content="head q"),
+        ConversationMessage(
+            role="assistant",
+            content={"content": "", "tool_calls": [tool_call]},
+        ),
+        ConversationMessage(role="user", content="middle", is_summarized=True),
+        ConversationMessage(
+            role="tool",
+            content='{"status":"success"}',
+            tool_call_id="call-1",
+            name="schedule_query",
+        ),
+        ConversationMessage(
+            role="user",
+            content=f"{CONTEXT_SUMMARY_PREFIX}summary",
+            is_summary=True,
+        ),
+        ConversationMessage(role="user", content="latest q"),
+    ]
+    memory_store = FakeMemoryStoreWithHistory(history=history)
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=FakeToolServiceForLLM(),
+        memory_store=memory_store,
+        summarizer=None,
+        context_engine=None,
+    )
+    state = await runner.load_context(AgentState(session_id="s1"))
+    contents = [str(m.get("content", "")) for m in state.working_messages]
+    assert contents[1:] == [
+        "head q",
+        f"{CONTEXT_SUMMARY_PREFIX}summary",
+        "latest q",
+    ]
+    assert not any(m.get("role") == "tool" for m in state.working_messages)
+    assert not any(m.get("tool_calls") for m in state.working_messages)
 
 
 @pytest.mark.asyncio

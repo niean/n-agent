@@ -463,6 +463,7 @@ async def test_compress_force_triggers_even_below_threshold():
         llm_provider=fake,
         context_length=10000, threshold_percent=0.50,
         protect_first_n=0, protect_last_n=0,
+        tail_budget_enabled=True,
     )
     msgs = [
         {"role": "user", "content": "q1"},
@@ -531,6 +532,7 @@ async def test_compress_tail_respects_token_budget_and_protect_last_count():
         protect_first_n=1,
         protect_last_n=2,
         summary_target_ratio=0.10,  # tail budget ~= 40 tokens
+        tail_budget_enabled=True,
     )
     msgs = [{"role": "user", "content": "head"}]
     for i in range(4):
@@ -546,6 +548,31 @@ async def test_compress_tail_respects_token_budget_and_protect_last_count():
     # When tail budget and protect_last_n conflict, implementation may keep only
     # budget-compatible recent messages, but must never split tool groups.
     assert len(result.messages) < len(msgs)
+
+
+@pytest.mark.asyncio
+async def test_compress_tail_budget_disabled_keeps_strict_tail_count():
+    fake = FakeLLMProvider(response=_make_llm_result("summary"))
+    c = make_compressor(
+        llm_provider=fake,
+        context_length=400,
+        threshold_percent=0.10,
+        protect_first_n=1,
+        protect_last_n=2,
+        summary_target_ratio=0.90,
+        tail_budget_enabled=False,
+    )
+    msgs = [{"role": "user", "content": "head"}]
+    for i in range(5):
+        msgs.append({"role": "user", "content": f"middle {i}"})
+    msgs.extend([
+        {"role": "user", "content": "tail 1"},
+        {"role": "user", "content": "tail 2"},
+    ])
+    result = await c.compress(msgs)
+    assert result.compressed is True
+    assert [m["content"] for m in result.messages[-2:]] == ["tail 1", "tail 2"]
+    assert len(result.messages) == 4  # head + summary + strict tail 2
 
 
 @pytest.mark.asyncio

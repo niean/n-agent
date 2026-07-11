@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class SQLiteMemoryStore:
-    def __init__(self, path: Path, *, migration_protect_first_n: int = 3, migration_protect_last_n: int = 20):
+    def __init__(self, path: Path, *, migration_protect_first_n: int = 3, migration_protect_last_n: int = 10):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._migration_protect_first_n = migration_protect_first_n
@@ -768,4 +768,3 @@ def _migrate_session_id_prefixes(conn: sqlite3.Connection) -> None:
         logger.info("session_id prefix migrated rows=%d", len(updates))
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
-

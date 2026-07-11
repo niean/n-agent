@@ -651,3 +651,11 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .observations-detail-header__back:hover { text-decoration: underline; }
 .observations-detail-header__sep { color: var(--color-border-default); }
 .observations-detail-header__id { color: var(--color-fg-muted); }
+.observations-json-section { margin-top: 16px; }
+.observations-json-section__title,
+.observations-json-section__toggle { margin-bottom: 6px; font-size: 13px; font-weight: 600; }
+.observations-json-section__toggle { display: inline-flex; align-items: center; gap: 6px; padding: 0; color: var(--color-fg-default); background: transparent; border: 0; cursor: pointer; }
+.observations-json-section__toggle:hover .observations-json-section__icon,
+.observations-json-section__toggle:focus-visible .observations-json-section__icon { opacity: 0.72; }
+.observations-json-section__icon { display: inline-flex; align-items: center; justify-content: center; width: 12px; height: 12px; color: var(--color-fg-subtle); font-size: 14px; line-height: 1; opacity: 0.42; transform: rotate(90deg); transition: opacity 0.15s ease, transform 0.15s ease; }
+.observations-json-section--collapsed .observations-json-section__icon { transform: rotate(0deg); }
