@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from inspect import isawaitable
@@ -19,7 +20,7 @@ from app.application.tool_service import ToolService
 from app.domain.agent import AgentState, RunStatus
 from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextEngine
 from app.domain.memory import MemoryStore, Summarizer
-from app.domain.provider import LLMEventType, LLMProvider, LLMResult
+from app.domain.provider import LLMEventType, LLMProvider, LLMResult, resolve_model
 from app.domain.session import ConversationMessage, Summary, TaskState, ToolCall
 from app.domain.tool import (
     ApprovalRequest,
@@ -35,6 +36,18 @@ from app.utils.memory_scrubber import scrub_memory_context
 
 logger = logging.getLogger(__name__)
 
+# Internal control keys in options that are NOT generation params and must
+# not be recorded as part of the Provider Request. Mirrors the filter in
+# OpenAICompatibleProvider._INTERNAL_OPTION_KEYS; duplicated here to keep
+# the application layer free of infrastructure imports.
+_INTERNAL_OPTION_KEYS = {
+    "tool_execution_context",
+    "tool_exposure_policy",
+    "execution_context_mode",
+    "external_memory_enabled",
+    "stream_event_sink",
+}
+
 
 class AgentGraphRunner:
     def __init__(
@@ -47,6 +60,8 @@ class AgentGraphRunner:
         external_memory_manager: ExternalMemoryManager | None = None,
         vision_capability: Optional[Callable[[], bool]] = None,
         context_engine: ContextEngine | None = None,
+        usage_service: Any = None,
+        skill_service: Any = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -56,6 +71,8 @@ class AgentGraphRunner:
         self.external_memory_manager = external_memory_manager
         self.vision_capability = vision_capability
         self.context_engine = context_engine
+        self.usage_service = usage_service
+        self.skill_service = skill_service
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -208,9 +225,25 @@ class AgentGraphRunner:
         messages = await self.memory_store.list_messages(state.session_id)
         summary = await self.memory_store.get_summary(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
-        context_messages = _filter_to_latest_summary(messages)
+        # 过滤掉已被摘要吸收的原始消息（is_summarized=1），避免 middle + summary 冗余。
+        unsummarized = [m for m in messages if not m.is_summarized]
+        context_messages = _filter_to_latest_summary(unsummarized)
+        # Deduplicate: callers (ChatCompletionService) persist user messages to
+        # memory_store before invoking the graph, so the same messages may
+        # appear both in context_messages (loaded from history) and in
+        # state.input_messages. Trim trailing context_messages that match
+        # input_messages to avoid sending duplicates to the LLM.
+        context_messages = _dedupe_trailing(context_messages, state.input_messages)
+        # 缓存 context_message_ids，供 compress_context 映射 middle 索引 -> 消息 id
+        state.context_message_ids = [m.id for m in context_messages]
+        skills_index: str | None = None
+        if self.skill_service is not None:
+            try:
+                skills_index = await self.skill_service.build_skills_index() or None
+            except Exception:
+                logger.warning("build_skills_index failed", exc_info=True)
         state.working_messages = [
-            {"role": "system", "content": build_system_prompt(self.external_memory_manager, enabled_override)},
+            {"role": "system", "content": build_system_prompt(self.external_memory_manager, enabled_override, skills_index)},
             *[_message_to_provider(message) for message in context_messages],
             *state.input_messages,
         ]
@@ -286,6 +319,26 @@ class AgentGraphRunner:
             logger.error("compress_context: append_summary_message failed: %s", exc)
             return state
 
+        # d.2 mark_messages_summarized：把 middle 段（被摘要吸收的原始消息）标记为
+        # is_summarized=1，下一次 load_context 时过滤掉，避免 middle + summary 冗余。
+        # result.summarized_message_indices 是相对于 compress 输入（non_system）的索引；
+        # non_system = context_messages + input_messages，前 len(context_message_ids) 个
+        # 是历史消息，后面是本轮新增。middle 只可能在历史消息范围内。
+        if result.summarized_message_indices:
+            ctx_ids = state.context_message_ids
+            ctx_len = len(ctx_ids)
+            middle_ids = [
+                ctx_ids[i] for i in result.summarized_message_indices
+                if 0 <= i < ctx_len
+            ]
+            if middle_ids:
+                try:
+                    await self.memory_store.mark_messages_summarized(state.session_id, middle_ids)
+                except Exception as exc:
+                    logger.warning(
+                        "compress_context: mark_messages_summarized failed: %s", exc,
+                    )
+
         # e. save_summary（source_message_id 关联新摘要消息 id；单行表，仅存最新摘要）
         if next_summary:
             try:
@@ -306,7 +359,64 @@ class AgentGraphRunner:
         # f. 更新 state（replace 成功后才写入）
         state.summary = next_summary
         state.working_messages = leading_system + result.messages
+
+        # ----- compression usage recording (T6) -----
+        # Only record when both before/after token counts are available
+        # (ContextCompressionResult.original_tokens / compressed_tokens may be None).
+        if (
+            self.usage_service is not None
+            and result.original_tokens is not None
+            and result.compressed_tokens is not None
+        ):
+            try:
+                await self.usage_service.record_compression(
+                    session_id=state.session_id,
+                    before_tokens=result.original_tokens,
+                    after_tokens=result.compressed_tokens,
+                )
+            except Exception:
+                logger.exception(
+                    "compression recording failed for session=%s", state.session_id,
+                )
+        # ----- end compression usage recording -----
         return state
+
+    def _resolve_usage_meta(self, model: str) -> tuple[str, str | None, str | None, str | None]:
+        """Derive (provider_kind, provider_name, real_model, requested_model) for usage recording.
+
+        ActiveProviderHolder exposes current_config (ProviderConfig with
+        provider_type, model). The runtime `model` arg may be a placeholder
+        id (e.g. "N-Agent") that the provider resolves to its configured model
+        internally; for admin-facing usage stats we want the real model name,
+        while preserving the originally requested name separately.
+
+        For raw providers without current_config (OpenAICompatibleProvider /
+        AnthropicProvider used directly, or test fakes), fall back to
+        default_model attr or the local `model` arg.
+        """
+        requested_model = model or None
+        config = getattr(self.llm_provider, "current_config", None)
+        if config is not None:
+            provider_type = getattr(config, "provider_type", None)
+            provider_kind = "anthropic" if provider_type == "anthropic" else "openai"
+            config_model = getattr(config, "model", None) or ""
+            real_model = resolve_model(model, config_model) or None
+            return provider_kind, provider_type, real_model, requested_model
+        default_model = getattr(self.llm_provider, "default_model", None) or ""
+        real_model = resolve_model(model, default_model) or None
+        return "openai", None, real_model, requested_model
+
+    def _resolve_trigger_type(self, state: AgentState) -> str:
+        """Classify what triggered this LLM call: 'tool' for continuation after
+        tool execution, 'user' for the first call in a turn."""
+        msgs = state.working_messages or []
+        for msg in reversed(msgs):
+            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+            if role == "tool":
+                return "tool"
+            if role == "user":
+                return "user"
+        return "user"
 
     async def call_llm(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
         if self.is_cancelled(state.session_id):
@@ -318,6 +428,7 @@ class AgentGraphRunner:
         configurable = (config or {}).get("configurable", {})
         model = configurable.get("model", "")
         options = configurable.get("options") or state.run_options
+        call_start = time.monotonic()
         try:
             tools = self.tool_service.list_openai_tools(
                 RiskLevel.SAFE if options.get("tool_exposure_policy") == "safe_only" else None,
@@ -341,13 +452,13 @@ class AgentGraphRunner:
                     state.pending_tool_calls = []
                     return state
 
-            # ----- 新增：外部记忆动态预取注入（临时构造 api_messages，不修改 state）-----
-            if self.external_memory_manager and len(state.working_messages) > 0:
+            # ----- 外部记忆动态预取注入（临时构造 api_messages，不修改 state）-----
+            if self.external_memory_manager and state.working_messages:
                 last_idx = len(state.working_messages) - 1
                 last_msg = state.working_messages[last_idx]
                 api_messages = state.working_messages.copy()
                 enabled_override: list[str] | None = state.run_options.get("external_memory_enabled")
-                if last_msg["role"] == "user":
+                if last_msg.get("role") == "user":
                     query_text = extract_text(last_msg["content"])
                     memory_context = self.external_memory_manager.prefetch_all(
                         query_text,
@@ -361,7 +472,7 @@ class AgentGraphRunner:
                 working_messages_for_call = api_messages
             else:
                 working_messages_for_call = state.working_messages
-            # ----- 结束新增 -----
+            # ----- 结束外部记忆动态预取注入 -----
 
             result = await self.llm_provider.chat(
                 working_messages_for_call,
@@ -374,6 +485,11 @@ class AgentGraphRunner:
                 state.error = "streaming provider result is not supported inside graph"
                 state.finish_reason = "error"
                 return state
+            # capture request JSON before working_messages is mutated below
+            request_json_cache = json.dumps(working_messages_for_call, default=str, ensure_ascii=False)
+            tools_json_cache = json.dumps(tools, default=str, ensure_ascii=False) if tools else None
+            gen_params = {k: v for k, v in options.items() if k not in _INTERNAL_OPTION_KEYS} if isinstance(options, dict) else {}
+            gen_params_json_cache = json.dumps(gen_params, default=str, ensure_ascii=False) if gen_params else None
             state.iteration_count += 1
             state.final_message = result.message
 
@@ -391,6 +507,46 @@ class AgentGraphRunner:
             if state.pending_tool_calls:
                 state.assistant_tool_messages.append(result.message)
             state.working_messages.append(result.message)
+
+            # ----- usage recording (T6) -----
+            # Record only when usage_service is wired AND provider returned a
+            # non-empty usage dict. provider_kind/provider/model are derived
+            # from llm_provider.current_config when available (ActiveProviderHolder);
+            # otherwise we fall back to the local `model` param and "openai"
+            # provider_kind (covers raw OpenAICompatibleProvider / test fakes).
+            if self.usage_service is not None and result.usage:
+                latency_ms = int((time.monotonic() - call_start) * 1000)
+                provider_kind, provider_name, real_model, requested_model = self._resolve_usage_meta(model)
+                trigger_type = self._resolve_trigger_type(state)
+                try:
+                    response_json = json.dumps(result.message, default=str, ensure_ascii=False)
+                    await self.usage_service.record_call(
+                        session_id=state.session_id,
+                        model=real_model,
+                        provider=provider_name,
+                        raw_usage=result.usage,
+                        latency_ms=latency_ms,
+                        provider_kind=provider_kind,
+                        requested_model=requested_model,
+                        trigger_type=trigger_type,
+                        request_messages=request_json_cache,
+                        response_message=response_json,
+                        tools=tools_json_cache,
+                        generation_params=gen_params_json_cache,
+                    )
+                    logger.info(
+                        "API call model=%s provider=%s in=%s out=%s total=%s latency=%dms",
+                        real_model, provider_name,
+                        result.usage.get("prompt_tokens", result.usage.get("input_tokens", 0)),
+                        result.usage.get("completion_tokens", result.usage.get("output_tokens", 0)),
+                        result.usage.get("total_tokens", 0),
+                        latency_ms,
+                    )
+                except Exception:
+                    logger.exception(
+                        "usage recording failed for session=%s", state.session_id,
+                    )
+            # ----- end usage recording -----
         except Exception as exc:
             state.error = str(exc)
             state.finish_reason = "error"
@@ -699,10 +855,11 @@ def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
 
 
 def _filter_to_latest_summary(messages: list[ConversationMessage]) -> list[ConversationMessage]:
-    """保留最新一条摘要 + 其后的所有消息；更早的消息（含旧摘要）由摘要代表，不进入上下文。
+    """保留全部非摘要消息 + 仅最新一条摘要；旧摘要从上下文剔除。
 
-    messages 表持久化所有摘要记录供 Dashboard 渲染；上下文只使用最新摘要。
-    无摘要时返回全部消息。
+    前置条件：调用方已过滤 is_summarized=1 的消息（middle 段已被标记）。
+    本函数只处理摘要消息：保留最新一条 summary，丢弃旧 summary。
+    非摘要消息（head + tail + new_msgs）全部保留。
     """
     latest_summary_idx = -1
     for idx in range(len(messages) - 1, -1, -1):
@@ -711,7 +868,39 @@ def _filter_to_latest_summary(messages: list[ConversationMessage]) -> list[Conve
             break
     if latest_summary_idx == -1:
         return list(messages)
-    return list(messages[latest_summary_idx:])
+    return [
+        m for idx, m in enumerate(messages)
+        if not m.is_summary or idx == latest_summary_idx
+    ]
+
+
+def _msg_role_content_key(msg: Any) -> tuple[str, str]:
+    """Normalize a message to a (role, content_text) key for dedup comparison."""
+    role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
+    content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+    if isinstance(content, list):
+        content = json.dumps(content, default=str, ensure_ascii=False)
+    elif not isinstance(content, str):
+        content = str(content or "")
+    return (role or "", content)
+
+
+def _dedupe_trailing(history: list, inputs: list) -> list:
+    """Drop trailing history entries that already appear in inputs.
+
+    Callers persist user messages to memory_store before invoking the graph,
+    so the same messages may show up in both history and inputs. Trim the
+    trailing history that matches inputs so the LLM doesn't see duplicates.
+    """
+    if not inputs:
+        return history
+    n = len(inputs)
+    if len(history) < n:
+        return history
+    tail = history[-n:]
+    if all(_msg_role_content_key(t) == _msg_role_content_key(i) for t, i in zip(tail, inputs)):
+        return history[:-n]
+    return history
 
 
 def _error_message_for_user(state: AgentState) -> str:

@@ -210,3 +210,33 @@ async def test_list_skills_filters_unsupported_for_llm():
     service = SkillService(registry, loader)
     visible = await service.list_for_llm()
     assert {s.name for s in visible} == {"a"}
+
+
+@pytest.mark.asyncio
+async def test_build_skills_index_groups_by_category():
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("alpha", relative_path="general/alpha/SKILL.md"))
+    await registry.upsert_skill(_skill("beta", relative_path="coding/beta/SKILL.md"))
+    await registry.upsert_skill(_skill("gamma", relative_path="coding/gamma/SKILL.md"))
+    await registry.upsert_skill(_skill("delta", readiness=SkillReadiness.UNSUPPORTED, relative_path="general/delta/SKILL.md"))
+    service = SkillService(registry, loader)
+    idx = await service.build_skills_index()
+    assert "<available_skills>" in idx
+    assert "</available_skills>" in idx
+    # general and coding categories both present
+    assert "  general:" in idx
+    assert "  coding:" in idx
+    # available skills listed
+    assert "alpha" in idx
+    assert "beta" in idx
+    assert "gamma" in idx
+    # unsupported skill excluded
+    assert "delta" not in idx
+
+
+@pytest.mark.asyncio
+async def test_build_skills_index_empty_when_no_skills():
+    registry, loader = FakeRegistry(), FakeLoader()
+    service = SkillService(registry, loader)
+    idx = await service.build_skills_index()
+    assert idx == ""

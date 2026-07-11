@@ -21,6 +21,7 @@ from .commands import (
     sessions,
     skill,
     status,
+    usage,
 )
 
 
@@ -462,6 +463,10 @@ def build_parser() -> argparse.ArgumentParser:
     _build_logs_parser(subparsers)
     _build_acp_parser(subparsers)
 
+    usage_parser = subparsers.add_parser("usage", help="Print token usage and context stats")
+    usage_parser.add_argument("session_id", nargs="?", default=None, help="Session ID (omit to list recent sessions)")
+    _add_format_flags(usage_parser)
+
     return parser
 
 
@@ -482,6 +487,7 @@ _DISPATCH = {
     "config": config.run,
     "logs": logs.run,
     "acp": acp.run,
+    "usage": usage.run,
 }
 
 

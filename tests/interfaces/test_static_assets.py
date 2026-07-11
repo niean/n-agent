@@ -352,7 +352,6 @@ def test_chat_builtin_memory_is_disabled_by_default(tmp_path):
     getter_body = chat_js[getter_start:getter_end]
 
     # 描述文案：未锁定提示默认关闭+互斥+锁定语义；锁定后提示已锁定
-    assert 'builtin 默认关闭' in render_body
     assert '文件记忆最多选择 1 个' in render_body
     assert '首轮发送后锁定' in render_body
     assert '此会话的记忆已锁定' in render_body
@@ -370,7 +369,6 @@ def test_chat_builtin_memory_is_disabled_by_default(tmp_path):
     assert "other !== pill && other.classList.contains('active') && other.dataset.slot === 'multi-project'" in render_body
     # active 状态不直接取 p.enabled_global（仅用于可见性过滤）
     assert 'pill.classList.add(\'active\')' in render_body
-    assert '重置为默认配置' in render_body
     assert "const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig" in getter_body
     assert "if (!config?.modified) return []" in getter_body
     assert 'function applySessionExternalMemoryState(detail)' in chat_js
@@ -486,7 +484,6 @@ def test_chat_memory_uses_toolbar_popover_grouped_picker(tmp_path):
     assert '.chat-memory-option.active' in css
     assert 'var(--color-primary)' in css
     assert 'var(--color-on-primary)' in css
-    assert '.chat-memory-popover__reset' in css
 
     # 旧折叠 CSS 已移除
     assert '.chat-external-memory__header' not in css

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、OpenAI-compatible 协议边界和 Docker Compose 数据挂载边界 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema（含 sessions token/cost 迁移列、usage_records/compression_stats 表）、OpenAI-compatible 协议边界和 Docker Compose 数据挂载边界，覆盖 Usage 观测值对象（CanonicalUsage/UsageCost/PricingEntry/SessionUsageStats/ContextBreakdown/UsageRecord/CompressionStat）与端口（UsageRecorder/PricingProvider/ContextBreakdownCalculator） -->
 # 数据与类型边界
 
 ## 领域模型
@@ -48,6 +48,26 @@
 `PermissionDecision`（`app/domain/tool.py`）：权限判定值对象，字段包括 allowed、reason。
 
 `ToolResult`（`app/domain/tool.py`）：工具执行结果，字段包括 tool_call_id、tool_name、status、content、duration_ms，其中 status 使用 ToolResultStatus。
+
+## Usage 观测模型
+
+`CanonicalUsage`（`app/domain/usage.py`）：归一化后的 token 五桶值对象（frozen dataclass），字段包括 input_tokens、output_tokens、cache_read_tokens、cache_write_tokens、reasoning_tokens、request_count、raw_usage。派生属性 `prompt_tokens`（= input_tokens + cache_read_tokens）、`total_tokens`（= input + output + cache_read + cache_write + reasoning）。raw_usage 保留 Provider 原始 usage dict 供调试。
+
+`UsageCost`（`app/domain/usage.py`）：成本估算值对象（frozen dataclass），字段包括 amount_usd（Decimal str）、status（`estimated`/`unknown`）、pricing_version。
+
+`PricingEntry`（`app/domain/usage.py`）：模型定价条目（frozen dataclass），字段包括 model_pattern、provider、input_cost_per_million、output_cost_per_million、cache_read_cost_per_million、cache_write_cost_per_million、pricing_version、source_url。`InMemoryPricingProvider` 按 model 前缀最长匹配查表。
+
+`SessionUsageStats`（`app/domain/usage.py`）：会话级累计统计值对象，字段包括 session_id、input_tokens、output_tokens、cache_read_tokens、cache_write_tokens、reasoning_tokens、total_tokens、api_call_count、estimated_cost_usd、cost_status。
+
+`ContextBreakdown`（`app/domain/usage.py`）：上下文分类 token 值对象（frozen dataclass），字段包括 system_prompt、tool_definitions、memory、conversation，派生属性 `total`。
+
+`UsageRecord` / `CompressionStat`（`app/domain/usage.py`）：单次调用记录 / 压缩记录值对象，分别映射 usage_records 和 compression_stats 表行。
+
+端口 `UsageRecorder`（`app/domain/usage.py`）：定义 record_call/get_session_stats/list_records/record_compression/list_compressions 接口。Infrastructure 的 `SqliteUsageRecorder`（`app/infrastructure/usage/sqlite_usage_recorder.py`）实现该端口，与 sessions.db 共享 path，sessions 表迁移幂等（PRAGMA table_info 检查列存在再 ALTER），async 方法内部直接调用同步 sqlite3（与 SQLiteMemoryStore 一致，技术债 D018）。
+
+端口 `PricingProvider`（`app/domain/usage.py`）：定义 `get_pricing(model, provider) -> PricingEntry | None`。Infrastructure 的 `InMemoryPricingProvider`（`app/infrastructure/usage/pricing_table.py`）硬编码 OpenAI/Anthropic/DeepSeek 主流模型定价，按 model 前缀最长匹配。
+
+端口 `ContextBreakdownCalculator`（`app/domain/usage.py`）：定义 `compute(system_prompt, tool_definitions, messages, external_memory_block) -> ContextBreakdown`。Infrastructure 的 `ContextBreakdownCalculatorImpl`（`app/infrastructure/usage/context_breakdown_calculator.py`）复用 ContextCompressor 的 ~4 chars/token 估算逻辑，按 system_prompt/tool_definitions/memory/conversation 四类分桶。
 
 ## Knowledge 模型
 
@@ -156,6 +176,23 @@ scheduled_tasks(id, name, prompt, cron_expression, timezone, enabled, status, se
 scheduled_task_executions(id, task_id, session_id, claim_id, lease_owner, claimed_next_run_at, started_at, completed_at, status, output, error, delivery_status, delivery_error, created_at)
 sandbox_released_history(id, session_id, sandbox_type, sandbox_id, created_at, released_at, reason)
 sandbox_execution_history(id, session_id, code_hash, code, result_json, status, duration_ms, authorized_callback_tools_json, created_at, execution_type)
+usage_records(id, session_id, model, provider, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, estimated_cost_usd, cost_status, latency_ms, created_at)
+compression_stats(id, session_id, before_tokens, after_tokens, tokens_saved, compression_ratio, created_at)
+```
+
+sessions 表 token/cost 列（迁移幂等，由 `SqliteUsageRecorder.init` 通过 `PRAGMA table_info` 检查列存在再 `ALTER TABLE ADD COLUMN`）：
+
+```sql
+input_tokens INTEGER DEFAULT 0
+output_tokens INTEGER DEFAULT 0
+cache_read_tokens INTEGER DEFAULT 0
+cache_write_tokens INTEGER DEFAULT 0
+reasoning_tokens INTEGER DEFAULT 0
+total_tokens INTEGER DEFAULT 0
+api_call_count INTEGER DEFAULT 0
+estimated_cost_usd REAL DEFAULT 0
+cost_status TEXT DEFAULT 'unknown'
+pricing_version TEXT
 ```
 
 providers 表唯一索引：
@@ -180,6 +217,8 @@ idx_scheduled_executions_task_created ON scheduled_task_executions(task_id, crea
 idx_sandbox_released_history_released_at ON sandbox_released_history(released_at)
 idx_sandbox_execution_history_created_at ON sandbox_execution_history(created_at)
 idx_sandbox_execution_history_session_created_at ON sandbox_execution_history(session_id, created_at)
+idx_usage_records_session ON usage_records(session_id)
+idx_compression_stats_session ON compression_stats(session_id)
 ```
 
 JSON 边界：

@@ -25,7 +25,10 @@
     if (!value) return '-';
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return value;
-    return date.toLocaleString();
+    // East-8 (Asia/Shanghai) regardless of browser timezone
+    const tz = new Date(date.getTime() + 8 * 3600 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${tz.getUTCFullYear()}-${pad(tz.getUTCMonth() + 1)}-${pad(tz.getUTCDate())} ${pad(tz.getUTCHours())}:${pad(tz.getUTCMinutes())}:${pad(tz.getUTCSeconds())}`;
   }
 
   function clear(node) {
@@ -86,6 +89,11 @@
   async function refresh() {
     const root = getRoot();
     if (!root) return;
+    // URL 回到列表规范路径时，重置 detail 视图（左导菜单点击会 pushState 到 /scheduled-tasks）
+    if (window.location.pathname === '/scheduled-tasks') {
+      state.view = 'list';
+      state.detail = null;
+    }
     state.loading = true;
     state.error = '';
     render();

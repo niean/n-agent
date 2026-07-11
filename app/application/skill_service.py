@@ -72,6 +72,34 @@ class SkillService:
             if s.readiness is SkillReadiness.AVAILABLE
         ]
 
+    async def build_skills_index(self) -> str:
+        """Build a compact skill index for the system prompt.
+
+        Returns a <available_skills>...</available_skills> block grouping skills
+        by category (name + description). Returns empty string when no skills
+        are available, so the caller can skip injection.
+        """
+        skills = await self.list_for_llm()
+        if not skills:
+            return ""
+        by_category: dict[str, list[tuple[str, str]]] = {}
+        for s in skills:
+            cat = _skill_category(s) or "general"
+            by_category.setdefault(cat, []).append((s.name, s.description or ""))
+        lines: list[str] = []
+        for category in sorted(by_category.keys()):
+            lines.append(f"  {category}:")
+            for name, desc in sorted(by_category[category], key=lambda x: x[0]):
+                if desc:
+                    lines.append(f"    - {name}: {desc}")
+                else:
+                    lines.append(f"    - {name}")
+        return (
+            "<available_skills>\n"
+            + "\n".join(lines) + "\n"
+            + "</available_skills>"
+        )
+
     async def get(self, name: str) -> Skill:
         skill = await self.registry.get_skill(name)
         if skill is None:
@@ -257,7 +285,12 @@ def skill_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(
             name="skills_list",
-            description="List available skills (only enabled and platform-supported).",
+            description=(
+                "Discover available procedural skills by name, description, category, and tags. "
+                "Use this before saying an installed capability is unavailable, especially for tasks "
+                "such as weather, forecasts, travel checks, operations, or other capability requests "
+                "that are not covered by direct tools."
+            ),
             input_schema={
                 "type": "object",
                 "properties": {"category": {"type": "string"}},
@@ -307,6 +340,7 @@ class SkillToolExecutor(ToolExecutor):
                         "name": s.name,
                         "description": s.description,
                         "category": _skill_category(s),
+                        "tags": list(s.frontmatter.tags),
                     }
                     for s in skills
                 ]
@@ -318,7 +352,10 @@ class SkillToolExecutor(ToolExecutor):
                     "skills": items,
                     "categories": categories,
                     "count": len(items),
-                    "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                    "hint": (
+                        "Choose the relevant skill by name/description/tags, then call "
+                        "skill_view(name) before answering or using other tools."
+                    ),
                 }
             elif request.name == "skill_view":
                 name = str(request.arguments.get("name") or "")

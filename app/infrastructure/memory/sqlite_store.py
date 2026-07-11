@@ -17,9 +17,11 @@ logger = logging.getLogger(__name__)
 
 
 class SQLiteMemoryStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, migration_protect_first_n: int = 3, migration_protect_last_n: int = 20):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migration_protect_first_n = migration_protect_first_n
+        self._migration_protect_last_n = migration_protect_last_n
         self.initialize()
 
     def initialize(self) -> None:
@@ -44,6 +46,7 @@ class SQLiteMemoryStore:
                     tool_call_id TEXT,
                     name TEXT,
                     is_summary INTEGER NOT NULL DEFAULT 0,
+                    is_summarized INTEGER NOT NULL DEFAULT 0,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
                 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -92,6 +95,12 @@ class SQLiteMemoryStore:
             self._ensure_sessions_external_memory_column(conn)
             self._ensure_sessions_acp_metadata_column(conn)
             self._migrate_add_is_summary_column(conn)
+            self._migrate_add_is_summarized_column(conn)
+            self._migrate_mark_legacy_middle_summarized(
+                conn,
+                protect_first_n=self._migration_protect_first_n,
+                protect_last_n=self._migration_protect_last_n,
+            )
             _initialize_gateway_schema(conn)
             _initialize_mcp_schema(conn)
 
@@ -160,8 +169,8 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -173,6 +182,7 @@ class SQLiteMemoryStore:
                     message.tool_call_id,
                     message.name,
                     1 if message.is_summary else 0,
+                    1 if message.is_summarized else 0,
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (message.created_at.isoformat(), session_id))
@@ -193,6 +203,7 @@ class SQLiteMemoryStore:
                 name=row["name"],
                 created_at=datetime.fromisoformat(row["created_at"]),
                 is_summary=bool(row["is_summary"]),
+                is_summarized=bool(row["is_summarized"]) if "is_summarized" in row.keys() else False,
             )
             for row in rows
         ]
@@ -336,8 +347,8 @@ class SQLiteMemoryStore:
             conn.execute(
                 """
                 INSERT INTO messages(id, session_id, role, content_json, created_at,
-                    provider_message_id, tool_call_id, name, is_summary)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider_message_id, tool_call_id, name, is_summary, is_summarized)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -349,6 +360,7 @@ class SQLiteMemoryStore:
                     message.tool_call_id,
                     message.name,
                     1,
+                    0,
                 ),
             )
             conn.execute(
@@ -356,6 +368,17 @@ class SQLiteMemoryStore:
                 (message.created_at.isoformat(), session_id),
             )
         return message
+
+    async def mark_messages_summarized(self, session_id: str, message_ids: list[str]) -> int:
+        if not message_ids:
+            return 0
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE messages SET is_summarized = 1 WHERE session_id = ? AND id IN (%s)"
+                % ",".join("?" * len(message_ids)),
+                [session_id, *message_ids],
+            )
+            return cur.rowcount
 
     async def delete_session(self, session_id: str) -> bool:
         with self._connect() as conn:
@@ -568,6 +591,57 @@ class SQLiteMemoryStore:
             "CREATE INDEX IF NOT EXISTS idx_messages_summary_session "
             "ON messages(session_id) WHERE is_summary = 1"
         )
+
+    @staticmethod
+    def _migrate_add_is_summarized_column(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "is_summarized" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN is_summarized INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _migrate_mark_legacy_middle_summarized(
+        conn: sqlite3.Connection, *, protect_first_n: int, protect_last_n: int,
+    ) -> None:
+        """一次性数据迁移：把存量会话中已被摘要吸收的 middle 消息标记为 is_summarized=1。
+
+        存量会话在 is_summarized 字段引入前已压缩过，middle 消息 is_summarized=0，
+        load 时不会被过滤，导致 middle + summary 冗余。本迁移对每个有 summary 的会话，
+        把"最新 summary 之前、head 之后、tail 之前"的非 summary 消息标记为 is_summarized=1。
+        head = 前 protect_first_n 条，tail = 最新 summary 之前最后 protect_last_n 条。
+        """
+        rows = conn.execute(
+            """
+            SELECT session_id, MAX(created_at) as latest_summary_at
+            FROM messages WHERE is_summary = 1
+            GROUP BY session_id
+            """
+        ).fetchall()
+        for row in rows:
+            session_id = row["session_id"]
+            latest_summary_at = row["latest_summary_at"]
+            msgs = conn.execute(
+                """
+                SELECT id FROM messages
+                WHERE session_id = ? AND is_summary = 0 AND is_summarized = 0
+                  AND created_at < ?
+                ORDER BY created_at ASC
+                """,
+                (session_id, latest_summary_at),
+            ).fetchall()
+            total = len(msgs)
+            if total <= protect_first_n + protect_last_n:
+                continue
+            ids_to_mark = [
+                msgs[i]["id"]
+                for i in range(protect_first_n, total - protect_last_n)
+            ]
+            if not ids_to_mark:
+                continue
+            placeholders = ",".join("?" * len(ids_to_mark))
+            conn.execute(
+                f"UPDATE messages SET is_summarized = 1 WHERE id IN ({placeholders})",
+                ids_to_mark,
+            )
 
     def migrate_session_id_prefixes(self) -> None:
         """Migrate historical session_id prefixes and source values to new format.

@@ -38,6 +38,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Any = None
     temperature: float | None = None
     max_tokens: int | None = None
+    top_p: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     options: dict[str, Any] = Field(default_factory=dict)
 
@@ -96,7 +97,7 @@ def create_openai_compatible_router(chat_service: ChatCompletionService, model_s
             messages=normalized_messages,
             stream=request.stream,
             metadata=request.metadata,
-            options=request.options,
+            options=_merge_generation_params(request),
             session_id=x_session_id,
         )
         result = await chat_service.complete(app_input)
@@ -115,6 +116,21 @@ def create_openai_compatible_router(chat_service: ChatCompletionService, model_s
         return _completion_response(result)
 
     return router
+
+
+def _merge_generation_params(request: ChatCompletionRequest) -> dict[str, Any]:
+    """Merge top-level generation params (temperature/max_tokens/top_p) into
+    the caller-provided options dict. Caller-provided options take precedence
+    so advanced callers can override per-call."""
+    merged: dict[str, Any] = {}
+    if request.temperature is not None:
+        merged["temperature"] = request.temperature
+    if request.max_tokens is not None:
+        merged["max_tokens"] = request.max_tokens
+    if request.top_p is not None:
+        merged["top_p"] = request.top_p
+    merged.update(request.options)
+    return merged
 
 
 def _completion_response(result: ChatCompletionResult) -> dict[str, Any]:

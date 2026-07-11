@@ -647,7 +647,7 @@
     // 描述文案（作为 label 的 title tooltip，同时保留字符串供锁定提示）
     const descText = locked
       ? '此会话的记忆已锁定'
-      : 'builtin 默认关闭；文件记忆最多选择 1 个；首轮发送后锁定';
+      : '文件记忆最多选择 1 个；首轮发送后锁定';
 
     const bar = document.createElement('div');
     bar.className = 'chat-memory-bar';
@@ -808,23 +808,6 @@
         empty.className = 'chat-memory-popover__empty';
         empty.textContent = '暂无可用记忆';
         popover.appendChild(empty);
-      }
-
-      if (useSessionConfig && !locked) {
-        const resetBtn = document.createElement('button');
-        resetBtn.className = 'chat-memory-popover__reset';
-        resetBtn.type = 'button';
-        resetBtn.textContent = '重置为默认配置';
-        resetBtn.addEventListener('click', () => {
-          if (currentSessionId) {
-            delete sessionExternalMemoryConfig[currentSessionId];
-          } else {
-            draftExternalMemoryConfig = null;
-          }
-          externalMemoryTouched = false;
-          renderExternalMemoryUI();
-        });
-        popover.appendChild(resetBtn);
       }
 
       container.appendChild(popover);

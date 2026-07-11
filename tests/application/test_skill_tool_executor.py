@@ -13,7 +13,7 @@ from app.domain.tool import RiskLevel, ToolCallRequest, ToolResultStatus, ToolSo
 
 def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path=None):
     fm = SkillFrontmatter(
-        name=name, description="d", version="", platforms=["linux"], tags=[],
+        name=name, description="d", version="", platforms=["linux"], tags=["weather"] if name == "weather" else [],
         related_skills=[], author="", license="", setup_help=None,
         required_env_vars=[], raw={"name": name},
     )
@@ -72,6 +72,8 @@ class FakeLoader:
 def test_skill_tool_definitions_metadata():
     defs = {d.name: d for d in skill_tool_definitions()}
     assert set(defs.keys()) == {"skills_list", "skill_view"}
+    assert "unavailable" in defs["skills_list"].description
+    assert "weather" in defs["skills_list"].description
     for d in defs.values():
         assert d.risk_level is RiskLevel.SAFE
         assert d.source_type is ToolSourceType.BUILTIN
@@ -94,6 +96,7 @@ async def test_skills_list_returns_visible_only():
     assert {item["name"] for item in payload["skills"]} == {"a"}
     assert payload["count"] == 1
     assert "hint" in payload and "categories" in payload
+    assert "tags" in payload["skills"][0]
 
 
 @pytest.mark.asyncio

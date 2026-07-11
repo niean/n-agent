@@ -30,6 +30,7 @@ from app.application.session_service import SessionService
 from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
 from app.application.plugin_service import PluginService, PluginToolExecutor
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
+from app.application.usage_service import UsageService
 from app.application.vision_tool_executor import VisionAnalyzeToolExecutor
 from app.config import Settings
 from app.domain.knowledge import KnowledgeBaseType
@@ -62,6 +63,9 @@ from app.infrastructure.registry.sqlite_plugin_registry import SQLitePluginRegis
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
+from app.infrastructure.usage.context_breakdown_calculator import ContextBreakdownCalculatorImpl
+from app.infrastructure.usage.pricing_table import InMemoryPricingProvider
+from app.infrastructure.usage.sqlite_usage_recorder import SqliteUsageRecorder
 from app.domain.external_memory import ExternalMemoryConfigRegistry
 from app.domain.external_memory_provider import ExternalMemoryProviderType
 from app.application.external_memory_manager import ExternalMemoryManager
@@ -230,13 +234,18 @@ class ApplicationServices:
     platform_registry: PlatformRegistry
     platform_service: PlatformService
     health_snapshot: Callable[[], dict]
+    usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
     sandbox_manager: "_SandboxManager | None" = None
 
 
 def build_application_services(settings: Settings | None = None) -> ApplicationServices:
     settings = settings or Settings()
-    memory_store = SQLiteMemoryStore(settings.sqlite_path)
+    memory_store = SQLiteMemoryStore(
+        settings.sqlite_path,
+        migration_protect_first_n=settings.context_compression_protect_first_n,
+        migration_protect_last_n=settings.context_compression_protect_last_n,
+    )
     summarizer = HeuristicSummarizer()
     registry = SQLiteProviderRegistry(settings.sqlite_path)
     gateway_registry = SQLiteGatewaySessionRegistry(settings.sqlite_path)
@@ -477,6 +486,18 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             cooldown_seconds=settings.context_compression_cooldown_seconds,
             fallback_summarizer=summarizer,
         )
+    # Usage assembly (T7): recorder/pricing/breakdown -> UsageService -> runner.
+    # SqliteUsageRecorder.init is async but performs synchronous sqlite3 DDL;
+    # run via _run_sync so build_application_services stays callable from sync
+    # contexts (CLI/tests). Sessions table already exists at this point because
+    # SQLiteMemoryStore.initialize() runs in its __init__.
+    usage_recorder = SqliteUsageRecorder(str(settings.sqlite_path))
+    _run_sync(usage_recorder.init())
+    usage_service = UsageService(
+        usage_recorder,
+        InMemoryPricingProvider(),
+        ContextBreakdownCalculatorImpl(),
+    )
     graph_runner = AgentGraphRunner(
         holder,
         tool_service,
@@ -486,6 +507,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         external_memory_manager=external_memory_manager,
         vision_capability=lambda: bool(holder.current_config and holder.current_config.supports_vision),
         context_engine=context_engine,
+        usage_service=usage_service,
+        skill_service=skill_service,
     )
     session_service = SessionService(
         memory_store,
@@ -825,6 +848,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         platform_registry=platform_registry,
         platform_service=platform_service,
         health_snapshot=health_snapshot,
+        usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
         sandbox_manager=sandbox_manager if settings.sandbox_enabled else None,
     )
@@ -907,6 +931,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             external_memory_service=services.external_memory_service,
             external_memory_provider_service=services.external_memory_provider_service,
             sandbox_dashboard_service=services.sandbox_dashboard_service,
+            usage_service=services.usage_service,
+            memory_store=services.memory_store,
         )
     )
     return app

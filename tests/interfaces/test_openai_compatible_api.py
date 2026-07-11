@@ -21,6 +21,7 @@ class FakeProvider:
         self.calls = 0
         self.tool_name = tool_name
         self.final_content = final_content
+        self.last_options: dict | None = None
 
     async def list_models(self):
         return [ModelInfo("test-model", "test-model", "fake")]
@@ -30,6 +31,7 @@ class FakeProvider:
 
     async def chat(self, messages, tools, stream, model, options):
         self.calls += 1
+        self.last_options = options
         if messages and messages[-1].get("role") == "tool":
             return LLMResult({"role": "assistant", "content": self.final_content}, "stop")
         if messages and "tool" in str(messages[-1].get("content", "")):
@@ -370,3 +372,78 @@ def test_openai_chat_completion_provider_error_returns_500_not_400(tmp_path):
     )
 
     assert response.status_code == 500
+
+
+def test_openai_chat_completion_merges_top_level_generation_params(tmp_path):
+    """Top-level temperature/max_tokens/top_p fields should be merged into
+    the options dict passed to the provider, so they reach the LLM and are
+    captured in usage recording."""
+    provider = FakeProvider()
+    client, _ = build_client(tmp_path, provider=provider)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "metadata": {"session_id": "s-gen"},
+            "temperature": 0.5,
+            "max_tokens": 100,
+            "top_p": 0.9,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert provider.last_options is not None
+    assert provider.last_options.get("temperature") == 0.5
+    assert provider.last_options.get("max_tokens") == 100
+    assert provider.last_options.get("top_p") == 0.9
+
+
+def test_openai_chat_completion_options_dict_overrides_top_level(tmp_path):
+    """When the same param is provided both as a top-level field and inside
+    the options dict, the options dict wins (advanced callers can override)."""
+    provider = FakeProvider()
+    client, _ = build_client(tmp_path, provider=provider)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "metadata": {"session_id": "s-override"},
+            "temperature": 0.5,
+            "max_tokens": 100,
+            "options": {"temperature": 0.9},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert provider.last_options is not None
+    assert provider.last_options.get("temperature") == 0.9
+    assert provider.last_options.get("max_tokens") == 100
+
+
+def test_openai_chat_completion_omits_unset_generation_params(tmp_path):
+    """When generation params are not set, they should not appear in options
+    (avoids sending null values to provider)."""
+    provider = FakeProvider()
+    client, _ = build_client(tmp_path, provider=provider)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "metadata": {"session_id": "s-none"},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert provider.last_options is not None
+    assert "temperature" not in provider.last_options
+    assert "max_tokens" not in provider.last_options
+    assert "top_p" not in provider.last_options

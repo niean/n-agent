@@ -6,6 +6,7 @@
     sessions: false,
     models: false,
     status: false,
+    observations: false,
     'scheduled-tasks': false,
     platforms: false,
     memory: false,

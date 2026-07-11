@@ -14,8 +14,9 @@
     { tab: 'tools-builtin', path: '/tools/builtin', label: 'Builtin', parentTab: 'tools' },
     { tab: 'sandbox', path: '/sandbox', label: '沙盒' },
     { tab: 'models', path: '/models', label: '模型' },
+    { tab: 'observations', path: '/chat/observations', label: '观测' },
     { tab: 'platforms', path: '/platforms', label: '平台' },
-    { tab: 'status', path: '/status', label: '观测' },
+    { tab: 'status', path: '/status', label: '健康' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
   const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));
@@ -35,6 +36,7 @@
     const path = window.location.pathname;
     if (tabByPath[path]) return tabByPath[path];
     if (path.startsWith('/scheduled-tasks/')) return 'scheduled-tasks';
+    if (path.startsWith('/chat/observations/')) return 'observations';
     if (path === '/tools/external-memory') return 'memory';
     if (path === '/tools/sandbox') return 'sandbox';
     if (path === '/tools') return TOOLS_DEFAULT_CHILD;
@@ -93,10 +95,9 @@
     }
     const path = pathByTab[name];
     if (!path) return;
-    // 当前已在目标 tab 的路径或其子路径上时，不覆盖 URL（保留子路径状态，如
-    // /scheduled-tasks/{task_id}），只切换 tab 高亮。
-    const current = window.location.pathname;
-    if (current !== path && !current.startsWith(path + '/')) {
+    // 点击菜单一律跳到规范路径，清掉子路径（如 /chat/observations/{sid}、
+    // /scheduled-tasks/{id}）。模块的 render/refresh 负责按新 URL 切换视图。
+    if (window.location.pathname !== path) {
       history.pushState({ tab: name }, '', path);
     }
     applyTab(name);

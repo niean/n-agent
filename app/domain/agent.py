@@ -48,3 +48,4 @@ class AgentState:
     finish_reason: str | None = None
     run_options: dict[str, Any] = field(default_factory=dict)
     stream_tool_events: list[Any] = field(default_factory=list)
+    context_message_ids: list[str] = field(default_factory=list)

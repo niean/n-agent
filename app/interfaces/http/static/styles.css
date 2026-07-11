@@ -469,21 +469,6 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
   color: var(--color-fg-subtle);
   font-size: 13px;
 }
-.chat-memory-popover__reset {
-  margin-top: 12px;
-  padding: 0;
-  font-size: 12px;
-  color: var(--color-fg-subtle);
-  background: transparent;
-  border: 0;
-  cursor: pointer;
-  text-decoration: underline;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-.chat-memory-popover__reset:hover {
-  color: var(--color-primary-strong);
-}
 
 .checkbox-list {
   display: grid;
@@ -645,3 +630,24 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .sandbox-detail-meta { font-size: 12px; color: var(--color-fg-muted); }
 .sandbox-callback-log-table { font-size: 12px; }
 .sandbox-callback-log-table th, .sandbox-callback-log-table td { padding: 4px 8px; }
+
+/* Observations: context breakdown bar chart */
+.breakdown-row { display: flex; flex-direction: column; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--color-border-light); }
+.breakdown-row:last-child { border-bottom: none; }
+.breakdown-row__head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.breakdown-row__name { font-size: 13px; color: var(--color-fg-default); }
+.breakdown-row__stat { font-size: 12px; color: var(--color-fg-muted); font-variant-numeric: tabular-nums; }
+.breakdown-row__track { width: 100%; height: 8px; background: var(--color-bg-default); border: 1px solid var(--color-border-light); border-radius: 4px; overflow: hidden; }
+.breakdown-row__fill { height: 100%; background: var(--color-primary); border-radius: 3px; transition: width 0.2s ease; }
+
+/* Observations: pager */
+.observations-pager { margin-top: 12px; }
+.observations-pager__info { font-size: 12px; color: var(--color-fg-muted); font-variant-numeric: tabular-nums; }
+.observations-pager__ctrl .btn { min-width: 32px; }
+.observations-pager__dots { padding: 0 6px; color: var(--color-fg-subtle); }
+.observations-stats-bar { margin-bottom: 0; }
+.observations-detail-header { display: flex; align-items: center; gap: 12px; padding: 8px 0 16px; font-size: 13px; }
+.observations-detail-header__back { color: var(--color-primary); text-decoration: none; }
+.observations-detail-header__back:hover { text-decoration: underline; }
+.observations-detail-header__sep { color: var(--color-border-default); }
+.observations-detail-header__id { color: var(--color-fg-muted); }

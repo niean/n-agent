@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射、TUI 一次会话完整执行链路、多模态内容归一化与 vision 能力守卫、上下文短期记忆增量压缩与摘要持久化（双标记 + a-f 顺序 + replace_summary_message 单事务 + 双写降级） -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射、TUI 一次会话完整执行链路、多模态内容归一化与 vision 能力守卫、上下文短期记忆增量压缩与摘要持久化（双标记 + a-f 顺序 + replace_summary_message 单事务 + 双写降级）、观测与 Token 统计 DDD 装配（五桶归一化 + Decimal 成本估算 + sessions 迁移 + usage_records/compression_stats 持久化 + Dashboard/CLI 双界面） -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -661,3 +661,25 @@ LLM 摘要失败回退：
 - cooldown 用 wall clock 会让测试等待真实时间，应注入 `_clock` callable 用 fake clock 验证
 - `replace_summary_message` 非单事务实现会在 DELETE 后 INSERT 之间因进程崩溃遗留 0 条或多条摘要消息，破坏"最多 1 条"不变量
 - `save_summary` 失败时回滚 messages 表会让下次 load_context 加载到新摘要但 summaries 表无对应记录，Dashboard 显示滞后；正确降级是接受 Dashboard 滞后一轮不回滚
+
+## 模式二十三：观测与 Token 统计 DDD 装配
+
+Agent Runtime 在每次 LLM 调用后需归一化 usage（五桶 token + 成本）并持久化，供 Dashboard 观测页和 CLI 子命令查询。观测能力通过 DDD 四层装配实现，Domain 定义值对象与端口，Application 编排归一化/估算/持久化，Infrastructure 提供 SQLite 持久化与硬编码价格表，Interfaces 暴露 Dashboard 观测页与 CLI usage 子命令。
+
+装配链路：
+1. Domain 值对象与端口（`app/domain/usage.py`）：`CanonicalUsage`（五桶 frozen dataclass，`prompt_tokens`/`total_tokens` 派生属性）、`UsageCost`（Decimal amount_usd + status + pricing_version）、`PricingEntry`、`SessionUsageStats`、`ContextBreakdown`（四类 token + total 派生）、`UsageRecord`/`CompressionStat`；端口 `UsageRecorder`/`PricingProvider`/`ContextBreakdownCalculator`
+2. Application 用例（`app/application/usage_service.py`）：`UsageService` 编排 `normalize_usage`（OpenAI prompt_tokens/completion_tokens + prompt_tokens_details.cached_tokens + completion_tokens_details.reasoning_tokens 五桶归一化；Anthropic input_tokens/output_tokens/cache_creation_input_tokens/cache_read_input_tokens 归一化）、`estimate_cost`（Decimal 精度，`get_pricing` 命中时按桶分别计算 amount_usd 并 status='estimated'，未命中 status='unknown' 且 amount_usd=0）、`record_call`/`get_session_stats`/`list_records`/`record_compression`/`list_compressions`/`get_context_breakdown`
+3. Infrastructure 实现（`app/infrastructure/usage/`）：`SqliteUsageRecorder` 实现 `UsageRecorder`，sessions 表迁移幂等（`_COLUMN_SPECS` table + PRAGMA table_info 检查列存在再 ALTER），`record_call` 在单连接内 INSERT usage_records + UPDATE sessions 累加（`input_tokens = input_tokens + ?` 等增量累加，`api_call_count = api_call_count + 1`）；`InMemoryPricingProvider` 硬编码 9 款主流模型定价，`get_pricing` 按 model 前缀最长匹配；`ContextBreakdownCalculatorImpl` 复用 ContextCompressor 的 ~4 chars/token 估算逻辑按 system_prompt/tool_definitions/memory/conversation 四类分桶
+4. agent_graph 集成（`app/application/agent_graph.py`）：`call_llm` 在 LLM 调用前捕获 `call_start = time.monotonic()`，调用后从 `LLMResult.usage` 提取 raw_usage 调 `usage_service.record_call(session_id, model, provider, raw_usage, latency_ms, provider_kind)`，record 成功后输出 `logger.info("API call model=... provider=... in=... out=... total=... latency=Nms")`；`compress_context` 在 `result.compressed=True` 时调 `usage_service.record_compression(session_id, before_tokens, after_tokens)`；usage_service 为 None 或 record 异常均不阻塞主流程
+5. main.py 装配（`app/main.py`）：组装 `UsageService(SqliteUsageRecorder, InMemoryPricingProvider, ContextBreakdownCalculatorImpl)`，`_run_sync` 处理 async init；`ApplicationServices.usage_service` 暴露；`AgentGraphRunner(usage_service=...)` 和 `create_dashboard_router(usage_service=...)` 注入
+6. Interfaces 暴露（`app/interfaces/http/usage_routes.py` + `app/interfaces/cli/commands/usage.py` + `app/interfaces/http/static/observations.js`）：HTTP `/chat/usage/sessions/{id}` 系列端点（records 端点 `limit: int = Query(50, ge=1, le=500)` 防越界，breakdown 端点 list_messages/tool_service 失败 `logger.warning(..., exc_info=True)` 降级空列表不阻塞响应）；CLI `n-agent usage [session_id]` 沿用 `_load_usage_service()` inline 模式；Dashboard 观测页三段布局（6 卡片总览 + 4 类条形图 + 调用历史表格 + 压缩收益折叠区），全 textContent 渲染
+
+陷阱：
+- `usage_records` 与 `compression_stats` 表未加 `ON DELETE CASCADE` 会让删除 session 后历史残留，违反 Chat Session 级联清理预期；正确做法是 FK 引用 sessions.id ON DELETE CASCADE
+- `record_call` 非单连接事务实现会在 INSERT usage_records 后 UPDATE sessions 失败时遗留孤立项；正确做法是单连接 try/finally close
+- `record_compression` 未对 `saved = before_tokens - after_tokens` clamp 负值会在压缩后 token 反而增加时记录负数 saved，Dashboard 显示混乱；正确做法是 `max(before-after, 0)`
+- `limit` 参数未做上界校验会让恶意请求 `?limit=999999999` 拖垮 SQLite；正确做法是 `Query(50, ge=1, le=500)`
+- bare `except Exception:` 不记录日志会让 memory_store.list_messages / tool_service.list_definitions 故障被静默吞掉，观测页 breakdown 显示 0 但实际是异常；正确做法是 `logger.warning(..., exc_info=True)` 后降级空列表
+- Domain 值对象直接 import Infrastructure 会让 DDD 边界破坏（如 ContextBreakdownCalculator 直接依赖 ContextCompressor）；正确做法是 Domain 定义 Protocol，Infrastructure 实现，Application 通过 Protocol 注入
+- 价格表硬编码到 Domain 会让 Domain 依赖具体定价数据违反纯领域原则；正确做法是 Domain 定义 `PricingProvider` 端口 + `PricingEntry` 值对象，Infrastructure 实现 InMemoryPricingProvider
+- async 方法内部直接调用同步 sqlite3 会阻塞事件循环（与 SQLiteMemoryStore 一致，技术债 D018）；正确做法是 `asyncio.to_thread` 包装，但本期不修复保持与现有 pattern 一致

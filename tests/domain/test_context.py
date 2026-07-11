@@ -43,5 +43,5 @@ def test_context_compression_result_field_names():
     fields = ContextCompressionResult.__dataclass_fields__.keys()
     assert set(fields) == {
         "messages", "summary", "compressed", "skipped_reason",
-        "original_tokens", "compressed_tokens",
+        "original_tokens", "compressed_tokens", "summarized_message_indices",
     }

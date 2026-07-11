@@ -158,3 +158,90 @@ async def test_append_summary_message_preserves_plain_message_with_prefix(store)
         f"{CONTEXT_SUMMARY_PREFIX}real old",
         f"{CONTEXT_SUMMARY_PREFIX}real new",
     ]
+
+
+@pytest.mark.asyncio
+async def test_migrate_mark_legacy_middle_summarized(tmp_path):
+    """存量数据迁移：已有 summary 但 middle 未标记 is_summarized 的会话，
+    迁移后 middle 被标记，head 和 tail 保护。"""
+    import json as _json
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE messages("
+            "id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content_json TEXT, "
+            "created_at TEXT, provider_message_id TEXT, tool_call_id TEXT, name TEXT, "
+            "is_summary INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE sessions("
+            "id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, source TEXT, "
+            "external_memory_enabled_json TEXT, external_memory_slots_json TEXT, acp_metadata_json TEXT)"
+        )
+        sid = "legacy-session-1"
+        base = datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+        for i in range(30):
+            conn.execute(
+                "INSERT INTO messages(id, session_id, role, content_json, created_at, "
+                "provider_message_id, tool_call_id, name, is_summary) "
+                "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0)",
+                (f"m{i}", sid, "user", _json.dumps(f"msg{i}"), base.replace(second=i).isoformat()),
+            )
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content_json, created_at, "
+            "provider_message_id, tool_call_id, name, is_summary) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 1)",
+            ("s1", sid, "user", _json.dumps(f"{CONTEXT_SUMMARY_PREFIX}summary"), base.replace(second=40).isoformat()),
+        )
+    store = SQLiteMemoryStore(
+        db_path, migration_protect_first_n=3, migration_protect_last_n=20,
+    )
+    msgs = await store.list_messages(sid)
+    assert msgs[0].is_summarized is False
+    assert msgs[1].is_summarized is False
+    assert msgs[2].is_summarized is False
+    for i in range(3, 10):
+        assert msgs[i].is_summarized is True, f"msg {i} should be marked"
+    for i in range(10, 30):
+        assert msgs[i].is_summarized is False, f"msg {i} should be protected"
+    assert msgs[30].is_summarized is False
+    assert msgs[30].is_summary is True
+
+
+@pytest.mark.asyncio
+async def test_migrate_mark_legacy_middle_idempotent(tmp_path):
+    """迁移幂等：重复 initialize 不会重复标记。"""
+    import json as _json
+    db_path = tmp_path / "legacy2.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE messages("
+            "id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content_json TEXT, "
+            "created_at TEXT, provider_message_id TEXT, tool_call_id TEXT, name TEXT, "
+            "is_summary INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE sessions("
+            "id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, source TEXT, "
+            "external_memory_enabled_json TEXT, external_memory_slots_json TEXT, acp_metadata_json TEXT)"
+        )
+        sid = "legacy-session-2"
+        base = datetime(2026, 7, 1, 0, 0, 0, tzinfo=timezone.utc)
+        for i in range(30):
+            conn.execute(
+                "INSERT INTO messages(id, session_id, role, content_json, created_at, "
+                "provider_message_id, tool_call_id, name, is_summary) "
+                "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0)",
+                (f"m{i}", sid, "user", _json.dumps(f"msg{i}"), base.replace(second=i).isoformat()),
+            )
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content_json, created_at, "
+            "provider_message_id, tool_call_id, name, is_summary) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 1)",
+            ("s1", sid, "user", _json.dumps(f"{CONTEXT_SUMMARY_PREFIX}summary"), base.replace(second=40).isoformat()),
+        )
+    store = SQLiteMemoryStore(db_path, migration_protect_first_n=3, migration_protect_last_n=20)
+    store.initialize()
+    msgs = await store.list_messages(sid)
+    middle_marked = [m for m in msgs[3:10] if m.is_summarized]
+    assert len(middle_marked) == 7

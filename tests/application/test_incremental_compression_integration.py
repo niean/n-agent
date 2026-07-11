@@ -87,13 +87,20 @@ async def test_incremental_compression_second_round_uses_iterative_path(tmp_path
     assert state2.summary == "summary round 2"
     msgs2 = await store.list_messages(sid)
     summaries2 = [m for m in msgs2 if m.is_summary]
-    assert len(summaries2) == 1
-    assert summaries2[0].content == f"{CONTEXT_SUMMARY_PREFIX}summary round 2"
+    # append 语义：2 轮压缩后 messages 表保留 2 条摘要（spec: 保留所有摘要记录）
+    assert len(summaries2) == 2
+    # 最新摘要是 round 2
+    assert summaries2[-1].content == f"{CONTEXT_SUMMARY_PREFIX}summary round 2"
+    # 旧摘要保留
+    assert summaries2[0].content == f"{CONTEXT_SUMMARY_PREFIX}summary round 1"
 
 
 @pytest.mark.asyncio
-async def test_incremental_compression_summary_replaced_not_accumulated(tmp_path):
-    """多次压缩后 messages 表 is_summary=1 的消息只有 1 条（最新摘要）"""
+async def test_incremental_compression_summary_accumulated_not_replaced(tmp_path):
+    """多次压缩后 messages 表保留所有摘要记录（append 语义），最新摘要是最后一轮的产物。
+
+    spec: 持久化messages表保留所有摘要记录，上下文只使用最新的摘要。
+    """
     store = SQLiteMemoryStore(tmp_path / "test.db")
     llm = FakeLLM()
     compressor = ContextCompressor(
@@ -125,5 +132,13 @@ async def test_incremental_compression_summary_replaced_not_accumulated(tmp_path
 
     msgs = await store.list_messages(sid)
     summaries = [m for m in msgs if m.is_summary]
-    assert len(summaries) == 1
-    assert summaries[0].content == f"{CONTEXT_SUMMARY_PREFIX}summary round 3"
+    # append 语义：3 轮压缩后保留 3 条摘要
+    assert len(summaries) == 3
+    # 最新摘要是 round 3
+    assert summaries[-1].content == f"{CONTEXT_SUMMARY_PREFIX}summary round 3"
+    # 所有历史摘要按顺序保留
+    assert [s.content for s in summaries] == [
+        f"{CONTEXT_SUMMARY_PREFIX}summary round 1",
+        f"{CONTEXT_SUMMARY_PREFIX}summary round 2",
+        f"{CONTEXT_SUMMARY_PREFIX}summary round 3",
+    ]

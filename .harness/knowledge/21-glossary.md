@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、CliChatAdapter、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语，ContextEngine/ContextCompressor/ContextCompressionResult/compress_context/三段式压缩/增量压缩/CONTEXT_SUMMARY_PREFIX/is_summary 双标记/Cooldown 等上下文短期记忆压缩相关术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、CliChatAdapter、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语，ContextEngine/ContextCompressor/ContextCompressionResult/compress_context/三段式压缩/增量压缩/CONTEXT_SUMMARY_PREFIX/is_summary 双标记/Cooldown 等上下文短期记忆压缩相关术语，CanonicalUsage/UsageCost/PricingEntry/ContextBreakdown/UsageRecorder/PricingProvider/ContextBreakdownCalculator/usage_records/compression_stats 等观测与 Token 统计相关术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -85,3 +85,13 @@
 
 - terminal：内置 safe 工具（toolset=sandbox），由 `TerminalToolExecutor`（`app/application/terminal_tool_executor.py`）实现。LLM 直接调用 shell 命令，命令在 session 级 sandbox 容器内执行（DockerSandbox 用 `docker exec`，LocalSandbox 用 `sh -c`），与 execute_code 共享同一 session sandbox 和 scratch。非零退出码仍为 SUCCESS（shell 语义 — 命令已执行，只是失败）；仅 timeout 返回 TIMEOUT、spawn 失败返回 ERROR。workdir 按 backend 校验：Docker 仅允许 /scratch 和 /workspace 前缀（posixpath.normpath），Local 仅允许 scratch_root/workspace_root 内（Path.resolve）。无危险命令审批机制 — sandbox 本身是安全边界。
 - shell 语义（shell semantics）：terminal 工具的状态映射约定。非零退出码表示命令已执行但失败（如 `exit 7`、command-not-found returncode=127），映射为 `SandboxStatus.SUCCESS`；仅命令执行超时映射为 `TIMEOUT`（returncode=124），仅 spawn/write 失败映射为 `ERROR`（returncode=-1）。与 execute_code 的 Python 语义不同（非零退出码在 Python 中为 ERROR）。
+- CanonicalUsage：Domain 值对象（`app/domain/usage.py`），归一化后的 token 五桶（input/output/cache_read/cache_write/reasoning），由 `UsageService.normalize_usage` 从 Provider 原始 usage dict（OpenAI/Anthropic 不同键名）转换而来；`prompt_tokens` = input + cache_read、`total_tokens` = 五桶之和为派生属性。raw_usage 保留原始 dict。
+- UsageCost：Domain 值对象（`app/domain/usage.py`），成本估算结果，含 amount_usd（Decimal str）、status（`estimated`/`unknown`）、pricing_version。`estimated` 表示价格表命中，`unknown` 表示未命中且 amount_usd=0。
+- PricingEntry：Domain 值对象（`app/domain/usage.py`），模型定价条目，含 model_pattern、provider、input/output/cache_read/cache_write 各项 cost_per_million（Decimal）、pricing_version、source_url。Infrastructure 的 InMemoryPricingProvider 按 model 前缀最长匹配查表。
+- SessionUsageStats：Domain 值对象（`app/domain/usage.py`），会话级累计统计，对应 sessions 表新增的 token/cost/api_call_count 列。
+- ContextBreakdown：Domain 值对象（`app/domain/usage.py`），上下文分类 token，含 system_prompt/tool_definitions/memory/conversation 四桶 + 派生 total。由 ContextBreakdownCalculator 计算，用于观测页展示当前 context 占用。
+- UsageRecorder：Domain 端口（`app/domain/usage.py`），定义 record_call/get_session_stats/list_records/record_compression/list_compressions 接口。Infrastructure 的 SqliteUsageRecorder 实现，与 sessions.db 共享 path，sessions 表迁移幂等。
+- PricingProvider：Domain 端口（`app/domain/usage.py`），定义 `get_pricing(model, provider) -> PricingEntry | None`。Infrastructure 的 InMemoryPricingProvider 实现硬编码 9 款主流模型定价。
+- ContextBreakdownCalculator：Domain 端口（`app/domain/usage.py`），定义 `compute(system_prompt, tool_definitions, messages, external_memory_block) -> ContextBreakdown`。Infrastructure 的 ContextBreakdownCalculatorImpl 实现，复用 ContextCompressor 的 ~4 chars/token 估算逻辑。
+- usage_records：SQLite 表，持久化每次 LLM 调用的 usage 明细，由 SqliteUsageRecorder.record_call 写入；sessions 表同步累加 token/cost/api_call_count。
+- compression_stats：SQLite 表，持久化上下文压缩前后的 token 对比，由 SqliteUsageRecorder.record_compression 写入；`tokens_saved` 用 `max(before-after, 0)` clamp 防止负值。

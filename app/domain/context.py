@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
@@ -15,6 +15,7 @@ class ContextCompressionResult:
     skipped_reason: str | None
     original_tokens: int | None
     compressed_tokens: int | None
+    summarized_message_indices: list[int] = field(default_factory=list)
 
 
 class ContextEngine(Protocol):

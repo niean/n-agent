@@ -85,3 +85,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：审计/运维历史如果要求长期保存，必须有独立于业务会话生命周期的 registry/table，并在 Dashboard 读路径上优先使用该表；兼容旧数据可以合并 legacy 表，但不能继续把 legacy 表当作权威来源。
 
 来源：bug fix 260701 沙盒执行历史长期保存
+
+### P009: 上下文压缩必须持久化"已被摘要"标注，否则跨轮 load 无法恢复压缩后状态
+
+现象：spec 03-prd-specs.md:328 把摘要持久化从 replace 改为 append（保留所有摘要记录供 Dashboard 渲染）后，用户报告压缩后 head 3 消失。第一轮 fix 用"保留全部非摘要消息"恢复 head，但引入 middle + summary 冗余（违背压缩算法）；第二轮 fix 用"head + summary + 之后"丢弃 middle，但同时丢掉了 tail（tail 在 DB 中位于 summary 之前）。
+
+根因：DB 只持久化消息详情（role/content/is_summary），没有标注哪些原始消息已被摘要吸收。压缩算法执行后 in-memory working_messages = head + [summary] + tail，middle 已移除；但 DB 中 middle 仍在（append 语义只 INSERT summary 不 DELETE middle）。跨轮 load 时拿到 [head, middle, tail, summary, new_msgs]，无法区分 middle（应丢弃）和 tail（应保留）--两者都是非摘要消息、都在 summary 之前。错误根因跨 Application（agent_graph.py load/compress）、Infrastructure（sqlite_store.py 持久化）、Domain（context.py 压缩结果）三层。
+
+教训：上下文消息需要动态计算的加载，持久化层必须标注好每条消息的压缩状态。加 is_summarized 字段标记"已被摘要吸收的原始消息"，压缩成功后 mark_messages_summarized(middle_ids)，load 时 WHERE is_summarized=0 过滤。这样 load 拿到的就是 [head, tail, summary, new_msgs]（middle 已过滤），_filter_to_latest_summary 只需处理旧摘要去重。涉及"持久化形态变更"的改动必须有跨轮加载的回归测试，断言 middle 被标记、load 后 working_messages 不含 middle 且保留 head/tail。
+
+来源：bug fix 260711 head 3 被遗弃 -> 260711 is_summarized 标注

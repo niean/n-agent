@@ -290,6 +290,30 @@ async def test_agent_graph_excludes_system_prompt_from_summary(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_load_context_dedupes_persisted_user_message(tmp_path):
+    """ChatCompletionService persists user messages to memory_store before
+    invoking the graph, so the same message appears in both history and
+    input_messages. load_context must dedupe to avoid sending duplicates."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-dedup"))
+    from app.domain.session import ConversationMessage
+    user_msg = {"role": "user", "content": "新增预单的六层"}
+    # Simulate ChatService persisting user message before graph run
+    await store.append_message("s-dedup", ConversationMessage(role="user", content=user_msg["content"]))
+    provider = DirectProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    state = AgentState(session_id="s-dedup", input_messages=[user_msg])
+    await runner.load_context(state)
+    user_count = sum(1 for m in state.working_messages if m.get("role") == "user")
+    assert user_count == 1, f"expected 1 user message, got {user_count}: {state.working_messages}"
+
+
+@pytest.mark.asyncio
 async def test_agent_graph_uses_safe_only_tool_surface_when_requested(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))

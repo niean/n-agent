@@ -39,6 +39,7 @@ class FakeMemoryStore:
         self.appended_messages = []
         self.saved_task_states = []
         self.appended_summaries = []
+        self.summarized_message_ids: list[str] = []
         self._messages = messages or []
 
     async def get_summary(self, session_id):
@@ -62,6 +63,10 @@ class FakeMemoryStore:
     async def append_summary_message(self, session_id, message):
         self.appended_summaries.append((session_id, message))
         return message
+
+    async def mark_messages_summarized(self, session_id, message_ids):
+        self.summarized_message_ids = list(message_ids)
+        return len(message_ids)
 
 
 class FakeLLMProvider:
@@ -545,10 +550,11 @@ async def test_e2e_compress_context_invoked_in_full_graph_flow():
 
 
 @pytest.mark.asyncio
-async def test_load_context_keeps_only_latest_summary_and_following_messages():
-    """load_context 仅保留最新摘要 + 其后消息；更早的消息和旧摘要不进入上下文。
+async def test_load_context_keeps_all_non_summary_messages_and_latest_summary_only():
+    """load_context 保留全部非摘要消息 + 仅最新一条摘要；旧摘要从上下文剔除。
 
-    spec: 持久化messages表保留所有摘要记录，上下文只使用最新的摘要。
+    spec: 上下文只使用最新的摘要。head/middle/tail 非摘要消息全部保留，确保 head 保护生效。
+    DB 中摘要是 append 在末尾的，head/middle/tail 都在摘要之前，不能按"摘要+其后"过滤。
     """
     history = [
         ConversationMessage(role="user", content="old question 1"),
@@ -578,19 +584,70 @@ async def test_load_context_keeps_only_latest_summary_and_following_messages():
         summary="",
     )
     new_state = await runner.load_context(state)
-    # working_messages = [system, summary 2, latest question, new input]
+    # working_messages = [system, old question 1, old reply 1, question 2, reply 2, summary 2, latest question, new input]
     assert new_state.working_messages[0]["role"] == "system"
-    assert new_state.working_messages[1]["content"] == f"{CONTEXT_SUMMARY_PREFIX}summary 2"
-    assert new_state.working_messages[2]["content"] == "latest question"
-    assert new_state.working_messages[3]["content"] == "new input"
-    assert len(new_state.working_messages) == 4
-    # old messages and old summary excluded
     contents = [str(m.get("content", "")) for m in new_state.working_messages]
-    assert "old question 1" not in contents
-    assert "old reply 1" not in contents
+    # head (old question 1, old reply 1) preserved
+    assert "old question 1" in contents
+    assert "old reply 1" in contents
+    # middle (question 2, reply 2) preserved
+    assert "question 2" in contents
+    assert "reply 2" in contents
+    # tail (latest question) preserved
+    assert "latest question" in contents
+    # new input preserved
+    assert "new input" in contents
+    # only latest summary (summary 2) in context; old summary 1 excluded
+    assert f"{CONTEXT_SUMMARY_PREFIX}summary 2" in contents
     assert f"{CONTEXT_SUMMARY_PREFIX}summary 1" not in contents
-    assert "question 2" not in contents
-    assert "reply 2" not in contents
+
+
+@pytest.mark.asyncio
+async def test_load_context_preserves_head_messages_when_summary_appended_last():
+    """regression: 摘要 append 在 DB 末尾时，head（protect_first_n）不能被丢弃。
+
+    用户报告：压缩后 head 3 消失。根因是 _filter_to_latest_summary 曾按"摘要+其后"
+    过滤，丢弃了摘要之前的 head/middle/tail。修复后应保留 head。
+    """
+    history = [
+        # head (protect_first_n=3)
+        ConversationMessage(role="user", content="head msg 1"),
+        ConversationMessage(role="assistant", content="head reply 1"),
+        ConversationMessage(role="user", content="head msg 2"),
+        # middle (would be summarized, but DB retains them)
+        ConversationMessage(role="assistant", content="middle reply"),
+        ConversationMessage(role="user", content="middle msg"),
+        # tail (protect_last_n=20)
+        ConversationMessage(role="assistant", content="tail reply"),
+        # summary appended last by append_summary_message
+        ConversationMessage(
+            role="user", content=f"{CONTEXT_SUMMARY_PREFIX}compressed summary", is_summary=True,
+        ),
+    ]
+    memory_store = FakeMemoryStoreWithHistory(history=history)
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=FakeToolServiceForLLM(),
+        memory_store=memory_store,
+        summarizer=None,
+        context_engine=None,
+    )
+    state = AgentState(
+        session_id="s1",
+        input_messages=[],
+        working_messages=[],
+        summary="",
+    )
+    new_state = await runner.load_context(state)
+    contents = [str(m.get("content", "")) for m in new_state.working_messages]
+    # head messages must survive (this was the bug)
+    assert "head msg 1" in contents
+    assert "head reply 1" in contents
+    assert "head msg 2" in contents
+    # tail must survive
+    assert "tail reply" in contents
+    # summary must be present
+    assert f"{CONTEXT_SUMMARY_PREFIX}compressed summary" in contents
 
 
 @pytest.mark.asyncio
@@ -620,6 +677,98 @@ async def test_load_context_without_summary_returns_all_messages():
     assert len(new_state.working_messages) == 4
     assert new_state.working_messages[1]["content"] == "question 1"
     assert new_state.working_messages[3]["content"] == "question 2"
+
+
+@pytest.mark.asyncio
+async def test_load_context_filters_is_summarized_messages():
+    """load_context 过滤 is_summarized=1 的消息（已被摘要吸收的 middle）。
+
+    压缩成功后 middle 段被标记 is_summarized=1，load 时过滤掉，避免 middle + summary 冗余。
+    """
+    history = [
+        # head (未摘要)
+        ConversationMessage(id="m1", role="user", content="head q"),
+        # middle (已被摘要，is_summarized=True)
+        ConversationMessage(id="m2", role="assistant", content="middle r", is_summarized=True),
+        ConversationMessage(id="m3", role="user", content="middle q", is_summarized=True),
+        # tail (未摘要)
+        ConversationMessage(id="m4", role="assistant", content="tail r"),
+        # summary
+        ConversationMessage(
+            id="s1", role="user", content=f"{CONTEXT_SUMMARY_PREFIX}summary", is_summary=True,
+        ),
+        # new message after summary
+        ConversationMessage(id="m5", role="user", content="new q"),
+    ]
+    memory_store = FakeMemoryStoreWithHistory(history=history)
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=FakeToolServiceForLLM(),
+        memory_store=memory_store,
+        summarizer=None,
+        context_engine=None,
+    )
+    state = AgentState(
+        session_id="s1",
+        input_messages=[],
+        working_messages=[],
+        summary="",
+    )
+    new_state = await runner.load_context(state)
+    contents = [str(m.get("content", "")) for m in new_state.working_messages]
+    # head + tail + summary + new all preserved
+    assert "head q" in contents
+    assert "tail r" in contents
+    assert f"{CONTEXT_SUMMARY_PREFIX}summary" in contents
+    assert "new q" in contents
+    # middle (is_summarized=True) filtered out
+    assert "middle r" not in contents
+    assert "middle q" not in contents
+
+
+@pytest.mark.asyncio
+async def test_compress_context_marks_middle_messages_summarized():
+    """compress_context 成功后调用 mark_messages_summarized 标记 middle 段。
+
+    result.summarized_message_indices 是相对于 non_system 的索引；
+    compress_context 通过 state.context_message_ids 映射到消息 id，调用 mark。
+    """
+    compressed_msgs = [
+        {"role": "user", "content": f"{CONTEXT_SUMMARY_PREFIX}S1"},
+        {"role": "user", "content": "tail msg"},
+    ]
+    result = ContextCompressionResult(
+        messages=compressed_msgs, summary="S1", compressed=True,
+        skipped_reason=None, original_tokens=500, compressed_tokens=50,
+        summarized_message_indices=[1, 2],  # middle 索引（相对于 non_system）
+    )
+    fake_engine = FakeContextEngine(result)
+    memory_store = FakeMemoryStore()
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=None,
+        memory_store=memory_store,
+        summarizer=None,
+        context_engine=fake_engine,
+    )
+    # 模拟 load_context 缓存的 context_message_ids：non_system = [ctx0, ctx1, ctx2, ctx3]
+    # middle 索引 [1, 2] 对应 ctx1, ctx2
+    state = AgentState(
+        session_id="s1",
+        input_messages=[],
+        working_messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "ctx0"},
+            {"role": "user", "content": "ctx1"},
+            {"role": "user", "content": "ctx2"},
+            {"role": "user", "content": "ctx3"},
+        ],
+        summary="",
+        context_message_ids=["id0", "id1", "id2", "id3"],
+    )
+    await runner.compress_context(state)
+    # mark_messages_summarized called with middle ids
+    assert memory_store.summarized_message_ids == ["id1", "id2"]
 
 
 class FailingAppendMemoryStore(FakeMemoryStore):

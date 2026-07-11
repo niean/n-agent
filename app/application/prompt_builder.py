@@ -24,6 +24,14 @@ KNOWLEDGE_GUIDANCE = (
     "use the search_knowledge tool when it is available, then ground your answer in the returned snippets."
 )
 
+SKILL_GUIDANCE = (
+    "Skills are available as task instructions, not direct tools. When a user asks for a capability that is not covered "
+    "by a direct tool, or asks for a task that may need procedural guidance such as weather, forecasts, travel checks, "
+    "operations, or other installed capabilities, first call skills_list to discover relevant skills, then call "
+    "skill_view(name) for the best match and follow it with available tools. Do not say the capability is unavailable "
+    "until you have checked skills_list."
+)
+
 MANAGED_TOOL_GUIDANCE = (
     "When the user asks to create, modify, view, pause, resume, run, or delete managed resources "
     "(currently scheduled tasks; future: MCP sites etc.), first call skills_list / skill_view(\"n-agent\") "
@@ -34,15 +42,19 @@ MANAGED_TOOL_GUIDANCE = (
 
 def build_system_prompt(
     external_memory_manager: ExternalMemoryManager | None = None,
-    enabled_override: list[str] | None = None
+    enabled_override: list[str] | None = None,
+    skills_index: str | None = None,
 ) -> str:
     blocks = [
         DEFAULT_AGENT_IDENTITY,
         REACT_GUIDANCE,
         KNOWLEDGE_GUIDANCE,
+        SKILL_GUIDANCE,
         MANAGED_TOOL_GUIDANCE,
         SAFETY_GUIDANCE,
     ]
+    if skills_index:
+        blocks.append(skills_index)
     if external_memory_manager:
         ext_block = external_memory_manager.build_system_prompt(enabled_override=enabled_override)
         if ext_block:

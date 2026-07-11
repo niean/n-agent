@@ -201,7 +201,7 @@ Context Frame（上下文来源分层）
 │  │  ├─ identity: DEFAULT_AGENT_IDENTITY
 │  │  ├─ instruction: REACT_GUIDANCE + KNOWLEDGE_GUIDANCE + MANAGED_TOOL_GUIDANCE
 │  │  ├─ safety: SAFETY_GUIDANCE
-│  │  └─ *外部记忆*静态快照：系统记忆（builtin）/文件记忆（multi-project）的 {memory,user}.md
+│  │  └─ 外部记忆静态快照：系统记忆（builtin）/文件记忆（multi-project）的 {memory,user}.md
 │  └─ Capability Context
 │     └─ tool definitions: name + description + parameters
 │
@@ -214,7 +214,7 @@ Context Frame（上下文来源分层）
 │
 ├─ 3. Turn Context
 │  ├─ input: latest user messages
-│  ├─ *外部记忆*动态检索（retrieved memory）: prefetch_all → <memory-context> 围栏，prepend 到 last user message content 副本
+│  ├─ 外部记忆动态检索（retrieved memory）: prefetch_all → <memory-context> 围栏，prepend 到 last user message content 副本
 │  └─ run options: external_memory_enabled + tool_exposure_policy + tool_execution_context + execution_context_mode（控制信号，不进入Provider Request）
 │
 └─ 4. Execution Context（执行现场，不进入Provider Request）
@@ -354,7 +354,8 @@ finalize
 关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用 external_memory / multi_external_memory 工具（execute_tools），以及 finalize 阶段 sync_all（builtin 写 observations.md，multi-project / external-query 为 no-op）。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
 </details>
 
-历史消息增量压缩，本次摘要 = llm_summary(上次摘要 + 新增消息)。
+历史消息增量三段式压缩，head 保护首 N 条 + middle LLM 摘要 + tail 末 N 条，本次摘要 = llm_summary(上次摘要 + 新增消息)。
+
 
 ## Action
 
@@ -572,6 +573,15 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | 端口 | SandboxCallbackTool / SandboxCallbackToolRegistry | 沙盒回调工具及注册表，list_enabled 决定可调用工具集 |
 | 端口 | SandboxExecutionHistoryRegistry / ReleasedSandboxRegistry | 执行历史与废弃沙盒历史持久化，独立于 Chat Session 生命周期 |
 | 端口 | SearchProvider | Web 搜索后端 SPI，供 web_extract/web_search 回调工具调用 |
+| 值对象 | CanonicalUsage | 归一化 token 五桶（input/output/cache_read/cache_write/reasoning + request_count + raw_usage），prompt_tokens/total_tokens 派生属性 |
+| 值对象 | UsageCost | 成本估算结果（Decimal amount_usd + status: estimated/unknown + pricing_version） |
+| 值对象 | PricingEntry | 模型定价条目（input/output/cache_read/cache_write 各项 cost_per_million + pricing_version + source_url） |
+| 值对象 | SessionUsageStats | 会话级累计统计（五桶 + api_call_count + estimated_cost_usd + cost_status） |
+| 值对象 | ContextBreakdown | 上下文分类 token（system_prompt/tool_definitions/memory/conversation 四桶 + total 派生） |
+| 值对象 | UsageRecord / CompressionStat | 单次 LLM 调用记录 / 单次压缩记录值对象 |
+| 端口 | UsageRecorder | usage 持久化端口（record_call/get_session_stats/list_records/record_compression/list_compressions），归属观测子域 |
+| 端口 | PricingProvider | 模型定价查询端口（get_pricing -> PricingEntry | None），硬编码实现按前缀最长匹配 |
+| 端口 | ContextBreakdownCalculator | 上下文分类计算端口，Infrastructure 复用 ContextCompressor token 估算实现 |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 

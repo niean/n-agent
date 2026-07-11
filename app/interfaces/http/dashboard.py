@@ -93,12 +93,16 @@ def create_dashboard_router(
     external_memory_provider_service: ExternalMemoryProviderService | None = None,
     sandbox_dashboard_service=None,
     plugin_service=None,
+    usage_service=None,
+    memory_store=None,
 ) -> APIRouter:
     router = APIRouter()
 
     @router.get("/", response_class=HTMLResponse)
     @router.get("/summary", response_class=HTMLResponse)
     @router.get("/chat", response_class=HTMLResponse)
+    @router.get("/chat/observations", response_class=HTMLResponse)
+    @router.get("/chat/observations/{session_id}", response_class=HTMLResponse)
     @router.get("/sessions", response_class=HTMLResponse)
     @router.get("/memory", response_class=HTMLResponse)
     @router.get("/tools", response_class=HTMLResponse)
@@ -117,6 +121,10 @@ def create_dashboard_router(
     @router.get("/platforms", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    if usage_service is not None:
+        from app.interfaces.http.usage_routes import register_usage_routes
+        register_usage_routes(router, usage_service, memory_store=memory_store, tool_service=tool_service, skill_service=skill_service)
 
     if sandbox_dashboard_service is not None:
         from app.interfaces.http.sandbox_routes import register_sandbox_routes

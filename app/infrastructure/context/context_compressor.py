@@ -247,6 +247,7 @@ class ContextCompressor(ContextEngine):
 
             head = messages[:head_end]
             tail = messages[tail_start:]
+            middle_indices = list(range(head_end, tail_start))
             summary = await self._generate_summary(middle, existing_summary=previous_summary)
             if summary is None:
                 summary = await self._build_fallback_summary(middle, existing_summary=previous_summary)
@@ -274,6 +275,7 @@ class ContextCompressor(ContextEngine):
                 messages=combined, summary=summary, compressed=True,
                 skipped_reason=None,
                 original_tokens=original_tokens, compressed_tokens=compressed_tokens,
+                summarized_message_indices=middle_indices,
             )
         except Exception as exc:
             logger.error("context_compressor: compress failed: %s", exc)

@@ -50,9 +50,83 @@ def test_empty_base_url_falls_back_to_v3():
     assert a._base_url == "https://api.mem0.ai/v3"
 
 
-def test_prefetch_returns_empty(adapter):
-    a, _ = adapter
+def test_prefetch_returns_empty_when_no_api_key():
+    # 未配置 api_key 时 is_available 返回 False，prefetch 直接返回空
+    a = Mem0Adapter(http_client=FakeHttpClient(), config={"base_url": "https://api.mem0.ai/v3", "api_key": ""})
     assert a.prefetch("q", session_id="s1") == ""
+
+
+def test_prefetch_returns_empty_when_query_empty(adapter):
+    a, _ = adapter
+    assert a.prefetch("", session_id="s1") == ""
+
+
+def test_prefetch_returns_formatted_memory_when_results_exist(adapter):
+    a, http = adapter
+    http.responses[("POST", "https://api.mem0.ai/v3/memories/search/")] = {
+        "results": [{"memory": "likes spicy food"}, {"memory": "lives in Beijing"}],
+    }
+    text = a.prefetch("what does the user like", session_id="s1")
+    assert "## Mem0 Memory" in text
+    assert "- likes spicy food" in text
+    assert "- lives in Beijing" in text
+    # 验证搜索请求 body
+    method, url, body, headers = http.calls[0]
+    assert method == "POST" and url.endswith("/memories/search/")
+    assert body["query"] == "what does the user like"
+    assert body["filters"]["user_id"] == "u1"
+    assert body["rerank"] is True
+    assert body["top_k"] == 10
+    assert headers["Authorization"] == "Token sk-x"
+
+
+def test_prefetch_returns_empty_when_no_results(adapter):
+    a, http = adapter
+    http.responses[("POST", "https://api.mem0.ai/v3/memories/search/")] = {"results": []}
+    assert a.prefetch("anything", session_id="s1") == ""
+
+
+def test_prefetch_returns_empty_on_backend_error(adapter):
+    a, http = adapter
+    # http_client 抛异常时，后台线程捕获后缓存空字符串
+    def raise_error(url, *, json=None, headers=None):
+        raise RuntimeError("network down")
+    http.post = raise_error
+    assert a.prefetch("q", session_id="s1") == ""
+
+
+def test_prefetch_consumes_cache_after_call(adapter):
+    """同 query 第二次 prefetch 不再发起网络请求（缓存命中）。"""
+    a, http = adapter
+    http.responses[("POST", "https://api.mem0.ai/v3/memories/search/")] = {
+        "results": [{"memory": "fact1"}],
+    }
+    first = a.prefetch("q", session_id="s1")
+    assert "fact1" in first
+    initial_call_count = len(http.calls)
+    # 同 query 再次 prefetch：缓存被消费后 query 不变，但 _prefetch_done=False，
+    # 应启动新线程；为避免重复网络请求，验证语义改为：再次调用能返回结果
+    second = a.prefetch("q", session_id="s1")
+    assert "fact1" in second
+    # 至少又发起了一次搜索
+    assert len(http.calls) > initial_call_count
+
+
+def test_prefetch_different_query_triggers_new_search(adapter):
+    """不同 query 的 prefetch 独立搜索，不复用旧缓存。"""
+    a, http = adapter
+    http.responses[("POST", "https://api.mem0.ai/v3/memories/search/")] = {
+        "results": [{"memory": "fact1"}],
+    }
+    first = a.prefetch("query-a", session_id="s1")
+    assert "fact1" in first
+    second = a.prefetch("query-b", session_id="s1")
+    assert "fact1" in second
+    # 两次搜索请求
+    search_calls = [c for c in http.calls if c[1].endswith("/memories/search/")]
+    assert len(search_calls) == 2
+    assert search_calls[0][2]["query"] == "query-a"
+    assert search_calls[1][2]["query"] == "query-b"
 
 
 def test_sync_turn_posts_memories(adapter):

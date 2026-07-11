@@ -40,6 +40,7 @@ class ConversationMessage:
     name: str | None = None
     created_at: datetime = field(default_factory=utc_now)
     is_summary: bool = False
+    is_summarized: bool = False
 
 
 @dataclass(frozen=True)

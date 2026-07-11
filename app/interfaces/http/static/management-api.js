@@ -169,6 +169,26 @@
     releaseSandbox,
   };
 
+  // Usage / observation endpoints
+  const getUsageOverview = () => fetchJson(`/chat/usage/overview`);
+  const listUsageSessions = (page, pageSize) => fetchJson(
+    `/chat/usage/sessions?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}`,
+  );
+  const getUsageStats = (sessionId) => fetchJson(`/chat/usage/sessions/${encodeURIComponent(sessionId)}`);
+  const getUsageRecords = (sessionId, limit) => fetchJson(
+    `/chat/usage/sessions/${encodeURIComponent(sessionId)}/records${limit ? `?limit=${encodeURIComponent(limit)}` : ''}`,
+  );
+  const getUsageCompressions = (sessionId) => fetchJson(`/chat/usage/sessions/${encodeURIComponent(sessionId)}/compressions`);
+  const getUsageBreakdown = (sessionId) => fetchJson(`/chat/usage/sessions/${encodeURIComponent(sessionId)}/breakdown`);
+  const usage = {
+    getOverview: getUsageOverview,
+    listSessions: listUsageSessions,
+    getStats: getUsageStats,
+    getRecords: getUsageRecords,
+    getCompressions: getUsageCompressions,
+    getBreakdown: getUsageBreakdown,
+  };
+
   global.NAGENT = namespace;
   global.NAGENT.api = {
     fetchJson,
@@ -228,5 +248,6 @@
     setPluginEnabled,
     updatePluginConfig,
     sandbox,
+    usage,
   };
 }(window));

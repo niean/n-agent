@@ -331,6 +331,27 @@
         - 对话：Dashboard Chat，摘要渲染改用`工具调用调试信息`的样式，默认折叠可展开、黄底色等，标题`对话摘要`
 
 [20260711]
+- HE
+    - HE：参考iterate-feature P7，给fix-bug工作流P5、补齐after-hook
+- NFR
+    - 需求：对比N-Agent和Hermes-Agent，看下N-Agent还有哪些功能完全缺失、功能不完备，分析结果就到spec/active/文档即可。Hermes-Agent源码/Users/niean/code/github.com/niean/hermes-agent
+- FR
+    - 技能：将skill索引主动注入到system prompt，避免高频发生的skill_list
+    - 记忆：mem0支持自动预取+工具调用双轨制，自动预取又分静态(放入system prompt)、动态(放入user msg前缀)
+    - 左导：点击一级菜单后，URL要切换到对应的新路径上，现在有问题的至少有对话、观测
+    - 观测：[KF]实现Token、上下文等统计信息，对标Hermes-Agent
+        - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
+        - 观测：重构观测页面，页面布局自上而下是整体总览卡片(所有会话总和)、会话表格(翻页、每页20条)，会话列表操作列支持`详情`按钮，点击跳转会话观测详情页面
+        - 观测：会话详情，上下文分布并未正常展示分类条形图
+        - 观测：会话列表，点击详情后跳转到一个新开的Tab、而不是在原页面
+        - 观测：会话详情，API调用历史的模型使用率N-Agent，并非真实调用的模型名称；观测页面暂定对管理员开放，展示真实模型名称、而不是归一化后的N-Agent，你可以记录两个名称、分场景展示不同名称
+        - 观测：会话详情，API调用历史，在模型列后新增一列`调起类型`，取值如 user、tool、消息压缩；取值可以探讨下
+       - 观测：会话详情，API调用历史，增加操作列、支持详情按钮，点击后弹框，内容包括输入、输出，Json格式展示
+       - 观测：会话详情，API调用历史，详情展示工具定义字段
+       - 观测：会话详情，API调用历史-详情，除了工具定义、输入消息、输出消息 上下文还包括其它哪些内容？展示在详情弹出框
+       - 观测：会话详情，API调用历史-详情，取值去掉加粗等特殊效果，如`记录ID: #57`中的`#57`、`输入: 5,583`中的`5,583`、`估算成本: $0.000000`中的`$0.000000`
+       - 观测：会话详情，API调用历史-详情，Token 用量 (Usage)、成本 (Cost)，两部分合并为一项，放到第一位置；调用元信息 (Meta)、生成参数 (Generation Params)，两部分合并为一项、放到第二位置，`生成参数`作为一项、加入到调用元信息下
+
 
 
 ---
@@ -346,8 +367,6 @@
     - 架构：MoA，对标Hermes
     - 工具：Skill自进化
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明
-    - 观测：支持Token、上下文统计等统计信息
-        - 参照：HermesAgent源码/Users/niean/code/github.com/niean/hermes-agent
 
 ---
 

@@ -39,7 +39,7 @@
 ## Workflow 完成 Hook
 
 - 支持在 Workflow 最后一个 Phase 成功结束后执行自定义收尾命令，统一入口为 `.harness/framework/hooks/after-finish.sh`
-- Hook 仅在 Workflow 明确声明时执行；当前适用 Workflow：`iterate-feature`、`refine-feature`
+- Hook 仅在 Workflow 明确声明时执行；当前适用 Workflow：`iterate-feature`、`refine-feature`、`fix-bug`
 - Hook 文件不存在时视为未定义，直接跳过；不得因为未定义 Hook 中断或降级 Workflow
 - Hook 文件存在时执行：`sh .harness/framework/hooks/after-finish.sh`
 - Hook 失败不回滚已完成 Phase；必须在最终输出中标注失败命令和退出码，等待用户决策
