@@ -18,6 +18,12 @@ class ContextCompressionResult:
     summarized_message_indices: list[int] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ProviderContext:
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
+
+
 class ContextEngine(Protocol):
     def should_compress(
         self,

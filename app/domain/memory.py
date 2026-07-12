@@ -88,7 +88,7 @@ class MemoryStore(Protocol):
         """将指定消息标记为 is_summarized=1（已被摘要吸收）。
 
         压缩成功后调用：middle 段（被摘要的原始消息）标记为 is_summarized=1，
-        load_context 时过滤掉这些消息，避免 middle + summary 冗余。
+        上下文准备时过滤掉这些消息，避免 middle + summary 冗余。
         返回实际更新的行数。
         """
 

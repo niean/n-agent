@@ -37,7 +37,7 @@
 ## LangGraph
 
 - LangGraph 只存在于 Application 层 `app/application/agent_graph.py`
-- 图节点至少包含：`load_context`、`call_llm`、`execute_tools`、`update_memory`、`finalize`
+- 图节点至少包含：`prepare_context`、`call_llm`、`execute_tools`、`update_memory`、`finalize`
 - Application 层将运行结果转换为 `ChatEvent`，Interfaces 层只负责 SSE/JSON 编码
 - Domain 模型不得暴露 LangGraph 类型
 

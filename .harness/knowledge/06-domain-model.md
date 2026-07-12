@@ -9,64 +9,30 @@
 ```text
 Agent Runtime
 ├── 核心子域
-│   ├── Loop：运行状态推进、工具调用回环、结束判断
-│   ├── AgentCore：模型调用、上下文组织、推理结果承接
-│   ├── Memory：消息、会话、工具调用、任务状态、滚动摘要，以及外部记忆
+│   ├── TurnLoop：一轮对话请求的执行编排，包括上下文准备、LLM交互、工具执行、记忆更新、结束判断
+│   ├── Context：组装模型输入视图，包括消息上下文、工具定义、压缩，以及Execution Context边界
+│   ├── LLM：模型交互子域，负责 Provider Request(请求)构造、模型调用、响应解析
+│   ├── Memory：会话、消息、滚动摘要、工具调用、任务状态，以及外部记忆
 │   ├── Action：把模型 tool_calls 转换为受控工具执行，工具由支撑子域实现
 │   └── Policy：工具权限、风险等级、执行约束和安全决策
 ├── 支撑子域
 │   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
 │   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
 │   ├── MCP：MCP site 注册与工具同步，把远程 MCP server 工具暴露给 LLM 调用
-│   ├── Plugin：预留工具适配入口
+│   ├── Plugin：本地插件包扫描、启停、配置和工具动态注入
 │   ├── Platform/Gateway：飞书等外部消息平台抽象、生命周期管理；CLI/TUI 仅作为终端聊天入口来源
 │   └── Sandbox：受控Python代码执行子域execute_code
 └── 通用子域
     └── Environment：模型、存储、文件、网络等外部资源边界
 ```
 
-## 概念架构
-- Skill：结构化Prompt，控制LLM怎么想、怎么说，进而完成功能。Skill定义**业务功能**，**主决策**而非执行，这是和工具的主要区别
-- Plugin：特化工具为LLM定制的**点对点适配**，将外部工具能力、封装为LLM可调用函数FC。Plugin是本地部署的工具适配层，而非工具本身
-- MCP：面向LLM的标准协议，用于统一外部工具、资源、上下文的访问方式，类似总线协议、SPI
-
-<details>
-<summary>概念架构图</summary>
+## TurnLoop
 
 ```mermaid
-graph TD
-
-Skill --> AgentCore
-AgentCore --> Knowledge
-AgentCore --> MCP
-AgentCore --> Plugin
-
-Knowledge --> FC
-MCP --> FC
-Plugin --> FC
-
-FC --> externals
-```
-</details>
-
-## Loop
-```text
-User Message
-    ↓
-AgentCore
-    ↓
-Tool Calls?
-    ├─ Yes → Execute Tool → Observation → AgentCore
-    └─ No  → Final Answer
-```
-
-<details>
-<summary>Loop FSM</summary>
-
-```mermaid
+%% align: left
 stateDiagram-v2
-  [*] --> load_context
-  load_context --> call_llm
+  [*] --> prepare_context
+  prepare_context --> call_llm
   call_llm --> execute_tools: pending_tool_calls
   call_llm --> update_memory: no tool calls
   call_llm --> finalize: error
@@ -75,94 +41,52 @@ stateDiagram-v2
   update_memory --> finalize: error / final_message / iteration_limit reached
   finalize --> [*]
 ```
-库：LangGraph.Graph.StateGraph
-</details>
+核心库：LangGraph.Graph.StateGraph
 
 
-## AgentCore
-AgentCore: Single-Turn Inference Engine(单轮推理引擎)
+## Context
+
+Context 是一次模型调用前组装出的运行视图，内容来源包括 system prompt、用户输入、Memory、工具定义、执行约束等。
 
 ```text
-Input
-├── Runtime State
-│     ├── History
-│     ├── Current Input
-│     ├── Summary
-│     ├── Memory
-│     └── Optional Retrieved Context
-├── Runtime Capabilities
-│     └── Tool Registry
-├── Runtime Constraints
-│     └── Policies
-└── Model Configuration
-
-        ↓
-
-AgentCore
-
-        ↓
-
-Output
-├── Assistant Message
-├── Tool Calls
-├── Finish Reason
-├── Usage
-└── Reasoning Metadata
+Context
+├── Message Context
+│   ├── system prompt：身份、指令、安全约束；外部记忆-静态快照
+│   └── session context：历史消息、滚动摘要，本轮用户输入
+│       ├── compression：历史消息按需压缩，得到滚动摘要
+│       └── 外部记忆-动态检索：call_llm 前 prepend 到 本轮用户输入user message
+├── Tool Context
+│   └── tool schemas：经工具暴露策略和 ToolExecutionContext 过滤
+└── Execution Context
+    └── 工具权限、trusted_metadata、运行分支控制，如生成 Tool Context；不直接进入 messages
 ```
 
-<details>
-<summary>AgentCore详情</summary>
+
+## LLM
+
+LLM 子域对应 `call_llm` 节点，负责一次模型交互，不负责工具执行或记忆写入。
 
 ```text
-AgentCore
+LLM
 │
-├── Context Assembly: produces Message Context
-│     ├── History
-│     ├── Current Input
-│     ├── Summary
-│     ├── Memory
-│     └── Optional Retrieved Context
+├── Provider Request
+│     ├── working_messages
+│     │     └── 外部记忆-动态检索：注入到user message
+│     ├── tool schemas
+│     ├── model
+│     └── options
 │
-├── Prompt Builder: produces System Context
-│     ├── Identity
-│     ├── Instruction
-│     ├── Safety / Policy Guidance
-│     ├── Platform Guidance
-│     └── Prompt Composition
+├── Provider Call
+│     └── llm_provider.chat(...)
 │
-├── Tool Assembly: produces Tool Context
-│     ├── Tool Selection
-│     ├── Authorization
-│     ├── Schema Normalization
-│     └── Tool Choice
-│
-├── Request Normalization: produces Provider-Agnostic Inference Request
-│     ├── System Context
-│     ├── Message Context
-│     ├── Tool Context
-│     └── Generation Parameters
-│
-├── Provider Adapter
-│     ├── adapts to Provider API Request
-│     ├── invokes Provider
-│     └── receives Raw Provider Response
-│
-├── Response Normalization: produces Normalized Inference Result
-│     ├── Content
-│     ├── Tool Calls
-│     ├── Finish Reason
-│     ├── Usage
-│     ├── Reasoning Metadata
-│     └── Raw Response
-│
-└── Inference Handoff: produces Agent Runtime Output
-      ├── Assistant Message
-      ├── Tool Calls
+└── Response Parse
+      ├── final_message
+      ├── pending_tool_calls
       ├── Finish Reason
       ├── Usage
-      └── Reasoning Metadata
+      └── 下一步分支信号
 ```
-</details>
+
 
 ## Memory
 
@@ -206,11 +130,10 @@ Context Frame（上下文来源分层）
 │     └─ tool definitions: name + description + parameters
 │
 ├─ 2. Session Context（*会话记忆*）
-│  ├─ 消息 ConversationMessage: 历史消息，包括 user / assistant / tool
-│  ├─ 会话 ConversationSession: id + title + source + external_memory_enabled（持久化但不进入Provider Request）
-│  ├─ 工具调用 ToolCall: 工具执行记录（持久化但不进入Provider Request，工具结果已包含在role=tool的消息中）
-│  ├─ 任务状态 TaskState: 任务运行状态（持久化但不进入Provider Request）
-│  └─ 滚动摘要 Summary（持久化但不进入Provider Request）
+│  ├─ 消息 ConversationMessage: 历史消息/滚动摘要 Summary
+│  ├─ 会话 ConversationSession: 会话身份、来源、标题和外部记忆选择
+│  ├─ 工具调用 ToolCall: 工具执行审计；对话语义由 role=tool 消息承接
+│  └─ 任务状态 TaskState: 任务运行状态（执行控制信号，不作为对话内容）
 │
 ├─ 3. Turn Context
 │  ├─ input: latest user messages
@@ -227,7 +150,7 @@ Context Frame（上下文来源分层）
        ▼
 
 Provider Request
-├─ messages  ← 1.System Context + 2.消息ConversationMessage + 3.input&retrieved memory
+├─ messages  ← 1.System Context + 2.历史消息/摘要 + 3.input&retrieved memory
 ├─ tools     ← 1.Capability Context（经 4.tool filtering 过滤）
 ├─ tool choice: 默认
 └─ generation params: temperature / top_p / top_k / max_tokens / stop_sequences / thinking / cache_control 等
@@ -285,7 +208,7 @@ ToolCall 持久化: call_u8us..., get_current_time, success, result={now:2026-06
   ├─ append(role=assistant, content="", tool_calls=[...])
   └─ append(role=tool, tool_call_id=call_u8us..., content=result)  ← 工具结果经 role=tool 消息回流
 TaskState: status=running, iteration_count=1
-Summary: HeuristicSummarizer 覆盖（未达阈值，仍持久化；不进 Provider Request）
+Summary: 本轮未触发上下文压缩，历史仍由原始消息承载
 *外部记忆*自动更新: 本轮 LLM 未调用 external_memory 工具 → 文件未变
 
 === 第 2 次推理 ===
@@ -295,9 +218,9 @@ Summary: HeuristicSummarizer 覆盖（未达阈值，仍持久化；不进 Provi
    │  ├─ user("现在几点了？打印下UTC时间。")
    │  ├─ assistant(content="", tool_calls=[get_current_time])
    │  └─ tool(content={now:...})  ← 工具结果通过 role=tool 消息进入 history
-   ├─ 工具调用 ToolCall: 已持久化（不进请求，结果已在 role=tool 消息中）
-   ├─ 任务状态 TaskState: running（不进请求）
-   └─ 滚动摘要 Summary: 已持久化（不进请求，仅作下次 summarize 入参）
+   ├─ 工具调用 ToolCall（审计记录；结果已在 role=tool 消息中）
+   ├─ 任务状态 TaskState: running（执行控制信号）
+   └─ 滚动摘要 Summary: 未参与本轮上下文
 3. Turn Context
    ├─ input: （无新 user 输入，本轮由 tool 结果驱动）
    └─ *外部记忆*动态检索: ""
@@ -313,7 +236,7 @@ Provider Request #2
 --- finalize ---
 消息 ConversationMessage: append(role=assistant, final)  ← scrub_memory_context 剥离 <memory-context>（本轮无此标签）
 TaskState: status=completed, iteration_count=2
-Summary: 覆盖为 "用户: 现在几点了？... | 助手: 外部记忆1：..."
+Summary: 若后续触发压缩，会用摘要代表被压缩的历史片段
 *外部记忆*消息同步: sync_all(primary) → 系统记忆（builtin）.sync_turn 抽取关键词写入 observations.md；external_memory_1（文件记忆）.sync_turn 为 no-op
 ```
 </details>
@@ -329,10 +252,12 @@ complete
   ├─ 会话 ConversationSession.external_memory_enabled: lock_session_external_memory（首写获胜）
   ├─ 消息 ConversationMessage: append_message(role=user) × N
   └─ 会话 ConversationSession.title: ensure_title（异步后台）
-load_context（装配 working_messages：system + history + input）
-  ├─ 消息 ConversationMessage: list_messages → 历史消息 history
-  ├─ 滚动摘要 Summary: get_summary → state.summary（不进 messages，仅作下次 summarize 入参）
-  └─ *外部记忆*静态快照: 随 system prompt 注入（Stable Context）
+prepare_context
+  ├─ 装配 working_messages: system + history/summary + input
+  ├─ *外部记忆*静态快照: 注入到 system
+  ├─ 压缩 ContextEngine.should_compress 判定是否压缩 history，外部记忆支持压缩前抢救
+  └─ Context Frame: head + latest summary + tail
+call_llm
   ├─ *外部记忆*动态检索: prefetch_all → <memory-context> prepend 到 last user message 副本（不污染 state）
   ├─ llm.chat → Provider Request
   └─ scrub_memory_context(final_message.content)  # 立即剥离回声，防写回 消息 ConversationMessage
@@ -342,16 +267,14 @@ execute_tools
 update_memory（更新*会话记忆*）
   ├─ 消息 ConversationMessage: append_message(role=assistant, content 含 tool_calls)
   ├─ 消息 ConversationMessage: append_message(role=tool, tool_call_id, name)
-  ├─ 任务状态 TaskState: save_task_state(status=running|failed)
-  └─ 滚动摘要 Summary: summarize → save_summary（覆盖最新值）
-       └─ *外部记忆*压缩前抢救: pre_compress_all → provider.on_pre_compress 返回要点，回填到 summary
+  └─ 任务状态 TaskState: save_task_state(status=running|failed)
 finalize
   ├─ 消息 ConversationMessage: 错误兜底 append_message(role=assistant, 错误文案)
   ├─ *外部记忆*消息同步: sync_all，同步本轮对话内容、给外部记忆provider，系统记忆（builtin）写 observations.md，文件记忆（multi-project）/检索记忆（external-query）为 no-op
   └─ 任务状态 TaskState: save_task_state(status=run_status)
 ```
 
-关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用 external_memory / multi_external_memory 工具（execute_tools），以及 finalize 阶段 sync_all（builtin 写 observations.md，multi-project / external-query 为 no-op）。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
+关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用 external_memory / multi_external_memory 工具（execute_tools），以及 finalize 阶段 sync_all（builtin 写 observations.md，multi-project 为 no-op，external-query 写 外部库）。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
 </details>
 
 历史消息增量三段式压缩，head 保护首 N 条 + middle LLM 摘要 + tail 末 N 条，本次摘要 = llm_summary(上次摘要 + 新增消息)。
@@ -401,8 +324,8 @@ MCP
 
 Plugin
   PluginToolExecutor -> PluginService.call_tool(name, args, context, tool_call_id)
-    ├─ lookup PluginToolRegistration + check_fn
-    ├─ 注入 plugin_config / secret_config / session_id / metadata 为 kwargs
+    ├─ lookup PluginToolRegistration + check_fn / requires_env
+    ├─ 注入 plugin_config / trusted_metadata / session_id / metadata 为 kwargs
     └─ handler(args, **kwargs) -> dict 包装
 
 Skill
@@ -417,9 +340,10 @@ Skill
 ToolService.definitions         <- 静态内置工具（BUILTIN）
 ToolService.dynamic_definitions <- 动态工具面，按 source_type 分槽
   ├─ "skill"     <- SkillService（skills_list / skill_view）
-  ├─ "knowledge" <- KnowledgeService（search_knowledge）
+  ├─ "external_memory" <- ExternalMemoryManager（provider 工具）
   ├─ "mcp"       <- McpService（site probe 后注入远端工具）
-  └─ "plugin"    <- PluginService（register(ctx) 后注入 plugin 工具）
+  ├─ "plugin"    <- PluginService（扫描启用插件后注入 plugin 工具）
+  └─ "sandbox"   <- Sandbox（execute_code / terminal）
 ```
 
 
@@ -441,8 +365,6 @@ Interface/Gateway -> ChatCompletionService -> AgentGraphRunner.execute_tools
 ```
 
 `safe_only` 策略隐藏 `ToolSourceType.AGENT` 来源工具，unattended/scheduler 默认不暴露 `execute_code`；交互通道不受影响。
-
-Dashboard API/CLI 的直接执行不经模型 tool_calls，但复用 `SandboxToolExecutor` 和同一沙盒边界。
 
 <details>
 <summary>生命周期</summary>
@@ -485,7 +407,7 @@ erDiagram
 
 ## 用户接口
 
-N-Agent 入口类型，有如下几类：
+N-Agent 用户入口类型，有如下几类：
 
 | 入口  | 传输+编码协议 | 适配器 | 应用层 | 适配器源文件 |
 |:-----|:------------|:------|:------|:-----------|
@@ -498,11 +420,36 @@ N-Agent 入口类型，有如下几类：
 
 其中，
 
-- 管理API不进入 Agent Runtime 应用层；
+- 管理API不进入 ChatCompletionService/Agent Loop；
 - OpenAI 兼容对话 API 直接进入 ChatCompletionService；
 - 飞书 IM、TUI/CLI、ACP 的用户消息先经 GatewayService 统一做入口会话、消息管理，再进入 ChatCompletionService。
 - ACP协议生命周期保留在 NAgentACPAgent 中。
 - 定时任务执行由 SchedulerRunner 定时触发，并通过 ScheduleRunService->ScheduledAgentExecutor 直接调用 ChatCompletionService，执行结果再由 ScheduleOutboundDelivery 投递。
+
+
+## 概念架构
+- Skill：结构化Prompt，控制LLM怎么想、怎么说，进而完成功能。Skill定义**业务功能**，**主决策**而非执行，这是和工具的主要区别
+- Plugin：特化工具为LLM定制的**点对点适配**，将外部工具能力、封装为LLM可调用函数FC。Plugin是本地部署的工具适配层，而非工具本身
+- MCP：面向LLM的标准协议，用于统一外部工具、资源、上下文的访问方式，类似总线协议、SPI
+
+<details>
+<summary>概念架构图</summary>
+
+```mermaid
+graph TD
+
+Skill --> LLM
+LLM --> Knowledge
+LLM --> MCP
+LLM --> Plugin
+
+Knowledge --> FC
+MCP --> FC
+Plugin --> FC
+
+FC --> externals
+```
+</details>
 
 
 # 待整理分界线
@@ -522,13 +469,13 @@ Infrastructure -> Domain
 - Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
 
-Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层的 Runtime Loop 实现细节。
+Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层的 TurnLoop 实现细节。
 
 ## 请求链路
 ```text
 客户端请求
   -> ChatCompletionService 创建/读取会话并写入用户消息
-  -> AgentGraphRunner 加载历史消息和摘要
+  -> AgentGraphRunner 准备上下文（prepare_context）
   -> LLMProvider 调用模型
   -> ToolService 校验 Policy 并执行模型请求的工具
   -> MemoryStore 写入助手消息、工具调用、任务状态和摘要
@@ -617,7 +564,7 @@ LLM tool_calls
 - 知识库工具：`search_knowledge`，按必填 kb_id 检索已注册 KB 后端。
 - Skill 工具：`skills_list` / `skill_view`，SAFE 只读，LLM 自助发现本地 SKILL.md。
 - MCP 工具：站点 probe 后动态注入远端工具，走 McpToolExecutor（兼 CompositeToolExecutor.fallback）。
-- Plugin 工具：`register(ctx)` 后动态注入，走 PluginToolExecutor，secret 独立 plugin_secrets 表存储。
+- Plugin 工具：扫描启用插件后动态注入，走 PluginToolExecutor，配置与 secret 独立存储。
 
 四类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Action` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
 

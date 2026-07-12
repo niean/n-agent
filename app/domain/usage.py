@@ -174,6 +174,8 @@ class CompressionStat:
     tokens_saved: int
     compression_ratio: float
     created_at: str
+    before_messages: str | None = None
+    after_messages: str | None = None
 
 
 class UsageRecorder(Protocol):
@@ -191,6 +193,8 @@ class UsageRecorder(Protocol):
     async def list_records(self, session_id: str, limit: int = 50) -> list[UsageRecord]: ...
     async def record_compression(
         self, session_id: str, before_tokens: int, after_tokens: int,
+        before_messages: str | None = None,
+        after_messages: str | None = None,
     ) -> None: ...
     async def list_compressions(self, session_id: str) -> list[CompressionStat]: ...
     async def get_overview_stats(self) -> OverviewStats: ...

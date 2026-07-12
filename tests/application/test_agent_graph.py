@@ -290,7 +290,7 @@ async def test_agent_graph_excludes_system_prompt_from_summary(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_load_context_dedupes_persisted_user_message(tmp_path):
+async def test_build_context_state_dedupes_persisted_user_message(tmp_path):
     """ChatCompletionService persists user messages to memory_store before
     invoking the graph, so the same message appears in both history and
     input_messages. load_context must dedupe to avoid sending duplicates."""
@@ -308,7 +308,7 @@ async def test_load_context_dedupes_persisted_user_message(tmp_path):
         HeuristicSummarizer(),
     )
     state = AgentState(session_id="s-dedup", input_messages=[user_msg])
-    await runner.load_context(state)
+    await runner.context_service.build_context_state(state)
     user_count = sum(1 for m in state.working_messages if m.get("role") == "user")
     assert user_count == 1, f"expected 1 user message, got {user_count}: {state.working_messages}"
 
@@ -446,7 +446,7 @@ async def test_agent_graph_preserves_assistant_tool_calls_for_replay(tmp_path):
 
 @pytest.mark.asyncio
 async def test_agent_graph_serializes_legacy_dict_tool_content_to_provider(tmp_path):
-    from app.application.agent_graph import _message_to_provider
+    from app.application.context_service import _message_to_provider
     from app.domain.session import ConversationMessage
 
     legacy = ConversationMessage(role="tool", content={"status": "success", "content": {"a": 1}}, tool_call_id="x")

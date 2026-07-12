@@ -111,7 +111,7 @@ async def test_compress_context_replaces_working_messages():
         ],
         summary="",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert fake_engine.compress_calls == 1
     # system message preserved
     assert new_state.working_messages[0]["role"] == "system"
@@ -150,7 +150,7 @@ async def test_compress_context_preserves_all_leading_system_messages():
         ],
         summary="",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert [m["content"] for m in new_state.working_messages[:2]] == [
         "system prompt 1",
         "system prompt 2",
@@ -172,7 +172,7 @@ async def test_compress_context_skips_when_engine_none():
         working_messages=[{"role": "system", "content": "sys"}],
         summary="",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert new_state.working_messages == state.working_messages  # unchanged
 
 
@@ -199,7 +199,7 @@ async def test_compress_context_skips_when_should_compress_false():
         ],
         summary="old summary",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert new_state.working_messages == state.working_messages
     assert new_state.summary == "old summary"
     assert len(memory_store.saved_summaries) == 0
@@ -229,7 +229,7 @@ async def test_compress_context_does_not_save_summary_when_compressor_skips():
         working_messages=[{"role": "user", "content": "msg"}],
         summary="old summary",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert new_state.summary == "old summary"
     assert memory_store.saved_summaries == []
 
@@ -265,7 +265,7 @@ async def test_compress_context_save_summary_failure_does_not_rollback():
         summary="",
     )
     # 不再抛异常
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     # append_summary_message 已调用（messages 表已更新）
     assert len(memory_store.appended_summaries) == 1
     # state 仍更新（降级接受 Dashboard 滞后）
@@ -352,7 +352,7 @@ async def test_compress_context_calls_pre_compress_all_before_compress():
         summary="",
         run_options={"external_memory_enabled": ["kb"]},
     )
-    await runner.compress_context(state)
+    await runner.context_service.compress_prepared_context(state)
     assert fake_emm.pre_compress_calls == 1
     assert fake_engine.compress_calls == 1
     # pre_compress must be called with non-system messages (rescued before compress)
@@ -384,7 +384,7 @@ async def test_compress_context_skips_pre_compress_when_should_compress_false():
         ],
         summary="",
     )
-    await runner.compress_context(state)
+    await runner.context_service.compress_prepared_context(state)
     assert fake_emm.pre_compress_calls == 0
 
 
@@ -416,7 +416,7 @@ async def test_compress_context_concatenates_rescued_context_into_summary():
         summary="",
         run_options={"external_memory_enabled": ["kb"]},
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert "RESCUED_KEY_POINTS" in new_state.summary
     assert "LLM_SUMMARY" in new_state.summary
     assert len(memory_store.saved_summaries) == 1
@@ -448,7 +448,7 @@ async def test_compress_context_does_not_append_regular_messages():
         ],
         summary="",
     )
-    await runner.compress_context(state)
+    await runner.context_service.compress_prepared_context(state)
     # No append_message (regular messages not persisted by compress_context)
     assert len(memory_store.appended_messages) == 0
     # Summary appended via append_summary_message
@@ -508,8 +508,33 @@ class FakeMemoryStoreWithHistory(FakeMemoryStore):
 
 
 @pytest.mark.asyncio
+async def test_graph_uses_prepare_context_node():
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=FakeToolServiceForLLM(),
+        memory_store=FakeMemoryStore(),
+        summarizer=None,
+        context_engine=None,
+    )
+
+    graph = runner.graph.get_graph()
+    node_names = set(graph.nodes.keys())
+    assert "prepare_context" in node_names
+    assert "load_context" not in node_names
+    assert "compress_context" not in node_names
+    assert any(
+        edge.source == "__start__" and edge.target == "prepare_context"
+        for edge in graph.edges
+    )
+    assert any(
+        edge.source == "prepare_context" and edge.target == "call_llm"
+        for edge in graph.edges
+    )
+
+
+@pytest.mark.asyncio
 async def test_e2e_compress_context_invoked_in_full_graph_flow():
-    """End-to-end: load_context loads history, compress_context compresses, call_llm replies."""
+    """End-to-end: prepare_context loads/compresses context, call_llm replies."""
     compressed_result = ContextCompressionResult(
         messages=[{"role": "user", "content": f"{CONTEXT_SUMMARY_PREFIX}E2E summary"}],
         summary="E2E summary",
@@ -518,7 +543,7 @@ async def test_e2e_compress_context_invoked_in_full_graph_flow():
     )
     fake_engine = FakeContextEngine(compressed_result)
 
-    # Pre-populate one history message (load_context will return it)
+    # Pre-populate one history message (prepare_context will load it)
     history = [
         ConversationMessage(role="user", content="past question"),
     ]
@@ -550,7 +575,7 @@ async def test_e2e_compress_context_invoked_in_full_graph_flow():
 
 
 @pytest.mark.asyncio
-async def test_load_context_keeps_all_non_summary_messages_and_latest_summary_only():
+async def test_build_context_state_keeps_all_non_summary_messages_and_latest_summary_only():
     """load_context 保留全部非摘要消息 + 仅最新一条摘要；旧摘要从上下文剔除。
 
     spec: 上下文只使用最新的摘要。head/middle/tail 非摘要消息全部保留，确保 head 保护生效。
@@ -583,7 +608,7 @@ async def test_load_context_keeps_all_non_summary_messages_and_latest_summary_on
         working_messages=[],
         summary="",
     )
-    new_state = await runner.load_context(state)
+    new_state = await runner.context_service.build_context_state(state)
     # working_messages = [system, old question 1, old reply 1, question 2, reply 2, summary 2, latest question, new input]
     assert new_state.working_messages[0]["role"] == "system"
     contents = [str(m.get("content", "")) for m in new_state.working_messages]
@@ -603,7 +628,7 @@ async def test_load_context_keeps_all_non_summary_messages_and_latest_summary_on
 
 
 @pytest.mark.asyncio
-async def test_load_context_preserves_head_messages_when_summary_appended_last():
+async def test_build_context_state_preserves_head_messages_when_summary_appended_last():
     """regression: 摘要 append 在 DB 末尾时，上下文仍按 head + summary + tail 注入。
 
     用户报告：压缩后只是把摘要加到了消息尾部，没有保留为
@@ -638,7 +663,7 @@ async def test_load_context_preserves_head_messages_when_summary_appended_last()
         working_messages=[],
         summary="",
     )
-    new_state = await runner.load_context(state)
+    new_state = await runner.context_service.build_context_state(state)
     contents = [str(m.get("content", "")) for m in new_state.working_messages]
     # head messages must survive (this was the bug)
     assert "head msg 1" in contents
@@ -660,7 +685,7 @@ async def test_load_context_preserves_head_messages_when_summary_appended_last()
 
 
 @pytest.mark.asyncio
-async def test_load_context_without_summary_returns_all_messages():
+async def test_build_context_state_without_summary_returns_all_messages():
     """无摘要时 load_context 返回全部消息（不过滤）。"""
     history = [
         ConversationMessage(role="user", content="question 1"),
@@ -681,7 +706,7 @@ async def test_load_context_without_summary_returns_all_messages():
         working_messages=[],
         summary="",
     )
-    new_state = await runner.load_context(state)
+    new_state = await runner.context_service.build_context_state(state)
     # working_messages = [system, question 1, reply 1, question 2]
     assert len(new_state.working_messages) == 4
     assert new_state.working_messages[1]["content"] == "question 1"
@@ -689,7 +714,7 @@ async def test_load_context_without_summary_returns_all_messages():
 
 
 @pytest.mark.asyncio
-async def test_load_context_filters_is_summarized_messages():
+async def test_build_context_state_filters_is_summarized_messages():
     """load_context 过滤 is_summarized=1 的消息（已被摘要吸收的 middle）。
 
     压缩成功后 middle 段被标记 is_summarized=1，load 时过滤掉，避免 middle + summary 冗余。
@@ -723,7 +748,7 @@ async def test_load_context_filters_is_summarized_messages():
         working_messages=[],
         summary="",
     )
-    new_state = await runner.load_context(state)
+    new_state = await runner.context_service.build_context_state(state)
     contents = [str(m.get("content", "")) for m in new_state.working_messages]
     # head + summary + tail + new all preserved
     assert "head q" in contents
@@ -742,7 +767,7 @@ async def test_load_context_filters_is_summarized_messages():
 
 
 @pytest.mark.asyncio
-async def test_load_context_drops_orphan_tool_messages():
+async def test_build_context_state_drops_orphan_tool_messages():
     """History loaded for a new Chat turn must not contain orphan tool messages."""
     history = [
         ConversationMessage(role="user", content="head q"),
@@ -762,13 +787,13 @@ async def test_load_context_drops_orphan_tool_messages():
         summarizer=None,
         context_engine=None,
     )
-    state = await runner.load_context(AgentState(session_id="s1"))
+    state = await runner.context_service.build_context_state(AgentState(session_id="s1"))
     assert [m.get("role") for m in state.working_messages] == ["system", "user", "user"]
     assert not any(m.get("role") == "tool" for m in state.working_messages)
 
 
 @pytest.mark.asyncio
-async def test_load_context_sanitizes_tool_pair_split_by_summary_reorder():
+async def test_build_context_state_sanitizes_tool_pair_split_by_summary_reorder():
     """Summary reordering can separate an old assistant tool_call from its tool result."""
     tool_call = {
         "id": "call-1",
@@ -803,7 +828,7 @@ async def test_load_context_sanitizes_tool_pair_split_by_summary_reorder():
         summarizer=None,
         context_engine=None,
     )
-    state = await runner.load_context(AgentState(session_id="s1"))
+    state = await runner.context_service.build_context_state(AgentState(session_id="s1"))
     contents = [str(m.get("content", "")) for m in state.working_messages]
     assert contents[1:] == [
         "head q",
@@ -854,7 +879,7 @@ async def test_compress_context_marks_middle_messages_summarized():
         summary="",
         context_message_ids=["id0", "id1", "id2", "id3"],
     )
-    await runner.compress_context(state)
+    await runner.context_service.compress_prepared_context(state)
     # mark_messages_summarized called with middle ids
     assert memory_store.summarized_message_ids == ["id1", "id2"]
 
@@ -895,7 +920,7 @@ async def test_compress_context_persists_summary_message_via_append():
         ],
         summary="",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     # append_summary_message called with ConversationMessage(is_summary=True)
     assert len(memory_store.appended_summaries) == 1
     sid, msg = memory_store.appended_summaries[0]
@@ -936,7 +961,7 @@ async def test_compress_context_append_failure_keeps_state_unchanged():
         working_messages=original_msgs.copy(),
         summary="old_summary",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     # state unchanged
     assert new_state.working_messages == original_msgs
     assert new_state.summary == "old_summary"
@@ -972,7 +997,7 @@ async def test_compress_context_rejects_result_with_zero_or_multiple_summary_mes
         ],
         summary=original_summary,
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert len(memory_store.appended_summaries) == 0
     assert new_state.working_messages == state.working_messages
     # spec Error Handling #7: state.summary must also remain unchanged
@@ -1005,7 +1030,7 @@ async def test_compress_context_rejects_result_with_zero_or_multiple_summary_mes
         ],
         summary=original_summary,
     )
-    new_state2 = await runner2.compress_context(state2)
+    new_state2 = await runner2.context_service.compress_prepared_context(state2)
     assert len(memory_store2.appended_summaries) == 0
     assert new_state2.working_messages == state2.working_messages
     assert new_state2.summary == original_summary
@@ -1036,7 +1061,7 @@ async def test_compress_context_passes_force_from_run_options():
         summary="",
         run_options={"force_compress": True},
     )
-    await runner.compress_context(state)
+    await runner.context_service.compress_prepared_context(state)
     assert fake_engine.last_should_compress_force is True
     assert fake_engine.last_compress_force is True
 
@@ -1066,7 +1091,7 @@ async def test_compress_context_does_not_force_by_default():
         summary="",
         run_options={},
     )
-    await runner.compress_context(state)
+    await runner.context_service.compress_prepared_context(state)
     assert fake_engine.last_should_compress_force is False
     assert fake_engine.last_compress_force is False
 

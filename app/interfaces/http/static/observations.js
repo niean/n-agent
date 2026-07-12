@@ -637,6 +637,8 @@
 
         const actionTd = ui.el('td');
         actionTd.style.textAlign = 'center';
+        actionTd.style.whiteSpace = 'nowrap';
+        actionTd.style.width = '1%';
         const detailBtn = ui.el('button', 'btn btn--primary');
         detailBtn.type = 'button';
         detailBtn.textContent = '详情';
@@ -656,6 +658,57 @@
     renderPage(1);
     panel.appendChild(body);
     container.appendChild(panel);
+  }
+
+  function openCompressionModal(comp) {
+    const backdrop = ui.el('div', 'modal-backdrop');
+    const dialog = ui.el('section', 'modal-dialog');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const form = ui.el('form', 'providers-form');
+    const header = ui.el('div', 'modal-header');
+    const titleEl = ui.el('h4');
+    titleEl.textContent = '压缩详情 · ' + formatTime(comp.created_at);
+    const closeBtn = ui.el('button', 'modal-close');
+    closeBtn.type = 'button';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '关闭');
+    header.append(titleEl, closeBtn);
+    form.appendChild(header);
+
+    const body = ui.el('div', 'modal-body');
+    body.style.maxHeight = '70vh';
+    body.style.overflowY = 'auto';
+
+    const ratio = Number(comp.compression_ratio || 0);
+    body.appendChild(buildKVSection('压缩统计 (Stats)', [
+      ['压缩前', formatNumber(comp.before_tokens) + ' tokens'],
+      ['压缩后', formatNumber(comp.after_tokens) + ' tokens'],
+      ['节省', formatNumber(comp.tokens_saved) + ' tokens'],
+      ['压缩比', (ratio * 100).toFixed(1) + '%'],
+    ]));
+
+    body.appendChild(buildJsonSection(
+      '压缩前 (Before · 被压缩的原始消息)',
+      '',
+      safeParseJson(comp.before_messages),
+      '(无记录或压缩时未捕获被压缩消息)'
+    ));
+    body.appendChild(buildJsonSection(
+      '压缩后 (After · 压缩后的摘要消息)',
+      '',
+      safeParseJson(comp.after_messages),
+      '(无记录或压缩时未捕获摘要消息)'
+    ));
+
+    form.appendChild(body);
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+    document.body.appendChild(backdrop);
+
+    function close() { backdrop.remove(); }
+    closeBtn.addEventListener('click', close);
+    backdrop.addEventListener('click', (ev) => { if (ev.target === backdrop) close(); });
   }
 
   function renderCompressions(container, compressions) {
@@ -691,7 +744,7 @@
       const table = ui.el('table', 'document-table');
       const thead = ui.el('thead');
       const trh = ui.el('tr');
-      ['时间', '压缩前', '压缩后', '节省', '压缩比'].forEach((h) => {
+      ['时间', '压缩前', '压缩后', '节省', '压缩比', '操作'].forEach((h) => {
         if (['压缩前', '压缩后', '节省', '压缩比'].includes(h)) appendNumericHeaderCell(trh, h);
         else appendHeaderCell(trh, h);
       });
@@ -713,6 +766,16 @@
           if (index === 0) appendTextCell(tr, val);
           else appendNumericCell(tr, val);
         });
+        const actionTd = ui.el('td');
+        actionTd.style.textAlign = 'center';
+        actionTd.style.whiteSpace = 'nowrap';
+        actionTd.style.width = '1%';
+        const detailBtn = ui.el('button', 'btn btn--primary');
+        detailBtn.type = 'button';
+        detailBtn.textContent = '详情';
+        detailBtn.addEventListener('click', () => openCompressionModal(c));
+        actionTd.appendChild(detailBtn);
+        tr.appendChild(actionTd);
         tbody.appendChild(tr);
       });
       table.appendChild(tbody);

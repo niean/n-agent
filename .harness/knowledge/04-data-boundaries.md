@@ -145,7 +145,7 @@
 
 跨字段校验：`context_compression_target_ratio` 必须 < `context_compression_threshold`，由 `Settings._validate_context_compression_ratios` model_validator(mode="after") 强制，违反抛 ValueError。
 
-上下文压缩 summary 持久化边界（增量压缩 + 摘要持久化）：`messages` 表新增 `is_summary INTEGER NOT NULL DEFAULT 0` 列（迁移函数 `_migrate_add_is_summary_column` 幂等）；`summaries` 表 schema 不变。`ContextCompressor.compress` 返回 `ContextCompressionResult`，`result.messages` 含恰好 1 条 `role="user"` + `content` 以 `CONTEXT_SUMMARY_PREFIX`（`"[CONTEXT SUMMARY]: "`，定义在 `app/domain/context.py`）开头的摘要消息。`compress_context` 节点在 `result.compressed=True` 时按 a-f 顺序：识别摘要消息 -> 构造 `ConversationMessage(is_summary=True)` -> 调 `replace_summary_message`（单连接事务 DELETE 旧 is_summary=1 + INSERT 新）-> 调 `save_summary(source_message_id=新摘要消息 id)` -> 更新 state。双写失败降级：`replace_summary_message` 失败时 state 不变；`save_summary` 失败时 messages 表已更新，summaries 表滞后一轮（Dashboard 降级），不回滚。
+上下文压缩 summary 持久化边界（增量压缩 + 摘要持久化）：`messages` 表新增 `is_summary INTEGER NOT NULL DEFAULT 0` 列（迁移函数 `_migrate_add_is_summary_column` 幂等）；`summaries` 表 schema 不变。`ContextCompressor.compress` 返回 `ContextCompressionResult`，`result.messages` 含恰好 1 条 `role="user"` + `content` 以 `CONTEXT_SUMMARY_PREFIX`（`"[CONTEXT SUMMARY]: "`，定义在 `app/domain/context.py`）开头的摘要消息。`prepare_context` 的压缩阶段在 `result.compressed=True` 时按 a-f 顺序：识别摘要消息 -> 构造 `ConversationMessage(is_summary=True)` -> 调 `replace_summary_message`（单连接事务 DELETE 旧 is_summary=1 + INSERT 新）-> 调 `save_summary(source_message_id=新摘要消息 id)` -> 更新 state。双写失败降级：`replace_summary_message` 失败时 state 不变；`save_summary` 失败时 messages 表已更新，summaries 表滞后一轮（Dashboard 降级），不回滚。
 
 Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPOSE_PROJECT_NAME`。
 

@@ -49,6 +49,30 @@ def test_usage_compressions_empty(client):
     assert r.json() == []
 
 
+def test_usage_compressions_includes_before_after_messages(client):
+    """compressions endpoint should expose before_messages/after_messages
+    fields so the frontend modal can render the comparison."""
+    r = client.post("/chat/sessions?session_id=sess-cm-api")
+    assert r.status_code == 200
+    from app.main import build_application_services
+    services = build_application_services()
+    import asyncio
+    asyncio.run(services.usage_service.record_compression(
+        "sess-cm-api", before_tokens=100, after_tokens=20,
+        before_messages='[{"role":"user","content":"hi"}]',
+        after_messages='[{"role":"user","content":"[CONTEXT SUMMARY]: s"}]',
+    ))
+    r = client.get("/chat/usage/sessions/sess-cm-api/compressions")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) >= 1
+    item = data[0]
+    assert "before_messages" in item
+    assert "after_messages" in item
+    assert item["before_messages"] is not None
+    assert item["after_messages"] is not None
+
+
 def test_usage_breakdown(client):
     r = client.post("/chat/sessions?session_id=sess-test4")
     assert r.status_code == 200

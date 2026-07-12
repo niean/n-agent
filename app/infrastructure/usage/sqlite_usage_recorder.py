@@ -99,6 +99,12 @@ class SqliteUsageRecorder:
                 )
                 """
             )
+            # compression_stats migration: add before/after messages columns
+            cs_cols = {row[1] for row in conn.execute("PRAGMA table_info(compression_stats)").fetchall()}
+            if "before_messages_json" not in cs_cols:
+                conn.execute("ALTER TABLE compression_stats ADD COLUMN before_messages_json TEXT")
+            if "after_messages_json" not in cs_cols:
+                conn.execute("ALTER TABLE compression_stats ADD COLUMN after_messages_json TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_compression_stats_session ON compression_stats(session_id)"
             )
@@ -196,6 +202,8 @@ class SqliteUsageRecorder:
 
     async def record_compression(
         self, session_id: str, before_tokens: int, after_tokens: int,
+        before_messages: str | None = None,
+        after_messages: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         saved = max(before_tokens - after_tokens, 0)
@@ -204,9 +212,11 @@ class SqliteUsageRecorder:
         try:
             conn.execute(
                 """INSERT INTO compression_stats
-                   (session_id, before_tokens, after_tokens, tokens_saved, compression_ratio, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, before_tokens, after_tokens, saved, ratio, now),
+                   (session_id, before_tokens, after_tokens, tokens_saved, compression_ratio, created_at,
+                    before_messages_json, after_messages_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, before_tokens, after_tokens, saved, ratio, now,
+                 before_messages, after_messages),
             )
             conn.commit()
         finally:
@@ -336,9 +346,14 @@ class SqliteUsageRecorder:
         )
 
     def _row_to_compression(self, row: sqlite3.Row) -> CompressionStat:
+        keys = row.keys()
+        before_msgs = row["before_messages_json"] if "before_messages_json" in keys else None
+        after_msgs = row["after_messages_json"] if "after_messages_json" in keys else None
         return CompressionStat(
             id=row["id"], session_id=row["session_id"],
             before_tokens=row["before_tokens"], after_tokens=row["after_tokens"],
             tokens_saved=row["tokens_saved"], compression_ratio=row["compression_ratio"],
             created_at=row["created_at"],
+            before_messages=before_msgs,
+            after_messages=after_msgs,
         )

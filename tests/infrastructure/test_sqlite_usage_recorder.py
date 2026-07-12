@@ -192,6 +192,28 @@ async def test_record_compression(store, tmp_path):
     assert comps[0].before_tokens == 5000
     assert comps[0].tokens_saved == 3000
     assert comps[0].compression_ratio == pytest.approx(0.4, rel=0.01)
+    assert comps[0].before_messages is None
+    assert comps[0].after_messages is None
+
+
+@pytest.mark.asyncio
+async def test_record_compression_persists_messages(store, tmp_path):
+    """record_compression should persist before/after message JSON and
+    list_compressions should return them."""
+    recorder = SqliteUsageRecorder(str(tmp_path / "test.db"))
+    await recorder.init()
+    session_id = (await store.create_session(ConversationSession(id="sess-cm", title="t"))).id
+    import json as _json
+    before_json = _json.dumps([{"role": "user", "content": "hello"}], ensure_ascii=False)
+    after_json = _json.dumps([{"role": "user", "content": "[CONTEXT SUMMARY]: summary"}], ensure_ascii=False)
+    await recorder.record_compression(
+        session_id, before_tokens=100, after_tokens=20,
+        before_messages=before_json, after_messages=after_json,
+    )
+    comps = await recorder.list_compressions(session_id)
+    assert len(comps) == 1
+    assert comps[0].before_messages == before_json
+    assert comps[0].after_messages == after_json
 
 
 @pytest.mark.asyncio

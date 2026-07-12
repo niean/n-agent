@@ -360,6 +360,10 @@ def test_fe_list_numeric_columns_are_right_aligned_and_grouped(tmp_path):
     assert "if (h === '对话轮数' || h === 'API 调用' || h === '归一化 Token') appendNumericHeaderCell(trh, h)" in observations_js
     assert "['输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)'].includes(h)" in observations_js
     assert "['压缩前', '压缩后', '节省', '压缩比'].includes(h)" in observations_js
+    assert "function openCompressionModal" in observations_js
+    assert "openCompressionModal(c)" in observations_js
+    assert "压缩前 (Before · 被压缩的原始消息)" in observations_js
+    assert "压缩后 (After · 压缩后的摘要消息)" in observations_js
     assert "formatNumber(r.normalized_tokens)" in observations_js
     assert "return n.toLocaleString()" in sandbox_js
     assert "if (['超时(秒)', '最大工具调用', '空闲回收(秒)'].includes(label)) th.className = 'document-table__numeric';" in sandbox_js

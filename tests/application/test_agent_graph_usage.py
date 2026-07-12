@@ -74,11 +74,14 @@ class FakeUsageService:
 
     async def record_compression(
         self, session_id, before_tokens, after_tokens,
+        before_messages=None, after_messages=None,
     ) -> None:
         self.record_compressions.append({
             "session_id": session_id,
             "before_tokens": before_tokens,
             "after_tokens": after_tokens,
+            "before_messages": before_messages,
+            "after_messages": after_messages,
         })
 
 
@@ -487,7 +490,7 @@ async def test_compress_context_records_compression_when_service_present(tmp_pat
         ],
         summary="",
     )
-    await runner.compress_context(state)
+    await runner.context_service.compress_prepared_context(state)
     assert len(usage_service.record_compressions) == 1
     comp = usage_service.record_compressions[0]
     assert comp["session_id"] == "sess-5"
@@ -525,5 +528,5 @@ async def test_compress_context_skips_compression_when_service_none(tmp_path):
         ],
         summary="",
     )
-    new_state = await runner.compress_context(state)
+    new_state = await runner.context_service.compress_prepared_context(state)
     assert new_state.summary == "summary"

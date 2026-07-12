@@ -164,6 +164,8 @@ def register_usage_routes(
                 "tokens_saved": c.tokens_saved,
                 "compression_ratio": c.compression_ratio,
                 "created_at": c.created_at,
+                "before_messages": c.before_messages,
+                "after_messages": c.after_messages,
             }
             for c in comps
         ]

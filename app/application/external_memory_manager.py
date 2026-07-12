@@ -359,9 +359,8 @@ class ExternalMemoryManager:
         """收集所有提供者的静态提示块，拼接到 system prompt.
 
         enabled_override: session-level override from request options; None means use global.
-        Note: build_system_prompt is called from load_context before request options
-        are available, so it typically won't get a session override. Refreshing the page
-        after global config change picks up the new configuration.
+        Note: build_system_prompt is called during prepare_context and may receive
+        the session override from run_options.
 
         For MultiProjectMemory, sets the enabled projects before building.
         """

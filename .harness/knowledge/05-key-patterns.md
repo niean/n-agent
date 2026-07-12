@@ -539,7 +539,7 @@ ACP event bridge 规则：
    - yield `DONE` 结束；`finally` 清理 `_running_tasks`/`_cancel_events`
 
 7. LangGraph Agent Loop（`AgentGraphRunner.run` → `graph.ainvoke`，详见模式三）
-   - `load_context`：`memory_store.list_messages` + `get_summary` 构造 `working_messages=[system_prompt, ...history, ...input]`；`build_system_prompt(external_memory_manager, enabled_override)` 生成 system prompt
+   - `prepare_context`：加载历史与摘要，构造 `working_messages=[system_prompt, ...history, ...input]`，并按需压缩；`build_system_prompt(external_memory_manager, enabled_override)` 生成 system prompt
    - `call_llm`：检查 `iteration_count >= iteration_limit`（默认 10）；`tool_service.list_openai_tools(safe_only?, context)`；外部记忆 `prefetch_all` 把记忆上下文拼到本次 user message 前（不修改 state）；`llm_provider.chat(api_messages, tools, False, model, options)`；`scrub_memory_context(final_message.content)` 清理回显；`pending_tool_calls = result.message.tool_calls or []`
    - `_after_llm` 路由：error→finalize / pending_tool_calls→execute_tools / 否则→update_memory
    - `execute_tools`：每个 tool_call 先 yield `TOOL_CALL_DELTA(pending)`；Approval gate（CONFIRM 风险 + `approval_decider` 注入时触发，CLI 默认无 decider）；`tool_service.execute(request, effective_context)`；yield `TOOL_CALL_DELTA(success|error, duration_ms)`；`memory_store.save_tool_call` 持久化；tool result append 到 `working_messages`
@@ -618,8 +618,8 @@ Agent Runtime 在多轮对话中 token 消耗持续增长，需在超过阈值�
 装配链路：
 1. Domain 端口（`app/domain/context.py`）：`ContextEngine` Protocol 定义 `should_compress` 与 `compress`；`ContextCompressionResult` frozen dataclass 携带 messages/summary/compressed/skipped_reason/original_tokens/compressed_tokens；`CONTEXT_SUMMARY_PREFIX`（`"[CONTEXT SUMMARY]: "`）常量定义运行时摘要消息识别前缀
 2. Infrastructure 实现（`app/infrastructure/context/context_compressor.py`）：`ContextCompressor` 实现 `ContextEngine`，注入 LLMProvider/model callable/context_length/threshold/protect_first_n/protect_last_n/summary_target_ratio/cooldown_seconds/可选 fallback_summarizer；`_find_latest_context_summary` 从后往前扫描 messages 定位最后一个 content 以 `CONTEXT_SUMMARY_PREFIX` 开头的 user 消息；`_generate_summary` 分首次路径（FIRST 模板，空 existing_summary）和迭代路径（ITERATIVE 模板，previous_summary=body）
-3. Application 节点（`app/application/agent_graph.py`）：`compress_context` 节点位于 `load_context` 与 `call_llm` 之间，调用 `context_engine.should_compress` 判定，超阈值时调 `compress` 执行压缩，按 a-f 顺序持久化（b 识别摘要消息 -> a 计算 next_summary -> c 构造 ConversationMessage(is_summary=True) -> d replace_summary_message -> e save_summary -> f 更新 state）
-4. main.py 装配（`app/main.py`）：当 `settings.context_compression_enabled=True` 时构造 `ContextCompressor` 并注入 `AgentGraphRunner.context_engine`；disabled 时 `context_engine=None`，compress_context 节点跳过压缩
+3. Application 节点（`app/application/agent_graph.py`）：`prepare_context` 内的压缩阶段调用 `context_engine.should_compress` 判定，超阈值时调 `compress` 执行压缩，按 a-f 顺序持久化（b 识别摘要消息 -> a 计算 next_summary -> c 构造 ConversationMessage(is_summary=True) -> d replace_summary_message -> e save_summary -> f 更新 state）
+4. main.py 装配（`app/main.py`）：当 `settings.context_compression_enabled=True` 时构造 `ContextCompressor` 并注入 `AgentGraphRunner.context_engine`；disabled 时 `context_engine=None`，`prepare_context` 跳过压缩
 
 增量三段式压缩规则：
 - head 段保留前 `protect_first_n` 条消息（含 system prompt + 早期关键上下文）
@@ -640,13 +640,13 @@ LLM 摘要失败回退：
 - 回退仍失败时 `skipped_reason` 标记原因，messages 原样返回不压缩
 
 外部记忆 pre_compress_all 迁移：
-- `pre_compress_all` 从 `update_memory` 迁移到 `compress_context`，仅在真正压缩时调用提取 rescued_context
-- `update_memory` 不再生成 summary（摘要职责迁移至 compress_context），避免双路径重复生成
+- `pre_compress_all` 从 `update_memory` 迁移到 `prepare_context` 的压缩阶段，仅在真正压缩时调用提取 rescued_context
+- `update_memory` 不再生成 summary（摘要职责迁移至上下文准备阶段），避免双路径重复生成
 - `prefetch_all` 仍留在 `call_llm` 节点做临时注入，不修改 state.working_messages
 
 摘要持久化边界（双标记 + 双写降级）：
 - `messages` 表新增 `is_summary INTEGER NOT NULL DEFAULT 0` 列 + partial index `idx_messages_summary_session`；`ConversationMessage.is_summary` 为 bool
-- `compress_context` 在 `result.compressed=True` 时从 result.messages 识别恰好 1 条摘要消息（role=user + content 以 `CONTEXT_SUMMARY_PREFIX` 开头），数量 != 1 时保持 state 不变
+- 压缩阶段在 `result.compressed=True` 时从 result.messages 识别恰好 1 条摘要消息（role=user + content 以 `CONTEXT_SUMMARY_PREFIX` 开头），数量 != 1 时保持 state 不变
 - `replace_summary_message`（MemoryStore 端口）：单连接事务内 DELETE 旧 is_summary=1 消息 + INSERT 新摘要消息，保证同一 session 最多 1 条 is_summary=1 消息
 - `save_summary`：写入 summaries 表，`source_message_id` 关联新摘要消息 id；`summaries.summary` 保存 state.summary（含 rescued_context），`messages` 摘要 content 保存 result.summary（纯 LLM 摘要，不含 rescued_context）
 - 双写降级：`replace_summary_message` 失败时 state 不变（state.summary 和 state.working_messages 都不更新）；`save_summary` 失败时 messages 表已更新，summaries 表滞后一轮（Dashboard 降级），不回滚
@@ -654,13 +654,13 @@ LLM 摘要失败回退：
 - Dashboard API `_message_to_dict` 返回 is_summary 字段，chat.js 对 is_summary=1 消息特殊渲染（摘要 badge + 灰色卡片，剥离前缀后展示正文）
 
 陷阱：
-- 在 `compress_context` 节点直接修改 `state.working_messages` 会污染后续 `update_memory` 落库的历史，应通过 LangGraph state 返回新值让框架替换
+- 在压缩阶段直接修改 `state.working_messages` 会污染后续 `update_memory` 落库的历史，应通过 LangGraph state 返回新值让框架替换
 - 增量压缩未做 previous_summary 提取（用 state.summary 而非 body）会把 rescued_context 混入 LLM 摘要输入，导致摘要质量退化
 - 三段式压缩未做工具组完整性对齐会在 assistant tool_calls 与 tool 消息之间截断，导致 provider API 报错（tool_calls 无对应 tool result）
 - LLM 摘要无 fallback 回退会让 LLM 故障直接中断 AgentGraph 主路径，应注入 `HeuristicSummarizer` 作为 fallback
 - cooldown 用 wall clock 会让测试等待真实时间，应注入 `_clock` callable 用 fake clock 验证
 - `replace_summary_message` 非单事务实现会在 DELETE 后 INSERT 之间因进程崩溃遗留 0 条或多条摘要消息，破坏"最多 1 条"不变量
-- `save_summary` 失败时回滚 messages 表会让下次 load_context 加载到新摘要但 summaries 表无对应记录，Dashboard 显示滞后；正确降级是接受 Dashboard 滞后一轮不回滚
+- `save_summary` 失败时回滚 messages 表会让下次上下文准备加载到新摘要但 summaries 表无对应记录，Dashboard 显示滞后；正确降级是接受 Dashboard 滞后一轮不回滚
 
 ## 模式二十三：观测与 Token 统计 DDD 装配
 
@@ -670,7 +670,7 @@ Agent Runtime 在每次 LLM 调用后需归一化 usage（五桶 token + 成本�
 1. Domain 值对象与端口（`app/domain/usage.py`）：`CanonicalUsage`（五桶 frozen dataclass，`prompt_tokens`/`total_tokens` 派生属性）、`UsageCost`（Decimal amount_usd + status + pricing_version）、`PricingEntry`、`SessionUsageStats`、`ContextBreakdown`（四类 token + total 派生）、`UsageRecord`/`CompressionStat`；端口 `UsageRecorder`/`PricingProvider`/`ContextBreakdownCalculator`
 2. Application 用例（`app/application/usage_service.py`）：`UsageService` 编排 `normalize_usage`（OpenAI prompt_tokens/completion_tokens + prompt_tokens_details.cached_tokens + completion_tokens_details.reasoning_tokens 五桶归一化；Anthropic input_tokens/output_tokens/cache_creation_input_tokens/cache_read_input_tokens 归一化）、`estimate_cost`（Decimal 精度，`get_pricing` 命中时按桶分别计算 amount_usd 并 status='estimated'，未命中 status='unknown' 且 amount_usd=0）、`record_call`/`get_session_stats`/`list_records`/`record_compression`/`list_compressions`/`get_context_breakdown`
 3. Infrastructure 实现（`app/infrastructure/usage/`）：`SqliteUsageRecorder` 实现 `UsageRecorder`，sessions 表迁移幂等（`_COLUMN_SPECS` table + PRAGMA table_info 检查列存在再 ALTER），`record_call` 在单连接内 INSERT usage_records + UPDATE sessions 累加（`input_tokens = input_tokens + ?` 等增量累加，`api_call_count = api_call_count + 1`）；`InMemoryPricingProvider` 硬编码 9 款主流模型定价，`get_pricing` 按 model 前缀最长匹配；`ContextBreakdownCalculatorImpl` 复用 ContextCompressor 的 ~4 chars/token 估算逻辑按 system_prompt/tool_definitions/memory/conversation 四类分桶
-4. agent_graph 集成（`app/application/agent_graph.py`）：`call_llm` 在 LLM 调用前捕获 `call_start = time.monotonic()`，调用后从 `LLMResult.usage` 提取 raw_usage 调 `usage_service.record_call(session_id, model, provider, raw_usage, latency_ms, provider_kind)`，record 成功后输出 `logger.info("API call model=... provider=... in=... out=... total=... latency=Nms")`；`compress_context` 在 `result.compressed=True` 时调 `usage_service.record_compression(session_id, before_tokens, after_tokens)`；usage_service 为 None 或 record 异常均不阻塞主流程
+4. agent_graph 集成（`app/application/agent_graph.py`）：`call_llm` 在 LLM 调用前捕获 `call_start = time.monotonic()`，调用后从 `LLMResult.usage` 提取 raw_usage 调 `usage_service.record_call(session_id, model, provider, raw_usage, latency_ms, provider_kind)`，record 成功后输出 `logger.info("API call model=... provider=... in=... out=... total=... latency=Nms")`；上下文压缩成功时调 `usage_service.record_compression(session_id, before_tokens, after_tokens)`；usage_service 为 None 或 record 异常均不阻塞主流程
 5. main.py 装配（`app/main.py`）：组装 `UsageService(SqliteUsageRecorder, InMemoryPricingProvider, ContextBreakdownCalculatorImpl)`，`_run_sync` 处理 async init；`ApplicationServices.usage_service` 暴露；`AgentGraphRunner(usage_service=...)` 和 `create_dashboard_router(usage_service=...)` 注入
 6. Interfaces 暴露（`app/interfaces/http/usage_routes.py` + `app/interfaces/cli/commands/usage.py` + `app/interfaces/http/static/observations.js`）：HTTP `/chat/usage/sessions/{id}` 系列端点（records 端点 `limit: int = Query(50, ge=1, le=500)` 防越界，breakdown 端点 list_messages/tool_service 失败 `logger.warning(..., exc_info=True)` 降级空列表不阻塞响应）；CLI `n-agent usage [session_id]` 沿用 `_load_usage_service()` inline 模式；Dashboard 观测页三段布局（6 卡片总览 + 4 类条形图 + 调用历史表格 + 压缩收益折叠区），全 textContent 渲染
 

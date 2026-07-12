@@ -28,12 +28,12 @@ def _settings(tmp_path: Path, *, compression_enabled: bool = True) -> Settings:
 def test_context_compressor_wired_when_enabled(tmp_path: Path):
     services = build_application_services(_settings(tmp_path))
     runner = services.chat_service.graph_runner
-    assert runner.context_engine is not None
+    assert runner.context_service.context_engine is not None
     from app.infrastructure.context.context_compressor import ContextCompressor
-    assert isinstance(runner.context_engine, ContextCompressor)
+    assert isinstance(runner.context_service.context_engine, ContextCompressor)
 
 
 def test_context_compressor_not_wired_when_disabled(tmp_path: Path):
     services = build_application_services(_settings(tmp_path, compression_enabled=False))
     runner = services.chat_service.graph_runner
-    assert runner.context_engine is None
+    assert runner.context_service.context_engine is None

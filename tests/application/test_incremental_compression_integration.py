@@ -61,8 +61,7 @@ async def test_incremental_compression_second_round_uses_iterative_path(tmp_path
         working_messages=[{"role": "system", "content": "sys"}],
         input_messages=[], summary="",
     )
-    state1 = await runner.load_context(state1)
-    state1 = await runner.compress_context(state1)
+    state1 = await runner.prepare_context(state1)
 
     assert state1.summary == "summary round 1"
     msgs1 = await store.list_messages(sid)
@@ -80,9 +79,9 @@ async def test_incremental_compression_second_round_uses_iterative_path(tmp_path
         working_messages=[{"role": "system", "content": "sys"}],
         input_messages=[], summary=state1.summary,
     )
-    state2 = await runner.load_context(state2)
+    state2 = await runner.context_service.build_context_state(state2)
     assert any(m.get("content", "").startswith(CONTEXT_SUMMARY_PREFIX) for m in state2.working_messages)
-    state2 = await runner.compress_context(state2)
+    state2 = await runner.context_service.compress_prepared_context(state2)
 
     assert state2.summary == "summary round 2"
     msgs2 = await store.list_messages(sid)
@@ -127,8 +126,7 @@ async def test_incremental_compression_summary_accumulated_not_replaced(tmp_path
             working_messages=[{"role": "system", "content": "sys"}],
             input_messages=[], summary="",
         )
-        state = await runner.load_context(state)
-        state = await runner.compress_context(state)
+        state = await runner.prepare_context(state)
 
     msgs = await store.list_messages(sid)
     summaries = [m for m in msgs if m.is_summary]

@@ -123,9 +123,15 @@ class UsageService:
 
     async def record_compression(
         self, session_id: str, before_tokens: int, after_tokens: int,
+        before_messages: str | None = None,
+        after_messages: str | None = None,
     ) -> None:
         try:
-            await self._recorder.record_compression(session_id, before_tokens, after_tokens)
+            await self._recorder.record_compression(
+                session_id, before_tokens, after_tokens,
+                before_messages=before_messages,
+                after_messages=after_messages,
+            )
         except Exception:
             logger.exception("failed to record compression for session=%s", session_id)
 

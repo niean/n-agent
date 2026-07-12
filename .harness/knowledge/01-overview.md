@@ -29,7 +29,7 @@ N-Agent 是面向 Open-WebUI 和本地调试的 Python Agent 服务，通过 Fas
 1. 请求进入：Open-WebUI、curl 或 Dashboard 调用 `/v1/chat/completions`。
 2. 协议转换：Interfaces 层将 OpenAI-compatible 请求转换为 Application 层 `ChatCompletionInput`。
 3. 会话持久化：`ChatCompletionService` 根据 `metadata.session_id`、`X-Session-ID` 或临时 id 创建/绑定会话，并保存用户消息。
-4. Agent Loop：`AgentGraphRunner` 通过 LangGraph 执行 `load_context -> call_llm -> execute_tools -> update_memory -> finalize`。
+4. TurnLoop：`AgentGraphRunner` 通过 LangGraph 执行 `prepare_context -> call_llm -> execute_tools -> update_memory -> finalize`。
 5. 模型调用：`call_llm` 只依赖 Domain `LLMProvider` 端口；当前 Infrastructure 实现为 OpenAI-compatible Provider。
 6. 工具执行：Tool Registry 暴露服务端 safe 工具 schema；模型返回 tool_calls 后由 `ToolService` 执行，并写入 tool message 和 tool_calls 表。
 7. 记忆更新：SQLite 保存 sessions、messages、tool_calls、task_states、summaries，摘要由 `HeuristicSummarizer` 生成。
