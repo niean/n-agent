@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from app.domain.usage import (
     CanonicalUsage, CompressionStat, OverviewStats, SessionUsageStats,
     SessionUsageSummary, UsageCost, UsageRecord,
+    compute_normalized_tokens,
 )
 
 # (column_name, sql_type, default_value)
@@ -175,6 +176,9 @@ class SqliteUsageRecorder:
                 api_call_count=row["api_call_count"],
                 estimated_cost_usd=str(row["estimated_cost_usd"]),
                 cost_status=row["cost_status"],
+                normalized_tokens=compute_normalized_tokens(
+                    row["input_tokens"], row["cache_read_tokens"], row["output_tokens"],
+                ),
             )
         finally:
             conn.close()
@@ -212,7 +216,7 @@ class SqliteUsageRecorder:
         conn = self._connect()
         try:
             rows = conn.execute(
-                """SELECT * FROM compression_stats WHERE session_id = ? ORDER BY id ASC""",
+                """SELECT * FROM compression_stats WHERE session_id = ? ORDER BY created_at DESC""",
                 (session_id,),
             ).fetchall()
             return [self._row_to_compression(r) for r in rows]
@@ -247,6 +251,9 @@ class SqliteUsageRecorder:
                 api_call_count=row["api_call_count"],
                 estimated_cost_usd=str(row["estimated_cost_usd"]),
                 session_count=row["session_count"],
+                normalized_tokens=compute_normalized_tokens(
+                    row["input_tokens"], row["cache_read_tokens"], row["output_tokens"],
+                ),
             )
         finally:
             conn.close()
@@ -261,12 +268,16 @@ class SqliteUsageRecorder:
         try:
             total = conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"]
             rows = conn.execute(
-                """SELECT id, title, created_at, source,
-                          input_tokens, output_tokens, cache_read_tokens,
-                          cache_write_tokens, reasoning_tokens, total_tokens,
-                          api_call_count, estimated_cost_usd, cost_status
-                   FROM sessions
-                   ORDER BY updated_at DESC, id DESC
+                """SELECT s.id, s.title, s.created_at, s.source,
+                          s.input_tokens, s.output_tokens, s.cache_read_tokens,
+                          s.cache_write_tokens, s.reasoning_tokens, s.total_tokens,
+                          s.api_call_count, s.estimated_cost_usd, s.cost_status,
+                          (SELECT COUNT(*) FROM messages m
+                           WHERE m.session_id = s.id
+                             AND m.role = 'user'
+                             AND m.is_summary = 0) AS turn_count
+                   FROM sessions s
+                   ORDER BY s.updated_at DESC, s.id DESC
                    LIMIT ? OFFSET ?""",
                 (page_size, offset),
             ).fetchall()
@@ -285,6 +296,10 @@ class SqliteUsageRecorder:
                     api_call_count=r["api_call_count"],
                     estimated_cost_usd=str(r["estimated_cost_usd"]),
                     cost_status=r["cost_status"],
+                    normalized_tokens=compute_normalized_tokens(
+                        r["input_tokens"], r["cache_read_tokens"], r["output_tokens"],
+                    ),
+                    turn_count=r["turn_count"] if "turn_count" in r.keys() else 0,
                 )
                 for r in rows
             ]
@@ -315,6 +330,9 @@ class SqliteUsageRecorder:
             response_message=resp_msg,
             tools=tools,
             generation_params=gen_params,
+            normalized_tokens=compute_normalized_tokens(
+                row["input_tokens"], row["cache_read_tokens"], row["output_tokens"],
+            ),
         )
 
     def _row_to_compression(self, row: sqlite3.Row) -> CompressionStat:

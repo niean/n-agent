@@ -16,6 +16,31 @@
     return n.toLocaleString();
   }
 
+  function appendHeaderCell(row, label, className) {
+    const th = ui.el('th', className || '');
+    th.textContent = label;
+    row.appendChild(th);
+    return th;
+  }
+
+  function appendNumericHeaderCell(row, label) {
+    return appendHeaderCell(row, label, 'document-table__numeric');
+  }
+
+  function appendNumericCell(row, value) {
+    const td = ui.el('td', 'document-table__numeric');
+    td.textContent = value;
+    row.appendChild(td);
+    return td;
+  }
+
+  function appendTextCell(row, value) {
+    const td = ui.el('td');
+    td.textContent = value;
+    row.appendChild(td);
+    return td;
+  }
+
   function formatCost(value) {
     const n = Number(value || 0);
     if (!isFinite(n)) return '0';
@@ -80,6 +105,61 @@
     return { totalPages, pages };
   }
 
+  function buildPager(page, total, pageSize, onPageChange) {
+    const { totalPages, pages } = buildPagination(page, total, pageSize);
+    const pager = ui.el('div', 'observations-pager');
+    pager.style.display = 'flex';
+    pager.style.justifyContent = 'flex-end';
+    pager.style.alignItems = 'center';
+    pager.style.gap = '12px';
+    pager.style.marginTop = '12px';
+    const start = (page - 1) * pageSize + 1;
+    const end = Math.min(page * pageSize, total);
+    const info = ui.el('span', 'observations-pager__info');
+    info.textContent = '第 ' + start + '-' + end + ' 条 / 共 ' + total + ' 条';
+    pager.appendChild(info);
+
+    const ctrl = ui.el('div', 'observations-pager__ctrl');
+    ctrl.style.display = 'flex';
+    ctrl.style.alignItems = 'center';
+    ctrl.style.gap = '4px';
+    const prevBtn = ui.el('button', 'btn');
+    prevBtn.type = 'button';
+    prevBtn.textContent = '<';
+    prevBtn.setAttribute('aria-label', '上一页');
+    prevBtn.disabled = page <= 1;
+    if (prevBtn.disabled) prevBtn.classList.add('btn--disabled');
+    prevBtn.addEventListener('click', () => onPageChange(page - 1));
+    ctrl.appendChild(prevBtn);
+
+    pages.forEach((p) => {
+      if (p === '...') {
+        const dots = ui.el('span', 'observations-pager__dots');
+        dots.textContent = '...';
+        ctrl.appendChild(dots);
+      } else {
+        const btn = ui.el('button', 'btn');
+        btn.type = 'button';
+        btn.textContent = String(p);
+        if (p === page) btn.classList.add('btn--primary');
+        btn.addEventListener('click', () => onPageChange(p));
+        ctrl.appendChild(btn);
+      }
+    });
+
+    const nextBtn = ui.el('button', 'btn');
+    nextBtn.type = 'button';
+    nextBtn.textContent = '>';
+    nextBtn.setAttribute('aria-label', '下一页');
+    nextBtn.disabled = page >= totalPages;
+    if (nextBtn.disabled) nextBtn.classList.add('btn--disabled');
+    nextBtn.addEventListener('click', () => onPageChange(page + 1));
+    ctrl.appendChild(nextBtn);
+
+    pager.appendChild(ctrl);
+    return pager;
+  }
+
   function renderOverviewCards(container, stats) {
     const panel = ui.el('section', 'status-panel');
     const header = ui.el('div', 'panel-header');
@@ -97,8 +177,7 @@
       { label: '缓存读', value: formatNumber(stats.cache_read_tokens) },
       { label: '缓存写', value: formatNumber(stats.cache_write_tokens) },
       { label: '缓存命中率', value: formatCacheHitRate(stats) },
-      { label: '总 Token', value: formatNumber(stats.total_tokens) },
-      { label: '成本 (USD)', value: formatCost(stats.estimated_cost_usd) },
+      { label: '归一化 Token', value: formatNumber(stats.normalized_tokens) },
       { label: 'API 调用数', value: formatNumber(stats.api_call_count) },
     ];
     cards.forEach((c) => {
@@ -136,10 +215,9 @@
     const table = ui.el('table', 'document-table');
     const thead = ui.el('thead');
     const trh = ui.el('tr');
-    ['标题', '来源', 'ID', 'API 调用', '总 Token', '成本', '操作'].forEach((h) => {
-      const th = ui.el('th');
-      th.textContent = h;
-      trh.appendChild(th);
+    ['标题', '来源', 'ID', '对话轮数', 'API 调用', '归一化 Token', '操作'].forEach((h) => {
+      if (h === '对话轮数' || h === 'API 调用' || h === '归一化 Token') appendNumericHeaderCell(trh, h);
+      else appendHeaderCell(trh, h);
     });
     thead.appendChild(trh);
     table.appendChild(thead);
@@ -155,15 +233,10 @@
       idTd.style.fontFamily = 'monospace';
       idTd.style.fontSize = '12px';
       idTd.textContent = s.session_id || '';
-      const apiTd = ui.el('td');
-      apiTd.style.textAlign = 'right';
-      apiTd.textContent = formatNumber(s.api_call_count);
-      const totalTd = ui.el('td');
-      totalTd.style.textAlign = 'right';
-      totalTd.textContent = formatNumber(s.total_tokens);
-      const costTd = ui.el('td');
-      costTd.style.textAlign = 'right';
-      costTd.textContent = formatCost(s.estimated_cost_usd);
+      tr.append(titleTd, sourceTd, idTd);
+      appendNumericCell(tr, formatNumber(s.turn_count));
+      const apiTd = appendNumericCell(tr, formatNumber(s.api_call_count));
+      const normTd = appendNumericCell(tr, formatNumber(s.normalized_tokens));
       const actionTd = ui.el('td');
       actionTd.style.textAlign = 'center';
       const detailBtn = ui.el('button', 'btn btn--primary');
@@ -173,62 +246,14 @@
         route.goToDetail(s.session_id);
       });
       actionTd.appendChild(detailBtn);
-      tr.append(titleTd, sourceTd, idTd, apiTd, totalTd, costTd, actionTd);
+      tr.appendChild(actionTd);
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
     body.appendChild(table);
 
     // Pagination
-    const { totalPages, pages } = buildPagination(page, total, pageSize);
-    const pager = ui.el('div', 'observations-pager');
-    pager.style.display = 'flex';
-    pager.style.justifyContent = 'flex-end';
-    pager.style.alignItems = 'center';
-    pager.style.gap = '12px';
-    pager.style.marginTop = '12px';
-    const start = (page - 1) * pageSize + 1;
-    const end = Math.min(page * pageSize, total);
-    const info = ui.el('span', 'observations-pager__info');
-    info.textContent = '第 ' + start + '-' + end + ' 条 / 共 ' + total + ' 条';
-    pager.appendChild(info);
-
-    const ctrl = ui.el('div', 'observations-pager__ctrl');
-    ctrl.style.display = 'flex';
-    ctrl.style.alignItems = 'center';
-    ctrl.style.gap = '4px';
-    const prevBtn = ui.el('button', 'btn');
-    prevBtn.type = 'button';
-    prevBtn.textContent = '上一页';
-    prevBtn.disabled = page <= 1;
-    if (prevBtn.disabled) prevBtn.classList.add('btn--disabled');
-    prevBtn.addEventListener('click', () => route.goToPage(page - 1));
-    ctrl.appendChild(prevBtn);
-
-    pages.forEach((p) => {
-      if (p === '...') {
-        const dots = ui.el('span', 'observations-pager__dots');
-        dots.textContent = '...';
-        ctrl.appendChild(dots);
-      } else {
-        const btn = ui.el('button', 'btn');
-        btn.type = 'button';
-        btn.textContent = String(p);
-        if (p === page) btn.classList.add('btn--primary');
-        btn.addEventListener('click', () => route.goToPage(p));
-        ctrl.appendChild(btn);
-      }
-    });
-
-    const nextBtn = ui.el('button', 'btn');
-    nextBtn.type = 'button';
-    nextBtn.textContent = '下一页';
-    nextBtn.disabled = page >= totalPages;
-    if (nextBtn.disabled) nextBtn.classList.add('btn--disabled');
-    nextBtn.addEventListener('click', () => route.goToPage(page + 1));
-    ctrl.appendChild(nextBtn);
-
-    pager.appendChild(ctrl);
+    const pager = buildPager(page, total, pageSize, (p) => route.goToPage(p));
     body.appendChild(pager);
 
     panel.appendChild(body);
@@ -255,6 +280,14 @@
   }
 
   function renderStatsBar(container, stats) {
+    const panel = ui.el('section', 'status-panel');
+    const header = ui.el('div', 'panel-header');
+    const title = ui.el('span');
+    title.textContent = '会话总览';
+    header.appendChild(title);
+    panel.appendChild(header);
+
+    const body = ui.el('div', 'panel-body');
     const bar = ui.el('div', 'stats-bar observations-stats-bar');
     const cards = [
       { label: '输入 Token', value: formatNumber(stats.input_tokens) },
@@ -262,8 +295,7 @@
       { label: '缓存读', value: formatNumber(stats.cache_read_tokens) },
       { label: '缓存写', value: formatNumber(stats.cache_write_tokens) },
       { label: '缓存命中率', value: formatCacheHitRate(stats) },
-      { label: '总 Token', value: formatNumber(stats.total_tokens) },
-      { label: '成本 (USD)', value: formatCost(stats.estimated_cost_usd) },
+      { label: '归一化 Token', value: formatNumber(stats.normalized_tokens) },
       { label: 'API 调用数', value: formatNumber(stats.api_call_count) },
     ];
     cards.forEach((c) => {
@@ -275,7 +307,9 @@
       card.append(value, label);
       bar.appendChild(card);
     });
-    container.appendChild(bar);
+    body.appendChild(bar);
+    panel.appendChild(body);
+    container.appendChild(panel);
   }
 
   function renderBreakdown(container, breakdown) {
@@ -350,6 +384,32 @@
     return section;
   }
 
+  const COPY_ICON_SVG = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"/><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"/></svg>';
+  const CHECK_ICON_SVG = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"/></svg>';
+
+  async function copyToClipboard(text) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) { /* fall through to legacy path */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '0';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return !!ok;
+    } catch (_) { return false; }
+  }
+
   function buildJsonSection(title, subtitle, jsonValue, emptyHint, options) {
     const opts = options || {};
     const section = ui.el('div', 'observations-json-section');
@@ -367,21 +427,50 @@
     } else {
       t.textContent = titleText;
     }
+    const wrap = ui.el('div', 'observations-json-pre-wrap');
     const pre = ui.el('pre', 'sandbox-detail-output');
     pre.style.maxHeight = '280px';
-    pre.textContent = jsonValue ? JSON.stringify(jsonValue, null, 2) : emptyHint;
+    const jsonText = jsonValue ? JSON.stringify(jsonValue, null, 2) : '';
+    pre.textContent = jsonText || emptyHint;
+    wrap.appendChild(pre);
+
+    if (jsonValue) {
+      const copyBtn = ui.el('button', 'observations-json-copy');
+      copyBtn.type = 'button';
+      copyBtn.setAttribute('aria-label', '复制 JSON');
+      copyBtn.title = '复制';
+      copyBtn.innerHTML = COPY_ICON_SVG;
+      let resetTimer = null;
+      copyBtn.addEventListener('click', async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const ok = await copyToClipboard(jsonText);
+        if (resetTimer) { clearTimeout(resetTimer); resetTimer = null; }
+        copyBtn.innerHTML = ok ? CHECK_ICON_SVG : COPY_ICON_SVG;
+        copyBtn.classList.toggle('observations-json-copy--done', ok);
+        copyBtn.title = ok ? '已复制' : '复制失败，请手动选择文本';
+        resetTimer = setTimeout(() => {
+          copyBtn.innerHTML = COPY_ICON_SVG;
+          copyBtn.classList.remove('observations-json-copy--done');
+          copyBtn.title = '复制';
+          resetTimer = null;
+        }, 1200);
+      });
+      wrap.appendChild(copyBtn);
+    }
+
     if (opts.collapsible) {
-      pre.hidden = !!opts.defaultCollapsed;
+      wrap.hidden = !!opts.defaultCollapsed;
       section.classList.toggle('observations-json-section--collapsed', !!opts.defaultCollapsed);
       t.addEventListener('click', () => {
-        const collapsed = !pre.hidden;
-        pre.hidden = collapsed;
+        const collapsed = !wrap.hidden;
+        wrap.hidden = collapsed;
         section.classList.toggle('observations-json-section--collapsed', collapsed);
         t.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
       });
     }
     section.appendChild(t);
-    section.appendChild(pre);
+    section.appendChild(wrap);
     return section;
   }
 
@@ -412,7 +501,7 @@
       ['缓存读', formatNumber(record.cache_read_tokens)],
       ['缓存写', formatNumber(record.cache_write_tokens)],
       ['推理', formatNumber(record.reasoning_tokens)],
-      ['总计', formatNumber(record.total_tokens)],
+      ['归一化', formatNumber(record.normalized_tokens)],
       ['估算成本', formatCost(record.estimated_cost_usd)],
       ['状态', record.cost_status || '-'],
     ]));
@@ -491,141 +580,151 @@
       return;
     }
 
-    const table = ui.el('table', 'document-table');
-    const thead = ui.el('thead');
-    const trh = ui.el('tr');
-    ['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '总计', '成本', '延迟', '操作'].forEach((h) => {
-      const th = ui.el('th');
-      th.textContent = h;
-      trh.appendChild(th);
-    });
-    thead.appendChild(trh);
-    table.appendChild(thead);
+    const total = records.length;
+    function renderPage(page) {
+      const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      page = Math.max(1, Math.min(page, totalPages));
+      body.replaceChildren();
+      const start = (page - 1) * PAGE_SIZE;
+      const end = Math.min(start + PAGE_SIZE, total);
+      const pageItems = records.slice(start, end);
 
-    const tbody = ui.el('tbody');
-    records.forEach((r) => {
-      const tr = ui.el('tr');
-      const timeTd = ui.el('td');
-      timeTd.textContent = formatTime(r.created_at);
-      tr.appendChild(timeTd);
-
-      const modelTd = ui.el('td');
-      modelTd.textContent = r.model || '-';
-      if (r.requested_model && r.requested_model !== r.model) {
-        modelTd.title = '请求模型: ' + r.requested_model;
-        const hint = ui.el('span');
-        hint.style.color = 'var(--color-fg-subtle, #909399)';
-        hint.style.fontSize = '11px';
-        hint.style.marginLeft = '4px';
-        hint.textContent = '(' + r.requested_model + ')';
-        modelTd.appendChild(hint);
-      }
-      tr.appendChild(modelTd);
-
-      const triggerTd = ui.el('td');
-      triggerTd.textContent = r.trigger_type || '-';
-      tr.appendChild(triggerTd);
-
-      [
-        formatNumber(r.input_tokens),
-        formatNumber(r.output_tokens),
-        formatNumber(r.cache_read_tokens),
-        formatNumber(r.cache_write_tokens),
-        formatCacheHitRate(r),
-        formatNumber(r.total_tokens),
-        formatCost(r.estimated_cost_usd),
-        r.latency_ms != null ? r.latency_ms + 'ms' : '-',
-      ].forEach((c) => {
-        const td = ui.el('td');
-        td.textContent = c;
-        tr.appendChild(td);
+      const table = ui.el('table', 'document-table');
+      const thead = ui.el('thead');
+      const trh = ui.el('tr');
+      ['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)', '操作'].forEach((h) => {
+        if (['输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)'].includes(h)) appendNumericHeaderCell(trh, h);
+        else appendHeaderCell(trh, h);
       });
+      thead.appendChild(trh);
+      table.appendChild(thead);
 
-      const actionTd = ui.el('td');
-      actionTd.style.textAlign = 'center';
-      const detailBtn = ui.el('button', 'btn btn--primary');
-      detailBtn.type = 'button';
-      detailBtn.textContent = '详情';
-      detailBtn.addEventListener('click', () => openRecordModal(r));
-      actionTd.appendChild(detailBtn);
-      tr.appendChild(actionTd);
+      const tbody = ui.el('tbody');
+      pageItems.forEach((r) => {
+        const tr = ui.el('tr');
+        const timeTd = ui.el('td');
+        timeTd.textContent = formatTime(r.created_at);
+        tr.appendChild(timeTd);
 
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-    body.appendChild(table);
+        const modelTd = ui.el('td');
+        modelTd.textContent = r.model || '-';
+        if (r.requested_model && r.requested_model !== r.model) {
+          modelTd.title = '请求模型: ' + r.requested_model;
+          const hint = ui.el('span');
+          hint.style.color = 'var(--color-fg-subtle, #909399)';
+          hint.style.fontSize = '11px';
+          hint.style.marginLeft = '4px';
+          hint.textContent = '(' + r.requested_model + ')';
+          modelTd.appendChild(hint);
+        }
+        tr.appendChild(modelTd);
+
+        const triggerTd = ui.el('td');
+        triggerTd.textContent = r.trigger_type || '-';
+        tr.appendChild(triggerTd);
+
+        [
+          formatNumber(r.input_tokens),
+          formatNumber(r.output_tokens),
+          formatNumber(r.cache_read_tokens),
+          formatNumber(r.cache_write_tokens),
+          formatCacheHitRate(r),
+          formatNumber(r.normalized_tokens),
+          r.latency_ms != null ? formatNumber(r.latency_ms) : '-',
+        ].forEach((c) => {
+          appendNumericCell(tr, c);
+        });
+
+        const actionTd = ui.el('td');
+        actionTd.style.textAlign = 'center';
+        const detailBtn = ui.el('button', 'btn btn--primary');
+        detailBtn.type = 'button';
+        detailBtn.textContent = '详情';
+        detailBtn.addEventListener('click', () => openRecordModal(r));
+        actionTd.appendChild(detailBtn);
+        tr.appendChild(actionTd);
+
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      body.appendChild(table);
+
+      const pager = buildPager(page, total, PAGE_SIZE, (p) => renderPage(p));
+      body.appendChild(pager);
+    }
+
+    renderPage(1);
     panel.appendChild(body);
     container.appendChild(panel);
   }
 
   function renderCompressions(container, compressions) {
-    const panel = ui.el('section', 'status-panel status-panel--collapsible');
-    const header = ui.el('button', 'panel-header');
-    header.type = 'button';
-    header.setAttribute('aria-expanded', 'false');
-    header.setAttribute('aria-controls', 'observations-compressions-body');
+    const panel = ui.el('section', 'status-panel');
+    const header = ui.el('div', 'panel-header');
     const title = ui.el('span');
     title.textContent = '上下文压缩记录';
-    const chevron = ui.el('span', 'panel-header__chevron');
-    chevron.setAttribute('aria-hidden', 'true');
-    chevron.textContent = '▶';
-    header.append(title, chevron);
+    header.appendChild(title);
     panel.appendChild(header);
 
     const body = ui.el('div', 'panel-body');
-    body.id = 'observations-compressions-body';
-    body.style.display = 'none';
     if (!compressions || !compressions.length) {
       ui.renderEmpty(body, '暂无压缩记录');
       panel.appendChild(body);
       container.appendChild(panel);
-      header.addEventListener('click', () => {
-        const open = body.style.display === 'none';
-        body.style.display = open ? 'block' : 'none';
-        header.setAttribute('aria-expanded', open ? 'true' : 'false');
-      });
       return;
     }
 
-    const table = ui.el('table', 'document-table');
-    const thead = ui.el('thead');
-    const trh = ui.el('tr');
-    ['时间', '压缩前', '压缩后', '节省', '压缩比'].forEach((h) => {
-      const th = ui.el('th');
-      th.textContent = h;
-      trh.appendChild(th);
+    const sorted = compressions.slice().sort((a, b) => {
+      const ta = a && a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b && b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
     });
-    thead.appendChild(trh);
-    table.appendChild(thead);
+    const total = sorted.length;
+    function renderPage(page) {
+      const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+      page = Math.max(1, Math.min(page, totalPages));
+      body.replaceChildren();
+      const start = (page - 1) * PAGE_SIZE;
+      const end = Math.min(start + PAGE_SIZE, total);
+      const pageItems = sorted.slice(start, end);
 
-    const tbody = ui.el('tbody');
-    compressions.forEach((c) => {
-      const tr = ui.el('tr');
-      const ratio = Number(c.compression_ratio || 0);
-      const cells = [
-        formatTime(c.created_at),
-        formatNumber(c.before_tokens),
-        formatNumber(c.after_tokens),
-        formatNumber(c.tokens_saved),
-        (ratio * 100).toFixed(1) + '%',
-      ];
-      cells.forEach((val) => {
-        const td = ui.el('td');
-        td.textContent = val;
-        tr.appendChild(td);
+      const table = ui.el('table', 'document-table');
+      const thead = ui.el('thead');
+      const trh = ui.el('tr');
+      ['时间', '压缩前', '压缩后', '节省', '压缩比'].forEach((h) => {
+        if (['压缩前', '压缩后', '节省', '压缩比'].includes(h)) appendNumericHeaderCell(trh, h);
+        else appendHeaderCell(trh, h);
       });
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-    body.appendChild(table);
+      thead.appendChild(trh);
+      table.appendChild(thead);
+
+      const tbody = ui.el('tbody');
+      pageItems.forEach((c) => {
+        const tr = ui.el('tr');
+        const ratio = Number(c.compression_ratio || 0);
+        const cells = [
+          formatTime(c.created_at),
+          formatNumber(c.before_tokens),
+          formatNumber(c.after_tokens),
+          formatNumber(c.tokens_saved),
+          (ratio * 100).toFixed(1) + '%',
+        ];
+        cells.forEach((val, index) => {
+          if (index === 0) appendTextCell(tr, val);
+          else appendNumericCell(tr, val);
+        });
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      body.appendChild(table);
+
+      const pager = buildPager(page, total, PAGE_SIZE, (p) => renderPage(p));
+      body.appendChild(pager);
+    }
+
+    renderPage(1);
     panel.appendChild(body);
     container.appendChild(panel);
-
-    header.addEventListener('click', () => {
-      const open = body.style.display === 'none';
-      body.style.display = open ? 'block' : 'none';
-      header.setAttribute('aria-expanded', open ? 'true' : 'false');
-    });
   }
 
   async function renderIndex(page) {

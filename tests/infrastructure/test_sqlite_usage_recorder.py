@@ -25,9 +25,22 @@ async def test_record_call_persists_usage(store, tmp_path):
     assert stats.input_tokens == 100
     assert stats.output_tokens == 50
     assert stats.api_call_count == 1
+    # Tn = 100 + 10*0.2 + 50*5 = 100 + 2 + 250 = 352
+    assert stats.normalized_tokens == 352
     records = await recorder.list_records(session_id)
     assert len(records) == 1
     assert records[0].input_tokens == 100
+    assert records[0].normalized_tokens == 352
+
+
+@pytest.mark.asyncio
+async def test_normalized_tokens_zero_for_empty_session(store, tmp_path):
+    """Session with no API calls should report normalized_tokens=0."""
+    recorder = SqliteUsageRecorder(str(tmp_path / "test.db"))
+    await recorder.init()
+    session_id = (await store.create_session(ConversationSession(id="sess-empty", title="t"))).id
+    stats = await recorder.get_session_stats(session_id)
+    assert stats.normalized_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -220,6 +233,8 @@ async def test_get_overview_stats_aggregates_across_sessions(store, tmp_path):
     assert stats.cache_read_tokens == 40
     assert stats.api_call_count == 2
     assert float(stats.estimated_cost_usd) == pytest.approx(0.02, rel=0.001)
+    # Tn = 400 + 40*0.2 + 200*5 = 400 + 8 + 1000 = 1408
+    assert stats.normalized_tokens == 1408
 
 
 @pytest.mark.asyncio
@@ -252,6 +267,15 @@ async def test_list_sessions_paginated_returns_total_and_page(store, tmp_path):
     summaries, total = await recorder.list_sessions_paginated(page=1, page_size=2)
     assert total == 5
     assert len(summaries) == 2
+    # Each session i has input_tokens=(i+1)*10, no output/cache
+    # Tn for session 4 (i=4): (4+1)*10 * 1 = 50
+    # Tn for session 3 (i=3): (3+1)*10 * 1 = 40
+    # Sessions are ordered by updated_at DESC, id DESC, so first page returns
+    # the most recently created sessions. Verify normalized_tokens is populated
+    # and matches formula for each returned row.
+    for s in summaries:
+        assert s.normalized_tokens == s.input_tokens  # no cache/output
+
 
     summaries_p2, total_p2 = await recorder.list_sessions_paginated(page=2, page_size=2)
     assert total_p2 == 5
@@ -281,3 +305,44 @@ async def test_list_sessions_paginated_clamps_invalid_input(store, tmp_path):
     summaries_far, total_far = await recorder.list_sessions_paginated(page=99, page_size=10)
     assert total_far == 1
     assert summaries_far == []
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_paginated_turn_count_counts_user_messages(store, tmp_path):
+    """turn_count should equal the number of non-summary user messages in
+    each session. Assistant/tool/system messages and summary messages are
+    excluded."""
+    from app.domain.session import ConversationMessage
+
+    recorder = SqliteUsageRecorder(str(tmp_path / "test.db"))
+    await recorder.init()
+    sid = (await store.create_session(ConversationSession(id="tc-1", title="t"))).id
+    # 3 user turns + 2 assistant + 1 tool result + 1 summary user message
+    await store.append_message(sid, ConversationMessage(role="user", content="q1"))
+    await store.append_message(sid, ConversationMessage(role="assistant", content="a1"))
+    await store.append_message(sid, ConversationMessage(role="user", content="q2"))
+    await store.append_message(sid, ConversationMessage(role="assistant", content="a2"))
+    await store.append_message(sid, ConversationMessage(role="user", content="q3"))
+    await store.append_message(sid, ConversationMessage(role="tool", tool_call_id="t1", content="tr"))
+    from app.domain.context import CONTEXT_SUMMARY_PREFIX
+    await store.append_summary_message(
+        sid, ConversationMessage(role="user", content=CONTEXT_SUMMARY_PREFIX + "summary", is_summary=True),
+    )
+
+    summaries, _ = await recorder.list_sessions_paginated(page=1, page_size=10)
+    match = [s for s in summaries if s.session_id == sid]
+    assert len(match) == 1
+    assert match[0].turn_count == 3
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_paginated_turn_count_zero_for_empty_session(store, tmp_path):
+    """Session with no messages should report turn_count=0."""
+    recorder = SqliteUsageRecorder(str(tmp_path / "test.db"))
+    await recorder.init()
+    await store.create_session(ConversationSession(id="tc-empty", title="t"))
+
+    summaries, _ = await recorder.list_sessions_paginated(page=1, page_size=10)
+    match = [s for s in summaries if s.session_id == "tc-empty"]
+    assert len(match) == 1
+    assert match[0].turn_count == 0

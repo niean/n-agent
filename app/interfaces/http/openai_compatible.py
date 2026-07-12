@@ -156,7 +156,7 @@ async def _sse(events: AsyncIterator[ChatEvent], model: str) -> AsyncIterator[st
             yield "data: [DONE]\n\n"
             continue
         chunk = _chunk_for_event(event, model)
-        yield f"data: {json.dumps(chunk)}\n\n"
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
 def _chunk_for_event(event: ChatEvent, model: str) -> dict[str, Any]:

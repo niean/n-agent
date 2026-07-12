@@ -67,6 +67,21 @@ async def test_exec_command_success_returns_success_status(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_exec_command_disables_docker_cli_hints(tmp_path: Path):
+    sandbox = _make_sandbox(tmp_path)
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    result = await sandbox.exec_command(
+        "printf '%s' \"$DOCKER_CLI_HINTS\"", str(workdir), 30
+    )
+
+    assert result.status is SandboxStatus.SUCCESS
+    assert result.returncode == 0
+    assert result.stdout == "false"
+
+
+@pytest.mark.asyncio
 async def test_exec_command_nonzero_returncode_still_success(tmp_path: Path):
     """Shell semantics: non-zero exit means the command ran but failed."""
     sandbox = _make_sandbox(tmp_path)

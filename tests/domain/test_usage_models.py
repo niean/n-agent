@@ -4,6 +4,10 @@ from app.domain.usage import (
     OverviewStats, SessionUsageSummary, ContextBreakdown,
     UsageRecord, CompressionStat,
     UsageRecorder, PricingProvider, ContextBreakdownCalculator,
+    compute_normalized_tokens,
+    NORMALIZED_TOKEN_INPUT_COEFFICIENT,
+    NORMALIZED_TOKEN_CACHE_READ_COEFFICIENT,
+    NORMALIZED_TOKEN_OUTPUT_COEFFICIENT,
 )
 
 def test_canonical_usage_defaults():
@@ -16,6 +20,7 @@ def test_canonical_usage_defaults():
     assert u.request_count == 1
     assert u.prompt_tokens == 0
     assert u.total_tokens == 0
+    assert u.normalized_tokens == 0
 
 def test_canonical_usage_prompt_tokens_includes_cache():
     u = CanonicalUsage(input_tokens=100, cache_read_tokens=50, cache_write_tokens=20)
@@ -25,6 +30,37 @@ def test_canonical_usage_prompt_tokens_includes_cache():
 def test_canonical_usage_total_tokens():
     u = CanonicalUsage(input_tokens=100, output_tokens=50, reasoning_tokens=10)
     assert u.total_tokens == 160
+
+def test_canonical_usage_normalized_tokens_formula():
+    """Tn = Ti + Tic*0.2 + To*5"""
+    u = CanonicalUsage(input_tokens=100, output_tokens=50, cache_read_tokens=10)
+    # 100 + 10*0.2 + 50*5 = 100 + 2 + 250 = 352
+    assert u.normalized_tokens == 352
+
+def test_canonical_usage_normalized_tokens_zero():
+    u = CanonicalUsage()
+    assert u.normalized_tokens == 0
+
+def test_canonical_usage_normalized_tokens_cache_only():
+    """Cache read only: 0 + 5727*0.2 + 0 = 1145.4 -> 1145"""
+    u = CanonicalUsage(cache_read_tokens=5727)
+    assert u.normalized_tokens == 1145
+
+def test_canonical_usage_normalized_tokens_rounding():
+    """0.2*5 = 1.0 -> round to 1"""
+    u = CanonicalUsage(cache_read_tokens=5)
+    # 0 + 5*0.2 + 0 = 1.0 -> 1
+    assert u.normalized_tokens == 1
+
+def test_compute_normalized_tokens_function():
+    assert compute_normalized_tokens(0, 0, 0) == 0
+    assert compute_normalized_tokens(100, 10, 50) == 352
+    assert compute_normalized_tokens(0, 5727, 0) == 1145
+
+def test_normalized_token_coefficients():
+    assert NORMALIZED_TOKEN_INPUT_COEFFICIENT == 1.0
+    assert NORMALIZED_TOKEN_CACHE_READ_COEFFICIENT == 0.2
+    assert NORMALIZED_TOKEN_OUTPUT_COEFFICIENT == 5.0
 
 def test_usage_cost_frozen():
     c = UsageCost(amount_usd="0.05", status="estimated", pricing_version="2026-07")
@@ -52,11 +88,13 @@ def test_overview_stats_defaults():
     assert o.api_call_count == 0
     assert o.estimated_cost_usd == "0"
     assert o.session_count == 0
+    assert o.normalized_tokens == 0
 
 
 def test_overview_stats_frozen():
-    o = OverviewStats(input_tokens=100, output_tokens=50, total_tokens=150, session_count=3)
+    o = OverviewStats(input_tokens=100, output_tokens=50, total_tokens=150, session_count=3, normalized_tokens=352)
     assert o.session_count == 3
+    assert o.normalized_tokens == 352
     try:
         o.input_tokens = 999  # type: ignore[misc]
         raised = False
@@ -70,6 +108,7 @@ def test_session_usage_summary_fields():
     assert s.session_id == "sess-1"
     assert s.api_call_count == 0
     assert s.cost_status == "unknown"
+    assert s.normalized_tokens == 0
 
 
 def test_protocols_exist():

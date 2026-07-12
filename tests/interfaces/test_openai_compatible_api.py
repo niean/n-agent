@@ -126,6 +126,24 @@ def test_streaming_chat_completion(tmp_path):
     assert "data: [DONE]" in text
 
 
+def test_streaming_chat_completion_emits_chinese_as_original_chars(tmp_path):
+    """SSE chunks must use ensure_ascii=False so Chinese characters appear as
+    original characters (not \\uXXXX escape sequences) in the response stream."""
+    provider = FakeProvider(final_content="你好，世界")
+    client, _ = build_client(tmp_path, provider=provider)
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "test-model", "stream": True, "metadata": {"session_id": "s-zh"}, "messages": [{"role": "user", "content": "use tool"}]},
+    ) as response:
+        text = "".join(response.iter_text())
+
+    assert "你好，世界" in text
+    assert "\\u4f60" not in text  # no ascii-escaped unicode for "你"
+    assert "\\u4e16" not in text  # no ascii-escaped unicode for "世"
+
+
 def test_tool_call_loop_persists_tool_call(tmp_path):
     client, store = build_client(tmp_path)
 

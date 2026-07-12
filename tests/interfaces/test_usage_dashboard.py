@@ -29,6 +29,8 @@ def test_usage_session_stats(client):
     assert "input_tokens" in data
     assert "api_call_count" in data
     assert "estimated_cost_usd" in data
+    assert "normalized_tokens" in data
+    assert isinstance(data["normalized_tokens"], int)
 
 
 def test_usage_records_empty(client):
@@ -69,6 +71,7 @@ def test_usage_overview_empty(client):
     assert "input_tokens" in data
     assert "output_tokens" in data
     assert "total_tokens" in data
+    assert "normalized_tokens" in data
     assert "api_call_count" in data
     assert "session_count" in data
     assert "estimated_cost_usd" in data
@@ -77,6 +80,7 @@ def test_usage_overview_empty(client):
     assert "reasoning_tokens" in data
     assert isinstance(data["session_count"], int)
     assert data["session_count"] >= 0
+    assert isinstance(data["normalized_tokens"], int)
 
 
 def test_usage_overview_after_session(client):
@@ -106,7 +110,10 @@ def test_usage_sessions_pagination(client):
         assert "session_id" in item
         assert "title" in item
         assert "total_tokens" in item
+        assert "normalized_tokens" in item
         assert "api_call_count" in item
+        assert "turn_count" in item
+        assert isinstance(item["turn_count"], int)
 
 
 def test_usage_sessions_pagination_validates_params(client):

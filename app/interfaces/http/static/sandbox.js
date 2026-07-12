@@ -28,10 +28,22 @@
     return `${tz.getUTCFullYear()}-${pad(tz.getUTCMonth() + 1)}-${pad(tz.getUTCDate())} ${pad(tz.getUTCHours())}:${pad(tz.getUTCMinutes())}:${pad(tz.getUTCSeconds())}`;
   }
 
+  function formatNumber(value) {
+    const n = Number(value || 0);
+    if (!isFinite(n)) return '0';
+    return n.toLocaleString();
+  }
+
   function appendCell(row, value) {
     const td = document.createElement('td');
     td.textContent = value == null || value === '' ? '-' : String(value);
     row.appendChild(td);
+    return td;
+  }
+
+  function appendNumericCell(row, value) {
+    const td = appendCell(row, value);
+    td.className = 'document-table__numeric';
     return td;
   }
 
@@ -231,6 +243,7 @@
     const headerRow = document.createElement('tr');
     ['类型', '启用', '超时(秒)', '最大工具调用', '空闲回收(秒)', '回调工具'].forEach((label) => {
       const th = document.createElement('th');
+      if (['超时(秒)', '最大工具调用', '空闲回收(秒)'].includes(label)) th.className = 'document-table__numeric';
       th.textContent = label;
       headerRow.appendChild(th);
     });
@@ -241,9 +254,9 @@
       const tr = document.createElement('tr');
       appendCell(tr, r.sandbox_type);
       appendBadgeCell(tr, r.enabled ? '是' : '否', r.enabled ? 'success' : 'warning');
-      appendCell(tr, r.timeout_seconds);
-      appendCell(tr, r.max_tool_calls);
-      appendCell(tr, isDocker ? r.idle_seconds : '-');
+      appendNumericCell(tr, r.timeout_seconds == null ? '-' : formatNumber(r.timeout_seconds));
+      appendNumericCell(tr, r.max_tool_calls == null ? '-' : formatNumber(r.max_tool_calls));
+      appendNumericCell(tr, isDocker && r.idle_seconds != null ? formatNumber(r.idle_seconds) : '-');
       appendCell(tr, (r.callback_tools || []).join(', '));
       tbody.appendChild(tr);
     });
@@ -336,6 +349,7 @@
     const headerRow = document.createElement('tr');
     ['时间', 'Session', 'code_hash', '工具名称', '状态', '耗时(ms)', '操作'].forEach((label) => {
       const th = document.createElement('th');
+      if (label === '耗时(ms)') th.className = 'document-table__numeric';
       th.textContent = label;
       headerRow.appendChild(th);
     });
@@ -350,7 +364,7 @@
       appendCell(tr, shortHash(args.code_hash || ''));
       appendCell(tr, it.tool_name || it.execution_type || 'execute_code');
       appendBadgeCell(tr, it.status || '-', statusBadge(it.status));
-      appendCell(tr, it.duration_ms);
+      appendNumericCell(tr, it.duration_ms == null ? '-' : formatNumber(it.duration_ms));
       const actions = document.createElement('td');
       actions.className = 'row-actions';
       actions.append(button('删除', 'btn', () => deleteHistory(it.id)));

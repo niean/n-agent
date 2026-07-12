@@ -4,6 +4,34 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+# 归一化 Token 系数：Tn = Ti + Tic*0.2 + To*5
+# Ti 标准输入(系数1)，Tic 输入缓存(2折)，To 输出(5倍单价)
+NORMALIZED_TOKEN_INPUT_COEFFICIENT: float = 1.0
+NORMALIZED_TOKEN_CACHE_READ_COEFFICIENT: float = 0.2
+NORMALIZED_TOKEN_OUTPUT_COEFFICIENT: float = 5.0
+
+
+def compute_normalized_tokens(
+    input_tokens: int,
+    cache_read_tokens: int,
+    output_tokens: int,
+) -> int:
+    """归一化 Token 总量: Tn = Ti + Tic*0.2 + To*5.
+
+    将不同计价维度的 token 折算为标准输入等价量：
+    - 输入 token (Ti) 系数 1（基准）
+    - 输入缓存 token (Tic) 系数 0.2（缓存读 2 折）
+    - 输出 token (To) 系数 5（输出 5 倍单价）
+
+    结果四舍五入为 int，与其它 token 字段保持类型一致。
+    """
+    value = (
+        input_tokens * NORMALIZED_TOKEN_INPUT_COEFFICIENT
+        + cache_read_tokens * NORMALIZED_TOKEN_CACHE_READ_COEFFICIENT
+        + output_tokens * NORMALIZED_TOKEN_OUTPUT_COEFFICIENT
+    )
+    return int(round(value))
+
 
 @dataclass(frozen=True)
 class CanonicalUsage:
@@ -22,6 +50,12 @@ class CanonicalUsage:
     @property
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.output_tokens + self.reasoning_tokens
+
+    @property
+    def normalized_tokens(self) -> int:
+        return compute_normalized_tokens(
+            self.input_tokens, self.cache_read_tokens, self.output_tokens,
+        )
 
 
 @dataclass(frozen=True)
@@ -55,6 +89,7 @@ class SessionUsageStats:
     api_call_count: int = 0
     estimated_cost_usd: str = "0"
     cost_status: str = "unknown"
+    normalized_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -69,6 +104,7 @@ class OverviewStats:
     api_call_count: int = 0
     estimated_cost_usd: str = "0"
     session_count: int = 0
+    normalized_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -88,6 +124,8 @@ class SessionUsageSummary:
     api_call_count: int = 0
     estimated_cost_usd: str = "0"
     cost_status: str = "unknown"
+    normalized_tokens: int = 0
+    turn_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -124,6 +162,7 @@ class UsageRecord:
     response_message: str | None = None
     tools: str | None = None
     generation_params: str | None = None
+    normalized_tokens: int = 0
 
 
 @dataclass(frozen=True)

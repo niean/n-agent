@@ -43,6 +43,7 @@ def _scrub_env(base: dict | None = None) -> dict:
         if lk.startswith(_SAFE_ENV_PREFIXES_LOWER) or lk in ("user", "shell"):
             scrubbed[k] = v
     scrubbed["PYTHONUNBUFFERED"] = "1"
+    scrubbed["DOCKER_CLI_HINTS"] = "false"
     return scrubbed
 
 

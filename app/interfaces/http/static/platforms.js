@@ -13,6 +13,12 @@
     return String(value);
   }
 
+  function formatNumber(value) {
+    const n = Number(value || 0);
+    if (!isFinite(n)) return '0';
+    return n.toLocaleString();
+  }
+
   function formatDate(value) {
     if (!value) return '-';
     const date = new Date(value);
@@ -33,6 +39,10 @@
     node.textContent = content;
     parent.appendChild(node);
     return node;
+  }
+
+  function appendNumericText(parent, tag, content) {
+    return appendText(parent, tag, content, 'document-table__numeric');
   }
 
   function badge(value, kind) {
@@ -91,7 +101,10 @@
     table.className = 'document-table';
     const thead = document.createElement('thead');
     const header = document.createElement('tr');
-    ['平台', '类型', '状态', '会话数', '最近活跃', '配置', '操作'].forEach((label) => appendText(header, 'th', label));
+    ['平台', '类型', '状态', '会话数', '最近活跃', '配置', '操作'].forEach((label) => {
+      if (label === '会话数') appendNumericText(header, 'th', label);
+      else appendText(header, 'th', label);
+    });
     thead.appendChild(header);
     table.appendChild(thead);
 
@@ -112,7 +125,7 @@
     status.appendChild(badge(text(platform.status), statusKind(platform.status)));
     if (platform.error_message) appendText(status, 'div', platform.error_message, 'muted');
     row.appendChild(status);
-    appendText(row, 'td', text(platform.session_count, '0'));
+    appendNumericText(row, 'td', formatNumber(platform.session_count));
     appendText(row, 'td', formatDate(platform.last_active_at));
     appendText(row, 'td', formatConfig(platform.config_summary));
     const actions = document.createElement('td');

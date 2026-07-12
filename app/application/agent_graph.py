@@ -511,6 +511,21 @@ class AgentGraphRunner:
                 state.assistant_tool_messages.append(result.message)
             state.working_messages.append(result.message)
 
+            # ----- 应用日志：完整打印 LLM 调用的输入、输出 -----
+            # 与 usage recording 解耦：即使 usage_service 为 None 或 result.usage
+            # 为空，也输出输入/输出日志，便于排查 LLM 行为。复用已计算的 json cache
+            # 避免重复序列化。response 在 scrub_memory_context 之后打印，保证日志
+            # 内容与持久化一致。
+            response_json_cache = json.dumps(result.message, default=str, ensure_ascii=False)
+            logger.info(
+                "LLM request: session=%s model=%s request=%s",
+                state.session_id, model, request_json_cache,
+            )
+            logger.info(
+                "LLM response: session=%s model=%s response=%s",
+                state.session_id, model, response_json_cache,
+            )
+
             # ----- usage recording (T6) -----
             # Record only when usage_service is wired AND provider returned a
             # non-empty usage dict. provider_kind/provider/model are derived
@@ -522,7 +537,6 @@ class AgentGraphRunner:
                 provider_kind, provider_name, real_model, requested_model = self._resolve_usage_meta(model)
                 trigger_type = self._resolve_trigger_type(state)
                 try:
-                    response_json = json.dumps(result.message, default=str, ensure_ascii=False)
                     await self.usage_service.record_call(
                         session_id=state.session_id,
                         model=real_model,
@@ -533,17 +547,9 @@ class AgentGraphRunner:
                         requested_model=requested_model,
                         trigger_type=trigger_type,
                         request_messages=request_json_cache,
-                        response_message=response_json,
+                        response_message=response_json_cache,
                         tools=tools_json_cache,
                         generation_params=gen_params_json_cache,
-                    )
-                    logger.info(
-                        "API call model=%s provider=%s in=%s out=%s total=%s latency=%dms",
-                        real_model, provider_name,
-                        result.usage.get("prompt_tokens", result.usage.get("input_tokens", 0)),
-                        result.usage.get("completion_tokens", result.usage.get("output_tokens", 0)),
-                        result.usage.get("total_tokens", 0),
-                        latency_ms,
                     )
                 except Exception:
                     logger.exception(

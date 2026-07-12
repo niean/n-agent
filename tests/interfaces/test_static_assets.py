@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
+from pathlib import Path
 import shutil
 import subprocess
 
@@ -338,9 +339,45 @@ def test_observations_cache_metrics_split_read_and_write(tmp_path):
     assert 'function formatCacheHitRate(item)' in observations_js
     assert 'return formatPercent(read, input + read + write)' in observations_js
     assert "{ label: '缓存读', value: formatNumber(stats.cache_read_tokens) },\n      { label: '缓存写', value: formatNumber(stats.cache_write_tokens) }" in observations_js
-    assert "['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '总计', '成本', '延迟', '操作']" in observations_js
-    assert "formatNumber(r.cache_read_tokens),\n        formatNumber(r.cache_write_tokens),\n        formatCacheHitRate(r)" in observations_js
+    assert "['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)', '操作']" in observations_js
+    assert "formatNumber(r.cache_read_tokens),\n          formatNumber(r.cache_write_tokens),\n          formatCacheHitRate(r)" in observations_js
     assert '缓存 Token' not in observations_js
+
+
+def test_fe_list_numeric_columns_are_right_aligned_and_grouped(tmp_path):
+    client = _client(tmp_path)
+    guidelines = Path('.harness/framework/guides/10-guidelines-fe.md').read_text(encoding='utf-8')
+    css_body = client.get('/static/styles.css').text
+    observations_js = client.get('/static/observations.js').text
+    sandbox_js = client.get('/static/sandbox.js').text
+
+    assert '数字列的列头名称与数据取值均右对齐，数据取值采用千分位法展示' in guidelines
+    assert '.document-table th.document-table__numeric, .document-table td.document-table__numeric { text-align: right; white-space: nowrap; }' in css_body
+    assert "return n.toLocaleString()" in observations_js
+    assert "function appendNumericHeaderCell(row, label)" in observations_js
+    assert "function appendNumericCell(row, value)" in observations_js
+    assert "if (h === '对话轮数' || h === 'API 调用' || h === '归一化 Token') appendNumericHeaderCell(trh, h)" in observations_js
+    assert "['输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)'].includes(h)" in observations_js
+    assert "['压缩前', '压缩后', '节省', '压缩比'].includes(h)" in observations_js
+    assert "formatNumber(r.normalized_tokens)" in observations_js
+    assert "return n.toLocaleString()" in sandbox_js
+    assert "if (['超时(秒)', '最大工具调用', '空闲回收(秒)'].includes(label)) th.className = 'document-table__numeric';" in sandbox_js
+    assert "appendNumericCell(tr, r.timeout_seconds == null ? '-' : formatNumber(r.timeout_seconds));" in sandbox_js
+    assert "appendNumericCell(tr, r.max_tool_calls == null ? '-' : formatNumber(r.max_tool_calls));" in sandbox_js
+    assert "appendNumericCell(tr, isDocker && r.idle_seconds != null ? formatNumber(r.idle_seconds) : '-');" in sandbox_js
+    assert "if (label === '耗时(ms)') th.className = 'document-table__numeric';" in sandbox_js
+    assert "appendNumericCell(tr, it.duration_ms == null ? '-' : formatNumber(it.duration_ms));" in sandbox_js
+
+
+def test_platform_list_session_count_is_numeric_column(tmp_path):
+    client = _client(tmp_path)
+    platforms_js = client.get('/static/platforms.js').text
+
+    assert "function formatNumber(value)" in platforms_js
+    assert "return n.toLocaleString()" in platforms_js
+    assert "function appendNumericText(parent, tag, content)" in platforms_js
+    assert "if (label === '会话数') appendNumericText(header, 'th', label);" in platforms_js
+    assert "appendNumericText(row, 'td', formatNumber(platform.session_count));" in platforms_js
 
 
 def test_current_session_refresh_renders_persisted_messages(tmp_path):
@@ -582,6 +619,25 @@ def test_management_ui_exports_el_helper(tmp_path):
     body = client.get('/static/management-ui.js').text
     assert 'el,' in body or 'el }' in body or 'el:' in body
     assert 'createElement' in body
+
+
+def test_modal_locks_background_scroll_and_traps_focus(tmp_path):
+    """Modal open must lock body scroll (overflow:hidden via body.modal-open)
+    and trap Tab focus within the topmost modal."""
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    assert 'body.modal-open' in css
+    assert 'overflow: hidden' in css
+
+    js = client.get('/static/management-ui.js').text
+    # body class synced via MutationObserver on document.body
+    assert 'MutationObserver' in js
+    assert 'modal-open' in js
+    assert 'openModalBackdrops' in js or "querySelectorAll('.modal-backdrop')" in js
+    # Tab key focus trap
+    assert "event.key !== 'Tab'" in js
+    assert 'focusableElements' in js
+    assert 'focusTopModal' in js
 
 
 def test_skills_js_present_and_safe(tmp_path):

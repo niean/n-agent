@@ -37,6 +37,7 @@ def _stats_dict(stats: Any) -> dict[str, Any]:
         "cache_write_tokens": stats.cache_write_tokens,
         "reasoning_tokens": stats.reasoning_tokens,
         "total_tokens": stats.total_tokens,
+        "normalized_tokens": getattr(stats, "normalized_tokens", 0),
         "api_call_count": stats.api_call_count,
         "estimated_cost_usd": stats.estimated_cost_usd,
         "cost_status": stats.cost_status,
@@ -54,6 +55,7 @@ def _record_dict(r: Any) -> dict[str, Any]:
         "cache_write_tokens": r.cache_write_tokens,
         "reasoning_tokens": r.reasoning_tokens,
         "total_tokens": r.total_tokens,
+        "normalized_tokens": getattr(r, "normalized_tokens", 0),
         "estimated_cost_usd": r.estimated_cost_usd,
         "cost_status": r.cost_status,
         "latency_ms": r.latency_ms,
@@ -105,7 +107,7 @@ def _render_session_tables(session_id: str, stats: Any, records: list, compressi
     stats_table.add_row("Cache read", str(stats.cache_read_tokens))
     stats_table.add_row("Cache write", str(stats.cache_write_tokens))
     stats_table.add_row("Reasoning", str(stats.reasoning_tokens))
-    stats_table.add_row("Total", str(stats.total_tokens))
+    stats_table.add_row("Normalized", str(getattr(stats, "normalized_tokens", 0)))
     stats_table.add_row("API calls", str(stats.api_call_count))
     stats_table.add_row("Cost (USD)", str(stats.estimated_cost_usd))
     stats_table.add_row("Cost status", str(stats.cost_status))
@@ -113,7 +115,7 @@ def _render_session_tables(session_id: str, stats: Any, records: list, compressi
 
     if records:
         rt = Table(title="Recent API Calls", show_header=True)
-        for col in ("Time", "Model", "In", "Out", "Cache", "Total", "Cost", "Latency"):
+        for col in ("Time", "Model", "In", "Out", "Cache", "Norm", "Cost", "Latency"):
             rt.add_column(col)
         for r in records[:20]:
             cache_total = (r.cache_read_tokens or 0) + (r.cache_write_tokens or 0)
@@ -123,7 +125,7 @@ def _render_session_tables(session_id: str, stats: Any, records: list, compressi
                 str(r.input_tokens),
                 str(r.output_tokens),
                 str(cache_total),
-                str(r.total_tokens),
+                str(getattr(r, "normalized_tokens", 0)),
                 str(r.estimated_cost_usd),
                 f"{r.latency_ms}ms" if r.latency_ms is not None else "-",
             )
@@ -157,14 +159,14 @@ def _cmd_recent(args) -> int:
         console.print("[dim](no recent sessions)[/dim]")
         return 0
     table = Table(title="Recent Sessions", show_header=True)
-    for col in ("Session ID", "Title", "API Calls", "Total Tokens", "Cost (USD)", "Status"):
+    for col in ("Session ID", "Title", "API Calls", "Norm Tokens", "Cost (USD)", "Status"):
         table.add_column(col)
     for s in sessions:
         table.add_row(
             str(s.get("session_id", "")),
             str(s.get("title", "") or "-"),
             str(s.get("api_call_count", 0)),
-            str(s.get("total_tokens", 0)),
+            str(s.get("normalized_tokens", 0)),
             str(s.get("estimated_cost_usd", "0")),
             str(s.get("cost_status", "unknown")),
         )
@@ -187,6 +189,7 @@ async def _gather_recent_sessions(service: Any) -> list[dict[str, Any]]:
                 "title": getattr(session, "title", "") or "",
                 "api_call_count": stats.api_call_count,
                 "total_tokens": stats.total_tokens,
+                "normalized_tokens": getattr(stats, "normalized_tokens", 0),
                 "estimated_cost_usd": stats.estimated_cost_usd,
                 "cost_status": stats.cost_status,
             })
@@ -197,6 +200,7 @@ async def _gather_recent_sessions(service: Any) -> list[dict[str, Any]]:
                 "title": getattr(session, "title", "") or "",
                 "api_call_count": 0,
                 "total_tokens": 0,
+                "normalized_tokens": 0,
                 "estimated_cost_usd": "0",
                 "cost_status": "unknown",
             })

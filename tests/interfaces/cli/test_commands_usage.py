@@ -29,6 +29,7 @@ class _FakeUsageService:
             api_call_count=2,
             estimated_cost_usd="0.0123",
             cost_status="estimated",
+            normalized_tokens=352,
         )
 
     async def list_records(self, session_id, limit=50):
@@ -39,6 +40,7 @@ class _FakeUsageService:
                 input_tokens=100, output_tokens=50, cache_read_tokens=10, cache_write_tokens=5,
                 reasoning_tokens=0, total_tokens=165, estimated_cost_usd="0.0123",
                 cost_status="estimated", latency_ms=200, created_at="2026-07-11T10:00:00Z",
+                normalized_tokens=352,
             ),
         ]
 
@@ -70,15 +72,18 @@ def test_usage_command_help():
 def test_usage_command_with_session_renders_stats(monkeypatch, capsys):
     fake = _FakeUsageService()
     monkeypatch.setattr(usage, "_load_usage_service", lambda: fake)
-    rc = usage.run(_args(session_id="sess-1"))
+    # form=True forces table render path (resolve_format defaults to json)
+    rc = usage.run(_args(session_id="sess-1", form=True))
     assert rc == 0
     assert fake.stats_returned
     assert fake.records_returned
     assert fake.compressions_returned
     out = capsys.readouterr().out
     assert "sess-1" in out
-    assert "165" in out
     assert "gpt-4o" in out
+    assert "352" in out  # normalized_tokens
+    # total_tokens (165) should NOT appear in table render (FE dropped)
+    assert "165" not in out
 
 
 def test_usage_command_json_output(monkeypatch, capsys):
@@ -89,6 +94,7 @@ def test_usage_command_json_output(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert '"session_id": "sess-1"' in out
     assert '"total_tokens": 165' in out
+    assert '"normalized_tokens": 352' in out
 
 
 def test_usage_command_no_session_runs_without_error(monkeypatch, capsys):

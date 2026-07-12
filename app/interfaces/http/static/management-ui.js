@@ -146,4 +146,63 @@
   global.NAGENT = namespace;
   global.NAGENT.ui = { byId, clear, appendText, appendBadge, renderJson, renderEmpty, renderLoading, renderError, el };
   global.NAGENT.modal = { confirm, alert };
+
+  function openModalBackdrops() {
+    return Array.from(document.querySelectorAll('.modal-backdrop')).filter(
+      (m) => !m.hidden && document.body.contains(m),
+    );
+  }
+
+  function syncModalBodyLock() {
+    document.body.classList.toggle('modal-open', openModalBackdrops().length > 0);
+  }
+
+  function focusableElements(container) {
+    if (!container) return [];
+    return Array.from(
+      container.querySelectorAll(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((node) => !node.disabled && node.offsetParent !== null);
+  }
+
+  function focusTopModal() {
+    const modals = openModalBackdrops();
+    if (!modals.length) return;
+    const top = modals[modals.length - 1];
+    if (top.contains(document.activeElement)) return;
+    const focusable = focusableElements(top);
+    if (focusable.length) focusable[0].focus();
+  }
+
+  function handleModalTabKey(event) {
+    if (event.key !== 'Tab') return;
+    const modals = openModalBackdrops();
+    if (!modals.length) return;
+    const top = modals[modals.length - 1];
+    const focusable = focusableElements(top);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (!top.contains(active)) {
+      event.preventDefault();
+      first.focus();
+      return;
+    }
+    if (event.shiftKey && active === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  const modalObserver = new MutationObserver(() => {
+    syncModalBodyLock();
+    focusTopModal();
+  });
+  modalObserver.observe(document.body, { childList: true, subtree: false });
+  document.addEventListener('keydown', handleModalTabKey);
 }(window));

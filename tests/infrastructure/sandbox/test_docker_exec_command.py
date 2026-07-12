@@ -152,6 +152,14 @@ async def test_exec_command_success_returns_success_status(monkeypatch):
     assert result.duration_seconds >= 0.0
     # Two create_subprocess_exec calls: write step + exec step
     assert mock_create.await_count == 2
+    first_call = mock_create.await_args_list[0]
+    assert first_call.kwargs["env"]["DOCKER_CLI_HINTS"] == "false"
+    write_proc.communicate.assert_awaited_once()
+    written_script = write_proc.communicate.await_args.kwargs["input"].decode("utf-8")
+    assert written_script.startswith(
+        'export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"\n'
+    )
+    assert written_script.endswith("echo hello")
     # Best-effort cleanup: rm -f /tmp/cmd-*.sh
     rm_calls = [a for a in _extract_run_docker_args(mock_run_docker) if "rm" in a]
     assert len(rm_calls) == 1
@@ -543,4 +551,8 @@ async def test_exec_command_writes_script_via_stdin_not_shell_args(monkeypatch):
     write_proc.communicate.assert_awaited_once()
     call_kwargs = write_proc.communicate.call_args.kwargs
     assert "input" in call_kwargs
-    assert call_kwargs["input"] == tricky_command.encode("utf-8")
+    written_script = call_kwargs["input"].decode("utf-8")
+    assert written_script.startswith(
+        'export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"\n'
+    )
+    assert written_script.endswith(tricky_command)

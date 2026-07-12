@@ -100,6 +100,23 @@ if TYPE_CHECKING:
     from app.infrastructure.sandbox.manager import SandboxManager as _SandboxManager
 
 
+def _configure_logging() -> None:
+    """Configure root logger so application INFO logs are visible.
+
+    uvicorn 0.30+ 默认 LOGGING_CONFIG 不再为 root logger 配置 handler/level，
+    导致应用层 logger.info() 因 root logger 无 handler 且 effective level 回落
+    到 WARNING 而完全静默（仅 uvicorn.access logger 单独配置仍可见）。这里在
+    模块 import 时显式配置 root logger，保证 HTTP 与 CLI 两种入口下应用日志
+    均可见。basicConfig 幂等：root logger 已有 handler 时（如 pytest 已配置）
+    不覆盖。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 

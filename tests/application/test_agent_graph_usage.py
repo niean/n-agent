@@ -176,6 +176,50 @@ async def test_call_llm_skips_usage_when_result_usage_empty(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_call_llm_logs_request_and_response(tmp_path, caplog):
+    """call_llm should emit INFO logs with full request/response JSON,
+    decoupled from usage recording (visible even when usage_service is None
+    or result.usage is empty)."""
+    import logging
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-log"))
+
+    provider = UsageCapturingProvider(
+        usage={},  # empty usage -> usage_service.record_call NOT invoked
+        model_response="hello world",
+    )
+    runner = AgentGraphRunner(
+        llm_provider=provider,
+        tool_service=ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        memory_store=store,
+        summarizer=HeuristicSummarizer(),
+    )
+
+    state = AgentState(
+        session_id="sess-log",
+        input_messages=[{"role": "user", "content": "hi there"}],
+        working_messages=[{"role": "user", "content": "hi there"}],
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.application.agent_graph"):
+        await runner.call_llm(state)
+
+    request_logs = [r for r in caplog.records if "LLM request" in r.getMessage()]
+    response_logs = [r for r in caplog.records if "LLM response" in r.getMessage()]
+    assert len(request_logs) == 1, f"expected 1 LLM request log, got {len(request_logs)}"
+    assert len(response_logs) == 1, f"expected 1 LLM response log, got {len(response_logs)}"
+
+    req_msg = request_logs[0].getMessage()
+    assert "session=sess-log" in req_msg
+    assert "hi there" in req_msg  # full input content printed
+
+    resp_msg = response_logs[0].getMessage()
+    assert "session=sess-log" in resp_msg
+    assert "hello world" in resp_msg  # full output content printed
+
+
+@pytest.mark.asyncio
 async def test_call_llm_records_usage_with_provider_config(tmp_path):
     """When llm_provider exposes current_config (ActiveProviderHolder-like),
     provider_kind/provider should be derived from it."""

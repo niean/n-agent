@@ -95,3 +95,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：上下文消息需要动态计算的加载，持久化层必须标注好每条消息的压缩状态。加 is_summarized 字段标记"已被摘要吸收的原始消息"，压缩成功后 mark_messages_summarized(middle_ids)，load 时 WHERE is_summarized=0 过滤。这样 load 拿到的就是 [head, tail, summary, new_msgs]（middle 已过滤），_filter_to_latest_summary 只需处理旧摘要去重。涉及"持久化形态变更"的改动必须有跨轮加载的回归测试，断言 middle 被标记、load 后 working_messages 不含 middle 且保留 head/tail。
 
 来源：bug fix 260711 head 3 被遗弃 -> 260711 is_summarized 标注
+
+### P010: uvicorn 0.30+ 默认 LOGGING_CONFIG 不配置 root logger，应用 INFO 日志会静默
+
+现象：观测页验收 3.1 失败——发送对话后服务日志只出现 uvicorn access log（`INFO: 192.168.65.1:xxx - "POST /v1/chat/completions HTTP/1.1" 200 OK`），完全没有 `API call model=... provider=... in=... out=... total=... latency=...ms` 行。但 usage_records 表有数据、sessions 表 api_call_count 已累加，代码逻辑本身正确。
+
+根因：uvicorn 0.30+ 默认 `LOGGING_CONFIG` 移除了 root logger（`""`）的配置项，只配置 `uvicorn` / `uvicorn.access` 两个独立 logger。应用层 `logger = logging.getLogger("app.application.agent_graph")` 创建后，root logger 无 handler、effective level 回落到 WARNING，`logger.info()` 完全静默。uvicorn.access logger 单独配置了 handler + level=INFO，所以 access log 仍可见，造成"只有 access log 没有 app log"的假象，容易误判为代码逻辑 bug。诊断时容器内 `python -c "import logging; print(logging.getLogger().handlers, logging.getLogger().level)"` 返回 `[] WARNING` 即可确认。
+
+教训：升级 uvicorn 主版本后必须验证应用 logger 可见性。uvicorn 0.30+ 移除了 root logger 配置，应用必须在 import 时显式 `logging.basicConfig(level=logging.INFO, format=...)`（幂等，root logger 已有 handler 时不覆盖）。诊断"日志缺失"类问题先用 `logging.getLogger().handlers` 和 `getEffectiveLevel()` 验证 root logger 配置，再检查代码逻辑；不要假设 uvicorn 默认配置了 root logger。同时避免在多层输出重复日志——call_llm 和 UsageService.record_call 都输出 "API call" 时，前者用原始 usage dict、后者用归一化后的 CanonicalUsage，Anthropic usage 无 `total_tokens` 字段导致前者 `total=0`，重复日志不仅冗余还会暴露归一化不一致的 bug。
+
+来源：bug fix 260712 观测 3.1 API call 日志缺失

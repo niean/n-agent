@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import posixpath
 import re
 import shutil
@@ -42,6 +43,12 @@ _SECRET_RE = re.compile(r"(api[_-]?key|token|secret|password|bearer)", re.IGNORE
 
 def _redact_secrets(text: str) -> str:
     return _SECRET_RE.sub("****", text)
+
+
+def _docker_cli_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env["DOCKER_CLI_HINTS"] = "false"
+    return env
 
 
 class DockerSandbox(Sandbox):
@@ -84,6 +91,7 @@ class DockerSandbox(Sandbox):
     async def _run_docker(self, args: list[str], timeout: float = 30.0) -> int:
         proc = await asyncio.create_subprocess_exec(
             "docker", *args,
+            env=_docker_cli_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -186,6 +194,7 @@ class DockerSandbox(Sandbox):
             proc = await asyncio.create_subprocess_exec(
                 "docker", "exec", "-w", container_staging,
                 self.session_container_name, "python", "-u", script_basename,
+                env=_docker_cli_env(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -288,6 +297,7 @@ class DockerSandbox(Sandbox):
                 write_proc = await asyncio.create_subprocess_exec(
                     "docker", "exec", "-i", self.session_container_name,
                     "sh", "-c", f"cat > {script_path}",
+                    env=_docker_cli_env(),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -304,7 +314,11 @@ class DockerSandbox(Sandbox):
 
             # Feed command as stdin; this completes the `cat > /tmp/cmd-*.sh`.
             try:
-                await write_proc.communicate(input=command.encode("utf-8"))
+                script_body = (
+                    'export DOCKER_CLI_HINTS="${DOCKER_CLI_HINTS:-false}"\n'
+                    + command
+                )
+                await write_proc.communicate(input=script_body.encode("utf-8"))
             except Exception as exc:
                 end = datetime.now(timezone.utc)
                 return SandboxExecResult(
@@ -336,6 +350,7 @@ class DockerSandbox(Sandbox):
                 exec_proc = await asyncio.create_subprocess_exec(
                     "docker", "exec", "-w", workdir, self.session_container_name,
                     "sh", script_path,
+                    env=_docker_cli_env(),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )

@@ -97,10 +97,10 @@ class UsageService:
             return
         cost = self.estimate_cost(usage, model or "", provider or "")
         logger.info(
-            "API call: model=%s provider=%s in=%d out=%d cache_r=%d cache_w=%d reason=%d total=%d latency=%dms",
+            "API call: model=%s provider=%s in=%d out=%d cache_r=%d cache_w=%d reason=%d total=%d norm=%d latency=%dms",
             model, provider, usage.input_tokens, usage.output_tokens,
             usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens,
-            usage.total_tokens, latency_ms or 0,
+            usage.total_tokens, usage.normalized_tokens, latency_ms or 0,
         )
         try:
             await self._recorder.record_call(
