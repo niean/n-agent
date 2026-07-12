@@ -13,7 +13,7 @@ def client():
 
 
 def test_observations_page_returns_html(client):
-    r = client.get("/chat/observations")
+    r = client.get("/observations/sessions")
     assert r.status_code == 200
     assert "<aside" in r.text
     assert 'id="app-sidebar"' in r.text
@@ -126,7 +126,7 @@ def test_usage_sessions_pagination_validates_params(client):
 
 
 def test_observations_detail_shell_route(client):
-    r = client.get("/chat/observations/sess-detail")
+    r = client.get("/observations/sessions/sess-detail")
     assert r.status_code == 200
     assert "<aside" in r.text
     assert 'id="app-sidebar"' in r.text

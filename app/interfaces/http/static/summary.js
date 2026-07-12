@@ -16,7 +16,8 @@
     { tab: 'sandbox', label: '沙盒', desc: '查看沙盒配置、活跃实例与执行历史' },
     { tab: 'models', label: '模型', desc: '查看对外暴露的统一模型' },
     { tab: 'platforms', label: '平台', desc: '查看接入平台与平台会话' },
-    { tab: 'status', label: '观测', desc: '检查状态' },
+    { tab: 'observations-sessions', label: '会话观测', desc: '查看会话 Token 用量与 API 调用历史' },
+    { tab: 'observations-modules', label: '组件观测', desc: '查看依赖组件健康状态' },
   ];
 
   function renderStats(stats, service, dependencies, counts) {
@@ -48,7 +49,7 @@
       card.className = 'summary-entry';
       card.href = namespace.navigation && namespace.navigation.pathByTab && namespace.navigation.pathByTab[entry.tab]
         ? namespace.navigation.pathByTab[entry.tab]
-        : `/${entry.tab === 'status' ? 'status' : entry.tab}`;
+        : `/${entry.tab}`;
       card.dataset.tab = entry.tab;
       card.addEventListener('click', (event) => {
         event.preventDefault();

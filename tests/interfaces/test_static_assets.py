@@ -63,7 +63,7 @@ def test_all_tab_paths_return_shell(tmp_path):
         "/memory", "/sandbox",
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
         "/tools/external-memory", "/tools/sandbox",
-        "/models", "/status", "/scheduled-tasks", "/platforms",
+        "/models", "/observations/sessions", "/observations/modules", "/scheduled-tasks", "/platforms",
     )
     for path in paths:
         response = client.get(path)
@@ -192,7 +192,8 @@ def test_static_assets_contain_expected_logic(tmp_path):
     nav_js = client.get('/static/management-navigation.js').text
     assert 'pushState' in nav_js
     assert "'/summary'" in nav_js
-    assert "'/status'" in nav_js
+    assert "'/observations/sessions'" in nav_js
+    assert "'/observations/modules'" in nav_js
     assert "'/scheduled-tasks'" in nav_js
     assert "'/platforms'" in nav_js
     assert "'scheduled-tasks'" in nav_js
@@ -204,7 +205,7 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert "modal.querySelector('.modal-close')" in nav_js
     keydown_handler = nav_js[nav_js.index("event.key !== 'Escape'"):]
     assert keydown_handler.index('closeTopModal()') < keydown_handler.index('closeAllPopouts()')
-    assert nav_js.index("tab: 'models'") < nav_js.index("tab: 'platforms'") < nav_js.index("tab: 'status'")
+    assert nav_js.index("tab: 'models'") < nav_js.index("tab: 'platforms'") < nav_js.index("tab: 'observations'")
     summary_js = client.get('/static/summary.js').text
     assert "'scheduled-tasks'" in summary_js
     assert 'listScheduledTasks' in summary_js
@@ -581,9 +582,9 @@ def test_index_html_links_assets(tmp_path):
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '记忆', '工具', '沙盒', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin'):
+    for tab in ('概览', '对话', '会话', '记忆', '工具', '沙盒', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin', '组件'):
         assert tab in html, f"index.html missing menu label {tab}"
-    for path in ('/summary', '/chat', '/sessions', '/memory', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/sandbox', '/models', '/platforms', '/status', '/scheduled-tasks'):
+    for path in ('/summary', '/chat', '/sessions', '/memory', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/sandbox', '/models', '/observations/sessions', '/observations/modules', '/platforms', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"
     assert (
         html.index('href="/sessions"')
@@ -592,7 +593,7 @@ def test_index_html_links_assets(tmp_path):
         < html.index('href="/sandbox"')
         < html.index('href="/models"')
         < html.index('href="/platforms"')
-        < html.index('href="/status"')
+        < html.index('data-tab-group="observations"')
     )
     assert (
         html.index('href="/tools/knowledge"')
@@ -687,6 +688,7 @@ def test_skills_static_served(tmp_path):
 def test_tools_submenu_nav(tmp_path):
     client = _client(tmp_path)
     nav_js = client.get('/static/management-navigation.js').text
+    css = client.get('/static/styles.css').text
     assert "tab: 'tools'" in nav_js
     assert "parent: true" in nav_js
     assert "children:" in nav_js
@@ -699,6 +701,13 @@ def test_tools_submenu_nav(tmp_path):
     for path in ("'/tools/knowledge'", "'/tools/mcp'", "'/tools/skill'", "'/tools/plugin'", "'/tools/builtin'"):
         assert path in nav_js, f"missing {path}"
     assert "tab: 'tools', path: '/tools'" not in nav_js
+    assert "sidebar__item--parent-selected" not in nav_js
+    assert "sidebar__item--parent-selected" not in css
+    child_active_rule = css[
+        css.index(".sidebar__item--child.sidebar__item--active"):
+        css.index("/* 收起态：二级菜单浮层弹出，不展开左导 */")
+    ]
+    assert "border-left-color" not in child_active_rule
 
 
 def test_knowledge_js_present_and_safe(tmp_path):

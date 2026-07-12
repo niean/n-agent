@@ -52,10 +52,11 @@ def register_usage_routes(
 ) -> None:
     """Register /chat/usage/* API routes.
 
-    The observations page shell (`/chat/observations` and
-    `/chat/observations/{session_id}`) is registered in dashboard.py
-    alongside the other shell routes that share the index.html handler.
-    This module only registers the JSON API endpoints.
+    The observations page shell (`/observations/sessions`,
+    `/observations/sessions/{session_id}` and `/observations/modules`)
+    is registered in dashboard.py alongside the other shell routes that
+    share the index.html handler. This module only registers the JSON
+    API endpoints.
     """
 
     @router.get("/chat/usage/overview")

@@ -293,7 +293,6 @@ body.modal-open { overflow: hidden; }
 .sidebar__group { display: flex; flex-direction: column; gap: 2px; }
 .sidebar__item--parent { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 10px; color: var(--color-fg-muted); white-space: nowrap; background: transparent; border: 0; border-radius: 10px; text-align: left; cursor: pointer; }
 .sidebar__item--parent:hover { color: var(--color-sidebar-hover-fg); background: var(--color-bg-hover); }
-.sidebar__item--parent-selected { color: var(--color-primary-strong); background: var(--color-bg-active); }
 .sidebar__item-chevron { display: none; margin-left: auto; color: var(--color-fg-subtle); font-size: 14px; line-height: 1; transition: transform 0.2s ease; }
 body.sidebar-expanded .sidebar__item-chevron { display: inline; }
 .sidebar__item--parent-open .sidebar__item-chevron { transform: rotate(90deg); color: var(--color-primary-strong); }
@@ -303,7 +302,7 @@ body.sidebar-expanded .sidebar__submenu.sidebar__submenu--open { display: flex; 
 .sidebar__item--child .sidebar__item-icon { display: none; }
 .sidebar__item--child .sidebar__item-label { font-size: inherit; }
 .sidebar__item--child:hover { color: var(--color-sidebar-hover-fg); background: var(--color-bg-hover); }
-.sidebar__item--child.sidebar__item--active { color: var(--color-primary-strong); background: var(--color-bg-active); border-left-color: var(--color-primary-strong); }
+.sidebar__item--child.sidebar__item--active { color: var(--color-primary-strong); background: var(--color-bg-active); }
 
 /* 收起态：二级菜单浮层弹出，不展开左导 */
 body:not(.sidebar-expanded) .sidebar { overflow: visible; }

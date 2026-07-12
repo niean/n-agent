@@ -14,9 +14,10 @@
     { tab: 'tools-builtin', path: '/tools/builtin', label: 'Builtin', parentTab: 'tools' },
     { tab: 'sandbox', path: '/sandbox', label: '沙盒' },
     { tab: 'models', path: '/models', label: '模型' },
-    { tab: 'observations', path: '/chat/observations', label: '观测' },
     { tab: 'platforms', path: '/platforms', label: '平台' },
-    { tab: 'status', path: '/status', label: '健康' },
+    { tab: 'observations', label: '观测', parent: true, children: ['observations-sessions', 'observations-modules'] },
+    { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', parentTab: 'observations' },
+    { tab: 'observations-modules', path: '/observations/modules', label: '组件', parentTab: 'observations' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
   const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));
@@ -25,7 +26,10 @@
   const parentByChild = Object.fromEntries(
     tabConfig.filter((c) => c.parentTab).map((c) => [c.tab, c.parentTab]),
   );
-  const TOOLS_DEFAULT_CHILD = 'tools-knowledge';
+  const DEFAULT_CHILD = {
+    tools: 'tools-knowledge',
+    observations: 'observations-sessions',
+  };
 
   function isParent(name) {
     const cfg = tabConfig.find((c) => c.tab === name);
@@ -36,21 +40,21 @@
     const path = window.location.pathname;
     if (tabByPath[path]) return tabByPath[path];
     if (path.startsWith('/scheduled-tasks/')) return 'scheduled-tasks';
-    if (path.startsWith('/chat/observations/')) return 'observations';
+    if (path.startsWith('/observations/sessions/')) return 'observations-sessions';
     if (path === '/tools/external-memory') return 'memory';
     if (path === '/tools/sandbox') return 'sandbox';
-    if (path === '/tools') return TOOLS_DEFAULT_CHILD;
+    if (path === '/tools') return DEFAULT_CHILD.tools;
+    if (path === '/observations') return DEFAULT_CHILD.observations;
     if (path === '/' || path === '') return 'summary';
     return 'summary';
   }
 
   function applyTab(name) {
     let next = tabNames.includes(name) ? name : 'summary';
-    if (isParent(next)) next = TOOLS_DEFAULT_CHILD;
+    if (isParent(next)) next = DEFAULT_CHILD[next] || 'summary';
     document.querySelectorAll('.tab-content').forEach((tab) => tab.classList.remove('active'));
     document.querySelectorAll('.sidebar__item').forEach((item) => {
       item.classList.remove('sidebar__item--active');
-      item.classList.remove('sidebar__item--parent-selected');
     });
     const target = document.getElementById(`tab-${next}`);
     if (target) target.classList.add('active');
@@ -59,8 +63,6 @@
     const parentTab = parentByChild[next];
     if (parentTab) {
       applySubmenuState(parentTab, readSubmenuPref(parentTab));
-      const parentNav = document.querySelector(`[data-tab="${parentTab}"]`);
-      if (parentNav) parentNav.classList.add('sidebar__item--parent-selected');
     }
     const title = document.getElementById('topbar-title');
     if (title) title.textContent = labelByTab[next] || next;
@@ -95,7 +97,7 @@
     }
     const path = pathByTab[name];
     if (!path) return;
-    // 点击菜单一律跳到规范路径，清掉子路径（如 /chat/observations/{sid}、
+    // 点击菜单一律跳到规范路径，清掉子路径（如 /observations/sessions/{sid}、
     // /scheduled-tasks/{id}）。模块的 render/refresh 负责按新 URL 切换视图。
     if (window.location.pathname !== path) {
       history.pushState({ tab: name }, '', path);

@@ -5,8 +5,8 @@
     chat: false,
     sessions: false,
     models: false,
-    status: false,
-    observations: false,
+    'observations-modules': false,
+    'observations-sessions': false,
     'scheduled-tasks': false,
     platforms: false,
     memory: false,
@@ -26,6 +26,8 @@
     if (tab === 'tools-plugin') return namespace.plugin;
     if (tab === 'memory') return namespace.externalMemory;
     if (tab === 'sandbox') return namespace.sandbox;
+    if (tab === 'observations-sessions') return namespace.observations;
+    if (tab === 'observations-modules') return namespace.status;
     return null;
   }
 

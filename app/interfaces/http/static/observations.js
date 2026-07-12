@@ -7,7 +7,7 @@
   const PAGES_SHOWN = 5;
 
   function root() {
-    return ui.byId ? ui.byId('tab-observations') : document.getElementById('tab-observations');
+    return ui.byId ? ui.byId('tab-observations-sessions') : document.getElementById('tab-observations-sessions');
   }
 
   function formatNumber(value) {
@@ -72,7 +72,7 @@
 
   function parseSessionIdFromPath() {
     const path = window.location.pathname || '';
-    const prefix = '/chat/observations/';
+    const prefix = '/observations/sessions/';
     const idx = path.indexOf(prefix);
     if (idx < 0) return '';
     const rest = path.slice(idx + prefix.length);
@@ -263,7 +263,7 @@
   function renderDetailHeader(container, sessionId) {
     const wrap = ui.el('div', 'observations-detail-header');
     const back = ui.el('a', 'observations-detail-header__back');
-    back.href = '/chat/observations';
+    back.href = '/observations/sessions';
     back.textContent = '返回';
     back.addEventListener('click', (ev) => {
       ev.preventDefault();
@@ -789,18 +789,18 @@
       }
     },
     goToDetail(sessionId) {
-      const url = '/chat/observations/' + encodeURIComponent(sessionId);
-      history.pushState({ tab: 'observations' }, '', url);
+      const url = '/observations/sessions/' + encodeURIComponent(sessionId);
+      history.pushState({ tab: 'observations-sessions' }, '', url);
       this.render();
     },
     goToIndex() {
-      history.pushState({ tab: 'observations' }, '', '/chat/observations');
+      history.pushState({ tab: 'observations-sessions' }, '', '/observations/sessions');
       this.render();
     },
     goToPage(page) {
       page = Math.max(1, page);
-      const url = '/chat/observations?page=' + encodeURIComponent(page);
-      history.pushState({ tab: 'observations', page }, '', url);
+      const url = '/observations/sessions?page=' + encodeURIComponent(page);
+      history.pushState({ tab: 'observations-sessions', page }, '', url);
       this.render();
     },
   };
