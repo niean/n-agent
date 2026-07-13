@@ -4,29 +4,37 @@
 本文介绍自研Agent套装[N-Agent](https://github.com/niean/n-agent)，一款类似Hermes的Agent Runtime。
 核心流程：接收对话请求，加载会话上下文，循环"调用模型→按需执行工具"直至产出最终回答，更新会话与外部记忆，返回同步或流式结果。
 
+
 ## 领域划分
 
 ```text
 Agent Runtime
 ├── 核心子域
-│   ├── TurnLoop：一轮对话请求的执行编排，包括上下文准备、LLM交互、工具执行、记忆更新、结束判断
+│   ├── TurnLoop：单轮对话执行编排，包括上下文准备、LLM交互、工具执行、记忆更新、结束判断
 │   ├── Context：组装模型输入视图，包括基础消息上下文、约束过滤后的工具定义等
-│   ├── LLM：模型交互子域，负责 Provider Request(请求)构造、模型调用、响应解析
-│   ├── Memory：会话、消息、滚动摘要、工具调用、任务状态，以及外部记忆
-│   └── Tool：负责工具契约与执行编排，把模型 tool_calls 转换为受控的工具执行
+│   ├── LLM：模型交互子域，负责Provider Request(请求)构造、模型调用、响应解析
+│   ├── Memory：记忆管理，包括会话记忆、跨会话的外部记忆
+│   └── Tool：工具契约与执行编排，把模型 tool_calls 转换为受控的工具执行
 ├── 支撑子域
-│   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
 │   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
 │   ├── MCP：MCP site 注册与工具同步，把远程 MCP server 工具暴露给 LLM 调用
 │   ├── Plugin：本地插件包扫描、启停、配置和工具动态注入
-│   ├── Platform/Gateway：飞书等外部消息平台抽象、生命周期管理；CLI/TUI 仅作为终端聊天入口来源
-│   └── Sandbox：受控Python代码执行子域execute_code
-└── 通用子域
-    └── Environment：模型、存储、文件、网络等外部资源边界
+│   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
+│   ├── Sandbox：受控代码执行子域execute_code(Python)、terminal(Shell)
+│   ├── Schedule：定时任务定义、调度、租约执行与结果投递
+│   ├── Gateway：统一飞书、CLI/TUI、ACP 的交互消息、入口会话、命令与确认，并路由至ChatCompletionService
+│   ├── Platform：飞书等外部消息平台抽象，生命周期管理
+│   └── Usage/Observation：模型用量、成本、上下文构成与压缩收益观测
+├── Shared Kernel
+│   └── Policy：通用决策契约
+└── 外部边界
+    ├── Storage
+    └── Model Provider
 ```
 
+
 ## TurnLoop
-Agent会话之单轮对话，是Agent的核心业务流程，FSM 如下。使用成熟的 LangGraph.Graph.StateGraph 框架实现。
+Agent会话之单轮对话，是Agent的核心业务流程，FSM状态图如下：
 
 ```mermaid
 %% align: left
@@ -41,6 +49,101 @@ stateDiagram-v2
   update_memory --> finalize: error / final_message / iteration_limit reached
   finalize --> [*]
 ```
+
+单轮对话 SD时序图如下：`ChatCompletionService.complete` → `AgentGraphRunner`（LangGraph.Graph.StateGraph）
+
+```mermaid
+%% align: left
+sequenceDiagram
+  autonumber
+  participant Chat as ChatCompletionService
+  participant Session as SessionService
+  participant Graph as AgentGraphRunner
+  participant Context as ContextService
+  participant LLM as LLMProvider
+  participant Tool as ToolService
+  participant Memory as MemoryStore
+  participant Usage as UsageService
+  participant External as ExternalMemoryManager
+
+  Chat->>Session: create_session(session_id)
+  Session->>Memory: create_session (INSERT OR IGNORE)
+  Chat->>Memory: lock_session_external_memory(enabled, slots)
+
+  alt /compress
+    Chat->>Graph: compress_session(session_id)
+    Graph->>Context: build_context_state + compress_prepared_context(force=true)
+    Context->>Memory: list_messages + get_summary
+    opt 实际执行压缩
+      Context->>External: pre_compress_all(messages)
+      Context->>Memory: append_summary_message(is_summary=true)
+      Context->>Memory: mark_messages_summarized(middle_ids)
+      Context->>Memory: save_summary(source_message_id)
+      Context->>Usage: record_compression
+    end
+    Chat-->>Chat: 提前返回，不写 user 消息
+  else 普通对话
+    loop 每条 user 消息
+      Chat->>Memory: append_message(role=user)
+    end
+    Chat->>Session: ensure_title(first_user_message)
+    Session-->>Memory: update_session_title（异步成功时）
+    Chat->>Graph: run / stream_events
+
+    Graph->>Context: prepare_context(state)
+    Context->>Memory: list_messages + get_summary
+    Context->>External: build_system_prompt 静态快照
+    opt 达到上下文压缩条件
+      Context->>External: pre_compress_all(messages)
+      Context->>LLM: 生成上下文摘要
+      LLM-->>Context: summary
+      Context->>Memory: append_summary_message(is_summary=true)
+      Context->>Memory: mark_messages_summarized(middle_ids)
+      Context->>Memory: save_summary(source_message_id)
+      Context->>Usage: record_compression
+    end
+
+    loop 直到 final_message / error / iteration_limit
+      Graph->>Context: build_provider_context(state, options)
+      opt 最后一条是 user 消息
+        Context->>External: prefetch_all(last_user_message)
+      end
+      Context-->>Graph: messages + ToolPolicy 过滤后的 tools
+      Graph->>LLM: chat(messages, tools, model, options)
+      LLM-->>Graph: final_message + tool_calls + usage
+      Graph->>Graph: scrub_memory_context(final_message)
+      opt provider 返回 usage
+        Graph->>Usage: record_call
+      end
+
+      opt 存在 pending_tool_calls
+        loop 每个 tool_call
+          Graph->>Tool: evaluate / approve / execute
+          opt memory provider 工具
+            Tool->>External: handle_tool_call
+          end
+          Graph->>Memory: save_tool_call
+        end
+      end
+
+      Graph->>Memory: append_message(role=assistant)
+      opt 存在工具结果
+        Graph->>Memory: append_message(role=tool)
+      end
+      Graph->>Memory: save_task_state(running / failed)
+    end
+
+    opt error 且无 final_message
+      Graph->>Memory: append_message(role=assistant, 友好错误文案)
+    end
+    opt 存在 final_message
+      Graph->>External: sync_all(user, assistant)
+      Note right of External: agent_context != primary 时 no-op
+    end
+    Graph->>Memory: save_task_state(completed / failed)
+  end
+```
+
 
 ## Context
 
@@ -83,7 +186,7 @@ AgentGraphRunner 再组合 ProviderContext + model + options，调用 llm_provid
 消息压缩：历史消息采用三段式压缩，head 保护首 3 条 + middle LLM 摘要 + tail 末 10 条；本次摘要 = llm_summary(上次摘要 + 新增消息)，滚动更新。
 
 
-<details>
+<details markdown="1">
 <summary>对话示例</summary>
 
 ```text
@@ -143,6 +246,7 @@ finalize
 </details>
 
 
+
 ## LLM
 
 LLM 子域对应 `call_llm` 节点，负责一次模型交互，不负责工具执行或记忆写入。
@@ -167,67 +271,30 @@ LLM
 ```
 
 
+
 ## Memory
 
-Memory 子域负责让 Agent 在单轮推理之外保留上下文。按生命周期，记忆分类如下：
+Memory 有两条持久化边界：会话记忆保存当前 session 的运行事实，外部记忆保存跨 session 知识。
 
 ```text
 Memory
-├─ 会话记忆（SQLite持久化，session内有效）
-│  ├─ 会话 ConversationSession
-│  ├─ 消息 ConversationMessage
-│  ├─ 工具调用 ToolCall
-│  ├─ 任务状态 TaskState
-│  └─ 滚动摘要 Summary
-└─ 外部记忆（跨session持久，按载体分三类）
-   ├─ 系统记忆（builtin）：根目录下的 {memory,user,observations}.md、memory.meta.json
-   │    ├─ memory.md：稳定知识
-   │    ├─ user.md：用户偏好
-   │    ├─ observations.md：sync_turn 自动抽取的轮次关键词
-   │    └─ memory.meta.json：memory.md 条目的信任度/时间衰减元数据
-   ├─ 文件记忆（multi-project）：按项目目录拆分的多组 {memory,user}.md
-   └─ 检索记忆（external-query）：通过query走向量/语义检索拿回相关片段，互斥、全局至多1个active provider
-        ├─ mem0：服务端事实库（HTTP）
-        ├─ holographic：本地 SQLite + MemoryRetriever（HRR 向量库）
-        └─ honcho：用户建模 dialectic 库（HTTP）
+├─ 会话记忆: MemoryStore → SQLiteMemoryStore
+│  ├─ ConversationSession: source / title / external_memory_enabled / slots / ACP metadata
+│  ├─ ConversationMessage: user / assistant / tool / is_summary / is_summarized
+│  └─ ToolCall / TaskState / Summary
+└─ 外部记忆: ExternalMemoryProvider → ExternalMemoryManager → Provider Adapter
+   ├─ builtin: Markdown + trust metadata + observations
+   ├─ multi-project: 多目录 Markdown
+   └─ external-query: mem0 / holographic / honcho，全局至多一个 active
 ```
 
-<details>
-<summary>单轮写入时序</summary>
-
-`ChatCompletionService.complete` → `AgentGraphRunner`（LangGraph）：
-
-```text
-complete
-  ├─ 会话 ConversationSession: create_session (INSERT OR IGNORE)
-  ├─ 会话 ConversationSession.external_memory_enabled: lock_session_external_memory（首写获胜）
-  ├─ 消息 ConversationMessage: append_message(role=user) × N
-  └─ 会话 ConversationSession.title: ensure_title（异步后台）
-prepare_context
-  ├─ 装配 working_messages: system + history/summary + input
-  ├─ *外部记忆*静态快照: 注入到 system
-  ├─ 压缩 ContextEngine.should_compress 判定是否压缩 history，外部记忆支持压缩前抢救
-  └─ Message Context: system + head + latest summary + tail
-call_llm
-  ├─ *外部记忆*动态检索: prefetch_all → <memory-context> prepend 到 last user message 副本（不污染 state）
-  ├─ build_provider_context: messages + 经工具策略过滤的 tools
-  ├─ llm.chat(messages, tools, model, options)
-  └─ scrub_memory_context(final_message.content)  # 立即剥离回声，防写回 消息 ConversationMessage
-execute_tools
-  ├─ 工具调用 ToolCall: save_tool_call 持久化工具执行事实
-  └─ *外部记忆*自动更新: LLM 主动调用工具external_memory，更新外部记忆 Markdown 文件
-update_memory（更新*会话记忆*）
-  ├─ 消息 ConversationMessage: append_message(role=assistant, content 含 tool_calls)
-  ├─ 消息 ConversationMessage: append_message(role=tool, tool_call_id, name)
-  └─ 任务状态 TaskState: save_task_state(status=running|failed)
-finalize
-  ├─ 消息 ConversationMessage: 错误兜底 append_message(role=assistant, 错误文案)
-  ├─ *外部记忆*消息同步: sync_all 将完整回合交给已启用 provider；具体写入或 no-op 由 provider 决定
-  └─ 任务状态 TaskState: save_task_state(status=run_status)
-```
-
-关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用记忆工具，以及 finalize 阶段委托各 provider 执行 `sync_turn`。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
-</details>
+| 槽位 | 实现 | 存储与写入 |
+|------|------|-----------|
+| builtin | `BuiltinProjectMemory` | `{memory,user,observations}.md` + `memory.meta.json`；`sync_turn` 追加观察 |
+| multi-project | `MultiProjectMemory` | 每个项目一组 `{memory,user}.md`；`sync_turn` 为 no-op，只由工具写入 |
+| external-query | `Mem0Adapter` | HTTP 事实库 |
+| external-query | `HolographicAdapter` | 本地 SQLite；`MemoryRetriever` 使用 Jaccard + 词频检索 |
+| external-query | `HonchoAdapter` | HTTP workspace / peer / session context |
 
 
 
@@ -263,63 +330,52 @@ ContextService 通过 ToolService 生成可见 tool definitions
 
 ## Sandbox
 
-Sandbox 子域承载 `execute_code`：为模型生成的 Python 代码提供隔离执行、受控文件/网络能力和独立审计。后端支持 Docker 与 Local，生产语义以 Docker 隔离为准。
+Sandbox 子域为模型提供受控执行环境，承载 `execute_code`（Python）与 `terminal`（Shell）。两者均为 `RiskLevel.SAFE`工具，Docker 是生产安全边界、不走审批。
 
-模型调用 `execute_code` 的执行链路如下，所有入口统一走 ToolService：
+所有入口统一经过 ToolService，并按工具路由到独立 Executor：
 
 ```text
 Interface/Gateway -> ChatCompletionService -> AgentGraphRunner.execute_tools
-  -> ToolService.execute -> SandboxToolExecutor.execute
-       ├─ 会话锁
-       ├─ get_or_create(session_id)       # session 级复用
-       ├─ new_call_staging(session_id)    # per-call scratch
-       └─ sandbox.execute(request)
-  -> record_history
+  -> ToolService.execute
+       ├─ execute_code -> SandboxToolExecutor
+       │    └─ 会话锁 -> get_or_create -> per-call staging -> Sandbox.execute
+       └─ terminal -> TerminalToolExecutor
+            └─ 会话锁 -> get_or_create -> 校验 workdir -> Sandbox.exec_command
+  -> SandboxExecutionHistoryRegistry
   -> ToolResult 回流 AgentGraph，写 role=tool 消息
 ```
 
-`safe_only` 策略隐藏 `ToolSourceType.AGENT` 来源工具，unattended/scheduler 默认不暴露 `execute_code`；交互通道不受影响。
-
-<details>
+<details markdown="1">
 <summary>生命周期</summary>
 
-Sandbox 生命周期如下。release 由 idle 到期或 session 删除触发；manual force 由 Dashboard 手动触发（docker kill -f）。
+`SandboxManager` 按 session 懒创建并串行执行。空闲到期或 session 删除时协作释放；Dashboard 可强制释放。Docker 启动时还会清理上次进程遗留的孤儿容器。
 
 ```mermaid
+%% align: left
 stateDiagram-v2
+  direction LR
   [*] --> active: get_or_create
   active --> executing: execute
   executing --> active: done
-  active --> releasing: release
-  executing --> releasing: force
-  active --> releasing: force
+  active --> releasing: idle / session / manual
+  executing --> releasing: manual force
   releasing --> [*]: cleanup
 ```
 </details>
 
-<details>
-<summary>业务关系</summary>
 
-```mermaid
-erDiagram
-  ConversationSession ||--o| Sandbox : "1:1 session级复用"
-  Sandbox ||--o{ SandboxExecutionHistoryEntry : "1:N 每次执行一条审计"
-  Sandbox ||--o| ReleasedSandboxInfo : "1:0..1 释放时一条"
-```
-</details>
-
-<details>
+<details markdown="1">
 <summary>安全边界</summary>
 
-`execute_code` 是 `RiskLevel.SAFE` 工具，无 confirmation gate，不依赖 trusted_metadata。安全边界在 sandbox 内部：
-
-- 隔离：workspace 只读，scratch 可写；Docker 后端禁网络、降权、限制进程和临时目录。
-- 外部能力：代码只能通过注入的 UDS RPC stub 调 callback tool；父进程按 allowlist 与 max_tool_calls 派发。
-- 审计：每次执行写入 SandboxExecutionHistoryRegistry，含 code_hash、状态、结果和授权工具。
-- 失败语义：sandbox 异常转成 `ToolResult(ERROR)`，不打断 AgentGraph。
+- Docker：workspace 只读、scratch 可写，默认禁网，并限制 CPU、内存、进程与临时目录。
+- `execute_code`：外部能力仅能通过 UDS RPC callback tools 获取，并受 allowlist、调用次数与超时约束。
+- `terminal`：不使用 callback tools；workdir 仅允许 scratch/workspace，workspace 仍只读。非零退出码表示命令执行失败，但工具状态仍为 SUCCESS；仅超时或执行异常映射为 TIMEOUT/ERROR。
+- 审计：两类执行都持久化 code_hash、状态、结果和 `execution_type`；Sandbox 异常转为 `ToolResult(ERROR)`，不打断 AgentGraph。
 </details>
 
-## 用户接口
+
+
+## XUI
 
 N-Agent 用户入口类型，有如下几类：
 
@@ -341,34 +397,42 @@ N-Agent 用户入口类型，有如下几类：
 - 定时任务执行由 SchedulerRunner 定时触发，并通过 ScheduleRunService->ScheduledAgentExecutor 直接调用 ChatCompletionService，执行结果再由 ScheduleOutboundDelivery 投递。
 
 
-## 概念架构
-- Skill：结构化Prompt，控制LLM怎么想、怎么说，进而完成功能。Skill定义**业务功能**，**主决策**而非执行，这是和工具的主要区别
-- Plugin：特化工具为LLM定制的**点对点适配**，将外部工具能力、封装为LLM可调用函数FC。Plugin是本地部署的工具适配层，而非工具本身
-- MCP：面向LLM的标准协议，用于统一外部工具、资源、上下文的访问方式，类似总线协议、SPI
+---
+---
 
-<details>
-<summary>概念架构图</summary>
+## 工具概念
+- Skill：结构化Prompt，指导LLM怎么想、怎么说，进而完成功能。Skill定义**业务逻辑**，主决策而非执行，这是和其它工具的区别
+- Plugin：特化工具为LLM定制的点对点适配，将外部工具能力、封装为LLM可调用函数FC；Plugin是本地部署的工具适配层，而非工具本身
+- MCP：面向LLM的标准协议，用于统一外部工具、资源、上下文的访问方式，类似总线协议。站在LLM领域看，**MCP是SPI、Plugin是Adapter**
+
 
 ```mermaid
-graph TD
+%% align: left
+flowchart LR
+  LLM((LLM))
+  Skill(Skill)
+  Tool((FC/Tool))
+  Knowledge(Knowledge)
+  MCP(MCP)
+  Plugin(Plugin)
+  Code(Code/Shell)
+  Sandbox(Sandbox)
 
-Skill --> LLM
-LLM --> Knowledge
-LLM --> MCP
-LLM --> Plugin
-
-Knowledge --> FC
-MCP --> FC
-Plugin --> FC
-
-FC --> externals
+Skill -->|指导| LLM
+LLM -->|通过| Tool
+Tool -->|知识能力| Knowledge
+Tool -->|标准协议| MCP
+Tool -->|特化适配| Plugin
+Tool -->|代码执行| Code
+Code -->|运行于| Sandbox
 ```
-</details>
 
+---
+---
 
 # 待整理分界线
 
-<details>
+<details markdown="1">
 <summary>待整理</summary>
 
 ## 分层边界
@@ -378,7 +442,7 @@ Interfaces -> Application -> Domain
 Infrastructure -> Domain
 ```
 
-- Domain：定义 Agent、Session、Message、Tool、Provider、Memory、Platform/Gateway 等领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
+- Domain：按领域划分定义 TurnLoop、Context、LLM、Memory、Tool 等核心子域，Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation 等支撑子域的领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
 - Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
 - Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
@@ -398,54 +462,59 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 
 ## 领域模型
 
-| 类型 | 模型 | 说明 |
-|------|------|------|
-| 聚合根 | ConversationSession | 会话主实体，串联消息、工具调用、任务状态和摘要 |
-| 运行状态 | AgentState | 单次 Agent 运行中的上下文、工具结果、状态和最终输出 |
-| 实体 | ConversationMessage | 用户、助手、工具消息 |
-| 实体 | ToolCall | 工具调用记录 |
-| 实体 | TaskState | 当前任务运行状态 |
-| 实体 | Summary | 会话摘要 |
-| 实体 | ProviderConfig | Provider 注册表脱敏配置（id、name、provider_type、base_url、model、api_key_present、is_active、extra_headers、created_at、updated_at），不含 api_key 明文 |
-| 值对象 | RiskLevel | ToolDefinition 的工具风险等级属性 |
-| 共享协议 | Policy | 各领域策略统一的 evaluate 协议 |
-| 值对象 | PolicyOutcome / PolicyDecision | 允许、拒绝、需审批及其原因 |
-| 领域策略 | ToolPolicy | 工具定义校验、暴露、执行和一次授权规则 |
-| 应用模型 | ToolExecutionEvaluation | 执行决策、审批快照及评估绑定 |
-| 端口 | LLMProvider | 屏蔽具体模型服务 |
-| 端口 | ProviderRegistry | Provider 配置注册表（CRUD + active 切换 + 明文 api_key 单独读取） |
-| 端口 | MemoryStore | 屏蔽 SQLite 等存储实现 |
-| 端口 | ToolExecutor | 屏蔽具体工具 handler |
-| 端口 | Summarizer | 屏蔽摘要生成策略 |
-| 端口 | TitleGenerator | 屏蔽会话标题生成策略，归属 Session 子域 |
-| 实体 | Skill | 本地 SKILL.md 包：name、description、frontmatter、platforms、enabled、readiness、last_scan_status |
-| 端口 | SkillRegistry | Skill 元数据持久化端口（list/get/upsert/set_enabled/delete），重扫保留 enabled 状态 |
-| 实体 | KnowledgeBase | KB 后端实例脱敏配置：id、name、description、base_type、base_url、dataset_id、api_key_present、enabled、默认检索参数和 probe 状态 |
-| 值对象 | KnowledgeBaseSecret | KB 明文密钥，只在 probe/search 时从 registry 单独读取 |
-| 值对象 | KnowledgeSearchRequest | LLM 工具侧检索请求，kb_id 与 query 必填，不支持默认 KB |
-| 值对象 | KnowledgeSnippet / KnowledgeSearchResult | 跨 N-KB/Ragflow 的标准检索结果 |
-| 值对象 | Platform / PlatformKind / PlatformDescriptor | 交互平台枚举、平台类型和脱敏配置摘要 |
-| 值对象 | GatewaySessionKey / GatewayConversation | 平台 conversation key 与 Dashboard 平台会话视图 |
-| 端口 | PlatformRegistry / PlatformLifecycle | 平台 descriptor 与运行态查询端口 |
-| 端口 | GatewaySessionRegistry | 平台 conversation 与内部 session 映射、事件幂等和平台统计查询端口 |
-| 端口 | KnowledgeBaseRegistry | KB 配置注册表端口（CRUD + get_secret + probe 状态更新） |
-| 端口 | KnowledgeRetriever / KnowledgeRetrieverFactory | KB 检索与探测 SPI，Infrastructure adapter 按 base_type 实现协议差异 |
-| 实体 | SandboxExecutionHistoryEntry | execute_code 执行审计：id、session_id、code_hash、code、result、status、duration_ms、authorized_callback_tools、created_at |
-| 值对象 | SandboxExecutionRequest / SandboxExecutionResult | 沙盒执行入参与结果（code、timeout、max_tool_calls、enabled_callback_tools、workspace_root、scratch_dir / status、stdout、stderr、returncode、tool_calls_made、tool_call_log） |
-| 值对象 | ActiveSandboxInfo / ReleasedSandboxInfo | 活跃沙盒只读视图与废弃沙盒审计记录（含 reason: idle/session/manual） |
-| 端口 | Sandbox | 沙盒执行端口，execute(request) -> result，屏蔽 Docker/Local 差异 |
-| 端口 | SandboxCallbackTool / SandboxCallbackToolRegistry | 沙盒回调工具及注册表，list_enabled 决定可调用工具集 |
-| 端口 | SandboxExecutionHistoryRegistry / ReleasedSandboxRegistry | 执行历史与废弃沙盒历史持久化，独立于 Chat Session 生命周期 |
-| 端口 | SearchProvider | Web 搜索后端 SPI，供 web_extract/web_search 回调工具调用 |
-| 值对象 | CanonicalUsage | 归一化 token 五桶（input/output/cache_read/cache_write/reasoning + request_count + raw_usage），prompt_tokens/total_tokens 派生属性 |
-| 值对象 | UsageCost | 成本估算结果（Decimal amount_usd + status: estimated/unknown + pricing_version） |
-| 值对象 | PricingEntry | 模型定价条目（input/output/cache_read/cache_write 各项 cost_per_million + pricing_version + source_url） |
-| 值对象 | SessionUsageStats | 会话级累计统计（五桶 + api_call_count + estimated_cost_usd + cost_status） |
-| 值对象 | ContextBreakdown | 上下文分类 token（system_prompt/tool_definitions/memory/conversation 四桶 + total 派生） |
-| 值对象 | UsageRecord / CompressionStat | 单次 LLM 调用记录 / 单次压缩记录值对象 |
-| 端口 | UsageRecorder | usage 持久化端口（record_call/get_session_stats/list_records/record_compression/list_compressions），归属观测子域 |
-| 端口 | PricingProvider | 模型定价查询端口（get_pricing -> PricingEntry | None），硬编码实现按前缀最长匹配 |
-| 端口 | ContextBreakdownCalculator | 上下文分类计算端口，Infrastructure 复用 ContextCompressor token 估算实现 |
+| 归属 | 类型 | 模型 | 说明 |
+|------|------|------|------|
+| TurnLoop | 运行模型 | AgentRun / AgentState / RunStatus / EndReason | 单次 Agent 运行、图内状态、运行阶段和结束原因 |
+| Context | 值对象 | ProviderContext | 本次模型调用可见的 messages 与 tools |
+| Context | 值对象 | ContextCompressionResult | 压缩后的消息、摘要、token 和被摘要消息索引 |
+| Context | 端口 | ContextEngine | 判断并执行消息上下文压缩 |
+| LLM | 值对象 | ModelInfo / LLMEvent / LLMResult | 模型信息、流式事件和标准调用结果 |
+| LLM | 值对象 | ProviderConfig | Provider 脱敏配置，不包含 api_key 明文 |
+| LLM | 端口 | LLMProvider / ProviderRegistry | 模型调用与 Provider 配置注册边界 |
+| Memory | 聚合根 | ConversationSession | 会话主实体，串联消息、工具调用、任务状态和摘要 |
+| Memory | 实体 | ConversationMessage / ToolCall / TaskState / Summary | 会话消息、工具审计、任务状态和滚动摘要 |
+| Memory | 端口 | MemoryStore / Summarizer / TitleGenerator | 会话持久化、摘要和标题生成边界 |
+| Memory | 值对象 | ExternalMemoryProviderConfig / ExternalMemoryProviderSecret | 检索记忆 Provider 的脱敏配置与独立密钥 |
+| Memory | 端口 | ExternalMemoryProvider / ExternalMemoryProviderRegistry | 外部记忆读写与检索记忆 Provider 注册边界 |
+| Tool | 值对象 | ToolDefinition / ToolCallRequest / ToolExecutionContext / ToolResult | 工具定义、调用、单轮授权上下文和执行结果 |
+| Tool | 值对象 | RiskLevel / ToolExposurePolicy | 工具风险等级与模型暴露范围 |
+| Tool | 领域策略 | ToolPolicy | 工具定义校验、暴露、执行决策和一次授权 |
+| Tool | 端口 | ToolExecutor | 屏蔽具体工具 handler |
+| Tool | 应用模型 | ToolExecutionEvaluation | 执行决策、审批快照及评估绑定 |
+| Skill | 实体 | Skill | 本地 SKILL.md 包及启用、就绪和扫描状态 |
+| Skill | 值对象 | SkillFrontmatter / SkillReadiness | Skill 元数据和就绪状态 |
+| Skill | 端口 | SkillRegistry | Skill 元数据持久化边界 |
+| Knowledge | 实体 | KnowledgeBase | KB 后端实例的脱敏配置和探测状态 |
+| Knowledge | 值对象 | KnowledgeBaseSecret / KnowledgeSearchRequest / KnowledgeSearchResult | KB 密钥、标准检索请求和结果 |
+| Knowledge | 端口 | KnowledgeBaseRegistry / KnowledgeRetriever / KnowledgeRetrieverFactory | KB 注册、检索和 adapter 创建边界 |
+| MCP | 实体 | McpSite / McpTool | MCP 站点及本地工具映射 |
+| MCP | 值对象 | McpRemoteTool / McpProbeResult | 远端工具描述和站点探测结果 |
+| MCP | 端口 | McpSiteRegistry | MCP 站点、工具和探测状态注册边界 |
+| Plugin | 聚合根 | Plugin | 本地插件包及公开视图、配置和 secret 引用 |
+| Plugin | 值对象 | PluginManifest / PluginKind / PluginSource / PluginScanStatus | 插件清单、类型、来源和扫描状态 |
+| Plugin | 端口 | PluginRegistry | 插件元数据、配置和 secret 持久化边界 |
+| Platform | 值对象 | Platform / PlatformKind / PlatformDescriptor | 外部消息平台枚举、类型和脱敏描述 |
+| Platform | 端口 | PlatformLifecycle / PlatformRegistry | 平台生命周期和注册查询边界 |
+| Gateway | 值对象 | GatewaySessionKey / InteractionMessage / GatewayOutboundMessage / InteractionResponse | 入口会话键、统一交互消息和回复 |
+| Gateway | 实体 | GatewaySessionLink / GatewayConversation / GatewayHomeTarget | 外部 conversation、内部 session 映射和平台投递目标 |
+| Gateway | 值对象 | GatewayConfirmationRequest / GatewayConfirmationAction / GatewayConfirmationChoice | Gateway 命令确认上下文、动作和选择 |
+| Gateway | 端口 | GatewaySessionRegistry | 会话映射、事件幂等、home target 和平台统计边界 |
+| Schedule | 聚合根 | ScheduledTask | 定时任务定义、状态、执行策略、租约和投递目标 |
+| Schedule | 实体 | ScheduledTaskExecution | 单次定时任务执行和投递结果 |
+| Schedule | 值对象 | ScheduleExpression / ScheduleTimezone / ScheduledTaskClaim / ScheduledTaskLease | 调度表达式、时区、claim 和租约 |
+| Schedule | 值对象 | DeliveryTarget / DeliveryResult / ScheduledExecutionPolicy | 投递目标、结果和无人值守执行策略 |
+| Schedule | 端口 | ScheduledTaskRegistry / ScheduleCalculator / PromptSafetyScanner / OutboundDelivery | 任务持久化、调度计算、Prompt 安全和投递边界 |
+| Sandbox | 值对象 | SandboxExecutionRequest / SandboxExecutionResult | execute_code 的执行入参与结果 |
+| Sandbox | 值对象 | SandboxExecResult | terminal 的 shell 执行结果，非零 returncode 仍可表示 SUCCESS |
+| Sandbox | 实体 | SandboxExecutionHistoryEntry | execute_code 与 terminal 共用的执行审计，execution_type 区分类型 |
+| Sandbox | 值对象 | ActiveSandboxInfo / ReleasedSandboxInfo | 活跃沙盒视图与释放审计，reason 为 idle/force/session/release |
+| Sandbox | 端口 | Sandbox | `execute` 执行 Python，`exec_command` 执行 Shell |
+| Sandbox | 端口 | SandboxCallbackTool / SandboxCallbackToolRegistry / SearchProvider | execute_code 回调工具及搜索能力边界 |
+| Sandbox | 端口 | SandboxExecutionHistoryRegistry / ReleasedSandboxRegistry | 执行历史与释放历史持久化边界 |
+| Usage/Observation | 值对象 | CanonicalUsage / UsageCost / PricingEntry | Token 归一化、成本和模型定价 |
+| Usage/Observation | 值对象 | SessionUsageStats / ContextBreakdown / UsageRecord / CompressionStat | 会话累计、上下文构成、调用和压缩记录 |
+| Usage/Observation | 端口 | UsageRecorder / PricingProvider / ContextBreakdownCalculator | 用量持久化、定价查询和上下文分类边界 |
+| Shared Kernel | 共享协议 | Policy / PolicyOutcome / PolicyDecision | 各领域策略共用的评估协议和决策语言 |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 
@@ -485,7 +554,7 @@ LLM tool_calls
 - MCP 工具：站点 probe 后动态注入远端工具，走 McpToolExecutor（兼 CompositeToolExecutor.fallback）。
 - Plugin 工具：扫描启用插件后动态注入，走 PluginToolExecutor，配置与 secret 独立存储。
 
-四类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Tool` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
+各类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Tool` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
 
 ## Policy Shared Kernel 与 ToolPolicy
 
@@ -495,13 +564,8 @@ LLM tool_calls
 
 ## 外部边界
 
-- Provider：只能通过 `LLMProvider` 端口访问，Runtime 不直接依赖具体 SDK。
-- Storage：只能通过 `MemoryStore` 和 `Summarizer` 端口访问，SQLite 属于 Infrastructure。
-- Tool：Application 层处理工具定义和执行编排，具体 handler 属于 Infrastructure。
-- Policy Shared Kernel：只统一策略协议与决策类型；工具启用、风险、授权和审批要求归 `ToolPolicy`，文件/网络等能力自身的安全约束仍由对应领域或 adapter 负责。
-- Platform：平台描述、lifecycle 和 Gateway 会话统计通过 PlatformRegistry/GatewaySessionRegistry 端口进入 Application；飞书 SDK、长连接、HTTP 发送属于 Infrastructure/Interfaces 细节。
-- FileSystem：文件工具必须围绕 workspace 根目录做路径安全约束。
-- Network：主要用于模型调用、KB 后端检索、FastAPI HTTP/SSE 服务。
+- Model Provider：只能通过 `LLMProvider` 端口访问，Runtime 不直接依赖具体 SDK。
+- Storage：只能通过各领域持久化端口访问；SQLite 等具体实现属于 Infrastructure。
 
 ## 快速判断规则
 

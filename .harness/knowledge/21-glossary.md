@@ -39,7 +39,7 @@
 - prepare_context：LangGraph 节点（`app/application/agent_graph.py`），位于 `call_llm` 之前；加载历史消息与摘要，构造 working_messages，并调用 `ContextEngine.should_compress` 按需执行增量三段式压缩；仅在真正压缩时调 `external_memory_manager.pre_compress_all` 提取 rescued_context，rescued_context 拼入 state.summary 但不进入摘要消息 content。
 - Three-segment compression（三段式压缩）：ContextCompressor 的压缩策略；head 段保留前 `protect_first_n` 条消息（含 system prompt + 早期关键上下文），中段送入 LLM 生成结构化摘要，tail 段保留最后 `protect_last_n` 条消息并按 token 预算分配；工具组完整性对齐避免截断 assistant tool_calls 与对应 tool 消息，sanitize 剥离未配对的 tool_calls/tool 消息。
 - Incremental compression（增量压缩）：ContextCompressor 对齐 HermesAgent 的压缩方法；`_find_latest_context_summary` 从后往前扫描 messages 定位最后一个 content 以 `CONTEXT_SUMMARY_PREFIX` 开头的 user 消息，middle 只取该摘要之后的新增消息，`_generate_summary` 分首次路径（空 existing_summary + FIRST 模板）和迭代路径（previous_summary=body + ITERATIVE 模板）两条 prompt 路径。
-- is_summary（双标记摘要持久化）：`ConversationMessage.is_summary`（Domain 为 bool）和 `messages.is_summary`（SQLite 为 INTEGER）字段；prepare_context 的压缩阶段通过 `replace_summary_message` 在单连接事务内 DELETE 旧 is_summary=1 消息 + INSERT 新摘要消息，保证同一 session 最多 1 条 is_summary=1 消息；`_message_to_provider` 不传递 is_summary 到 provider 格式，Dashboard API 和 chat.js 用 is_summary 做特殊渲染。
+- is_summary / is_summarized（摘要双标记）：`is_summary=1` 表示摘要消息，`is_summarized=1` 表示已被摘要吸收的原消息。`ContextService.prepare_context` 通过 `append_summary_message` 追加新摘要，再用 `mark_messages_summarized` 标记 middle 原消息；Provider Context 只选最新摘要并过滤已被吸收的原消息。`_message_to_provider` 不传递这两个持久化标记，Dashboard API 使用 is_summary 做特殊渲染。
 - Cooldown（压缩冷却）：ContextCompressor 内存中的 monotonic 时间戳（`_last_compressed_at`），防止在 `cooldown_seconds` 窗口内重复压缩同一会话上下文造成抖动；`should_compress` 检测 cooldown 未到期时返回 False（force=True 可绕过）。
 - Policy（Shared Kernel）：`app/domain/policy.py` 的通用策略协议，不是独立全局核心子域或中央服务；只统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`，具体业务规则归各领域 `XPolicy`。
 - PolicyOutcome / PolicyDecision：公共策略结果枚举与值对象；结果为 allow、deny、require_approval，decision 同时携带非空 reason。
@@ -59,12 +59,12 @@
 - FeishuToolApprovalBridge：Interfaces 层 ApprovalDecider 协议桥，把 ToolPolicy 审批转换为飞书 interactive card 和 Future；只持有带 TTL、actor/chat/card message id 绑定及原子 claim 的 pending，不拥有业务授权。
 - CliToolApprovalBridge：Interfaces 层 ApprovalDecider 协议桥（CLI/TUI），把 ToolPolicy 审批转换为进程内 Future + 精确命令路由（`/confirm once`/`/confirm trust`/`/cancel`）；持有带 900 秒 TTL、actor_id+GatewaySessionKey 双绑定及原子 claim 的 pending，不拥有业务授权；仅在 TTY REPL 构造，非 TTY/单次消息/stdin pipe 不注入 decider。
 - Toolset：工具集合或能力分组，用于后续按场景启用、禁用、检查依赖和控制权限。
-- ExternalMemoryProvider：外部记忆提供者领域端口（SPI），定义 prefetch/sync_turn/system_prompt_block/handle_tool_call + 生命周期钩子（on_session_switch/on_session_end/on_pre_compress/on_delegation/shutdown）；三类实现：系统记忆（builtin，Markdown 文件存储）、文件记忆（multi-project，多项目 Markdown CRUD）、检索记忆（external-query，mem0/holographic/honcho 等 query-only provider）。
-- Memory Slot：ExternalMemoryManager 的三槽模型。系统记忆槽（builtin，全局内置）、文件记忆槽（multi-project，多项目 Markdown CRUD）、检索记忆槽（external-query，至多一个 query-only provider）。三槽共存，activate mem0 不会替换文件记忆。`add_provider` 按 provider name 分类槽位，`swap_external_query_provider` 仅替换检索记忆槽。
+- ExternalMemoryProvider：外部记忆提供者领域端口（SPI），定义 prefetch/sync_turn/system_prompt_block/handle_tool_call + 生命周期钩子；实现分为 builtin、multi-project 和 external-query（mem0/holographic/honcho）三个槽位。
+- Memory Slot：ExternalMemoryManager 的三槽模型：builtin、multi-project、external-query。仅 external-query 至多一个 active provider，`swap_external_query_provider` 不影响前两槽。
 - 系统记忆（builtin slot）：ExternalMemoryManager 的 builtin 槽位中文名，对应槽位常量 `_BUILTIN_SLOT`。全局内置 Markdown 记忆，由 `BuiltinProjectMemory` 实现，存储 `{project_root}/locals/external-memory/{memory,user}.md` + sidecar `memory.meta.json`；含 trust 评分、时间衰减、矛盾检测机制，是唯一内置可信度体系的槽位。
 - 文件记忆（multi-project slot）：ExternalMemoryManager 的 multi-project 槽位中文名，对应槽位常量 `_MULTI_PROJECT_SLOT`。按项目子目录管理多组 `{memory,user}.md`，由 `MultiProjectMemory` 实现；通过 `set_enabled_projects` 选择启用项，跨 enabled project 合并打分取全局 top-K，返回文本用 `## Project: {name}` 前缀区分来源。
-- 检索记忆（external-query slot）：ExternalMemoryManager 的 external-query 槽位中文名，对应槽位常量 `_EXTERNAL_QUERY_SLOT`。该槽位承载 query-only provider（mem0/holographic/honcho），at-most-one 约束，由 `swap_external_query_provider` 单独替换，不影响系统记忆/文件记忆槽。
-- 检索记忆 provider（external-query provider）：外部记忆 SPI 中 query-only 的实现，数据非本地 Markdown 文本、无法做静态快照，只能通过 query 走向量/语义检索拿回相关片段。当前支持 mem0（服务端事实库 HTTP）、holographic（本地 SQLite + MemoryRetriever）、honcho（用户建模 dialectic 库 HTTP）。at-most-one 约束：至多一个检索记忆 provider 同时启用。
+- 检索记忆（external-query slot）：承载 mem0、holographic 或 honcho，由 `swap_external_query_provider` 单独替换，不影响 builtin / multi-project。
+- 检索记忆 provider：通过结构化或语义检索召回记忆，也可提供工具和 `sync_turn`。当前支持 mem0（HTTP）、holographic（本地 SQLite + MemoryRetriever）、honcho（HTTP）。
 - ActiveExternalMemoryReader：Application 层只读端口，`get_active_provider_names() -> list[str]`，读 ExternalMemoryManager 内存状态、无 IO；由 ExternalMemoryProviderService 实现。当前不消费于默认 profile 派生（未传 `external_memory_enabled` 时统一默认 `[]`，不自动启用 builtin 或 active 检索记忆 provider），接口留存供未来别处使用。
 - tool_surface_refresh_failed：activate/swap 返回的布尔标志，标记工具面回调（刷新 ToolService dynamic_definitions + Composite routes）是否失败。回调在 swap_lock 内同步执行，异常不阻塞 swap 本身，仅置标志供 API 响应透传。
 - provider_swapping：ExternalMemoryManager.handle_tool_call 在 swap_lock 持有期间对检索记忆槽工具返回的错误，避免 swap 进行中路由到不一致的工具实现。

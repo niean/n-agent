@@ -176,7 +176,7 @@ N-Agent 拥有知识检索 SPI，`search_knowledge` safe tool 按 LLM 显式传�
 
 不变式：检索记忆槽（external-query）全局至多 1 个 active provider，mem0 / holographic / honcho 互斥，激活其一自动 deactivate 其他。理由：多后端并存导致工具面 schema 膨胀、system prompt 指令冲突、新会话默认 profile 派生歧义。约束继承自 Hermes `MemoryManager` 单 external provider 限制。系统记忆（builtin）、文件记忆（multi-project）不受此约束，三槽共存。
 
-`ExternalMemoryManager` 采用三槽模型管理外部记忆 provider：系统记忆（builtin，全局内置 Markdown 记忆）、文件记忆（multi-project，多项目 Markdown CRUD）、检索记忆（external-query，query-only provider，至多一个）。三槽共存，activate mem0 不会替换文件记忆。
+`ExternalMemoryManager` 采用三槽模型管理外部记忆 provider：系统记忆（builtin，全局内置 Markdown 记忆）、文件记忆（multi-project，多项目 Markdown CRUD）、检索记忆（external-query，结构化/语义检索 provider，至多一个）。三槽共存，activate mem0 不会替换文件记忆。
 
 规则：
 - `add_provider(provider)` 按 provider name 调用 `_classify_slot` 分类槽位：name=="builtin" → 系统记忆槽（builtin）、name=="multi-project" → 文件记忆槽（multi-project）、其余 → 检索记忆槽（external-query）。系统记忆/文件记忆始终接受并 append 到 `_providers`；检索记忆槽至多一个，第二个记录 warning 并拒绝。
@@ -627,7 +627,7 @@ Agent Runtime 在多轮对话中 token 消耗持续增长，需在超过阈值�
 装配链路：
 1. Domain 端口（`app/domain/context.py`）：`ContextEngine` Protocol 定义 `should_compress` 与 `compress`；`ContextCompressionResult` frozen dataclass 携带 messages/summary/compressed/skipped_reason/original_tokens/compressed_tokens；`CONTEXT_SUMMARY_PREFIX`（`"[CONTEXT SUMMARY]: "`）常量定义运行时摘要消息识别前缀
 2. Infrastructure 实现（`app/infrastructure/context/context_compressor.py`）：`ContextCompressor` 实现 `ContextEngine`，注入 LLMProvider/model callable/context_length/threshold/protect_first_n/protect_last_n/summary_target_ratio/cooldown_seconds/可选 fallback_summarizer；`_find_latest_context_summary` 从后往前扫描 messages 定位最后一个 content 以 `CONTEXT_SUMMARY_PREFIX` 开头的 user 消息；`_generate_summary` 分首次路径（FIRST 模板，空 existing_summary）和迭代路径（ITERATIVE 模板，previous_summary=body）
-3. Application 节点（`app/application/agent_graph.py`）：`prepare_context` 内的压缩阶段调用 `context_engine.should_compress` 判定，超阈值时调 `compress` 执行压缩，按 a-f 顺序持久化（b 识别摘要消息 -> a 计算 next_summary -> c 构造 ConversationMessage(is_summary=True) -> d replace_summary_message -> e save_summary -> f 更新 state）
+3. Application 服务（`app/application/context_service.py`）：`prepare_context` 内的压缩阶段调用 `context_engine.should_compress` 判定，超阈值时调 `compress` 执行压缩；成功后按顺序执行 `append_summary_message` 写入新摘要消息、`mark_messages_summarized` 标记本次被摘要吸收的原消息、`save_summary` 更新滚动摘要，最后更新 state
 4. main.py 装配（`app/main.py`）：当 `settings.context_compression_enabled=True` 时构造 `ContextCompressor` 并注入 `AgentGraphRunner.context_engine`；disabled 时 `context_engine=None`，`prepare_context` 跳过压缩
 
 增量三段式压缩规则：
@@ -656,9 +656,10 @@ LLM 摘要失败回退：
 摘要持久化边界（双标记 + 双写降级）：
 - `messages` 表新增 `is_summary INTEGER NOT NULL DEFAULT 0` 列 + partial index `idx_messages_summary_session`；`ConversationMessage.is_summary` 为 bool
 - 压缩阶段在 `result.compressed=True` 时从 result.messages 识别恰好 1 条摘要消息（role=user + content 以 `CONTEXT_SUMMARY_PREFIX` 开头），数量 != 1 时保持 state 不变
-- `replace_summary_message`（MemoryStore 端口）：单连接事务内 DELETE 旧 is_summary=1 消息 + INSERT 新摘要消息，保证同一 session 最多 1 条 is_summary=1 消息
+- `append_summary_message`（MemoryStore 端口）：追加 role=user、`is_summary=1` 的新摘要消息；历史摘要保留在 messages 表，加载 Provider Context 时只选最新摘要
+- `mark_messages_summarized`（MemoryStore 端口）：将本次摘要吸收的 middle 消息标记为 `is_summarized=1`，后续上下文加载过滤这些原消息
 - `save_summary`：写入 summaries 表，`source_message_id` 关联新摘要消息 id；`summaries.summary` 保存 state.summary（含 rescued_context），`messages` 摘要 content 保存 result.summary（纯 LLM 摘要，不含 rescued_context）
-- 双写降级：`replace_summary_message` 失败时 state 不变（state.summary 和 state.working_messages 都不更新）；`save_summary` 失败时 messages 表已更新，summaries 表滞后一轮（Dashboard 降级），不回滚
+- 双写降级：`append_summary_message` 失败时 state 不变；`mark_messages_summarized` 失败时保留新摘要并继续；`save_summary` 失败时 messages 表已有新摘要，summaries 表滞后一轮（Dashboard 降级），不回滚
 - `_message_to_provider` 不传递 is_summary 到 provider 格式，provider 调用时消息只含 role/content/tool_calls 等标准字段
 - Dashboard API `_message_to_dict` 返回 is_summary 字段，chat.js 对 is_summary=1 消息特殊渲染（摘要 badge + 灰色卡片，剥离前缀后展示正文）
 
@@ -668,7 +669,7 @@ LLM 摘要失败回退：
 - 三段式压缩未做工具组完整性对齐会在 assistant tool_calls 与 tool 消息之间截断，导致 provider API 报错（tool_calls 无对应 tool result）
 - LLM 摘要无 fallback 回退会让 LLM 故障直接中断 AgentGraph 主路径，应注入 `HeuristicSummarizer` 作为 fallback
 - cooldown 用 wall clock 会让测试等待真实时间，应注入 `_clock` callable 用 fake clock 验证
-- `replace_summary_message` 非单事务实现会在 DELETE 后 INSERT 之间因进程崩溃遗留 0 条或多条摘要消息，破坏"最多 1 条"不变量
+- 只追加摘要消息却不标记被吸收的原消息，会使下轮上下文同时加载摘要和 middle 原文，造成重复与 token 回涨
 - `save_summary` 失败时回滚 messages 表会让下次上下文准备加载到新摘要但 summaries 表无对应记录，Dashboard 显示滞后；正确降级是接受 Dashboard 滞后一轮不回滚
 
 ## 模式二十三：观测与 Token 统计 DDD 装配

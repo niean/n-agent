@@ -377,9 +377,9 @@
         - 观测：观测菜单二级化调整，增加左导二级菜单`会话`、`组件`；会话，路径/observations/sessions，承接现有的`观测`页面；组件，路径系/observations/modules，承接现有的`健康`页面。修改后，观测一级菜单不再承接路由(类似工具)
 
 [20260713]
-- NFR
-    - 治理：上下文Context 拆分为独立子域
-    - 治理：集中式Policy 改为领域自治，先做ToolPolicy(ACP)；保留共性抽象，放到Shared Kernel级别的公共领域模型
+- FR
+    - 上下文：[KF]Context拆分子域，并独立Graph节点
+    - 工具：拆分ToolPolicy，先做ACP。集中式Policy改为领域自治，保留共性抽象、放到Shared Kernel
         - 飞书：支持 ToolPolicy 工具审批，审批方式跟`破坏性 Slash Command`保持一致
         - TUI：支持 ToolPolicy 工具审批，审批方式跟`破坏性 Slash Command`保持一致(如果有)；实现方式，参考ACP和飞书支持ToolPolicy
 
