@@ -12,7 +12,12 @@ from app.application.session_service import SessionService
 from app.domain.agent import AgentState
 from app.domain.memory import MemoryStore
 from app.domain.session import ConversationMessage, SessionSource
-from app.domain.tool import ApprovalDecider, ToolExecutionContext
+from app.domain.tool import (
+    ApprovalDecider,
+    ConfirmToolGrant,
+    RiskLevel,
+    ToolExecutionContext,
+)
 from app.utils.content_utils import extract_text, normalize_content
 
 
@@ -30,7 +35,7 @@ class ChatCompletionInput:
     session_id: str | None = None
     trusted_metadata: dict[str, Any] = field(default_factory=dict)
     approval_decider: ApprovalDecider | None = None
-    allowed_confirm_tools_override: dict[str, dict[str, Any]] | None = None
+    allowed_confirm_tools_override: dict[str, ConfirmToolGrant] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,8 +151,20 @@ class ChatCompletionService:
         if request.approval_decider is not None:
             ctx = dataclasses.replace(ctx, approval_decider=request.approval_decider)
         if request.allowed_confirm_tools_override:
-            merged = {**ctx.allowed_confirm_tools, **request.allowed_confirm_tools_override}
-            ctx = dataclasses.replace(ctx, allowed_confirm_tools=merged)
+            allowed_override, permitted_override = self._normalize_confirm_tool_grants(
+                request.allowed_confirm_tools_override
+            )
+            ctx = dataclasses.replace(
+                ctx,
+                allowed_confirm_tools={
+                    **ctx.allowed_confirm_tools,
+                    **allowed_override,
+                },
+                permitted_managed_tools={
+                    *ctx.permitted_managed_tools,
+                    *permitted_override,
+                },
+            )
         options["tool_execution_context"] = ctx
         if request.stream:
             return self.graph_runner.stream_events(state, request.model, options)
@@ -176,6 +193,41 @@ class ChatCompletionService:
         if gateway_platform == Platform.FEISHU.value:
             return {"manage_schedule"}
         return set()
+
+    def _normalize_confirm_tool_grants(
+        self,
+        grants: Any,
+    ) -> tuple[dict[str, ConfirmToolGrant], set[str]]:
+        allowed: dict[str, ConfirmToolGrant] = {}
+        permitted: set[str] = set()
+        if type(grants) is not dict:
+            return allowed, permitted
+        tool_service = getattr(self.graph_runner, "tool_service", None)
+        if tool_service is None:
+            return allowed, permitted
+
+        for tool_name, grant in grants.items():
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                continue
+            definition = tool_service.get_definition(tool_name)
+            if (
+                definition is None
+                or not definition.enabled
+                or definition.risk_level is not RiskLevel.CONFIRM
+            ):
+                continue
+            if definition.managed:
+                if isinstance(grant, str) and grant == "session":
+                    permitted.add(tool_name)
+                continue
+            if isinstance(grant, str) and grant == "session":
+                allowed[tool_name] = "session"
+            elif type(grant) is dict and all(
+                isinstance(key, str)
+                for key in grant
+            ):
+                allowed[tool_name] = dict(grant)
+        return allowed, permitted
 
     def _active_external_memory_names(self) -> set[str]:
         if self._external_memory_reader is None:

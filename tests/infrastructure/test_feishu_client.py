@@ -170,16 +170,17 @@ def test_send_interactive_card_posts_interactive_message():
         requests.append(request)
         if request.url.path.endswith("/tenant_access_token/internal"):
             return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token", "expire": 7200})
-        return httpx.Response(200, json={"code": 0})
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "card-msg-1"}})
 
     feishu = client(allowed_open_ids=[], allowed_chat_ids=[])
     feishu.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://open.feishu.cn")
 
-    asyncio.run(feishu.send_interactive_card("oc_1", {"type": "template", "data": {}}))
+    message_id = asyncio.run(feishu.send_interactive_card("oc_1", {"type": "template", "data": {}}))
 
     body = json.loads(requests[1].content)
     assert body["msg_type"] == "interactive"
     assert json.loads(body["content"])["type"] == "template"
+    assert message_id == "card-msg-1"
 
 
 def test_add_reaction_posts_message_reaction():

@@ -4,6 +4,10 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
+
 from app.interfaces.cli.management import is_management_command, run_management_command
 from app.interfaces.cli.render import render_markdown, render_status
 from app.interfaces.cli.slash import (
@@ -75,9 +79,14 @@ class ReplRunner:
         self._console = console
         self._conversation_id = conversation_id
         self._is_tty = is_tty
-        self._last_confirmation_id: str | None = None
+        self._last_slash_confirmation_id: str | None = None
+        self._last_tool_confirmation_id: str | None = None
         self._history_file = str(HISTORY_FILE)
         self._prompt_session: Any = None
+        self._tool_approval_bridge: Any = None
+        if is_tty:
+            from app.interfaces.cli.cli_tool_approval import CliToolApprovalBridge
+            self._tool_approval_bridge = CliToolApprovalBridge()
 
     async def run(self) -> int:
         self._ensure_history_file()
@@ -105,10 +114,6 @@ class ReplRunner:
                 return 0
 
     async def _run_tty(self) -> int:
-        from prompt_toolkit import PromptSession
-        from prompt_toolkit.history import FileHistory
-        from prompt_toolkit.patch_stdout import patch_stdout
-
         self._prompt_session = PromptSession(
             history=FileHistory(self._history_file),
             completer=build_slash_completer(),
@@ -122,6 +127,8 @@ class ReplRunner:
                     continue
                 should_exit = await self._handle_input(text)
             except (EOFError, KeyboardInterrupt):
+                return 0
+            except asyncio.CancelledError:
                 return 0
             if should_exit:
                 return 0
@@ -161,19 +168,66 @@ class ReplRunner:
             parts.append(f"--conversation-id {self._conversation_id}")
         return " ".join(parts)
 
-    async def _send_stream(self, text: str) -> None:
-        def on_confirmation(metadata: dict[str, Any]) -> None:
-            confirmation = metadata.get("confirmation") or {}
-            cid = confirmation.get("id")
-            if cid:
-                self._last_confirmation_id = cid
-                render_status("destructive command requires confirmation", "warning", self._console)
-                render_status("use /confirm once, /confirm trust, or /cancel", "info", self._console)
+    def _on_slash_confirmation(self, metadata: dict[str, Any]) -> None:
+        confirmation = metadata.get("confirmation") or {}
+        cid = confirmation.get("id")
+        if cid:
+            self._last_slash_confirmation_id = cid
+            render_status("destructive command requires confirmation", "warning", self._console)
+            render_status("use /confirm once, /confirm trust, or /cancel", "info", self._console)
 
-        stream = self._client.send_stream(text, self._conversation_id)
-        task = asyncio.create_task(consume_stream(stream, self._console, on_confirmation=on_confirmation))
+    def _on_tool_approval(self, metadata: dict[str, Any]) -> None:
+        cid = metadata.get("id")
+        if cid:
+            self._last_tool_confirmation_id = cid
+            tool_name = metadata.get("tool_name", "")
+            description = metadata.get("description", "")
+            arguments_summary = metadata.get("arguments_summary", "")
+            render_status(f"tool approval required: {tool_name}", "warning", self._console)
+            if description:
+                render_status(f"description: {description}", "info", self._console)
+            if arguments_summary:
+                render_status(f"arguments: {arguments_summary}", "info", self._console)
+            render_status("use /confirm once, /confirm trust, or /cancel", "info", self._console)
+
+    def _session_key(self):
+        from app.domain.gateway import GatewaySessionKey
+        from app.domain.session import SessionSource
+        return GatewaySessionKey(
+            SessionSource.CLI.value,
+            self._conversation_id,
+            display_name=self._conversation_id,
+        )
+
+    def _actor_id(self) -> str:
+        return f"cli:{self._conversation_id}"
+
+    async def _send_stream(self, text: str) -> None:
+        if self._tool_approval_bridge is not None:
+            def cleanup(cid: str) -> None:
+                if self._last_tool_confirmation_id == cid:
+                    self._last_tool_confirmation_id = None
+            decider = self._tool_approval_bridge.create_decider(
+                self._session_key(),
+                self._actor_id(),
+                self._on_tool_approval,
+                cleanup=cleanup,
+                session_grant_updater=self._client.grant_tool_for_session,
+                session_grant_checker=self._client.is_tool_granted,
+            )
+        else:
+            decider = None
+        stream = self._client.send_stream(
+            text, self._conversation_id, approval_decider=decider
+        )
+        task = asyncio.create_task(
+            consume_stream(stream, self._console, on_confirmation=self._on_slash_confirmation)
+        )
         try:
-            await task
+            if self._is_tty and self._prompt_session is not None:
+                await self._race_stream_with_prompt(task)
+            else:
+                await task
         except asyncio.CancelledError:
             task.cancel()
             aclose = getattr(stream, "aclose", None)
@@ -183,27 +237,131 @@ class ReplRunner:
                 except Exception:
                     pass
             render_status("\n[interrupted]", "warning", self._console)
+            raise
+        finally:
+            if self._tool_approval_bridge is not None:
+                self._tool_approval_bridge.discard_pending_for_actor(
+                    self._actor_id(), self._session_key()
+                )
 
-    async def _handle_confirm(self, text: str) -> None:
-        if not self._last_confirmation_id:
+    async def _race_stream_with_prompt(self, task: asyncio.Task) -> None:
+        while not task.done():
+            prompt_task = asyncio.create_task(
+                self._prompt_session.prompt_async("> ")
+            )
+            try:
+                with patch_stdout():
+                    await asyncio.wait(
+                        {task, prompt_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+            finally:
+                if not prompt_task.done():
+                    prompt_task.cancel()
+                    try:
+                        await prompt_task
+                    except BaseException:
+                        pass
+            if task.done():
+                return
+            try:
+                text = prompt_task.result()
+            except (EOFError, KeyboardInterrupt):
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+                raise
+            text = text.strip()
+            if not text:
+                continue
+            if text == "/exit":
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+                raise asyncio.CancelledError("/exit")
+            if text.startswith("/confirm") or text == "/cancel":
+                await self._handle_approval_during_stream(text)
+            else:
+                render_status(
+                    "stream in progress; use /confirm or /cancel", "warning", self._console
+                )
+
+    async def _handle_approval_during_stream(self, text: str) -> None:
+        if text == "/cancel":
+            choice = "cancel"
+        else:
+            parts = text.split()
+            arg = parts[1] if len(parts) > 1 else "once"
+            choice_map = {"once": "once", "trust": "trust_session"}
+            if arg not in choice_map:
+                render_status("usage: /confirm once|trust", "warning", self._console)
+                return
+            choice = choice_map[arg]
+        cid = self._last_tool_confirmation_id
+        if not cid or self._tool_approval_bridge is None:
             render_status("no pending confirmation", "warning", self._console)
             return
+        try:
+            claim = self._tool_approval_bridge.claim(
+                cid, choice, actor_id=self._actor_id(), session_key=self._session_key()
+            )
+        except Exception as exc:
+            render_status(str(exc), "warning", self._console)
+            return
+        self._tool_approval_bridge.complete(claim)
+        self._last_tool_confirmation_id = None
+
+    async def _handle_confirm(self, text: str) -> None:
         parts = text.split()
         choice = parts[1] if len(parts) > 1 else "once"
         choice_map = {"once": "once", "trust": "trust_session"}
         if choice not in choice_map:
             render_status("usage: /confirm once|trust", "warning", self._console)
             return
-        resp = await self._client.confirm(self._last_confirmation_id, choice_map[choice], self._conversation_id)
-        for msg in resp.messages:
-            render_markdown(msg.content, self._console)
-        self._last_confirmation_id = None
-
-    async def _handle_cancel(self) -> None:
-        if not self._last_confirmation_id:
+        if self._last_tool_confirmation_id is not None and self._tool_approval_bridge is not None:
+            cid = self._last_tool_confirmation_id
+            try:
+                claim = self._tool_approval_bridge.claim(
+                    cid, choice_map[choice], actor_id=self._actor_id(), session_key=self._session_key()
+                )
+            except Exception as exc:
+                render_status(str(exc), "warning", self._console)
+                return
+            self._tool_approval_bridge.complete(claim)
+            self._last_tool_confirmation_id = None
+            return
+        if not self._last_slash_confirmation_id:
             render_status("no pending confirmation", "warning", self._console)
             return
-        resp = await self._client.confirm(self._last_confirmation_id, "cancel", self._conversation_id)
+        resp = await self._client.confirm(
+            self._last_slash_confirmation_id, choice_map[choice], self._conversation_id
+        )
         for msg in resp.messages:
             render_markdown(msg.content, self._console)
-        self._last_confirmation_id = None
+        self._last_slash_confirmation_id = None
+
+    async def _handle_cancel(self) -> None:
+        if self._last_tool_confirmation_id is not None and self._tool_approval_bridge is not None:
+            cid = self._last_tool_confirmation_id
+            try:
+                claim = self._tool_approval_bridge.claim(
+                    cid, "cancel", actor_id=self._actor_id(), session_key=self._session_key()
+                )
+            except Exception as exc:
+                render_status(str(exc), "warning", self._console)
+                return
+            self._tool_approval_bridge.complete(claim)
+            self._last_tool_confirmation_id = None
+            return
+        if self._last_slash_confirmation_id:
+            resp = await self._client.confirm(
+                self._last_slash_confirmation_id, "cancel", self._conversation_id
+            )
+            for msg in resp.messages:
+                render_markdown(msg.content, self._console)
+            self._last_slash_confirmation_id = None
+            return
+        render_status("no pending confirmation", "warning", self._console)

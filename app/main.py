@@ -106,9 +106,9 @@ def _configure_logging() -> None:
     uvicorn 0.30+ 默认 LOGGING_CONFIG 不再为 root logger 配置 handler/level，
     导致应用层 logger.info() 因 root logger 无 handler 且 effective level 回落
     到 WARNING 而完全静默（仅 uvicorn.access logger 单独配置仍可见）。这里在
-    模块 import 时显式配置 root logger，保证 HTTP 与 CLI 两种入口下应用日志
-    均可见。basicConfig 幂等：root logger 已有 handler 时（如 pytest 已配置）
-    不覆盖。
+    FastAPI 工厂启动时显式配置 root logger，保证 HTTP 服务的应用日志可见。
+    CLI 只复用本模块的服务装配，不应因此开启 INFO 日志。basicConfig 幂等：
+    root logger 已有 handler 时（如 pytest 已配置）不覆盖。
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -116,7 +116,6 @@ def _configure_logging() -> None:
     )
 
 
-_configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -873,6 +872,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    _configure_logging()
     services = build_application_services(settings)
 
     @asynccontextmanager

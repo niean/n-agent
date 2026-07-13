@@ -289,3 +289,49 @@ async def test_handle_message_stream_slash_with_images_rejected_without_confirma
     assert svc.command_service.pending_confirmations == {}
     assert fake_chat.requests == []
     assert any(e.type == ChatEventType.MESSAGE_DONE for e in events)
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_cli_passes_decider_and_internal_session_id(gateway_service_with_fake_registry):
+    """CLI source: decider object enters ChatCompletionInput as-is; internal session id
+    resolved by Gateway (from registry) is the one placed in chat input. This internal
+    session id is what would propagate to ApprovalRequest.session_id downstream."""
+    svc, fake_chat = gateway_service_with_fake_registry
+    key = GatewaySessionKey("cli", "conv-1", display_name="conv-1")
+    await svc.registry.create_session_link(key, "internal-session-42")
+    event = _cli_event("hello", "evt-cli-decider")
+    approval_decider = object()
+
+    events = [
+        e async for e in svc.handle_message_stream(
+            event, approval_decider=approval_decider
+        )
+    ]
+
+    assert events[-1].type == ChatEventType.DONE
+    request = fake_chat.requests[0]
+    # Decider object identity preserved end-to-end at Gateway boundary
+    assert request.approval_decider is approval_decider
+    # Internal session id (from registry) is what flows into chat input;
+    # conversation id (conv-1) is NOT used as the session id
+    assert request.session_id == "internal-session-42"
+    assert request.session_id != "conv-1"
+    # No allowed_confirm_tools_override in CLI path
+    assert getattr(request, "allowed_confirm_tools_override", None) is None
+
+
+@pytest.mark.asyncio
+async def test_handle_message_stream_cli_without_decider_does_not_inject_override(gateway_service_with_fake_registry):
+    """CLI source without decider: Gateway must not synthesize a decider or
+    allowed_confirm_tools_override. The path stays fail-closed downstream."""
+    svc, fake_chat = gateway_service_with_fake_registry
+    key = GatewaySessionKey("cli", "conv-1", display_name="conv-1")
+    await svc.registry.create_session_link(key, "internal-session-43")
+    event = _cli_event("hello", "evt-cli-no-decider")
+
+    events = [e async for e in svc.handle_message_stream(event)]
+
+    assert events[-1].type == ChatEventType.DONE
+    request = fake_chat.requests[0]
+    assert request.approval_decider is None
+    assert getattr(request, "allowed_confirm_tools_override", None) is None

@@ -1,11 +1,15 @@
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from app.application.tool_service import (
+    ToolNotFoundError,
     ToolService,
     builtin_tool_definitions,
     knowledge_tool_definitions,
     schedule_tool_definitions,
 )
+from app.domain.policy import PolicyDecision, PolicyOutcome
 from app.domain.tool import (
     RiskLevel,
     ToolCallRequest,
@@ -15,6 +19,7 @@ from app.domain.tool import (
     ToolResultStatus,
     ToolSourceType,
 )
+from app.domain.tool_policy import ToolExposurePolicy, ToolPolicy
 
 
 class FakeExecutor:
@@ -299,3 +304,380 @@ def test_schedule_tool_definitions_shape():
     assert query.managed is False
     assert query.source_type is ToolSourceType.AGENT
     assert query.input_schema["properties"]["action"]["enum"] == ["list", "get"]
+
+
+def _definition(
+    name: str,
+    *,
+    description: str = "description",
+    risk_level: RiskLevel = RiskLevel.SAFE,
+    source_type: ToolSourceType = ToolSourceType.BUILTIN,
+    enabled: bool = True,
+    managed: bool = False,
+    input_schema=None,
+) -> ToolDefinition:
+    return ToolDefinition(
+        name=name,
+        description=description,
+        input_schema={"type": "object"} if input_schema is None else input_schema,
+        risk_level=risk_level,
+        source_type=source_type,
+        enabled=enabled,
+        managed=managed,
+    )
+
+
+class RecordingPolicy(ToolPolicy):
+    def __init__(self):
+        self.validated: list[str] = []
+
+    def validate_definition(self, definition):
+        self.validated.append(definition.name)
+        super().validate_definition(definition)
+
+
+def test_constructor_injects_policy_and_validates_all_static_definitions_first():
+    policy = RecordingPolicy()
+    service = ToolService(
+        RecordingExecutor(),
+        [_definition("first"), _definition("second")],
+        policy=policy,
+    )
+
+    assert service.policy is policy
+    assert policy.validated == ["first", "second"]
+
+
+def test_dynamic_definitions_filter_schema_before_dedup_and_keep_priority_order():
+    static = _definition("static", description="static")
+    first_source = _definition("shared", description="first source", source_type=ToolSourceType.MCP)
+    second_source = _definition("shared", description="second source", source_type=ToolSourceType.PLUGIN)
+    valid_after_invalid = _definition("later", description="valid", source_type=ToolSourceType.MCP)
+    service = ToolService(RecordingExecutor(), [static])
+
+    service.set_dynamic_definitions("first", [
+        _definition("static", description="ignored static", source_type=ToolSourceType.MCP),
+        _definition("later", input_schema={"type": "string"}, source_type=ToolSourceType.MCP),
+        valid_after_invalid,
+        _definition("later", description="duplicate", source_type=ToolSourceType.MCP),
+        first_source,
+    ])
+    service.set_dynamic_definitions("second", [second_source])
+
+    assert service.get_definition("static") is static
+    assert service.get_definition("later") is valid_after_invalid
+    assert service.get_definition("shared") is first_source
+    assert [definition.name for definition in service.list_definitions()] == [
+        "static",
+        "later",
+        "shared",
+        "shared",
+    ]
+
+
+def test_dynamic_definition_replacement_is_atomic_and_preserves_source_order_on_failure():
+    old = _definition("shared", description="old", source_type=ToolSourceType.MCP)
+    fallback = _definition("shared", description="fallback", source_type=ToolSourceType.PLUGIN)
+    service = ToolService(RecordingExecutor(), [])
+    service.set_dynamic_definitions("first", [old])
+    service.set_dynamic_definitions("second", [fallback])
+
+    with pytest.raises(ValueError, match="confirm"):
+        service.set_dynamic_definitions("first", [
+            _definition("new", source_type=ToolSourceType.MCP),
+            _definition("invalid", managed=True, source_type=ToolSourceType.MCP),
+        ])
+
+    assert service.get_definition("shared") is old
+    assert list(service.dynamic_definitions) == ["first", "second"]
+
+
+@pytest.mark.parametrize(
+    ("exposure", "expected"),
+    [
+        (
+            None,
+            {
+                "static_safe",
+                "static_agent",
+                "static_confirm",
+                "dynamic_safe",
+                "dynamic_agent",
+                "dynamic_confirm",
+            },
+        ),
+        (RiskLevel.SAFE, {"static_safe", "dynamic_safe"}),
+        (
+            ToolExposurePolicy.DEFAULT,
+            {
+                "static_safe",
+                "static_agent",
+                "static_confirm",
+                "dynamic_safe",
+                "dynamic_agent",
+                "dynamic_confirm",
+            },
+        ),
+        (ToolExposurePolicy.SAFE_ONLY, {"static_safe", "dynamic_safe"}),
+        (RiskLevel.CONFIRM, {"static_confirm", "dynamic_confirm"}),
+        (RiskLevel.DANGEROUS, {"static_dangerous", "dynamic_dangerous"}),
+    ],
+)
+def test_list_openai_tools_applies_compatible_static_and_dynamic_exposure_matrix(
+    exposure,
+    expected,
+):
+    static = [
+        _definition("static_safe"),
+        _definition("static_agent", source_type=ToolSourceType.AGENT),
+        _definition("static_confirm", risk_level=RiskLevel.CONFIRM),
+        _definition("static_dangerous", risk_level=RiskLevel.DANGEROUS),
+        _definition("static_disabled", enabled=False),
+        _definition("static_bad_schema", input_schema={"type": "string"}),
+    ]
+    dynamic = [
+        _definition("dynamic_safe", source_type=ToolSourceType.MCP),
+        _definition("dynamic_agent", source_type=ToolSourceType.AGENT),
+        _definition(
+            "dynamic_confirm",
+            risk_level=RiskLevel.CONFIRM,
+            source_type=ToolSourceType.MCP,
+        ),
+        _definition(
+            "dynamic_dangerous",
+            risk_level=RiskLevel.DANGEROUS,
+            source_type=ToolSourceType.MCP,
+        ),
+        _definition(
+            "dynamic_disabled",
+            enabled=False,
+            source_type=ToolSourceType.MCP,
+        ),
+    ]
+    service = ToolService(RecordingExecutor(), static)
+    service.set_dynamic_definitions("dynamic", dynamic)
+
+    schemas = service.list_openai_tools(exposure)
+
+    assert {schema["function"]["name"] for schema in schemas} == expected
+    assert all(set(schema) == {"type", "function"} for schema in schemas)
+    assert all(
+        set(schema["function"]) == {"name", "description", "parameters"}
+        for schema in schemas
+    )
+
+
+def test_evaluate_execution_returns_frozen_decision_and_display_from_one_definition_snapshot():
+    original = _definition(
+        "dynamic",
+        description="approval text v1",
+        risk_level=RiskLevel.CONFIRM,
+        source_type=ToolSourceType.MCP,
+    )
+    service = ToolService(RecordingExecutor(), [])
+    service.set_dynamic_definitions("mcp", [original])
+    request = ToolCallRequest(id="call", name="dynamic", arguments={"value": 1})
+
+    evaluation = service.evaluate_execution(request)
+    service.set_dynamic_definitions("mcp", [
+        _definition("dynamic", description="v2", source_type=ToolSourceType.MCP)
+    ])
+
+    assert evaluation.decision == PolicyDecision(
+        PolicyOutcome.REQUIRE_APPROVAL,
+        "confirm_approval_required",
+    )
+    assert evaluation.approval.name == "dynamic"
+    assert evaluation.approval.description == "approval text v1"
+    assert evaluation.approval.risk_level is RiskLevel.CONFIRM
+    with pytest.raises(FrozenInstanceError):
+        evaluation.approval.description = "mutated"
+
+
+def test_evaluate_and_authorize_once_use_lookup_and_raise_clear_not_found_error():
+    service = ToolService(RecordingExecutor(), [])
+    request = ToolCallRequest(id="missing", name="missing")
+
+    with pytest.raises(ToolNotFoundError, match="missing"):
+        service.evaluate_execution(request)
+    with pytest.raises(ValueError, match="missing"):
+        service.authorize_once(request)
+
+
+def test_authorize_once_uses_current_definition_and_returns_one_call_context():
+    service = ToolService(RecordingExecutor(), [
+        _definition("confirm", risk_level=RiskLevel.CONFIRM)
+    ])
+    request = ToolCallRequest(id="call", name="confirm", arguments={"path": "a"})
+
+    authorized = service.authorize_once(request, ToolExecutionContext(session_id="s"))
+
+    assert authorized.session_id == "s"
+    assert authorized.allowed_confirm_tools == {"confirm": {"path": "a"}}
+
+
+@pytest.mark.asyncio
+async def test_old_evaluation_cannot_authorize_or_execute_replaced_dynamic_definition():
+    old_definition = _definition(
+        "dynamic",
+        description="old confirm tool",
+        risk_level=RiskLevel.CONFIRM,
+        source_type=ToolSourceType.MCP,
+    )
+    new_definition = _definition(
+        "dynamic",
+        description="replacement tool",
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.MCP,
+    )
+    executor = RecordingExecutor()
+    service = ToolService(executor, [])
+    service.set_dynamic_definitions("mcp", [old_definition])
+    request = ToolCallRequest(id="call", name="dynamic", arguments={"value": 1})
+    evaluation = service.evaluate_execution(request)
+    service.set_dynamic_definitions("mcp", [new_definition])
+
+    with pytest.raises(ValueError, match="definition changed"):
+        service.authorize_once(request, evaluation=evaluation)
+
+    result = await service.execute(
+        request,
+        ToolExecutionContext(allowed_confirm_tools={"dynamic": {"value": 1}}),
+        evaluation=evaluation,
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content == {
+        "error": "permission_denied",
+        "reason": "tool_definition_changed",
+    }
+    assert executor.calls == []
+
+
+class CountingPolicy(ToolPolicy):
+    def __init__(self):
+        self.evaluations = 0
+
+    def evaluate_execution(self, definition, request, context=None):
+        self.evaluations += 1
+        return super().evaluate_execution(definition, request, context)
+
+
+@pytest.mark.asyncio
+async def test_unchanged_evaluation_authorizes_and_execute_rechecks_policy():
+    policy = CountingPolicy()
+    executor = RecordingExecutor()
+    service = ToolService(
+        executor,
+        [_definition("confirm", risk_level=RiskLevel.CONFIRM)],
+        policy=policy,
+    )
+    request = ToolCallRequest(id="call", name="confirm", arguments={"path": "a"})
+    evaluation = service.evaluate_execution(request)
+
+    authorized = service.authorize_once(request, evaluation=evaluation)
+    evaluations_before_execute = policy.evaluations
+    result = await service.execute(
+        request,
+        authorized,
+        evaluation=evaluation,
+    )
+
+    assert result.status is ToolResultStatus.SUCCESS
+    assert policy.evaluations == evaluations_before_execute + 1
+    assert executor.calls == [request]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        ToolCallRequest(id="call", name="confirm", arguments={"path": "a"}),
+        ToolCallRequest(id="other-id", name="confirm", arguments={"path": "a"}),
+        ToolCallRequest(id="call", name="other", arguments={"path": "a"}),
+        ToolCallRequest(id="call", name="confirm", arguments={"path": "b"}),
+    ],
+)
+async def test_evaluation_cannot_authorize_or_execute_replacement_request(replacement):
+    executor = RecordingExecutor()
+    service = ToolService(executor, [
+        _definition("confirm", risk_level=RiskLevel.CONFIRM),
+        _definition("other", risk_level=RiskLevel.CONFIRM),
+    ])
+    original = ToolCallRequest(
+        id="call",
+        name="confirm",
+        arguments={"path": "a"},
+    )
+    evaluation = service.evaluate_execution(original)
+
+    with pytest.raises(ValueError):
+        service.authorize_once(replacement, evaluation=evaluation)
+
+    result = await service.execute(
+        replacement,
+        ToolExecutionContext(
+            allowed_confirm_tools={replacement.name: "session"},
+        ),
+        evaluation=evaluation,
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert executor.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("definition", "reason"),
+    [
+        (_definition("disabled", enabled=False), "tool_disabled"),
+        (_definition("dangerous", risk_level=RiskLevel.DANGEROUS), "dangerous_tool"),
+        (_definition("confirm", risk_level=RiskLevel.CONFIRM), "confirm_approval_required"),
+    ],
+)
+async def test_execute_denies_non_allow_decisions_with_stable_non_sensitive_content(
+    definition,
+    reason,
+):
+    executor = RecordingExecutor()
+    service = ToolService(executor, [definition])
+    request = ToolCallRequest(id="call", name=definition.name, arguments={"secret": "value"})
+    context = ToolExecutionContext(
+        metadata={"authorization": "untrusted"},
+        trusted_metadata={"token": "trusted-secret"},
+    )
+
+    result = await service.execute(request, context)
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content == {"error": "permission_denied", "reason": reason}
+    assert executor.calls == []
+    assert "secret" not in str(result.content)
+    assert "authorization" not in str(result.content)
+
+
+@pytest.mark.asyncio
+async def test_execute_not_found_keeps_compatible_error_shape():
+    service = ToolService(RecordingExecutor(), [])
+
+    result = await service.execute(ToolCallRequest(id="call", name="missing"))
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.content == {"error": "tool not found"}
+
+
+class TypeErrorPolicy(ToolPolicy):
+    def evaluate_execution(self, definition, request, context=None):
+        raise TypeError("policy failure")
+
+
+@pytest.mark.asyncio
+async def test_execute_does_not_apply_executor_typeerror_fallback_to_policy_errors():
+    service = ToolService(
+        RecordingExecutor(),
+        [_definition("safe")],
+        policy=TypeErrorPolicy(),
+    )
+
+    with pytest.raises(TypeError, match="policy failure"):
+        await service.execute(ToolCallRequest(id="call", name="safe"))

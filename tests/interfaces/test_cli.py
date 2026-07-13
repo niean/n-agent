@@ -30,7 +30,7 @@ class FakeGatewayService:
         self.events.append(event)
         return FakeResponse("session-1", [FakeOutbound("reply")], {})
 
-    async def handle_message_stream(self, event: InteractionMessage) -> AsyncIterator[ChatEvent]:
+    async def handle_message_stream(self, event: InteractionMessage, **kwargs) -> AsyncIterator[ChatEvent]:
         self.events.append(event)
         yield ChatEvent(ChatEventType.MESSAGE_START)
         yield ChatEvent(ChatEventType.CONTENT_DELTA, content="reply")

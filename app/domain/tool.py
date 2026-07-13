@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Protocol, Union
+from typing import Any, Awaitable, Callable, Literal, Protocol, Union
 
 
 class RiskLevel(str, Enum):
@@ -26,12 +26,6 @@ class ToolResultStatus(str, Enum):
     PERMISSION_DENIED = "permission_denied"
     TIMEOUT = "timeout"
     SKIPPED = "skipped"
-
-
-@dataclass(frozen=True)
-class PermissionDecision:
-    allowed: bool
-    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -74,10 +68,12 @@ class ApprovalDecision:
 
 ApprovalDecider = Callable[[ApprovalRequest], Union[ApprovalDecision, Awaitable[ApprovalDecision]]]
 
+ConfirmToolGrant = dict[str, Any] | Literal["session"]
+
 
 @dataclass(frozen=True)
 class ToolExecutionContext:
-    allowed_confirm_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    allowed_confirm_tools: dict[str, ConfirmToolGrant] = field(default_factory=dict)
     session_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     trusted_metadata: dict[str, Any] = field(default_factory=dict)

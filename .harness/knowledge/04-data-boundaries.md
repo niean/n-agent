@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema（含 sessions token/cost 迁移列、usage_records/compression_stats 表）、OpenAI-compatible 协议边界和 Docker Compose 数据挂载边界，覆盖 Usage 观测值对象（CanonicalUsage/UsageCost/PricingEntry/SessionUsageStats/ContextBreakdown/UsageRecord/CompressionStat）与端口（UsageRecorder/PricingProvider/ContextBreakdownCalculator） -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、OpenAI-compatible 协议边界和 Docker Compose 数据挂载边界，含飞书 ToolPolicy 审批的会话授权与协议 pending 所有权 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -27,6 +27,10 @@
 
 `GatewayHomeTarget`（`app/domain/gateway.py`）：平台级 home chat 投递目标，字段包括 platform、receive_id、receive_id_type、thread_id、display_name、updated_at。定时任务的 Feishu origin 通知可以保存 `target=home` 逻辑引用，发送时动态解析当前 home target，因此 home chat 切换后既有任务自动跟随新目标。
 
+`GatewayToolApprovalService`（`app/application/gateway_tool_approval_service.py`）：Application 层进程内授权状态，键为 `(session_id, actor_id, tool_name)`，只表达 ToolPolicy 的“本会话信任”；不持久化、不跨进程共享，也不替代 `ToolService` 的执行前复判。
+
+`FeishuToolApprovalBridge` pending（`app/interfaces/feishu_tool_approval.py`）：Interfaces 层短生命周期协议状态，绑定 request/session/actor/reply target、创建/过期时间、等待中的 Future、服务端返回的 card message id 与原子 claim 状态；完成、超时、取消或发送失败即清理。它不保存会话授权，卡片参数只使用脱敏摘要，回调身份以服务端 pending 绑定的 actor/chat/card message id 为准，不信任客户端回传的 kind/thread/platform。
+
 ## Provider 与工具模型
 
 `ModelInfo`（`app/domain/provider.py`）：模型能力描述，字段包括 id、display_name、provider、supports_tools、supports_streaming。
@@ -43,9 +47,17 @@
 
 `ToolExecutionContext`（`app/domain/tool.py`）：单轮工具执行上下文，字段包括 allowed_confirm_tools、session_id、metadata、trusted_metadata、execution_context_mode、permitted_managed_tools、enabled_override。metadata 可来自客户端但不可信；trusted_metadata 只由 Gateway/服务端可信入口写入，用于 managed tool 授权和外部记忆写入权限判断；该对象不持久化、不跨轮复用、不进入 provider request。
 
-`ToolResultStatus`（`app/domain/tool.py`）：工具执行状态枚举，取值包括 success、error、permission_denied、timeout。
+`ToolResultStatus`（`app/domain/tool.py`）：工具执行状态枚举，取值包括 success、error、permission_denied、timeout、skipped。
 
-`PermissionDecision`（`app/domain/tool.py`）：权限判定值对象，字段包括 allowed、reason。
+`Policy` / `PolicyOutcome` / `PolicyDecision`（`app/domain/policy.py`）：Domain Shared Kernel。`Policy` 是泛型规则协议；`PolicyOutcome` 统一 allow、deny、require_approval；`PolicyDecision` 携带 outcome 与非空 reason。Shared Kernel 不承载具体业务规则。
+
+`ToolExposurePolicy`（`app/domain/tool_policy.py`）：工具模型暴露场景枚举，包括 default、safe_only。
+
+`ToolPolicyRequest`（`app/domain/tool_policy.py`）：工具执行策略请求，组合 `ToolDefinition` 与 `ToolCallRequest`。
+
+`ToolPolicy`（`app/domain/tool_policy.py`）：Tool Domain 具体策略，负责定义合法性、模型暴露、执行决策和一次授权。它消费 `ToolExecutionContext`，返回公共 `PolicyDecision`。
+
+`ToolExecutionEvaluation`（`app/application/tool_service.py`）：Application 层一次执行评估结果，包含 `PolicyDecision` 与稳定的审批快照；内部 token 绑定原请求和原定义，防止评估后工具定义被替换仍继续执行。
 
 `ToolResult`（`app/domain/tool.py`）：工具执行结果，字段包括 tool_call_id、tool_name、status、content、duration_ms，其中 status 使用 ToolResultStatus。
 
@@ -103,7 +115,7 @@
 
 `Summarizer`（`app/domain/memory.py`）：定义摘要生成接口。默认 HeuristicSummarizer 实现。
 
-`ToolExecutor`（`app/domain/tool.py`）：定义工具执行接口。Infrastructure 的 BuiltinToolExecutor 实现具体 handler。
+`ToolExecutor`（`app/domain/tool.py`）：定义工具执行 SPI。具体实现属于各支撑子域或 Infrastructure；Infrastructure 的 BuiltinToolExecutor 实现内置 handler。
 
 ## 配置模型
 

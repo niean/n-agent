@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import datetime
+import io
 from enum import Enum
 from types import SimpleNamespace
 
+import app.interfaces.cli.render as render_module
 from app.interfaces.cli.render import (
     make_console,
     render_action,
@@ -42,6 +44,35 @@ def test_render_markdown_no_color_respects_env(monkeypatch):
 def test_make_console_disables_color_by_default():
     console = make_console(force_terminal=True)
     assert console.no_color is True
+
+
+def test_make_console_emits_no_ansi_by_default(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("N_AGENT_CLI_COLOR", raising=False)
+    output = io.StringIO()
+    console = make_console(force_terminal=True)
+    console.file = output
+
+    render_status("description: Probe an MCP site", "info", console)
+
+    assert console.color_system is None
+    assert "\x1b[" not in output.getvalue()
+
+
+def test_make_console_explicitly_disables_rich_styles_by_default(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("N_AGENT_CLI_COLOR", raising=False)
+    options = {}
+
+    def fake_console(**kwargs):
+        options.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(render_module, "Console", fake_console)
+
+    make_console(force_terminal=True)
+
+    assert options["color_system"] is None
 
 
 def test_make_console_allows_explicit_color(monkeypatch):

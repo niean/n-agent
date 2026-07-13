@@ -10,11 +10,10 @@
 Agent Runtime
 ├── 核心子域
 │   ├── TurnLoop：一轮对话请求的执行编排，包括上下文准备、LLM交互、工具执行、记忆更新、结束判断
-│   ├── Context：组装模型输入视图，包括消息上下文、工具定义、压缩，以及Execution Context边界
+│   ├── Context：组装模型输入视图，包括基础消息上下文、约束过滤后的工具定义等
 │   ├── LLM：模型交互子域，负责 Provider Request(请求)构造、模型调用、响应解析
 │   ├── Memory：会话、消息、滚动摘要、工具调用、任务状态，以及外部记忆
-│   ├── Action：把模型 tool_calls 转换为受控工具执行，工具由支撑子域实现
-│   └── Policy：工具权限、风险等级、执行约束和安全决策
+│   └── Tool：负责工具契约与执行编排，把模型 tool_calls 转换为受控的工具执行
 ├── 支撑子域
 │   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
 │   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
@@ -27,6 +26,7 @@ Agent Runtime
 ```
 
 ## TurnLoop
+Agent会话之单轮对话，是Agent的核心业务流程，FSM 如下。使用成熟的 LangGraph.Graph.StateGraph 框架实现。
 
 ```mermaid
 %% align: left
@@ -41,25 +41,106 @@ stateDiagram-v2
   update_memory --> finalize: error / final_message / iteration_limit reached
   finalize --> [*]
 ```
-核心库：LangGraph.Graph.StateGraph
-
 
 ## Context
 
-Context 是一次模型调用前组装出的运行视图，内容来源包括 system prompt、用户输入、Memory、工具定义、执行约束等。
+Context 子域负责模型调用前的运行视图组装。prepare_context 准备基础消息上下文，包括 system prompt、历史消息/摘要(动态压缩)、本轮用户输入；每次 call_llm 前，再由 build_provider_context 生成本次 Provider Context。
 
 ```text
-Context
-├── Message Context
-│   ├── system prompt：身份、指令、安全约束；外部记忆-静态快照
-│   └── session context：历史消息、滚动摘要，本轮用户输入
-│       ├── compression：历史消息按需压缩，得到滚动摘要
-│       └── 外部记忆-动态检索：call_llm 前 prepend 到 本轮用户输入user message
-├── Tool Context
-│   └── tool schemas：经工具暴露策略和 ToolExecutionContext 过滤
-└── Execution Context
-    └── 工具权限、trusted_metadata、运行分支控制，如生成 Tool Context；不直接进入 messages
+Context Frame
+├─ 1. System Prompt
+│  ├─ 身份 identity / 指令 instruction / 安全约束 safety
+│  ├─ 技能 skills index
+│  └─ 外部记忆-静态快照：已启用 provider 的 system_prompt_block
+│
+├─ 2. Session Context
+│  └─ ConversationMessage：head + latest summary + tail
+│     └─ compression：历史消息按需压缩，得到滚动摘要summary
+│
+├─ 3. Turn Context
+│  ├─ 本轮 input messages
+│  └─ 外部记忆-动态检索：call_llm 前 prepend 到 本轮用户输入user message
+│
+├─ 4. Tool Context
+│  └── tool schemas：工具描述，经工具策略 ToolPolicy 过滤
+│
+└─ 5. Execution Context
+   ├─ run options
+   │  ├─ external_memory_enabled：选择外部记忆来源
+   │  └─ tool_exposure_policy：选择可见 tool definitions
+   └─ ToolExecutionContext：工具授权、trusted_metadata、execution_context_mode
+
+       │ ContextService 组装
+       ▼
+
+ProviderContext
+├─ messages ← 1 + 2 + 3
+└─ tools    ← 4
+
+AgentGraphRunner 再组合 ProviderContext + model + options，调用 llm_provider.chat(...)
 ```
+
+消息压缩：历史消息采用三段式压缩，head 保护首 3 条 + middle LLM 摘要 + tail 末 10 条；本次摘要 = llm_summary(上次摘要 + 新增消息)，滚动更新。
+
+
+<details>
+<summary>对话示例</summary>
+
+```text
+前提
+├─ input_messages: [user("我叫什么，最喜欢什么水果？顺便打印下 UTC 时间。")]
+├─ external_memory_enabled: ["file_memory_1", "mem0"]
+├─ file_memory_1 静态快照: "所有回复以‘外部记忆1：’开头。"
+├─ mem0 已存事实:
+│  ├─ "用户名是 niean"
+│  ├─ "最喜欢的水果是西瓜"
+│  └─ "偏好简洁回复"
+└─ tools: [get_current_time, ...]
+
+prepare_context
+└─ working_messages
+   ├─ system(identity / instruction / safety / skills index /
+   │        file_memory_1 静态快照 / mem0 system_prompt_block())
+   └─ user("我叫什么，最喜欢什么水果？顺便打印下 UTC 时间。")
+
+call_llm #1
+├─ 外部记忆-动态检索：prefetch_all()，返回:
+│  └─ <memory-context>
+│     └─ <provider name="mem0">
+│        └─ ## Mem0 Memory
+│           ├─ 用户名是 niean
+│           ├─ 最喜欢的水果是西瓜
+│           └─ 偏好简洁回复
+├─ 将 <memory-context> 临时 prepend 到最后一条 user message
+├─ ProviderContext.messages: [system, user(memory-context + input message)]
+├─ ProviderContext.tools: [get_current_time, ...]
+├─ llm_provider.chat(...)
+└─ LLM 返回 tool_calls: [get_current_time]
+
+execute_tools
+└─ ToolCall: 保存 get_current_time 执行审计
+
+update_memory #1
+└─ ConversationMessage:
+   ├─ assistant(tool_calls)
+   └─ tool(result)
+
+call_llm #2
+├─ working_messages: [system, user, assistant(tool_calls), tool(result)]
+├─ llm_provider.chat(...)
+└─ LLM 返回 final_message:
+   └─ assistant("外部记忆1：你叫 niean，最喜欢西瓜。当前 UTC 时间是……")
+
+update_memory #2
+├─ ConversationMessage: 追加 assistant(final_message)
+└─ TaskState: 保存 running 状态
+
+finalize
+├─ ExternalMemoryManager.sync_all(...):
+│  └─ agent_context="primary" 时，mem0.sync_turn() 同步本轮 user/assistant 消息
+└─ TaskState: 保存 completed 状态
+```
+</details>
 
 
 ## LLM
@@ -70,9 +151,7 @@ LLM 子域对应 `call_llm` 节点，负责一次模型交互，不负责工具�
 LLM
 │
 ├── Provider Request
-│     ├── working_messages
-│     │     └── 外部记忆-动态检索：注入到user message
-│     ├── tool schemas
+│     ├── provider context：messages / tools (由 Context 子域组装)
 │     ├── model
 │     └── options
 │
@@ -82,9 +161,9 @@ LLM
 └── Response Parse
       ├── final_message
       ├── pending_tool_calls
-      ├── Finish Reason
-      ├── Usage
-      └── 下一步分支信号
+      ├── finish_reason
+      ├── usage
+      └── next_step
 ```
 
 
@@ -114,134 +193,6 @@ Memory
 ```
 
 <details>
-<summary>Context Frame: Memory In Context</summary>
-
-完整上下文可以理解为一次模型调用前组装出的 Context Frame，从稳定上下文、到本轮临时上下文逐层合成。Memory 不是单独追加的一段文本，而是根据特征进入稳定层、会话层、本轮层。最终发给模型的是 Provider Request(provider-agnostic request)，返回后再拆成 assistant message、tool calls、usage 和推理元数据。
-
-```text
-Context Frame（上下文来源分层）
-├─ 1. Stable Context
-│  ├─ System Context（静态常量，平台无关；多项拼为单条 system message）
-│  │  ├─ identity: DEFAULT_AGENT_IDENTITY
-│  │  ├─ instruction: REACT_GUIDANCE + KNOWLEDGE_GUIDANCE + MANAGED_TOOL_GUIDANCE
-│  │  ├─ safety: SAFETY_GUIDANCE
-│  │  └─ 外部记忆静态快照：系统记忆（builtin）/文件记忆（multi-project）的 {memory,user}.md
-│  └─ Capability Context
-│     └─ tool definitions: name + description + parameters
-│
-├─ 2. Session Context（*会话记忆*）
-│  ├─ 消息 ConversationMessage: 历史消息/滚动摘要 Summary
-│  ├─ 会话 ConversationSession: 会话身份、来源、标题和外部记忆选择
-│  ├─ 工具调用 ToolCall: 工具执行审计；对话语义由 role=tool 消息承接
-│  └─ 任务状态 TaskState: 任务运行状态（执行控制信号，不作为对话内容）
-│
-├─ 3. Turn Context
-│  ├─ input: latest user messages
-│  ├─ 外部记忆动态检索（retrieved memory）: prefetch_all → <memory-context> 围栏，prepend 到 last user message content 副本
-│  └─ run options: external_memory_enabled + tool_exposure_policy + tool_execution_context + execution_context_mode（控制信号，不进入Provider Request）
-│
-└─ 4. Execution Context（执行现场，不进入Provider Request）
-   ├─ tool filtering: safe_only / default
-   ├─ ToolExecutionContext: 工具授权 + execution_context_mode + enabled_override + trusted_metadata
-   ├─ agent_context（trusted_metadata 内）: primary / subagent / cron / unattended（控制外部记忆写入权限）
-   └─ 运行进度: AgentState.run_status / iteration_count / error（控制 finalize）
-
-       │ 组装
-       ▼
-
-Provider Request
-├─ messages  ← 1.System Context + 2.历史消息/摘要 + 3.input&retrieved memory
-├─ tools     ← 1.Capability Context（经 4.tool filtering 过滤）
-├─ tool choice: 默认
-└─ generation params: temperature / top_p / top_k / max_tokens / stop_sequences / thinking / cache_control 等
-```
-</details>
-
-<details>
-<summary>真实对话示例</summary>
-
-```text
-#### 对话
->> User：现在几点了？打印下UTC时间。
->> Tool：
-{
-  "tool_call_id": "call_u8usl364ddpffrw3q5758dk3",
-  "name": "get_current_time",
-  "status": "success",
-  "content": {
-    "now": "2026-06-27T15:52:06.344631+00:00"
-  },
-  "duration_ms": 0
-}
->> Assistant：外部记忆1：当前的UTC时间是2026年06月27日 15:52:06.344631。
-
-
-#### Context Frame
-
-会话事实：source=dashboard（primary），external_memory_enabled=["builtin","external_memory_1"]，
-builtin/memory.md 为空，external_memory_1/memory.md = `所有的回复，必须以"外部记忆1："开头儿。`。
-共 2 次 LLM 推理（iteration_count=2）：第 1 次产出 tool_calls，第 2 次产出 final。
-
-=== 第 1 次推理 ===
-1. Stable Context
-   ├─ System Context
-   │  ├─ identity / instruction / safety（静态常量）
-   │  └─ *外部记忆*静态快照:
-   │     ├─ builtin/memory.md → ""（空文件不产生 block，跳过）
-   │     └─ external_memory_1/memory.md → "所有的回复，必须以"外部记忆1："开头儿。"
-   └─ Capability Context: tool definitions（含 get_current_time）
-2. Session Context（首轮 history 为空）
-3. Turn Context
-   ├─ input: "现在几点了？打印下UTC时间。"
-   └─ *外部记忆*动态检索: ""（系统记忆/文件记忆 均用 MemoryRetriever 按 query 检索 memory.md entry；本例 query 与 external_memory_1 的 entry 无词重叠，返回空）
-4. Execution Context: agent_context=primary，tool filtering=default
-   │ 组装
-   ▼
-Provider Request #1
-├─ messages: [system(含外部记忆静态快照), user("现在几点了？...")]
-└─ tools: [get_current_time, ...]
-→ LLM 返回: tool_calls=[get_current_time(id=call_u8us...)]
-
---- 中间落盘（execute_tools + update_memory #1）---
-ToolCall 持久化: call_u8us..., get_current_time, success, result={now:2026-06-27T15:52:06.344631+00:00}
-消息 ConversationMessage:
-  ├─ append(role=assistant, content="", tool_calls=[...])
-  └─ append(role=tool, tool_call_id=call_u8us..., content=result)  ← 工具结果经 role=tool 消息回流
-TaskState: status=running, iteration_count=1
-Summary: 本轮未触发上下文压缩，历史仍由原始消息承载
-*外部记忆*自动更新: 本轮 LLM 未调用 external_memory 工具 → 文件未变
-
-=== 第 2 次推理 ===
-1. Stable Context（同 #1，外部记忆静态快照再次注入）
-2. Session Context（首轮历史已落盘）
-   ├─ 消息 ConversationMessage history:
-   │  ├─ user("现在几点了？打印下UTC时间。")
-   │  ├─ assistant(content="", tool_calls=[get_current_time])
-   │  └─ tool(content={now:...})  ← 工具结果通过 role=tool 消息进入 history
-   ├─ 工具调用 ToolCall（审计记录；结果已在 role=tool 消息中）
-   ├─ 任务状态 TaskState: running（执行控制信号）
-   └─ 滚动摘要 Summary: 未参与本轮上下文
-3. Turn Context
-   ├─ input: （无新 user 输入，本轮由 tool 结果驱动）
-   └─ *外部记忆*动态检索: ""
-4. Execution Context: iteration_count=1→2
-   │ 组装
-   ▼
-Provider Request #2
-├─ messages: [system(含外部记忆静态快照), user, assistant(tool_calls), tool(result)]
-└─ tools: [get_current_time, ...]
-→ LLM 返回: final="外部记忆1：当前的UTC时间是2026年06月27日 15:52:06.344631。"
-   ↑ 前缀严格遵循 external_memory_1 静态快照指令 —— 证明外部记忆经 Stable Context 生效
-
---- finalize ---
-消息 ConversationMessage: append(role=assistant, final)  ← scrub_memory_context 剥离 <memory-context>（本轮无此标签）
-TaskState: status=completed, iteration_count=2
-Summary: 若后续触发压缩，会用摘要代表被压缩的历史片段
-*外部记忆*消息同步: sync_all(primary) → 系统记忆（builtin）.sync_turn 抽取关键词写入 observations.md；external_memory_1（文件记忆）.sync_turn 为 no-op
-```
-</details>
-
-<details>
 <summary>单轮写入时序</summary>
 
 `ChatCompletionService.complete` → `AgentGraphRunner`（LangGraph）：
@@ -256,10 +207,11 @@ prepare_context
   ├─ 装配 working_messages: system + history/summary + input
   ├─ *外部记忆*静态快照: 注入到 system
   ├─ 压缩 ContextEngine.should_compress 判定是否压缩 history，外部记忆支持压缩前抢救
-  └─ Context Frame: head + latest summary + tail
+  └─ Message Context: system + head + latest summary + tail
 call_llm
   ├─ *外部记忆*动态检索: prefetch_all → <memory-context> prepend 到 last user message 副本（不污染 state）
-  ├─ llm.chat → Provider Request
+  ├─ build_provider_context: messages + 经工具策略过滤的 tools
+  ├─ llm.chat(messages, tools, model, options)
   └─ scrub_memory_context(final_message.content)  # 立即剥离回声，防写回 消息 ConversationMessage
 execute_tools
   ├─ 工具调用 ToolCall: save_tool_call 持久化工具执行事实
@@ -270,80 +222,42 @@ update_memory（更新*会话记忆*）
   └─ 任务状态 TaskState: save_task_state(status=running|failed)
 finalize
   ├─ 消息 ConversationMessage: 错误兜底 append_message(role=assistant, 错误文案)
-  ├─ *外部记忆*消息同步: sync_all，同步本轮对话内容、给外部记忆provider，系统记忆（builtin）写 observations.md，文件记忆（multi-project）/检索记忆（external-query）为 no-op
+  ├─ *外部记忆*消息同步: sync_all 将完整回合交给已启用 provider；具体写入或 no-op 由 provider 决定
   └─ 任务状态 TaskState: save_task_state(status=run_status)
 ```
 
-关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用 external_memory / multi_external_memory 工具（execute_tools），以及 finalize 阶段 sync_all（builtin 写 observations.md，multi-project 为 no-op，external-query 写 外部库）。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
+关键边界：会话记忆由 `MemoryStore` 屏蔽 SQLite；外部记忆由 `ExternalMemoryManager` 路由到 provider。写入路径有两条：LLM 主动调用记忆工具，以及 finalize 阶段委托各 provider 执行 `sync_turn`。LLM 回声中的 `<memory-context>` 在 call_llm 内立即剥离，避免写回 ConversationMessage。
 </details>
 
-历史消息增量三段式压缩，head 保护首 N 条 + middle LLM 摘要 + tail 末 N 条，本次摘要 = llm_summary(上次摘要 + 新增消息)。
 
 
-## Action
+## Tool
 
-Action 子域把 LLM tool_calls 转换为受控工具执行。所有工具共享公共链路，在 ToolExecutor执行器 层按工具来源分化。
-
-#### 工具执行
-工具执行的公共链路，如下，
+Tool 子域定义 Agent 可发现、可调用的能力契约，并把 LLM tool_calls 转换为受控执行。它不实现 Knowledge、MCP、Plugin、Skill、Sandbox 等具体能力。
 
 ```text
-LLM tool_calls
-  -> AgentGraphRunner.execute_tools
-  -> ToolCallRequest(id, name, arguments)
-  -> ToolService.execute
-       ├─ lookup ToolDefinition
-       ├─ Policy 判定（enabled / risk_level / managed / permitted_managed_tools）
-       └─ CompositeToolExecutor.execute
-            └─ routes[name] -> ToolExecutor， 不同Tool在执行器上分化
-  -> ToolResult(tool_call_id, tool_name, status, content)
-  -> AgentGraphRunner写 role=tool 消息，回流给LLM
-  -> LLM 接收 tool result，继续推理
+Tool
+├─ Application：ToolService 管理工具定义、模型暴露、执行编排
+├─ Domain
+│   ├── ToolDefinition：工具定义，主要是能力描述，不包含 handler
+│   ├── ToolCallRequest：调用请求，包含 id、name、arguments
+│   ├── ToolPolicy：执行管控，治理工具的校验、暴露、执行、审批要求
+│   ├── ToolExecutionContext：执行上下文，携带授权和可信运行信息，仅限单轮对话
+│   ├── ToolExecutor：执行接口，定义SPI，具体实现属于各支撑子域或 Infrastructure
+│   └── ToolResult：执行结果，包含状态、内容和耗时
+└─ Infrastructure：CompositeToolExecutor 按工具名路由到具体 ToolExecutor
 ```
 
-- ToolDefinition 统一工具描述，包括 name/description/parameters/risk_level/source_type
-- ToolResult 统一工具调用结果
-- CompositeToolExecutor.routes将不同类型tool、路由到不同的执行器ToolExecutor
-
-<details>
-<summary>工具执行器分化</summary>
-
-工具执行器ToolExecutor按工具来源分化，主要实现包括Builtin/Knowledge/Mcp/Plugin/Skill等。核心执行器如下：
+一个工具可用需同时具备定义和执行路由：前者决定模型能否看到，后者决定调用能否落到具体实现。ToolService 是不可绕过的执行边界，执行前会按当前定义复判。
 
 ```text
-Knowledge
-  KnowledgeToolExecutor -> KnowledgeService.search(kb_id, query)
-    ├─ registry.get(kb_id) + get_secret(kb_id)
-    ├─ retriever_factory.create(config, secret)
-    └─ retriever.search -> normalize -> KnowledgeSearchResult
-
-MCP
-  McpToolExecutor（兼 CompositeToolExecutor.fallback）
-    -> McpService.call_tool(site_id, remote_name, args)
-    -> McpClient(SDK) -> 远端 MCP server（streamable_http / SSE / stdio）
-
-Plugin
-  PluginToolExecutor -> PluginService.call_tool(name, args, context, tool_call_id)
-    ├─ lookup PluginToolRegistration + check_fn / requires_env
-    ├─ 注入 plugin_config / trusted_metadata / session_id / metadata 为 kwargs
-    └─ handler(args, **kwargs) -> dict 包装
-
-Skill
-  SkillToolExecutor -> SkillService.list_skills / render_view(name)
-    └─ 读 SKILL.md frontmatter+body
-```
-</details>
-
-#### 工具注入
-
-```text
-ToolService.definitions         <- 静态内置工具（BUILTIN）
-ToolService.dynamic_definitions <- 动态工具面，按 source_type 分槽
-  ├─ "skill"     <- SkillService（skills_list / skill_view）
-  ├─ "external_memory" <- ExternalMemoryManager（provider 工具）
-  ├─ "mcp"       <- McpService（site probe 后注入远端工具）
-  ├─ "plugin"    <- PluginService（扫描启用插件后注入 plugin 工具）
-  └─ "sandbox"   <- Sandbox（execute_code / terminal）
+ContextService 通过 ToolService 生成可见 tool definitions
+  -> LLM 返回 tool_calls
+  -> TurnLoop 构造 ToolCallRequest
+  -> TurnLoop 拿到执行授权(如需)，过程是：ToolService 查找 ToolDefinition，调用 ToolPolicy、生成 PolicyDecision，TurnLoop根据 PolicyDecision 发起审批、获得执行授权
+  -> ToolService 执行前复判 ToolPolicy
+  -> ToolExecutor 执行具体能力
+  -> ToolResult 作为 role=tool 消息回流 LLM
 ```
 
 
@@ -464,7 +378,7 @@ Interfaces -> Application -> Domain
 Infrastructure -> Domain
 ```
 
-- Domain：定义 Agent、Session、Message、Tool、Policy、Provider、Memory、Platform/Gateway 等领域模型、值对象和端口协议。
+- Domain：定义 Agent、Session、Message、Tool、Provider、Memory、Platform/Gateway 等领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
 - Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
 - Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
@@ -477,7 +391,7 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
   -> ChatCompletionService 创建/读取会话并写入用户消息
   -> AgentGraphRunner 准备上下文（prepare_context）
   -> LLMProvider 调用模型
-  -> ToolService 校验 Policy 并执行模型请求的工具
+  -> ToolService 校验 ToolPolicy；AgentGraphRunner 按决策编排审批；ToolService 复判后执行
   -> MemoryStore 写入助手消息、工具调用、任务状态和摘要
   -> 返回 ChatCompletion 或 SSE 事件
 ```
@@ -493,8 +407,11 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | 实体 | TaskState | 当前任务运行状态 |
 | 实体 | Summary | 会话摘要 |
 | 实体 | ProviderConfig | Provider 注册表脱敏配置（id、name、provider_type、base_url、model、api_key_present、is_active、extra_headers、created_at、updated_at），不含 api_key 明文 |
-| 值对象 | RiskLevel | 工具或动作的风险等级 |
-| 值对象 | PermissionDecision | 工具或动作是否允许执行的判定结果 |
+| 值对象 | RiskLevel | ToolDefinition 的工具风险等级属性 |
+| 共享协议 | Policy | 各领域策略统一的 evaluate 协议 |
+| 值对象 | PolicyOutcome / PolicyDecision | 允许、拒绝、需审批及其原因 |
+| 领域策略 | ToolPolicy | 工具定义校验、暴露、执行和一次授权规则 |
+| 应用模型 | ToolExecutionEvaluation | 执行决策、审批快照及评估绑定 |
 | 端口 | LLMProvider | 屏蔽具体模型服务 |
 | 端口 | ProviderRegistry | Provider 配置注册表（CRUD + active 切换 + 明文 api_key 单独读取） |
 | 端口 | MemoryStore | 屏蔽 SQLite 等存储实现 |
@@ -546,13 +463,15 @@ SQLite Memory 默认使用 `sessions.db`。业务上以 session 为中心保存�
 
 外部记忆已由 `ExternalMemoryManager` 管理三槽：builtin、multi-project、external-query。新会话默认不启用任何外部记忆；builtin、文件记忆和检索记忆都需显式勾选。
 
-## Action 业务关系
+## Tool 业务关系
 
 ```text
 LLM tool_calls
   -> ToolCallRequest
-  -> Policy 判定
-  -> ToolService
+  -> ToolService.evaluate_execution
+  -> ToolPolicy 返回 PolicyDecision
+  -> AgentGraphRunner 按决策编排审批
+  -> ToolService 授权并复判
   -> ToolExecutor
   -> ToolResult
   -> ToolCall 持久化
@@ -566,28 +485,20 @@ LLM tool_calls
 - MCP 工具：站点 probe 后动态注入远端工具，走 McpToolExecutor（兼 CompositeToolExecutor.fallback）。
 - Plugin 工具：扫描启用插件后动态注入，走 PluginToolExecutor，配置与 secret 独立存储。
 
-四类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Action` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
+四类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Tool` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
 
-## Policy 业务关系
+## Policy Shared Kernel 与 ToolPolicy
 
-Policy 负责决定动作是否允许执行，避免把权限、安全和风险规则散落在 Tool handler 或 HTTP 接口里。
+公共 Policy 不是独立全局核心子域，也没有中央 PolicyService。`app/domain/policy.py` 只提供 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`，让各领域策略共享决策语言。
 
-当前 Policy 主要覆盖：
-
-- 工具是否启用。
-- 工具风险等级：safe、confirm、dangerous。
-- 工具执行权限判定：允许、拒绝、拒绝原因。
-- 文件、网络等外部资源访问的安全约束。
-- confirm 工具的运行时审批：通过 `ApprovalDecider` 端口（`app/domain/tool.py`）把授权决策外包给调用方。ACP stdio 服务端通过 `ACPPermissionBridge` 实现该端口，把 N-Agent 的 confirm 工具授权请求转换为 ACP `PermissionOption`（allow_once/allow_always/reject_once/reject_always）让用户在编辑器侧决策；allow_always/reject_always 持久化到 `sessions.acp_metadata_json`，后续轮次自动复用。
-
-当前以服务端 safe 工具为主；后续审批流、多 Agent、自动化任务和更完整的沙盒能力，都应优先扩展 Policy，而不是把规则写进具体工具实现。
+当前真实实现是 Tool Domain 的 `ToolPolicy`：它根据 `ToolDefinition`、`ToolCallRequest`、`ToolExecutionContext` 决定暴露、允许、拒绝或要求审批。`ToolService` 强制执行这些决策；`AgentGraphRunner` 只通过 `ApprovalDecider` 编排交互审批，批准后仍回到 `ToolService` 授权并执行。
 
 ## 外部边界
 
 - Provider：只能通过 `LLMProvider` 端口访问，Runtime 不直接依赖具体 SDK。
 - Storage：只能通过 `MemoryStore` 和 `Summarizer` 端口访问，SQLite 属于 Infrastructure。
 - Tool：Application 层处理工具定义和执行编排，具体 handler 属于 Infrastructure。
-- Policy：工具启用状态、风险等级、权限判定和资源访问约束属于业务规则，不下沉到具体 handler。
+- Policy Shared Kernel：只统一策略协议与决策类型；工具启用、风险、授权和审批要求归 `ToolPolicy`，文件/网络等能力自身的安全约束仍由对应领域或 adapter 负责。
 - Platform：平台描述、lifecycle 和 Gateway 会话统计通过 PlatformRegistry/GatewaySessionRegistry 端口进入 Application；飞书 SDK、长连接、HTTP 发送属于 Infrastructure/Interfaces 细节。
 - FileSystem：文件工具必须围绕 workspace 根目录做路径安全约束。
 - Network：主要用于模型调用、KB 后端检索、FastAPI HTTP/SSE 服务。
@@ -598,7 +509,7 @@ Policy 负责决定动作是否允许执行，避免把权限、安全和风险�
 - 用例编排、Prompt、LangGraph Runtime 放 Application。
 - FastAPI、Dashboard、OpenAI-compatible 协议适配放 Interfaces。
 - SQLite、HTTP Client、具体工具 handler、Provider Adapter 放 Infrastructure。
-- 权限、风险等级和执行约束优先归 Policy。
+- 跨领域只复用 Policy 决策语言；具体规则归对应领域的 `XPolicy`，当前仅登记真实存在的 `ToolPolicy`。
 - 新增外部能力时先定义端口，再实现 Infrastructure Adapter。
 
 ## 概念

@@ -93,7 +93,7 @@ class FeishuClient:
         )
         response.raise_for_status()
 
-    async def send_interactive_card(self, receive_id: str, card: dict[str, Any], receive_id_type: str = "chat_id") -> None:
+    async def send_interactive_card(self, receive_id: str, card: dict[str, Any], receive_id_type: str = "chat_id") -> str:
         tenant_access_token = await self.get_tenant_access_token()
         response = await self.http_client.post(
             "/open-apis/im/v1/messages",
@@ -106,6 +106,8 @@ class FeishuClient:
             },
         )
         response.raise_for_status()
+        payload = response.json()
+        return str((payload.get("data") or {}).get("message_id") or "")
 
     async def update_card(self, message_id: str, card: dict[str, Any]) -> None:
         tenant_access_token = await self.get_tenant_access_token()

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from weakref import WeakKeyDictionary
+
+from app.domain.policy import PolicyDecision, PolicyOutcome
 from app.domain.tool import (
     RiskLevel,
     ToolCallRequest,
@@ -10,30 +14,80 @@ from app.domain.tool import (
     ToolResultStatus,
     ToolSourceType,
 )
+from app.domain.tool_policy import ToolExposurePolicy, ToolPolicy
+
+
+class ToolNotFoundError(ValueError):
+    """Raised when an execution policy request names an unknown tool."""
+
+
+class ToolDefinitionChangedError(ValueError):
+    """Raised when an evaluated tool no longer resolves to the same definition."""
+
+
+class _EvaluationToken:
+    pass
+
+
+@dataclass(frozen=True)
+class _EvaluatedExecution:
+    definition: ToolDefinition
+    request: ToolCallRequest
+
+
+@dataclass(frozen=True)
+class ToolApprovalSnapshot:
+    name: str
+    description: str
+    risk_level: RiskLevel
+
+
+@dataclass(frozen=True)
+class ToolExecutionEvaluation:
+    decision: PolicyDecision
+    approval: ToolApprovalSnapshot
+    _token: _EvaluationToken = field(repr=False, compare=False)
 
 
 class ToolService:
-    def __init__(self, executor: ToolExecutor, definitions: list[ToolDefinition]):
+    def __init__(
+        self,
+        executor: ToolExecutor,
+        definitions: list[ToolDefinition],
+        policy: ToolPolicy | None = None,
+    ):
+        self.policy = policy if policy is not None else ToolPolicy()
         for definition in definitions:
-            if definition.managed and definition.risk_level is not RiskLevel.CONFIRM:
-                raise ValueError(
-                    f"managed tool {definition.name!r} must declare risk_level=CONFIRM"
-                )
+            self.policy.validate_definition(definition)
         self.executor = executor
         self.definitions = {definition.name: definition for definition in definitions}
         self.dynamic_definitions: dict[str, dict[str, ToolDefinition]] = {}
+        self._evaluated_executions: WeakKeyDictionary[
+            _EvaluationToken,
+            _EvaluatedExecution,
+        ] = WeakKeyDictionary()
 
     def set_dynamic_definitions(self, source_key: str, definitions: list[ToolDefinition]) -> None:
-        static_names = set(self.definitions)
-        dynamic: dict[str, ToolDefinition] = {}
+        schema_valid: list[ToolDefinition] = []
         for definition in definitions:
-            if definition.name in static_names:
-                continue
-            if definition.name in dynamic:
-                continue
             if not isinstance(definition.input_schema, dict) or definition.input_schema.get("type") != "object":
                 continue
-            dynamic[definition.name] = definition
+            schema_valid.append(definition)
+
+        deduplicated: dict[str, ToolDefinition] = {}
+        for definition in schema_valid:
+            if definition.name not in deduplicated:
+                deduplicated[definition.name] = definition
+
+        for definition in deduplicated.values():
+            self.policy.validate_definition(definition)
+
+        static_names = set(self.definitions)
+        dynamic = {
+            name: definition
+            for name, definition in deduplicated.items()
+            if name not in static_names
+        }
         self.dynamic_definitions[source_key] = dynamic
 
     def list_definitions(self) -> list[ToolDefinition]:
@@ -55,9 +109,18 @@ class ToolService:
 
     def list_openai_tools(
         self,
-        risk_level: RiskLevel | None = None,
+        risk_level: RiskLevel | ToolExposurePolicy | None = None,
         context: ToolExecutionContext | None = None,
     ) -> list[dict]:
+        if risk_level is None:
+            exposure_policy = ToolExposurePolicy.DEFAULT
+        elif risk_level is RiskLevel.SAFE:
+            exposure_policy = ToolExposurePolicy.SAFE_ONLY
+        elif isinstance(risk_level, ToolExposurePolicy):
+            exposure_policy = risk_level
+        else:
+            exposure_policy = None
+
         return [
             {
                 "type": "function",
@@ -68,44 +131,120 @@ class ToolService:
                 },
             }
             for definition in self.list_definitions()
-            if definition.enabled
-            and (definition.risk_level is risk_level if risk_level else definition.risk_level is not RiskLevel.DANGEROUS)
-            and not (
-                risk_level is RiskLevel.SAFE
-                and definition.source_type is ToolSourceType.AGENT
+            if (
+                self.policy.can_expose(definition, exposure_policy)
+                if exposure_policy is not None
+                else definition.enabled and definition.risk_level is risk_level
             )
             and isinstance(definition.input_schema, dict)
             and definition.input_schema.get("type") == "object"
         ]
 
-    async def execute(self, request: ToolCallRequest, context: ToolExecutionContext | None = None) -> ToolResult:
+    def evaluate_execution(
+        self,
+        request: ToolCallRequest,
+        context: ToolExecutionContext | None = None,
+    ) -> ToolExecutionEvaluation:
         definition = self._definition(request.name)
         if definition is None:
-            return ToolResult(request.id, request.name, ToolResultStatus.ERROR, {"error": "tool not found"})
-        if definition.risk_level is RiskLevel.CONFIRM:
-            if definition.managed:
-                if context is None or request.name not in context.permitted_managed_tools:
-                    return ToolResult(request.id, request.name, ToolResultStatus.PERMISSION_DENIED, {"error": "permission_denied"})
-            elif not _is_confirm_allowed(request, context):
-                return ToolResult(request.id, request.name, ToolResultStatus.PERMISSION_DENIED, {"error": "permission_denied"})
-        if definition.risk_level is RiskLevel.DANGEROUS or not definition.enabled:
-            return ToolResult(request.id, request.name, ToolResultStatus.PERMISSION_DENIED, {"error": "permission_denied"})
+            raise ToolNotFoundError(f"tool not found: {request.name}")
+        decision = self.policy.evaluate_execution(definition, request, context)
+        token = _EvaluationToken()
+        evaluation = ToolExecutionEvaluation(
+            decision=decision,
+            approval=ToolApprovalSnapshot(
+                name=definition.name,
+                description=definition.description,
+                risk_level=definition.risk_level,
+            ),
+            _token=token,
+        )
+        self._evaluated_executions[token] = _EvaluatedExecution(
+            definition=definition,
+            request=request,
+        )
+        return evaluation
+
+    def authorize_once(
+        self,
+        request: ToolCallRequest,
+        context: ToolExecutionContext | None = None,
+        *,
+        evaluation: ToolExecutionEvaluation | None = None,
+    ) -> ToolExecutionContext:
+        definition = (
+            self._definition_for_evaluation(request, evaluation)
+            if evaluation is not None
+            else self._required_definition(request.name)
+        )
+        return self.policy.authorize_once(definition, request, context)
+
+    async def execute(
+        self,
+        request: ToolCallRequest,
+        context: ToolExecutionContext | None = None,
+        *,
+        evaluation: ToolExecutionEvaluation | None = None,
+    ) -> ToolResult:
+        if evaluation is not None:
+            try:
+                definition = self._definition_for_evaluation(request, evaluation)
+            except ToolDefinitionChangedError:
+                return ToolResult(
+                    request.id,
+                    request.name,
+                    ToolResultStatus.PERMISSION_DENIED,
+                    {
+                        "error": "permission_denied",
+                        "reason": "tool_definition_changed",
+                    },
+                )
+        else:
+            definition = self._definition(request.name)
+            if definition is None:
+                return ToolResult(
+                    request.id,
+                    request.name,
+                    ToolResultStatus.ERROR,
+                    {"error": "tool not found"},
+                )
+        decision = self.policy.evaluate_execution(definition, request, context)
+        if decision.outcome is not PolicyOutcome.ALLOW:
+            return ToolResult(
+                request.id,
+                request.name,
+                ToolResultStatus.PERMISSION_DENIED,
+                {"error": "permission_denied", "reason": decision.reason},
+            )
         try:
             return await self.executor.execute(request, context)
         except TypeError:
             return await self.executor.execute(request)
 
+    def _required_definition(self, name: str) -> ToolDefinition:
+        definition = self._definition(name)
+        if definition is None:
+            raise ToolNotFoundError(f"tool not found: {name}")
+        return definition
 
-def _is_confirm_allowed(request: ToolCallRequest, context: ToolExecutionContext | None) -> bool:
-    if context is None:
-        return False
-    expected = context.allowed_confirm_tools.get(request.name)
-    if expected is None:
-        return False
-    for key, value in expected.items():
-        if request.arguments.get(key) != value:
-            return False
-    return True
+    def _definition_for_evaluation(
+        self,
+        request: ToolCallRequest,
+        evaluation: ToolExecutionEvaluation,
+    ) -> ToolDefinition:
+        evaluated = (
+            self._evaluated_executions.get(evaluation._token)
+            if isinstance(evaluation, ToolExecutionEvaluation)
+            else None
+        )
+        if (
+            evaluated is None
+            or evaluated.request is not request
+            or evaluation.approval.name != request.name
+            or self._definition(request.name) is not evaluated.definition
+        ):
+            raise ToolDefinitionChangedError("tool definition changed after evaluation")
+        return evaluated.definition
 
 
 def knowledge_tool_definitions(enabled: bool = True) -> list[ToolDefinition]:

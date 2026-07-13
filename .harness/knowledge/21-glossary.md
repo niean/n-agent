@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 ChatEvent/ChatEventType、Gateway 流式接口、CliChatAdapter、patch_stdout 等 CLI 交互相关术语，ACP (Agent Client Protocol) stdio 服务端、路径映射、ApprovalDecider 等 ACP 相关术语，ContextEngine/ContextCompressor/ContextCompressionResult/prepare_context/三段式压缩/增量压缩/CONTEXT_SUMMARY_PREFIX/is_summary 双标记/Cooldown 等上下文短期记忆压缩相关术语，CanonicalUsage/UsageCost/PricingEntry/ContextBreakdown/UsageRecorder/PricingProvider/ContextBreakdownCalculator/usage_records/compression_stats 等观测与 Token 统计相关术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、飞书与 CLI ToolPolicy 审批、Context 短期记忆及 Usage 观测术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -41,15 +41,23 @@
 - Incremental compression（增量压缩）：ContextCompressor 对齐 HermesAgent 的压缩方法；`_find_latest_context_summary` 从后往前扫描 messages 定位最后一个 content 以 `CONTEXT_SUMMARY_PREFIX` 开头的 user 消息，middle 只取该摘要之后的新增消息，`_generate_summary` 分首次路径（空 existing_summary + FIRST 模板）和迭代路径（previous_summary=body + ITERATIVE 模板）两条 prompt 路径。
 - is_summary（双标记摘要持久化）：`ConversationMessage.is_summary`（Domain 为 bool）和 `messages.is_summary`（SQLite 为 INTEGER）字段；prepare_context 的压缩阶段通过 `replace_summary_message` 在单连接事务内 DELETE 旧 is_summary=1 消息 + INSERT 新摘要消息，保证同一 session 最多 1 条 is_summary=1 消息；`_message_to_provider` 不传递 is_summary 到 provider 格式，Dashboard API 和 chat.js 用 is_summary 做特殊渲染。
 - Cooldown（压缩冷却）：ContextCompressor 内存中的 monotonic 时间戳（`_last_compressed_at`），防止在 `cooldown_seconds` 窗口内重复压缩同一会话上下文造成抖动；`should_compress` 检测 cooldown 未到期时返回 False（force=True 可绕过）。
-- Tool Registry：服务端工具注册表，管理可执行工具的定义、schema、风险等级、权限要求、启用状态和执行绑定。
+- Policy（Shared Kernel）：`app/domain/policy.py` 的通用策略协议，不是独立全局核心子域或中央服务；只统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`，具体业务规则归各领域 `XPolicy`。
+- PolicyOutcome / PolicyDecision：公共策略结果枚举与值对象；结果为 allow、deny、require_approval，decision 同时携带非空 reason。
+- Tool Registry：服务端工具注册表，管理工具定义；工具真正可用还要求存在对应 `ToolExecutor` 执行路由。
 - ToolDefinition：工具定义值对象，描述工具名称、说明、输入 schema、风险等级、权限、超时和启用状态，不包含具体 handler。
+- ToolExposurePolicy：Tool Domain 的模型暴露场景，当前为 default、safe_only。
+- ToolPolicyRequest / ToolPolicy：工具策略请求与 Tool Domain 具体策略；负责定义校验、模型暴露、执行允许/拒绝/需审批和一次授权。
+- ToolExecutionEvaluation：Application 层执行评估结果，包含 `PolicyDecision` 和审批快照，并以内部 token 绑定原请求与原定义，供 `ToolService` 防止审批期间定义替换。
 - ToolDefinition.managed：布尔字段，标记需要服务端 ChatCompletionService 显式授权才能执行的工具；当前 `manage_schedule` 是唯一 managed 工具，必须 `risk_level=CONFIRM` 且来源为 AGENT。
 - ToolExecutionContext.trusted_metadata：服务端注入的 metadata 字典，仅 GatewayService/Feishu 长连接适配器在 ChatCompletionInput 中写入；OpenAI HTTP 客户端 metadata 不进入此字段，作为 managed-tool 授权的事实来源。
 - permitted_managed_tools：ToolExecutionContext 字段，记录当前请求允许执行的 managed 工具集合；非 realtime 模式或非可信 Gateway 来源时为空集，managed 工具被 fail-closed 拒绝。
 - manage_schedule / schedule_query：Agent 定时任务管理 / 查询工具，source_type=AGENT、toolset=schedule；前者 managed=True 仅飞书 trusted_metadata 触发，后者 SAFE 但在 unattended（safe_only）模式仍被过滤避免调度器递归。
-- ToolExecutor：领域端口，定义工具调用执行接口，具体工具 handler 由 Infrastructure 实现。
+- ToolExecutor：领域执行 SPI，具体实现属于各支撑子域或 Infrastructure；ToolDefinition 与执行路由必须同时存在。
 - ToolResultStatus：工具执行结果状态枚举，描述成功、错误、权限拒绝和超时等标准状态。
-- PermissionDecision：权限判定值对象，描述工具或动作是否允许执行以及拒绝原因。
+- ToolService：Application 层工具强制执行边界，统一注册定义、按 ToolPolicy 暴露和评估、生成一次授权并在调用 `ToolExecutor` 前复判；调用方不得绕过。
+- GatewayToolApprovalService：Application 层进程内 ToolPolicy 会话授权服务，按 session_id、actor_id、tool_name 隔离“本会话信任”；不替代 ToolService 的一次授权与执行前复判。
+- FeishuToolApprovalBridge：Interfaces 层 ApprovalDecider 协议桥，把 ToolPolicy 审批转换为飞书 interactive card 和 Future；只持有带 TTL、actor/chat/card message id 绑定及原子 claim 的 pending，不拥有业务授权。
+- CliToolApprovalBridge：Interfaces 层 ApprovalDecider 协议桥（CLI/TUI），把 ToolPolicy 审批转换为进程内 Future + 精确命令路由（`/confirm once`/`/confirm trust`/`/cancel`）；持有带 900 秒 TTL、actor_id+GatewaySessionKey 双绑定及原子 claim 的 pending，不拥有业务授权；仅在 TTY REPL 构造，非 TTY/单次消息/stdin pipe 不注入 decider。
 - Toolset：工具集合或能力分组，用于后续按场景启用、禁用、检查依赖和控制权限。
 - ExternalMemoryProvider：外部记忆提供者领域端口（SPI），定义 prefetch/sync_turn/system_prompt_block/handle_tool_call + 生命周期钩子（on_session_switch/on_session_end/on_pre_compress/on_delegation/shutdown）；三类实现：系统记忆（builtin，Markdown 文件存储）、文件记忆（multi-project，多项目 Markdown CRUD）、检索记忆（external-query，mem0/holographic/honcho 等 query-only provider）。
 - Memory Slot：ExternalMemoryManager 的三槽模型。系统记忆槽（builtin，全局内置）、文件记忆槽（multi-project，多项目 Markdown CRUD）、检索记忆槽（external-query，至多一个 query-only provider）。三槽共存，activate mem0 不会替换文件记忆。`add_provider` 按 provider name 分类槽位，`swap_external_query_provider` 仅替换检索记忆槽。
@@ -73,8 +81,8 @@
 - ACP stdio 服务端：N-Agent 内置的 ACP 服务端入口，由 `n-agent acp` 命令启动（无 flag 进入 JSON-RPC 主循环，`--check` 验证依赖可导入，`--setup` 输出 provider 配置提示）。VsCode ACP Client 通过 `docker exec -i n-agent-n-agent-1 n-agent acp` 或 `kubectl exec -i <pod> -- n-agent acp` 接入容器内 Agent。
 - NAgentACPAgent：`app/interfaces/cli/commands/acp/agent.py` 中实现 `acp.Agent` 的类，提供 13 个 SDK 方法（initialize/authenticate/session/new/prompt/load/list/fork/cancel/close_session 等）；ACP 协议生命周期留在此 adapter，`session/prompt` 用户消息转换为 InteractionMessage 后经 GatewayService → ChatCompletionService。
 - 路径映射 (path mapping)：ACP cwd 来自宿主/editor，N-Agent 文件工具运行在容器/Pod，必须通过 `N_AGENT_ACP_HOST_WORKSPACE_ROOT` + `N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT` 环境变量配置映射。映射规则：(1) cwd 在 host root 下时替换前缀为 container root；(2) cwd 已在 container root 下时原样使用；(3) cwd 为空时使用 container root；(4) cwd 不可映射时 `session/new` 拒绝并返回协议错误，不回退到 `Path.cwd()`。
-- ApprovalDecider：Domain 端口（`app/domain/tool.py`），定义工具调用审批决策接口；ACP 服务端通过 `ACPPermissionBridge` 实现，将 N-Agent 的 confirm 工具授权请求转换为 ACP `PermissionOption`（allow_once/allow_always/reject_once/reject_always）让用户在编辑器侧决策。
-- ApprovalRequest / ApprovalDecision：ApprovalDecider 的输入/输出值对象。ApprovalRequest 携带 session_id、tool_name、tool_call_id、arguments 等上下文；ApprovalDecision 携带 allowed 与 scope（once/always/deny）。
+- ApprovalDecider：Domain 可调用端口（`app/domain/tool.py`），输入 `ApprovalRequest`、返回同步或异步 `ApprovalDecision`；ACP 桥接选项 ID 为 allow_once、allow_session、reject_once。
+- ApprovalRequest / ApprovalDecision：审批输入/输出值对象。ApprovalRequest 携带 session_id、tool_name、tool_call_id、arguments 等上下文；ApprovalDecision 携带 allowed 与 scope（once/session/deny）。
 - ACP session metadata：`sessions.acp_metadata_json` 列存储的 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入；ACP 服务端在 `session/new` 时写入，`session/load` 时读取复用，用于在 ACP 客户端重连后恢复会话上下文与 cwd 映射。
 - _BenignMethodNotFoundFilter：`app/interfaces/cli/commands/acp/command.py` 中的 logging.Filter，抑制 ACP SDK 通过 `logging.exception` 记录的 benign method-not-found 错误（code=-32601 且 method 为 `_ping`/`_health`/`ping`/`health`），避免 stderr 被客户端探测噪声污染；非 benign 方法（如 `session/prompt`）的异常仍透传。
 - supports_vision：`ProviderConfig` 的字段，表示 provider 是否支持图片输入。openai-compatible 类型默认 True，anthropic 类型默认 False。Dashboard provider 表单可在线编辑；`AgentGraphRunner.call_llm` 在 vision preflight 中检查此字段，不支持 vision 时遇到 image content 直接返回友好 assistant 消息而非调用 provider（避免 HTTP 500）。

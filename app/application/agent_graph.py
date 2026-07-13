@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import logging
 import time
@@ -16,15 +15,20 @@ from langgraph.graph import END, StateGraph
 from app.application.context_service import ContextService
 from app.application.events import ChatEvent, ChatEventType
 from app.application.external_memory_manager import ExternalMemoryManager
-from app.application.tool_service import ToolService
+from app.application.tool_service import (
+    ToolExecutionEvaluation,
+    ToolNotFoundError,
+    ToolService,
+)
 from app.domain.agent import AgentState, RunStatus
 from app.domain.context import ContextEngine
 from app.domain.memory import MemoryStore, Summarizer
+from app.domain.policy import PolicyOutcome
 from app.domain.provider import LLMEventType, LLMProvider, LLMResult, resolve_model
 from app.domain.session import ConversationMessage, TaskState, ToolCall
 from app.domain.tool import (
+    ApprovalDecision,
     ApprovalRequest,
-    RiskLevel,
     ToolCallRequest,
     ToolExecutionContext,
     ToolResult,
@@ -398,11 +402,16 @@ class AgentGraphRunner:
             context = raw_context
         for tool_call in state.pending_tool_calls:
             function = tool_call.get("function", {})
-            arguments = function.get("arguments") or "{}"
+            arguments = function.get("arguments", {})
+            invalid_arguments = False
             try:
                 parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
             except json.JSONDecodeError:
                 parsed_arguments = {}
+                invalid_arguments = True
+            if not isinstance(parsed_arguments, dict):
+                parsed_arguments = {}
+                invalid_arguments = True
             tool_id = tool_call.get("id", "")
             tool_name = function.get("name", "")
 
@@ -418,73 +427,48 @@ class AgentGraphRunner:
             ))
             await self._emit_stream_tool_event(state.stream_tool_events[-1], options)
 
-            request = ToolCallRequest(
-                id=tool_id,
-                name=tool_name,
-                arguments=parsed_arguments,
-            )
-
-            # Approval gate: ask the decider BEFORE calling ToolService.execute.
-            # Only CONFIRM-level tools with a configured decider trigger this path.
-            # allow_once: create a per-iteration copy via dataclasses.replace so
-            # ToolService.execute permits this single call. The original context
-            # stays unchanged for the next tool_call (S 6). allow_session: the
-            # ACP agent is responsible for persisting the permission into context
-            # before constructing this runner; the runner does NOT write metadata
-            # here (S 7).
-            result: ToolResult | None = None
-            effective_context = context
-            definition = self.tool_service.get_definition(tool_name)
-            if (
-                definition is not None
-                and definition.risk_level is RiskLevel.CONFIRM
-                and effective_context is not None
-                and effective_context.approval_decider is not None
-            ):
-                approval_request = ApprovalRequest(
-                    session_id=effective_context.session_id or state.session_id,
+            if invalid_arguments:
+                result = ToolResult(
                     tool_call_id=tool_id,
                     tool_name=tool_name,
-                    arguments=parsed_arguments,
-                    description=definition.description,
-                    risk_level=definition.risk_level,
+                    status=ToolResultStatus.ERROR,
+                    content={"error": "invalid arguments"},
                 )
-                raw_decision = effective_context.approval_decider(approval_request)
-                if isawaitable(raw_decision):
-                    raw_decision = await raw_decision
-                decision = raw_decision
-
-                if not decision.allowed:
+            else:
+                request = ToolCallRequest(
+                    id=tool_id,
+                    name=tool_name,
+                    arguments=parsed_arguments,
+                )
+                try:
+                    evaluation = self.tool_service.evaluate_execution(request, context)
+                except ToolNotFoundError:
                     result = ToolResult(
                         tool_call_id=tool_id,
                         tool_name=tool_name,
-                        status=ToolResultStatus.PERMISSION_DENIED,
-                        content={"error": "permission_denied", "reason": decision.reason},
+                        status=ToolResultStatus.ERROR,
+                        content={"error": "tool not found"},
                     )
-                elif decision.scope == "once":
-                    if definition.managed:
-                        new_permitted = set(effective_context.permitted_managed_tools)
-                        new_permitted.add(tool_name)
-                        effective_context = dataclasses.replace(
-                            effective_context,
-                            permitted_managed_tools=new_permitted,
+                else:
+                    decision = evaluation.decision
+                    if decision.outcome is PolicyOutcome.ALLOW:
+                        result = await self.tool_service.execute(
+                            request,
+                            context,
+                            evaluation=evaluation,
+                        )
+                    elif decision.outcome is PolicyOutcome.DENY:
+                        result = self._permission_denied_result(
+                            request,
+                            decision.reason,
                         )
                     else:
-                        # For non-managed CONFIRM tools, _is_confirm_allowed
-                        # iterates expected.items() and checks
-                        # request.arguments[key] == value. An empty dict means
-                        # no keys to check -> allowed for any arguments.
-                        new_allowed = dict(effective_context.allowed_confirm_tools)
-                        new_allowed[tool_name] = {}
-                        effective_context = dataclasses.replace(
-                            effective_context,
-                            allowed_confirm_tools=new_allowed,
+                        result = await self._request_tool_approval(
+                            request,
+                            state.session_id,
+                            context,
+                            evaluation,
                         )
-                # scope == "session": context is already set up by the ACP
-                # permission bridge/agent; no-op here.
-
-            if result is None:
-                result = await self.tool_service.execute(request, effective_context)
 
             # 工具执行后 - success/error 事件
             tool_status = "success" if result.status == ToolResultStatus.SUCCESS else "error"
@@ -521,7 +505,7 @@ class AgentGraphRunner:
                     id=result.tool_call_id,
                     session_id=state.session_id,
                     tool_name=result.tool_name,
-                    arguments=request.arguments,
+                    arguments=parsed_arguments,
                     result=result_payload,
                     status=result.status.value,
                     duration_ms=result.duration_ms,
@@ -530,6 +514,72 @@ class AgentGraphRunner:
         state.pending_tool_calls = []
         state.final_message = None
         return state
+
+    @staticmethod
+    def _permission_denied_result(
+        request: ToolCallRequest,
+        reason: str,
+    ) -> ToolResult:
+        return ToolResult(
+            tool_call_id=request.id,
+            tool_name=request.name,
+            status=ToolResultStatus.PERMISSION_DENIED,
+            content={"error": "permission_denied", "reason": reason},
+        )
+
+    async def _request_tool_approval(
+        self,
+        request: ToolCallRequest,
+        state_session_id: str,
+        context: ToolExecutionContext | None,
+        evaluation: ToolExecutionEvaluation,
+    ) -> ToolResult:
+        decider = context.approval_decider if context is not None else None
+        if decider is None:
+            return self._permission_denied_result(request, "approval_required")
+
+        approval = evaluation.approval
+        approval_request = ApprovalRequest(
+            session_id=context.session_id or state_session_id,
+            tool_call_id=request.id,
+            tool_name=approval.name,
+            arguments=dict(request.arguments),
+            description=approval.description,
+            risk_level=approval.risk_level,
+        )
+        try:
+            raw_decision = decider(approval_request)
+            if isawaitable(raw_decision):
+                raw_decision = await raw_decision
+        except Exception:
+            return self._permission_denied_result(request, "approval_failed")
+
+        if not isinstance(raw_decision, ApprovalDecision):
+            return self._permission_denied_result(
+                request,
+                "invalid_approval_decision",
+            )
+        if not raw_decision.allowed:
+            return self._permission_denied_result(
+                request,
+                raw_decision.reason or "approval_denied",
+            )
+        if raw_decision.scope not in {"once", "session"}:
+            return self._permission_denied_result(request, "invalid_approval_scope")
+
+        try:
+            authorized_context = self.tool_service.authorize_once(
+                request,
+                context,
+                evaluation=evaluation,
+            )
+        except ValueError:
+            return self._permission_denied_result(request, "authorization_failed")
+        return await self.tool_service.execute(
+            request,
+            authorized_context,
+            evaluation=evaluation,
+        )
 
     async def _emit_stream_tool_event(self, event: ChatEvent, options: dict[str, Any] | None) -> None:
         sink = (options or {}).get("stream_event_sink")

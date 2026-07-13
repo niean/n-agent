@@ -8,7 +8,7 @@ from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.agent import AgentState
 from app.domain.provider import LLMResult, ModelInfo
 from app.domain.session import ConversationMessage, ConversationSession
-from app.domain.tool import ToolExecutionContext
+from app.domain.tool import RiskLevel, ToolDefinition, ToolExecutionContext
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.tools.builtin import build_builtin_tool_executor
@@ -204,6 +204,106 @@ async def test_complete_unattended_mode_has_no_managed_tools(tmp_path):
     assert ctx.execution_context_mode == "unattended"
     assert ctx.permitted_managed_tools == set()
     assert runner.options["tool_exposure_policy"] == "safe_only"
+
+
+@pytest.mark.asyncio
+async def test_complete_normalizes_acp_session_grants_against_live_definitions(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    runner.tool_service = ToolService(
+        build_builtin_tool_executor(tmp_path),
+        [
+            ToolDefinition("ordinary", "ordinary", {"type": "object"}, RiskLevel.CONFIRM),
+            ToolDefinition("managed", "managed", {"type": "object"}, RiskLevel.CONFIRM, managed=True),
+            ToolDefinition("safe", "safe", {"type": "object"}),
+            ToolDefinition("disabled", "disabled", {"type": "object"}, RiskLevel.CONFIRM, enabled=False),
+        ],
+    )
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(ChatCompletionInput(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        allowed_confirm_tools_override={
+            "ordinary": {"": "valid", "target": "prod"},
+            "managed": "session",
+            "safe": "session",
+            "disabled": "session",
+            "unknown": "session",
+            "": "session",
+        },
+    ))
+
+    ctx = runner.options["tool_execution_context"]
+    assert ctx.allowed_confirm_tools == {
+        "ordinary": {"": "valid", "target": "prod"}
+    }
+    assert ctx.permitted_managed_tools == {"managed"}
+
+
+@pytest.mark.asyncio
+async def test_complete_rejects_invalid_grants_and_unions_trusted_managed_grants(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    runner.tool_service = ToolService(
+        build_builtin_tool_executor(tmp_path),
+        [
+            ToolDefinition("ordinary", "ordinary", {"type": "object"}, RiskLevel.CONFIRM),
+            ToolDefinition("manage_schedule", "managed", {"type": "object"}, RiskLevel.CONFIRM, managed=True),
+            ToolDefinition("managed2", "managed2", {"type": "object"}, RiskLevel.CONFIRM, managed=True),
+        ],
+    )
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(ChatCompletionInput(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        trusted_metadata={"gateway.platform": "feishu"},
+        allowed_confirm_tools_override={
+            "ordinary": {1: "invalid"},
+            "manage_schedule": {"x": 1},
+            "managed2": "session",
+        },
+    ))
+
+    ctx = runner.options["tool_execution_context"]
+    assert ctx.allowed_confirm_tools == {}
+    assert ctx.permitted_managed_tools == {"manage_schedule", "managed2"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["session", ["bad"], None])
+async def test_complete_treats_malformed_confirm_grant_root_as_empty(
+    tmp_path,
+    malformed,
+):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    runner.tool_service = ToolService(
+        build_builtin_tool_executor(tmp_path),
+        [
+            ToolDefinition(
+                "ordinary",
+                "ordinary",
+                {"type": "object"},
+                RiskLevel.CONFIRM,
+            )
+        ],
+    )
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(ChatCompletionInput(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        allowed_confirm_tools_override=malformed,
+    ))
+
+    ctx = runner.options["tool_execution_context"]
+    assert ctx.allowed_confirm_tools == {}
+    assert ctx.permitted_managed_tools == set()
 
 
 @pytest.mark.asyncio

@@ -19,20 +19,34 @@ from typing import Any
 import pytest
 from acp.interfaces import Client
 from acp.schema import (
+    AllowedOutcome,
     AuthenticateResponse,
     ImageContentBlock,
     InitializeResponse,
     NewSessionResponse,
     PromptResponse,
+    RequestPermissionResponse,
     TextContentBlock,
 )
 
 from app.application.events import ChatEvent, ChatEventType
-from app.application.chat_service import ChatCompletionInput
+from app.application.agent_graph import AgentGraphRunner
+from app.application.chat_service import ChatCompletionInput, ChatCompletionService
 from app.application.session_service import SessionService
+from app.application.tool_service import ToolService
 from app.config import Settings
 from app.domain.gateway import GatewaySessionKey, GatewaySessionLink
 from app.domain.session import ConversationMessage, ConversationSession
+from app.domain.provider import LLMResult, ModelInfo
+from app.domain.tool import (
+    ApprovalRequest,
+    RiskLevel,
+    ToolCallRequest,
+    ToolDefinition,
+    ToolResult,
+    ToolResultStatus,
+)
+from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.interfaces.cli.commands.acp.agent import NAgentACPAgent
 
@@ -43,13 +57,17 @@ class FakeConn:
     def __init__(self) -> None:
         self.updates: list[tuple[str, Any]] = []
         self.permission_responses: dict[str, Any] = {}
+        self.permission_calls: list[dict[str, Any]] = []
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         self.updates.append((session_id, update))
 
     async def request_permission(self, **kwargs: Any) -> Any:
-        # Not used in these tests; ACPPermissionBridge is covered in T11.
-        raise RuntimeError("request_permission not expected in T12 tests")
+        self.permission_calls.append(kwargs)
+        response = self.permission_responses.get("next")
+        if response is None:
+            raise RuntimeError("request_permission not expected in T12 tests")
+        return response
 
 
 class FakeChatService:
@@ -632,6 +650,268 @@ async def test_prompt_propagates_allowed_confirm_tools_override(agent, services,
 
     chat_input = services.chat_service.inputs[0]
     assert chat_input.allowed_confirm_tools_override == {"manage_schedule": "session"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["session", ["bad"]])
+async def test_prompt_treats_malformed_confirm_grant_root_as_empty(
+    agent,
+    services,
+    conn,
+    settings,
+    malformed,
+):
+    sid = (await agent.new_session(
+        cwd=str(settings.acp_host_workspace_root / "project")
+    )).session_id
+    session = await services.memory_store.get_session(sid)
+    metadata = dict(session.acp_metadata or {})
+    metadata["allowed_confirm_tools"] = malformed
+    await services.memory_store.update_session_acp_metadata(sid, metadata)
+    agent.on_connect(conn)
+
+    await agent.prompt(prompt=[_text_block("go")], session_id=sid)
+
+    assert services.chat_service.inputs[0].allowed_confirm_tools_override == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["session", ["bad"]])
+async def test_allow_session_repairs_malformed_confirm_grant_root(
+    agent,
+    services,
+    conn,
+    settings,
+    malformed,
+):
+    sid = (await agent.new_session(
+        cwd=str(settings.acp_host_workspace_root / "project")
+    )).session_id
+    session = await services.memory_store.get_session(sid)
+    metadata = dict(session.acp_metadata or {})
+    metadata["allowed_confirm_tools"] = malformed
+    await services.memory_store.update_session_acp_metadata(sid, metadata)
+    conn.permission_responses["next"] = RequestPermissionResponse(
+        outcome=AllowedOutcome(option_id="allow_session", outcome="selected")
+    )
+    agent.on_connect(conn)
+
+    decision = await agent._permission_bridge.request(ApprovalRequest(
+        session_id=sid,
+        tool_call_id="call-1",
+        tool_name="manage_schedule",
+        arguments={"action": "list"},
+        description="Manage schedules",
+        risk_level=RiskLevel.CONFIRM,
+    ))
+
+    stored = await services.memory_store.get_session(sid)
+    assert decision.allowed is True
+    assert decision.scope == "session"
+    assert stored.acp_metadata["allowed_confirm_tools"] == {
+        "manage_schedule": "session"
+    }
+
+
+@pytest.mark.asyncio
+async def test_allow_session_persistence_is_loaded_by_the_next_prompt(agent, services, conn, settings):
+    host_root = settings.acp_host_workspace_root
+    sid = (await agent.new_session(cwd=str(host_root / "project"))).session_id
+    conn.permission_responses["next"] = RequestPermissionResponse(
+        outcome=AllowedOutcome(option_id="allow_session", outcome="selected")
+    )
+    agent.on_connect(conn)
+
+    decision = await agent._permission_bridge.request(ApprovalRequest(
+        session_id=sid,
+        tool_call_id="call-1",
+        tool_name="manage_schedule",
+        arguments={"action": "list"},
+        description="Manage schedules",
+        risk_level=RiskLevel.CONFIRM,
+    ))
+    await agent.prompt(prompt=[_text_block("go")], session_id=sid)
+
+    assert decision.allowed is True
+    assert decision.scope == "session"
+    assert services.chat_service.inputs[0].allowed_confirm_tools_override == {
+        "manage_schedule": "session"
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_allow_session_persistence_is_not_loaded_by_the_next_prompt(
+    agent, services, conn, settings, monkeypatch
+):
+    host_root = settings.acp_host_workspace_root
+    sid = (await agent.new_session(cwd=str(host_root / "project"))).session_id
+    conn.permission_responses["next"] = RequestPermissionResponse(
+        outcome=AllowedOutcome(option_id="allow_session", outcome="selected")
+    )
+    original_update = services.memory_store.update_session_acp_metadata
+
+    async def fail_update(session_id, metadata):
+        raise RuntimeError("storage offline")
+
+    monkeypatch.setattr(
+        services.memory_store,
+        "update_session_acp_metadata",
+        fail_update,
+    )
+    agent.on_connect(conn)
+    decision = await agent._permission_bridge.request(ApprovalRequest(
+        session_id=sid,
+        tool_call_id="call-1",
+        tool_name="manage_schedule",
+        arguments={"action": "list"},
+        description="Manage schedules",
+        risk_level=RiskLevel.CONFIRM,
+    ))
+    monkeypatch.setattr(
+        services.memory_store,
+        "update_session_acp_metadata",
+        original_update,
+    )
+
+    await agent.prompt(prompt=[_text_block("go")], session_id=sid)
+
+    assert decision.allowed is True
+    assert decision.scope == "session"
+    assert services.chat_service.inputs[0].allowed_confirm_tools_override == {}
+
+
+class _ToolLoopProvider:
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+
+    async def list_models(self):
+        return [ModelInfo("test-model", "test-model", "fake")]
+
+    async def supports_tools(self, model: str):
+        return True
+
+    async def chat(self, messages, tools, stream, model, options):
+        if messages and messages[-1].get("role") == "tool":
+            return LLMResult(
+                message={"role": "assistant", "content": "done"},
+                finish_reason="stop",
+            )
+        return LLMResult(
+            message={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"call-{len(messages)}",
+                    "type": "function",
+                    "function": {
+                        "name": self.tool_name,
+                        "arguments": '{"action":"list"}',
+                    },
+                }],
+            },
+            finish_reason="tool_calls",
+        )
+
+
+class _ToolLoopExecutor:
+    def __init__(self) -> None:
+        self.calls: list[ToolCallRequest] = []
+
+    async def execute(self, request, context=None):
+        self.calls.append(request)
+        return ToolResult(
+            request.id,
+            request.name,
+            ToolResultStatus.SUCCESS,
+            {"ok": True},
+        )
+
+
+def _install_real_chat_service(services, tool_name: str, managed: bool):
+    executor = _ToolLoopExecutor()
+    runner = AgentGraphRunner(
+        _ToolLoopProvider(tool_name),
+        ToolService(executor, [
+            ToolDefinition(
+                name=tool_name,
+                description="Confirm action",
+                input_schema={"type": "object"},
+                risk_level=RiskLevel.CONFIRM,
+                managed=managed,
+            )
+        ]),
+        services.memory_store,
+        HeuristicSummarizer(),
+        iteration_limit=4,
+    )
+    chat_service = ChatCompletionService(
+        services.memory_store,
+        runner,
+        services.session_service,
+    )
+    services.chat_service = chat_service
+    services.gateway_service = FakeGatewayService(chat_service)
+    return executor
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "managed"),
+    [("ordinary_confirm", False), ("managed_confirm", True)],
+)
+async def test_persisted_acp_session_grant_executes_without_reapproval(
+    agent, services, conn, settings, tool_name, managed
+):
+    executor = _install_real_chat_service(services, tool_name, managed)
+    sid = (await agent.new_session(
+        cwd=str(settings.acp_host_workspace_root / "project")
+    )).session_id
+    session = await services.memory_store.get_session(sid)
+    metadata = dict(session.acp_metadata or {})
+    metadata["allowed_confirm_tools"] = {tool_name: "session"}
+    await services.memory_store.update_session_acp_metadata(sid, metadata)
+    agent.on_connect(conn)
+
+    await agent.prompt(prompt=[_text_block("run")], session_id=sid)
+
+    assert [call.name for call in executor.calls] == [tool_name]
+    assert conn.permission_calls == []
+
+
+@pytest.mark.asyncio
+async def test_failed_acp_persistence_executes_current_call_and_reapproves_next_round(
+    agent, services, conn, settings, monkeypatch
+):
+    tool_name = "managed_confirm"
+    executor = _install_real_chat_service(services, tool_name, managed=True)
+    sid = (await agent.new_session(
+        cwd=str(settings.acp_host_workspace_root / "project")
+    )).session_id
+    conn.permission_responses["next"] = RequestPermissionResponse(
+        outcome=AllowedOutcome(option_id="allow_session", outcome="selected")
+    )
+    original_update = services.memory_store.update_session_acp_metadata
+
+    async def fail_update(session_id, metadata):
+        raise RuntimeError("storage offline")
+
+    monkeypatch.setattr(
+        services.memory_store,
+        "update_session_acp_metadata",
+        fail_update,
+    )
+    agent.on_connect(conn)
+    await agent.prompt(prompt=[_text_block("first")], session_id=sid)
+    monkeypatch.setattr(
+        services.memory_store,
+        "update_session_acp_metadata",
+        original_update,
+    )
+
+    await agent.prompt(prompt=[_text_block("second")], session_id=sid)
+
+    assert [call.name for call in executor.calls] == [tool_name, tool_name]
+    assert len(conn.permission_calls) == 2
 
 
 # ---- error path maps to refusal -------------------------------------------

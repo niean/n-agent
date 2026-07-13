@@ -3,11 +3,16 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from app.application.gateway_service import GatewayService
 from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, InteractionMessage, InteractionResponse
 from app.domain.platform import Platform
+from app.interfaces.feishu_tool_approval import (
+    FeishuToolApprovalBridge,
+    FeishuToolApprovalError,
+)
 
 
 class FeishuEventClient(Protocol):
@@ -17,7 +22,7 @@ class FeishuEventClient(Protocol):
 
     async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None: ...
 
-    async def send_interactive_card(self, receive_id: str, card: dict[str, Any], receive_id_type: str = "chat_id") -> None: ...
+    async def send_interactive_card(self, receive_id: str, card: dict[str, Any], receive_id_type: str = "chat_id") -> str: ...
 
     async def update_card(self, message_id: str, card: dict[str, Any]) -> None: ...
 
@@ -37,6 +42,7 @@ class FeishuImAdapter:
         # confirmation_id -> confirmation dict last rendered to a card, so we
         # can rebuild the card with disabled buttons after a click.
         self._last_confirmations: dict[str, dict[str, Any]] = {}
+        self._tool_approval_bridge = FeishuToolApprovalBridge()
 
     def is_connected(self) -> bool:
         return self._connected
@@ -65,6 +71,7 @@ class FeishuImAdapter:
             raise
 
     async def handle_event(self, payload: dict[str, Any]) -> None:
+        self._cleanup_confirmation_cache()
         if _is_card_action(payload):
             await self._handle_card_action(payload)
             return
@@ -101,15 +108,16 @@ class FeishuImAdapter:
         receive_id = chat_id or open_id
         receive_id_type = "chat_id" if chat_id else "open_id"
         platform_session_id = receive_id
+        session_key = GatewaySessionKey(
+            Platform.FEISHU,
+            platform_session_id,
+            thread_id=thread_id,
+            display_name=open_id,
+        )
         response = await self.gateway_service.handle_message(
             InteractionMessage(
                 id=_clean_text(verified.get("header", {}).get("event_id")) or message_id,
-                session_key=GatewaySessionKey(
-                    Platform.FEISHU,
-                    platform_session_id,
-                    thread_id=thread_id,
-                    display_name=open_id,
-                ),
+                session_key=session_key,
                 text=content,
                 metadata={
                     "platform": Platform.FEISHU.value,
@@ -122,7 +130,14 @@ class FeishuImAdapter:
                     "display_name": open_id,
                     "actor_id": open_id,
                 },
-            )
+            ),
+            approval_decider=self._tool_approval_decider(
+                session_key,
+                open_id,
+                receive_id,
+                receive_id_type,
+                thread_id,
+            ),
         )
         if response.metadata.get("duplicate"):
             return
@@ -169,15 +184,16 @@ class FeishuImAdapter:
         receive_id = chat_id or open_id
         receive_id_type = "chat_id" if chat_id else "open_id"
         platform_session_id = receive_id
+        session_key = GatewaySessionKey(
+            Platform.FEISHU,
+            platform_session_id,
+            thread_id=thread_id,
+            display_name=open_id,
+        )
         response = await self.gateway_service.handle_message(
             InteractionMessage(
                 id=_clean_text(verified.get("header", {}).get("event_id")) or message_id,
-                session_key=GatewaySessionKey(
-                    Platform.FEISHU,
-                    platform_session_id,
-                    thread_id=thread_id,
-                    display_name=open_id,
-                ),
+                session_key=session_key,
                 text="",
                 images=[data_url],
                 metadata={
@@ -191,11 +207,66 @@ class FeishuImAdapter:
                     "display_name": open_id,
                     "actor_id": open_id,
                 },
-            )
+            ),
+            approval_decider=self._tool_approval_decider(
+                session_key,
+                open_id,
+                receive_id,
+                receive_id_type,
+                thread_id,
+            ),
         )
         if response.metadata.get("duplicate"):
             return
         await self._send_response(response, receive_id, receive_id_type, platform_session_id, thread_id)
+
+    def _tool_approval_decider(
+        self,
+        session_key: GatewaySessionKey,
+        actor_id: str,
+        receive_id: str,
+        receive_id_type: str,
+        thread_id: str,
+    ):
+        async def send(confirmation: dict[str, Any]) -> str:
+            confirmation_id = _clean_text(confirmation.get("id"))
+            if confirmation_id:
+                self._last_confirmations[confirmation_id] = dict(confirmation)
+            try:
+                card_message_id = await self.feishu_client.send_interactive_card(
+                    receive_id,
+                    _confirmation_card(
+                        confirmation,
+                        session_key.platform_session_id,
+                        thread_id,
+                    ),
+                    receive_id_type,
+                )
+                if not card_message_id:
+                    raise RuntimeError("missing card message id")
+                return card_message_id
+            except Exception:
+                self._last_confirmations.pop(confirmation_id, None)
+                await self.feishu_client.send_text(
+                    receive_id,
+                    "确认卡片发送失败，请稍后重试",
+                    receive_id_type,
+                )
+                raise
+
+        return self._tool_approval_bridge.create_decider(
+            session_key,
+            actor_id,
+            receive_id,
+            receive_id_type,
+            send,
+            cleanup=lambda confirmation_id: self._last_confirmations.pop(
+                confirmation_id,
+                None,
+            ),
+            session_grant_updater=self.gateway_service.grant_tool_for_session,
+            session_grant_checker=self.gateway_service.is_tool_granted,
+        )
 
     async def _handle_card_action(self, payload: dict[str, Any]) -> None:
         verified = self.feishu_client.verify_card_action_event(payload)
@@ -210,33 +281,102 @@ class FeishuImAdapter:
         thread_id = _clean_text(value.get("thread_id"))
         confirmation_id = _clean_text(value.get("confirmation_id"))
         choice = _clean_text(value.get("choice"))
-        # Disable buttons on the original card immediately to prevent the user
-        # from double-clicking while the destructive command is in flight.
-        if card_message_id and confirmation_id:
+        confirmation_kind = _clean_text(value.get("confirmation_kind"))
+        tool_owned = self._tool_approval_bridge.owns_confirmation(confirmation_id)
+        slash_owned = self.gateway_service.owns_confirmation(confirmation_id)
+        if tool_owned:
+            if confirmation_kind != "tool_policy":
+                await self._send_confirmation_error(chat_id, actor_id, "确认类型无效")
+                return
+            try:
+                claim = self._tool_approval_bridge.claim(
+                    confirmation_id,
+                    choice,
+                    verified_chat_id=chat_id,
+                    verified_card_message_id=card_message_id,
+                    actor_id=actor_id,
+                )
+            except FeishuToolApprovalError as exc:
+                await self._send_confirmation_error(chat_id, actor_id, str(exc))
+                return
+
             stored = self._last_confirmations.get(confirmation_id)
-            if stored is not None:
-                try:
-                    await self.feishu_client.update_card(
-                        card_message_id,
-                        _confirmation_card(
-                            stored,
-                            platform_session_id,
-                            thread_id,
-                            disabled=True,
-                            status_text=_status_text_for_choice(choice),
-                        ),
-                    )
-                except Exception:
-                    # Best-effort: gateway-side pending_confirmations pop is the
-                    # ultimate guard against double execution.
-                    pass
+            self._tool_approval_bridge.complete(claim)
+            await self._disable_confirmation_card(
+                card_message_id,
+                stored,
+                claim.pending.session_key.platform_session_id,
+                claim.pending.session_key.thread_id,
+                choice,
+            )
+            self._last_confirmations.pop(confirmation_id, None)
+            return
+        if not slash_owned or confirmation_kind not in {"", "slash_command"}:
+            await self._send_confirmation_error(chat_id, actor_id, "确认已失效")
+            return
+        if choice not in {"once", "trust_session", "cancel"}:
+            await self._send_confirmation_error(chat_id, actor_id, "确认选项无效")
+            return
+
+        stored = self._last_confirmations.get(confirmation_id)
+
+        async def disable_card() -> None:
+            await self._disable_confirmation_card(
+                card_message_id,
+                stored,
+                platform_session_id,
+                thread_id,
+                choice,
+            )
+
         response = await self.gateway_service.handle_confirmation(
             GatewaySessionKey(Platform.FEISHU, platform_session_id, thread_id=thread_id, display_name=actor_id),
             actor_id,
             confirmation_id,
             GatewayConfirmationChoice(choice),
+            on_consumed=disable_card,
         )
+        if not self.gateway_service.owns_confirmation(confirmation_id):
+            self._last_confirmations.pop(confirmation_id, None)
         await self._send_response(response, chat_id, "chat_id", platform_session_id, thread_id)
+
+    async def _disable_confirmation_card(
+        self,
+        card_message_id: str,
+        confirmation: dict[str, Any] | None,
+        platform_session_id: str,
+        thread_id: str,
+        choice: str,
+    ) -> None:
+        if not card_message_id or confirmation is None:
+            return
+        try:
+            await self.feishu_client.update_card(
+                card_message_id,
+                _confirmation_card(
+                    confirmation,
+                    platform_session_id,
+                    thread_id,
+                    disabled=True,
+                    status_text=_status_text_for_choice(choice),
+                ),
+            )
+        except Exception:
+            pass
+
+    async def _send_confirmation_error(
+        self,
+        chat_id: str,
+        actor_id: str,
+        message: str,
+    ) -> None:
+        receive_id = chat_id or actor_id
+        if receive_id:
+            await self.feishu_client.send_text(
+                receive_id,
+                message,
+                "chat_id" if chat_id else "open_id",
+            )
 
     async def _send_response(
         self,
@@ -260,9 +400,28 @@ class FeishuImAdapter:
                     )
                 except Exception:
                     self.gateway_service.discard_confirmation(confirmation_id)
+                    self._last_confirmations.pop(confirmation_id, None)
                     await self.feishu_client.send_text(receive_id, "确认卡片发送失败，请稍后重试", receive_id_type)
                 continue
             await self.feishu_client.send_text(receive_id, outbound.content, receive_id_type)
+
+    def _cleanup_confirmation_cache(self) -> None:
+        now = datetime.now(timezone.utc)
+        expired: list[str] = []
+        for confirmation_id, confirmation in self._last_confirmations.items():
+            raw_expires_at = _clean_text(confirmation.get("expires_at"))
+            if not raw_expires_at:
+                continue
+            try:
+                expires_at = datetime.fromisoformat(raw_expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= now:
+                expired.append(confirmation_id)
+        for confirmation_id in expired:
+            self._last_confirmations.pop(confirmation_id, None)
 
 
 def _is_card_action(payload: dict[str, Any]) -> bool:
@@ -278,19 +437,30 @@ def _confirmation_card(
     disabled: bool = False,
     status_text: str = "",
 ) -> dict[str, Any]:
+    confirmation_kind = _clean_text(confirmation.get("kind")) or "slash_command"
     command = _clean_text(confirmation.get("command"))
     confirmation_id = _clean_text(confirmation.get("id"))
-    action = _clean_text(confirmation.get("action"))
     elements: list[dict[str, Any]] = []
-    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"请确认执行：{command}"}})
+    if confirmation_kind == "tool_policy":
+        tool_name = _clean_text(confirmation.get("tool_name"))
+        description = _clean_text(confirmation.get("description"))
+        arguments_summary = _clean_text(confirmation.get("arguments_summary"))
+        content = f"请确认调用工具：{tool_name}"
+        if description:
+            content += f"\n描述：{description}"
+        if arguments_summary:
+            content += f"\n参数：`{arguments_summary}`"
+    else:
+        content = f"请确认执行：{command}"
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
     if status_text:
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": status_text}})
     elements.append({
         "tag": "action",
         "actions": [
-            _confirmation_button("执行一次", confirmation_id, "once", platform_session_id, thread_id, disabled),
-            _confirmation_button("本会话信任", confirmation_id, "trust_session", platform_session_id, thread_id, disabled),
-            _confirmation_button("取消", confirmation_id, "cancel", platform_session_id, thread_id, disabled),
+            _confirmation_button("执行一次", confirmation_id, "once", platform_session_id, thread_id, confirmation_kind, disabled),
+            _confirmation_button("本会话信任", confirmation_id, "trust_session", platform_session_id, thread_id, confirmation_kind, disabled),
+            _confirmation_button("取消", confirmation_id, "cancel", platform_session_id, thread_id, confirmation_kind, disabled),
         ],
     })
     return {"config": {"wide_screen_mode": True}, "elements": elements}
@@ -302,6 +472,7 @@ def _confirmation_button(
     choice: str,
     platform_session_id: str,
     thread_id: str,
+    confirmation_kind: str,
     disabled: bool = False,
 ) -> dict[str, Any]:
     button: dict[str, Any] = {
@@ -313,6 +484,7 @@ def _confirmation_button(
             "choice": choice,
             "platform_session_id": platform_session_id,
             "thread_id": thread_id,
+            "confirmation_kind": confirmation_kind,
         },
     }
     if disabled:
@@ -322,11 +494,11 @@ def _confirmation_button(
 
 def _status_text_for_choice(choice: str) -> str:
     if choice == "once":
-        return "**已点击「执行一次」，正在处理...**"
+        return "**已点击「执行一次」**"
     if choice == "trust_session":
-        return "**已点击「本会话信任」，正在处理...**"
+        return "**已点击「本会话信任」**"
     if choice == "cancel":
-        return "**已点击「取消」，正在处理...**"
+        return "**已点击「取消」**"
     return ""
 
 

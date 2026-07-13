@@ -14,7 +14,7 @@ from app.domain.agent import AgentState, RunStatus
 from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextEngine, ProviderContext
 from app.domain.memory import MemoryStore
 from app.domain.session import ConversationMessage, Summary
-from app.domain.tool import RiskLevel
+from app.domain.tool_policy import ToolExposurePolicy
 from app.utils.content_utils import extract_text, prepend_text_part
 
 
@@ -257,8 +257,13 @@ class ContextService:
         messages = self.build_provider_messages(state)
         tools: list[dict[str, Any]] = []
         if self.tool_service is not None:
+            exposure_policy = (
+                ToolExposurePolicy.SAFE_ONLY
+                if options.get("tool_exposure_policy") == "safe_only"
+                else ToolExposurePolicy.DEFAULT
+            )
             tools = self.tool_service.list_openai_tools(
-                RiskLevel.SAFE if options.get("tool_exposure_policy") == "safe_only" else None,
+                exposure_policy,
                 context=options.get("tool_execution_context") if isinstance(options, dict) else None,
             )
         return ProviderContext(messages=messages, tools=tools)

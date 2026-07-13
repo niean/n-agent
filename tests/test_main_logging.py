@@ -1,13 +1,41 @@
-"""Verify main.py configures root logger so application INFO logs are visible.
+"""Verify main.py configures HTTP logging without polluting CLI output.
 
 uvicorn 0.30+ 默认 LOGGING_CONFIG 不再为 root logger 配置 handler/level,
 导致应用层 logger.info() 静默 (仅 uvicorn.access logger 单独配置仍可见)。
-main.py 在模块 import 时调用 _configure_logging() 修复此问题。
+create_app() 调用 _configure_logging() 修复 HTTP 日志，同时模块 import 保持无副作用。
 """
 from __future__ import annotations
 
 import io
+import json
 import logging
+import subprocess
+import sys
+
+
+def test_importing_main_does_not_configure_cli_root_logger():
+    """CLI imports app.main for service wiring without opting into INFO logs."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, logging; "
+                "from app.interfaces.cli.main import _configure_cli_env; "
+                "_configure_cli_env(); "
+                "import app.main; "
+                "root = logging.getLogger(); "
+                "print(json.dumps({'handlers': len(root.handlers), 'level': root.level}))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    state = json.loads(result.stdout)
+    assert state == {"handlers": 0, "level": logging.WARNING}
+    assert result.stderr == ""
 
 
 def _reset_root() -> tuple[list[logging.Handler], int]:

@@ -378,7 +378,10 @@
 
 [20260713]
 - NFR
-    - 治理：上下文Context拆分为独立子域
+    - 治理：上下文Context 拆分为独立子域
+    - 治理：集中式Policy 改为领域自治，先做ToolPolicy(ACP)；保留共性抽象，放到Shared Kernel级别的公共领域模型
+        - 飞书：支持 ToolPolicy 工具审批，审批方式跟`破坏性 Slash Command`保持一致
+        - TUI：支持 ToolPolicy 工具审批，审批方式跟`破坏性 Slash Command`保持一致(如果有)；实现方式，参考ACP和飞书支持ToolPolicy
 
 
 ---

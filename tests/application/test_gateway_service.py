@@ -232,6 +232,60 @@ async def test_gateway_service_creates_source_session_and_runs_chat():
 
 
 @pytest.mark.asyncio
+async def test_gateway_service_passes_approval_decider_to_chat_service():
+    harness = Harness()
+    service = harness.service()
+    approval_decider = object()
+
+    await service.handle_message(message(), approval_decider=approval_decider)
+
+    assert harness.chat_service.requests[0].approval_decider is approval_decider
+
+
+@pytest.mark.asyncio
+async def test_gateway_service_applies_session_tool_grants_by_actor():
+    harness = Harness()
+    service = harness.service()
+    event = message(event_id="event-granted")
+    event.metadata["actor_id"] = "ou_1"
+    await harness.registry.create_session_link(event.session_key, "session-1")
+    service.grant_tool_for_session("session-1", "ou_1", "mcp_site_probe")
+
+    await service.handle_message(event)
+
+    assert harness.chat_service.requests[0].allowed_confirm_tools_override == {
+        "mcp_site_probe": "session"
+    }
+
+
+@pytest.mark.asyncio
+async def test_gateway_service_does_not_share_session_tool_grants_with_other_actor():
+    harness = Harness()
+    service = harness.service()
+    event = message(event_id="event-other-actor")
+    event.metadata["actor_id"] = "ou_2"
+    await harness.registry.create_session_link(event.session_key, "session-1")
+    service.grant_tool_for_session("session-1", "ou_1", "mcp_site_probe")
+
+    await service.handle_message(event)
+
+    assert harness.chat_service.requests[0].allowed_confirm_tools_override == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_destructive_preflight_does_not_call_chat_with_approval_decider():
+    harness = Harness()
+    service = harness.service()
+    event = message("/new")
+    event.metadata["actor_id"] = "ou_1"
+
+    response = await service.handle_message(event, approval_decider=object())
+
+    assert response.messages[0].metadata["confirmation"]["action"] == "new"
+    assert harness.chat_service.requests == []
+
+
+@pytest.mark.asyncio
 async def test_gateway_service_skips_duplicate_event():
     harness = Harness()
     service = harness.service()
@@ -283,6 +337,36 @@ async def test_gateway_confirmation_once_executes_pending_new():
     )
 
     assert response.messages[0].content.startswith("已创建新会话")
+    assert len(harness.session_service.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_confirmation_notifies_consumed_before_execution():
+    harness = Harness()
+    service = harness.service()
+    event = message("/new")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+    confirmation_id = pending.messages[0].metadata["confirmation"]["id"]
+    callback_state = []
+
+    async def on_consumed():
+        callback_state.append(
+            (
+                service.owns_confirmation(confirmation_id),
+                len(harness.session_service.created),
+            )
+        )
+
+    await service.handle_confirmation(
+        event.session_key,
+        "ou_1",
+        confirmation_id,
+        GatewayConfirmationChoice.ONCE,
+        on_consumed=on_consumed,
+    )
+
+    assert callback_state == [(False, 0)]
     assert len(harness.session_service.created) == 1
 
 

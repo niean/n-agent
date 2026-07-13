@@ -102,7 +102,11 @@ def make_console(force_terminal: bool | None = None) -> Console:
     cli_color = os.environ.get("N_AGENT_CLI_COLOR", "").strip().lower()
     color_enabled = cli_color in {"1", "true", "yes", "on", "always"}
     no_color = bool(os.environ.get("NO_COLOR")) or not color_enabled
-    return Console(no_color=no_color, force_terminal=force_terminal)
+    return Console(
+        no_color=no_color,
+        color_system=None if no_color else "auto",
+        force_terminal=force_terminal,
+    )
 
 
 def render_markdown(text: str, console: Console) -> None:

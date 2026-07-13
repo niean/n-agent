@@ -129,6 +129,34 @@ async def test_allow_session_supports_async_metadata_updater():
 
 
 @pytest.mark.asyncio
+async def test_allow_session_awaits_generic_metadata_updater_awaitable():
+    completed = False
+
+    def updater(sid: str, name: str, scope: str):
+        future = asyncio.get_running_loop().create_future()
+
+        def complete() -> None:
+            nonlocal completed
+            completed = True
+            future.set_result(None)
+
+        asyncio.get_running_loop().call_soon(complete)
+        return future
+
+    conn = FakeConn(
+        RequestPermissionResponse(
+            outcome=AllowedOutcome(option_id="allow_session", outcome="selected")
+        )
+    )
+    bridge = ACPPermissionBridge(conn, metadata_updater=updater)
+
+    decision = await bridge.request(_make_request())
+
+    assert decision.allowed is True
+    assert completed is True
+
+
+@pytest.mark.asyncio
 async def test_allow_session_without_metadata_updater_still_allows():
     conn = FakeConn(
         RequestPermissionResponse(
@@ -282,6 +310,22 @@ async def test_allow_session_swallows_metadata_updater_exception():
 
     assert decision.allowed is True
     assert decision.scope == "session"
+
+
+@pytest.mark.asyncio
+async def test_allow_session_does_not_swallow_metadata_updater_cancellation():
+    async def updater(sid: str, name: str, scope: str) -> None:
+        raise asyncio.CancelledError()
+
+    conn = FakeConn(
+        RequestPermissionResponse(
+            outcome=AllowedOutcome(option_id="allow_session", outcome="selected")
+        )
+    )
+    bridge = ACPPermissionBridge(conn, metadata_updater=updater)
+
+    with pytest.raises(asyncio.CancelledError):
+        await bridge.request(_make_request())
 
 
 @pytest.mark.asyncio

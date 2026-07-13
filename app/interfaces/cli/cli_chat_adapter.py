@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 from uuid import uuid4
 
 from app.application.events import ChatEvent
@@ -11,15 +12,24 @@ from app.domain.gateway import (
     InteractionResponse,
 )
 from app.domain.session import SessionSource
+from app.domain.tool import ApprovalDecider
 
 
 class CliChatAdapter:
-    def __init__(self, gateway_service) -> None:
+    def __init__(self, gateway_service: Any) -> None:
         self._svc = gateway_service
 
-    async def send_stream(self, text: str, conversation_id: str) -> AsyncIterator[ChatEvent]:
+    async def send_stream(
+        self,
+        text: str,
+        conversation_id: str,
+        *,
+        approval_decider: ApprovalDecider | None = None,
+    ) -> AsyncIterator[ChatEvent]:
         event = self._build_event(text, conversation_id)
-        async for evt in self._svc.handle_message_stream(event):
+        async for evt in self._svc.handle_message_stream(
+            event, approval_decider=approval_decider
+        ):
             yield evt
 
     async def send(self, text: str, conversation_id: str) -> InteractionResponse:
@@ -36,6 +46,12 @@ class CliChatAdapter:
         session_key = GatewaySessionKey(SessionSource.CLI.value, conversation_id, display_name=conversation_id)
         actor_id = f"cli:{conversation_id}"
         return await self._svc.handle_confirmation(session_key, actor_id, confirmation_id, choice_enum)
+
+    def grant_tool_for_session(self, session_id: str, actor_id: str, tool_name: str) -> None:
+        self._svc.grant_tool_for_session(session_id, actor_id, tool_name)
+
+    def is_tool_granted(self, session_id: str, actor_id: str, tool_name: str) -> bool:
+        return self._svc.is_tool_granted(session_id, actor_id, tool_name)
 
     def _build_event(self, text: str, conversation_id: str) -> InteractionMessage:
         return InteractionMessage(

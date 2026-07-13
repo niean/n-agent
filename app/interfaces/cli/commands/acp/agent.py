@@ -121,7 +121,7 @@ class NAgentACPAgent(Agent):
             if session is None or session.source != SessionSource.ACP.value:
                 return
             metadata = dict(session.acp_metadata or {})
-            allowed = dict(metadata.get("allowed_confirm_tools") or {})
+            allowed = _confirm_grants(metadata.get("allowed_confirm_tools"))
             allowed[tool_name] = scope
             metadata["allowed_confirm_tools"] = allowed
             await self.services.memory_store.update_session_acp_metadata(session_id, metadata)
@@ -369,7 +369,9 @@ class NAgentACPAgent(Agent):
             mapped_cwd = metadata.get("cwd", "")
             mode = metadata.get("mode", "default")
             model = metadata.get("model") or self.services.provider_holder.current_model or "default"
-            allowed_confirm = dict(metadata.get("allowed_confirm_tools") or {})
+            allowed_confirm = _confirm_grants(
+                metadata.get("allowed_confirm_tools")
+            )
 
             text, images = self._content_from_prompt(prompt)
             if not text and not images:
@@ -499,6 +501,12 @@ class NAgentACPAgent(Agent):
             ],
             current_mode_id="default",
         )
+
+
+def _confirm_grants(value: Any) -> dict[str, Any]:
+    if type(value) is not dict:
+        return {}
+    return dict(value)
 
 
 def _make_error_event(message: str):

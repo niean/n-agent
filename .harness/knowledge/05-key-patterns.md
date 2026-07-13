@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、协议适配、运行事件、工具权限、Memory 端口、provider 熔断器、Memory Slot 三槽模型与工具面同步、会话默认 profile 派生与 has_override、演进基线、会话来源与ID前缀命名规则、Plugin 子系统 Hermes 兼容装配与工具面路由、Gateway 流式接口与 ChatEvent 消费、CLI 子命令扩展与 _load_xxx_service indirection、ACP stdio 服务端 stdout 纯净性与路径映射、TUI 一次会话完整执行链路、多模态内容归一化与 vision 能力守卫、上下文短期记忆增量压缩与摘要持久化（双标记 + a-f 顺序 + replace_summary_message 单事务 + 双写降级）、观测与 Token 统计 DDD 装配（五桶归一化 + Decimal 成本估算 + sessions 迁移 + usage_records/compression_stats 持久化 + Dashboard/CLI 双界面） -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -85,10 +85,18 @@ Agent 实际可执行工具只来自服务端 Tool Registry。客户端传入 to
 规则：
 - ToolDefinition 是领域值对象，包含 name、description、input_schema、risk_level、permissions、timeout_seconds、enabled、source_type、toolset，不包含具体 handler。
 - source_type 表示工具来源大类，当前已使用 builtin、knowledge，并预留 skill、mcp、plugin、agent；toolset 表示能力分组，参考 Hermes 的工具集概念，用于展示和后续按组治理。
-- 工具 handler 属于 Infrastructure，通过 Application 层 ToolService 绑定执行。
-- 多个工具 handler 通过 Infrastructure 的组合 executor 按工具名路由；ToolService 只处理定义、风险等级、enabled 和 OpenAI schema 暴露语义。
-- 风险等级至少包含 safe、confirm、dangerous。
-- safe 默认允许执行；confirm 默认拒绝自动执行并返回 permission_denied；仅当 Application 从当前用户消息推导出的 ToolExecutionContext 明确授权且关键参数匹配时，confirm 工具可在本轮执行。
+- `ToolExecutor` 是 Domain SPI；具体实现属于各支撑子域或 Infrastructure，多个 executor 由 `CompositeToolExecutor` 按工具名路由。
+- 公共 `Policy` 是 Domain Shared Kernel，只统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`。具体工具规则归 Tool Domain 的 `ToolPolicy`，不存在中央 `PolicyService`。
+- `ToolPolicy` 统一定义校验、`DEFAULT` / `SAFE_ONLY` 暴露、执行决策和一次授权；`RiskLevel` 仍是 `ToolDefinition` 属性，不由 Runner 直接分支判断。
+- `ToolService` 是强制执行边界：`evaluate_execution` 生成带审批快照的 `ToolExecutionEvaluation`，`authorize_once` 生成本次授权上下文，`execute` 在调用 executor 前按当前定义重新评估。评估 token 同时防止请求或定义在审批期间被替换。
+- `AgentGraphRunner` 只按 `PolicyDecision` 的 allow / deny / require_approval 编排：需要审批时调用 `ApprovalDecider`，批准后仍通过 `ToolService.authorize_once` 和 `ToolService.execute`，不自行授予执行权限。
+- 飞书入口把 `FeishuToolApprovalBridge.create_decider(...)` 注入 Gateway；“执行一次”只完成当前 ApprovalDecision，“本会话信任”由 Application `GatewayToolApprovalService` 按 session/actor/tool 保存，并动态注入 `allowed_confirm_tools_override`。因此同一 Agent Loop 后续同名工具可直接复用授权，不再发第二张卡；不同 actor 不共享。
+- TUI 入口把 `CliToolApprovalBridge.create_decider(...)` 注入 Gateway（仅 TTY REPL），“执行一次”/“本会话信任”/“取消”通过 `/confirm once`/`/confirm trust`/`/cancel` 精确命令路由到进程内 Future；grant 检查使用真实 `ApprovalRequest.session_id`（内部 session id，非 conversation id）。“本会话信任”同样由 `GatewayToolApprovalService` 按 session/actor/tool 保存，但 TUI 路径不使用 `allowed_confirm_tools_override`，授权复用走 decider 内 grant checker。非 TTY/单次消息/stdin pipe 不注入 decider，fail-closed。
+- TUI 工具审批与破坏性 Slash Command 共享命令词（`/confirm`、`/cancel`）但使用独立完整 confirmation id 和 REPL 状态槽位（`_last_tool_confirmation_id` vs `_last_slash_confirmation_id`）；工具 id 永不传给 `CliChatAdapter.confirm`，slash id 永不传给 bridge。TTY stream 期间通过 `asyncio.wait(FIRST_COMPLETED)` 竞速 consumer 与普通 `> ` prompt（不得增加 `[stream]` 等用户可见前缀），非审批输入只显示提示不二次发送；`/exit`/Ctrl+C/EOF 取消 stream 并确定性收尾。
+- ToolPolicy 卡片回调必须按服务端 pending 所有者路由并校验 actor、verified chat id、verified card message id；客户端回传的 kind/thread/platform 只可做一致性检查。claim 与完成 Future 之间不得 await，重复回调只能有一个成功；发卡失败、超时、取消、授权写入失败均 fail closed，其中授权写入失败降级为仅本次批准。ToolPolicy 与破坏性 Slash Command 的合法选择一旦消费 pending，必须在业务执行前把卡片三个按钮全部禁用；越权、过期、类型篡改或非法 choice 不得禁用合法卡片。TUI 路径对应约束：claim 校验 actor_id + 完整 `GatewaySessionKey`，claim 与 complete 之间不得 await，cleanup 幂等（`cleanup_called` 标志防止 `discard_pending_for_actor` 与 decider finally 双重清理）。
+- 卡片参数展示使用递归脱敏和长度上限，secret/token/password/authorization/api-key/credential/cookie/private-key 等键不得泄漏；飞书 client 发送卡片必须返回服务端 message_id，作为回调绑定依据。
+- 工具可用性由定义面和执行面共同决定：`ToolDefinition` 决定模型可见性，`CompositeToolExecutor` 路由决定调用能否落到实现，两者必须同步注册和刷新。
+- 风险等级包含 safe、confirm、dangerous。safe 默认允许；confirm 无匹配授权时要求审批；dangerous 不暴露且拒绝执行。参数授权只接受字符串键，并按授权参数是调用参数子集进行匹配。
 - MCP 站点管理工具 mcp_site_probe/mcp_site_add/mcp_site_refresh 是 confirm，mcp_site_list 是 safe；模型不能直接写配置或 SQLite，只能调用受控管理工具。
 - MCP 远端工具通过 ToolService 动态定义源暴露，source_type=mcp，禁用站点、禁用工具、名称冲突或非 object schema 不暴露；执行时由 Application 薄 executor 调 McpService，再进入 Infrastructure MCP client。MCP client 支持 streamable_http、SSE 和 stdio；stdio 站点使用 command/args/env 配置，通过 argv 启动本地进程，不使用 shell，env 继承当前进程环境并由站点 env 覆盖。
 - 文件类工具必须限制在配置 workspace 根目录内，拒绝路径穿越和软链接逃逸。
@@ -246,7 +254,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - 飞书重复事件通过 GatewaySessionRegistry.mark_event_processed 做幂等，重复事件不再次调用 ChatCompletionService。
 - Gateway 破坏性命令确认属于 Application 层：/new、/rename、/delete、/schedule remove 先创建内存 pending confirmation，绑定 GatewaySessionKey、actor_id、target_session_id 和 15 分钟 TTL；确认回调消费 pending 后才执行，一次/本会话信任/取消均不进入 ToolService。
 - 飞书使用长连接接收事件，app_id、tenant_key、allowlist 校验和 tenant_access_token 获取属于 Infrastructure client；普通消息 allowlist 使用 event.sender/event.message，card action 必须单独按 event.operator.open_id 和 event.context.open_chat_id 校验。
-- Interfaces 飞书长连接适配器只消费已注入的 client 能力：普通文本事件转换为 InteractionMessage，confirmation outbound 渲染为 interactive card，card action 转换为 GatewayService.handle_confirmation。
+- Interfaces 飞书长连接适配器只消费已注入的 client 能力：普通文本事件转换为 InteractionMessage，破坏性 Slash confirmation outbound 渲染为 interactive card 并回调 GatewayService.handle_confirmation；ToolPolicy approval 由 FeishuToolApprovalBridge 转换为同款三按钮卡片并完成 ApprovalDecider Future。
 - CLI 与飞书入口不能绕过 ToolService 风险控制，也不能直接写 provider、tool 或 session 数据表。
 
 陷阱：在 CLI 或飞书长连接适配器里直接 new SQLite store、调用 Provider 或复制 AgentGraphRunner，会形成第二套 Runtime 并破坏 DDD 边界。
@@ -259,7 +267,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - ChatCompletionInput 同时携带 `metadata`（untrusted，可由 OpenAI HTTP 客户端写入）与 `trusted_metadata`（trusted，仅 GatewayService/Feishu 长连接适配器写入）。
 - ChatCompletionService.complete 在每次调用时构造 ToolExecutionContext，把 trusted_metadata 拷贝进去，并通过 `_compute_permitted_managed_tools(mode, trusted_metadata)` 决定 `permitted_managed_tools`。当前规则：mode=realtime 且 `trusted_metadata.gateway.platform` 为合法 Gateway（feishu）才返回 `{"manage_schedule"}`，否则空集。
 - 上下文通过 LangGraph `configurable.options["tool_execution_context"]` 传递；执行节点（call_llm/execute_tools）必须在 config 缺失时回退到 `state.run_options`，避免 LangGraph 框架精简 config 导致 context 丢失。
-- ToolService.execute 对 `definition.managed=True` 强制检查 `request.name in context.permitted_managed_tools`，否则返回 `permission_denied`，不调用 handler。
+- `ToolPolicy` 对未出现在 `context.permitted_managed_tools` 的 managed 工具返回 `REQUIRE_APPROVAL`；`ToolService` 未取得有效授权时返回 `permission_denied`，不调用 executor。
 - 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 platform/receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。`_origin_from_trusted` 把这四个字段一并写入 `ScheduledTask.origin` 与 `DeliveryTarget.context`，由 outbound 按 `platform` 路由投递。
 - 删除等需要确认的破坏性动作不允许 Agent 直接执行；自然语言删除要返回 confirmation_required 文案，引导用户走 `/schedule remove <id>`。Gateway 破坏性命令 preflight 时把当前飞书 trusted_metadata 写入 `GatewayConfirmationRequest.trusted_metadata`，handle_confirmation 还原后再校验 task.origin 一致性。
 - 不可信模式（unattended/safe_only、定时任务执行）时 `list_openai_tools` 必须过滤 source_type=AGENT 的工具，避免调度器递归调用自己。
@@ -401,6 +409,7 @@ AgentGraph 工具事件回放：
 
 CLI REPL TUI 隔离：
 - prompt_toolkit 与 rich 直接同时写 stdout 会乱屏，REPL 整个 loop body（prompt + handle_input + rich 输出）必须在 `patch_stdout()` 上下文内
+- Rich 默认关闭样式时必须显式 `color_system=None`；仅设 `no_color=True` 在 Rich 13 仍可能输出 dim/bold ANSI，经过 prompt_toolkit 或不兼容终端后会显示成 `?[2m` 等乱码。只有显式 `N_AGENT_CLI_COLOR=always` 且未设置 `NO_COLOR` 时允许 ANSI
 - 流式消费运行在 `asyncio.create_task` 包裹的 cancellable task 中，Ctrl+C 时 cancel task 并 `aclose` async iterator
 - 非 TTY 降级用 `input()` 循环（catch EOFError），避免 prompt_toolkit 在管道/CI 环境异常
 
@@ -465,10 +474,10 @@ stdout 纯净性规则：
 - 开发环境通常 host root 设为宿主项目目录、container root 设为容器内挂载点（与 docker-compose volumes 挂载源一致）；K8s 部署的 Pod 名动态生成，VsCode 客户端配置需用 `kubectl get pods -l app=n-agent` 查询实际名称填入
 
 ApprovalDecider 桥接规则：
-- Domain `ApprovalDecider` 端口定义 `decide(request: ApprovalRequest) -> ApprovalDecision` 接口；ACP 服务端通过 `ACPPermissionBridge` 实现，把 N-Agent confirm 工具授权请求转换为 ACP `PermissionOption`（allow_once/allow_always/reject_once/reject_always）
-- `ChatCompletionInput` 增加可选 `approval_decider` 与 `allowed_confirm_tools_override` 字段，`ChatCompletionService.complete` 通过 `dataclasses.replace(ctx, approval_decider=..., allowed_confirm_tools=...)` 注入到 `ToolExecutionContext`（frozen dataclass 必须用 replace 不可直接赋值）
-- `ACPPermissionBridge._persist_session` 把 allow_always/reject_always 决策持久化到 `sessions.acp_metadata_json`，best-effort 持久化（metadata_updater 异常 try/except: pass，不阻塞工具执行主路径）
-- `reject_once` 返回 `scope="deny"`（非 "once"），与其他拒绝路径一致；ACP `PermissionOption` 构造接受 `option_id`（snake_case）并 alias `optionId`
+- Domain `ApprovalDecider` 是 `Callable[[ApprovalRequest], ApprovalDecision | Awaitable[ApprovalDecision]]`；ACP 服务端的 `ACPPermissionBridge` 实现 `__call__`，稳定选项 ID 为 `allow_once`、`allow_session`、`reject_once`（`allow_session` 映射 ACP SDK 的 `allow_always` kind）
+- `ApprovalDecision.scope` 使用 `once`、`session`、`deny`；`reject_once` 和失败关闭路径返回 `deny`
+- 只有 `allow_session` 通过 `metadata_updater` best-effort 持久化会话授权；持久化异常记录 warning，但当前调用仍返回允许，后续调用会再次审批
+- `ChatCompletionService` 按当前 `ToolDefinition` 归一化 `allowed_confirm_tools_override`：普通 confirm grant 合入 `allowed_confirm_tools`，managed session grant 合入 `permitted_managed_tools`，无效、禁用或非 confirm 工具被丢弃
 
 ACP session 桥接规则：
 - ACP session 与 N-Agent session 通过 `ACPSessionBridge` 桥接：`create` 新建 N-Agent session（source="acp"）并写 acp_metadata；`load` 读取已有 session 与 metadata；`resume` 复用 session 并更新 cwd；`fork` 创建子会话继承父上下文；`list` 返回最近会话（cursor 分页，删除 session 时 cursor_found flag 处理边界）；`close` 调用可选 cleanup_callback（sync 或 async，`inspect.isawaitable` 判定）

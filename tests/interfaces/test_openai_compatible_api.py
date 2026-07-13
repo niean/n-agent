@@ -1,5 +1,6 @@
-import asyncio
+from contextlib import ExitStack
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.application.agent_graph import AgentGraphRunner
@@ -8,7 +9,13 @@ from app.application.model_service import ModelService
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.domain.provider import LLMResult, ModelInfo
-from app.domain.tool import ToolCallRequest, ToolResult, ToolResultStatus
+from app.domain.tool import (
+    RiskLevel,
+    ToolCallRequest,
+    ToolDefinition,
+    ToolResult,
+    ToolResultStatus,
+)
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.tools.builtin import build_builtin_tool_executor
@@ -65,6 +72,18 @@ class FakeKnowledgeExecutor:
         )
 
 
+_test_client_stack: ExitStack | None = None
+
+
+@pytest.fixture(autouse=True)
+def test_client_lifecycle():
+    global _test_client_stack
+    with ExitStack() as stack:
+        _test_client_stack = stack
+        yield
+    _test_client_stack = None
+
+
 def build_client(tmp_path, provider=None, tool_service=None):
     provider = provider or FakeProvider()
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -80,7 +99,10 @@ def build_client(tmp_path, provider=None, tool_service=None):
 
     app = FastAPI()
     app.include_router(create_openai_compatible_router(chat, models))
-    return TestClient(app), store
+    if _test_client_stack is None:
+        raise RuntimeError("TestClient lifecycle fixture is not active")
+    client = _test_client_stack.enter_context(TestClient(app))
+    return client, store
 
 
 def test_health_and_models(tmp_path):
@@ -156,6 +178,46 @@ def test_tool_call_loop_persists_tool_call(tmp_path):
     assert response.json()["choices"][0]["message"]["content"] == "tool done"
 
 
+def test_http_metadata_cannot_inject_internal_tool_authorization(tmp_path):
+    provider = FakeProvider(tool_name="managed_action")
+    tool_service = ToolService(
+        build_builtin_tool_executor(tmp_path),
+        [
+            ToolDefinition(
+                name="managed_action",
+                description="Managed action",
+                input_schema={"type": "object"},
+                risk_level=RiskLevel.CONFIRM,
+                managed=True,
+            )
+        ],
+    )
+    client, store = build_client(
+        tmp_path,
+        provider=provider,
+        tool_service=tool_service,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "metadata": {
+                "session_id": "s-untrusted-grant",
+                "allowed_confirm_tools": {"managed_action": "session"},
+                "permitted_managed_tools": ["managed_action"],
+            },
+            "messages": [{"role": "user", "content": "use tool"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.portal is not None
+    calls = client.portal.call(store.list_tool_calls, "s-untrusted-grant")
+    assert calls[0].status == "permission_denied"
+
+
 def test_openai_chat_completion_can_call_knowledge_tool(tmp_path):
     provider = FakeProvider(tool_name="search_knowledge", final_content="kb answer")
     builtin = build_builtin_tool_executor(tmp_path)
@@ -186,7 +248,8 @@ def test_openai_chat_completion_can_call_knowledge_tool(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "kb answer"
-    tool_calls = asyncio.run(store.list_tool_calls("s-kb"))
+    assert client.portal is not None
+    tool_calls = client.portal.call(store.list_tool_calls, "s-kb")
     assert tool_calls[0].tool_name == "search_knowledge"
     assert tool_calls[0].status == "success"
 

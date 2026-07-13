@@ -164,10 +164,13 @@ class FakeServices:
     def health_snapshot(self) -> dict[str, Any]:
         return {"provider": {"status": "ok"}, "gateway": {"status": "ok"}}
 
-    async def handle_message_stream(self, event: InteractionMessage) -> AsyncIterator[ChatEvent]:
+    async def handle_message_stream(
+        self, event: InteractionMessage, **kwargs: Any
+    ) -> AsyncIterator[ChatEvent]:
         self.last_event = event
         self.last_conversation_id = event.session_key.platform_session_id
-        async for evt in self._gateway.handle_message_stream(event):
+        self.last_stream_kwargs = kwargs
+        async for evt in self._gateway.handle_message_stream(event, **kwargs):
             yield evt
 
     async def handle_message(self, event: InteractionMessage) -> InteractionResponse:
@@ -178,6 +181,12 @@ class FakeServices:
     async def handle_confirmation(self, session_key, actor_id, confirmation_id, choice):
         self.last_confirmation_id = confirmation_id
         return await self._gateway.handle_confirmation(session_key, actor_id, confirmation_id, choice)
+
+    def grant_tool_for_session(self, session_id: str, actor_id: str, tool_name: str) -> None:
+        self._gateway.grant_tool_for_session(session_id, actor_id, tool_name)
+
+    def is_tool_granted(self, session_id: str, actor_id: str, tool_name: str) -> bool:
+        return self._gateway.is_tool_granted(session_id, actor_id, tool_name)
 
 
 @pytest.fixture
@@ -202,9 +211,13 @@ class _FakeCliChatAdapter:
     stream_responses: list[list[tuple[str, dict[str, Any]]]] = field(default_factory=list)
     last_confirm_id: str | None = None
     sent_texts: list[str] = field(default_factory=list)
+    last_approval_decider: Any = None
 
-    async def send_stream(self, text: str, conversation_id: str) -> AsyncIterator[ChatEvent]:
+    async def send_stream(
+        self, text: str, conversation_id: str, *, approval_decider: Any = None
+    ) -> AsyncIterator[ChatEvent]:
         self.sent_texts.append(text)
+        self.last_approval_decider = approval_decider
         if self.stream_responses:
             scripted = self.stream_responses.pop(0)
         else:

@@ -22,7 +22,9 @@ Any timeout or exception fails closed: ``ApprovalDecision(allowed=False, scope="
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
+from inspect import isawaitable
 
 from acp.helpers import update_tool_call
 from acp.interfaces import Client
@@ -37,6 +39,7 @@ from app.domain.tool import ApprovalDecision, ApprovalRequest
 
 
 MetadataUpdater = Callable[[str, str, str], Awaitable[None] | None]
+logger = logging.getLogger(__name__)
 
 
 class ACPPermissionBridge:
@@ -116,7 +119,7 @@ class ACPPermissionBridge:
             return
         try:
             result = self.metadata_updater(req.session_id, req.tool_name, "session")
-            if asyncio.iscoroutine(result):
+            if isawaitable(result):
                 await result
         except Exception:
-            pass
+            logger.warning("ACP session authorization persistence failed")

@@ -44,10 +44,12 @@
 ## 工具体系
 
 - Agent 实际可执行工具只来自服务端 Tool Registry
-- `ToolDefinition` 不包含 handler，handler 属于 Infrastructure
-- `safe` 工具默认允许执行
-- `confirm` 工具默认拒绝自动执行，返回 `permission_denied`
-- `dangerous` 工具默认不暴露给 LLM，也不可自动执行
+- `ToolDefinition` 只描述能力，不包含 handler；`ToolExecutor` 是执行 SPI，具体实现属于对应支撑子域或 Infrastructure
+- 公共 `Policy` 是 Domain Shared Kernel，只统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`；工具规则归 Tool Domain 的 `ToolPolicy`
+- `ToolPolicy` 统一治理定义校验、模型暴露、执行允许/拒绝/需审批和一次授权；`RiskLevel` 保留为 `ToolDefinition` 属性，不在 Runner、Interfaces 或 executor 中复制决策规则
+- `ToolService` 是强制执行边界：执行前按当前定义复判，不允许调用方绕过；`AgentGraphRunner` 只按 `PolicyDecision` 编排审批
+- 工具必须同时注册 `ToolDefinition` 和 `ToolExecutor` 执行路由；只有定义会导致模型可见但调用无法落到实现
+- `safe` 默认允许；`confirm` 无授权时要求审批，缺少审批器或审批拒绝时返回 `permission_denied`；`dangerous` 不暴露且拒绝执行
 - 内置 safe 工具：`get_current_time`、`calculator`、`list_directory`、`read_text_file`、`web_fetch`
 - 文件工具必须通过真实路径解析限制在 workspace 根目录内，拒绝路径穿越和软链接逃逸
 - calculator 使用 AST 白名单，只允许安全算术表达式

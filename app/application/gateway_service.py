@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
 from app.application.events import ChatEvent, ChatEventType
+from app.application.gateway_tool_approval_service import GatewayToolApprovalService
 from app.application.model_service import ModelService
 from app.application.schedule_service import ScheduledTaskCreateInput, ScheduleService
 from app.application.session_service import SessionService
@@ -25,6 +26,7 @@ from app.domain.gateway import (
 )
 from app.domain.platform import Platform
 from app.domain.session import SessionSource
+from app.domain.tool import ApprovalDecider
 
 HealthProvider = Callable[[], dict[str, Any]]
 
@@ -136,6 +138,8 @@ class GatewayCommandService:
         actor_id: str,
         confirmation_id: str,
         choice: GatewayConfirmationChoice,
+        *,
+        on_consumed: Callable[[], Awaitable[None]] | None = None,
     ) -> InteractionResponse:
         now = datetime.now(timezone.utc)
         self._cleanup_expired(now)
@@ -148,6 +152,8 @@ class GatewayCommandService:
         if confirmation.actor_id != actor_id:
             return _response(confirmation.session_id, "只有命令发起者可以确认")
         self.pending_confirmations.pop(confirmation_id, None)
+        if on_consumed is not None:
+            await on_consumed()
         if choice is GatewayConfirmationChoice.CANCEL:
             return _response(confirmation.session_id, "已取消")
         if choice is GatewayConfirmationChoice.TRUST_SESSION:
@@ -336,10 +342,12 @@ class GatewayService:
         model_service: ModelService,
         health_provider: HealthProvider,
         schedule_service: ScheduleService | None = None,
+        tool_approval_service: GatewayToolApprovalService | None = None,
     ):
         self.registry = registry
         self.chat_service = chat_service
         self.session_service = session_service
+        self.tool_approval_service = tool_approval_service or GatewayToolApprovalService()
         self.command_service = GatewayCommandService(
             registry,
             session_service,
@@ -350,7 +358,12 @@ class GatewayService:
             chat_service,
         )
 
-    async def handle_message(self, event: InteractionMessage) -> InteractionResponse:
+    async def handle_message(
+        self,
+        event: InteractionMessage,
+        *,
+        approval_decider: ApprovalDecider | None = None,
+    ) -> InteractionResponse:
         message_id = str(event.metadata.get("message_id", ""))
         processed = await self.registry.mark_event_processed(event.session_key.source_value, event.id, message_id)
         if not processed:
@@ -379,6 +392,11 @@ class GatewayService:
                 },
                 trusted_metadata=_build_trusted_metadata(event),
                 session_id=session_id,
+                approval_decider=approval_decider,
+                allowed_confirm_tools_override=self.tool_approval_service.grants_for(
+                    session_id,
+                    _actor_id(event),
+                ),
             )
         )
         assert isinstance(result, ChatCompletionResult)
@@ -390,8 +408,16 @@ class GatewayService:
         actor_id: str,
         confirmation_id: str,
         choice: GatewayConfirmationChoice,
+        *,
+        on_consumed: Callable[[], Awaitable[None]] | None = None,
     ) -> InteractionResponse:
-        return await self.command_service.handle_confirmation(session_key, actor_id, confirmation_id, choice)
+        return await self.command_service.handle_confirmation(
+            session_key,
+            actor_id,
+            confirmation_id,
+            choice,
+            on_consumed=on_consumed,
+        )
 
     async def handle_message_stream(
         self,
@@ -400,7 +426,7 @@ class GatewayService:
         model_override: str | None = None,
         options_override: dict[str, Any] | None = None,
         trusted_metadata_override: dict[str, Any] | None = None,
-        approval_decider: Any | None = None,
+        approval_decider: ApprovalDecider | None = None,
         allowed_confirm_tools_override: dict[str, Any] | None = None,
     ) -> AsyncIterator[ChatEvent]:
         """流式版本：复用幂等、destructive preflight、session 解析、Slash 分流。"""
@@ -478,6 +504,25 @@ class GatewayService:
     def discard_confirmation(self, confirmation_id: str) -> None:
         self.command_service.discard_confirmation(confirmation_id)
 
+    def owns_confirmation(self, confirmation_id: str) -> bool:
+        return confirmation_id in self.command_service.pending_confirmations
+
+    def grant_tool_for_session(
+        self,
+        session_id: str,
+        actor_id: str,
+        tool_name: str,
+    ) -> None:
+        self.tool_approval_service.grant_session(session_id, actor_id, tool_name)
+
+    def is_tool_granted(
+        self,
+        session_id: str,
+        actor_id: str,
+        tool_name: str,
+    ) -> bool:
+        return self.tool_approval_service.is_granted(session_id, actor_id, tool_name)
+
     async def _resolve_session_id(self, event: InteractionMessage) -> str:
         link = await self.registry.get_active_session(event.session_key)
         if link is not None:
@@ -528,6 +573,14 @@ def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:
         trusted["gateway.platform"] = platform.value
         trusted["platform"] = platform.value
     return trusted
+
+
+def _actor_id(event: InteractionMessage) -> str:
+    return str(
+        event.metadata.get("actor_id")
+        or event.session_key.display_name
+        or event.session_key.platform_session_id
+    )
 
 
 def _gateway_metadata(event: InteractionMessage) -> dict[str, str]:
