@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+from uuid import uuid4
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
+from app.application.policy_snapshot import IngressFacts
+from app.domain.policy import ExecutionMode
 from app.domain.schedule import PromptSafetyScanner, ScheduledTask, ScheduledTaskExecutionStatus
 
 SCHEDULED_EXECUTION_PROMPT = (
@@ -37,7 +41,19 @@ class ScheduledAgentExecutor:
                 ],
                 stream=False,
                 session_id=task.session_id,
-                options={"execution_context_mode": "unattended", "tool_exposure_policy": "safe_only"},
+                ingress_facts=IngressFacts(
+                    run_id=f"schedule-{uuid4()}",
+                    session_id=task.session_id,
+                    source="schedule",
+                    actor_id=None,
+                    execution_mode=ExecutionMode.UNATTENDED,
+                    trusted_claims={"execution_mode": ExecutionMode.UNATTENDED.value},
+                ),
+                # Schedule ingress facts: pass execution_mode as a structured
+                # trusted_metadata field (not a free options dict).  The
+                # ChatCompletionService derives tool_exposure_policy=safe_only
+                # from execution_mode=unattended.
+                trusted_metadata={"execution_mode": ExecutionMode.UNATTENDED.value},
             )
         )
         assert isinstance(result, ChatCompletionResult)

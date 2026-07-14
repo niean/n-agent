@@ -983,3 +983,99 @@ async def test_gateway_handle_message_destructive_slash_with_images_rejected_wit
 
     assert harness.command_service_pending_confirmations() == {}
     assert response.messages
+
+
+# ---------------------------------------------------------------------------
+# Spy tests: verify denials happen BEFORE any business write
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spy_forged_actor_confirmation_denies_before_writes():
+    """A different actor confirming must not trigger any SessionService/registry writes."""
+    harness = Harness()
+    key = message().session_key
+    await harness.registry.create_session_link(key, "session-1")
+    service = harness.service()
+    event = message("/delete")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    # Forge: a different actor tries to confirm
+    response = await service.handle_confirmation(
+        key,
+        "ou_forged",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert "只有命令发起者可以确认" in response.messages[0].content
+    # Spy: no business writes occurred
+    assert harness.session_service.created == []
+    assert harness.session_service.renamed == []
+    assert harness.session_service.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_spy_cross_session_confirmation_denies_before_writes():
+    """Confirmation from a different session_key must not trigger writes."""
+    harness = Harness()
+    await harness.registry.create_session_link(message().session_key, "session-1")
+    service = harness.service()
+    event = message("/delete")
+    event.metadata["actor_id"] = "ou_1"
+    pending = await service.handle_message(event)
+
+    # Cross-session: different session_key tries to confirm
+    other_key = GatewaySessionKey("cli", "other-session", display_name="Other")
+    response = await service.handle_confirmation(
+        other_key,
+        "ou_1",
+        pending.messages[0].metadata["confirmation"]["id"],
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert "确认已失效" in response.messages[0].content
+    # Spy: no business writes occurred
+    assert harness.session_service.created == []
+    assert harness.session_service.renamed == []
+    assert harness.session_service.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_spy_cross_origin_schedule_remove_denies_before_writes():
+    """Cross-origin schedule remove must not call schedule_service.delete."""
+    harness = Harness()
+    feishu_key = GatewaySessionKey(Platform.FEISHU, "oc_a", thread_id="")
+    await harness.registry.create_session_link(feishu_key, "session-1")
+    schedule = FakeScheduleService(
+        tasks={"sched-1": _schedule_task("sched-1", receive_id="oc_b")}
+    )
+    service = harness.service(schedule)
+    event = InteractionMessage(
+        id="evt-remove-spy",
+        session_key=feishu_key,
+        text="/schedule remove sched-1",
+        metadata={
+            "actor_id": "ou_x",
+            "receive_id": "oc_a",
+            "receive_id_type": "chat_id",
+            "thread_id": "",
+        },
+    )
+
+    pending = await service.handle_message(event)
+    confirmation_id = pending.messages[0].metadata["confirmation"]["id"]
+    response = await service.handle_confirmation(
+        feishu_key,
+        "ou_x",
+        confirmation_id,
+        GatewayConfirmationChoice.ONCE,
+    )
+
+    assert response.messages[0].content == "任务不存在"
+    # Spy: schedule_service.delete was not called
+    assert schedule.deleted_ids == []
+    # Spy: no session writes either
+    assert harness.session_service.created == []
+    assert harness.session_service.deleted == []

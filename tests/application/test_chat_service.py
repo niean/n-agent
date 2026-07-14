@@ -3,15 +3,25 @@ import pytest
 from app.application.agent_graph import AgentGraphRunner
 from app.application.chat_service import ChatCompletionInput, ChatCompletionService
 from app.application.events import ChatEventType
+from app.application.information_flow_service import InformationFlowService
+from app.application.policy_snapshot import (
+    InformationFlowPolicyConfig,
+    RunPolicySnapshot,
+    RunPolicySnapshotFactory,
+    SettingsPolicyProfileProvider,
+)
+from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.agent import AgentState
+from app.domain.information_flow import SecretCatalog
 from app.domain.provider import LLMResult, ModelInfo
 from app.domain.session import ConversationMessage, ConversationSession
 from app.domain.tool import RiskLevel, ToolDefinition, ToolExecutionContext
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.tools.builtin import build_builtin_tool_executor
+from app.config import Settings
 
 
 class FakeProvider:
@@ -110,6 +120,66 @@ async def test_chat_service_realtime_infers_confirm_context(tmp_path):
     )
 
     assert "tool_execution_context" in runner.options
+
+
+@pytest.mark.asyncio
+async def test_each_completion_gets_a_distinct_budget_run_id(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    request = ChatCompletionInput(
+        model="test",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=False,
+        session_id="shared-session",
+    )
+    await service.complete(request)
+    await service.complete(request)
+
+    first, second = runner.calls
+    first_ctx = first["options"]["tool_execution_context"]
+    second_ctx = second["options"]["tool_execution_context"]
+    assert first_ctx.run_id == first["state"].run_id
+    assert second_ctx.run_id == second["state"].run_id
+    assert first_ctx.run_id != second_ctx.run_id
+    assert first_ctx.run_id != "shared-session"
+
+
+@pytest.mark.asyncio
+async def test_production_snapshot_is_created_before_graph_and_consumed(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    settings = Settings(
+        agent_iteration_limit=4,
+        context_length=12345,
+        budget_max_tool_calls=7,
+    )
+    service = ChatCompletionService(
+        store,
+        runner,
+        SessionService(store),
+        policy_snapshot_factory=RunPolicySnapshotFactory(
+            SettingsPolicyProfileProvider(settings)
+        ),
+        session_bootstrap_reader=SessionBootstrapReader(store),
+    )
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="snapshot-session",
+        )
+    )
+
+    snapshot = runner.options["_policy_snapshot"]
+    assert isinstance(snapshot, RunPolicySnapshot)
+    assert snapshot.run_context.run_id == runner.calls[0]["state"].run_id
+    assert snapshot.turn.iteration_limit == 4
+    assert snapshot.context_config.context_length == 12345
+    assert snapshot.budget.max_tool_calls == 7
 
 
 @pytest.mark.asyncio
@@ -655,3 +725,150 @@ async def test_chat_service_no_force_for_unrelated_message(tmp_path):
 
     assert runner.calls
     assert "force_compress" not in runner.options
+
+
+# ---------------------------------------------------------------------------
+# S8: Non-stream final reply release tests
+# ---------------------------------------------------------------------------
+
+
+class _SecretResponseProvider:
+    """Provider that returns content containing a secret value."""
+
+    def __init__(self, content: str):
+        self._content = content
+
+    async def list_models(self):
+        return [ModelInfo("test", "test", "fake")]
+
+    async def supports_tools(self, model: str):
+        return True
+
+    async def chat(self, messages, tools, stream, model, options):
+        return LLMResult(
+            message={"role": "assistant", "content": self._content},
+            finish_reason="stop",
+        )
+
+
+def _build_service_with_secret(store, tmp_path, secret: str):
+    """Build a ChatCompletionService with an InformationFlowService that has a secret."""
+    info_svc = InformationFlowService(
+        InformationFlowPolicyConfig(redact_secrets=True),
+        SecretCatalog(secret_values=frozenset({secret})),
+    )
+    runner = AgentGraphRunner(
+        _SecretResponseProvider(f"the key is {secret} here"),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        information_flow_service=info_svc,
+    )
+    return ChatCompletionService(store, runner, SessionService(store), information_flow_service=info_svc)
+
+
+@pytest.mark.asyncio
+async def test_non_stream_reply_secret_redacted(tmp_path):
+    """Non-stream reply must have secret values redacted via release."""
+    secret = "sk-secret123"
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service_with_secret(store, tmp_path, secret)
+
+    result = await service.complete(
+        ChatCompletionInput(model="test", messages=[{"role": "user", "content": "hi"}], stream=False)
+    )
+    assert secret not in result.message["content"]
+    assert "[REDACTED]" in result.message["content"]
+
+
+@pytest.mark.asyncio
+async def test_non_stream_reply_deny_returns_stable_error(tmp_path):
+    """When release is denied (secret label + no transform), only stable error."""
+    secret = "sk-secret123"
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    info_svc = InformationFlowService(
+        InformationFlowPolicyConfig(redact_secrets=False),
+        SecretCatalog(secret_values=frozenset({secret})),
+    )
+    runner = AgentGraphRunner(
+        _SecretResponseProvider(f"the key is {secret} here"),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        information_flow_service=info_svc,
+    )
+    service = ChatCompletionService(store, runner, SessionService(store), information_flow_service=info_svc)
+
+    result = await service.complete(
+        ChatCompletionInput(model="test", messages=[{"role": "user", "content": "hi"}], stream=False)
+    )
+    assert result.finish_reason == "error"
+    assert result.message["content"] == "information_release_denied"
+    assert secret not in result.message["content"]
+
+
+@pytest.mark.asyncio
+async def test_non_stream_reply_no_secret_passes_through(tmp_path):
+    """Non-stream reply without secrets passes through unchanged."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service_with_secret(store, tmp_path, "sk-secret123")
+
+    # Use a provider that returns clean content
+    runner = AgentGraphRunner(
+        _SecretResponseProvider("hello world"),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        information_flow_service=InformationFlowService(
+            InformationFlowPolicyConfig(),
+            SecretCatalog(secret_values=frozenset({"sk-secret123"})),
+        ),
+    )
+    service = ChatCompletionService(
+        store, runner, SessionService(store),
+        information_flow_service=InformationFlowService(
+            InformationFlowPolicyConfig(),
+            SecretCatalog(secret_values=frozenset({"sk-secret123"})),
+        ),
+    )
+    result = await service.complete(
+        ChatCompletionInput(model="test", messages=[{"role": "user", "content": "hi"}], stream=False)
+    )
+    assert result.message["content"] == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_non_stream_error_message_also_released(tmp_path):
+    """Error messages must also go through release -- secrets in error text
+    must not leak to the client."""
+    secret = "sk-secret123"
+
+    class _ErrorProvider:
+        async def list_models(self):
+            return [ModelInfo("test", "test", "fake")]
+
+        async def supports_tools(self, model: str):
+            return True
+
+        async def chat(self, messages, tools, stream, model, options):
+            raise RuntimeError(f"provider failed with key={secret}")
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    info_svc = InformationFlowService(
+        InformationFlowPolicyConfig(redact_secrets=True),
+        SecretCatalog(secret_values=frozenset({secret})),
+    )
+    runner = AgentGraphRunner(
+        _ErrorProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        information_flow_service=info_svc,
+    )
+    service = ChatCompletionService(store, runner, SessionService(store), information_flow_service=info_svc)
+
+    result = await service.complete(
+        ChatCompletionInput(model="test", messages=[{"role": "user", "content": "hi"}], stream=False)
+    )
+    assert result.finish_reason == "error"
+    assert secret not in result.message["content"]

@@ -155,7 +155,9 @@ async def test_run_now_does_not_reclaim_running_lease(registry):
 
 
 @pytest.mark.asyncio
-async def test_skipped_missed_claim_fast_forwards_without_executable_work(registry):
+async def test_past_grace_claim_advances_next_run_without_skipped_flag(registry):
+    """Two-segment model: registry claims and advances next_run_at;
+    skipped_missed decision is post-claim (SchedulePolicy)."""
     now = datetime(2026, 6, 16, 1, 0, tzinfo=timezone.utc)
     await registry.create(_task(next_run_at=now - timedelta(hours=1)))
 
@@ -163,7 +165,7 @@ async def test_skipped_missed_claim_fast_forwards_without_executable_work(regist
     task = await registry.get("task-1")
 
     assert len(claims) == 1
-    assert claims[0].skipped_missed is True
+    assert claims[0].skipped_missed is False
     assert task is not None
     assert task.next_run_at > now
 
@@ -335,3 +337,96 @@ def test_origin_json_migration_is_idempotent_with_no_legacy_rows(tmp_path, caplo
         SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
 
     assert not any("source_type→platform" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# S4: Registry transaction atomicity tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_due_claims_only_one_succeeds(tmp_path):
+    """Two concurrent claim_due_tasks calls -> only 1 claim succeeds (CAS)."""
+    import asyncio
+
+    registry = SQLiteScheduledTaskRegistry(
+        tmp_path / "concurrent.db", CroniterScheduleCalculator(), missed_grace_seconds=300
+    )
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now))
+
+    results = await asyncio.gather(
+        registry.claim_due_tasks(now, limit=5, lease_seconds=900),
+        registry.claim_due_tasks(now, limit=5, lease_seconds=900),
+    )
+
+    total_claims = sum(len(r) for r in results)
+    assert total_claims == 1, "only one concurrent claim should succeed"
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_run_now_claims_only_one_succeeds(tmp_path):
+    """Two concurrent claim_task_for_run_now calls -> only 1 succeeds (CAS)."""
+    import asyncio
+
+    registry = SQLiteScheduledTaskRegistry(
+        tmp_path / "concurrent_rn.db", CroniterScheduleCalculator(), missed_grace_seconds=300
+    )
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now + timedelta(hours=1)))
+
+    results = await asyncio.gather(
+        registry.claim_task_for_run_now("task-1", now, lease_seconds=900),
+        registry.claim_task_for_run_now("task-1", now, lease_seconds=900),
+    )
+
+    claims = [r for r in results if r is not None]
+    assert len(claims) == 1, "only one concurrent run-now claim should succeed"
+
+
+@pytest.mark.asyncio
+async def test_claim_cas_checks_status_in_transaction(registry):
+    """Status check is in the CAS WHERE clause -- paused tasks are not claimed."""
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now))
+    await registry.update_status("task-1", ScheduledTaskStatus.PAUSED, enabled=False)
+
+    claims = await registry.claim_due_tasks(now, limit=5, lease_seconds=900)
+    assert claims == []
+
+
+@pytest.mark.asyncio
+async def test_claim_cas_checks_due_in_transaction(registry):
+    """Due check is in the CAS WHERE clause -- future tasks are not claimed."""
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now + timedelta(hours=1)))
+
+    claims = await registry.claim_due_tasks(now, limit=5, lease_seconds=900)
+    assert claims == []
+
+
+@pytest.mark.asyncio
+async def test_claim_cas_checks_lease_in_transaction(registry):
+    """Lease check is in the CAS WHERE clause -- leased tasks are not re-claimed."""
+    now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now))
+
+    first = await registry.claim_due_tasks(now, limit=5, lease_seconds=900)
+    second = await registry.claim_due_tasks(now, limit=5, lease_seconds=900)
+
+    assert len(first) == 1
+    assert second == []
+
+
+@pytest.mark.asyncio
+async def test_claim_does_not_set_last_status_skipped_missed(registry):
+    """Two-segment model: registry does not set last_status=SKIPPED_MISSED.
+    The missed decision is post-claim (SchedulePolicy)."""
+    now = datetime(2026, 6, 16, 1, 0, tzinfo=timezone.utc)
+    await registry.create(_task(next_run_at=now - timedelta(hours=1)))
+
+    await registry.claim_due_tasks(now, limit=5, lease_seconds=900)
+    task = await registry.get("task-1")
+
+    assert task is not None
+    assert task.last_status is not ScheduledTaskExecutionStatus.SKIPPED_MISSED

@@ -14,7 +14,7 @@
   // 尚未创建会话时，允许用户先勾选首轮要使用的外部记忆。
   let draftExternalMemoryConfig = null;
   // 用户是否在本会话中操作过外部记忆勾选；
-  // 仅当为 true 时才向 /v1/chat/completions 携带 options.external_memory_enabled，
+  // 仅当为 true 时才向 /chat/completions 携带 options.external_memory_enabled，
   // 未操作时不发送该字段，由后端按会话默认 profile 派生。
   let externalMemoryTouched = false;
   // 后端真实默认模型 id，启动时从 /chat/models 拉取；硬编码占位符会导致
@@ -502,7 +502,6 @@
       model: defaultModel || 'model',
       messages: [{ role: 'user', content }],
       stream: true,
-      metadata: { session_id: currentSessionId },
     };
     // 仅当用户在本会话中操作过外部记忆勾选时才携带 options.external_memory_enabled；
     // 未操作时不发送该字段，由后端按会话默认 profile 派生（builtin 默认关闭）。
@@ -548,9 +547,12 @@
     const streaming = appendMessage('assistant', '');
     setSending(true);
     try {
-      const res = await fetch('/v1/chat/completions', {
+      const res = await fetch('/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-ID': currentSessionId,
+        },
         body: JSON.stringify(buildChatRequestBody(text, sentImages)),
       });
       if (!res.ok) {

@@ -31,7 +31,7 @@ def test_domain_has_no_framework_or_infrastructure_imports():
 
 
 def test_policy_domain_modules_do_not_cross_domain_boundary():
-    for module in ("policy.py", "tool_policy.py"):
+    for module in ("policy.py", "tool_policy.py", "budget.py", "budget_policy.py", "gateway_policy.py", "memory_policy.py", "turn_policy.py", "sandbox_policy.py", "schedule_policy.py"):
         modules = imported_modules(ROOT / "app/domain" / module)
         forbidden = (
             "app.application",
@@ -46,6 +46,104 @@ def test_policy_domain_modules_do_not_cross_domain_boundary():
             if imported in forbidden or imported.startswith(forbidden)
         ]
         assert not violations, f"app/domain/{module} imports forbidden modules: {violations}"
+
+
+def test_context_policy_does_not_import_memory_or_tool_policy():
+    """T7: context_policy.py is pure Domain -- must not import memory_policy,
+    tool_policy, MemoryStore, pydantic, or Infrastructure."""
+    modules = imported_modules(ROOT / "app/domain" / "context_policy.py")
+    forbidden = (
+        "app.domain.memory_policy",
+        "app.domain.tool_policy",
+        "app.domain.memory",
+        "app.domain.tool",
+        "app.application",
+        "app.infrastructure",
+        "app.interfaces",
+        "pydantic",
+        "langgraph",
+        "fastapi",
+        "openai",
+    )
+    violations = [
+        imported
+        for imported in modules
+        if imported in forbidden or imported.startswith(forbidden)
+    ]
+    assert not violations, f"app/domain/context_policy.py imports forbidden modules: {violations}"
+
+
+def test_llm_policy_does_not_import_context_or_information_flow():
+    """T8: llm_policy.py is pure Domain -- must not import context_policy,
+    information_flow_policy, pydantic, or Infrastructure."""
+    modules = imported_modules(ROOT / "app/domain" / "llm_policy.py")
+    forbidden = (
+        "app.domain.context_policy",
+        "app.domain.context",
+        "app.domain.information_flow",
+        "app.domain.information_flow_policy",
+        "app.application",
+        "app.infrastructure",
+        "app.interfaces",
+        "pydantic",
+        "langgraph",
+        "fastapi",
+        "openai",
+    )
+    violations = [
+        imported
+        for imported in modules
+        if imported in forbidden or imported.startswith(forbidden)
+    ]
+    assert not violations, f"app/domain/llm_policy.py imports forbidden modules: {violations}"
+
+
+def test_turn_policy_pure_domain():
+    """T9: turn_policy.py is pure Domain -- no LangGraph, no asyncio, no
+    pydantic, no Infrastructure, no time calls. Only stdlib + app.domain."""
+    modules = imported_modules(ROOT / "app/domain" / "turn_policy.py")
+    forbidden = (
+        "app.application",
+        "app.infrastructure",
+        "app.interfaces",
+        "langgraph",
+        "acp",
+        "asyncio",
+        "pydantic",
+        "fastapi",
+        "openai",
+        "time",
+    )
+    violations = [
+        imported
+        for imported in modules
+        if imported in forbidden or imported.startswith(forbidden)
+    ]
+    assert not violations, f"app/domain/turn_policy.py imports forbidden modules: {violations}"
+
+
+def test_schedule_policy_pure_domain():
+    """T11: schedule_policy.py is pure Domain -- no sqlite, no pydantic,
+    no Infrastructure, no asyncio.  Only stdlib + app.domain."""
+    modules = imported_modules(ROOT / "app/domain" / "schedule_policy.py")
+    forbidden = (
+        "app.application",
+        "app.infrastructure",
+        "app.interfaces",
+        "langgraph",
+        "acp",
+        "asyncio",
+        "pydantic",
+        "fastapi",
+        "openai",
+        "sqlite3",
+    )
+    violations = [
+        imported
+        for imported in modules
+        if imported in forbidden or imported.startswith(forbidden)
+    ]
+    assert not violations, f"app/domain/schedule_policy.py imports forbidden modules: {violations}"
 
 
 def test_application_does_not_import_infrastructure():

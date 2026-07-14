@@ -10,6 +10,9 @@
     modal: null,
   };
 
+  // 当前弹框 backdrop 引用；弹框挂载到 document.body，接入全局 modal 管理与统一样式。
+  let modalBackdrop = null;
+
   function text(value, fallback) {
     if (value === null || value === undefined || value === '') return fallback || '-';
     return String(value);
@@ -43,23 +46,18 @@
     return node;
   }
 
+  function el(tag, className) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    return node;
+  }
+
   function button(label, className, onClick) {
     const node = document.createElement('button');
     node.type = 'button';
     node.className = className || 'btn';
     node.textContent = label;
     node.addEventListener('click', onClick);
-    return node;
-  }
-
-  // 新标签页打开的链接按钮，用于详情等需要独立 URL 的页面。
-  function linkButton(label, className, href) {
-    const node = document.createElement('a');
-    node.className = className || 'btn';
-    node.href = href;
-    node.target = '_blank';
-    node.rel = 'noopener';
-    node.textContent = label;
     return node;
   }
 
@@ -78,7 +76,7 @@
   }
 
   function getRoot() {
-    return document.getElementById('scheduled-tasks-list');
+    return document.getElementById('scheduled-tasks-list-view');
   }
 
   function showError(message) {
@@ -108,34 +106,31 @@
   }
 
   function render() {
-    const root = getRoot();
-    if (!root) return;
-    clear(root);
+    const listView = document.getElementById('scheduled-tasks-list-view');
+    const detailView = document.getElementById('scheduled-tasks-detail-view');
     if (state.view === 'detail') {
-      renderDetailPage(root);
-      renderModal(root);
+      if (listView) listView.hidden = true;
+      if (detailView) {
+        detailView.hidden = false;
+        clear(detailView);
+        renderDetailPage(detailView);
+      }
       return;
     }
-    root.appendChild(renderHeader());
-    if (state.error) appendText(root, 'div', state.error, 'error-state');
-    if (state.loading) {
-      appendText(root, 'div', '加载中...', 'loading-state');
-      renderModal(root);
-      return;
+    if (detailView) detailView.hidden = true;
+    if (listView) listView.hidden = false;
+    const statsRoot = document.getElementById('scheduled-tasks-stats');
+    const listRoot = document.getElementById('scheduled-tasks-list');
+    if (statsRoot) {
+      clear(statsRoot);
+      if (state.error) appendText(statsRoot, 'div', state.error, 'error-state');
+      else if (state.loading) appendText(statsRoot, 'div', '加载中...', 'loading-state');
+      else statsRoot.appendChild(renderStats());
     }
-    root.appendChild(renderStats());
-    root.appendChild(renderTable());
-    renderModal(root);
-  }
-
-  function renderHeader() {
-    const header = document.createElement('div');
-    header.className = 'scheduled-page-header';
-    const copy = document.createElement('div');
-    appendText(copy, 'h3', '任务');
-    appendText(copy, 'p', '管理 Dashboard 任务，并查看最近执行结果。', 'muted');
-    header.appendChild(copy);
-    return header;
+    if (listRoot) {
+      clear(listRoot);
+      if (!state.loading && !state.error) listRoot.appendChild(renderTable());
+    }
   }
 
   function renderStats() {
@@ -162,23 +157,11 @@
   }
 
   function renderTable() {
-    const panel = document.createElement('div');
-    panel.className = 'status-panel scheduled-table-panel';
-    const header = document.createElement('div');
-    header.className = 'panel-header';
-    appendText(header, 'span', '任务列表');
-    const actions = document.createElement('div');
-    actions.className = 'panel-actions';
-    actions.appendChild(button('新增', 'btn', () => openTaskForm()));
-    header.appendChild(actions);
-    panel.appendChild(header);
-
-    const body = document.createElement('div');
-    body.className = 'panel-body scheduled-table-wrap';
+    const wrap = document.createElement('div');
+    wrap.className = 'scheduled-table-wrap';
     if (!state.tasks.length) {
-      appendText(body, 'div', '暂无任务，点击“新增”开始。', 'empty-state');
-      panel.appendChild(body);
-      return panel;
+      appendText(wrap, 'div', '暂无任务，点击“新增”开始。', 'empty-state');
+      return wrap;
     }
 
     const table = document.createElement('table');
@@ -192,9 +175,8 @@
     const tbody = document.createElement('tbody');
     state.tasks.forEach((task) => tbody.appendChild(renderTaskRow(task)));
     table.appendChild(tbody);
-    body.appendChild(table);
-    panel.appendChild(body);
-    return panel;
+    wrap.appendChild(table);
+    return wrap;
   }
 
   function renderTaskRow(task) {
@@ -224,10 +206,10 @@
     const actions = document.createElement('div');
     actions.className = 'row-actions';
     actions.appendChild(button(task.status === 'paused' || task.enabled === false ? '启用' : '停用', 'btn', () => toggleTask(task)));
-    actions.appendChild(button('执行', 'btn', () => runTask(task)));
+    actions.appendChild(button('执行', 'btn', () => confirmRunTask(task)));
     actions.appendChild(button('编辑', 'btn', () => openTaskForm(task)));
     actions.appendChild(button('删除', 'btn', () => confirmDeleteTask(task)));
-    actions.appendChild(linkButton('详情', 'btn', `/scheduled-tasks/${encodeURIComponent(task.id)}`));
+    actions.appendChild(button('详情', 'btn', () => goToDetail(task.id)));
     actionCell.appendChild(actions);
     row.appendChild(actionCell);
     return row;
@@ -235,7 +217,7 @@
 
   function openTaskForm(task) {
     state.modal = { type: 'form', task: task || null, error: '' };
-    render();
+    showModal();
   }
 
   // 详情作为独立页面视图，URL 形如 /scheduled-tasks/{task_id}。
@@ -265,6 +247,15 @@
     render();
   }
 
+  // 本 Tab 内导航到任务详情：更新 URL 并切换视图，不新建标签页。
+  function goToDetail(id) {
+    const path = `/scheduled-tasks/${encodeURIComponent(id)}`;
+    if (window.location.pathname !== path) {
+      history.pushState({ tab: 'scheduled-tasks' }, '', path);
+    }
+    openTaskDetail(id);
+  }
+
   function pendingTaskIdFromPath() {
     const match = window.location.pathname.match(/^\/scheduled-tasks\/([^/]+)$/);
     if (!match) return null;
@@ -273,32 +264,49 @@
 
   function confirmDeleteTask(task) {
     state.modal = { type: 'delete', task, error: '' };
-    render();
+    showModal();
+  }
+
+  function confirmRunTask(task) {
+    state.modal = { type: 'run_confirm', task, error: '' };
+    showModal();
   }
 
   function closeModal() {
     state.modal = null;
-    render();
+    if (modalBackdrop) {
+      modalBackdrop.remove();
+      modalBackdrop = null;
+    }
   }
 
-  function renderModal(root) {
+  function showModal() {
     if (!state.modal) return;
-    const backdrop = document.createElement('div');
-    backdrop.className = 'modal-backdrop';
-    const dialog = document.createElement('div');
-    dialog.className = 'modal-dialog scheduled-modal';
+    if (modalBackdrop) modalBackdrop.remove();
+    const backdrop = el('div', 'modal-backdrop');
+    const dialog = el('section', 'modal-dialog');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
     if (state.modal.type === 'form') renderTaskForm(dialog);
-    if (state.modal.type === 'delete') renderDeleteConfirm(dialog);
-    if (state.modal.type === 'run_result') renderRunResult(dialog);
+    else if (state.modal.type === 'delete') renderDeleteConfirm(dialog);
+    else if (state.modal.type === 'run_confirm') renderRunConfirm(dialog);
     backdrop.appendChild(dialog);
-    root.appendChild(backdrop);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeModal();
+    });
+    document.body.appendChild(backdrop);
+    modalBackdrop = backdrop;
+    const closeBtn = dialog.querySelector('.modal-close');
+    if (closeBtn) requestAnimationFrame(() => closeBtn.focus());
   }
 
   function renderModalHeader(parent, title) {
     const header = document.createElement('div');
     header.className = 'modal-header';
     appendText(header, 'h4', title);
-    header.appendChild(button('×', 'modal-close', closeModal));
+    const closeBtn = button('×', 'modal-close', closeModal);
+    closeBtn.setAttribute('aria-label', '关闭');
+    header.appendChild(closeBtn);
     parent.appendChild(header);
   }
 
@@ -367,7 +375,7 @@
         await refresh();
       } catch (error) {
         state.modal.error = error.message || 'scheduled_task_save_failed';
-        render();
+        showModal();
       }
     });
 
@@ -404,22 +412,25 @@
     const wrapper = document.createElement('div');
     wrapper.className = 'scheduled-detail-page';
 
-    const header = document.createElement('div');
-    header.className = 'scheduled-page-header';
-    const copy = document.createElement('div');
-    appendText(copy, 'h3', '任务详情');
-    appendText(copy, 'p', '查看任务配置与最近执行历史。', 'muted');
-    header.appendChild(copy);
-
-    const actions = document.createElement('div');
-    actions.className = 'panel-actions';
-    actions.appendChild(button('← 返回列表', 'btn', backToList));
     const detail = state.detail || {};
-    if (detail.task) {
-      actions.appendChild(button('刷新', 'btn', () => openTaskDetail(detail.task.id)));
-      actions.appendChild(button('执行', 'btn', () => runTask(detail.task)));
-    }
-    header.appendChild(actions);
+    // 详情页头部对齐会话详情页样式：返回链接 + 任务标识导航条，不放置操作按钮。
+    const header = document.createElement('div');
+    header.className = 'scheduled-detail-header';
+    const back = document.createElement('a');
+    back.className = 'scheduled-detail-header__back';
+    back.href = '/scheduled-tasks';
+    back.textContent = '返回';
+    back.addEventListener('click', (event) => {
+      event.preventDefault();
+      backToList();
+    });
+    const sep = document.createElement('span');
+    sep.className = 'scheduled-detail-header__sep';
+    sep.textContent = '/';
+    const idLabel = document.createElement('span');
+    idLabel.className = 'scheduled-detail-header__id';
+    idLabel.textContent = detail.task ? text(detail.task.name, detail.task.id) : '加载中...';
+    header.append(back, sep, idLabel);
     wrapper.appendChild(header);
 
     if (!detail || detail.loading) {
@@ -536,7 +547,7 @@
         await refresh();
       } catch (error) {
         state.modal.error = error.message || 'scheduled_task_delete_failed';
-        render();
+        showModal();
       }
     });
     actions.append(cancelBtn, confirmBtn);
@@ -545,42 +556,27 @@
     requestAnimationFrame(() => cancelBtn.focus());
   }
 
-  const RUN_RESULT_MESSAGES = {
-    triggered: { title: '任务已触发', detail: '任务执行请求已受理，正在后台运行。可在执行历史中查看结果。', kind: 'info' },
-    not_claimed: { title: '任务正在运行', detail: '任务已被其他实例锁定或正在运行中，请稍后重试。', kind: 'warning' },
-  };
-
-  function renderRunResult(parent) {
-    const { task, result } = state.modal;
-    const status = String(result.status || '').toLowerCase();
-    const message = RUN_RESULT_MESSAGES[status] || { title: '任务已提交', detail: '任务执行请求已受理。', kind: 'info' };
+  function renderRunConfirm(parent) {
     const wrapper = document.createElement('div');
     wrapper.className = 'providers-form';
-    renderModalHeader(wrapper, message.title);
-    appendText(wrapper, 'p', `任务：${text(task.name, task.id)}`);
-    appendText(wrapper, 'p', message.detail);
+    renderModalHeader(wrapper, '执行任务');
+    if (state.modal.error) appendText(wrapper, 'div', state.modal.error, 'error-state');
+    appendText(wrapper, 'p', `确认立即执行“${text(state.modal.task.name, state.modal.task.id)}”？执行请求受理后，可在执行历史中查看结果。`);
     const actions = document.createElement('div');
     actions.className = 'providers-form__actions';
-    if (state.view === 'detail' && state.detail && state.detail.task && state.detail.task.id === task.id) {
-      // 已在详情页：关闭弹框并刷新本页执行历史
-      actions.appendChild(button('刷新执行历史', 'btn btn--primary', async () => {
-        closeModal();
-        await openTaskDetail(task.id);
-      }));
-    } else {
-      // 在列表页：新标签页打开任务详情
-      actions.appendChild(linkButton('查看执行历史', 'btn btn--primary', `/scheduled-tasks/${encodeURIComponent(task.id)}`));
-    }
-    actions.appendChild(button('关闭', 'btn', closeModal));
+    const cancelBtn = button('取消', 'btn', closeModal);
+    const confirmBtn = button('确认执行', 'btn btn--primary', () => runTask(state.modal.task));
+    actions.append(cancelBtn, confirmBtn);
     wrapper.appendChild(actions);
     parent.appendChild(wrapper);
+    requestAnimationFrame(() => cancelBtn.focus());
   }
 
+  // 确认执行：关闭确认弹框后触发执行，成功后刷新列表，失败在页内提示错误。
   async function runTask(task) {
+    closeModal();
     try {
-      const result = await api.runScheduledTask(task.id);
-      state.modal = { type: 'run_result', task, result: result || {} };
-      render();
+      await api.runScheduledTask(task.id);
       refresh();
     } catch (error) {
       showError(error.message || 'scheduled_task_run_failed');
@@ -599,6 +595,8 @@
 
   function init() {
     window.addEventListener('popstate', handlePathChange);
+    const newBtn = document.getElementById('scheduled-task-new');
+    if (newBtn) newBtn.addEventListener('click', () => openTaskForm());
     refresh().then(() => {
       const pendingId = pendingTaskIdFromPath();
       if (pendingId) openTaskDetail(pendingId);

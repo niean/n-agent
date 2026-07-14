@@ -2,16 +2,20 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
+from app.application.agent_graph import AgentGraphRunner
+from app.application.chat_service import ChatCompletionService
 from app.application.model_service import ModelService
 from app.application.provider_service import ProviderCreateInput, ProviderService, ProviderUpdateInput
 from app.application.schedule_service import ScheduledTaskNotFoundError, ScheduleValidationError
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
-from app.domain.provider import ModelInfo, ProviderConfig
+from app.domain.provider import LLMResult, ModelInfo, ProviderConfig
 from app.domain.session import ConversationMessage, ConversationSession, Summary, TaskState, ToolCall
 from app.domain.tool import ToolCallRequest, ToolExecutor, ToolResult, ToolResultStatus
+from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 from app.infrastructure.registry.sqlite_provider_registry import SQLiteProviderRegistry
+from app.infrastructure.tools.builtin import build_builtin_tool_executor
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 
 
@@ -140,9 +144,29 @@ class _FakeScheduleService:
 
 
 
-def _build_app(store, health=None, model_service=None, provider_service=None, schedule_service=None):
+class _ChatProvider:
+    """Minimal provider for dashboard chat tests."""
+    async def list_models(self):
+        return [ModelInfo("test-model", "test-model", "fake")]
+
+    async def supports_tools(self, model: str):
+        return True
+
+    async def chat(self, messages, tools, stream, model, options):
+        return LLMResult({"role": "assistant", "content": "hello"}, "stop")
+
+
+def _build_app(store, health=None, model_service=None, provider_service=None, schedule_service=None, chat_service=None):
     tool_service = ToolService(_StubExecutor(), builtin_tool_definitions())
     model_service = model_service or ModelService(_StubProvider(), "real-1")
+    if chat_service is None:
+        runner = AgentGraphRunner(
+            _ChatProvider(),
+            ToolService(_StubExecutor(), builtin_tool_definitions()),
+            store,
+            HeuristicSummarizer(),
+        )
+        chat_service = ChatCompletionService(store, runner, SessionService(store))
     app = FastAPI()
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.include_router(create_dashboard_router(
@@ -152,6 +176,8 @@ def _build_app(store, health=None, model_service=None, provider_service=None, sc
         health or _default_health,
         provider_service=provider_service,
         schedule_service=schedule_service,
+        memory_store=store,
+        chat_service=chat_service,
     ))
     return app
 
@@ -663,3 +689,149 @@ def test_chat_session_delete_returns_404_when_missing(tmp_path):
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "session_not_found"
+
+
+# ---------------------------------------------------------------------------
+# S6: Dashboard /chat/completions route tests
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_chat_completions_two_rounds_same_session(tmp_path):
+    """Create dashboard session -> /chat/completions two rounds -> detail returns same history."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store))
+
+    # Create a dashboard session first
+    create = client.post("/chat/sessions?session_id=dash-chat-1")
+    assert create.status_code == 200
+    assert create.json()["source"] == "dashboard"
+
+    # First round
+    r1 = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "dash-chat-1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "first"}]},
+    )
+    assert r1.status_code == 200
+
+    # Second round
+    r2 = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "dash-chat-1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "second"}]},
+    )
+    assert r2.status_code == 200
+
+    # Detail should return the same session history
+    detail = client.get("/chat/sessions/dash-chat-1").json()
+    messages = detail["messages"]
+    assert len(messages) >= 2
+    assert detail["session"]["source"] == "dashboard"
+
+
+def test_dashboard_chat_completions_no_session_header_returns_409(tmp_path):
+    """Dashboard /chat/completions without X-Session-ID returns 409."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store))
+
+    response = client.post(
+        "/chat/completions",
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "dashboard_session_scope_mismatch"
+
+
+def test_dashboard_chat_completions_nonexistent_session_returns_409(tmp_path):
+    """Dashboard /chat/completions with a non-existent session returns 409 (no implicit create)."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store))
+
+    response = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "does-not-exist"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "dashboard_session_scope_mismatch"
+
+
+def test_dashboard_chat_completions_api_session_returns_409(tmp_path):
+    """Dashboard selector cannot select an api session."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+    from app.domain.session import ConversationSession
+
+    asyncio.run(store.create_session(ConversationSession(id="api-1", source="api")))
+    client = TestClient(_build_app(store))
+
+    response = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "api-1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "dashboard_session_scope_mismatch"
+
+
+def test_dashboard_chat_completions_streaming(tmp_path):
+    """Dashboard /chat/completions streaming returns SSE."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store))
+
+    client.post("/chat/sessions?session_id=dash-stream-1")
+
+    with client.stream(
+        "POST",
+        "/chat/completions",
+        headers={"X-Session-ID": "dash-stream-1"},
+        json={"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    ) as response:
+        text = "".join(response.iter_text())
+
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "chat.completion.chunk" in text
+    assert "data: [DONE]" in text
+
+
+def test_api_selector_cannot_select_dashboard_session(tmp_path):
+    """API selector (OpenAI route) cannot select a dashboard session."""
+    from app.application.agent_graph import AgentGraphRunner
+    from app.application.chat_service import ChatCompletionService
+    from app.application.model_service import ModelService
+    from app.application.session_service import SessionService
+    from app.application.tool_service import ToolService, builtin_tool_definitions
+    from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+    from app.interfaces.http.openai_compatible import create_openai_compatible_router
+    from fastapi import FastAPI
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+    from app.domain.session import ConversationSession
+
+    asyncio.run(store.create_session(ConversationSession(id="dash-2", source="dashboard")))
+
+    runner = AgentGraphRunner(
+        _ChatProvider(),
+        ToolService(_StubExecutor(), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    chat = ChatCompletionService(store, runner, SessionService(store))
+    models = ModelService(_ChatProvider(), "test-model")
+    app = FastAPI()
+    app.include_router(create_openai_compatible_router(chat, models, store))
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "dash-2"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "api_session_scope_mismatch"

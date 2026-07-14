@@ -24,6 +24,7 @@ from app.domain.sandbox import (
     SandboxExecResult,
     SandboxStatus,
 )
+from app.infrastructure.sandbox._clamp import clamp_execution_request, clamp_timeout
 from app.infrastructure.sandbox.rpc_server import SandboxRpcServer
 from app.infrastructure.sandbox.stub_generator import generate_stub
 
@@ -61,15 +62,22 @@ class LocalSandbox(Sandbox):
         workspace_root: Path,
         max_stdout_bytes: int = 50000,
         max_stderr_bytes: int = 10000,
+        allowed_callbacks: frozenset[str] | None = None,
+        max_timeout: int | None = None,
     ) -> None:
         self.registry = registry
         self.workspace_root = workspace_root
         self.max_stdout_bytes = max_stdout_bytes
         self.max_stderr_bytes = max_stderr_bytes
+        self.allowed_callbacks = allowed_callbacks
+        self.max_timeout = max_timeout
         self.container_status = "local"
 
     async def execute(self, request: SandboxExecutionRequest) -> SandboxExecutionResult:
         start = datetime.now(timezone.utc)
+        # Second-layer validation: clamp request to grant-derived limits (defense-in-depth).
+        # Infrastructure MUST NOT self-escalate (no increasing timeout/quota beyond grant).
+        request = clamp_execution_request(request, self.max_timeout, self.allowed_callbacks)
         staging = request.scratch_dir
         staging.mkdir(parents=True, exist_ok=True)
         stub_path = staging / "nagent_tools.py"
@@ -186,7 +194,11 @@ class LocalSandbox(Sandbox):
         SandboxStatus.SUCCESS — the command ran, it just failed. Only
         timeout returns TIMEOUT; only spawn failures or nonexistent workdir
         return ERROR.
+
+        Second-layer validation: clamps timeout to grant-derived max (no
+        self-escalation).
         """
+        timeout_seconds = clamp_timeout(timeout_seconds, self.max_timeout)
         start = datetime.now(timezone.utc)
         try:
             proc = await asyncio.create_subprocess_exec(

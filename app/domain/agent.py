@@ -5,6 +5,8 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from app.domain.context_policy import ContextPlan
+
 
 class RunStatus(str, Enum):
     PENDING = "pending"
@@ -19,6 +21,9 @@ class EndReason(str, Enum):
     LENGTH = "length"
     ERROR = "error"
     ITERATION_LIMIT = "iteration_limit"
+    CANCELLED = "cancelled"
+    DEADLINE = "deadline"
+    BUDGET_EXHAUSTED = "budget_exhausted"
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,7 @@ class AgentRun:
 @dataclass
 class AgentState:
     session_id: str
+    run_id: str = field(default_factory=lambda: str(uuid4()))
     input_messages: list[dict[str, Any]] = field(default_factory=list)
     working_messages: list[dict[str, Any]] = field(default_factory=list)
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -49,3 +55,5 @@ class AgentState:
     run_options: dict[str, Any] = field(default_factory=dict)
     stream_tool_events: list[Any] = field(default_factory=list)
     context_message_ids: list[str] = field(default_factory=list)
+    context_plan: ContextPlan | None = None
+    budget_exhausted: bool = False

@@ -99,7 +99,7 @@ class _FakeSandboxManager:
     def acquire_session_lock(self, session_id: str) -> _TrackingLock:
         return self.lock
 
-    async def get_or_create(self, session_id: str) -> _FakeSandbox:
+    async def get_or_create(self, session_id: str, grant=None) -> _FakeSandbox:
         assert self.lock.held, "get_or_create called outside session lock"
         self.get_or_create_calls.append(session_id)
         if self.get_or_create_exc is not None:

@@ -12,20 +12,41 @@ from typing import Any, Optional
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 
+from app.application.budget_service import BudgetService
 from app.application.context_service import ContextService
 from app.application.events import ChatEvent, ChatEventType
 from app.application.external_memory_manager import ExternalMemoryManager
+from app.application.information_flow_service import InformationFlowService
+from app.application.policy_snapshot import (
+    BudgetPolicyConfig,
+    InformationFlowPolicyConfig,
+    RunPolicySnapshot,
+)
+from app.application.runtime_memory_service import RuntimeMemoryService
 from app.application.tool_service import (
     ToolExecutionEvaluation,
     ToolNotFoundError,
     ToolService,
 )
-from app.domain.agent import AgentState, RunStatus
+from app.domain.agent import AgentState, EndReason, RunStatus
+from app.domain.budget import (
+    BudgetActualUsage,
+    BudgetReserveKind,
+    BudgetReserveRequest,
+)
 from app.domain.context import ContextEngine
+from app.domain.information_flow import ReleaseTarget, SecretCatalog
+from app.domain.llm_policy import (
+    LLMConfig,
+    LLMPolicy,
+    ModelRequirements,
+    ProviderCapability,
+    ProviderConstraints,
+)
 from app.domain.memory import MemoryStore, Summarizer
-from app.domain.policy import PolicyOutcome
-from app.domain.provider import LLMEventType, LLMProvider, LLMResult, resolve_model
-from app.domain.session import ConversationMessage, TaskState, ToolCall
+from app.domain.policy import ExecutionMode, PolicyOutcome
+from app.domain.provider import LLMEventType, LLMProvider, LLMResult, ModelInfo, resolve_model
+from app.domain.session import TaskState, ToolCall
 from app.domain.tool import (
     ApprovalDecision,
     ApprovalRequest,
@@ -33,6 +54,12 @@ from app.domain.tool import (
     ToolExecutionContext,
     ToolResult,
     ToolResultStatus,
+)
+from app.domain.turn_policy import (
+    TurnDecision,
+    TurnEvaluationInput,
+    TurnNextStep,
+    TurnPolicy,
 )
 from app.utils.content_utils import extract_text, has_image_part
 from app.utils.memory_scrubber import scrub_memory_context
@@ -50,6 +77,21 @@ _INTERNAL_OPTION_KEYS = {
     "execution_context_mode",
     "external_memory_enabled",
     "stream_event_sink",
+    "_policy_snapshot",
+}
+
+
+# Mapping from Domain EndReason to OpenAI-compatible finish_reason strings.
+# Used by finalize to set state.finish_reason from TurnPolicy's end_reason.
+_END_REASON_TO_FINISH_REASON: dict[EndReason, str] = {
+    EndReason.STOP: "stop",
+    EndReason.ERROR: "error",
+    EndReason.ITERATION_LIMIT: "length",
+    EndReason.LENGTH: "length",
+    EndReason.CANCELLED: "error",
+    EndReason.DEADLINE: "length",
+    EndReason.BUDGET_EXHAUSTED: "length",
+    EndReason.TOOL_CALLS: "tool_calls",
 }
 
 
@@ -61,22 +103,43 @@ class AgentGraphRunner:
         memory_store: MemoryStore,
         summarizer: Summarizer,
         iteration_limit: int = 10,
+        turn_timeout_seconds: float = 900.0,
         external_memory_manager: ExternalMemoryManager | None = None,
         vision_capability: Optional[Callable[[], bool]] = None,
         context_engine: ContextEngine | None = None,
         context_service: ContextService | None = None,
         usage_service: Any = None,
         skill_service: Any = None,
+        information_flow_service: InformationFlowService | None = None,
+        runtime_memory_service: RuntimeMemoryService | None = None,
+        budget_service: BudgetService | None = None,
+        llm_policy: LLMPolicy | None = None,
+        llm_config: LLMConfig | None = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
         self.memory_store = memory_store
         self.summarizer = summarizer
         self.iteration_limit = iteration_limit
+        self._turn_timeout_seconds = turn_timeout_seconds
+        self._turn_policy = TurnPolicy()
+        self._run_start_times: dict[str, float] = {}
         self.external_memory_manager = external_memory_manager
         self.vision_capability = vision_capability
         self.usage_service = usage_service
         self.skill_service = skill_service
+        self._information_flow_service = information_flow_service or InformationFlowService(
+            InformationFlowPolicyConfig(),
+            SecretCatalog(),
+        )
+        self._runtime_memory = runtime_memory_service or RuntimeMemoryService(
+            memory_store,
+            external_memory_manager=external_memory_manager,
+        )
+        self._budget_service = budget_service or BudgetService(BudgetPolicyConfig())
+        self._llm_policy = llm_policy or LLMPolicy()
+        self._llm_config = llm_config or LLMConfig()
+        self._model_cache: list[ModelInfo] | None = None
         self.context_service = context_service or ContextService(
             memory_store,
             tool_service=tool_service,
@@ -85,6 +148,7 @@ class AgentGraphRunner:
             usage_service=usage_service,
             skill_service=skill_service,
             is_cancelled=self.is_cancelled,
+            runtime_memory_service=self._runtime_memory,
         )
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
@@ -138,8 +202,61 @@ class AgentGraphRunner:
 
     async def run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
         state.run_options = dict(options or {})
-        result = await self.graph.ainvoke(state, {"configurable": {"model": model, "options": state.run_options}})
-        return AgentState(**result) if isinstance(result, dict) else result
+        snapshot = self._policy_snapshot(state)
+        self._budget_service.open(
+            state.run_id,
+            snapshot.budget if snapshot is not None else None,
+        )
+        self._run_start_times[state.run_id] = time.monotonic()
+        try:
+            result = await self.graph.ainvoke(state, {"configurable": {"model": model, "options": state.run_options}})
+            return AgentState(**result) if isinstance(result, dict) else result
+        except asyncio.CancelledError:
+            # Close Budget account on cancel (release unsettled reservations)
+            await self._budget_service.close(state.run_id)
+            raise
+        finally:
+            self._run_start_times.pop(state.run_id, None)
+
+    def _build_turn_input(self, state: AgentState) -> TurnEvaluationInput:
+        """Build TurnEvaluationInput from AgentState + runtime facts.
+
+        Supplies elapsed_seconds from the runner's monotonic clock (NOT
+        from Domain). TurnPolicy receives facts as input, never calls
+        time.now() itself.
+        """
+        start = self._run_start_times.get(state.run_id)
+        elapsed = (time.monotonic() - start) if start else 0.0
+        snapshot = self._policy_snapshot(state)
+        turn_config = snapshot.turn if snapshot is not None else None
+        return TurnEvaluationInput(
+            final_message=state.final_message,
+            error=state.error,
+            pending_tool_calls=state.pending_tool_calls,
+            iteration_count=state.iteration_count,
+            cancelled=self.is_cancelled(state.session_id),
+            elapsed_seconds=elapsed,
+            turn_timeout_seconds=(
+                turn_config.turn_timeout_seconds
+                if turn_config is not None
+                else self._turn_timeout_seconds
+            ),
+            iteration_limit=(
+                turn_config.iteration_limit
+                if turn_config is not None
+                else self.iteration_limit
+            ),
+            budget_exhausted=state.budget_exhausted,
+        )
+
+    @staticmethod
+    def _policy_snapshot(state: AgentState) -> RunPolicySnapshot | None:
+        snapshot = state.run_options.get("_policy_snapshot")
+        return snapshot if isinstance(snapshot, RunPolicySnapshot) else None
+
+    def _evaluate_turn(self, state: AgentState) -> TurnDecision:
+        """Run TurnPolicy on the current state. Single decision point."""
+        return self._turn_policy.evaluate(self._build_turn_input(state))
 
     async def compress_session(self, session_id: str) -> dict[str, Any]:
         """Force compress a session's context without LLM call.
@@ -185,6 +302,7 @@ class AgentGraphRunner:
         from app.utils.memory_scrubber import StreamingContextScrubber
         yield ChatEvent(ChatEventType.MESSAGE_START)
         scrubber = StreamingContextScrubber()
+        stream_guard = self._information_flow_service.create_stream_guard()
         stream_options = dict(options or {})
         tool_event_queue: asyncio.Queue[ChatEvent] = asyncio.Queue()
 
@@ -212,21 +330,51 @@ class AgentGraphRunner:
                 run_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await run_task
+            # Close Budget account on any exit (cancel or normal).
+            # finalize already closes on terminal; this is a safety net
+            # for cancel/interrupt. Idempotent -- safe to call twice.
+            await self._budget_service.close(state.run_id)
             self.clear_run(state.session_id)
         if result is not None:
             if result.error:
-                yield ChatEvent(ChatEventType.ERROR, error=result.error, finish_reason="error")
+                # T9: Use result.finish_reason (set by TurnPolicy/finalize) for
+                # consistent finish_reason between stream and non-stream paths.
+                yield ChatEvent(ChatEventType.ERROR, error=result.error, finish_reason=result.finish_reason or "error")
+                yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason=result.finish_reason or "error")
             elif result.final_message:
                 content = str(result.final_message.get("content") or "")
                 if content:
-                    # scrub each chunk in streaming
+                    # scrub each chunk: first memory-context tags, then secret values
                     for chunk in self._split_content_for_streaming(content):
                         scrubbed = scrubber.feed(chunk)
                         if scrubbed:
-                            yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed)
+                            try:
+                                safe = stream_guard.feed(scrubbed)
+                                if safe:
+                                    yield ChatEvent(ChatEventType.CONTENT_DELTA, content=safe)
+                            except Exception:
+                                yield ChatEvent(ChatEventType.ERROR, error="information_release_denied", finish_reason="error")
+                                yield ChatEvent(ChatEventType.DONE)
+                                return
                     scrubbed_final = scrubber.flush()
                     if scrubbed_final:
-                        yield ChatEvent(ChatEventType.CONTENT_DELTA, content=scrubbed_final)
+                        try:
+                            safe = stream_guard.feed(scrubbed_final)
+                            if safe:
+                                yield ChatEvent(ChatEventType.CONTENT_DELTA, content=safe)
+                        except Exception:
+                            yield ChatEvent(ChatEventType.ERROR, error="information_release_denied", finish_reason="error")
+                            yield ChatEvent(ChatEventType.DONE)
+                            return
+                    # flush stream guard lookbehind buffer
+                    try:
+                        guard_final = stream_guard.flush()
+                        if guard_final:
+                            yield ChatEvent(ChatEventType.CONTENT_DELTA, content=guard_final)
+                    except Exception:
+                        yield ChatEvent(ChatEventType.ERROR, error="information_release_denied", finish_reason="error")
+                        yield ChatEvent(ChatEventType.DONE)
+                        return
                 yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason=result.finish_reason or "stop")
         yield ChatEvent(ChatEventType.DONE)
 
@@ -270,26 +418,158 @@ class AgentGraphRunner:
                 return "user"
         return "user"
 
+    def _build_provider_capabilities(
+        self,
+        model_infos: list[ModelInfo] | None = None,
+    ) -> tuple[ProviderCapability, ...]:
+        """Build LLM-owned ProviderCapability snapshot from the active provider.
+
+        Reads ``current_config`` (ProviderConfig) when available (ActiveProviderHolder).
+        Falls back to ``default_model`` attr for raw providers (test doubles,
+        OpenAICompatibleProvider used directly).
+
+        ``supports_tools`` is projected from ``ModelInfo.supports_tools`` when
+        a matching model is found in ``model_infos``; defaults to True when
+        no model info is available.
+        """
+        config = getattr(self.llm_provider, "current_config", None)
+        if config is not None:
+            supports_vision = getattr(config, "supports_vision", False)
+            if self.vision_capability is not None:
+                supports_vision = self.vision_capability()
+            model_id = getattr(config, "model", "")
+            supports_tools = True
+            if model_infos:
+                for mi in model_infos:
+                    if mi.id == model_id:
+                        supports_tools = mi.supports_tools
+                        break
+            return (
+                ProviderCapability(
+                    provider_id=getattr(config, "id", "default"),
+                    model_id=model_id,
+                    supports_tools=supports_tools,
+                    supports_vision=supports_vision,
+                ),
+            )
+        # Fallback for raw providers (test doubles)
+        supports_vision = False
+        if self.vision_capability is not None:
+            supports_vision = self.vision_capability()
+        default_model = getattr(self.llm_provider, "default_model", None) or ""
+        supports_tools = True
+        if model_infos:
+            for mi in model_infos:
+                if mi.id == default_model:
+                    supports_tools = mi.supports_tools
+                    break
+        return (
+            ProviderCapability(
+                provider_id="default",
+                model_id=default_model,
+                supports_tools=supports_tools,
+                supports_vision=supports_vision,
+            ),
+        )
+
+    def _build_model_requirements(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        state: AgentState,
+    ) -> ModelRequirements:
+        """Project ContextPlan + message content into LLM-owned ModelRequirements.
+
+        - ``tools`` capability: tools list is non-empty.
+        - ``vision`` capability: any user message has an image part.
+        - ``context_window`` capability: token_need > 0 (from ContextPlan).
+        - ``token_need``: from ContextPlan.token_allocation.total.
+        """
+        caps: set[str] = set()
+        if tools:
+            caps.add("tools")
+        for msg in messages:
+            if msg.get("role") == "user" and has_image_part(msg.get("content")):
+                caps.add("vision")
+                break
+        token_need = 0
+        plan = state.context_plan
+        if plan is not None and plan.token_allocation is not None:
+            token_need = plan.token_allocation.total
+            if token_need > 0:
+                caps.add("context_window")
+        return ModelRequirements(
+            capabilities=frozenset(caps),
+            token_need=token_need,
+        )
+
     async def call_llm(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
         if self.is_cancelled(state.session_id):
             raise asyncio.CancelledError()
-        if state.iteration_count >= self.iteration_limit:
-            state.error = "iteration limit reached"
-            state.finish_reason = "length"
-            return state
         configurable = (config or {}).get("configurable", {})
         model = configurable.get("model", "")
         options = configurable.get("options") or state.run_options
         call_start = time.monotonic()
         try:
-            # ----- vision preflight: 不支持 vision 时返回友好消息，不调用 provider -----
-            if (
-                state.working_messages
-                and self.vision_capability is not None
-                and not self.vision_capability()
-            ):
-                last_msg = state.working_messages[-1]
-                if last_msg.get("role") == "user" and has_image_part(last_msg.get("content")):
+            # 1. Build provider context (messages + tools)
+            provider_context = self.context_service.build_provider_context(state, options)
+            working_messages_for_call = provider_context.messages
+            tools = provider_context.tools
+
+            # Serialize request early -- reused for InformationFlow release,
+            # payload logging, and usage retention.
+            request_json_cache = json.dumps(working_messages_for_call, default=str, ensure_ascii=False)
+
+            # 2. InformationFlow release to LLM_PROVIDER
+            # If denied (e.g. secret content with redaction disabled), provider.chat
+            # is NOT called (0 calls).  Return a stable error.
+            llm_release = self._information_flow_service.release(
+                request_json_cache, ReleaseTarget.LLM_PROVIDER, origin="llm_request",
+            )
+            if not llm_release.allowed:
+                state.error = "information_release_denied"
+                state.finish_reason = "error"
+                return state
+
+            # When the release applied a redaction transform, use the REDACTED
+            # messages for provider.chat so secrets do not reach the provider.
+            if llm_release.decision.transform == "redaction":
+                working_messages_for_call = self._information_flow_service.redact_structured(
+                    working_messages_for_call
+                )
+                # Re-serialize so logging and usage retention also use redacted content.
+                request_json_cache = json.dumps(
+                    working_messages_for_call, default=str, ensure_ascii=False,
+                )
+
+            # 3. ModelSelection via LLMPolicy
+            # LLMPolicy checks placeholder resolution, tool/vision/context-window
+            # capabilities, and ProviderConstraints (from InformationFlow decision).
+            if self._model_cache is None:
+                try:
+                    self._model_cache = await self.llm_provider.list_models()
+                except Exception:
+                    self._model_cache = []
+            provider_caps = self._build_provider_capabilities(self._model_cache)
+            requirements = self._build_model_requirements(
+                working_messages_for_call, tools, state,
+            )
+            active_provider_id = provider_caps[0].provider_id if provider_caps else ""
+            constraints = ProviderConstraints(
+                allowed_provider_ids=frozenset({active_provider_id}),
+            )
+            snapshot = self._policy_snapshot(state)
+            llm_config = (
+                LLMConfig(fallback_enabled=snapshot.llm.fallback_enabled)
+                if snapshot is not None
+                else self._llm_config
+            )
+            selection = self._llm_policy.evaluate(
+                model, provider_caps, requirements, constraints, llm_config,
+            )
+            if selection.verdict is PolicyOutcome.DENY:
+                # Vision unsupported -> friendly final reply (NOT 500)
+                if selection.reason == "vision_capability_not_supported":
                     state.iteration_count += 1
                     state.final_message = {
                         "role": "assistant",
@@ -298,38 +578,77 @@ class AgentGraphRunner:
                     state.finish_reason = "stop"
                     state.pending_tool_calls = []
                     return state
+                # Other capability deny -> error
+                state.error = selection.reason
+                state.finish_reason = "error"
+                return state
 
-            provider_context = self.context_service.build_provider_context(state, options)
-            working_messages_for_call = provider_context.messages
-            tools = provider_context.tools
+            selected_model = selection.model_id or model
 
-            result = await self.llm_provider.chat(
-                working_messages_for_call,
-                tools,
-                False,
-                model,
-                options,
+            # 4. Budget reserve (fail-closed: if denied, provider.chat NOT called)
+            # Use a rough chars/4 token estimate (matching the codebase's ~4
+            # chars/token convention) so max_token_cost has rough enforcement
+            # at reserve time.  The settle step adjusts to actual usage.
+            estimated_tokens = len(request_json_cache) // 4
+            reservation = await self._budget_service.reserve(
+                state.run_id,
+                BudgetReserveRequest(
+                    kind=BudgetReserveKind.LLM_CALL,
+                    estimated_tokens=estimated_tokens,
+                ),
             )
+            if reservation.outcome is PolicyOutcome.DENY:
+                # T9: Set budget_exhausted flag; TurnPolicy will route to
+                # finalize with BUDGET_EXHAUSTED. Finalize creates the
+                # user-facing message.
+                state.budget_exhausted = True
+                state.pending_tool_calls = []
+                return state
+
+            # 5. provider.chat (Provider Adapter = pure protocol conversion)
+            try:
+                result = await self.llm_provider.chat(
+                    working_messages_for_call,
+                    tools,
+                    False,
+                    selected_model,
+                    options,
+                )
+            except Exception:
+                # Release budget reservation on provider failure
+                await self._budget_service.release(state.run_id, reservation)
+                raise
+
             if not isinstance(result, LLMResult):
+                await self._budget_service.release(state.run_id, reservation)
                 state.error = "streaming provider result is not supported inside graph"
                 state.finish_reason = "error"
                 return state
-            # capture request JSON before working_messages is mutated below
-            request_json_cache = json.dumps(working_messages_for_call, default=str, ensure_ascii=False)
+
+            # 6. Budget settle (conservative: unknown usage keeps estimate)
+            actual_token_cost = None
+            if result.usage:
+                total = result.usage.get("total_tokens")
+                if isinstance(total, int):
+                    actual_token_cost = total
+            await self._budget_service.settle(
+                state.run_id,
+                reservation,
+                BudgetActualUsage(token_cost=actual_token_cost),
+            )
+
+            # 7. Process result (T6/T7 preserved)
             tools_json_cache = json.dumps(tools, default=str, ensure_ascii=False) if tools else None
             gen_params = {k: v for k, v in options.items() if k not in _INTERNAL_OPTION_KEYS} if isinstance(options, dict) else {}
             gen_params_json_cache = json.dumps(gen_params, default=str, ensure_ascii=False) if gen_params else None
             state.iteration_count += 1
             state.final_message = result.message
 
-            # ----- 新增：立即清理 final_message 内容，防止持久化脏数据 -----
-            # 如果模型回显 <memory-context>，这里清理后再 append 到 state.working_messages
-            # 保证 SQLite/summary 永远不会收到脏内容
+            # ----- scrub memory context from final_message (T6) -----
             if self.external_memory_manager and state.final_message:
                 content = state.final_message.get("content", "")
                 if isinstance(content, str):
                     state.final_message["content"] = scrub_memory_context(content)
-            # ----- 结束新增 -----
 
             state.finish_reason = result.finish_reason
             state.pending_tool_calls = result.message.get("tool_calls") or []
@@ -337,31 +656,41 @@ class AgentGraphRunner:
                 state.assistant_tool_messages.append(result.message)
             state.working_messages.append(result.message)
 
-            # ----- 应用日志：完整打印 LLM 调用的输入、输出 -----
-            # 与 usage recording 解耦：即使 usage_service 为 None 或 result.usage
-            # 为空，也输出输入/输出日志，便于排查 LLM 行为。复用已计算的 json cache
-            # 避免重复序列化。response 在 scrub_memory_context 之后打印，保证日志
-            # 内容与持久化一致。
+            # ----- T3: InformationFlow payload logging -----
             response_json_cache = json.dumps(result.message, default=str, ensure_ascii=False)
-            logger.info(
-                "LLM request: session=%s model=%s request=%s",
-                state.session_id, model, request_json_cache,
+            log_req = self._information_flow_service.release(
+                request_json_cache, ReleaseTarget.LLM_PAYLOAD_LOG, origin="llm_request",
             )
-            logger.info(
-                "LLM response: session=%s model=%s response=%s",
-                state.session_id, model, response_json_cache,
+            log_resp = self._information_flow_service.release(
+                response_json_cache, ReleaseTarget.LLM_PAYLOAD_LOG, origin="llm_response",
             )
+            if log_req.allowed and log_req.content is not None:
+                logger.info(
+                    "LLM request: session=%s model=%s request=%s",
+                    state.session_id, selected_model, log_req.content,
+                )
+            if log_resp.allowed and log_resp.content is not None:
+                logger.info(
+                    "LLM response: session=%s model=%s response=%s",
+                    state.session_id, selected_model, log_resp.content,
+                )
 
-            # ----- usage recording (T6) -----
-            # Record only when usage_service is wired AND provider returned a
-            # non-empty usage dict. provider_kind/provider/model are derived
-            # from llm_provider.current_config when available (ActiveProviderHolder);
-            # otherwise we fall back to the local `model` param and "openai"
-            # provider_kind (covers raw OpenAICompatibleProvider / test fakes).
+            # ----- T3: usage recording -----
             if self.usage_service is not None and result.usage:
                 latency_ms = int((time.monotonic() - call_start) * 1000)
                 provider_kind, provider_name, real_model, requested_model = self._resolve_usage_meta(model)
                 trigger_type = self._resolve_trigger_type(state)
+                usage_req = self._information_flow_service.release(
+                    request_json_cache, ReleaseTarget.USAGE_RETENTION, origin="llm_request",
+                )
+                usage_resp = self._information_flow_service.release(
+                    response_json_cache, ReleaseTarget.USAGE_RETENTION, origin="llm_response",
+                )
+                usage_tools_result = None
+                if tools_json_cache:
+                    usage_tools_result = self._information_flow_service.release(
+                        tools_json_cache, ReleaseTarget.USAGE_RETENTION, origin="llm_tools",
+                    )
                 try:
                     await self.usage_service.record_call(
                         session_id=state.session_id,
@@ -372,9 +701,9 @@ class AgentGraphRunner:
                         provider_kind=provider_kind,
                         requested_model=requested_model,
                         trigger_type=trigger_type,
-                        request_messages=request_json_cache,
-                        response_message=response_json_cache,
-                        tools=tools_json_cache,
+                        request_messages=usage_req.content if usage_req.allowed else None,
+                        response_message=usage_resp.content if usage_resp.allowed else None,
+                        tools=usage_tools_result.content if (usage_tools_result and usage_tools_result.allowed) else None,
                         generation_params=gen_params_json_cache,
                     )
                 except Exception:
@@ -500,7 +829,7 @@ class AgentGraphRunner:
                     "content": json.dumps(result_payload),
                 }
             )
-            await self.memory_store.save_tool_call(
+            await self._runtime_memory.save_tool_call_if_allowed(
                 ToolCall(
                     id=result.tool_call_id,
                     session_id=state.session_id,
@@ -585,10 +914,30 @@ class AgentGraphRunner:
         sink = (options or {}).get("stream_event_sink")
         if not callable(sink):
             return
+        # Structured redaction of tool call arguments before publishing
+        event = self._redact_tool_event(event)
         result = sink(event)
         if isawaitable(result):
             await result
         await asyncio.sleep(0.001)
+
+    def _redact_tool_event(self, event: ChatEvent) -> ChatEvent:
+        """Apply structured redaction to tool call arguments in stream events."""
+        if not event.tool_call:
+            return event
+        tool_call = dict(event.tool_call)
+        if "arguments" in tool_call:
+            tool_call["arguments"] = self._information_flow_service.redact_structured(
+                tool_call["arguments"]
+            )
+        return ChatEvent(
+            type=event.type,
+            content=event.content,
+            tool_call=tool_call,
+            finish_reason=event.finish_reason,
+            error=event.error,
+            metadata=event.metadata,
+        )
 
     async def update_memory(self, state: AgentState) -> AgentState:
         if self.is_cancelled(state.session_id):
@@ -601,23 +950,19 @@ class AgentGraphRunner:
             tool_calls = assistant_message.get("tool_calls") or []
             if tool_calls:
                 content = {"content": content, "tool_calls": tool_calls}
-            await self.memory_store.append_message(
-                state.session_id,
-                ConversationMessage(role="assistant", content=content),
+            await self._runtime_memory.append_assistant_message(
+                state.session_id, content,
             )
         state.assistant_tool_messages = []
         for result in state.tool_results:
-            await self.memory_store.append_message(
+            await self._runtime_memory.append_tool_message(
                 state.session_id,
-                ConversationMessage(
-                    role="tool",
-                    content=json.dumps(result),
-                    tool_call_id=result.get("tool_call_id"),
-                    name=result.get("name"),
-                ),
+                json.dumps(result),
+                tool_call_id=result.get("tool_call_id"),
+                name=result.get("name"),
             )
         state.tool_results = []
-        await self.memory_store.save_task_state(
+        await self._runtime_memory.save_task_state_if_allowed(
             TaskState(
                 session_id=state.session_id,
                 status="failed" if state.error else "running",
@@ -644,9 +989,50 @@ class AgentGraphRunner:
         return extract_text(final_message.get("content", ""))
 
     async def finalize(self, state: AgentState) -> AgentState:
-        if not state.error and not state.final_message and state.iteration_count >= self.iteration_limit:
-            state.error = "iteration limit reached"
-            state.finish_reason = "length"
+        # T9: TurnPolicy confirms terminal + end_reason
+        decision = self._evaluate_turn(state)
+        if decision.terminal and decision.end_reason is not None:
+            end_reason = decision.end_reason
+            if end_reason == EndReason.ITERATION_LIMIT and not state.error:
+                state.error = "iteration limit reached"
+                state.finish_reason = _END_REASON_TO_FINISH_REASON[end_reason]
+                # Clear final_message (LLM result with tool_calls) so the
+                # error message is created for the user. The LLM result was
+                # already saved by update_memory if we went through "memory".
+                state.final_message = None
+            elif end_reason == EndReason.BUDGET_EXHAUSTED and not state.error:
+                state.finish_reason = _END_REASON_TO_FINISH_REASON[end_reason]
+                if not state.final_message:
+                    state.final_message = {
+                        "role": "assistant",
+                        "content": "已达到用量上限，请稍后重试或联系管理员。",
+                    }
+            elif end_reason == EndReason.DEADLINE and not state.error:
+                state.error = "turn timeout exceeded"
+                state.finish_reason = _END_REASON_TO_FINISH_REASON[end_reason]
+                # Edge case: if deadline is hit after a successful LLM call
+                # (LLM returned tool_calls) but before the next iteration,
+                # routing goes directly to finalize (skipping update_memory).
+                # The LLM response was appended to working_messages in
+                # call_llm but is NOT persisted via update_memory -> response
+                # lost from the store. This is an acceptable edge case for T9.
+                # TODO: future graceful handling could route through memory
+                # before finalize for DEADLINE (like ITERATION_LIMIT does).
+                state.final_message = None
+            elif end_reason == EndReason.CANCELLED:
+                # Set state.error so run_status = FAILED (not COMPLETED) and
+                # the error-message creation path produces a user-facing message.
+                state.error = state.error or "cancelled"
+                state.finish_reason = _END_REASON_TO_FINISH_REASON[end_reason]
+            elif end_reason == EndReason.ERROR:
+                state.finish_reason = state.finish_reason or "error"
+            elif end_reason == EndReason.STOP:
+                state.finish_reason = state.finish_reason or "stop"
+        else:
+            # Non-terminal at finalize (shouldn't happen): treat as stop
+            if not state.finish_reason:
+                state.finish_reason = "stop"
+
         state.run_status = RunStatus.FAILED if state.error else RunStatus.COMPLETED
         if state.error and not state.final_message:
             state.final_message = {"role": "assistant", "content": _error_message_for_user(state)}
@@ -654,12 +1040,11 @@ class AgentGraphRunner:
             content = state.final_message.get("content", "")
             if isinstance(content, str):
                 state.final_message["content"] = scrub_memory_context(content)
-            await self.memory_store.append_message(
-                state.session_id,
-                ConversationMessage(role="assistant", content=state.final_message["content"]),
+            await self._runtime_memory.append_assistant_message(
+                state.session_id, state.final_message["content"],
             )
 
-        # ----- 新增：外部记忆同步 -----
+        # ----- 外部记忆同步 -----
         # call_llm 已经清理过 final_message，这里同步的是干净内容
         if self.external_memory_manager and state.final_message:
             user_content = self._extract_user_content(state.input_messages)
@@ -670,15 +1055,22 @@ class AgentGraphRunner:
             if tool_ctx is not None and isinstance(tool_ctx, ToolExecutionContext):
                 agent_context = tool_ctx.trusted_metadata.get("agent_context", "unattended")
                 enabled_override = tool_ctx.enabled_override
-            self.external_memory_manager.sync_all(
+            # Derive execution_mode from run options for policy evaluation
+            mode_str = state.run_options.get("execution_context_mode") or "realtime"
+            try:
+                execution_mode = ExecutionMode(mode_str)
+            except ValueError:
+                execution_mode = ExecutionMode.REALTIME
+            await self._runtime_memory.sync_external_if_allowed(
                 user_content, assistant_content,
                 session_id=state.session_id,
                 agent_context=agent_context,
+                execution_mode=execution_mode,
                 enabled_override=enabled_override,
             )
         # ----- 结束新增 -----
 
-        await self.memory_store.save_task_state(
+        await self._runtime_memory.save_task_state_if_allowed(
             TaskState(
                 session_id=state.session_id,
                 status=state.run_status.value,
@@ -686,19 +1078,40 @@ class AgentGraphRunner:
                 last_error=state.error,
             )
         )
+
+        # T9: Close Budget account on terminal (release unsettled reservations)
+        await self._budget_service.close(state.run_id)
+
         return state
 
     def _after_llm(self, state: AgentState) -> str:
-        if state.error:
-            return "finalize"
-        if state.pending_tool_calls:
+        """Route after call_llm using TurnPolicy.
+
+        Maps TurnDecision to graph node names:
+        - EXECUTE_TOOLS -> "tools"
+        - terminal STOP (final_message, no tools) -> "memory" (save, then finalize)
+        - terminal ITERATION_LIMIT -> "memory" (save intermediate, then finalize)
+        - terminal ERROR/CANCELLED/DEADLINE/BUDGET_EXHAUSTED -> "finalize"
+        - non-terminal continue -> "memory" (saves any assistant message)
+        """
+        decision = self._evaluate_turn(state)
+        if decision.next_step is TurnNextStep.EXECUTE_TOOLS:
             return "tools"
+        if decision.terminal:
+            if decision.end_reason in (EndReason.STOP, EndReason.ITERATION_LIMIT):
+                # Save final_message / intermediate via memory before finalize
+                return "memory"
+            # Error/cancel/deadline/budget: go directly to finalize
+            return "finalize"
         return "memory"
 
     def _after_memory(self, state: AgentState) -> str:
-        if state.error or state.final_message:
-            return "finalize"
-        if state.iteration_count >= self.iteration_limit:
+        """Route after update_memory using TurnPolicy.
+
+        Terminal decisions go to finalize; non-terminal continue to call_llm.
+        """
+        decision = self._evaluate_turn(state)
+        if decision.terminal:
             return "finalize"
         return "continue"
 

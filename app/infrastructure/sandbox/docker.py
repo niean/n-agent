@@ -32,6 +32,7 @@ from app.domain.sandbox import (
     SandboxExecResult,
     SandboxStatus,
 )
+from app.infrastructure.sandbox._clamp import clamp_execution_request, clamp_timeout
 from app.infrastructure.sandbox.rpc_server import SandboxRpcServer
 from app.infrastructure.sandbox.stub_generator import generate_stub
 
@@ -65,6 +66,9 @@ class DockerSandbox(Sandbox):
         host_scratch_root: Path | None = None,
         max_stdout_bytes: int = 50000,
         max_stderr_bytes: int = 10000,
+        pids_limit: int = 256,
+        allowed_callbacks: frozenset[str] | None = None,
+        max_timeout: int | None = None,
     ) -> None:
         self.registry = registry
         self.workspace_root = workspace_root
@@ -77,6 +81,9 @@ class DockerSandbox(Sandbox):
         self.host_scratch_root = host_scratch_root or workspace_root
         self.max_stdout_bytes = max_stdout_bytes
         self.max_stderr_bytes = max_stderr_bytes
+        self.pids_limit = pids_limit
+        self.allowed_callbacks = allowed_callbacks
+        self.max_timeout = max_timeout
         self.container_status: str | None = None  # None = not running
 
     def is_available(self) -> bool:
@@ -115,7 +122,7 @@ class DockerSandbox(Sandbox):
             "--name", self.session_container_name,
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
-            "--pids-limit", "256",
+            "--pids-limit", str(self.pids_limit),
             "--memory", f"{self.memory_mb}m",
             "--cpus", str(self.cpus),
             "--tmpfs", "/tmp:rw,nosuid,size=512m",
@@ -135,6 +142,9 @@ class DockerSandbox(Sandbox):
 
     async def execute(self, request: SandboxExecutionRequest) -> SandboxExecutionResult:
         start = datetime.now(timezone.utc)
+        # Second-layer validation: clamp request to grant-derived limits (defense-in-depth).
+        # Infrastructure MUST NOT self-escalate (no increasing timeout/quota beyond grant).
+        request = clamp_execution_request(request, self.max_timeout, self.allowed_callbacks)
         staging = request.scratch_dir
         staging.mkdir(parents=True, exist_ok=True)
         # staging.name is "call-<uuid>" set by SandboxManager.new_call_staging;
@@ -272,7 +282,11 @@ class DockerSandbox(Sandbox):
         Status semantics (shell): a non-zero returncode still maps to
         SandboxStatus.SUCCESS — the command ran, it just failed. Only timeout
         returns TIMEOUT; only spawn/write errors return ERROR.
+
+        Second-layer validation: clamps timeout to grant-derived max (no
+        self-escalation).
         """
+        timeout_seconds = clamp_timeout(timeout_seconds, self.max_timeout)
         start = datetime.now(timezone.utc)
         # S6: ensure container first; let exceptions propagate to executor
         # so it can uniformly map them to "sandbox unavailable".

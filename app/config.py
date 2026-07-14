@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -102,6 +103,33 @@ class Settings(BaseSettings):
     context_compression_protect_first_n: int = Field(default=3, ge=0)
     context_compression_protect_last_n: int = Field(default=10, ge=0)
     context_compression_cooldown_seconds: int = Field(default=300, ge=0)
+
+    # Policy 治理配置
+    # Turn
+    agent_turn_timeout_seconds: int = Field(default=900, gt=0)
+    # LLM
+    llm_fallback_enabled: bool = Field(default=False)
+    # Memory
+    memory_cross_session_read_enabled: bool = Field(default=False)
+    memory_unattended_write_enabled: bool = Field(default=False)
+    # Budget
+    budget_max_wall_seconds: int = Field(default=900, gt=0)
+    budget_max_llm_calls: int = Field(default=10, gt=0)
+    budget_max_tool_calls: int = Field(default=100, gt=0)
+    budget_max_token_cost: int | None = Field(default=None, ge=0)
+    budget_max_usd_cost: Decimal | None = Field(default=None, ge=0)
+    # Budget -- Sandbox 累计配额
+    budget_max_sandbox_seconds: float | None = Field(default=None, ge=0)
+    budget_max_sandbox_cpu_seconds: float | None = Field(default=None, ge=0)
+    budget_max_sandbox_memory_mb_seconds: float | None = Field(default=None, ge=0)
+    budget_max_sandbox_callback_calls: int | None = Field(default=None, ge=0)
+    # Gateway
+    gateway_confirmation_ttl_seconds: int = Field(default=900, gt=0)
+    gateway_require_actor_for_managed_actions: bool = Field(default=True)
+    # InformationFlow
+    information_log_llm_payloads: bool = Field(default=False)
+    information_store_usage_payloads: bool = Field(default=True)
+    information_redact_secrets: bool = Field(default=True)
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 

@@ -13,6 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
 from app.application.events import ChatEvent, ChatEventType
 from app.application.model_service import ModelService
+from app.application.policy_snapshot import IngressFacts
+from app.application.session_bootstrap import SessionBootstrapReader, SessionScopeMismatchError
+from app.domain.memory import MemoryStore
+from app.domain.policy import ExecutionMode
 from app.domain.provider import resolve_model
 from app.utils.content_utils import has_image_part, normalize_content
 
@@ -45,8 +49,13 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-def create_openai_compatible_router(chat_service: ChatCompletionService, model_service: ModelService) -> APIRouter:
+def create_openai_compatible_router(
+    chat_service: ChatCompletionService,
+    model_service: ModelService,
+    memory_store: MemoryStore | None = None,
+) -> APIRouter:
     router = APIRouter()
+    bootstrap_reader = SessionBootstrapReader(memory_store) if memory_store is not None else None
 
     @router.get("/health")
     async def health():
@@ -70,6 +79,34 @@ def create_openai_compatible_router(chat_service: ChatCompletionService, model_s
 
     @router.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest, x_session_id: str | None = Header(default=None)):
+        # Resolve session_id from X-Session-ID header only (bearer selector).
+        # metadata.session_id is intentionally NOT promoted to session selection.
+        if x_session_id:
+            descriptor = None
+            if bootstrap_reader is not None:
+                try:
+                    descriptor = await bootstrap_reader.describe(x_session_id, expected_source="api")
+                except SessionScopeMismatchError:
+                    return JSONResponse(
+                        status_code=409,
+                        content={"error": {"code": "api_session_scope_mismatch", "message": "session scope mismatch: expected api"}},
+                    )
+            resolved_session_id = x_session_id
+        else:
+            resolved_session_id = f"api-{uuid4()}"
+            descriptor = None
+
+        # Build IngressFacts (verified entry facts; body metadata is NOT promoted)
+        # T12: IngressFacts will be passed to RunPolicySnapshotFactory
+        ingress = IngressFacts(
+            run_id=str(uuid4()),
+            session_id=resolved_session_id,
+            source="api",
+            actor_id=None,
+            execution_mode=ExecutionMode.REALTIME,
+            trusted_claims={},
+        )
+
         resolved_model = resolve_model(request.model, model_service.default_model)
         normalized_messages: list[dict[str, Any]] = []
         for message in request.messages:
@@ -98,7 +135,9 @@ def create_openai_compatible_router(chat_service: ChatCompletionService, model_s
             stream=request.stream,
             metadata=request.metadata,
             options=_merge_generation_params(request),
-            session_id=x_session_id,
+            session_id=resolved_session_id,
+            ingress_facts=ingress,
+            session_descriptor=descriptor,
         )
         result = await chat_service.complete(app_input)
         if request.stream:
@@ -170,7 +209,7 @@ def _chunk_for_event(event: ChatEvent, model: str) -> dict[str, Any]:
         delta["tool_calls"] = [event.tool_call]
     elif event.type is ChatEventType.ERROR:
         delta["content"] = event.error or "error"
-        finish_reason = "error"
+        finish_reason = event.finish_reason or "error"
     elif event.type is ChatEventType.MESSAGE_DONE:
         finish_reason = event.finish_reason or "stop"
     return {

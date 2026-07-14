@@ -21,6 +21,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.domain.sandbox import ActiveSandboxInfo, ReleasedSandboxInfo, Sandbox
+from app.domain.sandbox_policy import SandboxExecutionGrant
 from app.infrastructure.sandbox.docker import DockerSandbox
 from app.infrastructure.sandbox.local import LocalSandbox
 
@@ -123,7 +124,9 @@ class SandboxManager:
             return f"/scratch/{safe}"
         return str(host_session_scratch)
 
-    async def get_or_create(self, session_id: str) -> Sandbox:
+    async def get_or_create(
+        self, session_id: str, grant: SandboxExecutionGrant | None = None,
+    ) -> Sandbox:
         if session_id in self._releasing:
             raise RuntimeError(f"session {session_id} is being released")
         if session_id in self._sandboxes:
@@ -133,25 +136,58 @@ class SandboxManager:
         session_scratch = self.scratch_root / safe
         session_scratch.mkdir(parents=True, exist_ok=True)
         if self.sandbox_type == "docker":
+            if grant is not None:
+                network = grant.network
+                cpus = grant.resources.cpus
+                memory_mb = grant.resources.memory_mb
+                max_stdout = grant.resources.max_stdout_bytes
+                max_stderr = grant.resources.max_stderr_bytes
+                pids_limit = grant.resources.pids
+                allowed_callbacks = grant.callbacks
+                max_timeout = grant.resources.timeout_seconds
+            else:
+                network = self.settings.sandbox_docker_network
+                cpus = self.settings.sandbox_docker_cpus
+                memory_mb = self.settings.sandbox_docker_memory_mb
+                max_stdout = self.settings.sandbox_max_stdout_bytes
+                max_stderr = self.settings.sandbox_max_stderr_bytes
+                pids_limit = 256
+                allowed_callbacks = None
+                max_timeout = None
             sandbox = DockerSandbox(
                 registry=self.callback_registry,
                 workspace_root=self.workspace_root,
                 image=self.settings.sandbox_docker_image,
-                cpus=self.settings.sandbox_docker_cpus,
-                memory_mb=self.settings.sandbox_docker_memory_mb,
+                cpus=cpus,
+                memory_mb=memory_mb,
                 session_container_name=f"nagent-sandbox-{safe}-{uuid4().hex[:8]}",
-                network=self.settings.sandbox_docker_network,
+                network=network,
                 host_workspace_root=self.host_workspace_root,
                 host_scratch_root=self.host_scratch_root,
-                max_stdout_bytes=self.settings.sandbox_max_stdout_bytes,
-                max_stderr_bytes=self.settings.sandbox_max_stderr_bytes,
+                max_stdout_bytes=max_stdout,
+                max_stderr_bytes=max_stderr,
+                pids_limit=pids_limit,
+                allowed_callbacks=allowed_callbacks,
+                max_timeout=max_timeout,
             )
         else:
+            if grant is not None:
+                max_stdout = grant.resources.max_stdout_bytes
+                max_stderr = grant.resources.max_stderr_bytes
+                allowed_callbacks = grant.callbacks
+                max_timeout = grant.resources.timeout_seconds
+            else:
+                max_stdout = self.settings.sandbox_max_stdout_bytes
+                max_stderr = self.settings.sandbox_max_stderr_bytes
+                allowed_callbacks = None
+                max_timeout = None
             sandbox = LocalSandbox(
                 registry=self.callback_registry,
                 workspace_root=self.workspace_root,
-                max_stdout_bytes=self.settings.sandbox_max_stdout_bytes,
-                max_stderr_bytes=self.settings.sandbox_max_stderr_bytes,
+                max_stdout_bytes=max_stdout,
+                max_stderr_bytes=max_stderr,
+                allowed_callbacks=allowed_callbacks,
+                max_timeout=max_timeout,
             )
         self._sandboxes[session_id] = sandbox
         self._scratch_roots[session_id] = session_scratch

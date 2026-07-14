@@ -83,6 +83,8 @@
   const getPlatform = (platform) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}`);
   const listPlatformSessions = (platform, limit, offset) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}/sessions?limit=${encodeURIComponent(limit || 20)}&offset=${encodeURIComponent(offset || 0)}`);
 
+  const listPolicies = () => fetchJson('/chat/policies');
+
   const listMcpSites = () => fetchJson('/chat/mcp/sites');
   const probeMcpSite = (payload) => fetchJson('/chat/mcp/sites/probe', {
     method: 'POST',
@@ -227,6 +229,7 @@
     listPlatforms,
     getPlatform,
     listPlatformSessions,
+    listPolicies,
     listMcpSites,
     probeMcpSite,
     createMcpSite,

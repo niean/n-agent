@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import json
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+from uuid import uuid4
 
-from fastapi import APIRouter, Body
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import APIRouter, Body, Header
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
+from app.application.events import ChatEvent, ChatEventType
 from app.application.knowledge_service import (
     KnowledgeBaseCreateInput,
     KnowledgeBaseUpdateInput,
@@ -14,6 +20,7 @@ from app.application.knowledge_service import (
 )
 from app.application.mcp_service import McpService, McpSiteInput
 from app.application.model_service import ModelService
+from app.application.policy_snapshot import IngressFacts
 from app.application.provider_service import (
     ProviderCreateInput,
     ProviderService,
@@ -29,6 +36,7 @@ from app.application.schedule_service import (
     ScheduleServiceError,
     ScheduleValidationError,
 )
+from app.application.session_bootstrap import SessionBootstrapReader, SessionScopeMismatchError
 from app.application.session_service import SessionService
 from app.application.skill_service import SkillInput, SkillScanReport, SkillScanWarning, SkillService
 from app.application.tool_service import ToolService
@@ -40,6 +48,7 @@ from app.domain.knowledge import (
     KnowledgeBaseValidationError,
     KnowledgeProbeError,
 )
+from app.domain.memory import MemoryStore
 from app.domain.mcp import McpProbeError, McpSite, McpSiteNotFoundError, McpSiteValidationError, McpTool, McpTransportType
 from app.domain.provider import (
     DuplicateProviderError,
@@ -49,6 +58,7 @@ from app.domain.provider import (
     ProviderNotFoundError,
     ProviderValidationError,
 )
+from app.domain.policy import ExecutionMode
 from app.domain.session import (
     ConversationMessage,
     ConversationSession,
@@ -95,6 +105,8 @@ def create_dashboard_router(
     plugin_service=None,
     usage_service=None,
     memory_store=None,
+    chat_service: ChatCompletionService | None = None,
+    policy_dashboard_service=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -119,6 +131,7 @@ def create_dashboard_router(
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
     @router.get("/scheduled-tasks/{task_id}", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
+    @router.get("/security", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
@@ -172,6 +185,76 @@ def create_dashboard_router(
     @router.get("/chat/tools")
     async def list_tools():
         return [_tool_definition_to_dict(definition) for definition in tool_service.list_definitions()]
+
+    if chat_service is not None and memory_store is not None:
+        _dashboard_bootstrap = SessionBootstrapReader(memory_store)
+
+        @router.post("/chat/completions")
+        async def dashboard_chat_completions(
+            payload: dict = Body(...),
+            x_session_id: str | None = Header(default=None),
+        ):
+            # Dashboard /chat/completions requires an existing source=dashboard session.
+            # No implicit create -- new sessions must be created via /chat/sessions first.
+            if not x_session_id:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {"code": "dashboard_session_scope_mismatch", "message": "X-Session-ID required for dashboard chat"}},
+                )
+            try:
+                descriptor = await _dashboard_bootstrap.describe(x_session_id, expected_source="dashboard")
+            except SessionScopeMismatchError:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {"code": "dashboard_session_scope_mismatch", "message": "session scope mismatch: expected dashboard"}},
+                )
+            if not descriptor.exists:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {"code": "dashboard_session_scope_mismatch", "message": "session does not exist; create via /chat/sessions first"}},
+                )
+
+            # Build IngressFacts (verified entry facts; body metadata is NOT promoted)
+            # T12: IngressFacts will be passed to RunPolicySnapshotFactory
+            ingress = IngressFacts(
+                run_id=str(uuid4()),
+                session_id=x_session_id,
+                source="dashboard",
+                actor_id=None,
+                execution_mode=ExecutionMode.REALTIME,
+                trusted_claims={},
+            )
+
+            resolved_model = payload.get("model") or model_service.default_model
+            stream = payload.get("stream", True)
+            messages = payload.get("messages", [])
+            metadata = payload.get("metadata", {})
+            options = payload.get("options", {})
+
+            app_input = ChatCompletionInput(
+                model=resolved_model,
+                messages=messages,
+                stream=stream,
+                metadata=metadata,
+                options=options,
+                session_id=x_session_id,
+                ingress_facts=ingress,
+                session_descriptor=descriptor,
+            )
+            result = await chat_service.complete(app_input)
+            if stream:
+                return StreamingResponse(
+                    _dashboard_sse(result),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                )
+            assert isinstance(result, ChatCompletionResult)
+            if result.finish_reason == "error":
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": {"message": result.message.get("content", "provider failure"), "type": "server_error"}},
+                )
+            return _dashboard_completion_response(result)
 
     @router.get("/chat/models")
     async def list_admin_models():
@@ -376,6 +459,10 @@ def create_dashboard_router(
 
     if external_memory_provider_service is not None:
         _register_external_memory_provider_routes(router, external_memory_provider_service)
+
+    if policy_dashboard_service is not None:
+        from app.interfaces.http.policy_routes import register_policy_routes
+        register_policy_routes(router, policy_dashboard_service)
 
     return router
 
@@ -1270,4 +1357,53 @@ def _model_info_to_dict(info: ModelInfo, default_model: str) -> dict:
         "supports_tools": info.supports_tools,
         "supports_streaming": info.supports_streaming,
         "is_default": info.id == default_model,
+    }
+
+
+async def _dashboard_sse(events: AsyncIterator[ChatEvent]) -> AsyncIterator[str]:
+    async for event in events:
+        if event.type is ChatEventType.DONE:
+            yield "data: [DONE]\n\n"
+            continue
+        chunk = _dashboard_chunk_for_event(event)
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+def _dashboard_chunk_for_event(event: ChatEvent) -> dict[str, Any]:
+    delta: dict[str, Any] = {}
+    finish_reason = None
+    if event.type is ChatEventType.MESSAGE_START:
+        delta["role"] = "assistant"
+    elif event.type is ChatEventType.CONTENT_DELTA:
+        delta["content"] = event.content
+    elif event.type is ChatEventType.TOOL_CALL_DELTA:
+        delta["tool_calls"] = [event.tool_call]
+    elif event.type is ChatEventType.ERROR:
+        delta["content"] = event.error or "error"
+        finish_reason = "error"
+    elif event.type is ChatEventType.MESSAGE_DONE:
+        finish_reason = event.finish_reason or "stop"
+    return {
+        "id": f"chatcmpl-{uuid4()}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": "N-Agent",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+def _dashboard_completion_response(result: ChatCompletionResult) -> dict[str, Any]:
+    return {
+        "id": f"chatcmpl-{uuid4()}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "N-Agent",
+        "choices": [
+            {
+                "index": 0,
+                "message": result.message,
+                "finish_reason": result.finish_reason,
+            }
+        ],
+        "usage": result.usage,
     }

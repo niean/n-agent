@@ -138,7 +138,6 @@ sequenceDiagram
     end
     opt 存在 final_message
       Graph->>External: sync_all(user, assistant)
-      Note right of External: agent_context != primary 时 no-op
     end
     Graph->>Memory: save_task_state(completed / failed)
   end
@@ -514,7 +513,9 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | Usage/Observation | 值对象 | CanonicalUsage / UsageCost / PricingEntry | Token 归一化、成本和模型定价 |
 | Usage/Observation | 值对象 | SessionUsageStats / ContextBreakdown / UsageRecord / CompressionStat | 会话累计、上下文构成、调用和压缩记录 |
 | Usage/Observation | 端口 | UsageRecorder / PricingProvider / ContextBreakdownCalculator | 用量持久化、定价查询和上下文分类边界 |
-| Shared Kernel | 共享协议 | Policy / PolicyOutcome / PolicyDecision | 各领域策略共用的评估协议和决策语言 |
+| Shared Kernel | 共享协议 | Policy / PolicyOutcome / PolicyDecision / PolicyAuditEvent / PolicyAuditSink / ExecutionMode / PolicyDecisionKind | 各领域策略共用的评估协议、决策语言和审计通道 |
+| Policy Mesh | 领域策略 | TurnPolicy / ContextPolicy / LLMPolicy / ToolPolicy / MemoryPolicy / SandboxPolicy / GatewayPolicy / SchedulePolicy / BudgetPolicy / InformationFlowPolicy | 10 个独立领域 Policy，各自治理一个维度，不跨域导入 |
+| Policy Mesh | 值对象 | BudgetReservationDecision / InformationReleaseDecision / MemoryAccessDecision / SandboxExecutionGrant | 领域 Policy 的 typed decision |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 
@@ -556,11 +557,30 @@ LLM tool_calls
 
 各类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Tool` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
 
-## Policy Shared Kernel 与 ToolPolicy
+## Policy Shared Kernel 与 Policy Mesh
 
-公共 Policy 不是独立全局核心子域，也没有中央 PolicyService。`app/domain/policy.py` 只提供 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`，让各领域策略共享决策语言。
+公共 Policy 不是独立全局核心子域，也没有中央 PolicyService。`app/domain/policy.py` 提供 Shared Kernel：`Policy` Protocol、`PolicyOutcome`（allow/deny/require_approval）、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink` Protocol、`ExecutionMode`、`PolicyDecisionKind`（admission/plan/selection/allocation）、`RunPolicyContext`。
 
-当前真实实现是 Tool Domain 的 `ToolPolicy`：它根据 `ToolDefinition`、`ToolCallRequest`、`ToolExecutionContext` 决定暴露、允许、拒绝或要求审批。`ToolService` 强制执行这些决策；`AgentGraphRunner` 只通过 `ApprovalDecider` 编排交互审批，批准后仍回到 `ToolService` 授权并执行。
+Policy Mesh 由 10 个独立领域 Policy 组成，每个治理一个维度，不跨域导入：
+
+| Policy | 文件 | 治理维度 | Domain 决策类型 |
+|--------|------|---------|----------------|
+| TurnPolicy | `turn_policy.py` | 迭代上限、结束原因 | PolicyDecision |
+| ContextPolicy | `context_policy.py` | 压缩阈值与保护段 | PolicyDecision |
+| LLMPolicy | `llm_policy.py` | fallback、vision preflight | PolicyDecision |
+| ToolPolicy | `tool_policy.py` | 定义校验、暴露、执行审批 | PolicyDecision |
+| MemoryPolicy | `memory_policy.py` | 读写/跨会话/外部记忆门控 | MemoryAccessDecision |
+| SandboxPolicy | `sandbox_policy.py` | CPU/内存/时间/callback | SandboxExecutionGrant |
+| GatewayPolicy | `gateway_policy.py` | 出站目标与内容 | PolicyDecision |
+| SchedulePolicy | `schedule_policy.py` | cron安全/claim/投递 | PolicyDecision |
+| BudgetPolicy | `budget_policy.py` | LLM/Tool/Sandbox 配额 | BudgetReservationDecision / BudgetSettleDecision / BudgetReleaseDecision |
+| InformationFlowPolicy | `information_flow_policy.py` | 密级/释放目标/脱敏 | InformationReleaseDecision |
+
+Application 层封口执行：`ToolService.execute`（ToolPolicy + Budget + InformationFlow）、`ModelService.call_llm`（LLMPolicy + Budget）、`RuntimeMemoryService`（MemoryPolicy）、`SandboxToolExecutor`（SandboxPolicy + Budget）、`GatewayService`（GatewayPolicy）、`ScheduleRunService`（SchedulePolicy）、`ContextService`（ContextPolicy）、`AgentGraphRunner`（TurnPolicy）。
+
+`RunPolicySnapshot`（`app/application/policy_snapshot.py`）是不可变 frozen dataclass，携带 10 个 typed config + IngressFacts。审计通道 `PolicyAuditService` 委托 `PolicyAuditSink`，`PolicyAuditEvent` 无敏感字段。
+
+`ToolPolicy` 仍是 Tool Domain 的具体策略：根据 `ToolDefinition`、`ToolCallRequest`、`ToolExecutionContext` 决定暴露、允许、拒绝或要求审批。`ToolService` 强制执行这些决策；`AgentGraphRunner` 只通过 `ApprovalDecider` 编排交互审批，批准后仍回到 `ToolService` 授权并执行。
 
 ## 外部边界
 
@@ -573,7 +593,7 @@ LLM tool_calls
 - 用例编排、Prompt、LangGraph Runtime 放 Application。
 - FastAPI、Dashboard、OpenAI-compatible 协议适配放 Interfaces。
 - SQLite、HTTP Client、具体工具 handler、Provider Adapter 放 Infrastructure。
-- 跨领域只复用 Policy 决策语言；具体规则归对应领域的 `XPolicy`，当前仅登记真实存在的 `ToolPolicy`。
+- 跨领域只复用 Policy 决策语言（Shared Kernel）；具体规则归对应领域的 `XPolicy`，当前有 10 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy），Policy 间不跨域导入。
 - 新增外部能力时先定义端口，再实现 Infrastructure Adapter。
 
 ## 概念

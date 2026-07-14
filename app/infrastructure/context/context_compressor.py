@@ -134,6 +134,10 @@ class ContextCompressor(ContextEngine):
     def _record_compression_success(self) -> None:
         self._last_compressed_at = self._clock()
 
+    def is_in_cooldown(self) -> bool:
+        """Check if the compressor is currently in cooldown."""
+        return self._in_cooldown()
+
     def should_compress(
         self,
         messages: list[dict[str, Any]],

@@ -37,12 +37,16 @@ class FakeChatService:
 
 
 @pytest.mark.asyncio
-async def test_executor_uses_unattended_safe_only_options():
+async def test_executor_passes_unattended_via_trusted_metadata():
+    """T11: executor passes execution_mode via trusted_metadata, not free options dict."""
     chat = FakeChatService()
     result = await ScheduledAgentExecutor(chat, FakeScanner()).run(_task())
 
     assert result.status is ScheduledTaskExecutionStatus.SUCCEEDED
-    assert chat.requests[0].options == {"execution_context_mode": "unattended", "tool_exposure_policy": "safe_only"}
+    # execution_mode is in trusted_metadata (structured), not options (free dict)
+    assert chat.requests[0].trusted_metadata.get("execution_mode") == "unattended"
+    assert "execution_context_mode" not in chat.requests[0].options
+    assert "tool_exposure_policy" not in chat.requests[0].options
     assert chat.requests[0].session_id == "session-1"
     assert chat.requests[0].messages[0] == {"role": "system", "content": SCHEDULED_EXECUTION_PROMPT}
     assert chat.requests[0].messages[1] == {"role": "user", "content": "summarize"}

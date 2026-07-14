@@ -98,7 +98,7 @@ def build_client(tmp_path, provider=None, tool_service=None):
     from fastapi import FastAPI
 
     app = FastAPI()
-    app.include_router(create_openai_compatible_router(chat, models))
+    app.include_router(create_openai_compatible_router(chat, models, store))
     if _test_client_stack is None:
         raise RuntimeError("TestClient lifecycle fixture is not active")
     client = _test_client_stack.enter_context(TestClient(app))
@@ -138,7 +138,8 @@ def test_streaming_chat_completion(tmp_path):
     with client.stream(
         "POST",
         "/v1/chat/completions",
-        json={"model": "test-model", "stream": True, "metadata": {"session_id": "s1"}, "messages": [{"role": "user", "content": "hi"}]},
+        headers={"X-Session-ID": "s1"},
+        json={"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
     ) as response:
         text = "".join(response.iter_text())
 
@@ -157,7 +158,8 @@ def test_streaming_chat_completion_emits_chinese_as_original_chars(tmp_path):
     with client.stream(
         "POST",
         "/v1/chat/completions",
-        json={"model": "test-model", "stream": True, "metadata": {"session_id": "s-zh"}, "messages": [{"role": "user", "content": "use tool"}]},
+        headers={"X-Session-ID": "s-zh"},
+        json={"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "use tool"}]},
     ) as response:
         text = "".join(response.iter_text())
 
@@ -171,7 +173,8 @@ def test_tool_call_loop_persists_tool_call(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
-        json={"model": "test-model", "stream": False, "metadata": {"session_id": "s-tool"}, "messages": [{"role": "user", "content": "use tool"}]},
+        headers={"X-Session-ID": "s-tool"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "use tool"}]},
     )
 
     assert response.status_code == 200
@@ -200,11 +203,11 @@ def test_http_metadata_cannot_inject_internal_tool_authorization(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Session-ID": "s-untrusted-grant"},
         json={
             "model": "test-model",
             "stream": False,
             "metadata": {
-                "session_id": "s-untrusted-grant",
                 "allowed_confirm_tools": {"managed_action": "session"},
                 "permitted_managed_tools": ["managed_action"],
             },
@@ -238,10 +241,10 @@ def test_openai_chat_completion_can_call_knowledge_tool(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Session-ID": "s-kb"},
         json={
             "model": "test-model",
             "stream": False,
-            "metadata": {"session_id": "s-kb"},
             "messages": [{"role": "user", "content": "use tool for knowledge"}],
         },
     )
@@ -259,10 +262,10 @@ def test_openai_chat_completion_accepts_valid_content_array(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Session-ID": "s-valid"},
         json={
             "model": "test-model",
             "stream": False,
-            "metadata": {"session_id": "s-valid"},
             "messages": [
                 {
                     "role": "user",
@@ -283,10 +286,10 @@ def test_openai_chat_completion_normalizes_input_image_to_image_url(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Session-ID": "s-input-image"},
         json={
             "model": "test-model",
             "stream": False,
-            "metadata": {"session_id": "s-input-image"},
             "messages": [
                 {
                     "role": "user",
@@ -464,10 +467,10 @@ def test_openai_chat_completion_merges_top_level_generation_params(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Session-ID": "s-gen"},
         json={
             "model": "test-model",
             "stream": False,
-            "metadata": {"session_id": "s-gen"},
             "temperature": 0.5,
             "max_tokens": 100,
             "top_p": 0.9,
@@ -490,10 +493,10 @@ def test_openai_chat_completion_options_dict_overrides_top_level(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Session-ID": "s-override"},
         json={
             "model": "test-model",
             "stream": False,
-            "metadata": {"session_id": "s-override"},
             "temperature": 0.5,
             "max_tokens": 100,
             "options": {"temperature": 0.9},
@@ -515,10 +518,10 @@ def test_openai_chat_completion_omits_unset_generation_params(tmp_path):
 
     response = client.post(
         "/v1/chat/completions",
+        headers={"X-Session-ID": "s-none"},
         json={
             "model": "test-model",
             "stream": False,
-            "metadata": {"session_id": "s-none"},
             "messages": [{"role": "user", "content": "hi"}],
         },
     )
@@ -528,3 +531,108 @@ def test_openai_chat_completion_omits_unset_generation_params(tmp_path):
     assert "temperature" not in provider.last_options
     assert "max_tokens" not in provider.last_options
     assert "top_p" not in provider.last_options
+
+
+# ---------------------------------------------------------------------------
+# S4: API bearer selector tests
+# ---------------------------------------------------------------------------
+
+
+def test_api_no_session_header_creates_new_api_session(tmp_path):
+    """Without X-Session-ID, the route generates a new api- prefixed session."""
+    client, store = build_client(tmp_path)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    # The session should have been created with source=api
+    assert client.portal is not None
+    sessions = client.portal.call(store.list_sessions)
+    assert len(sessions) >= 1
+    assert sessions[-1].source == "api"
+    assert sessions[-1].id.startswith("api-")
+
+
+def test_api_header_continues_existing_api_session(tmp_path):
+    """X-Session-ID pointing to an existing api session continues it."""
+    client, store = build_client(tmp_path)
+
+    # First request creates the session
+    client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "api-existing"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "first"}]},
+    )
+
+    # Second request continues the same session
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "api-existing"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "second"}]},
+    )
+
+    assert response.status_code == 200
+    assert client.portal is not None
+    messages = client.portal.call(store.list_messages, "api-existing")
+    assert len(messages) >= 2
+
+
+def test_api_metadata_session_id_is_ignored(tmp_path):
+    """metadata.session_id must NOT be used for session selection."""
+    client, store = build_client(tmp_path)
+
+    # Send with metadata.session_id but NO X-Session-ID header
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "stream": False,
+            "metadata": {"session_id": "should-be-ignored"},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    # The session "should-be-ignored" should NOT exist; a new api- session was created
+    assert client.portal is not None
+    session = client.portal.call(store.get_session, "should-be-ignored")
+    assert session is None
+
+
+def test_api_header_pointing_to_dashboard_session_returns_409(tmp_path):
+    """X-Session-ID pointing to a dashboard session returns 409 before content read."""
+    client, store = build_client(tmp_path)
+
+    # Create a dashboard session via the session service
+    assert client.portal is not None
+    from app.domain.session import ConversationSession
+    client.portal.call(store.create_session, ConversationSession(id="dash-1", source="dashboard"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "dash-1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "api_session_scope_mismatch"
+
+def test_api_header_pointing_to_feishu_session_returns_409(tmp_path):
+    """X-Session-ID pointing to a feishu session returns 409."""
+    client, store = build_client(tmp_path)
+
+    assert client.portal is not None
+    from app.domain.session import ConversationSession
+    client.portal.call(store.create_session, ConversationSession(id="feishu-1", source="feishu"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "feishu-1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "api_session_scope_mismatch"

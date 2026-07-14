@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable
 from weakref import WeakKeyDictionary
 
-from app.domain.policy import PolicyDecision, PolicyOutcome
+from app.domain.policy import PolicyAuditEvent, PolicyDecisionKind, PolicyDecision, PolicyOutcome
 from app.domain.tool import (
     RiskLevel,
     ToolCallRequest,
@@ -15,6 +19,13 @@ from app.domain.tool import (
     ToolSourceType,
 )
 from app.domain.tool_policy import ToolExposurePolicy, ToolPolicy
+
+if TYPE_CHECKING:
+    from app.application.budget_service import BudgetService
+    from app.application.information_flow_service import InformationFlowService
+    from app.application.policy_audit_service import PolicyAuditService
+
+logger = logging.getLogger(__name__)
 
 
 class ToolNotFoundError(ValueError):
@@ -55,6 +66,10 @@ class ToolService:
         executor: ToolExecutor,
         definitions: list[ToolDefinition],
         policy: ToolPolicy | None = None,
+        *,
+        budget_service: "BudgetService | None" = None,
+        information_flow_service: "InformationFlowService | None" = None,
+        audit_service: "PolicyAuditService | None" = None,
     ):
         self.policy = policy if policy is not None else ToolPolicy()
         for definition in definitions:
@@ -66,6 +81,9 @@ class ToolService:
             _EvaluationToken,
             _EvaluatedExecution,
         ] = WeakKeyDictionary()
+        self._budget_service = budget_service
+        self._information_flow_service = information_flow_service
+        self._audit_service = audit_service
 
     def set_dynamic_definitions(self, source_key: str, definitions: list[ToolDefinition]) -> None:
         schema_valid: list[ToolDefinition] = []
@@ -216,10 +234,143 @@ class ToolService:
                 ToolResultStatus.PERMISSION_DENIED,
                 {"error": "permission_denied", "reason": decision.reason},
             )
+
+        # --- Tool Budget enforcement (T12 S3) ---
+        # Reserve a tool call before any executor. If denied, executor is NOT called.
+        # New runtime paths always provide an explicit per-run id.  Keep the
+        # session fallback for older direct callers while they migrate.
+        run_id = (
+            (context.run_id or context.session_id)
+            if context is not None
+            else ""
+        ) or ""
+        reservation = None
+        if self._budget_service is not None and run_id:
+            from app.domain.budget import BudgetReserveKind, BudgetReserveRequest
+            reservation = await self._budget_service.reserve(
+                run_id,
+                BudgetReserveRequest(kind=BudgetReserveKind.TOOL_CALL),
+            )
+            await self._audit_budget(
+                reservation.outcome, reservation.reason, run_id,
+            )
+            if reservation.outcome is PolicyOutcome.DENY:
+                return ToolResult(
+                    request.id,
+                    request.name,
+                    ToolResultStatus.PERMISSION_DENIED,
+                    {"error": "permission_denied", "reason": "budget_exhausted"},
+                )
+
+        # --- InformationFlow input wrapping (T12 S3) ---
+        # Release tool call (name + arguments) to TOOL_MCP_PLUGIN target.
+        # If denied, release budget and do NOT call executor.
+        working_request = request
+        if self._information_flow_service is not None:
+            from app.domain.information_flow import (
+                Classification,
+                ReleaseTarget,
+            )
+            input_payload = json.dumps(
+                {"name": request.name, "arguments": request.arguments},
+                default=str, ensure_ascii=False,
+            )
+            input_release = self._information_flow_service.release(
+                input_payload,
+                ReleaseTarget.TOOL_MCP_PLUGIN,
+                classification=Classification.INTERNAL,
+                origin="tool_service",
+            )
+            if not input_release.allowed:
+                # Release budget reservation before returning
+                if reservation is not None and self._budget_service is not None:
+                    await self._budget_service.release(run_id, reservation)
+                return ToolResult(
+                    request.id,
+                    request.name,
+                    ToolResultStatus.PERMISSION_DENIED,
+                    {"error": "permission_denied", "reason": "information_flow_denied"},
+                )
+            # If redaction was applied, use sanitized arguments
+            if input_release.content is not None and input_release.content != input_payload:
+                try:
+                    sanitized = json.loads(input_release.content)
+                    if isinstance(sanitized, dict) and "arguments" in sanitized:
+                        working_request = ToolCallRequest(
+                            id=request.id,
+                            name=request.name,
+                            arguments=sanitized["arguments"] if isinstance(sanitized["arguments"], dict) else request.arguments,
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Keep original request if JSON round-trip fails
+
+        # --- Execute tool ---
         try:
-            return await self.executor.execute(request, context)
-        except TypeError:
-            return await self.executor.execute(request)
+            try:
+                result = await self.executor.execute(working_request, context)
+            except TypeError:
+                result = await self.executor.execute(working_request)
+        except asyncio.CancelledError:
+            # Release budget on cancel (CancelledError is BaseException, not Exception)
+            if reservation is not None and self._budget_service is not None:
+                await self._budget_service.release(run_id, reservation)
+            raise
+        except Exception:
+            # Release budget on pre-call exception
+            if reservation is not None and self._budget_service is not None:
+                await self._budget_service.release(run_id, reservation)
+            raise
+
+        # --- Budget settle (success/unknown usage) ---
+        if reservation is not None and self._budget_service is not None:
+            from app.domain.budget import BudgetActualUsage
+            await self._budget_service.settle(
+                run_id,
+                reservation,
+                BudgetActualUsage(),  # conservative: unknown usage keeps estimate
+            )
+
+        # --- InformationFlow output wrapping (T12 S3) ---
+        # Redact secrets from the tool result content.
+        if self._information_flow_service is not None and result.content is not None:
+            sanitized_content = self._information_flow_service.redact_structured(
+                result.content
+            )
+            result = ToolResult(
+                tool_call_id=result.tool_call_id,
+                tool_name=result.tool_name,
+                status=result.status,
+                content=sanitized_content,
+                duration_ms=result.duration_ms,
+            )
+
+        return result
+
+    async def _audit_budget(
+        self,
+        outcome: PolicyOutcome,
+        reason: str,
+        run_id: str,
+    ) -> None:
+        if self._audit_service is None:
+            return
+        event = PolicyAuditEvent(
+            policy="budget-policy",
+            version="system-v1",
+            decision_kind=PolicyDecisionKind.ALLOCATION,
+            reason=reason,
+            run_id=run_id,
+            session_id=run_id,
+            outcome=outcome,
+        )
+        try:
+            await self._audit_service.record(event)
+        except Exception:
+            logger.warning(
+                "audit service failed for budget policy run_id=%s",
+                run_id,
+                exc_info=True,
+            )
 
     def _required_definition(self, name: str) -> ToolDefinition:
         definition = self._definition(name)

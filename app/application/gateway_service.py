@@ -10,6 +10,7 @@ from app.application.chat_service import ChatCompletionInput, ChatCompletionResu
 from app.application.events import ChatEvent, ChatEventType
 from app.application.gateway_tool_approval_service import GatewayToolApprovalService
 from app.application.model_service import ModelService
+from app.application.policy_snapshot import IngressFacts
 from app.application.schedule_service import ScheduledTaskCreateInput, ScheduleService
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService
@@ -24,7 +25,13 @@ from app.domain.gateway import (
     InteractionMessage,
     InteractionResponse,
 )
+from app.domain.gateway_policy import (
+    GatewayAccessDecision,
+    GatewayInboundRequest,
+    GatewayPolicy,
+)
 from app.domain.platform import Platform
+from app.domain.policy import ExecutionMode, PolicyOutcome
 from app.domain.session import SessionSource
 from app.domain.tool import ApprovalDecider
 
@@ -41,6 +48,9 @@ class GatewayCommandService:
         health_provider: HealthProvider,
         schedule_service: ScheduleService | None = None,
         chat_service: "ChatCompletionService | None" = None,
+        gateway_policy: GatewayPolicy | None = None,
+        require_actor_for_managed_actions: bool = True,
+        confirmation_ttl_seconds: int = 900,
     ):
         self.registry = registry
         self.session_service = session_service
@@ -49,9 +59,11 @@ class GatewayCommandService:
         self.health_provider = health_provider
         self.schedule_service = schedule_service
         self.chat_service = chat_service
+        self.gateway_policy = gateway_policy or GatewayPolicy()
+        self.require_actor_for_managed_actions = require_actor_for_managed_actions
         self.pending_confirmations: dict[str, GatewayConfirmationRequest] = {}
         self.trusted_actors: set[tuple[str, str, str, str]] = set()
-        self.confirmation_ttl = timedelta(minutes=15)
+        self.confirmation_ttl = timedelta(seconds=confirmation_ttl_seconds)
 
     async def handle_destructive_preflight(self, event: InteractionMessage) -> InteractionResponse | None:
         parsed = self._parse_destructive_command(event.text)
@@ -63,7 +75,23 @@ class GatewayCommandService:
             return _response("", "没有当前会话，请先发送普通消息或使用 /new 创建会话")
         session_id = active.session_id if active is not None else ""
         actor_value = event.metadata.get("actor_id")
-        if actor_value is None and action is GatewayConfirmationAction.NEW:
+
+        # GatewayPolicy: evaluate inbound before any state change
+        is_bootstrap = actor_value is None and action is GatewayConfirmationAction.NEW
+        policy_request = GatewayInboundRequest(
+            session_key=event.session_key,
+            actor_id=str(actor_value) if actor_value is not None else None,
+            action=action,
+            is_bootstrap=is_bootstrap,
+            has_confirmation_channel=True,
+            session_id=session_id or None,
+            require_actor_for_managed_actions=self.require_actor_for_managed_actions,
+        )
+        decision = self.gateway_policy.evaluate_inbound(policy_request)
+        if decision.verdict is PolicyOutcome.DENY:
+            return _response(session_id, f"操作被拒绝: {decision.reason}")
+
+        if is_bootstrap:
             return await self._execute_new(event)
         actor_id = str(actor_value if actor_value is not None else event.session_key.display_name or event.session_key.platform_session_id)
         if self._trust_key(event.session_key, actor_id) in self.trusted_actors:
@@ -152,6 +180,21 @@ class GatewayCommandService:
         if confirmation.actor_id != actor_id:
             return _response(confirmation.session_id, "只有命令发起者可以确认")
         self.pending_confirmations.pop(confirmation_id, None)
+
+        # GatewayPolicy: re-evaluate inbound before executing confirmed action
+        policy_request = GatewayInboundRequest(
+            session_key=session_key,
+            actor_id=actor_id,
+            action=confirmation.action,
+            is_bootstrap=False,
+            has_confirmation_channel=True,
+            session_id=confirmation.session_id,
+            require_actor_for_managed_actions=self.require_actor_for_managed_actions,
+        )
+        decision = self.gateway_policy.evaluate_inbound(policy_request)
+        if decision.verdict is PolicyOutcome.DENY:
+            return _response(confirmation.session_id, f"操作被拒绝: {decision.reason}")
+
         if on_consumed is not None:
             await on_consumed()
         if choice is GatewayConfirmationChoice.CANCEL:
@@ -241,6 +284,10 @@ class GatewayCommandService:
         origin.setdefault("thread_id", event.session_key.thread_id)
         return origin
 
+    def is_destructive_command(self, text: str) -> bool:
+        """Public check: does this text parse as a destructive slash command?"""
+        return text.strip().startswith("/") and self._parse_destructive_command(text) is not None
+
     def _parse_destructive_command(self, text: str) -> tuple[GatewayConfirmationAction, dict[str, Any]] | None:
         command, _, arg = text.strip().partition(" ")
         if command == "/new":
@@ -266,6 +313,21 @@ class GatewayCommandService:
         args: dict[str, Any],
         trusted_metadata: dict[str, Any] | None = None,
     ) -> InteractionResponse:
+        # GatewayPolicy: final re-evaluation before state change
+        actor_value = event.metadata.get("actor_id")
+        policy_request = GatewayInboundRequest(
+            session_key=event.session_key,
+            actor_id=str(actor_value) if actor_value is not None else None,
+            action=action,
+            is_bootstrap=action is GatewayConfirmationAction.NEW and actor_value is None,
+            has_confirmation_channel=True,
+            session_id=session_id or None,
+            require_actor_for_managed_actions=self.require_actor_for_managed_actions,
+        )
+        decision = self.gateway_policy.evaluate_inbound(policy_request)
+        if decision.verdict is PolicyOutcome.DENY:
+            return _response(session_id, f"操作被拒绝: {decision.reason}")
+
         if action is GatewayConfirmationAction.NEW:
             return await self._execute_new(event)
         if action is GatewayConfirmationAction.RENAME:
@@ -343,11 +405,15 @@ class GatewayService:
         health_provider: HealthProvider,
         schedule_service: ScheduleService | None = None,
         tool_approval_service: GatewayToolApprovalService | None = None,
+        gateway_policy: GatewayPolicy | None = None,
+        require_actor_for_managed_actions: bool = True,
+        confirmation_ttl_seconds: int = 900,
     ):
         self.registry = registry
         self.chat_service = chat_service
         self.session_service = session_service
         self.tool_approval_service = tool_approval_service or GatewayToolApprovalService()
+        self.gateway_policy = gateway_policy or GatewayPolicy()
         self.command_service = GatewayCommandService(
             registry,
             session_service,
@@ -356,7 +422,31 @@ class GatewayService:
             health_provider,
             schedule_service,
             chat_service,
+            gateway_policy=self.gateway_policy,
+            require_actor_for_managed_actions=require_actor_for_managed_actions,
+            confirmation_ttl_seconds=confirmation_ttl_seconds,
         )
+
+    def _evaluate_ordinary_message_policy(self, event: InteractionMessage) -> GatewayAccessDecision | None:
+        """Evaluate GatewayPolicy for ordinary (non-destructive) messages.
+
+        Returns the decision if a policy check was performed, or None if the
+        message is destructive (and thus handled by the preflight path).
+        The caller formats its own DENY response (InteractionResponse vs ChatEvent).
+        """
+        if self.command_service.is_destructive_command(event.text):
+            return None
+        actor_value = event.metadata.get("actor_id")
+        policy_request = GatewayInboundRequest(
+            session_key=event.session_key,
+            actor_id=str(actor_value) if actor_value is not None else None,
+            action=None,
+            is_bootstrap=False,
+            has_confirmation_channel=True,
+            session_id=None,
+            require_actor_for_managed_actions=self.command_service.require_actor_for_managed_actions,
+        )
+        return self.gateway_policy.evaluate_inbound(policy_request)
 
     async def handle_message(
         self,
@@ -372,6 +462,11 @@ class GatewayService:
         slash_with_images = event.text.strip().startswith("/") and bool(event.images)
         if slash_with_images:
             return _response("", "slash 命令不支持附带图片")
+
+        # GatewayPolicy: evaluate inbound for ordinary (non-destructive) messages
+        decision = self._evaluate_ordinary_message_policy(event)
+        if decision is not None and decision.verdict is PolicyOutcome.DENY:
+            return _response("", f"操作被拒绝: {decision.reason}")
 
         preflight = await self.command_service.handle_destructive_preflight(event)
         if preflight is not None:
@@ -392,6 +487,7 @@ class GatewayService:
                 },
                 trusted_metadata=_build_trusted_metadata(event),
                 session_id=session_id,
+                ingress_facts=_gateway_ingress(event, session_id),
                 approval_decider=approval_decider,
                 allowed_confirm_tools_override=self.tool_approval_service.grants_for(
                     session_id,
@@ -448,6 +544,17 @@ class GatewayService:
             yield ChatEvent(ChatEventType.DONE)
             return
 
+        # GatewayPolicy: evaluate inbound for ordinary (non-destructive) messages
+        decision = self._evaluate_ordinary_message_policy(event)
+        if decision is not None and decision.verdict is PolicyOutcome.DENY:
+            yield ChatEvent(
+                ChatEventType.MESSAGE_DONE,
+                content=f"操作被拒绝: {decision.reason}",
+                finish_reason="stop",
+            )
+            yield ChatEvent(ChatEventType.DONE)
+            return
+
         preflight = await self.command_service.handle_destructive_preflight(event)
         if preflight is not None:
             outbound_meta = preflight.messages[0].metadata if preflight.messages else {}
@@ -486,6 +593,11 @@ class GatewayService:
                 },
                 trusted_metadata=trusted_metadata,
                 session_id=session_id,
+                ingress_facts=_gateway_ingress(
+                    event,
+                    session_id,
+                    trusted_claims=trusted_metadata,
+                ),
                 options=dict(options_override or {}),
                 approval_decider=approval_decider,
                 allowed_confirm_tools_override=allowed_confirm_tools_override,
@@ -573,6 +685,23 @@ def _build_trusted_metadata(event: InteractionMessage) -> dict[str, Any]:
         trusted["gateway.platform"] = platform.value
         trusted["platform"] = platform.value
     return trusted
+
+
+def _gateway_ingress(
+    event: InteractionMessage,
+    session_id: str,
+    *,
+    trusted_claims: dict[str, Any] | None = None,
+) -> IngressFacts:
+    claims = dict(trusted_claims or _build_trusted_metadata(event))
+    return IngressFacts(
+        run_id=f"gateway-{uuid4()}",
+        session_id=session_id,
+        source=event.session_key.source_value,
+        actor_id=_actor_id(event),
+        execution_mode=ExecutionMode.REALTIME,
+        trusted_claims=claims,
+    )
 
 
 def _actor_id(event: InteractionMessage) -> str:

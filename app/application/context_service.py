@@ -8,10 +8,18 @@ from collections.abc import Callable
 from typing import Any
 
 from app.application.external_memory_manager import ExternalMemoryManager
+from app.application.policy_projections import (
+    build_context_policy_request,
+    project_messages,
+    project_working_messages,
+)
 from app.application.prompt_builder import build_system_prompt
+from app.application.runtime_memory_service import RuntimeMemoryService
+from app.application.policy_snapshot import RunPolicySnapshot
 from app.application.tool_service import ToolService
 from app.domain.agent import AgentState, RunStatus
 from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextEngine, ProviderContext
+from app.domain.context_policy import ContextPlan, ContextPolicy, DefaultContextPolicy
 from app.domain.memory import MemoryStore
 from app.domain.session import ConversationMessage, Summary
 from app.domain.tool_policy import ToolExposurePolicy
@@ -22,7 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 class ContextService:
-    """Application service for preparing and adapting context for model calls."""
+    """Application service for preparing and adapting context for model calls.
+
+    T7 refactor: ContextService is now a plan EXECUTOR.  ContextPolicy
+    decides which messages to select, when/how to compress, where to inject
+    external memory, and how to allocate tokens.  ContextService executes
+    the ContextPlan; ContextEngine (ContextCompressor) only executes the
+    CompressionPlan portion.
+    """
 
     def __init__(
         self,
@@ -34,6 +49,8 @@ class ContextService:
         usage_service: Any = None,
         skill_service: Any = None,
         is_cancelled: Callable[[str], bool] | None = None,
+        runtime_memory_service: RuntimeMemoryService | None = None,
+        context_policy: ContextPolicy | None = None,
     ):
         self.memory_store = memory_store
         self.tool_service = tool_service
@@ -42,6 +59,91 @@ class ContextService:
         self.usage_service = usage_service
         self.skill_service = skill_service
         self._is_cancelled = is_cancelled or (lambda _session_id: False)
+        self._runtime_memory = runtime_memory_service or RuntimeMemoryService(memory_store)
+        self._context_policy = context_policy or DefaultContextPolicy()
+
+    # ------------------------------------------------------------------
+    # Engine config extraction (for ContextPolicy request)
+    # ------------------------------------------------------------------
+
+    def _get_engine_config(self, state: AgentState | None = None) -> dict[str, Any]:
+        """Read config values from the context_engine (ContextCompressor).
+
+        Uses getattr so FakeContextEngine (test doubles without these
+        attributes) falls back to ContextPolicy defaults.
+        """
+        if state is not None:
+            snapshot = state.run_options.get("_policy_snapshot")
+            if isinstance(snapshot, RunPolicySnapshot):
+                config = snapshot.context_config
+                return {
+                    "context_length": config.context_length,
+                    "compression_threshold": config.compression_threshold,
+                    "compression_target_ratio": config.compression_target_ratio,
+                    "protect_first_n": config.protect_first_n,
+                    "protect_last_n": config.protect_last_n,
+                    "cooldown_seconds": config.cooldown_seconds,
+                    "tail_budget_enabled": config.tail_budget_enabled,
+                }
+        engine = self.context_engine
+        if engine is None:
+            return {}
+        return {
+            "context_length": getattr(engine, "context_length", 32000),
+            "compression_threshold": getattr(engine, "threshold_percent", 0.50),
+            "compression_target_ratio": getattr(engine, "summary_target_ratio", 0.20),
+            "protect_first_n": getattr(engine, "protect_first_n", 3),
+            "protect_last_n": getattr(engine, "protect_last_n", 10),
+            "cooldown_seconds": getattr(engine, "cooldown_seconds", 300),
+            "tail_budget_enabled": getattr(engine, "tail_budget_enabled", False),
+        }
+
+    def _check_cooldown(self) -> bool:
+        """Check if the context engine is currently in cooldown."""
+        if self.context_engine is None:
+            return False
+        check = getattr(self.context_engine, "is_in_cooldown", None)
+        if callable(check):
+            return bool(check())
+        return False
+
+    def _create_plan_from_state(
+        self,
+        state: AgentState,
+        non_system: list[dict[str, Any]] | None = None,
+    ) -> ContextPlan:
+        """Fallback: create a ContextPlan when build_context_state wasn't called.
+
+        Projects working_messages to candidates and evaluates the policy.
+        """
+        if non_system is None:
+            leading_count = 0
+            for msg in state.working_messages:
+                if msg.get("role") == "system":
+                    leading_count += 1
+                else:
+                    break
+            non_system = state.working_messages[leading_count:]
+
+        candidates_msg = project_working_messages(non_system)
+        from app.domain.context_policy import ContextCandidateSet
+
+        candidates = ContextCandidateSet(messages=candidates_msg)
+        config = self._get_engine_config(state)
+        force = bool(state.run_options.get("force_compress", False))
+        in_cooldown = self._check_cooldown()
+        request = build_context_policy_request(
+            candidates=candidates,
+            force=force,
+            in_cooldown=in_cooldown,
+            existing_summary=state.summary,
+            **config,
+        )
+        return self._context_policy.evaluate(request)
+
+    # ------------------------------------------------------------------
+    # Context preparation (plan execution)
+    # ------------------------------------------------------------------
 
     async def prepare_context(self, state: AgentState) -> AgentState:
         """Prepare the context frame for the next LLM call."""
@@ -51,10 +153,41 @@ class ContextService:
     async def build_context_state(self, state: AgentState) -> AgentState:
         if self._is_cancelled(state.session_id):
             raise asyncio.CancelledError()
-        messages = await self.memory_store.list_messages(state.session_id)
-        summary = await self.memory_store.get_summary(state.session_id)
+        messages = await self._runtime_memory.read_session_messages(state.session_id)
+        summary = await self._runtime_memory.get_summary_if_allowed(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
-        # 过滤掉已被摘要吸收的原始消息，并按压缩契约重建 head + latest summary + tail。
+
+        # -- T7: Evaluate ContextPolicy to produce ContextPlan --
+        from app.domain.context_policy import ContextCandidateSet
+
+        candidates = ContextCandidateSet(
+            messages=project_messages(messages),
+        )
+        config = self._get_engine_config(state)
+        force = bool(state.run_options.get("force_compress", False))
+        in_cooldown = self._check_cooldown()
+        request = build_context_policy_request(
+            candidates=candidates,
+            force=force,
+            in_cooldown=in_cooldown,
+            existing_summary=summary.summary if summary else "",
+            **config,
+        )
+        plan = self._context_policy.evaluate(request)
+        state.context_plan = plan
+
+        # -- Execute message selection --
+        # NOTE: plan.selected_message_ids is currently advisory. The executor
+        # uses _build_latest_compressed_context + _sanitize_conversation_tool_pairs
+        # + _dedupe_trailing, which implement equivalent selection logic.
+        # There is a subtle edge-case divergence: the policy's _select_messages
+        # drops ALL is_summarized non-summary messages when a latest summary
+        # exists; the executor's _build_latest_compressed_context keeps
+        # summarized messages that appear AFTER the latest summary when
+        # first_summarized_idx == -1 (no summarized messages before the summary).
+        # The executor's behavior is tested and correct for the current
+        # incremental-compression flow. TODO: wire plan.selected_message_ids
+        # directly in a future refactor for full consistency.
         context_messages = _sanitize_conversation_tool_pairs(
             _build_latest_compressed_context(messages)
         )
@@ -97,13 +230,28 @@ class ContextService:
             idx += 1
         non_system = state.working_messages[idx:]
 
-        force = bool(state.run_options.get("force_compress", False))
-        if not self.context_engine.should_compress(non_system, force=force):
+        # -- T7: Create/re-evaluate ContextPlan from full non_system context --
+        # The plan from build_context_state was based on history messages only;
+        # here we re-evaluate based on the full working_messages (which include
+        # input_messages) so the compression decision considers the total token
+        # count that will be sent to the model.
+        plan = self._create_plan_from_state(state, non_system)
+        state.context_plan = plan
+
+        if plan.compression is None:
             return state
+
+        force = plan.compression.force
 
         rescued_context = ""
         if self.external_memory_manager:
             enabled_override = state.run_options.get("external_memory_enabled")
+            # pre_compress_all is exempt from RuntimeMemoryService gating: it does
+            # NOT read from external memory stores. It passes the current
+            # conversation messages to each provider's on_pre_compress hook,
+            # which extracts rescue facts from already-policy-gated content
+            # (prefetch was gated via read_external_if_allowed in
+            # build_provider_messages). Re-gating here would be redundant.
             rescued_context = self.external_memory_manager.pre_compress_all(
                 non_system,
                 session_id=state.session_id,
@@ -140,7 +288,7 @@ class ContextService:
         )
 
         try:
-            returned_message = await self.memory_store.append_summary_message(
+            returned_message = await self._runtime_memory.append_summary_message_if_allowed(
                 state.session_id,
                 summary_message,
             )
@@ -157,7 +305,7 @@ class ContextService:
             ]
             if middle_ids:
                 try:
-                    await self.memory_store.mark_messages_summarized(state.session_id, middle_ids)
+                    await self._runtime_memory.mark_messages_summarized_if_allowed(state.session_id, middle_ids)
                 except Exception as exc:
                     logger.warning(
                         "prepare_context: mark_messages_summarized failed: %s",
@@ -166,7 +314,7 @@ class ContextService:
 
         if next_summary:
             try:
-                await self.memory_store.save_summary(
+                await self._runtime_memory.save_summary_if_allowed(
                     Summary(
                         session_id=state.session_id,
                         summary=next_summary,
@@ -228,7 +376,17 @@ class ContextService:
         return state
 
     def build_provider_messages(self, state: AgentState) -> list[dict[str, Any]]:
-        """Build provider-visible messages, including temporary memory retrieval."""
+        """Build provider-visible messages, including temporary memory retrieval.
+
+        T7: The ContextPlan's InjectionPlan is currently advisory. The executor
+        implements equivalent injection logic here (inject into the last message
+        if its role is "user"). Note a subtle difference: the plan's
+        InjectionPlan targets the last non-summary user message found via
+        reversed(candidate messages); this executor targets the last working
+        message if it is "user" (which includes input_messages appended after
+        history). TODO: wire plan.injection.target_message_id directly in a
+        future refactor for full consistency.
+        """
         if not self.external_memory_manager or not state.working_messages:
             return state.working_messages
 
@@ -238,7 +396,7 @@ class ContextService:
         enabled_override: list[str] | None = state.run_options.get("external_memory_enabled")
         if last_msg.get("role") == "user":
             query_text = extract_text(last_msg["content"])
-            memory_context = self.external_memory_manager.prefetch_all(
+            memory_context = self._runtime_memory.read_external_if_allowed(
                 query_text,
                 session_id=state.session_id,
                 enabled_override=enabled_override,
@@ -253,7 +411,11 @@ class ContextService:
         return api_messages
 
     def build_provider_context(self, state: AgentState, options: dict[str, Any]) -> ProviderContext:
-        """Build provider-visible message and tool context for one model call."""
+        """Build provider-visible message and tool context for one model call.
+
+        T7: messages are generated per the ContextPlan (injection plan).
+        tools consume ToolService-filtered results (already projected).
+        """
         messages = self.build_provider_messages(state)
         tools: list[dict[str, Any]] = []
         if self.tool_service is not None:

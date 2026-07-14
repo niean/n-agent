@@ -86,11 +86,23 @@ class FakeUsageService:
 
 
 class FakeContextEngine:
+    # T7: Config attributes read by ContextService._get_engine_config.
+    context_length = 100
+    threshold_percent = 0.01
+    protect_first_n = 3
+    protect_last_n = 10
+    summary_target_ratio = 0.2
+    cooldown_seconds = 300
+    tail_budget_enabled = False
+
     def __init__(self, result: ContextCompressionResult):
         self._result = result
 
     def should_compress(self, messages, *, prompt_tokens=None, force=False):
         return True
+
+    def is_in_cooldown(self) -> bool:
+        return False
 
     async def compress(self, messages, *, current_tokens=None, force=False, existing_summary=""):
         return self._result
@@ -179,10 +191,9 @@ async def test_call_llm_skips_usage_when_result_usage_empty(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_call_llm_logs_request_and_response(tmp_path, caplog):
-    """call_llm should emit INFO logs with full request/response JSON,
-    decoupled from usage recording (visible even when usage_service is None
-    or result.usage is empty)."""
+async def test_call_llm_does_not_log_full_payload_by_default(tmp_path, caplog):
+    """call_llm should NOT emit full request/response payload logs by default
+    (InformationFlowPolicyConfig.log_llm_payloads=False = fail-closed)."""
     import logging
 
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -210,16 +221,58 @@ async def test_call_llm_logs_request_and_response(tmp_path, caplog):
 
     request_logs = [r for r in caplog.records if "LLM request" in r.getMessage()]
     response_logs = [r for r in caplog.records if "LLM response" in r.getMessage()]
-    assert len(request_logs) == 1, f"expected 1 LLM request log, got {len(request_logs)}"
-    assert len(response_logs) == 1, f"expected 1 LLM response log, got {len(response_logs)}"
+    # Default config denies LLM payload logging -- no full payload logs
+    assert len(request_logs) == 0, f"expected 0 LLM request logs (default deny), got {len(request_logs)}"
+    assert len(response_logs) == 0, f"expected 0 LLM response logs (default deny), got {len(response_logs)}"
 
-    req_msg = request_logs[0].getMessage()
-    assert "session=sess-log" in req_msg
-    assert "hi there" in req_msg  # full input content printed
 
-    resp_msg = response_logs[0].getMessage()
-    assert "session=sess-log" in resp_msg
-    assert "hello world" in resp_msg  # full output content printed
+@pytest.mark.asyncio
+async def test_call_llm_logs_sanitized_payload_when_enabled(tmp_path, caplog):
+    """When log_llm_payloads=True and a secret is present, the logged payload
+    must be sanitized (secret value replaced with [REDACTED])."""
+    import logging
+
+    from app.application.information_flow_service import InformationFlowService
+    from app.application.policy_snapshot import InformationFlowPolicyConfig
+    from app.domain.information_flow import SecretCatalog
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-log2"))
+
+    provider = UsageCapturingProvider(
+        usage={},
+        model_response="the key is sk-secret123",
+    )
+    info_svc = InformationFlowService(
+        InformationFlowPolicyConfig(log_llm_payloads=True, redact_secrets=True),
+        SecretCatalog(secret_values=frozenset({"sk-secret123"})),
+    )
+    runner = AgentGraphRunner(
+        llm_provider=provider,
+        tool_service=ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        memory_store=store,
+        summarizer=HeuristicSummarizer(),
+        information_flow_service=info_svc,
+    )
+
+    state = AgentState(
+        session_id="sess-log2",
+        input_messages=[{"role": "user", "content": "key=sk-secret123"}],
+        working_messages=[{"role": "user", "content": "key=sk-secret123"}],
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.application.agent_graph"):
+        await runner.call_llm(state)
+
+    request_logs = [r for r in caplog.records if "LLM request" in r.getMessage()]
+    response_logs = [r for r in caplog.records if "LLM response" in r.getMessage()]
+    assert len(request_logs) == 1
+    assert len(response_logs) == 1
+    # Secret must be redacted in logs
+    assert "sk-secret123" not in request_logs[0].getMessage()
+    assert "sk-secret123" not in response_logs[0].getMessage()
+    assert "[REDACTED]" in request_logs[0].getMessage()
+    assert "[REDACTED]" in response_logs[0].getMessage()
 
 
 @pytest.mark.asyncio
@@ -457,6 +510,93 @@ async def test_call_llm_generation_params_none_when_no_public_options(tmp_path):
     assert len(usage_service.record_calls) == 1
     call = usage_service.record_calls[0]
     assert call["generation_params"] is None
+
+
+@pytest.mark.asyncio
+async def test_call_llm_usage_payloads_sanitized_when_secret_present(tmp_path):
+    """Usage recording must receive sanitized payloads when secrets are present.
+    Token/cost are still recorded; only the payload text is redacted."""
+    from app.application.information_flow_service import InformationFlowService
+    from app.application.policy_snapshot import InformationFlowPolicyConfig
+    from app.domain.information_flow import SecretCatalog
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-san"))
+
+    secret = "sk-secret123"
+    usage_dict = {"prompt_tokens": 50, "completion_tokens": 20}
+    provider = UsageCapturingProvider(usage=usage_dict, model_response=f"key={secret}")
+    info_svc = InformationFlowService(
+        InformationFlowPolicyConfig(store_usage_payloads=True, redact_secrets=True),
+        SecretCatalog(secret_values=frozenset({secret})),
+    )
+    usage_service = FakeUsageService()
+    runner = AgentGraphRunner(
+        llm_provider=provider,
+        tool_service=ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        memory_store=store,
+        summarizer=HeuristicSummarizer(),
+        usage_service=usage_service,
+        information_flow_service=info_svc,
+    )
+    state = AgentState(
+        session_id="sess-san",
+        input_messages=[{"role": "user", "content": f"key={secret}"}],
+        working_messages=[{"role": "user", "content": f"key={secret}"}],
+    )
+    await runner.call_llm(state)
+    assert len(usage_service.record_calls) == 1
+    call = usage_service.record_calls[0]
+    # Token/cost still recorded
+    assert call["raw_usage"] == usage_dict
+    # Payloads must be sanitized -- secret must not appear
+    assert call["request_messages"] is not None
+    assert secret not in call["request_messages"]
+    assert "[REDACTED]" in call["request_messages"]
+    assert call["response_message"] is not None
+    assert secret not in call["response_message"]
+    assert "[REDACTED]" in call["response_message"]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_usage_denied_raw_none_but_tokens_recorded(tmp_path):
+    """When store_usage_payloads=False, raw payload fields are None but
+    token/cost are still recorded."""
+    from app.application.information_flow_service import InformationFlowService
+    from app.application.policy_snapshot import InformationFlowPolicyConfig
+    from app.domain.information_flow import SecretCatalog
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-deny"))
+
+    usage_dict = {"prompt_tokens": 50, "completion_tokens": 20}
+    provider = UsageCapturingProvider(usage=usage_dict, model_response="hello")
+    info_svc = InformationFlowService(
+        InformationFlowPolicyConfig(store_usage_payloads=False, redact_secrets=True),
+        SecretCatalog(),
+    )
+    usage_service = FakeUsageService()
+    runner = AgentGraphRunner(
+        llm_provider=provider,
+        tool_service=ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        memory_store=store,
+        summarizer=HeuristicSummarizer(),
+        usage_service=usage_service,
+        information_flow_service=info_svc,
+    )
+    state = AgentState(
+        session_id="sess-deny",
+        input_messages=[{"role": "user", "content": "hi"}],
+        working_messages=[{"role": "user", "content": "hi"}],
+    )
+    await runner.call_llm(state)
+    assert len(usage_service.record_calls) == 1
+    call = usage_service.record_calls[0]
+    # Token/cost still recorded
+    assert call["raw_usage"] == usage_dict
+    # Payloads denied -> None
+    assert call["request_messages"] is None
+    assert call["response_message"] is None
 
 
 @pytest.mark.asyncio

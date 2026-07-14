@@ -13,6 +13,16 @@ from app.domain.session import ConversationMessage, Summary
 
 
 class FakeContextEngine:
+    # T7: Config attributes read by ContextService._get_engine_config.
+    # Low threshold so short test messages trigger compression.
+    context_length = 100
+    threshold_percent = 0.01
+    protect_first_n = 3
+    protect_last_n = 10
+    summary_target_ratio = 0.2
+    cooldown_seconds = 300
+    tail_budget_enabled = False
+
     def __init__(self, result: ContextCompressionResult):
         self._result = result
         self.compress_calls = 0
@@ -24,6 +34,9 @@ class FakeContextEngine:
         self.should_compress_calls += 1
         self.last_should_compress_force = force
         return True
+
+    def is_in_cooldown(self) -> bool:
+        return False
 
     async def compress(self, messages, *, current_tokens=None, force=False, existing_summary=""):
         self.compress_calls += 1
@@ -1038,7 +1051,7 @@ async def test_compress_context_rejects_result_with_zero_or_multiple_summary_mes
 
 @pytest.mark.asyncio
 async def test_compress_context_passes_force_from_run_options():
-    """When run_options has force_compress=True, force=True is passed to should_compress and compress."""
+    """When run_options has force_compress=True, force=True is passed to compress."""
     compressed_msgs = [{"role": "user", "content": f"{CONTEXT_SUMMARY_PREFIX}summary"}]
     result = ContextCompressionResult(
         messages=compressed_msgs, summary="summary", compressed=True,
@@ -1062,7 +1075,7 @@ async def test_compress_context_passes_force_from_run_options():
         run_options={"force_compress": True},
     )
     await runner.context_service.compress_prepared_context(state)
-    assert fake_engine.last_should_compress_force is True
+    # T7: ContextPolicy decides compression; force is passed to compress
     assert fake_engine.last_compress_force is True
 
 
@@ -1092,7 +1105,7 @@ async def test_compress_context_does_not_force_by_default():
         run_options={},
     )
     await runner.context_service.compress_prepared_context(state)
-    assert fake_engine.last_should_compress_force is False
+    # T7: ContextPolicy decides compression; force=False passed to compress
     assert fake_engine.last_compress_force is False
 
 

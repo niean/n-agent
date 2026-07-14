@@ -63,7 +63,7 @@ def test_all_tab_paths_return_shell(tmp_path):
         "/memory", "/sandbox",
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
         "/tools/external-memory", "/tools/sandbox",
-        "/models", "/observations/sessions", "/observations/modules", "/scheduled-tasks", "/platforms",
+        "/models", "/observations/sessions", "/observations/modules", "/scheduled-tasks", "/platforms", "/security",
     )
     for path in paths:
         response = client.get(path)
@@ -140,7 +140,7 @@ def test_static_assets_contain_expected_logic(tmp_path):
     chat_js = client.get('/static/chat.js').text
     assert '/chat/external-memory/memory-providers' in chat_js
     assert 'event.shiftKey' in chat_js
-    assert 'metadata' in chat_js
+    assert 'X-Session-ID' in chat_js
     assert "'[DONE]'" in chat_js or 'data: [DONE]' in chat_js
     assert 'if (!text && !pendingImages.length) return' in chat_js
     assert 'renameSession' in chat_js
@@ -262,11 +262,22 @@ def test_scheduled_tasks_static_assets_contain_management_ui(tmp_path):
         '.textContent',
     ):
         assert expected in scheduled_js
+    # 确认执行后不再弹出结果弹框（prd: 确认后弹框消失）
+    assert 'function renderRunResult' not in scheduled_js
+    assert "type: 'run_result'" not in scheduled_js
     row_start = scheduled_js.index('function renderTaskRow(task)')
     row_end = scheduled_js.index('function openTaskForm(task)', row_start)
     row_body = scheduled_js[row_start:row_end]
     assert "badge(text(task.last_status), statusKind(task.last_status))" in row_body
     assert 'task.last_completed_at' not in row_body
+    # 详情入口使用本 Tab 导航，不再新建标签页（prd: 详情页面使用本Tab）
+    assert "linkButton" not in row_body
+    assert "target = '_blank'" not in row_body
+    assert "goToDetail(task.id)" in row_body
+    # 执行按钮二次确认：点击后先弹确认框，确认后再触发执行（prd: 执行按钮，弹框确认后再触发执行）
+    assert "confirmRunTask(task)" in row_body
+    assert "function renderRunConfirm" in scheduled_js
+    assert "type: 'run_confirm'" in scheduled_js
     assert 'innerHTML =' not in scheduled_js
     assert 'insertAdjacentHTML' not in scheduled_js
 

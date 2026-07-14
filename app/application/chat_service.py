@@ -8,10 +8,20 @@ from uuid import uuid4
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.events import ChatEvent, ChatEventType
+from app.application.information_flow_service import InformationFlowService
+from app.application.policy_snapshot import (
+    IngressFacts,
+    InformationFlowPolicyConfig,
+    RunPolicySnapshot,
+    RunPolicySnapshotFactory,
+)
+from app.application.runtime_memory_service import RuntimeMemoryService
+from app.application.session_bootstrap import SessionBootstrapReader, SessionDescriptor
 from app.application.session_service import SessionService
 from app.domain.agent import AgentState
+from app.domain.information_flow import ReleaseTarget, SecretCatalog
 from app.domain.memory import MemoryStore
-from app.domain.session import ConversationMessage, SessionSource
+from app.domain.session import ConversationSession, SessionSource
 from app.domain.tool import (
     ApprovalDecider,
     ConfirmToolGrant,
@@ -36,6 +46,8 @@ class ChatCompletionInput:
     trusted_metadata: dict[str, Any] = field(default_factory=dict)
     approval_decider: ApprovalDecider | None = None
     allowed_confirm_tools_override: dict[str, ConfirmToolGrant] | None = None
+    ingress_facts: IngressFacts | None = None
+    session_descriptor: SessionDescriptor | None = None
 
 
 @dataclass(frozen=True)
@@ -55,12 +67,25 @@ class ChatCompletionService:
         session_service: SessionService,
         external_memory_reader: "ActiveExternalMemoryReader | None" = None,
         slot_resolver: "Callable[[str], str | None] | None" = None,
+        information_flow_service: InformationFlowService | None = None,
+        runtime_memory_service: RuntimeMemoryService | None = None,
+        policy_snapshot_factory: RunPolicySnapshotFactory | None = None,
+        session_bootstrap_reader: SessionBootstrapReader | None = None,
     ):
         self.memory_store = memory_store
         self.graph_runner = graph_runner
         self.session_service = session_service
         self._external_memory_reader = external_memory_reader
         self._slot_resolver = slot_resolver
+        self._information_flow_service = information_flow_service or InformationFlowService(
+            InformationFlowPolicyConfig(),
+            SecretCatalog(),
+        )
+        self._runtime_memory = runtime_memory_service or RuntimeMemoryService(memory_store)
+        self._policy_snapshot_factory = policy_snapshot_factory
+        self._session_bootstrap_reader = session_bootstrap_reader or SessionBootstrapReader(
+            memory_store
+        )
 
     async def compress_session(self, session_id: str) -> dict[str, Any]:
         """Force compress a session's context without LLM call.
@@ -71,10 +96,16 @@ class ChatCompletionService:
         return await self.graph_runner.compress_session(session_id)
 
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
-        session_id = request.session_id or request.metadata.get("session_id") or f"api-{uuid4()}"
-        await self.session_service.create_session(session_id, source=SessionSource.API.value)
-        session = await self.memory_store.get_session(session_id)
-        existing_messages = await self.memory_store.list_messages(session_id)
+        session_id = request.session_id or f"api-{uuid4()}"
+        snapshot = await self._build_policy_snapshot(request, session_id)
+        session_source = (
+            snapshot.run_context.source if snapshot is not None else SessionSource.API.value
+        )
+        await self._runtime_memory.create_session_if_allowed(
+            ConversationSession(id=session_id, source=session_source)
+        )
+        session = await self._runtime_memory.get_session_if_allowed(session_id)
+        existing_messages = await self._runtime_memory.read_session_messages(session_id)
         has_override = "external_memory_enabled" in request.options
         requested_memory = self._normalize_external_memory_enabled(request.options.get("external_memory_enabled"))
         if session is not None and session.external_memory_enabled is not None:
@@ -86,7 +117,7 @@ class ChatCompletionService:
         else:
             locked_external_memory = []
 
-        locked_external_memory = await self.memory_store.lock_session_external_memory(
+        locked_external_memory = await self._runtime_memory.lock_profile(
             session_id, locked_external_memory, slots=self._build_slot_map(locked_external_memory),
         )
         normalized_messages: list[dict[str, Any]] = []
@@ -114,36 +145,51 @@ class ChatCompletionService:
             )
         for message in normalized_messages:
             if message.get("role") == "user":
-                await self.memory_store.append_message(
+                await self._runtime_memory.append_user_message(
                     session_id,
-                    ConversationMessage(role="user", content=message.get("content", "")),
+                    message.get("content", ""),
                 )
         await self.session_service.ensure_title(session_id, str(first_user_message))
-        state = AgentState(session_id=session_id, input_messages=normalized_messages)
+        state = AgentState(
+            session_id=session_id,
+            run_id=snapshot.run_context.run_id if snapshot is not None else str(uuid4()),
+            input_messages=normalized_messages,
+        )
         options = dict(request.options)
+        if snapshot is not None:
+            options["_policy_snapshot"] = snapshot
         if _detect_conversational_compress(first_user_message):
             options["force_compress"] = True
         options["external_memory_enabled"] = locked_external_memory
-        mode = options.get("execution_context_mode") or "realtime"
+        # Read execution_mode from trusted_metadata (structured, T11) with
+        # fallback to options dict (backward compat for existing callers).
+        trusted_metadata = dict(request.trusted_metadata)
+        if snapshot is not None:
+            mode = snapshot.run_context.execution_mode.value
+            trusted_metadata = dict(snapshot.run_context.trusted_claims)
+        else:
+            mode = trusted_metadata.get("execution_mode") or options.get("execution_context_mode") or "realtime"
+        options["execution_context_mode"] = mode
         if mode == "unattended":
             options["tool_exposure_policy"] = "safe_only"
 
         # If caller didn't set agent_context, derive from execution_context_mode
-        if "agent_context" not in request.trusted_metadata:
+        if "agent_context" not in trusted_metadata:
             if mode == "realtime":
                 # Interactive realtime conversation -> primary allows writes
-                request.trusted_metadata["agent_context"] = "primary"
+                trusted_metadata["agent_context"] = "primary"
             else:
                 # unattended/cron/subagent -> non-primary prohibits writes
-                request.trusted_metadata["agent_context"] = "unattended"
+                trusted_metadata["agent_context"] = "unattended"
 
         mcp_ctx = _mcp_tool_execution_context(str(first_user_message)) if mode == "realtime" else ToolExecutionContext()
-        permitted = self._compute_permitted_managed_tools(mode, request.trusted_metadata)
+        permitted = self._compute_permitted_managed_tools(mode, trusted_metadata)
         ctx = ToolExecutionContext(
             allowed_confirm_tools=dict(mcp_ctx.allowed_confirm_tools),
             session_id=session_id,
+            run_id=state.run_id,
             metadata=dict(request.metadata),
-            trusted_metadata=dict(request.trusted_metadata),
+            trusted_metadata=trusted_metadata,
             execution_context_mode=mode,
             permitted_managed_tools=permitted,
             enabled_override=locked_external_memory,
@@ -170,18 +216,74 @@ class ChatCompletionService:
             return self.graph_runner.stream_events(state, request.model, options)
         final_state = await self.graph_runner.run(state, request.model, options)
         if final_state.error:
+            # Even error messages go through release -- secrets in error
+            # text must not leak to the client.
+            error_content = final_state.error
+            release = self._information_flow_service.release(
+                error_content, ReleaseTarget.CLIENT_RESPONSE, origin="error_message",
+            )
+            if release.allowed and release.content is not None:
+                safe_content = release.content
+            else:
+                safe_content = "information_release_denied"
             return ChatCompletionResult(
                 session_id=session_id,
                 model=request.model,
-                message={"role": "assistant", "content": final_state.error},
+                message={"role": "assistant", "content": safe_content},
+                finish_reason="error",
+            )
+        # Release final message content through InformationFlowService (client_response target).
+        # ALLOW+transform -> sanitized message; DENY/exception -> stable error, no original.
+        raw_content = str(final_state.final_message.get("content") or "") if final_state.final_message else ""
+        release = self._information_flow_service.release(
+            raw_content, ReleaseTarget.CLIENT_RESPONSE, origin="assistant_response",
+        )
+        if not release.allowed or release.content is None:
+            return ChatCompletionResult(
+                session_id=session_id,
+                model=request.model,
+                message={"role": "assistant", "content": "information_release_denied"},
                 finish_reason="error",
             )
         return ChatCompletionResult(
             session_id=session_id,
             model=request.model,
-            message=final_state.final_message or {"role": "assistant", "content": ""},
+            message={"role": "assistant", "content": release.content},
             finish_reason=final_state.finish_reason or "stop",
         )
+
+    async def _build_policy_snapshot(
+        self,
+        request: ChatCompletionInput,
+        session_id: str,
+    ) -> RunPolicySnapshot | None:
+        if self._policy_snapshot_factory is None:
+            return None
+        ingress = request.ingress_facts or IngressFacts(
+            run_id=str(uuid4()),
+            session_id=session_id,
+            source=str(request.trusted_metadata.get("gateway.source") or "api"),
+            actor_id=str(request.trusted_metadata.get("actor_id") or "") or None,
+            execution_mode=self._execution_mode_from_request(request),
+            trusted_claims=dict(request.trusted_metadata),
+        )
+        if ingress.session_id != session_id:
+            raise ValueError("policy_context_invalid: ingress session mismatch")
+        descriptor = request.session_descriptor or await self._session_bootstrap_reader.describe_unchecked(
+            session_id,
+            provisional_source=ingress.source,
+        )
+        return self._policy_snapshot_factory.create(ingress, descriptor)
+
+    @staticmethod
+    def _execution_mode_from_request(request: ChatCompletionInput):
+        from app.domain.policy import ExecutionMode
+
+        raw = request.trusted_metadata.get("execution_mode", "realtime")
+        try:
+            return ExecutionMode(str(raw))
+        except ValueError:
+            return ExecutionMode.REALTIME
 
     @staticmethod
     def _compute_permitted_managed_tools(mode: str, trusted_metadata: dict[str, Any]) -> set[str]:

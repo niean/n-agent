@@ -11,6 +11,7 @@
     platforms: false,
     memory: false,
     sandbox: false,
+    security: false,
     'tools-builtin': false,
     'tools-mcp': false,
     'tools-knowledge': false,
@@ -28,6 +29,7 @@
     if (tab === 'sandbox') return namespace.sandbox;
     if (tab === 'observations-sessions') return namespace.observations;
     if (tab === 'observations-modules') return namespace.status;
+    if (tab === 'security') return namespace.security;
     return null;
   }
 

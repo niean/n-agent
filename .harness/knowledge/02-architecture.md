@@ -9,7 +9,7 @@
 
 项目严格遵循领域驱动设计 DDD，采用外层依赖内层的方向：Interfaces -> Application -> Domain。Infrastructure 只实现 Domain 定义的端口，并在应用启动时注入。
 
-- Domain 层：核心子域包括 TurnLoop、Context、LLM、Memory、Tool，支撑子域包括 Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation；各子域定义自己的模型、值对象和端口协议。`app/domain/policy.py` 是 Domain Shared Kernel，只统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`；具体规则归各业务领域的 `XPolicy`。Storage 与 Model Provider 通过领域端口形成外部边界。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
+- Domain 层：核心子域包括 TurnLoop、Context、LLM、Memory、Tool，支撑子域包括 Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation；各子域定义自己的模型、值对象和端口协议。`app/domain/policy.py` 是 Domain Shared Kernel，统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`、`ExecutionMode`；10 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy）各自独立，不跨域导入。Storage 与 Model Provider 通过领域端口形成外部边界。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
 - Application 层：编排用例和 Agent Runtime。LangGraph 属于本层，只负责状态图和运行流程编排。
 - Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、Knowledge HTTP adapter、配置加载等。
 - Interfaces 层：实现 FastAPI、OpenAI-compatible API、Dashboard 和协议转换。
@@ -42,6 +42,49 @@
 - ACP stdio 服务端：N-Agent 内置 ACP（Agent Client Protocol）stdio JSON-RPC 服务端，支持 VsCode/Zed 等 ACP 兼容客户端通过 `docker exec -i n-agent-n-agent-1 n-agent acp` 或 `kubectl exec -i <pod> -- n-agent acp` 接入容器内 Agent。Domain 扩展 `ApprovalDecider` 端口与 `ApprovalRequest`/`ApprovalDecision` 值对象（工具调用审批决策），`ConversationSession.acp_metadata` 字段（ACP 会话元数据）；Application 的 `ChatCompletionInput` 增加可选 `approval_decider` 与 `allowed_confirm_tools_override` 字段，`GatewayService.handle_message_stream` 支持调用方传入 model/options/trusted_metadata/approval override，供 ACP 的 `session/prompt` 在复用 Gateway 会话映射、命令分流、幂等与 trusted metadata 组装后进入 ChatCompletionService；`AgentGraphRunner` 支持 task state interrupt 注册与查询（cancel 时通过 `asyncio.CancelledError` 中断 prompt）。Interfaces 的 `app/interfaces/cli/commands/acp/` package 实现 ACP stdio 服务端（`command.py` 入口与 stdout 纯净保证、`agent.py` `NAgentACPAgent(acp.Agent)` 13 个 SDK 方法、`path_mapping.py` host↔container cwd 映射、`session_bridge.py` ACP session↔N-Agent session 桥、`event_bridge.py` ChatEvent→ACP session update 桥与 history replay、`permission_bridge.py` ApprovalDecider→ACP PermissionOption 桥、`auth.py` provider Token 认证桥）。stdout 仅承载 JSON-RPC 帧，所有日志/诊断走 stderr；host cwd 通过 `N_AGENT_ACP_HOST_WORKSPACE_ROOT` + `N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT` 环境变量映射到容器路径，不可映射时 `session/new` 拒绝并返回协议错误，不回退到 `Path.cwd()`。ACP 会话 `source="acp"`，元数据持久化到 `sessions.acp_metadata_json` 列；initialize/authenticate/session/new/load/list/fork/cancel/close 等 ACP 协议生命周期保留在 ACP adapter，只有 `session/prompt` 用户消息经 GatewayService → ChatCompletionService。
 
 ## 演进边界
+
+## Policy Mesh 治理架构
+
+Policy Mesh 是 N-Agent 的运行时治理层，由 10 个领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成。每个 Policy 独立决策一个治理维度，Application Service 在外部调用前封口执行。
+
+### 10 个领域 Policy
+
+| Policy | Domain 文件 | 治理维度 | 执行点 |
+|--------|------------|---------|--------|
+| TurnPolicy | `turn_policy.py` | 迭代上限、结束原因 | AgentGraph 路由 |
+| ContextPolicy | `context_policy.py` | 上下文压缩阈值与保护段 | ContextService |
+| LLMPolicy | `llm_policy.py` | LLM fallback、vision preflight | ModelService.call_llm |
+| ToolPolicy | `tool_policy.py` | 工具定义校验、暴露、执行审批 | ToolService.execute |
+| MemoryPolicy | `memory_policy.py` | 读写、跨会话、外部记忆门控 | RuntimeMemoryService |
+| SandboxPolicy | `sandbox_policy.py` | CPU/内存/时间/callback 授权 | SandboxToolExecutor、TerminalToolExecutor |
+| GatewayPolicy | `gateway_policy.py` | 出站消息目标与内容 | GatewayService |
+| SchedulePolicy | `schedule_policy.py` | cron 安全、claim 原子性、投递 | ScheduleRunService |
+| BudgetPolicy | `budget_policy.py` | LLM/Tool/Sandbox 调用配额 | BudgetService |
+| InformationFlowPolicy | `information_flow_policy.py` | 密级、释放目标、脱敏 | InformationFlowService |
+
+约束：Domain Policy 不导入 Application/Infrastructure；一个 Policy 不导入另一个 Policy（AST 测试 `tests/architecture/test_policy_boundaries.py` 强制）。
+
+### Shared Kernel（`app/domain/policy.py`）
+
+`PolicyOutcome`（allow/deny/require_approval）、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`（Protocol）、`ExecutionMode`、`PolicyDecisionKind`（admission/plan/selection/allocation）。
+
+### RunPolicySnapshot（`app/application/policy_snapshot.py`）
+
+不可变 frozen dataclass，携带 10 个 typed config + IngressFacts（run_id、session_id、execution_mode、trusted_claims）。由 `RunPolicySnapshotFactory` 从 `PolicyProfileProvider` 解析 profile 后构造。不持有任何 mutable runtime state（RunBudgetAccount、Manager、Store 等禁止出现在字段中，AST 测试强制）。
+
+### 封口执行点
+
+- ToolService.execute：ToolPolicy 准入 -> BudgetService.reserve(TOOL_CALL) -> InformationFlowService.release(TOOL_MCP_PLUGIN) 输入脱敏 -> executor -> BudgetService.settle -> InformationFlowService.redact_structured 输出脱敏。deny -> executor 不调用。
+- ModelService.call_llm：LLMPolicy preflight -> BudgetService.reserve(LLM_CALL) -> provider -> BudgetService.settle。InformationFlow 覆盖 LLM_PAYLOAD_LOG / USAGE_RETENTION / CLIENT_RESPONSE / stream。
+- SandboxToolExecutor / TerminalToolExecutor：SandboxPolicy authorize -> BudgetService.reserve(SANDBOX_RESOURCE) -> Docker/Local 执行。
+- RuntimeMemoryService：MemoryPolicy 评估每个操作（read/write/sync/external），deny -> store 不调用。
+- GatewayService：GatewayPolicy 评估出站目标。
+- ScheduleRunService：SchedulePolicy 评估 cron 安全 + claim 原子性 + 投递。
+- 所有 Tool 执行器（Builtin/MCP/Plugin/ExternalMemory/Sandbox/Terminal/Knowledge/Schedule）通过 CompositeToolExecutor 路由到 ToolService.execute，统一受 Budget + InformationFlow 封口。
+
+### 审计通道
+
+`PolicyAuditService`（Application）委托 `PolicyAuditSink`（Protocol）。生产实现 `LoggingPolicyAuditSink`（Infrastructure）输出结构化 JSON 日志。已接入 RuntimeMemoryService、BudgetService、InformationFlowService、ToolService。`PolicyAuditEvent` 无 raw prompt / secret / tool arguments 字段，sink 无法泄漏。
 
 后续完整 Agent 能力应在现有边界内迭代，不推倒重来。优先演进方向包括：
 

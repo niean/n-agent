@@ -80,7 +80,7 @@ def test_can_expose_fails_closed_for_non_exposure_enum_values(unknown):
 
 def test_tool_policy_implements_shared_policy_contract_and_request_is_frozen():
     tool_request = ToolPolicyRequest(definition(risk=RiskLevel.SAFE), request())
-    policy: Policy[ToolPolicyRequest, ToolExecutionContext] = ToolPolicy()
+    policy: Policy[ToolPolicyRequest, ToolExecutionContext, PolicyDecision] = ToolPolicy()
 
     assert_decision(policy.evaluate(tool_request), PolicyOutcome.ALLOW, "safe_tool")
     with pytest.raises(FrozenInstanceError):

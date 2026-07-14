@@ -123,3 +123,52 @@ async def test_interrupt_missing_does_not_create_entries(tmp_path):
     assert "nope" not in runner._running_tasks
     assert "nope" not in runner._cancel_events
     assert runner.is_cancelled("nope") is False
+
+
+@pytest.mark.asyncio
+async def test_flag_based_cancel_in_finalize_does_not_report_completed(tmp_path):
+    """T9: When is_cancelled is True at finalize time (flag-based cancel,
+    without CancelledError being raised), the run must NOT report as
+    clean COMPLETED. This covers the race where the cancel event is set
+    between a node completing and the next routing decision."""
+    from app.domain.agent import AgentState, RunStatus
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+    from app.domain.session import ConversationSession
+    from app.application.tool_service import ToolService, builtin_tool_definitions
+    from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
+    from app.infrastructure.tools.builtin import build_builtin_tool_executor
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-cancel-flag"))
+    runner = AgentGraphRunner(
+        _SlowProvider(),
+        ToolService(_NoToolExecutor(), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    # Register and immediately cancel -- cancel event is set but no
+    # CancelledError is raised (we call finalize directly).
+    fake_task = asyncio.get_event_loop().create_future()
+    runner.register_run("s-cancel-flag", fake_task)
+    runner.interrupt("s-cancel-flag")
+    assert runner.is_cancelled("s-cancel-flag") is True
+
+    # Simulate state after call_llm completed (final_message set) but
+    # cancel flag was set between call_llm return and the routing decision.
+    state = AgentState(
+        session_id="s-cancel-flag",
+        input_messages=[{"role": "user", "content": "hi"}],
+    )
+    state.final_message = {"role": "assistant", "content": "partial"}
+    state.iteration_count = 1
+    state.run_status = RunStatus.RUNNING
+
+    result = await runner.finalize(state)
+
+    # Cancelled run must NOT report as clean COMPLETED
+    assert result.run_status is RunStatus.FAILED
+    assert result.error is not None
+    assert "cancel" in result.error.lower()
+    assert result.final_message is not None
+
+    runner.clear_run("s-cancel-flag")

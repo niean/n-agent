@@ -693,3 +693,37 @@ Agent Runtime 在每次 LLM 调用后需归一化 usage（五桶 token + 成本�
 - Domain 值对象直接 import Infrastructure 会让 DDD 边界破坏（如 ContextBreakdownCalculator 直接依赖 ContextCompressor）；正确做法是 Domain 定义 Protocol，Infrastructure 实现，Application 通过 Protocol 注入
 - 价格表硬编码到 Domain 会让 Domain 依赖具体定价数据违反纯领域原则；正确做法是 Domain 定义 `PricingProvider` 端口 + `PricingEntry` 值对象，Infrastructure 实现 InMemoryPricingProvider
 - async 方法内部直接调用同步 sqlite3 会阻塞事件循环（与 SQLiteMemoryStore 一致，技术债 D018）；正确做法是 `asyncio.to_thread` 包装，但本期不修复保持与现有 pattern 一致
+
+## 模式二十一：Policy Mesh 治理封口
+
+### Policy Mesh 模式
+
+10 个领域 Policy 各自独立决策一个治理维度，不跨域导入。Application Service 在调用外部资源前封口执行：Policy 评估 -> deny 则外部资源不被调用。封口点覆盖 LLM（ModelService.call_llm）、Tool（ToolService.execute，通过 CompositeToolExecutor 统一路由 Builtin/MCP/Plugin/ExternalMemory/Sandbox/Terminal）、Memory（RuntimeMemoryService）、Sandbox（SandboxToolExecutor）、Gateway（GatewayService）、Schedule（ScheduleRunService）。
+
+关键约束（AST 测试 `tests/architecture/test_policy_boundaries.py` 强制）：
+- Domain Policy 文件不导入 Application/Infrastructure/框架
+- 一个 Policy 不导入另一个 Policy
+- RunPolicySnapshot 不持有 RunBudgetAccount/Manager/Store 等 mutable state
+
+### 非绕过 Facade 模式
+
+RuntimeMemoryService 是 MemoryStore 的非绕过 facade：不暴露 raw store 属性，所有方法经 MemoryPolicy 评估，deny -> store 不调用。调用方只能通过 facade 方法访问存储，无法绕过策略。
+
+### 两段式预算（reserve-settle-release）模式
+
+BudgetService 对每次外部调用执行三段式预算：
+1. reserve：调用前预留配额，DENY -> 调用不发生（fail-closed）
+2. settle：调用成功后用实际用量替换估算（conservative：unknown usage 保留估算不释放）
+3. release：调用前异常/取消时回滚预留（decrement counter）
+
+RunBudgetAccount 用 asyncio.Lock 序列化所有操作，保证 concurrent reserve 不 oversell。
+
+ToolService.execute 的 Budget 封口顺序：ToolPolicy 准入 -> BudgetService.reserve(TOOL_CALL) -> InformationFlowService.release(TOOL_MCP_PLUGIN) 输入脱敏 -> executor -> BudgetService.settle -> InformationFlowService.redact_structured 输出脱敏。deny -> executor 不调用；executor 异常 -> budget release（无泄漏）。
+
+### 流脱敏守卫（Stream Guard）模式
+
+InformationFlowStreamGuard 做增量流脱敏：lookbehind buffer 保留 `max_secret_length - 1` 字符，防止 secret 跨 chunk 泄漏。`feed(chunk)` 先追加到 buffer、redact、再释放除 tail 外的内容；`flush()` 释放剩余。transform 异常时 raise InformationFlowError，不 yield 原始内容。
+
+### 审计通道模式
+
+PolicyAuditService 委托 PolicyAuditSink Protocol，sink 失败只 log warning 不传播。PolicyAuditEvent 无 raw prompt/secret/tool arguments 字段，sink 无法泄漏。生产实现 LoggingPolicyAuditSink 输出 JSON 日志。已接入 RuntimeMemoryService、BudgetService、InformationFlowService、ToolService。InformationFlowService.release 是 sync 方法，审计用 fire-and-forget（asyncio.create_task）。

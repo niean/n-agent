@@ -103,3 +103,25 @@
 - ContextBreakdownCalculator：Domain 端口（`app/domain/usage.py`），定义 `compute(system_prompt, tool_definitions, messages, external_memory_block) -> ContextBreakdown`。Infrastructure 的 ContextBreakdownCalculatorImpl 实现，复用 ContextCompressor 的 ~4 chars/token 估算逻辑。
 - usage_records：SQLite 表，持久化每次 LLM 调用的 usage 明细，由 SqliteUsageRecorder.record_call 写入；sessions 表同步累加 token/cost/api_call_count。
 - compression_stats：SQLite 表，持久化上下文压缩前后的 token 对比，由 SqliteUsageRecorder.record_compression 写入；`tokens_saved` 用 `max(before-after, 0)` clamp 防止负值。
+
+## Policy Mesh 治理术语
+
+- Policy Mesh：N-Agent 运行时治理架构，由 10 个独立领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成；每个 Policy 治理一个维度，Application Service 在外部调用前封口执行。
+- RunPolicySnapshot：不可变 frozen dataclass（`app/application/policy_snapshot.py`），携带 10 个 typed config + IngressFacts（run_id/session_id/execution_mode/trusted_claims）；由 RunPolicySnapshotFactory 从 PolicyProfileProvider 构造；不持有任何 mutable runtime state。
+- RunPolicySnapshotFactory：Application 层工厂（`app/application/policy_snapshot.py`），从 PolicyProfileProvider 解析 profile 并构造 RunPolicySnapshot；不持有 Settings 引用。
+- IngressFacts：RunPolicySnapshot 中的不可变运行时入口事实，含 run_id、session_id、execution_mode、actor_id、trusted_claims。
+- BudgetPolicy / BudgetService：Domain 预算策略 + Application 服务；reserve(settle/release) 三段式预算生命周期，覆盖 LLM_CALL / TOOL_CALL / SANDBOX_RESOURCE / WALL_TIME 四种 reserve kind。
+- RunBudgetAccount：BudgetService 内部 per-run mutable 账户，asyncio.Lock 序列化所有 reserve/settle/release，保证 no-oversell。
+- InformationFlowPolicy / InformationFlowService：Domain 信息流策略 + Application 服务；评估 content 对 ReleaseTarget 的释放决策（allow+redaction / deny），覆盖 LLM_PAYLOAD_LOG / USAGE_RETENTION / CLIENT_RESPONSE / TOOL_MCP_PLUGIN / stream。
+- InformationFlowStreamGuard：InformationFlowService 创建的增量流脱敏守卫，lookbehind buffer 防止 secret 跨 chunk 泄漏。
+- SandboxExecutionGrant：SandboxPolicy authorize 返回的不可变授权令牌，含 timeout/cpus/memory/callbacks 限制；SandboxToolExecutor 持有 grant 执行。
+- MemoryPolicy / RuntimeMemoryService：Domain 记忆策略 + Application 非绕过 facade；MemoryPolicy 评估 read/write/sync/external 操作，deny -> store 不调用。
+- GatewayPolicy：Domain 出站策略，评估消息目标（origin/dashboard/silent）与内容。
+- SchedulePolicy：Domain 调度策略，评估 cron 安全 + claim 原子性 + 投递。
+- TurnPolicy / EndReason：Domain 轮次策略 + 结束原因枚举，控制 AgentGraph 迭代上限与路由。
+- ContextPolicy：Domain 上下文策略，评估压缩阈值与保护段。
+- LLMPolicy / LLMConfig：Domain LLM 策略 + 配置，控制 fallback 与 vision preflight。
+- PolicyAuditService / PolicyAuditSink：Application 审计服务 + Domain 审计 sink Protocol；生产实现 LoggingPolicyAuditSink 输出 JSON 日志。
+- PolicyAuditEvent：Domain 不可变审计事件，含 policy/version/decision_kind/reason/run_id/session_id/outcome；无 raw prompt/secret/tool arguments 字段。
+- PolicyDecisionKind：审计决策类型枚举（admission/plan/selection/allocation）。
+- 封口（sealing）：Policy Mesh 的执行模式，指 Application Service 在调用外部资源（LLM/Tool/Sandbox/Memory/Gateway）前必须经过 Policy 评估，deny -> 外部资源不被调用。

@@ -94,6 +94,11 @@ class ExternalMemoryManager:
     工具名采用 first-wins，避免路由漂移。
 
     Special case: MultiProjectMemory exposes each subdirectory as a separate selectable option.
+
+    Note: Runtime callers (AgentGraphRunner, ContextService, ExternalMemoryToolExecutor)
+    should route external memory read/write/sync through RuntimeMemoryService for
+    MemoryPolicy gating. Direct calls from management/admin paths (SessionService)
+    are acceptable.
     """
 
     def __init__(

@@ -18,6 +18,7 @@
     { tab: 'observations', label: '观测', parent: true, children: ['observations-sessions', 'observations-modules'] },
     { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', parentTab: 'observations' },
     { tab: 'observations-modules', path: '/observations/modules', label: '组件', parentTab: 'observations' },
+    { tab: 'security', path: '/security', label: '安全' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
   const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));

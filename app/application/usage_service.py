@@ -91,6 +91,14 @@ class UsageService:
         tools: str | None = None,
         generation_params: str | None = None,
     ) -> None:
+        """Record a single LLM API call for usage tracking.
+
+        Payload parameters (request_messages, response_message, tools) must
+        already be sanitized by InformationFlowService (USAGE_RETENTION target).
+        When the release is denied, the caller passes None for these fields;
+        token/cost data (raw_usage) is always recorded regardless of payload
+        release verdict.
+        """
         usage = self.normalize_usage(raw_usage, provider_kind)
         if usage.request_count == 0:
             logger.warning("skip usage record: empty usage for session=%s model=%s", session_id, model)

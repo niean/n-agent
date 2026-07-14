@@ -100,6 +100,12 @@ class SQLiteScheduledTaskRegistry:
             return cursor.rowcount > 0
 
     async def claim_due_tasks(self, now: datetime, limit: int, lease_seconds: int) -> list[ScheduledTaskClaim]:
+        """Claim due tasks atomically (two-segment model).
+
+        Segment 1 (in-transaction): status/due/concurrency/lease CAS.
+        The skipped_missed decision is NOT computed here -- it is a
+        post-claim decision handled by SchedulePolicy.
+        """
         now = _aware_utc(now)
         claims: list[ScheduledTaskClaim] = []
         with self._connect() as conn:
@@ -116,14 +122,11 @@ class SQLiteScheduledTaskRegistry:
             for row in rows:
                 task = self._row_to_task(row)
                 next_run = self.calculator.next_after(task.schedule, now, task.timezone)
-                skipped = now - task.next_run_at > timedelta(seconds=self.missed_grace_seconds)
-                claim = self._claim(task, now, lease_seconds, "due", next_run, skipped)
+                claim = self._claim(task, now, lease_seconds, "due", next_run)
+                # CAS: status + due + lease checked atomically in the WHERE clause.
                 cursor = conn.execute(
                     """
-                    UPDATE scheduled_tasks SET lease_until=?, lease_owner=?, claim_id=?, next_run_at=?,
-                        last_run_at=CASE WHEN ? THEN ? ELSE last_run_at END,
-                        last_status=CASE WHEN ? THEN ? ELSE last_status END,
-                        updated_at=?
+                    UPDATE scheduled_tasks SET lease_until=?, lease_owner=?, claim_id=?, next_run_at=?, updated_at=?
                     WHERE id=? AND enabled=1 AND status=? AND (lease_until IS NULL OR lease_until < ?)
                     """,
                     (
@@ -131,10 +134,6 @@ class SQLiteScheduledTaskRegistry:
                         claim.lease_owner,
                         claim.claim_id,
                         _iso(claim.next_run_at),
-                        int(skipped),
-                        _iso(now),
-                        int(skipped),
-                        ScheduledTaskExecutionStatus.SKIPPED_MISSED.value,
                         _iso(now),
                         task.id,
                         ScheduledTaskStatus.ACTIVE.value,
@@ -169,7 +168,7 @@ class SQLiteScheduledTaskRegistry:
                 conn.commit()
                 return None
             task = self._row_to_task(row)
-            claim = self._claim(task, now, lease_seconds, "run_now", task.next_run_at, False)
+            claim = self._claim(task, now, lease_seconds, "run_now", task.next_run_at)
             cursor = conn.execute(
                 """
                 UPDATE scheduled_tasks SET lease_until=?, lease_owner=?, claim_id=?, updated_at=?
@@ -343,7 +342,6 @@ class SQLiteScheduledTaskRegistry:
         lease_seconds: int,
         reason: str,
         next_run_at: datetime,
-        skipped: bool,
     ) -> ScheduledTaskClaim:
         return ScheduledTaskClaim(
             task=task,
@@ -353,7 +351,6 @@ class SQLiteScheduledTaskRegistry:
             claimed_next_run_at=task.next_run_at,
             next_run_at=next_run_at,
             reason=reason,
-            skipped_missed=skipped,
         )
 
     def _task_params(self, task: ScheduledTask) -> tuple:

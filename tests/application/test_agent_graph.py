@@ -172,12 +172,24 @@ class CapturingSummarizer(HeuristicSummarizer):
 class AlwaysCompressEngine:
     """Fake ContextEngine that always triggers compression and captures messages."""
 
+    # T7: Config attributes read by ContextService._get_engine_config.
+    context_length = 100
+    threshold_percent = 0.01
+    protect_first_n = 3
+    protect_last_n = 10
+    summary_target_ratio = 0.2
+    cooldown_seconds = 300
+    tail_budget_enabled = False
+
     def __init__(self, summary_text: str = "generated summary"):
         self._summary_text = summary_text
         self.compress_messages: list[dict] | None = None
 
     def should_compress(self, messages, *, prompt_tokens=None, force=False):
         return True
+
+    def is_in_cooldown(self) -> bool:
+        return False
 
     async def compress(self, messages, *, current_tokens=None, force=False, existing_summary=""):
         self.compress_messages = list(messages)

@@ -75,6 +75,7 @@ ConfirmToolGrant = dict[str, Any] | Literal["session"]
 class ToolExecutionContext:
     allowed_confirm_tools: dict[str, ConfirmToolGrant] = field(default_factory=dict)
     session_id: str | None = None
+    run_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     trusted_metadata: dict[str, Any] = field(default_factory=dict)
     execution_context_mode: str = "realtime"

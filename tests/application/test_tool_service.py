@@ -681,3 +681,126 @@ async def test_execute_does_not_apply_executor_typeerror_fallback_to_policy_erro
 
     with pytest.raises(TypeError, match="policy failure"):
         await service.execute(ToolCallRequest(id="call", name="safe"))
+
+
+# ---------------------------------------------------------------------------
+# Tool Budget enforcement (T12 S3): reserve before executor; settle/release
+# ---------------------------------------------------------------------------
+
+from app.application.budget_service import BudgetService
+from app.application.policy_snapshot import BudgetPolicyConfig
+
+
+def _budget_service(max_tool_calls: int = 100) -> BudgetService:
+    return BudgetService(BudgetPolicyConfig(max_tool_calls=max_tool_calls))
+
+
+@pytest.mark.asyncio
+async def test_budget_reserved_on_allowed_path():
+    """A SAFE tool call that passes ToolPolicy admission reserves Budget."""
+    executor = RecordingExecutor()
+    budget = _budget_service(max_tool_calls=10)
+    service = ToolService(executor, [_definition("safe")], budget_service=budget)
+    ctx = ToolExecutionContext(session_id="sess-budget-1")
+
+    await service.execute(ToolCallRequest(id="c1", name="safe", arguments={}), ctx)
+
+    state = budget.get_state("sess-budget-1")
+    assert state is not None
+    assert state.tool_calls_reserved == 1  # settled (counter stays at 1)
+
+
+@pytest.mark.asyncio
+async def test_budget_reserved_on_approval_authorized_path():
+    """A CONFIRM tool call with explicit approval reserves Budget."""
+    executor = RecordingExecutor()
+    budget = _budget_service(max_tool_calls=10)
+    service = ToolService(executor, [_definition("confirm", risk_level=RiskLevel.CONFIRM)], budget_service=budget)
+    ctx = ToolExecutionContext(
+        session_id="sess-budget-2",
+        allowed_confirm_tools={"confirm": {"path": "a"}},
+    )
+
+    await service.execute(ToolCallRequest(id="c1", name="confirm", arguments={"path": "a"}), ctx)
+
+    state = budget.get_state("sess-budget-2")
+    assert state is not None
+    assert state.tool_calls_reserved == 1
+
+
+@pytest.mark.asyncio
+async def test_budget_not_reserved_on_deny_path():
+    """A DANGEROUS tool call denied by ToolPolicy never touches Budget."""
+    executor = RecordingExecutor()
+    budget = _budget_service(max_tool_calls=10)
+    service = ToolService(executor, [_definition("danger", risk_level=RiskLevel.DANGEROUS)], budget_service=budget)
+    ctx = ToolExecutionContext(session_id="sess-budget-3")
+
+    result = await service.execute(ToolCallRequest(id="c1", name="danger"), ctx)
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert len(executor.calls) == 0
+    # Budget account should not have been created
+    state = budget.get_state("sess-budget-3")
+    assert state is None or state.tool_calls_reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_budget_not_reserved_on_approval_required_path():
+    """A CONFIRM tool call without approval is denied; Budget is never touched."""
+    executor = RecordingExecutor()
+    budget = _budget_service(max_tool_calls=10)
+    service = ToolService(executor, [_definition("confirm", risk_level=RiskLevel.CONFIRM)], budget_service=budget)
+    ctx = ToolExecutionContext(session_id="sess-budget-4")
+
+    result = await service.execute(ToolCallRequest(id="c1", name="confirm", arguments={}), ctx)
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert len(executor.calls) == 0
+    state = budget.get_state("sess-budget-4")
+    assert state is None or state.tool_calls_reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_budget_released_on_executor_exception():
+    """When the executor raises, the Budget reservation is released (no leak)."""
+
+    class FailingExecutor:
+        async def execute(self, request: ToolCallRequest, context=None) -> ToolResult:
+            raise RuntimeError("executor failure")
+
+    budget = _budget_service(max_tool_calls=10)
+    service = ToolService(FailingExecutor(), [_definition("safe")], budget_service=budget)
+    ctx = ToolExecutionContext(session_id="sess-budget-5")
+
+    with pytest.raises(RuntimeError, match="executor failure"):
+        await service.execute(ToolCallRequest(id="c1", name="safe"), ctx)
+
+    state = budget.get_state("sess-budget-5")
+    assert state is not None
+    assert state.tool_calls_reserved == 0  # released -- no leak
+
+
+@pytest.mark.asyncio
+async def test_budget_released_on_cancel():
+    """When the executor is cancelled, the Budget reservation is released (no leak).
+
+    asyncio.CancelledError is a BaseException (not Exception) in Python 3.8+,
+    so it needs explicit handling to release the budget reservation.
+    """
+    import asyncio
+
+    class CancellingExecutor:
+        async def execute(self, request: ToolCallRequest, context=None) -> ToolResult:
+            raise asyncio.CancelledError()
+
+    budget = _budget_service(max_tool_calls=10)
+    service = ToolService(CancellingExecutor(), [_definition("safe")], budget_service=budget)
+    ctx = ToolExecutionContext(session_id="sess-budget-6")
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.execute(ToolCallRequest(id="c1", name="safe"), ctx)
+
+    state = budget.get_state("sess-budget-6")
+    assert state is not None
+    assert state.tool_calls_reserved == 0  # released -- no leak

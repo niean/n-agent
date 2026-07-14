@@ -383,6 +383,21 @@
         - 飞书：支持 ToolPolicy 工具审批，审批方式跟`破坏性 Slash Command`保持一致
         - TUI：支持 ToolPolicy 工具审批，审批方式跟`破坏性 Slash Command`保持一致(如果有)；实现方式，参考ACP和飞书支持ToolPolicy
 
+[20260714]
+- FR
+    - 任务：执行弹框，风格调整为一致(如对齐编辑弹框)
+    - 任务：执行按钮，弹框确认后再触发执行
+    - 任务：详情页面，使用本Tab、不再新建Tab
+    - 任务：任务详情，干掉右上角的按钮(刷新 执行)，返回按钮样式、改为`会话详情`页样式
+    - 任务：任务页面，整体总览修改样式、参考`会话`页，主要是标题、Sector风格，卡片风格维持现状
+    - 平台：健康状态，参照`安全-策略`的页面样式修改，特别是各Sector的数据展示样式
+    - 左导：平台、观测间，增加分隔符
+    - 安全：Policy领域自治，包括Turn、Context、LLM、Tool、Memory、Sandbox、Gateway、Schedule、Budget、InformationFlow 十类 Policy
+        - Spec：spec-260714-policy-governance.md
+        - Plan：plan-260714-policy-governance.md
+        - 待办：配置暂由代码默认值和 Settings 提供，不新增 Dashboard 策略管理或 SQLite Policy 表，但保留未来按团队、项目、个人租户解析独立 Policy 的稳定接入点
+    - 安全：新增安全一级菜单页面展示Policy，放到`观测`下方，分Sector、表格展示领域Policy策略
+
 
 ---
 
@@ -397,6 +412,7 @@
     - 架构：MoA，对标Hermes
     - 工具：Skill自进化
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明
+    - 租户：引入租户概念，如团队、项目、个人，租户间特定资源隔离
 
 ---
 

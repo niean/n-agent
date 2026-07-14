@@ -14,12 +14,22 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.application.agent_graph import AgentGraphRunner
+from app.application.budget_service import BudgetService
 from app.application.chat_service import ChatCompletionService
 from app.application.gateway_service import GatewayService
+from app.application.runtime_memory_service import RuntimeMemoryService
+from app.application.information_flow_service import InformationFlowService
 from app.application.knowledge_service import KnowledgeBaseCreateInput, KnowledgeService, KnowledgeToolExecutor
 from app.application.mcp_service import McpManagementToolExecutor, McpService, McpToolExecutor, mcp_management_tool_definitions
 from app.application.model_service import ModelService
 from app.application.platform_service import PlatformService
+from app.application.policy_snapshot import (
+    BudgetPolicyConfig,
+    RunPolicySnapshotFactory,
+    SettingsPolicyProfileProvider,
+)
+from app.application.policy_audit_service import PolicyAuditService
+from app.application.policy_dashboard_service import PolicyDashboardService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
 from app.application.schedule_run_service import ScheduleRunService
@@ -27,6 +37,7 @@ from app.application.schedule_service import ScheduleService
 from app.application.scheduled_agent_executor import ScheduledAgentExecutor
 from app.application.scheduler_runner import SchedulerRunner
 from app.application.session_service import SessionService
+from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
 from app.application.plugin_service import PluginService, PluginToolExecutor
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
@@ -34,6 +45,7 @@ from app.application.usage_service import UsageService
 from app.application.vision_tool_executor import VisionAnalyzeToolExecutor
 from app.config import Settings
 from app.domain.knowledge import KnowledgeBaseType
+from app.domain.llm_policy import LLMConfig, LLMPolicy
 from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, PlatformRegistry
 from app.domain.provider import ProviderConfig
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
@@ -91,9 +103,11 @@ from app.infrastructure.sandbox.manager import SandboxManager
 from app.infrastructure.sandbox.released_registry import SQLiteReleasedSandboxRegistry
 from app.infrastructure.sandbox.registry import InMemorySandboxCallbackToolRegistry
 from app.infrastructure.sandbox.search_provider import DuckDuckGoHtmlSearchProvider
+from app.infrastructure.policy.logging_sink import LoggingPolicyAuditSink
 from app.application.sandbox_dashboard_service import SandboxDashboardService
 from app.application.sandbox_tool_executor import SandboxToolExecutor
 from app.application.terminal_tool_executor import TerminalToolExecutor
+from app.domain.sandbox_policy import SandboxDomainConfig, SandboxPolicy
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 
 if TYPE_CHECKING:
@@ -250,6 +264,7 @@ class ApplicationServices:
     platform_registry: PlatformRegistry
     platform_service: PlatformService
     health_snapshot: Callable[[], dict]
+    policy_dashboard_service: PolicyDashboardService
     usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
     sandbox_manager: "_SandboxManager | None" = None
@@ -306,7 +321,32 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         + mcp_management_tool_definitions()
         + schedule_tool_definitions()
     )
-    tool_service = ToolService(CompositeToolExecutor(routes), tool_definitions)
+    # Policy audit sink + service (T12 S4: wired into all Policy-bearing services)
+    audit_sink = LoggingPolicyAuditSink()
+    audit_service = PolicyAuditService(audit_sink)
+    # Budget + InformationFlow services (created early so ToolService can enforce)
+    information_flow_service = InformationFlowService.from_settings(settings, audit_service=audit_service)
+    budget_service = BudgetService(
+        BudgetPolicyConfig(
+            max_wall_seconds=settings.budget_max_wall_seconds,
+            max_llm_calls=settings.budget_max_llm_calls,
+            max_tool_calls=settings.budget_max_tool_calls,
+            max_token_cost=settings.budget_max_token_cost,
+            max_usd_cost=settings.budget_max_usd_cost,
+            max_sandbox_seconds=settings.budget_max_sandbox_seconds,
+            max_sandbox_cpu_seconds=settings.budget_max_sandbox_cpu_seconds,
+            max_sandbox_memory_mb_seconds=settings.budget_max_sandbox_memory_mb_seconds,
+            max_sandbox_callback_calls=settings.budget_max_sandbox_callback_calls,
+        ),
+        audit_service=audit_service,
+    )
+    tool_service = ToolService(
+        CompositeToolExecutor(routes),
+        tool_definitions,
+        budget_service=budget_service,
+        information_flow_service=information_flow_service,
+        audit_service=audit_service,
+    )
     mcp_service = McpService(mcp_registry, mcp_client, tool_service)
     mcp_management_executor = McpManagementToolExecutor(mcp_service)
     for definition in mcp_management_tool_definitions():
@@ -396,7 +436,17 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         "external_memory",
         external_memory_manager.get_tool_definitions(),
     )
-    memory_executor = ExternalMemoryToolExecutor(external_memory_manager)
+    runtime_memory_service = RuntimeMemoryService(
+        memory_store,
+        audit_sink=audit_sink,
+        external_memory_manager=external_memory_manager,
+        cross_session_read_enabled=settings.memory_cross_session_read_enabled,
+        unattended_write_enabled=settings.memory_unattended_write_enabled,
+    )
+    memory_executor = ExternalMemoryToolExecutor(
+        external_memory_manager,
+        runtime_memory_service=runtime_memory_service,
+    )
     for tool_def in external_memory_manager.get_tool_definitions():
         routes[tool_def.name] = memory_executor
 
@@ -450,7 +500,10 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     def _refresh_external_memory_tools():
         tool_defs = external_memory_manager.get_tool_definitions()
         tool_service.set_dynamic_definitions("external_memory", tool_defs)
-        memory_executor_local = ExternalMemoryToolExecutor(external_memory_manager)
+        memory_executor_local = ExternalMemoryToolExecutor(
+            external_memory_manager,
+            runtime_memory_service=runtime_memory_service,
+        )
         # 先移除不再存在的 external memory 工具路由（避免 stale 路由堆积）
         current_names = {d.name for d in tool_defs}
         stale = [n for n in list(routes) if n not in current_names and _is_external_memory_tool_name(n)]
@@ -515,17 +568,27 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         InMemoryPricingProvider(),
         ContextBreakdownCalculatorImpl(),
     )
+    # information_flow_service and budget_service are created earlier (before ToolService)
+    # so they can be wired into ToolService for封口 enforcement.
+    llm_policy = LLMPolicy()
+    llm_config = LLMConfig(fallback_enabled=settings.llm_fallback_enabled)
     graph_runner = AgentGraphRunner(
         holder,
         tool_service,
         memory_store,
         summarizer,
-        settings.agent_iteration_limit,
+        iteration_limit=settings.agent_iteration_limit,
+        turn_timeout_seconds=settings.agent_turn_timeout_seconds,
         external_memory_manager=external_memory_manager,
         vision_capability=lambda: bool(holder.current_config and holder.current_config.supports_vision),
         context_engine=context_engine,
         usage_service=usage_service,
         skill_service=skill_service,
+        information_flow_service=information_flow_service,
+        runtime_memory_service=runtime_memory_service,
+        budget_service=budget_service,
+        llm_policy=llm_policy,
+        llm_config=llm_config,
     )
     session_service = SessionService(
         memory_store,
@@ -538,6 +601,12 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         session_service,
         external_memory_reader=external_memory_provider_service,
         slot_resolver=external_memory_manager.resolve_provider_slot,
+        information_flow_service=information_flow_service,
+        runtime_memory_service=runtime_memory_service,
+        policy_snapshot_factory=RunPolicySnapshotFactory(
+            SettingsPolicyProfileProvider(settings)
+        ),
+        session_bootstrap_reader=SessionBootstrapReader(memory_store),
     )
     model_service = ModelService(holder, lambda: holder.current_model)
     schedule_calculator = CroniterScheduleCalculator()
@@ -563,6 +632,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         ScheduleOutboundDelivery(feishu_client, gateway_registry.get_home_target),
         max_due_per_tick=settings.scheduler_max_due_per_tick,
         lease_seconds=settings.scheduler_lease_seconds,
+        missed_grace_seconds=settings.scheduler_missed_grace_seconds,
+        information_flow_service=information_flow_service,
     )
     schedule_service = ScheduleService(
         schedule_registry,
@@ -634,6 +705,30 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         host_scratch_root=sandbox_host_scratch_root,
         released_registry=sandbox_released_registry,
     )
+    # Build SandboxPolicy + config (T10: grant-based authorization)
+    _callback_tools_raw = settings.sandbox_callback_tools
+    if isinstance(_callback_tools_raw, str):
+        _allowed_callbacks = frozenset(
+            t.strip() for t in _callback_tools_raw.split(",") if t.strip()
+        )
+    else:
+        _allowed_callbacks = frozenset(_callback_tools_raw or [])
+    sandbox_domain_config = SandboxDomainConfig(
+        timeout_seconds=settings.sandbox_timeout_seconds,
+        max_tool_calls=settings.sandbox_max_tool_calls,
+        cpus=settings.sandbox_docker_cpus,
+        memory_mb=settings.sandbox_docker_memory_mb,
+        network_enabled=settings.sandbox_docker_network,
+        idle_seconds=settings.sandbox_idle_seconds,
+        workspace_readonly=True,
+        max_stdout_bytes=settings.sandbox_max_stdout_bytes,
+        max_stderr_bytes=settings.sandbox_max_stderr_bytes,
+        pids_limit=256,
+        allowed_backends=frozenset({settings.sandbox_type}),
+        allowed_callbacks=_allowed_callbacks,
+    )
+    sandbox_policy = SandboxPolicy(sandbox_domain_config)
+
     sandbox_tool_executor = SandboxToolExecutor(
         sandbox_manager=sandbox_manager,
         callback_registry=sandbox_callback_registry,
@@ -641,11 +736,17 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         history_registry=sandbox_history_registry,
         summary_max_stdout=settings.sandbox_summary_max_stdout_bytes,
         summary_max_stderr=settings.sandbox_summary_max_stderr_bytes,
+        sandbox_policy=sandbox_policy,
+        sandbox_config=sandbox_domain_config,
+        budget_service=budget_service,
     )
     terminal_tool_executor = TerminalToolExecutor(
         sandbox_manager=sandbox_manager,
         settings=settings,
         history_registry=sandbox_history_registry,
+        sandbox_policy=sandbox_policy,
+        sandbox_config=sandbox_domain_config,
+        budget_service=budget_service,
     )
     sandbox_dashboard_service = SandboxDashboardService(
         sandbox_manager=sandbox_manager,
@@ -811,6 +912,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         model_service,
         health_snapshot,
         schedule_service=schedule_service,
+        require_actor_for_managed_actions=settings.gateway_require_actor_for_managed_actions,
+        confirmation_ttl_seconds=settings.gateway_confirmation_ttl_seconds,
     )
     feishu_im_adapter = (
         FeishuImAdapter(gateway_service, feishu_client) if feishu_client is not None else None
@@ -865,6 +968,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         platform_registry=platform_registry,
         platform_service=platform_service,
         health_snapshot=health_snapshot,
+        policy_dashboard_service=PolicyDashboardService(SettingsPolicyProfileProvider(settings)),
         usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
         sandbox_manager=sandbox_manager if settings.sandbox_enabled else None,
@@ -932,7 +1036,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="N-Agent", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    app.include_router(create_openai_compatible_router(services.chat_service, services.model_service))
+    app.include_router(create_openai_compatible_router(services.chat_service, services.model_service, services.memory_store))
     app.include_router(create_platforms_router(services.platform_service))
     app.include_router(
         create_dashboard_router(
@@ -951,6 +1055,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sandbox_dashboard_service=services.sandbox_dashboard_service,
             usage_service=services.usage_service,
             memory_store=services.memory_store,
+            chat_service=services.chat_service,
+            policy_dashboard_service=services.policy_dashboard_service,
         )
     )
     return app
