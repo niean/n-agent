@@ -103,6 +103,19 @@ def test_turn_values_and_spec_metadata_alignment():
     assert len(_POLICY_METADATA) == 10
 
 
+def test_schedule_displays_tool_source_type_constraint():
+    # Scheduled tasks run unattended -> safe_only tool exposure, which blocks
+    # source_type=AGENT tools (preventing scheduler self-recursion). This
+    # source_type constraint must be surfaced in the Schedule sector.
+    svc, _ = service()
+    data = svc.list_policies()
+    schedule = next(p for p in data["policies"] if p["key"] == "schedule")
+    cfg = {c["key"]: c for c in schedule["config"]}
+    assert "unattended_blocked_source_type" in cfg
+    assert cfg["unattended_blocked_source_type"]["value"] == "agent"
+    assert cfg["unattended_blocked_source_type"]["label"] == "无人值守屏蔽工具来源"
+
+
 def test_config_field_order_matches_dataclass_declaration():
     svc, _ = service()
     data = svc.list_policies()

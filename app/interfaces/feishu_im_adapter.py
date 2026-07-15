@@ -32,6 +32,8 @@ class FeishuEventClient(Protocol):
 
     async def download_image(self, message_id: str, image_key: str) -> tuple[bytes, str | None]: ...
 
+    async def send_markdown_reply(self, receive_id: str, content: str, receive_id_type: str = "chat_id") -> None: ...
+
 
 class FeishuImAdapter:
     def __init__(self, gateway_service: GatewayService, feishu_client: FeishuEventClient):
@@ -403,7 +405,7 @@ class FeishuImAdapter:
                     self._last_confirmations.pop(confirmation_id, None)
                     await self.feishu_client.send_text(receive_id, "确认卡片发送失败，请稍后重试", receive_id_type)
                 continue
-            await self.feishu_client.send_text(receive_id, outbound.content, receive_id_type)
+            await self.feishu_client.send_markdown_reply(receive_id, outbound.content, receive_id_type)
 
     def _cleanup_confirmation_cache(self) -> None:
         now = datetime.now(timezone.utc)

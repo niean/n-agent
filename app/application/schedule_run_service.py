@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from app.application.information_flow_service import InformationFlowService
 from app.application.policy_snapshot import InformationFlowPolicyConfig
+from app.application.scheduled_agent_executor import ScheduledAgentResult
 from app.domain.gateway import GatewaySessionKey
 from app.domain.gateway_policy import GatewayDeliveryDecision, GatewayOutboundRequest, GatewayPolicy
 from app.domain.information_flow import ReleaseTarget, SecretCatalog
@@ -40,6 +41,7 @@ class ScheduleRunService:
         max_due_per_tick: int = 5,
         lease_seconds: int = 900,
         missed_grace_seconds: int = 300,
+        execution_timeout_seconds: int = 600,
         recover_missing_origin_sessions=None,
         schedule_policy: SchedulePolicy | None = None,
         information_flow_service: InformationFlowService | None = None,
@@ -50,6 +52,7 @@ class ScheduleRunService:
         self.outbound_delivery = outbound_delivery
         self.max_due_per_tick = max_due_per_tick
         self.lease_seconds = lease_seconds
+        self.execution_timeout_seconds = execution_timeout_seconds
         self.recover_missing_origin_sessions = recover_missing_origin_sessions
         self._schedule_policy = schedule_policy or SchedulePolicy(missed_grace_seconds=missed_grace_seconds)
         self._information_flow = information_flow_service or InformationFlowService(
@@ -61,6 +64,7 @@ class ScheduleRunService:
     async def run_now(self, task_id: str, *, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
         await self._recover_missing_origin_sessions()
+        await self.registry.recover_stale_executions(now)
         claim = await self.registry.claim_task_for_run_now(task_id, now, self.lease_seconds)
         if claim is None:
             return {"task_id": task_id, "status": "not_claimed"}
@@ -76,12 +80,42 @@ class ScheduleRunService:
     async def run_due_claims(self, now: datetime | None = None) -> list[dict]:
         now = now or datetime.now(timezone.utc)
         await self._recover_missing_origin_sessions()
+        await self.registry.recover_stale_executions(now)
         claims = await self.registry.claim_due_tasks(now, self.max_due_per_tick, self.lease_seconds)
         return [await self.run_claim(claim, now=now) for claim in claims]
 
     async def _recover_missing_origin_sessions(self) -> None:
         if self.recover_missing_origin_sessions is not None:
             await self.recover_missing_origin_sessions()
+
+    async def _run_executor(self, task: ScheduledTask) -> ScheduledAgentResult:
+        """Run the scheduled executor with a hard timeout and exception guard.
+
+        A hung executor.run (e.g. LLM provider or host bridge not responding)
+        would otherwise keep the execution RUNNING and hold the lease until
+        expiry; on timeout or exception we synthesize a FAILED result so
+        run_claim still records completion and releases the lease.
+        """
+        try:
+            return await asyncio.wait_for(
+                self.executor.run(task), timeout=self.execution_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "scheduled task execution timed out: task_id=%s timeout=%ss",
+                task.id,
+                self.execution_timeout_seconds,
+            )
+            return ScheduledAgentResult(
+                ScheduledTaskExecutionStatus.FAILED,
+                error=f"execution timed out after {self.execution_timeout_seconds}s",
+            )
+        except Exception as exc:
+            logger.exception("scheduled task execution raised: task_id=%s", task.id)
+            return ScheduledAgentResult(
+                ScheduledTaskExecutionStatus.FAILED,
+                error=f"execution error: {exc}",
+            )
 
     async def run_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
@@ -113,8 +147,9 @@ class ScheduleRunService:
             await self.registry.record_execution_completed(completed)
             return {"task_id": claim.task.id, "status": ScheduledTaskExecutionStatus.SKIPPED_MISSED.value}
 
-        # --- Run the agent ---
-        result = await self.executor.run(claim.task)
+        # --- Run the agent (bounded by execution_timeout; on timeout/error we
+        # still record completion so the lease is released instead of leaking) ---
+        result = await self._run_executor(claim.task)
         completed = self._completed(execution, result.status, started_at, result.output, result.error)
         if not await self.registry.record_execution_completed(completed):
             return {"task_id": claim.task.id, "status": "stale"}

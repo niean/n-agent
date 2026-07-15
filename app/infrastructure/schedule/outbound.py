@@ -44,7 +44,7 @@ class ScheduleOutboundDelivery:
             if not receive_id:
                 return DeliveryResult("failed", "feishu origin missing receive_id")
             try:
-                await self.feishu_client.send_text(
+                await self.feishu_client.send_markdown_reply(
                     receive_id,
                     content,
                     receive_id_type,

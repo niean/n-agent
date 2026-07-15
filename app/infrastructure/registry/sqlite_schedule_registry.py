@@ -283,6 +283,55 @@ class SQLiteScheduledTaskRegistry:
                 )
             return cursor.rowcount > 0
 
+    async def recover_stale_executions(self, now: datetime) -> int:
+        """Mark stale RUNNING executions as FAILED and release expired leases.
+
+        A RUNNING execution is stale when either its claim's lease has expired
+        (hung past lease, or process restarted mid-run) OR its claim has been
+        superseded by a newer claim (the task was re-claimed while this
+        execution was still RUNNING). Both leave an execution that can never
+        complete normally, so it must not block the executions view forever."""
+        now = _aware_utc(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE scheduled_task_executions
+                SET status=?, completed_at=?, error=?
+                WHERE status=?
+                  AND EXISTS(
+                    SELECT 1 FROM scheduled_tasks t
+                    WHERE t.id=scheduled_task_executions.task_id
+                      AND (
+                        (
+                          t.claim_id=scheduled_task_executions.claim_id
+                          AND t.lease_owner=scheduled_task_executions.lease_owner
+                          AND t.lease_until IS NOT NULL
+                          AND t.lease_until < ?
+                        )
+                        OR t.claim_id != scheduled_task_executions.claim_id
+                      )
+                  )
+                """,
+                (
+                    ScheduledTaskExecutionStatus.FAILED.value,
+                    _iso(now),
+                    "execution_stale_recovered",
+                    ScheduledTaskExecutionStatus.RUNNING.value,
+                    _iso(now),
+                ),
+            )
+            recovered = cursor.rowcount
+            conn.execute(
+                """
+                UPDATE scheduled_tasks SET lease_until=NULL, updated_at=?
+                WHERE lease_until IS NOT NULL AND lease_until < ?
+                """,
+                (_iso(now), _iso(now)),
+            )
+            conn.commit()
+        return recovered
+
     async def list_executions(self, task_id: str, limit: int) -> list[ScheduledTaskExecution]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -374,6 +423,7 @@ class SQLiteScheduledTaskRegistry:
                     "mode": task.execution_policy.mode.value,
                     "tool_exposure_policy": task.execution_policy.tool_exposure_policy,
                     "allow_confirm_tools": task.execution_policy.allow_confirm_tools,
+                    "allowed_tools": list(task.execution_policy.allowed_tools),
                 }
             ),
             _iso(task.next_run_at),
@@ -442,6 +492,9 @@ class SQLiteScheduledTaskRegistry:
                 mode=ScheduledExecutionPolicyMode(policy_json.get("mode", ScheduledExecutionPolicyMode.UNATTENDED.value)),
                 tool_exposure_policy=policy_json.get("tool_exposure_policy", "safe_only"),
                 allow_confirm_tools=bool(policy_json.get("allow_confirm_tools", False)),
+                allowed_tools=tuple(
+                    str(name) for name in (policy_json.get("allowed_tools") or ()) if isinstance(name, str)
+                ),
             ),
             next_run_at=_parse(row["next_run_at"]),
             lease_until=_parse_optional(row["lease_until"]),

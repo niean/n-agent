@@ -27,6 +27,56 @@
     parent.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   }
 
+  function safeUrl(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    return /^https?:\/\//i.test(trimmed) ? trimmed : null;
+  }
+
+  // 不可信的对话文本按 markdown 子集（图片、链接）渲染。全部用 DOM API 构建：
+  // 文本与链接标签走 textContent（自动转义），img/a 用 createElement 后属性赋值，
+  // URL 限定 http(s)；不使用 innerHTML，避免 XSS。
+  function renderMessageText(parent, value) {
+    const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    while (parent.firstChild) parent.removeChild(parent.firstChild);
+    const pattern = /!\[([^\]]*)\]\(([^)\s]+)\)|\[([^\]]+)\]\(([^)\s]+)\)/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        parent.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+      if (match[1] !== undefined) {
+        const url = safeUrl(match[2]);
+        if (url) {
+          const img = document.createElement('img');
+          img.src = url;
+          img.alt = match[1] || '';
+          img.loading = 'lazy';
+          parent.appendChild(img);
+        } else {
+          parent.appendChild(document.createTextNode(match[0]));
+        }
+      } else {
+        const url = safeUrl(match[4]);
+        if (url) {
+          const a = document.createElement('a');
+          a.href = url;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          a.textContent = match[3];
+          parent.appendChild(a);
+        } else {
+          parent.appendChild(document.createTextNode(match[0]));
+        }
+      }
+      lastIndex = pattern.lastIndex;
+    }
+    if (lastIndex < text.length) {
+      parent.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+  }
+
   function formatDebugJson(value) {
     if (typeof value !== 'string') return JSON.stringify(value, null, 2);
     try {
@@ -176,7 +226,7 @@
       if (hasImage && !hasText) el.classList.add('msg--image-only');
       return el;
     }
-    if (hasVisibleContent(content)) appendText(el, content);
+    if (hasVisibleContent(content)) renderMessageText(el, content);
     return el;
   }
 

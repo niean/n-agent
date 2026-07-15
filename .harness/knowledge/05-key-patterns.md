@@ -255,6 +255,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - Gateway 破坏性命令确认属于 Application 层：/new、/rename、/delete、/schedule remove 先创建内存 pending confirmation，绑定 GatewaySessionKey、actor_id、target_session_id 和 15 分钟 TTL；确认回调消费 pending 后才执行，一次/本会话信任/取消均不进入 ToolService。
 - 飞书使用长连接接收事件，app_id、tenant_key、allowlist 校验和 tenant_access_token 获取属于 Infrastructure client；普通消息 allowlist 使用 event.sender/event.message，card action 必须单独按 event.operator.open_id 和 event.context.open_chat_id 校验。
 - Interfaces 飞书长连接适配器只消费已注入的 client 能力：普通文本事件转换为 InteractionMessage，破坏性 Slash confirmation outbound 渲染为 interactive card 并回调 GatewayService.handle_confirmation；ToolPolicy approval 由 FeishuToolApprovalBridge 转换为同款三按钮卡片并完成 ApprovalDecider Future。
+- 飞书 IM 回复与定时投递统一走 `FeishuClient.send_markdown_reply`：纯文本发 text 消息；含 `![alt](url)`/`[label](url)` 的 markdown 渲染为 post 富文本，图片先 `download_url` 下载再用 `im/v1/images` 上传换取 image_key（飞书不支持外链 url 直显图片，必须 image_key），链接渲染为友好 `a` 元素不展示原始 url；图片下载/上传失败降级为占位文本 `[图片加载失败]`，post 发送失败整体降级为 text。`FeishuImAdapter._send_response` 普通回复与 `ScheduleOutboundDelivery.deliver` 均调用此方法，不在调用方重复渲染逻辑。
 - CLI 与飞书入口不能绕过 ToolService 风险控制，也不能直接写 provider、tool 或 session 数据表。
 
 陷阱：在 CLI 或飞书长连接适配器里直接 new SQLite store、调用 Provider 或复制 AgentGraphRunner，会形成第二套 Runtime 并破坏 DDD 边界。
@@ -282,11 +283,12 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - `Platform` 面向 feishu、dingtalk、wecom 等外部消息平台；GatewaySessionKey 使用 source/platform_session_id/thread_id 作为 conversation key。CLI/TUI 终端聊天使用 source=`cli`，不进入 PlatformRegistry，也不出现在 Dashboard 平台页。
 - `PlatformRegistry` 提供 descriptor 与 lifecycle；Application 的 PlatformService 合成 status、session_count、last_active_at、active_sessions 等只读视图。
 - `FeishuImAdapter` 是飞书入口适配器，同时实现 PlatformLifecycle；start() 先标记 connected，listen_events 正常返回后标记 disconnected，异常时写入 fatal("feishu_listen_error", message) 并继续抛出。
-- `ScheduleOutboundDelivery.deliver` 只判断 `platform`：feishu 则调用注入的 FeishuClient.send_text；缺失或未知 platform 返回 failed，不做 receive_id 启发式回退。
+- `ScheduleOutboundDelivery.deliver` 只判断 `platform`：feishu 则调用注入的 FeishuClient.send_markdown_reply 投递（与 IM 入口回复同路径，支持 markdown 图片/链接渲染）；缺失或未知 platform 返回 failed，不做 receive_id 启发式回退。
 - Gateway `_build_trusted_metadata` 必须写入 `gateway.platform` 与顶级 `platform`；Tool 落库 origin 时一并保存 platform/receive_id/receive_id_type/thread_id 四元组，跨 origin 操作统一返回 task not found。
 - Gateway 支持平台级 home target：`/sethome` 更新 GatewaySessionRegistry 中当前 platform 的 home chat；`/schedule add` 创建 Feishu/平台 origin 任务时保存 `target=home` 逻辑引用而不是固定当前聊天会话。
 - ScheduleOutboundDelivery 在投递 Feishu origin 时如注入 home resolver，则发送前动态读取当前 home target；即使历史任务仍保存旧 receive_id，只要当前 platform 配置了 home target，通知也会切到最新 home chat。
 - origin 定时任务的执行 session 必须是 schedule-owned session，不能绑定 Gateway 当前会话；当 origin 任务因历史绑定会话删除进入 `session_missing` 时，ScheduleService 在 run_now/runner claim 前创建新的 schedule session 并恢复 ACTIVE。
+- 定时任务按任务级授予工具：`ScheduledExecutionPolicy.allowed_tools` 声明该任务在 unattended 下可用的工具，由 `/schedule add <cron> <prompt> --tools <csv>` 或 Dashboard API `allowed_tools` 设置，持久化在 execution_policy_json。ScheduledAgentExecutor.run 把它作为 `granted_tools` 写入 trusted_metadata 与 ingress_facts.trusted_claims；ChatCompletionService 注入 `ToolExecutionContext.granted_tools`；`ToolPolicy.can_expose` 在 `SAFE_ONLY` 下对 `granted_tools` 中命中的 SAFE 工具放行（绕过 AGENT source_type 过滤，如 `host_terminal`），但仍拒绝 DANGEROUS/CONFIRM（unattended 无审批通道）。未授予的工具不受影响，default 与未授予的 unattended 任务仍不暴露 AGENT 工具。
 
 陷阱：把"平台能力"放进每条消息的 capability 列表，意味着任何中间层漏传一次都会让正常功能变成 fail-closed；把能力归到 platform 注册（client/lifecycle 是否注入）才是单一来源。
 
@@ -298,9 +300,11 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - claim 时设置 claim_id、lease_owner、lease_until，并立即按 cron 推进 next_run_at，避免同一触发被并发 runner 重复领取。
 - lease 只表示当前 claim 的执行保护期，不表示整个任务的冷却周期；执行完成后必须释放 lease_until，否则短周期任务会被旧 lease 阻塞。
 - record_execution_completed 仍按 claim_id/lease_owner 校验当前 claim，防止过期执行覆盖新 claim；释放 lease 不应清空 claim_id/lease_owner，因为后续 delivery result 仍需要一致性校验。
+- 执行必须有硬超时与异常兜底：`ScheduleRunService._run_executor` 用 `asyncio.wait_for(executor.run, execution_timeout_seconds)` 包裹（默认 600s，须 < lease_seconds 900s），超时或异常都合成 `ScheduledAgentResult(FAILED)`，确保 `run_claim` 始终走到 `record_execution_completed` 释放 lease。否则 executor.run hang（LLM/宿主桥接无响应）或抛异常会让 execution 永远 RUNNING、lease 持有到过期。
+- `recover_stale_executions` 在 `run_now` 与每个调度 tick（`run_due_claims`）claim 前执行，把 stale RUNNING execution 标记 FAILED 并清理过期 lease。stale 判定：(a) 当前 claim 的 lease 已过期，或 (b) claim 已被新 claim 取代（task.claim_id != execution.claim_id，如进程重启或 re-claim 后遗留的孤儿）。只靠 (a) 不够——re-claim 后旧 execution 的 claim_id 不再匹配 task 当前 claim_id，EXISTS 条件不命中，孤儿永远 RUNNING。
 - skipped_missed 只用于 runner 长时间未运行或任务确实错过宽限窗口；不能由正常执行留下的 lease 触发。
 
-陷阱：把 lease_seconds 当作调度间隔或执行后保留 lease，会让 */5 任务被默认 900 秒 lease 卡成 15 分钟一次，并在 missed_grace_seconds 后持续 skipped_missed。
+陷阱：把 lease_seconds 当作调度间隔或执行后保留 lease，会让 */5 任务被默认 900 秒 lease 卡成 15 分钟一次，并在 missed_grace_seconds 后持续 skipped_missed。陷阱：recover_stale_executions 只匹配"当前 claim 且 lease 过期"会漏掉被取代的孤儿执行，进程重启或 re-claim 后旧 RUNNING execution 永远停在 running 状态。
 
 ## 模式十五：检索记忆 Provider base_url 装配链路
 
@@ -699,6 +703,10 @@ Agent Runtime 在每次 LLM 调用后需归一化 usage（五桶 token + 成本�
 宿主执行不复用 Sandbox backend，也不允许模型提交任意 shell。`host_terminal` 只接受结构化 command 或 Skill script 请求：N-Agent 侧与宿主 Bridge 独立加载同一份 Policy，分别校验精确 argv；Skill script 还必须匹配 `skill_name + relative_path + SHA-256`。
 
 Bridge 必须只监听 loopback 并校验独立 token。执行前从已校验的源文件字节创建私有快照，命令以 argv 直接启动、不经 shell；macOS Mach-O 快照需完成本地签名验证。工具结果只返回结构化 stdout/stderr/exit code，临时凭证与 OSS 密钥不进入容器，上传结果只暴露限时签名 URL。
+
+photo-and-upload Skill 的 OSS object key 命名格式：脚本在宿主侧生成 OSS object key 时使用 `photo_<host>_<yymmddHHMMSS>.jpg` 格式（如 `photo_nieans-macbook-airm5_260715155941.jpg`），完整 key 为 `{OSS_BUCKET_PATH}/{opaque_name}`。host 段取 `socket.gethostname()` 并经 `_normalize_hostname` 规范化：取首个 `.` 前的部分、转小写、非字母数字分段以连字符连接、限长 32、空值回退 `host`。yymmddHHMMSS 段为 Asia/Shanghai 时区的拍摄时间（2位年+月+日+时+分+秒）。脚本通过 `hostname_factory` 参数（默认 `socket.gethostname`）注入主机名以便测试。stdout 契约 `CAPTURED:<opaque-name>:<size>` 中的 opaque-name 即上述文件名，不暴露宿主绝对路径。该格式不含随机 token，key 由 host 和时间戳决定，同一主机同一秒内多次拍摄存在碰撞风险。
+
+Skill 脚本失败时的脱敏阶段码透传：Skill 脚本在失败时向 stderr 写入 `ERROR:<code>` 行，`<code>` 是稳定的脱敏阶段标识符（如 `sts_failed`、`capture_failed`、`config_unsafe`）。Bridge 将脚本 stderr 结构化返回，executor（`app/application/host_terminal_tool_executor.py`）在 `_normalize_response` 中当 `error_code=host_execution_failed` 且 `target_type=skill_script` 时，用正则 `^ERROR:([a-z][a-z0-9_]{0,63})$` 从 stderr 解析阶段码，透传到 `ToolResult.content` 为 `{"error":"host_execution_failed","stage":"<code>"}` 并补上 `duration_ms`。原始 stderr 不进入模型上下文，只有解析出的阶段码被暴露；若 stderr 中无匹配行则回退为不透明的 `host_execution_failed`。此约定使脚本可用脱敏阶段码向模型传递失败原因，而不泄漏凭证、路径或外部服务原始响应。
 
 ## 模式二十一：Policy Mesh 治理封口
 

@@ -73,6 +73,23 @@ def test_can_expose_matrix(tool_definition, exposure, expected):
     assert ToolPolicy().can_expose(tool_definition, exposure) is expected
 
 
+def test_can_expose_safe_only_grants_expose_named_safe_agent_tool():
+    policy = ToolPolicy()
+    agent_safe = definition(risk=RiskLevel.SAFE, source=ToolSourceType.AGENT, name="host_terminal")
+    assert policy.can_expose(agent_safe, ToolExposurePolicy.SAFE_ONLY, frozenset({"host_terminal"})) is True
+    # not granted -> still hidden under SAFE_ONLY
+    assert policy.can_expose(agent_safe, ToolExposurePolicy.SAFE_ONLY, frozenset()) is False
+    assert policy.can_expose(agent_safe, ToolExposurePolicy.SAFE_ONLY, frozenset({"other_tool"})) is False
+
+
+@pytest.mark.parametrize("risk", [RiskLevel.CONFIRM, RiskLevel.DANGEROUS])
+def test_can_expose_grant_does_not_lift_confirm_or_dangerous_gating(risk):
+    policy = ToolPolicy()
+    defn = definition(risk=risk, source=ToolSourceType.AGENT, name="host_terminal")
+    # granted but not SAFE -> still hidden (unattended has no approval channel)
+    assert policy.can_expose(defn, ToolExposurePolicy.SAFE_ONLY, frozenset({"host_terminal"})) is False
+
+
 @pytest.mark.parametrize("unknown", [None, "default", RiskLevel.SAFE, object()])
 def test_can_expose_fails_closed_for_non_exposure_enum_values(unknown):
     assert ToolPolicy().can_expose(definition(risk=RiskLevel.SAFE), unknown) is False

@@ -82,6 +82,11 @@ class ToolExecutionContext:
     permitted_managed_tools: set[str] = field(default_factory=set)
     enabled_override: list[str] | None = None
     approval_decider: ApprovalDecider | None = None
+    # Tools explicitly granted for exposure in safe_only/unattended mode. A
+    # task may grant specific SAFE tools (e.g. host_terminal) so the unattended
+    # run can see them despite their AGENT source_type; grants never override
+    # DANGEROUS or CONFIRM risk gating.
+    granted_tools: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

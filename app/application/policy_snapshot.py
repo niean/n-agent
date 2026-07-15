@@ -9,6 +9,7 @@ from typing import Any, Mapping, Protocol
 from app.application.session_bootstrap import SessionDescriptor
 from app.config import Settings
 from app.domain.policy import ExecutionMode, RunPolicyContext
+from app.domain.tool import ToolSourceType
 
 # ---------------------------------------------------------------------------
 # Typed Policy configs (Application DTOs derived from Settings)
@@ -83,6 +84,13 @@ class SchedulePolicyConfig:
     max_due_per_tick: int = 5
     missed_grace_seconds: int = 300
     lease_seconds: int = 900
+    # Scheduled tasks run unattended -> safe_only tool exposure, which blocks
+    # source_type=AGENT tools (prevents the scheduler from recursively invoking
+    # agent tools); task-level granted_tools can still exempt specific SAFE
+    # AGENT tools (e.g. host_terminal). Constant mirror of the enforcement in
+    # ToolPolicy.can_expose, surfaced so the Schedule sector displays the tool
+    # source_type constraint.
+    unattended_blocked_source_type: str = ToolSourceType.AGENT.value
 
 
 @dataclass(frozen=True)
@@ -196,6 +204,7 @@ class SettingsPolicyProfileProvider:
                 max_due_per_tick=s.scheduler_max_due_per_tick,
                 missed_grace_seconds=s.scheduler_missed_grace_seconds,
                 lease_seconds=s.scheduler_lease_seconds,
+                unattended_blocked_source_type=ToolSourceType.AGENT.value,
             ),
             budget=BudgetPolicyConfig(
                 max_wall_seconds=s.budget_max_wall_seconds,

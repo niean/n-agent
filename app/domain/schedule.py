@@ -81,6 +81,7 @@ class ScheduledExecutionPolicy:
     mode: ScheduledExecutionPolicyMode = ScheduledExecutionPolicyMode.UNATTENDED
     tool_exposure_policy: str = "safe_only"
     allow_confirm_tools: bool = False
+    allowed_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,9 @@ class ScheduledTaskRegistry(Protocol):
         ...
 
     async def record_delivery_result(self, execution: ScheduledTaskExecution) -> bool:
+        ...
+
+    async def recover_stale_executions(self, now: datetime) -> int:
         ...
 
     async def list_executions(self, task_id: str, limit: int) -> list[ScheduledTaskExecution]:

@@ -184,6 +184,12 @@ class ChatCompletionService:
 
         mcp_ctx = _mcp_tool_execution_context(str(first_user_message)) if mode == "realtime" else ToolExecutionContext()
         permitted = self._compute_permitted_managed_tools(mode, trusted_metadata)
+        raw_grants = trusted_metadata.get("granted_tools")
+        granted_tools = (
+            frozenset(str(name) for name in raw_grants)
+            if isinstance(raw_grants, (list, tuple))
+            else frozenset()
+        )
         ctx = ToolExecutionContext(
             allowed_confirm_tools=dict(mcp_ctx.allowed_confirm_tools),
             session_id=session_id,
@@ -193,6 +199,7 @@ class ChatCompletionService:
             execution_context_mode=mode,
             permitted_managed_tools=permitted,
             enabled_override=locked_external_memory,
+            granted_tools=granted_tools,
         )
         if request.approval_decider is not None:
             ctx = dataclasses.replace(ctx, approval_decider=request.approval_decider)

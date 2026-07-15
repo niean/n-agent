@@ -784,6 +784,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         max_due_per_tick=settings.scheduler_max_due_per_tick,
         lease_seconds=settings.scheduler_lease_seconds,
         missed_grace_seconds=settings.scheduler_missed_grace_seconds,
+        execution_timeout_seconds=settings.scheduler_execution_timeout_seconds,
         information_flow_service=information_flow_service,
     )
     schedule_service = ScheduleService(

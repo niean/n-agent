@@ -32,6 +32,7 @@ class ScheduledAgentExecutor:
         safety = self.scanner.scan(task.prompt)
         if not safety.allowed:
             return ScheduledAgentResult(ScheduledTaskExecutionStatus.BLOCKED, error=safety.reason)
+        granted_tools = list(task.execution_policy.allowed_tools)
         result = await self.chat_service.complete(
             ChatCompletionInput(
                 model="N-Agent",
@@ -47,13 +48,21 @@ class ScheduledAgentExecutor:
                     source="schedule",
                     actor_id=None,
                     execution_mode=ExecutionMode.UNATTENDED,
-                    trusted_claims={"execution_mode": ExecutionMode.UNATTENDED.value},
+                    trusted_claims={
+                        "execution_mode": ExecutionMode.UNATTENDED.value,
+                        "granted_tools": granted_tools,
+                    },
                 ),
                 # Schedule ingress facts: pass execution_mode as a structured
                 # trusted_metadata field (not a free options dict).  The
                 # ChatCompletionService derives tool_exposure_policy=safe_only
-                # from execution_mode=unattended.
-                trusted_metadata={"execution_mode": ExecutionMode.UNATTENDED.value},
+                # from execution_mode=unattended. granted_tools carries the
+                # task-level tool grants so SAFE tools like host_terminal are
+                # exposed to the unattended run despite their AGENT source_type.
+                trusted_metadata={
+                    "execution_mode": ExecutionMode.UNATTENDED.value,
+                    "granted_tools": granted_tools,
+                },
             )
         )
         assert isinstance(result, ChatCompletionResult)

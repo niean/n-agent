@@ -154,7 +154,11 @@ class ToolService:
             }
             for definition in self.list_definitions()
             if (
-                self.policy.can_expose(definition, exposure_policy)
+                self.policy.can_expose(
+                    definition,
+                    exposure_policy,
+                    getattr(context, "granted_tools", frozenset()) if context is not None else frozenset(),
+                )
                 if exposure_policy is not None
                 else definition.enabled and definition.risk_level is risk_level
             )

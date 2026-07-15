@@ -324,9 +324,11 @@
     const name = inputField('名称', 'text', task ? task.name : '', '例如：每日总结');
     const cron = inputField('Cron 表达式', 'text', task ? task.cron_expression : '', '*/30 * * * *');
     const timezone = inputField('时区', 'text', task ? task.timezone : 'Asia/Shanghai', 'Asia/Shanghai');
+    const tools = inputField('允许的工具', 'text', task ? (task.allowed_tools || []).join(',') : '', '逗号分隔，如 host_terminal');
     grid.appendChild(name.label);
     grid.appendChild(cron.label);
     grid.appendChild(timezone.label);
+    grid.appendChild(tools.label);
 
     if (!isOrigin) {
       const target = selectField('投递目标', task ? task.delivery_target : 'dashboard', [['dashboard', 'Dashboard'], ['silent', 'Silent']]);
@@ -338,7 +340,7 @@
     } else {
       const notice = document.createElement('div');
       notice.className = 'scheduled-origin-notice';
-      notice.textContent = 'Origin 任务的投递目标和会话由 Gateway 管理，Dashboard 仅允许编辑名称、调度、时区和 Prompt。';
+      notice.textContent = 'Origin 任务的投递目标和会话由 Gateway 管理，Dashboard 仅允许编辑名称、调度、时区、允许的工具和 Prompt。';
       grid.appendChild(notice);
     }
     form.appendChild(grid);
@@ -363,6 +365,7 @@
         cron_expression: cron.input.value,
         timezone: timezone.input.value,
         prompt: prompt.input.value,
+        allowed_tools: tools.input.value,
       };
       if (!isOrigin) {
         payload.delivery_target = form._target.value;

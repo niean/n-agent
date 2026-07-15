@@ -10,7 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
+import socket
 import shutil
 import stat
 import subprocess
@@ -22,12 +22,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_ENV_PATH = Path("/Users/niean/install/n-agent/secrets/oss.env")
 DEFAULT_FFMPEG = "/opt/homebrew/bin/ffmpeg"
 URL_LIFETIME_SECONDS = 3600
-STS_DURATION_SECONDS = 7200
+# Alibaba Cloud STS AssumeRole enforces DurationSeconds within [900, 3600].
+STS_DURATION_SECONDS = 3600
 STS_EXPIRY_MARGIN_SECONDS = 300
 MIN_JPEG_BYTES = 128
 MAX_JPEG_BYTES = 20_000_000
@@ -51,7 +53,8 @@ OSS_ENDPOINTS = {
 _KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 _BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\Z")
 _PREFIX_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{20,128}\Z")
+_HOSTNAME_MAX_LENGTH = 32
+_PHOTO_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class PhotoUploadError(RuntimeError):
@@ -281,7 +284,7 @@ def _assume_role(config: dict[str, str], *, opener: Callable, now: float) -> dic
         }
         if any(not isinstance(value, str) or not value for value in result.values()):
             raise PhotoUploadError("sts_invalid")
-        if _parse_expiration(result["Expiration"]) < now + URL_LIFETIME_SECONDS + STS_EXPIRY_MARGIN_SECONDS:
+        if _parse_expiration(result["Expiration"]) < now + URL_LIFETIME_SECONDS - STS_EXPIRY_MARGIN_SECONDS:
             raise PhotoUploadError("sts_expiry_short")
         return result
     except PhotoUploadError as exc:
@@ -371,6 +374,18 @@ def _upload_and_sign(
     return upload_status, signed_url
 
 
+def _normalize_hostname(raw: str) -> str:
+    """Normalize the host name into a lowercase, path-safe key segment."""
+    if not isinstance(raw, str) or not raw:
+        return "host"
+    base = raw.split(".")[0].lower()
+    parts = [part for part in re.split(r"[^a-z0-9]+", base) if part]
+    normalized = "-".join(parts)
+    if not normalized:
+        return "host"
+    return normalized[:_HOSTNAME_MAX_LENGTH]
+
+
 def run_cli(
     *,
     env_path: Path = DEFAULT_ENV_PATH,
@@ -378,7 +393,7 @@ def run_cli(
     runner: Callable = subprocess.run,
     opener: Callable = urllib.request.urlopen,
     clock: Callable[[], float] = time.time,
-    token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(24),
+    hostname_factory: Callable[[], str] = socket.gethostname,
     cleanup: Callable[[Path], None] = shutil.rmtree,
 ) -> int:
     temp_dir: Path | None = None
@@ -386,11 +401,12 @@ def run_cli(
     error_code: str | None = None
     try:
         config = load_config(Path(env_path))
-        token = token_factory()
-        if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
-            raise PhotoUploadError("object_key_invalid")
         generated_at = clock()
-        opaque_name = f"photo-{datetime.fromtimestamp(generated_at, timezone.utc):%Y%m%dT%H%M%SZ}-{token}.jpg"
+        hostname = _normalize_hostname(hostname_factory())
+        opaque_name = (
+            f"photo_{hostname}_"
+            f"{datetime.fromtimestamp(generated_at, _PHOTO_TIMEZONE):%y%m%d%H%M%S}.jpg"
+        )
         object_key = f"{config['OSS_BUCKET_PATH']}/{opaque_name}"
         temp_dir = Path(tempfile.mkdtemp(prefix="n-agent-photo-"))
         temp_dir.chmod(0o700)

@@ -68,6 +68,7 @@ class FakeRegistry:
         self.delivered = []
         self.stale = stale
         self.dashboard_unread = False
+        self.recover_stale_calls = []
 
     async def claim_task_for_run_now(self, task_id, now, lease_seconds):
         return self.claim
@@ -86,6 +87,10 @@ class FakeRegistry:
     async def record_delivery_result(self, execution):
         self.delivered.append(execution)
         return not self.stale
+
+    async def recover_stale_executions(self, now):
+        self.recover_stale_calls.append(now)
+        return 0
 
     async def mark_dashboard_unread(self, task_id, claim_id, lease_owner):
         self.dashboard_unread = True
@@ -129,6 +134,61 @@ async def test_run_due_claims_recovers_missing_origin_sessions_before_claiming()
     await service.run_due_claims(now=NOW)
 
     assert recovered == [True]
+
+
+@pytest.mark.asyncio
+async def test_run_claim_records_failed_and_completes_on_executor_timeout():
+    registry = FakeRegistry(_claim())
+
+    class HangingExecutor:
+        async def run(self, task):
+            await asyncio.sleep(10)
+            return ScheduledAgentResult(ScheduledTaskExecutionStatus.SUCCEEDED, output="never")
+
+    service = ScheduleRunService(
+        registry,
+        HangingExecutor(),
+        FakeDelivery(),
+        execution_timeout_seconds=0.05,
+    )
+
+    await service.run_claim(_claim(), now=NOW)
+
+    assert registry.completed
+    assert registry.completed[0].status is ScheduledTaskExecutionStatus.FAILED
+    assert "timed out" in (registry.completed[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_run_claim_records_failed_on_executor_exception():
+    registry = FakeRegistry(_claim())
+
+    class RaisingExecutor:
+        async def run(self, task):
+            raise RuntimeError("boom")
+
+    service = ScheduleRunService(registry, RaisingExecutor(), FakeDelivery())
+
+    await service.run_claim(_claim(), now=NOW)
+
+    assert registry.completed
+    assert registry.completed[0].status is ScheduledTaskExecutionStatus.FAILED
+    assert "boom" in (registry.completed[0].error or "")
+
+
+@pytest.mark.asyncio
+async def test_run_now_and_run_due_claims_recover_stale_executions_before_claim():
+    registry = FakeRegistry(None)
+    service = ScheduleRunService(
+        registry,
+        FakeExecutor(ScheduledAgentResult(ScheduledTaskExecutionStatus.SUCCEEDED, output="done")),
+        FakeDelivery(),
+    )
+
+    await service.run_now("task-1", now=NOW)
+    await service.run_due_claims(now=NOW)
+
+    assert registry.recover_stale_calls == [NOW, NOW]
 
 
 @pytest.mark.asyncio

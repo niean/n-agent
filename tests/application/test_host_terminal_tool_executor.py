@@ -121,6 +121,18 @@ class _Client:
         )
 
 
+class _PinnedClient:
+    """Returns a response pinned to each request's id, for success/error paths."""
+
+    def __init__(self, response):
+        self.requests = []
+        self._response = response
+
+    async def execute(self, request):
+        self.requests.append(request)
+        return replace(self._response, request_id=request.request_id)
+
+
 def _executor(snapshot=None, client=None):
     loader = _Loader(snapshot or _snapshot())
     client = client or _Client()
@@ -282,6 +294,42 @@ async def test_malformed_or_truncated_success_is_invalid_response():
         "script": "scripts/photo-upload.py", "args": [],
     }))
     assert result.content == {"error": "host_bridge_invalid_response"}
+
+
+@pytest.mark.asyncio
+async def test_script_failure_surfaces_desensitized_stage_and_duration():
+    response = HostTerminalBridgeResponse(
+        protocol_version="1", request_id="ignored", status=HostTerminalStatus.ERROR,
+        exit_code=1, stdout="", stderr="ERROR:sts_failed\n",
+        duration_ms=1234, stdout_truncated=False, stderr_truncated=False,
+        error_code="host_execution_failed",
+    )
+    executor, _, _ = _executor(client=_PinnedClient(response))
+    result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": [],
+    }))
+    assert result.status is ToolResultStatus.ERROR
+    assert result.content == {"error": "host_execution_failed", "stage": "sts_failed"}
+    assert result.duration_ms == 1234
+    assert "ERROR:" not in str(result.content)
+
+
+@pytest.mark.asyncio
+async def test_script_failure_without_stage_code_keeps_opaque_error():
+    response = HostTerminalBridgeResponse(
+        protocol_version="1", request_id="ignored", status=HostTerminalStatus.ERROR,
+        exit_code=1, stdout="", stderr="some unstructured output\n",
+        duration_ms=10, stdout_truncated=False, stderr_truncated=False,
+        error_code="host_execution_failed",
+    )
+    executor, _, _ = _executor(client=_PinnedClient(response))
+    result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": [],
+    }))
+    assert result.status is ToolResultStatus.ERROR
+    assert result.content == {"error": "host_execution_failed"}
 
 
 @pytest.mark.asyncio

@@ -327,7 +327,7 @@ def test_tool_debug_json_strings_are_formatted(tmp_path):
     assert "content.map((item, index) => `#${index + 1}\\n${formatDebugJson(item)}`).join('\\n\\n')" in chat_js
     assert "appendToolDebugContent(content, message.content || '')" in chat_js
     assert 'function hasVisibleContent(value)' in chat_js
-    assert "if (hasVisibleContent(content)) appendText(el, content)" in chat_js
+    assert "if (hasVisibleContent(content)) renderMessageText(el, content)" in chat_js
 
 
 def test_assistant_tool_calls_are_not_rendered_as_chat_messages(tmp_path):

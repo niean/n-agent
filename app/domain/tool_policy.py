@@ -30,6 +30,7 @@ class ToolPolicy:
         self,
         definition: ToolDefinition,
         exposure_policy: ToolExposurePolicy,
+        granted_tools: frozenset[str] = frozenset(),
     ) -> bool:
         if not isinstance(exposure_policy, ToolExposurePolicy):
             return False
@@ -37,9 +38,16 @@ class ToolPolicy:
             return False
         if exposure_policy is ToolExposurePolicy.DEFAULT:
             return True
+        # SAFE_ONLY exposes safe non-agent tools. A task may additionally grant
+        # specific SAFE tools (e.g. host_terminal) so an unattended run can see
+        # them despite their AGENT source_type; grants never lift CONFIRM/DANGER
+        # gating, since unattended runs have no approval channel.
+        if definition.risk_level is RiskLevel.SAFE and definition.source_type is not ToolSourceType.AGENT:
+            return True
         return (
             definition.risk_level is RiskLevel.SAFE
-            and definition.source_type is not ToolSourceType.AGENT
+            and bool(granted_tools)
+            and definition.name in granted_tools
         )
 
     def validate_definition(self, definition: ToolDefinition) -> None:

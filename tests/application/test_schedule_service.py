@@ -263,3 +263,43 @@ async def test_schedule_service_update_supports_session_and_preserves_origin_con
     assert updated_origin.prompt == "new prompt"
     assert updated_origin.delivery_target.target_type.value == "origin"
     assert updated_origin.origin == {"receive_id": "chat-1", "receive_id_type": "chat_id"}
+
+
+@pytest.mark.asyncio
+async def test_schedule_service_create_persists_allowed_tools_on_execution_policy():
+    service, _, _ = _service()
+
+    task = await service.create(
+        ScheduledTaskCreateInput(
+            name="photo",
+            prompt="拍照上传",
+            cron_expression="0 10,18 * * *",
+            delivery_target="origin",
+            origin={"receive_id": "oc_1", "receive_id_type": "chat_id"},
+            allowed_tools=("host_terminal",),
+        )
+    )
+
+    assert task.execution_policy.allowed_tools == ("host_terminal",)
+
+
+@pytest.mark.asyncio
+async def test_schedule_service_update_sets_and_preserves_allowed_tools():
+    service, _, _ = _service()
+    task = await service.create(
+        ScheduledTaskCreateInput(
+            name="photo",
+            prompt="ok",
+            cron_expression="* * * * *",
+            allowed_tools=("host_terminal",),
+        )
+    )
+
+    without_grant_change = await service.update(task.id, ScheduledTaskUpdateInput(name="renamed"))
+    assert without_grant_change.execution_policy.allowed_tools == ("host_terminal",)
+
+    cleared = await service.update(task.id, ScheduledTaskUpdateInput(allowed_tools=()))
+    assert cleared.execution_policy.allowed_tools == ()
+
+    reset = await service.update(task.id, ScheduledTaskUpdateInput(allowed_tools=("host_terminal", "other")))
+    assert reset.execution_policy.allowed_tools == ("host_terminal", "other")

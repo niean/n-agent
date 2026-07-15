@@ -20,6 +20,7 @@ class FakeFeishuClient:
         self.image_mime = image_mime
         self.download_error = download_error
         self.download_calls: list[tuple[str, str]] = []
+        self.markdown_replies: list[tuple[str, str, str]] = []
 
     def verify_long_connection_event(self, payload):
         self.events.append(payload)
@@ -31,6 +32,10 @@ class FakeFeishuClient:
 
     async def send_text(self, receive_id, text, receive_id_type="chat_id"):
         self.sent.append((receive_id, text, receive_id_type))
+
+    async def send_markdown_reply(self, receive_id, content, receive_id_type="chat_id"):
+        self.markdown_replies.append((receive_id, content, receive_id_type))
+        await self.send_text(receive_id, content, receive_id_type)
 
     async def send_interactive_card(self, receive_id, card, receive_id_type="chat_id"):
         self.cards.append((receive_id, card, receive_id_type))
@@ -669,3 +674,19 @@ async def test_tool_approval_resumes_original_message_and_sends_final_reply():
     await message_task
 
     assert client.sent == [("oc_1", "tool allowed: True", "chat_id")]
+
+
+async def test_send_response_routes_normal_reply_through_markdown_reply():
+    markdown = "拍照上传成功！\n\n![照片](https://oss.example.com/a.jpg)\n\n[点击查看原图](https://oss.example.com/a.jpg)"
+    gateway = FakeGatewayService()
+    gateway.response = InteractionResponse(
+        session_id="s1",
+        messages=[GatewayOutboundMessage(markdown)],
+    )
+    client = FakeFeishuClient(text_payload("hello"))
+    adapter = FeishuImAdapter(gateway, client)
+
+    await adapter.handle_event({})
+
+    assert client.markdown_replies == [("oc_1", markdown, "chat_id")]
+    assert client.sent[0][1] == markdown

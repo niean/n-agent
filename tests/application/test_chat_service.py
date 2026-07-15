@@ -206,6 +206,31 @@ async def test_chat_service_unattended_disables_confirm_context_and_uses_safe_on
 
 
 @pytest.mark.asyncio
+async def test_complete_unattended_propagates_granted_tools_to_context(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "拍照上传"}],
+            stream=False,
+            trusted_metadata={
+                "execution_mode": "unattended",
+                "granted_tools": ["host_terminal"],
+            },
+        )
+    )
+
+    ctx = runner.options["tool_execution_context"]
+    assert isinstance(ctx, ToolExecutionContext)
+    assert ctx.execution_context_mode == "unattended"
+    assert ctx.granted_tools == frozenset({"host_terminal"})
+    assert runner.options["tool_exposure_policy"] == "safe_only"
+
+
+@pytest.mark.asyncio
 async def test_complete_injects_tool_execution_context_with_trusted_metadata(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     runner = RecordingRunner()

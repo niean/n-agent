@@ -217,12 +217,12 @@ class GatewayCommandService:
             return _response(session_id, "任务服务未启用")
         action, _, rest = arg.strip().partition(" ")
         if action in ("", "help"):
-            return _response(session_id, "用法: /schedule add <cron> <prompt> | list | pause <id> | resume <id> | run <id> | remove <id>")
+            return _response(session_id, "用法: /schedule add <cron> <prompt> [--tools <csv>] | list | pause <id> | resume <id> | run <id> | remove <id>")
         if action == "add":
             parsed = _parse_schedule_add(rest)
             if parsed is None:
-                return _response(session_id, "用法: /schedule add <cron> <prompt>")
-            cron_expression, prompt = parsed
+                return _response(session_id, "用法: /schedule add <cron> <prompt> [--tools <csv>]")
+            cron_expression, prompt, allowed_tools = parsed
             origin = await self._schedule_origin(event)
             task = await self.schedule_service.create(
                 ScheduledTaskCreateInput(
@@ -231,6 +231,7 @@ class GatewayCommandService:
                     cron_expression=cron_expression,
                     delivery_target="origin",
                     origin=origin,
+                    allowed_tools=allowed_tools,
                 )
             )
             return _response(session_id, f"已创建任务 {task.id}")
@@ -646,14 +647,30 @@ class GatewayService:
         return session_id
 
 
-def _parse_schedule_add(rest: str) -> tuple[str, str] | None:
+def _parse_schedule_add(rest: str) -> tuple[str, str, tuple[str, ...]] | None:
+    parts = rest.split()
+    allowed_tools: tuple[str, ...] = ()
+    if "--tools" in parts:
+        idx = parts.index("--tools")
+        if idx + 1 < len(parts):
+            allowed_tools = tuple(name.strip() for name in parts[idx + 1].split(",") if name.strip())
+            parts = parts[:idx] + parts[idx + 2:]
+        else:
+            parts = parts[:idx]
+    rest = " ".join(parts)
     if " -- " in rest:
         cron_expression, prompt = rest.split(" -- ", 1)
-        return (cron_expression.strip(), prompt.strip()) if cron_expression.strip() and prompt.strip() else None
-    parts = rest.split()
-    if len(parts) < 6:
+        cron_expression = cron_expression.strip()
+        prompt = prompt.strip()
+    else:
+        bits = rest.split()
+        if len(bits) < 6:
+            return None
+        cron_expression = " ".join(bits[:5])
+        prompt = " ".join(bits[5:])
+    if not cron_expression or not prompt:
         return None
-    return " ".join(parts[:5]), " ".join(parts[5:])
+    return cron_expression, prompt, allowed_tools
 
 
 def _home_target_from_event(event: InteractionMessage) -> GatewayHomeTarget:

@@ -56,6 +56,117 @@ async def test_registry_initializes_schema_and_crud(registry):
 
 
 @pytest.mark.asyncio
+async def test_registry_persists_execution_policy_allowed_tools(registry):
+    from app.domain.schedule import ScheduledExecutionPolicy
+
+    task = ScheduledTask(
+        id="task-grant",
+        name="photo",
+        prompt="拍照上传",
+        schedule=ScheduleExpression("0 10,18 * * *"),
+        timezone=ScheduleTimezone("UTC"),
+        session_id="session-1",
+        delivery_target=DeliveryTarget.dashboard(),
+        next_run_at=datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc),
+        execution_policy=ScheduledExecutionPolicy(allowed_tools=("host_terminal",)),
+    )
+    await registry.create(task)
+
+    fetched = await registry.get("task-grant")
+    assert fetched is not None
+    assert fetched.execution_policy.allowed_tools == ("host_terminal",)
+
+    cleared = ScheduledTask(
+        **{
+            **fetched.__dict__,
+            "execution_policy": ScheduledExecutionPolicy(allowed_tools=()),
+        }
+    )
+    await registry.update(cleared)
+    refetched = await registry.get("task-grant")
+    assert refetched is not None
+    assert refetched.execution_policy.allowed_tools == ()
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_executions_marks_expired_running_failed_and_releases_lease(registry):
+    task = _task()
+    await registry.create(task)
+    now = task.next_run_at
+
+    claim = await registry.claim_task_for_run_now(task.id, now, 900)
+    assert claim is not None
+    execution = ScheduledTaskExecution(
+        id="exec-stale",
+        task_id=task.id,
+        session_id=task.session_id,
+        claim_id=claim.claim_id,
+        lease_owner=claim.lease_owner,
+        claimed_next_run_at=claim.claimed_next_run_at,
+        started_at=now,
+        status=ScheduledTaskExecutionStatus.RUNNING,
+    )
+    await registry.record_execution_started(execution)
+
+    # before lease expiry: nothing recovered, execution still RUNNING
+    assert await registry.recover_stale_executions(now + timedelta(seconds=600)) == 0
+    assert (await registry.list_executions(task.id, 5))[0].status is ScheduledTaskExecutionStatus.RUNNING
+
+    # after lease expiry: execution marked FAILED, lease released
+    after = now + timedelta(seconds=901)
+    assert await registry.recover_stale_executions(after) == 1
+    execs = await registry.list_executions(task.id, 5)
+    assert execs[0].status is ScheduledTaskExecutionStatus.FAILED
+    assert execs[0].error == "execution_stale_recovered"
+    refreshed = await registry.get(task.id)
+    assert refreshed.lease_until is None
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_executions_marks_superseded_claim_running_failed(registry):
+    task = _task()
+    await registry.create(task)
+    now = task.next_run_at
+
+    claim1 = await registry.claim_task_for_run_now(task.id, now, 900)
+    assert claim1 is not None
+    exec1 = ScheduledTaskExecution(
+        id="exec-superseded",
+        task_id=task.id,
+        session_id=task.session_id,
+        claim_id=claim1.claim_id,
+        lease_owner=claim1.lease_owner,
+        claimed_next_run_at=claim1.claimed_next_run_at,
+        started_at=now,
+        status=ScheduledTaskExecutionStatus.RUNNING,
+    )
+    await registry.record_execution_started(exec1)
+
+    # lease for claim1 expires -> task is re-claimed (claim2) with a new execution
+    after = now + timedelta(seconds=901)
+    claim2 = await registry.claim_task_for_run_now(task.id, after, 900)
+    assert claim2 is not None
+    exec2 = ScheduledTaskExecution(
+        id="exec-current",
+        task_id=task.id,
+        session_id=task.session_id,
+        claim_id=claim2.claim_id,
+        lease_owner=claim2.lease_owner,
+        claimed_next_run_at=claim2.claimed_next_run_at,
+        started_at=after,
+        status=ScheduledTaskExecutionStatus.RUNNING,
+    )
+    await registry.record_execution_started(exec2)
+
+    recovered = await registry.recover_stale_executions(after + timedelta(seconds=1))
+    # only the superseded execution is recovered; the current one keeps running
+    assert recovered == 1
+    by_id = {e.id: e for e in await registry.list_executions(task.id, 5)}
+    assert by_id["exec-superseded"].status is ScheduledTaskExecutionStatus.FAILED
+    assert by_id["exec-current"].status is ScheduledTaskExecutionStatus.RUNNING
+
+
+@pytest.mark.asyncio
 async def test_claim_due_tasks_writes_claim_and_advances_next_run(registry):
     now = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
     await registry.create(_task(next_run_at=now))

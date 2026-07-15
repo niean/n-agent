@@ -292,6 +292,31 @@ def test_scheduled_task_update_and_execution_routes(tmp_path):
     assert invalid.status_code == 422
 
 
+def test_scheduled_task_routes_pass_allowed_tools_grant(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    client = TestClient(_build_app(store, schedule_service=schedule))
+
+    created = client.post(
+        "/chat/scheduled-tasks",
+        json={
+            "name": "photo",
+            "prompt": "拍照上传",
+            "cron_expression": "0 10,18 * * *",
+            "allowed_tools": ["host_terminal"],
+        },
+    )
+    assert created.status_code == 200
+    assert schedule.created_requests[0].allowed_tools == ("host_terminal",)
+
+    patched = client.patch(
+        f"/chat/scheduled-tasks/{created.json()['id']}",
+        json={"allowed_tools": "host_terminal,other"},
+    )
+    assert patched.status_code == 200
+    assert schedule.updated_requests[0].allowed_tools == ("host_terminal", "other")
+
+
 def test_scheduled_task_origin_payloads_are_protected(tmp_path):
     from app.domain.schedule import DeliveryTarget, ScheduledTask, ScheduleExpression, ScheduleTimezone
     from datetime import datetime, timezone

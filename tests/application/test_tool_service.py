@@ -281,6 +281,29 @@ def test_safe_only_hides_agent_source_tools():
     assert all(schema["function"]["name"] != "schedule_query" for schema in schemas)
 
 
+def test_safe_only_exposes_agent_tool_when_granted_by_context():
+    agent_def = ToolDefinition(
+        name="host_terminal",
+        description="",
+        input_schema={"type": "object"},
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.AGENT,
+        toolset="host",
+    )
+    service = ToolService(RecordingExecutor(), [agent_def])
+    granted = service.list_openai_tools(
+        risk_level=RiskLevel.SAFE,
+        context=ToolExecutionContext(granted_tools=frozenset({"host_terminal"})),
+    )
+    assert "host_terminal" in {schema["function"]["name"] for schema in granted}
+
+    # without grant the AGENT tool stays hidden under SAFE_ONLY
+    ungranted = service.list_openai_tools(
+        risk_level=RiskLevel.SAFE, context=ToolExecutionContext()
+    )
+    assert "host_terminal" not in {schema["function"]["name"] for schema in ungranted}
+
+
 def test_schedule_tool_definitions_shape():
     defs = {d.name: d for d in schedule_tool_definitions()}
     assert set(defs) == {"manage_schedule", "schedule_query"}

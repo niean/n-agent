@@ -93,7 +93,7 @@ def _success_fakes(module, tmp_path: Path):
         output.chmod(0o600)
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
-    expiration = module._format_utc(1_700_000_000 + 7200)
+    expiration = module._format_utc(1_700_000_000 + 3600)
     sts = json.dumps(
         {
             "Credentials": {
@@ -150,7 +150,7 @@ def test_success_contract_signing_and_cleanup(tmp_path, capsys, monkeypatch):
         runner=runner,
         opener=opener,
         clock=lambda: 1_700_000_000,
-        token_factory=lambda: "unpredictable_token_123456",
+        hostname_factory=lambda: "nieans-MacBook-AirM5",
         cleanup=cleanup,
     )
 
@@ -158,7 +158,7 @@ def test_success_contract_signing_and_cleanup(tmp_path, capsys, monkeypatch):
     assert code == 0
     lines = captured.out.splitlines()
     assert len(lines) == 3
-    assert lines[0].startswith("CAPTURED:photo-")
+    assert lines[0].startswith("CAPTURED:photo_")
     assert lines[0].endswith(":260")
     assert lines[1] == "UPLOAD_HTTP:201"
     assert lines[2].startswith("URL:https://")
@@ -166,11 +166,12 @@ def test_success_contract_signing_and_cleanup(tmp_path, capsys, monkeypatch):
     assert all(not path.exists() for path in observed_temp_dirs)
     assert requests[0][1] <= 15 and requests[1][1] <= 30 and requests[2][1] <= 15
     sts_query = requests[0][0].full_url
-    assert "DurationSeconds=7200" in sts_query
+    assert "DurationSeconds=3600" in sts_query
     signed_url = lines[2][4:]
     assert "Expires=1700003600" in signed_url
     assert "long-ak" not in signed_url and "long-sk" not in signed_url
     object_leaf = lines[0].split(":", 2)[1]
+    assert object_leaf == "photo_nieans-macbook-airm5_231115061320.jpg"
     assert object_leaf in requests[1][0].full_url
     assert ".." not in object_leaf and "/" not in object_leaf
 
@@ -178,7 +179,7 @@ def test_success_contract_signing_and_cleanup(tmp_path, capsys, monkeypatch):
         "Action": "AssumeRole",
         "RoleArn": "acs:ram::123:role/photo",
         "RoleSessionName": "n-agent-photo-upload",
-        "DurationSeconds": "7200",
+        "DurationSeconds": "3600",
         "Format": "JSON",
         "Version": "2015-04-01",
         "AccessKeyId": "long-ak",
@@ -354,7 +355,7 @@ def test_each_failure_has_only_stage_code_and_no_secret_or_url(
                 body = json.dumps({"Credentials": {
                     "AccessKeyId": "temp-ak", "AccessKeySecret": "temp-sk",
                     "SecurityToken": "temp-token",
-                    "Expiration": module._format_utc(1_700_000_000 + 3700),
+                    "Expiration": module._format_utc(1_700_000_000 + 3200),
                 }}).encode()
                 return _Response(200, body)
             raise AssertionError("upload must not run")
@@ -362,7 +363,7 @@ def test_each_failure_has_only_stage_code_and_no_secret_or_url(
     code = module.run_cli(
         env_path=env_path, runner=runner, opener=opener,
         clock=lambda: 1_700_000_000,
-        token_factory=lambda: "unpredictable_token_123456",
+        hostname_factory=lambda: "nieans-MacBook-AirM5",
     )
     captured = capsys.readouterr()
     assert code != 0
@@ -389,7 +390,7 @@ def test_cleanup_failure_suppresses_all_success_output(tmp_path, capsys):
         runner=runner,
         opener=opener,
         clock=lambda: 1_700_000_000,
-        token_factory=lambda: "unpredictable_token_123456",
+        hostname_factory=lambda: "nieans-MacBook-AirM5",
         cleanup=failing_cleanup,
     )
 

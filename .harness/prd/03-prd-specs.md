@@ -400,7 +400,12 @@
 
 [20260715]
 - FR
-    - 工具：新增host_terminal由宿主执行命令，terminal维持Sandbox执行；进而，迁移`拍照上传`Skill到N-Agent
+    - 安全：Schedule，Policy未展示 工具source_type!=agent的默认约束
+    - 工具：[KF]新增宿主执行器host_terminal，terminal维持Sandbox执行
+    - 工具：迁移`拍照上传`Skill到N-Agent
+        - 迭代：Skill拍照上传，照片命名格式 改为 `photo_${电脑名称}_${yymmddHHMMSS}.${照片格式}`，如 photo_nieans-macbook-airm5_260715100016.jpg
+        - 迭代：拍照上传成功后，Chat框 ①OSS链接 渲染为Link(不要展示url地址)，②Chat框展示照片预览
+        - 迭代：新增飞书IM定时任务，每天10:00和18:00执行`Skill拍照上传`，并把任务执行结果、图片链接、图片预览投递到飞书聊天框
 
 
 ---
@@ -410,7 +415,6 @@
 - NFR
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
-    - 治理：能力分层，平台是提供方视角(管理员)、业务是使用方视角(用户)。以Skill为例，Skill系平台能力、Workflow是业务能力，两者复用领域层
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
 - FR
     - 工具：Skill自进化，参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent

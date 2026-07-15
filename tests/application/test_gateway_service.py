@@ -685,6 +685,36 @@ async def test_gateway_schedule_add_uses_origin_metadata():
 
 
 @pytest.mark.asyncio
+async def test_gateway_schedule_add_parses_tools_grant():
+    harness = Harness()
+    schedule = FakeScheduleService()
+    service = harness.service(schedule)
+    event = message("/schedule add */5 * * * * summarize --tools host_terminal", "event-schedule-tools")
+    event.metadata.update({"receive_id": "oc_1", "receive_id_type": "chat_id"})
+
+    response = await service.handle_message(event)
+
+    assert "sched-1" in response.messages[0].content
+    created = schedule.created[0]
+    assert created.cron_expression == "*/5 * * * *"
+    assert created.prompt == "summarize"
+    assert created.allowed_tools == ("host_terminal",)
+
+
+@pytest.mark.asyncio
+async def test_gateway_schedule_add_without_tools_has_empty_grant():
+    harness = Harness()
+    schedule = FakeScheduleService()
+    service = harness.service(schedule)
+    event = message("/schedule add */5 * * * * summarize", "event-schedule-no-tools")
+    event.metadata.update({"receive_id": "oc_1", "receive_id_type": "chat_id"})
+
+    await service.handle_message(event)
+
+    assert schedule.created[0].allowed_tools == ()
+
+
+@pytest.mark.asyncio
 async def test_gateway_sethome_switches_future_schedule_home_reference():
     harness = Harness()
     service = harness.service(FakeScheduleService())

@@ -60,3 +60,32 @@ async def test_executor_blocks_without_calling_chat_service():
     assert result.status is ScheduledTaskExecutionStatus.BLOCKED
     assert result.error == "blocked prompt"
     assert chat.requests == []
+
+
+@pytest.mark.asyncio
+async def test_executor_passes_allowed_tools_grant_via_trusted_metadata():
+    """Per-task tool grants flow into trusted_metadata so ChatCompletionService
+    can expose the granted SAFE tools (e.g. host_terminal) under safe_only."""
+    from app.domain.schedule import ScheduledExecutionPolicy
+
+    chat = FakeChatService()
+    task = ScheduledTask(
+        **{
+            **_task().__dict__,
+            "execution_policy": ScheduledExecutionPolicy(allowed_tools=("host_terminal",)),
+        }
+    )
+
+    result = await ScheduledAgentExecutor(chat, FakeScanner()).run(task)
+
+    assert result.status is ScheduledTaskExecutionStatus.SUCCEEDED
+    assert chat.requests[0].trusted_metadata.get("granted_tools") == ["host_terminal"]
+    assert chat.requests[0].ingress_facts.trusted_claims.get("granted_tools") == ["host_terminal"]
+
+
+@pytest.mark.asyncio
+async def test_executor_passes_empty_grant_when_task_has_no_allowed_tools():
+    chat = FakeChatService()
+    await ScheduledAgentExecutor(chat, FakeScanner()).run(_task())
+
+    assert chat.requests[0].trusted_metadata.get("granted_tools") == []

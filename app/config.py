@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     scheduler_max_due_per_tick: int = Field(default=5, ge=1, le=100)
     scheduler_missed_grace_seconds: int = Field(default=300, ge=0)
     scheduler_lease_seconds: int = Field(default=900, ge=30)
+    scheduler_execution_timeout_seconds: int = Field(default=600, ge=30, le=3600)
     scheduler_timezone: str = Field(default="Asia/Shanghai")
     feishu_enabled: bool = Field(default=False)
     feishu_app_id: str = Field(default="")

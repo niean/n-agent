@@ -964,6 +964,7 @@ def _register_schedule_routes(router: APIRouter, schedule_service: ScheduleServi
                     delivery_target=payload.get("delivery_target", "dashboard"),
                     origin={},
                     session_id=payload.get("session_id"),
+                    allowed_tools=_normalize_allowed_tools(payload.get("allowed_tools")),
                 )
             )
         except ScheduleServiceError as exc:
@@ -1186,6 +1187,7 @@ def _scheduled_task_to_dict(task) -> dict:
         "last_error": task.last_error,
         "last_delivery_error": task.last_delivery_error,
         "unread_count": task.unread_count,
+        "allowed_tools": list(task.execution_policy.allowed_tools),
     }
 
 
@@ -1213,6 +1215,7 @@ def _scheduled_task_update_input(payload: dict, task) -> ScheduledTaskUpdateInpu
             prompt=payload.get("prompt"),
             cron_expression=payload.get("cron_expression"),
             timezone=payload.get("timezone"),
+            allowed_tools=_payload_allowed_tools(payload),
         )
     delivery_target = payload.get("delivery_target")
     if delivery_target == "origin":
@@ -1224,7 +1227,26 @@ def _scheduled_task_update_input(payload: dict, task) -> ScheduledTaskUpdateInpu
         timezone=payload.get("timezone"),
         delivery_target=delivery_target,
         session_id=payload.get("session_id"),
+        allowed_tools=_payload_allowed_tools(payload),
     )
+
+
+def _normalize_allowed_tools(value) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        items = [name.strip() for name in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = [str(name).strip() for name in value]
+    else:
+        return ()
+    return tuple(name for name in items if name)
+
+
+def _payload_allowed_tools(payload: dict) -> tuple[str, ...] | None:
+    if "allowed_tools" not in payload:
+        return None
+    return _normalize_allowed_tools(payload.get("allowed_tools"))
 
 
 def _schedule_error_response(exc: Exception) -> JSONResponse:

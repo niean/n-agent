@@ -16,6 +16,9 @@ class FakeFeishuClient:
         if self.fail:
             raise RuntimeError("send failed")
 
+    async def send_markdown_reply(self, receive_id, content, receive_id_type="chat_id"):
+        await self.send_text(receive_id, content, receive_id_type)
+
 
 @pytest.mark.asyncio
 async def test_silent_delivery_skips_sending():

@@ -11,6 +11,7 @@ from app.domain.schedule import (
     DeliveryTarget,
     DeliveryTargetType,
     PromptSafetyScanner,
+    ScheduledExecutionPolicy,
     ScheduledTask,
     ScheduledTaskRegistry,
     ScheduledTaskStatus,
@@ -52,6 +53,7 @@ class ScheduledTaskCreateInput:
     delivery_target: str = "dashboard"
     origin: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
+    allowed_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class ScheduledTaskUpdateInput:
     delivery_target: str | None = None
     origin: dict[str, Any] | None = None
     session_id: str | None = None
+    allowed_tools: tuple[str, ...] | None = None
 
 
 RunNowCallable = Callable[[str], Awaitable[Any]]
@@ -103,6 +106,7 @@ class ScheduleService:
             origin=dict(request.origin),
             delivery_target=target,
             next_run_at=self.calculator.next_after(expression, now, timezone_value),
+            execution_policy=ScheduledExecutionPolicy(allowed_tools=tuple(request.allowed_tools)),
             created_at=now,
             updated_at=now,
         )
@@ -128,6 +132,14 @@ class ScheduleService:
             request.delivery_target or task.delivery_target.target_type.value,
             origin,
         )
+        execution_policy = task.execution_policy
+        if request.allowed_tools is not None:
+            execution_policy = ScheduledExecutionPolicy(
+                mode=task.execution_policy.mode,
+                tool_exposure_policy=task.execution_policy.tool_exposure_policy,
+                allow_confirm_tools=task.execution_policy.allow_confirm_tools,
+                allowed_tools=tuple(request.allowed_tools),
+            )
         updated = ScheduledTask(
             **{
                 **task.__dict__,
@@ -139,6 +151,7 @@ class ScheduleService:
                 "delivery_target": delivery_target,
                 "session_id": request.session_id if request.session_id is not None else task.session_id,
                 "next_run_at": self.calculator.next_after(expression, datetime.now(timezone.utc), timezone_value),
+                "execution_policy": execution_policy,
                 "updated_at": datetime.now(timezone.utc),
             }
         )

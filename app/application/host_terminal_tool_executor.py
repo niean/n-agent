@@ -70,6 +70,20 @@ _BRIDGE_CODES = {
     "host_command_signing_failed",
     "host_command_snapshot_invalid",
 }
+_STAGE_ERROR_RE = re.compile(r"^ERROR:([a-z][a-z0-9_]{0,63})$", re.MULTILINE)
+
+
+def _parse_stage_error(stderr: str) -> str | None:
+    """Extract the desensitized stage code a Skill script writes to stderr.
+
+    Skill scripts emit ``ERROR:<code>`` on failure where ``<code>`` is a stable,
+    desensitized stage identifier. Only that code is surfaced; raw stderr never
+    enters the model context.
+    """
+    if not isinstance(stderr, str):
+        return None
+    match = _STAGE_ERROR_RE.search(stderr)
+    return match.group(1) if match is not None else None
 
 
 class HostTerminalPolicySnapshotProvider(Protocol):
@@ -483,6 +497,19 @@ class HostTerminalToolExecutor:
                 )
             if code == "host_bridge_unhealthy":
                 code = "host_bridge_unavailable"
+            if code == "host_execution_failed" and self._target_type(request.arguments) == "skill_script":
+                stage = _parse_stage_error(response.stderr)
+                if stage is not None:
+                    return (
+                        ToolResult(
+                            request.id,
+                            request.name,
+                            ToolResultStatus.ERROR,
+                            {"error": "host_execution_failed", "stage": stage},
+                            duration_ms=response.duration_ms,
+                        ),
+                        code,
+                    )
             return self._mapped_error(request, code), code
         if (
             response.exit_code != 0
