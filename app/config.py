@@ -46,6 +46,22 @@ class Settings(BaseSettings):
     skills_max_view_bytes: int = Field(default=131072, ge=1024)
     skills_max_count: int = Field(default=200, ge=1, le=2000)
 
+    # Restricted host-terminal bridge (disabled unless every required value is set)
+    host_terminal_enabled: bool = Field(default=False)
+    host_terminal_bridge_url: str = Field(default="")
+    host_terminal_policy_path: Path | None = Field(default=None)
+    host_terminal_token_path: Path | None = Field(default=None)
+    host_terminal_host_workspace_root: Path | None = Field(default=None)
+    host_terminal_host_skills_root: Path | None = Field(default=None)
+    host_terminal_tool_timeout_seconds: int = Field(default=120, ge=1, le=3600)
+    host_terminal_bridge_timeout_seconds: int = Field(default=120, ge=1, le=3600)
+    host_terminal_connect_timeout_seconds: float = Field(default=2.0, gt=0, le=60)
+    host_terminal_transfer_margin_seconds: float = Field(default=5.0, gt=0, le=60)
+    host_terminal_max_response_bytes: int = Field(default=1048576, ge=1024)
+    host_terminal_max_stdout_bytes: int = Field(default=65536, ge=1)
+    host_terminal_max_stderr_bytes: int = Field(default=16384, ge=1)
+    host_terminal_max_concurrency: int = Field(default=1, ge=1)
+
     # Plugin 配置
     plugins_root: Path = Field(default=Path("/workspace/plugins"))
     plugins_enabled: list[str] | str = Field(default_factory=lambda: ["hello"])
@@ -156,6 +172,9 @@ class Settings(BaseSettings):
         "sandbox_docker_host_workspace_root", "sandbox_docker_host_locals_root",
         "sandbox_scratch_root",
         "acp_host_workspace_root", "acp_container_workspace_root",
+        "host_terminal_policy_path", "host_terminal_token_path",
+        "host_terminal_host_workspace_root",
+        "host_terminal_host_skills_root",
         mode="before",
     )
     @classmethod

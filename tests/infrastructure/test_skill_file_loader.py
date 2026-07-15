@@ -1,4 +1,5 @@
 import pytest
+from app.domain.skill import SkillValidationError
 from app.infrastructure.skill.file_loader import SkillFileLoader, SkillFileLoaderConfig
 
 
@@ -107,7 +108,10 @@ async def test_render_linked_file_traversal_rejected(tmp_path):
     skills, _ = await loader.scan()
     ok = await loader.read_linked_file(skills[0], "references/x.md")
     assert ok == "ref-content"
-    with pytest.raises(Exception):
+    with pytest.raises(
+        SkillValidationError,
+        match=r"^Path traversal \('\.\.'\) is not allowed\.$",
+    ):
         await loader.read_linked_file(skills[0], "../escape.md")
 
 
@@ -119,3 +123,54 @@ async def test_excluded_dirs(tmp_path):
     loader = SkillFileLoader(SkillFileLoaderConfig(root=tmp_path, current_platform="linux"))
     skills, _ = await loader.scan()
     assert {s.name for s in skills} == {"kept"}
+
+
+@pytest.mark.asyncio
+async def test_read_script_bytes_requires_scripts_link_and_rejects_symlinks(tmp_path):
+    _write_skill(tmp_path, "demo/SKILL.md", "---\nname: demo\nplatforms: [linux]\n---\n")
+    scripts = tmp_path / "demo" / "scripts"
+    scripts.mkdir()
+    script = scripts / "photo.py"
+    script.write_bytes(b"payload")
+    loader = SkillFileLoader(SkillFileLoaderConfig(root=tmp_path, current_platform="linux"))
+    skills, _ = await loader.scan()
+    assert await loader.read_script_bytes(skills[0], "scripts/photo.py") == b"payload"
+    with pytest.raises(SkillValidationError, match="^skill_script_path_denied$"):
+        await loader.read_script_bytes(skills[0], "references/photo.py")
+    with pytest.raises(SkillValidationError, match="^skill_script_path_denied$"):
+        await loader.read_script_bytes(skills[0], "scripts/../photo.py")
+    script.unlink()
+    script.symlink_to(tmp_path / "outside.py")
+    with pytest.raises(SkillValidationError, match="^skill_script_path_denied$"):
+        await loader.read_script_bytes(skills[0], "scripts/photo.py")
+
+
+@pytest.mark.asyncio
+async def test_read_script_bytes_rejects_intermediate_symlink(tmp_path):
+    _write_skill(tmp_path, "demo/SKILL.md", "---\nname: demo\nplatforms: [linux]\n---\n")
+    real = tmp_path / "real-scripts"
+    real.mkdir()
+    (real / "photo.py").write_bytes(b"payload")
+    (tmp_path / "demo" / "scripts").symlink_to(real, target_is_directory=True)
+    loader = SkillFileLoader(SkillFileLoaderConfig(root=tmp_path, current_platform="linux"))
+    skills, _ = await loader.scan()
+    with pytest.raises(SkillValidationError, match="^skill_script_path_denied$"):
+        await loader.read_script_bytes(skills[0], "scripts/photo.py")
+
+
+@pytest.mark.asyncio
+async def test_read_script_bytes_missing_file_preserves_stable_not_found(tmp_path):
+    _write_skill(
+        tmp_path,
+        "demo/SKILL.md",
+        "---\nname: demo\nplatforms: [linux]\n---\n",
+    )
+    (tmp_path / "demo" / "scripts").mkdir()
+    loader = SkillFileLoader(
+        SkillFileLoaderConfig(root=tmp_path, current_platform="linux")
+    )
+    skills, _ = await loader.scan()
+
+    with pytest.raises(FileNotFoundError) as caught:
+        await loader.read_script_bytes(skills[0], "scripts/missing.py")
+    assert caught.value.filename == "missing.py"

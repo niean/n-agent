@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含飞书与 CLI ToolPolicy 审批服务与协议桥 -->
+<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批与 Host Terminal 宿主执行链路 -->
 # 功能与文件映射
 
 ## 应用入口与配置
@@ -15,6 +15,7 @@
 - Policy Shared Kernel：`app/domain/policy.py`，定义通用 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`、`ExecutionMode`、`PolicyDecisionKind`、`RunPolicyContext`；不包含具体业务规则
 - 工具领域模型：`app/domain/tool.py`，定义 `RiskLevel`、`ToolSourceType`、`ToolDefinition`、`ToolCallRequest`、`ApprovalRequest`、`ApprovalDecision`、`ToolExecutionContext`、`ToolResult`、`ToolExecutor`；`ToolDefinition` 不含 handler，`ToolExecutor` 是 SPI
 - 工具领域策略：`app/domain/tool_policy.py`，定义 `ToolExposurePolicy`、`ToolPolicyRequest`、`ToolPolicy`，治理定义校验、模型暴露、执行决策和一次授权
+- Host Terminal 领域模型与策略：`app/domain/host_terminal.py`、`app/domain/host_terminal_policy.py`，定义结构化宿主执行请求/结果、能力端口、精确 command/Skill script 授权与 SHA-256 约束
 - 预算领域模型：`app/domain/budget.py`，定义 `BudgetConfig`、`BudgetReserveKind`(LLM_CALL/TOOL_CALL/SANDBOX_RESOURCE/WALL_TIME)、`BudgetReserveRequest`、`BudgetReservationDecision`、`BudgetActualUsage`、`BudgetState`、`SandboxReserveSpec`
 - 预算策略：`app/domain/budget_policy.py`，定义 `BudgetPolicy`，评估 reserve/settle/release 决策
 - 信息流领域模型：`app/domain/information_flow.py`，定义 `Classification`、`ReleaseTarget`、`InformationAsset`、`InformationFlowConfig`、`InformationReleaseDecision`、`SecretCatalog`、`InformationFlowError`、`redact_secret_values`、`redact_structured`
@@ -41,6 +42,8 @@
 - Usage 观测领域模型：`app/domain/usage.py`，定义 `CanonicalUsage`/`UsageCost`/`PricingEntry`/`SessionUsageStats`/`ContextBreakdown`/`UsageRecord`/`CompressionStat` 值对象与 `UsageRecorder`/`PricingProvider`/`ContextBreakdownCalculator` 端口；纯领域不依赖 SQLite/OpenAI SDK
 
 ## Application Layer
+
+- Host Terminal 能力与工具执行器：`app/application/host_terminal_capability.py`、`app/application/host_terminal_tool_executor.py`，负责 Policy 刷新、容器/宿主路径映射、双重校验前置与 `host_terminal` ToolResult 映射
 
 - 应用运行事件：`app/application/events.py`，定义 `ChatEvent`（含 `metadata: dict[str, Any]` 字段，携带 Gateway confirmation/duplicate 等事件元信息）和 `ChatEventType`
 - Agent Runtime：`app/application/agent_graph.py`，使用 LangGraph 编排 `prepare_context`、`call_llm`、`execute_tools`、`update_memory`、`finalize`；工具节点只消费 `ToolService.evaluate_execution` 返回的 `PolicyDecision`，按 allow/deny/require_approval 编排，审批通过后仍调用 `ToolService.authorize_once` 与 `execute`，不直接按 `RiskLevel` 决策
@@ -77,6 +80,8 @@
 - Schedule 用例：`app/application/schedule_service.py` 定义任务 CRUD、校验、启停与 session 恢复，`schedule_run_service.py` 负责 claim 执行和结果投递，`scheduled_agent_executor.py` 以安全策略调用 ChatCompletionService，`scheduler_runner.py` 驱动周期调度
 
 ## Infrastructure Layer
+
+- Host Terminal 基础设施：`app/infrastructure/host_terminal/`，包含严格 Policy loader、固定地址/token HTTP client 与仅宿主运行的 loopback Bridge；Bridge 通过私有快照、并发限制、超时和结构化审计执行已授权字节
 
 - Policy 审计 sink：`app/infrastructure/policy/logging_sink.py`，定义 `LoggingPolicyAuditSink`，实现 `PolicyAuditSink` Protocol，输出结构化 JSON 日志（PolicyAuditEvent 字段序列化，无 raw prompt/secret）
 - OpenAI-compatible Provider：`app/infrastructure/llm/openai_compatible.py`，实现 Domain `LLMProvider`
@@ -147,6 +152,8 @@
 
 ## Docker 与部署
 
+- Host Terminal Compose/Policy 模板：`docker/docker-compose.yml.example`、`docker/host-terminal-policy.yaml.example`；前者只读挂载 Policy/token 并固定 Bridge 地址，后者示例化精确 command 与 Skill script SHA-256 授权
+
 - 镜像构建：`docker/Dockerfile`，使用 Python 3.11 slim 镜像，安装项目并以 Uvicorn 启动 8201 端口
 - Compose 部署：`docker/docker-compose.yml`，定义 `n-agent` service、可选根目录 `.env`、端口 `8201:8201`、locals/workspace volume
 - Docker 构建忽略：`docker/Dockerfile.dockerignore`，排除 `.claude`、`.harness`、`.git`、缓存、venv、locals、workspace
@@ -154,6 +161,8 @@
 - 本地产物：`locals/`、`.pytest_cache/`、`__pycache__/`、`*.pyc`、`*.egg-info/` 是运行、测试或构建缓存产物，不作为功能文件映射对象
 
 ## 测试
+
+- Host Terminal 测试：`tests/domain/test_host_terminal*.py`、`tests/application/test_host_terminal*.py`、`tests/infrastructure/test_host_terminal*.py`、`tests/test_main_host_terminal_wiring.py`、`tests/test_host_terminal_compose.py`；`tests/fixtures/photo-and-upload/photo-upload.py` 仅作为自动化测试 Skill 脚本夹具
 
 - 配置测试：`tests/test_config.py`
 - DDD 边界测试：`tests/test_architecture_boundaries.py`

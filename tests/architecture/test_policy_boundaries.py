@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 DOMAIN = ROOT / "app" / "domain"
 APPLICATION = ROOT / "app" / "application"
 
-# All domain Policy files (the 10 Policies + shared kernel).
+# All domain Policy files (the domain Policies + shared kernel).
 POLICY_FILES = [
     "policy.py",
     "turn_policy.py",
@@ -30,6 +30,7 @@ POLICY_FILES = [
     "schedule_policy.py",
     "budget_policy.py",
     "information_flow_policy.py",
+    "host_terminal_policy.py",
 ]
 
 # Domain types files consumed by Policies (not Policy files themselves).
@@ -100,6 +101,7 @@ POLICY_FILE_OWN_DOMAIN = {
     "schedule_policy.py": {"app.domain.schedule"},
     "budget_policy.py": {"app.domain.budget"},
     "information_flow_policy.py": {"app.domain.information_flow"},
+    "host_terminal_policy.py": {"app.domain.host_terminal"},
 }
 
 

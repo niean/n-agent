@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、OpenAI-compatible 协议边界和 Docker Compose 数据挂载边界，含飞书 ToolPolicy 审批的会话授权与协议 pending 所有权 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -294,6 +294,10 @@ volumes:
 - 废弃沙盒历史保存在同一 SQLite 的 `sandbox_released_history` 表；释放沙盒会删除 scratch 运行目录，但不会删除该历史表记录
 - execute_code 执行历史保存在同一 SQLite 的 `sandbox_execution_history` 表；Dashboard 兼容读取旧 `tool_calls` 记录，但长期保存以沙盒历史表为准，删除 Chat Session 不会清理该表
 - 文件工具只能访问宿主机 `/Users/niean/install/n-agent/workspace` 对应的容器路径 `/workspace`
+- Host Terminal 的 Policy 与 token 从宿主机 `/Users/niean/install/n-agent/locals/host-terminal-policy.yaml`、`host-terminal.token` 以单文件只读方式挂载到容器；容器和宿主 Bridge 各自加载并校验同一份权威内容，不能把整个 `locals` 目录作为可写授权面
+- 用户 Skill 在容器内使用 `/workspace/skills`，宿主 Bridge 使用对应的 `/Users/niean/install/n-agent/workspace/skills`；Policy 以 Skill 名、相对脚本路径和 SHA-256 绑定允许执行的字节
+- OSS 密钥只保存在宿主机 `/Users/niean/install/n-agent/secrets/oss.env`，默认不由 Docker Compose 自动加载，也不挂载或注入 N-Agent 容器；仅宿主 Bridge 启动被允许的上传脚本时按需读取
+- Host Terminal Bridge 只监听 `127.0.0.1`；容器客户端通过固定的 `host.docker.internal` 地址访问，不接受 Policy 中的任意远端 URL
 - KB 后端是外部独立服务，Dashboard 中每条 knowledge_bases 记录的 base_url 必须从 N-Agent 运行环境可达；容器内不能使用指向 N-Agent 容器自身的 localhost，应使用 Compose service name、共享 network 或宿主机网关地址
 - N-Agent compose 访问 N-KB 时应把 n-agent 容器加入 N-KB 所在 Docker 网络（`n-kb_default`，external），并以 KB base_url `http://n-kb:8212` 通过 service name 直连。否则 hostname 会被 Docker Desktop 内部 DNS 解析到不可达代理地址，TCP 表面 connect 成功但 HTTP 响应被丢弃，httpx 抛 RemoteProtocolError
 

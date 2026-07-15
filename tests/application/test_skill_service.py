@@ -70,6 +70,7 @@ class FakeLoader:
         self.rendered = "RENDERED"
         self.linked = "LINKED"
         self.linked_files = {"references": [], "templates": [], "scripts": [], "assets": []}
+        self.script_bytes = b"print('ok')\n"
 
     async def scan(self):
         return list(self.scan_skills), list(self.scan_warnings)
@@ -82,6 +83,39 @@ class FakeLoader:
 
     async def list_linked_files(self, skill):
         return dict(self.linked_files)
+
+    async def read_script_bytes(self, skill, script_relative_path):
+        return self.script_bytes
+
+
+@pytest.mark.asyncio
+async def test_resolve_script_bytes_returns_immutable_path_free_facts():
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("photo"))
+    service = SkillService(registry, loader)
+    result = await service.resolve_script_bytes("photo", "scripts/photo.py")
+    assert result.skill_name == "photo"
+    assert result.script_relative_path == "scripts/photo.py"
+    assert result.content == loader.script_bytes
+    assert len(result.sha256) == 64
+    assert not hasattr(result, "path")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "skill",
+    [
+        _skill("disabled", enabled=False),
+        _skill("unsupported", readiness=SkillReadiness.UNSUPPORTED),
+        _skill("scan-error", readiness=SkillReadiness.SCAN_ERROR),
+    ],
+)
+async def test_resolve_script_bytes_requires_enabled_ready_scan_success(skill):
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(skill)
+    service = SkillService(registry, loader)
+    with pytest.raises(SkillNotFoundError):
+        await service.resolve_script_bytes(skill.name, "scripts/photo.py")
 
 
 @pytest.mark.asyncio

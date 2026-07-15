@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -41,6 +42,16 @@ class SkillScanReport:
 
 
 @dataclass(frozen=True)
+class SkillScriptBytes:
+    """Immutable, path-free facts for a verified linked Skill script."""
+
+    skill_name: str
+    script_relative_path: str
+    content: bytes
+    sha256: str
+
+
+@dataclass(frozen=True)
 class SkillInput:
     name: str
     relative_path: str
@@ -56,6 +67,7 @@ class SkillFileLoaderProtocol(Protocol):
     async def render(self, skill: Skill, session_id: str = "") -> str: ...
     async def read_linked_file(self, skill: Skill, file_path: str) -> str: ...
     async def list_linked_files(self, skill: Skill) -> dict[str, list[str]]: ...
+    async def read_script_bytes(self, skill: Skill, script_relative_path: str) -> bytes: ...
 
 
 class SkillService:
@@ -137,6 +149,32 @@ class SkillService:
         await self.registry.replace_all_skills(skills)
         normalized = [_normalize_warning(w) for w in warnings]
         return SkillScanReport(skills_count=len(skills), warnings=normalized)
+
+    async def resolve_script_bytes(
+        self, skill_name: str, script_relative_path: str
+    ) -> SkillScriptBytes:
+        """Resolve bytes only for a ready, enabled, successfully scanned Skill."""
+        skill = await self.registry.get_skill(skill_name)
+        if (
+            skill is None
+            or skill.name != skill_name
+            or not skill.enabled
+            or skill.readiness is not SkillReadiness.AVAILABLE
+            or skill.last_scan_status != "ok"
+            or skill.last_scan_error is not None
+        ):
+            raise SkillNotFoundError("skill_script_not_found")
+        try:
+            content = await self.loader.read_script_bytes(skill, script_relative_path)
+        except FileNotFoundError as exc:
+            raise SkillNotFoundError("skill_script_not_found") from exc
+        digest = hashlib.sha256(content).hexdigest()
+        return SkillScriptBytes(
+            skill_name=skill.name,
+            script_relative_path=script_relative_path,
+            content=bytes(content),
+            sha256=digest,
+        )
 
     async def render_view(self, name: str, session_id: str = "") -> dict[str, Any]:
         skill = await self.registry.get_skill(name)

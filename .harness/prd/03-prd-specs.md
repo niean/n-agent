@@ -392,11 +392,15 @@
     - 任务：任务页面，整体总览修改样式、参考`会话`页，主要是标题、Sector风格，卡片风格维持现状
     - 平台：健康状态，参照`安全-策略`的页面样式修改，特别是各Sector的数据展示样式
     - 左导：平台、观测间，增加分隔符
-    - 安全：Policy领域自治，包括Turn、Context、LLM、Tool、Memory、Sandbox、Gateway、Schedule、Budget、InformationFlow 十类 Policy
+    - 安全：[KF]Policy领域自治，包括Turn、Context、LLM、Tool、Memory、Sandbox、Gateway、Schedule、Budget、InformationFlow 十类 Policy
         - Spec：spec-260714-policy-governance.md
         - Plan：plan-260714-policy-governance.md
         - 待办：配置暂由代码默认值和 Settings 提供，不新增 Dashboard 策略管理或 SQLite Policy 表，但保留未来按团队、项目、个人租户解析独立 Policy 的稳定接入点
     - 安全：新增安全一级菜单页面展示Policy，放到`观测`下方，分Sector、表格展示领域Policy策略
+
+[20260715]
+- FR
+    - 工具：新增host_terminal由宿主执行命令，terminal维持Sandbox执行；进而，迁移`拍照上传`Skill到N-Agent
 
 
 ---
@@ -409,10 +413,11 @@
     - 治理：能力分层，平台是提供方视角(管理员)、业务是使用方视角(用户)。以Skill为例，Skill系平台能力、Workflow是业务能力，两者复用领域层
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
 - FR
+    - 工具：Skill自进化，参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent
     - 架构：MoA，对标Hermes
-    - 工具：Skill自进化
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明
     - 租户：引入租户概念，如团队、项目、个人，租户间特定资源隔离
+    - 管理：秘钥Store(类似平台)
 
 ---
 

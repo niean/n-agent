@@ -17,6 +17,10 @@ from app.application.agent_graph import AgentGraphRunner
 from app.application.budget_service import BudgetService
 from app.application.chat_service import ChatCompletionService
 from app.application.gateway_service import GatewayService
+from app.application.host_terminal_tool_executor import (
+    HostTerminalToolExecutor,
+    host_terminal_tool_definition,
+)
 from app.application.runtime_memory_service import RuntimeMemoryService
 from app.application.information_flow_service import InformationFlowService
 from app.application.knowledge_service import KnowledgeBaseCreateInput, KnowledgeService, KnowledgeToolExecutor
@@ -49,6 +53,11 @@ from app.domain.llm_policy import LLMConfig, LLMPolicy
 from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, PlatformRegistry
 from app.domain.provider import ProviderConfig
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
+from app.infrastructure.host_terminal.http_client import (
+    HostTerminalHttpClient,
+    HostTerminalHttpClientConfig,
+)
+from app.infrastructure.host_terminal.policy_loader import HostTerminalPolicyLoader
 from app.infrastructure.knowledge.http_adapters import HttpKnowledgeRetrieverConfig, KnowledgeHttpRetrieverFactory
 from app.infrastructure.llm.anthropic_provider import AnthropicProvider
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
@@ -270,6 +279,44 @@ class ApplicationServices:
     sandbox_manager: "_SandboxManager | None" = None
 
 
+def _validate_host_terminal_host_mapping(
+    settings: Settings, authority_paths: tuple[Path, Path]
+) -> None:
+    """Validate host path descriptors without touching the host filesystem."""
+    host_workspace = settings.host_terminal_host_workspace_root
+    host_skills = settings.host_terminal_host_skills_root
+    if host_workspace is None or host_skills is None:
+        raise ValueError("host_terminal_host_mapping_invalid")
+    normalized_workspace = Path(str(host_workspace))
+    normalized_skills = Path(str(host_skills))
+    if (
+        not normalized_workspace.is_absolute()
+        or not normalized_skills.is_absolute()
+        or normalized_workspace != Path(*normalized_workspace.parts)
+        or normalized_skills != Path(*normalized_skills.parts)
+        or ".." in normalized_workspace.parts
+        or ".." in normalized_skills.parts
+    ):
+        raise ValueError("host_terminal_host_mapping_invalid")
+    try:
+        relative_skills = settings.skills_root.relative_to(settings.workspace_root)
+    except ValueError as exc:
+        raise ValueError("host_terminal_host_mapping_invalid") from exc
+    if (
+        relative_skills == Path(".")
+        or host_workspace / relative_skills != host_skills
+    ):
+        raise ValueError("host_terminal_host_mapping_invalid")
+    if any(
+        descriptor == authority
+        or descriptor.is_relative_to(authority)
+        or authority.is_relative_to(descriptor)
+        for descriptor in (host_workspace, host_skills)
+        for authority in authority_paths
+    ):
+        raise ValueError("host_terminal_host_mapping_invalid")
+
+
 def build_application_services(settings: Settings | None = None) -> ApplicationServices:
     settings = settings or Settings()
     memory_store = SQLiteMemoryStore(
@@ -367,6 +414,110 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     for definition in skill_tool_definitions():
         routes[definition.name] = skill_executor
     tool_service.set_dynamic_definitions("skill", skill_tool_definitions())
+
+    # Restricted host-terminal assembly. Configuration/Policy failures are
+    # fail-closed and only publish a stable, non-sensitive health reason.
+    host_terminal_executor: HostTerminalToolExecutor | None = None
+    host_terminal_health_reason = (
+        "host_terminal_disabled"
+        if not settings.host_terminal_enabled
+        else "host_terminal_config_incomplete"
+    )
+    if settings.host_terminal_enabled:
+        required_host_config = (
+            bool(settings.host_terminal_bridge_url.strip()),
+            settings.host_terminal_policy_path is not None,
+            settings.host_terminal_token_path is not None,
+            settings.host_terminal_host_workspace_root is not None,
+            settings.host_terminal_host_skills_root is not None,
+            bool(str(settings.skills_root)),
+        )
+        if all(required_host_config):
+            try:
+                authority_paths = (
+                    settings.host_terminal_policy_path.resolve(),  # type: ignore[union-attr]
+                    settings.host_terminal_token_path.resolve(),  # type: ignore[union-attr]
+                )
+                writable_roots = (
+                    settings.workspace_root.resolve(),
+                    settings.skills_root.resolve(),
+                    *(
+                        (settings.sandbox_scratch_root.resolve(),)
+                        if settings.sandbox_scratch_root is not None
+                        else ()
+                    ),
+                )
+                if (
+                    authority_paths[0] == authority_paths[1]
+                    or any(
+                        authority == root
+                        or authority.is_relative_to(root)
+                        or root.is_relative_to(authority)
+                        for authority in authority_paths
+                        for root in writable_roots
+                    )
+                ):
+                    raise ValueError("host_terminal_authority_path_unsafe")
+                _validate_host_terminal_host_mapping(settings, authority_paths)
+                policy_loader = HostTerminalPolicyLoader(
+                    settings.host_terminal_policy_path  # type: ignore[arg-type]
+                )
+                host_snapshot = policy_loader.load()
+                if not host_snapshot.rules:
+                    raise ValueError("host_policy_empty")
+                host_client = HostTerminalHttpClient(
+                    HostTerminalHttpClientConfig(
+                        base_url=settings.host_terminal_bridge_url,
+                        token_path=settings.host_terminal_token_path,
+                        connect_timeout_seconds=settings.host_terminal_connect_timeout_seconds,
+                        read_timeout_seconds=(
+                            settings.host_terminal_bridge_timeout_seconds
+                            + settings.host_terminal_transfer_margin_seconds
+                        ),
+                        max_response_bytes=settings.host_terminal_max_response_bytes,
+                    )
+                )
+                host_terminal_executor = HostTerminalToolExecutor(
+                    client=host_client,
+                    skill_service=skill_service,
+                    policy_loader=policy_loader,
+                    tool_timeout_seconds=settings.host_terminal_tool_timeout_seconds,
+                    bridge_timeout_seconds=settings.host_terminal_bridge_timeout_seconds,
+                    max_stdout_bytes=settings.host_terminal_max_stdout_bytes,
+                    max_stderr_bytes=settings.host_terminal_max_stderr_bytes,
+                    max_concurrency=settings.host_terminal_max_concurrency,
+                    audit_service=audit_service,
+                )
+                host_definition = host_terminal_tool_definition(
+                    settings.host_terminal_tool_timeout_seconds
+                )
+                routes[host_definition.name] = host_terminal_executor
+                tool_service.set_dynamic_definitions("host", [host_definition])
+                # No startup connectivity dependency: the tool surface remains
+                # stable and health moves to ok only after an actual success.
+                host_terminal_health_reason = "host_bridge_not_checked"
+            except Exception as exc:
+                host_terminal_health_reason = getattr(exc, "reason_code", None)
+                if host_terminal_health_reason is None:
+                    host_terminal_health_reason = getattr(
+                        exc, "error_code", "host_terminal_configuration_invalid"
+                    )
+                if (
+                    host_terminal_health_reason
+                    == "host_terminal_configuration_invalid"
+                    and str(exc)
+                    in {
+                        "host_terminal_authority_path_unsafe",
+                        "host_terminal_host_mapping_invalid",
+                    }
+                ):
+                    host_terminal_health_reason = str(exc)
+                if not isinstance(host_terminal_health_reason, str):
+                    host_terminal_health_reason = "host_terminal_configuration_invalid"
+                logger.warning(
+                    "host terminal not registered reason=%s",
+                    host_terminal_health_reason,
+                )
 
     # Plugin 装配
     seed_default_plugins(settings.plugins_root)
@@ -901,6 +1052,23 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 "docker_available": sandbox_docker_available if settings.sandbox_type == "docker" else None,
                 "enabled": settings.sandbox_enabled,
                 "idle_seconds": settings.sandbox_idle_seconds,
+            },
+            "host_terminal": {
+                "status": (
+                    "disabled"
+                    if not settings.host_terminal_enabled
+                    else "unavailable"
+                    if host_terminal_executor is None
+                    else "ok"
+                    if host_terminal_executor.last_health_code == "ok"
+                    else "degraded"
+                ),
+                "reason": (
+                    host_terminal_executor.last_health_code
+                    if host_terminal_executor is not None
+                    else host_terminal_health_reason
+                ),
+                "enabled": host_terminal_executor is not None,
             },
         }
 

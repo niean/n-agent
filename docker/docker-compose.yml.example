@@ -22,6 +22,20 @@ services:
       N_AGENT_SQLITE_PATH: /app/locals/sessions.db
       N_AGENT_WORKSPACE_ROOT: /workspace
       N_AGENT_AGENT_ITERATION_LIMIT: 5
+      N_AGENT_HOST_TERMINAL_ENABLED: ${N_AGENT_HOST_TERMINAL_ENABLED:-false}
+      N_AGENT_HOST_TERMINAL_BRIDGE_URL: ${N_AGENT_HOST_TERMINAL_BRIDGE_URL:-http://host.docker.internal:8765}
+      N_AGENT_HOST_TERMINAL_POLICY_PATH: /app/locals/host-terminal-policy.yaml
+      N_AGENT_HOST_TERMINAL_TOKEN_PATH: /app/locals/host-terminal.token
+      N_AGENT_HOST_TERMINAL_HOST_WORKSPACE_ROOT: ${N_AGENT_HOST_TERMINAL_HOST_WORKSPACE_ROOT:-/Users/you/app/workspace}
+      N_AGENT_HOST_TERMINAL_HOST_SKILLS_ROOT: ${N_AGENT_HOST_TERMINAL_HOST_SKILLS_ROOT:-/Users/you/app/workspace/skills}
+      N_AGENT_HOST_TERMINAL_TOOL_TIMEOUT_SECONDS: ${N_AGENT_HOST_TERMINAL_TOOL_TIMEOUT_SECONDS:-120}
+      N_AGENT_HOST_TERMINAL_BRIDGE_TIMEOUT_SECONDS: ${N_AGENT_HOST_TERMINAL_BRIDGE_TIMEOUT_SECONDS:-120}
+      N_AGENT_HOST_TERMINAL_CONNECT_TIMEOUT_SECONDS: ${N_AGENT_HOST_TERMINAL_CONNECT_TIMEOUT_SECONDS:-2}
+      N_AGENT_HOST_TERMINAL_TRANSFER_MARGIN_SECONDS: ${N_AGENT_HOST_TERMINAL_TRANSFER_MARGIN_SECONDS:-5}
+      N_AGENT_HOST_TERMINAL_MAX_RESPONSE_BYTES: ${N_AGENT_HOST_TERMINAL_MAX_RESPONSE_BYTES:-1048576}
+      N_AGENT_HOST_TERMINAL_MAX_STDOUT_BYTES: ${N_AGENT_HOST_TERMINAL_MAX_STDOUT_BYTES:-8192}
+      N_AGENT_HOST_TERMINAL_MAX_STDERR_BYTES: ${N_AGENT_HOST_TERMINAL_MAX_STDERR_BYTES:-8192}
+      N_AGENT_HOST_TERMINAL_MAX_CONCURRENCY: ${N_AGENT_HOST_TERMINAL_MAX_CONCURRENCY:-1}
     ports:
       - "8201:8201"
     healthcheck:
@@ -32,6 +46,9 @@ services:
       start_period: 10s
     volumes:
       - ~/app/locals:/app/locals
+      # Create these owner-only files first. They override the writable locals mount.
+      - ~/app/locals/host-terminal-policy.yaml:/app/locals/host-terminal-policy.yaml:ro
+      - ~/app/locals/host-terminal.token:/app/locals/host-terminal.token:ro
       - ~/workspace:/workspace
       # 沙盒 Docker 后端：sandbox_type=docker 时取消注释，并确保容器内 docker CLI 可用（见 Dockerfile）
       # - /var/run/docker.sock:/var/run/docker.sock

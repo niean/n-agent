@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、飞书与 CLI ToolPolicy 审批、Context 短期记忆及 Usage 观测术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -92,6 +92,9 @@
 - content_utils：`app/utils/content_utils.py`，多模态内容共享工具模块，提供 validate_image_url/parse_data_url/normalize_content/extract_text/has_image_part/prepend_text_part。被 Domain（不直接依赖，通过 Application 间接消费）、Application（chat_service/agent_graph/heuristic_summarizer/vision_tool_executor）、Infrastructure（anthropic_provider）、Interfaces（openai_compatible/dashboard 路由、ACP event_bridge）各层共享，不依赖任何外层模块。
 
 - terminal：内置 safe 工具（toolset=sandbox），由 `TerminalToolExecutor`（`app/application/terminal_tool_executor.py`）实现。LLM 直接调用 shell 命令，命令在 session 级 sandbox 容器内执行（DockerSandbox 用 `docker exec`，LocalSandbox 用 `sh -c`），与 execute_code 共享同一 session sandbox 和 scratch。非零退出码仍为 SUCCESS（shell 语义 — 命令已执行，只是失败）；仅 timeout 返回 TIMEOUT、spawn 失败返回 ERROR。workdir 按 backend 校验：Docker 仅允许 /scratch 和 /workspace 前缀（posixpath.normpath），Local 仅允许 scratch_root/workspace_root 内（Path.resolve）。无危险命令审批机制 — sandbox 本身是安全边界。
+- host_terminal：宿主执行工具（`source_type=AGENT`、`toolset=host`、`risk_level=SAFE`、`managed=false`），与 `terminal`、`execute_code` 同级；只执行 Host Terminal Policy 白名单中的精确命令或 SHA-256 匹配的 Skill 脚本，不是 Sandbox 的 host backend。
+- Host Terminal Bridge：运行在宿主机、只监听 loopback 的最小执行服务；校验 token 和自身加载的 Policy，使用已验证字节的私有快照以 argv 启动进程，不走 shell。
+- Host Terminal Policy：容器与宿主 Bridge 独立加载的同一份执行授权配置，按命令目标/argv 或 `skill_name + relative_path + SHA-256` 进行 fail-closed 校验；合法 reload 发布不可变快照，非法 reload 保留 last-good 快照。
 - shell 语义（shell semantics）：terminal 工具的状态映射约定。非零退出码表示命令已执行但失败（如 `exit 7`、command-not-found returncode=127），映射为 `SandboxStatus.SUCCESS`；仅命令执行超时映射为 `TIMEOUT`（returncode=124），仅 spawn/write 失败映射为 `ERROR`（returncode=-1）。与 execute_code 的 Python 语义不同（非零退出码在 Python 中为 ERROR）。
 - CanonicalUsage：Domain 值对象（`app/domain/usage.py`），归一化后的 token 五桶（input/output/cache_read/cache_write/reasoning），由 `UsageService.normalize_usage` 从 Provider 原始 usage dict（OpenAI/Anthropic 不同键名）转换而来；`prompt_tokens` = input + cache_read、`total_tokens` = 五桶之和为派生属性。raw_usage 保留原始 dict。
 - UsageCost：Domain 值对象（`app/domain/usage.py`），成本估算结果，含 amount_usd（Decimal str）、status（`estimated`/`unknown`）、pricing_version。`estimated` 表示价格表命中，`unknown` 表示未命中且 amount_usd=0。

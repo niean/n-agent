@@ -20,6 +20,10 @@
 | D016 | `tests/application/test_schedule_run_service.py::test_run_now_claims_and_runs_shared_path` 断言 status='succeeded' 但实际为 'triggered'，非本次插件变更引入（git stash 验证确认）。 | low | N/A | 2026-07-03 | open |
 | D017 | `tests/interfaces/test_static_assets.py` 5 项失败（test_chat_builtin_memory_is_disabled_by_default / test_chat_memory_uses_toolbar_popover_grouped_picker / test_static_assets_use_safe_text_rendering / test_chat_supports_image_upload_paste_and_rendering / test_chat_composer_uses_doubao_style_rounded_container），涉及 chat.js innerHTML 赋值、memory toolbar popover、图片上传渲染、chat-composer 样式；来自近期前端提交（18d4639 对话: [KF]多模态支持图片输入、ca28d23 前端: 确认框和列表操作样式归一）和工作树未提交前端变更，非 terminal-in-sandbox 任务引入。 | low | N/A | 2026-07-07 | open |
 | D018 | `SqliteUsageRecorder` async 方法（record_call/get_session_stats/list_records/record_compression/list_compressions/init）内部直接调用同步 `sqlite3` 连接与 DML，未走 thread executor；async 环境下会阻塞事件循环。与 `SQLiteMemoryStore` 现有模式一致，本期不修复。 | low | plan-260711-observation-usage.md | 2026-07-11 | open |
+| D019 | Host Terminal Policy 并发 `refresh()` 在锁外加载 candidate，旧刷新若后完成可能覆盖已发布的新 Policy；后续需串行化完整 load/publish 或加入发布序号，并补确定性乱序测试。 | high | plan-260715-photo-and-upload.md | 2026-07-15 | open |
+| D020 | Host Terminal command trusted root 的 owner 校验尚未覆盖从文件系统根到 trusted root 的全部祖先；后续需校验完整祖先链 owner、非软链接和不可写属性。 | high | plan-260715-photo-and-upload.md | 2026-07-15 | open |
+| D021 | macOS command Mach-O 的 codesign/verify 预处理 helper 尚未完全纳入请求绝对 deadline 与 Bridge shutdown 生命周期；后续需跟踪、终止和回收 helper，并确保 timeout/shutdown 后不会启动目标进程。 | high | plan-260715-photo-and-upload.md | 2026-07-15 | open |
+| D022 | Host Terminal 启动清理仅接受 `0500` command 快照，若 Bridge 在 codesign 阶段崩溃会遗留合法 `0700` 快照并导致后续启动失败；后续需在保持普通文件/owner/非软链接校验下安全清理两种生命周期权限。 | medium | plan-260715-photo-and-upload.md | 2026-07-15 | open |
 
 ---
 

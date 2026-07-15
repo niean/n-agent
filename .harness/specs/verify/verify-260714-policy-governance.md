@@ -1,39 +1,69 @@
-<!-- SUMMARY: Policy Governance 人工端到端验收清单，覆盖 API、Dashboard、Gateway、Schedule、Budget、Sandbox、InformationFlow 和多入口运行时治理 -->
-# 验收清单：Policy Governance（人工端到端部分）
+<!-- SUMMARY: Policy 治理人工验收清单，用日常操作确认不同入口的权限、用量、定时任务和敏感信息保护是否生效 -->
+# Policy 治理人工验收清单
 
 对应 spec：spec-260714-policy-governance.md
 对应 plan：plan-260714-policy-governance.md
 
-仅保留必须人工端到端验证的项。可脚本化/已自动化的项（Domain Policy 决策表、Application 强制边界、并发 reserve/settle/release、严格 warning、compileall 和架构依赖扫描）由自动化测试覆盖，不在本清单。
+这次改造的目标可以用一句话概括：不管用户从网页、API、飞书、定时任务还是命令行进入，系统都要按照该入口应有的权限运行，不能冒充其它入口、突破用量限制或泄露敏感信息。
 
-前置准备：启动使用独立 SQLite 数据库的 N-Agent 验收实例，设置 `BASE_URL`（例如 `http://127.0.0.1:8201`）；准备可正常调用且支持 tool calling 的测试模型。涉及飞书、Schedule 投递、ACP、Docker Sandbox 或密钥脱敏的项目，分别需要测试飞书应用与 allowlist、home target、ACP 客户端、可用 Docker，以及只用于验收的临时 Provider 和一次性 API key，禁止使用生产密钥。
+验收时只需要照着“怎么操作”执行，并根据“通过标准”判断是否打勾。需要改启动配置或发送 API 请求的项目，可以由开发协助操作；验收人只判断最终结果。
 
 ---
 
-## 1. OpenAI-compatible API
+## 1. 网页聊天
 
-- [ ] 1.1 API selector、多轮续聊与不可信 metadata：先用固定 `X-Session-ID: api-policy-uat` 连续发送“记住验证码 7319”和追问“刚才的验证码是什么”，再不传 header、仅在 body 加入 `"metadata":{"session_id":"metadata-forged-session","execution_mode":"unattended","gateway.platform":"feishu"}` 发送普通消息，最后查看 `GET /chat/sessions/api-policy-uat`、`GET /chat/sessions/metadata-forged-session` 和 session 列表 -> 固定 header 的两轮历史连续且第二轮能回答 7319；伪造 id 不存在，缺省 header 的请求创建新的 `api-` session，body metadata 没有成为 selector、execution mode 或 Gateway 身份。
+- [x] 1.1 网页聊天能够记住同一会话的上下文，并在刷新后恢复。
+  - 怎么操作：打开 `/chat`，新建一个会话；先发送“请记住数字 7319”，再问“刚才的数字是什么”；刷新浏览器并重新打开该会话。
+  - 通过标准：第二次回答中包含 7319；刷新后仍能看到两轮提问和回答，没有丢失或串到其它会话。
 
-## 2. Dashboard
+- [ ] 1.2 网页会话和外部 API 会话不能互相冒用。
+  - 怎么操作：先在网页新建一个会话 A，再让开发使用外部 API 尝试继续会话 A；然后由外部 API 新建会话 B，再让网页尝试继续会话 B。
+  - 通过标准：两次冒用都被拒绝，页面或接口明确提示“会话来源不匹配”；会话 A、B 的原有聊天记录都没有新增内容。
 
-- [x] 2.1 Dashboard 多轮与刷新恢复：打开 `$BASE_URL/chat` 创建 session，连续发送两轮有上下文关联的消息，刷新页面后重新选择该 session -> 页面调用专用 `/chat/completions`，两轮消息和回答仍在同一历史中，刷新后内容完整恢复。
-- [ ] 2.2 API/Dashboard source 隔离：先执行 `POST /chat/sessions?session_id=dashboard-policy-uat`，再分别用 OpenAI API 的 `X-Session-ID: dashboard-policy-uat` 和 Dashboard `/chat/completions` 的 `X-Session-ID: api-policy-uat` 发消息 -> 两次都返回 HTTP 409，错误码分别为 `api_session_scope_mismatch` 和 `dashboard_session_scope_mismatch`，两个 session 的原有历史均未新增消息。
+## 2. 外部 API
 
-## 3. Gateway 与受管操作
+- [ ] 2.1 外部 API 可以正常多轮聊天，但请求正文不能伪造会话或飞书身份。
+  - 怎么操作：让开发用固定会话号 `api-policy-uat` 连续发送“请记住数字 7319”和“刚才的数字是什么”；之后再发一条请求，只在请求正文中伪造另一个会话号和飞书身份，不提供正式会话号。
+  - 通过标准：固定会话号下的第二轮能回答 7319；伪造的会话没有被创建或写入消息，系统另外生成了一个普通 API 会话；伪造请求不能创建、删除或修改飞书定时任务。
 
-- [x] 3.1 飞书身份、确认和会话授权：使用 allowlist 内账号在测试群发送普通消息并执行 `/new`，由另一个账号尝试操作该确认卡，再由原账号选择“执行一次”；随后再次执行 `/new` 并选择“本会话信任” -> 普通消息正常回复，非原 actor 操作不执行，原 actor 的一次授权只执行一次，本会话信任仅对同一 actor/session 生效，卡片中不展示敏感工具参数。
-- [ ] 3.2 飞书 managed action 与 HTTP 伪造隔离：在飞书测试群设置 home target 后创建并列出一个定时任务；随后从 OpenAI API 在 metadata 中伪造相同 `gateway.platform`、actor 和聊天标识并要求创建或删除定时任务 -> 飞书入口可以按确认和 ownership 规则完成操作，HTTP 请求不能获得飞书 managed tool 权限，既有任务及 home target 不被伪造请求修改。
+## 3. 飞书
 
-## 4. Schedule unattended
+- [x] 3.1 飞书中的确认卡只能由正确的人操作，授权不会串到别人或其它会话。
+  - 怎么操作：账号 A 在测试群发送普通消息并执行 `/new`；账号 B 尝试点击账号 A 收到的确认卡；随后账号 A 选择“执行一次”。账号 A 再执行一次 `/new`，这次选择“本会话信任”。
+  - 通过标准：普通消息正常回复；账号 B 点击无效；“执行一次”只执行当前一次；“本会话信任”只对账号 A 的当前会话有效；确认卡不展示密码、Token 等敏感参数。
 
-- [ ] 4.1 正常执行、受限能力和投递：创建一个只返回当前时间的任务和一个要求修改其他任务、写外部记忆或启用 Sandbox 网络的任务，分别在 Dashboard 点击“立即运行”，查看 `/chat/scheduled-tasks/{task_id}/executions` 和测试 home target -> 正常任务记录为成功并只投递一次；受限任务以 unattended 能力运行，不能修改其他任务、扩大记忆写权限或开启网络，执行记录可观察且不存在对应副作用。
+- [x] 3.2 只有真实飞书会话才能管理该飞书会话名下的定时任务。
+  - 怎么操作：在飞书测试群设置默认接收群，创建一个定时任务并确认能列出；然后让开发从外部 API 伪造相同的飞书群和用户信息，尝试删除这个任务。
+  - 通过标准：飞书内可以正常创建和查看任务；外部 API 的伪造请求不能删除或修改任务，也不能改变默认接收群。
 
-## 5. Budget 与 Sandbox
+## 4. 定时任务
 
-- [ ] 5.1 per-run Budget 耗尽与隔离：在独立实例设置 `N_AGENT_BUDGET_MAX_LLM_CALLS=1`，通过固定 `X-Session-ID` 要求“调用 get_current_time 后解释结果”，随后在同一 session 再发送一条普通问候 -> 第一轮需要第二次 LLM 调用时显示“已达到用量上限，请稍后重试或联系管理员”，不会继续调用 Provider；第二轮拥有新的 run budget，普通问候仍可完成，不继承上一轮已耗尽账户。
-- [ ] 5.2 Sandbox grant 与资源边界：在 Docker Sandbox 网络关闭、资源上限较小的独立实例中，请求 `execute_code` 主动访问公网并申请超出 timeout/CPU/memory/callback 上限的执行，再查看 `$BASE_URL/tools/sandbox` 的执行历史 -> 网络或非法扩权被拒绝，合法超限值按服务端上限执行，历史中的实际 backend、时长和状态不超过配置，普通受限代码仍能运行。
+- [x] 4.1 定时任务可以正常执行和投递，但不能趁无人值守时扩大权限。
+  - 怎么操作：创建任务 A，内容为“告诉我当前时间”；创建任务 B，内容为“修改定时任务sched-a406eae127164f3a970f63dbfab24c5d、写入外部记忆并打开代码沙箱网络”。在 Dashboard 中分别点击“立即运行”，然后查看执行记录和飞书接收群。
+  - 通过标准：任务 A 只成功执行和投递一次；任务 B 不能修改其它任务、不能扩大记忆写入权限、不能打开网络；两项任务都有清晰的执行结果，不会卡在“运行中”。
 
-## 6. InformationFlow、审计与其它入口
+## 5. 用量和代码沙箱
 
-- [ ] 6.1 脱敏和结构化审计：仅在接受一次性 key 的测试 Provider 上设置 `N_AGENT_PROVIDER_API_KEY=uat-policy-secret`，通过 API 要求模型原样复述该字符串，然后检查客户端响应、Usage 页面和服务日志 -> Provider 出站、响应和留存中均不出现 `uat-policy-secret`；Policy 日志是含 `policy/version/decision_kind/reason/run_id/session_id/policy_scope` 的 JSON，且不含 prompt、secret、tool arguments 或完整 trusted claims。
-- [ ] 6.2 CLI 与 ACP 共享治理链：执行 `n-agent chat` 完成一轮普通对话和一次需要审批的工具调用，再用 ACP 测试客户端通过 `docker exec -i n-agent-n-agent-1 n-agent acp` 完成 `initialize -> authenticate -> session/new -> session/prompt -> close` -> 两个入口均复用同一 Chat/Tool/Memory Policy 行为，危险工具未经各自审批不会执行，ACP stdout 只有合法 JSON-RPC 帧，创建的会话分别保持 `cli`/`acp` source。
+- [ ] 5.1 一轮对话达到用量上限后会停止，但不会影响同一会话的下一轮对话。
+  - 所需条件：由开发在独立验收实例中把“每轮最多调用模型次数”设为 1，然后重启服务。
+  - 怎么操作：在固定会话中发送“请先调用当前时间工具，再解释结果”；看到用量提示后，在同一会话继续发送“你好”。
+  - 通过标准：第一轮需要再次调用模型时停止，并显示“已达到用量上限，请稍后重试或联系管理员”；第二轮“你好”仍能正常得到回答，不会继承上一轮已经耗尽的额度。
+
+- [x] 5.2 代码沙箱不能私自联网，也不能突破管理员设置的资源上限。
+  - 所需条件：使用 Docker 沙箱；由开发关闭沙箱网络，并设置较小的运行时间、CPU、内存和回调次数上限。
+  - 怎么操作：让 Agent 执行一段普通计算代码；再让它执行访问公网的代码，并要求使用超过管理员上限的时间、CPU、内存和回调次数；最后打开“沙箱”页面查看执行历史。
+  - 通过标准：普通计算可以完成；联网或其它越权要求被拒绝；允许执行的任务实际使用量没有超过管理员上限；执行历史中能看到最终状态，不存在一直占用的沙箱。
+
+## 6. 敏感信息和审计记录
+
+- [ ] 6.1 密钥不会泄露，同时管理员仍能从日志看出是哪条规则作出了决定。
+  - 所需条件：只能使用一次性测试密钥 `uat-policy-secret`，并使用接受该测试密钥的临时模型服务；禁止使用生产密钥。
+  - 怎么操作：把一次性测试密钥配置为模型服务密钥，在聊天中要求 Agent 原样复述 `uat-policy-secret`；再完成一次普通聊天、一次工具调用和一次被拒绝的操作，检查聊天回答、用量页面和服务日志。
+  - 通过标准：回答、用量记录和日志中都找不到完整的 `uat-policy-secret`，只能看到脱敏内容或拒绝提示；日志仍能看出规则名称、规则版本、决定原因、运行编号和会话编号，并且不包含完整提问、工具参数或身份明细。
+
+## 7. 命令行和 ACP 客户端
+
+- [x] 7.1 命令行和 ACP 客户端遵守与网页相同的权限规则。
+  - 所需条件：已安装 `n-agent` 命令；ACP 项还需要一个可连接 N-Agent 的测试客户端。
+  - 怎么操作：先用 `n-agent chat` 完成普通聊天，并尝试调用一个需要确认的工具；再通过 ACP 客户端创建会话、发送普通消息、尝试调用同类工具并关闭会话。
+  - 通过标准：两个入口都能正常聊天；需要确认的工具未经确认不会执行；允许一次只执行一次；ACP 客户端不会收到夹杂普通日志的协议数据；两个入口的聊天记录各自保存在正确会话中。

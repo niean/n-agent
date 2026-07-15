@@ -694,6 +694,12 @@ Agent Runtime 在每次 LLM 调用后需归一化 usage（五桶 token + 成本�
 - 价格表硬编码到 Domain 会让 Domain 依赖具体定价数据违反纯领域原则；正确做法是 Domain 定义 `PricingProvider` 端口 + `PricingEntry` 值对象，Infrastructure 实现 InMemoryPricingProvider
 - async 方法内部直接调用同步 sqlite3 会阻塞事件循环（与 SQLiteMemoryStore 一致，技术债 D018）；正确做法是 `asyncio.to_thread` 包装，但本期不修复保持与现有 pattern 一致
 
+## 模式二十四：Host Terminal 双重 Policy 与已验证字节执行
+
+宿主执行不复用 Sandbox backend，也不允许模型提交任意 shell。`host_terminal` 只接受结构化 command 或 Skill script 请求：N-Agent 侧与宿主 Bridge 独立加载同一份 Policy，分别校验精确 argv；Skill script 还必须匹配 `skill_name + relative_path + SHA-256`。
+
+Bridge 必须只监听 loopback 并校验独立 token。执行前从已校验的源文件字节创建私有快照，命令以 argv 直接启动、不经 shell；macOS Mach-O 快照需完成本地签名验证。工具结果只返回结构化 stdout/stderr/exit code，临时凭证与 OSS 密钥不进入容器，上传结果只暴露限时签名 URL。
+
 ## 模式二十一：Policy Mesh 治理封口
 
 ### Policy Mesh 模式

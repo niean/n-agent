@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,6 +157,87 @@ class SkillFileLoader:
 
     async def read_linked_file(self, skill: Skill, file_path: str) -> str:
         return await asyncio.to_thread(self._read_linked_file_sync, skill, file_path)
+
+    async def read_script_bytes(self, skill: Skill, script_relative_path: str) -> bytes:
+        return await asyncio.to_thread(
+            self._read_script_bytes_sync, skill, script_relative_path
+        )
+
+    def _read_script_bytes_sync(
+        self, skill: Skill, script_relative_path: str
+    ) -> bytes:
+        """Open a linked script through dir fds without following any symlink."""
+        if not isinstance(script_relative_path, str):
+            raise SkillValidationError("skill_script_path_denied")
+        normalized = script_relative_path.replace("\\", "/")
+        parts = normalized.split("/")
+        if (
+            normalized.startswith("/")
+            or len(parts) < 2
+            or parts[0] != "scripts"
+            or any(part in {"", ".", ".."} for part in parts)
+            or normalized != script_relative_path
+        ):
+            raise SkillValidationError("skill_script_path_denied")
+
+        skill_rel = Path(skill.relative_path)
+        if skill_rel.name != "SKILL.md" or skill_rel.is_absolute():
+            raise SkillValidationError("skill_script_path_denied")
+        skill_parts = skill_rel.parent.parts
+        if not skill_parts or any(part in {"", ".", ".."} for part in skill_parts):
+            raise SkillValidationError("skill_script_path_denied")
+
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | nofollow
+        )
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+        fds: list[int] = []
+        try:
+            root_metadata = self.root.lstat()
+            if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+                raise SkillValidationError("skill_script_path_denied")
+            fd = os.open(self.root, directory_flags)
+            fds.append(fd)
+            opened_root = os.fstat(fd)
+            if (opened_root.st_dev, opened_root.st_ino) != (
+                root_metadata.st_dev,
+                root_metadata.st_ino,
+            ):
+                raise SkillValidationError("skill_script_path_denied")
+            for component in (*skill_parts, *parts[:-1]):
+                fd = os.open(component, directory_flags, dir_fd=fds[-1])
+                fds.append(fd)
+                if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise SkillValidationError("skill_script_path_denied")
+            fd = os.open(parts[-1], file_flags, dir_fd=fds[-1])
+            fds.append(fd)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SkillValidationError("skill_script_path_denied")
+            chunks: list[bytes] = []
+            total = 0
+            while chunk := os.read(fd, 65536):
+                total += len(chunk)
+                if total > self.config.max_view_bytes:
+                    raise SkillValidationError("skill_script_too_large")
+                chunks.append(chunk)
+            return b"".join(chunks)
+        except SkillValidationError:
+            raise
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise SkillValidationError("skill_script_path_denied") from exc
+        finally:
+            for fd in reversed(fds):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _read_linked_file_sync(self, skill: Skill, file_path: str) -> str:
         from app.infrastructure.path_security import (

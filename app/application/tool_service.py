@@ -19,6 +19,10 @@ from app.domain.tool import (
     ToolSourceType,
 )
 from app.domain.tool_policy import ToolExposurePolicy, ToolPolicy
+from app.application.host_terminal_capability import (
+    is_photo_capability_request,
+    is_photo_capability_result,
+)
 
 if TYPE_CHECKING:
     from app.application.budget_service import BudgetService
@@ -336,6 +340,19 @@ class ToolService:
             sanitized_content = self._information_flow_service.redact_structured(
                 result.content
             )
+            # A strictly parsed successful host photo result intentionally
+            # delivers its short-lived signed URL to the model/user. Preserve
+            # only that one field; every other field and every failure remains
+            # under the normal structured redaction policy.
+            if (
+                result.tool_name == "host_terminal"
+                and result.status is ToolResultStatus.SUCCESS
+                and working_request.name == "host_terminal"
+                and is_photo_capability_request(working_request.arguments)
+                and is_photo_capability_result(result.content)
+                and isinstance(sanitized_content, dict)
+            ):
+                sanitized_content["signed_url"] = result.content["signed_url"]
             result = ToolResult(
                 tool_call_id=result.tool_call_id,
                 tool_name=result.tool_name,
