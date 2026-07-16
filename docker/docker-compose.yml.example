@@ -21,7 +21,7 @@ services:
       TZ: Asia/Shanghai
       N_AGENT_SQLITE_PATH: /app/locals/sessions.db
       N_AGENT_WORKSPACE_ROOT: /workspace
-      N_AGENT_AGENT_ITERATION_LIMIT: 5
+      N_AGENT_AGENT_ITERATION_LIMIT: ${N_AGENT_AGENT_ITERATION_LIMIT:-10}
       N_AGENT_HOST_TERMINAL_ENABLED: ${N_AGENT_HOST_TERMINAL_ENABLED:-false}
       N_AGENT_HOST_TERMINAL_BRIDGE_URL: ${N_AGENT_HOST_TERMINAL_BRIDGE_URL:-http://host.docker.internal:8765}
       N_AGENT_HOST_TERMINAL_POLICY_PATH: /app/locals/host-terminal-policy.yaml

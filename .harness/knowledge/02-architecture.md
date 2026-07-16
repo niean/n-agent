@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批与 Host Terminal 宿主执行边界 -->
+<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界与 Skill 自进化写入治理（12 个领域 Policy） -->
 # 架构与模块边界
 
 ## 架构定位
@@ -9,7 +9,7 @@
 
 项目严格遵循领域驱动设计 DDD，采用外层依赖内层的方向：Interfaces -> Application -> Domain。Infrastructure 只实现 Domain 定义的端口，并在应用启动时注入。
 
-- Domain 层：核心子域包括 TurnLoop、Context、LLM、Memory、Tool，支撑子域包括 Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation；各子域定义自己的模型、值对象和端口协议。`app/domain/policy.py` 是 Domain Shared Kernel，统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`、`ExecutionMode`；10 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy）各自独立，不跨域导入。Storage 与 Model Provider 通过领域端口形成外部边界。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
+- Domain 层：核心子域包括 TurnLoop、Context、LLM、Memory、Tool，支撑子域包括 Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation；各子域定义自己的模型、值对象和端口协议。`app/domain/policy.py` 是 Domain Shared Kernel，统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`、`ExecutionMode`；12 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy、HostTerminalPolicy、SkillPolicy）各自独立，不跨域导入。Storage 与 Model Provider 通过领域端口形成外部边界。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
 - Application 层：编排用例和 Agent Runtime。LangGraph 属于本层，只负责状态图和运行流程编排。
 - Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、Knowledge HTTP adapter、配置加载等。
 - Interfaces 层：实现 FastAPI、OpenAI-compatible API、Dashboard 和协议转换。
@@ -34,7 +34,8 @@
 - OpenAI-compatible API：对外兼容 Open-WebUI 的协议层，不等同于内部 Agent 模型。
 - Platform Aggregate / Interaction Gateway：`Platform` 面向飞书、钉钉、企微等外部消息平台；Domain 定义 PlatformRegistry 与 PlatformLifecycle 端口，Application 的 PlatformService 组合平台 descriptor、lifecycle、Gateway 会话统计并向 Dashboard 提供只读视图。CLI/TUI 终端聊天仍可通过 GatewayService 标准化为 InteractionMessage，但只作为 `source=cli` 的入口来源，不注册进 PlatformRegistry，也不出现在 Dashboard 平台页。飞书 IM 等平台入口复用 ChatCompletionService、SessionService、ToolService 和 MemoryStore；Gateway 破坏性命令确认由 Application 层 pending confirmation 管理，ToolPolicy 的“本会话信任”由 Application 的 `GatewayToolApprovalService` 按 session/actor/tool 保存，最终执行仍由 `ToolService` 复判。飞书使用 interactive card 作为两类审批的展示和回调通道；Interfaces 的 `FeishuToolApprovalBridge` 仅保存短生命周期协议 pending/Future 和服务端 card message id，不拥有授权业务状态。飞书使用长连接接收事件，平台适配只做协议解析、消息类型过滤、卡片渲染、回调路由和消息收发，FeishuImAdapter 同时实现 PlatformLifecycle，用 start() 进入 connected/正常返回 disconnected/异常 fatal 的事件驱动状态。CLI/TUI 终端在 TTY REPL 中使用进程内 Future + 精确命令路由（`/confirm once`/`/confirm trust`/`/cancel`）作为工具审批通道，Interfaces 的 `CliToolApprovalBridge` 同样只保存短生命周期协议 pending/Future，不拥有授权业务状态；非 TTY/单次消息/stdin pipe 不注入 decider，fail-closed。
 - Chat Dashboard：调试和演示入口，查看会话、流式输出、工具调用、摘要和任务状态，不替代 Open-WebUI。
-- Skill 子系统：独立 DDD 子域。Domain 定义 Skill 模型与 SkillRegistry 端口；Application SkillService 负责扫描、列表、view 渲染、启停切换、宏预处理（`${HERMES_SKILL_DIR}` / `${HERMES_SESSION_ID}`）和 safe 工具 (`skills_list`、`skill_view`) 的动态定义；Infrastructure 提供 SkillFileLoader 扫描本地 SKILLS_ROOT（默认 `/workspace/skills`，复用 path_security 防遍历/symlink）与 SQLite SkillRegistry 元数据持久化（启用状态在重扫间保留）；Interfaces 提供 Dashboard `/chat/skills*` 管理 API + 前端 skills.js 与 CLI `n-agent skill list/view`。LLM 通过 safe 工具自助按需读取，不暴露 `skill_run`。仓库携带 `app/infrastructure/skill/seeds/` 出厂模板（含 `n-agent` SKILL.md），main.py 启动时通过 `seed_default_skills` 幂等拷贝到 SKILLS_ROOT，不覆盖已有用户副本。
+- Skill 子系统：独立 DDD 子域，已从只读升级为可读写。Domain 定义 Skill 模型（含 SkillSource seed/agent/user、SkillWriteOrigin foreground/background_review、SkillWriteAction create/patch/edit/delete/write_file/remove_file）与 SkillRegistry 端口；Application SkillService 负责扫描、列表、view 渲染、启停切换、宏预处理（`${HERMES_SKILL_DIR}` / `${HERMES_SESSION_ID}`）、safe 工具 (`skills_list`、`skill_view`) 的动态定义，以及统一写入入口 `manage_skill`（先 SkillPolicy 准入 -> read-before-write guard -> 备份 -> 原子写或 staged pending）；`skill_manage` 工具（SkillManageToolExecutor 路由到 SkillService.manage_skill）对 Agent 前台与后台 review 均可用，actions 覆盖 create/patch/edit/delete/write_file/remove_file；Infrastructure 提供 SkillFileLoader 扫描本地 SKILLS_ROOT（默认 `/workspace/skills`，复用 path_security 防遍历/symlink）与写入能力（write_skill_file/patch_skill_file/delete_skill/write_linked_file/remove_linked_file，原子写 + 路径安全校验 + archive-not-delete，删除只归档到 `.archive/` 不物理删除）、SQLite SkillRegistry 元数据持久化（启用状态在重扫间保留）、skill_pending_store（write_approval staged 待审批写）与 skill_backup_store（写前备份）；Interfaces 提供 Dashboard `/chat/skills*` 管理 API + 前端 skills.js 与 CLI `n-agent skill list/view`。LLM 通过 safe 工具自助按需读取，不暴露 `skill_run`。仓库携带 `app/infrastructure/skill/seeds/` 出厂模板（含 `n-agent` SKILL.md），main.py 启动时通过 `seed_default_skills` 幂等拷贝到 SKILLS_ROOT，不覆盖已有用户副本。
+- Background Self-Improvement Review：AgentGraphRunner finalize 后按 nudge 计数（turn_count % nudge_interval == 0）fork 受限 ChatCompletionService turn，由 SkillEvolutionService.maybe_trigger 异步触发（fire-and-forget，max_concurrent 限流，异常不传播不影响主 turn）。forked turn 工具白名单为 skills + memory（skill_manage/skills_list/skill_view），max_iterations=16，trusted_metadata 注入 `skill_write_origin=background_review`，SkillPolicy 据此将写入限定到 agent-owned Skill（seed/user/pinned 不可自主改）。审查 Agent 基于对话摘要（recent messages digest，截断 2000 字符）决定是否创建/修补 Skill，无值得持久化的工作流时不做任何修改。
 - Plugin 子系统：独立 DDD 子域，遵循 Hermes plugin 模式（`plugin.yaml` + `register(ctx)`）支持零成本移植开源插件生态。Domain 定义 Plugin/PluginManifest/PluginKind/PluginSource/PluginScanStatus 模型与 PluginRegistry 端口（async 方法）；Application 的 PluginService 编排扫描/列表/启停/config CRUD/动态工具面，PluginContext 提供 Hermes 兼容的 `register_tool` 签名 + P1/P2 unsupported stub（不崩扫描），PluginToolExecutor 将 plugin 工具调用委托给 PluginService.call_tool；Infrastructure 的 SQLitePluginRegistry 持久化 plugins + plugin_secrets 两表（独立 secret 存储，FK ON DELETE CASCADE），PluginFileLoader 扫描 bundled/user/project 三源 + entry_points 开关，`n_agent_plugins` 命名空间稳定包 import；Interfaces 提供 Dashboard `/chat/plugins*` 管理 API（refresh 路由在 `{key:path}` catch-all 之前）+ 前端 plugin.js（config_schema secret 字段路由到 secret_updates）+ CLI `n-agent plugin list/view`。Plugin 工具通过 `ToolService.set_dynamic_definitions("plugin", ...)` 暴露给 LLM（`source_type=PLUGIN`），`CompositeToolExecutor.routes` 显式路由 plugin 工具名，MCP fallback 不回归。仓库携带 `app/infrastructure/plugin/seeds/hello/` 出厂示例（standalone kind，provides_tools=[hello]），main.py 启动时通过 `seed_default_plugins` 幂等拷贝到 PLUGINS_ROOT。
 - Managed Tools 授权：Domain `ToolDefinition.managed: bool` 标记需服务端授权才能执行的工具；`ToolExecutionContext` 携带 `session_id` / `metadata`(untrusted) / `trusted_metadata`(trusted) / `execution_context_mode` / `permitted_managed_tools`。`ChatCompletionService` 在每次 complete 调用时构造 context，仅当 mode=realtime 且 `trusted_metadata.gateway.platform` 为合法 Gateway 来源（当前 feishu）时把 `manage_schedule` 加入 permitted set；OpenAI HTTP 直连客户端伪造 metadata 不进入 trusted_metadata 字段，故无法获得授权。`ToolPolicy` 对未获授权的 managed 工具返回 `REQUIRE_APPROVAL`，`ToolService` 在未取得有效一次授权时拒绝执行；unattended 模式使用 `SAFE_ONLY` 暴露策略过滤 AGENT 来源工具，避免调度器递归。
 - Schedule 自然语言管理：飞书 IM 用户用自然语言增加/修改/查看/暂停/恢复/运行定时任务时，由 Agent 调用 `manage_schedule` / `schedule_query`（前者为 managed CONFIRM 工具，后者为 SAFE）；删除仍走 `/schedule remove` 确认卡，preflight 时把当前 trusted_metadata 写入 `GatewayConfirmationRequest.trusted_metadata`，handle_confirmation 还原后由 schedule_service 校验 task.origin 与 trusted_metadata 的 receive_id/receive_id_type/thread_id 一致再执行删除，跨 origin/会话统一返回"任务不存在"，不暴露存在性差异。系统提示词只声明"先 skill_view('n-agent')"等 ≤4 行 guidance，cron 语法等长知识沉淀在 SKILL.md。
@@ -46,9 +47,9 @@
 
 ## Policy Mesh 治理架构
 
-Policy Mesh 是 N-Agent 的运行时治理层，由 10 个领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成。每个 Policy 独立决策一个治理维度，Application Service 在外部调用前封口执行。
+Policy Mesh 是 N-Agent 的运行时治理层，由 12 个领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成。每个 Policy 独立决策一个治理维度，Application Service 在外部调用前封口执行。
 
-### 10 个领域 Policy
+### 12 个领域 Policy
 
 | Policy | Domain 文件 | 治理维度 | 执行点 |
 |--------|------------|---------|--------|
@@ -62,6 +63,8 @@ Policy Mesh 是 N-Agent 的运行时治理层，由 10 个领域 Policy + Shared
 | SchedulePolicy | `schedule_policy.py` | cron 安全、claim 原子性、投递 | ScheduleRunService |
 | BudgetPolicy | `budget_policy.py` | LLM/Tool/Sandbox 调用配额 | BudgetService |
 | InformationFlowPolicy | `information_flow_policy.py` | 密级、释放目标、脱敏 | InformationFlowService |
+| HostTerminalPolicy | `host_terminal_policy.py` | 宿主执行目标/argv/Skill 脚本 SHA-256 精确授权 | HostTerminalToolExecutor |
+| SkillPolicy | `skill_policy.py` | Skill 写入权限/来源/审批 | SkillService.manage_skill |
 
 约束：Domain Policy 不导入 Application/Infrastructure；一个 Policy 不导入另一个 Policy（AST 测试 `tests/architecture/test_policy_boundaries.py` 强制）。
 
@@ -71,7 +74,7 @@ Policy Mesh 是 N-Agent 的运行时治理层，由 10 个领域 Policy + Shared
 
 ### RunPolicySnapshot（`app/application/policy_snapshot.py`）
 
-不可变 frozen dataclass，携带 10 个 typed config + IngressFacts（run_id、session_id、execution_mode、trusted_claims）。由 `RunPolicySnapshotFactory` 从 `PolicyProfileProvider` 解析 profile 后构造。不持有任何 mutable runtime state（RunBudgetAccount、Manager、Store 等禁止出现在字段中，AST 测试强制）。
+不可变 frozen dataclass，携带 10 个 typed config + IngressFacts（run_id、session_id、execution_mode、trusted_claims）。由 `RunPolicySnapshotFactory` 从 `PolicyProfileProvider` 解析 profile 后构造。不持有任何 mutable runtime state（RunBudgetAccount、Manager、Store 等禁止出现在字段中，AST 测试强制）。HostTerminalPolicy 与 SkillPolicy 不纳入 RunPolicySnapshot typed config：前者由 `HostTerminalPolicySnapshot` 独立加载，后者由 SkillService 持有的 write_approval 标志与请求内 SkillWriteOrigin 驱动。
 
 ### 封口执行点
 
@@ -81,7 +84,8 @@ Policy Mesh 是 N-Agent 的运行时治理层，由 10 个领域 Policy + Shared
 - RuntimeMemoryService：MemoryPolicy 评估每个操作（read/write/sync/external），deny -> store 不调用。
 - GatewayService：GatewayPolicy 评估出站目标。
 - ScheduleRunService：SchedulePolicy 评估 cron 安全 + claim 原子性 + 投递。
-- 所有 Tool 执行器（Builtin/MCP/Plugin/ExternalMemory/Sandbox/Terminal/Knowledge/Schedule）通过 CompositeToolExecutor 路由到 ToolService.execute，统一受 Budget + InformationFlow 封口。
+- SkillService.manage_skill：载荷校验 -> read-before-write guard -> Anthropic 格式校验（Domain `SkillFormatValidator`，create/edit/patch 在 Policy 前校验 frontmatter，硬错误返回 `format_invalid:<reason>` 不落盘不进 pending，approved_replay 重跑）-> SkillPolicy 准入（deny > require_approval > allow）-> backup -> 原子写或 staged pending -> registry upsert 用规范化 frontmatter 重建 Skill 保证与磁盘一致。background_review origin 仅能写 agent-owned Skill，且需先 skill_view 精确加载目标；foreground 不可删 seed/pinned；write_approval 开启时写操作走 staged pending 待审批 replay。deny -> 写不执行。Skill 定义遵循 Anthropic Agent Skills 格式（name 英文 kebab-case、description 英文 what/when+括号中文 alias、顶层白名单 {name,description,license,allowed-tools,metadata,compatibility}、扩展字段下沉 metadata string->string），Infrastructure write_skill_file/patch_skill_file auto-normalize，scan 标记 format_warning（injection_warning 优先，不阻断）。
+- 所有 Tool 执行器（Builtin/MCP/Plugin/ExternalMemory/Sandbox/Terminal/Knowledge/Schedule/SkillManage）通过 CompositeToolExecutor 路由到 ToolService.execute，统一受 Budget + InformationFlow 封口。
 
 ### 审计通道
 
@@ -95,7 +99,7 @@ Policy Mesh 是 N-Agent 的运行时治理层，由 10 个领域 Policy + Shared
 4. 多 Provider、Provider fallback、模型能力检测、usage/cost 统计。
 5. CLI/TUI 和更完整 Dashboard。
 6. Cron、后台任务、通知投递和失败重试。
-7. Skills、自我改进 loop、用户画像和经验沉淀。
+7. Skills、自我改进 loop、用户画像和经验沉淀（Skill 自进化已实现：skill_manage 写入 + Background Self-Improvement Review；用户画像和经验沉淀待后续）。
 8. 子 Agent、并行执行、delegate 和结果汇总。
 9. 多平台 Messaging Gateway、远程运行环境和部署安装体系。
 

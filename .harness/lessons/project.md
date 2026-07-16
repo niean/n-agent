@@ -105,3 +105,23 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：升级 uvicorn 主版本后必须验证应用 logger 可见性。uvicorn 0.30+ 移除了 root logger 配置，HTTP 应用工厂必须显式 `logging.basicConfig(level=logging.INFO, format=...)`（幂等，root logger 已有 handler 时不覆盖），但不能在共享装配模块 import 时配置：CLI/TUI 也会导入 `app.main` 复用 `build_application_services()`，import 副作用会把插件注册、启动扫描等 INFO 日志泄漏到终端 UI。诊断"日志缺失/多余"类问题先按 HTTP、CLI、ACP 入口分别验证 root logger 的 handlers 与 effective level，再检查业务日志。还要避免在多层输出重复日志——call_llm 和 UsageService.record_call 都输出 "API call" 时，前者用原始 usage dict、后者用归一化后的 CanonicalUsage，Anthropic usage 无 `total_tokens` 字段导致前者 `total=0`，重复日志不仅冗余还会暴露归一化不一致的 bug。
 
 来源：bug fix 260712 观测 3.1 API call 日志缺失
+
+### P011: 面向用户/LLM/调试的 JSON 序列化必须 ensure_ascii=False，否则中文变 \uXXXX 字面
+
+现象：Dashboard 对话页"工具调用调试信息"中，工具返回的中文显示为 \uXXXX 转义字面（如 查看天气），看不懂。
+
+根因：tool 消息 content 经双层 json.dumps 产生：工具执行器（skill_service 等）用 `content=json.dumps(payload)`（默认 ensure_ascii=True）返回字符串型 content，agent_graph.py 再 `json.dumps(result_payload)`（默认 ensure_ascii=True）包一层存为 tool message content。前端 chat.js formatDebugJson 对该字符串只 JSON.parse 一次，只能解开外层；内层字符串里的 \uXXXX 字面无法还原，JSON.stringify 后显示字面转义。content 为 dict 的工具经前端单次 parse 可还原，仅字符串型 content 双层编码触发。根因跨 Interfaces（chat.js formatDebugJson）和 Application（agent_graph/skill_service）层。
+
+教训：面向用户/LLM/调试输出的 JSON 序列化统一用 ensure_ascii=False，保证中文原文可读；多层 json.dumps 嵌套时前端单次 JSON.parse 只解一层，内层字符串里的 \uXXXX 字面无法还原，修复需同步改汇聚点（agent_graph 的 tool message content 序列化）和各字符串型 content 生成点（工具执行器）。审计日志等需字节级哈希稳定的场景才用 ensure_ascii=True。相关：P002 tool message content 持久化形态。
+
+来源：bug fix 260716 工具调用调试信息中文被编码
+
+### P012: Dashboard 是跨源调试 UI，ingress source 校验不应阻断跨源会话续发
+
+现象：在 Dashboard Chat 上选中飞书类型的会话发消息，返回 409 `dashboard_session_scope_mismatch`，无法续发；8649dc4 前走 `/v1/chat/completions` 时可正常发送。
+
+根因：commit 8649dc4（Policy领域自治，spec-260714）给 Dashboard 专用 `/chat/completions` 路由加了 `SessionBootstrapReader.describe(x_session_id, expected_source="dashboard")` 强校验，飞书会话 source=feishu != dashboard 触发 `SessionScopeMismatchError` 返回 409。同时 chat.js 从 `/v1/chat/completions` 迁到 `/chat/completions`，`/v1` 也加了 `expected_source="api"`，两条入口都被作用域校验封死。但 Dashboard 会话列表 `/chat/sessions` 展示所有来源会话，operator 期望能续发任意会话进行调试，作用域强校验与 Dashboard 的跨源调试定位冲突。根因跨 Interfaces（dashboard.py）和 Application（session_bootstrap.py）层，叠加一个 spec 设计决策。
+
+教训：Dashboard 是 operator 跨源调试 UI（会话列表展示全部来源会话），其 chat 入口不应按 ingress source 强校验会话作用域，应用 `describe_unchecked(provisional_source=...)` 仅保留"会话必须已存在"校验。`describe(expected_source)` 适用于"ingress 与会话来源必须一致"的对外协议入口（如 `/v1/chat/completions` 限 api），`describe_unchecked` 适用于"接口已自行校验所有权、需跨源续发"的运维/调试入口（Dashboard、Gateway、Schedule）。IngressFacts.source 记录请求实际入口（dashboard），descriptor.source 记录会话原始来源（feishu），两者分离流入 PolicyProfileFacts，当前 system scope provider 忽略 source 不影响策略；`create_session` 用 INSERT OR IGNORE，续发不会覆盖既有会话 source。改动 ingress 作用域校验前必须检查会话列表是否跨源展示，避免"看得到选不了"。相关：spec-260714 第 350 行 Dashboard-scope 决策已被本修复反转。
+
+来源：bug fix 260716 Dashboard 无法给飞书会话发消息

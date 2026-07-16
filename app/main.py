@@ -42,7 +42,8 @@ from app.application.scheduled_agent_executor import ScheduledAgentExecutor
 from app.application.scheduler_runner import SchedulerRunner
 from app.application.session_service import SessionService
 from app.application.session_bootstrap import SessionBootstrapReader
-from app.application.skill_service import SkillService, SkillToolExecutor, skill_tool_definitions
+from app.application.skill_service import SkillManageToolExecutor, SkillService, SkillToolExecutor, skill_tool_definitions
+from app.application.skill_evolution_service import SkillEvolutionService
 from app.application.plugin_service import PluginService, PluginToolExecutor
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
 from app.application.usage_service import UsageService
@@ -52,6 +53,8 @@ from app.domain.knowledge import KnowledgeBaseType
 from app.domain.llm_policy import LLMConfig, LLMPolicy
 from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, PlatformRegistry
 from app.domain.provider import ProviderConfig
+from app.domain.skill_format import SkillFormatValidator
+from app.domain.skill_policy import SkillPolicy
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
 from app.infrastructure.host_terminal.http_client import (
     HostTerminalHttpClient,
@@ -78,6 +81,9 @@ from app.infrastructure.schedule.prompt_safety import DeterministicPromptSafetyS
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
 from app.infrastructure.skill.file_loader import SkillFileLoader, SkillFileLoaderConfig
 from app.infrastructure.skill.seed_runner import seed_default_skills
+from app.infrastructure.skill.skill_usage_store import SkillUsageStore
+from app.infrastructure.skill.skill_pending_store import SkillPendingStore
+from app.infrastructure.skill.skill_backup_store import SkillBackupStore
 from app.infrastructure.plugin.file_loader import PluginFileLoader, PluginFileLoaderConfig
 from app.infrastructure.plugin.seed_runner import seed_default_plugins
 from app.infrastructure.registry.sqlite_plugin_registry import SQLitePluginRegistry
@@ -265,6 +271,10 @@ class ApplicationServices:
     schedule_service: ScheduleService
     scheduler_runner: SchedulerRunner
     skill_service: SkillService
+    skill_usage_store: SkillUsageStore
+    skill_pending_store: SkillPendingStore
+    skill_backup_store: SkillBackupStore
+    skill_evolution_service: SkillEvolutionService
     plugin_service: PluginService
     knowledge_service: KnowledgeService
     external_memory_service: ExternalMemoryService | None
@@ -409,11 +419,33 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         max_count=settings.skills_max_count,
     ))
     seed_default_skills(settings.skills_root)
-    skill_service = SkillService(skill_registry, skill_loader)
+    # Skill 自进化 stores + policy (T5/T6/T7/T2)
+    skill_usage_store = SkillUsageStore(settings.sqlite_path)
+    skill_pending_store = SkillPendingStore(settings.sqlite_path)
+    skill_backup_store = SkillBackupStore(
+        root=settings.skills_root,
+        keep=settings.skills_backup_keep,
+    )
+    skill_policy = SkillPolicy()
+    skill_service = SkillService(
+        skill_registry,
+        skill_loader,
+        usage=skill_usage_store,
+        pending=skill_pending_store,
+        backup=skill_backup_store,
+        policy=skill_policy,
+        write_approval=settings.skills_write_approval,
+        guard_agent_created=settings.skills_guard_agent_created,
+        backup_enabled=settings.skills_backup_enabled,
+        format_validator=SkillFormatValidator(),
+    )
     skill_executor = SkillToolExecutor(skill_service)
     for definition in skill_tool_definitions():
         routes[definition.name] = skill_executor
     tool_service.set_dynamic_definitions("skill", skill_tool_definitions())
+    # Register skill_manage tool (T10: SkillManageToolExecutor)
+    skill_manage_executor = SkillManageToolExecutor(skill_service)
+    routes["skill_manage"] = skill_manage_executor
 
     # Restricted host-terminal assembly. Configuration/Policy failures are
     # fail-closed and only publish a stable, non-sensitive health reason.
@@ -740,6 +772,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         budget_service=budget_service,
         llm_policy=llm_policy,
         llm_config=llm_config,
+        nudge_interval=settings.skills_creation_nudge_interval,
     )
     session_service = SessionService(
         memory_store,
@@ -759,6 +792,20 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         ),
         session_bootstrap_reader=SessionBootstrapReader(memory_store),
     )
+    # Skill 自进化 service (T11). Built after chat_service because it calls
+    # chat.complete for background review; injected back into graph_runner to
+    # break the runner -> evolution -> chat -> runner cycle.
+    skill_evolution_service = SkillEvolutionService(
+        chat=chat_service,
+        tool_service=tool_service,
+        max_iterations=settings.skills_background_review_max_iterations,
+        max_concurrent=settings.skills_background_review_max_concurrent,
+        enabled=settings.skills_background_review_enabled,
+        nudge_interval=settings.skills_creation_nudge_interval,
+        model=None,
+        timeout_seconds=settings.skills_background_review_timeout_seconds,
+    )
+    graph_runner.evolution_service = skill_evolution_service
     model_service = ModelService(holder, lambda: holder.current_model)
     schedule_calculator = CroniterScheduleCalculator()
     schedule_scanner = DeterministicPromptSafetyScanner()
@@ -1129,6 +1176,10 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         schedule_service=schedule_service,
         scheduler_runner=scheduler_runner,
         skill_service=skill_service,
+        skill_usage_store=skill_usage_store,
+        skill_pending_store=skill_pending_store,
+        skill_backup_store=skill_backup_store,
+        skill_evolution_service=skill_evolution_service,
         plugin_service=plugin_service,
         knowledge_service=knowledge_service,
         external_memory_service=external_memory_service,
@@ -1226,6 +1277,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             memory_store=services.memory_store,
             chat_service=services.chat_service,
             policy_dashboard_service=services.policy_dashboard_service,
+            skill_pending_store=services.skill_pending_store,
+            skill_usage_store=services.skill_usage_store,
         )
     )
     return app

@@ -8,12 +8,13 @@ from typing import Iterable
 
 from app.domain.skill import (
     Skill,
-    SkillFrontmatter,
     SkillNotFoundError,
     SkillReadiness,
     SkillRegistry,
+    SkillSource,
     SkillValidationError,
 )
+from app.domain.skill_format import skill_frontmatter_from_dict
 
 
 def _initialize_skill_schema(conn: sqlite3.Connection) -> None:
@@ -32,11 +33,23 @@ def _initialize_skill_schema(conn: sqlite3.Connection) -> None:
             last_scan_error TEXT,
             last_seen_at TEXT,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'user'
         );
         CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled);
         """
     )
+    _migrate_add_source_column(conn)
+
+
+def _migrate_add_source_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add `source` column to legacy skills tables.
+
+    Existing rows default to 'user' (SkillSource.USER).
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
+    if "source" not in columns:
+        conn.execute("ALTER TABLE skills ADD COLUMN source TEXT NOT NULL DEFAULT 'user'")
 
 
 class SQLiteSkillRegistry(SkillRegistry):
@@ -77,7 +90,7 @@ class SQLiteSkillRegistry(SkillRegistry):
                         UPDATE skills
                         SET relative_path = ?, description = ?, platforms_json = ?, frontmatter_json = ?,
                             enabled = ?, readiness = ?, last_scan_status = ?, last_scan_error = ?,
-                            last_seen_at = ?, updated_at = ?
+                            last_seen_at = ?, updated_at = ?, source = ?
                         WHERE name = ?
                         """,
                         (
@@ -86,7 +99,7 @@ class SQLiteSkillRegistry(SkillRegistry):
                             int(skill.enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
                             _dt_str(skill.last_seen_at), now.isoformat(),
-                            skill.name,
+                            skill.source.value, skill.name,
                         ),
                     )
                 else:
@@ -94,8 +107,8 @@ class SQLiteSkillRegistry(SkillRegistry):
                     conn.execute(
                         """
                         INSERT INTO skills(id, name, relative_path, description, platforms_json, frontmatter_json,
-                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at, source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             skill.id, skill.name, skill.relative_path, skill.description,
@@ -103,6 +116,7 @@ class SQLiteSkillRegistry(SkillRegistry):
                             int(skill.enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
                             _dt_str(skill.last_seen_at), created_at.isoformat(), now.isoformat(),
+                            skill.source.value,
                         ),
                     )
         except sqlite3.IntegrityError as exc:
@@ -134,8 +148,13 @@ class SQLiteSkillRegistry(SkillRegistry):
         names = {s.name for s in skills_list}
         now = datetime.now(timezone.utc)
         with self._connect() as conn:
-            existing_rows = conn.execute("SELECT name, enabled, created_at FROM skills").fetchall()
-            existing = {row["name"]: (bool(row["enabled"]), row["created_at"]) for row in existing_rows}
+            existing_rows = conn.execute(
+                "SELECT name, enabled, created_at, source FROM skills"
+            ).fetchall()
+            existing = {
+                row["name"]: (bool(row["enabled"]), row["created_at"], row["source"])
+                for row in existing_rows
+            }
             if names:
                 placeholders = ",".join("?" for _ in names)
                 conn.execute(
@@ -150,13 +169,16 @@ class SQLiteSkillRegistry(SkillRegistry):
                 created_at = (
                     datetime.fromisoformat(prev[1]) if prev else (skill.created_at or now)
                 )
+                # Preserve the EXISTING source so a rescan does not downgrade an
+                # agent-created (source=agent) or seed skill back to USER.
+                source_value = prev[2] if prev else skill.source.value
                 if prev:
                     conn.execute(
                         """
                         UPDATE skills
                         SET relative_path = ?, description = ?, platforms_json = ?, frontmatter_json = ?,
                             enabled = ?, readiness = ?, last_scan_status = ?, last_scan_error = ?,
-                            last_seen_at = ?, updated_at = ?
+                            last_seen_at = ?, updated_at = ?, source = ?
                         WHERE name = ?
                         """,
                         (
@@ -164,22 +186,22 @@ class SQLiteSkillRegistry(SkillRegistry):
                             json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
                             int(enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
-                            now.isoformat(), now.isoformat(), skill.name,
+                            now.isoformat(), now.isoformat(), source_value, skill.name,
                         ),
                     )
                 else:
                     conn.execute(
                         """
                         INSERT INTO skills(id, name, relative_path, description, platforms_json, frontmatter_json,
-                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at, source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             skill.id, skill.name, skill.relative_path, skill.description,
                             json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
                             int(enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
-                            now.isoformat(), created_at.isoformat(), now.isoformat(),
+                            now.isoformat(), created_at.isoformat(), now.isoformat(), source_value,
                         ),
                     )
         return await self.list_skills(include_disabled=True)
@@ -187,29 +209,30 @@ class SQLiteSkillRegistry(SkillRegistry):
 
 def _skill_from_row(row: sqlite3.Row) -> Skill:
     raw = json.loads(row["frontmatter_json"] or "{}")
-    fm = SkillFrontmatter(
-        name=str(raw.get("name") or row["name"]),
-        description=str(raw.get("description") or ""),
-        version=str(raw.get("version") or ""),
-        platforms=list(raw.get("platforms") or []),
-        tags=list(raw.get("tags") or []),
-        related_skills=list(raw.get("related_skills") or []),
-        author=str(raw.get("author") or ""),
-        license=str(raw.get("license") or ""),
-        setup_help=raw.get("setup_help"),
-        required_env_vars=list(raw.get("required_env_vars") or []),
-        raw=raw,
-    )
+    platforms = json.loads(row["platforms_json"] or "[]")
+    # Reuse the same metadata-aware construction as the file loader so that
+    # normalized raw (legacy fields sunk to metadata) round-trips correctly.
+    fm = skill_frontmatter_from_dict(raw, row["name"], platforms)
+    # source column may be absent on legacy rows read mid-migration; default to USER.
+    try:
+        source_value = row["source"]
+    except (IndexError, KeyError):
+        source_value = None
+    try:
+        source = SkillSource(source_value) if source_value else SkillSource.USER
+    except ValueError:
+        source = SkillSource.USER
     return Skill(
         id=row["id"], name=row["name"], relative_path=row["relative_path"],
         description=row["description"] or "",
-        platforms=json.loads(row["platforms_json"] or "[]"),
+        platforms=platforms,
         frontmatter=fm, enabled=bool(row["enabled"]),
         readiness=SkillReadiness(row["readiness"]),
         last_scan_status=row["last_scan_status"], last_scan_error=row["last_scan_error"],
         last_seen_at=_dt_parse(row["last_seen_at"]),
         created_at=_dt_parse(row["created_at"]),
         updated_at=_dt_parse(row["updated_at"]),
+        source=source,
     )
 
 

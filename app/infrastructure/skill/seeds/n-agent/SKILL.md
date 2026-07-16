@@ -1,11 +1,11 @@
 ---
 name: n-agent
-description: N-Agent 操作手册（首期覆盖定时任务，后续追加 MCP / Gateway 等章节）
-version: 1
-platforms: []
-tags:
-  - n-agent
-  - manual
+description: N-Agent operations manual (N-Agent 操作手册). Use when managing scheduled tasks, MCP sites, gateway resources, or other managed capabilities via skill_view.
+metadata:
+  version: "1"
+  platforms: "linux,macos"
+  tags: "n-agent,manual"
+  source: "agent"
 ---
 
 # N-Agent 操作手册

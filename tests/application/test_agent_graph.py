@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from typing import Any
@@ -465,6 +467,82 @@ async def test_agent_graph_serializes_legacy_dict_tool_content_to_provider(tmp_p
     payload = _message_to_provider(legacy)
     assert isinstance(payload["content"], str)
     assert "success" in payload["content"]
+
+
+class ChineseDictExecutor:
+    """Returns tool content containing Chinese as a dict (common executor pattern)."""
+
+    async def execute(self, request: ToolCallRequest) -> ToolResult:
+        return ToolResult(
+            request.id,
+            request.name,
+            ToolResultStatus.SUCCESS,
+            {"summary": "中文结果", "items": ["你好世界"]},
+        )
+
+
+class ChineseStringExecutor:
+    """Returns tool content as a json string containing Chinese (skill_service pattern)."""
+
+    async def execute(self, request: ToolCallRequest) -> ToolResult:
+        return ToolResult(
+            request.id,
+            request.name,
+            ToolResultStatus.SUCCESS,
+            json.dumps({"summary": "中文结果", "items": ["你好世界"]}, ensure_ascii=False),
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_tool_message_keeps_chinese_for_dict_content(tmp_path):
+    """Persisted tool message content must keep real CJK characters (not \\uXXXX
+    escapes) so the dashboard '工具调用调试信息' panel renders the original text.
+    Covers the dict-content executor pattern."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(
+            CompositeToolExecutor({"calculator": ChineseDictExecutor()}),
+            builtin_tool_definitions(),
+        ),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "calc"}]), "test")
+    tool_messages = [m for m in await store.list_messages("s1") if m.role == "tool"]
+    assert len(tool_messages) == 1
+    content = tool_messages[0].content
+    assert isinstance(content, str)
+    assert "中文结果" in content
+    assert "\\u" not in content
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_tool_message_keeps_chinese_for_string_content(tmp_path):
+    """Same guarantee when the executor returns content as a json string
+    (skill_service pattern): the inner Chinese must survive the outer json.dumps
+    wrapping so a single client-side JSON.parse renders the original text."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(
+            CompositeToolExecutor({"calculator": ChineseStringExecutor()}),
+            builtin_tool_definitions(),
+        ),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "calc"}]), "test")
+    tool_messages = [m for m in await store.list_messages("s1") if m.role == "tool"]
+    assert len(tool_messages) == 1
+    content = tool_messages[0].content
+    assert isinstance(content, str)
+    assert "中文结果" in content
+    assert "\\u" not in content
 
 
 class MemoryContextProvider:

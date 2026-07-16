@@ -274,3 +274,114 @@ async def test_build_skills_index_empty_when_no_skills():
     service = SkillService(registry, loader)
     idx = await service.build_skills_index()
     assert idx == ""
+
+
+# ------------------------------------------------------------------
+# convenience methods: list_pending / get_pending / reject_pending
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_pending_delegates_to_store():
+    from unittest.mock import AsyncMock, MagicMock
+    from app.domain.skill import SkillPendingWrite, SkillWriteAction, SkillWriteOrigin
+    registry, loader = FakeRegistry(), FakeLoader()
+    pw = SkillPendingWrite(
+        "pid1", SkillWriteAction.CREATE, "demo",
+        SkillWriteOrigin.FOREGROUND, "create demo", "diff",
+        {}, "pending", None, None, None,
+    )
+    pending = MagicMock()
+    pending.list = AsyncMock(return_value=[pw])
+    service = SkillService(registry, loader, pending=pending)
+    result = await service.list_pending()
+    assert result == [pw]
+
+
+@pytest.mark.asyncio
+async def test_list_pending_raises_without_store():
+    registry, loader = FakeRegistry(), FakeLoader()
+    service = SkillService(registry, loader)
+    with pytest.raises(RuntimeError, match="pending store"):
+        await service.list_pending()
+
+
+@pytest.mark.asyncio
+async def test_get_pending_delegates_to_store():
+    from unittest.mock import AsyncMock, MagicMock
+    from app.domain.skill import SkillPendingWrite, SkillWriteAction, SkillWriteOrigin
+    registry, loader = FakeRegistry(), FakeLoader()
+    pw = SkillPendingWrite(
+        "pid1", SkillWriteAction.CREATE, "demo",
+        SkillWriteOrigin.FOREGROUND, "s", "d", {}, "pending", None, None, None,
+    )
+    pending = MagicMock()
+    pending.get = AsyncMock(return_value=pw)
+    service = SkillService(registry, loader, pending=pending)
+    result = await service.get_pending("pid1")
+    assert result is pw
+
+
+@pytest.mark.asyncio
+async def test_reject_pending_delegates_to_store():
+    from unittest.mock import AsyncMock, MagicMock
+    registry, loader = FakeRegistry(), FakeLoader()
+    pending = MagicMock()
+    pending.reject = AsyncMock(return_value=True)
+    service = SkillService(registry, loader, pending=pending)
+    result = await service.reject_pending("pid1")
+    assert result is True
+
+
+# ------------------------------------------------------------------
+# convenience methods: list_usage / set_pinned
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_usage_iterates_skills():
+    from unittest.mock import AsyncMock, MagicMock
+    from app.domain.skill import SkillUsage
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("alpha"))
+    await registry.upsert_skill(_skill("beta"))
+    usage = MagicMock()
+    usage.get = AsyncMock(side_effect=lambda name: SkillUsage(
+        created_by="foreground", use_count=1, view_count=2, patch_count=0,
+        created_at=None, last_used_at=None, last_viewed=None,
+        last_patched_at=None, state="active", pinned=False, archived_at=None,
+    ) if name == "alpha" else None)
+    service = SkillService(registry, loader, usage=usage)
+    result = await service.list_usage()
+    names = [name for name, _ in result]
+    assert names == ["alpha"]
+
+
+@pytest.mark.asyncio
+async def test_set_pinned_validates_skill_exists():
+    from unittest.mock import AsyncMock, MagicMock
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("alpha"))
+    usage = MagicMock()
+    usage.set_pinned = AsyncMock()
+    service = SkillService(registry, loader, usage=usage)
+    await service.set_pinned("alpha", True)
+    usage.set_pinned.assert_awaited_once_with("alpha", True)
+
+
+@pytest.mark.asyncio
+async def test_set_pinned_raises_for_missing_skill():
+    from unittest.mock import AsyncMock, MagicMock
+    registry, loader = FakeRegistry(), FakeLoader()
+    usage = MagicMock()
+    usage.set_pinned = AsyncMock()
+    service = SkillService(registry, loader, usage=usage)
+    with pytest.raises(SkillNotFoundError):
+        await service.set_pinned("missing", True)
+
+
+@pytest.mark.asyncio
+async def test_set_pinned_raises_without_usage_store():
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("alpha"))
+    service = SkillService(registry, loader)
+    with pytest.raises(RuntimeError, match="usage store"):
+        await service.set_pinned("alpha", True)

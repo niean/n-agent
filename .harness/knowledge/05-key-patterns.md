@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -741,3 +741,56 @@ InformationFlowStreamGuard 做增量流脱敏：lookbehind buffer 保留 `max_se
 ### 审计通道模式
 
 PolicyAuditService 委托 PolicyAuditSink Protocol，sink 失败只 log warning 不传播。PolicyAuditEvent 无 raw prompt/secret/tool arguments 字段，sink 无法泄漏。生产实现 LoggingPolicyAuditSink 输出 JSON 日志。已接入 RuntimeMemoryService、BudgetService、InformationFlowService、ToolService。InformationFlowService.release 是 sync 方法，审计用 fire-and-forget（asyncio.create_task）。
+
+## 模式二十五：Skill 自进化 loop 与 provenance 治理
+
+Skill 自进化（Background Review）让 Agent 在主 turn 结束后异步审视并修改自身 Skill 库。整个链路横跨 AgentGraphRunner、SkillEvolutionService、ChatCompletionService、ToolService、SkillManageToolExecutor、SkillService、SkillPolicy、SkillPendingStore、SkillBackupStore、SQLiteSkillRegistry 等组件，通过 origin provenance、staged approval、read-before-write、backup fail-closed、source 保留等多重约束保证后台自演化不破坏 Skill 库完整性。
+
+Skill 自进化主 loop（Background Review）：
+- AgentGraphRunner finalize 成功后触发 `_post_finalize_nudge`：检查 nudge counter，当 `turn_count % nudge_interval == 0` 时调用 `SkillEvolutionService.maybe_trigger`
+- `maybe_trigger` spawn 独立 asyncio task 执行 `run_background_review`，fire-and-forget，全异常捕获不影响主 turn
+- `run_background_review` fork 一个受限的 `ChatCompletionService`：工具白名单经 `ToolService.build_filtered_definitions` 按 toolset+toolname 双重过滤，只注入 skills+memory 相关工具
+- fork 内注入 `trusted_metadata.skill_write_origin=background_review`，标识本次 Skill 写入来自后台自演化
+- Agent 在 fork 内自主调用 `skill_manage` 工具 -> `SkillManageToolExecutor` 从 `trusted_metadata` 读取 origin -> `SkillService.manage_skill` -> `SkillPolicy` 评估
+
+provenance origin 防伪造链：
+- origin 只能由宿主注入到 `ToolExecutionContext.trusted_metadata["skill_write_origin"]`，SkillManageToolExecutor 从 `trusted_metadata` 读取，不读 `request.arguments.origin`
+- 前台调用默认 origin=foreground，后台 fork 注入 origin=background_review
+- OpenAI HTTP 直连客户端的 metadata 是 untrusted_metadata，无法伪造 origin 绕过 SkillPolicy 后台限制
+- 此约束与模式十二（trusted_metadata 端到端透传）同源：trusted_metadata 只能由服务端写入
+
+write_approval staged gate：
+- `SkillService.manage_skill` 当 SkillPolicy 返回 `REQUIRE_APPROVAL` 且 `approved_replay=False` 时，调 `SkillPendingStore.stage` 持久化 pending write，重启存活
+- 用户经 Dashboard/CLI approve 后，`approve_pending` 调 `approve_take` 原子取出 pending write
+- 取出后构造 `approved_replay=True` 的 `SkillManageRequest`，再次调 `manage_skill` 重放
+- `approved_replay=True` 绕过 require_approval staging，但 deny 规则仍评估，deny 不可被 approval 覆盖
+
+read-before-write guard：
+- background_review 修改既有 Skill 前，fork 内必须先调 `skill_view` 读取目标 Skill
+- `SkillService.mark_bg_read` 把已读目标记录到 `_bg_read_targets`
+- `SkillPolicyRequest.exact_target_loaded` 据此判定，未读则 SkillPolicy deny
+- 此 guard 防止后台 Agent 在不了解目标 Skill 当前内容的情况下盲改
+
+backup fail-closed：
+- `SkillService.manage_skill` 执行写入前，若 `backup_enabled=True` 则调 `SkillBackupStore.snapshot` 创建快照
+- `SkillBackupError` 时拒绝写入（不落盘），避免进入无法 rollback 的半保护状态
+- backup 失败不降级为无备份写入，保持 fail-closed 语义
+
+空写拒绝（防 LLM 误用清空 Skill）：
+- `SkillService.manage_skill` Step 1.5 在 backup/write 之前校验 action 载荷：EDIT/CREATE 要求 `content` 非空白（否则 `content_required`），PATCH 要求 `old_string` 非空白（否则 `old_string_required`）
+- 背景：LLM 易混淆 EDIT（整文件替换，用 `content`）与 PATCH（子串替换，用 `old_string`/`new_string`），曾用 `action=edit` 却把内容塞进 `old_string` 而漏给 `content`，执行器 `content=str(args.get("content") or "")` 得空串，`write_skill_file(skill, "")` 把 SKILL.md 清成 0 字节
+- `SkillFileLoader._write_skill_file_sync` 二次防御：`content` 空白时 raise `empty_content`，任何绕过 manage_skill 校验的路径都不会清空文件
+- backup 虽能恢复（快照在写前生成），但若空写发生在 create 之后、下一次有备份的写之前，中间无快照则内容丢失；故必须在源头拒绝空写
+
+Skill source 保留：
+- `SQLiteSkillRegistry.replace_all_skills` 对已存在的 Skill name 保留既有 source：先 SELECT 旧 source 覆盖传入值
+- 防止 agent-created skill（source=AGENT）被 rescan 降级为 USER，丢失 provenance
+- seed skill 由 `file_loader` scan 对照 seeds 目录识别，rescan 不改变其 source
+
+陷阱：
+- 后台 fork 的 ChatCompletionService 若未限制工具白名单，Agent 可能调用无关工具（如 schedule、mcp）产生副作用；必须按 toolset+toolname 双重过滤
+- `approved_replay=True` 若同时绕过 deny 规则，会让 approval 变成万能钥匙，破坏 SkillPolicy 的 deny 约束；deny 必须始终评估
+- `SkillPendingStore.stage` 若不持久化（仅内存），进程重启后 pending write 丢失，用户无法 approve；必须落 SQLite
+- backup 失败时若继续写入，会留下无法回滚的变更，破坏 Skill 库可恢复性；必须 fail-closed
+- `replace_all_skills` 若不保留既有 source，rescan 会把 agent-created skill 降级为 USER，丢失 provenance 信息
+- origin 若从 `request.arguments` 读取，OpenAI HTTP 客户端可伪造 `origin=foreground` 绕过后台限制；必须从 `trusted_metadata` 读取

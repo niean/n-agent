@@ -24,6 +24,10 @@
 | D020 | Host Terminal command trusted root 的 owner 校验尚未覆盖从文件系统根到 trusted root 的全部祖先；后续需校验完整祖先链 owner、非软链接和不可写属性。 | high | plan-260715-photo-and-upload.md | 2026-07-15 | open |
 | D021 | macOS command Mach-O 的 codesign/verify 预处理 helper 尚未完全纳入请求绝对 deadline 与 Bridge shutdown 生命周期；后续需跟踪、终止和回收 helper，并确保 timeout/shutdown 后不会启动目标进程。 | high | plan-260715-photo-and-upload.md | 2026-07-15 | open |
 | D022 | Host Terminal 启动清理仅接受 `0500` command 快照，若 Bridge 在 codesign 阶段崩溃会遗留合法 `0700` 快照并导致后续启动失败；后续需在保持普通文件/owner/非软链接校验下安全清理两种生命周期权限。 | medium | plan-260715-photo-and-upload.md | 2026-07-15 | open |
+| D023 | Skill CRUD 收口未完成：现有 Dashboard/CLI skill CRUD（create_skill/update_skill/delete_skill）保留 legacy 实现，未路由到 manage_skill + SkillPolicy，绕过 policy/guard/backup 编排。spec 验收标准要求收口，但 legacy 方法用 SkillInput（relative_path/platforms/frontmatter）与 SkillManageRequest 不匹配，强制路由破坏现有签名与测试。skill_manage 工具路径（Agent 自进化核心）已完整走 manage_skill + policy。 | medium | plan-260715-skill-self-evolution.md | 2026-07-15 | open |
+| D024 | Dashboard format_messages 本期不新增 DB 列，仅从 last_scan_error 派生，无法长期保存完整 SkillScanWarning detail；若需详情持久化，后续应设计 SkillScanWarning 存储或 frontmatter.raw 扩展，不在本期扩大 schema。 | low | plan-260716-skill-anthropic-format.md | 2026-07-16 | open |
+| D025 | metadata list 字段使用逗号分隔 string 序列化，不支持元素内转义逗号；若未来需要复杂列表，应另行设计 metadata 编码约定。 | low | plan-260716-skill-anthropic-format.md | 2026-07-16 | open |
+| D026 | `_skill_category`（app/application/skill_service.py）读 `frontmatter.raw.get("category")` 因 T3 normalize 丢弃非白名单/非 legacy 的 category 字段而成为 dead code；目录式 category fallback 仍工作，无功能影响，但 docstring 关于 frontmatter category 的描述已失真。 | low | plan-260716-skill-anthropic-format.md | 2026-07-16 | open |
 
 ---
 

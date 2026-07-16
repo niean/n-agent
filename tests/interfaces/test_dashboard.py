@@ -783,8 +783,12 @@ def test_dashboard_chat_completions_nonexistent_session_returns_409(tmp_path):
     assert response.json()["error"]["code"] == "dashboard_session_scope_mismatch"
 
 
-def test_dashboard_chat_completions_api_session_returns_409(tmp_path):
-    """Dashboard selector cannot select an api session."""
+def test_dashboard_chat_completions_continues_api_session(tmp_path):
+    """Dashboard is a cross-source debug UI: it may continue an existing api session.
+
+    Restores pre-policy-governance behavior; the session's origin source is preserved
+    (continuing from the Dashboard must not rewrite an api session into a dashboard one).
+    """
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     import asyncio
     from app.domain.session import ConversationSession
@@ -798,8 +802,32 @@ def test_dashboard_chat_completions_api_session_returns_409(tmp_path):
         json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
     )
 
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "dashboard_session_scope_mismatch"
+    assert response.status_code == 200
+    assert client.get("/chat/sessions/api-1").json()["session"]["source"] == "api"
+
+
+def test_dashboard_chat_completions_continues_feishu_session(tmp_path):
+    """Regression: Dashboard could not send to a feishu-type session after 8649dc4.
+
+    The Dashboard session list shows every session regardless of source, so the operator
+    must be able to continue a feishu conversation from the Dashboard. The feishu session's
+    origin source is preserved.
+    """
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+    from app.domain.session import ConversationSession
+
+    asyncio.run(store.create_session(ConversationSession(id="feishu-1", source="feishu")))
+    client = TestClient(_build_app(store))
+
+    response = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "feishu-1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert client.get("/chat/sessions/feishu-1").json()["session"]["source"] == "feishu"
 
 
 def test_dashboard_chat_completions_streaming(tmp_path):

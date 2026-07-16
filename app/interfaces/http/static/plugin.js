@@ -39,7 +39,7 @@
     const table = ui.el('table', 'document-table');
     const thead = ui.el('thead');
     const trh = ui.el('tr');
-    ['Key', '名称', '版本', '描述', 'Kind', '来源', '启用', '扫描状态', '操作'].forEach((h) => {
+    ['Key', '名称', '版本', '描述', 'Kind', '来源', '启用', '扫描', '操作'].forEach((h) => {
       const th = ui.el('th');
       th.textContent = h;
       trh.appendChild(th);

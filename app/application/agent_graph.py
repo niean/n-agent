@@ -7,7 +7,10 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from inspect import isawaitable
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from app.application.skill_evolution_service import SkillEvolutionService
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
@@ -115,6 +118,8 @@ class AgentGraphRunner:
         budget_service: BudgetService | None = None,
         llm_policy: LLMPolicy | None = None,
         llm_config: LLMConfig | None = None,
+        evolution_service: SkillEvolutionService | None = None,
+        nudge_interval: int = 10,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -153,6 +158,8 @@ class AgentGraphRunner:
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
+        self.evolution_service = evolution_service
+        self.nudge_interval = nudge_interval
 
     def register_run(self, session_id: str, task: asyncio.Task) -> None:
         self._running_tasks[session_id] = task
@@ -826,7 +833,7 @@ class AgentGraphRunner:
                     "role": "tool",
                     "tool_call_id": result.tool_call_id,
                     "name": result.tool_name,
-                    "content": json.dumps(result_payload),
+                    "content": json.dumps(result_payload, ensure_ascii=False, default=str),
                 }
             )
             await self._runtime_memory.save_tool_call_if_allowed(
@@ -957,7 +964,7 @@ class AgentGraphRunner:
         for result in state.tool_results:
             await self._runtime_memory.append_tool_message(
                 state.session_id,
-                json.dumps(result),
+                json.dumps(result, ensure_ascii=False, default=str),
                 tool_call_id=result.get("tool_call_id"),
                 name=result.get("name"),
             )
@@ -1082,7 +1089,52 @@ class AgentGraphRunner:
         # T9: Close Budget account on terminal (release unsettled reservations)
         await self._budget_service.close(state.run_id)
 
+        # T11: Post-finalize skill self-evolution nudge. Fire-and-forget;
+        # _post_finalize_nudge guards on evolution_service is None and on
+        # nudge_interval. maybe_trigger spawns a background asyncio task.
+        # Wrapped so evolution never breaks the turn finalize path.
+        if self.evolution_service is not None:
+            try:
+                await self._post_finalize_nudge(
+                    state.session_id,
+                    state.iteration_count,
+                    state.working_messages,
+                )
+            except Exception:
+                logger.warning(
+                    "skill evolution nudge failed for session=%s",
+                    state.session_id,
+                    exc_info=True,
+                )
+
         return state
+
+    async def _post_finalize_nudge(
+        self,
+        session_id: str,
+        turn_count: int,
+        recent_messages: list[dict[str, Any]],
+    ) -> None:
+        """Post-finalize hook for background skill self-evolution.
+
+        Called after a turn finalizes. If evolution_service is configured and
+        turn_count hits the nudge_interval, builds a digest from recent
+        messages and triggers a background skill review. All exceptions are
+        swallowed by maybe_trigger/run_background_review (fire-and-forget).
+        """
+        if self.evolution_service is None:
+            return
+        if turn_count % self.nudge_interval != 0:
+            return
+        parts: list[str] = []
+        for msg in recent_messages:
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if isinstance(content, str) and content:
+                parts.append(content)
+        digest = "\n".join(parts)
+        if len(digest) > 2000:
+            digest = digest[:2000]
+        await self.evolution_service.maybe_trigger(session_id, turn_count, digest)
 
     def _after_llm(self, state: AgentState) -> str:
         """Route after call_llm using TurnPolicy.

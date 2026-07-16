@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -128,3 +128,19 @@
 - PolicyAuditEvent：Domain 不可变审计事件，含 policy/version/decision_kind/reason/run_id/session_id/outcome；无 raw prompt/secret/tool arguments 字段。
 - PolicyDecisionKind：审计决策类型枚举（admission/plan/selection/allocation）。
 - 封口（sealing）：Policy Mesh 的执行模式，指 Application Service 在调用外部资源（LLM/Tool/Sandbox/Memory/Gateway）前必须经过 Policy 评估，deny -> 外部资源不被调用。
+
+## Skill 自进化术语
+
+- Skill 自进化（Skill Self-Evolution）：Agent 自主从对话中学习非平凡流程并沉淀为可复用 Skill（SKILL.md），形成"用-学-进化"闭环；参考 HermesAgent。
+- skill_manage：Skill 写入工具，Agent 通过它 create/patch/edit/delete/write_file/remove_file 管理 Skill；SAFE 工具，toolset=skills。
+- SkillPolicy：第 12 个领域 Policy，治理 Skill 写入（deny > require_approval > allow）；后台 review 只能改 agent-owned Skill，foreground 不可删 seed/pinned，read-before-write，write_approval staged。
+- SkillSource：Skill 所有者类型枚举（seed 出厂模板/agent Agent 创建/user 用户创建），与写入 origin 正交。
+- SkillWriteOrigin：写入来源枚举（foreground 前台/background_review 后台自进化），决定写权限边界。
+- Background Self-Improvement Review：turn 结束后按 nudge 计数 fork 受限 Agent（工具白名单 skills+memory），review 对话自主 patch/create Skill；fire-and-forget，失败不影响主 turn。
+- SkillEvolutionService：Background Review 的 Application 编排服务，maybe_trigger（nudge+并发）+ run_background_review（fork chat + 注入 origin）。
+- provenance origin 防伪造：origin 经 ToolExecutionContext.trusted_metadata["skill_write_origin"] 注入（服务端注入），OpenAI HTTP 直连客户端无法伪造，防绕过 SkillPolicy。
+- write_approval staged gate：skills_write_approval 开启时，skill_manage 写入被 staged 到 SkillPendingStore 而非直接落盘，经 Dashboard/CLI approve 后 replay（approved_replay 绕过 require_approval 但不绕过 deny）。
+- read-before-write guard：background_review 修改既有 Skill 前必须先 skill_view 读取（exact_target_loaded），SkillPolicy 否则 deny。
+- SkillUsage telemetry：Skill 使用遥测（created_by/use_count/view_count/patch_count/state/pinned/时间戳），存 SQLite skill_usage 表。
+- archive-not-delete：delete/remove_file 默认移到 .archive/ 而非物理删除，可恢复。
+- SkillBackupStore：Skill 目录 tar.gz 快照 + rollback，写入前 backup（fail-closed，backup 失败拒绝写入）。

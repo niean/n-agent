@@ -11,15 +11,15 @@ from app.domain.skill import Skill, SkillFrontmatter, SkillReadiness
 from app.domain.tool import RiskLevel, ToolCallRequest, ToolResultStatus, ToolSourceType
 
 
-def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path=None):
+def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path=None, description="d"):
     fm = SkillFrontmatter(
-        name=name, description="d", version="", platforms=["linux"], tags=["weather"] if name == "weather" else [],
+        name=name, description=description, version="", platforms=["linux"], tags=["weather"] if name == "weather" else [],
         related_skills=[], author="", license="", setup_help=None,
         required_env_vars=[], raw={"name": name},
     )
     return Skill(
         id=f"id-{name}", name=name, relative_path=relative_path or f"{name}/SKILL.md",
-        description="d", platforms=["linux"], frontmatter=fm,
+        description=description, platforms=["linux"], frontmatter=fm,
         enabled=enabled, readiness=readiness, last_scan_status="ok",
         last_scan_error=None, last_seen_at=None,
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
@@ -152,3 +152,17 @@ async def test_skill_view_unknown_returns_available_list():
     payload = json.loads(result.content) if isinstance(result.content, str) else result.content
     assert payload["success"] is False
     assert "available" in payload
+
+
+@pytest.mark.asyncio
+async def test_skills_list_content_keeps_chinese_description():
+    """Skill tool content must keep real CJK characters (not \\uXXXX escapes) so
+    the dashboard tool-call debug panel renders the original text."""
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("a", description="查看天气 (weather query)"))
+    service = SkillService(registry, loader)
+    executor = SkillToolExecutor(service)
+    result = await executor.execute(ToolCallRequest(id="1", name="skills_list", arguments={}))
+    assert isinstance(result.content, str)
+    assert "查看天气" in result.content
+    assert "\\u" not in result.content

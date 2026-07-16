@@ -129,6 +129,13 @@
   });
   const deleteSkill = (name) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
   const refreshSkills = () => fetchJson('/chat/skills/refresh', { method: 'POST' });
+  const listPendingSkills = () => fetchJson('/chat/skills/pending');
+  const getPendingDiff = (pendingId) => fetchJson(`/chat/skills/pending/${encodeURIComponent(pendingId)}/diff`);
+  const approvePending = (pendingId) => fetchJson(`/chat/skills/pending/${encodeURIComponent(pendingId)}/approve`, { method: 'POST' });
+  const rejectPending = (pendingId) => fetchJson(`/chat/skills/pending/${encodeURIComponent(pendingId)}/reject`, { method: 'POST' });
+  const approveAllPending = () => fetchJson('/chat/skills/pending/approve-all', { method: 'POST' });
+  const rejectAllPending = () => fetchJson('/chat/skills/pending/reject-all', { method: 'POST' });
+  const listSkillUsage = () => fetchJson('/chat/skills/usage');
 
   // Plugin dashboard endpoints
   const listPlugins = () => fetchJson('/chat/plugins');
@@ -245,6 +252,13 @@
     setSkillEnabled,
     deleteSkill,
     refreshSkills,
+    listPendingSkills,
+    getPendingDiff,
+    approvePending,
+    rejectPending,
+    approveAllPending,
+    rejectAllPending,
+    listSkillUsage,
     listPlugins,
     getPlugin,
     refreshPlugins,

@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -14,14 +17,23 @@ import yaml
 
 from app.domain.skill import (
     Skill,
-    SkillFrontmatter,
+    SkillPatchConflictError,
     SkillReadiness,
     SkillScanError,
+    SkillSource,
     SkillValidationError,
+)
+from app.domain.skill_format import (
+    SkillFormatError,
+    SkillFormatRequest,
+    SkillFormatValidator,
+    metadata_get,
+    normalize_frontmatter,
+    skill_frontmatter_from_dict,
 )
 
 
-EXCLUDED_SKILL_DIRS = {".git", ".github", ".hub", ".archive"}
+EXCLUDED_SKILL_DIRS = {".git", ".github", ".hub", ".archive", ".backups"}
 INJECTION_PATTERNS = (
     re.compile(r"ignore (all )?previous instructions", re.I),
     re.compile(r"system\s*:\s*you are", re.I),
@@ -77,10 +89,12 @@ class SkillFileLoader:
 
         root = self.root
         root.mkdir(parents=True, exist_ok=True)
+        seed_names = _seed_dir_names()
         skills: list[Skill] = []
         warnings: list[SkillScanWarning] = []
         seen_names: dict[str, str] = {}
         count = 0
+        validator = SkillFormatValidator()
         for file in _iter_skill_files(root):
             count += 1
             if count > self.config.max_count:
@@ -103,13 +117,9 @@ class SkillFileLoader:
                 )
                 continue
             seen_names[name] = rel
-            raw_platforms = fm_dict.get("platforms")
-            if not raw_platforms:
-                platforms: list[str] = []
-            elif isinstance(raw_platforms, list):
-                platforms = [str(p) for p in raw_platforms]
-            else:
-                platforms = [str(raw_platforms)]
+            # Platforms: metadata.platforms (string->list) first, then top-level fallback.
+            # Keeps readiness semantics identical (macos-only on linux -> UNSUPPORTED).
+            platforms = metadata_get(fm_dict, "platforms", is_list=True)
             unsupported = bool(platforms) and not _platform_matches(
                 platforms, self.config.current_platform
             )
@@ -121,7 +131,25 @@ class SkillFileLoader:
                 if pattern.search(body):
                     last_scan_error = "injection_warning"
                     break
-            fm = _frontmatter_from_dict(fm_dict, name, platforms)
+            # Format validation: non-blocking.  Records format_warning but
+            # never prevents the skill from entering the registry.  Injection
+            # takes priority for last_scan_error.
+            fmt_result = validator.validate(
+                SkillFormatRequest(
+                    frontmatter=fm_dict,
+                    dir_name=skill_dir.name,
+                    body_line_count=len(body.splitlines()),
+                )
+            )
+            if fmt_result.errors or fmt_result.warnings:
+                detail = _format_detail(fmt_result.errors, fmt_result.warnings)
+                warnings.append(SkillScanWarning(rel, "format_warning", detail=detail))
+                if last_scan_error is None:
+                    last_scan_error = "format_warning"
+            fm = skill_frontmatter_from_dict(fm_dict, name, platforms)
+            top_dir = Path(rel).parts[0] if Path(rel).parts else ""
+            default_source = SkillSource.SEED if top_dir in seed_names else SkillSource.USER
+            source = _resolve_source(fm_dict, default_source)
             skill = Skill(
                 id=str(uuid4()), name=name, relative_path=rel,
                 description=fm.description, platforms=platforms,
@@ -129,6 +157,7 @@ class SkillFileLoader:
                 last_scan_status="ok" if last_scan_error is None else "warning",
                 last_scan_error=last_scan_error,
                 last_seen_at=None, created_at=None, updated_at=None,
+                source=source,
             )
             skills.append(skill)
         return skills, warnings
@@ -162,6 +191,20 @@ class SkillFileLoader:
         return await asyncio.to_thread(
             self._read_script_bytes_sync, skill, script_relative_path
         )
+
+    async def read_skill_file(self, skill: Skill) -> str:
+        return await asyncio.to_thread(self._read_skill_file_sync, skill)
+
+    def _read_skill_file_sync(self, skill: Skill) -> str:
+        from app.infrastructure.path_security import validate_within_dir
+
+        skill_file = self.root / skill.relative_path
+        err = validate_within_dir(skill_file, self.root)
+        if err is not None:
+            raise SkillValidationError(err)
+        if not skill_file.is_file():
+            raise FileNotFoundError(f"skill file not found: {skill_file}")
+        return skill_file.read_text(encoding="utf-8")
 
     def _read_script_bytes_sync(
         self, skill: Skill, script_relative_path: str
@@ -277,6 +320,166 @@ class SkillFileLoader:
                         out[sub].append(str(p.relative_to(skill_dir)))
         return out
 
+    async def write_skill_file(self, skill: Skill, content: str) -> None:
+        await asyncio.to_thread(self._write_skill_file_sync, skill, content)
+
+    def _write_skill_file_sync(self, skill: Skill, content: str) -> None:
+        from app.infrastructure.path_security import validate_within_dir
+
+        skill_file = self.root / skill.relative_path
+        err = validate_within_dir(skill_file, self.root)
+        if err is not None:
+            raise SkillValidationError(err)
+        if skill_file.is_symlink():
+            raise SkillValidationError("symlink_not_allowed")
+        if not content.strip():
+            # Defense-in-depth: manage_skill already rejects empty EDIT/CREATE
+            # content, but never let an empty write through to disk -- it would
+            # silently destroy the SKILL.md.
+            raise SkillValidationError("empty_content")
+        # Fail-fast injection check on the original content.
+        for pattern in INJECTION_PATTERNS:
+            if pattern.search(content):
+                raise SkillValidationError("injection_detected")
+        # Normalize frontmatter (sinks legacy fields into metadata, stable
+        # order). Raises SkillScanError on non-mapping YAML frontmatter.
+        try:
+            final_content = _normalize_skill_content(content)
+        except SkillScanError as exc:
+            raise SkillValidationError(str(exc)) from exc
+        # Defense-in-depth: re-check injection on the normalized content.
+        for pattern in INJECTION_PATTERNS:
+            if pattern.search(final_content):
+                raise SkillValidationError("injection_detected")
+        _atomic_write(skill_file, final_content)
+
+    async def patch_skill_file(
+        self, skill: Skill, old_string: str, new_string: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._patch_skill_file_sync, skill, old_string, new_string
+        )
+
+    def _patch_skill_file_sync(
+        self, skill: Skill, old_string: str, new_string: str
+    ) -> None:
+        from app.infrastructure.path_security import validate_within_dir
+
+        skill_file = self.root / skill.relative_path
+        err = validate_within_dir(skill_file, self.root)
+        if err is not None:
+            raise SkillValidationError(err)
+        if skill_file.is_symlink():
+            raise SkillValidationError("symlink_not_allowed")
+        content = skill_file.read_text(encoding="utf-8")
+        count = content.count(old_string)
+        if count == 0:
+            raise SkillPatchConflictError("not_found")
+        if count > 1:
+            raise SkillPatchConflictError("not_unique")
+        candidate = content.replace(old_string, new_string)
+        # Determine whether the frontmatter is affected. The patch touches
+        # frontmatter if old_string appears within the frontmatter region OR
+        # the parsed frontmatter dict changes (e.g. a body edit that
+        # introduces/removes a '---' fence).
+        fm_region = _frontmatter_region(content)
+        frontmatter_touched = fm_region is not None and old_string in fm_region
+        frontmatter_changed = False
+        if not frontmatter_touched:
+            try:
+                fm_current, _ = _split_frontmatter(content)
+                fm_candidate, _ = _split_frontmatter(candidate)
+                frontmatter_changed = fm_candidate != fm_current
+            except SkillScanError:
+                # Corrupt frontmatter in the original file; cannot compare.
+                # Treat as unchanged to preserve body-only patch semantics.
+                frontmatter_changed = False
+        if frontmatter_touched or frontmatter_changed:
+            try:
+                final_content = _normalize_skill_content(candidate)
+            except SkillScanError as exc:
+                raise SkillValidationError(str(exc)) from exc
+        else:
+            final_content = candidate
+        # Injection guard on the final content (must not bypass).
+        for pattern in INJECTION_PATTERNS:
+            if pattern.search(final_content):
+                raise SkillValidationError("injection_detected")
+        _atomic_write(skill_file, final_content)
+
+    async def delete_skill(self, skill: Skill) -> None:
+        await asyncio.to_thread(self._delete_skill_sync, skill)
+
+    def _delete_skill_sync(self, skill: Skill) -> None:
+        skill_rel = Path(skill.relative_path)
+        skill_dir = (self.root / skill_rel.parent).resolve()
+        if not skill_dir.exists():
+            raise FileNotFoundError(f"skill dir not found: {skill_dir}")
+        archive_root = self.root / ".archive"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        suffix = datetime.now(timezone.utc).isoformat()
+        dest = archive_root / f"{skill.name}-{suffix}"
+        shutil.move(str(skill_dir), str(dest))
+
+    async def write_linked_file(
+        self, skill: Skill, file_path: str, content: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._write_linked_file_sync, skill, file_path, content
+        )
+
+    def _write_linked_file_sync(
+        self, skill: Skill, file_path: str, content: str
+    ) -> None:
+        from app.infrastructure.path_security import (
+            has_traversal_component,
+            validate_within_dir,
+        )
+
+        if has_traversal_component(file_path):
+            raise SkillValidationError("Path traversal ('..') is not allowed.")
+        parts = Path(file_path).parts
+        if not parts or parts[0] not in LINKED_DIRS:
+            raise SkillValidationError("linked_file_dir_not_allowed")
+        skill_dir = (self.root / Path(skill.relative_path).parent).resolve()
+        target = (skill_dir / file_path).resolve()
+        err = validate_within_dir(target, skill_dir)
+        if err is not None:
+            raise SkillValidationError(err)
+        if target.is_symlink():
+            raise SkillValidationError("symlink_not_allowed")
+        _atomic_write(target, content)
+
+    async def remove_linked_file(self, skill: Skill, file_path: str) -> None:
+        await asyncio.to_thread(self._remove_linked_file_sync, skill, file_path)
+
+    def _remove_linked_file_sync(self, skill: Skill, file_path: str) -> None:
+        from app.infrastructure.path_security import (
+            has_traversal_component,
+            validate_within_dir,
+        )
+
+        if has_traversal_component(file_path):
+            raise SkillValidationError("Path traversal ('..') is not allowed.")
+        parts = Path(file_path).parts
+        if not parts or parts[0] not in LINKED_DIRS:
+            raise SkillValidationError("linked_file_dir_not_allowed")
+        skill_dir = (self.root / Path(skill.relative_path).parent).resolve()
+        target = (skill_dir / file_path).resolve()
+        err = validate_within_dir(target, skill_dir)
+        if err is not None:
+            raise SkillValidationError(err)
+        if not target.exists():
+            raise FileNotFoundError(f"linked file not found: {target}")
+        archive_root = self.root / ".archive"
+        archive_root.mkdir(parents=True, exist_ok=True)
+        suffix = datetime.now(timezone.utc).isoformat()
+        dest_dir = archive_root / f"{skill.name}-{suffix}"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / file_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(target), str(dest))
+
 
 def _iter_skill_files(root: Path) -> list[Path]:
     matches: list[Path] = []
@@ -286,6 +489,55 @@ def _iter_skill_files(root: Path) -> list[Path]:
             matches.append(Path(dirpath) / "SKILL.md")
     matches.sort(key=lambda p: str(p.relative_to(root)))
     return matches
+
+
+def _seed_dir_names() -> set[str]:
+    """Return the set of top-level directory names under the bundled seeds dir.
+
+    Used during scan to tag skills whose top-level dir matches a seed as
+    ``SkillSource.SEED``. Returns an empty set if the seeds dir is missing.
+    """
+    seeds_dir = Path(__file__).parent / "seeds"
+    if not seeds_dir.is_dir():
+        return set()
+    return {p.name for p in seeds_dir.iterdir() if p.is_dir()}
+
+
+def _resolve_source(fm_dict: dict[str, Any], default: SkillSource) -> SkillSource:
+    """Resolve SkillSource from frontmatter ``metadata.source`` (validated),
+    falling back to *default* when absent or invalid."""
+    raw = metadata_get(fm_dict, "source")
+    if raw:
+        try:
+            return SkillSource(str(raw).strip())
+        except ValueError:
+            return default
+    return default
+
+
+def _atomic_write(target: Path, content: str) -> None:
+    """Atomically write ``content`` (utf-8) to ``target``.
+
+    Writes to a temp file in the same directory, fsyncs, then ``os.replace``.
+    The temp file is created with mode 0600 (no execute bit), so script writes
+    never grant execute permission.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(target.parent), prefix=".__tmp_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
@@ -300,22 +552,78 @@ def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return raw, parts[2].lstrip("\n")
 
 
-def _frontmatter_from_dict(
-    raw: dict[str, Any], fallback_name: str, platforms: list[str]
-) -> SkillFrontmatter:
-    return SkillFrontmatter(
-        name=str(raw.get("name") or fallback_name),
-        description=str(raw.get("description") or ""),
-        version=str(raw.get("version") or ""),
-        platforms=list(platforms),
-        tags=list(raw.get("tags") or []),
-        related_skills=list(raw.get("related_skills") or []),
-        author=str(raw.get("author") or ""),
-        license=str(raw.get("license") or ""),
-        setup_help=raw.get("setup_help"),
-        required_env_vars=list(raw.get("required_env_vars") or []),
-        raw=raw,
-    )
+def _dump_frontmatter(fm: dict[str, Any]) -> str:
+    """Serialize a normalized frontmatter dict to a YAML string.
+
+    ``sort_keys=False`` preserves the stable order produced by
+    ``normalize_frontmatter``; ``default_flow_style=False`` emits readable
+    block style. The result has no trailing newline.
+    """
+    return yaml.safe_dump(
+        fm, sort_keys=False, allow_unicode=True, default_flow_style=False
+    ).strip()
+
+
+def _frontmatter_region(text: str) -> str | None:
+    """Return the frontmatter fence text (including the ``---`` delimiters)
+    or ``None`` if *text* has no frontmatter block."""
+    if not text.startswith("---"):
+        return None
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+    return "---" + parts[1] + "---"
+
+
+def _normalize_skill_content(content: str) -> str:
+    """Normalize the frontmatter of *content*; preserve the body verbatim.
+
+    Legacy top-level fields are sunk into ``metadata`` and the frontmatter is
+    re-serialized in stable order (only whitelist keys, empty fields omitted).
+
+    *Body preservation*: the exact text following the closing ``---`` --
+    including leading blank lines -- is kept unchanged. Only the frontmatter
+    block is re-serialized.
+
+    *No-frontmatter files*: if *content* has no frontmatter block or an empty
+    frontmatter mapping, it is returned unchanged so that body-only files are
+    never given a synthetic frontmatter block.
+
+    Raises ``SkillScanError`` if the frontmatter YAML is a non-mapping.
+    """
+    if not content.startswith("---"):
+        return content
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return content
+    raw = yaml.safe_load(parts[1]) or {}
+    if not isinstance(raw, dict):
+        raise SkillScanError("frontmatter is not a mapping")
+    if not raw:
+        # Empty frontmatter mapping (e.g. ``---\n---\nbody``). Return as-is.
+        return content
+    try:
+        normalized = normalize_frontmatter(raw)
+    except SkillFormatError:
+        normalized = raw
+    raw_body = parts[2]
+    if raw_body and not raw_body.startswith("\n"):
+        raw_body = "\n" + raw_body
+    if not normalized:
+        # All fields were unknown/dropped; write body without a frontmatter
+        # block rather than an empty ``---\n{}\n---`` fence.
+        return raw_body.lstrip("\n")
+    yaml_str = _dump_frontmatter(normalized)
+    return f"---\n{yaml_str}\n---{raw_body}"
+
+
+def _format_detail(errors: list[str], warnings: list[str]) -> str:
+    """Combine format errors and warnings into a detail string (max 500 chars).
+
+    Errors come first, then warnings, joined by `` | ``.
+    """
+    parts = list(errors) + list(warnings)
+    return " | ".join(parts)[:500]
 
 
 _INLINE_SHELL_RE = re.compile(r"!`([^`]+)`")

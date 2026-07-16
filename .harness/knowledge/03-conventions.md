@@ -15,6 +15,7 @@
 - 源码按 DDD 分层目录组织：`domain/`、`application/`、`infrastructure/`、`interfaces/`
 - `app/main.py` 是唯一负责组装 Infrastructure 具体实现的位置
 - 新增业务能力时优先在 Domain 定义模型/端口，再由 Application 编排，最后由 Infrastructure/Interfaces 实现外部细节
+- 面向用户/LLM/调试输出的 JSON 序列化必须用 `ensure_ascii=False`，保证中文等非 ASCII 字符以原文存储与展示；仅审计日志等需要字节级哈希稳定的场景用 `ensure_ascii=True`（见 `host_terminal_tool_executor.py` 的 safe_reason）
 
 ## DDD 依赖方向
 

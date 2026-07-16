@@ -401,11 +401,22 @@
 [20260715]
 - FR
     - 安全：Schedule，Policy未展示 工具source_type!=agent的默认约束
+    - 沙盒：删除local类型的Sandbox(结论：不删除，local是docker的降级、在Sandbox子域，host_terminal在宿主子域、不在Sandbox子域)
     - 工具：[KF]新增宿主执行器host_terminal，terminal维持Sandbox执行
     - 工具：迁移`拍照上传`Skill到N-Agent
         - 迭代：Skill拍照上传，照片命名格式 改为 `photo_${电脑名称}_${yymmddHHMMSS}.${照片格式}`，如 photo_nieans-macbook-airm5_260715100016.jpg
         - 迭代：拍照上传成功后，Chat框 ①OSS链接 渲染为Link(不要展示url地址)，②Chat框展示照片预览
         - 迭代：新增飞书IM定时任务，每天10:00和18:00执行`Skill拍照上传`，并把任务执行结果、图片链接、图片预览投递到飞书聊天框
+
+[20260716]
+- FR
+    - 对话：工具调用信息，正确展示中文
+    - 对话：在Dashboard Chat上，无法`飞书类型的会话`发消息
+    - 工具：[KF]Skill支持自进化
+        - 要求：参照HermesAgent实现/Users/niean/code/github.com/niean/hermes-agent
+        - 前端：skills列表，干掉左上角两个按钮Skill列表、待审批，去掉左上角的新增按钮，列表不展示列平台、置顶、调用次数，详情弹框去掉置顶按钮、使用统计
+        - 前端：skills列表，排序按 先来源(seed/user/agent)、后ASC(名称)
+        - Skill：Skill定义，严格遵循Anthropic规范，此外要求英文命名+中文alias
 
 
 ---
@@ -413,11 +424,12 @@
 [待办]
 - HE
 - NFR
+    - 文档：Skill自进化原理
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
 - FR
-    - 工具：Skill自进化，参考HermesAgent的实现/Users/niean/code/github.com/niean/hermes-agent
+    - 工具：Skill自进化，Curator周期维护
     - 架构：MoA，对标Hermes
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明
     - 租户：引入租户概念，如团队、项目、个人，租户间特定资源隔离

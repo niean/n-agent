@@ -316,3 +316,18 @@ def test_context_compression_target_ratio_equal_threshold_rejected():
 def test_context_length_min_value():
     with pytest.raises(ValidationError):
         Settings(_env_file=None, context_length=100)  # < 1024
+
+
+def test_skill_evolution_settings_defaults(monkeypatch):
+    from app.config import Settings
+    s = Settings(_env_file=None)
+    assert s.skills_creation_nudge_interval == 10
+    assert s.skills_background_review_max_iterations == 16
+    assert s.skills_background_review_timeout_seconds == 120
+    assert s.skills_write_approval is False
+    assert s.skills_guard_agent_created is True
+    assert s.skills_backup_enabled is True
+    assert s.skills_backup_keep == 10
+    assert s.skills_archive_not_delete is True
+    assert s.skills_background_review_enabled is True
+    assert s.skills_background_review_max_concurrent == 1

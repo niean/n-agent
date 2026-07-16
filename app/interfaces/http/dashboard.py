@@ -36,7 +36,7 @@ from app.application.schedule_service import (
     ScheduleServiceError,
     ScheduleValidationError,
 )
-from app.application.session_bootstrap import SessionBootstrapReader, SessionScopeMismatchError
+from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.session_service import SessionService
 from app.application.skill_service import SkillInput, SkillScanReport, SkillScanWarning, SkillService
 from app.application.tool_service import ToolService
@@ -107,6 +107,8 @@ def create_dashboard_router(
     memory_store=None,
     chat_service: ChatCompletionService | None = None,
     policy_dashboard_service=None,
+    skill_pending_store=None,
+    skill_usage_store=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -194,20 +196,22 @@ def create_dashboard_router(
             payload: dict = Body(...),
             x_session_id: str | None = Header(default=None),
         ):
-            # Dashboard /chat/completions requires an existing source=dashboard session.
+            # Dashboard is a cross-source operator/debug UI: the session list shows every
+            # session regardless of origin, so the operator may continue any existing
+            # session (dashboard/api/cli/feishu/dingtalk/wecom/acp/schedule). The session's
+            # persisted source is preserved -- describe_unchecked does not rewrite it and
+            # raises no scope error; only the ingress source is "dashboard" because the
+            # request entered via the Dashboard. (pre-8649dc4 the Dashboard posted to
+            # /v1/chat/completions with no source check; this restores that capability.)
             # No implicit create -- new sessions must be created via /chat/sessions first.
             if not x_session_id:
                 return JSONResponse(
                     status_code=409,
                     content={"error": {"code": "dashboard_session_scope_mismatch", "message": "X-Session-ID required for dashboard chat"}},
                 )
-            try:
-                descriptor = await _dashboard_bootstrap.describe(x_session_id, expected_source="dashboard")
-            except SessionScopeMismatchError:
-                return JSONResponse(
-                    status_code=409,
-                    content={"error": {"code": "dashboard_session_scope_mismatch", "message": "session scope mismatch: expected dashboard"}},
-                )
+            descriptor = await _dashboard_bootstrap.describe_unchecked(
+                x_session_id, provisional_source="dashboard"
+            )
             if not descriptor.exists:
                 return JSONResponse(
                     status_code=409,
@@ -280,7 +284,7 @@ def create_dashboard_router(
     if schedule_service is not None:
         _register_schedule_routes(router, schedule_service)
     if skill_service is not None:
-        _register_skill_routes(router, skill_service)
+        _register_skill_routes(router, skill_service, skill_pending_store, skill_usage_store)
     if plugin_service is not None:
         from app.interfaces.http.plugin_routes import register_plugin_routes
         register_plugin_routes(router, plugin_service)
@@ -1043,6 +1047,16 @@ def _skill_error_response(exc: Exception) -> JSONResponse:
 
 
 def _skill_to_dict(skill) -> dict:
+    last_scan_error = skill.last_scan_error
+    format_status = (
+        "warning"
+        if last_scan_error in {"format_warning", "injection_warning"}
+        else "valid"
+    )
+    # No DB column persists full scan warning detail; surface the error
+    # category so the UI can show something actionable. Future work may
+    # store SkillScanWarning detail on the Skill.
+    format_messages = [last_scan_error] if last_scan_error else []
     return {
         "id": skill.id,
         "name": skill.name,
@@ -1051,8 +1065,11 @@ def _skill_to_dict(skill) -> dict:
         "platforms": skill.platforms,
         "enabled": skill.enabled,
         "readiness": skill.readiness.value,
+        "source": skill.source.value,
         "last_scan_status": skill.last_scan_status,
         "last_scan_error": skill.last_scan_error,
+        "format_status": format_status,
+        "format_messages": format_messages,
         "frontmatter": skill.frontmatter.raw,
     }
 
@@ -1095,7 +1112,53 @@ def _skill_platforms_from_payload(value) -> list[str]:
     raise SkillValidationError("platforms must be a string list")
 
 
-def _register_skill_routes(router: APIRouter, skill_service: SkillService) -> None:
+def _skill_pending_to_dict(pw) -> dict:
+    return {
+        "pending_id": pw.pending_id,
+        "action": pw.action.value if hasattr(pw.action, "value") else str(pw.action),
+        "skill_name": pw.skill_name,
+        "origin": pw.origin.value if hasattr(pw.origin, "value") else str(pw.origin),
+        "summary": pw.summary,
+        "state": pw.state,
+        "created_at": pw.created_at.isoformat() if pw.created_at else None,
+    }
+
+
+def _skill_usage_to_dict(name: str, usage) -> dict:
+    return {
+        "name": name,
+        "created_by": usage.created_by,
+        "use_count": usage.use_count,
+        "view_count": usage.view_count,
+        "patch_count": usage.patch_count,
+        "state": usage.state,
+        "pinned": usage.pinned,
+        "created_at": usage.created_at.isoformat() if usage.created_at else None,
+        "last_used_at": usage.last_used_at.isoformat() if usage.last_used_at else None,
+        "last_viewed": usage.last_viewed.isoformat() if usage.last_viewed else None,
+        "last_patched_at": usage.last_patched_at.isoformat() if usage.last_patched_at else None,
+    }
+
+
+def _skill_manage_result_to_dict(result) -> dict:
+    return {
+        "success": result.success,
+        "staged": result.staged,
+        "pending_id": result.pending_id,
+        "skill_name": result.skill_name,
+        "action": result.action.value if hasattr(result.action, "value") else str(result.action),
+        "summary": result.summary,
+        "diff": result.diff,
+        "error": result.error,
+    }
+
+
+def _register_skill_routes(
+    router: APIRouter,
+    skill_service: SkillService,
+    skill_pending_store=None,
+    skill_usage_store=None,
+) -> None:
     @router.get("/chat/skills")
     async def list_skills():
         items = await skill_service.list_skills(include_disabled=True)
@@ -1108,6 +1171,102 @@ def _register_skill_routes(router: APIRouter, skill_service: SkillService) -> No
         except Exception as exc:
             return _skill_error_response(exc)
         return _skill_to_dict(skill)
+
+    # ---- literal routes: must be registered BEFORE {name} catch-all ----
+
+    if skill_pending_store is not None:
+        @router.get("/chat/skills/pending")
+        async def list_pending():
+            items = await skill_pending_store.list()
+            return {"pending": [_skill_pending_to_dict(pw) for pw in items]}
+
+        @router.get("/chat/skills/pending/{pending_id}/diff")
+        async def get_pending_diff(pending_id: str):
+            pw = await skill_pending_store.get(pending_id)
+            if pw is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": {"code": "skill_pending_not_found", "message": f"pending write {pending_id} not found"}},
+                )
+            return {"diff": pw.diff, "summary": pw.summary}
+
+        @router.post("/chat/skills/pending/{pending_id}/approve")
+        async def approve_pending(pending_id: str):
+            result = await skill_service.approve_pending(pending_id)
+            if not result.success and result.error == "pending_not_found_or_taken":
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": {"code": "skill_pending_not_found", "message": f"pending write {pending_id} not found or already taken"}},
+                )
+            return _skill_manage_result_to_dict(result)
+
+        @router.post("/chat/skills/pending/{pending_id}/reject")
+        async def reject_pending(pending_id: str):
+            ok = await skill_pending_store.reject(pending_id)
+            return {"rejected": ok}
+
+        @router.post("/chat/skills/pending/approve-all")
+        async def approve_all_pending():
+            items = await skill_pending_store.list()
+            approved = 0
+            for pw in items:
+                result = await skill_service.approve_pending(pw.pending_id)
+                if result.success:
+                    approved += 1
+            return {"approved": approved}
+
+        @router.post("/chat/skills/pending/reject-all")
+        async def reject_all_pending():
+            items = await skill_pending_store.list()
+            rejected = 0
+            for pw in items:
+                ok = await skill_pending_store.reject(pw.pending_id)
+                if ok:
+                    rejected += 1
+            return {"rejected": rejected}
+
+    if skill_usage_store is not None:
+        @router.get("/chat/skills/usage")
+        async def list_skill_usage():
+            skills = await skill_service.list_skills(include_disabled=True)
+            usage_list = []
+            for s in skills:
+                usage = await skill_usage_store.get(s.name)
+                if usage is not None:
+                    usage_list.append(_skill_usage_to_dict(s.name, usage))
+            return {"usage": usage_list}
+
+    @router.post("/chat/skills/refresh")
+    async def refresh_skills():
+        try:
+            report = await skill_service.scan_now()
+        except Exception as exc:
+            return _skill_error_response(exc)
+        return {
+            "skills_count": report.skills_count,
+            "warnings": [
+                {
+                    "relative_path": w.relative_path,
+                    "reason": w.reason,
+                    "detail": w.detail,
+                    "first_path": w.first_path,
+                }
+                for w in report.warnings
+            ],
+        }
+
+    if skill_usage_store is not None:
+        @router.patch("/chat/skills/{name}/pin")
+        async def pin_skill(name: str, payload: dict = Body(...)):
+            try:
+                await skill_service.get(name)
+            except SkillNotFoundError as exc:
+                return _skill_error_response(exc)
+            pinned = bool(payload.get("pinned", False))
+            await skill_usage_store.set_pinned(name, pinned)
+            return {"pinned": pinned}
+
+    # ---- catch-all {name} routes: registered AFTER literal routes ----
 
     @router.get("/chat/skills/{name}")
     async def get_skill(name: str):
@@ -1144,25 +1303,6 @@ def _register_skill_routes(router: APIRouter, skill_service: SkillService) -> No
         except Exception as exc:
             return _skill_error_response(exc)
         return Response(status_code=204)
-
-    @router.post("/chat/skills/refresh")
-    async def refresh_skills():
-        try:
-            report = await skill_service.scan_now()
-        except Exception as exc:
-            return _skill_error_response(exc)
-        return {
-            "skills_count": report.skills_count,
-            "warnings": [
-                {
-                    "relative_path": w.relative_path,
-                    "reason": w.reason,
-                    "detail": w.detail,
-                    "first_path": w.first_path,
-                }
-                for w in report.warnings
-            ],
-        }
 
 
 

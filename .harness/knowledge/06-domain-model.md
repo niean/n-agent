@@ -157,7 +157,7 @@ Context Frame
 │
 ├─ 2. Session Context
 │  └─ ConversationMessage：head + latest summary + tail
-│     └─ compression：历史消息按需压缩，得到滚动摘要summary
+│     └─ compression：历史消息滚动压缩，最新摘要latest summary
 │
 ├─ 3. Turn Context
 │  ├─ 本轮 input messages
@@ -181,8 +181,6 @@ ProviderContext
 
 AgentGraphRunner 再组合 ProviderContext + model + options，调用 llm_provider.chat(...)
 ```
-
-消息压缩：历史消息采用三段式压缩，head 保护首 3 条 + middle LLM 摘要 + tail 末 10 条；本次摘要 = llm_summary(上次摘要 + 新增消息)，滚动更新。
 
 
 <details markdown="1">
@@ -425,6 +423,14 @@ Tool -->|特化适配| Plugin
 Tool -->|代码执行| Code
 Code -->|运行于| Sandbox
 ```
+
+## 消息压缩
+历史消息采用三段式压缩，收尾保护N条、中间滚动压缩，`head 3 + middle llm summary + tail 10`；最新摘要 = llm_summary(上次摘要 + 新增消息)，滚动更新。
+
+
+## Skill自进化
+
+
 
 ---
 ---

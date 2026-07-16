@@ -181,7 +181,7 @@ mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema
 knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 external_memory_providers(id, name UNIQUE, provider_type, base_url, api_key, enabled, extra_config, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 external_memory_global_config(id INTEGER PRIMARY KEY CHECK (id = 1), enabled_providers TEXT, updated_at)
-skills(id, name UNIQUE, relative_path, description, platforms_json, frontmatter_json, enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at)
+skills(id, name UNIQUE, relative_path, description, platforms_json, frontmatter_json, enabled, readiness, last_scan_status, last_scan_error, last_seen_at, source, created_at, updated_at)
 plugins(id, key UNIQUE, name, version, description, author, kind, source, source_path, enabled, config_json, capabilities_json, manifest_json, last_scan_status, last_scan_error, last_scanned_at, created_at, updated_at)
 plugin_secrets(plugin_key, field_name, secret_value, updated_at, PRIMARY KEY(plugin_key, field_name), FOREIGN KEY(plugin_key) REFERENCES plugins(key) ON DELETE CASCADE)
 scheduled_tasks(id, name, prompt, cron_expression, timezone, enabled, status, session_id, origin_json, delivery_target, delivery_context_json, execution_policy_json, next_run_at, lease_until, lease_owner, claim_id, last_run_at, last_status, last_error, last_delivery_error, unread_count, created_at, updated_at)
@@ -190,6 +190,8 @@ sandbox_released_history(id, session_id, sandbox_type, sandbox_id, created_at, r
 sandbox_execution_history(id, session_id, code_hash, code, result_json, status, duration_ms, authorized_callback_tools_json, created_at, execution_type)
 usage_records(id, session_id, model, provider, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, estimated_cost_usd, cost_status, latency_ms, created_at)
 compression_stats(id, session_id, before_tokens, after_tokens, tokens_saved, compression_ratio, created_at)
+skill_usage(name PRIMARY KEY, created_by, use_count, view_count, patch_count, created_at, last_used_at, last_viewed, last_patched_at, state, pinned, archived_at)
+skill_pending_writes(pending_id PRIMARY KEY, action, skill_name, origin, summary, diff, payload_json, state, error, created_at, updated_at)
 ```
 
 sessions 表 token/cost 列（迁移幂等，由 `SqliteUsageRecorder.init` 通过 `PRAGMA table_info` 检查列存在再 `ALTER TABLE ADD COLUMN`）：
@@ -214,6 +216,8 @@ CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active
 ```
 
 该 partial unique index 保证全表至多一条 active 记录，由 `SQLiteProviderRegistry.set_active` 通过先 `UPDATE is_active=0 WHERE is_active=1` 再 `UPDATE is_active=1 WHERE id=?` 实现切换；providers.api_key 与 knowledge_bases.api_key 列以明文形式落地 `locals/sessions.db`，依赖 Docker volume 持久化与文件系统隔离保护，不通过 HTTP 暴露、不写入日志。KnowledgeBase 更新中 `api_key=None` 表示保持不变，空字符串表示清空，非空字符串表示覆盖。external_memory_providers 表存储 mem0/holographic/honcho 三类检索记忆 provider 配置，`at-most-one-enabled` 约束由 `SQLiteExternalMemoryProviderRegistry._assert_no_other_enabled` 在 create/update enabled=True 时校验；api_key 三态更新同 providers/knowledge_bases；holographic adapter 的 facts 数据存储在 extra_config.db_path 指向的独立 SQLite 文件（默认 `locals/external-memory/holographic.db`），不与 sessions.db 共享。
+
+skills 表 source 列（TEXT NOT NULL DEFAULT 'user'）记录 SkillSource（seed/agent/user），迁移幂等（PRAGMA table_info 检查列存在再 ALTER TABLE ADD COLUMN）；replace_all 操作保留既有 source 值，防止 agent/seed 来源的 Skill 被 rescan 降级为 user。skill_usage 表与 skill_pending_writes 表分别由 SkillUsageStore、SkillPendingStore 实现，与 sessions.db 共享 path 但使用独立连接：skill_usage 记录 Skill 使用遥测（use_count/view_count/patch_count 等），skill_pending_writes 在 write_approval gate 开启时持久化 staged writes，state 取值 pending/approved_in_progress/approved/rejected/failed，重启后仍存活。
 
 索引：
 
@@ -244,12 +248,15 @@ JSON 边界：
 - `mcp_tools.input_schema_json` 存储 MCP 远端工具 schema
 - `mcp_sites.args_json` 和 `mcp_sites.env_json` 存储 stdio MCP server 的参数数组和环境变量映射
 - `scheduled_tasks.origin_json` 存储任务来源上下文（platform、receive_id 等），`delivery_context_json` 存储投递目标上下文，`execution_policy_json` 存储执行策略（mode、tool_exposure_policy、allow_confirm_tools）
-- `skills.platforms_json` 存储适用平台列表，`frontmatter_json` 存储 skill 文件 frontmatter 元数据
+- `skills.platforms_json` 存储适用平台列表，`frontmatter_json` 存储 skill 文件 frontmatter 元数据，`source` 列记录 SkillSource（seed/agent/user）
+- `skill_pending_writes.payload_json` 存储 staged write 的 payload，`state` 列取值 pending/approved_in_progress/approved/rejected/failed，`diff` 列存储变更 diff（TEXT，非 JSON）
 - `plugins.config_json` 存储非敏感配置（明文），`plugins.capabilities_json` 存储 provides_tools/unsupported 能力声明，`plugins.manifest_json` 存储 plugin.yaml 完整 manifest；`plugin_secrets.secret_value` 存储 secret 明文（与 providers.api_key 同等保护级别，依赖文件系统隔离，不通过 HTTP 暴露、不写入日志）；`Plugin.to_public_view().secret_refs` 仅返回 `{field: bool}` 占位标记，由 registry 查询 plugin_secrets 表填充
 - `external_memory_global_config.enabled_providers` 存储全局启用的外部记忆 provider 名称列表
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
 
 会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。沙盒审计数据不属于 Chat Session 级联删除范围：`sandbox_released_history` 与 `sandbox_execution_history` 由沙盒 Dashboard 显式删除动作或运维清理策略处理，释放沙盒和删除会话均不应自动删除这些长期历史。
+
+Skill 自进化文件系统存储边界：SKILLS_ROOT 下维护两个特殊目录。`.archive/<name>-<utc-iso>/` 由 delete_skill/remove_linked_file 写入，采用 archive-not-delete 策略，归档内容可恢复。`.backups/<utc-iso>-<uuid>/skills.tar.gz` 由 SkillBackupStore 创建快照（打包时排除 .backups 与 .archive 目录），rollback 时先将当前 skills 目录归档到 `.archive/rollback-<iso>/`，再解包快照覆盖。
 
 ## OpenAI-compatible 协议边界
 

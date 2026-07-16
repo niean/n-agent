@@ -47,6 +47,18 @@ class Settings(BaseSettings):
     skills_max_view_bytes: int = Field(default=131072, ge=1024)
     skills_max_count: int = Field(default=200, ge=1, le=2000)
 
+    # Skill 自进化配置
+    skills_creation_nudge_interval: int = Field(default=10)
+    skills_background_review_enabled: bool = Field(default=True)
+    skills_background_review_max_iterations: int = Field(default=16)
+    skills_background_review_timeout_seconds: int = Field(default=120)
+    skills_background_review_max_concurrent: int = Field(default=1)
+    skills_write_approval: bool = Field(default=False)
+    skills_guard_agent_created: bool = Field(default=True)
+    skills_backup_enabled: bool = Field(default=True)
+    skills_backup_keep: int = Field(default=10)
+    skills_archive_not_delete: bool = Field(default=True)
+
     # Restricted host-terminal bridge (disabled unless every required value is set)
     host_terminal_enabled: bool = Field(default=False)
     host_terminal_bridge_url: str = Field(default="")

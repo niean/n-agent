@@ -438,7 +438,7 @@ def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
         tool_calls = content.get("tool_calls") or []
         content = content.get("content", "")
     if message.role == "tool" and not isinstance(content, str):
-        content = json.dumps(content)
+        content = json.dumps(content, default=str, ensure_ascii=False)
     data = {"role": message.role, "content": content}
     if tool_calls:
         data["tool_calls"] = tool_calls

@@ -23,6 +23,7 @@ from app.application.host_terminal_capability import (
     is_photo_capability_request,
     is_photo_capability_result,
 )
+from app.application.skill_service import skill_manage_tool_definition
 
 if TYPE_CHECKING:
     from app.application.budget_service import BudgetService
@@ -117,6 +118,27 @@ class ToolService:
         for dynamic in self.dynamic_definitions.values():
             definitions.extend(dynamic.values())
         return definitions
+
+    def build_filtered_definitions(
+        self,
+        allow_toolsets: set[str] | None = None,
+        allow_tool_names: set[str] | None = None,
+    ) -> list[ToolDefinition]:
+        """Return list_definitions() filtered by toolset and/or tool name.
+
+        When ``allow_toolsets`` is given, only definitions whose ``toolset``
+        is in the set are kept. When ``allow_tool_names`` is given, only
+        definitions whose ``name`` is in the set are kept. When both are
+        given, both filters apply (AND semantics).
+        """
+        result: list[ToolDefinition] = []
+        for definition in self.list_definitions():
+            if allow_toolsets is not None and definition.toolset not in allow_toolsets:
+                continue
+            if allow_tool_names is not None and definition.name not in allow_tool_names:
+                continue
+            result.append(definition)
+        return result
 
     def get_definition(self, name: str) -> ToolDefinition | None:
         if name in self.definitions:
@@ -518,6 +540,7 @@ def builtin_tool_definitions(web_fetch_enabled: bool = True) -> list[ToolDefinit
             source_type=ToolSourceType.BUILTIN,
             toolset="vision",
         ),
+        skill_manage_tool_definition(),
     ]
 
 

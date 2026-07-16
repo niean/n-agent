@@ -11,8 +11,8 @@ def _write_skill(root, rel, body):
 
 @pytest.mark.asyncio
 async def test_scan_basic_and_nested(tmp_path):
-    _write_skill(tmp_path, "alpha/SKILL.md", "---\nname: alpha\ndescription: a\nplatforms: [linux]\n---\nbody\n")
-    _write_skill(tmp_path, "mlops/wandb/SKILL.md", "---\nname: wandb\nplatforms: [linux]\n---\nbody\n")
+    _write_skill(tmp_path, "alpha/SKILL.md", "---\nname: alpha\ndescription: alpha skill (阿尔法)\nmetadata:\n  platforms: linux\n---\nbody\n")
+    _write_skill(tmp_path, "mlops/wandb/SKILL.md", "---\nname: wandb\ndescription: wandb skill (权重看板)\nmetadata:\n  platforms: linux\n---\nbody\n")
     loader = SkillFileLoader(SkillFileLoaderConfig(root=tmp_path, current_platform="linux"))
     skills, warnings = await loader.scan()
     names = {s.name for s in skills}
@@ -26,7 +26,8 @@ async def test_name_fallback_to_dir(tmp_path):
     loader = SkillFileLoader(SkillFileLoaderConfig(root=tmp_path, current_platform="linux"))
     skills, warnings = await loader.scan()
     assert {s.name for s in skills} == {"fallback"}
-    assert warnings == []
+    # Missing name -> format_warning (non-blocking); no critical warnings.
+    assert all(w.reason == "format_warning" for w in warnings)
 
 
 @pytest.mark.asyncio

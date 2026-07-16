@@ -116,6 +116,18 @@ def test_static_assets_served(tmp_path):
         assert response.status_code == 200, f"missing {path}"
 
 
+def test_skills_js_renders_format_status(tmp_path):
+    client = _client(tmp_path)
+    skills_js = client.get("/static/skills.js").text
+    # T10: skills.js renders the format_status column badge using safe DOM
+    # text (textContent), never innerHTML. (Detail modal does not show
+    # format_messages.)
+    assert "format_status" in skills_js
+    assert "textContent" in skills_js
+    assert "innerHTML" not in skills_js
+
+
+
 def test_external_memory_static_asset_is_plain_javascript(tmp_path):
     client = _client(tmp_path)
     body = client.get('/static/external-memory.js').text

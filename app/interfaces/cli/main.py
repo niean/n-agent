@@ -443,6 +443,38 @@ def build_parser() -> argparse.ArgumentParser:
     skill_view_parser.add_argument("name")
     _add_format_flags(skill_view_parser)
 
+    skill_pending_parser = skill_subparsers.add_parser("pending", help="List pending skill writes")
+    _add_format_flags(skill_pending_parser)
+
+    skill_diff_parser = skill_subparsers.add_parser("diff", help="Show diff of a pending write")
+    skill_diff_parser.add_argument("pending_id")
+    _add_format_flags(skill_diff_parser)
+
+    skill_approve_parser = skill_subparsers.add_parser("approve", help="Approve a pending write")
+    skill_approve_parser.add_argument("pending_id")
+    _add_format_flags(skill_approve_parser)
+
+    skill_reject_parser = skill_subparsers.add_parser("reject", help="Reject a pending write")
+    skill_reject_parser.add_argument("pending_id")
+    _add_format_flags(skill_reject_parser)
+
+    skill_approve_all_parser = skill_subparsers.add_parser("approve-all", help="Approve all pending writes")
+    _add_format_flags(skill_approve_all_parser)
+
+    skill_reject_all_parser = skill_subparsers.add_parser("reject-all", help="Reject all pending writes")
+    _add_format_flags(skill_reject_all_parser)
+
+    skill_pin_parser = skill_subparsers.add_parser("pin", help="Pin a skill")
+    skill_pin_parser.add_argument("name")
+    _add_format_flags(skill_pin_parser)
+
+    skill_unpin_parser = skill_subparsers.add_parser("unpin", help="Unpin a skill")
+    skill_unpin_parser.add_argument("name")
+    _add_format_flags(skill_unpin_parser)
+
+    skill_usage_parser = skill_subparsers.add_parser("usage", help="List skill usage telemetry")
+    _add_format_flags(skill_usage_parser)
+
     plugin_parser = subparsers.add_parser("plugin", help="Plugin commands")
     plugin_subparsers = plugin_parser.add_subparsers(dest="plugin_command")
     plugin_list_parser = plugin_subparsers.add_parser("list", help="List plugins")

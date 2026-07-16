@@ -9,6 +9,8 @@
   }
 
   let skills = [];
+  let pendingItems = [];
+  let usageMap = {};
 
   function render() {
     const node = root();
@@ -20,30 +22,37 @@
     const title = ui.el('span');
     title.textContent = 'Skills';
     const actions = ui.el('span', 'panel-actions');
-    const addBtn = ui.el('button', 'btn');
-    addBtn.type = 'button';
-    addBtn.textContent = '新增';
-    addBtn.addEventListener('click', () => openForm(null));
     const refreshBtn = ui.el('button', 'btn');
     refreshBtn.type = 'button';
     refreshBtn.textContent = '扫描';
     refreshBtn.addEventListener('click', refresh);
-    actions.append(addBtn, refreshBtn);
+    actions.append(refreshBtn);
     header.append(title, actions);
     panel.appendChild(header);
 
     const body = ui.el('div', 'panel-body');
-    if (!skills.length) {
+    renderListBody(body);
+    panel.appendChild(body);
+    node.appendChild(panel);
+  }
+
+  function renderListBody(body) {
+    if (!skills.length && !pendingItems.length) {
       ui.renderEmpty(body, '尚未发现 Skill；请检查 skills_root 配置或点击重扫描');
-      panel.appendChild(body);
-      node.appendChild(panel);
       return;
     }
 
-    const table = ui.el('table', 'document-table');
+    // 待审批写入按 skill_name 索引：既有 skill 行内显示"待审批"并提供审批/拒绝；
+    // 不在列表中的 pending（新建）追加为独立行，统一在状态列体现待审批。
+    const pendingByName = new Map();
+    pendingItems.forEach((pw) => {
+      if (pw && pw.skill_name) pendingByName.set(pw.skill_name, pw);
+    });
+
+    const table = ui.el('table', 'document-table skills-table');
     const thead = ui.el('thead');
     const trh = ui.el('tr');
-    ['名称', '描述', '平台', '就绪状态', '启用', '扫描状态', '操作'].forEach((h) => {
+    ['名称', '描述', '来源', '就绪状态', '启用状态', '健康状态', '扫描状态', '格式状态', '操作'].forEach((h) => {
       const th = ui.el('th');
       th.textContent = h;
       trh.appendChild(th);
@@ -52,57 +61,166 @@
     table.appendChild(thead);
 
     const tbody = ui.el('tbody');
-    skills.forEach((s) => tbody.appendChild(renderRow(s)));
+    const existingNames = new Set(skills.map((s) => s.name));
+    // 列表排序：先按来源(seed/user/agent)、再按 ASC(名称)
+    const SOURCE_ORDER = { seed: 0, user: 1, agent: 2 };
+    const sorted = skills.slice().sort((a, b) => {
+      const oa = SOURCE_ORDER[a.source] ?? 99;
+      const ob = SOURCE_ORDER[b.source] ?? 99;
+      if (oa !== ob) return oa - ob;
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+    });
+    sorted.forEach((s) => tbody.appendChild(renderRow(s, pendingByName.get(s.name))));
+    pendingItems.forEach((pw) => {
+      if (pw && pw.skill_name && !existingNames.has(pw.skill_name)) {
+        tbody.appendChild(renderPendingCreateRow(pw));
+      }
+    });
     table.appendChild(tbody);
     body.appendChild(table);
-    panel.appendChild(body);
-    node.appendChild(panel);
   }
 
-  function renderRow(s) {
+  function renderRow(s, pending) {
     const tr = ui.el('tr');
-    ['name', 'description', 'platforms', 'readiness', 'enabled', 'last_scan_status'].forEach((key) => {
+    const usage = usageMap[s.name] || {};
+    // 名称、描述
+    ['name', 'description'].forEach((key) => {
+      const td = ui.el('td');
+      const v = s[key];
+      td.textContent = Array.isArray(v) ? v.join(',') : (v === null || v === undefined ? '' : String(v));
+      tr.appendChild(td);
+    });
+
+    // 来源（Skill.source：seed/agent/user）
+    const tdSource = ui.el('td');
+    tdSource.textContent = s.source || '-';
+    tr.appendChild(tdSource);
+
+    // 就绪状态、启用状态
+    ['readiness', 'enabled'].forEach((key) => {
       const td = ui.el('td');
       const v = s[key];
       if (key === 'enabled') {
         const badge = ui.el('span', 'badge badge--' + (s.enabled ? 'success' : 'warning'));
         badge.textContent = s.enabled ? '启用' : '停用';
         td.appendChild(badge);
-      } else if (key === 'readiness') {
+      } else {
         const isOk = v === 'available';
         const badge = ui.el('span', 'badge badge--' + (isOk ? 'success' : 'warning'));
         badge.textContent = v == null ? '' : String(v);
         td.appendChild(badge);
-      } else if (key === 'last_scan_status') {
-        const isOk = v === 'ok' || v === 'manual' || v == null || v === '';
-        const badge = ui.el('span', 'badge badge--' + (isOk ? 'success' : 'warning'));
-        badge.textContent = v == null || v === '' ? '未扫描' : String(v);
-        td.appendChild(badge);
-      } else {
-        td.textContent = Array.isArray(v) ? v.join(',') : (v === null || v === undefined ? '' : String(v));
       }
       tr.appendChild(td);
     });
+
+    const tdState = ui.el('td');
+    if (pending) {
+      const pendingBadge = ui.el('span', 'badge badge--warning');
+      pendingBadge.textContent = '待审批';
+      tdState.appendChild(pendingBadge);
+    } else {
+      const stateBadge = ui.el('span', 'badge badge--' + (usage.state === 'active' || !usage.state ? 'success' : 'warning'));
+      stateBadge.textContent = usage.state || 'active';
+      tdState.appendChild(stateBadge);
+    }
+    tr.appendChild(tdState);
+
+    const tdScan = ui.el('td');
+    const scanV = s.last_scan_status;
+    const isOk = scanV === 'ok' || scanV === 'manual' || scanV == null || scanV === '';
+    const scanBadge = ui.el('span', 'badge badge--' + (isOk ? 'success' : 'warning'));
+    scanBadge.textContent = scanV == null || scanV === '' ? '未扫描' : String(scanV);
+    tdScan.appendChild(scanBadge);
+    tr.appendChild(tdScan);
+
+    // 格式状态（Anthropic 规范合规性，从 last_scan_error 派生）
+    const tdFmt = ui.el('td');
+    const fmtOk = s.format_status === 'valid';
+    const fmtBadge = ui.el('span', 'badge badge--' + (fmtOk ? 'success' : 'warning'));
+    fmtBadge.textContent = fmtOk ? '合规' : (s.format_status ? String(s.format_status) : '');
+    tdFmt.appendChild(fmtBadge);
+    tr.appendChild(tdFmt);
+
     const td = ui.el('td');
     td.className = 'row-actions-cell';
     const group = ui.el('div', 'row-actions');
-    const viewBtn = ui.el('button', 'btn');
-    viewBtn.type = 'button';
-    viewBtn.textContent = '详情';
-    viewBtn.addEventListener('click', () => openDetail(s.name));
-    const editBtn = ui.el('button', 'btn');
-    editBtn.type = 'button';
-    editBtn.textContent = '编辑';
-    editBtn.addEventListener('click', () => openForm(s));
-    const toggle = ui.el('button', 'btn');
-    toggle.type = 'button';
-    toggle.textContent = s.enabled ? '停用' : '启用';
-    toggle.addEventListener('click', () => toggleEnabled(s.name, !s.enabled));
-    const del = ui.el('button', 'btn');
-    del.type = 'button';
-    del.textContent = '删除';
-    del.addEventListener('click', () => deleteSkill(s.name));
-    group.append(toggle, editBtn, del, viewBtn);
+    if (pending) {
+      const diffBtn = ui.el('button', 'btn');
+      diffBtn.type = 'button';
+      diffBtn.textContent = 'diff';
+      diffBtn.addEventListener('click', () => openDiffModal(pending.pending_id));
+      const approveBtn = ui.el('button', 'btn primary');
+      approveBtn.type = 'button';
+      approveBtn.textContent = '审批';
+      approveBtn.addEventListener('click', () => approvePendingItem(pending.pending_id));
+      const rejectBtn = ui.el('button', 'btn');
+      rejectBtn.type = 'button';
+      rejectBtn.textContent = '拒绝';
+      rejectBtn.addEventListener('click', () => rejectPendingItem(pending.pending_id));
+      group.append(diffBtn, approveBtn, rejectBtn);
+    } else {
+      const viewBtn = ui.el('button', 'btn');
+      viewBtn.type = 'button';
+      viewBtn.textContent = '详情';
+      viewBtn.addEventListener('click', () => openDetail(s.name));
+      const editBtn = ui.el('button', 'btn');
+      editBtn.type = 'button';
+      editBtn.textContent = '编辑';
+      editBtn.addEventListener('click', () => openForm(s));
+      const toggle = ui.el('button', 'btn');
+      toggle.type = 'button';
+      toggle.textContent = s.enabled ? '停用' : '启用';
+      toggle.addEventListener('click', () => toggleEnabled(s.name, !s.enabled));
+      const del = ui.el('button', 'btn');
+      del.type = 'button';
+      del.textContent = '删除';
+      del.addEventListener('click', () => deleteSkill(s.name));
+      group.append(toggle, editBtn, del, viewBtn);
+    }
+    td.appendChild(group);
+    tr.appendChild(td);
+    return tr;
+  }
+
+  // pending create（目标 skill 尚不在列表中）：以一行呈现，状态列标"待审批"，提供 diff/审批/拒绝
+  function renderPendingCreateRow(pw) {
+    const tr = ui.el('tr');
+    const tdName = ui.el('td');
+    tdName.textContent = (pw.skill_name || '(unknown)') + ' (新建)';
+    tr.appendChild(tdName);
+    // 描述 未知 -> 空单元格
+    tr.appendChild(ui.el('td'));
+    // 来源 未知
+    const tdCreatedBy = ui.el('td');
+    tdCreatedBy.textContent = '-';
+    tr.appendChild(tdCreatedBy);
+    // 就绪/启用 未知 -> 空单元格
+    for (let i = 0; i < 2; i += 1) tr.appendChild(ui.el('td'));
+    const tdState = ui.el('td');
+    const pendingBadge = ui.el('span', 'badge badge--warning');
+    pendingBadge.textContent = '待审批';
+    tdState.appendChild(pendingBadge);
+    tr.appendChild(tdState);
+    // 扫描状态 未知 -> 空单元格
+    tr.appendChild(ui.el('td'));
+    // 格式状态 未知 -> 空单元格
+    tr.appendChild(ui.el('td'));
+    const td = ui.el('td');
+    td.className = 'row-actions-cell';
+    const group = ui.el('div', 'row-actions');
+    const diffBtn = ui.el('button', 'btn');
+    diffBtn.type = 'button';
+    diffBtn.textContent = 'diff';
+    diffBtn.addEventListener('click', () => openDiffModal(pw.pending_id));
+    const approveBtn = ui.el('button', 'btn primary');
+    approveBtn.type = 'button';
+    approveBtn.textContent = '审批';
+    approveBtn.addEventListener('click', () => approvePendingItem(pw.pending_id));
+    const rejectBtn = ui.el('button', 'btn');
+    rejectBtn.type = 'button';
+    rejectBtn.textContent = '拒绝';
+    rejectBtn.addEventListener('click', () => rejectPendingItem(pw.pending_id));
+    group.append(diffBtn, approveBtn, rejectBtn);
     td.appendChild(group);
     tr.appendChild(td);
     return tr;
@@ -131,7 +249,7 @@
   }
 
   async function deleteSkill(name) {
-    if (!(await modal.confirm(`删除 Skill 元数据 ${name}？`))) return;
+    if (!(await modal.confirm('删除 Skill 元数据 ' + name + '？'))) return;
     try {
       await api.deleteSkill(name);
     } catch (err) {
@@ -147,6 +265,11 @@
 
   function closeForm() {
     const existing = ui.byId ? ui.byId('skill-form-modal') : document.getElementById('skill-form-modal');
+    if (existing) existing.remove();
+  }
+
+  function closeDiffModal() {
+    const existing = ui.byId ? ui.byId('skill-diff-modal') : document.getElementById('skill-diff-modal');
     if (existing) existing.remove();
   }
 
@@ -235,7 +358,7 @@
       description: field(form, 'description', '描述', skill ? skill.description : ''),
       platforms: field(form, 'platforms', '平台', skill && Array.isArray(skill.platforms) ? skill.platforms.join(',') : '', { placeholder: 'linux,darwin' }),
       readiness: field(form, 'readiness', '就绪状态', skill ? skill.readiness : 'available', { type: 'select', choices: ['available', 'unsupported', 'setup_needed', 'scan_error'] }),
-      enabled: checkbox(form, 'enabled', '启用', skill ? skill.enabled : true),
+      enabled: checkbox(form, 'enabled', '启用状态', skill ? skill.enabled : true),
       frontmatter: field(form, 'frontmatter', 'Frontmatter JSON', skill && skill.frontmatter ? JSON.stringify(skill.frontmatter, null, 2) : '{}', { type: 'textarea', rows: 8 }),
     };
     const actions = ui.el('div', 'providers-form__actions');
@@ -311,6 +434,73 @@
     close.focus();
   }
 
+  async function openDiffModal(pendingId) {
+    let data;
+    try {
+      data = await api.getPendingDiff(pendingId);
+    } catch (err) {
+      await modal.alert('获取 diff 失败: ' + (err && err.message ? err.message : err));
+      return;
+    }
+    closeDiffModal();
+    const backdrop = ui.el('div', 'modal-backdrop');
+    backdrop.id = 'skill-diff-modal';
+    backdrop.setAttribute('role', 'presentation');
+
+    const dialog = ui.el('section', 'modal-dialog tools-schema-dialog');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'skill-diff-title');
+
+    const content = ui.el('div', 'tools-schema-content');
+    const header = ui.el('div', 'modal-header');
+    const title = ui.el('h4');
+    title.id = 'skill-diff-title';
+    title.textContent = 'Diff - ' + pendingId;
+    const close = ui.el('button', 'modal-close');
+    close.type = 'button';
+    close.setAttribute('aria-label', '关闭 diff 弹出框');
+    close.textContent = '×';
+    close.addEventListener('click', closeDiffModal);
+    header.append(title, close);
+
+    const summaryDiv = ui.el('div', 'skill-diff-summary');
+    summaryDiv.textContent = (data && data.summary) || '';
+
+    const pre = ui.el('pre');
+    pre.textContent = (data && data.diff) || '';
+    content.append(header, summaryDiv, pre);
+    dialog.appendChild(content);
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeDiffModal();
+    });
+    document.body.appendChild(backdrop);
+    close.focus();
+  }
+
+  async function approvePendingItem(pendingId) {
+    try {
+      const result = await api.approvePending(pendingId);
+      if (result && result.error) {
+        await modal.alert('审批失败: ' + result.error);
+      }
+    } catch (err) {
+      await modal.alert('审批失败: ' + (err && err.message ? err.message : err));
+    }
+    await load();
+  }
+
+  async function rejectPendingItem(pendingId) {
+    if (!(await modal.confirm('拒绝该待审批写入 ' + pendingId + '？'))) return;
+    try {
+      await api.rejectPending(pendingId);
+    } catch (err) {
+      await modal.alert('拒绝失败: ' + (err && err.message ? err.message : err));
+    }
+    await load();
+  }
+
   async function load() {
     const node = root();
     if (!node) return;
@@ -319,8 +509,25 @@
     ui.renderLoading(loading);
     node.appendChild(loading);
     try {
-      const data = await api.listSkills();
+      const tasks = [api.listSkills()];
+      if (api.listPendingSkills) tasks.push(api.listPendingSkills());
+      if (api.listSkillUsage) tasks.push(api.listSkillUsage());
+      const results = await Promise.all(tasks);
+      const data = results[0];
       skills = (data && Array.isArray(data.skills)) ? data.skills : [];
+
+      pendingItems = [];
+      if (results.length > 1 && results[1] && Array.isArray(results[1].pending)) {
+        pendingItems = results[1].pending;
+      }
+
+      usageMap = {};
+      if (results.length > 2 && results[2] && Array.isArray(results[2].usage)) {
+        results[2].usage.forEach((u) => {
+          if (u && u.name) usageMap[u.name] = u;
+        });
+      }
+
       render();
     } catch (err) {
       node.replaceChildren();

@@ -65,6 +65,7 @@ async def test_tool_service_lists_openai_tools_and_executes_safe_tools():
         "read_text_file",
         "web_fetch",
         "vision_analyze",
+        "skill_manage",
     }
     assert result.status == ToolResultStatus.SUCCESS
 
@@ -827,3 +828,13 @@ async def test_budget_released_on_cancel():
     state = budget.get_state("sess-budget-6")
     assert state is not None
     assert state.tool_calls_reserved == 0  # released -- no leak
+
+
+def test_skill_manage_exposed_in_skill_toolset():
+    from app.application.skill_service import skill_manage_tool_definition
+    d = skill_manage_tool_definition()
+    assert d.name == "skill_manage"
+    # ToolService 静态/内置定义应包含 skill_manage
+    from app.application.tool_service import builtin_tool_definitions
+    names = [td.name for td in builtin_tool_definitions()]
+    assert "skill_manage" in names

@@ -8,7 +8,7 @@ from app.domain.skill import Skill, SkillFrontmatter, SkillNotFoundError, SkillR
 from app.interfaces.http.dashboard import create_dashboard_router
 
 
-def _skill(name, enabled=True, readiness=SkillReadiness.AVAILABLE):
+def _skill(name, enabled=True, readiness=SkillReadiness.AVAILABLE, last_scan_status="ok", last_scan_error=None):
     fm = SkillFrontmatter(
         name=name, description="d", version="", platforms=["linux"], tags=[],
         related_skills=[], author="", license="", setup_help=None,
@@ -17,15 +17,15 @@ def _skill(name, enabled=True, readiness=SkillReadiness.AVAILABLE):
     return Skill(
         id=f"id-{name}", name=name, relative_path=f"{name}/SKILL.md",
         description="d", platforms=["linux"], frontmatter=fm,
-        enabled=enabled, readiness=readiness, last_scan_status="ok",
-        last_scan_error=None, last_seen_at=None,
+        enabled=enabled, readiness=readiness, last_scan_status=last_scan_status,
+        last_scan_error=last_scan_error, last_seen_at=None,
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
     )
 
 
 class _FakeSkillService:
-    def __init__(self):
-        self.skills = {"alpha": _skill("alpha")}
+    def __init__(self, skills=None):
+        self.skills = skills if skills is not None else {"alpha": _skill("alpha")}
 
     async def list_skills(self, include_disabled=True):
         return list(self.skills.values())
@@ -114,6 +114,31 @@ def test_list_skills():
     res = client.get("/chat/skills")
     assert res.status_code == 200
     assert any(item["name"] == "alpha" for item in res.json()["skills"])
+
+
+def test_skill_dict_format_status_valid():
+    client = _build_app(_FakeSkillService())
+    item = next(i for i in client.get("/chat/skills").json()["skills"] if i["name"] == "alpha")
+    assert item["format_status"] == "valid"
+    assert item["format_messages"] == []
+
+
+def test_skill_dict_format_status_warning_for_format_warning():
+    svc = _FakeSkillService(skills={
+        "fw": _skill("fw", last_scan_status="warning", last_scan_error="format_warning"),
+    })
+    item = next(i for i in _build_app(svc).get("/chat/skills").json()["skills"] if i["name"] == "fw")
+    assert item["format_status"] == "warning"
+    assert item["format_messages"] == ["format_warning"]
+
+
+def test_skill_dict_format_status_warning_for_injection_warning():
+    svc = _FakeSkillService(skills={
+        "inj": _skill("inj", last_scan_status="warning", last_scan_error="injection_warning"),
+    })
+    item = next(i for i in _build_app(svc).get("/chat/skills").json()["skills"] if i["name"] == "inj")
+    assert item["format_status"] == "warning"
+    assert item["format_messages"] == ["injection_warning"]
 
 
 def test_get_skill_detail():
