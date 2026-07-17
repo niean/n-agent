@@ -74,6 +74,11 @@ async def test_valid_authority_registers_definition_and_route_without_bridge_pro
     assert "host_terminal" in services.tool_service.executor.routes
     health = services.health_snapshot()["host_terminal"]
     assert health == {"status": "degraded", "reason": "host_bridge_not_checked", "enabled": True}
+    # photo-upload 图片持久化已装配：executor 注入 image_persister，Dashboard 暴露 image_store
+    from app.infrastructure.image_store import LocalImageStore
+    assert isinstance(services.image_store, LocalImageStore)
+    executor = services.tool_service.executor.routes["host_terminal"]
+    assert executor._image_persister is services.image_store
 
 
 @pytest.mark.asyncio

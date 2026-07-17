@@ -542,6 +542,41 @@ async def test_complete_preserves_existing_acp_session_source(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_complete_derives_curator_session_source_from_gateway_source(tmp_path):
+    # 懒创建会话时，gateway.source=curator 经 IngressFacts -> snapshot.run_context.source
+    # 派生为 session.source=curator，与 curator- 前缀对齐（修复 source 误回落 api 的 bug）
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    service = ChatCompletionService(
+        store,
+        runner,
+        SessionService(store),
+        policy_snapshot_factory=RunPolicySnapshotFactory(
+            SettingsPolicyProfileProvider(Settings())
+        ),
+    )
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            session_id="curator-11111111-1111-4111-8111-111111111111",
+            messages=[{"role": "user", "content": "consolidation review"}],
+            stream=False,
+            trusted_metadata={"gateway.source": "curator"},
+        )
+    )
+
+    session = await store.get_session("curator-11111111-1111-4111-8111-111111111111")
+    assert session is not None
+    assert session.source == "curator"
+
+
+@pytest.mark.asyncio
 async def test_chat_service_normalizes_input_image_to_image_url_when_persisted(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     service = _build_service(store, tmp_path)

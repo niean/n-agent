@@ -8,7 +8,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from fastapi import APIRouter, Body, Header
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
 from app.application.events import ChatEvent, ChatEventType
@@ -109,6 +109,7 @@ def create_dashboard_router(
     policy_dashboard_service=None,
     skill_pending_store=None,
     skill_usage_store=None,
+    image_store=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -136,6 +137,17 @@ def create_dashboard_router(
     @router.get("/security", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    if image_store is not None:
+        @router.get("/chat/images/{image_id}")
+        async def serve_image(image_id: str):
+            path = image_store.resolve(image_id)
+            if path is None:
+                return JSONResponse(
+                    {"error": {"code": "image_not_found", "message": "image not found"}},
+                    status_code=404,
+                )
+            return FileResponse(path, media_type=image_store.media_type(image_id))
 
     if usage_service is not None:
         from app.interfaces.http.usage_routes import register_usage_routes
@@ -1425,6 +1437,8 @@ def _message_to_dict(message: ConversationMessage) -> dict:
         "tool_call_id": message.tool_call_id,
         "name": message.name,
         "is_summary": message.is_summary,
+        # 消息时间戳（UTC ISO），供 Dashboard Chat Hover 展示消息时间（飞书风格）
+        "created_at": message.created_at.isoformat() if message.created_at else None,
     }
     if tool_calls:
         data["tool_calls"] = tool_calls

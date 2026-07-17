@@ -70,3 +70,26 @@ def test_session_detail_response_includes_is_summary_field(tmp_path):
     assert len(msgs) == 2
     assert msgs[0]["is_summary"] is False
     assert msgs[1]["is_summary"] is True
+
+
+def test_session_detail_response_includes_message_created_at(tmp_path):
+    """消息时间戳通过 created_at 字段返回（UTC ISO 字符串），供前端 Hover 展示消息时间。"""
+    from datetime import datetime
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+
+    async def seed():
+        await store.create_session(ConversationSession(id="s1", title="t"))
+        await store.append_message("s1", ConversationMessage(role="user", content="hello"))
+
+    asyncio.run(seed())
+    client = TestClient(_build_app(store))
+    resp = client.get("/chat/sessions/s1")
+    assert resp.status_code == 200
+    msgs = resp.json()["messages"]
+    assert len(msgs) == 1
+    created_at = msgs[0]["created_at"]
+    assert isinstance(created_at, str)
+    # UTC ISO（带时区），可回解析为 datetime
+    parsed = datetime.fromisoformat(created_at)
+    assert parsed is not None

@@ -28,6 +28,8 @@
 | D024 | Dashboard format_messages 本期不新增 DB 列，仅从 last_scan_error 派生，无法长期保存完整 SkillScanWarning detail；若需详情持久化，后续应设计 SkillScanWarning 存储或 frontmatter.raw 扩展，不在本期扩大 schema。 | low | plan-260716-skill-anthropic-format.md | 2026-07-16 | open |
 | D025 | metadata list 字段使用逗号分隔 string 序列化，不支持元素内转义逗号；若未来需要复杂列表，应另行设计 metadata 编码约定。 | low | plan-260716-skill-anthropic-format.md | 2026-07-16 | open |
 | D026 | `_skill_category`（app/application/skill_service.py）读 `frontmatter.raw.get("category")` 因 T3 normalize 丢弃非白名单/非 legacy 的 category 字段而成为 dead code；目录式 category fallback 仍工作，无功能影响，但 docstring 关于 frontmatter category 的描述已失真。 | low | plan-260716-skill-anthropic-format.md | 2026-07-16 | open |
+| D027 | nudge 触发的 background review（`SkillEvolutionService.maybe_trigger` -> `run_background_review`）未注入 `gateway.source`，其 IngressFacts.source 回落 `api`；与 curator consolidation fork 同根问题。当前无害：nudge 复用既有用户 session_id，`create_session_if_allowed` 空操作不覆盖已存 source，且 policy profile 当前不按 source 分流。但语义不符（nudge 非外部 HTTP），未来若 policy 变为 source-aware 会误判。修复需把父会话 source 经 `maybe_trigger` 透传到 `run_background_review(ingress_source=...)`。 | low | N/A | 2026-07-17 | open |
+| D028 | `LocalImageStore` 用绝对 serve URL（`{dashboard_base_url}/chat/images/{id}`，默认 `http://localhost:8201`）替换 `signed_url`，便于 `renderMessageText` safeUrl（限 http/https）直渲染、飞书 `download_url` 自环拉取。但非默认部署下（如经 LAN IP / 反向代理访问）`dashboard_base_url` 与浏览器实际来源不一致，浏览器侧图片 URL 会指向 localhost 导致裂图；飞书侧因后端自环拉取不受影响。更稳健方案：serve URL 改相对路径 `/chat/images/{id}` + `renderMessageText` 允许同源相对 URL + 飞书 `send_markdown_reply` 对本地图片 URL 直接读 `LocalImageStore` 文件而非 HTTP 拉取（解耦 base_url 依赖）。 | low | N/A | 2026-07-17 | open |
 
 ---
 

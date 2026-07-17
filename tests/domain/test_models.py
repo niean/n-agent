@@ -6,7 +6,24 @@ from app.domain.agent import AgentState
 from app.domain.provider import ModelInfo, ProviderConfig, ProviderRegistry
 from app.domain.gateway import GatewayOutboundMessage, GatewaySessionKey, InteractionMessage
 from app.domain.platform import Platform
+from app.domain.session import SessionSource
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
+
+
+def test_session_sources_cover_entry_types():
+    # 模式十六：source 取值与 session_id 前缀一一对应；curator 是 Curator 周期维护的内部触发来源
+    assert SessionSource.CURATOR.value == "curator"
+    assert {source.value for source in SessionSource} == {
+        "dashboard",
+        "api",
+        "cli",
+        "feishu",
+        "dingtalk",
+        "wecom",
+        "acp",
+        "schedule",
+        "curator",
+    }
 
 
 def test_tool_definition_has_no_handler_field():

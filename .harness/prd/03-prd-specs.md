@@ -424,7 +424,9 @@
 - FR
     - 工具：Skill自进化，补全Curator周期维护
         - 要求：参照HermesAgent实现/Users/niean/code/github.com/niean/hermes-agent
-
+    - 会话：新增curator类型，用于Skill周期维护curator-xxx
+    - 对话：Chat框，鼠标Hover展示消息时间，样式、格式参考飞书消息
+    - 对话：Chat框，飞书IM裂图，图片先显示后变裂图
 
 ---
 
@@ -439,8 +441,10 @@
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明
     - 租户：引入租户概念，如团队、项目、个人，租户间特定资源隔离
     - 管理：秘钥Store(类似平台)
+    - 需求：调研Manus(https://manus.im/)产品功能，对比N-Agent、产出可能的产品/功能扩展事项。结果放到 .harness/specs/active/ 目录下
 
 ---
 
 [待验证]
 - 工具：MCP支持stdio类型
+- 对话：Chat查看飞书IM对话，图片先显示后变裂图

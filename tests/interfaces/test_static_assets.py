@@ -1010,3 +1010,27 @@ def test_styles_css_contains_summary_message_styles(tmp_path):
     assert '.msg--summary summary' in css
     assert '.msg--summary pre' in css
     assert '--color-warning-bg' in css
+
+
+def test_chat_message_hover_reveals_timestamp_feishu_style(tmp_path):
+    """PRD 03-prd-specs: Chat框鼠标 Hover 展示消息时间，样式、格式参考飞书消息。
+    chat.js 读取服务端 created_at 并按 今天/昨天/今年/往年 分级格式化，写入 data-time；
+    styles.css 在 .msg:hover 时通过 attr(data-time) 在气泡上方展示小号灰色时间。"""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    css = client.get('/static/styles.css').text
+
+    # JS: 时间格式化函数，消费服务端 created_at，分级输出（今天 HH:mm / 昨天 / 月日 / 年月日）
+    assert 'function formatMessageTime' in chat_js
+    assert 'formatMessageTime(message.created_at)' in chat_js
+    assert "el.dataset.time = timeLabel" in chat_js
+    assert "'昨天 '" in chat_js
+    assert '86400000' in chat_js
+    # 发送用户消息时携带客户端时间戳，Hover 即刻可见（流式结束后由 refresh 用服务端时间覆盖）
+    assert "appendMessage('user', userContent, new Date().toISOString())" in chat_js
+
+    # CSS: hover 时通过 attr(data-time) 展示小号灰色时间，不抢占气泡空间
+    assert 'content: attr(data-time)' in css
+    assert '.msg[data-time]::before' in css
+    assert '.msg[data-time]:hover::before' in css
+    assert 'pointer-events: none' in css

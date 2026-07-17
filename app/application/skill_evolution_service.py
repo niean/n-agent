@@ -118,6 +118,7 @@ class SkillEvolutionService:
         max_iterations: int | None = None,
         timeout_seconds: int | None = None,
         allow_toolsets: set[str] | None = None,
+        ingress_source: str | None = None,
     ) -> BackgroundReviewResult:
         """Run a background skill review forked-agent turn.
 
@@ -130,6 +131,11 @@ class SkillEvolutionService:
         (umbrella-building), iteration ceiling, timeout, and to narrow the
         toolset to skills-only (excluding memory). Defaults preserve the
         existing nudge-triggered background review behavior.
+
+        ``ingress_source`` lets the Curator consolidation fork declare its
+        session source (curator) so the lazily-created session is attributed
+        correctly instead of falling back to ``api`` (模式十六). The nudge
+        path leaves it None because it reuses an existing user session.
         """
         try:
             used_toolsets = (
@@ -155,12 +161,17 @@ class SkillEvolutionService:
                 if timeout_seconds is not None
                 else self.timeout_seconds
             )
+            trusted_metadata: dict[str, Any] = {
+                "skill_write_origin": "background_review",
+            }
+            if ingress_source is not None:
+                trusted_metadata["gateway.source"] = ingress_source
             request = ChatCompletionInput(
                 model=self.model or "",
                 messages=messages,
                 stream=False,
                 session_id=session_id,
-                trusted_metadata={"skill_write_origin": "background_review"},
+                trusted_metadata=trusted_metadata,
                 options={"max_iterations": used_max_iter},
             )
             result = await asyncio.wait_for(

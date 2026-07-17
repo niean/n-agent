@@ -61,6 +61,7 @@ from app.infrastructure.host_terminal.http_client import (
     HostTerminalHttpClientConfig,
 )
 from app.infrastructure.host_terminal.policy_loader import HostTerminalPolicyLoader
+from app.infrastructure.image_store import LocalImageStore
 from app.infrastructure.knowledge.http_adapters import HttpKnowledgeRetrieverConfig, KnowledgeHttpRetrieverFactory
 from app.infrastructure.llm.anthropic_provider import AnthropicProvider
 from app.infrastructure.llm.openai_compatible import OpenAICompatibleProvider
@@ -289,6 +290,7 @@ class ApplicationServices:
     platform_service: PlatformService
     health_snapshot: Callable[[], dict]
     policy_dashboard_service: PolicyDashboardService
+    image_store: LocalImageStore
     usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
     sandbox_manager: "_SandboxManager | None" = None
@@ -454,6 +456,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
 
     # Restricted host-terminal assembly. Configuration/Policy failures are
     # fail-closed and only publish a stable, non-sensitive health reason.
+    image_store = LocalImageStore(settings.image_store_dir, settings.dashboard_base_url)
     host_terminal_executor: HostTerminalToolExecutor | None = None
     host_terminal_health_reason = (
         "host_terminal_disabled"
@@ -524,6 +527,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                     max_stderr_bytes=settings.host_terminal_max_stderr_bytes,
                     max_concurrency=settings.host_terminal_max_concurrency,
                     audit_service=audit_service,
+                    image_persister=image_store,
                 )
                 host_definition = host_terminal_tool_definition(
                     settings.host_terminal_tool_timeout_seconds
@@ -1213,6 +1217,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         platform_service=platform_service,
         health_snapshot=health_snapshot,
         policy_dashboard_service=PolicyDashboardService(SettingsPolicyProfileProvider(settings)),
+        image_store=image_store,
         usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
         sandbox_manager=sandbox_manager if settings.sandbox_enabled else None,
@@ -1303,6 +1308,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             policy_dashboard_service=services.policy_dashboard_service,
             skill_pending_store=services.skill_pending_store,
             skill_usage_store=services.skill_usage_store,
+            image_store=services.image_store,
         )
     )
     return app

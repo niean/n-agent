@@ -7,9 +7,11 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from app.domain.curator_policy import CuratorPolicy, CuratorPolicyRequest
 from app.domain.policy import PolicyOutcome
+from app.domain.session import SessionSource
 from app.domain.skill import (
     CuratorConfig,
     CuratorRunResult,
@@ -457,8 +459,9 @@ class SkillCuratorService:
                 "tool_calls": [], "error": None,
             }
             if consolidate and has_candidates and self.evolution_service is not None:
+                # session_id 用 UUID 不用时间戳（模式十六：碰撞风险），对齐 schedule-{uuid4()}
                 llm_meta = await self._run_consolidation(
-                    dry_run=dry_run, session_id=f"curator-{start.strftime('%Y%m%d%H%M%S')}"
+                    dry_run=dry_run, session_id=f"curator-{uuid4()}"
                 )
             elif consolidate and not has_candidates:
                 llm_meta["summary"] = "skipped (no candidates)"
@@ -523,6 +526,7 @@ class SkillCuratorService:
                 prompt=prompt,
                 max_iterations=cfg.consolidate_max_iterations,
                 allow_toolsets={"skills"},
+                ingress_source=SessionSource.CURATOR.value,
             )
             summary = result.final_text[:240] if result.final_text else (
                 result.error or "no change"

@@ -182,6 +182,34 @@ def _build_app(store, health=None, model_service=None, provider_service=None, sc
     return app
 
 
+def test_chat_image_route_serves_stored_image_and_rejects_unsafe_names(tmp_path):
+    from app.infrastructure.image_store import LocalImageStore
+
+    image_store = LocalImageStore(tmp_path / "images", "http://localhost:8201")
+    image_id = "deadbeef.jpg"
+    (tmp_path / "images" / image_id).write_bytes(b"\xff\xd8fakejpeg")
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    tool_service = ToolService(_StubExecutor(), builtin_tool_definitions())
+    model_service = ModelService(_StubProvider(), "real-1")
+    app = FastAPI()
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(create_dashboard_router(
+        SessionService(store), tool_service, model_service, _default_health,
+        memory_store=store, image_store=image_store,
+    ))
+    client = TestClient(app)
+
+    ok = client.get(f"/chat/images/{image_id}")
+    assert ok.status_code == 200
+    assert ok.content == b"\xff\xd8fakejpeg"
+    assert ok.headers["content-type"].startswith("image/jpeg")
+
+    # unsafe / missing names -> 404, never a filesystem read
+    assert client.get("/chat/images/nonexistent.png").status_code == 404
+    assert client.get("/chat/images/not-valid").status_code == 404
+
+
 class _StubHolder:
     def __init__(self):
         self.swaps = []

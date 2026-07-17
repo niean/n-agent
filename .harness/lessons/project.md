@@ -125,3 +125,14 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：Dashboard 是 operator 跨源调试 UI（会话列表展示全部来源会话），其 chat 入口不应按 ingress source 强校验会话作用域，应用 `describe_unchecked(provisional_source=...)` 仅保留"会话必须已存在"校验。`describe(expected_source)` 适用于"ingress 与会话来源必须一致"的对外协议入口（如 `/v1/chat/completions` 限 api），`describe_unchecked` 适用于"接口已自行校验所有权、需跨源续发"的运维/调试入口（Dashboard、Gateway、Schedule）。IngressFacts.source 记录请求实际入口（dashboard），descriptor.source 记录会话原始来源（feishu），两者分离流入 PolicyProfileFacts，当前 system scope provider 忽略 source 不影响策略；`create_session` 用 INSERT OR IGNORE，续发不会覆盖既有会话 source。改动 ingress 作用域校验前必须检查会话列表是否跨源展示，避免"看得到选不了"。相关：spec-260714 第 350 行 Dashboard-scope 决策已被本修复反转。
 
 来源：bug fix 260716 Dashboard 无法给飞书会话发消息
+
+### P013: 外部临时资源（OSS 签名 URL）用于本地展示前必须持久化，不能假定 URL 永久可用
+
+现象：photo-upload 拍照上传的图片，在飞书 IM 可正常预览，但在 Dashboard Chat 框先显示、约 1 小时后变成裂图。
+
+根因：photo-upload Skill（宿主脚本）上传图片到阿里云 OSS 后返回 STS 签名 URL，`URL_LIFETIME_SECONDS=3600`（1 小时过期）。host_terminal_tool_executor 把该签名 URL 作为 `signed_url` 返回给 LLM，LLM 按 Skill 指令输出 `![照片](签名URL)`，该回复被原样存入会话消息并投递飞书。飞书投递链路 `send_markdown_reply` 会在投递瞬间把图片**下载并重传为飞书永久 image_key**，故飞书侧永久可预览；但 Dashboard Chat 直存原始签名 URL，超过 1 小时后 `<img>` 请求返回 403、变裂图。根因跨 4 层：宿主 Skill（photo-upload.py）-> Application（host_terminal_tool_executor 返回 signed_url）-> Infrastructure（消息存储原始 URL）-> Interfaces（Dashboard 直渲染原始 URL）。飞书与 Dashboard 对同一 URL 的"是否重传持久化"处理不对称，是 bug 根源。
+
+教训：外部临时资源（签名 URL、临时 token、短链接）在用于本地展示前必须持久化，不能假定 URL 永久可用。不同渠道对同一资源可能做不同处理（飞书重传为永久 image_key，Dashboard 直存原始 URL），跨渠道展示一致性需在"资源进入会话消息"这一汇聚点统一持久化，而非依赖各渠道各自处理。本次在 host_terminal 工具成功时（URL 仍 fresh）下载图片落地 `LocalImageStore`，返回永久 serve URL 替换 `signed_url`，飞书投递和 Dashboard 展示都用该永久 URL。相关：D028 非默认部署下 base_url 限制。
+
+来源：bug fix 260717 Chat 框飞书可预览图片过期裂图
+

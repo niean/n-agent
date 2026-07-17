@@ -133,6 +133,19 @@ class _PinnedClient:
         return replace(self._response, request_id=request.request_id)
 
 
+class _FakePersister:
+    def __init__(self, url=None, exc=None):
+        self.calls = []
+        self._url = url
+        self._exc = exc
+
+    async def persist(self, source_url, mime_hint=None):
+        self.calls.append((source_url, mime_hint))
+        if self._exc is not None:
+            raise self._exc
+        return self._url
+
+
 def _executor(snapshot=None, client=None):
     loader = _Loader(snapshot or _snapshot())
     client = client or _Client()
@@ -220,6 +233,56 @@ async def test_success_pins_policy_and_returns_only_structured_photo_result():
     assert loader.refresh_count == 1
     assert client.requests[0].n_agent_policy_version == "v1"
     assert client.requests[0].n_agent_content_digest == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_photo_success_replaces_signed_url_with_persistent_url():
+    persister = _FakePersister(url="http://localhost:8201/chat/images/abc.jpg")
+    executor = HostTerminalToolExecutor(
+        client=_Client(), skill_service=_Skills(), policy_loader=_Loader(_snapshot()),
+        image_persister=persister,
+    )
+    result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": [], "timeout": 120,
+    }))
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.content["signed_url"] == "http://localhost:8201/chat/images/abc.jpg"
+    assert persister.calls and persister.calls[0][0] == "https://example.invalid/photo.jpg?sig=test"
+    # capture_size / upload_http preserved
+    assert result.content["capture_size"] == 12
+    assert result.content["upload_http"] == 200
+
+
+@pytest.mark.asyncio
+async def test_photo_success_falls_back_to_signed_url_when_persist_returns_none():
+    persister = _FakePersister(url=None)
+    executor = HostTerminalToolExecutor(
+        client=_Client(), skill_service=_Skills(), policy_loader=_Loader(_snapshot()),
+        image_persister=persister,
+    )
+    result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": [],
+    }))
+    assert result.status is ToolResultStatus.SUCCESS
+    # falls back to the original (expiring) signed url
+    assert result.content["signed_url"] == "https://example.invalid/photo.jpg?sig=test"
+
+
+@pytest.mark.asyncio
+async def test_photo_success_falls_back_when_persister_raises():
+    persister = _FakePersister(exc=RuntimeError("boom"))
+    executor = HostTerminalToolExecutor(
+        client=_Client(), skill_service=_Skills(), policy_loader=_Loader(_snapshot()),
+        image_persister=persister,
+    )
+    result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": [],
+    }))
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.content["signed_url"] == "https://example.invalid/photo.jpg?sig=test"
 
 
 @pytest.mark.asyncio

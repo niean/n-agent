@@ -334,11 +334,13 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 | wecom | 企业微信 IM | wecom | wecom- |
 | acp | ACP stdio 客户端 | acp | acp- |
 | schedule | 定时触发 | schedule | schedule- |
+| curator | Curator 周期维护 consolidation fork（内部触发，非平台/非外部 HTTP） | curator | curator- |
 
 规则：
 - session_id 前缀严格等于一级名，UUID 跟在连字符后（如 `dashboard-{uuid}`、`feishu-{uuid}`）。
 - CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 IM 平台一级。GatewayService 通过 GatewaySessionKey.platform 分流：source=`cli` → (`cli`, `cli`)，真实 IM 平台 → (`{platform.value}`, `{platform.value}`)。
 - `schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
+- `curator` 是 Curator 周期维护 consolidation fork 的内部触发来源，独立成一级（前缀 `curator-`、source `curator`）。session_id 用 `curator-{uuid4()}`（与 `schedule-{uuid4()}` 同，不用时间戳，遵守本模式 UUID 通用规则）。`SkillCuratorService._run_consolidation` 经 `SkillEvolutionService.run_background_review(ingress_source="curator")` 注入 `gateway.source`，由 `ChatCompletionService` 派生为会话 source；缺失时 `_build_policy_snapshot` 会回落 `api`，导致来源与前缀脱节。
 - Dashboard 前端生成 session_id 用 `crypto.randomUUID()`（fallback `Date.now()+random`），不用 `Date.now()` 时间戳（碰撞风险）。
 
 历史数据迁移：

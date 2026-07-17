@@ -1,7 +1,7 @@
 <!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
-本文介绍自研Agent套装[N-Agent](https://github.com/niean/n-agent)，一款类似Hermes的Agent Runtime。
+本文介绍自研通用Agent [N-Agent](https://github.com/niean/n-agent)，一款类似Hermes的Agent Runtime。
 核心流程：接收对话请求，加载会话上下文，循环"调用模型→按需执行工具"直至产出最终回答，更新会话与外部记忆，返回同步或流式结果。
 
 

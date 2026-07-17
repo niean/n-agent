@@ -120,3 +120,27 @@ async def test_review_extracts_tool_calls_with_absorbed_into(svc):
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0]["name"] == "skill_manage"
     assert "absorbed_into" in result.tool_calls[0]["arguments"]
+
+
+@pytest.mark.asyncio
+async def test_review_ingress_source_sets_gateway_source(svc):
+    # Curator consolidation fork 必须把来源透传成 gateway.source，使会话 source 派生为 curator
+    svc.chat.complete = AsyncMock(return_value=MagicMock(message={"content": ""}))
+    await svc.run_background_review(
+        session_id="curator-11111111-1111-4111-8111-111111111111",
+        digest="x",
+        ingress_source="curator",
+    )
+    request = svc.chat.complete.call_args.args[0]
+    assert request.trusted_metadata["gateway.source"] == "curator"
+    assert request.trusted_metadata["skill_write_origin"] == "background_review"
+
+
+@pytest.mark.asyncio
+async def test_review_ingress_source_none_omits_gateway_source(svc):
+    # nudge 触发的 background review 复用既有用户 session，不注入 gateway.source，保持现状回落
+    svc.chat.complete = AsyncMock(return_value=MagicMock(message={"content": ""}))
+    await svc.run_background_review(session_id="s1", digest="x")
+    request = svc.chat.complete.call_args.args[0]
+    assert "gateway.source" not in request.trusted_metadata
+    assert request.trusted_metadata["skill_write_origin"] == "background_review"

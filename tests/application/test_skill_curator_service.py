@@ -377,6 +377,31 @@ async def test_run_curator_review_consolidate_on():
 
 
 @pytest.mark.asyncio
+async def test_run_curator_review_consolidate_sets_curator_session_source():
+    # curator consolidation fork 用 curator- 前缀 session_id + curator 来源，对齐模式十六
+    from app.domain.session import SessionSource
+    from app.domain.skill import CuratorState
+    evo = MagicMock()
+    evo.run_background_review = AsyncMock(
+        return_value=BackgroundReviewResult(final_text="merged", tool_calls=[])
+    )
+    svc = _make_service(
+        state=CuratorState(run_count=0),
+        rows=[_report("old", last_used_at=datetime.now(timezone.utc))],
+        evolution_service=evo,
+    )
+    await svc.run_curator_review(consolidate=True)
+    args, kwargs = evo.run_background_review.call_args
+    assert kwargs.get("ingress_source") == SessionSource.CURATOR.value
+    sid = kwargs.get("session_id", "")
+    assert sid.startswith("curator-")
+    # 模式十六：session_id 用 UUID 不用时间戳（碰撞风险）
+    from uuid import UUID
+
+    UUID(sid.removeprefix("curator-"))
+
+
+@pytest.mark.asyncio
 async def test_run_curator_review_consolidate_no_evolution_service():
     from app.domain.skill import CuratorState
     svc = _make_service(

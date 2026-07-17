@@ -20,6 +20,9 @@ class SessionSource(str, Enum):
     WECOM = "wecom"
     ACP = "acp"
     SCHEDULE = "schedule"
+    # Curator 周期维护的 consolidation fork 是内部触发（非平台、非外部 HTTP），
+    # 独立成一级并配 curator- 前缀，避免误回落 api 导致来源与前缀脱节（模式十六）
+    CURATOR = "curator"
 
     @classmethod
     def im_platforms(cls) -> set[str]:

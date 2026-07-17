@@ -77,6 +77,26 @@
     }
   }
 
+  // 飞书风格消息时间：Hover 时展示在气泡上方。服务端 created_at 为 UTC ISO 字符串，
+  // 浏览器按本地时区解析后，按 今天/昨天/今年/往年 分级格式化。返回空串表示无时间。
+  function formatMessageTime(iso) {
+    if (!iso) return '';
+    const date = new Date(iso);
+    if (isNaN(date.getTime())) return '';
+    const now = new Date();
+    const pad = (n) => (n < 10 ? '0' + n : '' + n);
+    const hhmm = pad(date.getHours()) + ':' + pad(date.getMinutes());
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const startOfMsgDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const dayDiff = Math.round((startOfToday - startOfMsgDay) / 86400000);
+    if (dayDiff === 0) return hhmm;
+    if (dayDiff === 1) return '昨天 ' + hhmm;
+    if (date.getFullYear() === now.getFullYear()) {
+      return (date.getMonth() + 1) + '月' + date.getDate() + '日 ' + hhmm;
+    }
+    return date.getFullYear() + '/' + (date.getMonth() + 1) + '/' + date.getDate() + ' ' + hhmm;
+  }
+
   function formatDebugJson(value) {
     if (typeof value !== 'string') return JSON.stringify(value, null, 2);
     try {
@@ -206,6 +226,9 @@
       el.appendChild(details);
       return el;
     }
+    // user/assistant 消息：附加 Hover 时间（飞书风格），由 CSS ::before 展示
+    const timeLabel = formatMessageTime(message.created_at);
+    if (timeLabel) el.dataset.time = timeLabel;
     const content = message.content;
     if (Array.isArray(content)) {
       let hasText = false;
@@ -253,12 +276,12 @@
     return grouped;
   }
 
-  function appendMessage(role, content) {
+  function appendMessage(role, content, createdAt) {
     const stack = ui.byId('chat-message-stack');
     if (!stack) return null;
     const empty = stack.querySelector('.empty-hero');
     if (empty) clearNode(stack);
-    const el = createMessageElement({ role, content });
+    const el = createMessageElement({ role, content, created_at: createdAt });
     stack.appendChild(el);
     scrollToBottom();
     return el;
@@ -593,7 +616,7 @@
           ...sentImages.map((img) => ({ type: 'image_url', image_url: { url: img.dataUrl } })),
         ]
       : text;
-    appendMessage('user', userContent);
+    appendMessage('user', userContent, new Date().toISOString());
     const streaming = appendMessage('assistant', '');
     setSending(true);
     try {

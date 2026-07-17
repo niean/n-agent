@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     host_terminal_max_stderr_bytes: int = Field(default=16384, ge=1)
     host_terminal_max_concurrency: int = Field(default=1, ge=1)
 
+    # 图片持久化：photo-upload 产出的 OSS 签名 URL 约 1h 过期，飞书投递时重传为
+    # 永久 image_key，而 Dashboard Chat 存的是原始临时 URL、过期后裂图。后端在
+    # 工具成功时把图片落地到 image_store_dir，经 /chat/images/{id} 永久对外服务。
+    image_store_dir: Path = Field(default=Path("locals/images"))
+    dashboard_base_url: str = Field(default="http://localhost:8201")
+
     # Plugin 配置
     plugins_root: Path = Field(default=Path("/workspace/plugins"))
     plugins_enabled: list[str] | str = Field(default_factory=lambda: ["hello"])

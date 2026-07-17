@@ -5,6 +5,7 @@ import hashlib
 import asyncio
 import json
 import re
+from dataclasses import replace
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -96,6 +97,14 @@ class HostTerminalPolicySnapshotProvider(Protocol):
     def refresh(self) -> bool: ...
 
 
+class ImagePersister(Protocol):
+    """Persists photo-upload images so they remain renderable after the
+    OSS signed URL expires (~1h). Returns a permanent serve URL, or ``None``
+    to fall back to the original (expiring) URL."""
+
+    async def persist(self, source_url: str, mime_hint: str | None = None) -> str | None: ...
+
+
 def host_terminal_tool_definition(timeout_seconds: int = 120) -> ToolDefinition:
     common_properties: dict[str, Any] = {
         "args": {
@@ -157,6 +166,7 @@ class HostTerminalToolExecutor:
         max_stderr_bytes: int = 16384,
         max_concurrency: int = 1,
         audit_service: PolicyAuditService | None = None,
+        image_persister: ImagePersister | None = None,
     ) -> None:
         self._client = client
         self._skill_service = skill_service
@@ -167,6 +177,7 @@ class HostTerminalToolExecutor:
         self._max_stderr_bytes = max_stderr_bytes
         self._max_concurrency = max_concurrency
         self._audit_service = audit_service
+        self._image_persister = image_persister
         self.last_health_code = "host_bridge_not_checked"
 
     async def execute(
@@ -407,7 +418,27 @@ class HostTerminalToolExecutor:
             response.status is HostTerminalStatus.TIMEOUT,
             response.stdout_truncated or response.stderr_truncated,
         )
-        return result
+        return await self._persist_photo_image(result)
+
+    async def _persist_photo_image(self, result: ToolResult) -> ToolResult:
+        """Replace the expiring OSS signed_url in a photo success result with a
+        permanent serve URL. No-op when no persister is wired, on non-photo
+        results, or when persistence fails (falls back to the original URL)."""
+        if self._image_persister is None or result.status is not ToolResultStatus.SUCCESS:
+            return result
+        content = result.content
+        if not isinstance(content, dict):
+            return result
+        signed_url = content.get("signed_url")
+        if not isinstance(signed_url, str) or not signed_url:
+            return result
+        try:
+            permanent = await self._image_persister.persist(signed_url)
+        except Exception:
+            permanent = None
+        if not permanent:
+            return result
+        return replace(result, content={**content, "signed_url": permanent})
 
     @staticmethod
     def _validate_shape(
