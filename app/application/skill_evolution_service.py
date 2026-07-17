@@ -2,12 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from app.application.chat_service import ChatCompletionInput
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class BackgroundReviewResult:
+    """Forked background review 的结构化结果，供 Curator consolidation 报告消费。
+
+    final_text 为 assistant 最终文本；tool_calls 为本轮产生的 skill_manage 调用
+    （{name, arguments}）；error 非空表示 fork 失败/超时。best-effort：仅收集
+    final message 携带的 tool_calls，中间轮 tool_calls 未收集时分类退化为 pruned。
+    """
+
+    final_text: str = ""
+    tool_calls: list[dict] = field(default_factory=list)
+    error: str | None = None
 
 _SKILL_REVIEW_PROMPT = """\
 你是一个 Skill 自进化审查 Agent。你将在后台审查对话摘要，识别值得持久化为 Skill 的非平凡工作流。
@@ -99,40 +114,97 @@ class SkillEvolutionService:
         self,
         session_id: str,
         digest: str,
-    ) -> None:
+        prompt: str | None = None,
+        max_iterations: int | None = None,
+        timeout_seconds: int | None = None,
+        allow_toolsets: set[str] | None = None,
+    ) -> BackgroundReviewResult:
         """Run a background skill review forked-agent turn.
 
         Builds a skill-only toolset, constructs a ChatCompletionInput with
         background_review provenance, and calls chat.complete under a timeout.
-        All exceptions are caught and logged -- this method never raises.
+        All exceptions are caught and returned as BackgroundReviewResult.error --
+        this method never raises.
+
+        Parameters allow Curator consolidation to override the system prompt
+        (umbrella-building), iteration ceiling, timeout, and to narrow the
+        toolset to skills-only (excluding memory). Defaults preserve the
+        existing nudge-triggered background review behavior.
         """
         try:
+            used_toolsets = (
+                allow_toolsets if allow_toolsets is not None else {"skills", "memory"}
+            )
             tools = self.tool_service.build_filtered_definitions(
-                allow_toolsets={"skills", "memory"},
+                allow_toolsets=used_toolsets,
                 allow_tool_names={"skill_manage", "skills_list", "skill_view"},
             )
+            used_prompt = prompt if prompt is not None else _SKILL_REVIEW_PROMPT
             messages: list[dict[str, Any]] = [
-                {"role": "system", "content": _SKILL_REVIEW_PROMPT},
+                {"role": "system", "content": used_prompt},
                 {"role": "user", "content": digest},
             ]
             # Lazy import to avoid potential circular imports at module load time.
             from app.application.chat_service import ChatCompletionInput
 
+            used_max_iter = (
+                max_iterations if max_iterations is not None else self.max_iterations
+            )
+            used_timeout = (
+                timeout_seconds
+                if timeout_seconds is not None
+                else self.timeout_seconds
+            )
             request = ChatCompletionInput(
                 model=self.model or "",
                 messages=messages,
                 stream=False,
                 session_id=session_id,
                 trusted_metadata={"skill_write_origin": "background_review"},
-                options={"max_iterations": self.max_iterations},
+                options={"max_iterations": used_max_iter},
             )
-            await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self.chat.complete(request),
-                timeout=self.timeout_seconds,
+                timeout=used_timeout,
             )
-        except Exception:
+            return _extract_review_result(result)
+        except Exception as e:
             logger.warning(
                 "skill background review failed for session=%s",
                 session_id,
                 exc_info=True,
             )
+            return BackgroundReviewResult(error=str(e))
+
+
+def _extract_review_result(result: Any) -> BackgroundReviewResult:
+    """从 ChatCompletionResult 提取 final_text 与 tool_calls。
+
+    best-effort：仅收集 final assistant message 携带的 tool_calls；中间轮
+    tool_calls 未收集时 Curator 分类退化为 pruned（保守）。
+    """
+    final_text = ""
+    tool_calls: list[dict] = []
+    msg = getattr(result, "message", None)
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, str):
+            final_text = content
+        elif isinstance(content, list):
+            final_text = "".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") in (None, "text")
+            )
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                name = fn.get("name") or tc.get("name") or ""
+                args_raw = fn.get("arguments") or tc.get("arguments") or ""
+                if isinstance(args_raw, str) and len(args_raw) > 400:
+                    args_raw = args_raw[:400] + "…"
+                tool_calls.append({"name": name, "arguments": args_raw})
+    return BackgroundReviewResult(final_text=final_text, tool_calls=tool_calls)

@@ -112,12 +112,12 @@ Third Review 是 Workflow 内部的独立审阅通道，用于在主流程模型
 - `.harness/framework/third/plan-review-prompt.md`：plan 审阅提示模板
 
 调用约定：
-- 默认命令：`.harness/framework/third/third-review-codex.sh`
+- 默认命令：`sh .harness/framework/third/third-review-codex.sh`
 - 可通过环境变量 `HARNESS_THIRD_REVIEW_CMD` 覆盖命令
 - 可通过环境变量 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型
 - 可通过环境变量 `CODEX_BIN` 指定 Codex CLI；未指定时默认命令依次探测 PATH、VSCode/Cursor/Windsurf 的 Codex 扩展目录
-- spec 审阅：`$HARNESS_THIRD_REVIEW_CMD spec <spec_file>`
-- plan 审阅：`$HARNESS_THIRD_REVIEW_CMD plan <plan_file> <spec_file>`
+- spec 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} spec <spec_file>`
+- plan 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`
 
 Third Review 输出规则：
 - Third Review 可直接修改目标 spec/plan 文件，禁止修改无关文件

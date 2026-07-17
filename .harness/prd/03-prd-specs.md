@@ -420,18 +420,21 @@
         - 前端：skills列表，排序按 先来源(seed/user/agent)、后ASC(名称)
         - Skill：Skill定义，严格遵循Anthropic规范，此外要求英文命名+中文alias
 
+[20260717]
+- FR
+    - 工具：Skill自进化，补全Curator周期维护
+        - 要求：参照HermesAgent实现/Users/niean/code/github.com/niean/hermes-agent
+
 
 ---
 
 [待办]
 - HE
 - NFR
-    - 文档：Skill自进化原理
     - 知识：UDS，详细原理、Go样例
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
 - FR
-    - 工具：Skill自进化，Curator周期维护
     - 架构：MoA，对标Hermes
     - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明
     - 租户：引入租户概念，如团队、项目、个人，租户间特定资源隔离

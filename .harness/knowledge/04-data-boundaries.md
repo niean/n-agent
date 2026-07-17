@@ -192,6 +192,7 @@ usage_records(id, session_id, model, provider, input_tokens, output_tokens, cach
 compression_stats(id, session_id, before_tokens, after_tokens, tokens_saved, compression_ratio, created_at)
 skill_usage(name PRIMARY KEY, created_by, use_count, view_count, patch_count, created_at, last_used_at, last_viewed, last_patched_at, state, pinned, archived_at)
 skill_pending_writes(pending_id PRIMARY KEY, action, skill_name, origin, summary, diff, payload_json, state, error, created_at, updated_at)
+curator_state(key PRIMARY KEY DEFAULT 'default', value TEXT NOT NULL) -- 单行 KV，value 为 JSON 含 last_run_at/last_run_duration_seconds/last_run_summary/last_report_path/paused/run_count，由 SqliteCuratorStateStore 实现，与 sessions.db 共享 path 独立连接，损坏 JSON 回退默认 state
 ```
 
 sessions 表 token/cost 列（迁移幂等，由 `SqliteUsageRecorder.init` 通过 `PRAGMA table_info` 检查列存在再 `ALTER TABLE ADD COLUMN`）：

@@ -8,6 +8,7 @@ from .commands import (
     acp,
     chat,
     config,
+    curator,
     doctor,
     knowledge,
     logs,
@@ -475,6 +476,9 @@ def build_parser() -> argparse.ArgumentParser:
     skill_usage_parser = skill_subparsers.add_parser("usage", help="List skill usage telemetry")
     _add_format_flags(skill_usage_parser)
 
+    curator_parser = subparsers.add_parser("curator", help="Curator commands")
+    curator.register_cli(curator_parser, _add_format_flags)
+
     plugin_parser = subparsers.add_parser("plugin", help="Plugin commands")
     plugin_subparsers = plugin_parser.add_subparsers(dest="plugin_command")
     plugin_list_parser = plugin_subparsers.add_parser("list", help="List plugins")
@@ -507,6 +511,7 @@ _DISPATCH = {
     "sessions": sessions.run,
     "status": status.run,
     "skill": skill.run,
+    "curator": curator.run,
     "plugin": plugin.run,
     "provider": provider.run,
     "knowledge": knowledge.run,

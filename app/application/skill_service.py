@@ -157,11 +157,17 @@ class SkillManageRequestBuilder:
         )
 
     @classmethod
-    def delete(cls, name: str, origin: SkillWriteOrigin) -> SkillManageRequest:
+    def delete(
+        cls,
+        name: str,
+        origin: SkillWriteOrigin,
+        absorbed_into: str = "",
+    ) -> SkillManageRequest:
         return SkillManageRequest(
             action=SkillWriteAction.DELETE,
             name=name,
             origin=origin,
+            absorbed_into=absorbed_into,
         )
 
     @classmethod
@@ -1271,6 +1277,14 @@ def skill_manage_tool_definition() -> ToolDefinition:
                 "file_path": {"type": "string"},
                 "file_content": {"type": "string"},
                 "category": {"type": "string"},
+                "absorbed_into": {
+                    "type": "string",
+                    "default": "",
+                    "description": "delete only: declare absorption target umbrella "
+                    "(empty=prune with no merge target, non-empty=merged into the "
+                    "named umbrella); used by Curator classification, does not "
+                    "change delete behavior.",
+                },
             },
             "required": ["action", "name"],
             "additionalProperties": False,
@@ -1333,6 +1347,7 @@ class SkillManageToolExecutor(ToolExecutor):
                 file_path=str(args.get("file_path") or ""),
                 file_content=str(args.get("file_content") or ""),
                 category=str(args.get("category") or ""),
+                absorbed_into=str(args.get("absorbed_into") or ""),
                 approved_replay=False,
             )
             result = await self.service.manage_skill(manage_request)

@@ -480,6 +480,71 @@ class SkillFileLoader:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(target), str(dest))
 
+    async def restore_skill(self, name: str) -> Path:
+        return await asyncio.to_thread(self._restore_skill_sync, name)
+
+    def _restore_skill_sync(self, name: str) -> Path:
+        archive_root = self.root / ".archive"
+        if not archive_root.exists():
+            raise FileNotFoundError(f"archive root not found: {archive_root}")
+        candidates: list[Path] = []
+        for p in archive_root.iterdir():
+            if not p.is_dir():
+                continue
+            parsed = _split_archive_name(p.name)
+            if parsed is not None and parsed[0] == name:
+                candidates.append(p)
+        candidates.sort(reverse=True)
+        if not candidates:
+            raise FileNotFoundError(f"archived skill not found: {name}")
+        src = candidates[0]
+        dest = self.root / name
+        if dest.exists():
+            raise FileExistsError(f"destination exists: {dest}")
+        shutil.move(str(src), str(dest))
+        return dest
+
+    async def list_archived(self) -> list[dict]:
+        return await asyncio.to_thread(self._list_archived_sync)
+
+    def _list_archived_sync(self) -> list[dict]:
+        archive_root = self.root / ".archive"
+        if not archive_root.exists():
+            return []
+        results: list[dict] = []
+        for p in sorted(archive_root.iterdir()):
+            if not p.is_dir():
+                continue
+            parsed = _split_archive_name(p.name)
+            if parsed is None:
+                continue
+            skill_name, ts = parsed
+            results.append(
+                {
+                    "name": skill_name,
+                    "archive_path": str(p),
+                    "archived_at": ts,
+                }
+            )
+        return results
+
+
+_ARCHIVE_TS_RE = re.compile(r"^(?P<name>.+)-(?P<ts>\d{4}-\d{2}-\d{2}T[\d:.+\-]+)$")
+
+
+def _split_archive_name(dir_name: str) -> tuple[str, str] | None:
+    """从 archive 目录名分离 skill name 与 ISO 时间戳。
+
+    delete_skill 归档目录名为 <name>-<utc-iso>，ISO 时间戳形如
+    2026-07-17T10:30:00.123456+00:00（自身含多个连字符）。用正则按时间戳
+    后缀切分，正确处理含连字符的 skill name（如 deploy-staging），不能用
+    rsplit("-", 1) 或 startswith(f"{name}-")。
+    """
+    m = _ARCHIVE_TS_RE.match(dir_name)
+    if m is None:
+        return None
+    return m.group("name"), m.group("ts")
+
 
 def _iter_skill_files(root: Path) -> list[Path]:
     matches: list[Path] = []

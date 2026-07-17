@@ -84,6 +84,9 @@ from app.infrastructure.skill.seed_runner import seed_default_skills
 from app.infrastructure.skill.skill_usage_store import SkillUsageStore
 from app.infrastructure.skill.skill_pending_store import SkillPendingStore
 from app.infrastructure.skill.skill_backup_store import SkillBackupStore
+from app.infrastructure.skill.curator_state_store import SqliteCuratorStateStore
+from app.domain.curator_policy import CuratorPolicy
+from app.application.skill_curator_service import SkillCuratorService
 from app.infrastructure.plugin.file_loader import PluginFileLoader, PluginFileLoaderConfig
 from app.infrastructure.plugin.seed_runner import seed_default_plugins
 from app.infrastructure.registry.sqlite_plugin_registry import SQLitePluginRegistry
@@ -275,6 +278,8 @@ class ApplicationServices:
     skill_pending_store: SkillPendingStore
     skill_backup_store: SkillBackupStore
     skill_evolution_service: SkillEvolutionService
+    skill_curator_service: SkillCuratorService
+    curator_state_store: SqliteCuratorStateStore
     plugin_service: PluginService
     knowledge_service: KnowledgeService
     external_memory_service: ExternalMemoryService | None
@@ -806,6 +811,23 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         timeout_seconds=settings.skills_background_review_timeout_seconds,
     )
     graph_runner.evolution_service = skill_evolution_service
+    # Skill Curator 周期维护 service. Built after evolution_service because
+    # consolidation reuses its fork path; injected into graph_runner for the
+    # finalize auto-trigger (maybe_run_curator, fire-and-forget).
+    curator_state_store = SqliteCuratorStateStore(settings.sqlite_path)
+    curator_policy = CuratorPolicy()
+    skill_curator_service = SkillCuratorService(
+        skill_registry=skill_registry,
+        skill_usage_store=skill_usage_store,
+        skill_service=skill_service,
+        file_loader=skill_loader,
+        backup_store=skill_backup_store,
+        evolution_service=skill_evolution_service,
+        curator_state_store=curator_state_store,
+        curator_policy=curator_policy,
+        settings=settings,
+    )
+    graph_runner.curator_service = skill_curator_service
     model_service = ModelService(holder, lambda: holder.current_model)
     schedule_calculator = CroniterScheduleCalculator()
     schedule_scanner = DeterministicPromptSafetyScanner()
@@ -1180,6 +1202,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         skill_pending_store=skill_pending_store,
         skill_backup_store=skill_backup_store,
         skill_evolution_service=skill_evolution_service,
+        skill_curator_service=skill_curator_service,
+        curator_state_store=curator_state_store,
         plugin_service=plugin_service,
         knowledge_service=knowledge_service,
         external_memory_service=external_memory_service,

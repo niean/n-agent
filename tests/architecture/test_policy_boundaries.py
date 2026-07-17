@@ -32,6 +32,7 @@ POLICY_FILES = [
     "information_flow_policy.py",
     "host_terminal_policy.py",
     "skill_policy.py",
+    "curator_policy.py",
 ]
 
 # Domain types files consumed by Policies (not Policy files themselves).
@@ -104,6 +105,7 @@ POLICY_FILE_OWN_DOMAIN = {
     "information_flow_policy.py": {"app.domain.information_flow"},
     "host_terminal_policy.py": {"app.domain.host_terminal"},
     "skill_policy.py": {"app.domain.skill"},
+    "curator_policy.py": {"app.domain.skill"},
 }
 
 

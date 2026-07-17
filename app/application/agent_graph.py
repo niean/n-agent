@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import logging
 import time
@@ -120,6 +121,7 @@ class AgentGraphRunner:
         llm_config: LLMConfig | None = None,
         evolution_service: SkillEvolutionService | None = None,
         nudge_interval: int = 10,
+        curator_service: Any | None = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -160,6 +162,8 @@ class AgentGraphRunner:
         self._cancel_events: dict[str, asyncio.Event] = {}
         self.evolution_service = evolution_service
         self.nudge_interval = nudge_interval
+        self.curator_service = curator_service
+        self._last_finalize_at: datetime | None = None
 
     def register_run(self, session_id: str, task: asyncio.Task) -> None:
         self._running_tasks[session_id] = task
@@ -216,7 +220,18 @@ class AgentGraphRunner:
         )
         self._run_start_times[state.run_id] = time.monotonic()
         try:
-            result = await self.graph.ainvoke(state, {"configurable": {"model": model, "options": state.run_options}})
+            cfg: dict[str, Any] = {
+                "configurable": {"model": model, "options": state.run_options},
+            }
+            max_iter_opt = (
+                state.run_options.get("max_iterations") if state.run_options else None
+            )
+            iter_limit = int(max_iter_opt) if max_iter_opt else self.iteration_limit
+            # LangGraph recursion_limit: 每轮迭代约 2-3 节点（call_llm/execute_tools/
+            # update_memory），consolidation fork 传 max_iterations=64 需高限；默认
+            # iteration_limit 也给足余量，避免 GraphRecursionError 提前打断。
+            cfg["recursion_limit"] = max(iter_limit * 3, 25)
+            result = await self.graph.ainvoke(state, cfg)
             return AgentState(**result) if isinstance(result, dict) else result
         except asyncio.CancelledError:
             # Close Budget account on cancel (release unsettled reservations)
@@ -251,7 +266,11 @@ class AgentGraphRunner:
             iteration_limit=(
                 turn_config.iteration_limit
                 if turn_config is not None
-                else self.iteration_limit
+                else (
+                    int(state.run_options["max_iterations"])
+                    if state.run_options.get("max_iterations")
+                    else self.iteration_limit
+                )
             ),
             budget_exhausted=state.budget_exhausted,
         )
@@ -1106,6 +1125,26 @@ class AgentGraphRunner:
                     state.session_id,
                     exc_info=True,
                 )
+
+        # Curator 周期维护：finalize 后若能证明空闲（距上次 finalize）则触发。
+        # 首次 finalize（_last_finalize_at is None）无法计算 idle，不自动触发，
+        # 避免 min_idle_hours 形同虚设。maybe_run_curator 内部 fire-and-forget
+        # 且 never raises。CLI 手动 run 走 run_curator_review，不经此路径。
+        if self.curator_service is not None and self._last_finalize_at is not None:
+            idle = (
+                datetime.now(timezone.utc) - self._last_finalize_at
+            ).total_seconds()
+            try:
+                asyncio.create_task(
+                    self.curator_service.maybe_run_curator(idle_for_seconds=idle)
+                )
+            except Exception:
+                logger.warning(
+                    "curator trigger failed for session=%s",
+                    state.session_id,
+                    exc_info=True,
+                )
+        self._last_finalize_at = datetime.now(timezone.utc)
 
         return state
 

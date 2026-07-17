@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     skills_backup_keep: int = Field(default=10)
     skills_archive_not_delete: bool = Field(default=True)
 
+    # Skill Curator 周期维护配置
+    skills_curator_enabled: bool = Field(default=True)
+    skills_curator_interval_hours: int = Field(default=168, ge=1)
+    skills_curator_min_idle_hours: float = Field(default=2.0, gt=0)
+    skills_curator_stale_after_days: int = Field(default=30, ge=1)
+    skills_curator_archive_after_days: int = Field(default=90, ge=1)
+    skills_curator_prune_seeds: bool = Field(default=False)
+    skills_curator_consolidate: bool = Field(default=False)
+    skills_curator_consolidate_max_iterations: int = Field(default=64, ge=1)
+
     # Restricted host-terminal bridge (disabled unless every required value is set)
     host_terminal_enabled: bool = Field(default=False)
     host_terminal_bridge_url: str = Field(default="")
