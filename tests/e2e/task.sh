@@ -88,7 +88,7 @@
   assert_contains "$show_json" "\"id\": \"$task_id\""
   assert_contains "$show_json" "\"title\": \"$title\""
   assert_contains "$show_json" "\"body\": \"$body\""
-  assert_contains "$show_json" '"status": "triage"'
+  assert_contains "$show_json" '"status": "queued"'
 
   echo "[Task E2E] list --all"
   list_json="$(docker exec n-agent-n-agent-1 n-agent task list --all --json)"

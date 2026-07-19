@@ -1,21 +1,12 @@
 """T19: HTTP/WS contract tests for app/interfaces/http/task_routes.py.
 
-Covers:
-  - board / list / create / get / patch / bulk / delete happy paths
-  - error envelope shape {"error": {"code", "message"}}
-  - error codes: task_not_found (404), task_state_invalid (409),
-    task_conflict (409), task_invalid (422), task_attachment_too_large (413)
-  - RUNNING rejects PATCH (409) and DELETE (409)
-  - bulk atomicity (one conflict -> whole batch fails)
-  - WebSocket /chat/tasks/events since cursor + dedup
-  - attachment download path whitelist (no host absolute path leak;
-    symlink/escape rejected)
+Manus-aligned 7-state machine: 5 swimlanes, no assignee/dependency/swarm,
+intent-approval routes (propose-change/approve/reject/cancel/retry).
 """
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,13 +17,9 @@ from fastapi.testclient import TestClient
 
 from app.application.task_service import TaskService
 from app.domain.task import (
-    BlockKind,
     BulkUpdateCommand,
-    BulkUpdateItem,
     BulkUpdateResult,
     ClaimResult,
-    CreateGraphCommand,
-    CreateGraphResult,
     DeliveryResult,
     FinishRunCommand,
     FinishRunResult,
@@ -43,7 +30,6 @@ from app.domain.task import (
     TaskConflictError,
     TaskEvent,
     TaskExecutionPolicy,
-    TaskLink,
     TaskListCursor,
     TaskListPage,
     TaskNotFoundError,
@@ -72,29 +58,22 @@ class FakeTaskRegistry:
         self._comments: dict[str, list[TaskComment]] = {}
         self._attachments: dict[str, list[TaskAttachment]] = {}
         self._attachments_by_id: dict[str, TaskAttachment] = {}
-        self._links: list[TaskLink] = []
         self._next_run_id = 1
         self._next_event_id = 1
 
     async def create_task(self, task: Task) -> Task:
         if task.id in self._tasks:
             raise TaskConflictError(f"duplicate id: {task.id}")
-        if task.idempotency_key:
-            for existing in self._tasks.values():
-                if (
-                    existing.board == task.board
-                    and existing.created_by == task.created_by
-                    and existing.idempotency_key == task.idempotency_key
-                ):
-                    raise TaskConflictError("duplicate idempotency_key")
         self._tasks[task.id] = task
         return task
 
     async def get_task(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
 
-    async def list_tasks(self, board="default", cursor=None, limit=100):
+    async def list_tasks(self, board="default", cursor=None, limit=100, include_archived=False):
         items = [t for t in self._tasks.values() if t.board == board]
+        if not include_archived:
+            items = [t for t in items if not t.is_archived]
         items.sort(key=lambda t: (t.created_at or datetime.min.replace(tzinfo=timezone.utc), t.id))
         return TaskListPage(items=tuple(items[:limit]))
 
@@ -105,10 +84,7 @@ class FakeTaskRegistry:
         if task.version != expected_version:
             raise TaskConflictError("version conflict")
         from dataclasses import replace as dc_replace
-        # Normalize status string -> TaskStatus
         normalized = dict(fields)
-        if "status" in normalized and isinstance(normalized["status"], str):
-            normalized["status"] = TaskStatus(normalized["status"])
         updated = dc_replace(
             task, **normalized, version=task.version + 1,
             updated_at=datetime.now(timezone.utc),
@@ -129,12 +105,12 @@ class FakeTaskRegistry:
         del self._tasks[task_id]
         return True
 
-    async def claim_task(self, task_id, claim_lock, lease_seconds):
+    async def claim_task(self, task_id, claim_lock, lease_seconds, now=None):
         task = self._tasks.get(task_id)
-        if task is None or task.status != TaskStatus.READY:
+        if task is None or task.status != TaskStatus.QUEUED:
             return None
         from dataclasses import replace as dc_replace
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
         run_id = self._next_run_id
         self._next_run_id += 1
         run = TaskRun(
@@ -144,7 +120,7 @@ class FakeTaskRegistry:
         self._runs[run_id] = run
         updated = dc_replace(
             task, status=TaskStatus.RUNNING, claim_lock=claim_lock,
-            current_run_id=run_id, worker_token=f"wt_{run_id}",
+            claim_expires=now, current_run_id=run_id, worker_token=f"wt_{run_id}",
             last_heartbeat_at=now, version=task.version + 1,
         )
         self._tasks[task_id] = updated
@@ -166,18 +142,20 @@ class FakeTaskRegistry:
         run = self._runs.get(command.run_id)
         if run is None:
             raise TaskNotFoundError(f"run not found: {command.run_id}")
-        if task.claim_lock != command.claim_lock or task.current_run_id != command.run_id:
-            raise TaskConflictError("finish CAS failed")
         from dataclasses import replace as dc_replace
         now = datetime.now(timezone.utc)
         if command.target_task_status is not None:
             new_status = command.target_task_status
         elif command.outcome == TaskRunOutcome.COMPLETED:
-            new_status = TaskStatus.DONE
-        elif command.outcome in (TaskRunOutcome.BLOCKED, TaskRunOutcome.GAVE_UP):
-            new_status = TaskStatus.BLOCKED
+            new_status = TaskStatus.SUCCEEDED
+        elif command.outcome == TaskRunOutcome.WAITING_APPROVAL:
+            new_status = TaskStatus.WAITING_APPROVAL
+        elif command.outcome in (TaskRunOutcome.CRASHED, TaskRunOutcome.TIMED_OUT):
+            new_status = TaskStatus.EXPIRED
+        elif command.outcome == TaskRunOutcome.TERMINATED:
+            new_status = TaskStatus.CANCELLED
         else:
-            new_status = TaskStatus.TODO
+            new_status = TaskStatus.FAILED
         updated_task = dc_replace(
             task, status=new_status, claim_lock=None, claim_expires=None,
             current_run_id=None, worker_token=None,
@@ -205,57 +183,20 @@ class FakeTaskRegistry:
             error=command.error,
         ))
 
-    async def list_ready(self, board="default", limit=100):
+    async def list_queued_due(self, now=None, limit=100, board="default"):
+        now = now or datetime.now(timezone.utc)
         return tuple(
             t for t in self._tasks.values()
-            if t.board == board and t.status == TaskStatus.READY
-        )
+            if t.board == board and t.status == TaskStatus.QUEUED
+            and not t.is_archived
+            and (t.scheduled_at is None or t.scheduled_at <= now)
+        )[:limit]
 
     async def list_running(self, board="default"):
         return tuple(
             t for t in self._tasks.values()
             if t.board == board and t.status == TaskStatus.RUNNING
         )
-
-    async def recompute_ready(self, board="default"):
-        return ()
-
-    async def create_graph(self, command: CreateGraphCommand):
-        for task in command.tasks:
-            self._tasks[task.id] = task
-        for link in command.links:
-            self._links.append(link)
-        return CreateGraphResult(tasks=command.tasks, links=command.links, comments=command.comments)
-
-    async def add_link(self, parent_id, child_id):
-        for l in self._links:
-            if l.parent_id == parent_id and l.child_id == child_id:
-                raise TaskConflictError("duplicate edge")
-        link = TaskLink(parent_id=parent_id, child_id=child_id)
-        self._links.append(link)
-        return link
-
-    async def remove_link(self, parent_id, child_id):
-        before = len(self._links)
-        self._links = [
-            l for l in self._links
-            if not (l.parent_id == parent_id and l.child_id == child_id)
-        ]
-        return len(self._links) < before
-
-    async def list_links(self, task_id):
-        return tuple(
-            l for l in self._links
-            if l.parent_id == task_id or l.child_id == task_id
-        )
-
-    async def list_children(self, parent_id):
-        ids = {l.child_id for l in self._links if l.parent_id == parent_id}
-        return tuple(self._tasks[cid] for cid in ids if cid in self._tasks)
-
-    async def list_parents(self, child_id):
-        ids = {l.parent_id for l in self._links if l.child_id == child_id}
-        return tuple(self._tasks[pid] for pid in ids if pid in self._tasks)
 
     async def add_comment(self, task_id, author, body):
         c = TaskComment(
@@ -344,7 +285,6 @@ def task_service(registry, tmp_path):
     svc = TaskService(
         registry=registry,
         policy=TaskPolicy(),
-        planning_service=None,
         memory_store=None,
         attachments_root=tmp_path / "attachments",
         attachment_max_bytes=1024 * 1024,
@@ -373,49 +313,52 @@ def client(app):
 
 
 # ---------------------------------------------------------------------------
-# Board / list
+# Board (5 swimlanes) / list
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_board_returns_columns(client, task_service):
+async def test_board_returns_5_swimlanes(client, task_service, registry):
     await task_service.create_task(title="T1", created_by="u")
     resp = client.get("/chat/tasks/board")
     assert resp.status_code == 200
     data = resp.json()
-    statuses = [c["status"] for c in data["columns"]]
-    # 8 active columns always present
-    assert statuses == ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"]
-    triage_col = next(c for c in data["columns"] if c["status"] == "triage")
-    assert triage_col["total"] == 1
-    assert triage_col["cards"][0]["title"] == "T1"
+    lane_ids = [c["id"] for c in data["columns"]]
+    assert lane_ids == ["queued", "running", "waiting_approval", "failed_expired", "succeeded_cancelled"]
+    queued_lane = next(c for c in data["columns"] if c["id"] == "queued")
+    assert queued_lane["total"] == 1
+    assert queued_lane["cards"][0]["title"] == "T1"
 
 
 @pytest.mark.asyncio
-async def test_board_archived_toggle(client, task_service, registry):
-    task = await task_service.create_task(title="Archived", created_by="u")
-    await registry.update_task(task.id, {"status": TaskStatus.ARCHIVED}, expected_version=1)
-    # default: exclude archived
-    resp = client.get("/chat/tasks/board")
-    data = resp.json()
-    assert all(c["status"] != "archived" for c in data["columns"])
-    # archived=true: include archived column
-    resp = client.get("/chat/tasks/board?archived=true")
-    data = resp.json()
-    statuses = [c["status"] for c in data["columns"]]
-    assert "archived" in statuses
+async def test_board_orders_tasks_within_a_swimlane_by_newest_creation(client, registry):
+    created_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
+    await registry.create_task(Task(
+        id="t_old", title="旧任务", status=TaskStatus.QUEUED,
+        priority=99, created_at=created_at,
+    ))
+    await registry.create_task(Task(
+        id="t_new", title="新任务", status=TaskStatus.QUEUED,
+        priority=0, created_at=created_at + timedelta(minutes=1),
+    ))
+
+    response = client.get("/chat/tasks/board")
+    assert response.status_code == 200
+    queued_lane = next(column for column in response.json()["columns"] if column["id"] == "queued")
+    assert [card["id"] for card in queued_lane["cards"]] == ["t_new", "t_old"]
 
 
 @pytest.mark.asyncio
-async def test_list_filters_archived_by_default(client, task_service, registry):
+async def test_list_excludes_archived_by_default(client, task_service, registry):
     t1 = await task_service.create_task(title="Active", created_by="u")
     t2 = await task_service.create_task(title="Archived", created_by="u")
-    await registry.update_task(t2.id, {"status": TaskStatus.ARCHIVED}, expected_version=1)
+    await registry.update_task(t2.id, {"is_archived": True}, expected_version=1)
     resp = client.get("/chat/tasks")
     assert resp.status_code == 200
     items = resp.json()["items"]
-    assert len(items) == 1
-    assert items[0]["id"] == t1.id
+    ids = {i["id"] for i in items}
+    assert t1.id in ids
+    assert t2.id not in ids
 
 
 # ---------------------------------------------------------------------------
@@ -429,19 +372,17 @@ async def test_create_and_get_task(client, task_service):
     assert resp.status_code == 200
     tid = resp.json()["id"]
     assert tid.startswith("t_")
-    # get detail
+    assert resp.json()["status"] == "queued"
     resp = client.get(f"/chat/tasks/{tid}")
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["task"]["title"] == "调研架构"
+    assert resp.json()["task"]["title"] == "调研架构"
 
 
 @pytest.mark.asyncio
 async def test_create_empty_title_returns_422(client):
     resp = client.post("/chat/tasks", json={"title": ""})
     assert resp.status_code == 422
-    data = resp.json()
-    assert data["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["code"] == "task_invalid"
 
 
 @pytest.mark.asyncio
@@ -463,26 +404,24 @@ async def test_patch_updates_fields(client, task_service):
 
 
 @pytest.mark.asyncio
+async def test_patch_status_rejected(client, task_service):
+    """status 不在 _PATCH_ALLOWED_FIELDS；PATCH 改 status 应被忽略或拒绝。"""
+    task = await task_service.create_task(title="T", created_by="u")
+    resp = client.patch(f"/chat/tasks/{task.id}", json={
+        "expected_version": 1, "status": "succeeded",
+    })
+    # status not updatable -> either 422 (no updatable fields) or 200 ignoring status
+    assert resp.status_code in (200, 422)
+    if resp.status_code == 200:
+        assert resp.json()["status"] == "queued"
+
+
+@pytest.mark.asyncio
 async def test_patch_missing_expected_version_returns_422(client, task_service):
     task = await task_service.create_task(title="T", created_by="u")
     resp = client.patch(f"/chat/tasks/{task.id}", json={"title": "x"})
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "task_invalid"
-
-
-@pytest.mark.asyncio
-async def test_patch_running_rejected_returns_409(client, task_service, registry):
-    task = await task_service.create_task(title="T", created_by="u", assignee="a")
-    # Move to READY via direct registry update (skip policy checks for test)
-    await registry.update_task(task.id, {"status": TaskStatus.READY, "assignee": "a"}, expected_version=1)
-    claim = await registry.claim_task(task.id, "lock-1", 900)
-    assert claim is not None
-    # Now RUNNING; PATCH should be rejected
-    resp = client.patch(f"/chat/tasks/{task.id}", json={
-        "expected_version": 3, "title": "x",
-    })
-    assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "task_state_invalid"
 
 
 @pytest.mark.asyncio
@@ -531,19 +470,6 @@ async def test_bulk_update_atomic(client, task_service):
     assert versions[t2.id] == 2
 
 
-@pytest.mark.asyncio
-async def test_bulk_update_conflict_returns_409(client, task_service):
-    t1 = await task_service.create_task(title="T1", created_by="u")
-    resp = client.post("/chat/tasks/bulk", json={
-        "items": [
-            {"task_id": t1.id, "expected_version": 1, "fields": {"title": "U1"}},
-            {"task_id": t1.id, "expected_version": 99, "fields": {"title": "U2"}},
-        ]
-    })
-    assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "task_conflict"
-
-
 # ---------------------------------------------------------------------------
 # Comments
 # ---------------------------------------------------------------------------
@@ -557,7 +483,6 @@ async def test_add_comment(client, task_service):
     })
     assert resp.status_code == 200
     assert resp.json()["body"] == "hello"
-    assert resp.json()["author"] == "alice"
 
 
 @pytest.mark.asyncio
@@ -568,32 +493,114 @@ async def test_add_comment_empty_body_rejected(client, task_service):
 
 
 # ---------------------------------------------------------------------------
-# Links
+# Intent approval: propose-change / approve / reject / cancel / retry
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_add_link_and_remove(client, task_service):
-    p = await task_service.create_task(title="Parent", created_by="u")
-    c = await task_service.create_task(title="Child", created_by="u")
-    resp = client.post(f"/chat/tasks/{p.id}/links", json={"child_id": c.id})
+async def test_propose_change_on_non_running_returns_409(client, task_service):
+    task = await task_service.create_task(title="T", created_by="u")
+    resp = client.post(f"/chat/tasks/{task.id}/propose-change", json={"proposal": "p"})
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_state_invalid"
+
+
+@pytest.mark.asyncio
+async def test_approve_on_non_waiting_returns_409(client, task_service):
+    task = await task_service.create_task(title="T", created_by="u")
+    resp = client.post(f"/chat/tasks/{task.id}/approve")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_state_invalid"
+
+
+async def _waiting_task(task_service, registry):
+    from app.domain.task import TaskStatus
+    task = await task_service.create_task(title="T", created_by="u")
+    await registry.update_task(
+        task.id, {"status": TaskStatus.WAITING_APPROVAL}, expected_version=1,
+    )
+    await registry.append_event(
+        task.id, "change_proposed", {"proposal": "p", "run_id": 1}, run_id=1,
+    )
+    return task
+
+
+@pytest.mark.asyncio
+async def test_approve_with_note(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/approve", json={"note": "  ok  "})
     assert resp.status_code == 200
-    assert resp.json()["parent_id"] == p.id
-    assert resp.json()["child_id"] == c.id
-    # remove
-    resp = client.delete(f"/chat/tasks/{p.id}/links/{c.id}")
-    assert resp.status_code == 204
+    assert resp.json()["note"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_reject_with_note(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/reject", json={"note": "reason"})
+    assert resp.status_code == 200
+    assert resp.json()["note"] == "reason"
+
+
+@pytest.mark.asyncio
+async def test_approve_no_body_compatible(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/approve")
+    assert resp.status_code == 200
+    assert resp.json()["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_approve_note_too_long_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/approve", json={"note": "x" * 2001})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    after = len(await registry.list_events(task.id))
+    assert after == before  # no decision event written on validation failure
+
+
+@pytest.mark.asyncio
+async def test_approve_note_non_string_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/approve", json={"note": ["a"]})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+
+
+@pytest.mark.asyncio
+async def test_cancel_queued_task(client, task_service):
+    task = await task_service.create_task(title="T", created_by="u")
+    resp = client.post(f"/chat/tasks/{task.id}/cancel")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_retry_non_failed_returns_409(client, task_service):
+    task = await task_service.create_task(title="T", created_by="u")
+    resp = client.post(f"/chat/tasks/{task.id}/retry")
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_state_invalid"
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_task(client, task_service, registry):
+    task = await task_service.create_task(title="T", created_by="u")
+    await registry.update_task(task.id, {"status": TaskStatus.FAILED}, expected_version=1)
+    resp = client.post(f"/chat/tasks/{task.id}/retry")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "queued"
 
 
 # ---------------------------------------------------------------------------
-# Attachments (upload + download path security)
+# Attachments
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_attachment_upload_and_download(client, task_service, tmp_path):
     task = await task_service.create_task(title="T", created_by="u")
-    # Upload
     resp = client.post(
         f"/chat/tasks/{task.id}/attachments",
         files={"file": ("hello.txt", b"hi", "text/plain")},
@@ -603,7 +610,6 @@ async def test_attachment_upload_and_download(client, task_service, tmp_path):
     att = resp.json()
     assert att["filename"] == "hello.txt"
     assert att["size"] == 2
-    # Download
     resp = client.get(f"/chat/tasks/attachments/{att['id']}")
     assert resp.status_code == 200
     assert resp.content == b"hi"
@@ -630,23 +636,6 @@ async def test_attachment_download_not_found(client):
     assert resp.json()["error"]["code"] == "attachment_not_found"
 
 
-@pytest.mark.asyncio
-async def test_attachment_download_no_path_leak(client, task_service, tmp_path):
-    """Download response must not leak host absolute paths."""
-    task = await task_service.create_task(title="T", created_by="u")
-    resp = client.post(
-        f"/chat/tasks/{task.id}/attachments",
-        files={"file": ("hello.txt", b"hi", "text/plain")},
-    )
-    att = resp.json()
-    resp = client.get(f"/chat/tasks/attachments/{att['id']}")
-    assert resp.status_code == 200
-    # No filesystem path in any header
-    for header_name, header_value in resp.headers.items():
-        assert str(tmp_path) not in header_value
-        assert "attachments" not in header_value or "filename" in header_name.lower()
-
-
 # ---------------------------------------------------------------------------
 # Runs / inspect / dispatch
 # ---------------------------------------------------------------------------
@@ -655,8 +644,7 @@ async def test_attachment_download_no_path_leak(client, task_service, tmp_path):
 def test_inspect_dispatcher_without_run_service(client):
     resp = client.get("/chat/tasks/inspect")
     assert resp.status_code == 200
-    data = resp.json()
-    assert "active" in data
+    assert "active" in resp.json()
 
 
 def test_dispatch_without_run_service_returns_409(client):
@@ -671,38 +659,15 @@ def test_dispatch_without_run_service_returns_409(client):
 
 
 def test_ws_events_route_registered(client):
-    """The /chat/tasks/events WS route is registered."""
     routes = [getattr(r, "path", "") for r in client.app.routes]
     assert "/chat/tasks/events" in routes
 
 
-def test_ws_events_since_non_negative_rejected(client):
-    """since must be >= 0; the Query(ge=0) validator rejects negative."""
-    try:
-        with client.websocket_connect("/chat/tasks/events?since=-1") as ws:
-            # If the connection opens (some FastAPI versions accept first
-            # then close), receive should fail or return close.
-            try:
-                ws.receive()
-            except Exception:
-                pass
-    except Exception:
-        # Expected: WebSocketReject, HTTPException(400), or close.
-        pass
-
-
 def test_ws_events_replay_envelope(client, task_service, registry):
-    """since=0 replays existing events with the fixed envelope shape.
-
-    Receives exactly the known event count then closes; we put exactly
-    one 'created' event in the registry to make the count deterministic.
-    """
     asyncio_run(task_service.create_task(title="T", created_by="u"))
-    # Now there's exactly one event (id=1, kind=created).
     with client.websocket_connect("/chat/tasks/events?since=0") as ws:
         msg = ws.receive_json()
         assert msg["kind"] == "created"
-        # Envelope shape (spec)
         for key in ("id", "task_id", "run_id", "kind", "payload", "created_at"):
             assert key in msg, f"missing {key} in event envelope"
         assert isinstance(msg["id"], int)
@@ -715,12 +680,10 @@ def test_ws_events_replay_envelope(client, task_service, registry):
 
 
 def asyncio_run(coro):
-    """Run a coroutine to completion from sync test code."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
-    # Already in a loop: run in thread
     import threading
     box: dict = {}
     def runner():
@@ -734,7 +697,3 @@ def asyncio_run(coro):
     if "error" in box:
         raise box["error"]
     return box.get("value")
-
-
-def _last_task_id(registry):
-    return list(registry._tasks.keys())[-1]

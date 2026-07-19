@@ -1,24 +1,28 @@
-"""T10: Application task tool definitions (Application Layer).
+"""T6: Application task tool definitions (Application Layer).
 
-Returns 7 managed ToolDefinitions for the Task subdomain. Each tool:
+Returns 6 managed ToolDefinitions for the Task subdomain (Manus-aligned
+7-state machine). Each tool:
   - source_type=AGENT (worker agent callable)
   - toolset="task"
   - managed=True (ToolPolicy only exposes when trusted_metadata.task context
     present -- pattern twelve gating; OpenAI HTTP clients cannot forge
     trusted_metadata)
-  - risk_level=SAFE (all task tools are safe to execute within a trusted task
-    context; gating is by managed+trusted_metadata, not by risk level)
+  - risk_level=CONFIRM (managed tools require CONFIRM per ToolPolicy)
   - description Chinese (per spec)
   - input_schema per spec tool contract
 
-工具契约（spec）:
-  - task_show:        {task_id} -- 读取 task + 上下文
-  - task_complete:    {summary, metadata, artifacts} -- 提交完成意图
-  - task_block:       {reason, kind} -- 提交阻塞意图（kind 对应 BlockKind）
-  - task_heartbeat:   {note} -- 续租 lease + 记录心跳
-  - task_comment:     {task_id, body} -- 给指定 task 加评论
-  - task_create:      {title, body, assignee, parents, skills} -- 创建子任务
-  - task_link:        {parent_id, child_id} -- 链接依赖
+工具契约（spec, 6 工具）:
+  - task_show:             {task_id} -- 读取 task + 上下文
+  - task_complete:         {summary, metadata, artifacts} -- 提交完成意图
+  - task_heartbeat:        {note} -- 续租 lease + 记录心跳
+  - task_comment:          {task_id, body} -- 给指定 task 加评论
+  - task_propose_change:   {proposal} -- 提出需用户审批的变更提案
+  - task_cancel:           {} -- 取消当前 task
+
+移除的工具（对齐 Manus 扁平状态机）:
+  - task_block:    阻塞意图已由 task_propose_change 的意图审批替代
+  - task_create:   worker 不再自动拆分子任务，创建只通过用户入口
+  - task_link:     依赖图已移除
 """
 from __future__ import annotations
 
@@ -28,26 +32,24 @@ from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 # 工具名常量，供 TaskManagementToolExecutor 与测试引用
 TASK_TOOL_SHOW = "task_show"
 TASK_TOOL_COMPLETE = "task_complete"
-TASK_TOOL_BLOCK = "task_block"
 TASK_TOOL_HEARTBEAT = "task_heartbeat"
 TASK_TOOL_COMMENT = "task_comment"
-TASK_TOOL_CREATE = "task_create"
-TASK_TOOL_LINK = "task_link"
+TASK_TOOL_PROPOSE_CHANGE = "task_propose_change"
+TASK_TOOL_CANCEL = "task_cancel"
 
-# managed 工具集，供 TaskAgentExecutor 写入 permitted_managed_tools
+# managed 工具集（6 工具），供 TaskAgentExecutor 写入 permitted_managed_tools
 TASK_TOOL_NAMES: frozenset[str] = frozenset({
     TASK_TOOL_SHOW,
     TASK_TOOL_COMPLETE,
-    TASK_TOOL_BLOCK,
     TASK_TOOL_HEARTBEAT,
     TASK_TOOL_COMMENT,
-    TASK_TOOL_CREATE,
-    TASK_TOOL_LINK,
+    TASK_TOOL_PROPOSE_CHANGE,
+    TASK_TOOL_CANCEL,
 })
 
 
 def task_tool_definitions() -> list[ToolDefinition]:
-    """返回 7 个 task managed ToolDefinition。
+    """返回 6 个 task managed ToolDefinition。
 
     工具集与 source_type/toolset/managed/risk_level 在所有工具上一致；
     差异在 description 与 input_schema。managed=True 让 ToolPolicy 走
@@ -59,9 +61,9 @@ def task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=TASK_TOOL_SHOW,
             description=(
-                "读取当前 task 的完整上下文：标题、正文、父任务交接、先前尝试摘要、"
-                "评论、最近事件、运行历史与 worker_context。worker 启动后应先调用"
-                "此工具了解任务全貌再开始工作。"
+                "读取当前 task 的完整上下文：标题、正文、待审批提案、审批决策、"
+                "进度事件、评论、最近事件、运行历史与 worker_context。worker 启动后"
+                "应先调用此工具了解任务全貌再开始工作。"
             ),
             input_schema={
                 "type": "object",
@@ -115,30 +117,6 @@ def task_tool_definitions() -> list[ToolDefinition]:
             managed=True,
         ),
         ToolDefinition(
-            name=TASK_TOOL_BLOCK,
-            description=(
-                "提交 task 阻塞意图。reason 为阻塞原因，kind 决定路由："
-                "dependency 回到 TODO 等待父任务；needs_input/capability/transient"
-                "进入 BLOCKED。工具只返回终态意图，最终由 TaskRunService 终结。"
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "minLength": 1},
-                    "kind": {
-                        "type": "string",
-                        "enum": ["dependency", "needs_input", "capability", "transient"],
-                    },
-                },
-                "required": ["reason", "kind"],
-                "additionalProperties": False,
-            },
-            risk_level=RiskLevel.CONFIRM,
-            source_type=ToolSourceType.AGENT,
-            toolset="task",
-            managed=True,
-        ),
-        ToolDefinition(
             name=TASK_TOOL_HEARTBEAT,
             description=(
                 "记录 task 心跳并续租 claim lease。长任务执行中应周期调用，"
@@ -178,28 +156,21 @@ def task_tool_definitions() -> list[ToolDefinition]:
             managed=True,
         ),
         ToolDefinition(
-            name=TASK_TOOL_CREATE,
+            name=TASK_TOOL_PROPOSE_CHANGE,
             description=(
-                "创建当前 task 的直接子任务。title 必填，body/assignee/parents/skills"
-                "可选。parents 不填时默认以当前 task 为 parent。创建后子任务默认 TODO，"
-                "由依赖重算推进到 READY。"
+                "提出需要用户审批的变更提案。当 worker 在执行中遇到需要用户决策"
+                "的修改（如改变方案、确认破坏性操作、关键路径分歧）时调用此工具，"
+                "附带 proposal 文本说明提案内容。调用后本 run 立即结束，task 进入"
+                "WAITING_APPROVAL，等待用户通过 approve/reject 决定后续行：批准后"
+                "按提案继续，拒绝后不得执行该提案。重复调用或 task 已在"
+                "WAITING_APPROVAL 时返回 409 task_state_invalid。"
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "minLength": 1},
-                    "body": {"type": "string"},
-                    "assignee": {"type": "string"},
-                    "parents": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "skills": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
+                    "proposal": {"type": "string", "minLength": 1},
                 },
-                "required": ["title"],
+                "required": ["proposal"],
                 "additionalProperties": False,
             },
             risk_level=RiskLevel.CONFIRM,
@@ -208,18 +179,17 @@ def task_tool_definitions() -> list[ToolDefinition]:
             managed=True,
         ),
         ToolDefinition(
-            name=TASK_TOOL_LINK,
+            name=TASK_TOOL_CANCEL,
             description=(
-                "建立 parent -> child 依赖边。parent 或 child 必须是当前 task，"
-                "且仍走同 board/DAG 校验（拒绝自环、重复边、跨 board、环）。"
+                "取消当前 worker 所属的 task。调用后 task 进入 CANCELLED 终态，"
+                "run 由 TaskRunService 统一终结（释放 claim + 回收 worker）。"
+                "只允许取消当前 worker claim 的 task，仍走 ownership 校验。"
+                "终态 task（SUCCEEDED/CANCELLED/EXPIRED）不可取消。"
             ),
             input_schema={
                 "type": "object",
-                "properties": {
-                    "parent_id": {"type": "string", "minLength": 1},
-                    "child_id": {"type": "string", "minLength": 1},
-                },
-                "required": ["parent_id", "child_id"],
+                "properties": {},
+                "required": [],
                 "additionalProperties": False,
             },
             risk_level=RiskLevel.CONFIRM,

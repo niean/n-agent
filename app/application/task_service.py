@@ -1,27 +1,24 @@
-"""T12: Application TaskService -- CRUD, orchestration, and worker-facing ops.
+"""T4: Application TaskService -- Manus-aligned 7-state machine.
 
-Satisfies ``TaskServiceProtocol`` from
-``app/infrastructure/tools/task_management.py`` (the 7 managed tool surface)
-PLUS full CRUD, attachment, and notify-subscription management.
+CRUD, attachments, worker context, and user actions (propose/approve/reject/
+cancel/retry). The dependency graph (``add_link`` / ``unlink`` /
+``list_links`` / ``list_children`` / ``list_parents``), swarm planning
+(``specify`` / ``decompose`` / ``create_swarm``), the ``planning_service``
+constructor parameter, and the ``assignee`` field have all been removed.
+
+State changes go through domain methods (``Task.propose_change`` /
+``resolve_approval`` / ``cancel`` / ``retry`` / ``complete`` / ``set_archived``)
+followed by ``registry.update_task`` with ``expected_version`` CAS. Run
+finalization (claim release + worker cancel) is owned by TaskRunService;
+``propose_change`` and ``cancel_task`` delegate to it when injected and
+otherwise only advance state + write the audit event.
 
 Injection:
   - ``TaskRegistry`` (Domain port -- async Protocol)
   - ``TaskPolicy`` (14th domain Policy)
-  - ``TaskPlanningService`` (optional, Batch E -- specify/decompose/swarm)
   - ``MemoryStore`` (optional, for execution_session cleanup on delete)
   - ``attachments_root`` (Path -- controlled directory for attachment files)
   - ``attachment_max_bytes`` / ``attachment_task_max_bytes`` (size limits)
-
-Key invariants (spec):
-  - title non-empty; idempotency_key unique on (board, created_by, idempotency_key)
-  - All updates receive expected_version (optimistic lock)
-  - RUNNING Task rejects generic update/delete/archive
-  - DELETE is hard-delete, non-RUNNING only; transactional row delete + file cleanup
-  - complete/block return terminal INTENT only -- they do NOT call finish_run.
-    TaskRunService (T14) owns the single CAS-based finalization path.
-  - heartbeat records via registry.record_heartbeat (CAS on claim_lock)
-  - build_worker_context constructs the worker prompt context, excluding host
-    absolute paths
 """
 from __future__ import annotations
 
@@ -38,20 +35,16 @@ from typing import Any
 from uuid import uuid4
 
 from app.domain.task import (
-    BlockKind,
     BulkUpdateCommand,
     BulkUpdateItem,
-    CreateGraphCommand,
     FinishRunCommand,
     Task,
     TaskAttachment,
-    TaskArtifact,
     TaskClaimError,
     TaskComment,
     TaskConflictError,
     TaskEvent,
     TaskExecutionPolicy,
-    TaskLink,
     TaskListCursor,
     TaskListPage,
     TaskNotFoundError,
@@ -62,7 +55,7 @@ from app.domain.task import (
     TaskValidationError,
     TaskWorkspaceKind,
 )
-from app.domain.task_policy import TaskPolicy, TaskPolicyRequest
+from app.domain.task_policy import TaskPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -75,46 +68,72 @@ _CONTEXT_BODY_LIMIT = 8192
 _CONTEXT_COMMENT_LIMIT = 2048
 _CONTEXT_EVENT_LIMIT = 4096
 _CONTEXT_RUN_LIMIT = 2048
+_CONTEXT_PROPOSAL_LIMIT = 2048
+_CONTEXT_DECISION_LIMIT = 1024
+_CONTEXT_PROGRESS_LIMIT = 4096
 _MAX_EVENTS_IN_DETAIL = 50
 _MAX_RUNS_IN_DETAIL = 20
+_MAX_PROGRESS_EVENTS = 10
 
 # Filename validation: reject path separators, control chars, dots-only
 _FILENAME_SAFE_RE = re.compile(r"^[^\x00-\x1f/\\<>:""|?*\x7f]+$")
 _FILENAME_DOT_RE = re.compile(r"^\.+$")
 
-# Default attachment limits (overridden by Settings in Batch F wiring)
+# Default attachment limits (overridden by Settings in wiring)
 _DEFAULT_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 _DEFAULT_ATTACHMENT_TASK_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
 
-# Terminal intent event kinds (non-terminal audit; TaskRunService writes the
-# actual terminal "finished" event)
+# Intent event kinds (non-terminal audit; TaskRunService writes the actual
+# terminal "finished" event)
 _INTENT_COMPLETE = "complete_requested"
-_INTENT_BLOCK = "block_requested"
+
+# Event kinds used by the propose/approve/reject/cancel/retry surface
+_EVENT_CHANGE_PROPOSED = "change_proposed"
+_EVENT_CHANGE_APPROVED = "change_approved"
+_EVENT_CHANGE_REJECTED = "change_rejected"
+_EVENT_CANCELLED = "cancelled"
+_EVENT_RETRIED = "retried"
+
+# Event kinds surfaced in the worker context "progress" segment
+_PROGRESS_EVENT_KINDS: frozenset[str] = frozenset({
+    "comment_added",
+    _INTENT_COMPLETE,
+    _EVENT_CHANGE_PROPOSED,
+    _EVENT_CHANGE_APPROVED,
+    _EVENT_CHANGE_REJECTED,
+    _EVENT_CANCELLED,
+    _EVENT_RETRIED,
+    "finished",
+})
 
 # Notification-worthy terminal outcomes (spec: only these trigger delivery)
 _NOTIFIED_OUTCOMES: frozenset[TaskRunOutcome] = frozenset({
     TaskRunOutcome.COMPLETED,
-    TaskRunOutcome.BLOCKED,
-    TaskRunOutcome.GAVE_UP,
+    TaskRunOutcome.WAITING_APPROVAL,
+    TaskRunOutcome.FAILED,
     TaskRunOutcome.CRASHED,
     TaskRunOutcome.TIMED_OUT,
+    TaskRunOutcome.EXPIRED,
     TaskRunOutcome.TERMINATED,
 })
 
 
 class TaskService:
-    """Application service for Task CRUD, orchestration, and worker ops.
+    """Application service for Task CRUD, worker ops, and user actions.
 
-    Satisfies ``TaskServiceProtocol`` (get_task_detail/complete/block/
-    heartbeat/add_comment/create_subtask/link/build_worker_context) plus
-    full CRUD, bulk update, attachments, and notify subscriptions.
+    Satisfies the Manus-aligned 7-state surface: create (default QUEUED),
+    propose_change / approve_change / reject_change (intent approval),
+    cancel_task, retry_task, complete, heartbeat, set_archived, plus full
+    CRUD, bulk update, attachments, and notify subscriptions.
+
+    State changes use domain methods + ``registry.update_task`` CAS. Run
+    finalization is delegated to TaskRunService when injected.
     """
 
     def __init__(
         self,
         registry: Any,
         policy: TaskPolicy,
-        planning_service: Any | None = None,
         memory_store: Any | None = None,
         attachments_root: Path | None = None,
         attachment_max_bytes: int = _DEFAULT_ATTACHMENT_MAX_BYTES,
@@ -122,13 +141,13 @@ class TaskService:
     ):
         self.registry = registry
         self.policy = policy
-        self.planning_service = planning_service
         self.memory_store = memory_store
         self.attachments_root = (
             Path(attachments_root) if attachments_root is not None else None
         )
         self.attachment_max_bytes = attachment_max_bytes
         self.attachment_task_max_bytes = attachment_task_max_bytes
+        self._run_service: Any = None
 
     # ------------------------------------------------------------------
     # CRUD
@@ -139,12 +158,12 @@ class TaskService:
         *,
         title: str,
         body: str = "",
-        assignee: str | None = None,
         priority: int = 0,
         created_by: str = "",
         board: str = "default",
         idempotency_key: str | None = None,
         origin_session_id: str | None = None,
+        scheduled_at: datetime | None = None,
         skills: tuple[str, ...] | list[str] | None = None,
         execution_policy: TaskExecutionPolicy | None = None,
         workspace_kind: TaskWorkspaceKind = TaskWorkspaceKind.SCRATCH,
@@ -158,11 +177,15 @@ class TaskService:
         if not title or not title.strip():
             raise TaskValidationError("title must not be empty")
         if board != "default":
-            raise TaskValidationError("only 'default' board is accepted in this iteration")
+            raise TaskValidationError(
+                "only 'default' board is accepted in this iteration"
+            )
 
         # Idempotency: if key provided, check for existing task
         if idempotency_key:
-            existing = await self._find_by_idempotency(board, created_by, idempotency_key)
+            existing = await self._find_by_idempotency(
+                board, created_by, idempotency_key
+            )
             if existing is not None:
                 return existing
 
@@ -171,15 +194,15 @@ class TaskService:
             id=f"t_{uuid4().hex[:16]}",
             title=title.strip(),
             body=body,
-            assignee=assignee,
             priority=priority,
             created_by=created_by,
             created_at=now,
             updated_at=now,
             version=1,
-            status=TaskStatus.TRIAGE,
+            status=TaskStatus.QUEUED,
             board=board,
             origin_session_id=origin_session_id,
+            scheduled_at=scheduled_at,
             skills=tuple(skills) if skills else (),
             execution_policy=execution_policy or TaskExecutionPolicy(),
             workspace_kind=workspace_kind,
@@ -192,7 +215,9 @@ class TaskService:
             idempotency_key=idempotency_key,
         )
         created = await self.registry.create_task(task)
-        await self.registry.append_event(created.id, "created", {"title": created.title})
+        await self.registry.append_event(
+            created.id, "created", {"title": created.title}
+        )
         return created
 
     async def get_task(self, task_id: str) -> Task:
@@ -220,11 +245,24 @@ class TaskService:
             raise TaskStateError(
                 f"cannot update RUNNING task {task_id}; terminate first"
             )
+        # Spec: status changes must go through propose/approve/reject/cancel/
+        # retry or run finalization, never via generic PATCH.
+        if "status" in fields:
+            raise TaskStateError(
+                "status cannot be changed via update_task; use "
+                "propose_change/approve_change/reject_change/cancel_task/"
+                "retry_task or run finalization"
+            )
         return await self.registry.update_task(task_id, fields, expected_version)
 
     async def bulk_update(self, command: BulkUpdateCommand) -> tuple[Task, ...]:
-        # Pre-check: reject if any task is RUNNING
+        # Pre-check: reject if any task is RUNNING or any item tries to set
+        # status (status must go through action methods).
         for item in command.items:
+            if "status" in item.fields:
+                raise TaskStateError(
+                    "status cannot be changed via bulk_update; use action methods"
+                )
             task = await self.registry.get_task(item.task_id)
             if task is not None and task.status == TaskStatus.RUNNING:
                 raise TaskStateError(
@@ -271,96 +309,280 @@ class TaskService:
         return True
 
     # ------------------------------------------------------------------
-    # State transitions (assign / promote / schedule / archive)
+    # Soft-delete archive flag (does NOT change status)
     # ------------------------------------------------------------------
 
-    async def assign(
-        self, task_id: str, assignee: str | None, expected_version: int
+    async def set_archived(
+        self, task_id: str, value: bool, expected_version: int
     ) -> Task:
-        return await self.update_task(
-            task_id, {"assignee": assignee}, expected_version
-        )
+        """Toggle ``is_archived`` without changing status.
 
-    async def promote_to_ready(self, task_id: str, expected_version: int) -> Task:
-        task = await self.get_task(task_id)
-        if task.status not in (TaskStatus.TODO, TaskStatus.SCHEDULED):
-            raise TaskStateError(
-                f"promote_to_ready requires TODO or SCHEDULED, got {task.status.value}"
-            )
-        return await self.update_task(
-            task_id, {"status": TaskStatus.READY}, expected_version
-        )
-
-    async def schedule(
-        self,
-        task_id: str,
-        scheduled_at: datetime,
-        expected_version: int,
-    ) -> Task:
-        return await self.update_task(
-            task_id, {"scheduled_at": scheduled_at, "status": TaskStatus.SCHEDULED},
-            expected_version,
-        )
-
-    async def archive(self, task_id: str, expected_version: int) -> Task:
+        Archive is a soft-delete flag for list/board visibility; it is NOT a
+        lifecycle state and never triggers run finalization. RUNNING tasks
+        cannot be archived (terminate first).
+        """
         task = await self.get_task(task_id)
         if task.status == TaskStatus.RUNNING:
-            raise TaskStateError("cannot archive RUNNING task; terminate first")
-        if task.status == TaskStatus.ARCHIVED:
-            return task
-        return await self.update_task(
-            task_id,
-            {"status": TaskStatus.ARCHIVED, "pre_archive_status": task.status},
-            expected_version,
-        )
-
-    async def unarchive(self, task_id: str, expected_version: int) -> Task:
-        task = await self.get_task(task_id)
-        if task.status != TaskStatus.ARCHIVED:
             raise TaskStateError(
-                f"unarchive requires ARCHIVED, got {task.status.value}"
+                "cannot archive RUNNING task; terminate first"
             )
-        restored = task.pre_archive_status or TaskStatus.TODO
-        return await self.update_task(
+        return await self.registry.update_task(
+            task_id, {"is_archived": bool(value)}, expected_version,
+        )
+
+    # ------------------------------------------------------------------
+    # Intent approval: propose_change / approve_change / reject_change
+    # ------------------------------------------------------------------
+
+    async def propose_change(
+        self,
+        task_id: str,
+        proposal: str,
+        run_id: int,
+    ) -> dict[str, Any]:
+        """Worker proposes a change requiring user approval.
+
+        Validates the task is RUNNING and ``run_id`` matches
+        ``current_run_id``. Writes a ``change_proposed`` event (with proposal
+        + run_id), advances the task to WAITING_APPROVAL via the domain
+        method, and CAS-updates the registry. If a TaskRunService is
+        injected, delegates run finalization (claim release + worker cancel)
+        with outcome=waiting_approval; otherwise only state + event are
+        written (T5 wires the cleanup path).
+        """
+        if not proposal or not proposal.strip():
+            raise TaskValidationError("proposal must not be empty")
+
+        task = await self.get_task(task_id)
+        if task.status != TaskStatus.RUNNING:
+            raise TaskStateError(
+                f"propose_change requires RUNNING, got {task.status.value}"
+            )
+        if task.current_run_id is None or task.current_run_id != run_id:
+            raise TaskStateError(
+                f"run_id mismatch: expected {task.current_run_id}, got {run_id}"
+            )
+        if not task.claim_lock:
+            raise TaskStateError("task has no active claim")
+
+        # Write the change_proposed event first; its id serves as the
+        # proposal_event_id that approve/reject will reference.
+        event = await self.registry.append_event(
             task_id,
-            {"status": restored, "pre_archive_status": None},
-            expected_version,
+            _EVENT_CHANGE_PROPOSED,
+            {"proposal": proposal, "run_id": run_id},
+            run_id=run_id,
         )
 
-    # ------------------------------------------------------------------
-    # Dependency graph
-    # ------------------------------------------------------------------
+        # Delegate run finalization to TaskRunService when injected (unified
+        # claim-release + worker-cancel path). Otherwise advance state in
+        # place; T5's run finalization will release the claim atomically.
+        delegated = False
+        if self._run_service is not None:
+            finalize = getattr(self._run_service, "finalize_propose", None)
+            if finalize is not None:
+                try:
+                    await finalize(task_id, run_id, task.claim_lock, proposal)
+                    delegated = True
+                except Exception as exc:
+                    logger.warning(
+                        "run_service.finalize_propose failed for %s: %s",
+                        task_id, exc,
+                    )
 
-    async def link(self, parent_id: str, child_id: str) -> dict[str, Any]:
-        link = await self.registry.add_link(parent_id, child_id)
-        await self.registry.append_event(
-            parent_id, "link_added", {"parent_id": parent_id, "child_id": child_id}
-        )
+        if not delegated:
+            # Advance state ourselves (claim release is T5's job in
+            # production; tests verify state + event only).
+            updated = task.propose_change(proposal, run_id)
+            await self.registry.update_task(
+                task_id,
+                {"status": updated.status},
+                task.version,
+            )
+
         return {
-            "parent_id": link.parent_id,
-            "child_id": link.child_id,
+            "outcome": TaskRunOutcome.WAITING_APPROVAL.value,
+            "proposal": proposal,
+            "run_id": run_id,
+            "proposal_event_id": event.id,
+            "task_id": task_id,
         }
 
-    async def unlink(self, parent_id: str, child_id: str) -> bool:
-        removed = await self.registry.remove_link(parent_id, child_id)
-        if removed:
-            await self.registry.append_event(
-                parent_id, "link_removed",
-                {"parent_id": parent_id, "child_id": child_id},
+    async def approve_change(self, task_id: str, note: str | None = None) -> dict[str, Any]:
+        """User approves the latest unresolved proposal.
+
+        ``note`` is an optional user-supplied approval comment/feedback;
+        persisted in the change_approved event payload and surfaced to the
+        worker via build_worker_context on the next run.
+
+        Validates the task is WAITING_APPROVAL. Finds the latest
+        ``change_proposed`` event without a subsequent
+        ``change_approved``/``change_rejected`` event, writes a
+        ``change_approved`` event referencing it, and advances the task to
+        QUEUED via ``resolve_approval(True)``. ``scheduled_at`` is NOT
+        changed.
+        """
+        return await self._resolve_approval(task_id, approved=True, note=note)
+
+    async def reject_change(self, task_id: str, note: str | None = None) -> dict[str, Any]:
+        """User rejects the latest unresolved proposal.
+
+        ``note`` is an optional rejection reason; same persistence/feedback
+        contract as approve_change.
+
+        Same contract as ``approve_change`` but writes ``change_rejected``
+        and calls ``resolve_approval(False)``. The task still returns to
+        QUEUED (next run may choose a different path or re-propose).
+        """
+        return await self._resolve_approval(task_id, approved=False, note=note)
+
+    async def _resolve_approval(
+        self, task_id: str, approved: bool, note: str | None = None,
+    ) -> dict[str, Any]:
+        task = await self.get_task(task_id)
+        if task.status != TaskStatus.WAITING_APPROVAL:
+            raise TaskStateError(
+                f"resolve_approval requires WAITING_APPROVAL, "
+                f"got {task.status.value}"
             )
-        return removed
 
-    async def list_links(self, task_id: str) -> tuple[TaskLink, ...]:
-        await self.get_task(task_id)
-        return await self.registry.list_links(task_id)
+        proposal_event_id = await self._find_latest_open_proposal(task_id)
+        decision = "approved" if approved else "rejected"
+        event_kind = (
+            _EVENT_CHANGE_APPROVED if approved else _EVENT_CHANGE_REJECTED
+        )
+        payload: dict[str, Any] = {
+            "decision": decision,
+            "note": note,
+        }
+        if proposal_event_id is not None:
+            payload["proposal_event_id"] = proposal_event_id
 
-    async def list_children(self, parent_id: str) -> tuple[Task, ...]:
-        await self.get_task(parent_id)
-        return await self.registry.list_children(parent_id)
+        await self.registry.append_event(task_id, event_kind, payload)
 
-    async def list_parents(self, child_id: str) -> tuple[Task, ...]:
-        await self.get_task(child_id)
-        return await self.registry.list_parents(child_id)
+        updated = task.resolve_approval(approved)
+        # scheduled_at is intentionally NOT changed (spec).
+        await self.registry.update_task(
+            task_id,
+            {"status": updated.status},
+            task.version,
+        )
+        return {
+            "task_id": task_id,
+            "decision": decision,
+            "proposal_event_id": proposal_event_id,
+            "note": note,
+            "status": updated.status.value,
+        }
+
+    async def _find_latest_open_proposal(self, task_id: str) -> int | None:
+        """Return the id of the latest unresolved ``change_proposed`` event.
+
+        "Unresolved" = no ``change_approved``/``change_rejected`` event
+        with id greater than the proposal's id exists.
+        """
+        events = await self.registry.list_events(
+            task_id, limit=_MAX_EVENTS_IN_DETAIL
+        )
+        # Walk backwards to find the latest change_proposed.
+        for event in reversed(events):
+            if event.kind != _EVENT_CHANGE_PROPOSED:
+                continue
+            # Check if a later decision event exists.
+            resolved = any(
+                e.id > event.id
+                and e.kind in (_EVENT_CHANGE_APPROVED, _EVENT_CHANGE_REJECTED)
+                and e.payload.get("proposal_event_id") == event.id
+                for e in events
+            )
+            if not resolved:
+                return event.id
+        return None
+
+    # ------------------------------------------------------------------
+    # cancel_task / retry_task (user actions)
+    # ------------------------------------------------------------------
+
+    async def cancel_task(self, task_id: str) -> dict[str, Any]:
+        """User cancels a task.
+
+        Allowed source states: QUEUED / RUNNING / WAITING_APPROVAL / FAILED.
+        Terminal states (SUCCEEDED / CANCELLED) and EXPIRED are rejected.
+
+        For RUNNING tasks, delegates to TaskRunService.terminate (when
+        injected) to cancel the worker and release the claim via the unified
+        run-finalization path. For non-RUNNING tasks, CAS-updates status to
+        CANCELLED and writes a ``cancelled`` event.
+        """
+        task = await self.get_task(task_id)
+        # Domain validation (raises TaskStateError for terminal / EXPIRED)
+        target = task.cancel()
+
+        if task.status == TaskStatus.RUNNING and self._run_service is not None:
+            terminate = getattr(self._run_service, "terminate", None)
+            if terminate is not None:
+                try:
+                    await terminate(task_id)
+                    await self.registry.append_event(
+                        task_id,
+                        _EVENT_CANCELLED,
+                        {"source": task.status.value},
+                    )
+                    return {
+                        "task_id": task_id,
+                        "status": TaskStatus.CANCELLED.value,
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "run_service.terminate failed for %s: %s",
+                        task_id, exc,
+                    )
+
+        # Non-RUNNING path (or no run_service): CAS status -> CANCELLED.
+        await self.registry.update_task(
+            task_id,
+            {"status": TaskStatus.CANCELLED},
+            task.version,
+        )
+        await self.registry.append_event(
+            task_id,
+            _EVENT_CANCELLED,
+            {"source": task.status.value},
+        )
+        return {
+            "task_id": task_id,
+            "status": TaskStatus.CANCELLED.value,
+        }
+
+    async def retry_task(self, task_id: str) -> dict[str, Any]:
+        """User retries a FAILED or EXPIRED task.
+
+        Returns the task to QUEUED (clearing claim fields via the domain
+        method) and writes a ``retried`` event. ``is_archived`` is NOT
+        changed.
+        """
+        task = await self.get_task(task_id)
+        # Domain validation (raises TaskStateError unless FAILED / EXPIRED)
+        updated = task.retry()
+        await self.registry.update_task(
+            task_id,
+            {
+                "status": updated.status,
+                "claim_lock": None,
+                "claim_expires": None,
+                "current_run_id": None,
+            },
+            task.version,
+        )
+        await self.registry.append_event(
+            task_id,
+            _EVENT_RETRIED,
+            {"source": task.status.value},
+        )
+        return {
+            "task_id": task_id,
+            "status": updated.status.value,
+        }
 
     # ------------------------------------------------------------------
     # Comments
@@ -568,34 +790,28 @@ class TaskService:
         )
 
     # ------------------------------------------------------------------
-    # Worker-facing ops (TaskServiceProtocol)
+    # Worker-facing ops
     # ------------------------------------------------------------------
 
     async def get_task_detail(self, task_id: str) -> dict[str, Any] | None:
         """Return full task detail for task_show tool / worker context.
 
-        Includes task, parents, children, comments, recent events, runs, and
-        the worker_context string. Attachments return controlled download
-        references (id + filename), never host absolute paths.
+        Includes task, comments, recent events, runs, attachments, and the
+        worker_context string. Dependency-graph fields (parents/children/
+        links) have been removed.
         """
         task = await self.registry.get_task(task_id)
         if task is None:
             return None
-        parents = await self.registry.list_parents(task_id)
-        children = await self.registry.list_children(task_id)
         comments = await self.registry.list_comments(task_id)
-        events = await self.registry.list_events(task_id, limit=_MAX_EVENTS_IN_DETAIL)
+        events = await self.registry.list_events(
+            task_id, limit=_MAX_EVENTS_IN_DETAIL
+        )
         runs = await self.registry.list_runs(task_id, limit=_MAX_RUNS_IN_DETAIL)
         attachments = await self.registry.list_attachments(task_id)
-        links = await self.registry.list_links(task_id)
-        worker_context = self.build_worker_context(task)
+        worker_context = await self.build_worker_context(task)
         return {
             "task": _task_to_dict(task),
-            "parents": [_task_to_dict(p) for p in parents],
-            "children": [_task_to_dict(c) for c in children],
-            "links": [
-                {"parent_id": l.parent_id, "child_id": l.child_id} for l in links
-            ],
             "comments": [
                 {
                     "id": c.id,
@@ -681,44 +897,6 @@ class TaskService:
         )
         return intent
 
-    async def block(
-        self,
-        task_id: str,
-        reason: str,
-        kind: str,
-    ) -> dict[str, Any]:
-        """Submit block intent. Does NOT finalize the run.
-
-        Validates the task is RUNNING, appends a ``block_requested`` audit
-        event, and returns the intent dict. TaskRunService performs the CAS
-        finalize.
-        """
-        task = await self.get_task(task_id)
-        if task.status != TaskStatus.RUNNING:
-            raise TaskStateError(
-                f"block requires RUNNING, got {task.status.value}"
-            )
-        if not task.claim_lock or task.current_run_id is None:
-            raise TaskStateError("task has no active claim")
-        try:
-            block_kind = BlockKind(kind)
-        except ValueError as exc:
-            raise TaskValidationError(
-                f"invalid block kind: {kind}"
-            ) from exc
-
-        intent = {
-            "outcome": TaskRunOutcome.BLOCKED.value,
-            "reason": reason,
-            "kind": block_kind.value,
-            "task_id": task_id,
-            "run_id": task.current_run_id,
-        }
-        await self.registry.append_event(
-            task_id, _INTENT_BLOCK, intent, run_id=task.current_run_id,
-        )
-        return intent
-
     async def heartbeat(self, task_id: str, note: str) -> dict[str, Any]:
         """Record heartbeat (CAS on claim_lock) and renew lease."""
         task = await self.get_task(task_id)
@@ -739,54 +917,25 @@ class TaskService:
             )
         return {"task_id": task_id, "heartbeat_at": _dt_str(now)}
 
-    async def create_subtask(
-        self,
-        parent_task_id: str,
-        title: str,
-        body: str = "",
-        assignee: str | None = None,
-        parents: list[str] | None = None,
-        skills: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Create a subtask linked to the parent. parents list must include
-        parent_task_id (enforced by the tool executor)."""
-        await self.get_task(parent_task_id)
-        child = await self.create_task(
-            title=title,
-            body=body,
-            assignee=assignee,
-            skills=tuple(skills) if skills else None,
-        )
-        # Link parent -> child
-        effective_parents = parents or [parent_task_id]
-        for pid in effective_parents:
-            await self.registry.add_link(pid, child.id)
-        await self.registry.append_event(
-            parent_task_id, "subtask_created",
-            {"child_id": child.id, "title": title},
-        )
-        return {
-            "id": child.id,
-            "title": child.title,
-            "status": child.status.value,
-            "parents": effective_parents,
-        }
-
     # ------------------------------------------------------------------
-    # build_worker_context
+    # build_worker_context (async; queries events for proposal/decision/
+    # progress segments)
     # ------------------------------------------------------------------
 
-    def build_worker_context(self, task: Task) -> str:
+    async def build_worker_context(self, task: Task) -> str:
         """Construct worker context string for the system prompt.
 
-        Includes title, body, prior attempts summaries, parent handoffs,
-        comments thread, and attachment paths (controlled references only --
-        never host absolute paths).
+        Includes:
+          - Title + body
+          - Meta (priority, scheduled_at)
+          - Goal mode / skills (if set)
+          - Identity (task_id, status, is_archived)
+          - 待审批提案: latest unresolved ``change_proposed`` event
+          - 审批决策: latest ``change_approved`` / ``change_rejected`` event
+          - 进度: recent events (comment/complete/propose/approve/reject/
+            retry/cancel/finished)
 
-        This is a SYNCHRONOUS method (no registry calls) because the task
-        is already loaded by the caller. Parents/children/comments/events are
-        fetched separately by get_task_detail; this method only formats the
-        task itself.
+        Host absolute paths (e.g. workspace_path) are NOT emitted.
         """
         segments: list[str] = []
         # Title + body
@@ -794,11 +943,10 @@ class TaskService:
         if task.body:
             body = _truncate(task.body, _CONTEXT_BODY_LIMIT)
             segments.append(f"\n## Body\n{body}")
-        # Priority + assignee
-        meta_parts: list[str] = []
-        meta_parts.append(f"priority: {task.priority}")
-        if task.assignee:
-            meta_parts.append(f"assignee: {task.assignee}")
+        # Meta
+        meta_parts: list[str] = [f"priority: {task.priority}"]
+        if task.scheduled_at is not None:
+            meta_parts.append(f"scheduled_at: {_dt_str(task.scheduled_at)}")
         segments.append(f"\n## Meta\n{', '.join(meta_parts)}")
         # Execution hints
         if task.goal_mode:
@@ -806,11 +954,110 @@ class TaskService:
             segments.append(f"\n## Goal Mode\nmax_turns: {turns}")
         if task.skills:
             segments.append(f"\n## Skills\n{', '.join(task.skills)}")
-        # Status + id
-        segments.append(
-            f"\n## Identity\ntask_id: {task.id}\nstatus: {task.status.value}"
-        )
+        # Identity
+        identity_parts = [
+            f"task_id: {task.id}",
+            f"status: {task.status.value}",
+        ]
+        if task.is_archived:
+            identity_parts.append("is_archived: true")
+        segments.append(f"\n## Identity\n{', '.join(identity_parts)}")
+
+        # Event-based segments (require registry query)
+        try:
+            events = await self.registry.list_events(
+                task.id, limit=_MAX_EVENTS_IN_DETAIL
+            )
+        except Exception:
+            events = ()
+
+        # 待审批提案: latest unresolved change_proposed
+        proposal_text = self._latest_open_proposal_text(events)
+        if proposal_text is not None:
+            truncated = _truncate(proposal_text, _CONTEXT_PROPOSAL_LIMIT)
+            segments.append(f"\n## 待审批提案\n{truncated}")
+
+        # 审批决策: latest change_approved / change_rejected
+        decision = self._latest_decision_text(events)
+        if decision is not None:
+            truncated = _truncate(decision, _CONTEXT_DECISION_LIMIT)
+            segments.append(f"\n## 审批决策\n{truncated}")
+
+        # 进度: recent progress events
+        progress_lines = self._progress_lines(events)
+        if progress_lines:
+            body = "\n".join(progress_lines)
+            truncated = _truncate(body, _CONTEXT_PROGRESS_LIMIT)
+            segments.append(f"\n## 进度\n{truncated}")
+
         return "\n".join(segments)
+
+    def _latest_open_proposal_text(
+        self, events: tuple[TaskEvent, ...]
+    ) -> str | None:
+        """Return the proposal text of the latest unresolved proposal."""
+        for event in reversed(events):
+            if event.kind != _EVENT_CHANGE_PROPOSED:
+                continue
+            resolved = any(
+                e.id > event.id
+                and e.kind in (_EVENT_CHANGE_APPROVED, _EVENT_CHANGE_REJECTED)
+                and e.payload.get("proposal_event_id") == event.id
+                for e in events
+            )
+            if not resolved:
+                return str(event.payload.get("proposal", ""))
+        return None
+
+    def _latest_decision_text(
+        self, events: tuple[TaskEvent, ...]
+    ) -> str | None:
+        """Return a human-readable line for the latest approval decision."""
+        for event in reversed(events):
+            if event.kind == _EVENT_CHANGE_APPROVED:
+                base = f"approved (proposal_event_id={event.payload.get('proposal_event_id')})"
+                note = event.payload.get("note")
+                return base + (f", note={note}" if note else "")
+            if event.kind == _EVENT_CHANGE_REJECTED:
+                base = f"rejected (proposal_event_id={event.payload.get('proposal_event_id')})"
+                note = event.payload.get("note")
+                return base + (f", note={note}" if note else "")
+        return None
+
+    def _progress_lines(
+        self, events: tuple[TaskEvent, ...]
+    ) -> list[str]:
+        """Return formatted lines for the latest N progress events."""
+        relevant = [
+            e for e in events if e.kind in _PROGRESS_EVENT_KINDS
+        ]
+        recent = relevant[-_MAX_PROGRESS_EVENTS:]
+        lines: list[str] = []
+        for event in recent:
+            ts = _dt_str(event.created_at) or ""
+            if event.kind == "comment_added":
+                author = event.payload.get("author", "?")
+                lines.append(f"[{ts}] comment by {author}")
+            elif event.kind == _INTENT_COMPLETE:
+                summary = event.payload.get("summary", "")
+                lines.append(f"[{ts}] complete_requested: {summary}")
+            elif event.kind == _EVENT_CHANGE_PROPOSED:
+                proposal = event.payload.get("proposal", "")
+                lines.append(f"[{ts}] propose_change: {proposal}")
+            elif event.kind == _EVENT_CHANGE_APPROVED:
+                note = event.payload.get("note")
+                lines.append(f"[{ts}] change_approved" + (f": {note}" if note else ""))
+            elif event.kind == _EVENT_CHANGE_REJECTED:
+                note = event.payload.get("note")
+                lines.append(f"[{ts}] change_rejected" + (f": {note}" if note else ""))
+            elif event.kind == _EVENT_CANCELLED:
+                lines.append(f"[{ts}] cancelled")
+            elif event.kind == _EVENT_RETRIED:
+                lines.append(f"[{ts}] retried")
+            elif event.kind == "finished":
+                outcome = event.payload.get("outcome", "")
+                lines.append(f"[{ts}] run finished: {outcome}")
+        return lines
 
     # ------------------------------------------------------------------
     # Dispatch delegation
@@ -827,30 +1074,9 @@ class TaskService:
             raise TaskStateError("run_service not configured")
         return await self._run_service.dispatch_once()
 
-    _run_service: Any = None
-
     def set_run_service(self, run_service: Any) -> None:
         """Inject TaskRunService (breaks circular dependency at wiring time)."""
         self._run_service = run_service
-
-    # ------------------------------------------------------------------
-    # Planning delegation (Batch E)
-    # ------------------------------------------------------------------
-
-    async def specify(self, task_id: str, **kwargs: Any) -> Any:
-        if self.planning_service is None:
-            raise TaskStateError("planning_service not configured")
-        return await self.planning_service.specify_task(task_id, **kwargs)
-
-    async def decompose(self, task_id: str, **kwargs: Any) -> Any:
-        if self.planning_service is None:
-            raise TaskStateError("planning_service not configured")
-        return await self.planning_service.decompose_task(task_id, **kwargs)
-
-    async def create_swarm(self, **kwargs: Any) -> Any:
-        if self.planning_service is None:
-            raise TaskStateError("planning_service not configured")
-        return await self.planning_service.create_swarm(**kwargs)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -892,12 +1118,17 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _task_to_dict(task: Task) -> dict[str, Any]:
-    """Serialize a Task to a JSON-safe dict (for tool output / API response)."""
+    """Serialize a Task to a JSON-safe dict (for tool output / API response).
+
+    Manus-aligned: outputs the 7-value ``status``, ``is_archived``,
+    ``scheduled_at``, claim summary, and failure summary. Removed fields:
+    ``assignee``, ``pre_archive_status``, ``block_kind``, ``block_reason``,
+    dependency-graph, swarm.
+    """
     return {
         "id": task.id,
         "title": task.title,
         "body": task.body,
-        "assignee": task.assignee,
         "priority": task.priority,
         "status": task.status.value,
         "board": task.board,
@@ -905,14 +1136,30 @@ def _task_to_dict(task: Task) -> dict[str, Any]:
         "created_by": task.created_by,
         "created_at": _dt_str(task.created_at),
         "updated_at": _dt_str(task.updated_at),
-        "block_kind": task.block_kind.value if task.block_kind else None,
-        "block_reason": task.block_reason,
+        "scheduled_at": _dt_str(task.scheduled_at),
+        "started_at": _dt_str(task.started_at),
+        "completed_at": _dt_str(task.completed_at),
+        "is_archived": task.is_archived,
+        # Claim summary
+        "current_run_id": task.current_run_id,
+        "claim_expires": _dt_str(task.claim_expires),
+        "last_heartbeat_at": _dt_str(task.last_heartbeat_at),
+        # Failure summary
         "consecutive_failures": task.consecutive_failures,
         "max_retries": task.max_retries,
+        "last_failure_error": task.last_failure_error,
+        # Execution config
         "goal_mode": task.goal_mode,
         "goal_max_turns": task.goal_max_turns,
-        "current_run_id": task.current_run_id,
+        "workspace_kind": task.workspace_kind.value,
+        "workspace_path": task.workspace_path,
+        "skills": list(task.skills),
+        "allowed_tools": list(task.execution_policy.allowed_tools),
+        "model_override": task.model_override,
+        "max_runtime_seconds": task.max_runtime_seconds,
+        # Sessions
         "origin_session_id": task.origin_session_id,
         "execution_session_id": task.execution_session_id,
+        # Result
         "result": task.result,
     }

@@ -7,6 +7,7 @@ can monkeypatch), ``asyncio.run`` for async service calls, and
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Any
 
 from app.interfaces.cli.render import (
@@ -74,19 +75,18 @@ def run(args) -> int:
         "show": _cmd_show,
         "create": _cmd_create,
         "delete": _cmd_delete,
-        "assign": _cmd_assign,
-        "promote": _cmd_promote,
         "archive": _cmd_archive,
         "unarchive": _cmd_unarchive,
         "complete": _cmd_complete,
-        "block": _cmd_block,
         "comment": _cmd_comment,
-        "link": _cmd_link,
         "runs": _cmd_runs,
         "events": _cmd_events,
         "dispatch": _cmd_dispatch,
-        "specify": _cmd_specify,
-        "decompose": _cmd_decompose,
+        "cancel": _cmd_cancel,
+        "retry": _cmd_retry,
+        "approve": _cmd_approve,
+        "reject": _cmd_reject,
+        "propose": _cmd_propose,
     }
     handler = dispatch.get(cmd)
     if handler is None:
@@ -141,8 +141,6 @@ def _cmd_create(args) -> int:
     kwargs: dict[str, Any] = {"title": args.title, "created_by": getattr(args, "created_by", "") or "cli"}
     if getattr(args, "body", None):
         kwargs["body"] = args.body
-    if getattr(args, "assignee", None):
-        kwargs["assignee"] = args.assignee
     if getattr(args, "priority", None) is not None:
         kwargs["priority"] = args.priority
     if getattr(args, "goal", False):
@@ -154,32 +152,38 @@ def _cmd_create(args) -> int:
         kwargs["max_runtime_seconds"] = args.max_runtime
     if getattr(args, "max_retries", None) is not None:
         kwargs["max_retries"] = args.max_retries
-    if getattr(args, "triage", False):
-        pass  # default status is TRIAGE
-    else:
-        # Promote to TODO immediately by assigning + ready after create.
-        pass
+    scheduled_at = getattr(args, "scheduled_at", None)
+    if scheduled_at:
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(str(scheduled_at))
+        except ValueError as exc:
+            print(f"invalid scheduled_at: {exc}", file=sys.stderr)
+            return 1
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        kwargs["scheduled_at"] = dt
     task = asyncio.run(service.create_task(**kwargs))
     fmt = resolve_format(args)
     render_data(_task_to_dict(task), fmt=fmt, console=make_console())
     return 0
 
 
-def _cmd_assign(args) -> int:
+def _cmd_cancel(args) -> int:
     service = _load_task_service()
     if service is None:
         return _disabled()
-    task = asyncio.run(service.assign(args.id, args.assignee, expected_version=args.version))
-    render_data(_task_to_dict(task), fmt=resolve_format(args), console=make_console())
+    result = asyncio.run(service.cancel_task(args.id))
+    render_data(result if isinstance(result, dict) else _task_to_dict(result), fmt=resolve_format(args), console=make_console())
     return 0
 
 
-def _cmd_promote(args) -> int:
+def _cmd_retry(args) -> int:
     service = _load_task_service()
     if service is None:
         return _disabled()
-    task = asyncio.run(service.promote_to_ready(args.id, expected_version=args.version))
-    render_data(_task_to_dict(task), fmt=resolve_format(args), console=make_console())
+    result = asyncio.run(service.retry_task(args.id))
+    render_data(result if isinstance(result, dict) else _task_to_dict(result), fmt=resolve_format(args), console=make_console())
     return 0
 
 
@@ -187,7 +191,7 @@ def _cmd_archive(args) -> int:
     service = _load_task_service()
     if service is None:
         return _disabled()
-    task = asyncio.run(service.archive(args.id, expected_version=args.version))
+    task = asyncio.run(service.set_archived(args.id, True, expected_version=args.version))
     render_data(_task_to_dict(task), fmt=resolve_format(args), console=make_console())
     return 0
 
@@ -196,7 +200,7 @@ def _cmd_unarchive(args) -> int:
     service = _load_task_service()
     if service is None:
         return _disabled()
-    task = asyncio.run(service.unarchive(args.id, expected_version=args.version))
+    task = asyncio.run(service.set_archived(args.id, False, expected_version=args.version))
     render_data(_task_to_dict(task), fmt=resolve_format(args), console=make_console())
     return 0
 
@@ -213,11 +217,12 @@ def _cmd_complete(args) -> int:
     return 0
 
 
-def _cmd_block(args) -> int:
+def _cmd_approve(args) -> int:
     service = _load_task_service()
     if service is None:
         return _disabled()
-    result = asyncio.run(service.block(args.id, reason=args.reason, kind=args.kind))
+    note = getattr(args, "note", None)
+    result = asyncio.run(service.approve_change(args.id, note=note))
     render_data(result if isinstance(result, dict) else _task_to_dict(result), fmt=resolve_format(args), console=make_console())
     return 0
 
@@ -231,12 +236,13 @@ def _cmd_comment(args) -> int:
     return 0
 
 
-def _cmd_link(args) -> int:
+def _cmd_reject(args) -> int:
     service = _load_task_service()
     if service is None:
         return _disabled()
-    result = asyncio.run(service.link(args.parent_id, args.child_id))
-    render_data(result if isinstance(result, dict) else {"linked": True}, fmt=resolve_format(args), console=make_console())
+    note = getattr(args, "note", None)
+    result = asyncio.run(service.reject_change(args.id, note=note))
+    render_data(result if isinstance(result, dict) else _task_to_dict(result), fmt=resolve_format(args), console=make_console())
     return 0
 
 
@@ -288,21 +294,20 @@ def _cmd_dispatch(args) -> int:
     return 0
 
 
-def _cmd_specify(args) -> int:
+def _cmd_propose(args) -> int:
     service = _load_task_service()
     if service is None:
         return _disabled()
-    task = asyncio.run(service.specify(args.id))
-    render_data(_task_to_dict(task) if not isinstance(task, dict) else task, fmt=resolve_format(args), console=make_console())
-    return 0
-
-
-def _cmd_decompose(args) -> int:
-    service = _load_task_service()
-    if service is None:
-        return _disabled()
-    result = asyncio.run(service.decompose(args.id))
-    render_data(result if isinstance(result, dict) else {"decomposed": True}, fmt=resolve_format(args), console=make_console())
+    proposal = getattr(args, "proposal", "") or ""
+    if not proposal:
+        print("proposal is required", file=sys.stderr)
+        return 1
+    task = asyncio.run(service.get_task(args.id))
+    if task is None:
+        print(f"task not found: {args.id}", file=sys.stderr)
+        return 1
+    result = asyncio.run(service.propose_change(args.id, proposal, task.current_run_id))
+    render_data(result if isinstance(result, dict) else _task_to_dict(result), fmt=resolve_format(args), console=make_console())
     return 0
 
 

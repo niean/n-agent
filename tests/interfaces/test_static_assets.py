@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 from pathlib import Path
+import re
 import shutil
 import subprocess
 
@@ -150,14 +151,16 @@ def test_external_memory_static_asset_is_plain_javascript(tmp_path):
 def test_static_assets_contain_expected_logic(tmp_path):
     client = _client(tmp_path)
     styles_css = client.get('/static/styles.css').text
+    tasks_js = client.get('/static/tasks.js').text
     assert '#tab-tasks.active' in styles_css
     assert '#tasks-board-view > .status-panel' in styles_css
     assert '.kanban-board' in styles_css
+    assert 'width: calc(100vw - var(--sidebar-width-collapsed))' in styles_css
+    assert 'width: calc(100vw - var(--sidebar-width-expanded))' in styles_css
     assert 'min-height: calc(100vh - 179px)' in styles_css
     kanban_board_rule = styles_css[styles_css.index('.kanban-board {'):styles_css.index('.kanban-column {')]
-    assert '--kanban-column-count: 8' in kanban_board_rule
+    assert '--kanban-column-count: 5' in kanban_board_rule
     assert '--kanban-column-gap: 12px' in kanban_board_rule
-    assert '--kanban-column-max-width: calc(12.5cqw - 10.5px)' in kanban_board_rule
     assert 'container-type: inline-size' in kanban_board_rule
     assert 'repeat(var(--kanban-column-count), minmax(0, 1fr))' in kanban_board_rule
     assert 'width: 100%' in kanban_board_rule
@@ -168,8 +171,14 @@ def test_static_assets_contain_expected_logic(tmp_path):
     kanban_column_rule = styles_css[styles_css.index('.kanban-column {'):styles_css.index('.kanban-column__header {')]
     assert 'width: 100%' in kanban_column_rule
     assert 'min-width: 0' in kanban_column_rule
-    assert 'max-width: var(--kanban-column-max-width)' in kanban_column_rule
+    assert 'max-width' not in kanban_column_rule
     assert 'repeat(4, minmax(180px, 1fr))' not in styles_css
+    assert '.tasks-detail-drawer' not in styles_css
+    assert "backdrop.id = 'tasks-detail-modal'" in tasks_js
+    assert "el('div', 'modal-backdrop')" in tasks_js
+    assert "el('section', 'modal-dialog tasks-modal')" in tasks_js
+    assert 'function formatTaskTime' in tasks_js
+    assert '8 * 3600 * 1000' in tasks_js
     chat_js = client.get('/static/chat.js').text
     assert '/chat/external-memory/memory-providers' in chat_js
     assert 'event.shiftKey' in chat_js
@@ -604,6 +613,17 @@ def test_static_assets_use_safe_text_rendering(tmp_path):
         assert 'innerHTML =' not in body, f"{path} contains innerHTML assignment"
         assert 'insertAdjacentHTML' not in body, f"{path} uses insertAdjacentHTML"
         assert '.textContent' in body, f"{path} lacks textContent rendering"
+
+
+def test_dashboard_uses_shared_modal_instead_of_native_alert():
+    """Dashboard feedback must use NAGENT.modal.alert for consistent styling."""
+    for path in STATIC_DIR.glob('*.js'):
+        if path.name == 'management-ui.js':
+            continue  # This module owns the shared modal.alert implementation.
+        body = path.read_text()
+        assert not re.search(r'(?<![.\w])alert\s*\(', body), f"{path.name} uses native alert"
+        assert 'window.alert' not in body, f"{path.name} uses window.alert"
+        assert 'globalThis.alert' not in body, f"{path.name} uses globalThis.alert"
 
 
 def test_index_html_links_assets(tmp_path):

@@ -45,11 +45,12 @@ logger = logging.getLogger(__name__)
 
 _NOTIFIED_OUTCOMES: frozenset[TaskRunOutcome] = frozenset({
     TaskRunOutcome.COMPLETED,
-    TaskRunOutcome.BLOCKED,
-    TaskRunOutcome.GAVE_UP,
+    TaskRunOutcome.WAITING_APPROVAL,
+    TaskRunOutcome.FAILED,
     TaskRunOutcome.CRASHED,
     TaskRunOutcome.TIMED_OUT,
     TaskRunOutcome.TERMINATED,
+    TaskRunOutcome.EXPIRED,
 })
 
 

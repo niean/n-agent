@@ -273,30 +273,26 @@ def _build_task_parser(subparsers) -> None:
     create_p = sub.add_parser("create", help="Create a task")
     create_p.add_argument("--title", required=True)
     create_p.add_argument("--body", default=None)
-    create_p.add_argument("--assignee", default=None)
     create_p.add_argument("--priority", type=int, default=None)
-    create_p.add_argument("--goal", action="store_true", help="Enable goal_mode (Ralph-style loop)")
+    create_p.add_argument("--goal", action="store_true", help="Enable goal_mode (autonomous loop)")
     create_p.add_argument("--goal-max-turns", type=int, default=None)
     create_p.add_argument("--max-runtime", type=int, default=None)
     create_p.add_argument("--max-retries", type=int, default=None)
     create_p.add_argument("--created-by", default=None)
-    create_p.add_argument("--triage", action="store_true", help="Leave task in TRIAGE (default)")
+    create_p.add_argument("--scheduled-at", default=None, help="Auto-schedule ISO datetime (queued until due)")
     _fmt(create_p)
 
     delete_p = sub.add_parser("delete", help="Delete a task (hard delete, non-RUNNING only)")
     delete_p.add_argument("id")
     _fmt(delete_p)
 
-    assign_p = sub.add_parser("assign", help="Assign a task")
-    assign_p.add_argument("id")
-    assign_p.add_argument("--assignee", required=True)
-    assign_p.add_argument("--version", type=int, required=True)
-    _fmt(assign_p)
+    cancel_p = sub.add_parser("cancel", help="Cancel a task (queued/running/waiting_approval/failed)")
+    cancel_p.add_argument("id")
+    _fmt(cancel_p)
 
-    promote_p = sub.add_parser("promote", help="Promote a TODO task to READY")
-    promote_p.add_argument("id")
-    promote_p.add_argument("--version", type=int, required=True)
-    _fmt(promote_p)
+    retry_p = sub.add_parser("retry", help="Retry a failed/expired task (back to queued)")
+    retry_p.add_argument("id")
+    _fmt(retry_p)
 
     archive_p = sub.add_parser("archive", help="Archive a task")
     archive_p.add_argument("id")
@@ -314,12 +310,10 @@ def _build_task_parser(subparsers) -> None:
     complete_p.add_argument("--metadata", default=None, help="JSON metadata")
     _fmt(complete_p)
 
-    block_p = sub.add_parser("block", help="Block a task")
-    block_p.add_argument("id")
-    block_p.add_argument("--reason", required=True)
-    block_p.add_argument("--kind", default="needs_input",
-                          choices=["dependency", "needs_input", "capability", "transient"])
-    _fmt(block_p)
+    approve_p = sub.add_parser("approve", help="Approve a waiting_approval task's proposal")
+    approve_p.add_argument("id")
+    approve_p.add_argument("--note", default=None, help="Optional approval note/feedback")
+    _fmt(approve_p)
 
     comment_p = sub.add_parser("comment", help="Add a comment")
     comment_p.add_argument("id")
@@ -327,10 +321,10 @@ def _build_task_parser(subparsers) -> None:
     comment_p.add_argument("--author", default=None)
     _fmt(comment_p)
 
-    link_p = sub.add_parser("link", help="Add a dependency edge")
-    link_p.add_argument("--parent-id", required=True)
-    link_p.add_argument("--child-id", required=True)
-    _fmt(link_p)
+    reject_p = sub.add_parser("reject", help="Reject a waiting_approval task's proposal")
+    reject_p.add_argument("id")
+    reject_p.add_argument("--note", default=None, help="Optional rejection reason")
+    _fmt(reject_p)
 
     runs_p = sub.add_parser("runs", help="List runs of a task")
     runs_p.add_argument("id")
@@ -345,13 +339,10 @@ def _build_task_parser(subparsers) -> None:
     dispatch_p = sub.add_parser("dispatch", help="Nudge the dispatcher (one tick)")
     _fmt(dispatch_p)
 
-    specify_p = sub.add_parser("specify", help="LLM: flesh out a TRIAGE task to TODO")
-    specify_p.add_argument("id")
-    _fmt(specify_p)
-
-    decompose_p = sub.add_parser("decompose", help="LLM: decompose a task into children")
-    decompose_p.add_argument("id")
-    _fmt(decompose_p)
+    propose_p = sub.add_parser("propose", help="Propose a change on a running task (manual/testing)")
+    propose_p.add_argument("id")
+    propose_p.add_argument("--proposal", required=True)
+    _fmt(propose_p)
 
 
 def _build_sandbox_parser(subparsers) -> None:

@@ -47,7 +47,6 @@ from app.application.skill_evolution_service import SkillEvolutionService
 from app.application.plugin_service import PluginCliCommand, PluginService, PluginToolExecutor
 from app.application.prompt_builder import build_system_prompt
 from app.application.task_agent_executor import TaskAgentExecutor
-from app.application.task_planning_service import TaskPlanningService
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
 from app.application.task_service import TaskService
@@ -310,7 +309,6 @@ class ApplicationServices:
     task_service: TaskService | None = None
     task_run_service: TaskRunService | None = None
     task_runner: TaskRunner | None = None
-    task_planning_service: TaskPlanningService | None = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -919,7 +917,6 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     task_agent_executor: TaskAgentExecutor | None = None
     task_outbound_delivery: TaskOutboundDelivery | None = None
     task_run_service: TaskRunService | None = None
-    task_planning_service: TaskPlanningService | None = None
     task_service: TaskService | None = None
     if task_registry is not None:
         # Resolve attachments_root to an absolute path under workspace_root
@@ -954,17 +951,9 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         #   TaskRunService needs dispatcher=TaskRunner,
         #   TaskRunner.spawn needs run_service to call run_claim.
         task_runner.set_run_service(task_run_service)
-        task_planning_service = TaskPlanningService(
-            chat_service=chat_service,
-            registry=task_registry,
-            policy=task_policy,
-            planning_max_children=settings.task_planning_max_children,
-            max_goal_max_turns=settings.task_goal_max_turns,
-        )
         task_service = TaskService(
             registry=task_registry,
             policy=task_policy,
-            planning_service=task_planning_service,
             memory_store=memory_store,
             attachments_root=attachments_root,
             attachment_max_bytes=settings.task_attachment_max_bytes,
@@ -1345,7 +1334,6 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         task_service=task_service,
         task_run_service=task_run_service,
         task_runner=task_runner,
-        task_planning_service=task_planning_service,
     )
 
 

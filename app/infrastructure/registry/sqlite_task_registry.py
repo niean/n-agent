@@ -6,13 +6,28 @@ foreign_keys, and busy_timeout per connection. Async methods wrap sync
 sqlite3 via ``asyncio.to_thread`` (tech debt D018: to_thread wrapping).
 
 Atomicity guarantees:
-  - claim_task: BEGIN IMMEDIATE, only READY + no valid claim + version match
-    -> insert run + update task to RUNNING in one transaction.
+  - claim_task: BEGIN IMMEDIATE, only QUEUED + no valid claim + version match
+    + scheduled_at due + not archived -> insert run + update task to RUNNING
+    in one transaction.
   - finish_run / recover_run: CAS on (run_id, claim_lock) in one transaction;
     writes run terminal, transitions task, appends terminal event, releases
     lease. Late/duplicate results raise TaskConflictError.
   - record_heartbeat: CAS on (run_id, claim_lock), renews claim_expires.
-  - bulk_update / create_graph: single transaction, all-or-nothing.
+  - bulk_update: single transaction, all-or-nothing.
+
+State machine (Manus-aligned 7 states):
+  queued / running / waiting_approval / succeeded / failed / cancelled / expired
+
+Legacy migration (idempotent):
+  - ADD COLUMN is_archived (PRAGMA-protected)
+  - status mapping (WHERE-guarded): triage/todo/scheduled/ready -> queued,
+    running -> expired (avoid ghost RUNNING on restart), review ->
+    waiting_approval, done -> succeeded, blocked -> failed,
+    archived -> cancelled + is_archived=1
+  - DROP TABLE IF EXISTS task_links
+  - DROP COLUMN assignee/block_kind/block_reason/block_recurrences/
+    pre_archive_status when supported (SQLite 3.35+); otherwise the columns
+    are left as legacy unused and the registry read/write model ignores them.
 
 datetime<->storage: all datetimes stored as UTC ISO-8601 strings; conversion
 happens at the registry boundary (``_dt_to_str`` / ``_str_to_dt``).
@@ -34,13 +49,10 @@ from typing import Any
 from uuid import uuid4
 
 from app.domain.task import (
-    BlockKind,
     BulkUpdateCommand,
     BulkUpdateItem,
     BulkUpdateResult,
     ClaimResult,
-    CreateGraphCommand,
-    CreateGraphResult,
     DeliveryResult,
     FinishRunCommand,
     FinishRunResult,
@@ -52,7 +64,6 @@ from app.domain.task import (
     TaskConflictError,
     TaskEvent,
     TaskExecutionPolicy,
-    TaskLink,
     TaskListCursor,
     TaskListPage,
     TaskNotFoundError,
@@ -75,16 +86,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     body TEXT NOT NULL DEFAULT '',
-    assignee TEXT,
     priority INTEGER NOT NULL DEFAULT 0,
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1,
-    status TEXT NOT NULL DEFAULT 'triage',
-    block_kind TEXT,
-    block_reason TEXT,
-    block_recurrences INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'queued',
     started_at TEXT,
     completed_at TEXT,
     scheduled_at TEXT,
@@ -113,7 +120,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_heartbeat_at TEXT,
     result TEXT,
     idempotency_key TEXT,
-    pre_archive_status TEXT
+    is_archived INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_runs (
@@ -135,15 +142,6 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS task_links (
-    parent_id TEXT NOT NULL,
-    child_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY(parent_id, child_id),
-    FOREIGN KEY(parent_id) REFERENCES tasks(id) ON DELETE CASCADE,
-    FOREIGN KEY(child_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -192,18 +190,22 @@ CREATE TABLE IF NOT EXISTS task_notify_subs (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority);
-CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(origin_session_id, execution_session_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency
     ON tasks(board, created_by, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_links_parent ON task_links(parent_id);
-CREATE INDEX IF NOT EXISTS idx_links_child ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_runs_task ON task_runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task ON task_attachments(task_id);
 CREATE INDEX IF NOT EXISTS idx_notify_task ON task_notify_subs(task_id);
+"""
+
+# Indexes that reference columns added by migration are created separately
+# after the migration completes (avoids "no such column" on legacy DBs where
+# the tasks table pre-exists without is_archived).
+_POST_MIGRATION_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_tasks_is_archived ON tasks(is_archived);
 """
 
 # ---------------------------------------------------------------------------
@@ -218,7 +220,7 @@ _DATETIME_FIELDS: frozenset[str] = frozenset({
 
 # Task fields that are enums (store .value)
 _ENUM_FIELDS: frozenset[str] = frozenset({
-    "status", "block_kind", "workspace_kind", "pre_archive_status",
+    "status", "workspace_kind",
 })
 
 # Mapping from Task field name to column name (when they differ)
@@ -230,18 +232,36 @@ _FIELD_TO_COLUMN: dict[str, str] = {
 # Fields that cannot be updated via update_task
 _IMMUTABLE_FIELDS: frozenset[str] = frozenset({"id", "created_at"})
 
-
-# ---------------------------------------------------------------------------
-# Outcome -> task status mapping for finish_run / recover_run
-# ---------------------------------------------------------------------------
-
-_RETRYABLE_OUTCOMES: frozenset[TaskRunOutcome] = frozenset({
-    TaskRunOutcome.FAILED,
-    TaskRunOutcome.CRASHED,
-    TaskRunOutcome.TIMED_OUT,
-    TaskRunOutcome.SPAWN_FAILED,
-    TaskRunOutcome.RECLAIMED,
+# Boolean fields stored as 0/1
+_BOOLEAN_FIELDS: frozenset[str] = frozenset({
+    "goal_mode", "is_archived",
 })
+
+# Legacy columns from the prior 9-state schema. If present on an existing
+# DB, the migration tries to DROP them (SQLite 3.35+); otherwise they remain
+# as unused legacy columns that the registry never reads or writes.
+_LEGACY_COLUMNS: tuple[str, ...] = (
+    "assignee",
+    "block_kind",
+    "block_reason",
+    "block_recurrences",
+    "pre_archive_status",
+)
+
+# Legacy status -> (new_status, is_archived) mapping. Applied with WHERE
+# guards so re-running the migration never re-maps new values.
+_LEGACY_STATUS_MAP: tuple[tuple[str, str, int], ...] = (
+    # legacy_status, new_status, is_archived
+    ("triage", "queued", 0),
+    ("todo", "queued", 0),
+    ("scheduled", "queued", 0),
+    ("ready", "queued", 0),
+    ("running", "expired", 0),
+    ("review", "waiting_approval", 0),
+    ("done", "succeeded", 0),
+    ("blocked", "failed", 0),
+    ("archived", "cancelled", 1),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -315,14 +335,14 @@ def _field_value_to_storage(field_name: str, value: Any) -> Any:
         if isinstance(value, Enum):
             return value.value
         return value
+    if field_name in _BOOLEAN_FIELDS:
+        return 1 if value else 0
     if field_name == "skills":
         return _json_dumps(list(value))
     if field_name == "execution_policy":
         if isinstance(value, TaskExecutionPolicy):
             return _json_dumps({"allowed_tools": list(value.allowed_tools)})
         return _json_dumps(value)
-    if field_name == "goal_mode":
-        return 1 if value else 0
     return value
 
 
@@ -358,19 +378,96 @@ class SQLiteTaskRegistry:
         return conn
 
     def _ensure_schema(self) -> None:
-        """Idempotent schema creation. Safe for empty DBs, repeated startup,
-        and half-migrated DBs (CREATE IF NOT EXISTS)."""
+        """Idempotent schema creation + legacy migration.
+
+        Safe for empty DBs, repeated startup, and half-migrated DBs.
+        Legacy migration is guarded so re-running never re-maps new
+        statuses or duplicates columns.
+
+        The legacy 9-state -> 7-state status mapping (including
+        ``running -> expired`` to avoid ghost RUNNING on restart) runs
+        only once, guarded by ``PRAGMA user_version``. On subsequent
+        startups the migration is skipped so newly-created RUNNING
+        tasks are not re-mapped; stale RUNNING detection is handled at
+        runtime by TaskRunService.
+        """
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
-            # Migration: add lease_seconds to task_runs if missing (legacy DBs)
-            cols = {
+            # --- task_runs lease_seconds migration (legacy) ---
+            run_cols = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(task_runs)")
             }
-            if "lease_seconds" not in cols:
+            if "lease_seconds" not in run_cols:
                 conn.execute(
                     "ALTER TABLE task_runs ADD COLUMN lease_seconds INTEGER"
                 )
+
+            # --- tasks.is_archived migration ---
+            task_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            if "is_archived" not in task_cols:
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0"
+                )
+
+            # Now that is_archived is guaranteed to exist, create indexes
+            # that reference it. Safe on both new and legacy DBs.
+            conn.executescript(_POST_MIGRATION_INDEX_SQL)
+
+            # --- one-time legacy migration (guarded by user_version) ---
+            # user_version 0 = uninitialized or pre-migration; 1 = migrated.
+            user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if user_version < 1:
+                # Legacy status mapping (WHERE-guarded for idempotency).
+                for legacy_st, new_st, is_archived in _LEGACY_STATUS_MAP:
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, is_archived = ? "
+                        "WHERE status = ?",
+                        (new_st, is_archived, legacy_st),
+                    )
+
+                # Drop task_links table if it exists (dependency graph removed).
+                conn.execute("DROP TABLE IF EXISTS task_links")
+
+                # Drop legacy indexes that reference dropped columns/tables.
+                conn.execute("DROP INDEX IF EXISTS idx_links_parent")
+                conn.execute("DROP INDEX IF EXISTS idx_links_child")
+                conn.execute("DROP INDEX IF EXISTS idx_tasks_assignee_status")
+
+                # Attempt to DROP legacy columns (SQLite 3.35+).
+                # If not supported, columns remain as unused legacy.
+                self._try_drop_legacy_columns(conn)
+
+                # Mark migration as complete so subsequent startups skip
+                # the status mapping (avoids re-mapping new RUNNING).
+                conn.execute("PRAGMA user_version = 1")
+
+            conn.commit()
+
+    @staticmethod
+    def _try_drop_legacy_columns(conn: sqlite3.Connection) -> None:
+        """Best-effort DROP COLUMN for legacy 9-state columns.
+
+        Silently skips columns that don't exist or when the SQLite version
+        does not support ALTER TABLE DROP COLUMN (pre-3.35). The registry
+        read/write model never references these columns, so leaving them
+        as legacy is safe.
+        """
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        for col in _LEGACY_COLUMNS:
+            if col not in existing:
+                continue
+            try:
+                conn.execute(f"ALTER TABLE tasks DROP COLUMN {col}")
+            except sqlite3.OperationalError:
+                # Unsupported or blocked (e.g. indexed); leave as legacy.
+                pass
 
     def _list_tables(self) -> set[str]:
         with self._connect() as conn:
@@ -390,16 +487,12 @@ class SQLiteTaskRegistry:
             id=row["id"],
             title=row["title"],
             body=row["body"],
-            assignee=row["assignee"],
             priority=row["priority"],
             created_by=row["created_by"],
             created_at=_str_to_dt(row["created_at"]),
             updated_at=_str_to_dt(row["updated_at"]),
             version=row["version"],
             status=TaskStatus(row["status"]),
-            block_kind=_str_to_enum(BlockKind, row["block_kind"]),
-            block_reason=row["block_reason"],
-            block_recurrences=row["block_recurrences"],
             started_at=_str_to_dt(row["started_at"]),
             completed_at=_str_to_dt(row["completed_at"]),
             scheduled_at=_str_to_dt(row["scheduled_at"]),
@@ -432,7 +525,7 @@ class SQLiteTaskRegistry:
             last_heartbeat_at=_str_to_dt(row["last_heartbeat_at"]),
             result=row["result"],
             idempotency_key=row["idempotency_key"],
-            pre_archive_status=_str_to_enum(TaskStatus, row["pre_archive_status"]),
+            is_archived=bool(row["is_archived"]),
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> TaskRun:
@@ -487,9 +580,6 @@ class SQLiteTaskRegistry:
             created_at=_str_to_dt(row["created_at"]),
         )
 
-    def _row_to_link(self, row: sqlite3.Row) -> TaskLink:
-        return TaskLink(parent_id=row["parent_id"], child_id=row["child_id"])
-
     # ------------------------------------------------------------------
     # Task params for INSERT
     # ------------------------------------------------------------------
@@ -502,16 +592,12 @@ class SQLiteTaskRegistry:
             task.id,
             task.title,
             task.body,
-            task.assignee,
             task.priority,
             task.created_by,
             _dt_to_str(created_at),
             _dt_to_str(updated_at),
             task.version,
             _enum_to_str(task.status),
-            _enum_to_str(task.block_kind),
-            task.block_reason,
-            task.block_recurrences,
             _dt_to_str(task.started_at),
             _dt_to_str(task.completed_at),
             _dt_to_str(task.scheduled_at),
@@ -540,22 +626,23 @@ class SQLiteTaskRegistry:
             _dt_to_str(task.last_heartbeat_at),
             task.result,
             task.idempotency_key,
-            _enum_to_str(task.pre_archive_status),
+            1 if task.is_archived else 0,
         )
 
     _INSERT_TASK_SQL = """
         INSERT INTO tasks (
-            id, title, body, assignee, priority, created_by, created_at, updated_at,
-            version, status, block_kind, block_reason, block_recurrences,
-            started_at, completed_at, scheduled_at, claim_lock, claim_expires,
-            current_run_id, workspace_kind, workspace_path, skills_json,
-            execution_policy_json, model_override, max_runtime_seconds, max_retries,
-            goal_mode, goal_max_turns, workflow_template_id, current_step_key,
-            project_id, tenant, board, origin_session_id, execution_session_id,
-            consecutive_failures, worker_token, last_failure_error, last_heartbeat_at,
-            result, idempotency_key, pre_archive_status
+            id, title, body, priority, created_by, created_at, updated_at,
+            version, status, started_at, completed_at, scheduled_at,
+            claim_lock, claim_expires, current_run_id, workspace_kind,
+            workspace_path, skills_json, execution_policy_json,
+            model_override, max_runtime_seconds, max_retries, goal_mode,
+            goal_max_turns, workflow_template_id, current_step_key,
+            project_id, tenant, board, origin_session_id,
+            execution_session_id, consecutive_failures, worker_token,
+            last_failure_error, last_heartbeat_at, result, idempotency_key,
+            is_archived
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
 
@@ -568,55 +655,15 @@ class SQLiteTaskRegistry:
         created_at = task.created_at or now
         updated_at = task.updated_at or now
         # Return a task with the resolved timestamps
-        resolved = Task(
-            id=task.id,
-            title=task.title,
-            body=task.body,
-            assignee=task.assignee,
-            priority=task.priority,
-            created_by=task.created_by,
+        resolved = dataclass_replace(
+            task,
             created_at=created_at,
             updated_at=updated_at,
-            version=task.version,
-            status=task.status,
-            block_kind=task.block_kind,
-            block_reason=task.block_reason,
-            block_recurrences=task.block_recurrences,
-            started_at=task.started_at,
-            completed_at=task.completed_at,
-            scheduled_at=task.scheduled_at,
-            claim_lock=task.claim_lock,
-            claim_expires=task.claim_expires,
-            current_run_id=task.current_run_id,
-            workspace_kind=task.workspace_kind,
-            workspace_path=task.workspace_path,
-            skills=task.skills,
-            execution_policy=task.execution_policy,
-            model_override=task.model_override,
-            max_runtime_seconds=task.max_runtime_seconds,
-            max_retries=task.max_retries,
-            goal_mode=task.goal_mode,
-            goal_max_turns=task.goal_max_turns,
-            workflow_template_id=task.workflow_template_id,
-            current_step_key=task.current_step_key,
-            project_id=task.project_id,
-            tenant=task.tenant,
-            board=task.board,
-            origin_session_id=task.origin_session_id,
-            execution_session_id=task.execution_session_id,
-            consecutive_failures=task.consecutive_failures,
-            worker_token=task.worker_token,
-            last_failure_error=task.last_failure_error,
-            last_heartbeat_at=task.last_heartbeat_at,
-            result=task.result,
-            idempotency_key=task.idempotency_key,
-            pre_archive_status=task.pre_archive_status,
         )
         with self._connect() as conn:
             try:
                 conn.execute(self._INSERT_TASK_SQL, self._task_params(resolved))
             except sqlite3.IntegrityError as e:
-                # Could be duplicate PK or idempotency key conflict
                 conn.rollback()
                 raise TaskConflictError(f"create_task integrity error: {e}") from e
         return resolved
@@ -633,15 +680,17 @@ class SQLiteTaskRegistry:
         board: str = "default",
         cursor: TaskListCursor | None = None,
         limit: int = 100,
+        include_archived: bool = False,
     ) -> TaskListPage:
         # Clamp limit to a safe range
         limit = max(1, min(limit, 500))
+        archived_clause = "" if include_archived else " AND is_archived = 0"
         with self._connect() as conn:
             if cursor is not None:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM tasks
-                    WHERE board = ?
+                    WHERE board = ?{archived_clause}
                       AND (created_at > ? OR (created_at = ? AND id > ?))
                     ORDER BY created_at ASC, id ASC
                     LIMIT ?
@@ -656,9 +705,9 @@ class SQLiteTaskRegistry:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM tasks
-                    WHERE board = ?
+                    WHERE board = ?{archived_clause}
                     ORDER BY created_at ASC, id ASC
                     LIMIT ?
                     """,
@@ -745,7 +794,6 @@ class SQLiteTaskRegistry:
                     f"UPDATE tasks SET {clause} WHERE id = ? AND version = ?",
                     (*params, item.task_id, item.expected_version),
                 )
-            # Fetch all updated rows
             for item in command.items:
                 row = conn.execute(
                     "SELECT * FROM tasks WHERE id = ?", (item.task_id,)
@@ -779,14 +827,21 @@ class SQLiteTaskRegistry:
         worker_token = uuid4().hex
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            # CAS: status=READY and no valid claim
+            # CAS: status=QUEUED + not archived + scheduled_at due
+            # + no valid current claim (claim_expires NULL or in the past)
             row = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE id = ? AND status = ?
+                WHERE id = ? AND status = ? AND is_archived = 0
+                  AND (scheduled_at IS NULL OR scheduled_at <= ?)
                   AND (claim_expires IS NULL OR claim_expires < ?)
                 """,
-                (task_id, TaskStatus.READY.value, _dt_to_str(now)),
+                (
+                    task_id,
+                    TaskStatus.QUEUED.value,
+                    _dt_to_str(now),
+                    _dt_to_str(now),
+                ),
             ).fetchone()
             if row is None:
                 conn.commit()
@@ -886,7 +941,7 @@ class SQLiteTaskRegistry:
                 conn.rollback()
                 raise TaskClaimError(
                     f"heartbeat CAS failed: task={task_id} run={run_id} "
-                    f"claim_lock mismatch or task not RUNNING"
+                    f"claim_lock mismatch or task not RUNNING this run"
                 )
             # Read stored lease_seconds from the run; fall back to 900 for
             # legacy rows (NULL).
@@ -930,7 +985,7 @@ class SQLiteTaskRegistry:
             outcome=command.outcome,
             summary=command.summary,
             metadata=command.metadata,
-            error=None,
+            error=command.error,
             is_recover=False,
             target_task_status=command.target_task_status,
         )
@@ -1017,19 +1072,25 @@ class SQLiteTaskRegistry:
                     f"claim_lock mismatch or task not RUNNING this run"
                 )
 
-            # Determine new task status
             task = self._row_to_task(task_row)
-            # Increment failures for any outcome that is not COMPLETED,
-            # BLOCKED, or GAVE_UP (matches the previous default-branch logic).
-            increment_failures = outcome not in (
-                TaskRunOutcome.COMPLETED,
-                TaskRunOutcome.BLOCKED,
-                TaskRunOutcome.GAVE_UP,
+
+            # Determine whether this outcome increments consecutive_failures.
+            # Only retryable worker-failure outcomes increment; CRASHED and
+            # TIMED_OUT map to EXPIRED (user-driven retry) and do not
+            # participate in the auto-retry counter.
+            increment_failures = outcome in (
+                TaskRunOutcome.FAILED,
+                TaskRunOutcome.SPAWN_FAILED,
             )
+            new_consecutive = (
+                task.consecutive_failures + 1 if increment_failures else task.consecutive_failures
+            )
+
+            # Determine new task status
             if target_task_status is not None:
                 new_status = target_task_status
             else:
-                new_status = self._outcome_to_task_status(outcome)
+                new_status = self._outcome_to_task_status(outcome, new_consecutive, task.max_retries)
 
             # Write run terminal
             run_status = self._outcome_to_run_status(outcome)
@@ -1070,14 +1131,10 @@ class SQLiteTaskRegistry:
                 params.append(_dt_to_str(now))
                 params.append(summary or "")
             elif increment_failures:
-                set_parts.append("consecutive_failures = consecutive_failures + 1")
+                set_parts.append("consecutive_failures = ?")
                 set_parts.append("last_failure_error = ?")
+                params.append(new_consecutive)
                 params.append(error or summary or outcome.value)
-            elif outcome == TaskRunOutcome.GAVE_UP:
-                set_parts.append("block_kind = ?")
-                set_parts.append("block_reason = ?")
-                params.append(BlockKind.NEEDS_INPUT.value)
-                params.append("circuit breaker: max_retries exceeded")
 
             params.append(task_id)
             params.append(task.version)
@@ -1128,32 +1185,52 @@ class SQLiteTaskRegistry:
             terminal_event=self._row_to_event(event_row),
         )
 
-    def _outcome_to_task_status(self, outcome: TaskRunOutcome) -> TaskStatus:
-        """Default outcome -> task status mapping.
+    def _outcome_to_task_status(
+        self,
+        outcome: TaskRunOutcome,
+        new_consecutive_failures: int,
+        max_retries: int,
+    ) -> TaskStatus:
+        """Default outcome -> task status mapping (Manus-aligned).
 
-        This is the registry's standalone default. TaskRunService (Batch D)
-        should pass ``target_task_status`` in ``FinishRunCommand`` to own
-        the decision; this fallback exists so the registry works standalone.
+        Used only when ``target_task_status`` is None; TaskRunService should
+        pass ``target_task_status`` explicitly to own the decision.
+
+        Mapping:
+          COMPLETED            -> SUCCEEDED
+          WAITING_APPROVAL     -> WAITING_APPROVAL
+          EXPIRED              -> EXPIRED
+          CRASHED / TIMED_OUT  -> EXPIRED  (worker died; user must retry)
+          TERMINATED           -> CANCELLED (user cancel)
+          FAILED / SPAWN_FAILED -> if consecutive_failures > max_retries:
+                                  FAILED; else QUEUED (auto-retry)
         """
         if outcome == TaskRunOutcome.COMPLETED:
-            return TaskStatus.DONE
-        if outcome in (TaskRunOutcome.BLOCKED, TaskRunOutcome.GAVE_UP):
-            return TaskStatus.BLOCKED
-        # Retryable outcomes -> TODO
-        return TaskStatus.TODO
+            return TaskStatus.SUCCEEDED
+        if outcome == TaskRunOutcome.WAITING_APPROVAL:
+            return TaskStatus.WAITING_APPROVAL
+        if outcome == TaskRunOutcome.EXPIRED:
+            return TaskStatus.EXPIRED
+        if outcome in (TaskRunOutcome.CRASHED, TaskRunOutcome.TIMED_OUT):
+            return TaskStatus.EXPIRED
+        if outcome == TaskRunOutcome.TERMINATED:
+            return TaskStatus.CANCELLED
+        # Retryable: FAILED, SPAWN_FAILED
+        if new_consecutive_failures > max_retries:
+            return TaskStatus.FAILED
+        return TaskStatus.QUEUED
 
     def _outcome_to_run_status(self, outcome: TaskRunOutcome) -> TaskRunStatus:
         """Map outcome to the terminal TaskRunStatus."""
         mapping = {
             TaskRunOutcome.COMPLETED: TaskRunStatus.COMPLETED,
-            TaskRunOutcome.BLOCKED: TaskRunStatus.BLOCKED,
+            TaskRunOutcome.WAITING_APPROVAL: TaskRunStatus.COMPLETED,
             TaskRunOutcome.FAILED: TaskRunStatus.FAILED,
             TaskRunOutcome.CRASHED: TaskRunStatus.CRASHED,
             TaskRunOutcome.TIMED_OUT: TaskRunStatus.TIMED_OUT,
             TaskRunOutcome.TERMINATED: TaskRunStatus.TERMINATED,
             TaskRunOutcome.SPAWN_FAILED: TaskRunStatus.FAILED,
-            TaskRunOutcome.GAVE_UP: TaskRunStatus.FAILED,
-            TaskRunOutcome.RECLAIMED: TaskRunStatus.RECLAIMED,
+            TaskRunOutcome.EXPIRED: TaskRunStatus.TIMED_OUT,
         }
         return mapping.get(outcome, TaskRunStatus.FAILED)
 
@@ -1161,17 +1238,33 @@ class SQLiteTaskRegistry:
     # Dispatch helpers (sync)
     # ------------------------------------------------------------------
 
-    def _list_ready_sync(self, board: str = "default", limit: int = 100) -> list[Task]:
+    def _list_queued_due_sync(
+        self,
+        now: datetime,
+        limit: int = 100,
+        board: str = "default",
+    ) -> list[Task]:
+        """Return QUEUED + due + not-archived tasks for dispatch.
+
+        Ordered by priority DESC, created_at ASC, id ASC.
+        """
         limit = max(1, min(limit, 500))
+        now_utc = _aware_utc(now)
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE board = ? AND status = ?
+                WHERE board = ? AND status = ? AND is_archived = 0
+                  AND (scheduled_at IS NULL OR scheduled_at <= ?)
                 ORDER BY priority DESC, created_at ASC, id ASC
                 LIMIT ?
                 """,
-                (board, TaskStatus.READY.value, limit),
+                (
+                    board,
+                    TaskStatus.QUEUED.value,
+                    _dt_to_str(now_utc),
+                    limit,
+                ),
             ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
@@ -1187,316 +1280,6 @@ class SQLiteTaskRegistry:
             ).fetchall()
         return [self._row_to_task(r) for r in rows]
 
-    def _recompute_ready_sync(self, board: str = "default") -> list[str]:
-        now = _now()
-        promoted: list[str] = []
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-
-            # 1. Demote READY tasks whose parents are not all DONE -> TODO
-            ready_rows = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE board = ? AND status = ?
-                """,
-                (board, TaskStatus.READY.value),
-            ).fetchall()
-            for row in ready_rows:
-                task_id = row["id"]
-                non_done_parents = conn.execute(
-                    """
-                    SELECT COUNT(*) AS cnt FROM task_links l
-                    JOIN tasks t ON t.id = l.parent_id
-                    WHERE l.child_id = ? AND t.status != ?
-                    """,
-                    (task_id, TaskStatus.DONE.value),
-                ).fetchone()
-                if non_done_parents["cnt"] > 0:
-                    conn.execute(
-                        """
-                        UPDATE tasks SET status = ?, version = version + 1, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (TaskStatus.TODO.value, _dt_to_str(now), task_id),
-                    )
-
-            # 2. Notify RUNNING tasks whose parents are not all DONE.
-            #    RUNNING tasks are NOT demoted (not preempted); a
-            #    dependency_changed event is appended so the running worker
-            #    can react.
-            running_rows = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE board = ? AND status = ?
-                """,
-                (board, TaskStatus.RUNNING.value),
-            ).fetchall()
-            for row in running_rows:
-                task_id = row["id"]
-                non_done_parents = conn.execute(
-                    """
-                    SELECT COUNT(*) AS cnt FROM task_links l
-                    JOIN tasks t ON t.id = l.parent_id
-                    WHERE l.child_id = ? AND t.status != ?
-                    """,
-                    (task_id, TaskStatus.DONE.value),
-                ).fetchone()
-                if non_done_parents["cnt"] > 0:
-                    conn.execute(
-                        """
-                        INSERT INTO task_events (task_id, run_id, kind, payload_json, created_at)
-                        VALUES (?, ?, 'dependency_changed', ?, ?)
-                        """,
-                        (
-                            task_id,
-                            row["current_run_id"],
-                            _json_dumps({"reason": "parent left DONE"}),
-                            _dt_to_str(now),
-                        ),
-                    )
-
-            # 3. Promote TODO/SCHEDULED tasks whose parents are all DONE +
-            #    assignee + scheduled -> READY
-            candidate_rows = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE board = ? AND status IN (?, ?) AND assignee IS NOT NULL
-                """,
-                (board, TaskStatus.TODO.value, TaskStatus.SCHEDULED.value),
-            ).fetchall()
-            for row in candidate_rows:
-                task = self._row_to_task(row)
-                # Check all parents DONE
-                non_done_parents = conn.execute(
-                    """
-                    SELECT COUNT(*) AS cnt FROM task_links l
-                    JOIN tasks t ON t.id = l.parent_id
-                    WHERE l.child_id = ? AND t.status != ?
-                    """,
-                    (task.id, TaskStatus.DONE.value),
-                ).fetchone()
-                if non_done_parents["cnt"] > 0:
-                    continue
-                # Check scheduled_at (applies to both TODO and SCHEDULED)
-                if task.scheduled_at is not None and task.scheduled_at > now:
-                    continue
-                # Promote
-                conn.execute(
-                    """
-                    UPDATE tasks SET status = ?, version = version + 1, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (TaskStatus.READY.value, _dt_to_str(now), task.id),
-                )
-                promoted.append(task.id)
-
-            conn.commit()
-        return promoted
-
-    # ------------------------------------------------------------------
-    # Dependency graph (sync)
-    # ------------------------------------------------------------------
-
-    def _has_path_sync(self, conn: sqlite3.Connection, start_id: str, target_id: str) -> bool:
-        """DFS: is there a path start_id -> ... -> target_id in the dependency graph?
-
-        Edges: parent_id -> child_id (parent must complete before child).
-        """
-        if start_id == target_id:
-            return True
-        visited: set[str] = set()
-        stack: list[str] = [start_id]
-        while stack:
-            node = stack.pop()
-            if node in visited:
-                continue
-            visited.add(node)
-            children = conn.execute(
-                "SELECT child_id FROM task_links WHERE parent_id = ?", (node,)
-            ).fetchall()
-            for child in children:
-                child_id = child["child_id"]
-                if child_id == target_id:
-                    return True
-                stack.append(child_id)
-        return False
-
-    def _add_link_sync(self, parent_id: str, child_id: str) -> TaskLink:
-        now = _now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            # Self-loop
-            if parent_id == child_id:
-                conn.rollback()
-                raise TaskValidationError("self-loop not allowed")
-            # Both tasks must exist
-            parent_row = conn.execute(
-                "SELECT board FROM tasks WHERE id = ?", (parent_id,)
-            ).fetchone()
-            child_row = conn.execute(
-                "SELECT board FROM tasks WHERE id = ?", (child_id,)
-            ).fetchone()
-            if parent_row is None or child_row is None:
-                conn.rollback()
-                raise TaskNotFoundError("parent or child task not found")
-            # Cross-board check
-            if parent_row["board"] != child_row["board"]:
-                conn.rollback()
-                raise TaskValidationError(
-                    f"cross-board link not allowed: {parent_row['board']} vs {child_row['board']}"
-                )
-            # Duplicate check
-            existing = conn.execute(
-                "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-                (parent_id, child_id),
-            ).fetchone()
-            if existing is not None:
-                conn.rollback()
-                raise TaskConflictError(
-                    f"duplicate link: {parent_id} -> {child_id}"
-                )
-            # Cycle check: adding parent->child creates a cycle if there's
-            # already a path from child to parent
-            if self._has_path_sync(conn, child_id, parent_id):
-                conn.rollback()
-                raise TaskValidationError(
-                    f"cycle detected: {parent_id} -> {child_id}"
-                )
-            conn.execute(
-                """
-                INSERT INTO task_links (parent_id, child_id, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (parent_id, child_id, _dt_to_str(now)),
-            )
-            conn.commit()
-        return TaskLink(parent_id=parent_id, child_id=child_id)
-
-    def _remove_link_sync(self, parent_id: str, child_id: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
-                (parent_id, child_id),
-            )
-            return cursor.rowcount > 0
-
-    def _list_links_sync(self, task_id: str) -> list[TaskLink]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM task_links
-                WHERE parent_id = ? OR child_id = ?
-                ORDER BY created_at ASC
-                """,
-                (task_id, task_id),
-            ).fetchall()
-        return [self._row_to_link(r) for r in rows]
-
-    def _list_children_sync(self, parent_id: str) -> list[Task]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT t.* FROM tasks t
-                JOIN task_links l ON l.child_id = t.id
-                WHERE l.parent_id = ?
-                ORDER BY t.created_at ASC, t.id ASC
-                """,
-                (parent_id,),
-            ).fetchall()
-        return [self._row_to_task(r) for r in rows]
-
-    def _list_parents_sync(self, child_id: str) -> list[Task]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT t.* FROM tasks t
-                JOIN task_links l ON l.parent_id = t.id
-                WHERE l.child_id = ?
-                ORDER BY t.created_at ASC, t.id ASC
-                """,
-                (child_id,),
-            ).fetchall()
-        return [self._row_to_task(r) for r in rows]
-
-    def _create_graph_sync(self, command: CreateGraphCommand) -> CreateGraphResult:
-        now = _now()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            # 1. Insert all tasks
-            for task in command.tasks:
-                resolved = dataclass_replace(
-                    task,
-                    created_at=task.created_at or now,
-                    updated_at=task.updated_at or now,
-                )
-                try:
-                    conn.execute(self._INSERT_TASK_SQL, self._task_params(resolved))
-                except sqlite3.IntegrityError as e:
-                    conn.rollback()
-                    raise TaskConflictError(
-                        f"create_graph task integrity error: {e}"
-                    ) from e
-            # 2. Validate and insert links
-            for link in command.links:
-                if link.parent_id == link.child_id:
-                    conn.rollback()
-                    raise TaskValidationError("self-loop not allowed")
-                parent_row = conn.execute(
-                    "SELECT board FROM tasks WHERE id = ?", (link.parent_id,)
-                ).fetchone()
-                child_row = conn.execute(
-                    "SELECT board FROM tasks WHERE id = ?", (link.child_id,)
-                ).fetchone()
-                if parent_row is None or child_row is None:
-                    conn.rollback()
-                    raise TaskNotFoundError("parent or child task not found")
-                if parent_row["board"] != child_row["board"]:
-                    conn.rollback()
-                    raise TaskValidationError("cross-board link not allowed")
-                existing = conn.execute(
-                    "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
-                    (link.parent_id, link.child_id),
-                ).fetchone()
-                if existing is not None:
-                    conn.rollback()
-                    raise TaskConflictError(
-                        f"duplicate link: {link.parent_id} -> {link.child_id}"
-                    )
-                # Cycle check (within graph being created)
-                if self._has_path_sync(conn, link.child_id, link.parent_id):
-                    conn.rollback()
-                    raise TaskValidationError(
-                        f"cycle detected: {link.parent_id} -> {link.child_id}"
-                    )
-                conn.execute(
-                    """
-                    INSERT INTO task_links (parent_id, child_id, created_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (link.parent_id, link.child_id, _dt_to_str(now)),
-                )
-            # 3. Insert comments
-            for comment in command.comments:
-                conn.execute(
-                    """
-                    INSERT INTO task_comments (id, task_id, author, body, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        comment.id,
-                        comment.task_id,
-                        comment.author,
-                        comment.body,
-                        _dt_to_str(comment.created_at or now),
-                    ),
-                )
-            conn.commit()
-        return CreateGraphResult(
-            tasks=command.tasks,
-            links=command.links,
-            comments=command.comments,
-        )
-
     # ------------------------------------------------------------------
     # Comments (sync)
     # ------------------------------------------------------------------
@@ -1505,7 +1288,6 @@ class SQLiteTaskRegistry:
         comment_id = f"tc_{uuid4().hex[:16]}"
         now = _now()
         with self._connect() as conn:
-            # Verify task exists
             row = conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
@@ -1552,7 +1334,6 @@ class SQLiteTaskRegistry:
         now = _now()
         payload_json = _json_dumps(dict(payload))
         with self._connect() as conn:
-            # Verify task exists
             row = conn.execute(
                 "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
@@ -1740,7 +1521,6 @@ class SQLiteTaskRegistry:
                 "task_id": r["task_id"],
                 "platform": r["platform"],
                 "chat_id": r["chat_id"],
-                # Normalize '' back to None for the domain
                 "thread_id": r["thread_id"] or None,
                 "last_terminal_event_id": r["last_terminal_event_id"],
             }
@@ -1754,7 +1534,6 @@ class SQLiteTaskRegistry:
         chat_id: str,
         thread_id: str | None = None,
     ) -> bool:
-        # Normalize thread_id to match stored '' convention
         tid = thread_id or ""
         with self._connect() as conn:
             cursor = conn.execute(
@@ -1817,9 +1596,10 @@ class SQLiteTaskRegistry:
         board: str = "default",
         cursor: TaskListCursor | None = None,
         limit: int = 100,
+        include_archived: bool = False,
     ) -> TaskListPage:
         return await asyncio.to_thread(
-            self._list_tasks_sync, board, cursor, limit
+            self._list_tasks_sync, board, cursor, limit, include_archived
         )
 
     async def update_task(
@@ -1865,39 +1645,19 @@ class SQLiteTaskRegistry:
     async def recover_run(self, command: RecoverRunCommand) -> FinishRunResult:
         return await asyncio.to_thread(self._recover_run_sync, command)
 
-    async def list_ready(
-        self, board: str = "default", limit: int = 100
+    async def list_queued_due(
+        self,
+        now: datetime,
+        limit: int = 100,
+        board: str = "default",
     ) -> tuple[Task, ...]:
-        result = await asyncio.to_thread(self._list_ready_sync, board, limit)
+        result = await asyncio.to_thread(
+            self._list_queued_due_sync, now, limit, board
+        )
         return tuple(result)
 
     async def list_running(self, board: str = "default") -> tuple[Task, ...]:
         result = await asyncio.to_thread(self._list_running_sync, board)
-        return tuple(result)
-
-    async def recompute_ready(self, board: str = "default") -> tuple[str, ...]:
-        result = await asyncio.to_thread(self._recompute_ready_sync, board)
-        return tuple(result)
-
-    async def create_graph(self, command: CreateGraphCommand) -> CreateGraphResult:
-        return await asyncio.to_thread(self._create_graph_sync, command)
-
-    async def add_link(self, parent_id: str, child_id: str) -> TaskLink:
-        return await asyncio.to_thread(self._add_link_sync, parent_id, child_id)
-
-    async def remove_link(self, parent_id: str, child_id: str) -> bool:
-        return await asyncio.to_thread(self._remove_link_sync, parent_id, child_id)
-
-    async def list_links(self, task_id: str) -> tuple[TaskLink, ...]:
-        result = await asyncio.to_thread(self._list_links_sync, task_id)
-        return tuple(result)
-
-    async def list_children(self, parent_id: str) -> tuple[Task, ...]:
-        result = await asyncio.to_thread(self._list_children_sync, parent_id)
-        return tuple(result)
-
-    async def list_parents(self, child_id: str) -> tuple[Task, ...]:
-        result = await asyncio.to_thread(self._list_parents_sync, child_id)
         return tuple(result)
 
     async def add_comment(

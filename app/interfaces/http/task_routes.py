@@ -69,8 +69,36 @@ _LIST_LIMIT_MAX = 200
 # the public surface; status transitions still go through PATCH but
 # RUNNING rejects generic updates at the service layer.
 _PATCH_ALLOWED_FIELDS = frozenset({
-    "title", "body", "assignee", "priority", "status",
+    "title", "body", "priority", "is_archived",
 })
+
+
+# Approval note length cap (trim'd). Defends worker_context budget.
+_NOTE_MAX = 2000
+
+
+def _extract_note(payload: Any) -> tuple[str | None, str | None]:
+    """Extract and validate the optional approval note from request body.
+
+    Returns ``(note, error)``: on success error is None and note is None when
+    absent/empty; on failure note is None and error is a human message.
+    Never calls str() on non-string input (rejects list/dict).
+    """
+    if payload is None:
+        return None, None
+    if not isinstance(payload, dict):
+        return None, "body must be a JSON object"
+    raw = payload.get("note")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str):
+        return None, "note must be a string"
+    note = raw.strip()
+    if not note:
+        return None, None
+    if len(note) > _NOTE_MAX:
+        return None, f"note too long (>{_NOTE_MAX} chars)"
+    return note, None
 
 
 # ---------------------------------------------------------------------------
@@ -91,33 +119,18 @@ def register_task_routes(
 
     # ---- static paths (registered first) ----
     @router.get("/chat/tasks/board")
-    async def get_board(
-        archived: bool = Query(default=False),
-        assignee: str | None = Query(default=None),
-    ):
+    async def get_board():
         try:
             page = await task_service.list_tasks(limit=_LIST_LIMIT_MAX)
         except Exception as exc:
             return _task_error_response("task_internal_error", str(exc), 500)
-        items = list(page.items)
-        if archived:
-            filtered = [t for t in items if t.status.value == "archived"]
-        else:
-            filtered = [t for t in items if t.status.value != "archived"]
-        if assignee:
-            filtered = [t for t in filtered if t.assignee == assignee]
-        columns = _group_by_status(filtered)
+        columns = _group_by_status(list(page.items))
         # Add per-column totals (capped)
         for col in columns:
             cards = col["cards"][:_BOARD_COLUMN_LIMIT]
             col["cards"] = cards
             col["total"] = len(col["cards"]) if len(cards) < col["total"] else col["total"]
-        assignees = sorted({t.assignee for t in items if t.assignee})
-        return {
-            "columns": columns,
-            "archived": archived,
-            "assignees": assignees,
-        }
+        return {"columns": columns}
 
     @router.get("/chat/tasks/inspect")
     async def inspect_dispatcher():
@@ -138,48 +151,10 @@ def register_task_routes(
         except Exception as exc:
             return _task_error_response("task_internal_error", str(exc), 500)
 
-    @router.post("/chat/tasks/swarm")
-    async def create_swarm(payload: dict = Body(default_factory=dict)):
-        from app.application.task_planning_service import SwarmWorkerSpec
-
-        try:
-            workers_raw = payload.get("workers") or []
-            workers = [
-                SwarmWorkerSpec(
-                    profile=str(w.get("profile", "")),
-                    title=str(w.get("title", "")),
-                    body=str(w.get("body", "")),
-                    skills=tuple(w.get("skills") or ()),
-                    priority=int(w.get("priority", 0) or 0),
-                    max_runtime_seconds=w.get("max_runtime_seconds"),
-                )
-                for w in workers_raw
-            ]
-            result = await task_service.create_swarm(
-                goal=str(payload.get("goal", "")),
-                workers=workers,
-                verifier_assignee=str(payload.get("verifier_assignee", "")),
-                synthesizer_assignee=str(payload.get("synthesizer_assignee", "")),
-            )
-        except TaskValidationError as exc:
-            return _task_error_response("task_invalid", str(exc), 422)
-        except TaskStateError as exc:
-            return _task_error_response("task_state_invalid", str(exc), 409)
-        except Exception as exc:
-            return _task_error_response("task_internal_error", str(exc), 500)
-        return {
-            "root_id": result.root_id,
-            "worker_ids": list(result.worker_ids),
-            "verifier_id": result.verifier_id,
-            "synthesizer_id": result.synthesizer_id,
-        }
-
     # ---- list / create ----
     @router.get("/chat/tasks")
     async def list_tasks(
         status: str | None = Query(default=None),
-        assignee: str | None = Query(default=None),
-        archived: bool = Query(default=False),
         limit: int = Query(default=100, ge=1, le=_LIST_LIMIT_MAX),
     ):
         try:
@@ -189,13 +164,6 @@ def register_task_routes(
         items = list(page.items)
         if status:
             items = [t for t in items if t.status.value == status]
-        if assignee:
-            items = [t for t in items if t.assignee == assignee]
-        if archived:
-            items = [t for t in items if t.status.value == "archived"]
-        else:
-            # By default, exclude archived unless explicitly requested.
-            items = [t for t in items if t.status.value != "archived"]
         return {
             "items": [_task_to_dict(t) for t in items],
             "next_cursor": _cursor_to_dict(page.next_cursor),
@@ -204,10 +172,18 @@ def register_task_routes(
     @router.post("/chat/tasks")
     async def create_task(payload: dict = Body(default_factory=dict)):
         try:
+            scheduled_at = None
+            raw_scheduled = payload.get("scheduled_at")
+            if raw_scheduled:
+                try:
+                    scheduled_at = datetime.fromisoformat(str(raw_scheduled))
+                except ValueError as exc:
+                    return _task_error_response("task_invalid", f"invalid scheduled_at: {exc}", 422)
+                if scheduled_at.tzinfo is None:
+                    scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
             task = await task_service.create_task(
                 title=str(payload.get("title", "") or ""),
                 body=str(payload.get("body", "") or ""),
-                assignee=payload.get("assignee"),
                 priority=int(payload.get("priority", 0) or 0),
                 created_by=str(payload.get("created_by", "") or ""),
                 idempotency_key=payload.get("idempotency_key"),
@@ -218,6 +194,7 @@ def register_task_routes(
                 goal_max_turns=payload.get("goal_max_turns"),
                 model_override=payload.get("model_override"),
                 max_runtime_seconds=payload.get("max_runtime_seconds"),
+                scheduled_at=scheduled_at,
             )
         except TaskValidationError as exc:
             return _task_error_response("task_invalid", str(exc), 422)
@@ -522,76 +499,76 @@ def register_task_routes(
         except Exception as exc:
             return _task_error_response("task_internal_error", str(exc), 500)
 
-    # ---- /{id}/specify, /{id}/decompose (LLM planning) ----
-    @router.post("/chat/tasks/{task_id}/specify")
-    async def specify_task(task_id: str):
+    # ---- /{id}/propose-change, /{id}/approve, /{id}/reject, /{id}/cancel, /{id}/retry ----
+    @router.post("/chat/tasks/{task_id}/propose-change")
+    async def propose_change(task_id: str, payload: dict = Body(default_factory=dict)):
+        proposal = str(payload.get("proposal") or "")
+        if not proposal:
+            return _task_error_response("task_invalid", "proposal is required", 422)
         try:
-            task = await task_service.specify(task_id)
+            detail = await task_service.get_task_detail(task_id)
+            if detail is None:
+                return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
+            run_id = detail.get("current_run_id")
+            return await task_service.propose_change(task_id, proposal, run_id)
         except TaskNotFoundError:
-            return _task_error_response(
-                "task_not_found", f"task not found: {task_id}", 404,
-            )
+            return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
         except TaskStateError as exc:
             return _task_error_response("task_state_invalid", str(exc), 409)
         except TaskValidationError as exc:
             return _task_error_response("task_invalid", str(exc), 422)
         except Exception as exc:
             return _task_error_response("task_internal_error", str(exc), 500)
-        return _task_to_dict(task)
 
-    @router.post("/chat/tasks/{task_id}/decompose")
-    async def decompose_task(task_id: str):
+    @router.post("/chat/tasks/{task_id}/approve")
+    async def approve_change(task_id: str, payload: Any = Body(default=None)):
+        note, err = _extract_note(payload)
+        if err is not None:
+            return _task_error_response("task_invalid", err, 422)
         try:
-            children = await task_service.decompose(task_id)
+            return await task_service.approve_change(task_id, note=note)
         except TaskNotFoundError:
-            return _task_error_response(
-                "task_not_found", f"task not found: {task_id}", 404,
-            )
+            return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
         except TaskStateError as exc:
             return _task_error_response("task_state_invalid", str(exc), 409)
-        except TaskValidationError as exc:
-            return _task_error_response("task_invalid", str(exc), 422)
-        except Exception as exc:
-            return _task_error_response("task_internal_error", str(exc), 500)
-        return {"items": [_task_to_dict(c) for c in children]}
-
-    # ---- /{id}/links ----
-    @router.post("/chat/tasks/{task_id}/links")
-    async def add_link(task_id: str, payload: dict = Body(default_factory=dict)):
-        child_id = payload.get("child_id")
-        if not isinstance(child_id, str) or not child_id:
-            return _task_error_response(
-                "task_invalid", "child_id is required", 422,
-            )
-        try:
-            return await task_service.link(task_id, child_id)
-        except TaskNotFoundError:
-            return _task_error_response(
-                "task_not_found", "task not found", 404,
-            )
-        except TaskValidationError as exc:
-            return _task_error_response("task_invalid", str(exc), 422)
-        except TaskConflictError as exc:
-            # Cycle or duplicate edge
-            return _task_error_response("task_dependency_cycle", str(exc), 422)
         except Exception as exc:
             return _task_error_response("task_internal_error", str(exc), 500)
 
-    @router.delete("/chat/tasks/{task_id}/links/{child_id}")
-    async def remove_link(task_id: str, child_id: str):
+    @router.post("/chat/tasks/{task_id}/reject")
+    async def reject_change(task_id: str, payload: Any = Body(default=None)):
+        note, err = _extract_note(payload)
+        if err is not None:
+            return _task_error_response("task_invalid", err, 422)
         try:
-            ok = await task_service.unlink(task_id, child_id)
+            return await task_service.reject_change(task_id, note=note)
         except TaskNotFoundError:
-            return _task_error_response(
-                "task_not_found", "task not found", 404,
-            )
+            return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
+        except TaskStateError as exc:
+            return _task_error_response("task_state_invalid", str(exc), 409)
         except Exception as exc:
             return _task_error_response("task_internal_error", str(exc), 500)
-        if not ok:
-            return _task_error_response(
-                "task_not_found", "link not found", 404,
-            )
-        return Response(status_code=204)
+
+    @router.post("/chat/tasks/{task_id}/cancel")
+    async def cancel_task(task_id: str):
+        try:
+            return await task_service.cancel_task(task_id)
+        except TaskNotFoundError:
+            return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
+        except TaskStateError as exc:
+            return _task_error_response("task_state_invalid", str(exc), 409)
+        except Exception as exc:
+            return _task_error_response("task_internal_error", str(exc), 500)
+
+    @router.post("/chat/tasks/{task_id}/retry")
+    async def retry_task(task_id: str):
+        try:
+            return await task_service.retry_task(task_id)
+        except TaskNotFoundError:
+            return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
+        except TaskStateError as exc:
+            return _task_error_response("task_state_invalid", str(exc), 409)
+        except Exception as exc:
+            return _task_error_response("task_internal_error", str(exc), 500)
 
     # ---- /{id}/attachments ----
     @router.get("/chat/tasks/{task_id}/attachments")
@@ -731,39 +708,38 @@ async def _ws_send_loop(
 # ---------------------------------------------------------------------------
 
 
-_ACTIVE_COLUMNS = (
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+# 5 Kanban swimlanes (Manus 7 statuses merged): (lane_id, statuses, label)
+_SWIMLANES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("queued", ("queued",), "排队"),
+    ("running", ("running",), "运行中"),
+    ("waiting_approval", ("waiting_approval",), "待批准"),
+    ("failed_expired", ("failed", "expired"), "失败/过期"),
+    ("succeeded_cancelled", ("succeeded", "cancelled"), "成功/取消"),
 )
 
 
 def _group_by_status(tasks: list[Any]) -> list[dict[str, Any]]:
-    """Group tasks into 8 active Kanban columns (or 1 archived column)."""
-    buckets: dict[str, list[Any]] = {col: [] for col in _ACTIVE_COLUMNS}
-    archived_bucket: list[Any] = []
+    """Group tasks into 5 Kanban swimlanes (Manus 7 statuses merged)."""
+    by_status: dict[str, list[Any]] = {}
     for t in tasks:
         status_value = t.status.value if hasattr(t.status, "value") else str(t.status)
-        if status_value == "archived":
-            archived_bucket.append(t)
-        elif status_value in buckets:
-            buckets[status_value].append(t)
+        by_status.setdefault(status_value, []).append(t)
     columns = []
-    for col in _ACTIVE_COLUMNS:
-        items = buckets[col]
-        items.sort(key=lambda t: (-(t.priority or 0), t.created_at or datetime.min.replace(tzinfo=timezone.utc), t.id))
-        columns.append({
-            "status": col,
-            "cards": [_task_to_dict(t) for t in items],
-            "total": len(items),
-        })
-    if archived_bucket:
-        archived_sorted = sorted(
-            archived_bucket,
-            key=lambda t: (-(t.priority or 0), t.created_at or datetime.min.replace(tzinfo=timezone.utc), t.id),
+    for lane_id, statuses, label in _SWIMLANES:
+        items: list[Any] = []
+        for st in statuses:
+            items.extend(by_status.get(st, []))
+        # Newer tasks lead each swimlane, independent of priority.
+        items.sort(
+            key=lambda t: (t.created_at or datetime.min.replace(tzinfo=timezone.utc), t.id),
+            reverse=True,
         )
         columns.append({
-            "status": "archived",
-            "cards": [_task_to_dict(t) for t in archived_sorted],
-            "total": len(archived_sorted),
+            "id": lane_id,
+            "label": label,
+            "statuses": list(statuses),
+            "cards": [_task_to_dict(t) for t in items],
+            "total": len(items),
         })
     return columns
 

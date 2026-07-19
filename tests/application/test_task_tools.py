@@ -1,15 +1,18 @@
-"""T10: Application task tool definitions (ToolDefinition).
+"""T6: Application task tool definitions (ToolDefinition).
 
-Covers plan T10 (task_tool_definitions 返回 7 个 managed ToolDefinition).
+Covers plan T6 (task_tool_definitions 返回 6 个 managed ToolDefinition).
 
-Spec reference:
-  - 7 个工具: task_show / task_complete / task_block / task_heartbeat /
-    task_comment / task_create / task_link
+Spec reference (Manus-aligned 7-state machine):
+  - 6 个工具: task_show / task_complete / task_heartbeat / task_comment /
+    task_propose_change / task_cancel
   - source_type=AGENT, toolset="task", managed=True, risk_level=CONFIRM
   - managed=True 表示 ToolPolicy 仅在 trusted_metadata.task 上下文存在时
     才暴露（模式十二 trusted_metadata 门控）
   - description 中文
   - input_schema 按 spec 工具契约
+
+移除的工具（对齐 Manus 扁平状态机）:
+  - task_block / task_create / task_link
 """
 from __future__ import annotations
 
@@ -20,27 +23,35 @@ from app.domain.tool import RiskLevel, ToolSourceType
 
 
 # ---------------------------------------------------------------------------
-# T10 S1-S4: 7 工具 ToolDefinition
+# T6 S1-S4: 6 工具 ToolDefinition
 # ---------------------------------------------------------------------------
 
 
-def test_task_tool_definitions_returns_seven_tools():
+def test_task_tool_definitions_returns_six_tools():
     defs = task_tool_definitions()
     names = {d.name for d in defs}
     assert names == {
         "task_show",
         "task_complete",
-        "task_block",
         "task_heartbeat",
         "task_comment",
-        "task_create",
-        "task_link",
+        "task_propose_change",
+        "task_cancel",
     }
-    assert len(defs) == 7
+    assert len(defs) == 6
+
+
+def test_task_tool_definitions_no_removed_tools():
+    """Removed tools (task_block/task_create/task_link) must not appear."""
+    defs = task_tool_definitions()
+    names = {d.name for d in defs}
+    assert "task_block" not in names
+    assert "task_create" not in names
+    assert "task_link" not in names
 
 
 def test_task_tool_definitions_common_attributes():
-    """所有 7 个工具必须有统一的 source_type/toolset/managed/risk_level。"""
+    """所有 6 个工具必须有统一的 source_type/toolset/managed/risk_level。"""
     defs = task_tool_definitions()
     for d in defs:
         assert d.source_type is ToolSourceType.AGENT, f"{d.name} source_type"
@@ -53,7 +64,7 @@ def test_task_tool_definitions_common_attributes():
 
 
 def test_task_tool_definitions_pass_policy_validation():
-    """7 个工具必须能通过 ToolPolicy.validate_definition（wiring 必需）。"""
+    """6 个工具必须能通过 ToolPolicy.validate_definition（wiring 必需）。"""
     from app.domain.tool_policy import ToolPolicy
     policy = ToolPolicy()
     for d in task_tool_definitions():
@@ -107,25 +118,6 @@ def test_task_complete_input_schema():
     assert "summary" in schema.get("required", [])
 
 
-def test_task_block_input_schema():
-    """task_block: {reason, kind}"""
-    defs = {d.name: d for d in task_tool_definitions()}
-    schema = defs["task_block"].input_schema
-    props = schema["properties"]
-    assert "reason" in props
-    assert "kind" in props
-    # kind 是枚举，对应 BlockKind: dependency/needs_input/capability/transient
-    assert "enum" in props["kind"]
-    assert set(props["kind"]["enum"]) == {
-        "dependency",
-        "needs_input",
-        "capability",
-        "transient",
-    }
-    assert "reason" in schema.get("required", [])
-    assert "kind" in schema.get("required", [])
-
-
 def test_task_heartbeat_input_schema():
     """task_heartbeat: {note}"""
     defs = {d.name: d for d in task_tool_definitions()}
@@ -146,25 +138,22 @@ def test_task_comment_input_schema():
     assert "body" in schema.get("required", [])
 
 
-def test_task_create_input_schema():
-    """task_create: {title, body, assignee, parents, skills}"""
+def test_task_propose_change_input_schema():
+    """task_propose_change: {proposal} -- proposal 非空 text"""
     defs = {d.name: d for d in task_tool_definitions()}
-    schema = defs["task_create"].input_schema
+    schema = defs["task_propose_change"].input_schema
     props = schema["properties"]
-    assert "title" in props
-    assert "body" in props
-    assert "assignee" in props
-    assert "parents" in props
-    assert "skills" in props
-    assert "title" in schema.get("required", [])
+    assert "proposal" in props
+    assert props["proposal"]["type"] == "string"
+    assert props["proposal"].get("minLength") == 1
+    assert "proposal" in schema.get("required", [])
+    assert schema.get("additionalProperties") is False
 
 
-def test_task_link_input_schema():
-    """task_link: {parent_id, child_id}"""
+def test_task_cancel_input_schema():
+    """task_cancel: 无参"""
     defs = {d.name: d for d in task_tool_definitions()}
-    schema = defs["task_link"].input_schema
-    props = schema["properties"]
-    assert "parent_id" in props
-    assert "child_id" in props
-    assert "parent_id" in schema.get("required", [])
-    assert "child_id" in schema.get("required", [])
+    schema = defs["task_cancel"].input_schema
+    assert schema["properties"] == {}
+    assert schema.get("required", []) == []
+    assert schema.get("additionalProperties") is False

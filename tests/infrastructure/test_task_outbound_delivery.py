@@ -109,7 +109,7 @@ class FakeRegistry:
 def _task(
     task_id: str = "t_1",
     title: str = "Test Task",
-    status: TaskStatus = TaskStatus.DONE,
+    status: TaskStatus = TaskStatus.SUCCEEDED,
     result: str = "task completed successfully",
 ) -> Task:
     return Task(
@@ -341,7 +341,7 @@ async def test_delivery_failure_does_not_change_task_state(
     failing = FakeFeishuClient(fail=True)
     delivery = TaskOutboundDelivery(feishu_client=failing, registry=registry)
     registry.add_sub("t_1", platform="feishu", chat_id="chat-1")
-    task = _task(status=TaskStatus.DONE, result="done")
+    task = _task(status=TaskStatus.SUCCEEDED, result="done")
     original_status = task.status
     original_result = task.result
     await delivery.deliver(task, _terminal_event(event_id=1))

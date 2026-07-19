@@ -119,6 +119,12 @@ Docker Compose 项目隔离使用：
 - 迭代上限：Agent finalize，并写入 task_state last_error
 - SQLite 写入失败：当前请求失败，不静默丢状态
 
+## Dashboard 前端
+
+- Dashboard 的提示、错误反馈统一调用共享 `NAGENT.modal.alert(message, options)`，禁止使用浏览器原生 `alert`、`window.alert` 或 `globalThis.alert`；共享实现仅位于 `app/interfaces/http/static/management-ui.js`。
+- 需要用户确认的操作统一调用 `NAGENT.modal.confirm(message, options)`，以保持与 Dashboard 其它弹窗一致的样式和交互。
+- 新增或修改静态前端模块时，必须保持 `tests/interfaces/test_static_assets.py` 的原生 alert 扫描通过。
+
 ## 验收命令
 
 ```bash

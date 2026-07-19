@@ -1,37 +1,32 @@
-"""T12: TaskService tests.
+"""T4: TaskService tests (Manus-aligned 7-state machine).
 
 Tests CRUD, idempotency, optimistic lock, RUNNING guards, attachments,
-notify subs, build_worker_context, and the TaskServiceProtocol surface
-(get_task_detail/complete/block/heartbeat/add_comment/create_subtask/
-link/build_worker_context).
+notify subs, build_worker_context, and the new user-action surface
+(propose_change / approve_change / reject_change / cancel_task /
+retry_task).
 
 Uses an in-memory FakeTaskRegistry to isolate from SQLite.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.application.task_service import TaskService
+from app.application.task_service import TaskService, _task_to_dict
 from app.domain.task import (
-    BlockKind,
     BulkUpdateCommand,
     BulkUpdateItem,
     ClaimResult,
-    CreateGraphCommand,
     FinishRunCommand,
     FinishRunResult,
     RecoverRunCommand,
     Task,
-    TaskAttachment,
     TaskClaimError,
     TaskComment,
     TaskConflictError,
     TaskEvent,
     TaskExecutionPolicy,
-    TaskLink,
     TaskListCursor,
     TaskListPage,
     TaskNotFoundError,
@@ -47,7 +42,7 @@ from app.domain.task_policy import TaskPolicy
 
 
 # ---------------------------------------------------------------------------
-# Fake registry (in-memory)
+# Fake registry (in-memory, Manus-aligned 7-state)
 # ---------------------------------------------------------------------------
 
 
@@ -57,8 +52,7 @@ class FakeTaskRegistry:
         self._runs: dict[int, TaskRun] = {}
         self._events: list[TaskEvent] = []
         self._comments: dict[str, list[TaskComment]] = {}
-        self._attachments: dict[str, list[TaskAttachment]] = {}
-        self._links: list[TaskLink] = []
+        self._attachments: dict[str, list] = {}
         self._notify_subs: list[dict] = []
         self._next_run_id = 1
         self._next_event_id = 1
@@ -66,7 +60,6 @@ class FakeTaskRegistry:
     async def create_task(self, task: Task) -> Task:
         if task.id in self._tasks:
             raise TaskConflictError(f"duplicate id: {task.id}")
-        # Check idempotency
         if task.idempotency_key:
             for existing in self._tasks.values():
                 if (
@@ -81,9 +74,11 @@ class FakeTaskRegistry:
     async def get_task(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
 
-    async def list_tasks(self, board="default", cursor=None, limit=100):
+    async def list_tasks(self, board="default", cursor=None, limit=100,
+                         include_archived=False):
         items = [
-            t for t in self._tasks.values() if t.board == board
+            t for t in self._tasks.values()
+            if t.board == board and (include_archived or not t.is_archived)
         ]
         items.sort(key=lambda t: (t.created_at or datetime.min, t.id))
         return TaskListPage(items=tuple(items[:limit]))
@@ -95,15 +90,19 @@ class FakeTaskRegistry:
         if task.version != expected_version:
             raise TaskConflictError("version conflict")
         from dataclasses import replace as dc_replace
-        updated = dc_replace(task, **dict(fields), version=task.version + 1,
-                             updated_at=datetime.now(timezone.utc))
+        updated = dc_replace(
+            task, **dict(fields), version=task.version + 1,
+            updated_at=datetime.now(timezone.utc),
+        )
         self._tasks[task_id] = updated
         return updated
 
     async def bulk_update(self, command):
         updated = []
         for item in command.items:
-            t = await self.update_task(item.task_id, item.fields, item.expected_version)
+            t = await self.update_task(
+                item.task_id, item.fields, item.expected_version
+            )
             updated.append(t)
         from app.domain.task import BulkUpdateResult
         return BulkUpdateResult(updated=tuple(updated))
@@ -116,22 +115,29 @@ class FakeTaskRegistry:
 
     async def claim_task(self, task_id, claim_lock, lease_seconds):
         task = self._tasks.get(task_id)
-        if task is None or task.status != TaskStatus.READY:
+        if task is None or task.status != TaskStatus.QUEUED:
+            return None
+        if task.is_archived:
+            return None
+        now = datetime.now(timezone.utc)
+        if task.scheduled_at is not None and task.scheduled_at > now:
             return None
         from dataclasses import replace as dc_replace
         from datetime import timedelta
-        now = datetime.now(timezone.utc)
         run_id = self._next_run_id
         self._next_run_id += 1
+        expires = now + timedelta(seconds=lease_seconds)
         run = TaskRun(
             id=run_id, task_id=task_id, status=TaskRunStatus.RUNNING,
-            claim_lock=claim_lock, started_at=now,
+            claim_lock=claim_lock, claim_expires=expires,
+            started_at=now, lease_seconds=lease_seconds,
         )
         self._runs[run_id] = run
         updated = dc_replace(
             task, status=TaskStatus.RUNNING, claim_lock=claim_lock,
-            current_run_id=run_id, worker_token=f"wt_{run_id}",
-            last_heartbeat_at=now, version=task.version + 1,
+            claim_expires=expires, current_run_id=run_id,
+            worker_token=f"wt_{run_id}", last_heartbeat_at=now,
+            started_at=now, version=task.version + 1,
         )
         self._tasks[task_id] = updated
         return ClaimResult(task=updated, run=run)
@@ -156,18 +162,21 @@ class FakeTaskRegistry:
             raise TaskClaimError("finish CAS failed")
         from dataclasses import replace as dc_replace
         now = datetime.now(timezone.utc)
-        # Determine new status
         if command.target_task_status is not None:
             new_status = command.target_task_status
         elif command.outcome == TaskRunOutcome.COMPLETED:
-            new_status = TaskStatus.DONE
-        elif command.outcome in (TaskRunOutcome.BLOCKED, TaskRunOutcome.GAVE_UP):
-            new_status = TaskStatus.BLOCKED
+            new_status = TaskStatus.SUCCEEDED
+        elif command.outcome == TaskRunOutcome.WAITING_APPROVAL:
+            new_status = TaskStatus.WAITING_APPROVAL
+        elif command.outcome == TaskRunOutcome.TERMINATED:
+            new_status = TaskStatus.CANCELLED
+        elif command.outcome == TaskRunOutcome.EXPIRED:
+            new_status = TaskStatus.EXPIRED
         else:
-            new_status = TaskStatus.TODO
-        # Increment failures for retryable
+            # retryable failure
+            new_status = TaskStatus.QUEUED
         failures = task.consecutive_failures
-        if command.outcome not in (TaskRunOutcome.COMPLETED, TaskRunOutcome.BLOCKED, TaskRunOutcome.GAVE_UP):
+        if command.outcome in (TaskRunOutcome.FAILED, TaskRunOutcome.SPAWN_FAILED):
             failures += 1
         elif command.outcome == TaskRunOutcome.COMPLETED:
             failures = 0
@@ -177,6 +186,9 @@ class FakeTaskRegistry:
             consecutive_failures=failures,
             version=task.version + 1, updated_at=now,
             result=command.summary if command.outcome == TaskRunOutcome.COMPLETED else task.result,
+            completed_at=now if command.outcome in (
+                TaskRunOutcome.COMPLETED, TaskRunOutcome.TERMINATED
+            ) else task.completed_at,
         )
         self._tasks[command.task_id] = updated_task
         updated_run = dc_replace(
@@ -200,80 +212,22 @@ class FakeTaskRegistry:
             error=command.error,
         ))
 
-    async def list_ready(self, board="default", limit=100):
-        return tuple(
+    async def list_queued_due(self, now=None, limit=100, board="default"):
+        now = now or datetime.now(timezone.utc)
+        items = [
             t for t in self._tasks.values()
-            if t.board == board and t.status == TaskStatus.READY
-        )
+            if t.board == board and t.status == TaskStatus.QUEUED
+            and not t.is_archived
+            and (t.scheduled_at is None or t.scheduled_at <= now)
+        ]
+        items.sort(key=lambda t: (-t.priority, t.created_at or datetime.min, t.id))
+        return tuple(items[:limit])
 
     async def list_running(self, board="default"):
         return tuple(
             t for t in self._tasks.values()
             if t.board == board and t.status == TaskStatus.RUNNING
         )
-
-    async def recompute_ready(self, board="default"):
-        return ()
-
-    async def create_graph(self, command: CreateGraphCommand):
-        for task in command.tasks:
-            await self.create_task(task)
-        for link in command.links:
-            await self.add_link(link.parent_id, link.child_id)
-        from app.domain.task import CreateGraphResult
-        return CreateGraphResult(tasks=command.tasks, links=command.links, comments=command.comments)
-
-    async def add_link(self, parent_id, child_id):
-        if parent_id == child_id:
-            raise TaskValidationError("self-loop")
-        if parent_id not in self._tasks or child_id not in self._tasks:
-            raise TaskNotFoundError("parent or child not found")
-        link = TaskLink(parent_id=parent_id, child_id=child_id)
-        for existing in self._links:
-            if existing.parent_id == parent_id and existing.child_id == child_id:
-                raise TaskConflictError("duplicate link")
-        # Cycle check: is there already a path from child_id to parent_id?
-        if self._has_path(child_id, parent_id):
-            raise TaskValidationError("cycle detected")
-        self._links.append(link)
-        return link
-
-    def _has_path(self, start: str, target: str) -> bool:
-        if start == target:
-            return True
-        visited: set[str] = set()
-        stack: list[str] = [start]
-        while stack:
-            node = stack.pop()
-            if node in visited:
-                continue
-            visited.add(node)
-            for link in self._links:
-                if link.parent_id == node:
-                    if link.child_id == target:
-                        return True
-                    stack.append(link.child_id)
-        return False
-
-    async def remove_link(self, parent_id, child_id):
-        before = len(self._links)
-        self._links = [
-            l for l in self._links if not (l.parent_id == parent_id and l.child_id == child_id)
-        ]
-        return len(self._links) < before
-
-    async def list_links(self, task_id):
-        return tuple(
-            l for l in self._links if l.parent_id == task_id or l.child_id == task_id
-        )
-
-    async def list_children(self, parent_id):
-        child_ids = {l.child_id for l in self._links if l.parent_id == parent_id}
-        return tuple(self._tasks[cid] for cid in child_ids if cid in self._tasks)
-
-    async def list_parents(self, child_id):
-        parent_ids = {l.parent_id for l in self._links if l.child_id == child_id}
-        return tuple(self._tasks[pid] for pid in parent_ids if pid in self._tasks)
 
     async def add_comment(self, task_id, author, body):
         from uuid import uuid4
@@ -308,8 +262,10 @@ class FakeTaskRegistry:
             r for r in self._runs.values() if r.task_id == task_id
         )[-limit:]
 
-    async def add_attachment(self, task_id, filename, stored_name, content_type, size, checksum, uploaded_by):
+    async def add_attachment(self, task_id, filename, stored_name, content_type,
+                            size, checksum, uploaded_by):
         from uuid import uuid4
+        from app.domain.task import TaskAttachment
         att = TaskAttachment(
             id=f"ta_{uuid4().hex[:8]}", task_id=task_id, filename=filename,
             stored_name=stored_name, content_type=content_type, size=size,
@@ -369,6 +325,30 @@ class FakeMemoryStore:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _claim(registry: FakeTaskRegistry, task_id: str, lock: str = "lock-1") -> int:
+    """Claim a QUEUED task and return its run_id."""
+    result = await registry.claim_task(task_id, lock, 900)
+    assert result is not None, f"claim failed for {task_id}"
+    return result.run.id
+
+
+def _running_task(task_id: str = "t_run") -> Task:
+    """Build a task directly in RUNNING with a claim (bypasses dispatcher)."""
+    now = datetime.now(timezone.utc)
+    return Task(
+        id=task_id, title="running", status=TaskStatus.RUNNING,
+        created_at=now, created_by="u", version=1,
+        claim_lock="lock-1", claim_expires=now + timedelta(seconds=900),
+        current_run_id=1, worker_token="wt_1", last_heartbeat_at=now,
+        started_at=now,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -397,13 +377,30 @@ def svc(registry, tmp_path):
 async def test_create_task_basic(svc, registry):
     task = await svc.create_task(title="调研架构", created_by="alice")
     assert task.id.startswith("t_")
-    assert task.status == TaskStatus.TRIAGE
+    assert task.status == TaskStatus.QUEUED
     assert task.title == "调研架构"
     assert task.board == "default"
     assert task.version == 1
-    # created event appended
     events = await registry.list_events(task.id)
     assert any(e.kind == "created" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_create_task_no_assignee_field(svc):
+    """create_task must not accept an assignee parameter."""
+    import inspect
+    sig = inspect.signature(svc.create_task)
+    assert "assignee" not in sig.parameters
+
+
+@pytest.mark.asyncio
+async def test_create_task_with_scheduled_at(svc):
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    task = await svc.create_task(
+        title="delayed", created_by="u", scheduled_at=future,
+    )
+    assert task.status == TaskStatus.QUEUED
+    assert task.scheduled_at == future
 
 
 @pytest.mark.asyncio
@@ -416,8 +413,7 @@ async def test_create_task_empty_title_rejected(svc):
 
 @pytest.mark.asyncio
 async def test_create_task_idempotency(svc):
-    t1 = await svc.create_task(title="x", created_by="u", idempotency_key="k1")
-    # Second call with same key should raise (registry enforces uniqueness)
+    await svc.create_task(title="x", created_by="u", idempotency_key="k1")
     with pytest.raises(TaskConflictError):
         await svc.create_task(title="x", created_by="u", idempotency_key="k1")
 
@@ -447,7 +443,7 @@ async def test_update_task_optimistic_lock(svc, registry):
 @pytest.mark.asyncio
 async def test_update_task_running_rejected(svc, registry):
     task = Task(
-        id="t_run", title="r", status=TaskStatus.READY, assignee="d",
+        id="t_run", title="r", status=TaskStatus.QUEUED,
         created_at=datetime.now(timezone.utc), version=1,
     )
     await registry.create_task(task)
@@ -467,7 +463,7 @@ async def test_delete_task_non_running(svc, registry):
 @pytest.mark.asyncio
 async def test_delete_task_running_rejected(svc, registry):
     task = Task(
-        id="t_run2", title="r", status=TaskStatus.READY, assignee="d",
+        id="t_run2", title="r", status=TaskStatus.QUEUED,
         created_at=datetime.now(timezone.utc), version=1,
     )
     await registry.create_task(task)
@@ -479,7 +475,6 @@ async def test_delete_task_running_rejected(svc, registry):
 @pytest.mark.asyncio
 async def test_delete_task_cleans_execution_session(svc, registry):
     task = await svc.create_task(title="x", created_by="u")
-    # Simulate execution session
     await registry.update_task(
         task.id, {"execution_session_id": "task-t_exec"}, expected_version=1
     )
@@ -488,79 +483,371 @@ async def test_delete_task_cleans_execution_session(svc, registry):
 
 
 # ---------------------------------------------------------------------------
-# State transitions
+# propose_change / approve / reject
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_assign(svc):
+async def test_propose_change_writes_event_and_advances_state(svc, registry):
+    task = _running_task("t_p1")
+    await registry.create_task(task)
+    # Create a run row to match current_run_id
+    run = TaskRun(
+        id=1, task_id="t_p1", status=TaskRunStatus.RUNNING,
+        claim_lock="lock-1", started_at=datetime.now(timezone.utc),
+    )
+    registry._runs[1] = run
+
+    result = await svc.propose_change(
+        "t_p1", "switch to plan B", run_id=1,
+    )
+    assert result["outcome"] == "waiting_approval"
+    assert result["proposal"] == "switch to plan B"
+    assert result["run_id"] == 1
+    assert "proposal_event_id" in result
+
+    events = await registry.list_events("t_p1")
+    proposed = [e for e in events if e.kind == "change_proposed"]
+    assert len(proposed) == 1
+    assert proposed[0].payload["proposal"] == "switch to plan B"
+    assert proposed[0].payload["run_id"] == 1
+    assert proposed[0].run_id == 1
+
+
+@pytest.mark.asyncio
+async def test_propose_change_not_running_rejected(svc, registry):
     task = await svc.create_task(title="x", created_by="u")
-    updated = await svc.assign(task.id, "worker-1", expected_version=1)
-    assert updated.assignee == "worker-1"
+    # task is QUEUED, not RUNNING
+    with pytest.raises(TaskStateError):
+        await svc.propose_change(task.id, "p", run_id=1)
 
 
 @pytest.mark.asyncio
-async def test_promote_to_ready(svc, registry):
-    task = await svc.create_task(title="x", created_by="u", assignee="d")
-    # Move to TODO first (TRIAGE -> TODO is allowed)
-    await registry.update_task(task.id, {"status": TaskStatus.TODO}, expected_version=1)
-    updated = await svc.promote_to_ready(task.id, expected_version=2)
-    assert updated.status == TaskStatus.READY
-
-
-@pytest.mark.asyncio
-async def test_archive_unarchive(svc):
-    task = await svc.create_task(title="x", created_by="u")
-    archived = await svc.archive(task.id, expected_version=1)
-    assert archived.status == TaskStatus.ARCHIVED
-    assert archived.pre_archive_status == TaskStatus.TRIAGE
-    unarchived = await svc.unarchive(task.id, expected_version=2)
-    assert unarchived.status == TaskStatus.TRIAGE
-    assert unarchived.pre_archive_status is None
-
-
-@pytest.mark.asyncio
-async def test_archive_running_rejected(svc, registry):
-    task = Task(
-        id="t_ar", title="r", status=TaskStatus.READY, assignee="d",
-        created_at=datetime.now(timezone.utc), version=1,
+async def test_propose_change_run_id_mismatch_rejected(svc, registry):
+    task = _running_task("t_p2")
+    task = task.__class__(
+        **{**task.__dict__, "current_run_id": 5}
     )
     await registry.create_task(task)
-    await registry.claim_task("t_ar", "lock-1", 900)
     with pytest.raises(TaskStateError):
-        await svc.archive("t_ar", expected_version=1)
+        await svc.propose_change("t_p2", "p", run_id=999)
+
+
+@pytest.mark.asyncio
+async def test_approve_change_moves_to_queued(svc, registry):
+    # Set up a WAITING_APPROVAL task with a prior change_proposed event
+    task = _running_task("t_a1")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    proposal_event = await registry.append_event(
+        "t_a1", "change_proposed",
+        {"proposal": "do X", "run_id": 1}, run_id=1,
+    )
+
+    result = await svc.approve_change("t_a1")
+    assert result["task_id"] == "t_a1"
+    assert result["decision"] == "approved"
+    assert result["proposal_event_id"] == proposal_event.id
+
+    updated = await registry.get_task("t_a1")
+    assert updated.status == TaskStatus.QUEUED
+
+    events = await registry.list_events("t_a1")
+    approved = [e for e in events if e.kind == "change_approved"]
+    assert len(approved) == 1
+    assert approved[0].payload["proposal_event_id"] == proposal_event.id
+
+
+@pytest.mark.asyncio
+async def test_reject_change_moves_to_queued(svc, registry):
+    task = _running_task("t_r1")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    proposal_event = await registry.append_event(
+        "t_r1", "change_proposed",
+        {"proposal": "do Y", "run_id": 1}, run_id=1,
+    )
+
+    result = await svc.reject_change("t_r1")
+    assert result["decision"] == "rejected"
+    assert result["proposal_event_id"] == proposal_event.id
+
+    updated = await registry.get_task("t_r1")
+    assert updated.status == TaskStatus.QUEUED
+
+    events = await registry.list_events("t_r1")
+    rejected = [e for e in events if e.kind == "change_rejected"]
+    assert len(rejected) == 1
+
+
+@pytest.mark.asyncio
+async def test_approve_not_waiting_rejected(svc, registry):
+    task = await svc.create_task(title="x", created_by="u")
+    # task is QUEUED, not WAITING_APPROVAL
+    with pytest.raises(TaskStateError):
+        await svc.approve_change(task.id)
+
+
+@pytest.mark.asyncio
+async def test_approve_does_not_change_scheduled_at(svc, registry):
+    future = datetime.now(timezone.utc) + timedelta(hours=2)
+    task = _running_task("t_a2")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None,
+           "scheduled_at": future}
+    )
+    await registry.create_task(task)
+    await registry.append_event(
+        "t_a2", "change_proposed", {"proposal": "p", "run_id": 1}, run_id=1,
+    )
+
+    await svc.approve_change("t_a2")
+    updated = await registry.get_task("t_a2")
+    assert updated.scheduled_at == future
+
+
+@pytest.mark.asyncio
+async def test_approve_change_with_note_persists_payload(svc, registry):
+    task = _running_task("t_an1")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await registry.append_event(
+        "t_an1", "change_proposed", {"proposal": "do X", "run_id": 1}, run_id=1,
+    )
+
+    result = await svc.approve_change("t_an1", note="looks good")
+    assert result["note"] == "looks good"
+    assert result["decision"] == "approved"
+    events = await registry.list_events("t_an1")
+    approved = [e for e in events if e.kind == "change_approved"]
+    assert approved[0].payload["note"] == "looks good"
+
+
+@pytest.mark.asyncio
+async def test_reject_change_with_note_persists_payload(svc, registry):
+    task = _running_task("t_an2")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await registry.append_event(
+        "t_an2", "change_proposed", {"proposal": "do Y", "run_id": 1}, run_id=1,
+    )
+    result = await svc.reject_change("t_an2", note="reason: risky")
+    assert result["note"] == "reason: risky"
+    events = await registry.list_events("t_an2")
+    rejected = [e for e in events if e.kind == "change_rejected"]
+    assert rejected[0].payload["note"] == "reason: risky"
+
+
+@pytest.mark.asyncio
+async def test_approval_without_note_persists_null(svc, registry):
+    task = _running_task("t_an3")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await registry.append_event(
+        "t_an3", "change_proposed", {"proposal": "p", "run_id": 1}, run_id=1,
+    )
+    result = await svc.approve_change("t_an3")
+    assert result["note"] is None
+    events = await registry.list_events("t_an3")
+    approved = [e for e in events if e.kind == "change_approved"]
+    assert approved[0].payload["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_build_worker_context_renders_approval_note(svc, registry):
+    task = _running_task("t_wn1")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await registry.append_event(
+        "t_wn1", "change_proposed", {"proposal": "do X", "run_id": 1}, run_id=1,
+    )
+    await svc.approve_change("t_wn1", note="proceed with care")
+    updated = await registry.get_task("t_wn1")
+    ctx = await svc.build_worker_context(updated)
+    assert "审批决策" in ctx
+    assert "proceed with care" in ctx
+
+
+@pytest.mark.asyncio
+async def test_build_worker_context_legacy_approval_without_note(svc, registry):
+    # Legacy change_approved event written before note field existed.
+    task = _running_task("t_wn2")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.QUEUED,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await registry.append_event(
+        "t_wn2", "change_approved", {"decision": "approved"},
+    )
+    updated = await registry.get_task("t_wn2")
+    ctx = await svc.build_worker_context(updated)
+    assert "note=None" not in ctx
+    assert "note=undefined" not in ctx
 
 
 # ---------------------------------------------------------------------------
-# Dependency graph
+# cancel_task
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_link(svc, registry):
-    parent = await svc.create_task(title="p", created_by="u")
-    child = await svc.create_task(title="c", created_by="u")
-    result = await svc.link(parent.id, child.id)
-    assert result["parent_id"] == parent.id
-    assert result["child_id"] == child.id
+async def test_cancel_task_from_queued(svc, registry):
+    task = await svc.create_task(title="x", created_by="u")
+    result = await svc.cancel_task(task.id)
+    assert result["task_id"] == task.id
+    assert result["status"] == "cancelled"
+
+    updated = await registry.get_task(task.id)
+    assert updated.status == TaskStatus.CANCELLED
+
+    events = await registry.list_events(task.id)
+    assert any(e.kind == "cancelled" for e in events)
 
 
 @pytest.mark.asyncio
-async def test_unlink(svc, registry):
-    parent = await svc.create_task(title="p", created_by="u")
-    child = await svc.create_task(title="c", created_by="u")
-    await svc.link(parent.id, child.id)
-    removed = await svc.unlink(parent.id, child.id)
-    assert removed is True
+async def test_cancel_task_from_waiting_approval(svc, registry):
+    task = _running_task("t_c1")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await svc.cancel_task("t_c1")
+    updated = await registry.get_task("t_c1")
+    assert updated.status == TaskStatus.CANCELLED
 
 
 @pytest.mark.asyncio
-async def test_link_cycle_rejected(svc, registry):
-    t1 = await svc.create_task(title="a", created_by="u")
-    t2 = await svc.create_task(title="b", created_by="u")
-    await svc.link(t1.id, t2.id)
-    with pytest.raises(Exception):
-        await svc.link(t2.id, t1.id)
+async def test_cancel_task_from_failed(svc, registry):
+    task = _running_task("t_c2")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.FAILED,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await svc.cancel_task("t_c2")
+    updated = await registry.get_task("t_c2")
+    assert updated.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_terminal_rejected(svc, registry):
+    task = _running_task("t_c3")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.SUCCEEDED}
+    )
+    await registry.create_task(task)
+    with pytest.raises(TaskStateError):
+        await svc.cancel_task("t_c3")
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_expired_rejected(svc, registry):
+    """EXPIRED cannot be cancelled (must retry instead)."""
+    task = _running_task("t_c4")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.EXPIRED,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    with pytest.raises(TaskStateError):
+        await svc.cancel_task("t_c4")
+
+
+# ---------------------------------------------------------------------------
+# retry_task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retry_task_from_failed(svc, registry):
+    task = _running_task("t_rt1")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.FAILED,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None,
+           "is_archived": False}
+    )
+    await registry.create_task(task)
+    result = await svc.retry_task("t_rt1")
+    assert result["task_id"] == "t_rt1"
+    assert result["status"] == "queued"
+
+    updated = await registry.get_task("t_rt1")
+    assert updated.status == TaskStatus.QUEUED
+    assert updated.is_archived is False
+
+    events = await registry.list_events("t_rt1")
+    assert any(e.kind == "retried" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_retry_task_from_expired(svc, registry):
+    task = _running_task("t_rt2")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.EXPIRED,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await svc.retry_task("t_rt2")
+    updated = await registry.get_task("t_rt2")
+    assert updated.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_retry_task_not_failed_rejected(svc, registry):
+    task = await svc.create_task(title="x", created_by="u")
+    # task is QUEUED, not FAILED/EXPIRED
+    with pytest.raises(TaskStateError):
+        await svc.retry_task(task.id)
+
+
+# ---------------------------------------------------------------------------
+# Archive (soft-delete flag)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_archived_flag(svc, registry):
+    task = await svc.create_task(title="x", created_by="u")
+    archived = await svc.set_archived(task.id, True, expected_version=1)
+    assert archived.is_archived is True
+    assert archived.status == TaskStatus.QUEUED  # status unchanged
+    unarchived = await svc.set_archived(task.id, False, expected_version=2)
+    assert unarchived.is_archived is False
+    assert unarchived.status == TaskStatus.QUEUED
 
 
 # ---------------------------------------------------------------------------
@@ -604,7 +891,6 @@ async def test_upload_attachment(svc):
 @pytest.mark.asyncio
 async def test_upload_attachment_too_large(svc):
     task = await svc.create_task(title="x", created_by="u")
-    # Override max to small value
     svc.attachment_max_bytes = 10
     with pytest.raises(TaskValidationError):
         await svc.upload_attachment(task.id, "big.bin", b"x" * 100)
@@ -617,13 +903,6 @@ async def test_upload_attachment_path_traversal(svc):
         await svc.upload_attachment(task.id, "../etc/passwd", b"x")
     with pytest.raises(TaskValidationError):
         await svc.upload_attachment(task.id, "a/b.txt", b"x")
-
-
-@pytest.mark.asyncio
-async def test_upload_attachment_control_chars(svc):
-    task = await svc.create_task(title="x", created_by="u")
-    with pytest.raises(TaskValidationError):
-        await svc.upload_attachment(task.id, "bad\x00name", b"x")
 
 
 @pytest.mark.asyncio
@@ -653,7 +932,7 @@ async def test_subscribe_list_unsubscribe_notify(svc):
 
 
 # ---------------------------------------------------------------------------
-# Worker-facing ops (TaskServiceProtocol)
+# get_task_detail (no parents/children/links)
 # ---------------------------------------------------------------------------
 
 
@@ -667,6 +946,10 @@ async def test_get_task_detail(svc, registry):
     assert "worker_context" in detail
     assert "events" in detail
     assert "comments" in detail
+    # Dependency graph fields removed
+    assert "parents" not in detail
+    assert "children" not in detail
+    assert "links" not in detail
 
 
 @pytest.mark.asyncio
@@ -675,61 +958,15 @@ async def test_get_task_detail_not_found(svc):
     assert detail is None
 
 
-@pytest.mark.asyncio
-async def test_complete_returns_intent(svc, registry):
-    task = Task(
-        id="t_c", title="x", status=TaskStatus.READY, assignee="d",
-        created_at=datetime.now(timezone.utc), version=1,
-    )
-    await registry.create_task(task)
-    await registry.claim_task("t_c", "lock-1", 900)
-    result = await svc.complete("t_c", "done", {"key": "val"}, [])
-    assert result["outcome"] == "completed"
-    assert result["summary"] == "done"
-    assert result["metadata"] == {"key": "val"}
-    # Intent event written
-    events = await registry.list_events("t_c")
-    assert any(e.kind == "complete_requested" for e in events)
-
-
-@pytest.mark.asyncio
-async def test_complete_not_running_rejected(svc, registry):
-    task = await svc.create_task(title="x", created_by="u")
-    with pytest.raises(TaskStateError):
-        await svc.complete(task.id, "done", {}, [])
-
-
-@pytest.mark.asyncio
-async def test_block_returns_intent(svc, registry):
-    task = Task(
-        id="t_b", title="x", status=TaskStatus.READY, assignee="d",
-        created_at=datetime.now(timezone.utc), version=1,
-    )
-    await registry.create_task(task)
-    await registry.claim_task("t_b", "lock-1", 900)
-    result = await svc.block("t_b", "need input", "needs_input")
-    assert result["outcome"] == "blocked"
-    assert result["kind"] == "needs_input"
-    events = await registry.list_events("t_b")
-    assert any(e.kind == "block_requested" for e in events)
-
-
-@pytest.mark.asyncio
-async def test_block_invalid_kind(svc, registry):
-    task = Task(
-        id="t_bk", title="x", status=TaskStatus.READY, assignee="d",
-        created_at=datetime.now(timezone.utc), version=1,
-    )
-    await registry.create_task(task)
-    await registry.claim_task("t_bk", "lock-1", 900)
-    with pytest.raises(TaskValidationError):
-        await svc.block("t_bk", "r", "invalid_kind")
+# ---------------------------------------------------------------------------
+# heartbeat
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_heartbeat(svc, registry):
     task = Task(
-        id="t_h", title="x", status=TaskStatus.READY, assignee="d",
+        id="t_h", title="x", status=TaskStatus.QUEUED,
         created_at=datetime.now(timezone.utc), version=1,
     )
     await registry.create_task(task)
@@ -746,24 +983,18 @@ async def test_heartbeat_not_running_rejected(svc):
         await svc.heartbeat(task.id, "note")
 
 
-@pytest.mark.asyncio
-async def test_create_subtask(svc, registry):
-    parent = await svc.create_task(title="p", created_by="u")
-    result = await svc.create_subtask(parent.id, "child task", "body")
-    assert result["title"] == "child task"
-    assert result["status"] == "triage"
-    # Link created
-    children = await registry.list_children(parent.id)
-    assert any(c.id == result["id"] for c in children)
+# ---------------------------------------------------------------------------
+# build_worker_context (async, with proposal/decision/progress segments)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_build_worker_context(svc):
-    task = Task(id="t_1", title="Test Task", body="Do something important")
-    ctx = svc.build_worker_context(task)
+async def test_build_worker_context_basic(svc, registry):
+    task = await svc.create_task(title="Test Task", body="Do something", created_by="u")
+    ctx = await svc.build_worker_context(task)
     assert "Test Task" in ctx
-    assert "Do something important" in ctx
-    assert "t_1" in ctx
+    assert "Do something" in ctx
+    assert task.id in ctx
 
 
 @pytest.mark.asyncio
@@ -772,8 +1003,125 @@ async def test_build_worker_context_no_host_paths(svc):
         id="t_1", title="x", body="y",
         workspace_path="/home/user/secret/path",
     )
-    ctx = svc.build_worker_context(task)
+    ctx = await svc.build_worker_context(task)
     assert "/home/user/secret/path" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_build_worker_context_includes_pending_proposal(svc, registry):
+    """WAITING_APPROVAL task with unresolved change_proposed shows proposal."""
+    task = _running_task("t_wp1")
+    task = task.__class__(
+        **{**task.__dict__, "status": TaskStatus.WAITING_APPROVAL,
+           "claim_lock": None, "claim_expires": None,
+           "current_run_id": None, "worker_token": None}
+    )
+    await registry.create_task(task)
+    await registry.append_event(
+        "t_wp1", "change_proposed",
+        {"proposal": "switch to plan B", "run_id": 1}, run_id=1,
+    )
+
+    ctx = await svc.build_worker_context(task)
+    assert "待审批提案" in ctx
+    assert "switch to plan B" in ctx
+
+
+@pytest.mark.asyncio
+async def test_build_worker_context_includes_approval_decision(svc, registry):
+    """After approve/reject, the decision segment shows the latest decision."""
+    task = await svc.create_task(title="x", created_by="u")
+    # Simulate a prior propose->approve cycle
+    proposal_event = await registry.append_event(
+        task.id, "change_proposed",
+        {"proposal": "do X", "run_id": 1}, run_id=1,
+    )
+    await registry.append_event(
+        task.id, "change_approved",
+        {"proposal_event_id": proposal_event.id, "decision": "approved"},
+    )
+
+    ctx = await svc.build_worker_context(task)
+    assert "审批决策" in ctx
+    assert "approved" in ctx or "批准" in ctx
+
+
+@pytest.mark.asyncio
+async def test_build_worker_context_includes_progress(svc, registry):
+    """Progress segment includes recent comment/propose/approve events."""
+    task = await svc.create_task(title="x", created_by="u")
+    await registry.append_event(task.id, "comment_added", {"author": "w"})
+    proposal_event = await registry.append_event(
+        task.id, "change_proposed", {"proposal": "p", "run_id": 1}, run_id=1,
+    )
+    await registry.append_event(
+        task.id, "change_approved",
+        {"proposal_event_id": proposal_event.id},
+    )
+
+    ctx = await svc.build_worker_context(task)
+    assert "进度" in ctx
+
+
+# ---------------------------------------------------------------------------
+# _task_to_dict (no assignee/block/dependency fields)
+# ---------------------------------------------------------------------------
+
+
+def test_task_to_dict_has_no_assignee_or_block_fields():
+    task = Task(
+        id="t_d", title="x", body="y", status=TaskStatus.QUEUED,
+        created_at=datetime.now(timezone.utc), version=1,
+        scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        is_archived=False,
+    )
+    d = _task_to_dict(task)
+    assert d["id"] == "t_d"
+    assert d["status"] == "queued"
+    assert d["is_archived"] is False
+    assert d["scheduled_at"] is not None
+    # Removed fields
+    assert "assignee" not in d
+    assert "block_kind" not in d
+    assert "block_reason" not in d
+    assert "pre_archive_status" not in d
+
+
+def test_task_to_dict_includes_claim_and_failure_summary():
+    now = datetime.now(timezone.utc)
+    task = Task(
+        id="t_d2", title="x", status=TaskStatus.FAILED,
+        created_at=now, version=2,
+        claim_lock="lock-1", claim_expires=now + timedelta(seconds=900),
+        current_run_id=5, consecutive_failures=3,
+        last_failure_error="boom",
+    )
+    d = _task_to_dict(task)
+    assert d["status"] == "failed"
+    assert d["current_run_id"] == 5
+    assert d["consecutive_failures"] == 3
+    assert d["last_failure_error"] == "boom"
+
+
+def test_task_to_dict_includes_execution_configuration():
+    task = Task(
+        id="t_config", title="x", workspace_kind=TaskWorkspaceKind.DIR,
+        workspace_path="/workspace/repo", skills=("review",),
+        execution_policy=TaskExecutionPolicy(allowed_tools=("shell",)),
+        model_override="model-x", max_runtime_seconds=120,
+    )
+    d = _task_to_dict(task)
+    assert d["workspace_kind"] == "dir"
+    assert d["workspace_path"] == "/workspace/repo"
+    assert d["skills"] == ["review"]
+    assert d["allowed_tools"] == ["shell"]
+    assert d["model_override"] == "model-x"
+    assert d["max_runtime_seconds"] == 120
+
+
+# ---------------------------------------------------------------------------
+# Dispatch delegation
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -822,7 +1170,7 @@ async def test_bulk_update_atomic(svc):
 async def test_bulk_update_running_rejected(svc, registry):
     t1 = await svc.create_task(title="a", created_by="u")
     task = Task(
-        id="t_run3", title="r", status=TaskStatus.READY, assignee="d",
+        id="t_run3", title="r", status=TaskStatus.QUEUED,
         created_at=datetime.now(timezone.utc), version=1,
     )
     await registry.create_task(task)

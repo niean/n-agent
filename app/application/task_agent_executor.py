@@ -1,30 +1,43 @@
-"""T13: TaskAgentExecutor -- in-process worker that reuses AgentRunner.
+"""T6: TaskAgentExecutor -- in-process worker that reuses AgentRunner.
 
 Calls ``ChatCompletionService.complete(stream=False)`` with trusted task
 context, aligned with ``ScheduledAgentExecutor``'s calling boundary:
 
   - ``IngressFacts`` with ``source=task``, ``ExecutionMode.UNATTENDED``
   - Same ``run_id`` in both ``IngressFacts`` and ``trusted_metadata``
-  - task 7 tools in ``permitted_managed_tools`` (NOT ``granted_tools``)
+  - task 6 tools in ``permitted_managed_tools`` (NOT ``granted_tools``):
+    task_show / task_complete / task_heartbeat / task_comment /
+    task_propose_change / task_cancel
   - ``trusted_metadata.task`` carries the server-side immutable claim context
   - ``trusted_claims`` mirrors the same claim identifiers
 
 The executor returns ``TaskAgentResult`` (terminal INTENT only). It does NOT
-call ``finish_run`` -- ``TaskRunService`` (T14) owns the single CAS-based
+call ``finish_run`` -- ``TaskRunService`` owns the single CAS-based
 finalization path.
 
-Terminal intent detection:
+Terminal intent detection (Manus-aligned):
   After ``chat_service.complete()`` returns, the executor reads the latest
-  ``complete_requested`` or ``block_requested`` event for the task. These
-  events are written by ``TaskService.complete/block`` (called by the tool
-  executor inside the agent loop). If no intent event is found, the executor
-  defaults to COMPLETED with the final output as summary.
+  ``complete_requested`` or ``change_proposed`` event for the task.
+  - ``complete_requested`` (written by ``TaskService.complete``) maps to
+    ``TaskRunOutcome.COMPLETED``.
+  - ``change_proposed`` (written by ``TaskService.propose_change`` when the
+    worker calls ``task_propose_change``) maps to
+    ``TaskRunOutcome.WAITING_APPROVAL``. The actual run finalization
+    (claim release + worker reclaim) is performed by
+    ``TaskRunService.finalize_propose``, called by ``TaskService.propose_change``
+    inside the tool execution; the executor's returned intent lets
+    ``TaskRunService._finalize_run`` handle the CAS conflict gracefully
+    (late-worker path).
+  If no intent event is found, the executor defaults to COMPLETED with the
+  final output as summary.
 
 goal_mode:
   ``run_goal_loop`` runs multiple turns, each calling ``run()`` once. A
   judge fork (read-only, no write tools) evaluates ``{achieved, reason}``.
   ``goal_max_turns`` budget caps the loop. Not achieved at max turns ->
-  BLOCKED(NEEDS_INPUT). Judge parse failure -> retryable FAILED.
+  FAILED (the worker should use ``task_propose_change`` for needs-input
+  scenarios; BLOCKED outcome is removed). Judge parse failure -> retryable
+  FAILED.
 """
 from __future__ import annotations
 
@@ -53,15 +66,19 @@ TASK_GUIDANCE = """\
 
 你正在执行一个 Task（异步后台任务）。请严格遵循以下步骤：
 
-1. 先调用 task_show 读取任务完整上下文（标题、正文、父任务交接、先前尝试、评论）
+1. 先调用 task_show 读取任务完整上下文（标题、正文、待审批提案、审批决策、进度事件、评论）
 2. 在 workspace 中使用通用工具干活，不要凭空假设
 3. 长任务执行中周期调用 task_heartbeat 续租 lease，避免被 reclaim
-4. 遇到歧义或缺少信息时调用 task_block 提交阻塞意图（附 reason + kind）
+4. 遇到需要用户决策的修改（如改变方案、确认破坏性操作、关键路径分歧）时调用
+   task_propose_change 提出提案（附 proposal 文本说明变更内容）。调用后本 run
+   立即结束，不继续执行后续修改；task 进入 WAITING_APPROVAL，等待用户批准或拒绝：
+   - 批准后续行：按提案内容继续执行
+   - 拒绝后续行：不得执行该提案，需选择不包含该提案的可行路径或再次提出新提案
 5. 完成后调用 task_complete 提交完成意图，附带 summary + metadata + artifacts
-6. 后续工作应通过 task_create 派发子任务，不要自己做完所有事
+6. 仅当确认当前 task 无法继续且需要终止时调用 task_cancel 取消 task
 
-重要：task_complete 和 task_block 只提交终态意图，系统会以 claim token 一次性
-终结 run。不要尝试直接修改 task 状态。
+重要：task_complete 和 task_propose_change 只提交终态意图，系统会以 claim token
+一次性终结 run（释放 claim + 回收 worker）。不要尝试直接修改 task 状态。
 """
 
 
@@ -74,13 +91,16 @@ TASK_GUIDANCE = """\
 class TaskAgentResult:
     """Terminal intent returned by the executor.
 
-    ``status`` is the terminal outcome intent (COMPLETED / BLOCKED / FAILED /
-    TIMED_OUT). ``output`` is the agent's final text. ``metadata`` and
-    ``artifacts`` come from the task_complete tool call. ``error`` is set
-    for FAILED/TIMED_OUT.
+    ``status`` is the terminal outcome intent (COMPLETED / WAITING_APPROVAL /
+    FAILED / TIMED_OUT / CRASHED). ``output`` is the agent's final text.
+    ``metadata`` and ``artifacts`` come from the task_complete tool call.
+    ``error`` is set for FAILED/TIMED_OUT.
 
     The executor does NOT finalize the run; TaskRunService reads this result
-    and performs the CAS finalize.
+    and performs the CAS finalize. For WAITING_APPROVAL, TaskService.propose_change
+    has already called TaskRunService.finalize_propose inside the tool
+    execution; the returned intent lets _finalize_run handle the CAS conflict
+    gracefully (late-worker path).
     """
 
     status: TaskRunOutcome
@@ -269,9 +289,12 @@ class TaskAgentExecutor:
         Each turn calls ``run()`` once, then a judge fork evaluates whether
         the goal is achieved. The loop continues until:
           - Judge says achieved -> COMPLETED
-          - goal_max_turns reached -> BLOCKED(NEEDS_INPUT)
+          - goal_max_turns reached -> FAILED (the worker should use
+            task_propose_change for needs-input scenarios; BLOCKED outcome
+            is removed from the Manus-aligned state machine)
           - Judge parse failure -> FAILED (retryable)
           - Total runtime exceeded -> TIMED_OUT
+          - Worker proposed a change -> WAITING_APPROVAL (returned immediately)
         """
         max_turns = task.goal_max_turns or self.goal_max_turns
         max_runtime = task.max_runtime_seconds or self.max_runtime_seconds
@@ -290,10 +313,12 @@ class TaskAgentExecutor:
             turn_result = await self.run(task, task_run_id, claim_lock)
             last_result = turn_result
 
-            # If the turn itself already terminal (BLOCKED/FAILED/TIMED_OUT),
-            # return immediately
+            # If the turn itself already terminal (WAITING_APPROVAL/FAILED/
+            # TIMED_OUT/CRASHED), return immediately. WAITING_APPROVAL means
+            # the worker called task_propose_change; the run is already being
+            # finalized by TaskRunService.finalize_propose.
             if turn_result.status in (
-                TaskRunOutcome.BLOCKED,
+                TaskRunOutcome.WAITING_APPROVAL,
                 TaskRunOutcome.FAILED,
                 TaskRunOutcome.TIMED_OUT,
                 TaskRunOutcome.CRASHED,
@@ -320,10 +345,10 @@ class TaskAgentExecutor:
                 # Not achieved -- continue to next turn (unless this was the last)
                 if turn >= max_turns:
                     return TaskAgentResult(
-                        status=TaskRunOutcome.BLOCKED,
+                        status=TaskRunOutcome.FAILED,
                         output=turn_result.output,
                         error=f"goal not achieved after {max_turns} turns: {judge.reason}",
-                        metadata={"block_kind": "needs_input", "judge_reason": judge.reason},
+                        metadata={"judge_reason": judge.reason},
                     )
 
         # Should not reach here, but defensive
@@ -422,9 +447,14 @@ class TaskAgentExecutor:
     ) -> TaskAgentResult:
         """Construct TaskAgentResult from chat completion + intent events.
 
-        Reads the latest ``complete_requested`` or ``block_requested`` event
-        for the task. If found, uses the event payload as the terminal intent.
-        If not found, defaults to COMPLETED with the final output as summary.
+        Reads the latest ``complete_requested`` or ``change_proposed`` event
+        for the task. If ``complete_requested`` is found, maps to COMPLETED.
+        If ``change_proposed`` is found (written by TaskService.propose_change
+        when the worker called task_propose_change), maps to WAITING_APPROVAL;
+        the actual run finalization is performed by
+        TaskRunService.finalize_propose (called inside the tool execution).
+        If no intent event is found, defaults to COMPLETED with the final
+        output as summary.
         """
         output = ""
         if isinstance(result.message, dict):
@@ -447,6 +477,20 @@ class TaskAgentExecutor:
         # Read latest intent event
         intent = await self._read_latest_intent(task.id, task_run_id)
         if intent is not None:
+            kind = intent.get("kind")
+            if kind == "change_proposed":
+                # Worker called task_propose_change -> WAITING_APPROVAL.
+                # TaskRunService.finalize_propose has already been called
+                # inside the tool execution; the returned intent lets
+                # _finalize_run handle the CAS conflict gracefully.
+                proposal = intent.get("proposal", "")
+                return TaskAgentResult(
+                    status=TaskRunOutcome.WAITING_APPROVAL,
+                    output=output,
+                    metadata={"proposal": proposal},
+                    error=None,
+                )
+            # complete_requested
             outcome_str = intent.get("outcome", "")
             try:
                 outcome = TaskRunOutcome(outcome_str)
@@ -460,7 +504,6 @@ class TaskAgentExecutor:
                 output=output,
                 metadata=metadata,
                 artifacts=artifacts,
-                error=intent.get("reason") if outcome == TaskRunOutcome.BLOCKED else None,
             )
 
         # No explicit intent event -- default to COMPLETED
@@ -473,10 +516,14 @@ class TaskAgentExecutor:
     async def _read_latest_intent(
         self, task_id: str, run_id: int
     ) -> dict[str, Any] | None:
-        """Read the latest complete_requested or block_requested event.
+        """Read the latest complete_requested or change_proposed event.
 
-        Events are appended by TaskService.complete/block inside the agent
-        loop. We read the most recent one matching this run_id.
+        Events are appended by TaskService.complete / TaskService.propose_change
+        inside the agent loop. We read the most recent one matching this run_id.
+
+        Returns a dict augmented with the event ``kind`` so the caller can
+        distinguish complete_requested (-> COMPLETED) from change_proposed
+        (-> WAITING_APPROVAL).
         """
         try:
             events = await self.task_registry.list_events(task_id, limit=50)
@@ -484,11 +531,13 @@ class TaskAgentExecutor:
             return None
         # Search backwards for the latest intent event
         for event in reversed(events):
-            if event.kind not in ("complete_requested", "block_requested"):
+            if event.kind not in ("complete_requested", "change_proposed"):
                 continue
             if event.run_id is not None and event.run_id != run_id:
                 continue
-            return dict(event.payload)
+            payload = dict(event.payload)
+            payload["kind"] = event.kind
+            return payload
         return None
 
     # ------------------------------------------------------------------

@@ -1,8 +1,7 @@
 """T18: main.py task subsystem wiring tests.
 
 Covers plan T18 S5-S9:
-  - ApplicationServices exposes task_service/task_run_service/task_runner/
-    task_planning_service
+  - ApplicationServices exposes task_service/task_run_service/task_runner
   - TaskRunner.run_service bound (late-bind set_run_service called)
   - ToolService registers task tools as managed (visible in definitions;
     execution gated by permitted_managed_tools + trusted_metadata.task)
@@ -18,7 +17,6 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.application.task_planning_service import TaskPlanningService
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
 from app.application.task_service import TaskService
@@ -59,7 +57,6 @@ def test_application_services_expose_task_fields(tmp_path: Path):
     assert isinstance(services.task_service, TaskService)
     assert isinstance(services.task_run_service, TaskRunService)
     assert isinstance(services.task_runner, TaskRunner)
-    assert isinstance(services.task_planning_service, TaskPlanningService)
 
 
 def test_task_runner_run_service_late_bound(tmp_path: Path):
@@ -81,11 +78,6 @@ def test_task_service_attachments_root_resolved(tmp_path: Path):
     assert services.task_service.attachments_root == expected
 
 
-def test_task_service_injected_with_planning_service(tmp_path: Path):
-    services = build_application_services(_settings(tmp_path))
-    assert services.task_service.planning_service is services.task_planning_service
-
-
 # ---------------------------------------------------------------------------
 # T18 S5: ToolService registers task tools (managed, gated)
 # ---------------------------------------------------------------------------
@@ -102,7 +94,7 @@ def test_task_tools_registered_as_managed(tmp_path: Path):
 
 
 def test_task_management_executor_routes_bound(tmp_path: Path):
-    """All 7 task tool names routed to TaskManagementToolExecutor in CompositeToolExecutor."""
+    """All 6 task tool names routed to TaskManagementToolExecutor in CompositeToolExecutor."""
     from app.infrastructure.tools.task_management import TaskManagementToolExecutor
 
     services = build_application_services(_settings(tmp_path))
@@ -111,7 +103,7 @@ def test_task_management_executor_routes_bound(tmp_path: Path):
     task_executors = {
         routes[name] for name in TASK_TOOL_NAMES if name in routes
     }
-    assert len(task_executors) == 1, "all 7 task tools must share one executor"
+    assert len(task_executors) == 1, "all 6 task tools must share one executor"
     assert isinstance(next(iter(task_executors)), TaskManagementToolExecutor)
 
 
@@ -208,7 +200,7 @@ def test_task_registry_schema_initialized_at_startup(tmp_path: Path):
     # SQLiteTaskRegistry has _list_tables()
     tables = reg._list_tables()
     for t in [
-        "tasks", "task_runs", "task_links", "task_comments",
+        "tasks", "task_runs", "task_comments",
         "task_events", "task_attachments", "task_notify_subs",
     ]:
         assert t in tables, f"missing table {t}"

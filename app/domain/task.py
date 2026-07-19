@@ -1,23 +1,31 @@
 """Task aggregate, value objects, ports, and exceptions (Domain Layer).
 
-Implements the Hermes Kanban-aligned Task subdomain. Pure domain: no FastAPI,
-LangGraph, SQLite, OpenAI SDK, or `app.infrastructure` imports. Matches the
-frozen-dataclass + enum + async Protocol pattern of `schedule.py` / `skill.py`.
+Implements the Manus-aligned Task subdomain: a flat 7-state state machine
+with agent automatic scheduling (``scheduled_at``) and intent approval
+(``propose_change`` / ``resolve_approval``). Pure domain -- no FastAPI,
+LangGraph, SQLite, OpenAI SDK, or ``app.infrastructure`` imports. Matches the
+frozen-dataclass + enum + async Protocol pattern of ``schedule.py`` /
+``skill.py``.
 
-State transition contract (spec):
-  TRIAGE    -> TODO / ARCHIVED
-  TODO      -> SCHEDULED / READY / BLOCKED / ARCHIVED
-              (READY requires assignee + deps all DONE + scheduled_at empty or due)
-  SCHEDULED -> READY / TODO / ARCHIVED
-              (READY only when due and deps all DONE)
-  READY     -> RUNNING / TODO / BLOCKED / ARCHIVED
-              (RUNNING only by atomic claim)
-  RUNNING   -> REVIEW / DONE / TODO / BLOCKED
-              (TODO for retryable failure or reclaim; terminal must verify claim token)
-  REVIEW    -> DONE / TODO / BLOCKED / ARCHIVED
-  BLOCKED   -> TODO / ARCHIVED
-  DONE      -> REVIEW / ARCHIVED
-  ARCHIVED  -> (no generic transitions; unarchive is explicit domain op)
+State transition contract (spec Data Model):
+  QUEUED            -> RUNNING / CANCELLED
+  RUNNING           -> SUCCEEDED / FAILED / WAITING_APPROVAL /
+                      CANCELLED / EXPIRED / QUEUED
+                      (QUEUED is reserved for retryable-failure auto-retry;
+                       users cannot manually drag RUNNING back to QUEUED.)
+  WAITING_APPROVAL  -> QUEUED / CANCELLED
+  FAILED            -> QUEUED / CANCELLED
+  EXPIRED           -> QUEUED
+  SUCCEEDED         -> (terminal)
+  CANCELLED         -> (terminal)
+
+``is_archived`` is a soft-delete flag, NOT a lifecycle state. Archive /
+unarchive never changes ``status`` and never triggers run finalization; it
+only toggles ``is_archived`` for list/board visibility. Removed concepts
+from the prior 9-state machine: ``assignee``, ``pre_archive_status``,
+``block_kind``/``block_reason``/``block_recurrences``, ``BlockKind``, the
+dependency graph (``TaskLink`` / ``CreateGraphCommand`` /
+``CreateGraphResult``), and swarm planning commands.
 """
 from __future__ import annotations
 
@@ -33,30 +41,15 @@ from typing import Any, Mapping, Protocol
 
 
 class TaskStatus(str, Enum):
-    """Task lifecycle states (Kanban columns)."""
+    """Task lifecycle states (Manus-aligned 7-state machine)."""
 
-    TRIAGE = "triage"
-    TODO = "todo"
-    SCHEDULED = "scheduled"
-    READY = "ready"
+    QUEUED = "queued"
     RUNNING = "running"
-    BLOCKED = "blocked"
-    REVIEW = "review"
-    DONE = "done"
-    ARCHIVED = "archived"
-
-
-class BlockKind(str, Enum):
-    """Reason categories for blocking a task.
-
-    DEPENDENCY routes the task back to TODO (waiting on parent completion);
-    all other kinds place the task in BLOCKED.
-    """
-
-    DEPENDENCY = "dependency"
-    NEEDS_INPUT = "needs_input"
-    CAPABILITY = "capability"
-    TRANSIENT = "transient"
+    WAITING_APPROVAL = "waiting_approval"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
 
 
 class TaskWorkspaceKind(str, Enum):
@@ -71,7 +64,12 @@ class TaskWorkspaceKind(str, Enum):
 
 
 class TaskRunStatus(str, Enum):
-    """Lifecycle of an individual TaskRun (execution attempt)."""
+    """Lifecycle of an individual TaskRun (execution attempt).
+
+    Legacy BLOCKED/RECLAIMED values are retained for historical run rows;
+    new code must not produce them. Terminal outcome is captured by
+    ``TaskRunOutcome``.
+    """
 
     RUNNING = "running"
     COMPLETED = "completed"
@@ -84,22 +82,28 @@ class TaskRunStatus(str, Enum):
 
 
 class TaskRunOutcome(str, Enum):
-    """Terminal outcome for a TaskRun.
+    """Terminal outcome for a TaskRun (Manus-aligned).
 
-    Only COMPLETED/BLOCKED/GAVE_UP/CRASHED/TIMED_OUT/TERMINATED trigger
-    notification delivery; FAILED/SPAWN_FAILED/RECLAIMED are retryable and
-    do not notify.
+    Retryable outcomes (``FAILED`` / ``CRASHED`` / ``TIMED_OUT`` /
+    ``SPAWN_FAILED``) map to either ``QUEUED`` (under ``max_retries``) or
+    ``FAILED`` (over ``max_retries``) on the Task; the TaskPolicy decides.
+    ``WAITING_APPROVAL`` releases the claim like any terminal outcome and
+    moves the task to ``WAITING_APPROVAL``. ``TERMINATED`` represents
+    user-initiated cancel of a RUNNING worker -> task ``CANCELLED``.
+    ``EXPIRED`` represents stale/lease expiration -> task ``EXPIRED``.
+
+    Legacy ``BLOCKED`` / ``GAVE_UP`` / ``RECLAIMED`` outcomes are removed;
+    historical run rows are migrated by the registry.
     """
 
     COMPLETED = "completed"
-    BLOCKED = "blocked"
+    WAITING_APPROVAL = "waiting_approval"
     FAILED = "failed"
     CRASHED = "crashed"
     TIMED_OUT = "timed_out"
-    TERMINATED = "terminated"
     SPAWN_FAILED = "spawn_failed"
-    GAVE_UP = "gave_up"
-    RECLAIMED = "reclaimed"
+    EXPIRED = "expired"
+    TERMINATED = "terminated"
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +115,9 @@ class TaskRunOutcome(str, Enum):
 class TaskExecutionPolicy:
     """Per-task execution configuration.
 
-    `allowed_tools` only governs additional general-purpose tools; the seven
+    ``allowed_tools`` only governs additional general-purpose tools; the
     task tools are always authorized separately via the trusted task context
-    (`permitted_managed_tools`), never through this field.
+    (``permitted_managed_tools``), never through this field.
     """
 
     allowed_tools: tuple[str, ...] = ()
@@ -123,28 +127,28 @@ class TaskExecutionPolicy:
 # State transition table (authoritative source of truth)
 # ---------------------------------------------------------------------------
 
-# Allowed generic transitions per spec contract table. ARCHIVED has no generic
-# outgoing edges; unarchive is an explicit domain operation. Public constant
-# so that TaskPolicy (same subdomain) can evaluate transition legality without
-# reconstructing a Task instance.
+# Allowed transitions per spec Data Model. ``SUCCEEDED`` / ``CANCELLED`` are
+# terminal. ``RUNNING -> QUEUED`` is allowed by the table but reserved for
+# retryable-failure auto-retry (TaskPolicy + TaskRunService); users cannot
+# manually trigger it. Public constant so that TaskPolicy (same subdomain)
+# can evaluate transition legality without reconstructing a Task instance.
 TASK_TRANSITION_TABLE: dict[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.TRIAGE: frozenset({TaskStatus.TODO, TaskStatus.ARCHIVED}),
-    TaskStatus.TODO: frozenset(
-        {TaskStatus.SCHEDULED, TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.ARCHIVED}
-    ),
-    TaskStatus.SCHEDULED: frozenset({TaskStatus.READY, TaskStatus.TODO, TaskStatus.ARCHIVED}),
-    TaskStatus.READY: frozenset(
-        {TaskStatus.RUNNING, TaskStatus.TODO, TaskStatus.BLOCKED, TaskStatus.ARCHIVED}
-    ),
+    TaskStatus.QUEUED: frozenset({TaskStatus.RUNNING, TaskStatus.CANCELLED}),
     TaskStatus.RUNNING: frozenset(
-        {TaskStatus.REVIEW, TaskStatus.DONE, TaskStatus.TODO, TaskStatus.BLOCKED}
+        {
+            TaskStatus.SUCCEEDED,
+            TaskStatus.FAILED,
+            TaskStatus.WAITING_APPROVAL,
+            TaskStatus.CANCELLED,
+            TaskStatus.EXPIRED,
+            TaskStatus.QUEUED,
+        }
     ),
-    TaskStatus.REVIEW: frozenset(
-        {TaskStatus.DONE, TaskStatus.TODO, TaskStatus.BLOCKED, TaskStatus.ARCHIVED}
-    ),
-    TaskStatus.BLOCKED: frozenset({TaskStatus.TODO, TaskStatus.ARCHIVED}),
-    TaskStatus.DONE: frozenset({TaskStatus.REVIEW, TaskStatus.ARCHIVED}),
-    TaskStatus.ARCHIVED: frozenset(),
+    TaskStatus.WAITING_APPROVAL: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
+    TaskStatus.FAILED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
+    TaskStatus.EXPIRED: frozenset({TaskStatus.QUEUED}),
+    TaskStatus.SUCCEEDED: frozenset(),
+    TaskStatus.CANCELLED: frozenset(),
 }
 
 
@@ -161,11 +165,10 @@ class Task:
     callers must capture the return value. The aggregate never mutates in
     place.
 
-    Field grouping follows the spec Components section:
-      - 标识 (identity): id, title, body, assignee, priority, created_by,
+    Field grouping:
+      - 标识 (identity): id, title, body, priority, created_by,
         created_at, updated_at, version
-      - 状态 (status): status, block_kind, block_reason, block_recurrences,
-        started_at, completed_at
+      - 状态 (status): status, started_at, completed_at
       - 调度 (scheduling): scheduled_at, claim_lock, claim_expires,
         current_run_id
       - 执行配置 (execution): workspace_kind, workspace_path, skills,
@@ -176,14 +179,17 @@ class Task:
       - 会话 (sessions): origin_session_id, execution_session_id
       - 韧性 (resilience): consecutive_failures, worker_token,
         last_failure_error, last_heartbeat_at, result, idempotency_key
-      - 归档恢复 (archive recovery): pre_archive_status
+      - 归档 (archive flag): is_archived (软删标志，非状态)
+
+    Removed fields (vs prior 9-state machine): ``assignee``,
+    ``pre_archive_status``, ``block_kind``, ``block_reason``,
+    ``block_recurrences``. Archive is now a boolean flag, not a state.
     """
 
     # 标识
     id: str
     title: str
     body: str = ""
-    assignee: str | None = None
     priority: int = 0
     created_by: str = ""
     created_at: datetime | None = None
@@ -191,10 +197,7 @@ class Task:
     version: int = 1
 
     # 状态
-    status: TaskStatus = TaskStatus.TRIAGE
-    block_kind: BlockKind | None = None
-    block_reason: str | None = None
-    block_recurrences: int = 0
+    status: TaskStatus = TaskStatus.QUEUED
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
@@ -234,85 +237,53 @@ class Task:
     result: str | None = None
     idempotency_key: str | None = None
 
-    # 归档恢复
-    pre_archive_status: TaskStatus | None = None
+    # 归档 (软删标志，非状态)
+    is_archived: bool = False
 
     # -----------------------------------------------------------------
     # State transition contract
     # -----------------------------------------------------------------
 
     def can_transition_to(self, target: TaskStatus) -> bool:
-        """Return True if the generic transition ``self.status -> target`` is
+        """Return True if the transition ``self.status -> target`` is
         allowed by the spec contract table.
 
-        Note: ARCHIVED has no generic outgoing edges; use ``unarchive()``
-        for explicit recovery. READY->RUNNING is allowed by the table but
-        actual transition requires an atomic claim (``claim()``).
+        ``SUCCEEDED`` / ``CANCELLED`` are terminal. ``RUNNING -> QUEUED`` is
+        allowed by the table but reserved for retryable-failure auto-retry
+        (TaskPolicy + TaskRunService); users cannot manually trigger it.
         """
         return target in TASK_TRANSITION_TABLE.get(self.status, frozenset())
 
-    def can_promote_to_ready(self, parents_done: bool, now: datetime) -> bool:
-        """Return True if this task can be promoted to READY.
+    def can_claim(self, now: datetime) -> bool:
+        """Return True if this task can be claimed by a dispatcher.
 
         Conditions (per spec):
-          - current status is TODO or SCHEDULED
-          - has an assignee
-          - all parent dependencies are DONE (``parents_done=True``)
+          - current status is ``QUEUED``
           - ``scheduled_at`` is None or already due (``scheduled_at <= now``)
+
+        Assignee and parent-dependency checks were removed; the task is an
+        autonomous execution unit.
         """
-        if self.status not in (TaskStatus.TODO, TaskStatus.SCHEDULED):
+        if self.status is not TaskStatus.QUEUED:
             return False
-        if not self.assignee:
+        if self.scheduled_at is not None and self.scheduled_at > now:
             return False
-        if not parents_done:
-            return False
-        if self.scheduled_at is not None:
-            if self.scheduled_at > now:
-                return False
         return True
-
-    # -----------------------------------------------------------------
-    # Block routing
-    # -----------------------------------------------------------------
-
-    def block(self, kind: BlockKind, reason: str) -> Task:
-        """Return a new Task blocked with the given kind/reason.
-
-        DEPENDENCY routes the task back to TODO (waiting for parent
-        completion); all other kinds place the task in BLOCKED and
-        increment ``block_recurrences`` (used by the unblock-loop breaker
-        in TaskPolicy).
-        """
-        if kind == BlockKind.DEPENDENCY:
-            return replace(
-                self,
-                status=TaskStatus.TODO,
-                block_kind=kind,
-                block_reason=reason,
-                # DEPENDENCY does not count toward the unblock-loop budget
-            )
-        return replace(
-            self,
-            status=TaskStatus.BLOCKED,
-            block_kind=kind,
-            block_reason=reason,
-            block_recurrences=self.block_recurrences + 1,
-        )
 
     # -----------------------------------------------------------------
     # Claim / release (CAS)
     # -----------------------------------------------------------------
 
     def claim(self, run_id: int, claim_lock: str, expires_at: datetime) -> Task:
-        """Atomically claim a READY task, producing a RUNNING instance.
+        """Atomically claim a QUEUED task, producing a RUNNING instance.
 
-        Raises TaskStateError if the task is not READY. The Registry performs
-        the actual atomic CAS; this method is the domain-level specification
-        for in-transaction validation.
+        Raises ``TaskStateError`` if the task is not ``QUEUED``. The Registry
+        performs the actual atomic CAS; this method is the domain-level
+        specification for in-transaction validation.
         """
-        if self.status != TaskStatus.READY:
+        if self.status is not TaskStatus.QUEUED:
             raise TaskStateError(
-                f"claim requires READY status, got {self.status.value}"
+                f"claim requires QUEUED status, got {self.status.value}"
             )
         return replace(
             self,
@@ -320,14 +291,15 @@ class Task:
             current_run_id=run_id,
             claim_lock=claim_lock,
             claim_expires=expires_at,
+            started_at=datetime.now(timezone.utc),
         )
 
     def release_claim(self, claim_lock: str) -> Task:
         """Release the current claim, clearing the lock and run id.
 
-        Raises TaskClaimError if ``claim_lock`` does not match. Status is NOT
-        changed by release; the caller (TaskRunService) sets the terminal
-        status in the same transaction.
+        Raises ``TaskClaimError`` if ``claim_lock`` does not match. Status
+        is NOT changed by release; the caller (TaskRunService) sets the
+        terminal status in the same transaction.
         """
         if not self.claim_lock or self.claim_lock != claim_lock:
             raise TaskClaimError("claim_lock mismatch on release")
@@ -345,7 +317,7 @@ class Task:
     def record_heartbeat(self, now: datetime, claim_lock: str) -> Task:
         """Update ``last_heartbeat_at`` after verifying ``claim_lock``.
 
-        Raises TaskClaimError if the token does not match.
+        Raises ``TaskClaimError`` if the token does not match.
         """
         if not self.claim_lock or self.claim_lock != claim_lock:
             raise TaskClaimError("claim_lock mismatch on heartbeat")
@@ -355,10 +327,10 @@ class Task:
         """Return True if the RUNNING task has not heartbeated within
         ``heartbeat_timeout`` seconds.
 
-        Only RUNNING tasks with a claim can be considered stale; tasks in
-        other states or without a heartbeat are not stale.
+        Only RUNNING tasks with a claim and a heartbeat can be considered
+        stale; tasks in other states or without a heartbeat are not stale.
         """
-        if self.status != TaskStatus.RUNNING:
+        if self.status is not TaskStatus.RUNNING:
             return False
         if not self.claim_lock:
             return False
@@ -374,9 +346,9 @@ class Task:
     def record_failure(self, error: str) -> Task:
         """Record a failure attempt, incrementing ``consecutive_failures``.
 
-        Does not change status; the caller decides whether to retry
-        (status -> TODO) or give up (status -> BLOCKED with NEEDS_INPUT)
-        based on ``should_give_up()``.
+        Does not change status; the caller (TaskPolicy + TaskRunService)
+        decides whether to retry (status -> QUEUED) or give up
+        (status -> FAILED) based on ``should_give_up()``.
         """
         return replace(
             self,
@@ -388,52 +360,113 @@ class Task:
         """Return True when ``consecutive_failures > max_retries``.
 
         ``max_retries`` is the number of retries allowed after the first
-        failure, so GAVE_UP triggers when total failures exceed max_retries
+        failure, so give-up triggers when total failures exceed max_retries
         by one (i.e., ``consecutive_failures > max_retries``).
         """
         return self.consecutive_failures > self.max_retries
 
     def complete(self, summary: str) -> Task:
-        """Mark the task DONE and clear failure counters."""
+        """Mark the task SUCCEEDED and clear failure counters."""
         return replace(
             self,
-            status=TaskStatus.DONE,
+            status=TaskStatus.SUCCEEDED,
             result=summary,
             consecutive_failures=0,
             completed_at=datetime.now(timezone.utc),
         )
 
     # -----------------------------------------------------------------
-    # Archive / unarchive (explicit domain operations)
+    # Intent approval (propose / resolve)
     # -----------------------------------------------------------------
 
-    def archive(self) -> Task:
-        """Archive the task, recording ``pre_archive_status`` for recovery.
+    def propose_change(self, proposal: str, run_id: int) -> Task:
+        """Move RUNNING -> WAITING_APPROVAL.
 
-        archive() bypasses the generic transition table because it is an
-        explicit domain operation. RUNNING tasks must be terminated first
-        (RUNNING is not terminable through archive).
+        Workers call this when encountering a change that requires user
+        decision. The proposal text is persisted as a ``change_proposed``
+        event by TaskService; the domain method only advances state.
+        Claim release is handled by TaskRunService's unified run-finalization
+        path, not here.
+
+        Raises ``TaskStateError`` if the task is not RUNNING.
         """
-        if self.status == TaskStatus.RUNNING:
-            raise TaskStateError("cannot archive RUNNING task; terminate first")
+        if self.status is not TaskStatus.RUNNING:
+            raise TaskStateError(
+                f"propose_change requires RUNNING, got {self.status.value}"
+            )
+        return replace(self, status=TaskStatus.WAITING_APPROVAL)
+
+    def resolve_approval(self, approved: bool) -> Task:
+        """Move WAITING_APPROVAL -> QUEUED.
+
+        Both approve and reject return the task to QUEUED so the next run
+        can pick it up. The decision itself is captured in a
+        ``change_approved`` / ``change_rejected`` event by TaskService; the
+        domain method only advances state.
+
+        Raises ``TaskStateError`` if the task is not WAITING_APPROVAL.
+        """
+        if self.status is not TaskStatus.WAITING_APPROVAL:
+            raise TaskStateError(
+                f"resolve_approval requires WAITING_APPROVAL, got {self.status.value}"
+            )
+        return replace(self, status=TaskStatus.QUEUED)
+
+    # -----------------------------------------------------------------
+    # Cancel / retry (user actions)
+    # -----------------------------------------------------------------
+
+    def cancel(self) -> Task:
+        """Move {QUEUED, RUNNING, WAITING_APPROVAL, FAILED} -> CANCELLED.
+
+        RUNNING cancel must be coordinated through TaskRunService to
+        terminate the worker and release the claim in the same transaction;
+        the domain method only advances state.
+
+        Raises ``TaskStateError`` for terminal states (SUCCEEDED / CANCELLED)
+        and for EXPIRED (expired tasks must be retried, not cancelled).
+        """
+        if self.status in (TaskStatus.SUCCEEDED, TaskStatus.CANCELLED, TaskStatus.EXPIRED):
+            raise TaskStateError(
+                f"cannot cancel from {self.status.value}"
+            )
         return replace(
             self,
-            pre_archive_status=self.status,
-            status=TaskStatus.ARCHIVED,
+            status=TaskStatus.CANCELLED,
+            completed_at=datetime.now(timezone.utc),
         )
 
-    def unarchive(self) -> Task:
-        """Restore the task to its pre-archive status, or TODO if unknown.
+    def retry(self) -> Task:
+        """Move {FAILED, EXPIRED} -> QUEUED and clear claim fields.
 
-        Explicit domain operation; does not go through the generic transition
-        table.
+        Does not clear ``is_archived``; archive is a separate soft-delete
+        flag independent of lifecycle.
+
+        Raises ``TaskStateError`` if the task is not FAILED or EXPIRED.
         """
-        restored = self.pre_archive_status or TaskStatus.TODO
+        if self.status not in (TaskStatus.FAILED, TaskStatus.EXPIRED):
+            raise TaskStateError(
+                f"retry requires FAILED/EXPIRED, got {self.status.value}"
+            )
         return replace(
             self,
-            status=restored,
-            pre_archive_status=None,
+            status=TaskStatus.QUEUED,
+            claim_lock=None,
+            claim_expires=None,
+            current_run_id=None,
         )
+
+    # -----------------------------------------------------------------
+    # Archive flag (soft delete, does not change status)
+    # -----------------------------------------------------------------
+
+    def set_archived(self, value: bool) -> Task:
+        """Toggle ``is_archived`` without changing status or claim fields.
+
+        Archive is a soft-delete flag for list/board visibility; it is NOT
+        a lifecycle state and never triggers run finalization.
+        """
+        return replace(self, is_archived=bool(value))
 
 
 # ---------------------------------------------------------------------------
@@ -461,15 +494,6 @@ class TaskRun:
     summary: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
-
-
-@dataclass(frozen=True)
-class TaskLink:
-    """Dependency edge: child depends on parent (parent must be DONE before
-    child can be promoted to READY)."""
-
-    parent_id: str
-    child_id: str
 
 
 @dataclass(frozen=True)
@@ -632,24 +656,6 @@ class BulkUpdateResult:
 
 
 @dataclass(frozen=True)
-class CreateGraphCommand:
-    """Single-transaction graph creation (tasks + links + comments)."""
-
-    tasks: tuple[Task, ...]
-    links: tuple[TaskLink, ...] = ()
-    comments: tuple[TaskComment, ...] = ()
-
-
-@dataclass(frozen=True)
-class CreateGraphResult:
-    """Result of graph creation."""
-
-    tasks: tuple[Task, ...]
-    links: tuple[TaskLink, ...]
-    comments: tuple[TaskComment, ...]
-
-
-@dataclass(frozen=True)
 class DeliveryResult:
     """Outcome of a notify delivery attempt."""
 
@@ -663,7 +669,15 @@ class DeliveryResult:
 
 
 class TaskRegistry(Protocol):
-    """Async port for Task persistence with atomic claim/lease/finish."""
+    """Async port for Task persistence with atomic claim/lease/finish.
+
+    The dependency-graph methods (``create_graph`` / ``add_link`` /
+    ``remove_link`` / ``list_links`` / ``list_children`` / ``list_parents``)
+    and the old ``list_ready`` / ``recompute_ready`` helpers have been
+    removed: the new state machine has no READY/BLOCKED states and no
+    parent-child dependency graph. Dispatch now consumes
+    ``list_queued_due`` (QUEUED + scheduled_at due + not archived).
+    """
 
     # --- CRUD ---
     async def create_task(self, task: Task) -> Task: ...
@@ -701,17 +715,13 @@ class TaskRegistry(Protocol):
     async def recover_run(self, command: RecoverRunCommand) -> FinishRunResult: ...
 
     # --- dispatch helpers ---
-    async def list_ready(self, board: str = "default", limit: int = 100) -> tuple[Task, ...]: ...
+    async def list_queued_due(
+        self,
+        now: datetime,
+        limit: int = 100,
+        board: str = "default",
+    ) -> tuple[Task, ...]: ...
     async def list_running(self, board: str = "default") -> tuple[Task, ...]: ...
-    async def recompute_ready(self, board: str = "default") -> tuple[str, ...]: ...
-
-    # --- dependency graph ---
-    async def create_graph(self, command: CreateGraphCommand) -> CreateGraphResult: ...
-    async def add_link(self, parent_id: str, child_id: str) -> TaskLink: ...
-    async def remove_link(self, parent_id: str, child_id: str) -> bool: ...
-    async def list_links(self, task_id: str) -> tuple[TaskLink, ...]: ...
-    async def list_children(self, parent_id: str) -> tuple[Task, ...]: ...
-    async def list_parents(self, child_id: str) -> tuple[Task, ...]: ...
 
     # --- comments ---
     async def add_comment(

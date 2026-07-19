@@ -20,9 +20,9 @@ from app.domain.task import (
 )
 
 
-def _ready_task(id: str = "t_1") -> Task:
+def _queued_task(id: str = "t_1") -> Task:
     return Task(
-        id=id, title="x", status=TaskStatus.READY, assignee="d",
+        id=id, title="x", status=TaskStatus.QUEUED,
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
 
@@ -73,7 +73,7 @@ async def test_spawn_tracks_by_run_id_and_inspect():
     rs = FakeRunService()
     runner = TaskRunner(interval_seconds=1, shutdown_grace_seconds=1)
     runner.set_run_service(rs)
-    task = _ready_task()
+    task = _queued_task()
     token = await runner.spawn(task, run_id=1, claim_lock="L1")
     assert token.startswith("wt-1-")
     snap = await runner.inspect()
@@ -94,7 +94,7 @@ async def test_spawn_keyed_by_run_id_not_task_id():
     rs._run_claim_delay = 0.2
     runner = TaskRunner(interval_seconds=1, shutdown_grace_seconds=1)
     runner.set_run_service(rs)
-    task = _ready_task()
+    task = _queued_task()
     # Spawn run 1, then run 2 for the same task (simulates re-claim).
     await runner.spawn(task, run_id=1, claim_lock="L1")
     await runner.spawn(task, run_id=2, claim_lock="L2")
@@ -113,7 +113,7 @@ async def test_cancel_worker():
     rs._run_claim_delay = 1.0  # long-running
     runner = TaskRunner(interval_seconds=1, shutdown_grace_seconds=1)
     runner.set_run_service(rs)
-    task = _ready_task()
+    task = _queued_task()
     token = await runner.spawn(task, run_id=1, claim_lock="L1")
     cancelled = await runner.cancel(token)
     assert cancelled is True
@@ -142,7 +142,7 @@ async def test_get_crashed_workers():
     rs = CrashRunService()
     runner = TaskRunner(interval_seconds=1, shutdown_grace_seconds=1)
     runner.set_run_service(rs)
-    task = _ready_task()
+    task = _queued_task()
     await runner.spawn(task, run_id=1, claim_lock="L1")
     await asyncio.sleep(0.1)
     crashed = await runner.get_crashed_workers()
@@ -158,7 +158,7 @@ async def test_get_crashed_workers():
 async def test_spawn_requires_run_service_bound():
     runner = TaskRunner(interval_seconds=1, shutdown_grace_seconds=1)
     with pytest.raises(RuntimeError):
-        await runner.spawn(_ready_task(), run_id=1, claim_lock="L1")
+        await runner.spawn(_queued_task(), run_id=1, claim_lock="L1")
 
 
 @pytest.mark.asyncio

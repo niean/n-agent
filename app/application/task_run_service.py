@@ -1,53 +1,58 @@
-"""T14: TaskRunService -- dispatch + CAS termination + recovery.
+"""T5: TaskRunService -- dispatch + unified run finalization (Manus-aligned).
 
 The SOLE run terminator. It decides ``target_task_status`` via TaskPolicy
-and passes it through ``FinishRunCommand.target_task_status``. The Registry
-executes the CAS finalize (does not decide status).
+(circuit breaker) and passes it through ``FinishRunCommand.target_task_status``.
+The Registry executes the CAS finalize (does not decide status).
 
-Key flows:
-  - ``dispatch_once`` (fixed order): recover finished in-process workers ->
-    recover stale executions -> recompute_ready -> select READY+assignee by
-    priority desc / created_at asc / id asc -> within task_max_concurrency
-    claim+spawn each.
-  - ``claim_and_spawn``: registry.claim_task -> dispatcher.spawn
-  - ``run_claim``: asyncio.wait_for(executor.run, max_runtime) -> ONE-SHOT
-    finish_run CAS. Spawn failure -> SPAWN_FAILED + retry rule.
-  - ``recover_crashed_workers``: RUNNING + in-process worker done with
-    exception -> CRASHED (preserve attribution before release lease).
-  - ``recover_stale_executions``: claim TTL expired orphans -> RECLAIMED.
-  - ``terminate``: cancel in-process worker + converge + TERMINATED.
-  - ``notify``: terminal_event_id idempotent; only terminal states deliver.
+Unified run-finalization path (``_finish``): every outcome -- including
+``WAITING_APPROVAL`` (worker propose) and ``TERMINATED`` (user cancel) --
+releases the claim (``claim_lock``/``claim_expires``/``current_run_id``),
+reclaims the worker (``dispatcher.cancel``), writes the run outcome, and
+appends a terminal event. No outcome bypasses this cleanup.
 
-TaskPolicy decides target_task_status:
-  - COMPLETED -> DONE
-  - BLOCKED -> BLOCKED
-  - Retryable (FAILED/CRASHED/TIMED_OUT/SPAWN_FAILED/RECLAIMED):
-    project consecutive_failures+1, evaluate RUNNING->TODO. If DENY
-    (circuit breaker) -> GAVE_UP, target=BLOCKED. If ALLOW -> target=TODO.
-  - TERMINATED -> BLOCKED
+Outcome -> target_task_status mapping (spec Data Model):
+  COMPLETED            -> SUCCEEDED
+  WAITING_APPROVAL     -> WAITING_APPROVAL (claim released, worker reclaimed)
+  TERMINATED           -> CANCELLED (user cancel RUNNING)
+  EXPIRED              -> EXPIRED (stale/lease expired)
+  CRASHED / TIMED_OUT  -> EXPIRED (worker died; user must retry)
+  FAILED / SPAWN_FAILED -> if consecutive_failures > max_retries: FAILED;
+                          else QUEUED (auto-retry; TaskPolicy circuit breaker)
+
+Notification policy:
+  - WAITING_APPROVAL / terminal statuses (SUCCEEDED/FAILED/CANCELLED/EXPIRED)
+    trigger user-visible notification.
+  - Auto-retry to QUEUED does NOT notify.
+
+dispatch_once order (fixed):
+  1. Recover finished in-process workers (crash detection -> CRASHED -> EXPIRED)
+  2. Recover stale executions (lease/heartbeat expired -> EXPIRED)
+  3. Query due QUEUED tasks (``list_queued_due``; no recompute_ready/list_ready)
+  4. Within max_concurrency, claim+spawn each
+
+Removed concepts: ``BlockKind``, ``TaskRunOutcome.BLOCKED/GAVE_UP/RECLAIMED``,
+``TaskStatus.TODO``, ``block_kind``/``block_recurrences``, ``recompute_ready``,
+``list_ready``. The new state machine has no BLOCKED state and no dependency
+graph.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from app.domain.policy import PolicyOutcome
 from app.domain.task import (
-    BlockKind,
     ClaimResult,
     FinishRunCommand,
     FinishRunResult,
     RecoverRunCommand,
     Task,
-    TaskClaimError,
     TaskConflictError,
     TaskNotFoundError,
-    TaskRun,
     TaskRunOutcome,
-    TaskRunStatus,
     TaskStatus,
 )
 from app.domain.task_policy import TaskPolicy, TaskPolicyRequest
@@ -55,23 +60,26 @@ from app.domain.task_policy import TaskPolicy, TaskPolicyRequest
 logger = logging.getLogger(__name__)
 
 
-# Terminal outcomes that trigger notification delivery (spec)
-_NOTIFIED_OUTCOMES: frozenset[TaskRunOutcome] = frozenset({
-    TaskRunOutcome.COMPLETED,
-    TaskRunOutcome.BLOCKED,
-    TaskRunOutcome.GAVE_UP,
-    TaskRunOutcome.CRASHED,
-    TaskRunOutcome.TIMED_OUT,
-    TaskRunOutcome.TERMINATED,
+# ---------------------------------------------------------------------------
+# Notification policy
+# ---------------------------------------------------------------------------
+
+# Target task statuses that trigger user-visible notification. Auto-retry to
+# QUEUED is intentionally excluded (no terminal notification).
+_NOTIFIED_TARGET_STATUSES: frozenset[TaskStatus] = frozenset({
+    TaskStatus.SUCCEEDED,
+    TaskStatus.WAITING_APPROVAL,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.EXPIRED,
 })
 
-# Retryable outcomes (don't notify, go to TODO for retry)
+# Retryable outcomes that may auto-retry to QUEUED (subject to the circuit
+# breaker). CRASHED/TIMED_OUT are NOT here -- they always go to EXPIRED
+# (user-driven retry only).
 _RETRYABLE_OUTCOMES: frozenset[TaskRunOutcome] = frozenset({
     TaskRunOutcome.FAILED,
-    TaskRunOutcome.CRASHED,
-    TaskRunOutcome.TIMED_OUT,
     TaskRunOutcome.SPAWN_FAILED,
-    TaskRunOutcome.RECLAIMED,
 })
 
 
@@ -118,32 +126,31 @@ class TaskRunService:
 
     async def dispatch_once(self) -> dict[str, Any]:
         """Single dispatch tick. Fixed order:
-        1. Recover finished in-process workers (crash detection)
-        2. Recover stale executions (lease/heartbeat expired)
-        3. Recompute ready (dependency graph)
-        4. Select READY+assignee by priority desc / created_at asc / id asc
-        5. Within task_max_concurrency, claim+spawn each
+        1. Recover finished in-process workers (crash detection -> EXPIRED)
+        2. Recover stale executions (lease/heartbeat expired -> EXPIRED)
+        3. Query due QUEUED tasks (``list_queued_due``)
+        4. Within max_concurrency, claim+spawn each
 
         Single candidate failure does not block others. Exceptions are
-        caught and logged.
+        caught and logged. No ``recompute_ready``/``list_ready`` -- the
+        new state machine has no READY state.
         """
         now = datetime.now(timezone.utc)
         recovered_crashed = await self._recover_crashed_workers(now)
         recovered_stale = await self._recover_stale_executions(now)
-        promoted = await self.registry.recompute_ready()
 
-        ready_tasks = await self.registry.list_ready(limit=100)
-        # Sort by priority desc, created_at asc, id asc
-        ready_sorted = sorted(
-            ready_tasks,
+        queued_tasks = await self.registry.list_queued_due(now, limit=100)
+        # Registry already orders by priority desc, created_at asc, id asc;
+        # sort again defensively in case the port is a fake.
+        queued_sorted = sorted(
+            queued_tasks,
             key=lambda t: (-t.priority, t.created_at or now, t.id),
         )
 
-        # Check current concurrency
         active_count = await self._active_worker_count()
         spawned = 0
         spawn_failures = 0
-        for task in ready_sorted:
+        for task in queued_sorted:
             if active_count + spawned >= self.max_concurrency:
                 break
             try:
@@ -161,7 +168,6 @@ class TaskRunService:
         return {
             "recovered_crashed": recovered_crashed,
             "recovered_stale": recovered_stale,
-            "promoted": list(promoted),
             "spawned": spawned,
             "spawn_failures": spawn_failures,
         }
@@ -171,7 +177,7 @@ class TaskRunService:
     # ------------------------------------------------------------------
 
     async def _claim_and_spawn(self, task: Task) -> str | None:
-        """Atomically claim a READY task and spawn a worker.
+        """Atomically claim a QUEUED task and spawn a worker.
 
         Returns the worker_token, or None if claim failed (already claimed
         by another tick / status changed).
@@ -189,7 +195,6 @@ class TaskRunService:
             )
             return worker_token
         except Exception as exc:
-            # Spawn failed -- record SPAWN_FAILED and apply retry rule
             logger.warning(
                 "spawn failed for task %s run %s: %s",
                 task.id, claim.run.id, exc,
@@ -199,23 +204,13 @@ class TaskRunService:
 
     async def _handle_spawn_failure(self, claim: ClaimResult, error: str) -> None:
         """Record SPAWN_FAILED outcome and apply circuit breaker."""
-        final_outcome = self._apply_circuit_breaker(claim.task, TaskRunOutcome.SPAWN_FAILED)
-        target_status = await self._decide_target_status(claim.task, final_outcome)
-        try:
-            result = await self.registry.finish_run(FinishRunCommand(
-                task_id=claim.task.id,
-                run_id=claim.run.id,
-                claim_lock=claim.run.claim_lock or "",
-                outcome=final_outcome,
-                error=error,
-                target_task_status=target_status,
-            ))
-            await self._notify_if_terminal(result)
-        except (TaskConflictError, TaskNotFoundError) as exc:
-            logger.warning(
-                "spawn_failed finish_run conflict for task %s: %s",
-                claim.task.id, exc,
-            )
+        await self._finish(
+            task=claim.task,
+            run_id=claim.run.id,
+            claim_lock=claim.run.claim_lock or "",
+            outcome=TaskRunOutcome.SPAWN_FAILED,
+            error=error,
+        )
 
     # ------------------------------------------------------------------
     # run_claim (called by dispatcher.spawn)
@@ -232,7 +227,8 @@ class TaskRunService:
         This is the worker entry point called by the dispatcher's spawn.
         The asyncio.wait_for wraps executor.run with a hard timeout that
         must be less than the lease. On any outcome (success, timeout,
-        error), the service performs ONE-SHOT finish_run CAS.
+        error), the service performs ONE-SHOT finish_run CAS via the
+        unified ``_finish`` path.
 
         All exceptions are caught so the asyncio.Task never propagates.
         """
@@ -268,6 +264,10 @@ class TaskRunService:
             return await self.executor.run_goal_loop(task, run_id, claim_lock)
         return await self.executor.run(task, run_id, claim_lock)
 
+    # ------------------------------------------------------------------
+    # Unified run finalization (the SOLE cleanup path)
+    # ------------------------------------------------------------------
+
     async def _finalize_run(
         self,
         task: Task,
@@ -275,118 +275,244 @@ class TaskRunService:
         claim_lock: str,
         agent_result: Any,
     ) -> None:
-        """ONE-SHOT CAS finalize. Decides target_task_status via TaskPolicy."""
+        """Worker-driven finalization: extract outcome from agent_result
+        and delegate to ``_finish``.
+
+        Exceptions from ``_finish`` are already handled (CAS conflict /
+        not found are logged, not propagated).
+        """
         status = getattr(agent_result, "status", TaskRunOutcome.FAILED)
         output = getattr(agent_result, "output", None)
         error = getattr(agent_result, "error", None)
         metadata = getattr(agent_result, "metadata", {}) or {}
         artifacts = getattr(agent_result, "artifacts", ()) or ()
 
-        # Apply circuit breaker: if retryable outcome and circuit breaker
-        # trips, change outcome to GAVE_UP (so notification fires).
-        final_outcome = self._apply_circuit_breaker(task, status)
-        target_status = await self._decide_target_status(task, final_outcome)
-
-        # Build artifacts tuple for FinishRunCommand
-        artifact_dicts = tuple(
-            a if isinstance(a, dict) else {"type": "unknown", "name": str(a), "storage_ref": ""}
-            for a in artifacts
+        await self._finish(
+            task=task,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            outcome=status,
+            summary=output or error or "",
+            error=error,
+            metadata=dict(metadata),
+            artifacts=tuple(
+                a if isinstance(a, dict) else {
+                    "type": "unknown", "name": str(a), "storage_ref": "",
+                }
+                for a in artifacts
+            ),
         )
+
+    async def _finish(
+        self,
+        task: Task,
+        run_id: int,
+        claim_lock: str,
+        outcome: TaskRunOutcome,
+        summary: str | None = None,
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        artifacts: tuple[dict[str, Any], ...] = (),
+    ) -> FinishRunResult | None:
+        """Unified CAS finalize -- the SOLE run cleanup path.
+
+        Decides ``target_task_status`` via TaskPolicy (circuit breaker for
+        retryable outcomes), calls ``registry.finish_run`` with the target
+        status (so the Registry does not guess), and delivers notification
+        for terminal / WAITING_APPROVAL targets.
+
+        Returns the FinishRunResult, or None if a late-worker CAS conflict
+        or missing task/run was logged and swallowed.
+        """
+        target_status = self._decide_target_status(task, outcome)
 
         try:
             result = await self.registry.finish_run(FinishRunCommand(
                 task_id=task.id,
                 run_id=run_id,
                 claim_lock=claim_lock,
-                outcome=final_outcome,
-                summary=output or error or "",
-                metadata=dict(metadata),
-                artifacts=artifact_dicts,
+                outcome=outcome,
+                summary=summary or "",
+                metadata=dict(metadata or {}),
+                artifacts=artifacts,
                 target_task_status=target_status,
                 error=error,
             ))
-            await self._notify_if_terminal(result)
         except TaskConflictError as exc:
-            # Late worker or duplicate finish -- audit only, don't overwrite
+            # Late worker or duplicate finish -- audit only, don't overwrite.
             logger.info(
                 "finish_run CAS conflict (late worker): task=%s run=%s: %s",
                 task.id, run_id, exc,
             )
+            return None
         except TaskNotFoundError as exc:
             logger.warning(
                 "finish_run task/run not found: task=%s run=%s: %s",
                 task.id, run_id, exc,
             )
+            return None
 
-    def _apply_circuit_breaker(
-        self, task: Task, outcome: TaskRunOutcome
-    ) -> TaskRunOutcome:
-        """If the outcome is retryable and the circuit breaker trips,
-        change the outcome to GAVE_UP so that:
-          1. The task goes to BLOCKED (not TODO retry).
-          2. Notification fires (GAVE_UP is in _NOTIFIED_OUTCOMES).
+        await self._notify_if_terminal(result, target_status)
+        return result
+
+    # ------------------------------------------------------------------
+    # finalize_propose (worker propose -> WAITING_APPROVAL run finalization)
+    # ------------------------------------------------------------------
+
+    async def finalize_propose(
+        self,
+        task_id: str,
+        run_id: int,
+        claim_lock: str,
+        proposal: str | None = None,
+    ) -> dict[str, Any]:
+        """Worker proposed a change requiring user approval -- finalize the
+        run with outcome=WAITING_APPROVAL via the unified cleanup path.
+
+        Releases the claim (claim_lock/claim_expires/current_run_id),
+        reclaims the worker (``dispatcher.cancel``), writes the run outcome
+        + terminal event, and transitions the task to WAITING_APPROVAL.
+        The ``change_proposed`` audit event is written by TaskService before
+        calling this; the ``proposal`` arg is only used as the run summary.
+
+        Raises TaskNotFoundError if the task does not exist.
         """
-        if outcome not in _RETRYABLE_OUTCOMES:
-            return outcome
-        projected_failures = task.consecutive_failures + 1
-        if projected_failures > task.max_retries:
-            return TaskRunOutcome.GAVE_UP
-        return outcome
+        task = await self.registry.get_task(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"task not found: {task_id}")
+
+        # Reclaim the in-process worker (unified cleanup).
+        await self._cancel_worker_if_active(task, run_id)
+
+        result = await self._finish(
+            task=task,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            outcome=TaskRunOutcome.WAITING_APPROVAL,
+            summary=proposal or "",
+        )
+        status = "finalized" if result is not None else "conflict"
+        return {
+            "task_id": task_id,
+            "run_id": run_id,
+            "outcome": TaskRunOutcome.WAITING_APPROVAL.value,
+            "status": status,
+        }
+
+    # ------------------------------------------------------------------
+    # terminate (user cancel RUNNING -> TERMINATED -> CANCELLED)
+    # ------------------------------------------------------------------
+
+    async def terminate(
+        self, task_id: str, run_id: int | None = None
+    ) -> dict[str, Any]:
+        """Cancel an in-process worker and finalize the run as TERMINATED.
+
+        For RUNNING tasks with an active in-process worker: cancel the
+        worker and call ``_finish`` with outcome=TERMINATED ->
+        target=CANCELLED (unified cleanup releases claim).
+
+        For RUNNING tasks with no in-process handle (cross-process or
+        restart orphan): append a ``terminate_requested`` event and let
+        lease recovery handle the cleanup later.
+
+        Returns a status dict:
+          - ``terminated``: worker cancelled + run finalized
+          - ``terminate_requested``: no in-process handle; event written
+          - ``conflict``: CAS conflict during finalize
+          - ``not_running`` / ``no_active_run``: preconditions not met
+        """
+        task = await self.registry.get_task(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"task not found: {task_id}")
+        if task.status != TaskStatus.RUNNING:
+            return {"task_id": task_id, "status": "not_running"}
+
+        target_run_id = run_id or task.current_run_id
+        if target_run_id is None:
+            return {"task_id": task_id, "status": "no_active_run"}
+
+        cancelled = await self._cancel_worker_if_active(task, target_run_id)
+        if cancelled:
+            result = await self._finish(
+                task=task,
+                run_id=target_run_id,
+                claim_lock=task.claim_lock or "",
+                outcome=TaskRunOutcome.TERMINATED,
+                error="terminated by request",
+            )
+            if result is not None:
+                return {"task_id": task_id, "status": "terminated"}
+            return {"task_id": task_id, "status": "conflict"}
+
+        # No in-process handle -> write terminate_requested event and wait
+        # for lease recovery to reclaim.
+        await self.registry.append_event(
+            task_id, "terminate_requested",
+            {"run_id": target_run_id}, run_id=target_run_id,
+        )
+        return {"task_id": task_id, "status": "terminate_requested"}
 
     # ------------------------------------------------------------------
     # TaskPolicy -> target_task_status decision
     # ------------------------------------------------------------------
 
-    async def _decide_target_status(
+    def _decide_target_status(
         self,
         task: Task,
         outcome: TaskRunOutcome,
     ) -> TaskStatus:
         """Decide the target TaskStatus based on outcome and TaskPolicy.
 
-        - COMPLETED -> DONE
-        - BLOCKED -> BLOCKED
-        - GAVE_UP -> BLOCKED
-        - TERMINATED -> BLOCKED
-        - Retryable (FAILED/CRASHED/TIMED_OUT/SPAWN_FAILED/RECLAIMED):
-          Project consecutive_failures+1, evaluate RUNNING->TODO.
-          If DENY (circuit breaker) -> GAVE_UP -> BLOCKED.
-          If ALLOW -> TODO (retry).
+        Mapping (spec Data Model):
+          COMPLETED            -> SUCCEEDED
+          WAITING_APPROVAL     -> WAITING_APPROVAL
+          TERMINATED           -> CANCELLED (user cancel)
+          EXPIRED              -> EXPIRED
+          CRASHED / TIMED_OUT  -> EXPIRED (worker died; user must retry)
+          FAILED / SPAWN_FAILED -> circuit breaker:
+              projected_failures = consecutive_failures + 1
+              if projected_failures > max_retries -> FAILED
+              else -> QUEUED (auto-retry)
+
+        The circuit breaker uses TaskPolicy.evaluate(RUNNING -> QUEUED),
+        which DENYs when consecutive_failures > max_retries.
         """
         if outcome == TaskRunOutcome.COMPLETED:
-            return TaskStatus.DONE
-        if outcome in (TaskRunOutcome.BLOCKED, TaskRunOutcome.GAVE_UP):
-            return TaskStatus.BLOCKED
+            return TaskStatus.SUCCEEDED
+        if outcome == TaskRunOutcome.WAITING_APPROVAL:
+            return TaskStatus.WAITING_APPROVAL
         if outcome == TaskRunOutcome.TERMINATED:
-            return TaskStatus.BLOCKED
+            return TaskStatus.CANCELLED
+        if outcome == TaskRunOutcome.EXPIRED:
+            return TaskStatus.EXPIRED
+        if outcome in (TaskRunOutcome.CRASHED, TaskRunOutcome.TIMED_OUT):
+            return TaskStatus.EXPIRED
 
-        # Retryable outcome: evaluate circuit breaker
-        # Project the failure count AFTER this failure (current + 1)
+        # Retryable: FAILED, SPAWN_FAILED
         projected_failures = task.consecutive_failures + 1
         request = TaskPolicyRequest(
             current=TaskStatus.RUNNING,
-            target=TaskStatus.TODO,
-            block_kind=None,
+            target=TaskStatus.QUEUED,
             consecutive_failures=projected_failures,
             max_retries=task.max_retries,
-            block_recurrences=task.block_recurrences,
         )
-        decision = self.policy.evaluate(request)
-        if decision is PolicyOutcome.DENY:
-            # Circuit breaker trips -> GAVE_UP
-            return TaskStatus.BLOCKED
-        return TaskStatus.TODO
+        if self.policy.evaluate(request) is PolicyOutcome.DENY:
+            # Circuit breaker tripped -> FAILED (terminal)
+            return TaskStatus.FAILED
+        return TaskStatus.QUEUED
 
     # ------------------------------------------------------------------
-    # recover_crashed_workers
+    # recover_crashed_workers (crashed in-process worker -> CRASHED -> EXPIRED)
     # ------------------------------------------------------------------
 
     async def _recover_crashed_workers(self, now: datetime) -> int:
-        """Recover in-process workers that ended with exception.
+        """Recover in-process workers that ended with an exception.
 
         Only workers that the dispatcher tracks as done-with-exception are
-        recovered here. The dispatcher's inspect() returns crashed workers;
-        we finalize them as CRASHED.
+        recovered here. The outcome is CRASHED, which maps to EXPIRED
+        (user must retry). The registry's recover_run default mapping
+        handles the target status.
         """
         if not hasattr(self.dispatcher, "get_crashed_workers"):
             return 0
@@ -404,7 +530,6 @@ class TaskRunService:
                     continue
                 if task.current_run_id != run_id:
                     continue
-                target = await self._decide_target_status(task, TaskRunOutcome.CRASHED)
                 result = await self.registry.recover_run(RecoverRunCommand(
                     task_id=task_id,
                     run_id=run_id,
@@ -412,11 +537,8 @@ class TaskRunService:
                     outcome=TaskRunOutcome.CRASHED,
                     error=error,
                 ))
-                # recover_run doesn't take target_task_status; use the
-                # default mapping (CRASHED -> TODO for retry, or BLOCKED
-                # if circuit breaker). This is acceptable since the
-                # registry's default maps retryable -> TODO.
-                await self._notify_if_terminal(result)
+                # CRASHED -> EXPIRED (terminal) -> notify
+                await self._notify_if_terminal(result, TaskStatus.EXPIRED)
                 recovered += 1
             except (TaskConflictError, TaskNotFoundError) as exc:
                 logger.warning(
@@ -426,16 +548,18 @@ class TaskRunService:
         return recovered
 
     # ------------------------------------------------------------------
-    # recover_stale_executions
+    # recover_stale_executions (lease/heartbeat expired -> EXPIRED)
     # ------------------------------------------------------------------
 
     async def _recover_stale_executions(self, now: datetime) -> int:
         """Recover RUNNING tasks with expired leases or stale heartbeats.
 
         For each RUNNING task:
-          - If claim_expires < now -> lease expired -> RECLAIMED
-          - If last_heartbeat is stale (heartbeat_timeout) -> RECLAIMED
-          - If no in-process worker handle -> only reclaim if lease expired
+          - If the in-process worker is still active, only reclaim when the
+            heartbeat is stale (hung worker).
+          - If no in-process worker, reclaim when the lease has expired.
+          - Recovery outcome is EXPIRED, which maps to task status EXPIRED
+            (user must retry; not auto-retry to QUEUED).
         """
         running_tasks = await self.registry.list_running()
         recovered = 0
@@ -443,37 +567,32 @@ class TaskRunService:
             if task.claim_lock is None or task.current_run_id is None:
                 continue
 
-            # Check if this task has an active in-process worker
             has_worker = await self._has_active_worker(task.current_run_id)
             if has_worker:
-                # Worker is still running in-process; check heartbeat
-                if task.is_stale(now, self.heartbeat_timeout_seconds):
-                    # Heartbeat stale -- but worker still "active" in dispatcher.
-                    # This could be a hung worker. Reclaim it.
-                    pass
-                else:
+                # Worker still active in-process; check heartbeat staleness.
+                if not task.is_stale(now, self.heartbeat_timeout_seconds):
                     continue
+                # Heartbeat stale -- reclaim below.
+            else:
+                # No active worker; check lease expiry.
+                if task.claim_expires is not None:
+                    expires_aware = task.claim_expires
+                    if expires_aware.tzinfo is None:
+                        expires_aware = expires_aware.replace(tzinfo=timezone.utc)
+                    if expires_aware > now:
+                        # Lease still valid, don't reclaim.
+                        continue
 
-            # Check lease expiry
-            if task.claim_expires is not None:
-                expires_aware = task.claim_expires
-                if expires_aware.tzinfo is None:
-                    expires_aware = expires_aware.replace(tzinfo=timezone.utc)
-                if expires_aware > now:
-                    # Lease still valid, don't reclaim
-                    continue
-
-            # Lease expired -> RECLAIMED
+            # Reclaim as EXPIRED.
             try:
-                target = await self._decide_target_status(task, TaskRunOutcome.RECLAIMED)
                 result = await self.registry.recover_run(RecoverRunCommand(
                     task_id=task.id,
                     run_id=task.current_run_id,
                     claim_lock=task.claim_lock,
-                    outcome=TaskRunOutcome.RECLAIMED,
+                    outcome=TaskRunOutcome.EXPIRED,
                     error="lease expired or heartbeat stale",
                 ))
-                await self._notify_if_terminal(result)
+                await self._notify_if_terminal(result, TaskStatus.EXPIRED)
                 recovered += 1
             except (TaskConflictError, TaskNotFoundError) as exc:
                 logger.info(
@@ -482,83 +601,21 @@ class TaskRunService:
         return recovered
 
     # ------------------------------------------------------------------
-    # terminate
-    # ------------------------------------------------------------------
-
-    async def terminate(self, task_id: str, run_id: int | None = None) -> dict[str, Any]:
-        """Cancel in-process worker and converge to TERMINATED.
-
-        If the worker is in-process, cancel it and wait for convergence.
-        If no handle (cross-process or restart orphan), write
-        terminate_requested and wait for lease recovery.
-        """
-        task = await self.registry.get_task(task_id)
-        if task is None:
-            raise TaskNotFoundError(f"task not found: {task_id}")
-        if task.status != TaskStatus.RUNNING:
-            return {"task_id": task_id, "status": "not_running"}
-
-        target_run_id = run_id or task.current_run_id
-        if target_run_id is None:
-            return {"task_id": task_id, "status": "no_active_run"}
-
-        # Check for an active in-process worker. worker_token being set does
-        # NOT imply the worker is still live in-process (could be a restart
-        # orphan with stale worker_token). Only cancel when truly active.
-        cancelled = False
-        has_active = await self._has_active_worker(target_run_id)
-        if has_active and task.worker_token:
-            try:
-                cancelled = await self.dispatcher.cancel(task.worker_token)
-            except Exception as exc:
-                logger.warning(
-                    "cancel worker failed for task %s: %s", task_id, exc
-                )
-
-        if cancelled:
-            # Worker was in-process and cancelled -> TERMINATED
-            target = await self._decide_target_status(task, TaskRunOutcome.TERMINATED)
-            try:
-                result = await self.registry.finish_run(FinishRunCommand(
-                    task_id=task_id,
-                    run_id=target_run_id,
-                    claim_lock=task.claim_lock or "",
-                    outcome=TaskRunOutcome.TERMINATED,
-                    error="terminated by request",
-                    target_task_status=target,
-                ))
-                await self._notify_if_terminal(result)
-                return {"task_id": task_id, "status": "terminated"}
-            except (TaskConflictError, TaskNotFoundError) as exc:
-                logger.warning(
-                    "terminate finish_run conflict for task %s: %s",
-                    task_id, exc,
-                )
-                return {"task_id": task_id, "status": "conflict"}
-
-        # No in-process handle -> write terminate_requested event
-        await self.registry.append_event(
-            task_id, "terminate_requested",
-            {"run_id": target_run_id}, run_id=target_run_id,
-        )
-        return {"task_id": task_id, "status": "terminate_requested"}
-
-    # ------------------------------------------------------------------
     # notify (idempotent by terminal_event_id)
     # ------------------------------------------------------------------
 
-    async def _notify_if_terminal(self, result: FinishRunResult) -> None:
-        """Deliver notification for terminal outcomes.
+    async def _notify_if_terminal(
+        self, result: FinishRunResult, target_status: TaskStatus
+    ) -> None:
+        """Deliver notification for terminal / WAITING_APPROVAL targets.
 
         Idempotent by terminal_event_id: the notifier checks
-        task_notify_subs.last_terminal_event_id before delivering.
-        Only _NOTIFIED_OUTCOMES trigger delivery; retryable FAILED/
-        SPAWN_FAILED/RECLAIMED do not.
+        ``task_notify_subs.last_terminal_event_id`` before delivering.
+        Auto-retry to QUEUED does NOT trigger notification.
         """
         if self.notifier is None:
             return
-        outcome = result.run.outcome
-        if outcome not in _NOTIFIED_OUTCOMES:
+        if target_status not in _NOTIFIED_TARGET_STATUSES:
             return
         try:
             await self.notifier.deliver(result.task, result.terminal_event)
@@ -571,6 +628,25 @@ class TaskRunService:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _cancel_worker_if_active(
+        self, task: Task, run_id: int
+    ) -> bool:
+        """Cancel the in-process worker for this run if it is active.
+
+        Returns True if the worker was cancelled, False otherwise (no
+        active worker, no worker_token, or cancel raised).
+        """
+        has_active = await self._has_active_worker(run_id)
+        if not has_active or not task.worker_token:
+            return False
+        try:
+            return await self.dispatcher.cancel(task.worker_token)
+        except Exception as exc:
+            logger.warning(
+                "cancel worker failed for run %s: %s", run_id, exc,
+            )
+            return False
 
     async def _active_worker_count(self) -> int:
         """Count active in-process workers via dispatcher.inspect()."""

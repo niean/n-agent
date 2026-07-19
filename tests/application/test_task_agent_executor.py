@@ -1,16 +1,20 @@
-"""T13: TaskAgentExecutor tests.
+"""T6: TaskAgentExecutor tests (Manus-aligned 7-state machine).
 
 Tests:
   - Calls ChatCompletionService with source=task, UNATTENDED
   - Same run_id in IngressFacts and trusted_metadata
-  - task 7 tools in permitted_managed_tools (NOT granted_tools)
+  - task 6 tools in permitted_managed_tools (NOT granted_tools)
+    (task_show / task_complete / task_heartbeat / task_comment /
+     task_propose_change / task_cancel)
   - trusted_metadata.task carries claim context
   - user prompt is "work task {task.id}"
   - Returns terminal intent (does NOT finalize run)
+  - TASK_GUIDANCE contains task_propose_change guidance
   - goal_mode multi-turn until judge passes
-  - goal_mode max_turns blocks
+  - goal_mode max_turns returns FAILED (BLOCKED removed)
   - goal_mode invalid judge JSON is retryable FAILED
   - judge has no write tools
+  - worker calls task_propose_change -> executor returns WAITING_APPROVAL
 """
 from __future__ import annotations
 
@@ -86,7 +90,6 @@ def _task(**kwargs) -> Task:
         title="Test Task",
         body="Do important work",
         status=TaskStatus.RUNNING,
-        assignee="default",
         created_at=datetime.now(timezone.utc),
     )
     defaults.update(kwargs)
@@ -157,12 +160,29 @@ async def test_executor_task_tools_in_permitted_managed_not_granted(executor, fa
     await executor.run(task, task_run_id=1, claim_lock="L1")
     call = fake_chat.complete_calls[0]
     permitted = set(call.trusted_metadata.get("permitted_managed_tools", []))
-    # All 7 task tools should be in permitted_managed_tools
+    # All 6 task tools should be in permitted_managed_tools
     from app.application.task_tools import TASK_TOOL_NAMES
     assert TASK_TOOL_NAMES.issubset(permitted)
     # Task tools should NOT be in granted_tools (which is for additional tools)
     granted = set(call.trusted_metadata.get("granted_tools", []))
     assert not TASK_TOOL_NAMES.intersection(granted)
+
+
+@pytest.mark.asyncio
+async def test_executor_permitted_managed_tools_contains_propose_and_cancel(executor, fake_chat):
+    """permitted_managed_tools must contain task_propose_change and task_cancel,
+    and must NOT contain the removed task_block/task_create/task_link."""
+    task = _task()
+    await executor.run(task, task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+    permitted = set(call.trusted_metadata.get("permitted_managed_tools", []))
+    # New tools present
+    assert "task_propose_change" in permitted
+    assert "task_cancel" in permitted
+    # Removed tools absent
+    assert "task_block" not in permitted
+    assert "task_create" not in permitted
+    assert "task_link" not in permitted
 
 
 @pytest.mark.asyncio
@@ -217,6 +237,20 @@ async def test_executor_injects_task_guidance(executor, fake_chat):
 
 
 @pytest.mark.asyncio
+async def test_executor_task_guidance_contains_propose_change_guidance():
+    """TASK_GUIDANCE must instruct the worker to call task_propose_change when
+    encountering changes that require user decision, and that the run ends
+    immediately after the call."""
+    assert "task_propose_change" in TASK_GUIDANCE
+    # Guidance must mention that the run ends after proposing
+    assert "结束" in TASK_GUIDANCE or "终结" in TASK_GUIDANCE or "立即" in TASK_GUIDANCE
+    # Guidance must NOT reference removed tools
+    assert "task_block" not in TASK_GUIDANCE
+    assert "task_create" not in TASK_GUIDANCE
+    assert "task_link" not in TASK_GUIDANCE
+
+
+@pytest.mark.asyncio
 async def test_executor_session_id_is_task_prefix(executor, fake_chat):
     task = _task(id="t_1", execution_session_id=None)
     await executor.run(task, task_run_id=1, claim_lock="L1")
@@ -250,18 +284,23 @@ async def test_executor_returns_terminal_intent_not_finalize(executor, fake_regi
 
 
 @pytest.mark.asyncio
-async def test_executor_returns_blocked_intent(executor, fake_registry):
+async def test_executor_propose_change_returns_waiting_approval(executor, fake_registry):
+    """When the worker calls task_propose_change during the chat, a
+    change_proposed event is written. The executor must detect it and return
+    WAITING_APPROVAL so that TaskRunService.finalize_propose can终结 the run."""
     fake_registry._events = [
         TaskEvent(
-            id=1, task_id="t_1", kind="block_requested",
-            payload={"outcome": "blocked", "reason": "need user input", "kind": "needs_input"},
+            id=1, task_id="t_1", kind="change_proposed",
+            payload={"proposal": "switch to plan B", "run_id": 1},
             run_id=1, created_at=datetime.now(timezone.utc),
         ),
     ]
     task = _task()
     result = await executor.run(task, task_run_id=1, claim_lock="L1")
-    assert result.status == TaskRunOutcome.BLOCKED
-    assert result.error == "need user input"
+    assert result.status == TaskRunOutcome.WAITING_APPROVAL
+    # The proposal text should be reflected in the output or metadata
+    assert "switch to plan B" in (result.output or "") or \
+           "switch to plan B" in str(result.metadata or {})
 
 
 @pytest.mark.asyncio
@@ -375,7 +414,9 @@ async def test_goal_mode_multi_turn_until_judge_passes():
 
 
 @pytest.mark.asyncio
-async def test_goal_mode_max_turns_blocks():
+async def test_goal_mode_max_turns_fails():
+    """When goal not achieved after max_turns, the run fails (BLOCKED removed;
+    worker should use task_propose_change for needs-input scenarios)."""
     worker_result = ChatCompletionResult(
         session_id="task-t_1", model="N-Agent",
         message={"role": "assistant", "content": "did work"},
@@ -391,8 +432,8 @@ async def test_goal_mode_max_turns_blocks():
     )
     task = _task(goal_mode=True, goal_max_turns=3)
     result = await executor.run_goal_loop(task, task_run_id=1, claim_lock="L1")
-    assert result.status == TaskRunOutcome.BLOCKED
-    assert "needs_input" in (result.metadata.get("block_kind") or "") or "not achieved" in (result.error or "")
+    assert result.status == TaskRunOutcome.FAILED
+    assert "not achieved" in (result.error or "") or "incomplete" in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -465,7 +506,7 @@ async def test_goal_mode_judge_json_in_code_block():
 
 @pytest.mark.asyncio
 async def test_goal_mode_turn_terminal_returns_immediately():
-    """If a turn returns BLOCKED/FAILED, goal_loop returns immediately."""
+    """If a turn returns FAILED/TIMED_OUT/CRASHED, goal_loop returns immediately."""
     worker_result = ChatCompletionResult(
         session_id="task-t_1", model="N-Agent",
         message={"role": "assistant", "content": "blocked"},
