@@ -382,12 +382,28 @@ class SQLiteMemoryStore:
 
     async def delete_session(self, session_id: str) -> bool:
         with self._connect() as conn:
+            existing_tables = {r["name"] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
             conn.execute("DELETE FROM gateway_session_links WHERE session_id = ?", (session_id,))
             conn.execute("UPDATE gateway_conversations SET active_session_id = NULL WHERE active_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM task_states WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM summaries WHERE session_id = ?", (session_id,))
+            # Task 子域：删除 origin session 仅置空 tasks.origin_session_id；删除
+            # execution session 仅置空 tasks.execution_session_id；均不删除 Task
+            # 行。Task 删除由 TaskService 负责，并在删除后清理 execution session。
+            # 旧库未启用 Task（tasks 表不存在）时跳过，保持向后兼容。
+            if "tasks" in existing_tables:
+                conn.execute(
+                    "UPDATE tasks SET origin_session_id = NULL WHERE origin_session_id = ?",
+                    (session_id,),
+                )
+                conn.execute(
+                    "UPDATE tasks SET execution_session_id = NULL WHERE execution_session_id = ?",
+                    (session_id,),
+                )
             cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return cursor.rowcount > 0
 
@@ -725,6 +741,10 @@ def _migrate_session_id_prefixes(conn: sqlite3.Connection) -> None:
     ]
     available_tables = [t for t in session_id_tables if t in existing_tables]
     has_gateway_conversations = "gateway_conversations" in existing_tables
+    # Task 子域：tasks 表的 origin_session_id / execution_session_id 引用 session_id
+    # （ON DELETE SET NULL，但 prefix 迁移需要主动级联更新保持引用一致）。
+    # 旧库未启用 Task（tasks 表不存在）时跳过。
+    has_tasks_table = "tasks" in existing_tables
 
     updates: list[tuple[str, str, str]] = []
     for row in rows:
@@ -759,6 +779,16 @@ def _migrate_session_id_prefixes(conn: sqlite3.Connection) -> None:
                 if has_gateway_conversations:
                     conn.execute(
                         "UPDATE gateway_conversations SET active_session_id=? WHERE active_session_id=?",
+                        (new_id, old_id),
+                    )
+                # Task 子域：tasks 表的 origin/execution session_id 引用必须级联更新
+                if has_tasks_table:
+                    conn.execute(
+                        "UPDATE tasks SET origin_session_id=? WHERE origin_session_id=?",
+                        (new_id, old_id),
+                    )
+                    conn.execute(
+                        "UPDATE tasks SET execution_session_id=? WHERE execution_session_id=?",
                         (new_id, old_id),
                     )
             conn.execute(

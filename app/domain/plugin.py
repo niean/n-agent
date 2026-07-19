@@ -30,6 +30,79 @@ class PluginScanStatus(str, Enum):
     PARTIAL = "partial"
 
 
+def _normalize_string_list(
+    raw_value: Any, *, field_name: str, plugin_name: str
+) -> list[str]:
+    """Strict-normalize a list-of-strings manifest field.
+
+    None -> []. Non-list (including scalar strings) -> PluginValidationError.
+    Each item must be a non-empty string; duplicates removed preserving order.
+    """
+    if raw_value is None:
+        return []
+    if not isinstance(raw_value, list):
+        raise PluginValidationError(
+            f"plugin {plugin_name}: {field_name} must be a list"
+        )
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_value:
+        if not isinstance(item, str):
+            raise PluginValidationError(
+                f"plugin {plugin_name}: {field_name} items must be strings"
+            )
+        stripped = item.strip()
+        if not stripped:
+            raise PluginValidationError(
+                f"plugin {plugin_name}: {field_name} items must be non-empty"
+            )
+        if stripped in seen:
+            continue
+        seen.add(stripped)
+        result.append(stripped)
+    return result
+
+
+def _normalize_external_dependencies(
+    raw_value: Any, *, plugin_name: str
+) -> list[dict[str, str]]:
+    """Strict-normalize external_dependencies.
+
+    None -> []. Non-list -> PluginValidationError. Each item must be a mapping
+    with a non-empty string ``name``; optional ``install``/``check`` must be
+    strings when present (null treated as absent). Public projection only
+    carries name/install/check; unknown keys are dropped (but preserved in raw).
+    """
+    if raw_value is None:
+        return []
+    if not isinstance(raw_value, list):
+        raise PluginValidationError(
+            f"plugin {plugin_name}: external_dependencies must be a list"
+        )
+    result: list[dict[str, str]] = []
+    for item in raw_value:
+        if not isinstance(item, dict):
+            raise PluginValidationError(
+                f"plugin {plugin_name}: external_dependencies items must be mappings"
+            )
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise PluginValidationError(
+                f"plugin {plugin_name}: external_dependencies items must have a non-empty string name"
+            )
+        normalized: dict[str, str] = {"name": name.strip()}
+        for opt_key in ("install", "check"):
+            if opt_key in item and item[opt_key] is not None:
+                value = item[opt_key]
+                if not isinstance(value, str):
+                    raise PluginValidationError(
+                        f"plugin {plugin_name}: external_dependencies {opt_key} must be a string"
+                    )
+                normalized[opt_key] = value
+        result.append(normalized)
+    return result
+
+
 @dataclass(frozen=True)
 class PluginManifest:
     key: str
@@ -46,6 +119,9 @@ class PluginManifest:
     provides_hooks: list[str] = field(default_factory=list)
     provides_web_providers: list[str] = field(default_factory=list)
     platforms: list[str] = field(default_factory=list)
+    pip_dependencies: list[str] = field(default_factory=list)
+    external_dependencies: list[dict[str, str]] = field(default_factory=list)
+    requires_plugins: list[str] = field(default_factory=list)
     config_schema: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -89,6 +165,15 @@ class PluginManifest:
             provides_hooks=list(raw.get("provides_hooks", []) or []),
             provides_web_providers=list(raw.get("provides_web_providers", []) or []),
             platforms=list(raw.get("platforms", []) or []),
+            pip_dependencies=_normalize_string_list(
+                raw.get("pip_dependencies"), field_name="pip_dependencies", plugin_name=name
+            ),
+            external_dependencies=_normalize_external_dependencies(
+                raw.get("external_dependencies"), plugin_name=name
+            ),
+            requires_plugins=_normalize_string_list(
+                raw.get("requires_plugins"), field_name="requires_plugins", plugin_name=name
+            ),
             config_schema=dict(raw.get("config_schema", {}) or {}),
             raw=dict(raw),
         )

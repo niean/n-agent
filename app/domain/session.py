@@ -23,6 +23,10 @@ class SessionSource(str, Enum):
     # Curator 周期维护的 consolidation fork 是内部触发（非平台、非外部 HTTP），
     # 独立成一级并配 curator- 前缀，避免误回落 api 导致来源与前缀脱节（模式十六）
     CURATOR = "curator"
+    # Task（Kanban / Manus Task）是目标驱动的异步后台执行入口，与"对话""定时任务"
+    # 同级。worker 使用进程内 ChatCompletionService 执行，execution_session_id 固定
+    # `task-{task.id}` 前缀。非 IM 平台，不进 im_platforms。（模式十六）
+    TASK = "task"
 
     @classmethod
     def im_platforms(cls) -> set[str]:

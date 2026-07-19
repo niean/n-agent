@@ -12,7 +12,9 @@ from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 
 def test_session_sources_cover_entry_types():
     # 模式十六：source 取值与 session_id 前缀一一对应；curator 是 Curator 周期维护的内部触发来源
+    # task 是 Task（Kanban / Manus Task）入口，与"对话""定时任务"同级（T9）
     assert SessionSource.CURATOR.value == "curator"
+    assert SessionSource.TASK.value == "task"
     assert {source.value for source in SessionSource} == {
         "dashboard",
         "api",
@@ -23,6 +25,7 @@ def test_session_sources_cover_entry_types():
         "acp",
         "schedule",
         "curator",
+        "task",
     }
 
 

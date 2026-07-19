@@ -556,3 +556,98 @@ async def test_stream_and_non_stream_produce_same_iteration_limit_reason(tmp_pat
     events = [e async for e in runner2.stream_events(state2, "test")]
     done_event = next(e for e in events if e.type is ChatEventType.MESSAGE_DONE)
     assert done_event.finish_reason == "length"
+
+
+# ---------------------------------------------------------------------------
+# T10: Hook dispatch integration with streaming
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDispatcher:
+    """Minimal hook dispatcher that records calls and can transform output."""
+
+    def __init__(self, transform_llm_output_value: str | None = None):
+        self.calls: list[tuple[str, dict]] = []
+        self._transform_value = transform_llm_output_value
+
+    async def invoke_hook(self, hook_name: str, **kwargs):
+        self.calls.append((hook_name, dict(kwargs)))
+        if hook_name == "transform_llm_output" and self._transform_value is not None:
+            return [self._transform_value]
+        return []
+
+    def calls_for(self, name: str) -> list[dict]:
+        return [kw for n, kw in self.calls if n == name]
+
+
+@pytest.mark.asyncio
+async def test_stream_events_with_hooks_no_duplicate_turn_dispatch(tmp_path):
+    """T10: stream_events reuses run() path; on_turn_start/end fire exactly once."""
+    store = SQLiteMemoryStore(tmp_path / "s.db")
+    await store.create_session(ConversationSession(id="s-hook-stream"))
+    dispatcher = _RecordingDispatcher()
+    runner = AgentGraphRunner(
+        _ToolProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        hook_dispatcher=dispatcher,
+    )
+    state = AgentState(session_id="s-hook-stream", input_messages=[{"role": "user", "content": "calc"}])
+    events = [e async for e in runner.stream_events(state, "test")]
+
+    assert len(dispatcher.calls_for("on_turn_start")) == 1
+    assert len(dispatcher.calls_for("on_turn_end")) == 1
+    # Streaming should still produce the expected event types
+    assert any(e.type is ChatEventType.MESSAGE_DONE for e in events)
+    assert any(e.type is ChatEventType.DONE for e in events)
+
+
+@pytest.mark.asyncio
+async def test_stream_events_transform_llm_output_client_matches_db(tmp_path):
+    """T10: streaming buffers final content, applies transform_llm_output,
+    then yields. Client text must equal DB-persisted text."""
+    store = SQLiteMemoryStore(tmp_path / "s.db")
+    await store.create_session(ConversationSession(id="s-tx-stream"))
+    dispatcher = _RecordingDispatcher(transform_llm_output_value="STREAM_TX_RESULT")
+    runner = AgentGraphRunner(
+        _SecretContentProvider("original content"),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        hook_dispatcher=dispatcher,
+    )
+    state = AgentState(session_id="s-tx-stream", input_messages=[{"role": "user", "content": "hi"}])
+    events = [e async for e in runner.stream_events(state, "test")]
+
+    content_events = [e for e in events if e.type is ChatEventType.CONTENT_DELTA]
+    client_text = "".join(e.content for e in content_events)
+    assert client_text == "STREAM_TX_RESULT"
+
+    db_messages = await store.list_messages("s-tx-stream")
+    assistant_msgs = [m for m in db_messages if m.role == "assistant"]
+    assert any(m.content == "STREAM_TX_RESULT" for m in assistant_msgs)
+
+
+@pytest.mark.asyncio
+async def test_stream_events_without_dispatcher_unchanged(tmp_path):
+    """T10: streaming without hook_dispatcher produces same behavior as before."""
+    store = SQLiteMemoryStore(tmp_path / "s.db")
+    await store.create_session(ConversationSession(id="s-no-hook"))
+    runner = AgentGraphRunner(
+        _ToolProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(session_id="s-no-hook", input_messages=[{"role": "user", "content": "calc"}])
+    events = [e async for e in runner.stream_events(state, "test")]
+
+    types = [e.type for e in events]
+    assert ChatEventType.MESSAGE_START in types
+    assert ChatEventType.MESSAGE_DONE in types
+    assert ChatEventType.DONE in types
+    tool_deltas = [e for e in events if e.type is ChatEventType.TOOL_CALL_DELTA]
+    assert len(tool_deltas) >= 2

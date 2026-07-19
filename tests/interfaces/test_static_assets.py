@@ -786,6 +786,123 @@ def test_plugin_js_present_and_safe(tmp_path):
     assert '.textContent' in body
 
 
+def test_plugin_js_open_detail_calls_api_get_plugin(tmp_path):
+    """T13 S1/S2: openDetail(key) must call api.getPlugin(key) to fetch detail,
+    not use the cached list row. Must be async and handle fetch failure."""
+    client = _client(tmp_path)
+    body = client.get('/static/plugin.js').text
+
+    # locate openDetail function body (may be 'async function openDetail(' or 'function openDetail(')
+    start = body.index('function openDetail(')
+    # back up to include 'async ' prefix if present
+    if start >= 6 and body[start - 6:start] == 'async ':
+        start = start - 6
+    # the function body ends at the next top-level "function " declaration
+    end = body.index('function openConfig(', start)
+    detail_body = body[start:end]
+
+    # MUST be async so it can await api.getPlugin
+    assert detail_body.startswith('async function openDetail(')
+    # MUST call api.getPlugin(key) -- not plugins.find
+    assert 'api.getPlugin(' in detail_body
+    # MUST NOT use list row as detail source (the old behavior)
+    assert 'plugins.find' not in detail_body
+
+
+def test_plugin_js_open_detail_handles_fetch_failure_without_stale_data(tmp_path):
+    """T13 S4: when api.getPlugin fails, modal must show safe error and not
+    open with stale list-row data."""
+    client = _client(tmp_path)
+    body = client.get('/static/plugin.js').text
+
+    start = body.index('function openDetail(')
+    end = body.index('function openConfig(', start)
+    detail_body = body[start:end]
+
+    # try/catch around the fetch
+    assert 'try' in detail_body
+    assert 'catch' in detail_body
+    # On failure: alert via modal.alert (safe error message), then return without
+    # opening a modal with stale data
+    assert 'modal.alert' in detail_body
+    # Must NOT proceed to build the modal from list row on failure: the modal
+    # build (ui.el('div', 'modal-backdrop')) should only appear AFTER the
+    # successful fetch, inside the try block.
+    try_idx = detail_body.index('try')
+    backdrop_idx = detail_body.index("ui.el('div', 'modal-backdrop')")
+    assert backdrop_idx > try_idx, "modal backdrop must be built after try (only on fetch success)"
+
+
+def test_plugin_js_detail_modal_renders_four_dependency_sections(tmp_path):
+    """T13 S2: modal adds Pip, External, Required Plugins, Warnings four
+    read-only sections from dependency_status. Empty category shows None."""
+    client = _client(tmp_path)
+    body = client.get('/static/plugin.js').text
+
+    # 4 read-only section titles present in plugin.js source
+    # (labels rendered via textContent)
+    for label in ('Pip', 'External', 'Required Plugins', 'Warnings'):
+        assert label in body, f"plugin.js missing detail section label: {label}"
+
+    # Empty category displays 'None'
+    assert "'None'" in body or '"None"' in body or '`None`' in body
+
+    # Reads dependency_status fields: pip / external / requires_plugins / warnings
+    assert 'dependency_status' in body
+    assert 'pip' in body
+    assert 'external' in body
+    assert 'requires_plugins' in body
+    assert 'warnings' in body
+
+
+def test_plugin_js_detail_renders_install_strings_as_text_only(tmp_path):
+    """T13 S2: install/check/diagnostic/name rendered via textContent / ui.appendText.
+    No clickable install action, no command execution, no innerHTML."""
+    client = _client(tmp_path)
+    body = client.get('/static/plugin.js').text
+
+    # No command execution primitives
+    for forbidden in (
+        'eval(',
+        'new Function(',
+        'window.open(',
+        'location.href =',
+        'document.createElement(\'a\')',
+        "document.createElement(\"a\")",
+    ):
+        assert forbidden not in body, f"plugin.js uses forbidden primitive: {forbidden}"
+
+    # No install-related clickable action label (would indicate install button)
+    assert "'安装'" not in body
+    assert '"安装"' not in body
+    assert "'执行'" not in body
+    assert '"执行"' not in body
+
+    # install/check/diagnostic must be rendered via ui.appendText (the project's
+    # safe text helper) or direct textContent assignment -- never innerHTML.
+    # We already assert no innerHTML above; ensure ui.appendText is used for
+    # the detail rendering.
+    assert 'ui.appendText' in body
+
+
+def test_plugin_js_only_uses_documented_ui_helpers(tmp_path):
+    """T13 S2: plugin.js must only use ui helpers documented in management-ui.js
+    (appendText/el/renderEmpty/renderError etc.), no undocumented helpers."""
+    client = _client(tmp_path)
+    ui_body = client.get('/static/management-ui.js').text
+    body = client.get('/static/plugin.js').text
+    import re
+    used = set(re.findall(r"\bui\.([A-Za-z_][A-Za-z0-9_]*)", body))
+    documented = {
+        'byId', 'clear', 'appendText', 'appendBadge', 'renderJson',
+        'renderEmpty', 'renderLoading', 'renderError', 'el',
+    }
+    missing = used - documented
+    assert not missing, f"plugin.js uses undocumented ui helpers: {missing}"
+    for name in used:
+        assert name in ui_body, f"ui.{name} referenced but not defined in management-ui.js"
+
+
 def test_external_memory_provider_actions_keep_table_cell_layout(tmp_path):
     client = _client(tmp_path)
     memory_js = client.get('/static/external-memory.js').text

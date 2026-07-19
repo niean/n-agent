@@ -30,3 +30,13 @@ def test_plugin_call_tool_hello_handler():
     result = asyncio.run(services.plugin_service.call_tool("hello", {"name": "Alice"}, None))
     assert result.status.value == "success"
     assert result.content == {"message": "Hello, Alice!"}
+
+
+def test_graph_runner_wired_with_plugin_hook_dispatcher():
+    services = build_application_services()
+    assert services.chat_service.graph_runner._hook_dispatcher is services.plugin_service
+
+
+def test_session_service_wired_with_plugin_hook_dispatcher():
+    services = build_application_services()
+    assert services.session_service._hook_dispatcher is services.plugin_service

@@ -124,9 +124,21 @@
     }
   }
 
-  function openDetail(key) {
-    const plugin = plugins.find((p) => p.key === key);
-    if (!plugin) return;
+  async function openDetail(key) {
+    // T13: fetch detail via api.getPlugin; never use the cached list row.
+    // On fetch failure, show a safe error and DO NOT open stale data.
+    let plugin;
+    try {
+      plugin = await api.getPlugin(key);
+    } catch (exc) {
+      await modal.alert('Plugin 详情加载失败: ' + (exc && exc.message ? exc.message : exc));
+      return;
+    }
+    if (!plugin) {
+      await modal.alert('Plugin 详情加载失败: 未找到');
+      return;
+    }
+
     const backdrop = ui.el('div', 'modal-backdrop');
     const dialog = ui.el('section', 'modal-dialog');
     dialog.setAttribute('role', 'dialog');
@@ -168,6 +180,78 @@
       ui.appendText(list, 'Secret Fields', present.join(', '));
     }
     body.appendChild(list);
+
+    // T13: 4 read-only dependency sections from capabilities.dependency_status.
+    // All name/install/check/diagnostic rendered via ui.appendText (textContent).
+    // Empty category shows 'None'. No clickable install actions, no command exec.
+    const depStatus = (
+      plugin.capabilities
+      && plugin.capabilities.dependency_status
+    ) || {};
+    const depSection = ui.el('div', 'plugin-detail-deps');
+    const depTitle = ui.el('div', 'plugin-detail-deps__title');
+    depTitle.textContent = '依赖诊断';
+    depSection.appendChild(depTitle);
+
+    // Pip section
+    const pipList = ui.el('div');
+    const pipItems = depStatus.pip || [];
+    if (pipItems.length) {
+      pipItems.forEach((item) => {
+        ui.appendText(pipList, 'Pip', '');
+        ui.appendText(pipList, '  spec', item.spec || '');
+        ui.appendText(pipList, '  name', item.name || '');
+        ui.appendText(pipList, '  status', item.status || '');
+        ui.appendText(pipList, '  installed_version', item.installed_version || '');
+        ui.appendText(pipList, '  diagnostic', item.diagnostic || '');
+      });
+    } else {
+      ui.appendText(pipList, 'Pip', 'None');
+    }
+    depSection.appendChild(pipList);
+
+    // External section
+    const extList = ui.el('div');
+    const extItems = depStatus.external || [];
+    if (extItems.length) {
+      extItems.forEach((item) => {
+        ui.appendText(extList, 'External', '');
+        ui.appendText(extList, '  name', item.name || '');
+        ui.appendText(extList, '  install', item.install || '');
+        ui.appendText(extList, '  check', item.check || '');
+      });
+    } else {
+      ui.appendText(extList, 'External', 'None');
+    }
+    depSection.appendChild(extList);
+
+    // Required Plugins section
+    const reqList = ui.el('div');
+    const reqItems = depStatus.requires_plugins || [];
+    if (reqItems.length) {
+      reqItems.forEach((item) => {
+        ui.appendText(reqList, 'Required Plugins', '');
+        ui.appendText(reqList, '  key', item.key || '');
+        ui.appendText(reqList, '  available', item.available ? 'true' : 'false');
+        ui.appendText(reqList, '  reason', item.reason || '');
+        ui.appendText(reqList, '  diagnostic', item.diagnostic || '');
+      });
+    } else {
+      ui.appendText(reqList, 'Required Plugins', 'None');
+    }
+    depSection.appendChild(reqList);
+
+    // Warnings section
+    const warnList = ui.el('div');
+    const warnItems = depStatus.warnings || [];
+    if (warnItems.length) {
+      warnItems.forEach((w, idx) => ui.appendText(warnList, 'Warning ' + (idx + 1), w));
+    } else {
+      ui.appendText(warnList, 'Warnings', 'None');
+    }
+    depSection.appendChild(warnList);
+
+    body.appendChild(depSection);
     form.appendChild(body);
 
     const actions = ui.el('div', 'providers-form__actions');

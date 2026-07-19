@@ -23,9 +23,13 @@
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4V6Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">对话</span>
       </a>
+      <a class="sidebar__item" href="/tasks" data-tab="tasks">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h7v5H4V6ZM13 6h7v5h-7V6ZM4 13h7v5H4v-5ZM13 13h7v5h-7v-5Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">任务</span>
+      </a>
       <a class="sidebar__item" href="/scheduled-tasks" data-tab="scheduled-tasks">
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 3v3M17 3v3M4 9h16M6 5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-        <span class="sidebar__item-label">任务</span>
+        <span class="sidebar__item-label">定时任务</span>
       </a>
       <hr class="sidebar__divider" aria-hidden="true">
       <a class="sidebar__item" href="/sessions" data-tab="sessions">
@@ -135,6 +139,16 @@
             <div class="debug-section"><h4>Tool Calls</h4><div id="chat-tool-calls">暂未选择会话</div></div>
           </div>
         </section>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-tasks">
+      <div id="tasks-board-view">
+        <section class="status-panel">
+          <div class="panel-header"><span>任务看板</span></div>
+          <div class="panel-body" id="tasks-board"></div>
+        </section>
+        <div id="tasks-detail-view" hidden></div>
       </div>
     </div>
 
@@ -270,6 +284,7 @@
   <script src="/static/models.js"></script>
   <script src="/static/health.js"></script>
   <script src="/static/scheduled-tasks.js"></script>
+<script src="/static/tasks.js"></script>
   <script src="/static/platforms.js"></script>
   <script src="/static/skills.js"></script>
   <script src="/static/external-memory.js"></script>

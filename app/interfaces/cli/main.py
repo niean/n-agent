@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import inspect
 import logging
+import sys
 import warnings
+from typing import TYPE_CHECKING
 
 from .commands import (
     acp,
@@ -22,8 +26,14 @@ from .commands import (
     sessions,
     skill,
     status,
+    task,
     usage,
 )
+
+if TYPE_CHECKING:
+    from app.application.plugin_service import PluginCliCommand
+
+logger = logging.getLogger(__name__)
 
 
 def _configure_cli_env() -> None:
@@ -239,6 +249,105 @@ def _build_schedule_parser(subparsers) -> None:
     _add_format_flags(executions_p)
 
 
+def _build_task_parser(subparsers) -> None:
+    parser = subparsers.add_parser("task", help="Task (Kanban / Manus Task) commands")
+    sub = parser.add_subparsers(dest="task_command", required=True)
+
+    def _fmt(p):
+        return _add_format_flags(p)
+
+    list_p = sub.add_parser("list", help="List tasks")
+    list_p.add_argument("--status", default=None)
+    _fmt(list_p)
+
+    ls_p = sub.add_parser("ls", help="Alias of list")
+    ls_p.add_argument("--status", default=None)
+    _fmt(ls_p)
+
+    show_p = sub.add_parser("show", help="Show a task")
+    show_p.add_argument("id")
+    _fmt(show_p)
+
+    create_p = sub.add_parser("create", help="Create a task")
+    create_p.add_argument("--title", required=True)
+    create_p.add_argument("--body", default=None)
+    create_p.add_argument("--assignee", default=None)
+    create_p.add_argument("--priority", type=int, default=None)
+    create_p.add_argument("--goal", action="store_true", help="Enable goal_mode (Ralph-style loop)")
+    create_p.add_argument("--goal-max-turns", type=int, default=None)
+    create_p.add_argument("--max-runtime", type=int, default=None)
+    create_p.add_argument("--max-retries", type=int, default=None)
+    create_p.add_argument("--created-by", default=None)
+    create_p.add_argument("--triage", action="store_true", help="Leave task in TRIAGE (default)")
+    _fmt(create_p)
+
+    assign_p = sub.add_parser("assign", help="Assign a task")
+    assign_p.add_argument("id")
+    assign_p.add_argument("--assignee", required=True)
+    assign_p.add_argument("--version", type=int, required=True)
+    _fmt(assign_p)
+
+    promote_p = sub.add_parser("promote", help="Promote a TODO task to READY")
+    promote_p.add_argument("id")
+    promote_p.add_argument("--version", type=int, required=True)
+    _fmt(promote_p)
+
+    archive_p = sub.add_parser("archive", help="Archive a task")
+    archive_p.add_argument("id")
+    archive_p.add_argument("--version", type=int, required=True)
+    _fmt(archive_p)
+
+    unarchive_p = sub.add_parser("unarchive", help="Restore an archived task")
+    unarchive_p.add_argument("id")
+    unarchive_p.add_argument("--version", type=int, required=True)
+    _fmt(unarchive_p)
+
+    complete_p = sub.add_parser("complete", help="Mark a task complete (worker intent)")
+    complete_p.add_argument("id")
+    complete_p.add_argument("--summary", required=True)
+    complete_p.add_argument("--metadata", default=None, help="JSON metadata")
+    _fmt(complete_p)
+
+    block_p = sub.add_parser("block", help="Block a task")
+    block_p.add_argument("id")
+    block_p.add_argument("--reason", required=True)
+    block_p.add_argument("--kind", default="needs_input",
+                          choices=["dependency", "needs_input", "capability", "transient"])
+    _fmt(block_p)
+
+    comment_p = sub.add_parser("comment", help="Add a comment")
+    comment_p.add_argument("id")
+    comment_p.add_argument("--body", required=True)
+    comment_p.add_argument("--author", default=None)
+    _fmt(comment_p)
+
+    link_p = sub.add_parser("link", help="Add a dependency edge")
+    link_p.add_argument("--parent-id", required=True)
+    link_p.add_argument("--child-id", required=True)
+    _fmt(link_p)
+
+    runs_p = sub.add_parser("runs", help="List runs of a task")
+    runs_p.add_argument("id")
+    runs_p.add_argument("--limit", type=int, default=None)
+    _fmt(runs_p)
+
+    events_p = sub.add_parser("events", help="List events of a task")
+    events_p.add_argument("id")
+    events_p.add_argument("--limit", type=int, default=None)
+    _fmt(events_p)
+
+    dispatch_p = sub.add_parser("dispatch", help="Nudge the dispatcher (one tick)")
+    _fmt(dispatch_p)
+
+    specify_p = sub.add_parser("specify", help="LLM: flesh out a TRIAGE task to TODO")
+    specify_p.add_argument("id")
+    _fmt(specify_p)
+
+    decompose_p = sub.add_parser("decompose", help="LLM: decompose a task into children")
+    decompose_p.add_argument("id")
+    _fmt(decompose_p)
+
+
 def _build_sandbox_parser(subparsers) -> None:
     parser = subparsers.add_parser("sandbox", help="Sandbox commands")
     sub = parser.add_subparsers(dest="sandbox_command", required=True)
@@ -415,7 +524,9 @@ def _build_logs_parser(subparsers) -> None:
     _add_format_flags(runs_p)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    plugin_commands: list[PluginCliCommand] | None = None,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="n-agent", description="N-Agent CLI")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -486,6 +597,11 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_view_parser = plugin_subparsers.add_parser("view", help="View a plugin")
     plugin_view_parser.add_argument("name")
     _add_format_flags(plugin_view_parser)
+    plugin_deps_parser = plugin_subparsers.add_parser(
+        "deps", help="Show plugin dependency diagnostics"
+    )
+    plugin_deps_parser.add_argument("name")
+    _add_format_flags(plugin_deps_parser)
 
     _build_provider_parser(subparsers)
     _build_knowledge_parser(subparsers)
@@ -498,12 +614,73 @@ def build_parser() -> argparse.ArgumentParser:
     _build_config_parser(subparsers)
     _build_logs_parser(subparsers)
     _build_acp_parser(subparsers)
-
+    _build_task_parser(subparsers)
     usage_parser = subparsers.add_parser("usage", help="Print token usage and context stats")
     usage_parser.add_argument("session_id", nargs="?", default=None, help="Session ID (omit to list recent sessions)")
     _add_format_flags(usage_parser)
 
+    if plugin_commands:
+        _register_plugin_commands(subparsers, plugin_commands)
+
     return parser
+
+
+def _register_plugin_commands(
+    subparsers: argparse._SubParsersAction,
+    plugin_commands: list[PluginCliCommand],
+) -> None:
+    """Register plugin CLI commands as top-level subparsers.
+
+    Conflict rules:
+    - Plugin name == builtin top-level name -> warning + skip (builtin wins).
+    - Inter-plugin or same-plugin duplicate -> stable first-wins (first in
+      list order), later -> warning + skip.
+    - setup_fn raises -> warning + skip THAT command only, continue others.
+    After any failure, builtin commands + other plugin commands still work.
+    """
+    builtin_names = set(_DISPATCH.keys())
+    seen_names: set[str] = set()
+    for cmd in plugin_commands:
+        name = cmd.name
+        if name in builtin_names:
+            logger.warning(
+                "plugin %s: CLI command %r conflicts with builtin; skipping",
+                cmd.plugin_key,
+                name,
+            )
+            continue
+        if name in seen_names:
+            logger.warning(
+                "plugin %s: CLI command %r duplicates earlier registration; skipping",
+                cmd.plugin_key,
+                name,
+            )
+            continue
+        try:
+            subparser = subparsers.add_parser(name, help=cmd.help)
+        except Exception:
+            logger.warning(
+                "plugin %s: CLI command %r add_parser failed; skipping",
+                cmd.plugin_key,
+                name,
+                exc_info=True,
+            )
+            continue
+        try:
+            cmd.setup_fn(subparser)
+        except Exception:
+            logger.warning(
+                "plugin %s: CLI command %r setup_fn failed; skipping",
+                cmd.plugin_key,
+                name,
+                exc_info=True,
+            )
+            # Remove the partially-added subparser so it is not usable.
+            subparsers.choices.pop(name, None)
+            continue
+        if cmd.handler_fn is not None:
+            subparser.set_defaults(func=cmd.handler_fn)
+        seen_names.add(name)
 
 
 _DISPATCH = {
@@ -524,13 +701,17 @@ _DISPATCH = {
     "config": config.run,
     "logs": logs.run,
     "acp": acp.run,
+    "task": task.run,
     "usage": usage.run,
 }
 
 
 def main(argv: list[str] | None = None) -> int:
     _configure_cli_env()
-    parser = build_parser()
+    from app.main import collect_plugin_cli_commands
+
+    plugin_commands = collect_plugin_cli_commands()
+    parser = build_parser(plugin_commands=plugin_commands)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -540,8 +721,86 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    handler = _DISPATCH.get(args.command)
+    # Plugin commands set args.func via set_defaults; they take priority over
+    # the builtin _DISPATCH table.
+    handler = getattr(args, "func", None)
     if handler is None:
-        parser.print_help()
+        handler = _DISPATCH.get(args.command)
+    if handler is None:
+        _print_command_help(parser, args.command)
         return 0
-    return handler(args)
+    return _invoke_handler(handler, args)
+
+
+def _invoke_handler(handler, args) -> int:
+    """Execute a CLI handler and normalise its return value.
+
+    Contract:
+    - None -> 0
+    - int -> as-is
+    - awaitable -> run to completion, then None->0 / int->as-is
+    - other types or exception -> print short error + return 1
+    """
+    try:
+        result = handler(args)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if inspect.isawaitable(result):
+        try:
+            result = _run_coroutine(result)
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if result is None:
+        return 0
+    if isinstance(result, int):
+        return result
+    print(
+        f"error: handler returned unexpected type {type(result).__name__}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _run_coroutine(coro):
+    """Run a coroutine to completion from sync context.
+
+    Uses ``asyncio.run`` when no event loop is running (the normal CLI case).
+    If a loop is already running (e.g., inside an async test), runs the
+    coroutine in a separate thread to avoid ``RuntimeError``.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    import threading
+
+    box: dict = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _print_command_help(parser: argparse.ArgumentParser, command: str) -> None:
+    """Print the help text for a specific subcommand."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            subparser = action.choices.get(command)
+            if subparser is not None:
+                subparser.print_help()
+                return
+    parser.print_help()

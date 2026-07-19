@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from app.application.skill_evolution_service import SkillEvolutionService
@@ -99,6 +99,19 @@ _END_REASON_TO_FINISH_REASON: dict[EndReason, str] = {
 }
 
 
+@runtime_checkable
+class HookDispatcherProtocol(Protocol):
+    """Duck-typed dispatcher for plugin lifecycle hooks.
+
+    PluginService implements this protocol. Kept as a Protocol to avoid
+    importing PluginService into agent_graph.py (circular import / DDD).
+    When None, all hook dispatch is skipped (backward-compatible).
+    """
+
+    async def invoke_hook(self, hook_name: str, **kwargs: Any) -> list[Any]:
+        ...
+
+
 class AgentGraphRunner:
     def __init__(
         self,
@@ -122,6 +135,7 @@ class AgentGraphRunner:
         evolution_service: SkillEvolutionService | None = None,
         nudge_interval: int = 10,
         curator_service: Any | None = None,
+        hook_dispatcher: HookDispatcherProtocol | None = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -135,6 +149,7 @@ class AgentGraphRunner:
         self.vision_capability = vision_capability
         self.usage_service = usage_service
         self.skill_service = skill_service
+        self._hook_dispatcher = hook_dispatcher
         self._information_flow_service = information_flow_service or InformationFlowService(
             InformationFlowPolicyConfig(),
             SecretCatalog(),
@@ -188,6 +203,22 @@ class AgentGraphRunner:
         self._running_tasks.pop(session_id, None)
         self._cancel_events.pop(session_id, None)
 
+    async def _dispatch_hook(self, hook_name: str, **kwargs: Any) -> list[Any]:
+        """Dispatch a lifecycle hook via the configured dispatcher.
+
+        Returns the list of non-None results from invoke_hook, or [] when
+        no dispatcher is configured (backward-compatible no-op).
+        """
+        if self._hook_dispatcher is None:
+            return []
+        try:
+            return await self._hook_dispatcher.invoke_hook(hook_name, **kwargs)
+        except Exception:
+            logger.warning(
+                "hook %s dispatch failed", hook_name, exc_info=True,
+            )
+            return []
+
     def _build_graph(self):
         graph = StateGraph(AgentState)
         graph.add_node("prepare_context", self.prepare_context)
@@ -219,6 +250,13 @@ class AgentGraphRunner:
             snapshot.budget if snapshot is not None else None,
         )
         self._run_start_times[state.run_id] = time.monotonic()
+        # T10: on_turn_start -- at run() graph entry (also covers stream_events
+        # which reuses this path, so no duplicate dispatch in stream_events).
+        await self._dispatch_hook(
+            "on_turn_start", session_id=state.session_id, metadata={},
+        )
+        finish_reason = "error"
+        error: str | None = None
         try:
             cfg: dict[str, Any] = {
                 "configurable": {"model": model, "options": state.run_options},
@@ -232,12 +270,28 @@ class AgentGraphRunner:
             # iteration_limit 也给足余量，避免 GraphRecursionError 提前打断。
             cfg["recursion_limit"] = max(iter_limit * 3, 25)
             result = await self.graph.ainvoke(state, cfg)
-            return AgentState(**result) if isinstance(result, dict) else result
+            result = AgentState(**result) if isinstance(result, dict) else result
+            finish_reason = result.finish_reason or "stop"
+            error = result.error
+            return result
         except asyncio.CancelledError:
             # Close Budget account on cancel (release unsettled reservations)
+            error = error or "cancelled"
             await self._budget_service.close(state.run_id)
             raise
+        except Exception as exc:
+            error = str(exc)
+            raise
         finally:
+            # T10: on_turn_end -- exactly once per turn (normal, provider-exception,
+            # tool-exception, cancel, iteration-limit). Observer hook; callers
+            # ignore the return value.
+            await self._dispatch_hook(
+                "on_turn_end",
+                session_id=state.session_id,
+                finish_reason=finish_reason,
+                error=error,
+            )
             self._run_start_times.pop(state.run_id, None)
 
     def _build_turn_input(self, state: AgentState) -> TurnEvaluationInput:
@@ -405,7 +459,32 @@ class AgentGraphRunner:
         yield ChatEvent(ChatEventType.DONE)
 
     async def prepare_context(self, state: AgentState) -> AgentState:
-        return await self.context_service.prepare_context(state)
+        state = await self.context_service.build_context_state(state)
+        # T10: on_pre_compress -- only when ContextEngine.should_compress is True
+        # AND actually compressing. Check the ContextPlan from build_context_state;
+        # compress_prepared_context re-evaluates the plan internally, but the
+        # build plan is the best available signal at this point.
+        if (
+            self._hook_dispatcher is not None
+            and self.context_service.context_engine is not None
+            and state.context_plan is not None
+            and state.context_plan.compression is not None
+        ):
+            non_system = [
+                m for m in state.working_messages if m.get("role") != "system"
+            ]
+            estimated_tokens = sum(
+                len(str(m.get("content", ""))) for m in non_system
+            ) // 4
+            await self._dispatch_hook(
+                "on_pre_compress",
+                session_id=state.session_id,
+                messages=non_system,
+                estimated_tokens=estimated_tokens,
+                metadata={},
+            )
+        state = await self.context_service.compress_prepared_context(state)
+        return state
 
     def _resolve_usage_meta(self, model: str) -> tuple[str, str | None, str | None, str | None]:
         """Derive (provider_kind, provider_name, real_model, requested_model) for usage recording.
@@ -529,6 +608,38 @@ class AgentGraphRunner:
             token_need=token_need,
         )
 
+    @staticmethod
+    def _extract_last_user_message(messages: list[dict[str, Any]]) -> str:
+        """Extract text content from the last user message in a message list."""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                return extract_text(msg.get("content", ""))
+        return ""
+
+    @staticmethod
+    def _inject_context_into_last_user_message(
+        messages: list[dict[str, Any]], context: str,
+    ) -> bool:
+        """Inject merged pre_llm_call context into the last user message (ephemeral).
+
+        String content -> append text with separator.
+        Multimodal list content -> append a text part.
+        Returns True if injected, False if no user message found.
+        """
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = content + "\n\n" + context
+                    return True
+                if isinstance(content, list):
+                    msg["content"] = content + [{"type": "text", "text": context}]
+                    return True
+                # Unknown content type; keep searching for a user message
+                # with string or list content.
+        return False
+
     async def call_llm(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
         if self.is_cancelled(state.session_id):
             raise asyncio.CancelledError()
@@ -631,6 +742,34 @@ class AgentGraphRunner:
                 state.pending_tool_calls = []
                 return state
 
+            # T10: pre_llm_call -- after working messages prepared (post-release,
+            # post-redaction, post-model-selection, post-budget-reserve), before
+            # provider.chat. Inject merged context into the provider CALL COPY's
+            # last user message (EPHEMERAL: not written back to AgentState,
+            # session, summary, or system prompt).
+            pre_llm_results = await self._dispatch_hook(
+                "pre_llm_call",
+                session_id=state.session_id,
+                model=selected_model,
+                user_message=self._extract_last_user_message(working_messages_for_call),
+                conversation_history=working_messages_for_call,
+                iteration_count=state.iteration_count,
+                metadata={},
+            )
+            if pre_llm_results and pre_llm_results[0]:
+                merged_context = pre_llm_results[0]
+                # Shallow-copy so injection does not mutate state.working_messages.
+                working_messages_for_call = [dict(m) for m in working_messages_for_call]
+                injected = self._inject_context_into_last_user_message(
+                    working_messages_for_call, merged_context,
+                )
+                if not injected:
+                    logger.warning(
+                        "pre_llm_call context injection skipped: "
+                        "no user message in working_messages for session=%s",
+                        state.session_id,
+                    )
+
             # 5. provider.chat (Provider Adapter = pure protocol conversion)
             try:
                 result = await self.llm_provider.chat(
@@ -681,6 +820,19 @@ class AgentGraphRunner:
             if state.pending_tool_calls:
                 state.assistant_tool_messages.append(result.message)
             state.working_messages.append(result.message)
+
+            # T10: post_llm_call -- after provider success + protocol normalization
+            # (state.final_message set, iteration_count incremented, working_messages
+            # updated). Observer hook.
+            await self._dispatch_hook(
+                "post_llm_call",
+                session_id=state.session_id,
+                model=selected_model,
+                assistant_content=extract_text(result.message.get("content", "")),
+                tool_calls=result.message.get("tool_calls") or [],
+                usage=result.usage or {},
+                iteration_count=state.iteration_count,
+            )
 
             # ----- T3: InformationFlow payload logging -----
             response_json_cache = json.dumps(result.message, default=str, ensure_ascii=False)
@@ -770,6 +922,18 @@ class AgentGraphRunner:
             tool_id = tool_call.get("id", "")
             tool_name = function.get("name", "")
 
+            # T10: pre_tool_call -- before ToolService evaluate_execution.
+            # Observer hook (no block). Fires for every tool call including
+            # invalid arguments (which skip evaluation but still produce a result).
+            await self._dispatch_hook(
+                "pre_tool_call",
+                session_id=state.session_id,
+                tool_call_id=tool_id,
+                tool_name=tool_name,
+                args=parsed_arguments,
+                metadata={},
+            )
+
             # 工具执行前 - pending 事件
             state.stream_tool_events.append(ChatEvent(
                 ChatEventType.TOOL_CALL_DELTA,
@@ -846,6 +1010,38 @@ class AgentGraphRunner:
                 "content": result.content,
                 "duration_ms": result.duration_ms,
             }
+
+            # T10: post_tool_call -- after final ToolResult (success/denied/error/
+            # timeout). Observer hook. result is a JSON-compatible snapshot;
+            # args/metadata are shallow-copied by invoke_hook. Does not expose
+            # ToolExecutor or trusted_metadata.
+            await self._dispatch_hook(
+                "post_tool_call",
+                session_id=state.session_id,
+                tool_call_id=tool_id,
+                tool_name=result.tool_name,
+                args=parsed_arguments,
+                result=result_payload,
+                duration_ms=result.duration_ms,
+                metadata={},
+            )
+
+            # T10: transform_tool_result -- after post_tool_call, before tool
+            # message encode + persist. Returns first valid value to replace
+            # content (string or JSON-compatible dict/list/scalar).
+            transform_results = await self._dispatch_hook(
+                "transform_tool_result",
+                session_id=state.session_id,
+                tool_call_id=tool_id,
+                tool_name=result.tool_name,
+                args=parsed_arguments,
+                result=result_payload,
+                duration_ms=result.duration_ms,
+                metadata={},
+            )
+            if transform_results and transform_results[0] is not None:
+                result_payload["content"] = transform_results[0]
+
             state.tool_results.append(result_payload)
             state.working_messages.append(
                 {
@@ -969,8 +1165,10 @@ class AgentGraphRunner:
         if self.is_cancelled(state.session_id):
             raise asyncio.CancelledError()
         assistant_messages = [*state.assistant_tool_messages]
-        if state.final_message:
-            assistant_messages.append(state.final_message)
+        # T10: final_message is NOT persisted here; finalize persists it after
+        # transform_llm_output. This ensures DB content matches client-visible
+        # content (both use the transformed text). Previously, final_message
+        # was appended here, which pre-empted the transform.
         for assistant_message in assistant_messages:
             content = assistant_message.get("content", "")
             tool_calls = assistant_message.get("tool_calls") or []
@@ -1015,6 +1213,16 @@ class AgentGraphRunner:
         return extract_text(final_message.get("content", ""))
 
     async def finalize(self, state: AgentState) -> AgentState:
+        # T10: pre_finalize -- at finalize node entry, before persisting final
+        # message. Observer hook.
+        await self._dispatch_hook(
+            "pre_finalize",
+            session_id=state.session_id,
+            content=extract_text(state.final_message.get("content", "")) if state.final_message else "",
+            finish_reason=state.finish_reason or "",
+            error=state.error,
+            metadata={},
+        )
         # T9: TurnPolicy confirms terminal + end_reason
         decision = self._evaluate_turn(state)
         if decision.terminal and decision.end_reason is not None:
@@ -1066,8 +1274,36 @@ class AgentGraphRunner:
             content = state.final_message.get("content", "")
             if isinstance(content, str):
                 state.final_message["content"] = scrub_memory_context(content)
+            # T10: persist deferred to after transform_llm_output below.
+
+        # T10: transform_llm_output -- after final assistant text determined,
+        # BEFORE persist + send. Returns first non-empty string to replace
+        # content. Applied to both normal and error final messages.
+        if state.final_message:
+            fm_content = state.final_message.get("content")
+            if isinstance(fm_content, str) and fm_content:
+                transform_results = await self._dispatch_hook(
+                    "transform_llm_output",
+                    session_id=state.session_id,
+                    content=fm_content,
+                    finish_reason=state.finish_reason or "",
+                    metadata={},
+                )
+                if transform_results and transform_results[0]:
+                    state.final_message["content"] = transform_results[0]
+
+        # T10: Persist final_message after transform_llm_output. Previously,
+        # the normal-path final_message was persisted in update_memory and the
+        # error-path message was persisted in the error block above. Now both
+        # are unified here so DB content matches client-visible text (both use
+        # the post-transform content).
+        if state.final_message:
+            persist_content = state.final_message.get("content", "")
+            persist_tool_calls = state.final_message.get("tool_calls") or []
+            if persist_tool_calls:
+                persist_content = {"content": persist_content, "tool_calls": persist_tool_calls}
             await self._runtime_memory.append_assistant_message(
-                state.session_id, state.final_message["content"],
+                state.session_id, persist_content,
             )
 
         # ----- 外部记忆同步 -----

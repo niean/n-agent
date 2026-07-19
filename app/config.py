@@ -99,6 +99,10 @@ class Settings(BaseSettings):
     enable_project_plugins: bool = Field(default=False)
     enable_plugin_entrypoints: bool = Field(default=False)
     plugin_tool_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    # override allowlist: 非空时仅允许名单内插件加载，精确匹配（不支持前缀/glob）
+    plugins_override_allowlist: list[str] | str = Field(default_factory=list)
+    # hook 执行超时（秒），覆盖 plugin_tool_timeout_seconds 的默认 30s 仅用于 hook 场景
+    plugin_hook_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
 
     # 外部记忆配置
     external_memory_provider: str | None = None
@@ -176,6 +180,24 @@ class Settings(BaseSettings):
     information_store_usage_payloads: bool = Field(default=True)
     information_redact_secrets: bool = Field(default=True)
 
+    # Task 子域配置 (T18 S3). N_AGENT_TASK_ 前缀.
+    # 基础时长与并发
+    task_enabled: bool = Field(default=True)
+    task_dispatch_interval_seconds: int = Field(default=30, gt=0)
+    task_lease_seconds: int = Field(default=900, gt=0)
+    task_heartbeat_timeout_seconds: int = Field(default=300, gt=0)
+    task_max_runtime_seconds: int = Field(default=3600, gt=0)
+    task_failure_limit: int = Field(default=3, ge=1)  # 映射 Task.max_retries 默认
+    task_max_concurrency: int = Field(default=4, ge=1)
+    task_shutdown_grace_seconds: int = Field(default=30, gt=0)
+    # 规划与附件上限（下游 T13/T16/T19 依赖）
+    task_planning_max_children: int = Field(default=20, ge=1)
+    task_goal_max_turns: int = Field(default=10, ge=1)
+    task_attachment_max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    task_attachment_task_max_bytes: int = Field(default=100 * 1024 * 1024, gt=0)
+    # 附件根路径（相对路径在 main.py 装配时 resolve 到 workspace_root 下）
+    task_attachments_root: Path = Field(default=Path("locals/task-attachments"))
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @field_validator("sandbox_type")
@@ -196,6 +218,32 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_task_subsystem(self) -> "Settings":
+        # lease 由 heartbeat 续租，max_runtime 可大于初始 lease，禁止加入
+        # max_runtime < lease 的错误约束。
+        if self.task_heartbeat_timeout_seconds >= self.task_lease_seconds:
+            raise ValueError(
+                "task_heartbeat_timeout_seconds must be less than "
+                "task_lease_seconds"
+            )
+        if self.task_dispatch_interval_seconds >= self.task_lease_seconds:
+            raise ValueError(
+                "task_dispatch_interval_seconds must be less than "
+                "task_lease_seconds"
+            )
+        if self.task_attachment_task_max_bytes < self.task_attachment_max_bytes:
+            raise ValueError(
+                "task_attachment_task_max_bytes must be >= "
+                "task_attachment_max_bytes"
+            )
+        # attachments_root: 拒绝 ".." 穿越；不以字符串前缀代替路径校验
+        if any(part == ".." for part in self.task_attachments_root.parts):
+            raise ValueError(
+                "task_attachments_root must not contain '..' traversal"
+            )
+        return self
+
     @field_validator(
         "sqlite_path", "workspace_root", "skills_root", "plugins_root",
         "sandbox_docker_host_workspace_root", "sandbox_docker_host_locals_root",
@@ -204,6 +252,7 @@ class Settings(BaseSettings):
         "host_terminal_policy_path", "host_terminal_token_path",
         "host_terminal_host_workspace_root",
         "host_terminal_host_skills_root",
+        "task_attachments_root",
         mode="before",
     )
     @classmethod
@@ -226,9 +275,18 @@ class Settings(BaseSettings):
             raise ValueError(f"invalid scheduler timezone: {value}") from exc
         return value
 
-    @field_validator("feishu_allowed_open_ids", "feishu_allowed_chat_ids", "sandbox_callback_tools", "plugins_enabled", "plugins_disabled", mode="before")
+    @field_validator("feishu_allowed_open_ids", "feishu_allowed_chat_ids", "sandbox_callback_tools", "plugins_enabled", "plugins_disabled", "plugins_override_allowlist", mode="before")
     @classmethod
     def parse_csv_list(cls, value: list[str] | str) -> list[str]:
         if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
-        return value
+            items = [item.strip() for item in value.split(",") if item.strip()]
+        else:
+            items = value
+        # stable dedupe: preserve first-occurrence order
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result

@@ -1174,3 +1174,97 @@ async def test_compress_session_returns_no_change_when_too_few():
     status = await runner.compress_session("s1")
     assert status["compressed"] is False
     assert status["reason"] == "no_change"
+
+
+# ---------------------------------------------------------------------------
+# T10: on_pre_compress hook dispatch integration
+# ---------------------------------------------------------------------------
+
+
+class _RecordingDispatcher:
+    """Minimal hook dispatcher for compress context tests."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    async def invoke_hook(self, hook_name: str, **kwargs):
+        self.calls.append((hook_name, dict(kwargs)))
+        return []
+
+    def calls_for(self, name: str) -> list[dict]:
+        return [kw for n, kw in self.calls if n == name]
+
+
+@pytest.mark.asyncio
+async def test_on_pre_compress_fires_in_full_graph_flow():
+    """T10: on_pre_compress fires during compression in the full graph flow."""
+    compressed_result = ContextCompressionResult(
+        messages=[{"role": "user", "content": f"{CONTEXT_SUMMARY_PREFIX}E2E summary"}],
+        summary="E2E summary",
+        compressed=True, skipped_reason=None,
+        original_tokens=1000, compressed_tokens=100,
+    )
+    fake_engine = FakeContextEngine(compressed_result)
+
+    history = [
+        ConversationMessage(role="user", content="past question"),
+    ]
+    memory_store = FakeMemoryStoreWithHistory(history=history)
+
+    dispatcher = _RecordingDispatcher()
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=FakeToolServiceForLLM(),
+        memory_store=memory_store,
+        summarizer=None,
+        context_engine=fake_engine,
+        iteration_limit=1,
+        hook_dispatcher=dispatcher,
+    )
+    state = AgentState(
+        session_id="s1",
+        input_messages=[{"role": "user", "content": "final question"}],
+        working_messages=[],
+        summary="",
+        run_options={"force_compress": True},
+    )
+    await runner.run(state, model="test-model")
+
+    compress_calls = dispatcher.calls_for("on_pre_compress")
+    assert len(compress_calls) == 1
+    assert compress_calls[0]["session_id"] == "s1"
+    assert "messages" in compress_calls[0]
+    assert "estimated_tokens" in compress_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_on_pre_compress_does_not_fire_without_dispatcher():
+    """T10: compression works unchanged when hook_dispatcher is None (regression)."""
+    compressed_result = ContextCompressionResult(
+        messages=[{"role": "user", "content": f"{CONTEXT_SUMMARY_PREFIX}summary"}],
+        summary="summary",
+        compressed=True, skipped_reason=None,
+        original_tokens=500, compressed_tokens=50,
+    )
+    fake_engine = FakeContextEngine(compressed_result)
+    memory_store = FakeMemoryStore()
+
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=None,
+        memory_store=memory_store,
+        summarizer=None,
+        context_engine=fake_engine,
+    )
+    state = AgentState(
+        session_id="s1",
+        input_messages=[],
+        working_messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "msg"},
+        ],
+        summary="",
+    )
+    new_state = await runner.context_service.compress_prepared_context(state)
+    assert fake_engine.compress_calls == 1
+    assert new_state.summary == "summary"

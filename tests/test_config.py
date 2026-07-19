@@ -331,3 +331,178 @@ def test_skill_evolution_settings_defaults(monkeypatch):
     assert s.skills_archive_not_delete is True
     assert s.skills_background_review_enabled is True
     assert s.skills_background_review_max_concurrent == 1
+
+
+def test_plugin_override_and_hook_defaults():
+    s = Settings(_env_file=None)
+    assert s.plugins_override_allowlist == []
+    assert s.plugin_hook_timeout_seconds == 5.0
+
+
+def test_plugin_override_allowlist_parses_csv(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("N_AGENT_PLUGINS_OVERRIDE_ALLOWLIST", " a, b,a,, ")
+    s = Settings(_env_file=None)
+    # trim + drop-empty + stable dedupe (preserve first-occurrence order)
+    assert s.plugins_override_allowlist == ["a", "b"]
+
+
+def test_plugin_override_allowlist_stores_exact_strings_no_glob():
+    # exact match only: '*' and 'foo/*' are stored verbatim, no prefix/glob expansion
+    s = Settings(
+        _env_file=None,
+        plugins_override_allowlist="*,foo/*,bar",
+    )
+    assert s.plugins_override_allowlist == ["*", "foo/*", "bar"]
+
+
+def test_plugin_override_allowlist_preserves_first_occurrence_order():
+    s = Settings(
+        _env_file=None,
+        plugins_override_allowlist="b,a,b,c,a",
+    )
+    assert s.plugins_override_allowlist == ["b", "a", "c"]
+
+
+@pytest.mark.parametrize("timeout_seconds", [0, -1, -0.1, 60.1, 61])
+def test_plugin_hook_timeout_seconds_rejects_invalid(timeout_seconds: float):
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            plugin_hook_timeout_seconds=timeout_seconds,
+        )
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.1, 1.0, 5.0, 30.0, 60.0])
+def test_plugin_hook_timeout_seconds_accepts_boundary(timeout_seconds: float):
+    s = Settings(_env_file=None, plugin_hook_timeout_seconds=timeout_seconds)
+    assert s.plugin_hook_timeout_seconds == timeout_seconds
+
+
+def test_plugin_hook_timeout_seconds_env_override(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("N_AGENT_PLUGIN_HOOK_TIMEOUT_SECONDS", "12.5")
+    s = Settings(_env_file=None)
+    assert s.plugin_hook_timeout_seconds == 12.5
+
+
+# ---------------------------------------------------------------------------
+# Task subsystem (T18 S1)
+# ---------------------------------------------------------------------------
+
+
+def test_settings_task_defaults(tmp_path: Path):
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+    assert s.task_enabled is True
+    assert s.task_dispatch_interval_seconds == 30
+    assert s.task_lease_seconds == 900
+    assert s.task_heartbeat_timeout_seconds == 300
+    assert s.task_max_runtime_seconds == 3600
+    assert s.task_failure_limit == 3
+    assert s.task_max_concurrency == 4
+    assert s.task_shutdown_grace_seconds == 30
+    assert s.task_planning_max_children == 20
+    assert s.task_goal_max_turns == 10
+    assert s.task_attachment_max_bytes == 20 * 1024 * 1024
+    assert s.task_attachment_task_max_bytes == 100 * 1024 * 1024
+    # attachments_root default
+    assert s.task_attachments_root == Path("locals/task-attachments")
+
+
+def test_settings_task_max_runtime_can_exceed_lease(tmp_path: Path):
+    """lease 由 heartbeat 续租，max_runtime 可大于初始 lease，禁止加入 max_runtime < lease 的错误约束。"""
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        task_max_runtime_seconds=3600,
+        task_lease_seconds=900,
+        task_heartbeat_timeout_seconds=300,
+        task_dispatch_interval_seconds=30,
+    )
+    assert s.task_max_runtime_seconds > s.task_lease_seconds
+
+
+def test_settings_task_cross_field_heartbeat_lt_lease(tmp_path: Path):
+    # heartbeat_timeout_seconds < lease_seconds 必须满足
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            task_heartbeat_timeout_seconds=1000,
+            task_lease_seconds=900,
+        )
+
+
+def test_settings_task_cross_field_dispatch_lt_lease(tmp_path: Path):
+    # dispatch_interval_seconds < lease_seconds 必须满足
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            task_dispatch_interval_seconds=1000,
+            task_lease_seconds=900,
+        )
+
+
+def test_settings_task_attachment_total_ge_single(tmp_path: Path):
+    # attachment_task_max_bytes >= attachment_max_bytes
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            task_attachment_max_bytes=100,
+            task_attachment_task_max_bytes=50,
+        )
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"task_lease_seconds": 0},
+    {"task_heartbeat_timeout_seconds": 0},
+    {"task_dispatch_interval_seconds": 0},
+    {"task_max_runtime_seconds": 0},
+    {"task_failure_limit": 0},
+    {"task_max_concurrency": 0},
+    {"task_planning_max_children": 0},
+    {"task_goal_max_turns": 0},
+    {"task_attachment_max_bytes": 0},
+    {"task_shutdown_grace_seconds": 0},
+])
+def test_settings_task_validates_positive_bounds(tmp_path: Path, kwargs: dict):
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            **kwargs,
+        )
+
+
+def test_settings_task_env_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("N_AGENT_TASK_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_TASK_DISPATCH_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("N_AGENT_TASK_MAX_CONCURRENCY", "2")
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+    assert s.task_enabled is False
+    assert s.task_dispatch_interval_seconds == 5
+    assert s.task_max_concurrency == 2
+
+
+def test_settings_task_attachments_root_rejects_parent_traversal(tmp_path: Path):
+    # 附件根路径不得包含 ".." 穿越
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            task_attachments_root="../../etc",
+        )

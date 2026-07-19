@@ -8,6 +8,7 @@
     'observations-modules': false,
     'observations-sessions': false,
     'scheduled-tasks': false,
+    tasks: false,
     platforms: false,
     memory: false,
     sandbox: false,
@@ -21,6 +22,7 @@
 
   function resolveModule(tab) {
     if (namespace[tab]) return namespace[tab];
+    if (tab === 'tasks') return namespace.tasks;
     if (tab === 'tools-builtin' || tab === 'tools-mcp') return namespace.tools;
     if (tab === 'tools-skill') return namespace.skills;
     if (tab === 'tools-knowledge') return namespace.knowledge;

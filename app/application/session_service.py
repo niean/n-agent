@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from app.domain.memory import MemoryStore
 from app.domain.session import (
@@ -28,6 +28,18 @@ logger = logging.getLogger(__name__)
 SessionDeletedHandler = Callable[[str], Any]
 
 
+@runtime_checkable
+class HookDispatcherProtocol(Protocol):
+    """Duck-typed dispatcher for plugin lifecycle hooks.
+
+    PluginService implements this protocol. Kept as a Protocol to avoid
+    importing PluginService into the Application layer (circular import / DDD).
+    """
+
+    async def invoke_hook(self, hook_name: str, **kwargs: Any) -> list[Any]:
+        ...
+
+
 class SessionService:
     def __init__(
         self,
@@ -36,10 +48,12 @@ class SessionService:
         on_session_deleted: SessionDeletedHandler | None = None,
         on_session_deleted_handlers: list[SessionDeletedHandler] | None = None,
         external_memory_manager: "ExternalMemoryManager | None" = None,
+        hook_dispatcher: HookDispatcherProtocol | None = None,
     ):
         self.memory_store = memory_store
         self.title_generator = title_generator
         self.external_memory_manager = external_memory_manager
+        self._hook_dispatcher = hook_dispatcher
         self._on_session_deleted_handlers: list[SessionDeletedHandler] = list(
             on_session_deleted_handlers or []
         )
@@ -80,6 +94,21 @@ class SessionService:
                     session_id,
                     exc,
                 )
+        # T10: on_session_start -- only for new sessions, after persist success.
+        # source uses the created session's source.
+        if is_new and self._hook_dispatcher is not None:
+            try:
+                await self._hook_dispatcher.invoke_hook(
+                    "on_session_start",
+                    session_id=session_id,
+                    source=created.source,
+                )
+            except Exception:
+                logger.warning(
+                    "on_session_start hook failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
         return created
 
     async def list_sessions(self) -> list[ConversationSession]:
@@ -114,6 +143,8 @@ class SessionService:
         existing = await self.memory_store.get_session(session_id)
         if existing is None:
             raise SessionNotFoundError(session_id)
+        # T10: save existing.source before delete for on_session_end dispatch.
+        existing_source = existing.source
         if self.external_memory_manager is not None:
             try:
                 self.external_memory_manager.on_session_end(session_id)
@@ -126,6 +157,20 @@ class SessionService:
         deleted = await self.memory_store.delete_session(session_id)
         if not deleted:
             raise SessionNotFoundError(session_id)
+        # T10: on_session_end -- after persist-delete success, using pre-delete source.
+        if self._hook_dispatcher is not None:
+            try:
+                await self._hook_dispatcher.invoke_hook(
+                    "on_session_end",
+                    session_id=session_id,
+                    source=existing_source,
+                )
+            except Exception:
+                logger.warning(
+                    "on_session_end hook failed for %s",
+                    session_id,
+                    exc_info=True,
+                )
         await self._invoke_session_deleted_handlers(session_id)
 
     async def _invoke_session_deleted_handlers(self, session_id: str) -> None:

@@ -1,7 +1,8 @@
 <!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
-本文介绍自研通用Agent [N-Agent](https://github.com/niean/n-agent)，一款类似Hermes的Agent Runtime。
+本文介绍自研通用Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 以 LangGraph 编排 Agent TurnLoop，用领域驱动设计（DDD）隔离业务核心与外部实现，支撑持续演进。
+
 核心流程：接收对话请求，加载会话上下文，循环"调用模型→按需执行工具"直至产出最终回答，更新会话与外部记忆，返回同步或流式结果。
 
 
@@ -461,6 +462,18 @@ N-Agent 用户入口类型，有如下几类：
 ---
 ---
 以下是一些概念澄清、技术要点。
+
+## 产品形态
+
+对话=交互问答；定时任务=Cron触发投递；任务=目标驱动异步后台执行，Kanban状态机 + 意图分解 + 多次AgentRun + 汇总 + Artifact。
+
+```text
+①ChatCompletion：
+用户提问 → AgentRun → 回复消息
+
+②Task：
+用户交代目标 → 意图分解 → 多次 AgentRun → 汇总 → Artifact
+```
 
 ## 工具概念
 - Skill：结构化Prompt，指导LLM怎么想、怎么说，进而完成功能。Skill定义**业务逻辑**，主决策而非执行，这是和其它工具的区别

@@ -421,12 +421,27 @@
         - Skill：Skill定义，严格遵循Anthropic规范，此外要求英文命名+中文alias
 
 [20260717]
+- NFR
+    - 需求：调研Manus(https://manus.im/)产品功能，对比N-Agent、产出可能的产品/功能扩展事项。结果放到 .harness/specs/active/ 目录下
 - FR
     - 工具：Skill自进化，补全Curator周期维护
         - 要求：参照HermesAgent实现/Users/niean/code/github.com/niean/hermes-agent
     - 会话：新增curator类型，用于Skill周期维护curator-xxx
     - 对话：Chat框，鼠标Hover展示消息时间，样式、格式参考飞书消息
     - 对话：Chat框，飞书IM裂图，图片先显示后变裂图
+    - 插件：对标Hermes，缺少lifecycle hooks、CLI subcommand、plugin override builtin、plugin依赖声明，待完善pip entry points，请补全实现
+        - 要求：参照HermesAgent实现/Users/niean/code/github.com/niean/hermes-agent
+
+[20260718]
+- FR
+    - 任务：[KF]实现任务入口（跟对话、定时任务同等地位），类似Hermes Kanban、Manus Task，要求复用 AgentRunner。如需，咱们要重新定义`任务`概念
+        - 要求：参照HermesAgent实现/Users/niean/code/github.com/niean/hermes-agent
+        - 裁剪：tenant 隔离、多 board UI、worktree workspace、独立 daemon、subprocess worker（用进程内 async 对齐 ScheduledAgentExecutor）
+
+[20260719]
+- FR
+    - 任务：实现任务入口，验收和迭代
+
 
 ---
 
@@ -437,14 +452,12 @@
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
 - FR
-    - 架构：MoA，对标Hermes
-    - 插件：lifecycle hooks、CLI subcommand、pip entry points、plugin override builtin，plugin依赖声明
-    - 租户：引入租户概念，如团队、项目、个人，租户间特定资源隔离
-    - 管理：秘钥Store(类似平台)
-    - 需求：调研Manus(https://manus.im/)产品功能，对比N-Agent、产出可能的产品/功能扩展事项。结果放到 .harness/specs/active/ 目录下
+    - 执行器：新增一级菜单`执行器`，`沙盒`改为其二级菜单，同时新增二级菜单`本机`、用于纳管host_terminal类型的执行器
+    - 产品：对标Hermes，MoA、*Kanban*(类Manus Task)
+    - 产品：对标Manus，*Project*、Task/Artifact、租户隔离
+    - 管理：接入配置，秘钥Store(类似平台)
 
 ---
 
 [待验证]
 - 工具：MCP支持stdio类型
-- 对话：Chat查看飞书IM对话，图片先显示后变裂图

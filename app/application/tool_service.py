@@ -82,6 +82,7 @@ class ToolService:
         self.executor = executor
         self.definitions = {definition.name: definition for definition in definitions}
         self.dynamic_definitions: dict[str, dict[str, ToolDefinition]] = {}
+        self._suppressed_static_names: dict[str, set[str]] = {}
         self._evaluated_executions: WeakKeyDictionary[
             _EvaluationToken,
             _EvaluatedExecution,
@@ -90,31 +91,90 @@ class ToolService:
         self._information_flow_service = information_flow_service
         self._audit_service = audit_service
 
-    def set_dynamic_definitions(self, source_key: str, definitions: list[ToolDefinition]) -> None:
+    def replace_dynamic_definitions(
+        self,
+        source_key: str,
+        definitions: list[ToolDefinition],
+        override_static_names: set[str] | None = None,
+    ) -> None:
+        """Atomically replace the dynamic definitions for ``source_key``.
+
+        Validates the entire candidate batch (schema, dedup, policy, and that
+        every name in ``override_static_names`` has a same-name candidate) BEFORE
+        mutating any state. On failure, the old dynamic definitions and old
+        suppression set for this source are preserved (no partial mutation).
+
+        ``override_static_names`` declares static (builtin) tool names that the
+        dynamic definitions should OVERRIDE -- the static definition stays in
+        ``self.definitions`` but is suppressed from all query surfaces whenever
+        a dynamic override exists. Empty ``definitions`` + empty
+        ``override_static_names`` restores the builtin (suppression cleared).
+        """
+        override_names: set[str] = set(override_static_names) if override_static_names else set()
+
+        # --- Phase 1: schema filter (no mutation) ---
         schema_valid: list[ToolDefinition] = []
         for definition in definitions:
             if not isinstance(definition.input_schema, dict) or definition.input_schema.get("type") != "object":
                 continue
             schema_valid.append(definition)
 
+        # --- Phase 2: dedup by name, keep first occurrence (no mutation) ---
         deduplicated: dict[str, ToolDefinition] = {}
         for definition in schema_valid:
             if definition.name not in deduplicated:
                 deduplicated[definition.name] = definition
 
+        # --- Phase 3: policy validation for ALL candidates (no mutation) ---
         for definition in deduplicated.values():
             self.policy.validate_definition(definition)
 
+        # --- Phase 4: override_static_names must all have same-name candidate ---
+        candidate_names = set(deduplicated)
+        missing_candidates = override_names - candidate_names
+        if missing_candidates:
+            raise ValueError(
+                f"override_static_names missing candidate definitions: {sorted(missing_candidates)}"
+            )
+
+        # --- Phase 5: partition -- drop dynamic defs shadowing statics without override ---
         static_names = set(self.definitions)
-        dynamic = {
-            name: definition
-            for name, definition in deduplicated.items()
-            if name not in static_names
-        }
-        self.dynamic_definitions[source_key] = dynamic
+        kept_dynamic: dict[str, ToolDefinition] = {}
+        suppressed: set[str] = set()
+        for name, definition in deduplicated.items():
+            if name in static_names:
+                if name in override_names:
+                    kept_dynamic[name] = definition
+                    suppressed.add(name)
+                # else: drop -- backward compat, static wins
+            else:
+                kept_dynamic[name] = definition
+
+        # --- Phase 6: atomic commit ---
+        self.dynamic_definitions[source_key] = kept_dynamic
+        self._suppressed_static_names[source_key] = suppressed
+
+    def set_dynamic_definitions(self, source_key: str, definitions: list[ToolDefinition]) -> None:
+        """Backward-compatible alias for ``replace_dynamic_definitions`` with
+        empty suppression (``override_static_names=None``)."""
+        self.replace_dynamic_definitions(source_key, definitions, override_static_names=None)
+
+    def _is_suppressed_static(self, name: str) -> bool:
+        """Return True if ``name`` is suppressed by any source's override."""
+        for names in self._suppressed_static_names.values():
+            if name in names:
+                return True
+        return False
 
     def list_definitions(self) -> list[ToolDefinition]:
-        definitions = list(self.definitions.values())
+        suppressed: set[str] = set()
+        for names in self._suppressed_static_names.values():
+            suppressed |= names
+        definitions = [
+            definition
+            for name, definition in self.definitions.items()
+            if name not in suppressed
+        ]
         for dynamic in self.dynamic_definitions.values():
             definitions.extend(dynamic.values())
         return definitions
@@ -141,7 +201,9 @@ class ToolService:
         return result
 
     def get_definition(self, name: str) -> ToolDefinition | None:
-        if name in self.definitions:
+        # If name is suppressed by any source's override, skip static and
+        # resolve to the dynamic (plugin) definition only.
+        if not self._is_suppressed_static(name) and name in self.definitions:
             return self.definitions[name]
         for dynamic in self.dynamic_definitions.values():
             if name in dynamic:

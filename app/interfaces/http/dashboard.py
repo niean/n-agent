@@ -110,6 +110,8 @@ def create_dashboard_router(
     skill_pending_store=None,
     skill_usage_store=None,
     image_store=None,
+    task_service=None,
+    task_run_service=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -133,6 +135,8 @@ def create_dashboard_router(
     @router.get("/models", response_class=HTMLResponse)
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
     @router.get("/scheduled-tasks/{task_id}", response_class=HTMLResponse)
+    @router.get("/tasks", response_class=HTMLResponse)
+    @router.get("/tasks/{task_id}", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
     @router.get("/security", response_class=HTMLResponse)
     async def shell():
@@ -300,6 +304,9 @@ def create_dashboard_router(
     if plugin_service is not None:
         from app.interfaces.http.plugin_routes import register_plugin_routes
         register_plugin_routes(router, plugin_service)
+    if task_service is not None:
+        from app.interfaces.http.task_routes import register_task_routes
+        register_task_routes(router, task_service, task_run_service)
     if knowledge_service is not None:
         _register_knowledge_routes(router, knowledge_service, tool_service)
 

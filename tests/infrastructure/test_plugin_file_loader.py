@@ -220,7 +220,7 @@ async def test_unsupported_api_does_not_break_scan(tmp_path):
     )
     (plugin_dir / "__init__.py").write_text(
         "def register(ctx):\n"
-        "    ctx.register_hook('pre_tool_call', lambda: None)\n"
+        "    ctx.register_command('cmd', lambda: None)\n"
         "    ctx.register_tool(name='hooky_tool', toolset='hooky', schema={'name':'hooky_tool','parameters':{'type':'object'}}, handler=lambda a, **k: {'ok': True})\n",
         encoding="utf-8",
     )
@@ -233,7 +233,7 @@ async def test_unsupported_api_does_not_break_scan(tmp_path):
     )
     assert "hooky" in result.registrations
     assert "hooky" in result.unsupported
-    assert "hook" in result.unsupported["hooky"]
+    assert "command" in result.unsupported["hooky"]
 
 
 @pytest.mark.asyncio

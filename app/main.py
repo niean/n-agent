@@ -8,7 +8,7 @@ import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -44,7 +44,14 @@ from app.application.session_service import SessionService
 from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.skill_service import SkillManageToolExecutor, SkillService, SkillToolExecutor, skill_tool_definitions
 from app.application.skill_evolution_service import SkillEvolutionService
-from app.application.plugin_service import PluginService, PluginToolExecutor
+from app.application.plugin_service import PluginCliCommand, PluginService, PluginToolExecutor
+from app.application.prompt_builder import build_system_prompt
+from app.application.task_agent_executor import TaskAgentExecutor
+from app.application.task_planning_service import TaskPlanningService
+from app.application.task_run_service import TaskRunService
+from app.application.task_runner import TaskRunner
+from app.application.task_service import TaskService
+from app.application.task_tools import task_tool_definitions
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
 from app.application.usage_service import UsageService
 from app.application.vision_tool_executor import VisionAnalyzeToolExecutor
@@ -88,12 +95,16 @@ from app.infrastructure.skill.skill_backup_store import SkillBackupStore
 from app.infrastructure.skill.curator_state_store import SqliteCuratorStateStore
 from app.domain.curator_policy import CuratorPolicy
 from app.application.skill_curator_service import SkillCuratorService
+from app.domain.task_policy import TaskPolicy
 from app.infrastructure.plugin.file_loader import PluginFileLoader, PluginFileLoaderConfig
 from app.infrastructure.plugin.seed_runner import seed_default_plugins
 from app.infrastructure.registry.sqlite_plugin_registry import SQLitePluginRegistry
+from app.infrastructure.registry.sqlite_task_registry import SQLiteTaskRegistry
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
+from app.infrastructure.tools.task_management import TaskManagementToolExecutor
+from app.infrastructure.task.outbound import TaskOutboundDelivery
 from app.infrastructure.usage.context_breakdown_calculator import ContextBreakdownCalculatorImpl
 from app.infrastructure.usage.pricing_table import InMemoryPricingProvider
 from app.infrastructure.usage.sqlite_usage_recorder import SqliteUsageRecorder
@@ -294,6 +305,12 @@ class ApplicationServices:
     usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
     sandbox_manager: "_SandboxManager | None" = None
+    # Task 子域服务 (T18). schema 迁移失败时 task_registry 为 None，其余服务
+    # 也为 None；lifespan 不启动 dispatcher，health 报不健康。
+    task_service: TaskService | None = None
+    task_run_service: TaskRunService | None = None
+    task_runner: TaskRunner | None = None
+    task_planning_service: TaskPlanningService | None = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -384,6 +401,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         + [knowledge_definition]
         + mcp_management_tool_definitions()
         + schedule_tool_definitions()
+        + task_tool_definitions()
     )
     # Policy audit sink + service (T12 S4: wired into all Policy-bearing services)
     audit_sink = LoggingPolicyAuditSink()
@@ -782,11 +800,13 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         llm_policy=llm_policy,
         llm_config=llm_config,
         nudge_interval=settings.skills_creation_nudge_interval,
+        hook_dispatcher=plugin_service,
     )
     session_service = SessionService(
         memory_store,
         title_generator=LLMTitleGenerator(holder, lambda: holder.current_model),
         external_memory_manager=external_memory_manager,
+        hook_dispatcher=plugin_service,
     )
     chat_service = ChatCompletionService(
         memory_store,
@@ -874,6 +894,93 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     routes["manage_schedule"] = schedule_management_executor
     routes["schedule_query"] = schedule_management_executor
     tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
+
+    # Task subsystem wiring (T18). Built after schedule wiring because it
+    # reuses chat_service + feishu_client + memory_store + tool_service.
+    # Schema/migration failure is fail-soft: task_registry stays None, all
+    # task services stay None, lifespan skips dispatcher start, and
+    # health_snapshot reports the error (spec: 迁移失败写 health unhealthy
+    # 且 dispatcher 不启动).
+    task_schema_error: str = ""
+    task_registry: SQLiteTaskRegistry | None = None
+    try:
+        task_registry = SQLiteTaskRegistry(str(settings.sqlite_path))
+    except Exception as exc:
+        task_schema_error = str(exc)
+        logger.warning("task schema init failed: %s", exc)
+
+    task_policy = TaskPolicy()
+    # TaskRunner is always constructed (it is the dispatcher); lifespan will
+    # only start it when task_enabled AND task_run_service is bound.
+    task_runner = TaskRunner(
+        interval_seconds=settings.task_dispatch_interval_seconds,
+        shutdown_grace_seconds=settings.task_shutdown_grace_seconds,
+    )
+    task_agent_executor: TaskAgentExecutor | None = None
+    task_outbound_delivery: TaskOutboundDelivery | None = None
+    task_run_service: TaskRunService | None = None
+    task_planning_service: TaskPlanningService | None = None
+    task_service: TaskService | None = None
+    if task_registry is not None:
+        # Resolve attachments_root to an absolute path under workspace_root
+        # (spec: attachments_root 解析到允许的本地持久化根; 不以字符串前缀
+        # 代替 Path.resolve()/is_relative_to()).
+        attachments_root = settings.task_attachments_root
+        if not attachments_root.is_absolute():
+            attachments_root = settings.workspace_root / attachments_root
+        attachments_root = attachments_root.resolve()
+        attachments_root.mkdir(parents=True, exist_ok=True)
+
+        task_agent_executor = TaskAgentExecutor(
+            chat_service=chat_service,
+            task_registry=task_registry,
+            prompt_builder=build_system_prompt,
+            max_runtime_seconds=settings.task_max_runtime_seconds,
+            goal_max_turns=settings.task_goal_max_turns,
+        )
+        task_outbound_delivery = TaskOutboundDelivery(feishu_client, task_registry)
+        task_run_service = TaskRunService(
+            registry=task_registry,
+            dispatcher=task_runner,
+            executor=task_agent_executor,
+            policy=task_policy,
+            notifier=task_outbound_delivery,
+            lease_seconds=settings.task_lease_seconds,
+            heartbeat_timeout_seconds=settings.task_heartbeat_timeout_seconds,
+            max_runtime_seconds=settings.task_max_runtime_seconds,
+            max_concurrency=settings.task_max_concurrency,
+        )
+        # Late-bind to resolve circular dep:
+        #   TaskRunService needs dispatcher=TaskRunner,
+        #   TaskRunner.spawn needs run_service to call run_claim.
+        task_runner.set_run_service(task_run_service)
+        task_planning_service = TaskPlanningService(
+            chat_service=chat_service,
+            registry=task_registry,
+            policy=task_policy,
+            planning_max_children=settings.task_planning_max_children,
+            max_goal_max_turns=settings.task_goal_max_turns,
+        )
+        task_service = TaskService(
+            registry=task_registry,
+            policy=task_policy,
+            planning_service=task_planning_service,
+            memory_store=memory_store,
+            attachments_root=attachments_root,
+            attachment_max_bytes=settings.task_attachment_max_bytes,
+            attachment_task_max_bytes=settings.task_attachment_task_max_bytes,
+        )
+        # TaskService.dispatch_tick delegates to TaskRunService (late-bind).
+        task_service.set_run_service(task_run_service)
+        # Wire TaskManagementToolExecutor into CompositeToolExecutor routes.
+        # Single authoritative source for task tool execution (no duplicate
+        # dynamic registration; spec: 启动时发现重名即失败).
+        task_management_executor = TaskManagementToolExecutor(task_service)
+        for definition in task_tool_definitions():
+            routes[definition.name] = task_management_executor
+        tool_service.executor = CompositeToolExecutor(
+            routes, fallback=McpToolExecutor(mcp_service)
+        )
 
     # Sandbox assembly (T24)
     sandbox_callback_registry = InMemorySandboxCallbackToolRegistry()
@@ -1144,6 +1251,20 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 ),
                 "enabled": host_terminal_executor is not None,
             },
+            "task": {
+                "status": (
+                    "disabled"
+                    if not settings.task_enabled
+                    else "error"
+                    if task_schema_error
+                    else "ok"
+                    if task_run_service is not None
+                    else "error"
+                ),
+                "enabled": settings.task_enabled,
+                "schema_error": task_schema_error,
+                "runner_wired": task_run_service is not None,
+            },
         }
 
     gateway_service = GatewayService(
@@ -1221,7 +1342,79 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
         sandbox_manager=sandbox_manager if settings.sandbox_enabled else None,
+        task_service=task_service,
+        task_run_service=task_run_service,
+        task_runner=task_runner,
+        task_planning_service=task_planning_service,
     )
+
+
+class _NoOpToolService:
+    """Minimal no-op tool service for lightweight CLI command discovery.
+
+    Provides just the interface ``PluginService.scan()`` needs (``definitions``
+    + ``replace_dynamic_definitions``) without publishing tools to any live
+    tool surface. Used by ``collect_plugin_cli_commands`` so plugin CLI
+    command discovery does NOT construct the full ``ToolService`` or publish
+    tools/hooks/routes.
+    """
+
+    def __init__(self) -> None:
+        self.definitions: dict[str, Any] = {}
+
+    def replace_dynamic_definitions(
+        self,
+        source_key: str,
+        definitions: list[Any],
+        override_static_names: set[str] | None = None,
+    ) -> None:
+        pass
+
+    def list_definitions(self) -> list[Any]:
+        return list(self.definitions.values())
+
+
+def collect_plugin_cli_commands() -> list[PluginCliCommand]:
+    """Lightweight composition helper for plugin CLI command discovery.
+
+    Constructs ONLY the minimal objects needed to collect plugin CLI commands:
+    ``Settings``, ``SQLitePluginRegistry``, ``PluginFileLoader``, and a
+    ``PluginService`` wired with a no-op ``tool_service`` + no-op
+    ``route_refresher``. Calls ``plugin_service.scan()`` to populate
+    ``_cli_commands`` (this runs enabled plugins' ``register(ctx)`` to collect
+    ``cli_command_registrations``; candidate Contexts are discarded after
+    scan).
+
+    MUST NOT call ``build_application_services()``; MUST NOT construct
+    Provider/MCP/Feishu/Scheduler/AgentGraphRunner; MUST NOT publish
+    tools/hooks/routes to any live ``tool_service``.
+
+    On any global failure (exception): log warning, return empty list (so the
+    CLI never crashes due to plugin discovery).
+    """
+    try:
+        settings = Settings()
+        plugin_registry = SQLitePluginRegistry(settings.sqlite_path)
+        plugin_loader = PluginFileLoader(PluginFileLoaderConfig(
+            bundled_root=Path(__file__).resolve().parent / "infrastructure" / "plugin" / "seeds",
+            user_root=settings.plugins_root,
+            project_root=settings.workspace_root / ".hermes" / "plugins",
+            enable_entrypoints=settings.enable_plugin_entrypoints,
+            enable_project=settings.enable_project_plugins,
+            safe_mode=settings.plugins_safe_mode,
+        ))
+        plugin_service = PluginService(
+            registry=plugin_registry,
+            loader=plugin_loader,
+            tool_service=_NoOpToolService(),
+            route_refresher=lambda names: None,
+            settings=settings,
+        )
+        _run_sync(plugin_service.scan())
+        return plugin_service.list_cli_commands()
+    except Exception:
+        logger.warning("plugin CLI command discovery failed", exc_info=True)
+        return []
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -1248,6 +1441,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.exception("plugin lifespan scan failed; dashboard refresh available as fallback")
         if services.settings.scheduler_enabled:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
+        # Task dispatcher (T18). Only start when task_enabled AND schema
+        # migration succeeded (task_run_service is bound). Migration failure
+        # -> health unhealthy and dispatcher not started (spec).
+        if (
+            services.settings.task_enabled
+            and services.task_run_service is not None
+            and services.task_runner is not None
+        ):
+            try:
+                await services.task_runner.start()
+            except Exception:
+                logger.exception("TaskRunner start failed")
         if services.feishu_im_adapter is not None:
             feishu_task = asyncio.create_task(services.feishu_im_adapter.start())
         if services.sandbox_manager is not None:
@@ -1266,6 +1471,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await scheduler_task
                 except asyncio.CancelledError:
                     pass
+            if (
+                services.task_runner is not None
+                and services.task_runner._started
+            ):
+                try:
+                    await services.task_runner.stop()
+                except Exception:
+                    logger.exception("TaskRunner stop failed")
             if feishu_task is not None:
                 feishu_task.cancel()
                 try:
@@ -1309,6 +1522,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             skill_pending_store=services.skill_pending_store,
             skill_usage_store=services.skill_usage_store,
             image_store=services.image_store,
+            task_service=services.task_service,
+            task_run_service=services.task_run_service,
         )
     )
     return app

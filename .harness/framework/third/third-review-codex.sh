@@ -32,11 +32,17 @@ find_codex_bin() {
     return 0
   fi
 
+  # The IDE extension is now published as openai.chatgpt, while its bundled
+  # command-line executable is still named codex. Keep the legacy extension
+  # identifier as a fallback for older installations.
   candidate="$(find \
     "$HOME/.vscode/extensions" \
     "$HOME/.cursor/extensions" \
     "$HOME/.windsurf/extensions" \
-    -path '*openai.chatgpt*/bin/*/codex' \
+    \( \
+      -path '*openai.chatgpt*/bin/*/codex' -o \
+      -path '*openai.codex*/bin/*/codex' \
+    \) \
     -type f 2>/dev/null | sort -r | while IFS= read -r found_codex; do
       if [ -x "$found_codex" ]; then
         printf '%s\n' "$found_codex"

@@ -5,7 +5,8 @@
 
   const ENTRIES = [
     { tab: 'chat', label: '对话', desc: '发起新一轮对话或恢复会话' },
-    { tab: 'scheduled-tasks', label: '任务', desc: '管理定时任务与查看最近执行结果' },
+    { tab: 'tasks', label: '任务', desc: '提交目标驱动异步任务，看板跟踪进度与产物' },
+    { tab: 'scheduled-tasks', label: '定时任务', desc: '管理定时任务与查看最近执行结果' },
     { tab: 'sessions', label: '会话', desc: '查看历史会话与详细消息' },
     { tab: 'memory', label: '记忆', desc: '管理项目记忆，配置全局默认启用' },
     { tab: 'tools-knowledge', label: '知识', desc: '知识管理' },
@@ -29,7 +30,8 @@
       { label: 'Memory', value: (dependencies.memory || {}).status || 'unknown' },
       { label: 'Knowledge', value: (dependencies.knowledge || {}).status || 'unknown' },
       { label: 'Sandbox', value: (dependencies.sandbox || {}).status || 'unknown' },
-      { label: '任务数', value: counts.scheduledTasks },
+      { label: '任务数', value: counts.tasks != null ? counts.tasks : 0 },
+      { label: '定时任务数', value: counts.scheduledTasks },
       { label: '会话数', value: counts.sessions },
       { label: '工具数', value: counts.tools },
       { label: '模型数', value: counts.models },

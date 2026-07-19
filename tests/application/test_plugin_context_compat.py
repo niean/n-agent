@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import asyncio
 
-from app.application.plugin_service import PluginContext, PluginToolRegistration
+from app.application.plugin_service import (
+    HookRegistration,
+    PluginCliCommand,
+    PluginContext,
+    PluginToolRegistration,
+)
 
 
 def test_register_tool_signature_matches_hermes():
@@ -69,17 +74,26 @@ def test_register_tool_propagates_plugin_config_and_secret():
 
 def test_unsupported_api_does_not_raise():
     ctx = PluginContext(plugin_key="hello", plugin_config={})
+    # T2: register_hook and register_cli_command are now real, not unsupported
     ctx.register_hook("pre_tool_call", lambda: None)
-    ctx.register_cli_command("hello", lambda: None)
+    ctx.register_cli_command("hello", "greet user", lambda parser: None)
+    # these remain unsupported stubs
+    ctx.register_command("cmd", lambda: None)
     ctx.register_platform("discord", lambda: None)
     ctx.register_web_search_provider(lambda: None)
     ctx.register_image_gen_provider(lambda: None)
     ctx.register_skill("s", lambda: None)
-    assert "hook" in ctx.unsupported_capabilities
-    assert "cli_command" in ctx.unsupported_capabilities
+    assert "hook" not in ctx.unsupported_capabilities
+    assert "cli_command" not in ctx.unsupported_capabilities
+    assert "command" in ctx.unsupported_capabilities
     assert "platform" in ctx.unsupported_capabilities
     assert "web_search_provider" in ctx.unsupported_capabilities
     assert len(ctx.warnings) == len(ctx.unsupported_capabilities)
+    # real registrations are stored, not unsupported
+    assert len(ctx.hook_registrations) == 1
+    assert isinstance(ctx.hook_registrations[0], HookRegistration)
+    assert len(ctx.cli_command_registrations) == 1
+    assert isinstance(ctx.cli_command_registrations[0], PluginCliCommand)
 
 
 def test_dispatch_tool_returns_error():

@@ -3,7 +3,8 @@
   const tabConfig = [
     { tab: 'summary', path: '/summary', label: '概览' },
     { tab: 'chat', path: '/chat', label: '对话' },
-    { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '任务' },
+    { tab: 'tasks', path: '/tasks', label: '任务' },
+    { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '定时任务' },
     { tab: 'sessions', path: '/sessions', label: '会话' },
     { tab: 'memory', path: '/memory', label: '记忆' },
     { tab: 'tools', label: '工具', parent: true, children: ['tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin'] },
@@ -41,6 +42,7 @@
     const path = window.location.pathname;
     if (tabByPath[path]) return tabByPath[path];
     if (path.startsWith('/scheduled-tasks/')) return 'scheduled-tasks';
+    if (path.startsWith('/tasks/')) return 'tasks';
     if (path.startsWith('/observations/sessions/')) return 'observations-sessions';
     if (path === '/tools/external-memory') return 'memory';
     if (path === '/tools/sandbox') return 'sandbox';
