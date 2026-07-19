@@ -15,6 +15,7 @@
     { tab: 'tools-plugin', label: 'Plugin', desc: 'Plugin 子系统（待实现）' },
     { tab: 'tools-builtin', label: 'Builtin', desc: '查看已注册的工具与风险等级' },
     { tab: 'sandbox', label: '沙盒', desc: '查看沙盒配置、活跃实例与执行历史' },
+    { tab: 'executors-host', label: '本机', desc: '查看本机执行器状态、授权策略与执行历史' },
     { tab: 'models', label: '模型', desc: '查看对外暴露的统一模型' },
     { tab: 'platforms', label: '平台', desc: '查看接入平台与平台会话' },
     { tab: 'observations-sessions', label: '会话观测', desc: '查看会话 Token 用量与 API 调用历史' },

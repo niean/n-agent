@@ -133,6 +133,7 @@ from app.infrastructure.sandbox.released_registry import SQLiteReleasedSandboxRe
 from app.infrastructure.sandbox.registry import InMemorySandboxCallbackToolRegistry
 from app.infrastructure.sandbox.search_provider import DuckDuckGoHtmlSearchProvider
 from app.infrastructure.policy.logging_sink import LoggingPolicyAuditSink
+from app.application.host_terminal_dashboard_service import HostTerminalDashboardService
 from app.application.sandbox_dashboard_service import SandboxDashboardService
 from app.application.sandbox_tool_executor import SandboxToolExecutor
 from app.application.terminal_tool_executor import TerminalToolExecutor
@@ -304,6 +305,7 @@ class ApplicationServices:
     usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
     sandbox_manager: "_SandboxManager | None" = None
+    host_terminal_dashboard_service: "HostTerminalDashboardService | None" = None
     # Task 子域服务 (T18). schema 迁移失败时 task_registry 为 None，其余服务
     # 也为 None；lifespan 不启动 dispatcher，health 报不健康。
     task_service: TaskService | None = None
@@ -479,6 +481,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         if not settings.host_terminal_enabled
         else "host_terminal_config_incomplete"
     )
+    host_policy_loader = None
     if settings.host_terminal_enabled:
         required_host_config = (
             bool(settings.host_terminal_bridge_url.strip()),
@@ -553,6 +556,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 # No startup connectivity dependency: the tool surface remains
                 # stable and health moves to ok only after an actual success.
                 host_terminal_health_reason = "host_bridge_not_checked"
+                host_policy_loader = policy_loader
             except Exception as exc:
                 host_terminal_health_reason = getattr(exc, "reason_code", None)
                 if host_terminal_health_reason is None:
@@ -575,6 +579,13 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                     "host terminal not registered reason=%s",
                     host_terminal_health_reason,
                 )
+
+    host_terminal_dashboard_service = HostTerminalDashboardService(
+        host_policy_loader,
+        host_terminal_executor,
+        memory_store,
+        host_terminal_health_reason,
+    )
 
     # Plugin 装配
     seed_default_plugins(settings.plugins_root)
@@ -1331,6 +1342,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
         sandbox_manager=sandbox_manager if settings.sandbox_enabled else None,
+        host_terminal_dashboard_service=host_terminal_dashboard_service,
         task_service=task_service,
         task_run_service=task_run_service,
         task_runner=task_runner,
@@ -1503,6 +1515,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             external_memory_service=services.external_memory_service,
             external_memory_provider_service=services.external_memory_provider_service,
             sandbox_dashboard_service=services.sandbox_dashboard_service,
+            host_terminal_dashboard_service=services.host_terminal_dashboard_service,
             usage_service=services.usage_service,
             memory_store=services.memory_store,
             chat_service=services.chat_service,

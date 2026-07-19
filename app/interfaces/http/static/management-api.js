@@ -178,6 +178,24 @@
     releaseSandbox,
   };
 
+  // Host terminal dashboard endpoints - read-only, no write ops (see host_terminal_routes.py)
+  const getHostStatus = () => fetchJson('/chat/host/status');
+  const getHostPolicy = () => fetchJson('/chat/host/policy');
+  const listHostHistory = (sessionId, limit) => {
+    const params = new URLSearchParams();
+    if (sessionId) params.set('session_id', sessionId);
+    // Only send limit when it is a valid positive integer; never silently
+    // rewrite an invalid 0 to the default (let the backend 422 it).
+    if (Number.isInteger(limit) && limit >= 1) params.set('limit', String(limit));
+    const qs = params.toString();
+    return fetchJson(`/chat/host/history${qs ? `?${qs}` : ''}`);
+  };
+  const host = {
+    getStatus: getHostStatus,
+    getPolicy: getHostPolicy,
+    listHistory: listHostHistory,
+  };
+
   // Usage / observation endpoints
   const getUsageOverview = () => fetchJson(`/chat/usage/overview`);
   const listUsageSessions = (page, pageSize) => fetchJson(
@@ -265,6 +283,7 @@
     setPluginEnabled,
     updatePluginConfig,
     sandbox,
+    host,
     usage,
     task: {
       board: () => fetchJson('/chat/tasks/board'),

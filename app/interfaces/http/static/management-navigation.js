@@ -13,7 +13,9 @@
     { tab: 'tools-skill', path: '/tools/skill', label: 'Skill', parentTab: 'tools' },
     { tab: 'tools-plugin', path: '/tools/plugin', label: 'Plugin', parentTab: 'tools' },
     { tab: 'tools-builtin', path: '/tools/builtin', label: 'Builtin', parentTab: 'tools' },
-    { tab: 'sandbox', path: '/sandbox', label: '沙盒' },
+    { tab: 'executors', label: '执行器', parent: true, children: ['sandbox', 'executors-host'] },
+    { tab: 'sandbox', path: '/sandbox', label: '沙盒', parentTab: 'executors' },
+    { tab: 'executors-host', path: '/executors/host', label: '本机', parentTab: 'executors' },
     { tab: 'models', path: '/models', label: '模型' },
     { tab: 'platforms', path: '/platforms', label: '平台' },
     { tab: 'observations', label: '观测', parent: true, children: ['observations-sessions', 'observations-modules'] },
@@ -31,6 +33,7 @@
   const DEFAULT_CHILD = {
     tools: 'tools-knowledge',
     observations: 'observations-sessions',
+    executors: 'sandbox',
   };
 
   function isParent(name) {
@@ -46,6 +49,8 @@
     if (path.startsWith('/observations/sessions/')) return 'observations-sessions';
     if (path === '/tools/external-memory') return 'memory';
     if (path === '/tools/sandbox') return 'sandbox';
+    if (path === '/executors') return DEFAULT_CHILD.executors;
+    if (path === '/executors/host') return 'executors-host';
     if (path === '/tools') return DEFAULT_CHILD.tools;
     if (path === '/observations') return DEFAULT_CHILD.observations;
     if (path === '/' || path === '') return 'summary';

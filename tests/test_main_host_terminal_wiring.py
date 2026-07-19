@@ -98,6 +98,42 @@ async def test_invalid_policy_does_not_register_and_health_has_no_paths(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_dashboard_service_injected_in_all_three_states(tmp_path):
+    # disabled
+    services = build_application_services(_settings(tmp_path))
+    assert services.host_terminal_dashboard_service is not None
+    status = await services.host_terminal_dashboard_service.get_status()
+    assert status["enabled"] is False
+    assert status["health_code"] == "host_terminal_disabled"
+
+    # valid authority -> enabled, bridge not yet checked
+    policy, token = _write_authority_files(tmp_path)
+    services = build_application_services(_settings(
+        tmp_path, host_terminal_enabled=True,
+        host_terminal_bridge_url="http://host.docker.internal:8765",
+        host_terminal_policy_path=policy, host_terminal_token_path=token,
+        **_host_mapping(tmp_path),
+    ))
+    assert services.host_terminal_dashboard_service is not None
+    status = await services.host_terminal_dashboard_service.get_status()
+    assert status["enabled"] is True
+    assert status["health_code"] == "host_bridge_not_checked"
+
+    # invalid policy yaml -> not enabled, stable reason; loader not retained
+    policy.write_text("broken: [")
+    services = build_application_services(_settings(
+        tmp_path, host_terminal_enabled=True,
+        host_terminal_bridge_url="http://host.docker.internal:8765",
+        host_terminal_policy_path=policy, host_terminal_token_path=token,
+        **_host_mapping(tmp_path),
+    ))
+    assert services.host_terminal_dashboard_service is not None
+    status = await services.host_terminal_dashboard_service.get_status()
+    assert status["enabled"] is False
+    assert status["health_code"] == "host_policy_yaml_invalid"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("root_name", ["workspace_root", "skills_root", "sandbox_scratch_root"])
 @pytest.mark.parametrize("authority_name", ["host_terminal_policy_path", "host_terminal_token_path"])
 async def test_authority_must_not_overlap_any_container_model_writable_root(

@@ -742,3 +742,9 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .tasks-detail__body { white-space: pre-wrap; font-size: var(--font-size-md); color: var(--color-fg-default); background: var(--color-bg-muted, #f7f8fa); padding: 8px; border-radius: 6px; word-break: break-word; }
 .tasks-detail__list-item + .tasks-detail__list-item { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--color-border-light); }
 .tasks-error { color: #b91c1c; padding: 8px; }
+
+/* Host terminal (本机) dashboard - read-only; status/limits reuse security page
+   .policy-cfg/.policy-item so similar key-value content shares the same FE style. */
+.host-subsection-title { font-size: var(--font-size-md); font-weight: 600; margin: 12px 0 6px; color: var(--color-fg-default); }
+.host-rules-section { margin-bottom: 16px; }
+.host-unavailable { color: var(--color-fg-subtle); padding: 24px; text-align: center; }

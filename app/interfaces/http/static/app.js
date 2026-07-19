@@ -12,6 +12,7 @@
     platforms: false,
     memory: false,
     sandbox: false,
+    'executors-host': false,
     security: false,
     'tools-builtin': false,
     'tools-mcp': false,
@@ -29,6 +30,7 @@
     if (tab === 'tools-plugin') return namespace.plugin;
     if (tab === 'memory') return namespace.externalMemory;
     if (tab === 'sandbox') return namespace.sandbox;
+    if (tab === 'executors-host') return namespace.host;
     if (tab === 'observations-sessions') return namespace.observations;
     if (tab === 'observations-modules') return namespace.status;
     if (tab === 'security') return namespace.security;

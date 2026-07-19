@@ -102,6 +102,7 @@ def create_dashboard_router(
     external_memory_service: ExternalMemoryService | None = None,
     external_memory_provider_service: ExternalMemoryProviderService | None = None,
     sandbox_dashboard_service=None,
+    host_terminal_dashboard_service=None,
     plugin_service=None,
     usage_service=None,
     memory_store=None,
@@ -132,6 +133,8 @@ def create_dashboard_router(
     @router.get("/tools/external-memory", response_class=HTMLResponse)
     @router.get("/tools/sandbox", response_class=HTMLResponse)
     @router.get("/sandbox", response_class=HTMLResponse)
+    @router.get("/executors", response_class=HTMLResponse)
+    @router.get("/executors/host", response_class=HTMLResponse)
     @router.get("/models", response_class=HTMLResponse)
     @router.get("/scheduled-tasks", response_class=HTMLResponse)
     @router.get("/scheduled-tasks/{task_id}", response_class=HTMLResponse)
@@ -160,6 +163,10 @@ def create_dashboard_router(
     if sandbox_dashboard_service is not None:
         from app.interfaces.http.sandbox_routes import register_sandbox_routes
         register_sandbox_routes(router, sandbox_dashboard_service)
+
+    if host_terminal_dashboard_service is not None:
+        from app.interfaces.http.host_terminal_routes import register_host_terminal_routes
+        register_host_terminal_routes(router, host_terminal_dashboard_service)
 
     @router.get("/chat/sessions")
     async def sessions():
