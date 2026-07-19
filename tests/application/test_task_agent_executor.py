@@ -180,6 +180,24 @@ async def test_executor_trusted_metadata_task_context(executor, fake_chat):
 
 
 @pytest.mark.asyncio
+async def test_executor_trusted_claims_carries_task_context(executor, fake_chat):
+    """The task sub-dict must travel in ingress_facts.trusted_claims (not just
+    trusted_metadata): ChatCompletionService rebuilds trusted_metadata from
+    the policy snapshot's trusted_claims (built from IngressFacts.trusted_claims),
+    so a task sub-dict only in trusted_metadata is dropped and the task tools
+    fail with trusted_task_context_missing."""
+    task = _task(id="t_abc", board="default", created_by="alice")
+    await executor.run(task, task_run_id=42, claim_lock="lock-xyz")
+    call = fake_chat.complete_calls[0]
+    task_ctx = call.ingress_facts.trusted_claims.get("task")
+    assert task_ctx is not None
+    assert task_ctx["task_id"] == "t_abc"
+    assert task_ctx["run_id"] == 42
+    assert task_ctx["claim_lock"] == "lock-xyz"
+    assert task_ctx["write_origin"] == "worker"
+
+
+@pytest.mark.asyncio
 async def test_executor_user_prompt_is_work_task(executor, fake_chat):
     task = _task(id="t_xyz")
     await executor.run(task, task_run_id=1, claim_lock="L1")

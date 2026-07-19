@@ -258,10 +258,12 @@ def _build_task_parser(subparsers) -> None:
 
     list_p = sub.add_parser("list", help="List tasks")
     list_p.add_argument("--status", default=None)
+    list_p.add_argument("--all", action="store_true", help="List all pages")
     _fmt(list_p)
 
     ls_p = sub.add_parser("ls", help="Alias of list")
     ls_p.add_argument("--status", default=None)
+    ls_p.add_argument("--all", action="store_true", help="List all pages")
     _fmt(ls_p)
 
     show_p = sub.add_parser("show", help="Show a task")
@@ -280,6 +282,10 @@ def _build_task_parser(subparsers) -> None:
     create_p.add_argument("--created-by", default=None)
     create_p.add_argument("--triage", action="store_true", help="Leave task in TRIAGE (default)")
     _fmt(create_p)
+
+    delete_p = sub.add_parser("delete", help="Delete a task (hard delete, non-RUNNING only)")
+    delete_p.add_argument("id")
+    _fmt(delete_p)
 
     assign_p = sub.add_parser("assign", help="Assign a task")
     assign_p.add_argument("id")

@@ -242,6 +242,7 @@ class ToolService:
                     definition,
                     exposure_policy,
                     getattr(context, "granted_tools", frozenset()) if context is not None else frozenset(),
+                    getattr(context, "permitted_managed_tools", frozenset()) if context is not None else frozenset(),
                 )
                 if exposure_policy is not None
                 else definition.enabled and definition.risk_level is risk_level

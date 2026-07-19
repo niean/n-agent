@@ -100,7 +100,12 @@ Docker Compose 项目隔离使用：
 
 ## 测试
 
-- 测试命令：`python -m pytest -v`
+- 标准化单元测试允许直接在宿主开发环境执行，测试命令：`python -m pytest`
+- 所有 E2E 测试必须在 Docker 环境进行，禁止在宿主机直接执行
+- 除标准化单元测试 `python -m pytest` 外，禁止在宿主机直接执行 N-Agent Python 代码
+- 禁止在宿主机直接启动 N-Agent 服务
+- E2E 测试前必须执行 `cd docker && ./restart.sh` 重建并启动服务，后续直接通过 `docker exec n-agent-n-agent-1 n-agent <子命令及参数>` 调用容器内 N-Agent
+- E2E 测试禁止依赖宿主 `n-agent` alias，禁止为 `docker exec` 增加 `-i` 或 `-t`
 - 当前全量测试覆盖 789 项
 - 新增 Domain、Application、Infrastructure、Interfaces 能力时必须补对应测试
 - 涉及 DDD 边界变更时必须运行 `tests/test_architecture_boundaries.py`
@@ -117,10 +122,10 @@ Docker Compose 项目隔离使用：
 ## 验收命令
 
 ```bash
-python -m pytest -v
+python -m pytest
 docker compose -f docker/docker-compose.yml config >/dev/null
-curl http://127.0.0.1:8201/health
-curl http://127.0.0.1:8201/v1/models
+cd docker && ./restart.sh
+docker exec n-agent-n-agent-1 n-agent <验收子命令及参数>
 ```
 
 ---

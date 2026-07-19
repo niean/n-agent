@@ -149,6 +149,27 @@ def test_external_memory_static_asset_is_plain_javascript(tmp_path):
 
 def test_static_assets_contain_expected_logic(tmp_path):
     client = _client(tmp_path)
+    styles_css = client.get('/static/styles.css').text
+    assert '#tab-tasks.active' in styles_css
+    assert '#tasks-board-view > .status-panel' in styles_css
+    assert '.kanban-board' in styles_css
+    assert 'min-height: calc(100vh - 179px)' in styles_css
+    kanban_board_rule = styles_css[styles_css.index('.kanban-board {'):styles_css.index('.kanban-column {')]
+    assert '--kanban-column-count: 8' in kanban_board_rule
+    assert '--kanban-column-gap: 12px' in kanban_board_rule
+    assert '--kanban-column-max-width: calc(12.5cqw - 10.5px)' in kanban_board_rule
+    assert 'container-type: inline-size' in kanban_board_rule
+    assert 'repeat(var(--kanban-column-count), minmax(0, 1fr))' in kanban_board_rule
+    assert 'width: 100%' in kanban_board_rule
+    assert 'min-width: 0' in kanban_board_rule
+    assert 'overflow-x: hidden' in kanban_board_rule
+    assert 'overflow-x: auto' not in kanban_board_rule
+    assert 'overflow-y: auto' not in kanban_board_rule
+    kanban_column_rule = styles_css[styles_css.index('.kanban-column {'):styles_css.index('.kanban-column__header {')]
+    assert 'width: 100%' in kanban_column_rule
+    assert 'min-width: 0' in kanban_column_rule
+    assert 'max-width: var(--kanban-column-max-width)' in kanban_column_rule
+    assert 'repeat(4, minmax(180px, 1fr))' not in styles_css
     chat_js = client.get('/static/chat.js').text
     assert '/chat/external-memory/memory-providers' in chat_js
     assert 'event.shiftKey' in chat_js

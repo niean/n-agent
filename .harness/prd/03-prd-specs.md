@@ -439,8 +439,17 @@
         - 裁剪：tenant 隔离、多 board UI、worktree workspace、独立 daemon、subprocess worker（用进程内 async 对齐 ScheduledAgentExecutor）
 
 [20260719]
+- HE
+    - HE：所有E2E测试，都应该在docker环境进行，禁止在本地执行python代码、启动N-Agent服务；`cd docker && ./restart; n-gent xx`，zsh/bash环境已经映射`n-gent`为`docker exec -it n-agent-n-agent-1 n-agent`
+    - HE：基于CLI，建立E2E功能测试集，基本是各个功能的`创建、查看、删除(仅限删除测试创建的实例)`，先覆盖 Task任务（注意：E2E功能测试的命令是`n-agent xx`）
 - FR
     - 任务：实现任务入口，验收和迭代
+        - 待办：创建任务前，增加用户澄清（类似Manus）
+        - 前端：n-agent task ls 能看到2个任务，但Dashboard 任务看板上没有
+        - 前端：新增任务，改用标准弹出框modal，输入至少包括标题、目标等
+        - 前端：任务看板，干掉刷新按钮、干掉显示已归档；新增按钮，放到panel右上角，样式跟定时任务保持一致
+        - 前端：任务看板，垂直高度默认适配全屏，如果任务太多不够用、再自动扩展；水平方向禁止滑动，单个泳道设置最大宽度(最大宽度*泳道数不大于水平宽度)，要考虑到左导展开/收缩之影响
+        - 任务：参照Manus简化任务流程，去除`针对人的项目管理`功能，如assign分派、审阅、排期；保留`Agent自动控制`，如自动执行的排期、意图识别(提出修改 → 用户审阅 → 批准)
 
 
 ---

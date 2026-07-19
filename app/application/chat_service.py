@@ -295,6 +295,13 @@ class ChatCompletionService:
     @staticmethod
     def _compute_permitted_managed_tools(mode: str, trusted_metadata: dict[str, Any]) -> set[str]:
         if mode != "realtime":
+            # Unattended executors (e.g. TaskAgentExecutor) declare their
+            # permitted managed tools as server-side trusted claims; honor
+            # that declaration so the worker can actually use the task tools.
+            # No declaration -> empty (scheduled tasks, etc. stay tool-less).
+            declared = trusted_metadata.get("permitted_managed_tools")
+            if isinstance(declared, (list, tuple, set, frozenset)):
+                return {str(name) for name in declared}
             return set()
         gateway_platform = trusted_metadata.get("gateway.platform")
         from app.domain.platform import Platform

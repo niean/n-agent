@@ -267,7 +267,7 @@
     sandbox,
     usage,
     task: {
-      board: () => fetchJson('/chat/tasks/board'),
+      board: (archived) => fetchJson('/chat/tasks/board' + (archived ? '?archived=true' : '')),
       list: (params) => fetchJson('/chat/tasks' + (params && params.status ? ('?status=' + encodeURIComponent(params.status)) : '')),
       get: (id) => fetchJson('/chat/tasks/' + encodeURIComponent(id)),
       create: (body) => fetchJson('/chat/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),

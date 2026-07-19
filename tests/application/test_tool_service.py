@@ -196,6 +196,31 @@ def test_list_openai_tools_can_filter_safe_only():
     assert names == {"safe_tool"}
 
 
+def test_list_openai_tools_safe_only_exposes_permitted_managed_tool():
+    """Regression: unattended task workers run under SAFE_ONLY but must still
+    see the managed task tools declared in permitted_managed_tools."""
+    definitions = [
+        ToolDefinition("safe_tool", "safe", {"type": "object"}, RiskLevel.SAFE),
+        _managed_def(),  # manage_schedule, CONFIRM + managed=True
+    ]
+    service = ToolService(FakeExecutor(), definitions)
+
+    # SAFE_ONLY without permitted_managed_tools -> managed tool hidden
+    names = {
+        s["function"]["name"]
+        for s in service.list_openai_tools(ToolExposurePolicy.SAFE_ONLY, ToolExecutionContext())
+    }
+    assert names == {"safe_tool"}
+
+    # SAFE_ONLY with permitted_managed_tools -> managed tool exposed
+    ctx = ToolExecutionContext(permitted_managed_tools={"manage_schedule"})
+    names = {
+        s["function"]["name"]
+        for s in service.list_openai_tools(ToolExposurePolicy.SAFE_ONLY, ctx)
+    }
+    assert names == {"safe_tool", "manage_schedule"}
+
+
 
 def test_kb_tool_definition_enabled_when_configured():
     definitions = builtin_tool_definitions() + knowledge_tool_definitions(enabled=True)

@@ -18,46 +18,21 @@
     { key: 'review', label: '审阅' },
     { key: 'done', label: '完成' },
   ];
-  const ARCHIVED_KEY = 'archived';
-
-  let state = { board: { columns: {}, archived: [] }, showArchived: false, detail: null };
+  let state = { board: { columns: [], archived: false, assignees: [] }, detail: null };
   let ws = null;
 
   function init() {
     if (!api || !api.task) return;
     renderShell();
+    const newBtn = document.getElementById('task-new');
+    if (newBtn) newBtn.addEventListener('click', openCreateModal);
     refresh();
-    bindCreate();
   }
 
   function renderShell() {
     const root = document.getElementById('tasks-board');
     if (!root) return;
     ui.clear(root);
-
-    const bar = el('div', 'tasks-bar');
-    const newBtn = el('button', 'btn btn--primary');
-    newBtn.type = 'button';
-    newBtn.textContent = '新增任务';
-    newBtn.addEventListener('click', openCreateModal);
-    bar.appendChild(newBtn);
-
-    const refreshBtn = el('button', 'btn');
-    refreshBtn.type = 'button';
-    refreshBtn.textContent = '刷新';
-    refreshBtn.addEventListener('click', refresh);
-    bar.appendChild(refreshBtn);
-
-    const archivedToggle = el('label', 'tasks-archived-toggle');
-    const cb = el('input', '');
-    cb.type = 'checkbox';
-    cb.addEventListener('change', () => { state.showArchived = cb.checked; renderBoard(); });
-    const span = el('span', '');
-    span.textContent = '显示已归档';
-    archivedToggle.appendChild(cb);
-    archivedToggle.appendChild(span);
-    bar.appendChild(archivedToggle);
-    root.appendChild(bar);
 
     const board = el('div', 'kanban-board');
     board.id = 'kanban-board-root';
@@ -74,31 +49,40 @@
     if (!board) return;
     ui.clear(board);
 
-    const columns = state.showArchived
-      ? [{ key: ARCHIVED_KEY, label: '已归档' }]
-      : COLUMNS;
+    const cols = COLUMNS;
 
-    columns.forEach((col) => {
+    // Backend /chat/tasks/board returns `columns` as an ARRAY of
+    // {status, cards, total}. Index by status so each Kanban column can look
+    // up its cards and total. Treating columns as a dict keyed by status yields
+    // undefined and renders zero cards.
+    const cardsByStatus = {};
+    const totalByStatus = {};
+    (state.board.columns || []).forEach((c) => {
+      cardsByStatus[c.status] = c.cards || [];
+      totalByStatus[c.status] = (c.total != null ? c.total : (c.cards || []).length);
+    });
+
+    cols.forEach((col) => {
       const colEl = el('div', 'kanban-column');
       colEl.dataset.column = col.key;
       const header = el('div', 'kanban-column__header');
-      header.textContent = col.label + ' (' + ((state.board.columns[col.key] || state.board.archived || []).length) + ')';
+      header.textContent = col.label + ' (' + (totalByStatus[col.key] || 0) + ')';
       colEl.appendChild(header);
 
       const list = el('div', 'kanban-column__list');
       list.addEventListener('dragover', (e) => { e.preventDefault(); });
       list.addEventListener('drop', (e) => { e.preventDefault(); const id = e.dataTransfer.getData('text/plain'); if (id) moveTask(id, col.key); });
 
-      const items = state.board.columns[col.key] || (col.key === ARCHIVED_KEY ? state.board.archived : []) || [];
-      items.forEach((t) => list.appendChild(renderCard(t, col.key)));
+      const items = cardsByStatus[col.key] || [];
+      items.forEach((t) => list.appendChild(renderCard(t)));
       colEl.appendChild(list);
       board.appendChild(colEl);
     });
   }
 
-  function renderCard(t, columnKey) {
+  function renderCard(t) {
     const card = el('div', 'kanban-card');
-    card.draggable = (columnKey !== ARCHIVED_KEY);
+    card.draggable = true;
     card.dataset.id = t.id;
     card.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', t.id); });
     card.addEventListener('click', () => openDetail(t.id));
@@ -132,8 +116,8 @@
 
   async function refresh() {
     try {
-      const board = await api.task.board();
-      state.board = board || { columns: {}, archived: [] };
+      const board = await api.task.board(false);
+      state.board = board || { columns: [], archived: false, assignees: [] };
       renderBoard();
       connectWs();
     } catch (e) {
@@ -166,14 +150,134 @@
     }
   }
 
-  function openCreateModal() {
-    const title = window.prompt('任务标题');
-    if (!title) return;
-    const body = { title: title, triage: true };
-    api.task.create(body).then(() => refresh()).catch((e) => alert('创建失败：' + (e && e.message ? e.message : e)));
+  // ---- create modal ----
+  // Standard modal popup (mirrors knowledge.js openKbForm): replaces the old
+  // window.prompt which only collected a title. Inputs: title (required),
+  // goal (-> body), priority, goal_mode. Esc / backdrop / × close. All
+  // textContent rendering, no innerHTML. The legacy `triage: true` flag is
+  // dropped: the backend create_task never consumed it (new tasks default to
+  // the triage state); assignee is intentionally omitted (prd 20260719
+  // direction: drop human-PM fields).
+  function closeCreateModal() {
+    const modal = document.getElementById('tasks-create-modal');
+    if (modal) modal.remove();
+    document.removeEventListener('keydown', onCreateModalKeydown);
   }
 
-  function bindCreate() { /* placeholder for future modal binding */ }
+  function onCreateModalKeydown(event) {
+    if (event.key === 'Escape') closeCreateModal();
+  }
+
+  function field(form, name, labelText, options) {
+    options = options || {};
+    const label = el('label', '');
+    label.textContent = labelText;
+    let input;
+    if (options.type === 'textarea') {
+      input = el('textarea', '');
+    } else {
+      input = el('input', '');
+      input.type = options.type || 'text';
+    }
+    input.name = name;
+    input.id = 'tasks-create-' + name;
+    if (options.value != null) input.value = options.value;
+    if (options.placeholder) input.placeholder = options.placeholder;
+    if (options.min != null) input.min = String(options.min);
+    if (options.required) input.required = true;
+    label.appendChild(input);
+    form.appendChild(label);
+    return input;
+  }
+
+  function checkbox(form, name, labelText, checked) {
+    const label = el('label', '');
+    const input = el('input', '');
+    input.type = 'checkbox';
+    input.name = name;
+    input.id = 'tasks-create-' + name;
+    input.checked = !!checked;
+    const span = el('span', '');
+    span.textContent = labelText;
+    label.append(input, span);
+    form.appendChild(label);
+    return input;
+  }
+
+  function openCreateModal() {
+    closeCreateModal();
+    const backdrop = el('div', 'modal-backdrop');
+    backdrop.id = 'tasks-create-modal';
+    const dialog = el('section', 'modal-dialog tasks-modal');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    const form = el('form', 'providers-form tasks-form');
+    const header = el('div', 'modal-header');
+    const titleEl = el('h4', '');
+    titleEl.textContent = '新增';
+    const closeBtn = el('button', 'modal-close');
+    closeBtn.type = 'button';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '关闭');
+    closeBtn.addEventListener('click', closeCreateModal);
+    header.append(titleEl, closeBtn);
+    form.appendChild(header);
+
+    const titleInput = field(form, 'title', '标题', { required: true, placeholder: '任务标题（必填）' });
+    const goalInput = field(form, 'goal', '目标', { type: 'textarea', placeholder: '描述任务要达成的目标' });
+    const priorityInput = field(form, 'priority', '优先级', { type: 'number', min: 0, value: '0' });
+    const goalModeInput = checkbox(form, 'goal_mode', '自主目标驱动执行（goal_mode）', false);
+
+    const hint = el('div', 'providers-form__hint muted');
+    form.appendChild(hint);
+
+    const actions = el('div', 'providers-form__actions');
+    const cancelBtn = el('button', 'btn');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = '取消';
+    cancelBtn.addEventListener('click', closeCreateModal);
+    const submitBtn = el('button', 'btn btn--primary');
+    submitBtn.type = 'submit';
+    submitBtn.textContent = '创建';
+    actions.append(cancelBtn, submitBtn);
+    form.appendChild(actions);
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const titleVal = String(titleInput.value || '').trim();
+      if (!titleVal) {
+        hint.className = 'providers-form__hint badge badge--danger';
+        hint.textContent = '请填写标题';
+        return;
+      }
+      const goalVal = String(goalInput.value || '').trim();
+      const priorityVal = String(priorityInput.value || '').trim();
+      const payload = { title: titleVal, goal_mode: !!goalModeInput.checked };
+      if (goalVal) payload.body = goalVal;
+      if (priorityVal) payload.priority = Number(priorityVal);
+      submitBtn.disabled = true;
+      hint.className = 'providers-form__hint muted';
+      hint.textContent = '';
+      try {
+        await api.task.create(payload);
+        closeCreateModal();
+        await refresh();
+      } catch (e) {
+        hint.className = 'providers-form__hint badge badge--danger';
+        hint.textContent = '创建失败：' + (e && e.message ? e.message : e);
+        submitBtn.disabled = false;
+      }
+    });
+
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeCreateModal();
+    });
+    document.body.appendChild(backdrop);
+    document.addEventListener('keydown', onCreateModalKeydown);
+    if (titleInput.focus) titleInput.focus();
+  }
 
   async function openDetail(id) {
     const drawer = document.getElementById('tasks-detail-drawer');

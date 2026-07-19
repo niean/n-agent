@@ -316,7 +316,7 @@
     const isOrigin = task && task.delivery_target === 'origin';
     const form = document.createElement('form');
     form.className = 'providers-form scheduled-task-form';
-    renderModalHeader(form, isEdit ? '编辑任务' : '新增任务');
+    renderModalHeader(form, isEdit ? '编辑' : '新增');
     if (state.modal.error) appendText(form, 'div', state.modal.error, 'error-state');
 
     const grid = document.createElement('div');

@@ -136,3 +136,43 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 
 来源：bug fix 260717 Chat 框飞书可预览图片过期裂图
 
+### P014: Application service 返回类型契约变更必须同步迁移所有 Interface 消费方（CLI + HTTP routes）
+
+现象：终端执行 `n-agent task ls` 直接报 `'TaskListPage' object is not iterable`，命令不可用。
+
+根因：commit 71772ba（任务入口）把 `TaskService.list_tasks` 返回类型从可迭代的 `tuple[Task,...]` 改为分页包装 `TaskListPage(items, next_cursor)`。HTTP 路由 `task_routes.py` 全部正确迁移为 `page = await task_service.list_tasks(...)` 后访问 `page.items`/`page.next_cursor`，但 CLI `app/interfaces/cli/commands/task.py::_cmd_list` 仍 `for t in tasks` 直接迭代 page 对象，`TaskListPage` 未实现 `__iter__` 即报错。根因跨 domain（task.py 定义 TaskListPage）、application（task_service.py 返回 page）、interfaces（cli 漏迁 / http 已迁）三层。CLI 侧无 `task list` 回归测试，迁移时漏改未被发现。
+
+教训：Application service 方法的返回类型是 CLI 与 HTTP routes 共享的契约（见模式十九 _load_xxx_service indirection），改返回类型（尤其可迭代对象 -> 包装对象，如 list/tuple -> Page/Result wrapper）时必须 grep 全部消费方同步迁移到新字段（`.items`/`.data`/`.result`），并给每个 Interface 消费方补一条回归测试（CLI 用 monkeypatch `_load_xxx_service` 返回 Fake，断言 rc==0 且渲染含期望 id）。CLI 子命令测试覆盖不全时，契约变更最易在 CLI 侧漏迁。相关：P006 冗余字段迁移必须覆盖所有读取路径。
+
+来源：bug fix 260719 n-agent task ls 报 TaskListPage not iterable
+
+### P015: Dashboard 前端必须按后端路由实际响应 shape 消费，并补 Node 行为夹具防契约漂移
+
+现象：`n-agent task ls` 能看到 2 个任务（triage 状态），但 Dashboard 任务看板一列卡片都不显示。
+
+根因：后端 `/chat/tasks/board` 返回 `columns` 为对象数组 `[{status, cards, total}, ...]`、`archived` 为布尔标志（`task_routes.py`，且有 `test_task_routes.py` 断言此数组 shape）；但前端 `tasks.js` 把 `state.board.columns` 当作以 status 为键的 dict 取（`columns[col.key]`），数组按字符串索引恒为 `undefined`，导致每列 `items=[]` 不渲染卡片；同时 `state.board.archived` 被当作卡片数组（实为布尔）取 `.length`，archived 开关也只调 `renderBoard()` 不带 `?archived=true` 重拉。前后端 shape 不匹配，且 `tasks.js` 无任何前端行为测试，靠人工验收才发现。根因跨 interfaces 层 3 文件（task_routes.py / tasks.js / management-api.js）。
+
+教训：Dashboard 前端 JS 消费 HTTP 路由时，必须严格按路由实际响应 shape（数组/dict、字段名）解析，不能凭前端臆想的 shape 取值；后端 route 有 Python 合同测试但前端无对应消费测试时，shape 漂移只在浏览器暴露。新增/改动 Dashboard 前端模块时必须补一个无依赖 Node 行为夹具（vm + 最小 DOM mock + 返回真实后端 shape 的 mock api，仿 `security_frontend_harness.js` / `tasks_frontend_harness.js`），断言关键渲染分支（卡片数、列数、开关重拉参数）。archived/toggle 类开关必须走"重拉带查询参数"而非仅本地重渲染。相关：P014 接口消费方契约迁移。
+
+来源：bug fix 260719 Dashboard 任务看板不显示任务
+
+### P016: managed CONFIRM 工具对 unattended worker 有"暴露+执行"双闸门，两闸都依赖 permitted_managed_tools
+
+现象：Task worker 执行任务时，系统提示让它用 task_complete/task_heartbeat/task_show 等 task 工具提交产物，但 worker 会话里根本没有这些工具，worker 只能放弃并把"无法完成"当结果，任务被标记 done（consecutive_failures=0）。
+
+根因：task 工具是 `managed=True, risk_level=CONFIRM, toolset="task"`，TaskAgentExecutor 已把 7 个工具名写入 `trusted_metadata["permitted_managed_tools"]`，但 worker 实际看不到也调不了，因为两道闸门都断了：(1) 暴露闸 `ToolPolicy.can_expose` 在 `SAFE_ONLY`（unattended 模式自动启用）下只放行 SAFE 工具，CONFIRM managed 工具被隐藏，LLM 拿不到 schema；(2) `ChatCompletionService._compute_permitted_managed_tools` 对 `mode != "realtime"` 直接返回空集，把 executor 声明的 permitted_managed_tools 丢弃，`context.permitted_managed_tools` 为空，执行闸 `evaluate_execution` 也放行不了。两闸都依赖 `permitted_managed_tools`，缺一不可。根因跨 domain（tool_policy）、application（chat_service/tool_service）、executor（task_agent_executor）。无 worker 工具面端到端测试，靠人工跑任务才发现。
+
+教训：managed CONFIRM 工具对 unattended worker 有双闸门--暴露闸（can_expose，LLM 是否看到 schema）与执行闸（evaluate_execution，调用是否 ALLOW），两闸都读 `context.permitted_managed_tools`。给 unattended worker 增加_managed 工具时必须同时：(a) executor 把工具名写入 permitted_managed_tools（已有）；(b) `_compute_permitted_managed_tools` 对 unattended 荣誉 executor 声明（不能一律返回空）；(c) `can_expose` 在 SAFE_ONLY 下对 `definition.managed and name in permitted_managed_tools` 放行（managed 是服务端声明、无需交互审批，不违背"unattended 无审批通道"原则，区别于普通 CONFIRM）。改动任一闸门必须配三处单测：can_expose 单元、_compute 传播、list_openai_tools 端到端暴露。相关：P017 trusted_claims 镜像。
+
+来源：bug fix 260719 task worker 看不到 task 工具
+
+### P017: executor 写入 trusted_metadata 的子字典必须镜像进 IngressFacts.trusted_claims
+
+现象：P016 修复后 worker 能看到 task 工具了，但调用 task_show/task_complete 时被拒 `trusted_task_context_missing`，worker 无法读取任务上下文、无法提交结果。
+
+根因：TaskAgentExecutor 把 worker 身份（task_id/run_id/claim_lock/write_origin）组装成 `task` 子字典放入 `trusted_metadata["task"]`，但 `IngressFacts.trusted_claims` 只放了顶级字段（task_id/claim_lock 等），没放 `task` 子字典。生产装配了 `policy_snapshot_factory`，ChatCompletionService 在 `_build_policy_snapshot` 用 `request.ingress_facts.trusted_claims` 构造 snapshot，随后 `trusted_metadata = dict(snapshot.run_context.trusted_claims)` 整体替换 trusted_metadata（chat_service.py:169）--只放在 trusted_metadata 的 `task` 子字典被丢弃，`ToolExecutionContext.trusted_metadata["task"]` 为空，`TaskManagementToolExecutor._origin_from_trusted` 读不到返回 None，工具报 `trusted_task_context_missing`。根因跨 application（chat_service policy snapshot 路径）与 executor（trusted_claims 构造）。
+
+教训：服务端 executor 写入 `trusted_metadata` 的每个键（尤其子字典如 `task`）必须同时镜像进 `IngressFacts.trusted_claims`。原因：有 policy_snapshot_factory 时，ChatCompletionService 用 snapshot.run_context.trusted_claims（源自 IngressFacts.trusted_claims）整体替换 trusted_metadata，trusted_metadata-only 的键会被丢。trusted_claims 是"服务端声明经 snapshot 透传"的权威通道，trusted_metadata 在 snapshot 路径下只是初始值。诊断 managed 工具报 `trusted_*_missing` 时，先检查对应子字典是否同时在 ingress_facts.trusted_claims，而非只看 trusted_metadata。相关：P016 双闸门、模式十二 trusted_claims 镜像陷阱。
+
+来源：bug fix 260719 task worker 调 task 工具报 trusted_task_context_missing
+

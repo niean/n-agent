@@ -31,6 +31,7 @@ class ToolPolicy:
         definition: ToolDefinition,
         exposure_policy: ToolExposurePolicy,
         granted_tools: frozenset[str] = frozenset(),
+        permitted_managed_tools: frozenset[str] = frozenset(),
     ) -> bool:
         if not isinstance(exposure_policy, ToolExposurePolicy):
             return False
@@ -42,6 +43,11 @@ class ToolPolicy:
         # specific SAFE tools (e.g. host_terminal) so an unattended run can see
         # them despite their AGENT source_type; grants never lift CONFIRM/DANGER
         # gating, since unattended runs have no approval channel.
+        # Managed CONFIRM tools are the exception: a server-side executor (e.g.
+        # TaskAgentExecutor) declares them in permitted_managed_tools, so they
+        # need no interactive approval and are exposed to the worker.
+        if definition.managed and definition.name in permitted_managed_tools:
+            return True
         if definition.risk_level is RiskLevel.SAFE and definition.source_type is not ToolSourceType.AGENT:
             return True
         return (

@@ -53,11 +53,27 @@
 ### 单元测试
 单元测试执行策略：
 - 用户明确要求时：必须执行
-- {{描述需要自动执行测试的场景和条件}}
+- 标准化单元测试允许直接在宿主开发环境执行
 - 其他场景：跳过
 
 ```bash
-{{测试命令}}
+cd /Users/niean/code/github.com/niean/n-agent
+python -m pytest
+```
+
+### E2E 测试
+E2E 测试执行策略：
+- 所有 E2E 测试必须在 Docker 环境进行，禁止在宿主机直接执行
+- 除标准化单元测试 `python -m pytest` 外，禁止在宿主机直接执行 N-Agent Python 代码
+- 禁止在宿主机直接启动 N-Agent 服务
+- E2E 测试前必须通过 `docker/restart.sh` 重建并启动服务，后续直接通过 `tests/e2e/run.sh` 全部 CLI E2E测试
+
+```bash
+cd /Users/niean/code/github.com/niean/n-agent 
+# 重建并启动服务
+sh docker/restart.sh
+# 全部 CLI E2E
+sh tests/e2e/run.sh
 ```
 
 ## 扫描维度

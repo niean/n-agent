@@ -189,11 +189,17 @@ class TaskAgentExecutor:
             "execution_session_id": execution_session_id,
         }
 
-        # Build trusted_claims (mirrors trusted_metadata)
+        # Build trusted_claims (mirrors trusted_metadata). The ``task`` sub-dict
+        # must travel here too: ChatCompletionService rebuilds trusted_metadata
+        # from the policy snapshot's trusted_claims (sourced from
+        # IngressFacts.trusted_claims), so a task context only in
+        # trusted_metadata would be dropped and the task tools would fail with
+        # trusted_task_context_missing.
         trusted_claims: dict[str, Any] = {
             "execution_mode": ExecutionMode.UNATTENDED.value,
             "granted_tools": granted_tools,
             "permitted_managed_tools": list(permitted_managed),
+            "task": task_context,
             "task_id": task.id,
             "task_run_id": task_run_id,
             "execution_run_id": execution_run_id,

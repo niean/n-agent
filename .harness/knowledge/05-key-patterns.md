@@ -266,14 +266,17 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 
 规则：
 - ChatCompletionInput 同时携带 `metadata`（untrusted，可由 OpenAI HTTP 客户端写入）与 `trusted_metadata`（trusted，仅 GatewayService/Feishu 长连接适配器写入）。
-- ChatCompletionService.complete 在每次调用时构造 ToolExecutionContext，把 trusted_metadata 拷贝进去，并通过 `_compute_permitted_managed_tools(mode, trusted_metadata)` 决定 `permitted_managed_tools`。当前规则：mode=realtime 且 `trusted_metadata.gateway.platform` 为合法 Gateway（feishu）才返回 `{"manage_schedule"}`，否则空集。
+- ChatCompletionService.complete 在每次调用时构造 ToolExecutionContext，把 trusted_metadata 拷贝进去，并通过 `_compute_permitted_managed_tools(mode, trusted_metadata)` 决定 `permitted_managed_tools`。当前规则：mode=realtime 且 `trusted_metadata.gateway.platform` 为合法 Gateway（feishu）才返回 `{"manage_schedule"}`，否则空集；mode!=realtime（unattended）时返回 executor 在 trusted_metadata 声明的 `permitted_managed_tools`（TaskAgentExecutor 声明 7 个 task managed 工具），未声明则空集。
+- managed CONFIRM 工具有双闸门：暴露闸 `ToolPolicy.can_expose`（决定 LLM 是否看到 schema）与执行闸 `evaluate_execution`（决定调用是否 ALLOW）。unattended worker 走 `safe_only` 暴露策略，默认只暴露 SAFE 工具；TaskAgentExecutor 声明的 task managed 工具经 `can_expose(definition, SAFE_ONLY, granted_tools, permitted_managed_tools)` 放行（`definition.managed and name in permitted_managed_tools`），并在执行闸 `name in context.permitted_managed_tools` 放行（`managed_grant`，无需审批通道）。两闸都依赖 `context.permitted_managed_tools`，缺一不可。
 - 上下文通过 LangGraph `configurable.options["tool_execution_context"]` 传递；执行节点（call_llm/execute_tools）必须在 config 缺失时回退到 `state.run_options`，避免 LangGraph 框架精简 config 导致 context 丢失。
 - `ToolPolicy` 对未出现在 `context.permitted_managed_tools` 的 managed 工具返回 `REQUIRE_APPROVAL`；`ToolService` 未取得有效授权时返回 `permission_denied`，不调用 executor。
-- 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 platform/receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。`_origin_from_trusted` 把这四个字段一并写入 `ScheduledTask.origin` 与 `DeliveryTarget.context`，由 outbound 按 `platform` 路由投递。
+- 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 platform/receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。`_origin_from_trusted` 把这四个字段一并写入 `ScheduledTask.origin` 与 `DeliveryTarget.context`，由 outbound 按 `platform` 路由投递。Task worker 的 `TaskManagementToolExecutor._origin_from_trusted` 同理从 `context.trusted_metadata["task"]`（含 task_id/run_id/claim_lock/write_origin）读取 worker 身份，缺失返回 `trusted_task_context_missing`。
 - 删除等需要确认的破坏性动作不允许 Agent 直接执行；自然语言删除要返回 confirmation_required 文案，引导用户走 `/schedule remove <id>`。Gateway 破坏性命令 preflight 时把当前飞书 trusted_metadata 写入 `GatewayConfirmationRequest.trusted_metadata`，handle_confirmation 还原后再校验 task.origin 一致性。
 - 不可信模式（unattended/safe_only、定时任务执行）时 `list_openai_tools` 必须过滤 source_type=AGENT 的工具，避免调度器递归调用自己。
 
 陷阱：把 OpenAI HTTP 客户端 metadata 直接当 trusted_metadata 用，或者只在 ToolExecutionContext 里塞 metadata 不区分 trusted/untrusted，会让伪造 `gateway.platform=feishu` 的 OpenAI 客户端获得飞书会话的 schedule 操作权限。
+
+陷阱：服务端构造的子字典（如 Task worker 的 `trusted_metadata["task"]`）必须同时放入 `IngressFacts.trusted_claims`，不能只放 `trusted_metadata`。ChatCompletionService 在有 policy_snapshot_factory 时会用 `snapshot.run_context.trusted_claims`（源自 `IngressFacts.trusted_claims`）整体替换 trusted_metadata（`_build_policy_snapshot`），只放 trusted_metadata 的子字典会被丢弃，导致下游 `_origin_from_trusted` 读不到、task 工具报 `trusted_task_context_missing`。规则：executor 写入 trusted_metadata 的每个键都应镜像进 trusted_claims。
 
 ## 模式十三：平台聚合与主动外发按 platform 路由
 
@@ -463,6 +466,7 @@ logs 范围限制：
 - CLI 构造 `InteractionMessage` 时必须注入 `actor_id=cli:{conversation_id}`，否则 `/new` 等破坏性命令会绕过 confirmation 直接执行（actor_id 为空时 preflight 视为无 actor 不需要确认）
 - CLI `trusted_metadata.gateway.source` 必须为 `"cli"`，且不得写入 `gateway.platform`；`ChatCompletionService._compute_permitted_managed_tools` 只认可真实平台 `gateway.platform=feishu`，CLI 不得获得 Feishu 专属 managed tool（如 `manage_schedule`）
 - `app.interfaces.cli:main` console script 入口由 `__init__.py` re-export `main`，迁移单文件为 package 时必须删除旧 `cli.py` 避免同名冲突
+- CLI 子命令与 HTTP routes 共享同一 Application service 契约（同一 `xxx_service` 方法）：service 方法返回类型变更（尤其可迭代对象 -> 包装对象，如 `tuple[Task,...]` -> `TaskListPage(items, next_cursor)`）时必须 grep 全部消费方同步迁移到新字段，并给 CLI 侧补回归测试（monkeypatch `_load_xxx_service` 返回 Fake，断言 rc==0 且渲染含期望 id）；HTTP 迁移而 CLI 漏迁会导致 `n-agent task ls` 类 `'XxxPage' object is not iterable` 错误（教训 P014）
 
 ## 模式二十：ACP stdio 服务端 stdout 纯净性与路径映射
 

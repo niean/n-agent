@@ -95,6 +95,39 @@ def test_can_expose_fails_closed_for_non_exposure_enum_values(unknown):
     assert ToolPolicy().can_expose(definition(risk=RiskLevel.SAFE), unknown) is False
 
 
+def test_can_expose_safe_only_exposes_permitted_managed_tool():
+    """Managed CONFIRM tools (e.g. task_*) must be exposed to unattended
+    workers when the server-side executor declares them in
+    permitted_managed_tools; otherwise task workers see no task tools."""
+    policy = ToolPolicy()
+    managed = definition(managed=True, name="task_complete")
+    # permitted -> exposed even under SAFE_ONLY
+    assert policy.can_expose(
+        managed, ToolExposurePolicy.SAFE_ONLY,
+        frozenset(), frozenset({"task_complete"}),
+    ) is True
+    # not permitted -> hidden
+    assert policy.can_expose(
+        managed, ToolExposurePolicy.SAFE_ONLY,
+        frozenset(), frozenset(),
+    ) is False
+    assert policy.can_expose(
+        managed, ToolExposurePolicy.SAFE_ONLY,
+        frozenset(), frozenset({"other_tool"}),
+    ) is False
+
+
+def test_can_expose_safe_only_permitted_managed_does_not_lift_non_managed_confirm():
+    """permitted_managed_tools must never expose a non-managed CONFIRM tool;
+    only managed tools are lifted by the server-side declaration."""
+    policy = ToolPolicy()
+    confirm = definition(risk=RiskLevel.CONFIRM, managed=False, name="task_complete")
+    assert policy.can_expose(
+        confirm, ToolExposurePolicy.SAFE_ONLY,
+        frozenset(), frozenset({"task_complete"}),
+    ) is False
+
+
 def test_tool_policy_implements_shared_policy_contract_and_request_is_frozen():
     tool_request = ToolPolicyRequest(definition(risk=RiskLevel.SAFE), request())
     policy: Policy[ToolPolicyRequest, ToolExecutionContext, PolicyDecision] = ToolPolicy()

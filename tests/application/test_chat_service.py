@@ -302,6 +302,32 @@ async def test_complete_unattended_mode_has_no_managed_tools(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_complete_unattended_mode_honors_declared_permitted_managed_tools(tmp_path):
+    """Task workers run unattended and declare their permitted managed tools
+    (task_show/task_complete/...) as server-side trusted claims; ChatCompletion
+    Service must honor that declaration so the worker can actually use them."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            options={"execution_context_mode": "unattended"},
+            trusted_metadata={"permitted_managed_tools": ["task_complete", "task_heartbeat"]},
+            session_id="s4",
+        )
+    )
+
+    ctx = runner.options["tool_execution_context"]
+    assert ctx.execution_context_mode == "unattended"
+    assert ctx.permitted_managed_tools == {"task_complete", "task_heartbeat"}
+    assert runner.options["tool_exposure_policy"] == "safe_only"
+
+
+@pytest.mark.asyncio
 async def test_complete_normalizes_acp_session_grants_against_live_definitions(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     runner = RecordingRunner()

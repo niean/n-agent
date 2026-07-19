@@ -73,6 +73,7 @@ def run(args) -> int:
         "ls": _cmd_list,
         "show": _cmd_show,
         "create": _cmd_create,
+        "delete": _cmd_delete,
         "assign": _cmd_assign,
         "promote": _cmd_promote,
         "archive": _cmd_archive,
@@ -101,7 +102,13 @@ def _cmd_list(args) -> int:
         console = make_console()
         console.print("[yellow]task subsystem disabled[/yellow]")
         return 0
-    tasks = asyncio.run(service.list_tasks(limit=100))
+    page = asyncio.run(service.list_tasks(limit=100))
+    tasks = list(page.items)
+    while getattr(args, "all", False) and page.next_cursor is not None:
+        page = asyncio.run(
+            service.list_tasks(cursor=page.next_cursor, limit=100)
+        )
+        tasks.extend(page.items)
     items = [_task_to_dict(t) for t in tasks]
     fmt = resolve_format(args)
     render_data(items, fmt=fmt, headers=_LIST_HEADERS, console=make_console())
@@ -116,6 +123,15 @@ def _cmd_show(args) -> int:
     fmt = resolve_format(args)
     render_data(_task_to_dict(task), fmt=fmt, console=make_console())
     return 0
+
+
+def _cmd_delete(args) -> int:
+    service = _load_task_service()
+    if service is None:
+        return _disabled()
+    deleted = asyncio.run(service.delete_task(args.id))
+    render_data({"id": args.id, "deleted": bool(deleted)}, fmt=resolve_format(args), console=make_console())
+    return 0 if deleted else 1
 
 
 def _cmd_create(args) -> int:
