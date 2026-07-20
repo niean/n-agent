@@ -29,6 +29,7 @@ Returns 6 managed ToolDefinitions for the Task subdomain (Manus-aligned
 """
 from __future__ import annotations
 
+from app.domain.task import TaskStatus
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 
 
@@ -202,5 +203,79 @@ def task_tool_definitions() -> list[ToolDefinition]:
             source_type=ToolSourceType.AGENT,
             toolset="task",
             managed=True,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 用户侧任务工具（自然语言委派入口）
+# ---------------------------------------------------------------------------
+
+USER_TASK_TOOL_CREATE = "create_task"
+USER_TASK_TOOL_LIST = "list_tasks"
+USER_TASK_TOOL_NAMES: frozenset[str] = frozenset({USER_TASK_TOOL_CREATE, USER_TASK_TOOL_LIST})
+
+
+def user_task_tool_definitions() -> list[ToolDefinition]:
+    """返回用户侧任务工具定义（create_task / list_tasks）。
+
+    与 worker managed task 工具（task_tool_definitions）的关键差异：
+      - source_type=AGENT + risk_level=SAFE + managed=false
+      - realtime（DEFAULT 暴露）对对话 Agent 可见；unattended（SAFE_ONLY）
+        默认隐藏 AGENT 源工具，故 worker/judge 不可见，防递归建子任务。
+      - 绝不加入任何 worker/judge 的 granted_tools（见 spec Constraints）。
+
+    create_task 由对话 Agent 在判断用户目标适合委派时调用，把自然语言目标
+    委派为后台 Task（绑定当前会话），由既有 TaskRunner/worker 在同会话执行。
+    list_tasks 列出当前会话关联任务，供 Agent 回答任务进度类提问。
+    """
+    return [
+        ToolDefinition(
+            name=USER_TASK_TOOL_CREATE,
+            description=(
+                "把用户的自然语言目标委派为一个后台 Task，绑定当前会话；"
+                "Task 进入队列后由任务引擎在当前会话内自主执行，生命周期状态以系统消息呈现。"
+                "适用于多步执行、研究分析、文件/代码产出、长耗时或可后台自主完成的目标；"
+                "不适用于单步问答、查事实、简单计算等可直接回答的请求。"
+                "goal 为完整自然语言目标（写入 task body）；title 为短标题，可省略。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "minLength": 1},
+                    "title": {"type": "string"},
+                    "priority": {"type": "integer", "minimum": 0},
+                    "goal_mode": {"type": "boolean"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["goal"],
+                "additionalProperties": False,
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="task",
+            managed=False,
+        ),
+        ToolDefinition(
+            name=USER_TASK_TOOL_LIST,
+            description=(
+                "列出当前会话关联、未归档的任务（origin_session_id 精确匹配）。"
+                "用于回答用户关于本会话任务进度/状态的提问。可选 status 过滤。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": [s.value for s in TaskStatus],
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="task",
+            managed=False,
         ),
     ]

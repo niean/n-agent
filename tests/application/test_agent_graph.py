@@ -964,3 +964,114 @@ async def test_agent_graph_external_memory_prefetch_uses_text_only_and_preserves
     user_msg = next(m for m in provider.last_messages if m.get("role") == "user")
     assert isinstance(user_msg["content"], list)
     assert any(part.get("type") == "image_url" for part in user_msg["content"])
+
+
+# ---------------------------------------------------------------------------
+# 自然语言任务委派闭环：对话 Agent 调 create_task -> 服务收到会话 origin ->
+# 持久化 tool call -> Agent 输出含 task id 的确认
+# spec: spec-260720-chat-natural-language-task.md
+# ---------------------------------------------------------------------------
+
+
+class TaskDelegationProvider(FakeProvider):
+    """call 1 发 create_task 工具调用；call 2 输出含 task id 的确认文本。"""
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-del-1",
+                            "type": "function",
+                            "function": {
+                                "name": "create_task",
+                                "arguments": '{"goal":"帮我生成本周工作周报","title":"写周报"}',
+                            },
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+            )
+        return LLMResult(
+            message={"role": "assistant", "content": "已创建任务 t_delegated，将在本会话执行。"},
+            finish_reason="stop",
+        )
+
+
+class _FakeUserTaskServiceForGraph:
+    """记录 create_task 调用并返回固定 task。"""
+
+    def __init__(self):
+        self.create_calls: list[dict] = []
+
+    async def create_task(self, *, title, body="", priority=0, created_by="",
+                          origin_session_id=None, idempotency_key=None,
+                          skills=(), goal_mode=False, **_kw):
+        self.create_calls.append({
+            "title": title, "body": body, "origin_session_id": origin_session_id,
+            "idempotency_key": idempotency_key, "created_by": created_by,
+        })
+        from app.domain.task import TaskStatus, TaskWorkspaceKind
+        from datetime import datetime, timezone
+        from app.domain.task import Task
+        now = datetime.now(timezone.utc)
+        return Task(
+            id="t_delegated", title=title, body=body, status=TaskStatus.QUEUED,
+            origin_session_id=origin_session_id, created_at=now, updated_at=now,
+            goal_mode=goal_mode, workspace_kind=TaskWorkspaceKind.SCRATCH,
+        )
+
+    async def list_tasks(self, board="default", cursor=None, limit=100):
+        from app.domain.task import TaskListPage
+        return TaskListPage(items=(), next_cursor=None)
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_delegates_task_and_confirms_with_task_id(tmp_path):
+    from app.application.task_tools import user_task_tool_definitions
+    from app.domain.tool import ToolExecutionContext
+    from app.infrastructure.tools.user_task_management import UserTaskToolExecutor
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    fake_svc = _FakeUserTaskServiceForGraph()
+    runner = AgentGraphRunner(
+        TaskDelegationProvider(),
+        ToolService(
+            CompositeToolExecutor({
+                "create_task": UserTaskToolExecutor(fake_svc),
+                "list_tasks": UserTaskToolExecutor(fake_svc),
+            }),
+            user_task_tool_definitions(),
+        ),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    ctx = ToolExecutionContext(session_id="s1", trusted_metadata={"actor_id": "u1"})
+    state = await runner.run(
+        AgentState(
+            session_id="s1",
+            input_messages=[{"role": "user", "content": "帮我生成本周工作周报"}],
+        ),
+        "test",
+        options={"tool_execution_context": ctx},
+    )
+
+    # 服务收到当前会话作为 origin，幂等键含 session 与 tool_call id
+    assert len(fake_svc.create_calls) == 1
+    rec = fake_svc.create_calls[0]
+    assert rec["origin_session_id"] == "s1"
+    assert rec["created_by"] == "u1"
+    assert rec["idempotency_key"] == "chat:s1:call-del-1"
+    assert rec["body"] == "帮我生成本周工作周报"
+    # tool call 持久化
+    tool_calls = await store.list_tool_calls("s1")
+    assert any(tc.tool_name == "create_task" and tc.status == "success" for tc in tool_calls)
+    # Agent 在工具结果后输出含 task id 的确认文本
+    assert state.final_message["content"] == "已创建任务 t_delegated，将在本会话执行。"

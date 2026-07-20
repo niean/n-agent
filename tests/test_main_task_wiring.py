@@ -237,3 +237,61 @@ def test_task_run_service_lease_and_concurrency_from_settings(tmp_path: Path):
     assert services.task_run_service.max_concurrency == 2
     assert services.task_run_service.max_runtime_seconds == 1800
     assert services.task_run_service.heartbeat_timeout_seconds == 120
+
+
+# ---------------------------------------------------------------------------
+# 用户侧任务工具装配（自然语言委派 create_task / list_tasks）
+# spec: spec-260720-chat-natural-language-task.md
+# ---------------------------------------------------------------------------
+
+
+def test_user_task_tools_registered_when_task_subsystem_available(tmp_path: Path):
+    """task 子系统可用时，create_task/list_tasks 注册为动态定义。"""
+    from app.application.task_tools import USER_TASK_TOOL_NAMES
+
+    services = build_application_services(_settings(tmp_path))
+    names = {d.name for d in services.tool_service.list_definitions()}
+    assert USER_TASK_TOOL_NAMES <= names
+    # 无重名
+    all_names = [d.name for d in services.tool_service.list_definitions()]
+    assert len(all_names) == len(set(all_names)), "duplicate tool names"
+
+
+def test_user_task_tools_routed_to_single_user_executor(tmp_path: Path):
+    """create_task/list_tasks 路由到同一个 UserTaskToolExecutor。"""
+    from app.application.task_tools import USER_TASK_TOOL_NAMES
+    from app.infrastructure.tools.user_task_management import UserTaskToolExecutor
+
+    services = build_application_services(_settings(tmp_path))
+    routes = services.tool_service.executor.routes
+    user_executors = {
+        routes[name] for name in USER_TASK_TOOL_NAMES if name in routes
+    }
+    assert len(user_executors) == 1, "create_task/list_tasks must share one executor"
+    assert isinstance(next(iter(user_executors)), UserTaskToolExecutor)
+
+
+def test_user_task_tools_do_not_disrupt_worker_task_routes(tmp_path: Path):
+    """用户侧工具注册后，6 个 worker managed task 工具路由保持不变。"""
+    from app.infrastructure.tools.task_management import TaskManagementToolExecutor
+
+    services = build_application_services(_settings(tmp_path))
+    routes = services.tool_service.executor.routes
+    worker_executors = {routes[name] for name in TASK_TOOL_NAMES if name in routes}
+    assert len(worker_executors) == 1
+    assert isinstance(next(iter(worker_executors)), TaskManagementToolExecutor)
+
+
+def test_user_task_tools_absent_when_task_schema_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """task 子系统 schema 失败（task_registry None）时，create_task/list_tasks 不注册。"""
+    from app.application.task_tools import USER_TASK_TOOL_NAMES
+    import app.main as main_module
+
+    class _BoomRegistry:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("simulated schema failure")
+
+    monkeypatch.setattr(main_module, "SQLiteTaskRegistry", _BoomRegistry)
+    services = build_application_services(_settings(tmp_path))
+    names = {d.name for d in services.tool_service.list_definitions()}
+    assert USER_TASK_TOOL_NAMES.isdisjoint(names)

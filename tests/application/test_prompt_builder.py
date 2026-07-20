@@ -38,3 +38,28 @@ def test_build_system_prompt_includes_skills_index_when_provided():
 def test_build_system_prompt_omits_skills_index_when_none():
     prompt = build_system_prompt()
     assert "<available_skills>" not in prompt
+
+
+def test_build_system_prompt_includes_task_delegation_guidance():
+    from app.application.prompt_builder import TASK_DELEGATION_GUIDANCE
+
+    prompt = build_system_prompt()
+    assert TASK_DELEGATION_GUIDANCE in prompt
+    assert "create_task" in prompt
+    assert "list_tasks" in prompt
+
+
+def test_task_delegation_guidance_covers_key_points():
+    from app.application.prompt_builder import TASK_DELEGATION_GUIDANCE
+
+    text = TASK_DELEGATION_GUIDANCE
+    # 委派多步/研究/文件产出/长耗时目标
+    assert "create_task" in text
+    # 查询本会话任务
+    assert "list_tasks" in text
+    # goal_mode 限定
+    assert "goal_mode" in text
+    # 管控操作走 /task 或看板
+    assert "/task" in text
+    # 委派后仅确认、不在同轮自行完成
+    assert "confirm" in text.lower() or "one sentence" in text.lower() or "不要" in text

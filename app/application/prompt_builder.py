@@ -39,6 +39,25 @@ MANAGED_TOOL_GUIDANCE = (
     "Never schedule tasks that recursively manage N-Agent itself."
 )
 
+TASK_DELEGATION_GUIDANCE = (
+    "When the user's goal is multi-step, requires research or analysis, produces files or code, "
+    "or is long-running and can be completed autonomously in the background, delegate it as a Task "
+    "by calling create_task(goal=..., title=...) with a short title and the full natural-language goal. "
+    "The task engine executes the task in the current session and reports lifecycle state as system "
+    "messages. After delegating, reply with one sentence confirming the created task id; do not also "
+    "complete the whole goal yourself in the chat. "
+    "Set goal_mode=true only for open-ended goals that need the multi-turn judge verification loop; "
+    "otherwise omit it. "
+    "Do not delegate single-step questions, factual lookups, simple calculations, or one-shot lookups -- "
+    "answer directly or use other tools instead. "
+    "When list_tasks is available and the user asks about their tasks or progress, call it (it filters "
+    "to the current session) and answer naturally; if empty, say so. "
+    "Approve, reject, cancel, and retry are not handled via natural language this iteration -- tell the "
+    "user to use the /task command or the kanban board for those. "
+    "Do not delegate every message, and never delegate a goal and then also execute it yourself in the "
+    "same turn."
+)
+
 
 def build_system_prompt(
     external_memory_manager: ExternalMemoryManager | None = None,
@@ -51,6 +70,7 @@ def build_system_prompt(
         KNOWLEDGE_GUIDANCE,
         SKILL_GUIDANCE,
         MANAGED_TOOL_GUIDANCE,
+        TASK_DELEGATION_GUIDANCE,
         SAFETY_GUIDANCE,
     ]
     if skills_index:

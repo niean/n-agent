@@ -50,7 +50,7 @@ from app.application.task_agent_executor import TaskAgentExecutor
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
 from app.application.task_service import TaskService
-from app.application.task_tools import task_tool_definitions
+from app.application.task_tools import task_tool_definitions, user_task_tool_definitions
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
 from app.application.usage_service import UsageService
 from app.application.vision_tool_executor import VisionAnalyzeToolExecutor
@@ -104,6 +104,7 @@ from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_t
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
 from app.infrastructure.tools.task_management import TaskManagementToolExecutor
+from app.infrastructure.tools.user_task_management import UserTaskToolExecutor
 from app.infrastructure.task.outbound import TaskOutboundDelivery
 from app.infrastructure.usage.context_breakdown_calculator import ContextBreakdownCalculatorImpl
 from app.infrastructure.usage.pricing_table import InMemoryPricingProvider
@@ -993,6 +994,22 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         task_management_executor = TaskManagementToolExecutor(task_service)
         for definition in task_tool_definitions():
             routes[definition.name] = task_management_executor
+        # Wire UserTaskToolExecutor (natural-language task delegation) into
+        # routes. 仅在 task 子系统可用时注册（本块已在 if task_registry is not
+        # None: 内）；source_type=AGENT+SAFE+managed=false，realtime 可见、
+        # SAFE_ONLY 默认隐藏，worker/judge 不得 grant 这两个名字（防递归）。
+        # spec: spec-260720-chat-natural-language-task.md
+        user_task_executor = UserTaskToolExecutor(task_service)
+        # 启动时断言两工具名未与既有 static/dynamic 定义或 route 冲突（spec）。
+        _existing_tool_names = {d.name for d in tool_service.list_definitions()}
+        for _user_task_name in ("create_task", "list_tasks"):
+            if _user_task_name in routes or _user_task_name in _existing_tool_names:
+                raise RuntimeError(
+                    f"duplicate tool name on startup: {_user_task_name}"
+                )
+        routes["create_task"] = user_task_executor
+        routes["list_tasks"] = user_task_executor
+        tool_service.set_dynamic_definitions("user_task", user_task_tool_definitions())
         tool_service.executor = CompositeToolExecutor(
             routes, fallback=McpToolExecutor(mcp_service)
         )

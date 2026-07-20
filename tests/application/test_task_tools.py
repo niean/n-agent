@@ -159,3 +159,85 @@ def test_task_fail_input_schema():
     assert props["reason"].get("minLength") == 1
     assert "reason" in schema.get("required", [])
     assert schema.get("additionalProperties") is False
+
+
+# ---------------------------------------------------------------------------
+# 用户侧任务工具定义（自然语言委派入口 create_task / list_tasks）
+# spec: spec-260720-chat-natural-language-task.md
+# ---------------------------------------------------------------------------
+
+
+def test_user_task_tool_names_constants_and_disjoint():
+    from app.application.task_tools import (
+        USER_TASK_TOOL_CREATE,
+        USER_TASK_TOOL_LIST,
+        USER_TASK_TOOL_NAMES,
+    )
+
+    assert USER_TASK_TOOL_CREATE == "create_task"
+    assert USER_TASK_TOOL_LIST == "list_tasks"
+    assert USER_TASK_TOOL_NAMES == frozenset({USER_TASK_TOOL_CREATE, USER_TASK_TOOL_LIST})
+    # 与 worker managed 工具集不相交（防递归：worker 侧不暴露用户侧工具）
+    worker_names = {d.name for d in task_tool_definitions()}
+    assert USER_TASK_TOOL_NAMES.isdisjoint(worker_names)
+
+
+def test_user_task_tool_definitions_returns_two():
+    from app.application.task_tools import user_task_tool_definitions
+
+    defs = user_task_tool_definitions()
+    assert {d.name for d in defs} == {"create_task", "list_tasks"}
+    assert len(defs) == 2
+
+
+def test_user_task_tool_definitions_common_attributes():
+    """两个用户侧工具：AGENT + SAFE + managed=False + toolset=task + enabled。"""
+    from app.application.task_tools import user_task_tool_definitions
+
+    for d in user_task_tool_definitions():
+        assert d.source_type is ToolSourceType.AGENT, f"{d.name} source_type"
+        assert d.toolset == "task", f"{d.name} toolset"
+        assert d.managed is False, f"{d.name} managed"
+        assert d.risk_level is RiskLevel.SAFE, f"{d.name} risk_level"
+        assert d.enabled is True, f"{d.name} enabled"
+
+
+def test_user_task_tool_definitions_pass_policy_validation():
+    """managed=False + SAFE 能通过 ToolPolicy.validate_definition。"""
+    from app.application.task_tools import user_task_tool_definitions
+    from app.domain.tool_policy import ToolPolicy
+
+    policy = ToolPolicy()
+    for d in user_task_tool_definitions():
+        policy.validate_definition(d)
+
+
+def test_create_task_input_schema():
+    from app.application.task_tools import user_task_tool_definitions
+
+    schema = {d.name: d for d in user_task_tool_definitions()}["create_task"].input_schema
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["goal"]
+    props = schema["properties"]
+    assert props["goal"]["type"] == "string"
+    assert props["goal"]["minLength"] == 1
+    assert props["title"]["type"] == "string"
+    assert props["priority"]["type"] == "integer"
+    assert props["priority"]["minimum"] == 0
+    assert props["goal_mode"]["type"] == "boolean"
+    assert props["skills"]["type"] == "array"
+    assert props["skills"]["items"]["type"] == "string"
+
+
+def test_list_tasks_input_schema_status_enum_matches_taskstatus():
+    """list_tasks 的 status 枚举与 TaskStatus value 集合一致（不硬编码状态机）。"""
+    from app.application.task_tools import user_task_tool_definitions
+    from app.domain.task import TaskStatus
+
+    schema = {d.name: d for d in user_task_tool_definitions()}["list_tasks"].input_schema
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {"status"}
+    expected = {s.value for s in TaskStatus}
+    assert set(schema["properties"]["status"]["enum"]) == expected

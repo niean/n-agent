@@ -412,10 +412,14 @@ async def test_create_task_empty_title_rejected(svc):
 
 
 @pytest.mark.asyncio
-async def test_create_task_idempotency(svc):
+async def test_create_task_idempotency(svc, registry):
     await svc.create_task(title="x", created_by="u", idempotency_key="k1")
     with pytest.raises(TaskConflictError):
         await svc.create_task(title="x", created_by="u", idempotency_key="k1")
+    # 自然语言委派复用此契约：同一 tool-call 重放（chat:{session}:{request.id}）
+    # 不得创建第二个任务，registry 只含一条记录。
+    page = await registry.list_tasks(limit=200)
+    assert len(page.items) == 1
 
 
 @pytest.mark.asyncio

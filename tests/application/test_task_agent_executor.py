@@ -643,3 +643,49 @@ async def test_executor_trusted_claims_match_metadata(executor, fake_chat):
     assert claims.get("claim_lock") == metadata.get("claim_lock") == "lock-7"
     assert claims.get("execution_run_id") == metadata.get("execution_run_id")
     assert claims.get("write_origin") == metadata.get("write_origin") == "worker"
+
+
+# ---------------------------------------------------------------------------
+# 防递归：worker / judge 不得 grant 用户侧任务工具（spec 防递归核心）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_grant_user_task_tools(executor, fake_chat):
+    """worker 的 granted_tools 与 permitted_managed_tools 都不得含用户侧工具。"""
+    from app.application.task_tools import USER_TASK_TOOL_NAMES
+
+    await executor.run(_task(), task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+    granted = set(call.trusted_metadata.get("granted_tools", []))
+    permitted = set(call.trusted_metadata.get("permitted_managed_tools", []))
+    assert USER_TASK_TOOL_NAMES.isdisjoint(granted)
+    assert USER_TASK_TOOL_NAMES.isdisjoint(permitted)
+
+
+@pytest.mark.asyncio
+async def test_judge_does_not_grant_user_task_tools():
+    """judge fork 的 granted_tools 与 permitted_managed_tools 都不得含用户侧工具。"""
+    from app.application.task_tools import USER_TASK_TOOL_NAMES
+
+    worker_result = ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": "did work"},
+        finish_reason="stop",
+    )
+    judge_text = '{"achieved": true, "reason": "done"}'
+    chat = FakeJudgeChatService(worker_result, judge_text)
+    ex = TaskAgentExecutor(
+        chat_service=chat, task_registry=FakeTaskRegistry(),
+        prompt_builder=FakePromptBuilder(),
+    )
+    await ex.run_goal_loop(
+        _task(goal_mode=True, goal_max_turns=3), task_run_id=1, claim_lock="L1",
+    )
+    judge_calls = [c for c in chat.complete_calls if c.trusted_metadata.get("judge")]
+    assert len(judge_calls) >= 1
+    judge_call = judge_calls[0]
+    granted = set(judge_call.trusted_metadata.get("granted_tools", []))
+    permitted = set(judge_call.trusted_metadata.get("permitted_managed_tools", []))
+    assert USER_TASK_TOOL_NAMES.isdisjoint(granted)
+    assert USER_TASK_TOOL_NAMES.isdisjoint(permitted)

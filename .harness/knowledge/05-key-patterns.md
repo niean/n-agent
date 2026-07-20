@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -881,3 +881,27 @@ Task 终态失败必须区分三种来源，分别映射不同 status 与重试�
 - 把 worker 主动失败塞进可重试 `FAILED`（`_RETRYABLE_OUTCOMES`）会导致确定性失败被反复重试（execute_code 不可用重试 N 次仍失败，浪费）。必须用独立 `ABORTED` 绕过断路器。
 - `task_cancel` 收回用户专用后，worker 工具集枚举、`_dispatch` 分支、`TASK_TOOL_NAMES`、`permitted_managed_tools`、TASK_GUIDANCE、测试必须同步更新；遗漏任一处会留死代码或 worker 仍能调 cancel。
 - `_NOTIFIED_OUTCOMES`（task_service.py 与 infrastructure/task/outbound.py 镜像）必须加 ABORTED，否则 worker 快速失败不触发飞书/通知投递。
+
+## 模式二十九：用户侧委派工具的暴露与防递归
+
+对话 Agent（realtime）需要把目标委派给后台任务引擎（Task），但 worker（unattended）不得看到该工具，否则 worker 会递归建子任务。用 `source_type=AGENT + risk_level=SAFE + managed=false` 三属性组合实现“realtime 可见 / unattended 隐藏”的非对称暴露：
+
+| 暴露策略 | 场景 | can_expose 规则（tool_policy.py） | create_task/list_tasks |
+|----------|------|-----------------------------------|------------------------|
+| DEFAULT | realtime 对话 Agent | 非 DANGEROUS 全暴露 | 可见 |
+| SAFE_ONLY | unattended worker / judge | managed+permitted 或 SAFE+非AGENT 或 SAFE+AGENT+granted | 不可见（AGENT 源默认隐藏） |
+
+规则：
+- 用户侧工具定义在 Application（`task_tools.py::user_task_tool_definitions`），执行器在 Infrastructure（`user_task_management.py::UserTaskToolExecutor`），与 worker managed 工具（`task_tool_definitions`/`TaskManagementToolExecutor`）分离，不互相污染。
+- `source_type=AGENT` 是防递归的关键：SAFE_ONLY 下 AGENT 源工具仅在 `granted_tools` 命中时暴露（这正是 host_terminal 被 worker 可见的机制）。因此必须用回归测试固化“worker/judge 的 `granted_tools` 与 `USER_TASK_TOOL_NAMES` 不相交”，防止未来 grant 改造误授予。
+- 会话绑定只读 trusted 通道：`origin_session_id = ctx.session_id`（ChatCompletionService 服务端注入，非客户端可伪造）、`created_by = ctx.trusted_metadata.actor_id`，禁止读 untrusted `ctx.metadata`（模式十二）。
+- 幂等键 `chat:{session_id}:{request.id}`：同一 tool-call 重放经 `Task.idempotency_key` 唯一索引去重，registry 抛 `TaskConflictError` -> 执行器映射 `task_conflict`，不重复建任务。
+- 公开字段白名单：create 响应仅 `id/title/status/goal_mode`，list 仅 `id/title/status/created_at`，不回传 body/origin_session_id/claim/worker_token；错误用稳定 code（不透传 traceback/数据库文本）。
+- 装配条件：仅在 `task_registry is not None`（task 子系统可用）分支注册 routes + `set_dynamic_definitions("user_task", ...)`，并在注册前断言两工具名未与既有 static/dynamic 定义或 route 冲突；task 子系统不可用时两工具不注册、`/chat/tools` 不显示。
+- 复用既有执行链：任务创建后走同一 TaskRunner `dispatch_once` 认领、`task_execution_session_id(task)` 选择器（origin 优先）路由回当前会话、`ui.task_lifecycle` 生命周期消息；不新增状态机/表/迁移。
+
+陷阱：
+- 若误把用户侧工具设为 `source_type=BUILTIN`，SAFE_ONLY 会暴露给 worker -> worker 调 create_task 递归建子任务。必须用 AGENT 源。
+- 若未来给 worker `granted_tools` 加入 `create_task`/`list_tasks`（仿 host_terminal 授权），SAFE_ONLY 会暴露 -> 防递归失效。grant 禁令必须由回归测试守护。
+- `list_tasks` 服务异常应映射 ERROR + `success:false` + `task_list_failed` + 空 items，不得返回 `success:true`+SUCCESS（自相矛盾，Agent 会把错误误判为空列表）；异常捕获只包服务调用，过滤逻辑的 bug 应向上传播不被静默吞掉。
+- 用户侧工具不得用 `permitted_managed_tools` 绕过暴露（该通道只适用 managed 工具）；`managed=false` 决定它走 SAFE 暴露路径，不走 managed 门控。

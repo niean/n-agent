@@ -34,7 +34,8 @@
 | D030 | `n-agent task list/ls` 的 `--status` 参数被 argparse 解析但 `_cmd_list` 完全未使用（`TaskService.list_tasks(board, cursor, limit)` 无 status 形参，registry 也未实现状态过滤）。当前为误导性 dead arg：用户传 `--status done` 仍返回全量任务。修复需在 service/registry 链路增加可选 status 过滤或移除该参数。非本次 bugfix 引入，属既有遗留。 | low | N/A | 2026-07-19 | open |
 | D031 | goal_mode judge fork（`TaskAgentExecutor._run_judge`）的 TASK_GUIDANCE 指示 judge 使用只读工具 `task_show` 读取任务上下文，但 judge 构造的 `permitted_managed_tools=[]`（且 safe_only 暴露闸要求 permitted_managed_tools 命中才放行 managed 工具），导致 task_show 对 judge 不可见，judge 无法读取任务 body/result 判定目标是否达成。仅影响 goal_mode 任务（验收 5.1），单轮 worker 路径不受影响（run() 已注入 7 个 task 工具）。修复需给 judge 注入 `permitted_managed_tools={"task_show"}`（只读子集，不含 task_complete/block 等写工具）。 | low | N/A | 2026-07-19 | open |
 | D032 | Dashboard Chat `/task list` 仅取首页分页：`api.task.list()` 返回 `{items, next_cursor}`，前端按 `origin_session_id` 过滤首页 100 条后不消费 `next_cursor`，单会话任务超 100 条时漏显。spec 约定本期不改后端 `list_tasks`，故前端只过滤首页。后续需后端支持 session/cursor 过滤或前端聚合全部分页。 | low | plan-260720-task-chat-lifecycle.md | 2026-07-20 | open |
-| D033 | 自然语言任务管控（用户在对话用自然语言指挥 Agent 创建/管控任务）为 spec 明确的未来 TODO，本期仅实现 `/task` slash 命令（本地解析，不消耗 LLM token）。后续需用户侧 task 工具或 Agent 意图识别才能实现。 | low | plan-260720-task-chat-lifecycle.md | 2026-07-20 | open |
+| D033 | 自然语言任务管控：创建+查询已由 plan-260720-chat-natural-language-task.md 实现（用户侧 create_task/list_tasks SAFE 工具 + Agent 委派指引，realtime 可见/worker 防递归）；状态变更类管控（approve/reject/cancel/retry 用自然语言承载）仍为未来 TODO，本期继续走 /task 命令与看板。 | low | plan-260720-chat-natural-language-task.md | 2026-07-20 | open |
+| D034 | UserTaskToolExecutor.list_tasks 穷尽 TaskService 全局 board 分页后再按 origin_session_id 过滤，单 board 任务量大时查询成本线性增长。本期按 spec 保持现有数据模型不新增索引或 session 查询接口；后续可加 session 维度查询。 | low | plan-260720-chat-natural-language-task.md | 2026-07-20 | open |
 
 ---
 

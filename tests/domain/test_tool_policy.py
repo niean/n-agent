@@ -406,3 +406,31 @@ def test_authorize_once_rejects_inputs_that_do_not_currently_require_approval(
 ):
     with pytest.raises(ValueError):
         ToolPolicy().authorize_once(tool_definition, call, context)
+
+
+def test_user_task_tools_exposure_rules():
+    """用户侧工具 create_task/list_tasks 暴露规则（spec 防递归核心）。
+
+    - DEFAULT（realtime 对话）：可见
+    - SAFE_ONLY（unattended worker）未 grant：不可见（防 worker 递归建子任务）
+    - SAFE_ONLY 错误 grant 后会暴露：回归守卫，提醒 grant 禁令的必要性
+    """
+    from app.application.task_tools import user_task_tool_definitions
+
+    policy = ToolPolicy()
+    defs = user_task_tool_definitions()
+    names = frozenset(d.name for d in defs)
+    for d in defs:
+        assert d.source_type is ToolSourceType.AGENT
+        assert d.risk_level is RiskLevel.SAFE
+        assert d.managed is False
+        assert policy.can_expose(d, ToolExposurePolicy.DEFAULT) is True
+        assert (
+            policy.can_expose(d, ToolExposurePolicy.SAFE_ONLY, granted_tools=frozenset())
+            is False
+        )
+        # 回归守卫：grant 命中时会暴露，故 worker/judge 不得 grant 这两个名字
+        assert (
+            policy.can_expose(d, ToolExposurePolicy.SAFE_ONLY, granted_tools=names)
+            is True
+        )
