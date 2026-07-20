@@ -143,3 +143,29 @@ async def test_provider_passes_through_multimodal_content_array():
     assert messages[0]["content"] is content
     assert isinstance(messages[0]["content"], list)
     assert messages[0]["content"][1]["type"] == "image_url"
+
+
+def test_tool_call_to_dict_normalizes_unicode_escapes_in_arguments():
+    """tool_call arguments 的 \\uXXXX 转义归一化为可读中文（/v1/chat/completions 响应 + SSE）。"""
+    from app.infrastructure.llm.openai_compatible import _tool_call_to_dict
+
+    # 对象形式（provider 返回的 tool_call）
+    tc = SimpleNamespace(
+        id="c1", type="function",
+        function=SimpleNamespace(name="task_complete", arguments='{"summary": "\\u5df2\\u5b8c\\u6210"}'),
+    )
+    d = _tool_call_to_dict(tc)
+    assert "\\u" not in d["function"]["arguments"], "still escaped: " + d["function"]["arguments"]
+    assert "已完成" in d["function"]["arguments"]
+
+    # dict 形式
+    d2 = _tool_call_to_dict({
+        "id": "c2", "type": "function",
+        "function": {"name": "x", "arguments": '{"a": "\\u5df2"}'},
+    })
+    assert "已" in d2["function"]["arguments"]
+    assert "\\u" not in d2["function"]["arguments"]
+
+    # 非法 JSON 原样返回（best-effort）
+    d3 = _tool_call_to_dict({"id": "c3", "type": "function", "function": {"name": "x", "arguments": "not json"}})
+    assert d3["function"]["arguments"] == "not json"

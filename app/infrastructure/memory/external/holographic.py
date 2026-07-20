@@ -142,7 +142,7 @@ class HolographicAdapter(ExternalMemoryProvider):
         else:
             mode_label = "hybrid (context auto-injected AND tools available)"
         return (
-            "# Holographic Memory\n"
+            "## Holographic Memory\n"
             f"Active. {total} facts stored.\n"
             f"Mode: {mode_label}."
         )

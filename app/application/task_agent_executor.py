@@ -55,39 +55,11 @@ from uuid import uuid4
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult
 from app.application.policy_snapshot import IngressFacts
 from app.application.task_session import task_execution_session_id
-from app.application.task_tools import TASK_TOOL_NAMES
+from app.application.task_tools import TASK_TOOL_NAMES, TASK_TOOL_SHOW
 from app.domain.policy import ExecutionMode
 from app.domain.task import Task, TaskRunOutcome
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# TASK_GUIDANCE (aligns Hermes KANBAN_GUIDANCE)
-# ---------------------------------------------------------------------------
-
-TASK_GUIDANCE = """\
-## Task Worker Guidance
-
-你正在执行一个 Task（异步后台任务）。请严格遵循以下步骤：
-
-1. 先调用 task_show 读取任务完整上下文（标题、正文、待审批提案、审批决策、进度事件、评论）
-2. 在 workspace 中使用通用工具干活，不要凭空假设
-3. 长任务执行中周期调用 task_heartbeat 续租 lease，避免被 reclaim
-4. 遇到需要用户决策的修改（如改变方案、确认破坏性操作、关键路径分歧）时调用
-   task_propose_change 提出提案（附 proposal 文本说明变更内容）。调用后本 run
-   立即结束，不继续执行后续修改；task 进入 WAITING_APPROVAL，等待用户批准或拒绝：
-   - 批准后续行：按提案内容继续执行
-   - 拒绝后续行：不得执行该提案，需选择不包含该提案的可行路径或再次提出新提案
-5. 完成后调用 task_complete 提交完成意图，附带 summary + metadata + artifacts
-6. 仅当确认当前 task 无法继续、确定性快速失败（不再重试）时调用 task_fail，
-   附带 reason 说明失败原因（如必需工具不可用、任务指令禁止兜底）。调用后 task
-   进入 FAILED 终态，不自动重试。注意：task_fail 是 worker 主动失败，不是用户取消；
-   用户取消走 /task cancel 或取消按钮，worker 不得触发取消语义。
-
-重要：task_complete / task_propose_change / task_fail 只提交终态意图，系统会以 claim token
-一次性终结 run（释放 claim + 回收 worker）。不要尝试直接修改 task 状态。
-"""
 
 
 # goal_mode 连续被判"目标未达成"的早退阈值。对齐 Hermes Ralph loop 的 turn-budget
@@ -138,22 +110,6 @@ class JudgeResult:
     reason: str = ""
 
 
-_JUDGE_PROMPT = """\
-你是一个 Task goal_mode judge。你的职责是判断 task 的 goal 是否已达成。
-
-你只能使用只读工具（task_show, search_knowledge, skills_list, skill_view），
-禁止使用任何写工具。
-
-判断完成后，你必须以严格 JSON 格式返回结果，不要包含其他内容：
-{"achieved": true/false, "reason": "简要说明判断依据"}
-
-判断依据：
-- task 的 goal 是否已在 workspace 中产出可验证的成果
-- task_complete 是否已被调用并附带合理 summary
-- 如果 task 仍在进行中或成果不完整，achieved=false
-"""
-
-
 # ---------------------------------------------------------------------------
 # TaskAgentExecutor
 # ---------------------------------------------------------------------------
@@ -196,7 +152,7 @@ class TaskAgentExecutor:
     ) -> TaskAgentResult:
         """Execute a single task turn via ChatCompletionService.
 
-        Constructs the system prompt (build_system_prompt + TASK_GUIDANCE),
+        Constructs the system prompt (build_system_prompt，含固定 TASK_GUIDANCE block),
         user prompt ``work task {task.id}``, and calls chat_service.complete
         with trusted task context. After completion, reads the latest intent
         event to determine the terminal outcome.
@@ -204,11 +160,10 @@ class TaskAgentExecutor:
         execution_session_id = task_execution_session_id(task)
         execution_run_id = f"task-run-{uuid4().hex[:12]}"
 
-        # Build system prompt
-        system_prompt = self._build_system_prompt(task)
-        # Inject TASK_GUIDANCE only when task tools are visible (always true
-        # for task workers -- they have permitted_managed_tools)
-        system_prompt = system_prompt + "\n\n" + TASK_GUIDANCE
+        # system prompt 由 ContextService 运行时构建（build_system_prompt，含固定 Task Guidance），
+        # 不在 request 中传 system 消息，避免 working_messages 出现重复 system + 重复 user
+        # （request 的 user 经 ChatCompletionService 持久化进 history，又经 input 重复；
+        # 且 request 的 system 打头会破坏 _dedupe_trailing 对 user 的去重）。
 
         # Build granted tools and permitted managed tools
         granted_tools = list(task.execution_policy.allowed_tools)
@@ -252,7 +207,6 @@ class TaskAgentExecutor:
         }
 
         messages = [
-            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"work task {task.id}"},
         ]
 
@@ -329,12 +283,13 @@ class TaskAgentExecutor:
             turn_result = await self.run(task, task_run_id, claim_lock)
             last_result = turn_result
 
-            # If the turn itself already terminal (WAITING_APPROVAL/FAILED/
-            # TIMED_OUT/CRASHED), return immediately. WAITING_APPROVAL means
+            # If the turn itself already terminal (WAITING_APPROVAL/ABORTED/
+            # FAILED/TIMED_OUT/CRASHED), return immediately. WAITING_APPROVAL means
             # the worker called task_propose_change; the run is already being
             # finalized by TaskRunService.finalize_propose.
             if turn_result.status in (
                 TaskRunOutcome.WAITING_APPROVAL,
+                TaskRunOutcome.ABORTED,
                 TaskRunOutcome.FAILED,
                 TaskRunOutcome.TIMED_OUT,
                 TaskRunOutcome.CRASHED,
@@ -343,7 +298,7 @@ class TaskAgentExecutor:
 
             # If the turn completed, run the judge
             if turn_result.status == TaskRunOutcome.COMPLETED:
-                judge = await self._run_judge(task)
+                judge = await self._run_judge(task, task_run_id, claim_lock)
                 if judge is None:
                     # Judge parse failure -> retryable FAILED
                     return TaskAgentResult(
@@ -413,19 +368,35 @@ class TaskAgentExecutor:
     # Judge fork
     # ------------------------------------------------------------------
 
-    async def _run_judge(self, task: Task) -> JudgeResult | None:
+    async def _run_judge(
+        self, task: Task, task_run_id: int, claim_lock: str,
+    ) -> JudgeResult | None:
         """Run a judge fork to evaluate goal achievement.
 
-        Returns None on parse failure (retryable FAILED). The judge has
-        read-only tools only -- no write tools, no task tools.
+        Returns None on parse failure (retryable FAILED). The judge is read-only:
+        only task_show is permitted（读任务上下文），无写工具、无 search_knowledge。
+        system 消息复用 build_system_prompt（含固定 ## Goal Mode Judge 章节），与 worker
+        共享 system prompt 前缀（cache stable），不再单独注入 _JUDGE_PROMPT。
+        judge 复用 worker 的 run_id/claim_lock 注入 trusted_metadata.task，使 task_show
+        通过 _origin_from_trusted（Gate 2）；write_origin="judge" 标识只读 fork。
         """
         execution_session_id = task_execution_session_id(task)
         judge_run_id = f"task-judge-{uuid4().hex[:12]}"
 
+        task_context: dict[str, Any] = {
+            "task_id": task.id,
+            "run_id": task_run_id,
+            "claim_lock": claim_lock,
+            "write_origin": "judge",
+            "board": task.board,
+            "execution_session_id": execution_session_id,
+        }
+
         trusted_claims: dict[str, Any] = {
             "execution_mode": ExecutionMode.UNATTENDED.value,
-            "granted_tools": [],  # No write tools for judge
-            "permitted_managed_tools": [],  # No task tools for judge
+            "granted_tools": [],  # 无写工具
+            "permitted_managed_tools": [TASK_TOOL_SHOW],  # 只读 task_show
+            "task": task_context,
             "task_id": task.id,
             "judge": True,
         }
@@ -433,8 +404,7 @@ class TaskAgentExecutor:
         request = ChatCompletionInput(
             model=task.model_override or "N-Agent",
             messages=[
-                {"role": "system", "content": _JUDGE_PROMPT},
-                {"role": "user", "content": f"Judge task {task.id}: has the goal been achieved?"},
+                {"role": "user", "content": f"judge task {task.id}: has the goal been achieved?"},
             ],
             stream=False,
             session_id=execution_session_id,
@@ -449,7 +419,7 @@ class TaskAgentExecutor:
             trusted_metadata={
                 "execution_mode": ExecutionMode.UNATTENDED.value,
                 "granted_tools": [],
-                "permitted_managed_tools": [],
+                "permitted_managed_tools": [TASK_TOOL_SHOW],
                 **trusted_claims,
             },
         )

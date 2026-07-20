@@ -255,11 +255,10 @@ async def test_build_skills_index_groups_by_category():
     await registry.upsert_skill(_skill("delta", readiness=SkillReadiness.UNSUPPORTED, relative_path="general/delta/SKILL.md"))
     service = SkillService(registry, loader)
     idx = await service.build_skills_index()
-    assert "<available_skills>" in idx
-    assert "</available_skills>" in idx
+    assert "## Available Skills" in idx
     # general and coding categories both present
-    assert "  general:" in idx
-    assert "  coding:" in idx
+    assert "- general:" in idx
+    assert "- coding:" in idx
     # available skills listed
     assert "alpha" in idx
     assert "beta" in idx

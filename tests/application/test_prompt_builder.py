@@ -29,7 +29,7 @@ def test_skill_guidance_routes_capability_requests_to_skill_discovery():
 
 
 def test_build_system_prompt_includes_skills_index_when_provided():
-    idx = "<available_skills>\n  general:\n    - foo: do foo\n</available_skills>"
+    idx = "## Available Skills\n\n- general:\n  - foo: do foo"
     prompt = build_system_prompt(skills_index=idx)
     assert idx in prompt
     assert prompt.index(idx) > prompt.index(SKILL_GUIDANCE)
@@ -37,7 +37,7 @@ def test_build_system_prompt_includes_skills_index_when_provided():
 
 def test_build_system_prompt_omits_skills_index_when_none():
     prompt = build_system_prompt()
-    assert "<available_skills>" not in prompt
+    assert "## Available Skills" not in prompt
 
 
 def test_build_system_prompt_includes_task_delegation_guidance():
@@ -47,6 +47,18 @@ def test_build_system_prompt_includes_task_delegation_guidance():
     assert TASK_DELEGATION_GUIDANCE in prompt
     assert "create_task" in prompt
     assert "list_tasks" in prompt
+
+
+def test_build_system_prompt_includes_task_worker_guidance_fixed():
+    """TASK_GUIDANCE 作为固定 block 内置于 build_system_prompt（普通对话与 worker 共用），
+    避免 worker 运行时追加导致 system prompt 中途变更、LLM prefix cache 失效。"""
+    from app.application.prompt_builder import TASK_GUIDANCE
+
+    prompt = build_system_prompt()
+    assert TASK_GUIDANCE in prompt
+    assert "task_show" in prompt
+    assert "task_complete" in prompt
+    assert "task_propose_change" in prompt
 
 
 def test_task_delegation_guidance_covers_key_points():
@@ -63,3 +75,25 @@ def test_task_delegation_guidance_covers_key_points():
     assert "/task" in text
     # 委派后仅确认、不在同轮自行完成
     assert "confirm" in text.lower() or "one sentence" in text.lower() or "不要" in text
+
+
+def test_build_system_prompt_uses_unified_section_format():
+    """治理：每个静态拼接块统一为 '## <Title>' 标题章节，按固定顺序排列。"""
+    prompt = build_system_prompt()
+    assert prompt.startswith("## Identity\n")
+    titles = [
+        "## Identity",
+        "## Reasoning & Tools",
+        "## Knowledge Base",
+        "## Skills",
+        "## Managed Resources",
+        "## Task Delegation",
+        "## Task Guidance",
+        "## Safety",
+    ]
+    pos = -1
+    for title in titles:
+        assert title in prompt, f"missing section: {title}"
+        idx = prompt.index(title)
+        assert idx > pos, f"{title} out of order"
+        pos = idx

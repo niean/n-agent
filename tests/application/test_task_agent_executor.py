@@ -26,8 +26,8 @@ from uuid import uuid4, uuid5, NAMESPACE_URL
 import pytest
 
 from app.application.chat_service import ChatCompletionResult
+from app.application.prompt_builder import TASK_GUIDANCE
 from app.application.task_agent_executor import (
-    TASK_GUIDANCE,
     JudgeResult,
     TaskAgentExecutor,
     TaskAgentResult,
@@ -236,12 +236,15 @@ async def test_executor_user_prompt_is_work_task(executor, fake_chat):
 
 
 @pytest.mark.asyncio
-async def test_executor_injects_task_guidance(executor, fake_chat):
+async def test_executor_request_has_no_system_message(executor, fake_chat):
+    """Worker request 只含 user 消息；system prompt 由 ContextService 运行时构建
+    （不在 request 传 system），避免 working_messages 出现重复 system + 重复 user。"""
     task = _task()
     await executor.run(task, task_run_id=1, claim_lock="L1")
     call = fake_chat.complete_calls[0]
-    system_msg = call.messages[0]["content"]
-    assert TASK_GUIDANCE in system_msg or "Task Worker Guidance" in system_msg
+    roles = [m["role"] for m in call.messages]
+    assert roles == ["user"]
+    assert call.messages[0]["content"] == "work task t_1"
 
 
 @pytest.mark.asyncio
@@ -251,7 +254,7 @@ async def test_executor_task_guidance_contains_propose_change_guidance():
     immediately after the call."""
     assert "task_propose_change" in TASK_GUIDANCE
     # Guidance must mention that the run ends after proposing
-    assert "结束" in TASK_GUIDANCE or "终结" in TASK_GUIDANCE or "立即" in TASK_GUIDANCE
+    assert "ends immediately" in TASK_GUIDANCE or "immediately" in TASK_GUIDANCE
     # Guidance must NOT reference removed tools
     assert "task_block" not in TASK_GUIDANCE
     assert "task_create" not in TASK_GUIDANCE
@@ -493,6 +496,35 @@ async def test_goal_mode_max_turns_fails():
 
 
 @pytest.mark.asyncio
+async def test_goal_mode_worker_abort_returns_without_next_turn():
+    """task_fail maps to ABORTED and must end goal_mode immediately.
+
+    Regression: t_2a913349cfe74c5c emitted task_fail repeatedly because
+    run_goal_loop did not include ABORTED in its terminal outcomes.
+    """
+    registry = FakeTaskRegistry([
+        TaskEvent(
+            id=1, task_id="t_1", kind="fail_requested",
+            payload={"error": "execute_code unavailable"}, run_id=1,
+            created_at=datetime.now(timezone.utc),
+        ),
+    ])
+    chat = FakeChatService()
+    executor = TaskAgentExecutor(
+        chat_service=chat, task_registry=registry,
+        prompt_builder=FakePromptBuilder(),
+    )
+
+    result = await executor.run_goal_loop(
+        _task(goal_mode=True, goal_max_turns=10), task_run_id=1, claim_lock="L1",
+    )
+
+    assert result.status is TaskRunOutcome.ABORTED
+    assert result.error == "execute_code unavailable"
+    assert len(chat.complete_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_goal_mode_early_exit_on_consecutive_rejections():
     """连续 GOAL_MAX_CONSECUTIVE_REJECTIONS 次 judge 否决即早退 FAILED，不耗尽 max_turns。
 
@@ -587,7 +619,13 @@ async def test_judge_has_no_write_tools():
     assert len(judge_calls) >= 1
     judge_call = judge_calls[0]
     assert judge_call.trusted_metadata.get("granted_tools") == []
-    assert judge_call.trusted_metadata.get("permitted_managed_tools") == []
+    # judge 只读 task_show（评估目标达成），无写工具
+    permitted = set(judge_call.trusted_metadata.get("permitted_managed_tools", []))
+    assert permitted == {"task_show"}
+    # judge 注入 task 上下文（使 task_show 通过 _origin_from_trusted，修复 permission_denied）
+    task_ctx = judge_call.trusted_metadata.get("task", {})
+    assert task_ctx.get("task_id") == task.id
+    assert task_ctx.get("write_origin") == "judge"
 
 
 @pytest.mark.asyncio

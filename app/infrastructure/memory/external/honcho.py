@@ -170,17 +170,17 @@ class HonchoAdapter(ExternalMemoryProvider):
             return ""
         if self._recall_mode == "tools":
             return (
-                "# Honcho Memory\n"
+                "## Honcho Memory\n"
                 "Active (tools-only mode). Use honcho_profile / honcho_search / "
                 "honcho_reasoning / honcho_context / honcho_conclude tools."
             )
         if self._recall_mode == "context":
             return (
-                "# Honcho Memory\n"
+                "## Honcho Memory\n"
                 "Active (context-injection mode). Relevant context auto-injected."
             )
         return (
-            "# Honcho Memory\n"
+            "## Honcho Memory\n"
             "Active (hybrid mode). Context auto-injected AND tools available."
         )
 

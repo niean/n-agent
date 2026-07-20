@@ -43,6 +43,45 @@ def _extract_memory_block(request_messages_json: str | None) -> str:
     return "\n\n".join(blocks)
 
 
+def _normalize_observation_payload(payload: str | None) -> str | None:
+    """Return a readable JSON payload for the observations API.
+
+    Usage records contain a serialized LLM request/response.  Tool arguments
+    within those payloads are themselves JSON strings, so a provider that
+    emits ``\\uXXXX`` escapes leaves unreadable text after the outer payload is
+    parsed by the Dashboard.  Normalize just that nested JSON representation;
+    malformed payloads and arguments remain available unchanged for debugging.
+    """
+    if not isinstance(payload, str):
+        return payload
+    try:
+        decoded = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return payload
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        result = {key: normalize(item) for key, item in value.items()}
+        function = result.get("function")
+        if not isinstance(function, dict) or not isinstance(function.get("arguments"), str):
+            return result
+        try:
+            normalized_function = dict(function)
+            normalized_function["arguments"] = json.dumps(
+                json.loads(function["arguments"]), ensure_ascii=False,
+            )
+            result["function"] = normalized_function
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return result
+
+    return json.dumps(normalize(decoded), ensure_ascii=False)
+
+
 def register_usage_routes(
     router: APIRouter,
     usage_service: Any,
@@ -145,8 +184,8 @@ def register_usage_routes(
                 "cost_status": r.cost_status,
                 "latency_ms": r.latency_ms,
                 "created_at": r.created_at,
-                "request_messages": r.request_messages,
-                "response_message": r.response_message,
+                "request_messages": _normalize_observation_payload(r.request_messages),
+                "response_message": _normalize_observation_payload(r.response_message),
                 "tools": r.tools,
                 "generation_params": r.generation_params,
             }

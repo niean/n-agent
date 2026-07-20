@@ -141,3 +141,34 @@ def test_post_session_message_boundary_65536_ok(tmp_path):
     client, _ = _client_with_session(tmp_path)
     r = client.post("/chat/sessions/s1/messages", json={"content": "a" * 65536})
     assert r.status_code == 201
+
+
+def test_message_to_dict_normalizes_tool_call_arguments_unicode_escapes():
+    """tool_call arguments 的 \\uXXXX 转义归一化为可读中文（部分 provider 返回转义）。"""
+    from app.domain.session import ConversationMessage
+    from app.interfaces.http.dashboard import _message_to_dict
+
+    msg = ConversationMessage(
+        role="assistant",
+        content={
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "task_complete", "arguments": '{"summary": "\\u5df2\\u6210\\u529f"}'},
+            }],
+        },
+    )
+    data = _message_to_dict(msg)
+    args = data["tool_calls"][0]["function"]["arguments"]
+    assert "\\u" not in args  # 无转义
+    assert "已成功" in args  # 可读中文
+
+
+def test_normalize_tool_call_arguments_handles_non_string_and_invalid_json():
+    """非字符串/非法 JSON 原样返回（best-effort）。"""
+    from app.interfaces.http.dashboard import _normalize_tool_call_arguments
+
+    assert _normalize_tool_call_arguments({"a": 1}) == {"a": 1}  # dict 原样
+    assert _normalize_tool_call_arguments(None) is None
+    assert _normalize_tool_call_arguments("not json") == "not json"  # 非法 JSON 原样
+    assert _normalize_tool_call_arguments('{"x": 1}') == '{"x": 1}'  # 合法 JSON 保持

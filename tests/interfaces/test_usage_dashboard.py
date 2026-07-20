@@ -41,6 +41,18 @@ def test_usage_records_empty(client):
     assert r.json() == []
 
 
+def test_usage_record_payload_normalizes_unicode_escaped_tool_arguments():
+    """观测详情中的历史 tool arguments 应以可读中文返回。"""
+    from app.interfaces.http.usage_routes import _normalize_observation_payload
+
+    payload = '{"role":"assistant","content":"","tool_calls":[{"function":{"name":"task_complete","arguments":"{\\"summary\\": \\"\\\\u5df2\\\\u5b8c\\\\u6210\\"}"}}]}'
+
+    normalized = _normalize_observation_payload(payload)
+
+    assert "\\\\u" not in normalized
+    assert "已完成" in normalized
+
+
 def test_usage_compressions_empty(client):
     r = client.post("/chat/sessions?session_id=sess-test3")
     assert r.status_code == 200

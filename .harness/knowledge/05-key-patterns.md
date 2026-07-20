@@ -228,6 +228,7 @@ ChatCompletionService 首轮锁定 `external_memory_enabled` 时，需区分"客
 - 系统提示词不写入 MemoryStore 的 messages，也不得通过摘要间接持久化。
 - Infrastructure Provider 只负责协议转换，不承载 N-Agent 身份、ReAct 行为等业务提示词。
 - 新增动态提示词能力时，应优先扩展 Application prompt builder，而不是在 API 层或 Provider 层拼接。
+- 各拼接块统一为 `## <Title>` 标题章节：静态块经 `prompt_builder._section(title, body)` 渲染，动态块（`SkillService.build_skills_index` 产出 `## Available Skills`、各 external memory provider 的 `system_prompt_block()`）各自产出同名 `## ` 章节；禁止裸段落或 XML 标签混入，新增块须遵循该格式。
 
 陷阱：把 system prompt 当普通消息保存，会污染 Dashboard 会话历史、摘要和后续上下文恢复。
 
@@ -872,6 +873,7 @@ Task 终态失败必须区分三种来源，分别映射不同 status 与重试�
 规则：
 - worker 工具集只含 `task_show/complete/heartbeat/comment/propose_change/fail`（6 工具），**不含 task_cancel**。取消是用户语义，worker 不得触发取消。
 - `task_fail` 是 terminal intent（对齐 `task_complete`/`task_propose_change`）：`TaskService.fail(task_id, reason)` 只写 `fail_requested` 审计事件（非终态），不 finalize；`TaskAgentExecutor._build_result_from_chat` 经 `_read_latest_intent` 识别 `fail_requested` -> 返回 `TaskAgentResult(status=ABORTED, error=reason)`；`TaskRunService._finalize_run` -> `_finish(outcome=ABORTED)` -> `_decide_target_status(ABORTED)` -> **直接 FAILED，不进 `_RETRYABLE_OUTCOMES`，绕过断路器**。
+- `goal_mode` 外层循环也必须将 `ABORTED` 与 `WAITING_APPROVAL`、`FAILED`、`TIMED_OUT`、`CRASHED` 一样视为立即退出的终态；否则单轮已识别的 `task_fail` 会被循环忽略，反复发送 `work task {id}` 直至 `goal_max_turns` 耗尽（t_2a913349cfe74c5c）。
 - `_decide_target_status` 映射：COMPLETED->SUCCEEDED、WAITING_APPROVAL->WAITING_APPROVAL、TERMINATED->CANCELLED、ABORTED->FAILED（不重试）、EXPIRED->EXPIRED、CRASHED/TIMED_OUT->EXPIRED、FAILED/SPAWN_FAILED->断路器（QUEUED 或 FAILED）。
 - `_read_latest_intent` 的 kind 过滤含 `complete_requested`/`change_proposed`/`fail_requested` 三种；找不到任何 intent 事件时默认 COMPLETED（finish_reason="length" -> FAILED）。
 - worker 判定无法继续必须调 `task_fail(reason)`，不得调 `task_cancel`（已从 worker 工具集移除）；TASK_GUIDANCE 明确"task_fail 是 worker 主动失败，不是用户取消"。

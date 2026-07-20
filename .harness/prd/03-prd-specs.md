@@ -469,8 +469,16 @@
         - 任务：生命周期用Chat交互，看板维持现状、主做观测（Manus任务形态，体验好于Hermes）
         - 任务：Chat框，`系统消息`也应该遵循消息渲染规范，给人聊天的感觉，就像工具调用调试信息一样
         - 任务：Chat交互，不只限于任务创建，生命周期的后续状态、也应该体现在同一个会话Chat框中，任务会话应复用任务创建时的Chat会话ID、不要自己再新建；请参考Manus
-        - 任务：t_97d317e953b64edc，任务明确失败后，未标记错误且结束任务，而是继续尝试耗尽10轮后才认为失败；改为快速失败
+        - 任务：t_2a913349cfe74c5c，任务已明确失败，但还在执行work task t_2a913349cfe74c5c、直到耗尽10轮后才认为失败；改为快速失败
         - 任务：t_a742046a521d46eb，Result: Failed (cancelled)，算作失败、还是取消？worker快速失败要算作失败，只有用户发出取消命令的才算取消
+        - 任务：Chat交互，过程中改动system提示词、注入Task Worker Guidance，导致LLM输出Cache失效；我希望，Task Worker Guidance改为固定system提示词(看做N-Agent功能引导)，从而避免中途修改system提示词
+        - 任务：任务相关的描述从中文改为英文，包括但不限于system提示词、builtin工具描述
+
+[20260721]
+- NFR
+    - 上下文：system提示词，治理各拼接块格式、使更结构化，异构如Task Guidance、Skills等。统一格式，按你的推进即可
+    - 任务：LLM请求未命中缓存读，分析原因，如会话dashboard-fc1efd1f-57e9-4b10-9b49-22529ae83c77
+- FR
     - 任务：Chat交互支持自然语言，在`/task`命令之外、再支持用户自然语言命令，要共用任务引擎。按照你的推荐设计、参照Manus产品功能，先产出一版(无需我确认Spec)，Harness流程免用户确认
 
 
@@ -486,6 +494,9 @@
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
 - FR
+    - 任务：Chat入口单拆，标题定制
+    - 对话：Chat框，消息样式区分user、assistant、tool、task等不同角色
+    - 前端：左导，支持垂直滚动
     - 前端：新增顶导菜单组件；支持同一页面多个路由，如顶导、左导均路由到相同页面
         - 要求：顶导菜单样式，参考/Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 产品：对标Manus，Project、Tenant

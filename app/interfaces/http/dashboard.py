@@ -1478,6 +1478,35 @@ def _session_to_dict(session: ConversationSession) -> dict:
     }
 
 
+def _normalize_tool_call_arguments(args):
+    """Normalize tool_call arguments JSON string to readable UTF-8 (no \\uXXXX escapes).
+
+    部分 LLM provider 返回的 arguments JSON 字符串含 \\uXXXX 转义（如中文被转义），
+    Dashboard 原样展示人看不懂。parse + 以 ensure_ascii=False 重序列化为可读中文。
+    best-effort：非字符串或不可解析时原样返回。
+    """
+    if not isinstance(args, str):
+        return args
+    try:
+        return json.dumps(json.loads(args), ensure_ascii=False)
+    except (ValueError, TypeError):
+        return args
+
+
+def _normalize_tool_call_args(tool_call):
+    """Normalize a single tool_call dict's function.arguments (readable UTF-8)."""
+    if not isinstance(tool_call, dict):
+        return tool_call
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return tool_call
+    normalized = dict(tool_call)
+    normalized_function = dict(function)
+    normalized_function["arguments"] = _normalize_tool_call_arguments(function.get("arguments"))
+    normalized["function"] = normalized_function
+    return normalized
+
+
 def _message_to_dict(message: ConversationMessage) -> dict:
     content = message.content
     tool_calls = None
@@ -1495,7 +1524,7 @@ def _message_to_dict(message: ConversationMessage) -> dict:
         "created_at": message.created_at.isoformat() if message.created_at else None,
     }
     if tool_calls:
-        data["tool_calls"] = tool_calls
+        data["tool_calls"] = [_normalize_tool_call_args(tc) for tc in tool_calls]
     return data
 
 
@@ -1517,7 +1546,7 @@ def _tool_call_to_dict(tool_call: ToolCall) -> dict:
         "id": tool_call.id,
         "session_id": tool_call.session_id,
         "tool_name": tool_call.tool_name,
-        "arguments": tool_call.arguments,
+        "arguments": _normalize_tool_call_arguments(tool_call.arguments),
         "result": tool_call.result,
         "status": tool_call.status,
         "duration_ms": tool_call.duration_ms,

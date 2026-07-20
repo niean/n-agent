@@ -77,13 +77,13 @@ def test_task_tool_definitions_no_duplicate_names():
     assert len(names) == len(set(names)), "duplicate tool names"
 
 
-def test_task_tool_definitions_descriptions_are_chinese():
-    """description 必须为中文（spec 约束）。"""
+def test_task_tool_definitions_descriptions_are_english():
+    """description 必须为英文（spec 约束：任务相关描述从中文改为英文）。"""
     defs = task_tool_definitions()
     for d in defs:
-        # 简单启发式：description 至少包含一个中文字符
-        assert any("一" <= ch <= "鿿" for ch in d.description), (
-            f"{d.name} description should contain Chinese characters"
+        # 不含中文字符
+        assert not any("一" <= ch <= "鿿" for ch in d.description), (
+            f"{d.name} description should not contain Chinese characters"
         )
         assert len(d.description) > 0, f"{d.name} description empty"
 

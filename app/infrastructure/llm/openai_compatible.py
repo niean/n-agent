@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -115,8 +116,29 @@ def _message_to_dict(message: Any) -> dict[str, Any]:
     return result
 
 
+def _normalize_arguments(args: Any) -> Any:
+    """Normalize tool_call arguments JSON string to readable UTF-8 (no \\uXXXX escapes).
+
+    部分 LLM provider 返回的 arguments 含 \\uXXXX 转义；parse + ensure_ascii=False 重序列化
+    为可读中文。best-effort：非字符串/不可解析原样返回。
+    """
+    if not isinstance(args, str):
+        return args
+    try:
+        return json.dumps(json.loads(args), ensure_ascii=False)
+    except (ValueError, TypeError):
+        return args
+
+
 def _tool_call_to_dict(tool_call: Any) -> dict[str, Any]:
     if isinstance(tool_call, dict):
+        function = tool_call.get("function")
+        if isinstance(function, dict) and "arguments" in function:
+            normalized = dict(tool_call)
+            normalized_function = dict(function)
+            normalized_function["arguments"] = _normalize_arguments(function.get("arguments"))
+            normalized["function"] = normalized_function
+            return normalized
         return tool_call
     function = getattr(tool_call, "function", None)
     return {
@@ -124,6 +146,6 @@ def _tool_call_to_dict(tool_call: Any) -> dict[str, Any]:
         "type": getattr(tool_call, "type", "function"),
         "function": {
             "name": getattr(function, "name", "") if function else "",
-            "arguments": getattr(function, "arguments", "") if function else "",
+            "arguments": _normalize_arguments(getattr(function, "arguments", "") if function else ""),
         },
     }

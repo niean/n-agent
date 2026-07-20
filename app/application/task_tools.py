@@ -8,7 +8,7 @@ Returns 6 managed ToolDefinitions for the Task subdomain (Manus-aligned
     present -- pattern twelve gating; OpenAI HTTP clients cannot forge
     trusted_metadata)
   - risk_level=CONFIRM (managed tools require CONFIRM per ToolPolicy)
-  - description Chinese (per spec)
+  - description English (per spec)
   - input_schema per spec tool contract
 
 工具契约（spec, 6 工具）:
@@ -65,9 +65,10 @@ def task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=TASK_TOOL_SHOW,
             description=(
-                "读取当前 task 的完整上下文：标题、正文、待审批提案、审批决策、"
-                "进度事件、评论、最近事件、运行历史与 worker_context。worker 启动后"
-                "应先调用此工具了解任务全貌再开始工作。"
+                "Read the full context of the current task: title, body, pending proposals, "
+                "approval decisions, progress events, comments, recent events, run history, "
+                "and worker_context. After startup, the worker should call this tool first to "
+                "understand the task before starting work."
             ),
             input_schema={
                 "type": "object",
@@ -85,9 +86,10 @@ def task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=TASK_TOOL_COMPLETE,
             description=(
-                "提交 task 完成意图。summary 为人类可读的完成摘要，metadata 为"
-                "结构化结果，artifacts 为产出物清单。工具只返回终态意图，最终"
-                "由 TaskRunService 以 claim token 一次性 CAS 终结 run。"
+                "Submit the task completion intent. summary is a human-readable completion "
+                "summary, metadata is structured results, and artifacts is the list of outputs. "
+                "The tool only returns the terminal intent; TaskRunService finalizes the run in "
+                "one shot via a CAS using the claim token."
             ),
             input_schema={
                 "type": "object",
@@ -123,8 +125,9 @@ def task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=TASK_TOOL_HEARTBEAT,
             description=(
-                "记录 task 心跳并续租 claim lease。长任务执行中应周期调用，"
-                "避免被 dispatcher 判定 stale 而 reclaim。note 为本次心跳备注。"
+                "Record a task heartbeat and renew the claim lease. Call periodically during "
+                "long tasks to avoid being deemed stale and reclaimed by the dispatcher. note "
+                "is a remark for this heartbeat."
             ),
             input_schema={
                 "type": "object",
@@ -142,8 +145,8 @@ def task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=TASK_TOOL_COMMENT,
             description=(
-                "给指定 task 追加评论。worker 只能评论自己 claim 的 task；"
-                "跨 task 评论会被 ownership 校验拒绝。"
+                "Append a comment to the specified task. The worker can only comment on the "
+                "task it has claimed; cross-task comments are rejected by ownership checks."
             ),
             input_schema={
                 "type": "object",
@@ -162,12 +165,14 @@ def task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=TASK_TOOL_PROPOSE_CHANGE,
             description=(
-                "提出需要用户审批的变更提案。当 worker 在执行中遇到需要用户决策"
-                "的修改（如改变方案、确认破坏性操作、关键路径分歧）时调用此工具，"
-                "附带 proposal 文本说明提案内容。调用后本 run 立即结束，task 进入"
-                "WAITING_APPROVAL，等待用户通过 approve/reject 决定后续行：批准后"
-                "按提案继续，拒绝后不得执行该提案。重复调用或 task 已在"
-                "WAITING_APPROVAL 时返回 409 task_state_invalid。"
+                "Raise a change proposal that requires user approval. Call this tool when the "
+                "worker encounters a change requiring a user decision during execution (e.g., "
+                "altering the plan, confirming a destructive operation, a key path divergence), "
+                "with a proposal text describing the proposal. After the call, this run ends "
+                "immediately, the task enters WAITING_APPROVAL, and the user decides the next "
+                "step via approve/reject: if approved, proceed per the proposal; if rejected, "
+                "do not execute the proposal. Repeated calls or calling when the task is already "
+                "in WAITING_APPROVAL returns 409 task_state_invalid."
             ),
             input_schema={
                 "type": "object",
@@ -185,11 +190,14 @@ def task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=TASK_TOOL_FAIL,
             description=(
-                "worker 判定当前 task 无法继续、确定性地快速失败（不再重试）时调用。"
-                "典型场景：必需工具不可用、任务指令明确禁止兜底方案、遇到不可恢复的"
-                "前置条件缺失。reason 为失败原因（人类可读）。调用后本 run 立即结束，"
-                "task 进入 FAILED 终态（绕过断路器，不自动重试）。注意：本工具表达的是"
-                "worker 主动失败，不是用户取消；用户取消请走 /task cancel 或取消按钮。"
+                "Call when the worker determines the current task cannot continue and must "
+                "fail fast deterministically (no retry). Typical scenarios: a required tool is "
+                "unavailable, the task instructions explicitly forbid a fallback, or an "
+                "unrecoverable precondition is missing. reason is the failure cause (human-"
+                "readable). After the call, this run ends immediately and the task enters the "
+                "FAILED terminal state (bypassing the circuit breaker, no auto-retry). Note: "
+                "this tool expresses a worker-initiated failure, not a user cancellation; for "
+                "user cancellation use /task cancel or the cancel button."
             ),
             input_schema={
                 "type": "object",
@@ -233,11 +241,14 @@ def user_task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=USER_TASK_TOOL_CREATE,
             description=(
-                "把用户的自然语言目标委派为一个后台 Task，绑定当前会话；"
-                "Task 进入队列后由任务引擎在当前会话内自主执行，生命周期状态以系统消息呈现。"
-                "适用于多步执行、研究分析、文件/代码产出、长耗时或可后台自主完成的目标；"
-                "不适用于单步问答、查事实、简单计算等可直接回答的请求。"
-                "goal 为完整自然语言目标（写入 task body）；title 为短标题，可省略。"
+                "Delegate the user's natural-language goal as a background Task bound to the "
+                "current session; after queuing, the task engine executes it autonomously within "
+                "the current session, and lifecycle states are surfaced as system messages. "
+                "Suitable for multi-step execution, research and analysis, file/code output, "
+                "long-running, or goals that can be completed autonomously in the background; "
+                "not suitable for single-step questions, fact lookups, or simple calculations "
+                "that can be answered directly. goal is the full natural-language goal (written "
+                "to the task body); title is a short title and may be omitted."
             ),
             input_schema={
                 "type": "object",
@@ -259,8 +270,9 @@ def user_task_tool_definitions() -> list[ToolDefinition]:
         ToolDefinition(
             name=USER_TASK_TOOL_LIST,
             description=(
-                "列出当前会话关联、未归档的任务（origin_session_id 精确匹配）。"
-                "用于回答用户关于本会话任务进度/状态的提问。可选 status 过滤。"
+                "List the current session's associated, non-archived tasks (exact match on "
+                "origin_session_id). Used to answer user questions about this session's task "
+                "progress/status. Optional status filter."
             ),
             input_schema={
                 "type": "object",

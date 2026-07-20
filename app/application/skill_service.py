@@ -237,11 +237,12 @@ class SkillService:
         ]
 
     async def build_skills_index(self) -> str:
-        """Build a compact skill index for the system prompt.
+        """Build a compact skill index section for the system prompt.
 
-        Returns a <available_skills>...</available_skills> block grouping skills
-        by category (name + description). Returns empty string when no skills
-        are available, so the caller can skip injection.
+        Returns a ``## Available Skills`` markdown section grouping skills by category
+        (name + description), matching the titled-section convention used by every other
+        system-prompt block. Returns empty string when no skills are available, so the
+        caller can skip injection.
         """
         skills = await self.list_for_llm()
         if not skills:
@@ -252,17 +253,13 @@ class SkillService:
             by_category.setdefault(cat, []).append((s.name, s.description or ""))
         lines: list[str] = []
         for category in sorted(by_category.keys()):
-            lines.append(f"  {category}:")
+            lines.append(f"- {category}:")
             for name, desc in sorted(by_category[category], key=lambda x: x[0]):
                 if desc:
-                    lines.append(f"    - {name}: {desc}")
+                    lines.append(f"  - {name}: {desc}")
                 else:
-                    lines.append(f"    - {name}")
-        return (
-            "<available_skills>\n"
-            + "\n".join(lines) + "\n"
-            + "</available_skills>"
-        )
+                    lines.append(f"  - {name}")
+        return "## Available Skills\n\n" + "\n".join(lines)
 
     async def get(self, name: str) -> Skill:
         skill = await self.registry.get_skill(name)

@@ -79,7 +79,7 @@ class Mem0Adapter(ExternalMemoryProvider):
         if not self.is_available():
             return ""
         return (
-            "# Mem0 Memory\n"
+            "## Mem0 Memory\n"
             f"Active. User: {self._user_id}.\n"
             "Persistent memory of this user from past conversations is available. "
             "Relevant facts are auto-recalled and injected into your context per turn; "
