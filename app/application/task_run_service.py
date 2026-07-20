@@ -14,6 +14,8 @@ Outcome -> target_task_status mapping (spec Data Model):
   COMPLETED            -> SUCCEEDED
   WAITING_APPROVAL     -> WAITING_APPROVAL (claim released, worker reclaimed)
   TERMINATED           -> CANCELLED (user cancel RUNNING)
+  ABORTED              -> FAILED (worker deliberate fast-fail via task_fail;
+                          no retry, bypasses circuit breaker. 取消只认用户指令)
   EXPIRED              -> EXPIRED (stale/lease expired)
   CRASHED / TIMED_OUT  -> EXPIRED (worker died; user must retry)
   FAILED / SPAWN_FAILED -> if consecutive_failures > max_retries: FAILED;
@@ -39,10 +41,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from app.application.task_session import task_execution_session_id
 from app.domain.policy import PolicyOutcome
 from app.domain.task import (
     ClaimResult,
@@ -105,6 +109,7 @@ class TaskRunService:
         executor: Any,
         policy: TaskPolicy,
         notifier: Any | None = None,
+        lifecycle_writer: Callable[[str, str], Awaitable[Any]] | None = None,
         lease_seconds: int = 900,
         heartbeat_timeout_seconds: int = 300,
         max_runtime_seconds: int = 3600,
@@ -115,10 +120,66 @@ class TaskRunService:
         self.executor = executor
         self.policy = policy
         self.notifier = notifier
+        self.lifecycle_writer = lifecycle_writer
         self.lease_seconds = lease_seconds
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.max_runtime_seconds = max_runtime_seconds
         self.max_concurrency = max_concurrency
+
+    # ------------------------------------------------------------------
+    # Lifecycle chat messages (best-effort, never blocks finalization)
+    # ------------------------------------------------------------------
+
+    async def _write_lifecycle(self, task: Task, content: str) -> None:
+        """向执行会话 best-effort 写 ui.task_lifecycle system 消息。
+
+        writer 为 None（未装配/降级）时跳过；写入异常仅 log.warning，不改变任务 CAS、
+        worker 回收或飞书投递结果。会话不存在时 SessionService 抛 SessionNotFoundError
+        -> 这里吞掉（会话已删，不复活）。
+        """
+        if self.lifecycle_writer is None:
+            return
+        session_id = task_execution_session_id(task)
+        try:
+            await self.lifecycle_writer(session_id, content)
+        except Exception:
+            logger.warning(
+                "lifecycle write failed for task %s", task.id, exc_info=True,
+            )
+
+    def _lifecycle_text(
+        self,
+        task: Task,
+        target_status: TaskStatus,
+        summary: str | None = None,
+        error: str | None = None,
+    ) -> str | None:
+        """终态/等待批准 -> 生命周期正文；QUEUED 等非通知态返回 None（不写）。"""
+        title = task.title
+        if target_status == TaskStatus.WAITING_APPROVAL:
+            return f"[任务状态] 等待批准: {task.id} - {title} | 提案: {summary or ''}"
+        if target_status == TaskStatus.SUCCEEDED:
+            return f"[任务状态] 已完成: {task.id} - {title} | {summary or ''}"
+        if target_status == TaskStatus.FAILED:
+            return f"[任务状态] 已失败: {task.id} - {title} | {error or summary or ''}"
+        if target_status == TaskStatus.CANCELLED:
+            return f"[任务状态] 已取消: {task.id} - {title}"
+        if target_status == TaskStatus.EXPIRED:
+            return f"[任务状态] 已过期: {task.id} - {title}"
+        # QUEUED（自动重试）等：不写
+        return None
+
+    async def _write_lifecycle_for_status(
+        self,
+        task: Task,
+        target_status: TaskStatus,
+        summary: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        text = self._lifecycle_text(task, target_status, summary=summary, error=error)
+        if text is None:
+            return
+        await self._write_lifecycle(task, text)
 
     # ------------------------------------------------------------------
     # dispatch_once (fixed order)
@@ -236,6 +297,10 @@ class TaskRunService:
         # Hard timeout must be < lease
         timeout = min(max_runtime, self.lease_seconds - 1)
 
+        # 生命周期：worker 起始（best-effort，不阻断执行；spawn 失败走 _handle_spawn_failure，
+        # 未进 run_claim，不写"开始运行"）
+        await self._write_lifecycle(task, f"[任务状态] 开始运行: {task.id} - {task.title}")
+
         agent_result = None
         try:
             agent_result = await asyncio.wait_for(
@@ -352,6 +417,9 @@ class TaskRunService:
             )
             return None
 
+        await self._write_lifecycle_for_status(
+            result.task, target_status, summary=summary, error=error,
+        )
         await self._notify_if_terminal(result, target_status)
         return result
 
@@ -484,6 +552,10 @@ class TaskRunService:
             return TaskStatus.WAITING_APPROVAL
         if outcome == TaskRunOutcome.TERMINATED:
             return TaskStatus.CANCELLED
+        if outcome == TaskRunOutcome.ABORTED:
+            # Worker deliberate fast-fail (task_fail) -> FAILED terminal, no retry.
+            # 绕过断路器（区别于 FAILED/SPAWN_FAILED 的可重试系统失败）。
+            return TaskStatus.FAILED
         if outcome == TaskRunOutcome.EXPIRED:
             return TaskStatus.EXPIRED
         if outcome in (TaskRunOutcome.CRASHED, TaskRunOutcome.TIMED_OUT):
@@ -537,7 +609,8 @@ class TaskRunService:
                     outcome=TaskRunOutcome.CRASHED,
                     error=error,
                 ))
-                # CRASHED -> EXPIRED (terminal) -> notify
+                # CRASHED -> EXPIRED (terminal) -> lifecycle + notify
+                await self._write_lifecycle_for_status(result.task, TaskStatus.EXPIRED)
                 await self._notify_if_terminal(result, TaskStatus.EXPIRED)
                 recovered += 1
             except (TaskConflictError, TaskNotFoundError) as exc:
@@ -592,6 +665,7 @@ class TaskRunService:
                     outcome=TaskRunOutcome.EXPIRED,
                     error="lease expired or heartbeat stale",
                 ))
+                await self._write_lifecycle_for_status(result.task, TaskStatus.EXPIRED)
                 await self._notify_if_terminal(result, TaskStatus.EXPIRED)
                 recovered += 1
             except (TaskConflictError, TaskNotFoundError) as exc:

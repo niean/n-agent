@@ -907,6 +907,7 @@ class AgentGraphRunner:
         raw_context = (options or {}).get("tool_execution_context")
         if isinstance(raw_context, ToolExecutionContext):
             context = raw_context
+        terminal_tool_called = False
         for tool_call in state.pending_tool_calls:
             function = tool_call.get("function", {})
             arguments = function.get("arguments", {})
@@ -1062,8 +1063,21 @@ class AgentGraphRunner:
                     duration_ms=result.duration_ms,
                 )
             )
+            if result.terminal:
+                # Terminal tool semantics are decided by the server-side
+                # executor. Stop after persisting this result; do not make a
+                # further LLM call that can repeat the same terminal intent.
+                terminal_tool_called = True
+                break
         state.pending_tool_calls = []
-        state.final_message = None
+        if terminal_tool_called:
+            # TurnPolicy treats a final message without pending calls as STOP.
+            # TaskAgentExecutor reads the authoritative task intent event for
+            # its outcome and user-facing summary/error.
+            state.final_message = {"role": "assistant", "content": ""}
+            state.finish_reason = "stop"
+        else:
+            state.final_message = None
         return state
 
     @staticmethod

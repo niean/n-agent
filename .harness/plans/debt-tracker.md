@@ -33,6 +33,8 @@
 | D029 | Plugin hook/CLI 注册端到端流通：原问题 file_loader._scan_sync 未传播 hook_registrations。T7 将 PluginService.scan 改为直接用 3 阶段 API 从 PluginContext 收集 hook_registrations；T9 同型模式收集 cli_command_registrations 并增 PluginScanResult.cli_command_registrations 字段。hooks 与 CLI 命令均端到端流通，list_cli_commands 可用。file_loader._scan_sync 未改（scan 不再调它）。 | medium | plan-260717-plugin-capabilities.md | 2026-07-17 | resolved |
 | D030 | `n-agent task list/ls` 的 `--status` 参数被 argparse 解析但 `_cmd_list` 完全未使用（`TaskService.list_tasks(board, cursor, limit)` 无 status 形参，registry 也未实现状态过滤）。当前为误导性 dead arg：用户传 `--status done` 仍返回全量任务。修复需在 service/registry 链路增加可选 status 过滤或移除该参数。非本次 bugfix 引入，属既有遗留。 | low | N/A | 2026-07-19 | open |
 | D031 | goal_mode judge fork（`TaskAgentExecutor._run_judge`）的 TASK_GUIDANCE 指示 judge 使用只读工具 `task_show` 读取任务上下文，但 judge 构造的 `permitted_managed_tools=[]`（且 safe_only 暴露闸要求 permitted_managed_tools 命中才放行 managed 工具），导致 task_show 对 judge 不可见，judge 无法读取任务 body/result 判定目标是否达成。仅影响 goal_mode 任务（验收 5.1），单轮 worker 路径不受影响（run() 已注入 7 个 task 工具）。修复需给 judge 注入 `permitted_managed_tools={"task_show"}`（只读子集，不含 task_complete/block 等写工具）。 | low | N/A | 2026-07-19 | open |
+| D032 | Dashboard Chat `/task list` 仅取首页分页：`api.task.list()` 返回 `{items, next_cursor}`，前端按 `origin_session_id` 过滤首页 100 条后不消费 `next_cursor`，单会话任务超 100 条时漏显。spec 约定本期不改后端 `list_tasks`，故前端只过滤首页。后续需后端支持 session/cursor 过滤或前端聚合全部分页。 | low | plan-260720-task-chat-lifecycle.md | 2026-07-20 | open |
+| D033 | 自然语言任务管控（用户在对话用自然语言指挥 Agent 创建/管控任务）为 spec 明确的未来 TODO，本期仅实现 `/task` slash 命令（本地解析，不消耗 LLM token）。后续需用户侧 task 工具或 Agent 意图识别才能实现。 | low | plan-260720-task-chat-lifecycle.md | 2026-07-20 | open |
 
 ---
 

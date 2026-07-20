@@ -21,6 +21,11 @@
     body: JSON.stringify({ title }),
   });
   const deleteSession = (id) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  const appendSessionMessage = (id, content) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  });
   const listTools = () => fetchJson('/chat/tools');
   const listModels = () => fetchJson('/v1/models');
   const getAdminModels = () => fetchJson('/chat/models');
@@ -225,6 +230,7 @@
     getSessionToolCalls,
     renameSession,
     deleteSession,
+    appendSessionMessage,
     listTools,
     listModels,
     getAdminModels,

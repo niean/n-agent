@@ -112,6 +112,7 @@ def test_task_run_outcome_enum():
         "spawn_failed",
         "expired",
         "terminated",
+        "aborted",
     }
     assert {o.value for o in TaskRunOutcome} == expected
 

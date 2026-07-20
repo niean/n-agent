@@ -338,12 +338,14 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 | acp | ACP stdio 客户端 | acp | acp- |
 | schedule | 定时触发 | schedule | schedule- |
 | curator | Curator 周期维护 consolidation fork（内部触发，非平台/非外部 HTTP） | curator | curator- |
+| task | Task worker 进程内执行（Kanban/Manus Task，内部触发，非平台/非外部 HTTP） | task | task- |
 
 规则：
 - session_id 前缀严格等于一级名，UUID 跟在连字符后（如 `dashboard-{uuid}`、`feishu-{uuid}`）。
 - CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 IM 平台一级。GatewayService 通过 GatewaySessionKey.platform 分流：source=`cli` → (`cli`, `cli`)，真实 IM 平台 → (`{platform.value}`, `{platform.value}`)。
 - `schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
 - `curator` 是 Curator 周期维护 consolidation fork 的内部触发来源，独立成一级（前缀 `curator-`、source `curator`）。session_id 用 `curator-{uuid4()}`（与 `schedule-{uuid4()}` 同，不用时间戳，遵守本模式 UUID 通用规则）。`SkillCuratorService._run_consolidation` 经 `SkillEvolutionService.run_background_review(ingress_source="curator")` 注入 `gateway.source`，由 `ChatCompletionService` 派生为会话 source；缺失时 `_build_policy_snapshot` 会回落 `api`，导致来源与前缀脱节。
+- `task` 是 Task worker（Kanban/Manus Task）进程内执行的内部触发来源，独立成一级（前缀 `task-`、source `task`）。execution_session_id 用 `task-{uuid5(NAMESPACE_URL, task.id)}`：从 task.id 确定性派生完整 UUID（str 形式带连字符 8-4-4-4-12，与 `schedule-{uuid4()}`/`curator-{uuid4()}` 完全一致，禁止用 `.hex` 无连字符形式），使同一 task 跨 run/claim 稳定复用同一 execution session（无需持久化 execution_session_id；delete_session 置空后下次 claim 重新派生出同一 id 重建/复用）。禁止 `task-{task.id}`：task.id 形如 `t_{hex}`，带 `t_` 前缀且非完整 UUID，会产生 `task-t_...` 双前缀且后缀非 UUID，违反本模式。worker 执行会话由 `task_execution_session_id(task)`（`app/application/task_session.py`）统一选择：`task.execution_session_id`（显式存量/外部）-> `task.origin_session_id`（Dashboard `/task create` 捕获的 Chat 会话，使 worker 对话与生命周期回到创建任务的 Chat 框，对齐 Manus）-> `task-{uuid5(NAMESPACE_URL, task.id)}`（origin=None 的 kanban/CLI/feishu 回退）。execution_session_id 不持久化（DB NULL），delete_task 仅按持久化显式字段清理 -> 不删 origin Chat 会话。
 - Dashboard 前端生成 session_id 用 `crypto.randomUUID()`（fallback `Date.now()+random`），不用 `Date.now()` 时间戳（碰撞风险）。
 
 历史数据迁移：
@@ -800,3 +802,82 @@ Skill source 保留：
 - backup 失败时若继续写入，会留下无法回滚的变更，破坏 Skill 库可恢复性；必须 fail-closed
 - `replace_all_skills` 若不保留既有 source，rescan 会把 agent-created skill 降级为 USER，丢失 provenance 信息
 - origin 若从 `request.arguments` 读取，OpenAI HTTP 客户端可伪造 `origin=foreground` 绕过后台限制；必须从 `trusted_metadata` 读取
+
+## 模式二十六：Dashboard Chat slash 命令本地解析路径
+
+任务生命周期管控提供双入口：看板 tasks.js（维持现状，主做观测）与 Dashboard Chat `/task` slash 命令（Manus 任务形态，对话内创建与跟踪）。slash 命令在 chat.js 前端本地解析，不调 LLM、不消耗 token，复用既有 task_routes API（不改 Application/Domain/状态机）。
+
+路由隔离（`chat.js send()`）：
+- 在空输入检查后、原 `await ensureSession()` 之前检测 `text.startsWith('/task')`：命中走命令分支（try/catch/finally：ensureSession -> 清空 input -> runTaskCommand；ensureSession 失败呈现 `[任务指令]` system 错误并保留 input 供重试；finally 恢复 focus；始终 return 不进入 LLM 路径），未命中走原 `/chat/completions` LLM 对话。
+- 命令分支不产生 user/assistant 消息、不调用 `/chat/completions`；非命令文本（含正文中间出现 `/task`）仍走 LLM。
+
+解析（`parseTaskCommand`，纯函数，无 DOM/api，供 harness 测试）：
+- 引号感知分词（spec 要求 title "支持引号"）：`"..."`/`'...'` 分组内部空格、剥离外层引号；未闭合引号返回 `{error}`。
+- 第一个 token 必须是 `create|list|approve|reject|cancel|retry` 之一；按子命令校验位置/命名参数（create 允许 `--body/--priority/--goal`，approve/reject 允许 `--note`，list/cancel/retry 无命名参数）。
+- 坏值返回 `{error: '<原因>。<完整用法>'}` 不传给 API：`--body/--note` 缺值、`--priority` 非整数、未知 `--xxx`、create 缺标题、approve/reject/cancel/retry 缺 id 或多 id、list 多余位置参数、命名参数不适用于该子命令。
+
+执行（`runTaskCommand`）：
+- 调既有 `api.task.*`（对应 task_routes 的 `/chat/tasks*` 端点）；create payload 始终含 `title` + `origin_session_id: currentSessionId`，仅用户提供时加 `body/priority/goal_mode`。
+- list 取 `api.task.list()` 首页 `items` 按 `origin_session_id === currentSessionId` 前端过滤（不改后端 list_tasks；首页 100 条限制见 debt D032）。
+- 结果统一以 `[任务指令]` 前缀 system 消息呈现（spec UI Design）；system 消息按 PRD L464 用"工具调用调试信息"样式渲染为 `<details open>` 可折叠气泡（summary 标题"系统消息" + pre 正文，默认展开保证命令结果可见、给人聊天感，区别于 user/assistant 消息），textContent 安全渲染，无 innerHTML。
+
+错误码映射：
+- `fetchJson` 失败时 `throw new Error(code)`（code 来自 `data.error.code`，如 task_not_found/task_state_invalid/task_invalid/task_conflict）；`describeTaskError` 把已知码映射为可读说明并括号保留原码，未知码走通用文案含 `String(error.message)`。
+
+陷阱：
+- 命令结果必须用 system 消息（带 `[任务指令]` 前缀）区别于 user/assistant，不得回落 LLM 或追加 user/assistant 消息。
+- slash 命令必须本地解析（Dashboard Chat 走 `/chat/completions`，不走 Gateway slash 解析），否则产生 LLM token 消耗。
+- create 必须绑定当前会话 `origin_session_id`，否则 `/task list` 无法按会话过滤。
+- 命令分支 ensureSession 失败时不得清空 input（保留供重试），但 finally 必须恢复 focus。
+- 看板 tasks.js 与 `/task` 命令双入口并存，看板不删任何管控按钮（用户对比两种交互）。
+
+## 模式二十七：Dashboard Chat 激活态消息自动刷新（客户端轮询）
+
+Dashboard Chat 激活态会话需自动展示后台追加的新消息（多标签同会话、任务生命周期 system 消息等），无需用户手动刷新。采用纯前端客户端轮询，复用既有 `GET /chat/sessions/{id}`，无后端改动、无 WebSocket。
+
+选型理由（轮询 vs WebSocket）：既有 tasks WS `/chat/tasks/events` 实为服务端 `_ws_poll_events` 轮询 DB 后推送，非消息写入事件总线；chat 无单调游标端点。新增 WS 仍需跨 ChatCompletionService/TaskAgentExecutor/Schedule 等分散写入来源建立事件传播，不能降低核心复杂度。本地 Dashboard 单激活会话每 4 秒一次详情请求可接受。
+
+规则：
+- `chat.js` 维护唯一 `setInterval`（`AUTO_REFRESH_INTERVAL_MS = 4000`）+ 世代 `autoRefreshGeneration` + 请求序号 `autoRefreshSeq` + 单飞 token `autoRefreshInFlight` + 复合版本 `renderedMessageVersion = {count, lastId}`（空会话用 `{count:0, lastId:null}`）。
+- `startAutoRefresh(sessionId, {immediate})` 幂等：先 `stopAutoRefresh`（清定时器+递增世代+清单飞），仅当 `sessionId === currentSessionId` 且 `!document.hidden` 时注册定时器；`immediate=true` 立即触发一次（供 visible 追赶）。
+- `autoRefreshTick` 守卫顺序：捕获 `sessionId/generation` -> 检查 `currentSessionId/isSending/document.hidden` -> 检查单飞（同世代 in-flight 跳过）-> 发请求 -> 响应返回后三重归属校验（`sessionId===currentSessionId && gen===autoRefreshGeneration && seq===autoRefreshSeq`）-> `isSending` 复检 -> 版本计算 -> 变更检测 -> `applySessionDetail(preserveScroll=true, skipToolCalls=true, skipSessionList=true, applyExternalMemoryState=false)` -> 推进版本。`finally` 仅清除自身 token（`generation===gen && seq===seq`），旧世代请求不得释放新世代单飞锁。
+- 变更检测：`messageVersionOf(detail)` 返回 `{count: messages.length, lastId: 末条id}`；空数组 `{count:0,lastId:null}`；非空但末条无 id 返回 `null`（无效快照，console.warn 不渲染不推进）。`versionsEqual` 比较两者。版本相同完全跳过消息区/调试区/会话列表/滚动写入（防闪烁）。仅检测追加（append-only），不检测编辑/删除。
+- 滚动保持：`applySessionDetail(preserveScroll=true)` 渲染前记录 `isAtScrollBottom()`（`scrollHeight - (scrollTop+clientHeight) <= 48`）与 `scrollTop`；渲染后 `restoreScroll`：原在底部则 `scrollToBottom`，否则 `scrollTop = min(原值, scrollHeight-clientHeight)` 下界 0。`preserveScroll=false`（selectSession/refreshCurrentSession）不调 restoreScroll，由调用方自行 `scrollToBottom`（selectSession）或保持原位（refreshCurrentSession）。
+- `applySessionDetail(detail, {preserveScroll, skipToolCalls, skipSessionList, applyExternalMemoryState})` 是共享渲染入口：`applyExternalMemoryState` 时调 `applySessionExternalMemoryState`+`renderExternalMemoryUI`（轮询跳过，避免覆盖用户操作）；`renderSessionMessages`；`updateInfo(detail, {skipToolCalls})`（`skipToolCalls=true` 跳过 `loadToolCalls`）；`preserveScroll` 时 `restoreScroll`；`!skipSessionList` 时 `await loadSessions`（轮询跳过）。函数 `async`，`loadSessions` 必须 `await`。
+- 生命周期：`selectSession` 在 `currentSessionId=id` 前 `stopAutoRefresh`，applySessionDetail+scrollToBottom 后 `startAutoRefresh(id)`；`ensureSession` 末尾设空版本+`startAutoRefresh`；`newSession` 开头 `stopAutoRefresh`；`handleDelete` 删当前会话前 `stopAutoRefresh`+清版本；`init` 绑定 `visibilitychange`（hidden 停，visible 且 `!isSending` 时 `startAutoRefresh(immediate=true)` 追赶）与 `beforeunload`（`stopAutoRefresh`），均一次性绑定。
+- 错误处理：`fetchJson` 失败抛 `new Error(code)` 无 HTTP status，`session_not_found` 按 `e.message === 'session_not_found'` 识别（禁用 `error.status`）-> `stopAutoRefresh`+清 `currentSessionId`/版本+`setHeader(null)`+`setStatusMessage('会话不存在或已删除')`+`loadSessions` 一次；其它错误 `console.warn` 保留 UI 与版本，下一周期重试，不停止定时器。
+- `/task` 版本协调：`persistTaskSystemMessage` 返回 `api.appendSessionMessage` 的消息（含真实 id）；`taskSystemMessage` 持久化前捕获 `preVersion = renderedMessageVersion`，成功且 `persisted.id` 存在时调 `advanceVersionAfterPersistedAppend(realId, preVersion)`：仅当 `preVersion === renderedMessageVersion`（期间未被权威详情改变）才推进为 `{count: preVersion.count+1, lastId: realId}`，否则跳过以权威为准。禁用本地临时 id 或 `__local__` 哨兵冒充服务端版本。
+- `refreshCurrentSession` 与 `send` finally：捕获发送时会话 id 与 `++autoRefreshSeq`，响应返回后归属校验（`sessionId===currentSessionId && seq===autoRefreshSeq`），防迟到响应串台；`send` finally `await refreshCurrentSession()`。
+
+陷阱：
+- 用单值 `lastRenderedMessageId` 无法表达空会话状态，也不利于乱序响应校验；必须用复合版本 `{count, lastId}`。
+- 单飞只用跨世代共享布尔值会让旧世代请求的 `finally` 释放新世代的单飞锁；in-flight token 必须含 `{generation, seq}`，`finally` 仅在 `generation===gen && seq===seq` 时清除。
+- `stopAutoRefresh` 不能取消已发出的 Promise；迟到响应必须靠返回后的三重归属校验（会话+世代+序号）丢弃，不能靠取消请求。
+- `applySessionDetail` 不 `await loadSessions` 会让会话列表更新变为 fire-and-forget、错误成为未处理 rejection；函数必须 `async`。
+- `session_not_found` 用 `error.status === 404` 判断永远不成立（`fetchJson` 抛 `new Error(code)` 无 status），会导致会话被删后持续轮询报错；必须用 `error.message === 'session_not_found'`。
+- `selectSession` 重构为 `applySessionDetail` 后须显式 `scrollToBottom()`，否则 `applySessionDetail(preserveScroll=false)` 不滚动，选中会话不再跳到最新消息（回归）。
+- 轮询路径必须 `skipToolCalls/skipSessionList/applyExternalMemoryState=true`，否则每 4 秒触发 `loadToolCalls`/`loadSessions`/外部记忆 UI 重渲，造成额外 API 与 UI 抖动。
+- `/task` 本地追加后若不推进 `renderedMessageVersion`，下一次轮询会因末条 id 不同误判变更触发无意义 clear+rebuild（闪烁）；必须用持久化响应的真实 id 推进，且期间版本被改变时跳过。
+
+## 模式二十八：Task 三态失败语义（用户取消 / worker 快速失败 / 系统失败）
+
+Task 终态失败必须区分三种来源，分别映射不同 status 与重试策略，不得混用：
+
+| 来源 | 触发方 | 语义 | 工具/路径 | TaskRunOutcome | TaskStatus | 重试 |
+|------|--------|------|-----------|----------------|------------|------|
+| 取消 | **用户明确指令**（`/task cancel`、取消按钮） | 用户主动终止 | `TaskService.cancel_task` -> `run_service.terminate` -> `dispatcher.cancel` 自取消 worker | TERMINATED | CANCELLED | 否 |
+| 快速失败 | **worker 判定**无法继续、确定性放弃 | 必需工具不可用、任务指令禁止兜底、不可恢复前置缺失 | worker `task_fail` -> `TaskService.fail` 写 `fail_requested` 事件 -> executor 返回 ABORTED | ABORTED | FAILED | **否（绕过断路器）** |
+| 系统失败 | 运行时异常 | crash/timeout/spawn 非确定性失败 | executor 返回 FAILED/TIMED_OUT/CRASHED/SPAWN_FAILED | FAILED/CRASHED/TIMED_OUT/SPAWN_FAILED | FAILED（触底）或 QUEUED（重试） | 断路器：consecutive_failures > max_retries -> FAILED，否则 QUEUED |
+
+规则：
+- worker 工具集只含 `task_show/complete/heartbeat/comment/propose_change/fail`（6 工具），**不含 task_cancel**。取消是用户语义，worker 不得触发取消。
+- `task_fail` 是 terminal intent（对齐 `task_complete`/`task_propose_change`）：`TaskService.fail(task_id, reason)` 只写 `fail_requested` 审计事件（非终态），不 finalize；`TaskAgentExecutor._build_result_from_chat` 经 `_read_latest_intent` 识别 `fail_requested` -> 返回 `TaskAgentResult(status=ABORTED, error=reason)`；`TaskRunService._finalize_run` -> `_finish(outcome=ABORTED)` -> `_decide_target_status(ABORTED)` -> **直接 FAILED，不进 `_RETRYABLE_OUTCOMES`，绕过断路器**。
+- `_decide_target_status` 映射：COMPLETED->SUCCEEDED、WAITING_APPROVAL->WAITING_APPROVAL、TERMINATED->CANCELLED、ABORTED->FAILED（不重试）、EXPIRED->EXPIRED、CRASHED/TIMED_OUT->EXPIRED、FAILED/SPAWN_FAILED->断路器（QUEUED 或 FAILED）。
+- `_read_latest_intent` 的 kind 过滤含 `complete_requested`/`change_proposed`/`fail_requested` 三种；找不到任何 intent 事件时默认 COMPLETED（finish_reason="length" -> FAILED）。
+- worker 判定无法继续必须调 `task_fail(reason)`，不得调 `task_cancel`（已从 worker 工具集移除）；TASK_GUIDANCE 明确"task_fail 是 worker 主动失败，不是用户取消"。
+
+陷阱：
+- worker 判定快速失败若误用 `task_cancel`（用户取消语义），会触发 `cancel_task`->`terminate`->`dispatcher.cancel(worker_token)` **自取消竞态**（worker 取消自己的 asyncio task）：自取消与 worker 正常 COMPLETED 终结 CAS 竞态，COMPLETED 先赢 -> task SUCCEEDED，与 worker"已取消"摘要矛盾（t_a742046a521d46eb 案例）。正确做法是 `task_fail` 走 intent 事件，不自取消。
+- 把 worker 主动失败塞进可重试 `FAILED`（`_RETRYABLE_OUTCOMES`）会导致确定性失败被反复重试（execute_code 不可用重试 N 次仍失败，浪费）。必须用独立 `ABORTED` 绕过断路器。
+- `task_cancel` 收回用户专用后，worker 工具集枚举、`_dispatch` 分支、`TASK_TOOL_NAMES`、`permitted_managed_tools`、TASK_GUIDANCE、测试必须同步更新；遗漏任一处会留死代码或 worker 仍能调 cancel。
+- `_NOTIFIED_OUTCOMES`（task_service.py 与 infrastructure/task/outbound.py 镜像）必须加 ABORTED，否则 worker 快速失败不触发飞书/通知投递。

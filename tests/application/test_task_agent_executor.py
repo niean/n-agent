@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from typing import Any
-from uuid import uuid4
+from uuid import uuid4, uuid5, NAMESPACE_URL
 
 import pytest
 
@@ -66,12 +66,18 @@ class FakeTaskRegistry:
 
     def __init__(self, events: list[TaskEvent] | None = None):
         self._events = events or []
+        self.appended_events: list[dict] = []
 
     async def list_events(self, task_id, since=0, limit=100):
         return tuple(
             e for e in self._events
             if e.task_id == task_id and e.id > since
         )[-limit:]
+
+    async def append_event(self, task_id, kind, payload, run_id=None):
+        self.appended_events.append(
+            {"task_id": task_id, "kind": kind, "payload": payload, "run_id": run_id}
+        )
 
 
 class FakePromptBuilder:
@@ -169,20 +175,22 @@ async def test_executor_task_tools_in_permitted_managed_not_granted(executor, fa
 
 
 @pytest.mark.asyncio
-async def test_executor_permitted_managed_tools_contains_propose_and_cancel(executor, fake_chat):
-    """permitted_managed_tools must contain task_propose_change and task_cancel,
-    and must NOT contain the removed task_block/task_create/task_link."""
+async def test_executor_permitted_managed_tools_contains_propose_and_fail(executor, fake_chat):
+    """permitted_managed_tools must contain task_propose_change and task_fail,
+    and must NOT contain the removed task_block/task_create/task_link/task_cancel."""
     task = _task()
     await executor.run(task, task_run_id=1, claim_lock="L1")
     call = fake_chat.complete_calls[0]
     permitted = set(call.trusted_metadata.get("permitted_managed_tools", []))
     # New tools present
     assert "task_propose_change" in permitted
-    assert "task_cancel" in permitted
+    assert "task_fail" in permitted
     # Removed tools absent
     assert "task_block" not in permitted
     assert "task_create" not in permitted
     assert "task_link" not in permitted
+    # task_cancel 收回为用户专用，worker 不得持有
+    assert "task_cancel" not in permitted
 
 
 @pytest.mark.asyncio
@@ -255,7 +263,7 @@ async def test_executor_session_id_is_task_prefix(executor, fake_chat):
     task = _task(id="t_1", execution_session_id=None)
     await executor.run(task, task_run_id=1, claim_lock="L1")
     call = fake_chat.complete_calls[0]
-    assert call.session_id == "task-t_1"
+    assert call.session_id == f"task-{uuid5(NAMESPACE_URL, 't_1')}"
 
 
 @pytest.mark.asyncio
@@ -264,6 +272,15 @@ async def test_executor_reuses_existing_execution_session(executor, fake_chat):
     await executor.run(task, task_run_id=1, claim_lock="L1")
     call = fake_chat.complete_calls[0]
     assert call.session_id == "task-t_1-existing"
+
+
+@pytest.mark.asyncio
+async def test_executor_reuses_origin_session_for_dashboard_task(executor, fake_chat):
+    """dashboard /task 任务：origin_session_id = Chat 会话 -> worker 在 Chat 会话执行。"""
+    task = _task(id="t_1", execution_session_id=None, origin_session_id="dashboard-s1")
+    await executor.run(task, task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+    assert call.session_id == "dashboard-s1"
 
 
 @pytest.mark.asyncio
@@ -279,6 +296,7 @@ async def test_executor_returns_terminal_intent_not_finalize(executor, fake_regi
     task = _task()
     result = await executor.run(task, task_run_id=1, claim_lock="L1")
     assert result.status == TaskRunOutcome.COMPLETED
+    assert result.output == "all done"
     # The executor does not have a finish_run method and does not call registry.finish_run
     assert not hasattr(executor, "finish_run")
 
@@ -310,6 +328,44 @@ async def test_executor_no_intent_defaults_completed(executor, fake_registry):
     task = _task()
     result = await executor.run(task, task_run_id=1, claim_lock="L1")
     assert result.status == TaskRunOutcome.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_executor_fail_requested_returns_aborted(executor, fake_registry):
+    """Worker 判定快速失败调 task_fail -> 写 fail_requested 事件 -> executor 返回
+    ABORTED（-> task FAILED 不重试）。回归 t_a742046a521d46eb：worker 误用 task_cancel
+    导致 run 以 COMPLETED 终结 -> SUCCEEDED 的语义 bug。"""
+    fake_registry._events = [
+        TaskEvent(
+            id=1, task_id="t_1", kind="fail_requested",
+            payload={"outcome": "aborted", "error": "execute_code unavailable", "run_id": 1},
+            run_id=1, created_at=datetime.now(timezone.utc),
+        ),
+    ]
+    task = _task()
+    result = await executor.run(task, task_run_id=1, claim_lock="L1")
+    assert result.status == TaskRunOutcome.ABORTED
+    assert result.error == "execute_code unavailable"
+    assert result.output == "execute_code unavailable"
+
+
+@pytest.mark.asyncio
+async def test_executor_budget_exhausted_no_intent_defaults_failed(executor, fake_chat, fake_registry):
+    """BUDGET_EXHAUSTED (finish_reason='length') + 无 task_complete intent -> FAILED。
+
+    Regression: 此前默认 COMPLETED，把预算耗尽的 run 误标 SUCCEEDED（看板=succeeded /
+    Chat=已达到用量上限，最终结果不一致）。worker 未调用 task_complete 即未完成 -> FAILED。
+    """
+    fake_registry._events = []
+    fake_chat.set_result(ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": "已达到用量上限，请稍后重试或联系管理员。"},
+        finish_reason="length",
+    ))
+    task = _task()
+    result = await executor.run(task, task_run_id=1, claim_lock="L1")
+    assert result.status == TaskRunOutcome.FAILED
+    assert "已达到用量上限" in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -430,10 +486,60 @@ async def test_goal_mode_max_turns_fails():
         chat_service=chat, task_registry=FakeTaskRegistry(),
         prompt_builder=FakePromptBuilder(),
     )
-    task = _task(goal_mode=True, goal_max_turns=3)
+    task = _task(goal_mode=True, goal_max_turns=1)
     result = await executor.run_goal_loop(task, task_run_id=1, claim_lock="L1")
     assert result.status == TaskRunOutcome.FAILED
     assert "not achieved" in (result.error or "") or "incomplete" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_goal_mode_early_exit_on_consecutive_rejections():
+    """连续 GOAL_MAX_CONSECUTIVE_REJECTIONS 次 judge 否决即早退 FAILED，不耗尽 max_turns。
+
+    Regression: t_97d317e953b64edc 明确失败后耗尽 10 轮才判失败。
+    """
+    worker_result = ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": "did work"},
+        finish_reason="stop",
+    )
+    judge_text = '{"achieved": false, "reason": "incomplete"}'
+    chat = FakeJudgeChatService(worker_result, judge_text)
+    executor = TaskAgentExecutor(
+        chat_service=chat, task_registry=FakeTaskRegistry(),
+        prompt_builder=FakePromptBuilder(),
+    )
+    task = _task(goal_mode=True, goal_max_turns=10)  # 远大于早退阈值
+    result = await executor.run_goal_loop(task, task_run_id=1, claim_lock="L1")
+    assert result.status == TaskRunOutcome.FAILED
+    assert "consecutive" in (result.error or "")
+    # 早退：worker 只跑 GOAL_MAX_CONSECUTIVE_REJECTIONS 轮，不是 10 轮
+    worker_calls = [c for c in chat.complete_calls if not c.trusted_metadata.get("judge")]
+    from app.application.task_agent_executor import GOAL_MAX_CONSECUTIVE_REJECTIONS
+    assert len(worker_calls) == GOAL_MAX_CONSECUTIVE_REJECTIONS
+
+
+@pytest.mark.asyncio
+async def test_goal_mode_records_judge_feedback():
+    """judge 否决后写 goal_judge_feedback 事件（喂回下一轮 worker，对齐 Hermes continuation prompt）。"""
+    worker_result = ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": "did work"},
+        finish_reason="stop",
+    )
+    judge_text = '{"achieved": false, "reason": "缺 Q3 数据"}'
+    chat = FakeJudgeChatService(worker_result, judge_text)
+    registry = FakeTaskRegistry()
+    executor = TaskAgentExecutor(
+        chat_service=chat, task_registry=registry,
+        prompt_builder=FakePromptBuilder(),
+    )
+    task = _task(goal_mode=True, goal_max_turns=10)
+    await executor.run_goal_loop(task, task_run_id=1, claim_lock="L1")
+    feedback_events = [e for e in registry.appended_events if e["kind"] == "goal_judge_feedback"]
+    assert len(feedback_events) >= 1
+    assert feedback_events[0]["payload"]["reason"] == "缺 Q3 数据"
+    assert feedback_events[0]["run_id"] == 1
 
 
 @pytest.mark.asyncio

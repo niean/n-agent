@@ -28,7 +28,7 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -55,6 +55,7 @@ from app.domain.task import (
     TaskValidationError,
     TaskWorkspaceKind,
 )
+from app.application.task_session import task_execution_session_id
 from app.domain.task_policy import TaskPolicy
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,7 @@ _DEFAULT_ATTACHMENT_TASK_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
 # Intent event kinds (non-terminal audit; TaskRunService writes the actual
 # terminal "finished" event)
 _INTENT_COMPLETE = "complete_requested"
+_INTENT_FAIL = "fail_requested"
 
 # Event kinds used by the propose/approve/reject/cancel/retry surface
 _EVENT_CHANGE_PROPOSED = "change_proposed"
@@ -98,11 +100,13 @@ _EVENT_RETRIED = "retried"
 _PROGRESS_EVENT_KINDS: frozenset[str] = frozenset({
     "comment_added",
     _INTENT_COMPLETE,
+    _INTENT_FAIL,
     _EVENT_CHANGE_PROPOSED,
     _EVENT_CHANGE_APPROVED,
     _EVENT_CHANGE_REJECTED,
     _EVENT_CANCELLED,
     _EVENT_RETRIED,
+    "goal_judge_feedback",
     "finished",
 })
 
@@ -111,6 +115,7 @@ _NOTIFIED_OUTCOMES: frozenset[TaskRunOutcome] = frozenset({
     TaskRunOutcome.COMPLETED,
     TaskRunOutcome.WAITING_APPROVAL,
     TaskRunOutcome.FAILED,
+    TaskRunOutcome.ABORTED,
     TaskRunOutcome.CRASHED,
     TaskRunOutcome.TIMED_OUT,
     TaskRunOutcome.EXPIRED,
@@ -138,16 +143,34 @@ class TaskService:
         attachments_root: Path | None = None,
         attachment_max_bytes: int = _DEFAULT_ATTACHMENT_MAX_BYTES,
         attachment_task_max_bytes: int = _DEFAULT_ATTACHMENT_TASK_MAX_BYTES,
+        lifecycle_writer: Callable[[str, str], Awaitable[Any]] | None = None,
     ):
         self.registry = registry
         self.policy = policy
         self.memory_store = memory_store
+        self.lifecycle_writer = lifecycle_writer
         self.attachments_root = (
             Path(attachments_root) if attachments_root is not None else None
         )
         self.attachment_max_bytes = attachment_max_bytes
         self.attachment_task_max_bytes = attachment_task_max_bytes
         self._run_service: Any = None
+
+    async def _write_lifecycle(self, task: Task, content: str) -> None:
+        """向执行会话 best-effort 写 ui.task_lifecycle system 消息（非 RUNNING cancel 用）。
+
+        writer 为 None 时跳过；异常仅 log.warning，不阻断 cancel CAS 结果。RUNNING cancel
+        由 TaskRunService.terminate -> _finish 写，此处不重复写。
+        """
+        if self.lifecycle_writer is None:
+            return
+        session_id = task_execution_session_id(task)
+        try:
+            await self.lifecycle_writer(session_id, content)
+        except Exception:
+            logger.warning(
+                "lifecycle write failed for task %s", task.id, exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # CRUD
@@ -544,6 +567,7 @@ class TaskService:
             {"status": TaskStatus.CANCELLED},
             task.version,
         )
+        await self._write_lifecycle(task, f"[任务状态] 已取消: {task.id} - {task.title}")
         await self.registry.append_event(
             task_id,
             _EVENT_CANCELLED,
@@ -897,6 +921,39 @@ class TaskService:
         )
         return intent
 
+    async def fail(
+        self,
+        task_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Submit worker fast-fail intent. Does NOT finalize the run.
+
+        Worker 判定任务无法继续、不再重试（如必需工具不可用、任务指令禁止兜底）
+        时调用。Validates the task is RUNNING, appends a ``fail_requested`` audit
+        event (non-terminal), returns the intent dict. TaskRunService reads the
+        latest intent event and performs the CAS finalize with outcome=ABORTED
+        -> task FAILED（绕过断路器，不重试）。取消（CANCELLED）只认用户指令，
+        worker 不得用本方法触发取消语义。
+        """
+        task = await self.get_task(task_id)
+        if task.status != TaskStatus.RUNNING:
+            raise TaskStateError(
+                f"fail requires RUNNING, got {task.status.value}"
+            )
+        if not task.claim_lock or task.current_run_id is None:
+            raise TaskStateError("task has no active claim")
+
+        intent = {
+            "outcome": TaskRunOutcome.ABORTED.value,
+            "error": reason or "worker aborted",
+            "task_id": task_id,
+            "run_id": task.current_run_id,
+        }
+        await self.registry.append_event(
+            task_id, _INTENT_FAIL, intent, run_id=task.current_run_id,
+        )
+        return intent
+
     async def heartbeat(self, task_id: str, note: str) -> dict[str, Any]:
         """Record heartbeat (CAS on claim_lock) and renew lease."""
         task = await self.get_task(task_id)
@@ -1041,6 +1098,9 @@ class TaskService:
             elif event.kind == _INTENT_COMPLETE:
                 summary = event.payload.get("summary", "")
                 lines.append(f"[{ts}] complete_requested: {summary}")
+            elif event.kind == _INTENT_FAIL:
+                reason = event.payload.get("error", "")
+                lines.append(f"[{ts}] fail_requested: {reason}")
             elif event.kind == _EVENT_CHANGE_PROPOSED:
                 proposal = event.payload.get("proposal", "")
                 lines.append(f"[{ts}] propose_change: {proposal}")
@@ -1057,6 +1117,10 @@ class TaskService:
             elif event.kind == "finished":
                 outcome = event.payload.get("outcome", "")
                 lines.append(f"[{ts}] run finished: {outcome}")
+            elif event.kind == "goal_judge_feedback":
+                reason = event.payload.get("reason", "")
+                turn = event.payload.get("turn", "")
+                lines.append(f"[{ts}] goal_judge_feedback (turn {turn}): {reason}")
         return lines
 
     # ------------------------------------------------------------------

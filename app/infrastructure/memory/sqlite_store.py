@@ -188,10 +188,63 @@ class SQLiteMemoryStore:
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (message.created_at.isoformat(), session_id))
         return message
 
+    async def append_message_if_session_exists(
+        self, session_id: str, message: ConversationMessage,
+    ) -> ConversationMessage | None:
+        """仅当 session 存在时追加 message；不存在返回 None，不建会话。
+
+        单连接、单 ``BEGIN IMMEDIATE`` 事务内完成 session 存在性检查、messages INSERT
+        与 sessions.updated_at 更新；任一步失败整体回滚。sqlite3 默认 ``isolation_level``
+        会在 DML 前隐式 BEGIN，与显式 BEGIN IMMEDIATE 冲突，故先切 autocommit 再手动管事务。
+        并发删除/追加以先获写锁方为准：追加先提交则消息随后随显式 delete_session 清理；
+        删除先提交则追加返回 None。不留下孤儿消息、不复活 session。
+        """
+        with self._connect() as conn:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT updated_at FROM sessions WHERE id = ?", (session_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return None
+                conn.execute(
+                    """
+                    INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message.id,
+                        session_id,
+                        message.role,
+                        json.dumps(message.content),
+                        message.created_at.isoformat(),
+                        None,
+                        message.tool_call_id,
+                        message.name,
+                        1 if message.is_summary else 0,
+                        1 if message.is_summarized else 0,
+                    ),
+                )
+                # updated_at = max(原值, message.created_at)，防迟到客户端时间令活动时间倒退
+                conn.execute(
+                    "UPDATE sessions SET updated_at = MAX(updated_at, ?) WHERE id = ?",
+                    (message.created_at.isoformat(), session_id),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        return message
+
     async def list_messages(self, session_id: str) -> list[ConversationMessage]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC",
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
                 (session_id,),
             ).fetchall()
         return [

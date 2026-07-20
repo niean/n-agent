@@ -29,6 +29,15 @@ class MemoryStore(Protocol):
     async def append_message(self, session_id: str, message: ConversationMessage) -> ConversationMessage:
         ...
 
+    async def append_message_if_session_exists(
+        self, session_id: str, message: ConversationMessage,
+    ) -> ConversationMessage | None:
+        """仅当 session 存在时追加 message；不存在返回 None。
+
+        不创建会话、不更新其它会话、不写孤儿消息。与 ``append_message`` 的隐式建会话
+        行为互补，供 UI 通知（命令记录/生命周期）在会话删除竞态中安全写入。
+        """
+
     async def list_messages(self, session_id: str) -> list[ConversationMessage]:
         ...
 

@@ -47,6 +47,7 @@ _NOTIFIED_OUTCOMES: frozenset[TaskRunOutcome] = frozenset({
     TaskRunOutcome.COMPLETED,
     TaskRunOutcome.WAITING_APPROVAL,
     TaskRunOutcome.FAILED,
+    TaskRunOutcome.ABORTED,
     TaskRunOutcome.CRASHED,
     TaskRunOutcome.TIMED_OUT,
     TaskRunOutcome.TERMINATED,

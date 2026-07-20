@@ -448,6 +448,7 @@ class ToolService:
                 status=result.status,
                 content=sanitized_content,
                 duration_ms=result.duration_ms,
+                terminal=result.terminal,
             )
 
         return result

@@ -36,7 +36,7 @@ def test_task_tool_definitions_returns_six_tools():
         "task_heartbeat",
         "task_comment",
         "task_propose_change",
-        "task_cancel",
+        "task_fail",
     }
     assert len(defs) == 6
 
@@ -150,10 +150,12 @@ def test_task_propose_change_input_schema():
     assert schema.get("additionalProperties") is False
 
 
-def test_task_cancel_input_schema():
-    """task_cancel: 无参"""
+def test_task_fail_input_schema():
+    """task_fail: {reason} 必填"""
     defs = {d.name: d for d in task_tool_definitions()}
-    schema = defs["task_cancel"].input_schema
-    assert schema["properties"] == {}
-    assert schema.get("required", []) == []
+    schema = defs["task_fail"].input_schema
+    props = schema["properties"]
+    assert "reason" in props
+    assert props["reason"].get("minLength") == 1
+    assert "reason" in schema.get("required", [])
     assert schema.get("additionalProperties") is False

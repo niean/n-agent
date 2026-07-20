@@ -96,6 +96,10 @@ class ToolResult:
     status: ToolResultStatus
     content: Any
     duration_ms: int = 0
+    # A successful terminal intent (for example task_complete/task_fail) ends
+    # the current Agent turn after its tool result has been persisted. This is
+    # executor-controlled flow metadata, not model-provided content.
+    terminal: bool = False
 
 
 class ToolExecutor(Protocol):

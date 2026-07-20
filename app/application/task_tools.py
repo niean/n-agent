@@ -17,12 +17,15 @@ Returns 6 managed ToolDefinitions for the Task subdomain (Manus-aligned
   - task_heartbeat:        {note} -- 续租 lease + 记录心跳
   - task_comment:          {task_id, body} -- 给指定 task 加评论
   - task_propose_change:   {proposal} -- 提出需用户审批的变更提案
-  - task_cancel:           {} -- 取消当前 task
+  - task_fail:             {reason} -- worker 快速失败（不再重试）
 
 移除的工具（对齐 Manus 扁平状态机）:
   - task_block:    阻塞意图已由 task_propose_change 的意图审批替代
   - task_create:   worker 不再自动拆分子任务，创建只通过用户入口
   - task_link:     依赖图已移除
+  - task_cancel:   取消语义收回为用户专用（用户 /task cancel 或取消按钮），
+                   worker 判定无法继续改用 task_fail（快速失败 -> FAILED 不重试），
+                   不再混用用户取消语义
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ TASK_TOOL_COMPLETE = "task_complete"
 TASK_TOOL_HEARTBEAT = "task_heartbeat"
 TASK_TOOL_COMMENT = "task_comment"
 TASK_TOOL_PROPOSE_CHANGE = "task_propose_change"
-TASK_TOOL_CANCEL = "task_cancel"
+TASK_TOOL_FAIL = "task_fail"
 
 # managed 工具集（6 工具），供 TaskAgentExecutor 写入 permitted_managed_tools
 TASK_TOOL_NAMES: frozenset[str] = frozenset({
@@ -44,7 +47,7 @@ TASK_TOOL_NAMES: frozenset[str] = frozenset({
     TASK_TOOL_HEARTBEAT,
     TASK_TOOL_COMMENT,
     TASK_TOOL_PROPOSE_CHANGE,
-    TASK_TOOL_CANCEL,
+    TASK_TOOL_FAIL,
 })
 
 
@@ -179,17 +182,20 @@ def task_tool_definitions() -> list[ToolDefinition]:
             managed=True,
         ),
         ToolDefinition(
-            name=TASK_TOOL_CANCEL,
+            name=TASK_TOOL_FAIL,
             description=(
-                "取消当前 worker 所属的 task。调用后 task 进入 CANCELLED 终态，"
-                "run 由 TaskRunService 统一终结（释放 claim + 回收 worker）。"
-                "只允许取消当前 worker claim 的 task，仍走 ownership 校验。"
-                "终态 task（SUCCEEDED/CANCELLED/EXPIRED）不可取消。"
+                "worker 判定当前 task 无法继续、确定性地快速失败（不再重试）时调用。"
+                "典型场景：必需工具不可用、任务指令明确禁止兜底方案、遇到不可恢复的"
+                "前置条件缺失。reason 为失败原因（人类可读）。调用后本 run 立即结束，"
+                "task 进入 FAILED 终态（绕过断路器，不自动重试）。注意：本工具表达的是"
+                "worker 主动失败，不是用户取消；用户取消请走 /task cancel 或取消按钮。"
             ),
             input_schema={
                 "type": "object",
-                "properties": {},
-                "required": [],
+                "properties": {
+                    "reason": {"type": "string", "minLength": 1},
+                },
+                "required": ["reason"],
                 "additionalProperties": False,
             },
             risk_level=RiskLevel.CONFIRM,

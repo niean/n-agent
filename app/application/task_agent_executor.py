@@ -7,7 +7,7 @@ context, aligned with ``ScheduledAgentExecutor``'s calling boundary:
   - Same ``run_id`` in both ``IngressFacts`` and ``trusted_metadata``
   - task 6 tools in ``permitted_managed_tools`` (NOT ``granted_tools``):
     task_show / task_complete / task_heartbeat / task_comment /
-    task_propose_change / task_cancel
+    task_propose_change / task_fail
   - ``trusted_metadata.task`` carries the server-side immutable claim context
   - ``trusted_claims`` mirrors the same claim identifiers
 
@@ -17,7 +17,7 @@ finalization path.
 
 Terminal intent detection (Manus-aligned):
   After ``chat_service.complete()`` returns, the executor reads the latest
-  ``complete_requested`` or ``change_proposed`` event for the task.
+  ``complete_requested`` / ``change_proposed`` / ``fail_requested`` event for the task.
   - ``complete_requested`` (written by ``TaskService.complete``) maps to
     ``TaskRunOutcome.COMPLETED``.
   - ``change_proposed`` (written by ``TaskService.propose_change`` when the
@@ -28,6 +28,10 @@ Terminal intent detection (Manus-aligned):
     inside the tool execution; the executor's returned intent lets
     ``TaskRunService._finalize_run`` handle the CAS conflict gracefully
     (late-worker path).
+  - ``fail_requested`` (written by ``TaskService.fail`` when the worker calls
+    ``task_fail``) maps to ``TaskRunOutcome.ABORTED`` -> task FAILED（绕过断路器，
+    不重试）。worker 判定无法继续、确定性快速失败时使用；取消（CANCELLED）只认用户
+    指令，worker 不得触发取消语义。
   If no intent event is found, the executor defaults to COMPLETED with the
   final output as summary.
 
@@ -50,6 +54,7 @@ from uuid import uuid4
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult
 from app.application.policy_snapshot import IngressFacts
+from app.application.task_session import task_execution_session_id
 from app.application.task_tools import TASK_TOOL_NAMES
 from app.domain.policy import ExecutionMode
 from app.domain.task import Task, TaskRunOutcome
@@ -75,11 +80,21 @@ TASK_GUIDANCE = """\
    - 批准后续行：按提案内容继续执行
    - 拒绝后续行：不得执行该提案，需选择不包含该提案的可行路径或再次提出新提案
 5. 完成后调用 task_complete 提交完成意图，附带 summary + metadata + artifacts
-6. 仅当确认当前 task 无法继续且需要终止时调用 task_cancel 取消 task
+6. 仅当确认当前 task 无法继续、确定性快速失败（不再重试）时调用 task_fail，
+   附带 reason 说明失败原因（如必需工具不可用、任务指令禁止兜底）。调用后 task
+   进入 FAILED 终态，不自动重试。注意：task_fail 是 worker 主动失败，不是用户取消；
+   用户取消走 /task cancel 或取消按钮，worker 不得触发取消语义。
 
-重要：task_complete 和 task_propose_change 只提交终态意图，系统会以 claim token
+重要：task_complete / task_propose_change / task_fail 只提交终态意图，系统会以 claim token
 一次性终结 run（释放 claim + 回收 worker）。不要尝试直接修改 task 状态。
 """
+
+
+# goal_mode 连续被判"目标未达成"的早退阈值。对齐 Hermes Ralph loop 的 turn-budget
+# 兜底思想，但在 N-Agent 后台任务场景下额外加早退：worker 连续 N 次完成但 judge 均判
+# 未达成（且已通过 goal_judge_feedback 事件把 reason 喂回 worker 仍无改进）即视为
+# "明确失败"，直接 FAILED，避免耗尽 goal_max_turns（修复 t_97d317e953b64edc 耗尽 10 轮）。
+GOAL_MAX_CONSECUTIVE_REJECTIONS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +107,7 @@ class TaskAgentResult:
     """Terminal intent returned by the executor.
 
     ``status`` is the terminal outcome intent (COMPLETED / WAITING_APPROVAL /
-    FAILED / TIMED_OUT / CRASHED). ``output`` is the agent's final text.
+    FAILED / TIMED_OUT / CRASHED / ABORTED). ``output`` is the agent's final text.
     ``metadata`` and ``artifacts`` come from the task_complete tool call.
     ``error`` is set for FAILED/TIMED_OUT.
 
@@ -186,7 +201,7 @@ class TaskAgentExecutor:
         with trusted task context. After completion, reads the latest intent
         event to determine the terminal outcome.
         """
-        execution_session_id = task.execution_session_id or f"task-{task.id}"
+        execution_session_id = task_execution_session_id(task)
         execution_run_id = f"task-run-{uuid4().hex[:12]}"
 
         # Build system prompt
@@ -300,6 +315,7 @@ class TaskAgentExecutor:
         max_runtime = task.max_runtime_seconds or self.max_runtime_seconds
         start = asyncio.get_event_loop().time()
         last_result: TaskAgentResult | None = None
+        consecutive_rejections = 0
 
         for turn in range(1, max_turns + 1):
             elapsed = asyncio.get_event_loop().time() - start
@@ -342,7 +358,23 @@ class TaskAgentExecutor:
                         metadata={**turn_result.metadata, "judge_reason": judge.reason},
                         artifacts=turn_result.artifacts,
                     )
-                # Not achieved -- continue to next turn (unless this was the last)
+                # Not achieved: 把 judge reason 喂回下一轮 worker（goal_judge_feedback
+                # 事件，经 build_worker_context 进度段透传，对齐 Hermes Ralph loop 的
+                # continuation prompt），并累计连续否决次数。超过阈值即"明确失败"早退
+                # FAILED，避免耗尽 max_turns（修复 t_97d317e953b64edc）。
+                consecutive_rejections += 1
+                await self._record_judge_feedback(task, task_run_id, turn, judge.reason)
+                if consecutive_rejections >= GOAL_MAX_CONSECUTIVE_REJECTIONS:
+                    return TaskAgentResult(
+                        status=TaskRunOutcome.FAILED,
+                        output=turn_result.output,
+                        error=(
+                            f"goal not achieved after {consecutive_rejections} consecutive "
+                            f"judge rejections: {judge.reason}"
+                        ),
+                        metadata={"judge_reason": judge.reason},
+                    )
+                # 未达阈值但已是最后一轮 -> max_turns 兜底 FAILED
                 if turn >= max_turns:
                     return TaskAgentResult(
                         status=TaskRunOutcome.FAILED,
@@ -357,6 +389,26 @@ class TaskAgentExecutor:
             error="goal_loop exited without result",
         )
 
+    async def _record_judge_feedback(
+        self, task: Task, task_run_id: int, turn: int, reason: str,
+    ) -> None:
+        """把 judge 的 not-achieved reason 持久化为 goal_judge_feedback 事件。
+
+        build_worker_context 进度段透传给下一轮 worker（task_show 读取），使 worker
+        能基于反馈调整方法或主动 task_propose_change/task_cancel，而非重复同一失败做法
+        （对齐 Hermes Ralph loop 的 continuation prompt）。best-effort，失败仅 log。
+        """
+        try:
+            await self.task_registry.append_event(
+                task.id, "goal_judge_feedback",
+                {"turn": turn, "achieved": False, "reason": reason},
+                run_id=task_run_id,
+            )
+        except Exception:
+            logger.warning(
+                "record judge feedback failed for task %s", task.id, exc_info=True,
+            )
+
     # ------------------------------------------------------------------
     # Judge fork
     # ------------------------------------------------------------------
@@ -367,7 +419,7 @@ class TaskAgentExecutor:
         Returns None on parse failure (retryable FAILED). The judge has
         read-only tools only -- no write tools, no task tools.
         """
-        execution_session_id = task.execution_session_id or f"task-{task.id}"
+        execution_session_id = task_execution_session_id(task)
         judge_run_id = f"task-judge-{uuid4().hex[:12]}"
 
         trusted_claims: dict[str, Any] = {
@@ -490,6 +542,14 @@ class TaskAgentExecutor:
                     metadata={"proposal": proposal},
                     error=None,
                 )
+            if kind == "fail_requested":
+                # Worker called task_fail -> ABORTED -> task FAILED（绕过断路器，不重试）。
+                reason = intent.get("error") or "worker aborted"
+                return TaskAgentResult(
+                    status=TaskRunOutcome.ABORTED,
+                    output=reason,
+                    error=reason,
+                )
             # complete_requested
             outcome_str = intent.get("outcome", "")
             try:
@@ -501,12 +561,23 @@ class TaskAgentExecutor:
             artifacts = tuple(artifacts_raw) if isinstance(artifacts_raw, list) else ()
             return TaskAgentResult(
                 status=outcome,
-                output=output,
+                output=str(intent.get("summary") or output),
                 metadata=metadata,
                 artifacts=artifacts,
             )
 
-        # No explicit intent event -- default to COMPLETED
+        # No explicit intent event: worker did not call task_complete/propose.
+        # finish_reason "length" = BUDGET_EXHAUSTED or ITERATION_LIMIT (worker hit a
+        # limit without completing) -> FAILED, not COMPLETED (otherwise a budget-exhausted
+        # run is misclassified as SUCCEEDED, causing 看板/Chat 最终结果不一致).
+        # finish_reason "stop" = worker gave a final answer -> COMPLETED with output as
+        # summary (existing behavior).
+        if result.finish_reason == "length":
+            return TaskAgentResult(
+                status=TaskRunOutcome.FAILED,
+                output=output,
+                error=output or "run ended without task_complete (limit reached)",
+            )
         return TaskAgentResult(
             status=TaskRunOutcome.COMPLETED,
             output=output,
@@ -516,14 +587,15 @@ class TaskAgentExecutor:
     async def _read_latest_intent(
         self, task_id: str, run_id: int
     ) -> dict[str, Any] | None:
-        """Read the latest complete_requested or change_proposed event.
+        """Read the latest complete_requested / change_proposed / fail_requested event.
 
-        Events are appended by TaskService.complete / TaskService.propose_change
-        inside the agent loop. We read the most recent one matching this run_id.
+        Events are appended by TaskService.complete / TaskService.propose_change /
+        TaskService.fail inside the agent loop. We read the most recent one matching
+        this run_id.
 
         Returns a dict augmented with the event ``kind`` so the caller can
         distinguish complete_requested (-> COMPLETED) from change_proposed
-        (-> WAITING_APPROVAL).
+        (-> WAITING_APPROVAL) from fail_requested (-> ABORTED).
         """
         try:
             events = await self.task_registry.list_events(task_id, limit=50)
@@ -531,7 +603,7 @@ class TaskAgentExecutor:
             return None
         # Search backwards for the latest intent event
         for event in reversed(events):
-            if event.kind not in ("complete_requested", "change_proposed"):
+            if event.kind not in ("complete_requested", "change_proposed", "fail_requested"):
                 continue
             if event.run_id is not None and event.run_id != run_id:
                 continue

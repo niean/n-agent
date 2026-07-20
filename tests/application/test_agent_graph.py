@@ -162,6 +162,36 @@ class FakeKnowledgeExecutor:
         )
 
 
+class TerminalToolExecutor:
+    """A task-style tool whose successful intent must end the Agent turn."""
+
+    async def execute(self, request: ToolCallRequest) -> ToolResult:
+        return ToolResult(
+            request.id,
+            request.name,
+            ToolResultStatus.SUCCESS,
+            {"success": True},
+            terminal=True,
+        )
+
+
+class TerminalToolProvider(FakeProvider):
+    async def chat(self, messages, tools, stream, model, options):
+        self.calls += 1
+        return LLMResult(
+            message={
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": f"terminal-{self.calls}",
+                    "type": "function",
+                    "function": {"name": "task_fail", "arguments": "{}"},
+                }],
+            },
+            finish_reason="tool_calls",
+        )
+
+
 class CapturingSummarizer(HeuristicSummarizer):
     def __init__(self):
         self.messages = []
@@ -221,6 +251,37 @@ async def test_agent_graph_executes_tool_loop_and_finalizes(tmp_path):
 
     assert state.final_message["content"] == "result is 3"
     assert (await store.list_tool_calls("s1"))[0].tool_name == "calculator"
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_stops_after_terminal_tool_success(tmp_path):
+    """A successful terminal task intent must not consume another LLM turn.
+
+    Regression for t_9512da67a7344159: task_fail was persisted, but the graph
+    kept re-entering the model loop and invoked it once per iteration.
+    """
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-terminal"))
+    provider = TerminalToolProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(
+            TerminalToolExecutor(),
+            [ToolDefinition("task_fail", "fail task", {"type": "object"})],
+        ),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=10,
+    )
+
+    state = await runner.run(
+        AgentState(session_id="s-terminal", input_messages=[{"role": "user", "content": "fail"}]),
+        "test",
+    )
+
+    assert provider.calls == 1
+    assert state.finish_reason == "stop"
+    assert len(await store.list_tool_calls("s-terminal")) == 1
 
 
 @pytest.mark.asyncio

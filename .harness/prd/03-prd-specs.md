@@ -284,7 +284,7 @@
 
 [20260707]
 - HE
-    - HE：修改Harness Workflow，①Phase2 spec生成后，引入Third模型、审阅修改spec文件，然后交回给主流程模型加载和审阅；②Phase3 plan生成后，引入Third模型、审阅修改plan文件，然后交回给主流程模型加载和审阅。我希望在现有的 .harness框架上做修改，且希望IDE无关(claudecode codex均能支持)，Third审阅交互在Codex IDE可见
+    - HE：修改Harness Workflow，①Phase2 spec生成后，引入Third模型、审阅修改spec文件，然后交回给主流程模型加载和审阅；②Phase3 plan生成后，引入Third模型、审阅修改plan文件，然后交回给主流程模型加载和审阅。我希望在现有的 .harness框架上做修改，Third Review 使用 ChatGPT Mac 应用内置执行器、不使用 VSCode 扩展；Third Review 不可用或失败时，需经人工确认后才能跳过
     - HE：修改Harness Workflow iterate-feature、refine-feature，任务最后一个Phase结束后，允许执行自定义hook命令、未定义hook则跳过；hook放在 .harness/framework/hooks/after-finish.sh
 - FR
     - 对话：[KF]多模态支持图片输入，vision_analyze，覆盖入口包括 API、飞书IM、ACP等
@@ -456,11 +456,23 @@
 
 [20260720]
 - FR
-    - 任务：任务Agent自动化去人化，参照Manus简化任务流程、去除`针对人的项目管理`功能，如assign分派、审阅、排期；保留`Agent自动控制`，如自动执行的排期、意图识别(提出修改 → 用户审阅 → 批准)
-        - 任务：待批准状态的任务，需支持用户输入信息、确定意图，现状只允许审批动作
-        - 任务：任务生命周期管控改用Chat交互，看板维持现状、主做观测（Manus任务形态，体验好于Hermes）
     - 执行：新增一级菜单`执行器`，`沙盒`改为其二级菜单；同时新增二级菜单`本机`、用于纳管host_terminal类型的执行器，页面内容帮我简单设计下
         - 前端：本机，页面字体大小太违和了。比如，执行器状态键的字体过大(比标题`执行器状态`还大)；授权策略，也应参照安全页面(相似功能采用相同FE样式)
+    - 对话：任务驱动的迭代优化
+        - 会话：task-t_ef55165d8f52472c，这样的ID不符合规范，在SessionID上、屡次犯错了
+        - 对话：命令记录、系统消息都要保存起来，下次刷新Chat框后能正常展示，如 /cmd命令、/task任务创建系统消息
+        - 对话：对话激活态消息自动刷新，当前未自动刷新、需要人手动刷
+        - 对话：任务指令、任务状态消息默认折叠；合并相邻的任务指令，如任务指令发送和回执
+        - 对话：会话列表，标题也要自动刷新、展示最新命名，特别是`New Session`
+    - 任务：任务Agent自动化去人化，参照Manus简化任务流程、去除`针对人的项目管理`功能，如assign分派、审阅、排期；保留`Agent自动控制`，如自动执行的排期、意图识别(提出修改 → 用户审阅 → 批准)
+        - 任务：待批准状态的任务，需支持用户输入信息、确定意图，现状只允许审批动作
+        - 任务：生命周期用Chat交互，看板维持现状、主做观测（Manus任务形态，体验好于Hermes）
+        - 任务：Chat框，`系统消息`也应该遵循消息渲染规范，给人聊天的感觉，就像工具调用调试信息一样
+        - 任务：Chat交互，不只限于任务创建，生命周期的后续状态、也应该体现在同一个会话Chat框中，任务会话应复用任务创建时的Chat会话ID、不要自己再新建；请参考Manus
+        - 任务：t_97d317e953b64edc，任务明确失败后，未标记错误且结束任务，而是继续尝试耗尽10轮后才认为失败；改为快速失败
+        - 任务：t_a742046a521d46eb，Result: Failed (cancelled)，算作失败、还是取消？worker快速失败要算作失败，只有用户发出取消命令的才算取消
+
+
 
 
 ---
@@ -473,9 +485,11 @@
     - 治理：IAM，安全护栏
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
 - FR
-    - 任务：新增顶导菜单，包括创建、看板
+    - 任务：Chat交互，在/cmd之外再支持自然语言命令
+    - 前端：新增顶导菜单组件；支持同一页面多个路由，如顶导、左导均路由到相同页面
+        - 要求：顶导菜单样式，参考/Users/niean/code/git.zuoyebang.cc/odin/odin-fe
+    - 产品：对标Manus，Project、Tenant
     - 产品：对标Hermes，MoA
-    - 产品：对标Manus，*Project*、租户隔离
     - 管理：接入配置，秘钥Store(类似平台)
 
 ---

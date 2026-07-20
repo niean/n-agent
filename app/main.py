@@ -59,6 +59,7 @@ from app.domain.knowledge import KnowledgeBaseType
 from app.domain.llm_policy import LLMConfig, LLMPolicy
 from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, PlatformRegistry
 from app.domain.provider import ProviderConfig
+from app.domain.session import SessionNotFoundError
 from app.domain.skill_format import SkillFormatValidator
 from app.domain.skill_policy import SkillPolicy
 from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
@@ -947,12 +948,25 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             goal_max_turns=settings.task_goal_max_turns,
         )
         task_outbound_delivery = TaskOutboundDelivery(feishu_client, task_registry)
+
+        async def _task_lifecycle_writer(session_id: str, content: str) -> None:
+            """向执行会话写 ui.task_lifecycle system 消息（TaskRunService/TaskService 共用）。
+
+            会话已不存在（SessionNotFoundError）静默跳过、不复活；其它异常向上传播，
+            由调用方 _write_lifecycle 的 broad except 记录 warning。
+            """
+            try:
+                await session_service.append_task_lifecycle_message(session_id, content)
+            except SessionNotFoundError:
+                logger.debug("task lifecycle session absent: %s", session_id)
+
         task_run_service = TaskRunService(
             registry=task_registry,
             dispatcher=task_runner,
             executor=task_agent_executor,
             policy=task_policy,
             notifier=task_outbound_delivery,
+            lifecycle_writer=_task_lifecycle_writer,
             lease_seconds=settings.task_lease_seconds,
             heartbeat_timeout_seconds=settings.task_heartbeat_timeout_seconds,
             max_runtime_seconds=settings.task_max_runtime_seconds,
@@ -969,6 +983,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             attachments_root=attachments_root,
             attachment_max_bytes=settings.task_attachment_max_bytes,
             attachment_task_max_bytes=settings.task_attachment_task_max_bytes,
+            lifecycle_writer=_task_lifecycle_writer,
         )
         # TaskService.dispatch_tick delegates to TaskRunService (late-bind).
         task_service.set_run_service(task_run_service)

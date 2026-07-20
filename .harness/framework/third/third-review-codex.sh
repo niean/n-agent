@@ -9,52 +9,28 @@ Usage:
 
 Environment:
   HARNESS_THIRD_REVIEW_MODEL   Codex model name for Third Review
-  CODEX_BIN                    Codex executable path, overrides auto-detection
+  CHATGPT_CODEX_BIN            ChatGPT Mac app bundled Codex executable path
 USAGE
 }
 
-find_codex_bin() {
-  if [ -n "${CODEX_BIN:-}" ]; then
-    if command -v "$CODEX_BIN" >/dev/null 2>&1; then
-      command -v "$CODEX_BIN"
+find_chatgpt_codex_bin() {
+  if [ -n "${CHATGPT_CODEX_BIN:-}" ]; then
+    if [ -x "$CHATGPT_CODEX_BIN" ]; then
+      printf '%s\n' "$CHATGPT_CODEX_BIN"
       return 0
     fi
-    if [ -x "$CODEX_BIN" ]; then
-      printf '%s\n' "$CODEX_BIN"
-      return 0
-    fi
-    echo "third-review: CODEX_BIN is set but not executable: $CODEX_BIN" >&2
+    echo "third-review: CHATGPT_CODEX_BIN is set but not executable: $CHATGPT_CODEX_BIN" >&2
     return 127
   fi
 
-  if command -v codex >/dev/null 2>&1; then
-    command -v codex
+  chatgpt_codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex"
+  if [ -x "$chatgpt_codex_bin" ]; then
+    printf '%s\n' "$chatgpt_codex_bin"
     return 0
   fi
 
-  # The IDE extension is now published as openai.chatgpt, while its bundled
-  # command-line executable is still named codex. Keep the legacy extension
-  # identifier as a fallback for older installations.
-  candidate="$(find \
-    "$HOME/.vscode/extensions" \
-    "$HOME/.cursor/extensions" \
-    "$HOME/.windsurf/extensions" \
-    \( \
-      -path '*openai.chatgpt*/bin/*/codex' -o \
-      -path '*openai.codex*/bin/*/codex' \
-    \) \
-    -type f 2>/dev/null | sort -r | while IFS= read -r found_codex; do
-      if [ -x "$found_codex" ]; then
-        printf '%s\n' "$found_codex"
-        break
-      fi
-    done)"
-  if [ -n "$candidate" ]; then
-    printf '%s\n' "$candidate"
-    return 0
-  fi
-
-  echo "third-review: codex executable not found; set CODEX_BIN or install Codex CLI" >&2
+  echo "third-review: ChatGPT Mac app bundled Codex executable not found: $chatgpt_codex_bin" >&2
+  echo "third-review: install ChatGPT for macOS or set CHATGPT_CODEX_BIN" >&2
   return 127
 }
 
@@ -99,7 +75,7 @@ if [ "$doc_type" = "plan" ] && [ ! -f "$spec_file" ]; then
   exit 1
 fi
 
-codex_bin="$(find_codex_bin)"
+codex_bin="$(find_chatgpt_codex_bin)"
 
 prompt_template=".harness/framework/third/${doc_type}-review-prompt.md"
 if [ ! -f "$prompt_template" ]; then
@@ -120,7 +96,7 @@ trap cleanup EXIT
   printf '# %s\n\n' "$session_title"
   printf 'SESSION_TITLE: %s\n' "$session_title"
   printf 'PROJECT_ROOT: %s\n' "$repo_root"
-  printf 'RECORD_VISIBILITY: 本次审阅对话记录由 Codex exec 持久化为当前项目会话；禁止为审阅记录在 .harness 下新建文件或目录。\n'
+  printf 'RECORD_VISIBILITY: 本次审阅使用 ChatGPT Mac 应用内置的 Codex exec，并持久化为当前项目会话；禁止为审阅记录在 .harness 下新建文件或目录。\n'
   printf '\n---\n\n'
   cat "$prompt_template"
   printf '\n---\n\n'

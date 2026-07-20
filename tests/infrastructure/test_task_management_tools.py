@@ -69,6 +69,10 @@ class FakeTaskService:
         self._record("cancel_task", task_id=task_id)
         return {"task_id": task_id, "intent": "cancel"}
 
+    async def fail(self, task_id, reason):
+        self._record("fail", task_id=task_id, reason=reason)
+        return {"task_id": task_id, "intent": "fail", "error": reason}
+
     async def build_worker_context(self, task):
         parts = [f"# {task.title}", "", task.body or "", "", f"task_id: {task.id}", f"status: {task.status.value}"]
         return "\n".join(parts)
@@ -93,7 +97,7 @@ def _task(task_id="t_1", *, title="demo task", status=TaskStatus.RUNNING, claim_
 
 _DEFAULT_PERMITTED = {
     "task_show", "task_complete", "task_heartbeat", "task_comment",
-    "task_propose_change", "task_cancel",
+    "task_propose_change", "task_fail",
 }
 
 
@@ -153,7 +157,7 @@ async def test_any_task_tool_requires_trusted_task_context():
         _req("task_heartbeat", {"note": "still working"}),
         _req("task_comment", {"task_id": "t_1", "body": "hi"}),
         _req("task_propose_change", {"proposal": "change approach"}),
-        _req("task_cancel", {}),
+        _req("task_fail", {"reason": "cannot proceed"}),
     ]
     for req in requests:
         ctx = _no_task_trusted_ctx()
@@ -244,6 +248,7 @@ async def test_task_propose_change_dispatches_with_run_id():
     assert result.status is ToolResultStatus.SUCCESS
     payload = _payload(result)
     assert payload["intent"] == "propose_change"
+    assert result.terminal is True
     assert any(c[0] == "propose_change" and c[1]["run_id"] == 7 and c[1]["proposal"] == "switch approach" for c in fake.calls)
 
 
@@ -258,13 +263,24 @@ async def test_task_propose_change_requires_proposal():
 
 
 @pytest.mark.asyncio
-async def test_task_cancel_dispatches():
+async def test_task_fail_dispatches():
     fake = FakeTaskService(tasks={"t_1": _task("t_1")})
     executor = TaskManagementToolExecutor(fake)
     ctx = _trusted_ctx(task_id="t_1")
-    result = await executor.execute(_req("task_cancel", {}), ctx)
+    result = await executor.execute(_req("task_fail", {"reason": "execute_code unavailable"}), ctx)
     assert result.status is ToolResultStatus.SUCCESS
-    assert any(c[0] == "cancel_task" and c[1]["task_id"] == "t_1" for c in fake.calls)
+    assert result.terminal is True
+    assert any(c[0] == "fail" and c[1]["task_id"] == "t_1" and c[1]["reason"] == "execute_code unavailable" for c in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_task_fail_requires_reason():
+    fake = FakeTaskService(tasks={"t_1": _task("t_1")})
+    executor = TaskManagementToolExecutor(fake)
+    ctx = _trusted_ctx(task_id="t_1")
+    result = await executor.execute(_req("task_fail", {"reason": ""}), ctx)
+    assert result.status is ToolResultStatus.ERROR
+    assert not any(c[0] == "fail" for c in fake.calls)
 
 
 @pytest.mark.asyncio
@@ -285,6 +301,7 @@ async def test_task_complete_with_artifacts_dispatches():
     artifacts = [{"type": "file", "name": "report.md", "mime": "text/markdown", "size": 100, "storage_ref": "tasks/t_1/report.md", "summary": "report", "checksum": "sha256:abc"}]
     result = await executor.execute(_req("task_complete", {"summary": "done", "metadata": {"k": "v"}, "artifacts": artifacts}), ctx)
     assert result.status is ToolResultStatus.SUCCESS
+    assert result.terminal is True
     complete_calls = [c for c in fake.calls if c[0] == "complete"]
     assert len(complete_calls) == 1
     assert complete_calls[0][1]["artifacts"] == artifacts

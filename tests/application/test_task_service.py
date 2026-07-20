@@ -732,6 +732,44 @@ async def test_cancel_task_from_queued(svc, registry):
     assert any(e.kind == "cancelled" for e in events)
 
 
+class _FakeLifecycleWriter:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    async def __call__(self, session_id: str, content: str):
+        self.calls.append((session_id, content))
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_from_queued_writes_cancelled_lifecycle(registry, tmp_path):
+    """非 RUNNING cancel CAS 成功后写 ui.task_lifecycle '已取消' 到执行会话（origin 复用）。"""
+    writer = _FakeLifecycleWriter()
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        lifecycle_writer=writer,
+    )
+    task = await svc.create_task(
+        title="完成报告", created_by="u", origin_session_id="dashboard-s1",
+    )
+    await svc.cancel_task(task.id)
+    assert any(sid == "dashboard-s1" and "已取消" in c for (sid, c) in writer.calls)
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_no_writer_does_not_crash(registry, tmp_path):
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+    )
+    task = await svc.create_task(title="x", created_by="u")
+    await svc.cancel_task(task.id)  # lifecycle_writer=None，不应抛
+
+
 @pytest.mark.asyncio
 async def test_cancel_task_from_waiting_approval(svc, registry):
     task = _running_task("t_c1")

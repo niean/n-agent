@@ -154,6 +154,10 @@ class ContextService:
         if self._is_cancelled(state.session_id):
             raise asyncio.CancelledError()
         messages = await self._runtime_memory.read_session_messages(state.session_id)
+        # 历史 role=system 消息（ui.task_command 命令记录 / ui.task_lifecycle 生命周期）
+        # 是 UI 通知，排除出模型候选、压缩与外部记忆钩子；运行时 system prompt 仍由
+        # build_system_prompt 构建并作为 working_messages[0]，不落盘。
+        eligible_messages = [m for m in messages if m.role != "system"]
         summary = await self._runtime_memory.get_summary_if_allowed(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
 
@@ -161,7 +165,7 @@ class ContextService:
         from app.domain.context_policy import ContextCandidateSet
 
         candidates = ContextCandidateSet(
-            messages=project_messages(messages),
+            messages=project_messages(eligible_messages),
         )
         config = self._get_engine_config(state)
         force = bool(state.run_options.get("force_compress", False))
@@ -189,7 +193,7 @@ class ContextService:
         # incremental-compression flow. TODO: wire plan.selected_message_ids
         # directly in a future refactor for full consistency.
         context_messages = _sanitize_conversation_tool_pairs(
-            _build_latest_compressed_context(messages)
+            _build_latest_compressed_context(eligible_messages)
         )
         context_messages = _dedupe_trailing(context_messages, state.input_messages)
         state.context_message_ids = [m.id for m in context_messages]

@@ -23,6 +23,103 @@
   // 待发送的图片列表，每项 {dataUrl, name}；发送后清空。
   let pendingImages = [];
 
+  // === 激活态消息自动刷新控制器 ===
+  // 唯一定时器 + 世代 + 请求序号 + 单飞 + 复合版本(count+lastId)。
+  // 仅当会话激活、页面可见、非发送中时轮询 GET /chat/sessions/{id}；
+  // 版本相同不渲染（防闪烁），不同则按滚动规则刷新。system 历史消息已被
+  // 后端 build_context_state 过滤，不进 LLM 上下文；本控制器只管展示刷新。
+  const AUTO_REFRESH_INTERVAL_MS = 4000;
+  const SCROLL_BOTTOM_THRESHOLD_PX = 48;
+  let autoRefreshTimer = null;
+  let autoRefreshGeneration = 0;
+  let autoRefreshInFlight = null; // {generation, seq}
+  let autoRefreshSeq = 0;
+  let renderedMessageVersion = null; // {count, lastId} | null；空会话用 {count:0, lastId:null}
+
+  function messageVersionOf(detail) {
+    const msgs = Array.isArray(detail && detail.messages) ? detail.messages : null;
+    if (!msgs) return null;
+    if (msgs.length === 0) return { count: 0, lastId: null };
+    const last = msgs[msgs.length - 1];
+    if (!last || !last.id) return null; // 非空但末条无 id -> 无效快照
+    return { count: msgs.length, lastId: last.id };
+  }
+
+  function versionsEqual(a, b) {
+    return !!a && !!b && a.count === b.count && a.lastId === b.lastId;
+  }
+
+  function startAutoRefresh(sessionId, options) {
+    options = options || {};
+    stopAutoRefresh();
+    if (!sessionId || sessionId !== currentSessionId) return;
+    if (document.hidden) return;
+    autoRefreshGeneration++;
+    autoRefreshTimer = setInterval(autoRefreshTick, AUTO_REFRESH_INTERVAL_MS);
+    if (options.immediate) autoRefreshTick();
+  }
+
+  function stopAutoRefresh() {
+    if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+    autoRefreshGeneration++;
+    autoRefreshInFlight = null;
+  }
+
+  // 仅当本地追加伴随成功持久化、返回真实服务端 id 时调用。
+  // preVersion 为调用前捕获的 renderedMessageVersion；若期间版本已被权威详情改变，跳过。
+  function advanceVersionAfterPersistedAppend(realId, preVersion) {
+    if (!realId || preVersion !== renderedMessageVersion) return;
+    if (!preVersion) { renderedMessageVersion = { count: 1, lastId: realId }; return; }
+    renderedMessageVersion = { count: preVersion.count + 1, lastId: realId };
+  }
+
+  async function autoRefreshTick() {
+    const sessionId = currentSessionId;
+    const gen = autoRefreshGeneration;
+    if (!sessionId || isSending || document.hidden) return;
+    maybeRefreshSessionListTitles();  // 标题自动刷新（独立于消息版本，rate-limited）
+    if (autoRefreshInFlight && autoRefreshInFlight.generation === gen) return; // 单飞
+    const seq = ++autoRefreshSeq;
+    autoRefreshInFlight = { generation: gen, seq };
+    try {
+      const detail = await api.getSessionDetail(sessionId);
+      // 归属校验：会话、世代、请求序号三重，防切换/乱序串台
+      if (sessionId !== currentSessionId || gen !== autoRefreshGeneration || seq !== autoRefreshSeq) return;
+      if (isSending) return; // 进入发送态后丢弃，不覆盖 SSE DOM
+      const version = messageVersionOf(detail);
+      if (!version) { console.warn('auto-refresh: invalid snapshot'); return; }
+      if (versionsEqual(version, renderedMessageVersion)) return; // 无变化跳过
+      await applySessionDetail(detail, {
+        preserveScroll: true, skipToolCalls: true, skipSessionList: true, applyExternalMemoryState: false,
+      });
+      if (sessionId === currentSessionId && gen === autoRefreshGeneration && seq === autoRefreshSeq) {
+        renderedMessageVersion = version;
+      }
+    } catch (e) {
+      handleAutoRefreshError(e, sessionId, gen, seq);
+    } finally {
+      // 仅清除自身 token，旧世代请求不得释放新世代单飞锁
+      if (autoRefreshInFlight && autoRefreshInFlight.generation === gen && autoRefreshInFlight.seq === seq) {
+        autoRefreshInFlight = null;
+      }
+    }
+  }
+
+  function handleAutoRefreshError(e, sessionId, gen, seq) {
+    if (sessionId !== currentSessionId || gen !== autoRefreshGeneration || seq !== autoRefreshSeq) return;
+    // fetchJson 失败抛 new Error(code)，无 HTTP status；按 error.message 识别
+    if (e && e.message === 'session_not_found') {
+      stopAutoRefresh();
+      currentSessionId = null;
+      renderedMessageVersion = null;
+      setHeader(null);
+      setStatusMessage('会话不存在或已删除', 'error');
+      loadSessions();
+      return;
+    }
+    console.warn('auto-refresh failed:', e);
+  }
+
   function appendText(parent, value) {
     parent.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   }
@@ -226,6 +323,21 @@
       el.appendChild(details);
       return el;
     }
+    // system 消息：遵循消息渲染规范，按工具调用调试信息样式渲染为可折叠气泡（默认展开，
+    // 保证命令结果可见、给人聊天感），textContent 安全渲染，无 innerHTML。
+    if (message.role === 'system') {
+      const details = document.createElement('details');
+      details.open = false;  // 默认折叠（任务指令/任务状态/系统消息），点击展开
+      const summary = document.createElement('summary');
+      summary.textContent = message.name === 'ui.task_command' ? '任务指令'
+        : message.name === 'ui.task_lifecycle' ? '任务状态' : '系统消息';
+      el.dataset.name = message.name || '';
+      const content = document.createElement('pre');
+      content.textContent = typeof message.content === 'string' ? message.content : String(message.content || '');
+      details.append(summary, content);
+      el.appendChild(details);
+      return el;
+    }
     // user/assistant 消息：附加 Hover 时间（飞书风格），由 CSS ::before 展示
     const timeLabel = formatMessageTime(message.created_at);
     if (timeLabel) el.dataset.time = timeLabel;
@@ -276,12 +388,12 @@
     return grouped;
   }
 
-  function appendMessage(role, content, createdAt) {
+  function appendMessage(role, content, createdAt, name) {
     const stack = ui.byId('chat-message-stack');
     if (!stack) return null;
     const empty = stack.querySelector('.empty-hero');
     if (empty) clearNode(stack);
-    const el = createMessageElement({ role, content, created_at: createdAt });
+    const el = createMessageElement({ role, content, created_at: createdAt, name: name || null });
     stack.appendChild(el);
     scrollToBottom();
     return el;
@@ -291,7 +403,8 @@
     const stack = ui.byId('chat-message-stack');
     if (!stack) return;
     clearNode(stack);
-    const visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage));
+    let visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage));
+    visibleMessages = groupTaskCommandMessages(visibleMessages);
     if (!visibleMessages.length) showEmptyState();
     visibleMessages.forEach((message) => stack.appendChild(createMessageElement(message)));
   }
@@ -310,9 +423,52 @@
     }
   }
 
+  // 轻量标题刷新：不全量 re-render 会话列表（保留重命名输入态/避免闪烁），仅按 id 更新
+  // 各 session-item 的标题文本。供 auto-refresh 周期性同步标题（尤其 New Session 经
+  // ensure_title 生成实际标题后，会话列表自动展示最新命名）。
+  let titleRefreshInFlight = false;
+  let titleRefreshTickCounter = 0;
+  const TITLE_REFRESH_EVERY_N_TICKS = 3;  // 每 3 个 auto-refresh tick 刷一次（~12s）
+
+  async function refreshSessionListTitles() {
+    if (titleRefreshInFlight) return;
+    const list = ui.byId('chat-session-list');
+    if (!list) return;
+    titleRefreshInFlight = true;
+    let sessions;
+    try {
+      sessions = await api.listSessions();
+    } catch (e) {
+      return;  // best-effort，静默失败
+    } finally {
+      titleRefreshInFlight = false;
+    }
+    const titleById = new Map();
+    (sessions || []).forEach((s) => titleById.set(s.id, s.title || s.id));
+    const items = list.querySelectorAll('.session-item');
+    items.forEach((item) => {
+      const id = item.dataset && item.dataset.sessionId;
+      if (!id) return;
+      const newTitle = titleById.get(id);
+      if (newTitle === undefined) return;
+      const titleBtn = item.querySelector('.session-item__title');
+      if (titleBtn && titleBtn.textContent !== newTitle) {
+        titleBtn.textContent = newTitle;
+      }
+    });
+  }
+
+  function maybeRefreshSessionListTitles() {
+    titleRefreshTickCounter++;
+    if (titleRefreshTickCounter < TITLE_REFRESH_EVERY_N_TICKS) return;
+    titleRefreshTickCounter = 0;
+    refreshSessionListTitles();  // fire-and-forget
+  }
+
   function buildSessionItem(session) {
     const item = document.createElement('div');
     item.className = `session-item${session.id === currentSessionId ? ' active' : ''}`;
+    item.dataset.sessionId = session.id;
 
     const titleBtn = document.createElement('button');
     titleBtn.type = 'button';
@@ -391,6 +547,8 @@
       return;
     }
     if (currentSessionId === session.id) {
+      stopAutoRefresh();
+      renderedMessageVersion = null;
       currentSessionId = null;
       setHeader(null);
       showEmptyState();
@@ -400,6 +558,7 @@
   }
 
   async function selectSession(id) {
+    stopAutoRefresh();
     currentSessionId = id;
     draftExternalMemoryConfig = null;
     setHeader(id);
@@ -407,12 +566,13 @@
     externalMemoryTouched = false;
     try {
       const detail = await api.getSessionDetail(id);
-      applySessionExternalMemoryState(detail);
-      renderExternalMemoryUI();
-      renderSessionMessages(detail);
-      updateInfo(detail);
-      await loadSessions();
+      if (id !== currentSessionId) return; // 切换串台防护
+      await applySessionDetail(detail, {
+        preserveScroll: false, skipToolCalls: false, skipSessionList: false, applyExternalMemoryState: true,
+      });
       scrollToBottom();
+      renderedMessageVersion = messageVersionOf(detail);
+      startAutoRefresh(id);
     } catch (error) {
       setStatusMessage('加载会话失败: ' + error.message, 'error');
     }
@@ -441,10 +601,13 @@
     showEmptyState();
     updateInfo({});
     await loadSessions();
+    renderedMessageVersion = { count: 0, lastId: null };
+    startAutoRefresh(id);
     return id;
   }
 
   async function newSession() {
+    stopAutoRefresh();
     currentSessionId = null;
     draftExternalMemoryConfig = null;
     await ensureSession();
@@ -455,7 +618,8 @@
     if (header) header.textContent = id || 'N-Agent Chat';
   }
 
-  function updateInfo(detail) {
+  function updateInfo(detail, options) {
+    options = options || {};
     const summary = ui.byId('chat-summary');
     const taskState = ui.byId('chat-task-state');
     const toolCalls = ui.byId('chat-tool-calls');
@@ -479,7 +643,41 @@
     } else {
       taskState.textContent = '暂无任务状态';
     }
-    loadToolCalls();
+    if (!options.skipToolCalls) loadToolCalls();
+  }
+
+  function isAtScrollBottom() {
+    const el = ui.byId('chat-messages');
+    if (!el) return true;
+    return el.scrollHeight - (el.scrollTop + el.clientHeight) <= SCROLL_BOTTOM_THRESHOLD_PX;
+  }
+
+  function restoreScroll(wasAtBottom, prevScrollTop) {
+    const el = ui.byId('chat-messages');
+    if (!el) return;
+    if (wasAtBottom) { scrollToBottom(); return; }
+    const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTop = Math.min(prevScrollTop != null ? prevScrollTop : el.scrollTop, maxTop);
+  }
+
+  // 已通过响应归属校验后的共享渲染入口。
+  // preserveScroll=true（轮询）：记录滚动状态，渲染后恢复（底部跟随/上翻保持）。
+  // preserveScroll=false（selectSession/refreshCurrentSession）：不滚动，由调用方自行 scrollToBottom 或保持原位。
+  // skipToolCalls/skipSessionList=true（轮询）：跳过工具调用列表与会话列表刷新。
+  // applyExternalMemoryState=false（轮询）：不周期覆盖用户正在操作的外部记忆选择。
+  async function applySessionDetail(detail, options) {
+    options = options || {};
+    const el = ui.byId('chat-messages');
+    const wasAtBottom = options.preserveScroll ? isAtScrollBottom() : false;
+    const prevScrollTop = el ? el.scrollTop : 0;
+    if (options.applyExternalMemoryState) {
+      applySessionExternalMemoryState(detail);
+      renderExternalMemoryUI();
+    }
+    renderSessionMessages(detail);
+    updateInfo(detail, { skipToolCalls: options.skipToolCalls });
+    if (options.preserveScroll) restoreScroll(wasAtBottom, prevScrollTop);
+    if (!options.skipSessionList) await loadSessions();
   }
 
   async function loadToolCalls() {
@@ -586,16 +784,269 @@
 
   async function refreshCurrentSession() {
     if (!currentSessionId) return;
+    const sessionId = currentSessionId;
+    const seq = ++autoRefreshSeq;
     try {
-      const detail = await api.getSessionDetail(currentSessionId);
-      applySessionExternalMemoryState(detail);
-      renderExternalMemoryUI();
-      renderSessionMessages(detail);
-      updateInfo(detail);
-      await loadSessions();
+      const detail = await api.getSessionDetail(sessionId);
+      if (sessionId !== currentSessionId || seq !== autoRefreshSeq) return; // 归属校验
+      await applySessionDetail(detail, {
+        preserveScroll: false, skipToolCalls: false, skipSessionList: false, applyExternalMemoryState: true,
+      });
+      renderedMessageVersion = messageVersionOf(detail);
     } catch (error) {
       const summary = ui.byId('chat-summary');
       if (summary) summary.textContent = '刷新会话失败: ' + error.message;
+    }
+  }
+
+  // /task slash 命令统一用法与错误码映射。错误码来自 task_routes 的 _task_error_response
+  // （fetchJson 失败时 throw new Error(code)），映射为可读说明并保留原码。
+  const TASK_USAGE = '用法：/task create <title> [--body <text>] [--priority <n>] [--goal] | list | approve|reject <id> [--note <text>] | cancel|retry <id>';
+  const TASK_ERROR_MAP = {
+    task_not_found: '任务不存在',
+    task_state_invalid: '任务状态不允许该操作',
+    task_invalid: '任务参数无效',
+    task_conflict: '任务状态冲突',
+    task_claim_failed: '任务抢占失败',
+    task_internal_error: '任务服务内部错误',
+  };
+
+  // 命令结果统一以 [任务指令] 前缀的 system 消息呈现（spec UI Design 要求）。
+  // 正文 UTF-8 字节安全截断（DOM 与 POST 同一字符串）；仅当 session 仍为当前会话时
+  // 追加本地 system 气泡；无论会话是否切换都向捕获 session best-effort 持久化。
+  const TASK_MESSAGE_MAX_BYTES = 65536;
+  const TASK_MESSAGE_TRUNCATE_SUFFIX = '…[内容已截断]';
+
+  function truncateTaskMessageUtf8(text) {
+    const data = new TextEncoder().encode(text);
+    if (data.length <= TASK_MESSAGE_MAX_BYTES) return text;
+    const suffixBytes = new TextEncoder().encode(TASK_MESSAGE_TRUNCATE_SUFFIX);
+    const budget = TASK_MESSAGE_MAX_BYTES - suffixBytes.length;
+    if (budget <= 0) return TASK_MESSAGE_TRUNCATE_SUFFIX;
+    // 按 code point 累加字节，超 budget 前停止（避免 TextDecoder 默认 U+FFFD 替换导致
+    // 重编码超限；与 Python 侧 errors="ignore" 行为一致）。
+    const chars = Array.from(text);
+    let out = '';
+    let outBytes = 0;
+    for (let i = 0; i < chars.length; i++) {
+      const chBytes = new TextEncoder().encode(chars[i]);
+      if (outBytes + chBytes.length > budget) break;
+      out += chars[i];
+      outBytes += chBytes.length;
+    }
+    return (out + TASK_MESSAGE_TRUNCATE_SUFFIX).trim();
+  }
+
+  async function persistTaskSystemMessage(sessionId, content) {
+    try {
+      return await api.appendSessionMessage(sessionId, content);
+    } catch (e) {
+      console.warn('persist task message failed', e);
+      return null;
+    }
+  }
+
+  async function taskSystemMessage(sessionId, message) {
+    const body = truncateTaskMessageUtf8('[任务指令] ' + message);
+    if (currentSessionId === sessionId) appendOrMergeTaskCommand(body);
+    const preVersion = renderedMessageVersion;
+    const persisted = await persistTaskSystemMessage(sessionId, body);
+    // 持久化成功且返回真实 id 时推进版本，避免下一次轮询误判变更触发无意义重渲。
+    // 期间版本若被权威详情改变（并发追加/切换），跳过以权威为准。
+    if (persisted && persisted.id) advanceVersionAfterPersistedAppend(persisted.id, preVersion);
+  }
+
+  // 相邻任务指令合并：/task 命令记录（"[任务指令] 执行命令: ..."）与其回执（结果/错误）
+  // 渲染为同一条任务指令气泡。命令记录开新气泡，回执追加到上一条任务指令气泡的 <pre>。
+  const TASK_CMD_EXEC_PREFIX = '[任务指令] 执行命令: ';
+
+  function isTaskCommandRecord(content) {
+    return typeof content === 'string' && content.startsWith(TASK_CMD_EXEC_PREFIX);
+  }
+
+  function _lastMessageEl(stack) {
+    if (stack.lastElementChild) return stack.lastElementChild;
+    const kids = stack._kids || [];
+    return kids.length ? kids[kids.length - 1] : null;
+  }
+
+  function _detailsPre(el) {
+    if (el.querySelector) {
+      const pre = el.querySelector('pre');
+      if (pre) return pre;
+    }
+    const details = el._kids && el._kids[0];
+    const pre = details && details._kids && details._kids[1];
+    return pre || null;
+  }
+
+  function appendOrMergeTaskCommand(body) {
+    // 回执（非"执行命令:"）追加到上一条任务指令气泡；命令记录开新气泡
+    if (!isTaskCommandRecord(body)) {
+      const stack = ui.byId('chat-message-stack');
+      if (stack) {
+        const last = _lastMessageEl(stack);
+        if (last && last.dataset && last.dataset.name === 'ui.task_command') {
+          const pre = _detailsPre(last);
+          if (pre) {
+            pre.textContent = (pre.textContent || '') + '\n' + body;
+            return;
+          }
+        }
+      }
+    }
+    appendMessage('system', body, undefined, 'ui.task_command');
+  }
+
+  function groupTaskCommandMessages(messages) {
+    // 渲染时合并相邻 ui.task_command：命令记录开新组，回执追加到当前组（命令记录+回执一条）
+    const result = [];
+    let currentGroup = null;
+    for (const msg of messages) {
+      if (msg.role === 'system' && msg.name === 'ui.task_command') {
+        if (isTaskCommandRecord(msg.content) || currentGroup === null) {
+          currentGroup = {role: 'system', name: 'ui.task_command', content: String(msg.content)};
+          result.push(currentGroup);
+        } else {
+          currentGroup.content = String(currentGroup.content) + '\n' + String(msg.content);
+        }
+      } else {
+        currentGroup = null;
+        result.push(msg);
+      }
+    }
+    return result;
+  }
+
+  function describeTaskError(e) {
+    const code = (e && e.message) ? String(e.message) : String(e || '');
+    const desc = TASK_ERROR_MAP[code];
+    if (desc) return desc + '（' + code + '）';
+    return '任务指令失败：' + (code || '未知错误');
+  }
+
+  // Parse a "/task ..." slash command into {subcommand, title, id, body,
+  // priority, goal, note} or {error}. Pure function (no DOM/api) for testing.
+  // 引号感知分词（spec 要求 title "支持引号"）；按子命令校验位置/命名参数，坏值返回 {error}。
+  function parseTaskCommand(text) {
+    const rest = text.slice('/task'.length).trim();
+    if (!rest) return {error: TASK_USAGE};
+    const tokens = [];
+    let cur = '';
+    let quote = null;
+    for (let i = 0; i < rest.length; i++) {
+      const ch = rest[i];
+      if (quote) {
+        if (ch === quote) { quote = null; } else { cur += ch; }
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === ' ' || ch === '\t') {
+        if (cur.length) { tokens.push(cur); cur = ''; }
+      } else {
+        cur += ch;
+      }
+    }
+    if (quote) return {error: '未闭合的引号。' + TASK_USAGE};
+    if (cur.length) tokens.push(cur);
+
+    const subcommand = tokens[0];
+    const valid = ['create', 'list', 'approve', 'reject', 'cancel', 'retry'];
+    if (valid.indexOf(subcommand) === -1) {
+      return {error: '未知子命令 ' + subcommand + '。' + TASK_USAGE};
+    }
+    const allowedNamed = {
+      create: {body: true, priority: true, goal: true},
+      list: {},
+      approve: {note: true},
+      reject: {note: true},
+      cancel: {},
+      retry: {},
+    }[subcommand];
+
+    const result = {subcommand: subcommand};
+    const positional = [];
+    let i = 1;
+    while (i < tokens.length) {
+      const t = tokens[i];
+      if (t === '--body' || t === '--note') {
+        const key = t.slice(2);
+        if (!allowedNamed[key]) return {error: t + ' 不适用于 ' + subcommand + '。' + TASK_USAGE};
+        i++;
+        const parts = [];
+        while (i < tokens.length && !tokens[i].startsWith('--')) { parts.push(tokens[i]); i++; }
+        if (!parts.length) return {error: t + ' 需要值。' + TASK_USAGE};
+        result[key] = parts.join(' ');
+      } else if (t === '--priority') {
+        if (!allowedNamed.priority) return {error: '--priority 不适用于 ' + subcommand + '。' + TASK_USAGE};
+        i++;
+        if (i >= tokens.length) return {error: '--priority 需要值。' + TASK_USAGE};
+        const raw = tokens[i];
+        if (!/^-?\d+$/.test(raw)) return {error: '--priority 需要整数。' + TASK_USAGE};
+        result.priority = Number(raw);
+        i++;
+      } else if (t === '--goal') {
+        if (!allowedNamed.goal) return {error: '--goal 不适用于 ' + subcommand + '。' + TASK_USAGE};
+        result.goal = true;
+        i++;
+      } else if (t.startsWith('--')) {
+        return {error: '未知参数 ' + t + '。' + TASK_USAGE};
+      } else {
+        positional.push(t);
+        i++;
+      }
+    }
+    if (subcommand === 'create') {
+      result.title = positional.join(' ').trim();
+      if (!result.title) return {error: '/task create 需要标题。' + TASK_USAGE};
+    } else if (subcommand === 'list') {
+      if (positional.length) return {error: '/task list 不接受额外参数。' + TASK_USAGE};
+    } else {
+      if (!positional.length) return {error: '/task ' + subcommand + ' 需要 task id。' + TASK_USAGE};
+      if (positional.length > 1) return {error: '/task ' + subcommand + ' 不接受多个 id。' + TASK_USAGE};
+      result.id = positional[0];
+    }
+    return result;
+  }
+
+  // Execute a parsed /task command via api.task.*, appending a [任务指令] system
+  // message with the result. create binds to currentSessionId (origin_session_id).
+  async function runTaskCommand(text, sessionId) {
+    await taskSystemMessage(sessionId, '执行命令: ' + text);
+    const parsed = parseTaskCommand(text);
+    if (parsed.error) {
+      await taskSystemMessage(sessionId, parsed.error);
+      return;
+    }
+    let msg = '';
+    try {
+      if (parsed.subcommand === 'create') {
+        const payload = {title: parsed.title, origin_session_id: sessionId};
+        if (parsed.body) payload.body = parsed.body;
+        if (parsed.priority != null) payload.priority = parsed.priority;
+        if (parsed.goal) payload.goal_mode = true;
+        const task = await api.task.create(payload);
+        msg = '已创建任务 ' + ((task && task.id) || '') + '：' + ((task && task.title) || parsed.title);
+      } else if (parsed.subcommand === 'list') {
+        const page = await api.task.list();
+        const items = ((page && page.items) || []).filter((t) => t.origin_session_id === sessionId);
+        if (!items.length) msg = '当前会话无关联任务';
+        else msg = '当前会话任务（' + items.length + '）：\n' + items.map((t) => '- ' + t.id + ' [' + (t.status || '') + '] ' + (t.title || '')).join('\n');
+      } else if (parsed.subcommand === 'approve') {
+        await api.task.approve(parsed.id, parsed.note);
+        msg = '已批准任务 ' + parsed.id;
+      } else if (parsed.subcommand === 'reject') {
+        await api.task.reject(parsed.id, parsed.note);
+        msg = '已拒绝任务 ' + parsed.id;
+      } else if (parsed.subcommand === 'cancel') {
+        await api.task.cancel(parsed.id);
+        msg = '已取消任务 ' + parsed.id;
+      } else if (parsed.subcommand === 'retry') {
+        await api.task.retry(parsed.id);
+        msg = '已重试任务 ' + parsed.id;
+      }
+      await taskSystemMessage(sessionId, msg);
+    } catch (e) {
+      await taskSystemMessage(sessionId, describeTaskError(e));
     }
   }
 
@@ -605,6 +1056,23 @@
     if (!input) return;
     const text = input.value.trim();
     if (!text && !pendingImages.length) return;
+    if (text.startsWith('/task')) {
+      setSending(true);
+      try {
+        await ensureSession();
+        const commandSessionId = currentSessionId;
+        if (!commandSessionId) { input.focus(); return; }
+        input.value = '';
+        await runTaskCommand(text, commandSessionId);
+      } catch (e) {
+        // ensureSession 失败尚无可靠 session id，仅显示本地错误、不调持久化端点
+        appendMessage('system', '会话创建失败：' + ((e && e.message) || e), undefined, 'ui.task_command');
+      } finally {
+        setSending(false);
+        input.focus();
+      }
+      return;
+    }
     await ensureSession();
     input.value = '';
     const sentImages = pendingImages.slice();
@@ -667,7 +1135,7 @@
       }
     } finally {
       setSending(false);
-      refreshCurrentSession();
+      await refreshCurrentSession();
       input.focus();
     }
   }
@@ -988,6 +1456,12 @@
     bindDebugToggle();
     document.addEventListener('click', handleMemoryDocumentClick);
     initImagePreview();
+    // 激活态自动刷新：页面隐藏时停止（不浪费请求），可见时立即追赶一次并恢复周期。
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { stopAutoRefresh(); return; }
+      if (currentSessionId && !isSending) startAutoRefresh(currentSessionId, { immediate: true });
+    });
+    window.addEventListener('beforeunload', stopAutoRefresh);
     // Memory mode switcher lives in the composer toolbar, before the send button.
     const composerBar = document.querySelector('.chat-composer__bar');
     const emContainer = document.createElement('div');
@@ -1017,5 +1491,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.chat = { init };
+  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send };
 }(window));

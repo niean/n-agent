@@ -8,7 +8,7 @@ Implements the 6 managed task tools defined in `app/application/task_tools.py`
   - task_heartbeat:        record heartbeat (note)
   - task_comment:          add comment (task_id + body)
   - task_propose_change:   propose a change requiring user approval (proposal)
-  - task_cancel:           cancel the current task
+  - task_fail:             worker 快速失败（不再重试）
 
 Removed tools (Manus flattening):
   - task_block:   replaced by task_propose_change (intent approval)
@@ -27,7 +27,7 @@ Pattern twelve (trusted_metadata gating):
 Ownership enforcement:
   - `write_origin == "worker"` may only mutate the task identified by
     `trusted_metadata.task.task_id`.
-  - task_complete / task_heartbeat / task_propose_change / task_cancel
+  - task_complete / task_heartbeat / task_propose_change / task_fail
     operate on the current task (no task_id argument); they always use the
     trusted task_id.
   - task_comment takes task_id in arguments; if it differs from the trusted
@@ -36,7 +36,7 @@ Ownership enforcement:
 Terminal intent only:
   - task_complete returns an intent payload; it does NOT call
     TaskRunService.finish_run. TaskRunService owns the single CAS-based
-    finalization path. task_propose_change / task_cancel likewise delegate
+    finalization path. task_propose_change / task_fail likewise delegate
     run finalization to TaskRunService.
 """
 from __future__ import annotations
@@ -46,7 +46,7 @@ import time
 from typing import Any, Protocol
 
 from app.application.task_tools import (
-    TASK_TOOL_CANCEL,
+    TASK_TOOL_FAIL,
     TASK_TOOL_COMPLETE,
     TASK_TOOL_HEARTBEAT,
     TASK_TOOL_PROPOSE_CHANGE,
@@ -167,6 +167,17 @@ class TaskManagementToolExecutor(ToolExecutor):
             status=status,
             content=json.dumps(payload, ensure_ascii=False, default=str),
             duration_ms=int((time.monotonic() - start) * 1000),
+            # These tools submit terminal task intents. Continuing the graph
+            # after a successful call can repeatedly submit the same intent
+            # until the Agent iteration limit is reached.
+            terminal=(
+                status is ToolResultStatus.SUCCESS
+                and request.name in {
+                    TASK_TOOL_COMPLETE,
+                    TASK_TOOL_PROPOSE_CHANGE,
+                    TASK_TOOL_FAIL,
+                }
+            ),
         )
 
     # -----------------------------------------------------------------
@@ -206,8 +217,8 @@ class TaskManagementToolExecutor(ToolExecutor):
             return await self._handle_comment(request, task_ctx)
         if request.name == TASK_TOOL_PROPOSE_CHANGE:
             return await self._handle_propose_change(request, task_ctx)
-        if request.name == TASK_TOOL_CANCEL:
-            return await self._handle_cancel(request, task_ctx)
+        if request.name == TASK_TOOL_FAIL:
+            return await self._handle_fail(request, task_ctx)
         # Unreachable: TASK_TOOL_NAMES check above guarantees one of the 6.
         raise _TaskInvalidArgument(f"unknown tool: {request.name}")
 
@@ -315,12 +326,15 @@ class TaskManagementToolExecutor(ToolExecutor):
         )
         return {"success": True, **result}
 
-    async def _handle_cancel(
+    async def _handle_fail(
         self,
         request: ToolCallRequest,
         task_ctx: TaskContextOrigin,
     ) -> dict[str, Any]:
-        result = await self.service.cancel_task(task_id=task_ctx.task_id)
+        reason = str(request.arguments.get("reason") or "")
+        if not reason:
+            raise _TaskInvalidArgument("reason is required")
+        result = await self.service.fail(task_id=task_ctx.task_id, reason=reason)
         return {"success": True, **result}
 
 

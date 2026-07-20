@@ -186,3 +186,43 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 
 来源：feature 260719 task-flow-simplify（Manus 7 状态扁平化）
 
+### P019: 新增会话来源时 session_id 必须是"前缀+完整 UUID"，禁止"前缀+业务 id"
+
+现象：Task worker 的 execution_session_id 用 `f"task-{task.id}"`，而 task.id = `t_{uuid4().hex[:16]}`（带 `t_` 前缀、截断 16 hex 非完整 UUID），产出 `task-t_ef55165d8f52472c`。用户在会话列表看到该 id 指出不符合规范。双重违规模式十六：后缀非完整 UUID（16 hex + `t_`），且出现 `task-t_` 双前缀。同时模式十六表漏列 task 来源（SessionSource.TASK 枚举存在、知识库表无），枚举与知识脱节。
+
+根因：新增 SessionSource.TASK（第 10 个来源）时，executor 为"同 task 跨 run 稳定复用 execution session、无需持久化"而用 `task-{task.id}` 派生，但 task.id 是业务 id（`t_` 前缀 + 截断 hex），不是 UUID，直接拼接违反模式十六"前缀+UUID"规则。根因跨 Application（task_agent_executor.py）+ Domain（session.py 枚举）+ 知识（05-key-patterns.md 模式十六表），叠加"为稳定性牺牲合规"的设计取舍错误。属 SessionID 命名反复犯错（见 memory feedback-apply-conventions-not-just-quote）。
+
+教训：新增会话来源时三点必须同时做到：① session_id 严格 `{source}-{完整 UUID}`（模式十六），禁止 `{source}-{业务 id}`--业务 id 常自带前缀/非 UUID（如 `t_`/截断 hex），拼接会双前缀且后缀非 UUID；② 需要跨 run 稳定又不想持久化时，用 `uuid5(namespace, business_id)`（str 形式带连字符，与 `schedule-{uuid4()}`/`curator-{uuid4()}` 一致）从业务 id 确定性派生完整 UUID（同 id->同 UUID，stable），而非直接嵌业务 id；③ SessionSource 枚举与模式十六表必须同步更新（新增来源两处都加），避免枚举/知识脱节。UUID 必须用 str 带连字符形式（8-4-4-4-12，如 `d8701f7f-28f9-4875-94c1-20c2f28cc66e`），禁止 `.hex` 无连字符形式--所有既有来源（dashboard/schedule/curator）都是 `f"prefix-{uuid4()}"`（f-string 直接用 uuid 对象走 `__str__`），不用 `.hex`。修 session_id/source/naming 时必须把规则应用到实际 id 生成代码，不能边引用模式十六边 legitimatize 不合规代码。相关：模式十六、P015 契约漂移。
+
+来源：fix 260720 task worker execution_session_id 合规（用户指出 `task-t_...` 不符规范）
+
+### P020: Task worker 无 task_complete intent 时不可默认 COMPLETED，limit/error finish_reason 必须 FAILED
+
+现象：任务 t_acfc2d6e33bf4ccc 预算耗尽（BUDGET_EXHAUSTED），run summary="已达到用量上限，请稍后重试或联系管理员。"，但任务被标 SUCCEEDED。看板显示 succeeded，Chat 框显示"已完成 | 已达到用量上限"，最终结果不一致。worker 实际未调用 task_complete（预算耗尽直接 finalize），却被误判成功完成。
+
+根因：TaskAgentExecutor._build_result_from_chat 在无 intent event（complete_requested/change_proposed）时默认 COMPLETED。但 BUDGET_EXHAUSTED 在 agent_graph.finalize 设 finish_reason="length"（_END_REASON_TO_FINISH_REASON 映射，与 ITERATION_LIMIT 同）、不设 state.error；chat_service 据此返回 finish_reason="length"（非 "error"）。executor 只检查 `finish_reason == "error"` -> FAILED，"length" 漏网 -> 默认 COMPLETED -> SUCCEEDED。根因跨 task_agent_executor.py（默认 COMPLETED）+ agent_graph.py（BUDGET_EXHAUSTED 映射 length、不设 error）+ chat_service.py（finish_reason 传递），executor 与 agent-loop 的 finish_reason 语义脱节。注意：不能改 BUDGET_EXHAUSTED 映射为 "error"--openai_compatible.py 对 finish_reason=="error" 返回 HTTP error body（非消息体），会破坏正常 Chat UX 且 test_llm_policy_integration 断言 "length"。
+
+教训：Task worker 完成判定必须以"worker 是否显式调用 task_complete（intent event）"为准；无 intent 时按 finish_reason 兜底：`error`/`length`（BUDGET_EXHAUSTED/ITERATION_LIMIT）-> FAILED（worker 未完成），`stop` -> COMPLETED（worker 给出最终答案）。禁止无 intent 一律默认 COMPLETED--任何 limit/error 都会被误标成功。修复优先在消费侧（executor）按 finish_reason 分流，不要改 agent-loop 的 EndReason->finish_reason 映射（该映射服务于正常 Chat 的 OpenAI 兼容编码与 UX，改它会破坏 openai_compatible error body 合同）。相关：P018 状态机全栈同步、模式十六。
+
+来源：fix 260720 task t_acfc2d6e33bf4ccc 预算耗尽被误标 SUCCEEDED（用户指出看板/Chat 最终结果不一致）
+
+### P021: goal_mode 必须把 judge 反馈喂回 worker 并在连续否决时早退，不能无脑跑到 max_turns
+
+现象：任务 t_97d317e953b64edc（goal_mode）worker 连续 10 轮都调 task_complete（自认完成）、judge 连续 10 轮判 not achieved，goal_loop 无早退、耗满 goal_max_turns=10 才判 FAILED。用户质疑"明确失败后未标记错误结束、继续耗尽 10 轮"是否符合预期。
+
+根因：`TaskAgentExecutor.run_goal_loop` 的 "Not achieved" 分支无条件 continue 到 max_turns，且未把 judge reason 喂回 worker--worker 每 turn 重复同一失败做法（task_show 读不到 judge 反馈），judge 持续否决，直到 max_turns。跨 task_agent_executor.py（goal_loop 无早退 + 无反馈）+ task_service.py（build_worker_context 进度段未含 judge 反馈）。对齐 Hermes Ralph loop（goals.py）：judge 每轮判、未达成则把反馈喂给下一轮 worker（continuation prompt）、worker 被指示"受阻则停"；turn budget 是兜底。N-Agent 后台任务无用户介入，额外需早退。
+
+教训：goal_mode 多轮判定必须做到两点：① judge 否决后把 reason 持久化为事件（goal_judge_feedback）并经 build_worker_context 进度段透传给下一轮 worker（对齐 Hermes continuation prompt），使 worker 能 adapt 或主动 task_propose_change/task_cancel；② 连续 N 次（GOAL_MAX_CONSECUTIVE_REJECTIONS=2）judge 否决即"明确失败"早退 FAILED，不耗尽 max_turns--max_turns 仅作 max_turns < 阈值时的兜底。禁止"无反馈 + 无早退"的空转循环。相关：P018 状态机全栈同步、P020 worker 完成判定。
+
+来源：fix 260720 task t_97d317e953b64edc goal_mode 耗尽 10 轮才判失败（用户指出明确失败后应早退）
+
+
+### P022: Task 失败必须区分用户取消/worker 快速失败/系统失败三态，worker 不得用 task_cancel 表达快速失败
+
+现象：任务 t_a742046a521d46eb（"无法用 execute_code 则直接失败"），worker 发现 execute_code 不可用，调 task_cancel 试图"快速失败"，run summary 自称"moved to the CANCELLED terminal state"，但 task.status 实际为 succeeded（run outcome=completed）。worker 摘要"Failed (cancelled)"与状态机 SUCCEEDED 矛盾，本该失败的任务落成成功。
+
+根因：worker 工具集原本含 task_cancel，TASK_GUIDANCE 指示"无法继续时调 task_cancel"。但 task_cancel 不是 terminal intent（_build_result_from_chat 只识别 complete_requested/change_proposed，无 cancel/fail intent）-> 默认 COMPLETED；且 task_cancel->cancel_task->run_service.terminate->dispatcher.cancel(worker_token) 是 worker 自取消自己的 asyncio task，与 worker 正常 COMPLETED 终结 CAS 竞态，COMPLETED 先赢 -> SUCCEEDED。根因跨 task_tools.py（worker 工具集含 cancel）+ task_agent_executor.py（无 fail intent 检测、默认 COMPLETED）+ task_run_service.py（task_cancel 走 terminate 自取消竞态）+ task_service.py（无 fail 方法）+ task_management.py（_handle_cancel 分发）。语义混淆：把 worker 判定快速失败（应 FAILED）与用户取消（CANCELLED）混用 task_cancel。
+
+教训：Task 终态失败必须三态分离：(1) 取消=用户明确指令 only（/task cancel/按钮 -> TERMINATED -> CANCELLED），worker 不得触发；(2) worker 快速失败=worker 判定无法继续、确定性放弃（必需工具不可用/指令禁止兜底）-> 用独立 task_fail intent（写 fail_requested 事件 -> ABORTED -> FAILED 绕过断路器不重试）；(3) 系统失败=crash/timeout/spawn 非确定性 -> FAILED 走断路器（可重试）。worker 工具集不得含 task_cancel；worker 无法继续必须调 task_fail。worker 主动失败（ABORTED）必须绕过断路器直接 FAILED（区别于可重试的系统 FAILED），否则确定性失败被反复重试。terminal intent 检测（_read_latest_intent）必须覆盖 complete_requested/change_proposed/fail_requested 三种。相关：P020 无 intent 默认 COMPLETED、P018 状态机全栈同步、模式二十八。
+
+来源：fix 260720 task t_a742046a521d46eb worker 快速失败误用 task_cancel 致 run COMPLETED->SUCCEEDED（用户明确"取消只指用户指令，worker 快速失败不是取消"）

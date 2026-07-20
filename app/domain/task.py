@@ -91,6 +91,9 @@ class TaskRunOutcome(str, Enum):
     moves the task to ``WAITING_APPROVAL``. ``TERMINATED`` represents
     user-initiated cancel of a RUNNING worker -> task ``CANCELLED``.
     ``EXPIRED`` represents stale/lease expiration -> task ``EXPIRED``.
+    ``ABORTED`` represents worker-initiated fast-fail (worker 判定无法继续、
+    不再重试) -> task ``FAILED`` 终态，绕过断路器（区别于 FAILED/SPAWN_FAILED
+    的可重试系统失败）。取消（CANCELLED）只认用户指令，worker 不得触发取消。
 
     Legacy ``BLOCKED`` / ``GAVE_UP`` / ``RECLAIMED`` outcomes are removed;
     historical run rows are migrated by the registry.
@@ -104,6 +107,7 @@ class TaskRunOutcome(str, Enum):
     SPAWN_FAILED = "spawn_failed"
     EXPIRED = "expired"
     TERMINATED = "terminated"
+    ABORTED = "aborted"
 
 
 # ---------------------------------------------------------------------------

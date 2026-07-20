@@ -10,7 +10,7 @@ Spec reference:
     tasks.execution_session_id
   - delete_session: 删除 origin session 时把 tasks.origin_session_id 置空
     （不删 Task）；删除 execution session 时把 tasks.execution_session_id 置空
-    （不删 Task），下次 claim 由 TaskAgentExecutor 以稳定 task-{task.id}
+    （不删 Task），下次 claim 由 TaskAgentExecutor 以稳定 task-{uuid5(NAMESPACE_URL, task.id)}
     重建/复用 execution session。
 """
 from __future__ import annotations
@@ -201,7 +201,7 @@ async def test_delete_session_clears_task_origin_session_id(tmp_path):
 async def test_delete_session_clears_task_execution_session_id(tmp_path):
     """删除 execution session 时，tasks.execution_session_id 必须置空，不删除 Task。
 
-    下一次 claim 由 TaskAgentExecutor 以稳定 task-{task.id} 重建/复用 execution
+    下一次 claim 由 TaskAgentExecutor 以稳定 task-{uuid5(NAMESPACE_URL, task.id)} 重建/复用 execution
     session（本测试只验证 delete_session 的置空行为，重建由 T13 验证）。
     """
     db_path = tmp_path / "sessions.db"

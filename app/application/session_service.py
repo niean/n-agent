@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from app.domain.memory import MemoryStore
 from app.domain.session import (
+    ConversationMessage,
     ConversationSession,
     SessionNotFoundError,
     SessionSource,
@@ -203,3 +204,72 @@ class SessionService:
         if not title:
             return
         await self.memory_store.update_session_title(session_id, title[:60])
+
+    # ------------------------------------------------------------------
+    # Task UI system messages (command records + lifecycle)
+    # ------------------------------------------------------------------
+
+    async def append_task_command_message(
+        self, session_id: str, content: str,
+    ) -> ConversationMessage:
+        """持久化 /task 命令记录与结果通知。固定 role=system、name=ui.task_command。
+
+        HTTP 入口路径：超长内容不截断、直接抛 SessionValidationError（422），由前端在
+        请求前按同一合同截断。
+        """
+        return await self._append_system_message(
+            session_id, "ui.task_command", content, truncate=False
+        )
+
+    async def append_task_lifecycle_message(
+        self, session_id: str, content: str,
+    ) -> ConversationMessage:
+        """持久化任务生命周期状态通知。固定 role=system、name=ui.task_lifecycle。
+
+        由 TaskRunService/TaskService 在状态 CAS 成功后 best-effort 调用，不走 HTTP。
+        服务端构造的正文按 UTF-8 安全截断，不因超长丢失生命周期信号。
+        """
+        return await self._append_system_message(
+            session_id, "ui.task_lifecycle", content, truncate=True
+        )
+
+    async def _append_system_message(
+        self, session_id: str, name: str, content: str, *, truncate: bool,
+    ) -> ConversationMessage:
+        if not isinstance(content, str):
+            raise SessionValidationError("content must be a string")
+        cleaned = content.strip()
+        if not cleaned:
+            raise SessionValidationError("content must not be blank")
+        if truncate:
+            cleaned = _truncate_task_message_utf8(cleaned)
+        elif len(cleaned.encode("utf-8")) > _TASK_MESSAGE_MAX_BYTES:
+            raise SessionValidationError("content too large")
+        message = ConversationMessage(role="system", name=name, content=cleaned)
+        result = await self.memory_store.append_message_if_session_exists(session_id, message)
+        if result is None:
+            raise SessionNotFoundError(session_id)
+        return result
+
+
+# Task UI 通知正文长度上限与截断后缀。命令侧在 HTTP 入口前由前端按同一合同截断；
+# 生命周期侧由服务端截断（TaskRunService/TaskService 构造正文后经 SessionService 写入）。
+_TASK_MESSAGE_MAX_BYTES = 65536
+_TASK_MESSAGE_TRUNCATE_SUFFIX = "…[内容已截断]"
+
+
+def _truncate_task_message_utf8(text: str) -> str:
+    """UTF-8 字节安全截断：为后缀预留字节，按 code point 截取，strip 后不超上限。
+
+    长度合法时原样返回（含 strip 由调用方先做；此处仅保证截断后总字节数 <= 上限）。
+    """
+    data = text.encode("utf-8")
+    if len(data) <= _TASK_MESSAGE_MAX_BYTES:
+        return text
+    suffix = _TASK_MESSAGE_TRUNCATE_SUFFIX.encode("utf-8")
+    budget = _TASK_MESSAGE_MAX_BYTES - len(suffix)
+    if budget <= 0:
+        # 后缀本身已超上限（理论不达），退化为硬截断
+        return _TASK_MESSAGE_TRUNCATE_SUFFIX
+    truncated = data[:budget].decode("utf-8", errors="ignore")
+    return (truncated + _TASK_MESSAGE_TRUNCATE_SUFFIX).strip()

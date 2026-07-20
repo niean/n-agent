@@ -107,7 +107,7 @@ subagent 为性能优化手段，非流程成败条件。所有使用 subagent �
 Third Review 是 Workflow 内部的独立审阅通道，用于在主流程模型产出关键文档后引入第三方模型审阅并修正文件。spec/plan 审阅顺序固定为：Skill 自带 Review Loop 审阅并修正 -> Third Review 审阅并修正 -> 主流程模型重新读取目标文件并复审。这里的 Skill 自带 Review Loop 指 spec 的 `brainstorming.md` Spec Review Loop，以及 plan 的 `writing-plans.md` Plan Review Loop。Third Review 对 spec/plan 的默认审阅强度是发现并修复 20+ 个问题，以充分激发第三方模型的审阅能力。Third Review 不新增 Phase，不改变 GATE 边界，也不替代主流程模型的最终审阅责任。
 
 默认实现位于 `.harness/framework/third/`：
-- `.harness/framework/third/third-review-codex.sh`：基于 `codex exec` 的默认 Third Review 命令
+- `.harness/framework/third/third-review-codex.sh`：基于 ChatGPT Mac 应用内置 `codex exec` 的默认 Third Review 命令
 - `.harness/framework/third/spec-review-prompt.md`：spec 审阅提示模板
 - `.harness/framework/third/plan-review-prompt.md`：plan 审阅提示模板
 
@@ -115,18 +115,19 @@ Third Review 是 Workflow 内部的独立审阅通道，用于在主流程模型
 - 默认命令：`sh .harness/framework/third/third-review-codex.sh`
 - 可通过环境变量 `HARNESS_THIRD_REVIEW_CMD` 覆盖命令
 - 可通过环境变量 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型
-- 可通过环境变量 `CODEX_BIN` 指定 Codex CLI；未指定时默认命令依次探测 PATH、VSCode/Cursor/Windsurf 的 Codex 扩展目录
+- 默认执行 `/Applications/ChatGPT.app/Contents/Resources/codex`；ChatGPT 安装位置非默认时，可通过环境变量 `CHATGPT_CODEX_BIN` 指定其内置 Codex 可执行文件
 - spec 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} spec <spec_file>`
 - plan 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`
 
 Third Review 输出规则：
 - Third Review 可直接修改目标 spec/plan 文件，禁止修改无关文件
-- 默认 Third Review 命令通过 `codex exec --cd <repo_root>` 启动，不使用 `--ephemeral`，审阅对话记录由 Codex 自身保存为当前项目的非交互会话；禁止为审阅记录在 `.harness` 下新建文件或目录
+- 默认 Third Review 命令通过 ChatGPT Mac 应用内置的 `codex exec --cd <repo_root>` 启动，不使用 `--ephemeral`，审阅对话记录由 Codex 自身保存为当前项目的非交互会话；禁止为审阅记录在 `.harness` 下新建文件或目录
 - Third Review 以发现并修复 20+ 个问题为目标；若实际问题不足 20 个，禁止编造问题，但必须说明已覆盖的审阅维度
 - Third Review 完成摘要必须给出实际修改数量，格式为 `修改数量: N 项`；禁止编造问题数量，也禁止用 `20+` 代替真实数量
 - Third Review 前，必须先完成对应 Skill 自带 Review Loop 并修正目标文件
 - Third Review 完成后，主流程模型必须重新读取目标文件，审阅 Third 是否破坏用户原始需求、Harness 模板、Phase/GATE 边界、spec/plan 一致性和可验证性
-- Third Review 命令不可用、执行失败或指定模型不可用时，跳过 Third Review 和后续 Third 修改复审；因为目标文件未被 Third 修改，不再执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`
+- Third Review 命令不可用、执行失败或指定模型不可用时，禁止自动跳过；必须立即结束当前回复，报告失败命令与退出码，并请求人工确认是否跳过本次 Third Review
+- 仅在上一条用户消息明确确认跳过后，才可跳过本次 Third Review，不执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`；用户未确认时保持 `third_review: awaiting-skip-confirmation`，禁止推进后续流程
 
 ## Workflows（端到端编排）
 

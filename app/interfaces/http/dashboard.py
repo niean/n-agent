@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, Header
+from fastapi import APIRouter, Body, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
@@ -206,6 +206,46 @@ def create_dashboard_router(
         except SessionNotFoundError as exc:
             return _session_error_response(exc)
         return Response(status_code=204)
+
+    @router.post("/chat/sessions/{session_id}/messages")
+    async def append_session_message(session_id: str, request: Request):
+        """持久化 /task 命令记录与结果通知（ui.task_command）。
+
+        客户端只能提交正文 content；服务端固定 role=system、name=ui.task_command。
+        会话不存在 -> 404 session_not_found（不复活）；非法 body/Content-Type/超长 -> 422
+        session_message_invalid（不写消息）。错误形状统一 {"error":{"code","message"}}。
+        """
+        content_type = request.headers.get("content-type", "")
+        if not content_type.lower().startswith("application/json"):
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"code": "session_message_invalid", "message": "content-type must be application/json"}},
+            )
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"code": "session_message_invalid", "message": "invalid json body"}},
+            )
+        if not isinstance(payload, dict) or set(payload.keys()) != {"content"}:
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"code": "session_message_invalid", "message": "body must be {content: string}"}},
+            )
+        try:
+            message = await session_service.append_task_command_message(session_id, payload.get("content"))
+        except SessionNotFoundError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={"error": {"code": "session_not_found", "message": str(exc)}},
+            )
+        except SessionValidationError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"error": {"code": "session_message_invalid", "message": str(exc)}},
+            )
+        return JSONResponse(status_code=201, content=_message_to_dict(message))
 
     @router.get("/chat/tools")
     async def list_tools():

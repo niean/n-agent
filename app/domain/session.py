@@ -24,8 +24,10 @@ class SessionSource(str, Enum):
     # 独立成一级并配 curator- 前缀，避免误回落 api 导致来源与前缀脱节（模式十六）
     CURATOR = "curator"
     # Task（Kanban / Manus Task）是目标驱动的异步后台执行入口，与"对话""定时任务"
-    # 同级。worker 使用进程内 ChatCompletionService 执行，execution_session_id 固定
-    # `task-{task.id}` 前缀。非 IM 平台，不进 im_platforms。（模式十六）
+    # 同级。worker 使用进程内 ChatCompletionService 执行，execution_session_id 用
+    # `task-{uuid5(NAMESPACE_URL, task.id)}`：从 task.id 确定性派生完整 UUID（str 形式
+    # 带连字符，与 schedule-{uuid4()}/curator-{uuid4()} 一致；跨 run 稳定、无需持久化），
+    # 符合模式十六"前缀+UUID"规则。非 IM 平台，不进 im_platforms。
     TASK = "task"
 
     @classmethod

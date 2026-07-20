@@ -381,7 +381,8 @@ def test_assistant_tool_calls_are_not_rendered_as_chat_messages(tmp_path):
     assert "if (message.role === 'tool' && previous && previous.role === 'tool')" in chat_js
     assert "previous.content.push(message.content || '')" in chat_js
     assert "grouped.push({ ...message, content: [message.content || ''] })" in chat_js
-    assert 'const visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage))' in chat_js
+    assert 'let visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage))' in chat_js
+    assert 'groupTaskCommandMessages(visibleMessages)' in chat_js
     assert 'appendDebugJson(content, message.tool_calls)' not in chat_js
     assert "if (Array.isArray(value)) return value.length > 0" in chat_js
     assert "if (typeof value === 'object') return Object.keys(value).length > 0" in chat_js
@@ -444,7 +445,33 @@ def test_current_session_refresh_renders_persisted_messages(tmp_path):
     refresh_start = chat_js.index('async function refreshCurrentSession()')
     refresh_end = chat_js.index('async function send()', refresh_start)
     refresh_body = chat_js[refresh_start:refresh_end]
-    assert 'renderSessionMessages(detail)' in refresh_body
+    # refreshCurrentSession delegates rendering to applySessionDetail
+    assert 'applySessionDetail(detail' in refresh_body
+    apply_start = chat_js.index('async function applySessionDetail(detail, options)')
+    apply_end = chat_js.index('async function loadToolCalls()', apply_start)
+    apply_body = chat_js[apply_start:apply_end]
+    assert 'renderSessionMessages(detail)' in apply_body
+
+
+def test_chat_auto_refresh_controller_present(tmp_path):
+    """Chat 激活态自动刷新：控制器存在、复合版本检测、无 WebSocket、无 __local__ 哨兵、
+    session_not_found 按 error.message 识别（fetchJson 不保留 HTTP status）。"""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    assert 'AUTO_REFRESH_INTERVAL_MS = 4000' in chat_js
+    assert 'function startAutoRefresh' in chat_js
+    assert 'function stopAutoRefresh' in chat_js
+    assert 'function autoRefreshTick' in chat_js
+    assert 'function messageVersionOf' in chat_js
+    assert 'async function applySessionDetail' in chat_js
+    assert 'function advanceVersionAfterPersistedAppend' in chat_js
+    # 轮询而非 WebSocket
+    assert 'WebSocket' not in chat_js
+    # 禁用本地哨兵冒充服务端版本
+    assert '__local__' not in chat_js
+    # session_not_found 必须用 error.message（fetchJson 抛 new Error(code)，无 status）
+    assert 'error.status' not in chat_js
+    assert "e.message === 'session_not_found'" in chat_js
 
 
 def test_chat_builtin_memory_is_disabled_by_default(tmp_path):
@@ -1120,11 +1147,15 @@ def test_chat_message_images_render_after_refresh(tmp_path):
     assert 'detail.messages' in render_body
     assert 'createMessageElement(message)' in render_body
 
-    # refreshCurrentSession calls renderSessionMessages(detail) after stream ends
+    # refreshCurrentSession delegates to applySessionDetail (which calls renderSessionMessages)
     refresh_start = chat_js.index('async function refreshCurrentSession()')
     refresh_end = chat_js.index('async function send()', refresh_start)
     refresh_body = chat_js[refresh_start:refresh_end]
-    assert 'renderSessionMessages(detail)' in refresh_body
+    assert 'applySessionDetail(detail' in refresh_body
+    apply_start = chat_js.index('async function applySessionDetail(detail, options)')
+    apply_end = chat_js.index('async function loadToolCalls()', apply_start)
+    apply_body = chat_js[apply_start:apply_end]
+    assert 'renderSessionMessages(detail)' in apply_body
 
 
 def test_chat_js_renders_summary_messages_specially(tmp_path):

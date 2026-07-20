@@ -1,237 +1,275 @@
 diff --git a/.harness/framework/FRAMEWORK.md b/.harness/framework/FRAMEWORK.md
-index 96a7c06..0bfe3a4 100644
+index 3724737..acbe608 100644
 --- a/.harness/framework/FRAMEWORK.md
 +++ b/.harness/framework/FRAMEWORK.md
-@@ -96,7 +96,7 @@ subagent 为性能优化手段，非流程成败条件。所有使用 subagent
+@@ -36,6 +36,14 @@
+ 3. 遵守 `[GATE]` 门禁（见下方 GATE 规则），在 GATE 点等待用户确认后再继续
+ 4. 按 Phase 定义的消息输出格式输出，不简化、不改动
 
- ## Third Review（三方审阅）
++## Workflow 完成 Hook
++
++- 支持在 Workflow 最后一个 Phase 成功结束后执行自定义收尾命令，统一入口为 `.harness/framework/hooks/after-finish.sh`
++- Hook 仅在 Workflow 明确声明时执行；当前适用 Workflow：`iterate-feature`、`refine-feature`、`fix-bug`
++- Hook 文件不存在时视为未定义，直接跳过；不得因为未定义 Hook 中断或降级 Workflow
++- Hook 文件存在时执行：`sh .harness/framework/hooks/after-finish.sh`
++- Hook 失败不回滚已完成 Phase；必须在最终输出中标注失败命令和退出码，等待用户决策
++
+ ## Skill 执行
 
--Third Review 是 Workflow 内部的独立审阅通道，用于在主流程模型产出关键文档后引入第三方模型审阅并修正文件。Third Review 不新增 Phase，不改变 GATE 边界，也不替代主流程模型的最终审阅责任。
+ 1. 读取定义：立即读取对应的 Skill 文件（如 `.harness/framework/skills/harness/load-knowledge.md`）
+@@ -94,6 +102,33 @@ Agent 定义"谁来做"，Workflow 编排"按什么顺序做"，Skill 提供"原
+
+ subagent 为性能优化手段，非流程成败条件。所有使用 subagent 的 Phase/Skill 必须支持主 Agent 顺序执行的降级路径，降级不改变产出质量要求。
+
++## Third Review（三方审阅）
++
 +Third Review 是 Workflow 内部的独立审阅通道，用于在主流程模型产出关键文档后引入第三方模型审阅并修正文件。spec/plan 审阅顺序固定为：Skill 自带 Review Loop 审阅并修正 -> Third Review 审阅并修正 -> 主流程模型重新读取目标文件并复审。这里的 Skill 自带 Review Loop 指 spec 的 `brainstorming.md` Spec Review Loop，以及 plan 的 `writing-plans.md` Plan Review Loop。Third Review 对 spec/plan 的默认审阅强度是发现并修复 20+ 个问题，以充分激发第三方模型的审阅能力。Third Review 不新增 Phase，不改变 GATE 边界，也不替代主流程模型的最终审阅责任。
-
- 默认实现位于 `.harness/framework/third/`：
- - `.harness/framework/third/third-review-codex.sh`：基于 `codex exec` 的默认 Third Review 命令
-@@ -107,14 +107,17 @@ Third Review 是 Workflow 内部的独立审阅通道，用于在主流程模型
-- 默认命令：`.harness/framework/third/third-review-codex.sh`
-+ 默认命令：`sh .harness/framework/third/third-review-codex.sh`
- - 可通过环境变量 `HARNESS_THIRD_REVIEW_CMD` 覆盖命令
- - 可通过环境变量 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型
-+- 可通过环境变量 `CODEX_BIN` 指定 Codex CLI；未指定时默认命令依次探测 PATH、VSCode/Cursor/Windsurf 的 Codex 扩展目录
-- spec 审阅：`$HARNESS_THIRD_REVIEW_CMD spec <spec_file>`
-- plan 审阅：`$HARNESS_THIRD_REVIEW_CMD plan <plan_file> <spec_file>`
-+ spec 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} spec <spec_file>`
-+ plan 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`
-
- Third Review 输出规则：
- - Third Review 可直接修改目标 spec/plan 文件，禁止修改无关文件
--- Third Review 完成后，主流程模型必须重新读取目标文件，而不是只读取 Third Review 摘要
--- 主流程模型必须审阅 Third Review 的修改是否破坏用户原始需求、Harness 模板、Phase/GATE 边界、spec/plan 一致性和可验证性
--- Third Review 命令不可用、执行失败或指定模型不可用时，主流程模型按同一审阅目标内联执行降级审阅，并在检查点中标注 `third_review: inline-fallback`
++
++默认实现位于 `.harness/framework/third/`：
++- `.harness/framework/third/third-review-codex.sh`：基于 ChatGPT Mac 应用内置 `codex exec` 的默认 Third Review 命令
++- `.harness/framework/third/spec-review-prompt.md`：spec 审阅提示模板
++- `.harness/framework/third/plan-review-prompt.md`：plan 审阅提示模板
++
++调用约定：
++- 默认命令：`sh .harness/framework/third/third-review-codex.sh`
++- 可通过环境变量 `HARNESS_THIRD_REVIEW_CMD` 覆盖命令
++- 可通过环境变量 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型
++- 默认执行 `/Applications/ChatGPT.app/Contents/Resources/codex`；ChatGPT 安装位置非默认时，可通过环境变量 `CHATGPT_CODEX_BIN` 指定其内置 Codex 可执行文件
++- spec 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} spec <spec_file>`
++- plan 审阅：`${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`
++
++Third Review 输出规则：
++- Third Review 可直接修改目标 spec/plan 文件，禁止修改无关文件
++- 默认 Third Review 命令通过 ChatGPT Mac 应用内置的 `codex exec --cd <repo_root>` 启动，不使用 `--ephemeral`，审阅对话记录由 Codex 自身保存为当前项目的非交互会话；禁止为审阅记录在 `.harness` 下新建文件或目录
 +- Third Review 以发现并修复 20+ 个问题为目标；若实际问题不足 20 个，禁止编造问题，但必须说明已覆盖的审阅维度
-+- Third Review 完成摘要必须给出实际修改数量，格式为 `修改数量: N 项`；禁止用 `20+` 代替真实数量
++- Third Review 完成摘要必须给出实际修改数量，格式为 `修改数量: N 项`；禁止编造问题数量，也禁止用 `20+` 代替真实数量
 +- Third Review 前，必须先完成对应 Skill 自带 Review Loop 并修正目标文件
 +- Third Review 完成后，主流程模型必须重新读取目标文件，审阅 Third 是否破坏用户原始需求、Harness 模板、Phase/GATE 边界、spec/plan 一致性和可验证性
-+- 所有 review 均直接修改目标 spec/plan 文件，禁止为 review 额外创建快照、临时副本或中间版本文件
-+- Third Review 命令不可用、执行失败或指定模型不可用时，跳过 Third Review 和后续 Third 修改复审；因为目标文件未被 Third 修改，不再执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`
-
++- Third Review 命令不可用、执行失败或指定模型不可用时，禁止自动跳过；必须立即结束当前回复，报告失败命令与退出码，并请求人工确认是否跳过本次 Third Review
++- 仅在上一条用户消息明确确认跳过后，才可跳过本次 Third Review，不执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`；用户未确认时保持 `third_review: awaiting-skip-confirmation`，禁止推进后续流程
++
  ## Workflows（端到端编排）
 
+ 编排多个 Agent 角色完成端到端目标，含 GATE 门禁和反馈环路。详细定义见 `.harness/framework/workflows/` 目录。
+@@ -183,19 +218,21 @@ AI 通过 `.harness/specs/` 和 `.harness/plans/` 自主管理设计文档和实
+
+ - Spec 命名：`spec-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/brainstorming.md`
+ - Plan 命名：`plan-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/writing-plans.md`
++- Verify 命名：`verify-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/writing-verify.md`
+ - Spec 触发：默认必须产出 spec；用户显式要求跳过、或指令显式要求跳过时，可省略 spec
+ - Spec 是一次性产物，实现完成后持久性知识通过 Phase 5 回填 knowledge/
+ - 同一窗口内第 2+ 次迭代复用同一计划文件
+
+ ### 生命周期
+
+-同一 Task 允许 1 spec + 1 plan；不同 Task 的文件可在 active/ 中并行。
++同一 Task 允许 1 spec + 1 plan + 1 verify；不同 Task 的文件可在 active/ 中并行。
+
+ | 阶段 | 操作 | 规则 |
+ |------|------|------|
+ | Phase 1 知识加载 | 检测 active/ | 按文件名日期和描述匹配当前任务，匹配则复用；不匹配视为其他 Task 文件，后续 Phase 新建。completed/ 中有匹配则移回 active/ 复用；均无则后续 Phase 创建 |
+ | Phase 2 需求探索 | 写入 spec | spec -> `specs/active/`（仅迭代功能） |
+ | Phase 3 计划制定 | 写入 plan | plan -> `plans/active/`（仅迭代功能） |
++| Phase 3 计划制定 | 写入 verify | verify -> `specs/verify/`（仅迭代功能） |
+ | 任务执行中 | 更新 plan | 更新检查清单、记录变更和技术债 |
+ | 任务总结 | 归档 | 状态改 completed，移到 `completed/` |
+
+@@ -233,8 +270,10 @@ AI 自主维护教训库，人工可通过提示或建议触发新增/修正。
+ .harness/framework/
+   FRAMEWORK.md         -- 通用规范入口（本文件）
+   agents/              -- Agent 角色模板（Orchestrator、Designer、Planner、Coder、Reviewer）
++  hooks/               -- Workflow 完成后可选自定义 Hook（如 after-finish.sh）
+   workflows/           -- Workflow 端到端编排（迭代功能、修复Bug、迭代文档）
+     harness-ops/       -- Harness 运维类 Workflow（治理代码-人工、治理技能-人工）
++  third/               -- Third Review 外部审阅通道
+   skills/              -- Skill 定义
+     harness/           -- Harness 核心 Skill
+       subskills/       -- Subskill 扫描模板
 diff --git a/.harness/framework/third/plan-review-prompt.md b/.harness/framework/third/plan-review-prompt.md
-index 13eabe3..c7feb45 100644
---- a/.harness/framework/third/plan-review-prompt.md
+new file mode 100644
+index 0000000..1520141
+--- /dev/null
 +++ b/.harness/framework/third/plan-review-prompt.md
-@@ -1,6 +1,6 @@
- # Third Review: Plan
-
--你是 Harness Third Review 审阅模型。你的任务是根据关联 spec 审阅并直接修复目标 plan 文件。
+@@ -0,0 +1,27 @@
++# Third Review: Plan
++
 +你是 Harness Third Review 审阅模型。你的任务是根据关联 spec 审阅并直接修复目标 plan 文件，目标是发现并修复 20+ 个问题，以充分暴露计划缺陷和执行风险。
-
- 输入由调用方提供：
- - DOC_TYPE: plan
-@@ -14,11 +14,12 @@
- - plan 不得擅自修改设计决策；设计问题只能在输出摘要中标注风险
- - 保留 Harness plan 结构：标题、元信息、关联 spec、Goal、Architecture、Tech Stack、任务清单、变更记录、发现的技术债
- - 每个任务必须包含具体文件路径、测试路径或验证命令；适用场景下保持 TDD 步骤
++
++输入由调用方提供：
++- DOC_TYPE: plan
++- TARGET_FILE: 目标 plan 文件路径
++- SPEC_FILE: 关联 spec 文件路径
++- REPO_ROOT: 仓库根目录
++
++必须遵守：
++- 只修改 TARGET_FILE，禁止修改 spec 或其它文件
++- plan 必须覆盖 SPEC_FILE 的需求和验收标准，禁止遗漏核心能力
++- plan 不得擅自修改设计决策；设计问题只能在输出摘要中标注风险
++- 保留 Harness plan 结构：标题、元信息、关联 spec、Goal、Architecture、Tech Stack、任务清单、变更记录、发现的技术债
++- 每个任务必须包含具体文件路径、测试路径或验证命令；适用场景下保持 TDD 步骤
 +- 以 20+ 个问题为目标进行系统性审阅和修复；若实际问题不足 20 个，禁止编造问题，但必须说明已覆盖的审阅维度
-+- 统计实际修改数量；同一处任务、文件路径、验证命令、依赖顺序或风险修正计为 1 项，禁止用 `20+` 代替真实数量
- - 修复严重问题优先：任务顺序不可执行、文件路径虚构、接口签名猜测、测试缺失、验收不可验证、与 spec 不一致、Phase/GATE 边界破坏
- - 不引入 IDE 绑定描述；保持 Claude Code、Codex、其它可运行 shell 的环境都可执行
- - 不加入 emoji、夸张格式或营销式文案
-
- 完成后输出简短摘要：
- - 状态: approved 或 fixed
--- 修改摘要: 1-5 条
++- 统计实际修改数量；同一处任务、文件路径、验证命令、依赖顺序或风险修正计为 1 项，禁止编造问题、禁止用 `20+` 代替真实数量
++- 修复严重问题优先：任务顺序不可执行、文件路径虚构、接口签名猜测、测试缺失、验收不可验证、与 spec 不一致、Phase/GATE 边界破坏
++- 不引入 IDE 绑定描述；保持 Claude Code、Codex、其它可运行 shell 的环境都可执行
++- 不加入 emoji、夸张格式或营销式文案
++
++完成后输出简短摘要：
++- 状态: approved 或 fixed
 +- 修改数量: N 项，必须填写具体数字；若 N < 20，说明未达到 20+ 目标的原因和已覆盖的审阅维度
 +- 修改摘要: 1-5 条，概括主要修改类别
- - 剩余风险: 无 或 1-3 条
++- 剩余风险: 无 或 1-3 条
 diff --git a/.harness/framework/third/spec-review-prompt.md b/.harness/framework/third/spec-review-prompt.md
-index f655cff..e28cf60 100644
---- a/.harness/framework/third/spec-review-prompt.md
+new file mode 100644
+index 0000000..0456826
+--- /dev/null
 +++ b/.harness/framework/third/spec-review-prompt.md
-@@ -1,6 +1,6 @@
- # Third Review: Spec
-
--你是 Harness Third Review 审阅模型。你的任务是审阅并直接修复目标 spec 文件。
+@@ -0,0 +1,25 @@
++# Third Review: Spec
++
 +你是 Harness Third Review 审阅模型。你的任务是审阅并直接修复目标 spec 文件，目标是发现并修复 20+ 个问题，以充分暴露设计缺陷和合同风险。
-
- 输入由调用方提供：
- - DOC_TYPE: spec
-@@ -11,6 +11,7 @@
- - 只修改 TARGET_FILE，禁止修改其它文件
- - 保留用户原始需求和已确认的范围，不擅自扩大任务
- - 保留 Harness spec 的标题、元信息、Goal、Architecture、Components、Data Flow、Error Handling、Constraints、Acceptance Criteria 等结构；如原文结构缺失，只补足必要章节
++
++输入由调用方提供：
++- DOC_TYPE: spec
++- TARGET_FILE: 目标 spec 文件路径
++- REPO_ROOT: 仓库根目录
++
++必须遵守：
++- 只修改 TARGET_FILE，禁止修改其它文件
++- 保留用户原始需求和已确认的范围，不擅自扩大任务
++- 保留 Harness spec 的标题、元信息、Goal、Architecture、Components、Data Flow、Error Handling、Constraints、Acceptance Criteria 等结构；如原文结构缺失，只补足必要章节
 +- 以 20+ 个问题为目标进行系统性审阅和修复；若实际问题不足 20 个，禁止编造问题，但必须说明已覆盖的审阅维度
-+- 统计实际修改数量；同一处文本、结构或验收标准修正计为 1 项，禁止用 `20+` 代替真实数量
- - 修复严重问题优先：需求歧义、边界错误、不可验收、实现路径与项目架构冲突、GATE/Phase 边界破坏、验收标准不可执行
- - 不写实现计划任务清单；实现拆分属于 plan
- - 不引入 IDE 绑定描述；保持 Claude Code、Codex、其它可运行 shell 的环境都可执行
-@@ -18,5 +19,5 @@
-
- 完成后输出简短摘要：
- - 状态: approved 或 fixed
--- 修改摘要: 1-5 条
++- 统计实际修改数量；同一处文本、结构或验收标准修正计为 1 项，禁止编造问题数量、禁止用 `20+` 代替真实数量
++- 修复严重问题优先：需求歧义、边界错误、不可验收、实现路径与项目架构冲突、GATE/Phase 边界破坏、验收标准不可执行
++- 不写实现计划任务清单；实现拆分属于 plan
++- 不引入 IDE 绑定描述；保持 Claude Code、Codex、其它可运行 shell 的环境都可执行
++- 不加入 emoji、夸张格式或营销式文案
++
++完成后输出简短摘要：
++- 状态: approved 或 fixed
 +- 修改数量: N 项，必须填写具体数字；若 N < 20，说明未达到 20+ 目标的原因和已覆盖的审阅维度
 +- 修改摘要: 1-5 条，概括主要修改类别
- - 剩余风险: 无 或 1-3 条
++- 剩余风险: 无 或 1-3 条
 diff --git a/.harness/framework/third/third-review-codex.sh b/.harness/framework/third/third-review-codex.sh
-index b7d4086..aa50f80 100755
---- a/.harness/framework/third/third-review-codex.sh
+new file mode 100755
+index 0000000..ca5270f
+--- /dev/null
 +++ b/.harness/framework/third/third-review-codex.sh
-@@ -1,5 +1,5 @@
--#!/usr/bin/env bash
--set -euo pipefail
+@@ -0,0 +1,127 @@
 +#!/usr/bin/env sh
 +set -eu
-
- usage() {
-   cat >&2 <<'USAGE'
-@@ -9,17 +9,17 @@ Usage:
-
- Environment:
-   HARNESS_THIRD_REVIEW_MODEL   Codex model name for Third Review
--  CODEX_BIN                    Codex executable path, default: codex
-+  CODEX_BIN                    Codex executable path, overrides auto-detection
- USAGE
- }
-
-+find_codex_bin() {
-+  if [ -n "${CODEX_BIN:-}" ]; then
-+    if command -v "$CODEX_BIN" >/dev/null 2>&1; then
-+      command -v "$CODEX_BIN"
++
++usage() {
++  cat >&2 <<'USAGE'
++Usage:
++  third-review-codex.sh spec <spec_file>
++  third-review-codex.sh plan <plan_file> <spec_file>
++
++Environment:
++  HARNESS_THIRD_REVIEW_MODEL   Codex model name for Third Review
++  CHATGPT_CODEX_BIN            ChatGPT Mac app bundled Codex executable path
++USAGE
++}
++
++find_chatgpt_codex_bin() {
++  if [ -n "${CHATGPT_CODEX_BIN:-}" ]; then
++    if [ -x "$CHATGPT_CODEX_BIN" ]; then
++      printf '%s\n' "$CHATGPT_CODEX_BIN"
 +      return 0
 +    fi
-+    if [ -x "$CODEX_BIN" ]; then
-+      printf '%s\n' "$CODEX_BIN"
-+      return 0
-+    fi
-+    echo "third-review: CODEX_BIN is set but not executable: $CODEX_BIN" >&2
++    echo "third-review: CHATGPT_CODEX_BIN is set but not executable: $CHATGPT_CODEX_BIN" >&2
 +    return 127
 +  fi
 +
-+  if command -v codex >/dev/null 2>&1; then
-+    command -v codex
++  chatgpt_codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex"
++  if [ -x "$chatgpt_codex_bin" ]; then
++    printf '%s\n' "$chatgpt_codex_bin"
 +    return 0
 +  fi
 +
-+  candidate="$(find \
-+    "$HOME/.vscode/extensions" \
-+    "$HOME/.cursor/extensions" \
-+    "$HOME/.windsurf/extensions" \
-+    -path '*openai.chatgpt*/bin/*/codex' \
-+    -type f 2>/dev/null | sort -r | while IFS= read -r found_codex; do
-+      if [ -x "$found_codex" ]; then
-+        printf '%s\n' "$found_codex"
-+        break
-+      fi
-+    done)"
-+  if [ -n "$candidate" ]; then
-+    printf '%s\n' "$candidate"
-+    return 0
-+  fi
-+
-+  echo "third-review: codex executable not found; set CODEX_BIN or install Codex CLI" >&2
++  echo "third-review: ChatGPT Mac app bundled Codex executable not found: $chatgpt_codex_bin" >&2
++  echo "third-review: install ChatGPT for macOS or set CHATGPT_CODEX_BIN" >&2
 +  return 127
 +}
 +
--if [[ $# -lt 2 ]]; then
 +if [ "$#" -lt 2 ]; then
-   usage
-   exit 2
- fi
-@@ -30,13 +70,13 @@ spec_file="${3:-}"
-
- case "$doc_type" in
-   spec)
--    if [[ $# -ne 2 ]]; then
++  usage
++  exit 2
++fi
++
++doc_type="$1"
++target_file="$2"
++spec_file="${3:-}"
++
++case "$doc_type" in
++  spec)
 +    if [ "$#" -ne 2 ]; then
-       usage
-       exit 2
-     fi
-     ;;
-   plan)
--    if [[ $# -ne 3 ]]; then
++      usage
++      exit 2
++    fi
++    ;;
++  plan)
 +    if [ "$#" -ne 3 ]; then
-       usage
-       exit 2
-     fi
-@@ -50,25 +90,20 @@ esac
- repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
- cd "$repo_root"
-
--if [[ ! -f "$target_file" ]]; then
++      usage
++      exit 2
++    fi
++    ;;
++  *)
++    usage
++    exit 2
++    ;;
++esac
++
++repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
++cd "$repo_root"
++
 +if [ ! -f "$target_file" ]; then
-   echo "third-review: target file not found: $target_file" >&2
-   exit 1
- fi
-
--if [[ "$doc_type" == "plan" && ! -f "$spec_file" ]]; then
++  echo "third-review: target file not found: $target_file" >&2
++  exit 1
++fi
++
 +if [ "$doc_type" = "plan" ] && [ ! -f "$spec_file" ]; then
-   echo "third-review: spec file not found: $spec_file" >&2
-   exit 1
- fi
-
--codex_bin="${CODEX_BIN:-codex}"
--if ! command -v "$codex_bin" >/dev/null 2>&1; then
--  echo "third-review: codex executable not found: $codex_bin" >&2
--  exit 127
--fi
-+codex_bin="$(find_codex_bin)"
-
--model_args=()
--if [[ -n "${HARNESS_THIRD_REVIEW_MODEL:-}" ]]; then
--  model_args=(--model "$HARNESS_THIRD_REVIEW_MODEL")
--fi
--
- prompt_template=".harness/framework/third/${doc_type}-review-prompt.md"
--if [[ ! -f "$prompt_template" ]]; then
++  echo "third-review: spec file not found: $spec_file" >&2
++  exit 1
++fi
++
++codex_bin="$(find_chatgpt_codex_bin)"
++
++prompt_template=".harness/framework/third/${doc_type}-review-prompt.md"
 +if [ ! -f "$prompt_template" ]; then
-   echo "third-review: prompt template not found: $prompt_template" >&2
-   exit 1
- fi
-@@ -93,7 +128,7 @@ trap cleanup EXIT
-   printf 'DOC_TYPE: %s\n' "$doc_type"
-   printf 'TARGET_FILE: %s\n' "$target_file"
-   printf 'REPO_ROOT: %s\n' "$repo_root"
--  if [[ "$doc_type" == "plan" ]]; then
++  echo "third-review: prompt template not found: $prompt_template" >&2
++  exit 1
++fi
++
++target_basename="$(basename "$target_file")"
++session_title="HarnessReview-${target_basename%.md}"
++
++tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/harness-third-review.XXXXXX.md")"
++cleanup() {
++  rm -f "$tmp_prompt"
++}
++trap cleanup EXIT
++
++{
++  printf '# %s\n\n' "$session_title"
++  printf 'SESSION_TITLE: %s\n' "$session_title"
++  printf 'PROJECT_ROOT: %s\n' "$repo_root"
++  printf 'RECORD_VISIBILITY: 本次审阅使用 ChatGPT Mac 应用内置的 Codex exec，并持久化为当前项目会话；禁止为审阅记录在 .harness 下新建文件或目录。\n'
++  printf '\n---\n\n'
++  cat "$prompt_template"
++  printf '\n---\n\n'
++  printf 'DOC_TYPE: %s\n' "$doc_type"
++  printf 'TARGET_FILE: %s\n' "$target_file"
++  printf 'REPO_ROOT: %s\n' "$repo_root"
 +  if [ "$doc_type" = "plan" ]; then
-     printf 'SPEC_FILE: %s\n' "$spec_file"
-   fi
-   cat <<'PROMPT'
-@@ -101,19 +136,20 @@ trap cleanup EXIT
-
- 请先读取目标文件；plan 审阅还必须读取关联 spec。完成审阅后，直接修改 TARGET_FILE。
--最终回复只给出状态、修改摘要、剩余风险。
-+最终回复只给出状态、修改数量、修改摘要、剩余风险；修改数量必须是具体数字，禁止写成 20+。
- PROMPT
- } > "$tmp_prompt"
-
--codex_cmd=(
--  "$codex_bin" exec
--  --cd "$repo_root"
--  --sandbox workspace-write
--)
--if (( ${#model_args[@]} > 0 )); then
--  codex_cmd+=("${model_args[@]}")
++    printf 'SPEC_FILE: %s\n' "$spec_file"
++  fi
++  cat <<'PROMPT'
++
++请先读取目标文件；plan 审阅还必须读取关联 spec。完成审阅后，直接修改 TARGET_FILE。
++最终回复只给出状态、修改数量、修改摘要、剩余风险；修改数量必须是具体数字，禁止编造问题、禁止写成 20+。
++PROMPT
++} > "$tmp_prompt"
++
 +if [ -n "${HARNESS_THIRD_REVIEW_MODEL:-}" ]; then
 +  "$codex_bin" exec \
 +    --cd "$repo_root" \
@@ -243,59 +281,64 @@ index b7d4086..aa50f80 100755
 +    --cd "$repo_root" \
 +    --sandbox workspace-write \
 +    - < "$tmp_prompt"
- fi
--codex_cmd+=(-)
--
--"${codex_cmd[@]}" < "$tmp_prompt"
++fi
 diff --git a/.harness/framework/workflows/iterate-feature.md b/.harness/framework/workflows/iterate-feature.md
-index b317a28..c9f9242 100644
+index c7c1d4a..15bb043 100644
 --- a/.harness/framework/workflows/iterate-feature.md
 +++ b/.harness/framework/workflows/iterate-feature.md
-@@ -36,31 +36,30 @@ Workflow Progress:
+@@ -17,7 +17,7 @@ description: 功能迭代端到端工作流，编排 Designer/Planner/Coder/Revi
+ Workflow Progress:
+ - [ ] Phase 1: 知识加载（知识库加载、约束确认）
+ - [ ] Phase 2: 需求探索与设计（spec 落盘）[GATE]
+-- [ ] Phase 3: 计划制定（plan 落盘）[GATE-ENTRY]
++- [ ] Phase 3: 计划制定（plan 落盘 + verify 落盘）[GATE-ENTRY]
+ - [ ] Phase 4: 代码实现（按 plan 逐 task）
+ - [ ] Phase 5: 结果验收（构建 + 扫描 + 验收标准）
+ - [ ] Phase 6: 知识回填
+@@ -36,19 +36,30 @@ Workflow Progress:
  ## Phase 2: 需求探索与设计 `[GATE]`
  - Agent: Designer
  - 执行 `Skill: brainstorming`（`.harness/framework/skills/superpowers/brainstorming.md`），按其完整流程执行
--- spec 落盘后，执行 Third Review：
--  1. 优先执行 `${HARNESS_THIRD_REVIEW_CMD:-.harness/framework/third/third-review-codex.sh} spec <spec_file>`；可通过 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型
--  2. Third Review 可直接修改 spec 文件，但只能修改该 spec
--  3. Third Review 完成后，主流程模型必须重新读取 spec 文件并审阅修改结果
--  4. 主流程模型确认 spec 未破坏用户原始需求、Harness 模板、Phase/GATE 边界和验收可执行性后，才可继续
--  5. Third Review 命令不可用或失败时，主流程模型按同一审阅目标内联降级审阅，并在检查点中标注 `third_review: inline-fallback`
--- spec 经 Third Review 和主流程模型复审后，向用户输出需求摘要（目标 + 范围 + 方案 + 验收标准），等待确认
+-- spec 落盘后，向用户输出需求摘要（目标 + 范围 + 方案 + 验收标准），等待确认
 +- spec 落盘后，执行三段式审阅：
 +  1. 确认 `brainstorming.md` 的 Spec Review Loop 已完成并修正 spec；该 Review Loop 即本阶段内联 review
 +  2. 执行 Third Review：优先执行 `${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} spec <spec_file>`；可通过 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型；Third Review 可直接修改 spec 文件，但只能修改该 spec
 +  3. Third Review 完成后，主流程模型必须重新读取 spec 文件，复审是否破坏用户原始需求、Harness 模板、Phase/GATE 边界和验收可执行性
-+  4. Third Review 命令不可用或失败时，跳过 Third Review 和后续 Third 修改复审，不再执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`
++  4. Third Review 命令不可用或失败时，禁止自动跳过；必须立即结束当前回复，报告失败命令与退出码，并请求人工确认。仅在上一条用户消息明确确认跳过后，才可跳过本次 Third Review，不执行额外内联降级审阅，并标注 `third_review: skipped`；未确认时标注 `third_review: awaiting-skip-confirmation`，禁止推进后续流程
 +- spec 经 Spec Review Loop、Third Review 和主流程复审后，向用户输出需求摘要（目标 + 范围 + 方案 + 验收标准），等待确认
  - 用户修正时：更新 spec，输出完整摘要再次确认
  - `[GATE]` 规则见 FRAMEWORK.md
 
--检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, third_review: codex/inline-fallback/skipped, 方案: 已确认`
-+检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, third_review: codex/skipped, 方案: 已确认`
+-检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, 方案: 已确认`
++检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, third_review: chatgpt/skipped/awaiting-skip-confirmation, 方案: 已确认`
 
  ## Phase 3: 计划制定 `[GATE-ENTRY]`
  - Agent: Planner
  - `[GATE-ENTRY]` 前置条件：用户已在上一条消息中明确确认 spec；若 Phase 2 在当前回复中刚输出，说明 GATE 被违反，必须停止
  - 执行 `Skill: writing-plans`（`.harness/framework/skills/superpowers/writing-plans.md`），按其流程执行到 "Plan Review Loop" 后终止；"Execution Handoff" 由本 Phase 自行执行
--- plan 落盘后，执行 Third Review：
--  1. 优先执行 `${HARNESS_THIRD_REVIEW_CMD:-.harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`；可通过 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型
--  2. Third Review 可直接修改 plan 文件，但只能修改该 plan，禁止修改 spec
--  3. Third Review 完成后，主流程模型必须重新读取 plan 文件，并按关联 spec 审阅修改结果
--  4. 主流程模型确认 plan 未破坏 spec、Harness 模板、Phase/GATE 边界、任务可执行性和验收可验证性后，才可继续
--  5. Third Review 命令不可用或失败时，主流程模型按同一审阅目标内联降级审阅，并在检查点中标注 `third_review: inline-fallback`
--- plan 经 Third Review 和主流程模型复审后，确定执行方式（Subagent-Driven / Inline Execution）后直接进入 Phase 4：若用户在输入指令中明确指定了执行方式则遵从；否则 AI 按任务规模自主决策，plan 中 task <= 3 个时使用 Inline Execution，其余使用 Subagent-Driven，无需人工确认。禁止中断回复等待确认 -- 本 Phase 无 [GATE] 标记，plan 复审后必须自主推进
--
--检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: codex/inline-fallback/skipped, 执行方式: subagent/inline`
+-- plan 落盘后，确定执行方式（Subagent-Driven / Inline Execution）后直接进入 Phase 4：若用户在输入指令中明确指定了执行方式则遵从；否则 AI 按任务规模自主决策，plan 中 task <= 3 个时使用 Inline Execution，其余使用 Subagent-Driven，无需人工确认。禁止中断回复等待确认 -- 本 Phase 无 [GATE] 标记，plan 落盘后必须自主推进
 +- plan 落盘后，执行三段式审阅：
 +  1. 确认 `writing-plans.md` 的 Plan Review Loop 已完成并修正 plan；该 Review Loop 即本阶段内联 review
 +  2. 执行 Third Review：优先执行 `${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`；可通过 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型；Third Review 可直接修改 plan 文件，但只能修改该 plan，禁止修改 spec
 +  3. Third Review 完成后，主流程模型必须重新读取 plan 文件，并按关联 spec 复审是否破坏 spec、Harness 模板、Phase/GATE 边界、任务可执行性和验收可验证性
-+  4. 所有 review 均直接修改 plan 文件，禁止为 review 额外创建快照、临时副本或中间版本文件
-+  5. Third Review 命令不可用或失败时，跳过 Third Review 和后续 Third 修改复审，不再执行额外内联降级审阅，并在检查点中标注 `third_review: skipped`
++  4. Third Review 命令不可用或失败时，禁止自动跳过；必须立即结束当前回复，报告失败命令与退出码，并请求人工确认。仅在上一条用户消息明确确认跳过后，才可跳过本次 Third Review，不执行额外内联降级审阅，并标注 `third_review: skipped`；未确认时标注 `third_review: awaiting-skip-confirmation`，禁止推进后续流程
++- plan 经 Plan Review Loop、Third Review 和主流程复审后，执行 `Skill: writing-verify`（`.harness/framework/skills/superpowers/writing-verify.md`），输入 Phase 2 spec 文件路径和 Phase 3 plan 文件路径，生成独立旁路人工验收文件 `.harness/specs/verify/verify-{YYMMDD}-{desc}.md`
 +- plan 经 Plan Review Loop、Third Review 和主流程复审后，确定执行方式（Subagent-Driven / Inline Execution）后直接进入 Phase 4：若用户在输入指令中明确指定了执行方式则遵从；否则 AI 按任务规模自主决策，plan 中 task <= 3 个时使用 Inline Execution，其余使用 Subagent-Driven，无需人工确认。禁止中断回复等待确认 -- 本 Phase 无 [GATE] 标记，plan 复审后必须自主推进
-+
-+检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: codex/skipped, 执行方式: subagent/inline`
+
+-检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, 执行方式: subagent/inline`
++检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: chatgpt/skipped/awaiting-skip-confirmation, 执行方式: subagent/inline`
 
  ## Phase 4: 代码实现
  - Agent: Coder
+@@ -72,8 +83,9 @@ Workflow Progress:
+
+ ## Phase 7: 任务总结
+ - Agent: Orchestrator
+-- 执行顺序：`Skill: 归档任务文件`（输入：Phase 2 spec 文件路径 + Phase 3 plan 文件路径）-> `Skill: 总结任务` -> 结束任务，在同一条回复中完成
++- 执行顺序：`Skill: 归档任务文件`（输入：Phase 2 spec 文件路径 + Phase 3 plan 文件路径）-> `Skill: 总结任务` -> Phase 7 结束 -> 执行 after-finish Hook -> 提醒人工验收 -> 结束任务，在同一条回复中完成
++- after-finish Hook：若 `.harness/framework/hooks/after-finish.sh` 存在，执行 `sh .harness/framework/hooks/after-finish.sh`；若文件不存在则跳过。Hook 失败不回滚 Phase 7，但必须在最终输出中标注失败命令和退出码
+
+-检查点：`[Phase 7 任务总结] 归档: spec+plan, 状态: 完成`
++检查点：`[Phase 7 任务总结] 归档: spec+plan, hook: executed/skipped/failed, 状态: 完成`
+
+ ---
