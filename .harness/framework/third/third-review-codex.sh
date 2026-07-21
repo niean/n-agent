@@ -86,7 +86,7 @@ fi
 target_basename="$(basename "$target_file")"
 session_title="HarnessReview-${target_basename%.md}"
 
-tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/harness-third-review.XXXXXX.md")"
+tmp_prompt="$(mktemp "${TMPDIR:-/tmp}/harness-third-review.XXXXXX")"
 cleanup() {
   rm -f "$tmp_prompt"
 }

@@ -14,6 +14,7 @@ _INTERNAL_OPTION_KEYS = {
     "execution_context_mode",
     "external_memory_enabled",
     "stream_event_sink",
+    "persist_messages",
 }
 
 

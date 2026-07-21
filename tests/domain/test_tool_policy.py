@@ -434,3 +434,49 @@ def test_user_task_tools_exposure_rules():
             policy.can_expose(d, ToolExposurePolicy.SAFE_ONLY, granted_tools=names)
             is True
         )
+
+
+def test_user_task_approval_tools_exposure_rules():
+    """用户侧审批工具 approve_task/reject_task/revise_task 暴露规则（Task 4）。
+
+    - DEFAULT（realtime 对话）：可见，供对话 Agent 调用审批最近 waiting_approval 任务
+    - SAFE_ONLY（unattended worker）未 grant：不可见（防递归，worker 不能自我审批）
+    - SAFE_ONLY 错误 grant 任一名称后会暴露：回归守卫，提醒 grant 禁令的必要性
+    """
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    policy = ToolPolicy()
+    defs = user_task_approval_tool_definitions()
+    names = frozenset(d.name for d in defs)
+    assert names == {"approve_task", "reject_task", "revise_task"}
+
+    for d in defs:
+        assert d.source_type is ToolSourceType.AGENT
+        assert d.risk_level is RiskLevel.SAFE
+        assert d.managed is False
+        # DEFAULT 可见
+        assert policy.can_expose(d, ToolExposurePolicy.DEFAULT) is True
+        # SAFE_ONLY 无 grant 不可见
+        assert (
+            policy.can_expose(d, ToolExposurePolicy.SAFE_ONLY, granted_tools=frozenset())
+            is False
+        )
+        # 错误 grant（其它工具名）不可见
+        assert (
+            policy.can_expose(
+                d, ToolExposurePolicy.SAFE_ONLY, granted_tools=frozenset({"other_tool"})
+            )
+            is False
+        )
+        # 回归守卫：grant 命中自身名称时会暴露
+        assert (
+            policy.can_expose(
+                d, ToolExposurePolicy.SAFE_ONLY, granted_tools=frozenset({d.name})
+            )
+            is True
+        )
+        # 回归守卫：grant 命中全部三个名称时也会暴露
+        assert (
+            policy.can_expose(d, ToolExposurePolicy.SAFE_ONLY, granted_tools=names)
+            is True
+        )

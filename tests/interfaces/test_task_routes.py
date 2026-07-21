@@ -23,6 +23,8 @@ from app.domain.task import (
     DeliveryResult,
     FinishRunCommand,
     FinishRunResult,
+    ProposalResolutionCommand,
+    ProposalResolutionResult,
     RecoverRunCommand,
     Task,
     TaskAttachment,
@@ -268,6 +270,124 @@ class FakeTaskRegistry:
 
     async def update_notify_sub_last_event(self, task_id, platform, chat_id, thread_id, last_terminal_event_id):
         return True
+
+    # ------------------------------------------------------------------
+    # T3: proposal resolution port (atomic, mirrors SQLite registry)
+    # ------------------------------------------------------------------
+
+    _FAKE_DECISION_TO_KIND = {
+        "approved": "change_approved",
+        "rejected": "change_rejected",
+        "revised": "change_revised",
+    }
+    _FAKE_RESOLUTION_MARKER_KINDS = frozenset(_FAKE_DECISION_TO_KIND.values())
+
+    async def resolve_proposal(
+        self, command: ProposalResolutionCommand,
+    ) -> ProposalResolutionResult:
+        """Atomic in-memory mirror of SQLiteTaskRegistry.resolve_proposal."""
+        if not command.task_id:
+            raise TaskValidationError("task_id must not be empty")
+        if command.decision not in self._FAKE_DECISION_TO_KIND:
+            raise TaskValidationError(
+                f"invalid decision: {command.decision!r}"
+            )
+        expected_kind = self._FAKE_DECISION_TO_KIND[command.decision]
+        if command.event_kind != expected_kind:
+            raise TaskValidationError(
+                f"decision/event_kind mismatch: decision={command.decision!r} "
+                f"requires event_kind={expected_kind!r}, "
+                f"got {command.event_kind!r}"
+            )
+        if command.decision == "revised":
+            if not command.note or not command.note.strip():
+                raise TaskValidationError(
+                    "revised decision requires a non-empty note"
+                )
+
+        task = self._tasks.get(command.task_id)
+        if task is None:
+            raise TaskNotFoundError(f"task not found: {command.task_id}")
+        if task.version != command.expected_version:
+            raise TaskConflictError(
+                f"version conflict: expected {command.expected_version}, "
+                f"got {task.version}"
+            )
+        if task.is_archived:
+            raise TaskStateError(
+                f"task {command.task_id} is archived; cannot resolve proposal"
+            )
+        if task.status is not TaskStatus.WAITING_APPROVAL:
+            raise TaskStateError(
+                f"resolve_proposal requires WAITING_APPROVAL, "
+                f"got {task.status.value}"
+            )
+
+        events = [e for e in self._events if e.task_id == command.task_id]
+        resolved_ids: set[int] = set()
+        for ev in events:
+            if ev.kind in self._FAKE_RESOLUTION_MARKER_KINDS:
+                pid = ev.payload.get("proposal_event_id")
+                if pid is not None:
+                    resolved_ids.add(int(pid))
+
+        latest_pending: TaskEvent | None = None
+        for ev in reversed(events):
+            if ev.kind == "change_proposed" and ev.id not in resolved_ids:
+                latest_pending = ev
+                break
+
+        if latest_pending is None:
+            raise TaskStateError(
+                f"task {command.task_id} has no pending change_proposed event"
+            )
+
+        proposal_event_id = latest_pending.id
+        now = datetime.now(timezone.utc)
+        decision_event = TaskEvent(
+            id=self._next_event_id,
+            task_id=command.task_id,
+            kind=command.event_kind,
+            payload={
+                "decision": command.decision,
+                "note": command.note,
+                "proposal_event_id": proposal_event_id,
+            },
+            run_id=None,
+            created_at=now,
+        )
+        self._next_event_id += 1
+        self._events.append(decision_event)
+
+        from dataclasses import replace as dc_replace
+        updated_task = dc_replace(
+            task, status=TaskStatus.QUEUED, version=task.version + 1,
+            updated_at=now,
+        )
+        self._tasks[command.task_id] = updated_task
+
+        return ProposalResolutionResult(
+            proposal_event_id=proposal_event_id,
+            task=updated_task,
+            decision_event=decision_event,
+        )
+
+    async def latest_waiting_approval_in_session(
+        self, session_id: str,
+    ) -> Task | None:
+        if not session_id:
+            raise TaskValidationError("session_id must not be empty")
+        candidates = [
+            t for t in self._tasks.values()
+            if t.origin_session_id == session_id
+            and t.status == TaskStatus.WAITING_APPROVAL
+            and not t.is_archived
+        ]
+        candidates.sort(
+            key=lambda t: (t.created_at or datetime.min, t.id),
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +686,348 @@ async def test_approve_note_non_string_returns_422(client, task_service, registr
     resp = client.post(f"/chat/tasks/{task.id}/approve", json={"note": ["a"]})
     assert resp.status_code == 422
     assert resp.json()["error"]["code"] == "task_invalid"
+
+
+# ---------------------------------------------------------------------------
+# T9: /revise route + shared _extract_note(required=...) + fixed messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_revise_success_response_fields(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "请修改方案"})
+    assert resp.status_code == 200
+    data = resp.json()
+    # Response matches TaskService.revise_change contract:
+    # task_id/title/status/decision/proposal_event_id/note
+    assert set(data.keys()) >= {
+        "task_id", "title", "status", "decision",
+        "proposal_event_id", "note",
+    }
+    assert data["task_id"] == task.id
+    assert data["title"] == task.title
+    assert data["status"] == "queued"
+    assert data["decision"] == "revised"
+    assert data["note"] == "请修改方案"
+    assert isinstance(data["proposal_event_id"], int)
+    assert data["proposal_event_id"] > 0
+
+
+@pytest.mark.asyncio
+async def test_revise_trims_note(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "  revise me  "})
+    assert resp.status_code == 200
+    assert resp.json()["note"] == "revise me"
+
+
+@pytest.mark.asyncio
+async def test_revise_body_non_object_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json="text")
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before  # no decision event written
+
+
+@pytest.mark.asyncio
+async def test_revise_no_body_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/revise")
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_revise_empty_object_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_revise_null_note_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": None})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_revise_blank_note_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "   "})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_revise_oversized_note_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "x" * 2001})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_revise_wrong_note_type_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": ["a"]})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_revise_numeric_note_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": 123})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+
+
+@pytest.mark.asyncio
+async def test_revise_extra_field_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(
+        f"/chat/tasks/{task.id}/revise",
+        json={"note": "redo", "extra": "field"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_revise_not_found_returns_404(client):
+    resp = client.post("/chat/tasks/t_missing/revise", json={"note": "redo"})
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+    assert resp.json()["error"]["message"] == "task not found"
+
+
+@pytest.mark.asyncio
+async def test_revise_non_waiting_returns_409(client, task_service):
+    task = await task_service.create_task(title="T", created_by="u")
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "redo"})
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_state_invalid"
+    assert resp.json()["error"]["message"] == "task state invalid"
+
+
+@pytest.mark.asyncio
+async def test_revise_conflict_returns_409_desensitized(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+
+    async def conflict(command):
+        raise TaskConflictError("secret version mismatch detail")
+    registry.resolve_proposal = conflict
+
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "redo"})
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_conflict"
+    assert resp.json()["error"]["message"] == "task conflict"
+    assert "secret" not in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_revise_service_validation_returns_422_desensitized(
+    client, task_service, registry,
+):
+    task = await _waiting_task(task_service, registry)
+
+    async def boom(command):
+        raise TaskValidationError("service-side validation: sensitive detail")
+    registry.resolve_proposal = boom
+
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "redo"})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    assert "sensitive" not in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_revise_unknown_exception_returns_500_desensitized(
+    client, task_service, registry,
+):
+    task = await _waiting_task(task_service, registry)
+
+    async def boom(command):
+        raise Exception("sqlite3.OperationalError: sensitive internal /tmp/secret.db")
+    registry.resolve_proposal = boom
+
+    resp = client.post(f"/chat/tasks/{task.id}/revise", json={"note": "redo"})
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "task_internal_error"
+    assert resp.json()["error"]["message"] == "internal task error"
+    assert "sensitive" not in resp.json()["error"]["message"]
+    assert "sqlite3" not in resp.json()["error"]["message"]
+    assert "/tmp/" not in resp.json()["error"]["message"]
+
+
+# --- approve/reject regression: extra field, conflict, unknown exception ---
+
+
+@pytest.mark.asyncio
+async def test_approve_extra_field_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(
+        f"/chat/tasks/{task.id}/approve",
+        json={"note": "ok", "extra": "field"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_approve_body_non_object_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/approve", json="text")
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+
+
+@pytest.mark.asyncio
+async def test_approve_conflict_returns_409_desensitized(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+
+    async def conflict(command):
+        raise TaskConflictError("secret version mismatch detail")
+    registry.resolve_proposal = conflict
+
+    resp = client.post(f"/chat/tasks/{task.id}/approve", json={"note": "ok"})
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_conflict"
+    assert resp.json()["error"]["message"] == "task conflict"
+    assert "secret" not in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_approve_service_validation_returns_422_desensitized(
+    client, task_service, registry,
+):
+    task = await _waiting_task(task_service, registry)
+
+    async def boom(command):
+        raise TaskValidationError("service-side validation: sensitive detail")
+    registry.resolve_proposal = boom
+
+    resp = client.post(f"/chat/tasks/{task.id}/approve", json={"note": "ok"})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    assert "sensitive" not in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_approve_unknown_exception_returns_500_desensitized(
+    client, task_service, registry,
+):
+    task = await _waiting_task(task_service, registry)
+
+    async def boom(command):
+        raise Exception("sqlite3.OperationalError: sensitive internal /tmp/secret.db")
+    registry.resolve_proposal = boom
+
+    resp = client.post(f"/chat/tasks/{task.id}/approve", json={"note": "ok"})
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "task_internal_error"
+    assert resp.json()["error"]["message"] == "internal task error"
+    assert "sensitive" not in resp.json()["error"]["message"]
+    assert "sqlite3" not in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_reject_extra_field_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    before = len(await registry.list_events(task.id))
+    resp = client.post(
+        f"/chat/tasks/{task.id}/reject",
+        json={"note": "no", "extra": "field"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+    assert resp.json()["error"]["message"] == "invalid task request"
+    after = len(await registry.list_events(task.id))
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_reject_body_non_object_returns_422(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+    resp = client.post(f"/chat/tasks/{task.id}/reject", json="text")
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "task_invalid"
+
+
+@pytest.mark.asyncio
+async def test_reject_conflict_returns_409_desensitized(client, task_service, registry):
+    task = await _waiting_task(task_service, registry)
+
+    async def conflict(command):
+        raise TaskConflictError("secret version mismatch detail")
+    registry.resolve_proposal = conflict
+
+    resp = client.post(f"/chat/tasks/{task.id}/reject", json={"note": "no"})
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_conflict"
+    assert resp.json()["error"]["message"] == "task conflict"
+    assert "secret" not in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_reject_unknown_exception_returns_500_desensitized(
+    client, task_service, registry,
+):
+    task = await _waiting_task(task_service, registry)
+
+    async def boom(command):
+        raise Exception("sqlite3.OperationalError: sensitive internal /tmp/secret.db")
+    registry.resolve_proposal = boom
+
+    resp = client.post(f"/chat/tasks/{task.id}/reject", json={"note": "no"})
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "task_internal_error"
+    assert resp.json()["error"]["message"] == "internal task error"
+    assert "sensitive" not in resp.json()["error"]["message"]
+    assert "sqlite3" not in resp.json()["error"]["message"]
 
 
 @pytest.mark.asyncio

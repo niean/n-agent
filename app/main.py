@@ -50,7 +50,11 @@ from app.application.task_agent_executor import TaskAgentExecutor
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
 from app.application.task_service import TaskService
-from app.application.task_tools import task_tool_definitions, user_task_tool_definitions
+from app.application.task_tools import (
+    task_tool_definitions,
+    user_task_approval_tool_definitions,
+    user_task_tool_definitions,
+)
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
 from app.application.usage_service import UsageService
 from app.application.vision_tool_executor import VisionAnalyzeToolExecutor
@@ -906,32 +910,33 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     routes["schedule_query"] = schedule_management_executor
     tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
 
-    # Task subsystem wiring (T18). Built after schedule wiring because it
+    # Task subsystem wiring (T18 + T8). Built after schedule wiring because it
     # reuses chat_service + feishu_client + memory_store + tool_service.
-    # Schema/migration failure is fail-soft: task_registry stays None, all
-    # task services stay None, lifespan skips dispatcher start, and
-    # health_snapshot reports the error (spec: 迁移失败写 health unhealthy
-    # 且 dispatcher 不启动).
-    task_schema_error: str = ""
-    task_registry: SQLiteTaskRegistry | None = None
-    try:
-        task_registry = SQLiteTaskRegistry(str(settings.sqlite_path))
-    except Exception as exc:
-        task_schema_error = str(exc)
-        logger.warning("task schema init failed: %s", exc)
-
+    # Spec (T8): task_enabled=true -> initialize subsystem; init exceptions
+    # propagate (fail-fast, NOT fail-soft). task_enabled=false -> skip entire
+    # subsystem (task_service/task_run_service/task_runner stay None, no
+    # user_task tools registered, lifespan does not start dispatcher).
     task_policy = TaskPolicy()
-    # TaskRunner is always constructed (it is the dispatcher); lifespan will
-    # only start it when task_enabled AND task_run_service is bound.
-    task_runner = TaskRunner(
-        interval_seconds=settings.task_dispatch_interval_seconds,
-        shutdown_grace_seconds=settings.task_shutdown_grace_seconds,
-    )
+    task_registry: SQLiteTaskRegistry | None = None
+    task_runner: TaskRunner | None = None
     task_agent_executor: TaskAgentExecutor | None = None
     task_outbound_delivery: TaskOutboundDelivery | None = None
     task_run_service: TaskRunService | None = None
     task_service: TaskService | None = None
-    if task_registry is not None:
+    # task_schema_error stays "" under fail-fast semantics: when task_enabled
+    # is True, init exceptions propagate and build_application_services raises;
+    # when task_enabled is False, no init is attempted. Retained as a constant
+    # so health_snapshot can keep its existing schema_error field shape.
+    task_schema_error: str = ""
+    if settings.task_enabled:
+        # SQLiteTaskRegistry performs schema init in __init__; failures
+        # propagate (spec: 初始化异常必须让启动失败，不得伪装成"子系统不可用"
+        # 静默降级).
+        task_registry = SQLiteTaskRegistry(str(settings.sqlite_path))
+        task_runner = TaskRunner(
+            interval_seconds=settings.task_dispatch_interval_seconds,
+            shutdown_grace_seconds=settings.task_shutdown_grace_seconds,
+        )
         # Resolve attachments_root to an absolute path under workspace_root
         # (spec: attachments_root 解析到允许的本地持久化根; 不以字符串前缀
         # 代替 Path.resolve()/is_relative_to()).
@@ -950,16 +955,32 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         )
         task_outbound_delivery = TaskOutboundDelivery(feishu_client, task_registry)
 
-        async def _task_lifecycle_writer(session_id: str, content: str) -> None:
+        async def _task_lifecycle_writer(
+            session_id: str, content: str, card: dict[str, Any] | None = None,
+        ) -> None:
             """向执行会话写 ui.task_lifecycle system 消息（TaskRunService/TaskService 共用）。
 
+            card 为可选结构化交互载荷，透传给 SessionService.append_task_lifecycle_message。
             会话已不存在（SessionNotFoundError）静默跳过、不复活；其它异常向上传播，
             由调用方 _write_lifecycle 的 broad except 记录 warning。
             """
             try:
-                await session_service.append_task_lifecycle_message(session_id, content)
+                await session_service.append_task_lifecycle_message(
+                    session_id, content, card,
+                )
             except SessionNotFoundError:
                 logger.debug("task lifecycle session absent: %s", session_id)
+
+        async def _task_result_writer(session_id: str, content: str) -> None:
+            """向执行会话写 ui.task_result system 消息（SUCCEEDED 最终结果，普通消息渲染）。
+
+            会话已不存在（SessionNotFoundError）静默跳过、不复活；其它异常向上传播，
+            由调用方 _write_result 的 broad except 记录 warning。
+            """
+            try:
+                await session_service.append_task_result_message(session_id, content)
+            except SessionNotFoundError:
+                logger.debug("task result session absent: %s", session_id)
 
         task_run_service = TaskRunService(
             registry=task_registry,
@@ -968,6 +989,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             policy=task_policy,
             notifier=task_outbound_delivery,
             lifecycle_writer=_task_lifecycle_writer,
+            result_writer=_task_result_writer,
             lease_seconds=settings.task_lease_seconds,
             heartbeat_timeout_seconds=settings.task_heartbeat_timeout_seconds,
             max_runtime_seconds=settings.task_max_runtime_seconds,
@@ -994,22 +1016,38 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         task_management_executor = TaskManagementToolExecutor(task_service)
         for definition in task_tool_definitions():
             routes[definition.name] = task_management_executor
-        # Wire UserTaskToolExecutor (natural-language task delegation) into
-        # routes. 仅在 task 子系统可用时注册（本块已在 if task_registry is not
-        # None: 内）；source_type=AGENT+SAFE+managed=false，realtime 可见、
-        # SAFE_ONLY 默认隐藏，worker/judge 不得 grant 这两个名字（防递归）。
-        # spec: spec-260720-chat-natural-language-task.md
+        # Wire UserTaskToolExecutor (natural-language task delegation +
+        # approval) into routes. 仅在 task 子系统启用时注册（本块已在 if
+        # settings.task_enabled: 内）；source_type=AGENT+SAFE+managed=false，
+        # realtime 可见、SAFE_ONLY 默认隐藏，worker/judge 不得 grant 这五个
+        # 名字（防递归）。spec: spec-260720-chat-natural-language-task.md,
+        # spec-260721-chat-nl-approval.md
         user_task_executor = UserTaskToolExecutor(task_service)
-        # 启动时断言两工具名未与既有 static/dynamic 定义或 route 冲突（spec）。
+        # 启动时断言五个用户侧工具名未与既有 static/dynamic 定义或 route 冲突
+        # （spec）。
         _existing_tool_names = {d.name for d in tool_service.list_definitions()}
-        for _user_task_name in ("create_task", "list_tasks"):
+        for _user_task_name in (
+            "create_task",
+            "list_tasks",
+            "approve_task",
+            "reject_task",
+            "revise_task",
+        ):
             if _user_task_name in routes or _user_task_name in _existing_tool_names:
                 raise RuntimeError(
                     f"duplicate tool name on startup: {_user_task_name}"
                 )
         routes["create_task"] = user_task_executor
         routes["list_tasks"] = user_task_executor
-        tool_service.set_dynamic_definitions("user_task", user_task_tool_definitions())
+        routes["approve_task"] = user_task_executor
+        routes["reject_task"] = user_task_executor
+        routes["revise_task"] = user_task_executor
+        # 五个用户侧工具合并到唯一 source key `user_task`，不传
+        # override_static_names（spec）。
+        tool_service.set_dynamic_definitions(
+            "user_task",
+            user_task_tool_definitions() + user_task_approval_tool_definitions(),
+        )
         tool_service.executor = CompositeToolExecutor(
             routes, fallback=McpToolExecutor(mcp_service)
         )

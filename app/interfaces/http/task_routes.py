@@ -77,27 +77,56 @@ _PATCH_ALLOWED_FIELDS = frozenset({
 _NOTE_MAX = 2000
 
 
-def _extract_note(payload: Any) -> tuple[str | None, str | None]:
-    """Extract and validate the optional approval note from request body.
+# Fixed public error messages (never leak task id, str(exc), or db details).
+_MSG_TASK_NOT_FOUND = "task not found"
+_MSG_TASK_STATE_INVALID = "task state invalid"
+_MSG_TASK_CONFLICT = "task conflict"
+_MSG_TASK_INVALID = "invalid task request"
+_MSG_TASK_INTERNAL = "internal task error"
 
+
+def _extract_note(
+    payload: Any, required: bool = False,
+) -> tuple[str | None, str | None]:
+    """Extract and validate the approval note from request body.
+
+    Shared by approve/reject (required=False) and revise (required=True).
     Returns ``(note, error)``: on success error is None and note is None when
-    absent/empty; on failure note is None and error is a human message.
-    Never calls str() on non-string input (rejects list/dict).
+    absent/empty (only allowed for required=False); on failure note is None
+    and error is the fixed public message ``invalid task request``.
+
+    Validation order:
+      1. payload must be a JSON object (dict) or None
+      2. only the ``note`` field is allowed (extra fields rejected)
+      3. note must be a string (if present)
+      4. note is trimmed; empty note is None (or error if required)
+      5. note length <= _NOTE_MAX code points (after trim)
+
+    Never calls str() on non-string input (rejects list/dict/number).
     """
     if payload is None:
+        if required:
+            return None, _MSG_TASK_INVALID
         return None, None
     if not isinstance(payload, dict):
-        return None, "body must be a JSON object"
+        return None, _MSG_TASK_INVALID
+    # Only ``note`` is allowed; reject any extra field.
+    if any(key != "note" for key in payload):
+        return None, _MSG_TASK_INVALID
     raw = payload.get("note")
     if raw is None:
+        if required:
+            return None, _MSG_TASK_INVALID
         return None, None
     if not isinstance(raw, str):
-        return None, "note must be a string"
+        return None, _MSG_TASK_INVALID
     note = raw.strip()
     if not note:
+        if required:
+            return None, _MSG_TASK_INVALID
         return None, None
     if len(note) > _NOTE_MAX:
-        return None, f"note too long (>{_NOTE_MAX} chars)"
+        return None, _MSG_TASK_INVALID
     return note, None
 
 
@@ -522,31 +551,57 @@ def register_task_routes(
 
     @router.post("/chat/tasks/{task_id}/approve")
     async def approve_change(task_id: str, payload: Any = Body(default=None)):
-        note, err = _extract_note(payload)
+        note, err = _extract_note(payload, required=False)
         if err is not None:
             return _task_error_response("task_invalid", err, 422)
         try:
             return await task_service.approve_change(task_id, note=note)
         except TaskNotFoundError:
-            return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
-        except TaskStateError as exc:
-            return _task_error_response("task_state_invalid", str(exc), 409)
-        except Exception as exc:
-            return _task_error_response("task_internal_error", str(exc), 500)
+            return _task_error_response("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+        except TaskValidationError:
+            return _task_error_response("task_invalid", _MSG_TASK_INVALID, 422)
+        except TaskStateError:
+            return _task_error_response("task_state_invalid", _MSG_TASK_STATE_INVALID, 409)
+        except TaskConflictError:
+            return _task_error_response("task_conflict", _MSG_TASK_CONFLICT, 409)
+        except Exception:
+            return _task_error_response("task_internal_error", _MSG_TASK_INTERNAL, 500)
 
     @router.post("/chat/tasks/{task_id}/reject")
     async def reject_change(task_id: str, payload: Any = Body(default=None)):
-        note, err = _extract_note(payload)
+        note, err = _extract_note(payload, required=False)
         if err is not None:
             return _task_error_response("task_invalid", err, 422)
         try:
             return await task_service.reject_change(task_id, note=note)
         except TaskNotFoundError:
-            return _task_error_response("task_not_found", f"task not found: {task_id}", 404)
-        except TaskStateError as exc:
-            return _task_error_response("task_state_invalid", str(exc), 409)
-        except Exception as exc:
-            return _task_error_response("task_internal_error", str(exc), 500)
+            return _task_error_response("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+        except TaskValidationError:
+            return _task_error_response("task_invalid", _MSG_TASK_INVALID, 422)
+        except TaskStateError:
+            return _task_error_response("task_state_invalid", _MSG_TASK_STATE_INVALID, 409)
+        except TaskConflictError:
+            return _task_error_response("task_conflict", _MSG_TASK_CONFLICT, 409)
+        except Exception:
+            return _task_error_response("task_internal_error", _MSG_TASK_INTERNAL, 500)
+
+    @router.post("/chat/tasks/{task_id}/revise")
+    async def revise_change(task_id: str, payload: Any = Body(default=None)):
+        note, err = _extract_note(payload, required=True)
+        if err is not None:
+            return _task_error_response("task_invalid", err, 422)
+        try:
+            return await task_service.revise_change(task_id, note=note)
+        except TaskNotFoundError:
+            return _task_error_response("task_not_found", _MSG_TASK_NOT_FOUND, 404)
+        except TaskValidationError:
+            return _task_error_response("task_invalid", _MSG_TASK_INVALID, 422)
+        except TaskStateError:
+            return _task_error_response("task_state_invalid", _MSG_TASK_STATE_INVALID, 409)
+        except TaskConflictError:
+            return _task_error_response("task_conflict", _MSG_TASK_CONFLICT, 409)
+        except Exception:
+            return _task_error_response("task_internal_error", _MSG_TASK_INTERNAL, 500)
 
     @router.post("/chat/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str):

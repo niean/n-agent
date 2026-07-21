@@ -305,6 +305,7 @@
       reject: (id, note) => fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/reject', note ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: note }) } : { method: 'POST' }),
       cancel: (id) => fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/cancel', { method: 'POST' }),
       retry: (id) => fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/retry', { method: 'POST' }),
+      revise: (id, note) => fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/revise', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: note }) }),
       dispatch: () => fetchJson('/chat/tasks/dispatch', { method: 'POST' }),
       inspect: () => fetchJson('/chat/tasks/inspect'),
       runs: (runId) => fetchJson('/chat/tasks/runs/' + encodeURIComponent(runId)),

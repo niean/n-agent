@@ -9,6 +9,14 @@
   let initialized = false;
   let externalMemoryProviders = [];
   let memoryPopoverOpen = false;
+  // 调试设置弹框开关；工具调试/任务状态显隐按会话独立生效（每会话一份，互不影响）。
+  // 持久化到 localStorage（按 sessionId 分桶）；新建会话默认 任务状态选中/工具调试未选中。
+  const DEBUG_SETTINGS_KEY = 'nagent.chat.debug';
+  const DEBUG_DEFAULTS = { task: true, tool: false };
+  // sessionId -> {task, tool}；尚未创建会话时用 draft 兜底（首轮发送后转入对应会话）
+  let sessionDebugSettings = {};
+  let draftDebugSettings = null;
+  let settingsPopoverOpen = false;
   // 存储每个会话的外部记忆配置
   let sessionExternalMemoryConfig = {};
   // 尚未创建会话时，允许用户先勾选首轮要使用的外部记忆。
@@ -35,6 +43,13 @@
   let autoRefreshInFlight = null; // {generation, seq}
   let autoRefreshSeq = 0;
   let renderedMessageVersion = null; // {count, lastId} | null；空会话用 {count:0, lastId:null}
+  // 已渲染消息节点按稳定 key 缓存。轮询只协调变化的节点，避免重建旧 <details>
+  // 而丢失用户手动展开的工具调用、任务状态等界面状态。
+  let renderedMessageNodes = new Map();
+  let renderedMessageFingerprints = new Map();
+  // Render token: monotonic counter to prevent stale async renders from overwriting newer content.
+  // Incremented at the start of each renderSessionMessages; checked after await to abort stale renders.
+  let renderToken = 0;
 
   function messageVersionOf(detail) {
     const msgs = Array.isArray(detail && detail.messages) ? detail.messages : null;
@@ -91,6 +106,7 @@
       if (versionsEqual(version, renderedMessageVersion)) return; // 无变化跳过
       await applySessionDetail(detail, {
         preserveScroll: true, skipToolCalls: true, skipSessionList: true, applyExternalMemoryState: false,
+        partialMessages: true,
       });
       if (sessionId === currentSessionId && gen === autoRefreshGeneration && seq === autoRefreshSeq) {
         renderedMessageVersion = version;
@@ -296,7 +312,430 @@
     if (messages) messages.scrollTop = messages.scrollHeight;
   }
 
-  function createMessageElement(message) {
+  // 任务状态中等待用户交互的状态文案（如"等待批准"），这类消息默认展开；其余任务状态默认折叠
+  const TASK_LIFECYCLE_AWAITING_LABELS = ['等待批准'];
+
+  // === Task card schema (T6/T7) ===
+  // Canonical card payload from lifecycle_writer (_lifecycle_card in task_run_service):
+  //   { schema_version, kind, task_id, status, title, summary, available_actions }
+  // Only ui.task_lifecycle messages with a valid card render as inline interactive cards;
+  // invalid/no-card messages fall back to the existing <details><pre> rendering.
+  const TASK_CARD_SCHEMA_VERSION = 1;
+  const TASK_CARD_KIND = 'task_lifecycle';
+  const TASK_CARD_STATUSES = new Set(['waiting_approval', 'failed', 'expired']);
+  // interaction_type is only meaningful for waiting_approval cards; it selects
+  // the button group (approval -> approve/reject, intent_request -> revise/cancel).
+  const TASK_CARD_INTERACTION_TYPES = new Set(['approval', 'intent_request']);
+  const TASK_ACTION_LABELS = {
+    approve: '批准',
+    reject: '拒绝',
+    revise: '补充并继续',
+    cancel: '取消',
+    retry: '重试',
+  };
+  // Explicit handler allowlist: action string -> fixed api.task function.
+  // Prevents dynamic api.task[action] indexing that could call arbitrary API methods.
+  const TASK_CARD_ACTION_HANDLERS = {
+    approve: (apiRef, id) => apiRef.task.approve(id),
+    reject: (apiRef, id) => apiRef.task.reject(id),
+    revise: (apiRef, id, note) => apiRef.task.revise(id, note),
+    cancel: (apiRef, id) => apiRef.task.cancel(id),
+    retry: (apiRef, id) => apiRef.task.retry(id),
+  };
+  const TASK_CARD_ALLOWED_ACTIONS = new Set(Object.keys(TASK_CARD_ACTION_HANDLERS));
+
+  // validateTaskCard(card) -> canonical card object | null.
+  // Returns a NEW object (does not mutate server payload). Only allowlist actions
+  // survive, preserving their original order; unknown actions are dropped.
+  // Returns null if the card is missing required fields, has wrong types,
+  // unknown schema_version/kind/status, blank task_id, or no valid actions.
+  // interaction_type is an optional field meaningful only for waiting_approval:
+  //   - present -> must be 'approval' or 'intent_request' (else null)
+  //   - absent  -> defaults to 'approval'
+  //   - non-waiting_approval cards never carry interaction_type in canonical
+  //     (failed/expired have no interaction_type on the wire)
+  function validateTaskCard(card) {
+    if (!card || typeof card !== 'object' || Array.isArray(card)) return null;
+    if (card.schema_version !== TASK_CARD_SCHEMA_VERSION) return null;
+    if (card.kind !== TASK_CARD_KIND) return null;
+    if (!TASK_CARD_STATUSES.has(card.status)) return null;
+    const taskId = typeof card.task_id === 'string' ? card.task_id.trim() : '';
+    if (!taskId) return null;
+    if (typeof card.title !== 'string') return null;
+    if (typeof card.summary !== 'string') return null;
+    if (!Array.isArray(card.available_actions)) return null;
+    let interactionType = undefined;
+    if (card.status === 'waiting_approval') {
+      const raw = card.interaction_type;
+      if (raw === undefined || raw === null) {
+        interactionType = 'approval';
+      } else {
+        if (typeof raw !== 'string' || !TASK_CARD_INTERACTION_TYPES.has(raw)) return null;
+        interactionType = raw;
+      }
+    }
+    const actions = [];
+    for (const a of card.available_actions) {
+      if (typeof a === 'string' && TASK_CARD_ALLOWED_ACTIONS.has(a) && actions.indexOf(a) === -1) {
+        actions.push(a);
+      }
+    }
+    if (actions.length === 0) return null;
+    const canonical = {
+      schema_version: TASK_CARD_SCHEMA_VERSION,
+      kind: TASK_CARD_KIND,
+      task_id: taskId,
+      status: card.status,
+      title: card.title,
+      summary: card.summary,
+      available_actions: actions,
+    };
+    if (interactionType !== undefined) canonical.interaction_type = interactionType;
+    return canonical;
+  }
+
+  // resolveTaskCardStates(messages) -> Map<task_id, {kind, status?}>.
+  // Collects unique task_ids from valid cards, issues one GET per task (dedup),
+  // and returns per-task authoritative state. Each card later compares its own
+  // card.status against the entry to determine active/stale/unavailable.
+  //   { kind: 'resolved', status }  GET succeeded, status is authoritative
+  //   { kind: 'stale' }              task_not_found / task_state_invalid / task_conflict
+  //   { kind: 'unavailable' }        network error / unknown code
+  async function resolveTaskCardStates(messages) {
+    const taskIds = new Set();
+    for (const msg of messages) {
+      const card = validateTaskCard(msg && msg.card);
+      if (card) taskIds.add(card.task_id);
+    }
+    if (taskIds.size === 0) return new Map();
+    const entries = await Promise.all(Array.from(taskIds).map(async (id) => {
+      try {
+        const detail = await api.task.get(id);
+        // GET /chat/tasks/{id} returns {task: {...}, comments, events, ...};
+        // authoritative status is on detail.task.status. Support flat {status}
+        // fallback for harness stubs / legacy shapes.
+        const taskStatus = (detail && detail.task && detail.task.status) || (detail && detail.status);
+        return [id, { kind: 'resolved', status: taskStatus }];
+      } catch (e) {
+        const code = (e && e.message) ? String(e.message) : '';
+        if (code === 'task_not_found' || code === 'task_state_invalid' || code === 'task_conflict') {
+          return [id, { kind: 'stale' }];
+        }
+        return [id, { kind: 'unavailable' }];
+      }
+    }));
+    return new Map(entries);
+  }
+
+  // Decision receipts written by TaskService for approve/reject/revise/cancel
+  // (content: "已批准: {task_id} - {title}"; revise appends " | 修订指示: ...").
+  // resolveTaskDecisions(messages) -> Map<task_id, decision label>.
+  // Scans ui.task_lifecycle text receipts (no card) so a stale waiting_approval
+  // card can surface the recorded approval/intent-supplement (revise) decision
+  // as a light-gray hint. This covers the primary "任务状态已变更" trigger --
+  // fresh load/switch of a session whose task already transitioned -- where no
+  // in-memory decision is available but the receipt is already in the session.
+  // Card-bearing messages are skipped (they are cards, not receipts). Later
+  // receipts overwrite earlier ones, so the latest decision per task wins.
+  const TASK_DECISION_PREFIXES = ['已批准', '已拒绝', '已修订', '已取消'];
+  function resolveTaskDecisions(messages) {
+    const decisions = new Map();
+    for (const msg of messages) {
+      if (!msg || msg.role !== 'system' || msg.name !== 'ui.task_lifecycle') continue;
+      if (validateTaskCard(msg.card)) continue;
+      const content = typeof msg.content === 'string' ? msg.content : '';
+      for (const decision of TASK_DECISION_PREFIXES) {
+        const prefix = decision + ': ';
+        if (content.indexOf(prefix) === 0) {
+          const rest = content.slice(prefix.length);
+          const dash = rest.indexOf(' - ');
+          const taskId = (dash === -1 ? rest : rest.slice(0, dash)).trim();
+          if (taskId) decisions.set(taskId, decision);
+          break;
+        }
+      }
+    }
+    return decisions;
+  }
+
+  // computeCardState(card, entry) -> 'active' | 'stale' | 'unavailable'.
+  // Per-card comparison: card.status vs authoritative entry status.
+  function computeCardState(card, entry) {
+    if (!entry) return 'unavailable';
+    if (entry.kind === 'unavailable') return 'unavailable';
+    if (entry.kind === 'stale') return 'stale';
+    if (entry.kind === 'resolved') return entry.status === card.status ? 'active' : 'stale';
+    return 'unavailable';
+  }
+
+  function isTaskLifecycleAwaitingInteraction(message) {
+    // Prefer canonical card status (three interaction states); no-card messages
+    // fall back to text matching for backward compatibility with history messages.
+    const card = validateTaskCard(message && message.card);
+    if (card) return TASK_CARD_STATUSES.has(card.status);
+    const content = message && message.content;
+    const text = typeof content === 'string' ? content : String(content || '');
+    return TASK_LIFECYCLE_AWAITING_LABELS.some((label) => text.indexOf(label) !== -1);
+  }
+
+  // 去掉任务消息抬头 [任务指令] / [任务状态]：新增消息已无抬头，历史消息按行剥离行首抬头
+  // （合并块中每行各带一个抬头，逐行剥离避免误伤正文中的同类字符串）。
+  function stripTaskMessageHeader(text) {
+    if (typeof text !== 'string') return text;
+    return text.split('\n').map((line) =>
+      line.replace(/^\[任务指令\]\s?/, '').replace(/^\[任务状态\]\s?/, '')
+    ).join('\n');
+  }
+
+  // 非真人进程来源的 user 消息渲染为左对齐状态卡片（灰底卡片，区别于真人 user 蓝底右对齐气泡）。
+  // work task / judge task 前缀的消息样式打平 ui.task_lifecycle 任务状态卡片（className `msg system`）：
+  //   单独时 summary = `<前缀>: <content>`（work task -> 查询状态、judge task -> 判断结束），pre 放原始 content，
+  //   details 默认 open=false；与 ui.task_command/ui.task_lifecycle 折叠卡片结构一致。
+  // 相邻的 work task / judge task 与 ui.task_lifecycle（无 card）合并为一个 details 卡片：
+  //   summary 固定 = `任务状态`，pre 多行拼接（lifecycle 行用原文，work/judge 行带前缀），open=false。
+  // 其余进程消息（schedule/curator 等）原样渲染为非折叠 msg--process-card 左对齐卡片。
+  const PROCESS_SOURCES = new Set(['task', 'schedule', 'curator']);
+  const PROCESS_CONTENT_PREFIXES = [
+    { match: 'work task ', label: '查询状态' },
+    { match: 'judge task ', label: '判断结束' },
+  ];
+
+  // work task / judge task 前缀的消息：
+  // - 单独卡片 summary = `<label>: <content>`（例如 `查询状态: work task t_xxx`）
+  // - 合并卡片行 = `<label>: <content>`（与单独 summary 一致）
+  // 仅 string content 且行首命中任一 PROCESS_CONTENT_PREFIXES 时返回对应 label；否则返回 null。
+  function foldableProcessLabel(content) {
+    if (typeof content !== 'string') return null;
+    for (const rule of PROCESS_CONTENT_PREFIXES) {
+      if (content.startsWith(rule.match)) return rule.label;
+    }
+    return null;
+  }
+
+  // 单独 work task / judge task 卡片 summary = `<label>: <content>`
+  function foldableProcessSummary(content) {
+    const label = foldableProcessLabel(content);
+    return label !== null ? label + ': ' + content : null;
+  }
+
+  // work task / judge task 前缀的消息渲染为折叠卡片（进程内部消息不占 Chat 空间），
+  // 仅 string content 且行首命中任一 PROCESS_CONTENT_PREFIXES 时为 true；多模态/空串等为 false。
+  function isFoldableProcessContent(content) {
+    return foldableProcessLabel(content) !== null;
+  }
+
+  // 合并卡片行生成：
+  // - work task / judge task（role=user, source=task, 前缀命中）: `<label>: <content>`（带前缀）
+  // - ui.task_lifecycle 无 card: 原文（[任务状态] 抬头由 stripTaskMessageHeader 在渲染时剥离）
+  function taskStatusLineForMessage(msg) {
+    if (msg && msg.role === 'user' && PROCESS_SOURCES.has(msg.source) && typeof msg.content === 'string') {
+      const label = foldableProcessLabel(msg.content);
+      if (label !== null) return label + ': ' + msg.content;
+    }
+    return String(msg && msg.content !== undefined ? msg.content : '');
+  }
+
+  // === T7: Task card builder + action handler ===
+  // buildTaskCardElement(message, card, state, decision) -> DOM element.
+  // state is 'active' | 'stale' | 'unavailable'. 'settled' is a post-action
+  // client-side state managed by handleTaskCardAction (removes actions, updates feedback).
+  // `decision` is an optional recorded decision label (已批准/已拒绝/已修订/已取消)
+  // scanned from session receipts by resolveTaskDecisions; when present on a
+  // stale card it is shown as a light-gray outcome hint on the last line,
+  // replacing the generic "任务状态已变更" prompt.
+  // All dynamic values are written via textContent (no innerHTML). Buttons are
+  // native <button type="button">. The feedback node is always created with
+  // aria-live="polite" so screen readers announce state changes.
+  function buildTaskCardElement(message, card, state, decision) {
+    const el = document.createElement('div');
+    el.className = 'msg system task-card';
+    if (state === 'stale') el.classList.add('task-card__stale');
+    if (state === 'unavailable') el.classList.add('task-card__unavailable');
+    el.dataset.name = message.name || 'ui.task_lifecycle';
+    el.dataset.debugKind = 'task';
+
+    const details = document.createElement('details');
+    details.open = true;  // three interaction states default open
+
+    const summary = document.createElement('summary');
+    summary.textContent = card.status === 'waiting_approval' ? '任务待审批'
+      : card.status === 'failed' ? '任务已失败'
+      : card.status === 'expired' ? '任务已过期'
+      : '任务状态';
+
+    const body = document.createElement('div');
+    body.className = 'task-card__body';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'task-card__title';
+    titleEl.textContent = card.title;
+    body.appendChild(titleEl);
+
+    const meta = document.createElement('div');
+    meta.className = 'task-card__meta';
+    meta.textContent = 'ID: ' + card.task_id + ' · 状态: ' + card.status;
+    body.appendChild(meta);
+
+    if (card.summary) {
+      const sumEl = document.createElement('div');
+      sumEl.className = 'task-card__summary';
+      sumEl.textContent = card.summary;
+      body.appendChild(sumEl);
+    }
+
+    const feedback = document.createElement('div');
+    feedback.className = 'task-card__feedback';
+    feedback.setAttribute('aria-live', 'polite');
+
+    // Only active waiting-approval cards are actionable in the conversation.
+    // Failed and expired cards are terminal status records: keep their details
+    // visible, but never render retry/cancel (or any future server-supplied)
+    // action buttons. stale/unavailable cards also render body + feedback only.
+    if (state === 'active' && card.status === 'waiting_approval' && card.available_actions.length > 0) {
+      const actions = document.createElement('div');
+      actions.className = 'task-card__actions';
+      const inflight = { value: false };
+      const buttonRefs = [];
+      let textareaRef = null;
+
+      for (const action of card.available_actions) {
+        if (action === 'revise') {
+          const label = document.createElement('label');
+          label.className = 'task-card__label';
+          label.textContent = '补充说明';
+          const ta = document.createElement('textarea');
+          ta.className = 'task-card__textarea';
+          ta.id = 'task-card-revise-' + card.task_id;
+          label.htmlFor = ta.id;
+          actions.append(label, ta);
+          textareaRef = ta;
+        }
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'task-card__btn';
+        btn.dataset.action = action;
+        btn.dataset.taskId = card.task_id;
+        btn.textContent = TASK_ACTION_LABELS[action] || action;
+        // Explicit async handler consumption: .catch prevents unhandledRejection.
+        btn.addEventListener('click', () => {
+          handleTaskCardAction({
+            card, action, actions, feedback, inflight,
+            textarea: textareaRef, buttons: buttonRefs,
+          }).catch(() => {});
+        });
+        actions.appendChild(btn);
+        buttonRefs.push(btn);
+      }
+      body.appendChild(actions);
+    } else {
+      if (state === 'stale') {
+        // Surface the recorded approval/intent-supplement (revise) decision as
+        // a light-gray hint when a receipt is present in the session; otherwise
+        // fall back to a concise status-changed notice. Drops the old
+        // "任务状态已变更，操作不可用" prompt: "操作不可用" is already implied by
+        // the absence of action buttons, and a known decision is informational
+        // rather than a warning. Scoped to waiting_approval cards -- the receipts
+        // (已批准/已拒绝/已修订/已取消) are decisions on a pending-approval task,
+        // so showing one on a failed/expired historical card would be misleading.
+        feedback.textContent = (decision && card.status === 'waiting_approval') ? decision : '任务状态已变更';
+      } else if (state === 'unavailable') {
+        feedback.textContent = '无法获取任务状态，请稍后重试';
+      }
+    }
+
+    body.appendChild(feedback);
+    details.append(summary, body);
+    el.appendChild(details);
+    return el;
+  }
+
+  // handleTaskCardAction(ctx) -> Promise<void>.
+  // State machine: success -> settled (remove actions, show action result, await refresh);
+  // task_state_invalid/task_conflict/task_not_found -> stale (remove actions, refresh);
+  // task_invalid/network/unknown -> show error, restore controls (still active).
+  // revise: trim + Array.from(note).length code-point validation (1..2000) before any API call.
+  // In-flight flag prevents duplicate submissions. finally only restores controls if
+  // the actions container is still attached (i.e., card is still active/retryable).
+  async function handleTaskCardAction(ctx) {
+    const { card, action, actions, feedback, inflight, textarea, buttons } = ctx;
+    if (inflight.value) return;  // dedup: second click during in-flight is a no-op
+
+    // revise: validate note (Unicode code points, not UTF-16 units) before API call.
+    // Array.from splits into code points; textarea.maxLength counts UTF-16 units.
+    if (action === 'revise') {
+      const raw = (textarea && typeof textarea.value === 'string') ? textarea.value : '';
+      const note = raw.trim();
+      const codePoints = Array.from(note).length;
+      if (codePoints < 1) {
+        feedback.textContent = '补充内容不能为空';
+        return;
+      }
+      if (codePoints > 2000) {
+        feedback.textContent = '补充内容过长（最多 2000 个字符）';
+        return;
+      }
+    }
+
+    inflight.value = true;
+    buttons.forEach((b) => { b.disabled = true; });
+
+    try {
+      const handler = TASK_CARD_ACTION_HANDLERS[action];
+      const note = (action === 'revise')
+        ? (textarea.value || '').trim()
+        : undefined;
+      await handler(api, card.task_id, note);
+
+      const successText = action === 'approve' ? '已批准'
+        : action === 'reject' ? '已拒绝'
+        : action === 'revise' ? '补充: ' + note
+        : '操作已提交';
+      // Success -> settled: remove actions, show the concrete result, await refresh.
+      // Direct getSessionDetail + applySessionDetail (not refreshCurrentSession)
+      // so refresh failures are catchable and can update the feedback text.
+      if (actions.parentNode) actions.parentNode.removeChild(actions);
+      feedback.textContent = successText;
+      if (currentSessionId) {
+        try {
+          const detail = await api.getSessionDetail(currentSessionId);
+          await applySessionDetail(detail, {
+            preserveScroll: false, skipToolCalls: false, skipSessionList: false, applyExternalMemoryState: true,
+            partialMessages: true,
+          });
+        } catch (refreshErr) {
+          feedback.textContent = successText + '，刷新失败';
+        }
+      }
+    } catch (e) {
+      const code = (e && e.message) ? String(e.message) : '';
+      if (code === 'task_state_invalid' || code === 'task_conflict' || code === 'task_not_found') {
+        // stale: remove actions, show error, attempt refresh.
+        if (actions.parentNode) actions.parentNode.removeChild(actions);
+        feedback.textContent = describeTaskError(e);
+        if (currentSessionId) {
+          try {
+          const detail = await api.getSessionDetail(currentSessionId);
+          await applySessionDetail(detail, {
+            preserveScroll: false, skipToolCalls: false, skipSessionList: false, applyExternalMemoryState: true,
+            partialMessages: true,
+            });
+          } catch (_) { /* best-effort; stale feedback already shown */ }
+        }
+      } else {
+        // task_invalid / network / unknown: show stable error mapping, controls restored.
+        feedback.textContent = describeTaskError(e);
+      }
+    } finally {
+      inflight.value = false;
+      // Only restore controls if actions container is still attached (still active/retryable).
+      // If settled/stale removed actions, do not re-enable.
+      if (actions.parentNode) {
+        buttons.forEach((b) => { b.disabled = false; });
+      }
+    }
+  }
+
+  function createMessageElement(message, cardStates, taskDecisions) {
     if (message.is_summary) {
       const el = document.createElement('div');
       el.className = 'msg msg--summary';
@@ -312,35 +751,108 @@
       return el;
     }
     const el = document.createElement('div');
-    el.className = `msg ${message.role || 'assistant'}`;
+    // 任务最终结果（ui.task_result）以普通消息渲染（区别于 ui.task_lifecycle/
+    // ui.task_command 状态卡片），样式对齐 assistant 气泡、支持 Hover 时间与 markdown 子集。
+    const isTaskResult = message.role === 'system' && message.name === 'ui.task_result';
+    const isProcessUser = message.role === 'user' && PROCESS_SOURCES.has(message.source);
+    // 多消息合并卡片（groupTaskMessages 产出的 _mergedTaskStatus=true）：
+    // summary 固定=任务状态，pre 多行拼接，open=false，className `msg system`（与 ui.task_lifecycle 一致）。
+    const isMergedTaskStatus = !!message._mergedTaskStatus;
+    // work task / judge task 单独卡片（1-message group，无 _mergedTaskStatus）：
+    // summary = 前缀+content，pre 放原始 content，open=false，className `msg system`。
+    const isFoldedProcess = isProcessUser && isFoldableProcessContent(message.content) && !isMergedTaskStatus;
+    // 进程来源 user 消息：左对齐状态卡片（灰底卡片样式，区别于真人 user 蓝底右对齐气泡）。
+    // work task / judge task / 合并卡片 样式打平 ui.task_lifecycle 任务状态卡片（msg system）；
+    // 其余进程消息（schedule/curator 等）沿用 msg--process-card 非折叠样式。
+    el.className = isTaskResult ? 'msg assistant'
+      : ((isMergedTaskStatus || isFoldedProcess) ? 'msg system'
+      : (isProcessUser ? 'msg msg--process-card' : `msg ${message.role || 'assistant'}`));
+    // 合并卡片 / work task / judge task 卡片样式打平 ui.task_lifecycle（不携带 dataset.source，与 system 消息一致）；
+    // 其余进程消息（schedule/curator）保留 dataset.source 标识来源。
+    if (isProcessUser && !isFoldedProcess && !isMergedTaskStatus) el.dataset.source = message.source;
     if (message.role === 'tool') {
       const details = document.createElement('details');
       const summary = document.createElement('summary');
       const content = document.createElement('pre');
-      summary.textContent = '工具调用调试信息';
+      summary.textContent = '工具调用';
       appendToolDebugContent(content, message.content || '');
+      details.append(summary, content);
+      el.appendChild(details);
+      el.dataset.debugKind = 'tool';
+      return el;
+    }
+    // 合并卡片（_mergedTaskStatus=true）：summary 固定=任务状态，open=false，pre=多行 content。
+    // 跨 role：first message 可能是 work task (role=user source=task) 或 lifecycle (role=system)，
+    // 统一在此分支渲染为 msg system 折叠卡片，避免进入 system/isFoldedProcess 分支误判。
+    if (isMergedTaskStatus) {
+      const details = document.createElement('details');
+      details.open = false;
+      const summary = document.createElement('summary');
+      summary.textContent = '任务状态';
+      el.dataset.name = message.name || 'ui.task_lifecycle';
+      el.dataset.debugKind = 'task';
+      const content = document.createElement('pre');
+      const rawText = typeof message.content === 'string' ? message.content : String(message.content || '');
+      content.textContent = stripTaskMessageHeader(rawText);
       details.append(summary, content);
       el.appendChild(details);
       return el;
     }
-    // system 消息：遵循消息渲染规范，按工具调用调试信息样式渲染为可折叠气泡（默认展开，
+    // system 消息：遵循消息渲染规范，按工具调用样式渲染为可折叠气泡（默认展开，
     // 保证命令结果可见、给人聊天感），textContent 安全渲染，无 innerHTML。
-    if (message.role === 'system') {
+    // ui.task_result 不走此分支（普通消息，上方 isTaskResult 已分流到 assistant 样式）。
+    if (message.role === 'system' && !isTaskResult) {
+      // Valid card with resolved state -> inline interactive card (T6/T7).
+      // cardStates is undefined when createMessageElement is called outside
+      // renderSessionMessages (e.g. appendMessage); in that case fall back to details/pre.
+      const validatedCard = validateTaskCard(message.card);
+      if (validatedCard && cardStates) {
+        const entry = cardStates.get(validatedCard.task_id);
+        const state = computeCardState(validatedCard, entry);
+        if (state) {
+          const decision = taskDecisions ? taskDecisions.get(validatedCard.task_id) : null;
+          return buildTaskCardElement(message, validatedCard, state, decision);
+        }
+      }
       const details = document.createElement('details');
-      details.open = false;  // 默认折叠（任务指令/任务状态/系统消息），点击展开
+      // 任务指令和等待用户交互的任务状态（如等待批准）默认展开；
+      // 其余 system 消息默认折叠。合并卡片 content 多行拼接，命中任一等待行即展开。
+      details.open = message.name === 'ui.task_command' || isTaskLifecycleAwaitingInteraction(message);
       const summary = document.createElement('summary');
       summary.textContent = message.name === 'ui.task_command' ? '任务指令'
         : message.name === 'ui.task_lifecycle' ? '任务状态' : '系统消息';
       el.dataset.name = message.name || '';
+      if (message.name === 'ui.task_command' || message.name === 'ui.task_lifecycle') {
+        el.dataset.debugKind = 'task';
+      }
       const content = document.createElement('pre');
-      content.textContent = typeof message.content === 'string' ? message.content : String(message.content || '');
+      const rawText = typeof message.content === 'string' ? message.content : String(message.content || '');
+      content.textContent = stripTaskMessageHeader(rawText);
       details.append(summary, content);
       el.appendChild(details);
       return el;
     }
-    // user/assistant 消息：附加 Hover 时间（飞书风格），由 CSS ::before 展示
+    // user/assistant/ui.task_result 消息：附加 Hover 时间（飞书风格），由 CSS ::before 展示
     const timeLabel = formatMessageTime(message.created_at);
     if (timeLabel) el.dataset.time = timeLabel;
+    // work task / judge task 单独卡片（1-message group）：样式打平 ui.task_lifecycle 任务状态卡片，
+    // 折叠卡片（details 默认 open=false），summary = 前缀+content（查询状态/判断结束），pre = 原始 content；
+    // 与 ui.task_command/ui.task_lifecycle 折叠卡片结构一致（details+summary+pre），
+    // textContent 安全渲染，无 innerHTML。
+    if (isFoldedProcess) {
+      const details = document.createElement('details');
+      details.open = false;
+      const summary = document.createElement('summary');
+      summary.textContent = foldableProcessSummary(message.content);
+      const pre = document.createElement('pre');
+      pre.textContent = typeof message.content === 'string' ? message.content : String(message.content || '');
+      details.append(summary, pre);
+      el.appendChild(details);
+      el.dataset.debugKind = 'task';
+      return el;
+    }
+    // 进程来源 user 消息（task/schedule/curator，非 work task/judge task 前缀）：
+    // 原样渲染为非折叠左对齐状态卡片；多模态 list content 原样处理。
     const content = message.content;
     if (Array.isArray(content)) {
       let hasText = false;
@@ -368,6 +880,14 @@
   function shouldRenderMessage(message) {
     if (message.is_summary) return true;
     if (message.role === 'tool') return true;
+    // 进程来源（task/schedule/curator）的 assistant 推理属 worker 内部思考过程，
+    // 不在 Dashboard 对话框展示：worker 在 origin Chat 会话执行（prd：任务会话
+    // 复用创建会话 ID），其推理虽落库供 goal_mode 续轮与 LLM 上下文，但对用户
+    // 不可见（与 judge 推理 persist_messages=False 不落库同理，worker 需历史故仅
+    // 前端隐藏）。worker 的工具调用结果仍按工具调试卡片独立渲染；realtime
+    // （api/dashboard/无 source）assistant 正常渲染。Regression: worker CoT
+    // "The task requires querying weather..." 泄露为普通 assistant 气泡。
+    if (message.role === 'assistant' && PROCESS_SOURCES.has(message.source)) return false;
     return hasVisibleContent(message.content);
   }
 
@@ -399,14 +919,79 @@
     return el;
   }
 
-  function renderSessionMessages(detail) {
+  function messageRenderKey(message, index) {
+    // 分组合并后的消息保留首条消息 id；后续连续 tool/task 消息增加时仍更新同一节点。
+    // 服务端消息均有 id，index 仅用于旧数据/异常响应的安全回退。
+    return message && message.id ? String(message.id) : `message-${index}`;
+  }
+
+  function messageRenderFingerprint(message) {
+    return JSON.stringify(message);
+  }
+
+  function preserveDetailsState(from, to) {
+    const oldDetails = from.querySelector && from.querySelector('details');
+    const newDetails = to.querySelector && to.querySelector('details');
+    if (oldDetails && newDetails) newDetails.open = oldDetails.open;
+  }
+
+  // renderSessionMessages is async: it awaits resolveTaskCardStates (GET per task)
+  // before writing any message DOM. partial=true 时只新增或替换变更节点；未变消息
+  // 沿用既有 DOM，确保 details 展开状态和卡片中的用户输入不受轮询影响。
+  async function renderSessionMessages(detail, options) {
+    options = options || {};
     const stack = ui.byId('chat-message-stack');
     if (!stack) return;
-    clearNode(stack);
+    const myToken = ++renderToken;
     let visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage));
-    visibleMessages = groupTaskCommandMessages(visibleMessages);
+    visibleMessages = groupTaskMessages(visibleMessages);
+    const cardStates = await resolveTaskCardStates(visibleMessages);
+    const taskDecisions = resolveTaskDecisions(visibleMessages);
+    // Stale render guard: a newer render has incremented renderToken; abort without writing DOM.
+    if (myToken !== renderToken) return;
+    if (!options.partial) {
+      clearNode(stack);
+      renderedMessageNodes = new Map();
+      renderedMessageFingerprints = new Map();
+      if (!visibleMessages.length) { showEmptyState(); return; }
+      visibleMessages.forEach((message, index) => {
+        const key = messageRenderKey(message, index);
+        const el = createMessageElement(message, cardStates, taskDecisions);
+        el.dataset.messageKey = key;
+        stack.appendChild(el);
+        renderedMessageNodes.set(key, el);
+        renderedMessageFingerprints.set(key, messageRenderFingerprint(message));
+      });
+      return;
+    }
+
+    const nextKeys = new Set();
+    visibleMessages.forEach((message, index) => {
+      const key = messageRenderKey(message, index);
+      const fingerprint = messageRenderFingerprint(message);
+      nextKeys.add(key);
+      const existing = renderedMessageNodes.get(key);
+      if (existing && renderedMessageFingerprints.get(key) === fingerprint) return;
+      const el = createMessageElement(message, cardStates, taskDecisions);
+      el.dataset.messageKey = key;
+      if (existing && existing.parentNode === stack) {
+        preserveDetailsState(existing, el);
+        stack.replaceChild(el, existing);
+      } else {
+        stack.appendChild(el);
+      }
+      renderedMessageNodes.set(key, el);
+      renderedMessageFingerprints.set(key, fingerprint);
+    });
+    // 正常消息历史是只追加的；删除会话消息等少数情况移除已不在权威快照中的节点。
+    [...renderedMessageNodes.keys()].forEach((key) => {
+      if (nextKeys.has(key)) return;
+      const el = renderedMessageNodes.get(key);
+      if (el && el.parentNode === stack) stack.removeChild(el);
+      renderedMessageNodes.delete(key);
+      renderedMessageFingerprints.delete(key);
+    });
     if (!visibleMessages.length) showEmptyState();
-    visibleMessages.forEach((message) => stack.appendChild(createMessageElement(message)));
   }
 
   async function loadSessions() {
@@ -546,6 +1131,11 @@
       setStatusMessage('删除失败: ' + error.message, 'error');
       return;
     }
+    // 清理被删会话的调试设置，避免 localStorage 残留孤儿记录
+    if (sessionDebugSettings[session.id]) {
+      delete sessionDebugSettings[session.id];
+      saveDebugSettings();
+    }
     if (currentSessionId === session.id) {
       stopAutoRefresh();
       renderedMessageVersion = null;
@@ -553,6 +1143,9 @@
       setHeader(null);
       showEmptyState();
       updateInfo({});
+      // 当前会话已删：调试设置回落默认（draft 为空），刷新显隐与弹框勾选态
+      applyDebugVisibility();
+      renderSettingsUI();
     }
     await loadSessions();
   }
@@ -564,6 +1157,10 @@
     setHeader(id);
     // 会话切换：重置外部记忆操作标记，避免沿用上一会话的 options 注入
     externalMemoryTouched = false;
+    // 会话切换：套用目标会话的调试设置（每会话独立），并刷新设置弹框勾选态
+    draftDebugSettings = null;
+    applyDebugVisibility();
+    renderSettingsUI();
     try {
       const detail = await api.getSessionDetail(id);
       if (id !== currentSessionId) return; // 切换串台防护
@@ -596,6 +1193,14 @@
       // 新建会话：重置外部记忆操作标记，后续请求由后端按默认 profile 派生
       externalMemoryTouched = false;
     }
+    // 空态勾选的调试设置转入新会话；未勾选则新会话用默认值（无映射记录）
+    if (draftDebugSettings) {
+      sessionDebugSettings[id] = draftDebugSettings;
+      saveDebugSettings();
+      draftDebugSettings = null;
+    }
+    applyDebugVisibility();
+    renderSettingsUI();
     // Chat 会话默认关闭 builtin 记忆，外部记忆需用户手动勾选。
     renderExternalMemoryUI();
     showEmptyState();
@@ -610,6 +1215,7 @@
     stopAutoRefresh();
     currentSessionId = null;
     draftExternalMemoryConfig = null;
+    draftDebugSettings = null;
     await ensureSession();
   }
 
@@ -674,7 +1280,9 @@
       applySessionExternalMemoryState(detail);
       renderExternalMemoryUI();
     }
-    renderSessionMessages(detail);
+    // Await state resolution + render before restoring scroll / updating info,
+    // so clickable actions are not inserted mid-render.
+    await renderSessionMessages(detail, { partial: options.partialMessages === true });
     updateInfo(detail, { skipToolCalls: options.skipToolCalls });
     if (options.preserveScroll) restoreScroll(wasAtBottom, prevScrollTop);
     if (!options.skipSessionList) await loadSessions();
@@ -811,7 +1419,7 @@
     task_internal_error: '任务服务内部错误',
   };
 
-  // 命令结果统一以 [任务指令] 前缀的 system 消息呈现（spec UI Design 要求）。
+  // 命令结果统一以 system 消息呈现（spec UI Design 要求，正文不带抬头）。
   // 正文 UTF-8 字节安全截断（DOM 与 POST 同一字符串）；仅当 session 仍为当前会话时
   // 追加本地 system 气泡；无论会话是否切换都向捕获 session best-effort 持久化。
   const TASK_MESSAGE_MAX_BYTES = 65536;
@@ -847,21 +1455,35 @@
   }
 
   async function taskSystemMessage(sessionId, message) {
-    const body = truncateTaskMessageUtf8('[任务指令] ' + message);
-    if (currentSessionId === sessionId) appendOrMergeTaskCommand(body);
+    const body = truncateTaskMessageUtf8(message);
+    // Keep the optimistic task-command card addressable by the server message
+    // id once persistence succeeds. A poll may complete between the optimistic
+    // DOM update and advanceVersionAfterPersistedAppend(); without this bridge,
+    // partial rendering cannot find the local node and appends the authoritative
+    // copy as a second, identical card. A full page reload naturally removes
+    // that local-only copy, which is why the former symptom disappeared on
+    // refresh.
+    const optimisticEl = currentSessionId === sessionId ? appendOrMergeTaskCommand(body) : null;
     const preVersion = renderedMessageVersion;
     const persisted = await persistTaskSystemMessage(sessionId, body);
+    if (optimisticEl && persisted && persisted.id) {
+      reconcileOptimisticTaskCommand(optimisticEl, persisted.id);
+    }
     // 持久化成功且返回真实 id 时推进版本，避免下一次轮询误判变更触发无意义重渲。
     // 期间版本若被权威详情改变（并发追加/切换），跳过以权威为准。
     if (persisted && persisted.id) advanceVersionAfterPersistedAppend(persisted.id, preVersion);
   }
 
-  // 相邻任务指令合并：/task 命令记录（"[任务指令] 执行命令: ..."）与其回执（结果/错误）
-  // 渲染为同一条任务指令气泡。命令记录开新气泡，回执追加到上一条任务指令气泡的 <pre>。
-  const TASK_CMD_EXEC_PREFIX = '[任务指令] 执行命令: ';
+  // 相邻任务指令合并：/task 命令记录（"执行命令: ..."）与其回执（结果/错误）渲染为同一条
+  // 任务指令气泡。命令记录开新气泡，回执追加到上一条任务指令气泡的 <pre>。
+  // 兼容历史消息：记录历史曾带 [任务指令] 抬头，先剥离抬头再判定。
+  const TASK_CMD_EXEC_PREFIX = '执行命令: ';
+  const TASK_LEGACY_HEADER = '[任务指令] ';
 
   function isTaskCommandRecord(content) {
-    return typeof content === 'string' && content.startsWith(TASK_CMD_EXEC_PREFIX);
+    if (typeof content !== 'string') return false;
+    const c = content.startsWith(TASK_LEGACY_HEADER) ? content.slice(TASK_LEGACY_HEADER.length) : content;
+    return c.startsWith(TASK_CMD_EXEC_PREFIX);
   }
 
   function _lastMessageEl(stack) {
@@ -890,29 +1512,127 @@
           const pre = _detailsPre(last);
           if (pre) {
             pre.textContent = (pre.textContent || '') + '\n' + body;
-            return;
+            return last;
           }
         }
       }
     }
-    appendMessage('system', body, undefined, 'ui.task_command');
+    return appendMessage('system', body, undefined, 'ui.task_command');
   }
 
-  function groupTaskCommandMessages(messages) {
-    // 渲染时合并相邻 ui.task_command：命令记录开新组，回执追加到当前组（命令记录+回执一条）
+  function reconcileOptimisticTaskCommand(el, messageId) {
+    // Consecutive command record/result messages render as one group keyed by
+    // the first server message. Preserve that first key when the result is
+    // persisted, so the next partial render replaces this node instead of
+    // appending another card.
+    if (!el || !messageId || !el.dataset) return;
+    if (el.dataset.messageKey) return;
+    const key = String(messageId);
+    el.dataset.messageKey = key;
+    renderedMessageNodes.set(key, el);
+    // Deliberately omit a fingerprint: the next authoritative snapshot must
+    // replace the optimistic content with its canonical grouped content.
+    renderedMessageFingerprints.delete(key);
+  }
+
+  // 任务消息类型分类（按"类型"分组，同类型相邻合并，不同类型不合并/断开）：
+  //   'command'      任务指令：ui.task_command（相邻的多条合并，summary=任务指令，content 多行原文）
+  //   'task_status'  任务消息：ui.task_lifecycle 无 card + work task + judge task
+  //                  （相邻的多条合并，summary=任务状态，content 多行：lifecycle 原文 /
+  //                   work task `查询状态: ...` / judge task `判断结束: ...`）
+  //   'card'         交互卡片：ui.task_lifecycle 带 card payload（独立，不参与任何合并）
+  //   'other'        非 task 消息（assistant / user dashboard / schedule / curator 等）断开合并链
+  // 关键：
+  //   - 任务指令 vs 任务消息：不同类型，相邻不合并（断开）
+  //   - 同类型相邻合并：2 条相连 ui.task_command 合并；相连的 lifecycle+work+judge 合并
+  //   - 跨 role：work/judge role=user + lifecycle role=system 同属任务消息，可合并
+  function classifyTaskMessage(msg) {
+    if (!msg) return 'other';
+    // 交互卡片（ui.task_lifecycle 带 card payload）：独立，断开合并链
+    if (msg.role === 'system' && msg.name === 'ui.task_lifecycle' && validateTaskCard(msg.card)) {
+      return 'card';
+    }
+    // 任务指令（ui.task_command）
+    if (msg.role === 'system' && msg.name === 'ui.task_command') {
+      return 'command';
+    }
+    // 任务消息（ui.task_lifecycle 无 card + work task + judge task）
+    const isLifecycleNoCard = msg.role === 'system' && msg.name === 'ui.task_lifecycle';
+    const isWorkOrJudgeTask = msg.role === 'user'
+      && PROCESS_SOURCES.has(msg.source)
+      && isFoldableProcessContent(msg.content);
+    if (isLifecycleNoCard || isWorkOrJudgeTask) {
+      return 'task_status';
+    }
+    return 'other';
+  }
+
+  function groupTaskMessages(messages) {
+    // 合并规则（按"类型"分组，同类型相邻合并，不同类型不合并/断开）：
+    // - 类型 1 任务指令（ui.task_command）：相邻的多条合并为一组（summary=任务指令，content 多行原文）
+    // - 类型 2 任务消息（ui.task_lifecycle 无 card + work task + judge task）：相邻的多条合并为一组
+    //   （summary=任务状态，content 多行：lifecycle 原文 / work task `查询状态: ...` / judge task `判断结束: ...`）
+    //   跨 role（work/judge role=user + lifecycle role=system）同属任务消息，可合并
+    // - 类型 3 交互卡片（ui.task_lifecycle 带 card payload）：独立，不参与任何合并
+    // - 其他：非 task 消息（assistant / user dashboard / schedule / curator 等）断开合并链
+    // - 不同类型相邻不合并（断开）：任务指令 vs 任务消息 不合并；任务指令/任务消息 vs 交互卡片 不合并
+    // - 1-message group（无相邻同类型）：保持原 role/name，按各自规则渲染
+    //   （单独 work/judge task -> summary=前缀+content；单独 ui.task_lifecycle 无 card -> summary=任务状态；
+    //    单独 ui.task_command -> summary=任务指令）
+    // - Multi-message merged card：
+    //   * 任务指令组：name=ui.task_command，content 多行原文拼接（无前缀），走 system 分支渲染（summary=任务指令）
+    //   * 任务消息组：_mergedTaskStatus=true，content 多行（lifecycle 原文 + work `查询状态: ...` + judge `判断结束: ...`），
+    //     走 isMergedTaskStatus 分支渲染（summary=任务状态、open=false）
     const result = [];
     let currentGroup = null;
+    let currentGroupType = null;
+    let currentGroupSources = null;
     for (const msg of messages) {
-      if (msg.role === 'system' && msg.name === 'ui.task_command') {
-        if (isTaskCommandRecord(msg.content) || currentGroup === null) {
-          currentGroup = {role: 'system', name: 'ui.task_command', content: String(msg.content)};
-          result.push(currentGroup);
-        } else {
-          currentGroup.content = String(currentGroup.content) + '\n' + String(msg.content);
-        }
-      } else {
+      const type = classifyTaskMessage(msg);
+      if (type === 'other' || type === 'card') {
+        // 非合并对象 / 交互卡片：独立，断开合并链
         currentGroup = null;
+        currentGroupType = null;
+        currentGroupSources = null;
         result.push(msg);
+        continue;
+      }
+      // type === 'command' or 'task_status'
+      if (currentGroupType !== type) {
+        // 不同类型：断开合并链，开新组
+        currentGroup = null;
+        currentGroupType = null;
+        currentGroupSources = null;
+      }
+      if (currentGroup === null) {
+        // 开新 1-message 组：保留原始 content，不加合并标志
+        currentGroup = { ...msg };
+        currentGroupSources = [msg];
+        currentGroupType = type;
+        result.push(currentGroup);
+      } else {
+        // 同类型相邻：追加到现有组 -> 多消息合并卡片
+        currentGroupSources.push(msg);
+        if (type === 'command') {
+          // 任务指令组：content 多行原文拼接（无前缀）
+          if (!currentGroup._mergedTaskCommand) {
+            currentGroup.content = currentGroupSources
+              .map((m) => String(m.content !== undefined ? m.content : ''))
+              .join('\n');
+            currentGroup._mergedTaskCommand = true;
+          } else {
+            currentGroup.content = String(currentGroup.content) + '\n'
+              + String(msg.content !== undefined ? msg.content : '');
+          }
+        } else {
+          // 任务消息组：lifecycle 原文 + work `查询状态: ...` + judge `判断结束: ...`
+          if (!currentGroup._mergedTaskStatus) {
+            currentGroup.content = currentGroupSources.map(taskStatusLineForMessage).join('\n');
+            currentGroup._mergedTaskStatus = true;
+          } else {
+            currentGroup.content = String(currentGroup.content) + '\n' + taskStatusLineForMessage(msg);
+          }
+        }
       }
     }
     return result;
@@ -1008,7 +1728,7 @@
     return result;
   }
 
-  // Execute a parsed /task command via api.task.*, appending a [任务指令] system
+  // Execute a parsed /task command via api.task.*, appending a system
   // message with the result. create binds to currentSessionId (origin_session_id).
   async function runTaskCommand(text, sessionId) {
     await taskSystemMessage(sessionId, '执行命令: ' + text);
@@ -1364,6 +2084,198 @@
     renderExternalMemoryUI();
   }
 
+  // === 调试设置：工具调试 / 任务状态 显隐（按会话独立） ===
+  // 设置弹框复用记忆弹框的 .chat-memory-trigger / .chat-memory-popover / .chat-memory-option
+  // 样式，与记忆弹框保持一致；显隐状态按会话独立持久化到 localStorage
+  // （DEBUG_SETTINGS_KEY 的值为 {sessionId: {task, tool}} 映射），切换会话各用各的设置。
+  function loadDebugSettings() {
+    try {
+      if (typeof localStorage === 'undefined') return {};
+      const raw = localStorage.getItem(DEBUG_SETTINGS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      const map = {};
+      Object.keys(parsed).forEach((sid) => {
+        const v = parsed[sid];
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          map[sid] = {
+            task: typeof v.task === 'boolean' ? v.task : DEBUG_DEFAULTS.task,
+            tool: typeof v.tool === 'boolean' ? v.tool : DEBUG_DEFAULTS.tool,
+          };
+        }
+      });
+      return map;
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveDebugSettings() {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(DEBUG_SETTINGS_KEY, JSON.stringify(sessionDebugSettings));
+    } catch (e) { /* ignore persistence failure */ }
+  }
+
+  // 当前生效的调试设置：有会话用会话配置（无记录则默认值），无会话用 draft（无则默认值）。
+  function getDebugSettings() {
+    if (currentSessionId) {
+      return sessionDebugSettings[currentSessionId] || DEBUG_DEFAULTS;
+    }
+    return draftDebugSettings || DEBUG_DEFAULTS;
+  }
+
+  // 写入当前上下文的调试设置：有会话则写入会话映射并持久化，无会话则写入 draft。
+  function setDebugSettings(next) {
+    if (currentSessionId) {
+      sessionDebugSettings[currentSessionId] = next;
+      saveDebugSettings();
+    } else {
+      draftDebugSettings = next;
+    }
+  }
+
+  // 按当前会话的调试设置在稳定的 #chat-messages 滚动容器上切换 hide class；
+  // CSS 据此隐藏对应 data-debug-kind 卡片。容器在消息重渲染中保持稳定。
+  // 切换会话后须重新调用以套用目标会话的设置。
+  function applyDebugVisibility() {
+    const el = ui.byId('chat-messages');
+    if (!el) return;
+    const s = getDebugSettings();
+    el.classList.toggle('chat-debug--hide-tool', !s.tool);
+    el.classList.toggle('chat-debug--hide-task', !s.task);
+  }
+
+  // 互斥：记忆与设置弹框同一时刻只能开一个，新开一个则收回另一个。
+  // closeSettingsPopover / closeMemoryPopover 各自幂等（已关闭则 no-op）。
+  function closeMemoryPopover() {
+    if (!memoryPopoverOpen) return;
+    memoryPopoverOpen = false;
+    renderExternalMemoryUI();
+  }
+
+  function closeSettingsPopover() {
+    if (!settingsPopoverOpen) return;
+    settingsPopoverOpen = false;
+    renderSettingsUI();
+  }
+
+  // capture 阶段拦截 trigger 点击：点击记忆区域则收起设置、点击设置区域则收起记忆。
+  // 在 trigger 自身 stopPropagation 之前完成互斥，因此无需改动记忆弹框代码。
+  function handlePopoverMutualExclusion(event) {
+    const target = event.target;
+    if (!target || !target.closest) return;
+    if (target.closest('#chat-settings')) {
+      closeMemoryPopover();
+    } else if (target.closest('#chat-external-memory')) {
+      closeSettingsPopover();
+    }
+  }
+
+  function createSettingsTriggerIcon() {
+    const svg = createSvgElement('svg', {
+      class: 'chat-memory-trigger__icon',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      'aria-hidden': 'true',
+    });
+    svg.append(
+      createSvgElement('path', {
+        d: 'M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z',
+        stroke: 'currentColor',
+        'stroke-width': '2',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+      }),
+      createSvgElement('circle', {
+        cx: '12',
+        cy: '12',
+        r: '3',
+        stroke: 'currentColor',
+        'stroke-width': '2',
+      })
+    );
+    return svg;
+  }
+
+  function renderSettingsUI() {
+    const container = document.getElementById('chat-settings');
+    if (!container) return;
+    container.replaceChildren();
+
+    const bar = document.createElement('div');
+    bar.className = 'chat-memory-bar';
+
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'chat-memory-trigger';
+    trigger.title = '调试设置';
+    trigger.setAttribute('aria-haspopup', 'dialog');
+    trigger.setAttribute('aria-expanded', settingsPopoverOpen ? 'true' : 'false');
+    const triggerLabel = document.createElement('span');
+    triggerLabel.className = 'chat-memory-trigger__label';
+    triggerLabel.textContent = '设置';
+    trigger.append(createSettingsTriggerIcon(), triggerLabel);
+    trigger.addEventListener('click', (event) => {
+      event.stopPropagation();
+      settingsPopoverOpen = !settingsPopoverOpen;
+      renderSettingsUI();
+    });
+
+    bar.appendChild(trigger);
+    container.appendChild(bar);
+
+    if (settingsPopoverOpen) {
+      const popover = document.createElement('div');
+      popover.className = 'chat-memory-popover';
+      popover.setAttribute('role', 'dialog');
+      popover.setAttribute('aria-label', '调试设置');
+      popover.addEventListener('click', (event) => event.stopPropagation());
+
+      const group = document.createElement('section');
+      group.className = 'chat-memory-popover__group';
+      const groupTitle = document.createElement('div');
+      groupTitle.className = 'chat-memory-popover__group-title';
+      groupTitle.textContent = '调试';
+      const groupItems = document.createElement('div');
+      groupItems.className = 'chat-memory-popover__group-items';
+
+      const options = [
+        { key: 'task', label: '任务状态' },
+        { key: 'tool', label: '工具调试' },
+      ];
+      const current = getDebugSettings();
+      options.forEach((opt) => {
+        const pill = document.createElement('button');
+        pill.type = 'button';
+        pill.className = 'chat-memory-option';
+        pill.textContent = opt.label;
+        if (current[opt.key]) pill.classList.add('active');
+        pill.setAttribute('aria-pressed', current[opt.key] ? 'true' : 'false');
+        pill.addEventListener('click', () => {
+          // 写入当前上下文（有会话写会话映射、无会话写 draft），保证按会话独立
+          const next = { ...getDebugSettings(), [opt.key]: !getDebugSettings()[opt.key] };
+          setDebugSettings(next);
+          applyDebugVisibility();
+          renderSettingsUI();
+        });
+        groupItems.appendChild(pill);
+      });
+
+      group.append(groupTitle, groupItems);
+      popover.appendChild(group);
+      container.appendChild(popover);
+    }
+  }
+
+  function handleSettingsDocumentClick(event) {
+    const container = document.getElementById('chat-settings');
+    if (!settingsPopoverOpen || (container && container.contains(event.target))) return;
+    settingsPopoverOpen = false;
+    renderSettingsUI();
+  }
+
   function getExternalMemoryEnabled() {
     const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig;
     if (!config?.modified) return [];
@@ -1455,6 +2367,8 @@
     }
     bindDebugToggle();
     document.addEventListener('click', handleMemoryDocumentClick);
+    document.addEventListener('click', handleSettingsDocumentClick);
+    document.addEventListener('click', handlePopoverMutualExclusion, true);
     initImagePreview();
     // 激活态自动刷新：页面隐藏时停止（不浪费请求），可见时立即追赶一次并恢复周期。
     document.addEventListener('visibilitychange', () => {
@@ -1467,13 +2381,22 @@
     const emContainer = document.createElement('div');
     emContainer.id = 'chat-external-memory';
     emContainer.className = 'chat-external-memory';
+    // 调试设置容器：紧随记忆之后、发送按钮之前，复用记忆弹框样式
+    const settingsContainer = document.createElement('div');
+    settingsContainer.id = 'chat-settings';
+    settingsContainer.className = 'chat-settings';
     if (composerBar) {
       if (sendBtn) {
         composerBar.insertBefore(emContainer, sendBtn);
+        composerBar.insertBefore(settingsContainer, sendBtn);
       } else {
         composerBar.appendChild(emContainer);
+        composerBar.appendChild(settingsContainer);
       }
       loadExternalMemoryProviders();
+      sessionDebugSettings = loadDebugSettings();
+      renderSettingsUI();
+      applyDebugVisibility();
     }
     showEmptyState();
     updateInfo({});
@@ -1491,5 +2414,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send };
+  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings };
 }(window));

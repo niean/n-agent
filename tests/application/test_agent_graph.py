@@ -254,6 +254,110 @@ async def test_agent_graph_executes_tool_loop_and_finalizes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_persist_messages_false_skips_assistant_message_persistence(tmp_path):
+    """persist_messages=False 时，finalize 的 final assistant 消息不持久化到会话。
+
+    Regression: goal_mode judge 的 assistant JSON ``{"achieved": true, "reason":
+    "..."}`` 是控制流信号，不应出现在用户可见 Chat。finalize 在 persist 前必须
+    检查 state.persist_messages，False 则跳过 append_assistant_message。
+    """
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-judge"))
+    runner = AgentGraphRunner(
+        DirectProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    state = await runner.run(
+        AgentState(
+            session_id="s-judge",
+            input_messages=[{"role": "user", "content": "judge task t_1: has the goal been achieved?"}],
+            persist_messages=False,
+        ),
+        "test",
+        options={"persist_messages": False},
+    )
+
+    assert state.final_message["content"] == "hello"
+    msgs = await store.list_messages("s-judge")
+    assistant_msgs = [m for m in msgs if m.role == "assistant"]
+    assert assistant_msgs == [], "judge assistant message must not be persisted"
+
+
+@pytest.mark.asyncio
+async def test_persist_messages_false_skips_tool_call_and_tool_message_persistence(tmp_path):
+    """persist_messages=False 时，execute_tools 的 tool_call 审计记录和 update_memory
+    的 tool 消息都不持久化。但工具仍执行、结果仍返回 LLM（judge 可调 task_show 读 task）。
+
+    Regression: judge 可能调 task_show 工具读任务上下文。tool_call 记录和 tool role
+    消息若持久化，会泄露到用户可见 Chat。persist_messages=False 必须同时抑制
+    save_tool_call_if_allowed 和 append_tool_message，但工具执行本身不受影响。
+    """
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-judge-tool"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    state = await runner.run(
+        AgentState(
+            session_id="s-judge-tool",
+            input_messages=[{"role": "user", "content": "calc"}],
+            persist_messages=False,
+        ),
+        "test",
+        options={"persist_messages": False},
+    )
+
+    # Tool still executed, final message is the post-tool answer
+    assert state.final_message["content"] == "result is 3"
+    # Tool call audit log must be empty
+    tool_calls = await store.list_tool_calls("s-judge-tool")
+    assert tool_calls == [], "judge tool_call audit log must not be persisted"
+    # Tool role messages must not be persisted
+    msgs = await store.list_messages("s-judge-tool")
+    tool_msgs = [m for m in msgs if m.role == "tool"]
+    assert tool_msgs == [], "judge tool messages must not be persisted"
+    # Intermediate assistant messages (with tool_calls) must also not be persisted
+    assistant_msgs = [m for m in msgs if m.role == "assistant"]
+    assert assistant_msgs == [], "judge intermediate assistant messages must not be persisted"
+
+
+@pytest.mark.asyncio
+async def test_persist_messages_default_true_persists_everything(tmp_path):
+    """persist_messages 默认 True：assistant/tool 消息和 tool_call 审计记录正常持久化（回归保护）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-default"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    await runner.run(
+        AgentState(session_id="s-default", input_messages=[{"role": "user", "content": "calc"}]),
+        "test",
+    )
+
+    tool_calls = await store.list_tool_calls("s-default")
+    assert len(tool_calls) == 1
+    assert tool_calls[0].tool_name == "calculator"
+    msgs = await store.list_messages("s-default")
+    roles = {m.role for m in msgs}
+    assert "assistant" in roles
+    assert "tool" in roles
+
+
+@pytest.mark.asyncio
 async def test_agent_graph_stops_after_terminal_tool_success(tmp_path):
     """A successful terminal task intent must not consume another LLM turn.
 
@@ -526,8 +630,25 @@ async def test_agent_graph_serializes_legacy_dict_tool_content_to_provider(tmp_p
 
     legacy = ConversationMessage(role="tool", content={"status": "success", "content": {"a": 1}}, tool_call_id="x")
     payload = _message_to_provider(legacy)
+    assert list(payload) == ["role", "tool_call_id", "content"]
     assert isinstance(payload["content"], str)
     assert "success" in payload["content"]
+
+
+def test_message_to_provider_preserves_live_tool_message_field_order():
+    from app.application.context_service import _message_to_provider
+    from app.domain.session import ConversationMessage
+
+    message = ConversationMessage(
+        role="tool",
+        content="result",
+        tool_call_id="call-1",
+        name="calculator",
+    )
+
+    payload = _message_to_provider(message)
+
+    assert list(payload) == ["role", "tool_call_id", "name", "content"]
 
 
 class ChineseDictExecutor:
@@ -557,7 +678,7 @@ class ChineseStringExecutor:
 @pytest.mark.asyncio
 async def test_agent_graph_tool_message_keeps_chinese_for_dict_content(tmp_path):
     """Persisted tool message content must keep real CJK characters (not \\uXXXX
-    escapes) so the dashboard '工具调用调试信息' panel renders the original text.
+    escapes) so the dashboard '工具调用' panel renders the original text.
     Covers the dict-content executor pattern."""
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))

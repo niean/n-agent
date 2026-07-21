@@ -172,3 +172,23 @@ def test_normalize_tool_call_arguments_handles_non_string_and_invalid_json():
     assert _normalize_tool_call_arguments(None) is None
     assert _normalize_tool_call_arguments("not json") == "not json"  # 非法 JSON 原样
     assert _normalize_tool_call_arguments('{"x": 1}') == '{"x": 1}'  # 合法 JSON 保持
+
+
+def test_message_to_dict_includes_card_field():
+    from app.domain.session import ConversationMessage
+    from app.interfaces.http.dashboard import _message_to_dict
+
+    card = {"schema_version": 1, "kind": "task_lifecycle", "task_id": "t1",
+            "status": "waiting_approval", "title": "T", "summary": "p",
+            "available_actions": ["approve"]}
+    msg = ConversationMessage(role="system", content="等待批准", name="ui.task_lifecycle", card=card)
+    data = _message_to_dict(msg)
+    assert data["card"] == card
+
+
+def test_message_to_dict_card_null_when_absent():
+    from app.domain.session import ConversationMessage
+    from app.interfaces.http.dashboard import _message_to_dict
+
+    msg = ConversationMessage(role="user", content="hi")
+    assert _message_to_dict(msg)["card"] is None

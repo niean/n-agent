@@ -13,6 +13,7 @@ _INTERNAL_OPTION_KEYS = {
     "execution_context_mode",
     "external_memory_enabled",
     "stream_event_sink",
+    "persist_messages",
 }
 _ALLOWED_OPTION_KEYS = {"temperature", "top_p", "top_k", "stop_sequences", "cache_control", "thinking", "output_config"}
 _FINISH_REASON_MAP = {
@@ -79,12 +80,16 @@ class AnthropicProvider:
         options: dict[str, Any],
     ) -> LLMResult | AsyncIterator[LLMEvent]:
         selected_model = resolve_model(model, self.default_model)
-        system, anthropic_messages = _convert_messages(messages)
+        provider_options = _provider_options(selected_model, options or {})
+        system, anthropic_messages = _convert_messages(
+            messages,
+            cache_control=provider_options.get("cache_control"),
+        )
         kwargs = {
             "model": selected_model,
             "max_tokens": _resolve_max_tokens(selected_model, options or {}),
             "messages": anthropic_messages,
-            **_provider_options(selected_model, options or {}),
+            **provider_options,
         }
         if system:
             kwargs["system"] = system
@@ -100,7 +105,7 @@ class AnthropicProvider:
 
 def _provider_options(model: str, options: dict[str, Any]) -> dict[str, Any]:
     skip_sampling = model == "claude-opus-4-7"
-    result = {}
+    result = {"cache_control": {"type": "ephemeral"}}
     for key, value in options.items():
         if key in _INTERNAL_OPTION_KEYS or key == "max_tokens":
             continue
@@ -126,7 +131,10 @@ def _resolve_max_tokens(model: str, options: dict[str, Any]) -> int:
     return min(resolved, 4096)
 
 
-def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str | None, list[dict[str, Any]]]:
+def _convert_messages(
+    messages: list[dict[str, Any]],
+    cache_control: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]] | str | None, list[dict[str, Any]]]:
     system_parts: list[str] = []
     converted: list[dict[str, Any]] = []
     awaiting_tool_results: set[str] = set()
@@ -162,7 +170,28 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str | None, list[
         index += 1
     if awaiting_tool_results:
         raise ValueError("tool result must immediately follow assistant tool_use")
-    return "\n".join(system_parts) if system_parts else None, converted
+    if not system_parts:
+        system: list[dict[str, Any]] | str | None = None
+    else:
+        system_text = "\n".join(system_parts)
+        system = (
+            [{"type": "text", "text": system_text, "cache_control": cache_control}]
+            if cache_control
+            else system_text
+        )
+    if cache_control:
+        for message in converted:
+            content = message.get("content")
+            if message.get("role") == "user" and isinstance(content, str) and content:
+                message["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": cache_control,
+                    }
+                ]
+                break
+    return system, converted
 
 
 def _convert_assistant_message(message: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:

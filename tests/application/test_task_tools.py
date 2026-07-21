@@ -139,7 +139,8 @@ def test_task_comment_input_schema():
 
 
 def test_task_propose_change_input_schema():
-    """task_propose_change: {proposal} -- proposal 非空 text"""
+    """task_propose_change: {proposal, proposal_type?} -- proposal 非空 text;
+    proposal_type 可选 enum [approval, intent_request]，默认 approval。"""
     defs = {d.name: d for d in task_tool_definitions()}
     schema = defs["task_propose_change"].input_schema
     props = schema["properties"]
@@ -147,7 +148,21 @@ def test_task_propose_change_input_schema():
     assert props["proposal"]["type"] == "string"
     assert props["proposal"].get("minLength") == 1
     assert "proposal" in schema.get("required", [])
+    # proposal_type 可选（不在 required 中）
+    assert "proposal_type" in props
+    assert props["proposal_type"]["type"] == "string"
+    assert props["proposal_type"]["enum"] == ["approval", "intent_request"]
+    assert "proposal_type" not in schema.get("required", [])
     assert schema.get("additionalProperties") is False
+
+
+def test_task_propose_change_description_mentions_proposal_type():
+    """task_propose_change description 应说明 proposal_type 的两种语义。"""
+    defs = {d.name: d for d in task_tool_definitions()}
+    desc = defs["task_propose_change"].description
+    assert "proposal_type" in desc
+    assert "approval" in desc
+    assert "intent_request" in desc
 
 
 def test_task_fail_input_schema():
@@ -241,3 +256,151 @@ def test_list_tasks_input_schema_status_enum_matches_taskstatus():
     assert set(schema["properties"]) == {"status"}
     expected = {s.value for s in TaskStatus}
     assert set(schema["properties"]["status"]["enum"]) == expected
+
+
+# ---------------------------------------------------------------------------
+# 用户侧任务审批工具定义（approve_task / reject_task / revise_task）
+# spec: Task 4 -- 用户侧审批工具定义与暴露策略
+# ---------------------------------------------------------------------------
+
+
+def test_user_task_approval_tool_names_constants_and_disjoint():
+    """三个审批工具名常量与 USER_TASK_APPROVAL_TOOL_NAMES 集合，且与既有工具集不相交。"""
+    from app.application.task_tools import (
+        USER_TASK_TOOL_APPROVE,
+        USER_TASK_TOOL_REJECT,
+        USER_TASK_TOOL_REVISE,
+        USER_TASK_APPROVAL_TOOL_NAMES,
+        USER_TASK_TOOL_NAMES,
+    )
+
+    assert USER_TASK_TOOL_APPROVE == "approve_task"
+    assert USER_TASK_TOOL_REJECT == "reject_task"
+    assert USER_TASK_TOOL_REVISE == "revise_task"
+    assert USER_TASK_APPROVAL_TOOL_NAMES == frozenset({
+        USER_TASK_TOOL_APPROVE,
+        USER_TASK_TOOL_REJECT,
+        USER_TASK_TOOL_REVISE,
+    })
+    # 与 create/list 工具集不相交（保留 USER_TASK_TOOL_NAMES 既有语义）
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(USER_TASK_TOOL_NAMES)
+    # 与 worker managed 工具集不相交（防递归）
+    worker_names = {d.name for d in task_tool_definitions()}
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(worker_names)
+
+
+def test_user_task_approval_tool_definitions_returns_three():
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    defs = user_task_approval_tool_definitions()
+    assert {d.name for d in defs} == {"approve_task", "reject_task", "revise_task"}
+    assert len(defs) == 3
+
+
+def test_user_task_approval_tool_definitions_common_attributes():
+    """三个审批工具：AGENT + SAFE + managed=False + toolset=task + enabled。"""
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    for d in user_task_approval_tool_definitions():
+        assert d.source_type is ToolSourceType.AGENT, f"{d.name} source_type"
+        assert d.toolset == "task", f"{d.name} toolset"
+        assert d.managed is False, f"{d.name} managed"
+        assert d.risk_level is RiskLevel.SAFE, f"{d.name} risk_level"
+        assert d.enabled is True, f"{d.name} enabled"
+
+
+def test_user_task_approval_tool_definitions_pass_policy_validation():
+    """managed=False + SAFE 能通过 ToolPolicy.validate_definition。"""
+    from app.application.task_tools import user_task_approval_tool_definitions
+    from app.domain.tool_policy import ToolPolicy
+
+    policy = ToolPolicy()
+    for d in user_task_approval_tool_definitions():
+        policy.validate_definition(d)
+
+
+def test_user_task_approval_tool_definitions_no_duplicate_names():
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    defs = user_task_approval_tool_definitions()
+    names = [d.name for d in defs]
+    assert len(names) == len(set(names)), "duplicate tool names"
+
+
+def test_user_task_approval_tool_definitions_descriptions_english_and_distinct():
+    """description 英文，且 reject 与 revise 必须语义可区分。"""
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    defs = {d.name: d for d in user_task_approval_tool_definitions()}
+    for d in defs.values():
+        # 不含中文字符
+        assert not any("一" <= ch <= "鿿" for ch in d.description), (
+            f"{d.name} description should not contain Chinese characters"
+        )
+        assert len(d.description) > 0, f"{d.name} description empty"
+
+    # reject 与 revise 必须有不同 description，且都含可区分的关键词
+    reject_desc = defs["reject_task"].description.lower()
+    revise_desc = defs["revise_task"].description.lower()
+    assert defs["reject_task"].description != defs["revise_task"].description
+    # reject 语义：拒绝提案、不再执行
+    assert "reject" in reject_desc or "deny" in reject_desc or "decline" in reject_desc
+    # revise 语义：给修改指示让 worker 调整后重试（区别于直接拒绝）
+    assert "revise" in revise_desc or "revision" in revise_desc or "adjust" in revise_desc
+
+
+def test_user_task_approval_tool_definitions_root_schema_shape():
+    """三个工具根 schema: type=object + additionalProperties=false。"""
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    for d in user_task_approval_tool_definitions():
+        schema = d.input_schema
+        assert schema["type"] == "object", f"{d.name} schema type"
+        assert schema["additionalProperties"] is False, f"{d.name} additionalProperties"
+        assert "properties" in schema, f"{d.name} properties"
+
+
+def test_approve_task_input_schema():
+    """approve_task: {task_id(可选 minLength:1), note(可选 maxLength:2000)} required=[]"""
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    schema = {d.name: d for d in user_task_approval_tool_definitions()}["approve_task"].input_schema
+    props = schema["properties"]
+    assert set(props) == {"task_id", "note"}
+    assert props["task_id"]["type"] == "string"
+    assert props["task_id"]["minLength"] == 1
+    assert props["note"]["type"] == "string"
+    assert props["note"]["maxLength"] == 2000
+    assert schema["required"] == []
+    assert schema["additionalProperties"] is False
+
+
+def test_reject_task_input_schema():
+    """reject_task: {task_id(可选 minLength:1), note(可选 maxLength:2000)} required=[]"""
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    schema = {d.name: d for d in user_task_approval_tool_definitions()}["reject_task"].input_schema
+    props = schema["properties"]
+    assert set(props) == {"task_id", "note"}
+    assert props["task_id"]["type"] == "string"
+    assert props["task_id"]["minLength"] == 1
+    assert props["note"]["type"] == "string"
+    assert props["note"]["maxLength"] == 2000
+    assert schema["required"] == []
+    assert schema["additionalProperties"] is False
+
+
+def test_revise_task_input_schema():
+    """revise_task: {task_id(可选 minLength:1), note(必填 minLength:1 maxLength:2000)} required=["note"]"""
+    from app.application.task_tools import user_task_approval_tool_definitions
+
+    schema = {d.name: d for d in user_task_approval_tool_definitions()}["revise_task"].input_schema
+    props = schema["properties"]
+    assert set(props) == {"task_id", "note"}
+    assert props["task_id"]["type"] == "string"
+    assert props["task_id"]["minLength"] == 1
+    assert props["note"]["type"] == "string"
+    assert props["note"]["minLength"] == 1
+    assert props["note"]["maxLength"] == 2000
+    assert schema["required"] == ["note"]
+    assert schema["additionalProperties"] is False

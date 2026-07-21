@@ -326,6 +326,11 @@ def _build_task_parser(subparsers) -> None:
     reject_p.add_argument("--note", default=None, help="Optional rejection reason")
     _fmt(reject_p)
 
+    revise_p = sub.add_parser("revise", help="Revise a waiting_approval task's proposal with modification guidance")
+    revise_p.add_argument("id")
+    revise_p.add_argument("--note", required=True, help="Required revision instruction for the worker")
+    _fmt(revise_p)
+
     runs_p = sub.add_parser("runs", help="List runs of a task")
     runs_p.add_argument("id")
     runs_p.add_argument("--limit", type=int, default=None)

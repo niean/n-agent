@@ -156,6 +156,45 @@ TASK_TRANSITION_TABLE: dict[TaskStatus, frozenset[TaskStatus]] = {
 }
 
 
+def available_lifecycle_actions(
+    status: TaskStatus, interaction_type: str | None = None,
+) -> tuple[str, ...]:
+    """Return the lifecycle card actions exposed for a task status.
+
+    Empty tuple means the status renders a plain-text lifecycle message with
+    no interactive card. The Task aggregate and action APIs remain the final
+    authority on legality; this only drives which buttons the Dashboard card
+    offers. EXPIRED returns only ``retry`` because ``Task.cancel()`` rejects
+    EXPIRED (expired tasks must be retried, not cancelled).
+
+    ``interaction_type`` distinguishes WAITING_APPROVAL card flavors:
+      - ``"approval"`` (default, also when ``None`` or any value other than
+        ``"intent_request"``): show approve/reject buttons for the user to
+        approve or reject the worker's proposal.
+      - ``"intent_request"``: show revise/cancel buttons for the user to
+        supply additional intent/information (revise carries the note) or
+        cancel the task. The same domain transitions apply; only the offered
+        action set differs.
+
+    Validation of ``interaction_type`` membership is the Application layer's
+    responsibility (``TaskService.propose_change`` rejects unknown values).
+    This Domain pure function conservatively falls back to the approval
+    action set for any non-``"intent_request"`` value so a malformed payload
+    never produces the revise/cancel pair unintentionally.
+
+    FAILED/EXPIRED/other statuses ignore ``interaction_type``.
+    """
+    if status == TaskStatus.WAITING_APPROVAL:
+        if interaction_type == "intent_request":
+            return ("revise", "cancel")
+        return ("approve", "reject")
+    if status == TaskStatus.FAILED:
+        return ("retry", "cancel")
+    if status == TaskStatus.EXPIRED:
+        return ("retry",)
+    return ()
+
+
 # ---------------------------------------------------------------------------
 # Task aggregate
 # ---------------------------------------------------------------------------
@@ -416,6 +455,24 @@ class Task:
             )
         return replace(self, status=TaskStatus.QUEUED)
 
+    def revise(self) -> Task:
+        """Move WAITING_APPROVAL -> QUEUED as the third approval decision.
+
+        ``revise`` is the third approval decision alongside approve/reject:
+        the user gives revision instructions for the worker to re-execute.
+        The state transition WAITING_APPROVAL -> QUEUED is already legal in
+        ``TASK_TRANSITION_TABLE``, so this method does not extend the state
+        machine. The revision note is persisted as a ``change_revised``
+        event by TaskService; the domain method only advances state.
+
+        Raises ``TaskStateError`` if the task is not WAITING_APPROVAL.
+        """
+        if self.status is not TaskStatus.WAITING_APPROVAL:
+            raise TaskStateError(
+                f"revise requires WAITING_APPROVAL, got {self.status.value}"
+            )
+        return replace(self, status=TaskStatus.QUEUED)
+
     # -----------------------------------------------------------------
     # Cancel / retry (user actions)
     # -----------------------------------------------------------------
@@ -667,6 +724,51 @@ class DeliveryResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ProposalResolutionCommand:
+    """In-transaction proposal resolution specification.
+
+    Captures a user's approval decision on a pending ``change_proposed``
+    event. ``decision`` is one of ``"approved"`` / ``"rejected"`` /
+    ``"revised"`` (revise = give the worker revision instructions and
+    re-queue for another run). ``event_kind`` is the corresponding
+    ``change_approved`` / ``change_rejected`` / ``change_revised`` kind
+    string; ``note`` carries the user's revision note (non-empty for
+    revise, optional otherwise). The Domain command layer does not
+    validate ``note`` / ``decision`` semantics; that is the service /
+    registry's responsibility.
+
+    The command intentionally does NOT carry ``proposal_event_id``: the
+    Registry locates the pending proposal inside the transaction (by
+    ``task_id`` + unmatched ``change_proposed``). ``expected_version`` is
+    used by the Registry for optimistic-lock CAS on the Task row.
+    """
+
+    task_id: str
+    expected_version: int
+    decision: str
+    event_kind: str
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class ProposalResolutionResult:
+    """Result of an atomic proposal resolution.
+
+    ``proposal_event_id`` is the id of the resolved ``change_proposed``
+    event (non-nullable ``int``): the Registry always locates a pending
+    proposal when constructing this result, raising ``TaskStateError``
+    when none exists. ``task`` is the persisted Task after the state
+    transition; ``decision_event`` is the newly-appended
+    ``change_approved`` / ``change_rejected`` / ``change_revised``
+    event.
+    """
+
+    proposal_event_id: int
+    task: Task
+    decision_event: TaskEvent
+
+
 # ---------------------------------------------------------------------------
 # Ports (async Protocols)
 # ---------------------------------------------------------------------------
@@ -717,6 +819,16 @@ class TaskRegistry(Protocol):
     ) -> Task: ...
     async def finish_run(self, command: FinishRunCommand) -> FinishRunResult: ...
     async def recover_run(self, command: RecoverRunCommand) -> FinishRunResult: ...
+
+    # --- proposal resolution (CAS) ---
+    async def resolve_proposal(
+        self,
+        command: ProposalResolutionCommand,
+    ) -> ProposalResolutionResult: ...
+    async def latest_waiting_approval_in_session(
+        self,
+        session_id: str,
+    ) -> Task | None: ...
 
     # --- dispatch helpers ---
     async def list_queued_due(

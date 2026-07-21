@@ -172,12 +172,29 @@ def task_tool_definitions() -> list[ToolDefinition]:
                 "immediately, the task enters WAITING_APPROVAL, and the user decides the next "
                 "step via approve/reject: if approved, proceed per the proposal; if rejected, "
                 "do not execute the proposal. Repeated calls or calling when the task is already "
-                "in WAITING_APPROVAL returns 409 task_state_invalid."
+                "in WAITING_APPROVAL returns 409 task_state_invalid. "
+                "proposal_type selects the card flavor shown to the user: 'approval' (default) "
+                "asks the user to approve or reject the proposal; 'intent_request' asks the "
+                "user to supply information, intent, or clarification before continuing (the "
+                "card shows a textarea for the supplementary intent and a cancel button). "
+                "Use 'approval' when the worker has a concrete plan the user can accept or "
+                "reject; use 'intent_request' when the worker cannot proceed without the "
+                "user providing additional information or intent first."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "proposal": {"type": "string", "minLength": 1},
+                    "proposal_type": {
+                        "type": "string",
+                        "enum": ["approval", "intent_request"],
+                        "description": (
+                            "Card flavor: 'approval' (default) = request user to "
+                            "approve/reject the proposal; 'intent_request' = request "
+                            "user to supply intent/information/clarification before "
+                            "continuing (card shows a textarea + cancel)."
+                        ),
+                    },
                 },
                 "required": ["proposal"],
                 "additionalProperties": False,
@@ -283,6 +300,116 @@ def user_task_tool_definitions() -> list[ToolDefinition]:
                     },
                 },
                 "required": [],
+                "additionalProperties": False,
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="task",
+            managed=False,
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 用户侧任务审批工具（自然语言审批入口 approve_task / reject_task / revise_task）
+# Task 4: 用户侧审批工具定义与暴露策略
+# ---------------------------------------------------------------------------
+
+USER_TASK_TOOL_APPROVE = "approve_task"
+USER_TASK_TOOL_REJECT = "reject_task"
+USER_TASK_TOOL_REVISE = "revise_task"
+# 审批工具集（3 工具），独立于 USER_TASK_TOOL_NAMES（create/list）。
+# 装配时由调用方显式合并两个集合，避免让旧 create/list 契约与防递归约束悄然改变含义。
+USER_TASK_APPROVAL_TOOL_NAMES: frozenset[str] = frozenset({
+    USER_TASK_TOOL_APPROVE,
+    USER_TASK_TOOL_REJECT,
+    USER_TASK_TOOL_REVISE,
+})
+
+
+def user_task_approval_tool_definitions() -> list[ToolDefinition]:
+    """返回用户侧任务审批工具定义（approve_task / reject_task / revise_task）。
+
+    与 create/list 同装配范式：source_type=AGENT + risk_level=SAFE + managed=false
+    + toolset="task"。realtime（DEFAULT 暴露）对对话 Agent 可见，供对话 Agent
+    在用户用自然语言表达审批意图时调用；unattended（SAFE_ONLY）默认隐藏 AGENT
+    源工具，故 worker/judge 不可见，防递归自我审批。绝不加入任何 worker/judge
+    的 granted_tools（见 spec Constraints）。
+
+    语义区分：
+      - approve_task：批准最近一个 waiting_approval 任务，按原提案继续执行。
+      - reject_task：拒绝最近一个 waiting_approval 任务的原提案，不再执行该提案。
+      - revise_task：给最近一个 waiting_approval 任务下达修改指示，让 worker
+        调整后重新尝试，区别于直接拒绝（任务不进入失败终态，而是带着修订指示
+        重新进入执行）。
+    """
+    return [
+        ToolDefinition(
+            name=USER_TASK_TOOL_APPROVE,
+            description=(
+                "Approve the most recent waiting_approval task in the current session so "
+                "the worker can proceed with the original proposal. task_id optionally "
+                "targets a specific task (defaults to the latest waiting_approval one); "
+                "note is an optional human-readable approval comment (max 2000 chars)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1},
+                    "note": {"type": "string", "maxLength": 2000},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="task",
+            managed=False,
+        ),
+        ToolDefinition(
+            name=USER_TASK_TOOL_REJECT,
+            description=(
+                "Reject the most recent waiting_approval task's proposal so the worker "
+                "will not execute the proposed change. Use reject when the user disagrees "
+                "with the proposal and does not want the worker to proceed with it. "
+                "task_id optionally targets a specific task (defaults to the latest "
+                "waiting_approval one); note is an optional human-readable rejection "
+                "reason (max 2000 chars)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1},
+                    "note": {"type": "string", "maxLength": 2000},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="task",
+            managed=False,
+        ),
+        ToolDefinition(
+            name=USER_TASK_TOOL_REVISE,
+            description=(
+                "Revise the most recent waiting_approval task by giving the worker "
+                "revision instructions to adjust its approach and retry, rather than "
+                "outright rejecting the proposal. Use revise when the user wants the "
+                "task to continue but with a modified direction (e.g. change scope, "
+                "switch approach, correct a misunderstanding). The task does not enter "
+                "a terminal state; it re-enters execution carrying the revision note. "
+                "task_id optionally targets a specific task (defaults to the latest "
+                "waiting_approval one); note is required and carries the revision "
+                "instructions (1..2000 chars)."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1},
+                    "note": {"type": "string", "minLength": 1, "maxLength": 2000},
+                },
+                "required": ["note"],
                 "additionalProperties": False,
             },
             risk_level=RiskLevel.SAFE,

@@ -933,3 +933,67 @@ async def test_prompt_error_event_maps_to_refusal(agent, services, conn, setting
         prompt=[_text_block("hi")], session_id=sid
     )
     assert response.stop_reason == "refusal"
+
+
+# ---------------------------------------------------------------------------
+# T11: realtime contract -- session_id passing + DEFAULT approval tool surface
+# ---------------------------------------------------------------------------
+
+
+def _default_exposed_tool_names_with_approval_tools() -> set[str]:
+    """Construct a ToolService wired with user_task_approval_tool_definitions
+    (mirrors T8 wiring in app/main.py) and return DEFAULT-exposed tool names."""
+    from app.application.task_tools import user_task_approval_tool_definitions
+    from app.application.tool_service import ToolService as _ToolService
+    from app.domain.tool_policy import ToolExposurePolicy
+
+    class _UnusedExecutor:
+        async def execute(self, request, context=None):
+            raise RuntimeError("executor not used by list_openai_tools")
+
+    tool_service = _ToolService(executor=_UnusedExecutor(), definitions=[])
+    tool_service.set_dynamic_definitions(
+        "user_task", user_task_approval_tool_definitions()
+    )
+    return {
+        t["function"]["name"]
+        for t in tool_service.list_openai_tools(ToolExposurePolicy.DEFAULT, None)
+    }
+
+
+@pytest.mark.asyncio
+async def test_realtime_tool_context_passes_session_id_and_exposes_approval_tools(
+    agent, services, conn, settings
+):
+    """ACP realtime contract (T11).
+
+    NAgentACPAgent.prompt -> GatewayService.handle_message_stream must pass the
+    ACP session_id through to ChatCompletionService, carry realtime indicators
+    (agent_context=primary, execution_context_mode=realtime, tool_exposure_policy
+    != safe_only), and the shared ToolService DEFAULT surface must contain
+    approve_task / reject_task / revise_task (wired by T8).
+    """
+    agent.on_connect(conn)
+    host_root = settings.acp_host_workspace_root
+    new_resp = await agent.new_session(cwd=str(host_root / "project"))
+    sid = new_resp.session_id
+
+    response = await agent.prompt(prompt=[_text_block("hello")], session_id=sid)
+    assert response.stop_reason == "end_turn"
+
+    # ChatCompletionInput captured by FakeChatService
+    assert services.chat_service.inputs, "ChatCompletionInput was not captured"
+    chat_input = services.chat_service.inputs[0]
+
+    # session_id passes through unchanged (ACP session_id == platform_session_id)
+    assert chat_input.session_id == sid
+
+    # realtime indicators on trusted_metadata + options
+    assert chat_input.trusted_metadata.get("agent_context") == "primary"
+    assert chat_input.options.get("execution_context_mode") == "realtime"
+    # DEFAULT exposure (not SAFE_ONLY) for default mode
+    assert chat_input.options.get("tool_exposure_policy") != "safe_only"
+
+    # Shared ToolService DEFAULT surface contains the three approval tools
+    tool_names = _default_exposed_tool_names_with_approval_tools()
+    assert {"approve_task", "reject_task", "revise_task"}.issubset(tool_names)

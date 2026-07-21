@@ -1520,6 +1520,8 @@ def _message_to_dict(message: ConversationMessage) -> dict:
         "tool_call_id": message.tool_call_id,
         "name": message.name,
         "is_summary": message.is_summary,
+        "source": message.source,
+        "card": message.card,
         # 消息时间戳（UTC ISO），供 Dashboard Chat Hover 展示消息时间（飞书风格）
         "created_at": message.created_at.isoformat() if message.created_at else None,
     }

@@ -31,6 +31,17 @@ from app.domain.tool import (
 from app.utils.content_utils import extract_text, normalize_content
 
 
+# Process-origin session sources whose worker assistant reasoning must be
+# hidden from the dashboard (the worker's chain-of-thought is internal;
+# user-facing task output flows through ui.task_lifecycle/ui.task_result
+# system messages). See AgentState.message_source.
+_PROCESS_MESSAGE_SOURCES = frozenset({
+    SessionSource.TASK.value,
+    SessionSource.SCHEDULE.value,
+    SessionSource.CURATOR.value,
+})
+
+
 class ActiveExternalMemoryReader(Protocol):
     def get_active_provider_names(self) -> list[str]: ...
 
@@ -48,6 +59,12 @@ class ChatCompletionInput:
     allowed_confirm_tools_override: dict[str, ConfirmToolGrant] | None = None
     ingress_facts: IngressFacts | None = None
     session_descriptor: SessionDescriptor | None = None
+    # When False, skip persisting user/assistant/tool messages and tool_call
+    # audit records to the session store. Used by goal_mode judge fork to keep
+    # its internal control-flow signals (achieved/reason JSON, task_show reads)
+    # out of the user-visible Chat history. Default True preserves existing
+    # behavior for all other callers.
+    persist_messages: bool = True
 
 
 @dataclass(frozen=True)
@@ -98,9 +115,12 @@ class ChatCompletionService:
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
         session_id = request.session_id or f"api-{uuid4()}"
         snapshot = await self._build_policy_snapshot(request, session_id)
-        session_source = (
-            snapshot.run_context.source if snapshot is not None else SessionSource.API.value
-        )
+        if snapshot is not None:
+            session_source = snapshot.run_context.source
+        elif request.ingress_facts is not None:
+            session_source = request.ingress_facts.source
+        else:
+            session_source = SessionSource.API.value
         await self._runtime_memory.create_session_if_allowed(
             ConversationSession(id=session_id, source=session_source)
         )
@@ -145,17 +165,28 @@ class ChatCompletionService:
             )
         for message in normalized_messages:
             if message.get("role") == "user":
-                await self._runtime_memory.append_user_message(
-                    session_id,
-                    message.get("content", ""),
-                )
+                if request.persist_messages:
+                    await self._runtime_memory.append_user_message(
+                        session_id,
+                        message.get("content", ""),
+                        source=session_source,
+                    )
         await self.session_service.ensure_title(session_id, str(first_user_message))
+        # Process-origin runs (task/schedule/curator workers) tag their assistant
+        # messages with the run source so the dashboard can hide the worker's
+        # internal reasoning; realtime (api/dashboard) stays untagged (None) and
+        # renders normally. session_source already folds snapshot -> ingress
+        # fallback, so this works with or without a policy_snapshot_factory.
+        message_source = session_source if session_source in _PROCESS_MESSAGE_SOURCES else None
         state = AgentState(
             session_id=session_id,
             run_id=snapshot.run_context.run_id if snapshot is not None else str(uuid4()),
             input_messages=normalized_messages,
+            persist_messages=request.persist_messages,
+            message_source=message_source,
         )
         options = dict(request.options)
+        options["persist_messages"] = request.persist_messages
         if snapshot is not None:
             options["_policy_snapshot"] = snapshot
         if _detect_conversational_compress(first_user_message):

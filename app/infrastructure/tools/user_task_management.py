@@ -1,6 +1,7 @@
-"""用户侧任务工具执行器（create_task / list_tasks）。
+"""用户侧任务工具执行器（create_task / list_tasks / approve_task /
+reject_task / revise_task）。
 
-spec: spec-260720-chat-natural-language-task.md
+spec: spec-260720-chat-natural-language-task.md, spec-260721-chat-nl-approval.md
 
 与 worker 的 TaskManagementToolExecutor 区别：
   - 面向对话 Agent（realtime），不是 worker（unattended）
@@ -8,7 +9,13 @@ spec: spec-260720-chat-natural-language-task.md
     unattended（SAFE_ONLY）默认隐藏 AGENT 源工具，故 worker/judge 不可见，防递归
   - 从 ctx.session_id 取 origin_session_id，从 ctx.trusted_metadata.actor_id 取 created_by
   - 不读 untrusted ctx.metadata（模式十二 trusted-only）
-  - 防递归约束：worker/judge 的 granted_tools 不得含这两个名字（spec Constraints）
+  - 防递归约束：worker/judge 的 granted_tools 不得含这些工具名（spec Constraints）
+
+审批工具（approve/reject/revise）会话隔离：
+  - 只读 ctx.session_id 定位同会话任务；task_id 缺省取最近 WAITING_APPROVAL 任务
+  - 指定 task_id 校验 origin_session_id == ctx.session_id 且未归档
+  - 跨会话、归档、不存在统一 task_not_found，不泄露存在性差异
+  - status/decision 取 service 提交结果，不硬编码；terminal=False
 
 错误处理：所有结果为 JSON object 且含 success；不向 Agent 泄露 traceback、数据库错误
 或原始异常字符串。未知服务异常映射为稳定 task_internal_error / task_list_failed。
@@ -21,11 +28,22 @@ from datetime import timezone
 from typing import Any, Protocol
 
 from app.application.task_tools import (
+    USER_TASK_APPROVAL_TOOL_NAMES,
+    USER_TASK_TOOL_APPROVE,
     USER_TASK_TOOL_CREATE,
     USER_TASK_TOOL_LIST,
+    USER_TASK_TOOL_REJECT,
+    USER_TASK_TOOL_REVISE,
     USER_TASK_TOOL_NAMES,
 )
-from app.domain.task import TaskConflictError, TaskStatus, TaskValidationError
+from app.domain.task import (
+    Task,
+    TaskConflictError,
+    TaskNotFoundError,
+    TaskStateError,
+    TaskStatus,
+    TaskValidationError,
+)
 from app.domain.tool import (
     ToolCallRequest,
     ToolExecutionContext,
@@ -38,12 +56,17 @@ from app.domain.tool import (
 _TITLE_MAX_CODEPOINTS = 80
 _LIST_PAGE_LIMIT = 200
 _TASK_STATUS_VALUES = frozenset(s.value for s in TaskStatus)
+_NOTE_MAX_CODEPOINTS = 2000
+_APPROVAL_ALLOWED_FIELDS = frozenset({"task_id", "note"})
+_APPROVAL_DECISION_APPROVE = "approved"
+_APPROVAL_DECISION_REJECT = "rejected"
+_APPROVAL_DECISION_REVISE = "revised"
 
 
 class UserTaskServiceProtocol(Protocol):
     """用户侧工具依赖的 TaskService 子集（async）。
 
-    具体 ``TaskService`` 已实现这两个方法并满足本 Protocol；测试以 async fake 替换。
+    具体 ``TaskService`` 已实现这些方法并满足本 Protocol；测试以 async fake 替换。
     不复用 worker 的 ``TaskServiceProtocol``（后者是 worker 导向，不含 create/list）。
     """
 
@@ -66,9 +89,37 @@ class UserTaskServiceProtocol(Protocol):
         self, board: str = "default", cursor: Any = None, limit: int = 100,
     ) -> Any: ...
 
+    async def get_task(self, task_id: str) -> Task:
+        """Return the Task for ``task_id`` or raise ``TaskNotFoundError``."""
+
+    async def latest_waiting_approval_in_session(
+        self, session_id: str,
+    ) -> Task | None:
+        """Return the most recent WAITING_APPROVAL Task in ``session_id``, or None."""
+
+    async def approve_change(
+        self, task_id: str, note: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def reject_change(
+        self, task_id: str, note: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def revise_change(
+        self, task_id: str, note: str | None = None,
+    ) -> dict[str, Any]: ...
+
 
 class UserTaskToolExecutor(ToolExecutor):
-    """Dispatches create_task / list_tasks to TaskService, session-bound."""
+    """Dispatches create_task / list_tasks / approve_task / reject_task /
+    revise_task to TaskService, session-bound.
+
+    审批工具（approve/reject/revise）定位只读 ``context.session_id``：task_id
+    缺省时取当前会话最近一个 WAITING_APPROVAL 任务；指定 task_id 时校验
+    ``origin_session_id == ctx.session_id`` 且未归档。跨会话、归档、不存在统一
+    ``task_not_found``，不泄露存在性差异。status/decision 取 service 提交结果，
+    不硬编码。``terminal=False``：审批决策不是对话终态。
+    """
 
     def __init__(self, service: UserTaskServiceProtocol):
         self.service = service
@@ -80,12 +131,18 @@ class UserTaskToolExecutor(ToolExecutor):
     ) -> ToolResult:
         start = time.monotonic()
         try:
-            if context is None or not context.session_id:
+            if context is None or not (context.session_id or "").strip():
                 raise _UserTaskDenied("session_missing")
             if request.name == USER_TASK_TOOL_CREATE:
                 payload = await self._handle_create(request, context)
             elif request.name == USER_TASK_TOOL_LIST:
                 payload = await self._handle_list(request, context)
+            elif request.name == USER_TASK_TOOL_APPROVE:
+                payload = await self._handle_approve(request, context)
+            elif request.name == USER_TASK_TOOL_REJECT:
+                payload = await self._handle_reject(request, context)
+            elif request.name == USER_TASK_TOOL_REVISE:
+                payload = await self._handle_revise(request, context)
             else:
                 raise _UserTaskInvalid(f"unknown tool: {request.name}")
             status = ToolResultStatus.SUCCESS
@@ -102,6 +159,12 @@ class UserTaskToolExecutor(ToolExecutor):
                 "items": [],
                 "count": 0,
             }
+            status = ToolResultStatus.ERROR
+        except TaskNotFoundError:
+            payload = {"success": False, "error": "task_not_found"}
+            status = ToolResultStatus.ERROR
+        except TaskStateError:
+            payload = {"success": False, "error": "task_state_invalid"}
             status = ToolResultStatus.ERROR
         except TaskValidationError:
             payload = {"success": False, "error": "task_invalid"}
@@ -244,6 +307,107 @@ class UserTaskToolExecutor(ToolExecutor):
             "count": len(items),
         }
 
+    # ------------------------------------------------------------------
+    # approve_task / reject_task / revise_task
+    # ------------------------------------------------------------------
+
+    async def _handle_approve(
+        self, request: ToolCallRequest, ctx: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        task_id_raw, note = self._parse_approval_args(request, required=False)
+        task = await self._resolve_task(task_id_raw, ctx)
+        result = await self.service.approve_change(task.id, note=note)
+        return _approval_success_payload(task, result)
+
+    async def _handle_reject(
+        self, request: ToolCallRequest, ctx: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        task_id_raw, note = self._parse_approval_args(request, required=False)
+        task = await self._resolve_task(task_id_raw, ctx)
+        result = await self.service.reject_change(task.id, note=note)
+        return _approval_success_payload(task, result)
+
+    async def _handle_revise(
+        self, request: ToolCallRequest, ctx: ToolExecutionContext,
+    ) -> dict[str, Any]:
+        task_id_raw, note = self._parse_approval_args(request, required=True)
+        task = await self._resolve_task(task_id_raw, ctx)
+        result = await self.service.revise_change(task.id, note)
+        return _approval_success_payload(task, result)
+
+    # ------------------------------------------------------------------
+    # approval helpers
+    # ------------------------------------------------------------------
+
+    def _parse_approval_args(
+        self, request: ToolCallRequest, *, required: bool,
+    ) -> tuple[str | None, str | None]:
+        """Parse and validate ``task_id`` + ``note`` from approval tool arguments.
+
+        Returns ``(task_id_raw, note)`` where ``task_id_raw`` is ``None`` when
+        absent (caller delegates to ``latest_waiting_approval_in_session``),
+        or a trimmed non-empty string when specified. ``note`` is ``None`` for
+        approve/reject when blank, or a trimmed string. Raises
+        ``_UserTaskInvalid`` with a stable code on any schema violation.
+        """
+        args = request.arguments
+        if not isinstance(args, dict):
+            raise _UserTaskInvalid("invalid_arguments")
+        # 拒绝未知字段（schema 绕过防御）
+        if any(k not in _APPROVAL_ALLOWED_FIELDS for k in args):
+            raise _UserTaskInvalid("invalid_arguments")
+
+        raw_task_id = args.get("task_id")
+        task_id: str | None
+        if raw_task_id is None:
+            task_id = None
+        elif isinstance(raw_task_id, str):
+            trimmed_id = raw_task_id.strip()
+            if not trimmed_id:
+                raise _UserTaskInvalid("invalid_arguments")
+            task_id = trimmed_id
+        else:
+            raise _UserTaskInvalid("invalid_arguments")
+
+        note = _validate_note(args.get("note"), required=required)
+        return task_id, note
+
+    async def _resolve_task(
+        self, task_id: str | None, ctx: ToolExecutionContext,
+    ) -> Task:
+        """Locate the target Task for an approval decision.
+
+        - ``task_id`` is ``None``: delegate to
+          ``latest_waiting_approval_in_session(ctx.session_id)``; no candidate
+          -> ``no_waiting_approval``.
+        - ``task_id`` specified: call ``get_task`` and verify
+          ``origin_session_id == ctx.session_id`` and ``not is_archived``;
+          cross-session / archived / not-found all map to ``task_not_found``
+          without leaking which case occurred.
+
+        ``TaskNotFoundError`` from ``get_task`` is normalized here so the
+        handler's service call (which may raise ``TaskNotFoundError`` in a
+        race) is still caught by ``execute``.
+        """
+        if task_id is None:
+            task = await self.service.latest_waiting_approval_in_session(
+                ctx.session_id,
+            )
+            if task is None:
+                raise _UserTaskInvalid("no_waiting_approval")
+            return task
+
+        try:
+            task = await self.service.get_task(task_id)
+        except TaskNotFoundError:
+            raise _UserTaskInvalid("task_not_found")
+        if (
+            getattr(task, "origin_session_id", None) != ctx.session_id
+            or getattr(task, "is_archived", False)
+        ):
+            raise _UserTaskInvalid("task_not_found")
+        return task
+
 
 # ---------------------------------------------------------------------------
 # Internal exceptions
@@ -293,3 +457,47 @@ def _dt_str(dt: Any) -> str | None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
     return str(dt)
+
+
+def _validate_note(value: Any, *, required: bool) -> str | None:
+    """Normalize an approval ``note`` argument.
+
+    - ``None`` (absent or explicit null): ``required`` -> ``note_required``;
+      otherwise -> ``None``.
+    - Non-string -> ``invalid_arguments``.
+    - Trimmed empty: ``required`` -> ``note_required``; otherwise -> ``None``.
+    - Trimmed length > ``_NOTE_MAX_CODEPOINTS`` -> ``note_too_long``.
+    - Otherwise -> trimmed string.
+    """
+    if value is None:
+        if required:
+            raise _UserTaskInvalid("note_required")
+        return None
+    if not isinstance(value, str):
+        raise _UserTaskInvalid("invalid_arguments")
+    trimmed = value.strip()
+    if not trimmed:
+        if required:
+            raise _UserTaskInvalid("note_required")
+        return None
+    if len(trimmed) > _NOTE_MAX_CODEPOINTS:
+        raise _UserTaskInvalid("note_too_long")
+    return trimmed
+
+
+def _approval_success_payload(task: Task, result: dict[str, Any]) -> dict[str, Any]:
+    """Build the whitelist success response for an approval decision.
+
+    ``id``/``title`` come from the pre-decision Task snapshot (read by
+    ``_resolve_task``); ``status``/``decision`` come from the service's
+    committed result -- never hardcoded.
+    """
+    return {
+        "success": True,
+        "task": {
+            "id": getattr(task, "id", ""),
+            "title": getattr(task, "title", ""),
+            "status": result.get("status", ""),
+            "decision": result.get("decision", ""),
+        },
+    }

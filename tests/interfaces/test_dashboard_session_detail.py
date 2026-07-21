@@ -93,3 +93,18 @@ def test_session_detail_response_includes_message_created_at(tmp_path):
     # UTC ISO（带时区），可回解析为 datetime
     parsed = datetime.fromisoformat(created_at)
     assert parsed is not None
+
+
+def test_message_to_dict_includes_source():
+    from app.interfaces.http.dashboard import _message_to_dict
+
+    m = ConversationMessage(role="user", content="x", source="task")
+    d = _message_to_dict(m)
+    assert d["source"] == "task"
+
+
+def test_message_to_dict_source_none_when_absent():
+    from app.interfaces.http.dashboard import _message_to_dict
+
+    d = _message_to_dict(ConversationMessage(role="user", content="y"))
+    assert d["source"] is None

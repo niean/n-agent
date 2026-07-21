@@ -51,9 +51,19 @@ TASK_DELEGATION_GUIDANCE = (
     "Do not delegate single-step questions, factual lookups, simple calculations, or one-shot lookups -- "
     "answer directly or use other tools instead. "
     "When list_tasks is available and the user asks about their tasks or progress, call it (it filters "
-    "to the current session) and answer naturally; if empty, say so. "
-    "Approve, reject, cancel, and retry are not handled via natural language this iteration -- tell the "
-    "user to use the /task command or the kanban board for those. "
+    "to the current session) and answer naturally; if empty, say so. When the user only asks about "
+    "progress, do not call approval tools. "
+    "When approve_task, reject_task, and revise_task are available in the current tool surface and the "
+    "user expresses an explicit approve, reject, or revise intent on a waiting-approval task, call the "
+    "matching tool. The task_id may be omitted and defaults to the latest waiting-approval task in the "
+    "current session. approve_task and reject_task accept an optional note carrying user feedback, "
+    "while revise_task requires a note carrying revision guidance. "
+    "Do not proactively call approval tools on every message or when the user has not expressed an "
+    "explicit decision intent. When the intent is ambiguous (for example only \"this won't work\" "
+    "without a way to tell reject from revise), ask a clarifying question first instead of guessing "
+    "the decision. "
+    "Cancel and retry are still not handled via natural language this iteration -- tell the user to use "
+    "the /task command or the kanban board for those. "
     "Do not delegate every message, and never delegate a goal and then also execute it yourself in the "
     "same turn."
 )
@@ -74,9 +84,10 @@ When you act as a Task worker executing an asynchronous background task, follow 
 1. First call task_show to read the full task context (title, body, pending proposals, approval decisions, progress events, comments).
 2. Do real work in the workspace using general tools; do not make assumptions without evidence.
 3. Call task_heartbeat periodically during long tasks to renew the lease and avoid being reclaimed by the dispatcher.
-4. When you encounter a change that requires a user decision (e.g., altering the plan, confirming a destructive operation, a key path divergence), call task_propose_change with a proposal text describing the change. After the call, this run ends immediately and does not continue; the task enters WAITING_APPROVAL, waiting for the user to approve or reject:
+4. When you encounter a change that requires a user decision (e.g., altering the plan, confirming a destructive operation, a key path divergence), call task_propose_change with a proposal text describing the change. Use proposal_type to select the card flavor shown to the user: 'approval' (default) when you have a concrete plan the user can approve or reject; 'intent_request' when you cannot proceed without the user providing information, intent, or clarification first (the card will show a textarea for the supplementary intent and a cancel button). After the call, this run ends immediately and does not continue; the task enters WAITING_APPROVAL, waiting for the user to approve, reject, or revise. On the next run, task_show returns the recorded decision and its note; act on it as follows:
    - If approved: proceed according to the proposal.
    - If rejected: do not execute the proposal; choose a feasible path that excludes it, or raise a new proposal.
+   - If revised: treat the decision note as this round's adjustment input; you may follow the revised path, or raise a new proposal when the revision is still infeasible. The note guides your direction only and does not promise that you will always produce the specific outcome the user expects.
 5. When done, call task_complete to submit the completion intent, with summary + metadata + artifacts.
 6. Only when you are certain the task cannot continue and must fail fast (no retry), call task_fail with a reason explaining the failure cause (e.g., a required tool is unavailable, the task instructions forbid a fallback). After the call, the task enters the FAILED terminal state with no auto-retry. Note: task_fail is a worker-initiated failure, not a user cancellation; user cancellation goes through /task cancel or the cancel button, and the worker must not trigger cancellation semantics.
 

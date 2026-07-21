@@ -23,6 +23,8 @@ from app.domain.task import (
     TaskExecutionPolicy,
     TaskNotFoundError,
     TaskNotifier,
+    ProposalResolutionCommand,
+    ProposalResolutionResult,
     TaskRegistry,
     TaskRun,
     TaskRunOutcome,
@@ -32,7 +34,92 @@ from app.domain.task import (
     TaskValidationError,
     TaskWorkspaceKind,
     TASK_TRANSITION_TABLE,
+    available_lifecycle_actions,
 )
+from app.domain.session import ConversationMessage
+
+
+# ---------------------------------------------------------------------------
+# available_lifecycle_actions: lifecycle 卡片可用动作纯函数
+# ---------------------------------------------------------------------------
+
+
+def test_available_lifecycle_actions_per_status():
+    """Default behavior (interaction_type=None / "approval") for WAITING_APPROVAL
+    returns only approve/reject. FAILED/EXPIRED unchanged; other statuses empty.
+    """
+    assert available_lifecycle_actions(TaskStatus.WAITING_APPROVAL) == ("approve", "reject")
+    assert available_lifecycle_actions(TaskStatus.FAILED) == ("retry", "cancel")
+    assert available_lifecycle_actions(TaskStatus.EXPIRED) == ("retry",)
+    assert available_lifecycle_actions(TaskStatus.QUEUED) == ()
+    assert available_lifecycle_actions(TaskStatus.RUNNING) == ()
+    assert available_lifecycle_actions(TaskStatus.SUCCEEDED) == ()
+    assert available_lifecycle_actions(TaskStatus.CANCELLED) == ()
+
+
+def test_available_lifecycle_actions_interaction_type_approval():
+    """interaction_type="approval" (explicit) -> same as default: approve/reject."""
+    assert available_lifecycle_actions(
+        TaskStatus.WAITING_APPROVAL, interaction_type="approval",
+    ) == ("approve", "reject")
+
+
+def test_available_lifecycle_actions_interaction_type_intent_request():
+    """interaction_type="intent_request" -> revise/cancel (用户补充意图并继续/取消)."""
+    assert available_lifecycle_actions(
+        TaskStatus.WAITING_APPROVAL, interaction_type="intent_request",
+    ) == ("revise", "cancel")
+
+
+def test_available_lifecycle_actions_interaction_type_ignored_for_non_waiting():
+    """FAILED/EXPIRED/其他状态忽略 interaction_type 参数，行为不变。"""
+    assert available_lifecycle_actions(
+        TaskStatus.FAILED, interaction_type="intent_request",
+    ) == ("retry", "cancel")
+    assert available_lifecycle_actions(
+        TaskStatus.EXPIRED, interaction_type="approval",
+    ) == ("retry",)
+    assert available_lifecycle_actions(
+        TaskStatus.QUEUED, interaction_type="intent_request",
+    ) == ()
+
+
+def test_available_lifecycle_actions_unknown_interaction_type_falls_back_to_approval():
+    """未知 interaction_type 值回退到 approval 行为（向后兼容）。
+
+    Domain 层不做严格校验（TaskService 层校验 proposal_type in
+    {"approval","intent_request"}）；Domain 纯函数对未知值采用保守回退，
+    只有显式 "intent_request" 才返回 revise/cancel。
+    """
+    assert available_lifecycle_actions(
+        TaskStatus.WAITING_APPROVAL, interaction_type="unknown",
+    ) == ("approve", "reject")
+    assert available_lifecycle_actions(
+        TaskStatus.WAITING_APPROVAL, interaction_type="",
+    ) == ("approve", "reject")
+
+
+# ---------------------------------------------------------------------------
+# ConversationMessage.card: 末尾默认字段，向后兼容
+# ---------------------------------------------------------------------------
+
+
+def test_conversation_message_card_default_is_none():
+    msg = ConversationMessage(role="system", content="x")
+    assert msg.card is None
+    msg_with_card = ConversationMessage(role="system", content="x", card={"kind": "task_lifecycle"})
+    assert msg_with_card.card == {"kind": "task_lifecycle"}
+
+
+def test_conversation_message_card_field_does_not_break_positional_construction():
+    """card 位于末尾且默认 None：既有位置参数构造（不传 card）保持兼容。"""
+    msg = ConversationMessage("system", "content", "id-1", None, "ui.task_lifecycle")
+    assert msg.role == "system"
+    assert msg.content == "content"
+    assert msg.id == "id-1"
+    assert msg.tool_call_id is None
+    assert msg.name == "ui.task_lifecycle"
+    assert msg.card is None
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +655,227 @@ def test_resolve_approval_rejects_non_waiting_approval():
     t = Task(id="t1", title="x", status=TaskStatus.RUNNING)
     with pytest.raises(TaskStateError):
         t.resolve_approval(approved=True)
+
+
+# ---------------------------------------------------------------------------
+# T1 (chat-approval): revise() -- third approval decision (WAITING_APPROVAL -> QUEUED)
+# ---------------------------------------------------------------------------
+
+
+def test_revise_from_waiting_approval_returns_queued():
+    """WAITING_APPROVAL.revise() 返回新的 QUEUED Task，原对象不变。
+
+    revise 是与 approve/reject 并列的第三种审批决策：用户给修改指示让 worker
+    重新执行。状态推进 WAITING_APPROVAL -> QUEUED，该转换在
+    TASK_TRANSITION_TABLE 已合法，不需改状态机。
+    """
+    original = Task(
+        id="t1",
+        title="x",
+        status=TaskStatus.WAITING_APPROVAL,
+        version=3,
+    )
+    revised = original.revise()
+
+    # 新对象状态为 QUEUED
+    assert revised.status is TaskStatus.QUEUED
+    # 原对象不变（frozen aggregate，revise 返回新实例）
+    assert original.status is TaskStatus.WAITING_APPROVAL
+    assert original.version == 3
+    # 新对象仍是同 task（id 不变）
+    assert revised.id == original.id
+    # 不改 version（状态机推进不改 version；version 由 Registry CAS 推进）
+    assert revised.version == original.version
+
+
+def test_revise_preserves_other_fields():
+    """revise() 只改 status，其余字段原样保留。"""
+    original = Task(
+        id="t1",
+        title="调研 N-Agent",
+        body="正文",
+        priority=5,
+        status=TaskStatus.WAITING_APPROVAL,
+        origin_session_id="s_1",
+        execution_session_id="s_2",
+        current_run_id=7,
+        version=4,
+    )
+    revised = original.revise()
+    assert revised.title == "调研 N-Agent"
+    assert revised.body == "正文"
+    assert revised.priority == 5
+    assert revised.origin_session_id == "s_1"
+    assert revised.execution_session_id == "s_2"
+    assert revised.current_run_id == 7
+    assert revised.version == 4
+
+
+def test_revise_rejects_all_non_waiting_approval_states():
+    """其余六种状态调用 revise() 均抛 TaskStateError。"""
+    non_waiting = [
+        TaskStatus.QUEUED,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.EXPIRED,
+    ]
+    for st in non_waiting:
+        t = Task(id="t1", title="x", status=st)
+        with pytest.raises(TaskStateError):
+            t.revise()
+
+
+def test_task_transition_table_unchanged_by_revise():
+    """revise 实现不增加新状态或转换。
+
+    WAITING_APPROVAL -> QUEUED 已在 TASK_TRANSITION_TABLE 中合法，
+    revise 复用该转换，不需要也不允许扩展状态机。
+    """
+    # 键集合仍是 7 个 Manus 状态，无新增
+    assert set(TASK_TRANSITION_TABLE.keys()) == set(TaskStatus)
+    # WAITING_APPROVAL 的出边仍是 {QUEUED, CANCELLED}，无新增
+    assert TASK_TRANSITION_TABLE[TaskStatus.WAITING_APPROVAL] == frozenset(
+        {TaskStatus.QUEUED, TaskStatus.CANCELLED}
+    )
+    # QUEUED 的出边仍是 {RUNNING, CANCELLED}，无新增
+    assert TASK_TRANSITION_TABLE[TaskStatus.QUEUED] == frozenset(
+        {TaskStatus.RUNNING, TaskStatus.CANCELLED}
+    )
+    # 状态枚举仍是 7 个值
+    assert len(list(TaskStatus)) == 7
+
+
+# ---------------------------------------------------------------------------
+# T1 (chat-approval): ProposalResolutionCommand / Result (frozen value objects)
+# ---------------------------------------------------------------------------
+
+
+def test_proposal_resolution_command_fields():
+    """ProposalResolutionCommand 字段固定为 task_id/expected_version/decision/event_kind/note。
+
+    command 不接受客户端提供的 proposal_event_id；Registry 在事务内定位
+    未决 proposal。decision/event_kind 取值语义由 service/registry 校验，
+    Domain command 层只承载字段。
+    """
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=3,
+        decision="revised",
+        event_kind="change_revised",
+        note="请用更简洁的实现",
+    )
+    assert cmd.task_id == "t_1"
+    assert cmd.expected_version == 3
+    assert cmd.decision == "revised"
+    assert cmd.event_kind == "change_revised"
+    assert cmd.note == "请用更简洁的实现"
+
+
+def test_proposal_resolution_command_note_defaults_none():
+    """note 默认 None（approve/reject 场景可能无 note；revise 由 service 校验非空）。"""
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=3,
+        decision="approved",
+        event_kind="change_approved",
+    )
+    assert cmd.note is None
+
+
+def test_proposal_resolution_command_is_frozen():
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=3,
+        decision="rejected",
+        event_kind="change_rejected",
+        note="nope",
+    )
+    with pytest.raises(Exception):
+        cmd.decision = "approved"  # type: ignore[misc]
+
+
+def test_proposal_resolution_command_field_set_is_fixed():
+    """command 字段集合精确等于 spec 声明的 5 个字段。
+
+    特别地，不接受客户端提供 proposal_event_id（Registry 在事务内定位）。
+    """
+    expected_fields = {"task_id", "expected_version", "decision", "event_kind", "note"}
+    assert set(ProposalResolutionCommand.__dataclass_fields__.keys()) == expected_fields
+    # 显式禁止客户端提供 proposal_event_id
+    assert "proposal_event_id" not in ProposalResolutionCommand.__dataclass_fields__
+
+
+def test_proposal_resolution_result_fields():
+    """ProposalResolutionResult.proposal_event_id 为非可空 int；同时返回 task 与 decision_event。"""
+    task = Task(id="t_1", title="x", status=TaskStatus.QUEUED, version=4)
+    decision_event = TaskEvent(
+        id=42,
+        task_id="t_1",
+        kind="change_revised",
+        payload={"note": "请简化"},
+        run_id=7,
+    )
+    result = ProposalResolutionResult(
+        proposal_event_id=15,
+        task=task,
+        decision_event=decision_event,
+    )
+    assert result.proposal_event_id == 15
+    assert result.task is task
+    assert result.decision_event is decision_event
+
+
+def test_proposal_resolution_result_proposal_event_id_is_non_optional_int():
+    """proposal_event_id 类型为 int（非 Optional）。
+
+    Registry 总能定位到未决 proposal（无未决时抛 TaskStateError，不构造 result），
+    因此字段非可空。
+    """
+    import typing
+
+    hints = typing.get_type_hints(ProposalResolutionResult)
+    proposal_event_id_hint = hints["proposal_event_id"]
+    # 非 Optional[int] / int | None
+    assert proposal_event_id_hint is int, (
+        f"proposal_event_id must be int, got {proposal_event_id_hint}"
+    )
+
+
+def test_proposal_resolution_result_is_frozen():
+    task = Task(id="t_1", title="x", status=TaskStatus.QUEUED)
+    decision_event = TaskEvent(id=42, task_id="t_1", kind="change_revised", payload={})
+    result = ProposalResolutionResult(
+        proposal_event_id=15,
+        task=task,
+        decision_event=decision_event,
+    )
+    with pytest.raises(Exception):
+        result.proposal_event_id = 99  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# T1 (chat-approval): TaskRegistry ports -- resolve_proposal / latest_waiting_approval_in_session
+# ---------------------------------------------------------------------------
+
+
+def test_registry_has_resolve_proposal_port():
+    """TaskRegistry 声明 resolve_proposal(command) -> ProposalResolutionResult。"""
+    assert hasattr(TaskRegistry, "resolve_proposal")
+
+
+def test_registry_has_latest_waiting_approval_in_session_port():
+    """TaskRegistry 声明 latest_waiting_approval_in_session(session_id)。"""
+    assert hasattr(TaskRegistry, "latest_waiting_approval_in_session")
+
+
+def test_registry_port_methods_are_async():
+    """两个新端口方法均为 async（与 Registry 其余方法一致）。"""
+    import inspect
+
+    assert inspect.iscoroutinefunction(TaskRegistry.resolve_proposal)
+    assert inspect.iscoroutinefunction(TaskRegistry.latest_waiting_approval_in_session)
 
 
 def test_cancel_from_queued_running_waiting_failed():

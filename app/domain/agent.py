@@ -57,3 +57,21 @@ class AgentState:
     context_message_ids: list[str] = field(default_factory=list)
     context_plan: ContextPlan | None = None
     budget_exhausted: bool = False
+    # When False, suppress persisting assistant/tool messages and tool_call
+    # audit records to the session store (tools still execute, LLM context
+    # still includes results). Used by goal_mode judge fork to keep its
+    # internal control-flow signals out of user-visible Chat history.
+    # Mirrored into run_options by AgentGraphRunner.run for central access.
+    persist_messages: bool = True
+    # Source to tag on persisted assistant messages for process-origin runs
+    # (task/schedule/curator workers), so the dashboard can hide the worker's
+    # internal chain-of-thought reasoning. Regression: worker CoT
+    # "The task requires querying weather..." leaked to the dashboard chat as a
+    # normal assistant bubble because assistant messages were persisted with
+    # source=None and rendered like a realtime reply. The reasoning stays in
+    # the store/LLM context for goal-mode continuation (unlike the judge fork,
+    # which uses persist_messages=False to drop its reasoning entirely); only
+    # the dashboard rendering hides it. None for realtime chat (api/dashboard)
+    # preserves existing assistant rendering. Set by ChatCompletionService from
+    # session_source; read by AgentGraphRunner when persisting assistant msgs.
+    message_source: str | None = None

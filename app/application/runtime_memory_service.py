@@ -221,15 +221,19 @@ class RuntimeMemoryService:
         self,
         session_id: str,
         content: Any,
+        *,
+        source: str | None = None,
     ) -> ConversationMessage:
-        return await self._append_message(session_id, "user", content)
+        return await self._append_message(session_id, "user", content, source=source)
 
     async def append_assistant_message(
         self,
         session_id: str,
         content: Any,
+        *,
+        source: str | None = None,
     ) -> ConversationMessage:
-        return await self._append_message(session_id, "assistant", content)
+        return await self._append_message(session_id, "assistant", content, source=source)
 
     async def append_tool_message(
         self,
@@ -258,6 +262,8 @@ class RuntimeMemoryService:
         session_id: str,
         role: str,
         content: Any,
+        *,
+        source: str | None = None,
     ) -> ConversationMessage:
         decision = self._evaluate(
             MemoryOperation.WRITE_MESSAGE, session_id,
@@ -265,7 +271,7 @@ class RuntimeMemoryService:
         await self._audit(decision, MemoryOperation.WRITE_MESSAGE, session_id)
         if decision.verdict is not PolicyOutcome.ALLOW:
             raise MemoryAccessDeniedError(decision, MemoryOperation.WRITE_MESSAGE)
-        message = ConversationMessage(role=role, content=content)
+        message = ConversationMessage(role=role, content=content, source=source)
         return await self._store.append_message(session_id, message)
 
     # ------------------------------------------------------------------

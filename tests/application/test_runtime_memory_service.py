@@ -588,3 +588,30 @@ class TestMemoryAccessDeniedError:
         msg = str(exc_info.value)
         assert "write_message" in msg
         assert "write denied by test stub" in msg
+
+
+class TestAppendUserMessageSource:
+    async def test_threads_source_to_store(self):
+        spy = SpyMemoryStore()
+        svc = RuntimeMemoryService(spy)
+        msg = await svc.append_user_message("s1", "work task t1", source="task")
+        assert msg.source == "task"
+        assert spy._messages[0].source == "task"
+
+    async def test_default_source_none(self):
+        spy = SpyMemoryStore()
+        svc = RuntimeMemoryService(spy)
+        msg = await svc.append_user_message("s1", "hi")
+        assert msg.source is None
+
+    async def test_source_is_keyword_only(self):
+        spy = SpyMemoryStore()
+        svc = RuntimeMemoryService(spy)
+        with pytest.raises(TypeError):
+            await svc.append_user_message("s1", "hi", "task")
+
+    async def test_assistant_message_has_no_source(self):
+        spy = SpyMemoryStore()
+        svc = RuntimeMemoryService(spy)
+        msg = await svc.append_assistant_message("s1", "ok")
+        assert msg.source is None

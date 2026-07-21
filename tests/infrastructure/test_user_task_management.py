@@ -1,8 +1,8 @@
 """用户侧任务工具执行器测试（UserTaskToolExecutor）。
 
-spec: spec-260720-chat-natural-language-task.md
-覆盖 create_task / list_tasks 的会话绑定、参数校验、错误映射、公开字段白名单、
-幂等键、分页过滤与未知工具名。
+spec: spec-260720-chat-natural-language-task.md, spec-260721-chat-nl-approval.md
+覆盖 create_task / list_tasks / approve_task / reject_task / revise_task 的会话绑定、
+参数校验、错误映射、公开字段白名单、幂等键、分页过滤与未知工具名。
 """
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from app.domain.task import (
     TaskConflictError,
     TaskListCursor,
     TaskListPage,
+    TaskNotFoundError,
+    TaskStateError,
     TaskStatus,
     TaskValidationError,
     TaskWorkspaceKind,
@@ -48,6 +50,39 @@ class FakeUserTaskService:
         self.raise_on_create: Exception | None = None
         self.raise_on_list: Exception | None = None
         self.list_calls = 0
+        # Approval-related state
+        self.approval_calls: list[dict[str, Any]] = []
+        self.tasks_by_id: dict[str, Task] = {}
+        self.latest_waiting_task: Task | None = None
+        self.latest_waiting_calls: list[str] = []
+        self.get_task_calls: list[str] = []
+        self.raise_on_approve: Exception | None = None
+        self.raise_on_reject: Exception | None = None
+        self.raise_on_revise: Exception | None = None
+        self.raise_on_get_task: Exception | None = None
+        self.raise_on_latest_waiting: Exception | None = None
+        self.approve_result: dict[str, Any] = {
+            "task_id": "t_1",
+            "decision": "approved",
+            "proposal_event_id": "e_1",
+            "note": None,
+            "status": "queued",
+        }
+        self.reject_result: dict[str, Any] = {
+            "task_id": "t_1",
+            "decision": "rejected",
+            "proposal_event_id": "e_1",
+            "note": None,
+            "status": "queued",
+        }
+        self.revise_result: dict[str, Any] = {
+            "task_id": "t_1",
+            "decision": "revised",
+            "proposal_event_id": "e_1",
+            "note": "修订指示",
+            "status": "queued",
+            "title": "标题",
+        }
 
     async def create_task(self, *, title, body="", priority=0, created_by="",
                           origin_session_id=None, idempotency_key=None,
@@ -67,6 +102,51 @@ class FakeUserTaskService:
         if self.list_pages:
             return self.list_pages.pop(0)
         return TaskListPage(items=(), next_cursor=None)
+
+    async def get_task(self, task_id: str) -> Task:
+        self.get_task_calls.append(task_id)
+        if self.raise_on_get_task is not None:
+            raise self.raise_on_get_task
+        task = self.tasks_by_id.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"task not found: {task_id}")
+        return task
+
+    async def latest_waiting_approval_in_session(self, session_id: str) -> Task | None:
+        self.latest_waiting_calls.append(session_id)
+        if self.raise_on_latest_waiting is not None:
+            raise self.raise_on_latest_waiting
+        return self.latest_waiting_task
+
+    async def approve_change(self, task_id: str, note: str | None = None) -> dict[str, Any]:
+        self.approval_calls.append({"method": "approve", "task_id": task_id, "note": note})
+        if self.raise_on_approve is not None:
+            raise self.raise_on_approve
+        result = dict(self.approve_result)
+        result["task_id"] = task_id
+        if note is not None:
+            result["note"] = note
+        return result
+
+    async def reject_change(self, task_id: str, note: str | None = None) -> dict[str, Any]:
+        self.approval_calls.append({"method": "reject", "task_id": task_id, "note": note})
+        if self.raise_on_reject is not None:
+            raise self.raise_on_reject
+        result = dict(self.reject_result)
+        result["task_id"] = task_id
+        if note is not None:
+            result["note"] = note
+        return result
+
+    async def revise_change(self, task_id: str, note: str | None = None) -> dict[str, Any]:
+        self.approval_calls.append({"method": "revise", "task_id": task_id, "note": note})
+        if self.raise_on_revise is not None:
+            raise self.raise_on_revise
+        result = dict(self.revise_result)
+        result["task_id"] = task_id
+        if note is not None:
+            result["note"] = note
+        return result
 
 
 def _ctx(session_id="sess-1", actor_id="user-1", metadata=None):
@@ -384,6 +464,549 @@ async def test_list_tasks_service_exception_returns_error_no_leak():
     assert body["items"] == []
     assert body["count"] == 0
     assert "sqlite3" not in json.dumps(body)
+
+
+# ---------------------------------------------------------------------------
+# approve_task / reject_task / revise_task -- session isolation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_task_context_none_permission_denied():
+    svc = FakeUserTaskService()
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, None)
+    assert res.status is ToolResultStatus.PERMISSION_DENIED
+    assert _payload(res)["error"] == "session_missing"
+    assert svc.approval_calls == []
+    assert svc.latest_waiting_calls == []
+    assert svc.get_task_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_task_session_id_blank_permission_denied_no_service_call():
+    svc = FakeUserTaskService()
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    for sid in (None, "", "   "):
+        res = await ex.execute(req, _ctx(session_id=sid))  # type: ignore[arg-type]
+        assert res.status is ToolResultStatus.PERMISSION_DENIED
+        assert _payload(res)["error"] == "session_missing"
+    assert svc.approval_calls == []
+    assert svc.latest_waiting_calls == []
+    assert svc.get_task_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reject_task_session_missing_no_service_call():
+    svc = FakeUserTaskService()
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="reject_task", arguments={})
+    res = await ex.execute(req, ToolExecutionContext())
+    assert res.status is ToolResultStatus.PERMISSION_DENIED
+    assert _payload(res)["error"] == "session_missing"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revise_task_session_missing_no_service_call():
+    svc = FakeUserTaskService()
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="revise_task", arguments={"note": "x"})
+    res = await ex.execute(req, ToolExecutionContext())
+    assert res.status is ToolResultStatus.PERMISSION_DENIED
+    assert _payload(res)["error"] == "session_missing"
+    assert svc.approval_calls == []
+
+
+# ---------------------------------------------------------------------------
+# approve_task / reject_task / revise_task -- task_id default & no_waiting_approval
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_task_default_uses_latest_waiting_approval():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_9", title="待批准任务",
+                                     origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.SUCCESS
+    assert svc.latest_waiting_calls == ["sess-1"]
+    assert svc.get_task_calls == []
+    assert svc.approval_calls[0]["task_id"] == "t_9"
+
+
+@pytest.mark.asyncio
+async def test_approve_task_no_waiting_approval_error():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = None
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "no_waiting_approval"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revise_task_no_waiting_approval_error():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = None
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="revise_task", arguments={"note": "改一下"})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "no_waiting_approval"
+    assert svc.approval_calls == []
+
+
+# ---------------------------------------------------------------------------
+# approve_task / reject_task / revise_task -- cross-session / archived / not-found
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_task_cross_session_task_not_found():
+    svc = FakeUserTaskService()
+    svc.tasks_by_id["t_1"] = _task(id="t_1", origin_session_id="other-session",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={"task_id": "t_1"})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "task_not_found"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_task_archived_task_not_found():
+    svc = FakeUserTaskService()
+    svc.tasks_by_id["t_1"] = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL,
+                                     is_archived=True)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={"task_id": "t_1"})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "task_not_found"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_task_nonexistent_task_not_found():
+    svc = FakeUserTaskService()
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={"task_id": "nope"})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "task_not_found"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_task_not_found_no_existence_leak():
+    """跨会话、归档、不存在三类统一 task_not_found，content 不泄露差异。"""
+    svc = FakeUserTaskService()
+    svc.tasks_by_id["t_cross"] = _task(id="t_cross", origin_session_id="other")
+    svc.tasks_by_id["t_arch"] = _task(id="t_arch", origin_session_id="sess-1",
+                                       is_archived=True)
+    ex = UserTaskToolExecutor(svc)
+    bodies = []
+    for tid in ("t_cross", "t_arch", "t_missing"):
+        req = ToolCallRequest(id="c", name="approve_task", arguments={"task_id": tid})
+        res = await ex.execute(req, _ctx(session_id="sess-1"))
+        assert res.status is ToolResultStatus.ERROR
+        body = _payload(res)
+        assert body["error"] == "task_not_found"
+        bodies.append(json.dumps(body))
+    # 三类响应内容一致（不含 task_id 差异、不含 "archived"/"cross" 等区分词）
+    assert bodies[0] == bodies[1] == bodies[2]
+    for b in bodies:
+        assert "archived" not in b
+        assert "cross" not in b
+        assert "missing" not in b
+
+
+# ---------------------------------------------------------------------------
+# approve_task / reject_task / revise_task -- argument & note validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_task_unknown_field_invalid_arguments():
+    svc = FakeUserTaskService()
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task",
+                          arguments={"task_id": "t_1", "extra": "x"})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "invalid_arguments"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_task_task_id_non_string_invalid_arguments():
+    ex = UserTaskToolExecutor(FakeUserTaskService())
+    req = ToolCallRequest(id="c", name="approve_task", arguments={"task_id": 123})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "invalid_arguments"
+
+
+@pytest.mark.asyncio
+async def test_approve_task_task_id_blank_invalid_arguments():
+    ex = UserTaskToolExecutor(FakeUserTaskService())
+    req = ToolCallRequest(id="c", name="approve_task", arguments={"task_id": "   "})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "invalid_arguments"
+
+
+@pytest.mark.asyncio
+async def test_approve_task_arguments_none_invalid_arguments():
+    """arguments 为 None（schema 绕过）-> invalid_arguments，不访问 service。"""
+    svc = FakeUserTaskService()
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments=None)  # type: ignore[arg-type]
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "invalid_arguments"
+    assert svc.approval_calls == []
+    assert svc.latest_waiting_calls == []
+    assert svc.get_task_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_task_note_non_string_invalid_arguments():
+    svc = FakeUserTaskService()
+    svc.tasks_by_id["t_1"] = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task",
+                          arguments={"task_id": "t_1", "note": 42})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "invalid_arguments"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approve_task_note_too_long():
+    svc = FakeUserTaskService()
+    svc.tasks_by_id["t_1"] = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    long_note = "字" * 2001
+    req = ToolCallRequest(id="c", name="approve_task",
+                          arguments={"task_id": "t_1", "note": long_note})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "note_too_long"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revise_task_note_required():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    # 缺省 note
+    req = ToolCallRequest(id="c", name="revise_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "note_required"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revise_task_note_blank_required():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="revise_task",
+                          arguments={"note": "   "})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "note_required"
+    assert svc.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_revise_task_note_null_required():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="revise_task",
+                          arguments={"note": None})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "note_required"
+
+
+# ---------------------------------------------------------------------------
+# approve_task / reject_task / revise_task -- exception mapping
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_task_service_not_found_error_mapped():
+    """service.approve_change 抛 TaskNotFoundError -> task_not_found。"""
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    svc.raise_on_approve = TaskNotFoundError("vanished between read and approve")
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "task_not_found"
+    assert "vanished" not in json.dumps(_payload(res))
+
+
+@pytest.mark.asyncio
+async def test_approve_task_state_error_mapped():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    svc.raise_on_approve = TaskStateError("not waiting_approval")
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "task_state_invalid"
+
+
+@pytest.mark.asyncio
+async def test_approve_task_conflict_error_mapped():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    svc.raise_on_approve = TaskConflictError("version mismatch")
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "task_conflict"
+
+
+@pytest.mark.asyncio
+async def test_revise_task_validation_error_mapped():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    svc.raise_on_revise = TaskValidationError("bad note")
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="revise_task", arguments={"note": "ok"})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    assert _payload(res)["error"] == "task_invalid"
+
+
+@pytest.mark.asyncio
+async def test_reject_task_unknown_exception_mapped_no_leak():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    svc.raise_on_reject = RuntimeError("internal db detail: sqlite3.OperationalError")
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="reject_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.ERROR
+    body = _payload(res)
+    assert body["error"] == "task_internal_error"
+    assert "sqlite3" not in json.dumps(body)
+    assert "internal db detail" not in json.dumps(body)
+
+
+# ---------------------------------------------------------------------------
+# approve_task / reject_task / revise_task -- success whitelist & terminal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_task_success_whitelist():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_7", title="周报任务",
+                                     origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.SUCCESS
+    body = _payload(res)
+    assert body["success"] is True
+    task = body["task"]
+    assert set(task) == {"id", "title", "status", "decision"}
+    assert task["id"] == "t_7"
+    assert task["title"] == "周报任务"
+    assert task["status"] == "queued"
+    assert task["decision"] == "approved"
+    assert res.terminal is False
+
+
+@pytest.mark.asyncio
+async def test_reject_task_success_whitelist():
+    svc = FakeUserTaskService()
+    svc.tasks_by_id["t_3"] = _task(id="t_3", title="拒绝任务",
+                                    origin_session_id="sess-1",
+                                    status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="reject_task", arguments={"task_id": "t_3"})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.SUCCESS
+    body = _payload(res)
+    assert body["success"] is True
+    task = body["task"]
+    assert set(task) == {"id", "title", "status", "decision"}
+    assert task["id"] == "t_3"
+    assert task["title"] == "拒绝任务"
+    assert task["status"] == "queued"
+    assert task["decision"] == "rejected"
+    assert res.terminal is False
+
+
+@pytest.mark.asyncio
+async def test_revise_task_success_whitelist():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_5", title="修订任务",
+                                     origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="revise_task", arguments={"note": "调整范围"})
+    res = await ex.execute(req, _ctx(session_id="sess-1"))
+    assert res.status is ToolResultStatus.SUCCESS
+    body = _payload(res)
+    assert body["success"] is True
+    task = body["task"]
+    assert set(task) == {"id", "title", "status", "decision"}
+    assert task["id"] == "t_5"
+    assert task["title"] == "修订任务"
+    assert task["status"] == "queued"
+    assert task["decision"] == "revised"
+    assert res.terminal is False
+
+
+@pytest.mark.asyncio
+async def test_approve_task_status_from_service_not_hardcoded():
+    """status 取 service 返回值，不硬编码 queued。"""
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    svc.approve_result = {
+        "task_id": "t_1", "decision": "approved",
+        "proposal_event_id": "e_1", "note": None,
+        "status": "running",  # 非典型值，验证不硬编码
+    }
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.SUCCESS
+    assert _payload(res)["task"]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_approve_task_does_not_read_untrusted_metadata():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx(session_id="real-sess", actor_id="real-actor",
+                                     metadata={"session_id": "forged",
+                                               "actor_id": "forged"}))
+    assert res.status is ToolResultStatus.SUCCESS
+    # 定位用 real-sess，不是 forged
+    assert svc.latest_waiting_calls == ["real-sess"]
+
+
+# ---------------------------------------------------------------------------
+# approve_task / reject_task / revise_task -- note trimming
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_approve_task_note_trimmed_passed_to_service():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task",
+                          arguments={"note": "  好的  "})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.SUCCESS
+    assert svc.approval_calls[0]["note"] == "好的"
+
+
+@pytest.mark.asyncio
+async def test_reject_task_note_trimmed_passed_to_service():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="reject_task",
+                          arguments={"note": "\t不行\n"})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.SUCCESS
+    assert svc.approval_calls[0]["note"] == "不行"
+
+
+@pytest.mark.asyncio
+async def test_revise_task_note_trimmed_passed_to_service():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="revise_task",
+                          arguments={"note": "  改一下方案  "})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.SUCCESS
+    assert svc.approval_calls[0]["note"] == "改一下方案"
+
+
+@pytest.mark.asyncio
+async def test_approve_task_note_absent_passes_none_to_service():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task", arguments={})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.SUCCESS
+    assert svc.approval_calls[0]["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_approve_task_note_blank_passes_none_to_service():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    req = ToolCallRequest(id="c", name="approve_task",
+                          arguments={"note": "   "})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.SUCCESS
+    assert svc.approval_calls[0]["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_approve_task_note_exactly_2000_chars_ok():
+    svc = FakeUserTaskService()
+    svc.latest_waiting_task = _task(id="t_1", origin_session_id="sess-1",
+                                     status=TaskStatus.WAITING_APPROVAL)
+    ex = UserTaskToolExecutor(svc)
+    note = "字" * 2000
+    req = ToolCallRequest(id="c", name="approve_task",
+                          arguments={"note": note})
+    res = await ex.execute(req, _ctx())
+    assert res.status is ToolResultStatus.SUCCESS
+    assert svc.approval_calls[0]["note"] == note
 
 
 # ---------------------------------------------------------------------------

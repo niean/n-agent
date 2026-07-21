@@ -9,6 +9,7 @@ Uses an in-memory FakeTaskRegistry to isolate from SQLite.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -20,6 +21,8 @@ from app.domain.task import (
     ClaimResult,
     FinishRunCommand,
     FinishRunResult,
+    ProposalResolutionCommand,
+    ProposalResolutionResult,
     RecoverRunCommand,
     Task,
     TaskClaimError,
@@ -56,6 +59,11 @@ class FakeTaskRegistry:
         self._notify_subs: list[dict] = []
         self._next_run_id = 1
         self._next_event_id = 1
+        # T3: track Registry port calls for "validation failure does not
+        # access Registry" assertions.
+        self.resolve_proposal_calls: list[ProposalResolutionCommand] = []
+        self.latest_waiting_approval_calls: list[str] = []
+        self.get_task_calls: list[str] = []
 
     async def create_task(self, task: Task) -> Task:
         if task.id in self._tasks:
@@ -72,6 +80,7 @@ class FakeTaskRegistry:
         return task
 
     async def get_task(self, task_id: str) -> Task | None:
+        self.get_task_calls.append(task_id)
         return self._tasks.get(task_id)
 
     async def list_tasks(self, board="default", cursor=None, limit=100,
@@ -314,6 +323,140 @@ class FakeTaskRegistry:
         ]
         return len(self._notify_subs) < before
 
+    # ------------------------------------------------------------------
+    # T3: proposal resolution port (atomic, mirrors SQLite registry)
+    # ------------------------------------------------------------------
+
+    _FAKE_DECISION_TO_KIND = {
+        "approved": "change_approved",
+        "rejected": "change_rejected",
+        "revised": "change_revised",
+    }
+    _FAKE_RESOLUTION_MARKER_KINDS = frozenset(_FAKE_DECISION_TO_KIND.values())
+
+    async def resolve_proposal(
+        self, command: ProposalResolutionCommand,
+    ) -> ProposalResolutionResult:
+        """Atomic in-memory mirror of SQLiteTaskRegistry.resolve_proposal.
+
+        Single logical transaction: entry validation, task CAS, pending
+        proposal discovery by precise ``proposal_event_id`` match, decision
+        event INSERT, task status CAS UPDATE. Returns the re-read Task and
+        the newly-appended decision event.
+        """
+        self.resolve_proposal_calls.append(command)
+
+        # 1. Entry validation (mirrors SQLite _validate_resolution_command)
+        if not command.task_id:
+            raise TaskValidationError("task_id must not be empty")
+        if command.decision not in self._FAKE_DECISION_TO_KIND:
+            raise TaskValidationError(
+                f"invalid decision: {command.decision!r}; expected one of "
+                f"{sorted(self._FAKE_DECISION_TO_KIND)}"
+            )
+        expected_kind = self._FAKE_DECISION_TO_KIND[command.decision]
+        if command.event_kind != expected_kind:
+            raise TaskValidationError(
+                f"decision/event_kind mismatch: decision={command.decision!r} "
+                f"requires event_kind={expected_kind!r}, "
+                f"got {command.event_kind!r}"
+            )
+        if command.decision == "revised":
+            if not command.note or not command.note.strip():
+                raise TaskValidationError(
+                    "revised decision requires a non-empty note"
+                )
+
+        # 2. Read task and validate state
+        task = self._tasks.get(command.task_id)
+        if task is None:
+            raise TaskNotFoundError(f"task not found: {command.task_id}")
+        if task.version != command.expected_version:
+            raise TaskConflictError(
+                f"version conflict: expected {command.expected_version}, "
+                f"got {task.version}"
+            )
+        if task.is_archived:
+            raise TaskStateError(
+                f"task {command.task_id} is archived; cannot resolve proposal"
+            )
+        if task.status is not TaskStatus.WAITING_APPROVAL:
+            raise TaskStateError(
+                f"resolve_proposal requires WAITING_APPROVAL, "
+                f"got {task.status.value}"
+            )
+
+        # 3. Find latest pending change_proposed by precise proposal_event_id
+        events = [e for e in self._events if e.task_id == command.task_id]
+        resolved_ids: set[int] = set()
+        for ev in events:
+            if ev.kind in self._FAKE_RESOLUTION_MARKER_KINDS:
+                pid = ev.payload.get("proposal_event_id")
+                if pid is not None:
+                    resolved_ids.add(int(pid))
+
+        latest_pending: TaskEvent | None = None
+        for ev in reversed(events):
+            if ev.kind == "change_proposed" and ev.id not in resolved_ids:
+                latest_pending = ev
+                break
+
+        if latest_pending is None:
+            raise TaskStateError(
+                f"task {command.task_id} has no pending change_proposed event"
+            )
+
+        proposal_event_id = latest_pending.id
+
+        # 4. Append decision event (non-null proposal_event_id)
+        now = datetime.now(timezone.utc)
+        decision_event = TaskEvent(
+            id=self._next_event_id,
+            task_id=command.task_id,
+            kind=command.event_kind,
+            payload={
+                "decision": command.decision,
+                "note": command.note,
+                "proposal_event_id": proposal_event_id,
+            },
+            run_id=None,
+            created_at=now,
+        )
+        self._next_event_id += 1
+        self._events.append(decision_event)
+
+        # 5. CAS UPDATE task: status -> QUEUED, version+1
+        from dataclasses import replace as dc_replace
+        updated_task = dc_replace(
+            task, status=TaskStatus.QUEUED, version=task.version + 1,
+            updated_at=now,
+        )
+        self._tasks[command.task_id] = updated_task
+
+        return ProposalResolutionResult(
+            proposal_event_id=proposal_event_id,
+            task=updated_task,
+            decision_event=decision_event,
+        )
+
+    async def latest_waiting_approval_in_session(
+        self, session_id: str,
+    ) -> Task | None:
+        self.latest_waiting_approval_calls.append(session_id)
+        if not session_id:
+            raise TaskValidationError("session_id must not be empty")
+        candidates = [
+            t for t in self._tasks.values()
+            if t.origin_session_id == session_id
+            and t.status == TaskStatus.WAITING_APPROVAL
+            and not t.is_archived
+        ]
+        candidates.sort(
+            key=lambda t: (t.created_at or datetime.min, t.id),
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
+
 
 class FakeMemoryStore:
     def __init__(self):
@@ -538,6 +681,71 @@ async def test_propose_change_run_id_mismatch_rejected(svc, registry):
 
 
 @pytest.mark.asyncio
+async def test_propose_change_default_proposal_type_is_approval(svc, registry):
+    """propose_change 不传 proposal_type -> 默认 approval，event payload 含 proposal_type='approval'。"""
+    task = _running_task("t_p3")
+    await registry.create_task(task)
+    run = TaskRun(
+        id=1, task_id="t_p3", status=TaskRunStatus.RUNNING,
+        claim_lock="lock-1", started_at=datetime.now(timezone.utc),
+    )
+    registry._runs[1] = run
+
+    result = await svc.propose_change("t_p3", "switch to plan B", run_id=1)
+    assert result["outcome"] == "waiting_approval"
+    assert result["proposal_type"] == "approval"
+
+    events = await registry.list_events("t_p3")
+    proposed = [e for e in events if e.kind == "change_proposed"]
+    assert len(proposed) == 1
+    assert proposed[0].payload["proposal"] == "switch to plan B"
+    assert proposed[0].payload["proposal_type"] == "approval"
+
+
+@pytest.mark.asyncio
+async def test_propose_change_intent_request_proposal_type(svc, registry):
+    """propose_change(proposal_type='intent_request') -> event payload 含 proposal_type='intent_request'。"""
+    task = _running_task("t_p4")
+    await registry.create_task(task)
+    run = TaskRun(
+        id=1, task_id="t_p4", status=TaskRunStatus.RUNNING,
+        claim_lock="lock-1", started_at=datetime.now(timezone.utc),
+    )
+    registry._runs[1] = run
+
+    result = await svc.propose_change(
+        "t_p4", "需要用户补充意图", run_id=1, proposal_type="intent_request",
+    )
+    assert result["outcome"] == "waiting_approval"
+    assert result["proposal_type"] == "intent_request"
+
+    events = await registry.list_events("t_p4")
+    proposed = [e for e in events if e.kind == "change_proposed"]
+    assert len(proposed) == 1
+    assert proposed[0].payload["proposal_type"] == "intent_request"
+
+
+@pytest.mark.asyncio
+async def test_propose_change_invalid_proposal_type_rejected(svc, registry):
+    """proposal_type 非 approval/intention_request -> TaskValidationError，不写 event。"""
+    task = _running_task("t_p5")
+    await registry.create_task(task)
+    run = TaskRun(
+        id=1, task_id="t_p5", status=TaskRunStatus.RUNNING,
+        claim_lock="lock-1", started_at=datetime.now(timezone.utc),
+    )
+    registry._runs[1] = run
+
+    with pytest.raises(TaskValidationError):
+        await svc.propose_change(
+            "t_p5", "p", run_id=1, proposal_type="unknown",
+        )
+    # 校验失败不写 event
+    events = await registry.list_events("t_p5")
+    assert not any(e.kind == "change_proposed" for e in events)
+
+
+@pytest.mark.asyncio
 async def test_approve_change_moves_to_queued(svc, registry):
     # Set up a WAITING_APPROVAL task with a prior change_proposed event
     task = _running_task("t_a1")
@@ -718,6 +926,504 @@ async def test_build_worker_context_legacy_approval_without_note(svc, registry):
 
 
 # ---------------------------------------------------------------------------
+# T3: revise_change + unified _resolve_proposal + lifecycle + worker_context
+# ---------------------------------------------------------------------------
+
+
+def _waiting_approval_task(
+    task_id: str = "t_wa",
+    *,
+    title: str = "waiting",
+    origin_session_id: str | None = None,
+) -> Task:
+    """Build a task directly in WAITING_APPROVAL (claim already released)."""
+    now = datetime.now(timezone.utc)
+    return Task(
+        id=task_id, title=title, status=TaskStatus.WAITING_APPROVAL,
+        created_at=now, created_by="u", version=1,
+        origin_session_id=origin_session_id,
+    )
+
+
+async def _seed_pending_proposal(
+    registry: FakeTaskRegistry,
+    task_id: str = "t_wa",
+    *,
+    proposal: str = "do X",
+    origin_session_id: str | None = None,
+    title: str = "waiting",
+) -> TaskEvent:
+    """Create a WAITING_APPROVAL task with a pending change_proposed event."""
+    task = _waiting_approval_task(
+        task_id, title=title, origin_session_id=origin_session_id,
+    )
+    await registry.create_task(task)
+    return await registry.append_event(
+        task_id, "change_proposed",
+        {"proposal": proposal, "run_id": 1}, run_id=1,
+    )
+
+
+class _FailingLifecycleWriter:
+    """Lifecycle writer that always raises (for failure-isolation tests)."""
+
+    def __init__(self, exc: Exception | None = None):
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self._exc = exc or RuntimeError("lifecycle writer failed")
+
+    async def __call__(
+        self, session_id: str, content: str, card: dict | None = None,
+    ):
+        self.calls.append((session_id, content, card))
+        raise self._exc
+
+
+# --- Point 1: revise_change trims note and returns full response ---
+
+
+@pytest.mark.asyncio
+async def test_revise_change_trims_note_and_returns_response(svc, registry):
+    proposal = await _seed_pending_proposal(registry, "t_rev1")
+
+    result = await svc.revise_change("t_rev1", note="  please redo with plan B  ")
+
+    assert result["task_id"] == "t_rev1"
+    assert result["title"] == "waiting"
+    assert result["status"] == "queued"
+    assert result["decision"] == "revised"
+    assert result["proposal_event_id"] == proposal.id
+    assert result["note"] == "please redo with plan B"
+
+    updated = await registry.get_task("t_rev1")
+    assert updated.status == TaskStatus.QUEUED
+
+    events = await registry.list_events("t_rev1")
+    revised = [e for e in events if e.kind == "change_revised"]
+    assert len(revised) == 1
+    assert revised[0].payload["note"] == "please redo with plan B"
+    assert revised[0].payload["proposal_event_id"] == proposal.id
+
+
+# --- Point 2: note normalization (approve/reject/revise) ---
+
+
+@pytest.mark.asyncio
+async def test_approve_note_normalizes_empty_to_none(svc, registry):
+    """approve note: missing/null/whitespace -> None."""
+    for note in (None, "   ", ""):
+        registry._tasks.clear()
+        registry._events.clear()
+        registry._next_event_id = 1
+        await _seed_pending_proposal(registry, "t_an")
+        result = await svc.approve_change("t_an", note=note)
+        assert result["note"] is None
+        events = await registry.list_events("t_an")
+        approved = [e for e in events if e.kind == "change_approved"]
+        assert approved[0].payload["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_reject_note_normalizes_empty_to_none(svc, registry):
+    """reject note: missing/null/whitespace -> None."""
+    for note in (None, "   ", ""):
+        registry._tasks.clear()
+        registry._events.clear()
+        registry._next_event_id = 1
+        await _seed_pending_proposal(registry, "t_rn")
+        result = await svc.reject_change("t_rn", note=note)
+        assert result["note"] is None
+
+
+@pytest.mark.asyncio
+async def test_revise_rejects_empty_or_whitespace_note(svc, registry):
+    """revise note: missing/null/whitespace -> TaskValidationError."""
+    for note in (None, "", "   ", "  \t  "):
+        registry._tasks.clear()
+        registry._events.clear()
+        registry._next_event_id = 1
+        await _seed_pending_proposal(registry, "t_re")
+        with pytest.raises(TaskValidationError):
+            await svc.revise_change("t_re", note=note)
+
+
+@pytest.mark.asyncio
+async def test_approval_rejects_non_string_note(svc, registry):
+    """All three decisions reject non-string note (int/list/dict)."""
+    for note in (123, ["a"], {"k": "v"}, True):
+        registry._tasks.clear()
+        registry._events.clear()
+        registry._next_event_id = 1
+        await _seed_pending_proposal(registry, "t_ns")
+        with pytest.raises(TaskValidationError):
+            await svc.approve_change("t_ns", note=note)
+        with pytest.raises(TaskValidationError):
+            await svc.reject_change("t_ns", note=note)
+        with pytest.raises(TaskValidationError):
+            await svc.revise_change("t_ns", note=note)
+
+
+@pytest.mark.asyncio
+async def test_approval_rejects_oversized_note(svc, registry):
+    """All three decisions reject note > 2000 code points."""
+    oversized = "x" * 2001
+    for method_name in ("approve_change", "reject_change", "revise_change"):
+        registry._tasks.clear()
+        registry._events.clear()
+        registry._next_event_id = 1
+        await _seed_pending_proposal(registry, "t_os")
+        method = getattr(svc, method_name)
+        with pytest.raises(TaskValidationError):
+            await method("t_os", note=oversized)
+
+
+@pytest.mark.asyncio
+async def test_approval_accepts_note_at_exactly_2000_codepoints(svc, registry):
+    """Note at exactly 2000 code points is accepted (boundary)."""
+    boundary = "x" * 2000
+    for method_name in ("approve_change", "reject_change", "revise_change"):
+        registry._tasks.clear()
+        registry._events.clear()
+        registry._next_event_id = 1
+        await _seed_pending_proposal(registry, "t_bd")
+        method = getattr(svc, method_name)
+        result = await method("t_bd", note=boundary)
+        assert result["note"] == boundary
+
+
+# --- Point 3: validation failure does not access Registry; proposal_event_id never null ---
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_does_not_access_registry(svc, registry):
+    """Service-level validation failure (empty task_id, bad note) does not
+    call Registry.resolve_proposal or Registry.get_task."""
+    # Empty task_id
+    registry.resolve_proposal_calls.clear()
+    registry.get_task_calls.clear()
+    with pytest.raises(TaskValidationError):
+        await svc.approve_change("", note="x")
+    assert registry.resolve_proposal_calls == []
+    assert registry.get_task_calls == []
+
+    # Non-string note
+    with pytest.raises(TaskValidationError):
+        await svc.reject_change("t_x", note=42)
+    assert registry.resolve_proposal_calls == []
+    assert registry.get_task_calls == []
+
+    # Oversized note
+    with pytest.raises(TaskValidationError):
+        await svc.approve_change("t_x", note="y" * 2001)
+    assert registry.resolve_proposal_calls == []
+    assert registry.get_task_calls == []
+
+    # revise with whitespace note
+    with pytest.raises(TaskValidationError):
+        await svc.revise_change("t_x", note="   ")
+    assert registry.resolve_proposal_calls == []
+    assert registry.get_task_calls == []
+
+
+@pytest.mark.asyncio
+async def test_proposal_event_id_never_null_on_success(svc, registry):
+    """proposal_event_id is always a non-null int for all three decisions."""
+    for method_name, note in (
+        ("approve_change", None),
+        ("reject_change", None),
+        ("revise_change", "redo it"),
+    ):
+        registry._tasks.clear()
+        registry._events.clear()
+        registry._next_event_id = 1
+        await _seed_pending_proposal(registry, "t_pn")
+        method = getattr(svc, method_name)
+        result = await method("t_pn", note=note)
+        assert result["proposal_event_id"] is not None
+        assert isinstance(result["proposal_event_id"], int)
+
+
+# --- Point 4: lifecycle written exactly once on success ---
+
+
+@pytest.mark.asyncio
+async def test_approve_writes_approved_lifecycle(registry, tmp_path):
+    writer = _FakeLifecycleWriter()
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        lifecycle_writer=writer,
+    )
+    await _seed_pending_proposal(
+        registry, "t_la", origin_session_id="chat-s1", title="My Task",
+    )
+
+    await svc.approve_change("t_la")
+
+    assert len(writer.calls) == 1
+    sid, content, card = writer.calls[0]
+    assert sid == "chat-s1"
+    assert content == "已批准: t_la - My Task"
+    assert card is None  # 决策回执无 card
+
+
+@pytest.mark.asyncio
+async def test_reject_writes_rejected_lifecycle(registry, tmp_path):
+    writer = _FakeLifecycleWriter()
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        lifecycle_writer=writer,
+    )
+    await _seed_pending_proposal(
+        registry, "t_lr", origin_session_id="chat-s1", title="Reject Me",
+    )
+
+    await svc.reject_change("t_lr")
+
+    assert len(writer.calls) == 1
+    sid, content, card = writer.calls[0]
+    assert sid == "chat-s1"
+    assert content == "已拒绝: t_lr - Reject Me"
+    assert card is None  # 决策回执无 card
+
+
+@pytest.mark.asyncio
+async def test_revise_writes_revised_lifecycle_with_note(registry, tmp_path):
+    writer = _FakeLifecycleWriter()
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        lifecycle_writer=writer,
+    )
+    await _seed_pending_proposal(
+        registry, "t_lrev", origin_session_id="chat-s1", title="Revise Me",
+    )
+
+    await svc.revise_change("t_lrev", note="  use plan C instead  ")
+
+    assert len(writer.calls) == 1
+    sid, content, card = writer.calls[0]
+    assert sid == "chat-s1"
+    assert content == "已修订: t_lrev - Revise Me | 修订指示: use plan C instead"
+    assert card is None  # 决策回执无 card
+
+
+# --- Point 5: lifecycle failure does not block decision; failed decision no lifecycle ---
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_writer_exception_decision_still_succeeds(registry, tmp_path):
+    """When lifecycle writer raises, the decision still succeeds and Registry
+    has exactly one decision event."""
+    writer = _FailingLifecycleWriter()
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        lifecycle_writer=writer,
+    )
+    await _seed_pending_proposal(registry, "t_lf")
+
+    result = await svc.revise_change("t_lf", note="redo")
+
+    # Decision succeeded
+    assert result["decision"] == "revised"
+    assert result["proposal_event_id"] is not None
+
+    # Registry has exactly one decision event
+    events = await registry.list_events("t_lf")
+    decision_events = [
+        e for e in events
+        if e.kind in ("change_approved", "change_rejected", "change_revised")
+    ]
+    assert len(decision_events) == 1
+    assert decision_events[0].kind == "change_revised"
+
+    # Writer was called (attempted) despite the exception
+    assert len(writer.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_decision_does_not_write_lifecycle(registry, tmp_path):
+    """Validation failure does not call the lifecycle writer."""
+    writer = _FakeLifecycleWriter()
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        lifecycle_writer=writer,
+    )
+    await _seed_pending_proposal(registry, "t_fd")
+
+    # revise with empty note -> validation failure
+    with pytest.raises(TaskValidationError):
+        await svc.revise_change("t_fd", note="   ")
+    assert writer.calls == []
+
+    # non-string note -> validation failure
+    with pytest.raises(TaskValidationError):
+        await svc.approve_change("t_fd", note=123)
+    assert writer.calls == []
+
+
+# --- Point 6: worker_context renders revised + proposal_event_id + note ---
+
+
+@pytest.mark.asyncio
+async def test_worker_context_renders_revised_decision(svc, registry):
+    """After revise, 审批决策 segment shows revised + proposal_event_id + note."""
+    proposal = await _seed_pending_proposal(registry, "t_wr")
+
+    await svc.revise_change("t_wr", note="switch to plan B")
+    updated = await registry.get_task("t_wr")
+    ctx = await svc.build_worker_context(updated)
+
+    assert "审批决策" in ctx
+    assert "revised" in ctx
+    assert f"proposal_event_id={proposal.id}" in ctx
+    assert "switch to plan B" in ctx
+
+
+@pytest.mark.asyncio
+async def test_worker_context_progress_renders_change_revised(svc, registry):
+    """After revise, 进度 segment includes a change_revised line."""
+    await _seed_pending_proposal(registry, "t_wp2")
+
+    await svc.revise_change("t_wp2", note="redo cleanly")
+    updated = await registry.get_task("t_wp2")
+    ctx = await svc.build_worker_context(updated)
+
+    assert "进度" in ctx
+    assert "change_revised" in ctx
+    assert "redo cleanly" in ctx
+
+
+@pytest.mark.asyncio
+async def test_worker_context_approved_regression_unchanged(svc, registry):
+    """approved/rejected rendering is unchanged by the revised addition."""
+    proposal = await _seed_pending_proposal(registry, "t_war")
+
+    await svc.approve_change("t_war", note="ok")
+    updated = await registry.get_task("t_war")
+    ctx = await svc.build_worker_context(updated)
+
+    assert "审批决策" in ctx
+    assert "approved" in ctx
+    assert f"proposal_event_id={proposal.id}" in ctx
+    assert "ok" in ctx
+    assert "revised" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_worker_context_rejected_regression_unchanged(svc, registry):
+    proposal = await _seed_pending_proposal(registry, "t_wrr")
+
+    await svc.reject_change("t_wrr", note="nope")
+    updated = await registry.get_task("t_wrr")
+    ctx = await svc.build_worker_context(updated)
+
+    assert "审批决策" in ctx
+    assert "rejected" in ctx
+    assert f"proposal_event_id={proposal.id}" in ctx
+    assert "nope" in ctx
+
+
+# --- Point 7: _latest_open_proposal_text treats revised as marker ---
+
+
+@pytest.mark.asyncio
+async def test_latest_open_proposal_treats_revised_as_marker(svc, registry):
+    """After revise, the proposal is no longer shown as 待审批提案."""
+    await _seed_pending_proposal(registry, "t_lm1", proposal="original plan")
+
+    await svc.revise_change("t_lm1", note="redo")
+    updated = await registry.get_task("t_lm1")
+    ctx = await svc.build_worker_context(updated)
+
+    # The proposal was resolved by the revised marker -> no 待审批提案 segment
+    assert "待审批提案" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_latest_open_proposal_precise_proposal_id_match(svc, registry):
+    """revised marker only resolves the referenced proposal_event_id; a
+    different pending proposal remains open."""
+    task = _waiting_approval_task("t_lm2")
+    await registry.create_task(task)
+    # Two proposals; only the first is resolved by the revised marker.
+    first_proposal = await registry.append_event(
+        "t_lm2", "change_proposed",
+        {"proposal": "first proposal", "run_id": 1}, run_id=1,
+    )
+    second_proposal = await registry.append_event(
+        "t_lm2", "change_proposed",
+        {"proposal": "second proposal", "run_id": 1}, run_id=1,
+    )
+
+    # Manually append a revised marker referencing the FIRST proposal only.
+    await registry.append_event(
+        "t_lm2", "change_revised",
+        {
+            "decision": "revised",
+            "note": "redo first",
+            "proposal_event_id": first_proposal.id,
+        },
+    )
+
+    updated = await registry.get_task("t_lm2")
+    ctx = await svc.build_worker_context(updated)
+
+    # The second proposal is still open -> 待审批提案 segment is present.
+    assert "待审批提案" in ctx
+    # Isolate the 待审批提案 segment: it ends at the next "## " header.
+    proposal_section = ctx.split("## 待审批提案\n", 1)[1].split("## ", 1)[0]
+    assert "second proposal" in proposal_section
+    assert "first proposal" not in proposal_section
+    assert second_proposal.id != first_proposal.id
+
+
+# --- Point 8: note does not enter logs (caplog) ---
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_failure_log_excludes_note(registry, tmp_path, caplog):
+    """When lifecycle write fails, the warning log must not contain the
+    user's revision note."""
+    writer = _FailingLifecycleWriter()
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        lifecycle_writer=writer,
+    )
+    await _seed_pending_proposal(registry, "t_nl", origin_session_id="chat-s1")
+
+    secret_note = "secret-revision-instruction-XYZ-DO-NOT-LEAK"
+    with caplog.at_level(logging.WARNING, logger="app.application.task_service"):
+        result = await svc.revise_change("t_nl", note=secret_note)
+
+    # Decision still succeeded
+    assert result["decision"] == "revised"
+    assert result["note"] == secret_note
+
+    # Log captured the lifecycle failure
+    log_text = caplog.text
+    assert "lifecycle write failed" in log_text
+    # The user note must NOT appear anywhere in the log
+    assert secret_note not in log_text
+    assert "修订指示" not in log_text
+
+
+# ---------------------------------------------------------------------------
 # cancel_task
 # ---------------------------------------------------------------------------
 
@@ -737,11 +1443,18 @@ async def test_cancel_task_from_queued(svc, registry):
 
 
 class _FakeLifecycleWriter:
-    def __init__(self):
-        self.calls: list[tuple[str, str]] = []
+    """三参 lifecycle writer（T4）：记录三元组 (session_id, content, card)。
 
-    async def __call__(self, session_id: str, content: str):
-        self.calls.append((session_id, content))
+    决策回执/取消均为纯文本 lifecycle，card 恒为 None。
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, dict | None]] = []
+
+    async def __call__(
+        self, session_id: str, content: str, card: dict | None = None,
+    ):
+        self.calls.append((session_id, content, card))
 
 
 @pytest.mark.asyncio
@@ -759,7 +1472,12 @@ async def test_cancel_task_from_queued_writes_cancelled_lifecycle(registry, tmp_
         title="完成报告", created_by="u", origin_session_id="dashboard-s1",
     )
     await svc.cancel_task(task.id)
-    assert any(sid == "dashboard-s1" and "已取消" in c for (sid, c) in writer.calls)
+    assert any(
+        sid == "dashboard-s1" and "已取消" in c
+        for (sid, c, _card) in writer.calls
+    )
+    # 取消回执无 card
+    assert all(card is None for (_sid, _c, card) in writer.calls)
 
 
 @pytest.mark.asyncio

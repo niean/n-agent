@@ -38,6 +38,7 @@ from app.domain.task import (
     BulkUpdateCommand,
     BulkUpdateItem,
     FinishRunCommand,
+    ProposalResolutionCommand,
     Task,
     TaskAttachment,
     TaskClaimError,
@@ -89,12 +90,17 @@ _DEFAULT_ATTACHMENT_TASK_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
 _INTENT_COMPLETE = "complete_requested"
 _INTENT_FAIL = "fail_requested"
 
-# Event kinds used by the propose/approve/reject/cancel/retry surface
+# Event kinds used by the propose/approve/reject/revise/cancel/retry surface
 _EVENT_CHANGE_PROPOSED = "change_proposed"
 _EVENT_CHANGE_APPROVED = "change_approved"
 _EVENT_CHANGE_REJECTED = "change_rejected"
+_EVENT_CHANGE_REVISED = "change_revised"
 _EVENT_CANCELLED = "cancelled"
 _EVENT_RETRIED = "retried"
+
+# Approval note length cap (trim'd code points). Defends worker_context budget
+# and aligns with task_routes._NOTE_MAX.
+_NOTE_MAX_CODEPOINTS = 2000
 
 # Event kinds surfaced in the worker context "progress" segment
 _PROGRESS_EVENT_KINDS: frozenset[str] = frozenset({
@@ -104,6 +110,7 @@ _PROGRESS_EVENT_KINDS: frozenset[str] = frozenset({
     _EVENT_CHANGE_PROPOSED,
     _EVENT_CHANGE_APPROVED,
     _EVENT_CHANGE_REJECTED,
+    _EVENT_CHANGE_REVISED,
     _EVENT_CANCELLED,
     _EVENT_RETRIED,
     "goal_judge_feedback",
@@ -143,7 +150,7 @@ class TaskService:
         attachments_root: Path | None = None,
         attachment_max_bytes: int = _DEFAULT_ATTACHMENT_MAX_BYTES,
         attachment_task_max_bytes: int = _DEFAULT_ATTACHMENT_TASK_MAX_BYTES,
-        lifecycle_writer: Callable[[str, str], Awaitable[Any]] | None = None,
+        lifecycle_writer: Callable[[str, str, dict[str, Any] | None], Awaitable[Any]] | None = None,
     ):
         self.registry = registry
         self.policy = policy
@@ -156,9 +163,12 @@ class TaskService:
         self.attachment_task_max_bytes = attachment_task_max_bytes
         self._run_service: Any = None
 
-    async def _write_lifecycle(self, task: Task, content: str) -> None:
+    async def _write_lifecycle(
+        self, task: Task, content: str, card: dict[str, Any] | None = None,
+    ) -> None:
         """向执行会话 best-effort 写 ui.task_lifecycle system 消息（非 RUNNING cancel 用）。
 
+        card 为可选结构化交互载荷：决策回执/取消均为纯文本 lifecycle，card 恒为 None。
         writer 为 None 时跳过；异常仅 log.warning，不阻断 cancel CAS 结果。RUNNING cancel
         由 TaskRunService.terminate -> _finish 写，此处不重复写。
         """
@@ -166,7 +176,7 @@ class TaskService:
             return
         session_id = task_execution_session_id(task)
         try:
-            await self.lifecycle_writer(session_id, content)
+            await self.lifecycle_writer(session_id, content, card)
         except Exception:
             logger.warning(
                 "lifecycle write failed for task %s", task.id, exc_info=True,
@@ -248,6 +258,23 @@ class TaskService:
         if task is None:
             raise TaskNotFoundError(f"task not found: {task_id}")
         return task
+
+    async def latest_waiting_approval_in_session(
+        self, session_id: str,
+    ) -> Task | None:
+        """Return the most recent WAITING_APPROVAL Task in ``session_id``.
+
+        Delegates to the Registry's session-scoped query. Empty ``session_id``
+        is rejected with ``TaskValidationError`` to prevent full-board scans.
+        Result satisfies ``origin_session_id == session_id``,
+        ``status == WAITING_APPROVAL``, ``not is_archived``, ordered by
+        ``created_at DESC, id DESC`` (Registry responsibility).
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise TaskValidationError("session_id must not be empty")
+        return await self.registry.latest_waiting_approval_in_session(
+            session_id.strip(),
+        )
 
     async def list_tasks(
         self,
@@ -354,7 +381,8 @@ class TaskService:
         )
 
     # ------------------------------------------------------------------
-    # Intent approval: propose_change / approve_change / reject_change
+    # Intent approval: propose_change / approve_change / reject_change /
+    # revise_change
     # ------------------------------------------------------------------
 
     async def propose_change(
@@ -362,19 +390,37 @@ class TaskService:
         task_id: str,
         proposal: str,
         run_id: int,
+        proposal_type: str = "approval",
     ) -> dict[str, Any]:
         """Worker proposes a change requiring user approval.
 
         Validates the task is RUNNING and ``run_id`` matches
         ``current_run_id``. Writes a ``change_proposed`` event (with proposal
-        + run_id), advances the task to WAITING_APPROVAL via the domain
-        method, and CAS-updates the registry. If a TaskRunService is
+        + run_id + proposal_type), advances the task to WAITING_APPROVAL via
+        the domain method, and CAS-updates the registry. If a TaskRunService is
         injected, delegates run finalization (claim release + worker cancel)
-        with outcome=waiting_approval; otherwise only state + event are
-        written (T5 wires the cleanup path).
+        with outcome=waiting_approval and the interaction_type carried on the
+        lifecycle card; otherwise only state + event are written (T5 wires
+        the cleanup path).
+
+        ``proposal_type`` selects the WAITING_APPROVAL card flavor:
+          - ``"approval"`` (default): card shows approve/reject buttons.
+          - ``"intent_request"``: card shows revise/cancel buttons + a
+            textarea so the user can supply intent/information/clarification
+            before continuing.
+
+        Any other value raises ``TaskValidationError``. The Task state
+        machine is unchanged: both flavors transition RUNNING ->
+        WAITING_APPROVAL and resolve via the same approve/reject/revise
+        decisions.
         """
         if not proposal or not proposal.strip():
             raise TaskValidationError("proposal must not be empty")
+        if proposal_type not in ("approval", "intent_request"):
+            raise TaskValidationError(
+                f"proposal_type must be 'approval' or 'intent_request', "
+                f"got {proposal_type!r}"
+            )
 
         task = await self.get_task(task_id)
         if task.status != TaskStatus.RUNNING:
@@ -389,11 +435,12 @@ class TaskService:
             raise TaskStateError("task has no active claim")
 
         # Write the change_proposed event first; its id serves as the
-        # proposal_event_id that approve/reject will reference.
+        # proposal_event_id that approve/reject will reference. proposal_type
+        # is recorded for audit / worker_context.
         event = await self.registry.append_event(
             task_id,
             _EVENT_CHANGE_PROPOSED,
-            {"proposal": proposal, "run_id": run_id},
+            {"proposal": proposal, "run_id": run_id, "proposal_type": proposal_type},
             run_id=run_id,
         )
 
@@ -405,7 +452,9 @@ class TaskService:
             finalize = getattr(self._run_service, "finalize_propose", None)
             if finalize is not None:
                 try:
-                    await finalize(task_id, run_id, task.claim_lock, proposal)
+                    await finalize(
+                        task_id, run_id, task.claim_lock, proposal, proposal_type,
+                    )
                     delegated = True
                 except Exception as exc:
                     logger.warning(
@@ -426,6 +475,7 @@ class TaskService:
         return {
             "outcome": TaskRunOutcome.WAITING_APPROVAL.value,
             "proposal": proposal,
+            "proposal_type": proposal_type,
             "run_id": run_id,
             "proposal_event_id": event.id,
             "task_id": task_id,
@@ -435,17 +485,22 @@ class TaskService:
         """User approves the latest unresolved proposal.
 
         ``note`` is an optional user-supplied approval comment/feedback;
-        persisted in the change_approved event payload and surfaced to the
+        persisted in the ``change_approved`` event payload and surfaced to the
         worker via build_worker_context on the next run.
 
-        Validates the task is WAITING_APPROVAL. Finds the latest
-        ``change_proposed`` event without a subsequent
-        ``change_approved``/``change_rejected`` event, writes a
-        ``change_approved`` event referencing it, and advances the task to
-        QUEUED via ``resolve_approval(True)``. ``scheduled_at`` is NOT
-        changed.
+        Validates the task is WAITING_APPROVAL. Delegates to the Registry's
+        atomic ``resolve_proposal`` port (single transaction: find pending
+        proposal, append decision event, CAS task -> QUEUED). After the
+        Registry succeeds, a best-effort ``ui.task_lifecycle`` message is
+        written to the task's execution session.
         """
-        return await self._resolve_approval(task_id, approved=True, note=note)
+        return await self._resolve_proposal(
+            task_id=task_id,
+            decision="approved",
+            event_kind=_EVENT_CHANGE_APPROVED,
+            note=note,
+            required=False,
+        )
 
     async def reject_change(self, task_id: str, note: str | None = None) -> dict[str, Any]:
         """User rejects the latest unresolved proposal.
@@ -454,73 +509,136 @@ class TaskService:
         contract as approve_change.
 
         Same contract as ``approve_change`` but writes ``change_rejected``
-        and calls ``resolve_approval(False)``. The task still returns to
-        QUEUED (next run may choose a different path or re-propose).
+        and the decision is ``"rejected"``. The task still returns to QUEUED
+        (next run may choose a different path or re-propose).
         """
-        return await self._resolve_approval(task_id, approved=False, note=note)
+        return await self._resolve_proposal(
+            task_id=task_id,
+            decision="rejected",
+            event_kind=_EVENT_CHANGE_REJECTED,
+            note=note,
+            required=False,
+        )
 
-    async def _resolve_approval(
-        self, task_id: str, approved: bool, note: str | None = None,
+    async def revise_change(self, task_id: str, note: str | None = None) -> dict[str, Any]:
+        """User revises the latest unresolved proposal with revision instructions.
+
+        The third approval decision alongside approve/reject: the user gives
+        the worker revision instructions (``note``) for re-execution. The note
+        is required, trimmed, persisted in a ``change_revised`` event payload,
+        and surfaced to the worker via build_worker_context.
+
+        Delegates to the same unified ``_resolve_proposal`` helper as
+        approve/reject. The response includes ``title`` for chat display.
+        """
+        result = await self._resolve_proposal(
+            task_id=task_id,
+            decision="revised",
+            event_kind=_EVENT_CHANGE_REVISED,
+            note=note,
+            required=True,
+        )
+        # revise_change adds title for chat display (approve/reject do not)
+        task = await self.get_task(task_id)
+        result["title"] = task.title
+        return result
+
+    def _normalize_note(self, *, required: bool, note: str | None) -> str | None:
+        """Normalize an approval note (service-level, no Registry access).
+
+        - Non-string (and non-None) -> TaskValidationError
+        - None or trim-empty:
+          - required=True (revise) -> TaskValidationError
+          - required=False (approve/reject) -> None (normalized)
+        - Otherwise -> stripped note
+        - > _NOTE_MAX_CODEPOINTS code points (after trim) -> TaskValidationError
+        """
+        if note is None:
+            if required:
+                raise TaskValidationError("note must not be empty")
+            return None
+        if not isinstance(note, str):
+            raise TaskValidationError("note must be a string")
+        trimmed = note.strip()
+        if not trimmed:
+            if required:
+                raise TaskValidationError("note must not be empty")
+            return None
+        if len(trimmed) > _NOTE_MAX_CODEPOINTS:
+            raise TaskValidationError(
+                f"note too long (>{_NOTE_MAX_CODEPOINTS} code points)"
+            )
+        return trimmed
+
+    async def _resolve_proposal(
+        self,
+        *,
+        task_id: str,
+        decision: str,
+        event_kind: str,
+        note: str | None,
+        required: bool,
     ) -> dict[str, Any]:
+        """Unified Application path for approve/reject/revise decisions.
+
+        Single atomic flow:
+          1. Service-level validation (task_id + note) -- no Registry access.
+          2. Read Task to obtain ``expected_version`` and check status is
+             WAITING_APPROVAL.
+          3. Call ``registry.resolve_proposal`` (single transaction: locate
+             pending proposal, append decision event, CAS task -> QUEUED).
+          4. Best-effort ``ui.task_lifecycle`` write to the task's execution
+             session (writer None -> skip; exception -> log.warning, decision
+             still succeeds).
+          5. Return a stable whitelist response from the Registry result.
+
+        The old non-atomic ``_resolve_approval`` path (append_event +
+        update_task as separate calls) has been removed; all three decisions
+        now go through this helper and the Registry's atomic port.
+        """
+        # 1. Service-level validation (no Registry access)
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise TaskValidationError("task_id must not be empty")
+        normalized_note = self._normalize_note(required=required, note=note)
+
+        # 2. Read Task for expected_version + status check
         task = await self.get_task(task_id)
         if task.status != TaskStatus.WAITING_APPROVAL:
             raise TaskStateError(
-                f"resolve_approval requires WAITING_APPROVAL, "
+                f"resolve_proposal requires WAITING_APPROVAL, "
                 f"got {task.status.value}"
             )
 
-        proposal_event_id = await self._find_latest_open_proposal(task_id)
-        decision = "approved" if approved else "rejected"
-        event_kind = (
-            _EVENT_CHANGE_APPROVED if approved else _EVENT_CHANGE_REJECTED
+        # 3. Atomic resolution via Registry port
+        command = ProposalResolutionCommand(
+            task_id=task_id,
+            expected_version=task.version,
+            decision=decision,
+            event_kind=event_kind,
+            note=normalized_note,
         )
-        payload: dict[str, Any] = {
-            "decision": decision,
-            "note": note,
-        }
-        if proposal_event_id is not None:
-            payload["proposal_event_id"] = proposal_event_id
+        result = await self.registry.resolve_proposal(command)
 
-        await self.registry.append_event(task_id, event_kind, payload)
+        # 4. Best-effort lifecycle write (does not block the decision)
+        if decision == "approved":
+            content = f"已批准: {result.task.id} - {result.task.title}"
+        elif decision == "rejected":
+            content = f"已拒绝: {result.task.id} - {result.task.title}"
+        else:  # revised
+            content = (
+                f"已修订: {result.task.id} - {result.task.title} | "
+                f"修订指示: {normalized_note or ''}"
+            )
+        await self._write_lifecycle(result.task, content, card=None)
 
-        updated = task.resolve_approval(approved)
-        # scheduled_at is intentionally NOT changed (spec).
-        await self.registry.update_task(
-            task_id,
-            {"status": updated.status},
-            task.version,
-        )
+        # 5. Stable whitelist response (Registry result is the source of truth)
         return {
             "task_id": task_id,
             "decision": decision,
-            "proposal_event_id": proposal_event_id,
-            "note": note,
-            "status": updated.status.value,
+            "proposal_event_id": result.proposal_event_id,
+            "note": normalized_note,
+            "status": result.task.status.value,
         }
-
-    async def _find_latest_open_proposal(self, task_id: str) -> int | None:
-        """Return the id of the latest unresolved ``change_proposed`` event.
-
-        "Unresolved" = no ``change_approved``/``change_rejected`` event
-        with id greater than the proposal's id exists.
-        """
-        events = await self.registry.list_events(
-            task_id, limit=_MAX_EVENTS_IN_DETAIL
-        )
-        # Walk backwards to find the latest change_proposed.
-        for event in reversed(events):
-            if event.kind != _EVENT_CHANGE_PROPOSED:
-                continue
-            # Check if a later decision event exists.
-            resolved = any(
-                e.id > event.id
-                and e.kind in (_EVENT_CHANGE_APPROVED, _EVENT_CHANGE_REJECTED)
-                and e.payload.get("proposal_event_id") == event.id
-                for e in events
-            )
-            if not resolved:
-                return event.id
-        return None
 
     # ------------------------------------------------------------------
     # cancel_task / retry_task (user actions)
@@ -567,7 +685,9 @@ class TaskService:
             {"status": TaskStatus.CANCELLED},
             task.version,
         )
-        await self._write_lifecycle(task, f"[任务状态] 已取消: {task.id} - {task.title}")
+        await self._write_lifecycle(
+            task, f"已取消: {task.id} - {task.title}", card=None,
+        )
         await self.registry.append_event(
             task_id,
             _EVENT_CANCELLED,
@@ -988,9 +1108,10 @@ class TaskService:
           - Goal mode / skills (if set)
           - Identity (task_id, status, is_archived)
           - 待审批提案: latest unresolved ``change_proposed`` event
-          - 审批决策: latest ``change_approved`` / ``change_rejected`` event
+          - 审批决策: latest ``change_approved`` / ``change_rejected`` /
+            ``change_revised`` event
           - 进度: recent events (comment/complete/propose/approve/reject/
-            retry/cancel/finished)
+            revise/retry/cancel/finished)
 
         Host absolute paths (e.g. workspace_path) are NOT emitted.
         """
@@ -1052,13 +1173,23 @@ class TaskService:
     def _latest_open_proposal_text(
         self, events: tuple[TaskEvent, ...]
     ) -> str | None:
-        """Return the proposal text of the latest unresolved proposal."""
+        """Return the proposal text of the latest unresolved proposal.
+
+        "Unresolved" = no later ``change_approved``/``change_rejected``/
+        ``change_revised`` event references this proposal's id via its
+        ``proposal_event_id`` payload. The precise id match (not marker
+        time) correctly handles interleaved proposals and markers.
+        """
         for event in reversed(events):
             if event.kind != _EVENT_CHANGE_PROPOSED:
                 continue
             resolved = any(
                 e.id > event.id
-                and e.kind in (_EVENT_CHANGE_APPROVED, _EVENT_CHANGE_REJECTED)
+                and e.kind in (
+                    _EVENT_CHANGE_APPROVED,
+                    _EVENT_CHANGE_REJECTED,
+                    _EVENT_CHANGE_REVISED,
+                )
                 and e.payload.get("proposal_event_id") == event.id
                 for e in events
             )
@@ -1077,6 +1208,10 @@ class TaskService:
                 return base + (f", note={note}" if note else "")
             if event.kind == _EVENT_CHANGE_REJECTED:
                 base = f"rejected (proposal_event_id={event.payload.get('proposal_event_id')})"
+                note = event.payload.get("note")
+                return base + (f", note={note}" if note else "")
+            if event.kind == _EVENT_CHANGE_REVISED:
+                base = f"revised (proposal_event_id={event.payload.get('proposal_event_id')})"
                 note = event.payload.get("note")
                 return base + (f", note={note}" if note else "")
         return None
@@ -1110,6 +1245,9 @@ class TaskService:
             elif event.kind == _EVENT_CHANGE_REJECTED:
                 note = event.payload.get("note")
                 lines.append(f"[{ts}] change_rejected" + (f": {note}" if note else ""))
+            elif event.kind == _EVENT_CHANGE_REVISED:
+                note = event.payload.get("note")
+                lines.append(f"[{ts}] change_revised" + (f": {note}" if note else ""))
             elif event.kind == _EVENT_CANCELLED:
                 lines.append(f"[{ts}] cancelled")
             elif event.kind == _EVENT_RETRIED:

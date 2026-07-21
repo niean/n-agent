@@ -56,6 +56,8 @@ from app.domain.task import (
     DeliveryResult,
     FinishRunCommand,
     FinishRunResult,
+    ProposalResolutionCommand,
+    ProposalResolutionResult,
     RecoverRunCommand,
     Task,
     TaskAttachment,
@@ -70,6 +72,7 @@ from app.domain.task import (
     TaskRun,
     TaskRunOutcome,
     TaskRunStatus,
+    TaskStateError,
     TaskStatus,
     TaskValidationError,
     TaskWorkspaceKind,
@@ -207,6 +210,26 @@ CREATE INDEX IF NOT EXISTS idx_notify_task ON task_notify_subs(task_id);
 _POST_MIGRATION_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_tasks_is_archived ON tasks(is_archived);
 """
+
+# ---------------------------------------------------------------------------
+# Proposal resolution constants
+# ---------------------------------------------------------------------------
+
+# Decision string -> resolution marker event kind.
+_DECISION_TO_EVENT_KIND: dict[str, str] = {
+    "approved": "change_approved",
+    "rejected": "change_rejected",
+    "revised": "change_revised",
+}
+
+# All resolution marker kinds (used to detect already-resolved proposals).
+_RESOLUTION_MARKER_KINDS: frozenset[str] = frozenset(
+    _DECISION_TO_EVENT_KIND.values()
+)
+
+# The proposal event kind written by TaskService when a worker requests
+# user approval (pending until a resolution marker closes it).
+_PROPOSAL_KIND = "change_proposed"
 
 # ---------------------------------------------------------------------------
 # Field <-> column mapping for update_task / bulk_update
@@ -1387,6 +1410,222 @@ class SQLiteTaskRegistry:
         return [self._row_to_run(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # Proposal resolution (sync) -- single-transaction CAS
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_resolution_command(command: ProposalResolutionCommand) -> None:
+        """Entry-level defensive validation (no DB access).
+
+        Checks the decision/event_kind correspondence and the revised-note
+        invariant. Raises ``TaskValidationError`` on any violation. Called
+        before opening the transaction so no DB side-effects are possible
+        when the command itself is malformed.
+        """
+        if not command.task_id:
+            raise TaskValidationError("task_id must not be empty")
+        decision = command.decision
+        if decision not in _DECISION_TO_EVENT_KIND:
+            raise TaskValidationError(
+                f"invalid decision: {decision!r}; expected one of "
+                f"{sorted(_DECISION_TO_EVENT_KIND)}"
+            )
+        expected_kind = _DECISION_TO_EVENT_KIND[decision]
+        if command.event_kind != expected_kind:
+            raise TaskValidationError(
+                f"decision/event_kind mismatch: decision={decision!r} "
+                f"requires event_kind={expected_kind!r}, "
+                f"got {command.event_kind!r}"
+            )
+        if decision == "revised":
+            if not command.note or not command.note.strip():
+                raise TaskValidationError(
+                    "revised decision requires a non-empty note"
+                )
+
+    def _resolve_proposal_sync(
+        self, command: ProposalResolutionCommand
+    ) -> ProposalResolutionResult:
+        """Atomically resolve the latest pending ``change_proposed`` event.
+
+        Single ``BEGIN IMMEDIATE`` transaction:
+          1. Entry validation (decision/event_kind, revised note).
+          2. Read task; reject if missing/archived/wrong-status/version-mismatch.
+          3. Read the FULL event history (no ``_MAX_EVENTS_IN_DETAIL`` cap)
+             and locate the latest ``change_proposed`` whose ``id`` is not
+             referenced by any resolution marker's ``proposal_event_id``
+             payload. This precise payload match (not marker time) correctly
+             handles interleaved proposals and markers.
+          4. INSERT the decision event with payload
+             ``{"decision", "note", "proposal_event_id"}`` (non-null id).
+          5. CAS UPDATE the task row: ``WHERE id AND expected_version AND
+             status='waiting_approval' AND is_archived=0``; require
+             ``rowcount == 1`` else rollback + ``TaskConflictError``.
+          6. Commit and return the re-read Task/Event.
+        """
+        # 1. Entry validation (before any DB access)
+        self._validate_resolution_command(command)
+
+        task_id = command.task_id
+        expected_version = command.expected_version
+        now = _now()
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            # 2. Read task and validate state
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task_row is None:
+                conn.rollback()
+                raise TaskNotFoundError(f"task not found: {task_id}")
+
+            task = self._row_to_task(task_row)
+
+            # Version check first: a stale expected_version means a concurrent
+            # writer already modified the task; this is a conflict, not a
+            # state error, even if the status also changed as a consequence.
+            if task.version != expected_version:
+                conn.rollback()
+                raise TaskConflictError(
+                    f"version conflict: expected {expected_version}, "
+                    f"got {task.version}"
+                )
+            if task.is_archived:
+                conn.rollback()
+                raise TaskStateError(
+                    f"task {task_id} is archived; cannot resolve proposal"
+                )
+            if task.status is not TaskStatus.WAITING_APPROVAL:
+                conn.rollback()
+                raise TaskStateError(
+                    f"resolve_proposal requires WAITING_APPROVAL, "
+                    f"got {task.status.value}"
+                )
+
+            # 3. Read full event history (no LIMIT cap) and find the latest
+            #    unresolved change_proposed by precise proposal_event_id match.
+            event_rows = conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+            events = [self._row_to_event(r) for r in event_rows]
+
+            resolved_ids: set[int] = set()
+            for ev in events:
+                if ev.kind in _RESOLUTION_MARKER_KINDS:
+                    pid = ev.payload.get("proposal_event_id")
+                    if pid is not None:
+                        resolved_ids.add(int(pid))
+
+            latest_pending: TaskEvent | None = None
+            for ev in reversed(events):
+                if ev.kind == _PROPOSAL_KIND and ev.id not in resolved_ids:
+                    latest_pending = ev
+                    break
+
+            if latest_pending is None:
+                conn.rollback()
+                raise TaskStateError(
+                    f"task {task_id} has no pending change_proposed event"
+                )
+
+            proposal_event_id = latest_pending.id
+
+            # 4. INSERT decision event (non-null proposal_event_id)
+            decision_payload = {
+                "decision": command.decision,
+                "note": command.note,
+                "proposal_event_id": proposal_event_id,
+            }
+            event_cursor = conn.execute(
+                """
+                INSERT INTO task_events (task_id, run_id, kind, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    None,  # resolution markers are not tied to a specific run
+                    command.event_kind,
+                    _json_dumps(decision_payload),
+                    _dt_to_str(now),
+                ),
+            )
+            decision_event_id = event_cursor.lastrowid
+
+            # 5. CAS UPDATE with rowcount check (defensive: within BEGIN
+            #    IMMEDIATE the row should always match, but if it doesn't
+            #    we must rollback to avoid an orphan decision event).
+            cas_cursor = conn.execute(
+                """
+                UPDATE tasks SET
+                    status = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND version = ?
+                  AND status = ? AND is_archived = 0
+                """,
+                (
+                    TaskStatus.QUEUED.value,
+                    _dt_to_str(now),
+                    task_id,
+                    expected_version,
+                    TaskStatus.WAITING_APPROVAL.value,
+                ),
+            )
+            if cas_cursor.rowcount != 1:
+                conn.rollback()
+                raise TaskConflictError(
+                    f"resolve_proposal CAS failed: task={task_id} "
+                    f"expected_version={expected_version} rowcount={cas_cursor.rowcount}"
+                )
+
+            # 6. Re-read final state and commit
+            final_task_row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            decision_event_row = conn.execute(
+                "SELECT * FROM task_events WHERE id = ?",
+                (decision_event_id,),
+            ).fetchone()
+            conn.commit()
+
+        return ProposalResolutionResult(
+            proposal_event_id=proposal_event_id,
+            task=self._row_to_task(final_task_row),
+            decision_event=self._row_to_event(decision_event_row),
+        )
+
+    def _latest_waiting_approval_in_session_sync(
+        self, session_id: str
+    ) -> Task | None:
+        """Return the latest WAITING_APPROVAL task in a session.
+
+        Filters by ``origin_session_id``, ``status='waiting_approval'``, and
+        ``is_archived=0``. Sorts by ``created_at DESC, id DESC`` for a stable
+        deterministic order (id breaks created_at ties). Returns ``None``
+        when no candidate exists. Raises ``TaskValidationError`` for an
+        empty session_id.
+
+        Uses a dedicated single SQL query (not ``list_tasks`` pagination)
+        with ``LIMIT 1`` for efficiency.
+        """
+        if not session_id:
+            raise TaskValidationError("session_id must not be empty")
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE origin_session_id = ?
+                  AND status = ?
+                  AND is_archived = 0
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (session_id, TaskStatus.WAITING_APPROVAL.value),
+            ).fetchone()
+        return self._row_to_task(row) if row else None
+
+    # ------------------------------------------------------------------
     # Attachments (sync)
     # ------------------------------------------------------------------
 
@@ -1644,6 +1883,18 @@ class SQLiteTaskRegistry:
 
     async def recover_run(self, command: RecoverRunCommand) -> FinishRunResult:
         return await asyncio.to_thread(self._recover_run_sync, command)
+
+    async def resolve_proposal(
+        self, command: ProposalResolutionCommand
+    ) -> ProposalResolutionResult:
+        return await asyncio.to_thread(self._resolve_proposal_sync, command)
+
+    async def latest_waiting_approval_in_session(
+        self, session_id: str
+    ) -> Task | None:
+        return await asyncio.to_thread(
+            self._latest_waiting_approval_in_session_sync, session_id
+        )
 
     async def list_queued_due(
         self,

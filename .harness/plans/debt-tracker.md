@@ -36,6 +36,8 @@
 | D032 | Dashboard Chat `/task list` 仅取首页分页：`api.task.list()` 返回 `{items, next_cursor}`，前端按 `origin_session_id` 过滤首页 100 条后不消费 `next_cursor`，单会话任务超 100 条时漏显。spec 约定本期不改后端 `list_tasks`，故前端只过滤首页。后续需后端支持 session/cursor 过滤或前端聚合全部分页。 | low | plan-260720-task-chat-lifecycle.md | 2026-07-20 | open |
 | D033 | 自然语言任务管控：创建+查询已由 plan-260720-chat-natural-language-task.md 实现（用户侧 create_task/list_tasks SAFE 工具 + Agent 委派指引，realtime 可见/worker 防递归）；状态变更类管控（approve/reject/cancel/retry 用自然语言承载）仍为未来 TODO，本期继续走 /task 命令与看板。 | low | plan-260720-chat-natural-language-task.md | 2026-07-20 | open |
 | D034 | UserTaskToolExecutor.list_tasks 穷尽 TaskService 全局 board 分页后再按 origin_session_id 过滤，单 board 任务量大时查询成本线性增长。本期按 spec 保持现有数据模型不新增索引或 session 查询接口；后续可加 session 维度查询。 | low | plan-260720-chat-natural-language-task.md | 2026-07-20 | open |
+| D035 | `tests/interfaces/chat_frontend_harness.js` 的轻量 DOM stub（makeEl）缺少完整 querySelector、事件和可访问性语义；本期 Chat 任务卡片交互化只补实现所需的最小能力（findDescendants 递归 _kids、textContent、aria-live、label 包裹）。键盘操作/完整可访问性语义无法在 Node harness 可靠验证，后续需引入浏览器级前端测试。 | low | plan-260721-chat-interactive-card.md | 2026-07-21 | open |
+| D036 | `tests/e2e/` 当前无可控的 task worker proposal/claim fixture，Chat 任务卡片交互化的真实浏览器+真实 worker 全链路 E2E 无法自动化；本期端到端证据由跨层 pytest + Node harness 组成。后续需补建稳定 task worker E2E fixture。 | low | plan-260721-chat-interactive-card.md | 2026-07-21 | open |
 
 ---
 

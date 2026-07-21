@@ -47,6 +47,8 @@ class SQLiteMemoryStore:
                     name TEXT,
                     is_summary INTEGER NOT NULL DEFAULT 0,
                     is_summarized INTEGER NOT NULL DEFAULT 0,
+                    source TEXT,
+                    card_json TEXT,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
                 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -96,6 +98,8 @@ class SQLiteMemoryStore:
             self._ensure_sessions_acp_metadata_column(conn)
             self._migrate_add_is_summary_column(conn)
             self._migrate_add_is_summarized_column(conn)
+            self._migrate_add_source_column(conn)
+            self._migrate_add_card_column(conn)
             self._migrate_mark_legacy_middle_summarized(
                 conn,
                 protect_first_n=self._migration_protect_first_n,
@@ -169,8 +173,8 @@ class SQLiteMemoryStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized, source, card_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -183,6 +187,8 @@ class SQLiteMemoryStore:
                     message.name,
                     1 if message.is_summary else 0,
                     1 if message.is_summarized else 0,
+                    message.source,
+                    json.dumps(message.card, ensure_ascii=False) if message.card is not None else None,
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (message.created_at.isoformat(), session_id))
@@ -211,8 +217,8 @@ class SQLiteMemoryStore:
                     return None
                 conn.execute(
                     """
-                    INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized, source, card_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message.id,
@@ -225,6 +231,8 @@ class SQLiteMemoryStore:
                         message.name,
                         1 if message.is_summary else 0,
                         1 if message.is_summarized else 0,
+                        message.source,
+                        json.dumps(message.card, ensure_ascii=False) if message.card is not None else None,
                     ),
                 )
                 # updated_at = max(原值, message.created_at)，防迟到客户端时间令活动时间倒退
@@ -257,6 +265,8 @@ class SQLiteMemoryStore:
                 created_at=datetime.fromisoformat(row["created_at"]),
                 is_summary=bool(row["is_summary"]),
                 is_summarized=bool(row["is_summarized"]) if "is_summarized" in row.keys() else False,
+                source=row["source"] if "source" in row.keys() else None,
+                card=self._decode_message_card(row),
             )
             for row in rows
         ]
@@ -400,8 +410,8 @@ class SQLiteMemoryStore:
             conn.execute(
                 """
                 INSERT INTO messages(id, session_id, role, content_json, created_at,
-                    provider_message_id, tool_call_id, name, is_summary, is_summarized)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider_message_id, tool_call_id, name, is_summary, is_summarized, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -414,6 +424,7 @@ class SQLiteMemoryStore:
                     message.name,
                     1,
                     0,
+                    message.source,
                 ),
             )
             conn.execute(
@@ -550,8 +561,8 @@ class SQLiteMemoryStore:
                 conn.execute(
                     """
                     INSERT INTO messages(id, session_id, role, content_json, created_at,
-                        provider_message_id, tool_call_id, name)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        provider_message_id, tool_call_id, name, is_summary, is_summarized, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_msg_id,
@@ -562,6 +573,9 @@ class SQLiteMemoryStore:
                         mrow["provider_message_id"],
                         mrow["tool_call_id"],
                         mrow["name"],
+                        mrow["is_summary"] if "is_summary" in mrow.keys() else 0,
+                        mrow["is_summarized"] if "is_summarized" in mrow.keys() else 0,
+                        mrow["source"] if "source" in mrow.keys() else None,
                     ),
                 )
             # Clone tool_calls: regenerate ids, rebuild message_id linkage via msg_id_map.
@@ -666,6 +680,42 @@ class SQLiteMemoryStore:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "is_summarized" not in columns:
             conn.execute("ALTER TABLE messages ADD COLUMN is_summarized INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _migrate_add_source_column(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "source" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN source TEXT")
+
+    @staticmethod
+    def _migrate_add_card_column(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "card_json" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN card_json TEXT")
+
+    @staticmethod
+    def _decode_message_card(row: sqlite3.Row) -> dict[str, Any] | None:
+        """Decode card_json; tolerate missing/NULL/invalid without losing the message.
+
+        Returns None for missing column, NULL, invalid JSON, or non-object JSON
+        (scalar/array). Only card_json is tolerated; content_json errors are NOT
+        masked and propagate normally.
+        """
+        keys = set(row.keys())
+        if "card_json" not in keys:
+            return None
+        raw = row["card_json"]
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("invalid card_json ignored: %.200r", raw)
+            return None
+        if not isinstance(value, dict):
+            logger.warning("non-object card_json ignored: %.200r", raw)
+            return None
+        return value
 
     @staticmethod
     def _migrate_mark_legacy_middle_summarized(

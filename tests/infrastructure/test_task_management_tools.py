@@ -61,9 +61,9 @@ class FakeTaskService:
         self._record("add_comment", task_id=task_id, body=body, author=author)
         return {"task_id": task_id, "comment_added": True}
 
-    async def propose_change(self, task_id, proposal, run_id):
-        self._record("propose_change", task_id=task_id, proposal=proposal, run_id=run_id)
-        return {"task_id": task_id, "intent": "propose_change", "proposal": proposal}
+    async def propose_change(self, task_id, proposal, run_id, proposal_type="approval"):
+        self._record("propose_change", task_id=task_id, proposal=proposal, run_id=run_id, proposal_type=proposal_type)
+        return {"task_id": task_id, "intent": "propose_change", "proposal": proposal, "proposal_type": proposal_type}
 
     async def cancel_task(self, task_id):
         self._record("cancel_task", task_id=task_id)
@@ -249,7 +249,50 @@ async def test_task_propose_change_dispatches_with_run_id():
     payload = _payload(result)
     assert payload["intent"] == "propose_change"
     assert result.terminal is True
-    assert any(c[0] == "propose_change" and c[1]["run_id"] == 7 and c[1]["proposal"] == "switch approach" for c in fake.calls)
+    # 默认 proposal_type='approval'（未传参数时）
+    assert any(
+        c[0] == "propose_change" and c[1]["run_id"] == 7
+        and c[1]["proposal"] == "switch approach"
+        and c[1]["proposal_type"] == "approval"
+        for c in fake.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_propose_change_routes_intent_request_proposal_type():
+    """proposal_type='intent_request' 从工具参数透传到 TaskService.propose_change。"""
+    fake = FakeTaskService(tasks={"t_1": _task("t_1")})
+    executor = TaskManagementToolExecutor(fake)
+    ctx = _trusted_ctx(task_id="t_1", run_id=3)
+    result = await executor.execute(
+        _req("task_propose_change", {
+            "proposal": "需要用户补充信息",
+            "proposal_type": "intent_request",
+        }), ctx,
+    )
+    assert result.status is ToolResultStatus.SUCCESS
+    payload = _payload(result)
+    assert payload["proposal_type"] == "intent_request"
+    assert any(
+        c[0] == "propose_change" and c[1]["proposal_type"] == "intent_request"
+        for c in fake.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_propose_change_rejects_invalid_proposal_type():
+    """proposal_type 非 approval/intent_request -> ERROR，不调用 TaskService。"""
+    fake = FakeTaskService(tasks={"t_1": _task("t_1")})
+    executor = TaskManagementToolExecutor(fake)
+    ctx = _trusted_ctx(task_id="t_1", run_id=1)
+    result = await executor.execute(
+        _req("task_propose_change", {
+            "proposal": "p",
+            "proposal_type": "bogus",
+        }), ctx,
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert not any(c[0] == "propose_change" for c in fake.calls)
 
 
 @pytest.mark.asyncio

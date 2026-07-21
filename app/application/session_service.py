@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import logging
 from collections.abc import Awaitable, Callable
@@ -222,19 +223,35 @@ class SessionService:
         )
 
     async def append_task_lifecycle_message(
-        self, session_id: str, content: str,
+        self, session_id: str, content: str, card: dict[str, Any] | None = None,
     ) -> ConversationMessage:
         """持久化任务生命周期状态通知。固定 role=system、name=ui.task_lifecycle。
 
         由 TaskRunService/TaskService 在状态 CAS 成功后 best-effort 调用，不走 HTTP。
         服务端构造的正文按 UTF-8 安全截断，不因超长丢失生命周期信号。
+        card 为可选结构化交互载荷，经 _normalize_card 复制并截断 summary 后持久化。
         """
         return await self._append_system_message(
-            session_id, "ui.task_lifecycle", content, truncate=True
+            session_id, "ui.task_lifecycle", content, truncate=True, card=card,
+        )
+
+    async def append_task_result_message(
+        self, session_id: str, content: str,
+    ) -> ConversationMessage:
+        """持久化任务最终结果。固定 role=system、name=ui.task_result。
+
+        所有任务结束情况（SUCCEEDED/FAILED/CANCELLED/EXPIRED）均由 TaskRunService
+        best-effort 调用，最终结果以普通消息形式渲染、打印在 Chat 框（可见结果）；
+        与之并存的是 ui.task_lifecycle 任务状态卡片（状态通知，折叠）。role=system 使其
+        被 ContextService 排除出模型候选，不污染上下文。服务端构造的正文按 UTF-8 安全截断。
+        """
+        return await self._append_system_message(
+            session_id, "ui.task_result", content, truncate=True
         )
 
     async def _append_system_message(
         self, session_id: str, name: str, content: str, *, truncate: bool,
+        card: dict[str, Any] | None = None,
     ) -> ConversationMessage:
         if not isinstance(content, str):
             raise SessionValidationError("content must be a string")
@@ -245,11 +262,23 @@ class SessionService:
             cleaned = _truncate_task_message_utf8(cleaned)
         elif len(cleaned.encode("utf-8")) > _TASK_MESSAGE_MAX_BYTES:
             raise SessionValidationError("content too large")
-        message = ConversationMessage(role="system", name=name, content=cleaned)
+        normalized_card = self._normalize_card(card)
+        message = ConversationMessage(role="system", name=name, content=cleaned, card=normalized_card)
         result = await self.memory_store.append_message_if_session_exists(session_id, message)
         if result is None:
             raise SessionNotFoundError(session_id)
         return result
+
+    @staticmethod
+    def _normalize_card(card: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Copy caller dict (deep) and truncate summary to the message byte cap; never mutate input."""
+        if card is None:
+            return None
+        normalized = copy.deepcopy(card)
+        summary = normalized.get("summary")
+        if isinstance(summary, str):
+            normalized["summary"] = _truncate_task_message_utf8(summary)
+        return normalized
 
 
 # Task UI 通知正文长度上限与截断后缀。命令侧在 HTTP 入口前由前端按同一合同截断；

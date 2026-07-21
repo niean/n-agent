@@ -107,6 +107,10 @@
 - usage_records：SQLite 表，持久化每次 LLM 调用的 usage 明细，由 SqliteUsageRecorder.record_call 写入；sessions 表同步累加 token/cost/api_call_count。
 - compression_stats：SQLite 表，持久化上下文压缩前后的 token 对比，由 SqliteUsageRecorder.record_compression 写入；`tokens_saved` 用 `max(before-after, 0)` clamp 防止负值。
 
+## Task 审批术语
+
+- revise（Task approval 第三决策）：Task 意图审批中 approve/reject 之外的第三决策。用户通过 `revise_task` 工具、`/task revise` CLI 子命令或 POST `/chat/tasks/{id}/revise` 路由下达修订指示（note 必填），把 WAITING_APPROVAL 任务重新入队（`Task.revise()`：WAITING_APPROVAL->QUEUED，状态机合法转换集合不变），worker 下次 run 在 `build_worker_context` 决策段看到 `change_revised` 事件与修订 note，可遵循修订路径或提出新提案。与 reject 的区别：reject 表示不同意原提案且不期望 worker 继续，revise 表示期望 worker 带着修订指示继续执行。三决策经 TaskService 统一 `_resolve_proposal` helper + Registry 单事务原子 `resolve_proposal` 端口编排，并发唯一成功无孤立事件。
+
 ## Policy Mesh 治理术语
 
 - Policy Mesh：N-Agent 运行时治理架构，由 10 个独立领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成；每个 Policy 治理一个维度，Application Service 在外部调用前封口执行。

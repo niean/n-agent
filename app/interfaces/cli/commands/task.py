@@ -86,6 +86,7 @@ def run(args) -> int:
         "retry": _cmd_retry,
         "approve": _cmd_approve,
         "reject": _cmd_reject,
+        "revise": _cmd_revise,
         "propose": _cmd_propose,
     }
     handler = dispatch.get(cmd)
@@ -242,6 +243,16 @@ def _cmd_reject(args) -> int:
         return _disabled()
     note = getattr(args, "note", None)
     result = asyncio.run(service.reject_change(args.id, note=note))
+    render_data(result if isinstance(result, dict) else _task_to_dict(result), fmt=resolve_format(args), console=make_console())
+    return 0
+
+
+def _cmd_revise(args) -> int:
+    service = _load_task_service()
+    if service is None:
+        return _disabled()
+    note = getattr(args, "note", None)
+    result = asyncio.run(service.revise_change(args.id, note))
     render_data(result if isinstance(result, dict) else _task_to_dict(result), fmt=resolve_format(args), console=make_console())
     return 0
 

@@ -50,6 +50,8 @@ class ConversationMessage:
     created_at: datetime = field(default_factory=utc_now)
     is_summary: bool = False
     is_summarized: bool = False
+    source: str | None = None
+    card: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

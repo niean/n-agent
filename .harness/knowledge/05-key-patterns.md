@@ -274,6 +274,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - 受 managed 保护的工具同时要求来源方可信：`ScheduleManagementToolExecutor` 进一步从 `context.trusted_metadata` 读取 platform/receive_id/receive_id_type/thread_id 作为任务 origin，禁止从 untrusted metadata 读取。`_origin_from_trusted` 把这四个字段一并写入 `ScheduledTask.origin` 与 `DeliveryTarget.context`，由 outbound 按 `platform` 路由投递。Task worker 的 `TaskManagementToolExecutor._origin_from_trusted` 同理从 `context.trusted_metadata["task"]`（含 task_id/run_id/claim_lock/write_origin）读取 worker 身份，缺失返回 `trusted_task_context_missing`。
 - 删除等需要确认的破坏性动作不允许 Agent 直接执行；自然语言删除要返回 confirmation_required 文案，引导用户走 `/schedule remove <id>`。Gateway 破坏性命令 preflight 时把当前飞书 trusted_metadata 写入 `GatewayConfirmationRequest.trusted_metadata`，handle_confirmation 还原后再校验 task.origin 一致性。
 - 不可信模式（unattended/safe_only、定时任务执行）时 `list_openai_tools` 必须过滤 source_type=AGENT 的工具，避免调度器递归调用自己。
+- 用户侧 Task 审批工具（`approve_task`/`reject_task`/`revise_task`）是 source_type=AGENT + risk_level=SAFE + managed=false，realtime DEFAULT 对对话 Agent 可见，unattended SAFE_ONLY 默认隐藏。但 `SAFE_ONLY` 暴露策略对 `granted_tools` 中显式命名的 SAFE AGENT 工具仍会放行（模式六 grant 语义），因此 worker/judge 的 `granted_tools` 禁止含这三个名字；`TaskAgentExecutor` 在构造 `granted_tools` 时显式剥离 `USER_TASK_APPROVAL_TOOL_NAMES`（即便 `task.execution_policy.allowed_tools` 误配置也生效），防止 worker 自我审批自己的 `task_propose_change` 提案形成递归。此约束是 worker boundary 收紧，不改变 ToolPolicy 通用 grant 可暴露 SAFE AGENT 工具的设计。
 
 陷阱：把 OpenAI HTTP 客户端 metadata 直接当 trusted_metadata 用，或者只在 ToolExecutionContext 里塞 metadata 不区分 trusted/untrusted，会让伪造 `gateway.platform=feishu` 的 OpenAI 客户端获得飞书会话的 schedule 操作权限。
 
@@ -346,7 +347,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 IM 平台一级。GatewayService 通过 GatewaySessionKey.platform 分流：source=`cli` → (`cli`, `cli`)，真实 IM 平台 → (`{platform.value}`, `{platform.value}`)。
 - `schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
 - `curator` 是 Curator 周期维护 consolidation fork 的内部触发来源，独立成一级（前缀 `curator-`、source `curator`）。session_id 用 `curator-{uuid4()}`（与 `schedule-{uuid4()}` 同，不用时间戳，遵守本模式 UUID 通用规则）。`SkillCuratorService._run_consolidation` 经 `SkillEvolutionService.run_background_review(ingress_source="curator")` 注入 `gateway.source`，由 `ChatCompletionService` 派生为会话 source；缺失时 `_build_policy_snapshot` 会回落 `api`，导致来源与前缀脱节。
-- `task` 是 Task worker（Kanban/Manus Task）进程内执行的内部触发来源，独立成一级（前缀 `task-`、source `task`）。execution_session_id 用 `task-{uuid5(NAMESPACE_URL, task.id)}`：从 task.id 确定性派生完整 UUID（str 形式带连字符 8-4-4-4-12，与 `schedule-{uuid4()}`/`curator-{uuid4()}` 完全一致，禁止用 `.hex` 无连字符形式），使同一 task 跨 run/claim 稳定复用同一 execution session（无需持久化 execution_session_id；delete_session 置空后下次 claim 重新派生出同一 id 重建/复用）。禁止 `task-{task.id}`：task.id 形如 `t_{hex}`，带 `t_` 前缀且非完整 UUID，会产生 `task-t_...` 双前缀且后缀非 UUID，违反本模式。worker 执行会话由 `task_execution_session_id(task)`（`app/application/task_session.py`）统一选择：`task.execution_session_id`（显式存量/外部）-> `task.origin_session_id`（Dashboard `/task create` 捕获的 Chat 会话，使 worker 对话与生命周期回到创建任务的 Chat 框，对齐 Manus）-> `task-{uuid5(NAMESPACE_URL, task.id)}`（origin=None 的 kanban/CLI/feishu 回退）。execution_session_id 不持久化（DB NULL），delete_task 仅按持久化显式字段清理 -> 不删 origin Chat 会话。
+- `task` 是 Task worker（Kanban/Manus Task）进程内执行的内部触发来源，独立成一级（前缀 `task-`、source `task`）。execution_session_id 用 `task-{uuid5(NAMESPACE_URL, task.id)}`：从 task.id 确定性派生完整 UUID（str 形式带连字符 8-4-4-4-12，与 `schedule-{uuid4()}`/`curator-{uuid4()}` 完全一致，禁止用 `.hex` 无连字符形式），使同一 task 跨 run/claim 稳定复用同一 execution session（无需持久化 execution_session_id；delete_session 置空后下次 claim 重新派生出同一 id 重建/复用）。禁止 `task-{task.id}`：task.id 形如 `t_{hex}`，带 `t_` 前缀且非完整 UUID，会产生 `task-t_...` 双前缀且后缀非 UUID，违反本模式。worker 执行会话由 `task_execution_session_id(task)`（`app/application/task_session.py`）统一选择：`task.execution_session_id`（显式存量/外部）-> `task.origin_session_id`（Dashboard `/task create` 捕获的 Chat 会话，使 worker 对话与生命周期回到创建任务的 Chat 框，对齐 Manus）-> `task-{uuid5(NAMESPACE_URL, task.id)}`（origin=None 的 kanban/CLI/feishu 回退）。execution_session_id 不持久化（DB NULL），delete_task 仅按持久化显式字段清理 -> 不删 origin Chat 会话。worker 在 origin Chat 会话执行时，其 assistant 推理消息（chain-of-thought）由 ChatCompletionService 经 `AgentState.message_source` 标记 source=task（命中 `_PROCESS_MESSAGE_SOURCES` 即置为 source、否则 None，session_source 已折叠 snapshot->IngressFacts->API 三级回落，故有无 policy_snapshot_factory 均生效），Dashboard `shouldRenderMessage` 据此跳过渲染进程来源（task/schedule/curator）的 assistant 消息，使 worker 内部推理不对用户可见（regression：worker CoT "The task requires querying weather..." 曾作为普通 assistant 气泡泄露到对话框）；与 judge 推理 `persist_messages=False` 不落库同理，但 worker 需跨轮历史故采用 source 标记 + 前端隐藏、推理仍落库供 goal_mode 续轮与 LLM 上下文（test_task_chat_merge 断言 worker assistant 保留进上下文），worker 工具调用结果仍按工具调试卡片独立渲染。realtime（api/dashboard）assistant 消息 source=None 正常渲染。
 - Dashboard 前端生成 session_id 用 `crypto.randomUUID()`（fallback `Date.now()+random`），不用 `Date.now()` 时间戳（碰撞风险）。
 
 历史数据迁移：
@@ -907,3 +908,68 @@ Task 终态失败必须区分三种来源，分别映射不同 status 与重试�
 - 若未来给 worker `granted_tools` 加入 `create_task`/`list_tasks`（仿 host_terminal 授权），SAFE_ONLY 会暴露 -> 防递归失效。grant 禁令必须由回归测试守护。
 - `list_tasks` 服务异常应映射 ERROR + `success:false` + `task_list_failed` + 空 items，不得返回 `success:true`+SUCCESS（自相矛盾，Agent 会把错误误判为空列表）；异常捕获只包服务调用，过滤逻辑的 bug 应向上传播不被静默吞掉。
 - 用户侧工具不得用 `permitted_managed_tools` 绕过暴露（该通道只适用 managed 工具）；`managed=false` 决定它走 SAFE 暴露路径，不走 managed 门控。
+
+## 模式三十：LLM 前缀缓存依赖 Ark 服务端自动缓存（无 cache_control 断点）
+
+当前 LLM 请求的前缀缓存命中完全依赖火山方舟 Ark `/api/plan`（Anthropic 兼容端点）的服务端自动接纳，代码侧未设任何 `cache_control` 断点，因此缓存是否生效不由前缀稳定性单方面决定，而受 Ark 不透明的接纳/预热/驱逐逻辑支配。
+
+数据流：
+- `AnthropicProvider.chat`（`app/infrastructure/llm/anthropic_provider.py`）走 `anthropic` SDK 的 Messages API；`_convert_messages` 把 system 拼成纯字符串经 `kwargs["system"]` 传入，messages 转 content blocks，全程不注入 `cache_control:{type:"ephemeral"}`。`cache_control` 仅出现在 `_ALLOWED_OPTION_KEYS`（允许透传），但无任何调用方（agent_graph/context_service/prompt_builder）构造或传入。
+- active provider `ark-agent` 的 `extra_headers_json` 为空，无 `anthropic-beta: prompt-caching` 头；pre/post-commit grep 均无 cache_control 注入，证明命中的零星缓存纯靠 Ark 服务端自动行为。
+- usage 记录：`AgentGraphRunner.call_llm` 在图内强制 `stream=False`（line 787 拒绝流式结果），从 `response.usage` 取 `model_dump()`；`_resolve_usage_meta` 据 `provider_type=="anthropic"` 选 `_normalize_anthropic`，读 `cache_read_input_tokens`/`cache_creation_input_tokens`。Ark 对自动缓存不报告 write，故 `cache_write_tokens` 恒为 0 是正常现象，不是"未尝试缓存"的信号；真正信号是 `cache_read_tokens`。
+
+规则：
+- 前缀缓存命中要求 system + tools + 早期消息逐字节稳定（append-only）。验证稳定性须比对实际发出的 `request_messages`（经 `_convert_messages` 转换后的 Anthropic 侧字节），不止比对 SQLite 存储的 OpenAI 格式；`sort_keys=True` 会掩盖键序差异，须用原始序列化比对。
+- system prompt 长度影响 Ark 自动缓存接纳：旧版 2911 字符 prompt 在增长对话上 cache_read 稳步增长（4k->20k+）；commit `5bf400f` 把 TASK_GUIDANCE 烘进 build_system_prompt 使其增至 6741 字符后，dashboard 增长对话 cache_read 跌为 0（会话 dashboard-fc1efd1f-57e9-4b10-9b49-22529ae83c77，10 次调用全零）。命中/未命中在 commit 点呈完美阶跃，provider/endpoint/headers 全程未变。
+- "稳定 system prompt 以保住前缀缓存"的改法（commit 5bf400f 意图）只有在缓存真正启用时才生效；单纯稳定前缀而不设 cache_control，仍受 Ark 自动接纳逻辑制约，可能因 prompt 变长而整体失效。
+
+陷阱：
+- 误判 `cache_write_tokens=0` 为"未尝试缓存"。OpenAI/Anthropic 路径下 Ark 不报告 write，须以 `cache_read_tokens` 判断；归一化路径选择错误（provider_kind 与实际协议不符）会导致字段全错位。
+- 依赖服务端自动缓存时，个例命中（如 c58bb129 仅 fresh-context judge 续轮命中 1 次 4408）与完全未命中（fc1efd1f）可能仅差 1 字符（"Judge" vs "judge"），属 Ark 不透明逻辑，不可用前缀内容差异解释，也不可据此推断前缀不稳定。
+- 修复方向：在 AnthropicProvider 显式设 cache_control 断点（system content block + tools 末项 + 每轮最后一条消息），使缓存由代码确定性保证，与 prompt 长度/Ark 自动接纳解耦。前置必做：实测 Ark `/api/plan` 是否透传并兑现 cache_control（发两次相同前缀看第二次 cache_read_input_tokens 是否 >0）；不兑现则改走 Ark 原生上下文缓存 API 或 openai-compatible 端点（ark-code，OpenAI 风格自动缓存）。
+
+## 模式三十一：Task lifecycle card 跨文件交互化模式
+
+Dashboard Chat 的 `ui.task_lifecycle` 系统消息在 waiting_approval/failed/expired 三态从纯文本升级为飞书风格 inline 交互卡片。card 是生成消息时的状态快照（非当前任务状态的权威来源），与纯文本 `content` 并列存入 `ConversationMessage.card`，横跨 Domain/Application/Infrastructure/Interfaces 四层与前端，通过版本化 schema + Domain 动作单一来源 + 前端实时状态校验 + 显式 handler allowlist 保证安全。
+
+跨文件链路：
+1. Domain 动作单一来源（`app/domain/task.py::available_lifecycle_actions(status)`）：纯函数返回 tuple，WAITING_APPROVAL->(approve,reject,revise,cancel)、FAILED->(retry,cancel)、EXPIRED->(retry)、其余空。EXPIRED 仅 retry 因 `Task.cancel()` 明确拒绝 EXPIRED。不执行 IO，服务端动作 API 与 Task 聚合仍是最终合法性边界。
+2. Application 构造 card（`app/application/task_run_service.py::TaskRunService._lifecycle_card(task, target_status, summary, error)`）：返回版本化 payload `{schema_version:1, kind:"task_lifecycle", task_id, status, title, summary, available_actions}`；status 用传入的 target_status（CAS 目标态）不用 task.status（可能仍是旧快照）；summary 来源按状态分流（waiting_approval 取 proposal，failed 优先 error 再取 summary，expired 后备稳定文案"任务运行已过期"）；available_actions 取 Domain 元组顺序（前端不重排）。非交互态（QUEUED/RUNNING/SUCCEEDED/CANCELLED）返回 None。
+3. Application 透传（`app/application/session_service.py::SessionService.append_task_lifecycle_message(session_id, content, card=None)` -> `_append_system_message(card=None)` -> `_normalize_card`）：`copy.deepcopy` 调用方 dict 不原地修改，按 `_truncate_task_message_utf8` 把 summary 截断到 65536 UTF-8 字节上限，构造 `ConversationMessage(role="system", name="ui.task_lifecycle", content, card=normalized)`。
+4. Infrastructure 持久化（`app/infrastructure/memory/sqlite_store.py`）：messages 表 `card_json TEXT` 列（幂等迁移 `_migrate_add_card_column`）；`append_message`/`append_message_if_session_exists` INSERT 写 card_json（None->NULL、dict->`json.dumps(ensure_ascii=False)`）；`list_messages` 经 `_decode_message_card(row)` 容错读取（列缺失/NULL->None，合法 JSON object->dict，非法 JSON/array/scalar->None+warning 不丢失消息，不掩盖 content_json 错误）。
+5. Interfaces 序列化（`app/interfaces/http/dashboard.py::_message_to_dict`）：始终输出 `"card": message.card`（object 或 null），既有字段与 tool_calls 规范化不变。
+6. 前端校验与渲染（`app/interfaces/http/static/chat.js`）：`validateTaskCard(card)` 严格校验 schema_version/kind/task_id/status/title/summary/available_actions 返回新 canonical object（未知动作丢弃保留原序、空动作返回 null，禁止 `api.task[action]` 动态属性索引）；`resolveTaskCardStates(messages)` 按 task_id 去重并行 `api.task.get` 返回权威 status Map；`computeCardState(card, entry)` 按 card.status 独立判定 active/stale/unavailable；`buildTaskCardElement` active 创建按钮+textarea，stale/unavailable/settled 只渲染正文+反馈；`handleTaskCardAction` in-flight 防重复 + 成功 settled + 状态错误 stale + task_invalid 恢复 + revise `Array.from(note).length` code-point 1..2000 校验。
+
+三参数 lifecycle_writer 签名：
+- TaskRunService 与 TaskService 的 `lifecycle_writer` 均为 `Callable[[str, str, dict[str, Any] | None], Awaitable]`，第三参数为可选 card 载荷。
+- 纯文本 lifecycle（succeeded/cancelled/开始运行/决策回执 approve/reject/revise）传 card=None；交互态（waiting_approval/failed/expired）传构造好的 card payload。
+- `main.py::_task_lifecycle_writer(session_id, content, card=None)` 闭包透传给 `SessionService.append_task_lifecycle_message`，`SessionNotFoundError` 静默跳过不复活。
+
+实时状态校验（防止存量卡片继续操作）：
+- 消息存储是追加式历史记录，已发生的卡片不会被后续消息删除。动作成功或任务被其它通道处理后，旧卡片保留为只读历史状态，不再暴露动作。
+- 每次渲染会话前，前端对本次消息中具有动作的不同 task_id 各调用一次既有 `GET /chat/tasks/{task_id}`（去重，避免同一任务 N 次请求）。
+- 仅当返回状态等于 card.status 时标记 active 启用动作；状态不一致或 task_not_found/task_state_invalid/task_conflict 标记 stale；网络或未知错误标记 unavailable。
+- 校验期间按钮不出现或保持 disabled，禁止先短暂提供未经校验的动作。
+- 动作返回 task_state_invalid/task_conflict/task_not_found 时卡片转 stale 并刷新；网络/未知错误恢复控件供重试；成功后保持禁用并先标记"操作已提交"再 `await refreshCurrentSession()`。
+- refresh 在动作成功后失败时保持 settled 和 disabled，显示"操作已提交，刷新失败"，不得因刷新失败重新提交相同动作。
+
+安全约束：
+- 前端使用显式 `TASK_CARD_ACTION_HANDLERS` allowlist（action string -> 固定 api.task 函数），即使数据库内容被篡改也不得按任意 action 名动态调用属性。
+- 所有动态文本使用 `textContent`（不使用 `innerHTML`）；反馈区 `aria-live="polite"`；textarea 关联 label；按钮使用原生 `<button type="button">`。
+- `task_id` 必须经 `encodeURIComponent` 进入 URL；revise 请求体固定为 `{"note": note}`，note 按 Unicode code point（`Array.from(note).length`，非 UTF-16 单元）trim 后 1..2000 校验，与服务端合同一致。
+- card payload 不含密钥、worker token、expected_version 或 HTML。
+- 仅 `ui.task_lifecycle` 支持 card；`ui.task_command` 和 `ui.task_result` 不交互化。无 card 的存量数据库和历史消息必须兼容（回退原 `<details><pre>` 纯文本渲染）。
+
+不改边界：
+- 不改 Task 状态转换、TaskPolicy、worker 的 6 个 managed task 工具、自然语言审批工具、看板、slash 命令、飞书 IM 或 ACP。
+- 复用既有 GET task 与 approve/reject/revise/cancel/retry API，不新增端点。
+- 服务端 Domain 函数是动作集合单一来源；前端 allowlist 只做安全分发，不推导状态动作。
+
+陷阱：
+- `_lifecycle_card` 误用 `task.status` 而非 `target_status` 会让 card 携带 CAS 前的旧状态，前端状态校验恒判 stale。必须用传入的 target_status 反映本次 CAS 的目标态。
+- 前端 `api.task[action]` 动态属性索引会让数据库被篡改的 action 名调用任意 API 方法；必须用显式 `TASK_CARD_ACTION_HANDLERS` allowlist。
+- `textarea.maxLength` 按 UTF-16 单元计数，emoji 等代理对字符会被截断；revise note 校验必须用 `Array.from(note).length` 按 Unicode code point 计数。
+- 历史卡片因后续 best-effort lifecycle 写入失败或任务被其它通道处理而保留为只读，不得承诺新消息会替换或删除旧消息；前端实时状态校验是防止存量卡片继续操作的唯一可靠手段。
+- `_decode_message_card` 用 broad exception 吞掉所有错误会掩盖 content_json 或数据库异常；只容忍 card_json 的 JSON 解析错误，content_json 与数据库错误照常传播。
+- `groupTaskMessages` 遇带合法 card 的 lifecycle 消息必须关闭当前合并组并独立 push，否则 card 字段会在 `{...firstMessage}` 浅拷贝中被覆盖或丢失；card 消息也不得吸纳后续消息。
+- in-flight 防重复只用单一布尔值会让第二次点击在第一次 await 期间触发；必须用 `inflight.value` 守卫 + 按钮 disabled 双重保护，且 finally 仅在 actions 容器仍 attached 时恢复控件。

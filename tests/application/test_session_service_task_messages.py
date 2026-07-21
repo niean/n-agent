@@ -38,6 +38,20 @@ async def test_append_task_lifecycle_message_uses_lifecycle_name(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_append_task_result_message_uses_result_name(tmp_path):
+    """最终结果走 ui.task_result（普通消息渲染），区别于 ui.task_lifecycle 状态卡片。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+    msg = await svc.append_task_result_message("s1", "任务已完成：完成报告\n\n已生成 Q3 总结")
+    assert msg.role == "system"
+    assert msg.name == "ui.task_result"
+    assert "已完成" in msg.content and "Q3 总结" in msg.content
+    persisted = (await store.list_messages("s1"))[0]
+    assert persisted.name == "ui.task_result"
+
+
+@pytest.mark.asyncio
 async def test_append_message_rejects_blank_and_non_string(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     svc = SessionService(store)
@@ -57,6 +71,8 @@ async def test_append_message_raises_not_found_when_session_absent(tmp_path):
         await svc.append_task_lifecycle_message("no-such", "[任务状态] 开始运行: t1")
     with pytest.raises(SessionNotFoundError):
         await svc.append_task_command_message("no-such", "[任务指令] x")
+    with pytest.raises(SessionNotFoundError):
+        await svc.append_task_result_message("no-such", "任务已完成：t1")
 
 
 @pytest.mark.asyncio
@@ -96,3 +112,64 @@ async def test_append_task_command_message_rejects_oversize(tmp_path):
         await svc.append_task_command_message("s1", "a" * 65537)
     # 零写入
     assert await store.list_messages("s1") == []
+
+
+@pytest.mark.asyncio
+async def test_append_task_lifecycle_message_persists_card(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+    card = {"schema_version": 1, "kind": "task_lifecycle", "task_id": "t1", "status": "waiting_approval", "title": "T", "summary": "p", "available_actions": ["approve"]}
+    await svc.append_task_lifecycle_message("s1", "等待批准", card=card)
+    msgs = await store.list_messages("s1")
+    assert msgs[-1].name == "ui.task_lifecycle"
+    assert msgs[-1].card == card
+
+
+@pytest.mark.asyncio
+async def test_append_task_lifecycle_message_truncates_card_summary(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+    long_summary = "x" * 100000
+    card = {"schema_version": 1, "kind": "task_lifecycle", "task_id": "t1", "status": "failed", "title": "T", "summary": long_summary, "available_actions": ["retry"]}
+    await svc.append_task_lifecycle_message("s1", "已失败", card=card)
+    msgs = await store.list_messages("s1")
+    assert len(msgs[-1].card["summary"].encode("utf-8")) <= 65536
+    assert msgs[-1].card["summary"].endswith("…[内容已截断]")
+
+
+@pytest.mark.asyncio
+async def test_append_task_lifecycle_message_truncates_multibyte_card_summary(tmp_path):
+    """中文多字节截断不产生替换字符或超限（spec 验收要求）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+    big = "中" * 22000  # ~66000 bytes
+    card = {"schema_version": 1, "kind": "task_lifecycle", "task_id": "t1", "status": "failed", "title": "T", "summary": big, "available_actions": ["retry"]}
+    await svc.append_task_lifecycle_message("s1", "已失败", card=card)
+    msgs = await store.list_messages("s1")
+    summary_bytes = msgs[-1].card["summary"].encode("utf-8")
+    assert len(summary_bytes) <= 65536
+    assert msgs[-1].card["summary"].endswith("…[内容已截断]")
+    assert b"\xef\xbf\xbd" not in summary_bytes  # 无 U+FFFD 替换字符
+
+
+@pytest.mark.asyncio
+async def test_append_task_lifecycle_message_does_not_mutate_caller_card(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+    card = {"schema_version": 1, "kind": "task_lifecycle", "task_id": "t1", "status": "failed", "title": "T", "summary": "x" * 100000, "available_actions": ["retry"]}
+    original_summary = card["summary"]
+    await svc.append_task_lifecycle_message("s1", "已失败", card=card)
+    assert card["summary"] == original_summary  # caller dict not mutated
+
+
+@pytest.mark.asyncio
+async def test_append_task_lifecycle_message_null_card_default(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+    await svc.append_task_lifecycle_message("s1", "已批准")
+    assert (await store.list_messages("s1"))[-1].card is None

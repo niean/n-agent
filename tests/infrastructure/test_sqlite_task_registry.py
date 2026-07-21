@@ -27,6 +27,8 @@ from app.domain.task import (
     BulkUpdateCommand,
     BulkUpdateItem,
     FinishRunCommand,
+    ProposalResolutionCommand,
+    ProposalResolutionResult,
     RecoverRunCommand,
     Task,
     TaskAttachment,
@@ -37,6 +39,7 @@ from app.domain.task import (
     TaskNotFoundError,
     TaskRunOutcome,
     TaskRunStatus,
+    TaskStateError,
     TaskStatus,
     TaskValidationError,
     TaskWorkspaceKind,
@@ -1775,3 +1778,700 @@ def test_lease_seconds_column_migration(tmp_path):
     with reg._connect() as conn:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
     assert "lease_seconds" in cols
+
+
+# ---------------------------------------------------------------------------
+# T2: Proposal resolution (resolve_proposal)
+# ---------------------------------------------------------------------------
+
+
+_PROPOSAL_KIND = "change_proposed"
+_APPROVED_KIND = "change_approved"
+_REJECTED_KIND = "change_rejected"
+_REVISED_KIND = "change_revised"
+_RESOLUTION_KINDS = (_APPROVED_KIND, _REJECTED_KIND, _REVISED_KIND)
+
+
+async def _seed_pending_proposal(
+    reg: SQLiteTaskRegistry,
+    task_id: str = "t_1",
+    session_id: str | None = None,
+    proposal_text: str = "do X",
+    **kw,
+):
+    """Create a WAITING_APPROVAL task with a pending change_proposed event.
+
+    Returns the change_proposed TaskEvent.
+    """
+    kwargs: dict = {"status": TaskStatus.WAITING_APPROVAL}
+    if session_id is not None:
+        kwargs["origin_session_id"] = session_id
+    kwargs.update(kw)
+    await reg.create_task(_task(task_id, "x", **kwargs))
+    proposal = await reg.append_event(
+        task_id,
+        kind=_PROPOSAL_KIND,
+        payload={"proposal": proposal_text},
+    )
+    return proposal
+
+
+class _CasFaultConnection:
+    """Connection wrapper that forces the resolve_proposal CAS UPDATE to rowcount=0.
+
+    Intercepts the CAS UPDATE (identified by the unique ``is_archived = 0``
+    in the WHERE clause combined with ``version = version + 1`` in SET) and
+    replaces the task_id parameter with a non-existent value, so the UPDATE
+    matches zero rows. All other SQL passes through unchanged.
+
+    Used to test the defensive rollback path when CAS rowcount != 1.
+    """
+
+    def __init__(self, real_conn: sqlite3.Connection, task_id_to_fail: str):
+        self._real = real_conn
+        self._task_id = task_id_to_fail
+
+    def execute(self, sql, params=()):
+        if (
+            "UPDATE tasks SET" in sql
+            and "is_archived = 0" in sql
+            and "version = version + 1" in sql
+        ):
+            new_params = tuple(
+                "__cas_fault_nonexistent__" if p == self._task_id else p
+                for p in params
+            )
+            return self._real.execute(sql, new_params)
+        return self._real.execute(sql, params)
+
+    def commit(self):
+        return self._real.commit()
+
+    def rollback(self):
+        return self._real.rollback()
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._real.__exit__(*args)
+
+    @property
+    def row_factory(self):
+        return self._real.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._real.row_factory = value
+
+
+# --- Point 1: Three legal decisions write marker + transition to QUEUED ---
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_approved_writes_marker_and_transitions(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    proposal = await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    result = await reg.resolve_proposal(cmd)
+
+    assert isinstance(result, ProposalResolutionResult)
+    assert result.proposal_event_id == proposal.id
+    assert result.task.status == TaskStatus.QUEUED
+    assert result.task.version == 2  # exactly +1
+    assert result.decision_event.kind == _APPROVED_KIND
+    assert result.decision_event.payload["proposal_event_id"] == proposal.id
+    assert result.decision_event.payload["decision"] == "approved"
+    assert result.decision_event.payload["note"] is None
+    # Exactly one resolution marker in the event history
+    events = await reg.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 1
+    assert markers[0].id == result.decision_event.id
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_rejected_writes_marker_and_transitions(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    proposal = await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="rejected",
+        event_kind=_REJECTED_KIND,
+        note="not needed",
+    )
+    result = await reg.resolve_proposal(cmd)
+
+    assert result.proposal_event_id == proposal.id
+    assert result.task.status == TaskStatus.QUEUED
+    assert result.task.version == 2
+    assert result.decision_event.kind == _REJECTED_KIND
+    assert result.decision_event.payload["proposal_event_id"] == proposal.id
+    assert result.decision_event.payload["decision"] == "rejected"
+    assert result.decision_event.payload["note"] == "not needed"
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_revised_writes_marker_with_note_and_transitions(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    proposal = await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="revised",
+        event_kind=_REVISED_KIND,
+        note="please redo with option B",
+    )
+    result = await reg.resolve_proposal(cmd)
+
+    assert result.proposal_event_id == proposal.id
+    assert result.task.status == TaskStatus.QUEUED
+    assert result.task.version == 2
+    assert result.decision_event.kind == _REVISED_KIND
+    assert result.decision_event.payload["proposal_event_id"] == proposal.id
+    assert result.decision_event.payload["decision"] == "revised"
+    assert result.decision_event.payload["note"] == "please redo with option B"
+
+
+# --- Point 2: Defensive rejection (no events written) ---
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_rejects_mismatched_decision_event_kind(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="approved",
+        event_kind=_REJECTED_KIND,  # mismatched
+    )
+    with pytest.raises(TaskValidationError):
+        await reg.resolve_proposal(cmd)
+    # No resolution marker written
+    events = await reg.list_events("t_1")
+    assert all(e.kind not in _RESOLUTION_KINDS for e in events)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_rejects_empty_task_id(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="",
+        expected_version=1,
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    with pytest.raises(TaskValidationError):
+        await reg.resolve_proposal(cmd)
+    # No event written for the empty task_id (and no marker on t_1)
+    events = await reg.list_events("t_1")
+    assert all(e.kind not in _RESOLUTION_KINDS for e in events)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_rejects_invalid_decision(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="maybe",
+        event_kind="change_maybe",
+    )
+    with pytest.raises(TaskValidationError):
+        await reg.resolve_proposal(cmd)
+    events = await reg.list_events("t_1")
+    assert all(e.kind not in _RESOLUTION_KINDS for e in events)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_rejects_revised_with_empty_note(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="revised",
+        event_kind=_REVISED_KIND,
+        note="",
+    )
+    with pytest.raises(TaskValidationError):
+        await reg.resolve_proposal(cmd)
+    events = await reg.list_events("t_1")
+    assert all(e.kind not in _RESOLUTION_KINDS for e in events)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_rejects_revised_with_whitespace_note(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="revised",
+        event_kind=_REVISED_KIND,
+        note="   ",
+    )
+    with pytest.raises(TaskValidationError):
+        await reg.resolve_proposal(cmd)
+    events = await reg.list_events("t_1")
+    assert all(e.kind not in _RESOLUTION_KINDS for e in events)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_rejects_revised_with_none_note(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="revised",
+        event_kind=_REVISED_KIND,
+        note=None,
+    )
+    with pytest.raises(TaskValidationError):
+        await reg.resolve_proposal(cmd)
+    events = await reg.list_events("t_1")
+    assert all(e.kind not in _RESOLUTION_KINDS for e in events)
+
+
+# --- Point 3: Task state guards ---
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_task_not_found_raises_not_found(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_missing",
+        expected_version=1,
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    with pytest.raises(TaskNotFoundError):
+        await reg.resolve_proposal(cmd)
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_archived_task_raises_state_error(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    proposal = await _seed_pending_proposal(reg, "t_1")
+    # Archive the task (keep status WAITING_APPROVAL, set is_archived)
+    await reg.update_task("t_1", {"is_archived": True}, expected_version=1)
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=2,  # version incremented by update_task
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    with pytest.raises(TaskStateError):
+        await reg.resolve_proposal(cmd)
+    # No marker written
+    events = await reg.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 0
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_non_waiting_approval_raises_state_error(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(_task("t_1", "x", status=TaskStatus.QUEUED))
+    await reg.append_event("t_1", kind=_PROPOSAL_KIND, payload={"proposal": "X"})
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    with pytest.raises(TaskStateError):
+        await reg.resolve_proposal(cmd)
+    events = await reg.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 0
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_no_pending_proposal_raises_state_error(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(_task("t_1", "x", status=TaskStatus.WAITING_APPROVAL))
+    # No change_proposed event
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    with pytest.raises(TaskStateError):
+        await reg.resolve_proposal(cmd)
+    events = await reg.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 0
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_version_conflict_raises_conflict(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=99,  # stale
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    with pytest.raises(TaskConflictError):
+        await reg.resolve_proposal(cmd)
+    events = await reg.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 0
+
+
+# --- Point 4: Concurrent resolution ---
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_concurrent_different_decisions_only_one_wins(tmp_path):
+    db_path = str(tmp_path / "t.db")
+    reg1 = SQLiteTaskRegistry(db_path)
+    reg2 = SQLiteTaskRegistry(db_path)
+    await _seed_pending_proposal(reg1, "t_1")
+
+    cmd1 = ProposalResolutionCommand(
+        task_id="t_1", expected_version=1,
+        decision="approved", event_kind=_APPROVED_KIND,
+    )
+    cmd2 = ProposalResolutionCommand(
+        task_id="t_1", expected_version=1,
+        decision="rejected", event_kind=_REJECTED_KIND,
+    )
+    results = await asyncio.gather(
+        reg1.resolve_proposal(cmd1),
+        reg2.resolve_proposal(cmd2),
+        return_exceptions=True,
+    )
+    successes = [r for r in results if not isinstance(r, Exception)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], TaskConflictError)
+    # Only one resolution marker
+    events = await reg1.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 1
+    # Task is QUEUED with version 2
+    task = await reg1.get_task("t_1")
+    assert task.status == TaskStatus.QUEUED
+    assert task.version == 2
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_concurrent_same_decision_only_one_wins(tmp_path):
+    db_path = str(tmp_path / "t.db")
+    reg1 = SQLiteTaskRegistry(db_path)
+    reg2 = SQLiteTaskRegistry(db_path)
+    await _seed_pending_proposal(reg1, "t_1")
+
+    cmd1 = ProposalResolutionCommand(
+        task_id="t_1", expected_version=1,
+        decision="approved", event_kind=_APPROVED_KIND,
+    )
+    cmd2 = ProposalResolutionCommand(
+        task_id="t_1", expected_version=1,
+        decision="approved", event_kind=_APPROVED_KIND,
+    )
+    results = await asyncio.gather(
+        reg1.resolve_proposal(cmd1),
+        reg2.resolve_proposal(cmd2),
+        return_exceptions=True,
+    )
+    successes = [r for r in results if not isinstance(r, Exception)]
+    failures = [r for r in results if isinstance(r, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], TaskConflictError)
+    events = await reg1.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 1
+
+
+# --- Point 5: High event count (proposal outside display window) ---
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_finds_proposal_outside_display_window(tmp_path):
+    """51+ events so the latest pending proposal falls outside a 50-event
+    display window. The atomic query must still find it, proving the
+    Registry does NOT reuse _MAX_EVENTS_IN_DETAIL (=50).
+    """
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(_task("t_1", "x", status=TaskStatus.WAITING_APPROVAL))
+
+    # Append 50 filler events first
+    for i in range(50):
+        await reg.append_event("t_1", kind="noted", payload={"seq": i})
+    # The change_proposed is event #51 (outside a 50-event window)
+    proposal = await reg.append_event(
+        "t_1", kind=_PROPOSAL_KIND, payload={"proposal": "do X"}
+    )
+    assert proposal.id > 50
+
+    # Verify the proposal is NOT in the first 50 events (display window)
+    display = await reg.list_events("t_1", limit=50)
+    assert all(e.kind != _PROPOSAL_KIND for e in display)
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    result = await reg.resolve_proposal(cmd)
+    assert result.proposal_event_id == proposal.id
+    assert result.task.status == TaskStatus.QUEUED
+
+
+# --- Point 6: Precise proposal matching by payload ---
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_matches_by_payload_not_marker_time(tmp_path):
+    """Multiple proposals and resolution markers interleaved: only the
+    proposal whose id matches the marker's proposal_event_id payload is
+    considered resolved. Marker time alone must not determine closure.
+    """
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(_task("t_1", "x", status=TaskStatus.WAITING_APPROVAL))
+
+    # Proposal A (id=1)
+    proposal_a = await reg.append_event(
+        "t_1", kind=_PROPOSAL_KIND, payload={"proposal": "A"}
+    )
+    # Proposal B (id=2) -- later than A
+    proposal_b = await reg.append_event(
+        "t_1", kind=_PROPOSAL_KIND, payload={"proposal": "B"}
+    )
+    # Marker resolving A (id=3) -- manually appended, NOT via resolve_proposal.
+    # Its proposal_event_id points to A, NOT B.
+    await reg.append_event(
+        "t_1",
+        kind=_APPROVED_KIND,
+        payload={"decision": "approved", "proposal_event_id": proposal_a.id},
+    )
+    # Task is still WAITING_APPROVAL (manual append, no state transition)
+
+    # The latest UNRESOLVED proposal is B (id=2), not A.
+    # A marker-time-based algorithm would wrongly think both A and B are
+    # resolved (marker id=3 is after both), raising "no pending proposal".
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="rejected",
+        event_kind=_REJECTED_KIND,
+    )
+    result = await reg.resolve_proposal(cmd)
+
+    # Must resolve B, not A
+    assert result.proposal_event_id == proposal_b.id
+    assert result.decision_event.payload["proposal_event_id"] == proposal_b.id
+    assert result.decision_event.kind == _REJECTED_KIND
+    assert result.task.status == TaskStatus.QUEUED
+    assert result.task.version == 2
+
+
+# --- Point 7: CAS rowcount=0 rollback ---
+
+
+@pytest.mark.asyncio
+async def test_proposal_resolution_cas_rowcount_zero_rolls_back_no_orphan(tmp_path):
+    """Force the CAS UPDATE to affect 0 rows; verify the transaction rolls
+    back and no orphan decision event is left behind.
+    """
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await _seed_pending_proposal(reg, "t_1")
+
+    original_connect = reg._connect
+
+    def faulty_connect():
+        return _CasFaultConnection(original_connect(), "t_1")
+
+    reg._connect = faulty_connect  # type: ignore[assignment]
+
+    cmd = ProposalResolutionCommand(
+        task_id="t_1",
+        expected_version=1,
+        decision="approved",
+        event_kind=_APPROVED_KIND,
+    )
+    with pytest.raises(TaskConflictError):
+        await reg.resolve_proposal(cmd)
+
+    # Restore original connect for verification queries
+    reg._connect = original_connect  # type: ignore[assignment]
+
+    # No orphan decision event
+    events = await reg.list_events("t_1")
+    markers = [e for e in events if e.kind in _RESOLUTION_KINDS]
+    assert len(markers) == 0
+    # Task unchanged
+    task = await reg.get_task("t_1")
+    assert task is not None
+    assert task.status == TaskStatus.WAITING_APPROVAL
+    assert task.version == 1
+
+
+# ---------------------------------------------------------------------------
+# T2: latest_waiting_approval_in_session
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_returns_matching_task(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(
+        _task("t_1", "x", status=TaskStatus.WAITING_APPROVAL, origin_session_id="sess-A")
+    )
+    result = await reg.latest_waiting_approval_in_session("sess-A")
+    assert result is not None
+    assert result.id == "t_1"
+    assert result.status == TaskStatus.WAITING_APPROVAL
+    assert result.origin_session_id == "sess-A"
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_excludes_other_sessions(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(
+        _task("t_1", "a", status=TaskStatus.WAITING_APPROVAL, origin_session_id="sess-A")
+    )
+    await reg.create_task(
+        _task("t_2", "b", status=TaskStatus.WAITING_APPROVAL, origin_session_id="sess-B")
+    )
+    result = await reg.latest_waiting_approval_in_session("sess-A")
+    assert result is not None
+    assert result.id == "t_1"
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_excludes_archived(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(
+        _task("t_1", "visible", status=TaskStatus.WAITING_APPROVAL,
+              origin_session_id="sess-A")
+    )
+    await reg.create_task(
+        _task("t_2", "archived", status=TaskStatus.WAITING_APPROVAL,
+              origin_session_id="sess-A", is_archived=True)
+    )
+    result = await reg.latest_waiting_approval_in_session("sess-A")
+    assert result is not None
+    assert result.id == "t_1"
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_excludes_non_waiting_approval(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(
+        _task("t_1", "queued", status=TaskStatus.QUEUED, origin_session_id="sess-A")
+    )
+    await reg.create_task(
+        _task("t_2", "waiting", status=TaskStatus.WAITING_APPROVAL,
+              origin_session_id="sess-A")
+    )
+    result = await reg.latest_waiting_approval_in_session("sess-A")
+    assert result is not None
+    assert result.id == "t_2"
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_sorts_created_desc_id_desc(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    base = datetime(2026, 7, 18, 0, 0, tzinfo=timezone.utc)
+    # t_1 created earlier, t_2 created later
+    await reg.create_task(
+        _task("t_1", "old", status=TaskStatus.WAITING_APPROVAL,
+              origin_session_id="sess-A", created_at=base)
+    )
+    await reg.create_task(
+        _task("t_2", "new", status=TaskStatus.WAITING_APPROVAL,
+              origin_session_id="sess-A", created_at=base + timedelta(seconds=10))
+    )
+    result = await reg.latest_waiting_approval_in_session("sess-A")
+    assert result is not None
+    assert result.id == "t_2"  # latest created_at wins
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_same_created_at_higher_id_wins(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    base = datetime(2026, 7, 18, 0, 0, tzinfo=timezone.utc)
+    # Same created_at; id DESC means "t_z" > "t_a"
+    await reg.create_task(
+        _task("t_a", "a", status=TaskStatus.WAITING_APPROVAL,
+              origin_session_id="sess-A", created_at=base)
+    )
+    await reg.create_task(
+        _task("t_z", "z", status=TaskStatus.WAITING_APPROVAL,
+              origin_session_id="sess-A", created_at=base)
+    )
+    result = await reg.latest_waiting_approval_in_session("sess-A")
+    assert result is not None
+    assert result.id == "t_z"  # higher id wins on tie
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_empty_session_raises_validation_error(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    with pytest.raises(TaskValidationError):
+        await reg.latest_waiting_approval_in_session("")
+    with pytest.raises(TaskValidationError):
+        await reg.latest_waiting_approval_in_session(None)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_no_candidates_returns_none(tmp_path):
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    await reg.create_task(
+        _task("t_1", "x", status=TaskStatus.QUEUED, origin_session_id="sess-A")
+    )
+    result = await reg.latest_waiting_approval_in_session("sess-A")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_latest_waiting_approval_query_plan_uses_index(tmp_path):
+    """EXPLAIN QUERY PLAN for the session query must not show a full table scan."""
+    reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
+    with reg._connect() as conn:
+        plan_rows = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT * FROM tasks "
+            "WHERE origin_session_id = ? AND status = ? AND is_archived = 0 "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            ("sess-A", TaskStatus.WAITING_APPROVAL.value),
+        ).fetchall()
+    plan_text = " ".join(row[3] for row in plan_rows)
+    # Must use an index (SEARCH/USING INDEX), not a full SCAN
+    assert "SCAN" not in plan_text.upper() or "USING INDEX" in plan_text.upper(), (
+        f"expected index usage, got: {plan_text}"
+    )

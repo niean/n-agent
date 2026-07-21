@@ -55,7 +55,11 @@ from uuid import uuid4
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult
 from app.application.policy_snapshot import IngressFacts
 from app.application.task_session import task_execution_session_id
-from app.application.task_tools import TASK_TOOL_NAMES, TASK_TOOL_SHOW
+from app.application.task_tools import (
+    TASK_TOOL_NAMES,
+    TASK_TOOL_SHOW,
+    USER_TASK_APPROVAL_TOOL_NAMES,
+)
 from app.domain.policy import ExecutionMode
 from app.domain.task import Task, TaskRunOutcome
 
@@ -166,7 +170,16 @@ class TaskAgentExecutor:
         # 且 request 的 system 打头会破坏 _dedupe_trailing 对 user 的去重）。
 
         # Build granted tools and permitted managed tools
-        granted_tools = list(task.execution_policy.allowed_tools)
+        # 防递归（Task 7）：即便 task.execution_policy.allowed_tools 被误配置为
+        # approve_task / reject_task / revise_task，worker boundary 也必须显式剥离
+        # 这三个用户侧审批工具名 -- worker 不能审批自己的 task_propose_change 提案。
+        # 不改 ToolPolicy 通用 grant 可暴露 SAFE AGENT 工具的设计（模式六保留），
+        # 只在 worker boundary 收紧。
+        granted_tools = [
+            name
+            for name in task.execution_policy.allowed_tools
+            if name not in USER_TASK_APPROVAL_TOOL_NAMES
+        ]
         permitted_managed = set(TASK_TOOL_NAMES)
 
         # Build trusted task context (server-side immutable)
@@ -422,6 +435,13 @@ class TaskAgentExecutor:
                 "permitted_managed_tools": [TASK_TOOL_SHOW],
                 **trusted_claims,
             },
+            # judge reuses execution_session_id but must NOT pollute the user-visible
+            # Chat history. Its user prompt ("judge task {id}: ..."), assistant JSON
+            # ({"achieved":..., "reason":...}) and any task_show tool_call/result are
+            # control-flow signals, not user-facing results. Suppress all message +
+            # tool_call persistence for this fork. Tools still execute (task_show can
+            # still read the task) and LLM context is unaffected.
+            persist_messages=False,
         )
 
         try:

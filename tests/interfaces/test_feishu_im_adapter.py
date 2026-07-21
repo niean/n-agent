@@ -690,3 +690,160 @@ async def test_send_response_routes_normal_reply_through_markdown_reply():
 
     assert client.markdown_replies == [("oc_1", markdown, "chat_id")]
     assert client.sent[0][1] == markdown
+
+
+# ---------------------------------------------------------------------------
+# T11: realtime contract -- session_id passing + DEFAULT approval tool surface
+# ---------------------------------------------------------------------------
+
+
+def _default_exposed_tool_names_with_approval_tools() -> set[str]:
+    """Construct a ToolService wired with user_task_approval_tool_definitions
+    (mirrors T8 wiring in app/main.py) and return DEFAULT-exposed tool names."""
+    from app.application.task_tools import user_task_approval_tool_definitions
+    from app.application.tool_service import ToolService
+    from app.domain.tool_policy import ToolExposurePolicy
+
+    class _UnusedExecutor:
+        async def execute(self, request, context=None):
+            raise RuntimeError("executor not used by list_openai_tools")
+
+    tool_service = ToolService(executor=_UnusedExecutor(), definitions=[])
+    tool_service.set_dynamic_definitions(
+        "user_task", user_task_approval_tool_definitions()
+    )
+    return {
+        t["function"]["name"]
+        for t in tool_service.list_openai_tools(ToolExposurePolicy.DEFAULT, None)
+    }
+
+
+async def test_realtime_tool_context_passes_session_id_and_exposes_approval_tools():
+    """Feishu IM realtime contract (T11).
+
+    FeishuImAdapter -> GatewayService.handle_message must pass a resolved
+    session_id through to ChatCompletionService, carry REALTIME execution_mode
+    on ingress_facts, and the shared ToolService DEFAULT surface must contain
+    approve_task / reject_task / revise_task (wired by T8).
+
+    The existing FakeGatewayService bypasses the real GatewayService and cannot
+    capture ChatCompletionInput, so this test wires a real GatewayService with
+    a capturing fake chat service to verify the end-to-end contract.
+    """
+    from app.application.chat_service import ChatCompletionResult
+    from app.application.gateway_service import GatewayService
+    from app.domain.gateway import GatewayHomeTarget, GatewaySessionLink
+    from app.domain.policy import ExecutionMode
+    from app.domain.provider import ModelInfo
+    from app.domain.session import ConversationSession
+    from app.domain.tool import ToolDefinition
+
+    class _Registry:
+        def __init__(self):
+            self.active = {}
+            self.links = {}
+            self.processed = set()
+            self.home_targets = {}
+
+        async def get_active_session(self, key):
+            sid = self.active.get(key.conversation_parts)
+            if sid is None:
+                return None
+            return GatewaySessionLink("conversation-1", sid, key.display_name)
+
+        async def create_session_link(self, key, session_id):
+            link = GatewaySessionLink("conversation-1", session_id, key.display_name)
+            self.links.setdefault(key.conversation_parts, []).append(link)
+            self.active[key.conversation_parts] = session_id
+            return link
+
+        async def set_active_session(self, key, session_id):
+            self.active[key.conversation_parts] = session_id
+            return GatewaySessionLink("conversation-1", session_id, key.display_name)
+
+        async def list_session_links(self, key):
+            return self.links.get(key.conversation_parts, [])
+
+        async def delete_session_link(self, session_id):
+            pass
+
+        async def mark_event_processed(self, source, event_id, message_id=""):
+            marker = (source, event_id)
+            if marker in self.processed:
+                return False
+            self.processed.add(marker)
+            return True
+
+        async def set_home_target(self, target):
+            self.home_targets[target.platform] = target
+            return target
+
+        async def get_home_target(self, platform):
+            return self.home_targets.get(platform)
+
+    class _SessionService:
+        async def create_session(self, session_id, source="dashboard"):
+            return ConversationSession(id=session_id, source=source)
+
+        async def rename_session(self, session_id, title):
+            return ConversationSession(id=session_id, title=title)
+
+        async def delete_session(self, session_id):
+            return None
+
+    class _CapturingChatService:
+        def __init__(self):
+            self.requests = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            return ChatCompletionResult(
+                session_id=request.session_id or "missing",
+                model=request.model,
+                message={"role": "assistant", "content": "pong"},
+            )
+
+    class _ToolService:
+        def list_definitions(self):
+            return [ToolDefinition("calculator", "Calculate", {"type": "object"})]
+
+    class _ModelService:
+        @property
+        def default_model(self):
+            return "model-a"
+
+        async def list_models(self):
+            return [ModelInfo("model-a", "Model A", "test", True, True)]
+
+    chat_service = _CapturingChatService()
+    gateway = GatewayService(
+        _Registry(),
+        chat_service,
+        _SessionService(),
+        _ToolService(),
+        _ModelService(),
+        lambda: {"provider": {"status": "ok"}, "gateway": {"status": "ok"}},
+        schedule_service=None,
+    )
+    client = FakeFeishuClient(text_payload("hello"))
+    adapter = FeishuImAdapter(gateway, client)
+
+    await adapter.handle_event({})
+
+    # ChatCompletionInput was captured
+    assert chat_service.requests, "ChatCompletionInput was not captured"
+    request = chat_service.requests[-1]
+
+    # session_id passes through (resolved by gateway registry, non-empty)
+    assert request.session_id
+    assert request.session_id is not None
+
+    # realtime execution mode on ingress_facts (authoritative claim)
+    assert request.ingress_facts is not None
+    assert request.ingress_facts.execution_mode is ExecutionMode.REALTIME
+    # trusted_metadata must not downgrade to unattended
+    assert request.trusted_metadata.get("execution_mode") != "unattended"
+
+    # Shared ToolService DEFAULT surface contains the three approval tools
+    tool_names = _default_exposed_tool_names_with_approval_tools()
+    assert {"approve_task", "reject_task", "revise_task"}.issubset(tool_names)

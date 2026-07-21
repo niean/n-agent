@@ -262,6 +262,17 @@ async def test_executor_task_guidance_contains_propose_change_guidance():
 
 
 @pytest.mark.asyncio
+async def test_executor_task_guidance_mentions_proposal_type():
+    """TASK_GUIDANCE must instruct the worker to choose proposal_type:
+    'approval' for approve/reject proposals, 'intent_request' when the worker
+    needs the user to supply information/intent/clarification before continuing.
+    """
+    assert "proposal_type" in TASK_GUIDANCE
+    assert "approval" in TASK_GUIDANCE
+    assert "intent_request" in TASK_GUIDANCE
+
+
+@pytest.mark.asyncio
 async def test_executor_session_id_is_task_prefix(executor, fake_chat):
     task = _task(id="t_1", execution_session_id=None)
     await executor.run(task, task_run_id=1, claim_lock="L1")
@@ -629,6 +640,52 @@ async def test_judge_has_no_write_tools():
 
 
 @pytest.mark.asyncio
+async def test_judge_fork_sets_persist_messages_false():
+    """judge fork 必须设 persist_messages=False，避免内部判定消息泄露到用户 Chat 会话。
+
+    Regression: goal_mode judge 的 user prompt ``judge task {id}: has the goal
+    been achieved?`` 和 assistant JSON ``{"achieved": true, "reason": "..."}``
+    被持久化到 execution_session_id，污染用户可见 Chat。judge 的 achieved/reason
+    是控制流信号（决定 COMPLETED/FAILED/续轮），不是用户可见结果。
+    """
+    worker_result = ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": "did work"},
+        finish_reason="stop",
+    )
+    judge_text = '{"achieved": true, "reason": "done"}'
+
+    chat = FakeJudgeChatService(worker_result, judge_text)
+    executor = TaskAgentExecutor(
+        chat_service=chat, task_registry=FakeTaskRegistry(),
+        prompt_builder=FakePromptBuilder(),
+    )
+    task = _task(goal_mode=True, goal_max_turns=3)
+    await executor.run_goal_loop(task, task_run_id=1, claim_lock="L1")
+
+    judge_calls = [c for c in chat.complete_calls if c.trusted_metadata.get("judge")]
+    assert len(judge_calls) >= 1
+    judge_call = judge_calls[0]
+    assert judge_call.persist_messages is False
+
+
+@pytest.mark.asyncio
+async def test_worker_run_keeps_persist_messages_default_true():
+    """worker 路径 persist_messages 保持默认 True（worker 消息仍持久化到会话）。"""
+    chat = FakeChatService()
+    executor = TaskAgentExecutor(
+        chat_service=chat, task_registry=FakeTaskRegistry(),
+        prompt_builder=FakePromptBuilder(),
+    )
+    await executor.run(_task(), task_run_id=1, claim_lock="L1")
+
+    # FakeChatService stores calls; only one worker call
+    assert len(chat.complete_calls) == 1
+    worker_call = chat.complete_calls[0]
+    assert worker_call.persist_messages is True
+
+
+@pytest.mark.asyncio
 async def test_goal_mode_judge_json_in_code_block():
     """Judge wraps JSON in markdown code block -- should still parse."""
     worker_result = ChatCompletionResult(
@@ -727,3 +784,164 @@ async def test_judge_does_not_grant_user_task_tools():
     permitted = set(judge_call.trusted_metadata.get("permitted_managed_tools", []))
     assert USER_TASK_TOOL_NAMES.isdisjoint(granted)
     assert USER_TASK_TOOL_NAMES.isdisjoint(permitted)
+
+
+# ---------------------------------------------------------------------------
+# 防递归（Task 7）：worker / judge 不得 grant 用户侧审批工具
+# approve_task / reject_task / revise_task。即使 task.execution_policy.allowed_tools
+# 被误配置为这三个名称，worker boundary 也必须显式剥离（worker 不能审批自己的提案）。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_strips_approval_tools_even_when_allowed_tools_misconfigured(
+    executor, fake_chat,
+):
+    """task.execution_policy.allowed_tools 误配置为 approve/reject/revise_task 时，
+    worker 的 granted_tools 必须显式移除这三个名称，permitted_managed_tools 也不得含。
+
+    防递归核心：worker 不能审批自己的 task_propose_change 提案。"""
+    from app.application.task_tools import USER_TASK_APPROVAL_TOOL_NAMES
+    from app.domain.task import TaskExecutionPolicy
+
+    malicious = tuple(USER_TASK_APPROVAL_TOOL_NAMES) + ("host_terminal",)
+    task = _task(execution_policy=TaskExecutionPolicy(allowed_tools=malicious))
+    await executor.run(task, task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+    granted = set(call.trusted_metadata.get("granted_tools", []))
+    permitted = set(call.trusted_metadata.get("permitted_managed_tools", []))
+    # 三个审批工具必须从 granted_tools 中剥离
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(granted)
+    # permitted_managed_tools 也不得含（双重保险：TASK_TOOL_NAMES 本就与之不相交）
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(permitted)
+    # 其它合法 grant 保留（剥离不能误伤 host_terminal）
+    assert "host_terminal" in granted
+
+
+@pytest.mark.asyncio
+async def test_worker_strips_approval_tools_from_trusted_claims(
+    executor, fake_chat,
+):
+    """trusted_claims（IngressFacts）中的 granted_tools / permitted_managed_tools
+    也必须剥离三个审批工具。ChatCompletionService 从 trusted_claims 重建
+    trusted_metadata，故两侧都必须干净。"""
+    from app.application.task_tools import USER_TASK_APPROVAL_TOOL_NAMES
+    from app.domain.task import TaskExecutionPolicy
+
+    task = _task(
+        execution_policy=TaskExecutionPolicy(
+            allowed_tools=tuple(USER_TASK_APPROVAL_TOOL_NAMES),
+        ),
+    )
+    await executor.run(task, task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+    claims = call.ingress_facts.trusted_claims
+    granted = set(claims.get("granted_tools", []))
+    permitted = set(claims.get("permitted_managed_tools", []))
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(granted)
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(permitted)
+
+
+@pytest.mark.asyncio
+async def test_judge_does_not_grant_user_approval_task_tools():
+    """judge fork 的 granted_tools 与 permitted_managed_tools 都不得含审批工具。
+
+    judge 本就空 grant + 只读 task_show，这里显式断言审批工具三名称不在任何集合。"""
+    from app.application.task_tools import USER_TASK_APPROVAL_TOOL_NAMES
+
+    worker_result = ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": "did work"},
+        finish_reason="stop",
+    )
+    judge_text = '{"achieved": true, "reason": "done"}'
+    chat = FakeJudgeChatService(worker_result, judge_text)
+    ex = TaskAgentExecutor(
+        chat_service=chat, task_registry=FakeTaskRegistry(),
+        prompt_builder=FakePromptBuilder(),
+    )
+    await ex.run_goal_loop(
+        _task(goal_mode=True, goal_max_turns=3), task_run_id=1, claim_lock="L1",
+    )
+    judge_calls = [c for c in chat.complete_calls if c.trusted_metadata.get("judge")]
+    assert len(judge_calls) >= 1
+    judge_call = judge_calls[0]
+    granted = set(judge_call.trusted_metadata.get("granted_tools", []))
+    permitted = set(judge_call.trusted_metadata.get("permitted_managed_tools", []))
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(granted)
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(permitted)
+
+
+@pytest.mark.asyncio
+async def test_worker_approval_tools_not_visible_under_safe_only_surface(
+    executor, fake_chat,
+):
+    """端到端：worker 即便误配置 allowed_tools 含审批工具三名称，经 boundary 剥离后，
+    通过 ToolService SAFE_ONLY surface 断言三个工具最终对 worker 不可见。
+
+    构造 ToolService 注册三个审批工具 + 一个 host_terminal（SAFE AGENT），用 worker
+    实际产出的 granted_tools（post-strip）构造 ToolExecutionContext，调用
+    list_openai_tools(SAFE_ONLY, context)：
+      - approve_task / reject_task / revise_task 不可见（未 grant）
+      - host_terminal 可见（证明 surface 本身工作，grant 机制未被破坏）
+    """
+    from app.application.task_tools import (
+        USER_TASK_APPROVAL_TOOL_NAMES,
+        user_task_approval_tool_definitions,
+    )
+    from app.application.tool_service import ToolService
+    from app.domain.task import TaskExecutionPolicy
+    from app.domain.tool import (
+        RiskLevel,
+        ToolDefinition,
+        ToolExecutionContext,
+        ToolSourceType,
+    )
+    from app.domain.tool_policy import ToolExposurePolicy
+
+    # 恶意配置：allowed_tools 含三个审批工具 + 合法 host_terminal
+    malicious = tuple(USER_TASK_APPROVAL_TOOL_NAMES) + ("host_terminal",)
+    task = _task(execution_policy=TaskExecutionPolicy(allowed_tools=malicious))
+    await executor.run(task, task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+
+    # 取 worker 实际产出的 granted_tools（post-strip）
+    worker_granted = frozenset(call.trusted_metadata.get("granted_tools", []))
+    worker_permitted = frozenset(call.trusted_metadata.get("permitted_managed_tools", []))
+    # 前置断言：三个审批工具已被 boundary 剥离
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(worker_granted)
+
+    # 构造 ToolService：注册三个审批工具 + host_terminal
+    host_terminal_def = ToolDefinition(
+        name="host_terminal",
+        description="host terminal",
+        input_schema={"type": "object", "properties": {}},
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.AGENT,
+        managed=False,
+    )
+    service = ToolService(
+        executor=FakeExecutorForExposure(),
+        definitions=[*user_task_approval_tool_definitions(), host_terminal_def],
+    )
+
+    context = ToolExecutionContext(
+        granted_tools=worker_granted,
+        permitted_managed_tools=set(worker_permitted),
+    )
+    visible = {
+        schema["function"]["name"]
+        for schema in service.list_openai_tools(ToolExposurePolicy.SAFE_ONLY, context)
+    }
+    # 三个审批工具不可见（worker 不能审批自己的提案）
+    assert USER_TASK_APPROVAL_TOOL_NAMES.isdisjoint(visible)
+    # host_terminal 可见：证明 grant 机制本身未被破坏（模式六设计保留）
+    assert "host_terminal" in visible
+
+
+class FakeExecutorForExposure:
+    """仅用于 ToolService 构造的占位 executor（exposure 测试不执行工具）。"""
+
+    async def execute(self, request, context=None):
+        from app.domain.tool import ToolResult, ToolResultStatus
+        return ToolResult(request.id, request.name, ToolResultStatus.SUCCESS, {"ok": True})

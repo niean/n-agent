@@ -82,6 +82,7 @@ _INTERNAL_OPTION_KEYS = {
     "external_memory_enabled",
     "stream_event_sink",
     "_policy_snapshot",
+    "persist_messages",
 }
 
 
@@ -244,6 +245,14 @@ class AgentGraphRunner:
 
     async def run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
         state.run_options = dict(options or {})
+        # Mirror persist_messages from options into the state field so that
+        # update_memory / finalize / execute_tools can read it without re-checking
+        # run_options. Caller may set either AgentState.persist_messages directly
+        # (e.g. tests) or pass it via options (ChatCompletionService path).
+        # Options wins to keep a single source of truth per run.
+        opt_persist = state.run_options.get("persist_messages")
+        if opt_persist is not None:
+            state.persist_messages = bool(opt_persist)
         snapshot = self._policy_snapshot(state)
         self._budget_service.open(
             state.run_id,
@@ -1052,17 +1061,18 @@ class AgentGraphRunner:
                     "content": json.dumps(result_payload, ensure_ascii=False, default=str),
                 }
             )
-            await self._runtime_memory.save_tool_call_if_allowed(
-                ToolCall(
-                    id=result.tool_call_id,
-                    session_id=state.session_id,
-                    tool_name=result.tool_name,
-                    arguments=parsed_arguments,
-                    result=result_payload,
-                    status=result.status.value,
-                    duration_ms=result.duration_ms,
+            if state.persist_messages:
+                await self._runtime_memory.save_tool_call_if_allowed(
+                    ToolCall(
+                        id=result.tool_call_id,
+                        session_id=state.session_id,
+                        tool_name=result.tool_name,
+                        arguments=parsed_arguments,
+                        result=result_payload,
+                        status=result.status.value,
+                        duration_ms=result.duration_ms,
+                    )
                 )
-            )
             if result.terminal:
                 # Terminal tool semantics are decided by the server-side
                 # executor. Stop after persisting this result; do not make a
@@ -1183,22 +1193,26 @@ class AgentGraphRunner:
         # transform_llm_output. This ensures DB content matches client-visible
         # content (both use the transformed text). Previously, final_message
         # was appended here, which pre-empted the transform.
+        persist = state.persist_messages
+        assistant_source = state.message_source
         for assistant_message in assistant_messages:
             content = assistant_message.get("content", "")
             tool_calls = assistant_message.get("tool_calls") or []
             if tool_calls:
                 content = {"content": content, "tool_calls": tool_calls}
-            await self._runtime_memory.append_assistant_message(
-                state.session_id, content,
-            )
+            if persist:
+                await self._runtime_memory.append_assistant_message(
+                    state.session_id, content, source=assistant_source,
+                )
         state.assistant_tool_messages = []
         for result in state.tool_results:
-            await self._runtime_memory.append_tool_message(
-                state.session_id,
-                json.dumps(result, ensure_ascii=False, default=str),
-                tool_call_id=result.get("tool_call_id"),
-                name=result.get("name"),
-            )
+            if persist:
+                await self._runtime_memory.append_tool_message(
+                    state.session_id,
+                    json.dumps(result, ensure_ascii=False, default=str),
+                    tool_call_id=result.get("tool_call_id"),
+                    name=result.get("name"),
+                )
         state.tool_results = []
         await self._runtime_memory.save_task_state_if_allowed(
             TaskState(
@@ -1311,13 +1325,13 @@ class AgentGraphRunner:
         # error-path message was persisted in the error block above. Now both
         # are unified here so DB content matches client-visible text (both use
         # the post-transform content).
-        if state.final_message:
+        if state.final_message and state.persist_messages:
             persist_content = state.final_message.get("content", "")
             persist_tool_calls = state.final_message.get("tool_calls") or []
             if persist_tool_calls:
                 persist_content = {"content": persist_content, "tool_calls": persist_tool_calls}
             await self._runtime_memory.append_assistant_message(
-                state.session_id, persist_content,
+                state.session_id, persist_content, source=state.message_source,
             )
 
         # ----- 外部记忆同步 -----
@@ -1476,7 +1490,7 @@ def _error_message_for_user(state: AgentState) -> str:
         content = _latest_tool_result_summary(state.working_messages)
         if content:
             return f"已达到工具调用上限，模型没有生成最终回答。最近一次工具调用已返回以下结果：\n\n{content}"
-        return "已达到工具调用上限，模型没有生成最终回答。请查看工具调用调试信息，或缩小问题后重试。"
+        return "已达到工具调用上限，模型没有生成最终回答。请查看工具调用，或缩小问题后重试。"
     return state.error or "error"
 
 

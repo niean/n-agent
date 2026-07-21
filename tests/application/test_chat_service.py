@@ -958,3 +958,172 @@ async def test_non_stream_error_message_also_released(tmp_path):
     )
     assert result.finish_reason == "error"
     assert secret not in result.message["content"]
+
+
+async def test_complete_persists_user_message_source_from_ingress_facts(tmp_path):
+    from app.application.policy_snapshot import IngressFacts
+    from app.domain.policy import ExecutionMode
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+    sid = "task-complete-1"
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "work task t1"}],
+            stream=False,
+            session_id=sid,
+            ingress_facts=IngressFacts(
+                run_id="r1", session_id=sid, source="task", actor_id=None,
+                execution_mode=ExecutionMode.UNATTENDED, trusted_claims={},
+            ),
+        )
+    )
+    msgs = await store.list_messages(sid)
+    user_msgs = [m for m in msgs if m.role == "user"]
+    assert len(user_msgs) == 1
+    assert user_msgs[0].source == "task"
+
+
+async def test_complete_source_falls_back_to_api_without_ingress_facts(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+    sid = "api-complete-1"
+    await service.complete(
+        ChatCompletionInput(model="test", messages=[{"role": "user", "content": "hi"}], stream=False, session_id=sid)
+    )
+    msgs = await store.list_messages(sid)
+    user_msgs = [m for m in msgs if m.role == "user"]
+    assert len(user_msgs) == 1
+    assert user_msgs[0].source == "api"
+
+
+@pytest.mark.asyncio
+async def test_complete_tags_worker_assistant_message_source(tmp_path):
+    """Worker（source=task）的 assistant 消息按来源标记 source=task，使 Dashboard
+    能隐藏 worker 内部推理（regression：worker 思考过程 "The task requires querying
+    weather..." 作为普通 assistant 气泡泄露到对话框）。推理仍落库供 goal_mode 续轮
+    与 LLM 上下文，仅前端渲染隐藏。与 judge 推理 persist_messages=False 不落库同理，
+    但 worker 需要历史故采用 source 标记 + 前端隐藏。"""
+    from app.application.policy_snapshot import IngressFacts
+    from app.domain.policy import ExecutionMode
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+    sid = "task-assistant-src"
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "work task t1"}],
+            stream=False,
+            session_id=sid,
+            ingress_facts=IngressFacts(
+                run_id="r1", session_id=sid, source="task", actor_id=None,
+                execution_mode=ExecutionMode.UNATTENDED, trusted_claims={},
+            ),
+        )
+    )
+    msgs = await store.list_messages(sid)
+    assistant_msgs = [m for m in msgs if m.role == "assistant"]
+    assert assistant_msgs, "expected a persisted assistant message"
+    assert assistant_msgs[0].source == "task"
+
+
+@pytest.mark.asyncio
+async def test_complete_leaves_realtime_assistant_message_untagged(tmp_path):
+    """Realtime（api）assistant 回复保持 source=None，在 Dashboard 正常渲染
+    （仅进程来源 worker 推理被隐藏，主对话回复不受影响）。"""
+    from app.application.policy_snapshot import IngressFacts
+    from app.domain.policy import ExecutionMode
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+    sid = "api-assistant-src"
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id=sid,
+            ingress_facts=IngressFacts(
+                run_id="r2", session_id=sid, source="api", actor_id=None,
+                execution_mode=ExecutionMode.REALTIME, trusted_claims={},
+            ),
+        )
+    )
+    msgs = await store.list_messages(sid)
+    assistant_msgs = [m for m in msgs if m.role == "assistant"]
+    assert assistant_msgs, "expected a persisted assistant message"
+    assert assistant_msgs[0].source is None
+
+
+@pytest.mark.asyncio
+async def test_persist_messages_false_skips_user_message_persistence(tmp_path):
+    """persist_messages=False 时，user prompt 不持久化到会话消息。
+
+    Regression: goal_mode judge fork 的内部判定 prompt ``judge task {id}: ...``
+    不应泄露到用户可见 Chat。judge 复用 execution_session_id，若不抑制 user 消息
+    持久化，prompt 会出现在用户会话历史中。
+    """
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+    sid = "judge-no-persist"
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "judge task t_1: has the goal been achieved?"}],
+            stream=False,
+            session_id=sid,
+            persist_messages=False,
+        )
+    )
+
+    msgs = await store.list_messages(sid)
+    user_msgs = [m for m in msgs if m.role == "user"]
+    assert user_msgs == [], "judge user prompt must not be persisted to the session"
+
+
+@pytest.mark.asyncio
+async def test_persist_messages_default_true_persists_user_message(tmp_path):
+    """persist_messages 默认 True：user prompt 正常持久化（回归保护）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+    sid = "default-persist"
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id=sid,
+        )
+    )
+
+    msgs = await store.list_messages(sid)
+    user_msgs = [m for m in msgs if m.role == "user"]
+    assert len(user_msgs) == 1
+    assert user_msgs[0].content == "hi"
+
+
+@pytest.mark.asyncio
+async def test_persist_messages_flag_propagated_to_runner_options(tmp_path):
+    """persist_messages 通过 options 传给 AgentGraphRunner（agent_graph 读此标志抑制持久化）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "judge task t_1"}],
+            stream=False,
+            session_id="propagate-flag",
+            persist_messages=False,
+        )
+    )
+
+    assert runner.options.get("persist_messages") is False
+

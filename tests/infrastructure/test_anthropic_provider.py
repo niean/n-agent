@@ -78,12 +78,55 @@ async def test_request_splits_system_messages_and_strips_internal_options():
         },
     )
 
-    assert client.messages.kwargs["system"] == "sys1\nsys2"
-    assert client.messages.kwargs["messages"] == [{"role": "user", "content": "hi"}]
+    assert client.messages.kwargs["system"] == [
+        {
+            "type": "text",
+            "text": "sys1\nsys2",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+    assert client.messages.kwargs["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "hi",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ]
     assert client.messages.kwargs["temperature"] == 0.2
     assert "tool_execution_context" not in client.messages.kwargs
     assert "tool_exposure_policy" not in client.messages.kwargs
     assert "execution_context_mode" not in client.messages.kwargs
+
+
+@pytest.mark.asyncio
+async def test_request_enables_static_and_automatic_prompt_caching_by_default():
+    client = FakeClient()
+    provider = AnthropicProvider("http://test", "key", "default", client=client)
+
+    await provider.chat(
+        [{"role": "system", "content": "stable"}, {"role": "user", "content": "hi"}],
+        [],
+        False,
+        "claude-opus-4-6",
+        {},
+    )
+
+    cache_control = {"type": "ephemeral"}
+    assert client.messages.kwargs["cache_control"] == cache_control
+    assert client.messages.kwargs["system"] == [
+        {"type": "text", "text": "stable", "cache_control": cache_control},
+    ]
+    assert client.messages.kwargs["messages"] == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": cache_control}],
+        }
+    ]
 
 
 @pytest.mark.asyncio

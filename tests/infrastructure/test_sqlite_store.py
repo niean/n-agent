@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -252,3 +253,149 @@ def test_migrate_session_id_prefixes_handles_legacy_feishu_with_gateway_prefix(t
         session = conn.execute("SELECT id, source FROM sessions").fetchone()
         assert session["id"] == "feishu-xyz"
         assert session["source"] == "feishu"
+
+
+async def test_append_message_persists_and_reads_source(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    sid = "task-src-1"
+    await store.append_message(sid, ConversationMessage(role="user", content="work task t1", source="task"))
+    msgs = await store.list_messages(sid)
+    assert len(msgs) == 1
+    assert msgs[0].source == "task"
+
+
+async def test_append_message_null_source_roundtrip(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    sid = "api-src-1"
+    await store.append_message(sid, ConversationMessage(role="user", content="hi"))
+    msgs = await store.list_messages(sid)
+    assert msgs[0].source is None
+
+
+async def test_source_migration_idempotent_on_legacy_db(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, source TEXT)")
+    conn.execute(
+        "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content_json TEXT, "
+        "created_at TEXT, provider_message_id TEXT, tool_call_id TEXT, name TEXT, "
+        "is_summary INTEGER DEFAULT 0, is_summarized INTEGER DEFAULT 0)"
+    )
+    conn.execute("INSERT INTO sessions(id,title,created_at,updated_at,source) VALUES('s','t','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00','api')")
+    conn.execute("INSERT INTO messages(id,session_id,role,content_json,created_at) VALUES('m','s','user','\"old\"','2026-01-01T00:00:00+00:00')")
+    conn.commit()
+    conn.close()
+    store = SQLiteMemoryStore(db)
+    msgs = await store.list_messages("s")
+    assert len(msgs) == 1
+    assert msgs[0].source is None
+    cols = {row["name"] for row in store._connect().execute("PRAGMA table_info(messages)").fetchall()}
+    assert "source" in cols
+    store2 = SQLiteMemoryStore(db)
+    assert len(await store2.list_messages("s")) == 1
+
+
+async def test_clone_session_preserves_source_and_summary_flags(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    src = "src-clone-1"
+    await store.append_message(src, ConversationMessage(role="user", content="work task t1", source="task"))
+    await store.append_message(src, ConversationMessage(role="user", content="[CONTEXT SUMMARY]: x", is_summary=True))
+    await store.clone_session(src, "dst-clone-1")
+    cloned = await store.list_messages("dst-clone-1")
+    assert len(cloned) == 2
+    assert cloned[0].source == "task"
+    assert cloned[0].is_summary is False
+    assert cloned[1].is_summary is True
+    assert cloned[1].source is None
+
+
+@pytest.mark.asyncio
+async def test_append_message_persists_and_reads_card(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-1"))
+    card = {"schema_version": 1, "kind": "task_lifecycle", "task_id": "t_1",
+            "status": "waiting_approval", "title": "T", "summary": "p",
+            "available_actions": ["approve", "reject", "revise", "cancel"]}
+    await store.append_message("sess-1", ConversationMessage(
+        role="system", content="等待批准", name="ui.task_lifecycle", card=card))
+    msgs = await store.list_messages("sess-1")
+    assert msgs[-1].card == card
+
+
+@pytest.mark.asyncio
+async def test_append_message_null_card_roundtrip(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-1"))
+    await store.append_message("sess-1", ConversationMessage(
+        role="system", content="x", name="ui.task_lifecycle"))
+    assert (await store.list_messages("sess-1"))[-1].card is None
+
+
+@pytest.mark.asyncio
+async def test_card_migration_idempotent_on_legacy_db(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, created_at TEXT, updated_at TEXT, source TEXT)")
+    conn.execute(
+        "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT, role TEXT, content_json TEXT, "
+        "created_at TEXT, provider_message_id TEXT, tool_call_id TEXT, name TEXT, "
+        "is_summary INTEGER DEFAULT 0, is_summarized INTEGER DEFAULT 0, source TEXT)"
+    )
+    conn.execute("INSERT INTO sessions(id,title,created_at,updated_at,source) VALUES('s','t','2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00','api')")
+    conn.execute("INSERT INTO messages(id,session_id,role,content_json,created_at,name,is_summary,is_summarized) VALUES('m','s','system','\"x\"','2026-01-01T00:00:00+00:00','ui.task_lifecycle',0,0)")
+    conn.commit()
+    conn.close()
+    store = SQLiteMemoryStore(db)
+    msgs = await store.list_messages("s")  # 触发懒初始化与迁移
+    assert msgs[-1].card is None  # legacy row reads None
+    cols = {row["name"] for row in store._connect().execute("PRAGMA table_info(messages)").fetchall()}
+    assert "card_json" in cols
+    store2 = SQLiteMemoryStore(db)
+    assert (await store2.list_messages("s"))[-1].card is None  # 二次初始化无副作用
+
+
+@pytest.mark.asyncio
+async def test_decode_message_card_invalid_json_returns_none(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-1"))
+    with store._connect() as conn:
+        conn.execute("INSERT INTO messages(id,session_id,role,content_json,created_at,name,is_summary,is_summarized,card_json) VALUES('m','sess-1','system','\"x\"','2026-01-01T00:00:00+00:00','ui.task_lifecycle',0,0,'not-json')")
+        conn.commit()
+    msgs = await store.list_messages("sess-1")
+    assert msgs[-1].card is None  # invalid JSON -> None, message preserved
+    assert msgs[-1].content == "x"
+
+
+@pytest.mark.asyncio
+async def test_decode_message_card_non_object_returns_none(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-1"))
+    with store._connect() as conn:
+        conn.execute("INSERT INTO messages(id,session_id,role,content_json,created_at,name,is_summary,is_summarized,card_json) VALUES('m','sess-1','system','\"x\"','2026-01-01T00:00:00+00:00','ui.task_lifecycle',0,0,'[1,2,3]')")
+        conn.commit()
+    assert (await store.list_messages("sess-1"))[-1].card is None  # JSON array -> None
+
+
+@pytest.mark.asyncio
+async def test_decode_message_card_does_not_mask_content_json_error(tmp_path):
+    """card 容错不掩盖 content_json 损坏：content_json 非法 JSON 仍抛原有 decode error。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-1"))
+    with store._connect() as conn:
+        conn.execute("INSERT INTO messages(id,session_id,role,content_json,created_at,name,is_summary,is_summarized,card_json) VALUES('m','sess-1','system','not-json-content','2026-01-01T00:00:00+00:00','ui.task_lifecycle',0,0,'not-json-card')")
+        conn.commit()
+    with pytest.raises(json.JSONDecodeError):
+        await store.list_messages("sess-1")
+
+
+@pytest.mark.asyncio
+async def test_append_message_card_not_json_serializable_fails_atomically(tmp_path):
+    """card 含不可 JSON 编码值时 append 整体失败，不写半条消息。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-1"))
+    bad_card = {"unencodable": object()}  # object() not JSON serializable
+    with pytest.raises(TypeError):
+        await store.append_message("sess-1", ConversationMessage(
+            role="system", content="x", name="ui.task_lifecycle", card=bad_card))
+    # 无半条消息
+    assert await store.list_messages("sess-1") == []

@@ -59,16 +59,19 @@ button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 
 /* Sidebar */
-.sidebar { position: fixed; inset: 0 auto 0 0; z-index: 10; width: var(--sidebar-width-collapsed); overflow: hidden; background: var(--color-bg-white); border-right: 1px solid var(--color-sidebar-border); box-shadow: var(--shadow-sidebar); transition: width var(--motion-fast); }
+.sidebar { position: fixed; inset: 0 auto 0 0; z-index: 10; display: flex; flex-direction: column; width: var(--sidebar-width-collapsed); overflow: hidden; background: var(--color-bg-white); border-right: 1px solid var(--color-sidebar-border); box-shadow: var(--shadow-sidebar); transition: width var(--motion-fast); }
 body.sidebar-expanded .sidebar { width: var(--sidebar-width-expanded); }
-.sidebar__toggle { display: flex; align-items: center; justify-content: center; width: 100%; height: 50px; color: var(--color-fg-muted); background: transparent; border: 0; }
+.sidebar__toggle { display: flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 100%; height: 50px; color: var(--color-fg-muted); background: transparent; border: 0; }
 body.sidebar-expanded .sidebar__toggle { justify-content: space-between; padding: 0 var(--space-6); }
 .sidebar__brand { display: none; align-items: center; gap: var(--space-4); font-weight: 700; }
 body.sidebar-expanded .sidebar__brand { display: flex; }
 .sidebar__brand-icon { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; color: var(--color-on-primary); background: var(--color-primary); border-radius: 50%; font-size: 11px; }
 .sidebar__toggle-icon { transition: transform 0.2s ease; }
 body.sidebar-expanded .sidebar__toggle-icon { transform: rotate(180deg); }
-.sidebar__nav { display: flex; flex-direction: column; gap: 4px; padding: 8px 6px; }
+.sidebar__nav { display: flex; flex-direction: column; gap: 4px; padding: 8px 6px; flex: 1 1 auto; min-height: 0; scrollbar-width: thin; scrollbar-color: var(--color-border-default) transparent; }
+.sidebar__nav::-webkit-scrollbar { width: 6px; }
+.sidebar__nav::-webkit-scrollbar-thumb { background: var(--color-border-default); border-radius: 3px; }
+.sidebar__nav::-webkit-scrollbar-track { background: transparent; }
 .sidebar__divider { height: 1px; margin: 6px 8px; background: var(--color-border-light); border: 0; }
 .sidebar__item { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 10px; color: var(--color-fg-muted); white-space: nowrap; text-decoration: none; background: transparent; border: 0; border-radius: 10px; }
 .sidebar__item:hover { color: var(--color-sidebar-hover-fg); background: var(--color-bg-hover); }
@@ -170,12 +173,20 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .msg { padding: 10px 14px; border-radius: 16px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-width: 80%; font-size: 14px; box-shadow: 0 1px 2px rgba(15,23,42,.04); }
 .msg.user { align-self: flex-end; color: var(--color-on-primary); background: var(--color-primary); border-bottom-right-radius: 4px; }
 .msg.assistant { align-self: flex-start; background: var(--color-bg-white); border: 1px solid var(--color-border-light); border-bottom-left-radius: 4px; }
+/* 工具调用：黄底 warning 调试卡。任务指令/任务状态/系统消息沿用原灰底，
+   仅文字样式（等宽字体、12px）与工具调用保持一致；标题以 <summary> 区分。 */
 .msg.tool { align-self: flex-start; max-width: 92%; background: var(--color-warning-bg); border: 1px solid var(--color-warning-border); color: var(--color-warning-fg); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .msg.tool summary { cursor: pointer; font-family: var(--font-family-base); font-weight: 600; }
 .msg.tool pre { margin-top: 8px; background: rgba(255, 255, 255, 0.55); }
-.msg.system { align-self: flex-start; max-width: 92%; background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); color: var(--color-fg-muted); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
-.msg.system summary { cursor: pointer; font-weight: 600; }
-.msg.system pre { margin-top: 8px; background: rgba(255, 255, 255, 0.55); white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+.msg.system { align-self: flex-start; max-width: 92%; background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); color: var(--color-fg-muted); border-radius: 8px; padding: 8px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.msg.system summary { cursor: pointer; font-family: var(--font-family-base); font-weight: 600; }
+.msg.system pre { margin-top: 8px; background: rgba(255, 255, 255, 0.55); }
+/* 进程消息状态卡片：task/schedule/curator 等非真人 user 输入，左对齐灰底卡片，
+   区别于真人 user 的 --color-primary 蓝底右对齐气泡；底色与 task 调试卡（.msg.system）
+   一致使用 --color-bg-subtle，圆角与卡片感对齐 .task-card 样式。
+   work task / judge task 前缀的消息（单独或合并）样式打平 ui.task_lifecycle 任务状态卡片（.msg.system），
+   不再使用 msg--process-card 样式，详见 chat.js createMessageElement isFoldedProcess / isMergedTaskStatus 分支。 */
+.msg--process-card { align-self: flex-start; max-width: 92%; background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); color: var(--color-fg-muted); border-radius: 8px; border-bottom-left-radius: 4px; }
 .msg.error { align-self: center; max-width: 92%; background: var(--color-danger-bg); border: 1px solid var(--color-danger-border); color: var(--color-danger-fg); font-size: 12px; }
 .msg img { display: block; max-width: 240px; max-height: 240px; border-radius: 8px; margin-top: 4px; cursor: zoom-in; }
 .msg.user img { max-width: 220px; max-height: 220px; }
@@ -185,6 +196,29 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .msg--summary { align-self: flex-start; max-width: 92%; background: var(--color-warning-bg); border: 1px solid var(--color-warning-border); color: var(--color-warning-fg); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
 .msg--summary summary { cursor: pointer; font-family: var(--font-family-base); font-weight: 600; }
 .msg--summary pre { margin-top: 8px; background: rgba(255, 255, 255, 0.55); white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+
+/* Task lifecycle interactive card (T6/T7): inline card with action buttons + revise textarea.
+   Reuses existing tokens (msg.system palette, radius, spacing). Stale/unavailable only
+   render body + feedback, no buttons or textarea created. */
+.task-card { max-width: 92%; background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+.task-card details { margin: 0; }
+.task-card summary { cursor: pointer; font-family: var(--font-family-base); font-weight: 600; color: var(--color-fg-default); }
+.task-card__body { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.task-card__title { font-weight: 600; color: var(--color-fg-default); word-break: break-word; }
+.task-card__meta { font-size: 12px; color: var(--color-fg-subtle); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.task-card__summary { color: var(--color-fg-muted); white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+.task-card__actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; margin-top: 4px; }
+.task-card__label { display: flex; flex-direction: column; gap: 4px; color: var(--color-fg-muted); font-size: 12px; flex-basis: 100%; }
+.task-card__textarea { width: 100%; min-height: 60px; max-height: 160px; padding: 6px 8px; border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); font: inherit; font-size: 13px; color: var(--color-fg-default); background: var(--color-bg-white); resize: vertical; }
+.task-card__btn { padding: 5px 12px; color: var(--color-fg-muted); background: var(--color-bg-white); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
+.task-card__btn:hover:not(:disabled) { background: var(--color-bg-hover); color: var(--color-fg-default); border-color: var(--color-border-default); }
+.task-card__btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.task-card__feedback { font-size: 12px; color: var(--color-fg-subtle); min-height: 16px; }
+/* Stale feedback surfaces the recorded decision (or a concise status-changed
+   notice) as a light-gray hint, not a warning: the outcome is informational.
+   Unavailable keeps the danger color since it signals a fetch failure the user may retry. */
+.task-card__stale .task-card__feedback { color: var(--color-fg-subtle); }
+.task-card__unavailable .task-card__feedback { color: var(--color-danger-fg); }
 
 /* Hover timestamp (飞书风格): 鼠标悬停消息气泡时，在气泡上方展示小号灰色时间。
    时间文本由 JS 写入 data-time，CSS 用 attr() 取值，避免 innerHTML。
@@ -339,6 +373,8 @@ body.sidebar-expanded .sidebar__submenu.sidebar__submenu--open { display: flex; 
 
 /* 收起态：二级菜单浮层弹出，不展开左导 */
 body:not(.sidebar-expanded) .sidebar { overflow: visible; }
+/* 展开态：导航项超出视口高度时内部垂直滚动（收起态保留 overflow:visible 以便二级菜单浮层弹出） */
+body.sidebar-expanded .sidebar__nav { overflow-x: hidden; overflow-y: auto; }
 body:not(.sidebar-expanded) .sidebar__group { position: relative; }
 body:not(.sidebar-expanded) .sidebar__submenu { position: absolute; top: 0; left: 100%; z-index: 20; min-width: 168px; margin: 0 0 0 6px; padding: 6px; background: var(--color-bg-white); border: 1px solid var(--color-border-light); border-radius: var(--radius-md); box-shadow: var(--shadow-card); }
 body:not(.sidebar-expanded) .sidebar__group:hover .sidebar__submenu { display: flex; }
@@ -405,7 +441,7 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
   left: 0;
   bottom: calc(100% + 10px);
   z-index: 20;
-  width: min(360px, calc(100vw - 40px));
+  width: min(240px, calc(100vw - 40px));
   max-height: min(420px, 60vh);
   overflow: auto;
   padding: 12px;
@@ -503,6 +539,12 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
   color: var(--color-fg-subtle);
   font-size: 13px;
 }
+
+/* 调试设置按钮：复用记忆弹框 trigger/popover/option 样式，仅新增定位容器 */
+.chat-settings { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
+/* 调试显隐：设置弹框控制工具调用 / 任务状态卡片的可见性（按 data-debug-kind 标记） */
+#chat-messages.chat-debug--hide-tool [data-debug-kind="tool"] { display: none; }
+#chat-messages.chat-debug--hide-task [data-debug-kind="task"] { display: none; }
 
 .checkbox-list {
   display: grid;

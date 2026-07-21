@@ -38,6 +38,29 @@ async def test_dashboard_task_lifecycle_lands_in_origin_chat_session(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dashboard_task_result_lands_in_origin_chat_session(tmp_path):
+    """dashboard 任务 SUCCEEDED：最终结果以 ui.task_result 普通消息写入 origin Chat 会话，
+    不再写 [任务状态] 已完成 卡片。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    session_svc = SessionService(store)
+    await store.create_session(ConversationSession(id="dashboard-s1"))
+
+    async def result_writer(session_id, content):
+        await session_svc.append_task_result_message(session_id, content)
+
+    task = Task(id="t1", title="完成报告", origin_session_id="dashboard-s1")
+
+    await result_writer(task_execution_session_id(task), "任务已完成：完成报告\n\n已生成 Q3 总结")
+    msgs = await store.list_messages("dashboard-s1")
+    assert len(msgs) == 1
+    assert msgs[0].name == "ui.task_result"
+    assert msgs[0].role == "system"
+    assert "已完成" in msgs[0].content and "Q3 总结" in msgs[0].content
+    # 最终结果不走状态卡片正文
+    assert not msgs[0].content.startswith("[任务状态]")
+
+
+@pytest.mark.asyncio
 async def test_non_dashboard_task_does_not_pollute_origin_chat(tmp_path):
     """kanban/CLI 任务（origin=None）：selector 回退 task-{uuid5}，lifecycle 不污染 dashboard Chat。
 

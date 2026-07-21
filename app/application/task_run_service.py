@@ -58,6 +58,7 @@ from app.domain.task import (
     TaskNotFoundError,
     TaskRunOutcome,
     TaskStatus,
+    available_lifecycle_actions,
 )
 from app.domain.task_policy import TaskPolicy, TaskPolicyRequest
 
@@ -109,7 +110,8 @@ class TaskRunService:
         executor: Any,
         policy: TaskPolicy,
         notifier: Any | None = None,
-        lifecycle_writer: Callable[[str, str], Awaitable[Any]] | None = None,
+        lifecycle_writer: Callable[[str, str, dict[str, Any] | None], Awaitable[Any]] | None = None,
+        result_writer: Callable[[str, str], Awaitable[Any]] | None = None,
         lease_seconds: int = 900,
         heartbeat_timeout_seconds: int = 300,
         max_runtime_seconds: int = 3600,
@@ -121,6 +123,7 @@ class TaskRunService:
         self.policy = policy
         self.notifier = notifier
         self.lifecycle_writer = lifecycle_writer
+        self.result_writer = result_writer
         self.lease_seconds = lease_seconds
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.max_runtime_seconds = max_runtime_seconds
@@ -130,21 +133,42 @@ class TaskRunService:
     # Lifecycle chat messages (best-effort, never blocks finalization)
     # ------------------------------------------------------------------
 
-    async def _write_lifecycle(self, task: Task, content: str) -> None:
+    async def _write_lifecycle(
+        self, task: Task, content: str, card: dict[str, Any] | None = None,
+    ) -> None:
         """向执行会话 best-effort 写 ui.task_lifecycle system 消息。
 
-        writer 为 None（未装配/降级）时跳过；写入异常仅 log.warning，不改变任务 CAS、
-        worker 回收或飞书投递结果。会话不存在时 SessionService 抛 SessionNotFoundError
+        card 为可选结构化交互载荷：交互态（waiting/failed/expired）传版本化 payload，
+        纯文本 lifecycle（succeeded/cancelled/开始运行）传 None。writer 为 None
+        （未装配/降级）时跳过；写入异常仅 log.warning，不改变任务 CAS、worker 回收
+        或飞书投递结果。会话不存在时 SessionService 抛 SessionNotFoundError
         -> 这里吞掉（会话已删，不复活）。
         """
         if self.lifecycle_writer is None:
             return
         session_id = task_execution_session_id(task)
         try:
-            await self.lifecycle_writer(session_id, content)
+            await self.lifecycle_writer(session_id, content, card)
         except Exception:
             logger.warning(
                 "lifecycle write failed for task %s", task.id, exc_info=True,
+            )
+
+    async def _write_result(self, task: Task, content: str) -> None:
+        """向执行会话 best-effort 写 ui.task_result system 消息（最终结果，普通消息渲染）。
+
+        所有终态（SUCCEEDED/FAILED/CANCELLED/EXPIRED）时调用，与 ui.task_lifecycle
+        任务状态卡片并存。writer 为 None 时跳过；写入异常仅 log.warning，不改变任务 CAS、
+        worker 回收或飞书投递结果。会话不存在时吞掉（不复活）。
+        """
+        if self.result_writer is None:
+            return
+        session_id = task_execution_session_id(task)
+        try:
+            await self.result_writer(session_id, content)
+        except Exception:
+            logger.warning(
+                "result write failed for task %s", task.id, exc_info=True,
             )
 
     def _lifecycle_text(
@@ -154,19 +178,103 @@ class TaskRunService:
         summary: str | None = None,
         error: str | None = None,
     ) -> str | None:
-        """终态/等待批准 -> 生命周期正文；QUEUED 等非通知态返回 None（不写）。"""
+        """终态/等待批准 -> 任务状态卡片正文；QUEUED 等非通知态返回 None（不写卡片）。
+
+        所有任务结束情况（SUCCEEDED/FAILED/CANCELLED/EXPIRED）均写任务状态卡片，
+        与 ui.task_result 结果消息并存：卡片为状态通知（折叠，含 summary/error），
+        结果消息为可见结果（普通消息，打印在 Chat 框）。开始运行由 run_claim 直接写。
+        """
         title = task.title
         if target_status == TaskStatus.WAITING_APPROVAL:
-            return f"[任务状态] 等待批准: {task.id} - {title} | 提案: {summary or ''}"
+            return f"等待批准: {task.id} - {title} | 提案: {summary or ''}"
         if target_status == TaskStatus.SUCCEEDED:
-            return f"[任务状态] 已完成: {task.id} - {title} | {summary or ''}"
+            return f"已完成: {task.id} - {title} | {summary or ''}"
         if target_status == TaskStatus.FAILED:
-            return f"[任务状态] 已失败: {task.id} - {title} | {error or summary or ''}"
+            return f"已失败: {task.id} - {title} | {error or summary or ''}"
         if target_status == TaskStatus.CANCELLED:
-            return f"[任务状态] 已取消: {task.id} - {title}"
+            return f"已取消: {task.id} - {title}"
         if target_status == TaskStatus.EXPIRED:
-            return f"[任务状态] 已过期: {task.id} - {title}"
+            return f"已过期: {task.id} - {title}"
         # QUEUED（自动重试）等：不写
+        return None
+
+    def _lifecycle_card(
+        self,
+        task: Task,
+        target_status: TaskStatus,
+        summary: str | None = None,
+        error: str | None = None,
+        interaction_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        """交互态 -> 版本化 card payload；无交互动作的状态返回 None。
+
+        card schema（waiting_approval 8 字段，failed/expired 7 字段）：
+          - schema_version: 1
+          - kind: "task_lifecycle"
+          - task_id / status / title / summary / available_actions
+          - interaction_type（仅 waiting_approval）：'approval' 或 'intent_request'
+
+        status 取传入的 target_status（target snapshot），不用 task.status，以
+        反映本次 CAS 的目标态而非 CAS 前的旧态。summary 优先级：
+          - WAITING_APPROVAL: summary（提案）
+          - FAILED: error 后备 summary
+          - EXPIRED: error/summary 后备稳定文案 "任务运行已过期"
+
+        动作来自 available_lifecycle_actions(target_status, interaction_type)
+        （app.domain.task）。无动作（QUEUED/RUNNING/SUCCEEDED/CANCELLED）返回 None。
+        interaction_type 字段仅写入 waiting_approval card payload；failed/expired
+        不带该字段（后端 Domain 层对 failed/expired 忽略 interaction_type）。
+        """
+        actions = available_lifecycle_actions(target_status, interaction_type)
+        if not actions:
+            return None
+        if target_status == TaskStatus.WAITING_APPROVAL:
+            card_summary = summary or ""
+        elif target_status == TaskStatus.FAILED:
+            card_summary = error or summary or ""
+        elif target_status == TaskStatus.EXPIRED:
+            card_summary = error or summary or "任务运行已过期"
+        else:
+            card_summary = ""
+        card = {
+            "schema_version": 1,
+            "kind": "task_lifecycle",
+            "task_id": task.id,
+            "status": target_status.value,
+            "title": task.title,
+            "summary": card_summary,
+            "available_actions": list(actions),
+        }
+        if target_status == TaskStatus.WAITING_APPROVAL:
+            # 仅 waiting_approval card 携带 interaction_type；TaskService 校验
+            # proposal_type in {"approval","intent_request"}，Domain 纯函数对
+            # None/未知值回退到 approval 语义。
+            card["interaction_type"] = interaction_type or "approval"
+        return card
+
+    def _terminal_result_text(
+        self,
+        task: Task,
+        target_status: TaskStatus,
+        summary: str | None = None,
+        error: str | None = None,
+    ) -> str | None:
+        """终态 -> 最终结果正文（以普通消息渲染，打印在 Chat 框）。
+
+        覆盖所有任务结束情况：SUCCEEDED（成功）/FAILED（错误）/CANCELLED（取消）/
+        EXPIRED（过期）。非终态（WAITING_APPROVAL/QUEUED/RUNNING）返回 None。
+        """
+        title = task.title
+        if target_status == TaskStatus.SUCCEEDED:
+            s = (summary or "").strip()
+            return f"任务已完成：{title}\n\n{s}" if s else f"任务已完成：{title}"
+        if target_status == TaskStatus.FAILED:
+            reason = (error or summary or "").strip()
+            return f"任务已失败：{title}\n\n{reason}" if reason else f"任务已失败：{title}"
+        if target_status == TaskStatus.CANCELLED:
+            return f"任务已取消：{title}"
+        if target_status == TaskStatus.EXPIRED:
+            return f"任务已过期：{title}"
         return None
 
     async def _write_lifecycle_for_status(
@@ -175,11 +283,34 @@ class TaskRunService:
         target_status: TaskStatus,
         summary: str | None = None,
         error: str | None = None,
+        interaction_type: str | None = None,
     ) -> None:
         text = self._lifecycle_text(task, target_status, summary=summary, error=error)
         if text is None:
             return
-        await self._write_lifecycle(task, text)
+        card = self._lifecycle_card(
+            task, target_status, summary=summary, error=error,
+            interaction_type=interaction_type,
+        )
+        await self._write_lifecycle(task, text, card)
+
+    async def _write_result_if_terminal(
+        self,
+        task: Task,
+        target_status: TaskStatus,
+        summary: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """终态 -> 写 ui.task_result 最终结果（普通消息，打印在 Chat 框）。
+
+        覆盖 SUCCEEDED/FAILED/CANCELLED/EXPIRED 所有任务结束情况；非终态不写。
+        """
+        text = self._terminal_result_text(
+            task, target_status, summary=summary, error=error,
+        )
+        if text is None:
+            return
+        await self._write_result(task, text)
 
     # ------------------------------------------------------------------
     # dispatch_once (fixed order)
@@ -298,8 +429,10 @@ class TaskRunService:
         timeout = min(max_runtime, self.lease_seconds - 1)
 
         # 生命周期：worker 起始（best-effort，不阻断执行；spawn 失败走 _handle_spawn_failure，
-        # 未进 run_claim，不写"开始运行"）
-        await self._write_lifecycle(task, f"[任务状态] 开始运行: {task.id} - {task.title}")
+        # 未进 run_claim，不写"开始运行"）。纯文本 lifecycle，card=None。
+        await self._write_lifecycle(
+            task, f"开始运行: {task.id} - {task.title}", card=None,
+        )
 
         agent_result = None
         try:
@@ -378,6 +511,7 @@ class TaskRunService:
         error: str | None = None,
         metadata: dict[str, Any] | None = None,
         artifacts: tuple[dict[str, Any], ...] = (),
+        interaction_type: str | None = None,
     ) -> FinishRunResult | None:
         """Unified CAS finalize -- the SOLE run cleanup path.
 
@@ -385,6 +519,10 @@ class TaskRunService:
         retryable outcomes), calls ``registry.finish_run`` with the target
         status (so the Registry does not guess), and delivers notification
         for terminal / WAITING_APPROVAL targets.
+
+        ``interaction_type`` is only meaningful for ``WAITING_APPROVAL``
+        outcomes (worker propose); it selects the lifecycle card flavor
+        (approval vs intent_request) and is ignored for other outcomes.
 
         Returns the FinishRunResult, or None if a late-worker CAS conflict
         or missing task/run was logged and swallowed.
@@ -419,6 +557,10 @@ class TaskRunService:
 
         await self._write_lifecycle_for_status(
             result.task, target_status, summary=summary, error=error,
+            interaction_type=interaction_type,
+        )
+        await self._write_result_if_terminal(
+            result.task, target_status, summary=summary, error=error,
         )
         await self._notify_if_terminal(result, target_status)
         return result
@@ -433,6 +575,7 @@ class TaskRunService:
         run_id: int,
         claim_lock: str,
         proposal: str | None = None,
+        proposal_type: str = "approval",
     ) -> dict[str, Any]:
         """Worker proposed a change requiring user approval -- finalize the
         run with outcome=WAITING_APPROVAL via the unified cleanup path.
@@ -442,6 +585,9 @@ class TaskRunService:
         + terminal event, and transitions the task to WAITING_APPROVAL.
         The ``change_proposed`` audit event is written by TaskService before
         calling this; the ``proposal`` arg is only used as the run summary.
+        ``proposal_type`` selects the lifecycle card flavor (approval vs
+        intent_request) and is forwarded to ``_finish`` as
+        ``interaction_type``; it does not change the Task state machine.
 
         Raises TaskNotFoundError if the task does not exist.
         """
@@ -458,6 +604,7 @@ class TaskRunService:
             claim_lock=claim_lock,
             outcome=TaskRunOutcome.WAITING_APPROVAL,
             summary=proposal or "",
+            interaction_type=proposal_type,
         )
         status = "finalized" if result is not None else "conflict"
         return {
@@ -609,8 +756,9 @@ class TaskRunService:
                     outcome=TaskRunOutcome.CRASHED,
                     error=error,
                 ))
-                # CRASHED -> EXPIRED (terminal) -> lifecycle + notify
+                # CRASHED -> EXPIRED (terminal) -> 任务状态卡片 + 最终结果(普通消息) + notify
                 await self._write_lifecycle_for_status(result.task, TaskStatus.EXPIRED)
+                await self._write_result_if_terminal(result.task, TaskStatus.EXPIRED)
                 await self._notify_if_terminal(result, TaskStatus.EXPIRED)
                 recovered += 1
             except (TaskConflictError, TaskNotFoundError) as exc:
@@ -665,7 +813,9 @@ class TaskRunService:
                     outcome=TaskRunOutcome.EXPIRED,
                     error="lease expired or heartbeat stale",
                 ))
+                # 恢复结束的任务消息：EXPIRED 终态写任务状态卡片 + 最终结果(普通消息)
                 await self._write_lifecycle_for_status(result.task, TaskStatus.EXPIRED)
+                await self._write_result_if_terminal(result.task, TaskStatus.EXPIRED)
                 await self._notify_if_terminal(result, TaskStatus.EXPIRED)
                 recovered += 1
             except (TaskConflictError, TaskNotFoundError) as exc:

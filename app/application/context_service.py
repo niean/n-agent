@@ -154,9 +154,9 @@ class ContextService:
         if self._is_cancelled(state.session_id):
             raise asyncio.CancelledError()
         messages = await self._runtime_memory.read_session_messages(state.session_id)
-        # 历史 role=system 消息（ui.task_command 命令记录 / ui.task_lifecycle 生命周期）
-        # 是 UI 通知，排除出模型候选、压缩与外部记忆钩子；运行时 system prompt 仍由
-        # build_system_prompt 构建并作为 working_messages[0]，不落盘。
+        # 历史 role=system 消息（ui.task_command 命令记录 / ui.task_lifecycle 生命周期 /
+        # ui.task_result 最终结果）是 UI 通知，排除出模型候选、压缩与外部记忆钩子；运行时
+        # system prompt 仍由 build_system_prompt 构建并作为 working_messages[0]，不落盘。
         eligible_messages = [m for m in messages if m.role != "system"]
         summary = await self._runtime_memory.get_summary_if_allowed(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
@@ -443,6 +443,15 @@ def _message_to_provider(message: ConversationMessage) -> dict[str, Any]:
         content = content.get("content", "")
     if message.role == "tool" and not isinstance(content, str):
         content = json.dumps(content, default=str, ensure_ascii=False)
+    if message.role == "tool":
+        data = {"role": message.role}
+        if message.tool_call_id:
+            data["tool_call_id"] = message.tool_call_id
+        if message.name:
+            data["name"] = message.name
+        data["content"] = content
+        return data
+
     data = {"role": message.role, "content": content}
     if tool_calls:
         data["tool_calls"] = tool_calls

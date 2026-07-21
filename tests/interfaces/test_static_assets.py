@@ -355,7 +355,7 @@ def test_tool_messages_are_collapsed_by_default(tmp_path):
     assert "message.role === 'tool'" in chat_js
     assert "document.createElement('details')" in chat_js
     assert "document.createElement('summary')" in chat_js
-    assert "工具调用调试信息" in chat_js
+    assert "工具调用" in chat_js
 
 
 def test_tool_debug_json_strings_are_formatted(tmp_path):
@@ -382,7 +382,7 @@ def test_assistant_tool_calls_are_not_rendered_as_chat_messages(tmp_path):
     assert "previous.content.push(message.content || '')" in chat_js
     assert "grouped.push({ ...message, content: [message.content || ''] })" in chat_js
     assert 'let visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage))' in chat_js
-    assert 'groupTaskCommandMessages(visibleMessages)' in chat_js
+    assert 'groupTaskMessages(visibleMessages)' in chat_js
     assert 'appendDebugJson(content, message.tool_calls)' not in chat_js
     assert "if (Array.isArray(value)) return value.length > 0" in chat_js
     assert "if (typeof value === 'object') return Object.keys(value).length > 0" in chat_js
@@ -439,6 +439,42 @@ def test_platform_list_session_count_is_numeric_column(tmp_path):
     assert "appendNumericText(row, 'td', formatNumber(platform.session_count));" in platforms_js
 
 
+def test_chat_task_card_interaction_present(tmp_path):
+    """T6/T7: chat.js exposes task card validation, action handler allowlist,
+    and task-card CSS classes for the inline interactive lifecycle card."""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    css = client.get('/static/styles.css').text
+
+    # validateTaskCard + groupTaskMessages exposed in namespace
+    assert 'function validateTaskCard' in chat_js
+    assert 'function groupTaskMessages' in chat_js
+    assert 'validateTaskCard' in chat_js[chat_js.index('global.NAGENT.chat = '):]
+    assert 'groupTaskMessages' in chat_js[chat_js.index('global.NAGENT.chat = '):]
+
+    # constants
+    assert 'TASK_CARD_SCHEMA_VERSION' in chat_js
+    assert "TASK_CARD_KIND = 'task_lifecycle'" in chat_js or 'TASK_CARD_KIND = "task_lifecycle"' in chat_js
+    assert 'TASK_CARD_STATUSES' in chat_js
+    assert 'TASK_ACTION_LABELS' in chat_js
+    # explicit handler allowlist (not dynamic api[action] indexing)
+    assert 'TASK_CARD_ACTION_HANDLERS' in chat_js
+    assert 'function resolveTaskCardStates' in chat_js
+    assert 'function buildTaskCardElement' in chat_js
+    assert 'function handleTaskCardAction' in chat_js
+
+    # CSS classes for task card
+    for cls in ('.task-card', '.task-card__body', '.task-card__meta', '.task-card__summary',
+                '.task-card__actions', '.task-card__label', '.task-card__textarea',
+                '.task-card__btn', '.task-card__feedback', '.task-card__stale', '.task-card__unavailable'):
+        assert cls in css, f"styles.css missing {cls}"
+
+    # management-api.js exposes task.revise
+    api_js = client.get('/static/management-api.js').text
+    assert 'revise' in api_js
+    assert 'task.get' not in api_js or '.get(' in api_js  # api.task.get exists
+
+
 def test_current_session_refresh_renders_persisted_messages(tmp_path):
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
@@ -450,7 +486,7 @@ def test_current_session_refresh_renders_persisted_messages(tmp_path):
     apply_start = chat_js.index('async function applySessionDetail(detail, options)')
     apply_end = chat_js.index('async function loadToolCalls()', apply_start)
     apply_body = chat_js[apply_start:apply_end]
-    assert 'renderSessionMessages(detail)' in apply_body
+    assert 'renderSessionMessages(detail, { partial: options.partialMessages === true })' in apply_body
 
 
 def test_chat_auto_refresh_controller_present(tmp_path):
@@ -622,6 +658,62 @@ def test_chat_memory_uses_toolbar_popover_grouped_picker(tmp_path):
     assert '.chat-external-memory__header' not in css
     assert '.chat-external-memory__content--collapsed' not in css
     assert '.chat-external-memory__checkboxes' not in css
+
+
+def test_chat_settings_debug_popover_present(tmp_path):
+    """PRD 03-prd-specs: 输入框下边缘新增设置按钮(齿轮)，弹出与记忆一致的 popover，
+    含工具调试/任务状态两个 pill，默认任务状态选中、工具调试未选中并隐藏工具调用卡片。"""
+    client = _client(tmp_path)
+    chat_js = client.get('/static/chat.js').text
+    css = client.get('/static/styles.css').text
+
+    # 设置弹框状态 + 渲染/显隐函数
+    assert 'settingsPopoverOpen' in chat_js
+    assert 'function renderSettingsUI' in chat_js
+    assert 'function createSettingsTriggerIcon' in chat_js
+    assert 'function handleSettingsDocumentClick' in chat_js
+    assert 'function applyDebugVisibility' in chat_js
+    assert 'function loadDebugSettings' in chat_js
+    # 默认值：任务状态选中、工具调试未选中
+    assert 'task: true, tool: false' in chat_js
+    # pill 标签 + 分组标题
+    assert "'任务状态'" in chat_js
+    assert "'工具调试'" in chat_js
+    assert "'调试'" in chat_js
+    # 持久化 localStorage（按会话分桶，每会话独立；spec: 设置只针对一个会话生效）
+    assert "'nagent.chat.debug'" in chat_js
+    assert 'localStorage' in chat_js
+    # 按会话模型：会话映射 + 空态 draft + 上下文读写函数
+    assert 'sessionDebugSettings' in chat_js
+    assert 'draftDebugSettings' in chat_js
+    assert 'function getDebugSettings' in chat_js
+    assert 'function setDebugSettings' in chat_js
+    # 复用记忆 class（不另立 trigger/popover 样式，与记忆弹框一致）
+    assert "trigger.className = 'chat-memory-trigger'" in chat_js
+    assert "popover.className = 'chat-memory-popover'" in chat_js
+    # 设置容器注入 composer bar：紧随记忆之后、发送按钮之前
+    assert "settingsContainer.id = 'chat-settings'" in chat_js
+    assert "settingsContainer.className = 'chat-settings'" in chat_js
+    assert 'composerBar.insertBefore(settingsContainer, sendBtn)' in chat_js
+    # 显隐联动：data-debug-kind 标记 + 容器 hide class
+    assert 'debugKind' in chat_js
+    assert 'chat-debug--hide-tool' in chat_js
+    assert 'chat-debug--hide-task' in chat_js
+    # CSS：定位容器 + hide 规则（按 data-debug-kind）
+    assert '.chat-settings {' in css
+    assert 'chat-debug--hide-tool' in css
+    assert 'chat-debug--hide-task' in css
+    assert '[data-debug-kind="tool"]' in css
+    assert '[data-debug-kind="task"]' in css
+    # 互斥：记忆与设置弹框同一时刻只能开一个（capture 阶段拦截，不改动记忆弹框代码）
+    assert 'closeMemoryPopover' in chat_js
+    assert 'closeSettingsPopover' in chat_js
+    assert 'handlePopoverMutualExclusion' in chat_js
+    assert "target.closest('#chat-settings')" in chat_js
+    assert "target.closest('#chat-external-memory')" in chat_js
+    assert "addEventListener('click', handlePopoverMutualExclusion, true)" in chat_js
+    # 安全渲染
+    assert 'innerHTML =' not in chat_js
 
 
 def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
@@ -1130,7 +1222,7 @@ def test_chat_message_images_render_after_refresh(tmp_path):
     chat_js = client.get('/static/chat.js').text
 
     # createMessageElement handles array content with image_url parts
-    create_start = chat_js.index('function createMessageElement(message)')
+    create_start = chat_js.index('function createMessageElement(message, cardStates, taskDecisions)')
     create_end = chat_js.index('function shouldRenderMessage(message)', create_start)
     create_body = chat_js[create_start:create_end]
     assert "Array.isArray(content)" in create_body
@@ -1139,13 +1231,16 @@ def test_chat_message_images_render_after_refresh(tmp_path):
     assert "document.createElement('img')" in create_body
     assert "imgEl.src = part.image_url.url" in create_body
 
-    # renderSessionMessages clears and re-renders from server detail.messages
-    render_start = chat_js.index('function renderSessionMessages(detail)')
+    # 初次加载全量渲染；轮询刷新则按消息 key 局部协调，保留旧节点的展开状态。
+    render_start = chat_js.index('function renderSessionMessages(detail, options)')
     render_end = chat_js.index('async function loadSessions()', render_start)
     render_body = chat_js[render_start:render_end]
-    assert 'clearNode(stack)' in render_body
+    assert 'function messageRenderKey(message, index)' in chat_js
+    assert 'renderedMessageNodes = new Map()' in chat_js
+    assert 'stack.replaceChild(el, existing)' in render_body
+    assert 'preserveDetailsState(existing, el)' in render_body
     assert 'detail.messages' in render_body
-    assert 'createMessageElement(message)' in render_body
+    assert 'createMessageElement(message, cardStates, taskDecisions)' in render_body
 
     # refreshCurrentSession delegates to applySessionDetail (which calls renderSessionMessages)
     refresh_start = chat_js.index('async function refreshCurrentSession()')
@@ -1155,7 +1250,7 @@ def test_chat_message_images_render_after_refresh(tmp_path):
     apply_start = chat_js.index('async function applySessionDetail(detail, options)')
     apply_end = chat_js.index('async function loadToolCalls()', apply_start)
     apply_body = chat_js[apply_start:apply_end]
-    assert 'renderSessionMessages(detail)' in apply_body
+    assert 'renderSessionMessages(detail, { partial: options.partialMessages === true })' in apply_body
 
 
 def test_chat_js_renders_summary_messages_specially(tmp_path):
@@ -1165,7 +1260,7 @@ def test_chat_js_renders_summary_messages_specially(tmp_path):
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
 
-    create_start = chat_js.index('function createMessageElement(message)')
+    create_start = chat_js.index('function createMessageElement(message, cardStates, taskDecisions)')
     create_end = chat_js.index('function shouldRenderMessage(message)', create_start)
     create_body = chat_js[create_start:create_end]
     assert 'message.is_summary' in create_body

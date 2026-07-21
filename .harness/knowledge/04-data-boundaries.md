@@ -11,7 +11,7 @@
 
 `ConversationSession`（`app/domain/session.py`）：会话聚合根，字段包括 id、title、source、external_memory_enabled、created_at、updated_at、acp_metadata。external_memory_enabled 是会话级外部记忆 profile 锁定值，首轮消息前可由 Chat/Dashboard 选择，首轮后不可变；未锁定的新会话为 null，发送首轮时写入规范化列表。acp_metadata 是 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入，其他来源会话为 null。
 
-`ConversationMessage`（`app/domain/session.py`）：会话消息值对象，字段包括 id、role、content、tool_call_id、name、created_at。role 支持 user、assistant、tool 等 Provider 消息角色。content 类型为 `str | list[dict] | dict`：str 为纯文本；list 为 OpenAI 风格多模态内容数组（`[{type:text,text:...},{type:image_url,image_url:{url:...}}]`），user 消息支持 text+image_url 混合，assistant 消息支持 `{content,tool_calls}` dict；持久化前由 `content_utils.normalize_content` 归一化，摘要/标题/外部记忆 prefetch 通过 `content_utils.extract_text` 提取纯文本避免 base64 泄漏。
+`ConversationMessage`（`app/domain/session.py`）：会话消息值对象，字段包括 id、role、content、tool_call_id、name、created_at、is_summary、is_summarized、source、card。role 支持 user、assistant、tool 等 Provider 消息角色。content 类型为 `str | list[dict] | dict`：str 为纯文本；list 为 OpenAI 风格多模态内容数组（`[{type:text,text:...},{type:image_url,image_url:{url:...}}]`），user 消息支持 text+image_url 混合，assistant 消息支持 `{content,tool_calls}` dict；持久化前由 `content_utils.normalize_content` 归一化，摘要/标题/外部记忆 prefetch 通过 `content_utils.extract_text` 提取纯文本避免 base64 泄漏。source 为消息级生产来源（复用 SessionSource 值，如 task/schedule/curator/dashboard/api/cli/feishu 等），仅 user 消息由 ChatCompletionService 按本轮受信入口（snapshot.run_context.source -> IngressFacts.source -> SessionSource.API.value 三级回落）赋值，区别于 ConversationSession.source（会话入口）；assistant/tool/system 与 summary 消息默认为 None；但进程来源（task/schedule/curator）worker 的 assistant 消息由 ChatCompletionService 经 AgentState.message_source 标记为对应来源（`_PROCESS_MESSAGE_SOURCES`，session_source 命中即置为 source，否则 None），供 Dashboard 隐藏 worker 内部推理：worker 在 origin Chat 会话执行（任务会话复用创建会话 ID），其 chain-of-thought 不对用户可见，与 judge 推理 persist_messages=False 不落库同理；worker 需历史故采用 source 标记 + 前端 shouldRenderMessage 隐藏（进程来源 assistant 不渲染），推理仍落库供 goal_mode 续轮与 LLM 上下文，worker 的工具调用结果仍按工具调试卡片独立渲染；source 仅参与 Dashboard 会话详情展示，不进 provider 上下文。card 为可选结构化交互载荷 `dict[str, Any] | None`（末尾默认 None，不破坏既有位置/关键字构造）；仅 `ui.task_lifecycle` system 消息在 waiting_approval/failed/expired 三态携带版本化 card payload，其余 lifecycle 消息（succeeded/cancelled/开始运行/决策回执）与 `ui.task_command`/`ui.task_result` 传 None；card 不进入 LLM 上下文（`role=system` 被 ContextService.build_context_state 过滤出 ContextPolicy 候选/压缩/外部记忆/Provider history），Domain 只持有载荷不解析 UI 字段；持久化由 `messages.card_json` 承载，Dashboard `_message_to_dict` 始终输出 `card: object | null`。
 
 `ToolCall`（`app/domain/session.py`）：工具调用记录，字段包括 id、session_id、message_id、tool_name、arguments、result、status、duration_ms、created_at。
 
@@ -30,6 +30,8 @@
 `GatewayToolApprovalService`（`app/application/gateway_tool_approval_service.py`）：Application 层进程内授权状态，键为 `(session_id, actor_id, tool_name)`，只表达 ToolPolicy 的“本会话信任”；不持久化、不跨进程共享，也不替代 `ToolService` 的执行前复判。
 
 `FeishuToolApprovalBridge` pending（`app/interfaces/feishu_tool_approval.py`）：Interfaces 层短生命周期协议状态，绑定 request/session/actor/reply target、创建/过期时间、等待中的 Future、服务端返回的 card message id 与原子 claim 状态；完成、超时、取消或发送失败即清理。它不保存会话授权，卡片参数只使用脱敏摘要，回调身份以服务端 pending 绑定的 actor/chat/card message id 为准，不信任客户端回传的 kind/thread/platform。
+
+`ProposalResolutionCommand` / `ProposalResolutionResult`（`app/domain/task.py`）：Task 意图审批决策的 Domain 值对象。`ProposalResolutionCommand`（frozen dataclass）携带 task_id、expected_version、decision（`"approved"` / `"rejected"` / `"revised"`）、event_kind（`change_approved` / `change_rejected` / `change_revised`）、可选 note（revise 必填）；不携带 `proposal_event_id`，由 Registry 在事务内定位未决 `change_proposed`。`ProposalResolutionResult` 携带 proposal_event_id（非空 int，Registry 定位不到未决提案时抛 `TaskStateError`）、决策后的 Task、新追加的 decision_event。`change_revised` 事件复用 `task_events.payload`（`{"decision", "note", "proposal_event_id"}`），无 schema 变化；`task_events` 表由 `SQLiteTaskRegistry` 管理（6 表之一，与 sessions.db 共享 path 独立 _connect），event kind 集合扩展为 `change_proposed` / `change_approved` / `change_rejected` / `change_revised`。
 
 ## Provider 与工具模型
 
@@ -167,7 +169,7 @@ SQLite store 位于 `app/infrastructure/memory/sqlite_store.py`，初始化以�
 
 ```sql
 sessions(id, title, created_at, updated_at, source, external_memory_enabled_json, acp_metadata_json)
-messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary)
+messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized, source, card_json)
 tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at)
 task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
@@ -243,6 +245,7 @@ JSON 边界：
 - `sessions.external_memory_enabled_json` 存储会话级外部记忆 profile 的 JSON 数组；null 表示尚未锁定，非 null 表示该 Chat Session 后续所有轮次必须使用同一 profile
 - `sessions.acp_metadata_json` 存储 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入；其他来源会话为 null。ACP stdio 服务端在 `session/new` 时写入，`session/load` 时读取复用，用于在 ACP 客户端重连后恢复会话上下文与 cwd 映射
 - `messages.content_json` 存储消息内容
+- `messages.card_json` 存储可选结构化交互载荷（nullable TEXT）：None 写 NULL，dict 使用 `json.dumps(..., ensure_ascii=False)`；幂等迁移 `_migrate_add_card_column`（PRAGMA table_info 检测后 ALTER TABLE ADD COLUMN card_json TEXT，不新增索引）；`_decode_message_card(row)` 容错读取（列缺失/NULL->None，合法 JSON object->dict，非法 JSON/array/scalar->None+warning 不丢失整条消息，不掩盖 content_json 或数据库错误）；card schema 固定为 version 1 的 `{schema_version:1, kind:"task_lifecycle", task_id, status, title, summary, available_actions}`，其中 status 取 `waiting_approval|failed|expired`，available_actions 取 Domain `available_lifecycle_actions(status)` 元组顺序（WAITING_APPROVAL->approve/reject/revise/cancel，FAILED->retry/cancel，EXPIRED->retry）；payload 不含密钥、worker token、expected_version 或 HTML；`SessionService._normalize_card` 在入库前 `copy.deepcopy` 调用方 dict 并按 `_truncate_task_message_utf8` 把 summary 截断到 65536 UTF-8 字节上限，不原地修改调用方 dict
 - `tool_calls.arguments_json` 存储工具参数
 - `tool_calls.result_json` 存储工具结果
 - `sandbox_execution_history.result_json` 存储 execute_code 沙盒执行结果，`authorized_callback_tools_json` 存储本次实际授权的 callback tool 名称列表，`execution_type` 区分执行类型（`execute_code` 或 `terminal`，默认 `execute_code`，由 `SQLiteSandboxExecutionHistoryRegistry._migrate_add_execution_type` 为旧库补列）

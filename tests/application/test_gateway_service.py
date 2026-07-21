@@ -1109,3 +1109,61 @@ async def test_spy_cross_origin_schedule_remove_denies_before_writes():
     # Spy: no session writes either
     assert harness.session_service.created == []
     assert harness.session_service.deleted == []
+
+
+# ---------------------------------------------------------------------------
+# T11: realtime contract -- session_id passing + DEFAULT approval tool surface
+# ---------------------------------------------------------------------------
+
+
+def _default_exposed_tool_names_with_approval_tools() -> set[str]:
+    """Construct a ToolService wired with user_task_approval_tool_definitions
+    (mirrors T8 wiring in app/main.py) and return DEFAULT-exposed tool names."""
+    from app.application.task_tools import user_task_approval_tool_definitions
+    from app.application.tool_service import ToolService
+    from app.domain.tool_policy import ToolExposurePolicy
+
+    class _UnusedExecutor:
+        async def execute(self, request, context=None):
+            raise RuntimeError("executor not used by list_openai_tools")
+
+    tool_service = ToolService(executor=_UnusedExecutor(), definitions=[])
+    tool_service.set_dynamic_definitions(
+        "user_task", user_task_approval_tool_definitions()
+    )
+    return {
+        t["function"]["name"]
+        for t in tool_service.list_openai_tools(ToolExposurePolicy.DEFAULT, None)
+    }
+
+
+@pytest.mark.asyncio
+async def test_realtime_tool_context_passes_session_id_and_exposes_approval_tools():
+    """Web/API Chat realtime contract (T11).
+
+    GatewayService.handle_message must pass the resolved session_id through to
+    ChatCompletionService, carry REALTIME execution_mode on ingress_facts, and
+    the shared ToolService DEFAULT surface must contain approve_task /
+    reject_task / revise_task (wired by T8).
+    """
+    from app.domain.policy import ExecutionMode
+
+    harness = Harness()
+    service = harness.service()
+
+    response = await service.handle_message(message(event_id="event-rt-contract"))
+
+    # session_id passes through to ChatCompletionInput unchanged
+    request = harness.chat_service.requests[-1]
+    assert request.session_id is not None
+    assert request.session_id == response.session_id
+
+    # realtime execution mode on ingress_facts (authoritative claim)
+    assert request.ingress_facts is not None
+    assert request.ingress_facts.execution_mode is ExecutionMode.REALTIME
+    # trusted_metadata must not downgrade to unattended
+    assert request.trusted_metadata.get("execution_mode") != "unattended"
+
+    # Shared ToolService DEFAULT surface contains the three approval tools
+    tool_names = _default_exposed_tool_names_with_approval_tools()
+    assert {"approve_task", "reject_task", "revise_task"}.issubset(tool_names)

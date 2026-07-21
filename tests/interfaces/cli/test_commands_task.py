@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from app.domain.task import TaskStateError, TaskValidationError
 from app.domain.task import TaskListPage
 from app.interfaces.cli.commands import task as task_cmd
 from app.interfaces.cli.main import build_parser
@@ -146,3 +149,210 @@ def test_task_list_default_keeps_single_page(monkeypatch):
 
     assert task_cmd.run(_args(task_command="list", all=False)) == 0
     assert service.calls == [(None, 100)]
+
+
+# ---------------------------------------------------------------------------
+# T10: task revise / approve / reject -- parser, dispatch, output, errors
+# ---------------------------------------------------------------------------
+
+
+class _ApprovalTaskService:
+    """Fake service recording approve/reject/revise calls.
+
+    Returns a dict shaped like TaskService._resolve_proposal's whitelist
+    response (task_id/decision/proposal_event_id/note/status). revise_change
+    additionally includes ``title`` (mirrors the real service).
+    """
+
+    def __init__(self, *, response: dict | None = None, exc: Exception | None = None):
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self._response = response or {
+            "task_id": "t_1",
+            "decision": "revised",
+            "proposal_event_id": "evt_42",
+            "note": "改一下",
+            "status": "QUEUED",
+            "title": "T1",
+        }
+        self._exc = exc
+
+    async def approve_change(self, task_id, note=None):
+        self.calls.append(("approve_change", (task_id,), {"note": note}))
+        if self._exc is not None:
+            raise self._exc
+        resp = dict(self._response)
+        resp["decision"] = "approved"
+        resp["note"] = note
+        resp.pop("title", None)
+        return resp
+
+    async def reject_change(self, task_id, note=None):
+        self.calls.append(("reject_change", (task_id,), {"note": note}))
+        if self._exc is not None:
+            raise self._exc
+        resp = dict(self._response)
+        resp["decision"] = "rejected"
+        resp["note"] = note
+        resp.pop("title", None)
+        return resp
+
+    async def revise_change(self, task_id, note=None):
+        self.calls.append(("revise_change", (task_id,), {"note": note}))
+        if self._exc is not None:
+            raise self._exc
+        resp = dict(self._response)
+        resp["decision"] = "revised"
+        resp["note"] = note
+        return resp
+
+
+# --- parser ---------------------------------------------------------------
+
+
+def test_task_revise_parser_accepts_id_and_required_note():
+    parser = build_parser(plugin_commands=[])
+    args = parser.parse_args(["task", "revise", "t_1", "--note", "改一下"])
+    assert args.task_command == "revise"
+    assert args.id == "t_1"
+    assert args.note == "改一下"
+
+
+def test_task_revise_parser_requires_note():
+    parser = build_parser(plugin_commands=[])
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["task", "revise", "t_1"])
+    assert exc.value.code == 2
+
+
+def test_task_approve_note_is_optional_in_parser():
+    parser = build_parser(plugin_commands=[])
+    args = parser.parse_args(["task", "approve", "t_1"])
+    assert args.task_command == "approve"
+    assert args.id == "t_1"
+    assert args.note is None
+
+
+def test_task_reject_note_is_optional_in_parser():
+    parser = build_parser(plugin_commands=[])
+    args = parser.parse_args(["task", "reject", "t_1"])
+    assert args.task_command == "reject"
+    assert args.id == "t_1"
+    assert args.note is None
+
+
+# --- dispatch -------------------------------------------------------------
+
+
+def test_task_revise_dispatch_calls_revise_change_with_id_and_note(monkeypatch):
+    service = _ApprovalTaskService()
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    rc = task_cmd.run(_args(task_command="revise", id="t_1", note="改一下"))
+    assert rc == 0
+    assert service.calls == [("revise_change", ("t_1",), {"note": "改一下"})]
+
+
+def test_task_approve_dispatch_passes_optional_note(monkeypatch):
+    service = _ApprovalTaskService()
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    rc = task_cmd.run(_args(task_command="approve", id="t_1", note="ok"))
+    assert rc == 0
+    assert service.calls == [("approve_change", ("t_1",), {"note": "ok"})]
+
+
+def test_task_reject_dispatch_passes_none_note_when_omitted(monkeypatch):
+    service = _ApprovalTaskService()
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    rc = task_cmd.run(_args(task_command="reject", id="t_1", note=None))
+    assert rc == 0
+    assert service.calls == [("reject_change", ("t_1",), {"note": None})]
+
+
+# --- output (json/form/yaml) ---------------------------------------------
+
+
+_REQUIRED_KEYS = {"task_id", "decision", "proposal_event_id", "note", "status"}
+
+
+def test_task_revise_json_output_contains_required_keys(monkeypatch, capsys):
+    service = _ApprovalTaskService()
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    rc = task_cmd.run(_args(task_command="revise", id="t_1", note="改一下", json=True))
+    assert rc == 0
+    import json as _json
+    payload = _json.loads(capsys.readouterr().out)
+    assert _REQUIRED_KEYS.issubset(payload.keys())
+    assert payload["task_id"] == "t_1"
+    assert payload["decision"] == "revised"
+    assert payload["proposal_event_id"] == "evt_42"
+    assert payload["note"] == "改一下"
+    assert payload["status"] == "QUEUED"
+
+
+def test_task_revise_yaml_output_contains_required_keys(monkeypatch, capsys):
+    service = _ApprovalTaskService()
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    rc = task_cmd.run(_args(task_command="revise", id="t_1", note="改一下", yaml=True))
+    assert rc == 0
+    import yaml as _yaml
+    payload = _yaml.safe_load(capsys.readouterr().out)
+    assert _REQUIRED_KEYS.issubset(payload.keys())
+    assert payload["decision"] == "revised"
+    assert payload["note"] == "改一下"
+
+
+def test_task_revise_form_output_contains_required_keys(monkeypatch, capsys):
+    service = _ApprovalTaskService()
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    rc = task_cmd.run(_args(task_command="revise", id="t_1", note="改一下", form=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    # form renderer (render_object) prints "key: value" lines for each field
+    for key in _REQUIRED_KEYS:
+        assert key in out
+    assert "改一下" in out
+
+
+# --- top-level error integration -----------------------------------------
+
+
+def test_task_revise_business_error_flows_through_cli_top_level(monkeypatch, capsys):
+    """Service-level validation errors must surface via the CLI top-level
+    exception handler as a single stderr line and exit code 1.
+
+    The command function itself must NOT invent HTTP/ToolResult codes; it
+    lets the exception bubble so ``_invoke_handler`` can format it.
+    """
+    from app.interfaces.cli.main import main
+
+    service = _ApprovalTaskService(exc=TaskValidationError("note must not be empty"))
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    monkeypatch.setattr(
+        "app.main.collect_plugin_cli_commands", lambda: [], raising=False
+    )
+
+    rc = main(["task", "revise", "t_1", "--note", "改一下"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    # single line, prefixed by the top-level handler
+    assert err.strip() == "error: note must not be empty"
+    assert err.count("\n") <= 1
+
+
+def test_task_revise_state_error_flows_through_cli_top_level(monkeypatch, capsys):
+    """TaskStateError (e.g. wrong status) also routes through the top-level
+    handler without command-level code invention."""
+    from app.interfaces.cli.main import main
+
+    service = _ApprovalTaskService(
+        exc=TaskStateError("resolve_proposal requires WAITING_APPROVAL, got RUNNING")
+    )
+    monkeypatch.setattr(task_cmd, "_load_task_service", lambda: service)
+    monkeypatch.setattr(
+        "app.main.collect_plugin_cli_commands", lambda: [], raising=False
+    )
+
+    rc = main(["task", "revise", "t_1", "--note", "改一下"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.strip().startswith("error: ")
+    assert "WAITING_APPROVAL" in err

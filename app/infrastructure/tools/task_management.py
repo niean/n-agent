@@ -121,6 +121,7 @@ class TaskServiceProtocol(Protocol):
         task_id: str,
         proposal: str,
         run_id: int,
+        proposal_type: str = "approval",
     ) -> dict[str, Any]: ...
 
     async def cancel_task(self, task_id: str) -> dict[str, Any]: ...
@@ -318,11 +319,19 @@ class TaskManagementToolExecutor(ToolExecutor):
         proposal = str(request.arguments.get("proposal") or "")
         if not proposal:
             raise _TaskInvalidArgument("proposal is required")
+        # proposal_type 可选，默认 'approval'；executor 做一层 schema 级校验，
+        # TaskService.propose_change 再做权威校验。
+        proposal_type = str(request.arguments.get("proposal_type") or "approval")
+        if proposal_type not in ("approval", "intent_request"):
+            raise _TaskInvalidArgument(
+                f"proposal_type must be 'approval' or 'intent_request', got {proposal_type!r}"
+            )
 
         result = await self.service.propose_change(
             task_id=task_ctx.task_id,
             proposal=proposal,
             run_id=task_ctx.run_id,
+            proposal_type=proposal_type,
         )
         return {"success": True, **result}
 
