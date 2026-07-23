@@ -93,8 +93,9 @@
   </aside>
 
   <header class="topbar">
-    <span class="topbar__title" id="topbar-title">概览</span>
-    <span class="last-update" id="last-update"></span>
+    <div id="topbar-title-wrap"><span id="topbar-title"></span></div>
+    <div id="topnav-mount" hidden></div>
+    <div class="topbar__reserved" aria-hidden="true"></div>
   </header>
 
   <main class="main-content">
@@ -163,6 +164,8 @@
         <div id="tasks-detail-view" hidden></div>
       </div>
     </div>
+
+    <div class="tab-content" id="tab-tasks-observations"></div>
 
     <div class="tab-content" id="tab-scheduled-tasks">
       <div id="scheduled-tasks-list-view">
@@ -307,6 +310,8 @@
   <script src="/static/host.js"></script>
   <script src="/static/observations.js"></script>
   <script src="/static/security.js"></script>
+  <script src="/static/topnav.js"></script>
+  <script src="/static/tasks-observations.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

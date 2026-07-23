@@ -9,7 +9,7 @@ N-Agent 是一套 Python Agent Runtime，面向 Open-WebUI、本地 CLI、Dashbo
 - 上下文与记忆：组装 Provider 可见的消息和工具，使用 SQLite 保存会话，支持上下文压缩与外部记忆。
 - 工具：统一管理 Tool、Knowledge、MCP、Plugin、Skill，并通过 `ToolPolicy` 控制暴露、审批和执行。
 - 沙盒：在受控环境中提供 `execute_code` 和 `terminal`。
-- 自动化与入口：支持 Schedule、CLI/TUI、飞书 Gateway、ACP 和 Dashboard。
+- 自动化与入口：支持 Schedule 和目标驱动的后台 Task，以及 CLI/TUI、飞书 Gateway、ACP 和 Dashboard。
 
 ## DDD 架构
 
@@ -36,7 +36,7 @@ Infrastructure -----------> Domain
 核心流程：
 
 ```text
-Interface / Gateway
+Interface / Gateway / Schedule / Task
   -> ChatCompletionService
   -> AgentGraphRunner.prepare_context
   -> ContextService 组装 ProviderContext(messages, tools)
@@ -76,7 +76,7 @@ n-agent chat                      # 进入 REPL
 n-agent provider list --form      # 单次管理命令
 ```
 
-REPL 示例：`/provider list`、`/knowledge list`、`/mcp list`、`/schedule list`、`/sandbox list-active`、`/skill list`、`/plugin list`。本地控制命令包括 `/help`、`/clear`、`/history`、`/confirm`、`/cancel` 和 `/exit`。
+REPL 示例：`/provider list`、`/knowledge list`、`/mcp list`、`/schedule list`、`/task list`、`/sandbox list-active`、`/skill list`、`/plugin list`。本地控制命令包括 `/help`、`/clear`、`/history`、`/confirm`、`/cancel` 和 `/exit`。
 
 ## ACP 远程接入
 

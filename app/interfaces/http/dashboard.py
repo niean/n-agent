@@ -140,6 +140,9 @@ def create_dashboard_router(
     @router.get("/scheduled-tasks/{task_id}", response_class=HTMLResponse)
     @router.get("/tasks", response_class=HTMLResponse)
     @router.get("/tasks/{task_id}", response_class=HTMLResponse)
+    # 堆叠装饰器自下而上注册：字面路由须在 catch-all 之下，方能先于其命中
+    @router.get("/tasks/observations", response_class=HTMLResponse)
+    @router.get("/observations/tasks", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
     @router.get("/security", response_class=HTMLResponse)
     async def shell():

@@ -65,11 +65,37 @@ def test_all_tab_paths_return_shell(tmp_path):
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
         "/tools/external-memory", "/tools/sandbox",
         "/models", "/observations/sessions", "/observations/modules", "/scheduled-tasks", "/platforms", "/security",
+        "/tasks/observations", "/observations/tasks",
     )
     for path in paths:
         response = client.get(path)
         assert response.status_code == 200, f"missing shell at {path}"
         assert 'id="app-sidebar"' in response.text, f"shell incomplete at {path}"
+
+
+def test_scoped_task_observations_routes_registered_before_catchall(tmp_path):
+    """T1: /tasks/observations 与 /observations/tasks 是显式字面 deep-link 合同，
+    必须注册在 /tasks/{task_id} 之前；未知深链保持 404，防止引入通配 shell。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    router = create_dashboard_router(
+        SessionService(store),
+        ToolService(_StubExecutor(), builtin_tool_definitions()),
+        ModelService(_StubProvider(), "real-1"),
+        lambda: {
+            "provider": {"status": "ok"},
+            "memory": {"status": "ok"},
+            "knowledge": {"status": "disabled", "enabled": False},
+        },
+    )
+    paths = [route.path for route in router.routes]
+    assert "/tasks/observations" in paths
+    assert "/observations/tasks" in paths
+    assert paths.index("/tasks/observations") < paths.index("/tasks/{task_id}")
+
+    client = _client(tmp_path)
+    for path in ("/observations/foo", "/unknown-deep"):
+        response = client.get(path)
+        assert response.status_code == 404, f"{path} should not match shell"
 
 
 def test_tools_submenu_url_routing(tmp_path):
@@ -110,6 +136,8 @@ def test_static_assets_served(tmp_path):
         "/static/knowledge.js",
         "/static/plugin.js",
         "/static/external-memory.js",
+        "/static/topnav.js",
+        "/static/tasks-observations.js",
         "/static/favicon.svg",
     )
     for path in paths:
@@ -727,7 +755,8 @@ def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',
                  '/static/models.js', '/static/health.js', '/static/summary.js', '/static/scheduled-tasks.js',
-                 '/static/skills.js', '/static/knowledge.js', '/static/plugin.js', '/static/external-memory.js'):
+                 '/static/skills.js', '/static/knowledge.js', '/static/plugin.js', '/static/external-memory.js',
+                 '/static/topnav.js', '/static/tasks-observations.js'):
         body = client.get(path).text
         assert 'innerHTML =' not in body, f"{path} contains innerHTML assignment"
         assert 'insertAdjacentHTML' not in body, f"{path} uses insertAdjacentHTML"
@@ -765,6 +794,8 @@ def test_index_html_links_assets(tmp_path):
         '/static/knowledge.js',
         '/static/plugin.js',
         '/static/external-memory.js',
+        '/static/topnav.js',
+        '/static/tasks-observations.js',
         '/static/favicon.svg',
     )
     for asset in assets:
@@ -800,6 +831,101 @@ def test_index_html_links_assets(tmp_path):
         < html.index('id="tab-sandbox"')
     )
     assert html.index('id="tab-chat"') < html.index('id="tab-scheduled-tasks"') < html.index('id="tab-sessions"')
+
+
+def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
+    """T4: topbar 重构为三段（标题挂载点 + 顶导挂载点 + 右侧预留区），
+    移除 last-update 与品牌占位；新增 #tab-tasks-observations 容器；
+    引入 topnav.js / tasks-observations.js（在 app.js 之前）。
+    #app-sidebar 整块不动（链接集合精确回归）。"""
+    import re as _re
+    client = _client(tmp_path)
+    html = client.get('/chat').text
+    css = client.get('/static/styles.css').text
+
+    # 1) topbar 含标题挂载点 #topbar-title 与非 nav 的顶导挂载点 div#topnav-mount
+    topbar_match = _re.search(r'<header class="topbar">(.*?)</header>', html, _re.DOTALL)
+    assert topbar_match, "topbar header not found"
+    topbar_html = topbar_match.group(1)
+    assert 'id="topbar-title-wrap"' in topbar_html, "topbar missing #topbar-title-wrap"
+    assert 'id="topbar-title"' in topbar_html, "topbar missing #topbar-title mount"
+    assert '<div id="topnav-mount"' in topbar_html, "topbar missing div#topnav-mount (must be a div, not nav)"
+    assert 'class="topbar__reserved"' in topbar_html, "topbar missing .topbar__reserved"
+    # 静态 HTML 内不预嵌 <nav class="topnav">；nav 由 topnav.js 运行时挂载
+    assert 'class="topnav"' not in topbar_html, "topbar must not pre-embed topnav nav in static HTML"
+
+    # 2) topbar 内无品牌、#last-update、项目/租户占位文字
+    assert 'last-update' not in topbar_html, "topbar must not contain last-update"
+    assert 'sidebar__brand' not in topbar_html, "topbar must not contain brand"
+    for placeholder in ('租户', '项目', 'workspace', 'tenant'):
+        assert placeholder not in topbar_html, f"topbar must not contain placeholder text {placeholder}"
+
+    # 3) 新增 <div class="tab-content" id="tab-tasks-observations">
+    assert '<div class="tab-content" id="tab-tasks-observations">' in html, \
+        "missing #tab-tasks-observations scoped tab container"
+
+    # 4) 引入 topnav.js / tasks-observations.js，均在 app.js 之前；管理基础脚本在它们之前
+    assert '/static/topnav.js' in html, "index.html missing topnav.js script"
+    assert '/static/tasks-observations.js' in html, "index.html missing tasks-observations.js script"
+    assert html.index('/static/topnav.js') < html.index('/static/app.js'), \
+        "topnav.js must load before app.js"
+    assert html.index('/static/tasks-observations.js') < html.index('/static/app.js'), \
+        "tasks-observations.js must load before app.js"
+    # 基础 API/UI/navigation 在依赖模块前
+    assert html.index('/static/management-ui.js') < html.index('/static/topnav.js'), \
+        "management-ui.js must load before topnav.js"
+    assert html.index('/static/management-api.js') < html.index('/static/topnav.js'), \
+        "management-api.js must load before topnav.js"
+    assert html.index('/static/management-navigation.js') < html.index('/static/topnav.js'), \
+        "management-navigation.js must load before topnav.js"
+    assert html.index('/static/management-ui.js') < html.index('/static/tasks-observations.js'), \
+        "management-ui.js must load before tasks-observations.js"
+    assert html.index('/static/management-api.js') < html.index('/static/tasks-observations.js'), \
+        "management-api.js must load before tasks-observations.js"
+    assert html.index('/static/management-navigation.js') < html.index('/static/tasks-observations.js'), \
+        "management-navigation.js must load before tasks-observations.js"
+
+    # 5) #app-sidebar 整块不动：链接集合精确回归（data-tab 序列 + href 序列）
+    sidebar_match = _re.search(r'<aside[^>]*id="app-sidebar"[^>]*>(.*?)</aside>', html, _re.DOTALL)
+    assert sidebar_match, "sidebar not found"
+    sidebar_html = sidebar_match.group(1)
+    expected_data_tabs = [
+        'summary', 'chat', 'tasks', 'scheduled-tasks', 'sessions', 'memory',
+        'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
+        'executors', 'sandbox', 'executors-host', 'models', 'platforms',
+        'observations', 'observations-sessions', 'observations-modules', 'security',
+    ]
+    expected_hrefs = [
+        '/summary', '/chat', '/tasks', '/scheduled-tasks', '/sessions', '/memory',
+        '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
+        '/sandbox', '/executors/host', '/models', '/platforms',
+        '/observations/sessions', '/observations/modules', '/security',
+    ]
+    sidebar_data_tabs = _re.findall(r'data-tab="([^"]*)"', sidebar_html)
+    assert sidebar_data_tabs == expected_data_tabs, f"sidebar data-tab set changed: {sidebar_data_tabs}"
+    sidebar_hrefs = _re.findall(r'href="([^"]*)"', sidebar_html)
+    assert sidebar_hrefs == expected_hrefs, f"sidebar href set changed: {sidebar_hrefs}"
+
+    # 6) styles.css 含 .topnav__item--active（无 border-bottom/底边条）、.topnav__scroll、.topbar__reserved
+    assert '.topnav__item--active' in css, "styles.css missing .topnav__item--active"
+    active_rule_match = _re.search(r'\.topnav__item--active\s*\{([^}]*)\}', css)
+    assert active_rule_match, "styles.css missing .topnav__item--active rule block"
+    active_rule = active_rule_match.group(1)
+    assert 'border-bottom' not in active_rule, ".topnav__item--active must not have border-bottom"
+    assert '.topnav__scroll' in css, "styles.css missing .topnav__scroll"
+    assert '.topbar__reserved' in css, "styles.css missing .topbar__reserved"
+    assert '#topbar-title-wrap { display: flex; align-items: center; min-width: 0; padding-left: 10px; }' in css, \
+        "topbar title must align with topnav item text"
+
+    # 7) topnav.js / tasks-observations.js 静态资源可访问（不 404）
+    for asset in ('/static/topnav.js', '/static/tasks-observations.js'):
+        res = client.get(asset)
+        assert res.status_code == 200, f"{asset} not served"
+    # tasks-observations.js stub 暴露 NAGENT.tasksObservations 占位（init/refresh）
+    to_body = client.get('/static/tasks-observations.js').text
+    assert 'tasksObservations' in to_body, "tasks-observations.js must expose tasksObservations namespace"
+    assert 'init' in to_body and 'refresh' in to_body
+    assert 'innerHTML' not in to_body
 
 
 def test_management_ui_exports_el_helper(tmp_path):
@@ -895,6 +1021,17 @@ def test_tools_submenu_nav(tmp_path):
         css.index("/* 收起态：二级菜单浮层弹出，不展开左导 */")
     ]
     assert "border-left-color" not in child_active_rule
+
+
+def test_sidebar_dividers_keep_their_height_when_submenus_expand(tmp_path):
+    """左导纵向空间不足时，分割线不能被 Flex 布局压缩为零。"""
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    divider_rule = css[
+        css.index('.sidebar__divider {'):
+        css.index('}', css.index('.sidebar__divider {'))
+    ]
+    assert 'flex: 0 0 1px' in divider_rule
 
 
 def test_knowledge_js_present_and_safe(tmp_path):

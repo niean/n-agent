@@ -107,6 +107,13 @@
 - usage_records：SQLite 表，持久化每次 LLM 调用的 usage 明细，由 SqliteUsageRecorder.record_call 写入；sessions 表同步累加 token/cost/api_call_count。
 - compression_stats：SQLite 表，持久化上下文压缩前后的 token 对比，由 SqliteUsageRecorder.record_compression 写入；`tokens_saved` 用 `max(before-after, 0)` clamp 防止负值。
 
+## Dashboard 顶导菜单术语
+
+- 顶导（topnav）：Dashboard 可选的子域横向导航组件（`topnav.js` NAGENT.topnav），按子域配置（`topnavConfig`）渲染当前子域的横向关注点（如任务子域：管理/观测）。顶导只展示当前子域 items，不跨子域；左导整体不变。样式参考 odin-fe（50px 高、选中主色+加粗无 border-bottom、溢出平移+箭头）。顶导点击经 `onActivate` 回调交由 `navigatePath`，不直接 pushState。
+- topnavConfig：`management-navigation.js` 中按子域（tab key）配置顶导 items 的映射表，每项含 tab/path/label/concern/scope/topnavParent；与 `tabConfig`（左导配置）和 `routeConfig`（多路径路由表）分离，未配置的子域不渲染顶导。
+- routeConfig：`management-navigation.js` 中独立于 `tabConfig` 的路由表，支持多路径映射到同一 renderer（如 `/tasks/observations` 与 `/observations/tasks` 均映射到 `tasks-observations`）；`buildRouteByPath` 校验后生成 routeByPath 映射，`resolveRoute` 优先查此表。
+- sidebarOverride：`management-navigation.js` 中的路径->sidebarTab 覆盖映射（如 `/observations/tasks`->`observations-sessions`），使左导入口下钻到 scoped 路由时左导高亮对齐原入口而非"任务"项。
+
 ## Task 审批术语
 
 - revise（Task approval 第三决策）：Task 意图审批中 approve/reject 之外的第三决策。用户通过 `revise_task` 工具、`/task revise` CLI 子命令或 POST `/chat/tasks/{id}/revise` 路由下达修订指示（note 必填），把 WAITING_APPROVAL 任务重新入队（`Task.revise()`：WAITING_APPROVAL->QUEUED，状态机合法转换集合不变），worker 下次 run 在 `build_worker_context` 决策段看到 `change_revised` 事件与修订 note，可遵循修订路径或提出新提案。与 reject 的区别：reject 表示不同意原提案且不期望 worker 继续，revise 表示期望 worker 带着修订指示继续执行。三决策经 TaskService 统一 `_resolve_proposal` helper + Registry 单事务原子 `resolve_proposal` 端口编排，并发唯一成功无孤立事件。

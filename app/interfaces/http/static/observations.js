@@ -10,6 +10,24 @@
     return ui.byId ? ui.byId('tab-observations-sessions') : document.getElementById('tab-observations-sessions');
   }
 
+  // Async guard: renderToken is a monotonic counter. Each render cycle captures
+  // a snapshot; late responses whose token != current are discarded. isActive
+  // ensures the observations tab is still the active tab (when the user
+  // switches to /observations/tasks the tab loses "active" and stale responses
+  // must not overwrite DOM). The navigation layer owns back/forward navigation
+  // and calls refresh(); observations no longer self-registers a history
+  // listener.
+  let renderToken = 0;
+
+  function isActive() {
+    const node = root();
+    return !!(node && node.classList && node.classList.contains('active'));
+  }
+
+  function isCurrent(token) {
+    return token === renderToken && isActive();
+  }
+
   function formatNumber(value) {
     const n = Number(value || 0);
     if (!isFinite(n)) return '0';
@@ -195,7 +213,11 @@
     container.appendChild(panel);
   }
 
-  function renderSessionsTable(container, items, page, pageSize, total) {
+  // nav: { onDetail(sessionId), onPage(page) } -- allows callers (e.g.
+  // tasks-observations) to wire their own navigation. Falls back to the
+  // closure `route` for backward compatibility.
+  function renderSessionsTable(container, items, page, pageSize, total, nav) {
+    const n = nav || {};
     const panel = ui.el('section', 'status-panel');
     const header = ui.el('div', 'panel-header');
     const title = ui.el('span');
@@ -225,6 +247,7 @@
     const tbody = ui.el('tbody');
     items.forEach((s) => {
       const tr = ui.el('tr');
+      tr.dataset.sessionId = s.session_id || '';
       const titleTd = ui.el('td');
       titleTd.textContent = s.title || '(未命名)';
       const sourceTd = ui.el('td');
@@ -242,8 +265,10 @@
       const detailBtn = ui.el('button', 'btn btn--primary');
       detailBtn.type = 'button';
       detailBtn.textContent = '详情';
+      detailBtn.dataset.action = 'detail';
       detailBtn.addEventListener('click', () => {
-        route.goToDetail(s.session_id);
+        if (typeof n.onDetail === 'function') n.onDetail(s.session_id);
+        else route.goToDetail(s.session_id);
       });
       actionTd.appendChild(detailBtn);
       tr.appendChild(actionTd);
@@ -253,21 +278,28 @@
     body.appendChild(table);
 
     // Pagination
-    const pager = buildPager(page, total, pageSize, (p) => route.goToPage(p));
+    const pager = buildPager(page, total, pageSize, (p) => {
+      if (typeof n.onPage === 'function') n.onPage(p);
+      else route.goToPage(p);
+    });
     body.appendChild(pager);
 
     panel.appendChild(body);
     container.appendChild(panel);
   }
 
-  function renderDetailHeader(container, sessionId) {
+  // nav: { backHref, onBack } -- allows callers (e.g. tasks-observations) to
+  // wire their own back navigation. Falls back to the closure `route`.
+  function renderDetailHeader(container, sessionId, nav) {
+    const n = nav || {};
     const wrap = ui.el('div', 'observations-detail-header');
     const back = ui.el('a', 'observations-detail-header__back');
-    back.href = '/observations/sessions';
+    back.setAttribute('href', n.backHref || '/observations/sessions');
     back.textContent = '返回';
     back.addEventListener('click', (ev) => {
       ev.preventDefault();
-      route.goToIndex();
+      if (typeof n.onBack === 'function') n.onBack();
+      else route.goToIndex();
     });
     const sep = ui.el('span', 'observations-detail-header__sep');
     sep.textContent = '|';
@@ -793,6 +825,8 @@
   async function renderIndex(page) {
     const node = root();
     if (!node) return;
+    if (!isActive()) return;
+    const token = ++renderToken;
     node.replaceChildren();
     const loading = ui.el('div');
     ui.renderLoading(loading, '加载观测数据...');
@@ -802,13 +836,18 @@
         api.usage.getOverview(),
         api.usage.listSessions(page || 1, PAGE_SIZE),
       ]);
+      if (!isCurrent(token)) return;
       const items = sessionsResp.items || [];
       const total = sessionsResp.total || 0;
       const current = sessionsResp.page || 1;
       node.replaceChildren();
       renderOverviewCards(node, overview || {});
-      renderSessionsTable(node, items, current, PAGE_SIZE, total);
+      renderSessionsTable(node, items, current, PAGE_SIZE, total, {
+        onDetail: (id) => route.goToDetail(id),
+        onPage: (p) => route.goToPage(p),
+      });
     } catch (err) {
+      if (!isCurrent(token)) return;
       node.replaceChildren();
       ui.renderError(node, '加载观测数据失败: ' + (err && err.message ? err.message : err));
     }
@@ -817,6 +856,8 @@
   async function renderDetail(sessionId) {
     const node = root();
     if (!node) return;
+    if (!isActive()) return;
+    const token = ++renderToken;
     node.replaceChildren();
     const loading = ui.el('div');
     ui.renderLoading(loading, '加载会话观测数据...');
@@ -828,15 +869,23 @@
         api.usage.getCompressions(sessionId),
         api.usage.getBreakdown(sessionId),
       ]);
+      if (!isCurrent(token)) return;
       node.replaceChildren();
-      renderDetailHeader(node, sessionId);
+      renderDetailHeader(node, sessionId, {
+        backHref: '/observations/sessions',
+        onBack: () => route.goToIndex(),
+      });
       renderStatsBar(node, stats || {});
       renderBreakdown(node, breakdown || {});
       renderRecords(node, records || []);
       renderCompressions(node, compressions || []);
     } catch (err) {
+      if (!isCurrent(token)) return;
       node.replaceChildren();
-      renderDetailHeader(node, sessionId);
+      renderDetailHeader(node, sessionId, {
+        backHref: '/observations/sessions',
+        onBack: () => route.goToIndex(),
+      });
       ui.renderError(node, '加载会话观测数据失败: ' + (err && err.message ? err.message : err));
     }
   }
@@ -876,14 +925,36 @@
   }
 
   function init() {
-    route.render();
-    window.addEventListener('popstate', () => route.render());
+    return route.render();
   }
 
   function refresh() {
-    route.render();
+    return route.render();
   }
 
-  namespace.observations = { init, refresh, render: () => route.render() };
+  namespace.observations = {
+    init,
+    refresh,
+    render: () => route.render(),
+    // Reusable render primitives + helpers. Consumed by tasks-observations.js
+    // to render the task-scoped observation view with the same layout, avoiding
+    // ~900 lines of duplication.
+    renderers: {
+      overviewCards: renderOverviewCards,
+      sessionsTable: renderSessionsTable,
+      detailHeader: renderDetailHeader,
+      statsBar: renderStatsBar,
+      breakdown: renderBreakdown,
+      records: renderRecords,
+      compressions: renderCompressions,
+      formatNumber,
+      formatTime,
+      formatCost,
+      formatPercent,
+      formatCacheHitRate,
+      buildPager,
+      PAGE_SIZE,
+    },
+  };
   global.NAGENT = namespace;
 }(window));

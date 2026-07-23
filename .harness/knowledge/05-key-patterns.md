@@ -973,3 +973,41 @@ Dashboard Chat 的 `ui.task_lifecycle` 系统消息在 waiting_approval/failed/e
 - `_decode_message_card` 用 broad exception 吞掉所有错误会掩盖 content_json 或数据库异常；只容忍 card_json 的 JSON 解析错误，content_json 与数据库错误照常传播。
 - `groupTaskMessages` 遇带合法 card 的 lifecycle 消息必须关闭当前合并组并独立 push，否则 card 字段会在 `{...firstMessage}` 浅拷贝中被覆盖或丢失；card 消息也不得吸纳后续消息。
 - in-flight 防重复只用单一布尔值会让第二次点击在第一次 await 期间触发；必须用 `inflight.value` 守卫 + 按钮 disabled 双重保护，且 finally 仅在 actions 容器仍 attached 时恢复控件。
+
+## 模式三十二：顶导菜单与多路由双入口
+
+Dashboard 在左导不变的前提下新增可选顶导菜单组件，按子域展示横向关注点（如任务子域：管理/观测），支持同一 renderer 多路径与左导/顶导双路由入口。顶导样式参考 odin-fe（50px 高、选中主色+加粗无下划线、溢出平移+箭头）。
+
+配置与路由分离规则：
+- `topnavConfig`（`management-navigation.js`）按子域（tab key）配置顶导 items，每项含 `tab`/`path`/`label`/`concern`/`scope`/`topnavParent`；当前仅 tasks 子域配置了 管理/观测 两个 item。`topnavConfig` 是可选配置，未配置的子域不渲染顶导、恢复标题展示。
+- `routeConfig` 是独立于 `tabConfig` 的路由表，支持多路径映射到同一 renderer（`paths: ['/tasks/observations', '/observations/tasks']` -> `renderTab: 'tasks-observations'`）；`buildRouteByPath` 在模块加载时校验 required 字段（tab/renderTab/sidebarTab/topnavParent/scope）、paths 非空数组、path 以 `/` 开头、无重复 path，校验失败 throw Error。
+- `sidebarOverride` 允许路由级覆盖 sidebarTab（如 `/observations/tasks` 路由的 sidebarTab 覆盖为 `observations-sessions`，使左导"会话"项高亮而非"任务"项），实现左导不变前提下双入口的侧栏高亮对齐。
+- `resolveRoute(pathname)` 优先查 `routeByPath` 精确匹配（命中返回 route state 含 activeTab/renderTab/sidebarTab/currentSubdomain），未命中回退 `tabByPath`/`selectedTabFromPath` 既有路径。`applyRoute(state)` 统一应用：切换 tab active class、sidebar active class、topbar title、调 `onTabActivated(state)`。
+- `navigatePath(path)` 是唯一写 history 的入口（pushState + resolveRoute + applyRoute），popstate 与 sidebar click 均迁移到此函数；移除旧 `applyTab`，selectedTabFromPath 接受可选 pathname 参数支持离线调用。
+
+顶导组件规则（`topnav.js` NAGENT.topnav={render,destroy}）：
+- `render(container, opts)` 构造单个 nav + a 链接项 DOM（不在既有 nav 内嵌套 nav），`aria-current="page"` + `topnav__item--active` 标记当前项；点击链接 `preventDefault` 后调 `onActivate(item)` 回调，不直接 pushState（交由调用方 `navigatePath`）。
+- 精确高亮：`activeTopnavItem(items, activeTab)` 用 `items.find(i => i.tab === activeTab)` 精确匹配，禁止 `indexOf`/`includes` 等模糊匹配（避免路径前缀误命中）。
+- 溢出控制：ResizeObserver 优先检测 scrollWidth > clientWidth，不可用退回 window resize；溢出时显示左右箭头按钮（step 80% clientWidth），滚轮 deltaY 转水平滚动，方向键在链接间移动焦点；`prefers-reduced-motion: reduce` 时用原生 `scrollLeft` 替代 `transform: translateX()` 平移。
+- 生命周期：重复 render 先 destroy 旧实例避免重复监听器；`destroy()` 设 `disposed=true` 使残留闭包回调不再生效，disconnect ResizeObserver，removeEventListener，replaceChildren 清空容器。
+- 安全降级：items 缺 tab/path/label 必填字段时跳过非法项（不 throw），生产环境静默、开发夹具 `namespace.__DEV__` 时 console.error 报告；activeTab 不在 items 中时无当前项渲染 + 开发报告。
+
+双入口规则：
+- 顶导入口：顶导点击 -> `navigatePath(item.path)` -> routeConfig 命中 -> renderTab 激活 tasks-observations 模块，sidebarTab 按 route.sidebarTab 高亮。
+- 左导入口：左导"观测 > 会话"（`/observations/sessions`）渲染 observations.js，index 视图新增 scope 控件 全部/任务 chip；点击"任务" chip 调 `navigatePath('/observations/tasks')` 下钻到 tasks-observations 模块（routeConfig 命中同一路由，sidebarOverride 使左导"会话"项高亮）。
+- 两个入口经 routeConfig 汇聚到同一 renderer，sidebar 高亮通过 sidebarOverride/sidebarTab 区分：顶导入口 sidebarTab=tasks（左导"任务"高亮），左导入口 sidebarTab=observations-sessions（左导"会话"高亮）。
+
+异步 guard 规则：
+- `app.js` onTabActivated 接收 state 对象（非裸 tab 字符串），`normalizeState` 兼容两种输入；`renderTopnav(state)` 在模块 init 前先渲染顶导（模块错误不阻断顶导状态）。
+- `inflight` map 共享并发 onTabActivated 的 init Promise，防止同一 tab 重复 init；init 失败调 `renderModuleError` 在容器内显示错误不 throw。
+- `tasks-observations.js` 与 `observations.js` 均用 `renderToken`（monotonic counter）+ `isActive()` 双重 guard：late response 的 token != current 时丢弃，tab 失去 active class 时丢弃；`inflight` Promise 去重防并发重复请求（force=true 时 supersede 旧 inflight）。
+
+shell 路由注册规则（`dashboard.py`）：
+- 字面路由 `/tasks/observations`、`/observations/tasks` 用堆叠装饰器置于 `/tasks/{task_id}` catch-all 下方（自下而上注册，字面路由先于 catch-all 命中），均返回 index.html 外壳由前端按 pathname 选 tab。
+
+陷阱：
+- `topnavConfig` 与 `tabConfig` 混淆会让顶导依赖左导的父子结构，破坏"左导不变"约束；`routeConfig` 与 `tabByPath` 混淆会让多路径同 renderer 无法表达（tabByPath 是 1:1 映射）。正确做法：topnavConfig/routeConfig 是独立配置，tabConfig/tabByPath/pathByTab/parentByChild 不改。
+- `activeTopnavItem` 用 `indexOf(path)` 匹配会让 `/tasks` 误命中 `/tasks/observations`，导致顶导"管理"项在观测页也高亮；必须用 `tab === activeTab` 精确匹配。
+- 顶导组件直接 pushState 会让路由层失去统一控制（sidebarOverride/applyRoute 副作用丢失）；必须通过 onActivate 回调交由 `navigatePath`。
+- 字面路由 `/tasks/observations` 置于 `/tasks/{task_id}` 上方会被 catch-all 吞噬（FastAPI 按注册顺序匹配，堆叠装饰器自下而上注册，源码下方先注册）；必须置于 catch-all 下方。
+- `tasks-observations.js` 的 `api.listSessions()` 后客户端按 `source === 'task'` 过滤是前端语义，禁止把 scope 作为后端查询参数传递（后端 listSessions 不支持 scope 过滤，会忽略）。

@@ -30,6 +30,42 @@
   const parentByChild = Object.fromEntries(
     tabConfig.filter((c) => c.parentTab).map((c) => [c.tab, c.parentTab]),
   );
+
+  const topnavConfig = {
+    tasks: [
+      { tab: 'tasks', path: '/tasks', label: '管理', concern: 'management', scope: 'tasks', topnavParent: 'tasks' },
+      { tab: 'tasks-observations', path: '/tasks/observations', label: '观测', concern: 'observation', scope: 'tasks', topnavParent: 'tasks' },
+    ],
+  };
+  const routeConfig = [
+    { paths: ['/tasks/observations', '/observations/tasks'], tab: 'tasks-observations', renderTab: 'tasks-observations', sidebarTab: 'tasks', topnavParent: 'tasks', scope: 'tasks' },
+  ];
+  const sidebarOverride = { '/observations/tasks': 'observations-sessions' };
+
+  function buildRouteByPath(config) {
+    const required = ['tab', 'renderTab', 'sidebarTab', 'topnavParent', 'scope'];
+    const map = {};
+    for (const entry of config) {
+      for (const f of required) {
+        if (!entry[f]) throw new Error('routeConfig: missing or empty field "' + f + '"');
+      }
+      if (!Array.isArray(entry.paths) || !entry.paths.length) {
+        throw new Error('routeConfig: paths must be a non-empty array');
+      }
+      for (const p of entry.paths) {
+        if (typeof p !== 'string' || p[0] !== '/') {
+          throw new Error('routeConfig: path must start with / (got ' + JSON.stringify(p) + ')');
+        }
+        if (Object.prototype.hasOwnProperty.call(map, p)) {
+          throw new Error('routeConfig: duplicate path "' + p + '"');
+        }
+        map[p] = entry;
+      }
+    }
+    return map;
+  }
+  const routeByPath = buildRouteByPath(routeConfig);
+
   const DEFAULT_CHILD = {
     tools: 'tools-knowledge',
     observations: 'observations-sessions',
@@ -41,8 +77,8 @@
     return cfg && cfg.parent === true;
   }
 
-  function selectedTabFromPath() {
-    const path = window.location.pathname;
+  function selectedTabFromPath(pathname) {
+    const path = pathname || window.location.pathname;
     if (tabByPath[path]) return tabByPath[path];
     if (path.startsWith('/scheduled-tasks/')) return 'scheduled-tasks';
     if (path.startsWith('/tasks/')) return 'tasks';
@@ -57,26 +93,63 @@
     return 'summary';
   }
 
-  function applyTab(name) {
-    let next = tabNames.includes(name) ? name : 'summary';
-    if (isParent(next)) next = DEFAULT_CHILD[next] || 'summary';
+  function resolveRoute(pathname) {
+    const route = routeByPath[pathname];
+    if (route) {
+      const sidebarTab = sidebarOverride[pathname] || route.sidebarTab;
+      return { activeTab: route.tab, renderTab: route.renderTab, sidebarTab, currentSubdomain: route.topnavParent, route };
+    }
+    const tab = tabByPath[pathname] || selectedTabFromPath(pathname);
+    const currentSubdomain = topnavConfig[tab] ? tab : (parentByChild[tab] || null);
+    return { activeTab: tab, renderTab: tab, sidebarTab: tab, currentSubdomain, route: null };
+  }
+
+  function activeTopnavItem(items, activeTab) {
+    return items.find((i) => i.tab === activeTab) || null;
+  }
+
+  function resolveTitle(activeTab, currentSubdomain) {
+    if (labelByTab[activeTab]) return labelByTab[activeTab];
+    if (currentSubdomain && topnavConfig[currentSubdomain]) {
+      const item = topnavConfig[currentSubdomain].find((i) => i.tab === activeTab);
+      if (item) return item.label;
+    }
+    return activeTab;
+  }
+
+  function applyRoute(state) {
     document.querySelectorAll('.tab-content').forEach((tab) => tab.classList.remove('active'));
+    const target = document.getElementById('tab-' + state.renderTab);
+    if (target) {
+      target.classList.add('active');
+    } else if (state.route) {
+      if (global.NAGENT && global.NAGENT.modal && typeof global.NAGENT.modal.alert === 'function') {
+        global.NAGENT.modal.alert('页面模块未就绪: ' + state.renderTab);
+      }
+    }
     document.querySelectorAll('.sidebar__item').forEach((item) => {
       item.classList.remove('sidebar__item--active');
     });
-    const target = document.getElementById(`tab-${next}`);
-    if (target) target.classList.add('active');
-    const nav = document.querySelector(`[data-tab="${next}"]`);
-    if (nav) nav.classList.add('sidebar__item--active');
-    const parentTab = parentByChild[next];
+    const navItem = document.querySelector('[data-tab="' + state.sidebarTab + '"]');
+    if (navItem) navItem.classList.add('sidebar__item--active');
+    const parentTab = parentByChild[state.sidebarTab];
     if (parentTab) {
       applySubmenuState(parentTab, readSubmenuPref(parentTab));
     }
     const title = document.getElementById('topbar-title');
-    if (title) title.textContent = labelByTab[next] || next;
+    if (title) title.textContent = resolveTitle(state.activeTab, state.currentSubdomain);
+    // TopNav render/destroy and mount visibility handled by onTabActivated (app.js)
     if (global.NAGENT && global.NAGENT.app && typeof global.NAGENT.app.onTabActivated === 'function') {
-      global.NAGENT.app.onTabActivated(next);
+      global.NAGENT.app.onTabActivated(state);
     }
+  }
+
+  function navigatePath(path) {
+    if (window.location.pathname !== path) {
+      history.pushState({ path }, '', path);
+    }
+    const state = resolveRoute(path);
+    applyRoute(state);
   }
 
   function closeAllPopouts() {
@@ -105,12 +178,7 @@
     }
     const path = pathByTab[name];
     if (!path) return;
-    // 点击菜单一律跳到规范路径，清掉子路径（如 /observations/sessions/{sid}、
-    // /scheduled-tasks/{id}）。模块的 render/refresh 负责按新 URL 切换视图。
-    if (window.location.pathname !== path) {
-      history.pushState({ tab: name }, '', path);
-    }
-    applyTab(name);
+    navigatePath(path);
   }
 
   const SIDEBAR_PREF_KEY = 'nagent.sidebar.expanded';
@@ -187,10 +255,14 @@
       if (closeTopModal()) return;
       closeAllPopouts();
     });
-    window.addEventListener('popstate', () => applyTab(selectedTabFromPath()));
-    applyTab(selectedTabFromPath());
+    window.addEventListener('popstate', () => navigatePath(window.location.pathname));
+    navigatePath(window.location.pathname);
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.navigation = { initNavigation, navigateTo, switchTab: navigateTo, tabNames, pathByTab };
+  global.NAGENT.navigation = {
+    initNavigation, navigateTo, switchTab: navigateTo, tabNames, pathByTab,
+    resolveRoute, applyRoute, navigatePath, activeTopnavItem, buildRouteByPath,
+    topnavConfig, selectedTabFromPath,
+  };
 }(window));

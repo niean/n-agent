@@ -72,7 +72,7 @@ body.sidebar-expanded .sidebar__toggle-icon { transform: rotate(180deg); }
 .sidebar__nav::-webkit-scrollbar { width: 6px; }
 .sidebar__nav::-webkit-scrollbar-thumb { background: var(--color-border-default); border-radius: 3px; }
 .sidebar__nav::-webkit-scrollbar-track { background: transparent; }
-.sidebar__divider { height: 1px; margin: 6px 8px; background: var(--color-border-light); border: 0; }
+.sidebar__divider { flex: 0 0 1px; height: 1px; margin: 6px 8px; background: var(--color-border-light); border: 0; }
 .sidebar__item { display: flex; align-items: center; gap: 12px; width: 100%; padding: 12px 10px; color: var(--color-fg-muted); white-space: nowrap; text-decoration: none; background: transparent; border: 0; border-radius: 10px; }
 .sidebar__item:hover { color: var(--color-sidebar-hover-fg); background: var(--color-bg-hover); }
 .sidebar__item--active { color: var(--color-primary-strong); background: var(--color-bg-active); }
@@ -84,12 +84,37 @@ body.sidebar-expanded .sidebar__item-label { max-width: 140px; visibility: visib
 /* Topbar + Main */
 .topbar, .main-content { width: calc(100vw - var(--sidebar-width-collapsed)); margin-left: var(--sidebar-width-collapsed); transition: margin-left 0.2s ease, width 0.2s ease; }
 body.sidebar-expanded .topbar, body.sidebar-expanded .main-content { width: calc(100vw - var(--sidebar-width-expanded)); margin-left: var(--sidebar-width-expanded); }
-.topbar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; justify-content: space-between; min-height: 50px; padding: 0 20px; background: var(--color-bg-white); border-bottom: 1px solid var(--color-border-muted); }
-.topbar__title { font-size: 16px; font-weight: 700; }
-.last-update { color: var(--color-fg-subtle); font-size: 12px; }
+.topbar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: var(--space-6); min-height: 50px; padding: 0 20px; background: var(--color-bg-white); border-bottom: 1px solid var(--color-border-muted); }
+#topbar-title-wrap { display: flex; align-items: center; min-width: 0; padding-left: 10px; }
+#topbar-title { font-size: var(--font-size-lg); font-weight: 700; color: var(--color-fg-default); }
+#topbar-title-wrap[hidden] { display: none; }
+#topnav-mount { display: flex; align-items: center; min-width: 0; flex: 1 1 auto; }
+#topnav-mount[hidden] { display: none; }
+.topbar__reserved { flex: 0 0 auto; margin-left: auto; }
 .main-content { min-width: 0; padding: 20px; }
 .tab-content { display: none; }
 .tab-content.active { display: block; min-width: 0; }
+
+/* TopNav: 子域顶导组件，由 topnav.js 挂载到 #topnav-mount */
+.topnav { display: flex; align-items: center; gap: var(--space-2); min-width: 0; background: transparent; border-bottom: 0; }
+.topnav__scroll { overflow: hidden; min-width: 0; }
+.topnav__inner { display: flex; align-items: center; gap: var(--space-4); transition: transform 0.2s ease; will-change: transform; }
+.topnav__item { display: inline-flex; align-items: center; padding: 6px 10px; color: var(--color-fg-muted); font-size: var(--font-size-lg); text-decoration: none; white-space: nowrap; background: transparent; border: 0; border-radius: var(--radius-sm); }
+.topnav__item:hover { color: var(--color-sidebar-hover-fg); background: var(--color-bg-hover); }
+.topnav__item--active { color: var(--color-primary-strong); font-weight: 600; }
+.topnav__item--truncate { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.topnav__item:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+.topnav__ctrl { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 28px; height: 28px; padding: 0; color: var(--color-fg-muted); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
+.topnav__ctrl:hover { color: var(--color-sidebar-hover-fg); background: var(--color-bg-hover); }
+.topnav__ctrl:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+.topnav__ctrl[hidden] { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .topnav__inner { transition: none; }
+}
+@media (max-width: 720px) {
+  .topbar__reserved { display: none; }
+  .topnav { flex: 1 1 auto; min-width: 0; }
+}
 
 /* Cards / Panels */
 .stats-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 20px; }
