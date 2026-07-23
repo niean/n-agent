@@ -42,6 +42,7 @@ flowchart TB
     API("Dashboard\nOpenAI-compatible API ")
     Gateway("Gateway\n飞书IM / CLI-TUI / ACP")
     Schedule("Schedule\n定时任务Runner")
+    Task("Task\n任务Runner")
   end
 
   subgraph Runtime["Agent Runtime"]
@@ -73,6 +74,7 @@ flowchart TB
   API --> Chat
   Gateway --> Chat
   Schedule --> Chat
+  Task --> Chat
   Chat --> Loop
   Loop --> Context
   Loop --> LLM
@@ -449,6 +451,7 @@ N-Agent 用户入口类型，有如下几类：
 | TUI/CLI Chat | Stdio+行式文本 | CliChatAdapter | GatewayService → ChatCompletionService | app/interfaces/cli/ |
 | ACP Agent | Stdio+JSON | NAgentACPAgent | GatewayService → ChatCompletionService | app/interfaces/cli/commands/acp/ |
 | 定时任务执行 | - | SchedulerRunner | ScheduleRunService → ChatCompletionService | app/application/scheduler_runner.py |
+| 任务执行 | - | TaskRunner | TaskRunService → ChatCompletionService | app/application/task_runner.py |
 
 其中，
 
@@ -457,6 +460,7 @@ N-Agent 用户入口类型，有如下几类：
 - 飞书 IM、TUI/CLI、ACP 的用户消息先经 GatewayService 统一做入口会话、消息管理，再进入 ChatCompletionService。
 - ACP协议生命周期保留在 NAgentACPAgent 中。
 - 定时任务执行由 SchedulerRunner 定时触发，并通过 ScheduleRunService->ScheduledAgentExecutor 直接调用 ChatCompletionService，执行结果再由 ScheduleOutboundDelivery 投递。
+- 任务执行由 TaskRunner 触发，并通过 TaskRunService->TaskAgentExecutor 直接调用 ChatCompletionService。
 
 
 ---
@@ -465,14 +469,18 @@ N-Agent 用户入口类型，有如下几类：
 
 ## 产品形态
 
-对话=交互问答；定时任务=Cron触发投递；任务=目标驱动异步后台执行，Kanban状态机 + 意图分解 + 多次AgentRun + 汇总 + Artifact。
+对话=交互问答；定时任务=定时触发投递；任务=目标驱动异步后台执行，任务状态机 + 意图分解 + 多次AgentRun + 汇总 + Artifact。
 
 ```text
-①ChatCompletion：
+①对话 ChatCompletion：
 用户提问 → AgentRun → 回复消息
 
-②Task：
-用户交代目标 → 意图分解 → 多次 AgentRun → 汇总 → Artifact
+②定时任务 Schedule：
+定时触发 -> ChatCompletion -> 结果投递
+
+③任务 Task：
+用户交代目标 → 意图分解 → 多次 ChatCompletionService → 汇总 + Artifact
+
 ```
 
 ## 工具概念
