@@ -54,11 +54,12 @@ def test_service_constructed_regardless_of_task_enabled(tmp_path):
     assert isinstance(s_on.task_security_dashboard_service, TaskSecurityDashboardService)
 
 
-def test_service_holds_same_settings_instance(tmp_path):
+@pytest.mark.asyncio
+async def test_service_holds_same_settings_instance(tmp_path):
     settings = _settings(tmp_path)
     services = build_application_services(settings)
     assert services.task_security_dashboard_service._settings is settings
-    data = services.task_security_dashboard_service.list_task_security()
+    data = await services.task_security_dashboard_service.list_task_security()
     assert data["profile_version"] == "task-security-v1"
 
 
@@ -147,3 +148,26 @@ def test_no_new_wildcard_shell_handler_added(tmp_path):
     # The literal /tasks/security shell route exists exactly once.
     paths = _route_paths(app)
     assert paths.count("/tasks/security") == 1
+
+
+def test_task_config_service_assembled_regardless_of_task_enabled(tmp_path):
+    from app.application.task_config_service import TaskConfigService
+    s_off = build_application_services(_settings(tmp_path, task_enabled=False))
+    s_on = build_application_services(_settings(tmp_path, task_enabled=True))
+    assert isinstance(s_off.task_config_service, TaskConfigService)
+    assert isinstance(s_on.task_config_service, TaskConfigService)
+
+
+def test_config_route_registered_before_task_id_catchall(tmp_path):
+    app = create_app(_settings(tmp_path, task_enabled=True))
+    paths = _route_paths(app)
+    assert "/chat/tasks/security/config" in paths
+    assert paths.index("/chat/tasks/security/config") < paths.index("/chat/tasks/{task_id}")
+
+
+def test_config_route_available_when_task_disabled(tmp_path):
+    app = create_app(_settings(tmp_path, task_enabled=False))
+    client = TestClient(app)
+    r = client.get("/chat/tasks/security/config")
+    assert r.status_code == 200
+    assert r.json()["version"] == 0

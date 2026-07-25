@@ -282,6 +282,19 @@ def test_update_supports_vision_none_keeps_value():
     assert updated.supports_vision is True
 
 
+def test_list_providers_sorted_by_name_asc_case_insensitive():
+    service, _, _ = _service()
+    for name in ["Gamma", "alpha", "Beta"]:
+        asyncio.run(
+            service.create_provider(
+                ProviderCreateInput(name=name, base_url="http://x", model="m", api_key="k")
+            )
+        )
+    providers = asyncio.run(service.list_providers())
+    names = [p.name for p in providers]
+    assert names == ["alpha", "Beta", "Gamma"]
+
+
 def test_update_supports_vision_true_persists():
     service, _, _ = _service()
     cfg = asyncio.run(

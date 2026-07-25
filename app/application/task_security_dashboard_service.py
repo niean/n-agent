@@ -53,7 +53,8 @@ _SETTINGS_ALLOWLIST: frozenset[str] = frozenset({
 class _ConfigSpec:
     key: str
     label: str
-    source: tuple  # ("settings", attr_name) | ("static", scalar_value)
+    source: tuple  # ("settings", attr) | ("static", value) | ("resolved", attr)
+    editable: bool = False  # C-class True; A/B/planning-unwired False
 
 
 @dataclass(frozen=True)
@@ -97,17 +98,19 @@ _TASK_SECURITY_METADATA: tuple[_SectorSpec, ...] = (
             "app/config.py",
         ),
         config=(
-            _ConfigSpec("task_enabled", "任务子系统启用", ("settings", "task_enabled")),
-            _ConfigSpec("task_max_concurrency", "最大并发", ("settings", "task_max_concurrency")),
-            _ConfigSpec("task_lease_seconds", "租约（秒）", ("settings", "task_lease_seconds")),
-            _ConfigSpec("task_heartbeat_timeout_seconds", "心跳超时（秒）", ("settings", "task_heartbeat_timeout_seconds")),
-            _ConfigSpec("task_max_runtime_seconds", "最大运行时长（秒）", ("settings", "task_max_runtime_seconds")),
-            _ConfigSpec("task_dispatch_interval_seconds", "调度间隔（秒）", ("settings", "task_dispatch_interval_seconds")),
-            _ConfigSpec("task_shutdown_grace_seconds", "关闭宽限（秒）", ("settings", "task_shutdown_grace_seconds")),
-            # task_failure_limit is defined in Settings but NOT wired to
-            # Task.max_retries default (task_routes defaults max_retries to 0).
-            # Label states this honestly; we do not change runtime wiring.
-            _ConfigSpec("task_failure_limit", "失败上限（当前未接入 Task.max_retries 默认值）", ("settings", "task_failure_limit")),
+            # B class (env-only, read-only display).
+            _ConfigSpec("task_enabled", "任务子系统启用", ("settings", "task_enabled"), editable=False),
+            # C class (Dashboard-editable, hot-reload; read resolved env+DB).
+            _ConfigSpec("task_max_concurrency", "最大并发", ("resolved", "task_max_concurrency"), editable=True),
+            _ConfigSpec("task_lease_seconds", "租约（秒）", ("resolved", "task_lease_seconds"), editable=True),
+            _ConfigSpec("task_heartbeat_timeout_seconds", "心跳超时（秒）", ("resolved", "task_heartbeat_timeout_seconds"), editable=True),
+            _ConfigSpec("task_max_runtime_seconds", "最大运行时长（秒）", ("resolved", "task_max_runtime_seconds"), editable=True),
+            # B class (env-only).
+            _ConfigSpec("task_dispatch_interval_seconds", "调度间隔（秒）", ("settings", "task_dispatch_interval_seconds"), editable=False),
+            _ConfigSpec("task_shutdown_grace_seconds", "关闭宽限（秒）", ("settings", "task_shutdown_grace_seconds"), editable=False),
+            # C class: task_failure_limit is now wired as Task.max_retries default
+            # (create_task max_retries=None resolves to this).
+            _ConfigSpec("task_failure_limit", "Task.max_retries 默认值", ("resolved", "task_failure_limit"), editable=True),
         ),
     ),
     _SectorSpec(
@@ -121,10 +124,11 @@ _TASK_SECURITY_METADATA: tuple[_SectorSpec, ...] = (
             "app/config.py",
         ),
         config=(
-            _ConfigSpec("task_goal_max_turns", "目标最大轮次", ("settings", "task_goal_max_turns")),
-            _ConfigSpec("task_planning_max_children", "规划最大子任务", ("settings", "task_planning_max_children")),
-            _ConfigSpec("task_attachment_max_bytes", "单附件上限（字节）", ("settings", "task_attachment_max_bytes")),
-            _ConfigSpec("task_attachment_task_max_bytes", "任务附件总上限（字节）", ("settings", "task_attachment_task_max_bytes")),
+            _ConfigSpec("task_goal_max_turns", "目标最大轮次", ("resolved", "task_goal_max_turns"), editable=True),
+            # planning 子系统已移除，task_planning_max_children 无消费方；只读展示，不可编辑。
+            _ConfigSpec("task_planning_max_children", "规划最大子任务（未接入：planning 已移除）", ("settings", "task_planning_max_children"), editable=False),
+            _ConfigSpec("task_attachment_max_bytes", "单附件上限（MB）", ("resolved", "task_attachment_max_bytes"), editable=True),
+            _ConfigSpec("task_attachment_task_max_bytes", "任务附件总上限（MB）", ("resolved", "task_attachment_task_max_bytes"), editable=True),
         ),
     ),
     _SectorSpec(
@@ -160,7 +164,8 @@ _TASK_SECURITY_METADATA: tuple[_SectorSpec, ...] = (
             _ConfigSpec("tool_session_isolation", "自然语言审批会话隔离", ("static", True)),
             _ConfigSpec("tool_not_found_normalization", "不泄露任务存在性", ("static", True)),
             _ConfigSpec("revise_note_required", "修订必填 note", ("static", True)),
-            _ConfigSpec("note_max_codepoints", "note 最大长度（code point）", ("static", 2000)),
+            # C class (Dashboard-editable, hot-reload).
+            _ConfigSpec("note_max_codepoints", "note 最大长度（code point）", ("resolved", "note_max_codepoints"), editable=True),
             _ConfigSpec("unknown_fields_rejected", "拒绝未知字段", ("static", True)),
         ),
     ),
@@ -177,17 +182,28 @@ _EXPECTED_SECTOR_KEYS = (
 class TaskSecurityDashboardService:
     """Projects task-subsystem security policies and configs into a read-only view.
 
-    Holds only ``Settings``. Reads current Settings attrs on every call -- no
-    caching. Does not access TaskService/TaskRunService/Registry, so
-    ``task_enabled=False`` still constructs, registers and returns 200.
+    Holds ``Settings`` (for A/B-class static + env values) and a
+    ``TaskConfigService`` (for C-class resolved env+DB values). C-class reads
+    go through ``get_resolved()`` so the dashboard shows the effective value
+    (DB override or env). ``task_enabled=False`` still constructs/returns 200
+    (config service has no task-runtime dependency).
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, task_config_service: Any = None) -> None:
         self._settings = settings
+        self._task_config_service = task_config_service
 
-    def list_task_security(self) -> dict[str, object]:
+    async def list_task_security(self) -> dict[str, object]:
         self._validate_metadata()
-        sectors = [self._sector_view(meta) for meta in _TASK_SECURITY_METADATA]
+        # C-class resolved config (env + DB overrides). Falls back to an
+        # env-derived TaskConfig when no config service is wired (legacy/tests);
+        # the fallback reads Settings so env values still display.
+        if self._task_config_service is not None:
+            resolved = await self._task_config_service.get_resolved()
+            resolved_config = resolved.config
+        else:
+            resolved_config = _resolved_from_settings(self._settings)
+        sectors = [self._sector_view(meta, resolved_config) for meta in _TASK_SECURITY_METADATA]
         return {"profile_version": "task-security-v1", "policies": sectors}
 
     def _validate_metadata(self) -> None:
@@ -252,18 +268,27 @@ class TaskSecurityDashboardService:
                     raise TaskSecurityDashboardError(f"settings attr {payload} not found")
             elif kind == "static":
                 _validate_static_value(payload)
+            elif kind == "resolved":
+                # C-class: attr must be a TaskConfig field.
+                from app.domain.task_config import TASK_CONFIG_FIELDS
+                if not isinstance(payload, str) or not payload:
+                    raise TaskSecurityDashboardError("resolved source attr must be non-empty string")
+                if payload not in TASK_CONFIG_FIELDS:
+                    raise TaskSecurityDashboardError(f"resolved attr {payload} not a TaskConfig field")
             else:
                 raise TaskSecurityDashboardError(f"unknown source kind {kind!r}")
 
-    def _sector_view(self, meta: _SectorSpec) -> dict[str, Any]:
+    def _sector_view(self, meta: _SectorSpec, resolved_config: Any) -> dict[str, Any]:
         config_items: list[dict[str, Any]] = []
         for c in meta.config:
             kind, payload = c.source
             if kind == "settings":
                 value = _normalize_value(getattr(self._settings, payload))
+            elif kind == "resolved":
+                value = _normalize_value(getattr(resolved_config, payload))
             else:
                 value = _normalize_value(payload)
-            config_items.append({"key": c.key, "label": c.label, "value": value})
+            config_items.append({"key": c.key, "label": c.label, "value": value, "editable": c.editable})
         return {
             "key": meta.key,
             "name": meta.name,
@@ -275,8 +300,23 @@ class TaskSecurityDashboardService:
         }
 
 
+def _resolved_from_settings(settings: Settings) -> Any:
+    """Build a TaskConfig from env Settings (fallback when no config service)."""
+    from app.domain.task_config import TaskConfig
+    return TaskConfig(
+        task_max_concurrency=settings.task_max_concurrency,
+        task_lease_seconds=settings.task_lease_seconds,
+        task_heartbeat_timeout_seconds=settings.task_heartbeat_timeout_seconds,
+        task_max_runtime_seconds=settings.task_max_runtime_seconds,
+        task_goal_max_turns=settings.task_goal_max_turns,
+        task_attachment_max_bytes=settings.task_attachment_max_bytes,
+        task_attachment_task_max_bytes=settings.task_attachment_task_max_bytes,
+        task_failure_limit=settings.task_failure_limit,
+        note_max_codepoints=settings.task_note_max_codepoints,
+    )
+
+
 def _validate_static_value(value: Any) -> None:
-    # bool must be checked before int: bool is a subclass of int.
     if isinstance(value, bool):
         return
     if isinstance(value, int):

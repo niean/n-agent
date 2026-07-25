@@ -60,6 +60,7 @@ from app.domain.task import (
     TaskStatus,
     available_lifecycle_actions,
 )
+from app.domain.task_config import TaskConfig, TaskConfigProvider
 from app.domain.task_policy import TaskPolicy, TaskPolicyRequest
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ class TaskRunService:
         heartbeat_timeout_seconds: int = 300,
         max_runtime_seconds: int = 3600,
         max_concurrency: int = 4,
+        task_config_provider: TaskConfigProvider | None = None,
     ):
         self.registry = registry
         self.dispatcher = dispatcher
@@ -128,6 +130,23 @@ class TaskRunService:
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.max_runtime_seconds = max_runtime_seconds
         self.max_concurrency = max_concurrency
+        self._task_config_provider = task_config_provider
+
+    def _fallback_config(self) -> TaskConfig:
+        """Build a TaskConfig from constructor scalars (provider unavailable)."""
+        return TaskConfig(
+            task_max_concurrency=self.max_concurrency,
+            task_lease_seconds=self.lease_seconds,
+            task_heartbeat_timeout_seconds=self.heartbeat_timeout_seconds,
+            task_max_runtime_seconds=self.max_runtime_seconds,
+        )
+
+    async def _snapshot(self) -> TaskConfig:
+        """Single config snapshot for one operation. Provider for hot-reload;
+        constructor scalars as fallback when no provider (tests/legacy)."""
+        if self._task_config_provider is not None:
+            return await self._task_config_provider.current()
+        return self._fallback_config()
 
     # ------------------------------------------------------------------
     # Lifecycle chat messages (best-effort, never blocks finalization)
@@ -328,8 +347,9 @@ class TaskRunService:
         new state machine has no READY state.
         """
         now = datetime.now(timezone.utc)
+        cfg = await self._snapshot()
         recovered_crashed = await self._recover_crashed_workers(now)
-        recovered_stale = await self._recover_stale_executions(now)
+        recovered_stale = await self._recover_stale_executions(now, cfg)
 
         queued_tasks = await self.registry.list_queued_due(now, limit=100)
         # Registry already orders by priority desc, created_at asc, id asc;
@@ -343,10 +363,10 @@ class TaskRunService:
         spawned = 0
         spawn_failures = 0
         for task in queued_sorted:
-            if active_count + spawned >= self.max_concurrency:
+            if active_count + spawned >= cfg.task_max_concurrency:
                 break
             try:
-                result = await self._claim_and_spawn(task)
+                result = await self._claim_and_spawn(task, cfg)
                 if result is not None:
                     spawned += 1
                 else:
@@ -368,7 +388,7 @@ class TaskRunService:
     # claim_and_spawn
     # ------------------------------------------------------------------
 
-    async def _claim_and_spawn(self, task: Task) -> str | None:
+    async def _claim_and_spawn(self, task: Task, cfg: TaskConfig) -> str | None:
         """Atomically claim a QUEUED task and spawn a worker.
 
         Returns the worker_token, or None if claim failed (already claimed
@@ -376,7 +396,7 @@ class TaskRunService:
         """
         claim_lock = f"cl-{uuid4().hex[:12]}"
         claim = await self.registry.claim_task(
-            task.id, claim_lock, self.lease_seconds
+            task.id, claim_lock, cfg.task_lease_seconds
         )
         if claim is None:
             return None
@@ -424,9 +444,10 @@ class TaskRunService:
 
         All exceptions are caught so the asyncio.Task never propagates.
         """
-        max_runtime = task.max_runtime_seconds or self.max_runtime_seconds
+        cfg = await self._snapshot()
+        max_runtime = task.max_runtime_seconds or cfg.task_max_runtime_seconds
         # Hard timeout must be < lease
-        timeout = min(max_runtime, self.lease_seconds - 1)
+        timeout = min(max_runtime, cfg.task_lease_seconds - 1)
 
         # 生命周期：worker 起始（best-effort，不阻断执行；spawn 失败走 _handle_spawn_failure，
         # 未进 run_claim，不写"开始运行"）。纯文本 lifecycle，card=None。
@@ -772,7 +793,7 @@ class TaskRunService:
     # recover_stale_executions (lease/heartbeat expired -> EXPIRED)
     # ------------------------------------------------------------------
 
-    async def _recover_stale_executions(self, now: datetime) -> int:
+    async def _recover_stale_executions(self, now: datetime, cfg: TaskConfig) -> int:
         """Recover RUNNING tasks with expired leases or stale heartbeats.
 
         For each RUNNING task:
@@ -791,7 +812,7 @@ class TaskRunService:
             has_worker = await self._has_active_worker(task.current_run_id)
             if has_worker:
                 # Worker still active in-process; check heartbeat staleness.
-                if not task.is_stale(now, self.heartbeat_timeout_seconds):
+                if not task.is_stale(now, cfg.task_heartbeat_timeout_seconds):
                     continue
                 # Heartbeat stale -- reclaim below.
             else:

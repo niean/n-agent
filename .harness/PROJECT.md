@@ -126,7 +126,7 @@ sh tests/e2e/run.sh
 
 ## 安全规范
 
-{{项目安全规范摘要，每条一行}}
+- 任务安全策略按 A/B/C 三类管理：A 类安全不变量只读禁止配置、B 类启动期绑定 env-only、C 类运行时可配 Dashboard 编辑+热重载（权威定义见 .harness/knowledge/03-conventions.md "任务安全策略分类"）
 
 ---
 

@@ -112,6 +112,7 @@ def create_dashboard_router(
     skill_usage_store=None,
     image_store=None,
     task_security_dashboard_service=None,
+    task_config_service=None,
     task_service=None,
     task_run_service=None,
 ) -> APIRouter:
@@ -361,6 +362,10 @@ def create_dashboard_router(
         # MUST register before register_task_routes so /chat/tasks/security is
         # not captured by the /chat/tasks/{task_id} catch-all.
         register_task_security_routes(router, task_security_dashboard_service)
+    if task_config_service is not None:
+        from app.interfaces.http.task_config_routes import register_task_config_routes
+        # Config routes also before /chat/tasks/{task_id} catch-all.
+        register_task_config_routes(router, task_config_service)
     if task_service is not None:
         from app.interfaces.http.task_routes import register_task_routes
         register_task_routes(router, task_service, task_run_service)

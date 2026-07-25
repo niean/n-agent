@@ -167,11 +167,36 @@
   function cfg(config) {
     const grid = document.createElement('div');
     grid.className = 'policy-cfg';
-    config.forEach((c) => grid.appendChild(policyItem(c.label, formatValue(c.value))));
+    // editable===false (A/B class) -> value rendered gray (muted) to distinguish
+    // from C-class (editable) values. undefined (e.g. /security page) -> normal.
+    // *_bytes fields are displayed in MB (bytes / 1024 / 1024).
+    config.forEach((c) => grid.appendChild(policyItem(c.label, formatConfigValue(c.key, c.value), c.editable)));
     return grid;
   }
 
-  function policyItem(label, value) {
+  // True if the config key is a byte-count field (displayed/edited in MB).
+  function isBytesField(key) {
+    return typeof key === 'string' && key.indexOf('_bytes', key.length - 6) !== -1;
+  }
+  function bytesToMb(v) {
+    var n = Number(v);
+    if (!isFinite(n)) return v;
+    var mb = n / (1024 * 1024);
+    return Math.round(mb * 100) / 100;
+  }
+  function mbToBytes(v) {
+    var n = Number(v);
+    if (!isFinite(n)) return v;
+    return Math.round(n * 1024 * 1024);
+  }
+  function formatConfigValue(key, value) {
+    if (isBytesField(key) && (typeof value === 'number' || (typeof value === 'string' && value && isFinite(Number(value))))) {
+      return String(bytesToMb(value));
+    }
+    return formatValue(value);
+  }
+
+  function policyItem(label, value, editable) {
     const item = document.createElement('div');
     item.className = 'policy-item';
     const k = document.createElement('span');
@@ -179,6 +204,7 @@
     k.textContent = label + '：';
     const v = document.createElement('span');
     v.className = 'policy-v';
+    if (editable === false) v.classList.add('policy-v--muted');
     v.textContent = value;
     item.append(k, v);
     return item;
@@ -226,5 +252,9 @@
     policyItem: policyItem,
     statCard: statCard,
     formatValue: formatValue,
+    isBytesField: isBytesField,
+    bytesToMb: bytesToMb,
+    mbToBytes: mbToBytes,
+    formatConfigValue: formatConfigValue,
   };
 }(window));

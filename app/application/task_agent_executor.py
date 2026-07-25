@@ -62,6 +62,7 @@ from app.application.task_tools import (
 )
 from app.domain.policy import ExecutionMode
 from app.domain.task import Task, TaskRunOutcome
+from app.domain.task_config import TaskConfig, TaskConfigProvider
 
 logger = logging.getLogger(__name__)
 
@@ -137,12 +138,22 @@ class TaskAgentExecutor:
         prompt_builder: Any | None = None,
         max_runtime_seconds: int = 3600,
         goal_max_turns: int = 10,
+        task_config_provider: TaskConfigProvider | None = None,
     ):
         self.chat_service = chat_service
         self.task_registry = task_registry
         self.prompt_builder = prompt_builder
         self.max_runtime_seconds = max_runtime_seconds
         self.goal_max_turns = goal_max_turns
+        self._task_config_provider = task_config_provider
+
+    async def _snapshot(self) -> TaskConfig:
+        if self._task_config_provider is not None:
+            return await self._task_config_provider.current()
+        return TaskConfig(
+            task_max_runtime_seconds=self.max_runtime_seconds,
+            task_goal_max_turns=self.goal_max_turns,
+        )
 
     # ------------------------------------------------------------------
     # Single-turn run
@@ -161,6 +172,7 @@ class TaskAgentExecutor:
         with trusted task context. After completion, reads the latest intent
         event to determine the terminal outcome.
         """
+        cfg = await self._snapshot()
         execution_session_id = task_execution_session_id(task)
         execution_run_id = f"task-run-{uuid4().hex[:12]}"
 
@@ -245,7 +257,7 @@ class TaskAgentExecutor:
         except asyncio.TimeoutError:
             return TaskAgentResult(
                 status=TaskRunOutcome.TIMED_OUT,
-                error=f"task execution timed out after {task.max_runtime_seconds or self.max_runtime_seconds}s",
+                error=f"task execution timed out after {task.max_runtime_seconds or cfg.task_max_runtime_seconds}s",
             )
         except Exception as exc:
             logger.exception("task agent executor failed: task=%s", task.id)
@@ -278,8 +290,9 @@ class TaskAgentExecutor:
           - Total runtime exceeded -> TIMED_OUT
           - Worker proposed a change -> WAITING_APPROVAL (returned immediately)
         """
-        max_turns = task.goal_max_turns or self.goal_max_turns
-        max_runtime = task.max_runtime_seconds or self.max_runtime_seconds
+        cfg = await self._snapshot()
+        max_turns = task.goal_max_turns or cfg.task_goal_max_turns
+        max_runtime = task.max_runtime_seconds or cfg.task_max_runtime_seconds
         start = asyncio.get_event_loop().time()
         last_result: TaskAgentResult | None = None
         consecutive_rejections = 0

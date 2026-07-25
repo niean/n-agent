@@ -181,11 +181,11 @@ function validPayload() {
   return {
     profile_version: 'task-security-v1',
     policies: [
-      { key: 'task_policy', name: 'TaskPolicy', display_name: '任务策略', dimension: 'd1', execution_point: 'e1', source_files: ['a.py'], config: [{ key: 'state_count', label: '状态数量', value: 7 }] },
-      { key: 'task_execution', name: 'X', display_name: '执行管控', dimension: 'd2', execution_point: 'e2', source_files: ['b.py'], config: [{ key: 'task_enabled', label: '启用', value: true }] },
-      { key: 'task_planning', name: 'X', display_name: '规划', dimension: 'd3', execution_point: 'e3', source_files: ['c.py'], config: [{ key: 'g', label: 'g', value: 10 }] },
-      { key: 'worker_security', name: 'X', display_name: 'Worker', dimension: 'd4', execution_point: 'e4', source_files: ['d.py'], config: [{ key: 's', label: 's', value: 'task' }] },
-      { key: 'approval_security', name: 'X', display_name: '审批', dimension: 'd5', execution_point: 'e5', source_files: ['e.py'], config: [{ key: 'n', label: 'n', value: null }] },
+      { key: 'task_policy', name: 'TaskPolicy', display_name: '任务策略', dimension: 'd1', execution_point: 'e1', source_files: ['a.py'], config: [{ key: 'state_count', label: '状态数量', value: 7, editable: false }] },
+      { key: 'task_execution', name: 'X', display_name: '执行管控', dimension: 'd2', execution_point: 'e2', source_files: ['b.py'], config: [{ key: 'task_enabled', label: '启用', value: true, editable: false }] },
+      { key: 'task_planning', name: 'X', display_name: '规划', dimension: 'd3', execution_point: 'e3', source_files: ['c.py'], config: [{ key: 'g', label: 'g', value: 10, editable: false }] },
+      { key: 'worker_security', name: 'X', display_name: 'Worker', dimension: 'd4', execution_point: 'e4', source_files: ['d.py'], config: [{ key: 's', label: 's', value: 'task', editable: false }] },
+      { key: 'approval_security', name: 'X', display_name: '审批', dimension: 'd5', execution_point: 'e5', source_files: ['e.py'], config: [{ key: 'n', label: 'n', value: null, editable: false }] },
     ],
   };
 }
@@ -205,7 +205,8 @@ async function runTests() {
     const c = resetPage(() => Promise.resolve(validPayload()));
     await sandbox.NAGENT.tasksSecurity.refresh();
     const txt = textOf(c);
-    ok(txt.indexOf('Sector 数量') !== -1, 'overview uses Sector 数量 countLabel');
+    // 整体概览 sector 已移除：页面不再渲染 "Sector 数量" 计数卡。
+    ok(txt.indexOf('Sector 数量') === -1, 'overview sector removed (no Sector 数量)');
     ok(txt.indexOf('来源文件') !== -1, 'sectors show 来源文件');
     ok(txt.indexOf('任务策略') !== -1 && txt.indexOf('执行管控') !== -1 && txt.indexOf('审批') !== -1,
       'all 5 sector display_names rendered');

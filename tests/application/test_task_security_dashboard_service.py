@@ -21,16 +21,18 @@ def _settings(**overrides) -> Settings:
     return Settings(**overrides)
 
 
-def test_top_level_fields_and_version():
-    data = _service().list_task_security()
+@pytest.mark.asyncio
+async def test_top_level_fields_and_version():
+    data = await _service().list_task_security()
     assert set(data.keys()) == {"profile_version", "policies"}
     assert data["profile_version"] == "task-security-v1"
     keys = [p["key"] for p in data["policies"]]
     assert keys == ["task_policy", "task_execution", "task_planning", "worker_security", "approval_security"]
 
 
-def test_sector_and_config_field_sets_exact():
-    data = _service().list_task_security()
+@pytest.mark.asyncio
+async def test_sector_and_config_field_sets_exact():
+    data = await _service().list_task_security()
     for sector in data["policies"]:
         assert set(sector.keys()) == {
             "key", "name", "display_name", "dimension",
@@ -38,18 +40,20 @@ def test_sector_and_config_field_sets_exact():
         }
         assert isinstance(sector["source_files"], list) and sector["source_files"]
         for c in sector["config"]:
-            assert set(c.keys()) == {"key", "label", "value"}
+            assert set(c.keys()) == {"key", "label", "value", "editable"}
 
 
-def test_config_keys_unique_per_sector():
-    data = _service().list_task_security()
+@pytest.mark.asyncio
+async def test_config_keys_unique_per_sector():
+    data = await _service().list_task_security()
     for sector in data["policies"]:
         keys = [c["key"] for c in sector["config"]]
         assert len(keys) == len(set(keys))
 
 
-def test_task_policy_sector_uses_per_task_breaker_not_failure_limit():
-    data = _service().list_task_security()
+@pytest.mark.asyncio
+async def test_task_policy_sector_uses_per_task_breaker_not_failure_limit():
+    data = await _service().list_task_security()
     tp = next(p for p in data["policies"] if p["key"] == "task_policy")
     by_label = {c["label"]: c["value"] for c in tp["config"]}
     assert by_label["状态数量"] == 7
@@ -59,43 +63,48 @@ def test_task_policy_sector_uses_per_task_breaker_not_failure_limit():
     assert all(c["key"] != "task_failure_limit" for c in tp["config"])
 
 
-def test_task_failure_limit_labeled_as_unwired_and_reflects_setting():
-    data = _service(task_failure_limit=5).list_task_security()
+@pytest.mark.asyncio
+async def test_task_failure_limit_labeled_as_unwired_and_reflects_setting():
+    data = await _service(task_failure_limit=5).list_task_security()
     te = next(p for p in data["policies"] if p["key"] == "task_execution")
     fl = next(c for c in te["config"] if c["key"] == "task_failure_limit")
-    assert "当前未接入 Task.max_retries 默认值" in fl["label"]
+    assert fl["label"] == "Task.max_retries 默认值"
     assert fl["value"] == 5
 
 
-def test_settings_values_reflected_and_no_caching():
+@pytest.mark.asyncio
+async def test_settings_values_reflected_and_no_caching():
     settings = _settings(task_max_concurrency=8, task_lease_seconds=1200)
     svc = TaskSecurityDashboardService(settings)
-    data1 = svc.list_task_security()
+    data1 = await svc.list_task_security()
     te = next(p for p in data1["policies"] if p["key"] == "task_execution")
     by_key = {c["key"]: c["value"] for c in te["config"]}
     assert by_key["task_max_concurrency"] == 8
     assert by_key["task_lease_seconds"] == 1200
     # Same Settings instance: mutating it is observable (no caching).
     settings.task_max_concurrency = 16
-    data2 = svc.list_task_security()
+    data2 = await svc.list_task_security()
     te2 = next(p for p in data2["policies"] if p["key"] == "task_execution")
     assert {c["key"]: c["value"] for c in te2["config"]}["task_max_concurrency"] == 16
 
 
-def test_service_holds_same_settings_instance():
+@pytest.mark.asyncio
+async def test_service_holds_same_settings_instance():
     settings = _settings()
     svc = TaskSecurityDashboardService(settings)
     assert svc._settings is settings
 
 
-def test_task_enabled_false_reflected_not_swallowed():
-    data = _service(task_enabled=False).list_task_security()
+@pytest.mark.asyncio
+async def test_task_enabled_false_reflected_not_swallowed():
+    data = await _service(task_enabled=False).list_task_security()
     te = next(p for p in data["policies"] if p["key"] == "task_execution")
     assert {c["key"]: c["value"] for c in te["config"]}["task_enabled"] is False
 
 
-def test_response_has_no_sensitive_or_path_fields():
-    data = _service().list_task_security()
+@pytest.mark.asyncio
+async def test_response_has_no_sensitive_or_path_fields():
+    data = await _service().list_task_security()
     blob = repr(data)
     # These field names must never appear (paths / secrets / config not in the
     # display allowlist). Concept words like "worker_token" may appear in config
@@ -110,8 +119,9 @@ def test_response_has_no_sensitive_or_path_fields():
             assert not f.startswith("/"), f"absolute source_file leaked: {f}"
 
 
-def test_worker_and_approval_static_values():
-    data = _service().list_task_security()
+@pytest.mark.asyncio
+async def test_worker_and_approval_static_values():
+    data = await _service().list_task_security()
     ws = next(p for p in data["policies"] if p["key"] == "worker_security")
     ws_map = {c["key"]: c["value"] for c in ws["config"]}
     assert ws_map["approval_tools_stripped"] is True
@@ -126,7 +136,8 @@ def test_worker_and_approval_static_values():
     assert ap_map["unknown_fields_rejected"] is True
 
 
-def test_metadata_is_deeply_immutable():
+@pytest.mark.asyncio
+async def test_metadata_is_deeply_immutable():
     # Outer tuple immutable: cannot assign item.
     with pytest.raises(TypeError):
         _TASK_SECURITY_METADATA[0] = _TASK_SECURITY_METADATA[0]  # type: ignore[index]
@@ -245,13 +256,15 @@ def test_metadata_is_deeply_immutable():
         "unsupported static value type",
     ),
 ])
-def test_metadata_validation_fail_closed(monkeypatch, bad, match):
+@pytest.mark.asyncio
+async def test_metadata_validation_fail_closed(monkeypatch, bad, match):
     monkeypatch.setattr(mod, "_TASK_SECURITY_METADATA", bad)
     with pytest.raises(TaskSecurityDashboardError, match=match):
-        _service().list_task_security()
+        await _service().list_task_security()
 
 
-def test_settings_allowlist_rejects_existing_but_unlisted_attr(monkeypatch):
+@pytest.mark.asyncio
+async def test_settings_allowlist_rejects_existing_but_unlisted_attr(monkeypatch):
     # provider_api_key exists on Settings but is NOT in the display allowlist.
     bad = (
         _SectorSpec("task_policy", "x", "x", "x", "x", ("a.py",),
@@ -267,10 +280,11 @@ def test_settings_allowlist_rejects_existing_but_unlisted_attr(monkeypatch):
     )
     monkeypatch.setattr(mod, "_TASK_SECURITY_METADATA", bad)
     with pytest.raises(TaskSecurityDashboardError, match="allowlist"):
-        _service().list_task_security()
+        await _service().list_task_security()
 
 
-def test_settings_allowlist_rejects_task_attachments_root(monkeypatch):
+@pytest.mark.asyncio
+async def test_settings_allowlist_rejects_task_attachments_root(monkeypatch):
     bad = (
         _SectorSpec("task_policy", "x", "x", "x", "x", ("a.py",),
                     (_ConfigSpec("a", "b", ("static", 1)),)),
@@ -285,7 +299,7 @@ def test_settings_allowlist_rejects_task_attachments_root(monkeypatch):
     )
     monkeypatch.setattr(mod, "_TASK_SECURITY_METADATA", bad)
     with pytest.raises(TaskSecurityDashboardError, match="allowlist"):
-        _service().list_task_security()
+        await _service().list_task_security()
 
 
 @pytest.mark.parametrize("value,ok", [
@@ -305,7 +319,8 @@ def test_settings_allowlist_rejects_task_attachments_root(monkeypatch):
     ({"a": 1}, False),
     (object(), False),
 ])
-def test_normalize_value(value, ok):
+@pytest.mark.asyncio
+async def test_normalize_value(value, ok):
     from app.application.task_security_dashboard_service import _normalize_value
     if ok:
         result = _normalize_value(value)

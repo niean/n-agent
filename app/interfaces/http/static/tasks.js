@@ -505,7 +505,8 @@
 
       // Terminal-ish actions: cancel / retry via buttons.
       const statusActions = el('div', 'providers-form__actions');
-      if (['queued', 'running', 'waiting_approval', 'failed'].indexOf(detail.status) !== -1) {
+      // 取消任务仅对进行中状态开放；失败/过期任务不再展示取消按钮。
+      if (['queued', 'running', 'waiting_approval'].indexOf(detail.status) !== -1) {
         const cancelBtn = el('button', 'btn');
         cancelBtn.type = 'button'; cancelBtn.textContent = '取消任务';
         cancelBtn.addEventListener('click', async () => {
@@ -525,7 +526,7 @@
       }
       if (DELETABLE_STATUSES.indexOf(detail.status) !== -1) {
         const deleteBtn = el('button', 'btn btn--danger');
-        deleteBtn.type = 'button'; deleteBtn.textContent = '删除任务';
+        deleteBtn.type = 'button'; deleteBtn.textContent = '删除';
         deleteBtn.addEventListener('click', () => { removeTask(id); });
         statusActions.appendChild(deleteBtn);
       }

@@ -29,7 +29,7 @@ def register_task_security_routes(router: APIRouter, service: TaskSecurityDashbo
     @router.get("/chat/tasks/security")
     async def list_task_security():
         try:
-            data = service.list_task_security()
+            data = await service.list_task_security()
             return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
         except Exception:
             logger.exception("task security profile could not be loaded")

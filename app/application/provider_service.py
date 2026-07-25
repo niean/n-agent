@@ -49,7 +49,9 @@ class ProviderService:
         self.holder = holder
 
     async def list_providers(self) -> list[ProviderConfig]:
-        return await self.registry.list_providers()
+        items = await self.registry.list_providers()
+        # 按名称 ASC 排序（大小写不敏感），供 Dashboard 模型页与 CLI list 统一展示
+        return sorted(items, key=lambda c: c.name.casefold())
 
     async def get_provider(self, provider_id: str) -> ProviderConfig | None:
         return await self.registry.get_provider(provider_id)

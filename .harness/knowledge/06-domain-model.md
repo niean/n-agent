@@ -542,8 +542,13 @@ Skill 自进化是 Agent Runtime 对会话摘要的后台审查，把可复用�
 
 ## 安全策略
 
-- 本地Shell：
-- X
+任务子域安全策略与配置按可配置性分三类（权威定义见 .harness/knowledge/03-conventions.md "任务安全策略分类"）：
+
+- A 类 安全不变量（只读，禁止配置）：任务状态机/claim 契约/断路条件逻辑、Worker 安全（工具剥离/Judge 只读/token 不透明/入口来源/执行模式）、审批安全（会话隔离/存在性不泄漏/revise 必填/未知字段拒绝）
+- B 类 启动期绑定（env-only，改需重启）：task_enabled、task_dispatch_interval_seconds、task_shutdown_grace_seconds
+- C 类 运行时可配（Dashboard 可编辑 + 热重载）：并发/租约/心跳/运行时长/目标轮次/附件限额/失败上限/note 上限，经 TaskConfigProvider 热重载，SQLite task_config 单行逐字段覆盖
+
+本地 Shell：terminal 工具在 Sandbox 子域执行（workspace 只读、scratch 可写、workdir 仅允许 scratch/workspace），详见 ## Sandbox 章节；host_terminal 走宿主子域独立 Policy。
 
 ---
 ---

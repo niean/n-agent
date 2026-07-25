@@ -38,6 +38,7 @@
 | D034 | UserTaskToolExecutor.list_tasks 穷尽 TaskService 全局 board 分页后再按 origin_session_id 过滤，单 board 任务量大时查询成本线性增长。本期按 spec 保持现有数据模型不新增索引或 session 查询接口；后续可加 session 维度查询。 | low | plan-260720-chat-natural-language-task.md | 2026-07-20 | open |
 | D035 | `tests/interfaces/chat_frontend_harness.js` 的轻量 DOM stub（makeEl）缺少完整 querySelector、事件和可访问性语义；本期 Chat 任务卡片交互化只补实现所需的最小能力（findDescendants 递归 _kids、textContent、aria-live、label 包裹）。键盘操作/完整可访问性语义无法在 Node harness 可靠验证，后续需引入浏览器级前端测试。 | low | plan-260721-chat-interactive-card.md | 2026-07-21 | open |
 | D036 | `tests/e2e/` 当前无可控的 task worker proposal/claim fixture，Chat 任务卡片交互化的真实浏览器+真实 worker 全链路 E2E 无法自动化；本期端到端证据由跨层 pytest + Node harness 组成。后续需补建稳定 task worker E2E fixture。 | low | plan-260721-chat-interactive-card.md | 2026-07-21 | open |
+| D037 | `.harness/PROJECT.md`「构建与测试」的「构建」小节仍为模板占位符 `{{构建命令}}`，verify-acceptance 的 build 步骤无权威构建命令可执行，只能退化为 py_compile + import 检查。非本次变更新引入；后续应填写实际构建命令（如 `python -m compileall app` 或 ruff/mypy）。 | low | N/A | 2026-07-25 | open |
 
 ---
 

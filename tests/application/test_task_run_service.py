@@ -364,6 +364,39 @@ async def test_dispatch_priority_order(run_service, registry, dispatcher):
     assert dispatcher.spawns[0][0].id == "t_high"
 
 
+class _FakeConfigProvider:
+    """Hot-reload provider stub. Returns a fixed TaskConfig; counts calls."""
+
+    def __init__(self, config):
+        self._config = config
+        self.call_count = 0
+
+    async def current(self):
+        self.call_count += 1
+        return self._config
+
+
+@pytest.mark.asyncio
+async def test_dispatch_uses_provider_snapshot_for_concurrency(registry, dispatcher, notifier):
+    from app.domain.task_config import TaskConfig
+    # Provider says max_concurrency=1, overriding the constructor scalar.
+    provider = _FakeConfigProvider(TaskConfig(task_max_concurrency=1))
+    svc = TaskRunService(
+        registry=registry, dispatcher=dispatcher, executor=FakeExecutor(),
+        policy=TaskPolicy(), notifier=notifier,
+        max_concurrency=4,  # would allow 4 without provider
+        task_config_provider=provider,
+    )
+    await registry.create_task(_queued_task(id="t_1", priority=5))
+    await registry.create_task(_queued_task(id="t_2", priority=4))
+    result = await svc.dispatch_once()
+    # Provider cap of 1 wins over constructor 4.
+    assert result["spawned"] == 1
+    # Single snapshot per dispatch (not per task).
+    assert provider.call_count == 1
+
+
+
 @pytest.mark.asyncio
 async def test_dispatch_skips_not_due_queued(run_service, registry, dispatcher):
     """QUEUED task with future scheduled_at is not dispatched."""

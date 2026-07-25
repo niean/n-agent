@@ -210,6 +210,20 @@ def register_task_routes(
                     return _task_error_response("task_invalid", f"invalid scheduled_at: {exc}", 422)
                 if scheduled_at.tzinfo is None:
                     scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+            # max_retries: only parse when the caller explicitly provides it.
+            # None propagates to the service, which resolves it to the
+            # configured task_failure_limit default. Strict parse rejects
+            # bool/string/negative (no silent `int(... or 0)` coercion).
+            max_retries_raw = payload.get("max_retries")
+            max_retries: int | None
+            if max_retries_raw is None:
+                max_retries = None
+            elif isinstance(max_retries_raw, bool) or not isinstance(max_retries_raw, int):
+                return _task_error_response("task_invalid", "max_retries must be an integer", 422)
+            elif max_retries_raw < 0:
+                return _task_error_response("task_invalid", "max_retries must be >= 0", 422)
+            else:
+                max_retries = max_retries_raw
             task = await task_service.create_task(
                 title=str(payload.get("title", "") or ""),
                 body=str(payload.get("body", "") or ""),
@@ -218,7 +232,7 @@ def register_task_routes(
                 idempotency_key=payload.get("idempotency_key"),
                 origin_session_id=payload.get("origin_session_id"),
                 skills=tuple(payload.get("skills") or ()),
-                max_retries=int(payload.get("max_retries", 0) or 0),
+                max_retries=max_retries,
                 goal_mode=bool(payload.get("goal_mode", False)),
                 goal_max_turns=payload.get("goal_max_turns"),
                 model_override=payload.get("model_override"),

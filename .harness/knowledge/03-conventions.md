@@ -94,6 +94,21 @@ Docker Compose 项目隔离使用：
 - `.env.example` 只保留占位值或空值，不写真实密钥
 - 任何日志、测试和文档都不得输出真实 API Key
 
+## 任务安全策略分类（A/B/C）
+
+任务子域安全策略与配置按可配置性分三类，新增策略须先归类后再决定存储与展示方式：
+
+- A 类 安全不变量：代码级安全合同，放宽会破坏安全边界。只读展示，禁止进入配置表、禁止 Dashboard 编辑。包括任务状态机/claim 契约/断路条件逻辑、Worker 安全（工具剥离、Judge 只读、token 不透明、入口来源、执行模式）、审批安全（会话隔离、存在性不泄漏、revise 必填、未知字段拒绝）
+- B 类 启动期绑定：在 main.py 装配期注入构造器或控制 lifespan，运行时热改代价高或语义危险。env-only（`N_AGENT_TASK_*`），Dashboard 只读展示，不纳入编辑白名单。包括 task_enabled、task_dispatch_interval_seconds、task_shutdown_grace_seconds
+- C 类 运行时可配：运行时调参旋钮，非安全边界。Dashboard 可编辑 + 热重载，经 `TaskConfigProvider.current()` 在使用点查询。包括 task_max_concurrency、task_lease_seconds、task_heartbeat_timeout_seconds、task_max_runtime_seconds、task_goal_max_turns、task_attachment_max_bytes、task_attachment_task_max_bytes、task_failure_limit、note_max_codepoints
+
+分类规则：
+- A 类判定标准：放宽该项会削弱防递归自审批、存在性不泄漏、断路器等安全保证；一律不进配置表
+- B 类判定标准：消费点在装配期/lifespan，或仅关停时生效；改 env 需重启，不热重载
+- C 类判定标准：运行时 per-claim/per-task/per-request 读取，热重载有意义且不触及安全边界
+- 跨字段校验（heartbeat<lease、dispatch_interval<lease、attachment_task>=attachment_max、各 int 边界）在 Domain `validate_task_config` 单一来源；DB 覆盖层与 env 启动校验复用同一规则
+- 存储采用 SQLite `task_config` 单行逐字段 JSON 覆盖（只存被编辑字段，未编辑字段继续跟随 env），CAS 乐观锁；分层解析 代码默认 -> env -> DB 覆盖 -> per-task 字段
+
 ---
 
 # 三、质量约定

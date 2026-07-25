@@ -438,7 +438,7 @@ async def test_recover_stale_writes_card_and_result():
         lifecycle_writer=lifecycle_writer,
         result_writer=result_writer,
     )
-    recovered = await svc._recover_stale_executions(now)
+    recovered = await svc._recover_stale_executions(now, svc._fallback_config())
     assert recovered == 1
     # 任务状态卡片；EXPIRED 有交互动作（retry）-> card 为 dict
     assert any(

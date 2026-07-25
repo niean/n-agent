@@ -528,6 +528,35 @@ async def test_create_task_basic(svc, registry):
     assert any(e.kind == "created" for e in events)
 
 
+class _FakeConfigProvider:
+    def __init__(self, config):
+        self._config = config
+
+    async def current(self):
+        return self._config
+
+
+@pytest.mark.asyncio
+async def test_create_task_max_retries_none_uses_provider_default(registry):
+    """max_retries=None (caller did not specify) resolves to the configured
+    task_failure_limit (hot-reload default). Explicit 0 is honored."""
+    from app.domain.task_config import TaskConfig
+    from app.application.task_service import TaskService
+    from app.domain.task_policy import TaskPolicy
+    provider = _FakeConfigProvider(TaskConfig(task_failure_limit=7))
+    svc = TaskService(registry=registry, policy=TaskPolicy(), task_config_provider=provider)
+    # None -> provider default (7).
+    t1 = await svc.create_task(title="a", created_by="u")
+    assert t1.max_retries == 7
+    # Explicit 0 honored (not overridden by provider default).
+    t2 = await svc.create_task(title="b", created_by="u", max_retries=0)
+    assert t2.max_retries == 0
+    # Explicit int honored.
+    t3 = await svc.create_task(title="c", created_by="u", max_retries=2)
+    assert t3.max_retries == 2
+
+
+
 @pytest.mark.asyncio
 async def test_create_task_no_assignee_field(svc):
     """create_task must not accept an assignee parameter."""

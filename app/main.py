@@ -35,6 +35,7 @@ from app.application.policy_snapshot import (
 from app.application.policy_audit_service import PolicyAuditService
 from app.application.policy_dashboard_service import PolicyDashboardService
 from app.application.task_security_dashboard_service import TaskSecurityDashboardService
+from app.application.task_config_service import TaskConfigService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
 from app.application.schedule_run_service import ScheduleRunService
@@ -105,6 +106,8 @@ from app.infrastructure.plugin.file_loader import PluginFileLoader, PluginFileLo
 from app.infrastructure.plugin.seed_runner import seed_default_plugins
 from app.infrastructure.registry.sqlite_plugin_registry import SQLitePluginRegistry
 from app.infrastructure.registry.sqlite_task_registry import SQLiteTaskRegistry
+from app.infrastructure.registry.sqlite_task_config_store import SqliteTaskConfigStore
+from app.infrastructure.policy.task_config_logging_sink import TaskConfigLoggingSink
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
@@ -309,6 +312,7 @@ class ApplicationServices:
     health_snapshot: Callable[[], dict]
     policy_dashboard_service: PolicyDashboardService
     task_security_dashboard_service: TaskSecurityDashboardService
+    task_config_service: TaskConfigService
     image_store: LocalImageStore
     usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
@@ -930,6 +934,13 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     # when task_enabled is False, no init is attempted. Retained as a constant
     # so health_snapshot can keep its existing schema_error field shape.
     task_schema_error: str = ""
+    # Task config service is assembled unconditionally (outside task_enabled):
+    # the security page and config API must work even when the task subsystem
+    # is disabled, so saved overrides apply on re-enable.
+    task_config_store = SqliteTaskConfigStore(str(settings.sqlite_path))
+    task_config_service = TaskConfigService(
+        settings, task_config_store, TaskConfigLoggingSink(),
+    )
     if settings.task_enabled:
         # SQLiteTaskRegistry performs schema init in __init__; failures
         # propagate (spec: 初始化异常必须让启动失败，不得伪装成"子系统不可用"
@@ -954,6 +965,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             prompt_builder=build_system_prompt,
             max_runtime_seconds=settings.task_max_runtime_seconds,
             goal_max_turns=settings.task_goal_max_turns,
+            task_config_provider=task_config_service,
         )
         task_outbound_delivery = TaskOutboundDelivery(feishu_client, task_registry)
 
@@ -996,6 +1008,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             heartbeat_timeout_seconds=settings.task_heartbeat_timeout_seconds,
             max_runtime_seconds=settings.task_max_runtime_seconds,
             max_concurrency=settings.task_max_concurrency,
+            task_config_provider=task_config_service,
         )
         # Late-bind to resolve circular dep:
         #   TaskRunService needs dispatcher=TaskRunner,
@@ -1009,6 +1022,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             attachment_max_bytes=settings.task_attachment_max_bytes,
             attachment_task_max_bytes=settings.task_attachment_task_max_bytes,
             lifecycle_writer=_task_lifecycle_writer,
+            task_config_provider=task_config_service,
         )
         # TaskService.dispatch_tick delegates to TaskRunService (late-bind).
         task_service.set_run_service(task_run_service)
@@ -1410,7 +1424,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         platform_service=platform_service,
         health_snapshot=health_snapshot,
         policy_dashboard_service=PolicyDashboardService(SettingsPolicyProfileProvider(settings)),
-        task_security_dashboard_service=TaskSecurityDashboardService(settings),
+        task_security_dashboard_service=TaskSecurityDashboardService(settings, task_config_service),
+        task_config_service=task_config_service,
         image_store=image_store,
         usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
@@ -1597,6 +1612,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             skill_usage_store=services.skill_usage_store,
             image_store=services.image_store,
             task_security_dashboard_service=services.task_security_dashboard_service,
+            task_config_service=services.task_config_service,
             task_service=services.task_service,
             task_run_service=services.task_run_service,
         )

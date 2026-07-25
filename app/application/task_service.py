@@ -57,6 +57,7 @@ from app.domain.task import (
     TaskWorkspaceKind,
 )
 from app.application.task_session import task_execution_session_id
+from app.domain.task_config import TaskConfig, TaskConfigProvider
 from app.domain.task_policy import TaskPolicy
 
 logger = logging.getLogger(__name__)
@@ -151,6 +152,7 @@ class TaskService:
         attachment_max_bytes: int = _DEFAULT_ATTACHMENT_MAX_BYTES,
         attachment_task_max_bytes: int = _DEFAULT_ATTACHMENT_TASK_MAX_BYTES,
         lifecycle_writer: Callable[[str, str, dict[str, Any] | None], Awaitable[Any]] | None = None,
+        task_config_provider: TaskConfigProvider | None = None,
     ):
         self.registry = registry
         self.policy = policy
@@ -162,6 +164,27 @@ class TaskService:
         self.attachment_max_bytes = attachment_max_bytes
         self.attachment_task_max_bytes = attachment_task_max_bytes
         self._run_service: Any = None
+        self._task_config_provider = task_config_provider
+
+    async def _snapshot(self) -> TaskConfig:
+        if self._task_config_provider is not None:
+            return await self._task_config_provider.current()
+        return TaskConfig(
+            task_attachment_max_bytes=self.attachment_max_bytes,
+            task_attachment_task_max_bytes=self.attachment_task_max_bytes,
+            task_failure_limit=3,
+            note_max_codepoints=_NOTE_MAX_CODEPOINTS,
+        )
+
+    @property
+    def note_max_codepoints(self) -> int:
+        """Synchronous fallback for the note limit (env constant).
+
+        Routes call _normalize_note which uses the resolved config snapshot
+        when a provider is set; this property is the legacy/env default used
+        only when no provider is configured.
+        """
+        return _NOTE_MAX_CODEPOINTS
 
     async def _write_lifecycle(
         self, task: Task, content: str, card: dict[str, Any] | None = None,
@@ -203,10 +226,16 @@ class TaskService:
         workspace_path: str | None = None,
         model_override: str | None = None,
         max_runtime_seconds: int | None = None,
-        max_retries: int = 0,
+        max_retries: int | None = None,
         goal_mode: bool = False,
         goal_max_turns: int | None = None,
     ) -> Task:
+        # max_retries None means "caller did not specify"; resolve to the
+        # configured task_failure_limit default. Explicit 0 (or any int) is
+        # honored as the caller's intent (avoids the int=0 default-arg trap).
+        if max_retries is None:
+            cfg = await self._snapshot()
+            max_retries = cfg.task_failure_limit
         if not title or not title.strip():
             raise TaskValidationError("title must not be empty")
         if board != "default":
@@ -543,7 +572,7 @@ class TaskService:
         result["title"] = task.title
         return result
 
-    def _normalize_note(self, *, required: bool, note: str | None) -> str | None:
+    def _normalize_note(self, *, required: bool, note: str | None, note_max_codepoints: int = _NOTE_MAX_CODEPOINTS) -> str | None:
         """Normalize an approval note (service-level, no Registry access).
 
         - Non-string (and non-None) -> TaskValidationError
@@ -551,7 +580,10 @@ class TaskService:
           - required=True (revise) -> TaskValidationError
           - required=False (approve/reject) -> None (normalized)
         - Otherwise -> stripped note
-        - > _NOTE_MAX_CODEPOINTS code points (after trim) -> TaskValidationError
+        - > note_max_codepoints code points (after trim) -> TaskValidationError
+
+        ``note_max_codepoints`` defaults to the env constant; callers that
+        have a resolved config snapshot pass it so the limit is hot-reloadable.
         """
         if note is None:
             if required:
@@ -564,9 +596,9 @@ class TaskService:
             if required:
                 raise TaskValidationError("note must not be empty")
             return None
-        if len(trimmed) > _NOTE_MAX_CODEPOINTS:
+        if len(trimmed) > note_max_codepoints:
             raise TaskValidationError(
-                f"note too long (>{_NOTE_MAX_CODEPOINTS} code points)"
+                f"note too long (>{note_max_codepoints} code points)"
             )
         return trimmed
 
@@ -599,7 +631,12 @@ class TaskService:
         # 1. Service-level validation (no Registry access)
         if not isinstance(task_id, str) or not task_id.strip():
             raise TaskValidationError("task_id must not be empty")
-        normalized_note = self._normalize_note(required=required, note=note)
+        # Resolve note_max_codepoints from the configured provider (hot-reload);
+        # falls back to the env constant when no provider is set.
+        cfg = await self._snapshot()
+        normalized_note = self._normalize_note(
+            required=required, note=note, note_max_codepoints=cfg.note_max_codepoints,
+        )
 
         # 2. Read Task for expected_version + status check
         task = await self.get_task(task_id)
@@ -783,17 +820,19 @@ class TaskService:
     ) -> TaskAttachment:
         await self.get_task(task_id)
         self._validate_attachment_filename(filename)
+        # Single config snapshot per upload (hot-reload).
+        cfg = await self._snapshot()
         size = len(content)
-        if size > self.attachment_max_bytes:
+        if size > cfg.task_attachment_max_bytes:
             raise TaskValidationError(
-                f"attachment too large: {size} > {self.attachment_max_bytes}"
+                f"attachment too large: {size} > {cfg.task_attachment_max_bytes}"
             )
         # Check total task attachment size
         existing = await self.registry.list_attachments(task_id)
         total = sum(a.size for a in existing) + size
-        if total > self.attachment_task_max_bytes:
+        if total > cfg.task_attachment_task_max_bytes:
             raise TaskValidationError(
-                f"task attachment total too large: {total} > {self.attachment_task_max_bytes}"
+                f"task attachment total too large: {total} > {cfg.task_attachment_task_max_bytes}"
             )
         if self.attachments_root is None:
             raise TaskStateError("attachments_root not configured")

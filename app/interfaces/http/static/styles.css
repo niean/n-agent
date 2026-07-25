@@ -316,6 +316,8 @@ body.modal-open { overflow: hidden; }
 .providers-form label { display: flex; flex-direction: column; gap: 4px; color: var(--color-fg-muted); font-size: 12px; }
 .providers-form input, .providers-form select { padding: 8px 10px; color: var(--color-fg-default); background: var(--color-bg-default); border: 1px solid var(--color-border-default); border-radius: 6px; font-size: 13px; }
 .providers-form__actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+/* 任务安全编辑 modal：表单项之间 5px 间隔。 */
+.providers-form__body { display: flex; flex-direction: column; gap: 5px; }
 .providers-form__hint { font-size: 12px; }
 .row-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .row-actions-cell { white-space: normal; }
@@ -775,6 +777,9 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .policy-item { display: flex; gap: 6px; font-size: var(--font-size-md); line-height: 1.6; }
 .policy-k { color: var(--color-fg-subtle); white-space: nowrap; }
 .policy-v { color: var(--color-fg-default); word-break: break-word; }
+/* A/B class (read-only) config values use the same gray as the key to
+   distinguish from C-class (editable) values. */
+.policy-v--muted { color: var(--color-fg-subtle); }
 
 /* Health dependency sectors (mirrors policy-* layout) */
 .health-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px; padding-bottom: 10px; border-bottom: 1px solid var(--color-border-light); }

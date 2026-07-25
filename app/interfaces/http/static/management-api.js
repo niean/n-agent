@@ -312,6 +312,10 @@
       terminateRun: (runId) => fetchJson('/chat/tasks/runs/' + encodeURIComponent(runId) + '/terminate', { method: 'POST' }),
       listAttachments: (id) => fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/attachments'),
       security: () => fetchJson('/chat/tasks/security'),
+      securityConfig: {
+        get: () => fetchJson('/chat/tasks/security/config'),
+        update: (payload) => fetchJson('/chat/tasks/security/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload || {}) }),
+      },
     },
   };
 }(window));

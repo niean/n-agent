@@ -190,6 +190,8 @@ class Settings(BaseSettings):
     task_failure_limit: int = Field(default=3, ge=1)  # 映射 Task.max_retries 默认
     task_max_concurrency: int = Field(default=4, ge=1)
     task_shutdown_grace_seconds: int = Field(default=30, gt=0)
+    # 审批 note 上限（C 类可配，env N_AGENT_TASK_NOTE_MAX_CODEPOINTS）
+    task_note_max_codepoints: int = Field(default=2000, ge=1)
     # 规划与附件上限（下游 T13/T16/T19 依赖）
     task_planning_max_children: int = Field(default=20, ge=1)
     task_goal_max_turns: int = Field(default=10, ge=1)
