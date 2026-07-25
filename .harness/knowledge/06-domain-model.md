@@ -540,6 +540,10 @@ Skill 自进化是 Agent Runtime 对会话摘要的后台审查，把可复用�
   -> 下轮 Context 的 System Prompt 注入 skills index；LLM 再通过 skills_list / skill_view 加载具体 Skill
 ```
 
+## 安全策略
+
+- 本地Shell：
+- X
 
 ---
 ---
@@ -548,6 +552,138 @@ Skill 自进化是 Agent Runtime 对会话摘要的后台审查，把可复用�
 
 <details markdown="1">
 <summary>待整理</summary>
+
+## 资源隔离
+
+```mermaid
+%% align: left
+erDiagram
+    TENANT {
+        uuid id PK
+        string name
+        string status
+        datetime created_at
+    }
+
+    TENANT_MEMBER {
+        uuid id PK
+        uuid tenant_id FK
+        string principal_id
+        string role
+        string status
+    }
+
+    PROJECT {
+        uuid id PK
+        uuid tenant_id FK
+        string name
+        text master_instruction
+        string visibility
+        int config_version
+        datetime created_at
+        datetime updated_at
+    }
+
+    PROJECT_MEMBER {
+        uuid project_id PK,FK
+        uuid tenant_member_id PK,FK
+        string role
+    }
+
+    RESOURCE {
+        uuid id PK
+        uuid tenant_id FK
+        uuid owner_project_id FK "NULL表示Tenant级资源"
+        string resource_type
+        string name
+        string source
+        string version
+        boolean enabled
+        datetime created_at
+        datetime updated_at
+    }
+
+    PROJECT_RESOURCE {
+        uuid project_id PK,FK
+        uuid resource_id PK,FK
+        string bound_version
+        boolean enabled
+        boolean locked
+        json config_override
+        datetime created_at
+    }
+
+    RESOURCE_CREDENTIAL {
+        uuid id PK
+        uuid tenant_id FK
+        uuid resource_id FK
+        uuid tenant_member_id FK "NULL表示Tenant共享凭证"
+        string credential_type
+        string encrypted_secret_ref
+        datetime expires_at
+    }
+
+    LLM_PROVIDER {
+        uuid resource_id PK,FK
+        string provider_type
+        string base_url
+        string default_model
+        json model_options
+    }
+
+    KNOWLEDGE_BASE {
+        uuid resource_id PK,FK
+        string backend_type
+        string endpoint
+        string dataset_id
+        json retrieval_config
+    }
+
+    MCP_SITE {
+        uuid resource_id PK,FK
+        string transport_type
+        string endpoint
+        string command
+        json connection_config
+    }
+
+    PLUGIN {
+        uuid resource_id PK,FK
+        string plugin_key
+        string plugin_version
+        string plugin_kind
+        json manifest
+    }
+
+    SKILL {
+        uuid resource_id PK,FK
+        string skill_key
+        string skill_version
+        string relative_path
+        json frontmatter
+    }
+
+    TENANT ||--o{ TENANT_MEMBER : contains
+    TENANT ||--o{ PROJECT : owns
+    TENANT ||--o{ RESOURCE : owns
+
+    PROJECT ||--o{ PROJECT_MEMBER : authorizes
+    TENANT_MEMBER ||--o{ PROJECT_MEMBER : joins
+
+    PROJECT o|--o{ RESOURCE : owns_project_private
+    PROJECT ||--o{ PROJECT_RESOURCE : configures
+    RESOURCE ||--o{ PROJECT_RESOURCE : bound_into
+
+    RESOURCE ||--o{ RESOURCE_CREDENTIAL : authenticates_with
+    TENANT_MEMBER o|--o{ RESOURCE_CREDENTIAL : supplies_personal
+
+    RESOURCE ||--o| LLM_PROVIDER : subtype
+    RESOURCE ||--o| KNOWLEDGE_BASE : subtype
+    RESOURCE ||--o| MCP_SITE : subtype
+    RESOURCE ||--o| PLUGIN : subtype
+    RESOURCE ||--o| SKILL : subtype
+```
+
 
 ## 分层边界
 

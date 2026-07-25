@@ -277,9 +277,10 @@ ok(state.currentSubdomain === null, 'A4 currentSubdomain (got ' + state.currentS
 // T2 Assertion 5: precise topnav item matching, no indexOf fallback
 // ===========================================================================
 const tasksItems = nav.topnavConfig.tasks;
-ok(tasksItems && tasksItems.length === 2, 'A5 topnavConfig.tasks has 2 items');
+ok(tasksItems && tasksItems.length === 3, 'A5 topnavConfig.tasks has 3 items');
 ok(nav.activeTopnavItem(tasksItems, 'tasks') !== null, 'A5 matches tasks');
 ok(nav.activeTopnavItem(tasksItems, 'tasks-observations') !== null, 'A5 matches tasks-observations');
+ok(nav.activeTopnavItem(tasksItems, 'tasks-security') !== null, 'A5 matches tasks-security');
 ok(nav.activeTopnavItem(tasksItems, 'tools-operation') === null, 'A5 no fuzzy match for tools-operation');
 ok(nav.activeTopnavItem(tasksItems, 'tools') === null, 'A5 no match for tools');
 ok(nav.activeTopnavItem(tasksItems, 'summary') === null, 'A5 no match for summary');

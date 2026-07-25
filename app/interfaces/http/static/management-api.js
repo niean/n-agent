@@ -311,6 +311,7 @@
       runs: (runId) => fetchJson('/chat/tasks/runs/' + encodeURIComponent(runId)),
       terminateRun: (runId) => fetchJson('/chat/tasks/runs/' + encodeURIComponent(runId) + '/terminate', { method: 'POST' }),
       listAttachments: (id) => fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/attachments'),
+      security: () => fetchJson('/chat/tasks/security'),
     },
   };
 }(window));

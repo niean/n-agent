@@ -138,6 +138,7 @@ def test_static_assets_served(tmp_path):
         "/static/external-memory.js",
         "/static/topnav.js",
         "/static/tasks-observations.js",
+        "/static/tasks-security.js",
         "/static/favicon.svg",
     )
     for path in paths:
@@ -796,6 +797,7 @@ def test_index_html_links_assets(tmp_path):
         '/static/external-memory.js',
         '/static/topnav.js',
         '/static/tasks-observations.js',
+        '/static/tasks-security.js',
         '/static/favicon.svg',
     )
     for asset in assets:
@@ -926,6 +928,45 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     assert 'tasksObservations' in to_body, "tasks-observations.js must expose tasksObservations namespace"
     assert 'init' in to_body and 'refresh' in to_body
     assert 'innerHTML' not in to_body
+
+
+def test_tasks_security_static_assets_and_wiring(tmp_path):
+    """T7: tasks-security.js 资产可达、容器唯一、脚本顺序、源码安全。"""
+    client = _client(tmp_path)
+    # Asset served.
+    res = client.get('/static/tasks-security.js')
+    assert res.status_code == 200, "tasks-security.js not served"
+    ts_body = res.text
+    sec_body = client.get('/static/security.js').text
+    html = client.get('/chat').text
+
+    # Container present exactly once.
+    assert html.count('id="tab-tasks-security"') == 1, "tab-tasks-security must appear once"
+
+    # Script order: security.js -> tasks-security.js -> app.js (renderers ready
+    # before the page module, page module before app boot).
+    assert html.index('/static/security.js') < html.index('/static/tasks-security.js'), \
+        "security.js must load before tasks-security.js"
+    assert html.index('/static/tasks-security.js') < html.index('/static/app.js'), \
+        "tasks-security.js must load before app.js"
+
+    # Module exposes the lifecycle surface.
+    assert 'tasksSecurity' in ts_body, "tasks-security.js must expose tasksSecurity namespace"
+    assert 'init' in ts_body and 'refresh' in ts_body and 'deactivate' in ts_body
+
+    # Source safety: no unsafe DOM sinks (assignment/call), textContent present.
+    for body in (ts_body, sec_body):
+        assert 'innerHTML =' not in body, "innerHTML assignment forbidden"
+        assert '.insertAdjacentHTML(' not in body, "insertAdjacentHTML forbidden"
+        assert 'textContent' in body, "textContent must be used for safe rendering"
+    node = shutil.which('node')
+    if node is not None:
+        for js_file in ('tasks-security.js', 'security.js'):
+            result = subprocess.run(
+                [node, '--check', str(STATIC_DIR / js_file)],
+                capture_output=True, text=True, check=False,
+            )
+            assert result.returncode == 0, f"{js_file} node --check failed: {result.stderr}"
 
 
 def test_management_ui_exports_el_helper(tmp_path):

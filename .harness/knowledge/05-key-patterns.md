@@ -979,7 +979,7 @@ Dashboard Chat 的 `ui.task_lifecycle` 系统消息在 waiting_approval/failed/e
 Dashboard 在左导不变的前提下新增可选顶导菜单组件，按子域展示横向关注点（如任务子域：管理/观测），支持同一 renderer 多路径与左导/顶导双路由入口。顶导样式参考 odin-fe（50px 高、选中主色+加粗无下划线、溢出平移+箭头）。
 
 配置与路由分离规则：
-- `topnavConfig`（`management-navigation.js`）按子域（tab key）配置顶导 items，每项含 `tab`/`path`/`label`/`concern`/`scope`/`topnavParent`；当前仅 tasks 子域配置了 管理/观测 两个 item。`topnavConfig` 是可选配置，未配置的子域不渲染顶导、恢复标题展示。
+- `topnavConfig`（`management-navigation.js`）按子域（tab key）配置顶导 items，每项含 `tab`/`path`/`label`/`concern`/`scope`/`topnavParent`；当前 tasks 子域配置了 管理/观测/安全 三个 item（`安全` -> `/tasks/security`，单路径无别名）。`topnavConfig` 是可选配置，未配置的子域不渲染顶导、恢复标题展示。
 - `routeConfig` 是独立于 `tabConfig` 的路由表，支持多路径映射到同一 renderer（`paths: ['/tasks/observations', '/observations/tasks']` -> `renderTab: 'tasks-observations'`）；`buildRouteByPath` 在模块加载时校验 required 字段（tab/renderTab/sidebarTab/topnavParent/scope）、paths 非空数组、path 以 `/` 开头、无重复 path，校验失败 throw Error。
 - `sidebarOverride` 允许路由级覆盖 sidebarTab（如 `/observations/tasks` 路由的 sidebarTab 覆盖为 `observations-sessions`，使左导"会话"项高亮而非"任务"项），实现左导不变前提下双入口的侧栏高亮对齐。
 - `resolveRoute(pathname)` 优先查 `routeByPath` 精确匹配（命中返回 route state 含 activeTab/renderTab/sidebarTab/currentSubdomain），未命中回退 `tabByPath`/`selectedTabFromPath` 既有路径。`applyRoute(state)` 统一应用：切换 tab active class、sidebar active class、topbar title、调 `onTabActivated(state)`。
@@ -1003,7 +1003,13 @@ Dashboard 在左导不变的前提下新增可选顶导菜单组件，按子域�
 - `tasks-observations.js` 与 `observations.js` 均用 `renderToken`（monotonic counter）+ `isActive()` 双重 guard：late response 的 token != current 时丢弃，tab 失去 active class 时丢弃；`inflight` Promise 去重防并发重复请求（force=true 时 supersede 旧 inflight）。
 
 shell 路由注册规则（`dashboard.py`）：
-- 字面路由 `/tasks/observations`、`/observations/tasks` 用堆叠装饰器置于 `/tasks/{task_id}` catch-all 下方（自下而上注册，字面路由先于 catch-all 命中），均返回 index.html 外壳由前端按 pathname 选 tab。
+- 字面路由 `/tasks/observations`、`/observations/tasks`、`/tasks/security` 用堆叠装饰器置于 `/tasks/{task_id}` catch-all 下方（自下而上注册，字面路由先于 catch-all 命中），均返回 index.html 外壳由前端按 pathname 选 tab。
+- API 路由 `/chat/tasks/security` 必须在 `register_task_routes`（注册 `/chat/tasks/{task_id}`）之前注册，否则被 catch-all 吞噬。
+
+共享 renderer 复用规则（`security.js` -> `tasks-security.js`）：
+- 子域页复用全局页渲染器：`security.js` 暴露 `namespace.security.renderers = {overview,sector,meta,cfg,policyItem,statCard,formatValue}`（shortened key，对标 `namespace.observations.renderers` 供 `tasks-observations.js` 复用的既定模式），`tasks-security.js` 经 `const R = (namespace.security && namespace.security.renderers) || {}` 取用。
+- renderer 必须是纯 DOM 构造函数（取参数、不读子域页闭包 state）；通过向后兼容可选参数（`overview(data,options)`/`sector(policy,options)`）扩展子域页专用展示（如 `countLabel:'Sector 数量'`、`showSourceFiles:true`），全局页单参数默认调用行为不变。
+- renderer 暴露必须在 `{init,refresh}` 赋值之后挂载（`global.NAGENT.security = {init,refresh}; global.NAGENT.security.renderers = {...}`），避免对象字面量赋值覆盖 renderers。
 
 陷阱：
 - `topnavConfig` 与 `tabConfig` 混淆会让顶导依赖左导的父子结构，破坏"左导不变"约束；`routeConfig` 与 `tabByPath` 混淆会让多路径同 renderer 无法表达（tabByPath 是 1:1 映射）。正确做法：topnavConfig/routeConfig 是独立配置，tabConfig/tabByPath/pathByTab/parentByChild 不改。

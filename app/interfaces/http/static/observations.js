@@ -182,7 +182,7 @@
     const panel = ui.el('section', 'status-panel');
     const header = ui.el('div', 'panel-header');
     const title = ui.el('span');
-    title.textContent = '整体总览';
+    title.textContent = '整体概览';
     header.appendChild(title);
     panel.appendChild(header);
 

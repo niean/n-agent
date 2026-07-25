@@ -111,6 +111,7 @@ def create_dashboard_router(
     skill_pending_store=None,
     skill_usage_store=None,
     image_store=None,
+    task_security_dashboard_service=None,
     task_service=None,
     task_run_service=None,
 ) -> APIRouter:
@@ -142,6 +143,7 @@ def create_dashboard_router(
     @router.get("/tasks/{task_id}", response_class=HTMLResponse)
     # 堆叠装饰器自下而上注册：字面路由须在 catch-all 之下，方能先于其命中
     @router.get("/tasks/observations", response_class=HTMLResponse)
+    @router.get("/tasks/security", response_class=HTMLResponse)
     @router.get("/observations/tasks", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
     @router.get("/security", response_class=HTMLResponse)
@@ -354,6 +356,11 @@ def create_dashboard_router(
     if plugin_service is not None:
         from app.interfaces.http.plugin_routes import register_plugin_routes
         register_plugin_routes(router, plugin_service)
+    if task_security_dashboard_service is not None:
+        from app.interfaces.http.task_security_routes import register_task_security_routes
+        # MUST register before register_task_routes so /chat/tasks/security is
+        # not captured by the /chat/tasks/{task_id} catch-all.
+        register_task_security_routes(router, task_security_dashboard_service)
     if task_service is not None:
         from app.interfaces.http.task_routes import register_task_routes
         register_task_routes(router, task_service, task_run_service)

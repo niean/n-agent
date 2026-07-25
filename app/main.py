@@ -34,6 +34,7 @@ from app.application.policy_snapshot import (
 )
 from app.application.policy_audit_service import PolicyAuditService
 from app.application.policy_dashboard_service import PolicyDashboardService
+from app.application.task_security_dashboard_service import TaskSecurityDashboardService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
 from app.application.schedule_run_service import ScheduleRunService
@@ -307,6 +308,7 @@ class ApplicationServices:
     platform_service: PlatformService
     health_snapshot: Callable[[], dict]
     policy_dashboard_service: PolicyDashboardService
+    task_security_dashboard_service: TaskSecurityDashboardService
     image_store: LocalImageStore
     usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
@@ -1408,6 +1410,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         platform_service=platform_service,
         health_snapshot=health_snapshot,
         policy_dashboard_service=PolicyDashboardService(SettingsPolicyProfileProvider(settings)),
+        task_security_dashboard_service=TaskSecurityDashboardService(settings),
         image_store=image_store,
         usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
@@ -1593,6 +1596,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             skill_pending_store=services.skill_pending_store,
             skill_usage_store=services.skill_usage_store,
             image_store=services.image_store,
+            task_security_dashboard_service=services.task_security_dashboard_service,
             task_service=services.task_service,
             task_run_service=services.task_run_service,
         )

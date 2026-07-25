@@ -10,6 +10,7 @@
     'scheduled-tasks': false,
     tasks: false,
     'tasks-observations': false,
+    'tasks-security': false,
     platforms: false,
     memory: false,
     sandbox: false,
@@ -31,6 +32,7 @@
     if (namespace[tab]) return namespace[tab];
     if (tab === 'tasks') return namespace.tasks;
     if (tab === 'tasks-observations') return namespace.tasksObservations;
+    if (tab === 'tasks-security') return namespace.tasksSecurity;
     if (tab === 'tools-builtin' || tab === 'tools-mcp') return namespace.tools;
     if (tab === 'tools-skill') return namespace.skills;
     if (tab === 'tools-knowledge') return namespace.knowledge;

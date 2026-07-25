@@ -35,10 +35,12 @@
     tasks: [
       { tab: 'tasks', path: '/tasks', label: '管理', concern: 'management', scope: 'tasks', topnavParent: 'tasks' },
       { tab: 'tasks-observations', path: '/tasks/observations', label: '观测', concern: 'observation', scope: 'tasks', topnavParent: 'tasks' },
+      { tab: 'tasks-security', path: '/tasks/security', label: '安全', concern: 'security', scope: 'tasks', topnavParent: 'tasks' },
     ],
   };
   const routeConfig = [
     { paths: ['/tasks/observations', '/observations/tasks'], tab: 'tasks-observations', renderTab: 'tasks-observations', sidebarTab: 'tasks', topnavParent: 'tasks', scope: 'tasks' },
+    { paths: ['/tasks/security'], tab: 'tasks-security', renderTab: 'tasks-security', sidebarTab: 'tasks', topnavParent: 'tasks', scope: 'tasks' },
   ];
   const sidebarOverride = { '/observations/tasks': 'observations-sessions' };
 

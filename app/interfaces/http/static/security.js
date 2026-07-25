@@ -93,11 +93,20 @@
 
   function render(root) {
     clear(root);
-    root.appendChild(renderOverview(state.data));
-    state.data.policies.forEach((p) => root.appendChild(renderSector(p)));
+    root.appendChild(overview(state.data));
+    state.data.policies.forEach((p) => root.appendChild(sector(p)));
   }
 
-  function renderOverview(data) {
+  // Shared renderers exposed as namespace.security.renderers for reuse by
+  // tasks-security.js. All are pure DOM constructors taking params + an
+  // optional options object; they never read tasks-security closure state.
+  // overview(data, options): options.countLabel overrides the count card label
+  //   (default 'Policy 数量').
+  // sector(policy, options) / meta(policy, options): options.showSourceFiles
+  //   === true plus policy.source_files array appends a source-files item;
+  //   options.sourceLabel overrides its label (default '来源文件').
+  function overview(data, options) {
+    const countLabel = (options && options.countLabel) || 'Policy 数量';
     const panel = document.createElement('section');
     panel.className = 'status-panel';
     const head = document.createElement('div');
@@ -109,7 +118,7 @@
     const bar = document.createElement('div');
     bar.className = 'stats-bar';
     bar.appendChild(statCard(data.profile_version || '', 'Profile 版本'));
-    bar.appendChild(statCard(String(data.policies.length), 'Policy 数量'));
+    bar.appendChild(statCard(String(data.policies.length), countLabel));
     body.appendChild(bar);
     panel.appendChild(body);
     return panel;
@@ -128,7 +137,7 @@
     return card;
   }
 
-  function renderSector(p) {
+  function sector(p, options) {
     const panel = document.createElement('section');
     panel.className = 'status-panel';
     const head = document.createElement('div');
@@ -137,21 +146,25 @@
     panel.appendChild(head);
     const body = document.createElement('div');
     body.className = 'panel-body';
-    body.appendChild(renderMeta(p));
-    body.appendChild(renderCfg(p.config));
+    body.appendChild(meta(p, options));
+    body.appendChild(cfg(p.config));
     panel.appendChild(body);
     return panel;
   }
 
-  function renderMeta(p) {
+  function meta(p, options) {
     const grid = document.createElement('div');
     grid.className = 'policy-meta';
     grid.appendChild(policyItem('治理维度', p.dimension));
     grid.appendChild(policyItem('执行点', p.execution_point));
+    if (options && options.showSourceFiles === true && Array.isArray(p.source_files) && p.source_files.length) {
+      const sourceLabel = (options && options.sourceLabel) || '来源文件';
+      grid.appendChild(policyItem(sourceLabel, p.source_files.join(', ')));
+    }
     return grid;
   }
 
-  function renderCfg(config) {
+  function cfg(config) {
     const grid = document.createElement('div');
     grid.className = 'policy-cfg';
     config.forEach((c) => grid.appendChild(policyItem(c.label, formatValue(c.value))));
@@ -202,4 +215,16 @@
 
   global.NAGENT = namespace;
   global.NAGENT.security = { init, refresh };
+  // Expose shared renderers AFTER the {init, refresh} assignment so the object
+  // already exists; setting .renderers does not overwrite init/refresh.
+  // Shortened keys mirror namespace.observations.renderers convention.
+  global.NAGENT.security.renderers = {
+    overview: overview,
+    sector: sector,
+    meta: meta,
+    cfg: cfg,
+    policyItem: policyItem,
+    statCard: statCard,
+    formatValue: formatValue,
+  };
 }(window));
