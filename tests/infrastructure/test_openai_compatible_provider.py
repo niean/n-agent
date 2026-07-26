@@ -97,6 +97,40 @@ async def test_provider_strips_internal_runtime_options():
 
 
 @pytest.mark.asyncio
+async def test_provider_strips_policy_snapshot_and_internal_control_keys():
+    # Regression: _policy_snapshot / force_compress / max_iterations are
+    # internal run-control keys, not LLM generation params. The OpenAI SDK's
+    # AsyncCompletions.create() rejects unknown kwargs (TypeError: unexpected
+    # keyword argument '_policy_snapshot'), which broke scheduled tasks whose
+    # ChatCompletionService builds a RunPolicySnapshot into options. These keys
+    # must be stripped before the SDK call, while real generation params
+    # (temperature) still pass through.
+    client = FakeClient()
+    provider = OpenAICompatibleProvider("http://test", "key", "default", client=client)
+
+    await provider.chat(
+        [],
+        [],
+        False,
+        "model-a",
+        {
+            "temperature": 0.3,
+            "_policy_snapshot": object(),  # RunPolicySnapshot sentinel
+            "force_compress": True,
+            "max_iterations": 20,
+            "tool_execution_context": ToolExecutionContext(),
+        },
+    )
+
+    kwargs = client.completions.kwargs
+    assert kwargs["temperature"] == 0.3
+    assert "_policy_snapshot" not in kwargs
+    assert "force_compress" not in kwargs
+    assert "max_iterations" not in kwargs
+    assert "tool_execution_context" not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_provider_streaming_chat_returns_llm_events():
     provider = OpenAICompatibleProvider("http://test", "key", "default", client=FakeClient())
 

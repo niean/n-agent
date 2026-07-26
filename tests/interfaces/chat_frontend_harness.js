@@ -914,26 +914,34 @@ async function runIntegration() {
 })();
 
 // ===========================================================================
-// shouldRenderMessage: 进程来源（task/schedule/curator）的 assistant 推理消息属
-// worker 内部思考过程，不在 Dashboard 对话框展示（与 judge 推理不落库同理）；
-// worker 推理虽落库供 goal_mode 续轮与上下文，但对用户不可见。realtime
-// （api/dashboard/无 source）assistant 正常渲染；进程来源 user/tool 消息不受影响。
-// Regression: worker CoT "The task requires querying weather..." 泄露为普通气泡。
+// shouldRenderMessage: task/curator 进程来源的 assistant 推理属 worker 内部
+// 思考过程，不在 Dashboard 对话框展示（task 经 ui.task_lifecycle 卡片对外，
+// curator 为内部维护）；realtime（api/dashboard/无 source）assistant 正常渲染；
+// 进程来源 user/tool 消息不受影响。Regression: worker CoT "The task requires
+// querying weather..." 泄露为普通气泡。
+// schedule 例外：其 assistant 消息是定时任务投递记录（无独立 ui.task_result
+// 卡片机制），必须在 Dashboard 对话框可见；空内容（仅 tool_calls 的中间步）仍
+// 由 hasVisibleContent 隐藏。Regression: 定时任务投递记录被误隐藏。
 // ===========================================================================
 (function testProcessAssistantReasoningHidden() {
   const env = loadChat();
   const shouldRenderMessage = env.chat.shouldRenderMessage;
   ok(typeof shouldRenderMessage === 'function', 'shouldRenderMessage exposed');
 
-  // 进程来源 assistant 推理 -> 隐藏（worker 思考过程不进对话框）
+  // task/curator 进程来源 assistant 推理 -> 隐藏（worker 思考过程不进对话框）
   ok(shouldRenderMessage({ role: 'assistant', source: 'task', content: 'The task requires querying weather...' }) === false,
     'task-sourced assistant reasoning hidden');
-  ok(shouldRenderMessage({ role: 'assistant', source: 'schedule', content: 'run prompt reasoning' }) === false,
-    'schedule-sourced assistant reasoning hidden');
   ok(shouldRenderMessage({ role: 'assistant', source: 'curator', content: 'consolidation reasoning' }) === false,
     'curator-sourced assistant reasoning hidden');
   ok(shouldRenderMessage({ role: 'assistant', source: 'task', content: '' }) === false,
     'task-sourced assistant with empty content hidden by source');
+
+  // schedule 进程来源 assistant 消息是投递记录 -> 可见（非空内容）
+  ok(shouldRenderMessage({ role: 'assistant', source: 'schedule', content: '定点报时：\n- UTC+8：2026-07-26 18:46:06' }) === true,
+    'schedule-sourced assistant delivery record rendered');
+  // schedule 空内容（仅 tool_calls 中间步）仍隐藏
+  ok(shouldRenderMessage({ role: 'assistant', source: 'schedule', content: '' }) === false,
+    'schedule-sourced assistant with empty content hidden by hasVisibleContent');
 
   // realtime assistant（api/dashboard/无 source）-> 正常渲染
   ok(shouldRenderMessage({ role: 'assistant', source: 'api', content: 'reply' }) === true,

@@ -226,3 +226,23 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：Task 终态失败必须三态分离：(1) 取消=用户明确指令 only（/task cancel/按钮 -> TERMINATED -> CANCELLED），worker 不得触发；(2) worker 快速失败=worker 判定无法继续、确定性放弃（必需工具不可用/指令禁止兜底）-> 用独立 task_fail intent（写 fail_requested 事件 -> ABORTED -> FAILED 绕过断路器不重试）；(3) 系统失败=crash/timeout/spawn 非确定性 -> FAILED 走断路器（可重试）。worker 工具集不得含 task_cancel；worker 无法继续必须调 task_fail。worker 主动失败（ABORTED）必须绕过断路器直接 FAILED（区别于可重试的系统 FAILED），否则确定性失败被反复重试。terminal intent 检测（_read_latest_intent）必须覆盖 complete_requested/change_proposed/fail_requested 三种。相关：P020 无 intent 默认 COMPLETED、P018 状态机全栈同步、模式二十八。
 
 来源：fix 260720 task t_a742046a521d46eb worker 快速失败误用 task_cancel 致 run COMPLETED->SUCCEEDED（用户明确"取消只指用户指令，worker 快速失败不是取消"）
+
+### P023: LLM Provider 黑名单滞后致内部 key 透传 SDK，定时任务/unattended worker 整体失败
+
+现象：定时任务 sched-a406eae127164f3a970f63dbfab24c5d 执行报错 `AsyncCompletions.create() got an unexpected keyword argument '_policy_snapshot'`，任务无法完成。
+
+根因：`ChatCompletionService.complete` 在 `policy_snapshot_factory` 可用时把 `RunPolicySnapshot` 实例写入 `options["_policy_snapshot"]`（[chat_service.py:190-191]）。该 options 经 `AgentGraphRunner.run` -> `state.run_options` -> `call_llm` 透传到 `OpenAICompatibleProvider.chat`。OpenAI provider 用黑名单 `_INTERNAL_OPTION_KEYS` 过滤内部 key（`_provider_options`），但该集合**漏了 `_policy_snapshot`**（agent_graph 的同名集合有、注释明示"Mirrors the filter in OpenAICompatibleProvider"但镜像失同步），导致 `_policy_snapshot` 经 `**kwargs` 透传给 `client.chat.completions.create()`，SDK 以 unexpected keyword argument 拒绝。同类滞后还漏了 `force_compress`（会话式压缩时置入）与 `max_iterations`（TaskAgentExecutor 传 `options={"max_iterations":20}`）。Anthropic provider 因用白名单 `_ALLOWED_OPTION_KEYS` 天然屏蔽，不受影响，故仅 OpenAI 路径报错。根因跨 chat_service.py（写入内部 key）+ agent_graph.py（权威黑名单，仅用于 usage gen_params 计算，不阻断 provider 调用）+ openai_compatible.py（黑名单滞后）三文件、跨 Application/Infrastructure 分层。
+
+教训：`options` 字典同时承载 generation param 与内部控制 key，Provider 调 SDK 前必须剥离内部 key。`_INTERNAL_OPTION_KEYS` 有三处定义（agent_graph / openai_compatible / anthropic），agent_graph 集合是权威源，新增内部 key 时三处一并更新（Anthropic 白名单无需动）。治理结构脆弱点：agent_graph 的过滤只管 usage 记录、不阻断 provider 调用，故 agent_graph 有该 key 而 OpenAI provider 漏该 key 时不会在任何单测里暴露（除非专门断言 SDK kwargs）。修复=同步黑名单覆盖 `_policy_snapshot`/`force_compress`/`max_iterations`，并补 `test_provider_strips_policy_snapshot_and_internal_control_keys` 断言。长期改进：OpenAI provider 对齐 Anthropic 切白名单，根除黑名单滞后类问题。相关：模式三十三 options 过滤契约、模式五 LLM Adapter。
+
+来源：fix 260726 定时任务 sched-a406eae127164f3a970f63dbfab24c5d 报错 unexpected keyword argument '_policy_snapshot'
+
+### P024: Dashboard Chat 进程消息过滤范围过宽，误隐藏定时任务投递记录
+
+现象：用户在 Dashboard Chat 查看定时任务会话，看不到投递记录（定时任务执行后投递到飞书的内容）。DB 与 `/chat/scheduled-tasks/{id}/executions` API 均有 delivery_status=success 记录，schedule 会话内 assistant 消息（"定点报时：..."，source=schedule）也正常落库，但前端不渲染。
+
+根因：提交 5a43346（"任务: Chat交互支持自然语言-迭代"）为修复 task worker CoT 泄露（"The task requires querying weather..." 作为普通 assistant 气泡显示），在 `chat.js shouldRenderMessage` 增加过滤：`if (message.role === 'assistant' && PROCESS_SOURCES.has(message.source)) return false;`，PROCESS_SOURCES={task,schedule,curator}。该过滤把 schedule 的 assistant 消息一并隐藏，但 schedule 与 task/curator 语义不同：task 经 `ui.task_lifecycle`/`ui.task_result` 卡片对外（assistant 推理是内部 CoT，隐藏合理），curator 为内部维护，而 schedule 没有独立卡片机制--其 assistant 消息就是投递记录本身（`ScheduledAgentExecutor` 把 chat_service 的 assistant 输出作为 `result.output` 投递并落库）。根因跨 chat.js（前端过滤范围过宽）+ chat_service.py（`_PROCESS_MESSAGE_SOURCES` 标记 source=schedule）+ scheduled_agent_executor.py（assistant 输出即投递内容）。过滤按"来源类型"一刀切，未区分"有无独立对外卡片机制"。
+
+教训：Dashboard Chat 隐藏进程来源 assistant 消息时，必须区分"worker 内部 CoT（有独立卡片对外，隐藏）"与"投递记录本身（无独立卡片，必须可见）"。task/curator 隐藏，schedule 可见（空内容由 hasVisibleContent 兜底隐藏中间步）。修改 shouldRenderMessage 的来源过滤范围时，必须同步检查 schedule 的投递可见性--schedule 的 assistant 消息是定时任务对用户/飞书的唯一输出凭证。修复=过滤条件加 `&& message.source !== 'schedule'`，并更新 chat_frontend_harness 断言 schedule 投递记录可见。相关：模式十六 task/schedule/curator 来源、模式三十三（无直接关联，同属进程消息处理）。
+
+来源：fix 260726 Dashboard Chat 看不到定时任务投递记录（用户反馈）

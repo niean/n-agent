@@ -880,14 +880,16 @@
   function shouldRenderMessage(message) {
     if (message.is_summary) return true;
     if (message.role === 'tool') return true;
-    // 进程来源（task/schedule/curator）的 assistant 推理属 worker 内部思考过程，
-    // 不在 Dashboard 对话框展示：worker 在 origin Chat 会话执行（prd：任务会话
-    // 复用创建会话 ID），其推理虽落库供 goal_mode 续轮与 LLM 上下文，但对用户
-    // 不可见（与 judge 推理 persist_messages=False 不落库同理，worker 需历史故仅
-    // 前端隐藏）。worker 的工具调用结果仍按工具调试卡片独立渲染；realtime
+    // 进程来源（task/curator）的 assistant 推理属 worker 内部思考过程，不在
+    // Dashboard 对话框展示：worker 推理虽落库供 goal_mode 续轮与 LLM 上下文，
+    // 但对用户不可见（task 经 ui.task_lifecycle/ui.task_result 卡片对外，curator
+    // 为内部维护）。worker 的工具调用结果仍按工具调试卡片独立渲染；realtime
     // （api/dashboard/无 source）assistant 正常渲染。Regression: worker CoT
     // "The task requires querying weather..." 泄露为普通 assistant 气泡。
-    if (message.role === 'assistant' && PROCESS_SOURCES.has(message.source)) return false;
+    // schedule 例外：其 assistant 消息是定时任务投递记录（无独立 ui.task_result
+    // 卡片机制），必须在 Dashboard 对话框可见；空内容（仅 tool_calls 的中间步）
+    // 由下方 hasVisibleContent 兜底隐藏。Regression: 定时任务投递记录被误隐藏。
+    if (message.role === 'assistant' && PROCESS_SOURCES.has(message.source) && message.source !== 'schedule') return false;
     return hasVisibleContent(message.content);
   }
 

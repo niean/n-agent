@@ -14,6 +14,9 @@ _INTERNAL_OPTION_KEYS = {
     "execution_context_mode",
     "external_memory_enabled",
     "stream_event_sink",
+    "_policy_snapshot",
+    "force_compress",
+    "max_iterations",
     "persist_messages",
 }
 

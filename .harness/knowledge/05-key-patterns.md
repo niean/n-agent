@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -347,7 +347,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 IM 平台一级。GatewayService 通过 GatewaySessionKey.platform 分流：source=`cli` → (`cli`, `cli`)，真实 IM 平台 → (`{platform.value}`, `{platform.value}`)。
 - `schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
 - `curator` 是 Curator 周期维护 consolidation fork 的内部触发来源，独立成一级（前缀 `curator-`、source `curator`）。session_id 用 `curator-{uuid4()}`（与 `schedule-{uuid4()}` 同，不用时间戳，遵守本模式 UUID 通用规则）。`SkillCuratorService._run_consolidation` 经 `SkillEvolutionService.run_background_review(ingress_source="curator")` 注入 `gateway.source`，由 `ChatCompletionService` 派生为会话 source；缺失时 `_build_policy_snapshot` 会回落 `api`，导致来源与前缀脱节。
-- `task` 是 Task worker（Kanban/Manus Task）进程内执行的内部触发来源，独立成一级（前缀 `task-`、source `task`）。execution_session_id 用 `task-{uuid5(NAMESPACE_URL, task.id)}`：从 task.id 确定性派生完整 UUID（str 形式带连字符 8-4-4-4-12，与 `schedule-{uuid4()}`/`curator-{uuid4()}` 完全一致，禁止用 `.hex` 无连字符形式），使同一 task 跨 run/claim 稳定复用同一 execution session（无需持久化 execution_session_id；delete_session 置空后下次 claim 重新派生出同一 id 重建/复用）。禁止 `task-{task.id}`：task.id 形如 `t_{hex}`，带 `t_` 前缀且非完整 UUID，会产生 `task-t_...` 双前缀且后缀非 UUID，违反本模式。worker 执行会话由 `task_execution_session_id(task)`（`app/application/task_session.py`）统一选择：`task.execution_session_id`（显式存量/外部）-> `task.origin_session_id`（Dashboard `/task create` 捕获的 Chat 会话，使 worker 对话与生命周期回到创建任务的 Chat 框，对齐 Manus）-> `task-{uuid5(NAMESPACE_URL, task.id)}`（origin=None 的 kanban/CLI/feishu 回退）。execution_session_id 不持久化（DB NULL），delete_task 仅按持久化显式字段清理 -> 不删 origin Chat 会话。worker 在 origin Chat 会话执行时，其 assistant 推理消息（chain-of-thought）由 ChatCompletionService 经 `AgentState.message_source` 标记 source=task（命中 `_PROCESS_MESSAGE_SOURCES` 即置为 source、否则 None，session_source 已折叠 snapshot->IngressFacts->API 三级回落，故有无 policy_snapshot_factory 均生效），Dashboard `shouldRenderMessage` 据此跳过渲染进程来源（task/schedule/curator）的 assistant 消息，使 worker 内部推理不对用户可见（regression：worker CoT "The task requires querying weather..." 曾作为普通 assistant 气泡泄露到对话框）；与 judge 推理 `persist_messages=False` 不落库同理，但 worker 需跨轮历史故采用 source 标记 + 前端隐藏、推理仍落库供 goal_mode 续轮与 LLM 上下文（test_task_chat_merge 断言 worker assistant 保留进上下文），worker 工具调用结果仍按工具调试卡片独立渲染。realtime（api/dashboard）assistant 消息 source=None 正常渲染。
+- `task` 是 Task worker（Kanban/Manus Task）进程内执行的内部触发来源，独立成一级（前缀 `task-`、source `task`）。execution_session_id 用 `task-{uuid5(NAMESPACE_URL, task.id)}`：从 task.id 确定性派生完整 UUID（str 形式带连字符 8-4-4-4-12，与 `schedule-{uuid4()}`/`curator-{uuid4()}` 完全一致，禁止用 `.hex` 无连字符形式），使同一 task 跨 run/claim 稳定复用同一 execution session（无需持久化 execution_session_id；delete_session 置空后下次 claim 重新派生出同一 id 重建/复用）。禁止 `task-{task.id}`：task.id 形如 `t_{hex}`，带 `t_` 前缀且非完整 UUID，会产生 `task-t_...` 双前缀且后缀非 UUID，违反本模式。worker 执行会话由 `task_execution_session_id(task)`（`app/application/task_session.py`）统一选择：`task.execution_session_id`（显式存量/外部）-> `task.origin_session_id`（Dashboard `/task create` 捕获的 Chat 会话，使 worker 对话与生命周期回到创建任务的 Chat 框，对齐 Manus）-> `task-{uuid5(NAMESPACE_URL, task.id)}`（origin=None 的 kanban/CLI/feishu 回退）。execution_session_id 不持久化（DB NULL），delete_task 仅按持久化显式字段清理 -> 不删 origin Chat 会话。worker 在 origin Chat 会话执行时，其 assistant 推理消息（chain-of-thought）由 ChatCompletionService 经 `AgentState.message_source` 标记 source=task（命中 `_PROCESS_MESSAGE_SOURCES` 即置为 source、否则 None，session_source 已折叠 snapshot->IngressFacts->API 三级回落，故有无 policy_snapshot_factory 均生效），Dashboard `shouldRenderMessage` 据此跳过渲染进程来源（task/curator）的 assistant 消息，使 worker 内部推理不对用户可见（regression：worker CoT "The task requires querying weather..." 曾作为普通 assistant 气泡泄露到对话框）；schedule 例外--其 assistant 消息是定时任务投递记录（无独立 ui.task_result 卡片机制，投递内容即 assistant 输出），必须可见，空内容（仅 tool_calls 中间步）由 hasVisibleContent 兜底隐藏（regression：schedule 投递记录曾被误归入 worker CoT 一并隐藏）；与 judge 推理 `persist_messages=False` 不落库同理，但 worker 需跨轮历史故采用 source 标记 + 前端隐藏、推理仍落库供 goal_mode 续轮与 LLM 上下文（test_task_chat_merge 断言 worker assistant 保留进上下文），worker 工具调用结果仍按工具调试卡片独立渲染。realtime（api/dashboard）assistant 消息 source=None 正常渲染。
 - Dashboard 前端生成 session_id 用 `crypto.randomUUID()`（fallback `Date.now()+random`），不用 `Date.now()` 时间戳（碰撞风险）。
 
 历史数据迁移：
@@ -1017,3 +1017,25 @@ shell 路由注册规则（`dashboard.py`）：
 - 顶导组件直接 pushState 会让路由层失去统一控制（sidebarOverride/applyRoute 副作用丢失）；必须通过 onActivate 回调交由 `navigatePath`。
 - 字面路由 `/tasks/observations` 置于 `/tasks/{task_id}` 上方会被 catch-all 吞噬（FastAPI 按注册顺序匹配，堆叠装饰器自下而上注册，源码下方先注册）；必须置于 catch-all 下方。
 - `tasks-observations.js` 的 `api.listSessions()` 后客户端按 `source === 'task'` 过滤是前端语义，禁止把 scope 作为后端查询参数传递（后端 listSessions 不支持 scope 过滤，会忽略）。
+
+## 模式三十三：LLM Provider options 内部 key 过滤契约
+
+`ChatCompletionService.complete` 构造的 `options` 字典经 `AgentGraphRunner.run`（写入 `state.run_options`，再经 LangGraph `configurable.options`）透传到 `provider.chat(..., options)`。该字典同时承载两类 key：LLM generation param（`temperature`/`max_tokens`/`top_p` 等，必须送达 SDK）与内部控制 key（运行态控制信号，禁止送达 SDK）。Provider 必须在调 `client.chat.completions.create(**kwargs)` / `client.messages.create(**kwargs)` 前剥离内部 key，否则 SDK 以 `TypeError: unexpected keyword argument` 拒绝。
+
+内部控制 key 清单（`_INTERNAL_OPTION_KEYS`，三处定义必须一致）：
+- `tool_execution_context`（ToolExecutionContext，execute_tools 读）
+- `tool_exposure_policy`（`safe_only`/`default`，工具暴露闸）
+- `execution_context_mode`（`realtime`/`unattended`，派生 agent_context/exposure）
+- `external_memory_enabled`（已锁定记忆 provider 列表）
+- `stream_event_sink`（stream_events 注入的工具事件回调）
+- `_policy_snapshot`（`RunPolicySnapshot` 实例，budget/turn/llm policy 读取，不可序列化）
+- `force_compress`（会话式 `/compress` 触发强制压缩）
+- `max_iterations`（LangGraph recursion_limit 派生，非 generation param）
+- `persist_messages`（是否落库）
+
+规则：
+- 三处 `_INTERNAL_OPTION_KEYS` 必须同步：`app/application/agent_graph.py`（用于 `call_llm` 计算 `gen_params`，排除内部 key 后记入 usage）、`app/infrastructure/llm/openai_compatible.py`、`app/infrastructure/llm/anthropic_provider.py`。agent_graph 的集合是权威源，注释明示"Mirrors the filter in OpenAICompatibleProvider"；新增内部 key 时三处一并加。
+- 两种过滤策略并存：OpenAI provider 用黑名单（`_provider_options` 剔除 `_INTERNAL_OPTION_KEYS` 后其余透传），Anthropic provider 用白名单（`_ALLOWED_OPTION_KEYS = {"temperature","top_p","top_k","stop_sequences","cache_control","thinking","output_config"}`，仅命中才透传）。白名单天然屏蔽未知内部 key，故 Anthropic 路径不受黑名单滞后影响。
+- 新增内部 key 时优先评估是否能复用现有 key；确实新增的，必须同时更新 agent_graph 与 OpenAI provider 两处黑名单（Anthropic 白名单无需动），并补 `tests/infrastructure/test_openai_compatible_provider.py::test_provider_strips_internal_runtime_options` 断言。
+
+陷阱：在 `ChatCompletionService`/executor 往 `options` 塞新内部 key（如 `_policy_snapshot`）后，只更新 agent_graph 的 `_INTERNAL_OPTION_KEYS` 而漏更新 `openai_compatible.py` 的黑名单，该 key 会经 `**kwargs` 透传给 `AsyncCompletions.create()`，定时任务/unattended worker（必经 `policy_snapshot_factory` 路径）会以 `unexpected keyword argument '_policy_snapshot'` 整体失败。根因隐蔽在于 agent_graph 的过滤只管 usage 记录，不阻断 provider 调用。治理：黑名单滞后是结构脆弱点，新增内部 key 时以 agent_graph 集合为单一事实源同步两处 provider；长期可考虑 OpenAI provider 也切白名单对齐 Anthropic。相关：P023、模式五 LLM Adapter。
