@@ -526,7 +526,7 @@
       }
       if (DELETABLE_STATUSES.indexOf(detail.status) !== -1) {
         const deleteBtn = el('button', 'btn btn--danger');
-        deleteBtn.type = 'button'; deleteBtn.textContent = '删除';
+        deleteBtn.type = 'button'; deleteBtn.textContent = '删除任务';
         deleteBtn.addEventListener('click', () => { removeTask(id); });
         statusActions.appendChild(deleteBtn);
       }

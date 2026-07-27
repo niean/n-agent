@@ -916,3 +916,526 @@ def test_api_selector_cannot_select_dashboard_session(tmp_path):
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "api_session_scope_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# T3: Dashboard tool approval route tests
+# ---------------------------------------------------------------------------
+
+import asyncio
+import json as _json
+from contextlib import suppress
+
+import httpx
+import pytest
+from app.application.events import ChatEvent, ChatEventType
+from app.application.gateway_tool_approval_service import GatewayToolApprovalService
+from app.domain.tool import ApprovalRequest, RiskLevel
+from app.interfaces.http.dashboard_tool_approval import DashboardToolApprovalBridge
+
+
+class _ApprovalChatService:
+    """Fake ChatCompletionService that invokes the approval decider once.
+
+    When stream=True and an approval_decider is set, it spawns a background
+    task that calls the decider (which registers a pending on the bridge and
+    puts a TOOL_APPROVAL_REQUIRED event on the per-stream queue).  The stream
+    yields MESSAGE_START, the approval event, MESSAGE_DONE, DONE.  The
+    background task is cancelled in ``finally`` to simulate the real
+    AgentGraphRunner cleanup chain.
+    """
+
+    def __init__(self):
+        self.last_request = None
+
+    async def complete(self, request):
+        self.last_request = request
+        if not request.stream:
+            from app.application.chat_service import ChatCompletionResult
+            return ChatCompletionResult(
+                session_id=request.session_id or "",
+                model=request.model,
+                message={"role": "assistant", "content": ""},
+            )
+        return self._stream(request)
+
+    async def _stream(self, request):
+        queue = request.options.get("dashboard_approval_event_queue")
+        decider = request.approval_decider
+        task = None
+        try:
+            yield ChatEvent(ChatEventType.MESSAGE_START)
+            if decider is not None and queue is not None:
+                req = ApprovalRequest(
+                    session_id=request.session_id,
+                    tool_call_id="call-1",
+                    tool_name="browser_click",
+                    arguments={"selector": "#btn"},
+                    description="Click an element",
+                    risk_level=RiskLevel.CONFIRM,
+                )
+                task = asyncio.ensure_future(decider(req))
+                event = await asyncio.wait_for(queue.get(), timeout=2.0)
+                yield event
+            yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop")
+            yield ChatEvent(ChatEventType.DONE)
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+
+def _build_approval_app(
+    store,
+    *,
+    bridge=None,
+    tool_approval_service=None,
+    chat_service=None,
+):
+    tool_service = ToolService(_StubExecutor(), builtin_tool_definitions())
+    model_service = ModelService(_StubProvider(), "real-1")
+    if chat_service is None:
+        chat_service = _ApprovalChatService()
+    if bridge is None:
+        bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    if tool_approval_service is None:
+        tool_approval_service = GatewayToolApprovalService()
+    app = FastAPI()
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(
+        create_dashboard_router(
+            SessionService(store),
+            tool_service,
+            model_service,
+            _default_health,
+            memory_store=store,
+            chat_service=chat_service,
+            dashboard_tool_approval_bridge=bridge,
+            tool_approval_service=tool_approval_service,
+        )
+    )
+    return app
+
+
+async def _create_pending(bridge, session_id, tool_name="browser_click"):
+    """Register a pending approval on the bridge and return its confirmation_id.
+
+    The decider task is left running (pending) so that ``claim`` can resolve it.
+    Returns ``(confirmation_id, decider_task)``.
+    """
+    sender_event = asyncio.Event()
+    captured = {}
+
+    async def sender(metadata):
+        captured["metadata"] = metadata
+        sender_event.set()
+
+    decider = bridge.create_decider(
+        session_id=session_id,
+        actor_id="dashboard",
+        sender=sender,
+    )
+    req = ApprovalRequest(
+        session_id=session_id,
+        tool_call_id="call-1",
+        tool_name=tool_name,
+        arguments={"selector": "#btn"},
+        description="Click an element",
+        risk_level=RiskLevel.CONFIRM,
+    )
+    task = asyncio.ensure_future(decider(req))
+    await asyncio.wait_for(sender_event.wait(), timeout=2.0)
+    return captured["metadata"]["confirmation_id"], task
+
+
+# -- Stream validation (sync, TestClient) ------------------------------------
+
+def test_dashboard_stream_false_returns_422_when_approval_enabled(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    client.post("/chat/sessions?session_id=s1")
+    r = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "s1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "dashboard_stream_required"
+
+
+def test_dashboard_stream_string_true_returns_422(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    client.post("/chat/sessions?session_id=s1")
+    r = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "s1"},
+        json={"model": "test-model", "stream": "true", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "dashboard_stream_required"
+
+
+def test_dashboard_stream_int_one_returns_422(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    client.post("/chat/sessions?session_id=s1")
+    r = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "s1"},
+        json={"model": "test-model", "stream": 1, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "dashboard_stream_required"
+
+
+def test_dashboard_stream_omitted_defaults_to_streaming_when_approval_enabled(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    client.post("/chat/sessions?session_id=s1")
+    with client.stream(
+        "POST",
+        "/chat/completions",
+        headers={"X-Session-ID": "s1"},
+        json={"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+    ) as response:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        text = "".join(response.iter_text())
+    assert "data: [DONE]" in text
+
+
+# -- Claim endpoint (async, needs pending on same loop) -----------------------
+
+async def test_dashboard_claim_returns_204_on_ok(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    grant_service = GatewayToolApprovalService()
+    app = _build_approval_app(store, bridge=bridge, tool_approval_service=grant_service)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/chat/sessions?session_id=s1")
+        confirmation_id, task = await _create_pending(bridge, "s1")
+        r = await client.post(
+            f"/chat/tool-approvals/{confirmation_id}",
+            headers={"X-Session-ID": "s1"},
+            json={"choice": "once"},
+        )
+        assert r.status_code == 204
+        assert r.content == b""
+        # The decider future is resolved by the claim
+        decision = await asyncio.wait_for(task, timeout=2.0)
+        assert decision.allowed
+
+
+async def test_dashboard_claim_returns_404_on_unknown(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    app = _build_approval_app(store)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/chat/sessions?session_id=s1")
+        r = await client.post(
+            "/chat/tool-approvals/tool-confirm-nonexistent",
+            headers={"X-Session-ID": "s1"},
+            json={"choice": "once"},
+        )
+        assert r.status_code == 404
+        body = r.json()
+        assert body["error"]["code"] == "tool_approval_not_found"
+        # No sensitive context leaks
+        blob = _json.dumps(body).lower()
+        for s in ("#btn", "browser_click", "dashboard", "call-1", "selector"):
+            assert s.lower() not in blob, f"404 leaked '{s}'"
+
+
+async def test_dashboard_claim_returns_404_on_cross_session(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    app = _build_approval_app(store, bridge=bridge)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/chat/sessions?session_id=s1")
+        await client.post("/chat/sessions?session_id=s2")
+        confirmation_id, task = await _create_pending(bridge, "s1")
+        # Claim from a different session -> 404 (must not leak ownership)
+        r = await client.post(
+            f"/chat/tool-approvals/{confirmation_id}",
+            headers={"X-Session-ID": "s2"},
+            json={"choice": "once"},
+        )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "tool_approval_not_found"
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_dashboard_claim_returns_409_on_duplicate(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    app = _build_approval_app(store, bridge=bridge)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/chat/sessions?session_id=s1")
+        confirmation_id, task = await _create_pending(bridge, "s1")
+        # First claim -> 204
+        r1 = await client.post(
+            f"/chat/tool-approvals/{confirmation_id}",
+            headers={"X-Session-ID": "s1"},
+            json={"choice": "once"},
+        )
+        assert r1.status_code == 204
+        # Decider resolves
+        await asyncio.wait_for(task, timeout=2.0)
+        # Second claim (same session, duplicate) -> 409
+        r2 = await client.post(
+            f"/chat/tool-approvals/{confirmation_id}",
+            headers={"X-Session-ID": "s1"},
+            json={"choice": "once"},
+        )
+        assert r2.status_code == 409
+        assert r2.json()["error"]["code"] == "tool_approval_conflict"
+
+
+# -- Claim endpoint 422 validation (sync, no pending needed) -----------------
+
+def test_dashboard_claim_returns_422_on_bad_choice(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    r = client.post(
+        "/chat/tool-approvals/some-id",
+        headers={"X-Session-ID": "s1"},
+        json={"choice": "bad_value"},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "tool_approval_invalid"
+
+
+def test_dashboard_claim_returns_422_on_extra_fields(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    r = client.post(
+        "/chat/tool-approvals/some-id",
+        headers={"X-Session-ID": "s1"},
+        json={"choice": "once", "session": "s1", "tool": "browser_click"},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "tool_approval_invalid"
+
+
+def test_dashboard_claim_returns_422_on_missing_header(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    r = client.post(
+        "/chat/tool-approvals/some-id",
+        json={"choice": "once"},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "tool_approval_invalid"
+
+
+def test_dashboard_claim_returns_422_on_non_json(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    r = client.post(
+        "/chat/tool-approvals/some-id",
+        headers={"X-Session-ID": "s1", "Content-Type": "application/json"},
+        content=b"not json",
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "tool_approval_invalid"
+
+
+def test_dashboard_claim_returns_422_on_wrong_content_type(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_approval_app(store))
+    r = client.post(
+        "/chat/tool-approvals/some-id",
+        headers={"X-Session-ID": "s1", "Content-Type": "text/plain"},
+        content="choice=once",
+    )
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "tool_approval_invalid"
+
+
+def test_dashboard_claim_errors_contain_no_sensitive_context(tmp_path):
+    """No 422/404/409 response may leak tool args, session ID, actor, or confirmation ID."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    client = TestClient(_build_approval_app(store, bridge=bridge))
+    sensitive = ("#btn", "browser_click", "dashboard", "call-1", "selector")
+    # 404
+    r404 = client.post(
+        "/chat/tool-approvals/tool-confirm-leak-test",
+        headers={"X-Session-ID": "s1"},
+        json={"choice": "once"},
+    )
+    assert r404.status_code == 404
+    blob404 = _json.dumps(r404.json()).lower()
+    for s in sensitive:
+        assert s.lower() not in blob404, f"404 leaked '{s}'"
+    # 422
+    r422 = client.post(
+        "/chat/tool-approvals/some-id",
+        headers={"X-Session-ID": "s1"},
+        json={"choice": "bad"},
+    )
+    assert r422.status_code == 422
+    blob422 = _json.dumps(r422.json()).lower()
+    for s in sensitive:
+        assert s.lower() not in blob422, f"422 leaked '{s}'"
+
+
+# -- Approval SSE envelope ---------------------------------------------------
+
+async def test_dashboard_approval_sse_envelope(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    grant_service = GatewayToolApprovalService()
+    app = _build_approval_app(store, bridge=bridge, tool_approval_service=grant_service)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/chat/sessions?session_id=s1")
+        async with client.stream(
+            "POST",
+            "/chat/completions",
+            headers={"X-Session-ID": "s1"},
+            json={"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        ) as response:
+            assert response.headers["content-type"].startswith("text/event-stream")
+            lines = []
+            async for line in response.aiter_lines():
+                lines.append(line)
+
+    text = "\n".join(lines)
+    # Approval envelope present with the right object type
+    assert "n-agent.tool_approval" in text
+    # Find the approval data line
+    approval_data = None
+    chunk_count = 0
+    done_count = 0
+    for line in lines:
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):]
+        if payload == "[DONE]":
+            done_count += 1
+            continue
+        obj = _json.loads(payload)
+        if obj.get("object") == "n-agent.tool_approval":
+            approval_data = obj["approval"]
+        else:
+            assert obj["object"] == "chat.completion.chunk"
+            chunk_count += 1
+
+    assert approval_data is not None
+    # Exactly the 5 fixed metadata fields
+    assert set(approval_data.keys()) == {
+        "confirmation_id",
+        "tool_name",
+        "description",
+        "arguments_summary",
+        "expires_at",
+    }
+    # All fields are JSON scalar strings
+    for v in approval_data.values():
+        assert isinstance(v, str)
+    # Normal chat chunks still present (at least MESSAGE_START)
+    assert chunk_count >= 1
+    # [DONE] at most once
+    assert done_count == 1
+
+
+# -- Disconnect cleanup -----------------------------------------------------
+
+async def test_dashboard_disconnect_cleans_up_bridge(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    grant_service = GatewayToolApprovalService()
+    app = _build_approval_app(store, bridge=bridge, tool_approval_service=grant_service)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/chat/sessions?session_id=s1")
+        confirmation_id = None
+        async with client.stream(
+            "POST",
+            "/chat/completions",
+            headers={"X-Session-ID": "s1"},
+            json={"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        ) as response:
+            async for line in response.aiter_lines():
+                if line.startswith("data: ") and "n-agent.tool_approval" in line:
+                    payload = _json.loads(line[len("data: "):])
+                    confirmation_id = payload["approval"]["confirmation_id"]
+                    break  # stop reading -> triggers disconnect
+
+        # Give cleanup a moment to propagate
+        await asyncio.sleep(0.15)
+        assert bridge.pending_count == 0
+        # Subsequent claim cannot execute the tool
+        if confirmation_id is not None:
+            result = bridge.claim(confirmation_id, "s1", "once")
+            assert result.status in ("not_found", "conflict")
+            assert result.status != "ok"
+
+
+# -- Fail-closed / no-bridge regression -------------------------------------
+
+def test_dashboard_router_without_bridge_has_no_claim_endpoint(tmp_path):
+    """When bridge/tool_approval_service are absent, the claim endpoint is not
+    registered.  A request to its path returns 404 (not 422/204)."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    app = _build_app(store)  # default: no bridge, no tool_approval_service
+    client = TestClient(app)
+    r = client.post(
+        "/chat/tool-approvals/some-id",
+        headers={"X-Session-ID": "s1"},
+        json={"choice": "once"},
+    )
+    assert r.status_code == 404
+
+
+def test_dashboard_router_without_bridge_stream_false_works(tmp_path):
+    """Without bridge, stream: false works normally (no 422 dashboard_stream_required)."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    client = TestClient(_build_app(store))
+    client.post("/chat/sessions?session_id=s1")
+    r = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "s1"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 200
+
+
+async def test_v1_chat_completions_still_fail_closed_no_approval(tmp_path):
+    """/v1/chat/completions never receives approval events (no decider injected)."""
+    from app.application.agent_graph import AgentGraphRunner
+    from app.application.chat_service import ChatCompletionService
+    from app.application.model_service import ModelService
+    from app.application.session_service import SessionService
+    from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
+    from app.interfaces.http.openai_compatible import create_openai_compatible_router
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = AgentGraphRunner(
+        _ChatProvider(),
+        ToolService(_StubExecutor(), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    chat = ChatCompletionService(store, runner, SessionService(store))
+    models = ModelService(_ChatProvider(), "test-model")
+    app = FastAPI()
+    app.include_router(create_openai_compatible_router(chat, models, store))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        # Create an api session
+        await client.post("/v1/chat/completions", json={
+            "model": "test-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        # The /v1 route has no approval decider -- if a CONFIRM tool were
+        # called it would return approval_required (fail-closed).  We just
+        # verify the route does not inject approval events into the stream.
+        r = await client.post("/v1/chat/completions", json={
+            "model": "test-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert r.status_code == 200
+        assert "n-agent.tool_approval" not in r.text

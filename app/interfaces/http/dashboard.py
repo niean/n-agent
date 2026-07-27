@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -77,6 +79,10 @@ STATIC_DIR = Path(__file__).parent / "static"
 DependencySnapshot = dict
 HealthProvider = Callable[[], DependencySnapshot]
 
+# Server-side Dashboard actor constant.  NEVER derived from header, body,
+# metadata, session, or any client-supplied value.
+_DASHBOARD_ACTOR = "dashboard"
+
 
 from app.application.external_memory_provider_service import ExternalMemoryProviderService
 from app.application.external_memory_service import ExternalMemoryService
@@ -115,6 +121,12 @@ def create_dashboard_router(
     task_config_service=None,
     task_service=None,
     task_run_service=None,
+    browser_dashboard_service=None,
+    browser_confirmation_service=None,
+    browser_actor_resolver=None,
+    dashboard_tool_approval_bridge=None,
+    tool_approval_service=None,
+    settings=None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -148,6 +160,8 @@ def create_dashboard_router(
     @router.get("/observations/tasks", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
     @router.get("/security", response_class=HTMLResponse)
+    @router.get("/browser/session", response_class=HTMLResponse)
+    @router.get("/browser", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
@@ -173,6 +187,21 @@ def create_dashboard_router(
     if host_terminal_dashboard_service is not None:
         from app.interfaces.http.host_terminal_routes import register_host_terminal_routes
         register_host_terminal_routes(router, host_terminal_dashboard_service)
+
+    if (
+        browser_dashboard_service is not None
+        and browser_confirmation_service is not None
+        and browser_actor_resolver is not None
+        and settings is not None
+    ):
+        from app.interfaces.http.browser_routes import register_browser_routes
+        register_browser_routes(
+            router,
+            browser_dashboard_service,
+            browser_confirmation_service,
+            browser_actor_resolver,
+            settings,
+        )
 
     @router.get("/chat/sessions")
     async def sessions():
@@ -259,6 +288,10 @@ def create_dashboard_router(
 
     if chat_service is not None and memory_store is not None:
         _dashboard_bootstrap = SessionBootstrapReader(memory_store)
+        _approval_enabled = (
+            dashboard_tool_approval_bridge is not None
+            and tool_approval_service is not None
+        )
 
         @router.post("/chat/completions")
         async def dashboard_chat_completions(
@@ -273,6 +306,18 @@ def create_dashboard_router(
             # request entered via the Dashboard. (pre-8649dc4 the Dashboard posted to
             # /v1/chat/completions with no source check; this restores that capability.)
             # No implicit create -- new sessions must be created via /chat/sessions first.
+
+            # -- Strict stream validation (approval-enabled mode only, BEFORE session
+            # lookup / Agent start).  Dashboard requires streaming when the approval
+            # bridge is wired; non-bool stream values never select the streaming path.
+            if _approval_enabled:
+                raw_stream = payload.get("stream", True)
+                if raw_stream is not True:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"error": {"code": "dashboard_stream_required", "message": "Dashboard chat requires stream=true when tool approval is enabled"}},
+                    )
+
             if not x_session_id:
                 return JSONResponse(
                     status_code=409,
@@ -299,11 +344,76 @@ def create_dashboard_router(
             )
 
             resolved_model = payload.get("model") or model_service.default_model
-            stream = payload.get("stream", True)
             messages = payload.get("messages", [])
+            if isinstance(messages, list) and any(
+                isinstance(message, dict)
+                and message.get("role") == "user"
+                and _is_internal_system_prompt_echo(message.get("content"))
+                for message in messages
+            ):
+                return JSONResponse(
+                    status_code=422,
+                    content={"error": {"code": "dashboard_prompt_echo", "message": "internal system prompt cannot be sent as a user message"}},
+                )
             metadata = payload.get("metadata", {})
-            options = payload.get("options", {})
+            # Copy client options and strip the internal queue key -- it is
+            # server-only and must never be supplied or overridden by the client.
+            options = dict(payload.get("options", {}))
+            options.pop("dashboard_approval_event_queue", None)
 
+            if _approval_enabled:
+                # Hydrate durable Dashboard trust before evaluating a confirm
+                # tool.  The in-memory cache alone is lost on reload/restart.
+                await tool_approval_service.restore_session_grants(
+                    x_session_id, _DASHBOARD_ACTOR
+                )
+                # Per-request private queue for approval events from the bridge.
+                approval_queue: asyncio.Queue[ChatEvent] = asyncio.Queue()
+
+                async def _send_approval(approval_metadata: dict) -> None:
+                    await session_service.append_tool_approval_message(
+                        x_session_id, approval_metadata
+                    )
+                    await approval_queue.put(
+                        ChatEvent(
+                            ChatEventType.TOOL_APPROVAL_REQUIRED,
+                            metadata=approval_metadata,
+                        )
+                    )
+
+                decider = dashboard_tool_approval_bridge.create_decider(
+                    session_id=x_session_id,
+                    actor_id=_DASHBOARD_ACTOR,
+                    sender=_send_approval,
+                    session_grant_updater=tool_approval_service.grant_session,
+                    session_grant_checker=tool_approval_service.is_granted,
+                    session_grant_revoker=tool_approval_service.revoke_session,
+                )
+                allowed_override = tool_approval_service.grants_for(
+                    x_session_id, _DASHBOARD_ACTOR
+                )
+                options["dashboard_approval_event_queue"] = approval_queue
+
+                app_input = ChatCompletionInput(
+                    model=resolved_model,
+                    messages=messages,
+                    stream=True,
+                    metadata=metadata,
+                    options=options,
+                    session_id=x_session_id,
+                    ingress_facts=ingress,
+                    session_descriptor=descriptor,
+                    approval_decider=decider,
+                    allowed_confirm_tools_override=allowed_override,
+                )
+                result = await chat_service.complete(app_input)
+                return StreamingResponse(
+                    _dashboard_sse_with_approval(result),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                )
+
+            stream = payload.get("stream", True)
             app_input = ChatCompletionInput(
                 model=resolved_model,
                 messages=messages,
@@ -328,6 +438,82 @@ def create_dashboard_router(
                     content={"error": {"message": result.message.get("content", "provider failure"), "type": "server_error"}},
                 )
             return _dashboard_completion_response(result)
+
+        # -- POST /chat/tool-approvals/{confirmation_id} --
+        # Registered ONLY when bridge + tool_approval_service + chat_service +
+        # memory_store are all present.
+        if _approval_enabled:
+
+            @router.post("/chat/tool-approvals/{confirmation_id}")
+            async def claim_tool_approval(confirmation_id: str, request: Request):
+                # X-Session-ID is a server-side matching key for pending records,
+                # NOT a new auth/authz mechanism.
+                raw_session = request.headers.get("x-session-id")
+                session_id = raw_session.strip() if isinstance(raw_session, str) else ""
+                if not session_id:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"error": {"code": "tool_approval_invalid", "message": "X-Session-ID required"}},
+                    )
+                # Content-Type must be application/json
+                content_type = request.headers.get("content-type", "")
+                if not content_type.lower().startswith("application/json"):
+                    return JSONResponse(
+                        status_code=422,
+                        content={"error": {"code": "tool_approval_invalid", "message": "content-type must be application/json"}},
+                    )
+                # Parse body manually (avoid Pydantic 422 shape leakage)
+                try:
+                    payload = await request.json()
+                except Exception:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"error": {"code": "tool_approval_invalid", "message": "invalid json body"}},
+                    )
+                if not isinstance(payload, dict) or set(payload.keys()) != {"choice"}:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"error": {"code": "tool_approval_invalid", "message": "body must be {choice: once|trust_session|cancel}"}},
+                    )
+                choice = payload["choice"]
+                if choice not in ("once", "trust_session", "cancel"):
+                    return JSONResponse(
+                        status_code=422,
+                        content={"error": {"code": "tool_approval_invalid", "message": "choice must be once, trust_session, or cancel"}},
+                    )
+                try:
+                    claim_result = dashboard_tool_approval_bridge.claim(
+                        confirmation_id, session_id, choice
+                    )
+                except ValueError:
+                    return JSONResponse(
+                        status_code=422,
+                        content={"error": {"code": "tool_approval_invalid", "message": "choice must be once, trust_session, or cancel"}},
+                    )
+                if claim_result.status == "ok":
+                    decision = claim_result.decision
+                    await session_service.append_tool_approval_resolution_message(
+                        session_id,
+                        confirmation_id,
+                        "approved" if decision is not None and decision.allowed else "rejected",
+                    )
+                    if (
+                        decision is not None
+                        and decision.scope == "session"
+                    ):
+                        await tool_approval_service.persist_session_grants(
+                            session_id, _DASHBOARD_ACTOR
+                        )
+                    return Response(status_code=204)
+                if claim_result.status == "not_found":
+                    return JSONResponse(
+                        status_code=404,
+                        content={"error": {"code": "tool_approval_not_found", "message": "approval not found"}},
+                    )
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": {"code": "tool_approval_conflict", "message": "approval already claimed or expired"}},
+                )
 
     @router.get("/chat/models")
     async def list_admin_models():
@@ -1643,6 +1829,50 @@ async def _dashboard_sse(events: AsyncIterator[ChatEvent]) -> AsyncIterator[str]
             continue
         chunk = _dashboard_chunk_for_event(event)
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+
+async def _dashboard_sse_with_approval(
+    events: AsyncIterator[ChatEvent],
+) -> AsyncIterator[str]:
+    """SSE generator for approval-enabled Dashboard chat.
+
+    Approval events (TOOL_APPROVAL_REQUIRED) are emitted as a SEPARATE
+    ``data:`` line with a dedicated ``n-agent.tool_approval`` envelope --
+    they never pass through the generic OpenAI chunk encoder.
+
+    On ASGI client disconnect / response cancellation the underlying
+    Chat-event async iterator is ``aclose()``d so that
+    ``AgentGraphRunner.stream_events`` -> ``run_task.cancel()`` propagates
+    cancellation to the bridge, triggering pending cleanup.
+    """
+    try:
+        async for event in events:
+            if event.type is ChatEventType.TOOL_APPROVAL_REQUIRED:
+                envelope = {
+                    "object": "n-agent.tool_approval",
+                    "approval": event.metadata,
+                }
+                yield f"data: {json.dumps(envelope, ensure_ascii=False)}\n\n"
+                continue
+            if event.type is ChatEventType.DONE:
+                yield "data: [DONE]\n\n"
+                continue
+            chunk = _dashboard_chunk_for_event(event)
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    finally:
+        # Close the underlying iterator on disconnect / cancellation so the
+        # agent run task is cancelled and the bridge pending is cleaned up.
+        aclose = getattr(events, "aclose", None)
+        if aclose is not None:
+            with suppress(Exception):
+                await aclose()
+
+
+def _is_internal_system_prompt_echo(content: Any) -> bool:
+    """Recognize a leaked full runtime prompt without blocking normal questions."""
+    if not isinstance(content, str):
+        return False
+    return content.startswith("## Identity\n\nYou are N-Agent(") and "\n\n## Reasoning & Tools\n\n" in content
 
 
 def _dashboard_chunk_for_event(event: ChatEvent) -> dict[str, Any]:

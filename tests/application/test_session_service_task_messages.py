@@ -127,6 +127,50 @@ async def test_append_task_lifecycle_message_persists_card(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_append_tool_approval_message_persists_whitelisted_card(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+    approval = {
+        "confirmation_id": "confirm-1",
+        "tool_name": "browser_click",
+        "description": "Open article",
+        "arguments_summary": '{"element_ref":"el-1"}',
+        "expires_at": "2026-07-28T12:00:00Z",
+        "unexpected": "must not persist",
+    }
+
+    await svc.append_tool_approval_message("s1", approval)
+
+    message = (await store.list_messages("s1"))[-1]
+    assert message.role == "system"
+    assert message.name == "ui.tool_approval"
+    assert message.card == {
+        "kind": "tool_approval",
+        "approval": {key: approval[key] for key in (
+            "confirmation_id", "tool_name", "description", "arguments_summary", "expires_at",
+        )},
+    }
+
+
+@pytest.mark.asyncio
+async def test_append_tool_approval_resolution_persists_confirmation_status(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+
+    await svc.append_tool_approval_resolution_message("s1", "confirm-1", "approved")
+
+    message = (await store.list_messages("s1"))[-1]
+    assert message.name == "ui.tool_approval_resolution"
+    assert message.card == {
+        "kind": "tool_approval_resolution",
+        "confirmation_id": "confirm-1",
+        "status": "approved",
+    }
+
+
+@pytest.mark.asyncio
 async def test_append_task_lifecycle_message_truncates_card_summary(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     svc = SessionService(store)

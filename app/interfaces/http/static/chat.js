@@ -50,6 +50,9 @@
   // Render token: monotonic counter to prevent stale async renders from overwriting newer content.
   // Incremented at the start of each renderSessionMessages; checked after await to abort stale renders.
   let renderToken = 0;
+  // Active stream's assistant element — tracks the streaming bubble so that
+  // session switches can disable its outstanding approval cards (no late POST).
+  let activeStreamEl = null;
 
   function messageVersionOf(detail) {
     const msgs = Array.isArray(detail && detail.messages) ? detail.messages : null;
@@ -458,6 +461,19 @@
     return decisions;
   }
 
+  function resolveToolApprovalDecisions(messages) {
+    const decisions = new Map();
+    for (const msg of messages) {
+      const card = msg && msg.card;
+      if (!card || card.kind !== 'tool_approval_resolution') continue;
+      if (typeof card.confirmation_id !== 'string') continue;
+      if (card.status === 'approved' || card.status === 'rejected') {
+        decisions.set(card.confirmation_id, card.status);
+      }
+    }
+    return decisions;
+  }
+
   // computeCardState(card, entry) -> 'active' | 'stale' | 'unavailable'.
   // Per-card comparison: card.status vs authoritative entry status.
   function computeCardState(card, entry) {
@@ -735,14 +751,318 @@
     }
   }
 
-  function createMessageElement(message, cardStates, taskDecisions) {
+  // === T4: Generic tool approval card (independent of task cards) ===
+  // Reusable renderer for any CONFIRM tool. Accepts only the 5-field approval
+  // payload (confirmation_id, tool_name, description, arguments_summary,
+  // expires_at). No browser-specific branches. All display fields set via
+  // textContent (never innerHTML). The card is ephemeral: it lives only in the
+  // assistant bubble during the stream that produced it, and is never persisted
+  // to session messages.
+
+  // Cross-environment child traversal: harness stubs store children in _kids,
+  // real DOM uses childNodes. Returns an array of child elements.
+  function childNodesOf(node) {
+    if (!node) return [];
+    if (node._kids) return node._kids;
+    var arr = [];
+    if (node.childNodes) {
+      for (var i = 0; i < node.childNodes.length; i++) arr.push(node.childNodes[i]);
+    }
+    return arr;
+  }
+
+  // Buffered SSE parser: accumulates text across network chunks, splits on
+  // COMPLETE events (terminated by \n\n, \r\n\r\n, or \r\r), reassembles
+  // multi-line data: fields per the SSE spec (concatenated with \n). Maintains
+  // a bounded buffer (drops if > 1 MiB to avoid unbounded memory).
+  function createSSEParser() {
+    var buffer = '';
+    var MAX_BUFFER = 1 << 20; // 1 MiB
+
+    function findBoundary(buf) {
+      var best = -1, bestLen = 0;
+      var i;
+      i = buf.indexOf('\n\n');
+      if (i !== -1) { best = i; bestLen = 2; }
+      i = buf.indexOf('\r\n\r\n');
+      if (i !== -1 && (best === -1 || i < best)) { best = i; bestLen = 4; }
+      i = buf.indexOf('\r\r');
+      if (i !== -1 && (best === -1 || i < best)) { best = i; bestLen = 2; }
+      return best === -1 ? null : { idx: best, len: bestLen };
+    }
+
+    function parseEvent(raw) {
+      var lines = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+      var dataLines = [];
+      for (var k = 0; k < lines.length; k++) {
+        var line = lines[k];
+        if (line.indexOf('data:') === 0) {
+          dataLines.push(line.slice(5).replace(/^ /, ''));
+        }
+      }
+      if (dataLines.length === 0) return null;
+      return dataLines.join('\n');
+    }
+
+    return {
+      feed: function (text) {
+        buffer += text;
+        if (buffer.length > MAX_BUFFER) buffer = '';
+        var events = [];
+        var b;
+        while ((b = findBoundary(buffer))) {
+          var raw = buffer.slice(0, b.idx);
+          buffer = buffer.slice(b.idx + b.len);
+          var data = parseEvent(raw);
+          if (data !== null) events.push(data);
+        }
+        return events;
+      },
+      flush: function () {
+        var trimmed = buffer;
+        buffer = '';
+        if (!trimmed.trim()) return [];
+        var data = parseEvent(trimmed);
+        return data !== null ? [data] : [];
+      },
+      getBufferLength: function () { return buffer.length; }
+    };
+  }
+
+  // Validate the approval payload: must be a non-null object with all 5
+  // required fields as strings, and confirmation_id non-empty after trim.
+  function isValidApprovalPayload(approval) {
+    if (!approval || typeof approval !== 'object') return false;
+    var fields = ['confirmation_id', 'tool_name', 'description', 'arguments_summary', 'expires_at'];
+    for (var i = 0; i < fields.length; i++) {
+      if (typeof approval[fields[i]] !== 'string') return false;
+    }
+    if (!approval.confirmation_id || !approval.confirmation_id.trim()) return false;
+    return true;
+  }
+
+  function validateToolApprovalCard(card) {
+    if (!card || typeof card !== 'object' || card.kind !== 'tool_approval') return null;
+    return isValidApprovalPayload(card.approval) ? card.approval : null;
+  }
+
+  function findApprovalCardById(container, id) {
+    function walk(node) {
+      if (!node) return null;
+      if (node.dataset && node.dataset.confirmationId === id) return node;
+      var kids = childNodesOf(node);
+      for (var i = 0; i < kids.length; i++) {
+        var found = walk(kids[i]);
+        if (found) return found;
+      }
+      return null;
+    }
+    return walk(container);
+  }
+
+  function findApprovalCards(container) {
+    var result = [];
+    function walk(node) {
+      if (!node) return;
+      if (node.className && typeof node.className === 'string' &&
+          node.className.indexOf('tool-approval-card') !== -1 &&
+          node.dataset && node.dataset.confirmationId) {
+        result.push(node);
+      }
+      var kids = childNodesOf(node);
+      for (var i = 0; i < kids.length; i++) walk(kids[i]);
+    }
+    walk(container);
+    return result;
+  }
+
+  function findCardButtons(card) {
+    var result = [];
+    function walk(node) {
+      if (!node) return;
+      if (node.tagName === 'BUTTON' && node.className &&
+          typeof node.className === 'string' &&
+          node.className.indexOf('tool-approval-card__btn') !== -1) {
+        result.push(node);
+      }
+      var kids = childNodesOf(node);
+      for (var i = 0; i < kids.length; i++) walk(kids[i]);
+    }
+    walk(card);
+    return result;
+  }
+
+  // Choice labels and button order for the generic approval card. Defined once
+  // at module scope so label changes need only one edit.
+  var APPROVAL_CHOICE_LABELS = { once: '仅本次允许', trust_session: '信任本会话', cancel: '拒绝' };
+  var APPROVAL_CHOICE_ORDER = ['once', 'trust_session', 'cancel'];
+
+  // Render the generic approval card into the container (the streaming assistant
+  // bubble). Dedup by confirmation_id: if a card for that ID already exists in
+  // the container, no duplicate is rendered.
+  function renderToolApprovalCard(container, approval, streamSessionId, resolvedStatus) {
+    if (!container || !approval || !isValidApprovalPayload(approval)) return;
+    var id = String(approval.confirmation_id);
+    if (findApprovalCardById(container, id)) return;
+
+    var card = document.createElement('div');
+    card.className = 'tool-approval-card';
+    card.dataset.confirmationId = id;
+
+    var title = document.createElement('div');
+    title.className = 'tool-approval-card__title';
+    title.textContent = '工具操作确认';
+    card.appendChild(title);
+
+    var toolField = document.createElement('div');
+    toolField.className = 'tool-approval-card__field';
+    toolField.textContent = '工具: ' + approval.tool_name;
+    card.appendChild(toolField);
+
+    var descField = document.createElement('div');
+    descField.className = 'tool-approval-card__field';
+    descField.textContent = '描述: ' + approval.description;
+    card.appendChild(descField);
+
+    var argsField = document.createElement('div');
+    argsField.className = 'tool-approval-card__field tool-approval-card__args';
+    argsField.textContent = '参数: ' + approval.arguments_summary;
+    card.appendChild(argsField);
+
+    var expiresField = document.createElement('div');
+    expiresField.className = 'tool-approval-card__field tool-approval-card__expires';
+    expiresField.textContent = '过期时间: ' + approval.expires_at;
+    card.appendChild(expiresField);
+
+    var feedback = document.createElement('div');
+    feedback.className = 'tool-approval-card__feedback';
+    feedback.setAttribute('aria-live', 'polite');
+
+    var actions = document.createElement('div');
+    actions.className = 'tool-approval-card__actions';
+
+    var cardState = { ended: false, submitted: false };
+    card._approvalState = cardState;
+    var buttons = [];
+    for (var ci = 0; ci < APPROVAL_CHOICE_ORDER.length; ci++) {
+      (function (choice) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'tool-approval-card__btn';
+        btn.dataset.choice = choice;
+        btn.textContent = APPROVAL_CHOICE_LABELS[choice] || choice;
+        btn.addEventListener('click', function () {
+          if (cardState.ended || cardState.submitted) return;
+          submitToolApproval(id, choice, streamSessionId, buttons, feedback, cardState).catch(function () {});
+        });
+        actions.appendChild(btn);
+        buttons.push(btn);
+      })(APPROVAL_CHOICE_ORDER[ci]);
+    }
+
+    card.appendChild(actions);
+    card.appendChild(feedback);
+    if (resolvedStatus === 'approved' || resolvedStatus === 'rejected') {
+      cardState.ended = true;
+      buttons.forEach(function (button) { button.disabled = true; });
+      feedback.textContent = resolvedStatus === 'approved' ? '已批准' : '已拒绝';
+    }
+    container.appendChild(card);
+  }
+
+  // Submit a choice to /chat/tool-approvals/{confirmation_id}. Disables all
+  // buttons immediately, sends exactly one POST with the stream-captured
+  // session ID, and handles 204/404/409/5xx/network per spec.
+  async function submitToolApproval(confirmationId, choice, streamSessionId, buttons, feedback, cardState) {
+    if (cardState.submitted) return;
+    cardState.submitted = true;
+    buttons.forEach(function (b) { b.disabled = true; });
+
+    try {
+      var res = await fetch('/chat/tool-approvals/' + encodeURIComponent(confirmationId), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-ID': streamSessionId
+        },
+        body: JSON.stringify({ choice: choice })
+      });
+      if (res.status === 204) {
+        feedback.textContent = '已提交: ' + (APPROVAL_CHOICE_LABELS[choice] || choice);
+        // buttons stay disabled, keep waiting for the rest of the stream
+      } else if (res.status === 404 || res.status === 409) {
+        feedback.textContent = '已过期或已处理';
+        // terminal: keep buttons disabled, no auto-retry
+      } else {
+        // 5xx or unexpected: retryable (unless stream has ended)
+        if (!cardState.ended) {
+          cardState.submitted = false;
+          feedback.textContent = '提交失败，请重试';
+          buttons.forEach(function (b) { b.disabled = false; });
+        } else {
+          feedback.textContent = '提交失败';
+        }
+      }
+    } catch (e) {
+      // network error: retryable (unless stream has ended)
+      if (!cardState.ended) {
+        cardState.submitted = false;
+        feedback.textContent = '网络错误，请重试';
+        buttons.forEach(function (b) { b.disabled = false; });
+      } else {
+        feedback.textContent = '网络错误';
+      }
+    }
+  }
+
+  // Disable all approval cards in the container: set ended flag (prevents
+  // future clicks from POSTing) and disable all buttons. Called on stream
+  // end, stream failure, or session switch.
+  function disableApprovalCards(container) {
+    if (!container) return;
+    var cards = findApprovalCards(container);
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i]._approvalState) cards[i]._approvalState.ended = true;
+      var btns = findCardButtons(cards[i]);
+      for (var j = 0; j < btns.length; j++) btns[j].disabled = true;
+    }
+  }
+
+  // Process a single SSE data payload: route approval envelopes to the card
+  // renderer, OpenAI chunks to text streaming. Returns false if the stream
+  // should terminate (invalid approval payload), true otherwise.
+  function processSSEData(data, streaming, streamSessionId) {
+    if (data === '[DONE]') return true;
+    var json;
+    try { json = JSON.parse(data); } catch (e) { json = null; }
+    if (!json) return true; // malformed non-approval chunk: ignore (existing behavior)
+    if (json.object === 'n-agent.tool_approval') {
+      var approval = json.approval;
+      if (!isValidApprovalPayload(approval)) {
+        // terminate stream with error, never render partial fields or guess allow
+        if (streaming) {
+          streaming.className = 'msg error';
+          streaming.textContent = '[Error: invalid approval payload]';
+        }
+        return false;
+      }
+      renderToolApprovalCard(streaming, approval, streamSessionId);
+      return true;
+    }
+    // OpenAI chunk: append text delta (existing behavior)
+    var content = (json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content) || '';
+    if (content && streaming) streaming.textContent += content;
+    return true;
+  }
+
+  function createMessageElement(message, cardStates, taskDecisions, approvalDecisions) {
     if (message.is_summary) {
       const el = document.createElement('div');
       el.className = 'msg msg--summary';
       const details = document.createElement('details');
       const summary = document.createElement('summary');
       const content = document.createElement('pre');
-      summary.textContent = '对话摘要调试信息';
+      summary.textContent = '对话压缩';
       const prefix = '[CONTEXT SUMMARY]: ';
       const raw = typeof message.content === 'string' ? message.content : String(message.content || '');
       content.textContent = raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
@@ -802,6 +1122,16 @@
     // 保证命令结果可见、给人聊天感），textContent 安全渲染，无 innerHTML。
     // ui.task_result 不走此分支（普通消息，上方 isTaskResult 已分流到 assistant 样式）。
     if (message.role === 'system' && !isTaskResult) {
+      // Server-persisted approval cards are reconstructed from session history
+      // after a Dashboard refresh. The payload is the same whitelist used by
+      // the SSE envelope, so it never contains raw tool arguments or actor data.
+      const persistedApproval = validateToolApprovalCard(message.card);
+      if (persistedApproval) {
+        el.dataset.name = message.name || 'ui.tool_approval';
+        const status = approvalDecisions ? approvalDecisions.get(persistedApproval.confirmation_id) : undefined;
+        renderToolApprovalCard(el, persistedApproval, currentSessionId, status);
+        return el;
+      }
       // Valid card with resolved state -> inline interactive card (T6/T7).
       // cardStates is undefined when createMessageElement is called outside
       // renderSessionMessages (e.g. appendMessage); in that case fall back to details/pre.
@@ -878,6 +1208,7 @@
   }
 
   function shouldRenderMessage(message) {
+    if (message && message.card && message.card.kind === 'tool_approval_resolution') return false;
     if (message.is_summary) return true;
     if (message.role === 'tool') return true;
     // 进程来源（task/curator）的 assistant 推理属 worker 内部思考过程，不在
@@ -945,10 +1276,12 @@
     const stack = ui.byId('chat-message-stack');
     if (!stack) return;
     const myToken = ++renderToken;
-    let visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage));
+    const allMessages = detail.messages || [];
+    let visibleMessages = groupToolMessages(allMessages.filter(shouldRenderMessage));
     visibleMessages = groupTaskMessages(visibleMessages);
     const cardStates = await resolveTaskCardStates(visibleMessages);
     const taskDecisions = resolveTaskDecisions(visibleMessages);
+    const approvalDecisions = resolveToolApprovalDecisions(allMessages);
     // Stale render guard: a newer render has incremented renderToken; abort without writing DOM.
     if (myToken !== renderToken) return;
     if (!options.partial) {
@@ -958,7 +1291,7 @@
       if (!visibleMessages.length) { showEmptyState(); return; }
       visibleMessages.forEach((message, index) => {
         const key = messageRenderKey(message, index);
-        const el = createMessageElement(message, cardStates, taskDecisions);
+        const el = createMessageElement(message, cardStates, taskDecisions, approvalDecisions);
         el.dataset.messageKey = key;
         stack.appendChild(el);
         renderedMessageNodes.set(key, el);
@@ -974,7 +1307,7 @@
       nextKeys.add(key);
       const existing = renderedMessageNodes.get(key);
       if (existing && renderedMessageFingerprints.get(key) === fingerprint) return;
-      const el = createMessageElement(message, cardStates, taskDecisions);
+      const el = createMessageElement(message, cardStates, taskDecisions, approvalDecisions);
       el.dataset.messageKey = key;
       if (existing && existing.parentNode === stack) {
         preserveDetailsState(existing, el);
@@ -1154,6 +1487,11 @@
 
   async function selectSession(id) {
     stopAutoRefresh();
+    // Session switch: disable outstanding approval cards from the previous
+    // stream so they can't be clicked or re-POSTed after the stream is gone.
+    if (activeStreamEl) {
+      disableApprovalCards(activeStreamEl);
+    }
     currentSessionId = id;
     draftExternalMemoryConfig = null;
     setHeader(id);
@@ -1221,9 +1559,32 @@
     await ensureSession();
   }
 
-  function setHeader(id) {
+  // 会话是否承接过浏览器工具调用：任一 role=tool 且 name 以 browser_ 开头的消息。
+  function sessionHasBrowserTool(detail) {
+    const msgs = Array.isArray(detail && detail.messages) ? detail.messages : [];
+    return msgs.some((m) => m && m.role === 'tool'
+      && typeof m.name === 'string' && m.name.indexOf('browser_') === 0);
+  }
+
+  // 对话框标题：展示会话 ID。承接过浏览器工具调用时，在 ID 后缀 `(浏览器视图)`，
+  // 其中"浏览器视图"为指向 /browser/session 的链接。
+  function setHeader(id, hasBrowser) {
     const header = ui.byId('chat-header');
-    if (header) header.textContent = id || 'N-Agent Chat';
+    if (!header) return;
+    clearNode(header);
+    if (!id) { header.textContent = 'N-Agent Chat'; return; }
+    header.appendChild(document.createTextNode(id));
+    if (hasBrowser) {
+      header.appendChild(document.createTextNode(' ('));
+      const link = document.createElement('a');
+      link.textContent = '浏览器视图';
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.className = 'chat-browser-link';
+      link.href = '/browser/session?nagent=' + encodeURIComponent(id);
+      header.appendChild(link);
+      header.appendChild(document.createTextNode(')'));
+    }
   }
 
   function updateInfo(detail, options) {
@@ -1285,6 +1646,8 @@
     // Await state resolution + render before restoring scroll / updating info,
     // so clickable actions are not inserted mid-render.
     await renderSessionMessages(detail, { partial: options.partialMessages === true });
+    // 会话承接浏览器工具调用时，在标题的会话 ID 后缀 `(浏览器视图)` 链接。
+    if (currentSessionId) setHeader(currentSessionId, sessionHasBrowserTool(detail));
     updateInfo(detail, { skipToolCalls: options.skipToolCalls });
     if (options.preserveScroll) restoreScroll(wasAtBottom, prevScrollTop);
     if (!options.skipSessionList) await loadSessions();
@@ -1809,12 +2172,17 @@
     appendMessage('user', userContent, new Date().toISOString());
     const streaming = appendMessage('assistant', '');
     setSending(true);
+    // Capture the session ID at stream creation time. The approval card POST
+    // must use THIS id, not a subsequently-switched global currentSessionId.
+    const streamSessionId = currentSessionId;
+    activeStreamEl = streaming;
+    var reader = null;
     try {
       const res = await fetch('/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Session-ID': currentSessionId,
+          'X-Session-ID': streamSessionId,
         },
         body: JSON.stringify(buildChatRequestBody(text, sentImages)),
       });
@@ -1830,25 +2198,34 @@
         }
         return;
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      while (true) {
+      reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8', { stream: true });
+      const parser = createSSEParser();
+      let streamAlive = true;
+      while (streamAlive) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value);
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') continue;
-          try {
-            const json = JSON.parse(data);
-            const content = (json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content) || '';
-            if (content && streaming) streaming.textContent += content;
-          } catch (error) {
-            // ignore malformed chunk
+        const text = decoder.decode(value, { stream: true });
+        const events = parser.feed(text);
+        for (let ei = 0; ei < events.length; ei++) {
+          if (!streamAlive) break;
+          if (!processSSEData(events[ei], streaming, streamSessionId)) {
+            streamAlive = false;
+            break;
           }
         }
         scrollToBottom();
+      }
+      // Flush decoder (finishes any pending multi-byte sequence) and feed any
+      // trailing text to the parser before flushing the parser itself.
+      const tail = decoder.decode();
+      if (tail) parser.feed(tail);
+      // Flush parser (trailing event without blank-line terminator)
+      if (streamAlive) {
+        const trailing = parser.flush();
+        for (let ti = 0; ti < trailing.length; ti++) {
+          if (!processSSEData(trailing[ti], streaming, streamSessionId)) break;
+        }
       }
     } catch (error) {
       if (streaming) {
@@ -1856,6 +2233,14 @@
         streaming.textContent = '[Error: ' + error.message + ']';
       }
     } finally {
+      // Release the underlying ReadableStream promptly (e.g. when the loop
+      // breaks early on invalid approval), instead of waiting for GC.
+      if (reader && typeof reader.cancel === 'function') {
+        reader.cancel().catch(function () {});
+      }
+      // Stream end/failure: disable outstanding approval cards (no late POST)
+      disableApprovalCards(streaming);
+      activeStreamEl = null;
       setSending(false);
       await refreshCurrentSession();
       input.focus();
@@ -2416,5 +2801,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings };
+  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload };
 }(window));

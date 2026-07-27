@@ -13,7 +13,7 @@
     { tab: 'tools-skill', path: '/tools/skill', label: 'Skill', parentTab: 'tools' },
     { tab: 'tools-plugin', path: '/tools/plugin', label: 'Plugin', parentTab: 'tools' },
     { tab: 'tools-builtin', path: '/tools/builtin', label: 'Builtin', parentTab: 'tools' },
-    { tab: 'executors', label: '执行器', parent: true, children: ['sandbox', 'executors-host'] },
+    { tab: 'executors', label: '执行器', parent: true, children: ['sandbox', 'executors-host', 'browser'] },
     { tab: 'sandbox', path: '/sandbox', label: '沙盒', parentTab: 'executors' },
     { tab: 'executors-host', path: '/executors/host', label: '本机', parentTab: 'executors' },
     { tab: 'models', path: '/models', label: '模型' },
@@ -22,6 +22,7 @@
     { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', parentTab: 'observations' },
     { tab: 'observations-modules', path: '/observations/modules', label: '组件', parentTab: 'observations' },
     { tab: 'security', path: '/security', label: '安全' },
+    { tab: 'browser', path: '/browser', label: '浏览器', parentTab: 'executors' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
   const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));
@@ -89,6 +90,7 @@
     if (path === '/tools/sandbox') return 'sandbox';
     if (path === '/executors') return DEFAULT_CHILD.executors;
     if (path === '/executors/host') return 'executors-host';
+    if (path.startsWith('/browser/')) return 'browser';
     if (path === '/tools') return DEFAULT_CHILD.tools;
     if (path === '/observations') return DEFAULT_CHILD.observations;
     if (path === '/' || path === '') return 'summary';

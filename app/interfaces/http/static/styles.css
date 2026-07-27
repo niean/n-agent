@@ -245,6 +245,20 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .task-card__stale .task-card__feedback { color: var(--color-fg-subtle); }
 .task-card__unavailable .task-card__feedback { color: var(--color-danger-fg); }
 
+/* Generic tool approval card (Dashboard chat): reusable inline card for any
+   CONFIRM tool. Independent of task cards. All fields rendered via textContent
+   (no innerHTML). Three uniform buttons: once / trust_session / cancel. */
+.tool-approval-card { margin-top: 8px; padding: 10px 12px; background: var(--color-warning-bg); border: 1px solid var(--color-warning-border); border-radius: var(--radius-lg); font-size: 13px; }
+.tool-approval-card__title { font-weight: 600; color: var(--color-warning-fg); margin-bottom: 6px; }
+.tool-approval-card__field { color: var(--color-fg-default); word-break: break-word; line-height: 1.5; }
+.tool-approval-card__args { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; }
+.tool-approval-card__expires { font-size: 12px; color: var(--color-fg-subtle); }
+.tool-approval-card__actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.tool-approval-card__btn { padding: 5px 12px; color: var(--color-fg-muted); background: var(--color-bg-white); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
+.tool-approval-card__btn:hover:not(:disabled) { background: var(--color-bg-hover); color: var(--color-fg-default); }
+.tool-approval-card__btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.tool-approval-card__feedback { font-size: 12px; color: var(--color-fg-subtle); min-height: 16px; margin-top: 6px; }
+
 /* Hover timestamp (飞书风格): 鼠标悬停消息气泡时，在气泡上方展示小号灰色时间。
    时间文本由 JS 写入 data-time，CSS 用 attr() 取值，避免 innerHTML。
    仅 user/assistant 消息携带 data-time；tool/summary 调试卡不展示。
@@ -822,3 +836,38 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .host-subsection-title { font-size: var(--font-size-md); font-weight: 600; margin: 12px 0 6px; color: var(--color-fg-default); }
 .host-rules-section { margin-bottom: 16px; }
 .host-unavailable { color: var(--color-fg-subtle); padding: 24px; text-align: center; }
+
+/* Browser Dashboard detail - full-width vertical panels (main view / controls+history) */
+.browser-shell { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
+.browser-main, .browser-side { width: 100%; min-width: 0; }
+.browser-status-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.browser-status-bar__backend { font-size: var(--font-size-sm); }
+.browser-screenshot-wrap { position: relative; min-height: 200px; background: var(--color-bg-subtle); border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); overflow: hidden; }
+.browser-screenshot { display: block; width: 100%; height: auto; min-height: 200px; object-fit: contain; }
+.browser-screenshot-placeholder { padding: 40px 20px; text-align: center; color: var(--color-fg-subtle); font-size: var(--font-size-sm); }
+.browser-screenshot-stale { position: absolute; top: 8px; right: 8px; padding: 4px 8px; color: var(--color-warning-fg); background: var(--color-warning-bg); border: 1px solid var(--color-warning-border); border-radius: var(--radius-pill); font-size: var(--font-size-xs); }
+.browser-screenshot-wrap--errored .browser-screenshot { display: none; }
+.browser-page-info { margin-top: 10px; }
+.browser-page-info__row { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--color-border-light); font-size: var(--font-size-sm); }
+.browser-page-info__row:last-child { border-bottom: none; }
+.browser-page-info__label { flex: 0 0 50px; color: var(--color-fg-subtle); }
+.browser-page-info__value { flex: 1; min-width: 0; word-break: break-all; }
+.browser-poll-wrap { display: inline-flex; align-items: center; gap: 6px; }
+.browser-poll-indicator { font-size: var(--font-size-xs); color: var(--color-fg-subtle); padding: 2px 8px; border: 1px solid var(--color-border-light); border-radius: var(--radius-pill); }
+.browser-poll-indicator--live { color: var(--color-success-fg); background: var(--color-success-bg); border-color: var(--color-success-border); }
+.browser-poll-select { width: auto; padding: 2px 4px; font-size: var(--font-size-xs); }
+.browser-takeover { min-height: 200px; }
+.browser-takeover__iframe { width: 100%; height: 400px; border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); }
+.browser-takeover__notice { margin-top: 6px; font-size: var(--font-size-sm); }
+.browser-takeover__message { padding: 40px 20px; text-align: center; color: var(--color-warning-fg); background: var(--color-warning-bg); border: 1px solid var(--color-warning-border); border-radius: var(--radius-sm); }
+.browser-controls { margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--color-border-light); }
+.browser-controls__title { font-weight: 600; font-size: var(--font-size-md); margin-bottom: 8px; }
+.browser-actions__title { font-weight: 600; font-size: var(--font-size-md); margin-bottom: 8px; }
+.browser-actions-table { table-layout: fixed; }
+.browser-actions-table th:nth-child(1), .browser-actions-table td:nth-child(1) { width: 23%; white-space: nowrap; }
+.browser-actions-table th:nth-child(2), .browser-actions-table td:nth-child(2) { width: 18%; }
+.browser-actions-table th:nth-child(3), .browser-actions-table td:nth-child(3) { width: 18%; }
+.browser-actions-table th:nth-child(4), .browser-actions-table td:nth-child(4) { width: 12%; }
+.browser-actions-table th:nth-child(5), .browser-actions-table td:nth-child(5) { width: 29%; word-break: break-word; }
+.chat-browser-link { color: var(--color-primary, #2563eb); text-decoration: none; cursor: pointer; }
+.chat-browser-link:hover { color: var(--color-primary-strong, #0969da); text-decoration: none; }

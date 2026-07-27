@@ -108,3 +108,14 @@ Policy Mesh 是 N-Agent 的运行时治理层，由 14 个领域 Policy + Shared
 9. 多平台 Messaging Gateway、远程运行环境和部署安装体系。
 
 当前阶段实现计划不得提前实现上述完整能力；只保留清晰扩展点。
+
+## Browser 子系统（Browser/Computer Use）
+
+新增独立 DDD 子域，从网页抓取升级为可登录、可操作、可接管的浏览器执行。gated by `settings.browser_enabled`（默认 False）。
+
+- Domain：`app/domain/browser.py` 定义 Browser 会话模型、显式状态机（pending_authorization/active/paused/takeover/degraded/closed）、动作值对象、BrowserBackend/BrowserSessionRegistry/BrowserScreenshotStore 端口、BrowserScreenshotConsumer 枚举；不依赖 Playwright/CDP/SQLite/FastAPI。`app/domain/browser_policy.py` 定义 BrowserPolicy（第 15 个领域 Policy），治理后端准入（HOST_CDP 默认 DENY 需 trusted_host_grant 全绑定、CONTAINER 默认 ALLOW）、会话状态（非 active DENY）、截图释放（仅 DASHBOARD_INTERNAL ALLOW）、接管（REQUIRE_APPROVAL）；fail-closed、IO-free、不导入其他 Policy。
+- Application：BrowserService 是唯一用例入口（per-session 锁串行 + document_revision 复判 + Policy 评估前置 + observe 清理 + screenshot 仅 Dashboard + 敏感字段 type 禁止 + click/type 超时 action_outcome_unknown+degraded 不重试 + host grant 流程）；BrowserToolExecutor 6 工具（navigate/observe/scroll/screenshot=SAFE，click/type=CONFIRM，逐次审批不支持 session grant）经 ToolService 封口；browser_tool_audit 纯投影在 agent_graph 所有持久化/展示边界防泄漏（D039，完成前不得启用 toolset）。
+- Infrastructure：双后端 BrowserBackend 实现——ContainerBrowserBackend（connect_over_cdp 容器 Chromium + 持久 profile + noVNC takeover）与 HostCdpBrowserBackend（受限 Host Bridge，镜像 host_terminal loopback+token+Policy 复判模式，操作宿主 Chrome 复用宿主登录态）；共享 playwright_driver；SQLite registry（4 表 + 部分唯一索引 + CAS）；screenshot_store（Pillow 强校验）；url_safety（SSRF/DNS rebinding 防御）。
+- Interfaces：`/chat/browser/*` Dashboard API（12 端点，同源+actor+一次性 challenge，host-grant 仅 trusted_dev，screenshot no-store）+ browser.js 观察接管页。
+- 安全不变量：cookies/密码/localStorage/原始截图不进入模型消息、ToolResult、tool_calls、browser_actions、通用日志、Usage、Artifact；截图仅 Dashboard 可读；副作用 click/type 逐次 CONFIRM 审批 fail-closed；HOST_CDP 双重 fail-closed（Agent + Bridge）。
+- Policy Mesh：BrowserPolicy 加入后领域 Policy 总数由 14 增至 15；AST 测试 `tests/architecture/test_policy_boundaries.py` 的 POLICY_FILES/POLICY_FILE_OWN_DOMAIN/forbidden 已扩展（forbidden 加 playwright）。

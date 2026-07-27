@@ -10,10 +10,6 @@ def _store(tmp_path):
     return SqliteTaskConfigStore(str(tmp_path / "sessions.db"))
 
 
-def test_get_no_row_returns_none(tmp_path):
-    assert _store(tmp_path).get() is None or True  # async; tested below
-
-
 @pytest.mark.asyncio
 async def test_get_no_row_returns_none_async(tmp_path):
     store = _store(tmp_path)

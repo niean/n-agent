@@ -34,6 +34,7 @@ POLICY_FILES = [
     "skill_policy.py",
     "curator_policy.py",
     "task_policy.py",
+    "browser_policy.py",
 ]
 
 # Domain types files consumed by Policies (not Policy files themselves).
@@ -79,6 +80,7 @@ def test_domain_policy_file_has_no_application_or_infrastructure_imports(filenam
         "sqlite3",
         "acp",
         "asyncio",
+        "playwright",
     )
     violations = [
         m for m in modules
@@ -108,6 +110,7 @@ POLICY_FILE_OWN_DOMAIN = {
     "skill_policy.py": {"app.domain.skill"},
     "curator_policy.py": {"app.domain.skill"},
     "task_policy.py": {"app.domain.task"},
+    "browser_policy.py": {"app.domain.browser"},
 }
 
 

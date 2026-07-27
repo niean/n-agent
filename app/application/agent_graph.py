@@ -17,6 +17,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 
 from app.application.budget_service import BudgetService
+from app.application.browser_tool_audit import project_browser_tool_arguments
 from app.application.context_service import ContextService
 from app.application.events import ChatEvent, ChatEventType
 from app.application.external_memory_manager import ExternalMemoryManager
@@ -85,6 +86,7 @@ _INTERNAL_OPTION_KEYS = {
     "force_compress",
     "max_iterations",
     "persist_messages",
+    "dashboard_approval_event_queue",
 }
 
 
@@ -134,6 +136,7 @@ class AgentGraphRunner:
         runtime_memory_service: RuntimeMemoryService | None = None,
         budget_service: BudgetService | None = None,
         llm_policy: LLMPolicy | None = None,
+        browser_guidance: str | None = None,
         llm_config: LLMConfig | None = None,
         evolution_service: SkillEvolutionService | None = None,
         nudge_interval: int = 10,
@@ -174,6 +177,7 @@ class AgentGraphRunner:
             skill_service=skill_service,
             is_cancelled=self.is_cancelled,
             runtime_memory_service=self._runtime_memory,
+            browser_guidance=browser_guidance,
         )
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
@@ -401,18 +405,51 @@ class AgentGraphRunner:
             await tool_event_queue.put(event)
 
         stream_options["stream_event_sink"] = emit_tool_event
+        # Pop the Dashboard approval event queue before run -- it must NEVER
+        # reach run()/state.run_options/LLM provider/executor. Belt-and-suspenders:
+        # also listed in _INTERNAL_OPTION_KEYS so gen_params filters it if it leaks.
+        approval_queue = stream_options.pop("dashboard_approval_event_queue", None)
         run_task = asyncio.create_task(self.run(state, model, stream_options))
         self.register_run(state.session_id, run_task)
         result = None
         try:
             while not run_task.done():
-                try:
-                    yield await asyncio.wait_for(tool_event_queue.get(), timeout=0.05)
-                except asyncio.TimeoutError:
-                    continue
+                if approval_queue is not None:
+                    # Fan-in: wait on tool_event_queue and approval_queue concurrently,
+                    # yield whichever fires first. Approval events are yielded as-is
+                    # (already ChatEvent(TOOL_APPROVAL_REQUIRED, metadata=...));
+                    # they must NOT pass through scrubber/stream_guard/_redact_tool_event.
+                    tool_task = asyncio.ensure_future(tool_event_queue.get())
+                    approval_task = asyncio.ensure_future(approval_queue.get())
+                    try:
+                        done, _pending = await asyncio.wait(
+                            [tool_task, approval_task],
+                            timeout=0.05,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        # Cancel any still-pending tasks. This handles both the
+                        # normal timeout case (neither queue had events) and
+                        # GeneratorExit/CancelledError interrupting asyncio.wait.
+                        for t in (tool_task, approval_task):
+                            if not t.done():
+                                t.cancel()
+                                with suppress(asyncio.CancelledError):
+                                    await t
+                    for t in done:
+                        if not t.cancelled():
+                            yield t.result()
+                else:
+                    try:
+                        yield await asyncio.wait_for(tool_event_queue.get(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        continue
             result = await run_task
             while not tool_event_queue.empty():
                 yield tool_event_queue.get_nowait()
+            if approval_queue is not None:
+                while not approval_queue.empty():
+                    yield approval_queue.get_nowait()
         except asyncio.CancelledError:
             yield ChatEvent(ChatEventType.ERROR, error="cancelled", finish_reason="cancelled")
             result = None
@@ -847,25 +884,26 @@ class AgentGraphRunner:
 
             # ----- T3: InformationFlow payload logging -----
             response_json_cache = json.dumps(result.message, default=str, ensure_ascii=False)
-            log_req = self._information_flow_service.release(
-                request_json_cache, ReleaseTarget.LLM_PAYLOAD_LOG, origin="llm_request",
-            )
-            log_resp = self._information_flow_service.release(
-                response_json_cache, ReleaseTarget.LLM_PAYLOAD_LOG, origin="llm_response",
-            )
-            if log_req.allowed and log_req.content is not None:
-                logger.info(
-                    "LLM request: session=%s model=%s request=%s",
-                    state.session_id, selected_model, log_req.content,
+            if state.persist_messages:
+                log_req = self._information_flow_service.release(
+                    request_json_cache, ReleaseTarget.LLM_PAYLOAD_LOG, origin="llm_request",
                 )
-            if log_resp.allowed and log_resp.content is not None:
-                logger.info(
-                    "LLM response: session=%s model=%s response=%s",
-                    state.session_id, selected_model, log_resp.content,
+                log_resp = self._information_flow_service.release(
+                    response_json_cache, ReleaseTarget.LLM_PAYLOAD_LOG, origin="llm_response",
                 )
+                if log_req.allowed and log_req.content is not None:
+                    logger.info(
+                        "LLM request: session=%s model=%s request=%s",
+                        state.session_id, selected_model, log_req.content,
+                    )
+                if log_resp.allowed and log_resp.content is not None:
+                    logger.info(
+                        "LLM response: session=%s model=%s response=%s",
+                        state.session_id, selected_model, log_resp.content,
+                    )
 
             # ----- T3: usage recording -----
-            if self.usage_service is not None and result.usage:
+            if state.persist_messages and self.usage_service is not None and result.usage:
                 latency_ms = int((time.monotonic() - call_start) * 1000)
                 provider_kind, provider_name, real_model, requested_model = self._resolve_usage_meta(model)
                 trigger_type = self._resolve_trigger_type(state)
@@ -934,6 +972,27 @@ class AgentGraphRunner:
             tool_id = tool_call.get("id", "")
             tool_name = function.get("name", "")
 
+            # T9/D039: Browser tool argument audit projection. Compute a safe
+            # copy for persistence/display/stream/hooks. Original arguments
+            # (parsed_arguments) are kept for ToolService.execute and
+            # ToolPolicy.authorize_once. Projection failure is fail-closed:
+            # the browser tool must NOT execute and must NOT persist raw args.
+            projection_failed = False
+            if tool_name.startswith("browser_"):
+                try:
+                    display_arguments = project_browser_tool_arguments(
+                        tool_name, parsed_arguments,
+                    )
+                except Exception:
+                    logger.warning(
+                        "browser tool argument projection failed for %s",
+                        tool_name, exc_info=True,
+                    )
+                    projection_failed = True
+                    display_arguments = {}
+            else:
+                display_arguments = parsed_arguments
+
             # T10: pre_tool_call -- before ToolService evaluate_execution.
             # Observer hook (no block). Fires for every tool call including
             # invalid arguments (which skip evaluation but still produce a result).
@@ -942,7 +1001,7 @@ class AgentGraphRunner:
                 session_id=state.session_id,
                 tool_call_id=tool_id,
                 tool_name=tool_name,
-                args=parsed_arguments,
+                args=display_arguments,
                 metadata={},
             )
 
@@ -952,13 +1011,22 @@ class AgentGraphRunner:
                 tool_call={
                     "id": tool_id,
                     "name": tool_name,
-                    "arguments": parsed_arguments,
+                    "arguments": display_arguments,
                     "status": "pending",
                 },
             ))
             await self._emit_stream_tool_event(state.stream_tool_events[-1], options)
 
-            if invalid_arguments:
+            if projection_failed:
+                # T9/D039: fail-closed -- browser tool must NOT execute when
+                # argument projection fails, and must NOT persist raw args.
+                result = ToolResult(
+                    tool_call_id=tool_id,
+                    tool_name=tool_name,
+                    status=ToolResultStatus.ERROR,
+                    content={"error": "browser_argument_projection_failed"},
+                )
+            elif invalid_arguments:
                 result = ToolResult(
                     tool_call_id=tool_id,
                     tool_name=tool_name,
@@ -1008,7 +1076,7 @@ class AgentGraphRunner:
                 tool_call={
                     "id": tool_id,
                     "name": result.tool_name,
-                    "arguments": parsed_arguments,
+                    "arguments": display_arguments,
                     "status": tool_status,
                     "duration_ms": result.duration_ms,
                 },
@@ -1032,7 +1100,7 @@ class AgentGraphRunner:
                 session_id=state.session_id,
                 tool_call_id=tool_id,
                 tool_name=result.tool_name,
-                args=parsed_arguments,
+                args=display_arguments,
                 result=result_payload,
                 duration_ms=result.duration_ms,
                 metadata={},
@@ -1046,7 +1114,7 @@ class AgentGraphRunner:
                 session_id=state.session_id,
                 tool_call_id=tool_id,
                 tool_name=result.tool_name,
-                args=parsed_arguments,
+                args=display_arguments,
                 result=result_payload,
                 duration_ms=result.duration_ms,
                 metadata={},
@@ -1069,7 +1137,7 @@ class AgentGraphRunner:
                         id=result.tool_call_id,
                         session_id=state.session_id,
                         tool_name=result.tool_name,
-                        arguments=parsed_arguments,
+                        arguments=display_arguments,
                         result=result_payload,
                         status=result.status.value,
                         duration_ms=result.duration_ms,
@@ -1104,6 +1172,65 @@ class AgentGraphRunner:
             content={"error": "permission_denied", "reason": reason},
         )
 
+    @staticmethod
+    def _project_approval_arguments(
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project browser tool arguments for approval display.
+
+        Returns a new dict (never the original). For browser tools, sensitive
+        arguments (typed text, URL query/fragment) are stripped/redacted.
+        ApprovalDecider/authorize_once still bind the original arguments
+        via ToolCallRequest; only the displayed ApprovalRequest copy is
+        projected.
+        """
+        if tool_name.startswith("browser_"):
+            try:
+                return project_browser_tool_arguments(tool_name, arguments)
+            except Exception:
+                return {}
+        return dict(arguments)
+
+    @staticmethod
+    def _project_tool_calls_for_persistence(
+        tool_calls: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Project browser tool arguments in tool_calls for persistence.
+
+        Creates a shallow copy of tool_calls with projected arguments for
+        browser tools (strips typed text, URL query/fragment). Non-browser
+        tool_calls are shallow-copied with original arguments. Does not
+        mutate the input.
+        """
+        projected: list[dict[str, Any]] = []
+        for tc in tool_calls:
+            tc_copy = dict(tc)
+            function = dict(tc_copy.get("function", {}))
+            tool_name = function.get("name", "")
+            raw_args = function.get("arguments", {})
+            if tool_name.startswith("browser_"):
+                parsed = raw_args
+                if isinstance(raw_args, str):
+                    try:
+                        parsed = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                if not isinstance(parsed, dict):
+                    parsed = {}
+                try:
+                    safe_args = project_browser_tool_arguments(tool_name, parsed)
+                except Exception:
+                    safe_args = {}
+                function["arguments"] = json.dumps(
+                    safe_args, ensure_ascii=False, default=str,
+                )
+            else:
+                function["arguments"] = raw_args
+            tc_copy["function"] = function
+            projected.append(tc_copy)
+        return projected
+
     async def _request_tool_approval(
         self,
         request: ToolCallRequest,
@@ -1116,11 +1243,17 @@ class AgentGraphRunner:
             return self._permission_denied_result(request, "approval_required")
 
         approval = evaluation.approval
+        # T9/D039: Project browser tool arguments for approval display.
+        # ApprovalDecider/authorize_once still bind the original arguments
+        # via ToolCallRequest; only the displayed ApprovalRequest copy is
+        # projected.
         approval_request = ApprovalRequest(
             session_id=context.session_id or state_session_id,
             tool_call_id=request.id,
             tool_name=approval.name,
-            arguments=dict(request.arguments),
+            arguments=self._project_approval_arguments(
+                approval.name, request.arguments,
+            ),
             description=approval.description,
             risk_level=approval.risk_level,
         )
@@ -1201,7 +1334,11 @@ class AgentGraphRunner:
             content = assistant_message.get("content", "")
             tool_calls = assistant_message.get("tool_calls") or []
             if tool_calls:
-                content = {"content": content, "tool_calls": tool_calls}
+                # T9/D039: Project browser tool arguments in tool_calls for
+                # persistence to prevent sensitive args (typed text, URL
+                # query/fragment) from leaking into persisted assistant messages.
+                projected_tool_calls = self._project_tool_calls_for_persistence(tool_calls)
+                content = {"content": content, "tool_calls": projected_tool_calls}
             if persist:
                 await self._runtime_memory.append_assistant_message(
                     state.session_id, content, source=assistant_source,
@@ -1216,14 +1353,15 @@ class AgentGraphRunner:
                     name=result.get("name"),
                 )
         state.tool_results = []
-        await self._runtime_memory.save_task_state_if_allowed(
-            TaskState(
-                session_id=state.session_id,
-                status="failed" if state.error else "running",
-                iteration_count=state.iteration_count,
-                last_error=state.error,
+        if state.persist_messages:
+            await self._runtime_memory.save_task_state_if_allowed(
+                TaskState(
+                    session_id=state.session_id,
+                    status="failed" if state.error else "running",
+                    iteration_count=state.iteration_count,
+                    last_error=state.error,
+                )
             )
-        )
         return state
 
     def _extract_user_content(self, input_messages: list[dict[str, Any]]) -> str:
@@ -1338,7 +1476,7 @@ class AgentGraphRunner:
 
         # ----- 外部记忆同步 -----
         # call_llm 已经清理过 final_message，这里同步的是干净内容
-        if self.external_memory_manager and state.final_message:
+        if state.persist_messages and self.external_memory_manager and state.final_message:
             user_content = self._extract_user_content(state.input_messages)
             assistant_content = self._extract_assistant_content(state.final_message)
             agent_context = "unattended"  # fail-closed default
@@ -1362,14 +1500,15 @@ class AgentGraphRunner:
             )
         # ----- 结束新增 -----
 
-        await self._runtime_memory.save_task_state_if_allowed(
-            TaskState(
-                session_id=state.session_id,
-                status=state.run_status.value,
-                iteration_count=state.iteration_count,
-                last_error=state.error,
+        if state.persist_messages:
+            await self._runtime_memory.save_task_state_if_allowed(
+                TaskState(
+                    session_id=state.session_id,
+                    status=state.run_status.value,
+                    iteration_count=state.iteration_count,
+                    last_error=state.error,
+                )
             )
-        )
 
         # T9: Close Budget account on terminal (release unsettled reservations)
         await self._budget_service.close(state.run_id)
@@ -1378,7 +1517,7 @@ class AgentGraphRunner:
         # _post_finalize_nudge guards on evolution_service is None and on
         # nudge_interval. maybe_trigger spawns a background asyncio task.
         # Wrapped so evolution never breaks the turn finalize path.
-        if self.evolution_service is not None:
+        if state.persist_messages and self.evolution_service is not None:
             try:
                 await self._post_finalize_nudge(
                     state.session_id,
@@ -1396,7 +1535,11 @@ class AgentGraphRunner:
         # 首次 finalize（_last_finalize_at is None）无法计算 idle，不自动触发，
         # 避免 min_idle_hours 形同虚设。maybe_run_curator 内部 fire-and-forget
         # 且 never raises。CLI 手动 run 走 run_curator_review，不经此路径。
-        if self.curator_service is not None and self._last_finalize_at is not None:
+        if (
+            state.persist_messages
+            and self.curator_service is not None
+            and self._last_finalize_at is not None
+        ):
             idle = (
                 datetime.now(timezone.utc) - self._last_finalize_at
             ).total_seconds()
@@ -1410,7 +1553,8 @@ class AgentGraphRunner:
                     state.session_id,
                     exc_info=True,
                 )
-        self._last_finalize_at = datetime.now(timezone.utc)
+        if state.persist_messages:
+            self._last_finalize_at = datetime.now(timezone.utc)
 
         return state
 
@@ -1433,7 +1577,9 @@ class AgentGraphRunner:
             return
         parts: list[str] = []
         for msg in recent_messages:
-            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if not isinstance(msg, dict) or msg.get("role") == "system":
+                continue
+            content = msg.get("content", "")
             if isinstance(content, str) and content:
                 parts.append(content)
         digest = "\n".join(parts)

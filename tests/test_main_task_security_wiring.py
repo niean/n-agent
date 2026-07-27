@@ -171,3 +171,70 @@ def test_config_route_available_when_task_disabled(tmp_path):
     r = client.get("/chat/tasks/security/config")
     assert r.status_code == 200
     assert r.json()["version"] == 0
+
+
+# ---------------------------------------------------------------------------
+# T3: DashboardToolApprovalBridge + GatewayToolApprovalService wiring
+# ---------------------------------------------------------------------------
+
+def test_tool_approval_service_is_non_default_dataclass_field():
+    """ApplicationServices.tool_approval_service is a non-default field."""
+    import dataclasses
+    from app.main import ApplicationServices
+    fields = {f.name: f for f in dataclasses.fields(ApplicationServices)}
+    assert "tool_approval_service" in fields
+    assert fields["tool_approval_service"].default is dataclasses.MISSING
+
+
+def test_build_application_services_creates_tool_approval_service(tmp_path):
+    from app.application.gateway_tool_approval_service import GatewayToolApprovalService
+    services = build_application_services(_settings(tmp_path))
+    assert isinstance(services.tool_approval_service, GatewayToolApprovalService)
+    # GatewayService holds the SAME instance (not a freshly-constructed one)
+    assert services.gateway_service.tool_approval_service is services.tool_approval_service
+
+
+def test_create_app_shares_tool_approval_service_between_gateway_and_router(tmp_path, monkeypatch):
+    """create_app creates ONE GatewayToolApprovalService and shares it between
+    GatewayService and the dashboard router (identity check ``is``)."""
+    from app.application.gateway_tool_approval_service import GatewayToolApprovalService
+    from app.interfaces.http.dashboard_tool_approval import DashboardToolApprovalBridge
+
+    settings = _settings(tmp_path)
+    captured = {}
+
+    real_create_dashboard_router = __import__(
+        "app.interfaces.http.dashboard", fromlist=["create_dashboard_router"]
+    ).create_dashboard_router
+
+    def router_spy(*args, **kwargs):
+        captured["router_tool_approval_service"] = kwargs.get("tool_approval_service")
+        captured["router_bridge"] = kwargs.get("dashboard_tool_approval_bridge")
+        return real_create_dashboard_router(*args, **kwargs)
+
+    real_build = build_application_services
+
+    def build_spy(s):
+        services = real_build(s)
+        captured["services"] = services
+        return services
+
+    monkeypatch.setattr("app.main.create_dashboard_router", router_spy)
+    monkeypatch.setattr("app.main.build_application_services", build_spy)
+
+    create_app(settings)
+
+    # Real bridge passed to the router
+    assert isinstance(captured["router_bridge"], DashboardToolApprovalBridge)
+    # Real GatewayToolApprovalService passed to the router
+    assert isinstance(captured["router_tool_approval_service"], GatewayToolApprovalService)
+    # Identity: GatewayService and the router receive the SAME instance
+    services = captured["services"]
+    assert services.gateway_service.tool_approval_service is captured["router_tool_approval_service"]
+
+
+def test_create_app_registers_claim_route(tmp_path):
+    """The claim endpoint is registered when the app is wired with the bridge."""
+    app = create_app(_settings(tmp_path))
+    paths = _route_paths(app)
+    assert "/chat/tool-approvals/{confirmation_id}" in paths

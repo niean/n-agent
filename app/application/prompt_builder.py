@@ -39,6 +39,20 @@ MANAGED_TOOL_GUIDANCE = (
     "Never schedule tasks that recursively manage N-Agent itself."
 )
 
+BROWSER_GUIDANCE = (
+    "Browser tools (browser_navigate, browser_observe, browser_click, browser_type, browser_scroll, browser_screenshot) "
+    "let you operate a real browser: log in, click, type, scroll, and observe pages beyond what web_fetch can read. "
+    "Prefer web_fetch for simple public-page reads; use browser tools only when you must log in, interact, or observe a "
+    "page that web_fetch cannot access. "
+    "Always browser_observe after browser_navigate to get the current page elements; browser_click and browser_type only "
+    "accept an element_ref returned by a recent browser_observe, and an element_ref becomes stale (stale_element_ref) after "
+    "any navigation that changes the document -- re-observe before acting again. "
+    "browser_click and browser_type require per-call approval; do not assume a previous approval carries over. "
+    "Never type into password, token, or credit-card fields -- the system returns sensitive_field_requires_takeover and the "
+    "user must take over to enter those values. "
+    "Screenshots are for the user's Dashboard view only; rely on browser_observe text and element refs to decide actions."
+)
+
 TASK_DELEGATION_GUIDANCE = (
     "When the user's goal is multi-step, requires research or analysis, produces files or code, "
     "or is long-running and can be completed autonomously in the background, delegate it as a Task "
@@ -114,6 +128,7 @@ def build_system_prompt(
     external_memory_manager: ExternalMemoryManager | None = None,
     enabled_override: list[str] | None = None,
     skills_index: str | None = None,
+    browser_guidance: str | None = None,
 ) -> str:
     sections: list[str] = [
         _section("Identity", DEFAULT_AGENT_IDENTITY),
@@ -121,10 +136,14 @@ def build_system_prompt(
         _section("Knowledge Base", KNOWLEDGE_GUIDANCE),
         _section("Skills", SKILL_GUIDANCE),
         _section("Managed Resources", MANAGED_TOOL_GUIDANCE),
+    ]
+    if browser_guidance:
+        sections.append(_section("Browser Guidance", browser_guidance))
+    sections.extend([
         _section("Task Delegation", TASK_DELEGATION_GUIDANCE),
         _section("Task Guidance", TASK_GUIDANCE),
         _section("Safety", SAFETY_GUIDANCE),
-    ]
+    ])
     if skills_index:
         sections.append(skills_index)
     if external_memory_manager:

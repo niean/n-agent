@@ -15,8 +15,16 @@ from fastapi.staticfiles import StaticFiles
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.budget_service import BudgetService
+from app.application.browser_service import BrowserService, BrowserServiceSettings
+from app.application.browser_confirmation_service import BrowserConfirmationService
+from app.application.browser_dashboard_service import BrowserDashboardService
+from app.application.browser_tool_executor import (
+    BrowserToolExecutor,
+    browser_tool_definitions,
+)
 from app.application.chat_service import ChatCompletionService
 from app.application.gateway_service import GatewayService
+from app.application.gateway_tool_approval_service import GatewayToolApprovalService
 from app.application.host_terminal_tool_executor import (
     HostTerminalToolExecutor,
     host_terminal_tool_definition,
@@ -47,7 +55,7 @@ from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.skill_service import SkillManageToolExecutor, SkillService, SkillToolExecutor, skill_tool_definitions
 from app.application.skill_evolution_service import SkillEvolutionService
 from app.application.plugin_service import PluginCliCommand, PluginService, PluginToolExecutor
-from app.application.prompt_builder import build_system_prompt
+from app.application.prompt_builder import BROWSER_GUIDANCE, build_system_prompt
 from app.application.task_agent_executor import TaskAgentExecutor
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
@@ -127,6 +135,7 @@ from app.infrastructure.memory.builtin_project import BuiltinProjectMemory
 from app.infrastructure.registry.sqlite_external_memory_config import SQLiteExternalMemoryConfig
 from app.interfaces.feishu_im_adapter import FeishuImAdapter
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
+from app.interfaces.http.dashboard_tool_approval import DashboardToolApprovalBridge
 from app.interfaces.http.openai_compatible import create_openai_compatible_router
 from app.interfaces.http.platforms import create_platforms_router
 from app.infrastructure.sandbox.callback_tools import (
@@ -149,6 +158,16 @@ from app.application.sandbox_tool_executor import SandboxToolExecutor
 from app.application.terminal_tool_executor import TerminalToolExecutor
 from app.domain.sandbox_policy import SandboxDomainConfig, SandboxPolicy
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
+from app.domain.browser import BrowserBackendType
+from app.infrastructure.browser.container_backend import ContainerBrowserBackend
+from app.infrastructure.browser.host_cdp_backend import (
+    HostCdpBackendConfig,
+    HostCdpBrowserBackend,
+)
+from app.infrastructure.browser.screenshot_store import SqliteBrowserScreenshotStore
+from app.infrastructure.browser.sqlite_browser_registry import SqliteBrowserSessionRegistry
+from app.infrastructure.browser.url_safety import UrlVerifier
+from app.domain.browser_policy import BrowserPolicy
 
 if TYPE_CHECKING:
     from app.infrastructure.sandbox.manager import SandboxManager as _SandboxManager
@@ -313,6 +332,7 @@ class ApplicationServices:
     policy_dashboard_service: PolicyDashboardService
     task_security_dashboard_service: TaskSecurityDashboardService
     task_config_service: TaskConfigService
+    tool_approval_service: GatewayToolApprovalService
     image_store: LocalImageStore
     usage_service: UsageService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
@@ -323,6 +343,10 @@ class ApplicationServices:
     task_service: TaskService | None = None
     task_run_service: TaskRunService | None = None
     task_runner: TaskRunner | None = None
+    # Browser 子域服务 (T10). None when browser_enabled=False.
+    browser_service: BrowserService | None = None
+    browser_dashboard_service: "BrowserDashboardService | None" = None
+    browser_confirmation_service: "BrowserConfirmationService | None" = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -822,6 +846,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         llm_config=llm_config,
         nudge_interval=settings.skills_creation_nudge_interval,
         hook_dispatcher=plugin_service,
+        browser_guidance=BROWSER_GUIDANCE if settings.browser_enabled else None,
     )
     session_service = SessionService(
         memory_store,
@@ -1277,6 +1302,84 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         routes["terminal"] = terminal_tool_executor
         tool_service.executor = CompositeToolExecutor(routes, fallback=McpToolExecutor(mcp_service))
 
+    # Browser subsystem wiring (T10/T11/T12/T13). Gated on browser_enabled:
+    # when False, the entire subsystem is skipped (no tools, no service, no
+    # routes). T13 wires both ContainerBrowserBackend and HostCdpBrowserBackend
+    # based on configuration; when a backend's required config is absent, it is
+    # omitted from the backends dict (degraded mode for that backend type).
+    browser_service: BrowserService | None = None
+    browser_dashboard_service_obj: BrowserDashboardService | None = None
+    browser_confirmation_service_obj: BrowserConfirmationService | None = None
+    if settings.browser_enabled:
+        browser_registry = SqliteBrowserSessionRegistry(settings.sqlite_path)
+        browser_screenshot_store = SqliteBrowserScreenshotStore(
+            settings.workspace_root / "locals" / "browser-screenshots",
+            max_pixels=settings.browser_max_screenshot_pixels,
+            max_per_session=settings.browser_per_session_screenshot_quota,
+            ttl_seconds=settings.browser_screenshot_ttl_seconds,
+        )
+        browser_url_verifier = UrlVerifier()
+        browser_policy = BrowserPolicy()
+        browser_service_settings = BrowserServiceSettings(
+            max_sessions_per_run=settings.browser_global_session_limit,
+            action_timeout_seconds=float(settings.browser_action_timeout),
+            screenshot_consumer_default="dashboard_internal",
+        )
+        # Build backends dict based on configuration.
+        browser_backends: dict[BrowserBackendType, Any] = {}
+        # Container backend: created when browser_container_endpoint is configured.
+        if settings.browser_container_endpoint.strip():
+            container_backend = ContainerBrowserBackend(
+                endpoint=settings.browser_container_endpoint,
+                url_verifier=browser_url_verifier,
+                action_timeout_seconds=float(settings.browser_action_timeout),
+                navigation_timeout_seconds=float(settings.browser_navigation_timeout),
+                takeover_ttl_seconds=settings.browser_takeover_ttl_seconds,
+            )
+            browser_backends[BrowserBackendType.CONTAINER] = container_backend
+        # Host CDP backend: created when host bridge URL + token path are
+        # configured AND trusted_dev is True. trusted_dev gates host Chrome
+        # access (production deployments must not enable host_cdp without
+        # explicit trusted_dev opt-in).
+        if (
+            settings.browser_host_bridge_url.strip()
+            and settings.browser_host_bridge_token_path is not None
+            and settings.browser_trusted_dev
+        ):
+            host_cdp_config = HostCdpBackendConfig(
+                base_url=settings.browser_host_bridge_url,
+                token_path=settings.browser_host_bridge_token_path,
+            )
+            host_cdp_backend = HostCdpBrowserBackend(host_cdp_config)
+            browser_backends[BrowserBackendType.HOST_CDP] = host_cdp_backend
+        browser_service = BrowserService(
+            backends=browser_backends,
+            registry=browser_registry,
+            screenshot_store=browser_screenshot_store,
+            browser_policy=browser_policy,
+            default_backend=BrowserBackendType(settings.browser_default_backend),
+            settings=browser_service_settings,
+            audit_service=audit_service,
+        )
+        browser_tool_executor = BrowserToolExecutor(browser_service)
+        browser_defs = browser_tool_definitions()
+        tool_service.set_dynamic_definitions("browser", browser_defs)
+        for browser_def in browser_defs:
+            routes[browser_def.name] = browser_tool_executor
+        tool_service.executor = CompositeToolExecutor(
+            routes, fallback=McpToolExecutor(mcp_service)
+        )
+        # Browser Dashboard services (T14/T15).
+        browser_confirmation_service_obj = BrowserConfirmationService(
+            ttl_seconds=settings.browser_takeover_ttl_seconds
+        )
+        browser_dashboard_service_obj = BrowserDashboardService(
+            browser_service=browser_service,
+            screenshot_store=browser_screenshot_store,
+            confirmation_service=browser_confirmation_service_obj,
+            settings=settings,
+        )
+
     def health_snapshot() -> dict:
         memory_status = "ok"
         try:
@@ -1353,6 +1456,12 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             },
         }
 
+    # T3: Create ONE GatewayToolApprovalService and share it between
+    # GatewayService and the Dashboard router.  Do NOT let either side
+    # construct its own -- the identity must be preserved so that session
+    # grants issued via the Dashboard claim endpoint are visible to the
+    # gateway's allowed_confirm_tools_override / trust_session checks.
+    tool_approval_service = GatewayToolApprovalService(memory_store)
     gateway_service = GatewayService(
         gateway_registry,
         chat_service,
@@ -1363,6 +1472,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         schedule_service=schedule_service,
         require_actor_for_managed_actions=settings.gateway_require_actor_for_managed_actions,
         confirmation_ttl_seconds=settings.gateway_confirmation_ttl_seconds,
+        tool_approval_service=tool_approval_service,
     )
     feishu_im_adapter = (
         FeishuImAdapter(gateway_service, feishu_client) if feishu_client is not None else None
@@ -1426,6 +1536,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         policy_dashboard_service=PolicyDashboardService(SettingsPolicyProfileProvider(settings)),
         task_security_dashboard_service=TaskSecurityDashboardService(settings, task_config_service),
         task_config_service=task_config_service,
+        tool_approval_service=tool_approval_service,
         image_store=image_store,
         usage_service=usage_service,
         sandbox_dashboard_service=sandbox_dashboard_service if settings.sandbox_enabled else None,
@@ -1434,6 +1545,9 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         task_service=task_service,
         task_run_service=task_run_service,
         task_runner=task_runner,
+        browser_service=browser_service,
+        browser_dashboard_service=browser_dashboard_service_obj,
+        browser_confirmation_service=browser_confirmation_service_obj,
     )
 
 
@@ -1503,6 +1617,21 @@ def collect_plugin_cli_commands() -> list[PluginCliCommand]:
     except Exception:
         logger.warning("plugin CLI command discovery failed", exc_info=True)
         return []
+
+
+def _default_browser_actor_resolver(request: Any) -> str | None:
+    """Default actor resolver for Browser Dashboard routes.
+
+    Derives the actor from a trusted server-side header (X-Dashboard-Actor)
+    set by the Dashboard frontend. In production deployments this should be
+    replaced with a resolver that reads from an authenticated session cookie
+    or mTLS identity. The actor is NEVER read from HTTP body/query/metadata.
+    """
+    actor = request.headers.get("x-dashboard-actor", "") if hasattr(request, "headers") else ""
+    if actor and isinstance(actor, str) and actor.strip():
+        return actor.strip()
+    # Fallback: dashboard operator (trusted same-origin context).
+    return "dashboard-operator"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -1583,11 +1712,44 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     services.external_memory_service.shutdown()
                 except Exception:
                     logger.exception("external memory shutdown failed")
+            # Browser subsystem best-effort shutdown (T10). Close non-closed
+            # sessions; failures are logged but do not block shutdown or fake
+            # closed status. T10: backends dict is empty (no backends wired),
+            # so close_session only releases registry/lease resources.
+            if services.browser_service is not None:
+                try:
+                    import sqlite3 as _sqlite3
+                    _registry = services.browser_service._registry
+                    _db_path = getattr(_registry, "path", None)
+                    if _db_path is not None:
+                        _conn = _sqlite3.connect(str(_db_path))
+                        _conn.row_factory = _sqlite3.Row
+                        _rows = _conn.execute(
+                            "SELECT id, n_agent_session_id FROM browser_sessions "
+                            "WHERE status != 'closed'"
+                        ).fetchall()
+                        _conn.close()
+                        for _row in _rows:
+                            try:
+                                await services.browser_service.close_session(
+                                    _row["n_agent_session_id"]
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "browser session close failed: %s",
+                                    _row["id"],
+                                    exc_info=True,
+                                )
+                except Exception:
+                    logger.exception("browser shutdown failed")
 
     app = FastAPI(title="N-Agent", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.include_router(create_openai_compatible_router(services.chat_service, services.model_service, services.memory_store))
     app.include_router(create_platforms_router(services.platform_service))
+    # T3: One DashboardToolApprovalBridge shared with the same
+    # GatewayToolApprovalService instance that GatewayService holds.
+    dashboard_tool_approval_bridge = DashboardToolApprovalBridge()
     app.include_router(
         create_dashboard_router(
             services.session_service,
@@ -1615,6 +1777,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             task_config_service=services.task_config_service,
             task_service=services.task_service,
             task_run_service=services.task_run_service,
+            browser_dashboard_service=services.browser_dashboard_service,
+            browser_confirmation_service=services.browser_confirmation_service,
+            browser_actor_resolver=_default_browser_actor_resolver,
+            dashboard_tool_approval_bridge=dashboard_tool_approval_bridge,
+            tool_approval_service=services.tool_approval_service,
+            settings=services.settings,
         )
     )
     return app

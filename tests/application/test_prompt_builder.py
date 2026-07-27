@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from app.application.prompt_builder import MANAGED_TOOL_GUIDANCE, SKILL_GUIDANCE, build_system_prompt
+from app.application.prompt_builder import BROWSER_GUIDANCE, MANAGED_TOOL_GUIDANCE, SKILL_GUIDANCE, build_system_prompt
 
 
 def test_managed_tool_guidance_routes_to_skill_view():
@@ -252,3 +252,26 @@ def test_task_guidance_worker_keeps_task_propose_change_contract():
     assert "task_propose_change" in text
     assert "immediately" in text
     assert "WAITING_APPROVAL" in text
+
+
+def test_browser_guidance_absent_by_default():
+    prompt = build_system_prompt()
+    assert "## Browser Guidance" not in prompt
+
+
+def test_browser_guidance_present_when_provided():
+    prompt = build_system_prompt(browser_guidance=BROWSER_GUIDANCE)
+    assert prompt.count("## Browser Guidance") == 1
+    # key guidance content present
+    assert "browser_observe" in prompt
+    assert "element_ref" in prompt
+    assert "stale_element_ref" in prompt
+    assert "sensitive_field_requires_takeover" in prompt
+    assert "web_fetch" in prompt
+
+
+def test_browser_guidance_placed_before_safety():
+    prompt = build_system_prompt(browser_guidance=BROWSER_GUIDANCE)
+    browser_idx = prompt.index("## Browser Guidance")
+    safety_idx = prompt.index("## Safety")
+    assert browser_idx < safety_idx

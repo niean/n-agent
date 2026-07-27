@@ -200,6 +200,27 @@ class Settings(BaseSettings):
     # 附件根路径（相对路径在 main.py 装配时 resolve 到 workspace_root 下）
     task_attachments_root: Path = Field(default=Path("locals/task-attachments"))
 
+    # Browser 子域配置 (B class env-only). N_AGENT_BROWSER_ 前缀.
+    # disabled unless explicitly enabled; container backend is the default.
+    browser_enabled: bool = Field(default=False)
+    browser_default_backend: str = Field(default="container")
+    browser_container_endpoint: str = Field(default="")
+    browser_action_timeout: int = Field(default=30, gt=0)
+    browser_navigation_timeout: int = Field(default=30, gt=0)
+    browser_max_observe_chars: int = Field(default=4000, ge=1, le=20000)
+    browser_max_observe_elements: int = Field(default=80, ge=1, le=200)
+    browser_max_screenshot_bytes: int = Field(default=1048576, ge=1024)
+    browser_max_screenshot_pixels: int = Field(default=10_000_000, ge=1)
+    browser_screenshot_ttl_seconds: int = Field(default=86400, gt=0)
+    browser_per_session_screenshot_quota: int = Field(default=20, ge=1)
+    browser_poll_interval_seconds: int = Field(default=2, ge=1, le=5)
+    browser_global_session_limit: int = Field(default=4, ge=1)
+    browser_host_bridge_url: str = Field(default="")
+    browser_host_bridge_token_path: Path | None = Field(default=None)
+    browser_host_grant_ttl_seconds: int = Field(default=300, gt=0)
+    browser_takeover_ttl_seconds: int = Field(default=60, gt=0)
+    browser_trusted_dev: bool = Field(default=False)
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @field_validator("sandbox_type")
@@ -208,6 +229,16 @@ class Settings(BaseSettings):
         if value not in ("local", "docker"):
             raise ValueError(
                 f"invalid sandbox_type: {value!r} (must be 'local' or 'docker')"
+            )
+        return value
+
+    @field_validator("browser_default_backend")
+    @classmethod
+    def validate_browser_default_backend(cls, value: str) -> str:
+        if value not in ("host_cdp", "container"):
+            raise ValueError(
+                f"invalid browser_default_backend: {value!r} "
+                "(must be 'host_cdp' or 'container')"
             )
         return value
 
@@ -246,6 +277,43 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_browser_backend_config(self) -> "Settings":
+        """Cross-field validation for browser backend configuration.
+
+        When browser_enabled is True and the default backend is host_cdp,
+        require the host bridge URL, token path, and trusted_dev flag. When
+        the default backend is container, require the container endpoint.
+        When browser_enabled is False, no validation is applied (allows
+        constructing Settings without backend config in disabled mode).
+        """
+        if not self.browser_enabled:
+            return self
+        if self.browser_default_backend == "host_cdp":
+            if not self.browser_host_bridge_url.strip():
+                raise ValueError(
+                    "browser_host_bridge_url is required when "
+                    "browser_default_backend is host_cdp"
+                )
+            if self.browser_host_bridge_token_path is None:
+                raise ValueError(
+                    "browser_host_bridge_token_path is required when "
+                    "browser_default_backend is host_cdp"
+                )
+            if not self.browser_trusted_dev:
+                raise ValueError(
+                    "browser_trusted_dev must be True when "
+                    "browser_default_backend is host_cdp (host Chrome access "
+                    "requires explicit trusted_dev opt-in)"
+                )
+        elif self.browser_default_backend == "container":
+            if not self.browser_container_endpoint.strip():
+                raise ValueError(
+                    "browser_container_endpoint is required when "
+                    "browser_default_backend is container"
+                )
+        return self
+
     @field_validator(
         "sqlite_path", "workspace_root", "skills_root", "plugins_root",
         "sandbox_docker_host_workspace_root", "sandbox_docker_host_locals_root",
@@ -255,6 +323,7 @@ class Settings(BaseSettings):
         "host_terminal_host_workspace_root",
         "host_terminal_host_skills_root",
         "task_attachments_root",
+        "browser_host_bridge_token_path",
         mode="before",
     )
     @classmethod

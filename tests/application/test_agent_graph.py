@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -5,12 +6,20 @@ import pytest
 from typing import Any
 
 from app.application.agent_graph import AgentGraphRunner
-from app.application.events import ChatEventType
+from app.application.events import ChatEvent, ChatEventType
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.domain.agent import AgentState
 from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextCompressionResult
 from app.domain.provider import LLMResult, ModelInfo
-from app.domain.tool import RiskLevel, ToolCallRequest, ToolDefinition, ToolResult, ToolResultStatus
+from app.domain.tool import (
+    ApprovalDecision,
+    RiskLevel,
+    ToolCallRequest,
+    ToolDefinition,
+    ToolExecutionContext,
+    ToolResult,
+    ToolResultStatus,
+)
 from app.domain.session import ConversationSession
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
@@ -76,6 +85,19 @@ class DirectProvider(FakeProvider):
         self.last_messages = list(messages)
         self.calls += 1
         return LLMResult(message={"role": "assistant", "content": "hello"}, finish_reason="stop")
+
+
+class OptionsCapturingProvider(FakeProvider):
+    """Records the options dict received by the provider for asserting internal keys are filtered."""
+
+    def __init__(self):
+        super().__init__()
+        self.received_options: dict[str, Any] | None = None
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.received_options = dict(options or {})
+        self.calls += 1
+        return LLMResult(message={"role": "assistant", "content": "done"}, finish_reason="stop")
 
 
 class KnowledgeProvider(FakeProvider):
@@ -1196,3 +1218,638 @@ async def test_agent_graph_delegates_task_and_confirms_with_task_id(tmp_path):
     assert any(tc.tool_name == "create_task" and tc.status == "success" for tc in tool_calls)
     # Agent 在工具结果后输出含 task id 的确认文本
     assert state.final_message["content"] == "已创建任务 t_delegated，将在本会话执行。"
+
+
+# ---------------------------------------------------------------------------
+# T9/D039: Browser tool argument audit projection integration tests
+# ---------------------------------------------------------------------------
+
+
+class _BrowserNavigateProvider:
+    """Provider that emits a browser_navigate tool_call once, then finalizes."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def list_models(self):
+        return [ModelInfo("test", "test", "fake")]
+
+    async def supports_tools(self, model):
+        return True
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-nav-1",
+                        "type": "function",
+                        "function": {
+                            "name": "browser_navigate",
+                            "arguments": json.dumps({
+                                "url": "https://example.com/path?secret=token#fragment",
+                            }),
+                        },
+                    }],
+                },
+                finish_reason="tool_calls",
+            )
+        return LLMResult(message={"role": "assistant", "content": "navigated"}, finish_reason="stop")
+
+
+class _BrowserTypeProvider:
+    """Provider that emits a browser_type tool_call once, then finalizes."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def list_models(self):
+        return [ModelInfo("test", "test", "fake")]
+
+    async def supports_tools(self, model):
+        return True
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-type-1",
+                        "type": "function",
+                        "function": {
+                            "name": "browser_type",
+                            "arguments": json.dumps({
+                                "element_ref": "input-1",
+                                "document_revision": 3,
+                                "text": "my secret password",
+                                "clear_first": True,
+                            }),
+                        },
+                    }],
+                },
+                finish_reason="tool_calls",
+            )
+        return LLMResult(message={"role": "assistant", "content": "typed"}, finish_reason="stop")
+
+
+class _RecordingBrowserExecutor:
+    """Records the arguments passed to execute (should be original, not projected)."""
+
+    def __init__(self):
+        self.calls: list[ToolCallRequest] = []
+
+    async def execute(self, request: ToolCallRequest, context=None) -> ToolResult:
+        self.calls.append(request)
+        return ToolResult(
+            request.id,
+            request.name,
+            ToolResultStatus.SUCCESS,
+            {"action_type": "navigate", "status": "success"},
+        )
+
+
+def _browser_tool_definitions():
+    from app.application.browser_tool_executor import browser_tool_definitions
+    return browser_tool_definitions()
+
+
+@pytest.mark.asyncio
+async def test_browser_navigate_arguments_projected_in_persisted_tool_call(tmp_path):
+    """browser_navigate: persisted ToolCall.arguments has URL sanitized
+    (no query/fragment), while executor receives the original URL."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-nav"))
+    executor = _RecordingBrowserExecutor()
+    runner = AgentGraphRunner(
+        _BrowserNavigateProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-nav",
+        input_messages=[{"role": "user", "content": "go to example.com"}],
+    )
+    ctx = ToolExecutionContext(session_id="s-nav")
+    await runner.run(state, "test", options={"tool_execution_context": ctx})
+
+    # Executor received the ORIGINAL url (with query/fragment)
+    assert len(executor.calls) == 1
+    assert executor.calls[0].arguments["url"] == "https://example.com/path?secret=token#fragment"
+
+    # Persisted ToolCall has PROJECTED url (no query/fragment)
+    tool_calls = await store.list_tool_calls("s-nav")
+    assert len(tool_calls) == 1
+    persisted_args = tool_calls[0].arguments
+    assert persisted_args["url"] == "https://example.com/path"
+    assert "?" not in persisted_args["url"]
+    assert "#" not in persisted_args["url"]
+
+
+@pytest.mark.asyncio
+async def test_browser_type_arguments_projected_in_persisted_tool_call(tmp_path):
+    """browser_type: persisted ToolCall.arguments has text redacted to
+    char_count, while executor receives the original text."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-type"))
+    executor = _RecordingBrowserExecutor()
+    runner = AgentGraphRunner(
+        _BrowserTypeProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-type",
+        input_messages=[{"role": "user", "content": "type password"}],
+    )
+    # browser_type is CONFIRM risk -- requires approval decider
+    ctx = ToolExecutionContext(
+        session_id="s-type",
+        approval_decider=lambda _: ApprovalDecision(True, "once"),
+    )
+    await runner.run(state, "test", options={"tool_execution_context": ctx})
+
+    # Executor received the ORIGINAL text
+    assert len(executor.calls) == 1
+    assert executor.calls[0].arguments["text"] == "my secret password"
+
+    # Persisted ToolCall has PROJECTED text (redacted)
+    tool_calls = await store.list_tool_calls("s-type")
+    assert len(tool_calls) == 1
+    persisted_args = tool_calls[0].arguments
+    assert "text" in persisted_args
+    assert isinstance(persisted_args["text"], dict)
+    assert persisted_args["text"]["char_count"] == 18
+    assert persisted_args["text"]["redacted"] is True
+    # Original text must NOT appear in persisted args
+    assert persisted_args.get("text") != "my secret password"
+
+
+@pytest.mark.asyncio
+async def test_browser_navigate_arguments_projected_in_stream_events(tmp_path):
+    """browser_navigate: stream events carry projected (sanitized) URL,
+    not the original URL with query/fragment."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-stream"))
+    executor = _RecordingBrowserExecutor()
+    runner = AgentGraphRunner(
+        _BrowserNavigateProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-stream",
+        input_messages=[{"role": "user", "content": "navigate"}],
+    )
+    ctx = ToolExecutionContext(session_id="s-stream")
+    events = [e async for e in runner.stream_events(
+        state, "test", options={"tool_execution_context": ctx},
+    )]
+
+    # Collect tool_call_delta events
+    tool_events = [e for e in events if e.type is ChatEventType.TOOL_CALL_DELTA]
+    assert len(tool_events) >= 2  # pending + success/error
+
+    for event in tool_events:
+        tc = event.tool_call
+        assert tc["name"] == "browser_navigate"
+        # Stream events must carry projected URL (no query/fragment)
+        url = tc["arguments"].get("url", "")
+        assert "?" not in url
+        assert "#" not in url
+        assert "secret" not in json.dumps(tc["arguments"])
+
+
+@pytest.mark.asyncio
+async def test_browser_type_arguments_projected_in_stream_events(tmp_path):
+    """browser_type: stream events carry redacted text (char_count),
+    not the original typed text."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-stream-type"))
+    executor = _RecordingBrowserExecutor()
+    runner = AgentGraphRunner(
+        _BrowserTypeProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-stream-type",
+        input_messages=[{"role": "user", "content": "type"}],
+    )
+    ctx = ToolExecutionContext(session_id="s-stream-type")
+    events = [e async for e in runner.stream_events(
+        state, "test", options={"tool_execution_context": ctx},
+    )]
+
+    tool_events = [e for e in events if e.type is ChatEventType.TOOL_CALL_DELTA]
+    assert len(tool_events) >= 2
+
+    for event in tool_events:
+        tc = event.tool_call
+        assert tc["name"] == "browser_type"
+        # Stream events must carry redacted text, not the original
+        text = tc["arguments"].get("text")
+        assert isinstance(text, dict)
+        assert text["redacted"] is True
+        # Original text must NOT appear in stream events
+        assert "my secret password" not in json.dumps(tc["arguments"])
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_arguments_projected_in_approval_request(tmp_path):
+    """browser_type: ApprovalRequest.arguments has text redacted for display,
+    but the executor receives the original text (via ToolCallRequest)."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-approval"))
+    executor = _RecordingBrowserExecutor()
+    approval_calls: list[Any] = []
+
+    def decider(req) -> Any:
+        approval_calls.append(req)
+        return ApprovalDecision(allowed=True, scope="once")
+
+    runner = AgentGraphRunner(
+        _BrowserTypeProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-approval",
+        input_messages=[{"role": "user", "content": "type password"}],
+    )
+    ctx = ToolExecutionContext(
+        session_id="s-approval",
+        approval_decider=decider,
+    )
+    await runner.run(state, "test", options={"tool_execution_context": ctx})
+
+    # Decider received projected arguments (text redacted)
+    assert len(approval_calls) == 1
+    approval_args = approval_calls[0].arguments
+    assert isinstance(approval_args["text"], dict)
+    assert approval_args["text"]["redacted"] is True
+    assert "my secret password" not in json.dumps(approval_args)
+
+    # Executor received the ORIGINAL text
+    assert len(executor.calls) == 1
+    assert executor.calls[0].arguments["text"] == "my secret password"
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_arguments_projected_in_persisted_assistant_message(tmp_path):
+    """browser_navigate: persisted assistant message tool_calls have
+    projected (sanitized) URL arguments, not the original."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-assistant"))
+    executor = _RecordingBrowserExecutor()
+    runner = AgentGraphRunner(
+        _BrowserNavigateProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-assistant",
+        input_messages=[{"role": "user", "content": "navigate"}],
+    )
+    ctx = ToolExecutionContext(session_id="s-assistant")
+    await runner.run(state, "test", options={"tool_execution_context": ctx})
+
+    persisted = await store.list_messages("s-assistant")
+    assistant_msgs = [m for m in persisted if m.role == "assistant"]
+    # Find the assistant message with tool_calls
+    tool_call_msgs = [
+        m for m in assistant_msgs
+        if isinstance(m.content, dict) and m.content.get("tool_calls")
+    ]
+    assert len(tool_call_msgs) >= 1
+    tc = tool_call_msgs[0].content["tool_calls"][0]
+    args_str = tc["function"]["arguments"]
+    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+    # Persisted args must have projected URL (no query/fragment)
+    assert "?" not in args["url"]
+    assert "#" not in args["url"]
+    assert "secret" not in args_str
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_executes_with_original_arguments(tmp_path):
+    """browser_type: the executor receives original arguments even though
+    persistence/stream/approval use projected arguments."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-original"))
+    executor = _RecordingBrowserExecutor()
+    runner = AgentGraphRunner(
+        _BrowserTypeProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-original",
+        input_messages=[{"role": "user", "content": "type"}],
+    )
+    # browser_type is CONFIRM risk -- requires approval decider
+    ctx = ToolExecutionContext(
+        session_id="s-original",
+        approval_decider=lambda _: ApprovalDecision(True, "once"),
+    )
+    await runner.run(state, "test", options={"tool_execution_context": ctx})
+
+    assert len(executor.calls) == 1
+    req = executor.calls[0]
+    assert req.arguments["text"] == "my secret password"
+    assert req.arguments["element_ref"] == "input-1"
+    assert req.arguments["document_revision"] == 3
+    assert req.arguments["clear_first"] is True
+
+
+@pytest.mark.asyncio
+async def test_non_browser_tool_arguments_not_projected_in_persistence(tmp_path):
+    """Non-browser tools: arguments are NOT projected (passthrough).
+    Regression: calculator arguments must appear unchanged in persisted ToolCall."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-calc"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    await runner.run(
+        AgentState(session_id="s-calc", input_messages=[{"role": "user", "content": "calc"}]),
+        "test",
+    )
+    tool_calls = await store.list_tool_calls("s-calc")
+    assert len(tool_calls) == 1
+    # Calculator arguments are NOT projected (passthrough for non-browser)
+    assert tool_calls[0].arguments == {"expression": "1+2"}
+
+
+@pytest.mark.asyncio
+async def test_browser_projection_does_not_mutate_working_messages(tmp_path):
+    """browser_navigate: working_messages (in-memory LLM context) retains
+    original arguments; only persisted copies are projected."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-retain"))
+    executor = _RecordingBrowserExecutor()
+    runner = AgentGraphRunner(
+        _BrowserNavigateProvider(),
+        ToolService(executor, _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-retain",
+        input_messages=[{"role": "user", "content": "navigate"}],
+    )
+    ctx = ToolExecutionContext(session_id="s-retain")
+    result_state = await runner.run(
+        state, "test", options={"tool_execution_context": ctx},
+    )
+
+    # working_messages should retain the original URL (in-memory, for LLM)
+    assistant_msgs = [
+        m for m in result_state.working_messages
+        if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
+    ]
+    assert len(assistant_msgs) >= 1
+    tc = assistant_msgs[0]["tool_calls"][0]
+    args_str = tc["function"]["arguments"]
+    # Original URL is retained in working_messages (not projected)
+    assert "secret=token" in args_str
+    assert "#fragment" in args_str
+
+
+# ---------------------------------------------------------------------------
+# T2: Dashboard approval event queue fan-in into stream_events
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_events_forwards_dashboard_approval_event_queue(tmp_path):
+    """stream_events fans in dashboard_approval_event_queue events alongside
+    tool events. The approval event must appear after MESSAGE_START, and the
+    queue must NOT leak into the provider's options."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-approval-queue"))
+    provider = OptionsCapturingProvider()
+    runner = AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    approval_queue: asyncio.Queue[ChatEvent] = asyncio.Queue()
+    approval_event = ChatEvent(
+        ChatEventType.TOOL_APPROVAL_REQUIRED,
+        metadata={"confirmation_id": "test-conf-1", "tool_name": "test_tool"},
+    )
+    await approval_queue.put(approval_event)
+
+    async def collect_events():
+        return [
+            event
+            async for event in runner.stream_events(
+                AgentState(
+                    session_id="s-approval-queue",
+                    input_messages=[{"role": "user", "content": "hi"}],
+                ),
+                "test",
+                options={"dashboard_approval_event_queue": approval_queue},
+            )
+        ]
+
+    events = await asyncio.wait_for(collect_events(), timeout=10.0)
+
+    # Approval event appears in output
+    approval_events = [
+        e for e in events if e.type is ChatEventType.TOOL_APPROVAL_REQUIRED
+    ]
+    assert len(approval_events) == 1
+    assert approval_events[0].metadata["confirmation_id"] == "test-conf-1"
+
+    # MESSAGE_START precedes the approval event
+    message_start_idx = next(
+        i for i, e in enumerate(events) if e.type is ChatEventType.MESSAGE_START
+    )
+    approval_idx = events.index(approval_events[0])
+    assert message_start_idx < approval_idx
+
+    # The approval queue is NOT passed to the provider
+    assert provider.received_options is not None
+    assert "dashboard_approval_event_queue" not in provider.received_options
+
+
+@pytest.mark.asyncio
+async def test_stream_events_disconnect_cleans_up_approval_event_queue(tmp_path):
+    """When the SSE consumer disconnects (aclose) after the approval event is
+    emitted, run_task.cancel() propagates into the decider's await, and the
+    bridge cleans up the pending approval (no leftover claimable pending)."""
+    from app.interfaces.http.dashboard_tool_approval import DashboardToolApprovalBridge
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-disconnect"))
+
+    bridge = DashboardToolApprovalBridge()
+    approval_queue: asyncio.Queue[ChatEvent] = asyncio.Queue()
+
+    async def sender(metadata: dict[str, Any]) -> None:
+        event = ChatEvent(ChatEventType.TOOL_APPROVAL_REQUIRED, metadata=metadata)
+        await approval_queue.put(event)
+
+    decider = bridge.create_decider("s-disconnect", "dashboard", sender)
+
+    runner = AgentGraphRunner(
+        _BrowserTypeProvider(),
+        ToolService(_RecordingBrowserExecutor(), _browser_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    state = AgentState(
+        session_id="s-disconnect",
+        input_messages=[{"role": "user", "content": "type password"}],
+    )
+    ctx = ToolExecutionContext(
+        session_id="s-disconnect",
+        approval_decider=decider,
+    )
+
+    gen = runner.stream_events(
+        state,
+        "test",
+        options={
+            "tool_execution_context": ctx,
+            "dashboard_approval_event_queue": approval_queue,
+        },
+    )
+
+    # Iterate until the approval event appears
+    confirmation_id: str | None = None
+    try:
+        while True:
+            event = await asyncio.wait_for(gen.__anext__(), timeout=10.0)
+            if event.type is ChatEventType.TOOL_APPROVAL_REQUIRED:
+                confirmation_id = event.metadata["confirmation_id"]
+                break
+    except (StopAsyncIteration, asyncio.TimeoutError):
+        pass
+
+    assert confirmation_id is not None
+    assert bridge.pending_count == 1
+
+    # Close the iterator (simulates SSE consumer disconnect)
+    await gen.aclose()
+
+    # Bridge pending is cleaned up by decider finally block
+    assert bridge.pending_count == 0
+    # A subsequent claim cannot approve the tool -- same-session returns
+    # conflict (tombstone), cross-session returns not_found
+    same_session_result = bridge.claim(confirmation_id, "s-disconnect", "once")
+    assert same_session_result.status == "conflict"
+    cross_session_result = bridge.claim(confirmation_id, "s-other", "once")
+    assert cross_session_result.status == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_stream_events_without_approval_event_queue_backward_compat(tmp_path):
+    """Without dashboard_approval_event_queue in options, stream_events behaves
+    exactly as before (no approval events, normal tool events still flow)."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-no-approval"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    events = [
+        event
+        async for event in runner.stream_events(
+            AgentState(
+                session_id="s-no-approval",
+                input_messages=[{"role": "user", "content": "calc"}],
+            ),
+            "test",
+        )
+    ]
+
+    # No approval events
+    assert not any(e.type is ChatEventType.TOOL_APPROVAL_REQUIRED for e in events)
+    # Normal flow preserved
+    assert events[0].type is ChatEventType.MESSAGE_START
+    assert any(e.type is ChatEventType.TOOL_CALL_DELTA for e in events)
+    assert events[-1].type is ChatEventType.DONE
+
+
+@pytest.mark.asyncio
+async def test_stream_events_fan_in_both_queues_concurrently_with_approval_event_queue(tmp_path):
+    """When both the tool_event_queue and approval_queue have events at the same
+    time, stream_events yields events from both -- neither queue starves or
+    drops events when both fire concurrently. Does NOT assert strict ordering
+    (simultaneous completion iterates a set from asyncio.wait)."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-fan-in"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+    approval_queue: asyncio.Queue[ChatEvent] = asyncio.Queue()
+    approval_event = ChatEvent(
+        ChatEventType.TOOL_APPROVAL_REQUIRED,
+        metadata={"confirmation_id": "fan-in-conf", "tool_name": "test_tool"},
+    )
+    await approval_queue.put(approval_event)
+
+    # FakeProvider emits a calculator tool_call on the first LLM call, which
+    # drives emit_tool_event -> TOOL_CALL_DELTA on tool_event_queue.
+    # The approval event is pre-put on approval_queue. The fan-in must yield
+    # events from both queues.
+    events = [
+        event
+        async for event in runner.stream_events(
+            AgentState(
+                session_id="s-fan-in",
+                input_messages=[{"role": "user", "content": "calc"}],
+            ),
+            "test",
+            options={"dashboard_approval_event_queue": approval_queue},
+        )
+    ]
+
+    # Both tool events and approval events appear in the output
+    tool_call_events = [e for e in events if e.type is ChatEventType.TOOL_CALL_DELTA]
+    approval_events = [e for e in events if e.type is ChatEventType.TOOL_APPROVAL_REQUIRED]
+
+    assert len(tool_call_events) >= 1, "tool events must appear in fan-in output"
+    assert len(approval_events) == 1, "approval event must appear in fan-in output"
+    assert approval_events[0].metadata["confirmation_id"] == "fan-in-conf"

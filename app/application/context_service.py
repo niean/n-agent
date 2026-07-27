@@ -51,6 +51,7 @@ class ContextService:
         is_cancelled: Callable[[str], bool] | None = None,
         runtime_memory_service: RuntimeMemoryService | None = None,
         context_policy: ContextPolicy | None = None,
+        browser_guidance: str | None = None,
     ):
         self.memory_store = memory_store
         self.tool_service = tool_service
@@ -61,6 +62,7 @@ class ContextService:
         self._is_cancelled = is_cancelled or (lambda _session_id: False)
         self._runtime_memory = runtime_memory_service or RuntimeMemoryService(memory_store)
         self._context_policy = context_policy or DefaultContextPolicy()
+        self._browser_guidance = browser_guidance
 
     # ------------------------------------------------------------------
     # Engine config extraction (for ContextPolicy request)
@@ -212,6 +214,7 @@ class ContextService:
                     self.external_memory_manager,
                     enabled_override,
                     skills_index,
+                    browser_guidance=self._browser_guidance,
                 ),
             },
             *[_message_to_provider(message) for message in context_messages],
@@ -248,7 +251,7 @@ class ContextService:
         force = plan.compression.force
 
         rescued_context = ""
-        if self.external_memory_manager:
+        if state.persist_messages and self.external_memory_manager:
             enabled_override = state.run_options.get("external_memory_enabled")
             # pre_compress_all is exempt from RuntimeMemoryService gating: it does
             # NOT read from external memory stores. It passes the current
@@ -285,6 +288,11 @@ class ContextService:
 
         next_summary = f"{rescued_context}\n\n{result.summary}".strip() if rescued_context else result.summary
         summary_dict = summary_dicts[0]
+        if not state.persist_messages:
+            state.summary = next_summary
+            state.working_messages = leading_system + result.messages
+            return state
+
         summary_message = ConversationMessage(
             role="user",
             content=summary_dict["content"],

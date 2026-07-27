@@ -63,16 +63,18 @@ recover_stale_port_proxy() {
   wait_until "host port health" "$HOST_HEALTH_ATTEMPTS" host_health "$HOST_HEALTH_URL"
 }
 
-# restart
-docker compose down --timeout "$COMPOSE_STOP_TIMEOUT" n-agent
-docker compose rm -f n-agent
-docker compose up -d --build --force-recreate --remove-orphans n-agent
+# restart (bring up all services incl. browser; n-agent depends_on browser healthy)
+docker compose down --timeout "$COMPOSE_STOP_TIMEOUT"
+# Compose can occasionally leave a stopped service container behind after
+# down. Remove any such containers before up reuses their generated names.
+docker compose rm --force --stop
+docker compose up -d --build --force-recreate --remove-orphans
 echo
 
 # status
 sleep 2
-echo "compose ps n-agent"
-docker compose ps n-agent
+echo "compose ps"
+docker compose ps
 echo
 
 # health

@@ -14,6 +14,7 @@ from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions
 from app.domain.agent import AgentState
+from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextCompressionResult
 from app.domain.information_flow import SecretCatalog
 from app.domain.provider import LLMResult, ModelInfo
 from app.domain.session import ConversationMessage, ConversationSession
@@ -1086,6 +1087,101 @@ async def test_persist_messages_false_skips_user_message_persistence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_persist_messages_false_leaves_existing_session_state_unchanged(tmp_path):
+    """内部 fork 即使触发上下文压缩，也不得改写用户会话的任何持久化状态。"""
+
+    class AlwaysCompressEngine:
+        context_length = 100
+        threshold_percent = 0.01
+        protect_first_n = 0
+        protect_last_n = 0
+        summary_target_ratio = 0.2
+        cooldown_seconds = 0
+        tail_budget_enabled = False
+
+        def should_compress(self, messages, *, prompt_tokens=None, force=False):
+            return True
+
+        def is_in_cooldown(self):
+            return False
+
+        async def compress(self, messages, **kwargs):
+            return ContextCompressionResult(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"{CONTEXT_SUMMARY_PREFIX}internal fork summary",
+                    }
+                ],
+                summary="internal fork summary",
+                compressed=True,
+                skipped_reason=None,
+                original_tokens=500,
+                compressed_tokens=50,
+            )
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    sid = "existing-user-session"
+    await store.create_session(ConversationSession(id=sid))
+    await store.append_message(
+        sid, ConversationMessage(role="user", content="existing user message")
+    )
+    before_session = await store.get_session(sid)
+    before_messages = await store.list_messages(sid)
+
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        context_engine=AlwaysCompressEngine(),
+    )
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[
+                {"role": "system", "content": "internal review instructions"},
+                {"role": "user", "content": "internal review digest"},
+            ],
+            stream=False,
+            session_id=sid,
+            options={"force_compress": True},
+            persist_messages=False,
+        )
+    )
+
+    after_session = await store.get_session(sid)
+    after_messages = await store.list_messages(sid)
+    assert after_messages == before_messages
+    assert await store.get_summary(sid) is None
+    assert await store.get_task_state(sid) is None
+    assert after_session is not None and before_session is not None
+    assert after_session.title == before_session.title
+
+
+@pytest.mark.asyncio
+async def test_persist_messages_false_does_not_execute_slash_compress(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "/compress internal review"}],
+            stream=False,
+            session_id="existing-user-session",
+            persist_messages=False,
+        )
+    )
+
+    assert runner.compress_calls == []
+    assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_persist_messages_default_true_persists_user_message(tmp_path):
     """persist_messages 默认 True：user prompt 正常持久化（回归保护）。"""
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -1126,4 +1222,3 @@ async def test_persist_messages_flag_propagated_to_runner_options(tmp_path):
     )
 
     assert runner.options.get("persist_messages") is False
-

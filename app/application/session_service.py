@@ -249,6 +249,48 @@ class SessionService:
             session_id, "ui.task_result", content, truncate=True
         )
 
+    async def append_tool_approval_message(
+        self, session_id: str, approval: dict[str, Any],
+    ) -> ConversationMessage:
+        """Persist the safe, user-visible projection of a pending tool approval."""
+        fields = (
+            "confirmation_id", "tool_name", "description",
+            "arguments_summary", "expires_at",
+        )
+        if not isinstance(approval, dict) or any(
+            not isinstance(approval.get(field), str) or not approval[field].strip()
+            for field in fields
+        ):
+            raise SessionValidationError("invalid tool approval")
+        safe_approval = {field: approval[field] for field in fields}
+        return await self._append_system_message(
+            session_id,
+            "ui.tool_approval",
+            "工具操作等待确认",
+            truncate=True,
+            card={"kind": "tool_approval", "approval": safe_approval},
+        )
+
+    async def append_tool_approval_resolution_message(
+        self, session_id: str, confirmation_id: str, status: str,
+    ) -> ConversationMessage:
+        if not isinstance(confirmation_id, str) or not confirmation_id.strip():
+            raise SessionValidationError("invalid tool approval confirmation")
+        if status not in {"approved", "rejected"}:
+            raise SessionValidationError("invalid tool approval status")
+        label = "已批准" if status == "approved" else "已拒绝"
+        return await self._append_system_message(
+            session_id,
+            "ui.tool_approval_resolution",
+            f"工具操作{label}",
+            truncate=True,
+            card={
+                "kind": "tool_approval_resolution",
+                "confirmation_id": confirmation_id,
+                "status": status,
+            },
+        )
+
     async def _append_system_message(
         self, session_id: str, name: str, content: str, *, truncate: bool,
         card: dict[str, Any] | None = None,

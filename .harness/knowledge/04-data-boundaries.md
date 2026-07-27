@@ -318,3 +318,14 @@ volumes:
 - Application 通过 Domain 端口访问 Provider、工具和 Memory
 - Infrastructure 负责 SDK、SQLite、文件系统和具体工具 handler
 - Interfaces 负责 HTTP 请求/响应、SSE 编码和 Dashboard JSON，不承载工具权限或 Agent Loop 规则
+
+## Browser 子系统数据边界
+
+Browser 子系统复用 sessions.db（独立 `_connect()` + asyncio.to_thread + 幂等迁移），新增 4 表：
+
+- `browser_sessions`：id PK、n_agent_session_id、backend_type（CHECK host_cdp/container）、status（CHECK 6 态）、profile_ref、document_revision、pre_takeover_status、created_at/updated_at/closed_at；部分唯一索引 `idx_browser_session_active ON (n_agent_session_id, backend_type) WHERE status!='closed'` 保证每 session/backend 最多一个非 closed 会话（DB 级强制）
+- `browser_profile_leases`：profile_ref PK、browser_session_id UNIQUE、acquired_at、FK session ON DELETE CASCADE
+- `browser_host_grants`：browser_session_id PK、n_agent_session_id、actor_id、policy_version、expires_at、created_at、FK session ON DELETE CASCADE
+- `browser_actions`：id PK、browser_session_id、action_type、arguments_summary_json（navigate 仅安全 URL 剥 userinfo/query/fragment；click/scroll 仅 element role/name；type 仅 char_count+clear_first，永不存完整 text）、status、safe_url、title、text_summary、warning_code、error_code、duration_ms、document_revision、created_at、FK session ON DELETE CASCADE；索引 (browser_session_id, created_at, id) 稳定 cursor 翻页
+
+登录态存储：Container profile_ref 映射 browser 服务持久卷目录；Host profile_ref 映射由宿主 Bridge 持有。cookies/localStorage/sessionStorage/password/autofill/payment 仅存在浏览器 profile，不进 DB/模型消息/日志/Artifact。截图落地 `locals/browser-screenshots/`（随机 ref + session->ref 元数据 + TTL/配额 + Close 清理），不进 browser_actions 或 tool_calls。

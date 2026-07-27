@@ -29,6 +29,17 @@ async def test_review_fork_calls_chat_with_skill_toolset_only(svc):
     await svc.run_background_review(session_id="s1", digest="对话摘要")
     svc.tool_service.build_filtered_definitions.assert_called_once()
 
+
+@pytest.mark.asyncio
+async def test_review_fork_does_not_persist_into_user_session(svc):
+    svc.chat.complete = AsyncMock(return_value=MagicMock(message={"content": ""}))
+
+    await svc.run_background_review(session_id="s1", digest="对话摘要")
+
+    request = svc.chat.complete.call_args.args[0]
+    assert request.persist_messages is False
+
+
 @pytest.mark.asyncio
 async def test_review_failure_isolated(svc):
     svc.chat.complete = AsyncMock(side_effect=RuntimeError("boom"))

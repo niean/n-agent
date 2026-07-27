@@ -506,3 +506,241 @@ def test_settings_task_attachments_root_rejects_parent_traversal(tmp_path: Path)
             _env_file=None,
             task_attachments_root="../../etc",
         )
+
+
+# ---------------------------------------------------------------------------
+# Browser subsystem (T10)
+# ---------------------------------------------------------------------------
+
+
+def test_settings_browser_defaults(tmp_path: Path):
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+    assert s.browser_enabled is False
+    assert s.browser_default_backend == "container"
+    assert s.browser_container_endpoint == ""
+    assert s.browser_action_timeout == 30
+    assert s.browser_navigation_timeout == 30
+    assert s.browser_max_observe_chars == 4000
+    assert s.browser_max_observe_elements == 80
+    assert s.browser_max_screenshot_bytes == 1048576
+    assert s.browser_max_screenshot_pixels == 10_000_000
+    assert s.browser_screenshot_ttl_seconds == 86400
+    assert s.browser_per_session_screenshot_quota == 20
+    assert s.browser_poll_interval_seconds == 2
+    assert s.browser_global_session_limit == 4
+    assert s.browser_host_bridge_url == ""
+    assert s.browser_host_bridge_token_path is None
+    assert s.browser_host_grant_ttl_seconds == 300
+    assert s.browser_takeover_ttl_seconds == 60
+    assert s.browser_trusted_dev is False
+
+
+def test_settings_browser_env_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("N_AGENT_BROWSER_ENABLED", "true")
+    monkeypatch.setenv("N_AGENT_BROWSER_DEFAULT_BACKEND", "host_cdp")
+    monkeypatch.setenv("N_AGENT_BROWSER_ACTION_TIMEOUT", "60")
+    monkeypatch.setenv("N_AGENT_BROWSER_POLL_INTERVAL_SECONDS", "5")
+    monkeypatch.setenv("N_AGENT_BROWSER_GLOBAL_SESSION_LIMIT", "8")
+    monkeypatch.setenv("N_AGENT_BROWSER_TRUSTED_DEV", "true")
+    monkeypatch.setenv("N_AGENT_BROWSER_HOST_BRIDGE_URL", "http://127.0.0.1:8766")
+    token_path = tmp_path / "browser_token"
+    token_path.write_bytes(b"a" * 32 + b"\n")
+    token_path.chmod(0o600)
+    monkeypatch.setenv("N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH", str(token_path))
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+    assert s.browser_enabled is True
+    assert s.browser_default_backend == "host_cdp"
+    assert s.browser_action_timeout == 60
+    assert s.browser_poll_interval_seconds == 5
+    assert s.browser_global_session_limit == 8
+    assert s.browser_trusted_dev is True
+    assert s.browser_host_bridge_url == "http://127.0.0.1:8766"
+    assert s.browser_host_bridge_token_path == token_path
+
+
+@pytest.mark.parametrize("backend", ["host_cdp", "container"])
+def test_settings_browser_default_backend_accepts_valid(tmp_path: Path, backend: str):
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        browser_default_backend=backend,
+    )
+    assert s.browser_default_backend == backend
+
+
+@pytest.mark.parametrize("backend", ["local", "docker", "", "invalid"])
+def test_settings_browser_default_backend_rejects_invalid(tmp_path: Path, backend: str):
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            browser_default_backend=backend,
+        )
+
+
+@pytest.mark.parametrize("poll", [0, 6, 10, -1])
+def test_settings_browser_poll_interval_rejects_out_of_bounds(tmp_path: Path, poll: int):
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            browser_poll_interval_seconds=poll,
+        )
+
+
+@pytest.mark.parametrize("poll", [1, 2, 3, 4, 5])
+def test_settings_browser_poll_interval_accepts_bounds(tmp_path: Path, poll: int):
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        browser_poll_interval_seconds=poll,
+    )
+    assert s.browser_poll_interval_seconds == poll
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"browser_action_timeout": 0},
+    {"browser_navigation_timeout": 0},
+    {"browser_max_observe_chars": 0},
+    {"browser_max_observe_elements": 0},
+    {"browser_max_screenshot_bytes": 100},
+    {"browser_max_screenshot_pixels": 0},
+    {"browser_screenshot_ttl_seconds": 0},
+    {"browser_per_session_screenshot_quota": 0},
+    {"browser_global_session_limit": 0},
+    {"browser_host_grant_ttl_seconds": 0},
+    {"browser_takeover_ttl_seconds": 0},
+])
+def test_settings_browser_validates_positive_bounds(tmp_path: Path, kwargs: dict):
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            **kwargs,
+        )
+
+
+def test_settings_browser_host_bridge_token_path_expands(tmp_path: Path):
+    token_path = tmp_path / "token"
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        browser_host_bridge_token_path=str(token_path),
+    )
+    assert s.browser_host_bridge_token_path == token_path
+
+
+# ---------------------------------------------------------------------------
+# T13: Browser cross-field validation
+# ---------------------------------------------------------------------------
+
+
+def test_browser_host_cdp_requires_bridge_url(tmp_path: Path):
+    """When browser_enabled + default_backend=host_cdp, bridge URL is required."""
+    token_path = tmp_path / "token"
+    token_path.write_bytes(b"a" * 32 + b"\n")
+    token_path.chmod(0o600)
+    with pytest.raises(ValidationError, match="browser_host_bridge_url is required"):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            browser_enabled=True,
+            browser_default_backend="host_cdp",
+            browser_host_bridge_token_path=str(token_path),
+            browser_trusted_dev=True,
+        )
+
+
+def test_browser_host_cdp_requires_token_path(tmp_path: Path):
+    """When browser_enabled + default_backend=host_cdp, token path is required."""
+    with pytest.raises(ValidationError, match="browser_host_bridge_token_path is required"):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            browser_enabled=True,
+            browser_default_backend="host_cdp",
+            browser_host_bridge_url="http://127.0.0.1:8766",
+            browser_trusted_dev=True,
+        )
+
+
+def test_browser_host_cdp_requires_trusted_dev(tmp_path: Path):
+    """When browser_enabled + default_backend=host_cdp, trusted_dev must be True."""
+    token_path = tmp_path / "token"
+    token_path.write_bytes(b"a" * 32 + b"\n")
+    token_path.chmod(0o600)
+    with pytest.raises(ValidationError, match="browser_trusted_dev must be True"):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            browser_enabled=True,
+            browser_default_backend="host_cdp",
+            browser_host_bridge_url="http://127.0.0.1:8766",
+            browser_host_bridge_token_path=str(token_path),
+            browser_trusted_dev=False,
+        )
+
+
+def test_browser_container_requires_endpoint(tmp_path: Path):
+    """When browser_enabled + default_backend=container, container endpoint is required."""
+    with pytest.raises(ValidationError, match="browser_container_endpoint is required"):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            browser_enabled=True,
+            browser_default_backend="container",
+            browser_container_endpoint="",
+        )
+
+
+def test_browser_host_cdp_valid_when_all_config_present(tmp_path: Path):
+    """When browser_enabled + default_backend=host_cdp and all required config
+    is present, Settings construction succeeds."""
+    token_path = tmp_path / "token"
+    token_path.write_bytes(b"a" * 32 + b"\n")
+    token_path.chmod(0o600)
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        browser_enabled=True,
+        browser_default_backend="host_cdp",
+        browser_host_bridge_url="http://127.0.0.1:8766",
+        browser_host_bridge_token_path=str(token_path),
+        browser_trusted_dev=True,
+    )
+    assert s.browser_default_backend == "host_cdp"
+    assert s.browser_host_bridge_url == "http://127.0.0.1:8766"
+
+
+def test_browser_validation_skipped_when_disabled(tmp_path: Path):
+    """When browser_enabled=False, no cross-field validation is applied
+    (allows constructing Settings without backend config)."""
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        browser_enabled=False,
+        browser_default_backend="container",
+        browser_container_endpoint="",
+    )
+    assert s.browser_enabled is False
+    assert s.browser_container_endpoint == ""

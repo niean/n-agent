@@ -201,6 +201,54 @@
     listHistory: listHostHistory,
   };
 
+  // Browser dashboard endpoints (T16). Write ops carry X-Browser-Challenge
+  // header (one-time token from write_challenges in session detail).
+  const listBrowserSessions = (nAgentSessionId) => fetchJson(
+    `/chat/browser/sessions?n_agent_session_id=${encodeURIComponent(nAgentSessionId)}`,
+  );
+  const getBrowserSession = (browserSessionId, nAgentSessionId) => fetchJson(
+    `/chat/browser/sessions/${encodeURIComponent(browserSessionId)}?n_agent_session_id=${encodeURIComponent(nAgentSessionId)}`,
+  );
+  const listBrowserActions = (browserSessionId, nAgentSessionId, limit) => {
+    const params = new URLSearchParams();
+    params.set('n_agent_session_id', nAgentSessionId);
+    if (Number.isInteger(limit) && limit >= 1) params.set('limit', String(limit));
+    return fetchJson(`/chat/browser/sessions/${encodeURIComponent(browserSessionId)}/actions?${params.toString()}`);
+  };
+  const getBrowserTakeoverView = (browserSessionId, nAgentSessionId) => fetchJson(
+    `/chat/browser/sessions/${encodeURIComponent(browserSessionId)}/takeover-view?n_agent_session_id=${encodeURIComponent(nAgentSessionId)}`,
+  );
+  const _BROWSER_OP_MAP = {
+    pause: { method: 'POST', suffix: 'pause' },
+    resume: { method: 'POST', suffix: 'resume' },
+    takeover: { method: 'POST', suffix: 'takeover' },
+    release: { method: 'POST', suffix: 'release' },
+    close: { method: 'POST', suffix: 'close' },
+    host_grant: { method: 'POST', suffix: 'host-grant' },
+    revoke_host: { method: 'DELETE', suffix: 'host-grant' },
+  };
+  const browserWrite = (op, browserSessionId, nAgentSessionId, token, body) => {
+    const m = _BROWSER_OP_MAP[op];
+    if (!m) throw new Error('invalid_browser_op');
+    const url = `/chat/browser/sessions/${encodeURIComponent(browserSessionId)}/${m.suffix}?n_agent_session_id=${encodeURIComponent(nAgentSessionId)}`;
+    const opts = {
+      method: m.method,
+      headers: { 'X-Browser-Challenge': token },
+    };
+    if (m.method === 'POST' && body) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetchJson(url, opts);
+  };
+  const browser = {
+    listSessions: listBrowserSessions,
+    getSession: getBrowserSession,
+    listActions: listBrowserActions,
+    getTakeoverView: getBrowserTakeoverView,
+    write: browserWrite,
+  };
+
   // Usage / observation endpoints
   const getUsageOverview = () => fetchJson(`/chat/usage/overview`);
   const listUsageSessions = (page, pageSize) => fetchJson(
@@ -290,6 +338,7 @@
     updatePluginConfig,
     sandbox,
     host,
+    browser,
     usage,
     task: {
       board: () => fetchJson('/chat/tasks/board'),

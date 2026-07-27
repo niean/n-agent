@@ -760,6 +760,7 @@ Skill 自进化主 loop（Background Review）：
 - AgentGraphRunner finalize 成功后触发 `_post_finalize_nudge`：检查 nudge counter，当 `turn_count % nudge_interval == 0` 时调用 `SkillEvolutionService.maybe_trigger`
 - `maybe_trigger` spawn 独立 asyncio task 执行 `run_background_review`，fire-and-forget，全异常捕获不影响主 turn
 - `run_background_review` fork 一个受限的 `ChatCompletionService`：工具白名单经 `ToolService.build_filtered_definitions` 按 toolset+toolname 双重过滤，只注入 skills+memory 相关工具
+- `_post_finalize_nudge` 构造 digest 时必须排除全部 `role=system` 消息；后台 fork 必须设置 `persist_messages=False`。该标志是运行级隔离契约，不只抑制普通 user/assistant/tool 消息，还必须阻断 profile lock、标题生成、`/compress` 持久化分支、summary/压缩标记、task_state、外部记忆同步、Usage/payload retention、完整 payload 日志以及递归 evolution/curator 触发，避免后台控制流和 runtime system prompt 污染或泄露到原用户会话。
 - fork 内注入 `trusted_metadata.skill_write_origin=background_review`，标识本次 Skill 写入来自后台自演化
 - Agent 在 fork 内自主调用 `skill_manage` 工具 -> `SkillManageToolExecutor` 从 `trusted_metadata` 读取 origin -> `SkillService.manage_skill` -> `SkillPolicy` 评估
 
@@ -804,6 +805,7 @@ Skill source 保留：
 - backup 失败时若继续写入，会留下无法回滚的变更，破坏 Skill 库可恢复性；必须 fail-closed
 - `replace_all_skills` 若不保留既有 source，rescan 会把 agent-created skill 降级为 USER，丢失 provenance 信息
 - origin 若从 `request.arguments` 读取，OpenAI HTTP 客户端可伪造 `origin=foreground` 绕过后台限制；必须从 `trusted_metadata` 读取
+- 只在 ChatCompletionService 入口跳过 user message 落库并不足以隔离后台 fork：ContextService 压缩、AgentGraph finalize、Usage retention 和 opt-in payload logging 都可能旁路写回原 session；新增内部 fork 时必须复用并回归验证完整 `persist_messages=False` 契约。
 
 ## 模式二十六：Dashboard Chat slash 命令本地解析路径
 
@@ -1032,6 +1034,7 @@ shell 路由注册规则（`dashboard.py`）：
 - `force_compress`（会话式 `/compress` 触发强制压缩）
 - `max_iterations`（LangGraph recursion_limit 派生，非 generation param）
 - `persist_messages`（是否落库）
+- `dashboard_approval_event_queue`（Dashboard 审批事件 `asyncio.Queue`，stream_events 弹出后 fan-in，不送 LLM/executor）
 
 规则：
 - 三处 `_INTERNAL_OPTION_KEYS` 必须同步：`app/application/agent_graph.py`（用于 `call_llm` 计算 `gen_params`，排除内部 key 后记入 usage）、`app/infrastructure/llm/openai_compatible.py`、`app/infrastructure/llm/anthropic_provider.py`。agent_graph 的集合是权威源，注释明示"Mirrors the filter in OpenAICompatibleProvider"；新增内部 key 时三处一并加。
@@ -1039,3 +1042,25 @@ shell 路由注册规则（`dashboard.py`）：
 - 新增内部 key 时优先评估是否能复用现有 key；确实新增的，必须同时更新 agent_graph 与 OpenAI provider 两处黑名单（Anthropic 白名单无需动），并补 `tests/infrastructure/test_openai_compatible_provider.py::test_provider_strips_internal_runtime_options` 断言。
 
 陷阱：在 `ChatCompletionService`/executor 往 `options` 塞新内部 key（如 `_policy_snapshot`）后，只更新 agent_graph 的 `_INTERNAL_OPTION_KEYS` 而漏更新 `openai_compatible.py` 的黑名单，该 key 会经 `**kwargs` 透传给 `AsyncCompletions.create()`，定时任务/unattended worker（必经 `policy_snapshot_factory` 路径）会以 `unexpected keyword argument '_policy_snapshot'` 整体失败。根因隐蔽在于 agent_graph 的过滤只管 usage 记录，不阻断 provider 调用。治理：黑名单滞后是结构脆弱点，新增内部 key 时以 agent_graph 集合为单一事实源同步两处 provider；长期可考虑 OpenAI provider 也切白名单对齐 Anthropic。相关：P023、模式五 LLM Adapter。
+
+## 模式三十四：Dashboard 通用工具确认审批流
+
+Dashboard 的 `POST /chat/completions` 原先不注入 `ApprovalDecider`，导致策略要求 `CONFIRM` 的工具（含 browser click/type）按 fail-closed 直接返回 `approval_required`。该模式为 Dashboard 提供可复用、通用于所有 `CONFIRM` 工具的确认交互，不改变 `/v1/chat/completions` 的无 UI/fail-closed 语义、不改变 ToolPolicy 风险分级与执行前复核。
+
+组件与数据流：
+- `DashboardToolApprovalBridge`（Interfaces 层进程内协调器，`app/interfaces/http/dashboard_tool_approval.py`）：持进程内 pending `Future` + 同会话 tombstone，`create_decider` 返回异步 `ApprovalDecider`，actor 固定 `"dashboard"` 服务端常量。复用 Feishu/CLI 审批领域语义但不依赖 IM 卡片、不复制其"全局单 pending"限制。
+- 共享授权：`build_application_services` 显式创建一个 `GatewayToolApprovalService`，同一实例注入 `GatewayService` 与 Dashboard router；授权键 `(session_id, "dashboard", tool_name)` 与 IM/CLI actor 互不互通。
+- 事件汇流：router 为每个流式请求创建私有 `asyncio.Queue[ChatEvent]`，其 `put` 作为 bridge sender（包装 metadata 为 `ChatEvent(TOOL_APPROVAL_REQUIRED, metadata=...)`）；该 queue 经 `ChatCompletionInput.options["dashboard_approval_event_queue"]` 内部传入。`AgentGraphRunner.stream_events` 从 options 弹出该 queue（加入 `_INTERNAL_OPTION_KEYS` 防泄漏到 LLM/executor），与既有 tool-event queue 用 `asyncio.wait(FIRST_COMPLETED)` fan-in 到同一 SSE 迭代器。approval 事件原样产出，不经 scrubber/stream_guard/redact。
+- SSE envelope：`_dashboard_sse_with_approval` 对 approval 事件输出独立 `data: {"object":"n-agent.tool_approval","approval":{...5字段...}}`，不经通用 chunk 编码器、不产生空 delta；普通 chunk 仍 OpenAI 形状；`[DONE]` 仅在 `DONE` 至多一次。
+- claim endpoint：`POST /chat/tool-approvals/{confirmation_id}` 原子领取（同步无 await 临界区），ok->204 / 未找到或跨会话->404 / 已领取或过期->409 / 非法->422，错误不泄露 tool 参数/session/actor/confirmation。
+- 前端：`chat.js` buffered SSE parser（`TextDecoder({stream:true})` + 残留缓冲 + 完整事件分帧）先识别 approval envelope 再处理 OpenAI chunk；通用确认卡片按 confirmation_id 去重、`textContent` 渲染（禁 innerHTML 解释服务端文本）、三按钮（once/trust_session/cancel）、捕获流创建时 session 发出唯一 POST、204/404/409/5xx 分流、流结束/会话切换禁用遗留卡片、不持久化 payload。
+
+关键安全不变量（fail-closed）：
+- 展示投影：`AgentGraphRunner._request_tool_approval` 在调 decider 前用 `_project_approval_arguments` 构造仅供展示的 `ApprovalRequest`（browser 工具脱敏 type 文本/URL query-fragment，非 browser 透传副本）；`ToolCallRequest.arguments` 原值仍绑定 once 授权与 executor。bridge 的 `arguments_summary` 再做递归敏感键脱敏 + 限深度/长度（`allow_nan=False`），任何失败 fail-closed 占位。
+- metadata 白名单：`TOOL_APPROVAL_REQUIRED.metadata` 与 SSE envelope 的 `approval` 各恰含 5 字段（confirmation_id/tool_name/description/arguments_summary/expires_at），均 JSON 标量字符串，不含 session/actor/raw 参数/risk 内部结果。
+- claim 语义：跨会话或不存在的 ID 一律 404（不泄露 ID 归属，即使已领取对跨会话也只 404 不 409）；同会话重复 claim 在 tombstone TTL 内稳定 409。tombstone 仅存 session_id+expires_at，不存参数/授权、不可完成 Future、进程重启失效。
+- 严格 stream：`/chat/completions` 仅在依赖齐全且 `stream` 为严格布尔 `True` 时创建 decider；`stream` 非 bool（含 `false`/`"true"`/`1`）一律 `422 dashboard_stream_required` 且不启动 Agent（校验先于 session lookup），省略 stream 默认 `True`。缺 bridge/grant service 时保持 fail-closed、不注册 claim endpoint。
+- 断连清理：SSE 响应 `finally` 对底层 Chat 事件迭代器 `aclose()`，使 ASGI 客户端断连传播到 `stream_events` 的 `run_task.cancel()`，再传播到 decider await 的 `CancelledError`，触发 bridge `finally` 按 identity 清理 pending + 写 tombstone；不得留下断连后可被 endpoint 放行的 Future。
+- 隔离：approval queue 不来自客户端 payload（先 pop 客户端同名 key）、不送 LLM/executor、不跨请求复用；`/v1/chat/completions` 仍无 decider/fail-closed；既有 Task/Feishu/CLI 审批交互不变。
+
+相关：模式十六（SessionSource）、模式三十三（options 内部 key 过滤，`dashboard_approval_event_queue` 已加入）、D038（通用 confirmation challenge 治理方向）。

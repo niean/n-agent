@@ -173,6 +173,7 @@ class SkillEvolutionService:
                 session_id=session_id,
                 trusted_metadata=trusted_metadata,
                 options={"max_iterations": used_max_iter},
+                persist_messages=False,
             )
             result = await asyncio.wait_for(
                 self.chat.complete(request),

@@ -65,7 +65,7 @@ def test_all_tab_paths_return_shell(tmp_path):
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
         "/tools/external-memory", "/tools/sandbox",
         "/models", "/observations/sessions", "/observations/modules", "/scheduled-tasks", "/platforms", "/security",
-        "/tasks/observations", "/observations/tasks",
+        "/tasks/observations", "/observations/tasks", "/browser", "/browser/session",
     )
     for path in paths:
         response = client.get(path)
@@ -139,6 +139,7 @@ def test_static_assets_served(tmp_path):
         "/static/topnav.js",
         "/static/tasks-observations.js",
         "/static/tasks-security.js",
+        "/static/browser.js",
         "/static/favicon.svg",
     )
     for path in paths:
@@ -410,7 +411,8 @@ def test_assistant_tool_calls_are_not_rendered_as_chat_messages(tmp_path):
     assert "if (message.role === 'tool' && previous && previous.role === 'tool')" in chat_js
     assert "previous.content.push(message.content || '')" in chat_js
     assert "grouped.push({ ...message, content: [message.content || ''] })" in chat_js
-    assert 'let visibleMessages = groupToolMessages((detail.messages || []).filter(shouldRenderMessage))' in chat_js
+    assert 'const allMessages = detail.messages || []' in chat_js
+    assert 'let visibleMessages = groupToolMessages(allMessages.filter(shouldRenderMessage))' in chat_js
     assert 'groupTaskMessages(visibleMessages)' in chat_js
     assert 'appendDebugJson(content, message.tool_calls)' not in chat_js
     assert "if (Array.isArray(value)) return value.length > 0" in chat_js
@@ -894,13 +896,13 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     expected_data_tabs = [
         'summary', 'chat', 'tasks', 'scheduled-tasks', 'sessions', 'memory',
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
-        'executors', 'sandbox', 'executors-host', 'models', 'platforms',
+        'executors', 'sandbox', 'executors-host', 'browser', 'models', 'platforms',
         'observations', 'observations-sessions', 'observations-modules', 'security',
     ]
     expected_hrefs = [
         '/summary', '/chat', '/tasks', '/scheduled-tasks', '/sessions', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
-        '/sandbox', '/executors/host', '/models', '/platforms',
+        '/sandbox', '/executors/host', '/browser', '/models', '/platforms',
         '/observations/sessions', '/observations/modules', '/security',
     ]
     sidebar_data_tabs = _re.findall(r'data-tab="([^"]*)"', sidebar_html)
@@ -1400,7 +1402,7 @@ def test_chat_message_images_render_after_refresh(tmp_path):
     chat_js = client.get('/static/chat.js').text
 
     # createMessageElement handles array content with image_url parts
-    create_start = chat_js.index('function createMessageElement(message, cardStates, taskDecisions)')
+    create_start = chat_js.index('function createMessageElement(message, cardStates, taskDecisions, approvalDecisions)')
     create_end = chat_js.index('function shouldRenderMessage(message)', create_start)
     create_body = chat_js[create_start:create_end]
     assert "Array.isArray(content)" in create_body
@@ -1418,7 +1420,7 @@ def test_chat_message_images_render_after_refresh(tmp_path):
     assert 'stack.replaceChild(el, existing)' in render_body
     assert 'preserveDetailsState(existing, el)' in render_body
     assert 'detail.messages' in render_body
-    assert 'createMessageElement(message, cardStates, taskDecisions)' in render_body
+    assert 'createMessageElement(message, cardStates, taskDecisions, approvalDecisions)' in render_body
 
     # refreshCurrentSession delegates to applySessionDetail (which calls renderSessionMessages)
     refresh_start = chat_js.index('async function refreshCurrentSession()')
@@ -1438,7 +1440,7 @@ def test_chat_js_renders_summary_messages_specially(tmp_path):
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
 
-    create_start = chat_js.index('function createMessageElement(message, cardStates, taskDecisions)')
+    create_start = chat_js.index('function createMessageElement(message, cardStates, taskDecisions, approvalDecisions)')
     create_end = chat_js.index('function shouldRenderMessage(message)', create_start)
     create_body = chat_js[create_start:create_end]
     assert 'message.is_summary' in create_body
@@ -1446,7 +1448,7 @@ def test_chat_js_renders_summary_messages_specially(tmp_path):
     assert "createElement('details')" in create_body
     assert "createElement('summary')" in create_body
     assert "createElement('pre')" in create_body
-    assert '对话摘要' in create_body
+    assert '对话压缩' in create_body
     assert CONTEXT_SUMMARY_PREFIX in create_body
     assert 'startsWith(prefix)' in create_body
     assert 'slice(prefix.length)' in create_body
@@ -1496,3 +1498,107 @@ def test_chat_message_hover_reveals_timestamp_feishu_style(tmp_path):
     assert '.msg[data-time]::before' in css
     assert '.msg[data-time]:hover::before' in css
     assert 'pointer-events: none' in css
+
+
+def test_browser_static_assets_and_wiring(tmp_path):
+    """T16: browser.js asset served, container present once, script order, source safety."""
+    client = _client(tmp_path)
+    # Asset served
+    res = client.get('/static/browser.js')
+    assert res.status_code == 200, "browser.js not served"
+    body = res.text
+    html = client.get('/browser').text
+
+    # /browser returns the shell
+    assert 'id="app-sidebar"' in html, "/browser must return the shell"
+
+    # Container present exactly once
+    assert html.count('id="tab-browser"') == 1, "tab-browser must appear once"
+
+    # Script tag present once, before app.js
+    assert html.count('/static/browser.js') == 1, "browser.js script must appear once"
+    assert html.index('/static/browser.js') < html.index('/static/app.js'), \
+        "browser.js must load before app.js"
+    # management base modules before browser.js
+    assert html.index('/static/management-ui.js') < html.index('/static/browser.js'), \
+        "management-ui.js must load before browser.js"
+    assert html.index('/static/management-api.js') < html.index('/static/browser.js'), \
+        "management-api.js must load before browser.js"
+    assert html.index('/static/management-navigation.js') < html.index('/static/browser.js'), \
+        "management-navigation.js must load before browser.js"
+
+    # Module exposes the lifecycle surface
+    assert 'NAGENT.browser' in body, "browser.js must expose NAGENT.browser namespace"
+    assert 'init' in body and 'refresh' in body and 'deactivate' in body
+
+    # Source safety: no unsafe DOM sinks
+    for forbidden in ('innerHTML =', 'innerHTML=', '.insertAdjacentHTML(', 'document.write(', '.outerHTML', 'onclick='):
+        assert forbidden not in body, f"browser.js contains {forbidden}"
+    assert 'textContent' in body, "textContent must be used for safe rendering"
+
+    # node --check
+    node = shutil.which('node')
+    if node is not None:
+        result = subprocess.run(
+            [node, '--check', str(STATIC_DIR / 'browser.js')],
+            capture_output=True, text=True, check=False,
+        )
+        assert result.returncode == 0, f"browser.js node --check failed: {result.stderr}"
+
+
+def test_browser_tab_in_navigation(tmp_path):
+    """T16: browser tab config in management-navigation.js."""
+    client = _client(tmp_path)
+    nav_js = client.get('/static/management-navigation.js').text
+    assert "tab: 'browser'" in nav_js, "browser tab not in tabConfig"
+    assert "path: '/browser'" in nav_js, "browser path not in tabConfig"
+    assert "label: '浏览器'" in nav_js, "browser label not in tabConfig"
+
+
+def test_browser_api_in_management_api(tmp_path):
+    """T16: browser API namespace in management-api.js."""
+    client = _client(tmp_path)
+    api_js = client.get('/static/management-api.js').text
+    assert 'browser' in api_js, "browser namespace missing from management-api.js"
+    assert 'listBrowserSessions' in api_js
+    assert 'getBrowserSession' in api_js
+    assert 'listBrowserActions' in api_js
+    assert 'getBrowserTakeoverView' in api_js
+    assert 'browserWrite' in api_js
+    assert 'X-Browser-Challenge' in api_js, "X-Browser-Challenge header not configured"
+
+
+def test_browser_lifecycle_in_app_js(tmp_path):
+    """T16: browser tab lifecycle in app.js."""
+    client = _client(tmp_path)
+    app_js = client.get('/static/app.js').text
+    assert 'browser: false' in app_js, "browser not in initialized map"
+    assert "namespace.browser" in app_js, "browser not in resolveModule"
+
+
+def test_browser_styles_namespaced(tmp_path):
+    """T16: browser styles in styles.css."""
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    for selector in (
+        ".browser-shell",
+        ".browser-main",
+        ".browser-side",
+        ".browser-screenshot",
+        ".browser-screenshot-stale",
+        ".browser-takeover",
+        ".browser-controls",
+        ".browser-actions",
+        ".browser-poll-indicator",
+    ):
+        assert selector in css, f"styles.css missing {selector}"
+
+
+def test_browser_shell_served_at_browser_path(tmp_path):
+    """T16: browser list and detail paths return the HTML shell."""
+    client = _client(tmp_path)
+    for path in ('/browser', '/browser/session'):
+        res = client.get(path)
+        assert res.status_code == 200
+        assert 'id="app-sidebar"' in res.text
+        assert 'id="tab-browser"' in res.text

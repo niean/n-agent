@@ -12,6 +12,7 @@ class ChatEventType(str, Enum):
     MESSAGE_DONE = "message_done"
     ERROR = "error"
     DONE = "done"
+    TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 
 
 @dataclass(frozen=True)

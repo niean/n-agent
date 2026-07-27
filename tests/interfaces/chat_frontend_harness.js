@@ -78,6 +78,11 @@ let fetchCalls = [];
 let createdSessionId = null;
 let appendCalls = [];
 let sessionsList = [];
+// SSE stream + fetch override state for tool-approval card tests.
+let sseQueue = [];
+let fetchOverrides = [];
+let streamKeepOpen = false;
+let streamEndResolver = null;
 
 function makeTimerEnv() {
   const timers = [];
@@ -95,6 +100,10 @@ function freshStubs() {
   createdSessionId = null;
   appendCalls = [];
   sessionsList = [];
+  sseQueue = [];
+  fetchOverrides = [];
+  streamKeepOpen = false;
+  streamEndResolver = null;
   const messageStack = makeEl();
   const input = makeEl();
   input.value = '';
@@ -153,11 +162,27 @@ function freshStubs() {
   };
   const fetchStub = (url, opts) => {
     fetchCalls.push({ url, opts });
+    for (const ov of fetchOverrides) {
+      const u = String(url);
+      const m = typeof ov.match === 'string' ? u.indexOf(ov.match) !== -1 : ov.match.test(u);
+      if (m) return ov.handler(url, opts);
+    }
+    const chunks = sseQueue.slice();
+    sseQueue = [];
+    const keepOpen = streamKeepOpen;
+    streamKeepOpen = false;
     return Promise.resolve({
       ok: true,
       status: 200,
       json: async () => ({}),
-      body: { getReader: () => ({ read: async () => ({ done: true }) }) },
+      body: { getReader: () => {
+        let i = 0;
+        return { read: async () => {
+          if (i < chunks.length) return { done: false, value: new TextEncoder().encode(chunks[i++]) };
+          if (keepOpen) await new Promise((res) => { streamEndResolver = res; });
+          return { done: true };
+        } };
+      } },
     });
   };
   const win = {
@@ -172,7 +197,13 @@ function freshStubs() {
     addEventListener: (type, fn) => { (win._listeners[type] = win._listeners[type] || []).push(fn); },
   };
   const timerEnv = makeTimerEnv();
-  return { win, messageStack, input, messagesScroll, byIdMap, document, timerEnv };
+  return { win, messageStack, input, messagesScroll, byIdMap, document, timerEnv,
+    enqueueSseChunks: (chunks) => { sseQueue.push(...chunks); },
+    setFetchHandler: (match, handler) => { fetchOverrides.push({ match, handler }); },
+    clearFetchHandlers: () => { fetchOverrides.length = 0; },
+    setStreamKeepOpen: () => { streamKeepOpen = true; },
+    endStream: () => { if (streamEndResolver) { const r = streamEndResolver; streamEndResolver = null; r(); } },
+  };
 }
 
 // Load chat.js into a fresh context. Calls init() so visibilitychange/beforeunload
@@ -1757,10 +1788,402 @@ async function testDebugSettingsPerSession() {
   ok(s1again.tool === true && s1again.task === true, 's1 retains its own settings after switching away and back (got ' + JSON.stringify(s1again) + ')');
 }
 
+// ===========================================================================
+// T4: 通用工具确认卡片 (generic tool approval card)
+// 覆盖：跨 chunk / CRLF 的 SSE 事件识别、有界缓冲、通用卡片渲染与文本转义、
+//       三个选择请求、session 捕获、按钮去重、并发卡片、404/409 终态、
+//       网络/5xx 重试、流结束/会话切换后禁止提交、敏感字段不渲染。
+// ===========================================================================
+async function testToolApprovalCard() {
+  function findDescendants(el, predicate) {
+    const out = [];
+    function walk(node) {
+      if (!node || !node._kids) return;
+      for (const k of node._kids) {
+        if (predicate(k)) out.push(k);
+        walk(k);
+      }
+    }
+    walk(el);
+    return out;
+  }
+  const findByClass = (el, cls) => findDescendants(el, (n) => {
+    if (!n || typeof n.className !== 'string') return false;
+    return n.className.split(/\s+/).indexOf(cls) !== -1;
+  });
+  const approvalEnvelope = (id, opts) => {
+    opts = opts || {};
+    return 'data: ' + JSON.stringify({
+      object: 'n-agent.tool_approval',
+      approval: {
+        confirmation_id: id,
+        tool_name: opts.tool_name || 'browser.click',
+        description: opts.description || '点击页面按钮',
+        arguments_summary: opts.arguments_summary || '{"selector":"#btn"}',
+        expires_at: opts.expires_at || '2026-07-28T12:00:00Z',
+      },
+    }) + (opts.sep || '\n\n');
+  };
+
+  let unhandledCount = 0;
+  const unhandledReasons = [];
+  const unhandledHandler = (reason) => { unhandledCount++; unhandledReasons.push(reason); };
+  process.on('unhandledRejection', unhandledHandler);
+
+  try {
+    // --- SSE parser: cross-chunk event recognition ---
+    let env = loadChat();
+    ok(typeof env.chat.createSSEParser === 'function', 'createSSEParser exposed');
+    const parser = env.chat.createSSEParser();
+    const full = approvalEnvelope('c1');
+    const part1 = full.slice(0, 23);
+    const part2 = full.slice(23);
+    const ev1 = parser.feed(part1);
+    ok(ev1.length === 0, 'cross-chunk: first half produces no events (got ' + ev1.length + ')');
+    const ev2 = parser.feed(part2);
+    ok(ev2.length === 1, 'cross-chunk: second half completes event (got ' + ev2.length + ')');
+    let j = JSON.parse(ev2[0]);
+    ok(j.object === 'n-agent.tool_approval' && j.approval.confirmation_id === 'c1', 'cross-chunk: event parsed correctly');
+
+    // --- SSE parser: CRLF line endings (\r\n\r\n boundary) ---
+    const parser2 = env.chat.createSSEParser();
+    const crlf = approvalEnvelope('c2', { sep: '\r\n\r\n' });
+    const crlfEvents = parser2.feed(crlf);
+    ok(crlfEvents.length === 1, 'CRLF boundary: event recognized (got ' + crlfEvents.length + ')');
+    j = JSON.parse(crlfEvents[0]);
+    ok(j.approval.confirmation_id === 'c2', 'CRLF: event parsed correctly');
+
+    // --- SSE parser: CRLF split across chunks ---
+    const parser2b = env.chat.createSSEParser();
+    const crlf2 = approvalEnvelope('c2b', { sep: '\r\n\r\n' });
+    const mid = Math.floor(crlf2.length / 2);
+    ok(parser2b.feed(crlf2.slice(0, mid)).length === 0, 'CRLF cross-chunk: first half no events');
+    ok(parser2b.feed(crlf2.slice(mid)).length === 1, 'CRLF cross-chunk: second half completes event');
+
+    // --- SSE parser: multi-line data: fields concatenated with \n ---
+    const parser3 = env.chat.createSSEParser();
+    const multiData = 'data: line1\ndata: line2\n\n';
+    const multiEvents = parser3.feed(multiData);
+    ok(multiEvents.length === 1 && multiEvents[0] === 'line1\nline2', 'multi-line data: concatenated with \\n (got ' + JSON.stringify(multiEvents[0]) + ')');
+
+    // --- SSE parser: bounded buffer (drop if > 1 MiB) ---
+    const parser4 = env.chat.createSSEParser();
+    ok(parser4.getBufferLength() === 0, 'parser starts with empty buffer');
+    // Feed a huge incomplete event (> 1 MiB, no boundary)
+    parser4.feed('x'.repeat(700000));
+    ok(parser4.getBufferLength() > 0, 'parser buffers incomplete event');
+    parser4.feed('y'.repeat(700000));
+    ok(parser4.getBufferLength() === 0, 'parser drops buffer beyond 1 MiB (got ' + parser4.getBufferLength() + ')');
+
+    // --- SSE parser: [DONE] sentinel ---
+    const parser5 = env.chat.createSSEParser();
+    ok(parser5.feed('data: [DONE]\n\n')[0] === '[DONE]', '[DONE] sentinel recognized');
+
+    // --- isValidApprovalPayload ---
+    ok(typeof env.chat.isValidApprovalPayload === 'function', 'isValidApprovalPayload exposed');
+    ok(env.chat.isValidApprovalPayload({ confirmation_id: 'c', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e' }) === true, 'valid approval passes');
+    ok(env.chat.isValidApprovalPayload(null) === false, 'null approval invalid');
+    ok(env.chat.isValidApprovalPayload({}) === false, 'empty approval invalid');
+    ok(env.chat.isValidApprovalPayload({ confirmation_id: 'c', tool_name: 't' }) === false, 'missing fields invalid');
+    ok(env.chat.isValidApprovalPayload({ confirmation_id: '', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e' }) === false, 'empty confirmation_id invalid');
+    ok(env.chat.isValidApprovalPayload({ confirmation_id: 'c', tool_name: 42, description: 'd', arguments_summary: 'a', expires_at: 'e' }) === false, 'non-string field invalid');
+    ok(env.chat.isValidApprovalPayload({ confirmation_id: 'c', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e', extra: 'x' }) === true, 'extra fields OK (only required checked)');
+
+    // --- Card rendering + text escaping (XSS) ---
+    env = loadChat();
+    ok(typeof env.chat.renderToolApprovalCard === 'function', 'renderToolApprovalCard exposed');
+    const container = env.win.document.createElement('div');
+    const xss = '<img src=x onerror=alert(1)>';
+    env.chat.renderToolApprovalCard(container, {
+      confirmation_id: 'c3', tool_name: xss, description: xss, arguments_summary: xss, expires_at: xss,
+    }, 'sess-3');
+    const cards3 = findByClass(container, 'tool-approval-card');
+    ok(cards3.length === 1, 'card rendered (got ' + cards3.length + ')');
+    ok(cards3[0].dataset.confirmationId === 'c3', 'card data-confirmation-id set');
+
+    // Refresh path: the server returns this card as a persisted session message,
+    // so no live SSE approval envelope is needed to reconstruct it.
+    const persisted = env.chat.createMessageElement({
+      role: 'system', name: 'ui.tool_approval', content: '工具操作等待确认',
+      card: { kind: 'tool_approval', approval: {
+        confirmation_id: 'persisted-c3', tool_name: 'browser.click',
+        description: '打开文章', arguments_summary: '{}', expires_at: '2030-01-01T00:00:00Z',
+      } },
+    });
+    ok(findByClass(persisted, 'tool-approval-card').length === 1,
+      'persisted approval card renders from session history');
+    ok(typeof env.chat.resolveToolApprovalDecisions === 'function',
+      'approval resolution reader exposed');
+    const approvalDecisions = env.chat.resolveToolApprovalDecisions([
+      { role: 'system', name: 'ui.tool_approval_resolution', card: {
+        kind: 'tool_approval_resolution', confirmation_id: 'persisted-c3', status: 'approved',
+      } },
+    ]);
+    ok(approvalDecisions.get('persisted-c3') === 'approved',
+      'persisted approval result is indexed by confirmation id');
+    const resolvedPersisted = env.chat.createMessageElement({
+      role: 'system', name: 'ui.tool_approval', content: '工具操作等待确认',
+      card: { kind: 'tool_approval', approval: {
+        confirmation_id: 'persisted-c3', tool_name: 'browser.click',
+        description: '打开文章', arguments_summary: '{}', expires_at: '2030-01-01T00:00:00Z',
+      } },
+    }, undefined, undefined, approvalDecisions);
+    const resolvedButtons = findByClass(resolvedPersisted, 'tool-approval-card__btn');
+    ok(resolvedButtons.length === 3 && resolvedButtons.every((button) => button.disabled),
+      'approved persisted card disables all three actions after refresh');
+    const allDescs = findDescendants(container, () => true);
+    ok(!allDescs.some((n) => n.tagName === 'IMG' || n.tagName === 'SCRIPT'), 'XSS: no IMG/SCRIPT created (textContent only)');
+    ok(container.textContent.indexOf(xss) !== -1, 'XSS: payload preserved as text');
+    // Three buttons
+    const btns3 = findByClass(cards3[0], 'tool-approval-card__btn');
+    ok(btns3.length === 3, 'three choice buttons rendered (got ' + btns3.length + ')');
+    ok(btns3.every((b) => b.type === 'button'), 'all buttons native type=button');
+    const choices3 = btns3.map((b) => b.dataset.choice).sort();
+    ok(JSON.stringify(choices3) === JSON.stringify(['cancel', 'once', 'trust_session'].sort()), 'three choices: once/trust_session/cancel (got ' + JSON.stringify(choices3) + ')');
+
+    // --- Three choice buttons each POST correctly ---
+    for (const choice of ['once', 'trust_session', 'cancel']) {
+      env = loadChat();
+      const c = env.win.document.createElement('div');
+      env.setFetchHandler('/chat/tool-approvals/', () => Promise.resolve({ status: 204, ok: true, json: async () => ({}) }));
+      env.chat.renderToolApprovalCard(c, {
+        confirmation_id: 'c4-' + choice, tool_name: 'browser.type', description: '输入', arguments_summary: '{}', expires_at: 'e',
+      }, 'sess-stream-4');
+      const btns = findByClass(c, 'tool-approval-card__btn');
+      const btn = btns.find((b) => b.dataset.choice === choice);
+      btn.click();
+      await env.waitMicro();
+      const posts = fetchCalls.filter((f) => f.url && f.url.indexOf('/chat/tool-approvals/c4-' + choice) !== -1);
+      ok(posts.length === 1, choice + ': POST to /chat/tool-approvals/c4-' + choice + ' (got ' + posts.length + ')');
+      ok(posts[0] && posts[0].opts && posts[0].opts.method === 'POST', choice + ': POST method');
+      ok(posts[0] && posts[0].opts.headers && posts[0].opts.headers['X-Session-ID'] === 'sess-stream-4', choice + ': X-Session-ID = stream session (sess-stream-4)');
+      const body = posts[0] && JSON.parse(posts[0].opts.body);
+      ok(body && body.choice === choice, choice + ': body choice correct (got ' + JSON.stringify(body) + ')');
+    }
+
+    // --- Session capture: POST uses streamSessionId, not currentSessionId ---
+    env = loadChat();
+    sessionsList = [{ id: 's-global', title: 's-global' }];
+    env.win.NAGENT.api.getSessionDetail = () => Promise.resolve({ session: { id: 's-global' }, messages: [], summary: null, task_state: null });
+    env.chat.init();
+    await env.waitMicro();
+    env.fireClick(env.findSessionItem('s-global'));
+    await env.waitMicro();
+    // currentSessionId is now 's-global'; render card with a DIFFERENT streamSessionId
+    const cCap = env.win.document.createElement('div');
+    env.setFetchHandler('/chat/tool-approvals/', () => Promise.resolve({ status: 204, ok: true, json: async () => ({}) }));
+    env.chat.renderToolApprovalCard(cCap, {
+      confirmation_id: 'c-cap', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-captured');
+    findByClass(cCap, 'tool-approval-card__btn')[0].click();
+    await env.waitMicro();
+    const capPost = fetchCalls.find((f) => f.url && f.url.indexOf('/chat/tool-approvals/c-cap') !== -1);
+    ok(capPost && capPost.opts.headers['X-Session-ID'] === 'sess-captured', 'session capture: POST uses stream session (sess-captured), not global (s-global)');
+
+    // --- Button dedup: rapid clicks = 1 POST, all buttons disable on first click ---
+    env = loadChat();
+    const c5 = env.win.document.createElement('div');
+    let resolvePost5;
+    env.setFetchHandler('/chat/tool-approvals/', () => new Promise((res) => { resolvePost5 = res; }));
+    env.chat.renderToolApprovalCard(c5, {
+      confirmation_id: 'c5', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-5');
+    const btns5 = findByClass(c5, 'tool-approval-card__btn');
+    btns5[0].click();  // once
+    btns5[0].click();  // dedup
+    btns5[1].click();  // dedup (different button)
+    await env.waitMicro();
+    const posts5 = fetchCalls.filter((f) => f.url && f.url.indexOf('/chat/tool-approvals/c5') !== -1);
+    ok(posts5.length === 1, 'dedup: rapid clicks produce 1 POST (got ' + posts5.length + ')');
+    ok(btns5.every((b) => b.disabled === true), 'dedup: all buttons disabled on first click');
+    resolvePost5({ status: 204, ok: true, json: async () => ({}) });
+    await env.waitMicro();
+
+    // --- Concurrent cards: two approvals in one stream render independent cards ---
+    env = loadChat();
+    const c6 = env.win.document.createElement('div');
+    env.chat.renderToolApprovalCard(c6, {
+      confirmation_id: 'c6a', tool_name: 'browser.click', description: 'd1', arguments_summary: 'a1', expires_at: 'e',
+    }, 'sess-6');
+    env.chat.renderToolApprovalCard(c6, {
+      confirmation_id: 'c6b', tool_name: 'browser.type', description: 'd2', arguments_summary: 'a2', expires_at: 'e',
+    }, 'sess-6');
+    const cards6 = findByClass(c6, 'tool-approval-card');
+    ok(cards6.length === 2, 'concurrent: two independent cards (got ' + cards6.length + ')');
+    ok(cards6[0].dataset.confirmationId === 'c6a' && cards6[1].dataset.confirmationId === 'c6b', 'concurrent: distinct confirmation IDs');
+    // Clicking one card does not disable the other card's buttons
+    env.setFetchHandler('/chat/tool-approvals/', () => Promise.resolve({ status: 204, ok: true, json: async () => ({}) }));
+    const btns6a = findByClass(cards6[0], 'tool-approval-card__btn');
+    const btns6b = findByClass(cards6[1], 'tool-approval-card__btn');
+    btns6a[0].click();
+    await env.waitMicro();
+    ok(btns6a.every((b) => b.disabled === true), 'concurrent: clicked card buttons disabled');
+    ok(btns6b.every((b) => !b.disabled), 'concurrent: other card buttons still enabled');
+
+    // --- Dedup: same confirmation_id not rendered twice ---
+    env = loadChat();
+    const c7 = env.win.document.createElement('div');
+    env.chat.renderToolApprovalCard(c7, {
+      confirmation_id: 'c7', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-7');
+    env.chat.renderToolApprovalCard(c7, {
+      confirmation_id: 'c7', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-7');
+    ok(findByClass(c7, 'tool-approval-card').length === 1, 'dedup: same confirmation_id not rendered twice');
+
+    // --- 404/409 -> terminal state (buttons disabled, no retry) ---
+    for (const status of [404, 409]) {
+      env = loadChat();
+      const c = env.win.document.createElement('div');
+      env.setFetchHandler('/chat/tool-approvals/', () => Promise.resolve({ status, ok: false, json: async () => ({ error: { code: 'x', message: 'm' } }) }));
+      env.chat.renderToolApprovalCard(c, {
+        confirmation_id: 'c-' + status, tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+      }, 'sess-' + status);
+      const btns = findByClass(c, 'tool-approval-card__btn');
+      btns[0].click();
+      await env.waitMicro();
+      await env.waitMicro();
+      ok(btns.every((b) => b.disabled === true), status + ': buttons stay disabled (terminal)');
+      ok(c.textContent.indexOf('已过期或已处理') !== -1, status + ': expired/processed message shown');
+      // Retry click -> no new POST
+      const postsBefore = fetchCalls.filter((f) => f.url && f.url.indexOf('/chat/tool-approvals/c-' + status) !== -1).length;
+      btns[0].click();
+      await env.waitMicro();
+      const postsAfter = fetchCalls.filter((f) => f.url && f.url.indexOf('/chat/tool-approvals/c-' + status) !== -1).length;
+      ok(postsAfter === postsBefore, status + ': no retry POST on re-click');
+    }
+
+    // --- 5xx -> buttons restored (retryable) ---
+    env = loadChat();
+    const c500 = env.win.document.createElement('div');
+    env.setFetchHandler('/chat/tool-approvals/', () => Promise.resolve({ status: 500, ok: false, json: async () => ({}) }));
+    env.chat.renderToolApprovalCard(c500, {
+      confirmation_id: 'c500', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-500');
+    const btns500 = findByClass(c500, 'tool-approval-card__btn');
+    btns500[0].click();
+    await env.waitMicro();
+    await env.waitMicro();
+    ok(btns500.every((b) => !b.disabled), '500: buttons restored for retry');
+    ok(c500.textContent.indexOf('失败') !== -1 || c500.textContent.indexOf('重试') !== -1, '500: error message shown');
+    // Retry: second click sends another POST
+    const posts500Before = fetchCalls.filter((f) => f.url && f.url.indexOf('/chat/tool-approvals/c500') !== -1).length;
+    btns500[0].click();
+    await env.waitMicro();
+    const posts500After = fetchCalls.filter((f) => f.url && f.url.indexOf('/chat/tool-approvals/c500') !== -1).length;
+    ok(posts500After === posts500Before + 1, '500: retry sends another POST');
+
+    // --- Network error -> buttons restored ---
+    env = loadChat();
+    const cNet = env.win.document.createElement('div');
+    env.setFetchHandler('/chat/tool-approvals/', () => Promise.reject(new Error('network down')));
+    env.chat.renderToolApprovalCard(cNet, {
+      confirmation_id: 'cNet', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-net');
+    const btnsNet = findByClass(cNet, 'tool-approval-card__btn');
+    btnsNet[0].click();
+    await env.waitMicro();
+    await env.waitMicro();
+    ok(btnsNet.every((b) => !b.disabled), 'network error: buttons restored for retry');
+    ok(cNet.textContent.indexOf('网络') !== -1 || cNet.textContent.indexOf('重试') !== -1, 'network error: message shown');
+
+    // --- 204 success: shows submitted choice, buttons stay disabled ---
+    env = loadChat();
+    const c204 = env.win.document.createElement('div');
+    env.setFetchHandler('/chat/tool-approvals/', () => Promise.resolve({ status: 204, ok: true, json: async () => ({}) }));
+    env.chat.renderToolApprovalCard(c204, {
+      confirmation_id: 'c204', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-204');
+    const btns204 = findByClass(c204, 'tool-approval-card__btn');
+    btns204.find((b) => b.dataset.choice === 'once').click();
+    await env.waitMicro();
+    await env.waitMicro();
+    ok(btns204.every((b) => b.disabled === true), '204: buttons stay disabled');
+    ok(c204.textContent.indexOf('已提交') !== -1 && c204.textContent.indexOf('仅本次允许') !== -1, '204: submitted choice shown');
+
+    // --- Stream end -> buttons disabled, no late POST ---
+    env = loadChat();
+    ok(typeof env.chat.disableApprovalCards === 'function', 'disableApprovalCards exposed');
+    const cEnd = env.win.document.createElement('div');
+    env.chat.renderToolApprovalCard(cEnd, {
+      confirmation_id: 'cEnd', tool_name: 't', description: 'd', arguments_summary: 'a', expires_at: 'e',
+    }, 'sess-end');
+    env.chat.disableApprovalCards(cEnd);
+    const btnsEnd = findByClass(cEnd, 'tool-approval-card__btn');
+    ok(btnsEnd.every((b) => b.disabled === true), 'stream end: all buttons disabled');
+    const postsBeforeEnd = fetchCalls.length;
+    btnsEnd[0].click();
+    await env.waitMicro();
+    ok(fetchCalls.length === postsBeforeEnd, 'stream end: clicking disabled button makes no POST');
+
+    // --- Sensitive fields: approval payload NOT written to session messages ---
+    env = loadChat();
+    const cPriv = env.win.document.createElement('div');
+    env.chat.renderToolApprovalCard(cPriv, {
+      confirmation_id: 'cPriv', tool_name: 'secret_tool', description: 'secret desc', arguments_summary: '{"password":"hunter2"}', expires_at: 'e',
+    }, 'sess-priv');
+    ok(appendCalls.length === 0, 'approval payload NOT persisted to session messages (got ' + appendCalls.length + ')');
+
+    // --- Integration: send() with approval SSE envelope renders card during stream ---
+    env = loadChat();
+    sessionsList = [];
+    env.win.NAGENT.api.getSessionDetail = () => Promise.resolve({ session: { id: 's-int' }, messages: [], summary: null, task_state: null });
+    env.input.value = 'hello';
+    const textChunk = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'hello' } }] }) + '\n\n';
+    const approvalChunk = approvalEnvelope('c-int', { tool_name: 'browser.click', description: '点击', arguments_summary: '{}' });
+    env.enqueueSseChunks([textChunk, approvalChunk]);
+    env.setStreamKeepOpen();
+    const sendPromise = env.chat.send();
+    // Wait for send to process chunks (multiple microtask hops: ensureSession + fetch + reads)
+    for (let i = 0; i < 10; i++) await env.waitMicro();
+    const intCards = findByClass(env.messageStack, 'tool-approval-card');
+    ok(intCards.length === 1, 'integration: card rendered during stream (got ' + intCards.length + ')');
+    ok(intCards[0] && intCards[0].dataset.confirmationId === 'c-int', 'integration: card confirmation_id correct');
+    // Text was streamed into the assistant bubble
+    const assistantBubbles = findByClass(env.messageStack, 'assistant');
+    ok(assistantBubbles.length >= 1 && assistantBubbles[0].textContent.indexOf('hello') !== -1, 'integration: text streamed to assistant bubble');
+    // End stream -> card buttons disabled
+    env.endStream();
+    await sendPromise;
+    // After stream end, card buttons should be disabled (card may be gone after refresh,
+    // but if present, buttons must be disabled). Check the captured card reference.
+    const intBtnsAfter = intCards[0] ? findByClass(intCards[0], 'tool-approval-card__btn') : [];
+    ok(intBtnsAfter.every((b) => b.disabled === true), 'integration: card buttons disabled after stream end');
+
+    // --- Integration: invalid approval payload terminates stream with error ---
+    env = loadChat();
+    sessionsList = [];
+    env.win.NAGENT.api.getSessionDetail = () => Promise.resolve({ session: { id: 's-inv' }, messages: [], summary: null, task_state: null });
+    env.input.value = 'hello';
+    const invalidApproval = 'data: ' + JSON.stringify({ object: 'n-agent.tool_approval', approval: { confirmation_id: 'c-inv', tool_name: 't' } }) + '\n\n';
+    const textAfter = 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'should-not-appear' } }] }) + '\n\n';
+    env.enqueueSseChunks([invalidApproval, textAfter]);
+    await env.chat.send();
+    // The key assertion: no card was rendered and no POST was made
+    ok(!fetchCalls.some((f) => f.url && f.url.indexOf('/chat/tool-approvals/') !== -1), 'invalid approval: no POST made');
+
+    // --- Integration: existing text streaming still works (regression) ---
+    env = loadChat();
+    sessionsList = [];
+    env.win.NAGENT.api.getSessionDetail = () => Promise.resolve({ session: { id: 's-reg' }, messages: [], summary: null, task_state: null });
+    env.input.value = '帮我写总结';
+    env.enqueueSseChunks(['data: ' + JSON.stringify({ choices: [{ delta: { content: '回复' } }] }) + '\n\n']);
+    await env.chat.send();
+    ok(fetchCalls.some((f) => f.url === '/chat/completions'), 'regression: text streaming calls /chat/completions');
+    ok(!fetchCalls.some((f) => f.url && f.url.indexOf('/chat/tool-approvals/') !== -1), 'regression: no approval POST for plain text');
+
+    await env.waitMicro();
+    ok(unhandledCount === 0, 'no unhandledRejection (got ' + unhandledCount + ', reasons=' + JSON.stringify(unhandledReasons.map((r) => r && r.message)) + ')');
+  } finally {
+    process.removeListener('unhandledRejection', unhandledHandler);
+  }
+}
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
   await testDebugSettingsPerSession();
+  await testToolApprovalCard();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

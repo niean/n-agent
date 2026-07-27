@@ -20,6 +20,27 @@ async def test_nudge_triggers_review_when_interval_reached():
     args = evolution.maybe_trigger.call_args
     assert (args.args[0] if args.args else args.kwargs["session_id"]) == "s1"
 
+
+@pytest.mark.asyncio
+async def test_nudge_digest_excludes_runtime_system_prompt():
+    evolution = MagicMock(); evolution.maybe_trigger = AsyncMock()
+    runner = _build_runner(evolution_service=evolution, nudge_interval=10)
+
+    await runner._post_finalize_nudge(
+        session_id="s1",
+        turn_count=10,
+        recent_messages=[
+            {"role": "system", "content": "## Identity\n\nsecret runtime prompt"},
+            {"role": "user", "content": "用户目标"},
+            {"role": "assistant", "content": "执行结果"},
+        ],
+    )
+
+    digest = evolution.maybe_trigger.call_args.args[2]
+    assert "## Identity" not in digest
+    assert digest == "用户目标\n执行结果"
+
+
 @pytest.mark.asyncio
 async def test_nudge_skipped_when_below_interval():
     evolution = MagicMock(); evolution.maybe_trigger = AsyncMock()

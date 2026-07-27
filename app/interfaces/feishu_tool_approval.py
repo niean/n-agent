@@ -18,7 +18,7 @@ from app.domain.tool import (
 
 ApprovalSender = Callable[[dict[str, Any]], Awaitable[str]]
 ApprovalCleanup = Callable[[str], None]
-SessionGrantUpdater = Callable[[str, str, str], None]
+SessionGrantUpdater = Callable[[str, str, str], Any]
 SessionGrantChecker = Callable[[str, str, str], bool]
 logger = logging.getLogger(__name__)
 

@@ -142,6 +142,37 @@ async def test_call_llm_records_usage_when_usage_service_present(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_call_llm_does_not_retain_internal_fork_payload_usage(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-internal"))
+    usage_service = FakeUsageService()
+    runner = AgentGraphRunner(
+        llm_provider=UsageCapturingProvider(
+            usage={"prompt_tokens": 100, "completion_tokens": 10}
+        ),
+        tool_service=ToolService(
+            build_builtin_tool_executor(tmp_path), builtin_tool_definitions()
+        ),
+        memory_store=store,
+        summarizer=HeuristicSummarizer(),
+        usage_service=usage_service,
+    )
+    state = AgentState(
+        session_id="sess-internal",
+        input_messages=[{"role": "user", "content": "internal digest"}],
+        working_messages=[
+            {"role": "system", "content": "## Identity\n\nsecret runtime prompt"},
+            {"role": "user", "content": "internal digest"},
+        ],
+        persist_messages=False,
+    )
+
+    await runner.call_llm(state)
+
+    assert usage_service.record_calls == []
+
+
+@pytest.mark.asyncio
 async def test_call_llm_skips_usage_when_service_none(tmp_path):
     """Backward compat: usage_service=None should not break call_llm."""
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -273,6 +304,50 @@ async def test_call_llm_logs_sanitized_payload_when_enabled(tmp_path, caplog):
     assert "sk-secret123" not in response_logs[0].getMessage()
     assert "[REDACTED]" in request_logs[0].getMessage()
     assert "[REDACTED]" in response_logs[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_call_llm_does_not_log_internal_fork_payload_when_enabled(
+    tmp_path, caplog
+):
+    import logging
+
+    from app.application.information_flow_service import InformationFlowService
+    from app.application.policy_snapshot import InformationFlowPolicyConfig
+    from app.domain.information_flow import SecretCatalog
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-internal-log"))
+    runner = AgentGraphRunner(
+        llm_provider=UsageCapturingProvider(usage={}, model_response="review done"),
+        tool_service=ToolService(
+            build_builtin_tool_executor(tmp_path), builtin_tool_definitions()
+        ),
+        memory_store=store,
+        summarizer=HeuristicSummarizer(),
+        information_flow_service=InformationFlowService(
+            InformationFlowPolicyConfig(log_llm_payloads=True),
+            SecretCatalog(),
+        ),
+    )
+    state = AgentState(
+        session_id="sess-internal-log",
+        input_messages=[{"role": "user", "content": "internal digest"}],
+        working_messages=[
+            {"role": "system", "content": "## Identity\n\nsecret runtime prompt"},
+            {"role": "user", "content": "internal digest"},
+        ],
+        persist_messages=False,
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.application.agent_graph"):
+        await runner.call_llm(state)
+
+    assert not any(
+        "LLM request" in record.getMessage()
+        or "LLM response" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @pytest.mark.asyncio

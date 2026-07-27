@@ -16,6 +16,7 @@
     sandbox: false,
     'executors-host': false,
     security: false,
+    browser: false,
     'tools-builtin': false,
     'tools-mcp': false,
     'tools-knowledge': false,
@@ -43,6 +44,7 @@
     if (tab === 'observations-sessions') return namespace.observations;
     if (tab === 'observations-modules') return namespace.status;
     if (tab === 'security') return namespace.security;
+    if (tab === 'browser') return namespace.browser;
     return null;
   }
 

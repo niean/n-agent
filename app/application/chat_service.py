@@ -137,9 +137,10 @@ class ChatCompletionService:
         else:
             locked_external_memory = []
 
-        locked_external_memory = await self._runtime_memory.lock_profile(
-            session_id, locked_external_memory, slots=self._build_slot_map(locked_external_memory),
-        )
+        if request.persist_messages:
+            locked_external_memory = await self._runtime_memory.lock_profile(
+                session_id, locked_external_memory, slots=self._build_slot_map(locked_external_memory),
+            )
         normalized_messages: list[dict[str, Any]] = []
         for message in request.messages:
             new_message = dict(message)
@@ -152,7 +153,7 @@ class ChatCompletionService:
             "",
         )
         # Detect /compress slash command: compress directly without saving user message or calling LLM
-        if _is_compress_slash(first_user_message):
+        if request.persist_messages and _is_compress_slash(first_user_message):
             status = await self.compress_session(session_id)
             content = _format_compress_status(status)
             if request.stream:
@@ -171,7 +172,8 @@ class ChatCompletionService:
                         message.get("content", ""),
                         source=session_source,
                     )
-        await self.session_service.ensure_title(session_id, str(first_user_message))
+        if request.persist_messages:
+            await self.session_service.ensure_title(session_id, str(first_user_message))
         # Process-origin runs (task/schedule/curator workers) tag their assistant
         # messages with the run source so the dashboard can hide the worker's
         # internal reasoning; realtime (api/dashboard) stays untagged (None) and

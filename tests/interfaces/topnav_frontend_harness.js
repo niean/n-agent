@@ -274,6 +274,13 @@ ok(state.activeTab === 'chat', 'A4 activeTab (got ' + state.activeTab + ')');
 ok(state.currentSubdomain === null, 'A4 currentSubdomain (got ' + state.currentSubdomain + ')');
 
 // ===========================================================================
+// T2 Assertion 4b: browser detail route keeps the browser module active
+// ===========================================================================
+state = nav.resolveRoute('/browser/session');
+ok(state.activeTab === 'browser', 'A4b activeTab (got ' + state.activeTab + ')');
+ok(state.currentSubdomain === 'executors', 'A4b currentSubdomain (got ' + state.currentSubdomain + ')');
+
+// ===========================================================================
 // T2 Assertion 5: precise topnav item matching, no indexOf fallback
 // ===========================================================================
 const tasksItems = nav.topnavConfig.tasks;
