@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import json
 from typing import Any
 
 import pytest
@@ -24,6 +25,7 @@ import pytest
 from app.application.browser_service import (
     BrowserService,
     BrowserServiceSettings,
+    HostGrantApprovalRequired,
     RunContext,
 )
 from app.domain.browser import (
@@ -64,6 +66,7 @@ class FakeBackend:
         self.next_action_result: BrowserActionResult | None = None
         self.next_action_exc: Exception | None = None
         self.next_state: Any | None = None
+        self.screenshot_by_session: dict[str, bytes] = {}
 
     async def create_session(self, session: BrowserSession) -> None:
         self.create_calls.append(session)
@@ -102,6 +105,9 @@ class FakeBackend:
 
     async def end_takeover(self, session_id: str) -> None:
         self.end_takeover_calls.append(session_id)
+
+    def last_screenshot_bytes(self, session_id: str) -> bytes | None:
+        return self.screenshot_by_session.get(session_id)
 
 
 class FakeRegistry:
@@ -558,10 +564,53 @@ async def test_observe_text_success_but_screenshot_fail_yields_warning():
 
     result = await service.execute_action("nagent-1", ObserveAction(), _run_ctx())
     assert result.status == "success"
-    # No screenshot capture during observe by default, so warning_code may
-    # be None. We exercise the warning path when the action_type is screenshot.
-    # (This test confirms the observe path does not crash on screenshot store
-    # failure.)
+    assert result.warning_code == "screenshot_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_non_screenshot_missing_frame_preserves_existing_warning():
+    service, _, _, backends, _ = _make_service()
+    backend = backends[BrowserBackendType.CONTAINER]
+    backend.next_action_result = BrowserActionResult(
+        action_type="observe",
+        status="success",
+        text="hello",
+        warning_code="host_warning",
+        document_revision=0,
+    )
+
+    result = await service.execute_action(
+        "nagent-1", ObserveAction(), _run_ctx()
+    )
+
+    assert result.status == "success"
+    assert result.warning_code == "host_warning"
+
+
+@pytest.mark.asyncio
+async def test_non_screenshot_persist_failure_preserves_existing_warning():
+    service, _, screenshot_store, backends, _ = _make_service()
+    backend = backends[BrowserBackendType.CONTAINER]
+    backend.next_action_result = BrowserActionResult(
+        action_type="observe",
+        status="success",
+        text="hello",
+        warning_code="host_warning",
+        document_revision=0,
+    )
+    setattr(
+        backend,
+        "last_screenshot_bytes",
+        lambda session_id: b"\x89PNG\r\n\x1a\n" + b"\x00" * 64,
+    )
+    screenshot_store.persist_exc = RuntimeError("disk full")
+
+    result = await service.execute_action(
+        "nagent-1", ObserveAction(), _run_ctx()
+    )
+
+    assert result.status == "success"
+    assert result.warning_code == "host_warning"
 
 
 @pytest.mark.asyncio
@@ -728,6 +777,46 @@ async def test_host_cdp_with_valid_grant_activates_session():
 
 
 @pytest.mark.asyncio
+async def test_host_cdp_fresh_screenshot_persists_without_base64_projection():
+    service, registry, screenshot_store, backends, _ = _make_service(
+        default_backend=BrowserBackendType.HOST_CDP,
+    )
+    backend = backends[BrowserBackendType.HOST_CDP]
+    session = await service.get_or_create_session(
+        "nagent-1", BrowserBackendType.HOST_CDP, _run_ctx()
+    )
+    assert await service.grant_host(
+        "nagent-1",
+        actor_id="actor-1",
+        policy_version="v1",
+        ttl_seconds=3600,
+    )
+    screenshot = b"\x89PNG\r\n\x1a\nhost-frame"
+    backend.screenshot_by_session[session.id] = screenshot
+    backend.next_action_result = BrowserActionResult(
+        action_type="observe",
+        status="success",
+        text="safe page text",
+        document_revision=0,
+    )
+
+    result = await service.execute_action(
+        "nagent-1", ObserveAction(), _run_ctx()
+    )
+
+    assert result.status == "success"
+    assert not hasattr(result, "screenshot_base64")
+    assert "base64" not in repr(result).lower()
+    assert screenshot_store.stored == [
+        (session.id, screenshot, "image/png")
+    ]
+    assert service._latest_screenshot_ref[session.id] == "ref-0"
+    summary = registry.action_summaries[session.id][-1]
+    assert "base64" not in json.dumps(summary).lower()
+    assert screenshot.decode("latin1") not in repr(summary)
+
+
+@pytest.mark.asyncio
 async def test_grant_host_returns_false_when_create_session_fails():
     """When backend.create_session raises, the session transitions to
     DEGRADED (not back to PENDING) and grant_host returns False."""
@@ -858,7 +947,42 @@ async def test_execute_on_host_cdp_before_grant_returns_host_grant_required():
 
 
 @pytest.mark.asyncio
-async def test_revoke_host_grant_makes_session_pending_again():
+async def test_host_cdp_pending_trusted_dev_raises_host_grant_approval_required():
+    """trusted_dev=True + host_cdp + pending -> execute_action raises
+    HostGrantApprovalRequired (Chat CONFIRM card flow signal), not an error
+    result. The signal carries the browser_session_id for the approval card."""
+    service, registry, _, backends, _ = _make_service(
+        default_backend=BrowserBackendType.HOST_CDP,
+        settings=BrowserServiceSettings(max_sessions_per_run=4, trusted_dev=True),
+    )
+    await service.get_or_create_session(
+        "nagent-1", BrowserBackendType.HOST_CDP, _run_ctx()
+    )
+    with pytest.raises(HostGrantApprovalRequired) as exc_info:
+        await service.execute_action(
+            "nagent-1", ObserveAction(), _run_ctx()
+        )
+    assert exc_info.value.browser_session_id is not None
+    assert exc_info.value.n_agent_session_id == "nagent-1"
+
+
+@pytest.mark.asyncio
+async def test_host_cdp_pending_trusted_dev_false_returns_error_no_signal():
+    """trusted_dev=False + host_cdp + pending -> execute_action returns an
+    error result (host_grant_required), does NOT raise (no card injection,
+    fail-closed to Dashboard/host-grant path)."""
+    service, registry, _, backends, _ = _make_service(
+        default_backend=BrowserBackendType.HOST_CDP,
+        settings=BrowserServiceSettings(max_sessions_per_run=4, trusted_dev=False),
+    )
+    await service.get_or_create_session(
+        "nagent-1", BrowserBackendType.HOST_CDP, _run_ctx()
+    )
+    result = await service.execute_action(
+        "nagent-1", ObserveAction(), _run_ctx()
+    )
+    assert result.status == "error"
+    assert result.error_code == "host_grant_required"
     service, registry, _, backends, _ = _make_service(
         default_backend=BrowserBackendType.HOST_CDP,
     )

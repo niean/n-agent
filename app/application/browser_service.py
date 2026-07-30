@@ -77,6 +77,24 @@ class BrowserServiceSettings:
     max_sessions_per_run: int = 4
     action_timeout_seconds: float = 30.0
     screenshot_consumer_default: str = "dashboard_internal"
+    trusted_dev: bool = False
+
+
+@dataclass(frozen=True)
+class HostGrantApprovalRequired(Exception):
+    """Signal that a host_cdp session is PENDING_AUTHORIZATION and needs a
+    Host Grant via the Chat CONFIRM card flow.
+
+    Raised by execute_action when BrowserPolicy returns REQUIRE_APPROVAL for
+    a host_cdp session AND settings.trusted_dev is True. Caught by
+    BrowserToolExecutor, which converts it to a PERMISSION_DENIED ToolResult
+    carrying the host-grant signal so AgentGraph can inject an approval card.
+
+    When trusted_dev is False, execute_action does NOT raise -- it returns an
+    error result (no card injection, fail-closed to Dashboard/host-grant path).
+    """
+    browser_session_id: str
+    n_agent_session_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -222,9 +240,14 @@ class BrowserService:
         )
         await self._audit_policy_decision(decision, session, "create")
 
-        if decision.outcome is PolicyOutcome.DENY:
-            # Surface the deny as a logical session in PENDING_AUTHORIZATION
-            # state; do NOT connect the backend.
+        if decision.outcome is PolicyOutcome.DENY or (
+            decision.outcome is PolicyOutcome.REQUIRE_APPROVAL
+            and decision.reason == "host_grant_required"
+        ):
+            # Surface the deny/require-approval as a logical session in
+            # PENDING_AUTHORIZATION state; do NOT connect the backend.
+            # host_grant_required REQUIRE_APPROVAL is handled at execute_action
+            # time (Chat CONFIRM card); create just registers the pending session.
             if session.status is BrowserSessionStatus.PENDING_AUTHORIZATION:
                 try:
                     await self._registry.create(session)
@@ -329,10 +352,22 @@ class BrowserService:
                     document_revision=session.document_revision,
                 )
             if decision.outcome is PolicyOutcome.REQUIRE_APPROVAL:
+                # host_grant_required on a host_cdp pending session: when
+                # trusted_dev is on, surface a signal so BrowserToolExecutor
+                # can route it to the Chat CONFIRM card flow; when off, fall
+                # back to the error result (no card, fail-closed).
+                if (
+                    decision.reason == "host_grant_required"
+                    and self._settings.trusted_dev
+                ):
+                    raise HostGrantApprovalRequired(
+                        browser_session_id=session.id,
+                        n_agent_session_id=n_agent_session_id,
+                    )
                 return BrowserActionResult(
                     action_type=type(action).__name__.replace("Action", "").lower(),
                     status="error",
-                    error_code="takeover_requires_approval",
+                    error_code=decision.reason or "takeover_requires_approval",
                     document_revision=session.document_revision,
                 )
 
@@ -962,6 +997,8 @@ class BrowserService:
                 error_code="screenshot_unavailable",
                 warning_code=None,
             )
+        if result.warning_code is not None:
+            return result
         # navigate/observe: screenshot was incidental -> success + warning.
         return replace(result, warning_code="screenshot_unavailable")
 

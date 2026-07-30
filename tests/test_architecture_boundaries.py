@@ -154,6 +154,43 @@ def test_interfaces_do_not_import_infrastructure_or_sqlite():
     assert_no_forbidden_imports("app/interfaces", ("sqlite3", "app.infrastructure"))
 
 
+def test_browser_host_runtime_does_not_import_interfaces():
+    modules = imported_modules(ROOT / "app/browser_host_runtime.py")
+    violations = [
+        module
+        for module in modules
+        if module == "app.interfaces" or module.startswith("app.interfaces.")
+    ]
+    assert not violations
+
+
+def test_browser_host_protocol_dependency_direction():
+    protocol = ROOT / "app/infrastructure/browser/host_protocol.py"
+    client = ROOT / "app/infrastructure/browser/host_cdp_backend.py"
+    server = ROOT / "app/infrastructure/browser/host_bridge_server.py"
+
+    forbidden_protocol_imports = (
+        "app.infrastructure.browser.host_cdp_backend",
+        "app.infrastructure.browser.host_bridge_server",
+        "app.interfaces",
+    )
+    assert not [
+        module
+        for module in imported_modules(protocol)
+        if module in forbidden_protocol_imports
+        or module.startswith(forbidden_protocol_imports)
+    ]
+    assert (
+        "app.infrastructure.browser.host_cdp_backend"
+        not in imported_modules(server)
+    )
+    for consumer in (client, server):
+        assert (
+            "app.infrastructure.browser.host_protocol"
+            in imported_modules(consumer)
+        )
+
+
 def test_skill_domain_pure():
     text = (ROOT / "app/domain/skill.py").read_text()
     for forbidden in (

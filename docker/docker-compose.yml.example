@@ -36,6 +36,10 @@ services:
       N_AGENT_HOST_TERMINAL_MAX_STDOUT_BYTES: ${N_AGENT_HOST_TERMINAL_MAX_STDOUT_BYTES:-8192}
       N_AGENT_HOST_TERMINAL_MAX_STDERR_BYTES: ${N_AGENT_HOST_TERMINAL_MAX_STDERR_BYTES:-8192}
       N_AGENT_HOST_TERMINAL_MAX_CONCURRENCY: ${N_AGENT_HOST_TERMINAL_MAX_CONCURRENCY:-1}
+      N_AGENT_BROWSER_DEFAULT_BACKEND: ${N_AGENT_BROWSER_DEFAULT_BACKEND:-container}
+      N_AGENT_BROWSER_HOST_BRIDGE_URL: ${N_AGENT_BROWSER_HOST_BRIDGE_URL:-http://host.docker.internal:8766}
+      N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH: ${N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH:-/app/locals/host-browser.token}
+      N_AGENT_BROWSER_TRUSTED_DEV: ${N_AGENT_BROWSER_TRUSTED_DEV:-false}
     ports:
       - "8201:8201"
     healthcheck:
@@ -49,6 +53,7 @@ services:
       # Create these owner-only files first. They override the writable locals mount.
       - ~/app/locals/host-terminal-policy.yaml:/app/locals/host-terminal-policy.yaml:ro
       - ~/app/locals/host-terminal.token:/app/locals/host-terminal.token:ro
+      - ~/app/locals/host-browser.token:/app/locals/host-browser.token:ro
       - ~/workspace:/workspace
       # 沙盒 Docker 后端：sandbox_type=docker 时取消注释，并确保容器内 docker CLI 可用（见 Dockerfile）
       # - /var/run/docker.sock:/var/run/docker.sock

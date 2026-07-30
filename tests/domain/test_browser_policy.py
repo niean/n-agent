@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 from app.domain.browser import (
@@ -49,16 +50,24 @@ class _FakeGrant:
     revoked: bool = False
 
 
-def test_host_default_deny_without_grant():
+def test_pending_authorization_host_cdp_returns_require_approval():
+    """PENDING_AUTHORIZATION + HOST_CDP surfaces REQUIRE_APPROVAL so the
+    Application layer can inject a Chat CONFIRM card for host grant."""
     p = BrowserPolicy()
     d = p.evaluate(_req(_host_session(), "navigate"))
-    assert d.outcome is PolicyOutcome.DENY
+    assert d.outcome is PolicyOutcome.REQUIRE_APPROVAL
     assert d.reason == "host_grant_required"
 
 
-def test_pending_authorization_returns_host_grant_required():
+def test_pending_authorization_container_stays_deny():
+    """PENDING_AUTHORIZATION + CONTAINER stays DENY fail-closed; no
+    fallthrough to the CONTAINER allow branch for pending sessions."""
     p = BrowserPolicy()
-    d = p.evaluate(_req(_host_session(), "navigate"))
+    # construct a container session forced into PENDING_AUTHORIZATION
+    container_pending = dataclasses.replace(
+        _container_session(), status=BrowserSessionStatus.PENDING_AUTHORIZATION
+    )
+    d = p.evaluate(_req(container_pending, "navigate"))
     assert d.outcome is PolicyOutcome.DENY
     assert d.reason == "host_grant_required"
 

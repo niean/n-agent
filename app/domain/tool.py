@@ -57,6 +57,11 @@ class ApprovalRequest:
     arguments: dict[str, Any]
     description: str
     risk_level: RiskLevel
+    # Optional metadata carried alongside the approval request. NOT part of
+    # the 5-field approval card envelope whitelist (confirmation_id /
+    # tool_name / description / arguments_summary / expires_at); used only
+    # internally by claim path and AgentGraph to route host-grant approvals.
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

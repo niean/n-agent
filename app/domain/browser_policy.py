@@ -13,6 +13,9 @@ from app.domain.browser import (
 from app.domain.policy import PolicyOutcome
 
 
+BROWSER_POLICY_VERSION = "system-v1"
+
+
 # Non-active statuses that deny all Agent actions (PENDING_AUTHORIZATION handled
 # separately to surface the more informative host_grant_required reason).
 _NON_ACTIVE_ACTION_STATUSES = frozenset({
@@ -66,7 +69,14 @@ class BrowserPolicy:
             return BrowserPolicyDecision(PolicyOutcome.DENY, "not_in_takeover")
 
         # PENDING_AUTHORIZATION: host session awaiting grant.
+        # HOST_CDP surfaces REQUIRE_APPROVAL so the Application layer can
+        # inject a Chat CONFIRM card (host grant); non-host_cdp pending stays
+        # DENY fail-closed (no fallthrough to CONTAINER allow).
         if session.status is BrowserSessionStatus.PENDING_AUTHORIZATION:
+            if request.requested_backend is BrowserBackendType.HOST_CDP:
+                return BrowserPolicyDecision(
+                    PolicyOutcome.REQUIRE_APPROVAL, "host_grant_required"
+                )
             return BrowserPolicyDecision(PolicyOutcome.DENY, "host_grant_required")
 
         # Other non-active states deny all Agent actions.

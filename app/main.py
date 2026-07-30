@@ -164,6 +164,7 @@ from app.infrastructure.browser.host_cdp_backend import (
     HostCdpBackendConfig,
     HostCdpBrowserBackend,
 )
+from app.infrastructure.browser import host_protocol
 from app.infrastructure.browser.screenshot_store import SqliteBrowserScreenshotStore
 from app.infrastructure.browser.sqlite_browser_registry import SqliteBrowserSessionRegistry
 from app.infrastructure.browser.url_safety import UrlVerifier
@@ -1324,6 +1325,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             max_sessions_per_run=settings.browser_global_session_limit,
             action_timeout_seconds=float(settings.browser_action_timeout),
             screenshot_consumer_default="dashboard_internal",
+            trusted_dev=settings.browser_trusted_dev,
         )
         # Build backends dict based on configuration.
         browser_backends: dict[BrowserBackendType, Any] = {}
@@ -1335,6 +1337,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 action_timeout_seconds=float(settings.browser_action_timeout),
                 navigation_timeout_seconds=float(settings.browser_navigation_timeout),
                 takeover_ttl_seconds=settings.browser_takeover_ttl_seconds,
+                max_screenshot_bytes=settings.browser_max_screenshot_bytes,
             )
             browser_backends[BrowserBackendType.CONTAINER] = container_backend
         # Host CDP backend: created when host bridge URL + token path are
@@ -1346,9 +1349,22 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             and settings.browser_host_bridge_token_path is not None
             and settings.browser_trusted_dev
         ):
+            if (
+                settings.browser_max_screenshot_bytes
+                != host_protocol.HOST_CDP_MAX_SCREENSHOT_BYTES
+            ):
+                raise ValueError(
+                    "host_bridge_screenshot_limit_invalid"
+                )
             host_cdp_config = HostCdpBackendConfig(
                 base_url=settings.browser_host_bridge_url,
                 token_path=settings.browser_host_bridge_token_path,
+                max_screenshot_bytes=(
+                    host_protocol.HOST_CDP_MAX_SCREENSHOT_BYTES
+                ),
+                max_response_bytes=(
+                    host_protocol.max_json_response_bytes()
+                ),
             )
             host_cdp_backend = HostCdpBrowserBackend(host_cdp_config)
             browser_backends[BrowserBackendType.HOST_CDP] = host_cdp_backend
@@ -1379,6 +1395,15 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             confirmation_service=browser_confirmation_service_obj,
             settings=settings,
         )
+        # Inject browser dashboard service + grant TTL into the graph runner so
+        # _request_browser_host_grant_approval can call grant_host after the
+        # Chat CONFIRM card is approved. graph_runner was constructed earlier
+        # (before browser services existed); setattr injects the dependency.
+        if settings.browser_enabled:
+            graph_runner._browser_dashboard_service = browser_dashboard_service_obj
+            graph_runner._browser_host_grant_ttl_seconds = (
+                settings.browser_host_grant_ttl_seconds
+            )
 
     def health_snapshot() -> dict:
         memory_status = "ok"

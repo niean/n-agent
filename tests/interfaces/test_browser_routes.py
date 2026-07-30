@@ -11,6 +11,8 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -26,6 +28,7 @@ from app.domain.browser import (
     BrowserSessionStatus,
     BrowserState,
 )
+from app.domain.browser_policy import BROWSER_POLICY_VERSION
 from app.interfaces.http.browser_routes import register_browser_routes
 
 
@@ -192,6 +195,48 @@ def _get_challenge(
         n_agent_session_id=n_agent_session_id,
         actor_id=actor,
     )
+
+
+async def _post_host_grant_asgi_stream(
+    client: TestClient,
+    token: str,
+    receive,
+    *,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> tuple[int, dict]:
+    messages: list[dict] = []
+    headers = [
+        (b"host", b"testserver"),
+        (b"content-type", b"application/json"),
+        (b"x-browser-challenge", token.encode("ascii")),
+    ]
+    headers.extend(extra_headers or [])
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/chat/browser/sessions/bsess-1/host-grant",
+        "raw_path": b"/chat/browser/sessions/bsess-1/host-grant",
+        "query_string": b"n_agent_session_id=nagent-1",
+        "root_path": "",
+        "headers": headers,
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    async def send(message):
+        messages.append(message)
+
+    await client.app(scope, receive, send)
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    body = b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+    return start["status"], json.loads(body)
 
 
 # ---------------------------------------------------------------------------
@@ -461,12 +506,23 @@ def test_host_grant_404_in_production():
     r = client.post(
         "/chat/browser/sessions/bsess-1/host-grant",
         params={"n_agent_session_id": "nagent-1"},
-        json={"policy_version": "v1", "ttl_seconds": 300},
+        json={},
     )
     assert r.status_code == 404
 
 
-def test_host_grant_succeeds_when_trusted_dev():
+@pytest.mark.parametrize(
+    ("payload", "expected_ttl"),
+    [
+        ({}, 300),
+        ({"ttl_seconds": 1}, 1),
+        ({"ttl_seconds": 17}, 17),
+        ({"ttl_seconds": 300}, 300),
+    ],
+)
+def test_host_grant_uses_server_policy_version_and_validated_ttl(
+    payload, expected_ttl
+):
     client, browser_service, _, confirmation = _make_app(trusted_dev=True)
     browser_service.sessions["bsess-1"] = _make_session(
         "bsess-1", "nagent-1",
@@ -477,11 +533,402 @@ def test_host_grant_succeeds_when_trusted_dev():
     r = client.post(
         "/chat/browser/sessions/bsess-1/host-grant",
         params={"n_agent_session_id": "nagent-1"},
-        json={"policy_version": "v1", "ttl_seconds": 300},
+        json=payload,
         headers={"x-browser-challenge": token},
     )
     assert r.status_code == 200
     assert r.json()["ok"] is True
+    assert browser_service.host_grant_called == [
+        ("nagent-1", "dashboard-operator", BROWSER_POLICY_VERSION, expected_ttl)
+    ]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"policy_version": BROWSER_POLICY_VERSION},
+        {"unknown": "field"},
+        {"ttl_seconds": True},
+        {"ttl_seconds": False},
+        {"ttl_seconds": "1"},
+        {"ttl_seconds": 1.0},
+        {"ttl_seconds": None},
+        {"ttl_seconds": 0},
+        {"ttl_seconds": -1},
+        {"ttl_seconds": 301},
+    ],
+)
+def test_host_grant_rejects_invalid_request_with_stable_non_leaking_error(payload):
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    r = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json=payload,
+        headers={"x-browser-challenge": token},
+    )
+    assert r.status_code == 400
+    assert r.json() == {
+        "error": {
+            "code": "browser_grant_invalid_request",
+            "message": "browser_grant_invalid_request",
+        }
+    }
+    assert browser_service.host_grant_called == []
+    assert "detail" not in r.text
+    assert "input" not in r.text
+    assert str(next(iter(payload.values()))) not in r.text
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type"),
+    [
+        ('{"ttl_seconds":', "application/json"),
+        ('["not", "an", "object"]', "application/json"),
+        ('null', "application/json"),
+    ],
+)
+def test_host_grant_normalizes_json_and_model_validation_failures(
+    content, content_type
+):
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    r = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        content=content,
+        headers={
+            "content-type": content_type,
+            "x-browser-challenge": token,
+        },
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == {
+        "code": "browser_grant_invalid_request",
+        "message": "browser_grant_invalid_request",
+    }
+    assert browser_service.host_grant_called == []
+    assert "detail" not in r.text
+    assert "input" not in r.text
+
+
+def test_host_grant_invalid_body_consumes_bound_challenge_before_validation():
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    invalid = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={"ttl_seconds": "300"},
+        headers={"x-browser-challenge": token},
+    )
+    replay = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={},
+        headers={"x-browser-challenge": token},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "browser_grant_invalid_request"
+    assert replay.status_code == 403
+    assert replay.json()["error"]["code"] == "invalid_challenge"
+    assert browser_service.host_grant_called == []
+
+
+def test_host_grant_oversized_body_is_bounded_and_consumes_challenge():
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    oversized = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        content=(b" " * 1024) + b"{}",
+        headers={
+            "content-type": "application/json",
+            "x-browser-challenge": token,
+        },
+    )
+    replay = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={},
+        headers={"x-browser-challenge": token},
+    )
+    assert oversized.status_code == 400
+    assert oversized.json() == {
+        "error": {
+            "code": "browser_grant_invalid_request",
+            "message": "browser_grant_invalid_request",
+        }
+    }
+    assert replay.status_code == 403
+    assert replay.json()["error"]["code"] == "invalid_challenge"
+    assert browser_service.host_grant_called == []
+
+
+def test_host_grant_streaming_overflow_stops_reading_and_consumes_challenge():
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    receive_calls = 0
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        if receive_calls > 2:
+            raise AssertionError("route continued reading an unbounded body")
+        return {
+            "type": "http.request",
+            "body": b" " * 600,
+            "more_body": True,
+        }
+
+    status, body = asyncio.run(
+        _post_host_grant_asgi_stream(client, token, receive)
+    )
+    replay = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={},
+        headers={"x-browser-challenge": token},
+    )
+    assert status == 400
+    assert body == {
+        "error": {
+            "code": "browser_grant_invalid_request",
+            "message": "browser_grant_invalid_request",
+        }
+    }
+    assert receive_calls == 2
+    assert replay.status_code == 403
+    assert replay.json()["error"]["code"] == "invalid_challenge"
+    assert browser_service.host_grant_called == []
+
+
+@pytest.mark.parametrize(
+    "content_length",
+    [b"1025", b"9" * 5000],
+)
+def test_host_grant_single_oversized_content_length_rejects_before_stream_read(
+    content_length
+):
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+
+    async def receive():
+        raise AssertionError("oversized Content-Length must reject before reading")
+
+    status, body = asyncio.run(
+        _post_host_grant_asgi_stream(
+            client,
+            token,
+            receive,
+            extra_headers=[(b"content-length", content_length)],
+        )
+    )
+    assert status == 400
+    assert body == {
+        "error": {
+            "code": "browser_grant_invalid_request",
+            "message": "browser_grant_invalid_request",
+        }
+    }
+    assert confirmation.outstanding_count() == 0
+    assert browser_service.host_grant_called == []
+
+
+@pytest.mark.parametrize(
+    "content_length_headers",
+    [
+        [],
+        [(b"content-length", b"invalid")],
+        [(b"content-length", b"2"), (b"content-length", b"999999")],
+    ],
+)
+def test_host_grant_untrusted_content_length_still_uses_stream_bound(
+    content_length_headers
+):
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    receive_calls = 0
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        return {
+            "type": "http.request",
+            "body": b" " * 1025,
+            "more_body": False,
+        }
+
+    status, body = asyncio.run(
+        _post_host_grant_asgi_stream(
+            client,
+            token,
+            receive,
+            extra_headers=content_length_headers,
+        )
+    )
+    assert status == 400
+    assert body == {
+        "error": {
+            "code": "browser_grant_invalid_request",
+            "message": "browser_grant_invalid_request",
+        }
+    }
+    assert receive_calls == 1
+    assert confirmation.outstanding_count() == 0
+    assert browser_service.host_grant_called == []
+
+
+def test_host_grant_binding_mismatch_precedes_body_validation_and_retains_challenge():
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    mismatch = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-evil"},
+        json={"ttl_seconds": "300"},
+        headers={"x-browser-challenge": token},
+    )
+    legitimate = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={},
+        headers={"x-browser-challenge": token},
+    )
+    assert mismatch.status_code == 403
+    assert mismatch.json()["error"]["code"] == "invalid_challenge"
+    assert legitimate.status_code == 200
+    assert browser_service.host_grant_called == [
+        ("nagent-1", "dashboard-operator", BROWSER_POLICY_VERSION, 300)
+    ]
+
+
+def test_host_grant_trusted_actor_precedes_body_validation_and_retains_challenge():
+    client, browser_service, _, confirmation = _make_app(
+        trusted_dev=True, actor=None
+    )
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    missing_actor = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={"ttl_seconds": "300"},
+        headers={"x-browser-challenge": token},
+    )
+    assert missing_actor.status_code == 403
+    assert missing_actor.json()["error"]["code"] == "browser_actor_required"
+    assert browser_service.host_grant_called == []
+    assert confirmation.consume(
+        token,
+        "POST",
+        "/chat/browser/sessions/bsess-1/host-grant",
+        "bsess-1",
+        "nagent-1",
+        "dashboard-operator",
+    )
+
+
+def test_host_grant_cross_origin_precedes_body_validation_and_retains_challenge():
+    client, browser_service, _, confirmation = _make_app(trusted_dev=True)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.HOST_CDP,
+        status=BrowserSessionStatus.PENDING_AUTHORIZATION,
+    )
+    token = _get_challenge(
+        client, confirmation, "bsess-1", "nagent-1",
+        "dashboard-operator", "host_grant",
+    )
+    cross_origin = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={"ttl_seconds": "300"},
+        headers={
+            "origin": "https://evil.example.com",
+            "x-browser-challenge": token,
+        },
+    )
+    legitimate = client.post(
+        "/chat/browser/sessions/bsess-1/host-grant",
+        params={"n_agent_session_id": "nagent-1"},
+        json={},
+        headers={"x-browser-challenge": token},
+    )
+    assert cross_origin.status_code == 403
+    assert cross_origin.json()["error"]["code"] == "browser_cross_origin_forbidden"
+    assert legitimate.status_code == 200
+    assert browser_service.host_grant_called == [
+        ("nagent-1", "dashboard-operator", BROWSER_POLICY_VERSION, 300)
+    ]
 
 
 def test_revoke_host_succeeds_when_trusted_dev():
@@ -592,6 +1039,29 @@ def test_same_origin_allowed():
         "/chat/browser/sessions/bsess-1/pause",
         params={"n_agent_session_id": "nagent-1"},
         headers={"x-browser-challenge": token, "origin": "http://localhost:8201"},
+    )
+    assert r.status_code == 200
+
+
+def test_same_origin_reverse_proxy_host_allowed():
+    client, browser_service, _, confirmation = _make_app()
+    browser_service.sessions["bsess-1"] = _make_session("bsess-1", "nagent-1")
+    token = _get_challenge(
+        client,
+        confirmation,
+        "bsess-1",
+        "nagent-1",
+        "dashboard-operator",
+        "pause",
+    )
+    r = client.post(
+        "/chat/browser/sessions/bsess-1/pause",
+        params={"n_agent_session_id": "nagent-1"},
+        headers={
+            "x-browser-challenge": token,
+            "origin": "http://nagent.localhost",
+            "host": "nagent.localhost",
+        },
     )
     assert r.status_code == 200
 

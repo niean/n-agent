@@ -23,14 +23,19 @@ BrowserDashboardService/BrowserService.
 """
 from __future__ import annotations
 
+import json
 import logging
+from contextlib import aclosing
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Body, Query, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 
 from app.application.browser_confirmation_service import BrowserConfirmationService
 from app.application.browser_dashboard_service import BrowserDashboardService
+from app.domain.browser_policy import BROWSER_POLICY_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,51 @@ ActorResolver = Callable[[Request], str | None]
 # (takeover/release) rather than the route. These endpoints pass the token to
 # the service which performs the consume.
 _SERVICE_CONSUMED_OPS = frozenset({"takeover", "release"})
+_HOST_GRANT_BODY_MAX_BYTES = 1024
+
+
+class _HostGrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_seconds: StrictInt | None = Field(default=None, ge=1)
+
+
+def _single_content_length_exceeds(request: Request, limit: int) -> bool:
+    values = [
+        value
+        for name, value in request.scope.get("headers", ())
+        if name.lower() == b"content-length"
+    ]
+    if len(values) != 1:
+        return False
+    try:
+        value = values[0].decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    if not value or not value.isdigit():
+        return False
+    normalized = value.lstrip("0") or "0"
+    limit_text = str(limit)
+    return (
+        len(normalized) > len(limit_text)
+        or (
+            len(normalized) == len(limit_text)
+            and normalized > limit_text
+        )
+    )
+
+
+async def _read_bounded_body(request: Request, limit: int) -> bytes | None:
+    if _single_content_length_exceeds(request, limit):
+        return None
+    body = bytearray()
+    async with aclosing(request.stream()) as stream:
+        async for chunk in stream:
+            remaining = limit + 1 - len(body)
+            body.extend(chunk[:remaining])
+            if len(body) > limit:
+                return None
+    return bytes(body)
 
 
 def _error(status: int, code: str, message: str = "") -> JSONResponse:
@@ -70,13 +120,49 @@ def _check_same_origin(request: Request, settings) -> bool:
     origin = request.headers.get("origin")
     if not origin:
         return True
-    allowed = _allowed_origins(settings)
-    if origin in allowed:
+    canonical_origin = _canonical_origin(origin)
+    if canonical_origin is None:
+        return False
+    allowed = {
+        item
+        for raw in _allowed_origins(settings)
+        if (item := _canonical_origin(raw)) is not None
+    }
+    if canonical_origin in allowed:
         return True
+
+    # Behind a reverse proxy the public Dashboard origin can differ from the
+    # configured internal base URL. Browser same-origin requests still carry
+    # an Origin authority exactly matching the HTTP Host presented to the
+    # application. Compare those canonical values instead of maintaining a
+    # deployment-specific hostname allowlist.
     host = request.headers.get("host", "")
-    if host and any(host in a.split("//", 1)[-1] for a in allowed if "://" in a):
-        return True
-    return False
+    if not host:
+        return False
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    scheme = (forwarded_proto.split(",", 1)[0].strip() or request.url.scheme)
+    request_origin = _canonical_origin(f"{scheme}://{host}")
+    return request_origin is not None and canonical_origin == request_origin
+
+
+def _canonical_origin(value: str) -> str | None:
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return None
+    if parsed.path not in {"", "/"}:
+        return None
+    hostname = hostname.lower().rstrip(".")
+    default_port = 80 if scheme == "http" else 443
+    authority = hostname if port in {None, default_port} else f"{hostname}:{port}"
+    return f"{scheme}://{authority}"
 
 
 def register_browser_routes(
@@ -338,7 +424,6 @@ def register_browser_routes(
             browser_session_id: str,
             request: Request,
             n_agent_session_id: str = Query(...),
-            payload: dict = Body(default_factory=dict),
         ):
             actor, err = _auth_write(request)
             if err:
@@ -349,16 +434,30 @@ def register_browser_routes(
             )
             if cerr:
                 return cerr
-            policy_version = str(payload.get("policy_version", "system-v1"))
-            ttl_seconds = int(
-                payload.get(
-                    "ttl_seconds",
-                    getattr(settings, "browser_host_grant_ttl_seconds", 300),
-                )
+            raw_body = await _read_bounded_body(
+                request, _HOST_GRANT_BODY_MAX_BYTES
             )
+            if raw_body is None:
+                return _error(400, "browser_grant_invalid_request")
+            try:
+                payload = {} if not raw_body else json.loads(raw_body)
+                grant_request = _HostGrantRequest.model_validate(payload)
+            except (json.JSONDecodeError, UnicodeDecodeError, ValidationError):
+                return _error(400, "browser_grant_invalid_request")
+            if (
+                "ttl_seconds" in grant_request.model_fields_set
+                and grant_request.ttl_seconds is None
+            ):
+                return _error(400, "browser_grant_invalid_request")
+            max_ttl_seconds = getattr(
+                settings, "browser_host_grant_ttl_seconds", 300
+            )
+            ttl_seconds = grant_request.ttl_seconds or max_ttl_seconds
+            if ttl_seconds > max_ttl_seconds:
+                return _error(400, "browser_grant_invalid_request")
             result = await dashboard_service.grant_host(
                 browser_session_id, n_agent_session_id, actor,
-                policy_version, ttl_seconds,
+                BROWSER_POLICY_VERSION, ttl_seconds,
             )
             return _command_response(result)
 

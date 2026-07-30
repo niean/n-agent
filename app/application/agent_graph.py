@@ -55,6 +55,7 @@ from app.domain.session import TaskState, ToolCall
 from app.domain.tool import (
     ApprovalDecision,
     ApprovalRequest,
+    RiskLevel,
     ToolCallRequest,
     ToolExecutionContext,
     ToolResult,
@@ -142,6 +143,8 @@ class AgentGraphRunner:
         nudge_interval: int = 10,
         curator_service: Any | None = None,
         hook_dispatcher: HookDispatcherProtocol | None = None,
+        browser_dashboard_service: Any = None,
+        browser_host_grant_ttl_seconds: int = 300,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -156,6 +159,8 @@ class AgentGraphRunner:
         self.usage_service = usage_service
         self.skill_service = skill_service
         self._hook_dispatcher = hook_dispatcher
+        self._browser_dashboard_service = browser_dashboard_service
+        self._browser_host_grant_ttl_seconds = browser_host_grant_ttl_seconds
         self._information_flow_service = information_flow_service or InformationFlowService(
             InformationFlowPolicyConfig(),
             SecretCatalog(),
@@ -1056,6 +1061,21 @@ class AgentGraphRunner:
                             context,
                             evaluation=evaluation,
                         )
+                        # Browser host_grant_required signal: BrowserToolExecutor
+                        # returns PERMISSION_DENIED with approval_kind=host_grant
+                        # when a host_cdp session is pending. Route it to the
+                        # Chat CONFIRM card flow (reusing _request_tool_approval).
+                        if (
+                            result.status is ToolResultStatus.PERMISSION_DENIED
+                            and isinstance(result.content, dict)
+                            and result.content.get("approval_kind") == "host_grant"
+                        ):
+                            result = await self._request_browser_host_grant_approval(
+                                request,
+                                state.session_id,
+                                context,
+                                result.content,
+                            )
                     elif decision.outcome is PolicyOutcome.DENY:
                         result = self._permission_denied_result(
                             request,
@@ -1289,6 +1309,96 @@ class AgentGraphRunner:
             request,
             authorized_context,
             evaluation=evaluation,
+        )
+
+    async def _request_browser_host_grant_approval(
+        self,
+        request: ToolCallRequest,
+        state_session_id: str,
+        context: ToolExecutionContext | None,
+        signal: dict[str, Any],
+    ) -> ToolResult:
+        """Route a browser host_grant_required signal to the Chat CONFIRM card.
+
+        Reuses _request_tool_approval's decider flow with host-grant metadata
+        so claim resolves the Future synchronously (no grant_host in claim).
+        After decider returns allowed, execute grant_host in this async context;
+        on success re-run the original tool call, on failure return
+        PERMISSION_DENIED (host_grant_failed).
+        """
+        if self._browser_dashboard_service is None:
+            return self._permission_denied_result(request, "host_grant_required")
+
+        decider = context.approval_decider if context is not None else None
+        if decider is None:
+            return self._permission_denied_result(request, "approval_required")
+
+        browser_session_id = signal.get("browser_session_id")
+        if not browser_session_id:
+            return self._permission_denied_result(request, "host_grant_required")
+
+        approval_request = ApprovalRequest(
+            session_id=context.session_id or state_session_id,
+            tool_call_id=request.id,
+            tool_name=request.name,
+            arguments=self._project_approval_arguments(
+                request.name, request.arguments,
+            ),
+            description="授予主机浏览器访问权限。批准后 Agent 可操作专用 Chrome 窗口。",
+            risk_level=RiskLevel.CONFIRM,
+            metadata={
+                "approval_kind": "host_grant",
+                "browser_session_id": browser_session_id,
+            },
+        )
+        try:
+            raw_decision = decider(approval_request)
+            if isawaitable(raw_decision):
+                raw_decision = await raw_decision
+        except Exception:
+            return self._permission_denied_result(request, "approval_failed")
+
+        if not isinstance(raw_decision, ApprovalDecision):
+            return self._permission_denied_result(request, "invalid_approval_decision")
+        if not raw_decision.allowed:
+            return self._permission_denied_result(
+                request, raw_decision.reason or "approval_denied",
+            )
+
+        # decider allowed -> execute grant_host in async context.
+        from app.domain.browser_policy import BROWSER_POLICY_VERSION
+        actor_id = (
+            context.trusted_metadata.get("actor_id")
+            if context and context.trusted_metadata
+            else None
+        )
+        try:
+            grant_result = self._browser_dashboard_service.grant_host(
+                browser_session_id,
+                context.session_id or state_session_id,
+                actor_id,
+                BROWSER_POLICY_VERSION,
+                self._browser_host_grant_ttl_seconds,
+            )
+            if isawaitable(grant_result):
+                grant_result = await grant_result
+        except Exception:
+            return self._permission_denied_result(request, "host_grant_failed")
+
+        # grant_host returns dict {ok, error} per BrowserDashboardService.
+        ok = bool(grant_result.get("ok")) if isinstance(grant_result, dict) else False
+        if not ok:
+            return self._permission_denied_result(request, "host_grant_failed")
+
+        # grant succeeded -> re-run the original tool call (session is now active).
+        try:
+            authorized_context = self.tool_service.authorize_once(
+                request, context, evaluation=None,
+            )
+        except (ValueError, TypeError):
+            authorized_context = context
+        return await self.tool_service.execute(
+            request, authorized_context,
         )
 
     async def _emit_stream_tool_event(self, event: ChatEvent, options: dict[str, Any] | None) -> None:

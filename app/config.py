@@ -209,7 +209,11 @@ class Settings(BaseSettings):
     browser_navigation_timeout: int = Field(default=30, gt=0)
     browser_max_observe_chars: int = Field(default=4000, ge=1, le=20000)
     browser_max_observe_elements: int = Field(default=80, ge=1, le=200)
-    browser_max_screenshot_bytes: int = Field(default=1048576, ge=1024)
+    browser_max_screenshot_bytes: int = Field(
+        default=1048576,
+        ge=1024,
+        le=16 * 1024 * 1024,
+    )
     browser_max_screenshot_pixels: int = Field(default=10_000_000, ge=1)
     browser_screenshot_ttl_seconds: int = Field(default=86400, gt=0)
     browser_per_session_screenshot_quota: int = Field(default=20, ge=1)

@@ -20,17 +20,22 @@ Security model (mirrors host_terminal):
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
+import threading
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
+import app.infrastructure.browser.host_protocol as host_protocol
 from app.domain.browser import (
     BrowserActionResult,
     BrowserElementSummary,
@@ -40,12 +45,28 @@ from app.domain.browser import (
 )
 
 
-AUTH_HEADER = "X-N-Agent-Browser-Token"
-_PROTOCOL_VERSION = "1"
+AUTH_HEADER = host_protocol.AUTH_HEADER
 
 _CANONICAL_URL_RE = re.compile(
     r"http://(127\.0\.0\.1|host\.docker\.internal):([1-9][0-9]{0,4})/?"
 )
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]+\Z")
+_BASE64_RE = re.compile(
+    r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\Z"
+)
+_MAX_URL_LENGTH = 8_192
+_MAX_TITLE_LENGTH = 4_096
+_MAX_TEXT_LENGTH = 20_000
+_MAX_CODE_LENGTH = 256
+_MAX_ACTION_TYPE_LENGTH = 64
+_MAX_SCREENSHOT_REF_LENGTH = 4_096
+_MAX_ELEMENTS = 200
+_MAX_ELEMENT_REF_LENGTH = 512
+_MAX_ELEMENT_ROLE_LENGTH = 128
+_MAX_ELEMENT_NAME_LENGTH = 2_048
+_MAX_ELEMENT_EXCERPT_LENGTH = 4_096
+_MAX_DURATION_MS = 3_600_000
+_MAX_DOCUMENT_REVISION = 2**63 - 1
 
 # Error codes that signal the session should be degraded (raised, not
 # returned as a normal error result). The BrowserService catches the
@@ -92,7 +113,10 @@ class HostCdpBackendConfig:
     token_path: str | os.PathLike[str] | None = None
     connect_timeout_seconds: float = 2.0
     read_timeout_seconds: float = 65.0
-    max_response_bytes: int = 2_097_152
+    max_screenshot_bytes: int = (
+        host_protocol.HOST_CDP_MAX_SCREENSHOT_BYTES
+    )
+    max_response_bytes: int = host_protocol.MAX_JSON_RESPONSE_BYTES
     transport: httpx.AsyncBaseTransport | None = None
 
     def __post_init__(self) -> None:
@@ -118,12 +142,28 @@ class HostCdpBackendConfig:
         if (self.token is None) == (self.token_path is None):
             raise ValueError("host_bridge_token_invalid")
         for value in (self.connect_timeout_seconds, self.read_timeout_seconds):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
                 raise ValueError("host_bridge_timeout_invalid")
+        if (
+            isinstance(self.max_screenshot_bytes, bool)
+            or not isinstance(self.max_screenshot_bytes, int)
+            or self.max_screenshot_bytes
+            != host_protocol.HOST_CDP_MAX_SCREENSHOT_BYTES
+        ):
+            raise ValueError("host_bridge_screenshot_limit_invalid")
         if (
             isinstance(self.max_response_bytes, bool)
             or not isinstance(self.max_response_bytes, int)
             or self.max_response_bytes <= 0
+            or self.max_response_bytes
+            < host_protocol.max_json_response_bytes(
+                self.max_screenshot_bytes
+            )
         ):
             raise ValueError("host_bridge_response_limit_invalid")
 
@@ -151,6 +191,8 @@ class HostCdpBrowserBackend:
         )
         # Locally registered session ids (set of create_session calls).
         self._sessions: set[str] = set()
+        self._screenshot_lock = threading.Lock()
+        self._screenshot_cache: dict[str, bytes] = {}
 
     # ------------------------------------------------------------------
     # BrowserBackend Protocol
@@ -163,33 +205,45 @@ class HostCdpBrowserBackend:
         session to ACTIVE via a valid host grant. If the session is still
         PENDING_AUTHORIZATION (or any non-ACTIVE state), fail-closed.
         """
+        self._clear_screenshot(session.id)
         if session.status is not BrowserSessionStatus.ACTIVE:
             raise HostCdpBackendError("session_not_active")
         payload = {
-            "protocol_version": _PROTOCOL_VERSION,
+            "protocol_version": host_protocol.PROTOCOL_VERSION,
             "session_id": session.id,
             "n_agent_session_id": session.bound_n_agent_session_id,
             "profile_ref": session.profile_ref,
             "status": session.status.value,
         }
-        body = await self._post("/v1/browser/session/create", payload)
-        _require_ok(body)
+        try:
+            body = await self._post(
+                "/v1/browser/session/create", payload, session.id
+            )
+            _require_ok(body, endpoint="create")
+        except BaseException:
+            self._clear_screenshot(session.id)
+            raise
         self._sessions.add(session.id)
 
     async def close_session(self, session_id: str) -> None:
         """Notify the bridge to release the session's target/capability."""
+        self._clear_screenshot(session_id)
         payload = {
-            "protocol_version": _PROTOCOL_VERSION,
+            "protocol_version": host_protocol.PROTOCOL_VERSION,
             "session_id": session_id,
         }
         try:
-            body = await self._post("/v1/browser/session/close", payload)
+            body = await self._post(
+                "/v1/browser/session/close", payload, session_id
+            )
+            _require_ok(body, endpoint="close")
         except HostCdpBackendError:
             # Best-effort close: do not raise on bridge errors, just remove
             # the local registration.
+            pass
+        finally:
             self._sessions.discard(session_id)
-            return
-        self._sessions.discard(session_id)
+            self._clear_screenshot(session_id)
 
     async def execute_action(
         self, session_id: str, action: Any
@@ -201,6 +255,7 @@ class HostCdpBrowserBackend:
         expired/revoked, policy version mismatch, unknown capability, or
         target disappeared.
         """
+        self._clear_screenshot(session_id)
         if session_id not in self._sessions:
             return BrowserActionResult(
                 action_type=_action_type_name(action),
@@ -209,19 +264,28 @@ class HostCdpBrowserBackend:
             )
         action_type, action_fields = _serialize_action(action)
         payload = {
-            "protocol_version": _PROTOCOL_VERSION,
+            "protocol_version": host_protocol.PROTOCOL_VERSION,
             "session_id": session_id,
             "action_type": action_type,
             "action": action_fields,
             "document_revision": _action_document_revision(action),
         }
         try:
-            body = await self._post("/v1/browser/session/action", payload)
-        except HostCdpBackendError as exc:
-            # Infrastructure failure (bridge unavailable, auth failed) ->
-            # signal degraded by raising.
+            body = await self._post(
+                "/v1/browser/session/action", payload, session_id
+            )
+            result, screenshot = _parse_action_result(
+                body,
+                action_type,
+                max_screenshot_bytes=self._config.max_screenshot_bytes,
+            )
+        except BaseException:
+            self._clear_screenshot(session_id)
             raise
-        return _parse_action_result(body, action_type)
+        if screenshot is not None:
+            with self._screenshot_lock:
+                self._screenshot_cache[session_id] = screenshot
+        return result
 
     async def get_state(self, session_id: str) -> BrowserState:
         """Return the current browser state for the session."""
@@ -234,12 +298,16 @@ class HostCdpBrowserBackend:
                 latest_screenshot_ref=None,
             )
         payload = {
-            "protocol_version": _PROTOCOL_VERSION,
+            "protocol_version": host_protocol.PROTOCOL_VERSION,
             "session_id": session_id,
         }
         try:
-            body = await self._post("/v1/browser/session/state", payload)
+            body = await self._post(
+                "/v1/browser/session/state", payload, session_id
+            )
+            return _parse_state(body)
         except HostCdpBackendError:
+            self._clear_screenshot(session_id)
             return BrowserState(
                 safe_url=None,
                 title=None,
@@ -247,7 +315,6 @@ class HostCdpBrowserBackend:
                 document_revision=0,
                 latest_screenshot_ref=None,
             )
-        return _parse_state(body)
 
     async def begin_takeover(self, session_id: str) -> str | None:
         """Host takeover: the user directly operates the managed Chrome window.
@@ -258,12 +325,18 @@ class HostCdpBrowserBackend:
         if session_id not in self._sessions:
             return None
         payload = {
-            "protocol_version": _PROTOCOL_VERSION,
+            "protocol_version": host_protocol.PROTOCOL_VERSION,
             "session_id": session_id,
         }
         try:
-            await self._post("/v1/browser/session/takeover/begin", payload)
+            body = await self._post(
+                "/v1/browser/session/takeover/begin",
+                payload,
+                session_id,
+            )
+            _require_ok(body, endpoint="takeover_begin")
         except HostCdpBackendError:
+            self._clear_screenshot(session_id)
             pass
         return None
 
@@ -272,19 +345,39 @@ class HostCdpBrowserBackend:
         if session_id not in self._sessions:
             return
         payload = {
-            "protocol_version": _PROTOCOL_VERSION,
+            "protocol_version": host_protocol.PROTOCOL_VERSION,
             "session_id": session_id,
         }
         try:
-            await self._post("/v1/browser/session/takeover/end", payload)
+            body = await self._post(
+                "/v1/browser/session/takeover/end",
+                payload,
+                session_id,
+            )
+            _require_ok(body, endpoint="takeover_end")
         except HostCdpBackendError:
+            self._clear_screenshot(session_id)
             pass
+
+    def last_screenshot_bytes(self, session_id: str) -> bytes | None:
+        """Return the fresh screenshot captured by the last successful action."""
+        with self._screenshot_lock:
+            return self._screenshot_cache.get(session_id)
+
+    def _clear_screenshot(self, session_id: str) -> None:
+        with self._screenshot_lock:
+            self._screenshot_cache.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # HTTP transport
     # ------------------------------------------------------------------
 
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _post(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        session_id: str,
+    ) -> dict[str, Any]:
         """Send a POST to the bridge and return the parsed response body.
 
         Raises HostCdpBackendError on network errors, auth failures, and
@@ -304,31 +397,82 @@ class HostCdpBrowserBackend:
                 follow_redirects=False,
                 trust_env=False,
             ) as client:
-                response = await client.post(
+                async with client.stream(
+                    "POST",
                     url,
-                    headers={AUTH_HEADER: self._token.decode("utf-8")},
+                    headers={
+                        AUTH_HEADER: self._token.decode("utf-8")
+                    },
                     json=payload,
-                )
+                ) as response:
+                    lengths = response.headers.get_list(
+                        "content-length"
+                    )
+                    if (
+                        len(lengths) != 1
+                        or len(lengths[0]) > 20
+                        or not _CONTENT_LENGTH_RE.fullmatch(lengths[0])
+                    ):
+                        raise HostCdpBackendError(
+                            "host_bridge_invalid_response"
+                        )
+                    declared_length = int(lengths[0])
+                    if (
+                        declared_length <= 0
+                        or declared_length
+                        > self._config.max_response_bytes
+                    ):
+                        raise HostCdpBackendError(
+                            "host_bridge_invalid_response"
+                        )
+                    if response.status_code == 401:
+                        raise HostCdpBackendError(
+                            "host_bridge_auth_failed"
+                        )
+                    if not 200 <= response.status_code < 300:
+                        if response.status_code >= 500:
+                            raise HostCdpBackendError(
+                                "host_bridge_unavailable"
+                            )
+                        raise HostCdpBackendError(
+                            "host_bridge_invalid_response"
+                        )
+                    chunks: list[bytes] = []
+                    actual_length = 0
+                    async for chunk in response.aiter_bytes():
+                        actual_length += len(chunk)
+                        if (
+                            actual_length > declared_length
+                            or actual_length
+                            > self._config.max_response_bytes
+                        ):
+                            raise HostCdpBackendError(
+                                "host_bridge_invalid_response"
+                            )
+                        chunks.append(chunk)
+                    if actual_length != declared_length:
+                        raise HostCdpBackendError(
+                            "host_bridge_invalid_response"
+                        )
+                    encoded_body = b"".join(chunks)
         except asyncio.CancelledError:
+            self._clear_screenshot(session_id)
+            raise
+        except HostCdpBackendError:
+            self._clear_screenshot(session_id)
             raise
         except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as exc:
+            self._clear_screenshot(session_id)
             raise HostCdpBackendError("host_bridge_unavailable") from exc
-        if response.status_code == 401:
-            raise HostCdpBackendError("host_bridge_auth_failed")
-        if response.status_code >= 500:
-            raise HostCdpBackendError("host_bridge_unavailable")
-        if response.status_code >= 400:
-            raise HostCdpBackendError("host_bridge_invalid_response")
         try:
-            body = json.loads(response.content)
+            decoded_body = encoded_body.decode("utf-8")
+            body = json.loads(decoded_body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._clear_screenshot(session_id)
             raise HostCdpBackendError("host_bridge_invalid_response") from exc
         if not isinstance(body, dict):
+            self._clear_screenshot(session_id)
             raise HostCdpBackendError("host_bridge_invalid_response")
-        # Check for degraded error codes that should signal session degraded.
-        error_code = body.get("error_code") if body.get("status") == "error" else None
-        if error_code in _DEGRADED_ERROR_CODES:
-            raise HostCdpBackendError(error_code)
         return body
 
 
@@ -366,7 +510,12 @@ def _serialize_action(action: Any) -> tuple[str, dict[str, Any]]:
     return action_type, fields
 
 
-def _parse_action_result(body: dict[str, Any], action_type: str) -> BrowserActionResult:
+def _parse_action_result(
+    body: dict[str, Any],
+    action_type: str,
+    *,
+    max_screenshot_bytes: int,
+) -> tuple[BrowserActionResult, bytes | None]:
     """Parse the bridge response into a BrowserActionResult.
 
     If the bridge returned an error, map it to a stable error_code. If
@@ -374,27 +523,37 @@ def _parse_action_result(body: dict[str, Any], action_type: str) -> BrowserActio
     """
     status = body.get("status")
     if status == "error":
-        error_code = body.get("error_code", "host_bridge_invalid_response")
+        _validate_action_error(body, action_type)
+        error_code = body["error_code"]
+        if error_code in _DEGRADED_ERROR_CODES:
+            raise HostCdpBackendError(error_code)
         return BrowserActionResult(
             action_type=action_type,
             status="error",
             error_code=error_code,
             document_revision=body.get("document_revision", 0),
-        )
+        ), None
+    _validate_action_success(body, action_type)
     elements_data = body.get("elements") or ()
     elements = tuple(
         BrowserElementSummary(
-            element_ref=e.get("element_ref", ""),
-            role=e.get("role", ""),
-            accessible_name=e.get("accessible_name", ""),
-            text_excerpt=e.get("text_excerpt", ""),
-            disabled=e.get("disabled", False),
+            element_ref=e["element_ref"],
+            role=e["role"],
+            accessible_name=e["accessible_name"],
+            text_excerpt=e["text_excerpt"],
+            disabled=e["disabled"],
         )
         for e in elements_data
     )
-    return BrowserActionResult(
-        action_type=body.get("action_type", action_type),
-        status=body.get("status", "error"),
+    screenshot = None
+    encoded_screenshot = body.get("screenshot_base64")
+    if encoded_screenshot is not None:
+        screenshot = _decode_screenshot(
+            encoded_screenshot, max_screenshot_bytes
+        )
+    result = BrowserActionResult(
+        action_type=body["action_type"],
+        status=body["status"],
         url=body.get("url"),
         title=body.get("title"),
         text=body.get("text"),
@@ -403,34 +562,240 @@ def _parse_action_result(body: dict[str, Any], action_type: str) -> BrowserActio
         warning_code=body.get("warning_code"),
         error_code=body.get("error_code"),
         duration_ms=body.get("duration_ms", 0),
-        document_revision=body.get("document_revision", 0),
+        document_revision=body["document_revision"],
     )
+    return result, screenshot
 
 
 def _parse_state(body: dict[str, Any]) -> BrowserState:
-    status_str = body.get("status", "closed")
+    if body.get("status") == "error":
+        _validate_error_envelope(body)
+        error_code = body["error_code"]
+        if error_code in _DEGRADED_ERROR_CODES:
+            raise HostCdpBackendError(error_code)
+        raise HostCdpBackendError(error_code)
+    required = {
+        "safe_url",
+        "title",
+        "status",
+        "document_revision",
+        "latest_screenshot_ref",
+    }
+    if set(body) != required:
+        _invalid_response()
+    _optional_bounded_text(
+        body["safe_url"], _MAX_URL_LENGTH
+    )
+    _optional_bounded_text(
+        body["title"], _MAX_TITLE_LENGTH
+    )
+    _optional_bounded_text(
+        body["latest_screenshot_ref"],
+        _MAX_SCREENSHOT_REF_LENGTH,
+    )
+    _bounded_int(
+        body["document_revision"], _MAX_DOCUMENT_REVISION
+    )
     try:
-        status = BrowserSessionStatus(status_str)
-    except ValueError:
-        status = BrowserSessionStatus.DEGRADED
+        status = BrowserSessionStatus(body["status"])
+    except (TypeError, ValueError):
+        _invalid_response()
     return BrowserState(
-        safe_url=body.get("safe_url"),
-        title=body.get("title"),
+        safe_url=body["safe_url"],
+        title=body["title"],
         status=status,
-        document_revision=body.get("document_revision", 0),
-        latest_screenshot_ref=body.get("latest_screenshot_ref"),
+        document_revision=body["document_revision"],
+        latest_screenshot_ref=body["latest_screenshot_ref"],
     )
 
 
-def _require_ok(body: dict[str, Any]) -> None:
+def _require_ok(body: dict[str, Any], *, endpoint: str) -> None:
     """Check that the bridge returned a success response."""
     status = body.get("status")
-    if status == "ok":
-        return
-    error_code = body.get("error_code", "host_bridge_invalid_response")
-    if error_code in _DEGRADED_ERROR_CODES:
+    if status == "error":
+        _validate_error_envelope(body)
+        error_code = body["error_code"]
+        if error_code in _DEGRADED_ERROR_CODES:
+            raise HostCdpBackendError(error_code)
         raise HostCdpBackendError(error_code)
-    raise HostCdpBackendError(error_code)
+    if endpoint == "takeover_begin":
+        if (
+            status != "ok"
+            or set(body) != {"status", "takeover_url"}
+            or body["takeover_url"] is not None
+        ):
+            _invalid_response()
+        return
+    if endpoint not in {"create", "close", "takeover_end"}:
+        _invalid_response()
+    if status != "ok" or set(body) != {"status"}:
+        _invalid_response()
+
+
+def _validate_error_envelope(body: dict[str, Any]) -> None:
+    if set(body) != {"status", "error_code"}:
+        _invalid_response()
+    if body.get("status") != "error":
+        _invalid_response()
+    _bounded_text(body.get("error_code"), _MAX_CODE_LENGTH)
+
+
+def _validate_action_error(
+    body: dict[str, Any], action_type: str
+) -> None:
+    if set(body) == {"status", "error_code"}:
+        _validate_error_envelope(body)
+        return
+    if set(body) != {
+        "action_type",
+        "status",
+        "error_code",
+        "document_revision",
+    }:
+        _invalid_response()
+    if body.get("status") != "error":
+        _invalid_response()
+    if body.get("action_type") != action_type:
+        _invalid_response()
+    _bounded_text(body.get("action_type"), _MAX_ACTION_TYPE_LENGTH)
+    _bounded_text(body.get("error_code"), _MAX_CODE_LENGTH)
+    _bounded_int(
+        body.get("document_revision"), _MAX_DOCUMENT_REVISION
+    )
+
+
+def _validate_action_success(
+    body: dict[str, Any], action_type: str
+) -> None:
+    required = {"action_type", "status", "document_revision"}
+    allowed = required | {
+        "url",
+        "title",
+        "text",
+        "elements",
+        "screenshot_ref",
+        "warning_code",
+        "duration_ms",
+        "screenshot_base64",
+    }
+    if not required <= set(body) or not set(body) <= allowed:
+        _invalid_response()
+    if body.get("status") != "success":
+        _invalid_response()
+    if body.get("action_type") != action_type:
+        _invalid_response()
+    _bounded_text(body.get("action_type"), _MAX_ACTION_TYPE_LENGTH)
+    _bounded_int(
+        body.get("document_revision"), _MAX_DOCUMENT_REVISION
+    )
+    if "duration_ms" in body:
+        _bounded_int(body["duration_ms"], _MAX_DURATION_MS)
+    for field, maximum in (
+        ("url", _MAX_URL_LENGTH),
+        ("title", _MAX_TITLE_LENGTH),
+        ("text", _MAX_TEXT_LENGTH),
+        ("screenshot_ref", _MAX_SCREENSHOT_REF_LENGTH),
+        ("warning_code", _MAX_CODE_LENGTH),
+    ):
+        if field in body:
+            _optional_bounded_text(body[field], maximum)
+    if "elements" in body:
+        elements = body["elements"]
+        if (
+            not isinstance(elements, list)
+            or len(elements) > _MAX_ELEMENTS
+        ):
+            _invalid_response()
+        for element in elements:
+            _validate_element(element)
+    if "screenshot_base64" in body and not isinstance(
+        body["screenshot_base64"], str
+    ):
+        _invalid_response()
+
+
+def _validate_element(value: Any) -> None:
+    fields = {
+        "element_ref",
+        "role",
+        "accessible_name",
+        "text_excerpt",
+        "disabled",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        _invalid_response()
+    _bounded_text(
+        value["element_ref"],
+        _MAX_ELEMENT_REF_LENGTH,
+    )
+    _bounded_text(
+        value["role"], _MAX_ELEMENT_ROLE_LENGTH, allow_empty=True
+    )
+    _bounded_text(
+        value["accessible_name"],
+        _MAX_ELEMENT_NAME_LENGTH,
+        allow_empty=True,
+    )
+    _bounded_text(
+        value["text_excerpt"],
+        _MAX_ELEMENT_EXCERPT_LENGTH,
+        allow_empty=True,
+    )
+    if type(value["disabled"]) is not bool:
+        _invalid_response()
+
+
+def _decode_screenshot(value: str, maximum: int) -> bytes:
+    if (
+        not value
+        or len(value) % 4 != 0
+        or _BASE64_RE.fullmatch(value) is None
+    ):
+        _invalid_response()
+    padding = 2 if value.endswith("==") else (
+        1 if value.endswith("=") else 0
+    )
+    estimated = (len(value) // 4) * 3 - padding
+    if estimated <= 0 or estimated > maximum:
+        _invalid_response()
+    try:
+        decoded = base64.b64decode(
+            value.encode("ascii"), validate=True
+        )
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        _invalid_response()
+    if (
+        len(decoded) != estimated
+        or len(decoded) > maximum
+        or base64.b64encode(decoded).decode("ascii") != value
+    ):
+        _invalid_response()
+    return decoded
+
+
+def _bounded_text(
+    value: Any, maximum: int, *, allow_empty: bool = False
+) -> None:
+    if (
+        not isinstance(value, str)
+        or (not value and not allow_empty)
+        or len(value) > maximum
+    ):
+        _invalid_response()
+
+
+def _optional_bounded_text(value: Any, maximum: int) -> None:
+    if value is not None:
+        _bounded_text(value, maximum, allow_empty=True)
+
+
+def _bounded_int(value: Any, maximum: int) -> None:
+    if type(value) is not int or not 0 <= value <= maximum:
+        _invalid_response()
+
+
+def _invalid_response() -> None:
+    raise HostCdpBackendError("host_bridge_invalid_response") from None
 
 
 # ------------------------------------------------------------------
@@ -480,17 +845,20 @@ def load_secure_token(path: Path) -> bytes:
 
 
 def _validate_token(value: bytes | str | None) -> bytes:
-    raw = value.encode("utf-8") if isinstance(value, str) else value
+    try:
+        raw = value.encode("ascii") if isinstance(value, str) else value
+    except UnicodeEncodeError as exc:
+        raise HostCdpBackendError("host_bridge_token_invalid") from exc
     if not isinstance(raw, bytes):
         raise HostCdpBackendError("host_bridge_token_invalid")
     if raw.endswith(b"\n"):
         raw = raw[:-1]
-    if len(raw) < 32 or b"\n" in raw or b"\r" in raw:
+    if (
+        len(raw) < 32
+        or len(raw) > 4096
+        or any(byte < 0x21 or byte > 0x7E for byte in raw)
+    ):
         raise HostCdpBackendError("host_bridge_token_invalid")
-    try:
-        raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HostCdpBackendError("host_bridge_token_invalid") from exc
     return raw
 
 

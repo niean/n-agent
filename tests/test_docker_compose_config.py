@@ -10,6 +10,59 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKER_DIR = ROOT / "docker"
 
 
+def _load_compose(compose_name: str) -> dict:
+    compose_path = DOCKER_DIR / compose_name
+    if compose_name == "docker-compose.yml" and not compose_path.exists():
+        pytest.skip(
+            "machine-local docker/docker-compose.yml is absent in a clean checkout"
+        )
+    return yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+
+
+def _parse_env_assignments(text: str) -> dict[str, str]:
+    assignments: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        assert separator, f"invalid env assignment: {key}"
+        assert key not in assignments, f"duplicate env assignment: {key}"
+        assignments[key] = value
+    return assignments
+
+
+def _published_target_ranges(service: dict) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for port in service.get("ports", []):
+        if isinstance(port, dict):
+            target = str(port["target"])
+        else:
+            target = str(port).rsplit("/", 1)[0].rsplit(":", 1)[-1]
+        first, separator, last = target.partition("-")
+        start = int(first)
+        end = int(last) if separator else start
+        ranges.append((min(start, end), max(start, end)))
+    return ranges
+
+
+def _assert_sensitive_ports_not_published(document: dict) -> None:
+    sensitive_ports = {8766, 9222, 6080}
+    for service in document["services"].values():
+        for start, end in _published_target_ranges(service):
+            assert not any(
+                start <= port <= end for port in sensitive_ports
+            ), f"sensitive target port published: {start}-{end}"
+
+
+def _host_browser_token_mount(service: dict) -> str:
+    return next(
+        item
+        for item in service["volumes"]
+        if ":/app/locals/host-browser.token:" in item
+    )
+
+
 def test_docker_compose_config():
     compose = (DOCKER_DIR / "docker-compose.yml.example").read_text()
     dockerfile = (DOCKER_DIR / "Dockerfile").read_text()
@@ -43,12 +96,139 @@ def test_docker_compose_config():
     assert "http://n-kb:8212" in env
 
 
+def test_env_example_documents_host_cdp_without_enabling_browser_by_default():
+    env = _parse_env_assignments(
+        (DOCKER_DIR / ".env.example").read_text(encoding="utf-8")
+    )
+    assert env["N_AGENT_BROWSER_ENABLED"] == "false"
+    assert env["N_AGENT_BROWSER_DEFAULT_BACKEND"] == "host_cdp"
+    assert (
+        env["N_AGENT_BROWSER_HOST_BRIDGE_URL"]
+        == "http://host.docker.internal:8766"
+    )
+    assert (
+        env["N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH"]
+        == "/app/locals/host-browser.token"
+    )
+    assert env["N_AGENT_BROWSER_TRUSTED_DEV"] == "true"
+
+
+def test_env_assignment_parser_rejects_duplicate_conflicts():
+    with pytest.raises(AssertionError, match="duplicate env assignment"):
+        _parse_env_assignments(
+            "N_AGENT_BROWSER_ENABLED=false\n"
+            "N_AGENT_BROWSER_ENABLED=true\n"
+        )
+
+
+def test_example_compose_adds_host_bridge_wiring_without_changing_topology():
+    document = _load_compose("docker-compose.yml.example")
+    assert set(document["services"]) == {"n-agent"}
+    assert set(document["networks"]) == {"n-kb"}
+
+    service = document["services"]["n-agent"]
+    assert service["ports"] == ["8201:8201"]
+    assert service["networks"] == ["default", "n-kb"]
+    assert "depends_on" not in service
+    environment = service["environment"]
+    assert (
+        environment["N_AGENT_BROWSER_HOST_BRIDGE_URL"]
+        == "${N_AGENT_BROWSER_HOST_BRIDGE_URL:-http://host.docker.internal:8766}"
+    )
+    assert (
+        environment["N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH"]
+        == "${N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH:-/app/locals/host-browser.token}"
+    )
+    assert (
+        environment["N_AGENT_BROWSER_TRUSTED_DEV"]
+        == "${N_AGENT_BROWSER_TRUSTED_DEV:-false}"
+    )
+    assert (
+        environment["N_AGENT_BROWSER_DEFAULT_BACKEND"]
+        == "${N_AGENT_BROWSER_DEFAULT_BACKEND:-container}"
+    )
+    assert _host_browser_token_mount(service).endswith(":ro")
+
+
+def test_current_machine_compose_adds_host_bridge_wiring_without_forcing_backend():
+    document = _load_compose("docker-compose.yml")
+    assert set(document["services"]) == {"n-agent", "browser"}
+    assert set(document["networks"]) == {"default", "n-kb"}
+
+    service = document["services"]["n-agent"]
+    assert service["ports"] == ["8201:8201"]
+    assert service["networks"] == ["default", "n-kb"]
+    assert service["depends_on"] == {"browser": {"condition": "service_healthy"}}
+    environment = service["environment"]
+    assert (
+        environment["N_AGENT_BROWSER_HOST_BRIDGE_URL"]
+        == "${N_AGENT_BROWSER_HOST_BRIDGE_URL:-http://host.docker.internal:8766}"
+    )
+    assert (
+        environment["N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH"]
+        == "${N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH:-/app/locals/host-browser.token}"
+    )
+    assert (
+        environment["N_AGENT_BROWSER_TRUSTED_DEV"]
+        == "${N_AGENT_BROWSER_TRUSTED_DEV:-false}"
+    )
+    assert "N_AGENT_BROWSER_DEFAULT_BACKEND" not in environment
+    assert _host_browser_token_mount(service).endswith(":ro")
+
+    browser = document["services"]["browser"]
+    assert browser["networks"] == {
+        "default": {"ipv4_address": "172.19.0.10"}
+    }
+    assert browser["expose"] == ["9222", "6080"]
+    assert "ports" not in browser
+
+
+@pytest.mark.parametrize(
+    "compose_name", ["docker-compose.yml", "docker-compose.yml.example"]
+)
+def test_compose_host_bridge_is_not_exposed_or_given_host_networking(compose_name):
+    document = _load_compose(compose_name)
+    serialized = (DOCKER_DIR / compose_name).read_text(encoding="utf-8")
+    for service in document["services"].values():
+        assert "network_mode" not in service
+        assert "extra_hosts" not in service
+    _assert_sensitive_ports_not_published(document)
+    assert "network_mode: host" not in serialized
+    assert "host-browser-bridge" not in document["services"]
+    assert "browser-host" not in document["services"]
+
+
+@pytest.mark.parametrize(
+    "ports",
+    [
+        ["127.0.0.1:9222:9222"],
+        ["12345:9222"],
+        [{"target": 6080, "published": 12345, "protocol": "tcp", "mode": "host"}],
+        ["12345-12347:9221-9223"],
+    ],
+)
+def test_sensitive_port_helper_rejects_all_compose_publication_syntaxes(ports):
+    document = {"services": {"malicious": {"ports": ports}}}
+    with pytest.raises(AssertionError):
+        _assert_sensitive_ports_not_published(document)
+
+
+def test_machine_local_compose_is_optional_in_clean_checkout(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "tests.test_docker_compose_config.DOCKER_DIR", tmp_path
+    )
+    with pytest.raises(
+        pytest.skip.Exception, match="machine-local.*absent"
+    ):
+        _load_compose("docker-compose.yml")
+
+
 @pytest.mark.parametrize(
     "compose_name", ["docker-compose.yml", "docker-compose.yml.example"]
 )
 def test_compose_host_terminal_text_and_yaml_contract_is_safe(compose_name):
     compose_path = DOCKER_DIR / compose_name
-    document = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    document = _load_compose(compose_name)
     service = document["services"]["n-agent"]
     environment = service["environment"]
     required_environment = {
@@ -90,9 +270,13 @@ def test_compose_host_terminal_text_and_yaml_contract_is_safe(compose_name):
     "compose_name", ["docker-compose.yml", "docker-compose.yml.example"]
 )
 def test_compose_config_subprocess(compose_name):
+    compose_path = DOCKER_DIR / compose_name
+    if compose_name == "docker-compose.yml" and not compose_path.exists():
+        pytest.skip(
+            "machine-local docker/docker-compose.yml is absent in a clean checkout"
+        )
     if shutil.which("docker") is None:
         pytest.skip("docker CLI unavailable")
-    compose_path = DOCKER_DIR / compose_name
     completed = subprocess.run(
         ["docker", "compose", "-f", str(compose_path), "config", "--quiet"],
         cwd=ROOT,

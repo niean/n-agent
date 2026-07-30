@@ -22,6 +22,7 @@ from app.config import Settings
 from app.domain.browser import BrowserBackendType
 from app.domain.tool import RiskLevel
 from app.domain.tool_policy import ToolExposurePolicy
+from app.infrastructure.browser import host_protocol
 from app.main import build_application_services
 
 
@@ -315,8 +316,60 @@ def test_host_cdp_backend_wired_when_host_bridge_configured(tmp_path: Path):
     backends = services.browser_service._backends
     assert BrowserBackendType.HOST_CDP in backends
     assert isinstance(backends[BrowserBackendType.HOST_CDP], HostCdpBrowserBackend)
+    config = backends[BrowserBackendType.HOST_CDP]._config
+    assert (
+        config.max_screenshot_bytes
+        == host_protocol.HOST_CDP_MAX_SCREENSHOT_BYTES
+    )
+    assert config.max_response_bytes == host_protocol.max_json_response_bytes(
+        host_protocol.HOST_CDP_MAX_SCREENSHOT_BYTES
+    )
     # Container backend absent (endpoint not configured).
     assert BrowserBackendType.CONTAINER not in backends
+
+
+def test_host_cdp_custom_screenshot_limit_fails_closed(
+    tmp_path: Path,
+) -> None:
+    token_path = tmp_path / "browser_token"
+    token_path.write_bytes(b"a" * 32 + b"\n")
+    token_path.chmod(0o600)
+    requested = 2 * 1_048_576
+    with pytest.raises(
+        ValueError, match="host_bridge_screenshot_limit_invalid"
+    ):
+        build_application_services(
+            _settings(
+                tmp_path,
+                browser_enabled=True,
+                browser_default_backend="host_cdp",
+                browser_container_endpoint="",
+                browser_host_bridge_url="http://127.0.0.1:8766",
+                browser_host_bridge_token_path=str(token_path),
+                browser_trusted_dev=True,
+                browser_max_screenshot_bytes=requested,
+            )
+        )
+
+
+def test_container_custom_screenshot_limit_is_wired(
+    tmp_path: Path,
+) -> None:
+    requested = 2 * 1_048_576
+    services = build_application_services(
+        _settings(
+            tmp_path,
+            browser_enabled=True,
+            browser_default_backend="container",
+            browser_container_endpoint="http://browser:9222",
+            browser_max_screenshot_bytes=requested,
+        )
+    )
+    assert services.browser_service is not None
+    backend = services.browser_service._backends[
+        BrowserBackendType.CONTAINER
+    ]
+    assert backend._max_screenshot_bytes == requested
 
 
 def test_host_cdp_backend_absent_when_host_bridge_not_configured(tmp_path: Path):

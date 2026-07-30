@@ -30,6 +30,7 @@ def _request(
     tool_call_id: str = "tc-1",
     arguments: dict[str, Any] | None = None,
     description: str = "Probe an MCP site",
+    metadata: dict[str, Any] | None = None,
 ) -> ApprovalRequest:
     return ApprovalRequest(
         session_id=session_id,
@@ -38,6 +39,7 @@ def _request(
         arguments=arguments or {"site": "demo"},
         description=description,
         risk_level=RiskLevel.CONFIRM,
+        metadata=metadata,
     )
 
 
@@ -324,6 +326,71 @@ async def test_trust_session_calls_grant_updater_and_allows() -> None:
     decision = await task
     assert decision == ApprovalDecision(allowed=True, scope="session")
     assert bridge.pending_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Decider: host_grant approval_kind (Chat CONFIRM card for Host Grant)
+# ---------------------------------------------------------------------------
+
+async def test_host_grant_once_only_resolves_future_no_session_grant() -> None:
+    """host_grant approval_kind + once: claim resolves Future allowed=True,
+    scope=once. Does NOT call session_grant_updater (grant_host executes in
+    AgentGraph async context, not in claim -- keeps claim sync-atomic)."""
+    service = GatewayToolApprovalService()
+    bridge = DashboardToolApprovalBridge()
+    task, confirmation = await _start_decider(
+        bridge,
+        request=_request(metadata={"approval_kind": "host_grant", "browser_session_id": "bsess-1"}),
+        session_grant_updater=service.grant_session,
+        session_grant_checker=service.is_granted,
+        session_grant_revoker=service.revoke_session,
+    )
+    result = bridge.claim(confirmation["confirmation_id"], "s1", "once")
+    assert result.status == "ok"
+    assert result.decision == ApprovalDecision(allowed=True, scope="once")
+    # session grant NOT applied (grant_host is deferred to AgentGraph).
+    assert not service.is_granted("s1", "dashboard", "mcp_site_probe")
+    decision = await task
+    assert decision.allowed is True
+    assert decision.scope == "once"
+    assert bridge.pending_count == 0
+
+
+async def test_host_grant_trust_session_only_resolves_future_no_session_grant() -> None:
+    """host_grant approval_kind + trust_session: TTL is uniform per settings;
+    claim still only resolves Future allowed=True, scope=once (no
+    session_grant_updater call)."""
+    service = GatewayToolApprovalService()
+    bridge = DashboardToolApprovalBridge()
+    task, confirmation = await _start_decider(
+        bridge,
+        request=_request(metadata={"approval_kind": "host_grant", "browser_session_id": "bsess-1"}),
+        session_grant_updater=service.grant_session,
+        session_grant_checker=service.is_granted,
+        session_grant_revoker=service.revoke_session,
+    )
+    result = bridge.claim(confirmation["confirmation_id"], "s1", "trust_session")
+    assert result.status == "ok"
+    assert result.decision == ApprovalDecision(allowed=True, scope="once")
+    assert not service.is_granted("s1", "dashboard", "mcp_site_probe")
+    decision = await task
+    assert decision.allowed is True
+
+
+async def test_host_grant_cancel_returns_denied() -> None:
+    """host_grant approval_kind + cancel: claim returns denied, fail-closed."""
+    bridge = DashboardToolApprovalBridge()
+    task, confirmation = await _start_decider(
+        bridge,
+        request=_request(metadata={"approval_kind": "host_grant", "browser_session_id": "bsess-1"}),
+    )
+    result = bridge.claim(confirmation["confirmation_id"], "s1", "cancel")
+    assert result.status == "ok"
+    assert result.decision == ApprovalDecision(
+        allowed=False, scope="deny", reason="cancelled"
+    )
+    decision = await task
+    assert decision.allowed is False
 
 
 # ---------------------------------------------------------------------------

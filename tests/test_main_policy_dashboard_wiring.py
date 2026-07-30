@@ -48,9 +48,30 @@ def test_field_is_non_default_and_before_optional_fields():
     assert dataclasses.fields(ApplicationServices)[pdi].default is dataclasses.MISSING
 
 
+def _route_paths(app) -> list[str]:
+    # Starlette 1.x wraps included routers in _IncludedRouter (path=None,
+    # real routes on .original_router); walk those + Mounts recursively.
+    paths: list[str] = []
+
+    def walk(routes):
+        for r in routes:
+            p = getattr(r, "path", None)
+            if p:
+                paths.append(p)
+            orig = getattr(r, "original_router", None)
+            if orig is not None and hasattr(orig, "routes"):
+                walk(orig.routes)
+            sub = getattr(r, "routes", None)
+            if isinstance(sub, list):
+                walk(sub)
+
+    walk(app.routes)
+    return paths
+
+
 def test_create_app_registers_security_and_policy_routes(tmp_path: Path):
     app = create_app(_settings(tmp_path))
-    paths = {getattr(r, "path", None) for r in app.routes}
+    paths = set(_route_paths(app))
     assert "/security" in paths
     assert "/chat/policies" in paths
 

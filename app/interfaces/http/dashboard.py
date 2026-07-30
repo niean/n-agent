@@ -334,13 +334,15 @@ def create_dashboard_router(
 
             # Build IngressFacts (verified entry facts; body metadata is NOT promoted)
             # T12: IngressFacts will be passed to RunPolicySnapshotFactory
+            # actor_id is the server-side Dashboard constant (never from body);
+            # host-grant attribution and browser policy require a non-empty actor.
             ingress = IngressFacts(
                 run_id=str(uuid4()),
                 session_id=x_session_id,
                 source="dashboard",
-                actor_id=None,
+                actor_id=_DASHBOARD_ACTOR,
                 execution_mode=ExecutionMode.REALTIME,
-                trusted_claims={},
+                trusted_claims={"actor_id": _DASHBOARD_ACTOR},
             )
 
             resolved_model = payload.get("model") or model_service.default_model

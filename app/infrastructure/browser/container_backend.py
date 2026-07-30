@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, Playwright  # noqa: F401
 
 logger = logging.getLogger(__name__)
+_MIN_SCREENSHOT_BYTES = 1_024
+_MAX_SCREENSHOT_BYTES = 16 * 1_024 * 1_024
 
 
 class ContainerBackendError(RuntimeError):
@@ -104,6 +106,7 @@ class ContainerBrowserBackend:
         navigation_timeout_seconds: float = 30.0,
         takeover_ttl_seconds: int = 60,
         novnc_base_url: str = "",
+        max_screenshot_bytes: int = 1_048_576,
     ) -> None:
         if not endpoint or not endpoint.strip():
             raise ContainerBackendError(
@@ -115,6 +118,16 @@ class ContainerBrowserBackend:
         self._navigation_timeout = float(navigation_timeout_seconds)
         self._takeover_ttl = int(takeover_ttl_seconds)
         self._novnc_base_url = (novnc_base_url or "").rstrip("/")
+        if (
+            type(max_screenshot_bytes) is not int
+            or not _MIN_SCREENSHOT_BYTES
+            <= max_screenshot_bytes
+            <= _MAX_SCREENSHOT_BYTES
+        ):
+            raise ContainerBackendError(
+                "container screenshot limit invalid"
+            )
+        self._max_screenshot_bytes = max_screenshot_bytes
         # Shared CDP connection (lazy).
         self._playwright: "Playwright | None" = None
         self._browser: "Browser | None" = None
@@ -193,6 +206,7 @@ class ContainerBrowserBackend:
             driver = PlaywrightBrowserBackend(
                 url_verifier=self._url_verifier,
                 default_timeout_seconds=self._navigation_timeout,
+                max_screenshot_bytes=self._max_screenshot_bytes,
             )
             driver.attach_page(page)
             self._sessions[session.id] = _SessionContext(

@@ -855,6 +855,42 @@ async def test_screenshot_returns_bytes_in_result():
     assert raw == png
 
 
+@pytest.mark.asyncio
+async def test_screenshot_rejects_bytes_over_configured_container_limit():
+    page = FakePage()
+    page.set_elements([])
+    page.set_screenshot(b"x" * 1025)
+    driver = PlaywrightBrowserBackend(
+        url_verifier=UrlVerifier(),
+        max_screenshot_bytes=1024,
+    )
+    driver.attach_page(page)
+
+    result = await driver.execute_action(
+        "session-1", ScreenshotAction()
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "screenshot_unavailable"
+    assert driver.last_screenshot_bytes() is None
+
+
+@pytest.mark.asyncio
+async def test_clear_last_screenshot_is_idempotent_and_preserves_driver_state():
+    page = FakePage()
+    page.set_screenshot(b"old-frame")
+    driver = PlaywrightBrowserBackend(url_verifier=UrlVerifier())
+    driver.attach_page(page)
+    await driver.execute_action("session-1", ScreenshotAction())
+
+    driver.clear_last_screenshot()
+    driver.clear_last_screenshot()
+
+    assert driver.last_screenshot_bytes() is None
+    assert driver.current_document_revision() == 0
+    assert driver.page is page
+
+
 # ---------------------------------------------------------------------------
 # get_state
 # ---------------------------------------------------------------------------

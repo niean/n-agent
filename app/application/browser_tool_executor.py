@@ -274,6 +274,23 @@ class BrowserToolExecutor(ToolExecutor):
                 context.session_id, action, run_context
             )
         except Exception as exc:
+            # Host grant required on a host_cdp pending session: convert the
+            # signal into a PERMISSION_DENIED ToolResult carrying the host-grant
+            # marker so AgentGraph can route it to the Chat CONFIRM card flow.
+            # Import locally to avoid import cycles.
+            from app.application.browser_service import HostGrantApprovalRequired
+            if isinstance(exc, HostGrantApprovalRequired):
+                return ToolResult(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    status=ToolResultStatus.PERMISSION_DENIED,
+                    content={
+                        "error": "host_grant_required",
+                        "error_code": "host_grant_required",
+                        "approval_kind": "host_grant",
+                        "browser_session_id": exc.browser_session_id,
+                    },
+                )
             logger.warning("browser service failed for %s", tool_name, exc_info=True)
             return ToolResult(
                 tool_call_id=tool_call_id,

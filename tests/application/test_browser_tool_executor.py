@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from app.application.browser_service import HostGrantApprovalRequired
 from app.application.browser_tool_executor import (
     BrowserToolExecutor,
     browser_tool_definitions,
@@ -130,9 +131,14 @@ class FakeBrowserService:
     def __init__(self) -> None:
         self.execute_calls: list[tuple[str, Any, Any]] = []
         self.next_result: BrowserActionResult | None = None
+        self.next_exception: Exception | None = None
 
     async def execute_action(self, n_agent_session_id: str, action: Any, run_context: Any) -> BrowserActionResult:
         self.execute_calls.append((n_agent_session_id, action, run_context))
+        if self.next_exception is not None:
+            exc = self.next_exception
+            self.next_exception = None
+            raise exc
         if self.next_result is not None:
             r = self.next_result
             self.next_result = None
@@ -172,6 +178,44 @@ async def test_execute_without_run_id_returns_error():
 
 def _ctx(session_id: str = "nagent-1", run_id: str = "run-1") -> ToolExecutionContext:
     return ToolExecutionContext(session_id=session_id, run_id=run_id)
+
+
+@pytest.mark.asyncio
+async def test_execute_host_grant_required_converts_to_permission_denied_signal():
+    """When BrowserService raises HostGrantApprovalRequired, the executor
+    converts it to a PERMISSION_DENIED ToolResult carrying the host-grant
+    marker so AgentGraph can route it to the Chat CONFIRM card flow."""
+    service = FakeBrowserService()
+    service.next_exception = HostGrantApprovalRequired(
+        browser_session_id="bsess-1", n_agent_session_id="nagent-1",
+    )
+    executor = BrowserToolExecutor(service)
+    request = ToolCallRequest(
+        id="tc-1", name="browser_navigate",
+        arguments={"url": "https://example.com"},
+    )
+    result = await executor.execute(request, _ctx())
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    content = result.content
+    assert content["error_code"] == "host_grant_required"
+    assert content["approval_kind"] == "host_grant"
+    assert content["browser_session_id"] == "bsess-1"
+
+
+@pytest.mark.asyncio
+async def test_execute_other_exception_still_maps_to_error():
+    """Non-host-grant exceptions still map to ERROR (browser_unavailable),
+    not PERMISSION_DENIED -- no regression in the generic failure path."""
+    service = FakeBrowserService()
+    service.next_exception = RuntimeError("boom")
+    executor = BrowserToolExecutor(service)
+    request = ToolCallRequest(
+        id="tc-1", name="browser_navigate",
+        arguments={"url": "https://example.com"},
+    )
+    result = await executor.execute(request, _ctx())
+    assert result.status is ToolResultStatus.ERROR
+    assert result.content["error"] == "browser_unavailable"
 
 
 @pytest.mark.asyncio

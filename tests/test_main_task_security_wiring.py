@@ -89,7 +89,26 @@ def test_create_app_passes_service_to_router(tmp_path, monkeypatch):
 
 
 def _route_paths(app) -> list[str]:
-    return [r.path for r in app.routes if hasattr(r, "path")]
+    # Starlette 1.x wraps each included router in an _IncludedRouter object
+    # (path=None, the real routes live on .original_router) instead of
+    # flattening them into app.routes. Walk those + Mounts so registration
+    # and ordering assertions keep working.
+    paths: list[str] = []
+
+    def walk(routes):
+        for r in routes:
+            p = getattr(r, "path", None)
+            if p:
+                paths.append(p)
+            orig = getattr(r, "original_router", None)
+            if orig is not None and hasattr(orig, "routes"):
+                walk(orig.routes)
+            sub = getattr(r, "routes", None)
+            if isinstance(sub, list):
+                walk(sub)
+
+    walk(app.routes)
+    return paths
 
 
 def test_api_route_registered_before_task_id_catchall(tmp_path):

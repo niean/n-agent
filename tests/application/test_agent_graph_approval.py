@@ -1230,3 +1230,409 @@ async def test_bridge_arguments_summary_does_not_mutate_original_request(tmp_pat
     # Executor received original arguments
     assert len(executor.calls) == 1
     assert executor.calls[0].arguments == {"action": "list"}
+
+
+# ===========================================================================
+# Host grant approval (browser host_cdp pending -> Chat CONFIRM card)
+#
+# Covers AgentGraphRunner._request_browser_host_grant_approval: the signal
+# from BrowserToolExecutor (PERMISSION_DENIED + approval_kind=host_grant) is
+# routed to a CONFIRM card; after the decider allows, grant_host runs in the
+# async context and the original tool call is retried. Failure/timeout/deny
+# are fail-closed (no retry).
+# ===========================================================================
+
+
+def _browser_navigate_def() -> ToolDefinition:
+    return ToolDefinition(
+        name="browser_navigate",
+        description="Navigate the browser session to a URL.",
+        input_schema={
+            "type": "object",
+            "properties": {"url": {"type": "string", "minLength": 1}},
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.AGENT,
+        toolset="browser",
+    )
+
+
+class _RetryExecutor:
+    """Executor used for the grant-success retry path.
+
+    Records every execute() call and returns SUCCESS. Used when testing
+    _request_browser_host_grant_approval directly (the signal-returning
+    first call happens upstream in execute_tools, not here).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[ToolCallRequest] = []
+
+    async def execute(self, request: ToolCallRequest, context=None) -> ToolResult:
+        self.calls.append(request)
+        return ToolResult(
+            request.id, request.name, ToolResultStatus.SUCCESS, {"navigated": True}
+        )
+
+
+class _HostGrantThenSuccessExecutor:
+    """First execute() returns the host_grant signal; second returns SUCCESS.
+
+    Models the real BrowserToolExecutor behavior on a pending host_cdp session:
+    the first call surfaces HostGrantApprovalRequired as a PERMISSION_DENIED
+    ToolResult carrying the host-grant marker; after grant_host succeeds the
+    AgentGraph retries the original call, which now succeeds.
+    """
+
+    def __init__(self, browser_session_id: str = "bsess-1") -> None:
+        self.calls = 0
+        self.browser_session_id = browser_session_id
+
+    async def execute(self, request: ToolCallRequest, context=None) -> ToolResult:
+        self.calls += 1
+        if self.calls == 1:
+            return ToolResult(
+                request.id,
+                request.name,
+                ToolResultStatus.PERMISSION_DENIED,
+                {
+                    "error": "host_grant_required",
+                    "error_code": "host_grant_required",
+                    "approval_kind": "host_grant",
+                    "browser_session_id": self.browser_session_id,
+                },
+            )
+        return ToolResult(
+            request.id, request.name, ToolResultStatus.SUCCESS, {"navigated": True}
+        )
+
+
+class _FakeBrowserDashboardService:
+    """Stand-in for BrowserDashboardService; records grant_host calls.
+
+    grant_host may return a dict {ok, error} (the real contract) or raise,
+    so the AgentGraph failure paths can be exercised.
+    """
+
+    def __init__(self, *, grant_result: dict | None = None, raise_exc: bool = False) -> None:
+        self.grant_result = grant_result
+        self.raise_exc = raise_exc
+        self.grant_calls: list[dict] = []
+
+    def grant_host(self, browser_session_id, n_agent_session_id, actor_id,
+                   policy_version, ttl_seconds):
+        self.grant_calls.append({
+            "browser_session_id": browser_session_id,
+            "n_agent_session_id": n_agent_session_id,
+            "actor_id": actor_id,
+            "policy_version": policy_version,
+            "ttl_seconds": ttl_seconds,
+        })
+        if self.raise_exc:
+            raise RuntimeError("bridge down")
+        return self.grant_result
+
+
+def _build_host_grant_runner(
+    tmp_path, *, executor, browser_dashboard_service, ttl: int = 600
+) -> AgentGraphRunner:
+    """Build a minimal AgentGraphRunner for direct method tests.
+
+    llm_provider is unused when calling _request_browser_host_grant_approval
+    directly; None is safe because __init__ only stores it.
+    """
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    return AgentGraphRunner(
+        None,
+        ToolService(executor, [_browser_navigate_def()]),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        browser_dashboard_service=browser_dashboard_service,
+        browser_host_grant_ttl_seconds=ttl,
+    )
+
+
+def _host_grant_request() -> ToolCallRequest:
+    return ToolCallRequest(
+        id="call-1", name="browser_navigate",
+        arguments={"url": "https://example.com"},
+    )
+
+
+def _host_grant_ctx(decider=None) -> ToolExecutionContext:
+    return ToolExecutionContext(
+        session_id="s-host",
+        trusted_metadata={"actor_id": "actor-1"},
+        approval_decider=decider,
+    )
+
+
+_HOST_GRANT_SIGNAL = {"approval_kind": "host_grant", "browser_session_id": "bsess-1"}
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_success_calls_grant_and_retries(tmp_path):
+    """decider allows -> grant_host runs with correct bindings -> tool retried -> SUCCESS."""
+    executor = _RetryExecutor()
+    svc = _FakeBrowserDashboardService(grant_result={"ok": True})
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=svc, ttl=600
+    )
+    captured: list[ApprovalRequest] = []
+
+    def decider(req: ApprovalRequest) -> ApprovalDecision:
+        captured.append(req)
+        return ApprovalDecision(allowed=True, scope="once")
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host", _host_grant_ctx(decider), _HOST_GRANT_SIGNAL
+    )
+
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.content == {"navigated": True}
+    # ApprovalRequest carried host-grant metadata + localized description.
+    assert len(captured) == 1
+    assert captured[0].metadata == {
+        "approval_kind": "host_grant", "browser_session_id": "bsess-1",
+    }
+    assert "授予主机浏览器访问权限" in captured[0].description
+    assert captured[0].risk_level is RiskLevel.CONFIRM
+    # grant_host called once with correct bindings + server-authoritative policy_version.
+    assert len(svc.grant_calls) == 1
+    gc = svc.grant_calls[0]
+    assert gc["browser_session_id"] == "bsess-1"
+    assert gc["n_agent_session_id"] == "s-host"
+    assert gc["actor_id"] == "actor-1"
+    assert gc["policy_version"] == "system-v1"  # BROWSER_POLICY_VERSION
+    assert gc["ttl_seconds"] == 600
+    # Original tool retried exactly once.
+    assert len(executor.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_grant_ok_false_denies_without_retry(tmp_path):
+    """grant_host returns {ok: False} -> PERMISSION_DENIED host_grant_failed, no retry."""
+    executor = _RetryExecutor()
+    svc = _FakeBrowserDashboardService(
+        grant_result={"ok": False, "error": "host_bridge_unavailable"}
+    )
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=svc
+    )
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host",
+        _host_grant_ctx(lambda req: ApprovalDecision(allowed=True, scope="once")),
+        _HOST_GRANT_SIGNAL,
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content["reason"] == "host_grant_failed"
+    assert len(svc.grant_calls) == 1
+    assert len(executor.calls) == 0  # no retry
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_grant_exception_denies_without_leak(tmp_path):
+    """grant_host raises -> PERMISSION_DENIED host_grant_failed, no exception leak, no retry."""
+    executor = _RetryExecutor()
+    svc = _FakeBrowserDashboardService(raise_exc=True)
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=svc
+    )
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host",
+        _host_grant_ctx(lambda req: ApprovalDecision(allowed=True, scope="once")),
+        _HOST_GRANT_SIGNAL,
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content["reason"] == "host_grant_failed"
+    assert "bridge down" not in str(result.content)  # no raw exception leak
+    assert len(svc.grant_calls) == 1
+    assert len(executor.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_decider_denies_skips_grant(tmp_path):
+    """decider returns allowed=False -> PERMISSION_DENIED with reason, grant_host NOT called."""
+    executor = _RetryExecutor()
+    svc = _FakeBrowserDashboardService(grant_result={"ok": True})
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=svc
+    )
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host",
+        _host_grant_ctx(
+            lambda req: ApprovalDecision(allowed=False, scope="deny", reason="cancelled")
+        ),
+        _HOST_GRANT_SIGNAL,
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content["reason"] == "cancelled"
+    assert len(svc.grant_calls) == 0
+    assert len(executor.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_decider_exception_fail_closed(tmp_path):
+    """decider raises -> PERMISSION_DENIED approval_failed, grant_host NOT called."""
+    executor = _RetryExecutor()
+    svc = _FakeBrowserDashboardService(grant_result={"ok": True})
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=svc
+    )
+
+    def boom(req: ApprovalRequest) -> ApprovalDecision:
+        raise RuntimeError("decider crashed")
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host", _host_grant_ctx(boom), _HOST_GRANT_SIGNAL
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content["reason"] == "approval_failed"
+    assert len(svc.grant_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_no_dashboard_service_fail_closed(tmp_path):
+    """No browser_dashboard_service injected -> PERMISSION_DENIED host_grant_required."""
+    executor = _RetryExecutor()
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=None
+    )
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host",
+        _host_grant_ctx(lambda req: ApprovalDecision(allowed=True, scope="once")),
+        _HOST_GRANT_SIGNAL,
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content["reason"] == "host_grant_required"
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_no_decider_fail_closed(tmp_path):
+    """No approval_decider in context -> PERMISSION_DENIED approval_required."""
+    executor = _RetryExecutor()
+    svc = _FakeBrowserDashboardService(grant_result={"ok": True})
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=svc
+    )
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host", _host_grant_ctx(decider=None),
+        _HOST_GRANT_SIGNAL,
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content["reason"] == "approval_required"
+    assert len(svc.grant_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_host_grant_approval_missing_session_id_fail_closed(tmp_path):
+    """Signal without browser_session_id -> PERMISSION_DENIED host_grant_required."""
+    executor = _RetryExecutor()
+    svc = _FakeBrowserDashboardService(grant_result={"ok": True})
+    runner = _build_host_grant_runner(
+        tmp_path, executor=executor, browser_dashboard_service=svc
+    )
+
+    result = await runner._request_browser_host_grant_approval(
+        _host_grant_request(), "s-host",
+        _host_grant_ctx(lambda req: ApprovalDecision(allowed=True, scope="once")),
+        {"approval_kind": "host_grant"},  # no browser_session_id
+    )
+
+    assert result.status is ToolResultStatus.PERMISSION_DENIED
+    assert result.content["reason"] == "host_grant_required"
+    assert len(svc.grant_calls) == 0
+
+
+class _BrowserNavigateProvider:
+    """Provider that emits a browser_navigate tool_call once, then a final message."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def list_models(self):
+        return [ModelInfo("test", "test", "fake")]
+
+    async def supports_tools(self, model):
+        return True
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-nav",
+                            "type": "function",
+                            "function": {
+                                "name": "browser_navigate",
+                                "arguments": '{"url":"https://example.com"}',
+                            },
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+            )
+        return LLMResult(
+            message={"role": "assistant", "content": "done"}, finish_reason="stop"
+        )
+
+
+@pytest.mark.asyncio
+async def test_host_grant_signal_routes_through_execute_tools_to_success(tmp_path):
+    """End-to-end: BrowserToolExecutor host_grant signal routes to the CONFIRM
+    card flow, grant_host runs, and the original navigate is retried to SUCCESS."""
+    executor = _HostGrantThenSuccessExecutor()
+    svc = _FakeBrowserDashboardService(grant_result={"ok": True})
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-host"))
+    runner = AgentGraphRunner(
+        _BrowserNavigateProvider(),
+        ToolService(executor, [_browser_navigate_def()]),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        browser_dashboard_service=svc,
+        browser_host_grant_ttl_seconds=600,
+    )
+    state = AgentState(
+        session_id="s-host",
+        input_messages=[{"role": "user", "content": "open the page"}],
+    )
+    ctx = ToolExecutionContext(
+        session_id="s-host",
+        trusted_metadata={"actor_id": "actor-1"},
+        approval_decider=lambda req: ApprovalDecision(allowed=True, scope="once"),
+    )
+    options = {"tool_execution_context": ctx}
+
+    events = [e async for e in runner.stream_events(state, "test", options)]
+
+    # grant_host called once with correct bindings.
+    assert len(svc.grant_calls) == 1
+    assert svc.grant_calls[0]["browser_session_id"] == "bsess-1"
+    assert svc.grant_calls[0]["actor_id"] == "actor-1"
+    # Executor called twice: 1st surfaced the signal, 2nd was the post-grant retry.
+    assert executor.calls == 2
+    # A tool_call event with success status was emitted.
+    tool_events = [
+        e for e in events if e.type is ChatEventType.TOOL_CALL_DELTA and e.tool_call
+    ]
+    assert any(te.tool_call.get("status") == "success" for te in tool_events)

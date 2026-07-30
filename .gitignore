@@ -25,6 +25,7 @@ secrets.json
 .clinerules/
 .superpowers/
 .claude/
+.workbuddy/
 
 # Project-Common
 locals/*
@@ -36,6 +37,7 @@ data/*
 
 .venv
 .pytest_cache
+.ruff_cache
 *.pyc
 *.egg-info/
 app/__pycache__

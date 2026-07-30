@@ -39,6 +39,7 @@ def test_cli_subcommands_help_available():
         "doctor",
         "config",
         "logs",
+        "browser-host",
     ):
         result = subprocess.run(
             [sys.executable, "-m", "app.interfaces.cli", cmd, "--help"],

@@ -1121,8 +1121,24 @@ def test_dispatch_without_run_service_returns_409(client):
 
 
 def test_ws_events_route_registered(client):
-    routes = [getattr(r, "path", "") for r in client.app.routes]
-    assert "/chat/tasks/events" in routes
+    # Starlette 1.x wraps included routers in _IncludedRouter (path=None,
+    # real routes on .original_router); walk those + Mounts recursively.
+    paths: list[str] = []
+
+    def walk(routes):
+        for r in routes:
+            p = getattr(r, "path", None)
+            if p:
+                paths.append(p)
+            orig = getattr(r, "original_router", None)
+            if orig is not None and hasattr(orig, "routes"):
+                walk(orig.routes)
+            sub = getattr(r, "routes", None)
+            if isinstance(sub, list):
+                walk(sub)
+
+    walk(client.app.routes)
+    assert "/chat/tasks/events" in paths
 
 
 def test_ws_events_replay_envelope(client, task_service, registry):

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from .commands import (
     acp,
+    browser_host,
     chat,
     config,
     curator,
@@ -617,6 +618,10 @@ def build_parser(
     _build_logs_parser(subparsers)
     _build_acp_parser(subparsers)
     _build_task_parser(subparsers)
+    browser_host_parser = subparsers.add_parser(
+        "browser-host", help="Run the bounded Browser Host Bridge"
+    )
+    browser_host.register_cli(browser_host_parser)
     usage_parser = subparsers.add_parser("usage", help="Print token usage and context stats")
     usage_parser.add_argument("session_id", nargs="?", default=None, help="Session ID (omit to list recent sessions)")
     _add_format_flags(usage_parser)
@@ -705,6 +710,7 @@ _DISPATCH = {
     "acp": acp.run,
     "task": task.run,
     "usage": usage.run,
+    "browser-host": browser_host.run,
 }
 
 
@@ -712,10 +718,17 @@ def main(argv: list[str] | None = None) -> int:
     _configure_cli_env()
     from app.main import collect_plugin_cli_commands
 
-    plugin_commands = collect_plugin_cli_commands()
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    # The security-sensitive foreground host command is entirely builtin.
+    # Avoid plugin discovery side effects and output on its startup/check path.
+    plugin_commands = (
+        []
+        if effective_argv[:1] == ["browser-host"]
+        else collect_plugin_cli_commands()
+    )
     parser = build_parser(plugin_commands=plugin_commands)
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(effective_argv)
     except SystemExit as exc:
         return int(exc.code or 0)
 

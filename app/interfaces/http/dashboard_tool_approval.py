@@ -88,6 +88,9 @@ class _PendingApproval:
     session_grant_updater: SessionGrantUpdater | None = None
     session_grant_checker: SessionGrantChecker | None = None
     session_grant_revoker: SessionGrantRevoker | None = None
+    # Carries approval_kind (e.g. "host_grant") and browser_session_id for
+    # host grant routing. Not part of the 5-field card envelope whitelist.
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -200,6 +203,7 @@ class DashboardToolApprovalBridge:
                 session_grant_updater=session_grant_updater,
                 session_grant_checker=session_grant_checker,
                 session_grant_revoker=session_grant_revoker,
+                metadata=request.metadata,
             )
 
             # Register pending BEFORE calling sender so cleanup paths can
@@ -278,13 +282,25 @@ class DashboardToolApprovalBridge:
         pending.claimed = True
         self._pending.pop(confirmation_id, None)
 
-        if choice == "once":
-            decision = ApprovalDecision(allowed=True, scope="once")
-        elif choice == "cancel":
+        is_host_grant = (
+            pending.metadata is not None
+            and pending.metadata.get("approval_kind") == "host_grant"
+        )
+
+        if choice == "cancel":
             decision = ApprovalDecision(
                 allowed=False, scope="deny", reason="cancelled"
             )
-        else:  # trust_session
+        elif is_host_grant:
+            # Host grant approvals: claim only resolves the Future to mark the
+            # user's decision. grant_host execution happens in AgentGraph's
+            # async context after decider returns (keeps claim sync-atomic).
+            # Both "once" and "trust_session" map to allowed=True, scope="once"
+            # (TTL is uniform per settings.browser_host_grant_ttl_seconds).
+            decision = ApprovalDecision(allowed=True, scope="once")
+        elif choice == "once":
+            decision = ApprovalDecision(allowed=True, scope="once")
+        else:  # trust_session (non-host-grant)
             decision = self._apply_session_grant(
                 pending,
                 pending.session_grant_updater,

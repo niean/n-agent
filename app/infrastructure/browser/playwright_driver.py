@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from playwright.async_api import Browser, Page, Playwright  # noqa: F401
 
 logger = logging.getLogger(__name__)
+_MIN_SCREENSHOT_BYTES = 1_024
+_MAX_SCREENSHOT_BYTES = 16 * 1_024 * 1_024
 
 
 # Sensitive input types / autocomplete hints that must NOT be typed by the
@@ -202,9 +204,18 @@ class PlaywrightBrowserBackend:
         *,
         url_verifier: UrlVerifier,
         default_timeout_seconds: float = 30.0,
+        max_screenshot_bytes: int = 1_048_576,
     ) -> None:
+        if (
+            type(max_screenshot_bytes) is not int
+            or not _MIN_SCREENSHOT_BYTES
+            <= max_screenshot_bytes
+            <= _MAX_SCREENSHOT_BYTES
+        ):
+            raise ValueError("browser_screenshot_limit_invalid")
         self._url_verifier = url_verifier
         self._default_timeout = default_timeout_seconds
+        self._max_screenshot_bytes = max_screenshot_bytes
         # Element actions need to fail before the service/backend's outer
         # timeout so a local actionability problem does not invalidate the
         # whole browser session. Five seconds is ample for a stable control;
@@ -256,6 +267,10 @@ class PlaywrightBrowserBackend:
 
     def last_screenshot_bytes(self) -> bytes | None:
         return self._last_screenshot
+
+    def clear_last_screenshot(self) -> None:
+        """Clear the ephemeral screenshot side channel for the next action."""
+        self._last_screenshot = None
 
     # ------------------------------------------------------------------
     # Document-revision tracking (called by navigate / redirect hooks)
@@ -839,8 +854,14 @@ class PlaywrightBrowserBackend:
         errors just clear the bytes.
         """
         try:
-            self._last_screenshot = await self._page.screenshot(
+            data = await self._page.screenshot(
                 full_page=False, type="png"
+            )
+            self._last_screenshot = (
+                data
+                if isinstance(data, bytes)
+                and 0 < len(data) <= self._max_screenshot_bytes
+                else None
             )
         except Exception:
             self._last_screenshot = None
@@ -858,6 +879,18 @@ class PlaywrightBrowserBackend:
                 status="error",
                 error_code="screenshot_failed",
                 text=str(exc)[:200],
+            )
+        if (
+            not isinstance(data, bytes)
+            or not data
+            or len(data) > self._max_screenshot_bytes
+        ):
+            self._last_screenshot = None
+            return BrowserActionResult(
+                action_type="screenshot",
+                status="error",
+                error_code="screenshot_unavailable",
+                document_revision=self._document_revision,
             )
         # The driver keeps raw bytes on a side channel; BrowserService reads
         # them via last_screenshot_bytes() and persists via screenshot_store.

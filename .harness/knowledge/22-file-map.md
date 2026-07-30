@@ -346,7 +346,7 @@
   - `host_cdp_backend.py`：HostCdpBrowserBackend，受限 Host Bridge client（loopback + 文件 token + Policy 快照复判 + fail-closed），不接受任意 CDP method/endpoint/target/profile path
   - `host_bridge.py`：Host Bridge 进程逻辑，镜像 host_terminal 模式（loopback-only、文件 token 权限校验、独立 Policy snapshot 每请求复判、fail-closed），代理受管 Chrome CDP
 - Interfaces 层:
-  - `app/interfaces/http/browser_routes.py`：register_browser_routes，12 个 `/chat/browser/*` 端点（sessions/actions/screenshot/pause/resume/takeover/release/close/host-grant/takeover-view），写端点要求同源+可信 actor+一次性 challenge，host-grant 仅 trusted_dev（生产 404），screenshot no-store，错误稳定 code 不泄漏
+  - `app/interfaces/http/browser_routes.py`：register_browser_routes，12 个 `/chat/browser/*` 端点（sessions/actions/screenshot/pause/resume/takeover/release/close/host-grant/takeover-view），写端点要求同源+可信 actor+一次性 challenge；同源判定除配置 allowlist 外会规范化 Origin，并与实际 Host + `X-Forwarded-Proto`/请求协议严格相等比较，兼容 `nagent.localhost` 等反向代理域名但仍拒绝跨站 Origin；host-grant 仅 trusted_dev（生产 404），screenshot no-store，错误稳定 code 不泄漏
   - `app/interfaces/http/static/browser.js`：Browser Dashboard 页面控制器，1-5s 轮询截图/URL/动作历史；截图首次 404 时显示占位，后续 cache-bust 图片成功 load 会清除 errored 样式和旧占位并恢复实时视图；状态控制矩阵，takeover 交互视图，全部 textContent 安全渲染
 - 配置：`app/config.py` 增加 `N_AGENT_BROWSER_*`（B 类 env-only，含 enabled/default_backend/container_endpoint/host_bridge_url+token_path/timeout/observe limits/screenshot bytes+pixels+TTL+quota/host_grant_ttl/takeover_ttl/poll_interval/global_session_limit/trusted_dev），跨字段校验（host_cdp 需 bridge+token+trusted_dev，container 需 endpoint）
 - 部署：`docker/browser/Dockerfile`+`entrypoint.sh`（Chromium+Xvfb+noVNC+Playwright，仅容器网络监听），`docker/docker-compose.yml` 新增 browser 服务（无宿主端口、资源限制、healthcheck、browser-profiles 持久卷）

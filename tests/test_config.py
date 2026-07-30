@@ -539,6 +539,31 @@ def test_settings_browser_defaults(tmp_path: Path):
     assert s.browser_trusted_dev is False
 
 
+@pytest.mark.parametrize("value", [1024, 16 * 1024 * 1024])
+def test_settings_browser_screenshot_bytes_accepts_finite_bounds(
+    tmp_path: Path, value: int
+) -> None:
+    settings = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        browser_max_screenshot_bytes=value,
+    )
+    assert settings.browser_max_screenshot_bytes == value
+
+
+def test_settings_browser_screenshot_bytes_rejects_above_finite_max(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            browser_max_screenshot_bytes=16 * 1024 * 1024 + 1,
+        )
+
+
 def test_settings_browser_env_mapping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("N_AGENT_BROWSER_ENABLED", "true")
     monkeypatch.setenv("N_AGENT_BROWSER_DEFAULT_BACKEND", "host_cdp")
