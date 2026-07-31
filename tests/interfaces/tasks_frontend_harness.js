@@ -83,6 +83,9 @@ function freshEnv(api, opts) {
   document._listeners = {};
   document.body = makeNode('body');
   byId['tasks-board'] = makeNode('div');
+  byId['tasks-board-view'] = makeNode('div');
+  byId['tasks-detail-view'] = makeNode('div');
+  byId['tasks-detail-view'].hidden = true;
   // Static "新增任务" button lives in the index.html panel-header (mirrors
   // scheduled-tasks' #scheduled-task-new). Pre-register it so tasks.js init()
   // can bind via getElementById('task-new').
@@ -108,14 +111,20 @@ function freshEnv(api, opts) {
   };
   const win = {
     NAGENT: { api: api, ui: ui, modal: modal },
-    location: { protocol: 'http:', host: '127.0.0.1:8201' },
+    location: { protocol: 'http:', host: '127.0.0.1:8201', pathname: opts.pathname || '/tasks' },
+    history: { pushState() {} },
     WebSocket: function () { return { close() {} }; },
+    _listeners: {},
+    addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
+    removeEventListener(ev, fn) { if (this._listeners[ev]) this._listeners[ev] = this._listeners[ev].filter((f) => f !== fn); },
   };
   const ctx = {
     NAGENT: win.NAGENT,
     document: document,
     console: console,
     window: win,
+    location: win.location,
+    history: win.history,
     WebSocket: win.WebSocket,
   };
   vm.createContext(ctx);
@@ -239,7 +248,7 @@ async function testUnsupportedLaneDropUsesStandardModal() {
   }
 }
 
-async function testCardDetailUsesStandardModal() {
+async function testCardDetailOpensPage() {
   const task = card('t1', '详情任务');
   task.created_by = 'alice';
   task.updated_at = '2026-07-19T01:00:00+00:00';
@@ -270,15 +279,19 @@ async function testCardDetailUsesStandardModal() {
   (taskCard._listeners.click || []).forEach((fn) => fn());
   await tick();
 
-  const backdrop = byId['tasks-detail-modal'];
-  ok(!!backdrop && !backdrop._removed, 'task detail opens in a modal');
-  ok(backdrop && backdrop.className === 'modal-backdrop', 'task detail uses modal-backdrop');
-  const dialog = backdrop && backdrop.children[0];
-  ok(dialog && dialog.className.indexOf('modal-dialog') !== -1, 'task detail uses modal-dialog');
-  const form = dialog && dialog.children[0];
-  ok(form && form.className.indexOf('providers-form') !== -1, 'task detail uses standard modal content');
-  ok(form && form.children[0].className === 'modal-header', 'task detail renders standard modal header');
-  const detailGrid = form && form.children.find((node) => node.className === 'tasks-detail__grid');
+  const detailView = byId['tasks-detail-view'];
+  ok(!!detailView && !detailView.hidden, 'task detail opens as a page (detail view visible)');
+  ok(byId['tasks-board-view'] && byId['tasks-board-view'].hidden, 'board view hidden when detail open');
+  ok(!byId['tasks-detail-modal'], 'no detail modal backdrop (page, not modal)');
+
+  const page = detailView.children[0];
+  ok(page && page.className === 'tasks-detail-page', 'detail page wrapper rendered');
+  const header = page && page.children[0];
+  ok(header && header.className === 'tasks-detail-header', 'detail header rendered');
+  const back = header && header.children[0];
+  ok(back && back.tag === 'a' && back.textContent === '返回', 'back link rendered');
+
+  const detailGrid = created.find((node) => node.className === 'tasks-detail__grid');
   ok(detailGrid && detailGrid.children.some((row) => row.children[1] && row.children[1].textContent === 't1'), 'task detail renders task fields');
   const detailText = created.map((node) => node.textContent).join('\n');
   ok(detailText.indexOf('alice') !== -1, 'task detail renders task owner');
@@ -286,8 +299,12 @@ async function testCardDetailUsesStandardModal() {
   ok(detailText.indexOf('执行记录') !== -1 && detailText.indexOf('评论') !== -1, 'task detail renders related records');
   ok(detailText.indexOf('2026-07-19 08:00:00') !== -1, 'task detail renders timestamps in UTC+8');
 
-  (document._listeners.keydown || []).forEach((fn) => fn({ key: 'Escape' }));
-  ok(backdrop._removed === true, 'task detail modal closes on ESC');
+  // Back link returns to the board view.
+  (back._listeners.click || []).forEach((fn) => fn({ preventDefault() {} }));
+  await tick();
+  await tick();
+  ok(byId['tasks-detail-view'].hidden === true, 'detail view hidden after back');
+  ok(byId['tasks-board-view'].hidden === false, 'board view shown after back');
 }
 
 async function testToolbarOnlyCreateButton() {
@@ -456,9 +473,10 @@ async function testDetailDeleteButtonOnTerminalTask() {
   const taskCard = board.children[3].children[1].children[0];
   (taskCard._listeners.click || []).forEach((fn) => fn());
   await tick();
+  await tick();
 
-  const backdrop = byId['tasks-detail-modal'];
-  ok(!!backdrop && !backdrop._removed, 'detail modal open for terminal task');
+  const detailView = byId['tasks-detail-view'];
+  ok(!!detailView && !detailView.hidden, 'detail page open for terminal task');
   const delBtn = created.find((n) => n.tag === 'button' && n.textContent === '删除任务' && n.className.indexOf('btn--danger') !== -1);
   ok(!!delBtn, 'detail renders 删除任务 button (btn--danger) for terminal task');
 
@@ -474,6 +492,7 @@ async function testDetailDeleteButtonOnTerminalTask() {
   await tick();
   const qCard = byId['kanban-board-root'].children[0].children[1].children[0];
   (qCard._listeners.click || []).forEach((fn) => fn());
+  await tick();
   await tick();
   const qDel = created.find((n) => n.tag === 'button' && n.textContent === '删除任务');
   ok(!qDel, 'queued task detail has no 删除任务 button');
@@ -528,11 +547,30 @@ async function testApprovalNoteTextareaAndSubmit() {
   ok(rejectCalls[0] && rejectCalls[0].note === null, 'reject called with null note when empty (got ' + JSON.stringify(rejectCalls[0]) + ')');
 }
 
+async function testDirectUrlOpensDetail() {
+  const task = card('t1', '直链任务');
+  const api = {
+    task: {
+      board: () => Promise.resolve(makeBoard([task])),
+      get: () => Promise.resolve({ task, runs: [], events: [], comments: [], attachments: [] }),
+    },
+  };
+  const ctx = freshEnv(api, { pathname: '/tasks/t1' });
+  ctx.NAGENT.tasks.init();
+  await tick();
+  await tick();
+  const detailView = byId['tasks-detail-view'];
+  ok(!!detailView && !detailView.hidden, 'direct URL /tasks/t1 opens detail page');
+  ok(byId['tasks-board-view'] && byId['tasks-board-view'].hidden, 'board hidden on direct detail URL');
+  const detailText = created.map((n) => n.textContent).join('\n');
+  ok(detailText.indexOf('直链任务') !== -1, 'direct detail renders task title');
+}
+
 (async () => {
   await testRendersQueuedCards();
   await testEmptyBoardNoCrash();
   await testUnsupportedLaneDropUsesStandardModal();
-  await testCardDetailUsesStandardModal();
+  await testCardDetailOpensPage();
   await testToolbarOnlyCreateButton();
   await testCreateModalSubmits();
   await testCreateModalValidatesEmptyTitle();
@@ -541,6 +579,7 @@ async function testApprovalNoteTextareaAndSubmit() {
   await testCardsDoNotRenderDeleteButton();
   await testDetailDeleteButtonOnTerminalTask();
   await testApprovalNoteTextareaAndSubmit();
+  await testDirectUrlOpensDetail();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('tasks_frontend_harness: all tests passed');
   process.exit(0);

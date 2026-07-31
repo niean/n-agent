@@ -273,22 +273,30 @@ class SessionService:
 
     async def append_tool_approval_resolution_message(
         self, session_id: str, confirmation_id: str, status: str,
+        *, scope: str | None = None,
     ) -> ConversationMessage:
         if not isinstance(confirmation_id, str) or not confirmation_id.strip():
             raise SessionValidationError("invalid tool approval confirmation")
         if status not in {"approved", "rejected"}:
             raise SessionValidationError("invalid tool approval status")
         label = "已批准" if status == "approved" else "已拒绝"
+        # Persist the trust scope so the resolved card can surface the
+        # complete approval context (仅信任本次 / 信任本会话) after a refresh,
+        # not just the approved/rejected verdict. Only meaningful for an
+        # approved decision; rejected (cancel/timeout) carries no scope.
+        card: dict[str, Any] = {
+            "kind": "tool_approval_resolution",
+            "confirmation_id": confirmation_id,
+            "status": status,
+        }
+        if status == "approved" and scope in {"once", "session"}:
+            card["scope"] = scope
         return await self._append_system_message(
             session_id,
             "ui.tool_approval_resolution",
             f"工具操作{label}",
             truncate=True,
-            card={
-                "kind": "tool_approval_resolution",
-                "confirmation_id": confirmation_id,
-                "status": status,
-            },
+            card=card,
         )
 
     async def _append_system_message(

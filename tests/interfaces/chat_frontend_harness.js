@@ -70,6 +70,7 @@ function taskApi() {
     cancel(id) { taskCalls.push({ name: 'cancel', id }); return Promise.resolve({}); },
     retry(id) { taskCalls.push({ name: 'retry', id }); return Promise.resolve({}); },
     revise(id, note) { taskCalls.push({ name: 'revise', id, note }); return Promise.resolve({}); },
+    board() { taskCalls.push({ name: 'board' }); return Promise.resolve({ columns: boardColumns.slice() }); },
   };
 }
 
@@ -78,6 +79,8 @@ let fetchCalls = [];
 let createdSessionId = null;
 let appendCalls = [];
 let sessionsList = [];
+let boardColumns = [];
+let scheduledTasks = [];
 // SSE stream + fetch override state for tool-approval card tests.
 let sseQueue = [];
 let fetchOverrides = [];
@@ -100,6 +103,8 @@ function freshStubs() {
   createdSessionId = null;
   appendCalls = [];
   sessionsList = [];
+  boardColumns = [];
+  scheduledTasks = [];
   sseQueue = [];
   fetchOverrides = [];
   streamKeepOpen = false;
@@ -125,7 +130,7 @@ function freshStubs() {
   const ui = {
     byId: (id) => (byIdMap[id] !== undefined ? byIdMap[id] : makeEl()),
     el: () => makeEl(),
-    clear: () => {},
+    clear: (node) => { if (node && node._kids) { for (const k of node._kids) if (k) k.parentNode = null; node._kids.length = 0; } },
     renderEmpty: () => {},
     renderError: () => {},
   };
@@ -142,6 +147,7 @@ function freshStubs() {
     getSessionToolCalls: () => Promise.resolve([]),
     renameSession: () => Promise.resolve({}),
     deleteSession: () => Promise.resolve({}),
+    listScheduledTasks: () => Promise.resolve(scheduledTasks.slice()),
   };
   const createdElements = [];
   const document = {
@@ -486,7 +492,7 @@ async function runIntegration() {
   env.input.value = '帮我写一段总结';
   await env.chat.send();
   ok(fetchCalls.some((f) => f.url === '/chat/completions'), 'non-command calls /chat/completions');
-  ok(taskCalls.length === 0, 'non-command calls no task api');
+  ok(taskCalls.every((c) => c.name === 'board'), 'non-command calls no task mutation api (board read ok)');
 
   // === persistence: /task command record + result persist to session ===
   env = loadChat();
@@ -991,7 +997,7 @@ async function runIntegration() {
 })();
 
 // ===========================================================================
-// 调试设置：createMessageElement 为工具调用/任务状态卡片打 data-debug-kind 标记，
+// 调试设置：createMessageElement 为工具调用/任务状态/对话压缩卡片打 data-debug-kind 标记，
 // 供设置弹框的显隐规则（CSS）控制。任务结果/普通消息/进程消息不打标记。
 // ===========================================================================
 (function testDebugKindTagging() {
@@ -1027,6 +1033,10 @@ async function runIntegration() {
   // work task 折叠卡片 -> task
   el = createMessageElement({ role: 'user', source: 'task', content: 'work task t_1' });
   ok(el && el.dataset && el.dataset.debugKind === 'task', 'work task folded card tagged data-debug-kind=task');
+
+  // 对话压缩摘要卡片 -> compression
+  el = createMessageElement({ role: 'user', is_summary: true, content: '[CONTEXT SUMMARY]: 历史摘要' });
+  ok(el && el.dataset && el.dataset.debugKind === 'compression', 'summary message tagged data-debug-kind=compression (got ' + JSON.stringify(el && el.dataset && el.dataset.debugKind) + ')');
 
   // 普通消息/任务结果/进程消息 不打标记（不受调试显隐控制）
   ok(!(createMessageElement({ role: 'user', source: 'dashboard', content: 'hi' }).dataset.debugKind), 'dashboard user has no debugKind');
@@ -1919,7 +1929,7 @@ async function testToolApprovalCard() {
         kind: 'tool_approval_resolution', confirmation_id: 'persisted-c3', status: 'approved',
       } },
     ]);
-    ok(approvalDecisions.get('persisted-c3') === 'approved',
+    ok(approvalDecisions.get('persisted-c3').status === 'approved',
       'persisted approval result is indexed by confirmation id');
     const resolvedPersisted = env.chat.createMessageElement({
       role: 'system', name: 'ui.tool_approval', content: '工具操作等待确认',
@@ -1931,6 +1941,56 @@ async function testToolApprovalCard() {
     const resolvedButtons = findByClass(resolvedPersisted, 'tool-approval-card__btn');
     ok(resolvedButtons.length === 3 && resolvedButtons.every((button) => button.disabled),
       'approved persisted card disables all three actions after refresh');
+    // A resolution without scope (legacy / rejected) collapses to bare 已批准.
+    ok(resolvedPersisted.textContent.indexOf('已批准') !== -1,
+      'approved card without scope shows bare 已批准');
+
+    // --- Resolved card surfaces the trust scope after refresh ---
+    // approved + session -> 已批准 · 信任本会话; approved + once -> 已批准 · 仅信任本次.
+    // Assert against the feedback node (button labels like 信任本会话 also live in
+    // the card text, so the whole-card text would be ambiguous).
+    function approvalFeedback(card) {
+      const nodes = findByClass(card, 'tool-approval-card__feedback');
+      return nodes.length ? nodes[0].textContent : '';
+    }
+    for (const scopeCase of [['session', '信任本会话'], ['once', '仅信任本次']]) {
+      const scope = scopeCase[0];
+      const label = scopeCase[1];
+      const decisions = env.chat.resolveToolApprovalDecisions([
+        { role: 'system', name: 'ui.tool_approval_resolution', card: {
+          kind: 'tool_approval_resolution', confirmation_id: 'scope-' + scope,
+          status: 'approved', scope: scope,
+        } },
+      ]);
+      ok(decisions.get('scope-' + scope).scope === scope,
+        'resolveToolApprovalDecisions exposes scope=' + scope);
+      const resolved = env.chat.createMessageElement({
+        role: 'system', name: 'ui.tool_approval', content: '工具操作等待确认',
+        card: { kind: 'tool_approval', approval: {
+          confirmation_id: 'scope-' + scope, tool_name: 'browser.click',
+          description: '打开文章', arguments_summary: '{}', expires_at: '2030-01-01T00:00:00Z',
+        } },
+      }, undefined, undefined, decisions);
+      const fb = approvalFeedback(resolved);
+      ok(fb === ('已批准 · ' + label),
+        'resolved feedback is 已批准 · ' + label + ' for scope=' + scope + " (got '" + fb + "')");
+    }
+    // rejected -> 已拒绝, no scope label
+    const rejectedDecisions = env.chat.resolveToolApprovalDecisions([
+      { role: 'system', name: 'ui.tool_approval_resolution', card: {
+        kind: 'tool_approval_resolution', confirmation_id: 'scope-rejected',
+        status: 'rejected', scope: 'deny',
+      } },
+    ]);
+    const rejectedCard = env.chat.createMessageElement({
+      role: 'system', name: 'ui.tool_approval', content: '工具操作等待确认',
+      card: { kind: 'tool_approval', approval: {
+        confirmation_id: 'scope-rejected', tool_name: 'browser.click',
+        description: '打开文章', arguments_summary: '{}', expires_at: '2030-01-01T00:00:00Z',
+      } },
+    }, undefined, undefined, rejectedDecisions);
+    ok(approvalFeedback(rejectedCard) === '已拒绝',
+      'rejected feedback is 已拒绝 without scope label');
     const allDescs = findDescendants(container, () => true);
     ok(!allDescs.some((n) => n.tagName === 'IMG' || n.tagName === 'SCRIPT'), 'XSS: no IMG/SCRIPT created (textContent only)');
     ok(container.textContent.indexOf(xss) !== -1, 'XSS: payload preserved as text');
@@ -2179,11 +2239,114 @@ async function testToolApprovalCard() {
   }
 }
 
+// ===========================================================================
+// setHeader: 会话 ID 后缀多视图链接（浏览器视图/任务/定时任务）
+// ===========================================================================
+(function testSetHeaderLinks() {
+  const env = loadChat();
+  const setHeader = env.chat.setHeader;
+  ok(typeof setHeader === 'function', 'setHeader exposed');
+  const header = env.byIdMap['chat-header'];
+  function linkHrefs() {
+    return (header._kids || []).filter((k) => k && k.tagName === 'A').map((a) => a.href);
+  }
+  setHeader(null);
+  ok(header.textContent === 'N-Agent Chat', 'no id -> N-Agent Chat');
+  setHeader('s1');
+  ok(header.textContent === 's1', 'id only -> id, no links');
+  ok(linkHrefs().length === 0, 'id only -> no links');
+  setHeader('s1', { browser: true });
+  ok(linkHrefs().length === 1 && linkHrefs()[0] === '/browser/session?nagent=s1', 'browser link');
+  setHeader('s1', { browser: true, taskId: 't_9', scheduledTaskId: 'sched-1' });
+  const hrefs = linkHrefs();
+  ok(hrefs.length === 3 && hrefs[0] === '/browser/session?nagent=s1' && hrefs[1] === '/tasks/t_9' && hrefs[2] === '/scheduled-tasks/sched-1', 'all three links in order');
+  setHeader('s1', { taskId: 't_x' });
+  ok(linkHrefs().length === 1 && linkHrefs()[0] === '/tasks/t_x', 'task only link');
+  // 空字符串 taskId/scheduledTaskId 视为无关联
+  setHeader('s1', { taskId: '' });
+  ok(linkHrefs().length === 0, 'empty taskId -> no link');
+})();
+
+// ===========================================================================
+// loadSessionViewLinks: 按会话过滤任务看板/定时任务列表，取最新一条，失败静默降级
+// ===========================================================================
+async function testSessionViewLinks() {
+  const emptyDetail = { session: { id: 's1' }, messages: [], summary: null, task_state: null };
+  function headerHrefs(env) {
+    return (env.byIdMap['chat-header']._kids || []).filter((k) => k && k.tagName === 'A').map((a) => a.href);
+  }
+
+  // 任务链接：origin_session_id 命中，取最新一条（t_new > t_old，t_other 属 s2 不命中）
+  let env = loadChat();
+  env.win.NAGENT.api.task.board = () => Promise.resolve({ columns: [
+    { cards: [
+      { id: 't_old', origin_session_id: 's1', created_at: '2026-07-01T00:00:00Z' },
+      { id: 't_new', origin_session_id: 's1', created_at: '2026-07-31T00:00:00Z' },
+      { id: 't_other', origin_session_id: 's2', created_at: '2026-08-01T00:00:00Z' },
+    ] },
+  ] });
+  env.win.NAGENT.api.listScheduledTasks = () => Promise.resolve([]);
+  await env.chat.loadSessionViewLinks('s1', emptyDetail);
+  await env.waitMicro();
+  env.chat.setHeader('s1', env.chat.buildHeaderLinks(emptyDetail, 's1'));
+  const hrefs1 = headerHrefs(env);
+  ok(hrefs1.indexOf('/tasks/t_new') !== -1 && hrefs1.indexOf('/tasks/t_old') === -1 && hrefs1.indexOf('/tasks/t_other') === -1, 'task link = latest by created_at (t_new), session-scoped');
+
+  // execution_session_id 命中亦可
+  env = loadChat();
+  env.win.NAGENT.api.task.board = () => Promise.resolve({ columns: [
+    { cards: [{ id: 't_exec', execution_session_id: 's1', created_at: '2026-07-31T00:00:00Z' }] },
+  ] });
+  env.win.NAGENT.api.listScheduledTasks = () => Promise.resolve([]);
+  await env.chat.loadSessionViewLinks('s1', emptyDetail);
+  await env.waitMicro();
+  env.chat.setHeader('s1', env.chat.buildHeaderLinks(emptyDetail, 's1'));
+  ok(headerHrefs(env).indexOf('/tasks/t_exec') !== -1, 'task link matches execution_session_id');
+
+  // 定时任务链接：session_id 命中，取最新一条（sched_b > sched_a，sched_c 属 s2 不命中）
+  env = loadChat();
+  env.win.NAGENT.api.task.board = () => Promise.resolve({ columns: [] });
+  env.win.NAGENT.api.listScheduledTasks = () => Promise.resolve([
+    { id: 'sched_a', session_id: 's1', created_at: '2026-07-01T00:00:00Z' },
+    { id: 'sched_b', session_id: 's1', created_at: '2026-07-31T00:00:00Z' },
+    { id: 'sched_c', session_id: 's2', created_at: '2026-08-01T00:00:00Z' },
+  ]);
+  await env.chat.loadSessionViewLinks('s1', emptyDetail);
+  await env.waitMicro();
+  env.chat.setHeader('s1', env.chat.buildHeaderLinks(emptyDetail, 's1'));
+  const hrefs2 = headerHrefs(env);
+  ok(hrefs2.indexOf('/scheduled-tasks/sched_b') !== -1 && hrefs2.indexOf('/scheduled-tasks/sched_c') === -1, 'schedule link = latest by created_at (sched_b), session-scoped');
+
+  // 无关联 -> 无链接
+  env = loadChat();
+  env.win.NAGENT.api.task.board = () => Promise.resolve({ columns: [{ cards: [{ id: 't_x', origin_session_id: 's2', created_at: '2026-07-31T00:00:00Z' }] }] });
+  env.win.NAGENT.api.listScheduledTasks = () => Promise.resolve([{ id: 'sched_x', session_id: 's2', created_at: '2026-07-31T00:00:00Z' }]);
+  await env.chat.loadSessionViewLinks('s1', emptyDetail);
+  await env.waitMicro();
+  env.chat.setHeader('s1', env.chat.buildHeaderLinks(emptyDetail, 's1'));
+  ok(headerHrefs(env).length === 0, 'no association -> no links');
+
+  // 拉取失败静默降级，不抛未处理 rejection，不展示对应链接
+  env = loadChat();
+  env.win.NAGENT.api.task.board = () => Promise.reject(new Error('network'));
+  env.win.NAGENT.api.listScheduledTasks = () => Promise.resolve([]);
+  let unhandled = 0;
+  const uh = () => { unhandled++; };
+  process.on('unhandledRejection', uh);
+  await env.chat.loadSessionViewLinks('s1', emptyDetail);
+  await env.waitMicro();
+  env.chat.setHeader('s1', env.chat.buildHeaderLinks(emptyDetail, 's1'));
+  ok(unhandled === 0, 'fetch failure silent, no unhandled rejection');
+  ok(headerHrefs(env).length === 0, 'fetch failure -> no task/schedule links rendered');
+  process.removeListener('unhandledRejection', uh);
+}
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
   await testDebugSettingsPerSession();
   await testToolApprovalCard();
+  await testSessionViewLinks();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

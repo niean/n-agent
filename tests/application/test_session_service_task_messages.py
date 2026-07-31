@@ -171,6 +171,37 @@ async def test_append_tool_approval_resolution_persists_confirmation_status(tmp_
 
 
 @pytest.mark.asyncio
+async def test_append_tool_approval_resolution_persists_scope(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    svc = SessionService(store)
+    await store.create_session(ConversationSession(id="s1"))
+
+    # approved + session scope -> card carries scope (信任本会话)
+    await svc.append_tool_approval_resolution_message(
+        "s1", "confirm-session", "approved", scope="session"
+    )
+    # approved + once scope -> card carries scope (仅信任本次)
+    await svc.append_tool_approval_resolution_message(
+        "s1", "confirm-once", "approved", scope="once"
+    )
+    # rejected -> no scope even if one is passed
+    await svc.append_tool_approval_resolution_message(
+        "s1", "confirm-cancel", "rejected", scope="deny"
+    )
+
+    messages = await store.list_messages("s1")
+    by_id = {m.card["confirmation_id"]: m.card for m in messages}
+    assert by_id["confirm-session"] == {
+        "kind": "tool_approval_resolution",
+        "confirmation_id": "confirm-session",
+        "status": "approved",
+        "scope": "session",
+    }
+    assert by_id["confirm-once"]["scope"] == "once"
+    assert "scope" not in by_id["confirm-cancel"]
+
+
+@pytest.mark.asyncio
 async def test_append_task_lifecycle_message_truncates_card_summary(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     svc = SessionService(store)

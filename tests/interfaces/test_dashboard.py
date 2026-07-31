@@ -1018,11 +1018,13 @@ def _build_approval_app(
     return app
 
 
-async def _create_pending(bridge, session_id, tool_name="browser_click"):
+async def _create_pending(bridge, session_id, tool_name="browser_click", *, grant_service=None):
     """Register a pending approval on the bridge and return its confirmation_id.
 
     The decider task is left running (pending) so that ``claim`` can resolve it.
-    Returns ``(confirmation_id, decider_task)``.
+    Returns ``(confirmation_id, decider_task)``. When ``grant_service`` is given,
+    its grant callbacks are wired into the decider so ``trust_session`` claims
+    can reach the session-scope grant path.
     """
     sender_event = asyncio.Event()
     captured = {}
@@ -1031,11 +1033,12 @@ async def _create_pending(bridge, session_id, tool_name="browser_click"):
         captured["metadata"] = metadata
         sender_event.set()
 
-    decider = bridge.create_decider(
-        session_id=session_id,
-        actor_id="dashboard",
-        sender=sender,
-    )
+    kwargs = {"session_id": session_id, "actor_id": "dashboard", "sender": sender}
+    if grant_service is not None:
+        kwargs["session_grant_updater"] = grant_service.grant_session
+        kwargs["session_grant_checker"] = grant_service.is_granted
+        kwargs["session_grant_revoker"] = grant_service.revoke_session
+    decider = bridge.create_decider(**kwargs)
     req = ApprovalRequest(
         session_id=session_id,
         tool_call_id="call-1",
@@ -1126,6 +1129,55 @@ async def test_dashboard_claim_returns_204_on_ok(tmp_path):
         # The decider future is resolved by the claim
         decision = await asyncio.wait_for(task, timeout=2.0)
         assert decision.allowed
+
+
+async def test_dashboard_claim_persists_resolution_scope(tmp_path):
+    """The resolution card must carry decision.scope so a refreshed card can
+    surface the trust context (仅信任本次 / 信任本会话), not just the verdict."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    bridge = DashboardToolApprovalBridge(timeout_seconds=30.0)
+    grant_service = GatewayToolApprovalService()
+    app = _build_approval_app(store, bridge=bridge, tool_approval_service=grant_service)
+    transport = httpx.ASGITransport(app=app)
+    # Distinct tool names prevent the session-grant fast path from short-
+    # circuiting later pendings after trust_session grants the first tool.
+    cases = [
+        ("browser_click", "trust_session", "session"),
+        ("browser_type", "once", "once"),
+        ("browser_scroll", "cancel", None),
+    ]
+    confirmation_ids = []
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        await client.post("/chat/sessions?session_id=s1")
+        for tool_name, choice, expected_scope in cases:
+            cid, task = await _create_pending(bridge, "s1", tool_name, grant_service=grant_service)
+            r = await client.post(
+                f"/chat/tool-approvals/{cid}",
+                headers={"X-Session-ID": "s1"},
+                json={"choice": choice},
+            )
+            assert r.status_code == 204, f"{choice}: expected 204 got {r.status_code}"
+            decision = await asyncio.wait_for(task, timeout=2.0)
+            if choice == "cancel":
+                assert not decision.allowed
+            else:
+                assert decision.allowed and decision.scope == expected_scope
+            confirmation_ids.append(cid)
+
+    messages = await store.list_messages("s1")
+    resolutions = {
+        m.card["confirmation_id"]: m.card
+        for m in messages
+        if m.card and m.card.get("kind") == "tool_approval_resolution"
+    }
+    for cid, (_tool, choice, expected_scope) in zip(confirmation_ids, cases):
+        card = resolutions[cid]
+        if choice == "cancel":
+            assert card["status"] == "rejected"
+            assert "scope" not in card, "rejected card must not carry a scope"
+        else:
+            assert card["status"] == "approved"
+            assert card["scope"] == expected_scope, f"{choice}: scope={card.get('scope')}"
 
 
 async def test_dashboard_claim_returns_404_on_unknown(tmp_path):

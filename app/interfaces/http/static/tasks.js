@@ -2,6 +2,10 @@
  * Board API returns 5 swimlanes (queued/running/waiting_approval/
  * failed+expired / succeeded+cancelled). textContent-only rendering (no
  * innerHTML/insertAdjacentHTML) per the frontend security contract.
+ *
+ * Task detail renders as an independent page at /tasks/{task_id} (URL style
+ * aligned with /scheduled-tasks/{task_id}), not a modal. list/detail views
+ * toggle via the hidden attribute on #tasks-board-view / #tasks-detail-view.
  */
 (function (global) {
   const namespace = global.NAGENT || (global.NAGENT = {});
@@ -11,12 +15,12 @@
   const modal = namespace.modal || {};
 
   // Terminal task statuses (failed/expired/succeeded/cancelled) expose
-  // deletion only from the task detail modal. RUNNING and in-flight tasks use
+  // deletion only from the task detail page. RUNNING and in-flight tasks use
   // cancel/retry instead. Mirrors task_service.delete_task which rejects
   // only RUNNING.
   const DELETABLE_STATUSES = ['failed', 'expired', 'succeeded', 'cancelled'];
 
-  let state = { board: { columns: [] } };
+  let state = { board: { columns: [] }, view: 'list', detail: null };
   let ws = null;
 
   function init() {
@@ -24,7 +28,11 @@
     renderShell();
     const newBtn = document.getElementById('task-new');
     if (newBtn) newBtn.addEventListener('click', openCreateModal);
-    refresh();
+    window.addEventListener('popstate', handlePathChange);
+    refresh().then(() => {
+      const pendingId = pendingTaskIdFromPath();
+      if (pendingId) openDetail(pendingId);
+    });
   }
 
   function renderShell() {
@@ -36,6 +44,59 @@
     board.id = 'kanban-board-root';
     root.appendChild(board);
 
+  }
+
+  // Toggle list/detail visibility via the hidden attribute, mirroring
+  // scheduled-tasks.js render(). list -> board visible; detail -> page visible.
+  function renderViewToggle() {
+    const boardView = document.getElementById('tasks-board-view');
+    const detailView = document.getElementById('tasks-detail-view');
+    if (state.view === 'detail') {
+      if (boardView) boardView.hidden = true;
+      if (detailView) detailView.hidden = false;
+    } else {
+      if (boardView) boardView.hidden = false;
+      if (detailView) detailView.hidden = true;
+    }
+  }
+
+  function pendingTaskIdFromPath() {
+    const match = window.location.pathname.match(/^\/tasks\/([^/]+)$/);
+    if (!match) return null;
+    try { return decodeURIComponent(match[1]); } catch (_) { return null; }
+  }
+
+  // In-tab navigation to task detail: update URL then render. No new tab.
+  function goToDetail(id) {
+    const path = '/tasks/' + encodeURIComponent(id);
+    if (window.location.pathname !== path) {
+      history.pushState({ tab: 'tasks' }, '', path);
+    }
+    openDetail(id);
+  }
+
+  function backToList() {
+    const path = '/tasks';
+    if (window.location.pathname !== path) {
+      history.pushState({ tab: 'tasks' }, '', path);
+    }
+    state.view = 'list';
+    state.detail = null;
+    renderViewToggle();
+    refresh();
+  }
+
+  function handlePathChange() {
+    const pendingId = pendingTaskIdFromPath();
+    if (pendingId) {
+      const current = state.detail && state.detail.id ? state.detail.id : null;
+      if (current !== pendingId) openDetail(pendingId);
+    } else if (state.view === 'detail') {
+      state.view = 'list';
+      state.detail = null;
+      renderViewToggle();
+      renderBoard();
+    }
   }
 
   function renderBoard() {
@@ -77,7 +138,7 @@
     card.draggable = true;
     card.dataset.id = t.id;
     card.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', t.id); });
-    card.addEventListener('click', () => openDetail(t.id));
+    card.addEventListener('click', () => goToDetail(t.id));
 
     const title = el('div', 'kanban-card__title');
     title.textContent = t.title || t.id;
@@ -107,14 +168,25 @@
   }
 
   async function refresh() {
+    // Returning to the canonical list path resets the detail view (sidebar
+    // click pushes /tasks).
+    if (window.location.pathname === '/tasks') {
+      state.view = 'list';
+      state.detail = null;
+    }
     try {
       const board = await api.task.board();
       state.board = board || { columns: [] };
-      renderBoard();
+      // Only re-render the board when in list view; in detail view the board
+      // data stays fresh in the background without disrupting the open detail.
+      if (state.view === 'list') renderBoard();
       connectWs();
+      renderViewToggle();
     } catch (e) {
-      const root = document.getElementById('tasks-board');
-      if (root) { const msg = el('div', 'tasks-error'); msg.textContent = '加载看板失败：' + (e && e.message ? e.message : e); root.appendChild(msg); }
+      if (state.view === 'list') {
+        const root = document.getElementById('tasks-board');
+        if (root) { const msg = el('div', 'tasks-error'); msg.textContent = '加载看板失败：' + (e && e.message ? e.message : e); root.appendChild(msg); }
+      }
     }
   }
 
@@ -175,11 +247,9 @@
         : window.confirm('确认删除任务 ' + id + '？删除后无法恢复。');
       if (!confirmed) return;
       await api.task.remove(id);
-      closeDetailModal();
-      await refresh();
+      backToList();
     } catch (e) {
       await showTaskActionError('删除失败（可能状态冲突）：' + (e && e.message ? e.message : e));
-      refresh();
     }
   }
 
@@ -305,29 +375,6 @@
     if (titleInput.focus) titleInput.focus();
   }
 
-  function closeDetailModal() {
-    const modal = document.getElementById('tasks-detail-modal');
-    if (modal) modal.remove();
-    document.removeEventListener('keydown', onDetailModalKeydown);
-  }
-
-  function onDetailModalKeydown(event) {
-    if (event.key === 'Escape') closeDetailModal();
-  }
-
-  function detailHeader(form, title) {
-    const header = el('div', 'modal-header');
-    const titleEl = el('h4', '');
-    titleEl.textContent = title;
-    const closeBtn = el('button', 'modal-close');
-    closeBtn.type = 'button';
-    closeBtn.textContent = '×';
-    closeBtn.setAttribute('aria-label', '关闭');
-    closeBtn.addEventListener('click', closeDetailModal);
-    header.append(titleEl, closeBtn);
-    form.appendChild(header);
-  }
-
   function detailValue(value) {
     if (value === null || value === undefined || value === '') return '-';
     if (value === true) return '是';
@@ -370,174 +417,215 @@
     form.append(sectionLabel, body);
   }
 
+  // ---- detail page (independent page at /tasks/{task_id}) ----
   async function openDetail(id) {
-    closeDetailModal();
-    const backdrop = el('div', 'modal-backdrop');
-    backdrop.id = 'tasks-detail-modal';
-    const dialog = el('section', 'modal-dialog tasks-modal');
-    dialog.setAttribute('role', 'dialog');
-    dialog.setAttribute('aria-modal', 'true');
-    const form = el('div', 'providers-form tasks-detail-modal');
-    detailHeader(form, '任务详情');
-    const loading = el('div', 'muted loading-state');
-    loading.textContent = '加载中...';
-    form.appendChild(loading);
-    dialog.appendChild(form);
-    backdrop.appendChild(dialog);
-    backdrop.addEventListener('click', (event) => {
-      if (event.target === backdrop) closeDetailModal();
-    });
-    document.body.appendChild(backdrop);
-    document.addEventListener('keydown', onDetailModalKeydown);
-
+    state.view = 'detail';
+    state.detail = { id: id, loading: true, response: null, error: null };
+    renderViewToggle();
+    const root = document.getElementById('tasks-detail-view');
+    if (!root) return;
+    ui.clear(root);
+    renderDetailPage(root, id, null, null);
     try {
       const response = await api.task.get(id);
-      const detail = response && response.task ? response.task : response;
-      if (document.getElementById('tasks-detail-modal') !== backdrop) return;
-      ui.clear(form);
-      detailHeader(form, detail.title || detail.id);
-
-      const grid = el('div', 'tasks-detail__grid');
-      const fields = [
-        ['ID', detail.id],
-        ['状态', detail.status],
-        ['优先级', detail.priority != null ? String(detail.priority) : '-'],
-        ['创建人', detail.created_by],
-        ['看板', detail.board],
-        ['版本', detail.version != null ? String(detail.version) : '-'],
-        ['目标模式', detail.goal_mode ? '是' : '否'],
-        ['目标最大轮数', detail.goal_max_turns],
-        ['已归档', detail.is_archived ? '是' : '否'],
-        ['创建时间', formatTaskTime(detail.created_at)],
-        ['更新时间', formatTaskTime(detail.updated_at)],
-        ['计划执行', formatTaskTime(detail.scheduled_at)],
-        ['开始时间', formatTaskTime(detail.started_at)],
-        ['完成时间', formatTaskTime(detail.completed_at)],
-        ['当前执行', detail.current_run_id],
-        ['最近心跳', formatTaskTime(detail.last_heartbeat_at)],
-        ['失败次数 / 最大重试', `${detail.consecutive_failures || 0} / ${detail.max_retries || 0}`],
-      ];
-      fields.forEach(([k, v]) => {
-        const row = el('div', 'tasks-detail__row');
-        const kl = el('span', 'tasks-detail__k'); kl.textContent = k + '：';
-        const vl = el('span', 'tasks-detail__v'); vl.textContent = detailValue(v);
-        row.appendChild(kl); row.appendChild(vl); grid.appendChild(row);
-      });
-      form.appendChild(grid);
-
-      appendDetailSection(form, '描述', detail.body);
-      appendDetailSection(form, '执行配置', [
-        `工作区：${detailValue(detail.workspace_kind)}`,
-        `路径：${detailValue(detail.workspace_path)}`,
-        `模型：${detailValue(detail.model_override)}`,
-        `最长执行：${detail.max_runtime_seconds == null ? '-' : `${detail.max_runtime_seconds} 秒`}`,
-        `技能：${detailValue(detail.skills)}`,
-        `允许工具：${detailValue(detail.allowed_tools)}`,
-      ].join('\n'));
-      appendDetailSection(form, '关联会话', [
-        `来源会话：${detailValue(detail.origin_session_id)}`,
-        `执行会话：${detailValue(detail.execution_session_id)}`,
-      ].join('\n'));
-
-      if (detail.result) {
-        appendDetailSection(form, '结果', detail.result);
-      }
-      if (detail.last_failure_error) {
-        appendDetailSection(form, '最近失败原因', detail.last_failure_error);
-      }
-      if (response && response.task) {
-        appendDetailList(form, '执行记录', response.runs, (run) => [
-          `#${detailValue(run.id)}`, detailValue(run.status), detailValue(run.outcome),
-          formatTaskTime(run.started_at), formatTaskTime(run.ended_at), run.summary || run.error || '',
-        ].filter(Boolean).join(' | '));
-        appendDetailList(form, '事件记录', response.events, (event) => [
-          formatTaskTime(event.created_at), detailValue(event.kind),
-          event.run_id == null ? '' : `执行 #${event.run_id}`,
-          event.payload && Object.keys(event.payload).length ? JSON.stringify(event.payload) : '',
-        ].filter(Boolean).join(' | '));
-        appendDetailList(form, '评论', response.comments, (comment) => [
-          formatTaskTime(comment.created_at), detailValue(comment.author), detailValue(comment.body),
-        ].join(' | '));
-        appendDetailList(form, '附件', response.attachments, (attachment) => [
-          detailValue(attachment.filename), detailValue(attachment.content_type),
-          attachment.size == null ? '' : `${attachment.size} B`,
-        ].filter(Boolean).join(' | '));
-        if (response.worker_context) appendDetailSection(form, '执行上下文', response.worker_context);
-      }
-
-      // Intent approval: if waiting_approval, show approve/reject actions.
-      if (detail.status === 'waiting_approval') {
-        const approvalLabel = el('div', 'tasks-detail__section-label');
-        approvalLabel.textContent = '待审批提案';
-        form.appendChild(approvalLabel);
-        const proposalDiv = el('div', 'tasks-detail__body');
-        proposalDiv.textContent = detail.latest_proposal || '（worker 提出了需要审批的修改）';
-        form.appendChild(proposalDiv);
-
-        const noteLabel = el('label', 'tasks-approval-note');
-        noteLabel.textContent = '审批意见/指示/拒绝理由（可选）';
-        const noteInput = el('textarea', '');
-        noteInput.id = 'tasks-approval-note';
-        noteInput.maxLength = 2000;
-        noteLabel.appendChild(noteInput);
-        form.appendChild(noteLabel);
-
-        const approvalActions = el('div', 'providers-form__actions');
-        const approveBtn = el('button', 'btn btn--primary');
-        approveBtn.type = 'button'; approveBtn.textContent = '批准';
-        approveBtn.addEventListener('click', async () => {
-          const note = noteInput.value.trim() || null;
-          setApprovalBusy(approvalActions, true);
-          try { await api.task.approve(id, note); closeDetailModal(); await refresh(); }
-          catch (e) { setApprovalBusy(approvalActions, false); await showTaskActionError('批准失败：' + (e && e.message ? e.message : e)); }
-        });
-        const rejectBtn = el('button', 'btn');
-        rejectBtn.type = 'button'; rejectBtn.textContent = '拒绝';
-        rejectBtn.addEventListener('click', async () => {
-          const note = noteInput.value.trim() || null;
-          setApprovalBusy(approvalActions, true);
-          try { await api.task.reject(id, note); closeDetailModal(); await refresh(); }
-          catch (e) { setApprovalBusy(approvalActions, false); await showTaskActionError('拒绝失败：' + (e && e.message ? e.message : e)); }
-        });
-        approvalActions.append(rejectBtn, approveBtn);
-        form.appendChild(approvalActions);
-      }
-
-      // Terminal-ish actions: cancel / retry via buttons.
-      const statusActions = el('div', 'providers-form__actions');
-      // 取消任务仅对进行中状态开放；失败/过期任务不再展示取消按钮。
-      if (['queued', 'running', 'waiting_approval'].indexOf(detail.status) !== -1) {
-        const cancelBtn = el('button', 'btn');
-        cancelBtn.type = 'button'; cancelBtn.textContent = '取消任务';
-        cancelBtn.addEventListener('click', async () => {
-          try { await api.task.cancel(id); closeDetailModal(); await refresh(); }
-          catch (e) { await showTaskActionError('取消失败：' + (e && e.message ? e.message : e)); }
-        });
-        statusActions.appendChild(cancelBtn);
-      }
-      if (['failed', 'expired'].indexOf(detail.status) !== -1) {
-        const retryBtn = el('button', 'btn');
-        retryBtn.type = 'button'; retryBtn.textContent = '重试';
-        retryBtn.addEventListener('click', async () => {
-          try { await api.task.retry(id); closeDetailModal(); await refresh(); }
-          catch (e) { await showTaskActionError('重试失败：' + (e && e.message ? e.message : e)); }
-        });
-        statusActions.appendChild(retryBtn);
-      }
-      if (DELETABLE_STATUSES.indexOf(detail.status) !== -1) {
-        const deleteBtn = el('button', 'btn btn--danger');
-        deleteBtn.type = 'button'; deleteBtn.textContent = '删除任务';
-        deleteBtn.addEventListener('click', () => { removeTask(id); });
-        statusActions.appendChild(deleteBtn);
-      }
-      if (statusActions.children.length) form.appendChild(statusActions);
+      // Guard: if the user navigated away while loading, do not render.
+      if (state.detail && state.detail.id !== id) return;
+      state.detail = { id: id, loading: false, response: response, error: null };
+      ui.clear(root);
+      renderDetailPage(root, id, response, null);
     } catch (e) {
-      if (document.getElementById('tasks-detail-modal') !== backdrop) return;
-      ui.clear(form);
-      detailHeader(form, '任务详情');
-      const err = el('div', 'tasks-error'); err.textContent = '加载详情失败：' + (e && e.message ? e.message : e);
-      form.appendChild(err);
+      if (state.detail && state.detail.id !== id) return;
+      state.detail = { id: id, loading: false, response: null, error: e };
+      ui.clear(root);
+      renderDetailPage(root, id, null, e);
     }
+  }
+
+  function renderDetailPage(root, id, response, error) {
+    const page = el('div', 'tasks-detail-page');
+    const detail = (response && (response.task || response)) || {};
+    const label = detail.title || detail.id || (error ? id : '加载中...');
+
+    // Header: back link + separator + task id, aligned with scheduled-tasks
+    // detail page (no action buttons in the header).
+    const header = el('div', 'tasks-detail-header');
+    const back = el('a', 'tasks-detail-header__back');
+    back.href = '/tasks';
+    back.textContent = '返回';
+    back.addEventListener('click', (event) => { event.preventDefault(); backToList(); });
+    const sep = el('span', 'tasks-detail-header__sep');
+    sep.textContent = '/';
+    const idLabel = el('span', 'tasks-detail-header__id');
+    idLabel.textContent = label;
+    header.append(back, sep, idLabel);
+    page.appendChild(header);
+
+    if (!response && !error) {
+      const loading = el('div', 'muted loading-state');
+      loading.textContent = '加载中...';
+      page.appendChild(loading);
+      root.appendChild(page);
+      return;
+    }
+    if (error) {
+      const err = el('div', 'tasks-error');
+      err.textContent = '加载详情失败：' + (error && error.message ? error.message : error);
+      page.appendChild(err);
+      root.appendChild(page);
+      return;
+    }
+
+    const panel = el('section', 'status-panel tasks-detail');
+    const panelHeader = el('div', 'panel-header');
+    const titleSpan = el('span', '');
+    titleSpan.textContent = detail.title || detail.id;
+    panelHeader.appendChild(titleSpan);
+    panel.appendChild(panelHeader);
+
+    const body = el('div', 'panel-body');
+    buildDetailContent(body, id, response, detail);
+    panel.appendChild(body);
+    page.appendChild(panel);
+    root.appendChild(page);
+  }
+
+  function buildDetailContent(body, id, response, detail) {
+    const grid = el('div', 'tasks-detail__grid');
+    const fields = [
+      ['ID', detail.id],
+      ['状态', detail.status],
+      ['优先级', detail.priority != null ? String(detail.priority) : '-'],
+      ['创建人', detail.created_by],
+      ['看板', detail.board],
+      ['版本', detail.version != null ? String(detail.version) : '-'],
+      ['目标模式', detail.goal_mode ? '是' : '否'],
+      ['目标最大轮数', detail.goal_max_turns],
+      ['已归档', detail.is_archived ? '是' : '否'],
+      ['创建时间', formatTaskTime(detail.created_at)],
+      ['更新时间', formatTaskTime(detail.updated_at)],
+      ['计划执行', formatTaskTime(detail.scheduled_at)],
+      ['开始时间', formatTaskTime(detail.started_at)],
+      ['完成时间', formatTaskTime(detail.completed_at)],
+      ['当前执行', detail.current_run_id],
+      ['最近心跳', formatTaskTime(detail.last_heartbeat_at)],
+      ['失败次数 / 最大重试', `${detail.consecutive_failures || 0} / ${detail.max_retries || 0}`],
+    ];
+    fields.forEach(([k, v]) => {
+      const row = el('div', 'tasks-detail__row');
+      const kl = el('span', 'tasks-detail__k'); kl.textContent = k + '：';
+      const vl = el('span', 'tasks-detail__v'); vl.textContent = detailValue(v);
+      row.appendChild(kl); row.appendChild(vl); grid.appendChild(row);
+    });
+    body.appendChild(grid);
+
+    appendDetailSection(body, '描述', detail.body);
+    appendDetailSection(body, '执行配置', [
+      `工作区：${detailValue(detail.workspace_kind)}`,
+      `路径：${detailValue(detail.workspace_path)}`,
+      `模型：${detailValue(detail.model_override)}`,
+      `最长执行：${detail.max_runtime_seconds == null ? '-' : `${detail.max_runtime_seconds} 秒`}`,
+      `技能：${detailValue(detail.skills)}`,
+      `允许工具：${detailValue(detail.allowed_tools)}`,
+    ].join('\n'));
+    appendDetailSection(body, '关联会话', [
+      `来源会话：${detailValue(detail.origin_session_id)}`,
+      `执行会话：${detailValue(detail.execution_session_id)}`,
+    ].join('\n'));
+
+    if (detail.result) {
+      appendDetailSection(body, '结果', detail.result);
+    }
+    if (detail.last_failure_error) {
+      appendDetailSection(body, '最近失败原因', detail.last_failure_error);
+    }
+    if (response && response.task) {
+      appendDetailList(body, '执行记录', response.runs, (run) => [
+        `#${detailValue(run.id)}`, detailValue(run.status), detailValue(run.outcome),
+        formatTaskTime(run.started_at), formatTaskTime(run.ended_at), run.summary || run.error || '',
+      ].filter(Boolean).join(' | '));
+      appendDetailList(body, '事件记录', response.events, (event) => [
+        formatTaskTime(event.created_at), detailValue(event.kind),
+        event.run_id == null ? '' : `执行 #${event.run_id}`,
+        event.payload && Object.keys(event.payload).length ? JSON.stringify(event.payload) : '',
+      ].filter(Boolean).join(' | '));
+      appendDetailList(body, '评论', response.comments, (comment) => [
+        formatTaskTime(comment.created_at), detailValue(comment.author), detailValue(comment.body),
+      ].join(' | '));
+      appendDetailList(body, '附件', response.attachments, (attachment) => [
+        detailValue(attachment.filename), detailValue(attachment.content_type),
+        attachment.size == null ? '' : `${attachment.size} B`,
+      ].filter(Boolean).join(' | '));
+      if (response.worker_context) appendDetailSection(body, '执行上下文', response.worker_context);
+    }
+
+    // Intent approval: if waiting_approval, show approve/reject actions.
+    if (detail.status === 'waiting_approval') {
+      const approvalLabel = el('div', 'tasks-detail__section-label');
+      approvalLabel.textContent = '待审批提案';
+      body.appendChild(approvalLabel);
+      const proposalDiv = el('div', 'tasks-detail__body');
+      proposalDiv.textContent = detail.latest_proposal || '（worker 提出了需要审批的修改）';
+      body.appendChild(proposalDiv);
+
+      const noteLabel = el('label', 'tasks-approval-note');
+      noteLabel.textContent = '审批意见/指示/拒绝理由（可选）';
+      const noteInput = el('textarea', '');
+      noteInput.id = 'tasks-approval-note';
+      noteInput.maxLength = 2000;
+      noteLabel.appendChild(noteInput);
+      body.appendChild(noteLabel);
+
+      const approvalActions = el('div', 'providers-form__actions');
+      const approveBtn = el('button', 'btn btn--primary');
+      approveBtn.type = 'button'; approveBtn.textContent = '批准';
+      approveBtn.addEventListener('click', async () => {
+        const note = noteInput.value.trim() || null;
+        setApprovalBusy(approvalActions, true);
+        try { await api.task.approve(id, note); openDetail(id); }
+        catch (e) { setApprovalBusy(approvalActions, false); await showTaskActionError('批准失败：' + (e && e.message ? e.message : e)); }
+      });
+      const rejectBtn = el('button', 'btn');
+      rejectBtn.type = 'button'; rejectBtn.textContent = '拒绝';
+      rejectBtn.addEventListener('click', async () => {
+        const note = noteInput.value.trim() || null;
+        setApprovalBusy(approvalActions, true);
+        try { await api.task.reject(id, note); openDetail(id); }
+        catch (e) { setApprovalBusy(approvalActions, false); await showTaskActionError('拒绝失败：' + (e && e.message ? e.message : e)); }
+      });
+      approvalActions.append(rejectBtn, approveBtn);
+      body.appendChild(approvalActions);
+    }
+
+    // Terminal-ish actions: cancel / retry via buttons. After a successful
+    // action, reload the detail in place to reflect the new status; delete
+    // returns to the board.
+    const statusActions = el('div', 'providers-form__actions');
+    // 取消任务仅对进行中状态开放；失败/过期任务不再展示取消按钮。
+    if (['queued', 'running', 'waiting_approval'].indexOf(detail.status) !== -1) {
+      const cancelBtn = el('button', 'btn');
+      cancelBtn.type = 'button'; cancelBtn.textContent = '取消任务';
+      cancelBtn.addEventListener('click', async () => {
+        try { await api.task.cancel(id); openDetail(id); }
+        catch (e) { await showTaskActionError('取消失败：' + (e && e.message ? e.message : e)); }
+      });
+      statusActions.appendChild(cancelBtn);
+    }
+    if (['failed', 'expired'].indexOf(detail.status) !== -1) {
+      const retryBtn = el('button', 'btn');
+      retryBtn.type = 'button'; retryBtn.textContent = '重试';
+      retryBtn.addEventListener('click', async () => {
+        try { await api.task.retry(id); openDetail(id); }
+        catch (e) { await showTaskActionError('重试失败：' + (e && e.message ? e.message : e)); }
+      });
+      statusActions.appendChild(retryBtn);
+    }
+    if (DELETABLE_STATUSES.indexOf(detail.status) !== -1) {
+      const deleteBtn = el('button', 'btn btn--danger');
+      deleteBtn.type = 'button'; deleteBtn.textContent = '删除任务';
+      deleteBtn.addEventListener('click', () => { removeTask(id); });
+      statusActions.appendChild(deleteBtn);
+    }
+    if (statusActions.children.length) body.appendChild(statusActions);
   }
 
   namespace.tasks = { init, refresh };

@@ -498,6 +498,7 @@ def create_dashboard_router(
                         session_id,
                         confirmation_id,
                         "approved" if decision is not None and decision.allowed else "rejected",
+                        scope=decision.scope if decision is not None else None,
                     )
                     if (
                         decision is not None

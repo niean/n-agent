@@ -204,7 +204,11 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert 'max-width' not in kanban_column_rule
     assert 'repeat(4, minmax(180px, 1fr))' not in styles_css
     assert '.tasks-detail-drawer' not in styles_css
-    assert "backdrop.id = 'tasks-detail-modal'" in tasks_js
+    assert "function pendingTaskIdFromPath" in tasks_js
+    assert "goToDetail" in tasks_js
+    assert "backToList" in tasks_js
+    assert "renderDetailPage" in tasks_js
+    assert "tasks-detail-view" in tasks_js
     assert "el('div', 'modal-backdrop')" in tasks_js
     assert "el('section', 'modal-dialog tasks-modal')" in tasks_js
     assert 'function formatTaskTime' in tasks_js
@@ -705,8 +709,8 @@ def test_chat_settings_debug_popover_present(tmp_path):
     assert 'function handleSettingsDocumentClick' in chat_js
     assert 'function applyDebugVisibility' in chat_js
     assert 'function loadDebugSettings' in chat_js
-    # 默认值：任务状态选中、工具调试未选中
-    assert 'task: true, tool: false' in chat_js
+    # 默认值：任务状态选中、对话压缩选中、工具调试未选中
+    assert 'task: true, compression: true, tool: false' in chat_js
     # pill 标签 + 分组标题
     assert "'任务状态'" in chat_js
     assert "'工具调试'" in chat_js

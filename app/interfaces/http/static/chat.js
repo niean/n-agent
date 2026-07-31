@@ -9,11 +9,11 @@
   let initialized = false;
   let externalMemoryProviders = [];
   let memoryPopoverOpen = false;
-  // 调试设置弹框开关；工具调试/任务状态显隐按会话独立生效（每会话一份，互不影响）。
-  // 持久化到 localStorage（按 sessionId 分桶）；新建会话默认 任务状态选中/工具调试未选中。
+  // 调试设置弹框开关；工具调试/任务状态/对话压缩显隐按会话独立生效（每会话一份，互不影响）。
+  // 持久化到 localStorage（按 sessionId 分桶）；新建会话默认 任务状态选中/对话压缩选中/工具调试未选中。
   const DEBUG_SETTINGS_KEY = 'nagent.chat.debug';
-  const DEBUG_DEFAULTS = { task: true, tool: false };
-  // sessionId -> {task, tool}；尚未创建会话时用 draft 兜底（首轮发送后转入对应会话）
+  const DEBUG_DEFAULTS = { task: true, compression: true, tool: false };
+  // sessionId -> {task, compression, tool}；尚未创建会话时用 draft 兜底（首轮发送后转入对应会话）
   let sessionDebugSettings = {};
   let draftDebugSettings = null;
   let settingsPopoverOpen = false;
@@ -468,7 +468,10 @@
       if (!card || card.kind !== 'tool_approval_resolution') continue;
       if (typeof card.confirmation_id !== 'string') continue;
       if (card.status === 'approved' || card.status === 'rejected') {
-        decisions.set(card.confirmation_id, card.status);
+        decisions.set(card.confirmation_id, {
+          status: card.status,
+          scope: typeof card.scope === 'string' ? card.scope : undefined,
+        });
       }
     }
     return decisions;
@@ -896,11 +899,16 @@
   // at module scope so label changes need only one edit.
   var APPROVAL_CHOICE_LABELS = { once: '仅本次允许', trust_session: '信任本会话', cancel: '拒绝' };
   var APPROVAL_CHOICE_ORDER = ['once', 'trust_session', 'cancel'];
+  // Trust-scope labels surfaced on the resolved card after a refresh. The
+  // server persists decision.scope ("once" | "session"); an approved card
+  // shows "已批准 · {scope label}" so the post-resolution state retains the
+  // full approval context instead of collapsing to a bare "已批准".
+  var APPROVAL_SCOPE_LABELS = { once: '仅信任本次', session: '信任本会话' };
 
   // Render the generic approval card into the container (the streaming assistant
   // bubble). Dedup by confirmation_id: if a card for that ID already exists in
   // the container, no duplicate is rendered.
-  function renderToolApprovalCard(container, approval, streamSessionId, resolvedStatus) {
+  function renderToolApprovalCard(container, approval, streamSessionId, resolution) {
     if (!container || !approval || !isValidApprovalPayload(approval)) return;
     var id = String(approval.confirmation_id);
     if (findApprovalCardById(container, id)) return;
@@ -962,10 +970,16 @@
 
     card.appendChild(actions);
     card.appendChild(feedback);
+    var resolvedStatus = resolution && resolution.status;
     if (resolvedStatus === 'approved' || resolvedStatus === 'rejected') {
       cardState.ended = true;
       buttons.forEach(function (button) { button.disabled = true; });
-      feedback.textContent = resolvedStatus === 'approved' ? '已批准' : '已拒绝';
+      if (resolvedStatus === 'approved') {
+        var scopeLabel = APPROVAL_SCOPE_LABELS[resolution && resolution.scope];
+        feedback.textContent = scopeLabel ? ('已批准 · ' + scopeLabel) : '已批准';
+      } else {
+        feedback.textContent = '已拒绝';
+      }
     }
     container.appendChild(card);
   }
@@ -1059,6 +1073,7 @@
     if (message.is_summary) {
       const el = document.createElement('div');
       el.className = 'msg msg--summary';
+      el.dataset.debugKind = 'compression';
       const details = document.createElement('details');
       const summary = document.createElement('summary');
       const content = document.createElement('pre');
@@ -1128,8 +1143,8 @@
       const persistedApproval = validateToolApprovalCard(message.card);
       if (persistedApproval) {
         el.dataset.name = message.name || 'ui.tool_approval';
-        const status = approvalDecisions ? approvalDecisions.get(persistedApproval.confirmation_id) : undefined;
-        renderToolApprovalCard(el, persistedApproval, currentSessionId, status);
+        const resolution = approvalDecisions ? approvalDecisions.get(persistedApproval.confirmation_id) : undefined;
+        renderToolApprovalCard(el, persistedApproval, currentSessionId, resolution);
         return el;
       }
       // Valid card with resolved state -> inline interactive card (T6/T7).
@@ -1566,24 +1581,102 @@
       && typeof m.name === 'string' && m.name.indexOf('browser_') === 0);
   }
 
-  // 对话框标题：展示会话 ID。承接过浏览器工具调用时，在 ID 后缀 `(浏览器视图)`，
-  // 其中"浏览器视图"为指向 /browser/session 的链接。
-  function setHeader(id, hasBrowser) {
+  // 对话框标题：展示会话 ID，并按 links 后缀视图链接（浏览器视图/任务/定时任务）。
+  // 每段链接形如 ` (文本)`，文本为指向对应详情页的 _blank 链接。
+  function setHeader(id, links) {
+    links = links || {};
     const header = ui.byId('chat-header');
     if (!header) return;
     clearNode(header);
     if (!id) { header.textContent = 'N-Agent Chat'; return; }
     header.appendChild(document.createTextNode(id));
-    if (hasBrowser) {
-      header.appendChild(document.createTextNode(' ('));
-      const link = document.createElement('a');
-      link.textContent = '浏览器视图';
-      link.target = '_blank';
-      link.rel = 'noopener';
-      link.className = 'chat-browser-link';
-      link.href = '/browser/session?nagent=' + encodeURIComponent(id);
-      header.appendChild(link);
-      header.appendChild(document.createTextNode(')'));
+    if (links.browser) {
+      appendHeaderLink(header, '浏览器视图', '/browser/session?nagent=' + encodeURIComponent(id));
+    }
+    if (links.taskId) {
+      appendHeaderLink(header, '任务', '/tasks/' + encodeURIComponent(links.taskId));
+    }
+    if (links.scheduledTaskId) {
+      appendHeaderLink(header, '定时任务', '/scheduled-tasks/' + encodeURIComponent(links.scheduledTaskId));
+    }
+  }
+
+  function appendHeaderLink(header, text, href) {
+    header.appendChild(document.createTextNode(' ('));
+    const link = document.createElement('a');
+    link.textContent = text;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.className = 'chat-header-link';
+    link.href = href;
+    header.appendChild(link);
+    header.appendChild(document.createTextNode(')'));
+  }
+
+  // 会话视图链接缓存：按 sessionId 存最新 taskId/scheduledTaskId 与任务关联消息序号。
+  const sessionViewLinksCache = {};
+
+  // 任务关联消息数：source==='task' 或 role=system 且 name 以 ui.task 开头。
+  // 用于 4s 轮询时判定是否需要失效重拉任务链接。
+  function countTaskAssocMessages(detail) {
+    const msgs = Array.isArray(detail && detail.messages) ? detail.messages : [];
+    let n = 0;
+    for (const m of msgs) {
+      if (!m) continue;
+      if (m.source === 'task') { n++; continue; }
+      if (m.role === 'system' && typeof m.name === 'string' && m.name.indexOf('ui.task') === 0) n++;
+    }
+    return n;
+  }
+
+  function buildHeaderLinks(detail, sessionId) {
+    const cached = sessionId ? sessionViewLinksCache[sessionId] : null;
+    return {
+      browser: sessionHasBrowserTool(detail),
+      taskId: cached ? cached.taskId : null,
+      scheduledTaskId: cached ? cached.scheduledTaskId : null,
+    };
+  }
+
+  // 按 created_at 倒序取首条；空 created_at 视为最旧；并列时按 id 倒序稳定。
+  function latestByCreated(items) {
+    return items.slice().sort((a, b) => {
+      const ta = (a.created_at || '');
+      const tb = (b.created_at || '');
+      if (ta !== tb) return ta < tb ? 1 : -1;
+      return (a.id || '') < (b.id || '') ? 1 : -1;
+    })[0] || null;
+  }
+
+  // 拉取并缓存该会话关联的任务/定时任务最新 id；fire-and-forget，失败静默。
+  // 拉取完成后若仍是当前会话则增量刷新标题。
+  async function loadSessionViewLinks(sessionId, detail) {
+    if (!sessionId) return;
+    try {
+      const [boardResp, scheduled] = await Promise.all([
+        api.task.board(),
+        api.listScheduledTasks(),
+      ]);
+      const columns = (boardResp && boardResp.columns) || [];
+      const cards = [];
+      for (const col of columns) {
+        for (const c of (col.cards || [])) {
+          if (c && (c.origin_session_id === sessionId || c.execution_session_id === sessionId)) cards.push(c);
+        }
+      }
+      const latestTask = latestByCreated(cards);
+      const scheds = (Array.isArray(scheduled) ? scheduled : []).filter((s) => s && s.session_id === sessionId);
+      const latestSched = latestByCreated(scheds);
+      sessionViewLinksCache[sessionId] = {
+        taskId: latestTask ? latestTask.id : null,
+        scheduledTaskId: latestSched ? latestSched.id : null,
+        taskMsgSeq: countTaskAssocMessages(detail),
+      };
+      if (sessionId === currentSessionId) {
+        setHeader(sessionId, buildHeaderLinks(detail, sessionId));
+      }
+    } catch (e) {
+      // 静默降级：拉取失败不展示对应链接，不影响对话与其他链接。
     }
   }
 
@@ -1646,8 +1739,14 @@
     // Await state resolution + render before restoring scroll / updating info,
     // so clickable actions are not inserted mid-render.
     await renderSessionMessages(detail, { partial: options.partialMessages === true });
-    // 会话承接浏览器工具调用时，在标题的会话 ID 后缀 `(浏览器视图)` 链接。
-    if (currentSessionId) setHeader(currentSessionId, sessionHasBrowserTool(detail));
+    // 会话视图链接：浏览器视图实时判定；任务/定时任务用缓存，任务关联消息数变化时失效重拉。
+    if (currentSessionId) {
+      const cached = sessionViewLinksCache[currentSessionId];
+      const seq = countTaskAssocMessages(detail);
+      const invalidate = !cached || cached.taskMsgSeq !== seq;
+      setHeader(currentSessionId, buildHeaderLinks(detail, currentSessionId));
+      if (invalidate) loadSessionViewLinks(currentSessionId, detail);
+    }
     updateInfo(detail, { skipToolCalls: options.skipToolCalls });
     if (options.preserveScroll) restoreScroll(wasAtBottom, prevScrollTop);
     if (!options.skipSessionList) await loadSessions();
@@ -2488,6 +2587,7 @@
         if (v && typeof v === 'object' && !Array.isArray(v)) {
           map[sid] = {
             task: typeof v.task === 'boolean' ? v.task : DEBUG_DEFAULTS.task,
+            compression: typeof v.compression === 'boolean' ? v.compression : DEBUG_DEFAULTS.compression,
             tool: typeof v.tool === 'boolean' ? v.tool : DEBUG_DEFAULTS.tool,
           };
         }
@@ -2532,6 +2632,7 @@
     const s = getDebugSettings();
     el.classList.toggle('chat-debug--hide-tool', !s.tool);
     el.classList.toggle('chat-debug--hide-task', !s.task);
+    el.classList.toggle('chat-debug--hide-compression', !s.compression);
   }
 
   // 互斥：记忆与设置弹框同一时刻只能开一个，新开一个则收回另一个。
@@ -2630,6 +2731,7 @@
 
       const options = [
         { key: 'task', label: '任务状态' },
+        { key: 'compression', label: '对话压缩' },
         { key: 'tool', label: '工具调试' },
       ];
       const current = getDebugSettings();
@@ -2801,5 +2903,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload };
+  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload, setHeader, buildHeaderLinks, loadSessionViewLinks };
 }(window));

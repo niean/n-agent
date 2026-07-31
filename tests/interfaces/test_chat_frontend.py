@@ -44,9 +44,9 @@ def test_browser_result_link_uses_browser_session_path():
     tool-call card, and is only rendered when the session used a browser tool.
     """
     source = (STATIC_DIR / "chat.js").read_text(encoding="utf-8")
-    assert "link.href = '/browser/session?nagent='" in source
+    assert "'/browser/session?nagent=' + encodeURIComponent(id)" in source
     # 工具调用卡片不再渲染浏览器视图链接。
     assert "el.appendChild(link);" not in source
     # 会话承接浏览器工具调用时，标题的会话 ID 后缀 `(浏览器视图)` 链接。
     assert "function sessionHasBrowserTool(" in source
-    assert "setHeader(currentSessionId, sessionHasBrowserTool(detail))" in source
+    assert "buildHeaderLinks(detail, currentSessionId)" in source

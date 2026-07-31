@@ -583,9 +583,10 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 
 /* 调试设置按钮：复用记忆弹框 trigger/popover/option 样式，仅新增定位容器 */
 .chat-settings { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
-/* 调试显隐：设置弹框控制工具调用 / 任务状态卡片的可见性（按 data-debug-kind 标记） */
+/* 调试显隐：设置弹框控制工具调用 / 任务状态 / 对话压缩卡片的可见性（按 data-debug-kind 标记） */
 #chat-messages.chat-debug--hide-tool [data-debug-kind="tool"] { display: none; }
 #chat-messages.chat-debug--hide-task [data-debug-kind="task"] { display: none; }
+#chat-messages.chat-debug--hide-compression [data-debug-kind="compression"] { display: none; }
 
 .checkbox-list {
   display: grid;
@@ -830,6 +831,12 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .tasks-detail__body { white-space: pre-wrap; font-size: var(--font-size-md); color: var(--color-fg-default); background: var(--color-bg-muted, #f7f8fa); padding: 8px; border-radius: 6px; word-break: break-word; }
 .tasks-detail__list-item + .tasks-detail__list-item { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--color-border-light); }
 .tasks-error { color: #b91c1c; padding: 8px; }
+.tasks-detail-page { display: flex; flex-direction: column; gap: 0; }
+.tasks-detail-header { display: flex; align-items: center; gap: 12px; padding: 8px 0 16px; font-size: 13px; }
+.tasks-detail-header__back { color: var(--color-primary); text-decoration: none; }
+.tasks-detail-header__back:hover { text-decoration: underline; }
+.tasks-detail-header__sep { color: var(--color-border-default); }
+.tasks-detail-header__id { color: var(--color-fg-muted); }
 
 /* Host terminal (本机) dashboard - read-only; status/limits reuse security page
    .policy-cfg/.policy-item so similar key-value content shares the same FE style. */
@@ -869,5 +876,5 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .browser-actions-table th:nth-child(3), .browser-actions-table td:nth-child(3) { width: 18%; }
 .browser-actions-table th:nth-child(4), .browser-actions-table td:nth-child(4) { width: 12%; }
 .browser-actions-table th:nth-child(5), .browser-actions-table td:nth-child(5) { width: 29%; word-break: break-word; }
-.chat-browser-link { color: var(--color-primary, #2563eb); text-decoration: none; cursor: pointer; }
-.chat-browser-link:hover { color: var(--color-primary-strong, #0969da); text-decoration: none; }
+.chat-browser-link, .chat-header-link { color: var(--color-primary, #2563eb); text-decoration: none; cursor: pointer; }
+.chat-browser-link:hover, .chat-header-link:hover { color: var(--color-primary-strong, #0969da); text-decoration: none; }

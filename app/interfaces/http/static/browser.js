@@ -753,7 +753,7 @@
     table.className = 'document-table browser-history-table';
     const thead = document.createElement('thead');
     const headerRow = document.createElement('tr');
-    ['Session', '浏览器 Session', '操作次数', '状态', '最后操作', '操作'].forEach((label) => {
+    ['Session', '浏览器 Session', '类型', '操作次数', '状态', '最后操作', '操作'].forEach((label) => {
       const th = document.createElement('th');
       if (label === '操作次数') th.className = 'document-table__numeric';
       th.textContent = label;
@@ -768,6 +768,9 @@
         cell.textContent = value;
         row.appendChild(cell);
       });
+      const backendCell = document.createElement('td');
+      backendCell.textContent = backendLabel(entry.backend_type);
+      row.appendChild(backendCell);
       const actionCount = document.createElement('td');
       actionCount.className = 'document-table__numeric';
       actionCount.textContent = formatNumber(entry.action_count);
@@ -794,6 +797,7 @@
       (byNagent[nagentId] || []).map((session) => ({
         n_agent_session_id: nagentId,
         browser_session_id: session.id,
+        backend_type: session.backend_type,
         status: session.status,
         action_count: session.action_count,
         created_at: session.created_at,
