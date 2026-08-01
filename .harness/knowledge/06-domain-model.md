@@ -550,6 +550,11 @@ Skill 自进化是 Agent Runtime 对会话摘要的后台审查，把可复用�
 
 本地 Shell：terminal 工具在 Sandbox 子域执行（workspace 只读、scratch 可写、workdir 仅允许 scratch/workspace），详见 ## Sandbox 章节；host_terminal 走宿主子域独立 Policy。
 
+## Browser Use
+Container VNC：Chromium → Xvfb → x11vnc → noVNC → websockify → Dashboard。Chromium 运行在 Xvfb 提供的虚拟显示器中，Playwright 通过 CDP `9222` 执行 Agent 自动化动作；x11vnc 将该显示器发布为 VNC，noVNC 作为浏览器端 HTML5 VNC 客户端，websockify 负责把Dashboard浏览器 WebSocket 转换为 VNC TCP 流量。
+
+
+
 ---
 ---
 

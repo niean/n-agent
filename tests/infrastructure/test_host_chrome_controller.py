@@ -421,6 +421,10 @@ class RecordingDriver:
     def clear_last_screenshot(self) -> None:
         self._last_screenshot = None
 
+    async def sync_after_takeover(self) -> None:
+        self.thread_ids.append(threading.get_ident())
+        self._last_screenshot = self.screenshot
+
 
 class MultiChromium:
     def __init__(self) -> None:
@@ -620,6 +624,27 @@ def test_exact_action_conversion_and_complete_session(
         assert base64.b64decode(
             response["screenshot_base64"], validate=True
         ) == b"shot"
+        assert driver.thread_ids == [controller._owner_thread_id]
+    finally:
+        controller.shutdown()
+
+
+def test_takeover_release_syncs_driver_and_returns_fresh_screenshot(
+    tmp_path: Path,
+) -> None:
+    RecordingDriver.instances.clear()
+    controller, _ = _recording_controller(tmp_path)
+    try:
+        target = controller.create_target(PROFILE_REF)
+
+        screenshot = controller.sync_after_takeover(
+            target,
+            deadline_monotonic=time.monotonic() + 1,
+            cancel_event=threading.Event(),
+        )
+
+        driver = RecordingDriver.instances[0]
+        assert screenshot == b"shot"
         assert driver.thread_ids == [controller._owner_thread_id]
     finally:
         controller.shutdown()

@@ -125,8 +125,14 @@ def test_browser_mount_point_and_script_in_index_html():
 def test_browser_styles_in_styles_css():
     """styles.css has Browser Dashboard styles."""
     css = STYLES_CSS.read_text(encoding="utf-8")
-    assert "grid-template-columns: minmax(0, 1fr)" in css
-    assert ".browser-main, .browser-side { width: 100%; min-width: 0; }" in css
+    # 水平两列：实时视图 80% | 控制与历史 20%（4fr:1fr）；占满视口高度；窄屏堆叠为单列
+    assert "grid-template-columns: minmax(0, 4fr) minmax(0, 1fr)" in css
+    assert "align-items: stretch; min-height: calc(100vh - 90px)" in css
+    assert ".browser-main, .browser-side { width: 100%; min-width: 0; display: flex; flex-direction: column; margin-bottom: 0; }" in css
+    assert ".browser-main > .panel-body, .browser-side > .panel-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }" in css
+    assert "@media (max-width: 1100px) { .browser-shell { grid-template-columns: 1fr; min-height: 0; } }" in css
+    assert ".browser-screenshot-wrap { position: relative; flex: 0 0 auto; width: 100%; aspect-ratio: 16 / 9;" in css
+    assert ".browser-controls .btn { font-size: var(--font-size-md); }" in css
     for selector in (
         ".browser-shell",
         ".browser-main",
@@ -136,7 +142,6 @@ def test_browser_styles_in_styles_css():
         ".browser-takeover",
         ".browser-controls",
         ".browser-actions",
-        ".browser-poll-indicator",
     ):
         assert selector in css, f"styles.css missing {selector}"
 
@@ -164,16 +169,11 @@ def test_browser_js_has_control_matrix():
 
 def test_browser_js_takeover_view_not_in_localStorage():
     """browser.js source: takeover-view URL must not be written to localStorage.
-    Only POLL_KEY should use localStorage.setItem."""
+    Poll frequency is fixed at 1s; no localStorage.setItem calls remain."""
     src = BROWSER_JS.read_text(encoding="utf-8")
-    # Find all localStorage.setItem calls
     import re
     setitem_calls = re.findall(r'localStorage\.setItem\([^)]+\)', src)
-    assert len(setitem_calls) <= 1, f"expected at most 1 localStorage.setItem call, found {len(setitem_calls)}"
-    if setitem_calls:
-        # The only setItem call must be for POLL_KEY (poll interval)
-        assert "POLL_KEY" in setitem_calls[0] or "poll_ms" in setitem_calls[0], \
-            f"localStorage.setItem must only store poll interval, got: {setitem_calls[0]}"
+    assert len(setitem_calls) == 0, f"expected no localStorage.setItem calls, found {len(setitem_calls)}: {setitem_calls}"
 
 
 def test_browser_js_strips_query_fragment_from_url():

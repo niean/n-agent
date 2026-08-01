@@ -11,6 +11,12 @@ set -e
 echo "[entrypoint] starting container browser runtime"
 echo "[entrypoint] CDP_PORT=${CDP_PORT} NOVNC_PORT=${NOVNC_PORT} DISPLAY=${DISPLAY}"
 
+# Docker restart may replace PID 1 before an orphaned Xvfb child exits. It is
+# confined to this browser container; clear only this fixed display before
+# bringing the runtime back.
+pkill -f "Xvfb :99" 2>/dev/null || true
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # 1. Xvfb: virtual framebuffer (required for headed Chromium + VNC capture)
 # ---------------------------------------------------------------------------
@@ -41,54 +47,22 @@ NOVNC_PID=$!
 echo "[entrypoint] websockify/noVNC started on port ${NOVNC_PORT} (pid=${NOVNC_PID})"
 
 # ---------------------------------------------------------------------------
-# 4. Chromium: headed on Xvfb with remote debugging (CDP)
+# 4. Persistent profile runtime manager.  It launches one Chromium process
+# per opaque profile_ref, each with its own user-data-dir and CDP port.
 # ---------------------------------------------------------------------------
-# Headed mode (not --headless) so the browser renders to the Xvfb display,
-# enabling VNC/noVNC interactive takeover. Chromium 150 ignores
-# --remote-debugging-address and binds CDP to 127.0.0.1 only; socat exposes
-# it on the container network at ${CDP_PORT} by forwarding to an internal
-# port, so n-agent can reach http://browser:${CDP_PORT}. Compose does NOT
-# map the port to the host.
+# Headed mode (not --headless) so each profile renders to the Xvfb display.
+# The runtime starts a private socat forwarder per profile because Chromium
+# binds its CDP listener to loopback.
 export DISPLAY="${DISPLAY}"
-CDP_INTERNAL_PORT="${CDP_INTERNAL_PORT:-19222}"
-
-echo "[entrypoint] starting socat forwarder 0.0.0.0:${CDP_PORT} -> 127.0.0.1:${CDP_INTERNAL_PORT}"
-socat TCP-LISTEN:${CDP_PORT},fork,bind=0.0.0.0 TCP:127.0.0.1:${CDP_INTERNAL_PORT} &
-SOCAT_PID=$!
-
-CHROMIUM_FLAGS="--no-sandbox \
-    --remote-debugging-port=${CDP_INTERNAL_PORT} \
-    --user-data-dir=${CHROMIUM_USER_DATA_DIR} \
-    --disable-gpu \
-    --no-first-run \
-    --no-default-browser-check \
-    --disable-background-networking \
-    --disable-extensions \
-    --disable-sync \
-    --metrics-recording-only \
-    --mute-audio \
-    --disable-dev-shm-usage \
-    --disable-component-update \
-    --window-size=${SCREEN_WIDTH},${SCREEN_HEIGHT}"
-
-echo "[entrypoint] starting chromium with CDP on internal port ${CDP_INTERNAL_PORT}"
-
-# Remove stale Chromium singleton lock files left by a previous container
-# that did not shut down cleanly. Profile data (cookies/localStorage) persists;
-# only the lock/socket files are stale and safe to remove on a fresh start.
-rm -f "${CHROMIUM_USER_DATA_DIR}/SingletonLock" \
-      "${CHROMIUM_USER_DATA_DIR}/SingletonSocket" \
-      "${CHROMIUM_USER_DATA_DIR}/SingletonCookie" 2>/dev/null || true
-
-chromium ${CHROMIUM_FLAGS} &
-CHROMIUM_PID=$!
+python3 /app/profile_runtime.py &
+RUNTIME_PID=$!
 
 # ---------------------------------------------------------------------------
 # Health: wait for CDP to be ready
 # ---------------------------------------------------------------------------
 echo "[entrypoint] waiting for CDP endpoint ..."
 for i in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:${CDP_PORT}/json/version" >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:9223/health" >/dev/null 2>&1; then
         echo "[entrypoint] CDP endpoint ready"
         break
     fi
@@ -99,20 +73,21 @@ done
 # Keep running until any child process exits, then shut down cleanly.
 # ---------------------------------------------------------------------------
 cleanup() {
+    trap - TERM INT EXIT
     echo "[entrypoint] shutting down"
-    kill "${CHROMIUM_PID}" 2>/dev/null || true
+    kill "${RUNTIME_PID}" 2>/dev/null || true
     kill "${NOVNC_PID}" 2>/dev/null || true
     kill "${XVFB_PID}" 2>/dev/null || true
-    kill "${SOCAT_PID}" 2>/dev/null || true
-    wait 2>/dev/null || true
+    wait "${RUNTIME_PID}" "${NOVNC_PID}" "${XVFB_PID}" 2>/dev/null || true
 }
 
-trap cleanup TERM INT EXIT
+trap 'cleanup; exit 0' TERM INT
+trap cleanup EXIT
 
 # Wait for any child to exit (indicates a crash). POSIX sh compatible:
 # `wait -n` is bash-only and fails under `set -e` in dash.
 while true; do
-    for pid in "${CHROMIUM_PID}" "${NOVNC_PID}" "${XVFB_PID}" "${SOCAT_PID}"; do
+    for pid in "${RUNTIME_PID}" "${NOVNC_PID}" "${XVFB_PID}"; do
         if ! kill -0 "${pid}" 2>/dev/null; then
             echo "[entrypoint] child process ${pid} exited, shutting down"
             exit 1

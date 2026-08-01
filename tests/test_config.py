@@ -522,6 +522,7 @@ def test_settings_browser_defaults(tmp_path: Path):
     assert s.browser_enabled is False
     assert s.browser_default_backend == "container"
     assert s.browser_container_endpoint == ""
+    assert s.browser_container_novnc_endpoint == "http://browser:6080"
     assert s.browser_action_timeout == 30
     assert s.browser_navigation_timeout == 30
     assert s.browser_max_observe_chars == 4000

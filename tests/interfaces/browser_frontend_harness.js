@@ -42,7 +42,7 @@ function makeNode(tag) {
     get id() { return this._id; },
     appendChild(c) { this.children.push(c); return c; },
     append() { for (let i = 0; i < arguments.length; i++) this.children.push(arguments[i]); },
-    replaceChildren() { this.children = []; },
+    replaceChildren() { this.children = []; for (let i = 0; i < arguments.length; i++) this.children.push(arguments[i]); },
     addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
     setAttribute(k, v) { if (k === 'sandbox') this._sandbox = v; },
     remove() { this._removed = true; },
@@ -232,8 +232,14 @@ async function testSourceSafety() {
   ok(code.indexOf('onclick=') === -1, 'source: no inline onclick');
   // textContent must be used for safe rendering
   ok(code.indexOf('textContent') !== -1, 'source: uses textContent');
-  // Only poll_ms stored in localStorage
-  ok(code.indexOf('POLL_KEY') !== -1, 'source: uses POLL_KEY for localStorage');
+  // 频率控件已移除：固定 1s 轮询，不再持久化到 localStorage
+  ok(code.indexOf('DEFAULT_POLL_MS = 1000') !== -1, 'source: fixed 1s poll interval');
+  ok(code.indexOf('POLL_KEY') === -1, 'source: no POLL_KEY localStorage persistence');
+  // 手动刷新按钮已移除：侧栏由轮询定时器按状态变化自动驱动局部刷新
+  ok(code.indexOf('browser-side-refresh') === -1, 'source: manual side refresh button removed');
+  ok(code.indexOf('refreshSector') === -1, 'source: refreshSector handler removed');
+  ok(code.indexOf('controlSignature') !== -1, 'source: control signature gates side refresh');
+  ok(code.indexOf('renderSidePartial') !== -1, 'source: partial side render avoids flicker');
 }
 
 async function testInitRendersDetailWithoutSessionSelector() {
@@ -316,9 +322,10 @@ async function testSelectRendersMainView() {
 
   const mainBody = byId['browser-main-body'];
   ok(!!mainBody, 'main body rendered');
-  // status badge
+  // status shown in the panel title (实时视图(运行中|容器))
+  const mainTitle = byId['browser-main-title'];
+  ok(!!mainTitle && mainTitle.textContent.indexOf('运行中') !== -1, 'main title shows active status');
   const texts = allTexts(mainBody).join('|');
-  ok(texts.indexOf('运行中') !== -1, 'main shows active status');
   // screenshot img
   const imgs = mainBody.children.filter((c) => c.className === 'browser-screenshot-wrap');
   ok(imgs.length === 1, 'screenshot wrap rendered');
@@ -339,8 +346,10 @@ async function testSelectRendersMainView() {
   const sideTexts = allTexts(sideBody).join('|');
   ok(sideTexts.indexOf('navigate') !== -1, 'action history shows action type');
   ok(sideTexts.indexOf('click') !== -1, 'action history shows latest action');
-  ok(findByClass(sideBody, 'browser-actions-table').length === 1,
-    'action history uses the standard document table');
+  ok(findByClass(sideBody, 'browser-actions-list').length === 1,
+    'action history uses a compact list suited to the narrow side column');
+  ok(findByClass(sideBody, 'browser-actions-item').length === 2,
+    'action history renders one item per action');
 }
 
 async function testControlMatrixByStatus() {
@@ -376,7 +385,7 @@ async function testControlMatrixByStatus() {
     for (const expected of tc.expected) {
       ok(labels.indexOf(expected) !== -1, 'status ' + tc.status + ' shows button: ' + expected + ' (got: ' + labels.join(',') + ')');
     }
-    // Check no unexpected buttons (besides poll select which is a <select> not button)
+    // Check no unexpected buttons in the side body
     for (const label of labels) {
       ok(tc.expected.indexOf(label) !== -1, 'status ' + tc.status + ' has no unexpected button: ' + label);
     }
@@ -402,6 +411,7 @@ async function testPollingStartsAndStops() {
   // Polling started: at least 1 getSession call (from initial pollTick)
   ok(getSessionCount >= 1, 'polling triggered getSession, count=' + getSessionCount);
   ok(activeIntervals.length === 1, '1 active interval after init, got ' + activeIntervals.length);
+  ok(activeIntervals[0].ms === 1000, 'polling fixed at 1s, got ' + activeIntervals[0].ms);
 
   // deactivate stops polling
   ctx.NAGENT.browser.deactivate();
@@ -453,11 +463,13 @@ async function testPollingRefreshesOnlyRealtimeViewAndPreservesFocus() {
   await tickN(8);
 
   const sideBody = byId['browser-side-body'];
+  ok(!byId['browser-side-refresh'], 'manual refresh button removed from side panel');
   const sideContent = sideBody.children[0];
-  const pollSelect = findByClass(byId['tab-browser'], 'browser-poll-select')[0];
-  pollSelect.focus();
+  // Focus a control button to verify polling leaves non-realtime focus alone.
+  const pauseBtn = findButtons(sideBody).find((b) => b.textContent === '暂停');
+  ok(!!pauseBtn, 'pause control button present for focus test');
+  pauseBtn.focus();
   const mainBody = byId['browser-main-body'];
-  const statusBar = findByClass(mainBody, 'browser-status-bar')[0];
   const screenshotWrap = findByClass(mainBody, 'browser-screenshot-wrap')[0];
   const screenshot = screenshotWrap.children.find((child) => child.tag === 'img');
   const firstScreenshotSrc = screenshot.src;
@@ -465,19 +477,107 @@ async function testPollingRefreshesOnlyRealtimeViewAndPreservesFocus() {
   await tickN(4);
 
   ok(getSessionCalls >= 2, 'polling refreshes the realtime view');
-  ok(actionListCalls === 1, 'polling does not refresh action history');
+  // Action history is polled every tick so new actions are detected, but with
+  // status and actions unchanged the side panel is NOT re-rendered.
+  ok(actionListCalls >= 2, 'polling fetches action history each tick');
   ok(byId['browser-side-body'] === sideBody && sideBody.children[0] === sideContent,
-    'polling leaves the side panel DOM untouched');
-  ok(document.activeElement === pollSelect,
+    'polling leaves the side panel DOM untouched when signatures are unchanged');
+  ok(document.activeElement === pauseBtn,
     'polling preserves focus in controls outside the realtime view');
-  ok(byId['browser-main-body'] === mainBody
-      && findByClass(mainBody, 'browser-status-bar')[0] === statusBar,
+  ok(byId['browser-main-body'] === mainBody,
     'polling keeps the realtime view shell stable');
   ok(findByClass(mainBody, 'browser-screenshot-wrap')[0] === screenshotWrap
       && screenshotWrap.children.find((child) => child.tag === 'img') === screenshot,
     'polling updates the existing screenshot without replacing its DOM');
   ok(screenshot.src !== firstScreenshotSrc,
     'polling cache-busts the existing screenshot source');
+}
+
+async function testPollingRefreshesSideOnStatusChange() {
+  // The side panel has no manual refresh button: it is auto-driven by the
+  // realtime-view poll timer. When the browser task status changes, the
+  // controls are partially rebuilt; the action-history node is reused when
+  // its content is unchanged (no flicker).
+  let getSessionCalls = 0;
+  let actionListCalls = 0;
+  const api = {
+    listSessions: () => Promise.resolve([makeNSession('nagent-1')]),
+    browser: {
+      listSessions: () => Promise.resolve({ sessions: [makeBrowserSession('bsess-1', 'nagent-1', 'active')] }),
+      getSession: () => {
+        getSessionCalls++;
+        const status = getSessionCalls === 1 ? 'active' : 'paused';
+        return Promise.resolve(makeSessionDetail('bsess-1', 'nagent-1', status));
+      },
+      listActions: () => { actionListCalls++; return Promise.resolve({ actions: makeActions(), next_cursor: null }); },
+      getTakeoverView: () => Promise.resolve(makeTakeoverView()),
+      write: () => Promise.resolve({ ok: true }),
+    },
+  };
+  freshEnv(api).NAGENT.browser.init();
+  await tickN(8);
+
+  // Initial poll: active status -> pause/takeover/close controls.
+  let labels = findButtons(byId['browser-side-body']).map((b) => b.textContent).filter((l) => l && l !== '×');
+  ok(labels.indexOf('暂停') !== -1, 'active status shows pause control');
+  ok(labels.indexOf('恢复') === -1, 'active status does not show resume');
+  const actionsNodeBefore = findByClass(byId['browser-side-body'], 'browser-actions')[0];
+  ok(actionListCalls === 1, 'actions fetched once on initial load');
+
+  // Next poll: status changed to paused -> controls rebuilt (resume, no pause).
+  activeIntervals[0].fn();
+  await tickN(6);
+
+  labels = findButtons(byId['browser-side-body']).map((b) => b.textContent).filter((l) => l && l !== '×');
+  ok(labels.indexOf('恢复') !== -1, 'paused status shows resume after status-driven refresh');
+  ok(labels.indexOf('暂停') === -1, 'pause control gone after status change');
+  ok(actionListCalls === 2, 'action history fetched on each poll');
+  // makeActions() is stable -> action signature unchanged -> history node reused.
+  const actionsNodeAfter = findByClass(byId['browser-side-body'], 'browser-actions')[0];
+  ok(actionsNodeAfter === actionsNodeBefore,
+    'action history node reused when only controls changed (no flicker)');
+}
+
+async function testPollingRefreshesActionHistoryOnNewAction() {
+  // New actions arrive while status is unchanged: the action history
+  // auto-refreshes (signature changed) and only the history section is rebuilt,
+  // leaving the controls node untouched.
+  let call = 0;
+  const api = {
+    listSessions: () => Promise.resolve([makeNSession('nagent-1')]),
+    browser: {
+      listSessions: () => Promise.resolve({ sessions: [makeBrowserSession('bsess-1', 'nagent-1', 'active')] }),
+      getSession: () => Promise.resolve(makeSessionDetail('bsess-1', 'nagent-1', 'active')),
+      listActions: () => {
+        call++;
+        // Second poll appends a new action to the history.
+        const actions = call === 1 ? makeActions() : makeActions().concat([{
+          id: 'act-3', action_type: 'type', status: 'success', safe_url: 'https://example.com/page',
+          title: 'Example Page', duration_ms: 80, created_at: '2026-07-27T10:06:00+00:00', error_code: null,
+        }]);
+        return Promise.resolve({ actions, next_cursor: null });
+      },
+      getTakeoverView: () => Promise.resolve(makeTakeoverView()),
+      write: () => Promise.resolve({ ok: true }),
+    },
+  };
+  freshEnv(api).NAGENT.browser.init();
+  await tickN(8);
+
+  const sideBody = byId['browser-side-body'];
+  let items = findByClass(sideBody, 'browser-actions-item');
+  ok(items.length === 2, 'initial history shows 2 actions, got ' + items.length);
+  const controlsNodeBefore = findByClass(sideBody, 'browser-controls')[0];
+
+  // Next poll: status unchanged, but a new action appeared -> history rebuilds.
+  activeIntervals[0].fn();
+  await tickN(6);
+
+  items = findByClass(sideBody, 'browser-actions-item');
+  ok(items.length === 3, 'action history auto-refreshes to 3 actions, got ' + items.length);
+  const controlsNodeAfter = findByClass(sideBody, 'browser-controls')[0];
+  ok(controlsNodeAfter === controlsNodeBefore,
+    'controls node reused when only action history changed (no flicker)');
 }
 
 async function testScreenshotRecoversAfterInitialLoadError() {
@@ -585,6 +685,37 @@ async function testWriteActionSendsChallengeHeader() {
   }
 }
 
+async function testReleaseRestartsRealtimePolling() {
+  let released = false;
+  let getSessionCalls = 0;
+  const api = {
+    listSessions: () => Promise.resolve([makeNSession('nagent-1')]),
+    browser: {
+      listSessions: () => Promise.resolve({ sessions: [makeBrowserSession('bsess-1', 'nagent-1', 'takeover')] }),
+      getSession: () => {
+        getSessionCalls++;
+        return Promise.resolve(makeSessionDetail('bsess-1', 'nagent-1', released ? 'active' : 'takeover'));
+      },
+      listActions: () => Promise.resolve({ actions: makeActions(), next_cursor: null }),
+      getTakeoverView: () => Promise.resolve(makeTakeoverView()),
+      write: () => { released = true; return Promise.resolve({ ok: true }); },
+    },
+  };
+  const ctx = freshEnv(api);
+  ctx.NAGENT.browser.init();
+  await tickN(8);
+  const release = findButtons(byId['browser-side-body']).find((b) => b.textContent === '释放');
+  ok(!!release, 'release button found');
+  if (!release) return;
+  (release._listeners.click || []).forEach((fn) => fn());
+  await tickN(8);
+  const callsAfterRelease = getSessionCalls;
+  activeIntervals.forEach((entry) => entry.fn());
+  await tickN(5);
+  ok(getSessionCalls > callsAfterRelease,
+    'release starts a fresh polling generation for later agent updates');
+}
+
 async function testSafeUrlStripsQueryAndFragment() {
   const api = {
     listSessions: () => Promise.resolve([makeNSession('nagent-1')]),
@@ -641,6 +772,38 @@ async function testClosedStatusNoScreenshot() {
   }
 }
 
+async function testMainTitleShowsStatusAndBackend() {
+  // 标题形如 实时视图(状态|后端)；无会话时回退为 实时视图
+  const cases = [
+    { status: 'active', backend: 'container', expected: '实时视图(运行中|容器)' },
+    { status: 'closed', backend: 'host_cdp', expected: '实时视图(已关闭|本机)' },
+    { status: 'takeover', backend: 'host_cdp', expected: '实时视图(已接管|本机)' },
+    { status: 'paused', backend: 'container', expected: '实时视图(已暂停|容器)' },
+  ];
+  for (const tc of cases) {
+    const api = {
+      listSessions: () => Promise.resolve([makeNSession('nagent-1')]),
+      browser: {
+        listSessions: () => Promise.resolve({ sessions: [makeBrowserSession('bsess-1', 'nagent-1', tc.status, tc.backend)] }),
+        getSession: () => Promise.resolve(makeSessionDetail('bsess-1', 'nagent-1', tc.status, tc.backend)),
+        listActions: () => Promise.resolve({ actions: makeActions(), next_cursor: null }),
+        getTakeoverView: () => Promise.resolve(makeTakeoverView()),
+        write: () => Promise.resolve({ ok: true }),
+      },
+    };
+    const ctx = freshEnv(api);
+    ctx.NAGENT.browser.init();
+    await tickN(8);
+    const title = byId['browser-main-title'];
+    ok(!!title, 'main title node present for ' + tc.status + '/' + tc.backend);
+    if (title) {
+      ok(title.textContent === tc.expected,
+        'title shows status|backend for ' + tc.status + '/' + tc.backend
+        + '; got "' + title.textContent + '" expected "' + tc.expected + '"');
+    }
+  }
+}
+
 async function main() {
   await testSourceSafety();
   await testInitRendersDetailWithoutSessionSelector();
@@ -650,11 +813,15 @@ async function main() {
   await testPollingStartsAndStops();
   await testPollingStopsWhenSessionCloses();
   await testPollingRefreshesOnlyRealtimeViewAndPreservesFocus();
+  await testPollingRefreshesSideOnStatusChange();
+  await testPollingRefreshesActionHistoryOnNewAction();
   await testScreenshotRecoversAfterInitialLoadError();
   await testTakeoverViewUrlNotInLocalStorage();
   await testWriteActionSendsChallengeHeader();
+  await testReleaseRestartsRealtimePolling();
   await testSafeUrlStripsQueryAndFragment();
   await testClosedStatusNoScreenshot();
+  await testMainTitleShowsStatusAndBackend();
 
   if (failures) { console.error(failures + ' failure(s)'); process.exit(1); }
   console.log('OK browser frontend harness passed');

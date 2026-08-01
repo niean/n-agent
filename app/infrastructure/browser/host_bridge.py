@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from contextlib import contextmanager
+import base64
 import hmac
 import math
 import os
@@ -131,6 +132,14 @@ class CdpTargetController(Protocol):
         deadline_monotonic: float,
         cancel_event: threading.Event,
     ) -> dict[str, Any]: ...
+
+    def sync_after_takeover(
+        self,
+        target_id: str,
+        *,
+        deadline_monotonic: float,
+        cancel_event: threading.Event,
+    ) -> bytes | None: ...
 
     def shutdown(self) -> bool: ...
 
@@ -856,7 +865,17 @@ class HostBridge:
                 raise _BridgeDenied("grant_expired")
         if path == "/v1/browser/session/takeover/begin":
             return {"status": "ok", "takeover_url": None}
-        return {"status": "ok"}
+        screenshot = self._cdp.sync_after_takeover(
+            registered.target_id,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        )
+        if screenshot is None:
+            return {"status": "ok"}
+        return {
+            "status": "ok",
+            "screenshot_base64": base64.b64encode(screenshot).decode("ascii"),
+        }
 
     def _load_authorization(
         self, session_id: str

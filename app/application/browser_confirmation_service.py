@@ -31,6 +31,14 @@ class _ChallengeRecord:
     consumed: bool = False
 
 
+@dataclass(frozen=True)
+class _CapabilityRecord:
+    browser_session_id: str
+    n_agent_session_id: str
+    actor_id: str
+    expires_at: datetime
+
+
 class BrowserConfirmationService:
     """In-memory one-time confirmation challenge issuer.
 
@@ -47,6 +55,7 @@ class BrowserConfirmationService:
             raise ValueError("ttl_seconds must be positive")
         self._ttl_seconds = ttl_seconds
         self._store: dict[str, _ChallengeRecord] = {}
+        self._capabilities: dict[str, _CapabilityRecord] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -132,6 +141,70 @@ class BrowserConfirmationService:
             self._store.pop(token, None)
         return True
 
+    def issue_capability(
+        self,
+        browser_session_id: str,
+        n_agent_session_id: str,
+        actor_id: str,
+    ) -> str:
+        """Issue a reusable, short-lived takeover-view capability.
+
+        Unlike write challenges, a view capability must authorize the noVNC
+        document, its static assets, and its WebSocket for the same browser
+        session. It remains fully bound and is revoked on release/close.
+        """
+        if not browser_session_id or not n_agent_session_id or not actor_id:
+            raise ValueError("all bind fields are required")
+        token = secrets.token_urlsafe(32)
+        record = _CapabilityRecord(
+            browser_session_id=browser_session_id,
+            n_agent_session_id=n_agent_session_id,
+            actor_id=actor_id,
+            expires_at=datetime.now(timezone.utc)
+            + timedelta(seconds=self._ttl_seconds),
+        )
+        with self._lock:
+            self._capabilities[token] = record
+        return token
+
+    def validate_capability(
+        self,
+        token: str,
+        browser_session_id: str,
+        n_agent_session_id: str,
+        actor_id: str,
+    ) -> bool:
+        with self._lock:
+            record = self._capabilities.get(token)
+            if record is None:
+                return False
+            if datetime.now(timezone.utc) >= record.expires_at:
+                self._capabilities.pop(token, None)
+                return False
+            return (
+                record.browser_session_id == browser_session_id
+                and record.n_agent_session_id == n_agent_session_id
+                and record.actor_id == actor_id
+            )
+
+    def resolve_capability(
+        self, token: str, browser_session_id: str, actor_id: str
+    ) -> str | None:
+        """Resolve a capability to its bound N-Agent session without leaking it."""
+        with self._lock:
+            record = self._capabilities.get(token)
+            if record is None:
+                return None
+            if datetime.now(timezone.utc) >= record.expires_at:
+                self._capabilities.pop(token, None)
+                return None
+            if (
+                record.browser_session_id != browser_session_id
+                or record.actor_id != actor_id
+            ):
+                return None
+            return record.n_agent_session_id
+
     # ------------------------------------------------------------------
     # revoke_for_session
     # ------------------------------------------------------------------
@@ -146,6 +219,13 @@ class BrowserConfirmationService:
             ]
             for token in to_remove:
                 self._store.pop(token, None)
+            capability_tokens = [
+                token
+                for token, record in self._capabilities.items()
+                if record.browser_session_id == browser_session_id
+            ]
+            for token in capability_tokens:
+                self._capabilities.pop(token, None)
 
     # ------------------------------------------------------------------
     # cleanup / introspection (test helpers)
@@ -162,7 +242,14 @@ class BrowserConfirmationService:
             ]
             for token in to_remove:
                 self._store.pop(token, None)
-        return len(to_remove)
+            expired_capabilities = [
+                token
+                for token, record in self._capabilities.items()
+                if now >= record.expires_at
+            ]
+            for token in expired_capabilities:
+                self._capabilities.pop(token, None)
+        return len(to_remove) + len(expired_capabilities)
 
     def outstanding_count(self) -> int:
         with self._lock:

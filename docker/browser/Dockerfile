@@ -11,7 +11,7 @@ ENV TZ=Asia/Shanghai \
     VNC_PORT=5900 \
     CHROMIUM_USER_DATA_DIR=/data/profiles \
     SCREEN_WIDTH=1280 \
-    SCREEN_HEIGHT=720 \
+    SCREEN_HEIGHT=960 \
     SCREEN_DEPTH=24
 
 RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
@@ -44,15 +44,16 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple playw
 RUN mkdir -p /data/profiles
 
 COPY entrypoint.sh /app/entrypoint.sh
+COPY profile_runtime.py /app/profile_runtime.py
 RUN chmod +x /app/entrypoint.sh
 
 WORKDIR /app
 
-# CDP (9222) and noVNC (6080) are exposed on the container network only.
+# Profile manager (9223) and noVNC (6080) are exposed on the container network only.
 # Compose must NOT map these to host ports.
-EXPOSE 9222 6080
+EXPOSE 9223 6080
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=6 --start-period=15s \
-    CMD curl -fsS "http://127.0.0.1:${CDP_PORT}/json/version" || exit 1
+    CMD curl -fsS "http://127.0.0.1:9223/health" || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]

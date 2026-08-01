@@ -251,12 +251,31 @@ class PlaywrightBrowserBackend:
         self._browser = await self._playwright.chromium.launch(headless=True)
         self._page = await self._browser.new_page()
 
-    def attach_page(self, page: Any) -> None:
-        """Inject a page implementing :class:`PageProtocol` (for tests)."""
+    def attach_page(self, page: Any, *, document_revision: int = 0) -> None:
+        """Attach a page and establish its canonical document revision.
+
+        A persistent Chromium profile can outlive the CDP client that drives
+        it.  In that case the service's registry remains the authority for
+        ``document_revision``; resetting it here would make freshly observed
+        element references look stale after a reconnect.
+        """
+        if type(document_revision) is not int or document_revision < 0:
+            raise ValueError("document_revision_invalid")
         self._page = page
-        self._document_revision = 0
+        self._document_revision = document_revision
         self._index = _ElementIndex()
         self._last_screenshot = None
+
+    def restore_document_revision(self, document_revision: int) -> None:
+        """Synchronize a reconnected driver with the service's revision.
+
+        The element index is deliberately discarded: references generated
+        before a browser/CDP reconnect must never be reused.
+        """
+        if type(document_revision) is not int or document_revision < 0:
+            raise ValueError("document_revision_invalid")
+        self._document_revision = document_revision
+        self._index.reset()
 
     @property
     def page(self) -> Any | None:
@@ -271,6 +290,19 @@ class PlaywrightBrowserBackend:
     def clear_last_screenshot(self) -> None:
         """Clear the ephemeral screenshot side channel for the next action."""
         self._last_screenshot = None
+
+    async def sync_after_takeover(self) -> None:
+        """Invalidate pre-takeover element refs and capture the live page.
+
+        A human can navigate or mutate the document through VNC without going
+        through execute_action(), so the normal revision/screenshot hooks do
+        not run. Release establishes a new automation boundary explicitly.
+        """
+        if self._page is None:
+            self._last_screenshot = None
+            return
+        self._on_main_document_replaced()
+        await self._capture_dashboard_screenshot()
 
     # ------------------------------------------------------------------
     # Document-revision tracking (called by navigate / redirect hooks)

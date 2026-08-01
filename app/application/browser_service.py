@@ -323,6 +323,30 @@ class BrowserService:
             if fresh is not None:
                 session = fresh
 
+            backend = self._backends.get(session.backend_type)
+            if backend is None:
+                return BrowserActionResult(
+                    action_type=type(action).__name__.replace("Action", "").lower(),
+                    status="error",
+                    error_code="backend_unavailable",
+                    document_revision=session.document_revision,
+                )
+
+            # Reattach and align before checking element_ref revisions. A
+            # persistent browser may have restarted while this service and
+            # its durable registry remained alive.
+            try:
+                await self._reattach_backend_if_needed(backend, session)
+                await self._sync_backend_document_revision(backend, session)
+            except Exception:
+                logger.warning("browser backend reattach failed for session=%s", session.id, exc_info=True)
+                return BrowserActionResult(
+                    action_type=type(action).__name__.replace("Action", "").lower(),
+                    status="error",
+                    error_code="backend_unavailable",
+                    document_revision=session.document_revision,
+                )
+
             # Stale element_ref check (before policy/backend).
             stale = self._check_stale_ref(session, action)
             if stale is not None:
@@ -368,15 +392,6 @@ class BrowserService:
                     action_type=type(action).__name__.replace("Action", "").lower(),
                     status="error",
                     error_code=decision.reason or "takeover_requires_approval",
-                    document_revision=session.document_revision,
-                )
-
-            backend = self._backends.get(session.backend_type)
-            if backend is None:
-                return BrowserActionResult(
-                    action_type=type(action).__name__.replace("Action", "").lower(),
-                    status="error",
-                    error_code="backend_unavailable",
                     document_revision=session.document_revision,
                 )
 
@@ -486,6 +501,8 @@ class BrowserService:
                 latest_screenshot_ref=None,
             )
         try:
+            await self._reattach_backend_if_needed(backend, session)
+            await self._sync_backend_document_revision(backend, session)
             state = await backend.get_state(session.id)
             return replace(state, latest_screenshot_ref=self._latest_screenshot_ref.get(session.id))
         except Exception:
@@ -544,6 +561,8 @@ class BrowserService:
                 latest_screenshot_ref=None,
             )
         try:
+            await backend.create_session(session)
+            await self._sync_backend_document_revision(backend, session)
             state = await backend.get_state(session.id)
             return replace(state, latest_screenshot_ref=self._latest_screenshot_ref.get(session.id))
         except Exception:
@@ -563,6 +582,20 @@ class BrowserService:
         if session is None:
             return []
         return await self._registry.list_actions(browser_session_id, limit)
+
+    async def _reattach_backend_if_needed(self, backend: Any, session: BrowserSession) -> None:
+        """Reattach durable Container sessions after the app process restarts."""
+        has_session = getattr(backend, "has_session", None)
+        if callable(has_session) and not has_session(session.id):
+            await backend.create_session(session)
+
+    async def _sync_backend_document_revision(
+        self, backend: Any, session: BrowserSession
+    ) -> None:
+        """Ask persistent backends to use the registry's revision authority."""
+        sync_revision = getattr(backend, "sync_document_revision", None)
+        if callable(sync_revision):
+            await sync_revision(session.id, session.document_revision)
 
     async def count_actions_for_session(self, browser_session_id: str) -> int:
         """Return the complete action count for a browser session."""
@@ -635,7 +668,35 @@ class BrowserService:
             if decision.outcome is not PolicyOutcome.ALLOW:
                 return False
             target = session.pre_takeover_status or BrowserSessionStatus.ACTIVE
-            return await self._transition_locked(session, target)
+            backend = self._backends.get(session.backend_type)
+            # A human takeover bypasses execute_action(), so refresh the
+            # backend's revision/screenshot side channel before Dashboard
+            # polling resumes. Never keep showing the pre-takeover frame if
+            # refresh fails.
+            self._latest_screenshot_ref.pop(session.id, None)
+            if backend is not None:
+                try:
+                    await backend.end_takeover(session.id)
+                    await self._persist_screenshot(
+                        session,
+                        backend,
+                        BrowserActionResult(
+                            action_type="takeover_release",
+                            status="success",
+                            document_revision=session.document_revision + 1,
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "browser takeover release sync failed for session=%s",
+                        session.id,
+                        exc_info=True,
+                    )
+            return await self._transition_locked(
+                session,
+                target,
+                document_revision=session.document_revision + 1,
+            )
 
     async def close_session(self, n_agent_session_id: str) -> bool:
         session = await self._find_session(n_agent_session_id)
@@ -851,7 +912,11 @@ class BrowserService:
             return await self._transition_locked(session, target)
 
     async def _transition_locked(
-        self, session: BrowserSession, target: BrowserSessionStatus
+        self,
+        session: BrowserSession,
+        target: BrowserSessionStatus,
+        *,
+        document_revision: int | None = None,
     ) -> bool:
         if not session.can_transition_to(target):
             return False
@@ -874,6 +939,7 @@ class BrowserService:
                 session.status,
                 target,
                 pre_takeover_status=None,
+                document_revision=document_revision,
             )
         else:
             updated = await self._registry.compare_and_set_status(

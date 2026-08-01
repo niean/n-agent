@@ -173,15 +173,35 @@ def test_current_machine_compose_adds_host_bridge_wiring_without_forcing_backend
         == "${N_AGENT_BROWSER_TRUSTED_DEV:-false}"
     )
     assert "N_AGENT_BROWSER_DEFAULT_BACKEND" not in environment
+    assert (
+        environment["N_AGENT_BROWSER_CONTAINER_NOVNC_ENDPOINT"]
+        == "${N_AGENT_BROWSER_CONTAINER_NOVNC_ENDPOINT:-http://browser:6080}"
+    )
     assert _host_browser_token_mount(service).endswith(":ro")
-
     browser = document["services"]["browser"]
     assert browser["networks"] == {
         "default": {"ipv4_address": "172.19.0.10"}
     }
-    assert browser["expose"] == ["9222", "6080"]
+    assert browser["expose"] == ["9223", "6080"]
     assert "ports" not in browser
 
+
+def test_container_browser_uses_4_by_3_viewport():
+    """Container Xvfb and Chromium use a 1280x960 viewport."""
+    document = _load_compose("docker-compose.yml")
+    browser = document["services"]["browser"]
+    assert browser["environment"]["SCREEN_WIDTH"] == 1280
+    assert browser["environment"]["SCREEN_HEIGHT"] == 960
+
+    browser_dockerfile = (DOCKER_DIR / "browser" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    runtime = (DOCKER_DIR / "browser" / "profile_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    assert "SCREEN_WIDTH=1280" in browser_dockerfile
+    assert "SCREEN_HEIGHT=960" in browser_dockerfile
+    assert 'HEIGHT = os.environ.get("SCREEN_HEIGHT", "960")' in runtime
 
 @pytest.mark.parametrize(
     "compose_name", ["docker-compose.yml", "docker-compose.yml.example"]

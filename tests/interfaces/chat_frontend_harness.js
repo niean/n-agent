@@ -1046,6 +1046,34 @@ async function runIntegration() {
 })();
 
 // ===========================================================================
+// Browser screenshot tool result: only the canonical successful envelope may
+// create a chat screenshot preview. Failed/malformed results remain ordinary
+// tool-debug output and never trigger an image fetch.
+// ===========================================================================
+(function testBrowserScreenshotRecognition() {
+  const env = loadChat();
+  ok(typeof env.chat.isSuccessfulBrowserScreenshot === 'function', 'browser screenshot recognizer exposed');
+  const success = JSON.stringify({
+    name: 'browser_screenshot', status: 'success',
+    content: { action_type: 'screenshot', status: 'success', screenshot_captured: true },
+  });
+  ok(env.chat.isSuccessfulBrowserScreenshot(success) === true, 'recognizes successful browser screenshot result');
+  ok(env.chat.isSuccessfulBrowserScreenshot([JSON.stringify({ name: 'calculator', status: 'success', content: { screenshot_captured: true } }), success]) === true,
+    'recognizes screenshot inside grouped tool messages');
+  ok(env.chat.isSuccessfulBrowserScreenshot(JSON.stringify({
+    name: 'browser_screenshot', status: 'error',
+    content: { action_type: 'screenshot', status: 'error', screenshot_captured: true },
+  })) === false, 'does not render failed screenshot result');
+  ok(env.chat.isSuccessfulBrowserScreenshot('{invalid') === false, 'does not render malformed tool payload');
+
+  const screenshotCard = env.chat.createMessageElement({
+    role: 'tool', content: success,
+  });
+  ok(!screenshotCard.dataset.debugKind,
+    'successful screenshot is visible even when tool-debug cards are hidden');
+})();
+
+// ===========================================================================
 // T6/T7: task card interaction (validate / state-resolve / group / render / action)
 // ===========================================================================
 async function testTaskCardInteraction() {
@@ -1994,6 +2022,34 @@ async function testToolApprovalCard() {
     const allDescs = findDescendants(container, () => true);
     ok(!allDescs.some((n) => n.tagName === 'IMG' || n.tagName === 'SCRIPT'), 'XSS: no IMG/SCRIPT created (textContent only)');
     ok(container.textContent.indexOf(xss) !== -1, 'XSS: payload preserved as text');
+
+    console.error("MARKER_TZ_TEST_REACHED");
+    // --- expires_at rendered in UTC+8 (Asia/Shanghai), not raw UTC ---
+    // 服务端 expires_at 为 UTC RFC 3339（trailing Z），前端须按项目规范转 UTC+8 展示。
+    const tzCard = env.win.document.createElement('div');
+    env.chat.renderToolApprovalCard(tzCard, {
+      confirmation_id: 'tz1', tool_name: 'browser.click', description: '点击',
+      arguments_summary: '{}', expires_at: '2026-07-28T12:00:00Z',
+    }, 'sess-tz');
+    const tzExpires = findByClass(findByClass(tzCard, 'tool-approval-card')[0], 'tool-approval-card__expires');
+    ok(tzExpires[0].textContent === '过期时间: 2026-07-28 20:00:00',
+      'expires_at rendered in UTC+8 (got "' + tzExpires[0].textContent + '")');
+    // 非法日期回退为原文字符串（textContent 安全渲染，不使用 innerHTML）。
+    const badCard = env.win.document.createElement('div');
+    env.chat.renderToolApprovalCard(badCard, {
+      confirmation_id: 'tz2', tool_name: 'browser.click', description: '点击',
+      arguments_summary: '{}', expires_at: 'not-a-date',
+    }, 'sess-tz2');
+    const badExpires = findByClass(findByClass(badCard, 'tool-approval-card')[0], 'tool-approval-card__expires');
+    ok(badExpires[0].textContent === '过期时间: not-a-date',
+      'invalid expires_at falls back to raw text (got "' + badExpires[0].textContent + '")');
+
+    // --- message hover time rendered in UTC+8, not browser local timezone ---
+    // 2020-01-01T00:00:00Z -> UTC+8 2020-01-01 08:00；年份 != 当前年 -> 年/月/日 HH:mm。
+    const tzMsg = env.chat.createMessageElement({ role: 'user', content: 'hi', created_at: '2020-01-01T00:00:00Z', name: null });
+    ok(tzMsg.dataset.time === '2020/1/1 08:00',
+      'message time rendered in UTC+8 (got "' + tzMsg.dataset.time + '")');
+
     // Three buttons
     const btns3 = findByClass(cards3[0], 'tool-approval-card__btn');
     ok(btns3.length === 3, 'three choice buttons rendered (got ' + btns3.length + ')');

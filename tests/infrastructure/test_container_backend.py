@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -139,6 +140,18 @@ class FakePlaywright:
         self.stop_calls += 1
 
 
+class FakeProfileRuntimeClient:
+    """A browser-runtime control plane fake for persistent profiles."""
+
+    def __init__(self) -> None:
+        self.ensure_calls: list[str] = []
+        self.runtime_id = "runtime-1"
+
+    async def ensure_profile(self, profile_ref: str) -> tuple[str, str]:
+        self.ensure_calls.append(profile_ref)
+        return ("http://browser:19222", self.runtime_id)
+
+
 # ---------------------------------------------------------------------------
 # Fixture: backend with monkeypatched CDP connection
 # ---------------------------------------------------------------------------
@@ -232,6 +245,62 @@ async def test_create_session_connects_cdp_and_creates_context():
     assert len(fake_browser.contexts[0].pages) == 1
     assert backend.has_session(session.id)
     assert backend.active_session_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_create_session_uses_the_profile_runtime_persistent_page():
+    """A container session must attach to profile-owned Chromium, not incognito."""
+    runtime = FakeProfileRuntimeClient()
+    backend, fake_browser, _ = _make_backend()
+    backend._runtime_client = runtime  # type: ignore[attr-defined]
+    persistent_context = FakeCDPContext()
+    await persistent_context.new_page()
+    fake_browser.contexts.append(persistent_context)
+    session = _make_session(profile_ref="profile-persistent")
+
+    await backend.create_session(session)
+
+    assert runtime.ensure_calls == ["profile-persistent"]
+    assert len(fake_browser.contexts) == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_profile_inherits_registry_revision_after_reconnect():
+    """Fresh refs after a browser restart must match durable session state."""
+    runtime = FakeProfileRuntimeClient()
+    backend, fake_browser, _ = _make_backend()
+    backend._runtime_client = runtime  # type: ignore[attr-defined]
+    persistent_context = FakeCDPContext()
+    await persistent_context.new_page()
+    fake_browser.contexts.append(persistent_context)
+    session = replace(_make_session(profile_ref="profile-persistent"), document_revision=4)
+
+    await backend.create_session(session)
+
+    ctx = backend._sessions[session.id]  # type: ignore[attr-defined]
+    assert ctx.driver.current_document_revision() == 4
+
+    await backend.sync_document_revision(session.id, 5)
+    assert ctx.driver.current_document_revision() == 5
+
+
+@pytest.mark.asyncio
+async def test_get_state_rebinds_profile_after_browser_runtime_restart():
+    runtime = FakeProfileRuntimeClient()
+    backend, fake_browser, _ = _make_backend()
+    backend._runtime_client = runtime  # type: ignore[attr-defined]
+    persistent_context = FakeCDPContext()
+    await persistent_context.new_page()
+    fake_browser.contexts.append(persistent_context)
+    session = _make_session(profile_ref="profile-persistent")
+    await backend.create_session(session)
+
+    runtime.runtime_id = "runtime-after-restart"
+    state = await backend.get_state(session.id)
+
+    assert state.safe_url == "https://example.com/"
+    assert runtime.ensure_calls == ["profile-persistent", "profile-persistent"]
+    assert len(fake_browser.contexts) == 1
 
 
 @pytest.mark.asyncio
@@ -520,6 +589,9 @@ async def test_end_takeover_revokes_capability():
 
     await backend.end_takeover(session.id)
     assert not backend.capability_is_active(token)
+    ctx = backend._sessions[session.id]
+    assert ctx.driver.current_document_revision() == 1
+    assert ctx.driver.last_screenshot_bytes() is not None
 
 
 @pytest.mark.asyncio

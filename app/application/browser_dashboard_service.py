@@ -131,17 +131,26 @@ class BrowserDashboardService:
         }
 
     async def read_screenshot(
-        self, browser_session_id: str, n_agent_session_id: str
+        self,
+        browser_session_id: str,
+        n_agent_session_id: str,
+        captured_at: str | None = None,
     ) -> tuple[bytes, str] | None:
-        """Read the latest screenshot for a session. Returns (data, content_type)
-        or None if the session is not visible or no screenshot is available."""
+        """Read a visible session's latest or timestamp-bound screenshot."""
         session = await self._visible_session(browser_session_id, n_agent_session_id)
         if session is None:
             return None
-        state = await self._browser_service.get_state_for_session(browser_session_id)
-        if state is None or state.latest_screenshot_ref is None:
+        ref: str | None = None
+        if captured_at:
+            finder = getattr(self._screenshot_store, "find_session_ref_at_or_before", None)
+            if finder is not None:
+                ref = await finder(browser_session_id, captured_at)
+        else:
+            state = await self._browser_service.get_state_for_session(browser_session_id)
+            ref = state.latest_screenshot_ref if state is not None else None
+        if ref is None:
             return None
-        data = await self._screenshot_store.read(state.latest_screenshot_ref)
+        data = await self._screenshot_store.read(ref)
         if data is None:
             return None
         return (data, "image/png")
@@ -301,22 +310,15 @@ class BrowserDashboardService:
                 "message": "session is not in takeover state",
                 "expires_at": None,
             }
-        # Issue a short-lived capability token bound to this session/actor.
-        # The token is consumed by the interactive view endpoint (container).
-        cap_path = f"/chat/browser/sessions/{browser_session_id}/interactive"
-        cap_token = self._confirmation.issue(
-            method="GET",
-            path=cap_path,
-            browser_session_id=browser_session_id,
-            n_agent_session_id=n_agent_session_id,
-            actor_id=actor_id,
+        # noVNC loads one document, many assets, and one WebSocket. Use a
+        # reusable TTL-bound capability rather than a single-use write
+        # challenge, and return only a same-origin Dashboard URL.
+        cap_token = self._confirmation.issue_capability(
+            browser_session_id, n_agent_session_id, actor_id
         )
-        # Build a capability URL. The container endpoint serves the
-        # interactive view; the capability token authorizes a single session.
-        container_endpoint = getattr(self._settings, "browser_container_endpoint", "")
         url = (
-            f"{container_endpoint}/vnc/websockify"
-            f"?session={browser_session_id}&cap={cap_token}"
+            f"/chat/browser/sessions/{browser_session_id}/interactive/vnc.html"
+            f"?cap={cap_token}&autoconnect=true&resize=scale"
         )
         from datetime import timedelta
         expires_at = datetime.now(timezone.utc) + timedelta(

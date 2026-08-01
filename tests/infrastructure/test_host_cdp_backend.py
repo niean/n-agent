@@ -648,10 +648,6 @@ async def test_state_schema_invalid_response_returns_no_partial_state(
             {"status": "error", "error_code": "x", "unknown": True},
         ),
         ("takeover_end", {"status": "success"}),
-        (
-            "takeover_end",
-            {"status": "ok", "screenshot_base64": "YQ=="},
-        ),
     ],
 )
 async def test_close_and_takeover_schemas_reject_unknown_or_mixed_fields(
@@ -1026,6 +1022,19 @@ class FakeCdpController:
             "document_revision": 1,
             "latest_screenshot_ref": None,
         }
+
+    def sync_after_takeover(
+        self,
+        target_id: str,
+        *,
+        deadline_monotonic: float,
+        cancel_event: threading.Event,
+    ) -> bytes | None:
+        self.last_deadline = deadline_monotonic
+        self.last_cancel_event = cancel_event
+        if target_id not in self.targets or self.targets[target_id]["closed"]:
+            raise TargetClosed()
+        return b"\x89PNG\r\n\x1a\npost-takeover"
 
     def force_target_closed(self, target_id: str) -> None:
         self._force_closed.add(target_id)
@@ -1520,6 +1529,37 @@ async def test_end_takeover_sends_request(tmp_path: Path) -> None:
     await backend.end_takeover("b-1")
     assert len(fake.requests) == 1
     assert fake.requests[0]["path"] == "/v1/browser/session/takeover/end"
+
+
+@pytest.mark.asyncio
+async def test_end_takeover_caches_the_fresh_host_screenshot(tmp_path: Path) -> None:
+    screenshot = b"\x89PNG\r\n\x1a\nhost-release-frame"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/browser/session/takeover/end":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "screenshot_base64": base64.b64encode(screenshot).decode("ascii"),
+                },
+            )
+        return httpx.Response(500, json={"status": "error"})
+
+    token_path = tmp_path / "private" / "token"
+    _write_token(token_path)
+    backend = HostCdpBrowserBackend(
+        HostCdpBackendConfig(
+            base_url=BASE_URL,
+            token_path=token_path,
+            transport=httpx.MockTransport(handler),
+        )
+    )
+    backend._sessions.add("b-1")
+
+    await backend.end_takeover("b-1")
+
+    assert backend.last_screenshot_bytes("b-1") == screenshot
 
 
 @pytest.mark.asyncio
@@ -2246,12 +2286,14 @@ def test_bridge_takeover_begin_returns_null(tmp_path: Path) -> None:
 
 
 def test_bridge_takeover_end_ok(tmp_path: Path) -> None:
-    bridge, _, _ = _bridge_with_session(tmp_path)
+    bridge, _, cdp = _bridge_with_session(tmp_path)
     status, body = bridge.handle_request(
         "/v1/browser/session/takeover/end",
         {"protocol_version": "1", "session_id": "b-1"},
     )
     assert body["status"] == "ok"
+    assert base64.b64decode(body["screenshot_base64"]) == b"\x89PNG\r\n\x1a\npost-takeover"
+    assert cdp.last_deadline is not None
 
 
 # ---------------------------------------------------------------------------

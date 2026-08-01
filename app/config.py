@@ -205,6 +205,8 @@ class Settings(BaseSettings):
     browser_enabled: bool = Field(default=False)
     browser_default_backend: str = Field(default="container")
     browser_container_endpoint: str = Field(default="")
+    browser_container_profile_runtime_endpoint: str = Field(default="")
+    browser_container_novnc_endpoint: str = Field(default="http://browser:6080")
     browser_action_timeout: int = Field(default=30, gt=0)
     browser_navigation_timeout: int = Field(default=30, gt=0)
     browser_max_observe_chars: int = Field(default=4000, ge=1, le=20000)

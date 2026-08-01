@@ -151,6 +151,38 @@ def test_revoke_for_session_removes_all_tokens():
     assert svc.consume(t3, "POST", "/p3", "bsess-2", "nagent-1", "actor-1") is True
 
 
+def test_takeover_capability_is_reusable_and_fully_bound():
+    svc = BrowserConfirmationService(ttl_seconds=60)
+    token = svc.issue_capability("bsess-1", "nagent-1", "actor-1")
+
+    assert svc.validate_capability(
+        token, "bsess-1", "nagent-1", "actor-1"
+    ) is True
+    assert svc.validate_capability(
+        token, "bsess-1", "nagent-1", "actor-1"
+    ) is True
+    assert svc.validate_capability(
+        token, "bsess-other", "nagent-1", "actor-1"
+    ) is False
+    assert svc.validate_capability(
+        token, "bsess-1", "nagent-other", "actor-1"
+    ) is False
+    assert svc.validate_capability(
+        token, "bsess-1", "nagent-1", "actor-other"
+    ) is False
+
+
+def test_revoke_for_session_revokes_takeover_capability():
+    svc = BrowserConfirmationService(ttl_seconds=60)
+    token = svc.issue_capability("bsess-1", "nagent-1", "actor-1")
+
+    svc.revoke_for_session("bsess-1")
+
+    assert svc.validate_capability(
+        token, "bsess-1", "nagent-1", "actor-1"
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # concurrent double-consume: only one succeeds
 # ---------------------------------------------------------------------------

@@ -682,17 +682,25 @@ async def test_request_takeover_transitions_to_takeover():
 
 @pytest.mark.asyncio
 async def test_release_takeover_restores_active():
-    service, registry, _, _, _ = _make_service()
+    service, registry, screenshot_store, backends, _ = _make_service()
     await service.get_or_create_session(
         "nagent-1", BrowserBackendType.CONTAINER, _run_ctx()
     )
     sid = list(registry.sessions)[0]
     await service.request_takeover("nagent-1")
+    backend = backends[BrowserBackendType.CONTAINER]
+    backend.screenshot_by_session[sid] = b"\x89PNG\r\n\x1a\npost-takeover"
     result = await service.release_takeover("nagent-1")
     assert result is True
     session = await registry.get(sid)
     assert session is not None
     assert session.status is BrowserSessionStatus.ACTIVE
+    assert session.document_revision == 1
+    assert backend.end_takeover_calls == [sid]
+    assert screenshot_store.stored == [
+        (sid, b"\x89PNG\r\n\x1a\npost-takeover", "image/png")
+    ]
+    assert service._latest_screenshot_ref[sid] == "ref-0"
 
 
 @pytest.mark.asyncio

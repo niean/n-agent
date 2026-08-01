@@ -265,3 +265,15 @@ async def test_list_session_refs(tmp_path):
     r3 = await store.persist("sess-2", data, "image/png")
     refs = await store.list_session_refs("sess-1")
     assert set(refs) == {r1, r2}
+
+
+@pytest.mark.asyncio
+async def test_find_session_ref_at_or_before_preserves_snapshot_history(tmp_path):
+    store = SqliteBrowserScreenshotStore(tmp_path / "shots")
+    data = _make_png()
+    first = await store.persist("sess-1", data, "image/png")
+    first_created_at = (await store.get_metadata(first))["created_at"]
+    second = await store.persist("sess-1", data, "image/png")
+
+    assert await store.find_session_ref_at_or_before("sess-1", first_created_at) == first
+    assert await store.find_session_ref_at_or_before("sess-1", "9999-12-31T23:59:59+00:00") == second

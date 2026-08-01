@@ -99,9 +99,15 @@ class FakeBrowserService:
 class FakeScreenshotStore:
     def __init__(self) -> None:
         self.data: dict[str, bytes] = {}
+        self.refs_at_or_before: dict[tuple[str, str], str] = {}
 
     async def read(self, ref: str) -> bytes | None:
         return self.data.get(ref)
+
+    async def find_session_ref_at_or_before(
+        self, session_id: str, captured_at: str
+    ) -> str | None:
+        return self.refs_at_or_before.get((session_id, captured_at))
 
     async def persist(self, session_id, data, content_type) -> str:
         ref = f"ref-{len(self.data)}"
@@ -110,6 +116,22 @@ class FakeScreenshotStore:
 
     async def delete_session(self, session_id) -> None:
         pass
+
+
+class FakeNoVncProxy:
+    def __init__(self) -> None:
+        self.fetch_calls: list[tuple[str, str]] = []
+        self.bridge_calls: list[str] = []
+
+    async def fetch(self, asset_path: str, query_string: str):
+        self.fetch_calls.append((asset_path, query_string))
+        return (200, {"content-type": "text/html"}, b"<html>noVNC</html>")
+
+    async def bridge(self, websocket, asset_path: str) -> None:
+        self.bridge_calls.append(asset_path)
+        await websocket.accept(subprotocol="binary")
+        await websocket.send_bytes(b"proxied")
+        await websocket.close()
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +162,7 @@ def _make_app(
     browser_service: FakeBrowserService | None = None,
     screenshot_store: FakeScreenshotStore | None = None,
     confirmation: BrowserConfirmationService | None = None,
+    no_vnc_proxy: FakeNoVncProxy | None = None,
 ) -> tuple[TestClient, FakeBrowserService, FakeScreenshotStore, BrowserConfirmationService]:
     browser_service = browser_service or FakeBrowserService()
     screenshot_store = screenshot_store or FakeScreenshotStore()
@@ -162,7 +185,14 @@ def _make_app(
         return actor
 
     app = FastAPI()
-    register_browser_routes(app.router, dashboard_service, confirmation, actor_resolver, settings)
+    register_browser_routes(
+        app.router,
+        dashboard_service,
+        confirmation,
+        actor_resolver,
+        settings,
+        no_vnc_proxy=no_vnc_proxy,
+    )
     return TestClient(app), browser_service, screenshot_store, confirmation
 
 
@@ -346,6 +376,23 @@ def test_get_screenshot_returns_no_store_header():
     assert r.status_code == 200
     assert r.headers.get("cache-control") == "no-store"
     assert r.content == b"\x89PNG fake data"
+
+
+def test_get_screenshot_at_timestamp_returns_historical_snapshot():
+    client, browser_service, screenshot_store, _ = _make_app()
+    browser_service.sessions["bsess-1"] = _make_session("bsess-1", "nagent-1")
+    screenshot_store.refs_at_or_before[("bsess-1", "2026-08-01T17:22:08.180364+00:00")] = "ref-old"
+    screenshot_store.data["ref-old"] = b"\x89PNG first screenshot"
+    screenshot_store.data["ref-new"] = b"\x89PNG latest screenshot"
+    r = client.get(
+        "/chat/browser/sessions/bsess-1/screenshot",
+        params={
+            "n_agent_session_id": "nagent-1",
+            "captured_at": "2026-08-01T17:22:08.180364+00:00",
+        },
+    )
+    assert r.status_code == 200
+    assert r.content == b"\x89PNG first screenshot"
 
 
 def test_get_screenshot_returns_404_when_unavailable():
@@ -955,7 +1002,8 @@ def test_revoke_host_succeeds_when_trusted_dev():
 
 
 def test_takeover_view_returns_url_for_container():
-    client, browser_service, _, _ = _make_app()
+    proxy = FakeNoVncProxy()
+    client, browser_service, _, _ = _make_app(no_vnc_proxy=proxy)
     browser_service.sessions["bsess-1"] = _make_session(
         "bsess-1", "nagent-1",
         backend=BrowserBackendType.CONTAINER,
@@ -967,11 +1015,55 @@ def test_takeover_view_returns_url_for_container():
     )
     assert r.status_code == 200
     data = r.json()
-    assert data["url"] is not None
+    assert data["url"].startswith(
+        "/chat/browser/sessions/bsess-1/interactive/vnc.html?"
+    )
     assert "cap=" in data["url"]
+    assert "browser:9222" not in data["url"]
     assert data["expires_at"] is not None
     # no-store header
     assert r.headers.get("cache-control") == "no-store"
+
+    page = client.get(data["url"])
+    assert page.status_code == 200
+    assert page.content == b"<html>noVNC</html>"
+    assert proxy.fetch_calls == [("vnc.html", "autoconnect=true&resize=scale")]
+    assert "n_agent_browser_takeover=" in page.headers["set-cookie"]
+
+    asset = client.get(
+        "/chat/browser/sessions/bsess-1/interactive/app/ui.js"
+    )
+    assert asset.status_code == 200
+    assert proxy.fetch_calls[-1] == ("app/ui.js", "")
+
+    with client.websocket_connect(
+        "/chat/browser/sessions/bsess-1/interactive/websockify",
+        subprotocols=["binary"],
+    ) as websocket:
+        assert websocket.receive_bytes() == b"proxied"
+    assert proxy.bridge_calls == ["websockify"]
+
+
+def test_interactive_proxy_rejects_missing_or_wrong_capability():
+    proxy = FakeNoVncProxy()
+    client, browser_service, _, _ = _make_app(no_vnc_proxy=proxy)
+    browser_service.sessions["bsess-1"] = _make_session(
+        "bsess-1", "nagent-1",
+        backend=BrowserBackendType.CONTAINER,
+        status=BrowserSessionStatus.TAKEOVER,
+    )
+
+    missing = client.get(
+        "/chat/browser/sessions/bsess-1/interactive/vnc.html"
+    )
+    wrong = client.get(
+        "/chat/browser/sessions/bsess-1/interactive/vnc.html",
+        params={"cap": "wrong"},
+    )
+
+    assert missing.status_code == 403
+    assert wrong.status_code == 403
+    assert proxy.fetch_calls == []
 
 
 def test_takeover_view_returns_message_for_host_cdp():

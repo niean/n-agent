@@ -194,23 +194,39 @@
   }
 
   // 飞书风格消息时间：Hover 时展示在气泡上方。服务端 created_at 为 UTC ISO 字符串，
-  // 浏览器按本地时区解析后，按 今天/昨天/今年/往年 分级格式化。返回空串表示无时间。
+  // 统一按 UTC+8（Asia/Shanghai）渲染，不依赖浏览器本地时区；按 今天/昨天/今年/往年
+  // 分级格式化。返回空串表示无时间。
   function formatMessageTime(iso) {
     if (!iso) return '';
     const date = new Date(iso);
     if (isNaN(date.getTime())) return '';
-    const now = new Date();
+    // East-8 (Asia/Shanghai) regardless of browser timezone
+    const tz = new Date(date.getTime() + 8 * 3600 * 1000);
+    const nowTz = new Date(Date.now() + 8 * 3600 * 1000);
     const pad = (n) => (n < 10 ? '0' + n : '' + n);
-    const hhmm = pad(date.getHours()) + ':' + pad(date.getMinutes());
-    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const startOfMsgDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const hhmm = pad(tz.getUTCHours()) + ':' + pad(tz.getUTCMinutes());
+    const startOfToday = Date.UTC(nowTz.getUTCFullYear(), nowTz.getUTCMonth(), nowTz.getUTCDate());
+    const startOfMsgDay = Date.UTC(tz.getUTCFullYear(), tz.getUTCMonth(), tz.getUTCDate());
     const dayDiff = Math.round((startOfToday - startOfMsgDay) / 86400000);
     if (dayDiff === 0) return hhmm;
     if (dayDiff === 1) return '昨天 ' + hhmm;
-    if (date.getFullYear() === now.getFullYear()) {
-      return (date.getMonth() + 1) + '月' + date.getDate() + '日 ' + hhmm;
+    if (tz.getUTCFullYear() === nowTz.getUTCFullYear()) {
+      return (tz.getUTCMonth() + 1) + '月' + tz.getUTCDate() + '日 ' + hhmm;
     }
-    return date.getFullYear() + '/' + (date.getMonth() + 1) + '/' + date.getDate() + ' ' + hhmm;
+    return tz.getUTCFullYear() + '/' + (tz.getUTCMonth() + 1) + '/' + tz.getUTCDate() + ' ' + hhmm;
+  }
+
+  // 统一时间格式化：服务端时间统一 UTC 存储，展示一律按 UTC+8（Asia/Shanghai）渲染，
+  // 不依赖浏览器本地时区（与 sandbox.js / host.js / tasks.js 等保持一致）。
+  function formatTime(value) {
+    if (!value) return '-';
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return String(value);
+    // East-8 (Asia/Shanghai) regardless of browser timezone
+    const tz = new Date(d.getTime() + 8 * 3600 * 1000);
+    const pad = (n) => (n < 10 ? '0' + n : '' + n);
+    return tz.getUTCFullYear() + '-' + pad(tz.getUTCMonth() + 1) + '-' + pad(tz.getUTCDate())
+      + ' ' + pad(tz.getUTCHours()) + ':' + pad(tz.getUTCMinutes()) + ':' + pad(tz.getUTCSeconds());
   }
 
   function formatDebugJson(value) {
@@ -221,6 +237,59 @@
     } catch (error) {
       return value;
     }
+  }
+
+  // Browser screenshots stay in the server-side screenshot store: tool results
+  // deliberately contain neither bytes nor a storage reference.  The Dashboard
+  // can still recognise the safe result envelope and resolve the associated
+  // browser session through its existing, session-scoped API.
+  function isSuccessfulBrowserScreenshot(content) {
+    const items = Array.isArray(content) ? content : [content];
+    return items.some((item) => {
+      let payload = item;
+      if (typeof payload === 'string') {
+        try { payload = JSON.parse(payload); } catch (_) { return false; }
+      }
+      if (!payload || typeof payload !== 'object') return false;
+      const result = payload.content;
+      return payload.name === 'browser_screenshot'
+        && payload.status === 'success'
+        && result && typeof result === 'object'
+        && result.action_type === 'screenshot'
+        && result.status === 'success'
+        && result.screenshot_captured === true;
+    });
+  }
+
+  function appendBrowserScreenshotPreview(parent, content, capturedAt) {
+    if (!parent || !isSuccessfulBrowserScreenshot(content) || !currentSessionId) return;
+    const browser = api && api.browser;
+    if (!browser || typeof browser.listSessions !== 'function') return;
+    const sessionId = currentSessionId;
+    const preview = document.createElement('div');
+    preview.className = 'tool-screenshot-preview';
+    const image = document.createElement('img');
+    image.className = 'tool-screenshot-preview__image';
+    image.alt = '浏览器截图';
+    image.loading = 'lazy';
+    image.hidden = true;
+    preview.appendChild(image);
+    parent.appendChild(preview);
+
+    browser.listSessions(sessionId).then((result) => {
+      if (currentSessionId !== sessionId) return;
+      const sessions = result && Array.isArray(result.sessions) ? result.sessions : [];
+      // BrowserService binds browser sessions to one N-Agent session. Prefer the
+      // newest record, then let the existing authenticated image endpoint decide
+      // whether its screenshot is still available.
+      const latest = sessions.slice().sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0];
+      if (!latest || !latest.id) { preview.remove(); return; }
+      image.src = '/chat/browser/sessions/' + encodeURIComponent(latest.id)
+        + '/screenshot?n_agent_session_id=' + encodeURIComponent(sessionId)
+        + (capturedAt ? '&captured_at=' + encodeURIComponent(capturedAt) : '');
+      image.hidden = false;
+      image.addEventListener('error', () => { preview.remove(); });
+    }).catch(() => { preview.remove(); });
   }
 
   function appendDebugJson(parent, value) {
@@ -640,7 +709,7 @@
         }
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = TASK_ACTION_BTN_CLASS[action] || 'btn';
+        btn.className = 'task-card__btn ' + (TASK_ACTION_BTN_CLASS[action] || 'btn');
         btn.dataset.action = action;
         btn.dataset.taskId = card.task_id;
         btn.textContent = TASK_ACTION_LABELS[action] || action;
@@ -949,7 +1018,7 @@
 
     var expiresField = document.createElement('div');
     expiresField.className = 'tool-approval-card__field tool-approval-card__expires';
-    expiresField.textContent = '过期时间: ' + approval.expires_at;
+    expiresField.textContent = '过期时间: ' + formatTime(approval.expires_at);
     card.appendChild(expiresField);
 
     var feedback = document.createElement('div');
@@ -966,7 +1035,7 @@
       (function (choice) {
         var btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = APPROVAL_CHOICE_BTN_CLASS[choice] || 'btn';
+        btn.className = 'tool-approval-card__btn ' + (APPROVAL_CHOICE_BTN_CLASS[choice] || 'btn');
         btn.dataset.choice = choice;
         btn.textContent = APPROVAL_CHOICE_LABELS[choice] || choice;
         btn.addEventListener('click', function () {
@@ -1123,7 +1192,12 @@
       appendToolDebugContent(content, message.content || '');
       details.append(summary, content);
       el.appendChild(details);
-      el.dataset.debugKind = 'tool';
+      const isScreenshot = isSuccessfulBrowserScreenshot(message.content);
+      appendBrowserScreenshotPreview(el, message.content, message.created_at);
+      // A successful screenshot is user-requested chat content, not debug
+      // telemetry. Keep the enclosing card visible even when the per-session
+      // "工具调试" switch is off; all other tool results retain that setting.
+      if (!isScreenshot) el.dataset.debugKind = 'tool';
       return el;
     }
     // 合并卡片（_mergedTaskStatus=true）：summary 固定=任务状态，open=false，pre=多行 content。
@@ -2913,5 +2987,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload, setHeader, buildHeaderLinks, loadSessionViewLinks };
+  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload, isSuccessfulBrowserScreenshot, setHeader, buildHeaderLinks, loadSessionViewLinks };
 }(window));

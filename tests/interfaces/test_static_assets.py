@@ -1497,6 +1497,13 @@ def test_chat_message_hover_reveals_timestamp_feishu_style(tmp_path):
     # 发送用户消息时携带客户端时间戳，Hover 即刻可见（流式结束后由 refresh 用服务端时间覆盖）
     assert "appendMessage('user', userContent, new Date().toISOString())" in chat_js
 
+    # 时间渲染统一 UTC+8（Asia/Shanghai），不依赖浏览器本地时区：
+    # - formatMessageTime 与 formatTime 均用 8*3600*1000 偏移 + getUTC* 分量
+    # - 工具操作确认卡片 expires_at（服务端 UTC RFC 3339）经 formatTime 转换后展示
+    assert '8 * 3600 * 1000' in chat_js
+    assert 'function formatTime' in chat_js
+    assert 'formatTime(approval.expires_at)' in chat_js
+
     # CSS: hover 时通过 attr(data-time) 展示小号灰色时间，不抢占气泡空间
     assert 'content: attr(data-time)' in css
     assert '.msg[data-time]::before' in css
@@ -1593,7 +1600,6 @@ def test_browser_styles_namespaced(tmp_path):
         ".browser-takeover",
         ".browser-controls",
         ".browser-actions",
-        ".browser-poll-indicator",
     ):
         assert selector in css, f"styles.css missing {selector}"
 

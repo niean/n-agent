@@ -230,3 +230,19 @@ class SqliteBrowserScreenshotStore:
                 (session_id,),
             ).fetchall()
         return [row["ref"] for row in rows]
+
+    async def find_session_ref_at_or_before(
+        self, session_id: str, captured_at: str
+    ) -> str | None:
+        """Return the newest retained screenshot at or before ``captured_at``."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ref FROM screenshots
+                WHERE session_id = ? AND created_at <= ?
+                ORDER BY created_at DESC, ref DESC
+                LIMIT 1
+                """,
+                (session_id, captured_at),
+            ).fetchone()
+        return str(row["ref"]) if row is not None else None

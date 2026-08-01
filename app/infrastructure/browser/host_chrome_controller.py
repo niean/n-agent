@@ -400,6 +400,22 @@ class HostChromeController:
             cancel_event=cancel_event,
         )
 
+    def sync_after_takeover(
+        self,
+        target_id: str,
+        *,
+        deadline_monotonic: float,
+        cancel_event: threading.Event,
+    ) -> bytes | None:
+        """Start a fresh automation epoch after direct host interaction."""
+        return self._run_deadlined(
+            target_id,
+            "takeover_release",
+            self._sync_after_takeover(target_id),
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+        )
+
     def shutdown(self) -> bool:
         with self._lifecycle_lock:
             if self._shutdown_started:
@@ -1218,6 +1234,20 @@ class HostChromeController:
             "document_revision": state.document_revision,
             "latest_screenshot_ref": state.latest_screenshot_ref,
         }
+
+    async def _sync_after_takeover(self, target_id: str) -> bytes | None:
+        self._assert_owner_thread()
+        target = self._require_target(target_id)
+        self._require_live_process(target)
+        try:
+            await target.driver.sync_after_takeover()
+        except Exception:
+            if self._managed_target_closed(target):
+                raise TargetClosed from None
+            raise HostChromeControllerError("target_unavailable") from None
+        if self._managed_target_closed(target):
+            raise TargetClosed
+        return target.driver.last_screenshot_bytes()
 
     # ------------------------------------------------------------------
     # Close and process lifecycle

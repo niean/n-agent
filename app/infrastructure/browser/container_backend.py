@@ -34,6 +34,9 @@ from app.domain.browser import (
     BrowserState,
 )
 from app.infrastructure.browser.playwright_driver import PlaywrightBrowserBackend
+from app.infrastructure.browser.container_profile_runtime import (
+    ContainerProfileRuntimeClient,
+)
 from app.infrastructure.browser.url_safety import UrlVerifier
 
 if TYPE_CHECKING:
@@ -56,6 +59,10 @@ class _SessionContext:
     context: Any  # playwright BrowserContext
     page: Any  # playwright Page
     profile_ref: str
+    runtime_id: str | None = None
+    persistent_profile: bool = False
+    runtime_browser: Any | None = None
+    runtime_playwright: Any | None = None
     page_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -106,6 +113,7 @@ class ContainerBrowserBackend:
         navigation_timeout_seconds: float = 30.0,
         takeover_ttl_seconds: int = 60,
         novnc_base_url: str = "",
+        profile_runtime_endpoint: str = "",
         max_screenshot_bytes: int = 1_048_576,
     ) -> None:
         if not endpoint or not endpoint.strip():
@@ -118,6 +126,11 @@ class ContainerBrowserBackend:
         self._navigation_timeout = float(navigation_timeout_seconds)
         self._takeover_ttl = int(takeover_ttl_seconds)
         self._novnc_base_url = (novnc_base_url or "").rstrip("/")
+        self._runtime_client = (
+            ContainerProfileRuntimeClient(profile_runtime_endpoint)
+            if profile_runtime_endpoint.strip()
+            else None
+        )
         if (
             type(max_screenshot_bytes) is not int
             or not _MIN_SCREENSHOT_BYTES
@@ -200,20 +213,33 @@ class ContainerBrowserBackend:
         async with self._sessions_guard:
             if session.id in self._sessions:
                 return
-            await self._ensure_connected()
-            context = await self._browser.new_context()  # type: ignore[union-attr]
-            page = await context.new_page()
+            runtime_id: str | None = None
+            persistent_profile = self._runtime_client is not None
+            if self._runtime_client is None:
+                await self._ensure_connected()
+                context = await self._browser.new_context()  # type: ignore[union-attr]
+                page = await context.new_page()
+            else:
+                endpoint, runtime_id = await self._runtime_client.ensure_profile(
+                    session.profile_ref
+                )
+                browser, playwright = await self._connect_profile_browser(endpoint)
+                context, page = await self._persistent_page(browser)
             driver = PlaywrightBrowserBackend(
                 url_verifier=self._url_verifier,
                 default_timeout_seconds=self._navigation_timeout,
                 max_screenshot_bytes=self._max_screenshot_bytes,
             )
-            driver.attach_page(page)
+            driver.attach_page(page, document_revision=session.document_revision)
             self._sessions[session.id] = _SessionContext(
                 driver=driver,
                 context=context,
                 page=page,
                 profile_ref=session.profile_ref,
+                runtime_id=runtime_id,
+                persistent_profile=persistent_profile,
+                runtime_browser=browser if persistent_profile else None,
+                runtime_playwright=playwright if persistent_profile else None,
             )
 
     async def close_session(self, session_id: str) -> None:
@@ -227,6 +253,12 @@ class ContainerBrowserBackend:
             should_disconnect = not self._sessions
         if ctx is None:
             # Still revoke capabilities for the session id.
+            await self._revoke_session_capabilities(session_id)
+            return
+        # Persistent profiles own their browser process and page lifecycle.
+        # Closing either from this CDP client would discard the restorable tab
+        # that must survive an n-agent/browser service reconnect.
+        if ctx.persistent_profile:
             await self._revoke_session_capabilities(session_id)
             return
         # Close the driver (closes the page).
@@ -271,6 +303,7 @@ class ContainerBrowserBackend:
                 error_code="session_not_found",
             )
         async with ctx.page_lock:
+            await self._rebind_persistent_profile(ctx)
             try:
                 result = await asyncio.wait_for(
                     ctx.driver.execute_action(session_id, action),
@@ -300,7 +333,60 @@ class ContainerBrowserBackend:
                 latest_screenshot_ref=None,
             )
         async with ctx.page_lock:
+            await self._rebind_persistent_profile(ctx)
             return await ctx.driver.get_state(session_id)
+
+    async def _connect_profile_browser(self, endpoint: str) -> tuple[Any, Any]:
+        """Connect a dedicated CDP client to one profile-owned Chromium."""
+        playwright = await self._start_playwright()
+        # Keep the Playwright object alive through the Browser object.  The
+        # session context owns it indirectly until process restart/teardown.
+        browser = await playwright.chromium.connect_over_cdp(endpoint)
+        return browser, playwright
+
+    async def _persistent_page(self, browser: Any) -> tuple[Any, Any]:
+        contexts = list(browser.contexts)
+        if not contexts:
+            raise ContainerBackendError("persistent_profile_context_missing")
+        context = contexts[0]
+        pages = list(context.pages)
+        page = pages[0] if pages else await context.new_page()
+        return context, page
+
+    async def _rebind_persistent_profile(self, ctx: _SessionContext) -> None:
+        """Reconnect after browser-container restart without creating a tab."""
+        if not ctx.persistent_profile or self._runtime_client is None:
+            return
+        endpoint, runtime_id = await self._runtime_client.ensure_profile(ctx.profile_ref)
+        if runtime_id == ctx.runtime_id:
+            return
+        browser, playwright = await self._connect_profile_browser(endpoint)
+        context, page = await self._persistent_page(browser)
+        ctx.context = context
+        ctx.page = page
+        ctx.runtime_id = runtime_id
+        ctx.runtime_browser = browser
+        ctx.runtime_playwright = playwright
+        # Keep the registry-aligned revision across a Chromium runtime
+        # restart.  The new CDP connection has no intrinsic revision history.
+        ctx.driver.attach_page(
+            page, document_revision=ctx.driver.current_document_revision()
+        )
+
+    async def sync_document_revision(
+        self, session_id: str, document_revision: int
+    ) -> None:
+        """Align a live/reconnected profile driver with registry state.
+
+        BrowserService calls this before validating an element_ref.  This is
+        needed when the browser runtime restarts independently of n-agent.
+        """
+        ctx = self._sessions.get(session_id)
+        if ctx is None:
+            return
+        async with ctx.page_lock:
+            if ctx.driver.current_document_revision() != document_revision:
+                ctx.driver.restore_document_revision(document_revision)
 
     def last_screenshot_bytes(self, session_id: str) -> bytes | None:
         """Return the side-channel screenshot bytes captured by the session driver.
@@ -344,8 +430,12 @@ class ContainerBrowserBackend:
         return f"cap://{token}"
 
     async def end_takeover(self, session_id: str) -> None:
-        """Revoke all active takeover capabilities for the session."""
+        """Revoke capabilities and snapshot the page changed through VNC."""
         await self._revoke_session_capabilities(session_id)
+        ctx = self._sessions.get(session_id)
+        if ctx is not None:
+            async with ctx.page_lock:
+                await ctx.driver.sync_after_takeover()
 
     async def _revoke_session_capabilities(self, session_id: str) -> None:
         async with self._capabilities_guard:

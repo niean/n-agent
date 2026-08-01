@@ -237,6 +237,8 @@ def test_browser_dashboard_service_constructed_when_enabled(tmp_path: Path):
     )
     assert isinstance(services.browser_dashboard_service, BrowserDashboardService)
     assert isinstance(services.browser_confirmation_service, BrowserConfirmationService)
+    from app.infrastructure.browser.novnc_proxy import BrowserNoVncProxy
+    assert isinstance(services.browser_novnc_proxy, BrowserNoVncProxy)
 
 
 def test_browser_dashboard_service_none_when_disabled(tmp_path: Path):
@@ -244,6 +246,7 @@ def test_browser_dashboard_service_none_when_disabled(tmp_path: Path):
     services = build_application_services(_settings(tmp_path))
     assert services.browser_dashboard_service is None
     assert services.browser_confirmation_service is None
+    assert services.browser_novnc_proxy is None
 
 
 def test_browser_dashboard_routes_registered_when_enabled(tmp_path: Path):

@@ -138,7 +138,9 @@ Docker Compose 项目隔离使用：
 
 - Dashboard 的提示、错误反馈统一调用共享 `NAGENT.modal.alert(message, options)`，禁止使用浏览器原生 `alert`、`window.alert` 或 `globalThis.alert`；共享实现仅位于 `app/interfaces/http/static/management-ui.js`。
 - 需要用户确认的操作统一调用 `NAGENT.modal.confirm(message, options)`，以保持与 Dashboard 其它弹窗一致的样式和交互。
+- Dashboard 操作按钮复用共享 `.btn` / `.btn--primary` / `.btn--danger` 外观；若按钮不在 `13px` 面板标题内，必须显式设为 `var(--font-size-md)`，与任务看板“新增”按钮保持相同文字尺寸，避免依赖正文继承导致视觉偏大。
 - 新增或修改静态前端模块时，必须保持 `tests/interfaces/test_static_assets.py` 的原生 alert 扫描通过。
+- 前端时间展示统一按 UTC+8（Asia/Shanghai）渲染，不依赖浏览器本地时区。服务端时间统一 UTC 存储（ISO 8601 / RFC 3339，如 `2026-07-28T12:00:00Z`），展示层一律用 `new Date(ms + 8 * 3600 * 1000)` 偏移后取 `getUTCFullYear/getUTCMonth/getUTCDate/getUTCHours/getUTCMinutes/getUTCSeconds` 分量格式化；各静态模块（chat/sandbox/host/observations/browser/tasks/scheduled-tasks/platforms）共用此 `formatTime`/`formatDate` 模式。新增时间渲染必须遵循，禁止用 `getHours()` 等本地时区方法或 `toLocaleString()` 渲染时间戳（`toLocaleString()` 仅用于数字 `formatNumber`）。
 
 ## 验收命令
 

@@ -341,7 +341,7 @@ class HostCdpBrowserBackend:
         return None
 
     async def end_takeover(self, session_id: str) -> None:
-        """Release the host takeover (no-op for host backend)."""
+        """Release the host takeover and retain its fresh dashboard frame."""
         if session_id not in self._sessions:
             return
         payload = {
@@ -354,7 +354,10 @@ class HostCdpBrowserBackend:
                 payload,
                 session_id,
             )
-            _require_ok(body, endpoint="takeover_end")
+            screenshot = _parse_takeover_end(body, self._config.max_screenshot_bytes)
+            if screenshot is not None:
+                with self._screenshot_lock:
+                    self._screenshot_cache[session_id] = screenshot
         except HostCdpBackendError:
             self._clear_screenshot(session_id)
             pass
@@ -626,10 +629,31 @@ def _require_ok(body: dict[str, Any], *, endpoint: str) -> None:
         ):
             _invalid_response()
         return
-    if endpoint not in {"create", "close", "takeover_end"}:
+    if endpoint not in {"create", "close"}:
         _invalid_response()
     if status != "ok" or set(body) != {"status"}:
         _invalid_response()
+
+
+def _parse_takeover_end(
+    body: dict[str, Any], max_screenshot_bytes: int
+) -> bytes | None:
+    """Validate an end-takeover response and extract its optional frame.
+
+    The no-frame envelope remains accepted so a rolling upgrade of the host
+    bridge never turns release into a failed state transition.
+    """
+    if body.get("status") == "error":
+        _validate_error_envelope(body)
+        raise HostCdpBackendError(body["error_code"])
+    if body.get("status") != "ok":
+        _invalid_response()
+    keys = set(body)
+    if keys == {"status"}:
+        return None
+    if keys != {"status", "screenshot_base64"}:
+        _invalid_response()
+    return _decode_screenshot(body["screenshot_base64"], max_screenshot_bytes)
 
 
 def _validate_error_envelope(body: dict[str, Any]) -> None:

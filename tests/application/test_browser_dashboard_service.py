@@ -480,8 +480,11 @@ async def test_takeover_view_returns_url_for_container_takeover():
     )
     result = await dashboard.get_takeover_view("bsess-1", "nagent-1", "actor-1")
     assert result is not None
-    assert result["url"] is not None
+    assert result["url"].startswith(
+        "/chat/browser/sessions/bsess-1/interactive/vnc.html?"
+    )
     assert "cap=" in result["url"]
+    assert "browser:9222" not in result["url"]
     assert result["expires_at"] is not None
 
 

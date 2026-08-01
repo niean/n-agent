@@ -1064,3 +1064,11 @@ Dashboard 的 `POST /chat/completions` 原先不注入 `ApprovalDecider`，导�
 - 隔离：approval queue 不来自客户端 payload（先 pop 客户端同名 key）、不送 LLM/executor、不跨请求复用；`/v1/chat/completions` 仍无 decider/fail-closed；既有 Task/Feishu/CLI 审批交互不变。
 
 相关：模式十六（SessionSource）、模式三十三（options 内部 key 过滤，`dashboard_approval_event_queue` 已加入）、D038（通用 confirmation challenge 治理方向）。
+
+## 模式三十五：Container 接管的 Dashboard 同源 noVNC 代理
+
+Container Browser 的 CDP `9222` 是后端自动化控制面，noVNC `6080` 是人工交互面；两者都只在 Docker 网络暴露，不能把 `browser:*` 地址直接交给用户浏览器。接管链路固定为：`BrowserDashboardService` 签发绑定 Browser Session、N-Agent Session、Dashboard actor 与 TTL 的 capability，返回同源 `/chat/browser/sessions/{id}/interactive/vnc.html`；路由校验 capability 后设置 session-scoped HttpOnly/SameSite Cookie，并由 `BrowserNoVncProxy` 转发 noVNC 静态资源和 `websockify` WebSocket。
+
+安全不变量：6080/9222 不映射宿主端口；capability 不转发到 noVNC、不写日志/模型消息/localStorage；HTTP 与 WebSocket 均校验同源、actor、session 绑定和 TTL；资源路径拒绝绝对路径/穿越/反斜杠/NUL，HTTP 响应有大小与响应头白名单；Release/Close 撤销能力。noVNC 的默认相对 `websockify` 路径会相对同源 iframe URL 解析到该 Browser Session 的代理端点，因此无需改 noVNC 静态资源。
+
+Release 不能只切换状态：人工导航/输入绕过 `execute_action()`，不会触发 element index、`document_revision` 和 Dashboard screenshot 的正常更新钩子。Container backend 在 `end_takeover()` 中必须持有 page lock，失效接管前 element refs、递增 revision 并采集同一 live page；Host CDP 则由 Host Bridge 调用受控 Chrome controller 建立相同的新自动化边界，并在受限响应中返回截图。BrowserService 在恢复 active 前持久化新截图，失败时清除旧 ref，禁止把接管前截图继续冒充实时画面。

@@ -164,6 +164,7 @@ from app.infrastructure.browser.host_cdp_backend import (
     HostCdpBackendConfig,
     HostCdpBrowserBackend,
 )
+from app.infrastructure.browser.novnc_proxy import BrowserNoVncProxy
 from app.infrastructure.browser import host_protocol
 from app.infrastructure.browser.screenshot_store import SqliteBrowserScreenshotStore
 from app.infrastructure.browser.sqlite_browser_registry import SqliteBrowserSessionRegistry
@@ -348,6 +349,7 @@ class ApplicationServices:
     browser_service: BrowserService | None = None
     browser_dashboard_service: "BrowserDashboardService | None" = None
     browser_confirmation_service: "BrowserConfirmationService | None" = None
+    browser_novnc_proxy: "BrowserNoVncProxy | None" = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -1311,6 +1313,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     browser_service: BrowserService | None = None
     browser_dashboard_service_obj: BrowserDashboardService | None = None
     browser_confirmation_service_obj: BrowserConfirmationService | None = None
+    browser_novnc_proxy_obj: BrowserNoVncProxy | None = None
     if settings.browser_enabled:
         browser_registry = SqliteBrowserSessionRegistry(settings.sqlite_path)
         browser_screenshot_store = SqliteBrowserScreenshotStore(
@@ -1338,8 +1341,14 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 navigation_timeout_seconds=float(settings.browser_navigation_timeout),
                 takeover_ttl_seconds=settings.browser_takeover_ttl_seconds,
                 max_screenshot_bytes=settings.browser_max_screenshot_bytes,
+                profile_runtime_endpoint=(
+                    settings.browser_container_profile_runtime_endpoint
+                ),
             )
             browser_backends[BrowserBackendType.CONTAINER] = container_backend
+            browser_novnc_proxy_obj = BrowserNoVncProxy(
+                settings.browser_container_novnc_endpoint
+            )
         # Host CDP backend: created when host bridge URL + token path are
         # configured AND trusted_dev is True. trusted_dev gates host Chrome
         # access (production deployments must not enable host_cdp without
@@ -1573,6 +1582,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         browser_service=browser_service,
         browser_dashboard_service=browser_dashboard_service_obj,
         browser_confirmation_service=browser_confirmation_service_obj,
+        browser_novnc_proxy=browser_novnc_proxy_obj,
     )
 
 
@@ -1804,6 +1814,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             task_run_service=services.task_run_service,
             browser_dashboard_service=services.browser_dashboard_service,
             browser_confirmation_service=services.browser_confirmation_service,
+            browser_novnc_proxy=services.browser_novnc_proxy,
             browser_actor_resolver=_default_browser_actor_resolver,
             dashboard_tool_approval_bridge=dashboard_tool_approval_bridge,
             tool_approval_service=services.tool_approval_service,

@@ -1,4 +1,4 @@
-"""Browser Dashboard HTTP routes - 12 endpoints.
+"""Browser Dashboard HTTP routes, including same-origin takeover proxy.
 
 Mounted into create_dashboard_router via register_browser_routes(router,
 dashboard_service, confirmation_service, actor_resolver, settings).
@@ -27,9 +27,9 @@ import json
 import logging
 from contextlib import aclosing
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
 
@@ -46,6 +46,7 @@ ActorResolver = Callable[[Request], str | None]
 # the service which performs the consume.
 _SERVICE_CONSUMED_OPS = frozenset({"takeover", "release"})
 _HOST_GRANT_BODY_MAX_BYTES = 1024
+_TAKEOVER_COOKIE = "n_agent_browser_takeover"
 
 
 class _HostGrantRequest(BaseModel):
@@ -171,8 +172,9 @@ def register_browser_routes(
     confirmation_service: BrowserConfirmationService,
     actor_resolver: ActorResolver,
     settings,
+    no_vnc_proxy=None,
 ) -> None:
-    """Register the 12 Browser Dashboard endpoints on the given router."""
+    """Register the Browser Dashboard endpoints on the given router."""
 
     def _auth_write(request: Request) -> tuple[str | None, JSONResponse | None]:
         if not _check_same_origin(request, settings):
@@ -210,6 +212,83 @@ def register_browser_routes(
         ):
             return _error(403, "invalid_challenge")
         return None
+
+    if no_vnc_proxy is not None:
+
+        @router.get(
+            "/chat/browser/sessions/{browser_session_id}/interactive/{asset_path:path}"
+        )
+        async def interactive_asset(
+            browser_session_id: str,
+            asset_path: str,
+            request: Request,
+        ):
+            if not _check_same_origin(request, settings):
+                return _error(403, "browser_cross_origin_forbidden")
+            actor = actor_resolver(request)
+            token = request.query_params.get("cap") or request.cookies.get(
+                _TAKEOVER_COOKIE, ""
+            )
+            if not actor or not confirmation_service.resolve_capability(
+                token, browser_session_id, actor
+            ):
+                return _error(403, "browser_takeover_capability_invalid")
+            try:
+                status, headers, body = await no_vnc_proxy.fetch(
+                    asset_path,
+                    urlencode(
+                        [
+                            (key, value)
+                            for key, value in request.query_params.multi_items()
+                            if key not in {"cap", "n_agent_session_id"}
+                        ]
+                    ),
+                )
+            except ValueError:
+                return _error(404, "browser_takeover_asset_not_found")
+            except Exception:
+                logger.warning("browser takeover HTTP proxy failed", exc_info=True)
+                return _error(502, "browser_takeover_proxy_unavailable")
+            response = Response(content=body, status_code=status, headers=headers)
+            response.headers["Cache-Control"] = "no-store"
+            if request.query_params.get("cap"):
+                response.set_cookie(
+                    _TAKEOVER_COOKIE,
+                    token,
+                    httponly=True,
+                    secure=request.url.scheme == "https",
+                    samesite="strict",
+                    path=(
+                        f"/chat/browser/sessions/{browser_session_id}/interactive"
+                    ),
+                )
+            return response
+
+        @router.websocket(
+            "/chat/browser/sessions/{browser_session_id}/interactive/websockify"
+        )
+        async def interactive_websocket(
+            browser_session_id: str,
+            websocket: WebSocket,
+        ) -> None:
+            if not _check_same_origin(websocket, settings):  # type: ignore[arg-type]
+                await websocket.close(code=1008)
+                return
+            actor = actor_resolver(websocket)  # type: ignore[arg-type]
+            token = websocket.cookies.get(_TAKEOVER_COOKIE, "")
+            if not actor or not confirmation_service.resolve_capability(
+                token, browser_session_id, actor
+            ):
+                await websocket.close(code=1008)
+                return
+            try:
+                await no_vnc_proxy.bridge(websocket, "websockify")
+            except Exception:
+                logger.warning("browser takeover WebSocket proxy failed", exc_info=True)
+                try:
+                    await websocket.close(code=1011)
+                except RuntimeError:
+                    pass
 
     # ------------------------------------------------------------------
     # GET /chat/browser/sessions
@@ -287,12 +366,13 @@ def register_browser_routes(
         browser_session_id: str,
         request: Request,
         n_agent_session_id: str = Query(...),
+        captured_at: str | None = Query(None, max_length=64),
     ):
         actor = actor_resolver(request)
         if not actor:
             return _error(403, "browser_actor_required")
         result = await dashboard_service.read_screenshot(
-            browser_session_id, n_agent_session_id
+            browser_session_id, n_agent_session_id, captured_at
         )
         if result is None:
             return _error(404, "screenshot_unavailable")

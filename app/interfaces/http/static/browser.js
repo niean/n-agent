@@ -1,8 +1,8 @@
 (function (global) {
   'use strict';
   // Browser Dashboard page controller (T16).
-  // 2-column detail layout: main view (screenshot / safe URL / title / polling
-  // indicator) | side panel (control matrix by status + cleaned action history).
+  // 2-column detail layout: main view (screenshot / safe URL / title) |
+  // side panel (control matrix by status + cleaned action history).
   //
   // Security:
   // - ALL untrusted text (URL/title/action summary/errors) rendered via
@@ -16,10 +16,7 @@
   const api = (namespace.api || {});
   const modal = (namespace.modal || {});
 
-  const DEFAULT_POLL_MS = 2000;
-  const MIN_POLL_MS = 1000;
-  const MAX_POLL_MS = 5000;
-  const POLL_KEY = 'nagent.browser.poll_ms';
+  const DEFAULT_POLL_MS = 1000;
   const STALE_THRESHOLD_MS = 60000;
 
   let state = {
@@ -29,10 +26,15 @@
     selectedNagentId: null,
     sessionDetail: null,
     actions: [],
-    sideLoaded: false,
     takeoverView: null,
     lastError: null,
     pollMs: DEFAULT_POLL_MS,
+    // Control-relevant signature last rendered into the side panel
+    // (status + available write-challenge keys) and the last rendered
+    // action-history signature (count + latest action id). The side panel is
+    // re-rendered only when one of these changes.
+    lastControlSig: null,
+    lastActionSig: null,
   };
 
   let pollTimer = null;
@@ -56,18 +58,6 @@
     } catch (_) {
       return '';
     }
-  }
-
-  function readPollMs() {
-    try {
-      const v = parseInt(localStorage.getItem(POLL_KEY), 10);
-      if (Number.isInteger(v) && v >= MIN_POLL_MS && v <= MAX_POLL_MS) return v;
-    } catch (_) { /* localStorage unavailable */ }
-    return DEFAULT_POLL_MS;
-  }
-
-  function writePollMs(ms) {
-    try { localStorage.setItem(POLL_KEY, String(ms)); } catch (_) { /* ignore */ }
   }
 
   // ---- helpers ----
@@ -94,22 +84,16 @@
     return map[status] || status || '-';
   }
 
-  function statusBadgeKind(status) {
-    const map = {
-      pending_authorization: 'warning',
-      active: 'success',
-      paused: 'warning',
-      takeover: 'danger',
-      degraded: 'warning',
-      closed: 'warning',
-    };
-    return map[status] || 'warning';
-  }
-
   function backendLabel(backend) {
     if (backend === 'container') return '容器';
     if (backend === 'host_cdp') return '本机';
     return backend || '-';
+  }
+
+  // 实时视图标题：实时视图(状态|后端)；无会话时回退为 实时视图
+  function mainTitleText(detail) {
+    if (!detail) return '实时视图';
+    return '实时视图(' + statusLabel(detail.status) + '|' + backendLabel(detail.backend_type) + ')';
   }
 
   function formatTime(value) {
@@ -156,9 +140,9 @@
     const panel = el('section', 'status-panel browser-main');
     const header = el('div', 'panel-header');
     const title = el('span');
+    title.id = 'browser-main-title';
     title.textContent = '实时视图';
-    const pollWrap = buildPollControls();
-    header.append(title, pollWrap);
+    header.appendChild(title);
     const body = el('div', 'panel-body');
     body.id = 'browser-main-body';
     panel.append(header, body);
@@ -169,7 +153,8 @@
     const body = ui.byId('browser-main-body');
     if (!body) return;
     const detail = state.sessionDetail;
-    updatePollIndicator();
+    const titleEl = ui.byId('browser-main-title');
+    if (titleEl) titleEl.textContent = mainTitleText(detail);
     const mode = mainViewMode(detail);
     if (body.dataset.renderMode === mode && updateMainInPlace(detail, mode)) return;
 
@@ -180,17 +165,6 @@
       return;
     }
     const status = detail.status;
-    // status indicator
-    const statusBar = el('div', 'browser-status-bar');
-    const badge = el('span', 'badge badge--' + statusBadgeKind(status));
-    badge.id = 'browser-status-badge';
-    badge.textContent = statusLabel(status);
-    const backend = el('span', 'muted browser-status-bar__backend');
-    backend.id = 'browser-status-backend';
-    backend.textContent = backendLabel(detail.backend_type);
-    statusBar.append(badge, backend);
-    body.appendChild(statusBar);
-
     if (status === 'takeover') {
       body.appendChild(renderTakeoverView(detail));
     } else if (status === 'closed') {
@@ -212,12 +186,6 @@
 
   function updateMainInPlace(detail, mode) {
     if (!detail || mode === 'empty') return false;
-    const badge = ui.byId('browser-status-badge');
-    const backend = ui.byId('browser-status-backend');
-    if (!badge || !backend) return false;
-    badge.className = 'badge badge--' + statusBadgeKind(detail.status);
-    badge.textContent = statusLabel(detail.status);
-    backend.textContent = backendLabel(detail.backend_type);
 
     // A takeover iframe owns its own focus/caret state. Keeping the same node
     // is essential: rebuilding it reloads the remote page and loses the caret.
@@ -226,44 +194,6 @@
     if (!screenshot) return false;
     screenshot.src = screenshotUrl(detail);
     return true;
-  }
-
-  function buildPollControls() {
-    const wrap = el('span', 'browser-poll-wrap');
-    wrap.id = 'browser-poll-wrap';
-    const indicator = el('span', 'browser-poll-indicator');
-    indicator.id = 'browser-poll-indicator';
-    wrap.appendChild(indicator);
-    const select = document.createElement('select');
-    select.className = 'browser-poll-select';
-    select.setAttribute('aria-label', '轮询间隔');
-    [1, 2, 3, 4, 5].forEach((sec) => {
-      const opt = document.createElement('option');
-      opt.value = String(sec * 1000);
-      opt.textContent = sec + 's';
-      if (sec * 1000 === state.pollMs) opt.selected = true;
-      select.appendChild(opt);
-    });
-    select.addEventListener('change', () => {
-      const ms = parseInt(select.value, 10);
-      if (Number.isInteger(ms) && ms >= MIN_POLL_MS && ms <= MAX_POLL_MS) {
-        state.pollMs = ms;
-        writePollMs(ms);
-        updatePollIndicator();
-        if (state.selectedBrowserSessionId) startPolling();
-      }
-    });
-    wrap.appendChild(select);
-    return wrap;
-  }
-
-  function updatePollIndicator() {
-    const indicator = ui.byId('browser-poll-indicator');
-    if (!indicator) return;
-    const detail = state.sessionDetail;
-    const polling = detail && detail.status !== 'closed' && detail.status !== 'takeover';
-    indicator.classList.toggle('browser-poll-indicator--live', Boolean(polling));
-    indicator.textContent = polling ? '轮询 ' + (state.pollMs / 1000) + 's' : '已停止';
   }
 
   function renderScreenshot(detail) {
@@ -388,39 +318,50 @@
     const header = el('div', 'panel-header');
     const title = el('span');
     title.textContent = '控制与历史';
-    const actions = el('span', 'panel-actions');
-    const refreshBtn = button('刷新', 'btn', refreshSector);
-    refreshBtn.id = 'browser-side-refresh';
-    actions.appendChild(refreshBtn);
-    header.append(title, actions);
+    header.appendChild(title);
     const body = el('div', 'panel-body');
     body.id = 'browser-side-body';
     panel.append(header, body);
     return panel;
   }
 
-  // Incrementally refresh the control & history sector: re-fetch session detail
-  // (drives control matrix) and action history, then re-render side panel only.
-  async function refreshSector() {
-    const sid = state.selectedBrowserSessionId;
-    const nid = state.selectedNagentId;
-    const bapi = browserApi();
-    if (!sid || !bapi) return;
-    const btn = ui.byId('browser-side-refresh');
-    if (btn) btn.disabled = true;
-    try {
-      const detail = await bapi.getSession(sid, nid);
-      state.sessionDetail = detail;
-      const actionsResult = await bapi.listActions(sid, nid);
-      state.actions = (actionsResult && actionsResult.actions) || [];
-      state.sideLoaded = true;
-      state.lastError = null;
-      renderSide();
-    } catch (e) {
-      state.lastError = e;
-    } finally {
-      if (btn) btn.disabled = false;
+  // The side panel has no manual refresh button: it is driven by the
+  // realtime-view poll timer. Action history is fetched every tick; the panel
+  // is re-rendered only when a signature changes, and only the changed section
+  // (controls or action history) is rebuilt so unchanged DOM (scroll position,
+  // focus) is preserved -- no full-panel flicker.
+  function controlSignature(detail) {
+    if (!detail) return '';
+    const challenges = detail.write_challenges || {};
+    const keys = Object.keys(challenges).sort();
+    return (detail.status || '-') + '|' + keys.join(',');
+  }
+
+  function actionSignature(actions) {
+    const list = actions || [];
+    if (list.length === 0) return '0|';
+    const last = list[list.length - 1];
+    return list.length + '|' + (last && last.id ? last.id : '');
+  }
+
+  // Partial in-place refresh of the side panel body. Only sections whose flag
+  // is true are rebuilt; the others are reused as-is (re-attached, which in a
+  // real browser preserves the existing node, its descendants and scroll).
+  function renderSidePartial(rebuildControls, rebuildActions) {
+    const body = ui.byId('browser-side-body');
+    if (!body) return;
+    const detail = state.sessionDetail;
+    if (!detail) {
+      body.replaceChildren();
+      ui.renderEmpty(body, '无会话');
+      return;
     }
+    const cur = body.children || [];
+    const hasControls = cur[0] && String(cur[0].className || '').indexOf('browser-controls') !== -1;
+    const hasActions = cur[1] && String(cur[1].className || '').indexOf('browser-actions') !== -1;
+    const controlsNode = (!rebuildControls && hasControls) ? cur[0] : renderControls(detail);
+    const actionsNode = (!rebuildActions && hasActions) ? cur[1] : renderActionHistory();
+    body.replaceChildren(controlsNode, actionsNode);
   }
 
   function renderSide() {
@@ -495,45 +436,40 @@
       wrap.appendChild(empty);
       return wrap;
     }
-    // Show latest first; cleaned summary only (action_type/status/duration/error_code).
-    const table = document.createElement('table');
-    table.className = 'document-table browser-actions-table';
-    const thead = document.createElement('thead');
-    const headerRow = document.createElement('tr');
-    ['时间', '操作', '状态', '耗时', '错误码'].forEach((label) => {
-      const th = document.createElement('th');
-      if (label === '耗时') th.className = 'document-table__numeric';
-      th.textContent = label;
-      headerRow.appendChild(th);
-    });
-    thead.appendChild(headerRow);
-    const tbody = document.createElement('tbody');
+    // 侧列仅 20% 宽度，5 列表格不再合适；改用紧凑纵向列表，最新在前。
+    // 仅展示清洗后的摘要（action_type/status/duration/error_code），全部 textContent 渲染。
+    const list = el('div', 'browser-actions-list');
     for (let i = actions.length - 1; i >= 0; i--) {
       const a = actions[i];
       if (!a) continue;
-      const row = document.createElement('tr');
-      [formatTime(a.created_at), a.action_type || '-'].forEach((value) => {
-        const cell = document.createElement('td');
-        cell.textContent = value;
-        row.appendChild(cell);
-      });
-      const statusCell = document.createElement('td');
-      const statusBadge = el('span', 'badge badge--' + actionStatusBadge(a.status));
-      statusBadge.textContent = a.status || '-';
-      statusCell.appendChild(statusBadge);
-      row.appendChild(statusCell);
-      const durationCell = document.createElement('td');
-      durationCell.className = 'document-table__numeric';
-      durationCell.textContent = formatDuration(a.duration_ms);
-      row.appendChild(durationCell);
-      const errorCell = document.createElement('td');
-      errorCell.textContent = a.error_code || '-';
-      row.appendChild(errorCell);
-      tbody.appendChild(row);
+      list.appendChild(renderActionItem(a));
     }
-    table.append(thead, tbody);
-    wrap.appendChild(table);
+    wrap.appendChild(list);
     return wrap;
+  }
+
+  function renderActionItem(a) {
+    const item = el('div', 'browser-actions-item');
+    const head = el('div', 'browser-actions-item__head');
+    const type = el('span', 'browser-actions-item__type');
+    type.textContent = a.action_type || '-';
+    const badge = el('span', 'badge badge--' + actionStatusBadge(a.status));
+    badge.textContent = a.status || '-';
+    head.append(type, badge);
+    item.appendChild(head);
+    const time = el('div', 'browser-actions-item__time muted');
+    time.textContent = formatTime(a.created_at);
+    item.appendChild(time);
+    const parts = [];
+    const dur = formatDuration(a.duration_ms);
+    if (dur && dur !== '-') parts.push(dur);
+    if (a.error_code) parts.push(a.error_code);
+    if (parts.length > 0) {
+      const extra = el('div', 'browser-actions-item__extra muted');
+      extra.textContent = parts.join(' · ');
+      item.appendChild(extra);
+    }
+    return item;
   }
 
   function actionStatusBadge(status) {
@@ -547,7 +483,6 @@
   function startPolling() {
     stopPolling();
     if (!state.selectedBrowserSessionId) return;
-    state.pollMs = readPollMs();
     pollGeneration++;
     const gen = pollGeneration;
     pollTimer = setInterval(() => { pollTick(gen); }, state.pollMs);
@@ -572,14 +507,19 @@
       const detail = await bapi.getSession(sid, nid);
       if (gen !== pollGeneration) return;
       state.sessionDetail = detail;
-      let shouldRenderSide = false;
-      if (!state.sideLoaded) {
-        const actionsResult = await bapi.listActions(sid, nid);
-        if (gen !== pollGeneration) return;
-        state.actions = (actionsResult && actionsResult.actions) || [];
-        state.sideLoaded = true;
-        shouldRenderSide = true;
-      }
+      // Fetch action history every tick so any new action (click/type/navigate)
+      // is detected promptly. The side panel is re-rendered only when a
+      // signature actually changes -- controls when status/available write
+      // challenges change, history when count+latest-id change -- so idle ticks
+      // skip the render entirely (no flicker). Fetching before renderMain keeps
+      // the main view's page info in sync with the latest action.
+      const actionsResult = await bapi.listActions(sid, nid);
+      if (gen !== pollGeneration) return;
+      state.actions = (actionsResult && actionsResult.actions) || [];
+      const cSig = controlSignature(detail);
+      const aSig = actionSignature(state.actions);
+      const rebuildControls = cSig !== state.lastControlSig;
+      const rebuildActions = aSig !== state.lastActionSig;
       // Fetch takeover-view URL on-demand when entering takeover
       if (detail.status === 'takeover' && !state.takeoverView) {
         try {
@@ -592,7 +532,11 @@
       }
       if (gen !== pollGeneration) return;
       renderMain();
-      if (shouldRenderSide) renderSide();
+      if (rebuildControls || rebuildActions) {
+        renderSidePartial(rebuildControls, rebuildActions);
+      }
+      state.lastControlSig = cSig;
+      state.lastActionSig = aSig;
       if (detail.status === 'closed') stopPolling();
     } catch (e) {
       if (gen !== pollGeneration) return;
@@ -602,6 +546,8 @@
         stopPolling();
         state.sessionDetail = null;
         state.selectedBrowserSessionId = null;
+        state.lastControlSig = null;
+        state.lastActionSig = null;
         renderMain();
         renderSide();
       }
@@ -621,32 +567,20 @@
     if (!bapi) return;
     try {
       await bapi.write(op, detail.id, state.selectedNagentId, token);
-      // Refresh session detail immediately (new write_challenges for new status)
-      pollGeneration++;
-      const gen = pollGeneration;
-      await pollTick(gen);
-      await refreshSidePanel();
     } catch (e) {
       if (modal && typeof modal.alert === 'function') {
         await modal.alert('操作失败: ' + (e && e.message ? e.message : e));
       }
-      // Re-fetch to refresh challenges even on failure
-      try {
-        await pollTick(pollGeneration);
-        await refreshSidePanel();
-      } catch (_) { /* ignore */ }
     }
-  }
-
-  async function refreshSidePanel() {
-    const sid = state.selectedBrowserSessionId;
-    const nid = state.selectedNagentId;
-    const bapi = browserApi();
-    if (!sid || !bapi) return;
-    const actionsResult = await bapi.listActions(sid, nid);
-    state.actions = (actionsResult && actionsResult.actions) || [];
-    state.sideLoaded = true;
-    renderSide();
+    // A write (success or failure) invalidates challenges and may change
+    // status. Reset the side-panel signatures so the next poll forces a
+    // partial rebuild of the changed sections. A write also invalidates the
+    // current generation; recreate the interval (merely incrementing
+    // pollGeneration leaves the old timer alive but permanently inert after
+    // Release) -- startPolling fires an immediate pollTick for the refresh.
+    state.lastControlSig = null;
+    state.lastActionSig = null;
+    startPolling();
   }
 
   // ---- session selection ----
@@ -657,9 +591,10 @@
     state.selectedNagentId = nagentId;
     state.sessionDetail = null;
     state.actions = [];
-    state.sideLoaded = false;
     state.takeoverView = null;
     state.lastError = null;
+    state.lastControlSig = null;
+    state.lastActionSig = null;
     renderMain();
     renderSide();
     startPolling();
@@ -670,7 +605,6 @@
   async function load() {
     const node = root();
     if (!node) return;
-    state.pollMs = readPollMs();
     const bapi = browserApi();
     if (!bapi) {
       node.replaceChildren();

@@ -123,6 +123,7 @@ def create_dashboard_router(
     task_run_service=None,
     browser_dashboard_service=None,
     browser_confirmation_service=None,
+    browser_novnc_proxy=None,
     browser_actor_resolver=None,
     dashboard_tool_approval_bridge=None,
     tool_approval_service=None,
@@ -201,6 +202,7 @@ def create_dashboard_router(
             browser_confirmation_service,
             browser_actor_resolver,
             settings,
+            no_vnc_proxy=browser_novnc_proxy,
         )
 
     @router.get("/chat/sessions")
