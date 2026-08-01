@@ -183,7 +183,7 @@
     cancelBtn.addEventListener('click', closeEditModal);
     const saveBtn = document.createElement('button');
     saveBtn.type = 'submit';
-    saveBtn.className = 'btn';
+    saveBtn.className = 'btn btn--primary';
     saveBtn.textContent = '保存';
     saveBtn.disabled = true;
     actions.append(status, cancelBtn, saveBtn);

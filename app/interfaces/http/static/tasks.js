@@ -480,6 +480,11 @@
     const titleSpan = el('span', '');
     titleSpan.textContent = detail.title || detail.id;
     panelHeader.appendChild(titleSpan);
+    // Lifecycle actions (cancel/retry/delete) live in the panel-header
+    // top-right, mirroring the board's panel-actions pattern; approval
+    // (approve/reject + note) stays in the body as it carries a textarea.
+    const headerActions = buildStatusActions(id, detail);
+    if (headerActions) panelHeader.appendChild(headerActions);
     panel.appendChild(panelHeader);
 
     const body = el('div', 'panel-body');
@@ -487,6 +492,40 @@
     panel.appendChild(body);
     page.appendChild(panel);
     root.appendChild(page);
+  }
+
+  // Lifecycle action buttons (cancel/retry/delete) for the panel-header
+  // top-right. Returns the panel-actions container, or null when the status
+  // exposes no lifecycle action. Approval actions stay in the body because
+  // they carry a note textarea.
+  function buildStatusActions(id, detail) {
+    const actions = el('div', 'panel-actions');
+    // 取消任务仅对进行中状态开放；失败/过期任务不再展示取消按钮。
+    if (['queued', 'running', 'waiting_approval'].indexOf(detail.status) !== -1) {
+      const cancelBtn = el('button', 'btn btn--danger');
+      cancelBtn.type = 'button'; cancelBtn.textContent = '取消任务';
+      cancelBtn.addEventListener('click', async () => {
+        try { await api.task.cancel(id); openDetail(id); }
+        catch (e) { await showTaskActionError('取消失败：' + (e && e.message ? e.message : e)); }
+      });
+      actions.appendChild(cancelBtn);
+    }
+    if (['failed', 'expired'].indexOf(detail.status) !== -1) {
+      const retryBtn = el('button', 'btn btn--primary');
+      retryBtn.type = 'button'; retryBtn.textContent = '重试';
+      retryBtn.addEventListener('click', async () => {
+        try { await api.task.retry(id); openDetail(id); }
+        catch (e) { await showTaskActionError('重试失败：' + (e && e.message ? e.message : e)); }
+      });
+      actions.appendChild(retryBtn);
+    }
+    if (DELETABLE_STATUSES.indexOf(detail.status) !== -1) {
+      const deleteBtn = el('button', 'btn btn--danger');
+      deleteBtn.type = 'button'; deleteBtn.textContent = '删除';
+      deleteBtn.addEventListener('click', () => { removeTask(id); });
+      actions.appendChild(deleteBtn);
+    }
+    return actions.children.length ? actions : null;
   }
 
   function buildDetailContent(body, id, response, detail) {
@@ -584,7 +623,7 @@
         try { await api.task.approve(id, note); openDetail(id); }
         catch (e) { setApprovalBusy(approvalActions, false); await showTaskActionError('批准失败：' + (e && e.message ? e.message : e)); }
       });
-      const rejectBtn = el('button', 'btn');
+      const rejectBtn = el('button', 'btn btn--danger');
       rejectBtn.type = 'button'; rejectBtn.textContent = '拒绝';
       rejectBtn.addEventListener('click', async () => {
         const note = noteInput.value.trim() || null;
@@ -595,37 +634,6 @@
       approvalActions.append(rejectBtn, approveBtn);
       body.appendChild(approvalActions);
     }
-
-    // Terminal-ish actions: cancel / retry via buttons. After a successful
-    // action, reload the detail in place to reflect the new status; delete
-    // returns to the board.
-    const statusActions = el('div', 'providers-form__actions');
-    // 取消任务仅对进行中状态开放；失败/过期任务不再展示取消按钮。
-    if (['queued', 'running', 'waiting_approval'].indexOf(detail.status) !== -1) {
-      const cancelBtn = el('button', 'btn');
-      cancelBtn.type = 'button'; cancelBtn.textContent = '取消任务';
-      cancelBtn.addEventListener('click', async () => {
-        try { await api.task.cancel(id); openDetail(id); }
-        catch (e) { await showTaskActionError('取消失败：' + (e && e.message ? e.message : e)); }
-      });
-      statusActions.appendChild(cancelBtn);
-    }
-    if (['failed', 'expired'].indexOf(detail.status) !== -1) {
-      const retryBtn = el('button', 'btn');
-      retryBtn.type = 'button'; retryBtn.textContent = '重试';
-      retryBtn.addEventListener('click', async () => {
-        try { await api.task.retry(id); openDetail(id); }
-        catch (e) { await showTaskActionError('重试失败：' + (e && e.message ? e.message : e)); }
-      });
-      statusActions.appendChild(retryBtn);
-    }
-    if (DELETABLE_STATUSES.indexOf(detail.status) !== -1) {
-      const deleteBtn = el('button', 'btn btn--danger');
-      deleteBtn.type = 'button'; deleteBtn.textContent = '删除任务';
-      deleteBtn.addEventListener('click', () => { removeTask(id); });
-      statusActions.appendChild(deleteBtn);
-    }
-    if (statusActions.children.length) body.appendChild(statusActions);
   }
 
   namespace.tasks = { init, refresh };

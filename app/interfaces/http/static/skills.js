@@ -366,7 +366,7 @@
     cancel.type = 'button';
     cancel.textContent = '取消';
     cancel.addEventListener('click', closeForm);
-    const save = ui.el('button', 'btn primary');
+    const save = ui.el('button', 'btn btn--primary');
     save.type = 'submit';
     save.textContent = '保存';
     actions.append(cancel, save);

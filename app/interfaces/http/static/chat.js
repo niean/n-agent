@@ -336,6 +336,15 @@
     cancel: '取消',
     retry: '重试',
   };
+  // Button class per action semantic, aligned to the shared .btn system
+  // (primary=positive action, danger=destructive action, btn=neutral).
+  const TASK_ACTION_BTN_CLASS = {
+    approve: 'btn btn--primary',
+    retry: 'btn btn--primary',
+    reject: 'btn btn--danger',
+    cancel: 'btn btn--danger',
+    revise: 'btn',
+  };
   // Explicit handler allowlist: action string -> fixed api.task function.
   // Prevents dynamic api.task[action] indexing that could call arbitrary API methods.
   const TASK_CARD_ACTION_HANDLERS = {
@@ -631,7 +640,7 @@
         }
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'task-card__btn';
+        btn.className = TASK_ACTION_BTN_CLASS[action] || 'btn';
         btn.dataset.action = action;
         btn.dataset.taskId = card.task_id;
         btn.textContent = TASK_ACTION_LABELS[action] || action;
@@ -883,9 +892,7 @@
     var result = [];
     function walk(node) {
       if (!node) return;
-      if (node.tagName === 'BUTTON' && node.className &&
-          typeof node.className === 'string' &&
-          node.className.indexOf('tool-approval-card__btn') !== -1) {
+      if (node.tagName === 'BUTTON' && node.dataset && node.dataset.choice) {
         result.push(node);
       }
       var kids = childNodesOf(node);
@@ -899,6 +906,9 @@
   // at module scope so label changes need only one edit.
   var APPROVAL_CHOICE_LABELS = { once: '仅本次允许', trust_session: '信任本会话', cancel: '拒绝' };
   var APPROVAL_CHOICE_ORDER = ['once', 'trust_session', 'cancel'];
+  // Button class per choice semantic, aligned to the shared .btn system:
+  // approve choices (once/trust_session) use primary, reject (cancel) uses danger.
+  var APPROVAL_CHOICE_BTN_CLASS = { once: 'btn btn--primary', trust_session: 'btn btn--primary', cancel: 'btn btn--danger' };
   // Trust-scope labels surfaced on the resolved card after a refresh. The
   // server persists decision.scope ("once" | "session"); an approved card
   // shows "已批准 · {scope label}" so the post-resolution state retains the
@@ -956,7 +966,7 @@
       (function (choice) {
         var btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'tool-approval-card__btn';
+        btn.className = APPROVAL_CHOICE_BTN_CLASS[choice] || 'btn';
         btn.dataset.choice = choice;
         btn.textContent = APPROVAL_CHOICE_LABELS[choice] || choice;
         btn.addEventListener('click', function () {
@@ -1096,7 +1106,7 @@
     // work task / judge task 单独卡片（1-message group，无 _mergedTaskStatus）：
     // summary = 前缀+content，pre 放原始 content，open=false，className `msg system`。
     const isFoldedProcess = isProcessUser && isFoldableProcessContent(message.content) && !isMergedTaskStatus;
-    // 进程来源 user 消息：左对齐状态卡片（灰底卡片样式，区别于真人 user 蓝底右对齐气泡）。
+    // 进程来源 user 消息：右对齐状态卡片（灰底卡片样式，与真人 user 蓝底右对齐气泡同处右侧、靠灰底区分）。
     // work task / judge task / 合并卡片 样式打平 ui.task_lifecycle 任务状态卡片（msg system）；
     // 其余进程消息（schedule/curator 等）沿用 msg--process-card 非折叠样式。
     el.className = isTaskResult ? 'msg assistant'
@@ -1197,7 +1207,7 @@
       return el;
     }
     // 进程来源 user 消息（task/schedule/curator，非 work task/judge task 前缀）：
-    // 原样渲染为非折叠左对齐状态卡片；多模态 list content 原样处理。
+    // 原样渲染为非折叠右对齐状态卡片；多模态 list content 原样处理。
     const content = message.content;
     if (Array.isArray(content)) {
       let hasText = false;

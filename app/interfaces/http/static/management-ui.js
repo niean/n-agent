@@ -84,7 +84,7 @@
       cancelBtn.textContent = options.cancelLabel || '取消';
       const confirmBtn = document.createElement('button');
       confirmBtn.type = 'submit';
-      confirmBtn.className = 'btn';
+      confirmBtn.className = options.confirmVariant || 'btn btn--danger';
       confirmBtn.textContent = options.confirmLabel || '确认';
       actions.append(cancelBtn, confirmBtn);
       frame.form.appendChild(actions);

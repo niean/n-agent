@@ -147,9 +147,9 @@ label { display: flex; flex-direction: column; gap: 6px; color: var(--color-fg-m
 input, textarea, select { width: 100%; padding: 8px 10px; color: var(--color-fg-default); background: var(--color-on-primary); border: 1px solid var(--color-border-default); border-radius: 4px; }
 textarea { min-height: 90px; resize: vertical; }
 .btn { padding: var(--space-4) var(--space-7); color: var(--color-fg-muted); background: var(--color-on-primary); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); transition: all 0.2s; }
-.btn:hover, .btn--primary { color: var(--color-on-primary); background: var(--color-primary); border-color: var(--color-primary); }
-.btn--danger { color: var(--color-on-primary); background: var(--color-danger); border-color: var(--color-danger); }
+.btn:hover { color: var(--color-on-primary); background: var(--color-primary); border-color: var(--color-primary); }
 .btn:disabled, .btn:disabled:hover { color: var(--color-fg-subtle); background: var(--color-bg-subtle); border-color: var(--color-border-muted); cursor: not-allowed; opacity: 0.6; }
+.btn--primary, .btn--danger { padding: var(--space-4) var(--space-7); color: var(--color-fg-muted); background: var(--color-on-primary); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); transition: all 0.2s; }
 .document-table { width: 100%; border-collapse: collapse; font-size: var(--font-size-md); }
 .document-table th, .document-table td { padding: var(--space-6); border-bottom: 1px solid var(--color-border-light); text-align: left; vertical-align: middle; }
 .document-table th { color: var(--color-fg-muted); background: var(--color-bg-subtle); font-weight: 600; }
@@ -206,12 +206,13 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .msg.system { align-self: flex-start; max-width: 92%; background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); color: var(--color-fg-muted); border-radius: 8px; padding: 8px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .msg.system summary { cursor: pointer; font-family: var(--font-family-base); font-weight: 600; }
 .msg.system pre { margin-top: 8px; background: rgba(255, 255, 255, 0.55); }
-/* 进程消息状态卡片：task/schedule/curator 等非真人 user 输入，左对齐灰底卡片，
-   区别于真人 user 的 --color-primary 蓝底右对齐气泡；底色与 task 调试卡（.msg.system）
-   一致使用 --color-bg-subtle，圆角与卡片感对齐 .task-card 样式。
+/* 进程消息状态卡片：task/schedule/curator 等非真人 user 输入，右对齐灰底卡片，
+   与真人 user 的 --color-primary 蓝底右对齐气泡同处右侧、靠灰底卡片样式区分；
+   水平最大宽度继承 .msg 基类 80%，与 .msg.user 用户气泡保持一致（不单独覆盖）。
+   底色与 task 调试卡（.msg.system）一致使用 --color-bg-subtle，圆角与卡片感对齐 .task-card 样式。
    work task / judge task 前缀的消息（单独或合并）样式打平 ui.task_lifecycle 任务状态卡片（.msg.system），
    不再使用 msg--process-card 样式，详见 chat.js createMessageElement isFoldedProcess / isMergedTaskStatus 分支。 */
-.msg--process-card { align-self: flex-start; max-width: 92%; background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); color: var(--color-fg-muted); border-radius: 8px; border-bottom-left-radius: 4px; }
+.msg--process-card { align-self: flex-end; background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); color: var(--color-fg-muted); border-radius: 8px; border-bottom-right-radius: 4px; }
 .msg.error { align-self: center; max-width: 92%; background: var(--color-danger-bg); border: 1px solid var(--color-danger-border); color: var(--color-danger-fg); font-size: 12px; }
 .msg img { display: block; max-width: 240px; max-height: 240px; border-radius: 8px; margin-top: 4px; cursor: zoom-in; }
 .msg.user img { max-width: 220px; max-height: 220px; }
@@ -235,9 +236,6 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .task-card__actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; margin-top: 4px; }
 .task-card__label { display: flex; flex-direction: column; gap: 4px; color: var(--color-fg-muted); font-size: 12px; flex-basis: 100%; }
 .task-card__textarea { width: 100%; min-height: 60px; max-height: 160px; padding: 6px 8px; border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); font: inherit; font-size: 13px; color: var(--color-fg-default); background: var(--color-bg-white); resize: vertical; }
-.task-card__btn { padding: 5px 12px; color: var(--color-fg-muted); background: var(--color-bg-white); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
-.task-card__btn:hover:not(:disabled) { background: var(--color-bg-hover); color: var(--color-fg-default); border-color: var(--color-border-default); }
-.task-card__btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .task-card__feedback { font-size: 12px; color: var(--color-fg-subtle); min-height: 16px; }
 /* Stale feedback surfaces the recorded decision (or a concise status-changed
    notice) as a light-gray hint, not a warning: the outcome is informational.
@@ -247,16 +245,14 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 
 /* Generic tool approval card (Dashboard chat): reusable inline card for any
    CONFIRM tool. Independent of task cards. All fields rendered via textContent
-   (no innerHTML). Three uniform buttons: once / trust_session / cancel. */
+   (no innerHTML). Three buttons aligned to the shared .btn system: once /
+   trust_session (primary) and cancel (danger). */
 .tool-approval-card { margin-top: 8px; padding: 10px 12px; background: var(--color-warning-bg); border: 1px solid var(--color-warning-border); border-radius: var(--radius-lg); font-size: 13px; }
 .tool-approval-card__title { font-weight: 600; color: var(--color-warning-fg); margin-bottom: 6px; }
 .tool-approval-card__field { color: var(--color-fg-default); word-break: break-word; line-height: 1.5; }
 .tool-approval-card__args { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; }
 .tool-approval-card__expires { font-size: 12px; color: var(--color-fg-subtle); }
 .tool-approval-card__actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-.tool-approval-card__btn { padding: 5px 12px; color: var(--color-fg-muted); background: var(--color-bg-white); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); cursor: pointer; font-size: 13px; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
-.tool-approval-card__btn:hover:not(:disabled) { background: var(--color-bg-hover); color: var(--color-fg-default); }
-.tool-approval-card__btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .tool-approval-card__feedback { font-size: 12px; color: var(--color-fg-subtle); min-height: 16px; margin-top: 6px; }
 
 /* Hover timestamp (飞书风格): 鼠标悬停消息气泡时，在气泡上方展示小号灰色时间。

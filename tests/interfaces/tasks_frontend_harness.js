@@ -477,7 +477,7 @@ async function testDetailDeleteButtonOnTerminalTask() {
 
   const detailView = byId['tasks-detail-view'];
   ok(!!detailView && !detailView.hidden, 'detail page open for terminal task');
-  const delBtn = created.find((n) => n.tag === 'button' && n.textContent === '删除任务' && n.className.indexOf('btn--danger') !== -1);
+  const delBtn = created.find((n) => n.tag === 'button' && n.textContent === '删除' && n.className.indexOf('btn--danger') !== -1);
   ok(!!delBtn, 'detail renders 删除任务 button (btn--danger) for terminal task');
 
   // Regression: queued (in-flight) task detail must NOT show 删除任务.
@@ -494,7 +494,7 @@ async function testDetailDeleteButtonOnTerminalTask() {
   (qCard._listeners.click || []).forEach((fn) => fn());
   await tick();
   await tick();
-  const qDel = created.find((n) => n.tag === 'button' && n.textContent === '删除任务');
+  const qDel = created.find((n) => n.tag === 'button' && n.textContent === '删除');
   ok(!qDel, 'queued task detail has no 删除任务 button');
 }
 

@@ -534,13 +534,13 @@
   function renderDeleteConfirm(parent) {
     const wrapper = document.createElement('div');
     wrapper.className = 'providers-form';
-    renderModalHeader(wrapper, '删除任务');
+    renderModalHeader(wrapper, '删除');
     if (state.modal.error) appendText(wrapper, 'div', state.modal.error, 'error-state');
     appendText(wrapper, 'p', `确认删除“${text(state.modal.task.name, state.modal.task.id)}”？删除后不可恢复。`);
     const actions = document.createElement('div');
     actions.className = 'providers-form__actions';
     const cancelBtn = button('取消', 'btn', closeModal);
-    const confirmBtn = button('确认', 'btn', async () => {
+    const confirmBtn = button('确认', 'btn btn--danger', async () => {
       try {
         await api.deleteScheduledTask(state.modal.task.id);
         closeModal();
