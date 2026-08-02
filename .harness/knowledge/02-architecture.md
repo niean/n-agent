@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界、Skill 自进化写入治理与 Curator 周期维护（13 个领域 Policy） -->
+<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界、Skill 自进化写入治理、Task 与 Browser 子域（15 个领域 Policy） -->
 # 架构与模块边界
 
 ## 架构定位
@@ -9,7 +9,7 @@
 
 项目严格遵循领域驱动设计 DDD，采用外层依赖内层的方向：Interfaces -> Application -> Domain。Infrastructure 只实现 Domain 定义的端口，并在应用启动时注入。
 
-- Domain 层：核心子域包括 TurnLoop、Context、LLM、Memory、Tool，支撑子域包括 Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation；各子域定义自己的模型、值对象和端口协议。`app/domain/policy.py` 是 Domain Shared Kernel，统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`、`ExecutionMode`；13 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy、HostTerminalPolicy、SkillPolicy、CuratorPolicy）各自独立，不跨域导入。Storage 与 Model Provider 通过领域端口形成外部边界。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
+- Domain 层：核心子域包括 TurnLoop、Context、LLM、Memory、Tool，支撑子域包括 Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Task、Sandbox、Browser、Host Terminal、Usage/Observation；各子域定义自己的模型、值对象和端口协议。`app/domain/policy.py` 是 Domain Shared Kernel，统一 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`、`ExecutionMode`；15 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy、HostTerminalPolicy、SkillPolicy、CuratorPolicy、TaskPolicy、BrowserPolicy）各自独立，不跨域导入。Storage 与 Model Provider 通过领域端口形成外部边界。详细 DDD 领域模型见 `.harness/knowledge/06-domain-model.md`。
 - Application 层：编排用例和 Agent Runtime。LangGraph 属于本层，只负责状态图和运行流程编排。
 - Infrastructure 层：实现外部依赖细节，包括 OpenAI-compatible Provider、SQLite store、内置工具 handler、Knowledge HTTP adapter、配置加载等。
 - Interfaces 层：实现 FastAPI、OpenAI-compatible API、Dashboard 和协议转换。
@@ -49,9 +49,9 @@
 
 ## Policy Mesh 治理架构
 
-Policy Mesh 是 N-Agent 的运行时治理层，由 14 个领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成。每个 Policy 独立决策一个治理维度，Application Service 在外部调用前封口执行。
+Policy Mesh 是 N-Agent 的运行时治理层，由 15 个领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成。每个 Policy 独立决策一个治理维度，Application Service 在外部调用前封口执行。
 
-### 14 个领域 Policy
+### 15 个领域 Policy
 
 | Policy | Domain 文件 | 治理维度 | 执行点 |
 |--------|------------|---------|--------|
@@ -69,6 +69,7 @@ Policy Mesh 是 N-Agent 的运行时治理层，由 14 个领域 Policy + Shared
 | SkillPolicy | `skill_policy.py` | Skill 写入权限/来源/审批 | SkillService.manage_skill |
 | CuratorPolicy | `curator_policy.py` | Curator 自动迁移与 archive 决策（protected seed/pinned/user/seed 门禁） | SkillCuratorService.apply_automatic_transitions |
 | TaskPolicy | `task_policy.py` | Task 状态迁移合法性、claim 原子性、断路器（consecutive_failures > max_retries）、unblock-loop breaker | TaskRunService._finalize_run / _decide_target_status |
+| BrowserPolicy | `browser_policy.py` | 浏览器后端准入、会话状态、截图释放与接管 | BrowserService |
 
 约束：Domain Policy 不导入 Application/Infrastructure；一个 Policy 不导入另一个 Policy（AST 测试 `tests/architecture/test_policy_boundaries.py` 强制）。
 

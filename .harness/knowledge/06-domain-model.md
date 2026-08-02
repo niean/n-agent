@@ -17,12 +17,15 @@ Agent Runtime
 │   ├── Memory：记忆管理，包括会话记忆、跨会话的外部记忆
 │   └── Tool：工具契约与执行编排，把模型 tool_calls 转换为受控的工具执行
 ├── 支撑子域
+│   ├── Schedule：定时任务定义、调度、租约执行与结果投递
+│   ├── Task：目标型后台任务的状态、调度、执行、审批与产物
 │   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
 │   ├── MCP：MCP site 注册与工具同步，把远程 MCP server 工具暴露给 LLM 调用
 │   ├── Plugin：本地插件包扫描、启停、配置和工具动态注入
-│   ├── Skill：本地SKILL.md包管理，通过skills_list/skill_view暴露给 LLM 自助使用
+│   ├── Skill：本地 SKILL.md 包的读写、审批、自进化与周期维护
 │   ├── Sandbox：受控代码执行子域execute_code(Python)、terminal(Shell)
-│   ├── Schedule：定时任务定义、调度、租约执行与结果投递
+│   ├── Host Terminal：经宿主 Bridge 和独立 Policy 授权的本地命令执行
+│   ├── Browser：浏览器会话、操作、接管与宿主/容器双后端
 │   ├── Gateway：统一飞书、CLI/TUI、ACP 的交互消息、入口会话、命令与确认，并路由至ChatCompletionService
 │   ├── Platform：飞书等外部消息平台抽象，生命周期管理
 │   └── Usage/Observation：模型用量、成本、上下文构成与压缩收益观测
@@ -551,9 +554,32 @@ Skill 自进化是 Agent Runtime 对会话摘要的后台审查，把可复用�
 本地 Shell：terminal 工具在 Sandbox 子域执行（workspace 只读、scratch 可写、workdir 仅允许 scratch/workspace），详见 ## Sandbox 章节；host_terminal 走宿主子域独立 Policy。
 
 ## Browser Use
-Container VNC：Chromium → Xvfb → x11vnc → noVNC → websockify → Dashboard。Chromium 运行在 Xvfb 提供的虚拟显示器中，Playwright 通过 CDP `9222` 执行 Agent 自动化动作；x11vnc 将该显示器发布为 VNC，noVNC 作为浏览器端 HTML5 VNC 客户端，websockify 负责把Dashboard浏览器 WebSocket 转换为 VNC TCP 流量。
+浏览器自动化，可选后端包括容器、本地CDP。
 
+- 容器：Playwright 通过 CDP 控制容器内 Chromium；Xvfb/noVNC 把同一画面送到 Dashboard，Agent 和人操作同一个页面。
+- 本地 CDP：N-Agent 请求宿主 Bridge；Bridge 验证授权后启动并控制独立 Chrome。专用 Profile 保留登录态，不影响日常 Chrome。
 
+```mermaid
+%% align: left
+flowchart LR
+  Tool("Browser Tool<br/>Agent 操作入口") --> Service("BrowserService<br/>会话与策略编排")
+
+  Service --> Container("ContainerBrowserBackend<br/>容器后端适配")
+  Container --> PW1("Playwright<br/>浏览器自动化驱动")
+  PW1 -->|"CDP：Chrome 控制协议"| Chromium("Chromium<br/>容器浏览器")
+  Chromium -.->|画面| Xvfb("Xvfb<br/>虚拟显示器")
+  Xvfb --> x11vnc("x11vnc<br/>VNC 服务端")
+  x11vnc --> websockify("websockify<br/>WebSocket/VNC 转换")
+  websockify --> noVNC("noVNC<br/>浏览器端 VNC 客户端")
+  noVNC --> Dashboard("Dashboard<br/>用户查看与接管界面")
+
+  Service --> Host("HostCdpBrowserBackend<br/>宿主后端适配")
+  Host --> Bridge("Host Bridge<br/>鉴权与请求转发")
+  Bridge --> Controller("HostChromeController<br/>Chrome 生命周期管理")
+  Controller --> PW2("Playwright<br/>浏览器自动化驱动")
+  PW2 -->|"CDP：Chrome 控制协议"| Chrome("独立 Chrome<br/>实际浏览器")
+  Profile("Profile<br/>保存登录态") --> Chrome
+```
 
 ---
 ---
@@ -744,6 +770,7 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | Skill | 实体 | Skill | 本地 SKILL.md 包及启用、就绪和扫描状态 |
 | Skill | 值对象 | SkillFrontmatter / SkillReadiness | Skill 元数据和就绪状态 |
 | Skill | 端口 | SkillRegistry | Skill 元数据持久化边界 |
+| Skill | 领域策略 | SkillPolicy / CuratorPolicy | Skill 写入与周期维护决策 |
 | Knowledge | 实体 | KnowledgeBase | KB 后端实例的脱敏配置和探测状态 |
 | Knowledge | 值对象 | KnowledgeBaseSecret / KnowledgeSearchRequest / KnowledgeSearchResult | KB 密钥、标准检索请求和结果 |
 | Knowledge | 端口 | KnowledgeBaseRegistry / KnowledgeRetriever / KnowledgeRetrieverFactory | KB 注册、检索和 adapter 创建边界 |
@@ -764,6 +791,17 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | Schedule | 值对象 | ScheduleExpression / ScheduleTimezone / ScheduledTaskClaim / ScheduledTaskLease | 调度表达式、时区、claim 和租约 |
 | Schedule | 值对象 | DeliveryTarget / DeliveryResult / ScheduledExecutionPolicy | 投递目标、结果和无人值守执行策略 |
 | Schedule | 端口 | ScheduledTaskRegistry / ScheduleCalculator / PromptSafetyScanner / OutboundDelivery | 任务持久化、调度计算、Prompt 安全和投递边界 |
+| Task | 聚合根 | Task | 目标型后台任务及其状态机 |
+| Task | 实体 | TaskRun / TaskComment / TaskEvent / TaskAttachment / TaskArtifact | 执行记录、留言、事件、附件和产物 |
+| Task | 端口 | TaskRegistry / TaskDispatcher / TaskNotifier | 任务持久化、派发与通知边界 |
+| Task | 领域策略 | TaskPolicy | 状态迁移、claim 与失败处理 |
+| Browser | 实体 | BrowserSession | 浏览器会话与状态机 |
+| Browser | 值对象 | NavigateAction / ObserveAction / ClickAction / TypeAction / ScrollAction / ScreenshotAction | 浏览器操作契约 |
+| Browser | 端口 | BrowserBackend / BrowserSessionRegistry | 浏览器后端与会话持久化边界 |
+| Browser | 领域策略 | BrowserPolicy | 后端准入、会话操作、截图释放与接管决策 |
+| Host Terminal | 值对象 | HostCommandTarget / HostSkillScriptTarget / HostTerminalExecutionLimits | 宿主执行目标与限额 |
+| Host Terminal | 端口 | HostTerminalBridgeClient | 宿主 Bridge 调用边界 |
+| Host Terminal | 领域策略 | HostTerminalPolicy | 命令和 Skill 脚本的精确授权 |
 | Sandbox | 值对象 | SandboxExecutionRequest / SandboxExecutionResult | execute_code 的执行入参与结果 |
 | Sandbox | 值对象 | SandboxExecResult | terminal 的 shell 执行结果，非零 returncode 仍可表示 SUCCESS |
 | Sandbox | 实体 | SandboxExecutionHistoryEntry | execute_code 与 terminal 共用的执行审计，execution_type 区分类型 |
@@ -775,7 +813,7 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | Usage/Observation | 值对象 | SessionUsageStats / ContextBreakdown / UsageRecord / CompressionStat | 会话累计、上下文构成、调用和压缩记录 |
 | Usage/Observation | 端口 | UsageRecorder / PricingProvider / ContextBreakdownCalculator | 用量持久化、定价查询和上下文分类边界 |
 | Shared Kernel | 共享协议 | Policy / PolicyOutcome / PolicyDecision / PolicyAuditEvent / PolicyAuditSink / ExecutionMode / PolicyDecisionKind | 各领域策略共用的评估协议、决策语言和审计通道 |
-| Policy Mesh | 领域策略 | TurnPolicy / ContextPolicy / LLMPolicy / ToolPolicy / MemoryPolicy / SandboxPolicy / GatewayPolicy / SchedulePolicy / BudgetPolicy / InformationFlowPolicy | 10 个独立领域 Policy，各自治理一个维度，不跨域导入 |
+| Policy Mesh | 领域策略 | TurnPolicy / ContextPolicy / LLMPolicy / ToolPolicy / MemoryPolicy / SandboxPolicy / GatewayPolicy / SchedulePolicy / BudgetPolicy / InformationFlowPolicy / HostTerminalPolicy / SkillPolicy / CuratorPolicy / TaskPolicy / BrowserPolicy | 15 个独立领域 Policy，各自治理一个维度，不跨域导入 |
 | Policy Mesh | 值对象 | BudgetReservationDecision / InformationReleaseDecision / MemoryAccessDecision / SandboxExecutionGrant | 领域 Policy 的 typed decision |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
@@ -812,9 +850,12 @@ LLM tool_calls
 
 - 内置工具：时间、计算、目录列表、文本读取、web_fetch。
 - 知识库工具：`search_knowledge`，按必填 kb_id 检索已注册 KB 后端。
-- Skill 工具：`skills_list` / `skill_view`，SAFE 只读，LLM 自助发现本地 SKILL.md。
+- Skill 工具：`skills_list` / `skill_view` 负责只读发现，`skill_manage` 负责受治理写入。
 - MCP 工具：站点 probe 后动态注入远端工具，走 McpToolExecutor（兼 CompositeToolExecutor.fallback）。
 - Plugin 工具：扫描启用插件后动态注入，走 PluginToolExecutor，配置与 secret 独立存储。
+- 执行工具：`execute_code` / `terminal` 在 Sandbox 中执行，`host_terminal` 经宿主独立授权执行。
+- 浏览器工具：navigate / observe / click / type / scroll / screenshot 六类操作。
+- 定时任务与后台任务工具：分别由 Schedule 和 Task 子域管理。
 
 各类工具共享 ToolService.execute -> CompositeToolExecutor 公共链路，差异在 ToolExecutor 实现层（详见 `## Tool` 章节）。Knowledge 子域只表达 N-Agent 侧的检索 SPI 和 KB 后端实例配置，N-KB、Ragflow 是外部独立服务和协议类型，N-Agent 通过 KnowledgeRetriever adapter 消费它们。
 
@@ -822,7 +863,7 @@ LLM tool_calls
 
 公共 Policy 不是独立全局核心子域，也没有中央 PolicyService。`app/domain/policy.py` 提供 Shared Kernel：`Policy` Protocol、`PolicyOutcome`（allow/deny/require_approval）、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink` Protocol、`ExecutionMode`、`PolicyDecisionKind`（admission/plan/selection/allocation）、`RunPolicyContext`。
 
-Policy Mesh 由 10 个独立领域 Policy 组成，每个治理一个维度，不跨域导入：
+Policy Mesh 由 15 个独立领域 Policy 组成，每个治理一个维度，不跨域导入：
 
 | Policy | 文件 | 治理维度 | Domain 决策类型 |
 |--------|------|---------|----------------|
@@ -836,8 +877,13 @@ Policy Mesh 由 10 个独立领域 Policy 组成，每个治理一个维度，�
 | SchedulePolicy | `schedule_policy.py` | cron安全/claim/投递 | PolicyDecision |
 | BudgetPolicy | `budget_policy.py` | LLM/Tool/Sandbox 配额 | BudgetReservationDecision / BudgetSettleDecision / BudgetReleaseDecision |
 | InformationFlowPolicy | `information_flow_policy.py` | 密级/释放目标/脱敏 | InformationReleaseDecision |
+| HostTerminalPolicy | `host_terminal_policy.py` | 宿主命令和 Skill 脚本授权 | HostTerminalPolicyDecision |
+| SkillPolicy | `skill_policy.py` | Skill 写入权限、来源与审批 | PolicyOutcome |
+| CuratorPolicy | `curator_policy.py` | Skill 周期维护与归档决策 | PolicyOutcome |
+| TaskPolicy | `task_policy.py` | Task 状态迁移、claim 与失败处理 | PolicyOutcome |
+| BrowserPolicy | `browser_policy.py` | 浏览器后端准入、操作、截图与接管 | BrowserPolicyDecision |
 
-Application 层封口执行：`ToolService.execute`（ToolPolicy + Budget + InformationFlow）、`ModelService.call_llm`（LLMPolicy + Budget）、`RuntimeMemoryService`（MemoryPolicy）、`SandboxToolExecutor`（SandboxPolicy + Budget）、`GatewayService`（GatewayPolicy）、`ScheduleRunService`（SchedulePolicy）、`ContextService`（ContextPolicy）、`AgentGraphRunner`（TurnPolicy）。
+Application 层封口执行：`ToolService.execute`（ToolPolicy + Budget + InformationFlow）、`ModelService.call_llm`（LLMPolicy + Budget）、`RuntimeMemoryService`（MemoryPolicy）、`SandboxToolExecutor`（SandboxPolicy + Budget）、`GatewayService`（GatewayPolicy）、`ScheduleRunService`（SchedulePolicy）、`ContextService`（ContextPolicy）、`AgentGraphRunner`（TurnPolicy）、`HostTerminalToolExecutor`（HostTerminalPolicy）、`SkillService`（SkillPolicy）、`SkillCuratorService`（CuratorPolicy）、`TaskRunService`（TaskPolicy）、`BrowserService`（BrowserPolicy）。
 
 `RunPolicySnapshot`（`app/application/policy_snapshot.py`）是不可变 frozen dataclass，携带 10 个 typed config + IngressFacts。审计通道 `PolicyAuditService` 委托 `PolicyAuditSink`，`PolicyAuditEvent` 无敏感字段。
 
@@ -854,7 +900,7 @@ Application 层封口执行：`ToolService.execute`（ToolPolicy + Budget + Info
 - 用例编排、Prompt、LangGraph Runtime 放 Application。
 - FastAPI、Dashboard、OpenAI-compatible 协议适配放 Interfaces。
 - SQLite、HTTP Client、具体工具 handler、Provider Adapter 放 Infrastructure。
-- 跨领域只复用 Policy 决策语言（Shared Kernel）；具体规则归对应领域的 `XPolicy`，当前有 10 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy），Policy 间不跨域导入。
+- 跨领域只复用 Policy 决策语言（Shared Kernel）；具体规则归对应领域的 `XPolicy`，当前有 15 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy、HostTerminalPolicy、SkillPolicy、CuratorPolicy、TaskPolicy、BrowserPolicy），Policy 间不跨域导入。
 - 新增外部能力时先定义端口，再实现 Infrastructure Adapter。
 
 ## 概念

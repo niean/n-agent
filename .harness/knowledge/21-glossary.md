@@ -120,7 +120,7 @@
 
 ## Policy Mesh 治理术语
 
-- Policy Mesh：N-Agent 运行时治理架构，由 10 个独立领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成；每个 Policy 治理一个维度，Application Service 在外部调用前封口执行。
+- Policy Mesh：N-Agent 运行时治理架构，由 15 个独立领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成；每个 Policy 治理一个维度，Application Service 在外部调用前封口执行。
 - RunPolicySnapshot：不可变 frozen dataclass（`app/application/policy_snapshot.py`），携带 10 个 typed config + IngressFacts（run_id/session_id/execution_mode/trusted_claims）；由 RunPolicySnapshotFactory 从 PolicyProfileProvider 构造；不持有任何 mutable runtime state。
 - RunPolicySnapshotFactory：Application 层工厂（`app/application/policy_snapshot.py`），从 PolicyProfileProvider 解析 profile 并构造 RunPolicySnapshot；不持有 Settings 引用。
 - IngressFacts：RunPolicySnapshot 中的不可变运行时入口事实，含 run_id、session_id、execution_mode、actor_id、trusted_claims。
