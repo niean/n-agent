@@ -365,6 +365,44 @@ async def test_read_attachment_source(tmp_path):
     assert result == b"attachment bytes"
 
 
+async def test_read_attachment_source_accepts_unicode_filename(tmp_path):
+    """Non-ASCII (e.g. Chinese) stored_names must be readable.
+
+    TaskService upload preserves the original filename in stored_name
+    (``f"{uuid_hex}_{filename}"``) and accepts Unicode via its denylist
+    validator. The content_ref built from such a stored_name must parse
+    so the attachment can register as an artifact. Bug: the ASCII-only
+    _FILENAME_RE rejected non-ASCII stored_names, silently breaking
+    artifact registration for Chinese-named attachments.
+    """
+    store = _make_store(tmp_path)
+    att_dir = store._attachments_root / "task-1"
+    att_dir.mkdir(parents=True)
+    stored_name = "2f361f8023564333_横向-邮箱归属.md"
+    payload = "# 横向-邮箱归属\n".encode("utf-8")
+    (att_dir / stored_name).write_bytes(payload)
+    result = await store.read(
+        f"attachment:task-1/{stored_name}", max_bytes=1024
+    )
+    assert result == payload
+
+
+async def test_attachment_ref_still_rejects_traversal_chars(tmp_path):
+    """Allowing Unicode letters must not weaken path-traversal defense:
+    separators, backslash, control chars, and exact dot/dotdot stay rejected."""
+    store = _make_store(tmp_path)
+    bad_refs = [
+        "attachment:task-1/foo/bar.md",   # nested path in filename
+        "attachment:task-1/foo\\bar.md",   # backslash separator
+        "attachment:task-1/\x00bad.md",    # NUL control char
+        "attachment:task-1/..",            # parent-dir reference
+        "attachment:task-1/.",             # current-dir reference
+    ]
+    for ref in bad_refs:
+        with pytest.raises(ArtifactValidationError):
+            await store.read(ref, max_bytes=1024)
+
+
 async def test_read_workspace_source(tmp_path):
     store = _make_store(tmp_path)
     (store._workspace_root / "notes.md").write_bytes(b"workspace notes")

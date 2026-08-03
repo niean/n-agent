@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
@@ -150,6 +150,38 @@ def _kind_from_mime(mime: str) -> ArtifactKind:
     return ArtifactKind.OTHER
 
 
+# Filename extension -> MIME mapping, used to infer kind/mime when the source
+# supplies no content_type. Task artifacts submitted via task_complete carry
+# only {name, storage_ref, type} (no mime); without this fallback they were
+# classified as OTHER and could not render in the workbench.
+_EXT_TO_MIME: dict[str, str] = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".csv": "text/csv",
+    ".json": "application/json",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+}
+
+
+def _resolve_mime(name: str, mime: str) -> str:
+    """Return ``mime`` when present; otherwise infer from filename extension.
+
+    Longest-extension-first so ``.markdown`` wins over ``.md`` if both could
+    match. Returns ``""`` when neither mime nor a known extension is available
+    (caller then classifies as OTHER via ``_kind_from_mime``).
+    """
+    if mime:
+        return mime
+    lowered = (name or "").lower()
+    for ext in sorted(_EXT_TO_MIME, key=len, reverse=True):
+        if lowered.endswith(ext):
+            return _EXT_TO_MIME[ext]
+    return ""
+
+
 def _generate_artifact_id() -> str:
     return secrets.token_urlsafe(16)
 
@@ -196,6 +228,9 @@ class ArtifactService:
         policy_audit_service: PolicyAuditService,
         config: ArtifactServiceConfig,
         convert_to_html: Callable[[str], str],
+        task_session_resolver: Callable[[str], Awaitable[str | None]] | None = None,
+        task_exists: Callable[[str], Awaitable[bool]] | None = None,
+        task_attachment_delete: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._registry = registry
         self._content_store = content_store
@@ -204,6 +239,62 @@ class ArtifactService:
         self._audit = policy_audit_service
         self._config = config
         self._convert_to_html = convert_to_html
+        self._task_session_resolver = task_session_resolver
+        self._task_exists_callback = task_exists
+        self._task_attachment_delete_callback = task_attachment_delete
+
+    def set_task_session_resolver(
+        self, resolver: Callable[[str], Awaitable[str | None]],
+    ) -> None:
+        """Late-bind the task_id -> session_id resolver.
+
+        The resolver is wired after construction because ``task_registry``
+        is created in a separate composition branch (``settings.task_enabled``)
+        from ``artifact_service`` (``settings.artifacts_enabled``). Mirrors the
+        existing ``set_run_service`` late-bind pattern.
+        """
+        self._task_session_resolver = resolver
+
+    def set_task_exists_callback(
+        self, callback: Callable[[str], Awaitable[bool]],
+    ) -> None:
+        """Late-bind the task_id -> exists callback for orphan backfill.
+
+        Used by :meth:`backfill_orphaned_task_artifacts` to detect artifacts
+        whose source task has been deleted. Mirrors ``set_task_session_resolver``
+        late-bind (task_registry lives in the task composition branch).
+        """
+        self._task_exists_callback = callback
+
+    def set_task_attachment_delete_callback(
+        self, callback: Callable[[str], Awaitable[bool]],
+    ) -> None:
+        """Late-bind the attachment_id -> delete callback for artifact delete.
+
+        When a task_attachment-sourced artifact is deleted from the workbench,
+        the underlying TaskAttachment (DB record + file) must be cascade-deleted
+        too -- otherwise the task detail page still shows the attachment and the
+        next startup ``backfill_attachments`` re-registers it (resurrection).
+        Mirrors ``set_task_exists_callback`` late-bind (task_service lives in
+        the task composition branch).
+        """
+        self._task_attachment_delete_callback = callback
+
+    async def _resolve_task_session(self, task_id: str) -> str | None:
+        """Resolve a task id to its execution session id via the injected
+        resolver. Returns None when no resolver is wired (task subsystem
+        disabled); task artifacts then get a NULL source_session_id and simply
+        remain invisible to the session-keyed panel query (no regression)."""
+        if self._task_session_resolver is None:
+            return None
+        try:
+            return await self._task_session_resolver(task_id)
+        except Exception as exc:
+            logger.warning(
+                "task session resolve failed: task_id=%s error=%s",
+                task_id, type(exc).__name__,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # List / Get
@@ -213,6 +304,8 @@ class ArtifactService:
         self,
         *,
         source_kind: ArtifactSource | None = None,
+        source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         kind: ArtifactKind | None = None,
         status: ArtifactStatus | None = None,
         q: str | None = None,
@@ -226,6 +319,8 @@ class ArtifactService:
         clamped = max(1, min(100, limit))
         return await self._registry.list_artifacts(
             source_kind=source_kind,
+            source_context_ref=source_context_ref,
+            source_session_id=source_session_id,
             kind=kind,
             status=status,
             q=q,
@@ -239,6 +334,12 @@ class ArtifactService:
         if art is None:
             raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
         return art
+
+    async def get_artifact_by_source(
+        self, source_kind: ArtifactSource, source_ref: str,
+    ) -> Artifact | None:
+        """Return artifact by (source_kind, source_ref), or None if not registered."""
+        return await self._registry.get_by_source(source_kind, source_ref)
 
     async def get_content(self, artifact_id: str) -> tuple[bytes, Artifact]:
         """Bounded content read. Returns (content_bytes, artifact).
@@ -278,6 +379,7 @@ class ArtifactService:
         source_kind: ArtifactSource = ArtifactSource.MANUAL,
         source_ref: str | None = None,
         source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         summary: str = "",
         classification: str | None = None,
         labels: tuple[str, ...] | None = None,
@@ -337,6 +439,7 @@ class ArtifactService:
             source_kind=source_kind,
             source_ref=source_ref,
             source_context_ref=source_context_ref,
+            source_session_id=source_session_id,
             summary=summary,
             classification=classification,
             labels=tuple(labels) if labels is not None else None,
@@ -486,9 +589,14 @@ class ArtifactService:
     # ------------------------------------------------------------------
 
     async def delete_artifact(self, artifact_id: str) -> bool:
-        """Delete artifact metadata first, then best-effort delete owned content.
+        """Delete artifact metadata, then best-effort delete owned content.
 
-        Does NOT delete source attachment/workspace files or publish snapshots.
+        For task_attachment-sourced artifacts, the underlying TaskAttachment
+        (source of truth) is cascade-deleted FIRST via the injected
+        ``task_attachment_delete`` callback, so the task detail page stays in
+        sync and the next startup backfill cannot resurrect the artifact. If the
+        callback raises, the artifact metadata is left intact (no resurrection
+        risk) and the error propagates. Does NOT delete publish snapshots.
         Repeat delete raises ArtifactNotFoundError.
         """
         art = await self._registry.get_artifact(artifact_id)
@@ -501,6 +609,13 @@ class ArtifactService:
             active_publish_checksum=None,
         )
 
+        # Cascade-delete the source TaskAttachment BEFORE the artifact metadata.
+        # The task attachment is the source of truth; deleting it first prevents
+        # backfill_attachments from resurrecting the artifact on next startup.
+        # Propagate on failure so a half-deleted source never leaves the artifact
+        # gone while its attachment survives.
+        await self._cascade_delete_task_attachment(art)
+
         # Delete metadata first.
         await self._registry.delete_artifact(artifact_id)
 
@@ -509,6 +624,133 @@ class ArtifactService:
             await self._best_effort_delete(art.content_ref)
 
         return True
+
+    async def _cascade_delete_task_attachment(self, artifact: Artifact) -> None:
+        """Cascade-delete the source TaskAttachment for a task_attachment artifact.
+
+        No-op when the callback is not wired (task subsystem disabled -- there
+        is no source to delete) or when the artifact is not task_attachment
+        -sourced (manual / task_artifact / session). Propagates callback errors
+        so the caller (:meth:`delete_artifact`) leaves the artifact metadata
+        intact, avoiding backfill resurrection of a half-deleted source.
+        """
+        if (
+            self._task_attachment_delete_callback is None
+            or artifact.source_kind is not ArtifactSource.TASK_ATTACHMENT
+        ):
+            return
+        attachment_id = artifact.source_ref
+        if not attachment_id:
+            return
+        await self._task_attachment_delete_callback(attachment_id)
+
+    async def delete_artifacts_by_source_task(self, task_id: str) -> int:
+        """Delete every artifact whose ``source_context_ref`` == ``task_id``.
+
+        Used by TaskService.delete_task to cascade-delete a task's artifacts
+        (task_attachment + task_artifact) from the separate artifacts DB so they
+        no longer appear in the artifact list. Each artifact is removed via
+        :meth:`delete_artifact` (policy + metadata + owned content); published
+        snapshots are NOT touched (public links remain independent). Per-artifact
+        failures are logged and skipped. Returns the number deleted.
+        """
+        # Collect all ids first (delete mutates the result set); paginate to
+        # cover tasks with more than one page of artifacts.
+        ids: list[str] = []
+        cursor: ArtifactListCursor | None = None
+        while True:
+            page = await self._registry.list_artifacts(
+                source_context_ref=task_id, cursor=cursor, limit=100,
+            )
+            ids.extend(a.id for a in page.items)
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+
+        deleted = 0
+        for artifact_id in ids:
+            try:
+                await self.delete_artifact(artifact_id)
+                deleted += 1
+            except ArtifactNotFoundError:
+                pass
+            except Exception as exc:  # best-effort: one failure must not abort the rest
+                logger.warning(
+                    "delete artifact %s for task %s failed: %s",
+                    artifact_id, task_id, exc,
+                )
+        return deleted
+
+    async def backfill_orphaned_task_artifacts(
+        self, *, batch_size: int = 100,
+    ) -> dict[str, int]:
+        """Delete task-sourced artifacts whose source task no longer exists.
+
+        Task artifacts (``task_attachment``/``task_artifact``) carry
+        ``source_context_ref = task_id``. Before the delete-task cascade existed,
+        deleting a task left its artifacts as orphans that still showed in the
+        artifact list. This startup backfill reclaims them: for each task-sourced
+        artifact it asks the injected ``task_exists`` callback whether the task
+        still lives, and deletes the artifact when it does not.
+
+        Fail-safe: a ``task_exists`` error counts the artifact as ``failed`` and
+        leaves it intact (never delete when existence is uncertain). No-op when
+        no callback is wired (task subsystem disabled). Returns
+        ``{processed, deleted, skipped, failed}``.
+        """
+        processed = 0
+        deleted = 0
+        skipped = 0
+        failed = 0
+
+        if self._task_exists_callback is None:
+            return {"processed": 0, "deleted": 0, "skipped": 0, "failed": 0}
+
+        for source_kind in (ArtifactSource.TASK_ATTACHMENT, ArtifactSource.TASK_ARTIFACT):
+            cursor: ArtifactListCursor | None = None
+            while True:
+                page = await self._registry.list_artifacts(
+                    source_kind=source_kind, cursor=cursor, limit=batch_size,
+                )
+                for art in page.items:
+                    processed += 1
+                    task_id = art.source_context_ref or ""
+                    if not task_id:
+                        skipped += 1
+                        continue
+                    try:
+                        exists = await self._task_exists_callback(task_id)
+                    except Exception as exc:
+                        # Fail-safe: cannot confirm deletion -> skip, do not delete.
+                        failed += 1
+                        logger.warning(
+                            "orphan backfill task_exists failed: "
+                            "task_id=%s artifact=%s error=%s",
+                            task_id, art.id, exc,
+                        )
+                        continue
+                    if exists:
+                        skipped += 1
+                        continue
+                    try:
+                        await self.delete_artifact(art.id)
+                        deleted += 1
+                    except Exception as exc:
+                        failed += 1
+                        logger.warning(
+                            "orphan backfill delete failed: artifact=%s error=%s",
+                            art.id, exc,
+                        )
+                if page.next_cursor is None:
+                    break
+                cursor = page.next_cursor
+
+        return {
+            "processed": processed,
+            "deleted": deleted,
+            "skipped": skipped,
+            "failed": failed,
+        }
 
     # ------------------------------------------------------------------
     # Export
@@ -601,7 +843,10 @@ class ArtifactService:
             content_str = await self._read_text_content(art)
             classification = self._resolve_classification(art)
             labels = frozenset(art.labels) if art.labels else frozenset()
-            session_id = art.source_context_ref or ""
+            # source_session_id is the real session id for task artifacts;
+            # source_context_ref holds the task id (not a session) and must
+            # not be passed to InformationFlow as session_id.
+            session_id = art.source_session_id or ""
             result = self._flow.release(
                 content_str,
                 target=ReleaseTarget.PUBLIC_ARTIFACT,
@@ -806,16 +1051,18 @@ class ArtifactService:
             )
             return None
 
-        kind = _kind_from_mime(attachment.content_type)
+        resolved_mime = _resolve_mime(attachment.filename, attachment.content_type)
+        kind = _kind_from_mime(resolved_mime)
         size = len(data)
         checksum = _sha256_checksum(data)
         artifact_id = _generate_artifact_id()
+        session_id = await self._resolve_task_session(attachment.task_id)
 
         artifact = Artifact(
             id=artifact_id,
             name=attachment.filename,
             kind=kind,
-            mime=attachment.content_type,
+            mime=resolved_mime,
             content_ref=content_ref,
             inline_content=None,
             size=size,
@@ -823,6 +1070,7 @@ class ArtifactService:
             source_kind=ArtifactSource.TASK_ATTACHMENT,
             source_ref=attachment.attachment_id,
             source_context_ref=attachment.task_id,
+            source_session_id=session_id,
             summary="",
             created_by=attachment.uploaded_by or _ACTOR,
         )
@@ -885,16 +1133,18 @@ class ArtifactService:
             )
             return None
 
-        kind = _kind_from_mime(task_artifact.mime)
+        resolved_mime = _resolve_mime(task_artifact.name, task_artifact.mime)
+        kind = _kind_from_mime(resolved_mime)
         size = len(data)
         checksum = _sha256_checksum(data)
         artifact_id = _generate_artifact_id()
+        session_id = await self._resolve_task_session(task_id)
 
         artifact = Artifact(
             id=artifact_id,
             name=task_artifact.name,
             kind=kind,
-            mime=task_artifact.mime,
+            mime=resolved_mime,
             content_ref=task_artifact.storage_ref,
             inline_content=None,
             size=size,
@@ -902,6 +1152,7 @@ class ArtifactService:
             source_kind=ArtifactSource.TASK_ARTIFACT,
             source_ref=Artifact.task_artifact_source_ref(task_id, run_id, ordinal),
             source_context_ref=task_id,
+            source_session_id=session_id,
             summary=task_artifact.summary,
             created_by=_ACTOR,
         )
@@ -966,6 +1217,104 @@ class ArtifactService:
         return {
             "processed": processed,
             "created": created,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
+    async def backfill_session_ids(self, *, batch_size: int = 200) -> dict[str, int]:
+        """Backfill ``source_session_id`` for existing task-source artifacts.
+
+        Existing task artifacts were registered before the session association
+        existed and have ``source_context_ref = task_id`` but NULL
+        ``source_session_id``. This resolves each task_id to its execution
+        session id (via the injected task_session_resolver, with a
+        deterministic uuid5 fallback for deleted tasks) and persists it.
+
+        Idempotent: only touches rows with NULL source_session_id. No-op when
+        no resolver is wired. Returns {processed, updated, skipped, failed}.
+        """
+        processed = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+
+        if self._task_session_resolver is None:
+            return {"processed": 0, "updated": 0, "skipped": 0, "failed": 0}
+
+        while True:
+            batch = await self._registry.list_task_artifacts_missing_session(
+                limit=batch_size,
+            )
+            if not batch:
+                break
+            for art in batch:
+                processed += 1
+                task_id = art.source_context_ref or ""
+                if not task_id:
+                    skipped += 1
+                    continue
+                try:
+                    session_id = await self._resolve_task_session(task_id)
+                    if not session_id:
+                        skipped += 1
+                        continue
+                    updated_art = replace(art, source_session_id=session_id)
+                    await self._registry.update_artifact(updated_art)
+                    updated += 1
+                except Exception:
+                    failed += 1
+            if len(batch) < batch_size:
+                break
+
+        return {
+            "processed": processed,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
+    async def backfill_kinds(self, *, batch_size: int = 100) -> dict[str, int]:
+        """Re-infer kind/mime for artifacts registered with empty mime.
+
+        Existing task artifacts submitted without a content_type have empty
+        mime and were classified as OTHER, so .md/.txt/.csv/etc. could not
+        render in the workbench (frontend BINARY_KINDS includes 'other').
+        Re-derives kind/mime from the filename extension and persists via
+        ``update_artifact``. Idempotent: artifacts with non-empty mime or an
+        unknown extension are skipped (no false reclassification).
+        """
+        processed = 0
+        updated = 0
+        skipped = 0
+        failed = 0
+        while True:
+            batch = await self._registry.list_artifacts_with_empty_mime(
+                limit=batch_size,
+            )
+            if not batch:
+                break
+            for art in batch:
+                processed += 1
+                resolved_mime = _resolve_mime(art.name, art.mime)
+                if not resolved_mime:
+                    # Unknown extension: cannot improve, leave as-is.
+                    skipped += 1
+                    continue
+                try:
+                    updated_art = replace(
+                        art,
+                        mime=resolved_mime,
+                        kind=_kind_from_mime(resolved_mime),
+                    )
+                    await self._registry.update_artifact(updated_art)
+                    updated += 1
+                except Exception:
+                    failed += 1
+            if len(batch) < batch_size:
+                break
+        return {
+            "processed": processed,
+            "updated": updated,
             "skipped": skipped,
             "failed": failed,
         }

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -718,6 +718,8 @@ photo-and-upload Skill 的 OSS object key 命名格式：脚本在宿主侧生�
 
 Skill 脚本失败时的脱敏阶段码透传：Skill 脚本在失败时向 stderr 写入 `ERROR:<code>` 行，`<code>` 是稳定的脱敏阶段标识符（如 `sts_failed`、`capture_failed`、`config_unsafe`）。Bridge 将脚本 stderr 结构化返回，executor（`app/application/host_terminal_tool_executor.py`）在 `_normalize_response` 中当 `error_code=host_execution_failed` 且 `target_type=skill_script` 时，用正则 `^ERROR:([a-z][a-z0-9_]{0,63})$` 从 stderr 解析阶段码，透传到 `ToolResult.content` 为 `{"error":"host_execution_failed","stage":"<code>"}` 并补上 `duration_ms`。原始 stderr 不进入模型上下文，只有解析出的阶段码被暴露；若 stderr 中无匹配行则回退为不透明的 `host_execution_failed`。此约定使脚本可用脱敏阶段码向模型传递失败原因，而不泄漏凭证、路径或外部服务原始响应。
 
+`host_terminal` 输入边界空 argv 归一化：LLM 偶发把空 argv 表达成 `args: ""`（空字符串）或 `null` 而非 `args: []`（空数组），`host_terminal_arguments_allowed`（Domain）用 `isinstance(args, (list, tuple))` 严格校验会拒绝空字符串返回 `host_arguments_invalid`，导致无值守定时任务（如每日拍照上传）整体失败。executor 在 `_execute_once` 输入边界（name 校验后、Policy 刷新前）把 `args` 为 `None`/`""` 归一化为 `[]`，原地写入 `request.arguments["args"]` 使全部消费点（`_validate_shape` 校验、`HostSkillScriptTarget` 构造、executor 与 tool_service 两处 `is_photo_capability_request` 能力检测、`_audit` 哈希）一致看到 `[]`。归一化仅限空表示：非空字符串（如 `"ls -la"`）保持原样被 `host_terminal_arguments_allowed` 拒绝（shell 字符串防护不削弱），Policy 白名单仍精确匹配位置参数（`_matches` 校验长度与逐位值），不绕过授权。Domain 校验函数保持严格类型契约（只接受 list/tuple），归一化属 Application 反腐败层职责。详见教训 P026。
+
 ## 模式二十一：Policy Mesh 治理封口
 
 ### Policy Mesh 模式
@@ -1075,7 +1077,7 @@ Release 不能只切换状态：人工导航/输入绕过 `execute_action()`，�
 
 ## 模式二十二：Artifact 制品工作台 write-through 注册与 publish 封口
 
-Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 preview/edit/export/publish（可分享持久链接）能力。核心实现约束围绕 write-through 注册、publish 快照独立、publish 封口、content_ref 不透明方案、公开路由隔离和启动 backfill 六个方面。
+Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 preview/edit/export/publish（可分享持久链接）能力。核心实现约束围绕 write-through 注册、delete 级联、publish 快照独立、publish 封口、content_ref 不透明方案、公开路由隔离和启动 backfill 七个方面。
 
 规则：
 
@@ -1084,6 +1086,7 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
    - 幂等键为 `(source_kind, source_ref)`，ArtifactRegistry 的 unique index 保证不重复注册；已注册的 source 直接跳过。
    - best-effort：回调失败不回滚主流程（附件上传或 TaskArtifact 产出仍成功），仅记录 warning。回调是旁路通知，不阻塞主路径。
    - source_ref 格式：task_attachment 用 `attachment:{task_id}/{stored_name}`，task_artifact 用 `task:{task_id}:run:{run_id}:artifact:{ordinal}`。
+   - 会话关联（source_session_id）：注册时经注入的 `task_session_resolver`（task_id -> task_execution_session_id）解析执行会话写入 `source_session_id`，与 `source_context_ref`（存 task_id，provenance）分离。resolver 在 main.py 用 task_registry late-bind（`set_task_session_resolver`，因 artifact_service 在 artifacts_enabled 分支、task_registry 在 task_enabled 分支创建）；task 记录已删除时回落到确定性 `task_session_id_fallback(task_id)`（`task-{uuid5}`）。resolver 未注入（task 子系统禁用）时 source_session_id 留空，制品对会话面板不可见但不报错。resolver 无法区分"task 不存在"与"task 已删除"（都回落 fallback session），故孤儿 backfill 另注入 `task_exists` 回调（task_id -> bool，`set_task_exists_callback`，返回 plain bool 可区分删除）判断 task 是否存活。
 
 2. publish 快照独立（PublishedArtifact nullable FK ON DELETE SET NULL）：
    - PublishedArtifact.artifact_id 是 nullable FK，ON DELETE SET NULL；源 Artifact 删除后快照存活，公开链接不失效。
@@ -1102,6 +1105,7 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
    - 磁盘文件名 server-generated（uuid4 hex + safe ext），客户端 filename 仅展示用，不作为磁盘路径。所有路径解析 per-component lstat 校验，拒绝 symlink 组件。
    - delete_owned 仅接受 item/published ref；attachment/workspace ref 只读不可删（源文件生命周期由 Task 子系统管理）。
    - materialize_source 把 attachment/workspace 源文件流式拷贝到 owned 存储后返回 item ref，不修改源文件。
+   - 文件名组件校验（_FILENAME_RE）用 denylist（拒绝控制字符 \x00-\x1f/\x7f、路径分隔符 / \、Windows 保留符 < > : " | ? *），允许 Unicode 字母/数字（中文文件名）；与 TaskService 上传层 `_FILENAME_SAFE_RE`（task_service.py）共享同一规则。两层必须一致：上传接受的文件名，content_ref 解析必须也接受，否则附件上传成功但 register_from_attachment 校验 content_ref 失败、制品静默不注册。exact "." / ".." 由 _validate_filename 单独拒绝，嵌套路径由 _parse_scheme_parts 的 split+"/" in file_part 检查拒绝。
 
 5. 公开路由隔离（/p/{publish_id} 只读快照，不读源）：
    - 公开未认证路由 `GET /p/{publish_id}` 与 `GET /p/{publish_id}/content` 只读 PublishedArtifact 快照，不读源 Artifact、不访问 ArtifactRegistry.get_artifact。
@@ -1114,6 +1118,33 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
    - ArtifactService.backfill_attachments 在 main.py lifespan 启动期执行，通过 ArtifactRegistry.list_attachment_sources 游标分页重扫 task_attachments 表。
    - 幂等：已注册的 (source_kind, source_ref) 跳过；每次启动都扫（不判断 artifacts 表是否为空），支持运行期新增附件后重启补建。
    - 单条失败 continue（per-item try/except），不中断整体 backfill；返回 processed/created 统计。
+   - 会话关联回填：backfill_session_ids 同在启动期执行，经 ArtifactRegistry.list_task_artifacts_missing_session（`source_kind IN (task_artifact,task_attachment) AND source_session_id IS NULL`）分批取出历史任务制品，用 task_session_resolver 解析 session_id 后 update_artifact 写入。幂等（只动 NULL 行）；resolver 未注入时 no-op。
+   - 孤儿 backfill：backfill_orphaned_task_artifacts 同在启动期执行，对 source_kind IN (task_attachment,task_artifact) 的制品分页扫描，用 `task_exists` 回调判断 source_context_ref 指向的 task 是否存活，不存活则 delete_artifact 清理。fail-safe：task_exists 抛异常时 failed++ 跳过（不确定时不删，宁留勿误删）；task_exists 未注入时 no-op。解决历史孤儿（task 已删但制品残留，artifacts DB 持久化跨重启累积）。返回 {processed,deleted,skipped,failed}。
+
+7. delete 级联（task 删除 -> 制品清理，write-through 的逆方向）：
+   - TaskService.delete_task 删除任务行（CASCADE 附件/事件等）、附件文件、执行会话后，经注入的 `artifact_delete_callback` 回调 ArtifactService.delete_artifacts_by_source_task(task_id)，清理独立 artifacts DB 中 source_context_ref=task_id 的全部制品。
+   - 这是 write-through 注册（规则 1）的逆方向：注册时 task -> artifact 单向写入，删除时必须反向级联，否则已删除任务的制品残留在 artifacts DB 仍展示在制品列表。
+   - delete_artifacts_by_source_task 经分页 list_artifacts 收集 source_context_ref=task_id 的全部 artifact_id，逐条 delete_artifact（走 policy delete 准入 + metadata 删除 + delete_owned 删 owned content），best-effort 逐条 try/except + warning，失败不阻断任务删除；published 快照不被触碰（ON DELETE SET NULL，见规则 2）。
+   - callback 在 main.py late-bind（与 register_callback 同源），artifact_service 为 None（artifacts_enabled=False）时 callback 为 None，delete_task 跳过制品清理。
+
+8. delete 级联（制品删除 -> 任务附件清理，制品页删除的逆同步）：
+   - ArtifactService.delete_artifact 删除 source_kind=task_attachment 的制品时，经注入的 `task_attachment_delete` 回调（attachment_id -> bool，`set_task_attachment_delete_callback`，main.py late-bind 到 task_service.delete_attachment）先于制品 metadata 删除底层 TaskAttachment（记录 + 文件 + attachment_deleted 事件）。
+   - 这是规则 7 的对偶方向：规则 7 是 task 删除 -> 制品清理，规则 8 是制品删除 -> 任务附件清理。两者保证制品工作台与任务详情页附件列表双向一致。
+   - 源 TaskAttachment 是 source of truth，必须先于制品 metadata 删除：否则制品删了但附件残留，启动期 backfill_attachments（规则 6）会按残留附件重建制品 -> 删除的制品在重启后"复活"。
+   - 回调失败必须传播异常（不删制品 metadata）：best-effort + 继续删制品会让附件残留 + backfill 复活（正是本 bug）；传播让两态保持一致（都保留），用户可重试。回调返回 False（附件已删，如 task 删除级联规则 7 已先 CASCADE 附件行）时继续删制品 metadata（清理 stale 投影）。
+   - 仅 task_attachment 制品触发；manual/session/task_artifact（workspace 源）不触发（task_artifact 是 worker 产出，非用户管理的附件，删除制品不动 workspace 源，保持现状语义）。
+   - callback 未注入（task 子系统禁用）时 no-op，仅删制品。
+   - delete_artifact 不经自有 content_store.delete_owned 删 attachment 源文件（attachment: ref 是 source ref 非 owned，_is_owned_ref 为 False）；附件文件生命周期由 TaskService.delete_attachment 负责，ArtifactService 只通过回调委托。
+
+9. preview 渲染布局（pre max-height 覆盖 + sandbox 分类）：
+   - 全局 `pre { max-height: 320px }`（styles.css 通用 pre 规则，line 164）作用于所有 `<pre>`，包括 `.artifacts-preview__pre`。`.artifacts-preview__pre` 必须显式 `max-height: none` 覆盖，否则 code/json/text 预览的 `<pre>` 被卡在 320px，无法经 `flex:1` 填满预览面板（实测：面板 698px、pre 仅 320px、底差 366px）。这是预览高度不达标的主根因，与 shell 高度无关。
+   - 异构根因：iframe 类（markdown/html/pdf 用 `<iframe>`，无 max-height 上限，`min-height:360px`+`flex:1` 填满）与 pre 类（code/json/text 用 `<pre>`，继承全局 max-height:320px 被卡在 320px）在同一面板内表现不同--iframe 填满、pre 仅 320px，用户感知"这还能异构"。修法是给 `.artifacts-preview__pre` 加 `max-height: none`；改 shell 的 min-height/height 不能解除 pre 的 320px 上限（实测 shell 改 height 后 pre 仍 320px）。
+   - 高度链（辅助 UX，非 bug 根因）：`.artifacts-shell` 用限定 `height: calc(100vh - 90px)`（对齐 `#tab-chat.active`，自限定不依赖 `#tab-artifacts` 父容器）使长内容时 pre 经 `flex:1;min-height:0;overflow:auto` 在面板内滚动而非撑高页面；`min-height` 会让长内容撑高 shell 走页面滚动。max-height 解除后两者都能让 pre 达底部，`height` 的内部滚动 UX 更优。flex 列链 `shell(grid stretch) -> .artifacts-detail -> #artifacts-detail-body(panel-body, flex:1/min-height:0) -> .artifacts-detail__preview(flex:1/min-height:0) -> pre/iframe(flex:1/min-height:0)`。
+   - sandbox 分类：HTML/markdown 预览用 `sandbox=""`（NO allow-*）iframe srcdoc 防 script 执行（渲染安全不变量，verify 2.2）；PDF 预览 iframe 必须 NOT sandbox--浏览器内置 PDF 查看器被视为 plugin，`sandbox=""` 禁用 plugin（且空 sandbox 把 blob 降级为 opaque origin）使 PDF 无法渲染、仅下载可用。PDF 是 blob 由浏览器查看器渲染、无页面脚本，不需要 sandbox。image 用 `<img>`（blob src）不涉及 sandbox。
+   - 响应式：`@media (max-width:1100px)` 单列时 shell 改 `height:auto; min-height:0` 回落页面级滚动（不再限定视口高度）。
+   - 预览 dispatch（artifacts.js renderPreview 按 kind）：markdown/document->sandbox="" iframe（srcdoc 取 /export?format=html 服务端 safe HTML）、html->sandbox="" iframe srcdoc、code/text->`<pre>`、json->`__json` div>pre、csv->table、image->img、pdf->无 sandbox iframe（blob src）+下载链接。binary 类（image/pdf）经 parseContent `URL.createObjectURL(blob)` 生成 blob URL。
+   - 编辑态填满（同一面板不同视图，预览修 max-height 后需补的点）：编辑视图 `.artifacts-detail__editor`（flex 列容器）和 `.artifacts-detail__textarea` 缺 `flex:1`，editor 仅随内容高度（code 315px/pdf 151px）、textarea 卡在 `min-height:240px`，编辑框+保存按钮不达面板底部（gap 398/562px）。修法：editor `flex:1; min-height:0`（与 `.artifacts-detail__preview` 同款填满 panel-body 剩余空间）、textarea `flex:1`（在 editor 内填满、底部留保存按钮）。二进制类编辑器无 textarea（note+file input+actions），editor `flex:1` 填满容器但内容在顶部（无可见背景，视觉为 no-op，紧凑 UX 优于把按钮推到底部留大空白）。排查时同样须实测 getComputedStyle(editor).flex 与 getBoundingClientRect 高度，禁止仅推理。
+   - 导出/下载文件名（artifacts.js doExport/renderPdf）：下载经 `URL.createObjectURL(blob)` 生成 blob URL + `<a download>` 触发，blob URL 下载绕过服务端 Content-Disposition（后端 `export()` 已返回 `art.name` 作 filename、`build_content_disposition` 已正确，但前端 blob 下载不读该 header），故前端必须自行设 `a.download` 为制品名。`exportFilename(name, format)`：original -> name 原样（制品名已含扩展名如 `report.md`/`script.py`）；html -> 去 原 扩展名加 `.html`（匹配实际 text/html 内容）。PDF 下载（renderPdf）同款用 `detail.name`。禁止硬编码 `'export'`。
 
 陷阱：
 - write-through 回调失败时回滚主流程会让附件上传因 Artifact 子系统故障而失败，违背 best-effort 旁路语义；正确做法是 catch + warning + 主流程继续。
@@ -1122,3 +1153,48 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
 - delete_owned 接受 attachment/workspace ref 会意外删除 Task 子系统管理的源文件（附件/工作区产出），破坏 Task 数据完整性。
 - backfill gated on table-empty 会让运行期新增附件在重启前无法补建为 Artifact；必须每次启动都扫。
 - published_base_url 由路由从 Host header 构造会让攻击者通过伪造 Host 注入恶意 share_url；必须由 service 用配置值计算。
+- source_context_ref 与 source_session_id 语义不可混用：source_context_ref 存 task_id（provenance，任务来源），source_session_id 存 task_execution_session_id（展示，会话关联）。publish 流程把 source_context_ref 当 session_id 传给 InformationFlow.release 会传错值；对话面板按 source_kind=session 查询会因该 source_kind 无写入路径而永远查不到任务制品。展示/会话维度一律用 source_session_id。
+- delete_task 不级联清理 artifacts DB 会让已删除任务的制品永久残留在制品列表（write-through 注册是单向的，无反向回调）；必须经 artifact_delete_callback 反向级联 delete_artifacts_by_source_task。
+- 制品页删除 task_attachment 制品不级联删任务附件会让任务详情页仍展示附件（制品工作台与任务详情页双向不一致），且启动期 backfill_attachments 会按残留附件重建制品使删除"复活"；必须经 task_attachment_delete 反向回调先删源 TaskAttachment（source of truth 先删，防 backfill 复活）。回调失败若 best-effort 继续删制品会触发复活，必须传播异常保留制品 metadata；回调返回 False（附件已删）时继续删制品清理 stale 投影。
+- 孤儿 backfill 用 task_session_resolver 判断 task 是否存活会误判：resolver 对已删除 task 返回 fallback session（非 None），无法区分"不存在"与"已删除"；必须用独立的 task_exists 回调（返回 plain bool）。
+- 孤儿 backfill 在 task_exists 抛异常时删除制品会误删不确定状态的数据；必须 fail-skip（不确定时 failed++ 不删，宁留勿误删）。
+- content_ref 文件名校验用 ASCII-only allowlist（如 `^[A-Za-z0-9._-]+$`）会拒绝非 ASCII stored_name（中文文件名）：TaskService 上传层用 denylist 接受 Unicode 文件名、stored_name=`{uuid16}_{原文件名}` 保留原文，register_from_attachment 构造的 `attachment:{task_id}/{stored_name}` 在 content_store._parse_ref 校验时被 ASCII allowlist 拒绝、抛 ArtifactValidationError、制品静默不注册（附件列表无制品链接、制品工作台不展示）。两层校验必须共享同一 denylist 规则。
+- Content-Disposition 的 legacy `filename="..."` 字段含非 ASCII（中文文件名）会让 Starlette 对 header value 做 latin-1 编码时抛 UnicodeEncodeError -> HTTP 500 -> 前端 fallback "request_failed"，制品预览/内容下载失败。legacy `filename` 必须 ASCII-only（非 ASCII 名回退为保留扩展名的 ASCII 占位名如 `artifact.md`），真实名用 RFC 5987 `filename*=UTF-8''<percent-encoded>` 传递。该模式曾在 artifact_routes、task_routes 附件下载、published_artifact_routes 三处重复实现且各自漏非 ASCII（bug 温床），现已收敛为共享 helper `app/interfaces/http/_content_disposition.py::build_content_disposition`，三个路由统一调用；新增 Content-Disposition 构造禁止再各自实现，必须复用该 helper。
+- 导出下载文件名恒为 `export`：前端 doExport 用 `URL.createObjectURL(blob)`+`<a download>` 触发下载，blob URL 下载绕过服务端 Content-Disposition（后端 export() 返回 art.name、build_content_disposition 已正确，但前端不读该 header），故 `a.download` 须前端自行设为制品名 `detail.name`。硬编码 `'export'` 会让所有制品导出同名文件。PDF 下载（renderPdf）已用 `detail.name`，doExport 须同款经 `exportFilename(name, format)`（original 原样、html 派生 .html）。
+- 制品预览 code/json/text 的 `<pre>` 继承全局 `pre { max-height: 320px }`（styles.css 通用规则 line 164）被卡在 320px，无法经 `flex:1` 填满面板；而 markdown/html/pdf 用 `<iframe>`（无 max-height）能填满，表现为预览最大高度"异构"（用户感知"这还能异构"）。`.artifacts-preview__pre` 必须显式 `max-height: none` 覆盖全局上限。根因是 max-height 上限而非 shell 的 min-height/height--改 shell 高度不能解除 pre 的 320px 上限（实测 shell 改 height 后 pre 仍 320px、面板 698px、底差 366px；加 max-height:none 后 pre 674px 填满）。排查时须实测 `getComputedStyle(pre).maxHeight` 而非仅推理 flex 链。
+- PDF 预览 iframe 设 `sandbox=""` 会阻断浏览器内置 PDF 查看器（plugin 被 sandbox 禁用、blob 同源被降级为 opaque origin），PDF 无法预览只有下载链接可用；PDF iframe 必须 NOT sandbox。这与 HTML/markdown 的 `sandbox=""`（防 script 执行）不同：PDF 是 blob 由浏览器查看器渲染、无页面脚本，不需要 sandbox。sandbox 策略按 kind 分类，不能一刀切。
+- E2E/测试直接往 registry 插 task_artifact fixture 时 `source_context_ref` 必须填真实 task_id（不能用 run_tag 等假值）：启动期孤儿 backfill（规则 6）用 `task_exists(source_context_ref)` 判断 task 存活，假 task_id 会让 fixture 被判为孤儿删除，backfill 幂等性断言（重启前后计数不变）失败。
+
+## 模式二十三：对话页右侧"更多信息"面板与制品列表共享渲染
+
+`/chat` 对话页右侧边栏由原单"调试信息"面板重构为"更多信息"单面板多 Tab（工具调用 / 制品信息），grid 推挤折叠（与原调试信息一致，非覆盖层），制品 Tab 复用制品工作台列表项渲染并按当前会话过滤。
+
+1. grid 推挤折叠（非覆盖层）+ header 按钮控制：
+   - `chat-shell` 三列网格：会话(280px) | 对话区(2fr) | 右侧边栏(0.9fr)；折叠 `.chat-shell--side-collapsed` 缩为 `280px 1fr 0` 且 `#chat-side-panel { display: none }`（侧栏完全隐藏，对话区变宽），非 40px 竖条。
+   - 展开/收起控制位于对话区 header 右上角 `#chat-side-toggle-btn`（分栏切换图标 SVG，aria-expanded 反映状态，展开时右侧面板填充 fill-opacity），不再用侧栏 panel-header 作 toggle。
+   - `bindSideToggle` 绑定 `#chat-side-toggle-btn`，toggle `chat-shell--side-collapsed` 于 shell（唯一状态源，panel 不再带 collapsed class）+ 同步 btn aria-expanded；侧栏 panel-header 为静态"更多信息"标签（非 button）。
+   - 经用户确认采用推挤式（对话区宽度变化），PRD"展开时对话区宽度保持稳定"为现状调试信息既有偏差，本模式不修复。
+
+2. 多 Tab + ARIA（bindTabSwitch + activateSideTab）：
+   - panel-body 内 `.chat-tabs[role=tablist]` + `.chat-tab-panels`（唯一 overflow-y:auto 滚动容器）；两个 `role=tab`（tool/artifact）+ 两个 `role=tabpanel`。
+   - roving tabindex（active=0，inactive=-1）+ aria-selected + aria-controls/aria-labelledby；隐藏仅靠 `.chat-tab-content[hidden]{display:none}`，不维护第二套 active-content class。
+   - 键盘 ArrowLeft/Right 循环、Home/End 跳首尾 + preventDefault + focus 跟随；Tab 选择页内记忆（模块级 `activeSideTab`，默认 tool，刷新恢复默认）。
+
+3. 制品列表项共享渲染（NAGENT.artifacts.renderListItem）：
+   - artifacts.js 内部 `renderListItem(artifact, onClick)` 经 `NAGENT.artifacts.renderListItem` 导出，工作台与对话页共享同一渲染函数 + `.artifacts-list__item` CSS（真复用渲染+样式，禁止 chat.js 重写）。
+   - `typeof onClick === 'function'` 时点击调 `() => onClick(artifact)`（artifact 为唯一参数，不传 DOM event），且不加 active class（对话页不继承工作台 state.selectedId）；缺省 onClick 走工作台 `selectArtifact(artifact.id)` + active class。
+   - 所有可见字段 textContent（kind 图标 kindLabel.slice(0,2) + name + sourceLabel·fmtTime），无 innerHTML。
+
+4. 会话制品加载（renderArtifactPanel + 竞态 + 时机）：
+   - 请求 `GET /chat/artifacts?source_session_id={sid}&limit=50`（URLSearchParams 构造），按当前会话过滤；查询命中所有 source_session_id 匹配的制品（含 task_artifact/task_attachment），不按 source_kind=session 过滤（该 source_kind 无任何写入路径，旧查询永远查不到任务制品）。
+   - 竞态防护：模块级 `artifactPanelRequestSeq`，每次调用递增 + 捕获 `currentSessionId`，每个 await 后检查序号+sid 仍最新才写 DOM；过期成功/失败静默丢弃。
+   - 原子渲染：`DocumentFragment` 中完成全部 renderer 调用后一次性替换 loading，renderer 中途抛错不留半列表（fragment 未挂载），显示"加载失败"。
+   - 四态：无会话"暂未选择会话"（不 fetch）/ 加载中"加载中..." / 空"暂无关联制品" / 失败"加载失败"（非 2xx、无效 JSON、非对象 payload、非数组 items、renderer 缺失/抛错）。
+   - 调用时机（关键：不挂 applySessionDetail）：`selectSession`（设 id 后）、`ensureSession`（建会话后）、`refreshCurrentSession`（归属校验+applySessionDetail 后）、init/空态/删除/session_not_found 路径；禁止挂 `applySessionDetail`（autoRefreshTick 每 4s 经 applySessionDetail，会导致轮询请求 + selectSession 重复）。`refreshCurrentSession` 是 send() 完成后看到新制品的唯一路径。
+   - 点击制品项 `NAGENT.navigation.navigatePath('/artifacts/{encodedId}')`，缺失 navigation 回退 `location.href`。
+
+陷阱：
+- 把 renderArtifactPanel 挂在 applySessionDetail 会导致 autoRefreshTick 每 4s 触发制品请求（违反轮询不刷制品），且 selectSession/refreshCurrentSession 均调 applySessionDetail 造成重复请求；必须挂 selectSession/ensureSession/refreshCurrentSession。
+- 对话页 renderArtifactPanel 传 onClick 时若让工作台 state.selectedId 决定 active class，会因工作台残留选中态给对话页列表项错误高亮；active class 必须仅在缺省 onClick（工作台）路径添加。
+- chat.js 早于 artifacts.js 加载（HTML 脚本顺序），不得在 chat.js 文件求值阶段读 NAGENT.artifacts，只在 init/渲染调用时动态读取。
+- 工作台 selectArtifact 与对话页 navigatePath 点击行为不同：renderListItem 缺省 onClick 走工作台 pushState+详情加载，对话页注入 onClick 走 Dashboard 导航跳 /artifacts/{id}；不能让对话页继承工作台 selectArtifact。

@@ -23,6 +23,10 @@
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9l-5 4V6Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">对话</span>
       </a>
+      <a class="sidebar__item" href="/scheduled-tasks" data-tab="scheduled-tasks">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 3v3M17 3v3M4 9h16M6 5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">定时任务</span>
+      </a>
       <a class="sidebar__item" href="/tasks" data-tab="tasks">
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h7v5H4V6ZM13 6h7v5h-7V6ZM4 13h7v5H4v-5ZM13 13h7v5h-7v-5Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">任务</span>
@@ -30,10 +34,6 @@
       <a class="sidebar__item" href="/artifacts" data-tab="artifacts" hidden>
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7l8-4 8 4-8 4-8-4ZM4 7v10l8 4 8-4V7M12 11v10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">制品</span>
-      </a>
-      <a class="sidebar__item" href="/scheduled-tasks" data-tab="scheduled-tasks">
-        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 3v3M17 3v3M4 9h16M6 5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-        <span class="sidebar__item-label">定时任务</span>
       </a>
       <hr class="sidebar__divider" aria-hidden="true">
       <a class="sidebar__item" href="/sessions" data-tab="sessions">
@@ -113,14 +113,20 @@
     </div>
 
     <div class="tab-content" id="tab-chat">
-      <div class="chat-shell chat-shell--debug-collapsed" id="chat-shell">
-        <section class="status-panel">
-          <div class="panel-header"><span>会话</span><button class="btn" id="chat-new" type="button">新建</button></div>
+      <div class="chat-shell chat-shell--side-collapsed" id="chat-shell">
+        <section class="status-panel chat-session-panel">
+          <div class="panel-header"><span>会话</span></div>
           <div class="panel-body"><div id="chat-session-list" class="session-list"></div></div>
         </section>
         <section class="chat-stack" aria-label="对话区">
           <header class="panel-header">
             <strong id="chat-header">N-Agent Chat</strong>
+            <button class="chat-side-toggle-btn" type="button" id="chat-side-toggle-btn" aria-label="展开/收起更多信息" aria-expanded="false" title="展开/收起更多信息">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="16" rx="2"/>
+                <rect x="15" y="4" width="6" height="16" rx="1" class="side-toggle__panel"/>
+              </svg>
+            </button>
           </header>
           <div class="chat-stack__messages" id="chat-messages" aria-live="polite">
             <div class="message-stack" id="chat-message-stack"></div>
@@ -141,15 +147,23 @@
             </div>
           </div>
         </section>
-        <section class="status-panel status-panel--collapsible chat-debug-panel collapsed" id="chat-debug-panel">
-          <button class="panel-header" type="button" id="chat-debug-toggle" aria-expanded="false" aria-controls="chat-debug-body">
-            <span>调试信息</span>
-            <span class="panel-header__chevron" aria-hidden="true">▶</span>
-          </button>
-          <div class="panel-body" id="chat-debug-body">
-            <div class="debug-section"><h4>Session Summary</h4><pre id="chat-summary">暂未选择会话</pre></div>
-            <div class="debug-section"><h4>Task State</h4><div id="chat-task-state">暂未选择会话</div></div>
-            <div class="debug-section"><h4>Tool Calls</h4><div id="chat-tool-calls">暂未选择会话</div></div>
+        <section class="status-panel chat-side-panel" id="chat-side-panel">
+          <div class="panel-header"></div>
+          <div class="panel-body" id="chat-side-body">
+            <div class="chat-tabs" role="tablist" aria-label="侧栏信息">
+              <button class="chat-tab chat-tab--active" id="chat-tab-tool-button" role="tab" type="button" data-tab="tool" aria-selected="true" aria-controls="chat-tab-tool" tabindex="0">工具调用</button>
+              <button class="chat-tab" id="chat-tab-artifact-button" role="tab" type="button" data-tab="artifact" aria-selected="false" aria-controls="chat-tab-artifact" tabindex="-1">制品信息</button>
+            </div>
+            <div class="chat-tab-panels">
+              <div class="chat-tab-content" id="chat-tab-tool" role="tabpanel" aria-labelledby="chat-tab-tool-button">
+                <div class="debug-section"><h4>Session Summary</h4><pre id="chat-summary">暂未选择会话</pre></div>
+                <div class="debug-section"><h4>Task State</h4><div id="chat-task-state">暂未选择会话</div></div>
+                <div class="debug-section"><h4>Tool Calls</h4><div id="chat-tool-calls">暂未选择会话</div></div>
+              </div>
+              <div class="chat-tab-content" id="chat-tab-artifact" role="tabpanel" aria-labelledby="chat-tab-artifact-button" hidden>
+                <div id="chat-artifact-list" class="artifacts-list__items" aria-live="polite">暂未选择会话</div>
+              </div>
+            </div>
           </div>
         </section>
       </div>

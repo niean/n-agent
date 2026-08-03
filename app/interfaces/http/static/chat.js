@@ -5,6 +5,8 @@
   const modal = namespace.modal;
 
   let currentSessionId = null;
+  let activeSideTab = 'tool';
+  let artifactPanelRequestSeq = 0;
   let isSending = false;
   let initialized = false;
   let externalMemoryProviders = [];
@@ -113,6 +115,10 @@
       });
       if (sessionId === currentSessionId && gen === autoRefreshGeneration && seq === autoRefreshSeq) {
         renderedMessageVersion = version;
+        // 消息版本变化（任务异步产出新消息/工具调用/制品）时，同步刷新工具调用与制品面板，
+        // 避免需手动刷新浏览器才能看到最新制品信息与工具调用记录
+        loadToolCalls();
+        renderArtifactPanel({ silent: true });
       }
     } catch (e) {
       handleAutoRefreshError(e, sessionId, gen, seq);
@@ -130,6 +136,7 @@
     if (e && e.message === 'session_not_found') {
       stopAutoRefresh();
       currentSessionId = null;
+      renderArtifactPanel();
       renderedMessageVersion = null;
       setHeader(null);
       setStatusMessage('会话不存在或已删除', 'error');
@@ -586,7 +593,7 @@
 
   // 非真人进程来源的 user 消息渲染为左对齐状态卡片（灰底卡片，区别于真人 user 蓝底右对齐气泡）。
   // work task / judge task 前缀的消息样式打平 ui.task_lifecycle 任务状态卡片（className `msg system`）：
-  //   单独时 summary = `<前缀>: <content>`（work task -> 查询状态、judge task -> 判断结束），pre 放原始 content，
+  //   单独时 summary 固定 = `任务状态`（与合并卡、standalone lifecycle 一致），pre 放原始 content，
   //   details 默认 open=false；与 ui.task_command/ui.task_lifecycle 折叠卡片结构一致。
   // 相邻的 work task / judge task 与 ui.task_lifecycle（无 card）合并为一个 details 卡片：
   //   summary 固定 = `任务状态`，pre 多行拼接（lifecycle 行用原文，work/judge 行带前缀），open=false。
@@ -598,8 +605,8 @@
   ];
 
   // work task / judge task 前缀的消息：
-  // - 单独卡片 summary = `<label>: <content>`（例如 `查询状态: work task t_xxx`）
-  // - 合并卡片行 = `<label>: <content>`（与单独 summary 一致）
+  // - 单独卡片 summary 固定 = `任务状态`（与合并卡、standalone lifecycle 一致，不再用前缀+content）
+  // - 合并卡片行 = `<label>: <content>`（work task -> 查询状态、judge task -> 判断结束，行级前缀区分 lifecycle 行）
   // 仅 string content 且行首命中任一 PROCESS_CONTENT_PREFIXES 时返回对应 label；否则返回 null。
   function foldableProcessLabel(content) {
     if (typeof content !== 'string') return null;
@@ -609,11 +616,8 @@
     return null;
   }
 
-  // 单独 work task / judge task 卡片 summary = `<label>: <content>`
-  function foldableProcessSummary(content) {
-    const label = foldableProcessLabel(content);
-    return label !== null ? label + ': ' + content : null;
-  }
+  // 单独 work task / judge task 卡片 summary 已统一为固定 `任务状态`（见 isFoldedProcess 分支），
+  // `查询状态`/`判断结束` label 仅作为合并卡片内的行级前缀（taskStatusLineForMessage）。
 
   // work task / judge task 前缀的消息渲染为折叠卡片（进程内部消息不占 Chat 空间），
   // 仅 string content 且行首命中任一 PROCESS_CONTENT_PREFIXES 时为 true；多模态/空串等为 false。
@@ -1148,6 +1152,43 @@
     return true;
   }
 
+  // ui.task_result 吸收相邻 ui.task_artifact 后，在结果气泡内追加制品详情链接。
+  // 复用 ui.task_artifact 气泡的详情链接样式（chat-artifact-link）与 SPA 导航逻辑。
+  function appendResultArtifactLinks(el, artifacts) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-task-artifacts';
+    let added = false;
+    for (let i = 0; i < artifacts.length; i++) {
+      const art = artifacts[i];
+      if (!art) continue;
+      const line = document.createElement('div');
+      line.className = 'chat-task-artifact-line';
+      const label = document.createElement('span');
+      label.textContent = '产出制品: ' + (art.name || '');
+      line.appendChild(label);
+      // 详情链接仅在有 artifact_id 时追加（与独立 ui.task_artifact 气泡一致）
+      if (art.artifact_id) {
+        const href = '/artifacts/' + encodeURIComponent(art.artifact_id);
+        const link = document.createElement('a');
+        link.href = href;
+        link.textContent = '详情';
+        link.className = 'chat-artifact-link';
+        link.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          const nav = global.NAGENT && global.NAGENT.navigation;
+          if (nav && typeof nav.navigatePath === 'function') {
+            nav.navigatePath(href);
+          } else { global.location.href = href; }
+        });
+        line.appendChild(document.createTextNode(' '));
+        line.appendChild(link);
+      }
+      wrap.appendChild(line);
+      added = true;
+    }
+    if (added) el.appendChild(wrap);
+  }
+
   function createMessageElement(message, cardStates, taskDecisions, approvalDecisions) {
     if (message.is_summary) {
       const el = document.createElement('div');
@@ -1168,22 +1209,50 @@
     // 任务最终结果（ui.task_result）以普通消息渲染（区别于 ui.task_lifecycle/
     // ui.task_command 状态卡片），样式对齐 assistant 气泡、支持 Hover 时间与 markdown 子集。
     const isTaskResult = message.role === 'system' && message.name === 'ui.task_result';
+    const isTaskArtifact = message.role === 'system' && message.name === 'ui.task_artifact';
     const isProcessUser = message.role === 'user' && PROCESS_SOURCES.has(message.source);
     // 多消息合并卡片（groupTaskMessages 产出的 _mergedTaskStatus=true）：
     // summary 固定=任务状态，pre 多行拼接，open=false，className `msg system`（与 ui.task_lifecycle 一致）。
     const isMergedTaskStatus = !!message._mergedTaskStatus;
     // work task / judge task 单独卡片（1-message group，无 _mergedTaskStatus）：
-    // summary = 前缀+content，pre 放原始 content，open=false，className `msg system`。
+    // summary 固定=任务状态（与合并卡/standalone lifecycle 一致），pre 放原始 content，open=false，className `msg system`。
     const isFoldedProcess = isProcessUser && isFoldableProcessContent(message.content) && !isMergedTaskStatus;
     // 进程来源 user 消息：右对齐状态卡片（灰底卡片样式，与真人 user 蓝底右对齐气泡同处右侧、靠灰底区分）。
     // work task / judge task / 合并卡片 样式打平 ui.task_lifecycle 任务状态卡片（msg system）；
     // 其余进程消息（schedule/curator 等）沿用 msg--process-card 非折叠样式。
-    el.className = isTaskResult ? 'msg assistant'
+    el.className = (isTaskResult || isTaskArtifact) ? 'msg assistant'
       : ((isMergedTaskStatus || isFoldedProcess) ? 'msg system'
       : (isProcessUser ? 'msg msg--process-card' : `msg ${message.role || 'assistant'}`));
     // 合并卡片 / work task / judge task 卡片样式打平 ui.task_lifecycle（不携带 dataset.source，与 system 消息一致）；
     // 其余进程消息（schedule/curator）保留 dataset.source 标识来源。
     if (isProcessUser && !isFoldedProcess && !isMergedTaskStatus) el.dataset.source = message.source;
+    // ui.task_artifact: 制品产出通知，渲染为 assistant 气泡 + "详情"链接到 /artifacts/{id}
+    if (isTaskArtifact) {
+      const text = typeof message.content === 'string' ? message.content : String(message.content || '');
+      const textNode = document.createElement('span');
+      textNode.textContent = text;
+      el.appendChild(textNode);
+      const card = message.card;
+      if (card && card.artifact_id) {
+        const href = '/artifacts/' + encodeURIComponent(card.artifact_id);
+        const link = document.createElement('a');
+        link.href = href;
+        link.textContent = '详情';
+        link.className = 'chat-artifact-link';
+        link.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          const nav = global.NAGENT && global.NAGENT.navigation;
+          if (nav && typeof nav.navigatePath === 'function') {
+            nav.navigatePath(href);
+          } else { global.location.href = href; }
+        });
+        el.appendChild(document.createTextNode(' '));
+        el.appendChild(link);
+      }
+      const timeLabel = formatMessageTime(message.created_at);
+      if (timeLabel) el.dataset.time = timeLabel;
+      return el;
+    }
     if (message.role === 'tool') {
       const details = document.createElement('details');
       const summary = document.createElement('summary');
@@ -1220,7 +1289,7 @@
     // system 消息：遵循消息渲染规范，按工具调用样式渲染为可折叠气泡（默认展开，
     // 保证命令结果可见、给人聊天感），textContent 安全渲染，无 innerHTML。
     // ui.task_result 不走此分支（普通消息，上方 isTaskResult 已分流到 assistant 样式）。
-    if (message.role === 'system' && !isTaskResult) {
+    if (message.role === 'system' && !isTaskResult && !isTaskArtifact) {
       // Server-persisted approval cards are reconstructed from session history
       // after a Dashboard refresh. The payload is the same whitelist used by
       // the SSE envelope, so it never contains raw tool arguments or actor data.
@@ -1265,14 +1334,14 @@
     const timeLabel = formatMessageTime(message.created_at);
     if (timeLabel) el.dataset.time = timeLabel;
     // work task / judge task 单独卡片（1-message group）：样式打平 ui.task_lifecycle 任务状态卡片，
-    // 折叠卡片（details 默认 open=false），summary = 前缀+content（查询状态/判断结束），pre = 原始 content；
+    // 折叠卡片（details 默认 open=false），summary 固定=任务状态（与合并卡、standalone lifecycle 一致），pre = 原始 content；
     // 与 ui.task_command/ui.task_lifecycle 折叠卡片结构一致（details+summary+pre），
     // textContent 安全渲染，无 innerHTML。
     if (isFoldedProcess) {
       const details = document.createElement('details');
       details.open = false;
       const summary = document.createElement('summary');
-      summary.textContent = foldableProcessSummary(message.content);
+      summary.textContent = '任务状态';
       const pre = document.createElement('pre');
       pre.textContent = typeof message.content === 'string' ? message.content : String(message.content || '');
       details.append(summary, pre);
@@ -1303,6 +1372,10 @@
       return el;
     }
     if (hasVisibleContent(content)) renderMessageText(el, content);
+    // ui.task_result 吸收了相邻 ui.task_artifact 时，在结果气泡内追加制品详情链接
+    if (isTaskResult && Array.isArray(message._resultArtifacts) && message._resultArtifacts.length) {
+      appendResultArtifactLinks(el, message._resultArtifacts);
+    }
     return el;
   }
 
@@ -1574,6 +1647,7 @@
       stopAutoRefresh();
       renderedMessageVersion = null;
       currentSessionId = null;
+      renderArtifactPanel();
       setHeader(null);
       showEmptyState();
       updateInfo({});
@@ -1592,6 +1666,7 @@
       disableApprovalCards(activeStreamEl);
     }
     currentSessionId = id;
+    renderArtifactPanel();
     draftExternalMemoryConfig = null;
     setHeader(id);
     // 会话切换：重置外部记忆操作标记，避免沿用上一会话的 options 注入
@@ -1620,6 +1695,7 @@
     await api.createSession(id);
     currentSessionId = id;
     setHeader(id);
+    renderArtifactPanel();
     if (draftExternalMemoryConfig?.modified === true) {
       sessionExternalMemoryConfig[id] = {
         providers: draftExternalMemoryConfig.providers,
@@ -1648,14 +1724,6 @@
     renderedMessageVersion = { count: 0, lastId: null };
     startAutoRefresh(id);
     return id;
-  }
-
-  async function newSession() {
-    stopAutoRefresh();
-    currentSessionId = null;
-    draftExternalMemoryConfig = null;
-    draftDebugSettings = null;
-    await ensureSession();
   }
 
   // 会话是否承接过浏览器工具调用：任一 role=tool 且 name 以 browser_ 开头的消息。
@@ -1949,6 +2017,7 @@
         preserveScroll: false, skipToolCalls: false, skipSessionList: false, applyExternalMemoryState: true,
       });
       renderedMessageVersion = messageVersionOf(detail);
+      if (sessionId === currentSessionId && seq === autoRefreshSeq) renderArtifactPanel();
     } catch (error) {
       const summary = ui.byId('chat-summary');
       if (summary) summary.textContent = '刷新会话失败: ' + error.message;
@@ -2112,6 +2181,14 @@
     if (isLifecycleNoCard || isWorkOrJudgeTask) {
       return 'task_status';
     }
+    // 任务最终结果（ui.task_result）：独立 1 消息组，可吸收后续相邻 ui.task_artifact
+    if (msg.role === 'system' && msg.name === 'ui.task_result') {
+      return 'task_result';
+    }
+    // 制品产出通知（ui.task_artifact）：被前导 task_result 组吸收，否则独立
+    if (msg.role === 'system' && msg.name === 'ui.task_artifact') {
+      return 'task_artifact';
+    }
     return 'other';
   }
 
@@ -2143,6 +2220,32 @@
         currentGroupType = null;
         currentGroupSources = null;
         result.push(msg);
+        continue;
+      }
+      // ui.task_artifact：前导 task_result 组存在时吸收（收集制品引用，供结果气泡内渲染详情链接），
+      // 否则独立渲染（保持原有 ui.task_artifact 气泡 + 详情链接）
+      if (type === 'task_artifact') {
+        if (currentGroupType === 'task_result' && currentGroup) {
+          const card = msg.card || {};
+          if (!currentGroup._resultArtifacts) currentGroup._resultArtifacts = [];
+          currentGroup._resultArtifacts.push({
+            name: card.name || (typeof msg.content === 'string' ? msg.content : ''),
+            artifact_id: card.artifact_id || '',
+          });
+          continue;
+        }
+        currentGroup = null;
+        currentGroupType = null;
+        currentGroupSources = null;
+        result.push(msg);
+        continue;
+      }
+      // ui.task_result：独立 1 消息组（多个 task_result 不互相合并），可吸收后续相邻 task_artifact
+      if (type === 'task_result') {
+        currentGroup = { ...msg };
+        currentGroupSources = [msg];
+        currentGroupType = type;
+        result.push(currentGroup);
         continue;
       }
       // type === 'command' or 'task_status'
@@ -2430,16 +2533,127 @@
     }
   }
 
-  function bindDebugToggle() {
-    const panel = ui.byId('chat-debug-panel');
-    const toggle = ui.byId('chat-debug-toggle');
+  function syncSideCollapse() {
     const shell = ui.byId('chat-shell');
-    if (!panel || !toggle) return;
-    toggle.addEventListener('click', () => {
-      const collapsed = panel.classList.toggle('collapsed');
-      if (shell) shell.classList.toggle('chat-shell--debug-collapsed', collapsed);
-      toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    const btn = ui.byId('chat-side-toggle-btn');
+    if (!shell || !btn) return;
+    const collapsed = shell.classList.contains('chat-shell--side-collapsed');
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+
+  function bindSideToggle() {
+    const btn = ui.byId('chat-side-toggle-btn');
+    const shell = ui.byId('chat-shell');
+    if (!btn || !shell) return;
+    // 展开/收起按钮视作右侧边栏的一部分：展开时移入侧栏 header（右上角），收起时回到对话区 header。
+    // querySelector 按 class 定位 header；宿主 DOM 缺失时（如测试桩）跳过移动，不影响 toggle 语义。
+    const stackHeader = shell.querySelector('.chat-stack > .panel-header');
+    const sidePanel = ui.byId('chat-side-panel');
+    const sideHeader = sidePanel ? sidePanel.querySelector('.panel-header') : null;
+    function placeToggleBtn() {
+      const collapsed = shell.classList.contains('chat-shell--side-collapsed');
+      const target = (collapsed || !sideHeader) ? stackHeader : sideHeader;
+      if (target && target !== btn.parentNode) target.appendChild(btn);
+    }
+    btn.addEventListener('click', () => {
+      shell.classList.toggle('chat-shell--side-collapsed');
+      placeToggleBtn();
+      syncSideCollapse();
     });
+    placeToggleBtn();
+    syncSideCollapse();
+  }
+
+  function activateSideTab(value, focus) {
+    if (value !== 'tool' && value !== 'artifact') return;
+    activeSideTab = value;
+    const toolBtn = ui.byId('chat-tab-tool-button');
+    const artBtn = ui.byId('chat-tab-artifact-button');
+    const toolPanel = ui.byId('chat-tab-tool');
+    const artPanel = ui.byId('chat-tab-artifact');
+    const tabs = [
+      { btn: toolBtn, panel: toolPanel, key: 'tool' },
+      { btn: artBtn, panel: artPanel, key: 'artifact' },
+    ];
+    tabs.forEach((t) => {
+      const active = t.key === value;
+      if (t.btn) {
+        t.btn.classList.toggle('chat-tab--active', active);
+        t.btn.setAttribute('aria-selected', active ? 'true' : 'false');
+        t.btn.setAttribute('tabindex', active ? '0' : '-1');
+      }
+      if (t.panel) t.panel.hidden = !active;
+    });
+    const focusBtn = value === 'tool' ? toolBtn : artBtn;
+    if (focus && focusBtn && typeof focusBtn.focus === 'function') focusBtn.focus();
+  }
+
+  function bindTabSwitch() {
+    const toolBtn = ui.byId('chat-tab-tool-button');
+    const artBtn = ui.byId('chat-tab-artifact-button');
+    const tabs = [
+      { btn: toolBtn, key: 'tool' },
+      { btn: artBtn, key: 'artifact' },
+    ];
+    tabs.forEach((t, idx) => {
+      if (!t.btn) return;
+      t.btn.addEventListener('click', () => activateSideTab(t.key, false));
+      t.btn.addEventListener('keydown', (ev) => {
+        const k = ev && ev.key;
+        if (k !== 'ArrowLeft' && k !== 'ArrowRight' && k !== 'Home' && k !== 'End') return;
+        if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+        let target;
+        if (k === 'ArrowLeft') target = tabs[(idx + tabs.length - 1) % tabs.length];
+        else if (k === 'ArrowRight') target = tabs[(idx + 1) % tabs.length];
+        else if (k === 'Home') target = tabs[0];
+        else target = tabs[tabs.length - 1];
+        if (target && target.btn) activateSideTab(target.key, true);
+      });
+    });
+    activateSideTab(activeSideTab, false);
+  }
+
+  async function renderArtifactPanel(options) {
+    options = options || {};
+    const target = ui.byId('chat-artifact-list');
+    artifactPanelRequestSeq++;
+    const seq = artifactPanelRequestSeq;
+    const sid = currentSessionId;
+    if (!target) return;
+    if (!sid) { clearNode(target); target.textContent = '暂未选择会话'; return; }
+    // silent 刷新（轮询）保留现有内容，避免每次 tick 闪烁「加载中...」
+    if (!options.silent) target.textContent = '加载中...';
+    try {
+      // Query by the session-id association (source_session_id) so task-produced
+      // artifacts (source_kind=task_artifact/task_attachment) registered against
+      // this session are found. The old source_kind=session filter never matched
+      // because no artifact is ever created with that source_kind.
+      const params = new URLSearchParams({ source_session_id: sid, limit: '50' });
+      const resp = await fetch('/chat/artifacts?' + params.toString());
+      if (seq !== artifactPanelRequestSeq || sid !== currentSessionId) return;
+      if (!resp.ok) throw new Error('load failed');
+      const data = await resp.json();
+      if (seq !== artifactPanelRequestSeq || sid !== currentSessionId) return;
+      const items = (data && !Array.isArray(data) && Array.isArray(data.items)) ? data.items : null;
+      if (items === null) throw new Error('invalid payload');
+      const renderer = global.NAGENT && global.NAGENT.artifacts && global.NAGENT.artifacts.renderListItem;
+      if (typeof renderer !== 'function') { target.textContent = '加载失败'; return; }
+      if (!items.length) { clearNode(target); target.textContent = '暂无关联制品'; return; }
+      const frag = document.createDocumentFragment();
+      items.forEach((a) => {
+        frag.appendChild(renderer(a, (artifact) => {
+          const href = '/artifacts/' + encodeURIComponent(artifact.id);
+          const nav = global.NAGENT && global.NAGENT.navigation;
+          if (nav && typeof nav.navigatePath === 'function') nav.navigatePath(href);
+          else global.location.href = href;
+        }));
+      });
+      clearNode(target);
+      target.appendChild(frag);
+    } catch (e) {
+      if (seq !== artifactPanelRequestSeq || sid !== currentSessionId) return;
+      target.textContent = '加载失败';
+    }
   }
 
   function loadExternalMemoryProviders() {
@@ -2925,20 +3139,20 @@
     initialized = true;
     const sendBtn = ui.byId('chat-send');
     const input = ui.byId('chat-input');
-    const newBtn = ui.byId('chat-new');
     if (sendBtn) sendBtn.addEventListener('click', send);
     if (input) {
       input.addEventListener('keydown', handleComposerKeydown);
       input.addEventListener('paste', handlePaste);
     }
-    if (newBtn) newBtn.addEventListener('click', newSession);
     const imageBtn = ui.byId('chat-image-button');
     const imageInput = ui.byId('chat-image-input');
     if (imageBtn && imageInput) {
       imageBtn.addEventListener('click', () => imageInput.click());
       imageInput.addEventListener('change', handleFileSelect);
     }
-    bindDebugToggle();
+    bindSideToggle();
+    bindTabSwitch();
+    renderArtifactPanel();
     document.addEventListener('click', handleMemoryDocumentClick);
     document.addEventListener('click', handleSettingsDocumentClick);
     document.addEventListener('click', handlePopoverMutualExclusion, true);

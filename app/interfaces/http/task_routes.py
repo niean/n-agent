@@ -29,11 +29,11 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from fastapi import APIRouter, Body, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
+from app.interfaces.http._content_disposition import build_content_disposition
 from app.application.task_run_service import TaskRunService
 from app.application.task_service import TaskService
 from app.domain.task import (
@@ -273,17 +273,12 @@ def register_task_routes(
                 "attachment path escapes root",
                 404,
             )
-        # Safe Content-Disposition: filename uses stored_name only (server
-        # generated); display filename is also safe (validated on upload).
-        safe_filename = att.stored_name.replace('"', "").replace("\r", "").replace("\n", "")
-        display_name = (att.filename or att.stored_name).replace('"', "").replace("\r", "").replace("\n", "")
-        # Use both filename (legacy) and filename* (RFC 5987) for UTF-8 display.
-        quoted_utf8 = quote(display_name, safe="")
+        # Content-Disposition: legacy filename stays ASCII-only (latin-1
+        # safe); the real (possibly non-ASCII) name is carried via RFC 5987
+        # filename*. Shared helper keeps the rule in one place.
+        display_name = att.filename or att.stored_name
         headers = {
-            "Content-Disposition": (
-                f'attachment; filename="{safe_filename}"; '
-                f"filename*=UTF-8''{quoted_utf8}"
-            ),
+            "Content-Disposition": build_content_disposition(display_name, "attachment"),
             "X-Content-Type-Options": "nosniff",
         }
         media_type = att.content_type or "application/octet-stream"

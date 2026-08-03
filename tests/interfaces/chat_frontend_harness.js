@@ -14,22 +14,38 @@ let failures = 0;
 function ok(cond, msg) { if (!cond) { failures++; console.error('FAIL: ' + msg); } }
 
 // --- stub element -----------------------------------------------------------
+// Module-level reference to the current document (set in freshStubs) so that
+// el.focus() can update document.activeElement.
+let _currentDoc = null;
+
 function makeEl() {
   const kids = [];
   const el = {
     className: '',
-    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    classList: {
+      add() { const parts = (el.className || '').split(/\s+/).filter(Boolean); for (const t of arguments) { if (parts.indexOf(t) === -1) parts.push(t); } el.className = parts.join(' '); },
+      remove() { const parts = (el.className || '').split(/\s+/).filter(Boolean); const args = Array.prototype.slice.call(arguments); el.className = parts.filter(function (c) { return args.indexOf(c) === -1; }).join(' '); },
+      toggle(token, force) { const parts = (el.className || '').split(/\s+/).filter(Boolean); const has = parts.indexOf(token) !== -1; if (force !== undefined) { if (force && !has) { parts.push(token); el.className = parts.join(' '); return true; } if (!force && has) { el.className = parts.filter(function (c) { return c !== token; }).join(' '); return false; } return force; } if (has) { el.className = parts.filter(function (c) { return c !== token; }).join(' '); return false; } parts.push(token); el.className = parts.join(' '); return true; },
+      contains(token) { return (el.className || '').split(/\s+/).indexOf(token) !== -1; },
+    },
     style: {},
     dataset: {},
     hidden: false,
     tagName: 'DIV',
     _kids: kids,
+    _attrs: {},
     _listeners: {},
-    appendChild(c) { c.parentNode = this; kids.push(c); return c; },
+    appendChild(c) {
+      if (c && c.tagName === '#document-fragment') {
+        while (c._kids && c._kids.length > 0) { const child = c._kids.shift(); child.parentNode = this; kids.push(child); }
+        return c;
+      }
+      c.parentNode = this; kids.push(c); return c;
+    },
     removeChild(c) { const i = kids.indexOf(c); if (i >= 0) kids.splice(i, 1); c.parentNode = null; return c; },
     replaceChild(next, previous) { const i = kids.indexOf(previous); if (i >= 0) { previous.parentNode = null; next.parentNode = this; kids[i] = next; } return previous; },
     replaceChildren() { kids.forEach((k) => { k.parentNode = null; }); kids.length = 0; },
-    append(...cs) { cs.forEach((c) => { c.parentNode = this; kids.push(c); }); },
+    append() { const args = Array.prototype.slice.call(arguments); args.forEach((c) => { if (c && c.tagName === '#document-fragment') { while (c._kids && c._kids.length > 0) { const child = c._kids.shift(); child.parentNode = this; kids.push(child); } } else { c.parentNode = this; kids.push(c); } }); },
     addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
     removeEventListener() {},
     dispatchEvent(ev) { (this._listeners[(ev && ev.type) || ''] || []).forEach((fn) => fn(ev)); },
@@ -46,9 +62,24 @@ function makeEl() {
       };
       return visit(this);
     },
-    querySelectorAll() { return []; },
-    setAttribute() {}, getAttribute() { return null; },
-    focus() {}, click() { this.dispatchEvent({ type: 'click' }); },
+    querySelectorAll(selector) {
+      const sel = String(selector || '');
+      const cls = sel.replace(/^\./, '');
+      const out = [];
+      const visit = (node) => {
+        if (!node || !node._kids) return;
+        for (const k of node._kids) {
+          if (k.className && k.className.split(/\s+/).indexOf(cls) !== -1) out.push(k);
+          visit(k);
+        }
+      };
+      visit(this);
+      return out;
+    },
+    setAttribute(name, value) { this._attrs[name] = String(value); },
+    getAttribute(name) { return this._attrs[name] !== undefined ? this._attrs[name] : null; },
+    focus() { if (_currentDoc) _currentDoc.activeElement = this; },
+    click() { this.dispatchEvent({ type: 'click' }); },
     get firstChild() { return kids[0] || null; },
     get textContent() {
       return kids.map((c) => (c && typeof c._text === 'string') ? c._text : (c && c.textContent) || '').join('');
@@ -86,6 +117,11 @@ let sseQueue = [];
 let fetchOverrides = [];
 let streamKeepOpen = false;
 let streamEndResolver = null;
+// T4: artifact panel fetch tracking (separate from main fetchCalls)
+let artifactFetchCalls = [];
+let artifactFetchHandler = null;
+// T4: navigation.navigatePath spy tracking
+let navPathCalls = [];
 
 function makeTimerEnv() {
   const timers = [];
@@ -109,6 +145,9 @@ function freshStubs() {
   fetchOverrides = [];
   streamKeepOpen = false;
   streamEndResolver = null;
+  artifactFetchCalls = [];
+  artifactFetchHandler = null;
+  navPathCalls = [];
   const messageStack = makeEl();
   const input = makeEl();
   input.value = '';
@@ -127,6 +166,50 @@ function freshStubs() {
     'chat-task-state': makeEl(),
     'chat-tool-calls': makeEl(),
   };
+  // T4: side panel structure (matching index.html)
+  const chatShell = makeEl();
+  chatShell.className = 'chat-shell chat-shell--side-collapsed';
+  const chatSidePanel = makeEl();
+  chatSidePanel.className = 'status-panel chat-side-panel';
+  const chatSideToggleBtn = makeEl();
+  chatSideToggleBtn.tagName = 'BUTTON';
+  chatSideToggleBtn.setAttribute('aria-expanded', 'false');
+  const chatSideBody = makeEl();
+  chatSideBody.className = 'panel-body';
+  const chatTabToolButton = makeEl();
+  chatTabToolButton.tagName = 'BUTTON';
+  chatTabToolButton.className = 'chat-tab chat-tab--active';
+  chatTabToolButton.dataset.tab = 'tool';
+  chatTabToolButton.setAttribute('role', 'tab');
+  chatTabToolButton.setAttribute('aria-selected', 'true');
+  chatTabToolButton.setAttribute('tabindex', '0');
+  const chatTabArtifactButton = makeEl();
+  chatTabArtifactButton.tagName = 'BUTTON';
+  chatTabArtifactButton.className = 'chat-tab';
+  chatTabArtifactButton.dataset.tab = 'artifact';
+  chatTabArtifactButton.setAttribute('role', 'tab');
+  chatTabArtifactButton.setAttribute('aria-selected', 'false');
+  chatTabArtifactButton.setAttribute('tabindex', '-1');
+  const chatTabTool = makeEl();
+  chatTabTool.className = 'chat-tab-content';
+  chatTabTool.setAttribute('role', 'tabpanel');
+  chatTabTool.hidden = false;
+  const chatTabArtifact = makeEl();
+  chatTabArtifact.className = 'chat-tab-content';
+  chatTabArtifact.setAttribute('role', 'tabpanel');
+  chatTabArtifact.hidden = true;
+  const chatArtifactList = makeEl();
+  chatArtifactList.className = 'artifacts-list__items';
+  chatArtifactList.textContent = '暂未选择会话';
+  byIdMap['chat-shell'] = chatShell;
+  byIdMap['chat-side-panel'] = chatSidePanel;
+  byIdMap['chat-side-toggle-btn'] = chatSideToggleBtn;
+  byIdMap['chat-side-body'] = chatSideBody;
+  byIdMap['chat-tab-tool-button'] = chatTabToolButton;
+  byIdMap['chat-tab-artifact-button'] = chatTabArtifactButton;
+  byIdMap['chat-tab-tool'] = chatTabTool;
+  byIdMap['chat-tab-artifact'] = chatTabArtifact;
+  byIdMap['chat-artifact-list'] = chatArtifactList;
   const ui = {
     byId: (id) => (byIdMap[id] !== undefined ? byIdMap[id] : makeEl()),
     el: () => makeEl(),
@@ -153,20 +236,42 @@ function freshStubs() {
   const document = {
     _elements: createdElements,
     _listeners: {},
+    activeElement: null,
     createElement: (tagName) => { const el = makeEl(); el.tagName = String(tagName || 'div').toUpperCase(); createdElements.push(el); return el; },
     createTextNode: (t) => ({ _text: String(t) }),
+    createDocumentFragment: () => { const frag = makeEl(); frag.tagName = '#document-fragment'; return frag; },
     getElementById: (id) => (byIdMap[id] !== undefined ? byIdMap[id] : null),
     querySelector: () => null,
     querySelectorAll: (sel) => {
       const cls = String(sel || '').replace(/^\./, '');
-      return createdElements.filter((el) => el.className && el.className.indexOf(cls) !== -1);
+      const all = createdElements.concat(Object.keys(byIdMap).map((k) => byIdMap[k]));
+      const seen = new Set();
+      const out = [];
+      for (const el of all) {
+        if (!el || seen.has(el)) continue;
+        seen.add(el);
+        if (el.className && el.className.split(/\s+/).indexOf(cls) !== -1) out.push(el);
+      }
+      return out;
     },
     addEventListener: (type, fn) => { (document._listeners[type] = document._listeners[type] || []).push(fn); },
     hidden: false,
     visibilityState: 'visible',
     body: makeEl(),
   };
+  _currentDoc = document;
   const fetchStub = (url, opts) => {
+    const u = String(url);
+    // T4: artifact list requests are recorded separately (not in fetchCalls)
+    if (u.indexOf('/chat/artifacts') !== -1) {
+      artifactFetchCalls.push({ url, opts });
+      if (artifactFetchHandler) return artifactFetchHandler(url, opts);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: async () => ({ items: [], next_cursor: null }),
+      });
+    }
     fetchCalls.push({ url, opts });
     for (const ov of fetchOverrides) {
       const u = String(url);
@@ -192,10 +297,26 @@ function freshStubs() {
     });
   };
   const win = {
-    NAGENT: { api, ui, modal: { confirm: () => Promise.resolve(true), alert: () => {} } },
+    NAGENT: {
+      api, ui,
+      modal: { confirm: () => Promise.resolve(true), alert: () => {} },
+      navigation: { navigatePath: (path) => { navPathCalls.push(path); } },
+      artifacts: {
+        renderListItem: (artifact, onClick) => {
+          const item = makeEl();
+          item.className = 'artifacts-list__item';
+          item._artifact = artifact;
+          item.textContent = artifact.name || artifact.id;
+          if (typeof onClick === 'function') {
+            item.addEventListener('click', () => onClick(artifact));
+          }
+          return item;
+        },
+      },
+    },
     _listeners: {},
     document,
-    location: { protocol: 'http:', host: 'x' },
+    location: { protocol: 'http:', host: 'x', href: '', pathname: '/chat' },
     crypto: { randomUUID: () => 'stub-uuid' },
     fetch: fetchStub,
     WebSocket: function () {},
@@ -209,6 +330,18 @@ function freshStubs() {
     clearFetchHandlers: () => { fetchOverrides.length = 0; },
     setStreamKeepOpen: () => { streamKeepOpen = true; },
     endStream: () => { if (streamEndResolver) { const r = streamEndResolver; streamEndResolver = null; r(); } },
+    // T4: artifact panel helpers
+    setArtifactFetchHandler: (handler) => { artifactFetchHandler = handler; },
+    clearArtifactFetchHandler: () => { artifactFetchHandler = null; },
+    getArtifactFetchCalls: () => artifactFetchCalls.slice(),
+    clearArtifactFetchCalls: () => { artifactFetchCalls.length = 0; },
+    getNavPathCalls: () => navPathCalls.slice(),
+    clearNavPathCalls: () => { navPathCalls.length = 0; },
+    fireKeydown: (el, key) => {
+      let prevented = false;
+      if (el) el.dispatchEvent({ type: 'keydown', key, preventDefault: () => { prevented = true; } });
+      return { prevented };
+    },
   };
 }
 
@@ -226,6 +359,8 @@ function loadChat() {
     WebSocket: env.win.WebSocket,
     TextDecoder,
     TextEncoder,
+    URLSearchParams,
+    encodeURIComponent,
     setInterval: env.timerEnv.setInterval,
     clearInterval: env.timerEnv.clearInterval,
   };
@@ -782,7 +917,7 @@ async function runIntegration() {
 // createMessageElement: 非真人进程来源 user 消息渲染为左对齐状态卡片
 // work task / judge task -> 折叠卡片，样式打平 ui.task_lifecycle 任务状态卡片
 //   （className `msg system`，与 ui.task_command/ui.task_lifecycle 一致）：
-//   summary 显示固定标题（work task -> 任务状态、judge task -> 判断完成），
+//   summary 显示固定标题 任务状态（work task / judge task 统一，与合并卡、standalone lifecycle 一致），
 //   pre 放原始 content，details 默认 open=false；
 // schedule/curator 等其它进程消息 -> 非折叠左对齐状态卡片（msg--process-card）
 // ===========================================================================
@@ -804,7 +939,7 @@ async function runIntegration() {
   const lifecycleClassName = lifecycleEl.className;
   ok(lifecycleClassName === 'msg system', 'ui.task_lifecycle renders msg system (got ' + lifecycleClassName + ')');
 
-  // task work -> 折叠卡片（details，默认 open=false）+ summary = 查询状态: <content>（前缀+content）
+  // task work -> 折叠卡片（details，默认 open=false）+ summary = 任务状态（固定标题，与合并卡一致）
   let el = createMessageElement({ role: 'user', source: 'task', content: 'work task t1' });
   ok(el.className === lifecycleClassName,
     'task work renders same className as ui.task_lifecycle (got ' + el.className + ', want ' + lifecycleClassName + ')');
@@ -816,13 +951,13 @@ async function runIntegration() {
   let d = findDetails(el);
   ok(d && d.open === false, 'task work card folded by default (open=false) (got open=' + (d && d.open) + ')');
   let sm = d && d._kids && d._kids[0];
-  ok(sm && sm.textContent === '查询状态: work task t1',
-    'work task summary = 查询状态: work task t1 (prefix+content) (got ' + JSON.stringify(sm && sm.textContent) + ')');
+  ok(sm && sm.textContent === '任务状态',
+    'work task summary = 任务状态 (fixed title, aligned with merged card / standalone lifecycle) (got ' + JSON.stringify(sm && sm.textContent) + ')');
   let pre = d && d._kids && d._kids[1];
   ok(pre && pre.textContent === 'work task t1',
     'work task pre = raw content (got ' + JSON.stringify(pre && pre.textContent) + ')');
 
-  // task judge -> 折叠卡片 + summary = 判断结束: <content>（前缀+content，注意"结束"非"完成"）
+  // task judge -> 折叠卡片 + summary = 任务状态（固定标题，与 work task / 合并卡一致）
   el = createMessageElement({ role: 'user', source: 'task', content: 'judge task t_xxx: has the goal been achieved?' });
   ok(el.className === lifecycleClassName,
     'judge task renders same className as ui.task_lifecycle (got ' + el.className + ', want ' + lifecycleClassName + ')');
@@ -834,8 +969,8 @@ async function runIntegration() {
   d = findDetails(el);
   ok(d && d.open === false, 'judge task card folded by default (open=false) (got open=' + (d && d.open) + ')');
   sm = d && d._kids && d._kids[0];
-  ok(sm && sm.textContent === '判断结束: judge task t_xxx: has the goal been achieved?',
-    'judge task summary = 判断结束: judge task... (prefix+content, 结束 not 完成) (got ' + JSON.stringify(sm && sm.textContent) + ')');
+  ok(sm && sm.textContent === '任务状态',
+    'judge task summary = 任务状态 (fixed title, aligned with work task / merged card) (got ' + JSON.stringify(sm && sm.textContent) + ')');
   pre = d && d._kids && d._kids[1];
   ok(pre && pre.textContent === 'judge task t_xxx: has the goal been achieved?',
     'judge task pre = raw content (got ' + JSON.stringify(pre && pre.textContent) + ')');
@@ -948,6 +1083,79 @@ async function runIntegration() {
   ok(e2eSummary && e2eSummary.textContent === '任务状态', 'e2e merged card summary = 任务状态');
   const e2ePre = e2eDetails && e2eDetails._kids && e2eDetails._kids[1];
   ok(e2ePre && e2ePre.textContent === '开始运行: t_aaa - 查天气\n查询状态: work task t_aaa', 'e2e merged card pre = lifecycle 原文 + work task 带前缀 (got ' + JSON.stringify(e2ePre && e2ePre.textContent) + ')');
+})();
+
+// ===========================================================================
+// ui.task_result 吸收相邻 ui.task_artifact：制品气泡合并到任务完成气泡内渲染
+// 任务完成后写入 task_result + N 条 task_artifact，前端合并为一个气泡：
+// 结果正文 + 逐行「产出制品: name 详情」链接（复用 /artifacts/{id} 导航）
+// ===========================================================================
+(function testTaskResultAbsorbsArtifacts() {
+  const env = loadChat();
+  const g = env.chat.groupTaskMessages;
+  const createMessageElement = env.chat.createMessageElement;
+  function collectAnchors(node) {
+    const out = [];
+    (function walk(n) {
+      if (!n || !n._kids) return;
+      for (const k of n._kids) { if (k.tagName === 'A') out.push(k); walk(k); }
+    })(node);
+    return out;
+  }
+
+  // --- 分组：task_result 吸收后续相邻 task_artifact ---
+  const grouped = g([
+    { id: 'r1', role: 'system', name: 'ui.task_result', content: '任务已完成：测试：任务制品\n\nCreated task-output-a.txt' },
+    { id: 'a1', role: 'system', name: 'ui.task_artifact', content: '产出制品: task-output-a.txt', card: { schema_version: 1, kind: 'task_artifact', artifact_id: 'artA', name: 'task-output-a.txt' } },
+    { id: 'a2', role: 'system', name: 'ui.task_artifact', content: '产出制品: task-output-b.md', card: { schema_version: 1, kind: 'task_artifact', artifact_id: 'artB', name: 'task-output-b.md' } },
+  ]);
+  ok(grouped.length === 1, 'task_result + 2 task_artifact: 1 merged group (got ' + grouped.length + ')');
+  ok(grouped[0].id === 'r1' && grouped[0].name === 'ui.task_result', 'merged group keeps task_result id/name');
+  ok(Array.isArray(grouped[0]._resultArtifacts) && grouped[0]._resultArtifacts.length === 2, 'merged group carries 2 _resultArtifacts');
+  ok(grouped[0]._resultArtifacts[0].artifact_id === 'artA' && grouped[0]._resultArtifacts[0].name === 'task-output-a.txt', 'first artifact ref (name+artifact_id) captured');
+  ok(grouped[0]._resultArtifacts[1].artifact_id === 'artB' && grouped[0]._resultArtifacts[1].name === 'task-output-b.md', 'second artifact ref captured');
+
+  // --- 渲染：合并后的 task_result 气泡含结果正文 + 制品详情链接 ---
+  const el = createMessageElement(grouped[0]);
+  ok(el.className === 'msg assistant', 'merged task_result renders as msg assistant (got ' + el.className + ')');
+  ok(el.textContent.indexOf('任务已完成') !== -1, 'merged bubble shows result text');
+  ok(el.textContent.indexOf('产出制品: task-output-a.txt') !== -1 && el.textContent.indexOf('产出制品: task-output-b.md') !== -1, 'merged bubble shows both artifact labels');
+  ok(el.textContent.indexOf('详情') !== -1, 'merged bubble shows 详情 links');
+  const hrefs = collectAnchors(el).map((a) => a.href).sort();
+  ok(hrefs.length === 2 && hrefs[0] === '/artifacts/artA' && hrefs[1] === '/artifacts/artB', 'merged bubble has 2 artifact links with correct hrefs (got ' + JSON.stringify(hrefs) + ')');
+
+  // --- 独立 task_artifact（无前导 task_result）保持独立渲染 ---
+  const standalone = g([
+    { id: 'a1', role: 'system', name: 'ui.task_artifact', content: '产出制品: x.txt', card: { artifact_id: 'artX', name: 'x.txt' } },
+  ]);
+  ok(standalone.length === 1 && standalone[0].id === 'a1' && standalone[0]._resultArtifacts === undefined, 'standalone task_artifact: independent, no _resultArtifacts');
+
+  // --- task_artifact 不被非 task_result 消息吸收（command 断开链）---
+  const notAbsorbed = g([
+    { id: 'c1', role: 'system', name: 'ui.task_command', content: 'cmd' },
+    { id: 'a1', role: 'system', name: 'ui.task_artifact', content: '产出制品: a.txt', card: { artifact_id: 'artA', name: 'a.txt' } },
+  ]);
+  ok(notAbsorbed.length === 2, 'command + task_artifact: 2 groups (not absorbed by non-result)');
+  ok(notAbsorbed[1].id === 'a1' && notAbsorbed[1]._resultArtifacts === undefined, 'task_artifact after command stays independent');
+
+  // --- task_result 后跟 command 再跟 task_artifact：command 断开吸收链 ---
+  const broken = g([
+    { id: 'r1', role: 'system', name: 'ui.task_result', content: '任务已完成：t' },
+    { id: 'c1', role: 'system', name: 'ui.task_command', content: 'cmd' },
+    { id: 'a1', role: 'system', name: 'ui.task_artifact', content: '产出制品: a.txt', card: { artifact_id: 'artA', name: 'a.txt' } },
+  ]);
+  ok(broken.length === 3, 'result + command + artifact: 3 groups (command breaks absorption)');
+  ok(broken[0]._resultArtifacts === undefined, 'task_result has no absorbed artifacts when command breaks chain');
+
+  // --- 无 artifact_id 的 task_artifact 仍被吸收；渲染时显示名称但不生成链接 ---
+  const noId = g([
+    { id: 'r1', role: 'system', name: 'ui.task_result', content: '任务已完成：t' },
+    { id: 'a1', role: 'system', name: 'ui.task_artifact', content: '产出制品: a.txt', card: { name: 'a.txt' } },
+  ]);
+  ok(noId.length === 1 && noId[0]._resultArtifacts.length === 1, 'task_artifact without artifact_id still absorbed');
+  const noIdEl = createMessageElement(noId[0]);
+  ok(noIdEl.textContent.indexOf('产出制品: a.txt') !== -1, 'artifact name still rendered without artifact_id');
+  ok(collectAnchors(noIdEl).length === 0, 'no link rendered when artifact_id missing (got ' + collectAnchors(noIdEl).length + ')');
 })();
 
 // ===========================================================================
@@ -2397,12 +2605,147 @@ async function testSessionViewLinks() {
   process.removeListener('unhandledRejection', uh);
 }
 
+async function testSidePanelAndArtifacts() {
+  // 1. init 空态：无会话显示"暂未选择会话"，不发 artifact 请求
+  let env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  ok(env.byIdMap['chat-artifact-list'].textContent === '暂未选择会话', 'init empty shows 暂未选择会话');
+  ok(env.getArtifactFetchCalls().length === 0, 'init empty: no artifact fetch');
+
+  // 2. bindSideToggle：点击同步 collapsed / shell class / aria-expanded
+  env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  const btn = env.byIdMap['chat-side-toggle-btn'];
+  const shell = env.byIdMap['chat-shell'];
+  ok(shell.classList.contains('chat-shell--side-collapsed') && btn.getAttribute('aria-expanded') === 'false', 'init: shell collapsed + btn aria false');
+  btn.click();
+  ok(!shell.classList.contains('chat-shell--side-collapsed') && btn.getAttribute('aria-expanded') === 'true', 'click btn expands: shell class removed, aria true');
+  btn.click();
+  ok(shell.classList.contains('chat-shell--side-collapsed') && btn.getAttribute('aria-expanded') === 'false', 'click btn collapses again');
+
+  // 3. bindTabSwitch 点击切换：恰好一个 active，aria/tabindex/hidden 一致；切换不发 artifact 请求
+  env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  const toolBtn = env.byIdMap['chat-tab-tool-button'];
+  const artBtn = env.byIdMap['chat-tab-artifact-button'];
+  const toolP = env.byIdMap['chat-tab-tool'];
+  const artP = env.byIdMap['chat-tab-artifact'];
+  ok(toolBtn.classList.contains('chat-tab--active') && toolBtn.getAttribute('aria-selected') === 'true' && toolBtn.getAttribute('tabindex') === '0', 'init: tool tab active');
+  ok(artBtn.getAttribute('aria-selected') === 'false' && artBtn.getAttribute('tabindex') === '-1' && artP.hidden === true, 'init: artifact tab inactive + hidden');
+  artBtn.click();
+  ok(artBtn.classList.contains('chat-tab--active') && artBtn.getAttribute('aria-selected') === 'true' && artBtn.getAttribute('tabindex') === '0', 'click artifact: active');
+  ok(!toolBtn.classList.contains('chat-tab--active') && toolBtn.getAttribute('aria-selected') === 'false' && toolP.hidden === true && artP.hidden === false, 'click artifact: tool inactive+hidden, artifact visible');
+  ok(env.getArtifactFetchCalls().length === 0, 'tab switch does not fetch artifacts');
+  toolBtn.click();
+  ok(toolBtn.classList.contains('chat-tab--active') && toolP.hidden === false && artP.hidden === true, 'click tool: back to tool');
+
+  // 4. bindTabSwitch 键盘：ArrowRight/Left/Home/End + preventDefault + focus
+  env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  const tb = env.byIdMap['chat-tab-tool-button'];
+  const ab = env.byIdMap['chat-tab-artifact-button'];
+  let r = env.fireKeydown(tb, 'ArrowRight');
+  ok(r.prevented === true && ab.classList.contains('chat-tab--active'), 'ArrowRight -> artifact active + prevented');
+  r = env.fireKeydown(ab, 'ArrowLeft');
+  ok(r.prevented === true && tb.classList.contains('chat-tab--active'), 'ArrowLeft -> tool active + prevented');
+  r = env.fireKeydown(tb, 'End');
+  ok(r.prevented === true && ab.classList.contains('chat-tab--active'), 'End -> artifact active');
+  r = env.fireKeydown(ab, 'Home');
+  ok(r.prevented === true && tb.classList.contains('chat-tab--active'), 'Home -> tool active');
+
+  // 5. renderArtifactPanel 有会话+items：send 触发 ensureSession -> 加载 -> renderer -> nav
+  env = loadChat();
+  env.setArtifactFetchHandler(() => Promise.resolve({ ok: true, status: 200, json: async () => ({ items: [
+    { id: 'a1', name: '制品一', kind: 'text', source_kind: 'session', updated_at: '2026-08-03T10:00:00Z' },
+    { id: 'a2', name: '制品二', kind: 'code', source_kind: 'session', updated_at: '2026-08-03T11:00:00Z' },
+  ], next_cursor: null }) }));
+  env.input.value = '/task list';
+  await env.chat.send();
+  await env.waitMicro(); await env.waitMicro(); await env.waitMicro();
+  const list = env.byIdMap['chat-artifact-list'];
+  ok(list._kids && list._kids.length === 2, 'session artifacts rendered 2 items');
+  ok(env.getArtifactFetchCalls().length === 1, 'exactly one artifact fetch on session create');
+  ok(env.getArtifactFetchCalls()[0].url.indexOf('source_session_id=') !== -1 && env.getArtifactFetchCalls()[0].url.indexOf('limit=50') !== -1, 'fetch URL has source_session_id/limit');
+  env.clearNavPathCalls();
+  list._kids[0].click();
+  ok(env.getNavPathCalls().indexOf('/artifacts/a1') !== -1, 'click item navigates to /artifacts/a1');
+
+  // 6. 空制品 -> "暂无关联制品"
+  env = loadChat();
+  env.setArtifactFetchHandler(() => Promise.resolve({ ok: true, status: 200, json: async () => ({ items: [], next_cursor: null }) }));
+  env.input.value = '/task list';
+  await env.chat.send();
+  await env.waitMicro(); await env.waitMicro(); await env.waitMicro();
+  ok(env.byIdMap['chat-artifact-list'].textContent === '暂无关联制品', 'empty items -> 暂无关联制品');
+
+  // 7. 非 2xx -> "加载失败"
+  env = loadChat();
+  env.setArtifactFetchHandler(() => Promise.resolve({ ok: false, status: 500, json: async () => ({}) }));
+  env.input.value = '/task list';
+  await env.chat.send();
+  await env.waitMicro(); await env.waitMicro(); await env.waitMicro();
+  ok(env.byIdMap['chat-artifact-list'].textContent === '加载失败', 'non-2xx -> 加载失败');
+
+  // 8. applySessionDetail（auto-poll 路径）不触发 artifact 请求
+  env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  env.clearArtifactFetchCalls();
+  await env.chat.applySessionDetail({ messages: [] });
+  await env.waitMicro(); await env.waitMicro();
+  ok(env.getArtifactFetchCalls().length === 0, 'applySessionDetail does not fetch artifacts (no auto-poll)');
+}
+
+// ===========================================================================
+// T4: 工具调用与制品面板随消息版本变化自动刷新（无需手动 F5）
+// autoRefreshTick 检测到消息版本变化时，同步调用 loadToolCalls() 与
+// renderArtifactPanel({silent:true})；版本无变化时不触发额外请求；silent 不闪烁。
+// ===========================================================================
+async function testAutoRefreshPanels() {
+  const detailWith = (id, msgs) => ({ session: { id }, messages: msgs, summary: null, task_state: null });
+
+  let env = loadChat();
+  sessionsList = [{ id: 's1', title: 's1' }];
+  let s1msgs = [{ id: 'm1', role: 'user', content: 'hi' }];
+  env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve(detailWith(id, s1msgs));
+  let toolCallsCount = 0;
+  env.win.NAGENT.api.getSessionToolCalls = () => { toolCallsCount++; return Promise.resolve([]); };
+  env.chat.init();
+  await env.waitMicro();
+  env.fireClick(env.findSessionItem('s1'));
+  await env.waitMicro(); await env.waitMicro(); await env.waitMicro(); // selectSession 完成：初始加载工具调用+制品并 startAutoRefresh
+  // 清零：排除 selectSession 初始加载计数，只观察轮询行为
+  toolCallsCount = 0;
+  env.clearArtifactFetchCalls();
+
+  // 版本无变化：轮询不应触发面板刷新
+  env.tickTimers();
+  await env.waitMicro(); await env.waitMicro();
+  ok(toolCallsCount === 0, 'no version change: tool calls not re-fetched (got ' + toolCallsCount + ')');
+  ok(env.getArtifactFetchCalls().length === 0, 'no version change: artifacts not re-fetched');
+
+  // 版本变化（任务异步产出新消息）：轮询应刷新工具调用与制品面板
+  s1msgs = [{ id: 'm1', role: 'user', content: 'hi' }, { id: 'm2', role: 'assistant', content: 'reply' }];
+  env.tickTimers();
+  await env.waitMicro(); await env.waitMicro(); await env.waitMicro();
+  ok(toolCallsCount >= 1, 'version change: tool calls re-fetched (got ' + toolCallsCount + ')');
+  ok(env.getArtifactFetchCalls().length >= 1, 'version change: artifacts re-fetched (got ' + env.getArtifactFetchCalls().length + ')');
+  // silent 刷新保留现有内容，不闪烁「加载中...」
+  ok(env.byIdMap['chat-artifact-list'].textContent !== '加载中...', 'silent refresh: no 加载中 flicker');
+}
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
   await testDebugSettingsPerSession();
   await testToolApprovalCard();
   await testSessionViewLinks();
+  await testSidePanelAndArtifacts();
+  await testAutoRefreshPanels();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

@@ -114,12 +114,13 @@ class TaskRunService:
         notifier: Any | None = None,
         lifecycle_writer: Callable[[str, str, dict[str, Any] | None], Awaitable[Any]] | None = None,
         result_writer: Callable[[str, str], Awaitable[Any]] | None = None,
+        artifact_writer: Callable[[str, str, dict[str, Any] | None], Awaitable[Any]] | None = None,
         lease_seconds: int = 900,
         heartbeat_timeout_seconds: int = 300,
         max_runtime_seconds: int = 3600,
         max_concurrency: int = 4,
         task_config_provider: TaskConfigProvider | None = None,
-        artifact_register_callback: Callable[[TaskArtifact, str, int, int], Awaitable[None]] | None = None,
+        artifact_register_callback: Callable[[TaskArtifact, str, int, int], Awaitable[Any]] | None = None,
         artifact_normalizer: Callable[[dict[str, Any], Task], Awaitable[TaskArtifact | None]] | None = None,
     ):
         self.registry = registry
@@ -129,6 +130,7 @@ class TaskRunService:
         self.notifier = notifier
         self.lifecycle_writer = lifecycle_writer
         self.result_writer = result_writer
+        self.artifact_writer = artifact_writer
         self.lease_seconds = lease_seconds
         self.heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self.max_runtime_seconds = max_runtime_seconds
@@ -596,10 +598,14 @@ class TaskRunService:
 
         # Invoke artifact register callbacks (ONLY after CAS success).
         # Best-effort: single failure does not affect other items or the
-        # completed Task.
-        await self._invoke_artifact_callbacks(
+        # completed Task. Returns successfully registered (TaskArtifact, Artifact) pairs.
+        registered = await self._invoke_artifact_callbacks(
             artifacts, task.id, run_id,
         )
+        # Notify the execution session of each produced artifact (best-effort),
+        # carrying artifact_id so the chat can render a /artifacts/{id} link.
+        for task_art, art in registered:
+            await self._write_artifact(task, task_art, art)
 
         return result
 
@@ -694,18 +700,47 @@ class TaskRunService:
         the completed Task.
         """
         if self.artifact_register_callback is None or not artifacts:
-            return
+            return ()
+        registered: list[tuple[TaskArtifact, Any]] = []
         for ordinal, artifact in enumerate(artifacts):
             try:
-                await self.artifact_register_callback(
+                result = await self.artifact_register_callback(
                     artifact, task_id, run_id, ordinal,
                 )
+                if result is not None:
+                    registered.append((artifact, result))
             except Exception as exc:
                 logger.warning(
                     "artifact register callback failed: "
                     "source_kind=task_artifact source_ref=%s exc_type=%s",
                     artifact.storage_ref, type(exc).__name__,
                 )
+        return tuple(registered)
+
+    async def _write_artifact(
+        self, task: Task, task_art: TaskArtifact, art: Any,
+    ) -> None:
+        """向执行会话 best-effort 写 ui.task_artifact system 消息（制品产出通知）。
+
+        card 含 artifact_id/name，供前端渲染 /artifacts/{id} 详情链接。writer 为 None
+        时跳过；写入异常仅 log.warning，不影响任务终结或制品注册。
+        """
+        if self.artifact_writer is None:
+            return
+        session_id = task_execution_session_id(task)
+        content = f"产出制品: {task_art.name}"
+        card = {
+            "schema_version": 1,
+            "kind": "task_artifact",
+            "artifact_id": art.id,
+            "name": task_art.name,
+        }
+        try:
+            await self.artifact_writer(session_id, content, card)
+        except Exception:
+            logger.warning(
+                "artifact write failed for task %s", task.id, exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # finalize_propose (worker propose -> WAITING_APPROVAL run finalization)

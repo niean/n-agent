@@ -22,7 +22,7 @@
 - Chat Dashboard 层
     - `/chat`：全屏聊天页面。
     - 会话抽屉：展示和选择 session，支持重命名和删除。
-    - 调试抽屉：展示 summary、task state、tool calls；默认收起，展开时不改变对话区宽度。
+    - 调试抽屉：展示 summary、task state、tool calls；默认收起，展开时挤压对话区。
     - 输入区：支持发送消息、空消息拦截、Shift+Enter 换行。
     - 左侧导航：按领域展示聊天、任务、工具、模型、平台、观测。
     - 工具二级菜单：知识、MCP、Skill、Plugin、Builtin。

@@ -35,10 +35,17 @@ from app.domain.artifact import (
 # underscore, hyphen. No path separators, no dots.
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
-# Filename components (stored_name, server_filename): alphanumeric, dot,
-# underscore, hyphen. Slashes and backslashes are rejected. Exact "." or
-# ".." are rejected separately.
-_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# Filename components (stored_name, server_filename): denylist aligned with
+# TaskService upload validation (task_service._FILENAME_SAFE_RE). Allows
+# Unicode letters/digits (e.g. Chinese filenames) so attachments whose
+# stored_name preserves a non-ASCII original filename can register as
+# artifacts. Rejects control chars (\x00-\x1f, \x7f), path separators
+# (/ and \), and Windows-reserved chars (<>:"|?*). Exact "." and ".." are
+# rejected separately in _validate_filename; nested paths are rejected in
+# _parse_scheme_parts. The two layers (upload + content_ref parse) must
+# share one rule, else a filename accepted at upload is rejected here and
+# the attachment silently fails to register as an artifact.
+_FILENAME_RE = re.compile(r"^[^\x00-\x1f/\\<>:\"|?*\x7f]+$")
 
 # Safe extension derived from the display filename: leading dot + 1-8
 # alphanumeric chars.
@@ -599,8 +606,8 @@ def _validate_filename(value: str, name: str) -> None:
         raise ArtifactValidationError(f"{name} must not be {value!r}")
     if not _FILENAME_RE.match(value):
         raise ArtifactValidationError(
-            f"{name} contains invalid characters (allowed: alphanumeric, "
-            f"dot, underscore, hyphen)"
+            f"{name} contains invalid characters "
+            f"(rejected: control chars, path separators / \\, and <>:\"|?*)"
         )
 
 

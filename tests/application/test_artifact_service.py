@@ -71,6 +71,7 @@ class FakeArtifactRegistry:
         self.delete_calls: list[str] = []
         self.register_calls: list[tuple[PublishedArtifact, str | None]] = []
         self.revoke_calls: list[str] = []
+        self.list_calls: list[dict[str, Any]] = []
         self.fail_on_create = False
         self.fail_on_update = False
         self.fail_on_register = False
@@ -89,15 +90,31 @@ class FakeArtifactRegistry:
         self,
         *,
         source_kind: ArtifactSource | None = None,
+        source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         kind: ArtifactKind | None = None,
         status: ArtifactStatus | None = None,
         q: str | None = None,
         cursor: ArtifactListCursor | None = None,
         limit: int = 50,
     ) -> Any:
+        self.list_calls.append({
+            "source_kind": source_kind,
+            "source_context_ref": source_context_ref,
+            "source_session_id": source_session_id,
+            "kind": kind,
+            "status": status,
+            "q": q,
+            "cursor": cursor,
+            "limit": limit,
+        })
         items = list(self._artifacts.values())
         if source_kind is not None:
             items = [a for a in items if a.source_kind is source_kind]
+        if source_context_ref is not None:
+            items = [a for a in items if a.source_context_ref == source_context_ref]
+        if source_session_id is not None:
+            items = [a for a in items if a.source_session_id == source_session_id]
         if kind is not None:
             items = [a for a in items if a.kind is kind]
         if status is not None:
@@ -147,6 +164,24 @@ class FakeArtifactRegistry:
 
     async def count_artifacts(self) -> int:
         return len(self._artifacts)
+
+    async def list_task_artifacts_missing_session(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        items = [
+            a for a in self._artifacts.values()
+            if a.source_kind in (ArtifactSource.TASK_ARTIFACT, ArtifactSource.TASK_ATTACHMENT)
+            and a.source_session_id is None
+        ]
+        items.sort(key=lambda a: a.id)
+        return tuple(items[:limit])
+
+    async def list_artifacts_with_empty_mime(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        items = [a for a in self._artifacts.values() if not (a.mime or "")]
+        items.sort(key=lambda a: a.id)
+        return tuple(items[:limit])
 
     async def register_published(
         self,
@@ -402,6 +437,8 @@ def _make_service(
     audit: FakePolicyAuditService | None = None,
     config: ArtifactServiceConfig | None = None,
     convert_html: Callable[[str], str] | None = None,
+    task_session_resolver: Callable[[str], Awaitable[str | None]] | None = None,
+    task_attachment_delete: Callable[[str], Awaitable[bool]] | None = None,
 ) -> ArtifactService:
     return ArtifactService(
         registry=registry or FakeArtifactRegistry(),
@@ -411,6 +448,8 @@ def _make_service(
         policy_audit_service=audit or FakePolicyAuditService(),
         config=config or _make_config(),
         convert_to_html=convert_html or convert_to_html,
+        task_session_resolver=task_session_resolver,
+        task_attachment_delete=task_attachment_delete,
     )
 
 
@@ -463,6 +502,7 @@ def _make_file_artifact(
     source_kind: ArtifactSource = ArtifactSource.MANUAL,
     source_ref: str | None = None,
     source_context_ref: str | None = None,
+    source_session_id: str | None = None,
     status: ArtifactStatus = ArtifactStatus.DRAFT,
     classification: str | None = None,
     labels: tuple[str, ...] | None = None,
@@ -479,6 +519,7 @@ def _make_file_artifact(
         source_kind=source_kind,
         source_ref=source_ref or artifact_id,
         source_context_ref=source_context_ref,
+        source_session_id=source_session_id,
         status=status,
         classification=classification,
         labels=labels,
@@ -553,6 +594,56 @@ class TestListArtifacts:
         page2 = await svc.list_artifacts(limit=5, cursor=page1.next_cursor)
         all_ids = {a.id for a in page1.items} | {a.id for a in page2.items}
         assert len(all_ids) == 10
+
+    @pytest.mark.asyncio
+    async def test_source_context_ref_passthrough_specific_value(self):
+        """Service passes source_context_ref as-is to registry."""
+        registry = FakeArtifactRegistry()
+        svc = _make_service(registry=registry)
+        await svc.list_artifacts(source_context_ref="session-a")
+        assert registry.list_calls[-1]["source_context_ref"] == "session-a"
+
+    @pytest.mark.asyncio
+    async def test_source_context_ref_passthrough_empty_string(self):
+        """Empty string is passed as-is, NOT coerced to None."""
+        registry = FakeArtifactRegistry()
+        svc = _make_service(registry=registry)
+        await svc.list_artifacts(source_context_ref="")
+        assert registry.list_calls[-1]["source_context_ref"] == ""
+
+    @pytest.mark.asyncio
+    async def test_source_context_ref_omitted_defaults_to_none(self):
+        """Omitting source_context_ref passes None to registry."""
+        registry = FakeArtifactRegistry()
+        svc = _make_service(registry=registry)
+        await svc.list_artifacts()
+        assert registry.list_calls[-1]["source_context_ref"] is None
+
+    @pytest.mark.asyncio
+    async def test_source_context_ref_with_limit_clamp(self):
+        """source_context_ref does not interfere with limit clamping."""
+        registry = FakeArtifactRegistry()
+        svc = _make_service(registry=registry)
+        await svc.list_artifacts(source_context_ref="session-a", limit=200)
+        assert registry.list_calls[-1]["source_context_ref"] == "session-a"
+        assert registry.list_calls[-1]["limit"] == 100
+
+    @pytest.mark.asyncio
+    async def test_source_context_ref_filters_results(self):
+        """The fake registry filters by source_context_ref, proving the
+        keyword is accepted and applied."""
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_inline_artifact(
+            artifact_id="a1", source_kind=ArtifactSource.SESSION,
+            source_ref="session-a:1", source_context_ref="session-a",
+        ))
+        registry.seed(_make_inline_artifact(
+            artifact_id="a2", source_kind=ArtifactSource.SESSION,
+            source_ref="session-b:2", source_context_ref="session-b",
+        ))
+        svc = _make_service(registry=registry)
+        page = await svc.list_artifacts(source_context_ref="session-a")
+        assert {a.id for a in page.items} == {"a1"}
 
 
 class TestGetArtifact:
@@ -907,6 +998,128 @@ class TestDeleteArtifact:
         assert store.has(attachment_ref)
 
     @pytest.mark.asyncio
+    async def test_delete_task_attachment_cascades_to_source(self):
+        """Deleting a task_attachment artifact must cascade-delete the
+        underlying TaskAttachment via the injected callback, so the task
+        detail page stays in sync. The source (source of truth) is removed
+        BEFORE the artifact metadata, so backfill cannot resurrect it."""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        attachment_ref = "attachment:task-1/stored-1"
+        store.seed(attachment_ref, b"source data")
+        art = _make_file_artifact(
+            artifact_id="art-att",
+            content_ref=attachment_ref,
+            source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_ref="att-1",
+        )
+        registry.seed(art)
+        deleted: list[str] = []
+
+        async def delete_attachment(attachment_id: str) -> bool:
+            deleted.append(attachment_id)
+            return True
+
+        svc = _make_service(
+            registry=registry, content_store=store,
+            task_attachment_delete=delete_attachment,
+        )
+        result = await svc.delete_artifact("art-att")
+        assert result is True
+        # Source TaskAttachment delete invoked with the attachment_id (source_ref).
+        assert deleted == ["att-1"]
+        # Artifact metadata deleted.
+        assert "art-att" in registry.delete_calls
+        # ArtifactService must NOT delete the source file via its own content
+        # store (the callback owns the attachment file lifecycle).
+        assert attachment_ref not in store.delete_calls
+
+    @pytest.mark.asyncio
+    async def test_delete_task_attachment_callback_already_gone(self):
+        """When the callback reports the attachment already deleted (False),
+        the artifact metadata is still removed (stale projection cleanup)."""
+        registry = FakeArtifactRegistry()
+        art = _make_file_artifact(
+            artifact_id="art-att",
+            content_ref="attachment:task-1/stored-1",
+            source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_ref="att-1",
+        )
+        registry.seed(art)
+
+        async def delete_attachment(attachment_id: str) -> bool:
+            return False  # already gone
+
+        svc = _make_service(
+            registry=registry, task_attachment_delete=delete_attachment,
+        )
+        result = await svc.delete_artifact("art-att")
+        assert result is True
+        assert "art-att" in registry.delete_calls
+
+    @pytest.mark.asyncio
+    async def test_delete_task_attachment_callback_failure_propagates(self):
+        """If the source TaskAttachment cannot be deleted, the artifact
+        metadata must be left intact -- otherwise the attachment survives and
+        backfill resurrects the artifact on next startup (the exact bug)."""
+        registry = FakeArtifactRegistry()
+        art = _make_file_artifact(
+            artifact_id="art-att",
+            content_ref="attachment:task-1/stored-1",
+            source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_ref="att-1",
+        )
+        registry.seed(art)
+
+        async def delete_attachment(attachment_id: str) -> bool:
+            raise RuntimeError("attachment delete failed")
+
+        svc = _make_service(
+            registry=registry, task_attachment_delete=delete_attachment,
+        )
+        with pytest.raises(RuntimeError):
+            await svc.delete_artifact("art-att")
+        # Artifact metadata NOT deleted (no resurrection).
+        assert "art-att" not in registry.delete_calls
+        assert await registry.get_artifact("art-att") is not None
+
+    @pytest.mark.asyncio
+    async def test_delete_non_task_attachment_skips_callback(self):
+        """Only task_attachment-sourced artifacts cascade. Manual and
+        task_artifact (workspace) artifacts must not trigger the attachment
+        delete callback."""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        deleted: list[str] = []
+
+        async def delete_attachment(attachment_id: str) -> bool:
+            deleted.append(attachment_id)
+            return True
+
+        # Manual artifact (owned content).
+        owned_ref = "item:art-m/file"
+        store.seed(owned_ref, b"data")
+        registry.seed(_make_file_artifact(
+            artifact_id="art-m", content_ref=owned_ref,
+            source_kind=ArtifactSource.MANUAL,
+        ))
+        # task_artifact (workspace source) artifact.
+        registry.seed(_make_file_artifact(
+            artifact_id="art-ta",
+            content_ref="workspace:task-1/output.md",
+            source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task-1#r1#0",
+        ))
+        svc = _make_service(
+            registry=registry, content_store=store,
+            task_attachment_delete=delete_attachment,
+        )
+        await svc.delete_artifact("art-m")
+        await svc.delete_artifact("art-ta")
+        assert deleted == []
+
+
+    @pytest.mark.asyncio
     async def test_delete_does_not_touch_snapshots(self):
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
@@ -939,6 +1152,48 @@ class TestDeleteArtifact:
         result = await svc.delete_artifact("art-1")
         assert result is True
         assert len(registry.delete_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_artifacts_by_source_task_removes_only_task_artifacts(self):
+        """delete_artifacts_by_source_task deletes every artifact whose
+        source_context_ref == task_id (both task_attachment and task_artifact),
+        leaving other tasks' artifacts intact and cleaning owned content."""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        store.seed("item:ta-1/file", b"a-data")
+        registry.seed(_make_file_artifact(
+            artifact_id="ta-1", content_ref="item:ta-1/file",
+            source_kind=ArtifactSource.TASK_ATTACHMENT, source_context_ref="task-1",
+        ))
+        registry.seed(_make_inline_artifact(
+            artifact_id="ta-2", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_context_ref="task-1",
+        ))
+        # task-2 artifact must survive
+        registry.seed(_make_inline_artifact(
+            artifact_id="tb-1", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_context_ref="task-2",
+        ))
+        svc = _make_service(registry=registry, content_store=store)
+        count = await svc.delete_artifacts_by_source_task("task-1")
+        assert count == 2
+        assert await registry.get_artifact("ta-1") is None
+        assert await registry.get_artifact("ta-2") is None
+        assert await registry.get_artifact("tb-1") is not None
+        # owned content of the deleted file artifact cleaned up
+        assert "item:ta-1/file" in store.delete_calls
+
+    @pytest.mark.asyncio
+    async def test_delete_artifacts_by_source_task_empty(self):
+        """No artifacts for the task -> returns 0, no delete calls."""
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_inline_artifact(
+            artifact_id="tb-1", source_context_ref="task-2",
+        ))
+        svc = _make_service(registry=registry)
+        count = await svc.delete_artifacts_by_source_task("task-1")
+        assert count == 0
+        assert registry.delete_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1412,6 +1667,33 @@ class TestRegisterFromAttachment:
         assert result.source_ref == "att-1"
         assert result.source_context_ref == "task-1"
 
+    @pytest.mark.asyncio
+    async def test_infers_kind_from_name_when_content_type_empty(self):
+        """Attachments without content_type fall back to filename extension.
+
+        Regression: attachments uploaded without a MIME content_type were
+        classified as OTHER and could not render.
+        """
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        attachment_ref = "attachment:task-1/stored-1"
+        store.seed(attachment_ref, b"a,b,c\n1,2,3")
+        svc = _make_service(registry=registry, content_store=store)
+        src = ArtifactAttachmentSource(
+            attachment_id="att-1",
+            task_id="task-1",
+            stored_name="stored-1",
+            filename="report.csv",
+            content_type="",  # missing -> infer from extension
+            size=0,
+            checksum="",
+            uploaded_by="user-1",
+        )
+        result = await svc.register_from_attachment(src)
+        assert result is not None
+        assert result.kind is ArtifactKind.CSV
+        assert result.mime == "text/csv"
+
 
 class TestRegisterFromTaskArtifact:
     @pytest.mark.asyncio
@@ -1465,6 +1747,57 @@ class TestRegisterFromTaskArtifact:
         expected_ref = Artifact.task_artifact_source_ref("task-1", 1, 0)
         assert result.source_ref == expected_ref
         assert result.source_context_ref == "task-1"
+
+    @pytest.mark.asyncio
+    async def test_infers_kind_from_name_when_mime_empty(self):
+        """Task artifacts submitted without mime fall back to filename ext.
+
+        Regression: task_complete submits {name, storage_ref, type} with no
+        mime (artifact_normalizer is not wired); kind became OTHER and
+        .md/.txt could not render in the workbench (BINARY_KINDS has 'other').
+        """
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        ws_md = "workspace:task-output-b.md"
+        ws_txt = "workspace:task-output-a.txt"
+        store.seed(ws_md, b"# artifact b")
+        store.seed(ws_txt, b"artifact a")
+        svc = _make_service(registry=registry, content_store=store)
+
+        ta_md = TaskArtifact(
+            type="text", name="task-output-b.md", mime="", size=0,
+            storage_ref=ws_md, source_task_id="task-1", summary="", checksum="",
+        )
+        result_md = await svc.register_from_task_artifact(ta_md, "task-1", 1, 0)
+        assert result_md is not None
+        assert result_md.kind is ArtifactKind.MARKDOWN
+        assert result_md.mime == "text/markdown"
+
+        ta_txt = TaskArtifact(
+            type="text", name="task-output-a.txt", mime="", size=0,
+            storage_ref=ws_txt, source_task_id="task-1", summary="", checksum="",
+        )
+        result_txt = await svc.register_from_task_artifact(ta_txt, "task-1", 1, 1)
+        assert result_txt is not None
+        assert result_txt.kind is ArtifactKind.TEXT
+        assert result_txt.mime == "text/plain"
+
+    @pytest.mark.asyncio
+    async def test_empty_mime_unknown_extension_stays_other(self):
+        """Unknown extension + empty mime stays OTHER (no false positive)."""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        ws = "workspace:output.dat"
+        store.seed(ws, b"\x00\x01\x02")
+        svc = _make_service(registry=registry, content_store=store)
+        ta = TaskArtifact(
+            type="binary", name="output.dat", mime="", size=0,
+            storage_ref=ws, source_task_id="task-1", summary="", checksum="",
+        )
+        result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is not None
+        assert result.kind is ArtifactKind.OTHER
+        assert result.mime == ""
 
     @pytest.mark.asyncio
     async def test_invalid_workspace_ref_skipped(self, caplog):
@@ -1527,6 +1860,233 @@ class TestRegisterFromTaskArtifact:
         )
         result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
         assert result is None  # no exception raised
+
+
+def _session_resolver(mapping: dict[str, str]):
+    """Build a task_id -> session_id resolver from a static mapping."""
+    async def resolve(task_id: str) -> str | None:
+        return mapping.get(task_id)
+    return resolve
+
+
+class TestSourceSessionAssociation:
+    """Registration establishes a session-keyed queryable association."""
+
+    @pytest.mark.asyncio
+    async def test_register_task_artifact_sets_session_id(self):
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        ws_ref = "workspace:reports/output.md"
+        store.seed(ws_ref, b"# Task output")
+        resolver = _session_resolver({"task-1": "task-sess-1"})
+        svc = _make_service(
+            registry=registry, content_store=store, task_session_resolver=resolver,
+        )
+        ta = TaskArtifact(
+            type="file", name="output.md", mime="text/markdown",
+            size=len(b"# Task output"), storage_ref=ws_ref,
+            source_task_id="task-1", summary="",
+            checksum=_sha256(b"# Task output"),
+        )
+        result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is not None
+        assert result.source_session_id == "task-sess-1"
+        # source_context_ref remains the task id (provenance), not the session.
+        assert result.source_context_ref == "task-1"
+
+    @pytest.mark.asyncio
+    async def test_register_attachment_sets_session_id(self):
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        attachment_ref = "attachment:task-9/stored-1"
+        store.seed(attachment_ref, b"attachment data")
+        resolver = _session_resolver({"task-9": "task-sess-9"})
+        svc = _make_service(
+            registry=registry, content_store=store, task_session_resolver=resolver,
+        )
+        src = ArtifactAttachmentSource(
+            attachment_id="att-9", task_id="task-9", stored_name="stored-1",
+            filename="report.pdf", content_type="application/pdf",
+            size=len(b"attachment data"), checksum=_sha256(b"attachment data"),
+            uploaded_by="user-1",
+        )
+        result = await svc.register_from_attachment(src)
+        assert result is not None
+        assert result.source_session_id == "task-sess-9"
+        assert result.source_context_ref == "task-9"
+
+    @pytest.mark.asyncio
+    async def test_register_without_resolver_leaves_session_null(self):
+        """No resolver wired (task subsystem disabled) -> graceful None."""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        ws_ref = "workspace:reports/output.md"
+        store.seed(ws_ref, b"# Task output")
+        svc = _make_service(registry=registry, content_store=store)
+        ta = TaskArtifact(
+            type="file", name="output.md", mime="text/markdown",
+            size=len(b"# Task output"), storage_ref=ws_ref,
+            source_task_id="task-1", summary="",
+            checksum=_sha256(b"# Task output"),
+        )
+        result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is not None
+        assert result.source_session_id is None
+
+    @pytest.mark.asyncio
+    async def test_list_passes_source_session_id_through(self):
+        registry = FakeArtifactRegistry()
+        svc = _make_service(registry=registry)
+        await svc.list_artifacts(source_session_id="task-sess-1")
+        assert registry.list_calls[-1]["source_session_id"] == "task-sess-1"
+
+    @pytest.mark.asyncio
+    async def test_list_omitted_source_session_id_defaults_none(self):
+        registry = FakeArtifactRegistry()
+        svc = _make_service(registry=registry)
+        await svc.list_artifacts()
+        assert registry.list_calls[-1]["source_session_id"] is None
+
+
+class TestBackfillSessionIds:
+    @pytest.mark.asyncio
+    async def test_backfill_populates_missing_session(self):
+        registry = FakeArtifactRegistry()
+        # Two task artifacts missing session, one already populated, one manual.
+        registry.seed(_make_file_artifact(
+            artifact_id="a1", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task:t1:run:1:artifact:0", source_context_ref="t1",
+            content_ref="item:a1/f", checksum=_sha256(b"a1"),
+        ))
+        registry.seed(_make_file_artifact(
+            artifact_id="a2", source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_ref="att-2", source_context_ref="t2",
+            content_ref="item:a2/f", checksum=_sha256(b"a2"),
+        ))
+        registry.seed(_make_file_artifact(
+            artifact_id="a3", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task:t3:run:1:artifact:0", source_context_ref="t3",
+            source_session_id="sess-3",
+            content_ref="item:a3/f", checksum=_sha256(b"a3"),
+        ))
+        registry.seed(_make_file_artifact(
+            artifact_id="a4", source_kind=ArtifactSource.MANUAL,
+            content_ref="item:a4/f", checksum=_sha256(b"a4"),
+        ))
+        resolver = _session_resolver({"t1": "sess-1", "t2": "sess-2", "t3": "sess-3"})
+        svc = _make_service(registry=registry, task_session_resolver=resolver)
+
+        stats = await svc.backfill_session_ids()
+        assert stats == {"processed": 2, "updated": 2, "skipped": 0, "failed": 0}
+        assert registry._artifacts["a1"].source_session_id == "sess-1"
+        assert registry._artifacts["a2"].source_session_id == "sess-2"
+        # Already-populated artifact untouched by backfill (not in missing set).
+        assert registry._artifacts["a3"].source_session_id == "sess-3"
+        # Manual artifact untouched.
+        assert registry._artifacts["a4"].source_session_id is None
+        # Idempotent: a second run finds nothing missing.
+        stats2 = await svc.backfill_session_ids()
+        assert stats2["processed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_backfill_noop_without_resolver(self):
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_file_artifact(
+            artifact_id="a1", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task:t1:run:1:artifact:0", source_context_ref="t1",
+            content_ref="item:a1/f", checksum=_sha256(b"a1"),
+        ))
+        svc = _make_service(registry=registry)
+        stats = await svc.backfill_session_ids()
+        assert stats == {"processed": 0, "updated": 0, "skipped": 0, "failed": 0}
+        assert registry._artifacts["a1"].source_session_id is None
+
+
+class TestBackfillKinds:
+    """Re-infer kind/mime for artifacts registered with empty mime.
+
+    Regression: existing task artifacts with empty mime were classified as
+    OTHER and could not render; the backfill re-derives kind/mime from the
+    filename extension so historical artifacts render correctly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reclassifies_empty_mime_from_name(self):
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_file_artifact(
+            artifact_id="a1", name="task-output-b.md",
+            kind=ArtifactKind.OTHER, mime="",
+            source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task:t1:run:1:artifact:0", source_context_ref="t1",
+            content_ref="workspace:task-output-b.md",
+        ))
+        registry.seed(_make_file_artifact(
+            artifact_id="a2", name="task-output-a.txt",
+            kind=ArtifactKind.OTHER, mime="",
+            source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task:t1:run:1:artifact:1", source_context_ref="t1",
+            content_ref="workspace:task-output-a.txt",
+        ))
+        svc = _make_service(registry=registry)
+
+        stats = await svc.backfill_kinds()
+        assert stats == {"processed": 2, "updated": 2, "skipped": 0, "failed": 0}
+        assert registry._artifacts["a1"].kind is ArtifactKind.MARKDOWN
+        assert registry._artifacts["a1"].mime == "text/markdown"
+        assert registry._artifacts["a2"].kind is ArtifactKind.TEXT
+        assert registry._artifacts["a2"].mime == "text/plain"
+
+    @pytest.mark.asyncio
+    async def test_skips_artifacts_with_nonempty_mime(self):
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_file_artifact(
+            artifact_id="a1", name="doc.md",
+            kind=ArtifactKind.MARKDOWN, mime="text/markdown",
+            content_ref="item:a1/f",
+        ))
+        registry.seed(_make_file_artifact(
+            artifact_id="a2", name="data.dat",
+            kind=ArtifactKind.OTHER, mime="application/octet-stream",
+            content_ref="item:a2/f",
+        ))
+        svc = _make_service(registry=registry)
+
+        stats = await svc.backfill_kinds()
+        assert stats == {"processed": 0, "updated": 0, "skipped": 0, "failed": 0}
+        # Untouched.
+        assert registry._artifacts["a2"].kind is ArtifactKind.OTHER
+
+    @pytest.mark.asyncio
+    async def test_skips_empty_mime_unknown_extension(self):
+        """Empty mime + unknown extension -> no reclassification (stays OTHER)."""
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_file_artifact(
+            artifact_id="a1", name="blob.dat",
+            kind=ArtifactKind.OTHER, mime="",
+            content_ref="item:a1/f",
+        ))
+        svc = _make_service(registry=registry)
+
+        stats = await svc.backfill_kinds()
+        assert stats == {"processed": 1, "updated": 0, "skipped": 1, "failed": 0}
+        assert registry._artifacts["a1"].kind is ArtifactKind.OTHER
+        assert registry._artifacts["a1"].mime == ""
+
+    @pytest.mark.asyncio
+    async def test_idempotent(self):
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_file_artifact(
+            artifact_id="a1", name="doc.md",
+            kind=ArtifactKind.OTHER, mime="",
+            content_ref="item:a1/f",
+        ))
+        svc = _make_service(registry=registry)
+
+        s1 = await svc.backfill_kinds()
+        assert s1["updated"] == 1
+        # Second run finds nothing with empty mime.
+        s2 = await svc.backfill_kinds()
+        assert s2 == {"processed": 0, "updated": 0, "skipped": 0, "failed": 0}
 
 
 class TestBackfillAttachments:
@@ -1691,3 +2251,95 @@ class TestBackfillAttachments:
         assert stats["skipped"] == 2
         assert stats["failed"] == 0
         assert len(registry.create_calls) == 3  # total unique artifacts across both runs
+
+
+# ---------------------------------------------------------------------------
+# Backfill orphaned task artifacts (deleted-task cleanup)
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillOrphanedTaskArtifacts:
+    """Delete task-sourced artifacts whose source task no longer exists.
+
+    Regression: artifacts registered one-way into the separate artifacts DB
+    survived task deletion (pre-cascade-fix), so deleted tasks' artifacts kept
+    showing in the list. The startup backfill reclaims these orphans.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deletes_orphans_keeps_alive(self):
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_inline_artifact(
+            artifact_id="orphan-1", source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_context_ref="task-deleted",
+        ))
+        registry.seed(_make_inline_artifact(
+            artifact_id="alive-1", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_context_ref="task-alive",
+        ))
+        svc = _make_service(registry=registry)
+        alive = {"task-alive"}
+
+        async def task_exists(tid: str) -> bool:
+            return tid in alive
+
+        svc.set_task_exists_callback(task_exists)
+        stats = await svc.backfill_orphaned_task_artifacts(batch_size=100)
+        assert stats["deleted"] == 1
+        assert await registry.get_artifact("orphan-1") is None
+        assert await registry.get_artifact("alive-1") is not None
+
+    @pytest.mark.asyncio
+    async def test_noop_without_callback(self):
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_inline_artifact(
+            artifact_id="orphan-1", source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_context_ref="task-deleted",
+        ))
+        svc = _make_service(registry=registry)
+        stats = await svc.backfill_orphaned_task_artifacts(batch_size=100)
+        assert stats["deleted"] == 0
+        assert await registry.get_artifact("orphan-1") is not None
+
+    @pytest.mark.asyncio
+    async def test_fail_safe_skips_on_existence_error(self):
+        """If task_exists raises (e.g. task DB unavailable), the artifact is NOT
+        deleted -- counted as failed, left intact (fail-safe)."""
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_inline_artifact(
+            artifact_id="orphan-1", source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_context_ref="task-deleted",
+        ))
+        svc = _make_service(registry=registry)
+
+        async def task_exists(tid: str) -> bool:
+            raise RuntimeError("task DB unavailable")
+
+        svc.set_task_exists_callback(task_exists)
+        stats = await svc.backfill_orphaned_task_artifacts(batch_size=100)
+        assert stats["deleted"] == 0
+        assert stats["failed"] == 1
+        assert await registry.get_artifact("orphan-1") is not None
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_task_artifacts(self):
+        """session/manual artifacts are never task orphans; not touched."""
+        registry = FakeArtifactRegistry()
+        registry.seed(_make_inline_artifact(
+            artifact_id="ses-1", source_kind=ArtifactSource.SESSION,
+            source_context_ref="sess-1",
+        ))
+        registry.seed(_make_inline_artifact(
+            artifact_id="man-1", source_kind=ArtifactSource.MANUAL,
+            source_context_ref=None,
+        ))
+        svc = _make_service(registry=registry)
+
+        async def task_exists(tid: str) -> bool:
+            return False  # nothing exists -> would delete if it touched these
+
+        svc.set_task_exists_callback(task_exists)
+        stats = await svc.backfill_orphaned_task_artifacts(batch_size=100)
+        assert stats["deleted"] == 0
+        assert await registry.get_artifact("ses-1") is not None
+        assert await registry.get_artifact("man-1") is not None

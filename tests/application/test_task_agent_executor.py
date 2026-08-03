@@ -417,6 +417,30 @@ async def test_executor_granted_tools_from_execution_policy(executor, fake_chat)
     assert "web_search" in granted
 
 
+@pytest.mark.asyncio
+async def test_executor_default_grants_execute_code(executor, fake_chat):
+    """默认 task（allowed_tools=()）的 worker 仍授予 execute_code，对齐
+    TASK_GUIDANCE“用通用工具在 workspace 做事”+ Hermes cron-default-core-tools；
+    write_file 仍为沙箱回调，不在此 grant。"""
+    task = _task()  # 默认 execution_policy -> allowed_tools=()
+    await executor.run(task, task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+    granted = call.trusted_metadata.get("granted_tools", [])
+    assert "execute_code" in granted
+
+
+@pytest.mark.asyncio
+async def test_executor_default_grant_layers_with_explicit_allowed_tools(executor, fake_chat):
+    """显式 allowed_tools 叠加在默认 execute_code 之上，不互相覆盖。"""
+    from app.domain.task import TaskExecutionPolicy
+    task = _task(execution_policy=TaskExecutionPolicy(allowed_tools=("host_terminal",)))
+    await executor.run(task, task_run_id=1, claim_lock="L1")
+    call = fake_chat.complete_calls[0]
+    granted = call.trusted_metadata.get("granted_tools", [])
+    assert "execute_code" in granted
+    assert "host_terminal" in granted
+
+
 # ---------------------------------------------------------------------------
 # goal_mode tests
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -830,3 +831,37 @@ class TestNoSourceRead:
         # Check no internal refs in headers
         for header_value in resp.headers.values():
             assert "secret-artifact-id-12345" not in header_value
+
+
+# ---------------------------------------------------------------------------
+# Unicode (non-ASCII) snapshot name tests
+# ---------------------------------------------------------------------------
+
+
+class TestUnicodeFilename:
+    """Non-ASCII snapshot names must not crash the content endpoint.
+
+    HTTP headers are latin-1; the legacy ``filename`` parameter must stay
+    ASCII-only while the real name is carried via the RFC 5987 ``filename*``
+    parameter. Bug: ``_sanitize_filename`` left the non-ASCII name in
+    ``filename="..."`` (and emitted no ``filename*``) -> UnicodeEncodeError
+    -> HTTP 500."""
+
+    def test_content_unicode_filename_does_not_500(self):
+        service = FakePublishedService()
+        service.add(_make_published(
+            name="横向-邮箱归属.md",
+            kind=ArtifactKind.MARKDOWN,
+            mime="text/markdown",
+            inline_content="# 横向-邮箱归属\n",
+        ))
+        client = _client(service)
+        resp = client.get(f"/p/{_VALID_PUBLISH_ID}/content")
+        assert resp.status_code == 200
+        cd = resp.headers.get("content-disposition", "")
+        # RFC 5987 UTF-8 form carries the real (non-ASCII) name.
+        assert "filename*=UTF-8''" in cd
+        assert quote("横向-邮箱归属.md", safe="") in cd
+        # Legacy filename must be latin-1 encodable so the header builds.
+        legacy = cd.split('filename="', 1)[1].split('"', 1)[0]
+        legacy.encode("latin-1")  # must not raise

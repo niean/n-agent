@@ -61,6 +61,10 @@ from app.application.task_agent_executor import TaskAgentExecutor
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
 from app.application.task_service import TaskService
+from app.application.task_session import (
+    task_execution_session_id,
+    task_session_id_fallback,
+)
 from app.application.task_tools import (
     task_tool_definitions,
     user_task_approval_tool_definitions,
@@ -171,8 +175,46 @@ from app.infrastructure.browser.screenshot_store import SqliteBrowserScreenshotS
 from app.infrastructure.browser.sqlite_browser_registry import SqliteBrowserSessionRegistry
 from app.infrastructure.browser.url_safety import UrlVerifier
 from app.domain.browser_policy import BrowserPolicy
-from app.domain.artifact import ArtifactAttachmentSource
+from app.domain.artifact import ArtifactAttachmentSource, ArtifactSource
 from app.domain.artifact_policy import ArtifactPolicy
+
+
+async def _lookup_attachment_artifact_id(svc, attachment_id: str) -> str | None:
+    """Best-effort: resolve a Task attachment_id to its Artifact id via ArtifactService."""
+    art = await svc.get_artifact_by_source(
+        ArtifactSource.TASK_ATTACHMENT, attachment_id
+    )
+    return art.id if art else None
+
+
+def _make_task_session_resolver(task_registry):
+    """Build a task_id -> execution session_id resolver for ArtifactService.
+
+    Used at artifact registration to establish the session-keyed queryable
+    association, and by the session-id backfill. Resolves the live Task
+    record when present (honoring explicit execution/origin session ids);
+    falls back to the deterministic uuid5 session for deleted tasks so
+    their artifacts remain reachable.
+    """
+    async def resolve(task_id: str) -> str | None:
+        task = await task_registry.get_task(task_id)
+        if task is not None:
+            return task_execution_session_id(task)
+        return task_session_id_fallback(task_id)
+    return resolve
+
+
+def _make_task_exists_resolver(task_registry):
+    """Build a task_id -> exists callback for ArtifactService orphan backfill.
+
+    Unlike the session resolver, this returns a plain bool (task present) with
+    no fallback, so the backfill can distinguish deleted tasks from live ones
+    and reclaim their orphaned artifacts.
+    """
+    async def exists(task_id: str) -> bool:
+        task = await task_registry.get_task(task_id)
+        return task is not None
+    return exists
 from app.infrastructure.artifact.content_store import LocalArtifactContentStore
 from app.infrastructure.artifact.export_converter import convert_to_html
 from app.infrastructure.registry.sqlite_artifact_registry import SQLiteArtifactRegistry
@@ -1082,6 +1124,17 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             except SessionNotFoundError:
                 logger.debug("task result session absent: %s", session_id)
 
+        async def _task_artifact_writer(session_id: str, content: str, card: dict | None = None) -> None:
+            """向执行会话写 ui.task_artifact system 消息（制品产出通知，card 含 artifact_id）。
+
+            会话已不存在（SessionNotFoundError）静默跳过、不复活；其它异常向上传播，
+            由调用方 _write_artifact 的 broad except 记录 warning。
+            """
+            try:
+                await session_service.append_task_artifact_message(session_id, content, card)
+            except SessionNotFoundError:
+                logger.debug("task artifact session absent: %s", session_id)
+
         task_run_service = TaskRunService(
             registry=task_registry,
             dispatcher=task_runner,
@@ -1090,6 +1143,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             notifier=task_outbound_delivery,
             lifecycle_writer=_task_lifecycle_writer,
             result_writer=_task_result_writer,
+            artifact_writer=_task_artifact_writer,
             lease_seconds=settings.task_lease_seconds,
             heartbeat_timeout_seconds=settings.task_heartbeat_timeout_seconds,
             max_runtime_seconds=settings.task_max_runtime_seconds,
@@ -1135,9 +1189,39 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 if artifact_service is not None
                 else None
             ),
+            artifact_id_lookup=(
+                (lambda aid: _lookup_attachment_artifact_id(artifact_service, aid))
+                if artifact_service is not None
+                else None
+            ),
+            artifact_delete_callback=(
+                (lambda tid: artifact_service.delete_artifacts_by_source_task(tid))
+                if artifact_service is not None
+                else None
+            ),
         )
         # TaskService.dispatch_tick delegates to TaskRunService (late-bind).
         task_service.set_run_service(task_run_service)
+        # Late-bind the task_id -> session_id resolver into ArtifactService so
+        # task-produced artifacts get a session-keyed queryable association at
+        # registration. artifact_service is created in the artifacts_enabled
+        # branch (above); task_registry here. Mirrors set_run_service late-bind.
+        if artifact_service is not None:
+            artifact_service.set_task_session_resolver(
+                _make_task_session_resolver(task_registry)
+            )
+            # Orphan-backfill existence check: lets ArtifactService detect
+            # task-sourced artifacts whose task has been deleted.
+            artifact_service.set_task_exists_callback(
+                _make_task_exists_resolver(task_registry)
+            )
+            # Reverse cascade: deleting a task_attachment artifact from the
+            # workbench must also delete the underlying TaskAttachment (record +
+            # file), otherwise the task detail page still shows the attachment
+            # and backfill_attachments resurrects the artifact on next startup.
+            artifact_service.set_task_attachment_delete_callback(
+                lambda aid: task_service.delete_attachment(aid)
+            )
         # Wire TaskManagementToolExecutor into CompositeToolExecutor routes.
         # Single authoritative source for task tool execution (no duplicate
         # dynamic registration; spec: 启动时发现重名即失败).
@@ -1816,6 +1900,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except Exception:
                 logger.exception("artifact backfill failed")
+            # Backfill source_session_id for pre-existing task artifacts
+            # (registered before the session association existed). No-op when
+            # the task subsystem is disabled (no resolver wired).
+            try:
+                sstats = await services.artifact_service.backfill_session_ids(
+                    batch_size=200
+                )
+                if sstats.get("processed", 0):
+                    logger.info(
+                        "artifact session backfill ok processed=%s "
+                        "updated=%s skipped=%s failed=%s",
+                        sstats.get("processed", 0),
+                        sstats.get("updated", 0),
+                        sstats.get("skipped", 0),
+                        sstats.get("failed", 0),
+                    )
+            except Exception:
+                logger.exception("artifact session backfill failed")
+            # Kind/mime backfill: re-infer kind from filename extension for
+            # artifacts registered with empty mime (task_complete submits no
+            # content_type), so historical .md/.txt/.csv artifacts render
+            # instead of being stuck as unrenderable OTHER.
+            try:
+                kstats = await services.artifact_service.backfill_kinds(
+                    batch_size=200
+                )
+                if kstats.get("processed", 0):
+                    logger.info(
+                        "artifact kind backfill ok processed=%s "
+                        "updated=%s skipped=%s failed=%s",
+                        kstats.get("processed", 0),
+                        kstats.get("updated", 0),
+                        kstats.get("skipped", 0),
+                        kstats.get("failed", 0),
+                    )
+            except Exception:
+                logger.exception("artifact kind backfill failed")
+            # Orphan backfill: delete task-sourced artifacts whose source task
+            # no longer exists (deleted before the delete-task cascade existed,
+            # or whose deletion predates this build). No-op when the task
+            # subsystem is disabled (no task_exists callback wired).
+            try:
+                ostats = await services.artifact_service.backfill_orphaned_task_artifacts(
+                    batch_size=100
+                )
+                if ostats.get("processed", 0):
+                    logger.info(
+                        "artifact orphan backfill ok processed=%s "
+                        "deleted=%s skipped=%s failed=%s",
+                        ostats.get("processed", 0),
+                        ostats.get("deleted", 0),
+                        ostats.get("skipped", 0),
+                        ostats.get("failed", 0),
+                    )
+            except Exception:
+                logger.exception("artifact orphan backfill failed")
         try:
             yield
         finally:

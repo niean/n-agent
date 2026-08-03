@@ -80,23 +80,25 @@ def test_artifacts_tab_container_unique_and_default_hidden():
     assert "hidden" in opening, "tab-artifacts must be hidden by default"
 
 
-def test_artifacts_nav_item_after_tasks_before_scheduled_in_tabconfig():
-    """management-navigation.js tabConfig: '制品' entry AFTER tasks, BEFORE scheduled-tasks."""
+def test_nav_order_scheduled_tasks_artifacts_in_tabconfig():
+    """management-navigation.js tabConfig: 定时任务在任务上方，制品在任务下方
+    (prd 03-specs L80: 左导定时任务调整到任务上方)。顺序: scheduled-tasks -> tasks -> artifacts。"""
     src = NAV_JS.read_text(encoding="utf-8")
     assert "'artifacts'" in src or '"artifacts"' in src, "artifacts tab not in tabConfig"
     assert "/artifacts" in src, "artifacts path not in tabConfig"
     assert "制品" in src, "artifacts label '制品' not in tabConfig"
-    # tabConfig order: tasks -> artifacts -> scheduled-tasks
-    assert src.index("tasks") < src.index("artifacts") < src.index("scheduled-tasks"), \
-        "artifacts must be after tasks and before scheduled-tasks in tabConfig source"
+    # tabConfig order: scheduled-tasks -> tasks -> artifacts (prd: 定时任务调到任务上方)
+    assert src.index("'scheduled-tasks'") < src.index("'tasks'") < src.index("'artifacts'"), \
+        "tabConfig order must be scheduled-tasks -> tasks -> artifacts"
 
 
-def test_artifacts_nav_item_order_in_index_html_sidebar():
-    """index.html sidebar: artifacts nav item AFTER tasks, BEFORE scheduled-tasks."""
+def test_nav_order_scheduled_tasks_artifacts_in_index_html_sidebar():
+    """index.html sidebar: 定时任务在任务上方，制品在任务下方
+    (prd 03-specs L80)。顺序: scheduled-tasks -> tasks -> artifacts。"""
     html = INDEX_HTML.read_text(encoding="utf-8")
-    assert html.index('data-tab="tasks"') < html.index('data-tab="artifacts"') \
-        < html.index('data-tab="scheduled-tasks"'), \
-        "artifacts nav item must be between tasks and scheduled-tasks in sidebar"
+    assert html.index('data-tab="scheduled-tasks"') < html.index('data-tab="tasks"') \
+        < html.index('data-tab="artifacts"'), \
+        "sidebar order must be scheduled-tasks -> tasks -> artifacts (prd: 定时任务调到任务上方)"
 
 
 def test_artifacts_nav_item_hidden_by_default_in_index_html():

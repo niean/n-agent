@@ -246,3 +246,85 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：Dashboard Chat 隐藏进程来源 assistant 消息时，必须区分"worker 内部 CoT（有独立卡片对外，隐藏）"与"投递记录本身（无独立卡片，必须可见）"。task/curator 隐藏，schedule 可见（空内容由 hasVisibleContent 兜底隐藏中间步）。修改 shouldRenderMessage 的来源过滤范围时，必须同步检查 schedule 的投递可见性--schedule 的 assistant 消息是定时任务对用户/飞书的唯一输出凭证。修复=过滤条件加 `&& message.source !== 'schedule'`，并更新 chat_frontend_harness 断言 schedule 投递记录可见。相关：模式十六 task/schedule/curator 来源、模式三十三（无直接关联，同属进程消息处理）。
 
 来源：fix 260726 Dashboard Chat 看不到定时任务投递记录（用户反馈）
+
+### P025: 查询过滤条件必须有对应写入路径，字段不可跨语义混用
+
+现象：对话右侧边栏制品面板对任务执行会话（如 task-{uuid5}）始终显示"暂无关联制品"，而任务实际产出了 TaskArtifact。同时 publish 流程把错误的 session_id 传给 InformationFlow。
+
+根因：制品面板查询 `GET /chat/artifacts?source_kind=session&source_context_ref={会话ID}`，但任务制品注册时存的是 `source_kind=task_artifact` + `source_context_ref=任务ID`，AND 过滤两维全不匹配；且 `source_kind=session` 这个枚举值全仓无任何创建路径（手动创建硬编码 MANUAL，任务路径用 task_attachment/task_artifact），查询永远命中空集。深层根因是 `source_context_ref` 字段被跨语义混用：注册端写 task_id（provenance），消费端（面板查询、publish 的 InformationFlow.release session_id）却按会话ID理解。根因跨 artifact_service.py（注册写 task_id、publish 当 session_id 用）+ sqlite_artifact_registry.py（AND 过滤）+ chat.js（面板查询）+ artifact_routes.py（接口）+ task_session.py（会话派生）。
+
+教训：新增查询过滤条件前必须确认存在对应的写入路径（grep 枚举值的创建点），无写入路径的过滤等于查空集且无报错，极易误判为"数据缺失"。一个字段不可同时承载 provenance（来源）和 display-key（展示关联）两种语义，consumers 会按各自需要解读导致错配；展示/会话维度应单独建字段（本例新增 source_session_id）与 provenance 字段分离。跨层（Application/Infrastructure/Interfaces）字段语义一致性必须由领域模型的 to_public_view 与端口签名共同守护。修复=注册时经 task_session_resolver 解析 task_execution_session_id 写入 source_session_id，面板改按 source_session_id 查询，存量数据 backfill_session_ids 回填，publish 改取 source_session_id。相关：模式二十二 write-through 注册与 source_session_id 会话关联、模式二十三面板查询。
+
+来源：fix 260804 制品信息展示不对（会话 task-d1d97cd7、任务 e2e-art-...）
+
+### P026: LLM 工具调用参数的空值表示非确定性，无值守任务需在执行器输入边界防御式归一化
+
+现象：每日 10:00 的拍照上传定时任务（无值守 unattended）连续多日成功后，08-04 起两次运行（含一次手动重试）"成功返回"但内容是 `host_terminal` 返回 `host_arguments_invalid` 的道歉，未产出 signed_url，照片未投递。
+
+根因：LLM 调用 `host_terminal` 时把空 argv 表达成 `args: ""`（空字符串）而非 `args: []`（空数组）。`host_terminal_arguments_allowed`（Domain，host_terminal_policy.py）用 `isinstance(args, (list, tuple))` 校验 argv 准入，空字符串不通过 -> `_validate_shape` 返回 `host_arguments_invalid`，Bridge 未被调用。DB tool_calls 证实：成功调用 `args: []`，08-04 失败调用 `args: ""`。根因跨 host_terminal_tool_executor.py（Application 校验）+ host_terminal_policy.py（Domain argv 准入）+ host_terminal_capability.py（Application photo 能力检测，`is_photo_capability_request` 用 `args == []` 严格匹配）+ tool_service.py（Application signed_url 保留，也读 `is_photo_capability_request`）。LLM 输出非确定性，无值守任务无人工干预容错，单次漂移即导致每日任务失败；08-03 及之前模型恰好输出 `[]`，08-04 起漂移为 `""`。
+
+教训：LLM 工具调用参数的"空值表示"存在非确定性（空数组可能被表达成空字符串 `""` 或 `null`），无值守/定时任务对此尤为敏感（无人工干预容错，单次漂移即每日失败）。需在工具执行器 Application 输入边界对语义等价的空表示做防御式归一化（`""`/`null` -> `[]`）；归一化必须覆盖全部消费该字段的点（校验 `_validate_shape`、目标 `HostSkillScriptTarget` 构造、能力检测 `is_photo_capability_request` 在 executor 与 tool_service 两处、审计哈希），否则某消费点仍看到原值导致部分功能（如 photo 结果解析、signed_url 保留）静默失败。归一化仅限空表示，不削弱非空内容的类型/安全校验（非空字符串仍被 `host_terminal_arguments_allowed` 拒绝为 shell 字符串），Policy 白名单仍精确匹配位置参数（`_matches` 校验 `len(rule.positional_args) == len(target.args)`），不绕过授权。Domain 校验函数应保持严格类型契约（只接受 list/tuple），归一化属于 Application 反腐败层职责（把 LLM 的非规范输出翻译为 Domain 期望的规范类型）。相关：P004 入口 null 归一化（同类模式，不同入口）、模式二十四 Host Terminal 双重 Policy、P023 unattended 任务整体失败。
+
+来源：fix 260804 定时任务拍照上传 sched-c6d0e455 返回 host_arguments_invalid（用户反馈）
+
+### P027: 制品 kind/mime 分类必须回退到文件名扩展名，backfill 需覆盖历史数据
+
+现象：会话 dashboard-53f61ffa-21b2-4cbc-b625-f348197bb8da 中 task-output-a.txt、task-output-b.md 制品被标记为 `其它`（OTHER）类型，前端 BINARY_KINDS 含 other 从而无法渲染；同时观感为"制品信息未正确关联"。
+
+根因：task_complete 工具提交的制品 dict 只含 `{name, storage_ref, type}`，无 mime；main.py 注入 `artifact_normalizer=None`；task_run_service 的 `_normalize_artifacts` else 分支把 mime 置为空串；artifact_service.register_from_task_artifact 用 `_kind_from_mime("")` -> OTHER（mime 保持空）。前端 artifacts.js 的 BINARY_KINDS 含 `other`，故无法渲染。根因跨 task_run_service.py（Application 归一化）+ artifact_service.py（Application kind 推断）+ artifacts.js（前端渲染），3 文件 / 2 架构分层（Application + 前端）。"制品未正确关联"与"无法渲染"是同一根因（kind/mime 未从文件名捕获）的两个表现。
+
+教训：制品 kind/mime 分类不能只依赖入参 mime（上游 task_complete 不带 mime、artifact_normalizer 可能未注入），必须回退到文件名扩展名推断（.md->MARKDOWN/.txt->TEXT/.html->HTML/.csv->CSV/.json->JSON 等）；分类错误会同时导致前端 BINARY_KINDS 渲染失败与"制品未关联"观感。新增分类逻辑后必须 backfill 历史数据（启动期 list_artifacts_with_empty_mime 重扫 + _resolve_mime 重推断），否则历史制品仍 OTHER 不可渲染；backfill 须 idempotent 且仅处理空 mime，避免误改已正确分类的制品。相关：P022/P023 backfill 模式、模式十六 write-through 注册、backfill_session_ids 同款 idempotent 游标重扫。
+
+来源：fix 260808 dashboard-53f61ffa 制品 kind/mime 误分类导致无法渲染（用户反馈）
+
+### P028: 单向注册回调必须有反向删除级联，孤儿清理的存活判断不能用 fallback resolver
+
+现象：已删除任务（如 e2e-art-1785716569-85752-att2.txt 所属任务）的制品仍展示在制品工作台列表，期望不展示。
+
+根因：Task 与 Artifact 是两个独立子系统（独立 DB）。注册方向是单向 write-through：TaskService 附件上传 / TaskRunService TaskArtifact 产出经 `artifact_register_callback` 回调 ArtifactService 注册为 Artifact（task -> artifact）。但 TaskService.delete_task 删除任务行（CASCADE 附件/事件）、附件文件、执行会话后，未反向级联清理 artifacts DB，导致 source_context_ref=task_id 的制品残留。叠加 artifacts DB 宿主挂载持久化跨 docker/restart.sh 重启，历史孤儿累积。根因跨 task_service.py（Application delete_task 缺反向回调）+ artifact_service.py（Application 无按 task 清理入口）+ main.py（wiring 未注入删除回调），3 文件 / 2 子系统（Task + Artifact）。
+
+教训：单向注册回调（write-through 注册）必须配对反向删除级联，否则被注册方在源删除后成为孤儿；删除入口 delete_task 须注入 `artifact_delete_callback` best-effort 回调 delete_artifacts_by_source_task（失败 try/except+warning 不阻断主流程，与注册同款 best-effort 旁路语义）。孤儿 backfill 判活不能用 `task_session_resolver`：它对已删除 task 回落确定性 fallback session（非 None），无法区分"不存在"与"已删除"，会误判存活而漏删；须另注入 `task_exists`（task_id -> plain bool）回调。孤儿清理须 fail-safe：task_exists 抛异常时 failed++ 跳过不删（不确定时宁留勿误删）。DB 持久化跨重启的场景，修复须同时覆盖未来（级联）与历史（启动 backfill）两条路径。相关：P027 backfill 模式、模式二十二 write-through 注册 + delete 级联。
+
+来源：fix 260808 已删除任务制品残留制品列表（用户反馈 e2e-art-1785716569-85752-att2.txt）
+
+### P029: 跨层文件名校验必须共享同一规则，ASCII-only allowlist 会拒绝上传层接受的 Unicode 文件名
+
+现象：任务 t_d214a4e52c64494e 的中文附件 `横向-邮箱归属.md`，任务详情页无"制品"链接、附件也不展示在制品工作台列表，疑似不支持中文文件名。
+
+根因：附件上传与制品注册是两个层。TaskService 上传层（Application, task_service.py）用 denylist `_FILENAME_SAFE_RE = ^[^\x00-\x1f/\\<>:"|?*\x7f]+$` 校验文件名，允许 Unicode（中文），stored_name=`{uuid16}_{原文件名}` 保留原文，上传成功、文件落盘。但 register_from_attachment 构造 content_ref=`attachment:{task_id}/{stored_name}` 后调 LocalArtifactContentStore.read（Infrastructure, content_store.py），_parse_ref -> _validate_filename 用 `_FILENAME_RE = ^[A-Za-z0-9._-]+$`（ASCII-only allowlist）校验 stored_name，中文被拒绝抛 ArtifactValidationError，read 在碰到文件系统前就失败、返回 None，制品静默不注册。任务详情页 tasks.js `if (attachment.artifact_id)` 才渲染"制品"链接，注册失败则 artifact_id 缺失、无链接；制品列表也因无 artifact 行而不展示。根因跨 content_store.py（Infrastructure 校验）+ task_service.py（Application 上传校验），2 文件 / 2 架构分层，两层校验规则不一致（一个 denylist 允许 Unicode、一个 allowlist 仅 ASCII）。
+
+教训：跨层文件名/路径校验必须共享同一规则（同 denylist 或同 allowlist），否则上游接受的值下游拒绝、中间静默失败、现象指向"不支持中文"实则校验不一致。LocalArtifactContentStore 的 _FILENAME_RE 应与 TaskService _FILENAME_SAFE_RE 对齐为 denylist（拒绝控制字符/路径分隔符/Windows 保留符，允许 Unicode 字母数字），路径穿越防御由 denylist + exact "."/".." 拒绝 + 嵌套路径 split 检查 + per-component lstat symlink 拒绝共同保证，allowlist 不是穿越防御的必要手段。"无制品链接 + 不展示"是同一根因（注册失败）的两个表现，不要当两个问题查。相关：P027 制品注册失败现象、模式二十二 content_ref 不透明方案 + 文件名校验对齐。
+
+来源：fix 260808 中文附件 横向-邮箱归属.md 未注册为制品（用户反馈任务详情页无制品链接/制品列表不展示）
+
+### P030: Content-Disposition legacy filename 必须 ASCII-only，非 ASCII 文件名用 RFC 5987 filename* 传递
+
+现象：中文附件 `横向-邮箱归属.md` 制品已注册成功（Task 7 修复），制品工作台预览失败，前端提示"加载失败：request_failed"。
+
+根因：artifact 内容/导出响应由 `_safe_content_disposition`（artifact_routes.py）构造 Content-Disposition header，其 legacy `filename="..."` 字段直接放入 sanitized 原文件名，sanitization 只清理 `/\"` 换行等、不处理非 ASCII，中文 `横向-邮箱归属.md` 原样进入 `filename="..."`。Starlette Response.init_headers 对 header value 做 `v.encode("latin-1")`，中文超出 latin-1 范围抛 `UnicodeEncodeError: 'latin-1' codec can't encode characters in position 18-19`，该 `_build_content_response` 调用在路由 try/except 之外、异常未捕获、propagate 到 ASGI -> HTTP 500 裸响应（无 error.code）-> 前端 fallback "request_failed"。同根因在 3 个 HTTP 路由文件重复：artifact_routes._safe_content_disposition（已修复）、task_routes.py 附件下载 inline（`filename="{stored_name}"` stored_name 含中文，同 bug）、published_artifact_routes._sanitize_filename（同 bug 且缺 filename* RFC 5987 fallback）。根因跨 3 文件 / 1 架构分层（HTTP Interface），三份重复的不完整 sanitization 是 bug 温床；修复方式：抽取共享 helper `app/interfaces/http/_content_disposition.py::build_content_disposition`，三个路由统一调用，从结构上消除漂移。
+
+教训：HTTP header value 是 latin-1，Content-Disposition 的 legacy `filename` 参数必须 ASCII-only；非 ASCII 文件名用 RFC 5987 `filename*=UTF-8''<percent-encoded>` 传递真实名，legacy `filename` 回退为 ASCII 占位名（保留扩展名如 `artifact.md` 让旧客户端保留文件类型）。`filename*` 用 `quote(name, safe="")` 全 percent-encode（含 `/` `\`，防 header 注入）。新增 Content-Disposition 构造必须复用共享 helper `build_content_disposition`，禁止再各自实现（已收敛 artifact_routes/task_routes/published_artifact_routes 三处）。`_build_content_response` 之类 header 构造若在路由 try/except 之外，编码异常会变 500 裸响应无 error.code，前端只能 fallback 通用错误，定位需查服务端 traceback。相关：P029 中文文件名（content_ref 校验层）、模式二十二 Content-Disposition ASCII 安全 + 陷阱。
+
+来源：fix 260808 中文制品 横向-邮箱归属.md 预览失败 request_failed（用户反馈）；同根因 task_routes 附件下载 / published_artifact_routes 已通过共享 helper `build_content_disposition` 一并修复
+
+### P031: write-through 投影删除须反向级联删 source of truth 先删，否则启动 backfill 复活投影；级联失败须传播非 best-effort
+
+现象：从制品工作台删除一个 task_attachment 制品后，任务详情页的附件仍存在（未同步删除），用户反馈"这种问题太Low了"。
+
+根因：Task 与 Artifact 双向级联只实现了一半。P028 补齐了 task 删除 -> 制品清理（`artifact_delete_callback` -> delete_artifacts_by_source_task），但制品删除 -> 任务附件清理这一对偶方向缺失：ArtifactService.delete_artifact 注释明确"Does NOT delete source attachment/workspace files"，对 task_attachment 制品只删 artifacts DB 元数据，不删底层 TaskAttachment（tasks DB 记录 + 附件文件）。制品的 content_ref 是 `attachment:` 源引用（非 `item:` owned），_is_owned_ref 为 False，best-effort delete_owned 也跳过，故附件文件/记录原样残留，任务详情页仍展示。更严重：启动期 backfill_attachments 按 task_attachments 表游标重扫幂等注册为 Artifact，残留附件会在下次 docker/restart.sh 重启后把已删制品"复活"回制品列表。根因跨 artifact_service.py（delete_artifact 无反向回调）+ task_service.py（delete_attachment 已存在但未被制品删除调用）+ main.py（wiring 未注入 task_attachment_delete 回调），3 文件 / 2 子系统（Artifact + Task），与 P028 同一 write-through 体系的另一半。
+
+教训：write-through 注册（source -> projection）+ 启动期 backfill（按 source 重扫重建 projection）的组合下，删除 projection 必须反向级联删 source，且 source of truth 须先于 projection metadata 删除——否则 source 残留 + backfill 复活 projection，删除"重启后失效"。这与 P028 方向相反但同体系：P028 是 source(task) 删 -> projection(artifact) 清理（projection 次要，best-effort）；本条是 projection(artifact) 删 -> source(task_attachment) 清理（source 是真相之源，须先删）。级联失败处理两方向不同：source 删失败必须传播异常、不删 projection metadata（best-effort + 继续删 projection 会让 source 残留 + backfill 复活，正是本 bug）；回调返回 False（source 已删，如 P028 级联已先 CASCADE 附件行）时继续删 projection 清理 stale 投影。仅 task_attachment 触发（manual/task_artifact/workspace 不触发，task_artifact 是 worker 产出不归用户管理）。回调注入沿用既有 late-bind 模式（`set_task_attachment_delete_callback`，对齐 `set_task_exists_callback`），ArtifactService 不直接依赖 TaskService（DDD 分层，回调解耦）。相关：P028 单向注册反向级联（task->制品方向）、模式二十二规则 8 制品删除反向级联、规则 6 backfill 复活风险。
+
+来源：fix 260809 制品页删除附件后任务附件未同步删除（用户反馈"太Low了"）
+
+### P032: 前端渲染 bug 必须浏览器实测 getComputedStyle，全局元素规则会经继承卡住特定 class；禁止仅推理 flex 链就下根因结论
+
+现象：制品预览 py/json 最大高度未达预览面板底部，且与 markdown/html/pdf 异构（"这还能异构?!"）。第一次修复把 `.artifacts-shell` 由 `min-height` 改 `height: calc(100vh - 90px)`，推理"flex 高度链内容驱动致 pre 塌缩"，未在浏览器实测就回填知识、报完成。用户复测发现未修复。
+
+根因（真）：styles.css 有一行通用元素规则 `pre { max-height: 320px; ... }`（line 164），作用于所有 `<pre>`。`.artifacts-preview__pre`（line 960）设了 `flex:1; min-height:0` 却未覆盖 `max-height`，故 pre 被全局规则死卡在 320px--无论 shell 用 min-height 还是 height、无论 flex:1 怎么长都超不过 320px。iframe 类（markdown/html/pdf 用 `<iframe>` 不是 `<pre>`，无此上限）能填满，pre 类被卡，遂异构。实测 `getComputedStyle(pre).maxHeight == '320px'`、pre_rect_h=320 而 wrap_rect_h=698。修法仅一行：`.artifacts-preview__pre` 加 `max-height: none` 覆盖全局上限，pre 即 674px 填满。
+
+根因（错，第一次）：误判为 shell min-height/height 致 flex 链内容驱动。实测证伪：shell 改 height 后 pre 仍 320px。
+
+教训：前端渲染/CSS bug 必须用浏览器 `getComputedStyle`/`getBoundingClientRect` 实测计算值再下根因结论，禁止仅推理 flex/盒模型链就修复并回填知识--CSS 特异性与全局元素规则（`pre {}`、`a {}`、`img {}`）会经继承作用于特定 class（当 class 未显式覆盖该属性时），这种"隐性上限"无法靠读 class 规则发现，只能靠 computed style 暴露。项目有浏览器容器（n-agent-browser，playwright + /usr/bin/chromium，可 `docker exec` 跑脚本访问 http://n-agent:8201），渲染 bug 一律走实测。回填知识前必须实测验证修复生效，避免把错误根因写进 knowledge 误导后续。相关：模式二十二规则 9 preview pre max-height 覆盖。
+
+来源：fix 260809 制品预览 py/json 高度不达标、PDF 无法预览（第一次修复错误，用户复测指出未修复）

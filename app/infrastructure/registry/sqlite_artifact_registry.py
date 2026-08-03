@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     source_kind TEXT NOT NULL,
     source_ref TEXT NOT NULL,
     source_context_ref TEXT,
+    source_session_id TEXT,
     summary TEXT NOT NULL DEFAULT '',
     classification TEXT,
     labels_json TEXT,
@@ -187,11 +188,12 @@ class SQLiteArtifactRegistry:
     _INSERT_ARTIFACT_SQL = """
         INSERT INTO artifacts (
             id, name, kind, mime, content_ref, inline_content, size,
-            checksum, source_kind, source_ref, source_context_ref, summary,
+            checksum, source_kind, source_ref, source_context_ref,
+            source_session_id, summary,
             classification, labels_json, status, created_by, created_at,
             updated_at
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
 
@@ -227,7 +229,29 @@ class SQLiteArtifactRegistry:
         """Idempotent schema creation for artifacts + published_artifacts."""
         with self._connect() as conn:
             conn.executescript(ARTIFACT_SCHEMA_SQL)
+            self._migrate_add_source_session_id(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate_add_source_session_id(conn: sqlite3.Connection) -> None:
+        """Idempotent migration: add source_session_id column if absent.
+
+        Existing artifacts tables predate the session-association column;
+        ADD COLUMN is idempotent via PRAGMA table_info check. The
+        source_session_id index is created here (not in ARTIFACT_SCHEMA_SQL)
+        so old DBs do not fail on CREATE INDEX before the column exists.
+        """
+        cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(artifacts)")
+        }
+        if "source_session_id" not in cols:
+            conn.execute(
+                "ALTER TABLE artifacts ADD COLUMN source_session_id TEXT"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_source_session_id "
+            "ON artifacts(source_session_id)"
+        )
 
     # ------------------------------------------------------------------
     # Row -> domain object conversion
@@ -246,6 +270,7 @@ class SQLiteArtifactRegistry:
             source_kind=ArtifactSource(row["source_kind"]),
             source_ref=row["source_ref"],
             source_context_ref=row["source_context_ref"],
+            source_session_id=row["source_session_id"],
             summary=row["summary"] or "",
             classification=row["classification"],
             labels=_parse_labels_json(row["labels_json"]),
@@ -306,6 +331,7 @@ class SQLiteArtifactRegistry:
             artifact.source_kind.value,
             artifact.source_ref,
             artifact.source_context_ref,
+            artifact.source_session_id,
             artifact.summary,
             artifact.classification,
             _labels_to_json(artifact.labels),
@@ -371,6 +397,8 @@ class SQLiteArtifactRegistry:
         self,
         *,
         source_kind: ArtifactSource | None = None,
+        source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         kind: ArtifactKind | None = None,
         status: ArtifactStatus | None = None,
         q: str | None = None,
@@ -383,6 +411,12 @@ class SQLiteArtifactRegistry:
         if source_kind is not None:
             conditions.append("source_kind = ?")
             params.append(source_kind.value)
+        if source_context_ref is not None:
+            conditions.append("source_context_ref = ?")
+            params.append(source_context_ref)
+        if source_session_id is not None:
+            conditions.append("source_session_id = ?")
+            params.append(source_session_id)
         if kind is not None:
             conditions.append("kind = ?")
             params.append(kind.value)
@@ -439,6 +473,7 @@ class SQLiteArtifactRegistry:
                     name = ?, kind = ?, mime = ?, content_ref = ?,
                     inline_content = ?, size = ?, checksum = ?,
                     source_kind = ?, source_ref = ?, source_context_ref = ?,
+                    source_session_id = ?,
                     summary = ?, classification = ?, labels_json = ?,
                     status = ?, created_by = ?, updated_at = ?
                 WHERE id = ?
@@ -454,6 +489,7 @@ class SQLiteArtifactRegistry:
                     artifact.source_kind.value,
                     artifact.source_ref,
                     artifact.source_context_ref,
+                    artifact.source_session_id,
                     artifact.summary,
                     artifact.classification,
                     _labels_to_json(artifact.labels),
@@ -495,6 +531,47 @@ class SQLiteArtifactRegistry:
                 "SELECT COUNT(*) AS cnt FROM artifacts",
             ).fetchone()
         return int(row["cnt"])
+
+    def _list_task_artifacts_missing_session_sync(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        """Return task-source artifacts with NULL source_session_id.
+
+        Ordered by id for stable cursor-less batching; the backfill loops
+        until an empty/short batch is returned. As rows get their
+        source_session_id populated they drop out of subsequent batches.
+        """
+        clamped = max(1, min(limit, 500))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE source_kind IN ('task_artifact', 'task_attachment')
+                  AND source_session_id IS NULL
+                ORDER BY id ASC LIMIT ?
+                """,
+                (clamped,),
+            ).fetchall()
+        return tuple(self._row_to_artifact(r) for r in rows)
+
+    def _list_artifacts_with_empty_mime_sync(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        """Return artifacts with empty mime, ordered by id for stable batching.
+
+        As rows get their mime populated they drop out of subsequent batches.
+        """
+        clamped = max(1, min(limit, 500))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM artifacts
+                WHERE COALESCE(mime, '') = ''
+                ORDER BY id ASC LIMIT ?
+                """,
+                (clamped,),
+            ).fetchall()
+        return tuple(self._row_to_artifact(r) for r in rows)
 
     # ------------------------------------------------------------------
     # PublishedArtifact lifecycle (sync implementations)
@@ -684,6 +761,8 @@ class SQLiteArtifactRegistry:
         self,
         *,
         source_kind: ArtifactSource | None = None,
+        source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         kind: ArtifactKind | None = None,
         status: ArtifactStatus | None = None,
         q: str | None = None,
@@ -693,6 +772,8 @@ class SQLiteArtifactRegistry:
         return await asyncio.to_thread(
             self._list_artifacts_sync,
             source_kind=source_kind,
+            source_context_ref=source_context_ref,
+            source_session_id=source_session_id,
             kind=kind,
             status=status,
             q=q,
@@ -715,6 +796,20 @@ class SQLiteArtifactRegistry:
 
     async def count_artifacts(self) -> int:
         return await asyncio.to_thread(self._count_artifacts_sync)
+
+    async def list_task_artifacts_missing_session(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        return await asyncio.to_thread(
+            self._list_task_artifacts_missing_session_sync, limit=limit,
+        )
+
+    async def list_artifacts_with_empty_mime(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        return await asyncio.to_thread(
+            self._list_artifacts_with_empty_mime_sync, limit=limit,
+        )
 
     async def register_published(
         self,

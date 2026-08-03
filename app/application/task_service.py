@@ -22,6 +22,7 @@ Injection:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -154,6 +155,8 @@ class TaskService:
         lifecycle_writer: Callable[[str, str, dict[str, Any] | None], Awaitable[Any]] | None = None,
         task_config_provider: TaskConfigProvider | None = None,
         artifact_register_callback: Callable[[TaskAttachment], Awaitable[None]] | None = None,
+        artifact_id_lookup: Callable[[str], Awaitable[str | None]] | None = None,
+        artifact_delete_callback: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.registry = registry
         self.policy = policy
@@ -167,6 +170,8 @@ class TaskService:
         self._run_service: Any = None
         self._task_config_provider = task_config_provider
         self._artifact_register_callback = artifact_register_callback
+        self._artifact_id_lookup = artifact_id_lookup
+        self._artifact_delete_callback = artifact_delete_callback
 
     async def _snapshot(self) -> TaskConfig:
         if self._task_config_provider is not None:
@@ -376,6 +381,17 @@ class TaskService:
                     logger.warning(
                         "failed to delete attachment file %s: %s", path, exc
                     )
+
+        # Clean up artifacts registered against this task (best-effort). Artifacts
+        # live in a separate DB registered via artifact_register_callback; without
+        # this cascade they would persist and still show in the artifact list.
+        if self._artifact_delete_callback is not None:
+            try:
+                await self._artifact_delete_callback(task_id)
+            except Exception as exc:
+                logger.warning(
+                    "failed to delete artifacts for task %s: %s", task_id, exc
+                )
 
         # Clean up execution session (not origin session)
         if task.execution_session_id and self.memory_store is not None:
@@ -1022,6 +1038,15 @@ class TaskService:
         )
         runs = await self.registry.list_runs(task_id, limit=_MAX_RUNS_IN_DETAIL)
         attachments = await self.registry.list_attachments(task_id)
+        # Resolve artifact_id for each attachment (best-effort, concurrent).
+        artifact_ids: dict[str, str | None] = {}
+        if self._artifact_id_lookup:
+            results = await asyncio.gather(
+                *(self._artifact_id_lookup(a.id) for a in attachments),
+                return_exceptions=True,
+            )
+            for a, r in zip(attachments, results):
+                artifact_ids[a.id] = r if isinstance(r, str) else None
         worker_context = await self.build_worker_context(task)
         return {
             "task": _task_to_dict(task),
@@ -1062,6 +1087,7 @@ class TaskService:
                     "filename": a.filename,
                     "content_type": a.content_type,
                     "size": a.size,
+                    "artifact_id": artifact_ids.get(a.id),
                 }
                 for a in attachments
             ],

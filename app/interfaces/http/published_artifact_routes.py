@@ -26,6 +26,7 @@ from html import escape
 from fastapi import APIRouter, Response
 from fastapi.responses import HTMLResponse
 
+from app.interfaces.http._content_disposition import build_content_disposition
 from app.domain.artifact import (
     ArtifactContentUnavailableError,
     ArtifactKind,
@@ -286,7 +287,11 @@ def _build_content_response(
     base_mime = mime.lower().split(";")[0].strip()
     is_html = base_mime == "text/html"
     disposition = "attachment" if is_html else "inline"
-    filename = _sanitize_filename(published.snapshot_name or "published")
+    # Legacy filename stays ASCII-only (latin-1 safe); the real (possibly
+    # non-ASCII) name is carried via RFC 5987 filename* (shared helper).
+    cd = build_content_disposition(
+        published.snapshot_name or "published", disposition,
+    )
     return Response(
         content=data,
         media_type=content_type,
@@ -295,7 +300,7 @@ def _build_content_response(
             "Content-Security-Policy": _CONTENT_CSP,
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
-            "Content-Disposition": f'{disposition}; filename="{filename}"',
+            "Content-Disposition": cd,
         },
     )
 
@@ -363,12 +368,3 @@ def _content_type_with_charset(mime: str) -> str:
     ):
         return f"{base}; charset=utf-8"
     return base
-
-
-def _sanitize_filename(filename: str) -> str:
-    """Sanitize a filename for Content-Disposition (remove path/quote chars)."""
-    safe = filename.replace("/", "_").replace("\\", "_").replace("\x00", "")
-    safe = safe.replace('"', "").replace("\r", "").replace("\n", "")
-    if not safe:
-        safe = "published"
-    return safe

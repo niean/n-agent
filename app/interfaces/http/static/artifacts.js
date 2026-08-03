@@ -3,7 +3,7 @@
  * Two-column workbench at /artifacts:
  *   left  -> artifact list (kind icon, name, source label, updated time) +
  *            search + source_kind/kind/status filters + load-more (cursor)
- *   right -> header (name, valid source backlink, [编辑][导出▾][发布]) +
+ *   right -> header (name, valid source backlink, [编辑][导出][发布]) +
  *            preview by kind; edit mode switches to editor
  *
  * Security (CRITICAL):
@@ -199,6 +199,9 @@
   async function revokePublish(id) {
     return apiRequest(API_BASE + '/' + encodeURIComponent(id) + '/publish', { method: 'DELETE' });
   }
+  async function fetchDeleteArtifact(id) {
+    return apiRequest(API_BASE + '/' + encodeURIComponent(id), { method: 'DELETE' });
+  }
 
   // ---- blob management ----
   function trackBlob(url) { if (url) activeBlobs.push(url); return url; }
@@ -350,10 +353,15 @@
     }
   }
 
-  function renderListItem(a) {
+  function renderListItem(a, onClick) {
     const item = el('div', 'artifacts-list__item');
-    if (state.selectedId === a.id) item.classList.add('artifacts-list__item--active');
-    item.addEventListener('click', () => selectArtifact(a.id));
+    const useCallback = typeof onClick === 'function';
+    if (!useCallback && state.selectedId === a.id) item.classList.add('artifacts-list__item--active');
+    if (useCallback) {
+      item.addEventListener('click', function () { onClick(a); });
+    } else {
+      item.addEventListener('click', () => selectArtifact(a.id));
+    }
     const icon = el('span', 'artifacts-list__icon');
     icon.textContent = kindLabel(a.kind).slice(0, 2);
     item.appendChild(icon);
@@ -384,6 +392,11 @@
   // ---- detail selection (race cancellation + blob cleanup) ----
   function selectArtifact(id) {
     if (state.selectedId === id) return;
+    // sync URL: /artifacts/{id}
+    const path = '/artifacts/' + encodeURIComponent(id);
+    if (window.location.pathname !== path) {
+      history.pushState({ tab: 'artifacts' }, '', path);
+    }
     // abort in-flight fetch on new selection
     if (inflight) { try { inflight.abort(); } catch (_) {} inflight = null; }
     // revoke previous blobs
@@ -400,6 +413,33 @@
     inflight = new AbortController();
     const sig = inflight.signal;
     loadDetail(id, sig);
+  }
+
+  // ---- deep-link routing (/artifacts/{id}) ----
+  function pendingArtifactIdFromPath() {
+    const match = window.location.pathname.match(/^\/artifacts\/([^/]+)$/);
+    if (!match) return null;
+    try { return decodeURIComponent(match[1]); } catch (_) { return null; }
+  }
+
+  function handlePathChange() {
+    const pendingId = pendingArtifactIdFromPath();
+    if (pendingId) {
+      if (state.selectedId !== pendingId) selectArtifact(pendingId);
+      return;
+    }
+    // back to /artifacts list: clear selection
+    if (state.selectedId) {
+      if (inflight) { try { inflight.abort(); } catch (_) {} inflight = null; }
+      revokeActiveBlobs();
+      state.selectedId = null;
+      state.detail = null;
+      state.content = null;
+      state.publish = null;
+      state.error = null;
+      renderList();
+      renderDetail();
+    }
   }
 
   async function loadDetail(id, sig) {
@@ -497,21 +537,37 @@
     const header = el('div', 'artifacts-detail__header');
     const name = el('span', 'artifacts-detail__name');
     name.textContent = detail.name || detail.id;
-    header.appendChild(name);
     // source backlink (only valid controlled task ids)
     const backHref = sourceBacklink(detail);
+    let standaloneBack = null;
     if (backHref) {
       const back = el('a', 'artifacts-detail__backlink');
       back.href = backHref;
-      back.textContent = sourceLabel(detail.source_kind);
+      const sk = detail.source_kind;
+      const isTaskSource = sk === 'task_attachment' || sk === 'task_artifact';
+      // 任务来源：紧跟名称显示"(任务)"，其中括号为纯文本、仅"任务"两字为链接，
+      // 形如"产出物名称(任务)"；其他来源（如 session）保持独立链接，位于名称之后。
+      back.textContent = isTaskSource ? '任务' : sourceLabel(detail.source_kind);
       back.addEventListener('click', (ev) => {
         ev.preventDefault();
         if (global.NAGENT && global.NAGENT.navigation && typeof global.NAGENT.navigation.navigatePath === 'function') {
           global.NAGENT.navigation.navigatePath(backHref);
         } else { global.location.href = backHref; }
       });
-      header.appendChild(back);
+      if (isTaskSource) {
+        const wrap = el('span', 'artifacts-detail__backlink-wrap');
+        const open = el('span', 'artifacts-detail__backlink-paren');
+        open.textContent = '(';
+        const close = el('span', 'artifacts-detail__backlink-paren');
+        close.textContent = ')';
+        wrap.append(open, back, close);
+        name.appendChild(wrap);
+      } else {
+        standaloneBack = back;
+      }
     }
+    header.appendChild(name);
+    if (standaloneBack) header.appendChild(standaloneBack);
     const actions = el('div', 'panel-actions artifacts-detail__actions');
     // edit button
     const editBtn = el('button', 'btn artifacts-detail__edit');
@@ -519,8 +575,14 @@
     editBtn.textContent = state.view === 'edit' ? '取消' : '编辑';
     editBtn.addEventListener('click', () => toggleEdit());
     actions.appendChild(editBtn);
-    // export dropdown
-    actions.appendChild(buildExportDropdown(detail));
+    // delete button
+    const delBtn = el('button', 'btn artifacts-detail__delete');
+    delBtn.type = 'button';
+    delBtn.textContent = '删除';
+    delBtn.addEventListener('click', () => doDelete(detail));
+    actions.appendChild(delBtn);
+    // export button (original format only)
+    actions.appendChild(buildExportButton(detail));
     // publish button
     const pubBtn = el('button', 'btn artifacts-detail__publish');
     pubBtn.type = 'button';
@@ -531,41 +593,41 @@
     body.appendChild(header);
   }
 
-  function buildExportDropdown(detail) {
-    const wrap = el('div', 'artifacts-detail__export');
-    const btn = el('button', 'btn artifacts-detail__export-btn');
+  // Export is a single button: original format only (no dropdown). The html
+  // export endpoint stays server-side and is still used for markdown/document
+  // preview rendering, but is not offered as a download format here.
+  function buildExportButton(detail) {
+    const btn = el('button', 'btn artifacts-detail__export');
     btn.type = 'button';
-    btn.textContent = '导出▾';
-    const menu = el('div', 'artifacts-detail__export-menu');
-    menu.hidden = true;
-    // original always
-    const orig = el('button', 'btn artifacts-detail__export-item');
-    orig.type = 'button';
-    orig.textContent = '原始文件 (original)';
-    orig.addEventListener('click', () => { doExport(detail.id, 'original'); menu.hidden = true; });
-    menu.appendChild(orig);
-    // html only for markdown/document
-    if (detail.kind === 'markdown' || detail.kind === 'document') {
-      const html = el('button', 'btn artifacts-detail__export-item');
-      html.type = 'button';
-      html.textContent = 'HTML (html)';
-      html.addEventListener('click', () => { doExport(detail.id, 'html'); menu.hidden = true; });
-      menu.appendChild(html);
-    }
-    btn.addEventListener('click', () => { menu.hidden = !menu.hidden; });
-    wrap.append(btn, menu);
-    return wrap;
+    btn.textContent = '导出';
+    btn.title = '导出原始文件（original）';
+    btn.addEventListener('click', () => doExport(detail, 'original'));
+    return btn;
   }
 
-  async function doExport(id, format) {
+  // Derive the download filename from the artifact name (not a hardcoded
+  // "export"): original keeps the name as-is (it already carries the right
+  // extension, e.g. "report.md"); html replaces the extension with .html so
+  // the downloaded file matches its actual content type.
+  function exportFilename(name, format) {
+    const base = (name && String(name).trim()) || 'export';
+    if (format === 'html') {
+      const dot = base.lastIndexOf('.');
+      const stem = dot > 0 ? base.slice(0, dot) : base;
+      return stem + '.html';
+    }
+    return base;
+  }
+
+  async function doExport(detail, format) {
     try {
-      const resp = await fetchExport(id, format);
+      const resp = await fetchExport(detail.id, format);
       if (!resp.ok) throw new Error('export failed');
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       const a = el('a');
       a.href = url;
-      a.download = (format === 'html' ? 'export.html' : 'export');
+      a.download = exportFilename(detail.name, format);
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (e) {
@@ -711,7 +773,10 @@
     const wrap = el('div', 'artifacts-preview__pdf');
     const iframe = el('iframe', 'artifacts-preview__iframe');
     iframe.setAttribute('title', 'PDF 预览');
-    iframe.setAttribute('sandbox', '');
+    // PDF is NOT sandboxed (unlike HTML/markdown srcdoc): the blob is routed
+    // to the browser's built-in PDF viewer, which sandbox="" blocks (viewer is
+    // treated as a plugin; empty sandbox also strips same-origin for the blob).
+    // PDFs carry no page scripts, so no sandbox is needed for preview safety.
     if (blobUrl) iframe.src = blobUrl;
     wrap.appendChild(iframe);
     // download fallback
@@ -898,6 +963,35 @@
     }
   }
 
+  async function doDelete(detail) {
+    if (!detail || !detail.id) return;
+    const name = detail.name || detail.id;
+    const confirmed = getModal() && typeof getModal().confirm === 'function'
+      ? await getModal().confirm('确认删除制品「' + name + '」？删除后不可恢复。')
+      : global.confirm('确认删除制品「' + name + '」？删除后不可恢复。');
+    if (!confirmed) return;
+    try {
+      await fetchDeleteArtifact(detail.id);
+      // clear selection and return to list
+      if (inflight) { try { inflight.abort(); } catch (_) {} inflight = null; }
+      revokeActiveBlobs();
+      state.selectedId = null;
+      state.detail = null;
+      state.content = null;
+      state.publish = null;
+      state.error = null;
+      if (window.location.pathname !== '/artifacts') {
+        history.pushState({ tab: 'artifacts' }, '', '/artifacts');
+      }
+      renderDetail();
+      await reloadList();
+    } catch (e) {
+      if (getModal() && typeof getModal().alert === 'function') {
+        await getModal().alert('删除失败：' + (e && e.message ? e.message : e));
+      }
+    }
+  }
+
   function renderPublishBlocked() {
     const host = byId('artifacts-detail-body');
     if (!host) return;
@@ -928,7 +1022,10 @@
     const root = byId('tab-artifacts');
     if (!root) return;
     buildShell(root);
+    window.addEventListener('popstate', handlePathChange);
     await reloadList();
+    const pendingId = pendingArtifactIdFromPath();
+    if (pendingId) selectArtifact(pendingId);
   }
 
   async function refresh() {
@@ -937,6 +1034,10 @@
     if (state.selectedId) {
       // re-render detail from cached state
       renderDetail();
+    } else {
+      // navigated to /artifacts/{id} from elsewhere: open it
+      const pendingId = pendingArtifactIdFromPath();
+      if (pendingId) selectArtifact(pendingId);
     }
   }
 
@@ -948,7 +1049,7 @@
     if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
   }
 
-  namespace.artifacts = { init, refresh, deactivate };
+  namespace.artifacts = { init, refresh, deactivate, renderListItem };
   global.NAGENT = namespace;
   global.NAGENT.artifacts = namespace.artifacts;
 

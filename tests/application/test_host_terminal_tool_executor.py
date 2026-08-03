@@ -207,6 +207,44 @@ async def test_application_argument_admission_has_domain_parity(args):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("args", ["", None])
+async def test_empty_args_representation_canonicalized_to_empty_argv(args):
+    """The model occasionally emits the empty argv list as "" or null instead
+    of []. An unattended scheduled photo run must not be rejected as
+    host_arguments_invalid for this benign empty representation. Non-empty
+    strings are still rejected as shell strings by the argv admission, and the
+    Policy allowlist still enforces exact positional args, so canonicalizing
+    only the empty form does not weaken the host execution boundary."""
+    executor, client, _ = _executor()
+    result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": args, "timeout": 120,
+    }))
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.content == {
+        "capture_size": 12,
+        "upload_http": 200,
+        "signed_url": "https://example.invalid/photo.jpg?sig=test",
+    }
+    # The bridge receives an empty argv tuple, not the raw empty string.
+    assert client.requests[0].target.args == ()
+
+
+@pytest.mark.asyncio
+async def test_non_empty_string_args_still_rejected_for_skill_script():
+    """Canonicalization only covers the empty form; a non-empty shell string is
+    still rejected so the argv admission boundary is not weakened."""
+    executor, client, _ = _executor()
+    result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": "ls -la", "timeout": 120,
+    }))
+    assert result.status is ToolResultStatus.ERROR
+    assert result.content == {"error": "host_arguments_invalid"}
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
 async def test_hash_mismatch_denied_without_bridge_call():
     executor, client, _ = _executor(_snapshot(digest="b" * 64))
     result = await executor.execute(ToolCallRequest("c1", "host_terminal", {
@@ -469,6 +507,37 @@ async def test_photo_target_does_not_restore_url_for_non_strict_result_shape():
         "script": "scripts/photo-upload.py", "args": [],
     }))
     assert result.content["signed_url"] == "[REDACTED]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args", ["", None])
+async def test_photo_signed_url_preserved_through_tool_service_with_empty_string_args(args):
+    """End-to-end through ToolService: the model emits args="" or null (observed
+    in the failing scheduled photo run). The executor canonicalizes it, the
+    photo result is parsed, and the signed_url survives the structured
+    redaction via the scoped photo capability preservation."""
+    class _Release:
+        def release(self, content, *args, **kwargs):
+            from types import SimpleNamespace
+            return SimpleNamespace(allowed=True, content=content)
+
+        def redact_structured(self, value):
+            return {**value, "signed_url": "[REDACTED]"}
+
+    executor = HostTerminalToolExecutor(
+        client=_Client(), skill_service=_Skills(), policy_loader=_Loader(_snapshot()),
+    )
+    service = ToolService(
+        executor,
+        [host_terminal_tool_definition()],
+        information_flow_service=_Release(),
+    )
+    result = await service.execute(ToolCallRequest("c1", "host_terminal", {
+        "target_type": "skill_script", "skill": "photo-and-upload",
+        "script": "scripts/photo-upload.py", "args": args,
+    }))
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.content["signed_url"] == "https://example.invalid/photo.jpg?sig=test"
 
 
 @pytest.mark.asyncio

@@ -377,12 +377,109 @@ def test_models_page_renders_provider_admin_controls(tmp_path):
     assert 'value="anthropic"' in html
 
 
-def test_chat_debug_panel_is_collapsed_by_default(tmp_path):
+def test_chat_side_panel_has_tab_structure(tmp_path):
+    """T3: 右侧栏从单一"调试信息"重构为单面板多 Tab 结构
+    (工具调用 | 制品信息)，复用 grid-push 折叠机制，旧 debug 标识清理。"""
+    import re as _re
     client = _client(tmp_path)
     html = client.get('/chat').text
-    assert 'chat-shell chat-shell--debug-collapsed' in html
-    assert 'status-panel status-panel--collapsible chat-debug-panel collapsed' in html
-    assert 'id="chat-debug-toggle" aria-expanded="false" aria-controls="chat-debug-body"' in html
+    css = client.get('/static/styles.css').text
+
+    # 1. chat-shell uses side-collapsed, not debug-collapsed
+    assert 'chat-shell--side-collapsed' in html
+    assert 'chat-shell--debug-collapsed' not in html
+    assert 'chat-debug-panel' not in html
+    assert 'id="chat-debug-toggle"' not in html
+    assert 'id="chat-debug-body"' not in html
+
+    # 2. Single side panel (static header label, not collapsible button); toggle button in chat-stack header
+    assert html.count('id="chat-side-panel"') == 1
+    assert 'status-panel chat-side-panel' in html
+    assert 'status-panel--collapsible chat-side-panel' not in html
+    assert html.count('id="chat-side-toggle-btn"') == 1
+    assert 'id="chat-side-toggle"' not in html
+    assert 'aria-label="展开/收起更多信息"' in html
+    assert 'side-toggle__panel' in html
+    assert '更多信息' in html
+
+    # 3. tablist has exactly two tabs (tool/artifact) with consistent attributes
+    tablist_match = _re.search(r'role="tablist"[^>]*>(.*?)</div>\s*<div[^>]*chat-tab-panels', html, _re.DOTALL)
+    assert tablist_match, "tablist not found"
+    tablist_inner = tablist_match.group(1)
+    tabs = _re.findall(r'<button[^>]*role="tab"[^>]*>', tablist_inner)
+    assert len(tabs) == 2, f"expected 2 tabs, got {len(tabs)}"
+    # tool tab: active, aria-selected=true, tabindex=0
+    assert 'data-tab="tool"' in tablist_inner
+    assert 'aria-selected="true"' in tablist_inner
+    assert 'tabindex="0"' in tablist_inner
+    assert 'chat-tab--active' in tablist_inner
+    # artifact tab: not active, aria-selected=false, tabindex=-1
+    assert 'data-tab="artifact"' in tablist_inner
+    assert 'aria-selected="false"' in tablist_inner
+    assert 'tabindex="-1"' in tablist_inner
+    # aria-controls references panel ids
+    assert 'aria-controls="chat-tab-tool"' in tablist_inner
+    assert 'aria-controls="chat-tab-artifact"' in tablist_inner
+
+    # 4. Two tabpanels with correct aria-labelledby; artifact panel hidden
+    tabpanels = _re.findall(r'<div[^>]*role="tabpanel"[^>]*>', html)
+    assert len(tabpanels) == 2, f"expected 2 tabpanels, got {len(tabpanels)}"
+    assert 'aria-labelledby="chat-tab-tool-button"' in html
+    assert 'aria-labelledby="chat-tab-artifact-button"' in html
+    artifact_panel_match = _re.search(r'<div[^>]*id="chat-tab-artifact"[^>]*>', html)
+    assert artifact_panel_match, "artifact tabpanel not found"
+    assert 'hidden' in artifact_panel_match.group(0), "artifact panel must be hidden by default"
+    tool_panel_match = _re.search(r'<div[^>]*id="chat-tab-tool"[^>]*>', html)
+    assert tool_panel_match, "tool tabpanel not found"
+    assert 'hidden' not in tool_panel_match.group(0), "tool panel must not be hidden"
+
+    # 5. Original debug-sections preserved once each, inside tool panel
+    assert html.count('id="chat-summary"') == 1
+    assert html.count('id="chat-task-state"') == 1
+    assert html.count('id="chat-tool-calls"') == 1
+    tool_panel_start = html.index('id="chat-tab-tool"')
+    artifact_panel_start = html.index('id="chat-tab-artifact"')
+    for elem_id in ('chat-summary', 'chat-task-state', 'chat-tool-calls'):
+        pos = html.index(f'id="{elem_id}"')
+        assert tool_panel_start < pos < artifact_panel_start, f"{elem_id} must be inside tool panel"
+
+    # 6. Artifact panel only contains chat-artifact-list; no filter/detail/load-more
+    artifact_section = html[artifact_panel_start:]
+    assert 'id="chat-artifact-list"' in artifact_section
+    assert 'artifacts-list__items' in artifact_section
+    assert 'aria-live="polite"' in artifact_section
+    assert '暂未选择会话' in artifact_section
+    panel_window = artifact_section[:300]
+    assert 'artifacts-filter' not in panel_window
+    assert 'artifacts-detail' not in panel_window
+    assert 'artifacts-list__more' not in panel_window
+
+    # 7. CSS: side-collapsed hides sidebar (0 column + display:none), toggle button styling, old debug classes removed
+    assert '.chat-shell.chat-shell--side-collapsed' in css
+    assert 'grid-template-columns: 280px minmax(360px, 1fr) 0' in css
+    assert '.chat-shell.chat-shell--side-collapsed #chat-side-panel' in css
+    assert '.chat-side-toggle-btn' in css
+    assert '.chat-side-panel.collapsed' not in css
+    assert '.chat-debug-panel' not in css
+    assert '.chat-shell--debug-collapsed' not in css
+
+    # 8. .chat-tab-panels is the scrollable container; height chain; min-width:0
+    assert '.chat-tab-panels' in css
+    tabpanels_idx = css.index('.chat-tab-panels')
+    tabpanels_rule = css[tabpanels_idx:tabpanels_idx + 200]
+    assert 'overflow-y: auto' in tabpanels_rule, "chat-tab-panels must scroll"
+    assert '.chat-tab-content[hidden]' in css
+    assert 'display: none' in css
+    # min-height: 0 and min-width: 0 present for height/width chain
+    assert 'min-height: 0' in css
+    assert 'min-width: 0' in css
+
+    # 9. @media (max-width: 1100px) covers both .chat-shell and --side-collapsed
+    media_idx = css.index('@media (max-width: 1100px)')
+    media_block = css[media_idx:media_idx + 400]
+    assert '.chat-shell.chat-shell--side-collapsed' in media_block
+    assert 'grid-template-columns: 1fr' in media_block
+    assert '.chat-side-panel' in media_block
 
 
 def test_tool_messages_are_collapsed_by_default(tmp_path):
@@ -584,7 +681,8 @@ def test_chat_external_memory_draft_selection_is_carried_into_new_session(tmp_pa
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
     ensure_start = chat_js.index('async function ensureSession()')
-    ensure_end = chat_js.index('async function newSession()', ensure_start)
+    # ensureSession 之后紧跟 sessionHasBrowserTool（原 newSession 已作为死代码移除）
+    ensure_end = chat_js.index('function sessionHasBrowserTool(', ensure_start)
     ensure_body = chat_js[ensure_start:ensure_end]
     render_start = chat_js.index('function renderExternalMemoryUI()')
     render_end = chat_js.index('function getExternalMemoryEnabled()', render_start)
@@ -757,7 +855,7 @@ def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
     client = _client(tmp_path)
     css = client.get('/static/styles.css').text
     assert 'grid-template-columns: 280px minmax(360px, 2fr) minmax(280px, 0.9fr)' in css
-    assert 'grid-template-columns: 280px minmax(360px, 5fr) 40px' in css
+    assert 'grid-template-columns: 280px minmax(360px, 1fr) 0' in css
 
 
 def test_static_assets_use_safe_text_rendering(tmp_path):
@@ -900,13 +998,13 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     assert sidebar_match, "sidebar not found"
     sidebar_html = sidebar_match.group(1)
     expected_data_tabs = [
-        'summary', 'chat', 'tasks', 'artifacts', 'scheduled-tasks', 'sessions', 'memory',
+        'summary', 'chat', 'scheduled-tasks', 'tasks', 'artifacts', 'sessions', 'memory',
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
         'executors', 'sandbox', 'executors-host', 'browser', 'models', 'platforms',
         'observations', 'observations-sessions', 'observations-modules', 'security',
     ]
     expected_hrefs = [
-        '/summary', '/chat', '/tasks', '/artifacts', '/scheduled-tasks', '/sessions', '/memory',
+        '/summary', '/chat', '/scheduled-tasks', '/tasks', '/artifacts', '/sessions', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/models', '/platforms',
         '/observations/sessions', '/observations/modules', '/security',
@@ -1619,7 +1717,7 @@ def test_browser_shell_served_at_browser_path(tmp_path):
 def test_artifacts_static_assets_and_wiring(tmp_path):
     """T15: artifacts.js asset reachable, container unique + default hidden,
     script order (artifacts.js before app.js), source safety, nav order
-    (tasks -> artifacts -> scheduled-tasks), nav hidden-by-default."""
+    (scheduled-tasks -> tasks -> artifacts), nav hidden-by-default."""
     client = _client(tmp_path)
     res = client.get('/static/artifacts.js')
     assert res.status_code == 200, "artifacts.js not served"
@@ -1640,9 +1738,9 @@ def test_artifacts_static_assets_and_wiring(tmp_path):
     assert html.index('/static/artifacts.js') < html.index('/static/app.js'), \
         "artifacts.js must load before app.js"
 
-    # Nav order in tabConfig source: tasks -> artifacts -> scheduled-tasks.
-    assert nav_js.index('tasks') < nav_js.index('artifacts') < nav_js.index('scheduled-tasks'), \
-        "artifacts must be between tasks and scheduled-tasks in tabConfig"
+    # Nav order in tabConfig source: scheduled-tasks -> tasks -> artifacts.
+    assert nav_js.index("tab: 'scheduled-tasks'") < nav_js.index("tab: 'tasks'") < nav_js.index("tab: 'artifacts'"), \
+        "tabConfig order must be scheduled-tasks -> tasks -> artifacts"
     assert '制品' in nav_js, "artifacts label '制品' missing from tabConfig"
 
     # Nav item hidden by default in sidebar (probe-gated reveal).

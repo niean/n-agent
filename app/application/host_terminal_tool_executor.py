@@ -230,6 +230,18 @@ class HostTerminalToolExecutor:
             )
             return self._error(request, "host_terminal_unsupported_route")
 
+        # Canonicalize the empty argv representation. Some models emit the empty
+        # argument list as "" or null instead of []; an unattended scheduled run
+        # must not be rejected as host_arguments_invalid for this benign empty
+        # form. Only the empty form is coerced: non-empty strings are left intact
+        # so the strict argv admission still rejects shell-string inputs, and the
+        # Policy allowlist still enforces exact positional args, so this does not
+        # weaken the host execution boundary.
+        if isinstance(request.arguments, dict):
+            raw_args = request.arguments.get("args")
+            if raw_args is None or raw_args == "":
+                request.arguments["args"] = []
+
         # Refresh once, then pin this exact immutable object for the whole call.
         await asyncio.to_thread(self._policy_loader.refresh)
         snapshot = self._policy_loader.snapshot

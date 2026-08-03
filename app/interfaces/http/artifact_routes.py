@@ -19,12 +19,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile
 
+from app.interfaces.http._content_disposition import build_content_disposition
 from app.application.artifact_service import (
     ArtifactTooLargeError,
     PublishBlockedError,
@@ -73,6 +73,8 @@ def register_artifact_routes(router: APIRouter, artifact_service) -> None:
     @router.get("/chat/artifacts")
     async def list_artifacts(
         source_kind: str | None = None,
+        source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         kind: str | None = None,
         status: str | None = None,
         q: str | None = None,
@@ -96,6 +98,8 @@ def register_artifact_routes(router: APIRouter, artifact_service) -> None:
         try:
             page = await artifact_service.list_artifacts(
                 source_kind=parsed_source_kind,
+                source_context_ref=source_context_ref,
+                source_session_id=source_session_id,
                 kind=parsed_kind,
                 status=parsed_status,
                 q=q,
@@ -480,7 +484,7 @@ def _build_content_response(
     # Raw HTML must use attachment (not same-origin top-level HTML).
     is_html = (mime or "").lower().split(";")[0].strip() == "text/html"
     disposition = "attachment" if (force_attachment or is_html) else "inline"
-    cd = _safe_content_disposition(filename, disposition)
+    cd = build_content_disposition(filename, disposition)
     return Response(
         content=data,
         media_type=content_type,
@@ -507,18 +511,6 @@ def _is_text_mime(mime: str) -> bool:
     )
 
 
-def _safe_content_disposition(filename: str, disposition: str = "attachment") -> str:
-    """Build a safe Content-Disposition header with RFC 5987 UTF-8 filename."""
-    raw = filename or "artifact"
-    # Sanitize: remove path separators, quotes, control chars.
-    safe = raw.replace("/", "_").replace("\\", "_").replace("\x00", "")
-    safe = safe.replace('"', "").replace("\r", "").replace("\n", "")
-    if not safe:
-        safe = "artifact"
-    quoted = quote(raw, safe="")
-    return f'{disposition}; filename="{safe}"; filename*=UTF-8\'\'{quoted}'
-
-
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -536,6 +528,7 @@ def _artifact_to_dict(artifact: Artifact) -> dict:
         "checksum": view["checksum"],
         "source_kind": _enum_value(view["source_kind"]),
         "source_context_ref": view["source_context_ref"],
+        "source_session_id": view["source_session_id"],
         "summary": view["summary"],
         "classification": view["classification"],
         "labels": list(view["labels"]) if view["labels"] is not None else None,

@@ -196,7 +196,7 @@
   # 1c. Create 2 TaskArtifacts by writing workspace files and registering
   # directly in the registry (simulates task-run artifact registration).
   echo "[Artifact E2E] 1c. register 2 task artifacts"
-  docker exec -i -e RUN_TAG="$RUN_TAG" "$CONTAINER" python3 - <<'PYEOF'
+  docker exec -i -e RUN_TAG="$RUN_TAG" -e TASK_ID="$TASK_ID" "$CONTAINER" python3 - <<'PYEOF'
 import asyncio
 import hashlib
 import os
@@ -210,6 +210,7 @@ from app.infrastructure.registry.sqlite_artifact_registry import SQLiteArtifactR
 
 async def main():
     run_tag = os.environ["RUN_TAG"]
+    task_id = os.environ["TASK_ID"]
     registry = SQLiteArtifactRegistry("/app/locals/sessions.db")
     workspace = Path("/workspace")
     for i in (1, 2):
@@ -218,7 +219,10 @@ async def main():
         (workspace / name).write_text(content)
         data = content.encode("utf-8")
         checksum = "sha256:" + hashlib.sha256(data).hexdigest()
-        source_ref = f"task:{run_tag}:run:1:artifact:{i}"
+        # source_context_ref must be the real task_id: orphan backfill
+        # (backfill_orphaned_task_artifacts) deletes task-sourced artifacts
+        # whose task no longer exists, checking source_context_ref == task_id.
+        source_ref = f"task:{task_id}:run:1:artifact:{i}"
         artifact = Artifact(
             id=secrets.token_urlsafe(16),
             name=name,
@@ -230,7 +234,7 @@ async def main():
             checksum=checksum,
             source_kind=ArtifactSource.TASK_ARTIFACT,
             source_ref=source_ref,
-            source_context_ref=run_tag,
+            source_context_ref=task_id,
             summary="",
             created_by="e2e",
         )

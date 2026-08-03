@@ -249,6 +249,18 @@ class SessionService:
             session_id, "ui.task_result", content, truncate=True
         )
 
+    async def append_task_artifact_message(
+        self, session_id: str, content: str, card: dict[str, Any] | None = None,
+    ) -> ConversationMessage:
+        """持久化任务制品产出通知。固定 role=system、name=ui.task_artifact。
+
+        由 TaskRunService 在 artifact 注册成功后 best-effort 调用，card 含
+        artifact_id/name，供前端渲染制品详情链接（/artifacts/{id}）。
+        """
+        return await self._append_system_message(
+            session_id, "ui.task_artifact", content, truncate=True, card=card,
+        )
+
     async def append_tool_approval_message(
         self, session_id: str, approval: dict[str, Any],
     ) -> ConversationMessage:

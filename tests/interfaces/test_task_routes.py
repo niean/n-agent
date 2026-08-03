@@ -9,6 +9,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
@@ -1096,6 +1097,36 @@ async def test_attachment_download_not_found(client):
     resp = client.get("/chat/tasks/attachments/a_missing")
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "attachment_not_found"
+
+
+@pytest.mark.asyncio
+async def test_attachment_download_unicode_filename_does_not_500(client, task_service):
+    """Non-ASCII attachment filenames must not crash the download endpoint.
+
+    HTTP headers are latin-1; the legacy ``filename`` parameter built from
+    ``stored_name`` must stay ASCII-only while the real name is carried via
+    the RFC 5987 ``filename*`` parameter. Bug: ``stored_name`` preserves the
+    non-ASCII original filename (e.g. ``<uuid>_横向-邮箱归属.md``), so
+    ``filename="{stored_name}"`` raised UnicodeEncodeError -> HTTP 500."""
+    task = await task_service.create_task(title="T", created_by="u")
+    resp = client.post(
+        f"/chat/tasks/{task.id}/attachments",
+        files={"file": ("横向-邮箱归属.md", "# 横向-邮箱归属\n".encode("utf-8"), "text/markdown")},
+        data={"uploaded_by": "alice"},
+    )
+    assert resp.status_code == 200
+    att = resp.json()
+    assert att["filename"] == "横向-邮箱归属.md"
+    resp = client.get(f"/chat/tasks/attachments/{att['id']}")
+    assert resp.status_code == 200
+    assert resp.content == "# 横向-邮箱归属\n".encode("utf-8")
+    cd = resp.headers.get("content-disposition", "")
+    # RFC 5987 UTF-8 form carries the real (non-ASCII) name.
+    assert "filename*=UTF-8''" in cd
+    assert quote("横向-邮箱归属.md", safe="") in cd
+    # Legacy filename must be latin-1 encodable so the header builds.
+    legacy = cd.split('filename="', 1)[1].split('"', 1)[0]
+    legacy.encode("latin-1")  # must not raise
 
 
 # ---------------------------------------------------------------------------

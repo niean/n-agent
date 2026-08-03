@@ -360,6 +360,7 @@
       runs: (runId) => fetchJson('/chat/tasks/runs/' + encodeURIComponent(runId)),
       terminateRun: (runId) => fetchJson('/chat/tasks/runs/' + encodeURIComponent(runId) + '/terminate', { method: 'POST' }),
       listAttachments: (id) => fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/attachments'),
+      uploadAttachment: (id, file) => { const fd = new FormData(); fd.append('file', file); return fetchJson('/chat/tasks/' + encodeURIComponent(id) + '/attachments', { method: 'POST', body: fd }); },
       security: () => fetchJson('/chat/tasks/security'),
       securityConfig: {
         get: () => fetchJson('/chat/tasks/security/config'),

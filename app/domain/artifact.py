@@ -138,6 +138,11 @@ class Artifact:
 
     # Optional metadata (with defaults)
     source_context_ref: str | None = None
+    # Session this artifact is associated with (queryable association keyed
+    # by session id). Set at registration for task-produced artifacts so the
+    # conversation panel can find them by session id. Distinct from
+    # ``source_context_ref`` (which holds the task id for task artifacts).
+    source_session_id: str | None = None
     summary: str = ""
     classification: str | None = None
     labels: tuple[str, ...] | None = None
@@ -230,6 +235,7 @@ class Artifact:
             "checksum": self.checksum,
             "source_kind": self.source_kind,
             "source_context_ref": self.source_context_ref,
+            "source_session_id": self.source_session_id,
             "summary": self.summary,
             "classification": self.classification,
             "labels": self.labels,
@@ -346,6 +352,8 @@ class ArtifactRegistry(Protocol):
         self,
         *,
         source_kind: ArtifactSource | None = None,
+        source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         kind: ArtifactKind | None = None,
         status: ArtifactStatus | None = None,
         q: str | None = None,
@@ -358,6 +366,28 @@ class ArtifactRegistry(Protocol):
         self, source_kind: ArtifactSource, source_ref: str,
     ) -> Artifact | None: ...
     async def count_artifacts(self) -> int: ...
+
+    # --- Session backfill ---
+    async def list_task_artifacts_missing_session(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        """Return task-source artifacts with NULL source_session_id.
+
+        Used by the session-id backfill to populate the queryable
+        session association for existing task artifacts.
+        """
+        ...
+
+    # --- Kind backfill ---
+    async def list_artifacts_with_empty_mime(
+        self, *, limit: int = 200,
+    ) -> tuple[Artifact, ...]:
+        """Return artifacts whose mime is empty (unclassified kind).
+
+        Used by the kind backfill to re-infer kind/mime from the filename
+        extension for artifacts registered without a content_type.
+        """
+        ...
 
     # --- PublishedArtifact lifecycle ---
     async def register_published(

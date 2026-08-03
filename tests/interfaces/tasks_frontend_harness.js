@@ -566,6 +566,56 @@ async function testDirectUrlOpensDetail() {
   ok(detailText.indexOf('直链任务') !== -1, 'direct detail renders task title');
 }
 
+// 附件上传遵循项目约定（与 chat 图片上传一致）：隐藏原生 file 控件，
+// 「选择文件」按钮触发选择并展示文件名；「上传」按钮未选文件时置灰（不隐藏）。
+async function testAttachmentUploadConventions() {
+  const task = card('t1', '附件任务');
+  let uploaded = null;
+  const api = {
+    task: {
+      board: () => Promise.resolve(makeBoard([task])),
+      get: () => Promise.resolve({ task, runs: [], events: [], comments: [], attachments: [], worker_context: '' }),
+      uploadAttachment: (id, file) => { uploaded = { id: id, file: file }; return Promise.resolve({}); },
+    },
+  };
+  const ctx = freshEnv(api);
+  ctx.NAGENT.tasks.init();
+  await tick();
+  const board = byId['kanban-board-root'];
+  const taskCard = board.children[0].children[1].children[0];
+  (taskCard._listeners.click || []).forEach((fn) => fn());
+  await tick();
+
+  const fileInput = created.find((n) => n.className === 'tasks-detail__file-input');
+  const pickBtn = created.find((n) => n.className === 'btn tasks-detail__pick');
+  const fileName = created.find((n) => n.className === 'tasks-detail__file-name muted');
+  const uploadBtn = created.find((n) => n.className === 'btn btn--primary' && n.textContent === '上传');
+  ok(!!fileInput && fileInput.type === 'file', 'attachment upload renders a file input');
+  ok(fileInput && fileInput.hidden === true, 'native file input is hidden (convention: hide native control)');
+  ok(!!pickBtn && pickBtn.textContent === '选择文件', '选择文件 button rendered');
+  ok(!!fileName && fileName.textContent === '未选择文件', 'file name placeholder shown');
+  ok(!!uploadBtn, '上传 button rendered');
+  ok(uploadBtn && uploadBtn.disabled === true, '上传 button disabled before file selection (置灰不隐藏)');
+
+  // 「选择文件」按钮触发隐藏的 file input
+  let fileClicked = false;
+  fileInput.click = () => { fileClicked = true; };
+  (pickBtn._listeners.click || []).forEach((fn) => fn());
+  ok(fileClicked === true, '选择文件 click triggers hidden file input');
+
+  // 选择文件后：文件名更新、「上传」按钮启用
+  fileInput.files = [{ name: 'plan.md' }];
+  (fileInput._listeners.change || []).forEach((fn) => fn());
+  ok(fileName.textContent === 'plan.md', 'file name updates after selection');
+  ok(uploadBtn.disabled === false, '上传 button enabled after file selection');
+
+  // 点击「上传」调用 uploadAttachment
+  (uploadBtn._listeners.click || []).forEach((fn) => fn());
+  await tick();
+  await tick();
+  ok(uploaded && uploaded.id === 't1' && uploaded.file.name === 'plan.md', '上传 calls uploadAttachment with selected file');
+}
+
 (async () => {
   await testRendersQueuedCards();
   await testEmptyBoardNoCrash();
@@ -580,6 +630,7 @@ async function testDirectUrlOpensDetail() {
   await testDetailDeleteButtonOnTerminalTask();
   await testApprovalNoteTextareaAndSubmit();
   await testDirectUrlOpensDetail();
+  await testAttachmentUploadConventions();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('tasks_frontend_harness: all tests passed');
   process.exit(0);

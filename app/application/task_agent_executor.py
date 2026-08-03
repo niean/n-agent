@@ -73,6 +73,13 @@ logger = logging.getLogger(__name__)
 # "明确失败"，直接 FAILED，避免耗尽 goal_max_turns（修复 t_97d317e953b64edc 耗尽 10 轮）。
 GOAL_MAX_CONSECUTIVE_REJECTIONS = 2
 
+# Task worker 默认工具授予。execute_code 让 worker 能跑沙箱 Python、经 write_file
+# 回调写 workspace 文件（回调写 workspace_root 经父进程 RPC，绕过 /workspace:ro），
+# 对齐 TASK_GUIDANCE“用通用工具在 workspace 做事”，镜像 Hermes cron-default-core-tools。
+# write_file 仍为沙箱内部回调（不提升为直接 LLM 工具）。sandbox 未启用时 execute_code
+# 定义未注册，此 grant 为 no-op。judge 上下文（下方 run_judge）保持无工具，不受影响。
+TASK_WORKER_DEFAULT_TOOLS: tuple[str, ...] = ("execute_code",)
+
 
 # ---------------------------------------------------------------------------
 # TaskAgentResult
@@ -187,9 +194,11 @@ class TaskAgentExecutor:
         # 这三个用户侧审批工具名 -- worker 不能审批自己的 task_propose_change 提案。
         # 不改 ToolPolicy 通用 grant 可暴露 SAFE AGENT 工具的设计（模式六保留），
         # 只在 worker boundary 收紧。
+        # 默认前置 TASK_WORKER_DEFAULT_TOOLS（execute_code），让 worker 有通用工具可用；
+        # 显式 allowed_tools 叠加其上；审批工具仍剥离防递归。
         granted_tools = [
             name
-            for name in task.execution_policy.allowed_tools
+            for name in (*TASK_WORKER_DEFAULT_TOOLS, *task.execution_policy.allowed_tools)
             if name not in USER_TASK_APPROVAL_TOOL_NAMES
         ]
         permitted_managed = set(TASK_TOOL_NAMES)

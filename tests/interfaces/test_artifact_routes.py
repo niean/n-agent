@@ -13,6 +13,7 @@ import io
 import json
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -38,6 +39,7 @@ from app.domain.artifact import (
     PublishedArtifactNotFoundError,
     PublishedArtifactStatus,
 )
+from app.interfaces.http._content_disposition import build_content_disposition
 from app.interfaces.http.dashboard import create_dashboard_router
 
 
@@ -60,6 +62,7 @@ def _make_artifact(
     source_kind: ArtifactSource = ArtifactSource.MANUAL,
     source_ref: str | None = None,
     source_context_ref: str | None = None,
+    source_session_id: str | None = None,
     summary: str = "",
     classification: str | None = None,
     labels: tuple[str, ...] | None = None,
@@ -96,6 +99,7 @@ def _make_artifact(
         source_kind=source_kind,
         source_ref=source_ref,
         source_context_ref=source_context_ref,
+        source_session_id=source_session_id,
         summary=summary,
         classification=classification,
         labels=labels,
@@ -156,6 +160,8 @@ class FakeArtifactService:
         self,
         *,
         source_kind: ArtifactSource | None = None,
+        source_context_ref: str | None = None,
+        source_session_id: str | None = None,
         kind: ArtifactKind | None = None,
         status: ArtifactStatus | None = None,
         q: str | None = None,
@@ -167,6 +173,10 @@ class FakeArtifactService:
         items = list(self._artifacts.values())
         if source_kind is not None:
             items = [a for a in items if a.source_kind == source_kind]
+        if source_context_ref is not None:
+            items = [a for a in items if a.source_context_ref == source_context_ref]
+        if source_session_id is not None:
+            items = [a for a in items if a.source_session_id == source_session_id]
         if kind is not None:
             items = [a for a in items if a.kind == kind]
         if status is not None:
@@ -578,6 +588,135 @@ class TestListArtifacts:
         assert len(items) == 1
         assert "important" in items[0]["name"]
 
+    def test_list_filter_by_source_context_ref(self):
+        """Filtering by source_context_ref returns only matching artifacts."""
+        service = FakeArtifactService()
+        service._artifacts["a1"] = _make_artifact(
+            "a1", source_kind=ArtifactSource.SESSION,
+            source_ref="session-a:1", source_context_ref="session-a",
+        )
+        service._artifacts["a2"] = _make_artifact(
+            "a2", name="b.md", source_kind=ArtifactSource.SESSION,
+            source_ref="session-b:2", source_context_ref="session-b",
+        )
+        client = _client(service)
+        response = client.get("/chat/artifacts?source_context_ref=session-a")
+        assert response.status_code == 200
+        data = response.json()
+        assert "items" in data
+        assert "next_cursor" in data
+        items = data["items"]
+        assert len(items) == 1
+        assert items[0]["source_context_ref"] == "session-a"
+
+    def test_list_source_context_ref_empty_string(self):
+        """Empty-string source_context_ref only matches empty-string records,
+        not NULL or other values."""
+        service = FakeArtifactService()
+        service._artifacts["a1"] = _make_artifact(
+            "a1", source_kind=ArtifactSource.SESSION,
+            source_ref="session-a:1", source_context_ref="session-a",
+        )
+        service._artifacts["a2"] = _make_artifact(
+            "a2", name="empty.md", source_context_ref="",
+        )
+        service._artifacts["a3"] = _make_artifact(
+            "a3", name="null.md",
+        )
+        client = _client(service)
+        response = client.get("/chat/artifacts?source_context_ref=")
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert len(items) == 1
+        assert items[0]["id"] == "a2"
+
+    def test_list_source_context_ref_omitted(self):
+        """Omitting source_context_ref returns all artifacts (no filter)."""
+        service = FakeArtifactService()
+        service._artifacts["a1"] = _make_artifact(
+            "a1", source_kind=ArtifactSource.SESSION,
+            source_ref="session-a:1", source_context_ref="session-a",
+        )
+        service._artifacts["a2"] = _make_artifact("a2", name="b.md")
+        client = _client(service)
+        response = client.get("/chat/artifacts")
+        assert response.status_code == 200
+        data = response.json()
+        assert "items" in data
+        assert "next_cursor" in data
+        assert len(data["items"]) == 2
+
+    def test_list_source_context_ref_with_source_kind(self):
+        """source_context_ref AND source_kind combine as joint filters."""
+        service = FakeArtifactService()
+        service._artifacts["a1"] = _make_artifact(
+            "a1", source_kind=ArtifactSource.SESSION,
+            source_ref="session-a:1", source_context_ref="session-a",
+        )
+        service._artifacts["a2"] = _make_artifact(
+            "a2", name="b.md", source_kind=ArtifactSource.SESSION,
+            source_ref="session-b:2", source_context_ref="session-b",
+        )
+        service._artifacts["a3"] = _make_artifact(
+            "a3", name="c.md", source_context_ref="session-a",
+        )
+        client = _client(service)
+        response = client.get(
+            "/chat/artifacts?source_kind=session&source_context_ref=session-a"
+        )
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert len(items) == 1
+        assert items[0]["id"] == "a1"
+        assert items[0]["source_kind"] == "session"
+        assert items[0]["source_context_ref"] == "session-a"
+
+    def test_list_filter_by_source_session_id(self):
+        """Filtering by source_session_id returns matching artifacts of any
+        task source kind (the conversation panel query)."""
+        service = FakeArtifactService()
+        service._artifacts["a1"] = _make_artifact(
+            "a1", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task:t1:run:1:artifact:0", source_context_ref="t1",
+            source_session_id="task-sess-1",
+        )
+        service._artifacts["a2"] = _make_artifact(
+            "a2", name="b.png", kind=ArtifactKind.IMAGE, mime="image/png",
+            inline_content=None, content_ref="item:a2/f", binary_data=b"img",
+            source_kind=ArtifactSource.TASK_ATTACHMENT,
+            source_ref="att-2", source_context_ref="t1",
+            source_session_id="task-sess-1",
+        )
+        service._artifacts["a3"] = _make_artifact(
+            "a3", name="c.md", source_kind=ArtifactSource.TASK_ARTIFACT,
+            source_ref="task:t2:run:1:artifact:0", source_context_ref="t2",
+            source_session_id="task-sess-2",
+        )
+        client = _client(service)
+        response = client.get("/chat/artifacts?source_session_id=task-sess-1")
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert {i["id"] for i in items} == {"a1", "a2"}
+        # both task source kinds found, no source_kind filter applied
+        assert {i["source_kind"] for i in items} == {
+            "task_artifact", "task_attachment",
+        }
+        # serialized source_session_id present
+        assert all(i["source_session_id"] == "task-sess-1" for i in items)
+
+    def test_list_source_session_id_serialized(self):
+        """_artifact_to_dict exposes source_session_id (None when unset)."""
+        service = FakeArtifactService()
+        service._artifacts["a1"] = _make_artifact(
+            "a1", source_session_id="sess-x",
+        )
+        service._artifacts["a2"] = _make_artifact("a2", name="b.md")
+        client = _client(service)
+        response = client.get("/chat/artifacts")
+        items = {i["id"]: i for i in response.json()["items"]}
+        assert items["a1"]["source_session_id"] == "sess-x"
+        assert items["a2"]["source_session_id"] is None
+
 
 # ---------------------------------------------------------------------------
 # Create tests
@@ -768,6 +907,34 @@ class TestGetContent:
         response = client.get("/chat/artifacts/broken-1/content")
         assert response.status_code == 409
         assert response.json()["error"]["code"] == "artifact_content_unavailable"
+
+    def test_get_content_unicode_filename_does_not_500(self):
+        """Non-ASCII (e.g. Chinese) artifact names must not crash the
+        content endpoint. HTTP headers are latin-1, so the legacy
+        ``filename`` parameter must stay ASCII-only while the real name
+        is conveyed via the RFC 5987 ``filename*`` parameter. Bug:
+        ``_safe_content_disposition`` put the raw non-ASCII name into
+        ``filename="..."`` -> UnicodeEncodeError -> HTTP 500 -> frontend
+        "request_failed"."""
+        service = FakeArtifactService()
+        art = _make_artifact(
+            "cn-1",
+            name="横向-邮箱归属.md",
+            kind=ArtifactKind.MARKDOWN,
+            mime="text/markdown",
+            inline_content="# 横向-邮箱归属\n",
+        )
+        service._artifacts["cn-1"] = art
+        client = _client(service)
+        response = client.get("/chat/artifacts/cn-1/content")
+        assert response.status_code == 200
+        cd = response.headers.get("content-disposition", "")
+        # RFC 5987 UTF-8 form carries the real (non-ASCII) name.
+        assert "filename*=UTF-8''" in cd
+        assert quote("横向-邮箱归属.md", safe="") in cd
+        # Legacy filename must be latin-1 encodable so the header builds.
+        legacy = cd.split('filename="', 1)[1].split('"', 1)[0]
+        legacy.encode("latin-1")  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -1216,3 +1383,43 @@ class TestPublicViewExclusion:
         assert "content_ref" not in item
         assert "inline_content" not in item
         assert "source_ref" not in item
+
+
+class TestSafeContentDisposition:
+    """Direct unit tests for the Content-Disposition header builder.
+
+    HTTP header values are latin-1; the legacy ``filename`` parameter must
+    stay ASCII-only (non-ASCII names fall back to a placeholder) while the
+    real name is carried by the RFC 5987 ``filename*`` parameter.
+    """
+
+    def test_ascii_filename_preserved_in_legacy_field(self):
+        cd = build_content_disposition("report.md", "inline")
+        assert cd == 'inline; filename="report.md"; filename*=UTF-8\'\'report.md'
+
+    def test_unicode_filename_legacy_field_is_ascii_only(self):
+        cd = build_content_disposition("横向-邮箱归属.md", "inline")
+        # Legacy filename must be latin-1 encodable (no UnicodeEncodeError).
+        legacy = cd.split('filename="', 1)[1].split('"', 1)[0]
+        legacy.encode("latin-1")
+        # RFC 5987 form carries the real non-ASCII name.
+        assert f"filename*=UTF-8''{quote('横向-邮箱归属.md', safe='')}" in cd
+        # Extension preserved in the ASCII fallback so legacy clients keep type.
+        assert legacy.endswith(".md")
+
+    def test_unicode_filename_whole_header_latin1_encodable(self):
+        """The entire header value must survive latin-1 encoding (what
+        Starlette does when writing the response header)."""
+        cd = build_content_disposition("横向-邮箱归属.md", "inline")
+        cd.encode("latin-1")  # must not raise
+
+    def test_sanitizes_path_separators_and_quotes(self):
+        cd = build_content_disposition('evil/.."\\n.md', "attachment")
+        legacy = cd.split('filename="', 1)[1].split('"', 1)[0]
+        assert "/" not in legacy
+        assert "\\" not in legacy
+        assert '"' not in legacy
+
+    def test_empty_filename_falls_back(self):
+        cd = build_content_disposition("", "attachment")
+        assert 'filename="artifact"' in cd

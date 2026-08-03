@@ -29,10 +29,8 @@
     const newBtn = document.getElementById('task-new');
     if (newBtn) newBtn.addEventListener('click', openCreateModal);
     window.addEventListener('popstate', handlePathChange);
-    refresh().then(() => {
-      const pendingId = pendingTaskIdFromPath();
-      if (pendingId) openDetail(pendingId);
-    });
+    // refresh() opens a pending /tasks/{id} detail internally.
+    refresh();
   }
 
   function renderShell() {
@@ -187,6 +185,14 @@
         const root = document.getElementById('tasks-board');
         if (root) { const msg = el('div', 'tasks-error'); msg.textContent = '加载看板失败：' + (e && e.message ? e.message : e); root.appendChild(msg); }
       }
+    }
+    // Open task detail when navigated to /tasks/{id} (e.g. from an artifact's
+    // task backlink) while the board is already initialized. Skip when already
+    // viewing this task to avoid re-render loops on WS-triggered refresh.
+    const pendingId = pendingTaskIdFromPath();
+    if (pendingId) {
+      const current = state.detail && state.detail.id ? state.detail.id : null;
+      if (current !== pendingId) openDetail(pendingId);
     }
   }
 
@@ -417,6 +423,78 @@
     form.append(sectionLabel, body);
   }
 
+  // 附件列表：每项展示文件名/类型/大小，若已注册制品则追加"制品"链接。
+  function appendAttachmentList(form, id, items) {
+    const sectionLabel = el('div', 'tasks-detail__section-label');
+    sectionLabel.textContent = '附件';
+    const bodyEl = el('div', 'tasks-detail__body');
+    if (!items || !items.length) {
+      bodyEl.textContent = '暂无';
+    } else {
+      items.forEach((attachment) => {
+        const row = el('div', 'tasks-detail__list-item');
+        const meta = [
+          detailValue(attachment.filename), detailValue(attachment.content_type),
+          attachment.size == null ? '' : `${attachment.size} B`,
+        ].filter(Boolean).join(' | ');
+        row.textContent = meta;
+        if (attachment.artifact_id) {
+          const href = '/artifacts/' + encodeURIComponent(attachment.artifact_id);
+          row.appendChild(document.createTextNode(' '));
+          const link = el('a', 'tasks-detail__artifact-link');
+          link.href = href;
+          link.textContent = '制品';
+          link.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            const nav = global.NAGENT && global.NAGENT.navigation;
+            if (nav && typeof nav.navigatePath === 'function') {
+              nav.navigatePath(href);
+            } else { global.location.href = href; }
+          });
+          row.appendChild(link);
+        }
+        bodyEl.appendChild(row);
+      });
+    }
+    const uploadRow = el('div', 'tasks-detail__upload');
+    // 隐藏原生 file 控件，由「选择文件」按钮触发（与 chat 图片上传一致，避免裸露原生控件破坏 Design Token 一致性）
+    const fileInput = el('input', 'tasks-detail__file-input');
+    fileInput.type = 'file';
+    fileInput.hidden = true;
+    const pickBtn = el('button', 'btn tasks-detail__pick');
+    pickBtn.type = 'button';
+    pickBtn.textContent = '选择文件';
+    const fileName = el('span', 'tasks-detail__file-name muted');
+    fileName.textContent = '未选择文件';
+    const uploadBtn = el('button', 'btn btn--primary');
+    uploadBtn.type = 'button';
+    uploadBtn.textContent = '上传';
+    uploadBtn.disabled = true; // 未选择文件时置灰（列表操作规范：置灰不隐藏）
+    pickBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files && fileInput.files[0];
+      fileName.textContent = f ? f.name : '未选择文件';
+      uploadBtn.disabled = !f;
+    });
+    uploadBtn.addEventListener('click', async () => {
+      if (!fileInput.files || !fileInput.files.length) return;
+      const file = fileInput.files[0];
+      uploadBtn.disabled = true;
+      uploadBtn.textContent = '上传中...';
+      try {
+        await api.task.uploadAttachment(id, file);
+        openDetail(id);
+      } catch (e) {
+        uploadBtn.textContent = '上传';
+        uploadBtn.disabled = false;
+        await modal.alert('上传失败：' + (e && e.message ? e.message : e), { title: '上传' });
+      }
+    });
+    uploadRow.append(fileInput, pickBtn, fileName, uploadBtn);
+    bodyEl.appendChild(uploadRow);
+    form.append(sectionLabel, bodyEl);
+  }
+
   // ---- detail page (independent page at /tasks/{task_id}) ----
   async function openDetail(id) {
     state.view = 'detail';
@@ -590,10 +668,7 @@
       appendDetailList(body, '评论', response.comments, (comment) => [
         formatTaskTime(comment.created_at), detailValue(comment.author), detailValue(comment.body),
       ].join(' | '));
-      appendDetailList(body, '附件', response.attachments, (attachment) => [
-        detailValue(attachment.filename), detailValue(attachment.content_type),
-        attachment.size == null ? '' : `${attachment.size} B`,
-      ].filter(Boolean).join(' | '));
+      appendAttachmentList(body, id, response.attachments);
       if (response.worker_context) appendDetailSection(body, '执行上下文', response.worker_context);
     }
 

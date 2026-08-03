@@ -141,6 +141,7 @@ async def test_artifacts_table_columns(tmp_path):
     expected = {
         "id", "name", "kind", "mime", "content_ref", "inline_content",
         "size", "checksum", "source_kind", "source_ref", "source_context_ref",
+        "source_session_id",
         "summary", "classification", "labels_json", "status", "created_by",
         "created_at", "updated_at",
     }
@@ -373,6 +374,217 @@ async def test_combined_filters(tmp_path):
         q="report",
     )
     assert {a.id for a in page.items} == {"f1"}
+
+
+# ---------------------------------------------------------------------------
+# source_session_id: persistence, migration, filter, backfill query
+# ---------------------------------------------------------------------------
+
+
+async def test_source_session_id_persisted(tmp_path):
+    """source_session_id is written on create and read back on get."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    art = _text_artifact(
+        id="art-sess-1",
+        source_kind=ArtifactSource.TASK_ARTIFACT,
+        source_ref="task:t1:run:1:artifact:0",
+        source_context_ref="t1",
+        source_session_id="task-sess-1",
+        checksum="sha256:" + "11" * 32,
+    )
+    await registry.create_artifact(art)
+    fetched = await registry.get_artifact("art-sess-1")
+    assert fetched is not None
+    assert fetched.source_session_id == "task-sess-1"
+    assert fetched.source_context_ref == "t1"
+
+
+async def test_source_session_id_defaults_null(tmp_path):
+    """Omitting source_session_id stores NULL, read back as None."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    await registry.create_artifact(_text_artifact(id="art-null", checksum="sha256:" + "12" * 32))
+    fetched = await registry.get_artifact("art-null")
+    assert fetched is not None
+    assert fetched.source_session_id is None
+
+
+async def test_source_session_id_migration(tmp_path):
+    """A DB created before the column exists is migrated idempotently."""
+    db = tmp_path / "sessions.db"
+    # Create the artifacts table WITHOUT source_session_id, then construct the
+    # registry which must add the column via the idempotent migration.
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE artifacts (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                mime TEXT NOT NULL,
+                content_ref TEXT,
+                inline_content TEXT,
+                size INTEGER NOT NULL,
+                checksum TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                source_context_ref TEXT,
+                summary TEXT NOT NULL DEFAULT '',
+                classification TEXT,
+                labels_json TEXT,
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    registry = SQLiteArtifactRegistry(str(db))
+    with sqlite3.connect(str(db)) as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(artifacts)")}
+    assert "source_session_id" in cols
+    # Registry is usable after migration.
+    await registry.create_artifact(_text_artifact(
+        id="art-mig", source_session_id="sess-mig",
+        checksum="sha256:" + "13" * 32,
+    ))
+    fetched = await registry.get_artifact("art-mig")
+    assert fetched is not None
+    assert fetched.source_session_id == "sess-mig"
+
+
+async def test_update_artifact_persists_source_session_id(tmp_path):
+    """update_artifact writes source_session_id (used by session backfill)."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    art = _text_artifact(
+        id="art-upd",
+        source_kind=ArtifactSource.TASK_ARTIFACT,
+        source_context_ref="t9",
+        checksum="sha256:" + "14" * 32,
+    )
+    await registry.create_artifact(art)
+    assert art.source_session_id is None
+    from dataclasses import replace as dc_replace
+    updated = await registry.update_artifact(
+        dc_replace(art, source_session_id="task-sess-9")
+    )
+    assert updated.source_session_id == "task-sess-9"
+    fetched = await registry.get_artifact("art-upd")
+    assert fetched is not None
+    assert fetched.source_session_id == "task-sess-9"
+
+
+async def test_list_filter_by_source_session_id(tmp_path):
+    """list_artifacts filters by source_session_id (the panel query)."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    await registry.create_artifact(_text_artifact(
+        id="a1", source_kind=ArtifactSource.TASK_ARTIFACT,
+        source_context_ref="t1", source_session_id="sess-A",
+        checksum="sha256:" + "21" * 32,
+    ))
+    await registry.create_artifact(_binary_artifact(
+        id="a2", source_kind=ArtifactSource.TASK_ATTACHMENT,
+        source_context_ref="t1", source_session_id="sess-A",
+        checksum="sha256:" + "22" * 32,
+    ))
+    await registry.create_artifact(_text_artifact(
+        id="a3", source_kind=ArtifactSource.TASK_ARTIFACT,
+        source_context_ref="t2", source_session_id="sess-B",
+        checksum="sha256:" + "23" * 32,
+    ))
+
+    page = await registry.list_artifacts(source_session_id="sess-A")
+    assert {a.id for a in page.items} == {"a1", "a2"}
+    # Both task source kinds are found (no source_kind filter) -- this is the
+    # behavior the conversation panel relies on.
+    assert {a.source_kind for a in page.items} == {
+        ArtifactSource.TASK_ARTIFACT, ArtifactSource.TASK_ATTACHMENT,
+    }
+
+    page = await registry.list_artifacts(source_session_id="sess-B")
+    assert {a.id for a in page.items} == {"a3"}
+
+    page = await registry.list_artifacts(source_session_id="sess-missing")
+    assert page.items == ()
+
+
+async def test_list_task_artifacts_missing_session(tmp_path):
+    """Backfill query returns only task-source artifacts with NULL session."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    # task_artifact, no session -> should appear
+    await registry.create_artifact(_text_artifact(
+        id="miss1", source_kind=ArtifactSource.TASK_ARTIFACT,
+        source_context_ref="t1", checksum="sha256:" + "31" * 32,
+    ))
+    # task_attachment, no session -> should appear
+    await registry.create_artifact(_binary_artifact(
+        id="miss2", source_kind=ArtifactSource.TASK_ATTACHMENT,
+        source_context_ref="t2", checksum="sha256:" + "32" * 32,
+    ))
+    # task_artifact WITH session -> should NOT appear
+    await registry.create_artifact(_text_artifact(
+        id="has1", source_kind=ArtifactSource.TASK_ARTIFACT,
+        source_context_ref="t3", source_session_id="sess-3",
+        checksum="sha256:" + "33" * 32,
+    ))
+    # manual, no session -> should NOT appear (not a task source)
+    await registry.create_artifact(_text_artifact(
+        id="man1", source_kind=ArtifactSource.MANUAL,
+        checksum="sha256:" + "34" * 32,
+    ))
+
+    missing = await registry.list_task_artifacts_missing_session(limit=200)
+    ids = {a.id for a in missing}
+    assert ids == {"miss1", "miss2"}
+
+    # After backfilling miss1, it drops out of the next query.
+    from dataclasses import replace as dc_replace
+    miss1 = next(a for a in missing if a.id == "miss1")
+    await registry.update_artifact(dc_replace(miss1, source_session_id="sess-1"))
+    missing2 = await registry.list_task_artifacts_missing_session(limit=200)
+    assert {a.id for a in missing2} == {"miss2"}
+
+
+async def test_list_artifacts_with_empty_mime(tmp_path):
+    """Kind backfill query returns only artifacts with empty mime."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    # empty mime (OTHER) -> should appear
+    await registry.create_artifact(_binary_artifact(
+        id="empty1", name="task-output-b.md",
+        kind=ArtifactKind.OTHER, mime="",
+        source_kind=ArtifactSource.TASK_ARTIFACT,
+        source_context_ref="t1", checksum="sha256:" + "41" * 32,
+    ))
+    # empty mime, unknown extension -> should appear (backfill skips it)
+    await registry.create_artifact(_binary_artifact(
+        id="empty2", name="blob.dat",
+        kind=ArtifactKind.OTHER, mime="",
+        checksum="sha256:" + "42" * 32,
+    ))
+    # non-empty mime -> should NOT appear
+    await registry.create_artifact(_text_artifact(
+        id="has1", name="doc.md",
+        kind=ArtifactKind.MARKDOWN, mime="text/markdown",
+        checksum="sha256:" + "43" * 32,
+    ))
+
+    empties = await registry.list_artifacts_with_empty_mime(limit=200)
+    assert {a.id for a in empties} == {"empty1", "empty2"}
+
+    # After backfilling empty1 (mime populated), it drops out of the next query.
+    from dataclasses import replace as dc_replace
+    empty1 = next(a for a in empties if a.id == "empty1")
+    await registry.update_artifact(dc_replace(
+        empty1, mime="text/markdown", kind=ArtifactKind.MARKDOWN,
+    ))
+    empties2 = await registry.list_artifacts_with_empty_mime(limit=200)
+    assert {a.id for a in empties2} == {"empty2"}
 
 
 # ---------------------------------------------------------------------------
@@ -837,3 +1049,245 @@ async def test_list_attachment_sources_pagination(tmp_path):
     assert [s.attachment_id for s in all_sources] == [
         "ta_000", "ta_001", "ta_002", "ta_003", "ta_004",
     ]
+
+
+# ---------------------------------------------------------------------------
+# source_context_ref precise filter
+# ---------------------------------------------------------------------------
+
+
+async def _seed_source_context_ref_data(registry: SQLiteArtifactRegistry) -> None:
+    """Seed artifacts with varied source_kind / source_context_ref for filter tests."""
+    # Session A: two artifacts
+    await registry.create_artifact(_text_artifact(
+        id="sc-session-a-1", source_kind=ArtifactSource.SESSION,
+        source_ref="session-a:art-1", source_context_ref="session-a",
+        updated_at=_dt(2024, 1, 1, 0, 0, 1),
+        checksum="sha256:" + "a1" * 32,
+    ))
+    await registry.create_artifact(_text_artifact(
+        id="sc-session-a-2", source_kind=ArtifactSource.SESSION,
+        source_ref="session-a:art-2", source_context_ref="session-a",
+        updated_at=_dt(2024, 1, 1, 0, 0, 2),
+        checksum="sha256:" + "a2" * 32,
+    ))
+    # Session B: one artifact
+    await registry.create_artifact(_text_artifact(
+        id="sc-session-b-1", source_kind=ArtifactSource.SESSION,
+        source_ref="session-b:art-1", source_context_ref="session-b",
+        updated_at=_dt(2024, 1, 1, 0, 0, 3),
+        checksum="sha256:" + "b1" * 32,
+    ))
+    # Manual with NULL source_context_ref
+    await registry.create_artifact(_text_artifact(
+        id="sc-manual-null", source_context_ref=None,
+        updated_at=_dt(2024, 1, 1, 0, 0, 4),
+        checksum="sha256:" + "c1" * 32,
+    ))
+    # Manual with empty-string source_context_ref
+    await registry.create_artifact(_text_artifact(
+        id="sc-manual-empty", source_context_ref="",
+        updated_at=_dt(2024, 1, 1, 0, 0, 5),
+        checksum="sha256:" + "c2" * 32,
+    ))
+    # Task attachment with source_context_ref="task-1"
+    await registry.create_artifact(_text_artifact(
+        id="sc-task-att-1", source_kind=ArtifactSource.TASK_ATTACHMENT,
+        source_ref="att-1", source_context_ref="task-1",
+        updated_at=_dt(2024, 1, 1, 0, 0, 6),
+        checksum="sha256:" + "d1" * 32,
+    ))
+
+
+async def test_source_context_ref_excludes_other_sessions_kinds_and_null(tmp_path):
+    """source_kind=session + source_context_ref=session-a excludes session B,
+    other source kinds, and NULL context."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    await _seed_source_context_ref_data(registry)
+
+    page = await registry.list_artifacts(
+        source_kind=ArtifactSource.SESSION,
+        source_context_ref="session-a",
+    )
+    ids = {a.id for a in page.items}
+    assert ids == {"sc-session-a-1", "sc-session-a-2"}
+
+
+async def test_source_context_ref_omit_empty_specific_distinguishable(tmp_path):
+    """Omitting, empty string, and a specific value are distinguishable.
+    Empty string only matches empty string, not NULL."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    await _seed_source_context_ref_data(registry)
+
+    all_ids = {
+        "sc-session-a-1", "sc-session-a-2", "sc-session-b-1",
+        "sc-manual-null", "sc-manual-empty", "sc-task-att-1",
+    }
+
+    # Omit -> returns all (no source_context_ref filter)
+    page = await registry.list_artifacts()
+    assert {a.id for a in page.items} == all_ids
+
+    # Empty string -> only the artifact whose source_context_ref == ""
+    page = await registry.list_artifacts(source_context_ref="")
+    assert {a.id for a in page.items} == {"sc-manual-empty"}
+
+    # Specific value -> only session-a artifacts
+    page = await registry.list_artifacts(source_context_ref="session-a")
+    assert {a.id for a in page.items} == {"sc-session-a-1", "sc-session-a-2"}
+
+
+async def test_source_context_ref_combined_with_kind_status_q_is_and(tmp_path):
+    """source_context_ref AND-combines with kind, status, and q filters."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    await _seed_source_context_ref_data(registry)
+
+    # Add a published session-a artifact with a distinctive name
+    await registry.create_artifact(_text_artifact(
+        id="sc-session-a-pub", name="published report",
+        source_kind=ArtifactSource.SESSION,
+        source_ref="session-a:art-pub", source_context_ref="session-a",
+        status=ArtifactStatus.PUBLISHED,
+        updated_at=_dt(2024, 1, 1, 0, 0, 7),
+        checksum="sha256:" + "a7" * 32,
+    ))
+
+    # context + kind
+    page = await registry.list_artifacts(
+        source_context_ref="session-a", kind=ArtifactKind.TEXT,
+    )
+    assert {a.id for a in page.items} == {
+        "sc-session-a-1", "sc-session-a-2", "sc-session-a-pub",
+    }
+
+    # context + status
+    page = await registry.list_artifacts(
+        source_context_ref="session-a", status=ArtifactStatus.PUBLISHED,
+    )
+    assert {a.id for a in page.items} == {"sc-session-a-pub"}
+
+    # context + q
+    page = await registry.list_artifacts(
+        source_context_ref="session-a", q="report",
+    )
+    assert {a.id for a in page.items} == {"sc-session-a-pub"}
+
+    # context + kind + status + q (all AND)
+    page = await registry.list_artifacts(
+        source_context_ref="session-a",
+        kind=ArtifactKind.TEXT,
+        status=ArtifactStatus.PUBLISHED,
+        q="report",
+    )
+    assert {a.id for a in page.items} == {"sc-session-a-pub"}
+
+
+async def test_source_context_ref_with_cursor_and_limit(tmp_path):
+    """source_context_ref + cursor + limit preserves updated_at DESC, id DESC
+    ordering and the next_cursor contract."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    # Create 3 session-a artifacts with distinct updated_at
+    for i in range(3):
+        await registry.create_artifact(_text_artifact(
+            id=f"sc-page-{i}",
+            source_kind=ArtifactSource.SESSION,
+            source_ref=f"session-a:page-{i}",
+            source_context_ref="session-a",
+            updated_at=_dt(2024, 1, 1, 0, 0, i),
+            checksum=f"sha256:{i:064x}",
+        ))
+    # Create a session-b artifact that must NOT appear
+    await registry.create_artifact(_text_artifact(
+        id="sc-page-b",
+        source_kind=ArtifactSource.SESSION,
+        source_ref="session-b:page-b",
+        source_context_ref="session-b",
+        updated_at=_dt(2024, 1, 1, 0, 0, 10),
+        checksum="sha256:" + "bb" * 32,
+    ))
+
+    # Page 1: limit=2 -> newest two session-a artifacts (DESC)
+    page1 = await registry.list_artifacts(
+        source_context_ref="session-a", limit=2,
+    )
+    assert [a.id for a in page1.items] == ["sc-page-2", "sc-page-1"]
+    assert page1.next_cursor is not None
+
+    # Page 2: cursor from page1 -> remaining one session-a artifact
+    page2 = await registry.list_artifacts(
+        source_context_ref="session-a", limit=2, cursor=page1.next_cursor,
+    )
+    assert [a.id for a in page2.items] == ["sc-page-0"]
+    assert page2.next_cursor is None
+
+
+async def test_source_context_ref_omit_matches_existing_behavior(tmp_path):
+    """Omitting source_context_ref yields the same results as before the
+    filter was added (no WHERE clause for source_context_ref)."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+    await _seed_source_context_ref_data(registry)
+
+    # Omit source_context_ref, filter only by source_kind
+    page = await registry.list_artifacts(source_kind=ArtifactSource.SESSION)
+    assert {a.id for a in page.items} == {
+        "sc-session-a-1", "sc-session-a-2", "sc-session-b-1",
+    }
+
+    # Omit source_context_ref, no other filters
+    page = await registry.list_artifacts()
+    assert len(page.items) == 6
+
+
+async def test_source_context_ref_special_chars_precise_match(tmp_path):
+    """Values containing single quotes, double quotes, %, _, backslash, and
+    non-ASCII characters are matched with = (exact). Similar-but-unequal
+    records prove no LIKE expansion or SQL injection."""
+    db = tmp_path / "sessions.db"
+    registry = SQLiteArtifactRegistry(str(db))
+
+    # Exact-value records
+    exact = [
+        ("sc-quote", "O'Brien"),
+        ("sc-dquote", 'say "hello"'),
+        ("sc-percent", "100%"),
+        ("sc-underscore", "session_a"),
+        ("sc-backslash", "path\\to"),
+        ("sc-unicode", "会话-α"),
+    ]
+    for idx, (aid, ctx) in enumerate(exact):
+        await registry.create_artifact(_text_artifact(
+            id=aid, source_kind=ArtifactSource.SESSION,
+            source_ref=f"session:{aid}", source_context_ref=ctx,
+            checksum=f"sha256:{idx:064x}",
+        ))
+
+    # Similar-but-unequal records that WOULD match under LIKE
+    similar = [
+        ("sc-percent-like", "100Xpercent"),    # LIKE '100%' matches
+        ("sc-underscore-like", "sessionXa"),   # LIKE 'session_a' matches
+    ]
+    for idx, (aid, ctx) in enumerate(similar):
+        await registry.create_artifact(_text_artifact(
+            id=aid, source_kind=ArtifactSource.SESSION,
+            source_ref=f"session:{aid}", source_context_ref=ctx,
+            checksum=f"sha256:{(idx + 10):064x}",
+        ))
+
+    # Each exact value matches only its own record
+    for aid, ctx in exact:
+        page = await registry.list_artifacts(source_context_ref=ctx)
+        ids = {a.id for a in page.items}
+        assert ids == {aid}, f"filter by {ctx!r} returned {ids}, expected {{{aid}}}"
+
+    # Percent does NOT match the similar record (no LIKE expansion)
+    page = await registry.list_artifacts(source_context_ref="100%")
+    assert {a.id for a in page.items} == {"sc-percent"}
+
+    # Underscore does NOT match the similar record (no LIKE expansion)
+    page = await registry.list_artifacts(source_context_ref="session_a")
+    assert {a.id for a in page.items} == {"sc-underscore"}

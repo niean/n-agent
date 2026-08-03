@@ -108,6 +108,14 @@ def test_callbacks_injected_when_both_enabled(tmp_path: Path):
     assert services.artifact_service is not None
     # TaskService has the attachment callback
     assert services.task_service._artifact_register_callback is not None
+    # TaskService has the artifact delete callback (cascade on task delete)
+    assert services.task_service._artifact_delete_callback is not None
+    # ArtifactService has the task_exists callback (orphan backfill on startup)
+    assert services.artifact_service._task_exists_callback is not None
+    # ArtifactService has the task_attachment_delete callback (cascade-delete
+    # the source TaskAttachment when a task_attachment artifact is deleted from
+    # the workbench, keeping the task detail page in sync).
+    assert services.artifact_service._task_attachment_delete_callback is not None
     # TaskRunService has the task-artifact callback
     assert services.task_run_service.artifact_register_callback is not None
 
@@ -122,6 +130,7 @@ def test_no_callbacks_when_artifacts_disabled(tmp_path: Path):
     assert services.task_run_service is not None
     assert services.artifact_service is None
     assert services.task_service._artifact_register_callback is None
+    assert services.task_service._artifact_delete_callback is None
     assert services.task_run_service.artifact_register_callback is None
 
 
@@ -169,6 +178,80 @@ def test_attachment_callback_registers_artifact(tmp_path: Path):
     page = asyncio.run(artifact_service.list_artifacts(limit=50))
     source_refs = [a.source_ref for a in page.items]
     assert "ta-regression-1" in source_refs
+
+
+def test_delete_task_cascades_artifacts_out_of_list(tmp_path: Path):
+    """Regression: deleting a task must remove its artifacts from the artifact
+    list. Previously artifacts lived in a separate DB (registered one-way via
+    artifact_register_callback) and survived task deletion, so a deleted task's
+    artifacts kept showing in the list (e.g. e2e-art-*-att2.txt)."""
+    attachments_root = tmp_path / "task-attachments"
+    services = build_application_services(
+        _settings(
+            tmp_path,
+            task_enabled=True,
+            artifacts_enabled=True,
+            task_attachments_root=str(attachments_root),
+        )
+    )
+    task_service = services.task_service
+    artifact_service = services.artifact_service
+
+    task = asyncio.run(task_service.create_task(title="cascade", created_by="u"))
+    asyncio.run(
+        task_service.upload_attachment(
+            task.id, "report.md", b"# Hello", "text/markdown", "alice",
+        )
+    )
+
+    # Artifact registered against the task and visible in the list.
+    page = asyncio.run(artifact_service.list_artifacts(limit=50))
+    assert any(a.source_context_ref == task.id for a in page.items)
+
+    # Delete the task -> its artifacts must no longer appear in the list.
+    asyncio.run(task_service.delete_task(task.id))
+    page = asyncio.run(artifact_service.list_artifacts(limit=50))
+    assert not any(a.source_context_ref == task.id for a in page.items)
+
+
+def test_delete_artifact_cascades_to_task_attachment(tmp_path: Path):
+    """Regression: deleting a task_attachment artifact from the workbench must
+    also delete the underlying TaskAttachment (record + file), otherwise the
+    task detail page still shows the attachment -- the user-reported sync bug.
+    Mirrors test_delete_task_cascades_artifacts_out_of_list in the reverse
+    direction (artifact delete -> task attachment delete)."""
+    attachments_root = tmp_path / "task-attachments"
+    services = build_application_services(
+        _settings(
+            tmp_path,
+            task_enabled=True,
+            artifacts_enabled=True,
+            task_attachments_root=str(attachments_root),
+        )
+    )
+    task_service = services.task_service
+    artifact_service = services.artifact_service
+
+    task = asyncio.run(task_service.create_task(title="cascade", created_by="u"))
+    att = asyncio.run(
+        task_service.upload_attachment(
+            task.id, "report.md", b"# Hello", "text/markdown", "alice",
+        )
+    )
+
+    # Artifact registered against the attachment and visible in the list.
+    page = asyncio.run(artifact_service.list_artifacts(limit=50))
+    art = next(a for a in page.items if a.source_context_ref == task.id)
+    assert art.source_kind.value == "task_attachment"
+    # Attachment file exists on disk.
+    assert (attachments_root / task.id / att.stored_name).exists()
+
+    # Delete the artifact from the workbench -> the task attachment must be gone.
+    asyncio.run(artifact_service.delete_artifact(art.id))
+    assert asyncio.run(task_service.get_attachment(att.id)) is None
+    # And the attachment file removed.
+    assert not (attachments_root / task.id / att.stored_name).exists()
+
 
 
 # ---------------------------------------------------------------------------

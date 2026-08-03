@@ -175,6 +175,10 @@ def create_dashboard_router(
         async def artifacts_shell():
             return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
+        @router.get("/artifacts/{artifact_id}", response_class=HTMLResponse)
+        async def artifacts_detail_shell(artifact_id: str):
+            return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
     if image_store is not None:
         @router.get("/chat/images/{image_id}")
         async def serve_image(image_id: str):

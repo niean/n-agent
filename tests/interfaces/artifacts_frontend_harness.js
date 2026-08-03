@@ -15,8 +15,7 @@
 // - image/PDF blob + fallback
 // - revokeObjectURL on switch/destroy
 // - text save / binary replace refresh via server size/checksum/updated_at
-// - export dropdown by server capabilities (original always; html only for
-//   markdown/document)
+// - export as a single button (original format only; no dropdown)
 // - publish share_url/copy/revoke; binary publish shows explicit-PUBLIC
 //   confirmation
 //
@@ -720,7 +719,7 @@ async function testTextSaveRefreshWithServerMetadata() {
     'refreshed metadata from server shown after save');
 }
 
-async function testExportDropdownCapabilities() {
+async function testExportButtonOriginalOnly() {
   const win = freshEnv();
   // markdown -> original + html
   const a = art('a1', 'markdown', { mime: 'text/markdown' });
@@ -734,11 +733,10 @@ async function testExportDropdownCapabilities() {
   const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
   for (const fn of (item._listeners['click'] || [])) fn({});
   await tick();
-  const text = collectText(byId['tab-artifacts']);
-  ok(/导出|export/i.test(text), 'export dropdown present');
-  // original always available; html only for markdown/document
-  ok(/original|原始/i.test(text), 'export offers original format');
-  ok(/html/i.test(text), 'export offers html for markdown');
+  const exportBtns = findByClass(byId['tab-artifacts'], 'artifacts-detail__export');
+  ok(exportBtns.length === 1, 'single export button present (no dropdown)');
+  ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__export-menu').length,
+    'no export dropdown menu rendered');
 
   // code -> original only (no html)
   const win2 = freshEnv();
@@ -752,9 +750,9 @@ async function testExportDropdownCapabilities() {
   const item2 = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
   for (const fn of (item2._listeners['click'] || [])) fn({});
   await tick();
-  // export dropdown for code: original present, html absent
+  // single export button for code as well
   const exportBtns2 = findByClass(byId['tab-artifacts'], 'artifacts-detail__export');
-  ok(exportBtns2.length > 0, 'export control present for code');
+  ok(exportBtns2.length === 1, 'export control present for code');
 }
 
 async function testPublishShareUrlCopyRevoke() {
@@ -842,6 +840,140 @@ function collectText(node) {
 }
 
 // ---------------------------------------------------------------------------
+// renderListItem export + callback contract (T2)
+// ---------------------------------------------------------------------------
+
+async function testRenderListItemExported() {
+  const win = freshEnv();
+  const a = art('a1', 'markdown', {
+    name: 'Doc1', source_kind: 'session',
+    updated_at: '2026-02-03T04:05:06+00:00',
+  });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  const mod = loadModule(win);
+  ok(typeof mod.renderListItem === 'function', 'renderListItem exported');
+  const item = mod.renderListItem(a);
+  ok(item && typeof item === 'object', 'renderListItem returns a node');
+  ok(item.className.indexOf('artifacts-list__item') !== -1,
+    'returned node has artifacts-list__item class');
+  // icon: kindLabel(kind).slice(0, 2)
+  const icons = findByClass(item, 'artifacts-list__icon');
+  ok(icons.length === 1, 'exactly one icon span');
+  if (icons[0]) {
+    ok(icons[0]._text === 'Ma',
+      'icon text is kindLabel(kind).slice(0,2), got: ' + icons[0]._text);
+  }
+  // name: a.name || a.id
+  const names = findByClass(item, 'artifacts-list__name');
+  ok(names.length === 1, 'exactly one name div');
+  if (names[0]) {
+    ok(names[0]._text === 'Doc1',
+      'name textContent is a.name, got: ' + names[0]._text);
+  }
+  // sub: sourceLabel · fmtTime
+  const subs = findByClass(item, 'artifacts-list__sub');
+  ok(subs.length === 1, 'exactly one sub div');
+  if (subs[0]) {
+    ok(subs[0]._text === '会话 · 2026-02-03 12:05:06',
+      'sub text is sourceLabel · fmtTime, got: ' + subs[0]._text);
+  }
+}
+
+async function testRenderListItemCallbackContract() {
+  const win = freshEnv();
+  const a = art('a1', 'text', { name: 'Doc1' });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
+  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
+  const mod = loadModule(win);
+  await mod.init();
+  await tick();
+  // Select a1 via workbench to set state.selectedId = 'a1'
+  const wbItem = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
+  for (const fn of (wbItem._listeners['click'] || [])) fn({});
+  await tick();
+  // Now state.selectedId === 'a1'. Call renderListItem WITH callback.
+  let callCount = 0;
+  let receivedArg = null;
+  const item = mod.renderListItem(a, function (arg) {
+    callCount++; receivedArg = arg;
+  });
+  // Callback provided => NO active class even though state.selectedId === a1.id
+  ok(!item.classList.contains('artifacts-list__item--active'),
+    'callback path must NOT add active class even when state.selectedId matches');
+  // Count detail fetches before callback click
+  const beforeDetail = fetchLog.filter(
+    (l) => l.url === '/chat/artifacts/a1').length;
+  // Click the item: callback called exactly once with artifact as only arg
+  const listeners = item._listeners['click'] || [];
+  ok(listeners.length > 0, 'callback item has click listener');
+  for (const fn of listeners) fn({ fake: 'dom-event' });
+  ok(callCount === 1, 'callback called exactly once, got ' + callCount);
+  ok(receivedArg === a,
+    'callback receives the artifact object as the only argument (not DOM event)');
+  // selectArtifact must NOT have been called (no new detail fetch)
+  const afterDetail = fetchLog.filter(
+    (l) => l.url === '/chat/artifacts/a1').length;
+  ok(afterDetail === beforeDetail,
+    'no additional detail fetch from callback click (selectArtifact not called)');
+}
+
+async function testRenderListItemDefaultBehavior() {
+  const win = freshEnv();
+  const a1 = art('a1', 'text', { name: 'Doc1' });
+  const a2 = art('a2', 'text', { name: 'Doc2' });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a1, a2], null));
+  route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a1));
+  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello1'));
+  route(/^\/chat\/artifacts\/a2$/, () => jsonResp(a2));
+  route(/^\/chat\/artifacts\/a2\/content/, () => textResp('hello2'));
+  const mod = loadModule(win);
+  await mod.init();
+  await tick();
+  // state.selectedId is null initially: no active class
+  const item = mod.renderListItem(a1);
+  ok(!item.classList.contains('artifacts-list__item--active'),
+    'no active class when state.selectedId is null');
+  // Click: default behavior calls selectArtifact(a1.id)
+  const beforeDetail = fetchLog.filter(
+    (l) => l.url === '/chat/artifacts/a1').length;
+  const listeners = item._listeners['click'] || [];
+  ok(listeners.length > 0, 'default item has click listener');
+  for (const fn of listeners) fn({});
+  await tick();
+  const afterDetail = fetchLog.filter(
+    (l) => l.url === '/chat/artifacts/a1').length;
+  ok(afterDetail === beforeDetail + 1,
+    'default click triggers selectArtifact (detail fetch)');
+  // Now state.selectedId === 'a1'. Render again: active class appears.
+  const itemActive = mod.renderListItem(a1);
+  ok(itemActive.classList.contains('artifacts-list__item--active'),
+    'default path adds active class when state.selectedId === artifact.id');
+  // a2 should NOT have active class
+  const item2 = mod.renderListItem(a2);
+  ok(!item2.classList.contains('artifacts-list__item--active'),
+    'no active class for non-selected artifact');
+}
+
+async function testRenderListItemXssSafety() {
+  const win = freshEnv();
+  const malicious = '<img src=x onerror=alert(1)><script>alert(2)</script>';
+  const a = art('a1', 'text', { name: malicious, source_kind: malicious });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  const mod = loadModule(win);
+  const item = mod.renderListItem(a);
+  // Malicious text must be preserved as textContent, not parsed as HTML
+  const text = collectText(item);
+  ok(text.indexOf(malicious) !== -1,
+    'malicious text preserved as textContent');
+  // No img or script elements created
+  ok(findByTag(item, 'img').length === 0,
+    'no img elements created from malicious name');
+  ok(findByTag(item, 'script').length === 0,
+    'no script elements created from malicious name');
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -866,9 +998,13 @@ const tests = [
   testPdfBlobFallback,
   testRevokeObjectURLOnDestroy,
   testTextSaveRefreshWithServerMetadata,
-  testExportDropdownCapabilities,
+  testExportButtonOriginalOnly,
   testPublishShareUrlCopyRevoke,
   testBinaryPublishConfirmation,
+  testRenderListItemExported,
+  testRenderListItemCallbackContract,
+  testRenderListItemDefaultBehavior,
+  testRenderListItemXssSafety,
 ];
 
 (async () => {

@@ -436,13 +436,14 @@ def test_to_public_view_excludes_for_binary():
 def test_to_public_view_includes_safe_fields():
     art = _text_artifact(
         source_context_ref="session:abc",
+        source_session_id="task-sess-1",
         classification="internal",
         labels=("doc", "v1"),
     )
     view = art.to_public_view()
     expected_safe = {
         "id", "name", "kind", "mime", "size", "checksum",
-        "source_kind", "source_context_ref", "summary",
+        "source_kind", "source_context_ref", "source_session_id", "summary",
         "classification", "labels", "status",
         "created_at", "updated_at", "created_by",
     }
@@ -450,6 +451,7 @@ def test_to_public_view_includes_safe_fields():
     assert view["id"] == "art-1"
     assert view["source_kind"] == ArtifactSource.MANUAL
     assert view["source_context_ref"] == "session:abc"
+    assert view["source_session_id"] == "task-sess-1"
     assert view["labels"] == ("doc", "v1")
 
 
@@ -588,6 +590,7 @@ class FakeArtifactRegistry:
         self,
         *,
         source_kind: ArtifactSource | None = None,
+        source_context_ref: str | None = None,
         kind: ArtifactKind | None = None,
         status: ArtifactStatus | None = None,
         q: str | None = None,
@@ -597,6 +600,8 @@ class FakeArtifactRegistry:
         items: list[Artifact] = list(self._artifacts.values())
         if source_kind is not None:
             items = [a for a in items if a.source_kind == source_kind]
+        if source_context_ref is not None:
+            items = [a for a in items if a.source_context_ref == source_context_ref]
         if kind is not None:
             items = [a for a in items if a.kind == kind]
         if status is not None:
@@ -744,6 +749,38 @@ async def test_fake_registry_all_methods_callable():
     assert revoked is not None
     assert revoked.status is PublishedArtifactStatus.REVOKED
     assert await reg.list_attachment_sources() == ()
+
+
+async def test_fake_registry_source_context_ref_filters():
+    """The Protocol test fake accepts and applies the source_context_ref
+    keyword, filtering with == (not (x or '') ==)."""
+    reg = FakeArtifactRegistry()
+    await reg.create_artifact(_text_artifact(
+        id="ctx-a", source_kind=ArtifactSource.SESSION,
+        source_ref="session-a:1", source_context_ref="session-a",
+    ))
+    await reg.create_artifact(_text_artifact(
+        id="ctx-b", source_kind=ArtifactSource.SESSION,
+        source_ref="session-b:2", source_context_ref="session-b",
+    ))
+    await reg.create_artifact(_text_artifact(
+        id="ctx-null", source_context_ref=None,
+    ))
+    await reg.create_artifact(_text_artifact(
+        id="ctx-empty", source_context_ref="",
+    ))
+
+    # Specific value -> only matching record
+    page = await reg.list_artifacts(source_context_ref="session-a")
+    assert {a.id for a in page.items} == {"ctx-a"}
+
+    # Empty string -> only empty-string record, NOT NULL
+    page = await reg.list_artifacts(source_context_ref="")
+    assert {a.id for a in page.items} == {"ctx-empty"}
+
+    # Omit -> all records
+    page = await reg.list_artifacts()
+    assert len(page.items) == 4
 
 
 async def test_fake_content_store_all_methods_callable():

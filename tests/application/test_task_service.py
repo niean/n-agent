@@ -659,6 +659,46 @@ async def test_delete_task_cleans_execution_session(svc, registry):
     assert svc.memory_store.deleted_sessions == ["task-t_exec"]
 
 
+@pytest.mark.asyncio
+async def test_delete_task_calls_artifact_delete_callback(registry, tmp_path):
+    """delete_task best-effort calls artifact_delete_callback(task_id) to remove
+    artifacts registered against the task in the separate artifacts DB."""
+    calls: list[str] = []
+
+    async def delete_callback(task_id: str) -> None:
+        calls.append(task_id)
+
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        artifact_delete_callback=delete_callback,
+    )
+    task = await svc.create_task(title="x", created_by="u")
+    await svc.delete_task(task.id)
+    assert calls == [task.id]
+
+
+@pytest.mark.asyncio
+async def test_delete_task_artifact_delete_callback_failure_does_not_block(registry, tmp_path):
+    """artifact_delete_callback failure is best-effort: task deletion still succeeds."""
+    async def delete_callback(task_id: str) -> None:
+        raise RuntimeError("artifact DB down")
+
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        artifact_delete_callback=delete_callback,
+    )
+    task = await svc.create_task(title="x", created_by="u")
+    deleted = await svc.delete_task(task.id)
+    assert deleted is True
+    assert await registry.get_task(task.id) is None
+
+
 # ---------------------------------------------------------------------------
 # propose_change / approve / reject
 # ---------------------------------------------------------------------------
