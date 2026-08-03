@@ -15,6 +15,7 @@ def _settings(tmp_path: Path) -> Settings:
         skills_root=str(tmp_path / "skills"),
         scheduler_enabled=False,
         feishu_enabled=False,
+        artifacts_enabled=False,
     )
 
 

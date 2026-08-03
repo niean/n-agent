@@ -153,6 +153,7 @@ class TaskService:
         attachment_task_max_bytes: int = _DEFAULT_ATTACHMENT_TASK_MAX_BYTES,
         lifecycle_writer: Callable[[str, str, dict[str, Any] | None], Awaitable[Any]] | None = None,
         task_config_provider: TaskConfigProvider | None = None,
+        artifact_register_callback: Callable[[TaskAttachment], Awaitable[None]] | None = None,
     ):
         self.registry = registry
         self.policy = policy
@@ -165,6 +166,7 @@ class TaskService:
         self.attachment_task_max_bytes = attachment_task_max_bytes
         self._run_service: Any = None
         self._task_config_provider = task_config_provider
+        self._artifact_register_callback = artifact_register_callback
 
     async def _snapshot(self) -> TaskConfig:
         if self._task_config_provider is not None:
@@ -886,7 +888,35 @@ class TaskService:
             task_id, "attachment_uploaded",
             {"attachment_id": attachment.id, "filename": filename},
         )
+        # T9: best-effort artifact register callback. Called after BOTH the
+        # file write AND registry.add_attachment succeed; does NOT participate
+        # in the attachment DB transaction. Failures only log a warning with
+        # safe fields (source_kind, attachment_id, exception type).
+        await self._invoke_artifact_register_callback(attachment)
         return attachment
+
+    async def _invoke_artifact_register_callback(
+        self, attachment: TaskAttachment,
+    ) -> None:
+        """Best-effort invocation of the artifact register callback (T9).
+
+        Called after the attachment file write AND ``registry.add_attachment``
+        both succeed. The callback does NOT participate in the attachment DB
+        transaction. On failure, logs a warning with ONLY safe fields
+        (source_kind, attachment_id, exception type) -- never content,
+        stored_name, filename, or absolute paths. The upload return value is
+        unchanged regardless of callback outcome.
+        """
+        if self._artifact_register_callback is None:
+            return
+        try:
+            await self._artifact_register_callback(attachment)
+        except Exception as exc:
+            logger.warning(
+                "artifact_register_callback failed: "
+                "source_kind=task_attachment, attachment_id=%s, error_type=%s",
+                attachment.id, type(exc).__name__,
+            )
 
     async def list_attachments(self, task_id: str) -> tuple[TaskAttachment, ...]:
         await self.get_task(task_id)

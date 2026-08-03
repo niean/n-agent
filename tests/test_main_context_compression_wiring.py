@@ -22,6 +22,7 @@ def _settings(tmp_path: Path, *, compression_enabled: bool = True) -> Settings:
         scheduler_enabled=False,
         feishu_enabled=False,
         context_compression_enabled=compression_enabled,
+        artifacts_enabled=False,
     )
 
 

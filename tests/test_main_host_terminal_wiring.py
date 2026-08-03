@@ -13,6 +13,7 @@ def _settings(tmp_path: Path, **updates):
         sqlite_path=tmp_path / "sessions.db", workspace_root=tmp_path / "workspace",
         skills_root=tmp_path / "workspace" / "skills", plugins_root=tmp_path / "plugins",
         scheduler_enabled=False, feishu_enabled=False, sandbox_enabled=False,
+        artifacts_enabled=False,
     )
     values.update(updates)
     return Settings(**values)

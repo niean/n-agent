@@ -72,6 +72,7 @@
 - NFR
     - 文档：Browser Use，容器/本地CDP 工作原理
 - FR
+    - 制品：[KF]Artifact 制品工作台，将附件和 Artifact 升级为可预览、编辑、导出和发布的结果交付体系。产品功能参考Hermes、Manus、Workbuddy
 
 
 ---
@@ -85,10 +86,9 @@
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 任务：LLM请求未命中缓存读，分析原因
 - FR
-    - 沙盒：远程沙盒，包括云沙盒、私有VM沙盒
-    - 调度：多 Agent 委派与并行，在现有 Task 基础上建立任务拆解、并发执行和结果聚合，MoA
-    - 任务：Artifact 制品工作台，将附件和 Artifact 元数据升级为可预览、编辑、导出和发布的结果交付体系
     - 任务：持久化执行环境，让任务拥有可休眠、恢复、快照和远程运行的 Workspace
+    - 调度：多 Agent 委派与并行，在现有 Task 基础上建立任务拆解、并发执行和结果聚合，MoA
+    - 沙盒：远程沙盒，包括云沙盒、私有VM沙盒
     - 工具：Computer Use(MacOS)
     - 管理：接入配置，秘钥Store(类似平台)
     - 产品：对标Manus，Project、Tenant(低优)

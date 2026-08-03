@@ -52,6 +52,7 @@ def _settings(tmp_path: Path, **updates) -> Settings:
         # cross-field validation in Settings. Tests that need a different
         # backend can override browser_container_endpoint / browser_default_backend.
         browser_container_endpoint="http://browser:9222",
+        artifacts_enabled=False,
     )
     values.update(updates)
     return Settings(**values)

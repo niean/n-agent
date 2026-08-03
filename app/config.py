@@ -1,5 +1,6 @@
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator, model_validator
@@ -227,6 +228,14 @@ class Settings(BaseSettings):
     browser_takeover_ttl_seconds: int = Field(default=60, gt=0)
     browser_trusted_dev: bool = Field(default=False)
 
+    # Artifact 制品工作台配置
+    artifacts_enabled: bool = Field(default=True)
+    artifacts_root: Path = Field(default=Path("/app/locals/artifacts"))
+    artifact_max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    artifact_publish_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    artifact_inline_max_bytes: int = Field(default=256 * 1024, gt=0)
+    published_base_url: str = Field(default="")
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @field_validator("sandbox_type")
@@ -320,6 +329,62 @@ class Settings(BaseSettings):
                 )
         return self
 
+    @model_validator(mode="after")
+    def _validate_artifact_size_bounds(self) -> "Settings":
+        if self.artifact_publish_max_bytes > self.artifact_max_bytes:
+            raise ValueError(
+                "artifact_publish_max_bytes must be <= artifact_max_bytes"
+            )
+        if self.artifact_inline_max_bytes > self.artifact_max_bytes:
+            raise ValueError(
+                "artifact_inline_max_bytes must be <= artifact_max_bytes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_published_base_url(self) -> "Settings":
+        """Validate/normalize published_base_url to either empty string or an
+        http/https origin with no path/query/fragment/userinfo. A trailing
+        slash on an otherwise clean origin is stripped; any other path is
+        rejected. Relative URLs (no scheme/netloc) are rejected.
+        """
+        url = self.published_base_url
+        if url == "":
+            return self
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"published_base_url must be an http/https origin "
+                f"(invalid scheme: {parsed.scheme!r})"
+            )
+        if not parsed.netloc:
+            raise ValueError(
+                "published_base_url must include a host "
+                "(relative URLs are not allowed)"
+            )
+        if parsed.username or parsed.password:
+            raise ValueError(
+                "published_base_url must not contain userinfo"
+            )
+        if parsed.path not in ("", "/"):
+            raise ValueError(
+                f"published_base_url must not contain a path "
+                f"(got: {parsed.path!r})"
+            )
+        if parsed.query:
+            raise ValueError(
+                f"published_base_url must not contain a query "
+                f"(got: {parsed.query!r})"
+            )
+        if parsed.fragment:
+            raise ValueError(
+                f"published_base_url must not contain a fragment "
+                f"(got: {parsed.fragment!r})"
+            )
+        # normalize: scheme://netloc, strip trailing slash
+        self.published_base_url = f"{parsed.scheme}://{parsed.netloc}"
+        return self
+
     @field_validator(
         "sqlite_path", "workspace_root", "skills_root", "plugins_root",
         "sandbox_docker_host_workspace_root", "sandbox_docker_host_locals_root",
@@ -330,6 +395,7 @@ class Settings(BaseSettings):
         "host_terminal_host_skills_root",
         "task_attachments_root",
         "browser_host_bridge_token_path",
+        "artifacts_root",
         mode="before",
     )
     @classmethod

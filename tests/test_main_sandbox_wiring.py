@@ -18,6 +18,7 @@ def test_build_application_services_wires_sandbox(tmp_path: Path):
         sandbox_enabled=True,
         sandbox_type="local",
         sandbox_scratch_root=str(tmp_path / "scratch"),
+        artifacts_enabled=False,
     )
 
     services = build_application_services(settings)
@@ -40,6 +41,7 @@ def test_build_application_services_sandbox_disabled(tmp_path: Path):
         scheduler_enabled=False,
         feishu_enabled=False,
         sandbox_enabled=False,
+        artifacts_enabled=False,
     )
 
     services = build_application_services(settings)
@@ -64,6 +66,7 @@ def test_terminal_definition_fields_when_sandbox_enabled(tmp_path: Path):
         sandbox_enabled=True,
         sandbox_type="local",
         sandbox_scratch_root=str(tmp_path / "scratch"),
+        artifacts_enabled=False,
     )
 
     services = build_application_services(settings)
@@ -90,6 +93,7 @@ def test_terminal_input_schema_structure(tmp_path: Path):
         sandbox_enabled=True,
         sandbox_type="local",
         sandbox_scratch_root=str(tmp_path / "scratch"),
+        artifacts_enabled=False,
     )
 
     services = build_application_services(settings)
@@ -116,6 +120,7 @@ def test_terminal_route_registered_when_sandbox_enabled(tmp_path: Path):
         sandbox_enabled=True,
         sandbox_type="local",
         sandbox_scratch_root=str(tmp_path / "scratch"),
+        artifacts_enabled=False,
     )
 
     services = build_application_services(settings)
@@ -137,6 +142,7 @@ def test_health_snapshot_includes_sandbox(tmp_path: Path):
         sandbox_enabled=True,
         sandbox_type="local",
         sandbox_scratch_root=str(tmp_path / "scratch"),
+        artifacts_enabled=False,
     )
 
     services = build_application_services(settings)

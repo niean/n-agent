@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -1072,3 +1072,53 @@ Container Browser 的 CDP `9222` 是后端自动化控制面，noVNC `6080` 是�
 安全不变量：6080/9222 不映射宿主端口；capability 不转发到 noVNC、不写日志/模型消息/localStorage；HTTP 与 WebSocket 均校验同源、actor、session 绑定和 TTL；资源路径拒绝绝对路径/穿越/反斜杠/NUL，HTTP 响应有大小与响应头白名单；Release/Close 撤销能力。noVNC 的默认相对 `websockify` 路径会相对同源 iframe URL 解析到该 Browser Session 的代理端点，因此无需改 noVNC 静态资源。
 
 Release 不能只切换状态：人工导航/输入绕过 `execute_action()`，不会触发 element index、`document_revision` 和 Dashboard screenshot 的正常更新钩子。Container backend 在 `end_takeover()` 中必须持有 page lock，失效接管前 element refs、递增 revision 并采集同一 live page；Host CDP 则由 Host Bridge 调用受控 Chrome controller 建立相同的新自动化边界，并在受限响应中返回截图。BrowserService 在恢复 active 前持久化新截图，失败时清除旧 ref，禁止把接管前截图继续冒充实时画面。
+
+## 模式二十二：Artifact 制品工作台 write-through 注册与 publish 封口
+
+Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 preview/edit/export/publish（可分享持久链接）能力。核心实现约束围绕 write-through 注册、publish 快照独立、publish 封口、content_ref 不透明方案、公开路由隔离和启动 backfill 六个方面。
+
+规则：
+
+1. write-through 注册（TaskAttachment/TaskArtifact -> Artifact）：
+   - TaskService 附件上传与 TaskRunService TaskArtifact 产出时，通过注入的 `artifact_register_callback` 回调 ArtifactService.register_from_attachment/register_from_task_artifact，幂等注册为 Artifact。
+   - 幂等键为 `(source_kind, source_ref)`，ArtifactRegistry 的 unique index 保证不重复注册；已注册的 source 直接跳过。
+   - best-effort：回调失败不回滚主流程（附件上传或 TaskArtifact 产出仍成功），仅记录 warning。回调是旁路通知，不阻塞主路径。
+   - source_ref 格式：task_attachment 用 `attachment:{task_id}/{stored_name}`，task_artifact 用 `task:{task_id}:run:{run_id}:artifact:{ordinal}`。
+
+2. publish 快照独立（PublishedArtifact nullable FK ON DELETE SET NULL）：
+   - PublishedArtifact.artifact_id 是 nullable FK，ON DELETE SET NULL；源 Artifact 删除后快照存活，公开链接不失效。
+   - 快照字段（snapshot_name/kind/mime/content_ref/inline_content/size/checksum）在发布时固化，不可变；仅 status 与 revoked_at 可变。
+   - 内容快照写入 `{artifacts_root}/published/{publish_id}/`，独立于源 Artifact 的 `{artifacts_root}/items/{artifact_id}/` 目录。
+   - 部分唯一索引 `WHERE status='active' AND artifact_id IS NOT NULL` 保证每 artifact 至多一个 active 发布；replacement publish 在单事务内 revoke old + insert new。
+
+3. publish 封口（ArtifactPolicy 准入 + InformationFlowService.release(PUBLIC_ARTIFACT)）：
+   - ArtifactPolicy 评估 publish 准入：archived DENY、content_unavailable DENY、size_over_limit DENY、kind_not_publishable DENY（`other` 不可发布）、binary 需 classification=public 且无 sensitive/secret labels。
+   - text 发布内容释放委托 InformationFlowService.release(PUBLIC_ARTIFACT)：SECRET/SENSITIVE DENY、known-secret text 经 redaction 后 ALLOW、无 secret text ALLOW raw。PUBLIC_ARTIFACT 分支不 fall through 到 generic default-allow。
+   - binary 发布不经 InformationFlowService（binary 无 text 内容需脱敏），由 ArtifactPolicy 的 classification=public 门禁独立控制。
+   - publish 幂等：(artifact_id, current_checksum) 匹配 active publish checksum 时 reuse=True，返回已有 publish_id 不新建快照。
+
+4. content_ref 不透明方案（item:/published:/attachment:/workspace:）：
+   - content_ref 是 ArtifactContentStore 返回的不透明字符串，caller 不解析其结构。scheme 取值：item（owned，可删）、published（快照，可删）、attachment（只读源引用）、workspace（只读源引用）。
+   - 磁盘文件名 server-generated（uuid4 hex + safe ext），客户端 filename 仅展示用，不作为磁盘路径。所有路径解析 per-component lstat 校验，拒绝 symlink 组件。
+   - delete_owned 仅接受 item/published ref；attachment/workspace ref 只读不可删（源文件生命周期由 Task 子系统管理）。
+   - materialize_source 把 attachment/workspace 源文件流式拷贝到 owned 存储后返回 item ref，不修改源文件。
+
+5. 公开路由隔离（/p/{publish_id} 只读快照，不读源）：
+   - 公开未认证路由 `GET /p/{publish_id}` 与 `GET /p/{publish_id}/content` 只读 PublishedArtifact 快照，不读源 Artifact、不访问 ArtifactRegistry.get_artifact。
+   - publish_id 正则 `^[A-Za-z0-9_-]{22,64}$`（>=128-bit URL-safe），invalid -> 404（不泄露存在性）。active -> 200、revoked -> 410、not-found -> 404。
+   - 不信任 Host/X-Forwarded-Host header（share_url 由 ArtifactService 用配置的 published_base_url 计算，不由路由从请求构造）。
+   - 渲染安全：markdown 经 safe HTML 转换、HTML snapshot escaped sandbox="" iframe srcdoc（NO allow-* permissions）、plain text escaped `<pre>`、binary controlled /content URL（不在页面读取 binary 内容）。
+   - 所有响应 Cache-Control: no-store + CSP + nosniff + no-referrer。
+
+6. 启动 backfill（幂等游标重扫，不 gated on table-empty）：
+   - ArtifactService.backfill_attachments 在 main.py lifespan 启动期执行，通过 ArtifactRegistry.list_attachment_sources 游标分页重扫 task_attachments 表。
+   - 幂等：已注册的 (source_kind, source_ref) 跳过；每次启动都扫（不判断 artifacts 表是否为空），支持运行期新增附件后重启补建。
+   - 单条失败 continue（per-item try/except），不中断整体 backfill；返回 processed/created 统计。
+
+陷阱：
+- write-through 回调失败时回滚主流程会让附件上传因 Artifact 子系统故障而失败，违背 best-effort 旁路语义；正确做法是 catch + warning + 主流程继续。
+- publish 时只检查 ArtifactPolicy 而不调 InformationFlowService.release(PUBLIC_ARTIFACT) 会让 SECRET/SENSITIVE 文本内容以 raw 形式发布到公开链接，绕过信息流封口。
+- 公开路由读源 Artifact 会让源 Artifact 删除后公开链接 404，破坏快照独立语义；必须只读 PublishedArtifact 快照。
+- delete_owned 接受 attachment/workspace ref 会意外删除 Task 子系统管理的源文件（附件/工作区产出），破坏 Task 数据完整性。
+- backfill gated on table-empty 会让运行期新增附件在重启前无法补建为 Artifact；必须每次启动都扫。
+- published_base_url 由路由从 Host header 构造会让攻击者通过伪造 Host 注入恶意 share_url；必须由 service 用配置值计算。

@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 from pydantic import ValidationError
@@ -212,6 +213,7 @@ def test_create_app_with_enabled_kb_configuration(tmp_path: Path, monkeypatch: p
             provider_model="test-model",
             sqlite_path=str(tmp_path / "sessions.db"),
             workspace_root=str(tmp_path),
+            artifacts_root=str(tmp_path / "artifacts"),
             kb_enabled=True,
             kb_base_url="http://kb.test",
         )
@@ -770,3 +772,218 @@ def test_browser_validation_skipped_when_disabled(tmp_path: Path):
     )
     assert s.browser_enabled is False
     assert s.browser_container_endpoint == ""
+
+
+# ---------------------------------------------------------------------------
+# Artifact workbench (Task 1: config & runtime deps)
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_ENV_KEYS = (
+    "N_AGENT_ARTIFACTS_ENABLED",
+    "N_AGENT_ARTIFACTS_ROOT",
+    "N_AGENT_ARTIFACT_MAX_BYTES",
+    "N_AGENT_ARTIFACT_PUBLISH_MAX_BYTES",
+    "N_AGENT_ARTIFACT_INLINE_MAX_BYTES",
+    "N_AGENT_PUBLISHED_BASE_URL",
+)
+
+
+def _clean_artifact_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _ARTIFACT_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_settings_artifact_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clean_artifact_env(monkeypatch)
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+    assert s.artifacts_enabled is True
+    assert s.artifacts_root == Path("/app/locals/artifacts")
+    assert s.artifact_max_bytes == 20 * 1024 * 1024
+    assert s.artifact_publish_max_bytes == 10 * 1024 * 1024
+    assert s.artifact_inline_max_bytes == 256 * 1024
+    assert s.published_base_url == ""
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"artifact_max_bytes": 0},
+    {"artifact_max_bytes": -1},
+    {"artifact_publish_max_bytes": 0},
+    {"artifact_publish_max_bytes": -1},
+    {"artifact_inline_max_bytes": 0},
+    {"artifact_inline_max_bytes": -1},
+])
+def test_settings_artifact_size_limits_must_be_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kwargs: dict
+):
+    _clean_artifact_env(monkeypatch)
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            **kwargs,
+        )
+
+
+def test_settings_artifact_publish_max_le_max(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clean_artifact_env(monkeypatch)
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            artifact_max_bytes=100,
+            artifact_publish_max_bytes=101,
+            artifact_inline_max_bytes=50,
+        )
+
+
+def test_settings_artifact_inline_max_le_max(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clean_artifact_env(monkeypatch)
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            artifact_max_bytes=100,
+            artifact_inline_max_bytes=101,
+            artifact_publish_max_bytes=50,
+        )
+
+
+def test_settings_artifact_publish_equal_max_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clean_artifact_env(monkeypatch)
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        artifact_max_bytes=100,
+        artifact_publish_max_bytes=100,
+        artifact_inline_max_bytes=50,
+    )
+    assert s.artifact_publish_max_bytes == 100
+
+
+def test_settings_artifact_inline_equal_max_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clean_artifact_env(monkeypatch)
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        artifact_max_bytes=100,
+        artifact_inline_max_bytes=100,
+        artifact_publish_max_bytes=50,
+    )
+    assert s.artifact_inline_max_bytes == 100
+
+
+def test_settings_artifacts_root_path_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clean_artifact_env(monkeypatch)
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        artifacts_root="/tmp/artifacts",
+    )
+    assert s.artifacts_root == Path("/tmp/artifacts")
+
+
+def test_settings_artifacts_root_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clean_artifact_env(monkeypatch)
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ROOT", "/tmp/env-artifacts")
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+    assert s.artifacts_root == Path("/tmp/env-artifacts")
+
+
+def test_settings_artifact_env_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clean_artifact_env(monkeypatch)
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_ARTIFACT_MAX_BYTES", "1024")
+    monkeypatch.setenv("N_AGENT_ARTIFACT_PUBLISH_MAX_BYTES", "512")
+    monkeypatch.setenv("N_AGENT_ARTIFACT_INLINE_MAX_BYTES", "128")
+    monkeypatch.setenv("N_AGENT_PUBLISHED_BASE_URL", "https://cdn.example.com")
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+    )
+    assert s.artifacts_enabled is False
+    assert s.artifact_max_bytes == 1024
+    assert s.artifact_publish_max_bytes == 512
+    assert s.artifact_inline_max_bytes == 128
+    assert s.published_base_url == "https://cdn.example.com"
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://example.com", "https://example.com"),
+    ("http://localhost:8201", "http://localhost:8201"),
+    ("https://example.com/", "https://example.com"),
+    ("http://example.com:8080", "http://example.com:8080"),
+])
+def test_settings_published_base_url_accepts_valid_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str, expected: str
+):
+    _clean_artifact_env(monkeypatch)
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        published_base_url=url,
+    )
+    assert s.published_base_url == expected
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://example.com",              # non-http scheme
+    "file:///etc/passwd",             # non-http scheme
+    "https://example.com/foo",        # path
+    "https://example.com?q=1",        # query
+    "https://example.com#frag",       # fragment
+    "https://user:pass@example.com",  # userinfo
+    "example.com",                    # relative, no scheme
+    "//example.com",                  # relative, no scheme
+    "/just/path",                     # relative path
+    "https://",                       # no host
+])
+def test_settings_published_base_url_rejects_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, url: str
+):
+    _clean_artifact_env(monkeypatch)
+    with pytest.raises(ValidationError):
+        Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            published_base_url=url,
+        )
+
+
+def test_settings_published_base_url_empty_is_valid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clean_artifact_env(monkeypatch)
+    s = Settings(
+        sqlite_path=str(tmp_path / "sessions.db"),
+        workspace_root=str(tmp_path),
+        _env_file=None,
+        published_base_url="",
+    )
+    assert s.published_base_url == ""

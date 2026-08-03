@@ -35,6 +35,7 @@ def _settings(tmp_path: Path, *, task_enabled: bool = True) -> Settings:
         scheduler_enabled=False,
         feishu_enabled=False,
         task_enabled=task_enabled,
+        artifacts_enabled=False,
     )
 
 

@@ -25,6 +25,7 @@ from app.domain.task import (
     ProposalResolutionResult,
     RecoverRunCommand,
     Task,
+    TaskAttachment,
     TaskClaimError,
     TaskComment,
     TaskConflictError,
@@ -1700,6 +1701,132 @@ async def test_delete_attachment(svc):
     att = await svc.upload_attachment(task.id, "r.md", b"hello", "text/markdown", "u")
     deleted = await svc.delete_attachment(att.id)
     assert deleted is True
+
+
+# ---------------------------------------------------------------------------
+# T9: artifact_register_callback (best-effort, after file write + DB add)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_artifact_register_callback_called_once_with_attachment(
+    registry, tmp_path,
+):
+    """After file write + add_attachment succeed, callback is called exactly
+    once with the real TaskAttachment."""
+    calls: list = []
+
+    async def callback(att: TaskAttachment) -> None:
+        calls.append(att)
+
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        artifact_register_callback=callback,
+    )
+    task = await svc.create_task(title="x", created_by="u")
+    att = await svc.upload_attachment(
+        task.id, "report.md", b"# Hello", "text/markdown", "alice",
+    )
+
+    assert len(calls) == 1
+    called = calls[0]
+    assert called.id == att.id
+    assert called.task_id == task.id
+    assert called.filename == "report.md"
+    assert called.size == 7
+    assert called.checksum == att.checksum
+    assert called.stored_name == att.stored_name
+
+    # Existing event-writing semantics unchanged
+    events = await registry.list_events(task.id)
+    assert any(e.kind == "attachment_uploaded" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_artifact_register_callback_none_preserves_old_behavior(
+    registry, tmp_path,
+):
+    """When callback is None (default), upload_attachment behaves as before."""
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+    )
+    task = await svc.create_task(title="x", created_by="u")
+    att = await svc.upload_attachment(
+        task.id, "report.md", b"# Hello", "text/markdown", "alice",
+    )
+    assert att.filename == "report.md"
+    assert att.size == 7
+    listed = await svc.list_attachments(task.id)
+    assert len(listed) == 1
+    assert listed[0].id == att.id
+
+
+@pytest.mark.asyncio
+async def test_artifact_register_callback_failure_logs_warning_and_preserves_upload(
+    registry, tmp_path, caplog,
+):
+    """Callback failure -> warning logged (safe fields only), file/DB record
+    NOT deleted, return value unchanged."""
+
+    async def failing_callback(att: TaskAttachment) -> None:
+        raise RuntimeError("BOOM-SECRET-MESSAGE-XYZ")
+
+    svc = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        artifact_register_callback=failing_callback,
+    )
+    task = await svc.create_task(title="x", created_by="u")
+
+    secret_content = b"TOPSECRET-CONTENT-DO-NOT-LEAK"
+    secret_filename = "leaky-filename.md"
+
+    with caplog.at_level(logging.WARNING, logger="app.application.task_service"):
+        att = await svc.upload_attachment(
+            task.id, secret_filename, secret_content, "text/markdown", "alice",
+        )
+
+    # Return value unchanged
+    assert att.filename == secret_filename
+    assert att.size == len(secret_content)
+
+    # DB record NOT deleted
+    listed = await svc.list_attachments(task.id)
+    assert len(listed) == 1
+    assert listed[0].id == att.id
+
+    # File NOT deleted
+    file_path = svc.get_attachment_path(task.id, att.stored_name)
+    assert file_path is not None
+    assert file_path.exists()
+
+    # Warning logged with safe fields
+    log_text = caplog.text
+    assert "artifact_register_callback failed" in log_text
+    assert "source_kind=task_attachment" in log_text
+    assert att.id in log_text
+    assert "RuntimeError" in log_text
+
+    # Sensitive fields must NOT appear in the warning
+    assert "TOPSECRET-CONTENT-DO-NOT-LEAK" not in log_text  # content
+    assert secret_filename not in log_text  # filename
+    assert att.stored_name not in log_text  # stored_name
+    assert "BOOM-SECRET-MESSAGE-XYZ" not in log_text  # exception message
+    # Absolute paths must NOT appear
+    assert str(tmp_path) not in log_text
+    assert str(svc.attachments_root) not in log_text
+
+    # Existing event-writing semantics unchanged
+    events = await registry.list_events(task.id)
+    assert any(e.kind == "attachment_uploaded" for e in events)
 
 
 # ---------------------------------------------------------------------------

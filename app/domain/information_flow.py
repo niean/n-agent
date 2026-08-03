@@ -32,6 +32,7 @@ class ReleaseTarget(str, Enum):
     USAGE_RETENTION = "usage_retention"
     LLM_PAYLOAD_LOG = "llm_payload_log"
     CLIENT_RESPONSE = "client_response"
+    PUBLIC_ARTIFACT = "public_artifact"
 
 
 # Standard credential field names whose values should be redacted in

@@ -22,6 +22,7 @@ def _settings(tmp_path: Path, *, feishu_enabled: bool) -> Settings:
         feishu_tenant_key="tenant-1",
         feishu_allowed_open_ids=["ou_a", "ou_b"],
         feishu_allowed_chat_ids=["oc_a"],
+        artifacts_enabled=False,
     )
 
 

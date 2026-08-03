@@ -12,6 +12,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("N_AGENT_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("N_AGENT_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_FEISHU_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
     # 用 with 触发 FastAPI lifespan（startup/shutdown）
     with TestClient(create_app()) as c:
         yield c
@@ -41,6 +42,7 @@ def test_active_provider_loaded_after_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("N_AGENT_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("N_AGENT_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_FEISHU_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
     with TestClient(create_app()) as client1:
         create = client1.post("/chat/external-memory/providers", json={
             "name": "h", "provider_type": "holographic",

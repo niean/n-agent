@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import pytest
+
 from app.application.mcp_service import McpToolExecutor
 from app.domain.tool import ToolSourceType
 from app.main import build_application_services
+
+
+@pytest.fixture(autouse=True)
+def _disable_artifacts(monkeypatch):
+    """Disable the artifact subsystem to avoid requiring /app/locals/artifacts."""
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
 
 
 def test_plugin_service_wired():

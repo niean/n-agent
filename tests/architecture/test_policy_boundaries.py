@@ -35,6 +35,7 @@ POLICY_FILES = [
     "curator_policy.py",
     "task_policy.py",
     "browser_policy.py",
+    "artifact_policy.py",
 ]
 
 # Domain types files consumed by Policies (not Policy files themselves).
@@ -111,6 +112,7 @@ POLICY_FILE_OWN_DOMAIN = {
     "curator_policy.py": {"app.domain.skill"},
     "task_policy.py": {"app.domain.task"},
     "browser_policy.py": {"app.domain.browser"},
+    "artifact_policy.py": {"app.domain.artifact"},
 }
 
 
@@ -242,3 +244,22 @@ def test_run_policy_snapshot_factory_has_no_settings_reference():
                         f"RunPolicySnapshotFactory field '{item.target.id}' "
                         f"holds a Settings reference: {type_str}"
                     )
+
+
+# ---------------------------------------------------------------------------
+# 4. Policy registration counts (artifact_policy is the 16th domain Policy)
+# ---------------------------------------------------------------------------
+
+
+def test_policy_registration_counts():
+    """artifact_policy.py is registered as the 16th domain Policy.
+
+    POLICY_FILES includes the shared kernel (policy.py) + 16 domain Policies
+    = 17 entries. POLICY_FILE_OWN_DOMAIN maps the 16 domain Policy files
+    (excluding the shared kernel) to their allowed own-domain imports.
+    """
+    assert len(POLICY_FILES) == 17
+    assert len(POLICY_FILE_OWN_DOMAIN) == 16
+    assert "artifact_policy.py" in POLICY_FILES
+    assert "artifact_policy.py" in POLICY_FILE_OWN_DOMAIN
+    assert POLICY_FILE_OWN_DOMAIN["artifact_policy.py"] == {"app.domain.artifact"}

@@ -21,6 +21,7 @@ def _settings(tmp_path: Path) -> Settings:
         plugins_root=str(plugins_root),
         scheduler_enabled=False,
         feishu_enabled=False,
+        artifacts_enabled=False,
     )
 
 

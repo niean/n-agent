@@ -23,6 +23,8 @@ dependencies = [
   "Pillow>=10,<12",
   "playwright>=1.40,<2",
   "websockets>=15,<16",
+  "markdown>=3.5,<4",
+  "python-multipart>=0.0.9,<1",
 ]
 
 [project.scripts]

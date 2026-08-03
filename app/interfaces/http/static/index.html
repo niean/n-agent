@@ -27,6 +27,10 @@
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h7v5H4V6ZM13 6h7v5h-7V6ZM4 13h7v5H4v-5ZM13 13h7v5h-7v-5Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">任务</span>
       </a>
+      <a class="sidebar__item" href="/artifacts" data-tab="artifacts" hidden>
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7l8-4 8 4-8 4-8-4ZM4 7v10l8 4 8-4V7M12 11v10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">制品</span>
+      </a>
       <a class="sidebar__item" href="/scheduled-tasks" data-tab="scheduled-tasks">
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 3v3M17 3v3M4 9h16M6 5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">定时任务</span>
@@ -168,6 +172,8 @@
 
     <div class="tab-content" id="tab-tasks-observations"></div>
     <div class="tab-content" id="tab-tasks-security"></div>
+
+    <div class="tab-content" id="tab-artifacts" hidden></div>
 
     <div class="tab-content" id="tab-scheduled-tasks">
       <div id="scheduled-tasks-list-view">
@@ -317,6 +323,7 @@
   <script src="/static/tasks-observations.js"></script>
   <script src="/static/tasks-security.js"></script>
   <script src="/static/browser.js"></script>
+  <script src="/static/artifacts.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

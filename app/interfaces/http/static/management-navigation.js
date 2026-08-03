@@ -4,6 +4,7 @@
     { tab: 'summary', path: '/summary', label: '概览' },
     { tab: 'chat', path: '/chat', label: '对话' },
     { tab: 'tasks', path: '/tasks', label: '任务' },
+    { tab: 'artifacts', path: '/artifacts', label: '制品' },
     { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '定时任务' },
     { tab: 'sessions', path: '/sessions', label: '会话' },
     { tab: 'memory', path: '/memory', label: '记忆' },

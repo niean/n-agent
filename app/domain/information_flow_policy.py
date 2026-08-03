@@ -118,6 +118,50 @@ class InformationFlowPolicy:
                 reason="usage_retention_no_secrets",
             )
 
+        # --- PUBLIC_ARTIFACT (strictest boundary) -----------------------
+        #
+        # Public artifact release is for TEXT content only (binary publish
+        # goes through ArtifactPolicy's classification gate).  SECRET and
+        # SENSITIVE classifications are never released here, regardless of
+        # content.  Known-secret text is released only through redaction.
+        # This branch MUST NOT fall through to the generic default-allow.
+        if target is ReleaseTarget.PUBLIC_ARTIFACT:
+            if asset.classification in (Classification.SECRET, Classification.SENSITIVE):
+                return InformationReleaseDecision(
+                    verdict=PolicyOutcome.DENY,
+                    transform=None,
+                    allowed_fields=frozenset(),
+                    retention="none",
+                    audit_level="summary",
+                    reason=f"public_artifact_{asset.classification.value}_classification_denied",
+                )
+            if needs_redaction:
+                if self._config.redact_secrets:
+                    return InformationReleaseDecision(
+                        verdict=PolicyOutcome.ALLOW,
+                        transform="redaction",
+                        allowed_fields=frozenset(),
+                        retention="sanitized",
+                        audit_level="summary",
+                        reason="public_artifact_secret_redacted",
+                    )
+                return InformationReleaseDecision(
+                    verdict=PolicyOutcome.DENY,
+                    transform=None,
+                    allowed_fields=frozenset(),
+                    retention="none",
+                    audit_level="summary",
+                    reason="public_artifact_secret_no_transform_available",
+                )
+            return InformationReleaseDecision(
+                verdict=PolicyOutcome.ALLOW,
+                transform=None,
+                allowed_fields=frozenset(),
+                retention="raw",
+                audit_level="summary",
+                reason=f"public_artifact_{asset.classification.value}_no_secrets",
+            )
+
         # --- Generic targets (LLM_PROVIDER, CLIENT_RESPONSE, etc.) -------
 
         if needs_redaction:

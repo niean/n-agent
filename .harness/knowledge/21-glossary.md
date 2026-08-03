@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化术语 -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语 -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -91,6 +91,18 @@
 - image_url content array：OpenAI Chat Completions 风格的多模态用户消息 content，格式为 `[{type:"text",text:...},{type:"image_url",image_url:{url:...}}]`。N-Agent 各入口（OpenAI HTTP API、Dashboard、飞书 IM、ACP）归一化为该格式后进入 provider；`content_utils.normalize_content` 负责归一化，`extract_text` 负责从数组中提取纯文本供摘要/标题使用。
 - content_utils：`app/utils/content_utils.py`，多模态内容共享工具模块，提供 validate_image_url/parse_data_url/normalize_content/extract_text/has_image_part/prepend_text_part。被 Domain（不直接依赖，通过 Application 间接消费）、Application（chat_service/agent_graph/heuristic_summarizer/vision_tool_executor）、Infrastructure（anthropic_provider）、Interfaces（openai_compatible/dashboard 路由、ACP event_bridge）各层共享，不依赖任何外层模块。
 
+## Artifact 制品工作台术语
+
+- Artifact：制品工作台的统一交付物聚合根（`app/domain/artifact.py`，frozen dataclass），由 TaskAttachment 上传、TaskArtifact 产出或手动创建而来。text kinds（document/markdown/code/html/data/csv/json/text）支持 inline_content 或 content_ref（XOR），binary kinds（image/pdf/other）仅 content_ref。source_kind 区分 task_attachment/task_artifact/session/manual。to_public_view 排除 content_ref/inline_content/source_ref 等内部存储细节。
+- PublishedArtifact：Artifact 的不可变发布快照实体（`app/domain/artifact.py`，frozen dataclass）。artifact_id nullable，支持源 Artifact 删除后快照独立存活（FK ON DELETE SET NULL）。快照字段（snapshot_name/kind/mime/content_ref/inline_content/size/checksum）在发布时固化，仅 status 与 revoked_at 可变。is_active 属性判定是否未撤销。
+- ArtifactRegistry：Artifact 元数据持久化 async 端口（`app/domain/artifact.py`），定义 Artifact CRUD、PublishedArtifact 生命周期（register_published/get_published/get_active_publish/list_published/revoke_published）、source 查询（get_by_source，unique (source_kind, source_ref) 防重复注册）、backfill 批量读取（list_attachment_sources）。Infrastructure 的 SQLiteArtifactRegistry 实现该端口。
+- ArtifactContentStore：Artifact 原始内容存储 async 端口（`app/domain/artifact.py`），定义 read（bounded）/write_atomic（原子写）/delete_owned（ownership-scoped 删除）/materialize_source（源文件拷贝到 owned 存储）/copy_to_publish_snapshot（快照拷贝）。Infrastructure 的 LocalArtifactContentStore 实现该端口。
+- publish_id：PublishedArtifact 的公开访问标识，>=128-bit URL-safe 随机字符串（22-64 字符 `[A-Za-z0-9_-]`），由 `secrets.token_urlsafe` 生成，不可枚举。公开路由 `/p/{publish_id}` 以此为唯一路径参数。
+- write-through registration（write-through 注册）：TaskService 附件上传与 TaskRunService TaskArtifact 产出时，通过注入的 `artifact_register_callback` 回调 ArtifactService.register_from_attachment/register_from_task_artifact，幂等注册为 Artifact（unique (source_kind, source_ref) 防重复）。best-effort，回调失败不回滚主流程。
+- backfill（启动回填）：ArtifactService.backfill_attachments 在 main.py lifespan 启动期幂等执行，通过 ArtifactRegistry.list_attachment_sources 游标分页重扫 task_attachments 表，为未注册的附件补建 Artifact。幂等（已注册的 source 跳过），不 gated on table-empty（每次启动都扫），单条失败 continue。
+- ReleaseTarget.PUBLIC_ARTIFACT：InformationFlow 新增的公开文本释放目标（`app/domain/information_flow.py`）。InformationFlowPolicy 对 PUBLIC_ARTIFACT 采用最严格边界：SECRET/SENSITIVE 分类 DENY；known-secret text 经 redaction 后 ALLOW；无 secret 的 text ALLOW raw。binary 发布不经此路径（由 ArtifactPolicy 的 classification=public 门禁控制）。
+- content_ref：ArtifactContentStore 的不透明内容引用方案（`app/infrastructure/artifact/content_store.py`），格式为 `{scheme}:{id}/{server_filename}`。scheme 取值：item（owned，可删）、published（快照，可删）、attachment（只读源引用）、workspace（只读源引用）。仅 item/published ref 可通过 delete_owned 删除；attachment/workspace ref 只读不可删。磁盘文件名由 server 生成（uuid4 hex + safe ext），客户端 filename 仅展示用。
+
 - terminal：内置 safe 工具（toolset=sandbox），由 `TerminalToolExecutor`（`app/application/terminal_tool_executor.py`）实现。LLM 直接调用 shell 命令，命令在 session 级 sandbox 容器内执行（DockerSandbox 用 `docker exec`，LocalSandbox 用 `sh -c`），与 execute_code 共享同一 session sandbox 和 scratch。非零退出码仍为 SUCCESS（shell 语义 — 命令已执行，只是失败）；仅 timeout 返回 TIMEOUT、spawn 失败返回 ERROR。workdir 按 backend 校验：Docker 仅允许 /scratch 和 /workspace 前缀（posixpath.normpath），Local 仅允许 scratch_root/workspace_root 内（Path.resolve）。无危险命令审批机制 — sandbox 本身是安全边界。
 - host_terminal：宿主执行工具（`source_type=AGENT`、`toolset=host`、`risk_level=SAFE`、`managed=false`），与 `terminal`、`execute_code` 同级；只执行 Host Terminal Policy 白名单中的精确命令或 SHA-256 匹配的 Skill 脚本，不是 Sandbox 的 host backend。
 - Host Terminal Bridge：运行在宿主机、只监听 loopback 的最小执行服务；校验 token 和自身加载的 Policy，使用已验证字节的私有快照以 argv 启动进程，不走 shell。
@@ -120,7 +132,7 @@
 
 ## Policy Mesh 治理术语
 
-- Policy Mesh：N-Agent 运行时治理架构，由 15 个独立领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成；每个 Policy 治理一个维度，Application Service 在外部调用前封口执行。
+- Policy Mesh：N-Agent 运行时治理架构，由 16 个独立领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成；每个 Policy 治理一个维度，Application Service 在外部调用前封口执行。
 - RunPolicySnapshot：不可变 frozen dataclass（`app/application/policy_snapshot.py`），携带 10 个 typed config + IngressFacts（run_id/session_id/execution_mode/trusted_claims）；由 RunPolicySnapshotFactory 从 PolicyProfileProvider 构造；不持有任何 mutable runtime state。
 - RunPolicySnapshotFactory：Application 层工厂（`app/application/policy_snapshot.py`），从 PolicyProfileProvider 解析 profile 并构造 RunPolicySnapshot；不持有 Settings 引用。
 - IngressFacts：RunPolicySnapshot 中的不可变运行时入口事实，含 run_id、session_id、execution_mode、actor_id、trusted_claims。

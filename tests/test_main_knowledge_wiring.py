@@ -24,6 +24,7 @@ def _settings(tmp_path: Path, *, kb_enabled: bool = True, kb_base_url: str = "ht
         kb_default_top_k=7,
         kb_default_min_score=0.3,
         kb_timeout_seconds=3,
+        artifacts_enabled=False,
     )
 
 

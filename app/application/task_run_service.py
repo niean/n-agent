@@ -54,6 +54,7 @@ from app.domain.task import (
     FinishRunResult,
     RecoverRunCommand,
     Task,
+    TaskArtifact,
     TaskConflictError,
     TaskNotFoundError,
     TaskRunOutcome,
@@ -118,6 +119,8 @@ class TaskRunService:
         max_runtime_seconds: int = 3600,
         max_concurrency: int = 4,
         task_config_provider: TaskConfigProvider | None = None,
+        artifact_register_callback: Callable[[TaskArtifact, str, int, int], Awaitable[None]] | None = None,
+        artifact_normalizer: Callable[[dict[str, Any], Task], Awaitable[TaskArtifact | None]] | None = None,
     ):
         self.registry = registry
         self.dispatcher = dispatcher
@@ -131,6 +134,8 @@ class TaskRunService:
         self.max_runtime_seconds = max_runtime_seconds
         self.max_concurrency = max_concurrency
         self._task_config_provider = task_config_provider
+        self.artifact_register_callback = artifact_register_callback
+        self.artifact_normalizer = artifact_normalizer
 
     def _fallback_config(self) -> TaskConfig:
         """Build a TaskConfig from constructor scalars (provider unavailable)."""
@@ -506,6 +511,10 @@ class TaskRunService:
         metadata = getattr(agent_result, "metadata", {}) or {}
         artifacts = getattr(agent_result, "artifacts", ()) or ()
 
+        normalized_artifacts = await self._normalize_artifacts(
+            tuple(artifacts), task,
+        )
+
         await self._finish(
             task=task,
             run_id=run_id,
@@ -514,12 +523,7 @@ class TaskRunService:
             summary=output or error or "",
             error=error,
             metadata=dict(metadata),
-            artifacts=tuple(
-                a if isinstance(a, dict) else {
-                    "type": "unknown", "name": str(a), "storage_ref": "",
-                }
-                for a in artifacts
-            ),
+            artifacts=normalized_artifacts,
         )
 
     async def _finish(
@@ -531,7 +535,7 @@ class TaskRunService:
         summary: str | None = None,
         error: str | None = None,
         metadata: dict[str, Any] | None = None,
-        artifacts: tuple[dict[str, Any], ...] = (),
+        artifacts: tuple[TaskArtifact, ...] = (),
         interaction_type: str | None = None,
     ) -> FinishRunResult | None:
         """Unified CAS finalize -- the SOLE run cleanup path.
@@ -544,6 +548,11 @@ class TaskRunService:
         ``interaction_type`` is only meaningful for ``WAITING_APPROVAL``
         outcomes (worker propose); it selects the lifecycle card flavor
         (approval vs intent_request) and is ignored for other outcomes.
+
+        ``artifacts`` is a normalized ``tuple[TaskArtifact, ...]`` produced
+        by ``_normalize_artifacts``. After CAS success, the optional
+        ``artifact_register_callback`` is invoked for each artifact in stable
+        ordinal order (best-effort, never affects the completed Task).
 
         Returns the FinishRunResult, or None if a late-worker CAS conflict
         or missing task/run was logged and swallowed.
@@ -584,7 +593,119 @@ class TaskRunService:
             result.task, target_status, summary=summary, error=error,
         )
         await self._notify_if_terminal(result, target_status)
+
+        # Invoke artifact register callbacks (ONLY after CAS success).
+        # Best-effort: single failure does not affect other items or the
+        # completed Task.
+        await self._invoke_artifact_callbacks(
+            artifacts, task.id, run_id,
+        )
+
         return result
+
+    # ------------------------------------------------------------------
+    # Artifact normalization + register callback (T10)
+    # ------------------------------------------------------------------
+
+    async def _normalize_artifacts(
+        self,
+        raw_artifacts: tuple[Any, ...],
+        task: Task,
+    ) -> tuple[TaskArtifact, ...]:
+        """Normalize agent-result artifact entries to ``TaskArtifact`` tuples.
+
+        Strict normalization rules:
+          - ``type``, ``name``, ``storage_ref`` are required. Missing any
+            -> skip that item with warning.
+          - ``source_task_id`` is force-overwritten with ``task.id`` (never
+            trust agent-supplied value).
+          - ``mime``, ``size``, ``summary``, ``checksum`` -- if missing,
+            filled via the injected ``artifact_normalizer`` (controlled /
+            server-side). If no normalizer, safe defaults are used.
+          - If the normalizer returns ``None`` (unreadable ref) or raises,
+            the item is skipped with warning.
+
+        The resulting ``tuple[TaskArtifact, ...]`` is passed to
+        ``FinishRunCommand.artifacts``.
+        """
+        result: list[TaskArtifact] = []
+        for raw in raw_artifacts:
+            if not isinstance(raw, dict):
+                raw = {"type": "unknown", "name": str(raw), "storage_ref": ""}
+            art_type = raw.get("type") or ""
+            art_name = raw.get("name") or ""
+            storage_ref = raw.get("storage_ref") or ""
+            if not art_type or not art_name or not storage_ref:
+                logger.warning(
+                    "artifact skipped: missing required field "
+                    "(type=%r name=%r storage_ref=%r)",
+                    art_type, art_name, storage_ref,
+                )
+                continue
+            # Force-overwrite source_task_id (never trust agent-supplied value)
+            raw = {**raw, "source_task_id": task.id}
+
+            if self.artifact_normalizer is not None:
+                try:
+                    normalized = await self.artifact_normalizer(raw, task)
+                except Exception as exc:
+                    logger.warning(
+                        "artifact normalization failed: "
+                        "source_kind=task_artifact source_ref=%s exc_type=%s",
+                        storage_ref, type(exc).__name__,
+                    )
+                    continue
+                if normalized is None:
+                    logger.warning(
+                        "artifact skipped: unreadable "
+                        "source_kind=task_artifact source_ref=%s",
+                        storage_ref,
+                    )
+                    continue
+                result.append(normalized)
+            else:
+                # No normalizer: use safe defaults for missing fields.
+                size = raw.get("size")
+                result.append(TaskArtifact(
+                    type=art_type,
+                    name=art_name,
+                    mime=raw.get("mime") or "",
+                    size=size if size is not None else 0,
+                    storage_ref=storage_ref,
+                    source_task_id=task.id,
+                    summary=raw.get("summary") or "",
+                    checksum=raw.get("checksum") or "",
+                ))
+        return tuple(result)
+
+    async def _invoke_artifact_callbacks(
+        self,
+        artifacts: tuple[TaskArtifact, ...],
+        task_id: str,
+        run_id: int,
+    ) -> None:
+        """Invoke ``artifact_register_callback`` for each artifact in ordinal order.
+
+        Called ONLY after ``registry.finish_run`` returns ``FinishRunResult``
+        (CAS success). Self-contained: no-ops when no callback is registered
+        or no artifacts to process. Single callback failure -> log warning
+        (safe fields only: source_kind, source_ref, exception type; NO
+        content/paths) and continue with remaining items. Does NOT affect
+        the completed Task.
+        """
+        if self.artifact_register_callback is None or not artifacts:
+            return
+        for ordinal, artifact in enumerate(artifacts):
+            try:
+                await self.artifact_register_callback(
+                    artifact, task_id, run_id, ordinal,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "artifact register callback failed: "
+                    "source_kind=task_artifact source_ref=%s exc_type=%s",
+                    artifact.storage_ref, type(exc).__name__,
+                )
 
     # ------------------------------------------------------------------
     # finalize_propose (worker propose -> WAITING_APPROVAL run finalization)

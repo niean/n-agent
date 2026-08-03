@@ -1,9 +1,21 @@
+import os
+import tempfile
 import warnings
 import sys
 
 import httpx
 from langchain_core._api.deprecation import LangChainPendingDeprecationWarning
 from starlette.exceptions import StarletteDeprecationWarning
+
+
+# Ensure artifacts_root points to a host-writable directory for tests that
+# call create_app() without explicit Settings. The default (/app/locals/
+# artifacts) is a Docker-only path that cannot be created on the host.
+# setdefault preserves any caller-provided value (e.g. artifact wiring tests
+# that pass their own artifacts_root via Settings).
+_test_artifacts_root = os.path.join(tempfile.gettempdir(), "n-agent-test-artifacts")
+os.makedirs(_test_artifacts_root, exist_ok=True)
+os.environ.setdefault("N_AGENT_ARTIFACTS_ROOT", _test_artifacts_root)
 
 
 sys.modules.setdefault("httpx2", httpx)

@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.application.agent_graph import AgentGraphRunner
+from app.application.artifact_service import ArtifactService, ArtifactServiceConfig
 from app.application.budget_service import BudgetService
 from app.application.browser_service import BrowserService, BrowserServiceSettings
 from app.application.browser_confirmation_service import BrowserConfirmationService
@@ -170,6 +171,12 @@ from app.infrastructure.browser.screenshot_store import SqliteBrowserScreenshotS
 from app.infrastructure.browser.sqlite_browser_registry import SqliteBrowserSessionRegistry
 from app.infrastructure.browser.url_safety import UrlVerifier
 from app.domain.browser_policy import BrowserPolicy
+from app.domain.artifact import ArtifactAttachmentSource
+from app.domain.artifact_policy import ArtifactPolicy
+from app.infrastructure.artifact.content_store import LocalArtifactContentStore
+from app.infrastructure.artifact.export_converter import convert_to_html
+from app.infrastructure.registry.sqlite_artifact_registry import SQLiteArtifactRegistry
+from app.interfaces.http.published_artifact_routes import register_published_artifact_routes
 
 if TYPE_CHECKING:
     from app.infrastructure.sandbox.manager import SandboxManager as _SandboxManager
@@ -350,6 +357,8 @@ class ApplicationServices:
     browser_dashboard_service: "BrowserDashboardService | None" = None
     browser_confirmation_service: "BrowserConfirmationService | None" = None
     browser_novnc_proxy: "BrowserNoVncProxy | None" = None
+    # Artifact 子域服务 (T14). None when artifacts_enabled=False.
+    artifact_service: ArtifactService | None = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -969,6 +978,55 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     task_config_service = TaskConfigService(
         settings, task_config_store, TaskConfigLoggingSink(),
     )
+    # Artifact subsystem wiring (T14). Gated on artifacts_enabled: when False,
+    # the entire subsystem is skipped (no service, no callbacks, no backfill,
+    # no routes). When True, registry/schema init failures propagate (fail-fast,
+    # NOT silent degrade) -- matching the task_enabled fail-fast pattern.
+    # Reuses the existing information_flow_service and audit_service (already
+    # constructed early in build_application_services).
+    artifact_service: ArtifactService | None = None
+    if settings.artifacts_enabled:
+        # SQLiteArtifactRegistry performs schema init in __init__; failures
+        # propagate (fail-fast).
+        artifact_registry = SQLiteArtifactRegistry(settings.sqlite_path)
+        # Resolve artifacts_root to an absolute path under workspace_root
+        # (spec: relative artifacts_root resolved via /app/locals semantics,
+        # not cwd drift).
+        artifacts_root = settings.artifacts_root
+        if not artifacts_root.is_absolute():
+            artifacts_root = settings.workspace_root / artifacts_root
+        artifacts_root = artifacts_root.resolve()
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        # Resolve task_attachments_root for content store (read-only source
+        # descriptor root; may not exist yet when task_enabled=False).
+        artifact_attachments_root = settings.task_attachments_root
+        if not artifact_attachments_root.is_absolute():
+            artifact_attachments_root = settings.workspace_root / artifact_attachments_root
+        artifact_attachments_root = artifact_attachments_root.resolve()
+        artifact_content_store = LocalArtifactContentStore(
+            artifacts_root,
+            artifact_attachments_root,
+            settings.workspace_root,
+            max_bytes=settings.artifact_max_bytes,
+            publish_max_bytes=settings.artifact_publish_max_bytes,
+            inline_max_bytes=settings.artifact_inline_max_bytes,
+        )
+        artifact_policy = ArtifactPolicy()
+        artifact_config = ArtifactServiceConfig(
+            artifact_max_bytes=settings.artifact_max_bytes,
+            artifact_publish_max_bytes=settings.artifact_publish_max_bytes,
+            artifact_inline_max_bytes=settings.artifact_inline_max_bytes,
+            published_base_url=settings.published_base_url,
+        )
+        artifact_service = ArtifactService(
+            artifact_registry,
+            artifact_content_store,
+            artifact_policy,
+            information_flow_service,
+            audit_service,
+            artifact_config,
+            convert_to_html,
+        )
     if settings.task_enabled:
         # SQLiteTaskRegistry performs schema init in __init__; failures
         # propagate (spec: 初始化异常必须让启动失败，不得伪装成"子系统不可用"
@@ -1037,6 +1095,12 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             max_runtime_seconds=settings.task_max_runtime_seconds,
             max_concurrency=settings.task_max_concurrency,
             task_config_provider=task_config_service,
+            artifact_register_callback=(
+                artifact_service.register_from_task_artifact
+                if artifact_service is not None
+                else None
+            ),
+            artifact_normalizer=None,
         )
         # Late-bind to resolve circular dep:
         #   TaskRunService needs dispatcher=TaskRunner,
@@ -1051,6 +1115,26 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             attachment_task_max_bytes=settings.task_attachment_task_max_bytes,
             lifecycle_writer=_task_lifecycle_writer,
             task_config_provider=task_config_service,
+            artifact_register_callback=(
+                # Adapt TaskAttachment -> ArtifactAttachmentSource. The
+                # callback receives a TaskAttachment (field: id); the service
+                # expects an ArtifactAttachmentSource (field: attachment_id).
+                (lambda att: artifact_service.register_from_attachment(
+                    ArtifactAttachmentSource(
+                        attachment_id=att.id,
+                        task_id=att.task_id,
+                        stored_name=att.stored_name,
+                        filename=att.filename,
+                        content_type=att.content_type,
+                        size=att.size,
+                        checksum=att.checksum,
+                        uploaded_by=att.uploaded_by,
+                        created_at=att.created_at,
+                    )
+                ))
+                if artifact_service is not None
+                else None
+            ),
         )
         # TaskService.dispatch_tick delegates to TaskRunService (late-bind).
         task_service.set_run_service(task_run_service)
@@ -1583,6 +1667,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         browser_dashboard_service=browser_dashboard_service_obj,
         browser_confirmation_service=browser_confirmation_service_obj,
         browser_novnc_proxy=browser_novnc_proxy_obj,
+        artifact_service=artifact_service,
     )
 
 
@@ -1713,6 +1798,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except Exception:
                 logger.exception("sandbox orphan cleanup failed at startup")
             services.sandbox_manager.start_reaper()
+        # Artifact backfill (T14). Runs when artifact_service is wired.
+        # Single-item failure continues (backfill handles per-item try/except);
+        # schema/global init already fail-fast in build_application_services.
+        if services.artifact_service is not None:
+            try:
+                stats = await services.artifact_service.backfill_attachments(
+                    batch_size=100
+                )
+                logger.info(
+                    "artifact backfill ok processed=%s created=%s "
+                    "skipped=%s failed=%s",
+                    stats.get("processed", 0),
+                    stats.get("created", 0),
+                    stats.get("skipped", 0),
+                    stats.get("failed", 0),
+                )
+            except Exception:
+                logger.exception("artifact backfill failed")
         try:
             yield
         finally:
@@ -1818,7 +1921,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             browser_actor_resolver=_default_browser_actor_resolver,
             dashboard_tool_approval_bridge=dashboard_tool_approval_bridge,
             tool_approval_service=services.tool_approval_service,
+            artifact_service=services.artifact_service,
             settings=services.settings,
         )
     )
+    # Published artifact routes at app root (GET /p/{publish_id} and
+    # /p/{publish_id}/content). Registered only when artifact_service is
+    # wired (artifacts_enabled=True).
+    if services.artifact_service is not None:
+        register_published_artifact_routes(app, services.artifact_service)
     return app

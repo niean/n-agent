@@ -16,6 +16,7 @@ def test_build_application_services_wires_skill(tmp_path: Path):
         skills_root=str(skills_root),
         scheduler_enabled=False,
         feishu_enabled=False,
+        artifacts_enabled=False,
     )
 
     services = build_application_services(settings)

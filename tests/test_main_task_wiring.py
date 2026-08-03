@@ -59,6 +59,7 @@ def _settings(
         scheduler_enabled=scheduler_enabled,
         feishu_enabled=feishu_enabled,
         task_enabled=task_enabled,
+        artifacts_enabled=False,
     )
 
 
@@ -146,6 +147,7 @@ def test_lifespan_starts_task_runner_when_enabled(tmp_path: Path, monkeypatch: p
     monkeypatch.setenv("N_AGENT_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("N_AGENT_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_FEISHU_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_TASK_ENABLED", "true")
     # Boots without exception; lifespan runs task_runner.start()/stop()
     with TestClient(create_app()) as client:
@@ -158,6 +160,7 @@ def test_lifespan_skips_task_runner_when_disabled(tmp_path: Path, monkeypatch: p
     monkeypatch.setenv("N_AGENT_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("N_AGENT_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_FEISHU_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_TASK_ENABLED", "false")
     with TestClient(create_app()) as client:
         # App still boots
@@ -342,6 +345,7 @@ def test_user_task_tools_listed_in_chat_tools_when_enabled(
     monkeypatch.setenv("N_AGENT_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("N_AGENT_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_FEISHU_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_TASK_ENABLED", "true")
     with TestClient(create_app()) as client:
         tools = client.get("/chat/tools").json()
@@ -359,6 +363,7 @@ def test_user_task_tools_absent_from_chat_tools_when_disabled(
     monkeypatch.setenv("N_AGENT_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("N_AGENT_SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_FEISHU_ENABLED", "false")
+    monkeypatch.setenv("N_AGENT_ARTIFACTS_ENABLED", "false")
     monkeypatch.setenv("N_AGENT_TASK_ENABLED", "false")
     with TestClient(create_app()) as client:
         tools = client.get("/chat/tools").json()

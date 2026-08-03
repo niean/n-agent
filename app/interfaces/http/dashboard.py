@@ -127,6 +127,7 @@ def create_dashboard_router(
     browser_actor_resolver=None,
     dashboard_tool_approval_bridge=None,
     tool_approval_service=None,
+    artifact_service=None,
     settings=None,
 ) -> APIRouter:
     router = APIRouter()
@@ -165,6 +166,14 @@ def create_dashboard_router(
     @router.get("/browser", response_class=HTMLResponse)
     async def shell():
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    # /artifacts shell route: registered early (before any catch-all) and
+    # only when artifact_service is wired. The literal path must precede
+    # any parametric catch-all so it is not captured.
+    if artifact_service is not None:
+        @router.get("/artifacts", response_class=HTMLResponse)
+        async def artifacts_shell():
+            return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
     if image_store is not None:
         @router.get("/chat/images/{image_id}")
@@ -560,6 +569,9 @@ def create_dashboard_router(
     if task_service is not None:
         from app.interfaces.http.task_routes import register_task_routes
         register_task_routes(router, task_service, task_run_service)
+    if artifact_service is not None:
+        from app.interfaces.http.artifact_routes import register_artifact_routes
+        register_artifact_routes(router, artifact_service)
     if knowledge_service is not None:
         _register_knowledge_routes(router, knowledge_service, tool_service)
 

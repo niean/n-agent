@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台 artifacts/published_artifacts 表与 artifacts_root 存储边界 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -329,3 +329,18 @@ Browser 子系统复用 sessions.db（独立 `_connect()` + asyncio.to_thread + 
 - `browser_actions`：id PK、browser_session_id、action_type、arguments_summary_json（navigate 仅安全 URL 剥 userinfo/query/fragment；click/scroll 仅 element role/name；type 仅 char_count+clear_first，永不存完整 text）、status、safe_url、title、text_summary、warning_code、error_code、duration_ms、document_revision、created_at、FK session ON DELETE CASCADE；索引 (browser_session_id, created_at, id) 稳定 cursor 翻页
 
 登录态存储：Container profile_ref 映射 browser 服务持久卷目录；Host profile_ref 映射由宿主 Bridge 持有。cookies/localStorage/sessionStorage/password/autofill/payment 仅存在浏览器 profile，不进 DB/模型消息/日志/Artifact。截图落地 `locals/browser-screenshots/`（随机 ref + session->ref 元数据 + TTL/配额 + Close 清理），不进 browser_actions 或 tool_calls。
+
+## Artifact 子系统数据边界
+
+Artifact 子系统复用 sessions.db（独立 `_connect()` + asyncio.to_thread + WAL + 幂等迁移），新增 2 表：
+
+- `artifacts`：id PK、name、kind（CHECK 11 kind 枚举）、mime、content_ref（nullable）、inline_content（nullable）、size、checksum（`sha256:` + 64 hex）、source_kind、source_ref、source_context_ref（nullable）、summary（DEFAULT ''）、classification（nullable）、labels_json（nullable）、status（DEFAULT 'draft'）、created_by（DEFAULT ''）、created_at、updated_at；唯一索引 `idx_artifacts_source ON (source_kind, source_ref)` 防重复注册；查询索引 `idx_artifacts_updated_at_id ON (updated_at, id)`（游标分页）、`idx_artifacts_source_kind ON (source_kind)`、`idx_artifacts_kind ON (kind)`、`idx_artifacts_status ON (status)`
+- `published_artifacts`：publish_id PK、artifact_id（nullable FK REFERENCES artifacts(id) ON DELETE SET NULL）、snapshot_name、snapshot_kind、snapshot_mime、snapshot_content_ref（nullable）、snapshot_inline_content（nullable）、snapshot_size、snapshot_checksum、snapshot_summary（DEFAULT ''）、published_by（DEFAULT ''）、published_at、status（DEFAULT 'active'）、revoked_at（nullable）；部分唯一索引 `idx_published_active_artifact ON (artifact_id) WHERE status='active' AND artifact_id IS NOT NULL` 保证每 artifact 至多一个 active 发布
+
+`register_published` 在单 `BEGIN IMMEDIATE` 事务内：revoke old active（若 `revoke_artifact_id` 设置）-> insert new active -> sync ArtifactStatus=PUBLISHED，异常全 rollback；并发 unique-violation 时 reread 已有 active 返回。
+
+artifacts_root 存储边界（`settings.artifacts_root`，默认 `/app/locals/artifacts`）：
+- `{root}/items/{artifact_id}/`：Artifact owned 内容目录，磁盘文件名 server-generated（uuid4 hex + safe ext），客户端 filename 仅展示
+- `{root}/published/{publish_id}/`：PublishedArtifact 快照内容目录
+- content_ref 方案：`item:{artifact_id}/{server_filename}`（owned，可删）、`published:{publish_id}/{server_filename}`（快照，可删）、`attachment:{task_id}/{stored_name}`（只读源引用，不可删）、`workspace:{relative_path}`（只读源引用，不可删）
+- 安全不变量：per-component lstat symlink 拒绝（非单次 resolved is_symlink）、bounded read（max_bytes 前置检查 + 流式累积）、原子写（same-dir temp + fsync + os.replace）、delete_owned 仅 item/published ref

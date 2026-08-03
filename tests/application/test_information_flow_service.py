@@ -112,6 +112,110 @@ class TestRelease:
             result.allowed = False  # type: ignore[misc]
 
 
+class TestPublicArtifactRelease:
+    """PUBLIC_ARTIFACT release through InformationFlowService (Task 4).
+
+    Verifies the application contract: the redacted ReleaseResult.content is
+    the ONLY content allowed into a text publish snapshot -- the caller cannot
+    copy the original and redact only the response.
+    """
+
+    def test_public_artifact_known_secret_redacted_in_content(self):
+        """Known secret in content -> release allowed, content redacted.
+
+        The original secret string must NOT appear in ReleaseResult.content.
+        """
+        svc = _make_service(secret_values=frozenset({"sk-secret123"}))
+        result = svc.release(
+            "the key is sk-secret123 here",
+            ReleaseTarget.PUBLIC_ARTIFACT,
+            classification=Classification.INTERNAL,
+            origin="llm_response",
+        )
+        assert result.allowed
+        assert result.content is not None
+        assert "sk-secret123" not in result.content
+        assert "[REDACTED]" in result.content
+
+    def test_public_artifact_secret_classification_denies_content_none(self):
+        """SECRET classification -> DENY, content is None."""
+        svc = _make_service()
+        result = svc.release(
+            "some content",
+            ReleaseTarget.PUBLIC_ARTIFACT,
+            classification=Classification.SECRET,
+            origin="user",
+        )
+        assert not result.allowed
+        assert result.content is None
+        assert result.error == "information_release_denied"
+
+    def test_public_artifact_sensitive_classification_denies_content_none(self):
+        """SENSITIVE classification -> DENY, content is None."""
+        svc = _make_service()
+        result = svc.release(
+            "some content",
+            ReleaseTarget.PUBLIC_ARTIFACT,
+            classification=Classification.SENSITIVE,
+            origin="user",
+        )
+        assert not result.allowed
+        assert result.content is None
+
+    def test_public_artifact_known_secret_without_redaction_denies(self):
+        """Known secret + redaction disabled -> DENY, content is None."""
+        svc = _make_service(
+            redact_secrets=False,
+            secret_values=frozenset({"sk-secret123"}),
+        )
+        result = svc.release(
+            "the key is sk-secret123 here",
+            ReleaseTarget.PUBLIC_ARTIFACT,
+            classification=Classification.INTERNAL,
+            origin="llm_response",
+        )
+        assert not result.allowed
+        assert result.content is None
+
+    def test_public_artifact_no_risk_text_passes_through(self):
+        """No-risk PUBLIC text -> allowed, content unchanged."""
+        svc = _make_service(secret_values=frozenset({"sk-secret123"}))
+        result = svc.release(
+            "public announcement",
+            ReleaseTarget.PUBLIC_ARTIFACT,
+            classification=Classification.PUBLIC,
+            origin="user",
+        )
+        assert result.allowed
+        assert result.content == "public announcement"
+
+    def test_public_artifact_release_content_is_only_content_for_snapshot(self):
+        """The release content is the ONLY content allowed into a text publish snapshot.
+
+        A snapshot built from the release must equal ReleaseResult.content exactly.
+        The original content still contains the secret, proving that the snapshot
+        cannot be built by copying the original and redacting only the response --
+        it MUST use the redacted result.content.
+        """
+        original = "api key sk-secret123 was leaked"
+        svc = _make_service(secret_values=frozenset({"sk-secret123"}))
+        result = svc.release(
+            original,
+            ReleaseTarget.PUBLIC_ARTIFACT,
+            classification=Classification.INTERNAL,
+            origin="llm_response",
+        )
+        assert result.allowed
+        snapshot = result.content
+        assert snapshot is not None
+        assert "sk-secret123" not in snapshot
+        # The original still carries the secret -- any snapshot path that uses
+        # `original` (then redacts only the response) would leak it.
+        assert "sk-secret123" in original
+        assert snapshot != original
+        assert snapshot == "api key [REDACTED] was leaked"
+
+
 class TestStreamGuardCrossChunk:
     """S4: cross-chunk secret redaction via StreamGuard."""
 

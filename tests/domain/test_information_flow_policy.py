@@ -185,6 +185,139 @@ class TestDecisionTable:
         assert decision.retention == "sanitized"
 
 
+class TestPublicArtifactRelease:
+    """PUBLIC_ARTIFACT target release rules (Task 4).
+
+    PUBLIC_ARTIFACT is a strict boundary: SECRET/SENSITIVE always deny;
+    known-secret text is only released through redaction; no-risk
+    PUBLIC/INTERNAL text is allowed without transform.
+    """
+
+    def test_public_artifact_secret_classification_denies(self):
+        """SECRET classification -> DENY regardless of content or config."""
+        policy = _make_policy()
+        asset = InformationAsset(
+            classification=Classification.SECRET,
+            origin="user",
+            labels=frozenset(),
+            content="some content",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.DENY
+        assert decision.transform is None
+        assert decision.retention == "none"
+
+    def test_public_artifact_sensitive_classification_denies(self):
+        """SENSITIVE classification -> DENY regardless of content or config."""
+        policy = _make_policy()
+        asset = InformationAsset(
+            classification=Classification.SENSITIVE,
+            origin="user",
+            labels=frozenset(),
+            content="some content",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.DENY
+        assert decision.transform is None
+        assert decision.retention == "none"
+
+    def test_public_artifact_secret_classification_denies_even_with_redaction(self):
+        """SECRET classification denies even when redaction is enabled and no secrets present."""
+        policy = _make_policy(redact_secrets=True)
+        asset = InformationAsset(
+            classification=Classification.SECRET,
+            origin="user",
+            labels=frozenset(),
+            content="no secrets here",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.DENY
+        assert decision.retention == "none"
+
+    def test_public_artifact_sensitive_classification_denies_even_with_redaction(self):
+        """SENSITIVE classification denies even when redaction is enabled."""
+        policy = _make_policy(redact_secrets=True)
+        asset = InformationAsset(
+            classification=Classification.SENSITIVE,
+            origin="user",
+            labels=frozenset(),
+            content="no secrets here",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.DENY
+        assert decision.retention == "none"
+
+    def test_public_artifact_known_secret_with_redaction_allows_and_transforms(self):
+        """Text with known secret + redaction allowed -> ALLOW + redaction transform."""
+        policy = _make_policy(secret_values=frozenset({"sk-secret123"}))
+        asset = InformationAsset(
+            classification=Classification.INTERNAL,
+            origin="llm_response",
+            labels=frozenset(),
+            content="the key is sk-secret123 here",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.ALLOW
+        assert decision.transform == "redaction"
+        assert decision.retention == "sanitized"
+
+    def test_public_artifact_known_secret_without_redaction_denies(self):
+        """Text with known secret + redaction disabled -> DENY."""
+        policy = _make_policy(
+            redact_secrets=False,
+            secret_values=frozenset({"sk-secret123"}),
+        )
+        asset = InformationAsset(
+            classification=Classification.INTERNAL,
+            origin="llm_response",
+            labels=frozenset(),
+            content="the key is sk-secret123 here",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.DENY
+        assert decision.transform is None
+        assert decision.retention == "none"
+
+    def test_public_artifact_public_no_secrets_allows(self):
+        """No-risk PUBLIC text -> ALLOW without transform."""
+        policy = _make_policy(secret_values=frozenset({"sk-secret123"}))
+        asset = InformationAsset(
+            classification=Classification.PUBLIC,
+            origin="user",
+            labels=frozenset(),
+            content="public announcement",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.ALLOW
+        assert decision.transform is None
+
+    def test_public_artifact_internal_no_secrets_allows(self):
+        """No-risk INTERNAL text -> ALLOW without transform."""
+        policy = _make_policy(secret_values=frozenset({"sk-secret123"}))
+        asset = InformationAsset(
+            classification=Classification.INTERNAL,
+            origin="user",
+            labels=frozenset(),
+            content="internal note",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.ALLOW
+        assert decision.transform is None
+
+    def test_public_artifact_secret_label_with_redaction_allows_and_transforms(self):
+        """Explicit secret label + redaction allowed -> ALLOW + redaction transform."""
+        policy = _make_policy(redact_secrets=True)
+        asset = InformationAsset(
+            classification=Classification.INTERNAL,
+            origin="user",
+            labels=frozenset({"secret"}),
+            content="labeled secret content",
+        )
+        decision = policy.evaluate(asset, ReleaseTarget.PUBLIC_ARTIFACT)
+        assert decision.verdict is PolicyOutcome.ALLOW
+        assert decision.transform == "redaction"
+
+
 class TestSecretCatalog:
     def test_max_secret_length(self):
         catalog = SecretCatalog(secret_values=frozenset({"abc", "abcdef", "x"}))
