@@ -66,6 +66,11 @@ from app.domain.task_policy import TaskPolicy, TaskPolicyRequest
 
 logger = logging.getLogger(__name__)
 
+# Layer-2 auto-artifact threshold: aligned with session_service._TASK_MESSAGE_MAX_BYTES.
+# A task completion summary exceeding this is truncated in the chat message, so the
+# full text is auto-promoted to an inline artifact to avoid losing the output.
+_TASK_SUMMARY_CHAT_MAX_BYTES = 65536
+
 
 # ---------------------------------------------------------------------------
 # Notification policy
@@ -607,6 +612,45 @@ class TaskRunService:
         for task_art, art in registered:
             await self._write_artifact(task, task_art, art)
 
+        # Layer-2 fallback (product rule: outputs that cannot be shown fully as
+        # a chat message must become a standard artifact). When the worker
+        # submitted no usable artifacts but the completion summary exceeds the
+        # chat message byte cap, the chat would truncate it -- auto-promote the
+        # full summary to an inline artifact so the output is never lost.
+        if (
+            not registered
+            and summary
+            and self.artifact_register_callback is not None
+            and target_status == TaskStatus.SUCCEEDED
+        ):
+            summary_bytes = len(summary.encode("utf-8"))
+            if summary_bytes > _TASK_SUMMARY_CHAT_MAX_BYTES:
+                auto_name = (
+                    f"{(task.title or 'task-summary').strip()[:60] or 'task-summary'}.md"
+                )
+                auto_ta = TaskArtifact(
+                    type="markdown",
+                    name=auto_name,
+                    mime="text/markdown",
+                    size=summary_bytes,
+                    storage_ref="",
+                    source_task_id=task.id,
+                    summary="",
+                    checksum="",
+                    content=summary,
+                )
+                try:
+                    auto_art = await self.artifact_register_callback(
+                        auto_ta, task.id, run_id, ordinal=-1,
+                    )
+                    if auto_art is not None:
+                        await self._write_artifact(task, auto_ta, auto_art)
+                except Exception as exc:
+                    logger.warning(
+                        "auto summary artifact failed for task %s exc_type=%s",
+                        task.id, type(exc).__name__,
+                    )
+
         return result
 
     # ------------------------------------------------------------------
@@ -621,8 +665,10 @@ class TaskRunService:
         """Normalize agent-result artifact entries to ``TaskArtifact`` tuples.
 
         Strict normalization rules:
-          - ``type``, ``name``, ``storage_ref`` are required. Missing any
-            -> skip that item with warning.
+          - ``type`` and ``name`` are required; ``storage_ref`` OR ``content``
+            must be present (``content`` carries inline text for text-kind
+            artifacts that have no workspace file). Missing both -> skip
+            that item with warning.
           - ``source_task_id`` is force-overwritten with ``task.id`` (never
             trust agent-supplied value).
           - ``mime``, ``size``, ``summary``, ``checksum`` -- if missing,
@@ -641,11 +687,12 @@ class TaskRunService:
             art_type = raw.get("type") or ""
             art_name = raw.get("name") or ""
             storage_ref = raw.get("storage_ref") or ""
-            if not art_type or not art_name or not storage_ref:
+            content = raw.get("content") or ""
+            if not art_type or not art_name or (not storage_ref and not content):
                 logger.warning(
                     "artifact skipped: missing required field "
-                    "(type=%r name=%r storage_ref=%r)",
-                    art_type, art_name, storage_ref,
+                    "(type=%r name=%r storage_ref=%r has_content=%r)",
+                    art_type, art_name, storage_ref, bool(content),
                 )
                 continue
             # Force-overwrite source_task_id (never trust agent-supplied value)
@@ -681,6 +728,7 @@ class TaskRunService:
                     source_task_id=task.id,
                     summary=raw.get("summary") or "",
                     checksum=raw.get("checksum") or "",
+                    content=content or None,
                 ))
         return tuple(result)
 

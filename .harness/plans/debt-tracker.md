@@ -60,3 +60,5 @@
 4. 状态流转：open -> in_progress -> resolved，resolved 状态保留 1 个月后归档
 | D048 | `tests/interfaces/test_static_assets.py::test_chat_external_memory_draft_selection_is_carried_into_new_session` 断言 chat.js 含 `async function newSession()`（在 `ensureSession()` 之后），但 chat.js 中仅存在 `ensureSession`、无 `newSession` 函数，断言必然失败。属外部记忆草稿选择功能的既有测试与实现漂移，非本次制品修复引入（git stash 验证确认）。 | low | N/A | 2026-08-04 | open |
 | D049 | `tests/infrastructure/test_host_chrome_controller.py::test_permanently_resistant_startup_cannot_retain_native_resources` 在全量 pytest 中偶发失败（资源清理时序相关），独立运行 3/3 通过。非本次制品修复引入，与制品子域无代码路径交集。 | low | N/A | 2026-08-04 | open |
+| D050 | `app/application/task_run_service.py` 的 `_TASK_SUMMARY_CHAT_MAX_BYTES = 65536` 与 `app/application/session_service.py` 的 `_TASK_MESSAGE_MAX_BYTES = 65536` 重复定义，注释已标注对齐关系，但两处独立常量若一方变更另一方不会跟随。后续可提取为共享常量或增加交叉校验测试。session_service 常量为既存，本次新增常量沿用同一模式。 | low | plan-260809-task-artifact-inline.md | 2026-08-09 | open |
+| D051 | `app/application/task_run_service.py` 的 `_invoke_artifact_callbacks` 返回类型注解为 `-> None`，实际返回 `tuple[TaskArtifact, Any]`；类型注解失真，IDE/静态检查会误判。非本次变更引入（该方法不在 diff 内）。 | low | plan-260809-task-artifact-inline.md | 2026-08-09 | open |

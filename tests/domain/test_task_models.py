@@ -338,6 +338,35 @@ def test_task_artifact_checksum():
     assert a.checksum == "sha256:abc"
 
 
+def test_task_artifact_content_default_none():
+    a = TaskArtifact(
+        type="file",
+        name="report.md",
+        mime="text/markdown",
+        size=100,
+        storage_ref="tasks/t_abc/report.md",
+        source_task_id="t_abc",
+        summary="调研报告",
+        checksum="sha256:abc",
+    )
+    assert a.content is None
+
+
+def test_task_artifact_content_inline_text():
+    a = TaskArtifact(
+        type="text",
+        name="report.md",
+        mime="text/markdown",
+        size=0,
+        storage_ref="",
+        source_task_id="t_abc",
+        summary="",
+        checksum="",
+        content="# full body",
+    )
+    assert a.content == "# full body"
+
+
 # ---------------------------------------------------------------------------
 # FinishRunCommand: target_task_status override
 # ---------------------------------------------------------------------------

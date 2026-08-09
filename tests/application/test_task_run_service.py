@@ -15,12 +15,13 @@ import asyncio
 import logging
 from dataclasses import replace as dc_replace
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from app.application.task_agent_executor import TaskAgentResult
-from app.application.task_run_service import TaskRunService
+from app.application.task_run_service import TaskRunService, _TASK_SUMMARY_CHAT_MAX_BYTES
 from app.domain.policy import PolicyOutcome
 from app.domain.task import (
     ClaimResult,
@@ -1386,3 +1387,188 @@ async def test_artifact_callback_skips_normalized_out_artifacts(registry, dispat
     # Ordinals are 0 and 1 (re-indexed after normalization)
     assert callback.calls[0][3] == 0
     assert callback.calls[1][3] == 1
+
+
+# ---------------------------------------------------------------------------
+# Layer-2 oversize-summary fallback + content passthrough (T11)
+# ---------------------------------------------------------------------------
+
+
+class _InlineReturningCallback:
+    """Records calls and returns a fake Artifact (with ``.id``) for each.
+
+    Used to exercise the Layer-2 oversize-summary fallback, which needs a
+    non-None return from ``artifact_register_callback`` to proceed to
+    ``_write_artifact``.
+    """
+
+    def __init__(self, artifact_id: str = "auto-art-1"):
+        self.calls: list[tuple[TaskArtifact, str, int, int]] = []
+        self.artifact_id = artifact_id
+
+    async def __call__(
+        self, artifact: TaskArtifact, task_id: str, run_id: int, ordinal: int,
+    ):
+        self.calls.append((artifact, task_id, run_id, ordinal))
+        return SimpleNamespace(id=self.artifact_id)
+
+
+@pytest.mark.asyncio
+async def test_finish_auto_artifact_for_oversize_summary(registry, dispatcher):
+    """No worker artifacts + oversize summary -> auto inline artifact.
+
+    When the worker submits no usable artifacts but the completion summary
+    exceeds the chat byte cap, _finish converts the full summary into an
+    inline markdown artifact so the output is never lost.
+    """
+    callback = _InlineReturningCallback()
+    big = "x" * (_TASK_SUMMARY_CHAT_MAX_BYTES + 10)
+    executor = FakeExecutor(TaskAgentResult(
+        status=TaskRunOutcome.COMPLETED, output=big, artifacts=(),
+    ))
+    svc = TaskRunService(
+        registry=registry, dispatcher=dispatcher, executor=executor,
+        policy=TaskPolicy(), artifact_register_callback=callback,
+    )
+    task = _queued_task(id="t_auto", title="Big Summary Task")
+    await registry.create_task(task)
+    claim = await registry.claim_task(task.id, "lock-1", 900)
+    await svc.run_claim(claim.task, claim.run.id, claim.run.claim_lock)
+    # Layer-2 invoked the callback once with the auto artifact
+    assert len(callback.calls) == 1
+    auto_ta, task_id, run_id, ordinal = callback.calls[0]
+    assert task_id == "t_auto"
+    assert ordinal == -1
+    assert auto_ta.type == "markdown"
+    assert auto_ta.mime == "text/markdown"
+    assert auto_ta.name.endswith(".md")
+    assert "Big Summary Task" in auto_ta.name
+    assert auto_ta.content == big
+    assert auto_ta.size == len(big.encode("utf-8"))
+    assert auto_ta.storage_ref == ""
+
+
+@pytest.mark.asyncio
+async def test_finish_no_auto_artifact_when_registered_nonempty(registry, dispatcher):
+    """Worker artifact registered + oversize summary -> no auto artifact.
+
+    Layer-2 only fires when no artifact was registered; an oversize summary
+    alongside a successfully registered worker artifact must not duplicate.
+    """
+    callback = _InlineReturningCallback()
+    big = "x" * (_TASK_SUMMARY_CHAT_MAX_BYTES + 10)
+    executor = FakeExecutor(TaskAgentResult(
+        status=TaskRunOutcome.COMPLETED, output=big,
+        artifacts=({"type": "report", "name": "r1", "storage_ref": "ws:1"},),
+    ))
+    svc = TaskRunService(
+        registry=registry, dispatcher=dispatcher, executor=executor,
+        policy=TaskPolicy(), artifact_normalizer=_fake_normalizer,
+        artifact_register_callback=callback,
+    )
+    task = _queued_task(id="t_noauto")
+    await registry.create_task(task)
+    claim = await registry.claim_task(task.id, "lock-1", 900)
+    await svc.run_claim(claim.task, claim.run.id, claim.run.claim_lock)
+    # Only the worker artifact callback (ordinal 0); no Layer-2 auto call
+    assert len(callback.calls) == 1
+    assert callback.calls[0][3] == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_no_auto_artifact_when_summary_small(registry, dispatcher):
+    """Small summary + no artifacts -> no auto artifact (under byte cap)."""
+    callback = _InlineReturningCallback()
+    executor = FakeExecutor(TaskAgentResult(
+        status=TaskRunOutcome.COMPLETED, output="small summary", artifacts=(),
+    ))
+    svc = TaskRunService(
+        registry=registry, dispatcher=dispatcher, executor=executor,
+        policy=TaskPolicy(), artifact_register_callback=callback,
+    )
+    task = _queued_task(id="t_small")
+    await registry.create_task(task)
+    claim = await registry.claim_task(task.id, "lock-1", 900)
+    await svc.run_claim(claim.task, claim.run.id, claim.run.claim_lock)
+    assert len(callback.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_normalize_artifact_content_passthrough(registry, dispatcher):
+    """No normalizer + content (no storage_ref) -> accepted, content passed.
+
+    A text artifact submitted with inline ``content`` and no ``storage_ref``
+    must pass normalization (content satisfies the required-field check) and
+    carry the content through to the TaskArtifact.
+    """
+    svc = TaskRunService(
+        registry=registry, dispatcher=dispatcher,
+        executor=_artifact_executor((
+            {"type": "text", "name": "r1", "content": "full body"},
+        )),
+        policy=TaskPolicy(),
+    )
+    task = _queued_task(id="t_content")
+    await registry.create_task(task)
+    claim = await registry.claim_task(task.id, "lock-1", 900)
+    await svc.run_claim(claim.task, claim.run.id, claim.run.claim_lock)
+    cmd = registry.finish_calls[0]
+    assert len(cmd.artifacts) == 1
+    art = cmd.artifacts[0]
+    assert art.content == "full body"
+    assert art.storage_ref == ""
+
+
+@pytest.mark.asyncio
+async def test_finish_no_auto_artifact_when_not_succeeded(registry, dispatcher):
+    """ABORTED (FAILED terminal) + oversize summary -> no auto artifact.
+
+    Layer-2 fallback is SUCCEEDED-only; a failed task must not convert its
+    error summary into an artifact.
+    """
+    callback = _InlineReturningCallback()
+    big = "x" * (_TASK_SUMMARY_CHAT_MAX_BYTES + 10)
+    executor = FakeExecutor(TaskAgentResult(
+        status=TaskRunOutcome.ABORTED, error=big, artifacts=(),
+    ))
+    svc = TaskRunService(
+        registry=registry, dispatcher=dispatcher, executor=executor,
+        policy=TaskPolicy(), artifact_register_callback=callback,
+    )
+    task = _queued_task(id="t_abort")
+    await registry.create_task(task)
+    claim = await registry.claim_task(task.id, "lock-1", 900)
+    await svc.run_claim(claim.task, claim.run.id, claim.run.claim_lock)
+    assert len(callback.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_finish_auto_artifact_callback_returns_none_no_write(
+    registry, dispatcher,
+):
+    """Layer-2 callback returns None -> _write_artifact not called."""
+    callback = _RecordingArtifactCallback()  # returns None
+    writer_calls: list[tuple] = []
+
+    async def writer(session_id, content, card):
+        writer_calls.append((session_id, content, card))
+
+    big = "x" * (_TASK_SUMMARY_CHAT_MAX_BYTES + 10)
+    executor = FakeExecutor(TaskAgentResult(
+        status=TaskRunOutcome.COMPLETED, output=big, artifacts=(),
+    ))
+    svc = TaskRunService(
+        registry=registry, dispatcher=dispatcher, executor=executor,
+        policy=TaskPolicy(), artifact_register_callback=callback,
+        artifact_writer=writer,
+    )
+    task = _queued_task(id="t_none")
+    await registry.create_task(task)
+    claim = await registry.claim_task(task.id, "lock-1", 900)
+    await svc.run_claim(claim.task, claim.run.id, claim.run.claim_lock)
+    # Layer-2 still invoked the callback with the auto artifact
+    assert len(callback.calls) == 1
+    assert callback.calls[0][3] == -1
+    # callback returned None -> _write_artifact skipped
+    assert len(writer_calls) == 0
+

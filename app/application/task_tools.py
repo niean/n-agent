@@ -87,9 +87,12 @@ def task_tool_definitions() -> list[ToolDefinition]:
             name=TASK_TOOL_COMPLETE,
             description=(
                 "Submit the task completion intent. summary is a human-readable completion "
-                "summary, metadata is structured results, and artifacts is the list of outputs. "
-                "The tool only returns the terminal intent; TaskRunService finalizes the run in "
-                "one shot via a CAS using the claim token."
+                "summary (short display abstract only, never the full output), metadata is "
+                "structured results, and artifacts is the list of outputs. For text outputs "
+                "put the complete content in each artifact's ``content`` field; for binary/"
+                "large files put a ``workspace:`` file ref in ``storage_ref``. The tool only "
+                "returns the terminal intent; TaskRunService finalizes the run in one shot "
+                "via a CAS using the claim token."
             ),
             input_schema={
                 "type": "object",
@@ -108,8 +111,12 @@ def task_tool_definitions() -> list[ToolDefinition]:
                                 "storage_ref": {"type": "string"},
                                 "summary": {"type": "string"},
                                 "checksum": {"type": "string"},
+                                "content": {
+                                    "type": "string",
+                                    "description": "Complete text content for text-kind artifacts (markdown/text/code/html/json/csv). Preferred over storage_ref for text outputs.",
+                                },
                             },
-                            "required": ["type", "name", "storage_ref"],
+                            "required": ["type", "name"],
                             "additionalProperties": False,
                         },
                     },

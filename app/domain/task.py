@@ -610,6 +610,12 @@ class TaskArtifact:
 
     Distinct from TaskAttachment: Artifact is the domain-level descriptor
     that may point at any storage_ref (not necessarily a local file).
+
+    ``content`` carries inline text for text-kind artifacts, used when the
+    worker submits the full content directly instead of a ``workspace:``
+    file ref. Server-side registration prefers ``content`` (then ``summary``
+    fallback) to create an inline artifact when no readable workspace ref
+    is provided.
     """
 
     type: str
@@ -620,6 +626,7 @@ class TaskArtifact:
     source_task_id: str
     summary: str
     checksum: str
+    content: str | None = None
 
 
 # ---------------------------------------------------------------------------

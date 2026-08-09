@@ -1126,47 +1126,79 @@ class ArtifactService:
     ) -> Artifact | None:
         """Idempotent register from a TaskArtifact.
 
-        Only accepts TaskArtifact. storage_ref must be a workspace: ref.
-        Invalid/missing/unreadable -> warning + skip (return None).
-        Does NOT affect Task finish.
+        Two content paths:
+          - ``storage_ref`` is a ``workspace:`` ref -> read the file from
+            workspace_root, store as ``content_ref`` (binary/large files).
+          - Otherwise, for text-kind artifacts, use inline content from
+            ``content`` (preferred) or ``summary`` (fallback) -> store as
+            ``inline_content`` (no workspace file needed).
+
+        Invalid/missing/unreadable/incompatible-kind -> warning + skip
+        (return None). Does NOT affect Task finish.
         """
+        source_ref = Artifact.task_artifact_source_ref(task_id, run_id, ordinal)
         existing = await self._registry.get_by_source(
-            ArtifactSource.TASK_ARTIFACT,
-            Artifact.task_artifact_source_ref(task_id, run_id, ordinal),
+            ArtifactSource.TASK_ARTIFACT, source_ref,
         )
         if existing is not None:
             return existing
 
-        # Validate storage_ref is a workspace ref.
-        if not isinstance(task_artifact.storage_ref, str) or not task_artifact.storage_ref.startswith("workspace:"):
-            logger.warning(
-                "register_from_task_artifact skipped: "
-                "source_kind=%s source_ref=%s error=%s",
-                ArtifactSource.TASK_ARTIFACT.value,
-                Artifact.task_artifact_source_ref(task_id, run_id, ordinal),
-                "InvalidStorageRef",
-            )
-            return None
-
-        try:
-            data = await self._content_store.read(
-                task_artifact.storage_ref,
-                max_bytes=self._config.artifact_max_bytes,
-            )
-        except Exception as exc:
-            logger.warning(
-                "register_from_task_artifact skipped: "
-                "source_kind=%s source_ref=%s error=%s",
-                ArtifactSource.TASK_ARTIFACT.value,
-                Artifact.task_artifact_source_ref(task_id, run_id, ordinal),
-                type(exc).__name__,
-            )
-            return None
-
         resolved_mime = _resolve_mime(task_artifact.name, task_artifact.mime)
         kind = _kind_from_mime(resolved_mime)
-        size = len(data)
-        checksum = _sha256_checksum(data)
+        is_workspace_ref = (
+            isinstance(task_artifact.storage_ref, str)
+            and task_artifact.storage_ref.startswith("workspace:")
+        )
+
+        new_content_ref: str | None = None
+        new_inline: str | None = None
+        size: int = 0
+        checksum: str = ""
+
+        if is_workspace_ref:
+            try:
+                data = await self._content_store.read(
+                    task_artifact.storage_ref,
+                    max_bytes=self._config.artifact_max_bytes,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "register_from_task_artifact skipped: "
+                    "source_kind=%s source_ref=%s error=%s",
+                    ArtifactSource.TASK_ARTIFACT.value, source_ref,
+                    type(exc).__name__,
+                )
+                return None
+            new_content_ref = task_artifact.storage_ref
+            size = len(data)
+            checksum = _sha256_checksum(data)
+        else:
+            # Inline path: text-kind artifacts only. Prefer ``content``,
+            # fall back to ``summary`` (worker may put full text there).
+            inline_text = task_artifact.content
+            if not inline_text and task_artifact.summary:
+                inline_text = task_artifact.summary
+            if not inline_text or kind not in _TEXT_KINDS:
+                logger.warning(
+                    "register_from_task_artifact skipped: "
+                    "source_kind=%s source_ref=%s error=%s",
+                    ArtifactSource.TASK_ARTIFACT.value, source_ref,
+                    "InvalidStorageRef",
+                )
+                return None
+            data = inline_text.encode("utf-8")
+            if len(data) > self._config.artifact_inline_max_bytes:
+                logger.warning(
+                    "register_from_task_artifact skipped: "
+                    "source_kind=%s source_ref=%s error=%s",
+                    ArtifactSource.TASK_ARTIFACT.value, source_ref,
+                    "ContentTooLarge",
+                )
+                return None
+            new_inline = inline_text
+            size = len(data)
+            checksum = _sha256_checksum(data)
+
         artifact_id = _generate_artifact_id()
         session_id = await self._resolve_task_session(task_id)
 
@@ -1175,12 +1207,12 @@ class ArtifactService:
             name=task_artifact.name,
             kind=kind,
             mime=resolved_mime,
-            content_ref=task_artifact.storage_ref,
-            inline_content=None,
+            content_ref=new_content_ref,
+            inline_content=new_inline,
             size=size,
             checksum=checksum,
             source_kind=ArtifactSource.TASK_ARTIFACT,
-            source_ref=Artifact.task_artifact_source_ref(task_id, run_id, ordinal),
+            source_ref=source_ref,
             source_context_ref=task_id,
             source_session_id=session_id,
             summary=task_artifact.summary,
@@ -1193,8 +1225,7 @@ class ArtifactService:
             logger.warning(
                 "register_from_task_artifact failed: "
                 "source_kind=%s source_ref=%s error=%s",
-                ArtifactSource.TASK_ARTIFACT.value,
-                Artifact.task_artifact_source_ref(task_id, run_id, ordinal),
+                ArtifactSource.TASK_ARTIFACT.value, source_ref,
                 type(exc).__name__,
             )
             return None

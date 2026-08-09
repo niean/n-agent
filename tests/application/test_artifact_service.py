@@ -1902,6 +1902,122 @@ class TestRegisterFromTaskArtifact:
         result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
         assert result is None  # no exception raised
 
+    @pytest.mark.asyncio
+    async def test_register_inline_content_creates_artifact(self):
+        """Non-workspace ref + ``content`` -> inline artifact (no file read).
+
+        Worker submits the full text output directly in ``content`` instead of
+        a ``workspace:`` file ref. Server creates an inline artifact and
+        recomputes trusted size/checksum.
+        """
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        svc = _make_service(registry=registry, content_store=store)
+        body = "# Report\n\nlong content here"
+        ta = TaskArtifact(
+            type="text", name="report.md", mime="text/markdown",
+            size=0, storage_ref="", source_task_id="task-1",
+            summary="short abstract", checksum="", content=body,
+        )
+        result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is not None
+        assert result.kind is ArtifactKind.MARKDOWN
+        assert result.source_kind is ArtifactSource.TASK_ARTIFACT
+        assert result.inline_content == body
+        assert result.content_ref is None
+        data = body.encode("utf-8")
+        assert result.size == len(data)
+        assert result.checksum == _sha256(data)
+        assert result.source_ref == Artifact.task_artifact_source_ref("task-1", 1, 0)
+        assert result.source_context_ref == "task-1"
+        # content store never touched (no workspace file to read)
+        assert len(store.read_calls) == 0
+        assert len(registry.create_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_register_summary_fallback_creates_artifact(self):
+        """No ``content`` + non-workspace ref + non-empty ``summary`` ->
+        inline artifact using summary as the body (fallback).
+
+        Workers that put the full output in ``summary`` still produce a
+        standard artifact instead of being silently dropped.
+        """
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        svc = _make_service(registry=registry, content_store=store)
+        body = "full output text in summary"
+        ta = TaskArtifact(
+            type="text", name="output.txt", mime="text/plain",
+            size=0, storage_ref="", source_task_id="task-1",
+            summary=body, checksum="", content=None,
+        )
+        result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is not None
+        assert result.kind is ArtifactKind.TEXT
+        assert result.inline_content == body
+        assert result.content_ref is None
+        data = body.encode("utf-8")
+        assert result.size == len(data)
+        assert result.checksum == _sha256(data)
+        assert len(store.read_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_register_inline_exceeds_limit_skipped(self, caplog):
+        """Inline content larger than artifact_inline_max_bytes -> skip."""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        svc = _make_service(
+            registry=registry, content_store=store,
+            config=_make_config(artifact_inline_max_bytes=4),
+        )
+        ta = TaskArtifact(
+            type="text", name="big.md", mime="text/markdown",
+            size=0, storage_ref="", source_task_id="task-1",
+            summary="", checksum="", content="more than four bytes",
+        )
+        with caplog.at_level(logging.WARNING):
+            result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is None
+        assert len(registry.create_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_register_binary_kind_no_content_skipped(self, caplog):
+        """Non-workspace ref + binary-kind name + content -> skipped.
+
+        Inline path is text-kind only; a .dat output without a workspace ref
+        cannot be inlined and must not be registered.
+        """
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        svc = _make_service(registry=registry, content_store=store)
+        ta = TaskArtifact(
+            type="binary", name="output.dat", mime="",
+            size=0, storage_ref="", source_task_id="task-1",
+            summary="", checksum="", content="\x00\x01\x02",
+        )
+        with caplog.at_level(logging.WARNING):
+            result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is None
+        assert len(registry.create_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_register_inline_kind_inferred_from_name(self):
+        """Empty mime + .md name + ``content`` -> MARKDOWN inline artifact."""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        svc = _make_service(registry=registry, content_store=store)
+        body = "# inferred"
+        ta = TaskArtifact(
+            type="text", name="notes.md", mime="",
+            size=0, storage_ref="", source_task_id="task-1",
+            summary="", checksum="", content=body,
+        )
+        result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is not None
+        assert result.kind is ArtifactKind.MARKDOWN
+        assert result.mime == "text/markdown"
+        assert result.inline_content == body
+
 
 def _session_resolver(mapping: dict[str, str]):
     """Build a task_id -> session_id resolver from a static mapping."""
