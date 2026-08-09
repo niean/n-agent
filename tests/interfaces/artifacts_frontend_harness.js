@@ -16,8 +16,8 @@
 // - revokeObjectURL on switch/destroy
 // - text save / binary replace refresh via server size/checksum/updated_at
 // - export as a single button (original format only; no dropdown)
-// - publish share_url/copy/revoke; binary publish shows explicit-PUBLIC
-//   confirmation
+// - publish: single toggle button (发布/撤回) + header status segment showing
+//   the share link; binary publish shows explicit-PUBLIC confirmation
 //
 // All artifact content is rendered via textContent / safe attributes /
 // sandbox iframe ONLY.
@@ -452,6 +452,15 @@ async function testPublishBlockedState() {
     if ((opts.method || 'GET') === 'POST') return errResp('publish_blocked', 'blocked', 422);
     return jsonResp({ status: 'unpublished' });
   });
+  // Publish failure is reported via the shared modal; artifacts.js has no
+  // inline "blocked" text -- the header status segment only reflects an active
+  // publish state, so a blocked publish must leave the UI unpublished.
+  let alertMsg = null;
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = {
+    alert: function (msg) { alertMsg = String(msg); return Promise.resolve(); },
+    confirm: function () { return Promise.resolve(true); },
+  };
   const mod = loadModule(win);
   await mod.init();
   await tick();
@@ -464,8 +473,16 @@ async function testPublishBlockedState() {
     for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({});
     await tick();
   }
-  const text = collectText(byId['tab-artifacts']);
-  ok(/blocked|阻止|禁止|不可发布|无法发布/i.test(text), 'publish-blocked state shown: ' + text.slice(0, 120));
+  // blocked publish -> failure reported via modal alert
+  ok(alertMsg && /失败|blocked|publish_blocked|不可发布|无法发布/i.test(alertMsg),
+    'publish-blocked failure reported via modal alert: ' + String(alertMsg));
+  // publish did not activate: button stays 发布, no share link rendered
+  if (pubBtn[0]) {
+    ok(/发布/.test(pubBtn[0]._text) && !/撤回/.test(pubBtn[0]._text),
+      'publish button stays 发布 after blocked publish, got: ' + pubBtn[0]._text);
+  }
+  ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-link').length,
+    'no share link shown after blocked publish');
 }
 
 async function testSourceBacklinkValidTaskId() {
@@ -755,20 +772,28 @@ async function testExportButtonOriginalOnly() {
   ok(exportBtns2.length === 1, 'export control present for code');
 }
 
-async function testPublishShareUrlCopyRevoke() {
+async function testPublishShareUrlToggleRevoke() {
   const win = freshEnv();
   const a = art('a1', 'text', { source_kind: 'manual' });
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
   route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
   route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
+  // GET /publish reflects the server-tracked state: unpublished before POST,
+  // active after POST, back to unpublished after DELETE (revoke). The client
+  // re-fetches status after publish, so the GET must stay consistent.
+  let published = false;
   route(/^\/chat\/artifacts\/a1\/publish$/, (m, opts) => {
     if ((opts.method || 'GET') === 'POST') {
+      published = true;
       return jsonResp({ publish_id: 'pub123', share_path: '/p/pub123', share_url: 'http://test/p/pub123', reused: false });
     }
     if ((opts.method || 'GET') === 'DELETE') {
+      published = false;
       return jsonResp({ status: 'revoked', publish_id: 'pub123', revoked_at: '2026-01-03T00:00:00+00:00' });
     }
-    return jsonResp({ status: 'unpublished' });
+    return jsonResp(published
+      ? { status: 'active', share_url: 'http://test/p/pub123', share_path: '/p/pub123' }
+      : { status: 'unpublished' });
   });
   const mod = loadModule(win);
   await mod.init();
@@ -778,20 +803,30 @@ async function testPublishShareUrlCopyRevoke() {
   await tick();
   // publish
   const pubBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish');
-  if (pubBtn[0]) { for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({}); await tick(); }
+  if (pubBtn[0]) { for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({}); await tick(); await tick(); }
+  // share link shown in the header status segment after publish
   const text = collectText(byId['tab-artifacts']);
-  ok(text.indexOf('http://test/p/pub123') !== -1 || text.indexOf('/p/pub123') !== -1,
-    'share_url shown after publish: ' + text.slice(0, 120));
-  // copy button present
-  const copyBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__copy');
-  ok(copyBtn.length > 0, 'copy button present after publish');
-  // revoke button present
-  const revokeBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__revoke');
-  ok(revokeBtn.length > 0, 'revoke button present after publish');
-  // click revoke
-  if (revokeBtn[0]) { for (const fn of (revokeBtn[0]._listeners['click'] || [])) fn({}); await tick(); }
+  ok(text.indexOf('http://test/p/pub123') !== -1 || text.indexOf('/p/pub123') !== -1 || text.indexOf('已发布') !== -1,
+    'share link / published state shown after publish: ' + text.slice(0, 120));
+  // single toggle button design: button text flips to 撤回; no separate
+  // copy or revoke buttons exist.
+  if (pubBtn[0]) {
+    ok(/撤回/.test(pubBtn[0]._text), 'publish button toggled to 撤回 after publish, got: ' + pubBtn[0]._text);
+  }
+  ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__copy').length,
+    'no separate copy button (single toggle button design)');
+  ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__revoke').length,
+    'no separate revoke button (publish button toggles to revoke)');
+  // click the same button again to revoke
+  if (pubBtn[0]) { for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({}); await tick(); await tick(); }
+  // after revoke: button reverts to 发布 and the share link is removed
+  if (pubBtn[0]) {
+    ok(/发布/.test(pubBtn[0]._text) && !/撤回/.test(pubBtn[0]._text),
+      'publish button reverts to 发布 after revoke, got: ' + pubBtn[0]._text);
+  }
   const text2 = collectText(byId['tab-artifacts']);
-  ok(/失效|invalid|revoked|已撤销/i.test(text2), 'revoked state shown after revoke: ' + text2.slice(0, 120));
+  ok(text2.indexOf('http://test/p/pub123') === -1 && text2.indexOf('/p/pub123') === -1,
+    'share link removed after revoke: ' + text2.slice(0, 120));
 }
 
 async function testBinaryPublishConfirmation() {
@@ -999,7 +1034,7 @@ const tests = [
   testRevokeObjectURLOnDestroy,
   testTextSaveRefreshWithServerMetadata,
   testExportButtonOriginalOnly,
-  testPublishShareUrlCopyRevoke,
+  testPublishShareUrlToggleRevoke,
   testBinaryPublishConfirmation,
   testRenderListItemExported,
   testRenderListItemCallbackContract,

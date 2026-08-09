@@ -5,8 +5,9 @@
 
   const ENTRIES = [
     { tab: 'chat', label: '对话', desc: '发起新一轮对话或恢复会话' },
-    { tab: 'tasks', label: '任务', desc: '提交目标驱动异步任务，看板跟踪进度与产物' },
     { tab: 'scheduled-tasks', label: '定时任务', desc: '管理定时任务与查看最近执行结果' },
+    { tab: 'tasks', label: '任务', desc: '提交目标驱动异步任务，看板跟踪进度与产物' },
+    { tab: 'artifacts', label: '制品', desc: '预览、编辑、导出与发布产出物' },
     { tab: 'sessions', label: '会话', desc: '查看历史会话与详细消息' },
     { tab: 'memory', label: '记忆', desc: '管理项目记忆，配置全局默认启用' },
     { tab: 'tools-knowledge', label: '知识', desc: '知识管理' },
@@ -16,6 +17,7 @@
     { tab: 'tools-builtin', label: 'Builtin', desc: '查看已注册的工具与风险等级' },
     { tab: 'sandbox', label: '沙盒', desc: '查看沙盒配置、活跃实例与执行历史' },
     { tab: 'executors-host', label: '本机', desc: '查看本机执行器状态、授权策略与执行历史' },
+    { tab: 'browser', label: '浏览器', desc: '浏览器自动化，实时视图与操作历史' },
     { tab: 'models', label: '模型', desc: '查看对外暴露的统一模型' },
     { tab: 'platforms', label: '平台', desc: '查看接入平台与平台会话' },
     { tab: 'observations-sessions', label: '会话观测', desc: '查看会话 Token 用量与 API 调用历史' },

@@ -189,7 +189,7 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert '.kanban-board' in styles_css
     assert 'width: calc(100vw - var(--sidebar-width-collapsed))' in styles_css
     assert 'width: calc(100vw - var(--sidebar-width-expanded))' in styles_css
-    assert 'min-height: calc(100vh - 179px)' in styles_css
+    assert 'height: calc(100vh - 90px)' in styles_css
     kanban_board_rule = styles_css[styles_css.index('.kanban-board {'):styles_css.index('.kanban-column {')]
     assert '--kanban-column-count: 5' in kanban_board_rule
     assert '--kanban-column-gap: 12px' in kanban_board_rule
@@ -296,6 +296,16 @@ def test_static_assets_contain_expected_logic(tmp_path):
         < summary_js.index("tab: 'tools-plugin'")
         < summary_js.index("tab: 'tools-builtin'")
     )
+    # 概览功能入口补全制品、浏览器，顺序对齐左导菜单上下顺序
+    assert "tab: 'artifacts'" in summary_js
+    assert "tab: 'browser'" in summary_js
+    summary_entry_tabs = re.findall(r"tab: '([^']+)'", summary_js)
+    assert summary_entry_tabs == [
+        'chat', 'scheduled-tasks', 'tasks', 'artifacts', 'sessions', 'memory',
+        'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
+        'sandbox', 'executors-host', 'browser', 'models', 'platforms',
+        'observations-sessions', 'observations-modules', 'security',
+    ], f"summary ENTRIES order mismatch: {summary_entry_tabs}"
 
 
 def test_platforms_static_assets_contain_readonly_ui(tmp_path):
@@ -908,9 +918,9 @@ def test_index_html_links_assets(tmp_path):
     )
     for asset in assets:
         assert asset in html, f"index.html missing reference to {asset}"
-    for tab in ('概览', '对话', '会话', '记忆', '工具', '沙盒', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin', '组件'):
+    for tab in ('对话', '会话', '记忆', '工具', '沙盒', '模型', '观测', '任务', '平台', '知识', 'MCP', 'Skill', 'Plugin', 'Builtin', '组件'):
         assert tab in html, f"index.html missing menu label {tab}"
-    for path in ('/summary', '/chat', '/sessions', '/memory', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/sandbox', '/models', '/observations/sessions', '/observations/modules', '/platforms', '/scheduled-tasks'):
+    for path in ('/chat', '/sessions', '/memory', '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin', '/sandbox', '/models', '/observations/sessions', '/observations/modules', '/platforms', '/scheduled-tasks'):
         assert f'href="{path}"' in html, f"index.html missing nav href {path}"
     assert (
         html.index('href="/sessions"')
@@ -945,7 +955,7 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     """T4: topbar 重构为三段（标题挂载点 + 顶导挂载点 + 右侧预留区），
     移除 last-update 与品牌占位；新增 #tab-tasks-observations 容器；
     引入 topnav.js / tasks-observations.js（在 app.js 之前）。
-    #app-sidebar 整块不动（链接集合精确回归）。"""
+    #app-sidebar 链接集合精确回归（概览菜单已移除，/summary 路由保留）。"""
     import re as _re
     client = _client(tmp_path)
     html = client.get('/chat').text
@@ -993,18 +1003,18 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     assert html.index('/static/management-navigation.js') < html.index('/static/tasks-observations.js'), \
         "management-navigation.js must load before tasks-observations.js"
 
-    # 5) #app-sidebar 整块不动：链接集合精确回归（data-tab 序列 + href 序列）
+    # 5) #app-sidebar 链接集合精确回归（概览菜单已从左导移除，域名默认页与 /summary 路由保留）
     sidebar_match = _re.search(r'<aside[^>]*id="app-sidebar"[^>]*>(.*?)</aside>', html, _re.DOTALL)
     assert sidebar_match, "sidebar not found"
     sidebar_html = sidebar_match.group(1)
     expected_data_tabs = [
-        'summary', 'chat', 'scheduled-tasks', 'tasks', 'artifacts', 'sessions', 'memory',
+        'chat', 'scheduled-tasks', 'tasks', 'artifacts', 'sessions', 'memory',
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
         'executors', 'sandbox', 'executors-host', 'browser', 'models', 'platforms',
         'observations', 'observations-sessions', 'observations-modules', 'security',
     ]
     expected_hrefs = [
-        '/summary', '/chat', '/scheduled-tasks', '/tasks', '/artifacts', '/sessions', '/memory',
+        '/chat', '/scheduled-tasks', '/tasks', '/artifacts', '/sessions', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/models', '/platforms',
         '/observations/sessions', '/observations/modules', '/security',
