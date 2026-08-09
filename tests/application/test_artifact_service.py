@@ -241,6 +241,16 @@ class FakeArtifactRegistry:
                 return p
         return None
 
+    async def delete_published_by_artifact(self, artifact_id: str) -> int:
+        to_remove = [
+            pid for pid, p in self._published.items()
+            if p.artifact_id == artifact_id
+        ]
+        for pid in to_remove:
+            del self._published[pid]
+        self._active_by_artifact.pop(artifact_id, None)
+        return len(to_remove)
+
     async def list_attachment_sources(
         self,
         *,
@@ -322,6 +332,12 @@ class FakeArtifactContentStore:
         ref = f"published:{publish_id}/snapshot"
         self._content[ref] = data
         return ref
+
+    async def delete_publish_snapshot(self, publish_id: str) -> None:
+        prefix = f"published:{publish_id}/"
+        for ref in [r for r in list(self._content) if r.startswith(prefix)]:
+            self.delete_calls.append(ref)
+            self._content.pop(ref, None)
 
     def seed(self, ref: str, data: bytes) -> None:
         self._content[ref] = data
@@ -1120,7 +1136,7 @@ class TestDeleteArtifact:
 
 
     @pytest.mark.asyncio
-    async def test_delete_does_not_touch_snapshots(self):
+    async def test_delete_without_publish_leaves_unrelated_snapshot(self):
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         ref = "item:art-1/file"
@@ -1130,7 +1146,9 @@ class TestDeleteArtifact:
         registry.seed(_make_file_artifact(artifact_id="art-1", content_ref=ref, size=4))
         svc = _make_service(registry=registry, content_store=store)
         await svc.delete_artifact("art-1")
-        # snapshot not deleted
+        # no publish row for art-1 -> purge is a no-op; an unrelated snapshot
+        # (different publish_id, not registered as a publish for this artifact)
+        # is not touched. Only this artifact's own publishes are purged.
         assert snapshot_ref not in store.delete_calls
         assert store.has(snapshot_ref)
 
@@ -1377,18 +1395,19 @@ class TestPublish:
         assert len(registry.register_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_edit_then_replacement_new_id_old_revoked(self):
+    async def test_edit_then_republish_new_id_old_revoked(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
         registry.seed(_make_inline_artifact(inline_content="v1"))
         svc = _make_service(registry=registry, flow=flow)
         r1 = await svc.publish("art-1")
-        # edit content
+        # edit content -> revokes the active publish (snapshot diverges)
         await svc.update_artifact("art-1", inline_content="v2")
+        # re-publish creates a fresh publish (no active left to replace)
         r2 = await svc.publish("art-1")
         assert not r2.reused
         assert r1.published.publish_id != r2.published.publish_id
-        # old publish revoked
+        # old publish revoked (by the edit)
         old = await registry.get_published(r1.published.publish_id)
         assert old.status is PublishedArtifactStatus.REVOKED
         # new is active
@@ -1429,23 +1448,41 @@ class TestPublish:
         assert len(registry.register_calls) == 1  # attempt was made
 
     @pytest.mark.asyncio
-    async def test_registry_failure_old_active_preserved(self):
+    async def test_failed_republish_after_edit_leaves_old_revoked(self):
+        # edit revokes the active publish; a subsequent failed re-publish must
+        # not resurrect the old publish (stays revoked, no active).
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         flow = FakeInformationFlowService(allow=True)
         registry.seed(_make_inline_artifact(inline_content="v1"))
         svc = _make_service(registry=registry, content_store=store, flow=flow)
         r1 = await svc.publish("art-1")
-        # edit and try to republish, but registry fails
+        # edit content -> revokes the old active publish
         await svc.update_artifact("art-1", inline_content="v2")
+        assert (await registry.get_active_publish("art-1")) is None
+        # failed re-publish does not resurrect it
         registry.fail_on_register = True
         with pytest.raises(RuntimeError):
             await svc.publish("art-1")
-        # old active still preserved
+        assert (await registry.get_active_publish("art-1")) is None
+        old = await registry.get_published(r1.published.publish_id)
+        assert old.status is PublishedArtifactStatus.REVOKED
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_edit_does_not_revoke_publish(self):
+        # metadata-only edit (no content change) does NOT revoke the active
+        # publish: the snapshot content is unchanged, so the publish stays valid.
+        registry = FakeArtifactRegistry()
+        flow = FakeInformationFlowService(allow=True)
+        registry.seed(_make_inline_artifact(inline_content="content"))
+        svc = _make_service(registry=registry, flow=flow)
+        r1 = await svc.publish("art-1")
+        await svc.update_artifact("art-1", name="renamed.md", summary="new summary")
         active = await registry.get_active_publish("art-1")
         assert active is not None
         assert active.publish_id == r1.published.publish_id
         assert active.status is PublishedArtifactStatus.ACTIVE
+        assert len(registry.revoke_calls) == 0
 
     @pytest.mark.asyncio
     async def test_publish_id_is_url_safe_128bit(self):
@@ -1582,29 +1619,33 @@ class TestGetPublished:
         assert len(store.read_calls) == 0
 
     @pytest.mark.asyncio
-    async def test_source_delete_snapshot_still_readable(self):
+    async def test_delete_source_purges_publish(self):
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
-        flow = FakeInformationFlowService(allow=True)
-        ref = "item:art-1/file"
-        store.seed(ref, b"content data")
-        registry.seed(
-            _make_file_artifact(
-                artifact_id="art-1",
-                kind=ArtifactKind.TEXT,
-                mime="text/plain",
-                content_ref=ref,
-                size=len(b"content data"),
-                checksum=_sha256(b"content data"),
-            )
+        flow = FakeInformationFlowService(allow=True, redacted_content="REDACTED")
+        registry.seed(_make_inline_artifact(inline_content="content data"))
+        # inline_max_bytes=1 forces the 7-byte redacted snapshot into a FILE
+        # (so snapshot_content_ref is set and a snapshot file exists to delete)
+        svc = _make_service(
+            registry=registry, content_store=store, flow=flow,
+            config=_make_config(artifact_inline_max_bytes=1),
         )
-        svc = _make_service(registry=registry, content_store=store, flow=flow)
         result = await svc.publish("art-1")
-        # delete source artifact
+        publish_id = result.published.publish_id
+        snapshot_ref = result.published.snapshot_content_ref
+        assert snapshot_ref is not None
+        assert store.has(snapshot_ref)
+
+        # delete source artifact -> purges publish record + snapshot file
         await svc.delete_artifact("art-1")
-        # snapshot still readable
-        pub = await svc.get_published(result.published.publish_id)
-        assert pub is not None
+
+        # publish record gone (public link 404, not 410 -- row deleted)
+        with pytest.raises(PublishedArtifactNotFoundError):
+            await svc.get_published(publish_id)
+        assert await registry.get_active_publish("art-1") is None
+        assert await registry.list_published("art-1") == ()
+        # snapshot content file deleted
+        assert store.has(snapshot_ref) is False
 
 
 # ---------------------------------------------------------------------------

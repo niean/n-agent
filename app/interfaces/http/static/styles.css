@@ -958,14 +958,14 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .artifacts-preview__markdown, .artifacts-preview__html, .artifacts-preview__json, .artifacts-preview__csv, .artifacts-preview__pdf { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .artifacts-preview__iframe { width: 100%; flex: 1 1 auto; min-height: 360px; border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); background: var(--color-bg-default, #fff); }
 .artifacts-preview__pre { flex: 1; min-height: 0; max-height: none; background: var(--color-bg-muted, #f7f8fa); padding: 10px; border-radius: var(--radius-sm); overflow: auto; white-space: pre-wrap; word-break: break-word; }
-.artifacts-preview__table { width: 100%; border-collapse: collapse; }
-.artifacts-preview__table th, .artifacts-preview__table td { border: 1px solid var(--color-border-light); padding: 4px 8px; text-align: left; word-break: break-word; }
+.artifacts-preview__table { width: 100%; min-width: max-content; border-collapse: collapse; }
+.artifacts-preview__table th, .artifacts-preview__table td { border: 1px solid var(--color-border-light); padding: 4px 10px; text-align: left; white-space: nowrap; }
+.artifacts-preview__csv { overflow-x: auto; }
 .artifacts-preview__img { max-width: 100%; height: auto; border-radius: var(--radius-sm); }
 .artifacts-preview__pdf-download { margin-top: 8px; }
 .artifacts-detail__editor { padding: 12px; flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
 .artifacts-detail__textarea { width: 100%; flex: 1; min-height: 240px; font-family: var(--font-mono, monospace); font-size: var(--font-size-sm); resize: vertical; }
 .artifacts-detail__edit-actions { display: flex; gap: 8px; }
-.artifacts-publish { padding: 10px 12px; border-top: 1px solid var(--color-border-light); display: flex; flex-direction: column; gap: 8px; }
-.artifacts-publish__url { display: flex; gap: 6px; align-items: center; }
-.artifacts-publish__share-url { flex: 1; min-width: 0; font-family: var(--font-mono, monospace); font-size: var(--font-size-sm); }
-.artifacts-publish__revoked { font-style: italic; }
+.artifacts-detail__publish-status { margin-left: 4px; }
+.artifacts-detail__publish-link { color: var(--color-primary, #2563eb); text-decoration: none; }
+.artifacts-detail__publish-link:hover { text-decoration: underline; }

@@ -406,6 +406,16 @@ class ArtifactRegistry(Protocol):
     async def revoke_published(
         self, artifact_id: str,
     ) -> PublishedArtifact | None: ...
+    async def delete_published_by_artifact(
+        self, artifact_id: str,
+    ) -> int:
+        """Delete every PublishedArtifact row referencing ``artifact_id``.
+
+        Returns the number of rows deleted. Used by source-artifact deletion
+        to purge publish records (and, via the content store, their snapshot
+        files) so no orphaned rows survive with a NULL artifact_id.
+        """
+        ...
 
     # --- Backfill batch read ---
     async def list_attachment_sources(
@@ -438,6 +448,15 @@ class ArtifactContentStore(Protocol):
     async def copy_to_publish_snapshot(
         self, src_ref: str, publish_id: str, *, inline: str | None = None,
     ) -> str: ...
+    async def delete_publish_snapshot(self, publish_id: str) -> None:
+        """Remove the ``published/{publish_id}/`` snapshot directory.
+
+        Idempotent: a missing directory is a no-op. Deletes only regular
+        files within the directory then the directory itself; refuses
+        symlinks/subdirs (defense-in-depth). Inverse of
+        :meth:`copy_to_publish_snapshot`.
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------

@@ -482,7 +482,7 @@
       const pub = await getPublish(id, sig);
       if (state.selectedId !== id) return;
       state.publish = pub;
-      renderPublishArea();
+      refreshPublishState();
     } catch (_) { /* publish status optional */ }
   }
 
@@ -524,13 +524,17 @@
     const meta = el('div', 'artifacts-detail__metadata muted');
     meta.textContent = '大小: ' + (detail.size != null ? detail.size : '-') + ' B'
       + ' · 更新: ' + fmtTime(detail.updated_at);
+    // publish status segment (populated by refreshPublishState when active):
+    // appends "；已发布: 链接" with the share link, per the prd format.
+    const pubStatus = el('span', 'artifacts-detail__publish-status');
+    meta.appendChild(pubStatus);
     body.appendChild(meta);
     if (state.view === 'edit') {
       renderEditor(body, detail);
     } else {
       renderPreview(body, detail);
     }
-    renderPublishArea(body);
+    refreshPublishState();
   }
 
   function renderHeader(body, detail) {
@@ -583,11 +587,18 @@
     actions.appendChild(delBtn);
     // export button (original format only)
     actions.appendChild(buildExportButton(detail));
-    // publish button
+    // publish button: toggles between 发布 (publish) and 撤回 (revoke) based on
+    // the active publish state. Text is kept in sync by refreshPublishState;
+    // the handler branches at click time so no listener swap is needed.
     const pubBtn = el('button', 'btn artifacts-detail__publish');
     pubBtn.type = 'button';
     pubBtn.textContent = '发布';
-    pubBtn.addEventListener('click', () => doPublish());
+    pubBtn.addEventListener('click', () => {
+      const pub = state.publish;
+      const active = pub && (pub.status === 'active' || pub.status === 'published');
+      if (active) { doRevoke(state.detail && state.detail.id); }
+      else { doPublish(); }
+    });
     actions.appendChild(pubBtn);
     header.appendChild(actions);
     body.appendChild(header);
@@ -831,9 +842,14 @@
       state.detail = updated;
       state.content = { text: value, kind: updated.kind, mime: updated.mime };
       state.view = 'preview';
+      // content edit revokes the active publish on the server (snapshot
+      // diverges); reset local state so the UI immediately shows unpublished.
+      // loadPublishStatus confirms the server state.
+      state.publish = null;
       renderDetail();
       // refresh list (metadata may have changed)
       reloadList();
+      loadPublishStatus(id, inflight ? inflight.signal : undefined);
     } catch (e) {
       if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('保存失败：' + (e && e.message ? e.message : e));
@@ -865,6 +881,9 @@
         // refresh with server-returned size/checksum/updated_at
         state.detail = updated;
         state.view = 'preview';
+        // content edit revokes the active publish on the server; reset local
+        // state. loadDetail (below) reloads publish status to confirm.
+        state.publish = null;
         // reload content (binary)
         if (inflight) { try { inflight.abort(); } catch (_) {} }
         revokeActiveBlobs();
@@ -887,53 +906,33 @@
   }
 
   // ---- publish ----
-  function renderPublishArea(body) {
-    const host = body || byId('artifacts-detail-body');
+  // Reflect state.publish in the header: the publish button text (发布/撤回)
+  // and the publish-status segment of the metadata row (已发布: 链接). This is
+  // a targeted update -- it does NOT re-render the preview, so calling it when
+  // the publish status arrives (async) won't reload iframes or reset scroll.
+  function refreshPublishState() {
+    const host = byId('artifacts-detail-body');
     if (!host) return;
-    // remove old publish area if present
-    const old = host.querySelector('.artifacts-publish');
-    if (old) old.remove();
     const pub = state.publish;
-    if (!pub) return;
-    if (pub.status === 'unpublished' || !pub.status) return;
-    const wrap = el('div', 'artifacts-publish');
-    if (pub.status === 'active' || pub.status === 'published') {
-      const shareUrl = pub.share_url || (pub.share_path ? global.location.origin + pub.share_path : '');
-      const urlBox = el('div', 'artifacts-publish__url');
-      // Render the share URL as textContent (read-only display) so it is
-      // visible without depending on input value rendering.
-      const urlText = el('span', 'artifacts-publish__share-url-text');
-      urlText.textContent = shareUrl;
-      urlBox.appendChild(urlText);
-      const input = el('input', 'artifacts-publish__share-url');
-      input.type = 'hidden';
-      input.value = shareUrl;
-      urlBox.appendChild(input);
-      const copy = el('button', 'btn artifacts-detail__copy');
-      copy.type = 'button';
-      copy.textContent = '复制';
-      copy.addEventListener('click', () => copyToClipboard(shareUrl));
-      urlBox.appendChild(copy);
-      wrap.appendChild(urlBox);
-      const revoke = el('button', 'btn btn--danger artifacts-detail__revoke');
-      revoke.type = 'button';
-      revoke.textContent = '撤销发布';
-      revoke.addEventListener('click', () => doRevoke(state.detail && state.detail.id));
-      wrap.appendChild(revoke);
-    } else if (pub.status === 'revoked') {
-      const msg = el('div', 'muted artifacts-publish__revoked');
-      msg.textContent = '链接已失效（发布已撤销）';
-      wrap.appendChild(msg);
+    const active = !!(pub && (pub.status === 'active' || pub.status === 'published'));
+    const btn = host.querySelector('.artifacts-detail__publish');
+    if (btn) btn.textContent = active ? '撤回' : '发布';
+    const span = host.querySelector('.artifacts-detail__publish-status');
+    if (!span) return;
+    clear(span);
+    if (!active) return;
+    const shareUrl = pub.share_url || (pub.share_path ? global.location.origin + pub.share_path : '');
+    span.appendChild(document.createTextNode('；已发布: '));
+    if (shareUrl) {
+      const a = el('a', 'artifacts-detail__publish-link');
+      a.href = shareUrl;
+      a.textContent = '链接';
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      span.appendChild(a);
+    } else {
+      span.appendChild(document.createTextNode('已发布'));
     }
-    host.appendChild(wrap);
-  }
-
-  async function copyToClipboard(text) {
-    try {
-      if (global.navigator && global.navigator.clipboard && global.navigator.clipboard.writeText) {
-        await global.navigator.clipboard.writeText(text);
-      }
-    } catch (_) { /* clipboard may be unavailable */ }
   }
 
   async function doPublish() {
@@ -950,14 +949,11 @@
     try {
       const result = await publishArtifact(detail.id);
       state.publish = { status: 'active', share_url: result.share_url, share_path: result.share_path };
-      renderPublishArea();
+      refreshPublishState();
       // refresh publish status (thread active signal for cancellation)
       loadPublishStatus(detail.id, inflight ? inflight.signal : undefined);
     } catch (e) {
-      const code = e && e.code ? e.code : '';
-      if (code === 'publish_blocked') {
-        renderPublishBlocked();
-      } else if (getModal() && typeof getModal().alert === 'function') {
+      if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('发布失败：' + (e && e.message ? e.message : e));
       }
     }
@@ -992,24 +988,12 @@
     }
   }
 
-  function renderPublishBlocked() {
-    const host = byId('artifacts-detail-body');
-    if (!host) return;
-    const old = host.querySelector('.artifacts-publish');
-    if (old) old.remove();
-    const wrap = el('div', 'artifacts-publish artifacts-publish__blocked');
-    const msg = el('div', 'muted error-state');
-    msg.textContent = '发布被阻止（publish_blocked）：该制品不满足发布条件';
-    wrap.appendChild(msg);
-    host.appendChild(wrap);
-  }
-
   async function doRevoke(id) {
     if (!id) return;
     try {
       const result = await revokePublish(id);
       state.publish = { status: 'revoked', revoked_at: result && result.revoked_at };
-      renderPublishArea();
+      refreshPublishState();
     } catch (e) {
       if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('撤销失败：' + (e && e.message ? e.message : e));

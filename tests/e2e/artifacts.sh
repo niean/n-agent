@@ -499,28 +499,31 @@ PYEOF
   fi
   echo "[Artifact E2E] 7b. ok (reuse same publish_id)"
 
-  # 7c. Edit artifact content (new checksum).
+  # 7c. Edit artifact content (new checksum) -> revokes the active publish
+  # (snapshot diverges from the artifact; public link 410s, state reverts to
+  # unpublished).
   http PATCH "$BASE_URL/chat/artifacts/$PUB_ART_ID" \
     -H "Content-Type: application/json" \
     -d "$(jq -n '{content:"## Updated publishable content"}')"
   assert_status 200 "edit published artifact"
 
-  # 7d. Publish again -- different checksum -> replacement (new publish_id).
+  # 7d. Publish again -- fresh publish (edit revoked the old active, so there
+  # is nothing to replace) -> new publish_id.
   http POST "$BASE_URL/chat/artifacts/$PUB_ART_ID/publish"
-  assert_status 200 "publish (replacement)"
+  assert_status 200 "publish (after edit)"
   PUB_ID_3=$(json_field '.publish_id')
   PUB_REUSED_3=$(json_field '.reused')
   if [ "$PUB_ID_3" = "$PUB_ID_1" ]; then
-    echo "FAIL: replacement should return new publish_id, got same as $PUB_ID_1" >&2
+    echo "FAIL: should return new publish_id, got same as $PUB_ID_1" >&2
     exit 1
   fi
   if [ "$PUB_REUSED_3" != "false" ]; then
-    echo "FAIL: replacement publish should have reused=false, got $PUB_REUSED_3" >&2
+    echo "FAIL: publish should have reused=false, got $PUB_REUSED_3" >&2
     exit 1
   fi
-  echo "[Artifact E2E] 7d. ok (replacement new publish_id=$PUB_ID_3)"
+  echo "[Artifact E2E] 7d. ok (fresh publish new publish_id=$PUB_ID_3)"
 
-  # 7e. Old publish_id -> 410 (revoked by replacement).
+  # 7e. Old publish_id -> 410 (revoked by the content edit in 7c).
   http GET "$BASE_URL/p/$PUB_ID_1"
   assert_status 410 "old publish page is 410"
   http GET "$BASE_URL/p/$PUB_ID_1/content"
@@ -541,10 +544,10 @@ PYEOF
   echo "[Artifact E2E] 7g. ok (revoke -> both 410)"
 
   # ---------------------------------------------------------------------------
-  # Section 8: Source-delete-snapshot (published link survives source deletion)
+  # Section 8: Source-delete purges publish (record+file deleted, public link 404)
   # ---------------------------------------------------------------------------
 
-  echo "[Artifact E2E] Section 8: Source-delete-snapshot"
+  echo "[Artifact E2E] Section 8: Source-delete-purges-publish"
 
   # 8a. Create + publish.
   create_artifact_json "${RUN_TAG}-snapshot" "markdown" "Snapshot test content"
@@ -554,17 +557,17 @@ PYEOF
   assert_status 200 "publish snapshot artifact"
   SNAP_PUB_ID=$(json_field '.publish_id')
 
-  # 8b. Delete the source artifact.
+  # 8b. Delete the source artifact -> purges the publish row + snapshot file.
   http DELETE "$BASE_URL/chat/artifacts/$SNAP_ART_ID"
   assert_status 204 "delete snapshot source artifact"
 
-  # 8c. Published page + content still return 200 (snapshot persists).
+  # 8c. Published page + content now return 404 (publish row deleted, not just
+  # revoked -- the record and snapshot file are gone).
   http GET "$BASE_URL/p/$SNAP_PUB_ID"
-  assert_status 200 "published page survives source deletion"
+  assert_status 404 "published page 404 after source delete"
   http GET "$BASE_URL/p/$SNAP_PUB_ID/content"
-  assert_status 200 "published content survives source deletion"
-  assert_body_contains "Snapshot test content" "snapshot content intact"
-  echo "[Artifact E2E] 8. ok (snapshot persists after source delete)"
+  assert_status 404 "published content 404 after source delete"
+  echo "[Artifact E2E] 8. ok (public link 404 after source delete, record+file purged)"
 
   # ---------------------------------------------------------------------------
   # Section 9: Size limits (inline/create/publish)

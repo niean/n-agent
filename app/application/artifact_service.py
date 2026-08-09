@@ -582,6 +582,16 @@ class ArtifactService:
         if old_owned_ref is not None and old_owned_ref != materialized_ref:
             await self._best_effort_delete(old_owned_ref)
 
+        # Content change invalidates the active publish snapshot: the snapshot
+        # now diverges from the artifact, so leaving it active would expose
+        # stale content at the public link. Revoke it (public link 410s, state
+        # reverts to unpublished) -- the user re-publishes if they want the new
+        # content public. Metadata-only edits skip this (snapshot content is
+        # unchanged, so the publish stays valid; that branch returns above).
+        active_publish = await self._registry.get_active_publish(artifact_id)
+        if active_publish is not None:
+            await self._registry.revoke_published(artifact_id)
+
         return result
 
     # ------------------------------------------------------------------
@@ -596,7 +606,11 @@ class ArtifactService:
         ``task_attachment_delete`` callback, so the task detail page stays in
         sync and the next startup backfill cannot resurrect the artifact. If the
         callback raises, the artifact metadata is left intact (no resurrection
-        risk) and the error propagates. Does NOT delete publish snapshots.
+        risk) and the error propagates. Purges ALL publish records + snapshot
+        files for this artifact BEFORE the metadata delete (artifact_id must
+        still be set to locate them): rows deleted -> public links 404, then
+        snapshot content dirs removed best-effort. No orphaned rows (with NULL
+        artifact_id) or snapshot files survive.
         Repeat delete raises ArtifactNotFoundError.
         """
         art = await self._registry.get_artifact(artifact_id)
@@ -615,6 +629,22 @@ class ArtifactService:
         # Propagate on failure so a half-deleted source never leaves the artifact
         # gone while its attachment survives.
         await self._cascade_delete_task_attachment(art)
+
+        # Purge ALL publish records + snapshot files for this artifact BEFORE
+        # deleting the artifact metadata: the published_artifacts.artifact_id FK
+        # is ON DELETE SET NULL, so once the artifacts row is gone the publishes
+        # can no longer be located by artifact_id. Deleting the rows first cuts
+        # off the public links (404); snapshot content dirs are then removed
+        # best-effort. Full cleanup -- no orphaned rows (with NULL artifact_id)
+        # or snapshot files survive the source deletion. Row deletion errors
+        # propagate (artifact metadata left intact); file deletion is
+        # best-effort (rows already gone, so leftover files are harmless disk
+        # waste). No publish -> no-op.
+        publishes = await self._registry.list_published(artifact_id)
+        if publishes:
+            await self._registry.delete_published_by_artifact(artifact_id)
+            for pub in publishes:
+                await self._best_effort_delete_publish_snapshot(pub.publish_id)
 
         # Delete metadata first.
         await self._registry.delete_artifact(artifact_id)
@@ -650,8 +680,8 @@ class ArtifactService:
         Used by TaskService.delete_task to cascade-delete a task's artifacts
         (task_attachment + task_artifact) from the separate artifacts DB so they
         no longer appear in the artifact list. Each artifact is removed via
-        :meth:`delete_artifact` (policy + metadata + owned content); published
-        snapshots are NOT touched (public links remain independent). Per-artifact
+        :meth:`delete_artifact` (policy + metadata + owned content + active
+        publish revocation); public links 410 once the source is gone. Per-artifact
         failures are logged and skipped. Returns the number deleted.
         """
         # Collect all ids first (delete mutates the result set); paginate to
@@ -1410,4 +1440,17 @@ class ArtifactService:
             logger.warning(
                 "best-effort delete failed for owned content (error=%s)",
                 type(exc).__name__,
+            )
+
+    async def _best_effort_delete_publish_snapshot(
+        self, publish_id: str,
+    ) -> None:
+        """Best-effort delete a publish snapshot dir. Logs on failure."""
+        try:
+            await self._content_store.delete_publish_snapshot(publish_id)
+        except Exception as exc:
+            logger.warning(
+                "best-effort delete failed for publish snapshot "
+                "(publish_id=%s, error=%s)",
+                publish_id, type(exc).__name__,
             )

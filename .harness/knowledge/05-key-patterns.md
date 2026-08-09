@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）、发布状态生命周期（内容编辑撤销 active publish 保留行+内容公链 410、metadata-only 不撤销、delete purge 发布记录+快照文件公链 404；头部状态栏+按钮切换）等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -1088,8 +1088,8 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
    - source_ref 格式：task_attachment 用 `attachment:{task_id}/{stored_name}`，task_artifact 用 `task:{task_id}:run:{run_id}:artifact:{ordinal}`。
    - 会话关联（source_session_id）：注册时经注入的 `task_session_resolver`（task_id -> task_execution_session_id）解析执行会话写入 `source_session_id`，与 `source_context_ref`（存 task_id，provenance）分离。resolver 在 main.py 用 task_registry late-bind（`set_task_session_resolver`，因 artifact_service 在 artifacts_enabled 分支、task_registry 在 task_enabled 分支创建）；task 记录已删除时回落到确定性 `task_session_id_fallback(task_id)`（`task-{uuid5}`）。resolver 未注入（task 子系统禁用）时 source_session_id 留空，制品对会话面板不可见但不报错。resolver 无法区分"task 不存在"与"task 已删除"（都回落 fallback session），故孤儿 backfill 另注入 `task_exists` 回调（task_id -> bool，`set_task_exists_callback`，返回 plain bool 可区分删除）判断 task 是否存活。
 
-2. publish 快照独立（PublishedArtifact nullable FK ON DELETE SET NULL）：
-   - PublishedArtifact.artifact_id 是 nullable FK，ON DELETE SET NULL；源 Artifact 删除后快照存活，公开链接不失效。
+2. publish 快照存储与生命周期（PublishedArtifact nullable FK ON DELETE SET NULL + edit 撤销 / delete purge）：
+   - PublishedArtifact.artifact_id 是 nullable FK，ON DELETE SET NULL（schema 兜底：若 publish 行在源 metadata 删除时仍存活，artifact_id 置 NULL）。delete_artifact 删源 metadata 前先 purge 全部 publish 记录+快照文件（`list_published` 收集 + `delete_published_by_artifact` 删行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 目录，公链 404），故 FK 通常不触发（行已先删）。edit 内容变更走 revoke（active->revoked，保留行+内容，公链 410）。
    - 快照字段（snapshot_name/kind/mime/content_ref/inline_content/size/checksum）在发布时固化，不可变；仅 status 与 revoked_at 可变。
    - 内容快照写入 `{artifacts_root}/published/{publish_id}/`，独立于源 Artifact 的 `{artifacts_root}/items/{artifact_id}/` 目录。
    - 部分唯一索引 `WHERE status='active' AND artifact_id IS NOT NULL` 保证每 artifact 至多一个 active 发布；replacement publish 在单事务内 revoke old + insert new。
@@ -1124,7 +1124,7 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
 7. delete 级联（task 删除 -> 制品清理，write-through 的逆方向）：
    - TaskService.delete_task 删除任务行（CASCADE 附件/事件等）、附件文件、执行会话后，经注入的 `artifact_delete_callback` 回调 ArtifactService.delete_artifacts_by_source_task(task_id)，清理独立 artifacts DB 中 source_context_ref=task_id 的全部制品。
    - 这是 write-through 注册（规则 1）的逆方向：注册时 task -> artifact 单向写入，删除时必须反向级联，否则已删除任务的制品残留在 artifacts DB 仍展示在制品列表。
-   - delete_artifacts_by_source_task 经分页 list_artifacts 收集 source_context_ref=task_id 的全部 artifact_id，逐条 delete_artifact（走 policy delete 准入 + metadata 删除 + delete_owned 删 owned content），best-effort 逐条 try/except + warning，失败不阻断任务删除；published 快照不被触碰（ON DELETE SET NULL，见规则 2）。
+   - delete_artifacts_by_source_task 经分页 list_artifacts 收集 source_context_ref=task_id 的全部 artifact_id，逐条 delete_artifact（走 policy delete 准入 + purge publish 记录+快照文件 + metadata 删除 + delete_owned 删 owned content），best-effort 逐条 try/except + warning，失败不阻断任务删除；每条 delete_artifact purge 该制品全部 publish 行+快照文件（公链 404，见规则 2）。
    - callback 在 main.py late-bind（与 register_callback 同源），artifact_service 为 None（artifacts_enabled=False）时 callback 为 None，delete_task 跳过制品清理。
 
 8. delete 级联（制品删除 -> 任务附件清理，制品页删除的逆同步）：
@@ -1145,11 +1145,13 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
    - 预览 dispatch（artifacts.js renderPreview 按 kind）：markdown/document->sandbox="" iframe（srcdoc 取 /export?format=html 服务端 safe HTML）、html->sandbox="" iframe srcdoc、code/text->`<pre>`、json->`__json` div>pre、csv->table、image->img、pdf->无 sandbox iframe（blob src）+下载链接。binary 类（image/pdf）经 parseContent `URL.createObjectURL(blob)` 生成 blob URL。
    - 编辑态填满（同一面板不同视图，预览修 max-height 后需补的点）：编辑视图 `.artifacts-detail__editor`（flex 列容器）和 `.artifacts-detail__textarea` 缺 `flex:1`，editor 仅随内容高度（code 315px/pdf 151px）、textarea 卡在 `min-height:240px`，编辑框+保存按钮不达面板底部（gap 398/562px）。修法：editor `flex:1; min-height:0`（与 `.artifacts-detail__preview` 同款填满 panel-body 剩余空间）、textarea `flex:1`（在 editor 内填满、底部留保存按钮）。二进制类编辑器无 textarea（note+file input+actions），editor `flex:1` 填满容器但内容在顶部（无可见背景，视觉为 no-op，紧凑 UX 优于把按钮推到底部留大空白）。排查时同样须实测 getComputedStyle(editor).flex 与 getBoundingClientRect 高度，禁止仅推理。
    - 导出/下载文件名（artifacts.js doExport/renderPdf）：下载经 `URL.createObjectURL(blob)` 生成 blob URL + `<a download>` 触发，blob URL 下载绕过服务端 Content-Disposition（后端 `export()` 已返回 `art.name` 作 filename、`build_content_disposition` 已正确，但前端 blob 下载不读该 header），故前端必须自行设 `a.download` 为制品名。`exportFilename(name, format)`：original -> name 原样（制品名已含扩展名如 `report.md`/`script.py`）；html -> 去 原 扩展名加 `.html`（匹配实际 text/html 内容）。PDF 下载（renderPdf）同款用 `detail.name`。禁止硬编码 `'export'`。
+   - 发布状态生命周期与 UI（artifacts.js refreshPublishState + service update_artifact）：发布状态展示在头部 metadata 行（`大小: ... · 更新: ...；已发布: 链接`，链接为 share_url），头部发布按钮按 active 状态切换 `发布`/`撤回`（handler 在 click 时分支，无需换 listener）；`refreshPublishState()` 做定向更新（仅改按钮文本 + metadata 内 `.artifacts-detail__publish-status` span），不重渲预览，故 publish 状态异步到达时不会重载 iframe/重置滚动。内容编辑（inline_content/file_data）撤销 active publish：`update_artifact` 内容变更成功后 `get_active_publish` 非 None 则 `revoke_published`（快照与制品内容分叉，公链 410、状态回未发布，用户需重新发布新内容）；metadata-only 编辑不撤销（快照内容未变，发布仍有效）。delete purge 全部 publish 记录+快照文件（`delete_artifact` 删源 metadata 前先 `list_published` 收集 + `delete_published_by_artifact` 删全部 publish 行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 目录，公链 404）--edit 撤销（保留行+内容、公链 410）与 delete purge（删行+文件、公链 404）是两条不同语义：edit 保留审计历史（制品仍在、内容分叉），delete 彻底清理（制品已删、无需保留）。前端 saveText/二进制替换 后置 `state.publish=null` + `loadPublishStatus` 重载确认。
 
 陷阱：
 - write-through 回调失败时回滚主流程会让附件上传因 Artifact 子系统故障而失败，违背 best-effort 旁路语义；正确做法是 catch + warning + 主流程继续。
 - publish 时只检查 ArtifactPolicy 而不调 InformationFlowService.release(PUBLIC_ARTIFACT) 会让 SECRET/SENSITIVE 文本内容以 raw 形式发布到公开链接，绕过信息流封口。
-- 公开路由读源 Artifact 会让源 Artifact 删除后公开链接 404，破坏快照独立语义；必须只读 PublishedArtifact 快照。
+- 公开路由读源 Artifact（而非 PublishedArtifact 快照）会让公链内容依赖源制品 registry 与当前内容；必须只读不可变快照（snapshot 字段发布时固化），与源 registry 解耦。源删除已 purge publish 行（公链 404）/编辑已撤销（公链 410），路由按 publish 行 status/存在性返回即可，无须读源。
+- 内容编辑不撤销 active publish 会让公链展示旧快照内容而 publish 状态仍为 active（制品内容已与新快照分叉，用户误以为公链是新内容）；`update_artifact` 内容变更（inline_content/file_data）成功后必须 `get_active_publish` 非 None 则 `revoke_published`（公链 410、状态回未发布）。metadata-only 编辑不撤销（快照内容未变，发布仍有效）。delete purge：`delete_artifact` 删源 metadata 前必须 `list_published` + `delete_published_by_artifact` 删全部 publish 行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 快照目录（公链 404），否则源删除后 active publish 仍 200 暴露已删制品内容、且留 orphan 行（artifact_id 被 FK ON DELETE SET NULL 置 NULL）+ orphan 快照文件。edit 撤销（保留行+内容、公链 410）/delete purge（删行+文件、公链 404）--两条语义不同，不可混：delete 须在 metadata 删除前 purge（否则 artifact_id 被 FK SET NULL 后无法按 artifact_id 定位 publish 行）。前端 saveText/二进制替换后须 `state.publish=null`+`loadPublishStatus` 重载，否则头部按钮/状态停留旧 active。
 - delete_owned 接受 attachment/workspace ref 会意外删除 Task 子系统管理的源文件（附件/工作区产出），破坏 Task 数据完整性。
 - backfill gated on table-empty 会让运行期新增附件在重启前无法补建为 Artifact；必须每次启动都扫。
 - published_base_url 由路由从 Host header 构造会让攻击者通过伪造 Host 注入恶意 share_url；必须由 service 用配置值计算。

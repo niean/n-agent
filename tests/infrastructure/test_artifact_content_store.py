@@ -137,6 +137,21 @@ async def test_delete_owned_deletes_item_and_published(tmp_path):
     assert await store.delete_owned(item_ref) is False
 
 
+async def test_delete_publish_snapshot_removes_dir_and_is_idempotent(tmp_path):
+    store = _make_store(tmp_path)
+    item_ref = await store.write_atomic("art-ps", "f.txt", b"snapshot data")
+    await store.copy_to_publish_snapshot(item_ref, "pub-ps")
+    pub_dir = store._root / "published" / "pub-ps"
+    assert pub_dir.is_dir()
+    # delete removes the snapshot file + its directory
+    await store.delete_publish_snapshot("pub-ps")
+    assert not pub_dir.exists()
+    # idempotent: second call on the now-gone dir is a no-op (no error)
+    await store.delete_publish_snapshot("pub-ps")
+    # a publish_id that was never materialized (inline publish) is a no-op
+    await store.delete_publish_snapshot("pub-never")
+
+
 async def test_delete_owned_rejects_unknown_scheme(tmp_path):
     store = _make_store(tmp_path)
     with pytest.raises(ArtifactValidationError):

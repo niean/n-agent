@@ -717,6 +717,15 @@ class SQLiteArtifactRegistry:
             conn.commit()
             return self._row_to_published(row) if row else None
 
+    def _delete_published_by_artifact_sync(self, artifact_id: str) -> int:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM published_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+
     # ------------------------------------------------------------------
     # Backfill batch read (sync implementation)
     # ------------------------------------------------------------------
@@ -847,6 +856,13 @@ class SQLiteArtifactRegistry:
     ) -> PublishedArtifact | None:
         return await asyncio.to_thread(
             self._revoke_published_sync, artifact_id,
+        )
+
+    async def delete_published_by_artifact(
+        self, artifact_id: str,
+    ) -> int:
+        return await asyncio.to_thread(
+            self._delete_published_by_artifact_sync, artifact_id,
         )
 
     async def list_attachment_sources(

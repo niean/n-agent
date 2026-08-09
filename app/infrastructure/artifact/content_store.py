@@ -132,6 +132,11 @@ class LocalArtifactContentStore:
             self._copy_to_publish_snapshot_sync, src_ref, publish_id, inline
         )
 
+    async def delete_publish_snapshot(self, publish_id: str) -> None:
+        return await asyncio.to_thread(
+            self._delete_publish_snapshot_sync, publish_id
+        )
+
     # ------------------------------------------------------------------
     # read
     # ------------------------------------------------------------------
@@ -307,6 +312,36 @@ class LocalArtifactContentStore:
             src_path, publish_dir, server_filename, self._publish_max_bytes
         )
         return f"{_PUBLISHED_PREFIX}{publish_id}/{server_filename}"
+
+    def _delete_publish_snapshot_sync(self, publish_id: str) -> None:
+        _validate_id(publish_id, "publish_id")
+        publish_dir = self._root / _PUBLISHED_DIR / publish_id
+        # Idempotent: missing dir is a no-op (already cleaned, or inline
+        # publish whose dir was never materialized on disk).
+        try:
+            st = publish_dir.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(st.st_mode):
+            raise ArtifactValidationError(
+                f"refuse to delete symlink publish snapshot: {publish_id}"
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise ArtifactValidationError(
+                f"refuse to delete non-directory publish snapshot: {publish_id}"
+            )
+        # Delete only regular files within the dir (copy_to_publish_snapshot
+        # writes exactly one file). Refuse symlinks/subdirs -- never rmtree,
+        # which could traverse a planted symlink and delete outside the root.
+        for entry in publish_dir.iterdir():
+            est = entry.lstat()
+            if stat.S_ISLNK(est.st_mode) or not stat.S_ISREG(est.st_mode):
+                raise ArtifactValidationError(
+                    f"refuse to delete non-regular file in publish snapshot: "
+                    f"{publish_id}/{entry.name}"
+                )
+            os.unlink(entry)
+        publish_dir.rmdir()
 
     # ------------------------------------------------------------------
     # Path resolution helpers (per-component symlink rejection)
