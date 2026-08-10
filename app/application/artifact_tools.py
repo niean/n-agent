@@ -179,8 +179,19 @@ def artifact_tool_definitions() -> list[ToolDefinition]:
                     "workspace_ref": {"type": "string"},
                     "text_patch": {
                         "type": "array",
-                        "items": {"type": "object"},
-                        "description": "1..100 search/replace operations",
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "search": {"type": "string", "minLength": 1, "description": "non-empty literal to find"},
+                                "replace": {"type": "string", "description": "replacement (empty string deletes the match)"},
+                                "mode": {"type": "string", "enum": ["first", "all"], "description": "'first' = replace first match only; 'all' = replace every match"},
+                            },
+                            "required": ["search", "replace", "mode"],
+                            "additionalProperties": False,
+                        },
+                        "description": "1..100 search/replace ops; each op is exactly {search, replace, mode}. Prefer full `content` when you know the entire new text -- it avoids patch mismatches and extra read round-trips.",
                     },
                     "change_summary": {"type": "string"},
                     "kind": {"type": "string", "enum": _KIND_VALUES},

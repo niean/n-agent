@@ -68,6 +68,16 @@ def test_build_system_prompt_includes_task_worker_guidance_fixed():
     assert "task_propose_change" in prompt
 
 
+def test_task_worker_guidance_workspace_ref_requires_write_file():
+    """A workspace: storage_ref resolves to the workspace root, not the
+    sandbox cwd; the guidance must tell the worker to use write_file so the
+    artifact is not silently dropped (regression for t_d0cb902535d94089)."""
+    prompt = build_system_prompt()
+    assert "write_file(path=" in prompt
+    assert "workspace ROOT" in prompt or "workspace root" in prompt
+    assert "ephemeral scratch" in prompt or "open()" in prompt
+
+
 def test_task_delegation_guidance_covers_key_points():
     from app.application.prompt_builder import TASK_DELEGATION_GUIDANCE
 
@@ -332,3 +342,83 @@ def test_artifact_guidance_empty_string_omitted():
     """Empty-string artifact_guidance is treated as absent (no empty section)."""
     prompt = build_system_prompt(artifact_guidance="")
     assert "## Artifact Guidance" not in prompt
+
+
+def test_goal_mode_judge_prompt_breaks_run_status_circular_reasoning():
+    """The goal_mode judge must NOT treat a 'running' task/run status as
+    incompleteness. The engine finalizes only AFTER the judge returns
+    achieved=true, so while the judge evaluates the run is always still
+    'running' with outcome=null and no 'finished' event. Without this
+    clarification the judge reasons "run not finalized -> goal not achieved"
+    and never approves, dooming every goal_mode task to fail after 2
+    consecutive rejections (the run can never finalize because finalization
+    is gated on the judge's own approval -- a circular dependency). The
+    prompt must explicitly break this circle."""
+    from app.application.prompt_builder import TASK_GUIDANCE
+
+    text = TASK_GUIDANCE
+    # Judge section present
+    assert "### Goal Mode Judge" in text
+    # Must explicitly state the goal_mode invariant: run stays running while
+    # the judge evaluates because finalization is gated on judge approval.
+    assert "finalizes the run only AFTER you return achieved=true" in text
+    # Must forbid using run status as an incompleteness signal.
+    assert "running" in text
+    assert (
+        "does NOT mean incomplete" in text
+        or "does not mean incomplete" in text
+    )
+    # Must clarify that complete_requested means task_complete was accepted.
+    assert "complete_requested" in text
+    assert "accepted" in text
+    # Must direct the judge to evaluate verifiable results, not run status.
+    assert "verifiably satisfy" in text
+
+
+def test_task_guidance_directs_terminal_task_to_artifact_update():
+    """After a task reaches a terminal state, the worker tools (task_complete,
+    task_show, ...) are no longer available (no active claim ->
+    trusted_task_context_missing). The prompt must redirect the agent to
+    artifact_update for modifying a deliverable that a finished task already
+    produced, instead of retrying task_complete or rewriting a workspace file.
+    Without this, a dashboard realtime chat continuing a finished task's
+    session retries task_complete (rejected) and never reaches artifact_update,
+    so the user cannot revise the delivered artifact by chat."""
+    from app.application.prompt_builder import TASK_GUIDANCE
+
+    text = TASK_GUIDANCE
+    # Must state worker tools are unavailable after a terminal state.
+    assert "terminal state" in text
+    assert "trusted_task_context_missing" in text
+    # Must forbid retrying task_complete to update a delivered artifact.
+    assert "do NOT retry task_complete" in text
+    # Must clarify artifact != workspace file (editing file does not update artifact).
+    assert "does NOT change the artifact" in text
+    # Must forbid rewriting the workspace file first.
+    assert "do NOT first rewrite the workspace file" in text
+    # Must direct the agent to act autonomously without asking the user.
+    assert "do NOT ask the user" in text
+    # Must redirect to the Artifact tools flow.
+    assert "artifact_list" in text
+    assert "artifact_update" in text
+    assert "expected_revision_id" in text
+    # Must confirm task-produced artifacts are editable in-session.
+    assert "same session scope" in text
+    # Must prefer full content over text_patch (fewer round-trips).
+    assert "Prefer full" in text
+    # Must forbid verify-after-update (avoid extra read round-trip).
+    assert "do NOT call artifact_read to verify" in text
+
+
+def test_artifact_guidance_mentions_terminal_task_fallback():
+    """ARTIFACT_GUIDANCE must note that after a task reaches a terminal state,
+    task_complete is unavailable and delivered artifacts are revised via
+    artifact_update (not by retrying task_complete). Reinforces the TASK_GUIDANCE
+    redirect so the agent does not loop on task_complete in a finished-task
+    session."""
+    from app.application.prompt_builder import ARTIFACT_GUIDANCE
+
+    text = ARTIFACT_GUIDANCE
+    assert "terminal state" in text
+    assert "artifact_update" in text
+    assert "retrying task_complete" in text

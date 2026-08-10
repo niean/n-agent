@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台 artifacts(+current_revision_id)/artifact_revisions(不可变版本链)/published_artifacts(+published_revision_id) 表与 artifacts_root 存储边界、Office 导出尺寸阈值配置 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台 artifacts(+current_revision_id)/artifact_revisions(不可变版本链)/published_artifacts(+published_revision_id) 表与 artifacts_root 存储边界、workspace: ref 解析到 workspace_root（非沙箱 cwd）、ArtifactContentStore probe 前置可读性校验、Office 导出尺寸阈值配置 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -343,7 +343,8 @@ Artifact 子系统复用 sessions.db（独立 `_connect()` + asyncio.to_thread +
 artifacts_root 存储边界（`settings.artifacts_root`，默认 `/app/locals/artifacts`）：
 - `{root}/items/{artifact_id}/`：Artifact owned 内容目录（含 Revision 持久内容），磁盘文件名 server-generated（uuid4 hex + safe ext），客户端 filename 仅展示
 - `{root}/published/{publish_id}/`：PublishedArtifact 快照内容目录
-- content_ref 方案：`item:{artifact_id}/{server_filename}`（owned，可删）、`published:{publish_id}/{server_filename}`（快照，可删）、`attachment:{task_id}/{stored_name}`（只读源引用，不可删）、`workspace:{relative_path}`（只读源引用，不可删）
+- content_ref 方案：`item:{artifact_id}/{server_filename}`（owned，可删）、`published:{publish_id}/{server_filename}`（快照，可删）、`attachment:{task_id}/{stored_name}`（只读源引用，不可删）、`workspace:{relative_path}`（只读源引用，不可删，解析到 `settings.workspace_root`，与 execute_code 沙箱 cwd `/scratch/sess-.../call-<uuid>/` 不同根）
 - 安全不变量：per-component lstat symlink 拒绝（非单次 resolved is_symlink）、bounded read（max_bytes 前置检查 + 流式累积）、原子写（same-dir temp + fsync + os.replace）、delete_owned 仅 item/published ref
+- ArtifactContentStore 端口方法：read（bounded 读）、probe（仅 lstat/resolve 校验可读性、不读内容，用于 task_complete workspace ref 前置校验避免大文件双读）、write_atomic、delete_owned、materialize_source（attachment/workspace 源物化为 owned item）、copy_to_publish_snapshot、delete_publish_snapshot
 
 Artifact 尺寸阈值配置（Settings，`artifact_` 前缀，gt=0）：artifact_read_max_bytes（默认 64KB）、artifact_diff_max_bytes（默认 1MB）、artifact_diff_max_lines（默认 20000）、artifact_diff_max_output_chars（默认 200000）、artifact_export_max_bytes（默认 50MB）；artifacts_enabled=False 时 artifact 工具/路由/迁移/Exporter 均不装配。

@@ -209,6 +209,27 @@ def test_artifacts_js_export_dropdown_by_capabilities():
         "export html capability tied to markdown/document kinds"
 
 
+def test_export_modal_format_options_are_single_choice_compact_grid():
+    """Export modal labels the first section 格式 and lays radios out 4-up."""
+    src = ARTIFACTS_JS.read_text(encoding="utf-8")
+    css = STYLES_CSS.read_text(encoding="utf-8")
+    assert "formatTitle.textContent = '格式'" in src
+    assert "radio.type = 'radio'" in src
+    assert "radio.name = 'export-format'" in src
+    assert ".export-modal__options" in css
+    assert "grid-template-columns: repeat(4, minmax(0, 1fr))" in css
+    assert ".export-modal__option { display: flex" in css
+    assert "gap: var(--space-2)" in css
+    assert "input[type=\"radio\"] { flex: 0 0 auto; width: auto;" in css
+
+
+def test_export_download_filename_matches_converted_format():
+    """Converted artifact downloads replace the source filename extension."""
+    src = ARTIFACTS_JS.read_text(encoding="utf-8")
+    assert "const extensions = { html: 'html', docx: 'docx', pptx: 'pptx', xlsx: 'xlsx' }" in src
+    assert "return stem + '.' + extension;" in src
+
+
 def test_artifacts_js_publish_flow():
     """Publish: POST -> show share_url + copy + revoke; binary publish shows
     explicit-PUBLIC confirmation."""

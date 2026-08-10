@@ -338,3 +338,43 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：写工具（CONFIRM/DANGEROUS）的端到端验收不要经 `/v1/chat/completions` 的 LLM 链路（无 decider 必被拒）；改由确定性 HTTP E2E（artifacts.sh 直击 /chat/artifacts* API，含 CAS/Revision/publish 语义）覆盖端点契约 + 工具层单测（test_artifact_tool_executor.py 会话隔离/溯源不可伪造）+ agent_graph 单测（ui.artifact 卡片持久化）覆盖工具层专属行为。LLM 工具选择/guidance 装配由单测（test_main_artifact_wiring/test_prompt_builder）守护。涉及审批门控的写工具 E2E 须先确认调用路由是否注入 approval_decider。
 
 来源：迭代 260809 artifact revision/export，T12 S2 偏离原"自然语言 LLM 链路"改确定性 HTTP 链路
+
+### P034: task_complete 的 workspace: storage_ref 解析到 workspace_root 而非沙箱 cwd，worker 用 open() 写 scratch 会导致制品静默 drop + 任务假成功
+
+现象：Task worker（如 t_d0cb902535d94089）用 execute_code 的 `open()` 在沙箱 cwd（`/scratch/sess-.../call-<uuid>/`）写文件，task_complete 以 `workspace:task3-output.md` 作为 artifacts 的 storage_ref 提交；task_complete 返回 success、任务标记 succeeded 并在 result 声称"submitted it as an artifact"，但 artifacts 表与 task_attachments 表均无该制品记录。
+
+根因：`workspace:{path}` ref 经 LocalArtifactContentStore 解析到 `settings.workspace_root`（容器内 `/workspace`，与 content_store 同根），与 execute_code 沙箱 cwd（ephemeral scratch，每调用独立 `call-<uuid>` 子目录）不同根。worker 用 `open()` 写到 cwd 的文件不在 workspace_root，register_from_task_artifact 的 `content_store.read` 抛 ArtifactContentUnavailableError，回调 catch 后 return None（best-effort，不影响 Task finish 的设计），制品被静默 skip。execute_code 工具描述说"write only to cwd (scratch)"且把 write_file 回调示例只给 web_extract/web_search，prompt 与 task_complete schema 都只说"put a workspace: file ref"，三者都没指出 workspace: ref 必须先用 write_file（回父进程 RPC 写 workspace_root）写入同路径。
+
+教训：opaque 引用方案（如 `workspace:{path}`）的解析根必须与写入路径的可达根一致，且该一致性须在工具描述/prompt 里显式说明并用前置校验守护，不能依赖 worker 推理。best-effort 旁路（register 回调失败不阻塞主流程）对"制品是任务主产出"的场景会产生假成功，致命副作用应改为前置确定性校验（task_complete 提交时 probe workspace ref 可读性，不可读抛 TaskValidationError 让 worker 自纠正用 write_file 或回落 inline content），而非 finalize 后静默 drop。诊断"任务成功但产出缺失"类 bug 时，优先比对工具调用记录里文件实际写入路径（execute_code 结果的 CWD/File path）与 storage_ref 解析根是否同根。修复涉及跨层（Application TaskService.complete -> Infrastructure content_store.probe -> Domain ArtifactContentStore 端口新增 probe）。
+
+来源：bug fix 260810 t_d0cb902535d94089 task_complete workspace: ref 制品未创建
+
+### P035: goal_mode judge 通过 task_show 看到 run 未 finalize 状态会循环否决（批准才 finalize vs 未 finalize 就否决），表现为 goal task 即建即败/无法创建
+
+现象：goal_mode task worker 正确调 task_complete（complete_requested 事件已记录、workspace: 制品 probe 校验通过），但 task 仍 failed。事件序列：complete_requested -> goal_judge_feedback(achieved=false) -> 连续否决 -> finished(failed)；retry 时 worker 识别"engine finalization issue"后 task_fail abort。用户感知为"命令/自然语言都无法创建 task"（任务即建即败）。
+
+根因：goal_mode 的 finalize 由 judge 批准触发（_execute_task -> run_goal_loop -> judge.achieved -> return COMPLETED -> _finalize_run），所以 judge 运行时 run 必然还是 running。但 judge prompt（prompt_builder TASK_GUIDANCE ### Goal Mode Judge）说"if the task is still in progress ... achieved=false"，judge 经 task_show（get_task_detail）读到 run 未 finalize 的状态——task.status="running"、runs[].status="running"/outcome=null/ended_at=null、worker_context 的 ## Identity 段 "status: running"、events 无 finished 事件——套用该指令否决，形成循环依赖。触发因素：前序 fix-bug 给 TASK_GUIDANCE item 5 加"task_complete validates... rejects the call if not"（worker/judge 共享可见），使 judge 更谨慎核查 run 是否真的 finalize，暴露了这个潜在的循环依赖。仅改 prompt 指令无效——LLM 仍基于具体 status 字段否决。
+
+教训：评估器（judge）不得看到被评估对象的待决状态（run 未 finalize），否则形成"批准才 finalize vs 未 finalize 就否决"的死循环。必须从数据层面 redact：judge fork（write_origin=="judge"）的 task_show 返回中移除 task 的 run 生命周期字段（status/current_run_id/claim/heartbeat/failure 等）、runs 数组置空、worker_context 置 null，让 judge 仅基于 complete_requested intent + 可验证结果判定目标达成。prompt 指令对 LLM 不可靠，只能作为辅助，不能替代数据层 redact。诊断"goal task 即建即败"类 bug 时，看 task_events 是否有 goal_judge_feedback 否决且理由含"run still running/not finalized"。修复跨层：Infrastructure TaskManagementToolExecutor._handle_show redact -> Application task_service.get_task_detail 返回字段 -> judge LLM。
+
+来源：bug fix 260811 goal_mode judge 循环否决导致 goal task 即建即败
+
+### P036: tool input_schema 未展开 items 子字段导致 LLM retry-guess（artifact_update text_patch 连续构造错误），表现为制品修改过程消息爆炸
+
+现象：task 制品在任务结束后通过 dashboard 自然语言修改成功，但修改过程暴露大量过程消息：3 次 artifact_update retry（错误 "text_patch op must have explicit mode" / "mode must be 'first' or 'all'"）+ 2 次 artifact_read（修改前预读 + 修改后验证读）+ 8 条冗长逐步 assistant 消息。用户感知为"修改过程中暴露了太多的过程消息"。
+
+根因：artifact_update 的 text_patch input_schema 只声明 `{"type":"array","items":{"type":"object"},"description":"1..100 search/replace operations"}`，未展开 items 的 search/replace/mode 字段定义。LLM 不知道 op 结构，靠 description 猜测，连续 3 次构造错误 op（缺 mode / mode 值错 / 多余字段），被运行时校验 _validate_text_patch 拒绝后 retry。运行时校验（infrastructure artifact_management.py）正确但无法引导 LLM 一次构造正确——schema 是 LLM 的契约，必须独立完整。叠加 prompt TASK_GUIDANCE 未指示"优先 content""跳过预读""不验证读""简洁报告"，LLM 还做了不必要的 artifact_read（preliminary + verify）和冗长逐步汇报。
+
+教训：给 LLM 的 tool input_schema 必须完整展开复合字段的子结构（array items 的 properties/required/enum/minLength 等），不能只给空 `{"type":"object"}` 让运行时校验兜底；schema 是 LLM 构造参数的契约，运行时校验只防穿透不负责引导。诊断"LLM 反复 retry 同一工具"类问题时，先查该工具 input_schema 是否对复合字段（array of object）展开了子字段定义。修复跨层：Application artifact_tools.py（schema 展开 search/replace/mode + required + additionalProperties:false + minItems/maxItems）+ Application prompt_builder.py TASK_GUIDANCE（优先 content、跳过预读/验证读、简洁报告）+ Infrastructure artifact_management.py _validate_text_patch（运行时校验，已存在，不替代 schema）。
+
+来源：bug fix 260811 task 制品修改过程消息过多（schema 未展开致 text_patch retry + 多余 artifact_read）
+
+### P037: 同资源的变更接口必须返回与读接口一致的视图，前端直接赋值响应会因精简形状丢字段
+
+现象：编辑 markdown 制品后预览不自动更新（需手动刷新浏览器才更新），版本列表也有类似不刷新问题。
+
+根因：content PATCH（JSON + multipart）返回 _write_result_to_dict（精简：artifact_id/revision_id/revision_number/name/kind/size/checksum/publish_sync_state，缺 id/current_revision_id/mime/updated_at），而 GET detail 与 metadata-only PATCH 返回 _artifact_view（完整视图）。前端 saveText 把 PATCH 响应直接赋给 state.detail，导致 detail.id=undefined -> renderMarkdownHtml 调 fetchExport(detail.id=undefined) -> /chat/artifacts/undefined/export 404 -> 预览不可用；同时 saveText 未调 loadRevisions，版本列表不刷新。手动刷新浏览器触发 loadDetail(id) 用真实 id 重新 GET 完整视图，预览恢复，故表现为"手动刷新才更新"。
+
+教训：同一资源的变更（mutation）接口必须返回与读（read）接口一致的视图形状，因为前端常把变更响应直接赋给本地 state（state.detail = updated）。若变更返回精简形状缺了前端依赖的字段（如 id），下游功能（预览 fetchExport(detail.id)、版本 modal 标记当前版本、下次保存 CAS token）会静默失效。诊断"编辑后需手动刷新才更新"类前端问题时，先查变更接口响应形状是否与读接口一致、前端是否直接赋值。修复跨层：Interfaces artifact_routes.py（content PATCH JSON + multipart 改返回 _artifact_view，与 GET 一致）+ frontend artifacts.js（saveText 赋值完整视图 + 失效并重载 revisions；openRevisionsModal 打开时重拉）。
+
+来源：bug fix 260811 制品编辑后预览/版本不自动刷新（content PATCH 响应缺 id 致 fetchExport 404 + 未重载 revisions）

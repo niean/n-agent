@@ -590,7 +590,14 @@ async def _patch_content_json(
     except Exception as exc:
         return _exception_to_response(exc)
     art = await _safe_get_artifact(service, artifact_id)
-    return JSONResponse(content=_write_result_to_dict(artifact_id, revision, art, result))
+    # Return the full artifact view (same shape as GET detail and metadata-only
+    # PATCH) so clients can assign state.detail directly. The legacy
+    # _write_result_to_dict shape omitted id/current_revision_id/mime/updated_at,
+    # which broke the post-save markdown preview (fetchExport used detail.id=
+    # undefined), the revisions modal (could not mark the current version), and
+    # a subsequent save (no CAS token). diff_summary/content_unchanged are
+    # tool-only fields (not consumed by the dashboard client).
+    return JSONResponse(content=await _artifact_view(art, service))
 
 
 async def _patch_from_multipart(artifact_id: str, request: Request, service) -> JSONResponse:
@@ -650,7 +657,9 @@ async def _patch_from_multipart(artifact_id: str, request: Request, service) -> 
         except Exception as exc:
             return _exception_to_response(exc)
         art = await _safe_get_artifact(service, artifact_id)
-        return JSONResponse(content=_write_result_to_dict(artifact_id, revision, art, result))
+        # Same full artifact view as JSON content PATCH (see _patch_content_json):
+        # lets clients assign state.detail directly with id/current_revision_id/mime intact.
+        return JSONResponse(content=await _artifact_view(art, service))
 
     # Metadata-only update.
     kwargs = _extract_patch_kwargs(form_fields)

@@ -95,6 +95,41 @@ async def test_read_missing_content_raises_unavailable(tmp_path):
         await store.read("item:art-x/nonexistent.bin", max_bytes=1024)
 
 
+@pytest.mark.asyncio
+async def test_probe_workspace_ref_existing(tmp_path):
+    """probe checks readability without reading content (used by task_complete
+    validation so a worker that wrote to scratch cwd instead of workspace_root
+    is told to retry via write_file, not silently dropped post-finalize)."""
+    store = _make_store(tmp_path)
+    (store._workspace_root / "output.md").write_bytes(b"# v1\ncontent")
+    # existing readable ref -> no exception, no content read
+    await store.probe("workspace:output.md")
+
+
+@pytest.mark.asyncio
+async def test_probe_workspace_ref_missing_raises(tmp_path):
+    store = _make_store(tmp_path)
+    with pytest.raises(ArtifactContentUnavailableError):
+        await store.probe("workspace:missing/file.md")
+
+
+@pytest.mark.asyncio
+async def test_probe_rejects_non_regular_file(tmp_path):
+    store = _make_store(tmp_path)
+    (store._workspace_root / "subdir").mkdir()
+    with pytest.raises(ArtifactValidationError):
+        await store.probe("workspace:subdir")
+
+
+@pytest.mark.asyncio
+async def test_probe_item_and_attachment_refs(tmp_path):
+    store = _make_store(tmp_path)
+    item_ref = await store.write_atomic("art-7", "doc.txt", b"x")
+    await store.probe(item_ref)  # owned item ref readable
+    with pytest.raises(ArtifactContentUnavailableError):
+        await store.probe("item:art-7/missing.txt")
+
+
 async def test_items_and_published_refs_are_isolated(tmp_path):
     store = _make_store(tmp_path)
     data = b"owned content"

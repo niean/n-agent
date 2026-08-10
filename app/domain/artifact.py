@@ -699,6 +699,18 @@ class ArtifactContentStore(Protocol):
     """
 
     async def read(self, content_ref: str, *, max_bytes: int) -> bytes: ...
+    async def probe(self, content_ref: str) -> None:
+        """Verify ``content_ref`` resolves to a readable regular file.
+
+        Raises :class:`ArtifactContentUnavailableError` (missing/unreadable)
+        or :class:`ArtifactValidationError` (non-regular/symlink). Does NOT
+        read content. Used for pre-flight validation -- e.g. a
+        ``workspace:`` storage_ref submitted via task_complete is probed
+        before the run finalizes so a missing file is surfaced to the worker
+        (which can then write it via ``write_file`` or fall back to inline
+        ``content``) instead of being silently dropped post-finalize.
+        """
+        ...
     async def write_atomic(
         self, artifact_id: str, filename: str, data: bytes,
     ) -> str: ...

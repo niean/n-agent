@@ -98,6 +98,18 @@ def test_task_tool_definitions_input_schemas_are_valid_json_schema():
         assert "additionalProperties" in d.input_schema, f"{d.name} additionalProperties"
 
 
+def test_task_complete_description_guides_workspace_ref_via_write_file():
+    """task_complete description must explain that a workspace: ref resolves
+    to the workspace root (not the sandbox cwd) and the file must be written
+    via write_file -- regression for the silent-drop bug where workers wrote
+    via open() to scratch and the artifact was never registered."""
+    defs = {d.name: d for d in task_tool_definitions()}
+    desc = defs["task_complete"].description
+    assert "workspace ROOT" in desc or "workspace root" in desc
+    assert "write_file" in desc
+    assert "open()" in desc
+
+
 def test_task_show_input_schema():
     """task_show: {task_id}"""
     defs = {d.name: d for d in task_tool_definitions()}

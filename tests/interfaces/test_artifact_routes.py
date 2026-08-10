@@ -1347,8 +1347,8 @@ class TestPatchArtifact:
         data = response.json()
         assert data["size"] == len("# New Content".encode("utf-8"))
         assert data["revision_number"] == 2
-        assert data["revision_id"] != rev.id
-        assert data["artifact_id"] == "art-1"
+        assert data["current_revision_id"] != rev.id
+        assert data["id"] == "art-1"
 
     def test_patch_forbidden_field_id(self):
         service = FakeArtifactService()
@@ -1408,7 +1408,7 @@ class TestPatchArtifact:
         data = response.json()
         assert data["name"] == "updated.md"
         assert data["revision_number"] == 2
-        assert data["revision_id"] != rev.id
+        assert data["current_revision_id"] != rev.id
 
     def test_patch_unsupported_content_type(self):
         service = FakeArtifactService()
@@ -1825,7 +1825,7 @@ class TestSafeContentDisposition:
 
 
 def _patch_content(client, artifact_id: str, expected_rev_id: str, content: str) -> dict:
-    """PATCH content with a CAS token; return the write-result dict."""
+    """PATCH content with a CAS token; return the artifact-view dict (full detail shape, same as GET)."""
     r = client.patch(
         f"/chat/artifacts/{artifact_id}",
         json={"content": content, "expected_revision_id": expected_rev_id},
@@ -1861,7 +1861,7 @@ class TestRevisionsList:
         art, rev1 = _seed_revisioned(service, inline_content="# v1")
         client = _client(service)
         rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
-        rev3 = _patch_content(client, "art-1", rev2["revision_id"], "# v3")
+        rev3 = _patch_content(client, "art-1", rev2["current_revision_id"], "# v3")
         r = client.get("/chat/artifacts/art-1/revisions?limit=2")
         assert r.status_code == 200
         page1 = r.json()
@@ -1957,7 +1957,7 @@ class TestDiffRoute:
         client = _client(service)
         rev2 = _patch_content(client, "art-1", rev1.id, "# v1\nline b")
         r = client.post("/chat/artifacts/art-1/diff", json={
-            "from_revision_id": rev1.id, "to_revision_id": rev2["revision_id"],
+            "from_revision_id": rev1.id, "to_revision_id": rev2["current_revision_id"],
         })
         assert r.status_code == 200
         data = r.json()
@@ -2011,7 +2011,7 @@ class TestRollbackRoute:
         rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
         r = client.post("/chat/artifacts/art-1/rollback", json={
             "target_revision_id": rev1.id,
-            "expected_revision_id": rev2["revision_id"],
+            "expected_revision_id": rev2["current_revision_id"],
             "change_summary": "revert to v1",
         })
         assert r.status_code == 200
@@ -2333,7 +2333,7 @@ class TestPublishBody:
         rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
         # Body claims current is rev1, but it is now rev2.
         r = client.post("/chat/artifacts/art-1/publish", json={
-            "revision_id": rev2["revision_id"],
+            "revision_id": rev2["current_revision_id"],
             "expected_current_revision_id": rev1.id,
         })
         assert r.status_code == 409
@@ -2347,7 +2347,7 @@ class TestPublishBody:
         # Trying to publish rev1 (not current) -> conflict.
         r = client.post("/chat/artifacts/art-1/publish", json={
             "revision_id": rev1.id,
-            "expected_current_revision_id": rev2["revision_id"],
+            "expected_current_revision_id": rev2["current_revision_id"],
         })
         assert r.status_code == 409
         assert r.json()["error"]["code"] == "artifact_revision_conflict"
@@ -2546,7 +2546,7 @@ class TestDiffSafeRendering:
         client = _client(service)
         rev2 = _patch_content(client, "art-1", rev1.id, "<script>alert(2)</script>")
         r = client.post("/chat/artifacts/art-1/diff", json={
-            "from_revision_id": rev1.id, "to_revision_id": rev2["revision_id"],
+            "from_revision_id": rev1.id, "to_revision_id": rev2["current_revision_id"],
         })
         assert r.status_code == 200
         # The response is JSON: diff_text is a plain string value, not HTML.

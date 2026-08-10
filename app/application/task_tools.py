@@ -90,9 +90,16 @@ def task_tool_definitions() -> list[ToolDefinition]:
                 "summary (short display abstract only, never the full output), metadata is "
                 "structured results, and artifacts is the list of outputs. For text outputs "
                 "put the complete content in each artifact's ``content`` field; for binary/"
-                "large files put a ``workspace:`` file ref in ``storage_ref``. The tool only "
-                "returns the terminal intent; TaskRunService finalizes the run in one shot "
-                "via a CAS using the claim token."
+                "large files put a ``workspace:`` file ref in ``storage_ref``. A "
+                "``workspace:{path}`` ref resolves against the workspace ROOT (the same "
+                "root write_file writes to), NOT the execute_code sandbox cwd -- so the file "
+                "MUST be created with write_file(path='{path}', content=...) using the same "
+                "path before calling task_complete. Files written to cwd via open() are "
+                "ephemeral scratch and are NOT referenceable as workspace: refs. The tool "
+                "validates each workspace: ref is readable and rejects the call (returning "
+                "an error, not finalizing) if not, so the worker can self-correct. The tool "
+                "only returns the terminal intent on success; TaskRunService finalizes the "
+                "run in one shot via a CAS using the claim token."
             ),
             input_schema={
                 "type": "object",

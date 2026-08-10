@@ -1168,6 +1168,18 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             except SessionNotFoundError:
                 logger.debug("task artifact session absent: %s", session_id)
 
+        async def _validate_workspace_ref(ref: str) -> None:
+            """Pre-flight probe for task_complete ``workspace:`` storage_refs.
+
+            Workers write artifact files via the write_file callback (which
+            writes to workspace root); a worker that instead uses open() in
+            execute_code writes to the ephemeral sandbox cwd, so the
+            ``workspace:{path}`` ref would not resolve. Probing here surfaces
+            the mismatch at task_complete time so the worker self-corrects
+            instead of the artifact being silently dropped post-finalize.
+            """
+            await artifact_content_store.probe(ref)
+
         task_run_service = TaskRunService(
             registry=task_registry,
             dispatcher=task_runner,
@@ -1232,6 +1244,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 if artifact_service is not None
                 else None
             ),
+            workspace_ref_validator=_validate_workspace_ref,
         )
         # TaskService.dispatch_tick delegates to TaskRunService (late-bind).
         task_service.set_run_service(task_run_service)
@@ -1451,7 +1464,12 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             "workspace mounted read-only, write only to cwd (scratch). "
             "To access external resources, use callback tools via bare function calls "
             f"(imported automatically): {', '.join(enabled_tool_names) or 'none'}. "
-            "Example: web_extract(url='https://...') or web_search(query='...')."
+            "Example: web_extract(url='https://...') or web_search(query='...'). "
+            "write_file(path, content) is the exception to cwd-only writes: it writes to "
+            "the workspace ROOT (not scratch), so a file created with write_file(path='x.md', "
+            "content=...) can be submitted as a workspace:x.md storage_ref artifact in "
+            "task_complete. Do NOT write artifact files via open() to cwd -- those are "
+            "ephemeral and cannot be referenced as workspace: artifacts."
         )
         execute_code_definition = ToolDefinition(
             name="execute_code",

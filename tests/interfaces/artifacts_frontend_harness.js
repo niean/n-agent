@@ -452,7 +452,7 @@ async function testContentUnavailableState() {
 
 async function testPublishBlockedState() {
   const win = freshEnv();
-  const a = art('a1', 'text', { source_kind: 'manual' });
+  const a = art('a1', 'text', { source_kind: 'manual', extra: { current_revision_id: 'r1' } });
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
   route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
   route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
@@ -460,9 +460,11 @@ async function testPublishBlockedState() {
     if ((opts.method || 'GET') === 'POST') return errResp('publish_blocked', 'blocked', 422);
     return jsonResp({ status: 'unpublished' });
   });
-  // Publish failure is reported via the shared modal; artifacts.js has no
-  // inline "blocked" text -- the header status segment only reflects an active
-  // publish state, so a blocked publish must leave the UI unpublished.
+  route(/^\/chat\/artifacts\/a1\/revisions/, () => jsonResp({
+    items: [{ id: 'r1', revision_number: 1, change_summary: '初版', created_at: '2026-01-01T00:00:00+00:00', is_current: true, is_published: false }],
+  }));
+  // Publish failure is reported via the shared modal; a blocked publish must
+  // leave the UI unpublished (no share link in the metadata row).
   let alertMsg = null;
   win.NAGENT = win.NAGENT || {};
   win.NAGENT.modal = {
@@ -475,22 +477,23 @@ async function testPublishBlockedState() {
   const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
   for (const fn of (item._listeners['click'] || [])) fn({});
   await tick();
-  // click publish button
-  const pubBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish');
-  if (pubBtn[0]) {
-    for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({});
+  // publish/revoke live in the 版本 modal: open it and click 发布此版本.
+  const modal = clickRevisionsButton();
+  await tick();
+  const pubBtn = findByClass(modal, 'artifacts-revisions__publish')[0];
+  if (pubBtn) {
+    for (const fn of (pubBtn._listeners['click'] || [])) fn({});
     await tick();
   }
   // blocked publish -> failure reported via modal alert
   ok(alertMsg && /失败|blocked|publish_blocked|不可发布|无法发布/i.test(alertMsg),
     'publish-blocked failure reported via modal alert: ' + String(alertMsg));
-  // publish did not activate: button stays 发布, no share link rendered
-  if (pubBtn[0]) {
-    ok(/发布/.test(pubBtn[0]._text) && !/撤回/.test(pubBtn[0]._text),
-      'publish button stays 发布 after blocked publish, got: ' + pubBtn[0]._text);
-  }
+  // publish did not activate: no share link rendered in the metadata row
   ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-link').length,
     'no share link shown after blocked publish');
+  const publication = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-status')[0];
+  ok(publication && publication.children[1] && publication.children[1]._text === '未发布',
+    'unpublished artifact shows 未发布 in the status bar');
 }
 
 async function testSourceBacklinkValidTaskId() {
@@ -821,6 +824,10 @@ async function testExportMenuCapabilitiesDriven() {
   for (const fn of (expBtn._listeners['click'] || [])) fn({});
   const modal = win.document.getElementById('artifacts-export-modal');
   ok(modal, 'export modal opens on click');
+  const formatTitle = findByClass(modal, 'export-modal__section-title')[0];
+  ok(formatTitle && formatTitle.textContent === '格式', 'export format section is named 格式');
+  const options = findByClass(modal, 'export-modal__options')[0];
+  ok(options && options.getAttribute('role') === 'radiogroup', 'export formats are a radio group');
   const radios = modal.querySelectorAll('input');
   ok(radios.length === 2, 'markdown advertises 2 export formats in modal (got ' + radios.length + ')');
   const fmts = radios.map((r) => r.dataset.format).sort();
@@ -871,13 +878,15 @@ async function testExportMenuCapabilitiesDriven() {
 
 async function testPublishShareUrlToggleRevoke() {
   const win = freshEnv();
-  const a = art('a1', 'text', { source_kind: 'manual' });
+  const a = art('a1', 'text', { source_kind: 'manual', extra: { current_revision_id: 'r1' } });
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
   route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
   route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
   // GET /publish reflects the server-tracked state: unpublished before POST,
   // active after POST, back to unpublished after DELETE (revoke). The client
-  // re-fetches status after publish, so the GET must stay consistent.
+  // re-fetches status after publish, so the GET must stay consistent. The
+  // revisions route reflects is_published the same way so the 版本 modal can
+  // swap 发布此版本 <-> 撤回发布 after each action.
   let published = false;
   route(/^\/chat\/artifacts\/a1\/publish$/, (m, opts) => {
     if ((opts.method || 'GET') === 'POST') {
@@ -892,35 +901,33 @@ async function testPublishShareUrlToggleRevoke() {
       ? { status: 'active', share_url: 'http://test/p/pub123', share_path: '/p/pub123' }
       : { status: 'unpublished' });
   });
+  route(/^\/chat\/artifacts\/a1\/revisions/, () => jsonResp({
+    items: [{ id: 'r1', revision_number: 1, change_summary: '初版', created_at: '2026-01-01T00:00:00+00:00', is_current: true, is_published: published }],
+  }));
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = { confirm: () => Promise.resolve(true), alert: () => Promise.resolve() };
   const mod = loadModule(win);
   await mod.init();
   await tick();
   const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
   for (const fn of (item._listeners['click'] || [])) fn({});
   await tick();
-  // publish
-  const pubBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish');
-  if (pubBtn[0]) { for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({}); await tick(); await tick(); }
-  // share link shown in the header status segment after publish
+  // publish via 版本 modal: open modal, click 发布此版本 on the current revision.
+  let modal = clickRevisionsButton();
+  await tick();
+  let pubBtn = findByClass(modal, 'artifacts-revisions__publish')[0];
+  if (pubBtn) { for (const fn of (pubBtn._listeners['click'] || [])) fn({}); await tick(); await tick(); }
+  // share link shown in the metadata row after publish
   const text = collectText(byId['tab-artifacts']);
   ok(text.indexOf('http://test/p/pub123') !== -1 || text.indexOf('/p/pub123') !== -1 || text.indexOf('已发布') !== -1,
     'share link / published state shown after publish: ' + text.slice(0, 120));
-  // single toggle button design: button text flips to 撤回; no separate
-  // copy or revoke buttons exist.
-  if (pubBtn[0]) {
-    ok(/撤回/.test(pubBtn[0]._text), 'publish button toggled to 撤回 after publish, got: ' + pubBtn[0]._text);
-  }
-  ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__copy').length,
-    'no separate copy button (single toggle button design)');
-  ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__revoke').length,
-    'no separate revoke button (publish button toggles to revoke)');
-  // click the same button again to revoke
-  if (pubBtn[0]) { for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({}); await tick(); await tick(); }
-  // after revoke: button reverts to 发布 and the share link is removed
-  if (pubBtn[0]) {
-    ok(/发布/.test(pubBtn[0]._text) && !/撤回/.test(pubBtn[0]._text),
-      'publish button reverts to 发布 after revoke, got: ' + pubBtn[0]._text);
-  }
+  // after publish the modal reloaded revisions: current revision now shows 撤回发布.
+  modal = byId['artifacts-revisions-modal'];
+  const revokeBtn = findByClass(modal, 'artifacts-revisions__revoke')[0];
+  ok(revokeBtn, 'after publish, current revision shows 撤回发布 in modal');
+  // click 撤回发布 to revoke
+  if (revokeBtn) { for (const fn of (revokeBtn._listeners['click'] || [])) fn({}); await tick(); await tick(); }
+  // after revoke: share link removed from the metadata row
   const text2 = collectText(byId['tab-artifacts']);
   ok(text2.indexOf('http://test/p/pub123') === -1 && text2.indexOf('/p/pub123') === -1,
     'share link removed after revoke: ' + text2.slice(0, 120));
@@ -928,7 +935,7 @@ async function testPublishShareUrlToggleRevoke() {
 
 async function testBinaryPublishConfirmation() {
   const win = freshEnv();
-  const a = art('a1', 'image', { mime: 'image/png', source_kind: 'manual' });
+  const a = art('a1', 'image', { mime: 'image/png', source_kind: 'manual', extra: { current_revision_id: 'r1' } });
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
   route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
   route(/^\/chat\/artifacts\/a1\/content/, () => blobResp([1, 2, 3], 'image/png'));
@@ -938,6 +945,9 @@ async function testBinaryPublishConfirmation() {
     }
     return jsonResp({ status: 'unpublished' });
   });
+  route(/^\/chat\/artifacts\/a1\/revisions/, () => jsonResp({
+    items: [{ id: 'r1', revision_number: 1, change_summary: '初版', created_at: '2026-01-01T00:00:00+00:00', is_current: true, is_published: false }],
+  }));
   let confirmShown = false;
   // Set up modal BEFORE loading so artifacts.js captures it; artifacts.js
   // resolves modal dynamically via getModal() -> namespace.modal.
@@ -952,8 +962,11 @@ async function testBinaryPublishConfirmation() {
   const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
   for (const fn of (item._listeners['click'] || [])) fn({});
   await tick();
-  const pubBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish');
-  if (pubBtn[0]) { for (const fn of (pubBtn[0]._listeners['click'] || [])) fn({}); await tick(); }
+  // publish via 版本 modal: open modal, click 发布此版本 on the current revision.
+  const modal = clickRevisionsButton();
+  await tick();
+  const pubBtn = findByClass(modal, 'artifacts-revisions__publish')[0];
+  if (pubBtn) { for (const fn of (pubBtn._listeners['click'] || [])) fn({}); await tick(); }
   ok(confirmShown, 'binary publish shows confirmation dialog');
   if (confirmShown) {
     ok(/PUBLIC|公开|扫描|秘密|secret/i.test(String(win.NAGENT.modal._lastMsg || '')),
@@ -1189,13 +1202,14 @@ function setupRevisionedArtifact(win, opts) {
   opts = opts || {};
   const detailExtra = Object.assign({
     current_revision_id: opts.currentRevisionId || 'r2',
+    revision_number: opts.revisionNumber != null ? opts.revisionNumber : 2,
     publish_sync_state: opts.syncState || 'current',
   }, opts.detailExtra || {});
   const a = art('a1', 'text', { extra: detailExtra });
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
   route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
   route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
-  route(/^\/chat\/artifacts\/a1\/publish$/, () => jsonResp({ status: opts.publishStatus || 'unpublished' }));
+  route(/^\/chat\/artifacts\/a1\/publish$/, () => jsonResp(opts.publishPayload || { status: opts.publishStatus || 'unpublished' }));
   route(/^\/chat\/artifacts\/a1\/export\/capabilities$/, () => jsonResp({ capabilities: opts.capabilities || ['original'] }));
   route(/^\/chat\/artifacts\/a1\/revisions/, () => jsonResp({
     items: opts.revisions || [
@@ -1217,21 +1231,45 @@ function detailGetCount() {
   return fetchLog.filter((l) => l.url === '/chat/artifacts/a1' && l.method === 'GET').length;
 }
 
-async function testRevisionPanelRendersWithMarkers() {
+// Click the 版本 button in the detail header and return the opened revisions
+// modal (standard modal on document.body). Revisions must already be loaded.
+function clickRevisionsButton() {
+  const revBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__revisions')[0];
+  ok(revBtn, '版本 button rendered in header');
+  for (const fn of (revBtn._listeners['click'] || [])) fn({});
+  return byId['artifacts-revisions-modal'];
+}
+
+async function testRevisionsModalRendersWithMarkers() {
   const win = freshEnv();
   setupRevisionedArtifact(win, { syncState: 'current', currentRevisionId: 'r2' });
   const mod = loadModule(win);
   await selectAndAwait(mod);
-  const panel = byId['artifacts-revisions-panel'];
-  ok(panel, 'revision panel container rendered');
-  const items = findByClass(panel, 'artifacts-revisions__item');
-  ok(items.length === 2, '2 revision rows rendered (got ' + items.length + ')');
-  ok(findByClass(panel, 'artifacts-revisions__item--current').length === 1, 'exactly one current revision marked');
-  ok(findByClass(panel, 'artifacts-revisions__badge--current').length === 1, 'one 当前 badge on current revision');
-  ok(findByClass(panel, 'artifacts-revisions__badge--published').length === 1, 'one 已发布 badge (r1 is the published revision)');
-  // Non-current r1 has compare + rollback actions; current r2 has neither.
-  ok(findByClass(panel, 'artifacts-revisions__diff').length === 1, 'one 对比当前 button (non-current only)');
-  ok(findByClass(panel, 'artifacts-revisions__rollback').length === 1, 'one 回滚 button (non-current only)');
+  // publish/revoke moved out of the header into the 版本 modal: the header
+  // actions no longer contain a artifacts-detail__publish button.
+  const actions = findByClass(byId['tab-artifacts'], 'artifacts-detail__actions')[0];
+  const btns = actions.children;
+  let hasHeaderPublish = false;
+  for (let i = 0; i < btns.length; i++) {
+    const cls = (btns[i].className || '').split(/\s+/);
+    if (cls.indexOf('artifacts-detail__publish') !== -1) hasHeaderPublish = true;
+  }
+  ok(!hasHeaderPublish, 'no publish button in header (publish/revoke moved to 版本 modal)');
+  const modal = clickRevisionsButton();
+  ok(modal, 'revisions modal opens on 版本 click');
+  ok(!byId['artifacts-revisions-panel'], 'no inline revision panel (history moved to modal)');
+  const items = findByClass(modal, 'artifacts-revisions__item');
+  ok(items.length === 2, '2 revision rows rendered in modal (got ' + items.length + ')');
+  ok(findByClass(modal, 'artifacts-revisions__item--current').length === 1, 'exactly one current revision marked');
+  ok(findByClass(modal, 'artifacts-revisions__badge--current').length === 1, 'one 当前 badge on current revision');
+  ok(findByClass(modal, 'artifacts-revisions__badge--published').length === 1, 'one 已发布 badge (r1 is the published revision)');
+  // Publish/revoke are version-aware per row: the published revision (r1)
+  // offers 撤回发布; the current non-published revision (r2) offers 发布此版本.
+  ok(findByClass(modal, 'artifacts-revisions__revoke').length === 1, 'one 撤回发布 button (on published r1)');
+  ok(findByClass(modal, 'artifacts-revisions__publish').length === 1, 'one 发布此版本 button (on current r2)');
+  // Non-current r1 also has compare + rollback.
+  ok(findByClass(modal, 'artifacts-revisions__diff').length === 1, 'one 对比当前 button (non-current only)');
+  ok(findByClass(modal, 'artifacts-revisions__rollback').length === 1, 'one 回滚 button (non-current only)');
 }
 
 async function testDiffRendersAsSafeTextContent() {
@@ -1242,15 +1280,15 @@ async function testDiffRendersAsSafeTextContent() {
   route(/^\/chat\/artifacts\/a1\/diff$/, () => jsonResp({ diff_text: maliciousDiff, binary_changed: false, redacted: true }));
   const mod = loadModule(win);
   await selectAndAwait(mod);
-  const panel = byId['artifacts-revisions-panel'];
-  const diffBtn = findByClass(panel, 'artifacts-revisions__diff')[0];
+  const modal = clickRevisionsButton();
+  const diffBtn = findByClass(modal, 'artifacts-revisions__diff')[0];
   ok(diffBtn, 'diff button present on non-current revision');
   for (const fn of (diffBtn._listeners['click'] || [])) fn({});
   await tick(); await tick();
-  const pre = findByClass(panel, 'artifacts-diff__pre')[0];
+  const pre = findByClass(modal, 'artifacts-diff__pre')[0];
   ok(pre, 'diff rendered in a <pre> element');
   ok(pre._text === maliciousDiff, 'diff text rendered verbatim as textContent (no HTML parsing), got: ' + pre._text);
-  ok(findByTag(panel, 'script').length === 0, 'no script elements created from diff text');
+  ok(findByTag(modal, 'script').length === 0, 'no script elements created from diff text');
 }
 
 async function testRollbackConflictKeepsCurrentNoAutoReplay() {
@@ -1264,8 +1302,8 @@ async function testRollbackConflictKeepsCurrentNoAutoReplay() {
   const mod = loadModule(win);
   await selectAndAwait(mod);
   const beforeDetail = detailGetCount();
-  const panel = byId['artifacts-revisions-panel'];
-  const rbBtn = findByClass(panel, 'artifacts-revisions__rollback')[0];
+  const modal = clickRevisionsButton();
+  const rbBtn = findByClass(modal, 'artifacts-revisions__rollback')[0];
   ok(rbBtn, 'rollback button present');
   for (const fn of (rbBtn._listeners['click'] || [])) fn({});
   await tick(); await tick(); await tick();
@@ -1283,22 +1321,153 @@ async function testRollbackSuccessReloadsDetail() {
   const mod = loadModule(win);
   await selectAndAwait(mod);
   const beforeDetail = detailGetCount();
-  const panel = byId['artifacts-revisions-panel'];
-  const rbBtn = findByClass(panel, 'artifacts-revisions__rollback')[0];
+  const modal = clickRevisionsButton();
+  const rbBtn = findByClass(modal, 'artifacts-revisions__rollback')[0];
   for (const fn of (rbBtn._listeners['click'] || [])) fn({});
   await tick(); await tick(); await tick();
   ok(detailGetCount() > beforeDetail, 'detail reloaded after successful rollback (got ' + beforeDetail + ' -> ' + detailGetCount() + ')');
+  ok(modal._removed, 'revisions modal closed after successful rollback');
 }
 
-async function testPublishSyncBadgeInMetadata() {
+async function testPreviewStatusBarShowsVersionAndPublication() {
   const win = freshEnv();
-  setupRevisionedArtifact(win, { syncState: 'outdated', currentRevisionId: 'r2' });
+  setupRevisionedArtifact(win, {
+    syncState: 'outdated', currentRevisionId: 'r2',
+    publishPayload: { status: 'active', share_url: 'http://test/p/pub1' },
+  });
   const mod = loadModule(win);
   await selectAndAwait(mod);
-  const badges = findByClass(byId['tab-artifacts'], 'artifacts-detail__sync-badge');
-  ok(badges.length === 1, 'publish_sync_state badge rendered in metadata');
-  ok(badges[0]._text === '已过期', 'outdated -> 已过期 label (got ' + badges[0]._text + ')');
-  ok(badges[0].className.indexOf('artifacts-detail__sync-badge--outdated') !== -1, 'badge carries outdated state class');
+  const metadata = findByClass(byId['tab-artifacts'], 'artifacts-detail__metadata')[0];
+  ok(metadata && metadata._text === '大小: 10 B，更新: 2026-01-01 08:00:00；版本: v2',
+    'status bar shows size, update time, and current version (got ' + (metadata && metadata._text) + ')');
+  const publication = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-status')[0];
+  ok(publication && publication.children[0] && publication.children[0]._text === '，',
+    'publication status starts with the prescribed separator');
+  ok(publication && publication.children[1] && publication.children[1]._text === '已发布: ',
+    'active publication shows 已发布 label');
+  ok(findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-link').length === 1,
+    'active publication shows share link');
+}
+
+async function testMarkdownSaveRefreshesPreviewAndRevisions() {
+  // Regression: after editing a markdown artifact, the preview and the version
+  // list must refresh without a manual browser reload. Root cause was the
+  // content-PATCH response omitting `id` (legacy _write_result_to_dict), so
+  // saveText assigned state.detail without an id -> renderMarkdownHtml called
+  // fetchExport(detail.id=undefined) -> /chat/artifacts/undefined/export (404),
+  // and loadRevisions was never called. Fix: PATCH returns the full artifact
+  // view (id intact) and saveText invalidates + reloads revisions.
+  const win = freshEnv();
+  const a = art('a1', 'markdown', { mime: 'text/markdown',
+    extra: { current_revision_id: 'r1' } });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  route(/^\/chat\/artifacts\/a1$/, (m, opts) => {
+    if ((opts.method || 'GET') === 'PATCH') {
+      // PATCH returns the FULL artifact view (id stays 'a1'), new CAS token r2.
+      return jsonResp(art('a1', 'markdown', { mime: 'text/markdown',
+        updated_at: '2026-01-02T00:00:00+00:00',
+        extra: { current_revision_id: 'r2' } }));
+    }
+    return jsonResp(a);
+  });
+  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('# original'));
+  route(/^\/chat\/artifacts\/a1\/export\?format=html/, () => textResp('<h1>original</h1>', 'text/html'));
+  route(/^\/chat\/artifacts\/a1\/revisions\?limit=100/, () => jsonResp({
+    items: [
+      { revision_id: 'r2', revision_number: 2, created_at: '2026-01-02T00:00:00+00:00', summary: '编辑' },
+      { revision_id: 'r1', revision_number: 1, created_at: '2026-01-01T00:00:00+00:00', summary: '创建' },
+    ],
+  }));
+  const mod = loadModule(win);
+  await mod.init();
+  await tick();
+  const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
+  for (const fn of (item._listeners['click'] || [])) fn({});
+  await tick();
+  // clear fetch log so only post-save requests are inspected
+  fetchLog.length = 0;
+  // enter edit mode, edit, save
+  const editBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__edit');
+  if (editBtn[0]) { for (const fn of (editBtn[0]._listeners['click'] || [])) fn({}); }
+  const tas = findByTag(byId['tab-artifacts'], 'textarea');
+  if (tas[0]) { tas[0].value = '# edited'; }
+  const saveBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__save');
+  if (saveBtn[0]) { for (const fn of (saveBtn[0]._listeners['click'] || [])) fn({}); }
+  await tick(); await tick(); await tick();
+  // PATCH sent with CAS token
+  const patchCall = fetchLog.find((l) => l.method === 'PATCH' && l.url.indexOf('/chat/artifacts/a1') !== -1);
+  ok(patchCall, 'markdown save sent PATCH');
+  ok(patchCall && patchCall.body && patchCall.body.indexOf('expected_revision_id') !== -1
+      && patchCall.body.indexOf('r1') !== -1,
+    'markdown content PATCH carries expected_revision_id CAS token');
+  // preview re-fetched export using the REAL artifact id (not 'undefined')
+  const exportCall = fetchLog.find((l) => l.method === 'GET'
+      && l.url.indexOf('/chat/artifacts/a1/export') !== -1);
+  ok(exportCall, 'preview re-fetched export after save');
+  ok(exportCall && exportCall.url.indexOf('/undefined/') === -1,
+    'export uses real artifact id (not undefined) -- regression: PATCH response must keep id');
+  // version list re-fetched (new revision created)
+  const revCall = fetchLog.find((l) => l.method === 'GET'
+      && l.url.indexOf('/chat/artifacts/a1/revisions') !== -1);
+  ok(revCall, 'markdown save re-fetched revisions (new revision created)');
+}
+
+async function testPublishLatestFromModalAfterEdit() {
+  // Regression: after editing a published artifact (publish_sync_state=
+  // outdated -- r1 published, r2 current not published), the user must be able
+  // to publish the latest revision directly from the 版本 modal WITHOUT first
+  // revoking. The header no longer has a publish/撤回 toggle (which used to
+  // force a two-step revoke -> publish). The current revision row offers
+  // 发布此版本; clicking it re-publishes atomically (backend revokes the old
+  // publish + registers a new one), and the sync badge + share link update.
+  const win = freshEnv();
+  let publishedRevision = 'r1';
+  const a = art('a1', 'text', { extra: { current_revision_id: 'r2', publish_sync_state: 'outdated' } });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
+  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
+  route(/^\/chat\/artifacts\/a1\/publish$/, (m, opts) => {
+    if ((opts.method || 'GET') === 'POST') {
+      publishedRevision = 'r2';
+      return jsonResp({ publish_id: 'pub2', share_path: '/p/pub2', share_url: 'http://test/p/pub2', reused: false });
+    }
+    return jsonResp(publishedRevision === 'r2'
+      ? { status: 'active', share_url: 'http://test/p/pub2', share_path: '/p/pub2' }
+      : { status: 'active', share_url: 'http://test/p/pub1', share_path: '/p/pub1' });
+  });
+  route(/^\/chat\/artifacts\/a1\/revisions/, () => jsonResp({
+    items: [
+      { id: 'r1', revision_number: 1, change_summary: '初版', created_at: '2026-01-01T00:00:00+00:00', is_current: false, is_published: publishedRevision === 'r1' },
+      { id: 'r2', revision_number: 2, change_summary: '更新', created_at: '2026-01-02T00:00:00+00:00', is_current: true, is_published: publishedRevision === 'r2' },
+    ],
+  }));
+  route(/^\/chat\/artifacts\/a1\/export\/capabilities$/, () => jsonResp({ capabilities: ['original'] }));
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = { confirm: () => Promise.resolve(true), alert: () => Promise.resolve() };
+  const mod = loadModule(win);
+  await selectAndAwait(mod);
+  // An older published revision still exposes its active share link.
+  let publication = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-status')[0];
+  ok(publication && publication.children[1] && publication.children[1]._text === '已发布: ',
+    'published older revision shows active publication status');
+  // open 版本 modal: r2 (current, not published) offers 发布此版本 directly.
+  const modal = clickRevisionsButton();
+  await tick();
+  const pubBtn = findByClass(modal, 'artifacts-revisions__publish')[0];
+  ok(pubBtn, 'current revision offers 发布此版本 (direct publish, no revoke needed)');
+  // the published r1 offers 撤回发布, but it is NOT required.
+  ok(findByClass(modal, 'artifacts-revisions__revoke').length === 1, 'published r1 offers 撤回发布 (optional, not required)');
+  // click 发布此版本 -> POST /publish (re-publish, atomically replaces old)
+  fetchLog.length = 0;
+  if (pubBtn) { for (const fn of (pubBtn._listeners['click'] || [])) fn({}); await tick(); await tick(); }
+  const postPublish = fetchLog.find((l) => l.method === 'POST' && l.url.indexOf('/chat/artifacts/a1/publish') !== -1);
+  ok(postPublish, '发布此版本 sent POST /publish');
+  // Publication status and share link update after publish.
+  publication = findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-status')[0];
+  ok(publication && publication.children[1] && publication.children[1]._text === '已发布: ',
+    'publication status -> 已发布 after publish');
+  ok(findByClass(byId['tab-artifacts'], 'artifacts-detail__publish-link').length === 1,
+    'share link rendered in metadata row after re-publish');
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,9 +1495,11 @@ const tests = [
   testPdfBlobFallback,
   testRevokeObjectURLOnDestroy,
   testTextSaveRefreshWithServerMetadata,
+  testMarkdownSaveRefreshesPreviewAndRevisions,
   testContentPatchConflictKeepsCurrentNoAutoReplay,
   testExportMenuCapabilitiesDriven,
   testPublishShareUrlToggleRevoke,
+  testPublishLatestFromModalAfterEdit,
   testBinaryPublishConfirmation,
   testBinaryReplaceCarriesIfMatchCas,
   testBinaryReplaceConflictKeepsCurrentNoAutoReplay,
@@ -1336,11 +1507,11 @@ const tests = [
   testRenderListItemCallbackContract,
   testRenderListItemDefaultBehavior,
   testRenderListItemXssSafety,
-  testRevisionPanelRendersWithMarkers,
+  testRevisionsModalRendersWithMarkers,
   testDiffRendersAsSafeTextContent,
   testRollbackConflictKeepsCurrentNoAutoReplay,
   testRollbackSuccessReloadsDetail,
-  testPublishSyncBadgeInMetadata,
+  testPreviewStatusBarShowsVersionAndPublication,
 ];
 
 (async () => {

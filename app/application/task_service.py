@@ -157,6 +157,7 @@ class TaskService:
         artifact_register_callback: Callable[[TaskAttachment], Awaitable[None]] | None = None,
         artifact_id_lookup: Callable[[str], Awaitable[str | None]] | None = None,
         artifact_delete_callback: Callable[[str], Awaitable[None]] | None = None,
+        workspace_ref_validator: Callable[[str], Awaitable[None]] | None = None,
     ):
         self.registry = registry
         self.policy = policy
@@ -172,6 +173,7 @@ class TaskService:
         self._artifact_register_callback = artifact_register_callback
         self._artifact_id_lookup = artifact_id_lookup
         self._artifact_delete_callback = artifact_delete_callback
+        self._workspace_ref_validator = workspace_ref_validator
 
     async def _snapshot(self) -> TaskConfig:
         if self._task_config_provider is not None:
@@ -1122,6 +1124,33 @@ class TaskService:
             raise TaskValidationError(
                 f"artifacts not serializable: {exc}"
             ) from exc
+
+        # Pre-flight: a ``workspace:`` storage_ref must resolve to a readable
+        # file at the workspace root BEFORE the run finalizes. Workers that
+        # write the file to the sandbox cwd via open() (ephemeral scratch)
+        # instead of the write_file callback (which writes to workspace root)
+        # would otherwise have their artifact silently dropped post-finalize
+        # while the task is marked succeeded. Reject here so the worker sees
+        # the error and self-corrects (use write_file, or inline ``content``).
+        if self._workspace_ref_validator is not None and isinstance(artifacts, list):
+            for art in artifacts:
+                if not isinstance(art, dict):
+                    continue
+                ref = art.get("storage_ref")
+                if isinstance(ref, str) and ref.startswith("workspace:"):
+                    name = art.get("name") or "(unnamed)"
+                    try:
+                        await self._workspace_ref_validator(ref)
+                    except Exception as exc:
+                        raise TaskValidationError(
+                            f"artifact '{name}' references workspace file "
+                            f"'{ref}' which is not readable at the workspace "
+                            f"root. Write the file via write_file(path='{ref[len('workspace:'):]}'"
+                            f", content=...) before task_complete, or put the "
+                            f"text content directly in the artifact's 'content' "
+                            f"field. Files written to the sandbox cwd via open() "
+                            f"are NOT referenceable as workspace: refs."
+                        ) from exc
 
         intent = {
             "outcome": TaskRunOutcome.COMPLETED.value,

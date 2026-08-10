@@ -39,13 +39,6 @@
   const CSV_MAX_ROWS = 200;
   const CSV_MAX_COLS = 50;
   const TASK_ID_RE = /^[A-Za-z0-9_-]+$/;
-  // T10: publish_sync_state -> badge label (chat card + workbench share this).
-  const ARTIFACT_SYNC_LABELS = {
-    unpublished: '未发布',
-    current: '已发布',
-    outdated: '已过期',
-  };
-
   // ---- state ----
   let state = {
     items: [],
@@ -572,16 +565,14 @@
     }
 
     renderHeader(body, detail);
-    // metadata row (size/updated_at) -- reflects server-returned values
-    // after save/replace so the user can verify the refresh.
+    // Preview status bar: server-returned values are refreshed after save or
+    // replace, so the displayed size, time, and current version stay current.
     const meta = el('div', 'artifacts-detail__metadata muted');
     meta.textContent = '大小: ' + (detail.size != null ? detail.size : '-') + ' B'
-      + ' · 更新: ' + fmtTime(detail.updated_at);
-    // T10: publish_sync_state badge (unpublished/current/outdated) from the
-    // server-enriched detail, distinct from the active-publish link segment.
-    meta.appendChild(renderPublishSyncBadge(detail));
-    // publish status segment (populated by refreshPublishState when active):
-    // appends "；已发布: 链接" with the share link, per the prd format.
+      + '，更新: ' + fmtTime(detail.updated_at)
+      + '；版本: v' + (detail.revision_number != null ? detail.revision_number : '-');
+    // The publish segment is filled asynchronously and reads either
+    // "已发布: 链接" or "未发布".
     const pubStatus = el('span', 'artifacts-detail__publish-status');
     meta.appendChild(pubStatus);
     body.appendChild(meta);
@@ -590,22 +581,10 @@
     } else {
       renderPreview(body, detail);
     }
-    // T10: revision history panel (loads async into the container).
-    const revPanel = el('div', 'artifacts-revisions-panel');
-    revPanel.id = 'artifacts-revisions-panel';
-    body.appendChild(revPanel);
-    renderRevisionsPanel();
+    // T10: revision history is shown in a modal triggered by the 版本 button in
+    // the header (no inline panel). Revisions still load in parallel so the
+    // modal is ready when opened; refreshRevisionsModal() updates an open modal.
     refreshPublishState();
-  }
-
-  // T10: publish_sync_state badge. Renders the raw server state as a labeled
-  // badge; unknown states fall back to their raw value. textContent only.
-  function renderPublishSyncBadge(detail) {
-    const badge = el('span', 'artifacts-detail__sync-badge');
-    const state_ = detail && typeof detail.publish_sync_state === 'string' ? detail.publish_sync_state : '';
-    badge.className = 'artifacts-detail__sync-badge artifacts-detail__sync-badge--' + (state_ || 'unpublished');
-    badge.textContent = ARTIFACT_SYNC_LABELS[state_] || state_ || '未发布';
-    return badge;
   }
 
   function renderHeader(body, detail) {
@@ -662,19 +641,14 @@
     expBtn.textContent = '导出';
     expBtn.addEventListener('click', () => openExportModal(state.detail));
     actions.appendChild(expBtn);
-    // publish button: toggles between 发布 (publish) and 撤回 (revoke) based on
-    // the active publish state. Text is kept in sync by refreshPublishState;
-    // the handler branches at click time so no listener swap is needed.
-    const pubBtn = el('button', 'btn artifacts-detail__publish');
-    pubBtn.type = 'button';
-    pubBtn.textContent = '发布';
-    pubBtn.addEventListener('click', () => {
-      const pub = state.publish;
-      const active = pub && (pub.status === 'active' || pub.status === 'published');
-      if (active) { doRevoke(state.detail && state.detail.id); }
-      else { doPublish(); }
-    });
-    actions.appendChild(pubBtn);
+    // Publish/revoke actions live in the version modal. The metadata row
+    // displays the current version and whether it is published.
+    // revisions button: opens a standard modal with the version history
+    const revBtn = el('button', 'btn artifacts-detail__revisions');
+    revBtn.type = 'button';
+    revBtn.textContent = '版本';
+    revBtn.addEventListener('click', () => openRevisionsModal());
+    actions.appendChild(revBtn);
     header.appendChild(actions);
     body.appendChild(header);
   }
@@ -723,8 +697,13 @@
     header.append(title, closeBtn);
     form.appendChild(header);
 
-    // format selector (radio group): the extra info the user confirms
+    // Format selector: one choice only; options are arranged compactly in a grid.
+    const formatSection = el('section', 'export-modal__section');
+    const formatTitle = el('div', 'export-modal__section-title');
+    formatTitle.textContent = '格式';
     const optionsWrap = el('div', 'export-modal__options');
+    optionsWrap.setAttribute('role', 'radiogroup');
+    optionsWrap.setAttribute('aria-label', '格式');
     const radios = [];
     formats.forEach((fmt) => {
       const opt = el('label', 'export-modal__option');
@@ -741,7 +720,8 @@
       opt.append(radio, lbl);
       optionsWrap.appendChild(opt);
     });
-    form.appendChild(optionsWrap);
+    formatSection.append(formatTitle, optionsWrap);
+    form.appendChild(formatSection);
 
     // resulting filename hint (artifact name + chosen format, PRD line 85)
     const filenameHint = el('div', 'providers-form__hint export-modal__filename');
@@ -804,17 +784,16 @@
   }
 
   // Derive the download filename from the artifact name (not a hardcoded
-  // "export"): original keeps the name as-is (it already carries the right
-  // extension, e.g. "report.md"); html replaces the extension with .html so
-  // the downloaded file matches its actual content type.
+  // "export"): original keeps the name as-is; converted formats replace any
+  // existing extension so the downloaded filename matches its actual content.
   function exportFilename(name, format) {
     const base = (name && String(name).trim()) || 'export';
-    if (format === 'html') {
-      const dot = base.lastIndexOf('.');
-      const stem = dot > 0 ? base.slice(0, dot) : base;
-      return stem + '.html';
-    }
-    return base;
+    const extensions = { html: 'html', docx: 'docx', pptx: 'pptx', xlsx: 'xlsx' };
+    const extension = extensions[format];
+    if (!extension) return base;
+    const dot = base.lastIndexOf('.');
+    const stem = dot > 0 ? base.slice(0, dot) : base;
+    return stem + '.' + extension;
   }
 
   // Download an export of `detail` in `format`. Throws on failure so the
@@ -1034,7 +1013,11 @@
     }
     try {
       const updated = await patchArtifact(detail.id, { content: value, expected_revision_id: expected });
-      // refresh with server-returned size/checksum/updated_at
+      // content PATCH returns the full artifact view (same shape as GET detail),
+      // so state.detail can be assigned directly -- id/current_revision_id/mime/
+      // updated_at stay intact for the post-save markdown preview
+      // (fetchExport(detail.id)), the revisions modal (marks current version),
+      // and a subsequent save (CAS token).
       state.detail = updated;
       state.content = { text: value, kind: updated.kind, mime: updated.mime };
       state.view = 'preview';
@@ -1042,10 +1025,14 @@
       // diverges); reset local state so the UI immediately shows unpublished.
       // loadPublishStatus confirms the server state.
       state.publish = null;
+      // 失效版本列表：刚创建了新 revision，必须重载否则版本 modal 显示旧数据。
+      state.revisions = null;
       renderDetail();
       // refresh list (metadata may have changed)
       reloadList();
-      loadPublishStatus(detail.id, inflight ? inflight.signal : undefined);
+      const sig = inflight ? inflight.signal : undefined;
+      loadPublishStatus(detail.id, sig);
+      loadRevisions(detail.id, sig);
     } catch (e) {
       if (e && e.code === 'artifact_revision_conflict') {
         if (getModal() && typeof getModal().alert === 'function') {
@@ -1126,23 +1113,24 @@
   }
 
   // ---- publish ----
-  // Reflect state.publish in the header: the publish button text (发布/撤回)
-  // and the publish-status segment of the metadata row (已发布: 链接). This is
-  // a targeted update -- it does NOT re-render the preview, so calling it when
-  // the publish status arrives (async) won't reload iframes or reset scroll.
+  // Reflect state.publish in the metadata row without re-rendering the
+  // preview, so an asynchronous status update does not reload iframes or reset
+  // scrolling.
   function refreshPublishState() {
     const host = byId('artifacts-detail-body');
     if (!host) return;
     const pub = state.publish;
     const active = !!(pub && (pub.status === 'active' || pub.status === 'published'));
-    const btn = host.querySelector('.artifacts-detail__publish');
-    if (btn) btn.textContent = active ? '撤回' : '发布';
     const span = host.querySelector('.artifacts-detail__publish-status');
     if (!span) return;
     clear(span);
-    if (!active) return;
+    span.appendChild(document.createTextNode('，'));
+    if (!active) {
+      span.appendChild(document.createTextNode('未发布'));
+      return;
+    }
     const shareUrl = pub.share_url || (pub.share_path ? global.location.origin + pub.share_path : '');
-    span.appendChild(document.createTextNode('；已发布: '));
+    span.appendChild(document.createTextNode('已发布: '));
     if (shareUrl) {
       const a = el('a', 'artifacts-detail__publish-link');
       a.href = shareUrl;
@@ -1166,12 +1154,26 @@
         : global.confirm('仅显式 PUBLIC，服务端不扫描文件内部秘密。确认发布？');
       if (!confirmed) return;
     }
+    // re-publish confirm: if an active publish already exists (outdated --
+    // published an older revision, then edited), re-publishing atomically
+    // replaces it and the old share link goes 410 immediately.
+    const existing = !!(state.publish && (state.publish.status === 'active' || state.publish.status === 'published'));
+    if (existing) {
+      const confirmed = getModal() && typeof getModal().confirm === 'function'
+        ? await getModal().confirm('当前已有发布版本，重新发布将使旧链接立即失效。确认发布当前版本？')
+        : global.confirm('当前已有发布版本，重新发布将使旧链接立即失效。确认发布当前版本？');
+      if (!confirmed) return;
+    }
     try {
       const result = await publishArtifact(detail.id);
       state.publish = { status: 'active', share_url: result.share_url, share_path: result.share_path };
+      if (state.detail) state.detail = { ...state.detail, publish_sync_state: 'current' };
       refreshPublishState();
-      // refresh publish status (thread active signal for cancellation)
-      loadPublishStatus(detail.id, inflight ? inflight.signal : undefined);
+      const sig = inflight ? inflight.signal : undefined;
+      // refresh publish status (thread active signal for cancellation) +
+      // reload revisions so is_published badges in the modal update.
+      loadPublishStatus(detail.id, sig);
+      loadRevisions(detail.id, sig);
     } catch (e) {
       if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('发布失败：' + (e && e.message ? e.message : e));
@@ -1217,7 +1219,10 @@
     try {
       const result = await revokePublish(id);
       state.publish = { status: 'revoked', revoked_at: result && result.revoked_at };
+      if (state.detail) state.detail = { ...state.detail, publish_sync_state: 'unpublished' };
       refreshPublishState();
+      // reload revisions so the 撤回发布 row reverts to 发布此版本 / loses 已发布.
+      loadRevisions(id, inflight ? inflight.signal : undefined);
     } catch (e) {
       if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('撤销失败：' + (e && e.message ? e.message : e));
@@ -1252,11 +1257,69 @@
       if (state.selectedId !== id) return;
       state.revisions = [];
     }
-    renderRevisionsPanel();
+    refreshRevisionsModal();
   }
 
-  function renderRevisionsPanel() {
-    const host = byId('artifacts-revisions-panel');
+  function closeRevisionsModal() {
+    const modal = document.getElementById('artifacts-revisions-modal');
+    if (modal) modal.remove();
+  }
+
+  // Revision history lives in a project-standard modal (modal-backdrop /
+  // modal-dialog) with a fixed header, a scrollable body (list + diff) and a
+  // fixed footer -- friendlier than the old inline <details> panel. The body
+  // is rebuilt by renderRevisionsContent(); refreshRevisionsModal() re-renders
+  // an already-open modal when state.revisions / state.diffView change.
+  function openRevisionsModal() {
+    const detail = state.detail;
+    if (!detail) return;
+    closeRevisionsModal(); // never stack two revisions modals
+    const backdrop = el('div', 'modal-backdrop');
+    backdrop.id = 'artifacts-revisions-modal';
+    const dialog = el('section', 'modal-dialog revisions-modal');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-label', '版本历史');
+
+    const head = el('div', 'revisions-modal__head');
+    const title = el('h4');
+    title.textContent = '版本历史';
+    const closeBtn = el('button', 'modal-close');
+    closeBtn.type = 'button';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '关闭');
+    head.append(title, closeBtn);
+    dialog.appendChild(head);
+
+    const body = el('div', 'revisions-modal__body');
+    dialog.appendChild(body);
+
+    const foot = el('div', 'revisions-modal__foot');
+    const doneBtn = el('button', 'btn');
+    doneBtn.type = 'button';
+    doneBtn.textContent = '关闭';
+    doneBtn.addEventListener('click', closeRevisionsModal);
+    foot.appendChild(doneBtn);
+    dialog.appendChild(foot);
+
+    backdrop.appendChild(dialog);
+    backdrop.addEventListener('click', (event) => { if (event.target === backdrop) closeRevisionsModal(); });
+    closeBtn.addEventListener('click', closeRevisionsModal);
+    document.body.appendChild(backdrop);
+
+    renderRevisionsContent(body);
+    // 打开时重新拉取版本，确保含最新 revision（如刚保存的）。
+    loadRevisions(detail.id, inflight ? inflight.signal : undefined);
+  }
+
+  function refreshRevisionsModal() {
+    const modal = document.getElementById('artifacts-revisions-modal');
+    if (!modal) return;
+    const body = modal.querySelector('.revisions-modal__body');
+    if (body) renderRevisionsContent(body);
+  }
+
+  function renderRevisionsContent(host) {
     if (!host) return;
     clear(host);
     const detail = state.detail;
@@ -1264,31 +1327,29 @@
     const revs = state.revisions;
     if (!revs) { renderState(host, '加载版本...', 'muted loading-state'); return; }
     if (!revs.length) { renderState(host, '无版本记录', 'muted empty-state'); return; }
-    const details = el('details', 'artifacts-revisions');
-    details.open = false;
-    const summary = el('summary', 'artifacts-revisions__summary');
-    summary.textContent = '版本历史 (' + revs.length + ')';
-    details.appendChild(summary);
+    const count = el('div', 'revisions-modal__count');
+    count.textContent = '共 ' + revs.length + ' 个版本';
+    host.appendChild(count);
     const list = el('ul', 'artifacts-revisions__list');
     const currentId = detail.current_revision_id || null;
     revs.forEach((rev) => list.appendChild(renderRevisionRow(rev, currentId, detail)));
-    details.appendChild(list);
-    host.appendChild(details);
+    host.appendChild(list);
     // diff view (safe textContent in a <pre>; no raw HTML assignment)
     if (state.diffView && state.diffView.text != null) {
       const diffWrap = el('div', 'artifacts-diff');
-      const diffTitle = el('div', 'artifacts-diff__title');
+      const diffHead = el('div', 'artifacts-diff__head');
+      const diffTitle = el('span', 'artifacts-diff__title');
       diffTitle.textContent = '差异: v' + (state.diffView.fromLabel != null ? state.diffView.fromLabel : '?')
         + ' -> v' + (state.diffView.toLabel != null ? state.diffView.toLabel : '?');
-      diffWrap.appendChild(diffTitle);
+      const closeDiffBtn = el('button', 'btn artifacts-diff__close');
+      closeDiffBtn.type = 'button';
+      closeDiffBtn.textContent = '关闭差异';
+      closeDiffBtn.addEventListener('click', () => { state.diffView = null; refreshRevisionsModal(); });
+      diffHead.append(diffTitle, closeDiffBtn);
+      diffWrap.appendChild(diffHead);
       const pre = el('pre', 'artifacts-diff__pre');
       pre.textContent = state.diffView.text;
       diffWrap.appendChild(pre);
-      const closeBtn = el('button', 'btn artifacts-diff__close');
-      closeBtn.type = 'button';
-      closeBtn.textContent = '关闭差异';
-      closeBtn.addEventListener('click', () => { state.diffView = null; renderRevisionsPanel(); });
-      diffWrap.appendChild(closeBtn);
       host.appendChild(diffWrap);
     }
   }
@@ -1317,11 +1378,29 @@
     const summaryText = el('div', 'artifacts-revisions__summary-text');
     summaryText.textContent = rev.change_summary || '';
     li.appendChild(summaryText);
-    // Actions for non-current revisions: compare with current + rollback.
-    // Rollback carries the page's current expected_revision_id (CAS); on
-    // conflict the server rejects and we refresh (NO auto-replay).
+    // Actions: publish/revoke are version-aware and live here (not in the
+    // header). The published revision offers 撤回发布; the current revision
+    // (when not itself published) offers 发布此版本 -- this lets the user
+    // publish the latest revision directly after an edit (outdated state),
+    // atomically replacing the old publish, without a separate revoke step.
+    // Non-current revisions also get compare + rollback. Rollback carries the
+    // page's current expected_revision_id (CAS); on conflict the server
+    // rejects and we refresh (NO auto-replay).
+    const actions = el('div', 'artifacts-revisions__actions');
+    if (rev.is_published) {
+      const revokeBtn = el('button', 'btn artifacts-revisions__revoke');
+      revokeBtn.type = 'button';
+      revokeBtn.textContent = '撤回发布';
+      revokeBtn.addEventListener('click', () => doRevoke(detail.id));
+      actions.appendChild(revokeBtn);
+    } else if (rev.is_current) {
+      const pubBtn = el('button', 'btn btn--primary artifacts-revisions__publish');
+      pubBtn.type = 'button';
+      pubBtn.textContent = '发布此版本';
+      pubBtn.addEventListener('click', () => doPublish());
+      actions.appendChild(pubBtn);
+    }
     if (!rev.is_current && rev.id && currentId) {
-      const actions = el('div', 'artifacts-revisions__actions');
       const diffBtn = el('button', 'btn artifacts-revisions__diff');
       diffBtn.type = 'button';
       diffBtn.textContent = '对比当前';
@@ -1332,8 +1411,8 @@
       rbBtn.textContent = '回滚到此版本';
       rbBtn.addEventListener('click', () => doRollback(detail, rev));
       actions.appendChild(rbBtn);
-      li.appendChild(actions);
     }
+    if (actions.children.length) li.appendChild(actions);
     return li;
   }
 
@@ -1345,7 +1424,7 @@
       const text = data && typeof data.diff_text === 'string' ? data.diff_text
         : (data && data.binary_changed ? '（二进制内容变化，无文本差异）' : '（无差异）');
       state.diffView = { text: text, fromLabel: fromNum != null ? fromNum : '?', toLabel: '当前' };
-      renderRevisionsPanel();
+      refreshRevisionsModal();
     } catch (e) {
       if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('对比失败：' + (e && e.message ? e.message : e));
@@ -1371,6 +1450,7 @@
       await rollbackArtifact(detail.id, rev.id, expected);
       // success: reload detail + revisions (new current revision). No auto-replay.
       state.diffView = null;
+      closeRevisionsModal(); // the current version changed; user can reopen 版本
       if (inflight) { try { inflight.abort(); } catch (_) {} }
       revokeActiveBlobs();
       inflight = new AbortController();

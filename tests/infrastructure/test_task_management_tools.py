@@ -435,3 +435,51 @@ async def test_forging_trusted_metadata_via_untrusted_channel_fails():
     result = await executor.execute(_req("task_show", {"task_id": "t_1"}), ctx)
     assert result.status is ToolResultStatus.PERMISSION_DENIED
     assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_task_show_judge_fork_redacts_run_state():
+    """The goal_mode judge fork must NOT see the run lifecycle state.
+
+    During judge evaluation the run is intentionally NOT finalized (finalization
+    is gated on the judge returning achieved=true), so task.status / runs[].status
+    read as "running / null / not-finished" and mislead the judge into rejecting
+    an achieved goal -- a circular dependency that dooms every goal_mode task.
+    Redact runs + run-lifecycle task fields for write_origin="judge"."""
+    from app.infrastructure.tools.task_management import _JUDGE_REDACTED_TASK_FIELDS
+
+    run = type("R", (), {"id": 1, "task_id": "t_1", "status": TaskRunStatus.RUNNING, "outcome": None})()
+    fake = FakeTaskService(tasks={"t_1": _task("t_1", status=TaskStatus.RUNNING, current_run_id=1)}, runs={"t_1": [run]})
+    executor = TaskManagementToolExecutor(fake)
+    ctx = _trusted_ctx(task_id="t_1", write_origin="judge")
+    result = await executor.execute(_req("task_show", {"task_id": "t_1"}), ctx)
+    payload = _payload(result)
+    # runs array omitted for the judge
+    assert payload["runs"] == []
+    # worker_context omitted for the judge (its Identity segment repeats
+    # task.status="running" and its progress segment lacks a "finished" entry)
+    assert payload["worker_context"] is None
+    # run-lifecycle task fields redacted (status, current_run_id, ...)
+    task_dict = payload["task"]
+    for field in _JUDGE_REDACTED_TASK_FIELDS:
+        assert field not in task_dict, f"judge saw redacted field {field}"
+    # goal-definition fields the judge DOES need are preserved
+    assert task_dict["id"] == "t_1"
+    assert task_dict["title"] == "demo task"
+    assert task_dict["body"] == "task body content"
+
+
+@pytest.mark.asyncio
+async def test_task_show_worker_fork_keeps_run_state():
+    """Worker fork keeps full run state (no regression from judge redaction)."""
+    run = type("R", (), {"id": 1, "task_id": "t_1", "status": TaskRunStatus.RUNNING, "outcome": None})()
+    fake = FakeTaskService(tasks={"t_1": _task("t_1", status=TaskStatus.RUNNING, current_run_id=1)}, runs={"t_1": [run]})
+    executor = TaskManagementToolExecutor(fake)
+    ctx = _trusted_ctx(task_id="t_1", write_origin="worker")
+    result = await executor.execute(_req("task_show", {"task_id": "t_1"}), ctx)
+    payload = _payload(result)
+    # worker sees the run
+    assert len(payload["runs"]) == 1
+    assert payload["runs"][0]["status"] == "running"
+    # worker sees task.status (NOT redacted -- only judge fork redacts)
+    assert payload["task"]["status"] == "running"

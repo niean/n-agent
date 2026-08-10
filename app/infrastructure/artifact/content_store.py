@@ -105,6 +105,11 @@ class LocalArtifactContentStore:
         root = self._root_for_scheme(scheme)
         return await asyncio.to_thread(self._read_sync, root, parts, max_bytes)
 
+    async def probe(self, content_ref: str) -> None:
+        scheme, parts = self._parse_ref(content_ref)
+        root = self._root_for_scheme(scheme)
+        await asyncio.to_thread(self._probe_sync, root, parts)
+
     async def write_atomic(
         self, artifact_id: str, filename: str, data: bytes
     ) -> str:
@@ -180,6 +185,18 @@ class LocalArtifactContentStore:
                 f"read error: {exc}"
             ) from exc
         return b"".join(chunks)
+
+    # ------------------------------------------------------------------
+    # probe
+    # ------------------------------------------------------------------
+
+    def _probe_sync(self, root: Path, parts: list[str]) -> None:
+        """Resolve root/parts and verify the leaf is a readable regular file
+        WITHOUT reading content. ``_resolve_existing`` already enforces all
+        components exist, intermediates are dirs, the leaf is a regular file,
+        and no component is a symlink -- so a successful return means the ref
+        is readable. Used by task_complete pre-flight validation."""
+        self._resolve_existing(root, parts)
 
     # ------------------------------------------------------------------
     # write_atomic

@@ -66,6 +66,24 @@ from app.domain.tool import (
 # 最大返回 event 数（spec: 最近 50 events）
 _MAX_EVENTS_IN_SHOW = 50
 
+# Task lifecycle/run-state fields redacted from task_show for the goal_mode
+# judge fork. During judge evaluation the run is intentionally NOT finalized
+# (finalization is gated on the judge returning achieved=true), so these
+# fields all read as "running / null / not-finished" and mislead the judge
+# into rejecting an achieved goal -- a circular dependency. The judge
+# evaluates the complete_requested intent + verifiable results, not the
+# run lifecycle, so these fields are irrelevant to it.
+_JUDGE_REDACTED_TASK_FIELDS = frozenset({
+    "status",
+    "current_run_id",
+    "claim_expires",
+    "last_heartbeat_at",
+    "started_at",
+    "completed_at",
+    "consecutive_failures",
+    "last_failure_error",
+})
+
 
 class _TaskAccessDenied(Exception):
     """Raised when trusted_metadata gating or ownership check fails."""
@@ -243,6 +261,29 @@ class TaskManagementToolExecutor(ToolExecutor):
         detail = await self.service.get_task_detail(target)
         if detail is None:
             return {"success": False, "error": "task not found"}
+        # Judge fork: the run is INTENTIONALLY not finalized yet -- the engine
+        # finalizes only AFTER the judge returns achieved=true. Exposing the
+        # unfinalized run state (task.status="running", runs[].status="running",
+        # outcome=null, ended_at=null, no "finished" event, consecutive_failures,
+        # last_failure_error) makes the judge conclude "not achieved" from the
+        # run state alone, dooming every goal_mode task to fail in a circular
+        # rejection loop (finalization is gated on the very approval the judge
+        # withholds). Redact run-lifecycle fields so the judge evaluates the
+        # complete_requested intent + verifiable results, not the (necessarily
+        # unfinalized) run state.
+        if task_ctx.write_origin == "judge":
+            task_dict = detail.get("task") or {}
+            task_dict = {
+                k: v for k, v in task_dict.items()
+                if k not in _JUDGE_REDACTED_TASK_FIELDS
+            }
+            # worker_context is a rendered string whose ## Identity segment
+            # repeats task.status ("running" during judge eval) and whose
+            # ## 进度 segment lists events without a "finished" entry -- both
+            # mislead the judge the same way runs does. The judge evaluates
+            # from the `task` (title/body) + `events` (complete_requested)
+            # fields, so drop worker_context entirely for the judge fork.
+            detail = {**detail, "task": task_dict, "runs": [], "worker_context": None}
         # 限制 events 到最近 50 条（spec 约束）
         events = detail.get("events") or []
         if len(events) > _MAX_EVENTS_IN_SHOW:

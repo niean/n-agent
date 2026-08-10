@@ -43,6 +43,7 @@ from app.domain.task import (
     TaskWorkspaceKind,
 )
 from app.domain.task_policy import TaskPolicy
+from app.domain.artifact import ArtifactContentUnavailableError
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +536,158 @@ class _FakeConfigProvider:
 
     async def current(self):
         return self._config
+
+
+# ---------------------------------------------------------------------------
+# task_complete workspace_ref validation (bug: worker wrote file to sandbox
+# cwd via open() then referenced workspace:{path}; file is not at workspace
+# root -> artifact silently skipped, task falsely succeeded). Validation at
+# complete() rejects the unreadable ref so the worker self-corrects via
+# write_file or inline content before the run finalizes.
+# ---------------------------------------------------------------------------
+
+
+class _ProbeValidator:
+    """Fake workspace_ref_validator: raises for refs in `missing`."""
+
+    def __init__(self, missing: set[str] | None = None):
+        self.missing = missing or set()
+        self.calls: list[str] = []
+
+    async def __call__(self, ref: str) -> None:
+        self.calls.append(ref)
+        if ref in self.missing:
+            raise ArtifactContentUnavailableError(f"unreadable: {ref}")
+
+
+@pytest.mark.asyncio
+async def test_complete_rejects_unreadable_workspace_ref(registry):
+    """A workspace: storage_ref whose file is not at the workspace root is
+    rejected at complete() so the worker can self-correct, instead of being
+    silently dropped post-finalize with a falsely-succeeded task."""
+    await registry.create_task(_running_task("t_ws_bad"))
+    validator = _ProbeValidator(missing={"workspace:task3-output.md"})
+    svc = TaskService(
+        registry=registry, policy=TaskPolicy(), memory_store=FakeMemoryStore(),
+        workspace_ref_validator=validator,
+    )
+    with pytest.raises(TaskValidationError) as exc_info:
+        await svc.complete(
+            "t_ws_bad", summary="done",
+            metadata={},
+            artifacts=[{
+                "type": "text/markdown", "name": "task3-output.md",
+                "storage_ref": "workspace:task3-output.md",
+            }],
+        )
+    msg = str(exc_info.value)
+    assert "workspace:task3-output.md" in msg
+    assert "write_file" in msg or "content" in msg
+    # intent not recorded (validation precedes append_event)
+    events = await registry.list_events("t_ws_bad")
+    assert not any(e.kind == "complete_requested" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_complete_accepts_readable_workspace_ref(registry):
+    await registry.create_task(_running_task("t_ws_ok"))
+    validator = _ProbeValidator()  # nothing missing -> all readable
+    svc = TaskService(
+        registry=registry, policy=TaskPolicy(), memory_store=FakeMemoryStore(),
+        workspace_ref_validator=validator,
+    )
+    intent = await svc.complete(
+        "t_ws_ok", summary="done", metadata={},
+        artifacts=[{
+            "type": "text/markdown", "name": "out.md",
+            "storage_ref": "workspace:out.md",
+        }],
+    )
+    assert intent["outcome"] == "completed"
+    assert validator.calls == ["workspace:out.md"]
+
+
+@pytest.mark.asyncio
+async def test_complete_inline_content_skips_workspace_validation(registry):
+    """Inline-content artifacts (no workspace: ref) must not trigger the
+    workspace probe -- the common text-output path stays validation-free."""
+    await registry.create_task(_running_task("t_ws_inline"))
+    validator = _ProbeValidator()
+    svc = TaskService(
+        registry=registry, policy=TaskPolicy(), memory_store=FakeMemoryStore(),
+        workspace_ref_validator=validator,
+    )
+    await svc.complete(
+        "t_ws_inline", summary="done", metadata={},
+        artifacts=[{
+            "type": "text", "name": "report.md", "content": "# report body",
+        }],
+    )
+    assert validator.calls == []
+
+
+@pytest.mark.asyncio
+async def test_complete_no_validator_skips_workspace_validation(registry):
+    """No validator wired (default) -> backward compatible, no probe."""
+    await registry.create_task(_running_task("t_ws_noval"))
+    svc = TaskService(
+        registry=registry, policy=TaskPolicy(), memory_store=FakeMemoryStore(),
+    )
+    intent = await svc.complete(
+        "t_ws_noval", summary="done", metadata={},
+        artifacts=[{
+            "type": "text/markdown", "name": "out.md",
+            "storage_ref": "workspace:out.md",
+        }],
+    )
+    assert intent["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_complete_workspace_ref_validated_against_real_content_store(
+    registry, tmp_path,
+):
+    """Integration: the validator wired in main.py calls
+    LocalArtifactContentStore.probe. A workspace: ref whose file was NOT
+    written to the workspace root (the bug: worker used open() to scratch
+    cwd) is rejected; after writing the file to the workspace root (via the
+    write_file callback path) the same ref is accepted."""
+    from app.infrastructure.artifact.content_store import LocalArtifactContentStore
+
+    ws_root = tmp_path / "workspace"
+    ws_root.mkdir()
+    store = LocalArtifactContentStore(
+        tmp_path / "artifacts", tmp_path / "attachments", ws_root,
+        max_bytes=4096,
+    )
+
+    async def validate(ref: str) -> None:
+        await store.probe(ref)
+
+    await registry.create_task(_running_task("t_ws_real"))
+    svc = TaskService(
+        registry=registry, policy=TaskPolicy(), memory_store=FakeMemoryStore(),
+        workspace_ref_validator=validate,
+    )
+    # File not at workspace root yet -> rejected (bug scenario: open() to cwd)
+    with pytest.raises(TaskValidationError):
+        await svc.complete(
+            "t_ws_real", summary="done", metadata={},
+            artifacts=[{
+                "type": "text/markdown", "name": "out.md",
+                "storage_ref": "workspace:out.md",
+            }],
+        )
+    # Worker self-corrects: write_file writes to workspace root -> accepted
+    (ws_root / "out.md").write_bytes(b"# output\nreal content")
+    intent = await svc.complete(
+        "t_ws_real", summary="done", metadata={},
+        artifacts=[{
+            "type": "text/markdown", "name": "out.md",
+            "storage_ref": "workspace:out.md",
+        }],
+    )
+    assert intent["outcome"] == "completed"
 
 
 @pytest.mark.asyncio

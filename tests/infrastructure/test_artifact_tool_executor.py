@@ -582,6 +582,24 @@ class TestUpdate:
         assert payload["error"]["code"] == "artifact_revision_conflict"
         assert payload["error"]["retryable"] is True
 
+    def test_text_patch_schema_exposes_fields_to_model(self):
+        """The UPDATE tool's text_patch schema must spell out search/replace/mode
+        so the model does not retry-guess the op shape (root cause of revision
+        retries). Mirrors runtime validation in _validate_text_patch."""
+        defs = {d.name: d for d in artifact_tool_definitions()}
+        schema = defs[ARTIFACT_TOOL_UPDATE].input_schema
+        tp = schema["properties"]["text_patch"]
+        assert tp["type"] == "array"
+        assert tp["minItems"] == 1
+        assert tp["maxItems"] == 100
+        item = tp["items"]
+        assert set(item["properties"]) == {"search", "replace", "mode"}
+        assert item["additionalProperties"] is False
+        assert set(item["required"]) == {"search", "replace", "mode"}
+        assert item["properties"]["search"]["minLength"] == 1
+        assert item["properties"]["replace"]["type"] == "string"
+        assert set(item["properties"]["mode"]["enum"]) == {"first", "all"}
+
     @pytest.mark.asyncio
     async def test_text_patch_structural_validation(self):
         ex = ArtifactToolExecutor(FakeArtifactService())

@@ -753,7 +753,11 @@ PYEOF
     -H "Content-Type: application/json" \
     -d "$(jq -n --arg rid "$R1_ID" --arg c "$REV_CONTENT_2" '{content:$c,expected_revision_id:$rid}')"
   assert_status 200 "update content (revision 2)"
-  R2_ID=$(json_field '.revision_id')
+  # Content PATCH returns the full artifact view (_artifact_view, same shape as
+  # GET detail): the new revision is exposed as current_revision_id (NOT the
+  # legacy _write_result_to_dict .revision_id field). revision_number is also
+  # enriched on the view.
+  R2_ID=$(json_field '.current_revision_id')
   R2_NUM=$(json_field '.revision_number')
   if [ -z "$R2_ID" ] || [ "$R2_ID" = "$R1_ID" ]; then
     echo "FAIL: update should create a new revision_id" >&2
