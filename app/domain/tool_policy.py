@@ -35,10 +35,21 @@ class ToolPolicy:
     ) -> bool:
         if not isinstance(exposure_policy, ToolExposurePolicy):
             return False
-        if not definition.enabled or definition.risk_level is RiskLevel.DANGEROUS:
+        if not definition.enabled:
             return False
         if exposure_policy is ToolExposurePolicy.DEFAULT:
+            # DEFAULT (realtime chat): all enabled tools are listed, including
+            # DANGEROUS ones -- the model can call them, and execution routes
+            # through the approval card (DANGEROUS -> REQUIRE_APPROVAL).
             return True
+        # SAFE_ONLY (unattended/cron): realtime-only tools are never exposed
+        # here, even when explicitly granted (spec: artifact_* grant 不得放开).
+        if definition.realtime_only:
+            return False
+        # DANGEROUS tools require an approval channel, which unattended runs
+        # do not have; they are hidden here and only approvable in realtime.
+        if definition.risk_level is RiskLevel.DANGEROUS:
+            return False
         # SAFE_ONLY exposes safe non-agent tools. A task may additionally grant
         # specific SAFE tools (e.g. host_terminal) so an unattended run can see
         # them despite their AGENT source_type; grants never lift CONFIRM/DANGER
@@ -75,11 +86,14 @@ class ToolPolicy:
     ) -> PolicyDecision:
         if not definition.enabled:
             return PolicyDecision(PolicyOutcome.DENY, "tool_disabled")
-        if definition.risk_level is RiskLevel.DANGEROUS:
-            return PolicyDecision(PolicyOutcome.DENY, "dangerous_tool")
         if definition.risk_level is RiskLevel.SAFE:
             return PolicyDecision(PolicyOutcome.ALLOW, "safe_tool")
 
+        # CONFIRM and DANGEROUS both require approval. DANGEROUS (externally
+        # visible side effects, e.g. artifact_publish) is never auto-granted:
+        # it surfaces a distinct reason so the approval card can render a
+        # stronger warning, but routes through the same approval channel as
+        # CONFIRM. Unattended runs have no decider, so it is denied there.
         if definition.managed:
             if context is not None and request.name in context.permitted_managed_tools:
                 return PolicyDecision(PolicyOutcome.ALLOW, "managed_grant")
@@ -97,7 +111,9 @@ class ToolPolicy:
             return PolicyDecision(PolicyOutcome.ALLOW, "argument_grant")
         return PolicyDecision(
             PolicyOutcome.REQUIRE_APPROVAL,
-            "confirm_approval_required",
+            "dangerous_approval_required"
+            if definition.risk_level is RiskLevel.DANGEROUS
+            else "confirm_approval_required",
         )
 
     def authorize_once(
@@ -110,8 +126,8 @@ class ToolPolicy:
             raise ValueError("context must be a ToolExecutionContext")
         if definition.name != request.name:
             raise ValueError("definition and request names must match")
-        if definition.risk_level is not RiskLevel.CONFIRM:
-            raise ValueError("only confirm tools can receive one-time authorization")
+        if definition.risk_level not in (RiskLevel.CONFIRM, RiskLevel.DANGEROUS):
+            raise ValueError("only confirm or dangerous tools can receive one-time authorization")
 
         current_context = context if context is not None else ToolExecutionContext()
         decision = self.evaluate_execution(definition, request, current_context)

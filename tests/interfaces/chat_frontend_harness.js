@@ -2738,6 +2738,96 @@ async function testAutoRefreshPanels() {
   ok(env.byIdMap['chat-artifact-list'].textContent !== '加载中...', 'silent refresh: no 加载中 flicker');
 }
 
+// ===========================================================================
+// T10: ui.artifact 卡片渲染 (conversational artifact write-tool card)
+// - name / version(vN) / publish-status badge / fixed /artifacts/{id} 详情 link
+// - link built ONLY from structured card.artifact_id (encodeURIComponent),
+//   never from a model-provided URL (card carries no url/share_url field)
+// - publish_sync_state badge: unpublished->未发布, current->已发布, outdated->已过期
+// - missing artifact_id -> content text only, no link
+// - NOT absorbed into task_result groups (renders independently)
+// ===========================================================================
+(function testUiArtifactCard() {
+  const env = loadChat();
+  const createMessageElement = env.chat.createMessageElement;
+  const g = env.chat.groupTaskMessages;
+  function collectAnchors(node) {
+    const out = [];
+    (function walk(n) {
+      if (!n || !n._kids) return;
+      for (const k of n._kids) { if (k.tagName === 'A') out.push(k); walk(k); }
+    })(node);
+    return out;
+  }
+  function collectByClass(node, cls) {
+    const out = [];
+    (function walk(n) {
+      if (!n || !n._kids) return;
+      for (const k of n._kids) {
+        if (k.className && k.className.split(/\s+/).indexOf(cls) !== -1) out.push(k);
+        walk(k);
+      }
+    })(node);
+    return out;
+  }
+
+  // --- create success: unpublished ---
+  const card = { artifact_id: 'art-1', revision_id: 'r1', name: '季度报告', kind: 'document', revision_number: 1, publish_sync_state: 'unpublished' };
+  let el = createMessageElement({ id: 'm1', role: 'system', name: 'ui.artifact', content: '制品已更新: 季度报告', card: card });
+  ok(el.className === 'msg assistant', 'ui.artifact renders as msg assistant (got ' + el.className + ')');
+  ok(el.textContent.indexOf('季度报告') !== -1, 'card shows artifact name');
+  ok(el.textContent.indexOf('v1') !== -1, 'card shows version v1');
+  ok(el.textContent.indexOf('未发布') !== -1, 'card shows unpublished badge label');
+  const anchors = collectAnchors(el);
+  ok(anchors.length === 1, 'card has exactly one 详情 link (got ' + anchors.length + ')');
+  ok(anchors[0].href === '/artifacts/art-1', 'link href built from card.artifact_id (got ' + anchors[0].href + ')');
+  ok(anchors[0].textContent === '详情', 'link text is 详情');
+  const badges = collectByClass(el, 'chat-artifact-card__badge');
+  ok(badges.length === 1 && badges[0].className.indexOf('chat-artifact-card__badge--unpublished') !== -1, 'badge carries unpublished state class');
+
+  // --- publish success: current ---
+  const pubCard = { artifact_id: 'art-1', revision_id: 'r2', name: '季度报告', kind: 'document', revision_number: 2, publish_sync_state: 'current' };
+  el = createMessageElement({ id: 'm2', role: 'system', name: 'ui.artifact', content: '制品已更新: 季度报告', card: pubCard });
+  ok(el.textContent.indexOf('已发布') !== -1, 'publish card shows 已发布 badge');
+  ok(el.textContent.indexOf('v2') !== -1, 'publish card shows v2');
+  ok(collectByClass(el, 'chat-artifact-card__badge')[0].className.indexOf('--current') !== -1, 'badge carries current state class');
+
+  // --- rollback: outdated ---
+  const rbCard = { artifact_id: 'art-1', revision_id: 'r3', name: '季度报告', kind: 'document', revision_number: 3, publish_sync_state: 'outdated' };
+  el = createMessageElement({ id: 'm3', role: 'system', name: 'ui.artifact', content: '制品已更新: 季度报告', card: rbCard });
+  ok(el.textContent.indexOf('已过期') !== -1, 'rollback card shows 已过期 badge');
+
+  // --- encodeURIComponent applied to artifact_id ---
+  const encCard = { artifact_id: 'art 1', revision_id: 'r1', name: 'x', kind: 'text', revision_number: 1, publish_sync_state: 'unpublished' };
+  el = createMessageElement({ id: 'm4', role: 'system', name: 'ui.artifact', content: '制品已更新: x', card: encCard });
+  ok(collectAnchors(el)[0].href === '/artifacts/art%201', 'artifact_id is encodeURIComponent-ed in link (got ' + collectAnchors(el)[0].href + ')');
+
+  // --- no model URL rendering: even if a malicious url/share_url were present
+  //     in the card, the card schema excludes it and the renderer ignores it ---
+  const leakCard = { artifact_id: 'art-1', revision_id: 'r1', name: 'x', kind: 'text', revision_number: 1, publish_sync_state: 'unpublished', share_url: 'https://evil.example/x', url: 'javascript:alert(1)' };
+  el = createMessageElement({ id: 'm5', role: 'system', name: 'ui.artifact', content: '制品已更新: x', card: leakCard });
+  const leakAnchors = collectAnchors(el);
+  ok(leakAnchors.length === 1 && leakAnchors[0].href === '/artifacts/art-1', 'renderer ignores model-provided url/share_url; link stays fixed in-site path (got ' + JSON.stringify(leakAnchors.map((a) => a.href)) + ')');
+
+  // --- missing artifact_id -> content text only, no link ---
+  el = createMessageElement({ id: 'm6', role: 'system', name: 'ui.artifact', content: '制品已更新: x', card: { name: 'x', revision_number: 1, publish_sync_state: 'unpublished' } });
+  ok(collectAnchors(el).length === 0, 'no link when artifact_id missing (got ' + collectAnchors(el).length + ')');
+  ok(el.textContent.indexOf('制品已更新: x') !== -1, 'content text rendered as fallback');
+
+  // --- no card at all -> content text only ---
+  el = createMessageElement({ id: 'm7', role: 'system', name: 'ui.artifact', content: '制品已更新: x' });
+  ok(collectAnchors(el).length === 0, 'no link when card absent');
+  ok(el.textContent.indexOf('制品已更新: x') !== -1, 'content text rendered when no card');
+
+  // --- NOT absorbed into task_result groups (renders independently) ---
+  const grouped = g([
+    { id: 'r1', role: 'system', name: 'ui.task_result', content: '任务已完成：t' },
+    { id: 'a1', role: 'system', name: 'ui.artifact', content: '制品已更新: x', card: card },
+  ]);
+  ok(grouped.length === 2, 'ui.artifact not absorbed by task_result (got ' + grouped.length + ' groups)');
+  ok(grouped[1].id === 'a1' && grouped[1].name === 'ui.artifact', 'ui.artifact stays independent after task_result');
+})();
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();

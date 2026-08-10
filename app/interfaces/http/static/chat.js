@@ -604,6 +604,15 @@
     { match: 'judge task ', label: '判断结束' },
   ];
 
+  // T10: ui.artifact card publish_sync_state -> badge label. The badge class
+  // also carries the raw state (chat-artifact-card__badge--<state>) so CSS can
+  // color it. Unknown states fall back to their raw value, then "未发布".
+  const ARTIFACT_PUBLISH_LABELS = {
+    unpublished: '未发布',
+    current: '已发布',
+    outdated: '已过期',
+  };
+
   // work task / judge task 前缀的消息：
   // - 单独卡片 summary 固定 = `任务状态`（与合并卡、standalone lifecycle 一致，不再用前缀+content）
   // - 合并卡片行 = `<label>: <content>`（work task -> 查询状态、judge task -> 判断结束，行级前缀区分 lifecycle 行）
@@ -1210,6 +1219,10 @@
     // ui.task_command 状态卡片），样式对齐 assistant 气泡、支持 Hover 时间与 markdown 子集。
     const isTaskResult = message.role === 'system' && message.name === 'ui.task_result';
     const isTaskArtifact = message.role === 'system' && message.name === 'ui.task_artifact';
+    // T10: conversational artifact write-tool card (create/update/rollback/publish
+    // success). Distinct from ui.task_artifact (task-worker artifacts). Renders
+    // independently (classifyTaskMessage -> 'other'), never absorbed into groups.
+    const isArtifact = message.role === 'system' && message.name === 'ui.artifact';
     const isProcessUser = message.role === 'user' && PROCESS_SOURCES.has(message.source);
     // 多消息合并卡片（groupTaskMessages 产出的 _mergedTaskStatus=true）：
     // summary 固定=任务状态，pre 多行拼接，open=false，className `msg system`（与 ui.task_lifecycle 一致）。
@@ -1220,7 +1233,7 @@
     // 进程来源 user 消息：右对齐状态卡片（灰底卡片样式，与真人 user 蓝底右对齐气泡同处右侧、靠灰底区分）。
     // work task / judge task / 合并卡片 样式打平 ui.task_lifecycle 任务状态卡片（msg system）；
     // 其余进程消息（schedule/curator 等）沿用 msg--process-card 非折叠样式。
-    el.className = (isTaskResult || isTaskArtifact) ? 'msg assistant'
+    el.className = (isTaskResult || isTaskArtifact || isArtifact) ? 'msg assistant'
       : ((isMergedTaskStatus || isFoldedProcess) ? 'msg system'
       : (isProcessUser ? 'msg msg--process-card' : `msg ${message.role || 'assistant'}`));
     // 合并卡片 / work task / judge task 卡片样式打平 ui.task_lifecycle（不携带 dataset.source，与 system 消息一致）；
@@ -1248,6 +1261,56 @@
         });
         el.appendChild(document.createTextNode(' '));
         el.appendChild(link);
+      }
+      const timeLabel = formatMessageTime(message.created_at);
+      if (timeLabel) el.dataset.time = timeLabel;
+      return el;
+    }
+    // T10: ui.artifact card -- name / version / publish-status badge / fixed
+    // in-site 详情 link. The link target is built ONLY from structured card
+    // metadata (artifact_id), never from a model-provided URL. All text uses
+    // textContent; no innerHTML. Falls back to plain content text when the
+    // card or artifact_id is missing.
+    if (isArtifact) {
+      const card = message.card;
+      if (card && card.artifact_id) {
+        const wrap = document.createElement('span');
+        wrap.className = 'chat-artifact-card';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'chat-artifact-card__name';
+        nameEl.textContent = card.name || (typeof message.content === 'string' ? message.content : '');
+        wrap.appendChild(nameEl);
+        if (card.revision_number != null) {
+          const verEl = document.createElement('span');
+          verEl.className = 'chat-artifact-card__version';
+          verEl.textContent = 'v' + card.revision_number;
+          wrap.appendChild(verEl);
+        }
+        const state = typeof card.publish_sync_state === 'string' ? card.publish_sync_state : '';
+        const badgeEl = document.createElement('span');
+        badgeEl.className = 'chat-artifact-card__badge chat-artifact-card__badge--' + (state || 'unpublished');
+        badgeEl.textContent = ARTIFACT_PUBLISH_LABELS[state] || state || '未发布';
+        wrap.appendChild(badgeEl);
+        el.appendChild(wrap);
+        const href = '/artifacts/' + encodeURIComponent(card.artifact_id);
+        const link = document.createElement('a');
+        link.href = href;
+        link.textContent = '详情';
+        link.className = 'chat-artifact-link';
+        link.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          const nav = global.NAGENT && global.NAGENT.navigation;
+          if (nav && typeof nav.navigatePath === 'function') {
+            nav.navigatePath(href);
+          } else { global.location.href = href; }
+        });
+        el.appendChild(document.createTextNode(' '));
+        el.appendChild(link);
+      } else {
+        const text = typeof message.content === 'string' ? message.content : String(message.content || '');
+        const textNode = document.createElement('span');
+        textNode.textContent = text;
+        el.appendChild(textNode);
       }
       const timeLabel = formatMessageTime(message.created_at);
       if (timeLabel) el.dataset.time = timeLabel;

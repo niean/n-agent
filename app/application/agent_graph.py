@@ -90,6 +90,16 @@ _INTERNAL_OPTION_KEYS = {
     "dashboard_approval_event_queue",
 }
 
+# Conversational artifact tools whose structured SUCCESS result materializes a
+# ui.artifact card (spec line 205). Read-only tools (artifact_read/list/
+# list_revisions/diff) are excluded -- they never write a card.
+_ARTIFACT_WRITE_TOOLS = frozenset({
+    "artifact_create",
+    "artifact_update",
+    "artifact_rollback",
+    "artifact_publish",
+})
+
 
 # Mapping from Domain EndReason to OpenAI-compatible finish_reason strings.
 # Used by finalize to set state.finish_reason from TurnPolicy's end_reason.
@@ -138,6 +148,7 @@ class AgentGraphRunner:
         budget_service: BudgetService | None = None,
         llm_policy: LLMPolicy | None = None,
         browser_guidance: str | None = None,
+        artifact_guidance: str | None = None,
         llm_config: LLMConfig | None = None,
         evolution_service: SkillEvolutionService | None = None,
         nudge_interval: int = 10,
@@ -183,6 +194,7 @@ class AgentGraphRunner:
             is_cancelled=self.is_cancelled,
             runtime_memory_service=self._runtime_memory,
             browser_guidance=browser_guidance,
+            artifact_guidance=artifact_guidance,
         )
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
@@ -1163,6 +1175,17 @@ class AgentGraphRunner:
                         duration_ms=result.duration_ms,
                     )
                 )
+            # T10: ui.artifact card -- persist a structured card for
+            # conversational artifact write tools on SUCCESS only. Reads the
+            # original result.content (never the transform_tool_result-mutated
+            # payload). Failures, approval rejections, read-only tools and
+            # missing-field results write NO card; a CAS conflict (success=
+            # false) leaves the previous card untouched. Best-effort: a write
+            # failure is logged and never breaks the tool flow.
+            if (state.persist_messages
+                    and result.status is ToolResultStatus.SUCCESS
+                    and result.tool_name in _ARTIFACT_WRITE_TOOLS):
+                await self._persist_artifact_card(state, result)
             if result.terminal:
                 # Terminal tool semantics are decided by the server-side
                 # executor. Stop after persisting this result; do not make a
@@ -1179,6 +1202,55 @@ class AgentGraphRunner:
         else:
             state.final_message = None
         return state
+
+    async def _persist_artifact_card(
+        self, state: AgentState, result: ToolResult,
+    ) -> None:
+        """Best-effort ui.artifact card for a successful artifact write tool.
+
+        Extracts the structured success payload from ``result.content`` (a JSON
+        string emitted by ArtifactToolExecutor) and persists a role=system,
+        name=ui.artifact message whose card is exactly
+        ``{artifact_id, revision_id, name, kind, revision_number,
+        publish_sync_state}`` (spec line 205). Skips silently when the payload
+        is not a dict, lacks success, or is missing the required artifact_id /
+        revision_id. Never raises: a persistence failure is logged and the
+        tool flow continues unaffected.
+        """
+        content = result.content
+        if isinstance(content, str):
+            try:
+                payload = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                return
+        else:
+            payload = content
+        if not isinstance(payload, dict) or not payload.get("success"):
+            return
+        artifact_id = payload.get("artifact_id")
+        revision_id = payload.get("revision_id")
+        if not artifact_id or not revision_id:
+            return
+        card = {
+            "artifact_id": artifact_id,
+            "revision_id": revision_id,
+            "name": payload.get("name"),
+            "kind": payload.get("kind"),
+            "revision_number": payload.get("revision_number"),
+            "publish_sync_state": payload.get("publish_sync_state"),
+        }
+        try:
+            await self._runtime_memory.append_system_named_message(
+                state.session_id,
+                "ui.artifact",
+                content=f"制品已更新: {payload.get('name') or artifact_id}",
+                card=card,
+            )
+        except Exception:
+            logger.warning(
+                "ui.artifact card persist failed: tool=%s session=%s",
+                result.tool_name, state.session_id, exc_info=True,
+            )
 
     @staticmethod
     def _permission_denied_result(

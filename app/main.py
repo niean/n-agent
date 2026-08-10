@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import shutil
 import sys
@@ -15,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.artifact_service import ArtifactService, ArtifactServiceConfig
+from app.application.artifact_tools import artifact_tool_definitions
 from app.application.budget_service import BudgetService
 from app.application.browser_service import BrowserService, BrowserServiceSettings
 from app.application.browser_confirmation_service import BrowserConfirmationService
@@ -56,7 +58,7 @@ from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.skill_service import SkillManageToolExecutor, SkillService, SkillToolExecutor, skill_tool_definitions
 from app.application.skill_evolution_service import SkillEvolutionService
 from app.application.plugin_service import PluginCliCommand, PluginService, PluginToolExecutor
-from app.application.prompt_builder import BROWSER_GUIDANCE, build_system_prompt
+from app.application.prompt_builder import ARTIFACT_GUIDANCE, BROWSER_GUIDANCE, build_system_prompt
 from app.application.task_agent_executor import TaskAgentExecutor
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
@@ -217,7 +219,9 @@ def _make_task_exists_resolver(task_registry):
     return exists
 from app.infrastructure.artifact.content_store import LocalArtifactContentStore
 from app.infrastructure.artifact.export_converter import convert_to_html
+from app.infrastructure.artifact.exporters import ArtifactExporterConfig, OfficeArtifactExporter
 from app.infrastructure.registry.sqlite_artifact_registry import SQLiteArtifactRegistry
+from app.infrastructure.tools.artifact_management import ArtifactToolExecutor
 from app.interfaces.http.published_artifact_routes import register_published_artifact_routes
 
 if TYPE_CHECKING:
@@ -901,6 +905,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         nudge_interval=settings.skills_creation_nudge_interval,
         hook_dispatcher=plugin_service,
         browser_guidance=BROWSER_GUIDANCE if settings.browser_enabled else None,
+        artifact_guidance=ARTIFACT_GUIDANCE if settings.artifacts_enabled else None,
     )
     session_service = SessionService(
         memory_store,
@@ -1059,7 +1064,19 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             artifact_publish_max_bytes=settings.artifact_publish_max_bytes,
             artifact_inline_max_bytes=settings.artifact_inline_max_bytes,
             published_base_url=settings.published_base_url,
+            diff_max_bytes=settings.artifact_diff_max_bytes,
+            diff_max_lines=settings.artifact_diff_max_lines,
+            diff_max_output_chars=settings.artifact_diff_max_output_chars,
+            artifact_read_max_bytes=settings.artifact_read_max_bytes,
         )
+        # Exporter SPI (T11): OfficeArtifactExporter lives in Infrastructure
+        # and adapts the Domain ArtifactExporter port. Constructed from a
+        # frozen ArtifactExporterConfig snapshot (NOT Settings) so the
+        # Application/Domain layers never read Settings directly.
+        exporter_config = ArtifactExporterConfig(
+            max_output_bytes=settings.artifact_export_max_bytes,
+        )
+        artifact_exporter = OfficeArtifactExporter(exporter_config)
         artifact_service = ArtifactService(
             artifact_registry,
             artifact_content_store,
@@ -1068,7 +1085,20 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             audit_service,
             artifact_config,
             convert_to_html,
+            exporter=artifact_exporter,
         )
+        # Register the 8 artifact_* tools (T11). ArtifactToolExecutor dispatches
+        # to ArtifactService, session-bound. routes is the live dict backing
+        # CompositeToolExecutor, so registering here surfaces the tools without
+        # reconstructing the composite. read_max_bytes is bound from the same
+        # frozen snapshot the service uses.
+        artifact_executor = ArtifactToolExecutor(
+            artifact_service,
+            read_max_bytes=settings.artifact_read_max_bytes,
+        )
+        for _artifact_def in artifact_tool_definitions():
+            routes[_artifact_def.name] = artifact_executor
+        tool_service.set_dynamic_definitions("artifact", artifact_tool_definitions())
     if settings.task_enabled:
         # SQLiteTaskRegistry performs schema init in __init__; failures
         # propagate (spec: 初始化异常必须让启动失败，不得伪装成"子系统不可用"
@@ -1090,7 +1120,10 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         task_agent_executor = TaskAgentExecutor(
             chat_service=chat_service,
             task_registry=task_registry,
-            prompt_builder=build_system_prompt,
+            prompt_builder=functools.partial(
+                build_system_prompt,
+                artifact_guidance=ARTIFACT_GUIDANCE if settings.artifacts_enabled else None,
+            ),
             max_runtime_seconds=settings.task_max_runtime_seconds,
             goal_max_turns=settings.task_goal_max_turns,
             task_config_provider=task_config_service,
@@ -1593,7 +1626,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         provider_configured = active is not None and active.api_key_present
         knowledge_bases = _run_sync(knowledge_service.list_bases())
         knowledge_enabled_count = sum(1 for base in knowledge_bases if base.enabled)
-        return {
+        snapshot = {
             "provider": {
                 "status": "ok" if provider_configured else "warn",
                 "base_url": active.base_url if active else "",
@@ -1657,6 +1690,11 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
                 "runner_wired": task_run_service is not None,
             },
         }
+        if settings.artifacts_enabled and artifact_service is not None:
+            snapshot["artifact_revision_migration"] = (
+                artifact_service.migration_status()
+            )
+        return snapshot
 
     # T3: Create ONE GatewayToolApprovalService and share it between
     # GatewayService and the Dashboard router.  Do NOT let either side
@@ -1956,6 +1994,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
             except Exception:
                 logger.exception("artifact orphan backfill failed")
+            # Revision migration backfill (T7): backfill initial revisions
+            # for unmigrated artifacts (current_revision_id is NULL).
+            # Idempotent; failure does not block unrelated subsystems.
+            try:
+                mstats = await services.artifact_service.migrate_revisions(
+                    batch_size=100
+                )
+                logger.info(
+                    "artifact revision migration ok processed=%s "
+                    "migrated=%s skipped=%s failed=%s",
+                    mstats.get("processed", 0),
+                    mstats.get("migrated", 0),
+                    mstats.get("skipped", 0),
+                    mstats.get("failed", 0),
+                )
+            except Exception:
+                logger.exception("artifact revision migration failed")
         try:
             yield
         finally:

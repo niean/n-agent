@@ -15,7 +15,7 @@
 // - image/PDF blob + fallback
 // - revokeObjectURL on switch/destroy
 // - text save / binary replace refresh via server size/checksum/updated_at
-// - export as a single button (original format only; no dropdown)
+// - export as a standard button opening a modal to confirm format (capabilities-driven)
 // - publish: single toggle button (发布/撤回) + header status segment showing
 //   the share link; binary publish shows explicit-PUBLIC confirmation
 //
@@ -157,7 +157,15 @@ const fetchRoutes = [];
 let fetchLog = [];
 function fetchMock(url, options) {
   options = options || {};
-  fetchLog.push({ url: String(url), method: options.method || 'GET', signal: options.signal || null });
+  // record body for assertion: strings as-is, FormData as a marker, headers captured
+  let bodyRec = null;
+  if (options.body != null) {
+    if (typeof options.body === 'string') bodyRec = options.body;
+    else if (options.body && options.body.toString) bodyRec = String(options.body);
+    else bodyRec = '[non-string body]';
+  }
+  fetchLog.push({ url: String(url), method: options.method || 'GET', signal: options.signal || null,
+    body: bodyRec, headers: options.headers || null });
   for (const r of fetchRoutes) {
     const m = r.match(String(url), options);
     if (m) return Promise.resolve(r.handle(m, options));
@@ -704,11 +712,13 @@ async function testRevokeObjectURLOnDestroy() {
 
 async function testTextSaveRefreshWithServerMetadata() {
   const win = freshEnv();
-  const a = art('a1', 'text', { size: 5, checksum: 'sha256:' + 'a'.repeat(64), updated_at: '2026-01-01T00:00:00+00:00' });
+  const a = art('a1', 'text', { size: 5, checksum: 'sha256:' + 'a'.repeat(64), updated_at: '2026-01-01T00:00:00+00:00',
+    extra: { current_revision_id: 'r1' } });
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
   route(/^\/chat\/artifacts\/a1$/, (m, opts) => {
     if ((opts.method || 'GET') === 'PATCH') {
-      return jsonResp(art('a1', 'text', { size: 11, checksum: 'sha256:' + 'b'.repeat(64), updated_at: '2026-01-02T00:00:00+00:00' }));
+      return jsonResp(art('a1', 'text', { size: 11, checksum: 'sha256:' + 'b'.repeat(64), updated_at: '2026-01-02T00:00:00+00:00',
+        extra: { current_revision_id: 'r2' } }));
     }
     return jsonResp(a);
   });
@@ -730,46 +740,133 @@ async function testTextSaveRefreshWithServerMetadata() {
   // a PATCH should have been sent
   const patchCall = fetchLog.find((l) => l.method === 'PATCH' && l.url.indexOf('/chat/artifacts/a1') !== -1);
   ok(patchCall, 'text save sent PATCH');
+  // T10: content PATCH must carry the CAS token (expected_revision_id)
+  ok(patchCall && patchCall.body && patchCall.body.indexOf('expected_revision_id') !== -1
+      && patchCall.body.indexOf('r1') !== -1,
+    'content PATCH carries expected_revision_id CAS token');
   // After save, server-returned size/checksum/updated_at should be reflected.
   const text = collectText(byId['tab-artifacts']);
   ok(text.indexOf('11') !== -1 || text.indexOf('b') !== -1 || text.indexOf('2026-01-02') !== -1,
     'refreshed metadata from server shown after save');
 }
 
-async function testExportButtonOriginalOnly() {
+async function testContentPatchConflictKeepsCurrentNoAutoReplay() {
+  // T10: content PATCH with a stale CAS token -> artifact_revision_conflict
+  // (409). Keep the current display, refresh server state, prompt the user,
+  // NO auto-replay of the save.
   const win = freshEnv();
-  // markdown -> original + html
-  const a = art('a1', 'markdown', { mime: 'text/markdown' });
+  const a = art('a1', 'text', { size: 5, extra: { current_revision_id: 'r1' } });
+  let patchAttempts = 0;
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
-  route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
-  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('# hi'));
-  route(/^\/chat\/artifacts\/a1\/export\?format=html/, () => textResp('<h1>hi</h1>', 'text/html'));
+  route(/^\/chat\/artifacts\/a1$/, (m, opts) => {
+    if ((opts.method || 'GET') === 'PATCH') {
+      patchAttempts += 1;
+      return errResp('artifact_revision_conflict', 'CAS conflict', 409);
+    }
+    return jsonResp(a);
+  });
+  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
+  let alertMsg = null;
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = { alert: (m) => { alertMsg = String(m); return Promise.resolve(); }, confirm: () => Promise.resolve(true) };
   const mod = loadModule(win);
   await mod.init();
   await tick();
   const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
   for (const fn of (item._listeners['click'] || [])) fn({});
   await tick();
-  const exportBtns = findByClass(byId['tab-artifacts'], 'artifacts-detail__export');
-  ok(exportBtns.length === 1, 'single export button present (no dropdown)');
-  ok(!findByClass(byId['tab-artifacts'], 'artifacts-detail__export-menu').length,
-    'no export dropdown menu rendered');
+  const editBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__edit');
+  if (editBtn[0]) { for (const fn of (editBtn[0]._listeners['click'] || [])) fn({}); }
+  const tas = findByTag(byId['tab-artifacts'], 'textarea');
+  if (tas[0]) { tas[0].value = 'edited text'; }
+  const saveBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__save');
+  if (saveBtn[0]) { for (const fn of (saveBtn[0]._listeners['click'] || [])) fn({}); await tick(); }
+  await tick(); await tick();
+  // exactly one PATCH attempt (NO auto-replay)
+  ok(patchAttempts === 1, 'content PATCH conflict: no auto-replay (single attempt, got ' + patchAttempts + ')');
+  // user was prompted about the version change
+  ok(alertMsg && alertMsg.indexOf('版本已变化') !== -1, 'conflict prompts user about version change (got ' + alertMsg + ')');
+  // a GET detail reload happened (refresh server state)
+  const reloads = fetchLog.filter((l) => l.method === 'GET' && l.url.indexOf('/chat/artifacts/a1') !== -1
+      && l.url.indexOf('/content') === -1 && l.url.indexOf('/export') === -1
+      && l.url.indexOf('/revisions') === -1 && l.url.indexOf('/capabilities') === -1
+      && l.url.indexOf('/publish') === -1);
+  ok(reloads.length >= 2, 'server state reloaded after conflict (got ' + reloads.length + ')');
+}
 
-  // code -> original only (no html)
+async function testExportMenuCapabilitiesDriven() {
+  // Export is a standard button that opens a project-standard modal. The format
+  // options come from GET /export/capabilities (server truth): markdown may
+  // advertise [original, html]; code may advertise [original] only; a
+  // capabilities failure degrades to [original] (no crash, no empty modal).
+  const win = freshEnv();
+  const a = art('a1', 'markdown', { mime: 'text/markdown' });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
+  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('# hi'));
+  route(/^\/chat\/artifacts\/a1\/export\/capabilities$/, () => jsonResp({ capabilities: ['original', 'html'] }));
+  route(/^\/chat\/artifacts\/a1\/export\?format=html/, () => textResp('<h1>hi</h1>', 'text/html'));
+  route(/^\/chat\/artifacts\/a1\/export\?format=original/, () => textResp('# hi', 'text/markdown'));
+  const mod = loadModule(win);
+  await mod.init();
+  await tick();
+  const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
+  for (const fn of (item._listeners['click'] || [])) fn({});
+  await tick();
+  await tick();
+  // export is a single standard button (no dropdown)
+  const expBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__export')[0];
+  ok(expBtn && expBtn.tag === 'button', 'export is a standard button');
+  // clicking it opens the export modal on document.body
+  for (const fn of (expBtn._listeners['click'] || [])) fn({});
+  const modal = win.document.getElementById('artifacts-export-modal');
+  ok(modal, 'export modal opens on click');
+  const radios = modal.querySelectorAll('input');
+  ok(radios.length === 2, 'markdown advertises 2 export formats in modal (got ' + radios.length + ')');
+  const fmts = radios.map((r) => r.dataset.format).sort();
+  ok(fmts[0] === 'html' && fmts[1] === 'original', 'export options are exactly the server capabilities (got ' + JSON.stringify(fmts) + ')');
+
+  // code -> server advertises [original] only -> modal has 1 option (NOT hardcoded html)
   const win2 = freshEnv();
   const a2 = art('a2', 'code', { mime: 'text/plain' });
   route(/^\/chat\/artifacts(\?|$)/, () => listResp([a2], null));
   route(/^\/chat\/artifacts\/a2$/, () => jsonResp(a2));
   route(/^\/chat\/artifacts\/a2\/content/, () => textResp('x=1'));
+  route(/^\/chat\/artifacts\/a2\/export\/capabilities$/, () => jsonResp({ capabilities: ['original'] }));
   const mod2 = loadModule(win2);
   await mod2.init();
   await tick();
   const item2 = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
   for (const fn of (item2._listeners['click'] || [])) fn({});
   await tick();
-  // single export button for code as well
-  const exportBtns2 = findByClass(byId['tab-artifacts'], 'artifacts-detail__export');
-  ok(exportBtns2.length === 1, 'export control present for code');
+  await tick();
+  const expBtn2 = findByClass(byId['tab-artifacts'], 'artifacts-detail__export')[0];
+  for (const fn of (expBtn2._listeners['click'] || [])) fn({});
+  const modal2 = win2.document.getElementById('artifacts-export-modal');
+  ok(modal2, 'export modal opens for code artifact');
+  const radios2 = modal2.querySelectorAll('input');
+  ok(radios2.length === 1 && radios2[0].dataset.format === 'original', 'code with [original] capability offers exactly original (got ' + JSON.stringify(radios2.map((r) => r.dataset.format)) + ')');
+
+  // capabilities fetch failure -> degrade to [original] (no crash, no empty modal)
+  const win3 = freshEnv();
+  const a3 = art('a3', 'text');
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a3], null));
+  route(/^\/chat\/artifacts\/a3$/, () => jsonResp(a3));
+  route(/^\/chat\/artifacts\/a3\/content/, () => textResp('hi'));
+  route(/^\/chat\/artifacts\/a3\/export\/capabilities$/, () => errResp('artifact_internal_error', 'boom', 500));
+  const mod3 = loadModule(win3);
+  await mod3.init();
+  await tick();
+  const item3 = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
+  for (const fn of (item3._listeners['click'] || [])) fn({});
+  await tick();
+  await tick();
+  const expBtn3 = findByClass(byId['tab-artifacts'], 'artifacts-detail__export')[0];
+  for (const fn of (expBtn3._listeners['click'] || [])) fn({});
+  const modal3 = win3.document.getElementById('artifacts-export-modal');
+  ok(modal3, 'export modal opens even when capabilities fail');
+  const radios3 = modal3.querySelectorAll('input');
+  ok(radios3.length === 1 && radios3[0].dataset.format === 'original', 'capabilities failure degrades to original-only (got ' + JSON.stringify(radios3.map((r) => r.dataset.format)) + ')');
 }
 
 async function testPublishShareUrlToggleRevoke() {
@@ -862,6 +959,83 @@ async function testBinaryPublishConfirmation() {
     ok(/PUBLIC|公开|扫描|秘密|secret/i.test(String(win.NAGENT.modal._lastMsg || '')),
       'binary publish confirmation mentions explicit-PUBLIC / no secret scan: ' + win.NAGENT.modal._lastMsg);
   }
+}
+
+async function testBinaryReplaceCarriesIfMatchCas() {
+  // T10: binary content replace carries the CAS token via If-Match header
+  // (multipart PATCH has no JSON body for expected_revision_id).
+  const win = freshEnv();
+  const a = art('a1', 'image', { mime: 'image/png', extra: { current_revision_id: 'r1' } });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  route(/^\/chat\/artifacts\/a1$/, (m, opts) => {
+    if ((opts.method || 'GET') === 'PATCH') {
+      return jsonResp(art('a1', 'image', { mime: 'image/png', extra: { current_revision_id: 'r2' } }));
+    }
+    return jsonResp(a);
+  });
+  route(/^\/chat\/artifacts\/a1\/content/, () => blobResp([1, 2, 3], 'image/png'));
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = { alert: () => Promise.resolve(), confirm: () => Promise.resolve(true) };
+  const mod = loadModule(win);
+  await mod.init();
+  await tick();
+  const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
+  for (const fn of (item._listeners['click'] || [])) fn({});
+  await tick();
+  // enter edit mode -> reveals binary editor (file input + 替换 button)
+  const editBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__edit');
+  if (editBtn[0]) { for (const fn of (editBtn[0]._listeners['click'] || [])) fn({}); }
+  const fileInput = findByClass(byId['tab-artifacts'], 'artifacts-detail__file')[0];
+  ok(fileInput, 'binary editor file input rendered in edit mode');
+  if (fileInput) { fileInput.files = [{ name: 'x.png' }]; }
+  const saveBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__save');
+  if (saveBtn[0]) { for (const fn of (saveBtn[0]._listeners['click'] || [])) fn({}); await tick(); }
+  await tick();
+  const patchCall = fetchLog.find((l) => l.method === 'PATCH' && l.url.indexOf('/chat/artifacts/a1') !== -1);
+  ok(patchCall, 'binary replace sent PATCH');
+  // If-Match header must carry the current revision id (CAS token)
+  const ifMatch = patchCall && patchCall.headers ? (patchCall.headers['If-Match'] || patchCall.headers['if-match']) : null;
+  ok(ifMatch === 'r1', 'binary replace PATCH carries If-Match=current_revision_id (got ' + ifMatch + ')');
+}
+
+async function testBinaryReplaceConflictKeepsCurrentNoAutoReplay() {
+  // T10: binary replace with stale If-Match -> artifact_revision_conflict (409).
+  // Keep current display, refresh server state, prompt user, NO auto-replay.
+  const win = freshEnv();
+  const a = art('a1', 'image', { mime: 'image/png', extra: { current_revision_id: 'r1' } });
+  let patchAttempts = 0;
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  route(/^\/chat\/artifacts\/a1$/, (m, opts) => {
+    if ((opts.method || 'GET') === 'PATCH') {
+      patchAttempts += 1;
+      return errResp('artifact_revision_conflict', 'CAS conflict', 409);
+    }
+    return jsonResp(a);
+  });
+  route(/^\/chat\/artifacts\/a1\/content/, () => blobResp([1, 2, 3], 'image/png'));
+  let alertMsg = null;
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = { alert: (m) => { alertMsg = String(m); return Promise.resolve(); }, confirm: () => Promise.resolve(true) };
+  const mod = loadModule(win);
+  await mod.init();
+  await tick();
+  const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
+  for (const fn of (item._listeners['click'] || [])) fn({});
+  await tick();
+  const editBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__edit');
+  if (editBtn[0]) { for (const fn of (editBtn[0]._listeners['click'] || [])) fn({}); }
+  const fileInput = findByClass(byId['tab-artifacts'], 'artifacts-detail__file')[0];
+  if (fileInput) { fileInput.files = [{ name: 'x.png' }]; }
+  const saveBtn = findByClass(byId['tab-artifacts'], 'artifacts-detail__save');
+  if (saveBtn[0]) { for (const fn of (saveBtn[0]._listeners['click'] || [])) fn({}); await tick(); }
+  await tick(); await tick();
+  ok(patchAttempts === 1, 'binary replace conflict: no auto-replay (single attempt, got ' + patchAttempts + ')');
+  ok(alertMsg && alertMsg.indexOf('版本已变化') !== -1, 'binary replace conflict prompts user (got ' + alertMsg + ')');
+  const reloads = fetchLog.filter((l) => l.method === 'GET' && l.url.indexOf('/chat/artifacts/a1') !== -1
+      && l.url.indexOf('/content') === -1 && l.url.indexOf('/export') === -1
+      && l.url.indexOf('/revisions') === -1 && l.url.indexOf('/capabilities') === -1
+      && l.url.indexOf('/publish') === -1);
+  ok(reloads.length >= 2, 'server state reloaded after binary replace conflict (got ' + reloads.length + ')');
 }
 
 function collectText(node) {
@@ -1009,6 +1183,125 @@ async function testRenderListItemXssSafety() {
 }
 
 // ---------------------------------------------------------------------------
+// T10: revision history panel + diff + rollback + publish_sync_state badge
+// ---------------------------------------------------------------------------
+function setupRevisionedArtifact(win, opts) {
+  opts = opts || {};
+  const detailExtra = Object.assign({
+    current_revision_id: opts.currentRevisionId || 'r2',
+    publish_sync_state: opts.syncState || 'current',
+  }, opts.detailExtra || {});
+  const a = art('a1', 'text', { extra: detailExtra });
+  route(/^\/chat\/artifacts(\?|$)/, () => listResp([a], null));
+  route(/^\/chat\/artifacts\/a1$/, () => jsonResp(a));
+  route(/^\/chat\/artifacts\/a1\/content/, () => textResp('hello'));
+  route(/^\/chat\/artifacts\/a1\/publish$/, () => jsonResp({ status: opts.publishStatus || 'unpublished' }));
+  route(/^\/chat\/artifacts\/a1\/export\/capabilities$/, () => jsonResp({ capabilities: opts.capabilities || ['original'] }));
+  route(/^\/chat\/artifacts\/a1\/revisions/, () => jsonResp({
+    items: opts.revisions || [
+      { id: 'r1', revision_number: 1, change_summary: '初版', created_at: '2026-01-01T00:00:00+00:00', is_current: false, is_published: true },
+      { id: 'r2', revision_number: 2, change_summary: '更新', created_at: '2026-01-02T00:00:00+00:00', is_current: true, is_published: false },
+    ],
+  }));
+}
+
+async function selectAndAwait(mod) {
+  await mod.init();
+  await tick();
+  const item = findByClass(byId['tab-artifacts'], 'artifacts-list__item')[0];
+  for (const fn of (item._listeners['click'] || [])) fn({});
+  await tick(); await tick(); await tick();
+}
+
+function detailGetCount() {
+  return fetchLog.filter((l) => l.url === '/chat/artifacts/a1' && l.method === 'GET').length;
+}
+
+async function testRevisionPanelRendersWithMarkers() {
+  const win = freshEnv();
+  setupRevisionedArtifact(win, { syncState: 'current', currentRevisionId: 'r2' });
+  const mod = loadModule(win);
+  await selectAndAwait(mod);
+  const panel = byId['artifacts-revisions-panel'];
+  ok(panel, 'revision panel container rendered');
+  const items = findByClass(panel, 'artifacts-revisions__item');
+  ok(items.length === 2, '2 revision rows rendered (got ' + items.length + ')');
+  ok(findByClass(panel, 'artifacts-revisions__item--current').length === 1, 'exactly one current revision marked');
+  ok(findByClass(panel, 'artifacts-revisions__badge--current').length === 1, 'one 当前 badge on current revision');
+  ok(findByClass(panel, 'artifacts-revisions__badge--published').length === 1, 'one 已发布 badge (r1 is the published revision)');
+  // Non-current r1 has compare + rollback actions; current r2 has neither.
+  ok(findByClass(panel, 'artifacts-revisions__diff').length === 1, 'one 对比当前 button (non-current only)');
+  ok(findByClass(panel, 'artifacts-revisions__rollback').length === 1, 'one 回滚 button (non-current only)');
+}
+
+async function testDiffRendersAsSafeTextContent() {
+  const win = freshEnv();
+  // Malicious diff text must be rendered as plain text, never parsed as HTML.
+  const maliciousDiff = '<script>alert(1)</script>\n-old\n+new';
+  setupRevisionedArtifact(win, { currentRevisionId: 'r2' });
+  route(/^\/chat\/artifacts\/a1\/diff$/, () => jsonResp({ diff_text: maliciousDiff, binary_changed: false, redacted: true }));
+  const mod = loadModule(win);
+  await selectAndAwait(mod);
+  const panel = byId['artifacts-revisions-panel'];
+  const diffBtn = findByClass(panel, 'artifacts-revisions__diff')[0];
+  ok(diffBtn, 'diff button present on non-current revision');
+  for (const fn of (diffBtn._listeners['click'] || [])) fn({});
+  await tick(); await tick();
+  const pre = findByClass(panel, 'artifacts-diff__pre')[0];
+  ok(pre, 'diff rendered in a <pre> element');
+  ok(pre._text === maliciousDiff, 'diff text rendered verbatim as textContent (no HTML parsing), got: ' + pre._text);
+  ok(findByTag(panel, 'script').length === 0, 'no script elements created from diff text');
+}
+
+async function testRollbackConflictKeepsCurrentNoAutoReplay() {
+  const win = freshEnv();
+  setupRevisionedArtifact(win, { currentRevisionId: 'r2' });
+  let rollbackCalls = 0;
+  route(/^\/chat\/artifacts\/a1\/rollback$/, () => { rollbackCalls++; return errResp('artifact_revision_conflict', 'stale', 409); });
+  let alertMsg = null;
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = { alert: (m) => { alertMsg = String(m); return Promise.resolve(); }, confirm: () => Promise.resolve(true) };
+  const mod = loadModule(win);
+  await selectAndAwait(mod);
+  const beforeDetail = detailGetCount();
+  const panel = byId['artifacts-revisions-panel'];
+  const rbBtn = findByClass(panel, 'artifacts-revisions__rollback')[0];
+  ok(rbBtn, 'rollback button present');
+  for (const fn of (rbBtn._listeners['click'] || [])) fn({});
+  await tick(); await tick(); await tick();
+  ok(rollbackCalls === 1, 'exactly one rollback POST on conflict -- NO auto-replay (got ' + rollbackCalls + ')');
+  ok(alertMsg && alertMsg.indexOf('版本已变化') !== -1, 'conflict alert prompts re-read (got ' + alertMsg + ')');
+  ok(detailGetCount() > beforeDetail, 'detail reloaded after conflict to reflect server current state');
+}
+
+async function testRollbackSuccessReloadsDetail() {
+  const win = freshEnv();
+  setupRevisionedArtifact(win, { currentRevisionId: 'r2' });
+  route(/^\/chat\/artifacts\/a1\/rollback$/, () => jsonResp({ artifact_id: 'a1', revision_id: 'r3', revision_number: 3, name: 'artifact-a1', kind: 'text', publish_sync_state: 'outdated' }));
+  win.NAGENT = win.NAGENT || {};
+  win.NAGENT.modal = { confirm: () => Promise.resolve(true) };
+  const mod = loadModule(win);
+  await selectAndAwait(mod);
+  const beforeDetail = detailGetCount();
+  const panel = byId['artifacts-revisions-panel'];
+  const rbBtn = findByClass(panel, 'artifacts-revisions__rollback')[0];
+  for (const fn of (rbBtn._listeners['click'] || [])) fn({});
+  await tick(); await tick(); await tick();
+  ok(detailGetCount() > beforeDetail, 'detail reloaded after successful rollback (got ' + beforeDetail + ' -> ' + detailGetCount() + ')');
+}
+
+async function testPublishSyncBadgeInMetadata() {
+  const win = freshEnv();
+  setupRevisionedArtifact(win, { syncState: 'outdated', currentRevisionId: 'r2' });
+  const mod = loadModule(win);
+  await selectAndAwait(mod);
+  const badges = findByClass(byId['tab-artifacts'], 'artifacts-detail__sync-badge');
+  ok(badges.length === 1, 'publish_sync_state badge rendered in metadata');
+  ok(badges[0]._text === '已过期', 'outdated -> 已过期 label (got ' + badges[0]._text + ')');
+  ok(badges[0].className.indexOf('artifacts-detail__sync-badge--outdated') !== -1, 'badge carries outdated state class');
+}
+
+// ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
 
@@ -1033,13 +1326,21 @@ const tests = [
   testPdfBlobFallback,
   testRevokeObjectURLOnDestroy,
   testTextSaveRefreshWithServerMetadata,
-  testExportButtonOriginalOnly,
+  testContentPatchConflictKeepsCurrentNoAutoReplay,
+  testExportMenuCapabilitiesDriven,
   testPublishShareUrlToggleRevoke,
   testBinaryPublishConfirmation,
+  testBinaryReplaceCarriesIfMatchCas,
+  testBinaryReplaceConflictKeepsCurrentNoAutoReplay,
   testRenderListItemExported,
   testRenderListItemCallbackContract,
   testRenderListItemDefaultBehavior,
   testRenderListItemXssSafety,
+  testRevisionPanelRendersWithMarkers,
+  testDiffRendersAsSafeTextContent,
+  testRollbackConflictKeepsCurrentNoAutoReplay,
+  testRollbackSuccessReloadsDetail,
+  testPublishSyncBadgeInMetadata,
 ];
 
 (async () => {

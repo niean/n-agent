@@ -40,6 +40,12 @@ class ToolDefinition:
     source_type: ToolSourceType = ToolSourceType.BUILTIN
     toolset: str = "builtin"
     managed: bool = False
+    # When True, the tool is exposed only in DEFAULT (realtime chat) and never
+    # in SAFE_ONLY (unattended/cron), even when explicitly listed in
+    # granted_tools. Used by session-bound conversational tools (e.g. the
+    # artifact_* tools) that must not run in unattended contexts to prevent
+    # recursion or bypassing approval (spec: SAFE_ONLY grant 不得放开).
+    realtime_only: bool = False
 
 
 @dataclass(frozen=True)

@@ -422,9 +422,18 @@ PYEOF
   assert_body_contains "original attachment content" "original content"
 
   # 5d. PATCH the artifact content (materializes to owned storage).
+  # Content PATCH requires a CAS token (expected_revision_id) matching the
+  # artifact's current_revision_id (see artifact revision CAS contract).
+  http GET "$BASE_URL/chat/artifacts/$UPDATE_ART_ID"
+  assert_status 200 "get artifact detail for revision id"
+  UPDATE_REV_ID=$(json_field '.current_revision_id')
+  if [ -z "$UPDATE_REV_ID" ] || [ "$UPDATE_REV_ID" = "null" ]; then
+    echo "FAIL: missing current_revision_id on artifact detail" >&2
+    exit 1
+  fi
   http PATCH "$BASE_URL/chat/artifacts/$UPDATE_ART_ID" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n '{content:"updated derived content"}')"
+    -d "$(jq -n --arg rid "$UPDATE_REV_ID" '{content:"updated derived content",expected_revision_id:$rid}')"
   assert_status 200 "patch artifact content"
 
   # 5e. Verify artifact content is updated.
@@ -499,16 +508,35 @@ PYEOF
   fi
   echo "[Artifact E2E] 7b. ok (reuse same publish_id)"
 
-  # 7c. Edit artifact content (new checksum) -> revokes the active publish
-  # (snapshot diverges from the artifact; public link 410s, state reverts to
-  # unpublished).
+  # 7c. Edit artifact content (new checksum) -> creates a new Revision.
+  # Per the revision contract, creating a new Revision does NOT revoke the
+  # active publish: the existing public snapshot keeps serving and
+  # publish_sync_state becomes "outdated". The old publish link stays 200
+  # until an explicit re-publish or revoke.
+  http GET "$BASE_URL/chat/artifacts/$PUB_ART_ID"
+  assert_status 200 "get published artifact detail for revision id"
+  PUB_REV_ID=$(json_field '.current_revision_id')
+  if [ -z "$PUB_REV_ID" ] || [ "$PUB_REV_ID" = "null" ]; then
+    echo "FAIL: missing current_revision_id on published artifact detail" >&2
+    exit 1
+  fi
   http PATCH "$BASE_URL/chat/artifacts/$PUB_ART_ID" \
     -H "Content-Type: application/json" \
-    -d "$(jq -n '{content:"## Updated publishable content"}')"
+    -d "$(jq -n --arg rid "$PUB_REV_ID" '{content:"## Updated publishable content",expected_revision_id:$rid}')"
   assert_status 200 "edit published artifact"
+  PUB_SYNC_STATE=$(json_field '.publish_sync_state')
+  if [ "$PUB_SYNC_STATE" != "outdated" ]; then
+    echo "FAIL: publish_sync_state should be outdated after edit, got $PUB_SYNC_STATE" >&2
+    exit 1
+  fi
+  # Old publish link still serves (edit did not revoke it).
+  http GET "$BASE_URL/p/$PUB_ID_1"
+  assert_status 200 "old publish still 200 after edit (outdated, not revoked)"
+  echo "[Artifact E2E] 7c. ok (edit -> outdated, old publish still serves)"
 
-  # 7d. Publish again -- fresh publish (edit revoked the old active, so there
-  # is nothing to replace) -> new publish_id.
+  # 7d. Publish again -- fresh publish (new checksum diverges from the old
+  # snapshot). Re-publishing atomically revokes the old active publish and
+  # registers a new one -> new publish_id.
   http POST "$BASE_URL/chat/artifacts/$PUB_ART_ID/publish"
   assert_status 200 "publish (after edit)"
   PUB_ID_3=$(json_field '.publish_id')
@@ -523,7 +551,7 @@ PYEOF
   fi
   echo "[Artifact E2E] 7d. ok (fresh publish new publish_id=$PUB_ID_3)"
 
-  # 7e. Old publish_id -> 410 (revoked by the content edit in 7c).
+  # 7e. Old publish_id -> 410 (revoked by the re-publish in 7d, not by the edit).
   http GET "$BASE_URL/p/$PUB_ID_1"
   assert_status 410 "old publish page is 410"
   http GET "$BASE_URL/p/$PUB_ID_1/content"
@@ -694,6 +722,133 @@ PYEOF
     exit 1
   fi
   echo "[Artifact E2E] 11f. ok ($ATT_ART_COUNT attachment artifacts auto-registered)"
+
+  # ---------------------------------------------------------------------------
+  # Section 12: Revision lifecycle (create -> update -> diff -> rollback)
+  #
+  # Drives the revision endpoints not covered by earlier sections
+  # (list_revisions / diff / rollback / revision content) and asserts
+  # revision_number continuity across the create -> update -> rollback chain.
+  # ---------------------------------------------------------------------------
+
+  echo "[Artifact E2E] Section 12: Revision lifecycle"
+
+  # 12a. Create a markdown artifact with three sections.
+  REV_CONTENT=$(printf '# Report\n\n## Section 1\nAlpha\n\n## Section 2\nBeta\n\n## Section 3\nGamma\n')
+  create_artifact_json "${RUN_TAG}-rev" "markdown" "$REV_CONTENT"
+  assert_status 201 "create revision-lifecycle artifact"
+  REV_ART_ID=$(json_field '.id'); track_artifact "$REV_ART_ID"
+  http GET "$BASE_URL/chat/artifacts/$REV_ART_ID"
+  assert_status 200 "get revision-lifecycle artifact detail"
+  R1_ID=$(json_field '.current_revision_id')
+  R1_NUM=$(json_field '.revision_number')
+  if [ "$R1_NUM" != "1" ]; then
+    echo "FAIL: initial revision_number should be 1, got $R1_NUM" >&2
+    exit 1
+  fi
+
+  # 12b. Update section 3 (CAS on r1) -> new revision, revision_number 2.
+  REV_CONTENT_2=$(printf '# Report\n\n## Section 1\nAlpha\n\n## Section 2\nBeta\n\n## Section 3\nGamma updated\n')
+  http PATCH "$BASE_URL/chat/artifacts/$REV_ART_ID" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg rid "$R1_ID" --arg c "$REV_CONTENT_2" '{content:$c,expected_revision_id:$rid}')"
+  assert_status 200 "update content (revision 2)"
+  R2_ID=$(json_field '.revision_id')
+  R2_NUM=$(json_field '.revision_number')
+  if [ -z "$R2_ID" ] || [ "$R2_ID" = "$R1_ID" ]; then
+    echo "FAIL: update should create a new revision_id" >&2
+    exit 1
+  fi
+  if [ "$R2_NUM" != "2" ]; then
+    echo "FAIL: revision_number should be 2, got $R2_NUM" >&2
+    exit 1
+  fi
+
+  # 12c. List revisions -> two entries; r2 is_current.
+  http GET "$BASE_URL/chat/artifacts/$REV_ART_ID/revisions?limit=50"
+  assert_status 200 "list revisions"
+  REV_COUNT=$(json_field '.count')
+  if [ "$REV_COUNT" != "2" ]; then
+    echo "FAIL: expected 2 revisions, got $REV_COUNT" >&2
+    exit 1
+  fi
+  CUR_IN_LIST=$(echo "$HTTP_BODY" | jq -r '.items[] | select(.is_current==true) | .id')
+  if [ "$CUR_IN_LIST" != "$R2_ID" ]; then
+    echo "FAIL: is_current should mark r2 ($R2_ID), got $CUR_IN_LIST" >&2
+    exit 1
+  fi
+
+  # 12d. Diff r1 -> r2 surfaces the section 3 change.
+  http POST "$BASE_URL/chat/artifacts/$REV_ART_ID/diff" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg f "$R1_ID" --arg t "$R2_ID" '{from_revision_id:$f,to_revision_id:$t,context_lines:2}')"
+  assert_status 200 "diff r1->r2"
+  assert_body_contains "Gamma updated" "diff shows updated section 3"
+
+  # 12e. Rollback to r1 (CAS on current=r2) -> new revision r3 with r1's content.
+  http POST "$BASE_URL/chat/artifacts/$REV_ART_ID/rollback" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg target "$R1_ID" --arg rid "$R2_ID" '{target_revision_id:$target,expected_revision_id:$rid,change_summary:"rollback to r1"}')"
+  assert_status 200 "rollback to r1"
+  R3_ID=$(json_field '.revision_id')
+  R3_NUM=$(json_field '.revision_number')
+  if [ "$R3_NUM" != "3" ]; then
+    echo "FAIL: revision_number should be 3 after rollback, got $R3_NUM" >&2
+    exit 1
+  fi
+  if [ "$R3_ID" = "$R1_ID" ] || [ "$R3_ID" = "$R2_ID" ]; then
+    echo "FAIL: rollback should create a new revision_id" >&2
+    exit 1
+  fi
+
+  # 12f. Content after rollback equals r1's original (update reverted).
+  http GET "$BASE_URL/chat/artifacts/$REV_ART_ID/content"
+  assert_status 200 "get content after rollback"
+  assert_body_contains "Alpha" "rollback content has unchanged section 1"
+  assert_body_not_contains "Gamma updated" "rollback reverted the update"
+
+  # 12g. Revision content endpoint serves r2 (the updated text) even though
+  # current is now r3 -- historical revisions remain readable.
+  http GET "$BASE_URL/chat/artifacts/$REV_ART_ID/revisions/$R2_ID/content"
+  assert_status 200 "get historical revision r2 content"
+  assert_body_contains "Gamma updated" "historical r2 content preserved"
+
+  # 12h. Revision history now has 3 entries.
+  http GET "$BASE_URL/chat/artifacts/$REV_ART_ID/revisions?limit=50"
+  assert_status 200 "list revisions after rollback"
+  REV_COUNT_3=$(json_field '.count')
+  if [ "$REV_COUNT_3" != "3" ]; then
+    echo "FAIL: expected 3 revisions after rollback, got $REV_COUNT_3" >&2
+    exit 1
+  fi
+  echo "[Artifact E2E] 12. ok (create->update->diff->rollback, revision_number 1->2->3)"
+
+  # ---------------------------------------------------------------------------
+  # Section 13: CAS conflict -> stable 409, no silent overwrite (no auto-replay)
+  # ---------------------------------------------------------------------------
+
+  echo "[Artifact E2E] Section 13: CAS conflict no-auto-replay"
+
+  # 13a. Content PATCH with a stale expected_revision_id (r1, but current is
+  # r3) -> 409 artifact_revision_conflict.
+  http PATCH "$BASE_URL/chat/artifacts/$REV_ART_ID" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg rid "$R1_ID" --arg c "stale overwrite attempt" '{content:$c,expected_revision_id:$rid}')"
+  assert_status 409 "stale content PATCH rejected"
+  assert_body_contains "artifact_revision_conflict" "stale PATCH conflict code"
+
+  # 13b. Content was NOT silently overwritten on the conflict.
+  http GET "$BASE_URL/chat/artifacts/$REV_ART_ID/content"
+  assert_status 200 "content unchanged after stale PATCH"
+  assert_body_not_contains "stale overwrite attempt" "no silent overwrite on conflict"
+
+  # 13c. Rollback with a stale expected_revision_id (r1, current is r3) -> 409.
+  http POST "$BASE_URL/chat/artifacts/$REV_ART_ID/rollback" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg target "$R1_ID" --arg rid "$R1_ID" '{target_revision_id:$target,expected_revision_id:$rid,change_summary:"stale rollback"}')"
+  assert_status 409 "stale rollback rejected"
+  assert_body_contains "artifact_revision_conflict" "stale rollback conflict code"
+  echo "[Artifact E2E] 13. ok (CAS conflict -> 409, no silent overwrite)"
 
   echo "[Artifact E2E] PASS"
 )

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）、发布状态生命周期（内容编辑撤销 active publish 保留行+内容公链 410、metadata-only 不撤销、delete purge 发布记录+快照文件公链 404；头部状态栏+按钮切换）等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）、发布状态生命周期（新 Revision 不撤销 active publish->publish_sync_state=outdated 旧公链仍 200、重新发布才撤销旧 active+登记新 publish、metadata-only 不撤销、delete purge 发布记录+快照文件公链 404；头部状态栏+按钮切换）、Revision 版本与 CAS（expected_revision_id/If-Match 内容更新令牌、冲突 409 不静默覆写、rollback 生成新版本、diff 文本/二进制/混合）、Office 导出（DOCX/PPTX/XLSX 格式库仅 Infrastructure exporters.py、Domain exporter 端口）、Agent-native 工具与 artifact_guidance 装配、ui.artifact 卡片写工具成功持久化等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -1090,8 +1090,10 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
    - register_from_task_artifact 双内容路径：`storage_ref` 为 `workspace:` ref 时走 content_store.read 存 `content_ref`（二进制/大文件）；否则走 inline 路径（仅 text kind），用 `TaskArtifact.content`（优先）或 `summary`（回落）创建 `inline_content` 制品，服务端从 `inline_text.encode("utf-8")` 重算 size/checksum（不信客户端值），校验 `artifact_inline_max_bytes`（默认 256KB）超限跳过。worker 仅有 execute_code 沙箱工具、无 workspace 写工具，故 task_complete schema 的 `content` 字段是 text 产出物的主路径（`storage_ref` 仅用于 worker 无法直写的二进制/大文件）。binary kind（OTHER/IMAGE/PDF 等）无 inline 路径，必须提供 `workspace:` ref 否则跳过。
    - Layer-2 oversize-summary fallback（TaskRunService._finish）：任务完成时若无制品注册（`registered` 为空）且 `summary` 超过 `_TASK_SUMMARY_CHAT_MAX_BYTES`（65536，对齐 session_service 的 chat 消息截断阈值 `_TASK_MESSAGE_MAX_BYTES`）且 target_status=SUCCEEDED，自动将完整 summary 转为 inline markdown 制品（name 取 `task.title[:60]+".md"`，ordinal=-1，content=summary），保证"无法以 Chat 消息完整呈现的产出必须以标准制品呈现"（Chat 截断后剩余内容不丢失）。best-effort：回调返回 None 或异常仅 warning（exc_type，不记内容/路径），不影响 Task finish；非 SUCCEEDED 终态（FAILED/EXPIRED 等）不触发。该 fallback 与 worker 显式提交 artifacts（Layer-1）形成双重保证：Layer-1 保证 worker 显式提交的 content 不丢失，Layer-2 兜底未提交制品但 summary 超限的情况。
 
-2. publish 快照存储与生命周期（PublishedArtifact nullable FK ON DELETE SET NULL + edit 撤销 / delete purge）：
-   - PublishedArtifact.artifact_id 是 nullable FK，ON DELETE SET NULL（schema 兜底：若 publish 行在源 metadata 删除时仍存活，artifact_id 置 NULL）。delete_artifact 删源 metadata 前先 purge 全部 publish 记录+快照文件（`list_published` 收集 + `delete_published_by_artifact` 删行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 目录，公链 404），故 FK 通常不触发（行已先删）。edit 内容变更走 revoke（active->revoked，保留行+内容，公链 410）。
+2. publish 快照存储与生命周期（PublishedArtifact nullable FK ON DELETE SET NULL + 新 Revision 不撤销 / 重新发布撤销旧 active / delete purge）：
+   - PublishedArtifact.artifact_id 是 nullable FK，ON DELETE SET NULL（schema 兜底：若 publish 行在源 metadata 删除时仍存活，artifact_id 置 NULL）。delete_artifact 删源 metadata 前先 purge 全部 publish 记录+快照文件（`list_published` 收集 + `delete_published_by_artifact` 删行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 目录，公链 404），故 FK 通常不触发（行已先删）。
+   - 新 Revision 不撤销 active publish（spec 核心契约）：内容 PATCH 走 `update_revision` 产生新 Revision，既有 active publish 的 published_revision_id 仍指向旧 Revision、公开快照 bytes/checksum 不变、公开链接仍 200；Artifact 派生 `publish_sync_state`：unpublished（无 active publish）/current（active publish 的 published_revision_id == 当前 Revision）/outdated（active publish 指向旧 Revision）。outdated 时工作台与 Chat 卡片显示"有未发布更改"。Artifact.status 仍为 published（outdated 仍是 published，差异只经 publish_sync_state 表达）。
+   - 重新发布（publish_revision）才原子切换：新公开内容写入独立 publish_id 暂存快照 -> 单 `BEGIN IMMEDIATE` 事务内重验 Artifact/current Revision CAS + 撤销旧 active publish + 登记新 active -> DB 失败删暂存快照且旧 active 继续有效。同 checksum 早期 reuse（不新建快照）。显式撤回（revoke_published）active->revoked 保留行+内容、公链 410。
    - 快照字段（snapshot_name/kind/mime/content_ref/inline_content/size/checksum）在发布时固化，不可变；仅 status 与 revoked_at 可变。
    - 内容快照写入 `{artifacts_root}/published/{publish_id}/`，独立于源 Artifact 的 `{artifacts_root}/items/{artifact_id}/` 目录。
    - 部分唯一索引 `WHERE status='active' AND artifact_id IS NOT NULL` 保证每 artifact 至多一个 active 发布；replacement publish 在单事务内 revoke old + insert new。
@@ -1147,13 +1149,13 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
    - 预览 dispatch（artifacts.js renderPreview 按 kind）：markdown/document->sandbox="" iframe（srcdoc 取 /export?format=html 服务端 safe HTML）、html->sandbox="" iframe srcdoc、code/text->`<pre>`、json->`__json` div>pre、csv->table、image->img、pdf->无 sandbox iframe（blob src）+下载链接。binary 类（image/pdf）经 parseContent `URL.createObjectURL(blob)` 生成 blob URL。
    - 编辑态填满（同一面板不同视图，预览修 max-height 后需补的点）：编辑视图 `.artifacts-detail__editor`（flex 列容器）和 `.artifacts-detail__textarea` 缺 `flex:1`，editor 仅随内容高度（code 315px/pdf 151px）、textarea 卡在 `min-height:240px`，编辑框+保存按钮不达面板底部（gap 398/562px）。修法：editor `flex:1; min-height:0`（与 `.artifacts-detail__preview` 同款填满 panel-body 剩余空间）、textarea `flex:1`（在 editor 内填满、底部留保存按钮）。二进制类编辑器无 textarea（note+file input+actions），editor `flex:1` 填满容器但内容在顶部（无可见背景，视觉为 no-op，紧凑 UX 优于把按钮推到底部留大空白）。排查时同样须实测 getComputedStyle(editor).flex 与 getBoundingClientRect 高度，禁止仅推理。
    - 导出/下载文件名（artifacts.js doExport/renderPdf）：下载经 `URL.createObjectURL(blob)` 生成 blob URL + `<a download>` 触发，blob URL 下载绕过服务端 Content-Disposition（后端 `export()` 已返回 `art.name` 作 filename、`build_content_disposition` 已正确，但前端 blob 下载不读该 header），故前端必须自行设 `a.download` 为制品名。`exportFilename(name, format)`：original -> name 原样（制品名已含扩展名如 `report.md`/`script.py`）；html -> 去 原 扩展名加 `.html`（匹配实际 text/html 内容）。PDF 下载（renderPdf）同款用 `detail.name`。禁止硬编码 `'export'`。
-   - 发布状态生命周期与 UI（artifacts.js refreshPublishState + service update_artifact）：发布状态展示在头部 metadata 行（`大小: ... · 更新: ...；已发布: 链接`，链接为 share_url），头部发布按钮按 active 状态切换 `发布`/`撤回`（handler 在 click 时分支，无需换 listener）；`refreshPublishState()` 做定向更新（仅改按钮文本 + metadata 内 `.artifacts-detail__publish-status` span），不重渲预览，故 publish 状态异步到达时不会重载 iframe/重置滚动。内容编辑（inline_content/file_data）撤销 active publish：`update_artifact` 内容变更成功后 `get_active_publish` 非 None 则 `revoke_published`（快照与制品内容分叉，公链 410、状态回未发布，用户需重新发布新内容）；metadata-only 编辑不撤销（快照内容未变，发布仍有效）。delete purge 全部 publish 记录+快照文件（`delete_artifact` 删源 metadata 前先 `list_published` 收集 + `delete_published_by_artifact` 删全部 publish 行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 目录，公链 404）--edit 撤销（保留行+内容、公链 410）与 delete purge（删行+文件、公链 404）是两条不同语义：edit 保留审计历史（制品仍在、内容分叉），delete 彻底清理（制品已删、无需保留）。前端 saveText/二进制替换 后置 `state.publish=null` + `loadPublishStatus` 重载确认。
+   - 发布状态生命周期与 UI（artifacts.js refreshPublishState + service update_artifact）：发布状态展示在头部 metadata 行（`大小: ... · 更新: ...；已发布: 链接`，链接为 share_url），头部发布按钮按 active 状态切换 `发布`/`撤回`（handler 在 click 时分支，无需换 listener）；`refreshPublishState()` 做定向更新（仅改按钮文本 + metadata 内 `.artifacts-detail__publish-status` span），不重渲预览，故 publish 状态异步到达时不会重载 iframe/重置滚动。内容编辑（content PATCH -> update_revision）不撤销 active publish：新 Revision 创建后 active publish 仍指向旧 Revision、公链仍 200、publish_sync_state 变 outdated（头部显示"有未发布更改"），用户重新发布才原子切换到新 Revision；metadata-only update_artifact 也不撤销（快照内容未变）。delete purge 全部 publish 记录+快照文件（`delete_artifact` 删源 metadata 前先 `list_published` 收集 + `delete_published_by_artifact` 删全部 publish 行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 目录，公链 404）--显式撤回 revoke（保留行+内容、公链 410）与 delete purge（删行+文件、公链 404）是两条不同语义：revoke 保留审计历史（制品仍在），delete 彻底清理（制品已删、无需保留）。前端 saveText/二进制替换 后置 `state.publish=null` + `loadPublishStatus` 重载确认。
 
 陷阱：
 - write-through 回调失败时回滚主流程会让附件上传因 Artifact 子系统故障而失败，违背 best-effort 旁路语义；正确做法是 catch + warning + 主流程继续。
 - publish 时只检查 ArtifactPolicy 而不调 InformationFlowService.release(PUBLIC_ARTIFACT) 会让 SECRET/SENSITIVE 文本内容以 raw 形式发布到公开链接，绕过信息流封口。
 - 公开路由读源 Artifact（而非 PublishedArtifact 快照）会让公链内容依赖源制品 registry 与当前内容；必须只读不可变快照（snapshot 字段发布时固化），与源 registry 解耦。源删除已 purge publish 行（公链 404）/编辑已撤销（公链 410），路由按 publish 行 status/存在性返回即可，无须读源。
-- 内容编辑不撤销 active publish 会让公链展示旧快照内容而 publish 状态仍为 active（制品内容已与新快照分叉，用户误以为公链是新内容）；`update_artifact` 内容变更（inline_content/file_data）成功后必须 `get_active_publish` 非 None 则 `revoke_published`（公链 410、状态回未发布）。metadata-only 编辑不撤销（快照内容未变，发布仍有效）。delete purge：`delete_artifact` 删源 metadata 前必须 `list_published` + `delete_published_by_artifact` 删全部 publish 行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 快照目录（公链 404），否则源删除后 active publish 仍 200 暴露已删制品内容、且留 orphan 行（artifact_id 被 FK ON DELETE SET NULL 置 NULL）+ orphan 快照文件。edit 撤销（保留行+内容、公链 410）/delete purge（删行+文件、公链 404）--两条语义不同，不可混：delete 须在 metadata 删除前 purge（否则 artifact_id 被 FK SET NULL 后无法按 artifact_id 定位 publish 行）。前端 saveText/二进制替换后须 `state.publish=null`+`loadPublishStatus` 重载，否则头部按钮/状态停留旧 active。
+- 内容编辑撤销 active publish 是旧 update_artifact 语义，已废弃：本期起内容 PATCH 走 `update_revision` 产生新 Revision，不撤销 active publish（publish_sync_state=outdated、旧公链仍 200），用户重新发布才切换。若误把内容更新路由回会撤销 publish 的旧 update_artifact 路径，会让用户每次编辑草稿都令既有公开链接立即失效（410），违背"编辑草稿不影响已发布版本"的 Revision 契约；内容更新必须走 update_revision，仅显式重新发布/撤回才动 publish 状态。delete purge：`delete_artifact` 删源 metadata 前必须 `list_published` + `delete_published_by_artifact` 删全部 publish 行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 快照目录（公链 404），否则源删除后 active publish 仍 200 暴露已删制品内容、且留 orphan 行（artifact_id 被 FK ON DELETE SET NULL 置 NULL）+ orphan 快照文件。显式撤回 revoke（保留行+内容、公链 410）/delete purge（删行+文件、公链 404）--两条语义不同，不可混：delete 须在 metadata 删除前 purge（否则 artifact_id 被 FK SET NULL 后无法按 artifact_id 定位 publish 行）。前端 saveText/二进制替换后须 `state.publish=null`+`loadPublishStatus` 重载，否则头部按钮/状态停留旧 active。
 - delete_owned 接受 attachment/workspace ref 会意外删除 Task 子系统管理的源文件（附件/工作区产出），破坏 Task 数据完整性。
 - backfill gated on table-empty 会让运行期新增附件在重启前无法补建为 Artifact；必须每次启动都扫。
 - published_base_url 由路由从 Host header 构造会让攻击者通过伪造 Host 注入恶意 share_url；必须由 service 用配置值计算。
@@ -1202,3 +1204,48 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
 - 对话页 renderArtifactPanel 传 onClick 时若让工作台 state.selectedId 决定 active class，会因工作台残留选中态给对话页列表项错误高亮；active class 必须仅在缺省 onClick（工作台）路径添加。
 - chat.js 早于 artifacts.js 加载（HTML 脚本顺序），不得在 chat.js 文件求值阶段读 NAGENT.artifacts，只在 init/渲染调用时动态读取。
 - 工作台 selectArtifact 与对话页 navigatePath 点击行为不同：renderListItem 缺省 onClick 走工作台 pushState+详情加载，对话页注入 onClick 走 Dashboard 导航跳 /artifacts/{id}；不能让对话页继承工作台 selectArtifact。
+
+## 模式二十四：Artifact Revision 版本与 CAS、Office 导出、Agent-native 工具
+
+本期把 Artifact 从被动 Task 结果登记对象升级为 Agent 原生可操作对象：引入不可变 ArtifactRevision 版本链、内容更新 CAS、diff/rollback、Office 导出（DOCX/PPTX/XLSX）和普通 Chat 暴露的 artifact_* 写工具。核心约束围绕版本不可变、CAS 不静默覆写、publish 与 Revision 解耦、格式库隔离、可信溯源和写工具卡片持久化七个方面。
+
+规则：
+
+1. ArtifactRevision 不可变版本链（`app/domain/artifact.py`）：
+   - Artifact 增加 `current_revision_id`（指向当前 Revision），ArtifactRevision 保存不可变内容快照（inline_content 或 content_ref XOR、checksum/size/mime/kind、revision_number、parent_revision_id、rollback_from_revision_id、change_summary、created_by/at）。内容更新不得覆盖历史 Revision，只追加新 Revision 并移动 current 指针。
+   - Registry 在单 `BEGIN IMMEDIATE` 事务内创建 Revision + 更新 current_revision_id（CAS re-verify expected_revision_id），并发同 expected 只有一个成功、另一返回 artifact_revision_conflict/409，无孤儿 item 文件。元数据并发更新不回退 current 指针。
+   - 迁移幂等：无 Revision 的既有 Artifact 在首次写（update/rollback/publish）返回 artifact_migration_incomplete/503（legacy 只读仍可用）；backfill 迁移以实读 bytes 重算 checksum，重复启动不新增 Revision 或 item 文件。
+
+2. 内容更新 CAS（expected_revision_id / If-Match，`artifact_routes._patch_from_json`/`_patch_from_multipart`）：
+   - 内容 PATCH 必须携带 CAS 令牌：JSON body `expected_revision_id` 或 `If-Match` header（quoted strong ETag），恰好一个。两者皆空 -> 409 artifact_revision_conflict；两者分歧 -> 422 artifact_revision_invalid。multipart 内容替换仅用 If-Match。metadata-only PATCH 不带令牌（不触内容 CAS、不撤销 publish）。
+   - service `update_revision(expected_revision_id=...)`：expected != current -> ArtifactRevisionConflictError/409，不静默覆写旧基线。内容 CAS 先于 metadata 写入（CAS 失败 metadata 不动，无半提交）。返回新 revision_id、revision_number、diff_summary、content_unchanged、publish_sync_state。
+   - 前端 artifacts.js saveText/二进制替换从详情 `current_revision_id` 取令牌随请求提交；409 冲突提示"版本已变化，请刷新后重试"并重载详情，不自动重放（避免基于过期基线覆写）。
+
+3. publish 与 Revision 解耦（publish_sync_state，见模式二十二规则 2 升级）：
+   - 新 Revision 不撤销 active publish（outdated），重新发布才原子切换。`publish_revision` 必须显式 revision_id + expected_current_revision_id（均须等于事务内当前 Revision），发布历史 Revision 返回冲突。published_artifacts 增加 `published_revision_id`（nullable，旧数据 null 按 outdated 处理）。
+
+4. diff / rollback（`artifact_service.diff_revisions`/`rollback`）：
+   - diff：文本 Revision 输出 unified diff（头与 context_lines 确定），二进制对只返回 checksum/mime/size 变化摘要，文本与二进制混合返回 422，超限返回 artifact_diff_too_large/413（不返回半截 diff）。POST `/chat/artifacts/{id}/diff` body {from_revision_id, to_revision_id, context_lines}。
+   - rollback：以操作前 current 为 parent、以目标为 rollback_from 创建新当前 Revision（编号连续、完整历史可查、共享内容不被提前删除、可再次回滚）。POST `/chat/artifacts/{id}/rollback` body {target_revision_id, expected_revision_id, change_summary}，CAS 同内容更新。
+
+5. Office 导出与格式库隔离（`app/domain/artifact_exporter.py` 端口 + `app/infrastructure/artifact/exporters.py` OfficeArtifactExporter 实现）：
+   - DOCX/PPTX/XLSX 导出：python-docx/python-pptx/openpyxl 仅在 Infrastructure exporters.py 导入（Domain/Application/Tools 不得导入，由 `tests/architecture/test_artifact_layer_boundaries.py` 守护）。导出文件签名与结构可被对应解析库重新打开；标题/段落/表格/多语言保持；恶意 HTML、前导空白/BOM 公式注入、外部 URL、畸形/空/嵌套 JSON、非矩形 CSV、输入与输出超限被阻断；失败无部分文件，v1 图片不嵌入。
+   - capabilities：逐个调用返回格式均成功，未返回格式返回 artifact_export_unsupported；历史 revision_id 的 capabilities 与 export 使用同一版本。响应文件名扩展、MIME、nosniff、Content-Disposition 一致且不含本机元数据（Content-Disposition 复用 `app/interfaces/http/_content_disposition.py::build_content_disposition`）。
+   - ArtifactExporterConfig/OfficeArtifactExporter 在 main.py artifacts_enabled 分支装配，注入 ArtifactService.exporter；尺寸阈值（artifact_read_max_bytes/artifact_diff_max_bytes/artifact_diff_max_lines/artifact_diff_max_output_chars/artifact_export_max_bytes）由 Settings 暴露（artifact_ 前缀，gt=0 校验）。
+
+6. Agent-native 写工具与可信溯源（`app/application/artifact_tools.py` 定义 + `app/infrastructure/tools/artifact_management.py` ArtifactToolExecutor 实现）：
+   - 普通 Chat 暴露 8 个 artifact_* 工具：create/list/read/update/list_revisions/diff/rollback/publish。风险等级：create/update/rollback=CONFIRM、publish=DANGEROUS、list/read/list_revisions/diff=SAFE。
+   - 可信溯源：session_id/run_id/actor_id 仅取自 ToolExecutionContext（ctx.session_id/ctx.trusted_metadata），工具参数不接受也不覆盖。artifact_list 按 ctx.session_id 过滤（source_session_id 隔离）；SAFE 读工具校验 source_session_id == ctx.session_id（manual/legacy source_session_id=None 仍可见），跨 Artifact revision_id 返回 artifact_revision_not_found 且不泄露归属。workspace ref 穿越/符号链接拒绝；source_type=AGENT 工具对 unattended 即使误配 grant 仍隐藏。
+   - 与 TaskService 解耦：artifact 工具不依赖 TaskService 装配（TaskService 禁用时 create/read/update/diff/rollback 仍可用）。CompositeToolExecutor 持有 routes dict 活引用（不拷贝），构造后注册 artifact 工具仍生效。
+
+7. ui.artifact 卡片持久化（`agent_graph.execute_tools` + `runtime_memory_service.append_system_named_message`）：
+   - 写工具（artifact_create/update/rollback/publish）成功后，Chat 编排层持久化一条 `ui.artifact` 系统消息（role=system、name=ui.artifact），metadata 统一 {artifact_id, revision_id, name, kind, revision_number, publish_sync_state}。失败、审批拒绝、只读工具不写卡片。best-effort：append 失败不影响工具结果。
+   - artifact_guidance（`prompt_builder.ARTIFACT_GUIDANCE`）在 artifacts_enabled 时经 main.py -> AgentGraphRunner(artifact_guidance=) -> ContextService -> build_system_prompt(artifact_guidance=) 线程注入 system prompt（与 browser_guidance 同款），引导 LLM 优先用 Artifact 工具产出/修改/比较/恢复/发布、artifact_list 选候选（不猜测最近）、artifact_read 处理脱敏。
+
+陷阱：
+- 内容更新不带 CAS 令牌会静默覆写：必须 expected_revision_id/If-Match 恰一，冲突 409 不重放。
+- 把内容更新路由回会撤销 publish 的旧 update_artifact 路径会令编辑草稿即失效公开链接；内容更新必须走 update_revision（不撤销、outdated），仅重新发布/撤回动 publish。
+- Domain/Application/Tools 导入 docx/pptx/openpyxl 会破坏 DDD 分层与格式库隔离；格式库仅 Infrastructure exporters.py。
+- artifact_* 工具从参数读 session_id/run_id/actor_id 会允许伪造溯源；必须只取 ctx。
+- 写工具失败/审批拒绝/只读工具也写 ui.artifact 卡片会误导用户；仅写工具成功写卡片。
+- LLM 驱动的写工具 E2E 经 `/v1/chat/completions` 不可行：该路由不注入 approval_decider，CONFIRM/DANGEROUS 写工具直接被拒（agent_graph._request_tool_approval decider 为空即 approval_required）；写工具链路改由确定性 HTTP E2E（artifacts.sh，含 CAS/Revision/publish 语义）+ 工具层单测（test_artifact_tool_executor.py 会话隔离/溯源）+ agent_graph 单测（ui.artifact 卡片）覆盖。

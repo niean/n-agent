@@ -328,3 +328,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：前端渲染/CSS bug 必须用浏览器 `getComputedStyle`/`getBoundingClientRect` 实测计算值再下根因结论，禁止仅推理 flex/盒模型链就修复并回填知识--CSS 特异性与全局元素规则（`pre {}`、`a {}`、`img {}`）会经继承作用于特定 class（当 class 未显式覆盖该属性时），这种"隐性上限"无法靠读 class 规则发现，只能靠 computed style 暴露。项目有浏览器容器（n-agent-browser，playwright + /usr/bin/chromium，可 `docker exec` 跑脚本访问 http://n-agent:8201），渲染 bug 一律走实测。回填知识前必须实测验证修复生效，避免把错误根因写进 knowledge 误导后续。相关：模式二十二规则 9 preview pre max-height 覆盖。
 
 来源：fix 260809 制品预览 py/json 高度不达标、PDF 无法预览（第一次修复错误，用户复测指出未修复）
+
+### P033: LLM 驱动的写工具 E2E 经 /v1/chat/completions 不可行（无 approval_decider，CONFIRM/DANGEROUS 被拒），写工具链路改确定性 HTTP E2E + 工具层单测
+
+现象：计划要求写"五条普通 Chat 自然语言链路 E2E"驱动 artifact_create/update/rollback/publish，经 `/v1/chat/completions` 发自然语言让 LLM 调写工具。实际 LLM 调用写工具后被拒，制品未创建，链路无法成立。
+
+根因：`/v1/chat/completions`（openai_compatible.py）调 `chat_service.complete` 时不注入 `approval_decider`（仅 Dashboard 对话路由经 `dashboard_tool_approval_bridge.create_decider` 注入阻塞式 decider）。agent_graph `_request_tool_approval` 在 decider 为 None 时直接返回 `approval_required`（permission_denied），不阻塞等待--CONFIRM（artifact_create/update/rollback）与 DANGEROUS（artifact_publish）写工具一律被拒。要经 Dashboard 阻塞式审批异步握手（发 NL -> 工具 pending -> POST 审批 -> 继续）才能跑通，但该握手对 E2E 过于脆弱且项目无既有模式。
+
+教训：写工具（CONFIRM/DANGEROUS）的端到端验收不要经 `/v1/chat/completions` 的 LLM 链路（无 decider 必被拒）；改由确定性 HTTP E2E（artifacts.sh 直击 /chat/artifacts* API，含 CAS/Revision/publish 语义）覆盖端点契约 + 工具层单测（test_artifact_tool_executor.py 会话隔离/溯源不可伪造）+ agent_graph 单测（ui.artifact 卡片持久化）覆盖工具层专属行为。LLM 工具选择/guidance 装配由单测（test_main_artifact_wiring/test_prompt_builder）守护。涉及审批门控的写工具 E2E 须先确认调用路由是否注入 approval_decider。
+
+来源：迭代 260809 artifact revision/export，T12 S2 偏离原"自然语言 LLM 链路"改确定性 HTTP 链路

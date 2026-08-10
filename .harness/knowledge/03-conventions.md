@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose 和文件管理规则 -->
+<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose、文件管理规则和 Dashboard 前端（modal/alert/按钮/菜单/时间渲染） -->
 # 约定与约束（实现细节）
 
 本文件是项目实现规范约定的权威来源，`.harness/PROJECT.md` "项目规范"各节为摘要引用，以本文件为准。
@@ -139,6 +139,7 @@ Docker Compose 项目隔离使用：
 - Dashboard 的提示、错误反馈统一调用共享 `NAGENT.modal.alert(message, options)`，禁止使用浏览器原生 `alert`、`window.alert` 或 `globalThis.alert`；共享实现仅位于 `app/interfaces/http/static/management-ui.js`。
 - 需要用户确认的操作统一调用 `NAGENT.modal.confirm(message, options)`，以保持与 Dashboard 其它弹窗一致的样式和交互。
 - Dashboard 操作按钮复用共享 `.btn` / `.btn--primary` / `.btn--danger` 外观；若按钮不在 `13px` 面板标题内，必须显式设为 `var(--font-size-md)`，与任务看板“新增”按钮保持相同文字尺寸，避免依赖正文继承导致视觉偏大。
+- 操作入口（按钮/菜单）规范：除左侧导航、顶部导航外，禁止使用 pop 二级菜单（`<details>`/`<summary>` 下拉、hover/click popover、右键菜单等悬浮二级面板）承载操作。操作入口统一用共享 `.btn` 标准按钮直接触发；需要用户确认额外信息（如格式、参数）时，用项目标准 Modal（`modal-backdrop`/`modal-dialog`/`providers-form`，见 `app/interfaces/http/static/management-ui.js` `buildModalFrame`）承载。除非用户明确要求使用二级菜单，否则一律不引入。反例：制品导出曾用 `<details>` 下拉列出格式，已改为标准按钮 + 导出确认 Modal（`app/interfaces/http/static/artifacts.js` `openExportModal`）。
 - 新增或修改静态前端模块时，必须保持 `tests/interfaces/test_static_assets.py` 的原生 alert 扫描通过。
 - 前端时间展示统一按 UTC+8（Asia/Shanghai）渲染，不依赖浏览器本地时区。服务端时间统一 UTC 存储（ISO 8601 / RFC 3339，如 `2026-07-28T12:00:00Z`），展示层一律用 `new Date(ms + 8 * 3600 * 1000)` 偏移后取 `getUTCFullYear/getUTCMonth/getUTCDate/getUTCHours/getUTCMinutes/getUTCSeconds` 分量格式化；各静态模块（chat/sandbox/host/observations/browser/tasks/scheduled-tasks/platforms）共用此 `formatTime`/`formatDate` 模式。新增时间渲染必须遵循，禁止用 `getHours()` 等本地时区方法或 `toLocaleString()` 渲染时间戳（`toLocaleString()` 仅用于数字 `formatNumber`）。
 

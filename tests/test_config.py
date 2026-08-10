@@ -785,6 +785,11 @@ _ARTIFACT_ENV_KEYS = (
     "N_AGENT_ARTIFACT_PUBLISH_MAX_BYTES",
     "N_AGENT_ARTIFACT_INLINE_MAX_BYTES",
     "N_AGENT_PUBLISHED_BASE_URL",
+    "N_AGENT_ARTIFACT_READ_MAX_BYTES",
+    "N_AGENT_ARTIFACT_DIFF_MAX_BYTES",
+    "N_AGENT_ARTIFACT_DIFF_MAX_LINES",
+    "N_AGENT_ARTIFACT_DIFF_MAX_OUTPUT_CHARS",
+    "N_AGENT_ARTIFACT_EXPORT_MAX_BYTES",
 )
 
 
@@ -806,6 +811,12 @@ def test_settings_artifact_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert s.artifact_publish_max_bytes == 10 * 1024 * 1024
     assert s.artifact_inline_max_bytes == 256 * 1024
     assert s.published_base_url == ""
+    # T11: revision/export limit defaults (frozen snapshot sources).
+    assert s.artifact_read_max_bytes == 64 * 1024
+    assert s.artifact_diff_max_bytes == 1 * 1024 * 1024
+    assert s.artifact_diff_max_lines == 20000
+    assert s.artifact_diff_max_output_chars == 200000
+    assert s.artifact_export_max_bytes == 50 * 1024 * 1024
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -815,6 +826,16 @@ def test_settings_artifact_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     {"artifact_publish_max_bytes": -1},
     {"artifact_inline_max_bytes": 0},
     {"artifact_inline_max_bytes": -1},
+    {"artifact_read_max_bytes": 0},
+    {"artifact_read_max_bytes": -1},
+    {"artifact_diff_max_bytes": 0},
+    {"artifact_diff_max_bytes": -1},
+    {"artifact_diff_max_lines": 0},
+    {"artifact_diff_max_lines": -1},
+    {"artifact_diff_max_output_chars": 0},
+    {"artifact_diff_max_output_chars": -1},
+    {"artifact_export_max_bytes": 0},
+    {"artifact_export_max_bytes": -1},
 ])
 def test_settings_artifact_size_limits_must_be_positive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kwargs: dict

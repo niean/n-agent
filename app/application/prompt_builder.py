@@ -53,6 +53,19 @@ BROWSER_GUIDANCE = (
     "Screenshots are for the user's Dashboard view only; rely on browser_observe text and element refs to decide actions."
 )
 
+ARTIFACT_GUIDANCE = (
+    "Artifacts are the durable, revisioned outputs of your work (documents, code, data). "
+    "When the user asks you to produce, form, modify, compare, restore, or publish a deliverable, "
+    "prefer the Artifact tools (artifact_create, artifact_update, artifact_diff, artifact_rollback, "
+    "artifact_publish) over pasting large content into a chat message. "
+    "When multiple candidate artifacts exist and the user does not name one, call artifact_list to "
+    "enumerate them and ask which to operate on; never assume the most recent item is the target. "
+    "artifact_read returns redacted content for artifacts you may not fully read; do not overwrite a "
+    "field based only on a redacted snippet -- re-read the full content first. "
+    "This guidance coexists with the Task Guidance: when working as a Task worker, submit complete "
+    "outputs via task_complete artifacts rather than echoing them as chat text."
+)
+
 TASK_DELEGATION_GUIDANCE = (
     "When the user's goal is multi-step, requires research or analysis, produces files or code, "
     "or is long-running and can be completed autonomously in the background, delegate it as a Task "
@@ -129,6 +142,7 @@ def build_system_prompt(
     enabled_override: list[str] | None = None,
     skills_index: str | None = None,
     browser_guidance: str | None = None,
+    artifact_guidance: str | None = None,
 ) -> str:
     sections: list[str] = [
         _section("Identity", DEFAULT_AGENT_IDENTITY),
@@ -139,6 +153,8 @@ def build_system_prompt(
     ]
     if browser_guidance:
         sections.append(_section("Browser Guidance", browser_guidance))
+    if artifact_guidance:
+        sections.append(_section("Artifact Guidance", artifact_guidance))
     sections.extend([
         _section("Task Delegation", TASK_DELEGATION_GUIDANCE),
         _section("Task Guidance", TASK_GUIDANCE),

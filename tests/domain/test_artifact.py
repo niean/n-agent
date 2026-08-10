@@ -18,18 +18,22 @@ from app.domain.artifact import (
     ArtifactConflictError,
     ArtifactContentStore,
     ArtifactContentUnavailableError,
+    ArtifactDeleteGraph,
     ArtifactError,
     ArtifactKind,
     ArtifactListCursor,
     ArtifactListPage,
     ArtifactNotFoundError,
     ArtifactRegistry,
+    ArtifactRevision,
     ArtifactSource,
     ArtifactStatus,
     ArtifactValidationError,
     PublishedArtifact,
     PublishedArtifactNotFoundError,
     PublishedArtifactStatus,
+    RevisionListCursor,
+    RevisionListPage,
 )
 
 
@@ -820,3 +824,232 @@ def test_fake_content_store_has_all_protocol_methods():
     for name in expected:
         assert hasattr(store, name), f"FakeArtifactContentStore missing: {name}"
         assert callable(getattr(store, name)), f"{name} not callable"
+
+
+# ---------------------------------------------------------------------------
+# ArtifactRevision: immutability, content XOR, provenance, parent/rollback
+# ---------------------------------------------------------------------------
+
+
+_REVISION_CHECKSUM = "sha256:" + "0" * 64
+
+
+def _valid_revision_kwargs() -> dict:
+    """Build a valid base kwargs dict for an initial ArtifactRevision (inline content)."""
+    return dict(
+        id="rev1",
+        artifact_id="art1",
+        revision_number=1,
+        parent_revision_id=None,
+        rollback_from_revision_id=None,
+        content_ref=None,
+        inline_content="# hi",
+        size=4,
+        checksum=_REVISION_CHECKSUM,
+        mime="text/markdown",
+        kind=ArtifactKind.MARKDOWN,
+        change_summary="init",
+        created_by="chat",
+        source_session_id="s1",
+        source_run_id=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+
+
+def _initial_kwargs() -> dict:
+    """Alias: an initial revision has no parent and no rollback."""
+    return _valid_revision_kwargs()
+
+
+def test_artifact_revision_immutable_and_invariants():
+    rev = ArtifactRevision(
+        id="rev1",
+        artifact_id="art1",
+        revision_number=1,
+        parent_revision_id=None,
+        rollback_from_revision_id=None,
+        content_ref=None,
+        inline_content="# hi",
+        size=4,
+        checksum="sha256:" + "0" * 64,
+        mime="text/markdown",
+        kind=ArtifactKind.MARKDOWN,
+        change_summary="init",
+        created_by="chat",
+        source_session_id="s1",
+        source_run_id=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    assert rev.is_initial  # parent_revision_id is None and rollback_from is None
+    with pytest.raises(FrozenInstanceError):
+        rev.change_summary = "x"
+
+
+def test_artifact_revision_content_xor():
+    # content_ref 与 inline_content 必须恰好一项不为 null；inline 空串合法；二进制只能 content_ref
+    with pytest.raises(ArtifactValidationError):
+        ArtifactRevision(
+            **(_valid_revision_kwargs() | {"content_ref": None, "inline_content": None})
+        )
+    with pytest.raises(ArtifactValidationError):
+        ArtifactRevision(
+            **(_valid_revision_kwargs() | {"content_ref": "", "inline_content": None})
+        )  # 空 content_ref
+    with pytest.raises(ArtifactValidationError):
+        ArtifactRevision(
+            **(_valid_revision_kwargs() | {
+                "content_ref": None, "inline_content": "x",
+                "kind": ArtifactKind.IMAGE, "size": 1,
+            })
+        )  # 二进制用 inline
+    # 文本空内容合法
+    rev = ArtifactRevision(
+        **(_valid_revision_kwargs() | {"inline_content": "", "size": 0})
+    )
+    assert rev.inline_content == ""
+    assert rev.size == 0
+
+
+def test_artifact_revision_validates_provenance_and_materialized_content():
+    # checksum 格式、size/int、mime、UTC aware created_at、持久 ref scheme 均需校验
+    for bad in (
+        dict(checksum="bad"),
+        dict(size=-1),
+        dict(mime=""),
+        dict(revision_number=0),
+        dict(created_at=datetime(2026, 1, 1)),
+        dict(created_at=None),
+        dict(content_ref="workspace:x", inline_content=None),
+        dict(content_ref="attachment:t/f", inline_content=None),
+        dict(content_ref="published:p/f", inline_content=None),
+        dict(content_ref="item:", inline_content=None),
+    ):
+        with pytest.raises(ArtifactValidationError):
+            ArtifactRevision(**(_valid_revision_kwargs() | bad))
+
+
+def test_artifact_revision_content_ref_item_scheme_ok():
+    """A revision with content_ref using item: scheme and a binary kind is valid."""
+    rev = ArtifactRevision(
+        **(_valid_revision_kwargs() | {
+            "content_ref": "item:art1/f.bin",
+            "inline_content": None,
+            "kind": ArtifactKind.OTHER,
+            "mime": "application/octet-stream",
+            "size": 1024,
+        })
+    )
+    assert rev.content_ref == "item:art1/f.bin"
+    assert rev.inline_content is None
+    assert rev.is_initial
+
+
+def test_artifact_revision_rollback_valid():
+    """A rollback revision with both parent and rollback_from set is valid."""
+    rev = ArtifactRevision(
+        **(_valid_revision_kwargs() | {
+            "revision_number": 3,
+            "parent_revision_id": "rev2",
+            "rollback_from_revision_id": "rev2",
+        })
+    )
+    assert not rev.is_initial
+    assert rev.parent_revision_id == "rev2"
+    assert rev.rollback_from_revision_id == "rev2"
+
+
+def test_artifact_revision_parent_and_rollback_shape():
+    assert ArtifactRevision(**_initial_kwargs()).is_initial
+    with pytest.raises(ArtifactValidationError):
+        ArtifactRevision(
+            **(_initial_kwargs() | {"rollback_from_revision_id": "r0"})
+        )
+
+
+def test_artifact_current_revision_id_nullable():
+    art = _text_artifact()
+    assert art.current_revision_id is None
+
+
+def test_published_artifact_published_revision_id_nullable():
+    pub = _published()
+    assert pub.published_revision_id is None
+
+
+# ---------------------------------------------------------------------------
+# ArtifactRegistry Protocol: revision method contracts
+# ---------------------------------------------------------------------------
+
+
+def test_registry_has_revision_methods():
+    for name in ("create_artifact_with_initial_revision", "append_revision",
+                 "get_revision", "list_revisions", "delete_artifact_graph",
+                 "list_revision_migration_candidates", "commit_initial_revision_backfill",
+                 "register_revision_publish", "count_artifacts_without_revision"):
+        assert hasattr(ArtifactRegistry, name), name
+
+
+# ---------------------------------------------------------------------------
+# Revision pagination & delete-graph value objects
+# ---------------------------------------------------------------------------
+
+
+def test_revision_list_cursor():
+    c = RevisionListCursor(artifact_id="art-1", revision_number=3, id="rev-3")
+    assert c.artifact_id == "art-1"
+    assert c.revision_number == 3
+    assert c.id == "rev-3"
+
+
+def test_revision_list_cursor_frozen():
+    c = RevisionListCursor(artifact_id="art-1", revision_number=3, id="rev-3")
+    with pytest.raises(FrozenInstanceError):
+        c.id = "x"
+
+
+def test_revision_list_page():
+    rev = ArtifactRevision(**_valid_revision_kwargs())
+    page = RevisionListPage(items=(rev,), next_cursor=None)
+    assert page.items == (rev,)
+    assert page.next_cursor is None
+
+
+def test_revision_list_page_with_cursor():
+    rev = ArtifactRevision(**_valid_revision_kwargs())
+    cursor = RevisionListCursor(artifact_id="art1", revision_number=1, id="rev1")
+    page = RevisionListPage(items=(rev,), next_cursor=cursor)
+    assert page.next_cursor == cursor
+
+
+def test_revision_list_page_frozen():
+    page = RevisionListPage(items=(), next_cursor=None)
+    with pytest.raises(FrozenInstanceError):
+        page.items = ()
+
+
+def test_artifact_delete_graph():
+    graph = ArtifactDeleteGraph(
+        revision_content_refs=("item:art1/a.bin", "item:art1/b.bin"),
+        legacy_artifact_content_ref="store://bucket/legacy.bin",
+        publish_snapshot_ids=("pub-1", "pub-2"),
+    )
+    assert graph.revision_content_refs == ("item:art1/a.bin", "item:art1/b.bin")
+    assert graph.legacy_artifact_content_ref == "store://bucket/legacy.bin"
+    assert graph.publish_snapshot_ids == ("pub-1", "pub-2")
+
+
+def test_artifact_delete_graph_defaults():
+    graph = ArtifactDeleteGraph()
+    assert graph.revision_content_refs == ()
+    assert graph.legacy_artifact_content_ref is None
+    assert graph.publish_snapshot_ids == ()
+
+
+def test_artifact_delete_graph_frozen():
+    graph = ArtifactDeleteGraph(
+        revision_content_refs=("item:art1/a.bin",),
+        legacy_artifact_content_ref=None,
+        publish_snapshot_ids=("pub-1",),
+    )
+    with pytest.raises(FrozenInstanceError):
+        graph.revision_content_refs = ("x",)

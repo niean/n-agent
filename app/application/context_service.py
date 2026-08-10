@@ -52,6 +52,7 @@ class ContextService:
         runtime_memory_service: RuntimeMemoryService | None = None,
         context_policy: ContextPolicy | None = None,
         browser_guidance: str | None = None,
+        artifact_guidance: str | None = None,
     ):
         self.memory_store = memory_store
         self.tool_service = tool_service
@@ -63,6 +64,7 @@ class ContextService:
         self._runtime_memory = runtime_memory_service or RuntimeMemoryService(memory_store)
         self._context_policy = context_policy or DefaultContextPolicy()
         self._browser_guidance = browser_guidance
+        self._artifact_guidance = artifact_guidance
 
     # ------------------------------------------------------------------
     # Engine config extraction (for ContextPolicy request)
@@ -215,6 +217,7 @@ class ContextService:
                     enabled_override,
                     skills_index,
                     browser_guidance=self._browser_guidance,
+                    artifact_guidance=self._artifact_guidance,
                 ),
             },
             *[_message_to_provider(message) for message in context_messages],

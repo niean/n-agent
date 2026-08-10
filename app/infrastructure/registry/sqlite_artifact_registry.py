@@ -41,15 +41,22 @@ from app.domain.artifact import (
     Artifact,
     ArtifactAttachmentSource,
     ArtifactConflictError,
+    ArtifactDeleteGraph,
     ArtifactError,
     ArtifactKind,
     ArtifactListCursor,
     ArtifactListPage,
     ArtifactNotFoundError,
+    ArtifactRevision,
+    ArtifactRevisionConflictError,
+    ArtifactRevisionNotFoundError,
+    ArtifactRevisionValidationError,
     ArtifactSource,
     ArtifactStatus,
     PublishedArtifact,
     PublishedArtifactStatus,
+    RevisionListCursor,
+    RevisionListPage,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,7 +83,8 @@ CREATE TABLE IF NOT EXISTS artifacts (
     status TEXT NOT NULL DEFAULT 'draft',
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    current_revision_id TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_source
@@ -89,6 +97,38 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_kind
     ON artifacts(kind);
 CREATE INDEX IF NOT EXISTS idx_artifacts_status
     ON artifacts(status);
+
+CREATE TABLE IF NOT EXISTS artifact_revisions (
+    id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL,
+    revision_number INTEGER NOT NULL,
+    parent_revision_id TEXT,
+    rollback_from_revision_id TEXT,
+    content_ref TEXT,
+    inline_content TEXT,
+    size INTEGER NOT NULL,
+    checksum TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    change_summary TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    source_session_id TEXT,
+    source_run_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(artifact_id, revision_number),
+    CHECK (revision_number >= 1),
+    CHECK (size >= 0),
+    CHECK ((content_ref IS NOT NULL) + (inline_content IS NOT NULL) = 1),
+    CHECK (content_ref IS NULL OR content_ref <> ''),
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE,
+    FOREIGN KEY(parent_revision_id) REFERENCES artifact_revisions(id) ON DELETE SET NULL,
+    FOREIGN KEY(rollback_from_revision_id) REFERENCES artifact_revisions(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_revisions_list
+    ON artifact_revisions(artifact_id, revision_number DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_revisions_checksum ON artifact_revisions(checksum);
+CREATE INDEX IF NOT EXISTS idx_revisions_created_at ON artifact_revisions(created_at);
 
 CREATE TABLE IF NOT EXISTS published_artifacts (
     publish_id TEXT PRIMARY KEY,
@@ -105,7 +145,9 @@ CREATE TABLE IF NOT EXISTS published_artifacts (
     published_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     revoked_at TEXT,
-    FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE SET NULL
+    published_revision_id TEXT,
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE SET NULL,
+    FOREIGN KEY(published_revision_id) REFERENCES artifact_revisions(id) ON DELETE SET NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_published_active_artifact
@@ -191,9 +233,9 @@ class SQLiteArtifactRegistry:
             checksum, source_kind, source_ref, source_context_ref,
             source_session_id, summary,
             classification, labels_json, status, created_by, created_at,
-            updated_at
+            updated_at, current_revision_id
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
 
@@ -202,9 +244,21 @@ class SQLiteArtifactRegistry:
             publish_id, artifact_id, snapshot_name, snapshot_kind,
             snapshot_mime, snapshot_content_ref, snapshot_inline_content,
             snapshot_size, snapshot_checksum, snapshot_summary,
-            published_by, published_at, status, revoked_at
+            published_by, published_at, status, revoked_at,
+            published_revision_id
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+    """
+
+    _INSERT_REVISION_SQL = """
+        INSERT INTO artifact_revisions (
+            id, artifact_id, revision_number, parent_revision_id,
+            rollback_from_revision_id, content_ref, inline_content,
+            size, checksum, mime, kind, change_summary, created_by,
+            source_session_id, source_run_id, created_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
 
@@ -230,6 +284,7 @@ class SQLiteArtifactRegistry:
         with self._connect() as conn:
             conn.executescript(ARTIFACT_SCHEMA_SQL)
             self._migrate_add_source_session_id(conn)
+            self._migrate_add_revision_columns(conn)
             conn.commit()
 
     @staticmethod
@@ -252,6 +307,35 @@ class SQLiteArtifactRegistry:
             "CREATE INDEX IF NOT EXISTS idx_artifacts_source_session_id "
             "ON artifacts(source_session_id)"
         )
+
+    @staticmethod
+    def _migrate_add_revision_columns(conn: sqlite3.Connection) -> None:
+        """Idempotent migration: add current_revision_id to artifacts and
+        published_revision_id to published_artifacts if absent.
+
+        For old DBs predating the revision feature, these columns are added
+        via ALTER TABLE.  FK constraints cannot be added via ALTER TABLE ADD
+        COLUMN in older SQLite builds with self-referencing tables, so the
+        columns are plain TEXT with application-layer validation.  The FK
+        constraints on artifact_revisions (artifact_id, parent_revision_id,
+        rollback_from_revision_id) are defined in the CREATE TABLE statement
+        and apply to new DBs.
+        """
+        art_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(artifacts)")
+        }
+        if "current_revision_id" not in art_cols:
+            conn.execute(
+                "ALTER TABLE artifacts ADD COLUMN current_revision_id TEXT"
+            )
+        pub_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(published_artifacts)")
+        }
+        if "published_revision_id" not in pub_cols:
+            conn.execute(
+                "ALTER TABLE published_artifacts ADD COLUMN published_revision_id TEXT"
+            )
 
     # ------------------------------------------------------------------
     # Row -> domain object conversion
@@ -278,6 +362,7 @@ class SQLiteArtifactRegistry:
             created_by=row["created_by"] or "",
             created_at=_str_to_dt(row["created_at"]),
             updated_at=_str_to_dt(row["updated_at"]),
+            current_revision_id=row["current_revision_id"],
         )
 
     def _row_to_published(self, row: sqlite3.Row) -> PublishedArtifact:
@@ -296,6 +381,27 @@ class SQLiteArtifactRegistry:
             published_by=row["published_by"] or "",
             status=PublishedArtifactStatus(row["status"]),
             revoked_at=_str_to_dt(row["revoked_at"]),
+            published_revision_id=row["published_revision_id"],
+        )
+
+    def _row_to_revision(self, row: sqlite3.Row) -> ArtifactRevision:
+        return ArtifactRevision(
+            id=row["id"],
+            artifact_id=row["artifact_id"],
+            revision_number=row["revision_number"],
+            parent_revision_id=row["parent_revision_id"],
+            rollback_from_revision_id=row["rollback_from_revision_id"],
+            content_ref=row["content_ref"],
+            inline_content=row["inline_content"],
+            size=row["size"],
+            checksum=row["checksum"],
+            mime=row["mime"],
+            kind=ArtifactKind(row["kind"]),
+            created_at=_str_to_dt(row["created_at"]),
+            change_summary=row["change_summary"] or "",
+            created_by=row["created_by"] or "",
+            source_session_id=row["source_session_id"],
+            source_run_id=row["source_run_id"],
         )
 
     @staticmethod
@@ -339,6 +445,7 @@ class SQLiteArtifactRegistry:
             artifact.created_by,
             _dt_to_str(created_at),
             _dt_to_str(updated_at),
+            artifact.current_revision_id,
         )
 
     def _published_params(
@@ -360,6 +467,28 @@ class SQLiteArtifactRegistry:
             _dt_to_str(published_at),
             published.status.value,
             _dt_to_str(published.revoked_at),
+            published.published_revision_id,
+        )
+
+    @staticmethod
+    def _revision_params(revision: ArtifactRevision) -> tuple:
+        return (
+            revision.id,
+            revision.artifact_id,
+            revision.revision_number,
+            revision.parent_revision_id,
+            revision.rollback_from_revision_id,
+            revision.content_ref,
+            revision.inline_content,
+            revision.size,
+            revision.checksum,
+            revision.mime,
+            revision.kind.value,
+            revision.change_summary,
+            revision.created_by,
+            revision.source_session_id,
+            revision.source_run_id,
+            _dt_to_str(revision.created_at),
         )
 
     # ------------------------------------------------------------------
@@ -756,6 +885,474 @@ class SQLiteArtifactRegistry:
                 ).fetchall()
         return tuple(self._row_to_attachment_source(r) for r in rows)
 
+    # ------------------------------------------------------------------
+    # Revision lifecycle (sync implementations)
+    # ------------------------------------------------------------------
+
+    def _create_with_initial_revision_sync(
+        self, artifact: Artifact, initial: ArtifactRevision,
+    ) -> tuple[Artifact, ArtifactRevision]:
+        """Single transaction: insert artifact (with current_revision_id) +
+        insert initial revision."""
+        if initial.artifact_id != artifact.id:
+            raise ArtifactRevisionValidationError(
+                "initial revision artifact_id does not match artifact id"
+            )
+        if initial.revision_number != 1 or not initial.is_initial:
+            raise ArtifactRevisionValidationError(
+                "initial revision must have revision_number=1 with no parent "
+                "and no rollback_from"
+            )
+        now = _now()
+        created_at = artifact.created_at or now
+        updated_at = artifact.updated_at or now
+        resolved_artifact = dataclass_replace(
+            artifact,
+            created_at=created_at,
+            updated_at=updated_at,
+            current_revision_id=initial.id,
+        )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    self._INSERT_ARTIFACT_SQL,
+                    self._artifact_params(resolved_artifact, now),
+                )
+                conn.execute(
+                    self._INSERT_REVISION_SQL,
+                    self._revision_params(initial),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError as e:
+                conn.rollback()
+                raise ArtifactConflictError(
+                    f"create_artifact_with_initial_revision integrity error: {e}"
+                ) from e
+        return resolved_artifact, initial
+
+    def _append_revision_sync(
+        self, artifact_id: str, revision: ArtifactRevision, *,
+        expected_revision_id: str,
+    ) -> ArtifactRevision:
+        """Append a revision under BEGIN IMMEDIATE with CAS.
+
+        Validates: expected_revision_id == current; parent == current;
+        revision_number == MAX(existing)+1; parent/rollback belong to
+        same artifact.  Inserts revision + updates current_revision_id.
+        """
+        if revision.artifact_id != artifact_id:
+            raise ArtifactRevisionValidationError(
+                "revision artifact_id does not match artifact_id argument"
+            )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                art_row = conn.execute(
+                    "SELECT current_revision_id FROM artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if art_row is None:
+                    conn.rollback()
+                    raise ArtifactNotFoundError(
+                        f"artifact not found: {artifact_id}"
+                    )
+                current_rev_id = art_row["current_revision_id"]
+                if current_rev_id != expected_revision_id:
+                    conn.rollback()
+                    raise ArtifactRevisionConflictError(
+                        f"CAS conflict: expected current_revision_id="
+                        f"{expected_revision_id}, actual={current_rev_id}"
+                    )
+                # parent must equal current
+                if revision.parent_revision_id != current_rev_id:
+                    conn.rollback()
+                    raise ArtifactRevisionValidationError(
+                        "parent_revision_id must equal current_revision_id"
+                    )
+                # Compute next revision_number
+                max_row = conn.execute(
+                    "SELECT MAX(revision_number) AS max_num "
+                    "FROM artifact_revisions WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                max_num = max_row["max_num"] if max_row and max_row["max_num"] else 0
+                expected_next = max_num + 1
+                if revision.revision_number != expected_next:
+                    conn.rollback()
+                    raise ArtifactRevisionValidationError(
+                        f"revision_number must be {expected_next}, "
+                        f"got {revision.revision_number}"
+                    )
+                # Validate parent/rollback belong to same artifact
+                if revision.parent_revision_id is not None:
+                    parent_row = conn.execute(
+                        "SELECT artifact_id FROM artifact_revisions WHERE id = ?",
+                        (revision.parent_revision_id,),
+                    ).fetchone()
+                    if parent_row is None or parent_row["artifact_id"] != artifact_id:
+                        conn.rollback()
+                        raise ArtifactRevisionValidationError(
+                            "parent_revision_id does not belong to this artifact"
+                        )
+                if revision.rollback_from_revision_id is not None:
+                    rb_row = conn.execute(
+                        "SELECT artifact_id FROM artifact_revisions WHERE id = ?",
+                        (revision.rollback_from_revision_id,),
+                    ).fetchone()
+                    if rb_row is None or rb_row["artifact_id"] != artifact_id:
+                        conn.rollback()
+                        raise ArtifactRevisionValidationError(
+                            "rollback_from_revision_id does not belong to this artifact"
+                        )
+                # Insert revision
+                conn.execute(
+                    self._INSERT_REVISION_SQL,
+                    self._revision_params(revision),
+                )
+                # Update current_revision_id
+                conn.execute(
+                    "UPDATE artifacts SET current_revision_id = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (revision.id, _dt_to_str(_now()), artifact_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM artifact_revisions WHERE id = ?",
+                    (revision.id,),
+                ).fetchone()
+                conn.commit()
+                return self._row_to_revision(row)
+            except sqlite3.IntegrityError as e:
+                conn.rollback()
+                raise ArtifactRevisionConflictError(
+                    f"append_revision integrity error: {e}"
+                ) from e
+
+    def _get_revision_sync(
+        self, artifact_id: str, revision_id: str,
+    ) -> ArtifactRevision | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact_revisions "
+                "WHERE id = ? AND artifact_id = ?",
+                (revision_id, artifact_id),
+            ).fetchone()
+        return self._row_to_revision(row) if row else None
+
+    def _list_revisions_sync(
+        self, artifact_id: str, *,
+        cursor: RevisionListCursor | None = None,
+        limit: int = 50,
+    ) -> RevisionListPage:
+        limit = max(1, min(limit, 100))
+        conditions = ["artifact_id = ?"]
+        params: list[object] = [artifact_id]
+        if cursor is not None:
+            if cursor.artifact_id != artifact_id:
+                raise ArtifactRevisionValidationError(
+                    "cursor artifact_id does not match requested artifact_id"
+                )
+            conditions.append(
+                "(revision_number < ? OR "
+                "(revision_number = ? AND id < ?))"
+            )
+            params.extend([
+                cursor.revision_number,
+                cursor.revision_number,
+                cursor.id,
+            ])
+        where_clause = " WHERE " + " AND ".join(conditions)
+        sql = (
+            f"SELECT * FROM artifact_revisions{where_clause} "
+            "ORDER BY revision_number DESC, id DESC LIMIT ?"
+        )
+        params.append(limit + 1)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        items = tuple(self._row_to_revision(r) for r in rows[:limit])
+        next_cursor = None
+        if len(rows) > limit:
+            last = items[-1]
+            next_cursor = RevisionListCursor(
+                artifact_id=artifact_id,
+                revision_number=last.revision_number,
+                id=last.id,
+            )
+        return RevisionListPage(items=items, next_cursor=next_cursor)
+
+    def _delete_artifact_graph_sync(self, artifact_id: str) -> ArtifactDeleteGraph:
+        """Delete artifact + all revisions + published rows in one transaction.
+
+        Returns deduplicated content refs and publish snapshot ids for
+        best-effort post-commit cleanup.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Collect revision content_refs (dedup, preserving order)
+            rev_rows = conn.execute(
+                "SELECT content_ref FROM artifact_revisions WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchall()
+            revision_refs = tuple(
+                dict.fromkeys(  # ordered dedup
+                    row["content_ref"] for row in rev_rows
+                    if row["content_ref"]
+                )
+            )
+            # Legacy artifact content_ref
+            art_row = conn.execute(
+                "SELECT content_ref FROM artifacts WHERE id = ?",
+                (artifact_id,),
+            ).fetchone()
+            legacy_ref = art_row["content_ref"] if art_row else None
+            # Publish snapshot ids
+            pub_rows = conn.execute(
+                "SELECT publish_id FROM published_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchall()
+            publish_ids = tuple(row["publish_id"] for row in pub_rows)
+            # Delete published_artifacts for this artifact
+            conn.execute(
+                "DELETE FROM published_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            )
+            # Delete artifact (CASCADE deletes revisions via FK)
+            conn.execute(
+                "DELETE FROM artifacts WHERE id = ?", (artifact_id,),
+            )
+            conn.commit()
+        return ArtifactDeleteGraph(
+            revision_content_refs=revision_refs,
+            legacy_artifact_content_ref=legacy_ref,
+            publish_snapshot_ids=publish_ids,
+        )
+
+    # ------------------------------------------------------------------
+    # Migration / backfill (sync implementations)
+    # ------------------------------------------------------------------
+
+    def _list_revision_migration_candidates_sync(
+        self, *, cursor: ArtifactListCursor | None, limit: int,
+    ) -> ArtifactListPage:
+        """Return artifacts with NULL current_revision_id, paginated."""
+        clamped = max(1, min(limit, 500))
+        conditions = ["current_revision_id IS NULL"]
+        params: list[object] = []
+        if cursor is not None:
+            cursor_updated = _dt_to_str(cursor.updated_at)
+            conditions.append(
+                "(updated_at < ? OR (updated_at = ? AND id < ?))"
+            )
+            params.extend([cursor_updated, cursor_updated, cursor.artifact_id])
+        where_clause = " WHERE " + " AND ".join(conditions)
+        sql = (
+            f"SELECT * FROM artifacts{where_clause} "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?"
+        )
+        params.append(clamped + 1)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        items = tuple(self._row_to_artifact(r) for r in rows[:clamped])
+        next_cursor = None
+        if len(rows) > clamped:
+            last = items[-1]
+            next_cursor = ArtifactListCursor(
+                updated_at=last.updated_at, artifact_id=last.id,
+            )
+        return ArtifactListPage(items=items, next_cursor=next_cursor)
+
+    def _commit_initial_revision_backfill_sync(
+        self, artifact_id: str, revision: ArtifactRevision,
+    ) -> ArtifactRevision:
+        """Backfill the initial revision under BEGIN IMMEDIATE.
+
+        Three states:
+          1. current_revision_id points to a valid revision of this artifact
+             -> skip (idempotent).
+          2. current_revision_id is NULL but a revision_number=1 row exists
+             -> backfill current_revision_id only.
+          3. current_revision_id is NULL and no revision exists -> insert
+             the passed revision + backfill current_revision_id.
+
+        If current_revision_id points to a revision of another artifact or
+        a non-existent revision, raise (do not auto-fix).
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                art_row = conn.execute(
+                    "SELECT current_revision_id FROM artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if art_row is None:
+                    conn.rollback()
+                    raise ArtifactNotFoundError(
+                        f"artifact not found: {artifact_id}"
+                    )
+                current_rev_id = art_row["current_revision_id"]
+
+                # State 1: current_revision_id is set
+                if current_rev_id is not None:
+                    rev_row = conn.execute(
+                        "SELECT * FROM artifact_revisions "
+                        "WHERE id = ? AND artifact_id = ?",
+                        (current_rev_id, artifact_id),
+                    ).fetchone()
+                    if rev_row is not None:
+                        # Valid pointer -> skip (idempotent)
+                        conn.commit()
+                        return self._row_to_revision(rev_row)
+                    # Pointer is invalid (cross-artifact or non-existent)
+                    conn.rollback()
+                    raise ArtifactRevisionValidationError(
+                        f"current_revision_id={current_rev_id} does not point "
+                        f"to a valid revision of artifact {artifact_id}"
+                    )
+
+                # State 2: current_revision_id is NULL, check for rev_number=1
+                existing_rev = conn.execute(
+                    "SELECT * FROM artifact_revisions "
+                    "WHERE artifact_id = ? AND revision_number = 1",
+                    (artifact_id,),
+                ).fetchone()
+                if existing_rev is not None:
+                    # Backfill current_revision_id only
+                    conn.execute(
+                        "UPDATE artifacts SET current_revision_id = ?, "
+                        "updated_at = ? WHERE id = ?",
+                        (existing_rev["id"], _dt_to_str(_now()), artifact_id),
+                    )
+                    conn.commit()
+                    return self._row_to_revision(existing_rev)
+
+                # State 3: no revision at all -> insert + backfill
+                if revision.artifact_id != artifact_id:
+                    conn.rollback()
+                    raise ArtifactRevisionValidationError(
+                        "revision artifact_id does not match artifact_id argument"
+                    )
+                if revision.revision_number != 1 or not revision.is_initial:
+                    conn.rollback()
+                    raise ArtifactRevisionValidationError(
+                        "backfill revision must be initial (revision_number=1, "
+                        "no parent, no rollback_from)"
+                    )
+                conn.execute(
+                    self._INSERT_REVISION_SQL,
+                    self._revision_params(revision),
+                )
+                conn.execute(
+                    "UPDATE artifacts SET current_revision_id = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (revision.id, _dt_to_str(_now()), artifact_id),
+                )
+                inserted_row = conn.execute(
+                    "SELECT * FROM artifact_revisions WHERE id = ?",
+                    (revision.id,),
+                ).fetchone()
+                conn.commit()
+                return self._row_to_revision(inserted_row)
+            except sqlite3.IntegrityError as e:
+                conn.rollback()
+                raise ArtifactConflictError(
+                    f"commit_initial_revision_backfill integrity error: {e}"
+                ) from e
+
+    def _register_revision_publish_sync(
+        self, published: PublishedArtifact, *, artifact_id: str,
+        revision_id: str, expected_current_revision_id: str,
+    ) -> PublishedArtifact:
+        """Register a revision publish under BEGIN IMMEDIATE with CAS.
+
+        Re-verifies current_revision_id, reuses active publish with same
+        checksum, or revokes old + inserts new.
+        """
+        now = _now()
+        resolved = dataclass_replace(
+            published, published_revision_id=revision_id,
+        )
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # CAS check
+                art_row = conn.execute(
+                    "SELECT current_revision_id FROM artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if art_row is None:
+                    conn.rollback()
+                    raise ArtifactNotFoundError(
+                        f"artifact not found: {artifact_id}"
+                    )
+                if art_row["current_revision_id"] != expected_current_revision_id:
+                    conn.rollback()
+                    raise ArtifactRevisionConflictError(
+                        f"CAS conflict: expected current_revision_id="
+                        f"{expected_current_revision_id}, "
+                        f"actual={art_row['current_revision_id']}"
+                    )
+                # Reuse: same checksum active publish for this artifact
+                existing = conn.execute(
+                    "SELECT * FROM published_artifacts "
+                    "WHERE artifact_id = ? AND status = 'active' "
+                    "AND snapshot_checksum = ?",
+                    (artifact_id, resolved.snapshot_checksum),
+                ).fetchone()
+                if existing is not None:
+                    conn.commit()
+                    return self._row_to_published(existing)
+                # Revoke old active
+                conn.execute(
+                    "UPDATE published_artifacts "
+                    "SET status = 'revoked', revoked_at = ? "
+                    "WHERE artifact_id = ? AND status = 'active'",
+                    (_dt_to_str(now), artifact_id),
+                )
+                # Insert new active publish
+                conn.execute(
+                    self._INSERT_PUBLISHED_SQL,
+                    self._published_params(resolved, now),
+                )
+                # Sync artifact status
+                conn.execute(
+                    "UPDATE artifacts SET status = 'published', "
+                    "updated_at = ? WHERE id = ?",
+                    (_dt_to_str(now), artifact_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM published_artifacts WHERE publish_id = ?",
+                    (resolved.publish_id,),
+                ).fetchone()
+                conn.commit()
+                return self._row_to_published(row)
+            except sqlite3.IntegrityError as e:
+                conn.rollback()
+                # Check for concurrent same-checksum reuse: if a concurrent
+                # transaction inserted an active publish with the same checksum,
+                # return it.  Only return when checksums match -- otherwise the
+                # IntegrityError was a PK/FK/CHECK violation (not a concurrent
+                # reuse), and returning the old active (different checksum)
+                # would mask the error.
+                existing = conn.execute(
+                    "SELECT * FROM published_artifacts "
+                    "WHERE artifact_id = ? AND status = 'active' "
+                    "AND snapshot_checksum = ?",
+                    (artifact_id, resolved.snapshot_checksum),
+                ).fetchone()
+                if existing is not None:
+                    return self._row_to_published(existing)
+                raise ArtifactConflictError(
+                    f"register_revision_publish integrity error: {e}"
+                ) from e
+
+    def _count_artifacts_without_revision_sync(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM artifacts "
+                "WHERE current_revision_id IS NULL"
+            ).fetchone()
+        return int(row["cnt"])
+
     # ==================================================================
     # Async public API (wraps sync via asyncio.to_thread)
     # ==================================================================
@@ -875,4 +1472,85 @@ class SQLiteArtifactRegistry:
             self._list_attachment_sources_sync,
             after_attachment_id=after_attachment_id,
             limit=limit,
+        )
+
+    # ------------------------------------------------------------------
+    # Revision lifecycle (async wrappers)
+    # ------------------------------------------------------------------
+
+    async def create_artifact_with_initial_revision(
+        self, artifact: Artifact, initial: ArtifactRevision,
+    ) -> tuple[Artifact, ArtifactRevision]:
+        return await asyncio.to_thread(
+            self._create_with_initial_revision_sync, artifact, initial,
+        )
+
+    async def append_revision(
+        self, artifact_id: str, revision: ArtifactRevision, *,
+        expected_revision_id: str,
+    ) -> ArtifactRevision:
+        return await asyncio.to_thread(
+            self._append_revision_sync,
+            artifact_id, revision,
+            expected_revision_id=expected_revision_id,
+        )
+
+    async def get_revision(
+        self, artifact_id: str, revision_id: str,
+    ) -> ArtifactRevision | None:
+        return await asyncio.to_thread(
+            self._get_revision_sync, artifact_id, revision_id,
+        )
+
+    async def list_revisions(
+        self, artifact_id: str, *,
+        cursor: RevisionListCursor | None = None,
+        limit: int = 50,
+    ) -> RevisionListPage:
+        return await asyncio.to_thread(
+            self._list_revisions_sync,
+            artifact_id,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    async def delete_artifact_graph(
+        self, artifact_id: str,
+    ) -> ArtifactDeleteGraph:
+        return await asyncio.to_thread(
+            self._delete_artifact_graph_sync, artifact_id,
+        )
+
+    async def list_revision_migration_candidates(
+        self, *, cursor: ArtifactListCursor | None, limit: int,
+    ) -> ArtifactListPage:
+        return await asyncio.to_thread(
+            self._list_revision_migration_candidates_sync,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    async def commit_initial_revision_backfill(
+        self, artifact_id: str, revision: ArtifactRevision,
+    ) -> ArtifactRevision:
+        return await asyncio.to_thread(
+            self._commit_initial_revision_backfill_sync,
+            artifact_id, revision,
+        )
+
+    async def register_revision_publish(
+        self, published: PublishedArtifact, *, artifact_id: str,
+        revision_id: str, expected_current_revision_id: str,
+    ) -> PublishedArtifact:
+        return await asyncio.to_thread(
+            self._register_revision_publish_sync,
+            published,
+            artifact_id=artifact_id,
+            revision_id=revision_id,
+            expected_current_revision_id=expected_current_revision_id,
+        )
+
+    async def count_artifacts_without_revision(self) -> int:
+        return await asyncio.to_thread(
+            self._count_artifacts_without_revision_sync,
         )

@@ -167,7 +167,10 @@ def test_openai_tool_schemas_exclude_n_agent_metadata():
 
 
 @pytest.mark.asyncio
-async def test_tool_service_denies_confirm_and_hides_dangerous_tools():
+async def test_tool_service_exposes_dangerous_in_default_but_denies_without_approval():
+    """DANGEROUS tools are listed in DEFAULT (realtime) so the model can call
+    them, but execution without an approval grant is denied (spec: DANGEROUS
+    审批通过后执行). CONFIRM tools are also listed and denied without a grant."""
     definitions = [
         ToolDefinition("confirm_tool", "confirm", {"type": "object"}, RiskLevel.CONFIRM),
         ToolDefinition("dangerous_tool", "dangerous", {"type": "object"}, RiskLevel.DANGEROUS),
@@ -178,7 +181,10 @@ async def test_tool_service_denies_confirm_and_hides_dangerous_tools():
     confirm = await service.execute(ToolCallRequest(id="1", name="confirm_tool"))
     dangerous = await service.execute(ToolCallRequest(id="2", name="dangerous_tool"))
 
-    assert {schema["function"]["name"] for schema in schemas} == {"confirm_tool"}
+    assert {schema["function"]["name"] for schema in schemas} == {
+        "confirm_tool",
+        "dangerous_tool",
+    }
     assert confirm.status == ToolResultStatus.PERMISSION_DENIED
     assert dangerous.status == ToolResultStatus.PERMISSION_DENIED
 
@@ -450,9 +456,11 @@ def test_dynamic_definition_replacement_is_atomic_and_preserves_source_order_on_
                 "static_safe",
                 "static_agent",
                 "static_confirm",
+                "static_dangerous",
                 "dynamic_safe",
                 "dynamic_agent",
                 "dynamic_confirm",
+                "dynamic_dangerous",
             },
         ),
         (RiskLevel.SAFE, {"static_safe", "dynamic_safe"}),
@@ -462,9 +470,11 @@ def test_dynamic_definition_replacement_is_atomic_and_preserves_source_order_on_
                 "static_safe",
                 "static_agent",
                 "static_confirm",
+                "static_dangerous",
                 "dynamic_safe",
                 "dynamic_agent",
                 "dynamic_confirm",
+                "dynamic_dangerous",
             },
         ),
         (ToolExposurePolicy.SAFE_ONLY, {"static_safe", "dynamic_safe"}),
@@ -680,7 +690,7 @@ async def test_evaluation_cannot_authorize_or_execute_replacement_request(replac
     ("definition", "reason"),
     [
         (_definition("disabled", enabled=False), "tool_disabled"),
-        (_definition("dangerous", risk_level=RiskLevel.DANGEROUS), "dangerous_tool"),
+        (_definition("dangerous", risk_level=RiskLevel.DANGEROUS), "dangerous_approval_required"),
         (_definition("confirm", risk_level=RiskLevel.CONFIRM), "confirm_approval_required"),
     ],
 )

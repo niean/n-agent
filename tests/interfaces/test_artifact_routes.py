@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import secrets
+from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
@@ -21,23 +23,38 @@ from fastapi.testclient import TestClient
 
 from app.application.artifact_service import (
     ArtifactTooLargeError,
+    DiffResult,
     PublishBlockedError,
     PublishResult,
+    UpdateRevisionResult,
 )
 from app.domain.artifact import (
     Artifact,
-    ArtifactContentUnavailableError,
     ArtifactConflictError,
+    ArtifactContentUnavailableError,
+    ArtifactDiffTooLargeError,
+    ArtifactDiffUnsupportedError,
+    ArtifactExportError,
+    ArtifactExportTooLargeError,
+    ArtifactExportUnsupportedError,
     ArtifactKind,
     ArtifactListCursor,
     ArtifactListPage,
+    ArtifactMigrationIncompleteError,
     ArtifactNotFoundError,
+    ArtifactReadTooLargeError,
+    ArtifactRevision,
+    ArtifactRevisionConflictError,
+    ArtifactRevisionNotFoundError,
+    ArtifactRevisionValidationError,
     ArtifactSource,
     ArtifactStatus,
     ArtifactValidationError,
     PublishedArtifact,
     PublishedArtifactNotFoundError,
     PublishedArtifactStatus,
+    RevisionListCursor,
+    RevisionListPage,
 )
 from app.interfaces.http._content_disposition import build_content_disposition
 from app.interfaces.http.dashboard import create_dashboard_router
@@ -151,9 +168,16 @@ class FakeArtifactService:
         self._binary: dict[str, bytes] = {}  # content_ref -> bytes
         self._active_publishes: dict[str, PublishedArtifact] = {}  # artifact_id -> active
         self._revoked_publishes: dict[str, PublishedArtifact] = {}  # artifact_id -> revoked
+        self._revisions: dict[str, list[ArtifactRevision]] = {}  # artifact_id -> revisions
+        self._revision_content: dict[str, bytes] = {}  # revision_id -> bytes
         self.create_calls: list[dict[str, Any]] = []
         self._raise_on_get: Exception | None = None
         self._raise_on_list: Exception | None = None
+        self._raise_on_update_revision: Exception | None = None
+        self._raise_on_rollback: Exception | None = None
+        self._raise_on_publish_revision: Exception | None = None
+        self._raise_on_export_capabilities: Exception | None = None
+        self._raise_on_diff: Exception | None = None
 
     # -- list --
     async def list_artifacts(
@@ -250,8 +274,7 @@ class FakeArtifactService:
             "kind": kind,
             "created_by": created_by,
         })
-        import secrets as _secrets
-        artifact_id = _secrets.token_urlsafe(16)
+        artifact_id = secrets.token_urlsafe(16)
         if source_kind == ArtifactSource.MANUAL and source_ref is None:
             source_ref = artifact_id
 
@@ -288,6 +311,32 @@ class FakeArtifactService:
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
+        # Materialize the initial revision (revision_number=1) and backfill
+        # current_revision_id, so every created Artifact has a current revision.
+        rev_id = secrets.token_urlsafe(16)
+        rev = ArtifactRevision(
+            id=rev_id,
+            artifact_id=artifact_id,
+            revision_number=1,
+            parent_revision_id=None,
+            rollback_from_revision_id=None,
+            content_ref=content_ref,
+            inline_content=inline_content,
+            size=size,
+            checksum=checksum,
+            mime=mime,
+            kind=kind,
+            created_at=art.created_at,
+            change_summary="initial",
+            created_by=created_by,
+            source_session_id=None,
+            source_run_id=None,
+        )
+        self._revisions[artifact_id] = [rev]
+        self._revision_content[rev_id] = (
+            inline_content.encode("utf-8") if inline_content is not None else file_data
+        )
+        art = dc_replace(art, current_revision_id=rev_id)
         self._artifacts[artifact_id] = art
         return art
 
@@ -307,7 +356,6 @@ class FakeArtifactService:
         art = self._artifacts.get(artifact_id)
         if art is None:
             raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
-        from dataclasses import replace as dc_replace
         new_name = name if name is not None else art.name
         new_summary = summary if summary is not None else art.summary
         new_classification = classification if classification is not None else art.classification
@@ -354,19 +402,24 @@ class FakeArtifactService:
     # -- export --
     async def export(
         self, artifact_id: str, *, format: str = "original",
+        revision_id: str | None = None,
     ) -> tuple[bytes, str, str]:
         art = self._artifacts.get(artifact_id)
         if art is None:
             raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
-        if format == "original":
+        if revision_id is not None:
+            data, rev = await self.get_revision_content(artifact_id, revision_id)
+            mime = rev.mime
+        else:
             data, _ = await self.get_content(artifact_id)
-            return data, art.mime, art.name
+            mime = art.mime
+        if format == "original":
+            return data, mime, art.name
         if format == "html":
             if art.kind not in (ArtifactKind.MARKDOWN, ArtifactKind.DOCUMENT):
                 raise ArtifactValidationError(
                     f"html export only supports markdown/document, got {art.kind}"
                 )
-            data, _ = await self.get_content(artifact_id)
             html = f"<html><body>{data.decode('utf-8')}</body></html>"
             return html.encode("utf-8"), "text/html", art.name
         raise ArtifactValidationError(f"unsupported export format: {format}")
@@ -383,8 +436,7 @@ class FakeArtifactService:
                 share_url=f"/p/{existing.publish_id}",
                 reused=True,
             )
-        import secrets as _secrets
-        publish_id = _secrets.token_urlsafe(16)
+        publish_id = secrets.token_urlsafe(16)
         published = _make_published(
             publish_id=publish_id,
             artifact_id=artifact_id,
@@ -393,6 +445,7 @@ class FakeArtifactService:
             mime=art.mime,
             inline_content=art.inline_content or "",
         )
+        published = dc_replace(published, published_revision_id=art.current_revision_id)
         self._active_publishes[artifact_id] = published
         return PublishResult(
             published=published,
@@ -404,7 +457,6 @@ class FakeArtifactService:
     async def revoke_publish(self, artifact_id: str) -> PublishedArtifact:
         active = self._active_publishes.get(artifact_id)
         if active is not None:
-            from dataclasses import replace as dc_replace
             revoked = dc_replace(
                 active,
                 status=PublishedArtifactStatus.REVOKED,
@@ -431,6 +483,295 @@ class FakeArtifactService:
             if pub.publish_id == publish_id:
                 return pub
         raise PublishedArtifactNotFoundError(f"published artifact not found: {publish_id}")
+
+    # -- revisions --
+    def _find_revision(self, artifact_id: str, revision_id: str) -> ArtifactRevision:
+        for rev in self._revisions.get(artifact_id, []):
+            if rev.id == revision_id:
+                return rev
+        raise ArtifactRevisionNotFoundError(f"revision not found: {revision_id}")
+
+    def _derive_sync_state(self, artifact_id: str) -> str:
+        art = self._artifacts.get(artifact_id)
+        if art is None or art.current_revision_id is None:
+            return "unpublished"
+        active = self._active_publishes.get(artifact_id)
+        if active is None or active.published_revision_id is None:
+            return "unpublished"
+        if active.published_revision_id == art.current_revision_id:
+            return "current"
+        return "outdated"
+
+    async def list_revisions(
+        self, artifact_id: str, *, cursor: RevisionListCursor | None = None,
+        limit: int = 50,
+    ) -> RevisionListPage:
+        if artifact_id not in self._artifacts:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        revs = list(self._revisions.get(artifact_id, []))
+        if cursor is not None:
+            idx = next((i for i, r in enumerate(revs) if r.id == cursor.id), None)
+            if idx is not None:
+                revs = revs[idx + 1:]
+        clamped = max(1, min(100, limit))
+        page_items = revs[:clamped]
+        next_cursor = None
+        if len(revs) > clamped:
+            last = page_items[-1]
+            next_cursor = RevisionListCursor(
+                artifact_id=artifact_id,
+                revision_number=last.revision_number,
+                id=last.id,
+            )
+        return RevisionListPage(items=tuple(page_items), next_cursor=next_cursor)
+
+    async def get_revision_content(
+        self, artifact_id: str, revision_id: str | None = None,
+    ) -> tuple[bytes, ArtifactRevision]:
+        if artifact_id not in self._artifacts:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if revision_id is None:
+            art = self._artifacts[artifact_id]
+            if art.current_revision_id is None:
+                raise ArtifactMigrationIncompleteError("no current revision")
+            revision_id = art.current_revision_id
+        rev = self._find_revision(artifact_id, revision_id)
+        data = self._revision_content.get(rev.id)
+        if data is None:
+            raise ArtifactContentUnavailableError(f"content not found for revision: {rev.id}")
+        return data, rev
+
+    async def update_revision(
+        self, artifact_id: str, *, expected_revision_id: str,
+        inline_content: str | None = None, file_data: bytes | None = None,
+        workspace_ref: str | None = None, text_patch: list | None = None,
+        change_summary: str = "", kind: ArtifactKind | None = None,
+        mime: str | None = None,
+    ) -> tuple[ArtifactRevision, UpdateRevisionResult]:
+        if self._raise_on_update_revision is not None:
+            raise self._raise_on_update_revision
+        art = self._artifacts.get(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError("no current revision")
+        if expected_revision_id != art.current_revision_id:
+            raise ArtifactRevisionConflictError("expected_revision_id mismatch")
+        revs = self._revisions.setdefault(artifact_id, [])
+        current = self._find_revision(artifact_id, art.current_revision_id)
+        current_content = self._revision_content.get(current.id, b"")
+        if inline_content is not None:
+            new_data = inline_content.encode("utf-8")
+            new_inline = inline_content
+            new_ref = None
+        elif file_data is not None:
+            new_data = file_data
+            new_inline = None
+            new_ref = f"item:{artifact_id}"
+            self._binary[new_ref] = file_data
+        elif text_patch is not None:
+            text = current_content.decode("utf-8", "replace") if current_content else ""
+            for op in text_patch:
+                search = op.get("search", "")
+                replace_text = op.get("replace", "")
+                mode = op.get("mode", "first")
+                if mode == "all":
+                    text = text.replace(search, replace_text)
+                else:
+                    text = text.replace(search, replace_text, 1)
+            new_data = text.encode("utf-8")
+            new_inline = text
+            new_ref = None
+        elif workspace_ref is not None:
+            new_data = current_content
+            new_inline = None
+            new_ref = workspace_ref
+        else:
+            new_data = current_content
+            new_inline = current.inline_content
+            new_ref = current.content_ref
+        new_size = len(new_data)
+        new_checksum = _sha256(new_data)
+        content_unchanged = new_checksum == current.checksum
+        rev_id = secrets.token_urlsafe(16)
+        rev = ArtifactRevision(
+            id=rev_id,
+            artifact_id=artifact_id,
+            revision_number=len(revs) + 1,
+            parent_revision_id=current.id,
+            rollback_from_revision_id=None,
+            content_ref=new_ref,
+            inline_content=new_inline,
+            size=new_size,
+            checksum=new_checksum,
+            mime=mime or current.mime,
+            kind=kind or current.kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary=change_summary or "",
+            created_by=art.created_by,
+            source_session_id=None,
+            source_run_id=None,
+        )
+        revs.append(rev)
+        self._revision_content[rev_id] = new_data
+        art = dc_replace(
+            art,
+            current_revision_id=rev_id,
+            size=new_size,
+            checksum=new_checksum,
+            inline_content=new_inline,
+            content_ref=new_ref,
+            updated_at=datetime.now(timezone.utc),
+        )
+        self._artifacts[artifact_id] = art
+        result = UpdateRevisionResult(
+            diff_summary=f"v{rev.revision_number}",
+            content_unchanged=content_unchanged,
+            publish_sync_state=self._derive_sync_state(artifact_id),
+        )
+        return rev, result
+
+    async def diff_revisions(
+        self, artifact_id: str, from_id: str, to_id: str, *, context_lines: int = 3,
+    ) -> DiffResult:
+        if self._raise_on_diff is not None:
+            raise self._raise_on_diff
+        if artifact_id not in self._artifacts:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        from_rev = self._find_revision(artifact_id, from_id)
+        to_rev = self._find_revision(artifact_id, to_id)
+        import difflib
+        from_data = self._revision_content.get(from_rev.id, b"")
+        to_data = self._revision_content.get(to_rev.id, b"")
+        diff = difflib.unified_diff(
+            from_data.decode("utf-8", "replace").splitlines(keepends=True),
+            to_data.decode("utf-8", "replace").splitlines(keepends=True),
+            fromfile=from_id,
+            tofile=to_id,
+            n=context_lines,
+        )
+        return DiffResult(diff_text="".join(diff), binary_changed=False)
+
+    async def rollback(
+        self, artifact_id: str, target_revision_id: str, *,
+        expected_revision_id: str, change_summary: str = "",
+    ) -> tuple[ArtifactRevision, UpdateRevisionResult]:
+        if self._raise_on_rollback is not None:
+            raise self._raise_on_rollback
+        art = self._artifacts.get(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError("no current revision")
+        if expected_revision_id != art.current_revision_id:
+            raise ArtifactRevisionConflictError("expected_revision_id mismatch")
+        target = self._find_revision(artifact_id, target_revision_id)
+        revs = self._revisions.setdefault(artifact_id, [])
+        target_content = self._revision_content.get(target.id, b"")
+        rev_id = secrets.token_urlsafe(16)
+        rev = ArtifactRevision(
+            id=rev_id,
+            artifact_id=artifact_id,
+            revision_number=len(revs) + 1,
+            parent_revision_id=art.current_revision_id,
+            rollback_from_revision_id=target.id,
+            content_ref=target.content_ref,
+            inline_content=target.inline_content,
+            size=target.size,
+            checksum=target.checksum,
+            mime=target.mime,
+            kind=target.kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary=change_summary or f"rollback to v{target.revision_number}",
+            created_by=art.created_by,
+            source_session_id=None,
+            source_run_id=None,
+        )
+        revs.append(rev)
+        self._revision_content[rev_id] = target_content
+        art = dc_replace(
+            art,
+            current_revision_id=rev_id,
+            size=target.size,
+            checksum=target.checksum,
+            inline_content=target.inline_content,
+            content_ref=target.content_ref,
+            updated_at=datetime.now(timezone.utc),
+        )
+        self._artifacts[artifact_id] = art
+        result = UpdateRevisionResult(
+            diff_summary=f"rollback to v{target.revision_number}",
+            content_unchanged=False,
+            publish_sync_state=self._derive_sync_state(artifact_id),
+        )
+        return rev, result
+
+    async def get_current_revision(self, artifact_id: str) -> ArtifactRevision:
+        if artifact_id not in self._artifacts:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        art = self._artifacts[artifact_id]
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError("no current revision")
+        return self._find_revision(artifact_id, art.current_revision_id)
+
+    async def get_publish_sync_state(self, artifact_id: str) -> str:
+        if artifact_id not in self._artifacts:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        return self._derive_sync_state(artifact_id)
+
+    async def export_capabilities(
+        self, artifact_id: str, *, revision_id: str | None = None,
+    ) -> tuple[str, ...]:
+        if self._raise_on_export_capabilities is not None:
+            raise self._raise_on_export_capabilities
+        if artifact_id not in self._artifacts:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if revision_id is not None:
+            self._find_revision(artifact_id, revision_id)
+        art = self._artifacts[artifact_id]
+        caps = ["original"]
+        if art.kind in (ArtifactKind.MARKDOWN, ArtifactKind.DOCUMENT):
+            caps.append("html")
+        return tuple(caps)
+
+    async def publish_revision(
+        self, artifact_id: str, *, revision_id: str,
+        expected_current_revision_id: str,
+    ) -> PublishResult:
+        if self._raise_on_publish_revision is not None:
+            raise self._raise_on_publish_revision
+        art = self._artifacts.get(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError("no current revision")
+        if expected_current_revision_id != art.current_revision_id:
+            raise ArtifactRevisionConflictError("expected_current_revision_id mismatch")
+        if revision_id != art.current_revision_id:
+            raise ArtifactRevisionConflictError("revision_id is not the current revision")
+        existing = self._active_publishes.get(artifact_id)
+        if existing is not None and existing.published_revision_id == revision_id:
+            return PublishResult(
+                published=existing,
+                share_url=f"/p/{existing.publish_id}",
+                reused=True,
+            )
+        publish_id = secrets.token_urlsafe(16)
+        published = _make_published(
+            publish_id=publish_id,
+            artifact_id=artifact_id,
+            name=art.name,
+            kind=art.kind,
+            mime=art.mime,
+            inline_content=art.inline_content or "",
+        )
+        published = dc_replace(published, published_revision_id=revision_id)
+        self._active_publishes[artifact_id] = published
+        return PublishResult(
+            published=published,
+            share_url=f"/p/{publish_id}",
+            reused=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +810,49 @@ def _seed_artifacts(service: FakeArtifactService, count: int = 3) -> list[Artifa
         service._artifacts[art.id] = art
         arts.append(art)
     return arts
+
+
+def _seed_revisioned(
+    service: FakeArtifactService,
+    artifact_id: str = "art-1",
+    name: str = "doc.md",
+    kind: ArtifactKind = ArtifactKind.MARKDOWN,
+    mime: str = "text/markdown",
+    inline_content: str = "# Hello",
+    revision_id: str = "rev-1",
+    created_at: datetime | None = None,
+) -> tuple[Artifact, ArtifactRevision]:
+    """Seed an artifact WITH a current revision (for CAS-based content tests)."""
+    if created_at is None:
+        created_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    art = _make_artifact(
+        artifact_id, name=name, kind=kind, mime=mime, inline_content=inline_content,
+        created_at=created_at, updated_at=created_at,
+    )
+    data = inline_content.encode("utf-8")
+    rev = ArtifactRevision(
+        id=revision_id,
+        artifact_id=artifact_id,
+        revision_number=1,
+        parent_revision_id=None,
+        rollback_from_revision_id=None,
+        content_ref=None,
+        inline_content=inline_content,
+        size=len(data),
+        checksum=_sha256(data),
+        mime=mime,
+        kind=kind,
+        created_at=created_at,
+        change_summary="initial",
+        created_by="dashboard",
+        source_session_id=None,
+        source_run_id=None,
+    )
+    art = dc_replace(art, current_revision_id=revision_id)
+    service._artifacts[artifact_id] = art
+    service._revisions[artifact_id] = [rev]
+    service._revision_content[revision_id] = data
+    return art, rev
 
 
 # ---------------------------------------------------------------------------
@@ -953,12 +1337,18 @@ class TestPatchArtifact:
 
     def test_patch_json_replace_content(self):
         service = FakeArtifactService()
-        _seed_artifacts(service, 1)
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
         client = _client(service)
-        response = client.patch("/chat/artifacts/art-1", json={"content": "# New Content"})
+        response = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# New Content", "expected_revision_id": rev.id},
+        )
         assert response.status_code == 200
         data = response.json()
         assert data["size"] == len("# New Content".encode("utf-8"))
+        assert data["revision_number"] == 2
+        assert data["revision_id"] != rev.id
+        assert data["artifact_id"] == "art-1"
 
     def test_patch_forbidden_field_id(self):
         service = FakeArtifactService()
@@ -1005,16 +1395,20 @@ class TestPatchArtifact:
 
     def test_patch_multipart_replace_file(self):
         service = FakeArtifactService()
-        _seed_artifacts(service, 1)
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
         client = _client(service)
         new_content = b"new binary data"
         response = client.patch(
             "/chat/artifacts/art-1",
             files={"file": ("new.txt", io.BytesIO(new_content), "text/plain")},
             data={"name": "updated.md"},
+            headers={"If-Match": f'"{rev.id}"'},
         )
         assert response.status_code == 200
-        assert response.json()["name"] == "updated.md"
+        data = response.json()
+        assert data["name"] == "updated.md"
+        assert data["revision_number"] == 2
+        assert data["revision_id"] != rev.id
 
     def test_patch_unsupported_content_type(self):
         service = FakeArtifactService()
@@ -1423,3 +1817,740 @@ class TestSafeContentDisposition:
     def test_empty_filename_falls_back(self):
         cd = build_content_disposition("", "attachment")
         assert 'filename="artifact"' in cd
+
+
+# ---------------------------------------------------------------------------
+# T9: Revision routes -- list / content / diff / rollback
+# ---------------------------------------------------------------------------
+
+
+def _patch_content(client, artifact_id: str, expected_rev_id: str, content: str) -> dict:
+    """PATCH content with a CAS token; return the write-result dict."""
+    r = client.patch(
+        f"/chat/artifacts/{artifact_id}",
+        json={"content": content, "expected_revision_id": expected_rev_id},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+class TestRevisionsList:
+    def test_list_returns_revisions_with_current_and_published(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
+        # Publish so the published marker is set on rev2.
+        client.post("/chat/artifacts/art-1/publish")
+        r = client.get("/chat/artifacts/art-1/revisions")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["count"] == 2
+        items = data["items"]
+        # Ordered oldest -> newest: rev1, rev2.
+        assert items[0]["revision_number"] == 1
+        assert items[0]["is_current"] is False
+        assert items[0]["is_published"] is False
+        assert items[1]["revision_number"] == 2
+        assert items[1]["is_current"] is True
+        assert items[1]["is_published"] is True
+        assert data["next_cursor"] is None
+
+    def test_list_cursor_pagination(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
+        rev3 = _patch_content(client, "art-1", rev2["revision_id"], "# v3")
+        r = client.get("/chat/artifacts/art-1/revisions?limit=2")
+        assert r.status_code == 200
+        page1 = r.json()
+        assert page1["count"] == 2
+        assert page1["items"][0]["revision_number"] == 1
+        assert page1["items"][1]["revision_number"] == 2
+        assert page1["next_cursor"] is not None
+        # Cursor is bound to artifact_id.
+        assert page1["next_cursor"]["artifact_id"] == "art-1"
+        cursor_str = json.dumps(page1["next_cursor"])
+        r2 = client.get(f"/chat/artifacts/art-1/revisions?limit=2&cursor={quote(cursor_str)}")
+        assert r2.status_code == 200
+        page2 = r2.json()
+        assert page2["count"] == 1
+        assert page2["items"][0]["revision_number"] == 3
+        assert page2["next_cursor"] is None
+
+    def test_list_bad_cursor_returns_revision_invalid(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/revisions?cursor=not-json")
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_list_cross_artifact_cursor_returns_revision_invalid(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, artifact_id="art-1", revision_id="rev-1")
+        _seed_revisioned(service, artifact_id="art-2", revision_id="rev-2")
+        client = _client(service)
+        # Cursor carries art-1's revision id; querying art-2 must reject it.
+        cursor = json.dumps({"artifact_id": "art-1", "revision_number": 1, "id": "rev-1"})
+        r = client.get(f"/chat/artifacts/art-2/revisions?cursor={quote(cursor)}")
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_list_artifact_not_found(self):
+        service = FakeArtifactService()
+        client = _client(service)
+        r = client.get("/chat/artifacts/nope/revisions")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_not_found"
+
+    def test_list_limit_clamped_to_max_100(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/revisions?limit=9999")
+        assert r.status_code == 200
+
+
+class TestRevisionContent:
+    def test_get_revision_content_returns_bytes(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.get(f"/chat/artifacts/art-1/revisions/{rev.id}/content")
+        assert r.status_code == 200
+        assert r.content == b"# Hello"
+        assert "text/markdown" in r.headers.get("content-type", "")
+        assert r.headers.get("x-content-type-options") == "nosniff"
+
+    def test_get_revision_content_cross_artifact_is_not_found(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, artifact_id="art-1", revision_id="rev-1")
+        _seed_revisioned(service, artifact_id="art-2", revision_id="rev-2")
+        client = _client(service)
+        # rev-2 belongs to art-2; querying via art-1 must not leak.
+        r = client.get("/chat/artifacts/art-1/revisions/rev-2/content")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_revision_not_found"
+
+    def test_get_revision_content_unknown_revision(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/revisions/unknown/content")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_revision_not_found"
+
+    def test_get_revision_content_artifact_not_found(self):
+        service = FakeArtifactService()
+        client = _client(service)
+        r = client.get("/chat/artifacts/nope/revisions/rev-1/content")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_not_found"
+
+
+class TestDiffRoute:
+    def test_diff_returns_text(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1\nline a")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v1\nline b")
+        r = client.post("/chat/artifacts/art-1/diff", json={
+            "from_revision_id": rev1.id, "to_revision_id": rev2["revision_id"],
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert "diff_text" in data
+        assert data["binary_changed"] is False
+        assert "line a" in data["diff_text"]
+        assert "line b" in data["diff_text"]
+
+    def test_diff_missing_from_revision_id(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/diff", json={"to_revision_id": "rev-1"})
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_invalid"
+
+    def test_diff_missing_to_revision_id(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/diff", json={"from_revision_id": "rev-1"})
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_invalid"
+
+    def test_diff_context_lines_clamped(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/diff", json={
+            "from_revision_id": "rev-1", "to_revision_id": "rev-1", "context_lines": 9999,
+        })
+        assert r.status_code == 200
+
+    def test_diff_cross_artifact_revision_not_found(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, artifact_id="art-1", revision_id="rev-1")
+        _seed_revisioned(service, artifact_id="art-2", revision_id="rev-2")
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/diff", json={
+            "from_revision_id": "rev-1", "to_revision_id": "rev-2",
+        })
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_revision_not_found"
+
+
+class TestRollbackRoute:
+    def test_rollback_creates_new_version_from_target(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
+        r = client.post("/chat/artifacts/art-1/rollback", json={
+            "target_revision_id": rev1.id,
+            "expected_revision_id": rev2["revision_id"],
+            "change_summary": "revert to v1",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["revision_number"] == 3
+        assert data["artifact_id"] == "art-1"
+        # Content is back to v1.
+        content = client.get(f"/chat/artifacts/art-1/revisions/{data['revision_id']}/content")
+        assert content.content == b"# v1"
+
+    def test_rollback_conflict_on_stale_expected(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
+        # Stale expected_revision_id (rev1, but current is rev2).
+        r = client.post("/chat/artifacts/art-1/rollback", json={
+            "target_revision_id": rev1.id, "expected_revision_id": rev1.id,
+        })
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "artifact_revision_conflict"
+
+    def test_rollback_missing_target(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/rollback", json={
+            "expected_revision_id": "rev-1",
+        })
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_invalid"
+
+    def test_rollback_target_belongs_to_other_artifact(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, artifact_id="art-1", revision_id="rev-1")
+        _seed_revisioned(service, artifact_id="art-2", revision_id="rev-2")
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/rollback", json={
+            "target_revision_id": "rev-2", "expected_revision_id": "rev-1",
+        })
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_revision_not_found"
+
+
+# ---------------------------------------------------------------------------
+# T9: PATCH content CAS (expected_revision_id / If-Match)
+# ---------------------------------------------------------------------------
+
+
+class TestPatchContentCAS:
+    def test_patch_content_with_if_match_header(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Via If-Match"},
+            headers={"If-Match": f'"{rev.id}"'},
+        )
+        assert r.status_code == 200
+        assert r.json()["revision_number"] == 2
+
+    def test_patch_content_both_tokens_agree(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Both", "expected_revision_id": rev.id},
+            headers={"If-Match": f'"{rev.id}"'},
+        )
+        assert r.status_code == 200
+        assert r.json()["revision_number"] == 2
+
+    def test_patch_content_both_tokens_disagree_is_revision_invalid(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Disagree", "expected_revision_id": "rev-1"},
+            headers={"If-Match": '"other-rev"'},
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_patch_content_no_token_is_conflict(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch("/chat/artifacts/art-1", json={"content": "# No token"})
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "artifact_revision_conflict"
+
+    def test_patch_content_stale_expected_is_conflict(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        _patch_content(client, "art-1", rev1.id, "# v2")  # current is now rev2
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Stale", "expected_revision_id": rev1.id},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "artifact_revision_conflict"
+
+    def test_patch_content_if_match_weak_etag_rejected(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Weak"},
+            headers={"If-Match": f'W/"{rev.id}"'},
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_patch_content_if_match_wildcard_rejected(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Wildcard"},
+            headers={"If-Match": "*"},
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_patch_content_if_match_multiple_etags_rejected(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Multi"},
+            headers={"If-Match": f'"{rev.id}", "other"'},
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_patch_content_if_match_unquoted_rejected(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# Unquoted"},
+            headers={"If-Match": rev.id},
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_patch_metadata_only_requires_no_token(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch("/chat/artifacts/art-1", json={"name": "renamed.md"})
+        assert r.status_code == 200
+        assert r.json()["name"] == "renamed.md"
+
+    def test_patch_content_metadata_and_content_together(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={
+                "name": "renamed.md", "content": "# New",
+                "expected_revision_id": rev.id,
+            },
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert data["name"] == "renamed.md"
+        assert data["revision_number"] == 2
+        assert data["size"] == len(b"# New")
+
+    def test_patch_content_stale_token_leaves_metadata_untouched(self):
+        """M1: a stale CAS token must NOT apply metadata (no partial commit)."""
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1", name="doc.md")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")  # current -> rev2
+        # Stale token (rev1) + metadata rename -> 409, name unchanged.
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"name": "renamed.md", "content": "# v3", "expected_revision_id": rev1.id},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "artifact_revision_conflict"
+        # Metadata was NOT applied.
+        detail = client.get("/chat/artifacts/art-1").json()
+        assert detail["name"] == "doc.md"
+
+    def test_patch_content_empty_string_token_is_revision_invalid(self):
+        """m1: an empty-string expected_revision_id is invalid (422), not 409."""
+        service = FakeArtifactService()
+        _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            json={"content": "# X", "expected_revision_id": ""},
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_revision_invalid"
+
+    def test_patch_multipart_content_form_field_rejected(self):
+        """C1: a multipart 'content' form field must be rejected (content=file)."""
+        service = FakeArtifactService()
+        _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        # Real multipart (a file is present so the body is multipart), but
+        # 'content' is also sent as a form field -- it must be rejected before
+        # any file/CAS processing.
+        r = client.patch(
+            "/chat/artifacts/art-1",
+            files={"file": ("x.txt", io.BytesIO(b"data"), "text/plain")},
+            data={"content": "# hacked"},
+        )
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_invalid"
+        # Content was NOT changed (no CAS, no revision created).
+        r2 = client.get("/chat/artifacts/art-1/revisions")
+        assert r2.json()["count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# T9: Export capabilities + revision-pinned export
+# ---------------------------------------------------------------------------
+
+
+class TestExportCapabilities:
+    def test_capabilities_for_markdown(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, kind=ArtifactKind.MARKDOWN)
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/export/capabilities")
+        assert r.status_code == 200
+        data = r.json()
+        assert "original" in data["capabilities"]
+        assert "html" in data["capabilities"]
+
+    def test_capabilities_for_code_excludes_html(self):
+        service = FakeArtifactService()
+        _seed_revisioned(
+            service, kind=ArtifactKind.CODE, mime="text/x-python",
+            inline_content="print(1)",
+        )
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/export/capabilities")
+        assert r.status_code == 200
+        caps = r.json()["capabilities"]
+        assert "original" in caps
+        assert "html" not in caps
+
+    def test_capabilities_with_revision_id(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.get(f"/chat/artifacts/art-1/export/capabilities?revision_id={rev.id}")
+        assert r.status_code == 200
+        assert r.json()["revision_id"] == rev.id
+
+    def test_capabilities_cross_artifact_revision_not_found(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, artifact_id="art-1", revision_id="rev-1")
+        _seed_revisioned(service, artifact_id="art-2", revision_id="rev-2")
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/export/capabilities?revision_id=rev-2")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_revision_not_found"
+
+
+class TestExportWithRevision:
+    def test_export_specific_revision(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
+        # Export the old revision (rev1) -- content must be v1, not the current v2.
+        r = client.get(f"/chat/artifacts/art-1/export?revision_id={rev1.id}")
+        assert r.status_code == 200
+        assert r.content == b"# v1"
+
+    def test_export_cross_artifact_revision_not_found(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service, artifact_id="art-1", revision_id="rev-1")
+        _seed_revisioned(service, artifact_id="art-2", revision_id="rev-2")
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/export?revision_id=rev-2")
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "artifact_revision_not_found"
+
+
+# ---------------------------------------------------------------------------
+# T9: Publish with body (revision_id + expected_current_revision_id)
+# ---------------------------------------------------------------------------
+
+
+class TestPublishBody:
+    def test_publish_with_body_publishes_current_revision(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/publish", json={
+            "revision_id": rev.id, "expected_current_revision_id": rev.id,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["reused"] is False
+        assert data["published_revision_id"] == rev.id
+
+    def test_publish_with_body_stale_current_is_conflict(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
+        # Body claims current is rev1, but it is now rev2.
+        r = client.post("/chat/artifacts/art-1/publish", json={
+            "revision_id": rev2["revision_id"],
+            "expected_current_revision_id": rev1.id,
+        })
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "artifact_revision_conflict"
+
+    def test_publish_with_body_revision_not_current_is_conflict(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "# v2")
+        # Trying to publish rev1 (not current) -> conflict.
+        r = client.post("/chat/artifacts/art-1/publish", json={
+            "revision_id": rev1.id,
+            "expected_current_revision_id": rev2["revision_id"],
+        })
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "artifact_revision_conflict"
+
+    def test_publish_with_body_missing_expected_current(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/publish", json={"revision_id": rev.id})
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_invalid"
+
+    def test_publish_legacy_no_body_publishes_current(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/publish")
+        assert r.status_code == 200
+        assert r.json()["published_revision_id"] == rev.id
+
+    def test_publish_idempotent_with_body_reuses(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        body = {"revision_id": rev.id, "expected_current_revision_id": rev.id}
+        r1 = client.post("/chat/artifacts/art-1/publish", json=body)
+        assert r1.status_code == 200
+        assert r1.json()["reused"] is False
+        r2 = client.post("/chat/artifacts/art-1/publish", json=body)
+        assert r2.status_code == 200
+        assert r2.json()["reused"] is True
+        assert r1.json()["publish_id"] == r2.json()["publish_id"]
+
+
+# ---------------------------------------------------------------------------
+# T9: Artifact view enrichment (current_revision_id / revision_number / state)
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactViewEnrichment:
+    def test_detail_includes_revision_fields(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["current_revision_id"] == rev.id
+        assert data["revision_number"] == 1
+        assert data["publish_sync_state"] == "unpublished"
+        # content_ref stays hidden.
+        assert "content_ref" not in data
+        assert "inline_content" not in data
+
+    def test_detail_publish_sync_state_after_publish(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        client.post("/chat/artifacts/art-1/publish")
+        r = client.get("/chat/artifacts/art-1")
+        assert r.json()["publish_sync_state"] == "current"
+
+    def test_detail_publish_sync_state_outdated_after_edit(self):
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="# v1")
+        client = _client(service)
+        client.post("/chat/artifacts/art-1/publish")  # publishes rev1
+        _patch_content(client, "art-1", rev1.id, "# v2")  # current -> rev2
+        r = client.get("/chat/artifacts/art-1")
+        assert r.json()["publish_sync_state"] == "outdated"
+
+    def test_list_includes_revision_fields(self):
+        service = FakeArtifactService()
+        art, rev = _seed_revisioned(service, inline_content="# Hello")
+        client = _client(service)
+        r = client.get("/chat/artifacts")
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert items[0]["current_revision_id"] == rev.id
+        assert items[0]["revision_number"] == 1
+
+    def test_create_response_includes_revision_fields(self):
+        service = FakeArtifactService()
+        client = _client(service)
+        r = client.post("/chat/artifacts", json={
+            "name": "doc.md", "kind": "markdown", "content": "# Hello",
+        })
+        assert r.status_code == 201
+        data = r.json()
+        assert data["current_revision_id"] is not None
+        assert data["revision_number"] == 1
+        assert data["publish_sync_state"] == "unpublished"
+
+
+# ---------------------------------------------------------------------------
+# T9: Error-code mapping (10 new codes via _exception_to_response)
+# ---------------------------------------------------------------------------
+
+
+class TestRevisionErrorMapping:
+    @pytest.mark.parametrize(
+        "exc_cls,code,status",
+        [
+            (ArtifactRevisionNotFoundError, "artifact_revision_not_found", 404),
+            (ArtifactRevisionConflictError, "artifact_revision_conflict", 409),
+            (ArtifactRevisionValidationError, "artifact_revision_invalid", 422),
+            (ArtifactReadTooLargeError, "artifact_read_too_large", 413),
+            (ArtifactDiffTooLargeError, "artifact_diff_too_large", 413),
+            (ArtifactDiffUnsupportedError, "artifact_diff_unsupported", 422),
+            (ArtifactExportUnsupportedError, "artifact_export_unsupported", 422),
+            (ArtifactExportTooLargeError, "artifact_export_too_large", 413),
+            (ArtifactMigrationIncompleteError, "artifact_migration_incomplete", 503),
+        ],
+    )
+    def test_exception_maps_to_code(self, exc_cls, code, status):
+        from app.interfaces.http.artifact_routes import _exception_to_response
+        resp = _exception_to_response(exc_cls("detail"))
+        assert resp.status_code == status
+        body = json.loads(resp.body)
+        assert body["error"]["code"] == code
+
+    def test_export_error_maps_to_failed_with_generic_message(self):
+        from app.interfaces.http.artifact_routes import _exception_to_response
+        resp = _exception_to_response(ArtifactExportError("python-docx: /tmp/secret.docx"))
+        assert resp.status_code == 500
+        body = json.loads(resp.body)
+        assert body["error"]["code"] == "artifact_export_failed"
+        # Generic message; no library internals / abs paths leak.
+        assert body["error"]["message"] == "export failed"
+
+    def test_revision_validation_takes_precedence_over_validation(self):
+        from app.interfaces.http.artifact_routes import _exception_to_response
+        # ArtifactRevisionValidationError is a subclass of ArtifactValidationError;
+        # it must map to artifact_revision_invalid, not artifact_invalid.
+        resp = _exception_to_response(ArtifactRevisionValidationError("bad"))
+        body = json.loads(resp.body)
+        assert body["error"]["code"] == "artifact_revision_invalid"
+        # The parent still maps to artifact_invalid.
+        resp2 = _exception_to_response(ArtifactValidationError("bad"))
+        body2 = json.loads(resp2.body)
+        assert body2["error"]["code"] == "artifact_invalid"
+
+    def test_export_subclasses_take_precedence_over_export_error(self):
+        from app.interfaces.http.artifact_routes import _exception_to_response
+        for sub_cls, code in [
+            (ArtifactExportUnsupportedError, "artifact_export_unsupported"),
+            (ArtifactExportTooLargeError, "artifact_export_too_large"),
+        ]:
+            resp = _exception_to_response(sub_cls("x"))
+            body = json.loads(resp.body)
+            assert body["error"]["code"] == code
+
+    def test_diff_route_maps_diff_unsupported(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        service._raise_on_diff = ArtifactDiffUnsupportedError("binary diff unsupported")
+        client = _client(service)
+        r = client.post("/chat/artifacts/art-1/diff", json={
+            "from_revision_id": "rev-1", "to_revision_id": "rev-1",
+        })
+        assert r.status_code == 422
+        assert r.json()["error"]["code"] == "artifact_diff_unsupported"
+
+    def test_capabilities_route_maps_export_failed(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        service._raise_on_export_capabilities = ArtifactExportError("boom")
+        client = _client(service)
+        r = client.get("/chat/artifacts/art-1/export/capabilities")
+        assert r.status_code == 500
+        assert r.json()["error"]["code"] == "artifact_export_failed"
+
+    def test_patch_content_maps_migration_incomplete(self):
+        service = FakeArtifactService()
+        _seed_revisioned(service)
+        service._raise_on_update_revision = ArtifactMigrationIncompleteError("no revision")
+        client = _client(service)
+        r = client.patch("/chat/artifacts/art-1", json={
+            "content": "# X", "expected_revision_id": "rev-1",
+        })
+        assert r.status_code == 503
+        assert r.json()["error"]["code"] == "artifact_migration_incomplete"
+
+
+# ---------------------------------------------------------------------------
+# T9: diff safe rendering helper (Content-Disposition / no innerHTML contract)
+# ---------------------------------------------------------------------------
+
+
+class TestDiffSafeRendering:
+    def test_diff_text_is_plain_text_not_html(self):
+        """diff_text is returned as a JSON string; the Dashboard renders it in
+        a <pre>/text node, never via innerHTML (spec line 207)."""
+        service = FakeArtifactService()
+        art, rev1 = _seed_revisioned(service, inline_content="<script>alert(1)</script>")
+        client = _client(service)
+        rev2 = _patch_content(client, "art-1", rev1.id, "<script>alert(2)</script>")
+        r = client.post("/chat/artifacts/art-1/diff", json={
+            "from_revision_id": rev1.id, "to_revision_id": rev2["revision_id"],
+        })
+        assert r.status_code == 200
+        # The response is JSON: diff_text is a plain string value, not HTML.
+        assert r.headers["content-type"].startswith("application/json")
+        data = r.json()
+        assert "<script>alert(1)</script>" in data["diff_text"]
+        assert "<script>alert(2)</script>" in data["diff_text"]

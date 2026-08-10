@@ -51,7 +51,9 @@ def assert_decision(
     [
         (definition(enabled=False), ToolExposurePolicy.DEFAULT, False),
         (definition(enabled=False), ToolExposurePolicy.SAFE_ONLY, False),
-        (definition(risk=RiskLevel.DANGEROUS), ToolExposurePolicy.DEFAULT, False),
+        # DANGEROUS is exposed in DEFAULT (realtime) so the model can call it;
+        # execution routes through the approval card. It is hidden in SAFE_ONLY.
+        (definition(risk=RiskLevel.DANGEROUS), ToolExposurePolicy.DEFAULT, True),
         (definition(risk=RiskLevel.DANGEROUS), ToolExposurePolicy.SAFE_ONLY, False),
         (definition(risk=RiskLevel.CONFIRM), ToolExposurePolicy.DEFAULT, True),
         (definition(risk=RiskLevel.CONFIRM), ToolExposurePolicy.SAFE_ONLY, False),
@@ -149,14 +151,24 @@ def test_tool_policy_implements_shared_policy_contract_and_request_is_frozen():
             PolicyOutcome.DENY,
             "tool_disabled",
         ),
+        # DANGEROUS honors an explicit session grant (host-approved for the
+        # session), routing through the same approval channel as CONFIRM; the
+        # distinct reason only surfaces when no grant is present.
         (
             definition(risk=RiskLevel.DANGEROUS),
             ToolExecutionContext(
                 allowed_confirm_tools={"tool": "session"},
                 permitted_managed_tools={"tool"},
             ),
-            PolicyOutcome.DENY,
-            "dangerous_tool",
+            PolicyOutcome.ALLOW,
+            "session_grant",
+        ),
+        # DANGEROUS without any grant requires approval (distinct reason).
+        (
+            definition(risk=RiskLevel.DANGEROUS),
+            None,
+            PolicyOutcome.REQUIRE_APPROVAL,
+            "dangerous_approval_required",
         ),
         (definition(risk=RiskLevel.SAFE), None, PolicyOutcome.ALLOW, "safe_tool"),
         (
@@ -378,13 +390,53 @@ def test_authorize_once_accepts_missing_context_as_empty_context():
     assert authorized.permitted_managed_tools == set()
 
 
+def test_authorize_once_supports_dangerous_tool():
+    """DANGEROUS tools route through the same approval channel as CONFIRM:
+    after the decider approves, authorize_once grants the call so execute
+    can proceed (spec: DANGEROUS 审批通过后执行)."""
+    dangerous = definition(risk=RiskLevel.DANGEROUS, name="artifact_publish")
+    authorized = ToolPolicy().authorize_once(
+        dangerous, request(name="artifact_publish", arguments={"artifact_id": "a1"}), None,
+    )
+    assert authorized.allowed_confirm_tools == {
+        "artifact_publish": {"artifact_id": "a1"},
+    }
+
+
+def test_realtime_only_hidden_in_safe_only_even_when_granted():
+    """A realtime_only tool is never exposed in SAFE_ONLY (unattended/cron),
+    even when explicitly listed in granted_tools -- prevents recursion or
+    bypassing approval (spec: SAFE_ONLY grant 不得放开 artifact_*)."""
+    policy = ToolPolicy()
+    rt = definition(
+        risk=RiskLevel.SAFE, source=ToolSourceType.AGENT, name="artifact_read",
+    )
+    rt = ToolDefinition(
+        name=rt.name, description=rt.description, input_schema=rt.input_schema,
+        risk_level=rt.risk_level, source_type=rt.source_type,
+        toolset="artifact", managed=False, realtime_only=True,
+    )
+    # DEFAULT (realtime): visible
+    assert policy.can_expose(rt, ToolExposurePolicy.DEFAULT) is True
+    # SAFE_ONLY: hidden even when granted the same name
+    assert (
+        policy.can_expose(
+            rt, ToolExposurePolicy.SAFE_ONLY, granted_tools=frozenset({"artifact_read"}),
+        )
+        is False
+    )
+    assert (
+        policy.can_expose(rt, ToolExposurePolicy.SAFE_ONLY, granted_tools=frozenset())
+        is False
+    )
+
+
 @pytest.mark.parametrize(
     ("tool_definition", "call", "context"),
     [
         (definition(name="definition"), request(name="request"), None),
         (definition(enabled=False), request(), None),
         (definition(risk=RiskLevel.SAFE), request(), None),
-        (definition(risk=RiskLevel.DANGEROUS), request(), None),
         (definition(risk="unknown"), request(), None),  # type: ignore[arg-type]
         (
             definition(),

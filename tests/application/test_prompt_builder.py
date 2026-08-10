@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from app.application.prompt_builder import BROWSER_GUIDANCE, MANAGED_TOOL_GUIDANCE, SKILL_GUIDANCE, build_system_prompt
+from app.application.prompt_builder import (
+    ARTIFACT_GUIDANCE,
+    BROWSER_GUIDANCE,
+    MANAGED_TOOL_GUIDANCE,
+    SKILL_GUIDANCE,
+    TASK_GUIDANCE,
+    build_system_prompt,
+)
 
 
 def test_managed_tool_guidance_routes_to_skill_view():
@@ -275,3 +282,53 @@ def test_browser_guidance_placed_before_safety():
     browser_idx = prompt.index("## Browser Guidance")
     safety_idx = prompt.index("## Safety")
     assert browser_idx < safety_idx
+
+
+# ---------------------------------------------------------------------------
+# T11: Artifact Guidance
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_guidance_omitted_by_default():
+    """No artifact_guidance arg -> no Artifact Guidance section in the prompt."""
+    prompt = build_system_prompt()
+    assert "## Artifact Guidance" not in prompt
+    assert ARTIFACT_GUIDANCE not in prompt
+
+
+def test_artifact_guidance_included_when_provided():
+    """artifact_guidance non-empty -> dedicated Artifact Guidance section."""
+    prompt = build_system_prompt(artifact_guidance=ARTIFACT_GUIDANCE)
+    assert "## Artifact Guidance" in prompt
+    assert ARTIFACT_GUIDANCE in prompt
+    # appears exactly once (no duplication)
+    assert prompt.count("## Artifact Guidance") == 1
+    assert prompt.count(ARTIFACT_GUIDANCE) == 1
+
+
+def test_artifact_guidance_coexists_with_task_guidance():
+    """Artifact Guidance and Task Guidance both present and not duplicated."""
+    prompt = build_system_prompt(artifact_guidance=ARTIFACT_GUIDANCE)
+    assert "## Task Guidance" in prompt
+    assert TASK_GUIDANCE in prompt
+    assert "## Artifact Guidance" in prompt
+    assert ARTIFACT_GUIDANCE in prompt
+    # each guidance body appears exactly once
+    assert prompt.count(TASK_GUIDANCE) == 1
+    assert prompt.count(ARTIFACT_GUIDANCE) == 1
+
+
+def test_artifact_guidance_coexists_with_browser_guidance():
+    """Both dynamic guidance blocks (Browser + Artifact) render together."""
+    prompt = build_system_prompt(
+        browser_guidance=BROWSER_GUIDANCE,
+        artifact_guidance=ARTIFACT_GUIDANCE,
+    )
+    assert "## Browser Guidance" in prompt
+    assert "## Artifact Guidance" in prompt
+
+
+def test_artifact_guidance_empty_string_omitted():
+    """Empty-string artifact_guidance is treated as absent (no empty section)."""
+    prompt = build_system_prompt(artifact_guidance="")
+    assert "## Artifact Guidance" not in prompt

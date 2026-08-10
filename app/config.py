@@ -235,6 +235,15 @@ class Settings(BaseSettings):
     artifact_publish_max_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     artifact_inline_max_bytes: int = Field(default=256 * 1024, gt=0)
     published_base_url: str = Field(default="")
+    # Artifact revision/export limits (T11): frozen snapshots are constructed
+    # from these in the composition root (ArtifactServiceConfig /
+    # ArtifactExporterConfig); the Application layer never reads Settings.
+    # gt=0 rejects non-positive values at construction time.
+    artifact_read_max_bytes: int = Field(default=64 * 1024, gt=0)
+    artifact_diff_max_bytes: int = Field(default=1 * 1024 * 1024, gt=0)
+    artifact_diff_max_lines: int = Field(default=20000, gt=0)
+    artifact_diff_max_output_chars: int = Field(default=200000, gt=0)
+    artifact_export_max_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 

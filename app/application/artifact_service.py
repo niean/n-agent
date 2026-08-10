@@ -20,6 +20,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from difflib import unified_diff
 
 from app.application.information_flow_service import InformationFlowService, ReleaseResult
 from app.application.policy_audit_service import PolicyAuditService
@@ -27,20 +28,35 @@ from app.domain.artifact import (
     Artifact,
     ArtifactAttachmentSource,
     ArtifactContentUnavailableError,
+    ArtifactDeleteGraph,
+    ArtifactDiffTooLargeError,
+    ArtifactDiffUnsupportedError,
     ArtifactError,
+    ArtifactExportError,
+    ArtifactExportTooLargeError,
+    ArtifactExportUnsupportedError,
     ArtifactKind,
     ArtifactListCursor,
     ArtifactListPage,
+    ArtifactMigrationIncompleteError,
     ArtifactNotFoundError,
     ArtifactRegistry,
     ArtifactContentStore,
+    ArtifactRevision,
+    ArtifactRevisionConflictError,
+    ArtifactRevisionNotFoundError,
+    ArtifactRevisionValidationError,
     ArtifactSource,
     ArtifactStatus,
     ArtifactValidationError,
     PublishedArtifact,
     PublishedArtifactNotFoundError,
     PublishedArtifactStatus,
+    RevisionListCursor,
+    RevisionListPage,
 )
+from app.domain.artifact_exporter import ArtifactExporter, ContentProfile
+from app.application.artifact_content_profile import probe_content_profile
 from app.domain.artifact_policy import (
     ArtifactPolicy,
     ArtifactPolicyAction,
@@ -77,6 +93,14 @@ class ArtifactServiceConfig:
     artifact_publish_max_bytes: int = 10 * 1024 * 1024
     artifact_inline_max_bytes: int = 256 * 1024
     published_base_url: str = ""
+    # Diff limits (T5): per-input byte/line caps and total output cap.
+    diff_max_bytes: int = 1 * 1024 * 1024
+    diff_max_lines: int = 20000
+    diff_max_output_chars: int = 200000
+    # artifact_read tool: max bytes returned per call (default 64 KiB).
+    # Only complete UTF-8 lines are returned; a single line exceeding this
+    # limit raises artifact_read_too_large (413) rather than a half line.
+    artifact_read_max_bytes: int = 64 * 1024
 
 
 class ArtifactTooLargeError(ArtifactError):
@@ -100,6 +124,40 @@ class PublishResult:
     published: PublishedArtifact
     share_url: str
     reused: bool
+
+
+@dataclass(frozen=True)
+class UpdateRevisionResult:
+    """Result of an update_revision / rollback call.
+
+    Attributes:
+        diff_summary: short human-readable summary of the content change.
+        content_unchanged: True when the new revision checksum equals the
+            parent revision checksum (no effective content change).
+        publish_sync_state: derived publish synchronization state --
+            ``unpublished`` (no active publish), ``current`` (active publish
+            points at this revision), or ``outdated`` (active publish points
+            at a different revision).
+    """
+
+    diff_summary: str
+    content_unchanged: bool
+    publish_sync_state: str
+
+
+@dataclass(frozen=True)
+class DiffResult:
+    """Result of a diff_revisions call.
+
+    Attributes:
+        diff_text: unified diff text for text-kind revision pairs (empty
+            for binary pairs or when there is no textual diff).
+        binary_changed: True when both revisions are binary kind and their
+            content (checksum/size/mime) differs.
+    """
+
+    diff_text: str
+    binary_changed: bool
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +249,28 @@ def _generate_publish_id() -> str:
     return secrets.token_urlsafe(16)
 
 
+def _generate_revision_id() -> str:
+    """Generate a high-entropy revision id (>=128-bit, URL-safe, no padding)."""
+    return secrets.token_urlsafe(16)
+
+
 def _is_text_kind(kind: ArtifactKind) -> bool:
     return kind in _TEXT_KINDS
+
+
+def _ensure_nonempty_mime(mime: str, kind: ArtifactKind) -> str:
+    """Return ``mime`` when non-empty, else a sensible default for ``kind``.
+
+    ArtifactRevision requires a non-empty mime; sources that carry no
+    content_type (unknown extension) would otherwise produce an invalid
+    revision.  Text kinds default to ``text/plain``; binary kinds default
+    to ``application/octet-stream``.
+    """
+    if mime:
+        return mime
+    if _is_text_kind(kind):
+        return "text/plain"
+    return "application/octet-stream"
 
 
 def _is_owned_ref(content_ref: str | None) -> bool:
@@ -205,6 +283,83 @@ def _is_source_ref(content_ref: str | None) -> bool:
     if content_ref is None:
         return False
     return content_ref.startswith("attachment:") or content_ref.startswith("workspace:")
+
+
+# ---------------------------------------------------------------------------
+# Text-patch helpers (used by update_revision text_patch mode)
+# ---------------------------------------------------------------------------
+
+_PATCH_MODES = frozenset({"first", "all"})
+
+
+def _validate_text_patch(patch: list[dict[str, object]]) -> None:
+    """Validate a text_patch structure.
+
+    Each item must be a dict with exactly {search, replace, mode}; search
+    must be a non-empty string, replace a string, mode one of first/all.
+    The list must have 1..100 items.  Raises ArtifactRevisionValidationError
+    on any violation (no partial application -- validation runs before any
+    content mutation).
+    """
+    if not isinstance(patch, list):
+        raise ArtifactRevisionValidationError("text_patch must be a list")
+    if len(patch) < 1 or len(patch) > 100:
+        raise ArtifactRevisionValidationError(
+            f"text_patch must have 1..100 items, got {len(patch)}"
+        )
+    for i, item in enumerate(patch):
+        if not isinstance(item, dict):
+            raise ArtifactRevisionValidationError(
+                f"text_patch[{i}] must be a dict"
+            )
+        keys = set(item.keys())
+        if keys != {"search", "replace", "mode"}:
+            raise ArtifactRevisionValidationError(
+                f"text_patch[{i}] must have exactly "
+                f"search/replace/mode, got {sorted(keys)}"
+            )
+        search = item["search"]
+        replace = item["replace"]
+        mode = item["mode"]
+        if not isinstance(search, str) or search == "":
+            raise ArtifactRevisionValidationError(
+                f"text_patch[{i}].search must be a non-empty string"
+            )
+        if not isinstance(replace, str):
+            raise ArtifactRevisionValidationError(
+                f"text_patch[{i}].replace must be a string"
+            )
+        if mode not in _PATCH_MODES:
+            raise ArtifactRevisionValidationError(
+                f"text_patch[{i}].mode must be 'first' or 'all', got {mode!r}"
+            )
+
+
+def _apply_text_patch(text: str, patch: list[dict[str, object]]) -> str:
+    """Apply a validated text_patch to ``text`` in order.
+
+    ``first`` replaces the first occurrence; ``all`` replaces every
+    occurrence.  Any unmatched search raises ArtifactRevisionValidationError
+    (the caller has not persisted anything yet, so this is atomic).
+    """
+    for item in patch:
+        search: str = item["search"]
+        replace: str = item["replace"]
+        mode: str = item["mode"]
+        if mode == "first":
+            idx = text.find(search)
+            if idx == -1:
+                raise ArtifactRevisionValidationError(
+                    f"patch search not found (first): {search!r}"
+                )
+            text = text[:idx] + replace + text[idx + len(search):]
+        else:  # mode == "all"
+            if search not in text:
+                raise ArtifactRevisionValidationError(
+                    f"patch search not found (all): {search!r}"
+                )
+            text = text.replace(search, replace)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +386,7 @@ class ArtifactService:
         task_session_resolver: Callable[[str], Awaitable[str | None]] | None = None,
         task_exists: Callable[[str], Awaitable[bool]] | None = None,
         task_attachment_delete: Callable[[str], Awaitable[bool]] | None = None,
+        exporter: ArtifactExporter | None = None,
     ) -> None:
         self._registry = registry
         self._content_store = content_store
@@ -242,6 +398,17 @@ class ArtifactService:
         self._task_session_resolver = task_session_resolver
         self._task_exists_callback = task_exists
         self._task_attachment_delete_callback = task_attachment_delete
+        self._exporter = exporter
+        # Migration state cache (updated by migrate_revisions, read by
+        # migration_status for health_snapshot).
+        self._migration_state: str = "ok"
+        self._migration_failed_count: int = 0
+        self._migration_last_error: str | None = None
+
+    @property
+    def config(self) -> ArtifactServiceConfig:
+        """Read-only access to the immutable config snapshot."""
+        return self._config
 
     def set_task_session_resolver(
         self, resolver: Callable[[str], Awaitable[str | None]],
@@ -344,14 +511,40 @@ class ArtifactService:
     async def get_content(self, artifact_id: str) -> tuple[bytes, Artifact]:
         """Bounded content read. Returns (content_bytes, artifact).
 
-        For inline content, returns the UTF-8 encoded inline bytes.
-        For file-backed content, reads via content_store with max_bytes.
+        Revision-aware: when the artifact has a current_revision_id (migrated),
+        reads content from the current Revision (not legacy columns).  When
+        unmigrated (current_revision_id is None), falls back to legacy
+        inline_content / content_ref (spec 157 allows legacy content read).
+
         Raises ArtifactNotFoundError if artifact missing.
-        Raises ArtifactContentUnavailableError if content unreadable.
+        Raises ArtifactContentUnavailableError if content unreadable or the
+        current revision row is missing despite current_revision_id being set.
         """
         art = await self._registry.get_artifact(artifact_id)
         if art is None:
             raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+
+        # Migrated: read from the current Revision.
+        if art.current_revision_id is not None:
+            rev = await self._registry.get_revision(
+                artifact_id, art.current_revision_id
+            )
+            if rev is None:
+                raise ArtifactContentUnavailableError(
+                    f"current revision not found: {art.current_revision_id}"
+                )
+            if rev.inline_content is not None:
+                return rev.inline_content.encode("utf-8"), art
+            if rev.content_ref is None:
+                raise ArtifactContentUnavailableError(
+                    f"revision has no content: {rev.id}"
+                )
+            data = await self._content_store.read(
+                rev.content_ref, max_bytes=self._config.artifact_max_bytes
+            )
+            return data, art
+
+        # Unmigrated: read legacy content fields (spec 157).
         if art.inline_content is not None:
             return art.inline_content.encode("utf-8"), art
         if art.content_ref is None:
@@ -362,6 +555,153 @@ class ArtifactService:
             art.content_ref, max_bytes=self._config.artifact_max_bytes
         )
         return data, art
+
+    # ------------------------------------------------------------------
+    # Revision read
+    # ------------------------------------------------------------------
+
+    async def get_current_revision(self, artifact_id: str) -> ArtifactRevision:
+        """Return the current revision of an artifact.
+
+        Raises ArtifactNotFoundError when the artifact does not exist,
+        ArtifactMigrationIncompleteError when the artifact has no current
+        revision (legacy unmigrated artifact), and ArtifactRevisionNotFoundError
+        when the revision row is missing despite current_revision_id being set.
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        rev = await self._registry.get_revision(
+            artifact_id, art.current_revision_id
+        )
+        if rev is None:
+            raise ArtifactRevisionNotFoundError(
+                f"current revision not found: {art.current_revision_id}"
+            )
+        return rev
+
+    async def get_revision(
+        self, artifact_id: str, revision_id: str,
+    ) -> ArtifactRevision:
+        """Return a specific revision of an artifact.
+
+        Unmigrated artifacts (existing but without a current revision) raise
+        ArtifactMigrationIncompleteError so callers know revision features are
+        pending migration rather than missing. Cross-artifact or non-existent
+        revision ids raise ArtifactRevisionNotFoundError (the registry filters
+        by artifact_id, so a foreign revision yields None without leaking which
+        artifact owns it).
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is not None and art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        rev = await self._registry.get_revision(artifact_id, revision_id)
+        if rev is None:
+            raise ArtifactRevisionNotFoundError(
+                f"revision not found: {revision_id}"
+            )
+        return rev
+
+    async def get_revision_content(
+        self, artifact_id: str, revision_id: str | None = None,
+    ) -> tuple[bytes, ArtifactRevision]:
+        """Read the content bytes of a revision (current or specified).
+
+        revision_id=None -> read the current revision's content (mirrors
+        ``get_content``'s migrated path; for unmigrated artifacts, reads
+        legacy content per spec line 157 and returns a synthetic revision
+        view built from the artifact's legacy fields).
+        revision_id specified -> ``get_artifact`` (None ->
+        ArtifactNotFoundError); migration guard (unmigrated ->
+        ArtifactMigrationIncompleteError); ``get_revision`` (None ->
+        ArtifactRevisionNotFoundError); read content (inline or
+        ``content_store.read``); verify checksum via
+        ``_verify_revision_checksum``; return ``(bytes, revision)``.
+
+        Cross-artifact revision_id is already rejected by ``get_revision``
+        (returns None -> ArtifactRevisionNotFoundError) without leaking which
+        artifact owns it.
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+
+        if revision_id is None:
+            # Current revision path.
+            if art.current_revision_id is None:
+                # Unmigrated: read legacy content (spec 157) and synthesize a
+                # revision view from the artifact's legacy fields.  This lets
+                # artifact_read work on legacy artifacts without forcing a
+                # migration first.
+                if art.inline_content is not None:
+                    data = art.inline_content.encode("utf-8")
+                elif art.content_ref is not None:
+                    data = await self._content_store.read(
+                        art.content_ref,
+                        max_bytes=self._config.artifact_max_bytes,
+                    )
+                else:
+                    raise ArtifactContentUnavailableError(
+                        f"artifact has no content: {artifact_id}"
+                    )
+                legacy_rev = ArtifactRevision(
+                    id="legacy",
+                    artifact_id=artifact_id,
+                    revision_number=1,
+                    parent_revision_id=None,
+                    rollback_from_revision_id=None,
+                    content_ref=art.content_ref,
+                    inline_content=art.inline_content,
+                    size=art.size,
+                    checksum=art.checksum,
+                    mime=art.mime,
+                    kind=art.kind,
+                    created_at=art.created_at or datetime.now(timezone.utc),
+                    change_summary="",
+                    created_by=art.created_by,
+                    source_session_id=art.source_session_id,
+                    source_run_id=None,
+                )
+                return data, legacy_rev
+
+            rev = await self._registry.get_revision(
+                artifact_id, art.current_revision_id
+            )
+            if rev is None:
+                raise ArtifactRevisionNotFoundError(
+                    f"current revision not found: {art.current_revision_id}"
+                )
+        else:
+            if art.current_revision_id is None:
+                raise ArtifactMigrationIncompleteError(
+                    f"artifact has no revision: {artifact_id}"
+                )
+            rev = await self._registry.get_revision(artifact_id, revision_id)
+            if rev is None:
+                raise ArtifactRevisionNotFoundError(
+                    f"revision not found: {revision_id}"
+                )
+
+        # Read content from the resolved revision.
+        if rev.inline_content is not None:
+            data = rev.inline_content.encode("utf-8")
+        elif rev.content_ref is not None:
+            data = await self._content_store.read(
+                rev.content_ref,
+                max_bytes=self._config.artifact_max_bytes,
+            )
+        else:
+            raise ArtifactContentUnavailableError(
+                f"revision has no content: {rev.id}"
+            )
+        self._verify_revision_checksum(rev, data)
+        return data, rev
 
     # ------------------------------------------------------------------
     # Create
@@ -376,10 +716,12 @@ class ArtifactService:
         inline_content: str | None = None,
         file_data: bytes | None = None,
         filename: str | None = None,
+        workspace_ref: str | None = None,
         source_kind: ArtifactSource = ArtifactSource.MANUAL,
         source_ref: str | None = None,
         source_context_ref: str | None = None,
         source_session_id: str | None = None,
+        source_run_id: str | None = None,
         summary: str = "",
         classification: str | None = None,
         labels: tuple[str, ...] | None = None,
@@ -387,19 +729,36 @@ class ArtifactService:
     ) -> Artifact:
         """Create a new artifact.
 
-        Exactly one of inline_content / file_data must be provided.
+        Exactly one of inline_content / file_data / workspace_ref must be
+        provided.  workspace_ref must use the ``workspace:`` scheme; the
+        content store enforces root confinement and per-component symlink
+        rejection, and the content is materialized to a Revision-owned
+        ``item:`` path (the source file is never modified).
+        For manual source, source_ref defaults to the generated artifact_id.
+        ``source_run_id`` is server provenance carried onto the initial
+        Revision (spec: chat-created SESSION artifacts take it from trusted
+        context, never from client arguments); legacy callers leave it None.
         For manual source, source_ref defaults to the generated artifact_id.
         Content is written first, then registry; on registry failure the new
         owned content is compensated (deleted).
         """
         artifact_id = _generate_artifact_id()
-        if source_kind is ArtifactSource.MANUAL and source_ref is None:
+        if source_kind in (ArtifactSource.MANUAL, ArtifactSource.SESSION) and source_ref is None:
             source_ref = artifact_id
 
         new_content_ref: str | None = None
         new_inline: str | None = None
         size: int
         checksum: str
+
+        content_inputs = sum(
+            1 for x in (inline_content, file_data, workspace_ref) if x is not None
+        )
+        if content_inputs != 1:
+            raise ArtifactValidationError(
+                "create requires exactly one of "
+                "inline_content / file_data / workspace_ref"
+            )
 
         if inline_content is not None:
             data = inline_content.encode("utf-8")
@@ -423,8 +782,26 @@ class ArtifactService:
                 artifact_id, filename or name, file_data
             )
         else:
-            raise ArtifactValidationError(
-                "create requires exactly one of inline_content / file_data"
+            # workspace_ref -> read bytes from the workspace source, then
+            # materialize to a Revision-owned item: path.  The content store
+            # enforces root confinement and per-component symlink rejection.
+            if not isinstance(workspace_ref, str) or not workspace_ref.startswith("workspace:"):
+                raise ArtifactValidationError(
+                    "workspace_ref must use the 'workspace:' scheme"
+                )
+            raw = await self._content_store.read(
+                workspace_ref,
+                max_bytes=self._config.artifact_max_bytes,
+            )
+            if len(raw) > self._config.artifact_max_bytes:
+                raise ArtifactTooLargeError(
+                    f"workspace content {len(raw)} exceeds "
+                    f"artifact_max_bytes {self._config.artifact_max_bytes}"
+                )
+            size = len(raw)
+            checksum = _sha256_checksum(raw)
+            new_content_ref = await self._content_store.write_atomic(
+                artifact_id, filename or name, raw
             )
 
         artifact = Artifact(
@@ -447,8 +824,35 @@ class ArtifactService:
             created_by=created_by,
         )
 
+        # Build the initial revision (revision_number=1) sharing the artifact's
+        # content fields.  The registry atomically inserts both rows and
+        # backfills ``current_revision_id`` in a single transaction.
+        initial_revision = ArtifactRevision(
+            id=_generate_revision_id(),
+            artifact_id=artifact_id,
+            revision_number=1,
+            parent_revision_id=None,
+            rollback_from_revision_id=None,
+            content_ref=new_content_ref,
+            inline_content=new_inline,
+            size=size,
+            checksum=checksum,
+            mime=mime,
+            kind=kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary="",
+            created_by=created_by,
+            source_session_id=source_session_id,
+            source_run_id=source_run_id,
+        )
+
         try:
-            return await self._registry.create_artifact(artifact)
+            created_artifact, _ = await (
+                self._registry.create_artifact_with_initial_revision(
+                    artifact, initial_revision,
+                )
+            )
+            return created_artifact
         except Exception:
             if new_content_ref is not None:
                 await self._best_effort_delete(new_content_ref)
@@ -593,6 +997,521 @@ class ArtifactService:
             await self._registry.revoke_published(artifact_id)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Revision write (update / list / diff / rollback)
+    # ------------------------------------------------------------------
+
+    async def update_revision(
+        self,
+        artifact_id: str,
+        *,
+        expected_revision_id: str,
+        inline_content: str | None = None,
+        file_data: bytes | None = None,
+        workspace_ref: str | None = None,
+        text_patch: list[dict[str, object]] | None = None,
+        change_summary: str = "",
+        kind: ArtifactKind | None = None,
+        mime: str | None = None,
+    ) -> tuple[ArtifactRevision, UpdateRevisionResult]:
+        """Create a new revision from a content update or text patch.
+
+        Exactly one content input (inline_content / file_data / workspace_ref
+        / text_patch) must be provided.  Uses optimistic compare-and-set via
+        ``registry.append_revision`` -- ``expected_revision_id`` must equal
+        the artifact's current revision id.  Does NOT revoke the active
+        publish (unlike ``update_artifact``); only derives
+        ``publish_sync_state``.
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        current = await self._registry.get_revision(
+            artifact_id, art.current_revision_id
+        )
+        if current is None:
+            raise ArtifactRevisionNotFoundError(
+                f"current revision not found: {art.current_revision_id}"
+            )
+        if expected_revision_id != current.id:
+            raise ArtifactRevisionConflictError(
+                f"CAS conflict: expected {expected_revision_id}, "
+                f"actual {current.id}"
+            )
+
+        # EDIT admission (archived -> deny), mirroring update_artifact.
+        await self._evaluate_policy(
+            art, ArtifactPolicyAction.EDIT, content_available=True,
+            active_publish_checksum=None,
+        )
+
+        # Exactly one content input.
+        content_inputs = sum(
+            1 for x in (inline_content, file_data, workspace_ref, text_patch)
+            if x is not None
+        )
+        if content_inputs != 1:
+            raise ArtifactRevisionValidationError(
+                "update_revision requires exactly one content input"
+            )
+
+        new_content_ref: str | None = None
+        new_inline: str | None = None
+        new_size: int
+        new_checksum: str
+        new_kind = kind if kind is not None else current.kind
+        new_mime = mime if mime is not None else current.mime
+        temp_new_ref: str | None = None
+
+        if text_patch is not None:
+            # text_patch preserves parent kind/mime (server ignores kind/mime
+            # overrides for patch mode).
+            new_kind = current.kind
+            new_mime = current.mime
+            if not _is_text_kind(current.kind):
+                raise ArtifactRevisionValidationError(
+                    "text_patch requires a text-kind revision"
+                )
+            _validate_text_patch(text_patch)
+            parent_text = await self._read_revision_text(
+                current, max_bytes=self._config.diff_max_bytes
+            )
+            patched = _apply_text_patch(parent_text, text_patch)
+            data = patched.encode("utf-8")
+            if len(data) > self._config.artifact_inline_max_bytes:
+                raise ArtifactRevisionValidationError(
+                    f"patched content {len(data)} exceeds "
+                    f"inline_max_bytes "
+                    f"{self._config.artifact_inline_max_bytes}"
+                )
+            if len(data) > self._config.artifact_max_bytes:
+                raise ArtifactRevisionValidationError(
+                    f"patched content {len(data)} exceeds "
+                    f"artifact_max_bytes {self._config.artifact_max_bytes}"
+                )
+            new_inline = patched
+            new_content_ref = None
+            new_size = len(data)
+            new_checksum = _sha256_checksum(data)
+        elif inline_content is not None:
+            data = inline_content.encode("utf-8")
+            if _is_text_kind(new_kind) and len(data) > (
+                self._config.artifact_inline_max_bytes
+            ):
+                raise ArtifactTooLargeError(
+                    f"inline content {len(data)} exceeds "
+                    f"inline_max_bytes "
+                    f"{self._config.artifact_inline_max_bytes}"
+                )
+            new_inline = inline_content
+            new_content_ref = None
+            new_size = len(data)
+            new_checksum = _sha256_checksum(data)
+        else:
+            # file_data or workspace_ref -> materialize to a new item: ref.
+            if file_data is not None:
+                raw = file_data
+            else:
+                if not isinstance(workspace_ref, str) or not workspace_ref.startswith("workspace:"):
+                    raise ArtifactRevisionValidationError(
+                        "workspace_ref must use the 'workspace:' scheme"
+                    )
+                raw = await self._content_store.read(
+                    workspace_ref,
+                    max_bytes=self._config.artifact_max_bytes,
+                )
+            if len(raw) > self._config.artifact_max_bytes:
+                raise ArtifactTooLargeError(
+                    f"file content {len(raw)} exceeds "
+                    f"artifact_max_bytes {self._config.artifact_max_bytes}"
+                )
+            temp_new_ref = await self._content_store.write_atomic(
+                artifact_id,
+                f"rev-{_generate_revision_id()}",
+                raw,
+            )
+            new_content_ref = temp_new_ref
+            new_inline = None
+            new_size = len(raw)
+            new_checksum = _sha256_checksum(raw)
+
+        # Binary kinds cannot use inline content.
+        if not _is_text_kind(new_kind) and new_inline is not None:
+            raise ArtifactRevisionValidationError(
+                "binary revision must use content_ref"
+            )
+
+        new_revision = ArtifactRevision(
+            id=_generate_revision_id(),
+            artifact_id=artifact_id,
+            revision_number=current.revision_number + 1,
+            parent_revision_id=current.id,
+            rollback_from_revision_id=None,
+            content_ref=new_content_ref,
+            inline_content=new_inline,
+            size=new_size,
+            checksum=new_checksum,
+            mime=new_mime,
+            kind=new_kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary=change_summary,
+            created_by=_ACTOR,
+            source_session_id=current.source_session_id,
+            source_run_id=current.source_run_id,
+        )
+
+        try:
+            committed = await self._registry.append_revision(
+                artifact_id, new_revision,
+                expected_revision_id=expected_revision_id,
+            )
+        except Exception:
+            if temp_new_ref is not None:
+                await self._best_effort_delete(temp_new_ref)
+            raise
+
+        content_unchanged = committed.checksum == current.checksum
+        publish_state = await self._derive_publish_sync_state(
+            artifact_id, committed.id
+        )
+        diff_summary = (
+            f"size {current.size}->{committed.size} bytes; "
+            f"checksum {'unchanged' if content_unchanged else 'changed'}"
+        )
+        return committed, UpdateRevisionResult(
+            diff_summary=diff_summary,
+            content_unchanged=content_unchanged,
+            publish_sync_state=publish_state,
+        )
+
+    async def list_revisions(
+        self,
+        artifact_id: str,
+        *,
+        cursor: RevisionListCursor | None = None,
+        limit: int = 50,
+    ) -> RevisionListPage:
+        """List revisions for an artifact (newest first).
+
+        Limit is clamped to 1..100.  Returns an empty page when the artifact
+        has no revisions (current_revision_id is None -- legacy unmigrated).
+        Raises ArtifactNotFoundError when the artifact does not exist.
+        Cross-artifact cursors raise ArtifactRevisionValidationError
+        (enforced by the registry).
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            return RevisionListPage(items=(), next_cursor=None)
+        clamped = max(1, min(100, limit))
+        return await self._registry.list_revisions(
+            artifact_id, cursor=cursor, limit=clamped,
+        )
+
+    async def diff_revisions(
+        self,
+        artifact_id: str,
+        from_id: str,
+        to_id: str,
+        *,
+        context_lines: int = 3,
+    ) -> DiffResult:
+        """Compute a unified diff between two text revisions, or a binary
+        change summary for two binary revisions.
+
+        Raises ArtifactMigrationIncompleteError when the artifact exists but
+        has no current revision (legacy unmigrated), ArtifactRevisionNotFoundError
+        for missing/cross-artifact revisions, ArtifactRevisionValidationError
+        for out-of-range context_lines, ArtifactDiffUnsupportedError for cross
+        text/binary pairs or undecodable content, and ArtifactDiffTooLargeError
+        when inputs or output exceed configured limits.
+        """
+        if context_lines < 0 or context_lines > 20:
+            raise ArtifactRevisionValidationError(
+                f"context_lines must be 0..20, got {context_lines}"
+            )
+        # Diff is a revision-scoped operation: an unmigrated artifact (existing
+        # but without a current revision) must signal migration-incomplete
+        # rather than reporting its (non-existent) revisions as not found.
+        art = await self._registry.get_artifact(artifact_id)
+        if art is not None and art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        from_rev = await self._registry.get_revision(artifact_id, from_id)
+        if from_rev is None:
+            raise ArtifactRevisionNotFoundError(
+                f"revision not found: {from_id}"
+            )
+        to_rev = await self._registry.get_revision(artifact_id, to_id)
+        if to_rev is None:
+            raise ArtifactRevisionNotFoundError(
+                f"revision not found: {to_id}"
+            )
+
+        from_is_text = _is_text_kind(from_rev.kind)
+        to_is_text = _is_text_kind(to_rev.kind)
+        if from_is_text != to_is_text:
+            raise ArtifactDiffUnsupportedError(
+                "diff across text/binary kinds is unsupported"
+            )
+        if not from_is_text:
+            # Binary pair: report whether content changed (checksum/size/mime).
+            changed = (
+                from_rev.checksum != to_rev.checksum
+                or from_rev.size != to_rev.size
+                or from_rev.mime != to_rev.mime
+            )
+            return DiffResult(diff_text="", binary_changed=changed)
+
+        # Text pair: read, decode, diff.
+        from_bytes = await self._read_revision_bytes_for_diff(from_rev)
+        to_bytes = await self._read_revision_bytes_for_diff(to_rev)
+        if len(from_bytes) > self._config.diff_max_bytes:
+            raise ArtifactDiffTooLargeError(
+                f"from revision {len(from_bytes)} exceeds "
+                f"diff_max_bytes {self._config.diff_max_bytes}"
+            )
+        if len(to_bytes) > self._config.diff_max_bytes:
+            raise ArtifactDiffTooLargeError(
+                f"to revision {len(to_bytes)} exceeds "
+                f"diff_max_bytes {self._config.diff_max_bytes}"
+            )
+        try:
+            from_text = from_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ArtifactDiffUnsupportedError(
+                f"from revision is not valid UTF-8: {exc}"
+            ) from exc
+        try:
+            to_text = to_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ArtifactDiffUnsupportedError(
+                f"to revision is not valid UTF-8: {exc}"
+            ) from exc
+        from_lines = from_text.splitlines()
+        to_lines = to_text.splitlines()
+        if len(from_lines) > self._config.diff_max_lines:
+            raise ArtifactDiffTooLargeError(
+                f"from revision {len(from_lines)} lines exceeds "
+                f"diff_max_lines {self._config.diff_max_lines}"
+            )
+        if len(to_lines) > self._config.diff_max_lines:
+            raise ArtifactDiffTooLargeError(
+                f"to revision {len(to_lines)} lines exceeds "
+                f"diff_max_lines {self._config.diff_max_lines}"
+            )
+
+        diff_lines = list(unified_diff(
+            from_lines,
+            to_lines,
+            fromfile=f"revision-{from_rev.revision_number}",
+            tofile=f"revision-{to_rev.revision_number}",
+            n=context_lines,
+            lineterm="",
+        ))
+        diff_text = "\n".join(diff_lines)
+        if len(diff_text) > self._config.diff_max_output_chars:
+            raise ArtifactDiffTooLargeError(
+                f"diff output {len(diff_text)} exceeds "
+                f"diff_max_output_chars "
+                f"{self._config.diff_max_output_chars}"
+            )
+        return DiffResult(diff_text=diff_text, binary_changed=False)
+
+    async def rollback(
+        self,
+        artifact_id: str,
+        target_revision_id: str,
+        *,
+        expected_revision_id: str,
+        change_summary: str = "",
+    ) -> tuple[ArtifactRevision, UpdateRevisionResult]:
+        """Roll back to a target revision by creating a new revision whose
+        content is copied from the target.
+
+        The new revision has ``parent_revision_id = current.id`` and
+        ``rollback_from_revision_id = target.id``.  If the target uses a
+        content_ref, its content is materialized to a new owned item: path
+        (the target's item file is never overwritten).  CAS via
+        ``append_revision``.
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        current = await self._registry.get_revision(
+            artifact_id, art.current_revision_id
+        )
+        if current is None:
+            raise ArtifactRevisionNotFoundError(
+                f"current revision not found: {art.current_revision_id}"
+            )
+        if expected_revision_id != current.id:
+            raise ArtifactRevisionConflictError(
+                f"CAS conflict: expected {expected_revision_id}, "
+                f"actual {current.id}"
+            )
+
+        await self._evaluate_policy(
+            art, ArtifactPolicyAction.EDIT, content_available=True,
+            active_publish_checksum=None,
+        )
+
+        target = await self._registry.get_revision(
+            artifact_id, target_revision_id
+        )
+        if target is None:
+            raise ArtifactRevisionNotFoundError(
+                f"revision not found: {target_revision_id}"
+            )
+
+        new_content_ref: str | None = None
+        new_inline: str | None = None
+        temp_new_ref: str | None = None
+
+        if target.inline_content is not None:
+            new_inline = target.inline_content
+            new_content_ref = None
+        else:
+            # Materialize target content to a new owned item: path.
+            data = await self._content_store.read(
+                target.content_ref,
+                max_bytes=self._config.artifact_max_bytes,
+            )
+            temp_new_ref = await self._content_store.write_atomic(
+                artifact_id,
+                f"rb-{_generate_revision_id()}",
+                data,
+            )
+            new_content_ref = temp_new_ref
+            new_inline = None
+
+        new_revision = ArtifactRevision(
+            id=_generate_revision_id(),
+            artifact_id=artifact_id,
+            revision_number=current.revision_number + 1,
+            parent_revision_id=current.id,
+            rollback_from_revision_id=target.id,
+            content_ref=new_content_ref,
+            inline_content=new_inline,
+            size=target.size,
+            checksum=target.checksum,
+            mime=target.mime,
+            kind=target.kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary=change_summary,
+            created_by=_ACTOR,
+            source_session_id=current.source_session_id,
+            source_run_id=current.source_run_id,
+        )
+
+        try:
+            committed = await self._registry.append_revision(
+                artifact_id, new_revision,
+                expected_revision_id=expected_revision_id,
+            )
+        except Exception:
+            if temp_new_ref is not None:
+                await self._best_effort_delete(temp_new_ref)
+            raise
+
+        content_unchanged = committed.checksum == current.checksum
+        publish_state = await self._derive_publish_sync_state(
+            artifact_id, committed.id
+        )
+        diff_summary = (
+            f"rollback to revision-{target.revision_number}; "
+            f"checksum {'unchanged' if content_unchanged else 'changed'}"
+        )
+        return committed, UpdateRevisionResult(
+            diff_summary=diff_summary,
+            content_unchanged=content_unchanged,
+            publish_sync_state=publish_state,
+        )
+
+    # ------------------------------------------------------------------
+    # Revision helpers
+    # ------------------------------------------------------------------
+
+    async def _derive_publish_sync_state(
+        self, artifact_id: str, current_revision_id: str,
+    ) -> str:
+        """Derive the publish sync state for the current revision.
+
+        - ``unpublished``: no active publish for the artifact.
+        - ``current``: active publish points at this revision.
+        - ``outdated``: active publish points at a different revision
+          (including legacy publishes with ``published_revision_id is None``).
+        """
+        active = await self._registry.get_active_publish(artifact_id)
+        if active is None:
+            return "unpublished"
+        if active.published_revision_id == current_revision_id:
+            return "current"
+        return "outdated"
+
+    async def _read_revision_text(
+        self, revision: ArtifactRevision, *, max_bytes: int,
+    ) -> str:
+        """Read and strictly UTF-8 decode the authoritative content of a
+        revision.  Raises ArtifactRevisionValidationError on decode failure
+        or ArtifactContentUnavailableError when content is unreadable."""
+        if revision.inline_content is not None:
+            return revision.inline_content
+        if revision.content_ref is None:
+            raise ArtifactContentUnavailableError(
+                f"revision has no content: {revision.id}"
+            )
+        data = await self._content_store.read(
+            revision.content_ref, max_bytes=max_bytes
+        )
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ArtifactRevisionValidationError(
+                f"revision content is not valid UTF-8: {exc}"
+            ) from exc
+
+    async def _read_revision_bytes_for_diff(
+        self, revision: ArtifactRevision,
+    ) -> bytes:
+        """Read raw bytes of a revision for diff (uses artifact_max_bytes)."""
+        if revision.inline_content is not None:
+            return revision.inline_content.encode("utf-8")
+        if revision.content_ref is None:
+            raise ArtifactContentUnavailableError(
+                f"revision has no content: {revision.id}"
+            )
+        return await self._content_store.read(
+            revision.content_ref,
+            max_bytes=self._config.artifact_max_bytes,
+        )
+
+    def _verify_revision_checksum(
+        self, revision: ArtifactRevision, content_bytes: bytes,
+    ) -> None:
+        """Defense-in-depth: recompute the checksum of the read bytes and
+        compare to the revision's stored checksum. A mismatch signals storage
+        corruption or tampering -- spec requires export to receive bytes whose
+        checksum has been verified, not the revision's declared value trusted
+        blindly. Raises ArtifactContentUnavailableError on mismatch.
+        """
+        actual = _sha256_checksum(content_bytes)
+        if actual != revision.checksum:
+            raise ArtifactContentUnavailableError(
+                f"revision content checksum mismatch for {revision.id}: "
+                f"storage corruption detected"
+            )
 
     # ------------------------------------------------------------------
     # Delete
@@ -787,24 +1706,171 @@ class ArtifactService:
     # ------------------------------------------------------------------
 
     async def export(
-        self, artifact_id: str, *, format: str = "original"
+        self, artifact_id: str, *, format: str = "original",
+        revision_id: str | None = None,
     ) -> tuple[bytes, str, str]:
         """Export artifact content.
 
-        original: returns source bytes + original mime + safe filename.
-        html: only markdown/document kinds, converted via export_converter.
+        When an exporter is injected, delegates fully to the exporter
+        (reads from the resolved revision, uses probe_content_profile for
+        format routing).  When no exporter is injected, falls back to
+        legacy behaviour (original/html only, reads from the Artifact).
 
-        Export does NOT modify the artifact.
+        Unmigrated artifacts (current_revision_id is None, no revision_id
+        specified) allow legacy original/html export (spec 157); other
+        formats (docx/pptx/xlsx) raise ArtifactMigrationIncompleteError
+        because they are Revision-scoped.
+
+        Export is read-only: never modifies Artifact/Revision/publish/files.
+        """
+        fmt = format.lower()
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+
+        # Unmigrated artifact without a specific revision_id: allow legacy
+        # original/html export (spec 157); Revision-scoped formats raise
+        # MigrationIncomplete.
+        if art.current_revision_id is None and revision_id is None:
+            if fmt in ("original", "html"):
+                return await self._export_legacy(artifact_id, fmt)
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+
+        if self._exporter is None:
+            return await self._export_legacy(artifact_id, fmt)
+
+        # --- Full delegation path ---
+        _, rev = await self._resolve_revision_for_export(
+            artifact_id, revision_id, art=art
+        )
+        content_bytes = await self._read_revision_bytes_for_diff(rev)
+        self._verify_revision_checksum(rev, content_bytes)
+        content_profile = probe_content_profile(rev.kind, rev.mime, content_bytes)
+
+        caps = await self._exporter.capabilities(
+            rev.kind, rev.mime, content_profile
+        )
+        if fmt not in caps:
+            raise ArtifactExportUnsupportedError(
+                f"unsupported export format: {fmt}"
+            )
+
+        options = {
+            "content_profile": content_profile,
+            "artifact_name": art.name,
+        }
+        try:
+            exported = await self._exporter.export(
+                rev, content_bytes, fmt, options
+            )
+        except ArtifactExportError:
+            raise
+        except Exception as exc:
+            raise ArtifactExportError(
+                f"export failed for format {fmt}: {exc}"
+            ) from exc
+
+        return exported.data, exported.mime, exported.filename
+
+    async def export_capabilities(
+        self, artifact_id: str, *, revision_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Return the tuple of supported export format names.
+
+        When an exporter is injected, returns its capabilities for the
+        resolved revision's content profile (lowercase, deduplicated, sorted).
+        When no exporter is injected, returns legacy caps: ``("original",)``
+        for any readable artifact, ``("html", "original")`` for
+        markdown/document kinds.
+
+        Unmigrated artifacts (current_revision_id is None, no revision_id
+        specified) return legacy caps regardless of exporter injection --
+        capability query is read-only and must not raise MigrationIncomplete
+        for unmigrated artifacts.
+
+        Read-only: never modifies Artifact/Revision/publish/files.
         """
         art = await self._registry.get_artifact(artifact_id)
         if art is None:
             raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
 
-        if format == "original":
+        # Unmigrated artifact without a specific revision_id: return legacy
+        # caps.  Capability query is read-only and must not raise
+        # MigrationIncomplete for unmigrated artifacts.
+        if art.current_revision_id is None and revision_id is None:
+            if art.kind in (ArtifactKind.MARKDOWN, ArtifactKind.DOCUMENT):
+                return ("html", "original")
+            return ("original",)
+
+        if self._exporter is None:
+            if art.kind in (ArtifactKind.MARKDOWN, ArtifactKind.DOCUMENT):
+                return ("html", "original")
+            return ("original",)
+
+        # --- Full delegation path ---
+        _, rev = await self._resolve_revision_for_export(
+            artifact_id, revision_id, art=art
+        )
+        content_bytes = await self._read_revision_bytes_for_diff(rev)
+        self._verify_revision_checksum(rev, content_bytes)
+        content_profile = probe_content_profile(rev.kind, rev.mime, content_bytes)
+        caps = await self._exporter.capabilities(
+            rev.kind, rev.mime, content_profile
+        )
+        return tuple(sorted({c.lower() for c in caps}))
+
+    async def _resolve_revision_for_export(
+        self, artifact_id: str, revision_id: str | None,
+        *, art: Artifact | None = None,
+    ) -> tuple[Artifact, ArtifactRevision]:
+        """Resolve the artifact and revision for export/capabilities.
+
+        revision_id=None -> current revision.  Raises ArtifactNotFoundError,
+        ArtifactMigrationIncompleteError, or ArtifactRevisionNotFoundError.
+
+        When ``art`` is supplied (pre-fetched by the caller), skips the
+        redundant registry lookup.
+        """
+        if art is None:
+            art = await self._registry.get_artifact(artifact_id)
+            if art is None:
+                raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None and revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        target_id = revision_id or art.current_revision_id
+        if target_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        rev = await self._registry.get_revision(artifact_id, target_id)
+        if rev is None:
+            raise ArtifactRevisionNotFoundError(
+                f"revision not found: {target_id}"
+            )
+        return art, rev
+
+    async def _export_legacy(
+        self, artifact_id: str, fmt: str,
+    ) -> tuple[bytes, str, str]:
+        """Legacy export path (no exporter injected).
+
+        Supports only 'original' and 'html' formats, reads from the
+        Artifact's content fields (not Revision).  Preserves backward
+        compatibility with pre-T6 tests.
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+
+        if fmt == "original":
             data, _ = await self.get_content(artifact_id)
             return data, art.mime, art.name
 
-        if format == "html":
+        if fmt == "html":
             if art.kind not in (ArtifactKind.MARKDOWN, ArtifactKind.DOCUMENT):
                 raise ArtifactValidationError(
                     f"html export only supports markdown/document, got {art.kind}"
@@ -814,7 +1880,7 @@ class ArtifactService:
             html = self._convert_to_html(content_str)
             return html.encode("utf-8"), "text/html", art.name
 
-        raise ArtifactValidationError(f"unsupported export format: {format}")
+        raise ArtifactValidationError(f"unsupported export format: {fmt}")
 
     # ------------------------------------------------------------------
     # Publish
@@ -823,45 +1889,94 @@ class ArtifactService:
     async def publish(
         self, artifact_id: str
     ) -> PublishResult:
-        """Publish an artifact to a public snapshot.
+        """Publish an artifact to a public snapshot (body-less HTTP compat).
 
-        Flow:
-        1. Get artifact + active publish.
-        2. ArtifactPolicy.publish_admission.
-        3. If deny -> raise.
-        4. If reuse -> return existing active publish.
-        5. Text: InformationFlowService.release -> use redacted content.
-        6. Binary: copy original bytes (policy gated classification=PUBLIC).
-        7. Generate publish_id, copy snapshot, register_published.
-        8. On registry failure -> compensate delete new snapshot.
+        Resolves the current revision and delegates to
+        :meth:`publish_revision`.  Raises ArtifactMigrationIncompleteError
+        when the artifact has no current revision.
         """
         art = await self._registry.get_artifact(artifact_id)
         if art is None:
             raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        return await self.publish_revision(
+            artifact_id,
+            revision_id=art.current_revision_id,
+            expected_current_revision_id=art.current_revision_id,
+        )
 
+    async def publish_revision(
+        self,
+        artifact_id: str,
+        *,
+        revision_id: str,
+        expected_current_revision_id: str,
+    ) -> PublishResult:
+        """Publish a specific revision to a public snapshot.
+
+        Flow:
+        1. Read artifact; None -> ArtifactNotFoundError; no revision ->
+           MigrationIncomplete.
+        2. Verify revision_id AND expected_current_revision_id both equal the
+           in-transaction current revision (spec: 任一不是事务内当前值都返回
+           artifact_revision_conflict). Publishing a historical revision is
+           rejected as a conflict.
+        3. Read the (current) revision; None -> RevisionNotFoundError.
+        4. PUBLISH admission (policy + audit).
+        5. Read revision content: text -> InformationFlow release; binary ->
+           raw bytes (policy already gated PUBLIC).
+        6. Early reuse: if active publish has same final public checksum,
+           return it without creating a new snapshot.
+        7. Generate publish_id, write staging snapshot.
+        8. register_revision_publish (single-tx CAS re-verify + reuse/switch).
+        9. DB failure -> compensate delete new snapshot.
+        10. Return PublishResult(published, share_url, reused).
+        """
+        # 1. Read artifact
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        current_id = art.current_revision_id
+
+        # 2. Both revision_id and expected must equal the current revision.
+        # This fast-fails before the expensive release/snapshot work; the
+        # authoritative CAS re-verification happens inside
+        # register_revision_publish's BEGIN IMMEDIATE transaction.
+        if revision_id != current_id or expected_current_revision_id != current_id:
+            raise ArtifactRevisionConflictError(
+                f"publish requires revision_id and expected_current_revision_id "
+                f"to equal the current revision {current_id}"
+            )
+
+        # 3. Read the (current) revision
+        rev = await self._registry.get_revision(artifact_id, revision_id)
+        if rev is None:
+            raise ArtifactRevisionNotFoundError(
+                f"current revision not found: {revision_id}"
+            )
+
+        # 4. PUBLISH admission
         active = await self._registry.get_active_publish(artifact_id)
         active_checksum = active.snapshot_checksum if active is not None else None
         content_available = (
-            art.inline_content is not None or bool(art.content_ref)
+            rev.inline_content is not None or bool(rev.content_ref)
         )
-
-        outcome = await self._evaluate_policy(
+        await self._evaluate_policy(
             art,
             ArtifactPolicyAction.PUBLISH,
             content_available=content_available,
             active_publish_checksum=active_checksum,
         )
 
-        # Reuse: return existing active publish.
-        if outcome.reuse and active is not None:
-            return PublishResult(
-                published=active,
-                share_url=self._compute_share_url(active.publish_id),
-                reused=True,
-            )
-
-        # --- Create new snapshot ---
-        is_text = _is_text_kind(art.kind)
+        # 5. Read revision content + release/copy
+        is_text = _is_text_kind(rev.kind)
         snapshot_ref: str | None = None
         snapshot_inline: str | None = None
         snapshot_content: str | None = None
@@ -869,13 +1984,11 @@ class ArtifactService:
         snapshot_checksum: str
 
         if is_text:
-            # Read content for InformationFlow release.
-            content_str = await self._read_text_content(art)
+            content_str = await self._read_revision_text(
+                rev, max_bytes=self._config.artifact_max_bytes
+            )
             classification = self._resolve_classification(art)
             labels = frozenset(art.labels) if art.labels else frozenset()
-            # source_session_id is the real session id for task artifacts;
-            # source_context_ref holds the task id (not a session) and must
-            # not be passed to InformationFlow as session_id.
             session_id = art.source_session_id or ""
             result = self._flow.release(
                 content_str,
@@ -894,34 +2007,36 @@ class ArtifactService:
             snapshot_bytes = snapshot_content.encode("utf-8")
             snapshot_size = len(snapshot_bytes)
             snapshot_checksum = _sha256_checksum(snapshot_bytes)
-            # Inline XOR file: small content stored inline only; large content
-            # copied to a publish snapshot file.
             if snapshot_size <= self._config.artifact_inline_max_bytes:
                 snapshot_inline = snapshot_content
                 snapshot_ref = None
             else:
                 snapshot_inline = None
-                # snapshot_ref will be set below via copy_to_publish_snapshot.
         else:
-            # Binary: copy original bytes (policy already gated PUBLIC).
-            if art.content_ref is None:
+            if rev.content_ref is None:
                 raise ArtifactContentUnavailableError(
-                    f"binary artifact has no content_ref: {artifact_id}"
+                    f"binary revision has no content_ref: {revision_id}"
                 )
-            # Verify content is readable and compute trusted size/checksum.
             data = await self._content_store.read(
-                art.content_ref, max_bytes=self._config.artifact_max_bytes
+                rev.content_ref, max_bytes=self._config.artifact_max_bytes
             )
             snapshot_size = len(data)
             snapshot_checksum = _sha256_checksum(data)
             snapshot_inline = None
 
-        publish_id = _generate_publish_id()
+        # 6. Early reuse: same final public checksum -> return existing
+        if (
+            active is not None
+            and active.snapshot_checksum == snapshot_checksum
+        ):
+            return PublishResult(
+                published=active,
+                share_url=self._compute_share_url(active.publish_id),
+                reused=True,
+            )
 
-        # Create snapshot file only when content is not stored inline.
-        # Text small: snapshot_inline set, skip file creation.
-        # Text large: snapshot_inline is None, copy redacted content to file.
-        # Binary: snapshot_inline is None, copy original bytes to file.
+        # 7. Generate publish_id, write staging snapshot
+        publish_id = _generate_publish_id()
         if snapshot_inline is None:
             if is_text:
                 snapshot_ref = await self._content_store.copy_to_publish_snapshot(
@@ -929,16 +2044,16 @@ class ArtifactService:
                 )
             else:
                 snapshot_ref = await self._content_store.copy_to_publish_snapshot(
-                    art.content_ref, publish_id, inline=None
+                    rev.content_ref, publish_id, inline=None
                 )
 
-        is_replacement = active is not None and not outcome.reuse
+        # 8. Construct PublishedArtifact and register
         published = PublishedArtifact(
             publish_id=publish_id,
             artifact_id=artifact_id,
             snapshot_name=art.name,
-            snapshot_kind=art.kind,
-            snapshot_mime=art.mime,
+            snapshot_kind=rev.kind,
+            snapshot_mime=rev.mime,
             snapshot_content_ref=snapshot_ref,
             snapshot_inline_content=snapshot_inline,
             snapshot_size=snapshot_size,
@@ -950,20 +2065,50 @@ class ArtifactService:
         )
 
         try:
-            await self._registry.register_published(
+            registered = await self._registry.register_revision_publish(
                 published,
-                revoke_artifact_id=artifact_id if is_replacement else None,
+                artifact_id=artifact_id,
+                revision_id=revision_id,
+                expected_current_revision_id=expected_current_revision_id,
             )
         except Exception:
-            # Compensate: delete the new snapshot, old active preserved.
+            # 9. Compensate: delete new snapshot, old active preserved.
             if snapshot_ref is not None:
                 await self._best_effort_delete(snapshot_ref)
             raise
 
+        # If register_revision_publish reused an existing active (different
+        # publish_id), clean up the orphaned new snapshot.
+        reused = registered.publish_id != publish_id
+        if reused and snapshot_ref is not None:
+            await self._best_effort_delete(snapshot_ref)
+
         return PublishResult(
-            published=published,
-            share_url=self._compute_share_url(publish_id),
-            reused=False,
+            published=registered,
+            share_url=self._compute_share_url(registered.publish_id),
+            reused=reused,
+        )
+
+    async def get_publish_sync_state(self, artifact_id: str) -> str:
+        """Return the publish sync state for an artifact's current revision.
+
+        - ``unpublished``: no active publish.
+        - ``current``: active publish points at the current revision.
+        - ``outdated``: active publish points at a different revision.
+
+        Raises ArtifactNotFoundError when the artifact does not exist.
+        Raises ArtifactMigrationIncompleteError when the artifact has no
+        current revision.
+        """
+        art = await self._registry.get_artifact(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id is None:
+            raise ArtifactMigrationIncompleteError(
+                f"artifact has no revision: {artifact_id}"
+            )
+        return await self._derive_publish_sync_state(
+            artifact_id, art.current_revision_id
         )
 
     # ------------------------------------------------------------------
@@ -1055,10 +2200,12 @@ class ArtifactService:
     ) -> Artifact | None:
         """Idempotent register from a TaskAttachment source.
 
-        Uses (task_attachment, attachment_id) for dedup.
-        Content_ref uses the controlled attachment ref.
-        Returns existing artifact if already registered.
-        Returns None on failure (best-effort, does not raise).
+        Uses (task_attachment, attachment_id) for dedup.  Content is read from
+        the attachment source and materialized to a Revision-owned ``item:``
+        path (the source ref is never used as content_ref), so source deletion
+        or rewrite does not affect registered revisions.  Returns existing
+        artifact if already registered.  Returns None on failure (best-effort,
+        does not raise).
         """
         existing = await self._registry.get_by_source(
             ArtifactSource.TASK_ATTACHMENT, attachment.attachment_id
@@ -1066,10 +2213,10 @@ class ArtifactService:
         if existing is not None:
             return existing
 
-        content_ref = f"attachment:{attachment.task_id}/{attachment.stored_name}"
+        source_ref = f"attachment:{attachment.task_id}/{attachment.stored_name}"
         try:
             data = await self._content_store.read(
-                content_ref, max_bytes=self._config.artifact_max_bytes
+                source_ref, max_bytes=self._config.artifact_max_bytes
             )
         except Exception as exc:
             logger.warning(
@@ -1083,10 +2230,27 @@ class ArtifactService:
 
         resolved_mime = _resolve_mime(attachment.filename, attachment.content_type)
         kind = _kind_from_mime(resolved_mime)
+        resolved_mime = _ensure_nonempty_mime(resolved_mime, kind)
         size = len(data)
         checksum = _sha256_checksum(data)
         artifact_id = _generate_artifact_id()
         session_id = await self._resolve_task_session(attachment.task_id)
+
+        # Materialize source content to a Revision-owned item: path so the
+        # registered content survives source deletion/rewrite.
+        try:
+            content_ref = await self._content_store.write_atomic(
+                artifact_id, attachment.filename, data
+            )
+        except Exception as exc:
+            logger.warning(
+                "register_from_attachment materialize failed: "
+                "source_kind=%s source_ref=%s error=%s",
+                ArtifactSource.TASK_ATTACHMENT.value,
+                attachment.attachment_id,
+                type(exc).__name__,
+            )
+            return None
 
         artifact = Artifact(
             id=artifact_id,
@@ -1104,10 +2268,34 @@ class ArtifactService:
             summary="",
             created_by=attachment.uploaded_by or _ACTOR,
         )
+        initial_revision = ArtifactRevision(
+            id=_generate_revision_id(),
+            artifact_id=artifact_id,
+            revision_number=1,
+            parent_revision_id=None,
+            rollback_from_revision_id=None,
+            content_ref=content_ref,
+            inline_content=None,
+            size=size,
+            checksum=checksum,
+            mime=resolved_mime,
+            kind=kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary="",
+            created_by=attachment.uploaded_by or _ACTOR,
+            source_session_id=session_id,
+            source_run_id=None,
+        )
 
         try:
-            return await self._registry.create_artifact(artifact)
+            created_artifact, _ = await (
+                self._registry.create_artifact_with_initial_revision(
+                    artifact, initial_revision,
+                )
+            )
+            return created_artifact
         except Exception as exc:
+            await self._best_effort_delete(content_ref)
             logger.warning(
                 "register_from_attachment failed: "
                 "source_kind=%s source_ref=%s error=%s",
@@ -1128,7 +2316,9 @@ class ArtifactService:
 
         Two content paths:
           - ``storage_ref`` is a ``workspace:`` ref -> read the file from
-            workspace_root, store as ``content_ref`` (binary/large files).
+            workspace_root, materialize to a Revision-owned ``item:`` path
+            (the source ref is never used as content_ref, so source deletion
+            does not affect registered revisions).
           - Otherwise, for text-kind artifacts, use inline content from
             ``content`` (preferred) or ``summary`` (fallback) -> store as
             ``inline_content`` (no workspace file needed).
@@ -1145,6 +2335,7 @@ class ArtifactService:
 
         resolved_mime = _resolve_mime(task_artifact.name, task_artifact.mime)
         kind = _kind_from_mime(resolved_mime)
+        resolved_mime = _ensure_nonempty_mime(resolved_mime, kind)
         is_workspace_ref = (
             isinstance(task_artifact.storage_ref, str)
             and task_artifact.storage_ref.startswith("workspace:")
@@ -1169,7 +2360,6 @@ class ArtifactService:
                     type(exc).__name__,
                 )
                 return None
-            new_content_ref = task_artifact.storage_ref
             size = len(data)
             checksum = _sha256_checksum(data)
         else:
@@ -1202,6 +2392,23 @@ class ArtifactService:
         artifact_id = _generate_artifact_id()
         session_id = await self._resolve_task_session(task_id)
 
+        # Materialize workspace content to a Revision-owned item: path so the
+        # registered content survives source deletion/rewrite.  Inline text
+        # is固化为 inline_content directly (no file needed).
+        if is_workspace_ref:
+            try:
+                new_content_ref = await self._content_store.write_atomic(
+                    artifact_id, task_artifact.name, data
+                )
+            except Exception as exc:
+                logger.warning(
+                    "register_from_task_artifact materialize failed: "
+                    "source_kind=%s source_ref=%s error=%s",
+                    ArtifactSource.TASK_ARTIFACT.value, source_ref,
+                    type(exc).__name__,
+                )
+                return None
+
         artifact = Artifact(
             id=artifact_id,
             name=task_artifact.name,
@@ -1218,10 +2425,35 @@ class ArtifactService:
             summary=task_artifact.summary,
             created_by=_ACTOR,
         )
+        initial_revision = ArtifactRevision(
+            id=_generate_revision_id(),
+            artifact_id=artifact_id,
+            revision_number=1,
+            parent_revision_id=None,
+            rollback_from_revision_id=None,
+            content_ref=new_content_ref,
+            inline_content=new_inline,
+            size=size,
+            checksum=checksum,
+            mime=resolved_mime,
+            kind=kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary="",
+            created_by=_ACTOR,
+            source_session_id=session_id,
+            source_run_id=None,
+        )
 
         try:
-            return await self._registry.create_artifact(artifact)
+            created_artifact, _ = await (
+                self._registry.create_artifact_with_initial_revision(
+                    artifact, initial_revision,
+                )
+            )
+            return created_artifact
         except Exception as exc:
+            if new_content_ref is not None:
+                await self._best_effort_delete(new_content_ref)
             logger.warning(
                 "register_from_task_artifact failed: "
                 "source_kind=%s source_ref=%s error=%s",
@@ -1378,6 +2610,181 @@ class ArtifactService:
             "updated": updated,
             "skipped": skipped,
             "failed": failed,
+        }
+
+    # ------------------------------------------------------------------
+    # Revision migration backfill
+    # ------------------------------------------------------------------
+
+    async def migrate_revisions(self, *, batch_size: int = 100) -> dict[str, int]:
+        """Backfill initial revisions for unmigrated artifacts.
+
+        Pages through artifacts with NULL ``current_revision_id``, reads
+        their legacy content (inline or file-backed), verifies checksum
+        and size against actual bytes, materializes file-backed content to
+        Revision-owned ``item:`` paths (never overwriting source files),
+        and commits via ``commit_initial_revision_backfill`` (three-state
+        idempotent: skip / backfill-pointer / insert+backfill).
+
+        Failure handling (source unreadable, checksum mismatch, size
+        exceeds limit, commit error): the new ``item:`` file is
+        compensated (deleted), the artifact is counted as failed, and no
+        pseudo-Revision is created.  The failure type is recorded for
+        health reporting (sanitized, no paths/refs/class names).
+
+        Returns ``{"processed", "migrated", "skipped", "failed"}``.
+        """
+        processed = 0
+        migrated = 0
+        skipped = 0
+        failed = 0
+        failure_types: dict[str, int] = {}
+
+        cursor: ArtifactListCursor | None = None
+        while True:
+            page = await self._registry.list_revision_migration_candidates(
+                cursor=cursor, limit=batch_size,
+            )
+            for art in page.items:
+                processed += 1
+                result = await self._migrate_one_artifact(art)
+                if result == "migrated":
+                    migrated += 1
+                elif result == "skipped":
+                    skipped += 1
+                else:
+                    failed += 1
+                    failure_types[result] = failure_types.get(result, 0) + 1
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+
+        # Update migration state cache for health_snapshot.
+        self._migration_failed_count = failed
+        if failed > 0:
+            self._migration_state = "degraded"
+            # Sanitized: only stable failure-type names + counts, no
+            # paths/refs/exception class names.
+            self._migration_last_error = ",".join(
+                f"{k}:{v}" for k, v in sorted(failure_types.items())
+            ) or "unknown"
+        else:
+            self._migration_state = "ok"
+            self._migration_last_error = None
+
+        return {
+            "processed": processed,
+            "migrated": migrated,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
+    async def _migrate_one_artifact(self, art: Artifact) -> str:
+        """Migrate a single unmigrated artifact.
+
+        Returns ``"migrated"``, ``"skipped"`` (already had a revision),
+        or a failure-type string (``"source_unreadable"``,
+        ``"checksum_mismatch"``, ``"size_exceeds_limit"``,
+        ``"commit_failed"``, ``"unknown"``).
+        """
+        new_item_ref: str | None = None
+        try:
+            # Read legacy content and recompute size/checksum from actual
+            # bytes (do not blindly trust declared values).
+            if art.inline_content is not None:
+                data = art.inline_content.encode("utf-8")
+            elif art.content_ref is not None:
+                try:
+                    data = await self._content_store.read(
+                        art.content_ref,
+                        max_bytes=self._config.artifact_max_bytes,
+                    )
+                except Exception:
+                    return "source_unreadable"
+            else:
+                return "source_unreadable"
+
+            # Verify size.
+            if len(data) > self._config.artifact_max_bytes:
+                return "size_exceeds_limit"
+
+            # Verify checksum matches declared value.
+            actual_checksum = _sha256_checksum(data)
+            if actual_checksum != art.checksum:
+                return "checksum_mismatch"
+
+            actual_size = len(data)
+
+            # Materialize file-backed content to a new Revision-owned
+            # item: path (never overwrite the source file).  Inline
+            # content is固化为 inline_content directly.
+            if art.inline_content is not None:
+                new_inline = art.inline_content
+                new_content_ref: str | None = None
+            else:
+                new_inline = None
+                new_item_ref = await self._content_store.write_atomic(
+                    art.id, f"rev-{_generate_revision_id()}", data,
+                )
+                new_content_ref = new_item_ref
+
+            # Resolve mime (ArtifactRevision requires non-empty mime).
+            rev_mime = _ensure_nonempty_mime(art.mime, art.kind)
+
+            revision = ArtifactRevision(
+                id=_generate_revision_id(),
+                artifact_id=art.id,
+                revision_number=1,
+                parent_revision_id=None,
+                rollback_from_revision_id=None,
+                content_ref=new_content_ref,
+                inline_content=new_inline,
+                size=actual_size,
+                checksum=actual_checksum,
+                mime=rev_mime,
+                kind=art.kind,
+                created_at=datetime.now(timezone.utc),
+                change_summary="migration backfill",
+                created_by="system",
+                source_session_id=art.source_session_id,
+                source_run_id=None,
+            )
+
+            try:
+                committed = await self._registry.commit_initial_revision_backfill(
+                    art.id, revision,
+                )
+            except Exception:
+                if new_item_ref is not None:
+                    await self._best_effort_delete(new_item_ref)
+                return "commit_failed"
+
+            # State 1 or 2: existing revision was used (not our insert).
+            # Clean up the new item: file we wrote (not needed).
+            if committed.id != revision.id:
+                if new_item_ref is not None:
+                    await self._best_effort_delete(new_item_ref)
+                return "skipped"
+
+            return "migrated"
+        except Exception:
+            if new_item_ref is not None:
+                await self._best_effort_delete(new_item_ref)
+            return "unknown"
+
+    def migration_status(self) -> dict:
+        """Return sanitized migration status for health reporting.
+
+        Returns ``{"state": "ok"|"degraded", "failed_count": N,
+        "last_error": str | None}``.  ``last_error`` is sanitized to
+        stable failure-type names (no paths/refs/exception class names).
+        Defaults to ``{"state": "ok", "failed_count": 0, "last_error": None}``
+        when migration has not run.
+        """
+        return {
+            "state": self._migration_state,
+            "failed_count": self._migration_failed_count,
+            "last_error": self._migration_last_error,
         }
 
     # ------------------------------------------------------------------

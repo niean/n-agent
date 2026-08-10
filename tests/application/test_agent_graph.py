@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 
 import pytest
@@ -6,6 +7,14 @@ import pytest
 from typing import Any
 
 from app.application.agent_graph import AgentGraphRunner
+from app.application.artifact_tools import (
+    ARTIFACT_TOOL_CREATE,
+    ARTIFACT_TOOL_PUBLISH,
+    ARTIFACT_TOOL_READ,
+    ARTIFACT_TOOL_ROLLBACK,
+    ARTIFACT_TOOL_UPDATE,
+    artifact_tool_definitions,
+)
 from app.application.events import ChatEvent, ChatEventType
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
 from app.domain.agent import AgentState
@@ -1853,3 +1862,221 @@ async def test_stream_events_fan_in_both_queues_concurrently_with_approval_event
     assert len(tool_call_events) >= 1, "tool events must appear in fan-in output"
     assert len(approval_events) == 1, "approval event must appear in fan-in output"
     assert approval_events[0].metadata["confirmation_id"] == "fan-in-conf"
+
+
+# ---------------------------------------------------------------------------
+# T10: ui.artifact card persistence on conversational artifact write tools
+# ---------------------------------------------------------------------------
+
+
+class FakeArtifactExecutor:
+    """Returns a configurable artifact tool result.
+
+    Mirrors ArtifactToolExecutor: content is a JSON STRING (not a dict), so the
+    ui.artifact hook must json.loads it. ``status`` defaults to SUCCESS.
+    """
+
+    def __init__(self, payload: dict, status: ToolResultStatus = ToolResultStatus.SUCCESS):
+        self._payload = payload
+        self._status = status
+
+    async def execute(self, request: ToolCallRequest, context: ToolExecutionContext | None = None) -> ToolResult:
+        return ToolResult(
+            request.id,
+            request.name,
+            self._status,
+            json.dumps(self._payload, ensure_ascii=False),
+        )
+
+
+def _safe_artifact_definitions() -> list[ToolDefinition]:
+    """Real artifact tool definitions overridden to SAFE so the default
+    ToolPolicy ALLOWs them without the approval card flow."""
+    return [dataclasses.replace(d, risk_level=RiskLevel.SAFE) for d in artifact_tool_definitions()]
+
+
+def _artifact_call(call_id: str, name: str, arguments: str) -> dict:
+    return {"id": call_id, "function": {"name": name, "arguments": arguments}}
+
+
+def _ui_artifact_cards(messages: list) -> list:
+    return [m for m in messages if m.role == "system" and m.name == "ui.artifact"]
+
+
+async def _run_execute_tools(store, executor, tool_name: str, *, persist_messages: bool = True, create_session: bool = True) -> AgentState:
+    if create_session:
+        await store.create_session(ConversationSession(id="s-art"))
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(CompositeToolExecutor({tool_name: executor}), _safe_artifact_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-art",
+        pending_tool_calls=[_artifact_call("call-art-1", tool_name, '{"name":"doc","kind":"document"}')],
+        persist_messages=persist_messages,
+    )
+    await runner.execute_tools(state)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_persists_ui_artifact_card_on_create_success(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {
+        "success": True, "artifact_id": "a1", "revision_id": "r1",
+        "revision_number": 1, "name": "doc", "kind": "document",
+        "publish_sync_state": "unpublished", "capabilities": ["original"],
+    }
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_CREATE)
+    cards = _ui_artifact_cards(await store.list_messages("s-art"))
+    assert len(cards) == 1
+    # Card is EXACTLY the 6 spec fields -- no capabilities/mime/size leak.
+    assert cards[0].card == {
+        "artifact_id": "a1", "revision_id": "r1", "name": "doc",
+        "kind": "document", "revision_number": 1,
+        "publish_sync_state": "unpublished",
+    }
+    assert cards[0].content == "制品已更新: doc"
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_persists_ui_artifact_card_on_publish_success(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {
+        "success": True, "artifact_id": "a1", "revision_id": "r2",
+        "revision_number": 2, "name": "doc", "kind": "document",
+        "publish_sync_state": "current", "publish_id": "p1",
+        "published_revision_id": "r2", "share_url": "/s/p1", "reused": False,
+    }
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_PUBLISH)
+    cards = _ui_artifact_cards(await store.list_messages("s-art"))
+    assert len(cards) == 1
+    assert cards[0].card["publish_sync_state"] == "current"
+    assert cards[0].card["revision_number"] == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_persists_ui_artifact_card_on_rollback_success(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {
+        "success": True, "artifact_id": "a1", "revision_id": "r3",
+        "revision_number": 3, "name": "doc", "kind": "document",
+        "publish_sync_state": "outdated", "diff_summary": "reverted",
+        "content_unchanged": False,
+    }
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_ROLLBACK)
+    cards = _ui_artifact_cards(await store.list_messages("s-art"))
+    assert len(cards) == 1
+    assert cards[0].card["publish_sync_state"] == "outdated"
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_no_card_on_tool_error_status(tmp_path):
+    """A CAS conflict / execution error yields status=ERROR -> no card. The
+    previous card (if any) is left untouched (no overwrite)."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {"success": False, "error": {"code": "artifact_revision_conflict", "message": "stale", "retryable": True}}
+    await _run_execute_tools(store, FakeArtifactExecutor(payload, ToolResultStatus.ERROR), ARTIFACT_TOOL_UPDATE)
+    cards = _ui_artifact_cards(await store.list_messages("s-art"))
+    assert cards == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_no_card_when_success_false_in_payload(tmp_path):
+    """Defensive: even if status were SUCCESS, success=False writes no card."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {"success": False, "artifact_id": "a1", "revision_id": "r1"}
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_CREATE)
+    assert _ui_artifact_cards(await store.list_messages("s-art")) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_no_card_for_readonly_artifact_read(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {"success": True, "artifact_id": "a1", "revision_id": "r1", "content": "..."}
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_READ)
+    assert _ui_artifact_cards(await store.list_messages("s-art")) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_no_card_when_artifact_id_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {"success": True, "revision_id": "r1", "name": "doc", "kind": "document", "revision_number": 1, "publish_sync_state": "unpublished"}
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_CREATE)
+    assert _ui_artifact_cards(await store.list_messages("s-art")) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_no_card_when_revision_id_missing(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {"success": True, "artifact_id": "a1", "name": "doc", "kind": "document", "revision_number": 1, "publish_sync_state": "unpublished"}
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_CREATE)
+    assert _ui_artifact_cards(await store.list_messages("s-art")) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_no_card_when_persist_messages_false(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    payload = {"success": True, "artifact_id": "a1", "revision_id": "r1", "revision_number": 1, "name": "doc", "kind": "document", "publish_sync_state": "unpublished"}
+    await _run_execute_tools(store, FakeArtifactExecutor(payload), ARTIFACT_TOOL_CREATE, persist_messages=False)
+    assert _ui_artifact_cards(await store.list_messages("s-art")) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_persistence_failure_does_not_break_flow(tmp_path):
+    """The ui.artifact card write is best-effort: if append_system_named_message
+    raises (policy deny / store error), the hook must log and swallow it -- the
+    tool flow continues, tool_results are still recorded, and no card appears."""
+    from app.application.runtime_memory_service import RuntimeMemoryService
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-art"))
+
+    class _CardFailingRuntimeMemory(RuntimeMemoryService):
+        async def append_system_named_message(self, session_id, name, content, *, card=None):
+            raise RuntimeError("simulated card persist failure")
+
+    payload = {"success": True, "artifact_id": "a1", "revision_id": "r1", "revision_number": 1, "name": "doc", "kind": "document", "publish_sync_state": "unpublished"}
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(CompositeToolExecutor({ARTIFACT_TOOL_CREATE: FakeArtifactExecutor(payload)}), _safe_artifact_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+        runtime_memory_service=_CardFailingRuntimeMemory(store),
+    )
+    state = AgentState(
+        session_id="s-art",
+        pending_tool_calls=[_artifact_call("call-art-1", ARTIFACT_TOOL_CREATE, '{"name":"doc","kind":"document"}')],
+    )
+    await runner.execute_tools(state)  # must not raise
+    assert len(state.tool_results) == 1  # tool result still recorded
+    assert _ui_artifact_cards(await store.list_messages("s-art")) == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tools_non_json_content_does_not_raise(tmp_path):
+    """Defensive: malformed (non-JSON) content string is skipped, not crashed."""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-art"))
+
+    class BadJsonExecutor:
+        async def execute(self, request, context=None):
+            return ToolResult(request.id, request.name, ToolResultStatus.SUCCESS, "not-json{")
+
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(CompositeToolExecutor({ARTIFACT_TOOL_CREATE: BadJsonExecutor()}), _safe_artifact_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+    state = AgentState(
+        session_id="s-art",
+        pending_tool_calls=[_artifact_call("call-art-1", ARTIFACT_TOOL_CREATE, '{"name":"doc","kind":"document"}')],
+    )
+    await runner.execute_tools(state)  # must not raise
+    assert _ui_artifact_cards(await store.list_messages("s-art")) == []

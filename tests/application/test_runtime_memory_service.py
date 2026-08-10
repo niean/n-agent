@@ -41,10 +41,14 @@ class SpyMemoryStore:
         self.append_summary_message_calls = 0
         self.mark_messages_summarized_calls = 0
         self.delete_summary_messages_calls = 0
+        self.append_message_if_session_exists_calls = 0
 
         self._session: ConversationSession | None = None
         self._messages: list[ConversationMessage] = []
         self._summary: Summary | None = None
+        # Controls append_message_if_session_exists: True -> append+return;
+        # False -> return None (simulates a deleted-session race).
+        self._session_exists = True
 
     # -- MemoryStore protocol methods (async) --
     async def create_session(self, session: ConversationSession) -> ConversationSession:
@@ -62,6 +66,15 @@ class SpyMemoryStore:
 
     async def append_message(self, session_id: str, message: ConversationMessage) -> ConversationMessage:
         self.append_message_calls += 1
+        self._messages.append(message)
+        return message
+
+    async def append_message_if_session_exists(
+        self, session_id: str, message: ConversationMessage,
+    ) -> ConversationMessage | None:
+        self.append_message_if_session_exists_calls += 1
+        if not self._session_exists:
+            return None
         self._messages.append(message)
         return message
 
@@ -615,3 +628,63 @@ class TestAppendUserMessageSource:
         svc = RuntimeMemoryService(spy)
         msg = await svc.append_assistant_message("s1", "ok")
         assert msg.source is None
+
+
+class TestAppendSystemNamedMessage:
+    """ui.artifact card path: role=system + name + card, session-gone safe."""
+
+    @pytest.mark.asyncio
+    async def test_allow_appends_system_named_with_card(self):
+        spy = SpyMemoryStore()
+        spy._session_exists = True
+        svc = RuntimeMemoryService(spy)
+        card = {
+            "artifact_id": "a1", "revision_id": "r1", "name": "foo",
+            "kind": "document", "revision_number": 2,
+            "publish_sync_state": "unpublished",
+        }
+        msg = await svc.append_system_named_message(
+            "s1", "ui.artifact", "制品已更新: foo", card=card,
+        )
+        assert msg is not None
+        assert msg.role == "system"
+        assert msg.name == "ui.artifact"
+        assert msg.card == card
+        # Uses append_message_if_session_exists, NOT the implicit-create path.
+        assert spy.append_message_if_session_exists_calls == 1
+        assert spy.append_message_calls == 0
+        assert spy._messages[-1] is msg
+
+    @pytest.mark.asyncio
+    async def test_session_gone_returns_none_no_revive(self):
+        spy = SpyMemoryStore()
+        spy._session_exists = False
+        svc = RuntimeMemoryService(spy)
+        msg = await svc.append_system_named_message(
+            "s1", "ui.artifact", "x", card={"artifact_id": "a1"},
+        )
+        assert msg is None
+        assert spy.append_message_if_session_exists_calls == 1
+        # A deleted-session race must NOT write an orphan or revive the session.
+        assert spy._messages == []
+        assert spy.append_message_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_denied_raises_and_does_not_touch_store(self):
+        spy = SpyMemoryStore()
+        svc = RuntimeMemoryService(spy, memory_policy=DenyWriteMessagePolicy())
+        with pytest.raises(MemoryAccessDeniedError) as exc_info:
+            await svc.append_system_named_message(
+                "s1", "ui.artifact", "x", card={"artifact_id": "a1"},
+            )
+        assert spy.append_message_if_session_exists_calls == 0
+        assert spy.append_message_calls == 0
+        assert exc_info.value.operation is MemoryOperation.WRITE_MESSAGE
+
+    @pytest.mark.asyncio
+    async def test_default_card_none(self):
+        spy = SpyMemoryStore()
+        svc = RuntimeMemoryService(spy)
+        msg = await svc.append_system_named_message("s1", "ui.artifact", "x")
+        assert msg is not None
+        assert msg.card is None

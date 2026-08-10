@@ -39,6 +39,12 @@
   const CSV_MAX_ROWS = 200;
   const CSV_MAX_COLS = 50;
   const TASK_ID_RE = /^[A-Za-z0-9_-]+$/;
+  // T10: publish_sync_state -> badge label (chat card + workbench share this).
+  const ARTIFACT_SYNC_LABELS = {
+    unpublished: '未发布',
+    current: '已发布',
+    outdated: '已过期',
+  };
 
   // ---- state ----
   let state = {
@@ -53,6 +59,10 @@
     view: 'preview',     // 'preview' | 'edit'
     publish: null,       // current publish state
     error: null,
+    // T10: revision management + capabilities-driven export
+    revisions: null,     // list[{id,revision_number,change_summary,created_at,is_current,is_published,...}] | null
+    capabilities: null,  // string[] from GET /export/capabilities | null
+    diffView: null,      // {text, fromLabel, toLabel} | null
   };
   let inflight = null;   // AbortController for in-flight detail/content fetch
   let activeBlobs = [];  // created object URLs to revoke on switch/destroy
@@ -181,12 +191,18 @@
       signal,
     });
   }
-  async function patchArtifactMultipart(id, formData, signal) {
+  async function patchArtifactMultipart(id, formData, signal, expectedRevisionId) {
+    const headers = {};
+    // T10: binary content replace carries the CAS token via If-Match
+    if (expectedRevisionId) { headers['If-Match'] = expectedRevisionId; }
     return fetch(API_BASE + '/' + encodeURIComponent(id), {
-      method: 'PATCH', body: formData, signal,
+      method: 'PATCH', headers, body: formData, signal,
     }).then(async (resp) => {
       const data = await resp.json();
-      if (!resp.ok) { const e = new Error(data && data.error && data.error.code || 'request_failed'); e.code = e.message; throw e; }
+      if (!resp.ok) {
+        const code = (data && data.error && data.error.code) || 'request_failed';
+        const e = new Error(code); e.code = code; throw e;
+      }
       return data;
     });
   }
@@ -201,6 +217,33 @@
   }
   async function fetchDeleteArtifact(id) {
     return apiRequest(API_BASE + '/' + encodeURIComponent(id), { method: 'DELETE' });
+  }
+
+  // ---- T10: revision management + capabilities-driven export ----
+  async function fetchExportCapabilities(id, signal) {
+    return apiRequest(API_BASE + '/' + encodeURIComponent(id) + '/export/capabilities', { signal });
+  }
+  async function fetchRevisions(id, signal) {
+    return apiRequest(API_BASE + '/' + encodeURIComponent(id) + '/revisions?limit=100', { signal });
+  }
+  async function fetchDiff(id, fromId, toId, signal) {
+    return apiRequest(API_BASE + '/' + encodeURIComponent(id) + '/diff', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_revision_id: fromId, to_revision_id: toId, context_lines: 3 }),
+      signal,
+    });
+  }
+  async function rollbackArtifact(id, targetRevisionId, expectedRevisionId) {
+    return apiRequest(API_BASE + '/' + encodeURIComponent(id) + '/rollback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target_revision_id: targetRevisionId,
+        expected_revision_id: expectedRevisionId,
+        change_summary: '从版本历史回滚',
+      }),
+    });
   }
 
   // ---- blob management ----
@@ -437,6 +480,10 @@
       state.content = null;
       state.publish = null;
       state.error = null;
+      // T10: clear revision/capabilities/diff state with the selection.
+      state.revisions = null;
+      state.capabilities = null;
+      state.diffView = null;
       renderList();
       renderDetail();
     }
@@ -451,8 +498,14 @@
       if (state.selectedId !== id) return; // raced
       state.detail = detail;
       state.content = await parseContent(contentResp, detail);
-      // load publish status in parallel (non-blocking)
+      // T10: reset revision/diff/capabilities state for the new selection.
+      state.revisions = null;
+      state.capabilities = null;
+      state.diffView = null;
+      // load publish status + capabilities + revisions in parallel (non-blocking)
       loadPublishStatus(id, sig);
+      loadCapabilities(id, sig);
+      loadRevisions(id, sig);
       renderDetail();
     } catch (e) {
       if (state.selectedId !== id) return;
@@ -524,6 +577,9 @@
     const meta = el('div', 'artifacts-detail__metadata muted');
     meta.textContent = '大小: ' + (detail.size != null ? detail.size : '-') + ' B'
       + ' · 更新: ' + fmtTime(detail.updated_at);
+    // T10: publish_sync_state badge (unpublished/current/outdated) from the
+    // server-enriched detail, distinct from the active-publish link segment.
+    meta.appendChild(renderPublishSyncBadge(detail));
     // publish status segment (populated by refreshPublishState when active):
     // appends "；已发布: 链接" with the share link, per the prd format.
     const pubStatus = el('span', 'artifacts-detail__publish-status');
@@ -534,7 +590,22 @@
     } else {
       renderPreview(body, detail);
     }
+    // T10: revision history panel (loads async into the container).
+    const revPanel = el('div', 'artifacts-revisions-panel');
+    revPanel.id = 'artifacts-revisions-panel';
+    body.appendChild(revPanel);
+    renderRevisionsPanel();
     refreshPublishState();
+  }
+
+  // T10: publish_sync_state badge. Renders the raw server state as a labeled
+  // badge; unknown states fall back to their raw value. textContent only.
+  function renderPublishSyncBadge(detail) {
+    const badge = el('span', 'artifacts-detail__sync-badge');
+    const state_ = detail && typeof detail.publish_sync_state === 'string' ? detail.publish_sync_state : '';
+    badge.className = 'artifacts-detail__sync-badge artifacts-detail__sync-badge--' + (state_ || 'unpublished');
+    badge.textContent = ARTIFACT_SYNC_LABELS[state_] || state_ || '未发布';
+    return badge;
   }
 
   function renderHeader(body, detail) {
@@ -585,8 +656,12 @@
     delBtn.textContent = '删除';
     delBtn.addEventListener('click', () => doDelete(detail));
     actions.appendChild(delBtn);
-    // export button (original format only)
-    actions.appendChild(buildExportButton(detail));
+    // export button: opens a standard modal to confirm the export format
+    const expBtn = el('button', 'btn artifacts-detail__export');
+    expBtn.type = 'button';
+    expBtn.textContent = '导出';
+    expBtn.addEventListener('click', () => openExportModal(state.detail));
+    actions.appendChild(expBtn);
     // publish button: toggles between 发布 (publish) and 撤回 (revoke) based on
     // the active publish state. Text is kept in sync by refreshPublishState;
     // the handler branches at click time so no listener swap is needed.
@@ -604,16 +679,128 @@
     body.appendChild(header);
   }
 
-  // Export is a single button: original format only (no dropdown). The html
-  // export endpoint stays server-side and is still used for markdown/document
-  // preview rendering, but is not offered as a download format here.
-  function buildExportButton(detail) {
-    const btn = el('button', 'btn artifacts-detail__export');
-    btn.type = 'button';
-    btn.textContent = '导出';
-    btn.title = '导出原始文件（original）';
-    btn.addEventListener('click', () => doExport(detail, 'original'));
-    return btn;
+  // Export: a standard button (项目标准按钮) opens a project-standard modal
+  // (modal-backdrop / modal-dialog / providers-form) where the user confirms
+  // the format before downloading. Available formats come from
+  // GET /export/capabilities (server truth); until they arrive, 'original' is
+  // offered as a fallback. html stays server-side for markdown/document preview
+  // but is offered as a download only when the server advertises it.
+  function exportFormats() {
+    return (state.capabilities && state.capabilities.length) ? state.capabilities : ['original'];
+  }
+
+  function exportFormatLabel(fmt) {
+    const map = { original: '原始文件', html: 'HTML', docx: 'DOCX', pptx: 'PPTX', xlsx: 'XLSX' };
+    return map[fmt] || fmt;
+  }
+
+  function closeExportModal() {
+    const modal = document.getElementById('artifacts-export-modal');
+    if (modal) modal.remove();
+  }
+
+  function openExportModal(detail) {
+    if (!detail) return;
+    closeExportModal(); // never stack two export modals
+    const formats = exportFormats();
+    const defaultFmt = formats.indexOf('original') !== -1 ? 'original' : formats[0];
+
+    const backdrop = el('div', 'modal-backdrop');
+    backdrop.id = 'artifacts-export-modal';
+    const dialog = el('section', 'modal-dialog');
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-label', '导出制品');
+    const form = el('form', 'providers-form');
+
+    const header = el('div', 'modal-header');
+    const title = el('h4');
+    title.textContent = '导出制品';
+    const closeBtn = el('button', 'modal-close');
+    closeBtn.type = 'button';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '关闭');
+    header.append(title, closeBtn);
+    form.appendChild(header);
+
+    // format selector (radio group): the extra info the user confirms
+    const optionsWrap = el('div', 'export-modal__options');
+    const radios = [];
+    formats.forEach((fmt) => {
+      const opt = el('label', 'export-modal__option');
+      const radio = el('input');
+      radio.type = 'radio';
+      radio.name = 'export-format';
+      radio.value = fmt;
+      radio.dataset.format = fmt;
+      radio.checked = (fmt === defaultFmt);
+      radio.addEventListener('change', updateFilename);
+      radios.push(radio);
+      const lbl = el('span');
+      lbl.textContent = exportFormatLabel(fmt);
+      opt.append(radio, lbl);
+      optionsWrap.appendChild(opt);
+    });
+    form.appendChild(optionsWrap);
+
+    // resulting filename hint (artifact name + chosen format, PRD line 85)
+    const filenameHint = el('div', 'providers-form__hint export-modal__filename');
+    form.appendChild(filenameHint);
+
+    // inline error (hidden until export fails; modal stays open for retry)
+    const errorHint = el('div', 'providers-form__hint badge badge--danger');
+    errorHint.style.display = 'none';
+    form.appendChild(errorHint);
+
+    const actions = el('div', 'providers-form__actions');
+    const cancelBtn = el('button', 'btn');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = '取消';
+    const confirmBtn = el('button', 'btn btn--primary');
+    confirmBtn.type = 'submit';
+    confirmBtn.textContent = '导出';
+    actions.append(cancelBtn, confirmBtn);
+    form.appendChild(actions);
+
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+
+    function selectedFormat() {
+      const r = radios.find((x) => x.checked);
+      return r ? r.value : defaultFmt;
+    }
+    function updateFilename() {
+      filenameHint.textContent = '文件名: ' + exportFilename(detail.name, selectedFormat());
+    }
+    updateFilename();
+
+    let closed = false;
+    function close() { if (closed) return; closed = true; backdrop.remove(); }
+    function setBusy(busy) {
+      confirmBtn.disabled = busy;
+      cancelBtn.disabled = busy;
+      confirmBtn.textContent = busy ? '导出中...' : '导出';
+    }
+
+    backdrop.addEventListener('click', (event) => { if (event.target === backdrop) close(); });
+    closeBtn.addEventListener('click', close);
+    cancelBtn.addEventListener('click', close);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (confirmBtn.disabled) return;
+      errorHint.style.display = 'none';
+      setBusy(true);
+      try {
+        await runExport(detail, selectedFormat());
+        close();
+      } catch (e) {
+        setBusy(false);
+        errorHint.textContent = '导出失败：' + (e && e.message ? e.message : e);
+        errorHint.style.display = '';
+      }
+    });
+
+    document.body.appendChild(backdrop);
   }
 
   // Derive the download filename from the artifact name (not a hardcoded
@@ -630,22 +817,19 @@
     return base;
   }
 
-  async function doExport(detail, format) {
-    try {
-      const resp = await fetchExport(detail.id, format);
-      if (!resp.ok) throw new Error('export failed');
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = el('a');
-      a.href = url;
-      a.download = exportFilename(detail.name, format);
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } catch (e) {
-      if (getModal() && typeof getModal().alert === 'function') {
-        await getModal().alert('导出失败：' + (e && e.message ? e.message : e));
-      }
-    }
+  // Download an export of `detail` in `format`. Throws on failure so the
+  // export modal can surface an inline error and let the user retry. The blob
+  // URL bypasses Content-Disposition (see knowledge/05-key-patterns.md).
+  async function runExport(detail, format) {
+    const resp = await fetchExport(detail.id, format);
+    if (!resp.ok) throw new Error('export failed');
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = el('a');
+    a.href = url;
+    a.download = exportFilename(detail.name, format);
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   // ---- preview by kind ----
@@ -825,7 +1009,7 @@
     const save = el('button', 'btn btn--primary artifacts-detail__save');
     save.type = 'button';
     save.textContent = '保存';
-    save.addEventListener('click', () => saveText(detail.id, ta.value));
+    save.addEventListener('click', () => saveText(detail, ta.value));
     const cancel = el('button', 'btn artifacts-detail__cancel');
     cancel.type = 'button';
     cancel.textContent = '取消';
@@ -835,9 +1019,21 @@
     body.appendChild(wrap);
   }
 
-  async function saveText(id, value) {
+  async function saveText(detail, value) {
+    if (!detail || !detail.id) return;
+    // T10: content PATCH always carries the detail's expected_revision_id
+    // (CAS). A stale token -> artifact_revision_conflict (409): keep the
+    // current display, refresh server state, prompt the user, NO auto-replay.
+    // Metadata-only PATCH (no content) stays token-less (handled elsewhere).
+    const expected = detail.current_revision_id;
+    if (!expected) {
+      if (getModal() && typeof getModal().alert === 'function') {
+        await getModal().alert('当前版本未知，请刷新后重试');
+      }
+      return;
+    }
     try {
-      const updated = await patchArtifact(id, { content: value });
+      const updated = await patchArtifact(detail.id, { content: value, expected_revision_id: expected });
       // refresh with server-returned size/checksum/updated_at
       state.detail = updated;
       state.content = { text: value, kind: updated.kind, mime: updated.mime };
@@ -849,9 +1045,17 @@
       renderDetail();
       // refresh list (metadata may have changed)
       reloadList();
-      loadPublishStatus(id, inflight ? inflight.signal : undefined);
+      loadPublishStatus(detail.id, inflight ? inflight.signal : undefined);
     } catch (e) {
-      if (getModal() && typeof getModal().alert === 'function') {
+      if (e && e.code === 'artifact_revision_conflict') {
+        if (getModal() && typeof getModal().alert === 'function') {
+          await getModal().alert('版本已变化，请刷新后重试');
+        }
+        if (inflight) { try { inflight.abort(); } catch (_) {} }
+        revokeActiveBlobs();
+        inflight = new AbortController();
+        loadDetail(detail.id, inflight.signal);
+      } else if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('保存失败：' + (e && e.message ? e.message : e));
       }
     }
@@ -874,10 +1078,18 @@
         if (getModal() && typeof getModal().alert === 'function') await getModal().alert('请选择文件');
         return;
       }
+      // T10: binary content replace carries the CAS token via If-Match.
+      const expected = detail.current_revision_id;
+      if (!expected) {
+        if (getModal() && typeof getModal().alert === 'function') {
+          await getModal().alert('当前版本未知，请刷新后重试');
+        }
+        return;
+      }
       const fd = new FormData();
       fd.append('content', fileInput.files[0]);
       try {
-        const updated = await patchArtifactMultipart(detail.id, fd);
+        const updated = await patchArtifactMultipart(detail.id, fd, undefined, expected);
         // refresh with server-returned size/checksum/updated_at
         state.detail = updated;
         state.view = 'preview';
@@ -891,7 +1103,15 @@
         loadDetail(detail.id, inflight.signal);
         reloadList();
       } catch (e) {
-        if (getModal() && typeof getModal().alert === 'function') {
+        if (e && e.code === 'artifact_revision_conflict') {
+          if (getModal() && typeof getModal().alert === 'function') {
+            await getModal().alert('版本已变化，请刷新后重试');
+          }
+          if (inflight) { try { inflight.abort(); } catch (_) {} }
+          revokeActiveBlobs();
+          inflight = new AbortController();
+          loadDetail(detail.id, inflight.signal);
+        } else if (getModal() && typeof getModal().alert === 'function') {
           await getModal().alert('替换失败：' + (e && e.message ? e.message : e));
         }
       }
@@ -976,6 +1196,10 @@
       state.content = null;
       state.publish = null;
       state.error = null;
+      // T10: clear revision/capabilities/diff state with the selection.
+      state.revisions = null;
+      state.capabilities = null;
+      state.diffView = null;
       if (window.location.pathname !== '/artifacts') {
         history.pushState({ tab: 'artifacts' }, '', '/artifacts');
       }
@@ -997,6 +1221,173 @@
     } catch (e) {
       if (getModal() && typeof getModal().alert === 'function') {
         await getModal().alert('撤销失败：' + (e && e.message ? e.message : e));
+      }
+    }
+  }
+
+  // ---- T10: revision history + diff + rollback ----
+  // Capabilities drive the export modal (loaded in parallel with detail); the
+  // modal reads state.capabilities when it opens, so no explicit refresh is
+  // needed here.
+  async function loadCapabilities(id, sig) {
+    try {
+      const data = await fetchExportCapabilities(id, sig);
+      if (state.selectedId !== id) return;
+      // Response shape: {capabilities: [...]} (or legacy array). Coerce defensively.
+      const caps = data && Array.isArray(data.capabilities) ? data.capabilities
+        : (Array.isArray(data) ? data : ['original']);
+      state.capabilities = caps.length ? caps : ['original'];
+    } catch (_) {
+      if (state.selectedId !== id) return;
+      state.capabilities = ['original']; // degrade to original on failure
+    }
+  }
+
+  async function loadRevisions(id, sig) {
+    try {
+      const data = await fetchRevisions(id, sig);
+      if (state.selectedId !== id) return;
+      state.revisions = (data && Array.isArray(data.items)) ? data.items : [];
+    } catch (_) {
+      if (state.selectedId !== id) return;
+      state.revisions = [];
+    }
+    renderRevisionsPanel();
+  }
+
+  function renderRevisionsPanel() {
+    const host = byId('artifacts-revisions-panel');
+    if (!host) return;
+    clear(host);
+    const detail = state.detail;
+    if (!detail) return;
+    const revs = state.revisions;
+    if (!revs) { renderState(host, '加载版本...', 'muted loading-state'); return; }
+    if (!revs.length) { renderState(host, '无版本记录', 'muted empty-state'); return; }
+    const details = el('details', 'artifacts-revisions');
+    details.open = false;
+    const summary = el('summary', 'artifacts-revisions__summary');
+    summary.textContent = '版本历史 (' + revs.length + ')';
+    details.appendChild(summary);
+    const list = el('ul', 'artifacts-revisions__list');
+    const currentId = detail.current_revision_id || null;
+    revs.forEach((rev) => list.appendChild(renderRevisionRow(rev, currentId, detail)));
+    details.appendChild(list);
+    host.appendChild(details);
+    // diff view (safe textContent in a <pre>; no raw HTML assignment)
+    if (state.diffView && state.diffView.text != null) {
+      const diffWrap = el('div', 'artifacts-diff');
+      const diffTitle = el('div', 'artifacts-diff__title');
+      diffTitle.textContent = '差异: v' + (state.diffView.fromLabel != null ? state.diffView.fromLabel : '?')
+        + ' -> v' + (state.diffView.toLabel != null ? state.diffView.toLabel : '?');
+      diffWrap.appendChild(diffTitle);
+      const pre = el('pre', 'artifacts-diff__pre');
+      pre.textContent = state.diffView.text;
+      diffWrap.appendChild(pre);
+      const closeBtn = el('button', 'btn artifacts-diff__close');
+      closeBtn.type = 'button';
+      closeBtn.textContent = '关闭差异';
+      closeBtn.addEventListener('click', () => { state.diffView = null; renderRevisionsPanel(); });
+      diffWrap.appendChild(closeBtn);
+      host.appendChild(diffWrap);
+    }
+  }
+
+  function renderRevisionRow(rev, currentId, detail) {
+    const li = el('li', 'artifacts-revisions__item');
+    if (rev.is_current) li.classList.add('artifacts-revisions__item--current');
+    const meta = el('div', 'artifacts-revisions__meta');
+    const num = el('span', 'artifacts-revisions__num');
+    num.textContent = 'v' + (rev.revision_number != null ? rev.revision_number : '?');
+    meta.appendChild(num);
+    if (rev.is_current) {
+      const cur = el('span', 'artifacts-revisions__badge artifacts-revisions__badge--current');
+      cur.textContent = '当前';
+      meta.appendChild(cur);
+    }
+    if (rev.is_published) {
+      const pub = el('span', 'artifacts-revisions__badge artifacts-revisions__badge--published');
+      pub.textContent = '已发布';
+      meta.appendChild(pub);
+    }
+    const time = el('span', 'artifacts-revisions__time muted');
+    time.textContent = fmtTime(rev.created_at);
+    meta.appendChild(time);
+    li.appendChild(meta);
+    const summaryText = el('div', 'artifacts-revisions__summary-text');
+    summaryText.textContent = rev.change_summary || '';
+    li.appendChild(summaryText);
+    // Actions for non-current revisions: compare with current + rollback.
+    // Rollback carries the page's current expected_revision_id (CAS); on
+    // conflict the server rejects and we refresh (NO auto-replay).
+    if (!rev.is_current && rev.id && currentId) {
+      const actions = el('div', 'artifacts-revisions__actions');
+      const diffBtn = el('button', 'btn artifacts-revisions__diff');
+      diffBtn.type = 'button';
+      diffBtn.textContent = '对比当前';
+      diffBtn.addEventListener('click', () => doDiff(detail.id, rev.id, currentId, rev.revision_number));
+      actions.appendChild(diffBtn);
+      const rbBtn = el('button', 'btn artifacts-revisions__rollback');
+      rbBtn.type = 'button';
+      rbBtn.textContent = '回滚到此版本';
+      rbBtn.addEventListener('click', () => doRollback(detail, rev));
+      actions.appendChild(rbBtn);
+      li.appendChild(actions);
+    }
+    return li;
+  }
+
+  async function doDiff(id, fromId, toId, fromNum) {
+    try {
+      const sig = inflight ? inflight.signal : undefined;
+      const data = await fetchDiff(id, fromId, toId, sig);
+      // diff_text is a server-produced unified diff; render as safe textContent.
+      const text = data && typeof data.diff_text === 'string' ? data.diff_text
+        : (data && data.binary_changed ? '（二进制内容变化，无文本差异）' : '（无差异）');
+      state.diffView = { text: text, fromLabel: fromNum != null ? fromNum : '?', toLabel: '当前' };
+      renderRevisionsPanel();
+    } catch (e) {
+      if (getModal() && typeof getModal().alert === 'function') {
+        await getModal().alert('对比失败：' + (e && e.message ? e.message : e));
+      }
+    }
+  }
+
+  async function doRollback(detail, rev) {
+    if (!detail || !detail.id || !rev || !rev.id) return;
+    const expected = detail.current_revision_id;
+    if (!expected) {
+      if (getModal() && typeof getModal().alert === 'function') {
+        await getModal().alert('当前版本未知，请刷新后重试');
+      }
+      return;
+    }
+    const targetNum = rev.revision_number != null ? rev.revision_number : '?';
+    const confirmed = getModal() && typeof getModal().confirm === 'function'
+      ? await getModal().confirm('回滚到 v' + targetNum + '？将基于该版本创建一个新版本（不删除中间版本）。')
+      : global.confirm('回滚到 v' + targetNum + '？将基于该版本创建一个新版本。');
+    if (!confirmed) return;
+    try {
+      await rollbackArtifact(detail.id, rev.id, expected);
+      // success: reload detail + revisions (new current revision). No auto-replay.
+      state.diffView = null;
+      if (inflight) { try { inflight.abort(); } catch (_) {} }
+      revokeActiveBlobs();
+      inflight = new AbortController();
+      loadDetail(detail.id, inflight.signal);
+      reloadList();
+    } catch (e) {
+      if (e && e.code === 'artifact_revision_conflict') {
+        // CAS conflict: keep current version, prompt re-read, NO auto-replay.
+        if (getModal() && typeof getModal().alert === 'function') {
+          await getModal().alert('版本已变化，请刷新后重试');
+        }
+        if (inflight) { try { inflight.abort(); } catch (_) {} }
+        revokeActiveBlobs();
+        inflight = new AbortController();
+        loadDetail(detail.id, inflight.signal);
+      } else if (getModal() && typeof getModal().alert === 'function') {
+        await getModal().alert('回滚失败：' + (e && e.message ? e.message : e));
       }
     }
   }

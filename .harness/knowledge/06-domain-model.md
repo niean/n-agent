@@ -597,6 +597,8 @@ Agent 调用 task_complete
 
 任务结果不超过 64KB 时直接作为消息、存入SQLite，超过 64KB 时自动转为制品文件。
 
+制品升级为 Agent 原生可操作对象：内容更新产生不可变 ArtifactRevision 版本链（CAS expected_revision_id 防并发覆写，冲突 409 不自动重放），支持 diff/rollback；普通 Chat 经 8 个 artifact_* 工具直接 create/update/diff/rollback/publish（可信溯源由 ctx 注入，与 TaskService 解耦），写工具成功持久化 ui.artifact 卡片；新 Revision 不撤销已发布快照（publish_sync_state=outdated），重新发布才切换。Office 导出 DOCX/PPTX/XLSX（格式库隔离在 Infrastructure）。
+
 ---
 ---
 

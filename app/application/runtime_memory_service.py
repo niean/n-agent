@@ -274,6 +274,35 @@ class RuntimeMemoryService:
         message = ConversationMessage(role=role, content=content, source=source)
         return await self._store.append_message(session_id, message)
 
+    async def append_system_named_message(
+        self,
+        session_id: str,
+        name: str,
+        content: Any,
+        *,
+        card: dict[str, Any] | None = None,
+    ) -> ConversationMessage | None:
+        """Append a role=system message carrying a name and optional card.
+
+        Mirrors the ui.task_artifact pattern (SessionService) for UI
+        notification cards emitted from inside the Agent Runtime, which only
+        holds RuntimeMemoryService (not SessionService). Uses
+        ``append_message_if_session_exists`` so a deleted-session race does
+        NOT revive the session or write an orphan message: returns None when
+        the session is gone. Raises MemoryAccessDeniedError when the policy
+        denies the write; callers wrap best-effort paths in try/except.
+        """
+        decision = self._evaluate(
+            MemoryOperation.WRITE_MESSAGE, session_id,
+        )
+        await self._audit(decision, MemoryOperation.WRITE_MESSAGE, session_id)
+        if decision.verdict is not PolicyOutcome.ALLOW:
+            raise MemoryAccessDeniedError(decision, MemoryOperation.WRITE_MESSAGE)
+        message = ConversationMessage(
+            role="system", name=name, content=content, card=card,
+        )
+        return await self._store.append_message_if_session_exists(session_id, message)
+
     # ------------------------------------------------------------------
     # Tool calls
     # ------------------------------------------------------------------

@@ -372,6 +372,11 @@ body.modal-open { overflow: hidden; }
 /* 任务安全编辑 modal：表单项之间 5px 间隔。 */
 .providers-form__body { display: flex; flex-direction: column; gap: 5px; }
 .providers-form__hint { font-size: 12px; }
+/* 制品导出 modal：格式选项横向单选行。.providers-form label 默认纵向，此处覆盖为横向。 */
+.export-modal__options { display: flex; flex-direction: column; gap: var(--space-4); }
+.providers-form .export-modal__option { display: flex; flex-direction: row; align-items: center; gap: var(--space-5); padding: var(--space-4) var(--space-5); cursor: pointer; color: var(--color-fg-default); font-size: 13px; }
+.export-modal__option input[type="radio"] { margin: 0; }
+.export-modal__filename { word-break: break-all; }
 .row-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .row-actions-cell { white-space: normal; }
 .row-actions--memory { display: inline-flex; justify-content: flex-start; gap: 8px; max-width: 240px; }

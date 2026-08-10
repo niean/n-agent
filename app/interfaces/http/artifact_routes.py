@@ -16,6 +16,7 @@ Error code -> HTTP status mapping:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -27,21 +28,36 @@ from starlette.datastructures import UploadFile
 from app.interfaces.http._content_disposition import build_content_disposition
 from app.application.artifact_service import (
     ArtifactTooLargeError,
+    DiffResult,
     PublishBlockedError,
     PublishResult,
+    UpdateRevisionResult,
 )
 from app.domain.artifact import (
     Artifact,
     ArtifactConflictError,
     ArtifactContentUnavailableError,
+    ArtifactDiffTooLargeError,
+    ArtifactDiffUnsupportedError,
+    ArtifactExportError,
+    ArtifactExportTooLargeError,
+    ArtifactExportUnsupportedError,
     ArtifactKind,
     ArtifactListCursor,
+    ArtifactMigrationIncompleteError,
     ArtifactNotFoundError,
+    ArtifactReadTooLargeError,
+    ArtifactRevision,
+    ArtifactRevisionConflictError,
+    ArtifactRevisionNotFoundError,
+    ArtifactRevisionValidationError,
     ArtifactSource,
     ArtifactStatus,
     ArtifactValidationError,
     PublishedArtifact,
     PublishedArtifactNotFoundError,
+    RevisionListCursor,
+    RevisionListPage,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,7 +69,9 @@ _CHUNK_SIZE = 64 * 1024
 
 # PATCH field whitelist: only these fields may be set by the client.
 # id/source/source_kind/source_ref/created_by/checksum/size/status are
-# NOT directly settable.
+# NOT directly settable. expected_revision_id is a CAS token for content
+# updates (accepted in JSON body or via If-Match header), not a settable
+# artifact field; see _patch_from_json / _patch_from_multipart.
 _PATCH_ALLOWED_FIELDS = frozenset({"name", "summary", "classification", "labels", "content"})
 
 
@@ -110,7 +128,9 @@ def register_artifact_routes(router: APIRouter, artifact_service) -> None:
             return _exception_to_response(exc)
 
         return {
-            "items": [_artifact_to_dict(a) for a in page.items],
+            "items": await asyncio.gather(
+                *[_artifact_view(a, artifact_service) for a in page.items]
+            ),
             "next_cursor": _cursor_to_dict(page.next_cursor),
         }
 
@@ -131,7 +151,7 @@ def register_artifact_routes(router: APIRouter, artifact_service) -> None:
             art = await artifact_service.get_artifact(artifact_id)
         except Exception as exc:
             return _exception_to_response(exc)
-        return _artifact_to_dict(art)
+        return await _artifact_view(art, artifact_service)
 
     # ---- get content ----
     @router.get("/chat/artifacts/{artifact_id}/content")
@@ -161,18 +181,157 @@ def register_artifact_routes(router: APIRouter, artifact_service) -> None:
             return _exception_to_response(exc)
         return Response(status_code=204)
 
-    # ---- export ----
-    @router.get("/chat/artifacts/{artifact_id}/export")
-    async def export_artifact(artifact_id: str, format: str = "original"):
+    # ---- export capabilities ----
+    @router.get("/chat/artifacts/{artifact_id}/export/capabilities")
+    async def export_capabilities(artifact_id: str, revision_id: str | None = None):
         try:
-            data, mime, filename = await artifact_service.export(artifact_id, format=format)
+            capabilities = await artifact_service.export_capabilities(
+                artifact_id, revision_id=revision_id,
+            )
+        except Exception as exc:
+            return _exception_to_response(exc)
+        return {"capabilities": list(capabilities), "revision_id": revision_id}
+
+    # ---- export (optional revision_id pins a specific revision) ----
+    @router.get("/chat/artifacts/{artifact_id}/export")
+    async def export_artifact(
+        artifact_id: str, format: str = "original", revision_id: str | None = None,
+    ):
+        try:
+            data, mime, filename = await artifact_service.export(
+                artifact_id, format=format, revision_id=revision_id,
+            )
         except Exception as exc:
             return _exception_to_response(exc)
         return _build_content_response(data, mime, filename, None, force_attachment=True)
 
-    # ---- publish ----
+    # ---- revisions list ----
+    @router.get("/chat/artifacts/{artifact_id}/revisions")
+    async def list_revisions(
+        artifact_id: str, cursor: str | None = None, limit: int = 50,
+    ):
+        parsed_cursor = _parse_revision_cursor(cursor, artifact_id)
+        if isinstance(parsed_cursor, JSONResponse):
+            return parsed_cursor
+        clamped = max(1, min(100, limit))
+        try:
+            art = await artifact_service.get_artifact(artifact_id)
+            page = await artifact_service.list_revisions(
+                artifact_id, cursor=parsed_cursor, limit=clamped,
+            )
+            active = await artifact_service.get_active_publish(artifact_id)
+        except Exception as exc:
+            return _exception_to_response(exc)
+        current_revision_id = art.current_revision_id
+        published_revision_id = active.published_revision_id if active else None
+        items = [
+            _revision_list_item(rev, current_revision_id, published_revision_id)
+            for rev in page.items
+        ]
+        return {
+            "items": items,
+            "count": len(items),
+            "next_cursor": _revision_cursor_to_dict(page.next_cursor),
+        }
+
+    # ---- revision content ----
+    @router.get("/chat/artifacts/{artifact_id}/revisions/{revision_id}/content")
+    async def get_revision_content(artifact_id: str, revision_id: str):
+        try:
+            data, rev = await artifact_service.get_revision_content(
+                artifact_id, revision_id,
+            )
+            art = await _safe_get_artifact(artifact_service, artifact_id)
+        except Exception as exc:
+            return _exception_to_response(exc)
+        filename = art.name if art is not None else "content"
+        return _build_content_response(data, rev.mime, filename, rev.kind)
+
+    # ---- diff ----
+    @router.post("/chat/artifacts/{artifact_id}/diff")
+    async def diff_revisions_route(artifact_id: str, request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error_response("artifact_invalid", "invalid json body", 422)
+        if not isinstance(payload, dict):
+            return _error_response("artifact_invalid", "body must be a JSON object", 422)
+        from_revision_id = payload.get("from_revision_id")
+        to_revision_id = payload.get("to_revision_id")
+        if not isinstance(from_revision_id, str) or not from_revision_id:
+            return _error_response("artifact_invalid", "from_revision_id is required", 422)
+        if not isinstance(to_revision_id, str) or not to_revision_id:
+            return _error_response("artifact_invalid", "to_revision_id is required", 422)
+        context_lines = payload.get("context_lines", 3)
+        if isinstance(context_lines, bool) or not isinstance(context_lines, int):
+            return _error_response("artifact_invalid", "context_lines must be an integer", 422)
+        context_lines = max(0, min(20, context_lines))
+        try:
+            result = await artifact_service.diff_revisions(
+                artifact_id, from_revision_id, to_revision_id, context_lines=context_lines,
+            )
+        except Exception as exc:
+            return _exception_to_response(exc)
+        return {"diff_text": result.diff_text, "binary_changed": result.binary_changed}
+
+    # ---- rollback ----
+    @router.post("/chat/artifacts/{artifact_id}/rollback")
+    async def rollback_artifact(artifact_id: str, request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return _error_response("artifact_invalid", "invalid json body", 422)
+        if not isinstance(payload, dict):
+            return _error_response("artifact_invalid", "body must be a JSON object", 422)
+        target_revision_id = payload.get("target_revision_id")
+        expected_revision_id = payload.get("expected_revision_id")
+        if not isinstance(target_revision_id, str) or not target_revision_id:
+            return _error_response("artifact_invalid", "target_revision_id is required", 422)
+        if not isinstance(expected_revision_id, str) or not expected_revision_id:
+            return _error_response("artifact_invalid", "expected_revision_id is required", 422)
+        change_summary = payload.get("change_summary", "")
+        if not isinstance(change_summary, str):
+            return _error_response("artifact_invalid", "change_summary must be a string", 422)
+        try:
+            revision, result = await artifact_service.rollback(
+                artifact_id, target_revision_id,
+                expected_revision_id=expected_revision_id,
+                change_summary=change_summary,
+            )
+        except Exception as exc:
+            return _exception_to_response(exc)
+        art = await _safe_get_artifact(artifact_service, artifact_id)
+        return _write_result_to_dict(artifact_id, revision, art, result)
+
+    # ---- publish (body optional: legacy publishes current revision) ----
     @router.post("/chat/artifacts/{artifact_id}/publish")
-    async def publish_artifact(artifact_id: str):
+    async def publish_artifact(artifact_id: str, request: Request):
+        body = None
+        try:
+            raw = await request.body()
+            if raw.strip():
+                body = json.loads(raw)
+        except Exception:
+            return _error_response("artifact_invalid", "invalid json body", 422)
+        if body and isinstance(body, dict) and body.get("revision_id"):
+            revision_id = body["revision_id"]
+            if not isinstance(revision_id, str):
+                return _error_response("artifact_invalid", "revision_id must be a string", 422)
+            expected_current = body.get("expected_current_revision_id")
+            if not isinstance(expected_current, str) or not expected_current:
+                return _error_response(
+                    "artifact_invalid", "expected_current_revision_id is required", 422
+                )
+            try:
+                result = await artifact_service.publish_revision(
+                    artifact_id,
+                    revision_id=revision_id,
+                    expected_current_revision_id=expected_current,
+                )
+            except Exception as exc:
+                return _exception_to_response(exc)
+            return _publish_result_to_dict(result)
+        # Legacy: publish the current revision at call time.
         try:
             result = await artifact_service.publish(artifact_id)
         except Exception as exc:
@@ -261,7 +420,7 @@ async def _create_from_json(request: Request, service) -> JSONResponse:
         )
     except Exception as exc:
         return _exception_to_response(exc)
-    return JSONResponse(status_code=201, content=_artifact_to_dict(art))
+    return JSONResponse(status_code=201, content=await _artifact_view(art, service))
 
 
 async def _create_from_multipart(request: Request, service) -> JSONResponse:
@@ -350,7 +509,9 @@ async def _patch_from_json(artifact_id: str, request: Request, service) -> JSONR
     if not isinstance(payload, dict):
         return _error_response("artifact_invalid", "body must be a JSON object", 422)
 
-    forbidden = set(payload.keys()) - _PATCH_ALLOWED_FIELDS
+    # expected_revision_id is a CAS token for content updates, not a settable
+    # artifact field; it is allowed in the JSON body alongside content.
+    forbidden = set(payload.keys()) - _PATCH_ALLOWED_FIELDS - {"expected_revision_id"}
     if forbidden:
         return _error_response(
             "artifact_invalid",
@@ -358,12 +519,78 @@ async def _patch_from_json(artifact_id: str, request: Request, service) -> JSONR
             422,
         )
 
+    if "content" in payload:
+        return await _patch_content_json(artifact_id, payload, request, service)
+
+    # Metadata-only update: no CAS token, legacy update_artifact path.
     kwargs = _extract_patch_kwargs(payload)
     try:
         art = await service.update_artifact(artifact_id, **kwargs)
     except Exception as exc:
         return _exception_to_response(exc)
-    return JSONResponse(content=_artifact_to_dict(art))
+    return JSONResponse(content=await _artifact_view(art, service))
+
+
+async def _patch_content_json(
+    artifact_id: str, payload: dict, request: Request, service,
+) -> JSONResponse:
+    """Content update via JSON: CAS via expected_revision_id (body) or If-Match.
+
+    Both present but inconsistent -> 422 artifact_revision_invalid.
+    Both absent -> 409 artifact_revision_conflict.
+    Exactly one -> used as expected_revision_id.
+    """
+    body_token = payload.get("expected_revision_id")
+    if body_token is not None and not isinstance(body_token, str):
+        return _error_response(
+            "artifact_revision_invalid", "expected_revision_id must be a string", 422
+        )
+    if body_token is not None and not body_token.strip():
+        return _error_response(
+            "artifact_revision_invalid", "expected_revision_id must be non-empty", 422
+        )
+    header_token = _parse_if_match(request.headers.get("if-match"))
+    if isinstance(header_token, JSONResponse):
+        return header_token
+
+    if body_token is not None and header_token is not None and body_token != header_token:
+        return _error_response(
+            "artifact_revision_invalid",
+            "expected_revision_id and If-Match disagree",
+            422,
+        )
+    if body_token is None and header_token is None:
+        return _error_response(
+            "artifact_revision_conflict",
+            "expected_revision_id or If-Match required for content update",
+            409,
+        )
+
+    expected_revision_id = body_token or header_token
+    inline_content = payload["content"]
+    if not isinstance(inline_content, str):
+        return _error_response(
+            "artifact_revision_invalid", "content must be a string", 422
+        )
+    # Content (CAS) runs FIRST; metadata is applied only after the CAS-protected
+    # content write succeeds, so a stale token leaves metadata untouched (no
+    # partial commit). Metadata-only update_artifact is safe: it early-returns
+    # without touching content columns or revoking the active publish.
+    meta_kwargs = _extract_patch_kwargs(
+        {k: v for k, v in payload.items() if k != "content"}
+    )
+    try:
+        revision, result = await service.update_revision(
+            artifact_id,
+            expected_revision_id=expected_revision_id,
+            inline_content=inline_content,
+        )
+        if meta_kwargs:
+            await service.update_artifact(artifact_id, **meta_kwargs)
+    except Exception as exc:
+        return _exception_to_response(exc)
+    art = await _safe_get_artifact(service, artifact_id)
+    return JSONResponse(content=_write_result_to_dict(artifact_id, revision, art, result))
 
 
 async def _patch_from_multipart(artifact_id: str, request: Request, service) -> JSONResponse:
@@ -380,7 +607,9 @@ async def _patch_from_multipart(artifact_id: str, request: Request, service) -> 
         else:
             form_fields[key] = str(value)
 
-    forbidden = set(form_fields.keys()) - _PATCH_ALLOWED_FIELDS
+    # Multipart uses If-Match only for content CAS; expected_revision_id and
+    # content are NOT accepted as form fields (content is the uploaded file).
+    forbidden = set(form_fields.keys()) - (_PATCH_ALLOWED_FIELDS - {"content"})
     if forbidden:
         return _error_response(
             "artifact_invalid",
@@ -389,26 +618,55 @@ async def _patch_from_multipart(artifact_id: str, request: Request, service) -> 
         )
 
     file_data = None
-    filename = None
     if len(upload_files) == 1:
         file = upload_files[0]
         file_data = await _read_upload_bounded(file)
         if isinstance(file_data, JSONResponse):
             return file_data
-        filename = file.filename
     elif len(upload_files) > 1:
         return _error_response("artifact_invalid", "at most one file is allowed", 422)
 
-    kwargs = _extract_patch_kwargs(form_fields)
     if file_data is not None:
-        kwargs["file_data"] = file_data
-        kwargs["filename"] = filename
+        # Multipart content update: If-Match only (spec line 199).
+        header_token = _parse_if_match(request.headers.get("if-match"))
+        if isinstance(header_token, JSONResponse):
+            return header_token
+        if header_token is None:
+            return _error_response(
+                "artifact_revision_conflict",
+                "If-Match required for multipart content update",
+                409,
+            )
+        # Content (CAS) first, then metadata (no partial commit on conflict).
+        meta_kwargs = _extract_patch_kwargs(form_fields)
+        try:
+            revision, result = await service.update_revision(
+                artifact_id,
+                expected_revision_id=header_token,
+                file_data=file_data,
+            )
+            if meta_kwargs:
+                await service.update_artifact(artifact_id, **meta_kwargs)
+        except Exception as exc:
+            return _exception_to_response(exc)
+        art = await _safe_get_artifact(service, artifact_id)
+        return JSONResponse(content=_write_result_to_dict(artifact_id, revision, art, result))
 
+    # Metadata-only update.
+    kwargs = _extract_patch_kwargs(form_fields)
     try:
         art = await service.update_artifact(artifact_id, **kwargs)
     except Exception as exc:
         return _exception_to_response(exc)
-    return JSONResponse(content=_artifact_to_dict(art))
+    return JSONResponse(content=await _artifact_view(art, service))
+
+
+async def _safe_get_artifact(service, artifact_id: str):
+    """Best-effort artifact fetch for write responses (write already committed)."""
+    try:
+        return await service.get_artifact(artifact_id)
+    except Exception:
+        return None
 
 
 def _extract_patch_kwargs(payload: dict) -> dict:
@@ -517,7 +775,11 @@ def _is_text_mime(mime: str) -> bool:
 
 
 def _artifact_to_dict(artifact: Artifact) -> dict:
-    """Serialize an Artifact to a JSON-safe dict (no content_ref/inline_content)."""
+    """Serialize an Artifact to a JSON-safe dict (no content_ref/inline_content).
+
+    current_revision_id is carried on the Artifact; revision_number and
+    publish_sync_state are derived (filled by _artifact_view, None until then).
+    """
     view = artifact.to_public_view()
     return {
         "id": view["id"],
@@ -533,9 +795,73 @@ def _artifact_to_dict(artifact: Artifact) -> dict:
         "classification": view["classification"],
         "labels": list(view["labels"]) if view["labels"] is not None else None,
         "status": _enum_value(view["status"]),
+        "current_revision_id": artifact.current_revision_id,
+        "revision_number": None,
+        "publish_sync_state": None,
         "created_at": _dt_to_iso(view["created_at"]),
         "updated_at": _dt_to_iso(view["updated_at"]),
         "created_by": view["created_by"],
+    }
+
+
+async def _artifact_view(artifact: Artifact, service) -> dict:
+    """Enriched artifact dict: derives revision_number + publish_sync_state.
+
+    Best-effort: list/detail reads are never blocked by migration state, so
+    derivation failures degrade to None rather than surfacing a 503 (503 only
+    gates writes and revision-specific operations, per the error contract).
+    """
+    data = _artifact_to_dict(artifact)
+    try:
+        current = await service.get_current_revision(artifact.id)
+        data["revision_number"] = current.revision_number
+    except Exception:
+        data["revision_number"] = None
+    try:
+        data["publish_sync_state"] = await service.get_publish_sync_state(artifact.id)
+    except Exception:
+        data["publish_sync_state"] = None
+    return data
+
+
+def _revision_list_item(
+    revision: ArtifactRevision,
+    current_revision_id: str | None,
+    published_revision_id: str | None,
+) -> dict:
+    """Compact revision list item (shape matches the artifact_list_revisions tool)."""
+    rid = revision.id
+    return {
+        "id": rid,
+        "revision_number": revision.revision_number,
+        "checksum": revision.checksum,
+        "size": revision.size,
+        "change_summary": revision.change_summary,
+        "created_by": revision.created_by,
+        "created_at": _dt_to_iso(revision.created_at),
+        "is_current": rid == current_revision_id,
+        "is_published": bool(published_revision_id) and rid == published_revision_id,
+    }
+
+
+def _write_result_to_dict(
+    artifact_id: str,
+    revision: ArtifactRevision,
+    art: Artifact | None,
+    result: UpdateRevisionResult,
+) -> dict:
+    """Unified write-tool metadata + diff/content markers (matches tool output)."""
+    return {
+        "artifact_id": artifact_id,
+        "revision_id": revision.id,
+        "revision_number": revision.revision_number,
+        "name": art.name if art is not None else "",
+        "kind": _enum_value(art.kind) if art is not None else None,
+        "size": revision.size,
+        "checksum": revision.checksum,
+        "publish_sync_state": getattr(result, "publish_sync_state", ""),
+        "diff_summary": getattr(result, "diff_summary", ""),
+        "content_unchanged": getattr(result, "content_unchanged", False),
     }
 
 
@@ -563,6 +889,7 @@ def _publish_result_to_dict(result: PublishResult) -> dict:
         "share_path": f"/p/{result.published.publish_id}",
         "share_url": result.share_url,
         "reused": result.reused,
+        "published_revision_id": result.published.published_revision_id,
     }
 
 
@@ -625,6 +952,66 @@ def _parse_cursor(cursor_str: str | None):
         return _error_response("artifact_invalid", "invalid cursor", 422)
 
 
+def _parse_revision_cursor(cursor_str: str | None, artifact_id: str):
+    """Parse a revision list cursor (bound to artifact_id).
+
+    A bad or cross-artifact cursor maps to artifact_revision_invalid (spec: the
+    revision cursor is bound to artifact_id; cross-artifact -> invalid, no leak).
+    """
+    if cursor_str is None:
+        return None
+    try:
+        data = json.loads(cursor_str)
+        cursor = RevisionListCursor(
+            artifact_id=data["artifact_id"],
+            revision_number=int(data["revision_number"]),
+            id=data["id"],
+        )
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+        return _error_response("artifact_revision_invalid", "invalid cursor", 422)
+    if cursor.artifact_id != artifact_id:
+        return _error_response("artifact_revision_invalid", "invalid cursor", 422)
+    return cursor
+
+
+def _revision_cursor_to_dict(cursor: RevisionListCursor | None) -> dict | None:
+    if cursor is None:
+        return None
+    return {
+        "artifact_id": cursor.artifact_id,
+        "revision_number": cursor.revision_number,
+        "id": cursor.id,
+    }
+
+
+def _parse_if_match(header_value: str | None):
+    """Parse the If-Match header into a single strong ETag revision_id.
+
+    Accepts exactly one strong, quoted ETag (``"rid"``). Rejects weak (``W/``),
+    wildcard (``*``), unquoted, empty, or multiple ETags with
+    artifact_revision_invalid. Returns None when the header is absent.
+    """
+    if header_value is None or header_value.strip() == "":
+        return None
+    raw = header_value.strip()
+    # Wildcard is not accepted for revision CAS.
+    if raw == "*":
+        return _error_response("artifact_revision_invalid", "If-Match wildcard not allowed", 422)
+    # Multiple ETags (comma-separated) are not accepted.
+    if "," in raw:
+        return _error_response("artifact_revision_invalid", "If-Match must be a single ETag", 422)
+    # Weak ETags are not accepted.
+    if raw.startswith("W/"):
+        return _error_response("artifact_revision_invalid", "If-Match weak ETag not allowed", 422)
+    # Must be a strong quoted ETag: "..." .
+    if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
+        return _error_response("artifact_revision_invalid", "If-Match must be a quoted ETag", 422)
+    revision_id = raw[1:-1]
+    if not revision_id:
+        return _error_response("artifact_revision_invalid", "If-Match empty ETag", 422)
+    return revision_id
+
+
 def _default_mime(kind: ArtifactKind) -> str:
     """Default MIME for an ArtifactKind."""
     defaults = {
@@ -657,7 +1044,38 @@ def _error_response(code: str, message: str, status_code: int) -> JSONResponse:
 
 
 def _exception_to_response(exc: Exception) -> JSONResponse:
-    """Map application/domain exceptions to the unified error envelope."""
+    """Map application/domain exceptions to the unified error envelope.
+
+    Branch order matters: revision/export subclasses must precede their parent
+    classes (ArtifactRevisionValidationError before ArtifactValidationError;
+    ArtifactExportUnsupportedError/ArtifactExportTooLargeError before
+    ArtifactExportError).
+    """
+    # Revision-specific error codes (independent roots + one subclass).
+    if isinstance(exc, ArtifactRevisionNotFoundError):
+        return _error_response("artifact_revision_not_found", str(exc), 404)
+    if isinstance(exc, ArtifactRevisionConflictError):
+        return _error_response("artifact_revision_conflict", str(exc), 409)
+    if isinstance(exc, ArtifactRevisionValidationError):
+        return _error_response("artifact_revision_invalid", str(exc), 422)
+    # Export errors: specific subclasses before the generic ArtifactExportError.
+    if isinstance(exc, ArtifactExportUnsupportedError):
+        return _error_response("artifact_export_unsupported", str(exc), 422)
+    if isinstance(exc, ArtifactExportTooLargeError):
+        return _error_response("artifact_export_too_large", str(exc), 413)
+    if isinstance(exc, ArtifactExportError):
+        # Generic message: never leak library internals/abs paths/temp files.
+        return _error_response("artifact_export_failed", "export failed", 500)
+    # Read/diff size limits.
+    if isinstance(exc, ArtifactReadTooLargeError):
+        return _error_response("artifact_read_too_large", str(exc), 413)
+    if isinstance(exc, ArtifactDiffTooLargeError):
+        return _error_response("artifact_diff_too_large", str(exc), 413)
+    if isinstance(exc, ArtifactDiffUnsupportedError):
+        return _error_response("artifact_diff_unsupported", str(exc), 422)
+    if isinstance(exc, ArtifactMigrationIncompleteError):
+        return _error_response("artifact_migration_incomplete", str(exc), 503)
+    # Existing branches (unchanged).
     if isinstance(exc, ArtifactNotFoundError):
         return _error_response("artifact_not_found", str(exc), 404)
     if isinstance(exc, ArtifactValidationError):

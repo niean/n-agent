@@ -391,3 +391,236 @@ def test_lifespan_skips_backfill_when_disabled(tmp_path: Path, monkeypatch):
     app = create_app(_settings(tmp_path, artifacts_enabled=False))
     with TestClient(app) as client:
         assert not backfill_called["value"]
+
+
+# ---------------------------------------------------------------------------
+# T7: Revision migration backfill + health
+# ---------------------------------------------------------------------------
+
+
+def test_lifespan_runs_revision_migration_when_enabled(
+    tmp_path: Path, monkeypatch,
+):
+    """Lifespan calls migrate_revisions when artifact_service is wired."""
+    migrate_called = {"value": False}
+    original_migrate = ArtifactService.migrate_revisions
+
+    async def tracking_migrate(self, *, batch_size: int = 100):
+        migrate_called["value"] = True
+        return await original_migrate(self, batch_size=batch_size)
+
+    monkeypatch.setattr(
+        ArtifactService, "migrate_revisions", tracking_migrate,
+    )
+    app = create_app(_settings(tmp_path, artifacts_enabled=True))
+    with TestClient(app) as client:
+        assert migrate_called["value"]
+
+
+def test_lifespan_skips_revision_migration_when_disabled(
+    tmp_path: Path, monkeypatch,
+):
+    """Lifespan does NOT run migrate_revisions when artifact_service is None."""
+    migrate_called = {"value": False}
+
+    async def tracking_migrate(self, *, batch_size: int = 100):
+        migrate_called["value"] = True
+        return {"processed": 0, "migrated": 0, "skipped": 0, "failed": 0}
+
+    monkeypatch.setattr(
+        ArtifactService, "migrate_revisions", tracking_migrate,
+    )
+    app = create_app(_settings(tmp_path, artifacts_enabled=False))
+    with TestClient(app) as client:
+        assert not migrate_called["value"]
+
+
+def test_health_has_migration_key_when_enabled(tmp_path: Path):
+    """health_snapshot includes artifact_revision_migration when
+    artifacts_enabled=True."""
+    services = build_application_services(
+        _settings(tmp_path, artifacts_enabled=True),
+    )
+    assert services.artifact_service is not None
+    health = services.health_snapshot()
+    assert "artifact_revision_migration" in health
+    mig = health["artifact_revision_migration"]
+    assert mig["state"] in ("ok", "degraded")
+    assert "failed_count" in mig
+    assert "last_error" in mig
+
+
+def test_health_no_migration_key_when_disabled(tmp_path: Path):
+    """health_snapshot does NOT include artifact_revision_migration when
+    artifacts_enabled=False."""
+    services = build_application_services(_settings(tmp_path))
+    assert services.artifact_service is None
+    health = services.health_snapshot()
+    assert "artifact_revision_migration" not in health
+
+
+def test_health_migration_ok_after_successful_backfill(tmp_path: Path):
+    """After a successful migration, health shows state=ok."""
+    from app.domain.artifact import (
+        Artifact,
+        ArtifactKind,
+        ArtifactSource,
+    )
+
+    services = build_application_services(
+        _settings(tmp_path, artifacts_enabled=True),
+    )
+    assert services.artifact_service is not None
+    registry = services.artifact_service._registry
+
+    # Insert an unmigrated inline artifact directly (no revision).
+    inline = b"# Hello world"
+    art = Artifact(
+        id="art-test-1",
+        name="doc.md",
+        kind=ArtifactKind.MARKDOWN,
+        mime="text/markdown",
+        content_ref=None,
+        inline_content=inline.decode("utf-8"),
+        size=len(inline),
+        checksum="sha256:" + hashlib.sha256(inline).hexdigest(),
+        source_kind=ArtifactSource.MANUAL,
+        source_ref="art-test-1",
+    )
+    asyncio.run(registry.create_artifact(art))
+
+    # Run migration
+    stats = asyncio.run(
+        services.artifact_service.migrate_revisions(batch_size=100),
+    )
+    assert stats["failed"] == 0
+    assert stats["migrated"] == 1
+
+    # Health shows ok
+    health = services.health_snapshot()
+    mig = health["artifact_revision_migration"]
+    assert mig["state"] == "ok"
+    assert mig["failed_count"] == 0
+    assert mig["last_error"] is None
+
+
+def test_health_migration_degraded_after_failed_backfill(tmp_path: Path):
+    """After a migration with failures, health shows state=degraded with
+    sanitized last_error (no paths/refs/class names)."""
+    from app.domain.artifact import (
+        Artifact,
+        ArtifactKind,
+        ArtifactSource,
+    )
+
+    services = build_application_services(
+        _settings(tmp_path, artifacts_enabled=True),
+    )
+    assert services.artifact_service is not None
+    registry = services.artifact_service._registry
+
+    # Insert an unmigrated artifact with an unreadable source (content_ref
+    # points to a non-existent file -- the content store has no such entry).
+    art = Artifact(
+        id="art-fail-1",
+        name="file.bin",
+        kind=ArtifactKind.OTHER,
+        mime="application/octet-stream",
+        content_ref="item:art-fail-1/missing",
+        inline_content=None,
+        size=10,
+        checksum="sha256:" + hashlib.sha256(b"x" * 10).hexdigest(),
+        source_kind=ArtifactSource.MANUAL,
+        source_ref="art-fail-1",
+    )
+    asyncio.run(registry.create_artifact(art))
+
+    # Run migration -- the unreadable source should fail.
+    stats = asyncio.run(
+        services.artifact_service.migrate_revisions(batch_size=100),
+    )
+    assert stats["failed"] == 1
+
+    # Health shows degraded with sanitized last_error
+    health = services.health_snapshot()
+    mig = health["artifact_revision_migration"]
+    assert mig["state"] == "degraded"
+    assert mig["failed_count"] == 1
+    assert mig["last_error"] is not None
+    # Sanitized: no paths, refs, or exception class names
+    assert "item:" not in mig["last_error"]
+    assert "art-fail" not in mig["last_error"]
+    assert "Error" not in mig["last_error"]
+    assert "/" not in mig["last_error"]
+
+
+# ---------------------------------------------------------------------------
+# T11: Exporter SPI + 8 artifact tools + PromptBuilder guidance wiring
+# ---------------------------------------------------------------------------
+
+from app.application.artifact_tools import ARTIFACT_TOOL_NAMES, artifact_tool_definitions  # noqa: E402
+from app.application.prompt_builder import ARTIFACT_GUIDANCE  # noqa: E402
+from app.infrastructure.artifact.exporters import OfficeArtifactExporter  # noqa: E402
+
+
+def test_artifact_tools_registered_when_enabled(tmp_path: Path):
+    """artifacts_enabled=True -> all 8 artifact_* tools registered on tool_service."""
+    services = build_application_services(
+        _settings(tmp_path, artifacts_enabled=True)
+    )
+    names = {d.name for d in services.tool_service.list_definitions()}
+    for tool_name in ARTIFACT_TOOL_NAMES:
+        assert tool_name in names, f"missing tool: {tool_name}"
+    # exactly the 8 artifact tools (no extras, no duplicates)
+    artifact_names = {n for n in names if n.startswith("artifact_")}
+    assert artifact_names == set(ARTIFACT_TOOL_NAMES)
+
+
+def test_no_artifact_tools_when_disabled(tmp_path: Path):
+    """artifacts_enabled=False -> NO artifact_* tool registered."""
+    services = build_application_services(_settings(tmp_path))
+    names = {d.name for d in services.tool_service.list_definitions()}
+    assert not any(n.startswith("artifact_") for n in names)
+
+
+def test_exporter_wired_when_enabled(tmp_path: Path):
+    """artifacts_enabled=True -> ArtifactService._exporter is the
+    OfficeArtifactExporter (Infrastructure adapter for the Domain port)."""
+    services = build_application_services(
+        _settings(tmp_path, artifacts_enabled=True)
+    )
+    assert services.artifact_service is not None
+    exporter = services.artifact_service._exporter
+    assert exporter is not None
+    assert isinstance(exporter, OfficeArtifactExporter)
+
+
+def test_exporter_none_when_disabled(tmp_path: Path):
+    """artifacts_enabled=False -> no ArtifactService (and thus no exporter)."""
+    services = build_application_services(_settings(tmp_path))
+    assert services.artifact_service is None
+
+
+def test_artifact_guidance_reaches_chat_prompt_when_enabled(tmp_path: Path):
+    """artifacts_enabled=True -> the chat AgentGraphRunner's ContextService
+    carries ARTIFACT_GUIDANCE (so the normal-chat system prompt includes it)."""
+    services = build_application_services(
+        _settings(tmp_path, artifacts_enabled=True)
+    )
+    ctx = services.chat_service.graph_runner.context_service
+    assert ctx._artifact_guidance == ARTIFACT_GUIDANCE
+
+
+def test_artifact_guidance_absent_from_chat_prompt_when_disabled(tmp_path: Path):
+    """artifacts_enabled=False -> ContextService._artifact_guidance is None
+    (no Artifact Guidance section in the chat system prompt)."""
+    services = build_application_services(_settings(tmp_path))
+    ctx = services.chat_service.graph_runner.context_service
+    assert ctx._artifact_guidance is None
+
+
+def test_artifact_tool_definitions_count_is_eight():
+    """artifact_tool_definitions() returns exactly the 8 revision tools."""
+    defs = artifact_tool_definitions()
+    assert len(defs) == 8
+    assert {d.name for d in defs} == set(ARTIFACT_TOOL_NAMES)

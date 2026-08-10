@@ -25,15 +25,23 @@ from app.domain.artifact import (
     Artifact,
     ArtifactAttachmentSource,
     ArtifactContentUnavailableError,
+    ArtifactDeleteGraph,
     ArtifactKind,
     ArtifactListCursor,
+    ArtifactListPage,
     ArtifactNotFoundError,
+    ArtifactRevision,
+    ArtifactRevisionConflictError,
+    ArtifactRevisionNotFoundError,
+    ArtifactRevisionValidationError,
     ArtifactSource,
     ArtifactStatus,
     ArtifactValidationError,
     PublishedArtifact,
     PublishedArtifactNotFoundError,
     PublishedArtifactStatus,
+    RevisionListCursor,
+    RevisionListPage,
 )
 from app.domain.artifact_policy import (
     ArtifactPolicy,
@@ -51,6 +59,7 @@ from app.domain.policy import (
     PolicyOutcome,
 )
 from app.domain.task import TaskArtifact
+from app.domain.artifact_exporter import ArtifactExporter
 from app.infrastructure.artifact.export_converter import convert_to_html
 
 
@@ -66,15 +75,18 @@ class FakeArtifactRegistry:
         self._artifacts: dict[str, Artifact] = {}
         self._published: dict[str, PublishedArtifact] = {}
         self._active_by_artifact: dict[str, str] = {}
+        self._revisions: dict[str, list[ArtifactRevision]] = {}
         self.create_calls: list[Artifact] = []
         self.update_calls: list[Artifact] = []
         self.delete_calls: list[str] = []
         self.register_calls: list[tuple[PublishedArtifact, str | None]] = []
         self.revoke_calls: list[str] = []
         self.list_calls: list[dict[str, Any]] = []
+        self.append_calls: list[tuple[str, ArtifactRevision, str]] = []
         self.fail_on_create = False
         self.fail_on_update = False
         self.fail_on_register = False
+        self.fail_on_append = False
 
     async def create_artifact(self, artifact: Artifact) -> Artifact:
         self.create_calls.append(artifact)
@@ -152,6 +164,7 @@ class FakeArtifactRegistry:
     async def delete_artifact(self, artifact_id: str) -> bool:
         self.delete_calls.append(artifact_id)
         existed = self._artifacts.pop(artifact_id, None) is not None
+        self._revisions.pop(artifact_id, None)
         return existed
 
     async def get_by_source(
@@ -259,9 +272,273 @@ class FakeArtifactRegistry:
     ) -> tuple[ArtifactAttachmentSource, ...]:
         return ()
 
+    # --- Revision lifecycle ---
+
+    async def create_artifact_with_initial_revision(
+        self, artifact: Artifact, initial: ArtifactRevision,
+    ) -> tuple[Artifact, ArtifactRevision]:
+        self.create_calls.append(artifact)
+        if self.fail_on_create:
+            raise RuntimeError("registry create failed")
+        if initial.artifact_id != artifact.id:
+            raise ArtifactRevisionValidationError(
+                "initial revision artifact_id mismatch"
+            )
+        if initial.revision_number != 1 or not initial.is_initial:
+            raise ArtifactRevisionValidationError(
+                "initial revision must be revision_number=1 with no parent"
+            )
+        stored = replace(artifact, current_revision_id=initial.id)
+        self._artifacts[artifact.id] = stored
+        self._revisions[artifact.id] = [initial]
+        return stored, initial
+
+    async def append_revision(
+        self, artifact_id: str, revision: ArtifactRevision, *,
+        expected_revision_id: str,
+    ) -> ArtifactRevision:
+        self.append_calls.append((artifact_id, revision, expected_revision_id))
+        if self.fail_on_append:
+            raise RuntimeError("append failed")
+        art = self._artifacts.get(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id != expected_revision_id:
+            raise ArtifactRevisionConflictError(
+                f"CAS conflict: expected {expected_revision_id}, "
+                f"actual {art.current_revision_id}"
+            )
+        if revision.parent_revision_id != art.current_revision_id:
+            raise ArtifactRevisionValidationError(
+                "parent_revision_id must equal current_revision_id"
+            )
+        revs = self._revisions.setdefault(artifact_id, [])
+        expected_next = max((r.revision_number for r in revs), default=0) + 1
+        if revision.revision_number != expected_next:
+            raise ArtifactRevisionValidationError(
+                f"revision_number must be {expected_next}, "
+                f"got {revision.revision_number}"
+            )
+        if revision.parent_revision_id is not None:
+            parent_ok = any(
+                r.id == revision.parent_revision_id for r in revs
+            )
+            if not parent_ok:
+                raise ArtifactRevisionValidationError(
+                    "parent_revision_id does not belong to this artifact"
+                )
+        if revision.rollback_from_revision_id is not None:
+            rb_ok = any(
+                r.id == revision.rollback_from_revision_id for r in revs
+            )
+            if not rb_ok:
+                raise ArtifactRevisionValidationError(
+                    "rollback_from_revision_id does not belong to this artifact"
+                )
+        revs.append(revision)
+        self._artifacts[artifact_id] = replace(
+            art, current_revision_id=revision.id
+        )
+        return revision
+
+    async def get_revision(
+        self, artifact_id: str, revision_id: str,
+    ) -> ArtifactRevision | None:
+        for r in self._revisions.get(artifact_id, []):
+            if r.id == revision_id:
+                return r
+        return None
+
+    async def list_revisions(
+        self, artifact_id: str, *,
+        cursor: RevisionListCursor | None = None,
+        limit: int = 50,
+    ) -> RevisionListPage:
+        if cursor is not None and cursor.artifact_id != artifact_id:
+            raise ArtifactRevisionValidationError(
+                "cursor artifact_id does not match requested artifact_id"
+            )
+        clamped = max(1, min(100, limit))
+        revs = list(self._revisions.get(artifact_id, []))
+        revs.sort(key=lambda r: (r.revision_number, r.id), reverse=True)
+        if cursor is not None:
+            revs = [
+                r for r in revs
+                if (r.revision_number, r.id)
+                < (cursor.revision_number, cursor.id)
+            ]
+        page = revs[:clamped]
+        next_cursor = None
+        if len(revs) > clamped and page:
+            last = page[-1]
+            next_cursor = RevisionListCursor(
+                artifact_id=artifact_id,
+                revision_number=last.revision_number,
+                id=last.id,
+            )
+        return RevisionListPage(items=tuple(page), next_cursor=next_cursor)
+
+    async def delete_artifact_graph(
+        self, artifact_id: str,
+    ) -> ArtifactDeleteGraph:
+        revs = self._revisions.pop(artifact_id, [])
+        art = self._artifacts.get(artifact_id)
+        refs: list[str] = []
+        seen: set[str] = set()
+        for r in revs:
+            if r.content_ref and r.content_ref not in seen:
+                refs.append(r.content_ref)
+                seen.add(r.content_ref)
+        legacy = None
+        if art is not None and art.content_ref and art.content_ref.startswith("item:"):
+            if art.content_ref not in seen:
+                legacy = art.content_ref
+        snapshot_ids = tuple(
+            p.publish_id for p in self._published.values()
+            if p.artifact_id == artifact_id
+        )
+        to_remove = [
+            pid for pid, p in self._published.items()
+            if p.artifact_id == artifact_id
+        ]
+        for pid in to_remove:
+            del self._published[pid]
+        self._active_by_artifact.pop(artifact_id, None)
+        self._artifacts.pop(artifact_id, None)
+        return ArtifactDeleteGraph(
+            revision_content_refs=tuple(refs),
+            legacy_artifact_content_ref=legacy,
+            publish_snapshot_ids=snapshot_ids,
+        )
+
+    async def list_revision_migration_candidates(
+        self, *, cursor: ArtifactListCursor | None, limit: int,
+    ) -> ArtifactListPage:
+        items = [
+            a for a in self._artifacts.values()
+            if a.current_revision_id is None
+        ]
+        items.sort(
+            key=lambda a: (
+                a.updated_at or datetime.min.replace(tzinfo=timezone.utc),
+                a.id,
+            ),
+            reverse=True,
+        )
+        return ArtifactListPage(items=tuple(items[:limit]), next_cursor=None)
+
+    async def commit_initial_revision_backfill(
+        self, artifact_id: str, revision: ArtifactRevision,
+    ) -> ArtifactRevision:
+        art = self._artifacts.get(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        revs = self._revisions.setdefault(artifact_id, [])
+        if art.current_revision_id is not None:
+            existing = next(
+                (r for r in revs if r.id == art.current_revision_id), None
+            )
+            if existing is not None:
+                return existing
+        existing_r1 = next(
+            (r for r in revs if r.revision_number == 1), None
+        )
+        if existing_r1 is not None:
+            self._artifacts[artifact_id] = replace(
+                art, current_revision_id=existing_r1.id
+            )
+            return existing_r1
+        revs.append(revision)
+        self._artifacts[artifact_id] = replace(
+            art, current_revision_id=revision.id
+        )
+        return revision
+
+    async def register_revision_publish(
+        self, published: PublishedArtifact, *, artifact_id: str,
+        revision_id: str, expected_current_revision_id: str,
+    ) -> PublishedArtifact:
+        art = self._artifacts.get(artifact_id)
+        if art is None:
+            raise ArtifactNotFoundError(f"artifact not found: {artifact_id}")
+        if art.current_revision_id != expected_current_revision_id:
+            raise ArtifactRevisionConflictError(
+                f"CAS conflict: expected {expected_current_revision_id}, "
+                f"actual {art.current_revision_id}"
+            )
+        finalized = replace(published, published_revision_id=revision_id)
+        # Reuse: if an active publish with the same final public checksum
+        # already exists for this artifact, return it without inserting.
+        # Mirrors the SQLite _register_revision_publish_sync reuse path.
+        existing_pid = self._active_by_artifact.get(artifact_id)
+        if existing_pid is not None:
+            existing = self._published.get(existing_pid)
+            if (
+                existing is not None
+                and existing.status is PublishedArtifactStatus.ACTIVE
+                and existing.snapshot_checksum == finalized.snapshot_checksum
+            ):
+                return existing
+        self.register_calls.append((finalized, artifact_id))
+        if self.fail_on_register:
+            raise RuntimeError("registry register failed")
+        # Switch: revoke old active (if any) before inserting new.
+        if existing_pid is not None:
+            old = self._published.get(existing_pid)
+            if old is not None and old.status is PublishedArtifactStatus.ACTIVE:
+                self._published[existing_pid] = replace(
+                    old,
+                    status=PublishedArtifactStatus.REVOKED,
+                    revoked_at=datetime.now(timezone.utc),
+                )
+        self._published[finalized.publish_id] = finalized
+        if finalized.artifact_id and finalized.status is PublishedArtifactStatus.ACTIVE:
+            self._active_by_artifact[finalized.artifact_id] = (
+                finalized.publish_id
+            )
+        return finalized
+
+    async def count_artifacts_without_revision(self) -> int:
+        return sum(
+            1 for a in self._artifacts.values()
+            if a.current_revision_id is None
+        )
+
     # Helper to seed an artifact directly.
     def seed(self, artifact: Artifact) -> None:
         self._artifacts[artifact.id] = artifact
+
+    def seed_with_revision(self, artifact: Artifact) -> Artifact:
+        """Seed an artifact with a synthetic initial revision.
+
+        Creates a revision mirroring the artifact's content fields and
+        backfills ``current_revision_id``.  Used by publish tests that need
+        a revision-aware artifact without going through ``create_artifact``.
+        """
+        import secrets as _secrets
+        rev_id = _secrets.token_urlsafe(16)
+        rev = ArtifactRevision(
+            id=rev_id,
+            artifact_id=artifact.id,
+            revision_number=1,
+            parent_revision_id=None,
+            rollback_from_revision_id=None,
+            content_ref=artifact.content_ref,
+            inline_content=artifact.inline_content,
+            size=artifact.size,
+            checksum=artifact.checksum,
+            mime=artifact.mime,
+            kind=artifact.kind,
+            created_at=datetime.now(timezone.utc),
+            change_summary="",
+            created_by=artifact.created_by,
+            source_session_id=artifact.source_session_id,
+            source_run_id=None,
+        )
+        stored = replace(artifact, current_revision_id=rev_id)
+        self._artifacts[artifact.id] = stored
+        self._revisions[artifact.id] = [rev]
+        return stored
 
 
 class FakeArtifactContentStore:
@@ -277,6 +554,7 @@ class FakeArtifactContentStore:
         self.fail_on_read = False
         self.fail_on_write = False
         self.fail_on_materialize = False
+        self.fail_on_copy = False
 
     async def read(self, content_ref: str, *, max_bytes: int) -> bytes:
         self.read_calls.append((content_ref, max_bytes))
@@ -323,6 +601,8 @@ class FakeArtifactContentStore:
         self, src_ref: str, publish_id: str, *, inline: str | None = None
     ) -> str:
         self.copy_calls.append((src_ref, publish_id, inline))
+        if self.fail_on_copy:
+            raise RuntimeError("copy_to_publish_snapshot failed")
         if inline is not None:
             data = inline.encode("utf-8")
         else:
@@ -435,12 +715,18 @@ def _make_config(
     artifact_publish_max_bytes: int = 10 * 1024 * 1024,
     artifact_inline_max_bytes: int = 256 * 1024,
     published_base_url: str = "",
+    diff_max_bytes: int = 1 * 1024 * 1024,
+    diff_max_lines: int = 20000,
+    diff_max_output_chars: int = 200000,
 ) -> ArtifactServiceConfig:
     return ArtifactServiceConfig(
         artifact_max_bytes=artifact_max_bytes,
         artifact_publish_max_bytes=artifact_publish_max_bytes,
         artifact_inline_max_bytes=artifact_inline_max_bytes,
         published_base_url=published_base_url,
+        diff_max_bytes=diff_max_bytes,
+        diff_max_lines=diff_max_lines,
+        diff_max_output_chars=diff_max_output_chars,
     )
 
 
@@ -455,6 +741,7 @@ def _make_service(
     convert_html: Callable[[str], str] | None = None,
     task_session_resolver: Callable[[str], Awaitable[str | None]] | None = None,
     task_attachment_delete: Callable[[str], Awaitable[bool]] | None = None,
+    exporter: ArtifactExporter | None = None,
 ) -> ArtifactService:
     return ArtifactService(
         registry=registry or FakeArtifactRegistry(),
@@ -466,6 +753,7 @@ def _make_service(
         convert_to_html=convert_html or convert_to_html,
         task_session_resolver=task_session_resolver,
         task_attachment_delete=task_attachment_delete,
+        exporter=exporter,
     )
 
 
@@ -1308,7 +1596,7 @@ class TestPublish:
     async def test_policy_and_audit_called(self):
         registry = FakeArtifactRegistry()
         audit = FakePolicyAuditService()
-        registry.seed(_make_inline_artifact(inline_content="safe content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="safe content"))
         svc = _make_service(registry=registry, audit=audit)
         await svc.publish("art-1")
         assert len(audit.events) >= 1
@@ -1318,7 +1606,7 @@ class TestPublish:
     async def test_text_publish_uses_release_content(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True, redacted_content="REDACTED")
-        registry.seed(_make_inline_artifact(inline_content="secret-value-here"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="secret-value-here"))
         svc = _make_service(registry=registry, flow=flow)
         result = await svc.publish("art-1")
         assert flow.release_calls
@@ -1334,7 +1622,7 @@ class TestPublish:
     async def test_text_publish_denied_by_flow(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=False)
-        registry.seed(_make_inline_artifact(inline_content="secret content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="secret content"))
         svc = _make_service(registry=registry, flow=flow)
         with pytest.raises(PublishBlockedError):
             await svc.publish("art-1")
@@ -1348,7 +1636,7 @@ class TestPublish:
         ref = "item:art-2/file"
         store.seed(ref, b"\x89PNG data")
         # non-public classification -> deny
-        registry.seed(
+        registry.seed_with_revision(
             _make_file_artifact(
                 artifact_id="art-2",
                 content_ref=ref,
@@ -1366,7 +1654,7 @@ class TestPublish:
         store = FakeArtifactContentStore()
         ref = "item:art-2/file"
         store.seed(ref, b"\x89PNG data")
-        registry.seed(
+        registry.seed_with_revision(
             _make_file_artifact(
                 artifact_id="art-2",
                 content_ref=ref,
@@ -1384,7 +1672,7 @@ class TestPublish:
     async def test_same_artifact_same_checksum_reuse(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="stable"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="stable"))
         svc = _make_service(registry=registry, flow=flow)
         r1 = await svc.publish("art-1")
         assert not r1.reused
@@ -1398,7 +1686,7 @@ class TestPublish:
     async def test_edit_then_republish_new_id_old_revoked(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="v1"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="v1"))
         svc = _make_service(registry=registry, flow=flow)
         r1 = await svc.publish("art-1")
         # edit content -> revokes the active publish (snapshot diverges)
@@ -1419,8 +1707,8 @@ class TestPublish:
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
         # Two artifacts with identical content
-        registry.seed(_make_inline_artifact(artifact_id="art-a", inline_content="same"))
-        registry.seed(_make_inline_artifact(artifact_id="art-b", inline_content="same", name="doc-b.md"))
+        registry.seed_with_revision(_make_inline_artifact(artifact_id="art-a", inline_content="same"))
+        registry.seed_with_revision(_make_inline_artifact(artifact_id="art-b", inline_content="same", name="doc-b.md"))
         svc = _make_service(registry=registry, flow=flow)
         ra = await svc.publish("art-a")
         rb = await svc.publish("art-b")
@@ -1432,7 +1720,7 @@ class TestPublish:
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         registry.fail_on_register = True
         # Use small inline_max_bytes to force file-backed snapshot (not inline)
         config = _make_config(artifact_inline_max_bytes=2)
@@ -1454,7 +1742,7 @@ class TestPublish:
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="v1"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="v1"))
         svc = _make_service(registry=registry, content_store=store, flow=flow)
         r1 = await svc.publish("art-1")
         # edit content -> revokes the old active publish
@@ -1474,7 +1762,7 @@ class TestPublish:
         # publish: the snapshot content is unchanged, so the publish stays valid.
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry, flow=flow)
         r1 = await svc.publish("art-1")
         await svc.update_artifact("art-1", name="renamed.md", summary="new summary")
@@ -1487,7 +1775,7 @@ class TestPublish:
     @pytest.mark.asyncio
     async def test_publish_id_is_url_safe_128bit(self):
         registry = FakeArtifactRegistry()
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry)
         result = await svc.publish("art-1")
         pid = result.published.publish_id
@@ -1502,7 +1790,7 @@ class TestPublish:
     @pytest.mark.asyncio
     async def test_share_url_from_config_origin(self):
         registry = FakeArtifactRegistry()
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(
             registry=registry,
             config=_make_config(published_base_url="https://example.com"),
@@ -1513,7 +1801,7 @@ class TestPublish:
     @pytest.mark.asyncio
     async def test_share_url_relative_when_no_origin(self):
         registry = FakeArtifactRegistry()
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry)
         result = await svc.publish("art-1")
         assert result.share_url == f"/p/{result.published.publish_id}"
@@ -1521,7 +1809,7 @@ class TestPublish:
     @pytest.mark.asyncio
     async def test_archived_deny(self):
         registry = FakeArtifactRegistry()
-        registry.seed(_make_inline_artifact(status=ArtifactStatus.ARCHIVED))
+        registry.seed_with_revision(_make_inline_artifact(status=ArtifactStatus.ARCHIVED))
         svc = _make_service(registry=registry)
         with pytest.raises((PublishBlockedError, ArtifactValidationError)):
             await svc.publish("art-1")
@@ -1531,7 +1819,7 @@ class TestPublish:
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         # artifact has content_ref but content is missing
-        registry.seed(_make_file_artifact(content_ref="item:art-2/missing", size=10))
+        registry.seed_with_revision(_make_file_artifact(content_ref="item:art-2/missing", size=10))
         svc = _make_service(registry=registry, content_store=store)
         with pytest.raises((PublishBlockedError, ArtifactContentUnavailableError)):
             await svc.publish("art-2")
@@ -1547,7 +1835,7 @@ class TestRevokePublish:
     async def test_revoke(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry, flow=flow)
         await svc.publish("art-1")
         revoked = await svc.revoke_publish("art-1")
@@ -1558,7 +1846,7 @@ class TestRevokePublish:
     async def test_repeat_revoke_returns_same_revoked(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry, flow=flow)
         await svc.publish("art-1")
         r1 = await svc.revoke_publish("art-1")
@@ -1577,7 +1865,7 @@ class TestRevokePublish:
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry, content_store=store, flow=flow)
         result = await svc.publish("art-1")
         revoked = await svc.revoke_publish("art-1")
@@ -1593,7 +1881,7 @@ class TestGetPublished:
     async def test_get_published(self):
         registry = FakeArtifactRegistry()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry, flow=flow)
         result = await svc.publish("art-1")
         pub = await svc.get_published(result.published.publish_id)
@@ -1610,7 +1898,7 @@ class TestGetPublished:
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         flow = FakeInformationFlowService(allow=True)
-        registry.seed(_make_inline_artifact(inline_content="content"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content"))
         svc = _make_service(registry=registry, content_store=store, flow=flow)
         result = await svc.publish("art-1")
         store.read_calls.clear()
@@ -1623,7 +1911,7 @@ class TestGetPublished:
         registry = FakeArtifactRegistry()
         store = FakeArtifactContentStore()
         flow = FakeInformationFlowService(allow=True, redacted_content="REDACTED")
-        registry.seed(_make_inline_artifact(inline_content="content data"))
+        registry.seed_with_revision(_make_inline_artifact(inline_content="content data"))
         # inline_max_bytes=1 forces the 7-byte redacted snapshot into a FILE
         # (so snapshot_content_ref is set and a snapshot file exists to delete)
         svc = _make_service(
@@ -1703,7 +1991,10 @@ class TestRegisterFromAttachment:
         assert result.checksum == _sha256(actual_data)
         assert result.kind is ArtifactKind.PDF
         assert result.mime == "application/pdf"
-        assert result.content_ref == attachment_ref
+        # content is materialized to an owned item: ref (not the source ref)
+        assert result.content_ref is not None
+        assert result.content_ref.startswith("item:")
+        assert result.content_ref != attachment_ref
         assert result.source_kind is ArtifactSource.TASK_ATTACHMENT
         assert result.source_ref == "att-1"
         assert result.source_context_ref == "task-1"
@@ -1838,7 +2129,9 @@ class TestRegisterFromTaskArtifact:
         result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
         assert result is not None
         assert result.kind is ArtifactKind.OTHER
-        assert result.mime == ""
+        # empty mime falls back to application/octet-stream (revision requires
+        # non-empty mime)
+        assert result.mime == "application/octet-stream"
 
     @pytest.mark.asyncio
     async def test_invalid_workspace_ref_skipped(self, caplog):
