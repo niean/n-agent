@@ -30,12 +30,12 @@ from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
 
 
 def test_session_source_task_enum_value():
-    """SessionSource 新增第 10 个来源 TASK，值 'task'。"""
+    """SessionSource.TASK = 'task'（内部触发来源，非 IM 平台）。"""
     assert SessionSource.TASK.value == "task"
-    # 第 10 个来源（按 enum 定义顺序）
+    # 内部触发来源（schedule/curator/task/delegation）与 IM 平台同级
     members = list(SessionSource)
     assert SessionSource.TASK in members
-    assert len(members) == 10
+    assert len(members) == 11
 
 
 def test_session_source_task_not_in_im_platforms():

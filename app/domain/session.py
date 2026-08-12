@@ -29,6 +29,11 @@ class SessionSource(str, Enum):
     # 带连字符，与 schedule-{uuid4()}/curator-{uuid4()} 一致；跨 run 稳定、无需持久化），
     # 符合模式十六"前缀+UUID"规则。非 IM 平台，不进 im_platforms。
     TASK = "task"
+    # Delegation（多 Agent 委派）child/aggregator 的隔离执行入口，内部触发（非平台、
+    # 非外部 HTTP）。execution_session_id 用 `delegation-{uuid5(NAMESPACE_URL,
+    # f"{delegation_id}/{member_id}")}`：从委派与成员确定性派生，跨 run 稳定、member
+    # 重试复用同一 session。同 CURATOR/TASK，非 IM 平台，不进 im_platforms（模式十六）。
+    DELEGATION = "delegation"
 
     @classmethod
     def im_platforms(cls) -> set[str]:

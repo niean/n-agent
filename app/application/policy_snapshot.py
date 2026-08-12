@@ -6,6 +6,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Mapping, Protocol
 
+from app.application.delegation_policy_config import DelegationPolicyConfig
 from app.application.session_bootstrap import SessionDescriptor
 from app.config import Settings
 from app.domain.policy import ExecutionMode, RunPolicyContext
@@ -129,7 +130,7 @@ class PolicyProfileFacts:
 
 @dataclass(frozen=True)
 class ResolvedPolicyProfile:
-    """A resolved set of 10 typed Policy configs with a version tag."""
+    """A resolved set of 11 typed Policy configs with a version tag."""
 
     version: str
     turn: TurnPolicyConfig
@@ -142,6 +143,7 @@ class ResolvedPolicyProfile:
     schedule: SchedulePolicyConfig
     budget: BudgetPolicyConfig
     information_flow: InformationFlowPolicyConfig
+    delegation: DelegationPolicyConfig
 
 
 class PolicyProfileProvider(Protocol):
@@ -222,6 +224,24 @@ class SettingsPolicyProfileProvider:
                 store_usage_payloads=s.information_store_usage_payloads,
                 redact_secrets=s.information_redact_secrets,
             ),
+            delegation=DelegationPolicyConfig(
+                enabled=s.delegation_enabled,
+                realtime_enabled=s.delegation_realtime_enabled,
+                task_enabled=s.delegation_task_enabled,
+                max_children=s.delegation_max_children,
+                max_concurrency=s.delegation_max_concurrency,
+                max_concurrency_per_parent=s.delegation_max_concurrency_per_parent,
+                max_runtime_seconds=s.delegation_max_runtime_seconds,
+                member_max_runtime_seconds=s.delegation_member_max_runtime_seconds,
+                max_total_tokens=s.delegation_max_total_tokens,
+                max_tokens_per_child=s.delegation_max_tokens_per_child,
+                result_max_bytes=s.delegation_result_max_bytes,
+                structured_result_max_bytes=s.delegation_structured_result_max_bytes,
+                event_payload_max_bytes=s.delegation_event_payload_max_bytes,
+                member_max_retries=s.delegation_member_max_retries,
+                cancel_retry_max_attempts=s.delegation_cancel_retry_max_attempts,
+                cancel_retry_max_backoff_seconds=s.delegation_cancel_retry_max_backoff_seconds,
+            ),
         )
 
 
@@ -260,7 +280,7 @@ class IngressFacts:
 class RunPolicySnapshot:
     """Frozen per-run policy snapshot.
 
-    Holds the common RunPolicyContext, profile version, and 10 typed Policy
+    Holds the common RunPolicyContext, profile version, and 11 typed Policy
     configs.  Does NOT hold Budget account, approval pending, clock, manager,
     store, or any mutable runtime state.  After creation, the snapshot is never
     re-read against mutable config; the next run builds a new snapshot.
@@ -278,6 +298,7 @@ class RunPolicySnapshot:
     schedule: SchedulePolicyConfig
     budget: BudgetPolicyConfig
     information_flow: InformationFlowPolicyConfig
+    delegation: DelegationPolicyConfig
 
 
 # ---------------------------------------------------------------------------
@@ -332,4 +353,5 @@ class RunPolicySnapshotFactory:
             schedule=profile.schedule,
             budget=profile.budget,
             information_flow=profile.information_flow,
+            delegation=profile.delegation,
         )

@@ -85,6 +85,6 @@ def test_production_app_serves_policies(tmp_path: Path):
         assert res.status_code == 200
         assert res.headers["cache-control"] == "no-store"
         data = res.json()
-        assert len(data["policies"]) == 10
+        assert len(data["policies"]) == 11
         assert client.get("/security").status_code == 200
         assert client.post("/chat/policies").status_code == 405

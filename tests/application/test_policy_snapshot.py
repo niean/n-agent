@@ -8,6 +8,7 @@ import pytest
 from app.application.policy_snapshot import (
     BudgetPolicyConfig,
     ContextPolicyConfig,
+    DelegationPolicyConfig,
     GatewayPolicyConfig,
     IngressFacts,
     InformationFlowPolicyConfig,
@@ -189,6 +190,7 @@ def test_factory_works_with_non_system_profile():
         schedule=SchedulePolicyConfig(),
         budget=BudgetPolicyConfig(),
         information_flow=InformationFlowPolicyConfig(),
+        delegation=DelegationPolicyConfig(),
     )
     provider = FakePolicyProfileProvider(profile=tenant_profile, scope_ref="tenant-1")
     factory = RunPolicySnapshotFactory(provider)
@@ -203,7 +205,7 @@ def test_factory_works_with_non_system_profile():
     assert len(provider.resolve_calls) == 1
 
 
-def test_snapshot_has_all_ten_typed_configs():
+def test_snapshot_has_all_eleven_typed_configs():
     provider = FakePolicyProfileProvider(profile=_system_profile())
     factory = RunPolicySnapshotFactory(provider)
 
@@ -219,6 +221,7 @@ def test_snapshot_has_all_ten_typed_configs():
     assert isinstance(snapshot.schedule, SchedulePolicyConfig)
     assert isinstance(snapshot.budget, BudgetPolicyConfig)
     assert isinstance(snapshot.information_flow, InformationFlowPolicyConfig)
+    assert isinstance(snapshot.delegation, DelegationPolicyConfig)
 
 
 def test_snapshot_profile_version_from_provider():

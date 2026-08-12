@@ -245,6 +245,25 @@ class Settings(BaseSettings):
     artifact_diff_max_output_chars: int = Field(default=200000, gt=0)
     artifact_export_max_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
 
+    # Delegation 子域配置（多 Agent 委派与并行）. N_AGENT_DELEGATION_ 前缀.
+    # 默认全部关闭，三开关渐进开放（enabled 总开关 + realtime/task 分开关）.
+    delegation_enabled: bool = Field(default=False)
+    delegation_realtime_enabled: bool = Field(default=False)
+    delegation_task_enabled: bool = Field(default=False)
+    delegation_max_children: int = Field(default=8, ge=1)
+    delegation_max_concurrency: int = Field(default=8, ge=1)
+    delegation_max_concurrency_per_parent: int = Field(default=3, ge=1)
+    delegation_max_runtime_seconds: int = Field(default=1800, gt=0)
+    delegation_member_max_runtime_seconds: int = Field(default=900, gt=0)
+    delegation_max_total_tokens: int = Field(default=100000, gt=0)
+    delegation_max_tokens_per_child: int = Field(default=50000, gt=0)
+    delegation_result_max_bytes: int = Field(default=65536, gt=0)
+    delegation_structured_result_max_bytes: int = Field(default=32768, gt=0)
+    delegation_event_payload_max_bytes: int = Field(default=32768, gt=0)
+    delegation_member_max_retries: int = Field(default=1, ge=1)
+    delegation_cancel_retry_max_attempts: int = Field(default=5, ge=1)
+    delegation_cancel_retry_max_backoff_seconds: int = Field(default=60, gt=0)
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @field_validator("sandbox_type")
@@ -347,6 +366,26 @@ class Settings(BaseSettings):
         if self.artifact_inline_max_bytes > self.artifact_max_bytes:
             raise ValueError(
                 "artifact_inline_max_bytes must be <= artifact_max_bytes"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_delegation_bounds(self) -> "Settings":
+        """Cross-field validation for Delegation subsystem configuration."""
+        if self.delegation_max_concurrency_per_parent > self.delegation_max_concurrency:
+            raise ValueError(
+                "delegation_max_concurrency_per_parent must be <= "
+                "delegation_max_concurrency"
+            )
+        if self.delegation_member_max_runtime_seconds > self.delegation_max_runtime_seconds:
+            raise ValueError(
+                "delegation_member_max_runtime_seconds must be <= "
+                "delegation_max_runtime_seconds"
+            )
+        if self.delegation_max_tokens_per_child > self.delegation_max_total_tokens:
+            raise ValueError(
+                "delegation_max_tokens_per_child must be <= "
+                "delegation_max_total_tokens"
             )
         return self
 

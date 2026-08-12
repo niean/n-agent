@@ -9,6 +9,7 @@ from app.application.policy_dashboard_service import PolicyDashboardService
 from app.application.policy_snapshot import (
     BudgetPolicyConfig,
     ContextPolicyConfig,
+    DelegationPolicyConfig,
     GatewayPolicyConfig,
     InformationFlowPolicyConfig,
     LLMPolicyConfig,
@@ -52,6 +53,7 @@ def _full_profile() -> ResolvedPolicyProfile:
         schedule=SchedulePolicyConfig(),
         budget=BudgetPolicyConfig(max_usd_cost=Decimal("0.5")),
         information_flow=InformationFlowPolicyConfig(),
+        delegation=DelegationPolicyConfig(),
     )
 
 
@@ -72,6 +74,7 @@ def test_get_policies_success_contract():
     assert keys == [
         "turn", "context", "llm", "tool", "memory",
         "sandbox", "gateway", "schedule", "budget", "information_flow",
+        "delegation",
     ]
     for p in data["policies"]:
         assert set(p.keys()) == {
@@ -147,7 +150,7 @@ def test_security_shell_and_policy_route_when_wired(tmp_path):
     assert 'id="app-sidebar"' in shell_security.text
     res = client.get("/chat/policies")
     assert res.status_code == 200
-    assert len(res.json()["policies"]) == 10
+    assert len(res.json()["policies"]) == 11
 
 
 def test_policy_route_404_when_not_wired(tmp_path):

@@ -36,6 +36,7 @@ POLICY_FILES = [
     "task_policy.py",
     "browser_policy.py",
     "artifact_policy.py",
+    "delegation_policy.py",
 ]
 
 # Domain types files consumed by Policies (not Policy files themselves).
@@ -113,6 +114,7 @@ POLICY_FILE_OWN_DOMAIN = {
     "task_policy.py": {"app.domain.task"},
     "browser_policy.py": {"app.domain.browser"},
     "artifact_policy.py": {"app.domain.artifact"},
+    "delegation_policy.py": {"app.domain.delegation"},
 }
 
 
@@ -247,19 +249,38 @@ def test_run_policy_snapshot_factory_has_no_settings_reference():
 
 
 # ---------------------------------------------------------------------------
-# 4. Policy registration counts (artifact_policy is the 16th domain Policy)
+# 4. Policy registration counts (delegation_policy is the 17th domain Policy)
 # ---------------------------------------------------------------------------
 
 
 def test_policy_registration_counts():
-    """artifact_policy.py is registered as the 16th domain Policy.
+    """delegation_policy.py is registered as the 17th domain Policy.
 
-    POLICY_FILES includes the shared kernel (policy.py) + 16 domain Policies
-    = 17 entries. POLICY_FILE_OWN_DOMAIN maps the 16 domain Policy files
+    POLICY_FILES includes the shared kernel (policy.py) + 17 domain Policies
+    = 18 entries. POLICY_FILE_OWN_DOMAIN maps the 17 domain Policy files
     (excluding the shared kernel) to their allowed own-domain imports.
     """
-    assert len(POLICY_FILES) == 17
-    assert len(POLICY_FILE_OWN_DOMAIN) == 16
+    assert len(POLICY_FILES) == 18
+    assert len(POLICY_FILE_OWN_DOMAIN) == 17
+    assert "delegation_policy.py" in POLICY_FILES
+    assert "delegation_policy.py" in POLICY_FILE_OWN_DOMAIN
+    assert POLICY_FILE_OWN_DOMAIN["delegation_policy.py"] == {"app.domain.delegation"}
     assert "artifact_policy.py" in POLICY_FILES
     assert "artifact_policy.py" in POLICY_FILE_OWN_DOMAIN
     assert POLICY_FILE_OWN_DOMAIN["artifact_policy.py"] == {"app.domain.artifact"}
+
+
+def test_run_policy_snapshot_has_delegation_config():
+    """RunPolicySnapshot must carry a delegation typed config (the 11th)."""
+    source = (APPLICATION / "policy_snapshot.py").read_text()
+    fields = _class_field_types(source, "RunPolicySnapshot")
+    assert "delegation" in fields
+    assert "DelegationPolicyConfig" in fields["delegation"]
+
+
+def test_resolved_policy_profile_has_delegation_config():
+    """ResolvedPolicyProfile must carry a delegation typed config (the 11th)."""
+    source = (APPLICATION / "policy_snapshot.py").read_text()
+    fields = _class_field_types(source, "ResolvedPolicyProfile")
+    assert "delegation" in fields
+    assert "DelegationPolicyConfig" in fields["delegation"]

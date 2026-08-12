@@ -12,6 +12,7 @@ from app.application.policy_dashboard_service import (
 from app.application.policy_snapshot import (
     BudgetPolicyConfig,
     ContextPolicyConfig,
+    DelegationPolicyConfig,
     GatewayPolicyConfig,
     InformationFlowPolicyConfig,
     LLMPolicyConfig,
@@ -48,6 +49,7 @@ def _profile() -> ResolvedPolicyProfile:
         schedule=SchedulePolicyConfig(),
         budget=BudgetPolicyConfig(max_usd_cost=Decimal("0.5")),
         information_flow=InformationFlowPolicyConfig(),
+        delegation=DelegationPolicyConfig(),
     )
 
 
@@ -61,7 +63,7 @@ def test_top_level_shape_and_version_from_profile():
     data = svc.list_policies()
     assert set(data.keys()) == {"profile_version", "policies"}
     assert data["profile_version"] == "test-v9"
-    assert len(data["policies"]) == 10
+    assert len(data["policies"]) == 11
 
 
 def test_fixed_key_order():
@@ -71,8 +73,9 @@ def test_fixed_key_order():
     assert keys == [
         "turn", "context", "llm", "tool", "memory",
         "sandbox", "gateway", "schedule", "budget", "information_flow",
+        "delegation",
     ]
-    assert len(set(keys)) == 10
+    assert len(set(keys)) == 11
 
 
 def test_policy_view_field_contract():
@@ -99,8 +102,8 @@ def test_turn_values_and_spec_metadata_alignment():
     # Tool keeps its own version field inside config
     tool = next(p for p in data["policies"] if p["key"] == "tool")
     assert tool["config"][0]["key"] == "version"
-    # metadata entry count matches the 10 spec policies
-    assert len(_POLICY_METADATA) == 10
+    # metadata entry count matches the 11 spec policies
+    assert len(_POLICY_METADATA) == 11
 
 
 def test_schedule_displays_tool_source_type_constraint():

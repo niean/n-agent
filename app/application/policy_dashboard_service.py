@@ -81,6 +81,24 @@ _POLICY_METADATA: tuple[dict[str, Any], ...] = (
      "domain_file": "information_flow_policy.py",
      "labels": {"log_llm_payloads": "记录LLM载荷", "store_usage_payloads": "存储Usage载荷",
                 "redact_secrets": "脱敏密钥"}},
+    {"key": "delegation", "attr": "delegation",
+     "name": "DelegationPolicy", "display_name": "委派策略",
+     "dimension": "多 Agent 委派并发、深度、预算、取消恢复",
+     "execution_point": "DelegationService、DelegationRunService",
+     "domain_file": "delegation_policy.py",
+     "labels": {"enabled": "启用", "realtime_enabled": "Realtime 启用",
+                "task_enabled": "Task 启用", "max_children": "最大子 Agent",
+                "max_concurrency": "全局并发", "max_concurrency_per_parent": "单父并发",
+                "max_runtime_seconds": "最大运行（秒）",
+                "member_max_runtime_seconds": "成员最大运行（秒）",
+                "max_total_tokens": "总 Token 上限",
+                "max_tokens_per_child": "单子 Token 上限",
+                "result_max_bytes": "结果字节上限",
+                "structured_result_max_bytes": "结构化结果字节上限",
+                "event_payload_max_bytes": "事件载荷字节上限",
+                "member_max_retries": "成员最大重试",
+                "cancel_retry_max_attempts": "取消重试次数",
+                "cancel_retry_max_backoff_seconds": "取消退避（秒）"}},
 )
 
 _REQUIRED_META_FIELDS = frozenset(
@@ -111,11 +129,11 @@ class PolicyDashboardService:
         return {"profile_version": profile.version, "policies": policies}
 
     def _validate_metadata(self, profile: ResolvedPolicyProfile) -> None:
-        if len(_POLICY_METADATA) != 10:
-            raise PolicyDashboardError("policy metadata must contain exactly 10 entries")
+        if len(_POLICY_METADATA) != 11:
+            raise PolicyDashboardError("policy metadata must contain exactly 11 entries")
         keys = [m["key"] for m in _POLICY_METADATA]
         attrs = [m["attr"] for m in _POLICY_METADATA]
-        if len(set(keys)) != 10 or len(set(attrs)) != 10:
+        if len(set(keys)) != 11 or len(set(attrs)) != 11:
             raise PolicyDashboardError("policy metadata key/attr must be unique")
         for meta in _POLICY_METADATA:
             if set(meta.keys()) != _REQUIRED_META_FIELDS:

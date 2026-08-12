@@ -88,3 +88,71 @@ def test_boolean_fields_accept_true_and_false():
     assert Settings(information_store_usage_payloads=False).information_store_usage_payloads is False
     assert Settings(information_redact_secrets=False).information_redact_secrets is False
     assert Settings(gateway_require_actor_for_managed_actions=False).gateway_require_actor_for_managed_actions is False
+
+
+# ---------------------------------------------------------------------------
+# Delegation 子域配置
+# ---------------------------------------------------------------------------
+
+
+def test_delegation_defaults_disabled():
+    s = Settings()
+    assert s.delegation_enabled is False
+    assert s.delegation_realtime_enabled is False
+    assert s.delegation_task_enabled is False
+    assert s.delegation_max_children == 8
+    assert s.delegation_max_concurrency == 8
+    assert s.delegation_max_concurrency_per_parent == 3
+    assert s.delegation_max_runtime_seconds == 1800
+    assert s.delegation_member_max_runtime_seconds == 900
+    assert s.delegation_max_total_tokens == 100000
+    assert s.delegation_max_tokens_per_child == 50000
+    assert s.delegation_result_max_bytes == 65536
+    assert s.delegation_structured_result_max_bytes == 32768
+    assert s.delegation_event_payload_max_bytes == 32768
+    assert s.delegation_member_max_retries == 1
+    assert s.delegation_cancel_retry_max_attempts == 5
+    assert s.delegation_cancel_retry_max_backoff_seconds == 60
+
+
+def test_delegation_gt_zero_fields_reject_zero_and_negative():
+    for field_name in (
+        "delegation_max_children",
+        "delegation_max_concurrency",
+        "delegation_max_concurrency_per_parent",
+        "delegation_max_runtime_seconds",
+        "delegation_member_max_runtime_seconds",
+        "delegation_max_total_tokens",
+        "delegation_max_tokens_per_child",
+        "delegation_result_max_bytes",
+        "delegation_structured_result_max_bytes",
+        "delegation_event_payload_max_bytes",
+        "delegation_member_max_retries",
+        "delegation_cancel_retry_max_attempts",
+        "delegation_cancel_retry_max_backoff_seconds",
+    ):
+        with pytest.raises(ValidationError):
+            Settings(**{field_name: 0})
+        with pytest.raises(ValidationError):
+            Settings(**{field_name: -1})
+
+
+def test_delegation_cross_field_per_parent_le_global():
+    with pytest.raises(ValidationError):
+        Settings(delegation_max_concurrency=4, delegation_max_concurrency_per_parent=5)
+
+
+def test_delegation_cross_field_member_runtime_le_runtime():
+    with pytest.raises(ValidationError):
+        Settings(
+            delegation_max_runtime_seconds=600,
+            delegation_member_max_runtime_seconds=900,
+        )
+
+
+def test_delegation_cross_field_per_child_le_total():
+    with pytest.raises(ValidationError):
+        Settings(
+            delegation_max_total_tokens=1000,
+            delegation_max_tokens_per_child=2000,
+        )
