@@ -100,6 +100,8 @@
         - 版本：版本历史，触发方式为右上角`版本`按钮、放到发布右侧，形式改用项目标准弹出框modal，modal内容样式要对人友好
 
 [20260811]
+- HE
+    - 文档：根据代码现状，更新DDD文档`## Artifact`章节。文档要求 ①说人话、②极简
 - FR
     - 制品：支持对话原生制品，验收和迭代
         - 任务：通过命令或Chat创建task失败，修复之
@@ -107,6 +109,15 @@
         - 制品：编辑后，预览不自动更新、手动刷新浏览器才更新，版本也有类似不自动刷新的问题
         - 制品：发布/撤销跟随版本，对应的操作按钮也移到版本modal
         - 制品：预览，状态栏增加版本信息，格式如：`大小: 17 B，更新: 2026-08-11 14:26:08；版本: v1，已发布: 链接`
+
+[20260812]
+- HE
+    - HE：新增人工E2E验收文档
+        - 提示词：根据.harness/harness-third-review-codex.diff，将.harness中的 `verify人工E2E验收` 相关的所有变更、更新到harness模板项目：/Users/niean/code/github.com/niean/harness-tpl。注意：①不要遗漏 ②不要连带其它diff(如after hook、third review等)
+    - HE：项目.harness中的Third Review，耦合Codex、不通用。评估下，是否可抽象为third-review Hook(就像after-finish Hook一样)
+- FR
+    - 调度：[KF]支持多Agent委派与并行，入口无关(不限于Task)
+
 
 ---
 
@@ -118,12 +129,12 @@
     - 前端：使用Element UI，重构前端代码，要求①保持功能一致、②最大限度的使用Element UI组件库(减少自己写的代码)。Element UI的项目规范，参考 /Users/niean/code/git.zuoyebang.cc/odin/odin-fe
     - 任务：LLM请求未命中缓存读，分析原因
 - FR
-    - 调度：支持MoA，多 Agent 委派与并行，在现有 Task 基础上建立任务拆解、并发执行和结果聚合
     - 任务：持久化执行环境，让任务拥有可休眠、恢复、快照和远程运行的 Workspace
     - 沙盒：远程沙盒，包括云沙盒、私有VM沙盒
     - 工具：Computer Use(MacOS)
     - 管理：接入配置，秘钥Store(类似平台)
     - 产品：对标Manus，Project、Tenant(低优)
+    - 调度：支持MoA
 
 ---
 

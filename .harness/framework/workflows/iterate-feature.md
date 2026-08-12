@@ -38,14 +38,14 @@ Workflow Progress:
 - 执行 `Skill: brainstorming`（`.harness/framework/skills/superpowers/brainstorming.md`），按其完整流程执行
 - spec 落盘后，执行三段式审阅：
   1. 确认 `brainstorming.md` 的 Spec Review Loop 已完成并修正 spec；该 Review Loop 即本阶段内联 review
-  2. 执行 Third Review：优先执行 `${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} spec <spec_file>`；可通过 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型；Third Review 可直接修改 spec 文件，但只能修改该 spec
+  2. 执行 Third Review：执行 `sh .harness/framework/hooks/third-review.sh spec <spec_file>`；Hook 负责选择第三方审阅 provider；Third Review 可直接修改 spec 文件，但只能修改该 spec
   3. Third Review 完成后，主流程模型必须重新读取 spec 文件，复审是否破坏用户原始需求、Harness 模板、Phase/GATE 边界和验收可执行性
   4. Third Review 命令不可用或失败时，禁止自动跳过；必须立即结束当前回复，报告失败命令与退出码，并请求人工确认。仅在上一条用户消息明确确认跳过后，才可跳过本次 Third Review，不执行额外内联降级审阅，并标注 `third_review: skipped`；未确认时标注 `third_review: awaiting-skip-confirmation`，禁止推进后续流程
 - spec 经 Spec Review Loop、Third Review 和主流程复审后，向用户输出需求摘要（目标 + 范围 + 方案 + 验收标准），等待确认
 - 用户修正时：更新 spec，输出完整摘要再次确认
 - `[GATE]` 规则见 FRAMEWORK.md
 
-检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, third_review: chatgpt/skipped/awaiting-skip-confirmation, 方案: 已确认`
+检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, third_review: executed/skipped/awaiting-skip-confirmation, 方案: 已确认`
 
 ## Phase 3: 计划制定 `[GATE-ENTRY]`
 - Agent: Planner
@@ -53,13 +53,13 @@ Workflow Progress:
 - 执行 `Skill: writing-plans`（`.harness/framework/skills/superpowers/writing-plans.md`），按其流程执行到 "Plan Review Loop" 后终止；"Execution Handoff" 由本 Phase 自行执行
 - plan 落盘后，执行三段式审阅：
   1. 确认 `writing-plans.md` 的 Plan Review Loop 已完成并修正 plan；该 Review Loop 即本阶段内联 review
-  2. 执行 Third Review：优先执行 `${HARNESS_THIRD_REVIEW_CMD:-sh .harness/framework/third/third-review-codex.sh} plan <plan_file> <spec_file>`；可通过 `HARNESS_THIRD_REVIEW_MODEL` 指定 Third 模型；Third Review 可直接修改 plan 文件，但只能修改该 plan，禁止修改 spec
+  2. 执行 Third Review：执行 `sh .harness/framework/hooks/third-review.sh plan <plan_file> <spec_file>`；Hook 负责选择第三方审阅 provider；Third Review 可直接修改 plan 文件，但只能修改该 plan，禁止修改 spec
   3. Third Review 完成后，主流程模型必须重新读取 plan 文件，并按关联 spec 复审是否破坏 spec、Harness 模板、Phase/GATE 边界、任务可执行性和验收可验证性
   4. Third Review 命令不可用或失败时，禁止自动跳过；必须立即结束当前回复，报告失败命令与退出码，并请求人工确认。仅在上一条用户消息明确确认跳过后，才可跳过本次 Third Review，不执行额外内联降级审阅，并标注 `third_review: skipped`；未确认时标注 `third_review: awaiting-skip-confirmation`，禁止推进后续流程
 - plan 经 Plan Review Loop、Third Review 和主流程复审后，执行 `Skill: writing-verify`（`.harness/framework/skills/superpowers/writing-verify.md`），输入 Phase 2 spec 文件路径和 Phase 3 plan 文件路径，生成独立旁路人工验收文件 `.harness/specs/verify/verify-{YYMMDD}-{desc}.md`
 - plan 经 Plan Review Loop、Third Review 和主流程复审后，确定执行方式（Subagent-Driven / Inline Execution）后直接进入 Phase 4：若用户在输入指令中明确指定了执行方式则遵从；否则 AI 按任务规模自主决策，plan 中 task <= 3 个时使用 Inline Execution，其余使用 Subagent-Driven，无需人工确认。禁止中断回复等待确认 -- 本 Phase 无 [GATE] 标记，plan 复审后必须自主推进
 
-检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: chatgpt/skipped/awaiting-skip-confirmation, 执行方式: subagent/inline`
+检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: executed/skipped/awaiting-skip-confirmation, 执行方式: subagent/inline`
 
 ## Phase 4: 代码实现
 - Agent: Coder

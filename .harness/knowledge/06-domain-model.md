@@ -1,7 +1,7 @@
 <!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
-本文介绍自研通用Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 以 LangGraph 编排 Agent TurnLoop，用领域驱动设计（DDD）隔离业务核心与外部实现，支撑持续演进。
+本文介绍自研通用Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 以 LangGraph 编排 TurnLoop，用领域驱动设计（DDD）隔离业务核心与外部实现，支撑持续演进。
 
 核心流程：接收对话请求，加载会话上下文，循环"调用模型→按需执行工具"直至产出最终回答，更新会话与外部记忆，返回同步或流式结果。
 
@@ -583,21 +583,20 @@ flowchart LR
 
 ## Artifact
 
-制品就是 Agent 任务产出的长文本或文件。
+制品是 Agent 产出的长文本或文件。
 
 ```text
-Agent 调用 task_complete
--> 提交 name、type，以及 content 或 workspace 文件引用
--> TaskRunService 校验制品信息
--> 任务完成后，调用 ArtifactService 登记
--> ArtifactService 识别 MIME，计算大小和 SHA-256
--> 保存内容或受控文件引用，并关联 session、task
+Agent 判断内容适合保存为制品
+-> 调用 artifact_create，提交名称、类型，以及内容或文件引用
+-> 系统从当前上下文补充会话、运行和创建人信息
+-> ArtifactService 校验内容，计算大小和 SHA-256
+-> 保存内容，并同时创建制品及首个版本
 -> 制品工作台提供预览、编辑、导出和发布
 ```
 
-任务结果不超过 64KB 时直接作为消息、存入SQLite，超过 64KB 时自动转为制品文件。
+制品会关联来源和会话，可预览、编辑、导出和公开发布。Task 产物和附件也会自动登记为制品。
 
-制品升级为 Agent 原生可操作对象：内容更新产生不可变 ArtifactRevision 版本链（CAS expected_revision_id 防并发覆写，冲突 409 不自动重放），支持 diff/rollback；普通 Chat 经 8 个 artifact_* 工具直接 create/update/diff/rollback/publish（可信溯源由 ctx 注入，与 TaskService 解耦），写工具成功持久化 ui.artifact 卡片；新 Revision 不撤销已发布快照（publish_sync_state=outdated），重新发布才切换。Office 导出 DOCX/PPTX/XLSX（格式库隔离在 Infrastructure）。
+每次改内容都会留下历史版本，可比较或回退；改完已发布内容后，重新发布才会更新公开内容。
 
 ---
 ---
