@@ -57,7 +57,7 @@ Workflow Progress:
 - Agent: Orchestrator
 - 执行 `Skill: 总结任务`（`.harness/framework/skills/harness/summarize-task.md`）
 - 执行顺序：输出总结报告 -> Phase 5 结束 -> 执行 after-finish Hook -> 结束任务，在同一条回复中完成
-- after-finish Hook：若 `.harness/framework/hooks/after-finish.sh` 存在，执行 `sh .harness/framework/hooks/after-finish.sh`；若文件不存在则跳过。Hook 失败不回滚 Phase 5，但必须在最终输出中标注失败命令和退出码
+- after-finish Hook：若 `.harness/hooks/after-finish.sh` 存在且为普通可读文件，执行 `sh .harness/hooks/after-finish.sh`；若文件不存在则跳过。文件非法或 Hook 失败不回滚 Phase 5，但必须在最终输出中标注失败命令和退出码
 
 检查点：`[Phase 5 任务总结] hook: executed/skipped/failed, 状态: 完成`
 

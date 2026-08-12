@@ -40,7 +40,7 @@ Workflow Progress:
 - Agent: Orchestrator
 - 执行 `Skill: 结果验收`（`.harness/framework/skills/harness/verify-acceptance.md`），scope=build_only
 - 不通过时回到 Phase 2 修复（反馈环路），Phase 2 -> Phase 3 的完整循环最多执行 3 轮（含首次），第 3 轮仍不通过时中断流程，输出错误报告等待人工介入
-- Phase 3 成功结束后，执行 after-finish Hook：若 `.harness/framework/hooks/after-finish.sh` 存在，执行 `sh .harness/framework/hooks/after-finish.sh`；若文件不存在则跳过。Hook 失败不回滚 Phase 3，但必须在最终输出中标注失败命令和退出码
+- Phase 3 成功结束后，执行 after-finish Hook：若 `.harness/hooks/after-finish.sh` 存在且为普通可读文件，执行 `sh .harness/hooks/after-finish.sh`；若文件不存在则跳过。文件非法或 Hook 失败不回滚 Phase 3，但必须在最终输出中标注失败命令和退出码
 
 检查点：`[Phase 3 编译通过] 构建: 通过/失败, hook: executed/skipped/failed`
 

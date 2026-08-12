@@ -115,6 +115,7 @@
     - HE：新增人工E2E验收文档
         - 提示词：根据.harness/harness-third-review-codex.diff，将.harness中的 `verify人工E2E验收` 相关的所有变更、更新到harness模板项目：/Users/niean/code/github.com/niean/harness-tpl。注意：①不要遗漏 ②不要连带其它diff(如after hook、third review等)
     - HE：项目.harness中的Third Review，耦合Codex、不通用。评估下，是否可抽象为third-review Hook(就像after-finish Hook一样)
+    - HE：重构，Third Review放到通用框架，Hooks移到项目私有
 - FR
     - 调度：[KF]支持多Agent委派与并行，入口无关(不限于Task)
 
