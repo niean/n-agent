@@ -33,6 +33,10 @@ class ReleaseTarget(str, Enum):
     LLM_PAYLOAD_LOG = "llm_payload_log"
     CLIENT_RESPONSE = "client_response"
     PUBLIC_ARTIFACT = "public_artifact"
+    # Agent-intermediary boundaries (T10): child result returning to the
+    # parent boundary, and worker result entering an aggregator's prompt.
+    PARENT = "parent"
+    AGGREGATOR_INPUT = "aggregator_input"
 
 
 # Standard credential field names whose values should be redacted in

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Any, Callable
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from datetime import datetime, timezone
+
 from app.application.agent_graph import AgentGraphRunner
 from app.application.artifact_service import ArtifactService, ArtifactServiceConfig
 from app.application.artifact_tools import artifact_tool_definitions
@@ -59,6 +61,19 @@ from app.application.skill_service import SkillManageToolExecutor, SkillService,
 from app.application.skill_evolution_service import SkillEvolutionService
 from app.application.plugin_service import PluginCliCommand, PluginService, PluginToolExecutor
 from app.application.prompt_builder import ARTIFACT_GUIDANCE, BROWSER_GUIDANCE, build_system_prompt
+from app.application.child_agent_executor import ChildAgentExecutor
+from app.application.delegation_parent_adapter import (
+    RealtimeDelegationAdapter,
+    TaskDelegationAdapter,
+)
+from app.application.delegation_policy_config import DelegationPolicyConfig
+from app.application.delegation_run_service import DelegationRunService
+from app.application.delegation_service import DelegationService
+from app.application.delegation_tool_executor import (
+    DelegateAgentsToolExecutor,
+    delegate_agent_tool_definitions,
+)
+from app.domain.delegation_policy import DelegationPolicy
 from app.application.task_agent_executor import TaskAgentExecutor
 from app.application.task_run_service import TaskRunService
 from app.application.task_runner import TaskRunner
@@ -120,6 +135,9 @@ from app.domain.task_policy import TaskPolicy
 from app.infrastructure.plugin.file_loader import PluginFileLoader, PluginFileLoaderConfig
 from app.infrastructure.plugin.seed_runner import seed_default_plugins
 from app.infrastructure.registry.sqlite_plugin_registry import SQLitePluginRegistry
+from app.infrastructure.registry.sqlite_delegation_registry import (
+    SQLiteDelegationRegistry,
+)
 from app.infrastructure.registry.sqlite_task_registry import SQLiteTaskRegistry
 from app.infrastructure.registry.sqlite_task_config_store import SqliteTaskConfigStore
 from app.infrastructure.policy.task_config_logging_sink import TaskConfigLoggingSink
@@ -223,6 +241,7 @@ from app.infrastructure.artifact.exporters import ArtifactExporterConfig, Office
 from app.infrastructure.registry.sqlite_artifact_registry import SQLiteArtifactRegistry
 from app.infrastructure.tools.artifact_management import ArtifactToolExecutor
 from app.interfaces.http.published_artifact_routes import register_published_artifact_routes
+from app.interfaces.http.delegation_routes import register_delegation_routes
 
 if TYPE_CHECKING:
     from app.infrastructure.sandbox.manager import SandboxManager as _SandboxManager
@@ -306,6 +325,17 @@ def _run_sync(coro):
 
 def _mask_app_id(app_id: str) -> str:
     return f"{app_id[:4]}****" if len(app_id) > 4 else "****"
+
+
+class _SystemClock:
+    """Production clock: returns the current UTC time as an ISO-8601 string.
+
+    Used by DelegationRunService / ChildAgentExecutor / DelegationService
+    which accept an injectable clock for testability.
+    """
+
+    def now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
 
 
 async def _seed_legacy_knowledge_base(service: KnowledgeService, settings: Settings) -> None:
@@ -405,6 +435,12 @@ class ApplicationServices:
     browser_novnc_proxy: "BrowserNoVncProxy | None" = None
     # Artifact 子域服务 (T14). None when artifacts_enabled=False.
     artifact_service: ArtifactService | None = None
+    # Delegation 子域服务 (T6-T14). None when delegation_enabled=False.
+    delegation_registry: "SQLiteDelegationRegistry | None" = None
+    delegation_service: "DelegationService | None" = None
+    delegation_run_service: "DelegationRunService | None" = None
+    delegation_tool_executor: "DelegateAgentsToolExecutor | None" = None
+    child_agent_executor: "ChildAgentExecutor | None" = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -913,6 +949,40 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         external_memory_manager=external_memory_manager,
         hook_dispatcher=plugin_service,
     )
+    # Delegation subsystem (T6-T14). Gated on delegation_enabled: when False,
+    # the entire subsystem is skipped (no registry/service/executor, no
+    # delegate_agents tool, no capability signing). When True, the registry
+    # + adapters are constructed here (before chat_service) so the realtime
+    # adapter can be injected into ChatCompletionService for capability
+    # signing; the service/executor layer is built after chat_service.
+    delegation_config: DelegationPolicyConfig | None = None
+    delegation_registry: SQLiteDelegationRegistry | None = None
+    realtime_delegation_adapter: RealtimeDelegationAdapter | None = None
+    task_delegation_adapter: TaskDelegationAdapter | None = None
+    if settings.delegation_enabled:
+        delegation_config = DelegationPolicyConfig(
+            enabled=settings.delegation_enabled,
+            realtime_enabled=settings.delegation_realtime_enabled,
+            task_enabled=settings.delegation_task_enabled,
+            max_children=settings.delegation_max_children,
+            max_concurrency=settings.delegation_max_concurrency,
+            max_concurrency_per_parent=settings.delegation_max_concurrency_per_parent,
+            max_runtime_seconds=settings.delegation_max_runtime_seconds,
+            member_max_runtime_seconds=settings.delegation_member_max_runtime_seconds,
+            max_total_tokens=settings.delegation_max_total_tokens,
+            max_tokens_per_child=settings.delegation_max_tokens_per_child,
+            result_max_bytes=settings.delegation_result_max_bytes,
+            structured_result_max_bytes=settings.delegation_structured_result_max_bytes,
+            event_payload_max_bytes=settings.delegation_event_payload_max_bytes,
+            member_max_retries=settings.delegation_member_max_retries,
+            cancel_retry_max_attempts=settings.delegation_cancel_retry_max_attempts,
+            cancel_retry_max_backoff_seconds=settings.delegation_cancel_retry_max_backoff_seconds,
+        )
+        # SQLiteDelegationRegistry performs shape verification in __init__;
+        # failures propagate (fail-fast, NOT silent degrade).
+        delegation_registry = SQLiteDelegationRegistry(str(settings.sqlite_path))
+        realtime_delegation_adapter = RealtimeDelegationAdapter()
+        task_delegation_adapter = TaskDelegationAdapter()
     chat_service = ChatCompletionService(
         memory_store,
         graph_runner,
@@ -925,7 +995,41 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             SettingsPolicyProfileProvider(settings)
         ),
         session_bootstrap_reader=SessionBootstrapReader(memory_store),
+        delegation_adapter=realtime_delegation_adapter,
+        delegation_config=delegation_config,
     )
+    # Delegation service layer (built after chat_service because
+    # ChildAgentExecutor wraps it). Registered as a tool route + dynamic
+    # definition so delegate_agents is exposed to the Agent when enabled.
+    delegation_service: DelegationService | None = None
+    delegation_run_service: DelegationRunService | None = None
+    delegation_tool_executor: DelegateAgentsToolExecutor | None = None
+    child_agent_executor: ChildAgentExecutor | None = None
+    if settings.delegation_enabled and delegation_registry is not None:
+        child_agent_executor = ChildAgentExecutor(
+            chat_service=chat_service, clock=_SystemClock(),
+        )
+        delegation_run_service = DelegationRunService(
+            registry=delegation_registry,
+            child_executor=child_agent_executor,
+            clock=_SystemClock(),
+            config=delegation_config,
+        )
+        delegation_service = DelegationService(
+            registry=delegation_registry,
+            run_service=delegation_run_service,
+            policy=DelegationPolicy(),
+            info_flow=information_flow_service,
+            clock=_SystemClock(),
+            config=delegation_config,
+        )
+        delegation_tool_executor = DelegateAgentsToolExecutor(
+            delegation_service=delegation_service
+        )
+        routes["delegate_agents"] = delegation_tool_executor
+        tool_service.set_dynamic_definitions(
+            "delegation", delegate_agent_tool_definitions()
+        )
     # Skill 自进化 service (T11). Built after chat_service because it calls
     # chat.complete for background review; injected back into graph_runner to
     # break the runner -> evolution -> chat -> runner cycle.
@@ -1127,6 +1231,8 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             max_runtime_seconds=settings.task_max_runtime_seconds,
             goal_max_turns=settings.task_goal_max_turns,
             task_config_provider=task_config_service,
+            task_delegation_adapter=task_delegation_adapter,
+            delegation_config=delegation_config,
         )
         task_outbound_delivery = TaskOutboundDelivery(feishu_client, task_registry)
 
@@ -1808,6 +1914,11 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         browser_confirmation_service=browser_confirmation_service_obj,
         browser_novnc_proxy=browser_novnc_proxy_obj,
         artifact_service=artifact_service,
+        delegation_registry=delegation_registry,
+        delegation_service=delegation_service,
+        delegation_run_service=delegation_run_service,
+        delegation_tool_executor=delegation_tool_executor,
+        child_agent_executor=child_agent_executor,
     )
 
 
@@ -1902,6 +2013,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         feishu_task: asyncio.Task | None = None
         scheduler_task: asyncio.Task | None = None
+        delegation_task: asyncio.Task | None = None
         try:
             report = await services.skill_service.scan_now()
             logger.info(
@@ -2029,6 +2141,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except Exception:
                 logger.exception("artifact revision migration failed")
+        # Delegation scheduler tick loop (T14). Drives the persistence-driven
+        # DelegationRunService: expires stale delegations, claims/executes
+        # pending members, advances joins, delivers cancel outbox. One tick
+        # per second is sufficient -- members execute concurrently within a
+        # tick and the registry is the state authority between ticks.
+        if services.delegation_run_service is not None:
+            async def _delegation_tick_loop() -> None:
+                while True:
+                    try:
+                        await services.delegation_run_service.tick()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("delegation tick failed")
+                    await asyncio.sleep(1.0)
+
+            delegation_task = asyncio.create_task(_delegation_tick_loop())
         try:
             yield
         finally:
@@ -2051,6 +2180,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 feishu_task.cancel()
                 try:
                     await feishu_task
+                except asyncio.CancelledError:
+                    pass
+            if delegation_task is not None:
+                delegation_task.cancel()
+                try:
+                    await delegation_task
                 except asyncio.CancelledError:
                     pass
             if services.sandbox_manager is not None:
@@ -2143,4 +2278,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # wired (artifacts_enabled=True).
     if services.artifact_service is not None:
         register_published_artifact_routes(app, services.artifact_service)
+    # Delegation HTTP routes (T13). Registered when delegation_enabled=True.
+    # The registry is the persistence authority; delegation_service is not
+    # needed over HTTP (delegation is invoked via the tool executor).
+    if services.delegation_registry is not None:
+        register_delegation_routes(
+            app,
+            delegation_service=services.delegation_service,
+            registry=services.delegation_registry,
+        )
     return app

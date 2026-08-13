@@ -3,8 +3,11 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, TYPE_CHECKING
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from app.application.delegation_parent_adapter import RealtimeDelegationAdapter
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.events import ChatEvent, ChatEventType
@@ -88,6 +91,8 @@ class ChatCompletionService:
         runtime_memory_service: RuntimeMemoryService | None = None,
         policy_snapshot_factory: RunPolicySnapshotFactory | None = None,
         session_bootstrap_reader: SessionBootstrapReader | None = None,
+        delegation_adapter: "RealtimeDelegationAdapter | None" = None,
+        delegation_config: Any | None = None,
     ):
         self.memory_store = memory_store
         self.graph_runner = graph_runner
@@ -103,6 +108,8 @@ class ChatCompletionService:
         self._session_bootstrap_reader = session_bootstrap_reader or SessionBootstrapReader(
             memory_store
         )
+        self._delegation_adapter = delegation_adapter
+        self._delegation_config = delegation_config
 
     async def compress_session(self, session_id: str) -> dict[str, Any]:
         """Force compress a session's context without LLM call.
@@ -223,6 +230,25 @@ class ChatCompletionService:
             if isinstance(raw_grants, (list, tuple))
             else frozenset()
         )
+        # Sign a realtime delegation capability when delegation is enabled for
+        # the realtime source. The capability is server-only (pattern twelve),
+        # bound to this run/session/scope, and non-serializable. Unattended
+        # (task) runs sign their own capability via TaskDelegationAdapter.
+        if (
+            mode == "realtime"
+            and self._delegation_adapter is not None
+            and getattr(self._delegation_config, "enabled", False)
+            and getattr(self._delegation_config, "realtime_enabled", False)
+        ):
+            cap = self._delegation_adapter.sign_capability(
+                run_id=state.run_id,
+                session_id=session_id,
+                scope_id=session_id,
+                actor_id=(request.ingress_facts.actor_id if request.ingress_facts else None),
+                parent_allowed_tools=granted_tools,
+                system_child_allowlist=granted_tools,
+            )
+            trusted_metadata["delegation_capability"] = cap.to_dict()
         ctx = ToolExecutionContext(
             allowed_confirm_tools=dict(mcp_ctx.allowed_confirm_tools),
             session_id=session_id,

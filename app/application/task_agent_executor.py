@@ -53,6 +53,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult
+from app.application.delegation_parent_adapter import TaskDelegationAdapter
 from app.application.policy_snapshot import IngressFacts
 from app.application.task_session import task_execution_session_id
 from app.application.task_tools import (
@@ -146,6 +147,8 @@ class TaskAgentExecutor:
         max_runtime_seconds: int = 3600,
         goal_max_turns: int = 10,
         task_config_provider: TaskConfigProvider | None = None,
+        task_delegation_adapter: Any | None = None,
+        delegation_config: Any | None = None,
     ):
         self.chat_service = chat_service
         self.task_registry = task_registry
@@ -153,6 +156,8 @@ class TaskAgentExecutor:
         self.max_runtime_seconds = max_runtime_seconds
         self.goal_max_turns = goal_max_turns
         self._task_config_provider = task_config_provider
+        self._task_delegation_adapter = task_delegation_adapter
+        self._delegation_config = delegation_config
 
     async def _snapshot(self) -> TaskConfig:
         if self._task_config_provider is not None:
@@ -203,6 +208,23 @@ class TaskAgentExecutor:
         ]
         permitted_managed = set(TASK_TOOL_NAMES)
 
+        # Delegation grant (T12): delegate_agents is added to the worker's
+        # explicit tool set only when all three gates allow it -- the global
+        # delegation switch, the task policy (delegate_agents in the task's
+        # allowed_tools), and the runtime grant. Children/aggregators always
+        # have it stripped (enforced in ChildAgentExecutor).
+        if self._task_delegation_adapter is not None:
+            delegate_allowed = TaskDelegationAdapter.should_grant(
+                global_enabled=getattr(self._delegation_config, "enabled", False),
+                task_policy_allows=(
+                    "delegate_agents" in task.execution_policy.allowed_tools
+                ),
+                delegate_in_grants=("delegate_agents" in granted_tools),
+            )
+            granted_tools = TaskDelegationAdapter.grant_delegate_tool(
+                granted_tools, allow=delegate_allowed
+            )
+
         # Build trusted task context (server-side immutable)
         task_context: dict[str, Any] = {
             "task_id": task.id,
@@ -239,6 +261,23 @@ class TaskAgentExecutor:
             "task": task_context,
             **trusted_claims,
         }
+
+        # Sign a task delegation capability when delegate_agents was granted.
+        # The capability is bound to the trusted task scope (task id), never
+        # to a client-submitted identifier.
+        if (
+            self._task_delegation_adapter is not None
+            and "delegate_agents" in granted_tools
+        ):
+            cap = self._task_delegation_adapter.sign_task_capability(
+                run_id=execution_run_id,
+                session_id=execution_session_id,
+                scope_id=task.id,
+                actor_id=task.created_by or None,
+                parent_allowed_tools=frozenset(granted_tools),
+                system_child_allowlist=frozenset(granted_tools),
+            )
+            trusted_metadata["delegation_capability"] = cap.to_dict()
 
         messages = [
             {"role": "user", "content": f"work task {task.id}"},

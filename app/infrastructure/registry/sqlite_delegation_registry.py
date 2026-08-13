@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS delegation_results (
     delegation_id TEXT NOT NULL,
     result_scope TEXT NOT NULL,
     member_id TEXT,
+    status TEXT NOT NULL DEFAULT 'succeeded',
     summary TEXT NOT NULL DEFAULT '',
     structured_data_json TEXT NOT NULL DEFAULT '{}',
     artifact_refs_json TEXT NOT NULL DEFAULT '[]',
@@ -286,10 +287,11 @@ _REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         "created_at",
     }),
     "delegation_results": frozenset({
-        "id", "delegation_id", "result_scope", "member_id", "summary",
-        "structured_data_json", "artifact_refs_json", "error_code",
-        "error_message", "usage_summary_json", "classification", "checksum",
-        "started_at", "ended_at", "created_at", "adopted",
+        "id", "delegation_id", "result_scope", "member_id", "status",
+        "summary", "structured_data_json", "artifact_refs_json",
+        "error_code", "error_message", "usage_summary_json",
+        "classification", "checksum", "started_at", "ended_at",
+        "created_at", "adopted",
     }),
     "delegation_events": frozenset({
         "id", "delegation_id", "kind", "payload_json", "member_ordinal",
@@ -492,6 +494,13 @@ class SQLiteDelegationRegistry:
         from datetime import datetime, timezone
         return datetime.now(timezone.utc).isoformat()
 
+    def _clock_now(self) -> str:
+        """Use the injected clock if available, else real UTC time."""
+        if self._clock is not None and hasattr(self._clock, "now_iso"):
+            return self._clock.now_iso()
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat()
+
     @staticmethod
     def _result_status_for_member_status(s: DelegationMemberStatus) -> str:
         return s.value
@@ -523,7 +532,7 @@ class SQLiteDelegationRegistry:
                 return self._row_to_delegation(existing)
 
             # Create new delegation.
-            now = self._now_iso()
+            now = self._clock_now()
             delegation_id = str(uuid.uuid4())
             snapshot_id = f"snap-{delegation_id}"
             join_policy = (
@@ -629,6 +638,45 @@ class SQLiteDelegationRegistry:
             ).fetchall()
         return tuple(self._row_to_delegation(r) for r in rows)
 
+    async def list_delegations(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        scope_id: str | None = None,
+        status: str | None = None,
+    ) -> tuple[Delegation, ...]:
+        """List delegations with optional scope/status filter + pagination.
+
+        Used by the Dashboard/HTTP list route. ``scope_id`` is a server-
+        authorized filter (never an authorization fact): the caller must
+        have already verified the actor may view this scope.
+        """
+        return await asyncio.to_thread(
+            self._list_delegations_sync, limit, offset, scope_id, status
+        )
+
+    def _list_delegations_sync(
+        self, limit: int, offset: int, scope_id: str | None, status: str | None
+    ) -> tuple[Delegation, ...]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope_id is not None:
+            clauses.append("parent_scope_id = ?")
+            params.append(scope_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.extend([limit, offset])
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM delegations{where} "
+                "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                tuple(params),
+            ).fetchall()
+        return tuple(self._row_to_delegation(r) for r in rows)
+
     async def list_members(self, delegation_id: str) -> tuple[DelegationMember, ...]:
         return await asyncio.to_thread(self._list_members_sync, delegation_id)
 
@@ -674,7 +722,7 @@ class SQLiteDelegationRegistry:
         )
 
     def _append_event_sync(self, delegation_id, kind, payload, member_ordinal) -> DelegationEvent:
-        now = self._now_iso()
+        now = self._clock_now()
         with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO delegation_events (delegation_id, kind, "
@@ -718,9 +766,15 @@ class SQLiteDelegationRegistry:
         )
 
     def _claim_member_sync(self, delegation_id, member_ordinal, claim_lock, lease_seconds) -> ClaimMemberResult:
-        now = self._now_iso()
+        now = self._clock_now()
         from datetime import datetime, timedelta, timezone
-        expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        # Compute expiry from the clock's current time, not wall-clock, so
+        # tests with a fake clock can deterministically expire leases.
+        try:
+            base = datetime.fromisoformat(now)
+        except (TypeError, ValueError):
+            base = datetime.now(timezone.utc)
+        expires = (base + timedelta(seconds=lease_seconds)).isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             # CAS: only pending members can be claimed.
@@ -782,7 +836,7 @@ class SQLiteDelegationRegistry:
         )
 
     def _finish_member_sync(self, delegation_id, member_ordinal, claim_lock, result, expected_version) -> FinishMemberResult:
-        now = self._now_iso()
+        now = self._clock_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             m_row = conn.execute(
@@ -827,13 +881,14 @@ class SQLiteDelegationRegistry:
             # Insert adopted result.
             conn.execute(
                 "INSERT INTO delegation_results (id, delegation_id, result_scope, "
-                "member_id, summary, structured_data_json, artifact_refs_json, "
-                "error_code, error_message, usage_summary_json, classification, "
-                "checksum, started_at, ended_at, created_at, adopted) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                "member_id, status, summary, structured_data_json, "
+                "artifact_refs_json, error_code, error_message, "
+                "usage_summary_json, classification, checksum, started_at, "
+                "ended_at, created_at, adopted) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
                 (
                     str(uuid.uuid4()), delegation_id, "member", member.id,
-                    result.summary,
+                    result.status.value, result.summary,
                     json.dumps(dict(result.structured_data), ensure_ascii=False) if result.structured_data else "{}",
                     json.dumps(list(result.artifact_refs), ensure_ascii=False),
                     result.error_code, result.error_message,
@@ -871,7 +926,7 @@ class SQLiteDelegationRegistry:
         return await asyncio.to_thread(self._reserve_ledger_sync, delegation_id, amount, purpose)
 
     def _reserve_ledger_sync(self, delegation_id, amount, purpose) -> LedgerResult:
-        now = self._now_iso()
+        now = self._clock_now()
         reservation_id = f"res-{uuid.uuid4()}"
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -915,7 +970,7 @@ class SQLiteDelegationRegistry:
         )
 
     def _settle_ledger_sync(self, delegation_id, reservation_id, actual, usage_event_id) -> LedgerResult:
-        now = self._now_iso()
+        now = self._clock_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             # Idempotent: if usage_event_id already settled, return existing.
@@ -976,7 +1031,7 @@ class SQLiteDelegationRegistry:
         return await asyncio.to_thread(self._release_ledger_sync, delegation_id, reservation_id)
 
     def _release_ledger_sync(self, delegation_id, reservation_id) -> LedgerResult:
-        now = self._now_iso()
+        now = self._clock_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -1019,7 +1074,7 @@ class SQLiteDelegationRegistry:
         return await asyncio.to_thread(self._request_cancel_sync, delegation_id, reason)
 
     def _request_cancel_sync(self, delegation_id, reason) -> Delegation:
-        now = self._now_iso()
+        now = self._clock_now()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -1093,7 +1148,7 @@ class SQLiteDelegationRegistry:
         await asyncio.to_thread(self._ack_outbox_sync, entry_id)
 
     def _ack_outbox_sync(self, entry_id: int) -> None:
-        now = self._now_iso()
+        now = self._clock_now()
         with self._connect() as conn:
             conn.execute(
                 "UPDATE delegation_cancel_outbox SET acked_at = ?, updated_at = ? "
@@ -1151,3 +1206,231 @@ class SQLiteDelegationRegistry:
                 member_results=tuple(member_results),
                 aggregation_result=aggregation_result,
             )
+
+    # ------------------------------------------------------------------
+    # recovery / scheduling helpers (T8)
+    # ------------------------------------------------------------------
+
+    async def mark_expired_delegations(self) -> int:
+        """Move non-terminal delegations past their deadline to EXPIRED.
+        Returns the count of delegations expired."""
+        return await asyncio.to_thread(self._mark_expired_sync)
+
+    def _mark_expired_sync(self) -> int:
+        now = self._clock_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE delegations SET status = 'expired', updated_at = ? "
+                "WHERE deadline_at IS NOT NULL AND deadline_at < ? "
+                "AND status NOT IN ('succeeded','failed','cancelled','expired')",
+                (now, now),
+            )
+            count = cur.rowcount
+            conn.commit()
+        return count
+
+    async def mark_stale_members(self) -> int:
+        """Reclaim RUNNING members whose lease has expired back to PENDING
+        (stale recovery). Returns the count of members reclaimed."""
+        return await asyncio.to_thread(self._mark_stale_sync)
+
+    def _mark_stale_sync(self) -> int:
+        now = self._clock_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE delegation_members SET status = 'pending', "
+                "claim_lock = NULL, claim_expires_at = NULL, "
+                "version = version + 1 "
+                "WHERE status = 'running' AND claim_expires_at IS NOT NULL "
+                "AND claim_expires_at < ?",
+                (now,),
+            )
+            count = cur.rowcount
+            conn.commit()
+        return count
+
+    async def list_pending_members(self, limit: int = 100) -> tuple[DelegationMember, ...]:
+        """Return PENDING members ordered by delegation_id + ordinal for
+        round-robin fairness across delegations."""
+        return await asyncio.to_thread(self._list_pending_members_sync, limit)
+
+    def _list_pending_members_sync(self, limit: int) -> tuple[DelegationMember, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM delegation_members WHERE status = 'pending' "
+                "ORDER BY delegation_id, ordinal LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(self._row_to_member(r) for r in rows)
+
+    async def list_active_delegations(self, limit: int = 100) -> tuple[Delegation, ...]:
+        """Return non-terminal delegations ordered by created_at."""
+        return await asyncio.to_thread(self._list_active_delegations_sync, limit)
+
+    def _list_active_delegations_sync(self, limit: int) -> tuple[Delegation, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM delegations WHERE status NOT IN "
+                "('succeeded','failed','cancelled','expired') "
+                "ORDER BY created_at LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return tuple(self._row_to_delegation(r) for r in rows)
+
+    async def finalize_cancelled(self, delegation_id: str) -> Delegation | None:
+        """If all members are terminal and the delegation is CANCELLING,
+        CAS it to CANCELLED. Returns the updated delegation or None if the
+        precondition is not met."""
+        return await asyncio.to_thread(self._finalize_cancelled_sync, delegation_id)
+
+    def _finalize_cancelled_sync(self, delegation_id: str) -> Delegation | None:
+        now = self._clock_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            if row is None or row["status"] != "cancelling":
+                conn.commit()
+                return self._row_to_delegation(row) if row else None
+            non_terminal = conn.execute(
+                "SELECT COUNT(*) AS c FROM delegation_members "
+                "WHERE delegation_id = ? AND status NOT IN "
+                "('succeeded','failed','cancelled','expired')",
+                (delegation_id,),
+            ).fetchone()["c"]
+            if non_terminal > 0:
+                conn.commit()
+                return self._row_to_delegation(row)
+            conn.execute(
+                "UPDATE delegations SET status = 'cancelled', updated_at = ? "
+                "WHERE id = ? AND status = 'cancelling'",
+                (now, delegation_id),
+            )
+            conn.execute(
+                "INSERT INTO delegation_events (delegation_id, kind, "
+                "payload_json, member_ordinal, run_id, created_at) "
+                "VALUES (?, 'cancelled', '{}', NULL, NULL, ?)",
+                (delegation_id, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            return self._row_to_delegation(row)
+
+    async def advance_to_joining(self, delegation_id: str) -> Delegation | None:
+        """CAS a RUNNING delegation to JOINING (all members terminal, about
+        to evaluate join policy). Returns updated delegation or None."""
+        return await asyncio.to_thread(self._advance_to_joining_sync, delegation_id)
+
+    def _advance_to_joining_sync(self, delegation_id: str) -> Delegation | None:
+        now = self._clock_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            if row is None or row["status"] != "running":
+                conn.commit()
+                return self._row_to_delegation(row) if row else None
+            cur = conn.execute(
+                "UPDATE delegations SET status = 'joining', updated_at = ? "
+                "WHERE id = ? AND status = 'running'",
+                (now, delegation_id),
+            )
+            if cur.rowcount == 0:
+                conn.commit()
+                return self._row_to_delegation(row)
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            return self._row_to_delegation(row)
+
+    async def finalize_result_set(self, delegation_id: str, status: str) -> Delegation | None:
+        """CAS a JOINING delegation to a terminal status (succeeded/failed)
+        after the join policy has been evaluated. Returns the updated
+        delegation or None."""
+        return await asyncio.to_thread(self._finalize_result_set_sync, delegation_id, status)
+
+    async def cancel_pending_members(self, delegation_id: str, reason: str = "") -> int:
+        """Force all non-terminal members of a delegation to CANCELLED.
+        Used by the kill-switch path. Returns the count cancelled."""
+        return await asyncio.to_thread(self._cancel_pending_members_sync, delegation_id, reason)
+
+    def _cancel_pending_members_sync(self, delegation_id: str, reason: str) -> int:
+        now = self._clock_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE delegation_members SET status = 'cancelled', "
+                "cancel_reason = ?, ended_at = ?, version = version + 1 "
+                "WHERE delegation_id = ? AND status NOT IN "
+                "('succeeded','failed','cancelled','expired')",
+                (reason or "cancelled", now, delegation_id),
+            )
+            count = cur.rowcount
+            conn.commit()
+        return count
+
+    async def start_delegation(self, delegation_id: str) -> Delegation | None:
+        """CAS a PENDING delegation to RUNNING. Returns the updated
+        delegation, or the existing one if already past PENDING."""
+        return await asyncio.to_thread(self._start_delegation_sync, delegation_id)
+
+    def _start_delegation_sync(self, delegation_id: str) -> Delegation | None:
+        now = self._clock_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            if row["status"] != "pending":
+                conn.commit()
+                return self._row_to_delegation(row)
+            conn.execute(
+                "UPDATE delegations SET status = 'running', updated_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (now, delegation_id),
+            )
+            conn.execute(
+                "INSERT INTO delegation_events (delegation_id, kind, "
+                "payload_json, member_ordinal, run_id, created_at) "
+                "VALUES (?, 'started', '{}', NULL, NULL, ?)",
+                (delegation_id, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            return self._row_to_delegation(row)
+
+    def _finalize_result_set_sync(self, delegation_id: str, status: str) -> Delegation | None:
+        now = self._clock_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE delegations SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'joining'",
+                (status, now, delegation_id),
+            )
+            if cur.rowcount == 0:
+                conn.commit()
+                return None
+            conn.execute(
+                "INSERT INTO delegation_events (delegation_id, kind, "
+                "payload_json, member_ordinal, run_id, created_at) "
+                "VALUES (?, ?, '{}', NULL, NULL, ?)",
+                (delegation_id, status, now),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM delegations WHERE id = ?", (delegation_id,)
+            ).fetchone()
+            return self._row_to_delegation(row)

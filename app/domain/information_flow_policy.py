@@ -162,6 +162,51 @@ class InformationFlowPolicy:
                 reason=f"public_artifact_{asset.classification.value}_no_secrets",
             )
 
+        # --- PARENT / AGGREGATOR_INPUT (Agent-intermediary boundaries) ----
+        #
+        # Child results returning to the parent boundary, and worker results
+        # entering an aggregator's prompt, are Agent-to-Agent release targets.
+        # SECRET content is never released across these boundaries.  Content
+        # needing redaction is allowed only when a redaction transform is
+        # available; otherwise denied.  This branch MUST NOT fall through to
+        # the generic default-allow.
+        if target in (ReleaseTarget.PARENT, ReleaseTarget.AGGREGATOR_INPUT):
+            if asset.classification == Classification.SECRET:
+                return InformationReleaseDecision(
+                    verdict=PolicyOutcome.DENY,
+                    transform=None,
+                    allowed_fields=frozenset(),
+                    retention="none",
+                    audit_level="summary",
+                    reason=f"{target.value}_secret_classification_denied",
+                )
+            if needs_redaction:
+                if self._config.redact_secrets:
+                    return InformationReleaseDecision(
+                        verdict=PolicyOutcome.ALLOW,
+                        transform="redaction",
+                        allowed_fields=frozenset(),
+                        retention="sanitized",
+                        audit_level="summary",
+                        reason=f"{target.value}_secret_redacted",
+                    )
+                return InformationReleaseDecision(
+                    verdict=PolicyOutcome.DENY,
+                    transform=None,
+                    allowed_fields=frozenset(),
+                    retention="none",
+                    audit_level="summary",
+                    reason=f"{target.value}_secret_no_transform_available",
+                )
+            return InformationReleaseDecision(
+                verdict=PolicyOutcome.ALLOW,
+                transform=None,
+                allowed_fields=frozenset(),
+                retention="raw",
+                audit_level="summary",
+                reason=f"{target.value}_{asset.classification.value}_no_secrets",
+            )
+
         # --- Generic targets (LLM_PROVIDER, CLIENT_RESPONSE, etc.) -------
 
         if needs_redaction:

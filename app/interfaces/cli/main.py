@@ -14,6 +14,7 @@ from .commands import (
     chat,
     config,
     curator,
+    delegation,
     doctor,
     knowledge,
     logs,
@@ -351,6 +352,36 @@ def _build_task_parser(subparsers) -> None:
     _fmt(propose_p)
 
 
+def _build_delegation_parser(subparsers) -> None:
+    parser = subparsers.add_parser("delegation", help="Delegation commands")
+    sub = parser.add_subparsers(dest="delegation_command", required=True)
+
+    def _fmt(p):
+        return _add_format_flags(p)
+
+    list_p = sub.add_parser("list", help="List delegations")
+    list_p.add_argument("--scope-id", default=None, help="Filter by trusted parent scope")
+    list_p.add_argument("--status", default=None)
+    _fmt(list_p)
+
+    ls_p = sub.add_parser("ls", help="Alias of list")
+    ls_p.add_argument("--scope-id", default=None)
+    ls_p.add_argument("--status", default=None)
+    _fmt(ls_p)
+
+    show_p = sub.add_parser("show", help="Show a delegation")
+    show_p.add_argument("id")
+    _fmt(show_p)
+
+    events_p = sub.add_parser("events", help="List delegation events")
+    events_p.add_argument("id")
+    _fmt(events_p)
+
+    cancel_p = sub.add_parser("cancel", help="Cancel a delegation (async)")
+    cancel_p.add_argument("id")
+    _fmt(cancel_p)
+
+
 def _build_sandbox_parser(subparsers) -> None:
     parser = subparsers.add_parser("sandbox", help="Sandbox commands")
     sub = parser.add_subparsers(dest="sandbox_command", required=True)
@@ -618,6 +649,7 @@ def build_parser(
     _build_logs_parser(subparsers)
     _build_acp_parser(subparsers)
     _build_task_parser(subparsers)
+    _build_delegation_parser(subparsers)
     browser_host_parser = subparsers.add_parser(
         "browser-host", help="Run the bounded Browser Host Bridge"
     )
@@ -709,6 +741,7 @@ _DISPATCH = {
     "logs": logs.run,
     "acp": acp.run,
     "task": task.run,
+    "delegation": delegation.run,
     "usage": usage.run,
     "browser-host": browser_host.run,
 }

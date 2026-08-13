@@ -341,3 +341,81 @@ class TestSecretCatalog:
         assert "api_key" in catalog.credential_field_names
         assert "password" in catalog.credential_field_names
         assert "token" in catalog.credential_field_names
+
+
+# ===========================================================================
+# T10: PARENT / AGGREGATOR_INPUT release targets
+# ===========================================================================
+
+
+class TestParentAndAggregatorInputTargets:
+    """T10: Agent-intermediary boundary release targets."""
+
+    def test_parent_target_redacts_secret_labelled_content(self):
+        p = _make_policy(redact_secrets=True)
+        asset = InformationAsset(
+            classification=Classification.SENSITIVE,
+            origin="child",
+            labels=frozenset({"secret"}),
+            content="plan: api_key=abc",
+        )
+        d = p.evaluate(asset, ReleaseTarget.PARENT)
+        assert d.verdict is PolicyOutcome.ALLOW
+        assert d.transform == "redaction"
+
+    def test_aggregator_input_target_redacts_secret_labelled_content(self):
+        p = _make_policy(redact_secrets=True)
+        asset = InformationAsset(
+            classification=Classification.INTERNAL,
+            origin="worker",
+            labels=frozenset({"secret"}),
+            content="x",
+        )
+        d = p.evaluate(asset, ReleaseTarget.AGGREGATOR_INPUT)
+        assert d.verdict is PolicyOutcome.ALLOW
+        assert d.transform == "redaction"
+
+    def test_parent_target_secret_classification_denies(self):
+        p = _make_policy(redact_secrets=True)
+        asset = InformationAsset(
+            classification=Classification.SECRET,
+            origin="child",
+            labels=frozenset(),
+            content="top secret",
+        )
+        d = p.evaluate(asset, ReleaseTarget.PARENT)
+        assert d.verdict is PolicyOutcome.DENY
+
+    def test_parent_target_no_secrets_allows_raw(self):
+        p = _make_policy()
+        asset = InformationAsset(
+            classification=Classification.INTERNAL,
+            origin="child",
+            labels=frozenset(),
+            content="summary of work",
+        )
+        d = p.evaluate(asset, ReleaseTarget.PARENT)
+        assert d.verdict is PolicyOutcome.ALLOW
+        assert d.transform is None
+
+    def test_parent_target_secret_no_transform_denies(self):
+        p = _make_policy(redact_secrets=False)
+        asset = InformationAsset(
+            classification=Classification.SENSITIVE,
+            origin="child",
+            labels=frozenset({"secret"}),
+            content="x",
+        )
+        d = p.evaluate(asset, ReleaseTarget.PARENT)
+        assert d.verdict is PolicyOutcome.DENY
+
+    def test_aggregator_input_secret_classification_denies(self):
+        p = _make_policy(redact_secrets=True)
+        asset = InformationAsset(
+            classification=Classification.SECRET,
+            origin="worker",
+            labels=frozenset(),
+            content="x",
+        )
+        d = p.evaluate(asset, ReleaseTarget.AGGREGATOR_INPUT)
+        assert d.verdict is PolicyOutcome.DENY
