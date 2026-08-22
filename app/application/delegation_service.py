@@ -23,12 +23,12 @@ the user's final message. It returns a bounded, information-flow-filtered
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol
 
 from app.application.delegation_request_parser import (
-    DelegationError,
-    DelegationRequestParser,
+    DelegationError,    DelegationRequestParser,
 )
 from app.domain.delegation import (
     DelegationChildSpec,
@@ -155,7 +155,7 @@ class DelegationService:
         # 3. Policy admission.
         policy_request = self._build_policy_request(
             parent_capability, norm_children, join_policy, aggregation,
-            timeout_seconds,
+            timeout_seconds, aggregator_instruction,
         )
         if self._policy.evaluate(policy_request) is not PolicyOutcome.ALLOW:
             raise DelegationError(
@@ -248,7 +248,17 @@ class DelegationService:
         join_policy: str,
         aggregation: str,
         timeout_seconds: int,
+        aggregator_instruction: str | None = None,
     ) -> DelegationPolicyRequest:
+        # The aggregator runs as a member when aggregation=AGENT; its spec
+        # must be part of the policy request, otherwise _validate_aggregator
+        # denies every AGENT aggregation request (aggregator_spec None).
+        aggregator_spec: DelegationChildSpec | None = None
+        if aggregation == "agent" and aggregator_instruction:
+            aggregator_spec = DelegationChildSpec(
+                title="aggregator",
+                instruction=aggregator_instruction.strip(),
+            )
         return DelegationPolicyRequest(
             parent=self._build_parent_ref(cap),
             has_capability=bool(cap.get("has_capability", False)),
@@ -268,6 +278,7 @@ class DelegationService:
             timeout_seconds=timeout_seconds,
             parent_deadline=cap.get("parent_deadline"),
             classification=cap.get("classification"),
+            aggregator_spec=aggregator_spec,
         )
 
     # ------------------------------------------------------------------
@@ -502,7 +513,9 @@ class DelegationService:
             return None
         from dataclasses import replace
 
-        summary = getattr(result, "summary", "") or ""
+        summary = self._redact_json_credential_fields(
+            getattr(result, "summary", "") or ""
+        )
         release = self._info_flow.release(
             summary,
             ReleaseTarget.PARENT,
@@ -516,6 +529,17 @@ class DelegationService:
         else:
             new_summary = "[filtered]"
         return replace(result, summary=new_summary)
+
+    def _redact_json_credential_fields(self, summary: str) -> str:
+        """Redact credentials when a child text result contains JSON."""
+        try:
+            data = json.loads(summary)
+        except (TypeError, ValueError):
+            return summary
+        if not isinstance(data, (dict, list)):
+            return summary
+        redacted = self._info_flow.redact_structured(data)
+        return json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def _classification(cap: Mapping[str, Any]) -> Classification:

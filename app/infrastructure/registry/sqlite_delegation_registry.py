@@ -624,6 +624,41 @@ class SQLiteDelegationRegistry:
             ).fetchone()
         return self._row_to_delegation(row) if row else None
 
+    async def list_execution_session_ids_for_parent(
+        self, parent_session_id: str
+    ) -> tuple[str, ...]:
+        return await asyncio.to_thread(
+            self._list_execution_session_ids_for_parent_sync, parent_session_id
+        )
+
+    def _list_execution_session_ids_for_parent_sync(
+        self, parent_session_id: str
+    ) -> tuple[str, ...]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT m.execution_session_id FROM delegation_members m "
+                "JOIN delegations d ON d.id = m.delegation_id "
+                "WHERE d.parent_session_id = ? AND m.execution_session_id != ''",
+                (parent_session_id,),
+            ).fetchall()
+        return tuple(r["execution_session_id"] for r in rows)
+
+    async def delete_by_parent_session(self, parent_session_id: str) -> int:
+        return await asyncio.to_thread(
+            self._delete_by_parent_session_sync, parent_session_id
+        )
+
+    def _delete_by_parent_session_sync(self, parent_session_id: str) -> int:
+        # 子表（members/policy_snapshots/results/events/budget_ledger/
+        # cancel_outbox）经 FK ON DELETE CASCADE 一并清理。
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM delegations WHERE parent_session_id = ?",
+                (parent_session_id,),
+            )
+            conn.commit()
+            return cur.rowcount
+
     async def list_for_trusted_scope(
         self, scope_id: str, limit: int = 100
     ) -> tuple[Delegation, ...]:

@@ -246,3 +246,80 @@ async def test_executor_returns_partial_flag_when_forced():
     payload = result.content if isinstance(result.content, dict) else {}
     assert payload["partial"] is True
     assert payload["partial_reason"] == "deadline"
+
+
+# ---------------------------------------------------------------------------
+# tool executor: omitted required arguments (model-side schema violations)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_executor_defaults_when_required_args_omitted():
+    """Model omitted delegation_key/timeout_seconds -> derive key + default.
+
+    Reproduces the dashboard session bug: an OpenAI-compatible provider may
+    return a tool call without schema-required fields; the executor must
+    still produce a valid request instead of a guaranteed-invalid sentinel
+    (empty key / zero timeout -> delegation_invalid).
+    """
+    svc = FakeDelegationService()
+    exe = DelegateAgentsToolExecutor(delegation_service=svc)
+    ctx = _ctx(capability=_capability())
+    result = await exe.execute(
+        ToolCallRequest(
+            id="c1",
+            name="delegate_agents",
+            arguments={
+                "aggregation": "parent",
+                "children": [{"title": "w0", "instruction": "do work"}],
+            },
+        ),
+        ctx,
+    )
+    assert result.status is ToolResultStatus.SUCCESS
+    captured = svc.captured
+    # delegation_key is derived (non-empty, stable).
+    assert isinstance(captured["delegation_key"], str)
+    assert captured["delegation_key"]
+    # timeout falls back to a positive default.
+    assert captured["timeout_seconds"] > 0
+    assert captured["join_policy"] == "all_completed"
+    assert captured["aggregation"] == "parent"
+
+
+@pytest.mark.asyncio
+async def test_executor_derives_same_key_for_same_logical_request():
+    """Identical omitted-key requests derive the same delegation_key."""
+    svc = FakeDelegationService()
+    exe = DelegateAgentsToolExecutor(delegation_service=svc)
+    ctx = _ctx(capability=_capability())
+    args = {"aggregation": "parent",
+            "children": [{"title": "w0", "instruction": "do work"}]}
+    await exe.execute(ToolCallRequest(id="c1", name="delegate_agents", arguments=args), ctx)
+    first = svc.captured["delegation_key"]
+    await exe.execute(ToolCallRequest(id="c2", name="delegate_agents", arguments=args), ctx)
+    assert svc.captured["delegation_key"] == first
+
+
+@pytest.mark.asyncio
+async def test_executor_tolerates_string_timeout():
+    svc = FakeDelegationService()
+    exe = DelegateAgentsToolExecutor(delegation_service=svc)
+    ctx = _ctx(capability=_capability())
+    result = await exe.execute(_req(timeout_seconds="60"), ctx)
+    assert result.status is ToolResultStatus.SUCCESS
+    assert svc.captured["timeout_seconds"] == 60
+
+
+@pytest.mark.asyncio
+async def test_executor_error_payload_includes_message():
+    svc = FakeDelegationService(
+        error=DelegationError("delegation_invalid", "delegation_key must not be blank")
+    )
+    exe = DelegateAgentsToolExecutor(delegation_service=svc)
+    ctx = _ctx(capability=_capability())
+    result = await exe.execute(_req(), ctx)
+    assert result.status is ToolResultStatus.ERROR
+    payload = result.content if isinstance(result.content, dict) else {}
+    assert payload["error"] == "delegation_invalid"
+    assert payload["message"] == "delegation_key must not be blank"

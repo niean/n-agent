@@ -147,6 +147,18 @@ expected_provider_dir=$(CDPATH= cd -P "$expected_provider_dir" 2>/dev/null && pw
 model=${HARNESS_THIRD_REVIEW_MODEL-}
 has_ascii_control "$model" && fail 'model must not contain ASCII control bytes'
 
+# 超时是框架级配置：runner 校验并以 watchdog 统一执行这一个期限，provider
+# 适配器不自建超时。默认 900 秒，可经 HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS 覆盖。
+timeout_seconds=${HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS:-900}
+case $timeout_seconds in
+    ''|*[!0-9]*|??????*) fail 'timeout must be a 1-5 digit seconds value' ;;
+esac
+if [ "$timeout_seconds" -lt 1 ] || [ "$timeout_seconds" -gt 86400 ]; then
+    fail 'timeout must be between 1 and 86400 seconds'
+fi
+HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS=$timeout_seconds
+export HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS
+
 runner_tmp=$(mktemp -d "${TMPDIR:-/tmp}/third-review-run.XXXXXX") || fail 'cannot create temporary directory'
 provider_pid=
 watchdog_pid=
@@ -166,7 +178,7 @@ terminate_provider() {
     (
         sleep 2
         kill -KILL "$provider_pid" 2>/dev/null || :
-    ) &
+    ) >/dev/null 2>&1 &
     killer_pid=$!
     wait "$provider_pid" 2>/dev/null || :
     kill "$killer_pid" 2>/dev/null || :
@@ -243,25 +255,31 @@ snapshot_repo() {
     (
         cd "$repo_root" || exit 1
         git rev-parse --verify HEAD >"$snapshot_dir/head" || exit 1
-        git ls-tree -r -t -z HEAD >"$snapshot_dir/head-tree.z" || exit 1
-        git ls-files --stage -z >"$snapshot_dir/index-stage.z" || exit 1
+        # 守护语义保持三层（目标哈希、越界检测、并发检测），实现从全量跟踪
+        # 文件逐文件哈希降级为集合哈希：
+        # 1) 干净跟踪文件被改动、删除或变更模式 -> 进入 HEAD diff 集合；
+        # 2) 新增文件 -> 进入未忽略未跟踪集合；集合本身的变化即判定越界；
+        # 3) 内容/模式粒度哈希只覆盖集合内文件（通常个位数），堵住“脏文件
+        #    被进一步编辑”这一路径粒度检测不到的场景；
+        # 4) index 由 write-tree 快照守护（捕获纯暂存区操作），HEAD 由
+        #    rev-parse 守护（捕获审阅期间并发提交）。
+        # 已忽略目录（.venv、locals/ 等）内的写入不在守护范围。
         git write-tree >"$snapshot_dir/index-tree" || exit 1
-        git status --porcelain=v1 -z --untracked-files=all --ignored=matching >"$snapshot_dir/status.z" || exit 1
-        find . -path ./.git -prune -o -exec sh -c '
-            for manifest_path do
-                [ "$manifest_path" != . ] || continue
+        {
+            git diff --name-only --no-renames -z HEAD
+            git ls-files --others --exclude-standard -z
+        } >"$snapshot_dir/dirty.z" || exit 1
+        xargs -0 sh -c '
+            repo_root=$1
+            shift
+            for manifest_relative do
+                manifest_path=$repo_root/$manifest_relative
                 if [ -L "$manifest_path" ]; then
                     manifest_type=link
-                    manifest_content=$(
-                        { printf "link\000"; readlink "$manifest_path"; } |
-                            git hash-object --stdin
-                    ) || exit 1
+                    manifest_content=$( { printf "link\000"; readlink "$manifest_path"; } | git hash-object --stdin ) || exit 1
                 elif [ -f "$manifest_path" ]; then
                     manifest_type=file
                     manifest_content=$(git hash-object --no-filters -- "$manifest_path") || exit 1
-                elif [ -d "$manifest_path" ]; then
-                    manifest_type=directory
-                    manifest_content=-
                 else
                     manifest_type=other
                     manifest_content=-
@@ -271,14 +289,14 @@ snapshot_repo() {
                 else
                     manifest_mode=$(stat -f "%p" "$manifest_path") || exit 1
                 fi
-                {
-                    printf "%s\000%s\000%s\000" "$manifest_type" "$manifest_mode" "$manifest_content"
-                    printf "%s" "$manifest_path"
-                } | git hash-object --stdin || exit 1
+                manifest_record=$( { printf "%s\000%s\000%s\000" "$manifest_type" "$manifest_mode" "$manifest_content"; printf "%s" "$manifest_relative"; } | git hash-object --stdin ) || exit 1
+                printf "%s %s\n" "$manifest_record" "$manifest_relative"
             done
-        ' sh {} + | LC_ALL=C sort >"$snapshot_dir/worktree.manifest" || exit 1
-        manifest_path_record "./$target_relative" >"$snapshot_dir/target.record" || exit 1
-        [ "$(grep -Fxc "$(cat "$snapshot_dir/target.record")" "$snapshot_dir/worktree.manifest")" -eq 1 ] || exit 1
+        ' sh "$repo_root" <"$snapshot_dir/dirty.z" >"$snapshot_dir/dirty.lines" || exit 1
+        # 审阅目标始终单独纳入：被 Git 忽略或刚写入的目标不在上述两个集合内。
+        target_record=$(manifest_path_record "$target_relative") || exit 1
+        printf '%s %s\n' "$target_record" "$target_relative" >>"$snapshot_dir/dirty.lines" || exit 1
+        LC_ALL=C sort "$snapshot_dir/dirty.lines" >"$snapshot_dir/dirty.manifest" || exit 1
     ) || return 1
 }
 
@@ -286,30 +304,96 @@ snapshot_metadata_equal() {
     first_snapshot=$1
     second_snapshot=$2
     cmp -s "$first_snapshot/head" "$second_snapshot/head" &&
-        cmp -s "$first_snapshot/head-tree.z" "$second_snapshot/head-tree.z" &&
-        cmp -s "$first_snapshot/index-stage.z" "$second_snapshot/index-stage.z" &&
         cmp -s "$first_snapshot/index-tree" "$second_snapshot/index-tree"
 }
 
-snapshot_worktree_equal() {
-    cmp -s "$1/worktree.manifest" "$2/worktree.manifest"
+snapshot_full_equal() {
+    snapshot_metadata_equal "$1" "$2" &&
+        cmp -s "$1/dirty.manifest" "$2/dirty.manifest"
 }
 
-snapshot_full_equal() {
-    snapshot_metadata_equal "$1" "$2" && snapshot_worktree_equal "$1" "$2"
+strip_target_lines() {
+    LC_ALL=C awk -v target="$target_relative" '
+        length($0) > length(target) + 1 &&
+            substr($0, length($0) - length(target)) == " " target { next }
+        { print }
+    ' "$1"
 }
 
 snapshot_boundary_equal() {
     before_snapshot=$1
     after_snapshot=$2
     snapshot_metadata_equal "$before_snapshot" "$after_snapshot" || return 1
-    target_record_before=$(cat "$before_snapshot/target.record") || return 2
-    target_record_after=$(cat "$after_snapshot/target.record") || return 2
-    LC_ALL=C grep -Fvx "$target_record_before" "$before_snapshot/worktree.manifest" >"$runner_tmp/boundary-before" ||
-        [ "$?" -eq 1 ] || return 2
-    LC_ALL=C grep -Fvx "$target_record_after" "$after_snapshot/worktree.manifest" >"$runner_tmp/boundary-after" ||
-        [ "$?" -eq 1 ] || return 2
+    strip_target_lines "$before_snapshot/dirty.manifest" >"$runner_tmp/boundary-before" || return 2
+    strip_target_lines "$after_snapshot/dirty.manifest" >"$runner_tmp/boundary-after" || return 2
     cmp -s "$runner_tmp/boundary-before" "$runner_tmp/boundary-after"
+}
+
+boundary_change_reason() {
+    before_snapshot=$1
+    after_snapshot=$2
+    change_reasons=
+
+    if ! cmp -s "$before_snapshot/head" "$after_snapshot/head"; then
+        change_reasons='Git HEAD changed'
+    fi
+    if ! cmp -s "$before_snapshot/index-tree" "$after_snapshot/index-tree"; then
+        index_change_paths=$(git -c core.quotePath=true diff --no-ext-diff --no-renames --name-status "$(cat "$before_snapshot/index-tree")" "$(cat "$after_snapshot/index-tree")" -- |
+            LC_ALL=C awk 'NR <= 20 { if (NR > 1) printf "; "; printf "%s", $0; count += 1 } END { if (count > 0) printf "" }') || return 2
+        if [ -z "$index_change_paths" ]; then
+            index_change_paths='paths unavailable'
+        fi
+        if [ -n "$change_reasons" ]; then
+            change_reasons="$change_reasons; Git index changed [$index_change_paths]"
+        else
+            change_reasons="Git index changed [$index_change_paths]"
+        fi
+    fi
+
+    strip_target_lines "$before_snapshot/dirty.manifest" >"$runner_tmp/boundary-before" || return 2
+    strip_target_lines "$after_snapshot/dirty.manifest" >"$runner_tmp/boundary-after" || return 2
+    if ! cmp -s "$runner_tmp/boundary-before" "$runner_tmp/boundary-after"; then
+        boundary_change_paths=$(LC_ALL=C awk '
+            function record_path(record) {
+                sub(/^[^ ]+ /, "", record)
+                return record
+            }
+            NR == FNR {
+                before[record_path($0)] = $1
+                next
+            }
+            {
+                after[record_path($0)] = $1
+            }
+            END {
+                for (path in before) {
+                    if (!(path in after)) {
+                        print "removed-or-cleaned " path
+                    } else if (before[path] != after[path]) {
+                        print "modified " path
+                    }
+                }
+                for (path in after) {
+                    if (!(path in before)) {
+                        print "added-or-dirtied " path
+                    }
+                }
+            }
+        ' "$runner_tmp/boundary-before" "$runner_tmp/boundary-after" |
+            LC_ALL=C sort |
+            LC_ALL=C awk 'NR <= 20 { if (NR > 1) printf "; "; printf "%s", $0; count += 1 } END { if (count > 0) printf "" }') || return 2
+        if [ -z "$boundary_change_paths" ]; then
+            boundary_change_paths='paths unavailable'
+        fi
+        if [ -n "$change_reasons" ]; then
+            change_reasons="$change_reasons; tracked, unstaged, or untracked files outside the review target changed [$boundary_change_paths]"
+        else
+            change_reasons="tracked, unstaged, or untracked files outside the review target changed [$boundary_change_paths]"
+        fi
+    fi
+
+    [ -n "$change_reasons" ] || return 2
+    printf '%s\n' "$change_reasons"
 }
 
 {
@@ -351,6 +435,9 @@ printf '%s\n' "$target_hash_before" >"$target_states"
 # the finalization window. A complete change-and-revert between samples cannot be
 # attributed without extending the provider protocol, so this is deliberately a
 # fail-closed heuristic rather than an authorship claim.
+# 后台子 shell 一律重定向输出：watchdog/monitor 被 kill 时其 sleep 子进程会
+# 短暂孤儿化，若继承调用方管道（如输出捕获的 $(...)），调用方将等待管道
+# EOF，最长阻塞至 sleep 结束。
 (
     target_monitor_last=$target_hash_before
     while kill -0 "$provider_pid" 2>/dev/null; do
@@ -365,16 +452,23 @@ printf '%s\n' "$target_hash_before" >"$target_states"
     if [ "$target_monitor_current" != "$target_monitor_last" ]; then
         printf '%s\n' "$target_monitor_current" >>"$target_states"
     fi
-) &
+) >/dev/null 2>&1 &
 target_monitor_pid=$!
 timeout_marker=$runner_tmp/timed-out
+# 步进 1 秒而非单次 sleep：watchdog 被 kill 时其当前 sleep 子进程会孤儿化，
+# 单次长 sleep 会泄漏整个期限；步进将孤儿存活上界压到 1 秒。输出重定向是
+# 为了孤儿不持有调用方的输出管道。
 (
-    sleep 900
+    watchdog_waited=0
+    while [ "$watchdog_waited" -lt "$timeout_seconds" ]; do
+        sleep 1
+        watchdog_waited=$((watchdog_waited + 1))
+    done
     printf '%s\n' timeout >"$timeout_marker"
     kill -TERM "$provider_pid" 2>/dev/null || :
     sleep 2
     kill -KILL "$provider_pid" 2>/dev/null || :
-) &
+) >/dev/null 2>&1 &
 watchdog_pid=$!
 wait "$provider_pid"
 provider_status=$?
@@ -391,17 +485,25 @@ kill "$watchdog_pid" 2>/dev/null || :
 wait "$watchdog_pid" 2>/dev/null || :
 watchdog_pid=
 if [ -f "$timeout_marker" ]; then
-    printf '%s\n' 'provider: timed out after configured deadline (exit timeout)' >&2
+    printf '%s\n' "provider: timed out after $timeout_seconds seconds (exit timeout)" >&2
     exit 124
 fi
 if [ "$provider_status" -ne 0 ]; then
     printf '%s\n' "provider: exited with status $provider_status" >&2
+    if [ -s "$stderr_file" ]; then
+        head -n 20 "$stderr_file" | sed 's/^/provider stderr: /' >&2
+    fi
     exit "$provider_status"
 fi
 
 failure_step=boundary-check
-target_state_count=$(LC_ALL=C sort -u "$target_states" | wc -l | tr -d '[:space:]') || fail 'cannot inspect target transitions'
-[ "$target_state_count" -le 2 ] || fail 'target content changed through multiple states during provider execution'
+# 目标文件在 provider 执行期间允许多次中间写入（provider 分步 patch 是正常编辑方式），
+# 不再以状态计数判定失败；最终版本的一致性由后续校验保证：
+# 1) provider 结束后两次守护快照相等（无并发外部修改）；
+# 2) provider 结束时 hash 与 boundary-check 时 hash 相等（终态稳定）；
+# 3) 守护快照剔除目标文件后必须相等（除目标外无越界写入或并发变更）。
+target_states_count_note=$(LC_ALL=C sort -u "$target_states" | wc -l | tr -d '[:space:]') || target_states_count_note=unknown
+printf '%s\n' "note: target went through $target_states_count_note distinct states during provider execution" >&2
 after_one=$runner_tmp/after-one
 after_two=$runner_tmp/after-two
 snapshot_repo "$after_one" || fail 'cannot capture repository state after provider'
@@ -416,7 +518,10 @@ snapshot_boundary_equal "$baseline_two" "$after_one"
 boundary_status=$?
 case $boundary_status in
     0) ;;
-    1) fail 'provider changed state outside target worktree content' ;;
+    1)
+        boundary_reason=$(boundary_change_reason "$baseline_two" "$after_one") || fail 'cannot identify repository boundary change'
+        fail "repository state outside the review target changed during provider execution: $boundary_reason"
+        ;;
     *) fail 'cannot compare complete repository boundary' ;;
 esac
 

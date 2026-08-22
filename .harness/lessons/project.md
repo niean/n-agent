@@ -378,3 +378,43 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：同一资源的变更（mutation）接口必须返回与读（read）接口一致的视图形状，因为前端常把变更响应直接赋给本地 state（state.detail = updated）。若变更返回精简形状缺了前端依赖的字段（如 id），下游功能（预览 fetchExport(detail.id)、版本 modal 标记当前版本、下次保存 CAS token）会静默失效。诊断"编辑后需手动刷新才更新"类前端问题时，先查变更接口响应形状是否与读接口一致、前端是否直接赋值。修复跨层：Interfaces artifact_routes.py（content PATCH JSON + multipart 改返回 _artifact_view，与 GET 一致）+ frontend artifacts.js（saveText 赋值完整视图 + 失效并重载 revisions；openRevisionsModal 打开时重拉）。
 
 来源：bug fix 260811 制品编辑后预览/版本不自动刷新（content PATCH 响应缺 id 致 fetchExport 404 + 未重载 revisions）
+
+### P038: 隔离子 Agent 的 ingress 身份必须绑定子会话，模型占位符也必须走统一解析
+
+现象：实时父 Agent 成功调用 `delegate_agents`，但两个子成员都在几十毫秒内同时失败，结果仅显示 `delegation_child_execution_error`，没有发生真实 LLM 推理。
+
+根因：ChildAgentExecutor 的请求使用 `delegation-<uuid>` 隔离会话，却把父会话 ID 写入 `IngressFacts.session_id`，被 ChatCompletionService 的策略快照入口以 `policy_context_invalid: ingress session mismatch` 拒绝。修复该错位后又发现 DelegationRunService 把子模型硬编码为 `default`；该字符串不是统一模型解析支持的占位符，会原样发给 Provider 并被拒绝。ChildAgentExecutor 还会把 `finish_reason=error` 的错误文本误判为成功摘要。
+
+教训：派生执行上下文必须区分“本次执行身份”和“父级来源”：request.session_id 与 IngressFacts.session_id 必须都绑定隔离子会话，父会话只能放入 trusted claims 作为谱系信息。跨子系统调用 LLM 时必须使用项目统一占位符（当前为 `N-Agent`）或显式解析后的活动模型，禁止自行发明 `default`。捕获异常的安全边界应保留可观测日志或测试复放入口，同时必须按 finish_reason 判断结果，不能仅以非空 content 判成功。
+
+来源：bug fix 260822 dashboard-d250c0b0 子 Agent 委派失败
+
+### P039: 不持久化消息不等于不创建会话，内部会话必须在创建时显式携带业务标题
+
+现象：委派子 Agent 会生成 `delegation-<uuid>` 隔离会话，但会话列表中的标题长期停留为 `New Session`，与普通会话和委派成员的任务语义不一致。
+
+根因：ChildAgentExecutor 为避免把内部控制消息写入会话记录而设置 `persist_messages=False`；ChatCompletionService 仍必须为策略快照创建会话，但自动标题生成被消息持久化开关一并跳过。结果是“会话已创建、消息不落库、标题也无人更新”。
+
+教训：会话存在性、消息持久化和标题来源是三个独立维度，不能用一个 `persist_messages` 开关隐式控制全部行为。服务端已知业务标题的内部执行（如委派成员）应通过类型化请求字段在创建会话时显式传入标题；复用历史默认标题时可以修复为业务标题，但必须保留用户已重命名或其他非默认标题。修复需同时覆盖调用方传递、会话服务创建/兼容修复，以及 `persist_messages=False` 的回归测试。
+
+来源：bug fix 260822 delegation-cf976103 子 Agent 隔离会话未正确命名
+
+### P040: capability 工具集不是工具暴露列表，签发时必须剥离 FORBIDDEN 工具
+
+现象：task worker 调用 `delegate_agents` 稳定返回 `delegation_invalid: delegation policy denied the request`，同参数 realtime 源却成功；静态重建 Policy 请求评估结果为 ALLOW，无法从代码推断拒绝原因。
+
+根因：TaskDelegationAdapter.grant_delegate_tool 把 `delegate_agents` 加入 worker 的 granted_tools（工具暴露列表，父要用它发起委派），TaskAgentExecutor 又把同一列表原样作为 parent_allowed_tools 传入 sign_task_capability；DelegationPolicy 检查 3(a) 禁止 parent_allowed_tools 与 FORBIDDEN_CHILD_TOOLS 相交（delegate_agents 在列），task 源委派自授权起即必然 DENY。realtime 源因 Dashboard 不设置 granted_tools（空集）而未触发。
+
+教训：同一份工具名列表在不同语义下含义不同：granted_tools 是"本 Agent 可调用的工具"，capability 的 parent_allowed_tools 是"可授予子 Agent 的工具"，两者集合关系是子集收紧而非等价。capability 签发点是做剥离的正确位置（对 realtime/task 两个 adapter 统一生效），修复需配"含 FORBIDDEN 工具输入 -> 签发结果不含"的回归测试。当静态分析与运行时行为矛盾且所有可重建输入都评估为 ALLOW 时，应在拒绝点加一次性诊断日志（capability 摘要+逐项子检查结果）拿运行时证据，而不是继续枚举假设。
+
+来源：bug fix 260823 dashboard-bf805e6d task 源委派被 policy 拒绝
+
+### P041: 文本形态的 JSON 委派结果也必须在持久化前按字段脱敏
+
+现象：子 Agent 返回 `{"secret":"…","credential":"…"}` 后，Dashboard 父会话展示了原始凭证值。
+
+根因：InformationFlow 的精确值脱敏只知道运行配置中登记的 secret（通常仅 provider API key）；委派结果作为纯文本摘要写入数据库，未解析 JSON 并复用结构化字段脱敏，`credential` 也不在默认字段列表中。
+
+教训：对模型返回的 JSON 文本，不能把它当作不透明字符串。应在第一个可持久化边界解析 object/list 并应用结构化凭证字段脱敏；在结果释放给父 Agent 时再作一次防御性过滤。测试必须断言原值既不在持久化摘要中，也不在父侧投影中。
+
+来源：bug fix 260823 dashboard-1e0276ec-5180-461f-93dd-dc60789e3d72 委派结果敏感字段未脱敏

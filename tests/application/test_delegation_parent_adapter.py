@@ -181,6 +181,29 @@ def test_task_grant_strips_delegate_when_not_allowed():
     assert "delegate_agents" not in result
 
 
+def test_task_capability_strips_forbidden_parent_tools():
+    """Regression: grant_delegate_tool puts delegate_agents into granted_tools,
+    and the executor passes the same list as parent_allowed_tools. DelegationPolicy
+    check 3(a) denies any capability whose parent_allowed_tools intersects
+    FORBIDDEN_CHILD_TOOLS, so signing must strip them (delegate_agents is the
+    parent's own capability, never a grantable child tool)."""
+    from app.domain.delegation_policy import FORBIDDEN_CHILD_TOOLS
+
+    adapter = TaskDelegationAdapter()
+    granted = ["execute_code", "delegate_agents", "task_show", "manage_schedule"]
+    cap = adapter.sign_task_capability(
+        run_id="task-run-1",
+        session_id="task-session-1",
+        scope_id="task-1",
+        parent_allowed_tools=frozenset(granted),
+        system_child_allowlist=frozenset(granted),
+    )
+    assert not (cap.parent_allowed_tools & FORBIDDEN_CHILD_TOOLS)
+    assert "execute_code" in cap.parent_allowed_tools
+    # The system child allowlist must not leak forbidden tools either.
+    assert not (cap.system_child_allowlist & FORBIDDEN_CHILD_TOOLS)
+
+
 # ---------------------------------------------------------------------------
 # TaskDelegationAdapter: on_task_cancel cancels scope delegations
 # ---------------------------------------------------------------------------

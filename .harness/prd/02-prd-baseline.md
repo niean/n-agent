@@ -120,7 +120,7 @@
 - Agent 可通过 `manage_schedule` 管理定时任务，通过 `schedule_query` 查询可见任务。
 
 ### 3.10 平台与 Gateway
-- 平台抽象统一纳管 IM 等外部入口，当前支持飞书，并预留钉钉、企业微信。
+- 平台抽象统一纳管 IM 等外部入口，当前支持飞书，并预留钉钉、企微。
 - 飞书长连接入口将 IM 消息转为 Gateway 事件，再进入统一 Chat/Agent 流程。
 - Gateway 会话映射应支持平台 session、thread 和 N-Agent session 的绑定。
 - Gateway 命令支持 `/new`、`/rename`、`/delete`、`/schedule` 等会话和任务操作。

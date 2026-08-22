@@ -39,6 +39,7 @@ class FakeChatService:
     response_usage: dict[str, Any] = field(default_factory=lambda: {
         "total_tokens": 120, "prompt_tokens": 80, "completion_tokens": 40
     })
+    response_finish_reason: str = "stop"
     raise_exc: Exception | None = None
 
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult:
@@ -49,7 +50,7 @@ class FakeChatService:
             session_id=request.session_id or "delegation-fake",
             model=request.model,
             message=self.response_message,
-            finish_reason="stop",
+            finish_reason=self.response_finish_reason,
             usage=self.response_usage,
         )
 
@@ -122,6 +123,22 @@ async def test_child_persist_messages_false():
 
 
 @pytest.mark.asyncio
+async def test_child_uses_member_title_for_isolated_session():
+    """Persist-disabled child sessions still appear in session storage for
+    policy bootstrap, so they need the member's meaningful title."""
+    fake = FakeChatService()
+    exe = ChildAgentExecutor(chat_service=fake, clock=FakeClock())
+    member = _make_member()
+    await exe.execute(
+        member=member,
+        model="m",
+        parent_capability=_parent_capability(),
+        deadline_at="2026-08-12T03:00:00Z",
+    )
+    assert fake.captured.session_title == member.title
+
+
+@pytest.mark.asyncio
 async def test_child_source_is_delegation_and_unattended():
     fake = FakeChatService()
     exe = ChildAgentExecutor(chat_service=fake, clock=FakeClock())
@@ -135,6 +152,28 @@ async def test_child_source_is_delegation_and_unattended():
     assert facts is not None
     assert facts.source == "delegation"
     assert facts.execution_mode is ExecutionMode.UNATTENDED
+
+
+@pytest.mark.asyncio
+async def test_child_ingress_session_matches_isolated_execution_session():
+    """Policy snapshot admission requires ingress/session identity equality.
+
+    Regression: the child request used the parent's session in IngressFacts,
+    so ChatCompletionService rejected every real child before the LLM call.
+    """
+    fake = FakeChatService()
+    exe = ChildAgentExecutor(chat_service=fake, clock=FakeClock())
+    member = _make_member()
+    await exe.execute(
+        member=member,
+        model="m",
+        parent_capability=_parent_capability(),
+        deadline_at="2026-08-12T03:00:00Z",
+    )
+    facts = fake.captured.ingress_facts
+    assert facts is not None
+    assert facts.session_id == member.execution_session_id
+    assert facts.session_id != _parent_capability()["session_id"]
 
 
 @pytest.mark.asyncio
@@ -224,3 +263,41 @@ async def test_successful_result_extracts_summary_and_usage():
     assert result.status is DelegationMemberStatus.SUCCEEDED
     assert result.summary == "done"
     assert result.usage_summary.get("total_tokens") == 120
+
+
+@pytest.mark.asyncio
+async def test_json_result_credential_values_are_redacted_before_persistence():
+    fake = FakeChatService(response_message={
+        "role": "assistant",
+        "content": '{"secret":"e2e-secret-123","credential":"e2e-token-456"}',
+    })
+    exe = ChildAgentExecutor(chat_service=fake, clock=FakeClock())
+
+    result = await exe.execute(
+        member=_make_member(),
+        model="test-model",
+        parent_capability=_parent_capability(),
+        deadline_at=None,
+    )
+
+    assert result.summary == '{"secret":"[REDACTED]","credential":"[REDACTED]"}'
+
+
+@pytest.mark.asyncio
+async def test_chat_error_result_is_not_reported_as_child_success():
+    """ChatCompletionService returns provider failures as an error result;
+    the error text must not be mistaken for a successful child summary."""
+    fake = FakeChatService(
+        response_message={"role": "assistant", "content": "provider failed"},
+        response_finish_reason="error",
+    )
+    exe = ChildAgentExecutor(chat_service=fake, clock=FakeClock())
+    result = await exe.execute(
+        member=_make_member(),
+        model="N-Agent",
+        parent_capability=_parent_capability(),
+        deadline_at="2026-08-12T03:00:00Z",
+    )
+    assert result.status is DelegationMemberStatus.FAILED
+    assert result.error_code == "delegation_child_execution_error"
+    assert result.summary == ""

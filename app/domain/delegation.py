@@ -783,6 +783,29 @@ class DelegationRegistry(Protocol):
 
     async def get(self, delegation_id: str) -> Delegation | None: ...
 
+    async def list_execution_session_ids_for_parent(
+        self,
+        parent_session_id: str,
+    ) -> tuple[str, ...]:
+        """Return all member ``execution_session_id`` values across every
+        delegation whose ``parent_session_id`` matches.
+
+        Used by the session-delete cascade: child ``delegation-`` prefixed
+        sessions must be removed together with the parent session so no
+        orphan child sessions remain.
+        """
+
+    async def delete_by_parent_session(self, parent_session_id: str) -> int:
+        """Delete every delegation whose ``parent_session_id`` matches and
+        return the number of delegations removed.
+
+        Child tables (members/policy_snapshots/results/events/budget_ledger/
+        cancel_outbox) cascade via FK ``ON DELETE CASCADE``. Used together
+        with the child-session cascade so no orphan delegation rows remain
+        after the parent session is deleted.
+        """
+        ...
+
     async def list_for_trusted_scope(
         self,
         scope_id: str,

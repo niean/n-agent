@@ -800,6 +800,7 @@ class TaskRegistry(Protocol):
         board: str = "default",
         cursor: TaskListCursor | None = None,
         limit: int = 100,
+        include_archived: bool = False,
     ) -> TaskListPage: ...
     async def update_task(
         self,

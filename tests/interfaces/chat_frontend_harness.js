@@ -46,21 +46,50 @@ function makeEl() {
     replaceChild(next, previous) { const i = kids.indexOf(previous); if (i >= 0) { previous.parentNode = null; next.parentNode = this; kids[i] = next; } return previous; },
     replaceChildren() { kids.forEach((k) => { k.parentNode = null; }); kids.length = 0; },
     append() { const args = Array.prototype.slice.call(arguments); args.forEach((c) => { if (c && c.tagName === '#document-fragment') { while (c._kids && c._kids.length > 0) { const child = c._kids.shift(); child.parentNode = this; kids.push(child); } } else { c.parentNode = this; kids.push(c); } }); },
+    remove() { if (el.parentNode) el.parentNode.removeChild(el); },
     addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
     removeEventListener() {},
     dispatchEvent(ev) { (this._listeners[(ev && ev.type) || ''] || []).forEach((fn) => fn(ev)); },
     querySelector(selector) {
-      const tag = String(selector || '').toUpperCase();
-      const visit = (node) => {
-        if (!node) return null;
-        if (node.tagName === tag) return node;
-        for (const child of node._kids || []) {
-          const found = visit(child);
-          if (found) return found;
+      // 支持 tag 选择器（原行为）与 class 选择器链（'.a' / '.a > .b'），供
+      // bindSideToggle 的 header 定位查询在桩上真实命中。
+      const sel = String(selector || '');
+      const parts = sel.split('>').map((s) => s.trim()).filter(Boolean);
+      const matches = (node, part) => {
+        if (!node) return false;
+        if (part.charAt(0) === '.') {
+          const cls = part.slice(1);
+          return !!(node.className && node.className.split(/\s+/).indexOf(cls) !== -1);
         }
-        return null;
+        return node.tagName === part.toUpperCase();
       };
-      return visit(this);
+      let found = null;
+      const search = (node, idx) => {
+        if (found || !node || !node._kids) return;
+        for (const child of node._kids) {
+          if (matches(child, parts[idx])) {
+            if (idx === parts.length - 1) { found = child; return; }
+            search(child, idx + 1);
+          }
+          if (found) return;
+          if (idx === 0) search(child, idx);
+        }
+      };
+      if (parts.length) search(this, 0);
+      else {
+        const tag = sel.toUpperCase();
+        const visit = (node) => {
+          if (!node) return null;
+          if (node.tagName === tag) return node;
+          for (const child of node._kids || []) {
+            const found = visit(child);
+            if (found) return found;
+          }
+          return null;
+        };
+        return visit(this);
+      }
+      return found;
     },
     querySelectorAll(selector) {
       const sel = String(selector || '');
@@ -122,6 +151,7 @@ let artifactFetchCalls = [];
 let artifactFetchHandler = null;
 // T4: navigation.navigatePath spy tracking
 let navPathCalls = [];
+const localStorageData = new Map();
 
 function makeTimerEnv() {
   const timers = [];
@@ -132,7 +162,10 @@ function makeTimerEnv() {
   return { setInterval, clearInterval, tickTimers, timerCount };
 }
 
-function freshStubs() {
+function freshStubs(options) {
+  options = options || {};
+  // options.missingIds: 数组；其中的 id 对 ui.byId / document.getElementById 均返回 null
+  const missingIds = new Set(options.missingIds || []);
   taskCalls.length = 0;
   fetchCalls = [];
   listItems = [];
@@ -165,6 +198,7 @@ function freshStubs() {
     'chat-summary': makeEl(),
     'chat-task-state': makeEl(),
     'chat-tool-calls': makeEl(),
+    'chat-session-filter-btn': makeEl(),
   };
   // T4: side panel structure (matching index.html)
   const chatShell = makeEl();
@@ -210,8 +244,52 @@ function freshStubs() {
   byIdMap['chat-tab-tool'] = chatTabTool;
   byIdMap['chat-tab-artifact'] = chatTabArtifact;
   byIdMap['chat-artifact-list'] = chatArtifactList;
+  // T3: 左侧会话面板结构（匹配 index.html 静态模板）
+  const hasId = (id) => !missingIds.has(id);
+  const sessionFilterBtn = byIdMap['chat-session-filter-btn'];
+  const sessionHideBtn = makeEl();
+  sessionHideBtn.tagName = 'BUTTON';
+  sessionHideBtn.setAttribute('aria-expanded', 'true'); // 静态模板初始：左侧展开
+  const sessionExpandBtn = makeEl();
+  sessionExpandBtn.tagName = 'BUTTON';
+  sessionExpandBtn.setAttribute('aria-expanded', 'false');
+  sessionExpandBtn.hidden = true; // 静态模板初始：展开按钮隐藏
+  const sessionPanel = makeEl();
+  sessionPanel.className = 'status-panel chat-session-panel';
+  const sessionHeader = makeEl();
+  sessionHeader.className = 'panel-header chat-session-panel__header';
+  const sessionActions = makeEl();
+  sessionActions.className = 'chat-session-panel__actions';
+  // 顺序：隐藏按钮在前，筛选按钮在后（同容器）
+  if (hasId('chat-session-toggle-btn')) sessionActions.appendChild(sessionHideBtn);
+  if (hasId('chat-session-filter-btn')) sessionActions.appendChild(sessionFilterBtn);
+  sessionHeader.appendChild(sessionActions);
+  if (hasId('chat-session-panel')) sessionPanel.appendChild(sessionHeader);
+  // 对话区 header（bindSideToggle 移动右侧按钮的目标之一）
+  const chatStack = makeEl();
+  chatStack.className = 'chat-stack';
+  const chatStackHeader = makeEl();
+  chatStackHeader.className = 'panel-header';
+  chatStack.appendChild(chatStackHeader);
+  // 右侧面板 header（展开时的按钮目标）
+  const sideHeader = makeEl();
+  sideHeader.className = 'panel-header';
+  chatSidePanel.appendChild(sideHeader);
+  // 真实 DOM 顺序：session panel, expand btn, chat stack, right panel
+  if (hasId('chat-shell')) {
+    if (hasId('chat-session-panel')) chatShell.appendChild(sessionPanel);
+    if (hasId('chat-session-expand-btn')) chatShell.appendChild(sessionExpandBtn);
+    chatShell.appendChild(chatStack);
+    chatShell.appendChild(chatSidePanel);
+  }
+  if (hasId('chat-session-panel')) byIdMap['chat-session-panel'] = sessionPanel;
+  if (hasId('chat-session-toggle-btn')) byIdMap['chat-session-toggle-btn'] = sessionHideBtn;
+  if (hasId('chat-session-expand-btn')) byIdMap['chat-session-expand-btn'] = sessionExpandBtn;
   const ui = {
-    byId: (id) => (byIdMap[id] !== undefined ? byIdMap[id] : makeEl()),
+    byId: (id) => {
+      if (missingIds.has(id)) return null;
+      return byIdMap[id] !== undefined ? byIdMap[id] : makeEl();
+    },
     el: () => makeEl(),
     clear: (node) => { if (node && node._kids) { for (const k of node._kids) if (k) k.parentNode = null; node._kids.length = 0; } },
     renderEmpty: () => {},
@@ -224,7 +302,9 @@ function freshStubs() {
       appendCalls.push({ id, content });
       return Promise.resolve({ id: 'msg_' + appendCalls.length, role: 'system', content });
     },
-    listSessions: () => Promise.resolve(sessionsList.slice()),
+    listSessions: () => Promise.resolve(sessionsList.map((session) => (
+      session.source ? session : Object.assign({}, session, { source: 'api' })
+    ))),
     getAdminModels: () => Promise.resolve({}),
     getSessionDetail: () => Promise.resolve({ messages: [] }),
     getSessionToolCalls: () => Promise.resolve([]),
@@ -233,14 +313,29 @@ function freshStubs() {
     listScheduledTasks: () => Promise.resolve(scheduledTasks.slice()),
   };
   const createdElements = [];
+  function findById(id) {
+    if (missingIds.has(id)) return null;
+    if (byIdMap[id] !== undefined) return byIdMap[id];
+    const visit = (node) => {
+      if (!node) return null;
+      if (node.id === id) return node;
+      for (const child of node._kids || []) {
+        const found = visit(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    return visit(document.body);
+  }
   const document = {
     _elements: createdElements,
     _listeners: {},
     activeElement: null,
     createElement: (tagName) => { const el = makeEl(); el.tagName = String(tagName || 'div').toUpperCase(); createdElements.push(el); return el; },
+    createElementNS: (_namespace, tagName) => { const el = makeEl(); el.tagName = String(tagName || 'div').toUpperCase(); createdElements.push(el); return el; },
     createTextNode: (t) => ({ _text: String(t) }),
     createDocumentFragment: () => { const frag = makeEl(); frag.tagName = '#document-fragment'; return frag; },
-    getElementById: (id) => (byIdMap[id] !== undefined ? byIdMap[id] : null),
+    getElementById: findById,
     querySelector: () => null,
     querySelectorAll: (sel) => {
       const cls = String(sel || '').replace(/^\./, '');
@@ -255,6 +350,9 @@ function freshStubs() {
       return out;
     },
     addEventListener: (type, fn) => { (document._listeners[type] = document._listeners[type] || []).push(fn); },
+    removeEventListener: (type, fn) => {
+      document._listeners[type] = (document._listeners[type] || []).filter((listener) => listener !== fn);
+    },
     hidden: false,
     visibilityState: 'visible',
     body: makeEl(),
@@ -319,6 +417,11 @@ function freshStubs() {
     location: { protocol: 'http:', host: 'x', href: '', pathname: '/chat' },
     crypto: { randomUUID: () => 'stub-uuid' },
     fetch: fetchStub,
+    localStorage: {
+      getItem: (key) => (localStorageData.has(key) ? localStorageData.get(key) : null),
+      setItem: (key, value) => { localStorageData.set(key, String(value)); },
+      removeItem: (key) => { localStorageData.delete(key); },
+    },
     WebSocket: function () {},
     TextDecoder: function () { this.decode = () => ''; },
     addEventListener: (type, fn) => { (win._listeners[type] = win._listeners[type] || []).push(fn); },
@@ -342,13 +445,17 @@ function freshStubs() {
       if (el) el.dispatchEvent({ type: 'keydown', key, preventDefault: () => { prevented = true; } });
       return { prevented };
     },
+    fireDocumentKeydown: (key) => {
+      (document._listeners.keydown || []).slice().forEach((fn) => fn({ type: 'keydown', key }));
+    },
+    clearLocalStorage: () => { localStorageData.clear(); },
   };
 }
 
 // Load chat.js into a fresh context. Calls init() so visibilitychange/beforeunload
 // listeners are bound; exposes timer/visibility/session-item helpers for auto-refresh tests.
-function loadChat() {
-  const env = freshStubs();
+function loadChat(options) {
+  const env = freshStubs(options);
   const ctx = {
     NAGENT: env.win.NAGENT,
     document: env.win.document,
@@ -2828,6 +2935,221 @@ async function testAutoRefreshPanels() {
   ok(grouped[1].id === 'a1' && grouped[1].name === 'ui.artifact', 'ui.artifact stays independent after task_result');
 })();
 
+// ===========================================================================
+// 会话来源筛选：默认隐藏 delegation，Modal 显式应用才改变列表；取消、遮罩和 ESC
+// 不提交草稿，localStorage 无效值回退为默认筛选。
+// ===========================================================================
+async function testSessionSourceFilter() {
+  let env = loadChat();
+  env.clearLocalStorage();
+  env = loadChat();
+  sessionsList = [
+    { id: 'normal', title: '普通会话', source: 'dashboard' },
+    { id: 'delegated', title: '委派会话', source: 'delegation' },
+  ];
+  env.chat.init();
+  await env.waitMicro();
+  const list = env.byIdMap['chat-session-list'];
+  ok(list._kids.length === 1 && list._kids[0].textContent.indexOf('普通会话') !== -1, 'session filter hides delegation by default');
+
+  const openModal = () => {
+    env.fireClick(env.byIdMap['chat-session-filter-btn']);
+    return env.document.getElementById('chat-session-source-filter-modal');
+  };
+  const checkbox = (backdrop, value) => {
+    const visit = (node) => {
+      if (!node) return null;
+      if (node.tagName === 'INPUT' && node.value === value) return node;
+      for (const child of node._kids || []) {
+        const found = visit(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    return visit(backdrop);
+  };
+  const formOf = (backdrop) => backdrop._kids[0]._kids[0];
+
+  let backdrop = openModal();
+  let delegation = checkbox(backdrop, 'delegation');
+  delegation.checked = true;
+  delegation.dispatchEvent({ type: 'change' });
+  formOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(list._kids.length === 2, 'applying delegation selection shows delegated session');
+
+  backdrop = openModal();
+  delegation = checkbox(backdrop, 'delegation');
+  delegation.checked = false;
+  delegation.dispatchEvent({ type: 'change' });
+  const cancel = formOf(backdrop)._kids[formOf(backdrop)._kids.length - 1]._kids[0];
+  cancel.click();
+  ok(list._kids.length === 2, 'cancel does not apply source-filter draft');
+
+  backdrop = openModal();
+  delegation = checkbox(backdrop, 'delegation');
+  delegation.checked = false;
+  delegation.dispatchEvent({ type: 'change' });
+  backdrop.dispatchEvent({ type: 'click', target: backdrop });
+  ok(list._kids.length === 2, 'backdrop close does not apply source-filter draft');
+
+  backdrop = openModal();
+  delegation = checkbox(backdrop, 'delegation');
+  delegation.checked = false;
+  delegation.dispatchEvent({ type: 'change' });
+  env.fireDocumentKeydown('Escape');
+  ok(!env.document.getElementById('chat-session-source-filter-modal') && list._kids.length === 2, 'ESC closes modal without applying source-filter draft');
+
+  backdrop = openModal();
+  delegation = checkbox(backdrop, 'delegation');
+  delegation.checked = false;
+  delegation.dispatchEvent({ type: 'change' });
+  formOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(list._kids.length === 1, 'unapplying delegation hides delegated session again');
+
+  env = loadChat();
+  sessionsList = [
+    { id: 'normal', title: '普通会话', source: 'dashboard' },
+    { id: 'delegated', title: '委派会话', source: 'delegation' },
+  ];
+  env.chat.init();
+  await env.waitMicro();
+  ok(env.byIdMap['chat-session-list']._kids.length === 1, 'stored source filter survives a new page instance');
+
+  env.clearLocalStorage();
+  const seed = loadChat();
+  seed.win.localStorage.setItem('nagent.chat.session-source-filter.v1', '{bad json');
+  env = loadChat();
+  sessionsList = [
+    { id: 'normal', title: '普通会话', source: 'dashboard' },
+    { id: 'delegated', title: '委派会话', source: 'delegation' },
+  ];
+  env.chat.init();
+  await env.waitMicro();
+  ok(env.byIdMap['chat-session-list']._kids.length === 1, 'invalid stored source filter falls back to default');
+}
+
+// ===========================================================================
+// T3: 左侧会话面板独立折叠（bindSessionsToggle）
+// 左右折叠互不干扰；aria/hidden 同步；焦点移动；无网络/定时器副作用；
+// 宿主 DOM 缺失时安全降级。
+// ===========================================================================
+async function testSessionsPanelCollapse() {
+  const hasSessions = (sh) => sh.classList.contains('chat-shell--sessions-collapsed');
+  const hasSide = (sh) => sh.classList.contains('chat-shell--side-collapsed');
+
+  // 1. 初始态：左展开（无 sessions-collapsed）、右折叠（side-collapsed）
+  let env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  const shell = env.byIdMap['chat-shell'];
+  const hideBtn = env.byIdMap['chat-session-toggle-btn'];
+  const expandBtn = env.byIdMap['chat-session-expand-btn'];
+  ok(hasSide(shell) && !hasSessions(shell), 'init: left expanded, right collapsed');
+  ok(hideBtn.getAttribute('aria-expanded') === 'true', 'init: hide btn aria-expanded=true');
+  ok(expandBtn.getAttribute('aria-expanded') === 'false' && expandBtn.hidden === true, 'init: expand btn aria-expanded=false + hidden');
+
+  // 2. 点击隐藏：仅新增 sessions-collapsed，保留 side-collapsed；焦点移到展开按钮
+  hideBtn.click();
+  ok(hasSessions(shell) && hasSide(shell), 'hide click: only adds sessions-collapsed, keeps side-collapsed');
+  ok(expandBtn.hidden === false, 'hide click: expand btn shown');
+  ok(hideBtn.getAttribute('aria-expanded') === 'false' && expandBtn.getAttribute('aria-expanded') === 'false', 'hide click: both aria-expanded=false');
+  ok(env.document.activeElement === expandBtn, 'hide click: focus moves to expand btn');
+  ok(sessionPanelStillChild(env), 'hide click: collapsed panel remains DOM child of shell');
+
+  // 3. 点击展开：仅移除 sessions-collapsed；焦点回到隐藏按钮
+  expandBtn.click();
+  ok(!hasSessions(shell) && hasSide(shell), 'expand click: only removes sessions-collapsed, side-collapsed kept');
+  ok(expandBtn.hidden === true, 'expand click: expand btn hidden');
+  ok(hideBtn.getAttribute('aria-expanded') === 'true' && expandBtn.getAttribute('aria-expanded') === 'true', 'expand click: both aria-expanded=true');
+  ok(env.document.activeElement === hideBtn, 'expand click: focus back to hide btn');
+
+  function sessionPanelStillChild(e) {
+    const sh = e.byIdMap['chat-shell'];
+    const panel = e.byIdMap['chat-session-panel'];
+    return panel && panel.parentNode === sh;
+  }
+
+  // 4. 正交性 + 四态列数表（镜像 CSS 网格规则；桩无 CSSOM，用数据表断言）
+  env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  const sh = env.byIdMap['chat-shell'];
+  const hb = env.byIdMap['chat-session-toggle-btn'];
+  const eb = env.byIdMap['chat-session-expand-btn'];
+  const sb = env.byIdMap['chat-side-toggle-btn'];
+  // 数据表镜像 styles.css 规则：
+  //   默认 .chat-shell = 3 列；+side-collapsed = 2 列；+sessions-collapsed = 2 列；双折叠 = 1 列
+  const columnTable = [
+    { sessions: false, side: false, cols: 3 }, // 双展开
+    { sessions: false, side: true, cols: 2 },  // 默认：左展开+右折叠
+    { sessions: true, side: false, cols: 2 },  // 左折叠+右展开
+    { sessions: true, side: true, cols: 1 },   // 双折叠
+  ];
+  const expectedCols = (sessions, side) => {
+    const row = columnTable.find((r) => r.sessions === sessions && r.side === side);
+    return row ? row.cols : -1;
+  };
+  function assertCombo(name) {
+    ok(expectedCols(hasSessions(sh), hasSide(sh)) === comboCols(name), name + ': column count matches CSS table (sessions=' + hasSessions(sh) + ', side=' + hasSide(sh) + ')');
+  }
+  let comboStep = 0;
+  const combos = ['left-expanded+right-collapsed', 'right-expanded', 'left-collapsed+right-expanded', 'both-collapsed'];
+  const comboCols = (name) => ({ 'left-expanded+right-collapsed': 2, 'right-expanded': 3, 'left-collapsed+right-expanded': 2, 'both-collapsed': 1 })[name];
+
+  // 默认：左展开+右折叠（2 列）
+  assertCombo(combos[comboStep++]);
+  // 右侧展开（3 列）；随后左侧隐藏不影响右侧展开
+  sb.click();
+  ok(!hasSide(sh), 'right toggle expands right panel');
+  assertCombo(combos[comboStep++]);
+  hb.click();
+  ok(hasSessions(sh) && !hasSide(sh), 'left hide keeps right expanded');
+  assertCombo(combos[comboStep++]);
+  ok(sessionPanelStillChild(env), 'collapsed left panel remains DOM child');
+  ok(eb.hidden === false, 'expand btn visible when left collapsed');
+  // 右侧折叠不影响左侧已折叠状态；随后左侧展开不影响右侧折叠
+  sb.click();
+  ok(hasSessions(sh) && hasSide(sh), 'right collapse keeps left collapsed');
+  assertCombo(combos[comboStep++]);
+  eb.click();
+  ok(!hasSessions(sh) && hasSide(sh), 'left expand keeps right collapsed');
+  const sidePanel = env.byIdMap['chat-side-panel'];
+  ok(sidePanel.parentNode === sh, 'collapsed right panel remains DOM child of shell');
+
+  // 5. 宿主 DOM 缺失安全降级（每个场景独立 VM）
+  for (const missing of ['chat-shell', 'chat-session-toggle-btn', 'chat-session-expand-btn']) {
+    const e2 = loadChat({ missingIds: [missing] });
+    let threw = null;
+    try {
+      e2.chat.init();
+    } catch (err) {
+      threw = err;
+    }
+    ok(!threw, 'init safe when ' + missing + ' missing' + (threw ? ' (threw: ' + threw.message + ')' : ''));
+    await e2.waitMicro();
+    if (missing !== 'chat-shell') {
+      const sb2 = e2.byIdMap['chat-side-toggle-btn'];
+      ok(sb2 && sb2.getAttribute('aria-expanded') === 'false', 'side toggle initial ARIA still synced when ' + missing + ' missing');
+    } else {
+      // chat-shell 缺失：静态初始属性不受影响（无 JS 同步）
+      ok(e2.byIdMap['chat-session-toggle-btn'].getAttribute('aria-expanded') === 'true', 'static initial aria kept on hide btn when chat-shell missing');
+    }
+  }
+
+  // 6. 副作用快照：两次点击不引入 fetch / 定时器
+  env = loadChat();
+  env.chat.init();
+  await env.waitMicro();
+  const beforeFetch = fetchCalls.length;
+  const beforeTimers = env.timerCount();
+  env.byIdMap['chat-session-toggle-btn'].click();
+  env.byIdMap['chat-session-expand-btn'].click();
+  ok(fetchCalls.length === beforeFetch, 'sessions toggle adds no fetch calls');
+  ok(env.timerCount() === beforeTimers, 'sessions toggle adds no timers');
+}
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
@@ -2835,7 +3157,9 @@ runIntegration().then(async () => {
   await testToolApprovalCard();
   await testSessionViewLinks();
   await testSidePanelAndArtifacts();
+  await testSessionsPanelCollapse();
   await testAutoRefreshPanels();
+  await testSessionSourceFilter();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

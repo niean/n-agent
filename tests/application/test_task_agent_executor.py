@@ -430,6 +430,52 @@ async def test_executor_default_grants_execute_code(executor, fake_chat):
 
 
 @pytest.mark.asyncio
+async def test_executor_default_task_grants_delegate_agents_when_task_delegation_enabled(
+    fake_chat, fake_registry,
+):
+    """The Task feature switch must grant the tool to normal Task creation.
+
+    Dashboard, HTTP, and CLI Task creation all produce the default empty
+    ``allowed_tools`` policy, so the Task-level delegation feature flag is
+    the server-side policy snapshot that authorizes this default grant.
+    """
+    from app.application.delegation_parent_adapter import TaskDelegationAdapter
+    from app.application.delegation_policy_config import DelegationPolicyConfig
+
+    task_executor = TaskAgentExecutor(
+        chat_service=fake_chat,
+        task_registry=fake_registry,
+        task_delegation_adapter=TaskDelegationAdapter(),
+        delegation_config=DelegationPolicyConfig(enabled=True, task_enabled=True),
+    )
+    await task_executor.run(_task(), task_run_id=1, claim_lock="L1")
+
+    call = fake_chat.complete_calls[0]
+    assert "delegate_agents" in call.trusted_metadata["granted_tools"]
+    assert "delegation_capability" in call.trusted_metadata
+
+
+@pytest.mark.asyncio
+async def test_executor_default_task_strips_delegate_agents_when_task_delegation_disabled(
+    fake_chat, fake_registry,
+):
+    from app.application.delegation_parent_adapter import TaskDelegationAdapter
+    from app.application.delegation_policy_config import DelegationPolicyConfig
+
+    task_executor = TaskAgentExecutor(
+        chat_service=fake_chat,
+        task_registry=fake_registry,
+        task_delegation_adapter=TaskDelegationAdapter(),
+        delegation_config=DelegationPolicyConfig(enabled=True, task_enabled=False),
+    )
+    await task_executor.run(_task(), task_run_id=1, claim_lock="L1")
+
+    call = fake_chat.complete_calls[0]
+    assert "delegate_agents" not in call.trusted_metadata["granted_tools"]
+    assert "delegation_capability" not in call.trusted_metadata
+
+
+@pytest.mark.asyncio
 async def test_executor_default_grant_layers_with_explicit_allowed_tools(executor, fake_chat):
     """显式 allowed_tools 叠加在默认 execute_code 之上，不互相覆盖。"""
     from app.domain.task import TaskExecutionPolicy

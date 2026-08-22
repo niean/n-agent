@@ -19,10 +19,12 @@ any error. Budget ledger reserve/settle is handled by
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Protocol
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult
 from app.domain.delegation import DelegationMember, DelegationResult, DelegationMemberStatus
+from app.domain.information_flow import SecretCatalog, redact_structured
 from app.domain.policy import ExecutionMode
 
 # Tools that must never be granted to a child agent, regardless of the
@@ -76,8 +78,11 @@ class ChildAgentExecutor:
             messages=messages,
             stream=False,
             session_id=session_id,
+            session_title=member.title,
             persist_messages=False,
-            ingress_facts=self._build_ingress_facts(parent_capability),
+            ingress_facts=self._build_ingress_facts(
+                parent_capability, execution_session_id=session_id
+            ),
             trusted_metadata={
                 "granted_tools": list(granted_tools),
                 "delegation": {
@@ -139,24 +144,39 @@ class ChildAgentExecutor:
         ]
 
     @staticmethod
-    def _build_ingress_facts(parent_capability: Mapping[str, Any]):
+    def _build_ingress_facts(
+        parent_capability: Mapping[str, Any], *, execution_session_id: str
+    ):
         from app.application.policy_snapshot import IngressFacts
         return IngressFacts(
             run_id=parent_capability.get("run_id", ""),
-            session_id=parent_capability.get("session_id", ""),
+            # Policy snapshot admission binds IngressFacts to the request's
+            # isolated child session. The parent session remains available
+            # only as a trusted claim; using it here rejects every child with
+            # policy_context_invalid before the LLM is called.
+            session_id=execution_session_id,
             source="delegation",
             actor_id=parent_capability.get("actor_id"),
             execution_mode=ExecutionMode.UNATTENDED,
             trusted_claims={
                 "parent_source": parent_capability.get("source", ""),
                 "parent_scope_id": parent_capability.get("scope_id", ""),
+                "parent_session_id": parent_capability.get("session_id", ""),
             },
         )
 
     def _parse_result(self, chat_result: ChatCompletionResult, started_at: str) -> DelegationResult:
+        if chat_result.finish_reason == "error":
+            return DelegationResult(
+                status=DelegationMemberStatus.FAILED,
+                error_code="delegation_child_execution_error",
+                error_message="child agent execution failed",
+                started_at=started_at,
+                ended_at=self._clock.now_iso(),
+            )
         message = chat_result.message or {}
         content = message.get("content", "")
-        summary = str(content) if content else ""
+        summary = self._redact_json_credential_fields(str(content) if content else "")
         usage = chat_result.usage or {}
         usage_summary: dict[str, int] = {}
         for key in ("total_tokens", "prompt_tokens", "completion_tokens"):
@@ -173,4 +193,19 @@ class ChildAgentExecutor:
             usage_summary=usage_summary,
             started_at=started_at,
             ended_at=self._clock.now_iso(),
+        )
+
+    @staticmethod
+    def _redact_json_credential_fields(summary: str) -> str:
+        """Remove credential values from JSON child output before storage."""
+        try:
+            data = json.loads(summary)
+        except (TypeError, ValueError):
+            return summary
+        if not isinstance(data, (dict, list)):
+            return summary
+        return json.dumps(
+            redact_structured(data, SecretCatalog()),
+            ensure_ascii=False,
+            separators=(",", ":"),
         )

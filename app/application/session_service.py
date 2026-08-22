@@ -47,6 +47,7 @@ class SessionService:
         self,
         memory_store: MemoryStore,
         title_generator: TitleGenerator | None = None,
+        on_session_deleting_handlers: list[SessionDeletedHandler] | None = None,
         on_session_deleted: SessionDeletedHandler | None = None,
         on_session_deleted_handlers: list[SessionDeletedHandler] | None = None,
         external_memory_manager: "ExternalMemoryManager | None" = None,
@@ -56,6 +57,14 @@ class SessionService:
         self.title_generator = title_generator
         self.external_memory_manager = external_memory_manager
         self._hook_dispatcher = hook_dispatcher
+        # Pre-delete handlers are reserved for cleanup that needs the session's
+        # foreign-key relationships to still be present (for example tasks
+        # created from this conversation). Unlike post-delete notifications,
+        # these handlers are part of the deletion operation: a failure leaves
+        # the session intact rather than orphaning related data.
+        self._on_session_deleting_handlers: list[SessionDeletedHandler] = list(
+            on_session_deleting_handlers or []
+        )
         self._on_session_deleted_handlers: list[SessionDeletedHandler] = list(
             on_session_deleted_handlers or []
         )
@@ -81,6 +90,10 @@ class SessionService:
 
     def add_session_deleted_handler(self, handler: SessionDeletedHandler) -> None:
         self._on_session_deleted_handlers.append(handler)
+
+    def add_session_deleting_handler(self, handler: SessionDeletedHandler) -> None:
+        """Register a required cleanup handler run before session deletion."""
+        self._on_session_deleting_handlers.append(handler)
 
     async def create_session(self, session_id: str, source: str = SessionSource.DASHBOARD.value) -> ConversationSession:
         existing = await self.memory_store.get_session(session_id)
@@ -147,6 +160,7 @@ class SessionService:
             raise SessionNotFoundError(session_id)
         # T10: save existing.source before delete for on_session_end dispatch.
         existing_source = existing.source
+        await self._invoke_session_deleting_handlers(session_id)
         if self.external_memory_manager is not None:
             try:
                 self.external_memory_manager.on_session_end(session_id)
@@ -174,6 +188,15 @@ class SessionService:
                     exc_info=True,
                 )
         await self._invoke_session_deleted_handlers(session_id)
+
+    async def _invoke_session_deleting_handlers(self, session_id: str) -> None:
+        # Pre-delete cleanup must succeed. The caller can then retry after the
+        # failed dependency is resolved, with the session and its relations
+        # still available for a complete cascade.
+        for handler in list(self._on_session_deleting_handlers):
+            result = handler(session_id)
+            if inspect.isawaitable(result):
+                await result
 
     async def _invoke_session_deleted_handlers(self, session_id: str) -> None:
         # Handlers may be sync or async; invoke in registration order.

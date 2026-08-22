@@ -160,6 +160,19 @@ async def test_tick_claims_pending_members_and_spawns(run_service, registry):
 
 
 @pytest.mark.asyncio
+async def test_tick_uses_active_model_placeholder_for_children(run_service, registry):
+    """Children must resolve through the active provider model.
+
+    The literal model id ``default`` is not a supported placeholder and is
+    sent unchanged to providers; ``N-Agent`` resolves to the active model.
+    """
+    await registry.create_or_reconnect(_make_request())
+    await run_service.tick()
+    assert run_service._test_chat.calls
+    assert all(call.model == "N-Agent" for call in run_service._test_chat.calls)
+
+
+@pytest.mark.asyncio
 async def test_tick_round_robin_no_starvation(registry):
     """Two delegations each with pending members -- tick processes both."""
     clock = FakeClock()

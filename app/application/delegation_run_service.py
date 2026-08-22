@@ -156,7 +156,10 @@ class DelegationRunService:
                  "scope_id": "", "actor_id": None},
             )
             return await self._child_executor.execute(
-                member=member, model="default",
+                # N-Agent is the provider-neutral placeholder resolved to the
+                # active configured model. The literal "default" is treated
+                # as a real model id by providers and can be rejected.
+                member=member, model="N-Agent",
                 parent_capability=parent_cap, deadline_at=deadline_at,
             )
         except asyncio.CancelledError:

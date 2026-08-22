@@ -13,43 +13,11 @@ if [ -z "$codex_bin" ]; then
     exit 127
 fi
 
+# 期限由框架 runner 的 watchdog 统一执行（HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS，
+# 默认 900 秒），provider 不自建超时，避免双重看门狗和两处阈值。exec 后
+# runner 的 TERM/KILL 直接作用于 codex 进程本身。
 set -- exec --cd "$repo_root" --sandbox workspace-write
 if [ -n "${HARNESS_THIRD_REVIEW_MODEL:-}" ]; then
     set -- "$@" --model "$HARNESS_THIRD_REVIEW_MODEL"
 fi
-set -- "$@" -
-
-deadline=${HARNESS_THIRD_REVIEW_CODEX_TIMEOUT_SECONDS:-}
-if [ -z "$deadline" ]; then
-    exec "$codex_bin" "$@"
-fi
-case $deadline in
-    *[!0-9]*|'') printf '%s\n' 'codex provider: invalid timeout' >&2; exit 64 ;;
-esac
-if [ "$deadline" -lt 1 ] || [ "$deadline" -gt 900 ]; then
-    printf '%s\n' 'codex provider: timeout must be between 1 and 900 seconds' >&2
-    exit 64
-fi
-
-"$codex_bin" "$@" &
-child_pid=$!
-(
-    sleep "$deadline"
-    kill -TERM "$child_pid" 2>/dev/null || exit 0
-    sleep 2
-    kill -KILL "$child_pid" 2>/dev/null || true
-) &
-watchdog_pid=$!
-
-forward_signal() {
-    kill -TERM "$child_pid" 2>/dev/null || true
-}
-trap forward_signal HUP INT TERM
-
-set +e
-wait "$child_pid"
-child_status=$?
-set -e
-kill "$watchdog_pid" 2>/dev/null || true
-wait "$watchdog_pid" 2>/dev/null || true
-exit "$child_status"
+exec "$codex_bin" "$@" -

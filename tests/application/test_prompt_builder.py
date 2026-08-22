@@ -8,6 +8,7 @@ from app.application.prompt_builder import (
     ARTIFACT_GUIDANCE,
     BROWSER_GUIDANCE,
     MANAGED_TOOL_GUIDANCE,
+    PARALLEL_DELEGATION_GUIDANCE,
     SKILL_GUIDANCE,
     TASK_GUIDANCE,
     build_system_prompt,
@@ -54,6 +55,16 @@ def test_build_system_prompt_includes_task_delegation_guidance():
     assert TASK_DELEGATION_GUIDANCE in prompt
     assert "create_task" in prompt
     assert "list_tasks" in prompt
+
+
+def test_build_system_prompt_includes_parallel_delegation_guidance():
+    """Realtime parallel-work requests must use the provided tool rather
+    than incorrectly claiming that child-agent delegation is unavailable."""
+    prompt = build_system_prompt()
+    assert PARALLEL_DELEGATION_GUIDANCE in prompt
+    assert "delegate_agents" in PARALLEL_DELEGATION_GUIDANCE
+    assert "MUST use it" in PARALLEL_DELEGATION_GUIDANCE
+    assert "priority over create_task" in PARALLEL_DELEGATION_GUIDANCE
 
 
 def test_build_system_prompt_includes_task_worker_guidance_fixed():
@@ -104,6 +115,7 @@ def test_build_system_prompt_uses_unified_section_format():
         "## Knowledge Base",
         "## Skills",
         "## Managed Resources",
+        "## Parallel Delegation",
         "## Task Delegation",
         "## Task Guidance",
         "## Safety",

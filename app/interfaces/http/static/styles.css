@@ -165,16 +165,18 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .muted { color: var(--color-fg-subtle); }
 
 /* Chat tab */
-.chat-shell { display: grid; grid-template-columns: 280px minmax(360px, 2fr) minmax(280px, 0.9fr); gap: 16px; align-items: stretch; }
-.chat-shell.chat-shell--side-collapsed { grid-template-columns: 280px minmax(360px, 1fr) 0; }
+.chat-shell { position: relative; display: grid; grid-template-columns: 280px minmax(0, 2fr) 280px; gap: 16px; padding-right: 16px; align-items: stretch; }
+.chat-shell.chat-shell--side-collapsed { grid-template-columns: 280px minmax(0, 1fr); }
 .chat-shell.chat-shell--side-collapsed #chat-side-panel { display: none; }
-.chat-shell:not(.chat-shell--side-collapsed) { padding-right: 16px; }
+.chat-shell.chat-shell--sessions-collapsed { grid-template-columns: minmax(0, 1fr) 280px; }
+.chat-shell.chat-shell--sessions-collapsed #chat-session-panel { display: none; }
+.chat-shell.chat-shell--sessions-collapsed.chat-shell--side-collapsed { grid-template-columns: minmax(0, 1fr); }
 /* 对话页右侧贴边；内容高度限制在主内容可视区域，页面本身不产生纵向滚动。
    消息、会话和右侧信息继续由各自的内部滚动容器承载溢出内容。 */
 #tab-chat.active { height: calc(100vh - 90px); margin-right: -20px; overflow-y: hidden; }
 /* 三区底色：会话区为 --color-bg-subtle（中间色，最深），对话框与消息区统一为 --color-bg-white（白底），
    整个对话框（消息区 + 输入区）无独立底色以保证可读性。右侧边栏状态面板维持原状（默认白底）。 */
-.chat-stack { display: flex; flex-direction: column; height: calc(100vh - 80px); background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); border-radius: var(--radius-md); box-shadow: var(--shadow-card); overflow: hidden; }
+.chat-stack { display: flex; flex-direction: column; min-width: 0; height: calc(100vh - 80px); background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); border-radius: var(--radius-md); box-shadow: var(--shadow-card); overflow: hidden; }
 .chat-stack__messages { flex: 1; overflow-y: auto; padding: 10px 16px; background: var(--color-bg-white); }
 .chat-stack__composer { margin-bottom: 10px; padding: 10px 16px; border-top: 1px solid var(--color-border-light); background: var(--color-bg-white); }
 .chat-stack__hint { margin-top: 6px; color: var(--color-fg-subtle); font-size: 11px; text-align: center; }
@@ -318,6 +320,11 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 /* 会话 panel：与对话框同高（calc(100vh - 80px)），内部 list flex 填充。
    三区底色从左到右逐渐变浅：会话区最深、对话框为白、右侧边栏维持原状最浅。 */
 .chat-session-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: calc(100vh - 80px); background: var(--color-bg-subtle); }
+.chat-session-panel__header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.chat-session-panel__actions { display: inline-flex; align-items: center; gap: 4px; }
+.chat-session-filter-btn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--color-fg-muted); cursor: pointer; }
+.chat-session-filter-btn:hover { background: var(--color-bg-hover); color: var(--color-fg-default); }
+.chat-session-filter-btn__icon { width: 18px; height: 18px; }
 .chat-session-panel .panel-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; padding: 10px 0; }
 .session-list { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-height: 0; padding: 10px 6px; overflow-y: auto; }
 .session-item { display: flex; align-items: center; gap: 8px; padding: 10px 12px; color: var(--color-fg-muted); background: transparent; border: 0; border-radius: 8px; text-align: left; }
@@ -329,6 +336,12 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .session-item__action { padding: 2px 4px; background: transparent; border: 0; color: inherit; cursor: pointer; font-size: 13px; }
 .session-item__action:hover { color: var(--color-primary-strong); }
 .session-item__input { flex: 1; padding: 4px 6px; background: var(--color-bg-default); border: 1px solid var(--color-border-default); border-radius: 6px; color: var(--color-fg-default); font: inherit; }
+.session-source-filter { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; padding: 8px 0 4px; }
+.session-source-filter__option,
+.providers-form .session-source-filter__option { display: inline-flex; flex-direction: row; align-items: center; min-width: 0; gap: 6px; color: var(--color-fg-default); font-size: 13px; cursor: pointer; white-space: nowrap; }
+.session-source-filter__option input[type="checkbox"],
+.providers-form .session-source-filter__option input[type="checkbox"] { flex: 0 0 auto; width: auto; height: auto; margin: 0; padding: 0; }
+.session-source-filter__option span { min-width: 0; }
 .debug-section { margin-bottom: 14px; }
 .debug-section h4 { margin-bottom: 6px; color: var(--color-fg-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
 .status-panel--collapsible > .panel-header { width: 100%; cursor: pointer; background: transparent; border: 0; color: inherit; font: inherit; text-align: left; }
@@ -338,10 +351,24 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .status-panel.collapsed .panel-header__chevron { transform: rotate(180deg); }
 /* 展开/收起按钮：位于对话区 header 右上角，分栏切换图标 */
 .chat-side-toggle-btn { display: inline-flex; align-items: center; justify-content: center; margin-left: auto; width: 30px; height: 30px; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--color-fg-muted); cursor: pointer; transition: background 0.15s ease, color 0.15s ease; }
-.chat-side-toggle-btn:hover { background: var(--color-bg-hover); color: var(--color-fg-default); }
+.chat-side-toggle-btn:hover, .chat-session-toggle-btn:hover { background: var(--color-bg-hover); color: var(--color-fg-default); }
+.chat-side-toggle-btn:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+.chat-session-toggle-btn:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+#chat-session-expand-btn:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
 .chat-side-toggle-btn svg { width: 18px; height: 18px; }
 .chat-side-toggle-btn .side-toggle__panel { fill: none; transition: fill 0.15s ease; }
 .chat-side-toggle-btn[aria-expanded="true"] .side-toggle__panel { fill: currentColor; fill-opacity: 0.18; }
+.chat-session-toggle-btn, #chat-session-expand-btn { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 30px; height: 30px; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--color-fg-muted); cursor: pointer; transition: background 0.15s ease, color 0.15s ease; }
+#chat-session-expand-btn { position: absolute; left: 4px; top: 10px; z-index: 5; }
+#chat-session-expand-btn[hidden] { display: none; }
+.chat-shell.chat-shell--sessions-collapsed .chat-stack > .panel-header { padding-left: 42px; }
+.chat-session-toggle-btn__icon, .chat-session-expand-btn__icon { width: 18px; height: 18px; }
+.chat-session-toggle-btn .session-toggle__panel { fill: none; transition: fill 0.15s ease; }
+.chat-session-toggle-btn[aria-expanded="false"] .session-toggle__panel { fill: currentColor; fill-opacity: 0.18; }
+@media (prefers-reduced-motion: reduce) {
+  .chat-side-toggle-btn, .chat-session-toggle-btn, #chat-session-expand-btn { transition: none; }
+  .side-toggle__panel, .session-toggle__panel { transition: none; }
+}
 .status-badge { display: inline-block; padding: 3px 8px; border-radius: var(--radius-pill); font-size: 11px; }
 .status-badge.running { color: #0369a1; background: #e0f2fe; }
 .status-badge.completed { color: var(--color-success-fg); background: var(--color-success-bg); }
@@ -349,8 +376,12 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .tool-call { padding: 6px 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; border-bottom: 1px solid var(--color-border-light); }
 
 @media (max-width: 1100px) {
-  .chat-shell, .chat-shell.chat-shell--side-collapsed { grid-template-columns: 1fr; }
+  .chat-shell,
+  .chat-shell.chat-shell--side-collapsed,
+  .chat-shell.chat-shell--sessions-collapsed,
+  .chat-shell.chat-shell--sessions-collapsed.chat-shell--side-collapsed { grid-template-columns: 1fr; }
   .chat-side-panel { width: 100%; max-height: none; height: auto; }
+  #chat-session-expand-btn { top: 6px; }
   #tab-chat.active { margin-right: 0; }
 }
 

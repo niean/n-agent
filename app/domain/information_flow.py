@@ -43,6 +43,7 @@ class ReleaseTarget(str, Enum):
 # structured (dict) data.  These are lowercase; matching is case-insensitive.
 DEFAULT_CREDENTIAL_FIELD_NAMES: frozenset[str] = frozenset({
     "api_key",
+    "credential",
     "password",
     "secret",
     "token",

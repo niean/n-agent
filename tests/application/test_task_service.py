@@ -852,6 +852,52 @@ async def test_delete_task_artifact_delete_callback_failure_does_not_block(regis
     assert await registry.get_task(task.id) is None
 
 
+@pytest.mark.asyncio
+async def test_delete_tasks_by_session_cascades_each_task_and_artifacts(registry, tmp_path):
+    artifact_calls: list[str] = []
+
+    async def delete_callback(task_id: str) -> None:
+        artifact_calls.append(task_id)
+
+    service = TaskService(
+        registry=registry,
+        policy=TaskPolicy(),
+        memory_store=FakeMemoryStore(),
+        attachments_root=tmp_path / "attachments",
+        artifact_delete_callback=delete_callback,
+    )
+    associated = await service.create_task(
+        title="associated", created_by="u", origin_session_id="session-1",
+    )
+    execution_associated = await service.create_task(
+        title="execution", created_by="u",
+    )
+    await registry.update_task(
+        execution_associated.id,
+        {"execution_session_id": "session-1"}, expected_version=1,
+    )
+    unrelated = await service.create_task(
+        title="unrelated", created_by="u", origin_session_id="session-2",
+    )
+    archived = await service.create_task(
+        title="archived", created_by="u", origin_session_id="session-1",
+    )
+    await registry.update_task(
+        archived.id, {"is_archived": True}, expected_version=1,
+    )
+
+    deleted = await service.delete_tasks_by_session("session-1")
+
+    assert deleted == 3
+    assert await registry.get_task(associated.id) is None
+    assert await registry.get_task(execution_associated.id) is None
+    assert await registry.get_task(archived.id) is None
+    assert await registry.get_task(unrelated.id) is not None
+    assert set(artifact_calls) == {
+        associated.id, execution_associated.id, archived.id,
+    }
+
+
 # ---------------------------------------------------------------------------
 # propose_change / approve / reject
 # ---------------------------------------------------------------------------

@@ -189,6 +189,8 @@ class DelegateAgentsToolExecutor(ToolExecutor):
                 "error": exc.code,
                 "retriable": exc.code not in _NON_RETRIABLE_CODES,
             }
+            if exc.message:
+                payload["message"] = exc.message
             status = ToolResultStatus.ERROR
         return ToolResult(
             tool_call_id=request.id,
@@ -213,18 +215,34 @@ class DelegateAgentsToolExecutor(ToolExecutor):
             request.arguments.get("aggregator"),
             request.arguments.get("aggregation"),
         )
+        join_policy = request.arguments.get("join_policy", "all_completed")
+        aggregation = request.arguments.get("aggregation", "parent")
+        timeout_seconds = self._coerce_timeout(
+            request.arguments.get("timeout_seconds")
+        )
+        raw_key = request.arguments.get("delegation_key")
+        if not isinstance(raw_key, str) or not raw_key.strip():
+            # OpenAI-compatible providers do not enforce the tool schema's
+            # required fields; a missing key must not fall through as a
+            # guaranteed-invalid empty sentinel. Derive a deterministic key
+            # from the normalized request so identical logical requests keep
+            # the reconnect/idempotency semantics.
+            raw_key = self._derive_delegation_key(
+                children, join_policy, aggregation, timeout_seconds,
+                aggregator_instruction,
+            )
         try:
             result_set = await self._service.delegate(
                 parent_capability=capability,
-                delegation_key=request.arguments.get("delegation_key", ""),
+                delegation_key=raw_key,
                 children=children,
-                join_policy=request.arguments.get("join_policy", "all_completed"),
-                aggregation=request.arguments.get("aggregation", "parent"),
-                timeout_seconds=int(request.arguments.get("timeout_seconds", 0)),
+                join_policy=join_policy,
+                aggregation=aggregation,
+                timeout_seconds=timeout_seconds,
                 aggregator_instruction=aggregator_instruction,
             )
         except DelegationError as exc:
-            raise _ToolDelegationError(exc.code) from exc
+            raise _ToolDelegationError(exc.code, exc.message) from exc
         return self._project_result(result_set)
 
     # ------------------------------------------------------------------
@@ -255,6 +273,63 @@ class DelegateAgentsToolExecutor(ToolExecutor):
     # ------------------------------------------------------------------
     # argument parsing
     # ------------------------------------------------------------------
+
+    #: Fallback timeout when the model omits timeout_seconds. Mirrors the
+    #: delegate_agents tool definition's own timeout_seconds.
+    _DEFAULT_TIMEOUT_SECONDS: int = 300
+
+    @staticmethod
+    def _coerce_timeout(raw: Any) -> int:
+        """Coerce the model-supplied timeout into a positive int.
+
+        Missing, blank, or non-numeric values fall back to the default --
+        never the guaranteed-invalid 0 sentinel (DelegationPolicy requires a
+        positive timeout).
+        """
+        if isinstance(raw, bool) or raw is None:
+            return DelegateAgentsToolExecutor._DEFAULT_TIMEOUT_SECONDS
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return DelegateAgentsToolExecutor._DEFAULT_TIMEOUT_SECONDS
+        if value <= 0:
+            return DelegateAgentsToolExecutor._DEFAULT_TIMEOUT_SECONDS
+        return value
+
+    @staticmethod
+    def _derive_delegation_key(
+        children: list[DelegationChildSpec],
+        join_policy: Any,
+        aggregation: Any,
+        timeout_seconds: int,
+        aggregator_instruction: str | None,
+    ) -> str:
+        """Derive a deterministic delegation_key from the request itself.
+
+        Same logical request (children/policy/timeout/aggregator) -> same
+        key, so fingerprint-based reconnect still works when the model
+        omits the explicit key.
+        """
+        import hashlib
+        import json
+
+        payload = {
+            "c": [
+                {
+                    "t": c.title,
+                    "i": c.instruction,
+                    "s": sorted(c.skills),
+                    "a": sorted(c.allowed_tools),
+                }
+                for c in children
+            ],
+            "j": str(join_policy),
+            "g": str(aggregation),
+            "t": timeout_seconds,
+            "ai": aggregator_instruction,
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return "auto-" + hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _parse_children(raw: Any) -> list[DelegationChildSpec]:
@@ -328,8 +403,9 @@ class DelegateAgentsToolExecutor(ToolExecutor):
 
 
 class _ToolDelegationError(Exception):
-    """Internal error carrying a stable delegation error code."""
+    """Internal error carrying a stable delegation error code + message."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, message: str = "") -> None:
         self.code = code
-        super().__init__(code)
+        self.message = message
+        super().__init__(message or code)

@@ -172,6 +172,37 @@ async def test_delete_session_notifies_after_delete(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_delete_session_runs_required_pre_delete_cleanup(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+    observed: list[bool] = []
+
+    async def cleanup(session_id: str) -> None:
+        observed.append(await store.get_session(session_id) is not None)
+
+    service = SessionService(store, on_session_deleting_handlers=[cleanup])
+    await service.delete_session("s1")
+
+    assert observed == [True]
+    assert await store.get_session("s1") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_session_keeps_session_when_required_cleanup_fails(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s1"))
+
+    async def cleanup(session_id: str) -> None:
+        raise RuntimeError("task cleanup failed")
+
+    service = SessionService(store, on_session_deleting_handlers=[cleanup])
+    with pytest.raises(RuntimeError, match="task cleanup failed"):
+        await service.delete_session("s1")
+
+    assert await store.get_session("s1") is not None
+
+
+@pytest.mark.asyncio
 async def test_delete_session_raises_when_missing(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     service = SessionService(store)
@@ -278,4 +309,3 @@ async def test_create_session_without_manager_does_not_error(tmp_path):
     assert session.id == "s1"
     persisted = await store.get_session("s1")
     assert persisted is not None
-

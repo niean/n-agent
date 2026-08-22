@@ -79,7 +79,7 @@ GOAL_MAX_CONSECUTIVE_REJECTIONS = 2
 # 对齐 TASK_GUIDANCE“用通用工具在 workspace 做事”，镜像 Hermes cron-default-core-tools。
 # write_file 仍为沙箱内部回调（不提升为直接 LLM 工具）。sandbox 未启用时 execute_code
 # 定义未注册，此 grant 为 no-op。judge 上下文（下方 run_judge）保持无工具，不受影响。
-TASK_WORKER_DEFAULT_TOOLS: tuple[str, ...] = ("execute_code",)
+TASK_WORKER_DEFAULT_TOOLS: tuple[str, ...] = ("execute_code", "delegate_agents")
 
 
 # ---------------------------------------------------------------------------
@@ -208,16 +208,17 @@ class TaskAgentExecutor:
         ]
         permitted_managed = set(TASK_TOOL_NAMES)
 
-        # Delegation grant (T12): delegate_agents is added to the worker's
-        # explicit tool set only when all three gates allow it -- the global
-        # delegation switch, the task policy (delegate_agents in the task's
-        # allowed_tools), and the runtime grant. Children/aggregators always
-        # have it stripped (enforced in ChildAgentExecutor).
+        # Delegation grant (T12): delegate_agents is in the server-owned
+        # default grant for ordinary Task creation, then remains visible only
+        # when both feature gates allow it. Task creation surfaces do not
+        # accept arbitrary allowed_tools, so using the empty per-Task policy
+        # as the Task-level gate made the enabled feature unreachable.
+        # Children/aggregators always have it stripped (ChildAgentExecutor).
         if self._task_delegation_adapter is not None:
             delegate_allowed = TaskDelegationAdapter.should_grant(
                 global_enabled=getattr(self._delegation_config, "enabled", False),
-                task_policy_allows=(
-                    "delegate_agents" in task.execution_policy.allowed_tools
+                task_policy_allows=getattr(
+                    self._delegation_config, "task_enabled", False
                 ),
                 delegate_in_grants=("delegate_agents" in granted_tools),
             )

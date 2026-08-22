@@ -21,7 +21,7 @@ Accept optional non-empty `provider` and `model`. Reject NUL or newline in model
 ## Execute
 
 1. Validate all inputs and evidence before invoking a shell. For a retry, validate again and establish a new invocation identity; all earlier results and skip confirmations become stale.
-2. From the Git repository root, apply explicit non-empty provider/model values only to this invocation through `HARNESS_THIRD_REVIEW_PROVIDER` and `HARNESS_THIRD_REVIEW_MODEL`.
+2. From the Git repository root, apply explicit non-empty provider/model values only to this invocation through `HARNESS_THIRD_REVIEW_PROVIDER` and `HARNESS_THIRD_REVIEW_MODEL`. The review deadline is a runner-owned framework setting: `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS` (integer seconds, 1-86400, default 900), validated and enforced by the runner watchdog as the single deadline; provider adapters must not implement their own timeouts.
 3. Invoke:
 
    ```sh

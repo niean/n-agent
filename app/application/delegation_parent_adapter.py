@@ -118,6 +118,12 @@ class RealtimeDelegationAdapter:
         parent_allowed_tools: frozenset[str] = frozenset(),
         system_child_allowlist: frozenset[str] = frozenset(),
     ) -> DelegationCapability:
+        # Same forbidden-tool strip as sign_task_capability: granted_tools
+        # is a tool-exposure list, never a child-grantable list.
+        from app.domain.delegation_policy import FORBIDDEN_CHILD_TOOLS
+
+        safe_parent = frozenset(parent_allowed_tools) - FORBIDDEN_CHILD_TOOLS
+        safe_allowlist = frozenset(system_child_allowlist) - FORBIDDEN_CHILD_TOOLS
         return DelegationCapability(
             source="realtime",
             scope_id=scope_id,
@@ -125,8 +131,8 @@ class RealtimeDelegationAdapter:
             session_id=session_id,
             actor_id=actor_id,
             classification=classification,
-            parent_allowed_tools=frozenset(parent_allowed_tools),
-            system_child_allowlist=frozenset(system_child_allowlist),
+            parent_allowed_tools=safe_parent,
+            system_child_allowlist=safe_allowlist,
         )
 
     async def on_disconnect(
@@ -192,7 +198,18 @@ class TaskDelegationAdapter:
 
         ``scope_id`` is the server-trusted task id (never a client-submitted
         value). The capability is bound to the task's execution run/session.
+
+        FORBIDDEN_CHILD_TOOLS (delegate_agents + task/approval lifecycle
+        tools) are stripped from both tool sets: callers pass the worker's
+        granted_tools (which legitimately contains delegate_agents so the
+        parent can call it), but those tools are parent-level capabilities
+        that DelegationPolicy check 3(a) forbids inside
+        parent_allowed_tools and that children must never receive.
         """
+        from app.domain.delegation_policy import FORBIDDEN_CHILD_TOOLS
+
+        safe_parent = frozenset(parent_allowed_tools) - FORBIDDEN_CHILD_TOOLS
+        safe_allowlist = frozenset(system_child_allowlist) - FORBIDDEN_CHILD_TOOLS
         return DelegationCapability(
             source="task",
             scope_id=scope_id,
@@ -200,8 +217,8 @@ class TaskDelegationAdapter:
             session_id=session_id,
             actor_id=actor_id,
             classification=classification,
-            parent_allowed_tools=frozenset(parent_allowed_tools),
-            system_child_allowlist=frozenset(system_child_allowlist),
+            parent_allowed_tools=safe_parent,
+            system_child_allowlist=safe_allowlist,
         )
 
     @staticmethod

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance） -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）和 Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox） -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -144,7 +144,7 @@
 ## Policy Mesh 治理术语
 
 - Policy Mesh：N-Agent 运行时治理架构，由 16 个独立领域 Policy + Shared Kernel + RunPolicySnapshot + 审计通道组成；每个 Policy 治理一个维度，Application Service 在外部调用前封口执行。
-- RunPolicySnapshot：不可变 frozen dataclass（`app/application/policy_snapshot.py`），携带 10 个 typed config + IngressFacts（run_id/session_id/execution_mode/trusted_claims）；由 RunPolicySnapshotFactory 从 PolicyProfileProvider 构造；不持有任何 mutable runtime state。
+- RunPolicySnapshot：不可变 frozen dataclass（`app/application/policy_snapshot.py`），携带 11 个 typed config（含 DelegationPolicyConfig）+ IngressFacts（run_id/session_id/execution_mode/trusted_claims）；由 RunPolicySnapshotFactory 从 PolicyProfileProvider 构造；不持有任何 mutable runtime state。
 - RunPolicySnapshotFactory：Application 层工厂（`app/application/policy_snapshot.py`），从 PolicyProfileProvider 解析 profile 并构造 RunPolicySnapshot；不持有 Settings 引用。
 - IngressFacts：RunPolicySnapshot 中的不可变运行时入口事实，含 run_id、session_id、execution_mode、actor_id、trusted_claims。
 - BudgetPolicy / BudgetService：Domain 预算策略 + Application 服务；reserve(settle/release) 三段式预算生命周期，覆盖 LLM_CALL / TOOL_CALL / SANDBOX_RESOURCE / WALL_TIME 四种 reserve kind。
@@ -178,3 +178,17 @@
 - SkillUsage telemetry：Skill 使用遥测（created_by/use_count/view_count/patch_count/state/pinned/时间戳），存 SQLite skill_usage 表。
 - archive-not-delete：delete/remove_file 默认移到 .archive/ 而非物理删除，可恢复。
 - SkillBackupStore：Skill 目录 tar.gz 快照 + rollback，写入前 backup（fail-closed，backup 失败拒绝写入）。
+
+## Delegation 委派术语
+
+- Delegation：多 Agent 委派聚合根（`app/domain/delegation.py`），深度固定 1、一次创建后 worker 集合与可选 aggregator 不可变；状态机 pending/running/joining/succeeded/failed/cancelling/cancelled/expired；同 (parent.source, parent.scope_id, delegation_key) 唯一，同 key 同规范化指纹重放返回原委派，不同指纹返回 delegation_conflict。
+- DelegationParentRef：父来源不透明引用（source 取 realtime|task、scope_id、run_id、session_id）；领域层不解析这些 ID，scope 只能由服务端 capability 填入，调用参数不接受 parent ref。
+- delegation_key / fingerprint：父作用域内稳定语义键（NFC+strip+lower 规范化）与请求规范化指纹（SHA-256），共同承载模型重试/Task retry/网络重放的幂等；空白、自动生成或服务端静默改写均被拒绝。
+- DelegationMember：委派成员（worker|aggregator），ordinal 创建时固定、所有查询按 role 后 ordinal 排序不依赖并发完成顺序；终态不可回退。
+- DelegationJoinPolicy：join 策略枚举 all_completed/all_succeeded/best_effort，决定部分失败、deadline、父取消时取消 siblings 与否及终态（全失败 FAILED、deadline EXPIRED、父取消 CANCELLED）。
+- DelegationAggregationPolicy：聚合策略 parent|agent；agent 模式在 workers 全部终态后运行一个无委派/审批能力的最小权限 aggregator，只读取经 InformationFlowPolicy 过滤后的 ResultSet。
+- delegate_agents：唯一模型可见委派工具（source_type=AGENT、risk_level=SAFE、managed=false、toolset=agent），joined delegation 语义：工具调用在父 run 内等待 join 完成后把有界 ResultSet 作为 tool result 返回；closed schema + allOf 条件校验（aggregation=agent 才允许 aggregator 字段）。
+- delegation capability（_ServerSentinel）：`app/application/delegation_parent_adapter.py` 用进程内 sentinel 对象签发不可 JSON 序列化的服务端 capability，写入 trusted_metadata["delegation_capability"]；反序列化副本（伪造 dict / 跨进程副本）经 is_valid() 拒绝，OpenAI HTTP 客户端无法伪造。
+- DelegationService / DelegationRunService / ChildAgentExecutor：Application 委派三件套——delegate 唯一创建入口（capability 验证 -> 规范化指纹 -> DelegationPolicy -> 父级预算 reserve -> 非扩权 child snapshot -> 单事务 create_or_reconnect -> join -> InformationFlow release(PARENT)）；RunService 持久化状态驱动调度（CAS claim/恢复/cancel outbox at-least-once）；ChildAgentExecutor 复用 ChatCompletionService 执行受限 child（delegation- 前缀 UUIDv5 独立 session、UNATTENDED、persist_messages=False、剥离 delegate_agents/审批工具防递归）。
+- delegation_cancel_outbox：取消意图 outbox 表，DB 状态变更与 outbox 插入同一事务，dispatcher 提交后 at-least-once 投递取消；迟到 child 成功只保存为审计事件，不能把 CANCELLED/EXPIRED 改回成功。
+- DelegationPolicy：第 17 个领域 Policy（`app/domain/delegation_policy.py`），纯校验委派请求（capability 来源、child 数量/深度/schema/重复 spec、child 工具集必须是父 allowlist 与系统 child allowlist 交集、预算总额），不查数据库不导入其他 Policy。

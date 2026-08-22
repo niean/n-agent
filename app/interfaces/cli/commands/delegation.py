@@ -50,6 +50,7 @@ def _delegation_to_dict(d: Any) -> dict[str, Any]:
 
 
 _LIST_HEADERS = ["id", "status", "parent_source", "parent_scope_id", "join_policy"]
+_LIST_PAGE_SIZE = 100
 
 
 def run(args) -> int:
@@ -77,9 +78,21 @@ def _cmd_list(args) -> int:
         return 0
     scope_id = getattr(args, "scope_id", None)
     status = getattr(args, "status", None)
-    delegations = asyncio.run(
-        registry.list_delegations(limit=100, scope_id=scope_id, status=status)
-    )
+    delegations = []
+    offset = 0
+    while True:
+        page = asyncio.run(
+            registry.list_delegations(
+                limit=_LIST_PAGE_SIZE,
+                offset=offset,
+                scope_id=scope_id,
+                status=status,
+            )
+        )
+        delegations.extend(page)
+        if len(page) < _LIST_PAGE_SIZE:
+            break
+        offset += len(page)
     items = [_delegation_to_dict(d) for d in delegations]
     fmt = resolve_format(args)
     render_data(items, fmt=fmt, headers=_LIST_HEADERS, console=make_console())

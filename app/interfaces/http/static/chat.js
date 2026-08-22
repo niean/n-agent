@@ -5,6 +5,22 @@
   const modal = namespace.modal;
 
   let currentSessionId = null;
+  const SESSION_SOURCE_FILTER_STORAGE_KEY = 'nagent.chat.session-source-filter.v1';
+  const SESSION_SOURCE_OPTIONS = [
+    ['dashboard', 'Dashboard'],
+    ['api', 'API'],
+    ['cli', 'CLI'],
+    ['feishu', '飞书'],
+    ['dingtalk', '钉钉'],
+    ['wecom', '企微'],
+    ['acp', 'ACP'],
+    ['schedule', '定时任务'],
+    ['task', '任务'],
+    ['curator', 'Curator'],
+    ['delegation', '委派'],
+  ];
+  const SESSION_SOURCE_VALUES = new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value));
+  let selectedSessionSources = loadSessionSourceFilter();
   let activeSideTab = 'tool';
   let artifactPanelRequestSeq = 0;
   let isSending = false;
@@ -1568,7 +1584,7 @@
     const list = ui.byId('chat-session-list');
     if (!list) return;
     try {
-      const sessions = await api.listSessions();
+      const sessions = (await api.listSessions()).filter(isSessionVisible);
       clearNode(list);
       if (!sessions.length) { ui.renderEmpty(list, '暂无会话'); return; }
       sessions.forEach((session) => list.appendChild(buildSessionItem(session)));
@@ -1576,6 +1592,121 @@
       clearNode(list);
       ui.renderError(list, '加载会话失败: ' + error.message);
     }
+  }
+
+  function defaultSessionSourceFilter() {
+    return new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value).filter((value) => value !== 'delegation'));
+  }
+
+  function loadSessionSourceFilter() {
+    try {
+      const raw = global.localStorage && global.localStorage.getItem(SESSION_SOURCE_FILTER_STORAGE_KEY);
+      if (!raw) return defaultSessionSourceFilter();
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return defaultSessionSourceFilter();
+      const selected = new Set(parsed.filter((value) => typeof value === 'string' && SESSION_SOURCE_VALUES.has(value)));
+      return selected.size ? selected : defaultSessionSourceFilter();
+    } catch (_) {
+      return defaultSessionSourceFilter();
+    }
+  }
+
+  function saveSessionSourceFilter(sources) {
+    selectedSessionSources = new Set(sources);
+    try {
+      if (global.localStorage) {
+        global.localStorage.setItem(SESSION_SOURCE_FILTER_STORAGE_KEY, JSON.stringify([...selectedSessionSources]));
+      }
+    } catch (_) {
+      // Local storage is an optional Dashboard convenience; the in-memory filter still applies.
+    }
+  }
+
+  function isSessionVisible(session) {
+    return !!session && typeof session.source === 'string'
+      && SESSION_SOURCE_VALUES.has(session.source) && selectedSessionSources.has(session.source);
+  }
+
+  function closeSessionSourceFilterModal(backdrop, onKeydown) {
+    if (onKeydown) document.removeEventListener('keydown', onKeydown);
+    if (backdrop && backdrop.parentNode) backdrop.remove();
+  }
+
+  function openSessionSourceFilterModal() {
+    const existing = document.getElementById('chat-session-source-filter-modal');
+    if (existing) existing.remove();
+    const backdrop = document.createElement('div');
+    backdrop.id = 'chat-session-source-filter-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'chat-session-source-filter-title');
+    const form = document.createElement('form');
+    form.className = 'providers-form';
+    const header = ui.el('div', 'modal-header');
+    const title = document.createElement('h4');
+    title.id = 'chat-session-source-filter-title';
+    title.textContent = '筛选会话类型';
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'modal-close';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '关闭筛选会话类型弹框');
+    header.append(title, closeBtn);
+    form.appendChild(header);
+
+    const options = ui.el('div', 'session-source-filter');
+    const draftSources = new Set(selectedSessionSources);
+    SESSION_SOURCE_OPTIONS.forEach(([value, label]) => {
+      const option = ui.el('label', 'session-source-filter__option');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = value;
+      checkbox.checked = draftSources.has(value);
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) draftSources.add(value);
+        else draftSources.delete(value);
+      });
+      const text = document.createElement('span');
+      text.textContent = label;
+      option.append(checkbox, text);
+      options.appendChild(option);
+    });
+    form.appendChild(options);
+
+    const actions = ui.el('div', 'providers-form__actions');
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn';
+    cancelBtn.textContent = '取消';
+    const applyBtn = document.createElement('button');
+    applyBtn.type = 'submit';
+    applyBtn.className = 'btn btn--primary';
+    applyBtn.textContent = '应用';
+    actions.append(cancelBtn, applyBtn);
+    form.appendChild(actions);
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+
+    const onKeydown = (event) => {
+      if (event.key === 'Escape') closeSessionSourceFilterModal(backdrop, onKeydown);
+    };
+    closeBtn.addEventListener('click', () => closeSessionSourceFilterModal(backdrop, onKeydown));
+    cancelBtn.addEventListener('click', () => closeSessionSourceFilterModal(backdrop, onKeydown));
+    backdrop.addEventListener('click', (event) => {
+      if (event.target === backdrop) closeSessionSourceFilterModal(backdrop, onKeydown);
+    });
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      saveSessionSourceFilter(draftSources);
+      closeSessionSourceFilterModal(backdrop, onKeydown);
+      loadSessions();
+    });
+    document.addEventListener('keydown', onKeydown);
+    document.body.appendChild(backdrop);
+    closeBtn.focus();
   }
 
   // 轻量标题刷新：不全量 re-render 会话列表（保留重命名输入态/避免闪烁），仅按 id 更新
@@ -1599,7 +1730,7 @@
       titleRefreshInFlight = false;
     }
     const titleById = new Map();
-    (sessions || []).forEach((s) => titleById.set(s.id, s.title || s.id));
+    (sessions || []).filter(isSessionVisible).forEach((s) => titleById.set(s.id, s.title || s.id));
     const items = list.querySelectorAll('.session-item');
     items.forEach((item) => {
       const id = item.dataset && item.dataset.sessionId;
@@ -2627,6 +2758,39 @@
     syncSideCollapse();
   }
 
+  function syncSessionsCollapse() {
+    const shell = ui.byId('chat-shell');
+    const hideBtn = ui.byId('chat-session-toggle-btn');
+    const expandBtn = ui.byId('chat-session-expand-btn');
+    if (!shell || !hideBtn || !expandBtn) return;
+    const collapsed = shell.classList.contains('chat-shell--sessions-collapsed');
+    hideBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    expandBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    expandBtn.hidden = !collapsed;
+  }
+
+  function bindSessionsToggle() {
+    const shell = ui.byId('chat-shell');
+    const hideBtn = ui.byId('chat-session-toggle-btn');
+    const expandBtn = ui.byId('chat-session-expand-btn');
+    if (!shell || !hideBtn || !expandBtn) return;
+    hideBtn.addEventListener('click', () => {
+      shell.classList.add('chat-shell--sessions-collapsed');
+      syncSessionsCollapse();
+      expandBtn.focus();
+    });
+    expandBtn.addEventListener('click', () => {
+      shell.classList.remove('chat-shell--sessions-collapsed');
+      syncSessionsCollapse();
+      hideBtn.focus();
+    });
+    // 初始同步：隐藏按钮 aria 与展开按钮 hidden 跟随面板状态；展开按钮 aria
+    // 保留静态模板初值（false），仅在交互后由 syncSessionsCollapse 同步。
+    const collapsed = shell.classList.contains('chat-shell--sessions-collapsed');
+    hideBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    expandBtn.hidden = !collapsed;
+  }
+
   function activateSideTab(value, focus) {
     if (value !== 'tool' && value !== 'artifact') return;
     activeSideTab = value;
@@ -3202,6 +3366,8 @@
     initialized = true;
     const sendBtn = ui.byId('chat-send');
     const input = ui.byId('chat-input');
+    const sessionFilterBtn = ui.byId('chat-session-filter-btn');
+    if (sessionFilterBtn) sessionFilterBtn.addEventListener('click', openSessionSourceFilterModal);
     if (sendBtn) sendBtn.addEventListener('click', send);
     if (input) {
       input.addEventListener('keydown', handleComposerKeydown);
@@ -3214,6 +3380,7 @@
       imageInput.addEventListener('change', handleFileSelect);
     }
     bindSideToggle();
+    bindSessionsToggle();
     bindTabSwitch();
     renderArtifactPanel();
     document.addEventListener('click', handleMemoryDocumentClick);

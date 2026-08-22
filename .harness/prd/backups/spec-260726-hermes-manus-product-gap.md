@@ -286,7 +286,7 @@ N-Agent 已有 Dashboard、CLI/TUI、ACP 和飞书，开发者入口较完整，
 
 Hermes 已支持 Telegram、Discord、Slack、WhatsApp、Signal、Teams 等平台及语音模式。N-Agent 不应简单追求平台数量，应优先选择目标用户真实使用的入口：
 
-1. Slack 或企业微信；
+1. Slack 或企微；
 2. 邮件触发任务；
 3. 移动端通知和任务审批；
 4. 语音消息和转写。

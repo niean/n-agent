@@ -87,6 +87,16 @@ def test_cli_delegation_list_json(fake_registry, capsys):
     assert "d1" in out
 
 
+def test_cli_delegation_list_reads_all_pages(monkeypatch, capsys):
+    registry = FakeRegistry([_delegation(f"d{i}") for i in range(101)])
+    monkeypatch.setattr(delegation_cmd, "_load_delegation_registry", lambda: registry)
+
+    rc = delegation_cmd.run(_args(delegation_command="list", format="json"))
+
+    assert rc == 0
+    assert "d100" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # show
 # ---------------------------------------------------------------------------

@@ -1861,7 +1861,31 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             lifecycles[Platform.FEISHU] = feishu_im_adapter
     platform_registry = InMemoryPlatformRegistry(descriptors, lifecycles)
     platform_service = PlatformService(platform_registry, gateway_registry)
+    if task_service is not None:
+        async def _delete_session_tasks(session_id: str) -> None:
+            # Run before MemoryStore deletes the session: SQLite's task FK uses
+            # ON DELETE SET NULL, which would otherwise erase the association
+            # needed to cascade task attachments and artifacts.
+            await task_service.delete_tasks_by_session(session_id)
+        session_service.add_session_deleting_handler(_delete_session_tasks)
     session_service.add_session_deleted_handler(schedule_service.handle_session_deleted)
+    if delegation_registry is not None:
+        async def _delete_delegation_sessions_on_session_deleted(session_id: str) -> None:
+            # 父会话删除时级联删除其全部 delegation 子会话（delegation- 前缀隔离
+            # session）及对应 delegation registry 记录（7 表 FK 级联），避免遗留野
+            # delegation 会话/记录。子会话不存在时静默跳过。
+            child_ids = await delegation_registry.list_execution_session_ids_for_parent(
+                session_id
+            )
+            for child_id in child_ids:
+                try:
+                    await session_service.delete_session(child_id)
+                except SessionNotFoundError:
+                    continue
+            await delegation_registry.delete_by_parent_session(session_id)
+        session_service.add_session_deleted_handler(
+            _delete_delegation_sessions_on_session_deleted
+        )
     if settings.sandbox_enabled:
         async def _release_sandbox_on_session_deleted(session_id: str) -> None:
             await sandbox_manager.release(session_id, reason="session")

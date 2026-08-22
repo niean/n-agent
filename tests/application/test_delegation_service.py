@@ -139,6 +139,72 @@ async def test_delegate_creates_and_returns_resultset(setup):
 
 
 @pytest.mark.asyncio
+async def test_delegate_redacts_credential_fields_in_json_result(setup):
+    """Credential fields in a child JSON result never reach the parent."""
+    svc, registry, run_svc, chat, clock = setup
+    chat.response_content = '{"secret":"e2e-secret-123","credential":"e2e-token-456"}'
+
+    result = await svc.delegate(
+        parent_capability=_parent_capability(),
+        delegation_key="credential-json-result",
+        children=[_child_spec("w0")],
+        join_policy="all_completed",
+        aggregation="parent",
+        timeout_seconds=60,
+    )
+
+    summary = result.member_results[0].summary
+    assert "e2e-secret-123" not in summary
+    assert "e2e-token-456" not in summary
+    assert summary == '{"secret":"[REDACTED]","credential":"[REDACTED]"}'
+
+
+@pytest.mark.asyncio
+async def test_delegate_agent_aggregation_passes_aggregator_spec_to_policy(setup):
+    """aggregation=agent must not be blanket-denied.
+
+    Regression: _build_policy_request never set aggregator_spec, so the
+    DelegationPolicy _validate_aggregator branch denied every AGENT
+    aggregation request with a generic delegation_invalid.
+    """
+    svc, registry, run_svc, chat, clock = setup
+    result = await svc.delegate(
+        parent_capability=_parent_capability(),
+        delegation_key="k-agent",
+        children=[_child_spec("w0"), _child_spec("w1")],
+        join_policy="all_completed",
+        aggregation="agent",
+        timeout_seconds=60,
+        aggregator_instruction="merge both child outputs",
+    )
+    assert isinstance(result, DelegationResultSet)
+    assert result.status is DelegationStatus.SUCCEEDED
+    # Worker members + one aggregator member were created.
+    delegations = await registry.list_delegations()
+    assert len(delegations) == 1
+    members = await registry.list_members(delegations[0].id)
+    roles = sorted(m.role.value for m in members)
+    assert roles == ["aggregator", "worker", "worker"]
+
+
+@pytest.mark.asyncio
+async def test_delegate_agent_aggregation_without_instruction_still_denied(setup):
+    """aggregation=agent without aggregator_instruction stays invalid."""
+    svc, registry, run_svc, chat, clock = setup
+    with pytest.raises(DelegationError) as exc_info:
+        await svc.delegate(
+            parent_capability=_parent_capability(),
+            delegation_key="k-agent-2",
+            children=[_child_spec("w0")],
+            join_policy="all_completed",
+            aggregation="agent",
+            timeout_seconds=60,
+            aggregator_instruction=None,
+        )
+    assert exc_info.value.code == "delegation_invalid"
+
+
+@pytest.mark.asyncio
 async def test_delegate_idempotent_replay_returns_same_delegation(setup):
     svc, registry, run_svc, chat, clock = setup
     r1 = await svc.delegate(

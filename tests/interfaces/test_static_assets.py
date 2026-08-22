@@ -33,6 +33,9 @@ class _StubProvider:
         raise NotImplementedError
 
 
+from _css_utils import _css_rule_bodies, _css_media_blocks  # noqa: E402
+
+
 def _client(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     tool_service = ToolService(_StubExecutor(), builtin_tool_definitions())
@@ -464,14 +467,22 @@ def test_chat_side_panel_has_tab_structure(tmp_path):
     assert 'artifacts-detail' not in panel_window
     assert 'artifacts-list__more' not in panel_window
 
-    # 7. CSS: side-collapsed hides sidebar (0 column + display:none), toggle button styling, old debug classes removed
+    # 7. CSS: side-collapsed hides sidebar (2-col + display:none), toggle button styling, old debug classes removed
     assert '.chat-shell.chat-shell--side-collapsed' in css
-    assert 'grid-template-columns: 280px minmax(360px, 1fr) 0' in css
+    assert 'grid-template-columns: 280px minmax(0, 1fr)' in _css_rule_bodies(css, '.chat-shell.chat-shell--side-collapsed')[0]
     assert '.chat-shell.chat-shell--side-collapsed #chat-side-panel' in css
     assert '.chat-side-toggle-btn' in css
     assert '.chat-side-panel.collapsed' not in css
     assert '.chat-debug-panel' not in css
     assert '.chat-shell--debug-collapsed' not in css
+    # 左侧会话面板折叠：display:none + 展开按钮 hidden 规则
+    session_rules = _css_rule_bodies(css, '.chat-shell.chat-shell--sessions-collapsed')
+    assert session_rules, "missing sessions-collapsed grid rule"
+    assert 'grid-template-columns: minmax(0, 1fr) 280px' in session_rules[0]
+    session_hide = _css_rule_bodies(css, '.chat-shell.chat-shell--sessions-collapsed #chat-session-panel')
+    assert session_hide and 'display: none' in session_hide[0]
+    expand_hidden = _css_rule_bodies(css, '#chat-session-expand-btn[hidden]')
+    assert expand_hidden and 'display: none' in expand_hidden[0]
 
     # 8. .chat-tab-panels is the scrollable container; height chain; min-width:0
     assert '.chat-tab-panels' in css
@@ -484,10 +495,12 @@ def test_chat_side_panel_has_tab_structure(tmp_path):
     assert 'min-height: 0' in css
     assert 'min-width: 0' in css
 
-    # 9. @media (max-width: 1100px) covers both .chat-shell and --side-collapsed
-    media_idx = css.index('@media (max-width: 1100px)')
-    media_block = css[media_idx:media_idx + 400]
+    # 9. @media (max-width: 1100px) 覆盖 .chat-shell 全部折叠组合（含左侧新类）
+    media_blocks = _css_media_blocks(css, '@media (max-width: 1100px)')
+    media_block = next((b for b in media_blocks if '.chat-shell' in b), '')
+    assert media_block, "missing 1100px media block covering chat-shell"
     assert '.chat-shell.chat-shell--side-collapsed' in media_block
+    assert '.chat-shell.chat-shell--sessions-collapsed' in media_block
     assert 'grid-template-columns: 1fr' in media_block
     assert '.chat-side-panel' in media_block
 
@@ -864,8 +877,8 @@ def test_chat_settings_debug_popover_present(tmp_path):
 def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
     client = _client(tmp_path)
     css = client.get('/static/styles.css').text
-    assert 'grid-template-columns: 280px minmax(360px, 2fr) minmax(280px, 0.9fr)' in css
-    assert 'grid-template-columns: 280px minmax(360px, 1fr) 0' in css
+    assert 'grid-template-columns: 280px minmax(0, 2fr) 280px' in css
+    assert 'grid-template-columns: 280px minmax(0, 1fr)' in css
 
 
 def test_static_assets_use_safe_text_rendering(tmp_path):

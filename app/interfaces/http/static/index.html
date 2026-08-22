@@ -110,10 +110,15 @@
 
     <div class="tab-content" id="tab-chat">
       <div class="chat-shell chat-shell--side-collapsed" id="chat-shell">
-        <section class="status-panel chat-session-panel">
-          <div class="panel-header"><span>会话</span></div>
+        <section class="status-panel chat-session-panel" id="chat-session-panel">
+          <div class="panel-header chat-session-panel__header"><span>会话</span><div class="chat-session-panel__actions"><button class="chat-session-toggle-btn" type="button" id="chat-session-toggle-btn" aria-label="隐藏会话列表" aria-controls="chat-session-panel" aria-expanded="true" title="隐藏会话列表">
+              <svg class="chat-session-toggle-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="1" class="session-toggle__panel" stroke="currentColor" stroke-width="2"/><path d="M10 4v16" stroke="currentColor" stroke-width="2"/></svg>
+            </button><button class="chat-session-filter-btn" type="button" id="chat-session-filter-btn" aria-label="筛选会话类型" title="筛选会话类型"><svg class="chat-session-filter-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></div>
           <div class="panel-body"><div id="chat-session-list" class="session-list"></div></div>
         </section>
+        <button class="chat-session-expand-btn" type="button" id="chat-session-expand-btn" aria-label="展开会话列表" aria-controls="chat-session-panel" aria-expanded="false" title="展开会话列表" hidden>
+          <svg class="chat-session-expand-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="1" stroke="currentColor" stroke-width="2"/><path d="M10 4v16" stroke="currentColor" stroke-width="2"/></svg>
+        </button>
         <section class="chat-stack" aria-label="对话区">
           <header class="panel-header">
             <strong id="chat-header">N-Agent Chat</strong>
@@ -213,7 +218,7 @@
 
     <div class="tab-content" id="tab-sessions">
       <section class="status-panel">
-        <div class="panel-header"><span>会话列表</span></div>
+        <div class="panel-header"><span>会话列表</span><button class="chat-session-filter-btn" type="button" id="sessions-filter-btn" aria-label="筛选会话类型" title="筛选会话类型"><svg class="chat-session-filter-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
         <div class="panel-body" id="sessions-list"></div>
       </section>
     </div>

@@ -39,6 +39,15 @@ MANAGED_TOOL_GUIDANCE = (
     "Never schedule tasks that recursively manage N-Agent itself."
 )
 
+PARALLEL_DELEGATION_GUIDANCE = (
+    "When delegate_agents is available, you MUST use it for a request that explicitly "
+    "asks for two or more isolated child agents to work in parallel and return a merged "
+    "result. This takes priority over create_task: do not substitute background Tasks "
+    "for explicit child-agent parallelism. Do not claim that child-agent delegation is "
+    "unavailable while delegate_agents is present. Use create_task instead only for "
+    "asynchronous background work that does not require an in-turn parallel child-agent result."
+)
+
 BROWSER_GUIDANCE = (
     "Browser tools (browser_navigate, browser_observe, browser_click, browser_type, browser_scroll, browser_screenshot) "
     "let you operate a real browser: log in, click, type, scroll, and observe pages beyond what web_fetch can read. "
@@ -154,6 +163,7 @@ def build_system_prompt(
         _section("Knowledge Base", KNOWLEDGE_GUIDANCE),
         _section("Skills", SKILL_GUIDANCE),
         _section("Managed Resources", MANAGED_TOOL_GUIDANCE),
+        _section("Parallel Delegation", PARALLEL_DELEGATION_GUIDANCE),
     ]
     if browser_guidance:
         sections.append(_section("Browser Guidance", browser_guidance))

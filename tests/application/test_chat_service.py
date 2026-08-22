@@ -546,6 +546,54 @@ async def test_chat_service_delegates_title_generation_to_session_service(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_chat_service_persists_explicit_internal_session_title(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "internal work"}],
+            stream=False,
+            session_id="delegation-00000000-0000-0000-0000-000000000001",
+            session_title="Python 优点",
+            persist_messages=False,
+        )
+    )
+
+    session = await store.get_session(
+        "delegation-00000000-0000-0000-0000-000000000001"
+    )
+    assert session is not None
+    assert session.title == "Python 优点"
+
+
+@pytest.mark.asyncio
+async def test_chat_service_repairs_existing_default_internal_title(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    session_id = "delegation-00000000-0000-0000-0000-000000000002"
+    await store.create_session(ConversationSession(id=session_id, source="delegation"))
+    runner = RecordingRunner()
+    service = ChatCompletionService(store, runner, SessionService(store))
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "internal work"}],
+            stream=False,
+            session_id=session_id,
+            session_title="Python 缺点",
+            persist_messages=False,
+        )
+    )
+
+    session = await store.get_session(session_id)
+    assert session is not None
+    assert session.title == "Python 缺点"
+
+
+@pytest.mark.asyncio
 async def test_complete_preserves_existing_acp_session_source(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     service = _build_service(store, tmp_path)
@@ -984,6 +1032,58 @@ async def test_complete_persists_user_message_source_from_ingress_facts(tmp_path
     user_msgs = [m for m in msgs if m.role == "user"]
     assert len(user_msgs) == 1
     assert user_msgs[0].source == "task"
+
+
+async def test_complete_preserves_task_delegation_capability_outside_policy_snapshot(
+    tmp_path,
+):
+    """Task delegation capabilities are process-local, not snapshot claims."""
+    from app.application.delegation_parent_adapter import TaskDelegationAdapter
+    from app.application.policy_snapshot import IngressFacts
+    from app.domain.policy import ExecutionMode
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = ChatCompletionService(
+        store,
+        runner,
+        SessionService(store),
+        policy_snapshot_factory=RunPolicySnapshotFactory(
+            SettingsPolicyProfileProvider(Settings())
+        ),
+        session_bootstrap_reader=SessionBootstrapReader(store),
+    )
+    capability = TaskDelegationAdapter.sign_task_capability(
+        run_id="task-run-1",
+        session_id="task-session-1",
+        scope_id="task-1",
+        parent_allowed_tools=frozenset({"delegate_agents"}),
+        system_child_allowlist=frozenset({"delegate_agents"}),
+    ).to_dict()
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "work task task-1"}],
+            stream=False,
+            session_id="task-session-1",
+            ingress_facts=IngressFacts(
+                run_id="task-run-1",
+                session_id="task-session-1",
+                source="task",
+                actor_id=None,
+                execution_mode=ExecutionMode.UNATTENDED,
+                trusted_claims={
+                    "execution_mode": ExecutionMode.UNATTENDED.value,
+                    "granted_tools": ["delegate_agents"],
+                },
+            ),
+            trusted_metadata={"delegation_capability": capability},
+        )
+    )
+
+    context = runner.options["tool_execution_context"]
+    assert context.trusted_metadata["delegation_capability"] is capability
 
 
 async def test_complete_source_falls_back_to_api_without_ingress_facts(tmp_path):

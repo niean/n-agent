@@ -62,6 +62,10 @@ class ChatCompletionInput:
     allowed_confirm_tools_override: dict[str, ConfirmToolGrant] | None = None
     ingress_facts: IngressFacts | None = None
     session_descriptor: SessionDescriptor | None = None
+    # Optional server-provided title for internal execution sessions whose
+    # messages are not persisted (delegation children, control forks). Normal
+    # user conversations continue to use asynchronous title generation.
+    session_title: str | None = None
     # When False, skip persisting user/assistant/tool messages and tool_call
     # audit records to the session store. Used by goal_mode judge fork to keep
     # its internal control-flow signals (achieved/reason JSON, task_show reads)
@@ -128,10 +132,31 @@ class ChatCompletionService:
             session_source = request.ingress_facts.source
         else:
             session_source = SessionSource.API.value
-        await self._runtime_memory.create_session_if_allowed(
-            ConversationSession(id=session_id, source=session_source)
+        explicit_title = (
+            request.session_title.strip()[:60]
+            if isinstance(request.session_title, str) and request.session_title.strip()
+            else None
         )
+        session_to_create = (
+            ConversationSession(
+                id=session_id, source=session_source, title=explicit_title
+            )
+            if explicit_title is not None
+            else ConversationSession(id=session_id, source=session_source)
+        )
+        await self._runtime_memory.create_session_if_allowed(session_to_create)
         session = await self._runtime_memory.get_session_if_allowed(session_id)
+        if (
+            explicit_title is not None
+            and session is not None
+            and session.has_default_title()
+        ):
+            # Repair legacy persist-disabled internal sessions that were
+            # previously left as "New Session", while preserving any
+            # user-renamed title.
+            session = await self.session_service.rename_session(
+                session_id, explicit_title
+            )
         existing_messages = await self._runtime_memory.read_session_messages(session_id)
         has_override = "external_memory_enabled" in request.options
         requested_memory = self._normalize_external_memory_enabled(request.options.get("external_memory_enabled"))
@@ -203,10 +228,24 @@ class ChatCompletionService:
         options["external_memory_enabled"] = locked_external_memory
         # Read execution_mode from trusted_metadata (structured, T11) with
         # fallback to options dict (backward compat for existing callers).
+        task_delegation_capability = request.trusted_metadata.get(
+            "delegation_capability"
+        )
         trusted_metadata = dict(request.trusted_metadata)
         if snapshot is not None:
             mode = snapshot.run_context.execution_mode.value
             trusted_metadata = dict(snapshot.run_context.trusted_claims)
+            # Task delegation capabilities are non-serializable, process-local
+            # server facts. They deliberately cannot live in trusted_claims,
+            # but snapshot reconstruction otherwise replaces all request
+            # metadata and drops the capability before ToolExecutionContext.
+            if (
+                snapshot.run_context.source == "task"
+                and task_delegation_capability is not None
+            ):
+                trusted_metadata["delegation_capability"] = (
+                    task_delegation_capability
+                )
         else:
             mode = trusted_metadata.get("execution_mode") or options.get("execution_context_mode") or "realtime"
         options["execution_context_mode"] = mode

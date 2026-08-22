@@ -407,6 +407,41 @@ class TaskService:
                 )
         return True
 
+    async def delete_tasks_by_session(self, session_id: str) -> int:
+        """Delete every task associated with a conversation session.
+
+        This is called before ``MemoryStore.delete_session`` so the task's
+        ``origin_session_id`` / ``execution_session_id`` are still available.
+        Deletion deliberately reuses :meth:`delete_task`, preserving its
+        attachment, artifact, publish-revocation, and execution-session
+        cleanup behaviour. A RUNNING task (or any other failure) is propagated
+        to prevent deleting the conversation while leaving a related task.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise TaskValidationError("session_id must not be empty")
+
+        task_ids: list[str] = []
+        cursor: TaskListCursor | None = None
+        while True:
+            # Include archived tasks too: archive only hides a task from the
+            # board; it must not preserve data after its owning session is
+            # explicitly deleted.
+            page = await self.registry.list_tasks(
+                "default", cursor, 100, include_archived=True,
+            )
+            task_ids.extend(
+                task.id for task in page.items
+                if task.origin_session_id == session_id
+                or task.execution_session_id == session_id
+            )
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor
+
+        for task_id in task_ids:
+            await self.delete_task(task_id)
+        return len(task_ids)
+
     # ------------------------------------------------------------------
     # Soft-delete archive flag (does NOT change status)
     # ------------------------------------------------------------------

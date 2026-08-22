@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台 artifacts(+current_revision_id)/artifact_revisions(不可变版本链)/published_artifacts(+published_revision_id) 表与 artifacts_root 存储边界、workspace: ref 解析到 workspace_root（非沙箱 cwd）、ArtifactContentStore probe 前置可读性校验、Office 导出尺寸阈值配置 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -348,3 +348,19 @@ artifacts_root 存储边界（`settings.artifacts_root`，默认 `/app/locals/ar
 - ArtifactContentStore 端口方法：read（bounded 读）、probe（仅 lstat/resolve 校验可读性、不读内容，用于 task_complete workspace ref 前置校验避免大文件双读）、write_atomic、delete_owned、materialize_source（attachment/workspace 源物化为 owned item）、copy_to_publish_snapshot、delete_publish_snapshot
 
 Artifact 尺寸阈值配置（Settings，`artifact_` 前缀，gt=0）：artifact_read_max_bytes（默认 64KB）、artifact_diff_max_bytes（默认 1MB）、artifact_diff_max_lines（默认 20000）、artifact_diff_max_output_chars（默认 200000）、artifact_export_max_bytes（默认 50MB）；artifacts_enabled=False 时 artifact 工具/路由/迁移/Exporter 均不装配。
+
+## Delegation 子系统数据边界
+
+Delegation 子系统复用 sessions.db（统一 schema 版本序列，不独立猜测 user_version），新增 7 表（`app/infrastructure/registry/sqlite_delegation_registry.py`）：
+
+- `delegations`：id PK、parent_source（realtime|task）、parent_scope_id、parent_run_id、delegation_key、fingerprint、status（8 状态枚举）、join_policy、aggregation、deadline_at、policy_snapshot_id、budget_total_tokens、version、created_at/updated_at/completed_at；唯一约束 (parent_source, parent_scope_id, delegation_key) 承载幂等创建/重连（create_or_reconnect 内部生成 delegation_id）
+- `delegation_members`：id PK、delegation_id（FK）、role（worker|aggregator）、ordinal、title/instruction/skills_json/allowed_tools_json/model_override/execution_session_id/deadline_at/budget_tokens、status（pending|running|succeeded|failed|cancelled|expired）、run_id/lease/retry、result_id、version、timestamps；唯一 (delegation_id, role, ordinal)；跨行不变量（连续 worker ordinal、至多一个 aggregator）由创建事务的请求规范化保证，非 SQLite CHECK
+- `delegation_policy_snapshots`：delegation_id、profile version、父/child/aggregator 不可扩权配置投影与 checksum，只存白名单字段不存 secret
+- `delegation_results`：result_scope（member|delegation）+ member_id（nullable）区分 member 级与聚合级结果；summary、bounded JSON、artifact_refs、error code/message、usage、classification、checksum；partial unique index 保证每 scope 至多一个被采纳 result
+- `delegation_events`：append-only 审计（单调 ID、delegation/member/run refs、kind、受限 payload、created_at）
+- `delegation_budget_ledger`：per delegation/member 的 allocation/reserved/settled/released token 数值 + version；reserve/settle 事务 CAS，重启不丢失（恢复权威）；对账按幂等 reservation ID，不重复扣减已结算额度
+- `delegation_cancel_outbox`：delegation/member、reason、attempts、next_attempt_at、acked_at；DB 状态变更与 outbox 插入同一事务，dispatcher 提交后 at-least-once 投递取消
+
+配置（Settings，`delegation_` 前缀，C 类热重载，默认全关）：delegation_enabled、delegation_realtime_enabled、delegation_task_enabled、delegation_max_children（默认 8）、delegation_max_concurrency（默认 8）、delegation_max_concurrency_per_parent（默认 3）、delegation_max_runtime_seconds（默认 1800）、delegation_member_max_runtime_seconds（默认 900）、delegation_max_total_tokens、delegation_max_tokens_per_child、delegation_result_max_bytes、delegation_structured_result_max_bytes、delegation_event_payload_max_bytes、delegation_member_max_retries（默认 1）。kill switch 关闭只收紧（拒绝新建 + 取消未终结），热重载不扩大既有权限/预算/deadline；main.py `delegation_enabled` gating（false 全部子组件为 None、true 初始化异常 fail-fast）。
+
+会话边界：child execution session 为 `delegation-` 前缀（UUIDv5 派生自 delegation/member ID），对应 SessionSource.DELEGATION 内部触发枚举（同 CURATOR/TASK，不进 im_platforms）；child prompt/逐轮消息不进用户会话或通用 message store。
