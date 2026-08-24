@@ -52,7 +52,7 @@
     const table = ui.el('table', 'document-table skills-table');
     const thead = ui.el('thead');
     const trh = ui.el('tr');
-    ['名称', '描述', '来源', '就绪状态', '启用状态', '健康状态', '扫描状态', '格式状态', '操作'].forEach((h) => {
+    ['名称', '描述', '来源', '就绪状态', '启用状态', '对话可见', '健康状态', '扫描状态', '格式状态', '操作'].forEach((h) => {
       const th = ui.el('th');
       th.textContent = h;
       trh.appendChild(th);
@@ -112,6 +112,14 @@
       }
       tr.appendChild(td);
     });
+
+    // 对话可见（chat_selectable）：仅 badge 显示状态，无操作按钮（编辑 modal 负责修改）
+    const tdChat = ui.el('td');
+    const chatSelectable = s.chat_selectable !== false;
+    const chatBadge = ui.el('span', 'badge badge--' + (chatSelectable ? 'success' : 'warning'));
+    chatBadge.textContent = chatSelectable ? '是' : '否';
+    tdChat.appendChild(chatBadge);
+    tr.appendChild(tdChat);
 
     const tdState = ui.el('td');
     if (pending) {
@@ -194,8 +202,8 @@
     const tdCreatedBy = ui.el('td');
     tdCreatedBy.textContent = '-';
     tr.appendChild(tdCreatedBy);
-    // 就绪/启用 未知 -> 空单元格
-    for (let i = 0; i < 2; i += 1) tr.appendChild(ui.el('td'));
+    // 就绪/启用/对话可见 未知 -> 空单元格
+    for (let i = 0; i < 3; i += 1) tr.appendChild(ui.el('td'));
     const tdState = ui.el('td');
     const pendingBadge = ui.el('span', 'badge badge--warning');
     pendingBadge.textContent = '待审批';
@@ -359,6 +367,7 @@
       platforms: field(form, 'platforms', '平台', skill && Array.isArray(skill.platforms) ? skill.platforms.join(',') : '', { placeholder: 'linux,darwin' }),
       readiness: field(form, 'readiness', '就绪状态', skill ? skill.readiness : 'available', { type: 'select', choices: ['available', 'unsupported', 'setup_needed', 'scan_error'] }),
       enabled: checkbox(form, 'enabled', '启用状态', skill ? skill.enabled : true),
+      chatSelectable: checkbox(form, 'chatSelectable', '在对话框技能选择器中显示', isEdit ? (skill.chat_selectable !== false) : true),
       frontmatter: field(form, 'frontmatter', 'Frontmatter JSON', skill && skill.frontmatter ? JSON.stringify(skill.frontmatter, null, 2) : '{}', { type: 'textarea', rows: 8 }),
     };
     const actions = ui.el('div', 'providers-form__actions');
@@ -375,8 +384,24 @@
       event.preventDefault();
       try {
         const payload = payloadFromForm(inputs);
-        if (isEdit) await api.updateSkill(skill.name, payload);
-        else await api.createSkill(payload);
+        if (isEdit) {
+          // 第一步：完整 Skill 更新（不含 chat_selectable）
+          await api.updateSkill(skill.name, payload);
+          // 第二步：仅在值变化时提交 chat_selectable 单字段 PATCH。
+          // 第二步失败不回滚第一步（与 spec 中"两步独立、失败不联动"约定一致）。
+          const prev = skill.chat_selectable !== false;
+          const nowVal = inputs.chatSelectable.checked;
+          if (prev !== nowVal) {
+            try {
+              await api.setSkillChatSelectable(skill.name, nowVal);
+            } catch (err) {
+              await modal.alert('对话可见保存失败: ' + (err && err.message ? err.message : err));
+              return;
+            }
+          }
+        } else {
+          await api.createSkill(payload);
+        }
         closeForm();
         await load();
       } catch (err) {

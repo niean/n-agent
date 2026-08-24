@@ -88,6 +88,7 @@ _INTERNAL_OPTION_KEYS = {
     "max_iterations",
     "persist_messages",
     "dashboard_approval_event_queue",
+    "activated_skills",
 }
 
 # Conversational artifact tools whose structured SUCCESS result materializes a

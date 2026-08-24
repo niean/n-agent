@@ -8,10 +8,10 @@ from app.application.skill_service import (
     SkillScanReport,
     SkillScanWarning,
 )
-from app.domain.skill import Skill, SkillFrontmatter, SkillReadiness, SkillNotFoundError
+from app.domain.skill import Skill, SkillFrontmatter, SkillReadiness, SkillNotFoundError, SkillSource
 
 
-def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path=None):
+def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path=None, chat_selectable=True, source=SkillSource.USER):
     fm = SkillFrontmatter(
         name=name, description="d", version="", platforms=["linux"], tags=[],
         related_skills=[], author="", license="", setup_help=None,
@@ -23,6 +23,7 @@ def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path
         enabled=enabled, readiness=readiness, last_scan_status="ok",
         last_scan_error=None, last_seen_at=None,
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+        chat_selectable=chat_selectable, source=source,
     )
 
 
@@ -53,13 +54,26 @@ class FakeRegistry:
         self.store[name] = updated
         return updated
 
+    async def set_chat_selectable(self, name, value):
+        s = self.store.get(name)
+        if s is None:
+            raise SkillNotFoundError(name)
+        from dataclasses import replace
+        updated = replace(s, chat_selectable=bool(value))
+        self.store[name] = updated
+        return updated
+
     async def replace_all_skills(self, skills):
         old = self.store
         self.store = {}
         for s in skills:
             prev = old.get(s.name)
             from dataclasses import replace
-            self.store[s.name] = replace(s, enabled=prev.enabled if prev else s.enabled)
+            self.store[s.name] = replace(
+                s,
+                enabled=prev.enabled if prev else s.enabled,
+                chat_selectable=prev.chat_selectable if prev else s.chat_selectable,
+            )
         return list(self.store.values())
 
 
@@ -194,6 +208,58 @@ async def test_set_enabled_updates_registry():
 
 
 @pytest.mark.asyncio
+async def test_set_chat_selectable_updates_registry():
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("a"))
+    service = SkillService(registry, loader)
+    updated = await service.set_chat_selectable("a", False)
+    assert updated.chat_selectable is False
+    reloaded = await registry.get_skill("a")
+    assert reloaded.chat_selectable is False
+
+
+@pytest.mark.asyncio
+async def test_set_chat_selectable_raises_when_missing():
+    service = SkillService(FakeRegistry(), FakeLoader())
+    with pytest.raises(SkillNotFoundError):
+        await service.set_chat_selectable("missing", False)
+
+
+@pytest.mark.asyncio
+async def test_list_chat_selectable_filters_out_false():
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("visible"))
+    await registry.upsert_skill(_skill("hidden", chat_selectable=False))
+    service = SkillService(registry, loader)
+    visible = {s.name for s in await service.list_chat_selectable()}
+    assert "visible" in visible
+    assert "hidden" not in visible
+
+
+@pytest.mark.asyncio
+async def test_list_chat_selectable_excludes_disabled_and_unavailable():
+    """The new method must not relax the enabled/available guards from list_for_llm."""
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("ok"))
+    await registry.upsert_skill(_skill("off", enabled=False))
+    await registry.upsert_skill(_skill("bad", readiness=SkillReadiness.UNSUPPORTED))
+    service = SkillService(registry, loader)
+    visible = {s.name for s in await service.list_chat_selectable()}
+    assert visible == {"ok"}
+
+
+@pytest.mark.asyncio
+async def test_list_for_llm_unchanged_by_chat_selectable():
+    """list_for_llm keeps the original LLM-facing index; chat_selectable is a separate filter."""
+    registry, loader = FakeRegistry(), FakeLoader()
+    await registry.upsert_skill(_skill("visible"))
+    await registry.upsert_skill(_skill("hidden", chat_selectable=False))
+    service = SkillService(registry, loader)
+    visible = {s.name for s in await service.list_for_llm()}
+    assert visible == {"visible", "hidden"}
+
+
+@pytest.mark.asyncio
 async def test_create_update_delete_skill_metadata():
     registry, loader = FakeRegistry(), FakeLoader()
     service = SkillService(registry, loader)
@@ -225,6 +291,48 @@ async def test_create_update_delete_skill_metadata():
 
     await service.delete_skill("manual")
     assert await registry.get_skill("manual") is None
+
+
+@pytest.mark.asyncio
+async def test_update_skill_preserves_source_from_current():
+    """Regression: openForm 保存只改 chat_selectable 时也会发完整 PATCH，
+    完整 PATCH 走 _skill_from_input，必须保留 current.source，避免 SEED/AGENT 被降级为 USER。"""
+    registry, loader = FakeRegistry(), FakeLoader()
+    service = SkillService(registry, loader)
+    # 模拟 n-agent / skill-creator 这类 seed Skill
+    seed_skill = _skill("n-agent", source=SkillSource.SEED)
+    await registry.upsert_skill(seed_skill)
+    agent_skill = _skill("skill-creator", source=SkillSource.AGENT)
+    await registry.upsert_skill(agent_skill)
+
+    # 用户在编辑 modal 改了描述（payload 不带 source 字段）
+    updated_seed = await service.update_skill(
+        "n-agent",
+        SkillInput(
+            name="n-agent",
+            relative_path="n-agent/SKILL.md",
+            description="Updated description",
+            platforms=["linux"],
+            enabled=True,
+        ),
+    )
+    assert updated_seed.source == SkillSource.SEED, (
+        "SEED skill must not be downgraded to USER on update"
+    )
+
+    updated_agent = await service.update_skill(
+        "skill-creator",
+        SkillInput(
+            name="skill-creator",
+            relative_path="skill-creator/SKILL.md",
+            description="Updated description",
+            platforms=["linux"],
+            enabled=True,
+        ),
+    )
+    assert updated_agent.source == SkillSource.AGENT, (
+        "AGENT skill must not be downgraded to USER on update"
+    )
 
 
 @pytest.mark.asyncio

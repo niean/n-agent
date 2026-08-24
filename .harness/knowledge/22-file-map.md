@@ -237,7 +237,7 @@
 - 配置测试：`tests/test_config.py`
 - DDD 边界测试：`tests/test_architecture_boundaries.py`
 - Docker Compose 配置测试：`tests/test_docker_compose_config.py`
-- Harness Third Review runner 测试：`tests/harness/test_third_review_runner.py`，覆盖 provider 以 0 退出但无有效 stdout 时按执行失败并回显有界 stderr；非空但五字段格式/语义非法时 warning 继续且展示原输出（目标变/未变两类）；以及合法五字段摘要成功回归
+- Harness Third Review runner 测试：`tests/harness/test_third_review_runner.py`，覆盖 provider 以 0 退出但无有效 stdout 时按执行失败并回显有界 stderr；非空但五字段格式/语义非法时 warning 继续且展示原输出（目标变/未变两类）；合法五字段摘要成功回归；以及默认 900 秒、runner 前台调用、内部受控后台子进程的执行合同
 - Domain 模型测试：`tests/domain/test_models.py`
 - Knowledge Domain 模型测试：`tests/domain/test_knowledge_models.py`，覆盖 KnowledgeBaseType、KnowledgeProbeStatus、KB slug 校验、api_key 脱敏和 backend request 分离
 - MCP Domain 模型测试：`tests/domain/test_mcp_models.py`，覆盖 MCP 站点/工具模型和 stdio 配置字段
@@ -302,6 +302,7 @@
 - Skill Service 测试：`tests/application/test_skill_service.py`，覆盖扫描、列表、view 渲染、enabled 切换、refresh 保留状态
 - Skill 工具 Executor 测试：`tests/application/test_skill_tool_executor.py`，覆盖 skills_list/skill_view 安全工具行为、category 过滤、file_path 限制
 - SQLite Skill Registry 测试：`tests/infrastructure/test_sqlite_skill_registry.py`
+- SQLite Skill Registry chat_selectable 测试：`tests/infrastructure/test_skill_registry.py`，覆盖列迁移、新表 schema、set_chat_selectable 含/不含 name 行、replace_all 与 enabled=False 保留值、upsert round-trip
 - Skill 文件加载器测试：`tests/infrastructure/test_skill_file_loader.py`，覆盖 frontmatter 解析、dirname fallback、平台过滤、嵌套发现、injection scan 非阻断
 - Skill Dashboard 测试：`tests/interfaces/test_skill_dashboard.py`，覆盖 `/chat/skills*` 列表/详情/启停/刷新及 not_found/invalid 错误码
 - Skill CLI 测试：`tests/interfaces/test_skill_cli.py` 与 `tests/interfaces/test_skill_cli_isolation.py`，覆盖 list/view 输出与 build_application_services 不被触发

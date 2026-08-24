@@ -1354,6 +1354,7 @@ def _skill_to_dict(skill) -> dict:
         "enabled": skill.enabled,
         "readiness": skill.readiness.value,
         "source": skill.source.value,
+        "chat_selectable": skill.chat_selectable,
         "last_scan_status": skill.last_scan_status,
         "last_scan_error": skill.last_scan_error,
         "format_status": format_status,
@@ -1572,7 +1573,12 @@ def _register_skill_routes(
     @router.patch("/chat/skills/{name}")
     async def patch_skill(name: str, payload: dict = Body(...)):
         try:
-            if set(payload.keys()) <= {"enabled"}:
+            if set(payload.keys()) == {"chat_selectable"}:
+                value = payload.get("chat_selectable")
+                if not isinstance(value, bool):
+                    raise SkillValidationError("chat_selectable must be boolean")
+                skill = await skill_service.set_chat_selectable(name, value)
+            elif set(payload.keys()) <= {"enabled"}:
                 enabled = payload.get("enabled")
                 if not isinstance(enabled, bool):
                     raise SkillValidationError("enabled must be boolean")

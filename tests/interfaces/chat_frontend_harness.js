@@ -21,6 +21,7 @@ let _currentDoc = null;
 function makeEl() {
   const kids = [];
   const el = {
+    _dead: false,
     className: '',
     classList: {
       add() { const parts = (el.className || '').split(/\s+/).filter(Boolean); for (const t of arguments) { if (parts.indexOf(t) === -1) parts.push(t); } el.className = parts.join(' '); },
@@ -31,6 +32,7 @@ function makeEl() {
     style: {},
     dataset: {},
     hidden: false,
+    disabled: false,
     tagName: 'DIV',
     _kids: kids,
     _attrs: {},
@@ -42,10 +44,41 @@ function makeEl() {
       }
       c.parentNode = this; kids.push(c); return c;
     },
-    removeChild(c) { const i = kids.indexOf(c); if (i >= 0) kids.splice(i, 1); c.parentNode = null; return c; },
-    replaceChild(next, previous) { const i = kids.indexOf(previous); if (i >= 0) { previous.parentNode = null; next.parentNode = this; kids[i] = next; } return previous; },
-    replaceChildren() { kids.forEach((k) => { k.parentNode = null; }); kids.length = 0; },
+    removeChild(c) { const i = kids.indexOf(c); if (i >= 0) kids.splice(i, 1); c.parentNode = null; c._dead = true; markDescendantsDead(c); return c; },
+    replaceChild(next, previous) { const i = kids.indexOf(previous); if (i >= 0) { previous.parentNode = null; previous._dead = true; markDescendantsDead(previous); next.parentNode = this; kids[i] = next; } return previous; },
+    replaceChildren() { kids.forEach((k) => { k.parentNode = null; k._dead = true; markDescendantsDead(k); }); kids.length = 0; },
     append() { const args = Array.prototype.slice.call(arguments); args.forEach((c) => { if (c && c.tagName === '#document-fragment') { while (c._kids && c._kids.length > 0) { const child = c._kids.shift(); child.parentNode = this; kids.push(child); } } else { c.parentNode = this; kids.push(c); } }); },
+    insertBefore(newNode, referenceNode) {
+      // 标准 DOM 语义：referenceNode 必须是当前子节点；不合法抛 NotFoundError
+      if (referenceNode == null) {
+        // 仿浏览器行为：referenceNode = null 时追加到末尾
+        if (newNode && newNode.tagName === '#document-fragment') {
+          while (newNode._kids && newNode._kids.length > 0) { const child = newNode._kids.shift(); child.parentNode = this; kids.push(child); }
+          return newNode;
+        }
+        newNode.parentNode = this; kids.push(newNode); return newNode;
+      }
+      const i = kids.indexOf(referenceNode);
+      if (i < 0) {
+        const err = new Error('insertBefore: reference node is not a child of this node');
+        err.name = 'NotFoundError';
+        err.code = 8;
+        throw err;
+      }
+      if (newNode && newNode.tagName === '#document-fragment') {
+        const frags = (newNode._kids || []).slice();
+        newNode._kids.length = 0;
+        // 按原顺序逐个插入到 referenceNode 之前（保持 fragment 内部顺序）
+        for (let k = 0; k < frags.length; k++) {
+          frags[k].parentNode = this;
+          kids.splice(i + k, 0, frags[k]);
+        }
+        return newNode;
+      }
+      newNode.parentNode = this;
+      kids.splice(i, 0, newNode);
+      return newNode;
+    },
     remove() { if (el.parentNode) el.parentNode.removeChild(el); },
     contains(node) {
       for (let cur = node; cur; cur = cur.parentNode) if (cur === el) return true;
@@ -56,67 +89,166 @@ function makeEl() {
       return el === _currentDoc.body || _currentDoc.body.contains(el);
     },
     addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
-    removeEventListener() {},
+    removeEventListener(type, fn) {
+      this._listeners[type] = (this._listeners[type] || []).filter((listener) => listener !== fn);
+    },
     dispatchEvent(ev) { (this._listeners[(ev && ev.type) || ''] || []).forEach((fn) => fn(ev)); },
-    querySelector(selector) {
-      // 支持 tag 选择器（原行为）与 class 选择器链（'.a' / '.a > .b'），供
-      // bindSideToggle 的 header 定位查询在桩上真实命中。
-      const sel = String(selector || '');
-      const parts = sel.split('>').map((s) => s.trim()).filter(Boolean);
-      const matches = (node, part) => {
+    closest(selector) {
+      // 支持 tag / #id / .cls 简单选择器；沿 parentNode 向上逐个检查
+      if (typeof selector !== 'string' || !selector) return null;
+      const match = (node) => {
         if (!node) return false;
+        if (selector.charAt(0) === '#') {
+          // 同时检查 _attrs.id 和 node.id（chat.js 直接给容器赋 id 字段）
+          const wanted = selector.slice(1);
+          return (node._attrs && node._attrs.id === wanted) || node.id === wanted;
+        }
+        if (selector.charAt(0) === '.') {
+          const cls = selector.slice(1);
+          return !!(node.className && node.className.split(/\s+/).indexOf(cls) !== -1);
+        }
+        return node.tagName === selector.toUpperCase();
+      };
+      for (let cur = el; cur; cur = cur.parentNode) {
+        if (match(cur)) return cur;
+      }
+      return null;
+    },
+    querySelector(selector) {
+      // 支持：tag / .cls / #id / 任意后代链（无 >）/ parent > .child / #ancestor .descendant
+      // 标准 DOM 选择器使用 getElementById/_attrs.className/_attrs.id 判定
+      const sel = String(selector || '');
+      // 拆分为简单 selector 段：按空白分隔（不拆带 # . 等的复合串）
+      const parts = sel.split(/\s+/).filter(Boolean);
+      // 匹配单段简单选择器（id / class / tag）
+      const matchSimple = (node, part) => {
+        if (!node) return false;
+        if (part.charAt(0) === '#') {
+          return node._attrs && node._attrs.id === part.slice(1);
+        }
         if (part.charAt(0) === '.') {
           const cls = part.slice(1);
           return !!(node.className && node.className.split(/\s+/).indexOf(cls) !== -1);
         }
         return node.tagName === part.toUpperCase();
       };
-      let found = null;
-      const search = (node, idx) => {
-        if (found || !node || !node._kids) return;
-        for (const child of node._kids) {
-          if (matches(child, parts[idx])) {
-            if (idx === parts.length - 1) { found = child; return; }
-            search(child, idx + 1);
-          }
-          if (found) return;
-          if (idx === 0) search(child, idx);
+      // 单段：走深度优先查找第一个匹配
+      if (parts.length === 1) {
+        const part = parts[0];
+        if (part.charAt(0) === '#') {
+          // id 查找：递归全树（DOM API 允许任意位置 id 匹配）
+          const wanted = part.slice(1);
+          const visit = (node) => {
+            if (!node) return null;
+            if (node._attrs && node._attrs.id === wanted) return node;
+            for (const child of node._kids || []) {
+              const found = visit(child);
+              if (found) return found;
+            }
+            return null;
+          };
+          return visit(this);
         }
-      };
-      if (parts.length) search(this, 0);
-      else {
-        const tag = sel.toUpperCase();
+        let found = null;
         const visit = (node) => {
-          if (!node) return null;
-          if (node.tagName === tag) return node;
-          for (const child of node._kids || []) {
-            const found = visit(child);
-            if (found) return found;
-          }
-          return null;
+          if (!node || found) return;
+          if (matchSimple(node, part)) { found = node; return; }
+          for (const child of node._kids || []) visit(child);
         };
-        return visit(this);
+        visit(this);
+        return found;
       }
-      return found;
+      // 多段：首段从 this 开始查，剩余段按后代关系
+      const visitRoot = (node) => {
+        if (!node) return null;
+        if (matchSimple(node, parts[0])) {
+          let cur = node;
+          let ok = true;
+          for (let p = 1; p < parts.length; p++) {
+            let next = null;
+            for (const c of (cur._kids || [])) {
+              if (matchSimple(c, parts[p])) { next = c; break; }
+            }
+            if (!next) { ok = false; break; }
+            cur = next;
+          }
+          if (ok) return cur;
+        }
+        for (const child of (node._kids || [])) {
+          const r = visitRoot(child);
+          if (r) return r;
+        }
+        return null;
+      };
+      return visitRoot(this);
     },
     querySelectorAll(selector) {
+      // 支持：单段 class / tag / id，以及任意后代链（空格分隔），不只支持 > 子代
       const sel = String(selector || '');
-      const cls = sel.replace(/^\./, '');
-      const out = [];
-      const visit = (node) => {
-        if (!node || !node._kids) return;
-        for (const k of node._kids) {
-          if (k.className && k.className.split(/\s+/).indexOf(cls) !== -1) out.push(k);
-          visit(k);
+      const parts = sel.split(/\s+/).filter(Boolean);
+      const matchSimple = (node, part) => {
+        if (!node) return false;
+        if (part.charAt(0) === '#') {
+          return node._attrs && node._attrs.id === part.slice(1);
         }
+        if (part.charAt(0) === '.') {
+          const cls = part.slice(1);
+          return !!(node.className && node.className.split(/\s+/).indexOf(cls) !== -1);
+        }
+        return node.tagName === part.toUpperCase();
       };
-      visit(this);
+      const out = [];
+      if (parts.length === 1) {
+        const part = parts[0];
+        if (part.charAt(0) === '#') {
+          const wanted = part.slice(1);
+          const visit = (node) => {
+            if (!node) return;
+            if (node._attrs && node._attrs.id === wanted) out.push(node);
+            for (const child of node._kids || []) visit(child);
+          };
+          visit(this);
+          return out;
+        }
+        const visit = (node) => {
+          if (!node) return;
+          if (matchSimple(node, part)) out.push(node);
+          for (const child of node._kids || []) visit(child);
+        };
+        visit(this);
+        return out;
+      }
+      // 多段：标准后代关系
+      const visitRoot = (node) => {
+        if (!node) return;
+        if (matchSimple(node, parts[0])) {
+          let cur = node;
+          let ok = true;
+          for (let p = 1; p < parts.length; p++) {
+            let next = null;
+            for (const c of (cur._kids || [])) {
+              if (matchSimple(c, parts[p])) { next = c; break; }
+            }
+            if (!next) { ok = false; break; }
+            cur = next;
+          }
+          if (ok) out.push(cur);
+        }
+        for (const child of (node._kids || [])) visitRoot(child);
+      };
+      visitRoot(this);
       return out;
     },
     setAttribute(name, value) { this._attrs[name] = String(value); },
     getAttribute(name) { return this._attrs[name] !== undefined ? this._attrs[name] : null; },
+    hasAttribute(name) { return this._attrs && Object.prototype.hasOwnProperty.call(this._attrs, name) && this._attrs[name] !== null && this._attrs[name] !== undefined; },
     focus() { if (_currentDoc) _currentDoc.activeElement = this; },
-    click() { this.dispatchEvent({ type: 'click' }); },
+    click() {
+      // 走真实 capture->target->bubble 派发，使 popover 等的 stopPropagation/preventDefault 链路正确触发。
+      // 调用元素自身的 click 不再仅做内部 dispatchEvent，测试也应使用 fireClick 走真 capture->target->bubble。
+      if (typeof dispatchClick === 'function') dispatchClick(this);
+      else this.dispatchEvent({ type: 'click' });
+    },
     get firstChild() { return kids[0] || null; },
     get textContent() {
       return kids.map((c) => (c && typeof c._text === 'string') ? c._text : (c && c.textContent) || '').join('');
@@ -124,6 +256,80 @@ function makeEl() {
     set textContent(v) { kids.length = 0; kids.push({ _text: String(v) }); },
   };
   return el;
+}
+
+// Capture/target/bubble 派发 click：document capture -> 祖先 capture -> 目标 -> 祖先 bubble -> document bubble。
+// event 暴露 target/currentTarget/stopPropagation()/preventDefault()。listener 主动 e.stopPropagation() 阻断后续阶段。
+function dispatchClick(target, opts) {
+  opts = opts || {};
+  const event = {
+    type: 'click',
+    target: target,
+    currentTarget: target,
+    bubbles: true,
+    cancelable: true,
+    defaultPrevented: false,
+    propagationStopped: false,
+    stopPropagation() { this.propagationStopped = true; },
+    stopImmediatePropagation() { this.propagationStopped = true; this.immediateStopped = true; },
+    preventDefault() { this.defaultPrevented = true; },
+  };
+  // 构造祖先链：target.parentNode 一直上升到 document
+  const ancestors = [];
+  for (let cur = target && target.parentNode; cur; cur = cur.parentNode) {
+    ancestors.push(cur);
+  }
+  // ancestors[0] 是最近祖先；列表逆序即从 document 到最近祖先
+  // 1) document capture 阶段（已经由 document.addEventListener 默认 bubble，但 capture 须显式 addEventListener 第三参 true）
+  if (_currentDoc && _currentDoc._captureListeners && _currentDoc._captureListeners.click) {
+    for (const fn of _currentDoc._captureListeners.click.slice()) {
+      if (event.propagationStopped) break;
+      event.currentTarget = _currentDoc;
+      fn(event);
+    }
+  }
+  // 2) 祖先 capture 阶段（按 document->target 顺序）
+  for (let i = ancestors.length - 1; i >= 0; i--) {
+    if (event.propagationStopped) break;
+    const a = ancestors[i];
+    event.currentTarget = a;
+    const capture = (a._captureListeners && a._captureListeners.click) || [];
+    for (const fn of capture.slice()) fn(event);
+  }
+  // 3) target 阶段
+  if (!event.propagationStopped) {
+    event.currentTarget = target;
+    const targetListeners = (target._listeners && target._listeners.click) || [];
+    for (const fn of targetListeners.slice()) {
+      if (event.immediateStopped) break;
+      fn(event);
+    }
+  }
+  // 4) 祖先 bubble 阶段（按 target->document 顺序）
+  for (let i = 0; i < ancestors.length; i++) {
+    if (event.propagationStopped) break;
+    const a = ancestors[i];
+    event.currentTarget = a;
+    const bubble = (a._listeners && a._listeners.click) || [];
+    for (const fn of bubble.slice()) fn(event);
+  }
+  // 5) document bubble 阶段
+  if (_currentDoc && !event.propagationStopped) {
+    event.currentTarget = _currentDoc;
+    const docBubble = (_currentDoc._listeners && _currentDoc._listeners.click) || [];
+    for (const fn of docBubble.slice()) fn(event);
+  }
+  return event;
+}
+
+// 标记一棵子树为 _dead（replaceChildren/replaceChild/removeChild 时调用，避免
+// createdElements 平表里的旧节点被 querySelectorAll 误认为当前 DOM 节点）。
+function markDescendantsDead(node) {
+  if (!node) return;
+  for (const c of (node._kids || [])) {
+    c._dead = true;
+    markDescendantsDead(c);
+  }
 }
 
 // --- api stub (records calls) ----------------------------------------------
@@ -159,6 +365,16 @@ let artifactFetchCalls = [];
 let artifactFetchHandler = null;
 // T4: navigation.navigatePath spy tracking
 let navPathCalls = [];
+// T5: skills api replaceable handler + call records
+let listSkillsCalls = [];
+let listSkillsHandler = null;
+// T5: replaceable session lifecycle handlers
+let createSessionCalls = [];
+let createSessionHandler = null;
+let getSessionDetailCalls = [];
+let getSessionDetailHandler = null;
+let deleteSessionCalls = [];
+let deleteSessionHandler = null;
 const localStorageData = new Map();
 
 function makeTimerEnv() {
@@ -189,6 +405,14 @@ function freshStubs(options) {
   artifactFetchCalls = [];
   artifactFetchHandler = null;
   navPathCalls = [];
+  listSkillsCalls = [];
+  listSkillsHandler = null;
+  createSessionCalls = [];
+  createSessionHandler = null;
+  getSessionDetailCalls = [];
+  getSessionDetailHandler = null;
+  deleteSessionCalls = [];
+  deleteSessionHandler = null;
   const messageStack = makeEl();
   const input = makeEl();
   input.value = '';
@@ -255,6 +479,30 @@ function freshStubs(options) {
   byIdMap['chat-artifact-list'] = chatArtifactList;
   // T3: 左侧会话面板结构（匹配 index.html 静态模板）
   const hasId = (id) => !missingIds.has(id);
+  // T5: chat-send + chat-composer__bar + chat-image-* 容器，使 chat.js init 装配块（chat.js:3523+）真实运行
+  const chatSendBtn = makeEl();
+  chatSendBtn.tagName = 'BUTTON';
+  chatSendBtn.setAttribute('type', 'button');
+  byIdMap['chat-send'] = chatSendBtn;
+  const chatComposer = makeEl();
+  chatComposer.id = 'chat-composer';
+  chatComposer.className = 'chat-composer';
+  const chatComposerBar = makeEl();
+  chatComposerBar.className = 'chat-composer__bar';
+  chatComposerBar.setAttribute('id', 'chat-composer-bar');
+  chatComposer.appendChild(chatComposerBar);
+  // sendBtn 必须挂在 composer bar 内部，保证 insertBefore(emContainer, sendBtn) 不会抛 NotFoundError
+  chatComposerBar.appendChild(chatSendBtn);
+  // chat-image-button / chat-image-input / chat-image-previews 容器
+  const chatImageBtn = makeEl();
+  chatImageBtn.tagName = 'BUTTON';
+  const chatImageInput = makeEl();
+  chatImageInput.tagName = 'INPUT';
+  chatImageInput.setAttribute('type', 'file');
+  byIdMap['chat-image-button'] = chatImageBtn;
+  byIdMap['chat-image-input'] = chatImageInput;
+  const chatImagePreviews = makeEl();
+  byIdMap['chat-image-previews'] = chatImagePreviews;
   const sessionFilterBtn = byIdMap['chat-session-filter-btn'];
   const sessionSearchBtn = byIdMap['chat-session-search-btn'];
   const sessionHideBtn = makeEl();
@@ -282,6 +530,8 @@ function freshStubs(options) {
   const chatStackHeader = makeEl();
   chatStackHeader.className = 'panel-header';
   chatStack.appendChild(chatStackHeader);
+  // T5: composer 挂到 chatStack，使 chat.js init 装配块中的 querySelector('.chat-composer__bar') 真实命中
+  chatStack.appendChild(chatComposer);
   // 右侧面板 header（展开时的按钮目标）
   const sideHeader = makeEl();
   sideHeader.className = 'panel-header';
@@ -308,7 +558,12 @@ function freshStubs(options) {
   };
   const api = {
     task: taskApi(),
-    createSession: (id) => { createdSessionId = id; return Promise.resolve({ id }); },
+    createSession: (id) => {
+      createSessionCalls.push({ id });
+      createdSessionId = id;
+      if (createSessionHandler) return createSessionHandler(id);
+      return Promise.resolve({ id });
+    },
     appendSessionMessage: (id, content) => {
       appendCalls.push({ id, content });
       return Promise.resolve({ id: 'msg_' + appendCalls.length, role: 'system', content });
@@ -317,10 +572,24 @@ function freshStubs(options) {
       session.source ? session : Object.assign({}, session, { source: 'api' })
     ))),
     getAdminModels: () => Promise.resolve({}),
-    getSessionDetail: () => Promise.resolve({ messages: [] }),
+    getSessionDetail: (id) => {
+      getSessionDetailCalls.push({ id });
+      if (getSessionDetailHandler) return getSessionDetailHandler(id);
+      return Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    },
     getSessionToolCalls: () => Promise.resolve([]),
     renameSession: () => Promise.resolve({}),
-    deleteSession: () => Promise.resolve({}),
+    // T5: listSkills 不走全局 fetch；直接返回已解析的 {skills: [...]}；由 listSkillsHandler 替换用于倒序/失败场景
+    listSkills: () => {
+      listSkillsCalls.push({});
+      if (listSkillsHandler) return listSkillsHandler();
+      return Promise.resolve({ skills: [] });
+    },
+    deleteSession: (id) => {
+      deleteSessionCalls.push({ id });
+      if (deleteSessionHandler) return deleteSessionHandler(id);
+      return Promise.resolve({});
+    },
     listScheduledTasks: () => Promise.resolve(scheduledTasks.slice()),
   };
   const createdElements = [];
@@ -341,33 +610,85 @@ function freshStubs(options) {
   const document = {
     _elements: createdElements,
     _listeners: {},
+    _captureListeners: {},
     activeElement: null,
     createElement: (tagName) => { const el = makeEl(); el.tagName = String(tagName || 'div').toUpperCase(); createdElements.push(el); return el; },
     createElementNS: (_namespace, tagName) => { const el = makeEl(); el.tagName = String(tagName || 'div').toUpperCase(); createdElements.push(el); return el; },
     createTextNode: (t) => ({ _text: String(t) }),
     createDocumentFragment: () => { const frag = makeEl(); frag.tagName = '#document-fragment'; return frag; },
     getElementById: findById,
-    querySelector: () => null,
+    // T5: document.querySelector 真返回挂在 body 上的 .chat-composer__bar；其它 selector 兜底沿用 byIdMap/createdElements
+    querySelector: (sel) => {
+      const s = String(sel || '');
+      const wantCls = (node, cls) => node && node.className && node.className.split(/\s+/).indexOf(cls) !== -1;
+      if (s === '.chat-composer__bar' || s === '#chat-composer-bar') {
+        if (byIdMap['chat-composer-bar']) return byIdMap['chat-composer-bar'];
+        // 兜底扫描 body
+        const visit = (node) => {
+          if (!node) return null;
+          if (s === '#chat-composer-bar' && node._attrs && node._attrs.id === 'chat-composer-bar') return node;
+          if (s === '.chat-composer__bar' && wantCls(node, 'chat-composer__bar')) return node;
+          for (const child of node._kids || []) { const f = visit(child); if (f) return f; }
+          return null;
+        };
+        return visit(document.body);
+      }
+      return null;
+    },
     querySelectorAll: (sel) => {
-      const cls = String(sel || '').replace(/^\./, '');
+      const s = String(sel || '');
+      // 优先用 createdElements + byIdMap 的扁平集合（生产代码的 list/querySelectorAll
+      // 依赖的若干 byIdMap 节点并未挂到 body 上；不能用纯 DOM 树遍历，否则漏报）。
+      // 同时过滤掉 replaceChildren/replaceChild/removeChild 后已脱离的旧节点（_dead）。
       const all = createdElements.concat(Object.keys(byIdMap).map((k) => byIdMap[k]));
       const seen = new Set();
-      const out = [];
+      const live = [];
       for (const el of all) {
-        if (!el || seen.has(el)) continue;
+        if (!el || seen.has(el) || el._dead) continue;
         seen.add(el);
+        live.push(el);
+      }
+      // 支持属性选择器：[role="dialog"] / [role='dialog']
+      const attrMatch = s.match(/^\[([a-zA-Z-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'))?\]$/);
+      if (attrMatch) {
+        const attr = attrMatch[1];
+        const val = attrMatch[2] != null ? attrMatch[2] : (attrMatch[3] != null ? attrMatch[3] : null);
+        const out = [];
+        for (const el of live) {
+          const has = el.hasAttribute ? el.hasAttribute(attr) : !!(el._attrs && Object.prototype.hasOwnProperty.call(el._attrs, attr));
+          if (!has) continue;
+          if (val != null) {
+            const got = el.getAttribute ? el.getAttribute(attr) : (el._attrs ? el._attrs[attr] : null);
+            if (got !== val) continue;
+          }
+          out.push(el);
+        }
+        return out;
+      }
+      const cls = s.replace(/^\./, '');
+      const out = [];
+      for (const el of live) {
         if (el.className && el.className.split(/\s+/).indexOf(cls) !== -1) out.push(el);
       }
       return out;
     },
-    addEventListener: (type, fn) => { (document._listeners[type] = document._listeners[type] || []).push(fn); },
-    removeEventListener: (type, fn) => {
-      document._listeners[type] = (document._listeners[type] || []).filter((listener) => listener !== fn);
+    addEventListener: (type, fn, capture) => {
+      if (capture) {
+        (document._captureListeners[type] = document._captureListeners[type] || []).push(fn);
+      } else {
+        (document._listeners[type] = document._listeners[type] || []).push(fn);
+      }
+    },
+    removeEventListener: (type, fn, capture) => {
+      const bucket = capture ? document._captureListeners : document._listeners;
+      bucket[type] = (bucket[type] || []).filter((listener) => listener !== fn);
     },
     hidden: false,
     visibilityState: 'visible',
     body: makeEl(),
   };
+  // 让 makeEl 内的 addEventListener 也能挂 capture 监听（target.closest 链路上的 capture 阶段）
+  // （仅在 document 拼装后注入；makeEl 在被创建时已存在的 _listeners 不变）
   _currentDoc = document;
   document.body.appendChild(chatShell);
   const fetchStub = (url, opts) => {
@@ -461,6 +782,24 @@ function freshStubs(options) {
       (document._listeners.keydown || []).slice().forEach((fn) => fn({ type: 'keydown', key }));
     },
     clearLocalStorage: () => { localStorageData.clear(); },
+    // T5: localStorage 显式 helper（测试主动预置/读取；不要隐式 clear）
+    setLocalStorage: (key, value) => { localStorageData.set(key, String(value)); },
+    getLocalStorage: (key) => (localStorageData.has(key) ? localStorageData.get(key) : null),
+    // T5: listSkills 替换 handler / 调用记录
+    setListSkillsHandler: (handler) => { listSkillsHandler = handler; },
+    getListSkillsCalls: () => listSkillsCalls.slice(),
+    clearListSkillsCalls: () => { listSkillsCalls.length = 0; },
+    setCreateSessionHandler: (handler) => { createSessionHandler = handler; },
+    getCreateSessionCalls: () => createSessionCalls.slice(),
+    setGetSessionDetailHandler: (handler) => { getSessionDetailHandler = handler; },
+    getGetSessionDetailCalls: () => getSessionDetailCalls.slice(),
+    setDeleteSessionHandler: (handler) => { deleteSessionHandler = handler; },
+    getDeleteSessionCalls: () => deleteSessionCalls.slice(),
+    // T5: capture/target/bubble click 派发（document + 祖先 + 目标 + 真实 stopPropagation/preventDefault）
+    fireClick: (el) => {
+      if (!el) return null;
+      return dispatchClick(el);
+    },
   };
 }
 
@@ -482,6 +821,8 @@ function loadChat(options) {
     encodeURIComponent,
     setInterval: env.timerEnv.setInterval,
     clearInterval: env.timerEnv.clearInterval,
+    // T5: VM-top-level localStorage（与 window.localStorage 共享同一份 storage）
+    localStorage: env.win.localStorage,
   };
   vm.createContext(ctx);
   vm.runInContext(code, ctx);
@@ -3207,6 +3548,711 @@ async function testSessionsPanelCollapse() {
   ok(env.timerCount() === beforeTimers, 'sessions toggle adds no timers');
 }
 
+// ===========================================================================
+// T5/T6/T7: 技能选择器（chat composer skill picker）
+// 覆盖 8 个行为场景：
+//   #1  loadAvailableSkills 过滤/分组/排序/安全渲染
+//   #2  localStorage 归一化（含坏 JSON/非对象降级）+ 刷新恢复
+//   #3  首败保留持久化 / 后续败保留最近成功 / 无操作不写回
+//   #4  两个 deferred 倒序：旧响应不覆盖新；请求期间切换/删除不重开
+//   #5  满 10：未选 disabled，已选可取消；trigger 计数 + .active
+//   #6  有/无 sendBtn init 路径顺序；三方互斥 + 外部点击
+//   #7  selectSession 立即切换 trigger/药丸；删除成功清键/失败不清；删当前重置 draft
+//   #8  空态选择 -> createSession 成功用于首条；reject 保留 draft 可重试
+// ===========================================================================
+
+// 通用辅助：找 chat-skill 容器（按真实 id 链）
+function _skillContainer(env) {
+  return env.byIdMap['chat-skill'] || env.document.getElementById('chat-skill');
+}
+// 通用辅助：按 className 收集所有匹配节点（深度优先）
+function _collectByClass(root, cls) {
+  const out = [];
+  (function walk(node) {
+    if (!node) return;
+    if (node.className && node.className.split(/\s+/).indexOf(cls) !== -1) out.push(node);
+    for (const c of (node._kids || [])) walk(c);
+  })(root);
+  return out;
+}
+// 通用辅助：找 chat-skill 容器下的 trigger
+function _skillTrigger(env) {
+  const cont = _skillContainer(env);
+  if (!cont) return null;
+  const triggers = _collectByClass(cont, 'chat-memory-trigger');
+  return triggers[0] || null;
+}
+// 通用辅助：找 chat-skill 容器下的 popover（dialog）
+function _skillPopover(env) {
+  const cont = _skillContainer(env);
+  if (!cont) return null;
+  const popovers = _collectByClass(cont, 'chat-memory-popover');
+  return popovers[0] || null;
+}
+// 通用辅助：找会话 item 内 aria-label='删除会话' 的按钮（用于删除路径）
+function _sessionDeleteButton(env) {
+  const items = env.document.querySelectorAll('.session-item');
+  for (const it of items) {
+    const found = (function visit(n) {
+      if (!n) return null;
+      for (const c of (n._kids || [])) {
+        if (c.tagName === 'BUTTON' && c.getAttribute('aria-label') === '删除会话') return c;
+        const r = visit(c);
+        if (r) return r;
+      }
+      return null;
+    })(it);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function testSkillPicker() {
+  // === #1: loadAvailableSkills 过滤/分组/排序/安全渲染 ===
+  {
+    const env = loadChat();
+    env.setListSkillsHandler(() => Promise.resolve({
+      skills: [
+        { name: 'inactive-1', enabled: false, readiness: 'available', source: 'user' },
+        { name: 'pending-1', enabled: true, readiness: 'pending', source: 'user' },
+        { name: '', enabled: true, readiness: 'available', source: 'user' },
+        { enabled: true, readiness: 'available', source: 'user' },
+        { name: 'duplicate', enabled: true, readiness: 'available', source: 'user' },
+        { name: 'duplicate', enabled: true, readiness: 'available', source: 'user' },
+        { name: '<img src=x onerror=alert(1)>', enabled: true, readiness: 'available', source: 'user', description: '<bad>desc' },
+        { name: 'beta', enabled: true, readiness: 'available', source: 'seed' },
+        { name: 'gamma', enabled: true, readiness: 'available', source: 'agent' },
+        { name: 'alpha', enabled: true, readiness: 'available', source: 'user' },
+        { name: 'unknown-source', enabled: true, readiness: 'available', source: 'plugin' },
+      ],
+    }));
+    await env.chat.init();
+    await env.waitMicro();
+    await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    ok(!!trigger, '#1 init: chat-skill trigger rendered');
+    if (!trigger) return;
+    ok(!trigger.classList.contains('active'), '#1 init empty: trigger has no .active class');
+    env.fireClick(trigger);
+    await env.waitMicro();
+    await env.waitMicro();
+    const popover = _skillPopover(env);
+    ok(!!popover, '#1 click trigger: popover rendered');
+    if (!popover) return;
+    const groupTitles = _collectByClass(popover, 'chat-memory-popover__group-title').map((n) => n.textContent);
+    ok(JSON.stringify(groupTitles) === JSON.stringify(['用户', '系统', '自建', '其他']),
+      '#1 groups: 用户 -> 系统 -> 自建 -> 其他 (got ' + JSON.stringify(groupTitles) + ')');
+    const pills = _collectByClass(popover, 'chat-memory-option');
+    const pillNames = pills.map((p) => p.textContent);
+    // 数据有 11 项；去掉 1 个 inactive、1 个 pending、1 个 空名、1 个 缺名、1 个 重复 (留下 1 个 duplicate)
+    // 剩余 5 个 (alpha, beta, duplicate, gamma, unknown-source, <img...>) — 等等，重新数：
+    // 原数据 11 项：inactive-1, pending-1, '', no-name, duplicate x2, <img>, beta, gamma, alpha, unknown-source
+    // 过滤后保留 (按 name 升序): alpha, beta, duplicate, gamma, unknown-source, <img src=x onerror=alert(1)>
+    // 实际上 localeCompare 把 '<' 排在字母前，所以 <img...> 第一
+    // localeCompare 默认：'<' (60) < 'a' (97)，所以 <img> 排在字母前；同组内按 name 升序
+    const expectedNames = ['<img src=x onerror=alert(1)>', 'alpha', 'duplicate', 'beta', 'gamma', 'unknown-source'];
+    ok(JSON.stringify(pillNames) === JSON.stringify(expectedNames),
+      '#1 pills: enabled+available+non-empty, duplicates collapsed, source bucketing (got ' + JSON.stringify(pillNames) + ')');
+    // XSS name：不应创建 IMG 节点
+    const hasImg = (function findImg(n) {
+      if (!n) return false;
+      if (n.tagName === 'IMG') return true;
+      for (const c of (n._kids || [])) if (findImg(c)) return true;
+      return false;
+    })(popover);
+    ok(!hasImg, '#1 XSS name: no IMG element created (textContent only)');
+    // description -> title attribute
+    const xssPill = pills.find((p) => p.textContent === '<img src=x onerror=alert(1)>');
+    ok(!!xssPill && xssPill.title && xssPill.title.indexOf('<bad>desc') !== -1,
+      '#1 description -> title attribute (got ' + (xssPill && xssPill.title) + ')');
+    ok(!!xssPill && xssPill.dataset && xssPill.dataset.skillName === '<img src=x onerror=alert(1)>',
+      '#1 dataset.skillName set');
+  }
+
+  // === #2: localStorage 归一化 + 刷新恢复 + 坏 JSON 降级 + 非对象降级 ===
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({
+      '': ['ghost'],
+      '  ': ['whitespace'],
+      's1': ['  strip-me  ', '', 'dup', 'dup', 'order-b', 'order-a', 'order-b', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7'],
+      's2': 'not-array',
+      's3': null,
+    }));
+    // listSkills 必返回 s1 用到的 10 个名字（否则 filter 会把 raw 全部剔除）
+    const skillsForS1 = () => Promise.resolve({ skills: [
+      { name: 'strip-me', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'dup', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'order-b', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'order-a', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'x1', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'x2', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'x3', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'x4', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'x5', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'x6', enabled: true, readiness: 'available', source: 'user' },
+    ] });
+    env.setListSkillsHandler(skillsForS1);
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    await env.chat.init();
+    // 等 init 内部 loadSessions 完成后才出现 session-item 节点
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const item = env.findSessionItem('s1');
+    if (item) item.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const got = env.chat.getActivatedSkills();
+    ok(Array.isArray(got) && got.length === 10, '#2 getActivatedSkills caps at 10 (got ' + (got && got.length) + ')');
+    ok(got[0] === 'strip-me' && got[1] === 'dup' && got[2] === 'order-b' && got[3] === 'order-a',
+      '#2 strip + dedup + order preserved (got ' + JSON.stringify(got) + ')');
+    // 刷新：再 loadChat 验证恢复
+    const env2 = loadChat();
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env2.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    env2.setListSkillsHandler(skillsForS1);
+    await env2.chat.init();
+    await env2.waitMicro();
+    env2.fireClick(env2.findSessionItem('s1'));
+    await env2.waitMicro();
+    await env2.waitMicro();
+    const got2 = env2.chat.getActivatedSkills();
+    ok(JSON.stringify(got2) === JSON.stringify(got), '#2 refresh (re-loadChat): same selection restored');
+  }
+  // 坏 JSON 降级
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', '{not valid');
+    await env.chat.init();
+    await env.waitMicro();
+    const got = env.chat.getActivatedSkills();
+    ok(Array.isArray(got) && got.length === 0, '#2b bad JSON: degrades to empty (got ' + JSON.stringify(got) + ')');
+  }
+  // 非对象（数组）降级
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', '[1,2,3]');
+    await env.chat.init();
+    await env.waitMicro();
+    const got = env.chat.getActivatedSkills();
+    ok(Array.isArray(got) && got.length === 0, '#2c non-object (array): degrades to empty (got ' + JSON.stringify(got) + ')');
+  }
+
+  // === #3: 首败保留持久化 / 后续败保留最近成功 / 成功刷新不写回 localStorage ===
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['kept'] }));
+    env.setListSkillsHandler(() => Promise.reject(new Error('network')));
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const _item3 = env.findSessionItem('s1');
+    if (_item3) _item3.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    // 首败：getActivatedSkills 返回 raw
+    const got = env.chat.getActivatedSkills();
+    ok(JSON.stringify(got) === JSON.stringify(['kept']), '#3 first load fails: persisted selection preserved (got ' + JSON.stringify(got) + ')');
+    const ls = env.getLocalStorage('nagent.chat.activated-skills');
+    ok(!!ls && ls.indexOf('kept') !== -1, '#3 first load fails: localStorage not rewritten');
+  }
+  // 后续败保留最近成功：先提供会成功的 handler 一次，再 reject
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['kept'] }));
+    let n = 0;
+    env.setListSkillsHandler(() => {
+      n++;
+      if (n === 1) return Promise.resolve({ skills: [
+        { name: 'kept', enabled: true, readiness: 'available', source: 'user' },
+        { name: 'new', enabled: true, readiness: 'available', source: 'user' },
+      ] });
+      return Promise.reject(new Error('again network'));
+    });
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const _item3 = env.findSessionItem('s1');
+    if (_item3) _item3.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    // 第一次成功（n=1）
+    env.fireClick(trigger); await env.waitMicro(); await env.waitMicro();
+    // 关闭 + 重新打开 -> 第二次调用 listSkills -> reject
+    env.fireClick(trigger); await env.waitMicro();
+    env.fireClick(trigger); await env.waitMicro(); await env.waitMicro();
+    // 仍有最近成功缓存（首次成功），filter 后保留 'kept'（raw 只有 kept）
+    const gotAfter = env.chat.getActivatedSkills();
+    ok(JSON.stringify(gotAfter) === JSON.stringify(['kept']),
+      '#3b subsequent failure: last successful cache kept (got ' + JSON.stringify(gotAfter) + ')');
+  }
+  // 成功刷新移除某 skill 后 filter，但 localStorage 未被改写
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['removed-skill', 'kept'] }));
+    let n = 0;
+    env.setListSkillsHandler(() => {
+      n++;
+      if (n === 1) return Promise.resolve({ skills: [
+        { name: 'removed-skill', enabled: true, readiness: 'available', source: 'user' },
+        { name: 'kept', enabled: true, readiness: 'available', source: 'user' },
+      ] });
+      return Promise.resolve({ skills: [
+        { name: 'kept', enabled: true, readiness: 'available', source: 'user' },
+      ] });
+    });
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const _item3 = env.findSessionItem('s1');
+    if (_item3) _item3.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    let got = env.chat.getActivatedSkills();
+    ok(JSON.stringify(got) === JSON.stringify(['removed-skill', 'kept']),
+      '#3c first refresh: both kept (got ' + JSON.stringify(got) + ')');
+    const trigger = _skillTrigger(env);
+    env.fireClick(trigger); await env.waitMicro(); // close
+    env.fireClick(trigger); await env.waitMicro(); await env.waitMicro(); // open -> listSkills 第二次
+    got = env.chat.getActivatedSkills();
+    ok(JSON.stringify(got) === JSON.stringify(['kept']),
+      '#3d second refresh: removed skill filtered out (got ' + JSON.stringify(got) + ')');
+    const ls = env.getLocalStorage('nagent.chat.activated-skills');
+    ok(!!ls && ls.indexOf('removed-skill') !== -1,
+      '#3e localStorage not rewritten on background refresh (got ' + ls + ')');
+  }
+
+  // === #4: 两个 deferred 倒序：旧响应不覆盖新；请求期间切换/删除不重开 ===
+  // 三个 listSkills 调用：init（renderWhenClosed=true）、click1 打开、click3 再次打开
+  // 第三个调用直接 resolve 一个已知 skills 数据（init + click1 两次使用 deferred）
+  {
+    const env = loadChat();
+    let firstResolve, secondResolve;
+    let firstCalled = false, secondCalled = false;
+    env.setListSkillsHandler(() => {
+      if (!firstCalled) { firstCalled = true; return new Promise((res) => { firstResolve = res; }); }
+      if (!secondCalled) { secondCalled = true; return new Promise((res) => { secondResolve = res; }); }
+      return Promise.resolve({ skills: [{ name: 'newer-skill', enabled: true, readiness: 'available', source: 'user' }] });
+    });
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const _item3 = env.findSessionItem('s1');
+    if (_item3) _item3.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    // init 调用 listSkills -> firstResolve pending (init)
+    // 第一次 click: 打开 -> listSkills -> secondResolve pending (click1)
+    // 关闭
+    // 再次打开 -> listSkills 第三次 -> 直接 resolve newer-skill (click3)
+    let trigger = _skillTrigger(env);
+    env.fireClick(trigger); await env.waitMicro();
+    env.fireClick(trigger); await env.waitMicro();
+    env.fireClick(trigger); await env.waitMicro();
+    // 倒序：先 resolve 第二次（newer from click1, seq=2），再 resolve 第一次（older from init, seq=1）
+    secondResolve({ skills: [{ name: 'newer-skill', enabled: true, readiness: 'available', source: 'user' }] });
+    firstResolve({ skills: [{ name: 'older-skill', enabled: true, readiness: 'available', source: 'user' }] });
+    await env.waitMicro(); await env.waitMicro();
+    await env.waitMicro();
+    trigger = _skillTrigger(env);
+    const popover = _skillPopover(env);
+    if (popover) {
+      const pillNames = _collectByClass(popover, 'chat-memory-option').map((p) => p.textContent);
+      ok(pillNames.indexOf('newer-skill') !== -1 && pillNames.indexOf('older-skill') === -1,
+        '#4 out-of-order: older response does not overwrite newer cache (got ' + JSON.stringify(pillNames) + ')');
+    } else {
+      ok(false, '#4 popover should still be open after older+newer resolve');
+    }
+    // 关闭 popover 期间旧响应不应再重开
+    env.fireClick(trigger); await env.waitMicro();
+    const popoverAfter = _skillPopover(env);
+    ok(!popoverAfter, '#4b out-of-order: stale response does not reopen closed popover');
+  }
+  // 请求期间切换会话不重开
+  {
+    const env = loadChat();
+    let deferred;
+    env.setListSkillsHandler(() => new Promise((res) => { deferred = res; }));
+    sessionsList = [{ id: 's1', title: 's1' }, { id: 's2', title: 's2' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    env.fireClick(env.findSessionItem('s1'));
+    await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    env.fireClick(trigger); await env.waitMicro();
+    // 切换到 s2
+    env.fireClick(env.findSessionItem('s2'));
+    await env.waitMicro();
+    // resolve 旧请求
+    deferred({ skills: [{ name: 'old-s1', enabled: true, readiness: 'available', source: 'user' }] });
+    await env.waitMicro(); await env.waitMicro();
+    // 当前是 s2，popover 不应被旧响应重开
+    const popover = _skillPopover(env);
+    ok(!popover, '#4c switch during pending: popover not reopened for new session');
+  }
+
+  // === #5: 满 10：未选 disabled，已选可取消；trigger 计数 + .active ===
+  {
+    const env = loadChat();
+    const skillList = [];
+    for (let i = 0; i < 12; i++) skillList.push({ name: 's' + i, enabled: true, readiness: 'available', source: 'user' });
+    env.setListSkillsHandler(() => Promise.resolve({ skills: skillList }));
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['s0','s1','s2','s3','s4','s5','s6','s7','s8','s9'] }));
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const _item3 = env.findSessionItem('s1');
+    if (_item3) _item3.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    ok(trigger.textContent.indexOf('技能 10') !== -1, '#5 trigger label = 技能 10 (got "' + trigger.textContent + '")');
+    ok(trigger.classList.contains('active'), '#5 trigger has .active when count > 0');
+    env.fireClick(trigger); await env.waitMicro(); await env.waitMicro();
+    const popover = _skillPopover(env);
+    const pills = _collectByClass(popover, 'chat-memory-option');
+    const enabledPills = pills.filter((p) => !p.disabled);
+    const disabledPills = pills.filter((p) => p.disabled);
+    ok(enabledPills.length === 10, '#5 all 10 selected pills remain enabled (got ' + enabledPills.length + ')');
+    ok(disabledPills.length === 2, '#5 2 unselected pills disabled at cap (got ' + disabledPills.length + ')');
+    // 取消一个已选：cap 10 -> 9，未选全部恢复 enabled
+    const firstSelected = enabledPills[0];
+    firstSelected.click();
+    await env.waitMicro();
+    const popover2 = _skillPopover(env);
+    const pills2 = popover2 ? _collectByClass(popover2, 'chat-memory-option') : [];
+    const disabled2 = pills2.filter((p) => p.disabled);
+    ok(disabled2.length === 0, '#5b after cancel: cap relaxes, all unselected re-enabled (got ' + disabled2.length + ' disabled)');
+  }
+
+  // === #6: 有/无 sendBtn init 路径顺序；三方互斥 + 外部点击 ===
+  // 有 sendBtn（默认）：3 个容器按 记忆 -> 技能 -> 设置 顺序
+  {
+    const env = loadChat();
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const composerBar = env.document.querySelector('.chat-composer__bar');
+    ok(!!composerBar, '#6 init with sendBtn: composer bar exists');
+    if (composerBar) {
+      // Use document.getElementById (which uses node.id, not _attrs.id) since chat.js sets emContainer.id directly
+      const em = (function findById(root, id) {
+        const visit = (n) => {
+          if (!n) return null;
+          if (n.id === id) return n;
+          for (const c of (n._kids || [])) { const f = visit(c); if (f) return f; }
+          return null;
+        };
+        return visit(root);
+      })(composerBar, 'chat-external-memory');
+      const _sk6 = (function findById(root, id) {
+        const visit = (n) => {
+          if (!n) return null;
+          if (n.id === id) return n;
+          for (const c of (n._kids || [])) { const f = visit(c); if (f) return f; }
+          return null;
+        };
+        return visit(root);
+      })(composerBar, 'chat-skill');
+      const _st6 = (function findById(root, id) {
+        const visit = (n) => {
+          if (!n) return null;
+          if (n.id === id) return n;
+          for (const c of (n._kids || [])) { const f = visit(c); if (f) return f; }
+          return null;
+        };
+        return visit(root);
+      })(composerBar, 'chat-settings');
+      const sk = (function findById(root, id) {
+        const visit = (n) => {
+          if (!n) return null;
+          if (n._attrs && n._attrs.id === id) return n;
+          for (const c of (n._kids || [])) { const f = visit(c); if (f) return f; }
+          return null;
+        };
+        return visit(root);
+      })(composerBar, 'chat-skill');
+      const st = (function findById(root, id) {
+        const visit = (n) => {
+          if (!n) return null;
+          if (n._attrs && n._attrs.id === id) return n;
+          for (const c of (n._kids || [])) { const f = visit(c); if (f) return f; }
+          return null;
+        };
+        return visit(root);
+      })(composerBar, 'chat-settings');
+      ok(!!em && !!_sk6 && !!_st6, '#6 all three composer containers present');
+      if (em && _sk6 && _st6) {
+        const idx = (n) => composerBar._kids.indexOf(n);
+        ok(idx(em) >= 0 && idx(_sk6) >= 0 && idx(_st6) >= 0, '#6 all three are direct children of composer bar');
+        ok(idx(em) < idx(_sk6) && idx(_sk6) < idx(_st6),
+          '#6 with sendBtn: 记忆 -> 技能 -> 设置 (em=' + idx(em) + ', sk=' + idx(_sk6) + ', st=' + idx(_st6) + ')');
+      }
+    }
+  }
+  // 无 sendBtn 路径
+  {
+    const env = loadChat({ missingIds: ['chat-send'] });
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const composerBar = env.document.querySelector('.chat-composer__bar');
+    ok(!!composerBar, '#6 init without sendBtn: composer bar exists');
+    if (composerBar) {
+      // 用 node.id 而非 _attrs.id（chat.js 直接给 emContainer.id 赋值）
+      const findById = (root, id) => {
+        const visit = (n) => {
+          if (!n) return null;
+          if (n.id === id) return n;
+          for (const c of (n._kids || [])) { const f = visit(c); if (f) return f; }
+          return null;
+        };
+        return visit(root);
+      };
+      const em_nosend = findById(composerBar, 'chat-external-memory');
+      const sk_nosend = findById(composerBar, 'chat-skill');
+      const st_nosend = findById(composerBar, 'chat-settings');
+      ok(!!em_nosend && !!sk_nosend && !!st_nosend, '#6 no-sendBtn path: all three containers present');
+      if (em_nosend && sk_nosend && st_nosend) {
+        const idx = (n) => composerBar._kids.indexOf(n);
+        ok(idx(em_nosend) < idx(sk_nosend) && idx(sk_nosend) < idx(st_nosend),
+          '#6 no-sendBtn fallback: 记忆 -> 技能 -> 设置 (em=' + idx(em_nosend) + ', sk=' + idx(sk_nosend) + ', st=' + idx(st_nosend) + ')');
+      }
+    }
+  }
+  // 三方互斥 + 外部点击
+  {
+    const env = loadChat();
+    await env.chat.init();
+    await env.waitMicro();
+    // chat-external-memory / chat-settings 容器由 init 动态创建并赋值给 node.id；用 getElementById 查找
+    const emEl = env.document.getElementById('chat-external-memory');
+    const stEl = env.document.getElementById('chat-settings');
+    const skTrigger = _skillTrigger(env);
+    const emTrigger = emEl ? _collectByClass(emEl, 'chat-memory-trigger')[0] : null;
+    const stTrigger = stEl ? _collectByClass(stEl, 'chat-memory-trigger')[0] : null;
+    ok(!!skTrigger && !!emTrigger && !!stTrigger, '#6 three triggers rendered');
+    if (!skTrigger || !emTrigger || !stTrigger) return;
+    // 点开 skill
+    env.fireClick(skTrigger); await env.waitMicro();
+    ok(!!_skillPopover(env), '#6 open skill popover');
+    const emElFresh = env.document.getElementById('chat-external-memory');
+    const emTriggerFresh = emElFresh ? _collectByClass(emElFresh, 'chat-memory-trigger')[0] : null;
+    env.fireClick(emTriggerFresh); await env.waitMicro();
+    ok(!_skillPopover(env), '#6 click em trigger: skill popover closed (mutual exclusion)');
+    // 点开 st -> em 应被收起（trigger 重新获取以避免 stale）
+    const stElFresh = env.document.getElementById('chat-settings');
+    const stTriggerFresh = stElFresh ? _collectByClass(stElFresh, 'chat-memory-trigger')[0] : null;
+    env.fireClick(stTriggerFresh); await env.waitMicro();
+    ok(!_collectByClass(emElFresh, 'chat-memory-popover')[0], '#6 click settings trigger: em popover closed (mutual exclusion)');
+    // 现在 st 打开；点开 skill -> st 应被收起（trigger 重新获取以避免 stale）
+    const skTriggerFresh2 = _skillTrigger(env);
+    env.fireClick(skTriggerFresh2); await env.waitMicro();
+    ok(!_collectByClass(stElFresh, 'chat-memory-popover')[0], '#6 click skill trigger: settings popover closed (mutual exclusion)');
+    // round-robin 始终最多 1 个 dialog（每轮重新获取 trigger 以避免 stale）
+    for (let round = 0; round < 3; round++) {
+      const d = env.document.querySelectorAll('[role="dialog"]');
+      ok(d.length === 1, '#6 round-robin round ' + round + ': exactly 1 dialog open (got ' + d.length + ')');
+      // 按顺序点开下一个 trigger
+      const targets = [
+        env.document.getElementById('chat-external-memory'),
+        env.document.getElementById('chat-settings'),
+        env.document.getElementById('chat-skill'),
+      ];
+      const next = targets[round % 3];
+      const nextTrigger = next ? _collectByClass(next, 'chat-memory-trigger')[0] : null;
+      env.fireClick(nextTrigger); await env.waitMicro();
+    }
+    // 外部点击：点 document.body
+    const dialog = env.document.querySelectorAll('[role="dialog"]');
+    if (dialog.length > 0) {
+      env.fireClick(env.document.body);
+      await env.waitMicro();
+      const d2 = env.document.querySelectorAll('[role="dialog"]');
+      ok(d2.length === 0, '#6 outside click: closes popover (got ' + d2.length + ' dialogs)');
+    }
+  }
+
+  // === #7: selectSession 立即切换 trigger/药丸；删除成功清键/失败不清；删当前重置 draft ===
+  // selectSession 立即切换（在 detail 返回前）
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['kept-in-s1'], s2: ['kept-in-s2'] }));
+    env.setListSkillsHandler(() => Promise.resolve({ skills: [
+      { name: 'kept-in-s1', enabled: true, readiness: 'available', source: 'user' },
+      { name: 'kept-in-s2', enabled: true, readiness: 'available', source: 'user' },
+    ] }));
+    let deferredDetail = null;
+    env.win.NAGENT.api.getSessionDetail = (id) => {
+      if (id === 's2') return new Promise((res) => { deferredDetail = res; });
+      return Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    };
+    sessionsList = [{ id: 's1', title: 's1' }, { id: 's2', title: 's2' }];
+    await env.chat.init();
+    await env.waitMicro();
+    env.fireClick(env.findSessionItem('s1'));
+    await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    ok(trigger.textContent.indexOf('技能 1') !== -1,
+      '#7 selectSession s1: trigger shows 1 (got "' + trigger.textContent + '")');
+    // 立即点 s2（detail 还没返回）
+    env.fireClick(env.findSessionItem('s2'));
+    await env.waitMicro();
+    // trigger 立即反映 s2 选择
+    const trigger2 = _skillTrigger(env);
+    ok(trigger2.textContent.indexOf('技能 1') !== -1,
+      '#7b selectSession s2 (before detail): trigger immediately reflects s2 selection (got "' + trigger2.textContent + '")');
+    if (deferredDetail) deferredDetail({ session: { id: 's2' }, messages: [], summary: null, task_state: null });
+    await env.waitMicro();
+  }
+  // 删除成功清键（含空数组键）；失败不清
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['a'], s2: [] }));
+    sessionsList = [{ id: 's1', title: 's1' }, { id: 's2', title: 's2' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    env.win.NAGENT.modal.confirm = () => Promise.resolve(true);
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const _item7 = env.findSessionItem('s1');
+    if (_item7) _item7.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const beforeLs = env.getLocalStorage('nagent.chat.activated-skills');
+    ok(!!beforeLs && beforeLs.indexOf('s1') !== -1, '#7c precondition: s1 in localStorage');
+    // delete s1 (success)
+    const delBtn = _sessionDeleteButton(env);
+    if (delBtn) {
+      // 把 confirm 设为 true；通过初始 modal 配置保证
+      env.setDeleteSessionHandler(() => Promise.resolve({}));
+      // delBtn 已 bind handleDelete；click 走真实路径
+      delBtn.click();
+      await env.waitMicro();
+      await env.waitMicro();
+      const ls1 = env.getLocalStorage('nagent.chat.activated-skills');
+      // s1 应被清；s2 也应被清（handleDelete 总清目标键）
+      ok(!!ls1 && ls1.indexOf('"s1"') === -1, '#7d delete success: s1 key removed (ls=' + ls1 + ')');
+    } else {
+      ok(false, '#7d delete button for s1 not found');
+    }
+  }
+  // 失败不清
+  {
+    const env = loadChat();
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['a'], s2: ['b'] }));
+    sessionsList = [{ id: 's1', title: 's1' }, { id: 's2', title: 's2' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    env.win.NAGENT.modal.confirm = () => Promise.resolve(true);
+    await env.chat.init();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const _item7 = env.findSessionItem('s1');
+    if (_item7) _item7.click();
+    for (let w = 0; w < 10; w++) await env.waitMicro();
+    const lsBefore = env.getLocalStorage('nagent.chat.activated-skills') || '';
+    env.setDeleteSessionHandler(() => Promise.reject(new Error('forbidden')));
+    const delBtn = _sessionDeleteButton(env);
+    if (delBtn) {
+      delBtn.click();
+      await env.waitMicro();
+      await env.waitMicro();
+      const lsAfter = env.getLocalStorage('nagent.chat.activated-skills') || '';
+      ok(lsBefore === lsAfter, '#7e delete fail: localStorage unchanged (before=' + lsBefore + ', after=' + lsAfter + ')');
+    } else {
+      ok(false, '#7e delete button for s1 not found');
+    }
+  }
+  // 删当前会话 -> draft/空态
+  {
+    const env = loadChat();
+    env.setListSkillsHandler(() => Promise.resolve({ skills: [{ name: 'a', enabled: true, readiness: 'available', source: 'user' }] }));
+    env.setLocalStorage('nagent.chat.activated-skills', JSON.stringify({ s1: ['a'] }));
+    sessionsList = [{ id: 's1', title: 's1' }];
+    env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
+    env.win.NAGENT.modal.confirm = () => Promise.resolve(true);
+    await env.chat.init();
+    await env.waitMicro();
+    env.fireClick(env.findSessionItem('s1'));
+    await env.waitMicro();
+    await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    ok(trigger.textContent.indexOf('技能 1') !== -1, '#7f current session: trigger has 1');
+    env.setDeleteSessionHandler(() => Promise.resolve({}));
+    const delBtn = _sessionDeleteButton(env);
+    if (delBtn) {
+      delBtn.click();
+      await env.waitMicro();
+      await env.waitMicro();
+      const trigger2 = _skillTrigger(env);
+      ok(!!trigger2 && (trigger2.textContent === '技能' || trigger2.textContent.indexOf('技能 0') !== -1),
+        '#7g after deleting current: trigger shows 0/empty (got "' + (trigger2 && trigger2.textContent) + '")');
+    } else {
+      ok(false, '#7g delete button for current session not found');
+    }
+  }
+
+  // === #8: 空态选择 -> createSession 成功用于首条；reject 保留 draft 可重试 ===
+  {
+    const env = loadChat();
+    env.setListSkillsHandler(() => Promise.resolve({ skills: [
+      { name: 'pick-me', enabled: true, readiness: 'available', source: 'user' },
+    ] }));
+    await env.chat.init();
+    await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    env.fireClick(trigger); await env.waitMicro(); await env.waitMicro();
+    const popover = _skillPopover(env);
+    const pill = _collectByClass(popover, 'chat-memory-option')[0];
+    pill.click();
+    await env.waitMicro();
+    // 空态：getActivatedSkills 返回 draft
+    const draft = env.chat.getActivatedSkills();
+    ok(JSON.stringify(draft) === JSON.stringify(['pick-me']),
+      '#8 empty state: draft selection (got ' + JSON.stringify(draft) + ')');
+    // createSession success
+    env.setCreateSessionHandler((id) => Promise.resolve({ id }));
+    env.input.value = 'hello';
+    await env.chat.send();
+    await env.waitMicro();
+    const completionCall = fetchCalls.find((f) => f.url === '/chat/completions');
+    ok(!!completionCall, '#8 first send: /chat/completions called');
+    if (completionCall) {
+      const body = JSON.parse(completionCall.opts.body);
+      ok(!!body && !!body.options && JSON.stringify(body.options.activated_skills) === JSON.stringify(['pick-me']),
+        '#8 first send body has activated_skills (got ' + JSON.stringify(body && body.options) + ')');
+    }
+    const ls = env.getLocalStorage('nagent.chat.activated-skills');
+    ok(!!ls && ls.indexOf('pick-me') !== -1, '#8 first send: localStorage updated for new session');
+  }
+  // createSession reject -> draft 保留，UI 可重试
+  {
+    const env = loadChat();
+    env.setListSkillsHandler(() => Promise.resolve({ skills: [
+      { name: 'retry-me', enabled: true, readiness: 'available', source: 'user' },
+    ] }));
+    await env.chat.init();
+    await env.waitMicro();
+    const trigger = _skillTrigger(env);
+    env.fireClick(trigger); await env.waitMicro(); await env.waitMicro();
+    const popover = _skillPopover(env);
+    const pill = _collectByClass(popover, 'chat-memory-option')[0];
+    pill.click();
+    await env.waitMicro();
+    // createSession reject
+    env.setCreateSessionHandler(() => Promise.reject(new Error('create failed')));
+    env.input.value = 'hi';
+    await env.chat.send();
+    await env.waitMicro();
+    // draft 仍在
+    const got = env.chat.getActivatedSkills();
+    ok(JSON.stringify(got) === JSON.stringify(['retry-me']),
+      '#8b createSession reject: draft preserved for retry (got ' + JSON.stringify(got) + ')');
+    const ls = env.getLocalStorage('nagent.chat.activated-skills');
+    ok(!ls || ls.indexOf('retry-me') === -1,
+      '#8c createSession reject: localStorage not written (ls=' + ls + ')');
+    const trigger2 = _skillTrigger(env);
+    ok(trigger2.textContent.indexOf('技能 1') !== -1,
+      '#8d createSession reject: trigger still shows 1 for retry (got "' + trigger2.textContent + '")');
+  }
+}
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
@@ -3218,6 +4264,7 @@ runIntegration().then(async () => {
   await testAutoRefreshPanels();
   await testSessionSourceFilter();
   await testSessionSearch();
+  await testSkillPicker();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

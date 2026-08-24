@@ -1,3 +1,5 @@
+import re
+
 from app.application.external_memory_manager import ExternalMemoryManager
 
 DEFAULT_AGENT_IDENTITY = (
@@ -150,12 +152,41 @@ def _section(title: str, body: str) -> str:
     return f"## {title}\n\n{body}".rstrip()
 
 
+def _markdown_code_span(value: str) -> str:
+    """Render untrusted text as one Markdown code span without heading injection."""
+    visible = value.replace("\r", "\\r").replace("\n", "\\n")
+    longest = max((len(run) for run in re.findall(r"`+", visible)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if visible.startswith(("`", " ")) or visible.endswith(("`", " ")) else ""
+    return f"{fence}{pad}{visible}{pad}{fence}"
+
+
+def _activated_skills_section(names: list[str]) -> str:
+    """Render the user's explicitly activated skills for this turn.
+
+    Distinct from the ``## Available Skills`` index: the index is discovery, this block
+    is the user's declared intent. Names are rendered as code spans so they can be passed
+    verbatim to ``skill_view``.
+    """
+    listed = ", ".join(_markdown_code_span(name) for name in names)
+    body = (
+        f"The user explicitly activated these skills for this request: {listed}. "
+        "Treat them as the user's declared intent for how the request should be handled. "
+        "Call skill_view(name) for each activated skill FIRST to read its full instructions, "
+        "then follow them -- never infer a skill's content from its name. "
+        "If an activated skill turns out to be irrelevant after reading it, do not force it. "
+        "Never claim that a skill was read or executed unless it actually was."
+    )
+    return _section("Activated Skills", body)
+
+
 def build_system_prompt(
     external_memory_manager: ExternalMemoryManager | None = None,
     enabled_override: list[str] | None = None,
     skills_index: str | None = None,
     browser_guidance: str | None = None,
     artifact_guidance: str | None = None,
+    activated_skills: list[str] | None = None,
 ) -> str:
     sections: list[str] = [
         _section("Identity", DEFAULT_AGENT_IDENTITY),
@@ -176,6 +207,8 @@ def build_system_prompt(
     ])
     if skills_index:
         sections.append(skills_index)
+    if activated_skills:
+        sections.append(_activated_skills_section(activated_skills))
     if external_memory_manager:
         ext_block = external_memory_manager.build_system_prompt(enabled_override=enabled_override)
         if ext_block:

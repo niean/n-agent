@@ -14,6 +14,7 @@ _INTERNAL_OPTION_KEYS = {
     "external_memory_enabled",
     "stream_event_sink",
     "persist_messages",
+    "activated_skills",
 }
 _ALLOWED_OPTION_KEYS = {"temperature", "top_p", "top_k", "stop_sequences", "cache_control", "thinking", "output_config"}
 _FINISH_REASON_MAP = {

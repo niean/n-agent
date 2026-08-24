@@ -18,6 +18,7 @@ _INTERNAL_OPTION_KEYS = {
     "force_compress",
     "max_iterations",
     "persist_messages",
+    "activated_skills",
 }
 
 

@@ -534,6 +534,7 @@ async def test_call_llm_captures_generation_params_filtered(tmp_path):
             "execution_context_mode": "auto",
             "external_memory_enabled": ["kb"],
             "stream_event_sink": None,
+            "activated_skills": ["a"],
         },
     )
     await runner.call_llm(state)
@@ -553,6 +554,7 @@ async def test_call_llm_captures_generation_params_filtered(tmp_path):
     assert "execution_context_mode" not in parsed
     assert "external_memory_enabled" not in parsed
     assert "stream_event_sink" not in parsed
+    assert "activated_skills" not in parsed
 
 
 @pytest.mark.asyncio

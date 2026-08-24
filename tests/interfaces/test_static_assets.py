@@ -35,6 +35,25 @@ class _StubProvider:
 
 from _css_utils import _css_rule_bodies, _css_media_blocks  # noqa: E402
 
+CHAT_JS = STATIC_DIR / 'chat.js'
+
+
+def _js_function_body(source, name):
+    """按函数名提取完整函数体（花括号配对），从声明行到闭合花括号。"""
+    pattern = re.compile(r'function\s+' + re.escape(name) + r'\s*\(')
+    match = pattern.search(source)
+    if match is None:
+        return None
+    open_brace = source.find('{', match.end())
+    depth, k = 1, open_brace + 1
+    while k < len(source) and depth > 0:
+        if source[k] == '{':
+            depth += 1
+        elif source[k] == '}':
+            depth -= 1
+        k += 1
+    return source[open_brace + 1:k - 1]
+
 
 def _client(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -1809,3 +1828,134 @@ def test_artifacts_shell_served_at_artifacts_path(tmp_path):
     assert res.status_code == 200
     assert 'id="app-sidebar"' in res.text
     assert 'id="tab-artifacts"' in res.text
+
+
+def test_chat_skill_popover_present():
+    """T5: 技能选择器核心 -- 静态资源锚点 + class 切片安全扫描。
+
+    锚点字符串仅约束结构与安全，不能代替行为测试。
+    """
+    chat_js = CHAT_JS.read_text(encoding='utf-8')
+    styles = (STATIC_DIR / 'styles.css').read_text(encoding='utf-8')
+
+    # 模块状态常量与持久化键
+    assert 'const ACTIVATED_SKILLS_KEY' in chat_js
+    assert "'nagent.chat.activated-skills'" in chat_js
+    assert 'const MAX_ACTIVATED_SKILLS = 10' in chat_js
+    assert "const SKILL_GROUP_ORDER = ['user', 'seed', 'agent']" in chat_js
+    assert "'user': '用户'" in chat_js
+    assert "'seed': '系统'" in chat_js
+    assert "'agent': '自建'" in chat_js
+    # 函数名（chat.js 顶层声明）
+    assert 'function loadAvailableSkills' in chat_js
+    assert 'function renderSkillUI' in chat_js
+    assert 'function getActivatedSkills' in chat_js
+    assert 'function closeSkillPopover' in chat_js
+    assert 'function handleSkillDocumentClick' in chat_js
+    assert 'function groupAvailableSkills' in chat_js
+    # 模块状态变量名
+    assert 'skillPopoverOpen' in chat_js
+    assert 'sessionActivatedSkills' in chat_js
+    assert 'draftActivatedSkills' in chat_js
+    assert 'skillsLoadSeq' in chat_js
+    assert 'availableSkillsLoaded' in chat_js
+    # 容器与药丸属性
+    assert "getElementById('chat-skill')" in chat_js
+    assert 'pill.dataset.skillName' in chat_js
+    # 数据源必须是 NAGENT.chat.send 内的 api.listSkills（不是 NAGENT.management）
+    assert "api.listSkills()" in chat_js
+    assert 'NAGENT.management.listSkills' not in chat_js
+    # trigger 计数与 .active 主色（整行唯一）
+    assert 'const skillCount = activeNames.length' in chat_js
+    assert "if (skillCount > 0) trigger.classList.add('active')" in chat_js
+    # aria-label 与文案
+    assert "'选择技能'" in chat_js
+    assert "'选择要激活的技能，可多选'" in chat_js
+    assert "'暂无可用技能'" in chat_js
+    # CSS 容器规则
+    assert '.chat-skill {' in styles
+
+    # class 切片安全扫描：renderSkillUI 内部不应出现 innerHTML
+    start = chat_js.index('function renderSkillUI')
+    end = chat_js.index('function handleSkillDocumentClick')
+    assert start != -1 and end != -1 and start < end
+    sk = chat_js[start:end]
+    assert "trigger.className = 'chat-memory-trigger'" in sk
+    assert "popover.className = 'chat-memory-popover'" in sk
+    assert "pill.className = 'chat-memory-option'" in sk
+    assert 'innerHTML' not in sk
+
+
+def test_chat_skill_composer_wiring():
+    """T6: 容器装配、三方互斥与会话生命周期挂钩 -- 静态锚点。
+
+    request/export (T7) 断言并入此用例，确保 T7 RED 也复用同一基线。
+    """
+    chat_js = CHAT_JS.read_text(encoding='utf-8')
+    styles = (STATIC_DIR / 'styles.css').read_text(encoding='utf-8')
+
+    # 容器装配：三个容器一致以 sendBtn 为参照
+    assert "skillContainer.id = 'chat-skill'" in chat_js
+    assert "skillContainer.className = 'chat-skill'" in chat_js
+    assert 'composerBar.insertBefore(skillContainer, sendBtn)' in chat_js
+    assert 'composerBar.insertBefore(settingsContainer, sendBtn)' in chat_js
+    assert 'composerBar.appendChild(skillContainer)' in chat_js
+
+    # 顺序断言：em -> skill -> settings（三方互斥参照）
+    em_idx = chat_js.index('insertBefore(emContainer')
+    sk_idx = chat_js.index('insertBefore(skillContainer')
+    st_idx = chat_js.index('insertBefore(settingsContainer')
+    assert 0 <= em_idx < sk_idx < st_idx, (
+        'order: em -> skill -> settings required (em=' + str(em_idx)
+        + ', sk=' + str(sk_idx) + ', st=' + str(st_idx) + ')'
+    )
+
+    # 三方互斥：handlePopoverMutualExclusion 必须含 #chat-skill 分支
+    assert "target.closest('#chat-skill')" in chat_js
+    assert "document.addEventListener('click', handleSkillDocumentClick)" in chat_js
+    assert "document.addEventListener('click', handlePopoverMutualExclusion, true)" in chat_js
+
+    # 会话生命周期挂钩
+    assert 'sessionActivatedSkills = loadActivatedSkills()' in chat_js
+    assert 'delete sessionActivatedSkills[session.id]' in chat_js
+    # selectSession 体内必须含 draftActivatedSkills = null + renderSkillUI()
+    sel_start = chat_js.index('async function selectSession')
+    sel_end = chat_js.index('async function ensureSession')
+    assert 0 <= sel_start < sel_end, 'selectSession must precede ensureSession in chat.js'
+    sel_body = chat_js[sel_start:sel_end]
+    assert 'draftActivatedSkills = null' in sel_body
+    assert 'renderSkillUI()' in sel_body
+
+    # ensureSession 体内必须含 draft 提升逻辑
+    ens_start = chat_js.index('async function ensureSession')
+    ens_end = chat_js.index('function sessionHasBrowserTool')
+    assert 0 <= ens_start < ens_end
+    ens_body = chat_js[ens_start:ens_end]
+    assert 'draftActivatedSkills' in ens_body
+    assert 'sessionActivatedSkills[id] = [...draftActivatedSkills]' in ens_body
+
+    # handleDelete 体内必须清目标键
+    del_start = chat_js.index('async function handleDelete')
+    del_end = chat_js.index('async function selectSession')
+    assert 0 <= del_start < del_end
+    del_body = chat_js[del_start:del_end]
+    assert 'delete sessionActivatedSkills[session.id]' in del_body
+
+    # T7: 请求组装（getActivatedSkills 必须出现在 buildChatRequestBody 内）
+    build_body = _js_function_body(chat_js, 'buildChatRequestBody')
+    assert build_body is not None
+    assert 'getActivatedSkills()' in build_body
+    assert build_body.count('getActivatedSkills()') == 1, (
+        'buildChatRequestBody must call getActivatedSkills() exactly once (got '
+        + str(build_body.count('getActivatedSkills()')) + ')'
+    )
+    # body.options 字段：按需创建、独立判定、不覆盖
+    assert 'body.options.activated_skills = activated' in chat_js
+    assert 'body.options = body.options || {}' in chat_js
+    assert "body.options = { external_memory_enabled: getExternalMemoryEnabled() }" not in chat_js
+    # 导出面：setDebugSettings, getActivatedSkills 必须带尾随逗号
+    assert 'setDebugSettings, getActivatedSkills' in chat_js
+    # 样式：与 .chat-settings 保持一致
+    assert '.chat-skill {' in styles
+    sk_block = styles[styles.index('.chat-skill {'):styles.index('.chat-skill {') + 200]
+    assert 'position: relative' in sk_block

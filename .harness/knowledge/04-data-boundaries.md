@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact） -->
 # 数据与类型边界
 
 ## 领域模型
@@ -183,7 +183,7 @@ mcp_tools(id, site_id, remote_name, local_name UNIQUE, description, input_schema
 knowledge_bases(id, name UNIQUE, description, base_type, base_url, dataset_id, api_key, enabled, default_top_k, default_min_score, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 external_memory_providers(id, name UNIQUE, provider_type, base_url, api_key, enabled, extra_config, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
 external_memory_global_config(id INTEGER PRIMARY KEY CHECK (id = 1), enabled_providers TEXT, updated_at)
-skills(id, name UNIQUE, relative_path, description, platforms_json, frontmatter_json, enabled, readiness, last_scan_status, last_scan_error, last_seen_at, source, created_at, updated_at)
+skills(id, name UNIQUE, relative_path, description, platforms_json, frontmatter_json, enabled, readiness, last_scan_status, last_scan_error, last_seen_at, source, created_at, updated_at, chat_selectable)
 plugins(id, key UNIQUE, name, version, description, author, kind, source, source_path, enabled, config_json, capabilities_json, manifest_json, last_scan_status, last_scan_error, last_scanned_at, created_at, updated_at)
 plugin_secrets(plugin_key, field_name, secret_value, updated_at, PRIMARY KEY(plugin_key, field_name), FOREIGN KEY(plugin_key) REFERENCES plugins(key) ON DELETE CASCADE)
 scheduled_tasks(id, name, prompt, cron_expression, timezone, enabled, status, session_id, origin_json, delivery_target, delivery_context_json, execution_policy_json, next_run_at, lease_until, lease_owner, claim_id, last_run_at, last_status, last_error, last_delivery_error, unread_count, created_at, updated_at)
@@ -220,7 +220,7 @@ CREATE UNIQUE INDEX idx_providers_active ON providers(is_active) WHERE is_active
 
 该 partial unique index 保证全表至多一条 active 记录，由 `SQLiteProviderRegistry.set_active` 通过先 `UPDATE is_active=0 WHERE is_active=1` 再 `UPDATE is_active=1 WHERE id=?` 实现切换；providers.api_key 与 knowledge_bases.api_key 列以明文形式落地 `locals/sessions.db`，依赖 Docker volume 持久化与文件系统隔离保护，不通过 HTTP 暴露、不写入日志。KnowledgeBase 更新中 `api_key=None` 表示保持不变，空字符串表示清空，非空字符串表示覆盖。external_memory_providers 表存储 mem0/holographic/honcho 三类检索记忆 provider 配置，`at-most-one-enabled` 约束由 `SQLiteExternalMemoryProviderRegistry._assert_no_other_enabled` 在 create/update enabled=True 时校验；api_key 三态更新同 providers/knowledge_bases；holographic adapter 的 facts 数据存储在 extra_config.db_path 指向的独立 SQLite 文件（默认 `locals/external-memory/holographic.db`），不与 sessions.db 共享。
 
-skills 表 source 列（TEXT NOT NULL DEFAULT 'user'）记录 SkillSource（seed/agent/user），迁移幂等（PRAGMA table_info 检查列存在再 ALTER TABLE ADD COLUMN）；replace_all 操作保留既有 source 值，防止 agent/seed 来源的 Skill 被 rescan 降级为 user。skill_usage 表与 skill_pending_writes 表分别由 SkillUsageStore、SkillPendingStore 实现，与 sessions.db 共享 path 但使用独立连接：skill_usage 记录 Skill 使用遥测（use_count/view_count/patch_count 等），skill_pending_writes 在 write_approval gate 开启时持久化 staged writes，state 取值 pending/approved_in_progress/approved/rejected/failed，重启后仍存活。
+skills 表 source 列（TEXT NOT NULL DEFAULT 'user'）记录 SkillSource（seed/agent/user），迁移幂等（PRAGMA table_info 检查列存在再 ALTER TABLE ADD COLUMN）；replace_all 操作保留既有 source 值，防止 agent/seed 来源的 Skill 被 rescan 降级为 user。skills 表 chat_selectable 列（INTEGER NOT NULL DEFAULT 1）记录该 Skill 是否出现在对话输入框的"技能"选择器中（与 enabled 独立：停用 Skill 不强制隐藏，停用后再启用仍按各自最新值生效），迁移幂等（PRAGMA table_info 检查列存在再 ALTER TABLE ADD COLUMN）；replace_all 操作保留既有 chat_selectable 值，防止 rescan 把运行时设置重置为默认 True。skill_usage 表与 skill_pending_writes 表分别由 SkillUsageStore、SkillPendingStore 实现，与 sessions.db 共享 path 但使用独立连接：skill_usage 记录 Skill 使用遥测（use_count/view_count/patch_count 等），skill_pending_writes 在 write_approval gate 开启时持久化 staged writes，state 取值 pending/approved_in_progress/approved/rejected/failed，重启后仍存活。
 
 索引：
 
@@ -329,6 +329,12 @@ Browser 子系统复用 sessions.db（独立 `_connect()` + asyncio.to_thread + 
 - `browser_actions`：id PK、browser_session_id、action_type、arguments_summary_json（navigate 仅安全 URL 剥 userinfo/query/fragment；click/scroll 仅 element role/name；type 仅 char_count+clear_first，永不存完整 text）、status、safe_url、title、text_summary、warning_code、error_code、duration_ms、document_revision、created_at、FK session ON DELETE CASCADE；索引 (browser_session_id, created_at, id) 稳定 cursor 翻页
 
 登录态存储：Container profile_ref 映射 browser 服务持久卷目录；Host profile_ref 映射由宿主 Bridge 持有。cookies/localStorage/sessionStorage/password/autofill/payment 仅存在浏览器 profile，不进 DB/模型消息/日志/Artifact。截图落地 `locals/browser-screenshots/`（随机 ref + session->ref 元数据 + TTL/配额 + Close 清理），不进 browser_actions 或 tool_calls。
+
+Dashboard 浏览器侧 localStorage（按前缀 `nagent.chat.*`，会话维度无 DB 副本）：
+- `nagent.chat.debug`：会话级调试设置（`sessionDebugSettings` 与 `draftDebugSettings` 双轨，键为 `<sessionId>` -> `{showToolCalls, ...}`，空态 draft 仅内存，`ensureSession` 成功后提升到会话键）。
+- `nagent.chat.activated-skills`：会话级激活技能（`sessionActivatedSkills` 与 `draftActivatedSkills` 双轨，键为 `<sessionId>` -> `string[]`）。每个数组经前端归一（strip/去空/去重/保序/上限 10），坏 JSON 或非对象安全降级为 `{}`，不影响发送。删除会话清自己的键；空态选择不落盘，新建失败时 draft 保留可重试。请求体在 `body.options.activated_skills` 独立字段携带，与 `external_memory_enabled` 并存不耦合。
+- `nagent.chat.session-source-filter.v1`：会话来源筛选，Dashboard 会话列表使用。
+- 这三个键由 chat.js 直接读写，不进 SQLite、不进模型消息、不进日志/Artifact；与外部凭证隔离的 browser profile 存储边界一致。
 
 ## Artifact 子系统数据边界
 

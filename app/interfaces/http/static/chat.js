@@ -44,6 +44,18 @@
   // 仅当为 true 时才向 /chat/completions 携带 options.external_memory_enabled，
   // 未操作时不发送该字段，由后端按会话默认 profile 派生。
   let externalMemoryTouched = false;
+  // === 技能选择器状态（按会话独立，形态与记忆/设置弹框一致） ===
+  const ACTIVATED_SKILLS_KEY = 'nagent.chat.activated-skills';
+  // 与后端 _MAX_ACTIVATED_SKILLS 必须一致，否则 UI 显示数量与实际注入数量不符
+  const MAX_ACTIVATED_SKILLS = 10;
+  const SKILL_GROUP_ORDER = ['user', 'seed', 'agent'];
+  const SKILL_GROUP_LABELS = { 'user': '用户', 'seed': '系统', 'agent': '自建' };
+  let availableSkills = [];
+  let availableSkillsLoaded = false;
+  let skillsLoadSeq = 0;
+  let sessionActivatedSkills = {};
+  let draftActivatedSkills = null;
+  let skillPopoverOpen = false;
   // 后端真实默认模型 id，启动时从 /chat/models 拉取；硬编码占位符会导致
   // provider 拒绝 tool 调用（如 Ark "does not support agent plan feature"）。
   let defaultModel = '';
@@ -1961,6 +1973,11 @@
       delete sessionDebugSettings[session.id];
       saveDebugSettings();
     }
+    // 清理被删会话的技能选择，避免 localStorage 残留孤儿记录
+    if (Object.prototype.hasOwnProperty.call(sessionActivatedSkills, session.id)) {
+      delete sessionActivatedSkills[session.id];
+      saveActivatedSkills();
+    }
     if (currentSessionId === session.id) {
       stopAutoRefresh();
       renderedMessageVersion = null;
@@ -1972,6 +1989,7 @@
       // 当前会话已删：调试设置回落默认（draft 为空），刷新显隐与弹框勾选态
       applyDebugVisibility();
       renderSettingsUI();
+      renderSkillUI();
     }
     await loadSessions();
   }
@@ -1993,6 +2011,11 @@
     draftDebugSettings = null;
     applyDebugVisibility();
     renderSettingsUI();
+    // 会话切换：重置技能选择 draft，立即切换 trigger/药丸（不等详情）
+    draftActivatedSkills = null;
+    // 会话切换：关闭技能弹框，避免旧会话 UI 状态跨会话残留
+    skillPopoverOpen = false;
+    renderSkillUI();
     try {
       const detail = await api.getSessionDetail(id);
       if (id !== currentSessionId) return; // 切换串台防护
@@ -2032,8 +2055,15 @@
       saveDebugSettings();
       draftDebugSettings = null;
     }
+    // 空态勾选的技能转入新会话；未勾选则新会话用默认值（无映射记录）
+    if (draftActivatedSkills && draftActivatedSkills.length) {
+      sessionActivatedSkills[id] = [...draftActivatedSkills];
+      saveActivatedSkills();
+      draftActivatedSkills = null;
+    }
     applyDebugVisibility();
     renderSettingsUI();
+    renderSkillUI();
     // Chat 会话默认关闭 builtin 记忆，外部记忆需用户手动勾选。
     renderExternalMemoryUI();
     showEmptyState();
@@ -2319,7 +2349,14 @@
     // 仅当用户在本会话中操作过外部记忆勾选时才携带 options.external_memory_enabled；
     // 未操作时不发送该字段，由后端按会话默认 profile 派生（builtin 默认关闭）。
     if (externalMemoryTouched) {
-      body.options = { external_memory_enabled: getExternalMemoryEnabled() };
+      body.options = body.options || {};
+      body.options.external_memory_enabled = getExternalMemoryEnabled();
+    }
+    // 技能选择：按需注入；激活为空或会话未启用时不携带 options.activated_skills。
+    const activated = getActivatedSkills();
+    if (activated.length) {
+      body.options = body.options || {};
+      body.options.activated_skills = activated;
     }
     return body;
   }
@@ -2762,7 +2799,15 @@
       }
       return;
     }
-    await ensureSession();
+    try {
+      await ensureSession();
+    } catch (e) {
+      // createSession 失败：保留 draft，UI 可重试；只显示本地错误，不写持久化
+      appendMessage('system', '会话创建失败：' + ((e && e.message) || e), undefined, 'ui.task_command');
+      setSending(false);
+      input.focus();
+      return;
+    }
     input.value = '';
     const sentImages = pendingImages.slice();
     pendingImages = [];
@@ -3305,7 +3350,12 @@
     if (!target || !target.closest) return;
     if (target.closest('#chat-settings')) {
       closeMemoryPopover();
+      closeSkillPopover();
     } else if (target.closest('#chat-external-memory')) {
+      closeSettingsPopover();
+      closeSkillPopover();
+    } else if (target.closest('#chat-skill')) {
+      closeMemoryPopover();
       closeSettingsPopover();
     }
   }
@@ -3414,6 +3464,266 @@
     renderSettingsUI();
   }
 
+  // === 技能选择：按会话独立持久化，随请求以 options.activated_skills 下传 ===
+  function normalizeSkillNames(value) {
+    if (!Array.isArray(value)) return [];
+    const result = [];
+    value.forEach((item) => {
+      if (typeof item !== 'string') return;
+      const name = item.trim();
+      if (!name || result.includes(name) || result.length >= MAX_ACTIVATED_SKILLS) return;
+      result.push(name);
+    });
+    return result;
+  }
+
+  function loadActivatedSkills() {
+    try {
+      if (typeof localStorage === 'undefined') return {};
+      const raw = localStorage.getItem(ACTIVATED_SKILLS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+      const map = Object.create(null);
+      Object.keys(parsed).forEach((sid) => {
+        if (!sid.trim()) return;
+        if (Array.isArray(parsed[sid])) map[sid] = normalizeSkillNames(parsed[sid]);
+      });
+      return map;
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function saveActivatedSkills() {
+    try {
+      if (typeof localStorage === 'undefined') return;
+      localStorage.setItem(ACTIVATED_SKILLS_KEY, JSON.stringify(sessionActivatedSkills));
+    } catch (e) { /* ignore persistence failure */ }
+  }
+
+  // 当前上下文的原始选择：有会话读会话映射，无会话读 draft。
+  function getRawActivatedSkills() {
+    if (currentSessionId) {
+      return sessionActivatedSkills[currentSessionId] || [];
+    }
+    return draftActivatedSkills || [];
+  }
+
+  // 对外口径（展示计数 + 请求上报）：去重、保持用户选择顺序、上限 MAX_ACTIVATED_SKILLS，
+  // 并过滤已失效的名称。严禁在此写 localStorage —— 该函数位于请求组装路径上，
+  // 仅在至少一次成功响应后做实时过滤。`availableSkills.length === 0` 不能区分
+  // "成功空列表"和"从未成功加载"，因此必须用 availableSkillsLoaded 单独建模。
+  function getActivatedSkills() {
+    const raw = getRawActivatedSkills();
+    const live = availableSkillsLoaded ? new Set(availableSkills.map((s) => s.name)) : null;
+    const out = [];
+    raw.forEach((name) => {
+      if (typeof name !== 'string' || !name) return;
+      if (out.includes(name)) return;
+      if (live && !live.has(name)) return;
+      if (out.length >= MAX_ACTIVATED_SKILLS) return;
+      out.push(name);
+    });
+    return out;
+  }
+
+  function setActivatedSkills(next) {
+    const normalized = normalizeSkillNames(next);
+    if (currentSessionId) {
+      sessionActivatedSkills[currentSessionId] = normalized;
+      saveActivatedSkills();
+    } else {
+      draftActivatedSkills = normalized;
+    }
+  }
+
+  // 拉取可用技能：仅保留 enabled && readiness==='available' 且 name 为非空字符串的技能。
+  // 用递增序号拒绝过期响应（快速切换/重复点击）；失败或过期时保留上一次成功结果，不清空。
+  async function loadAvailableSkills(renderWhenClosed) {
+    const seq = ++skillsLoadSeq;
+    const sessionAtRequest = currentSessionId;
+    try {
+      const data = await api.listSkills();
+      if (seq !== skillsLoadSeq) return;
+      const list = Array.isArray(data && data.skills) ? data.skills : [];
+      const seen = new Set();
+      availableSkills = list.filter((s) => {
+        if (!(s && s.enabled === true && s.readiness === 'available'
+              && typeof s.name === 'string' && s.name.trim())) return false;
+        // 隐藏（chat_selectable === false）的 Skill 不在聊天弹框出现；
+        // 字段缺失视为默认可见（向后兼容旧响应/缓存）。
+        if (s.chat_selectable === false) return false;
+        if (seen.has(s.name)) return false;
+        seen.add(s.name);
+        return true;
+      });
+      availableSkillsLoaded = true;
+    } catch (e) {
+      if (seq !== skillsLoadSeq) return;
+      // 保留 availableSkills 上一次成功值，避免瞬时故障清空已有列表
+    }
+    // init 可要求关闭态首次渲染；弹框刷新仅在仍展开且会话归属未变时重渲染。
+    if (seq !== skillsLoadSeq) return;
+    if (renderWhenClosed || (skillPopoverOpen && currentSessionId === sessionAtRequest)) {
+      renderSkillUI();
+    }
+  }
+
+  function createSkillTriggerIcon() {
+    const svg = createSvgElement('svg', {
+      class: 'chat-memory-trigger__icon',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      'aria-hidden': 'true',
+    });
+    svg.append(
+      createSvgElement('path', {
+        d: 'M13 2L3 14h7l-1 8 10-12h-7l1-8z',
+        stroke: 'currentColor',
+        'stroke-width': '2',
+        'stroke-linecap': 'round',
+        'stroke-linejoin': 'round',
+      })
+    );
+    return svg;
+  }
+
+  function closeSkillPopover() {
+    if (!skillPopoverOpen) return;
+    skillPopoverOpen = false;
+    renderSkillUI();
+  }
+
+  // 按 source 分组（user/seed/agent，其余归入"其他"），组内按 name 升序。
+  function groupAvailableSkills() {
+    const groups = new Map();
+    SKILL_GROUP_ORDER.forEach((key) => groups.set(key, []));
+    availableSkills.forEach((s) => {
+      const key = SKILL_GROUP_ORDER.indexOf(s.source) !== -1 ? s.source : 'other';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(s);
+    });
+    const result = [];
+    groups.forEach((items, key) => {
+      if (!items.length) return;
+      items.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+      result.push({ key, label: SKILL_GROUP_LABELS[key] || '其他', items });
+    });
+    return result;
+  }
+
+  function renderSkillUI() {
+    const container = document.getElementById('chat-skill');
+    if (!container) return;
+    container.replaceChildren();
+
+    const activeNames = getActivatedSkills();
+    const skillCount = activeNames.length;
+
+    const bar = document.createElement('div');
+    bar.className = 'chat-memory-bar';
+
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.className = 'chat-memory-trigger';
+    trigger.title = '技能';
+    trigger.setAttribute('aria-haspopup', 'dialog');
+    trigger.setAttribute('aria-expanded', skillPopoverOpen ? 'true' : 'false');
+    const triggerLabel = document.createElement('span');
+    triggerLabel.className = 'chat-memory-trigger__label';
+    // 激活数 > 0 时 label 追加计数并加 .active（复用 .chat-memory-trigger.active 主色）
+    triggerLabel.textContent = skillCount > 0 ? '技能 ' + skillCount : '技能';
+    trigger.append(createSkillTriggerIcon(), triggerLabel);
+    if (skillCount > 0) trigger.classList.add('active');
+    trigger.addEventListener('click', (event) => {
+      event.stopPropagation();
+      skillPopoverOpen = !skillPopoverOpen;
+      renderSkillUI();
+      // 先展开再刷新列表：用缓存立即出框，响应回来后若未过期则重渲染
+      if (skillPopoverOpen) loadAvailableSkills();
+    });
+
+    bar.appendChild(trigger);
+    container.appendChild(bar);
+
+    if (skillPopoverOpen) {
+      const popover = document.createElement('div');
+      popover.className = 'chat-memory-popover';
+      popover.setAttribute('role', 'dialog');
+      popover.setAttribute('aria-label', '选择技能');
+      popover.addEventListener('click', (event) => event.stopPropagation());
+
+      const desc = document.createElement('div');
+      desc.className = 'chat-memory-popover__desc';
+      desc.textContent = '选择要激活的技能，可多选';
+      popover.appendChild(desc);
+
+      const groups = groupAvailableSkills();
+      if (!groups.length) {
+        const empty = document.createElement('div');
+        empty.className = 'chat-memory-popover__empty';
+        empty.textContent = '暂无可用技能';
+        popover.appendChild(empty);
+      } else {
+        const atCap = skillCount >= MAX_ACTIVATED_SKILLS;
+        groups.forEach((g) => {
+          const group = document.createElement('section');
+          group.className = 'chat-memory-popover__group';
+          const groupTitle = document.createElement('div');
+          groupTitle.className = 'chat-memory-popover__group-title';
+          groupTitle.textContent = g.label;
+          const groupItems = document.createElement('div');
+          groupItems.className = 'chat-memory-popover__group-items';
+          g.items.forEach((s) => {
+            const pill = document.createElement('button');
+            pill.type = 'button';
+            pill.className = 'chat-memory-option';
+            pill.textContent = s.name;
+            pill.dataset.skillName = s.name;
+            if (s.description) pill.title = s.description;
+            const on = activeNames.indexOf(s.name) !== -1;
+            if (on) pill.classList.add('active');
+            pill.setAttribute('aria-pressed', on ? 'true' : 'false');
+            // 达到上限后仅禁止继续新增，已选项仍可取消；不弹任何提示框
+            if (atCap && !on) {
+              pill.disabled = true;
+              pill.title = '最多可激活 ' + MAX_ACTIVATED_SKILLS + ' 个技能';
+            }
+            // 语义（已定，实现时不要"顺手修正"）：toggle 基于过滤后的可见集合，
+            // 因此一次显式点击会把已失效的名称一并从 localStorage 清出。这是有意
+            // 取舍：保证存储、UI 计数、上报三者恒等且原始集合永不超过 10 项。
+            // spec 只禁止"因短暂加载失败"改写选择，此处改写发生在成功加载 + 用户
+            // 显式操作之后，符合约束。
+            pill.addEventListener('click', () => {
+              const current = getActivatedSkills();
+              let next;
+              if (current.indexOf(s.name) !== -1) {
+                next = current.filter((n) => n !== s.name);
+              } else {
+                if (current.length >= MAX_ACTIVATED_SKILLS) return;
+                next = current.concat([s.name]);
+              }
+              setActivatedSkills(next);
+              renderSkillUI();
+            });
+            groupItems.appendChild(pill);
+          });
+          group.append(groupTitle, groupItems);
+          popover.appendChild(group);
+        });
+      }
+      container.appendChild(popover);
+    }
+  }
+
+  function handleSkillDocumentClick(event) {
+    const container = document.getElementById('chat-skill');
+    if (!skillPopoverOpen || (container && container.contains(event.target))) return;
+    skillPopoverOpen = false;
+    renderSkillUI();
+  }
+
   function getExternalMemoryEnabled() {
     const config = currentSessionId ? sessionExternalMemoryConfig[currentSessionId] : draftExternalMemoryConfig;
     if (!config?.modified) return [];
@@ -3511,6 +3821,7 @@
     renderArtifactPanel();
     document.addEventListener('click', handleMemoryDocumentClick);
     document.addEventListener('click', handleSettingsDocumentClick);
+    document.addEventListener('click', handleSkillDocumentClick);
     document.addEventListener('click', handlePopoverMutualExclusion, true);
     initImagePreview();
     // 激活态自动刷新：页面隐藏时停止（不浪费请求），可见时立即追赶一次并恢复周期。
@@ -3524,6 +3835,10 @@
     const emContainer = document.createElement('div');
     emContainer.id = 'chat-external-memory';
     emContainer.className = 'chat-external-memory';
+    // 技能选择容器：紧随记忆之后、调试设置之前，复用记忆弹框样式
+    const skillContainer = document.createElement('div');
+    skillContainer.id = 'chat-skill';
+    skillContainer.className = 'chat-skill';
     // 调试设置容器：紧随记忆之后、发送按钮之前，复用记忆弹框样式
     const settingsContainer = document.createElement('div');
     settingsContainer.id = 'chat-settings';
@@ -3531,15 +3846,20 @@
     if (composerBar) {
       if (sendBtn) {
         composerBar.insertBefore(emContainer, sendBtn);
+        composerBar.insertBefore(skillContainer, sendBtn);
         composerBar.insertBefore(settingsContainer, sendBtn);
       } else {
         composerBar.appendChild(emContainer);
+        composerBar.appendChild(skillContainer);
         composerBar.appendChild(settingsContainer);
       }
       loadExternalMemoryProviders();
       sessionDebugSettings = loadDebugSettings();
       renderSettingsUI();
       applyDebugVisibility();
+      sessionActivatedSkills = loadActivatedSkills();
+      renderSkillUI();
+      loadAvailableSkills(true);
     }
     showEmptyState();
     updateInfo({});
@@ -3557,5 +3877,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload, isSuccessfulBrowserScreenshot, setHeader, buildHeaderLinks, loadSessionViewLinks };
+  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, getActivatedSkills, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload, isSuccessfulBrowserScreenshot, setHeader, buildHeaderLinks, loadSessionViewLinks };
 }(window));

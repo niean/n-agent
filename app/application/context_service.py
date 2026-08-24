@@ -209,6 +209,49 @@ class ContextService:
             except Exception:
                 logger.warning("build_skills_index failed", exc_info=True)
 
+        # 用户在对话框显式激活的技能：与实时可用集合求交，保持用户选择顺序。
+        # 选中后技能可能被禁用或变为不可用，因此不能直接信任 run_options。
+        # 本函数是防御层（非 Dashboard 调用方可传任意 options），自行校验形状，
+        # 不依赖 chat_service 的归一化。
+        activated_skills: list[str] = []
+        raw_activated = state.run_options.get("activated_skills")
+        if raw_activated:
+            if not isinstance(raw_activated, list):
+                logger.warning("activated_skills is not a list; degraded to empty")
+            elif self.skill_service is None:
+                logger.warning("skill_service unavailable; activated skills degraded to empty")
+            else:
+                try:
+                    # Use list_chat_selectable (subset of list_for_llm filtered
+                    # by the per-skill chat_selectable toggle) so an admin
+                    # hidden Skill is dropped from the Activated list at the
+                    # server boundary; the LLM-facing index and
+                    # `## Available Skills` still flow through list_for_llm.
+                    live = await self.skill_service.list_chat_selectable()
+                    if live is None:
+                        logger.warning("list_chat_selectable returned None; activated skills degraded to empty")
+                        live = []
+                    live_names: set[str] = set()
+                    invalid_live_entries = 0
+                    for skill in live:
+                        name = getattr(skill, "name", None)
+                        if not isinstance(name, str) or not name.strip():
+                            invalid_live_entries += 1
+                            continue
+                        live_names.add(name)
+                    if invalid_live_entries:
+                        logger.warning(
+                            "list_chat_selectable returned %d entries without a valid name; ignored",
+                            invalid_live_entries,
+                        )
+                    activated_skills = [
+                        name for name in raw_activated
+                        if isinstance(name, str) and name in live_names
+                    ]
+                except Exception:
+                    logger.warning("activated skills filtering failed", exc_info=True)
+                    activated_skills = []
+
         state.working_messages = [
             {
                 "role": "system",
@@ -218,6 +261,7 @@ class ContextService:
                     skills_index,
                     browser_guidance=self._browser_guidance,
                     artifact_guidance=self._artifact_guidance,
+                    activated_skills=activated_skills,
                 ),
             },
             *[_message_to_provider(message) for message in context_messages],

@@ -236,6 +236,18 @@ class SkillService:
             if s.readiness is SkillReadiness.AVAILABLE
         ]
 
+    async def list_chat_selectable(self) -> list[Skill]:
+        """Skills exposed in the chat input skill popover.
+
+        Filters list_for_llm with the per-skill ``chat_selectable`` toggle so
+        admins can hide individual Skills from the dialog without disabling
+        them globally or removing them from the LLM-facing index.
+        """
+        return [
+            s for s in await self.list_for_llm()
+            if s.chat_selectable
+        ]
+
     async def build_skills_index(self) -> str:
         """Build a compact skill index section for the system prompt.
 
@@ -292,6 +304,12 @@ class SkillService:
         if skill is None:
             raise SkillNotFoundError(name)
         return await self.registry.set_enabled(name, enabled)
+
+    async def set_chat_selectable(self, name: str, value: bool) -> Skill:
+        skill = await self.registry.get_skill(name)
+        if skill is None:
+            raise SkillNotFoundError(name)
+        return await self.registry.set_chat_selectable(name, value)
 
     async def scan_now(self) -> SkillScanReport:
         skills, warnings = await self.loader.scan()
@@ -1094,6 +1112,9 @@ def _skill_from_input(payload: SkillInput, current: Skill | None = None) -> Skil
         last_seen_at=current.last_seen_at if current else None,
         created_at=current.created_at if current else None,
         updated_at=current.updated_at if current else None,
+        # 保留既有 source，避免 SEED/AGENT Skill 在编辑后被降级为 USER
+        # （SkillInput 不暴露 source 字段，因此构造时必须显式从 current 派生）
+        source=current.source if current else SkillSource.USER,
     )
 
 

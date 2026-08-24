@@ -44,6 +44,10 @@ _PROCESS_MESSAGE_SOURCES = frozenset({
     SessionSource.CURATOR.value,
 })
 
+# Upper bound on skills the chat composer may activate for a single run; keeps the
+# Activated Skills prompt section bounded regardless of client payload size.
+_MAX_ACTIVATED_SKILLS = 10
+
 
 class ActiveExternalMemoryReader(Protocol):
     def get_active_provider_names(self) -> list[str]: ...
@@ -226,6 +230,9 @@ class ChatCompletionService:
         if _detect_conversational_compress(first_user_message):
             options["force_compress"] = True
         options["external_memory_enabled"] = locked_external_memory
+        options["activated_skills"] = self._normalize_activated_skills(
+            request.options.get("activated_skills")
+        )
         # Read execution_mode from trusted_metadata (structured, T11) with
         # fallback to options dict (backward compat for existing callers).
         task_delegation_capability = request.trusted_metadata.get(
@@ -485,6 +492,26 @@ class ChatCompletionService:
         enabled.extend(projects)
         enabled.extend(external_query)
         return enabled
+
+    def _normalize_activated_skills(self, value: Any) -> list[str]:
+        """Shape-normalize the composer's activated-skill selection.
+
+        Existence is NOT validated here -- context_service re-filters against the live
+        available set at prompt-build time. Non-list input degrades to empty rather than
+        raising, so a malformed client payload cannot fail the run.
+        """
+        if not isinstance(value, list):
+            return []
+        names: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            name = item.strip()
+            if name and name not in names:
+                names.append(name)
+                if len(names) >= _MAX_ACTIVATED_SKILLS:
+                    break
+        return names
 
 
 def _mcp_tool_execution_context(user_message: str) -> ToolExecutionContext:

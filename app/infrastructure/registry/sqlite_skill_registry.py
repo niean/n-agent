@@ -34,12 +34,14 @@ def _initialize_skill_schema(conn: sqlite3.Connection) -> None:
             last_seen_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'user'
+            source TEXT NOT NULL DEFAULT 'user',
+            chat_selectable INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled);
         """
     )
     _migrate_add_source_column(conn)
+    _migrate_add_chat_selectable_column(conn)
 
 
 def _migrate_add_source_column(conn: sqlite3.Connection) -> None:
@@ -50,6 +52,18 @@ def _migrate_add_source_column(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
     if "source" not in columns:
         conn.execute("ALTER TABLE skills ADD COLUMN source TEXT NOT NULL DEFAULT 'user'")
+
+
+def _migrate_add_chat_selectable_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add `chat_selectable` column to legacy skills tables.
+
+    Existing rows default to 1 (True). Mirrors the `source` migration.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
+    if "chat_selectable" not in columns:
+        conn.execute(
+            "ALTER TABLE skills ADD COLUMN chat_selectable INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 class SQLiteSkillRegistry(SkillRegistry):
@@ -90,7 +104,7 @@ class SQLiteSkillRegistry(SkillRegistry):
                         UPDATE skills
                         SET relative_path = ?, description = ?, platforms_json = ?, frontmatter_json = ?,
                             enabled = ?, readiness = ?, last_scan_status = ?, last_scan_error = ?,
-                            last_seen_at = ?, updated_at = ?, source = ?
+                            last_seen_at = ?, updated_at = ?, source = ?, chat_selectable = ?
                         WHERE name = ?
                         """,
                         (
@@ -99,7 +113,8 @@ class SQLiteSkillRegistry(SkillRegistry):
                             int(skill.enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
                             _dt_str(skill.last_seen_at), now.isoformat(),
-                            skill.source.value, skill.name,
+                            skill.source.value, int(skill.chat_selectable),
+                            skill.name,
                         ),
                     )
                 else:
@@ -107,8 +122,8 @@ class SQLiteSkillRegistry(SkillRegistry):
                     conn.execute(
                         """
                         INSERT INTO skills(id, name, relative_path, description, platforms_json, frontmatter_json,
-                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at, source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at, source, chat_selectable)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             skill.id, skill.name, skill.relative_path, skill.description,
@@ -116,7 +131,7 @@ class SQLiteSkillRegistry(SkillRegistry):
                             int(skill.enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
                             _dt_str(skill.last_seen_at), created_at.isoformat(), now.isoformat(),
-                            skill.source.value,
+                            skill.source.value, int(skill.chat_selectable),
                         ),
                     )
         except sqlite3.IntegrityError as exc:
@@ -143,16 +158,34 @@ class SQLiteSkillRegistry(SkillRegistry):
         assert skill is not None
         return skill
 
+    async def set_chat_selectable(self, name: str, value: bool) -> Skill:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE skills SET chat_selectable = ?, updated_at = ? WHERE name = ?",
+                (int(bool(value)), now, name),
+            )
+            if cursor.rowcount == 0:
+                raise SkillNotFoundError(name)
+        skill = await self.get_skill(name)
+        assert skill is not None
+        return skill
+
     async def replace_all_skills(self, skills: Iterable[Skill]) -> list[Skill]:
         skills_list = list(skills)
         names = {s.name for s in skills_list}
         now = datetime.now(timezone.utc)
         with self._connect() as conn:
             existing_rows = conn.execute(
-                "SELECT name, enabled, created_at, source FROM skills"
+                "SELECT name, enabled, created_at, source, chat_selectable FROM skills"
             ).fetchall()
             existing = {
-                row["name"]: (bool(row["enabled"]), row["created_at"], row["source"])
+                row["name"]: (
+                    bool(row["enabled"]),
+                    row["created_at"],
+                    row["source"],
+                    bool(row["chat_selectable"]) if "chat_selectable" in row.keys() else True,
+                )
                 for row in existing_rows
             }
             if names:
@@ -172,13 +205,16 @@ class SQLiteSkillRegistry(SkillRegistry):
                 # Preserve the EXISTING source so a rescan does not downgrade an
                 # agent-created (source=agent) or seed skill back to USER.
                 source_value = prev[2] if prev else skill.source.value
+                # Preserve the EXISTING chat_selectable so a rescan does not
+                # reset a runtime "hide from chat" setting back to default.
+                chat_selectable_value = prev[3] if prev else skill.chat_selectable
                 if prev:
                     conn.execute(
                         """
                         UPDATE skills
                         SET relative_path = ?, description = ?, platforms_json = ?, frontmatter_json = ?,
                             enabled = ?, readiness = ?, last_scan_status = ?, last_scan_error = ?,
-                            last_seen_at = ?, updated_at = ?, source = ?
+                            last_seen_at = ?, updated_at = ?, source = ?, chat_selectable = ?
                         WHERE name = ?
                         """,
                         (
@@ -186,22 +222,24 @@ class SQLiteSkillRegistry(SkillRegistry):
                             json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
                             int(enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
-                            now.isoformat(), now.isoformat(), source_value, skill.name,
+                            now.isoformat(), now.isoformat(), source_value,
+                            int(chat_selectable_value), skill.name,
                         ),
                     )
                 else:
                     conn.execute(
                         """
                         INSERT INTO skills(id, name, relative_path, description, platforms_json, frontmatter_json,
-                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at, source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            enabled, readiness, last_scan_status, last_scan_error, last_seen_at, created_at, updated_at, source, chat_selectable)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             skill.id, skill.name, skill.relative_path, skill.description,
                             json.dumps(skill.platforms), json.dumps(skill.frontmatter.raw),
                             int(enabled), skill.readiness.value,
                             skill.last_scan_status, skill.last_scan_error,
-                            now.isoformat(), created_at.isoformat(), now.isoformat(), source_value,
+                            now.isoformat(), created_at.isoformat(), now.isoformat(),
+                            source_value, int(chat_selectable_value),
                         ),
                     )
         return await self.list_skills(include_disabled=True)
@@ -222,6 +260,11 @@ def _skill_from_row(row: sqlite3.Row) -> Skill:
         source = SkillSource(source_value) if source_value else SkillSource.USER
     except ValueError:
         source = SkillSource.USER
+    # chat_selectable column may be absent on legacy rows read mid-migration; default True.
+    try:
+        chat_selectable = bool(row["chat_selectable"])
+    except (IndexError, KeyError):
+        chat_selectable = True
     return Skill(
         id=row["id"], name=row["name"], relative_path=row["relative_path"],
         description=row["description"] or "",
@@ -233,6 +276,7 @@ def _skill_from_row(row: sqlite3.Row) -> Skill:
         created_at=_dt_parse(row["created_at"]),
         updated_at=_dt_parse(row["updated_at"]),
         source=source,
+        chat_selectable=chat_selectable,
     )
 
 

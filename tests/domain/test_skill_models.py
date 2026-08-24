@@ -56,6 +56,40 @@ def test_skill_entity_holds_metadata():
 def test_registry_is_protocol():
     assert hasattr(SkillRegistry, "list_skills")
     assert hasattr(SkillRegistry, "replace_all_skills")
+    assert hasattr(SkillRegistry, "set_chat_selectable")
+
+
+def test_skill_chat_selectable_defaults_true():
+    fm = SkillFrontmatter(
+        name="demo", description="", version="", platforms=["linux"], tags=[],
+        related_skills=[], author="", license="", setup_help=None,
+        required_env_vars=[], raw={},
+    )
+    skill = Skill(
+        id="id-1", name="demo", relative_path="demo/SKILL.md",
+        description="", platforms=["linux"], frontmatter=fm,
+        enabled=True, readiness=SkillReadiness.AVAILABLE,
+        last_scan_status="ok", last_scan_error=None,
+        last_seen_at=None, created_at=None, updated_at=None,
+    )
+    assert skill.chat_selectable is True
+
+
+def test_skill_chat_selectable_can_be_disabled():
+    fm = SkillFrontmatter(
+        name="demo", description="", version="", platforms=["linux"], tags=[],
+        related_skills=[], author="", license="", setup_help=None,
+        required_env_vars=[], raw={},
+    )
+    skill = Skill(
+        id="id-1", name="demo", relative_path="demo/SKILL.md",
+        description="", platforms=["linux"], frontmatter=fm,
+        enabled=True, readiness=SkillReadiness.AVAILABLE,
+        last_scan_status="ok", last_scan_error=None,
+        last_seen_at=None, created_at=None, updated_at=None,
+        chat_selectable=False,
+    )
+    assert skill.chat_selectable is False
 
 
 def test_exceptions_are_hierarchy():

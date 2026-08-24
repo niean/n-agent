@@ -166,3 +166,15 @@ printf '%s\n' \
     assert result.returncode == 0
     assert result.stdout.startswith("状态: approved\n修改数量: 0 项\n")
     assert result.stderr == ""
+
+
+def test_timeout_and_foreground_invocation_contract() -> None:
+    runner = (THIRD_REVIEW_SKILL / "scripts/run-review.sh").read_text(
+        encoding="utf-8"
+    )
+    skill = (THIRD_REVIEW_SKILL / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "${HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS:-900}" in runner
+    assert "Invoke the runner in the foreground" in skill
+    assert "must not append `&` or pipe the command" in skill
+    assert "provider and watchdog as managed background children" in skill

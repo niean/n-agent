@@ -132,6 +132,11 @@
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled: !!enabled }),
   });
+  const setSkillChatSelectable = (name, value) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_selectable: !!value }),
+  });
   const deleteSkill = (name) => fetchJson(`/chat/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
   const refreshSkills = () => fetchJson('/chat/skills/refresh', { method: 'POST' });
   const listPendingSkills = () => fetchJson('/chat/skills/pending');
@@ -322,6 +327,7 @@
     createSkill,
     updateSkill,
     setSkillEnabled,
+    setSkillChatSelectable,
     deleteSkill,
     refreshSkills,
     listPendingSkills,

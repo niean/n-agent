@@ -474,16 +474,17 @@ body.modal-open { overflow: hidden; }
 .memory-table--retrieval th:nth-child(5), .memory-table--retrieval td:nth-child(5) { width: 10%; min-width: 100px; text-align: center; } /* 探测 */
 .memory-table--retrieval th:nth-child(6), .memory-table--retrieval td:nth-child(6) { width: 10%; min-width: 100px; text-align: center; } /* 启用 */
 .memory-table--retrieval th:nth-child(7), .memory-table--retrieval td:nth-child(7) { width: 15%; min-width: 150px; } /* 操作 */
-/* Skills 表格 9列布局 - 名称、描述、来源、就绪状态、启用状态、健康状态、扫描状态、格式状态、操作 */
+/* Skills 表格 10列布局 - 名称、描述、来源、就绪状态、启用状态、对话可见、健康状态、扫描状态、格式状态、操作 */
 .skills-table th:nth-child(1), .skills-table td:nth-child(1) { width: 12%; min-width: 120px; white-space: nowrap; } /* 名称 */
-.skills-table th:nth-child(2), .skills-table td:nth-child(2) { width: 28%; white-space: normal; word-break: break-word; } /* 描述 - 自适应剩余宽度 */
+.skills-table th:nth-child(2), .skills-table td:nth-child(2) { width: 21%; white-space: normal; word-break: break-word; } /* 描述 - 自适应剩余宽度 */
 .skills-table th:nth-child(3), .skills-table td:nth-child(3) { width: 8%; min-width: 80px; white-space: nowrap; } /* 来源 */
 .skills-table th:nth-child(4), .skills-table td:nth-child(4) { width: 7%; min-width: 80px; text-align: center; white-space: nowrap; } /* 就绪状态 */
 .skills-table th:nth-child(5), .skills-table td:nth-child(5) { width: 7%; min-width: 80px; text-align: center; white-space: nowrap; } /* 启用状态 */
-.skills-table th:nth-child(6), .skills-table td:nth-child(6) { width: 7%; min-width: 80px; text-align: center; white-space: nowrap; } /* 健康状态 */
-.skills-table th:nth-child(7), .skills-table td:nth-child(7) { width: 7%; min-width: 80px; text-align: center; white-space: nowrap; } /* 扫描状态 */
-.skills-table th:nth-child(8), .skills-table td:nth-child(8) { width: 8%; min-width: 80px; text-align: center; white-space: nowrap; } /* 格式状态 */
-.skills-table th:nth-child(9), .skills-table td:nth-child(9) { width: 16%; min-width: 160px; white-space: nowrap; } /* 操作 */
+.skills-table th:nth-child(6), .skills-table td:nth-child(6) { width: 7%; min-width: 80px; text-align: center; white-space: nowrap; } /* 对话可见 */
+.skills-table th:nth-child(7), .skills-table td:nth-child(7) { width: 7%; min-width: 80px; text-align: center; white-space: nowrap; } /* 健康状态 */
+.skills-table th:nth-child(8), .skills-table td:nth-child(8) { width: 7%; min-width: 80px; text-align: center; white-space: nowrap; } /* 扫描状态 */
+.skills-table th:nth-child(9), .skills-table td:nth-child(9) { width: 8%; min-width: 80px; text-align: center; white-space: nowrap; } /* 格式状态 */
+.skills-table th:nth-child(10), .skills-table td:nth-child(10) { width: 16%; min-width: 160px; white-space: nowrap; } /* 操作 */
 .document-table td > .btn + .btn { margin-left: 5px; }
 .knowledge-tool-table th:nth-child(4), .knowledge-tool-table td:nth-child(4) { width: 32%; max-width: 460px; white-space: normal; word-break: break-word; }
 /* 工具列表 7列布局 - 名称、类型、分组、描述、风险等级、启用、操作 */
@@ -705,6 +706,8 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 
 /* 调试设置按钮：复用记忆弹框 trigger/popover/option 样式，仅新增定位容器 */
 .chat-settings { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
+/* 技能选择按钮：复用记忆弹框 trigger/popover/option 样式，仅新增定位容器 */
+.chat-skill { position: relative; flex: 0 0 auto; display: flex; align-items: center; }
 /* 调试显隐：设置弹框控制工具调用 / 任务状态 / 对话压缩卡片的可见性（按 data-debug-kind 标记） */
 #chat-messages.chat-debug--hide-tool [data-debug-kind="tool"] { display: none; }
 #chat-messages.chat-debug--hide-task [data-debug-kind="task"] { display: none; }

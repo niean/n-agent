@@ -8,7 +8,7 @@ from app.domain.skill import Skill, SkillFrontmatter, SkillNotFoundError, SkillR
 from app.interfaces.http.dashboard import create_dashboard_router
 
 
-def _skill(name, enabled=True, readiness=SkillReadiness.AVAILABLE, last_scan_status="ok", last_scan_error=None):
+def _skill(name, enabled=True, readiness=SkillReadiness.AVAILABLE, last_scan_status="ok", last_scan_error=None, chat_selectable=True):
     fm = SkillFrontmatter(
         name=name, description="d", version="", platforms=["linux"], tags=[],
         related_skills=[], author="", license="", setup_help=None,
@@ -20,6 +20,7 @@ def _skill(name, enabled=True, readiness=SkillReadiness.AVAILABLE, last_scan_sta
         enabled=enabled, readiness=readiness, last_scan_status=last_scan_status,
         last_scan_error=last_scan_error, last_seen_at=None,
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+        chat_selectable=chat_selectable,
     )
 
 
@@ -76,6 +77,13 @@ class _FakeSkillService:
             raise SkillNotFoundError(name)
         from dataclasses import replace
         self.skills[name] = replace(self.skills[name], enabled=enabled)
+        return self.skills[name]
+
+    async def set_chat_selectable(self, name, value):
+        if name not in self.skills:
+            raise SkillNotFoundError(name)
+        from dataclasses import replace
+        self.skills[name] = replace(self.skills[name], chat_selectable=bool(value))
         return self.skills[name]
 
     async def scan_now(self):
@@ -162,6 +170,60 @@ def test_patch_skill_enabled():
     res = client.patch("/chat/skills/alpha", json={"enabled": False})
     assert res.status_code == 200
     assert res.json()["enabled"] is False
+
+
+def test_patch_skill_chat_selectable_true():
+    client = _build_app(_FakeSkillService())
+    res = client.patch("/chat/skills/alpha", json={"chat_selectable": True})
+    assert res.status_code == 200
+    assert res.json()["chat_selectable"] is True
+
+
+def test_patch_skill_chat_selectable_false():
+    client = _build_app(_FakeSkillService())
+    res = client.patch("/chat/skills/alpha", json={"chat_selectable": False})
+    assert res.status_code == 200
+    assert res.json()["chat_selectable"] is False
+
+
+def test_patch_skill_chat_selectable_422_when_not_bool():
+    client = _build_app(_FakeSkillService())
+    res = client.patch("/chat/skills/alpha", json={"chat_selectable": "yes"})
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == "skill_invalid"
+
+
+def test_patch_skill_chat_selectable_404_when_missing():
+    client = _build_app(_FakeSkillService())
+    res = client.patch("/chat/skills/ghost", json={"chat_selectable": False})
+    assert res.status_code == 404
+    assert res.json()["error"]["code"] == "skill_not_found"
+
+
+def test_patch_skill_with_extra_keys_falls_through_to_full_update():
+    """`{chat_selectable, enabled}` must NOT match the single-field branch and should
+    continue to the full SkillInput update path (regression guard)."""
+    svc = _FakeSkillService()
+    client = _build_app(svc)
+    res = client.patch(
+        "/chat/skills/alpha",
+        json={"chat_selectable": False, "enabled": False},
+    )
+    # update_skill on the fake always sets chat_selectable=True (default). The
+    # router reaches update_skill, not set_chat_selectable, and the value goes
+    # through SkillInput(enabled=False) -> fake's _skill(enabled=False). The
+    # stored chat_selectable is the default (True), proving we did not call
+    # the dedicated endpoint.
+    assert res.status_code == 200
+    assert res.json()["chat_selectable"] is True
+    assert res.json()["enabled"] is False
+
+
+def test_list_skills_includes_chat_selectable():
+    client = _build_app(_FakeSkillService())
+    item = next(i for i in client.get("/chat/skills").json()["skills"] if i["name"] == "alpha")
+    assert "chat_selectable" in item
+    assert item["chat_selectable"] is True
 
 
 def test_create_update_delete_skill_metadata():

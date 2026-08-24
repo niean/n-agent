@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）、发布状态生命周期（新 Revision 不撤销 active publish->publish_sync_state=outdated 旧公链仍 200、重新发布才撤销旧 active+登记新 publish、metadata-only 不撤销、delete purge 发布记录+快照文件公链 404；头部状态栏+按钮切换）、Revision 版本与 CAS（expected_revision_id/If-Match 内容更新令牌、冲突 409 不静默覆写、rollback 生成新版本、diff 文本/二进制/混合）、Office 导出（DOCX/PPTX/XLSX 格式库仅 Infrastructure exporters.py、Domain exporter 端口）、Agent-native 工具与 artifact_guidance 装配、ui.artifact 卡片写工具成功持久化、task_complete workspace: ref 前置 probe 校验（不可读抛 TaskValidationError 让 worker 自纠正用 write_file/inline content，替代 finalize 后静默 drop）、goal_mode judge fork task_show 数据层 redact run 生命周期状态（task status 字段/runs/worker_context，避免 judge 看到 run 未 finalize 循环否决）、多 Agent 委派（_ServerSentinel capability 防伪造/指纹幂等重放/父级预算 reserve+ledger 恢复权威/delegation- 前缀隔离 session/cancel outbox at-least-once/capability 工具集签发时剥离 FORBIDDEN 工具）等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）、发布状态生命周期（新 Revision 不撤销 active publish->publish_sync_state=outdated 旧公链仍 200、重新发布才撤销旧 active+登记新 publish、metadata-only 不撤销、delete purge 发布记录+快照文件公链 404；头部状态栏+按钮切换）、Revision 版本与 CAS（expected_revision_id/If-Match 内容更新令牌、冲突 409 不静默覆写、rollback 生成新版本、diff 文本/二进制/混合）、Office 导出（DOCX/PPTX/XLSX 格式库仅 Infrastructure exporters.py、Domain exporter 端口）、Agent-native 工具与 artifact_guidance 装配、ui.artifact 卡片写工具成功持久化、task_complete workspace: ref 前置 probe 校验（不可读抛 TaskValidationError 让 worker 自纠正用 write_file/inline content，替代 finalize 后静默 drop）、goal_mode judge fork task_show 数据层 redact run 生命周期状态（task status 字段/runs/worker_context，避免 judge 看到 run 未 finalize 循环否决）、多 Agent 委派（_ServerSentinel capability 防伪造/指纹幂等重放/父级预算 reserve+ledger 恢复权威/delegation- 前缀隔离 session/cancel outbox at-least-once/capability 工具集签发时剥离 FORBIDDEN 工具）、Activated Skills 三层过滤（前端 getActivatedSkills / chat_service 形状归一 / context_service 实时求交）与技能名 Markdown code span 转义（阻断 prompt injection 伪造 heading）等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -1262,3 +1262,36 @@ Artifact 子系统统一 TaskAttachment + TaskArtifact 为 Artifact，提供 pre
 - 模型侧缺参容错：OpenAI-compatible provider 不强制 tool schema required 字段，`delegate_agents` 执行器禁止把缺失参数映射为必然非法哨兵值（空 delegation_key/0 timeout 必然 delegation_invalid 且不可重试、模型无从自纠）；`delegation_key` 缺失时按规范化请求派生确定性 `auto-{sha256}` key（同逻辑请求同 key，保持指纹重连语义），`timeout_seconds` 缺失/非正/非数值回落默认 300，错误 payload 附带 `message`（DelegationError.message）供模型自我纠正。
 - capability 工具集与工具暴露列表分离：签发 capability 时 `parent_allowed_tools`/`system_child_allowlist` 必须剥离 FORBIDDEN_CHILD_TOOLS（delegate_agents/审批/管理写工具）。调用方传入的 granted_tools 是"工具暴露列表"（task worker 合法包含 delegate_agents 供父调用），但 DelegationPolicy 检查 3(a) 禁止 parent_allowed_tools 与 FORBIDDEN_CHILD_TOOLS 相交 -> 原样透传会使 task 源委派 100% DENY（realtime 源因 granted_tools 通常为空而侥幸通过）。剥离在 `RealtimeDelegationAdapter.sign_capability` 与 `TaskDelegationAdapter.sign_task_capability` 两个签发点统一执行（P024）。
 - 委派结果脱敏前置持久化：ChildAgentExecutor 在写入 `delegation_results` 前，对 JSON 格式摘要应用结构化凭证字段脱敏；DelegationService 在 PARENT 边界再次执行同一防线和 InformationFlow 过滤。这样 `secret`、`credential` 等字段值不会进入结果库，也不会经父会话被 Dashboard 展示。
+
+## 模式三十七：Activated Skills 三层过滤与用户意图的端到端贯通
+
+会话级"技能激活"（Activated Skills）是用户对当前请求希望被哪些 Skill 显式启用的声明，与 `## Available Skills` 的发现索引职责分离。整条数据链路必须贯通三层职责分离的过滤，每层只做自己该做的事，三层合计构成 defense-in-depth。
+
+```
+GET /chat/skills (已存在)
+  -> api.listSkills()            chat.js: loadAvailableSkills()  过滤 enabled && readiness==='available' && chat_selectable !== false
+  -> localStorage(nagent.chat.activated-skills) 按 sessionId 分桶 + draft
+  -> buildChatRequestBody()      body.options.activated_skills
+  -> chat_service.complete()     options["activated_skills"] = _normalize_activated_skills(...)
+  -> AgentState.run_options
+  -> context_service.build_context_state()  与 skill_service.list_chat_selectable() 求交（保序）
+  -> prompt_builder.build_system_prompt(activated_skills=...)  ## Activated Skills
+```
+
+三层过滤与各自上限（必须一致，10）：
+
+- 前端 `getActivatedSkills()`：决定"用户能选什么、上报什么"，同时承担 UI 数量与后端注入数量的一致性；可因 `availableSkillsLoaded` 跳过失效名字，但不写 localStorage（spec 强制不变性，避免临时加载失败清空用户选择）；同时该函数本身就是 `chat_selectable !== false` 过滤后集合的子集，无需再独立筛一次。
+- `chat_service._normalize_activated_skills`：只做形状归一（去重/strip/裁剪到 10），不做存在性校验；写复制的 `options` 副本，不动 `request.options`。归一化早于 context 过滤，超出 10 的输入在这一层即被截断。
+- `context_service.build_context_state`：决定"模型真正看到什么"。`await skill_service.list_chat_selectable()` 返回实时可选集（list_for_llm 的子集，再按 chat_selectable 字段过滤），剔除期间被禁用/删除/被设为 chat_selectable=false 的名字；`skill_service is None`/抛错/返回 None/包含无效条目都降级为空并 `logger.warning`，不阻断主 turn。
+
+已知冗余：`build_skills_index()` 内部已调用一次 `list_for_llm()`（`skill_service.py:247`），context 过滤再调用 `list_chat_selectable()`（list_for_llm 的子集，每轮会再触发一次底层 `list_for_llm`），索引与激活集合共三次注册表查询。spec 明确采用该设计（索引职责与用户意图过滤职责分离，且 list_chat_selectable 在用户关闭某技能"对话可见"时立即生效），不要在实现中"顺手合并"。
+
+`activated_skills` 是控制键，与 `external_memory_enabled` 等同处理：必须加入三处 `_INTERNAL_OPTION_KEYS`（agent_graph / openai_compatible / anthropic_provider），否则会经 `**kwargs` 透传给 SDK，定时任务/unattended worker 以 `unexpected keyword argument` 整体失败（见模式三十三）。Anthropic 路径因 `_ALLOWED_OPTION_KEYS` 白名单天然屏蔽未知 key，`_INTERNAL_OPTION_KEYS` 在该路径属 defense-in-depth 不是冗余。
+
+技能名的 XSS 与 prompt injection 防御：
+- 前端：所有远端字段（name/description）经 `textContent` / `dataset` / `setAttribute` / `title` 渲染，禁 `innerHTML`。
+- 后端：技能名未受信任，注入系统提示前 `_markdown_code_span` 强制 Markdown code span 包裹（动态长度 backtick fence + `\n`/`\r` 可见化 + 起止空格 padding），阻断 `name\n## Injected` 这类伪造 heading 的攻击面。
+
+空态/draft 语义：用户在新会话中选技能会先存内存 `draftActivatedSkills`，不发 localStorage（避免页面刷新或新建失败时丢失）；`ensureSession` 仅在 `api.createSession` 成功后才把 draft 提升到 `sessionActivatedSkills[id]` 并落盘；`createSession` 失败时 draft 与 UI 都保留供重试。删除会话只清自己的键，删的是当前会话则重渲染空态。
+
+相关：模式八（System Prompt 属于 Application Runtime 上下文）、模式三十三（options 内部 key 过滤）、`spec-260824-chat-composer-skill.md` 与 `plan-260824-chat-composer-skill.md`。

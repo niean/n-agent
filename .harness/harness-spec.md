@@ -154,6 +154,12 @@ provider 协议：
 - 成功返回 0，不可用、超时、收到信号或执行失败返回非 0。runner 保留原始 provider 退出信息供 Skill 诊断。
 - provider 专属二进制路径、凭据、sandbox 参数和会话策略只能存在于适配器及其环境变量中；通用层不得依赖 ChatGPT Mac、特定 IDE 或固定安装路径。
 
+执行前后台边界：
+
+- Workflow/Skill 必须前台调用 runner 并等待 runner 自身退出码，禁止在命令末尾追加 `&`，也禁止直接通过 `| tail` 等管道取代 runner 的退出码。
+- 审阅通常耗时较长，runner 的单一期限默认 900 秒；外层命令期限不得短于 runner 期限加清理余量。除非当前任务有明确理由，不覆盖该默认值。
+- runner 内部仅将 provider 和 watchdog 作为受控后台子进程：输出进入 runner 临时文件或 `/dev/null`，结束时逐个 `wait`/终止并清理。provider adapter 自身保持 `exec` 前台语义，不另建后台任务或第二套 timeout。
+
 ### 7.5 provider 输出合同
 
 provider 应在成功时将 stdout 规范化为以下五个字段；字段名各出现一次，且不应在字段前后输出说明、Markdown 围栏或日志：

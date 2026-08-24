@@ -1322,3 +1322,130 @@ async def test_persist_messages_flag_propagated_to_runner_options(tmp_path):
     )
 
     assert runner.options.get("persist_messages") is False
+
+
+@pytest.mark.asyncio
+async def test_activated_skills_dedup_strip_and_preserve_order(tmp_path):
+    """activated_skills 归一：去重、strip、保持首次出现顺序。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="skills-dedup",
+            options={"activated_skills": ["b", "a", "b", " a ", ""]},
+        )
+    )
+
+    assert runner.options.get("activated_skills") == ["b", "a"]
+
+
+@pytest.mark.parametrize("raw", ["x", None, {}, 12])
+@pytest.mark.asyncio
+async def test_activated_skills_non_list_degrades_to_empty(tmp_path, raw):
+    """非 list 输入降级为空列表，不抛异常（畸形客户端载荷不能让本次运行失败）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="skills-non-list",
+            options={"activated_skills": raw},
+        )
+    )
+
+    assert runner.options.get("activated_skills") == []
+
+
+@pytest.mark.asyncio
+async def test_activated_skills_truncated_to_ten(tmp_path):
+    """超过 10 项时截断为前 10 项。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+    raw = [f"skill-{index}" for index in range(15)]
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="skills-cap",
+            options={"activated_skills": raw},
+        )
+    )
+
+    assert runner.options.get("activated_skills") == raw[:10]
+
+
+@pytest.mark.asyncio
+async def test_activated_skills_skips_non_str_items(tmp_path):
+    """含非 str 元素时跳过该元素，不抛异常。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="skills-non-str",
+            options={"activated_skills": ["a", 1, None, {"name": "b"}, ["c"], " d "]},
+        )
+    )
+
+    assert runner.options.get("activated_skills") == ["a", "d"]
+
+
+@pytest.mark.asyncio
+async def test_activated_skills_does_not_mutate_request_options(tmp_path):
+    """归一只写 options 副本，调用方传入的 request.options 原对象不被修改。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+    caller_options = {"activated_skills": ["b", "b", " a "]}
+
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="skills-no-mutate",
+            options=caller_options,
+        )
+    )
+
+    assert runner.options.get("activated_skills") == ["b", "a"]
+    assert caller_options == {"activated_skills": ["b", "b", " a "]}
+    assert "persist_messages" not in caller_options
+    assert "external_memory_enabled" not in caller_options
+
+
+@pytest.mark.asyncio
+async def test_activated_skills_absent_key_yields_empty_list(tmp_path):
+    """options 缺少 activated_skills 时 runner 收到 []，完成结果与旧路径一致。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+
+    result = await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id="skills-absent",
+        )
+    )
+
+    assert runner.options.get("activated_skills") == []
+    assert result.message["content"] == "ok"
+    assert result.finish_reason == "stop"

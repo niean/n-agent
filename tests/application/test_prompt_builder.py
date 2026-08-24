@@ -434,3 +434,43 @@ def test_artifact_guidance_mentions_terminal_task_fallback():
     assert "terminal state" in text
     assert "artifact_update" in text
     assert "retrying task_complete" in text
+
+
+def test_build_system_prompt_includes_activated_skills_after_index():
+    idx = "## Available Skills\n\n- general:\n  - foo: do foo"
+    prompt = build_system_prompt(skills_index=idx, activated_skills=["foo", "bar"])
+    assert "## Activated Skills" in prompt
+    assert "`foo`" in prompt and "`bar`" in prompt
+    assert "skill_view" in prompt
+    # 顺序：skills_index 在前，Activated Skills 在后
+    assert prompt.index("## Activated Skills") > prompt.index(idx)
+
+
+def test_build_system_prompt_omits_activated_skills_when_empty():
+    assert "## Activated Skills" not in build_system_prompt(activated_skills=[])
+    assert "## Activated Skills" not in build_system_prompt()
+
+
+def test_build_system_prompt_places_activated_skills_before_external_memory():
+    class Memory:
+        def build_system_prompt(self, enabled_override=None):
+            return "## External Memory\n\nmemory"
+
+    prompt = build_system_prompt(
+        external_memory_manager=Memory(),
+        skills_index="## Available Skills\n\n- general:\n  - foo",
+        activated_skills=["foo"],
+    )
+    assert prompt.index("## Available Skills") < prompt.index("## Activated Skills")
+    assert prompt.index("## Activated Skills") < prompt.index("## External Memory")
+
+
+def test_build_system_prompt_escapes_untrusted_skill_names_as_code_spans():
+    prompt = build_system_prompt(activated_skills=["safe`name", "line\n## Injected"])
+    activated = prompt[prompt.index("## Activated Skills"):]
+    assert "line\n## Injected" not in activated
+    assert "``safe`name``" in activated
+    assert "`line\\n## Injected`" in activated
+    # Plan text asserts "never claim"; the section body renders it sentence-initial
+    # ("Never claim ..."), so compare case-insensitively.
+    assert "never claim" in activated.lower()

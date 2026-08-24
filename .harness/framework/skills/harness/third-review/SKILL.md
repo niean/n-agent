@@ -21,8 +21,8 @@ Accept optional non-empty `provider` and `model`. Reject NUL or newline in model
 ## Execute
 
 1. Validate all inputs and evidence before invoking a shell. For a retry, validate again and establish a new invocation identity; all earlier results and skip confirmations become stale.
-2. From the Git repository root, apply explicit non-empty provider/model values only to this invocation through `HARNESS_THIRD_REVIEW_PROVIDER` and `HARNESS_THIRD_REVIEW_MODEL`. The review deadline is a runner-owned framework setting: `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS` (integer seconds, 1-86400, default 900), validated and enforced by the runner watchdog as the single deadline; provider adapters must not implement their own timeouts.
-3. Invoke:
+2. From the Git repository root, apply explicit non-empty provider/model values only to this invocation through `HARNESS_THIRD_REVIEW_PROVIDER` and `HARNESS_THIRD_REVIEW_MODEL`. The review deadline is a runner-owned framework setting: `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS` (integer seconds, 1-86400, default 900), validated and enforced by the runner watchdog as the single deadline; provider adapters must not implement their own timeouts. Because reviews commonly take several minutes, keep the 900-second default unless an explicit task requirement justifies another value, and ensure any outer command timeout is not shorter than the runner deadline plus cleanup time.
+3. Invoke the runner in the foreground and wait for its own exit status. The caller must not append `&` or pipe the command through `tail` or another consumer that replaces the runner exit status. The runner itself starts only the provider and watchdog as managed background children, redirects their output to runner-owned files or `/dev/null`, and explicitly waits for or terminates them before returning. Invoke:
 
    ```sh
    sh .harness/framework/skills/harness/third-review/scripts/run-review.sh spec <target_file>
