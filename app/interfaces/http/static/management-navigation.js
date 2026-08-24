@@ -4,9 +4,8 @@
     { tab: 'summary', path: '/summary', label: '概览' },
     { tab: 'chat', path: '/chat', label: '对话' },
     { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '定时任务' },
-    { tab: 'tasks', path: '/tasks', label: '任务' },
-    { tab: 'artifacts', path: '/artifacts', label: '制品' },
     { tab: 'sessions', path: '/sessions', label: '会话' },
+    { tab: 'tasks', path: '/tasks', label: '任务' },
     { tab: 'memory', path: '/memory', label: '记忆' },
     { tab: 'tools', label: '工具', parent: true, children: ['tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin'] },
     { tab: 'tools-knowledge', path: '/tools/knowledge', label: '知识', parentTab: 'tools' },
@@ -17,13 +16,14 @@
     { tab: 'executors', label: '执行器', parent: true, children: ['sandbox', 'executors-host', 'browser'] },
     { tab: 'sandbox', path: '/sandbox', label: '沙盒', parentTab: 'executors' },
     { tab: 'executors-host', path: '/executors/host', label: '本机', parentTab: 'executors' },
+    { tab: 'browser', path: '/browser', label: '浏览器', parentTab: 'executors' },
+    { tab: 'artifacts', path: '/artifacts', label: '制品' },
     { tab: 'models', path: '/models', label: '模型' },
     { tab: 'platforms', path: '/platforms', label: '平台' },
     { tab: 'observations', label: '观测', parent: true, children: ['observations-sessions', 'observations-modules'] },
     { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', parentTab: 'observations' },
     { tab: 'observations-modules', path: '/observations/modules', label: '组件', parentTab: 'observations' },
     { tab: 'security', path: '/security', label: '安全' },
-    { tab: 'browser', path: '/browser', label: '浏览器', parentTab: 'executors' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
   const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));

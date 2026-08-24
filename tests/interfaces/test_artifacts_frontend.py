@@ -4,8 +4,8 @@ Covers:
 - artifacts.js present, served, node --check passes
 - index.html: artifacts.js script tag BEFORE app.js; #tab-artifacts container
   unique and default-hidden
-- management-navigation.js: '制品' tabConfig entry AFTER tasks, BEFORE
-  scheduled-tasks
+- management-navigation.js: '制品' tabConfig entry AFTER the complete executors
+  group, BEFORE models
 - app.js: artifacts integrated into initialized map + resolveModule
 - nav item hidden by default; artifacts.js probes API and only shows nav
   on success (disabled/missing API -> nav stays hidden)
@@ -80,25 +80,48 @@ def test_artifacts_tab_container_unique_and_default_hidden():
     assert "hidden" in opening, "tab-artifacts must be hidden by default"
 
 
-def test_nav_order_scheduled_tasks_artifacts_in_tabconfig():
-    """management-navigation.js tabConfig: 定时任务在任务上方，制品在任务下方
-    (prd 03-specs L80: 左导定时任务调整到任务上方)。顺序: scheduled-tasks -> tasks -> artifacts。"""
+def test_nav_order_artifacts_below_executors_in_tabconfig():
+    """management-navigation.js: 制品是执行器完整分组之后的一级入口。"""
     src = NAV_JS.read_text(encoding="utf-8")
     assert "'artifacts'" in src or '"artifacts"' in src, "artifacts tab not in tabConfig"
     assert "/artifacts" in src, "artifacts path not in tabConfig"
     assert "制品" in src, "artifacts label '制品' not in tabConfig"
-    # tabConfig order: scheduled-tasks -> tasks -> artifacts (prd: 定时任务调到任务上方)
-    assert src.index("'scheduled-tasks'") < src.index("'tasks'") < src.index("'artifacts'"), \
-        "tabConfig order must be scheduled-tasks -> tasks -> artifacts"
+    assert src.index("tab: 'executors'") < src.index("tab: 'sandbox'") \
+        < src.index("tab: 'executors-host'") < src.index("tab: 'browser'") \
+        < src.index("tab: 'artifacts'") < src.index("tab: 'models'"), \
+        "tabConfig order must be executors -> sandbox -> executors-host -> browser -> artifacts -> models"
+    for tab in ("sandbox", "executors-host", "browser"):
+        start = src.index("tab: '" + tab + "'")
+        end = src.index("},", start)
+        assert "parentTab: 'executors'" in src[start:end], f"{tab} must remain an executors child"
+    artifacts_start = src.index("tab: 'artifacts'")
+    artifacts_end = src.index("},", artifacts_start)
+    assert "parentTab" not in src[artifacts_start:artifacts_end], "artifacts must remain a top-level entry"
 
 
-def test_nav_order_scheduled_tasks_artifacts_in_index_html_sidebar():
-    """index.html sidebar: 定时任务在任务上方，制品在任务下方
-    (prd 03-specs L80)。顺序: scheduled-tasks -> tasks -> artifacts。"""
+def test_nav_order_artifacts_below_executors_in_index_html_sidebar():
+    """index.html sidebar: 制品位于完整执行器分组之后、模型之前。"""
     html = INDEX_HTML.read_text(encoding="utf-8")
-    assert html.index('data-tab="scheduled-tasks"') < html.index('data-tab="tasks"') \
-        < html.index('data-tab="artifacts"'), \
-        "sidebar order must be scheduled-tasks -> tasks -> artifacts (prd: 定时任务调到任务上方)"
+    group_start = html.index('data-tab-group="executors"')
+    group_open = html.rfind('<div', 0, group_start)
+    depth = 0
+    group_end = None
+    for match in re.finditer(r'</?div\b[^>]*>', html[group_open:]):
+        if match.group(0).startswith('</'):
+            depth -= 1
+            if depth == 0:
+                group_end = group_open + match.end()
+                break
+        else:
+            depth += 1
+    assert group_end is not None, "executors group must have a matching closing div"
+    artifacts_index = html.index('data-tab="artifacts"')
+    assert group_start < group_end < artifacts_index < html.index('data-tab="models"'), \
+        "sidebar order must be executors group -> artifacts -> models"
+    group_html = html[group_open:group_end]
+    assert group_html.index('data-tab="sandbox"') < group_html.index('data-tab="executors-host"') \
+        < group_html.index('data-tab="browser"')
+    assert 'data-tab="artifacts"' not in group_html
 
 
 def test_artifacts_nav_item_hidden_by_default_in_index_html():

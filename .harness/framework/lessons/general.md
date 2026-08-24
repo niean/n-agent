@@ -51,3 +51,20 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 来源：2026-08-23 third-review run-review.sh watchdog/monitor 孤儿 sleep 导致 $(...) 捕获阻塞 900 秒
 
 ---
+
+### L004: Third Review 的 approved/0 项 可能是 provider 静默失败的兜底结果
+
+现象：third-review runner 返回"状态: approved / 修改数量: 0 项"，看起来审阅通过，实际 provider 一个字都没审——stdout 为空，stderr 是 `failed to initialize in-process app-server client: Operation not permitted`。
+
+根因：两层叠加。一是 runner 在格式非法时走"目标变更兜底"，只比对目标文件哈希，文件未变即判 approved/0 项，provider 的真实 stdout 落在会被 EXIT trap 删除的临时目录里，从不回显；二是 codex 这类 provider 需要创建 PATH alias 和本地 app-server，放进受限沙箱或后台任务执行会初始化失败，且失败时仍可能以退出码 0 结束。
+
+教训：
+1. 收到 approved/0 项时，必须同时看 stderr 有没有 `structured summary was invalid; using target-change fallback`；出现这句就说明五行摘要不是 provider 给的，不能当审阅通过
+2. provider 类命令在前台、非沙箱环境执行；后台任务或沙箱内跑到的"失败"是环境结论，不是审阅结论
+3. 需要看 provider 原文时，用 `HARNESS_THIRD_REVIEW_CODEX_BIN` 指向只做 tee 的包装脚本，保留 runner 的边界检查，不改框架文件
+4. 判断 runner 成败要取 runner 自己的退出码；`cmd | tail` 后的 `$?` 是 tail 的退出码，不能作为成功证据
+5. `git hash-object` 是纯内容哈希，对 untracked/gitignored 文件同样有效，目标变更检测不因文件未被追踪而失效
+
+来源：2026-08-24 spec-260824-chat-composer-skill 三方审阅首轮被误报 approved，前台非沙箱重跑后真实结果为 fixed/24 项
+
+---

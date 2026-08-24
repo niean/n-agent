@@ -47,6 +47,14 @@ function makeEl() {
     replaceChildren() { kids.forEach((k) => { k.parentNode = null; }); kids.length = 0; },
     append() { const args = Array.prototype.slice.call(arguments); args.forEach((c) => { if (c && c.tagName === '#document-fragment') { while (c._kids && c._kids.length > 0) { const child = c._kids.shift(); child.parentNode = this; kids.push(child); } } else { c.parentNode = this; kids.push(c); } }); },
     remove() { if (el.parentNode) el.parentNode.removeChild(el); },
+    contains(node) {
+      for (let cur = node; cur; cur = cur.parentNode) if (cur === el) return true;
+      return false;
+    },
+    get isConnected() {
+      if (!_currentDoc) return false;
+      return el === _currentDoc.body || _currentDoc.body.contains(el);
+    },
     addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
     removeEventListener() {},
     dispatchEvent(ev) { (this._listeners[(ev && ev.type) || ''] || []).forEach((fn) => fn(ev)); },
@@ -198,6 +206,7 @@ function freshStubs(options) {
     'chat-summary': makeEl(),
     'chat-task-state': makeEl(),
     'chat-tool-calls': makeEl(),
+    'chat-session-search-btn': makeEl(),
     'chat-session-filter-btn': makeEl(),
   };
   // T4: side panel structure (matching index.html)
@@ -247,6 +256,7 @@ function freshStubs(options) {
   // T3: 左侧会话面板结构（匹配 index.html 静态模板）
   const hasId = (id) => !missingIds.has(id);
   const sessionFilterBtn = byIdMap['chat-session-filter-btn'];
+  const sessionSearchBtn = byIdMap['chat-session-search-btn'];
   const sessionHideBtn = makeEl();
   sessionHideBtn.tagName = 'BUTTON';
   sessionHideBtn.setAttribute('aria-expanded', 'true'); // 静态模板初始：左侧展开
@@ -262,6 +272,7 @@ function freshStubs(options) {
   sessionActions.className = 'chat-session-panel__actions';
   // 顺序：隐藏按钮在前，筛选按钮在后（同容器）
   if (hasId('chat-session-toggle-btn')) sessionActions.appendChild(sessionHideBtn);
+  if (hasId('chat-session-search-btn')) sessionActions.appendChild(sessionSearchBtn);
   if (hasId('chat-session-filter-btn')) sessionActions.appendChild(sessionFilterBtn);
   sessionHeader.appendChild(sessionActions);
   if (hasId('chat-session-panel')) sessionPanel.appendChild(sessionHeader);
@@ -358,6 +369,7 @@ function freshStubs(options) {
     body: makeEl(),
   };
   _currentDoc = document;
+  document.body.appendChild(chatShell);
   const fetchStub = (url, opts) => {
     const u = String(url);
     // T4: artifact list requests are recorded separately (not in fetchCalls)
@@ -2803,7 +2815,7 @@ async function testSidePanelAndArtifacts() {
   await env.waitMicro();
   env.clearArtifactFetchCalls();
   await env.chat.applySessionDetail({ messages: [] });
-  await env.waitMicro(); await env.waitMicro();
+  await env.waitMicro(); await env.waitMicro(); await env.waitMicro(); await env.waitMicro();
   ok(env.getArtifactFetchCalls().length === 0, 'applySessionDetail does not fetch artifacts (no auto-poll)');
 }
 
@@ -3031,6 +3043,51 @@ async function testSessionSourceFilter() {
 }
 
 // ===========================================================================
+// 会话搜索：独立 Modal、打开时来源快照、安全标题匹配和常规关闭。
+// ===========================================================================
+async function testSessionSearch() {
+  const find = (node, predicate) => {
+    if (!node) return null;
+    if (predicate(node)) return node;
+    for (const child of node._kids || []) {
+      const found = find(child, predicate);
+      if (found) return found;
+    }
+    return null;
+  };
+  let env = loadChat();
+  sessionsList = [
+    { id: 'api-alpha', title: ' Alpha <safe> ', source: 'api' },
+    { id: 'dashboard-beta', title: 'Beta', source: 'dashboard' },
+    { id: 'delegated', title: 'Alpha delegated', source: 'delegation' },
+    { id: 'bad', title: 'bad', source: 'unknown' },
+  ];
+  env.chat.init();
+  await env.waitMicro();
+  env.fireClick(env.byIdMap['chat-session-search-btn']);
+  const backdrop = env.document.getElementById('chat-session-search-modal');
+  ok(!!backdrop, 'session search opens a dedicated backdrop');
+  const input = find(backdrop, (node) => node.id === 'chat-session-search-input');
+  const results = find(backdrop, (node) => node.id === 'chat-session-search-results');
+  const status = find(backdrop, (node) => node.id === 'chat-session-search-status');
+  ok(env.document.activeElement === input, 'session search focuses input after opening');
+  await env.waitMicro(); await env.waitMicro();
+  ok(results._kids.length === 2, 'search keeps only visible valid source records (status=' + status.textContent + ')');
+  ok(results.textContent.indexOf('Alpha <safe>') !== -1, 'search renders title as text content');
+  input.value = 'alpha';
+  input.dispatchEvent({ type: 'input' });
+  ok(results._kids.length === 1 && results.textContent.indexOf('Alpha <safe>') !== -1, 'search applies case-insensitive title matching');
+  input.value = '';
+  input.dispatchEvent({ type: 'search' });
+  ok(results._kids.length === 2, 'native search clear event restores results');
+  const closeBtn = find(backdrop, (node) => node.className === 'modal-close');
+  closeBtn.focus();
+  closeBtn.click();
+  ok(!env.document.getElementById('chat-session-search-modal'), 'search close removes only its backdrop');
+  ok(env.document.activeElement === env.byIdMap['chat-session-search-btn'], 'search close restores trigger focus');
+}
+
+// ===========================================================================
 // T3: 左侧会话面板独立折叠（bindSessionsToggle）
 // 左右折叠互不干扰；aria/hidden 同步；焦点移动；无网络/定时器副作用；
 // 宿主 DOM 缺失时安全降级。
@@ -3160,6 +3217,7 @@ runIntegration().then(async () => {
   await testSessionsPanelCollapse();
   await testAutoRefreshPanels();
   await testSessionSourceFilter();
+  await testSessionSearch();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

@@ -23,18 +23,14 @@
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M7 3v3M17 3v3M4 9h16M6 5h12a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">定时任务</span>
       </a>
-      <a class="sidebar__item" href="/tasks" data-tab="tasks">
-        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h7v5H4V6ZM13 6h7v5h-7V6ZM4 13h7v5H4v-5ZM13 13h7v5h-7v-5Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-        <span class="sidebar__item-label">任务</span>
-      </a>
-      <a class="sidebar__item" href="/artifacts" data-tab="artifacts" hidden>
-        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7l8-4 8 4-8 4-8-4ZM4 7v10l8 4 8-4V7M12 11v10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-        <span class="sidebar__item-label">制品</span>
-      </a>
       <hr class="sidebar__divider" aria-hidden="true">
       <a class="sidebar__item" href="/sessions" data-tab="sessions">
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h16M4 18h10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">会话</span>
+      </a>
+      <a class="sidebar__item" href="/tasks" data-tab="tasks">
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h7v5H4V6ZM13 6h7v5h-7V6ZM4 13h7v5H4v-5ZM13 13h7v5h-7v-5Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">任务</span>
       </a>
       <a class="sidebar__item" href="/memory" data-tab="memory">
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 0 0 12 18a3 3 0 0 0 0-6 3 3 0 0 0 0-6Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 0 1 12 18" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
@@ -66,6 +62,10 @@
           <a class="sidebar__item sidebar__item--child" href="/browser" data-tab="browser"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">浏览器</span></a>
         </div>
       </div>
+      <a class="sidebar__item" href="/artifacts" data-tab="artifacts" hidden>
+        <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7l8-4 8 4-8 4-8-4ZM4 7v10l8 4 8-4V7M12 11v10" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="sidebar__item-label">制品</span>
+      </a>
       <a class="sidebar__item" href="/models" data-tab="models">
         <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke-width="2"/><path d="M19 12c0 3.9-3.1 7-7 7s-7-3.1-7-7 3.1-7 7-7M19 5l-7 7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span class="sidebar__item-label">模型</span>
@@ -113,7 +113,7 @@
         <section class="status-panel chat-session-panel" id="chat-session-panel">
           <div class="panel-header chat-session-panel__header"><span>会话</span><div class="chat-session-panel__actions"><button class="chat-session-toggle-btn" type="button" id="chat-session-toggle-btn" aria-label="隐藏会话列表" aria-controls="chat-session-panel" aria-expanded="true" title="隐藏会话列表">
               <svg class="chat-session-toggle-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="1" class="session-toggle__panel" stroke="currentColor" stroke-width="2"/><path d="M10 4v16" stroke="currentColor" stroke-width="2"/></svg>
-            </button><button class="chat-session-filter-btn" type="button" id="chat-session-filter-btn" aria-label="筛选会话类型" title="筛选会话类型"><svg class="chat-session-filter-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></div>
+            </button><button class="chat-session-search-btn" type="button" id="chat-session-search-btn" aria-label="搜索会话" title="搜索会话"><svg class="chat-session-search-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="11" cy="11" r="6" stroke="currentColor" stroke-width="2"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button><button class="chat-session-filter-btn" type="button" id="chat-session-filter-btn" aria-label="筛选会话类型" title="筛选会话类型"><svg class="chat-session-filter-btn__icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 5h16l-6 7v5l-4 2v-7L4 5z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></div>
           <div class="panel-body"><div id="chat-session-list" class="session-list"></div></div>
         </section>
         <button class="chat-session-expand-btn" type="button" id="chat-session-expand-btn" aria-label="展开会话列表" aria-controls="chat-session-panel" aria-expanded="false" title="展开会话列表" hidden>

@@ -29,16 +29,16 @@ Accept optional non-empty `provider` and `model`. Reject NUL or newline in model
    sh .harness/framework/skills/harness/third-review/scripts/run-review.sh plan <target_file> <spec_file>
    ```
 
-4. On success, reread the target. For a plan, also reread the associated spec without modifying it. Perform the main review against the original request, Harness structure, Phase/GATE boundaries, spec coverage, executability, and verifiable acceptance. Do not trust provider output alone.
+4. The runner validates the target file, output size, unsafe control bytes, and the complete five-field provider summary. Provider nonzero exit, timeout/signal, or zero non-whitespace stdout is an execution failure; bounded provider stderr is emitted for diagnosis. Nonempty stdout that is safe but violates the five-field syntax or semantics is not an execution failure: the runner exits successfully, emits a `warning:` diagnostic, and returns the provider stdout unchanged instead of inferring `approved` or `fixed` from target-file hashes. Unsafe output (oversize, NUL, or unsafe control bytes) remains an `output-check` failure. For a plan the runner also verifies that the read-only associated spec did not change. On runner success, reread the target and relay the warning plus invalid provider output when present. For a plan, also reread the associated spec without modifying it. Perform the main review against the original request, Harness structure, Phase/GATE boundaries, spec coverage, executability, and verifiable acceptance. Do not trust provider output alone.
 5. Return exactly one state below. Never advance the caller while awaiting confirmation.
 
-The document prompts are `prompts/spec-review.md` and `prompts/plan-review.md`. The runner owns provider selection, path checks, worktree boundaries, timeouts, and the five-field provider output contract.
+The document prompts are `prompts/spec-review.md` and `prompts/plan-review.md`. The runner owns provider selection, path checks, target-file boundaries, timeouts, and the five-field provider output contract. It does not snapshot or monitor repository HEAD, Git index, or files outside the explicit target and associated spec.
 
 ## States
 
 ### Success
 
-After runner success and main-review success, preserve its five fields and return:
+After runner success and main-review success, preserve a valid five-field summary and return:
 
 ```text
 third_review: executed
@@ -50,14 +50,25 @@ provider: <provider-name>
 剩余风险: 无或1-3条
 ```
 
+When runner success contains the invalid-summary warning, do not synthesize the five success fields. Relay the warning and safe provider stdout, then return:
+
+```text
+third_review: executed
+provider: <provider-name>
+warning: provider structured summary is invalid: <reason>
+非法输出:
+<provider-stdout-verbatim>
+主流程复审: passed
+```
+
 ### Failure
 
-For validation, baseline, provider, boundary-check, output-check, or main-review failure, do not run an inline substitute and do not revert the worktree. Return only:
+For validation, provider, boundary-check, unsafe output-check, or main-review failure, do not run an inline substitute and do not revert the worktree. Return only:
 
 ```text
 third_review: awaiting-skip-confirmation
 provider: <provider-name-or-unresolved>
-失败步骤: <validation|baseline|provider|boundary-check|output-check|main-review>
+失败步骤: <validation|provider|boundary-check|output-check|main-review>
 失败原因: <sanitized-error>
 失败命令: <command-without-secrets-or-not-applicable>
 退出码: <integer|signal|timeout|not-applicable>

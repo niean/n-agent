@@ -40,7 +40,7 @@ data/*
 .ruff_cache
 *.pyc
 *.egg-info/
-app/__pycache__
+__pycache__/
 docker/docker-compose.yml
 docker/.env
 docker/locals/*

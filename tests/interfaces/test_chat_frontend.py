@@ -278,6 +278,52 @@ def test_chat_session_source_filter_uses_standard_modal():
     assert "nagent.chat.session-source-filter.v1" in source
 
 
+def test_chat_session_search_assets():
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    styles = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+    source = CHAT_JS.read_text(encoding="utf-8")
+    tree = _HtmlTree(html)
+
+    search_nodes = tree.find_all(lambda n: n["attrs"].get("id") == "chat-session-search-btn")
+    assert len(search_nodes) == 1
+    search_btn = search_nodes[0]
+    assert search_btn["tag"] == "button"
+    assert search_btn["attrs"].get("type") == "button"
+    assert search_btn["attrs"].get("aria-label") == "搜索会话"
+    assert search_btn["attrs"].get("title") == "搜索会话"
+    assert "aria-controls" not in search_btn["attrs"]
+    assert "aria-expanded" not in search_btn["attrs"]
+    assert any(c["tag"] == "svg" and c["attrs"].get("aria-hidden") == "true" for c in search_btn["children"])
+
+    actions = [n for n in tree.ancestors(search_btn) if "chat-session-panel__actions" in (n["attrs"].get("class") or "")][-1]
+    action_ids = [n["attrs"].get("id") for n in actions["children"]]
+    assert action_ids.index("chat-session-toggle-btn") < action_ids.index("chat-session-search-btn") < action_ids.index("chat-session-filter-btn")
+    assert not tree.find_all(lambda n: n["attrs"].get("id") == "chat-session-search-modal")
+    dialog_bodies = _css_rule_bodies(styles, "#chat-session-search-modal .session-search-modal__dialog")
+    form_bodies = _css_rule_bodies(styles, "#chat-session-search-modal .session-search-modal__form")
+    results_bodies = _css_rule_bodies(styles, "#chat-session-search-modal #chat-session-search-results")
+    modal_bodies = _css_rule_bodies(styles, ".modal-dialog")
+    assert dialog_bodies and form_bodies and results_bodies and modal_bodies
+
+    dialog = dialog_bodies[0]
+    for declaration in ("display: flex", "flex-direction: column", "height: 480px", "min-height: 0", "overflow: hidden"):
+        assert declaration in dialog
+    assert "overflow-y: auto" not in dialog
+
+    assert not any("max-height" in body or "overflow-y: auto" in body for body in form_bodies)
+    assert "flex: 1 1 auto" in form_bodies[0]
+    assert "min-height: 0" in form_bodies[0]
+
+    results = results_bodies[0]
+    for declaration in ("display: flex", "flex: 1 1 auto", "flex-direction: column", "min-height: 0", "overflow-y: auto"):
+        assert declaration in results
+    assert not any("max-height" in body or re.search(r"(?<![-\\w])height\\s*:", body) for body in results_bodies)
+    assert "max-height: calc(100vh - 48px)" in modal_bodies[0]
+    assert "chat-session-search-btn:focus-visible" in styles
+    assert "function openSessionSearchModal()" in source
+    assert "currentSessionSearch" in source
+
+
 def test_browser_result_link_uses_browser_session_path():
     """The header browser-view link opens the dedicated browser-session page.
 

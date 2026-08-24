@@ -31,7 +31,7 @@
 - `iterate-feature` Phase 2/3 对 Third Review 的调用方式和失败/跳过状态。
 - `after-finish` 项目 Hook 的目标路径，以及当前声明使用该 Hook 的 Workflow 的调用路径。
 - 原 Third Review Hook、旧 Prompt/provider 入口和现行规则引用的单次切换边界。
-- 输入校验、工作树保护、输出校验、错误处理和可执行验收标准。
+- 输入校验、目标文件保护、输出校验、错误处理和可执行验收标准。
 
 ### 4.2 非目标
 
@@ -40,7 +40,7 @@
 - 不用 Third Review 替代主流程模型的最终复审责任。
 - 不要求所有项目使用同一 provider、模型或会话持久化方式。
 - 不定义各 provider 的模型质量、计费、凭据签发或安装流程。
-- 不为并发编辑提供合并或自动回滚能力；runner 对执行期间可观察到的并发变化按失败处理，但不保证识别采样窗口内修改后恢复等不可观察竞争。
+- 不为并发编辑提供检测、合并或自动回滚能力；runner 不快照或监控仓库 HEAD、Git index 及显式目标外文件。
 - 不在 `.harness` 下为单次审阅新建对话记录、日志、备份或临时目录。
 
 ## 5. 设计结论
@@ -156,7 +156,7 @@ provider 协议：
 
 ### 7.5 provider 输出合同
 
-provider 成功时 stdout 去除首尾空白后必须恰好包含以下字段；字段名各出现一次，禁止在字段前后输出说明、Markdown 围栏或日志：
+provider 应在成功时将 stdout 规范化为以下五个字段；字段名各出现一次，且不应在字段前后输出说明、Markdown 围栏或日志：
 
 ```text
 状态: approved | fixed
@@ -173,21 +173,20 @@ provider 成功时 stdout 去除首尾空白后必须恰好包含以下字段；
 - `fixed` 要求 `N >= 1`，并表示目标文件内容发生变化。
 - `N < 20` 时 `目标未达说明` 不得为“无”，且必须同时说明真实问题不足 20 的原因和已覆盖维度；`N >= 20` 时该字段必须为“无”。
 - 修改数量是 provider 按 Prompt 计数规则作出的语义声明。runner 不从文本 diff 推导语义数量，但必须拒绝状态、数量与文件是否变化之间的明显矛盾。
-- runner 在受限临时目录捕获 stdout/stderr；stdout 超过 64 KiB、包含 NUL、缺字段、重复字段或格式不符均视为输出校验失败。临时文件在本次调用结束时清理，不写入 `.harness`。
+- runner 在受限临时目录捕获 stdout/stderr。provider 非零退出、超时/信号，或返回 0 但 stdout 无任何非空白内容，视为执行失败并回显 provider stderr 前 20 行。非空 stdout 若不符合五字段语法或语义，只产生 `warning:`，runner 返回 0 并原样输出这份安全的非法 stdout，交由 Skill 展示和主流程复审；不得根据目标文件变化推导 `approved/fixed`。stdout 超过 64 KiB、包含 NUL/其它不安全控制字节仍是阻塞性输出校验失败。临时文件在本次调用结束时清理，不写入 `.harness`。
 
 ## 8. Data Flow
 
 1. Workflow 完成对应的 Spec Review Loop 或 Plan Review Loop，将当前 Task 文件路径和 `review_loop_evidence` 传给 Skill。
 2. Skill 校验调用上下文，再调用 runner；缺少可信检查点时不得只凭目标文件内容推断 Review Loop 已完成。
-3. runner 确认 Git 根目录，规范化输入路径，解析 provider/model，并在调用前采集工作树基线。
-4. 基线至少包含 tracked 文件的 staged/unstaged 状态与内容散列、untracked 文件路径与内容散列、文件类型和 mode；另存 `target_file` 的执行前内容散列。散列内容仅保存在系统临时目录。
-5. runner 组装 Prompt 并调用 provider，同时捕获 stdout、stderr、退出码和信号/超时状态。
-6. provider 返回后，runner 重新采集同一范围并比较。除 `target_file` 内容变化外，任何新增、删除、重命名、mode 变化、staged 状态变化或其它文件内容变化均为越界。
-7. runner 校验 provider 输出以及 `approved/fixed`、修改数量和 `target_file` 实际变化的一致性，将原始结果返回 Skill。
-8. Skill 重新读取目标文件。spec 按用户原始需求、Harness spec 结构、Phase/GATE 和验收可执行性复审；plan 还必须只读关联 spec 并复审覆盖关系。
-9. Skill 复审通过后输出 `third_review: executed`，Workflow 按原 Phase 顺序继续；任一步失败则进入等待跳过确认状态。
+3. runner 确认 Git 根目录，规范化输入路径，解析 provider/model，并记录 `target_file` 的执行前内容散列与 mode；plan 审阅还记录只读 `spec_file` 的内容散列与 mode。
+4. runner 组装 Prompt 并调用 provider，同时捕获 stdout、stderr、退出码和信号/超时状态。
+5. provider 返回后，runner 确认目标仍为普通文件且 mode 未变化；plan 审阅还确认关联 spec 仍为普通文件且内容与 mode 均未变化。runner 不扫描 HEAD、Git index、未跟踪文件或其它目标外路径。
+6. runner 校验 provider 五字段输出以及 `approved/fixed`、修改数量和 `target_file` 实际变化的一致性。零有效输出按 provider 执行失败；非空、安全但结构化格式或语义不合规时 warning 后继续并原样返回，不得根据目标文件变化生成五字段结果；合规时返回规范化结果。
+7. Skill 重新读取目标文件。spec 按用户原始需求、Harness spec 结构、Phase/GATE 和验收可执行性复审；plan 还必须只读关联 spec 并复审覆盖关系。
+8. Skill 复审通过后输出 `third_review: executed`，Workflow 按原 Phase 顺序继续；任一步失败则进入等待跳过确认状态。
 
-工作树保护以调用前后差异为准，允许调用前已经存在的用户变更保持不变。若 provider 运行期间出现 runner 可观察到且无法归因的并发变化，包括采样检测到的 `target_file` 多次状态转换，必须 fail-closed。并发检测是 best-effort：受当前 provider 直接编辑目标文件的协议限制，不保证识别完全发生在采样窗口内且最终恢复原状态的竞争；此类漏检是已接受风险。runner 和 Skill 不得自动覆盖、删除、stash、reset、checkout 或回滚任何文件；失败时保留现场并明确报告目标文件是否已变化，由人工处理。
+目标文件保护只覆盖本次调用显式声明的 `target_file`，以及 plan 审阅时只读的 `spec_file`。provider 通过 Prompt 合同承诺只修改目标文件；runner 不以全仓快照或实时 monitor 事后取证目标外变化，也不自动覆盖、删除、stash、reset、checkout 或回滚任何文件。失败时保留现场并明确报告目标文件是否已变化，由人工处理。
 
 ## 9. Workflow 编排合同
 
@@ -228,12 +227,23 @@ provider: <provider-name>
 剩余风险: 无或1-3条
 ```
 
+格式告警的 `executed` 结果使用互斥字段，不伪造五字段摘要：
+
+```text
+third_review: executed
+provider: <provider-name>
+warning: provider structured summary is invalid: <reason>
+非法输出:
+<provider-stdout-verbatim>
+主流程复审: passed
+```
+
 `awaiting-skip-confirmation` 必需字段：
 
 ```text
 third_review: awaiting-skip-confirmation
 provider: <provider-name-or-unresolved>
-失败步骤: <validation|baseline|provider|boundary-check|output-check|main-review>
+失败步骤: <validation|provider|boundary-check|output-check|main-review>
 失败原因: <sanitized-error>
 失败命令: <command-without-secrets-or-not-applicable>
 退出码: <integer|signal|timeout|not-applicable>
@@ -248,7 +258,7 @@ third_review: skipped
 确认依据: <紧邻的上一条用户消息摘要>
 ```
 
-`awaiting-skip-confirmation` 和 `skipped` 禁止伪造 `approved/fixed`、修改数量、修改摘要、目标未达说明或剩余风险。`provider` 只用于诊断和可观测性。Workflow 检查点只依赖 `third_review` 状态，不得使用 `chatgpt`、`codex` 等 provider 名称表示流程状态。
+`awaiting-skip-confirmation`、`skipped` 和格式告警的 `executed` 结果均禁止伪造 `approved/fixed`、修改数量、修改摘要、目标未达说明或剩余风险。`provider` 只用于诊断和可观测性。Workflow 检查点只依赖 `third_review` 状态，不得使用 `chatgpt`、`codex` 等 provider 名称表示流程状态。
 
 ## 10. Error Handling
 
@@ -256,21 +266,21 @@ Third Review 是 `iterate-feature` 中的必选 Skill，不使用可选 Hook 的
 
 - Skill、Prompt、runner、provider 或其它必需资源不存在、不是普通可读文件，或 provider 标识不合法。
 - 输入参数数量、类型、Task 归属、目录边界、canonical path 或 Review Loop 前置证据不合法。
-- Git 根目录不可确定，或基线无法完整采集、保存、重采集或比较。
+- Git 根目录不可确定，或目标文件执行前状态无法读取。
 - provider 未配置、不可用、指定模型不可用、超时、收到信号或返回非零退出码。
-- provider 修改了目标文件之外的文件，改变 staging/mode，或发生 runner 已观察到但无法安全归因的并发变更。
-- provider 输出不符合合同，或 `approved/fixed`、修改数量与目标文件实际变化明显矛盾。
+- provider 结束后目标文件不再是普通文件或 mode 发生变化；plan 审阅时关联 spec 不再是普通文件，或其内容/mode 发生变化。
+- provider 返回 0 但 stdout 无非空白内容，按执行失败处理；stdout 超长、包含 NUL/其它不安全控制字节按 `output-check` 失败。非空、安全的五字段格式或语义不合规不属于失败：runner warning 后继续、展示非法输出，且不得生成回退成功摘要。
 - 主流程模型复审发现 Third Review 破坏原始需求、关联 spec、Harness 结构或 Phase/GATE 边界。
 
 失败时固定执行：
 
 1. 立即停止当前 Skill 和 Workflow 推进，不执行 `writing-verify`、后续 Phase 或额外内联降级审阅。
-2. 对可识别的 provider 进程执行有界终止；默认超时为 15 分钟，可由 provider 专属环境变量缩短，但通用 Workflow 不感知该配置。
+2. 对可识别的 provider 进程执行有界终止；期限由 runner 框架级配置 `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS` 统一控制（默认 900 秒，1-86400 秒），provider 适配器不自建超时，通用 Workflow 不感知该配置。
 3. 清理 runner 自己创建的系统临时文件，不清理或回滚工作树文件。
 4. 输出脱敏后的失败步骤、provider、命令、退出信息和目标文件状态，并设为 `third_review: awaiting-skip-confirmation`。
 5. 通过 Skill 的 `[CONFIRM]` 结束当前回复，请求人工确认是否跳过。该确认只绑定本次文档、本次 provider 调用和本次失败，不得复用于另一文档或重试。
 6. 仅当紧邻的上一条用户消息明确确认跳过本次失败，且人工已处理任何越界或损坏状态后，才设为 `third_review: skipped` 并继续 Workflow；修正指令、重试指令或含糊回复不算跳过确认。
-7. 若用户要求重试，必须重新校验输入并建立新基线；旧的确认和执行结果全部失效。
+7. 若用户要求重试，必须重新校验输入并重新记录目标文件状态；旧的确认和执行结果全部失效。
 
 ## 11. Hook 边界
 
@@ -307,7 +317,7 @@ Hook 是 Workflow 在明确扩展点对项目脚本的回调，定义项目额�
 - 旧 Third Review Hook 与 `.harness/framework/third/` 生效入口已删除，不保留兼容 wrapper。
 - 项目特化的 `after-finish.sh` 已迁至 `.harness/hooks/`，所有现有调用方已同步更新。
 
-迁移后的 runner、provider、Skill 静态合同和 Workflow/Hook 集成已由隔离测试验证。目标文件并发修改检测保持 best-effort，采样窗口内修改后恢复的漏检为已接受风险。
+迁移后的 runner、provider、Skill 静态合同和 Workflow/Hook 集成已由隔离测试验证。runner 只检查显式目标文件与 plan 的只读关联 spec，不承担全仓并发变化检测。
 
 ## 14. 迁移边界
 
@@ -318,7 +328,7 @@ Hook 是 Workflow 在明确扩展点对项目脚本的回调，定义项目额�
 - 删除 `.harness/framework/hooks/third-review.sh` 和 `.harness/framework/third/` 下被新 Skill 取代的生效资源；如存在只为这些文件新增的 ignore 例外，一并清理。
 - 将 `after-finish.sh` 移至 `.harness/hooks/after-finish.sh`，同步更新 FRAMEWORK 和所有现有 Workflow 调用方。
 - 清理当前生效的 FRAMEWORK、Workflow、Skill 和脚本中对 `third-review Hook`、`HARNESS_THIRD_REVIEW_CMD`、ChatGPT/Codex 固定入口以及 provider 名充当状态值的引用。历史 diff、backup、已完成 spec/plan 的审阅记录及本规格的过渡状态说明不属于清理对象。
-- 补齐输入、路径逃逸、provider 选择、成功、无修改、低于强度目标、不可用、超时、非零退出、输出异常、越界修改、脏工作树、可观察并发变化、主流程复审失败和跳过确认的自动化覆盖。
+- 补齐输入、路径逃逸、provider 选择、成功、无修改、低于强度目标、不可用、超时、非零退出、输出异常、目标类型/mode 变化、plan 关联 spec 被修改、主流程复审失败和跳过确认的自动化覆盖。
 
 ## 15. Acceptance Criteria
 
@@ -328,13 +338,13 @@ Hook 是 Workflow 在明确扩展点对项目脚本的回调，定义项目额�
 2. `FRAMEWORK.md` Skills 注册表和目录结构只注册一个 Third Review 流程权威源，且新 SKILL 明确定义本规格的输入、步骤、输出和 `[CONFIRM]`。
 3. 在不修改 Workflow、SKILL 和 Prompt 的前提下，放入一个符合命名及协议的测试 provider 并通过显式输入选择后，可完成一次审阅；非法 provider 名、路径片段和不存在 provider 均在调用前失败。
 4. 自动化测试证明绝对路径、`..`、目录、非 Markdown/非普通文件、`.harness/` 外文件、禁止子目录和 symlink 逃逸被拒绝；合法 active spec/plan 与用户明确覆盖的 `.harness/` 内目标被接受，plan 必须携带不同且已通过 GATE 的关联 spec。
-5. 在包含 staged、unstaged 和 untracked 既有变更的临时 Git 仓库中运行测试 provider 后，既有变更的内容、mode 和 staging 状态保持不变，只有目标文件可产生本次增量。
-6. 测试 provider 新增、删除、重命名或修改目标外文件，改变任意文件 mode/staging 状态，或模拟 runner 可观察到的并发变化时，Skill 均输出 `awaiting-skip-confirmation`、停止 Workflow，且不自动回滚现场；采样窗口内修改后恢复等不可观察竞争不作为阻断验收项。
-7. provider 不可用、模型不可用、超时、信号退出、非零退出、stdout 超限、字段缺失/重复、非法整数和状态/数量/文件变化矛盾均有自动化用例，并产生脱敏且符合 schema 的失败结果。
+5. runner 执行期间不调用全仓快照、HEAD/Index 对比、未跟踪文件扫描或目标实时 monitor；既有 staged、unstaged 和 untracked 变更不参与 Third Review 判断。
+6. 测试 provider 修改目标内容时可正常成功；目标类型或 mode 变化必须失败。plan 审阅中关联 spec 的内容、类型或 mode 变化必须失败；spec 审阅不引入额外只读文件检查。
+7. provider 不可用、模型不可用、超时、信号退出、非零退出、零有效 stdout、stdout 超限/NUL/控制字符均有阻塞失败用例；非空但字段缺失/重复、非法整数和状态/数量/文件变化矛盾均有 warning 继续用例，并验证非法 stdout 被展示且未伪造 `approved/fixed`。
 8. `approved` 且 `N=0`、`fixed` 且 `N>=1` 的有效输出可执行成功；`N<20` 缺失目标未达说明时失败，存在合规说明时成功；Skill 不把 provider 日志混入结构化结果。
 9. provider 成功后，主流程模型重新读取目标文件；plan 审阅同时只读关联 spec。复审失败时 Workflow 停止，不执行 `writing-verify` 或后续 Phase。
 10. Phase 2 的 Spec Review Loop -> Third Review -> 需求摘要 -> GATE 顺序不变；Phase 3 的 Plan Review Loop -> Third Review -> writing-verify -> 执行方式选择 -> Phase 4 顺序不变，且未新增 GATE。
-11. Third Review 失败后，非跳过回复不得推进；只有紧邻的、明确绑定本次失败的用户确认才能产生 `third_review: skipped`，重试会建立新基线并使旧确认失效。
+11. Third Review 失败后，非跳过回复不得推进；只有紧邻的、明确绑定本次失败的用户确认才能产生 `third_review: skipped`，重试会重新记录目标状态并使旧确认失效。
 12. `third_review` 检查点只出现 `executed`、`awaiting-skip-confirmation` 或 `skipped`，不得以 provider 名称表示状态；三种结果分别包含本规格要求的全部字段，且互斥字段不会混用。
 13. `.harness/framework/hooks/third-review.sh` 和被替代的旧 Third Review 生效入口不存在；全量引用扫描仅允许历史材料与本规格“当前过渡状态”章节命中旧入口。
 14. `.harness/hooks/after-finish.sh` 是唯一项目 Hook 目标路径，所有声明使用 after-finish 的 Workflow 均从项目根目录以 `sh` 调用；文件缺失和执行失败行为符合本规格。

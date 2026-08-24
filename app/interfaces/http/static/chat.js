@@ -21,6 +21,7 @@
   ];
   const SESSION_SOURCE_VALUES = new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value));
   let selectedSessionSources = loadSessionSourceFilter();
+  let currentSessionSearch = null;
   let activeSideTab = 'tool';
   let artifactPanelRequestSeq = 0;
   let isSending = false;
@@ -1625,6 +1626,129 @@
   function isSessionVisible(session) {
     return !!session && typeof session.source === 'string'
       && SESSION_SOURCE_VALUES.has(session.source) && selectedSessionSources.has(session.source);
+  }
+
+  function isCurrentSessionSearch(instance) {
+    return !!instance && !instance.closed && currentSessionSearch === instance
+      && !!instance.backdrop && instance.backdrop.isConnected;
+  }
+
+  function openSessionSearchModal() {
+    const trigger = ui.byId('chat-session-search-btn');
+    if (currentSessionSearch) currentSessionSearch.close({ restoreFocus: false });
+    const leftover = document.getElementById('chat-session-search-modal');
+    if (leftover) leftover.remove();
+
+    const sourceSnapshot = new Set(selectedSessionSources);
+    const backdrop = document.createElement('div');
+    backdrop.id = 'chat-session-search-modal';
+    backdrop.className = 'modal-backdrop';
+    const dialog = document.createElement('section');
+    dialog.className = 'modal-dialog session-search-modal__dialog';
+    dialog.setAttribute('role', 'dialog');
+    dialog.setAttribute('aria-modal', 'true');
+    dialog.setAttribute('aria-labelledby', 'chat-session-search-title');
+    const form = document.createElement('div');
+    form.className = 'providers-form session-search-modal__form';
+    const header = ui.el('div', 'modal-header');
+    const title = document.createElement('h4');
+    title.id = 'chat-session-search-title';
+    title.textContent = '搜索会话';
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'modal-close';
+    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', '关闭搜索会话弹框');
+    header.append(title, closeBtn);
+    const input = document.createElement('input');
+    input.id = 'chat-session-search-input';
+    input.type = 'search';
+    input.value = '';
+    input.setAttribute('aria-label', '搜索会话');
+    input.placeholder = '输入会话名称';
+    const status = document.createElement('p');
+    status.id = 'chat-session-search-status';
+    status.setAttribute('aria-live', 'polite');
+    status.setAttribute('aria-atomic', 'true');
+    const results = document.createElement('ul');
+    results.id = 'chat-session-search-results';
+    results.setAttribute('aria-label', '搜索结果');
+    form.append(header, input, status, results);
+    dialog.appendChild(form);
+    backdrop.appendChild(dialog);
+
+    const instance = { backdrop, dialog, input, status, results, records: [], closed: false, selected: false, onKeydown: null, close: null };
+    const render = () => {
+      if (!isCurrentSessionSearch(instance)) return;
+      clearNode(results);
+      const query = input.value.trim().toLowerCase();
+      const matched = instance.records.filter((record) => !query || record.matchText.includes(query));
+      if (!instance.records.length) { status.textContent = '暂无可见会话'; return; }
+      if (!matched.length) { status.textContent = '未找到匹配的会话'; return; }
+      status.textContent = `找到 ${matched.length} 个会话`;
+      matched.forEach((record) => {
+        const item = document.createElement('li');
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'session-search-modal__result';
+        button.textContent = record.name;
+        button.addEventListener('click', () => {
+          if (!isCurrentSessionSearch(instance) || instance.selected) return;
+          instance.selected = true;
+          button.disabled = true;
+          instance.close({ restoreFocus: false });
+          selectSession(record.id);
+        });
+        item.appendChild(button);
+        results.appendChild(item);
+      });
+    };
+    instance.close = (options) => {
+      if (instance.closed) return;
+      instance.closed = true;
+      const wasCurrent = currentSessionSearch === instance;
+      const focusedInside = !!(document.activeElement && dialog.contains(document.activeElement));
+      if (wasCurrent) currentSessionSearch = null;
+      document.removeEventListener('keydown', instance.onKeydown, true);
+      backdrop.remove();
+      if (wasCurrent && focusedInside && (!options || options.restoreFocus !== false) && trigger && trigger.isConnected) trigger.focus();
+    };
+    instance.onKeydown = (event) => {
+      if (event.key !== 'Escape' || !isCurrentSessionSearch(instance) || !dialog.contains(document.activeElement)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      instance.close();
+    };
+    closeBtn.addEventListener('click', () => instance.close());
+    backdrop.addEventListener('click', (event) => { if (event.target === backdrop) instance.close(); });
+    input.addEventListener('input', render);
+    input.addEventListener('search', render);
+    currentSessionSearch = instance;
+    document.body.appendChild(backdrop);
+    document.addEventListener('keydown', instance.onKeydown, true);
+    status.textContent = '正在加载会话';
+    input.focus();
+
+    if (!api || typeof api.listSessions !== 'function') {
+      status.textContent = '加载会话失败';
+      return;
+    }
+    Promise.resolve().then(() => api.listSessions()).then((sessions) => {
+      if (!isCurrentSessionSearch(instance)) return;
+      instance.records = (Array.isArray(sessions) ? sessions : []).filter((session) => (
+        !!session && !Array.isArray(session) && typeof session.source === 'string'
+        && SESSION_SOURCE_VALUES.has(session.source) && sourceSnapshot.has(session.source)
+        && typeof session.id === 'string' && session.id.trim()
+      )).map((session) => {
+        const name = typeof session.title === 'string' && session.title.trim() ? session.title.trim() : session.id;
+        return { id: session.id, name, matchText: name.trim().toLowerCase() };
+      });
+      render();
+    }).catch(() => {
+      if (!isCurrentSessionSearch(instance)) return;
+      clearNode(results);
+      status.textContent = '加载会话失败';
+    });
   }
 
   function closeSessionSourceFilterModal(backdrop, onKeydown) {
@@ -3367,7 +3491,9 @@
     const sendBtn = ui.byId('chat-send');
     const input = ui.byId('chat-input');
     const sessionFilterBtn = ui.byId('chat-session-filter-btn');
+    const sessionSearchBtn = ui.byId('chat-session-search-btn');
     if (sessionFilterBtn) sessionFilterBtn.addEventListener('click', openSessionSourceFilterModal);
+    if (sessionSearchBtn) sessionSearchBtn.addEventListener('click', openSessionSearchModal);
     if (sendBtn) sendBtn.addEventListener('click', send);
     if (input) {
       input.addEventListener('keydown', handleComposerKeydown);

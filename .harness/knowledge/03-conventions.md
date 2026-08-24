@@ -121,6 +121,7 @@ Docker Compose 项目隔离使用：
 - 禁止在宿主机直接启动 N-Agent 服务
 - E2E 测试前必须执行 `cd docker && ./restart.sh` 重建并启动服务，后续直接通过 `docker exec n-agent-n-agent-1 n-agent <子命令及参数>` 调用容器内 N-Agent
 - E2E 测试禁止依赖宿主 `n-agent` alias，禁止为 `docker exec` 增加 `-i` 或 `-t`
+- 前端渲染/布局改动（styles.css、*.js、index.html）的浏览器实测前必须先执行 `sh docker/restart.sh` 重建镜像：`docker/Dockerfile` 用 `COPY app ./app` 烘焙静态资源、`app/` 无 volume 挂载，未重建时容器提供的是旧副本且无任何报错，RED/GREEN 都在测旧代码。实测脚本应先用 `curl -fsS http://localhost:8201/static/<file>` 断言新声明已在容器侧生效，再读取几何值
 - 当前全量测试覆盖 789 项
 - 新增 Domain、Application、Infrastructure、Interfaces 能力时必须补对应测试
 - 涉及 DDD 边界变更时必须运行 `tests/test_architecture_boundaries.py`

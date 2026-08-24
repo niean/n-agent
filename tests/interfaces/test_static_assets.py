@@ -299,14 +299,14 @@ def test_static_assets_contain_expected_logic(tmp_path):
         < summary_js.index("tab: 'tools-plugin'")
         < summary_js.index("tab: 'tools-builtin'")
     )
-    # 概览功能入口补全制品、浏览器，顺序对齐左导菜单上下顺序
+    # 概览功能入口顺序对齐左导菜单上下顺序
     assert "tab: 'artifacts'" in summary_js
     assert "tab: 'browser'" in summary_js
     summary_entry_tabs = re.findall(r"tab: '([^']+)'", summary_js)
     assert summary_entry_tabs == [
-        'chat', 'scheduled-tasks', 'tasks', 'artifacts', 'sessions', 'memory',
+        'chat', 'scheduled-tasks', 'sessions', 'tasks', 'memory',
         'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
-        'sandbox', 'executors-host', 'browser', 'models', 'platforms',
+        'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
         'observations-sessions', 'observations-modules', 'security',
     ], f"summary ENTRIES order mismatch: {summary_entry_tabs}"
 
@@ -1021,15 +1021,15 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     assert sidebar_match, "sidebar not found"
     sidebar_html = sidebar_match.group(1)
     expected_data_tabs = [
-        'chat', 'scheduled-tasks', 'tasks', 'artifacts', 'sessions', 'memory',
+        'chat', 'scheduled-tasks', 'sessions', 'tasks', 'memory',
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
-        'executors', 'sandbox', 'executors-host', 'browser', 'models', 'platforms',
+        'executors', 'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
         'observations', 'observations-sessions', 'observations-modules', 'security',
     ]
     expected_hrefs = [
-        '/chat', '/scheduled-tasks', '/tasks', '/artifacts', '/sessions', '/memory',
+        '/chat', '/scheduled-tasks', '/sessions', '/tasks', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
-        '/sandbox', '/executors/host', '/browser', '/models', '/platforms',
+        '/sandbox', '/executors/host', '/browser', '/artifacts', '/models', '/platforms',
         '/observations/sessions', '/observations/modules', '/security',
     ]
     sidebar_data_tabs = _re.findall(r'data-tab="([^"]*)"', sidebar_html)
@@ -1740,7 +1740,7 @@ def test_browser_shell_served_at_browser_path(tmp_path):
 def test_artifacts_static_assets_and_wiring(tmp_path):
     """T15: artifacts.js asset reachable, container unique + default hidden,
     script order (artifacts.js before app.js), source safety, nav order
-    (scheduled-tasks -> tasks -> artifacts), nav hidden-by-default."""
+    (executors -> sandbox -> executors-host -> browser -> artifacts -> models), nav hidden-by-default."""
     client = _client(tmp_path)
     res = client.get('/static/artifacts.js')
     assert res.status_code == 200, "artifacts.js not served"
@@ -1761,9 +1761,11 @@ def test_artifacts_static_assets_and_wiring(tmp_path):
     assert html.index('/static/artifacts.js') < html.index('/static/app.js'), \
         "artifacts.js must load before app.js"
 
-    # Nav order in tabConfig source: scheduled-tasks -> tasks -> artifacts.
-    assert nav_js.index("tab: 'scheduled-tasks'") < nav_js.index("tab: 'tasks'") < nav_js.index("tab: 'artifacts'"), \
-        "tabConfig order must be scheduled-tasks -> tasks -> artifacts"
+    # Nav order in tabConfig source: executors group -> artifacts -> models.
+    assert nav_js.index("tab: 'executors'") < nav_js.index("tab: 'sandbox'") \
+        < nav_js.index("tab: 'executors-host'") < nav_js.index("tab: 'browser'") \
+        < nav_js.index("tab: 'artifacts'") < nav_js.index("tab: 'models'"), \
+        "tabConfig order must be executors -> sandbox -> executors-host -> browser -> artifacts -> models"
     assert '制品' in nav_js, "artifacts label '制品' missing from tabConfig"
 
     # Nav item hidden by default in sidebar (probe-gated reveal).

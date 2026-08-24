@@ -7,8 +7,25 @@ if [ "$#" -ne 1 ]; then
 fi
 
 repo_root=$1
-codex_bin=$(command -v codex 2>/dev/null || true)
+
+# Codex 二进制解析（用户约束：只允许 ChatGPT 桌面版内置的 Codex Exec，禁用 vscode 扩展插件内置二进制）：
+# 1. HARNESS_THIRD_REVIEW_CODEX_BIN 显式指定
+# 2. ChatGPT.app 内置 codex（/Applications/ChatGPT.app/Contents/Resources/codex）
+# 3. PATH 查找，但拒绝解析到 .vscode/extensions 下的扩展内置二进制
+codex_bin=${HARNESS_THIRD_REVIEW_CODEX_BIN:-}
+if [ -z "$codex_bin" ] && [ -x "/Applications/ChatGPT.app/Contents/Resources/codex" ]; then
+    codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex"
+fi
 if [ -z "$codex_bin" ]; then
+    codex_bin=$(command -v codex 2>/dev/null || true)
+    case "$codex_bin" in
+        */.vscode/extensions/*)
+            printf '%s\n' 'codex provider: vscode extension codex binary is forbidden' >&2
+            exit 127
+            ;;
+    esac
+fi
+if [ -z "$codex_bin" ] || [ ! -x "$codex_bin" ]; then
     printf '%s\n' 'codex provider: codex command is unavailable' >&2
     exit 127
 fi
