@@ -132,7 +132,7 @@ prompt_path=$(canonical_resource "$prompt_path") || fail 'review prompt is not a
 [ "$(dirname "$prompt_path")" = "$prompt_dir" ] || fail 'review prompt escaped its resource directory'
 
 provider_name=${HARNESS_THIRD_REVIEW_PROVIDER-}
-[ -n "$provider_name" ] || provider_name=codex
+[ -n "$provider_name" ] || fail 'provider is not configured; set Skill input, HARNESS_THIRD_REVIEW_PROVIDER, or harness.json thirdReview.provider'
 has_ascii_control "$provider_name" && fail 'provider must not contain ASCII control bytes'
 case $provider_name in
     *[!a-z0-9-]*|-*|*--*|*-) fail 'provider must be a kebab-case identifier' ;;

@@ -21,6 +21,7 @@
 判定原则：
 - framework/ 下的文件（通用能力）不应包含任何项目特有内容（包括项目特有的扫描维度、严重程度排序、文件类型映射等配置）
 - knowledge/、prd/、PROJECT.md 中，`{{...}}` 占位符外部的非 Harness 术语均视为泄漏（即使看似是"格式示例"）
+- `harness.json` 不得保留源项目的启用状态、Provider 选择、模型或 Hook 开关；模板可选能力必须默认关闭
 - guides/ 中不应包含源项目的具体任务记录、plan 文件名或执行示例
 
 输出：泄漏内容原文 + 所在文件及行号 + 泄漏类型 + 建议修复
@@ -35,6 +36,7 @@ AI 无法理解或执行的内容会导致模板使用时出错。检查项：
 - 损坏的 Markdown 结构：未闭合代码块、格式错乱的表格、断裂的链接语法
 - 循环或死路径引用：A 引用 B 引用 A，或指令指向一个不存在的后续步骤
 - 编码异常：非预期的特殊字符、不可见字符、混合换行符
+- JSON 配置损坏：`.harness/harness.json` 无法由标准 JSON 解析器读取、`version` 不是 1、首版必需对象/字段缺失或类型错误
 
 输出：问题内容原文 + 所在文件及行号 + 问题类型 + 严重程度（高/中/低） + 建议修复
 
@@ -47,6 +49,7 @@ AI 无法理解或执行的内容会导致模板使用时出错。检查项：
 - 占位符描述：占位符内的说明文字是否足够清晰，能让用户理解需要填入什么
 - 假占位符：看似占位符但实际是固定内容（如 `{{固定值不需要改}}`）
 - 语法不一致：所有占位符必须统一使用 `{{...}}` 语法，不允许 `${...}` 或其他变体
+- JSON 占位符必须位于字符串值内，替换前后均不得破坏 JSON 语法
 
 输出：问题位置 + 问题类型 + 建议修复
 
@@ -54,7 +57,7 @@ AI 无法理解或执行的内容会导致模板使用时出错。检查项：
 
 模板目录结构必须与 FRAMEWORK.md 声明一致且完整。检查项：
 
-- 必需文件存在性：CLAUDE.md、AGENTS.md、PROJECT.md、FRAMEWORK.md 及 FRAMEWORK.md 注册表中列出的所有 Agent/Workflow/Skill 文件
+- 必需文件存在性：CLAUDE.md、AGENTS.md、PROJECT.md、`.harness/harness.json`、FRAMEWORK.md、`.harness/framework/scripts/get-config.sh` 及 FRAMEWORK.md 注册表中列出的所有 Agent/Workflow/Skill 文件
 - 必需目录存在性：knowledge/、prd/、lessons/、specs/active/、specs/completed/、plans/active/、plans/completed/；空目录必须包含 .gitkeep 文件（git 不跟踪空目录，缺少 .gitkeep 会导致模板分发后目录丢失）
 - 元数据完整性：Skill/Workflow/Agent 文件须有 YAML frontmatter（name + description）；knowledge/prd/lessons .md 文件须有首行 `<!-- SUMMARY: ... -->` 注释
 - 多余文件：模板中存在但 FRAMEWORK.md 未注册、且非标准结构要求的文件

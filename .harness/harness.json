@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "thirdReview": {
+    "enabled": true,
+    "provider": "codex",
+    "model": null,
+    "timeoutSeconds": 900
+  },
+  "hooks": {
+    "afterFinish": {
+      "enabled": true
+    }
+  }
+}

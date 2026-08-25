@@ -8,6 +8,10 @@ N-Agent 是一款类 Hermes 的本地 Agent 产品，让个人开发者以低成
 
 本节为 Harness 框架提供项目级配置，框架文件通过 `.harness/PROJECT.md` 直接引用。
 
+## 运行配置
+
+机器可读的 Harness 运行配置统一位于 `.harness/harness.json`，消费者通过 `sh .harness/framework/scripts/get-config.sh <config-key>` 读取。当前管理 Third Review 与 after-finish Hook；本文件只保留项目说明、知识索引和人工规则，不重复维护运行值或默认值。
+
 ## 知识库目录
 
 首次加载时需建立 SUMMARY 索引的目录：
@@ -140,7 +144,7 @@ sh tests/e2e/run.sh
 ## 质量守护
 
 - TDD 严格 S1-S5 顺序，红绿重构闭环，RED 证据必须保留在 plan/verify
-- 三方审阅不跳过：spec/plan Review Loop 后必须跑 Third Review 防止模型偏见
+- 三方审阅：默认关闭；启用后 spec/plan Review Loop 必须执行 Third Review，失败不得自动跳过
 - 任务安全策略 A/B/C：A 类不变量只读禁配、B 类启动期 env-only、C 类运行时 Dashboard 可编辑+热重载
 - 教训库沉淀：跨 2+ 源文件根因或实现与原假设偏离时自动写 .harness/lessons/project.md
 - 技术债闭环：新引入技术债必须当场解决或登记 plans/debt-tracker.md，禁止拖延
@@ -161,6 +165,7 @@ AGENTS.md              -- AI 入口（纯路由）
 CLAUDE.md              -- Claude Code 入口
 .harness/
   PROJECT.md           -- 项目规范入口（本文件）
+  harness.json         -- Harness 机器可读运行配置
   framework/           -- 通用能力（详见 FRAMEWORK.md "Framework 目录结构"）
   knowledge/           -- AI 知识库（01~05 认知约束类, 21~22 工具索引类）
   prd/                 -- 产品文档（AI只读：01-prd-sense、02-prd-baseline、03-prd-specs）

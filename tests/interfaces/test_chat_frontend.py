@@ -154,6 +154,8 @@ def test_chat_session_panel_collapse_assets():
         "grid-template-columns: 280px minmax(0, 2fr) 280px"
     ) != -1
     assert "padding-right: 16px" in _css_rule_bodies(styles, ".chat-shell")[0]
+    assert "gap: 16px 6.4px" in _css_rule_bodies(styles, ".chat-shell")[0]
+    assert "gap: 16px 8px" not in _css_rule_bodies(styles, ".chat-shell")[0]
     assert not _css_rule_bodies(styles, ".chat-shell:not(.chat-shell--side-collapsed)")
     assert "grid-template-columns: 280px minmax(0, 1fr)" in _css_rule_bodies(styles, ".chat-shell.chat-shell--side-collapsed")[0]
     assert "grid-template-columns: minmax(0, 1fr) 280px" in _css_rule_bodies(

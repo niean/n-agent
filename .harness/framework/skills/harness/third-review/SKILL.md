@@ -9,6 +9,8 @@ Run an independent, provider-backed review after the document's built-in Review 
 
 ## Inputs
 
+From the Git repository root, call `sh .harness/framework/scripts/get-config.sh thirdReview.enabled` before provider resolution. The capability is disabled when the normalized output is `false`, and enabled only when it is `true`. A nonzero getter exit is a validation failure. Do not read or parse `.harness/harness.json` directly.
+
 Require:
 
 - `doc_type`: exactly `spec` or `plan`.
@@ -16,12 +18,12 @@ Require:
 - `review_loop_evidence`: current-Task evidence that the corresponding Review Loop completed and corrected this exact target.
 - `spec_file`: required only for `plan`; it must be the distinct associated spec and evidence must show that its Phase 2 GATE was confirmed.
 
-Accept optional non-empty `provider` and `model`. Reject NUL or newline in model and reject NUL in any input. Treat empty optional values as absent. Evidence is invalid when it belongs to another Task, path, document revision, or retry.
+Accept optional non-empty `provider` and `model`. Resolve `provider` in this order: explicit Skill input, non-empty `HARNESS_THIRD_REVIEW_PROVIDER`, then the output of `get-config.sh thirdReview.provider`. Resolve `model` in the same order using `HARNESS_THIRD_REVIEW_MODEL` and `get-config.sh thirdReview.model`; an empty getter result is absent. Resolve timeout from valid `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS`, then `get-config.sh thirdReview.timeoutSeconds`. Reject unresolved or placeholder-valued provider configuration instead of assuming a built-in provider. Reject NUL or newline in model and reject NUL in any input. Treat empty optional values as absent. Evidence is invalid when it belongs to another Task, path, document revision, or retry.
 
 ## Execute
 
-1. Validate all inputs and evidence before invoking a shell. For a retry, validate again and establish a new invocation identity; all earlier results and skip confirmations become stale.
-2. From the Git repository root, apply explicit non-empty provider/model values only to this invocation through `HARNESS_THIRD_REVIEW_PROVIDER` and `HARNESS_THIRD_REVIEW_MODEL`. The review deadline is a runner-owned framework setting: `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS` (integer seconds, 1-86400, default 900), validated and enforced by the runner watchdog as the single deadline; provider adapters must not implement their own timeouts. Because reviews commonly take several minutes, keep the 900-second default unless an explicit task requirement justifies another value, and ensure any outer command timeout is not shorter than the runner deadline plus cleanup time.
+1. Resolve the project `enabled` switch through the getter. When disabled, return the `disabled` state immediately and do not resolve provider resources or invoke the runner. When enabled, validate all inputs and evidence before invoking the runner. For a retry, validate again and establish a new invocation identity; all earlier results and skip confirmations become stale.
+2. From the Git repository root, call the getter separately for any needed provider/model/timeout configuration, resolve the input precedence above, and apply the resolved values only to this invocation through `HARNESS_THIRD_REVIEW_PROVIDER`, optional `HARNESS_THIRD_REVIEW_MODEL`, and `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS`. Any getter failure blocks the review as `validation`; do not source, execute, or independently parse `.harness/harness.json`. The runner validates and enforces the timeout (integer seconds, 1-86400) as the single deadline; provider adapters must not implement their own timeouts. Ensure any outer command timeout is not shorter than the runner deadline plus cleanup time.
 3. Invoke the runner in the foreground and wait for its own exit status. The caller must not append `&` or pipe the command through `tail` or another consumer that replaces the runner exit status. The runner itself starts only the provider and watchdog as managed background children, redirects their output to runner-owned files or `/dev/null`, and explicitly waits for or terminates them before returning. Invoke:
 
    ```sh
@@ -35,6 +37,17 @@ Accept optional non-empty `provider` and `model`. Reject NUL or newline in model
 The document prompts are `prompts/spec-review.md` and `prompts/plan-review.md`. The runner owns provider selection, path checks, target-file boundaries, timeouts, and the five-field provider output contract. It does not snapshot or monitor repository HEAD, Git index, or files outside the explicit target and associated spec.
 
 ## States
+
+### Disabled
+
+When project configuration does not enable Third Review, return:
+
+```text
+third_review: disabled
+配置依据: get-config.sh thirdReview.enabled=false
+```
+
+This is a normal non-review state, not a failure or confirmed skip. The caller may continue its existing Phase sequence.
 
 ### Success
 

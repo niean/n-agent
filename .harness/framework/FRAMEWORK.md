@@ -42,8 +42,9 @@ Workflow 可在明确声明的扩展点调用 `.harness/hooks/` 下的项目自�
 
 ### after-finish Hook
 
-- 支持在 Workflow 最后一个 Phase 成功结束后执行自定义收尾命令，统一入口为 `.harness/hooks/after-finish.sh`
+- 支持在 Workflow 最后一个 Phase 成功结束后执行自定义收尾命令，配置开关通过 `sh .harness/framework/scripts/get-config.sh hooks.afterFinish.enabled` 获取，统一入口为 `.harness/hooks/after-finish.sh`
 - Hook 仅在 Workflow 明确声明时执行；当前适用 Workflow：`iterate-feature`、`refine-feature`、`fix-bug`
+- 配置缺失或开关为 `false` 时返回 `hook: disabled`，不得检查或执行脚本
 - Hook 文件不存在时视为未定义，直接跳过；不得因为未定义 Hook 中断或降级 Workflow
 - Hook 文件存在时执行：`sh .harness/hooks/after-finish.sh`
 - Hook 失败不回滚已完成 Phase；必须在最终输出中标注失败命令和退出码，等待用户决策
@@ -108,9 +109,13 @@ subagent 为性能优化手段，非流程成败条件。所有使用 subagent �
 
 ## Third Review（三方审阅）
 
-Third Review 是 Workflow 内部的通用 Skill，用于在主流程模型产出关键文档后引入可替换 provider 审阅并修正文件。spec/plan 顺序固定为：文档 Skill 自带 Review Loop -> `Skill: 三方审阅` -> Third Review Skill 内的主流程复审。它不新增 Phase、不改变 GATE，也不替代前序 Review Loop。
+Third Review 是 Workflow 内部的通用 Skill，用于在主流程模型产出关键文档后引入可替换 provider 审阅并修正文件。能力默认关闭；项目启用后，spec/plan 顺序固定为：文档 Skill 自带 Review Loop -> `Skill: 三方审阅` -> Third Review Skill 内的主流程复审。它不新增 Phase、不改变 GATE，也不替代前序 Review Loop。
 
-流程、输入、provider 选择、输出、失败确认和跳过状态的唯一权威定义是 `.harness/framework/skills/harness/third-review/SKILL.md`。Workflow 只决定调用时机并传入当前 Task 的文件路径与 Review Loop evidence，不直接调用 runner、provider 或读取 provider 环境变量。
+流程、输入、provider 选择、输出、失败确认和跳过状态的唯一权威定义是 `.harness/framework/skills/harness/third-review/SKILL.md`。项目开关和默认 provider/model/timeout 定义在 `.harness/harness.json` 的 `thirdReview` 配置中，并通过统一配置脚本获取；Workflow 只决定调用时机并传入当前 Task 的文件路径与 Review Loop evidence，不直接调用 runner、provider 或读取 provider 环境变量。
+
+## Harness 运行配置
+
+`.harness/harness.json` 是机器可读运行配置的唯一权威源，使用严格 JSON。所有消费者必须从项目根目录调用 `sh .harness/framework/scripts/get-config.sh <config-key>`，不得自行解析 JSON 或从自然语言推断默认值。脚本首版支持 `thirdReview.enabled`、`thirdReview.provider`、`thirdReview.model`、`thirdReview.timeoutSeconds`、`hooks.afterFinish.enabled`，确定性默认值依次为 `false`、空、空、`900`、`false`；布尔输出为 `true`/`false`，`null` 输出为空行。配置文件缺失时使用默认值；配置存在时严格校验 JSON、`version=1`、字段结构和类型。脚本按 `jq` -> `python3` -> `node` 自动选择可用 JSON 解析器，均不可用时明确失败。`.harness/PROJECT.md` 继续承载人工规则和项目说明，不重复运行值。
 
 ## Workflows（端到端编排）
 
@@ -253,6 +258,8 @@ AI 自主维护教训库，人工可通过提示或建议触发新增/修正。
 ```
 .harness/framework/
   FRAMEWORK.md         -- 通用规范入口（本文件）
+  scripts/
+    get-config.sh      -- Harness 运行配置统一读取与默认值入口
   agents/              -- Agent 角色模板（Orchestrator、Designer、Planner、Coder、Reviewer）
   workflows/           -- Workflow 端到端编排（迭代功能、修复Bug、迭代文档）
     harness-ops/       -- Harness 运维类 Workflow（治理代码-人工、治理技能-人工）

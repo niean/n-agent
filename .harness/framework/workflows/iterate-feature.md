@@ -37,23 +37,23 @@ Workflow Progress:
 - Agent: Designer
 - 执行 `Skill: brainstorming`（`.harness/framework/skills/superpowers/brainstorming.md`），按其完整流程执行
 - spec 落盘后，先确认 `brainstorming.md` 的 Spec Review Loop 已完成并修正 spec，再执行 `Skill: 三方审阅`（`.harness/framework/skills/harness/third-review/SKILL.md`），输入 `doc_type=spec`、`target_file=<spec_file>` 和当前 Task 的 `review_loop_evidence`
-- 仅当三方审阅返回 `executed` 或经绑定确认返回 `skipped` 时继续；`awaiting-skip-confirmation` 时停止本 Workflow
+- 三方审阅返回 `disabled`、`executed` 或经绑定确认返回 `skipped` 时继续；`awaiting-skip-confirmation` 时停止本 Workflow
 - spec 经 Spec Review Loop、Third Review 和主流程复审后，向用户输出需求摘要（目标 + 范围 + 方案 + 验收标准），等待确认
 - 用户修正时：更新 spec，输出完整摘要再次确认
 - `[GATE]` 规则见 FRAMEWORK.md
 
-检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, third_review: executed/skipped/awaiting-skip-confirmation, 方案: 已确认`
+检查点：`[Phase 2 需求探索与设计] goal: ..., scope: N 文件, third_review: disabled/executed/skipped/awaiting-skip-confirmation, 方案: 已确认`
 
 ## Phase 3: 计划制定 `[GATE-ENTRY]`
 - Agent: Planner
 - `[GATE-ENTRY]` 前置条件：用户已在上一条消息中明确确认 spec；若 Phase 2 在当前回复中刚输出，说明 GATE 被违反，必须停止
 - 执行 `Skill: writing-plans`（`.harness/framework/skills/superpowers/writing-plans.md`），按其流程执行到 "Plan Review Loop" 后终止；"Execution Handoff" 由本 Phase 自行执行
 - plan 落盘后，先确认 `writing-plans.md` 的 Plan Review Loop 已完成并修正 plan，再执行 `Skill: 三方审阅`（`.harness/framework/skills/harness/third-review/SKILL.md`），输入 `doc_type=plan`、`target_file=<plan_file>`、`spec_file=<spec_file>` 和当前 Task 的 `review_loop_evidence`；evidence 同时证明关联 spec 已通过 Phase 2 GATE
-- 仅当三方审阅返回 `executed` 或经绑定确认返回 `skipped` 时继续；`awaiting-skip-confirmation` 时停止本 Workflow
+- 三方审阅返回 `disabled`、`executed` 或经绑定确认返回 `skipped` 时继续；`awaiting-skip-confirmation` 时停止本 Workflow
 - plan 经 Plan Review Loop、Third Review 和主流程复审后，执行 `Skill: writing-verify`（`.harness/framework/skills/superpowers/writing-verify.md`），输入 Phase 2 spec 文件路径和 Phase 3 plan 文件路径，生成独立旁路人工验收文件 `.harness/specs/verify/verify-{YYMMDD}-{desc}.md`
 - plan 经 Plan Review Loop、Third Review 和主流程复审后，确定执行方式（Subagent-Driven / Inline Execution）后直接进入 Phase 4：若用户在输入指令中明确指定了执行方式则遵从；否则 AI 按任务规模自主决策，plan 中 task <= 3 个时使用 Inline Execution，其余使用 Subagent-Driven，无需人工确认。禁止中断回复等待确认 -- 本 Phase 无 [GATE] 标记，plan 复审后必须自主推进
 
-检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: executed/skipped/awaiting-skip-confirmation, 执行方式: subagent/inline`
+检查点：`[Phase 3 计划制定] tasks: N 个, steps: M 步, third_review: disabled/executed/skipped/awaiting-skip-confirmation, 执行方式: subagent/inline`
 
 ## Phase 4: 代码实现
 - Agent: Coder
@@ -78,9 +78,9 @@ Workflow Progress:
 ## Phase 7: 任务总结
 - Agent: Orchestrator
 - 执行顺序：`Skill: 归档任务文件`（输入：Phase 2 spec 文件路径 + Phase 3 plan 文件路径）-> `Skill: 总结任务` -> Phase 7 结束 -> 执行 after-finish Hook -> 提醒人工验收 -> 结束任务，在同一条回复中完成
-- after-finish Hook：若 `.harness/hooks/after-finish.sh` 存在且为普通可读文件，执行 `sh .harness/hooks/after-finish.sh`；若文件不存在则跳过。文件非法或 Hook 失败不回滚 Phase 7，但必须在最终输出中标注失败命令和退出码
+- after-finish Hook：调用 `sh .harness/framework/scripts/get-config.sh hooks.afterFinish.enabled`；输出 `false` 时返回 `hook: disabled` 且不检查 Hook，输出 `true` 时若 `.harness/hooks/after-finish.sh` 存在且为普通可读文件，执行 `sh .harness/hooks/after-finish.sh`，文件不存在返回 `hook: skipped`。配置 getter、文件或 Hook 执行失败不回滚 Phase 7，但必须在最终输出中标注失败命令和退出码
 
-检查点：`[Phase 7 任务总结] 归档: spec+plan, hook: executed/skipped/failed, 状态: 完成`
+检查点：`[Phase 7 任务总结] 归档: spec+plan, hook: disabled/skipped/executed/failed, 状态: 完成`
 
 ---
 

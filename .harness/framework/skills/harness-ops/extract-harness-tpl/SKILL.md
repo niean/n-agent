@@ -22,13 +22,14 @@ description: 从当前项目提取可复用的 Harness 工程模板
 蒸馏规则：
 1. CLAUDE.md：直接拷贝，无需修改内容（兼容Claude Code项目环境）
 2. AGENTS.md+FRAMEWORK.md+PROJECT.md+README：剥离项目专属信息，替换为 `{{占位符}}`
-3. 保留通用框架/结构/流程
-4. 通用规范原文保留；项目规范保留骨架，专属条目替换占位符
-5. Subskills 目录仅含通用模板 scan-dimension.md，直接拷贝；扫描维度定义在 `.harness/PROJECT.md` 中，随项目规范一起蒸馏
-6. .harness/knowledge/ 和 .harness/prd/ 文件保留结构，正文替换占位符；特例：.harness/prd/03-prd-specs.md也需要蒸馏为模板
-7. .harness/plans/、.harness/specs/ 保留目录结构；特例：.harness/plans/debt-tracker.md 也需要蒸馏为模板
-8. 禁用 emoji/加粗/斜体
-9. 蒸馏判断标准是"内容归属"而非"内容是否具体"：框架自身的版本历史、设计哲学、约束声明等属于框架元数据，应原文保留；仅项目专属信息（项目名、技术栈、业务规则等）才替换为占位符
+3. `.harness/harness.json`：保留 `version=1` 和完整字段结构；模板中的 Third Review 与 Hook 必须默认关闭，provider 等项目选择使用可保持 JSON 合法的字符串占位符；`.harness/framework/scripts/get-config.sh` 作为通用确定性读取入口原文同步
+4. 保留通用框架/结构/流程
+5. 通用规范原文保留；项目规范保留骨架，专属条目替换占位符
+6. Subskills 目录仅含通用模板 scan-dimension.md，直接拷贝；扫描维度定义在 `.harness/PROJECT.md` 中，随项目规范一起蒸馏
+7. .harness/knowledge/ 和 .harness/prd/ 文件保留结构，正文替换占位符；特例：.harness/prd/03-prd-specs.md也需要蒸馏为模板
+8. .harness/plans/、.harness/specs/ 保留目录结构；特例：.harness/plans/debt-tracker.md 也需要蒸馏为模板
+9. 禁用 emoji/加粗/斜体
+10. 蒸馏判断标准是"内容归属"而非"内容是否具体"：框架自身的版本历史、设计哲学、约束声明等属于框架元数据，应原文保留；仅项目专属信息（项目名、技术栈、业务规则等）才替换为占位符
 
 ### Step 3 -- 清理多余文件
 比对目标目录，排除 .git/、LICENSE、.DS_Store、node_modules/、*.log 文件；其余不在源目录中的文件经确认后删除。
@@ -39,7 +40,7 @@ description: 从当前项目提取可复用的 Harness 工程模板
 
 执行方式：
 1. 从当前项目 PROJECT.md 提取项目名称和关键业务术语作为维度1搜索关键词
-2. 按维度1-5顺序扫描目标目录所有 .md 文件
+2. 按维度1-5顺序扫描目标目录所有 .md 文件、`.harness/harness.json` 及 `.harness/framework/scripts/get-config.sh`
 3. 维度6（版本漂移）：以当前项目 `.harness/framework/` 为基准，比对目标目录同名文件
 4. 按 references/scan-harness-tpl.md 报告格式输出扫描结果
 
