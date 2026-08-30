@@ -143,6 +143,7 @@ Docker Compose 项目隔离使用：
 - 操作入口（按钮/菜单）规范：除左侧导航、顶部导航外，禁止使用 pop 二级菜单（`<details>`/`<summary>` 下拉、hover/click popover、右键菜单等悬浮二级面板）承载操作。操作入口统一用共享 `.btn` 标准按钮直接触发；需要用户确认额外信息（如格式、参数）时，用项目标准 Modal（`modal-backdrop`/`modal-dialog`/`providers-form`，见 `app/interfaces/http/static/management-ui.js` `buildModalFrame`）承载。除非用户明确要求使用二级菜单，否则一律不引入。反例：制品导出曾用 `<details>` 下拉列出格式，已改为标准按钮 + 导出确认 Modal（`app/interfaces/http/static/artifacts.js` `openExportModal`）。
 - 新增或修改静态前端模块时，必须保持 `tests/interfaces/test_static_assets.py` 的原生 alert 扫描通过。
 - 前端时间展示统一按 UTC+8（Asia/Shanghai）渲染，不依赖浏览器本地时区。服务端时间统一 UTC 存储（ISO 8601 / RFC 3339，如 `2026-07-28T12:00:00Z`），展示层一律用 `new Date(ms + 8 * 3600 * 1000)` 偏移后取 `getUTCFullYear/getUTCMonth/getUTCDate/getUTCHours/getUTCMinutes/getUTCSeconds` 分量格式化；各静态模块（chat/sandbox/host/observations/browser/tasks/scheduled-tasks/platforms）共用此 `formatTime`/`formatDate` 模式。新增时间渲染必须遵循，禁止用 `getHours()` 等本地时区方法或 `toLocaleString()` 渲染时间戳（`toLocaleString()` 仅用于数字 `formatNumber`）。
+- 多入口模式下，相同页面必须使用独立的 `routeConfig` entry（独立 `path`）与独立的左导/顶导菜单配置；只允许共享 renderer 代码，禁止复用路由和菜单。默认禁止单页面多路由别名模式（如 `path-alias` 把 `A/foo` 透明重定向到既有路径 `B/bar`），如需复用须用户明确说明。`topnavParent` / `scope` / `sidebarTab` 按 entry 各自所属左导入口语义独立归类；`path` 必须全局唯一；entry 之间共享 `tab` 与 `renderTab` 仅用于 activeTab 匹配与 renderer 复用，不豁免路由/菜单独立性。**顶导是左导的子域**：顶导 items 归属左导父菜单的子域（每个左导父菜单项对应一份统一顶导），左导入口菜单的对应页面统一增加顶导菜单（已有则不调整），避免顶导脱离左导语义独立存在。典型用例：`/sessions/observations` 与 `/observations/sessions` 共享 observations.js renderer，但分别归 `sessions` / `observations` 子域，顶导与左导按各自 entry 所属子域渲染（详见 `knowledge/05-key-patterns.md` 模式三十九）。
 
 ## 验收命令
 

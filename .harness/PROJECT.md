@@ -129,7 +129,7 @@ sh tests/e2e/run.sh
 - 错误处理：异常分业务/系统/校验三类，统一错误响应格式
 - 测试：TDD 严格顺序 S1→S5（spec/红/实现/绿/重构），单测宿主机、E2E 必须在 Docker
 - 文件管理：禁止创建 docs/ 目录；新建文档放 .harness/knowledge/ 或 specs/plans
-- Dashboard 前端：禁止原生 alert/confirm；modal/按钮/菜单/时间渲染统一规范
+- Dashboard 前端：禁止原生 alert/confirm；modal/按钮/菜单/时间渲染统一规范；多入口模式下禁止复用路由和菜单（相同页面必须用独立 routeConfig entry 与独立左导/顶导菜单，顶导是左导的子域）
 
 ## 架构边界
 

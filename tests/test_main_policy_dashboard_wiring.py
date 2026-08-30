@@ -73,7 +73,8 @@ def _route_paths(app) -> list[str]:
 def test_create_app_registers_security_and_policy_routes(tmp_path: Path):
     app = create_app(_settings(tmp_path))
     paths = set(_route_paths(app))
-    assert "/security" in paths
+    for path in ("/security", "/security/sessions", "/security/memory", "/security/sandbox"):
+        assert path in paths
     assert "/chat/policies" in paths
 
 

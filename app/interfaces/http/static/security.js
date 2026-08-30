@@ -4,10 +4,17 @@
   const EXPECTED_KEYS = [
     'turn', 'context', 'llm', 'tool', 'memory',
     'sandbox', 'gateway', 'schedule', 'budget', 'information_flow',
+    'delegation',
   ];
   const POLICY_FIELDS = ['key', 'name', 'display_name', 'dimension', 'execution_point', 'domain_file', 'config'];
   const CFG_FIELDS = ['key', 'label', 'value'];
-  const state = { data: null, loading: false, error: '', token: 0 };
+  const SCOPES = Object.freeze({
+    overview: Object.freeze(EXPECTED_KEYS.slice()),
+    sessions: Object.freeze(['turn', 'context', 'llm', 'tool', 'budget', 'information_flow', 'delegation']),
+    memory: Object.freeze(['memory']),
+    sandbox: Object.freeze(['sandbox']),
+  });
+  const state = { data: null, loading: false, error: '', token: 0, scope: null };
   let initialized = false;
 
   function clear(node) { if (node) node.textContent = ''; }
@@ -36,11 +43,12 @@
 
   function validate(payload) {
     if (!payload || typeof payload !== 'object') throw new Error('policy_load_failed');
+    if (!sameKeys(payload, ['profile_version', 'policies'])) throw new Error('policy_load_failed');
     if (typeof payload.profile_version !== 'string' || !payload.profile_version) {
       throw new Error('policy_load_failed');
     }
     const policies = payload.policies;
-    if (!Array.isArray(policies) || policies.length !== 10) throw new Error('policy_load_failed');
+    if (!Array.isArray(policies) || policies.length !== EXPECTED_KEYS.length) throw new Error('policy_load_failed');
     const keys = policies.map((p) => (p && typeof p === 'object') ? p.key : null);
     if (keys.join(',') !== EXPECTED_KEYS.join(',')) throw new Error('policy_load_failed');
     policies.forEach((p) => {
@@ -86,15 +94,20 @@
     btn.type = 'button';
     btn.className = 'btn';
     btn.textContent = '重试';
-    btn.addEventListener('click', () => refresh());
+    btn.addEventListener('click', () => refresh({ route: { scope: state.scope } }));
     wrap.appendChild(btn);
     root.appendChild(wrap);
   }
 
-  function render(root) {
+  function render(root, data, scope) {
+    const keys = SCOPES[scope];
+    if (!keys || !keys.length || !data || !Array.isArray(data.policies)
+        || data.policies.length !== keys.length) {
+      throw new Error('policy_load_failed');
+    }
     clear(root);
-    root.appendChild(overview(state.data));
-    state.data.policies.forEach((p) => root.appendChild(sector(p)));
+    root.appendChild(overview(data));
+    data.policies.forEach((p) => root.appendChild(sector(p)));
   }
 
   // Shared renderers exposed as namespace.security.renderers for reuse by
@@ -210,37 +223,57 @@
     return item;
   }
 
-  async function refresh() {
+  function scopeFor(routeState) {
+    const scope = routeState && routeState.route && routeState.route.scope;
+    return Object.prototype.hasOwnProperty.call(SCOPES, scope) ? scope : null;
+  }
+
+  function renderFailure(root) {
+    state.data = null;
+    state.loading = false;
+    state.error = 'policy_load_failed';
+    renderError(root);
+  }
+
+  async function refresh(routeState) {
     const root = getRoot();
     if (!root) return;
+    const scope = scopeFor(routeState);
     const myToken = ++state.token;
+    if (!scope) {
+      state.scope = null;
+      renderFailure(root);
+      return;
+    }
+    state.scope = scope;
     state.loading = true;
     state.error = '';
     renderLoading(root);
     try {
-      const payload = await api.listPolicies();
-      if (myToken !== state.token) return;
+      const payload = await api.listPolicies(scope);
+      if (myToken !== state.token || scope !== state.scope) return;
       validate(payload);
-      state.data = payload;
+      const policies = payload.policies.filter((p) => SCOPES[scope].indexOf(p.key) !== -1);
+      if (policies.length !== SCOPES[scope].length) throw new Error('policy_load_failed');
+      state.data = { profile_version: payload.profile_version, policies: policies };
       state.loading = false;
-      render(root);
+      render(root, state.data, scope);
     } catch (err) {
-      if (myToken !== state.token) return;
-      state.data = null;
-      state.loading = false;
-      state.error = 'policy_load_failed';
-      renderError(root);
+      if (myToken !== state.token || scope !== state.scope) return;
+      renderFailure(root);
     }
   }
 
-  function init() {
+  function init(routeState) {
     if (initialized) return;
     initialized = true;
-    refresh();
+    return refresh(routeState);
   }
 
+  function activate(routeState) { return refresh(routeState); }
+
   global.NAGENT = namespace;
-  global.NAGENT.security = { init, refresh };
+  global.NAGENT.security = { init, refresh, activate };
   // Expose shared renderers AFTER the {init, refresh} assignment so the object
   // already exists; setting .renderers does not overwrite init/refresh.
   // Shortened keys mirror namespace.observations.renderers convention.

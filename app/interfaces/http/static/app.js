@@ -87,7 +87,14 @@
     const topnavMount = document.getElementById('topnav-mount');
     const topnav = namespace.topnav;
     const topnavConfig = (namespace.navigation && namespace.navigation.topnavConfig) || {};
-    const items = state.currentSubdomain ? topnavConfig[state.currentSubdomain] : null;
+    // The shared subdomain TopNav wins for multi-entry routes (e.g. the new
+    // /sessions/security entry shares tab='security-sessions' with
+    // /security/sessions, but the sessions subdomain renders its own
+    // 3-item navigation). Fall back to the active tab's private TopNav only
+    // when the shared subdomain has no entry (e.g. /security/* children).
+    const items = state.currentSubdomain
+      ? (topnavConfig[state.currentSubdomain] || topnavConfig[state.activeTab])
+      : null;
     const hasTopnav = items && items.length && topnav && typeof topnav.render === 'function';
     if (hasTopnav) {
       if (topnavMount) topnavMount.hidden = false;
@@ -149,15 +156,21 @@
 
     if (!initialized[tab]) {
       // First activation: init. Share in-flight Promise to prevent duplicate
-      // init requests from concurrent onTabActivated calls.
-      if (inflight[tab]) return inflight[tab];
+      // init requests from concurrent onTabActivated calls. A shared renderer
+      // may still need the latest route state while its first load is pending.
+      if (inflight[tab]) {
+        if (typeof module.activate === 'function') {
+          return Promise.resolve(module.activate(state));
+        }
+        return inflight[tab];
+      }
       inflight[tab] = (async () => {
         try {
           if (typeof module.init === 'function') {
-            await Promise.resolve(module.init());
+            await Promise.resolve(module.init(state));
           }
           if (secondary && typeof secondary.init === 'function') {
-            await Promise.resolve(secondary.init());
+            await Promise.resolve(secondary.init(state));
           }
           initialized[tab] = true;
         } catch (e) {
@@ -172,9 +185,9 @@
     // Subsequent activation: refresh only (chat skips refresh on activation).
     if (tab !== 'chat' && typeof module.refresh === 'function') {
       try {
-        await Promise.resolve(module.refresh());
+        await Promise.resolve(module.refresh(state));
         if (secondary && typeof secondary.refresh === 'function') {
-          await Promise.resolve(secondary.refresh());
+          await Promise.resolve(secondary.refresh(state));
         }
       } catch (e) {
         renderModuleError(tab, e);

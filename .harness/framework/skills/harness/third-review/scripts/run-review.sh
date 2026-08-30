@@ -1,9 +1,54 @@
 #!/bin/sh
 
 failure_step=validation
+failure_detail=
+result_dir=
+stdout_file=
+stderr_file=
+diagnostic_file=
+target_file=
+spec_file=
+provider_name=
+timeout_seconds=
+target_hash_before=
+
+persist_validation_result() {
+    validation_exit=$1
+    [ -n "$result_dir" ] || return 0
+    : >"$result_dir/stdout.txt" 2>/dev/null || :
+    if [ -s "$diagnostic_file" ]; then
+        cp "$diagnostic_file" "$result_dir/stderr.txt" 2>/dev/null || :
+    else
+        : >"$result_dir/stderr.txt" 2>/dev/null || :
+    fi
+    {
+        printf '%s\n' \
+            'outcome=failure' \
+            "exit_code=$validation_exit" \
+            "failure_step=$failure_step" \
+            "failure_detail=$failure_detail" \
+            "provider=$provider_name" \
+            "doc_type=${doc_type:-}" \
+            "target_file=$target_file" \
+            "spec_file=$spec_file" \
+            "timeout_seconds=$timeout_seconds" \
+            'target_changed=unknown'
+    } >"$result_dir/result.txt" 2>/dev/null || :
+    printf '%s\n' "$result_dir" >"$result_root/latest-result-path.txt" 2>/dev/null || :
+    return 0
+}
+
+emit_error() {
+    error_message=$1
+    printf '%s\n' "$error_message" >&2
+    if [ -n "$diagnostic_file" ]; then
+        printf '%s\n' "$error_message" >>"$diagnostic_file" 2>/dev/null || :
+    fi
+}
 
 fail() {
-    printf '%s\n' "$failure_step: $1" >&2
+    failure_detail=$1
+    emit_error "$failure_step: $failure_detail"
     exit 2
 }
 
@@ -106,6 +151,14 @@ has_ascii_control "$repo_root" && fail 'canonical Git root must not contain ASCI
 current_dir=$(pwd -P) || fail 'current directory is unavailable'
 [ "$current_dir" = "$repo_root" ] || fail 'runner must execute at the Git root'
 
+result_root=$repo_root/locals/harness_tmp/third-review-results
+run_id=$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null)-$$
+result_dir=$result_root/$run_id
+mkdir -p "$result_dir" || fail 'cannot create retained result directory'
+diagnostic_file=$result_dir/runner-diagnostics.txt
+: >"$diagnostic_file" || fail 'cannot initialize retained diagnostics'
+trap 'validation_exit=$?; persist_validation_result "$validation_exit"; exit "$validation_exit"' EXIT
+
 runner_path=$0
 case $runner_path in
     /*) ;;
@@ -164,6 +217,56 @@ provider_pid=
 watchdog_pid=
 killer_pid=
 
+persist_result() {
+    retained_exit=$1
+    retained_outcome=failure
+    retained_failure_step=$failure_step
+    retained_failure_detail=$failure_detail
+    if [ "$retained_exit" -eq 0 ]; then
+        retained_outcome=success
+        retained_failure_step=none
+        retained_failure_detail=
+    fi
+    retained_target_changed=unknown
+    if [ -n "$target_hash_before" ] && [ -n "$target_file" ] && [ -f "$target_file" ]; then
+        retained_target_hash=$(git hash-object --no-filters -- "$target_file" 2>/dev/null || true)
+        if [ -n "$retained_target_hash" ]; then
+            if [ "$retained_target_hash" = "$target_hash_before" ]; then
+                retained_target_changed=false
+            else
+                retained_target_changed=true
+            fi
+        fi
+    fi
+    if [ -n "$stdout_file" ] && [ -f "$stdout_file" ]; then
+        cp "$stdout_file" "$result_dir/stdout.txt" 2>/dev/null || :
+    else
+        : >"$result_dir/stdout.txt" 2>/dev/null || :
+    fi
+    : >"$result_dir/stderr.txt" 2>/dev/null || :
+    if [ -n "$stderr_file" ] && [ -f "$stderr_file" ]; then
+        cat "$stderr_file" >>"$result_dir/stderr.txt" 2>/dev/null || :
+    fi
+    if [ -s "$diagnostic_file" ]; then
+        cat "$diagnostic_file" >>"$result_dir/stderr.txt" 2>/dev/null || :
+    fi
+    {
+        printf '%s\n' \
+            "outcome=$retained_outcome" \
+            "exit_code=$retained_exit" \
+            "failure_step=$retained_failure_step" \
+            "failure_detail=$retained_failure_detail" \
+            "provider=$provider_name" \
+            "doc_type=$doc_type" \
+            "target_file=$target_file" \
+            "spec_file=$spec_file" \
+            "timeout_seconds=$timeout_seconds" \
+            "target_changed=$retained_target_changed"
+    } >"$result_dir/result.txt" 2>/dev/null || :
+    printf '%s\n' "$result_dir" >"$result_root/latest-result-path.txt" 2>/dev/null || :
+    return 0
+}
+
 cleanup() {
     [ -z "$watchdog_pid" ] || kill "$watchdog_pid" 2>/dev/null || :
     [ -z "$killer_pid" ] || kill "$killer_pid" 2>/dev/null || :
@@ -188,8 +291,9 @@ handle_signal() {
     caught_signal=$1
     trap '' HUP INT TERM
     terminate_provider
-    cleanup
-    printf '%s\n' "provider: interrupted by signal $caught_signal" >&2
+    failure_step=provider
+    failure_detail="interrupted by signal $caught_signal"
+    emit_error "provider: $failure_detail"
     case $caught_signal in
         HUP) exit 129 ;;
         INT) exit 130 ;;
@@ -197,7 +301,7 @@ handle_signal() {
     esac
 }
 
-trap cleanup EXIT
+trap 'retained_exit=$?; persist_result "$retained_exit"; cleanup; exit "$retained_exit"' EXIT
 trap 'handle_signal HUP' HUP
 trap 'handle_signal INT' INT
 trap 'handle_signal TERM' TERM
@@ -253,6 +357,14 @@ if [ "$doc_type" = plan ]; then
 fi
 
 failure_step=provider
+HARNESS_THIRD_REVIEW_TARGET_FILE=$target_file
+export HARNESS_THIRD_REVIEW_TARGET_FILE
+if [ "$doc_type" = plan ]; then
+    HARNESS_THIRD_REVIEW_SPEC_FILE=$spec_file
+    export HARNESS_THIRD_REVIEW_SPEC_FILE
+else
+    unset HARNESS_THIRD_REVIEW_SPEC_FILE
+fi
 if [ -n "$model" ]; then
     (
         HARNESS_THIRD_REVIEW_MODEL=$model
@@ -288,11 +400,13 @@ kill "$watchdog_pid" 2>/dev/null || :
 wait "$watchdog_pid" 2>/dev/null || :
 watchdog_pid=
 if [ -f "$timeout_marker" ]; then
-    printf '%s\n' "provider: timed out after $timeout_seconds seconds (exit timeout)" >&2
+    failure_detail="timed out after $timeout_seconds seconds (exit timeout)"
+    emit_error "provider: $failure_detail"
     exit 124
 fi
 if [ "$provider_status" -ne 0 ]; then
-    printf '%s\n' "provider: exited with status $provider_status" >&2
+    failure_detail="exited with status $provider_status"
+    emit_error "provider: $failure_detail"
     if [ -s "$stderr_file" ]; then
         head -n 20 "$stderr_file" | sed 's/^/provider stderr: /' >&2
     fi

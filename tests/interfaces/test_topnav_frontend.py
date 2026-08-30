@@ -11,7 +11,7 @@ TOPNAV_JS = STATIC_DIR / "topnav.js"
 TASKS_OBSERVATIONS_JS = STATIC_DIR / "tasks-observations.js"
 HARNESS_JS = Path(__file__).parent / "topnav_frontend_harness.js"
 
-TARGET_FILES = (NAV_JS, TOPNAV_JS, TASKS_OBSERVATIONS_JS)
+TARGET_FILES = (NAV_JS, TOPNAV_JS, TASKS_OBSERVATIONS_JS, STATIC_DIR / "observations.js")
 
 
 def test_topnav_js_node_syntax_check():

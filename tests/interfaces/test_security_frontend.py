@@ -1,5 +1,7 @@
+import re
 import shutil
 import subprocess
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,32 @@ from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
 SECURITY_JS = STATIC_DIR / "security.js"
 HARNESS_JS = Path(__file__).parent / "security_frontend_harness.js"
 STYLES_CSS = STATIC_DIR / "styles.css"
+
+
+class _SubmenuTabsParser(HTMLParser):
+    """Collect data-tab descendants of one named sidebar submenu."""
+
+    def __init__(self, submenu_of: str):
+        super().__init__()
+        self._submenu_of = submenu_of
+        self._stack: list[bool] = []
+        self.tabs: set[str] = set()
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        if any(self._stack) and values.get("data-tab"):
+            self.tabs.add(values["data-tab"])
+        self._stack.append(values.get("data-submenu-of") == self._submenu_of)
+
+    def handle_endtag(self, tag):
+        if self._stack:
+            self._stack.pop()
+
+
+def _submenu_tabs(html: str, submenu_of: str) -> set[str]:
+    parser = _SubmenuTabsParser(submenu_of)
+    parser.feed(html)
+    return parser.tabs
 
 
 class _StubExecutor(ToolExecutor):
@@ -51,8 +79,21 @@ def test_security_js_static_contract():
     src = SECURITY_JS.read_text(encoding="utf-8")
     assert "NAGENT.security" in src
     assert "api.listPolicies" in src
-    # fixed 10-key order
-    assert "'turn', 'context', 'llm', 'tool', 'memory'" in src
+    # fixed 11-key order (regex across whitespace)
+    m = re.search(r"const\s+EXPECTED_KEYS\s*=\s*\[([^\]]+)\]", src)
+    assert m, "EXPECTED_KEYS 数组未找到"
+    keys = re.findall(r"'([^']+)'", m.group(1))
+    assert keys == [
+        'turn', 'context', 'llm', 'tool', 'memory',
+        'sandbox', 'gateway', 'schedule', 'budget', 'information_flow',
+        'delegation',
+    ], f"EXPECTED_KEYS 顺序不符: {keys}"
+    # 数量校验以 EXPECTED_KEYS.length 为唯一来源（跨空白正则）
+    assert re.search(r"policies\.length\s*!==\s*EXPECTED_KEYS\.length", src), \
+        "validate() 必须以 EXPECTED_KEYS.length 校验数量"
+    # 顶层 envelope 严格校验存在（跨空白正则），必须位于读取 payload 字段前
+    assert re.search(r"sameKeys\s*\(\s*payload\s*,\s*\[\s*'profile_version'\s*,\s*'policies'\s*\]\s*\)", src), \
+        "顶层 envelope 校验必须精确为 sameKeys(payload, ['profile_version', 'policies'])"
     # race guard + single init
     assert "state.token" in src and "myToken" in src
     assert "if (initialized) return" in src
@@ -91,8 +132,24 @@ def test_security_shell_menu_and_assets(tmp_path):
     assert html.count('href="/security"') == 1
     assert html.count('id="tab-security"') == 1
     assert html.count('/static/security.js') == 1
-    # security menu is a top-level leaf after the full observations group
+    # security is a parent group after the full observations group
     assert html.index('data-tab-group="observations"') < html.index('href="/security"')
+    assert html.count('data-tab-group="security"') == 1
+    assert html.count('data-submenu-of="security"') == 1
+    security_parent = re.search(
+        r'<button\b(?=[^>]*\bdata-tab="security")'
+        r'(?=[^>]*\bclass="[^"]*\bsidebar__item--parent\b[^"]*")'
+        r'(?=[^>]*\btype="button")(?=[^>]*\baria-expanded="false")[^>]*>',
+        html,
+    )
+    assert security_parent, "security root must be an expandable sidebar parent button"
+    for tab in ('security-overview', 'security-sessions', 'security-memory', 'security-sandbox'):
+        assert html.count(f'data-tab="{tab}"') == 1
+    assert _submenu_tabs(html, "security") >= {
+        "security-overview", "security-sessions", "security-memory", "security-sandbox",
+    }, "all security child tabs must be contained by the security submenu"
+    for href in ('/security/sessions', '/security/memory', '/security/sandbox'):
+        assert html.count(f'href="{href}"') == 1
     # tab container after observations tab contents
     assert html.index('id="tab-observations-sessions"') < html.index('id="tab-security"')
     # script loaded after management modules, before app.js
@@ -102,11 +159,24 @@ def test_security_shell_menu_and_assets(tmp_path):
     assert "安全" in html
 
 
+@pytest.mark.parametrize("path", ["/security", "/security/sessions", "/security/memory", "/security/sandbox"])
+def test_security_shell_routes_return_dashboard_shell(tmp_path, path):
+    response = _client(tmp_path).get(path)
+    assert response.status_code == 200
+    assert 'id="app-sidebar"' in response.text
+    assert 'id="tab-security"' in response.text
+
+
 def test_summary_has_security_entry():
     summary_js = (STATIC_DIR / "summary.js").read_text(encoding="utf-8")
-    assert "{ tab: 'security', label: '安全', desc: '查看各领域 Policy 管控策略' }" in summary_js
+    security_entry = re.search(
+        r"\{\s*tab\s*:\s*['\"]security-overview['\"]\s*,\s*"
+        r"label\s*:\s*['\"]安全['\"]",
+        summary_js,
+    )
+    assert security_entry, "summary must contain a security-overview entry labelled 安全"
     # placed after the observations entries
-    assert summary_js.index("tab: 'observations-modules'") < summary_js.index("tab: 'security'")
+    assert summary_js.index("tab: 'observations-modules'") < security_entry.start()
 
 
 def test_security_styles_are_namespaced():

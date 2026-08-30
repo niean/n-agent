@@ -23,7 +23,11 @@
     { tab: 'observations', label: '观测', parent: true, children: ['observations-sessions', 'observations-modules'] },
     { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', parentTab: 'observations' },
     { tab: 'observations-modules', path: '/observations/modules', label: '组件', parentTab: 'observations' },
-    { tab: 'security', path: '/security', label: '安全' },
+    { tab: 'security', label: '安全', parent: true, children: ['security-overview', 'security-sessions', 'security-memory', 'security-sandbox'] },
+    { tab: 'security-overview', path: '/security', label: '概览', parentTab: 'security' },
+    { tab: 'security-sessions', path: '/security/sessions', label: '会话', parentTab: 'security' },
+    { tab: 'security-memory', path: '/security/memory', label: '记忆', parentTab: 'security' },
+    { tab: 'security-sandbox', path: '/security/sandbox', label: '沙盒', parentTab: 'security' },
   ];
   const tabNames = tabConfig.map((c) => c.tab);
   const tabByPath = Object.fromEntries(tabConfig.filter((c) => c.path).map((c) => [c.path, c.tab]));
@@ -39,10 +43,49 @@
       { tab: 'tasks-observations', path: '/tasks/observations', label: '观测', concern: 'observation', scope: 'tasks', topnavParent: 'tasks' },
       { tab: 'tasks-security', path: '/tasks/security', label: '安全', concern: 'security', scope: 'tasks', topnavParent: 'tasks' },
     ],
+    sessions: [
+      { tab: 'sessions', path: '/sessions', label: '管理', concern: 'management', scope: 'sessions', topnavParent: 'sessions' },
+      { tab: 'observations-sessions', path: '/sessions/observations', label: '观测', concern: 'observation', scope: 'sessions', topnavParent: 'sessions' },
+      { tab: 'security-sessions', path: '/sessions/security', label: '安全', concern: 'security', scope: 'sessions', topnavParent: 'sessions' },
+    ],
+    observations: [
+      { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', concern: 'observation', scope: 'observations', topnavParent: 'observations' },
+    ],
+    'observations-modules': [
+      { tab: 'observations-modules', path: '/observations/modules', label: '组件', concern: 'observation', scope: 'observations-modules', topnavParent: 'observations-modules' },
+    ],
+    'security-overview': [
+      { tab: 'security-overview', path: '/security', label: '概览', concern: 'security', scope: 'overview', topnavParent: 'security' },
+    ],
+    'security-sessions': [
+      { tab: 'security-sessions', path: '/security/sessions', label: '会话', concern: 'security', scope: 'sessions', topnavParent: 'security' },
+    ],
+    'security-memory': [
+      { tab: 'security-memory', path: '/security/memory', label: '记忆', concern: 'security', scope: 'memory', topnavParent: 'security' },
+    ],
+    'security-sandbox': [
+      { tab: 'security-sandbox', path: '/security/sandbox', label: '沙盒', concern: 'security', scope: 'sandbox', topnavParent: 'security' },
+    ],
   };
   const routeConfig = [
     { paths: ['/tasks/observations', '/observations/tasks'], tab: 'tasks-observations', renderTab: 'tasks-observations', sidebarTab: 'tasks', topnavParent: 'tasks', scope: 'tasks' },
     { paths: ['/tasks/security'], tab: 'tasks-security', renderTab: 'tasks-security', sidebarTab: 'tasks', topnavParent: 'tasks', scope: 'tasks' },
+    // /sessions/observations 是"会话观测"页面的独立 routeConfig entry，
+    // 顶导与左导均归左导一级"会话"语义（顶导 `管理 | 观测`，左导 `会话` 高亮），
+    // 与 /observations/sessions 共享 observations.js renderer（renderTab='observations-sessions'）。
+    { paths: ['/sessions/observations'], tab: 'observations-sessions', renderTab: 'observations-sessions', sidebarTab: 'sessions', topnavParent: 'sessions', scope: 'sessions' },
+    // /observations/sessions 是左导二级"观测-会话"标准入口，左导高亮"观测-会话"，顶导进 observations 子域。
+    { paths: ['/observations/sessions'], tab: 'observations-sessions', renderTab: 'observations-sessions', sidebarTab: 'observations-sessions', topnavParent: 'observations', scope: 'observations' },
+    // /observations/modules 是左导二级"观测-组件"入口，使用组件私有顶导作用域。
+    { paths: ['/observations/modules'], tab: 'observations-modules', renderTab: 'observations-modules', sidebarTab: 'observations-modules', topnavParent: 'observations-modules', scope: 'observations-modules' },
+    { paths: ['/security'], tab: 'security-overview', renderTab: 'security', sidebarTab: 'security-overview', topnavParent: 'security', scope: 'overview' },
+    { paths: ['/security/sessions'], tab: 'security-sessions', renderTab: 'security', sidebarTab: 'security-sessions', topnavParent: 'security', scope: 'sessions' },
+    { paths: ['/security/memory'], tab: 'security-memory', renderTab: 'security', sidebarTab: 'security-memory', topnavParent: 'security', scope: 'memory' },
+    { paths: ['/security/sandbox'], tab: 'security-sandbox', renderTab: 'security', sidebarTab: 'security-sandbox', topnavParent: 'security', scope: 'sandbox' },
+    // /sessions/security 是"会话-安全"页面的独立 routeConfig entry，
+    // 顶导归 sessions 子域（左导一级"会话"父项高亮），与 /security/sessions 共享
+    // security.js renderer（renderTab='security'），与 /tasks/security 同款范式。
+    { paths: ['/sessions/security'], tab: 'security-sessions', renderTab: 'security', sidebarTab: 'sessions', topnavParent: 'sessions', scope: 'sessions' },
   ];
   const sidebarOverride = { '/observations/tasks': 'observations-sessions' };
 
@@ -74,6 +117,7 @@
     tools: 'tools-knowledge',
     observations: 'observations-sessions',
     executors: 'sandbox',
+    security: 'security-overview',
   };
 
   function isParent(name) {
@@ -151,15 +195,14 @@
   }
 
   function navigatePath(path) {
-    // Normalize absolute URLs to pathname so route matching (startsWith) works
-    // for callers that pass element.href (browser-resolved full URL).
-    if (path && /^https?:\/\//i.test(path)) {
-      try { path = new URL(path).pathname; } catch (_) { /* keep original */ }
-    }
-    if (window.location.pathname !== path) {
-      history.pushState({ path }, '', path);
-    }
-    const state = resolveRoute(path);
+    let target;
+    const base = window.location.href || (window.location.protocol + '//' + window.location.host + window.location.pathname);
+    try { target = new URL(path, base); } catch (_) { return; }
+    if (target.origin !== new URL(base).origin) return;
+    const historyTarget = target.pathname + target.search + target.hash;
+    const currentTarget = window.location.pathname + (window.location.search || '') + (window.location.hash || '');
+    if (currentTarget !== historyTarget) history.pushState({ path: historyTarget }, '', historyTarget);
+    const state = resolveRoute(target.pathname);
     applyRoute(state);
   }
 
@@ -266,14 +309,14 @@
       if (closeTopModal()) return;
       closeAllPopouts();
     });
-    window.addEventListener('popstate', () => navigatePath(window.location.pathname));
-    navigatePath(window.location.pathname);
+    window.addEventListener('popstate', () => applyRoute(resolveRoute(window.location.pathname)));
+    navigatePath(window.location.pathname + (window.location.search || '') + (window.location.hash || ''));
   }
 
   global.NAGENT = namespace;
   global.NAGENT.navigation = {
     initNavigation, navigateTo, switchTab: navigateTo, tabNames, pathByTab,
     resolveRoute, applyRoute, navigatePath, activeTopnavItem, buildRouteByPath,
-    topnavConfig, selectedTabFromPath,
+    topnavConfig, selectedTabFromPath, DEFAULT_CHILD,
   };
 }(window));

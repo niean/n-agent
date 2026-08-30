@@ -22,7 +22,7 @@
     { tab: 'platforms', label: '平台', desc: '查看接入平台与平台会话' },
     { tab: 'observations-sessions', label: '会话观测', desc: '查看会话 Token 用量与 API 调用历史' },
     { tab: 'observations-modules', label: '组件观测', desc: '查看依赖组件健康状态' },
-    { tab: 'security', label: '安全', desc: '查看各领域 Policy 管控策略' },
+    { tab: 'security-overview', label: '安全', desc: '查看分域安全 Policy 管控策略' },
   ];
 
   function renderStats(stats, service, dependencies, counts) {

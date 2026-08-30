@@ -158,7 +158,8 @@ function loadNavigation(opts) {
   const tabIds = ['summary', 'chat', 'tasks', 'scheduled-tasks', 'sessions', 'memory',
     'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
     'sandbox', 'executors-host', 'models', 'platforms',
-    'observations-sessions', 'observations-modules', 'security'];
+    'observations-sessions', 'observations-modules', 'security',
+    'security-overview', 'security-sessions', 'security-memory', 'security-sandbox'];
   tabIds.forEach((id) => {
     const el = makeEl('div');
     el._cls.add('tab-content');
@@ -168,17 +169,44 @@ function loadNavigation(opts) {
   const sidebarTabs = ['summary', 'chat', 'tasks', 'scheduled-tasks', 'sessions', 'memory',
     'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
     'executors', 'sandbox', 'executors-host', 'models', 'platforms',
-    'observations', 'observations-sessions', 'observations-modules', 'security'];
+    'observations', 'observations-sessions', 'observations-modules'];
   sidebarTabs.forEach((tab) => {
     const item = makeEl('a');
     item._cls.add('sidebar__item');
     item.dataset.tab = tab;
-    if (['tools', 'executors', 'observations'].indexOf(tab) !== -1) {
+    if (['tools', 'executors', 'observations', 'security'].indexOf(tab) !== -1) {
       item._cls.add('sidebar__item--parent');
       const submenu = makeEl('div');
       submenu._cls.add('sidebar__submenu');
       submenu.dataset.submenuOf = tab;
     }
+  });
+  // Security mirrors the production parent -> submenu -> child hierarchy,
+  // while the other legacy mock items remain flat for their existing tests.
+  const securityGroup = makeEl('div');
+  securityGroup.dataset.tabGroup = 'security';
+  const securityParent = makeEl('button');
+  securityParent.type = 'button';
+  securityParent._cls.add('sidebar__item');
+  securityParent._cls.add('sidebar__item--parent');
+  securityParent.dataset.tab = 'security';
+  securityParent.setAttribute('aria-expanded', 'false');
+  const securitySubmenu = makeEl('div');
+  securitySubmenu._cls.add('sidebar__submenu');
+  securitySubmenu.dataset.submenuOf = 'security';
+  securityGroup.append(securityParent, securitySubmenu);
+  [
+    ['security-overview', '/security'],
+    ['security-sessions', '/security/sessions'],
+    ['security-memory', '/security/memory'],
+    ['security-sandbox', '/security/sandbox'],
+  ].forEach(([tab, href]) => {
+    const child = makeEl('a');
+    child._cls.add('sidebar__item');
+    child._cls.add('sidebar__item--child');
+    child.dataset.tab = tab;
+    child.setAttribute('href', href);
+    securitySubmenu.appendChild(child);
   });
 
   const win = {
@@ -213,6 +241,7 @@ function loadNavigation(opts) {
     document: doc,
     window: win,
     console,
+    URL,
     localStorage,
     history: win.history,
   };
@@ -267,11 +296,228 @@ ok(state.currentSubdomain === 'tasks', 'A3 currentSubdomain (got ' + state.curre
 ok(state.route === null, 'A3 route null (not scoped)');
 
 // ===========================================================================
-// T2 Assertion 4: resolveRoute('/chat') -> currentSubdomain:null
+// T2 Assertion 4: resolveRoute('/sessions') -> currentSubdomain:'sessions'
 // ===========================================================================
-state = nav.resolveRoute('/chat');
-ok(state.activeTab === 'chat', 'A4 activeTab (got ' + state.activeTab + ')');
-ok(state.currentSubdomain === null, 'A4 currentSubdomain (got ' + state.currentSubdomain + ')');
+state = nav.resolveRoute('/sessions');
+ok(state.activeTab === 'sessions', 'A4 activeTab (got ' + state.activeTab + ')');
+ok(state.currentSubdomain === 'sessions', 'A4 currentSubdomain (got ' + state.currentSubdomain + ')');
+
+// ===========================================================================
+// T1: security is a parent subdomain with four independently routable scopes.
+// ===========================================================================
+const securityRoutes = [
+  ['/security', 'overview'],
+  ['/security/sessions', 'sessions'],
+  ['/security/memory', 'memory'],
+  ['/security/sandbox', 'sandbox'],
+];
+securityRoutes.forEach(([path, scope]) => {
+  const s = nav.resolveRoute(path);
+  const child = 'security-' + scope;
+  ok(s.activeTab === child, 'security ' + path + ' activeTab === ' + child);
+  ok(s.renderTab === 'security', 'security ' + path + ' renderTab === security');
+  ok(s.sidebarTab === child, 'security ' + path + ' sidebarTab === ' + child);
+  ok(s.currentSubdomain === 'security', 'security ' + path + ' currentSubdomain === security');
+  ok(s.route && s.route.scope === scope, 'security ' + path + ' route.scope === ' + scope);
+});
+ok(nav.DEFAULT_CHILD && nav.DEFAULT_CHILD.security === 'security-overview',
+  'security DEFAULT_CHILD is security-overview');
+['overview', 'sessions', 'memory', 'sandbox'].forEach((scope) => {
+  const tab = 'security-' + scope;
+  const items = nav.topnavConfig[tab];
+  const expectedPath = scope === 'overview' ? '/security' : '/security/' + scope;
+  ok(items && items.length === 1, tab + ' private topnav has exactly one own item');
+  ok(items && items[0] && items[0].tab === tab, tab + ' private topnav item owns its tab');
+  ok(items && items[0] && items[0].path === expectedPath, tab + ' private topnav item has canonical path');
+});
+// The security parent opens its submenu by default when no preference exists.
+nav.applyRoute(nav.resolveRoute('/security'));
+const securitySubmenu = env.doc.querySelector('[data-submenu-of="security"]');
+ok(securitySubmenu && securitySubmenu.classList.contains('sidebar__submenu--open'),
+  'security submenu opens when no preference exists');
+
+// ===========================================================================
+// T2 Assertion 4c: /sessions topnav config has 2 items (管理 | 观测), /observations
+// topnav config has 1 item (观测 only). The new sessions[1] reuses the
+// observations-sessions tab but uses the parent-subdomain scope pattern
+// (topnavParent/scope === 'sessions') and points to the independent
+// /sessions/observations entry (NOT /observations/sessions, which is the
+// canonical observations-subdomain entry).
+// ===========================================================================
+ok(nav.topnavConfig.sessions && nav.topnavConfig.sessions.length === 3,
+  'A4c topnavConfig.sessions length === 3 (got ' + (nav.topnavConfig.sessions && nav.topnavConfig.sessions.length) + ')');
+ok(nav.topnavConfig.sessions[0].tab === 'sessions', 'A4c sessions[0].tab === sessions');
+ok(nav.topnavConfig.sessions[0].label === '管理', 'A4c sessions[0].label === 管理');
+ok(nav.topnavConfig.sessions[0].path === '/sessions', 'A4c sessions[0].path === /sessions');
+ok(nav.topnavConfig.sessions[0].topnavParent === 'sessions', 'A4c sessions[0].topnavParent === sessions');
+ok(nav.topnavConfig.sessions[0].scope === 'sessions', 'A4c sessions[0].scope === sessions');
+const sessionObservation = nav.topnavConfig.sessions && nav.topnavConfig.sessions[1];
+const expectedSessionObservation = {
+  tab: 'observations-sessions',
+  path: '/sessions/observations',
+  label: '观测',
+  concern: 'observation',
+  scope: 'sessions',
+  topnavParent: 'sessions',
+};
+ok(!!sessionObservation, 'A4c sessions[1] exists');
+ok(sessionObservation && JSON.stringify(sessionObservation) === JSON.stringify(expectedSessionObservation),
+  'A4c sessions[1] deep-equals {tab, path, label, concern, scope, topnavParent} (got ' + JSON.stringify(sessionObservation) + ')');
+ok(sessionObservation && sessionObservation.path !== nav.topnavConfig.observations[0].path,
+  'A4c sessions[1].path !== observations[0].path (independent entry, not alias)');
+const sessionSecurity = nav.topnavConfig.sessions && nav.topnavConfig.sessions[2];
+const expectedSessionSecurity = {
+  tab: 'security-sessions',
+  path: '/sessions/security',
+  label: '安全',
+  concern: 'security',
+  scope: 'sessions',
+  topnavParent: 'sessions',
+};
+ok(!!sessionSecurity, 'A4c sessions[2] exists');
+ok(sessionSecurity && JSON.stringify(sessionSecurity) === JSON.stringify(expectedSessionSecurity),
+  'A4c sessions[2] deep-equals {tab, path, label, concern, scope, topnavParent} (got ' + JSON.stringify(sessionSecurity) + ')');
+ok(sessionSecurity && sessionSecurity.path !== nav.topnavConfig['security-sessions'][0].path,
+  'A4c sessions[2].path !== security-sessions[0].path (independent entry, not alias)');
+ok(nav.topnavConfig.observations && nav.topnavConfig.observations.length === 1,
+  'A4c topnavConfig.observations length === 1 (got ' + (nav.topnavConfig.observations && nav.topnavConfig.observations.length) + ')');
+ok(nav.topnavConfig.observations && nav.topnavConfig.observations[0] && nav.topnavConfig.observations[0].tab === 'observations-sessions', 'A4c observations[0].tab === observations-sessions');
+ok(nav.topnavConfig.observations && nav.topnavConfig.observations[0] && nav.topnavConfig.observations[0].label === '会话', 'A4c observations[0].label === 会话');
+ok(nav.topnavConfig.observations && nav.topnavConfig.observations[0] && nav.topnavConfig.observations[0].path === '/observations/sessions', 'A4c observations[0].path === /observations/sessions (canonical)');
+ok(nav.topnavConfig.observations && nav.topnavConfig.observations[0] && nav.topnavConfig.observations[0].topnavParent === 'observations', 'A4c observations[0].topnavParent === observations');
+ok(nav.topnavConfig.observations && nav.topnavConfig.observations[0] && nav.topnavConfig.observations[0].scope === 'observations', 'A4c observations[0].scope === observations');
+ok(nav.topnavConfig.observations && nav.topnavConfig.observations[0] && nav.topnavConfig.observations[0].concern === 'observation', 'A4c observations[0].concern === observation');
+const expectedComponentTopnav = {
+  tab: 'observations-modules',
+  path: '/observations/modules',
+  label: '组件',
+  concern: 'observation',
+  scope: 'observations-modules',
+  topnavParent: 'observations-modules',
+};
+ok(nav.topnavConfig['observations-modules'] && nav.topnavConfig['observations-modules'].length === 1,
+  'A4c component private topnav has exactly one item');
+ok(nav.topnavConfig['observations-modules']
+  && JSON.stringify(nav.topnavConfig['observations-modules'][0]) === JSON.stringify(expectedComponentTopnav),
+  'A4c component private topnav item matches the complete contract');
+ok(nav.topnavConfig.observations.length === 1
+  && nav.topnavConfig.observations[0].tab === 'observations-sessions',
+  'A4c observations topnav remains session-only');
+
+// ===========================================================================
+// T2 Assertion 4a: /sessions/observations and /observations/sessions are
+// independent routeConfig entries to the same renderer (会话观测 page).
+// /sessions/observations is OWNED by sessions subdomain (topnav 管理|观测,
+// leftnav 会话). /observations/sessions is OWNED by observations subdomain
+// (topnav 观测, leftnav 观测-会话). Both share renderer via renderTab.
+// ===========================================================================
+state = nav.resolveRoute('/sessions/observations');
+ok(state.activeTab === 'observations-sessions', 'A4a /sessions/observations activeTab');
+ok(state.renderTab === 'observations-sessions', 'A4a /sessions/observations renderTab');
+ok(state.sidebarTab === 'sessions', 'A4a /sessions/observations sidebarTab');
+ok(state.currentSubdomain === 'sessions', 'A4a /sessions/observations currentSubdomain');
+state = nav.resolveRoute('/observations/sessions');
+ok(state.activeTab === 'observations-sessions', 'A4a /observations/sessions activeTab');
+ok(state.renderTab === 'observations-sessions', 'A4a /observations/sessions renderTab');
+ok(state.sidebarTab === 'observations-sessions', 'A4a /observations/sessions sidebarTab');
+ok(state.currentSubdomain === 'observations', 'A4a /observations/sessions currentSubdomain');
+// The two routes are independent entries (not sharing one entry)
+state = nav.resolveRoute('/sessions/observations');
+const sessionsObsRoute = state.route;
+state = nav.resolveRoute('/observations/sessions');
+const observationsRoute = state.route;
+ok(sessionsObsRoute !== null && observationsRoute !== null, 'A4a both routes are split entries (non-null)');
+ok(sessionsObsRoute !== observationsRoute, 'A4a /sessions/observations and /observations/sessions are independent routeConfig entries');
+
+// ===========================================================================
+// T2 Assertion 4d: /sessions/observations is owned by sessions subdomain
+// (topnavParent='sessions', scope='sessions', sidebarTab='sessions').
+// Renderer (observations.js) is shared via renderTab='observations-sessions'.
+// ===========================================================================
+state = nav.resolveRoute('/sessions/observations');
+ok(state.route !== null, 'A4d /sessions/observations route is split into own entry (non-null)');
+ok(state.route.topnavParent === 'sessions', 'A4d route.topnavParent === sessions (independent entry, owned by sessions)');
+ok(state.route.scope === 'sessions', 'A4d route.scope === sessions');
+ok(state.route.sidebarTab === 'sessions', 'A4d route.sidebarTab === sessions (leftnav 会话)');
+ok(state.route.renderTab === 'observations-sessions', 'A4d route.renderTab === observations-sessions (shared renderer)');
+ok(state.route.tab === 'observations-sessions', 'A4d route.tab === observations-sessions');
+
+// ===========================================================================
+// T2 Assertion 4g: /sessions/security is owned by sessions subdomain
+// (topnavParent='sessions', scope='sessions', sidebarTab='sessions').
+// Renderer (security.js) is shared via renderTab='security'.
+// Independent from /security/sessions entry (different routeConfig row).
+// ===========================================================================
+state = nav.resolveRoute('/sessions/security');
+ok(state.activeTab === 'security-sessions', 'A4g /sessions/security activeTab (got ' + state.activeTab + ')');
+ok(state.renderTab === 'security', 'A4g /sessions/security renderTab (got ' + state.renderTab + ')');
+ok(state.sidebarTab === 'sessions', 'A4g /sessions/security sidebarTab (got ' + state.sidebarTab + ')');
+ok(state.currentSubdomain === 'sessions', 'A4g /sessions/security currentSubdomain (got ' + state.currentSubdomain + ')');
+ok(state.route !== null, 'A4g /sessions/security route non-null');
+ok(state.route.scope === 'sessions', 'A4g /sessions/security route.scope');
+ok(state.route.topnavParent === 'sessions', 'A4g /sessions/security route.topnavParent');
+ok(state.route.paths.length === 1 && state.route.paths[0] === '/sessions/security',
+  'A4g /sessions/security route.paths');
+// /sessions/security and /security/sessions are independent routeConfig entries
+const securitySessionsState = nav.resolveRoute('/security/sessions');
+ok(state.route !== securitySessionsState.route,
+  'A4g /sessions/security and /security/sessions are independent routeConfig entries');
+// buildRouteByPath accepts the new path
+const routeMap = nav.buildRouteByPath([state.route]);
+ok(routeMap['/sessions/security'] === state.route,
+  'A4g buildRouteByPath maps /sessions/security to the same route entry');
+
+// ===========================================================================
+// T2 Assertion 4e: /observations/sessions sidebarTab comes from routeConfig.
+// ===========================================================================
+state = nav.resolveRoute('/observations/sessions');
+ok(state.route !== null, 'A4e /observations/sessions route is split into own entry (non-null)');
+ok(state.route.topnavParent === 'observations', 'A4e route.topnavParent === observations');
+ok(state.route.scope === 'observations', 'A4e route.scope === observations');
+ok(state.route.sidebarTab === 'observations-sessions', 'A4e route.sidebarTab === observations-sessions (explicit)');
+ok(state.route.renderTab === 'observations-sessions', 'A4e route.renderTab === observations-sessions (shared renderer)');
+ok(state.route.tab === 'observations-sessions', 'A4e route.tab === observations-sessions');
+
+// ===========================================================================
+// T2 Assertion 4f: sidebarOverride no longer contains /sessions/observations.
+// Only /observations/tasks (untouched) remains for backward compatibility.
+// ===========================================================================
+// sidebarOverride is module-private; verify via behavior: /observations/tasks
+// still gets its alias sidebar override (observations-sessions), proving
+// sidebarOverride is still consulted where intended.
+state = nav.resolveRoute('/observations/tasks');
+ok(state.sidebarTab === 'observations-sessions', 'A4f /observations/tasks sidebarTab from sidebarOverride (preserved)');
+// And the inverse: /sessions/observations sidebarTab must come from routeConfig
+// (not sidebarOverride). Already covered by A4d; this is the regression check.
+state = nav.resolveRoute('/sessions/observations');
+ok(state.sidebarTab === 'sessions' && state.route.sidebarTab === 'sessions',
+  'A4f /sessions/observations sidebarTab NOT from sidebarOverride (routeConfig owns it)');
+
+// ===========================================================================
+// T2 Assertion 4g: /observations/modules owns a private topnav scope, while
+// /observations/sessions/{id} keeps the existing observations fallback.
+// ===========================================================================
+state = nav.resolveRoute('/observations/modules');
+ok(state.route !== null, 'A_obs_modules /observations/modules routeConfig entry exists (replaces A4g fallback)');
+ok(state.currentSubdomain === 'observations-modules', 'A_obs_modules currentSubdomain === observations-modules (private topnav scope)');
+ok(state.activeTab === 'observations-modules', 'A_obs_modules activeTab === observations-modules');
+ok(state.renderTab === 'observations-modules', 'A_obs_modules renderTab === observations-modules (status renderer)');
+ok(state.sidebarTab === 'observations-modules', 'A_obs_modules sidebarTab === observations-modules (leftnav highlight)');
+if (state.route) {
+  ok(state.route.topnavParent === 'observations-modules', 'A_obs_modules route.topnavParent');
+  ok(state.route.scope === 'observations-modules', 'A_obs_modules route.scope');
+  ok(state.route.tab === 'observations-modules', 'A_obs_modules route.tab');
+  ok(state.route.paths.length === 1 && state.route.paths[0] === '/observations/modules',
+    'A_obs_modules route.paths is the single component path');
+  ok(nav.buildRouteByPath([state.route])['/observations/modules'] === state.route,
+    'A_obs_modules buildRouteByPath accepts /observations/modules and maps the same entry');
+}
+
+state = nav.resolveRoute('/observations/sessions/sess_1');
+ok(state.activeTab === 'observations-sessions', 'A4g /observations/sessions/{id} activeTab');
+ok(state.route === null, 'A4g /observations/sessions/{id} route null (no entry)');
+ok(state.currentSubdomain === 'observations', 'A4g /observations/sessions/{id} currentSubdomain === observations (parentByChild)');
+ok(state.sidebarTab === 'observations-sessions', 'A4g /observations/sessions/{id} sidebarTab');
 
 // ===========================================================================
 // T2 Assertion 4b: browser detail route keeps the browser module active
@@ -313,6 +559,20 @@ try {
   ]);
   ok(false, 'A6b missing topnavParent should throw');
 } catch (e) { ok(true, 'A6b missing topnavParent throws'); }
+// 6b2: missing scope
+try {
+  nav.buildRouteByPath([
+    { paths: ['/a'], tab: 'x', renderTab: 'x', sidebarTab: 'x', topnavParent: 'x' },
+  ]);
+  ok(false, 'A6b2 missing scope should throw');
+} catch (e) { ok(true, 'A6b2 missing scope throws'); }
+// 6b3: empty paths
+try {
+  nav.buildRouteByPath([
+    { paths: [], tab: 'x', renderTab: 'x', sidebarTab: 'x', topnavParent: 'x', scope: 'x' },
+  ]);
+  ok(false, 'A6b3 empty paths should throw');
+} catch (e) { ok(true, 'A6b3 empty paths throws'); }
 // 6c: empty field
 try {
   nav.buildRouteByPath([
@@ -378,6 +638,115 @@ ok(nav2.byId['topbar-title']._text === '任务', 'navigatePath sets title (got '
 // Same path -> no extra pushState
 nav2.nav.navigatePath('/tasks');
 ok(nav2.pushStateCalls.length === 1, 'navigatePath no pushState when path unchanged');
+
+const securityNav = loadNavigation({ pathname: '/security' });
+const securityStates = [];
+securityNav.win.NAGENT.app = { onTabActivated(s) { securityStates.push(s); } };
+securityNav.nav.navigatePath('/security/memory');
+const memoryState = securityStates[0];
+ok(memoryState && memoryState.activeTab === 'security-memory', 'security navigatePath preserves memory active child');
+ok(memoryState && memoryState.renderTab === 'security', 'security navigatePath renders security module');
+ok(memoryState && memoryState.route && memoryState.route.scope === 'memory', 'security navigatePath preserves memory scope');
+ok(securityNav.byId['tab-security'] && securityNav.byId['tab-security'].classList.contains('active'),
+  'security navigatePath activates shared security container');
+
+const componentNav = loadNavigation({ pathname: '/chat' });
+const componentStates = [];
+componentNav.win.NAGENT.app = {
+  onTabActivated(state2) { componentStates.push(state2); },
+};
+componentNav.nav.navigatePath('/observations/modules');
+const componentState = componentStates[0];
+ok(componentState && componentState.activeTab === 'observations-modules', 'component navigatePath activeTab');
+ok(componentState && componentState.currentSubdomain === 'observations-modules', 'component navigatePath private subdomain');
+ok(componentState && componentState.sidebarTab === 'observations-modules', 'component navigatePath sidebarTab');
+ok(componentState && componentState.renderTab === 'observations-modules', 'component navigatePath renderTab');
+ok(componentState && componentState.route !== null, 'component navigatePath route entry');
+ok(componentNav.byId['tab-observations-modules'].classList.contains('active'),
+  'component navigatePath activates #tab-observations-modules');
+ok(componentNav.pushStateCalls.length === 1, 'component navigatePath pushes exactly once');
+ok(componentNav.pushStateCalls[0] && componentNav.pushStateCalls[0].url === '/observations/modules',
+  'component navigatePath pushes /observations/modules');
+
+// ===========================================================================
+// T2 Extra: popstate -> /sessions/observations resolves to sessions subdomain
+// (proves initial direct load and browser back/forward reuse the independent
+// /sessions/observations route entry, owned by sessions subdomain).
+// ===========================================================================
+const nav3 = loadNavigation({ pathname: '/sessions' });
+const popstateStates = [];
+nav3.win.NAGENT.app = {
+  onTabActivated(state) { popstateStates.push(state); },
+};
+nav3.nav.initNavigation();
+ok(popstateStates.length >= 1, 'initNavigation: onTabActivated invoked with initial state (got ' + popstateStates.length + ')');
+const initState = popstateStates[0];
+ok(initState && initState.currentSubdomain === 'sessions',
+  'initNavigation initial /sessions state.currentSubdomain === sessions (got ' + (initState && initState.currentSubdomain) + ')');
+ok(initState && initState.activeTab === 'sessions',
+  'initNavigation initial /sessions state.activeTab === sessions (got ' + (initState && initState.activeTab) + ')');
+ok(nav3.pushStateCalls.length === 0, 'initNavigation: no pushState when initial path matches location (got ' + nav3.pushStateCalls.length + ')');
+const popstateListeners = nav3.win._listeners.popstate || [];
+ok(popstateListeners.length >= 1, 'initNavigation registered popstate listener (got ' + popstateListeners.length + ')');
+// Simulate browser back/forward to /sessions/observations (independent entry)
+nav3.win.location.pathname = '/sessions/observations';
+popstateListeners.forEach((fn) => fn({ path: '/sessions/observations' }));
+const lastState = popstateStates[popstateStates.length - 1];
+ok(!!lastState, 'popstate -> app.onTabActivated received state');
+ok(lastState && lastState.activeTab === 'observations-sessions',
+  'popstate /sessions/observations activeTab === observations-sessions (got ' + (lastState && lastState.activeTab) + ')');
+ok(lastState && lastState.renderTab === 'observations-sessions',
+  'popstate /sessions/observations renderTab === observations-sessions (got ' + (lastState && lastState.renderTab) + ')');
+ok(lastState && lastState.sidebarTab === 'sessions',
+  'popstate /sessions/observations sidebarTab === sessions (got ' + (lastState && lastState.sidebarTab) + ')');
+ok(lastState && lastState.currentSubdomain === 'sessions',
+  'popstate /sessions/observations currentSubdomain === sessions (independent entry, got ' + (lastState && lastState.currentSubdomain) + ')');
+ok(nav3.pushStateCalls.length === 0, 'popstate does not pushState (got ' + nav3.pushStateCalls.length + ')');
+
+const securityPopstate = loadNavigation({ pathname: '/security' });
+const securityPopstateStates = [];
+securityPopstate.win.NAGENT.app = { onTabActivated(s) { securityPopstateStates.push(s); } };
+securityPopstate.nav.initNavigation();
+securityPopstate.win.location.pathname = '/security/sandbox';
+(securityPopstate.win._listeners.popstate || []).forEach((fn) => fn({}));
+const sandboxState = securityPopstateStates[securityPopstateStates.length - 1];
+ok(sandboxState && sandboxState.activeTab === 'security-sandbox', 'security popstate preserves sandbox active child');
+ok(sandboxState && sandboxState.renderTab === 'security', 'security popstate preserves shared renderer');
+ok(sandboxState && sandboxState.route && sandboxState.route.scope === 'sandbox', 'security popstate preserves sandbox scope');
+ok(securityPopstate.pushStateCalls.length === 0, 'security popstate does not push history');
+
+// Direct load and browser back/forward keep /observations/modules in its
+// component-private scope without writing history.
+const componentDirect = loadNavigation({ pathname: '/observations/modules' });
+const componentDirectStates = [];
+componentDirect.win.NAGENT.app = {
+  onTabActivated(state2) { componentDirectStates.push(state2); },
+};
+componentDirect.nav.initNavigation();
+const componentInitState = componentDirectStates[0];
+ok(componentInitState && componentInitState.activeTab === 'observations-modules', 'component direct activeTab');
+ok(componentInitState && componentInitState.renderTab === 'observations-modules', 'component direct renderTab');
+ok(componentInitState && componentInitState.sidebarTab === 'observations-modules', 'component direct sidebarTab');
+ok(componentInitState && componentInitState.currentSubdomain === 'observations-modules', 'component direct private subdomain');
+ok(componentInitState && componentInitState.route !== null, 'component direct route entry');
+ok(componentInitState && componentInitState.route
+  && componentInitState.route.topnavParent === 'observations-modules', 'component direct route parent');
+ok(componentInitState && componentInitState.route
+  && componentInitState.route.paths.length === 1
+  && componentInitState.route.paths[0] === '/observations/modules', 'component direct single route path');
+ok(componentDirect.pushStateCalls.length === 0, 'component direct load does not pushState');
+const componentPopstateListeners = componentDirect.win._listeners.popstate || [];
+componentDirect.win.location.pathname = '/observations/modules';
+componentPopstateListeners.forEach((fn) => fn({ path: '/observations/modules' }));
+const componentPopState = componentDirectStates[componentDirectStates.length - 1];
+ok(componentPopState && componentInitState
+  && componentPopState.activeTab === componentInitState.activeTab
+  && componentPopState.renderTab === componentInitState.renderTab
+  && componentPopState.sidebarTab === componentInitState.sidebarTab
+  && componentPopState.currentSubdomain === componentInitState.currentSubdomain
+  && componentPopState.route === componentInitState.route,
+  'component popstate preserves all route state fields');
+ok(componentDirect.pushStateCalls.length === 0, 'component popstate does not pushState');
 
 // ===========================================================================
 // T3: TopNav component (topnav.js)
@@ -507,7 +876,7 @@ function loadApp(opts) {
   const topnavMount = makeEl('div');
   topnavMount.id = 'topnav-mount';
 
-  ['tasks-observations', 'tasks', 'chat', 'summary'].forEach((id) => {
+  ['tasks-observations', 'tasks', 'chat', 'summary', 'observations-modules', 'security'].forEach((id) => {
     const el = makeEl('div');
     el._cls.add('tab-content');
     el.id = 'tab-' + id;
@@ -520,12 +889,32 @@ function loadApp(opts) {
   const renderCalls = [];
   const destroyCalls = [];
   const navigateCalls = [];
+  const statusInitCalls = [];
+  const statusRefreshCalls = [];
+  const securityInitCalls = [];
+  const securityRefreshCalls = [];
+  const securityActivateCalls = [];
 
   const topnavConfig = {
     tasks: [
       { tab: 'tasks', path: '/tasks', label: '管理', concern: 'management', scope: 'tasks', topnavParent: 'tasks' },
       { tab: 'tasks-observations', path: '/tasks/observations', label: '观测', concern: 'observation', scope: 'tasks', topnavParent: 'tasks' },
     ],
+    sessions: [
+      { tab: 'sessions', path: '/sessions', label: '管理', concern: 'management', scope: 'sessions', topnavParent: 'sessions' },
+      { tab: 'observations-sessions', path: '/sessions/observations', label: '观测', concern: 'observation', scope: 'sessions', topnavParent: 'sessions' },
+      { tab: 'security-sessions', path: '/sessions/security', label: '安全', concern: 'security', scope: 'sessions', topnavParent: 'sessions' },
+    ],
+    observations: [
+      { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', concern: 'observation', scope: 'observations', topnavParent: 'observations' },
+    ],
+    'observations-modules': [
+      { tab: 'observations-modules', path: '/observations/modules', label: '组件', concern: 'observation', scope: 'observations-modules', topnavParent: 'observations-modules' },
+    ],
+    'security-overview': [{ tab: 'security-overview', path: '/security', label: '概览', concern: 'security', scope: 'overview', topnavParent: 'security' }],
+    'security-sessions': [{ tab: 'security-sessions', path: '/security/sessions', label: '会话', concern: 'security', scope: 'sessions', topnavParent: 'security' }],
+    'security-memory': [{ tab: 'security-memory', path: '/security/memory', label: '记忆', concern: 'security', scope: 'memory', topnavParent: 'security' }],
+    'security-sandbox': [{ tab: 'security-sandbox', path: '/security/sandbox', label: '沙盒', concern: 'security', scope: 'sandbox', topnavParent: 'security' }],
   };
 
   // Deferred init for in-flight Promise test
@@ -541,6 +930,15 @@ function loadApp(opts) {
   const win = {
     NAGENT: {
       tasksObservations: tasksObservations,
+      status: {
+        init() { statusInitCalls.push('observations-modules'); },
+        refresh() { statusRefreshCalls.push('observations-modules'); },
+      },
+      security: {
+        init(state) { securityInitCalls.push(state); return initPromise; },
+        refresh(state) { securityRefreshCalls.push(state); },
+        activate(state) { securityActivateCalls.push(state); },
+      },
       topnav: {
         render(container, opts2) { renderCalls.push({ container: container, opts: opts2 }); },
         destroy() { destroyCalls.push('destroy'); },
@@ -591,6 +989,9 @@ function loadApp(opts) {
     NAGENT: ctx.NAGENT, app: ctx.NAGENT.app,
     initCalls: initCalls, refreshCalls: refreshCalls, deactivateCalls: deactivateCalls,
     renderCalls: renderCalls, destroyCalls: destroyCalls, navigateCalls: navigateCalls,
+    statusInitCalls: statusInitCalls, statusRefreshCalls: statusRefreshCalls,
+    securityInitCalls: securityInitCalls, securityRefreshCalls: securityRefreshCalls,
+    securityActivateCalls: securityActivateCalls,
     byId: byId, allEls: allEls,
     topnavMount: topnavMount, topbarTitle: topbarTitle, topbarTitleWrap: topbarTitleWrap,
     resolveInit: resolveInit,
@@ -1058,6 +1459,40 @@ async function runT5() {
   await env.app.onTabActivated({ renderTab: 'chat', activeTab: 'chat', currentSubdomain: null, sidebarTab: 'chat', route: null });
   ok(env.deactivateCalls.length === 1, 'T5 A2b leaving task observations calls deactivate');
 
+  // --- T5 security: a scope switch during pending init activates the new
+  // scope once; it must not refresh the stale sessions scope.
+  env = loadApp({ deferInit: true });
+  const sessionsState = { renderTab: 'security', activeTab: 'security-sessions', currentSubdomain: 'security', sidebarTab: 'security-sessions', route: { scope: 'sessions' } };
+  const memoryState = { renderTab: 'security', activeTab: 'security-memory', currentSubdomain: 'security', sidebarTab: 'security-memory', route: { scope: 'memory' } };
+  const pendingSecurityInit = env.app.onTabActivated(sessionsState);
+  const switchToMemory = env.app.onTabActivated(memoryState);
+  ok(env.securityInitCalls.length === 1, 'T5 security first activation calls init once');
+  ok(env.securityActivateCalls.length === 1, 'T5 security scope switch calls activate once');
+  ok(env.securityActivateCalls[0] === memoryState, 'T5 security activate receives memory state');
+  ok(env.securityRefreshCalls.length === 0, 'T5 security scope switch does not call refresh');
+  env.resolveInit();
+  await Promise.all([pendingSecurityInit, switchToMemory]);
+
+  // --- T5 security route integration: a child route renders its one-item
+  // private TopNav, rather than a shared/security-parent configuration.
+  env = loadApp();
+  await env.app.onTabActivated(memoryState);
+  ok(env.renderCalls.length === 1, 'T5 security memory route renders TopNav once');
+  if (env.renderCalls.length > 0) {
+    ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items.length === 1,
+      'T5 security memory private topnav has one item');
+    ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[0].tab === 'security-memory',
+      'T5 security memory private item owns security-memory');
+    ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[0].path === '/security/memory',
+      'T5 security memory private item uses the memory route');
+    ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[0].label === '记忆',
+      'T5 security memory private item has the memory label');
+    ok(env.renderCalls[0].opts.activeTab === 'security-memory',
+      'T5 security memory private topnav marks memory active');
+  } else {
+    ok(false, 'T5 security memory route skipped private TopNav assertions: no render');
+  }
+
   // --- T5 A3: TopNav.render called with items, activeTab, onActivate ---
   env = loadApp();
   await env.app.onTabActivated({ renderTab: 'tasks-observations', activeTab: 'tasks-observations', currentSubdomain: 'tasks', sidebarTab: 'tasks', route: {} });
@@ -1071,6 +1506,104 @@ async function runT5() {
     ok(false, 'T5 A3 skipped: no topnav.render call');
   }
 
+  // --- T5 A3b: /sessions topnav render receives sessions config (3 items: 管理 | 观测 | 安全) ---
+  env = loadApp();
+  await env.app.onTabActivated({ renderTab: 'sessions', activeTab: 'sessions', currentSubdomain: 'sessions', sidebarTab: 'sessions', route: null });
+  ok(env.renderCalls.length === 1, 'T5 A3b /sessions topnav.render called once (got ' + env.renderCalls.length + ')');
+  if (env.renderCalls.length > 0) {
+    ok(env.renderCalls[0].opts.items === env.NAGENT.navigation.topnavConfig.sessions, 'T5 A3b /sessions topnav.render received topnavConfig.sessions items');
+    ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items.length === 3, 'T5 A3b /sessions topnav.render received 3 items');
+    ok(env.renderCalls[0].opts.activeTab === 'sessions', 'T5 A3b /sessions topnav.render activeTab === sessions (no cross-subdomain double activation)');
+    const secondItem = env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[1];
+    ok(!secondItem || secondItem.tab !== 'sessions',
+      'T5 A3b /sessions sessions[1].tab is not "sessions" (no cross-subdomain double activation by item tab)');
+  } else {
+    ok(false, 'T5 A3b skipped: no topnav.render call');
+  }
+
+  // --- T4 A3d: /sessions/security topnav render receives sessions config (3 items) ---
+  env = loadApp();
+  await env.app.onTabActivated({ renderTab: 'security', activeTab: 'security-sessions', currentSubdomain: 'sessions', sidebarTab: 'sessions', route: { scope: 'sessions' } });
+  ok(env.renderCalls.length === 1, 'T4 A3d /sessions/security topnav.render called once (got ' + env.renderCalls.length + ')');
+  if (env.renderCalls.length > 0) {
+    ok(env.renderCalls[0].opts.items === env.NAGENT.navigation.topnavConfig.sessions,
+      'T4 A3d /sessions/security topnav.render received topnavConfig.sessions items');
+    ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items.length === 3,
+      'T4 A3d /sessions/security topnav.render received 3 items');
+    ok(env.renderCalls[0].opts.activeTab === 'security-sessions',
+      'T4 A3d /sessions/security topnav.render activeTab === security-sessions');
+    // /security/sessions regression: must still use its private topnav (1 item, currentSubdomain=security)
+    env = loadApp();
+    await env.app.onTabActivated({ renderTab: 'security', activeTab: 'security-sessions', currentSubdomain: 'security', sidebarTab: 'security-sessions', route: { scope: 'sessions' } });
+    ok(env.renderCalls.length === 1, 'T4 A3d /security/sessions regression: topnav.render called once (got ' + env.renderCalls.length + ')');
+    if (env.renderCalls.length > 0) {
+      ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items.length === 1,
+        'T4 A3d /security/sessions regression: private topnav has 1 item (security-sessions)');
+      ok(env.renderCalls[0].opts.items[0] && env.renderCalls[0].opts.items[0].tab === 'security-sessions',
+        'T4 A3d /security/sessions regression: private topnav tab is security-sessions');
+    }
+  } else {
+    ok(false, 'T4 A3d skipped: no topnav.render call');
+  }
+
+  // --- T4 A3e: /sessions/security DOM: 安全项 active + aria-current=page, 管理/观测 非 active ---
+  env = loadTopnav();
+  const sessionsItems = [
+    { tab: 'sessions', path: '/sessions', label: '管理', concern: 'management', scope: 'sessions', topnavParent: 'sessions' },
+    { tab: 'observations-sessions', path: '/sessions/observations', label: '观测', concern: 'observation', scope: 'sessions', topnavParent: 'sessions' },
+    { tab: 'security-sessions', path: '/sessions/security', label: '安全', concern: 'security', scope: 'sessions', topnavParent: 'sessions' },
+  ];
+  env.topnav.render(env.container, { items: sessionsItems, activeTab: 'security-sessions', onActivate: function () {} });
+  const links = liveQuery(env.container, 'a[href]');
+  ok(links.length === 3, 'T4 A3e /sessions/security topnav renders 3 <a> items (got ' + links.length + ')');
+  const activeLinks = links.filter((a) => a.getAttribute('aria-current') === 'page');
+  ok(activeLinks.length === 1, 'T4 A3e exactly one aria-current=page (got ' + activeLinks.length + ')');
+  if (activeLinks.length === 1) {
+    ok(activeLinks[0]._cls.has('topnav__item--active'), 'T4 A3e active link has topnav__item--active class');
+    ok(activeLinks[0].getAttribute('href') === '/sessions/security', 'T4 A3e active link href === /sessions/security');
+    ok(activeLinks[0]._text === '安全', 'T4 A3e active link label is "安全"');
+  } else {
+    ok(false, 'T4 A3e skipped: no active link');
+  }
+  const inactiveLinks = links.filter((a) => a.getAttribute('aria-current') !== 'page');
+  ok(inactiveLinks.length === 2, 'T4 A3e two inactive links (got ' + inactiveLinks.length + ')');
+  inactiveLinks.forEach((a) => {
+    ok(!a._cls.has('topnav__item--active'), 'T4 A3e inactive link ' + a.getAttribute('href') + ' has NO topnav__item--active');
+  });
+
+  // --- T4 A4c: /sessions topnav items navigate to their independent paths ---
+  env = loadApp();
+  await env.app.onTabActivated({ renderTab: 'sessions', activeTab: 'sessions', currentSubdomain: 'sessions', sidebarTab: 'sessions', route: null });
+  if (env.renderCalls.length > 0) {
+    const sessionManagementItem = env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[0];
+    const sessionObservationItem = env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[1];
+    const sessionSecurityItem = env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[2];
+    ok(sessionManagementItem && sessionManagementItem.path === '/sessions', 'T4 A4c /sessions items[0] is 管理 -> /sessions');
+    ok(sessionObservationItem && sessionObservationItem.path === '/sessions/observations', 'T4 A4c /sessions items[1] is 观测 -> /sessions/observations');
+    ok(!!sessionSecurityItem, 'T4 A4c /sessions has items[2] (new 安全 item)');
+    if (sessionSecurityItem) {
+      ok(sessionSecurityItem.path === '/sessions/security', 'T4 A4c /sessions items[2].path === /sessions/security');
+      env.renderCalls[0].opts.onActivate(sessionSecurityItem);
+      ok(env.navigateCalls.length === 1, 'T4 A4c /sessions onActivate(sessions[2]) calls navigatePath once (got ' + env.navigateCalls.length + ')');
+      ok(env.navigateCalls[0] === '/sessions/security', 'T4 A4c /sessions onActivate(sessions[2]) navigates to /sessions/security (got ' + env.navigateCalls[0] + ')');
+    }
+  } else {
+    ok(false, 'T4 A4c skipped: no topnav.render call');
+  }
+
+  // --- T5 A3c: /observations/sessions topnav render receives observations config (1 item, active) ---
+  env = loadApp();
+  await env.app.onTabActivated({ renderTab: 'observations-sessions', activeTab: 'observations-sessions', currentSubdomain: 'observations', sidebarTab: 'observations-sessions', route: {} });
+  ok(env.renderCalls.length === 1, 'T5 A3c /observations/sessions topnav.render called once (got ' + env.renderCalls.length + ')');
+  if (env.renderCalls.length > 0) {
+    ok(env.renderCalls[0].opts.items === env.NAGENT.navigation.topnavConfig.observations, 'T5 A3c /observations/sessions topnav.render received topnavConfig.observations items');
+    ok(env.renderCalls[0].opts.items && env.renderCalls[0].opts.items.length === 1, 'T5 A3c /observations/sessions topnav.render received 1 item (no 管理)');
+    ok(env.renderCalls[0].opts.activeTab === 'observations-sessions', 'T5 A3c /observations/sessions topnav.render activeTab === observations-sessions');
+    ok(env.renderCalls[0].opts.items[0] && env.renderCalls[0].opts.items[0].label === '会话', 'T5 A3c /observations/sessions topnav.render items[0].label === 会话');
+  } else {
+    ok(false, 'T5 A3c skipped: no topnav.render call');
+  }
+
   // --- T5 A4: onActivate callback calls navigatePath ---
   env = loadApp();
   await env.app.onTabActivated({ renderTab: 'tasks-observations', activeTab: 'tasks-observations', currentSubdomain: 'tasks', sidebarTab: 'tasks', route: {} });
@@ -1082,6 +1615,41 @@ async function runT5() {
   } else {
     ok(false, 'T5 A4 skipped: no topnav.render call');
   }
+
+  // --- T5 A4b: /sessions topnav onActivate for sessions[1] navigates to /sessions/observations ---
+  env = loadApp();
+  await env.app.onTabActivated({ renderTab: 'sessions', activeTab: 'sessions', currentSubdomain: 'sessions', sidebarTab: 'sessions', route: null });
+  if (env.renderCalls.length > 0) {
+    const sessionObsItem = env.renderCalls[0].opts.items && env.renderCalls[0].opts.items[1];
+    ok(!!sessionObsItem, 'T5 A4b /sessions has items[1] (new 观测 item)');
+    if (sessionObsItem) {
+      env.renderCalls[0].opts.onActivate(sessionObsItem);
+      ok(env.navigateCalls.length === 1, 'T5 A4b /sessions onActivate(sessions[1]) calls navigatePath once (got ' + env.navigateCalls.length + ')');
+      ok(env.navigateCalls[0] === '/sessions/observations', 'T5 A4b /sessions onActivate(sessions[1]) navigates to /sessions/observations (independent entry, got ' + env.navigateCalls[0] + ')');
+    }
+  } else {
+    ok(false, 'T5 A4b skipped: no topnav.render call');
+  }
+
+  // --- T5 A11: component scope renders one private item and initializes status ---
+  env = loadApp();
+  await env.app.onTabActivated({ renderTab: 'observations-modules', activeTab: 'observations-modules', currentSubdomain: 'observations-modules', sidebarTab: 'observations-modules', route: {} });
+  ok(env.renderCalls.length === 1, 'T5 A11 component topnav.render called once');
+  if (env.renderCalls.length > 0) {
+    const componentItems = env.renderCalls[0].opts.items;
+    ok(componentItems === env.NAGENT.navigation.topnavConfig['observations-modules'],
+      'T5 A11 render receives the component private scope');
+    ok(componentItems && componentItems.length === 1, 'T5 A11 component scope has one item');
+    ok(componentItems && componentItems[0].tab === 'observations-modules', 'T5 A11 component item tab');
+    ok(componentItems && componentItems[0].topnavParent === 'observations-modules', 'T5 A11 component item parent');
+    ok(componentItems && componentItems[0].scope === 'observations-modules', 'T5 A11 component item scope');
+    ok(env.renderCalls[0].opts.activeTab === 'observations-modules', 'T5 A11 component item active');
+    env.renderCalls[0].opts.onActivate(componentItems[0]);
+    ok(env.navigateCalls.length === 1 && env.navigateCalls[0] === '/observations/modules',
+      'T5 A11 component onActivate stays on /observations/modules');
+  }
+  ok(env.statusInitCalls.length === 1, 'T5 A11 first component activation initializes status');
+  ok(env.statusRefreshCalls.length === 0, 'T5 A11 first component activation does not refresh status');
 
   // --- T5 A5: no currentSubdomain -> destroy + show title ---
   env = loadApp();

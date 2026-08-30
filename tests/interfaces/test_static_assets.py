@@ -84,7 +84,7 @@ def test_chat_returns_index_html(tmp_path):
 def test_all_tab_paths_return_shell(tmp_path):
     client = _client(tmp_path)
     paths = (
-        "/", "/summary", "/chat", "/sessions",
+        "/", "/summary", "/chat", "/sessions", "/sessions/observations", "/sessions/security",
         "/memory", "/sandbox",
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
         "/tools/external-memory", "/tools/sandbox",
@@ -120,6 +120,24 @@ def test_scoped_task_observations_routes_registered_before_catchall(tmp_path):
     for path in ("/observations/foo", "/unknown-deep"):
         response = client.get(path)
         assert response.status_code == 404, f"{path} should not match shell"
+
+
+def test_sessions_security_route_registered(tmp_path):
+    """T1: /sessions/security 是显式字面 deep-link 合同，
+    必须注册在 router 上；防御性位置：堆叠装饰器组底部（与 /sessions/{id} 未来 catch-all 兼容）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    router = create_dashboard_router(
+        SessionService(store),
+        ToolService(_StubExecutor(), builtin_tool_definitions()),
+        ModelService(_StubProvider(), "real-1"),
+        lambda: {
+            "provider": {"status": "ok"},
+            "memory": {"status": "ok"},
+            "knowledge": {"status": "disabled", "enabled": False},
+        },
+    )
+    paths = [route.path for route in router.routes]
+    assert "/sessions/security" in paths, "/sessions/security must be registered as a literal route"
 
 
 def test_tools_submenu_url_routing(tmp_path):
@@ -326,7 +344,7 @@ def test_static_assets_contain_expected_logic(tmp_path):
         'chat', 'scheduled-tasks', 'sessions', 'tasks', 'memory',
         'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
         'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
-        'observations-sessions', 'observations-modules', 'security',
+        'observations-sessions', 'observations-modules', 'security-overview',
     ], f"summary ENTRIES order mismatch: {summary_entry_tabs}"
 
 
@@ -1044,12 +1062,14 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
         'executors', 'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
         'observations', 'observations-sessions', 'observations-modules', 'security',
+        'security-overview', 'security-sessions', 'security-memory', 'security-sandbox',
     ]
     expected_hrefs = [
         '/chat', '/scheduled-tasks', '/sessions', '/tasks', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/artifacts', '/models', '/platforms',
         '/observations/sessions', '/observations/modules', '/security',
+        '/security/sessions', '/security/memory', '/security/sandbox',
     ]
     sidebar_data_tabs = _re.findall(r'data-tab="([^"]*)"', sidebar_html)
     assert sidebar_data_tabs == expected_data_tabs, f"sidebar data-tab set changed: {sidebar_data_tabs}"
@@ -1062,6 +1082,10 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     assert active_rule_match, "styles.css missing .topnav__item--active rule block"
     active_rule = active_rule_match.group(1)
     assert 'border-bottom' not in active_rule, ".topnav__item--active must not have border-bottom"
+    assert 'color: var(--color-primary-strong)' in active_rule, \
+        ".topnav__item--active must use --color-primary-strong"
+    assert 'font-weight: 600' in active_rule, \
+        ".topnav__item--active must have font-weight: 600"
     assert '.topnav__scroll' in css, "styles.css missing .topnav__scroll"
     assert '.topbar__reserved' in css, "styles.css missing .topbar__reserved"
     assert '#topbar-title-wrap { display: flex; align-items: center; min-width: 0; padding-left: 10px; }' in css, \

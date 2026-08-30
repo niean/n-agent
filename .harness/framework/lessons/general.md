@@ -68,3 +68,18 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 来源：2026-08-24 spec-260824-chat-composer-skill 三方审阅首轮被误报 approved，前台非沙箱重跑后真实结果为 fixed/24 项
 
 ---
+
+### L005: Provider 已具备文件工具时不要叠加第二套补丁协议
+
+现象：Claude Code 能正常使用 `ark-code-latest` 完成审阅，却在 provider 将结构化 `old_text + occurrence + new_text` 修改顺序应用到目标文档时失败，报 `edit occurrence is out of range`，导致整个三方审阅以 65 退出。
+
+根因：Claude Code 本身已经具备 Read/Edit 文件能力，但适配器禁用工具后又实现了“嵌入全文、生成 JSON edits、解析 occurrence、重建全文、原子替换”的第二套写入机制。多条修改按原始文档生成、按已变更文档顺序应用时容易互相遮蔽；额外协议增加了故障面，却没有加强 runner 已有的目标文件与关联 spec 边界。
+
+教训：
+1. Provider 的职责应与其原生能力对齐：coding agent 直接读取和修改 runner 指定的目标文件，并输出统一五字段摘要；不要在 provider 中翻译成另一套补丁语言
+2. 安全边界由 runner 负责，provider 只配置最小工具面；Claude Code 使用 Read/Edit + acceptEdits，Codex 使用 workspace-write，二者保持同构
+3. stderr 中的模型识别诊断不等于调用失败；必须结合 provider 退出码和 stdout 判断。`ark-code-latest` 即使输出 `unrecognized_model` 诊断，仍可成功调用并完成文件编辑
+
+来源：2026-08-31 claude-code third-review plan 审阅 occurrence 解析失败，参照 codex provider 改为直接编辑
+
+---

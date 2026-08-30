@@ -135,6 +135,7 @@ def create_dashboard_router(
     @router.get("/", response_class=HTMLResponse)
     @router.get("/summary", response_class=HTMLResponse)
     @router.get("/chat", response_class=HTMLResponse)
+    @router.get("/sessions/observations", response_class=HTMLResponse)
     @router.get("/observations/sessions", response_class=HTMLResponse)
     @router.get("/observations/sessions/{session_id}", response_class=HTMLResponse)
     @router.get("/observations/modules", response_class=HTMLResponse)
@@ -162,6 +163,10 @@ def create_dashboard_router(
     @router.get("/observations/tasks", response_class=HTMLResponse)
     @router.get("/platforms", response_class=HTMLResponse)
     @router.get("/security", response_class=HTMLResponse)
+    @router.get("/security/sessions", response_class=HTMLResponse)
+    @router.get("/security/memory", response_class=HTMLResponse)
+    @router.get("/security/sandbox", response_class=HTMLResponse)
+    @router.get("/sessions/security", response_class=HTMLResponse)
     @router.get("/browser/session", response_class=HTMLResponse)
     @router.get("/browser", response_class=HTMLResponse)
     async def shell():

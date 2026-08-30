@@ -902,16 +902,29 @@
     },
     goToDetail(sessionId) {
       const url = '/observations/sessions/' + encodeURIComponent(sessionId);
+      if (namespace.navigation && typeof namespace.navigation.navigatePath === 'function') {
+        namespace.navigation.navigatePath(url);
+        return;
+      }
       history.pushState({ tab: 'observations-sessions' }, '', url);
       this.render();
     },
     goToIndex() {
-      history.pushState({ tab: 'observations-sessions' }, '', '/observations/sessions');
+      const url = '/observations/sessions';
+      if (namespace.navigation && typeof namespace.navigation.navigatePath === 'function') {
+        namespace.navigation.navigatePath(url);
+        return;
+      }
+      history.pushState({ tab: 'observations-sessions' }, '', url);
       this.render();
     },
     goToPage(page) {
       page = Math.max(1, page);
       const url = '/observations/sessions?page=' + encodeURIComponent(page);
+      if (namespace.navigation && typeof namespace.navigation.navigatePath === 'function') {
+        namespace.navigation.navigatePath(url);
+        return;
+      }
       history.pushState({ tab: 'observations-sessions', page }, '', url);
       this.render();
     },

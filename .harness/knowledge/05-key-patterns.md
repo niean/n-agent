@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）、发布状态生命周期（新 Revision 不撤销 active publish->publish_sync_state=outdated 旧公链仍 200、重新发布才撤销旧 active+登记新 publish、metadata-only 不撤销、delete purge 发布记录+快照文件公链 404；头部状态栏+按钮切换）、Revision 版本与 CAS（expected_revision_id/If-Match 内容更新令牌、冲突 409 不静默覆写、rollback 生成新版本、diff 文本/二进制/混合）、Office 导出（DOCX/PPTX/XLSX 格式库仅 Infrastructure exporters.py、Domain exporter 端口）、Agent-native 工具与 artifact_guidance 装配、ui.artifact 卡片写工具成功持久化、task_complete workspace: ref 前置 probe 校验（不可读抛 TaskValidationError 让 worker 自纠正用 write_file/inline content，替代 finalize 后静默 drop）、goal_mode judge fork task_show 数据层 redact run 生命周期状态（task status 字段/runs/worker_context，避免 judge 看到 run 未 finalize 循环否决）、多 Agent 委派（_ServerSentinel capability 防伪造/指纹幂等重放/父级预算 reserve+ledger 恢复权威/delegation- 前缀隔离 session/cancel outbox at-least-once/capability 工具集签发时剥离 FORBIDDEN 工具）、Activated Skills 三层过滤（前端 getActivatedSkills / chat_service 形状归一 / context_service 实时求交）与技能名 Markdown code span 转义（阻断 prompt injection 伪造 heading）等实现约束 -->
+<!-- SUMMARY: N-Agent 的关键实现模式，包括 DDD 边界、工具权限与飞书/CLI ToolPolicy 审批、Gateway/ACP/CLI 协议适配、Memory/Context、Plugin、观测与 Token 统计、Skill 自进化与 provenance 治理、用户侧委派工具暴露与防递归、LLM Provider options 内部 key 过滤契约、Artifact 制品工作台 write-through/publish 封口/公开路由隔离/delete 双向级联（task<->制品 task_attachment）/Content-Disposition 共享 helper、对话页"更多信息"面板多 Tab 与制品列表共享渲染、preview pre max-height 覆盖与 sandbox 分类（HTML/markdown sandbox=""、PDF 不 sandbox）、编辑态 editor/textarea flex:1 填满面板、导出下载文件名用制品名（blob URL 绕过 Content-Disposition）、发布状态生命周期（新 Revision 不撤销 active publish->publish_sync_state=outdated 旧公链仍 200、重新发布才撤销旧 active+登记新 publish、metadata-only 不撤销、delete purge 发布记录+快照文件公链 404；头部状态栏+按钮切换）、Revision 版本与 CAS（expected_revision_id/If-Match 内容更新令牌、冲突 409 不静默覆写、rollback 生成新版本、diff 文本/二进制/混合）、Office 导出（DOCX/PPTX/XLSX 格式库仅 Infrastructure exporters.py、Domain exporter 端口）、Agent-native 工具与 artifact_guidance 装配、ui.artifact 卡片写工具成功持久化、task_complete workspace: ref 前置 probe 校验（不可读抛 TaskValidationError 让 worker 自纠正用 write_file/inline content，替代 finalize 后静默 drop）、goal_mode judge fork task_show 数据层 redact run 生命周期状态（task status 字段/runs/worker_context，避免 judge 看到 run 未 finalize 循环否决）、多 Agent 委派（_ServerSentinel capability 防伪造/指纹幂等重放/父级预算 reserve+ledger 恢复权威/delegation- 前缀隔离 session/cancel outbox at-least-once/capability 工具集签发时剥离 FORBIDDEN 工具）、Activated Skills 三层过滤（前端 getActivatedSkills / chat_service 形状归一 / context_service 实时求交）与技能名 Markdown code span 转义（阻断 prompt injection 伪造 heading）、顶导子域按入口语义归类（/sessions/observations 与 /observations/sessions 共享 renderer 但分别归 sessions/observations；/observations/modules 使用 observations-modules 私有 scope）、跨子域顶导快捷项的 tab 复用与父子域配置（OWNER 子域的快捷项可复用 TARGET 子域同 renderer 的 tab 名，但 topnavParent/scope 严格等于 OWNER，path 与 TARGET 同 tab 项保持一致，activeTopnavItem 在 OWNER 子域内精确匹配不会跨子域双激活）等实现约束、页面与路由解耦——同 renderer 多 entry 独立归属（一个页面可被多个 routeConfig entry 引用，entry 间共享 tab/renderTab 用于 activeTab 匹配与 renderer 复用，但 topnavParent/scope/sidebarTab/path 按各自左导入口语义独立归类；同一 renderer 多 entry 必须用独立 routeConfig entry 禁止合并多路径到单 entry；典型用例 /sessions/observations 与 /observations/sessions 共享 observations.js renderer 但分别归 sessions/observations 子域）、多入口模式禁止复用路由和菜单（同 renderer 多 entry 只允许共享 tab/renderTab 与 renderer 代码，path / topnavParent / scope / sidebarTab / 顶导 items / 左导 sidebarTab 必须按 entry 各自所属左导入口语义独立归类，禁止 path-alias 路由别名合并）、顶导是左导的子域（顶导 items 归属左导父菜单的子域，每个左导父菜单项对应一份统一顶导；左导入口菜单的对应页面统一增加顶导菜单，已有则不调整；避免顶导脱离左导语义独立存在）等实现约束 -->
 # 关键代码模式
 
 项目中反复出现但不易从单个文件推断的模式，供新功能实现时参照。
@@ -1003,7 +1003,7 @@ Dashboard 在左导不变的前提下新增可选顶导菜单组件，按子域�
 - 两个入口经 routeConfig 汇聚到同一 renderer，sidebar 高亮通过 sidebarOverride/sidebarTab 区分：顶导入口 sidebarTab=tasks（左导"任务"高亮），左导入口 sidebarTab=observations-sessions（左导"会话"高亮）。
 
 异步 guard 规则：
-- `app.js` onTabActivated 接收 state 对象（非裸 tab 字符串），`normalizeState` 兼容两种输入；`renderTopnav(state)` 在模块 init 前先渲染顶导（模块错误不阻断顶导状态）。
+- `app.js` onTabActivated 接收 state 对象（非裸 tab 字符串），`normalizeState` 兼容两种输入；`renderTopnav(state)` 在模块 init 前先渲染顶导（模块错误不阻断顶导状态）；`renderTopnav` 优先按 `state.currentSubdomain` 从 `topnavConfig` 取 items（多 entry 共用 `tab` 时取 OWNER 子域的顶导组），缺失时回退到 `state.activeTab` 的私有配置（保证 `/security/*` 等子域无 `topnavConfig[subdomain]` 的 entry 仍命中各自私有顶导）。
 - `inflight` map 共享并发 onTabActivated 的 init Promise，防止同一 tab 重复 init；init 失败调 `renderModuleError` 在容器内显示错误不 throw。
 - `tasks-observations.js` 与 `observations.js` 均用 `renderToken`（monotonic counter）+ `isActive()` 双重 guard：late response 的 token != current 时丢弃，tab 失去 active class 时丢弃；`inflight` Promise 去重防并发重复请求（force=true 时 supersede 旧 inflight）。
 
@@ -1295,3 +1295,58 @@ GET /chat/skills (已存在)
 空态/draft 语义：用户在新会话中选技能会先存内存 `draftActivatedSkills`，不发 localStorage（避免页面刷新或新建失败时丢失）；`ensureSession` 仅在 `api.createSession` 成功后才把 draft 提升到 `sessionActivatedSkills[id]` 并落盘；`createSession` 失败时 draft 与 UI 都保留供重试。删除会话只清自己的键，删的是当前会话则重渲染空态。
 
 相关：模式八（System Prompt 属于 Application Runtime 上下文）、模式三十三（options 内部 key 过滤）、`spec-260824-chat-composer-skill.md` 与 `plan-260824-chat-composer-skill.md`。
+
+## 模式三十八：顶导子域按左导入口语义归类（顶导归属铁律）
+
+顶导 items 归属哪个子域（`topnavConfig` 的 key / `routeConfig` 的 `topnavParent`）由左导一级/二级菜单的语义决定，不由 URL 层级决定；当同一 renderer 存在多路径入口（含别名）时，顶导归属以"语义入口所在的左导节点"为准。
+
+典型用例（spec-260830-sessions-topnav-observation）：`/sessions/observations` 是左导一级“会话”子域中的观测快捷入口，归 `sessions` 子域（顶导“管理 | 观测”、左导“会话”高亮）；`/observations/sessions` 是左导二级“观测-会话”标准入口，归 `observations` 子域（顶导单项“观测”、左导“观测-会话”高亮）。两条路径复用 observations.js renderer，但必须使用独立 routeConfig entry。
+
+组件用例（spec-260830-observations-components-topnav）：`/observations/modules` 虽位于 `/observations/` URL 层级，左导二级“观测-组件”仍是一个独立入口，必须拥有 `observations-modules` 私有 scope 与单项“组件”顶导；禁止因共同父级或共享 `status` renderer 回退到 `observations` 会话顶导。
+
+归属判定规则：
+- 左导一级菜单项（如“会话”“任务”）：该入口拥有自己的 topnavConfig scope，快捷项必须保持 owner scope，不因目标 renderer 属于另一子域而改归属。
+- 左导二级菜单项（如“观测-会话”“观测-组件”）：每个入口可拥有独立私有 scope；不得仅因同属“观测”父级就共享会话默认顶导。
+- renderer 复用（单页面多路由模式）：同一 renderer 可被多条 URL 共享，但顶导归属以调用方 entry 的语义入口为准，不以 renderer 唯一性为准。
+
+`routeConfig` 拆分规则：
+- 同一 renderer 跨多条 URL 时，按"每条 URL 的左导入口语义"决定 `topnavParent` / `scope` / `sidebarTab`，不要为多条 URL 共享一份 entry；共享 entry 会让顶导与左导高亮在别名与标准入口之间无法区分。
+- `sidebarTab` 必须在 routeConfig 内显式指定，**禁止**用 `sidebarOverride` 收敛；`sidebarOverride` 只用于历史脏数据兼容，新增/调整路由必须走 routeConfig。
+- 拆分后每条 entry 仍需满足 `buildRouteByPath` 校验：required 字段非空、paths 非空 / `/` 开头 / 全局唯一。
+
+铁律（项目内强制）：
+- 顶导配置项必须严格按入口语义归类，禁止仅按 URL 层级、共同父级或 renderer 归类。
+- renderer 复用不等于顶导共用；同一 renderer 可被多个不同语义子域调用，顶导按调用方的语义子域渲染。
+- 左导 HTML 结构、tabConfig、tabByPath/parentByChild/pathByTab 不动；顶导归属调整只能通过 topnavConfig / routeConfig / sidebarOverride 的拆分或重组达成。
+
+相关：模式三十二（顶导菜单与多路由双入口）、`spec-260830-topnav-scope-split.md` 与 `plan-260830-topnav-scope-split.md`。
+
+## 模式三十九：页面与路由解耦——同 renderer 多 entry 独立归属
+
+一个"页面"（renderer）可以被多个 routeConfig entry 引用，每个 entry 是该页面的独立入口，可拥有不同的 `topnavParent`/`scope`/`sidebarTab`/`path`，但 `tab` 与 `renderTab` 共享（用于 activeTab 匹配与 renderer 复用）。顶导与左导按"调用方 entry 所属子域"渲染，与"目标页面由哪个 renderer 渲染"解耦。
+
+典型用例（spec-260830-sessions-topnav-observation）：`会话观测` 页面（observations.js renderer）有两条独立 routeConfig entry：
+
+```
+/sessions/observations     → tab=observations-sessions, renderTab=observations-sessions, topnavParent=sessions,     scope=sessions,     sidebarTab=sessions
+/observations/sessions     → tab=observations-sessions, renderTab=observations-sessions, topnavParent=observations, scope=observations, sidebarTab=observations-sessions
+```
+
+两条 entry 共享 `tab` 与 `renderTab`（renderer 复用），但 `topnavParent`/`scope`/`sidebarTab` 按各自左导入口语义归类：
+- `/sessions/observations`：左导一级 `会话` 语义 → 顶导 `管理 | 观测`（`观测` 激活），左导 `会话` 高亮
+- `/observations/sessions`：左导二级 `观测 > 会话` 语义 → 顶导单项 `观测`（`观测` 激活），左导 `观测-会话` 高亮
+
+`topnavConfig` 与 routeConfig 字段语义：
+- **`tab` 是 activeTab 匹配名**——同一 renderer 在不同 entry 可共用 `tab` 名；`activeTopnavItem` 按 `state.activeTab` 与**当前子域** items 精确匹配，跨子域不会双激活。
+- **`renderTab` 是 renderer 调度键**——`app.js` 的 `resolveModule(renderTab)` 加载对应页面模块（如 `observations-sessions -> namespace.observations`）；同一 renderer 多 entry 必须共享 `renderTab`，否则会触发重复初始化或加载错误模块。
+- **`topnavParent` / `scope` / `sidebarTab` 是 entry 的"调用方语义"**——由该 entry 所属左导入口语义决定，不受 renderer 影响。
+- **`path` 是 entry 的 URL 唯一标识**——同一 `tab` 名的多个 entry 必须用不同 `path`，`buildRouteByPath` 校验 `paths` 全局唯一；点击不同 entry 的顶导项 `navigatePath(item.path)` 走的 URL 由 `path` 决定。
+
+铁律：
+- **同一 renderer 多 entry 必须用独立 routeConfig entry**——禁止把多路径合并到一条 entry（如 `paths: ['/a', '/b']`），否则 `topnavParent`/`scope`/`sidebarTab` 只能选一个值，无法按 entry 区分顶导与左导。
+- **禁止复用路由和菜单**——同 renderer 多 entry 只允许共享 `tab`/`renderTab`（用于 activeTab 匹配与 renderer 复用）与 renderer 代码；`path` / `topnavParent` / `scope` / `sidebarTab` / 顶导 items / 左导 sidebarTab 必须按 entry 各自所属左导入口语义独立归类，不允许通过路由别名（`path-alias` 把 `A/foo` 透明重定向到既有路径）合并。
+- **独立 entry 仍需满足 `buildRouteByPath` 校验**——required 字段（`tab`/`renderTab`/`sidebarTab`/`topnavParent`/`scope`）非空、`paths` 非空且以 `/` 开头、跨 entry 不重复。
+- **OWNER 子域与 TARGET 子域可同可异**——OWNER（顶导项所属子域，由 `topnavConfig` key 决定）与 TARGET（实际渲染归属，由 routeConfig `topnavParent` 决定）在本模式与模式三十八共同约束下可解耦；同子域 entry（OWNER==TARGET）是"同子域多 entry"用例，跨子域 entry（OWNER!=TARGET）是"跨子域共享 renderer"用例。
+- **顶导 item 顺序遵循 OWNER 子域期望**——`管理` 出现在 `观测` 之前是按"OWNER 顶导的逻辑分组"排列，与 renderer 共享方子域的 items 顺序无关。
+
+相关：模式三十八（顶导子域按左导入口语义归类）、`spec-260830-sessions-topnav-observation.md` 与 `plan-260830-sessions-topnav-observation.md`。

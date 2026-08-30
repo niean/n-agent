@@ -438,3 +438,11 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：任何前端文件改动后的浏览器实测，前置步骤是 `sh docker/restart.sh` 重建镜像，而不只是确认 `/health` 可用。实测脚本应先用 `curl -fsS http://localhost:8201/static/<file> | grep <新声明片段>` 断言容器提供的资源已包含本次改动，再读取几何值；否则 RED/GREEN 结果都在测旧代码，GREEN 会假失败、RED 会假通过。
 
 来源：feature 260824 chat-adaptive-width Phase 4 S6 GREEN 检查前发现容器提供旧 CSS
+
+### P044: 前端数量/枚举校验必须用单一来源常量 + 严格顶层 envelope，禁止魔法数字 + 弱顶层 shape 检查
+
+现象：Dashboard `/security` 页面加载失败，一直显示"策略加载失败"+"重试"。后端 `_POLICY_METADATA` 新增了第 11 个 Policy（`delegation`），`/chat/policies` 实际返回 11 项 Policy，但前端 `security.js` validator 同时有 `policies.length !== 10`（魔法数字）和 `EXPECTED_KEYS` 数组（10 项，缺 `delegation`），任一校验失败都抛 `policy_load_failed`。Node 行为夹具 `security_frontend_harness.js` 的 `validPayload()` 也只构造 10 项 Policy（与硬编码常量同步），所以 6 项前端测试全绿，浏览器实页全红。
+
+根因：跨 3 文件 / 2 层（interfaces 静态 JS + 测试）。(1) 数量校验用魔法数字 10，没从唯一来源常量 `EXPECTED_KEYS.length` 派生；后端新增第 N 项 Policy 时，validator 与夹具必须同步手改 3 处常量（validator `10`、夹具 `meta.length`、夹具断言 `=== 10`），任何一处漏改都让前端彻底白屏。(2) 顶层 envelope 未做 `sameKeys(payload, ['profile_version', 'policies'])` 严格校验，只校验子字段是否存在，导致后端万一多加一个顶层字段（如 `extra`）前端也放行。(3) Node 行为夹具是"自参照"的——夹具的 `validPayload` 与被测 validator 共享同一个魔法数字，测试只验证"夹具 == validator"，不验证"夹具 == 真实后端 shape"，夹具漂移被掩盖。根因跨 `policy_dashboard_service.py`（后端新增 11 项）/`security.js`（validator 10）/`security_frontend_harness.js`（夹具 10）/`test_security_frontend.py`（静态合同仅检查前 5 个 key）。
+
+教训：(1) 数量/枚举类校验必须用单一来源常量派生——`if (policies.length !== EXPECTED_KEYS.length) throw`，不写 `!== 10` 这类魔法数字；新增/删除 Policy 时只改 `EXPECTED_KEYS` 一处，数量校验自动跟随。(2) 顶层 envelope 必须用 `sameKeys(payload, [...expected])` 严格校验字段集合，不只校验"子字段是否各自有效"；这一调用必须位于读取任一 payload 字段之前。(3) 行为夹具的 `validPayload` 应从后端真实 `_POLICY_METADATA` 等权威元数据派生（如直接 import 或在编译期生成），不手维护与被测代码同源的常量数组；若必须手维护，须补一条 Python 静态合同用正则锁住源文件里的 `EXPECTED_KEYS` 完整顺序、`policies.length !== EXPECTED_KEYS.length` 派生形式、`sameKeys(payload, ['profile_version', 'policies'])` 调用存在——把"夹具"和"源"分离的护栏建在源端（regex 直接读源），避免夹具漂移时测试仍绿。(4) Dashboard 前端任一 JS validator 增改后，必须先 RED（夹具 + 静态合同双红）再 GREEN，并经 Playwright 真浏览器实测确认页面渲染数量符合契约（参考 P015/P032/P043）。相关：P015 契约漂移（JS 消费错 shape）、P032 浏览器实测根因、P043 静态资源烘焙重建。
