@@ -168,12 +168,14 @@
     table.className = 'document-table scheduled-table';
     const thead = document.createElement('thead');
     const headRow = document.createElement('tr');
-    ['任务', '调度', '启用', '下次运行', '最近结果', '操作'].forEach((label) => appendText(headRow, 'th', label));
+    ['任务名称', '调度', '启用', '下次运行', '最近结果', '操作'].forEach((label) => appendText(headRow, 'th', label));
     thead.appendChild(headRow);
     table.appendChild(thead);
 
     const tbody = document.createElement('tbody');
-    state.tasks.forEach((task) => tbody.appendChild(renderTaskRow(task)));
+    const sortedTasks = state.tasks.slice().sort((a, b) =>
+      text(a.name, a.id).localeCompare(text(b.name, b.id), 'zh-CN'));
+    sortedTasks.forEach((task) => tbody.appendChild(renderTaskRow(task)));
     table.appendChild(tbody);
     wrap.appendChild(table);
     return wrap;

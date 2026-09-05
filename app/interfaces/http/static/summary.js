@@ -74,6 +74,7 @@
     try {
       const value = await promise;
       if (Array.isArray(value)) return value.length;
+      if (value && Array.isArray(value.items)) return value.items.length;
       if (value && Array.isArray(value.data)) return value.data.length;
       return 0;
     } catch (error) {
@@ -88,18 +89,20 @@
     ui.clear(stats);
     ui.renderLoading(stats, '加载概览...');
     try {
-      const [service, dependencies, sessionsCount, toolsCount, modelsCount, scheduledTasksCount] = await Promise.all([
+      const [service, dependencies, sessionsCount, toolsCount, modelsCount, tasksCount, scheduledTasksCount] = await Promise.all([
         api.getHealth().catch(() => ({ status: 'error' })),
         api.getDependencyHealth().catch(() => ({})),
         safeCount(api.listSessions()),
         safeCount(api.listTools()),
         safeCount(api.listModels()),
+        safeCount(api.task.list()),
         safeCount(api.listScheduledTasks()),
       ]);
       renderStats(stats, service || {}, dependencies || {}, {
         sessions: sessionsCount,
         tools: toolsCount,
         models: modelsCount,
+        tasks: tasksCount,
         scheduledTasks: scheduledTasksCount,
       });
       renderEntries(entries);

@@ -328,6 +328,12 @@ def test_static_assets_contain_expected_logic(tmp_path):
     assert "'scheduled-tasks'" in summary_js
     assert 'listScheduledTasks' in summary_js
     assert '任务数' in summary_js
+    # 概览页"任务数"卡片：前端必须拉取任务 API 且 safeCount 必须支持
+    # {items, next_cursor} 形态（GET /chat/tasks 当前返回的格式），否则
+    # counts.tasks 兜底为 0，详见 fix-bug: 概览任务数显示 0。
+    assert 'api.task.list' in summary_js, "summary.js must call api.task.list() to populate 任务数"
+    safe_count_block = summary_js[summary_js.index('async function safeCount'):summary_js.index('\n  }\n', summary_js.index('async function safeCount')) + len('\n  }\n')]
+    assert 'value.items' in safe_count_block, "safeCount must recognise {items, next_cursor} responses"
     assert summary_js.index("tab: 'chat'") < summary_js.index("tab: 'scheduled-tasks'") < summary_js.index("tab: 'sessions'")
     assert (
         summary_js.index("tab: 'tools-knowledge'")
