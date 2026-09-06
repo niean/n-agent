@@ -168,7 +168,7 @@
     table.className = 'document-table scheduled-table';
     const thead = document.createElement('thead');
     const headRow = document.createElement('tr');
-    ['任务名称', '调度', '启用', '下次运行', '最近结果', '操作'].forEach((label) => appendText(headRow, 'th', label));
+    ['任务名称', '调度表达式', '启用', '下次运行', '最近结果', '操作'].forEach((label) => appendText(headRow, 'th', label));
     thead.appendChild(headRow);
     table.appendChild(thead);
 

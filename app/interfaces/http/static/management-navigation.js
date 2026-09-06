@@ -3,8 +3,8 @@
   const tabConfig = [
     { tab: 'summary', path: '/summary', label: '概览' },
     { tab: 'chat', path: '/chat', label: '对话' },
-    { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '定时任务' },
     { tab: 'sessions', path: '/sessions', label: '会话' },
+    { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '定时任务' },
     { tab: 'tasks', path: '/tasks', label: '任务' },
     { tab: 'memory', path: '/memory', label: '记忆' },
     { tab: 'tools', label: '工具', parent: true, children: ['tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin'] },

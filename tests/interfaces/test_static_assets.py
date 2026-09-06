@@ -1064,14 +1064,14 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
     assert sidebar_match, "sidebar not found"
     sidebar_html = sidebar_match.group(1)
     expected_data_tabs = [
-        'chat', 'scheduled-tasks', 'sessions', 'tasks', 'memory',
+        'chat', 'sessions', 'scheduled-tasks', 'tasks', 'memory',
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
         'executors', 'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
         'observations', 'observations-sessions', 'observations-modules', 'security',
         'security-overview', 'security-sessions', 'security-memory', 'security-sandbox',
     ]
     expected_hrefs = [
-        '/chat', '/scheduled-tasks', '/sessions', '/tasks', '/memory',
+        '/chat', '/sessions', '/scheduled-tasks', '/tasks', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/artifacts', '/models', '/platforms',
         '/observations/sessions', '/observations/modules', '/security',

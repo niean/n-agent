@@ -1012,9 +1012,10 @@ shell 路由注册规则（`dashboard.py`）：
 - API 路由 `/chat/tasks/security` 必须在 `register_task_routes`（注册 `/chat/tasks/{task_id}`）之前注册，否则被 catch-all 吞噬。
 
 共享 renderer 复用规则（`security.js` -> `tasks-security.js`）：
-- 子域页复用全局页渲染器：`security.js` 暴露 `namespace.security.renderers = {overview,sector,meta,cfg,policyItem,statCard,formatValue}`（shortened key，对标 `namespace.observations.renderers` 供 `tasks-observations.js` 复用的既定模式），`tasks-security.js` 经 `const R = (namespace.security && namespace.security.renderers) || {}` 取用。
+- 子域页复用全局页渲染器：`security.js` 暴露 `namespace.security.renderers` 共 11 个导出 `{overview,sector,meta,cfg,policyItem,statCard,formatValue,isBytesField,bytesToMb,mbToBytes,formatConfigValue}`（shortened key，对标 `namespace.observations.renderers` 供 `tasks-observations.js` 复用的既定模式），`tasks-security.js` 经 `const R = (namespace.security && namespace.security.renderers) || {}` 取用。
 - renderer 必须是纯 DOM 构造函数（取参数、不读子域页闭包 state）；通过向后兼容可选参数（`overview(data,options)`/`sector(policy,options)`）扩展子域页专用展示（如 `countLabel:'Sector 数量'`、`showSourceFiles:true`），全局页单参数默认调用行为不变。
-- renderer 暴露必须在 `{init,refresh}` 赋值之后挂载（`global.NAGENT.security = {init,refresh}; global.NAGENT.security.renderers = {...}`），避免对象字面量赋值覆盖 renderers。
+- 兼容导出（`overview`、`sector` 的 `countLabel` 形参）：安全页 `render()` 自 spec-260907-remove-security-overview-sector 已不调用 `overview()`，但 `tasks-security.js` 仍按既有合同调用 `overview({countLabel:'Sector 数量'})` 渲染任务安全页顶部统计卡片，且其 `renderers().need` 预检包含 `'overview'`。`security.js` 必须保留 `overview` 函数与导出（`namespace.security.renderers.overview`），且函数体不破坏兼容签名；未来删除须先调整 `tasks-security.js` 消费者合同，不属于本任务范围。
+- renderer 暴露必须在 `{init,refresh,activate}` 赋值之后挂载（`global.NAGENT.security = {init,refresh,activate}; global.NAGENT.security.renderers = {...}`），避免对象字面量赋值覆盖 renderers。
 
 陷阱：
 - `topnavConfig` 与 `tabConfig` 混淆会让顶导依赖左导的父子结构，破坏"左导不变"约束；`routeConfig` 与 `tabByPath` 混淆会让多路径同 renderer 无法表达（tabByPath 是 1:1 映射）。正确做法：topnavConfig/routeConfig 是独立配置，tabConfig/tabByPath/pathByTab/parentByChild 不改。

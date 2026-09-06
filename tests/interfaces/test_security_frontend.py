@@ -111,9 +111,13 @@ def test_security_js_static_contract():
     assert "policy-cfg" in src
     assert "policy-item" in src
     assert "cfg-item" not in src
-    # overview sector (stats-bar + stat-card), no topbar last-update usage
-    assert "整体概览" in src
-    assert "stat-card" in src
+    # overview sector (stats-bar + stat-card) no longer rendered in security page
+    # render(); overview() 兼容函数仍存在供 tasks-security.js 预检，函数体保留
+    # `整体概览` 字面与 stat-card 引用。render() 必须不再调用 overview。
+    assert "整体概览" in src, "overview() 兼容导出应保留字面量"
+    assert "root.appendChild(overview(data))" not in src, \
+        "render() 必须不再追加 overview sector"
+    assert "stat-card" in src, "overview() 仍依赖 stat-card"
     assert "last-update" not in src
     # safe rendering only
     assert "document.createElement" in src

@@ -106,7 +106,8 @@
       throw new Error('policy_load_failed');
     }
     clear(root);
-    root.appendChild(overview(data));
+    // 安全页不再追加 整体概览 sector；overview() 兼容函数保留供 tasks-security.js
+    // 预检与既有消费者调用，不在安全页 render() 中渲染。
     data.policies.forEach((p) => root.appendChild(sector(p)));
   }
 
@@ -114,7 +115,9 @@
   // tasks-security.js. All are pure DOM constructors taking params + an
   // optional options object; they never read tasks-security closure state.
   // overview(data, options): options.countLabel overrides the count card label
-  //   (default 'Policy 数量').
+  //   (default 'Policy 数量'). 兼容导出：安全页 render() 已不再调用；保留供
+  //   tasks-security.js 预检 `renderers().need.includes('overview')` 通过，避免
+  //   任务安全页报"安全页面渲染器不可用"。移除须另行调整消费者。
   // sector(policy, options) / meta(policy, options): options.showSourceFiles
   //   === true plus policy.source_files array appends a source-files item;
   //   options.sourceLabel overrides its label (default '来源文件').

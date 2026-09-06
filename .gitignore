@@ -26,6 +26,7 @@ secrets.json
 .superpowers/
 .claude/
 .workbuddy/
+.multica/
 
 # Project-Common
 locals/*

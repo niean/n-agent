@@ -97,39 +97,59 @@ function headerText(sector) {
 function policySectors() {
   return sectors().filter((s) => headerText(s) !== '整体概览');
 }
-function overviewVersion() {
-  const ov = sectors().find((s) => headerText(s) === '整体概览');
-  if (!ov) return null;
-  const body = ov.children.find((c) => c.className === 'panel-body');
-  const bar = body && body.children.find((c) => c.className === 'stats-bar');
-  const card = bar && bar.children[0];
-  const val = card && card.children.find((c) => c.className === 'value');
-  return val ? val.textContent : null;
-}
 function allTexts(node, out) {
   out = out || [];
   if (node._text) out.push(node._text);
   (node.children || []).forEach((c) => allTexts(c, out));
   return out;
 }
+// 与 security.js EXPECTED_KEYS 同步的 scope 策略顺序（跨 scope 验收用）
+const SCOPES_ORDER = [
+  'turn', 'context', 'llm', 'tool', 'memory',
+  'sandbox', 'gateway', 'schedule', 'budget', 'information_flow', 'delegation',
+];
+// 与 security.js SCOPES 同步的 scope -> key 集合
+function expectedScopeKeys(scope) {
+  const sessions = ['turn', 'context', 'llm', 'tool', 'budget', 'information_flow', 'delegation'];
+  if (scope === 'overview') return SCOPES_ORDER.slice();
+  if (scope === 'sessions') return sessions;
+  if (scope === 'memory') return ['memory'];
+  if (scope === 'sandbox') return ['sandbox'];
+  return [];
+}
+
+// /sessions/security: 会话顶导下的安全页，与 /security/sessions 共享 renderer
+// 但 route state 走 sessions 子域（topnavParent/sidebarTab=sessions，scope=sessions）。
+function sessionsSecurityState() {
+  return {
+    activeTab: 'security-sessions',
+    renderTab: 'security',
+    sidebarTab: 'sessions',
+    currentSubdomain: 'sessions',
+    route: { scope: 'sessions', tab: 'security-sessions', renderTab: 'security', sidebarTab: 'sessions', topnavParent: 'sessions' },
+  };
+}
 
 async function main() {
-  // 1. success renders 10 sectors
+  // 1. success renders 11 policy sectors (no 整体概览 sector)
   let count = 0;
-  const api1 = { listPolicies: () => { count++; return Promise.resolve(validPayload('v1')); } };
+  let seenScopes = [];
+  const api1 = { listPolicies: (scope) => { count++; seenScopes.push(scope); return Promise.resolve(validPayload('v1')); } };
   const env1 = freshEnv(api1);
   env1.NAGENT.security.init(stateFor('overview'));
   await tick();
   ok(policySectors().length === 11, 'render 11 policy sectors, got ' + policySectors().length);
-  ok(sectors().length === 12, 'overview + 11 policy sectors, got ' + sectors().length);
+  ok(sectors().length === 11, 'no overview sector, total sectors should be 11, got ' + sectors().length);
+  ok(sectors().every((s) => headerText(s) !== '整体概览'),
+    'no sector has header 整体概览, got headers=' + sectors().map(headerText).join('|'));
   ok(count === 1, 'init triggered 1 fetch, got ' + count);
-  ok(overviewVersion() === 'v1', 'overview shows profile version v1, got ' + overviewVersion());
-  // overview "Policy 数量" 值 = 11
-  const ov = sectors().find((s) => headerText(s) === '整体概览');
-  const bar = ov && ov.children.find((c) => c.className === 'panel-body').children.find((c) => c.className === 'stats-bar');
-  const countCard = bar && bar.children[1];
-  const countVal = countCard && countCard.children.find((c) => c.className === 'value');
-  ok(countVal && countVal.textContent === '11', 'overview count card shows 11, got ' + (countVal && countVal.textContent));
+  // 完整 display_name 顺序：validPayload 11 个策略按 EXPECTED_KEYS 顺序
+  const expectedOrder = validPayload().policies
+    .filter((p) => SCOPES_ORDER.indexOf(p.key) !== -1)
+    .map((p) => p.display_name);
+  const renderedOrder = policySectors().map(headerText);
+  ok(JSON.stringify(renderedOrder) === JSON.stringify(expectedOrder),
+    'overview scope sector order matches EXPECTED_KEYS, got ' + renderedOrder.join(','));
   // 末项为委派策略
   const lastPolicy = policySectors()[policySectors().length - 1];
   ok(lastPolicy && headerText(lastPolicy) === '委派策略', 'last policy sector is 委派策略');
@@ -179,19 +199,29 @@ async function main() {
   ok(sectors().length === 0, 'extra top-level field clears sectors, got ' + sectors().length);
 
   // 6. race: late request must not overwrite the latest
+  // 用 config value 区分新旧响应（仅 profile_version 不同时旧响应覆盖也会通过）
   let r1, r2, n = 0;
   const p1 = new Promise((res) => { r1 = res; });
   const p2 = new Promise((res) => { r2 = res; });
   const api4 = { listPolicies: () => { n++; return n === 1 ? p1 : p2; } };
   const env4 = freshEnv(api4);
-  env4.NAGENT.security.refresh(stateFor('overview')); // token 1
-  env4.NAGENT.security.refresh(stateFor('overview')); // token 2
-  r2(validPayload('EARLY')); // latest resolves first
+  env4.NAGENT.security.refresh(stateFor('overview')); // token 1 (stale)
+  env4.NAGENT.security.refresh(stateFor('overview')); // token 2 (latest)
+  const latestPayload = validPayload('LATEST');
+  latestPayload.policies[0].config[0].value = 22; // distinct visible value
+  r2(latestPayload);
   await tick();
-  ok(overviewVersion() === 'EARLY', 'latest request wins, got ' + overviewVersion());
-  r1(validPayload('LATE')); // stale resolves late
+  const stalePayload = validPayload('STALE');
+  stalePayload.policies[0].config[0].value = 99; // distinct visible value
+  r1(stalePayload);
   await tick();
-  ok(overviewVersion() === 'EARLY', 'stale request ignored, got ' + overviewVersion());
+  // 抽取首个 policy sector 的 policy-cfg 子节点文本，断言包含 22 且不含 99
+  const firstPolicy = policySectors()[0];
+  const firstPolicyTexts = firstPolicy ? allTexts(firstPolicy).join('|') : '';
+  ok(firstPolicyTexts.indexOf('22') !== -1, 'latest response visible (config value 22), got ' + firstPolicyTexts);
+  ok(firstPolicyTexts.indexOf('99') === -1, 'stale response ignored (no config value 99), got ' + firstPolicyTexts);
+  ok(sectors().every((s) => headerText(s) !== '整体概览'),
+    'after race resolution still no overview sector');
 
   // 7. single init: second init() does not fetch again
   let m = 0;
@@ -205,12 +235,42 @@ async function main() {
   // 8. Each security child uses its route scope to render the intended policy set.
   const expectedCounts = { overview: 11, sessions: 7, memory: 1, sandbox: 1 };
   for (const scope of Object.keys(expectedCounts)) {
-    const env = freshEnv({ listPolicies: () => Promise.resolve(validPayload(scope)) });
+    let observedScope = null;
+    const env = freshEnv({ listPolicies: (s) => { observedScope = s; return Promise.resolve(validPayload(s)); } });
     env.NAGENT.security.init(stateFor(scope));
     await tick();
     ok(policySectors().length === expectedCounts[scope],
       scope + ' renders ' + expectedCounts[scope] + ' policy sectors, got ' + policySectors().length);
+    ok(sectors().length === expectedCounts[scope],
+      scope + ' no overview sector, total=' + sectors().length);
+    ok(sectors().every((s) => headerText(s) !== '整体概览'),
+      scope + ' no sector has header 整体概览');
+    ok(observedScope === scope, scope + ' listPolicies called with ' + scope + ', got ' + observedScope);
+    const expectedOrder = validPayload().policies
+      .filter((p) => SCOPES_ORDER.indexOf(p.key) !== -1 && expectedScopeKeys(scope).indexOf(p.key) !== -1)
+      .map((p) => p.display_name);
+    const renderedOrder = policySectors().map(headerText);
+    ok(JSON.stringify(renderedOrder) === JSON.stringify(expectedOrder),
+      scope + ' sector order matches expected, got ' + renderedOrder.join(','));
   }
+
+  // 8b. /sessions/security 入口：route state 归 sessions 子域，scope=sessions
+  let sessionsSecurityScope = null;
+  const sessionsSecurityEnv = freshEnv({ listPolicies: (s) => {
+    sessionsSecurityScope = s; return Promise.resolve(validPayload(s));
+  } });
+  sessionsSecurityEnv.NAGENT.security.activate(sessionsSecurityState());
+  await tick();
+  ok(sessionsSecurityScope === 'sessions', '/sessions/security requests sessions scope, got ' + sessionsSecurityScope);
+  ok(policySectors().length === 7, '/sessions/security renders 7 policy sectors, got ' + policySectors().length);
+  ok(sectors().every((s) => headerText(s) !== '整体概览'),
+    '/sessions/security no sector has header 整体概览');
+  const sessionsExpectedOrder = validPayload().policies
+    .filter((p) => expectedScopeKeys('sessions').indexOf(p.key) !== -1)
+    .map((p) => p.display_name);
+  const sessionsRenderedOrder = policySectors().map(headerText);
+  ok(JSON.stringify(sessionsRenderedOrder) === JSON.stringify(sessionsExpectedOrder),
+    '/sessions/security sector order matches expected, got ' + sessionsRenderedOrder.join(','));
 
   // 9. Invalid or missing route scope is a safe, retryable load error.
   for (const badState of [stateFor('unknown'), { renderTab: 'security', route: {} }]) {
@@ -259,6 +319,8 @@ async function main() {
   ok(sessionScopes.length === 2 && sessionScopes[0] === 'sessions' && sessionScopes[1] === 'sessions',
     'sessions retry requests the sessions scope both times');
   ok(policySectors().length === 7, 'sessions retry retains sessions scope (got ' + policySectors().length + ')');
+  ok(sectors().every((s) => headerText(s) !== '整体概览'),
+    'sessions retry does not bring back overview sector');
 
   // 12. A late sessions response cannot overwrite a later memory activation.
   let resolveSessions;
@@ -271,9 +333,13 @@ async function main() {
     raceEnv.NAGENT.security.activate(stateFor('memory'));
     await tick();
     ok(policySectors().length === 1, 'later memory activation renders one memory sector');
+    ok(headerText(policySectors()[0]) === '记忆策略',
+      'later memory activation renders 记忆策略 sector, got ' + headerText(policySectors()[0]));
     resolveSessions(validPayload('sessions'));
     await tick();
     ok(policySectors().length === 1, 'late sessions response does not overwrite memory');
+    ok(headerText(policySectors()[0]) === '记忆策略',
+      'late sessions response leaves 记忆策略 sector untouched');
   } else {
     resolveSessions(validPayload('sessions'));
     await tick();
