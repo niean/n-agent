@@ -16,6 +16,7 @@ description: 需求探索、方案设计、spec 产出
 ## Skills
 
 - superpowers/brainstorming
+- harness/third-review
 
 ## 约束
 

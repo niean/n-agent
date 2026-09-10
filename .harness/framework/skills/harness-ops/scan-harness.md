@@ -141,6 +141,7 @@ Layer 3   subskills/      (原子操作)
 - PROJECT.md "项目规范"摘要 vs knowledge/03-conventions.md 权威源：是否存在规则偏差
 - 同一术语在不同文件中定义是否一致（对照 knowledge/21-glossary.md）
 - Workflow/Skill 中引用的规则与 FRAMEWORK.md/PROJECT.md 中声明是否一致
+- Workflow 各 Phase（含条件分支）的任务、配置与产出要求是否符合执行 Agent 的全部适用约束；按 FRAMEWORK.md 的“Agent 执行检查”核对并报告不符合项
 - 知识索引表中"何时查阅"描述与文件实际内容是否匹配
 
 输出：矛盾对（文件A vs 文件B） + 具体冲突内容 + 建议以哪个为准

@@ -106,7 +106,7 @@ subagent 是通过 Agent 工具启动的独立上下文窗口，是运行方式�
 - Skill 不声明自身由哪个 Agent 执行，执行角色由上层指定
 - Skill 不声明自身的触发时机，调用时机由上层（Workflow/Orchestrator）决定；Skill 的 description 只描述功能用途
 - Skill/Agent 调用 Subskill：通过 subagent 机制并行启动
-- Agent 不反向引用 Skill（如具体 Phase 编号、Skill 文件名），不定义执行流程
+- Agent 可声明 Skill 能力列表，不定义执行流程，也不反向引用 Workflow 的具体 Phase 编号；Skill 的调用时机与执行顺序由 Workflow/Orchestrator 决定
 - Subskill 不反向引用 Skill 或 Agent
 - 引用方向自上而下：上层引用下层，同层可编排引用，下层仅允许"指回入口"式引用
 - 允许的特例：PROJECT.md 与 03-conventions.md 双向声明摘要-权威源关系；01-overview.md 指回 FRAMEWORK.md 或 PROJECT.md

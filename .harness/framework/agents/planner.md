@@ -16,6 +16,8 @@ description: 计划拆分、plan 产出
 ## Skills
 
 - superpowers/writing-plans
+- harness/third-review
+- superpowers/writing-verify
 
 ## 约束
 

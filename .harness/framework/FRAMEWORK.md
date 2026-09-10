@@ -36,6 +36,12 @@
 3. 遵守 `[GATE]` 门禁（见下方 GATE 规则），在 GATE 点等待用户确认后再继续
 4. 按 Phase 定义的消息输出格式输出，不简化、不改动
 
+## Agent 执行检查
+
+- Orchestrator 在 Phase 开始前读取执行 Agent 定义，核对职责、LLMs、Skills、行为边界、上下文、委派等全部适用约束；执行 Agent 在操作前复核，Orchestrator 在 Phase 结束时核对产出。
+- Workflow/Orchestrator 分配的直接 Skill 调用须由 Agent 的 `## Skills` 名称或分类覆盖；Skill 内部声明的依赖由该 Skill 管理。
+- 不符合约束时停止相关操作或 Phase 流转，报告不符合项及规则来源，不自动扩充能力或放宽约束。
+
 ## Workflow Hook
 
 Workflow 可在明确声明的扩展点调用 `.harness/hooks/` 下的项目自定义脚本。Hook 是稳定调用入口，具体命令和项目配置由 Hook 自行管理。
