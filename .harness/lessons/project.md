@@ -1,4 +1,4 @@
-<!-- SUMMARY: {{项目名称}}开发中的经验教训，AI自主维护 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界 -->
 # 项目教训
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
@@ -446,3 +446,19 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 根因：跨 3 文件 / 2 层（interfaces 静态 JS + 测试）。(1) 数量校验用魔法数字 10，没从唯一来源常量 `EXPECTED_KEYS.length` 派生；后端新增第 N 项 Policy 时，validator 与夹具必须同步手改 3 处常量（validator `10`、夹具 `meta.length`、夹具断言 `=== 10`），任何一处漏改都让前端彻底白屏。(2) 顶层 envelope 未做 `sameKeys(payload, ['profile_version', 'policies'])` 严格校验，只校验子字段是否存在，导致后端万一多加一个顶层字段（如 `extra`）前端也放行。(3) Node 行为夹具是"自参照"的——夹具的 `validPayload` 与被测 validator 共享同一个魔法数字，测试只验证"夹具 == validator"，不验证"夹具 == 真实后端 shape"，夹具漂移被掩盖。根因跨 `policy_dashboard_service.py`（后端新增 11 项）/`security.js`（validator 10）/`security_frontend_harness.js`（夹具 10）/`test_security_frontend.py`（静态合同仅检查前 5 个 key）。
 
 教训：(1) 数量/枚举类校验必须用单一来源常量派生——`if (policies.length !== EXPECTED_KEYS.length) throw`，不写 `!== 10` 这类魔法数字；新增/删除 Policy 时只改 `EXPECTED_KEYS` 一处，数量校验自动跟随。(2) 顶层 envelope 必须用 `sameKeys(payload, [...expected])` 严格校验字段集合，不只校验"子字段是否各自有效"；这一调用必须位于读取任一 payload 字段之前。(3) 行为夹具的 `validPayload` 应从后端真实 `_POLICY_METADATA` 等权威元数据派生（如直接 import 或在编译期生成），不手维护与被测代码同源的常量数组；若必须手维护，须补一条 Python 静态合同用正则锁住源文件里的 `EXPECTED_KEYS` 完整顺序、`policies.length !== EXPECTED_KEYS.length` 派生形式、`sameKeys(payload, ['profile_version', 'policies'])` 调用存在——把"夹具"和"源"分离的护栏建在源端（regex 直接读源），避免夹具漂移时测试仍绿。(4) Dashboard 前端任一 JS validator 增改后，必须先 RED（夹具 + 静态合同双红）再 GREEN，并经 Playwright 真浏览器实测确认页面渲染数量符合契约（参考 P015/P032/P043）。相关：P015 契约漂移（JS 消费错 shape）、P032 浏览器实测根因、P043 静态资源烘焙重建。
+
+### P045: 夹具与真实产物的形态差必然自成一类缺陷，构造侧夹具必须用被测产物的真实打包方式
+
+现象：Config Bundle 任务中连续出现三个同源缺陷 —— (1) 预检把 `tar -C <staging> .` 产生的 `./` 根成员当成"空成员名"拒绝，而这正是导出器的真实打包形态；(2) macOS 打包带入 `._*` AppleDouble 成员，触发 manifest `packed - listed` 硬拒绝；(3) 宿主链路测试用停机服务的桩替代真实容器，掩盖了停机路径的行为差异。
+
+根因：跨 `docker/config_bundle_files.py` 预检实现与 `tests/test_config_bundle_scripts.py` 夹具两侧。测试夹具用 `tarfile.addfile` 逐个添加成员来"构造一个包"，产物形态干净、成员集合精确；真实导出器用 `tar -C <dir> .` 打包一个目录，产物必然多出根成员，并在 macOS 上可能多出扩展属性伴生成员。夹具与产物同名同格式，却不同形态，于是所有"包结构"断言都在验证一个真实世界不存在的输入。
+
+教训：凡是被测代码要消费"由另一段代码生产的产物"（归档、导出文件、序列化载荷），至少一条用例必须用生产侧的真实生产方式构造输入，而不是用测试库手工拼装 —— 本任务的做法是补 `_repack_like_the_exporter` 助手，用与 config-export.sh 相同的 `tar -C . ` 形式重新打包再送进预检。手工拼装的夹具保留用于负面用例（构造非法成员），但不能是唯一的正面用例。同时注意平台差异会进入产物形态（macOS AppleDouble、gzip 时间戳），跨平台产物的断言要么屏蔽这类成员，要么在打包侧显式关闭（`COPYFILE_DISABLE=1`）。相关：P015 契约漂移、P016 测试与 E2E 也是契约消费方、D064。
+
+### P046: 已提交之后发生的失败，绝不能沿用"什么都没做"的错误码
+
+现象：`import_bundle` 的段内逐行 guard 只保护单行写入，而读目标现状解冲突、写单例段这类工作落在所有 try 之外；一旦抛出，异常逃逸到 CLI 的兜底 `except Exception -> return 2`，而退 2 的公开语义是"包格式错误、目标未被改动"。此时前面若干段已经落库，`config-import.sh` 却打印"容器内配置导入无法运行"。
+
+根因：跨 `app/application/config_bundle_service.py`（段编排）、`app/interfaces/cli/commands/config.py`（兜底 except）、`docker/config-import.sh`（退出码解读）三层。错误码是跨进程的唯一可观测契约，而"抛异常"这个动作在不同时刻有完全不同的含义：校验期抛异常时"目标未被改动"为真，执行期抛异常时它已经为假。代码只区分了异常类型，没有区分异常发生的阶段。
+
+教训：设计退出码/错误码契约时，必须为"已经产生副作用之后的失败"预留一个独立码，并在实现里按阶段划界 —— 校验阶段继续抛（错误码准确），执行阶段每个提交单元用一层包裹把失败收敛为报告项（本任务的 `_apply_section`，段级失败记为 `section="*"` 的 FAILED item，从而落到"部分应用"的退 1）。收敛层只记异常类型不记 message，避免把正在写入的取值带进报告。判断"是否需要后续动作（重启/回滚）"只能依据显式的 `action` 字段，不能依据 outcome。同理 POSIX sh 侧：数据库已提交之后调用的 helper 一旦失败，不得让它的非零码成为脚本退出码，必须兜住并取安全默认值。相关：模式四十、P016。

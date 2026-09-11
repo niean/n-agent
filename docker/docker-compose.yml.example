@@ -9,6 +9,13 @@ name: n-agent
 #      到不存在的宿主目录。scratch 默认复用 locals/sandbox-scratch。
 #   注：宿主路径以实际部署机为准。
 
+# 本文件是无迁移包时的冷启动模板，使用 ~/app/... 占位与 ${VAR:-default}，
+# 可在没有 docker/.env 的情况下 `docker compose config` 通过。
+# 实际部署的 docker-compose.yml 改用两个必填变量：
+#   N_AGENT_INSTALL_ROOT -- 数据根（logs/locals/workspace/browser-profiles/secrets）
+#   N_AGENT_CODE_ROOT    -- 宿主代码根（ACP 挂载到 /workspace-code）
+# 迁移安装请用 docker/install.sh，compose 由迁移包携带。
+
 services:
   n-agent:
     build:

@@ -532,6 +532,41 @@ def _build_config_parser(subparsers) -> None:
     parser = subparsers.add_parser("config", help="Show runtime config (redacted)")
     parser.add_argument("--section", default=None)
     _add_format_flags(parser)
+    # required=False keeps the bare `n-agent config` behaviour (--section +
+    # redacted display) exactly as it was before export/import existed.
+    sub = parser.add_subparsers(dest="config_command", required=False)
+
+    export_p = sub.add_parser("export", help="Export the configuration bundle")
+    destination = export_p.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--stdout", action="store_true", help="Write the bundle to stdout")
+    destination.add_argument("--out", default=None, help="Write the bundle to this new 0600 file")
+    export_p.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        help="Strip every secret from the bundle (importer reports them as degraded)",
+    )
+    _add_format_flags(export_p)
+
+    import_p = sub.add_parser("import", help="Apply a configuration bundle to this machine")
+    source = import_p.add_mutually_exclusive_group(required=True)
+    source.add_argument("--stdin", action="store_true", help="Read the bundle from stdin")
+    source.add_argument("--file", default=None, help="Read the bundle from this file")
+    import_p.add_argument("--mode", choices=["merge", "overwrite"], default="merge")
+    import_p.add_argument("--with-schedules", action="store_true")
+    import_p.add_argument("--dry-run", action="store_true")
+    import_p.add_argument(
+        "--internal-context",
+        action="store_true",
+        help="Internal: stdin carries a {bundle, pre_existing} envelope (requires --stdin)",
+    )
+    # --format is the spec-facing spelling and --json/--form/--yaml the existing
+    # repo-wide one; they select the same renderer, so conflicting combinations
+    # are rejected at parse time rather than silently resolved.
+    fmt = import_p.add_mutually_exclusive_group()
+    fmt.add_argument("--json", action="store_true", help="Output as JSON (default)")
+    fmt.add_argument("--form", action="store_true", help="Output as human-readable form (table/detail)")
+    fmt.add_argument("--yaml", action="store_true", help="Output as YAML")
+    fmt.add_argument("--format", choices=["json", "table"], default=None)
 
 
 def _build_logs_parser(subparsers) -> None:
@@ -752,11 +787,22 @@ def main(argv: list[str] | None = None) -> int:
     from app.main import collect_plugin_cli_commands
 
     effective_argv = list(sys.argv[1:] if argv is None else argv)
-    # The security-sensitive foreground host command is entirely builtin.
-    # Avoid plugin discovery side effects and output on its startup/check path.
+    # Commands whose startup must stay free of plugin discovery. Discovery
+    # constructs SQLitePluginRegistry(settings.sqlite_path) and runs a scan, so
+    # it CREATES the database file and WRITES plugin rows + scan timestamps
+    # before the command itself ever runs.
+    #   browser-host -- security-sensitive foreground host command, entirely
+    #                   builtin; no discovery side effects or output on its
+    #                   startup/check path.
+    #   config       -- the migration surface (`config export`, `config import
+    #                   --dry-run`) is contractually read-only: a missing
+    #                   database must raise instead of being created, and a dry
+    #                   run must not leave schema or scan flags behind. All
+    #                   config subcommands are builtin, so nothing is lost.
+    _NO_PLUGIN_DISCOVERY = (["browser-host"], ["config"])
     plugin_commands = (
         []
-        if effective_argv[:1] == ["browser-host"]
+        if effective_argv[:1] in _NO_PLUGIN_DISCOVERY
         else collect_plugin_cli_commands()
     )
     parser = build_parser(plugin_commands=plugin_commands)

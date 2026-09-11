@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批、Host Terminal 宿主执行链路、Skill 自进化治理、Artifact 制品工作台和 Delegation 多 Agent 委派（delegation_service/run_service/child_agent_executor/tool_executor/parent_adapter + SQLite 7 表 + API/CLI） -->
+<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批、Host Terminal 宿主执行链路、Skill 自进化治理、Artifact 制品工作台和 Delegation 多 Agent 委派（delegation_service/run_service/child_agent_executor/tool_executor/parent_adapter + SQLite 7 表 + API/CLI）、Config Bundle 配置迁移（config_bundle_service + domain/config_bundle + config_bundle_readers + sqlite_support + docker/ 四个宿主脚本 + CLI config export|import） -->
 # 功能与文件映射
 
 ## 应用入口与配置
@@ -53,6 +53,8 @@
 - 信息流领域模型（修改）：`app/domain/information_flow.py`，ReleaseTarget 枚举新增 `PUBLIC_ARTIFACT`（公开文本发布释放目标）
 - 信息流策略（修改）：`app/domain/information_flow_policy.py`，InformationFlowPolicy 新增 PUBLIC_ARTIFACT 分支（SECRET/SENSITIVE DENY、known-secret text redact 后 ALLOW、无 secret text ALLOW raw，不 fall through 到 generic default-allow）
 
+- 配置迁移模型：`app/domain/config_bundle.py`，定义 ConfigBundle/BundleManifest/ImportMode/ImportOutcome/ImportItemReport/ImportReport 值对象、SECTION_NAMES（10 段，顺序即导入顺序）、BUNDLE_SCHEMA_VERSION 与 ConfigBundleValidationError；ImportReport.exit_code 是退出码唯一推导点
+
 ## Application Layer
 
 - Host Terminal 能力与工具执行器：`app/application/host_terminal_capability.py`、`app/application/host_terminal_tool_executor.py`，负责 Policy 刷新、容器/宿主路径映射、双重校验前置与 `host_terminal` ToolResult 映射；定义 `ImagePersister` Protocol，photo 能力成功后调用其 `persist(signed_url)` 把临时 OSS 签名 URL 替换为永久 serve URL（失败回退原 URL，详见 Infrastructure `LocalImageStore`）
@@ -106,6 +108,8 @@
 - Artifact 用例：`app/application/artifact_service.py`，定义 `ArtifactService` + `ArtifactServiceConfig`（immutable snapshot，含 size limits + published_base_url），编排 Artifact CRUD/内容读取/export（markdown->HTML 安全转换 via injected converter callable）/publish 生命周期/backfill；sealed by ArtifactPolicy（edit/publish/delete 准入）+ InformationFlowService（text 发布 PUBLIC_ARTIFACT 释放封口，session_id 取 source_session_id 而非 source_context_ref）；publish 幂等（ArtifactPolicy reuse=True 时返回已有 publish_id），update_revision（内容 PATCH 走此路径）产生新 Revision 不撤销 active publish（publish_sync_state=outdated、旧公链仍 200），重新发布 publish_revision 才原子切换（CAS revision_id+expected_current_revision_id，单事务 revoke old+insert new）；metadata-only update_artifact 不撤销 publish（不触内容 CAS）；replacement publish 单事务 revoke old + insert new；diff_revisions（文本 unified diff/二进制摘要/混合 422/超限 413）、rollback（以 current 为 parent、目标为 rollback_from 创建新当前 Revision，CAS expected_revision_id）；无 Revision 的 legacy Artifact 写入返回 artifact_migration_incomplete/503（只读仍可用）；Office 导出经注入 exporter（ArtifactExporterPort，artifacts_enabled 时为 OfficeArtifactExporter）；write-through 注册入口 register_from_attachment/register_from_task_artifact（幂等，best-effort，经注入的 task_session_resolver 解析 task_execution_session_id 写入 source_session_id）；register_from_task_artifact 双内容路径：`workspace:` ref -> content_store.read 存 content_ref；否则 text kind 用 `TaskArtifact.content`（优先）或 `summary`（回落）创建 inline_content 制品，服务端重算 size/checksum、校验 artifact_inline_max_bytes（worker 无 workspace 写工具，content 字段是 text 产出主路径）；mime 缺失时按文件名扩展名推断 mime/kind（_resolve_mime + _kind_from_mime，.md->MARKDOWN/.txt->TEXT/.html->HTML 等）；backfill_attachments 启动期游标重扫，backfill_session_ids 回填历史任务制品的 source_session_id（resolver 未注入时 no-op），backfill_kinds 回填历史空 mime 制品的 kind/mime（按文件名扩展名重推断，idempotent）；`task_exists` 回调注入（`set_task_exists_callback`，task_id -> bool，plain bool 可区分 task 已删除，弥补 task_session_resolver 都回落 fallback 无法区分删除的缺陷）；`task_attachment_delete` 回调注入（`set_task_attachment_delete_callback`，attachment_id -> bool，late-bind 到 task_service.delete_attachment）；`delete_artifact` 删除 source_kind=task_attachment 制品时经该回调先于 metadata 删除源 TaskAttachment（source of truth 先删防启动期 backfill 复活，回调失败传播异常不删 metadata，返回 False 即附件已删则继续清理 stale 投影；仅 task_attachment 触发，manual/session/task_artifact 不触发；callback 未注入 no-op；owned content 仍 best-effort delete_owned，attachment: 源文件生命周期归 TaskService.delete_attachment 不归 ArtifactService；删源 metadata 前先 purge 全部 publish 记录+快照文件--`list_published` 收集 + `delete_published_by_artifact` 删行 + 逐条 `delete_publish_snapshot` 删 `published/{publish_id}/` 目录（公链 404、无 publish 则 no-op；行删除传播异常不删 metadata，快照文件删除 best-effort；须在 metadata 删除前 purge，否则 FK ON DELETE SET NULL 后 artifact_id 置 NULL 无法按 artifact_id 定位 publish 行）；`delete_artifacts_by_source_task(task_id)` 按 source_context_ref=task_id 分页收集并逐条 delete_artifact 清理（best-effort，每条 delete_artifact purge 该制品全部 publish 行+快照文件 公链 404；task 删除级联已先 CASCADE 附件行，故逐条 delete_artifact 的 task_attachment 回调返回 False 不报错）；`backfill_orphaned_task_artifacts` 启动期对 task_attachment/task_artifact 制品用 task_exists 判活删孤儿（fail-skip：task_exists 异常 failed++ 不删，callback 未注入 no-op，返回 {processed,deleted,skipped,failed}）
 - Task 用例（修改）：`app/application/task_service.py`，新增可选 `artifact_register_callback` 注入，附件上传成功后 best-effort 回调 ArtifactService.register_from_attachment（幂等注册，失败不回滚主流程）；新增可选 `artifact_delete_callback`（task_id -> Awaitable[None]）注入，`delete_task` 删除任务行/附件文件/执行会话后 best-effort 回调 ArtifactService.delete_artifacts_by_source_task（清理独立 artifacts DB 中 source_context_ref=task_id 的制品，反向级联 write-through 注册，失败 try/except+warning 不阻断任务删除）；callback 为 None（artifacts 禁用）时跳过
 - Task Run 用例（修改）：`app/application/task_run_service.py`，新增可选 `artifact_register_callback` + `artifact_normalizer` 注入，TaskArtifact 产出时 dict->TaskArtifact 归一化（`type`/`name` 必填，`storage_ref` 或 `content` 至少一项即通过；`content` 字段透传 inline 文本）+ 按 ordinal 顺序回调 ArtifactService.register_from_task_artifact（幂等注册，best-effort）；`_finish` Layer-2 fallback：无制品注册 + summary 超过 `_TASK_SUMMARY_CHAT_MAX_BYTES`(65536，对齐 chat 截断阈值) + target_status=SUCCEEDED 时，自动将完整 summary 转为 inline markdown 制品（ordinal=-1，content=summary），保证无法以 Chat 消息完整呈现的产出不丢失，best-effort 不影响 Task finish
+
+- 配置迁移用例：`app/application/config_bundle_service.py`，export 按段白名单读取并剔除运行时字段，import 按固定段序执行；`_validate_bundle` 在任何写入前校验并继续抛异常（此时退 2 准确），其后每段经 `_apply_section` 收敛段级失败为 FAILED item（避免已提交后误报退 2）
 
 ## Infrastructure Layer
 
@@ -170,6 +174,9 @@
 - Artifact 内容画像：`app/application/artifact_content_profile.py`，纯 Application 模块，探测内容画像供 diff/export 决策（不导入格式库，不属 Domain/Infrastructure）
 - Artifact SQLite Registry：`app/infrastructure/registry/sqlite_artifact_registry.py`，`SQLiteArtifactRegistry` 实现 Domain `ArtifactRegistry` 端口，3 表（artifacts + artifact_revisions + published_artifacts，独立 _connect + WAL + asyncio.to_thread）；artifacts 含 current_revision_id 列、published_artifacts 含 published_revision_id 列（幂等迁移补列）；artifact_revisions 不可变版本链（per-artifact revision_number、parent/rollback_from、checksum 以实读 bytes 重算）；unique (source_kind, source_ref) 防重复注册；artifacts 表含 source_session_id 列 + idx_artifacts_source_session_id 索引（幂等迁移 `_migrate_add_source_session_id`：PRAGMA table_info 检查 + ALTER TABLE ADD COLUMN + CREATE INDEX，既有库安全升级）；list_artifacts 支持 source_session_id 过滤；`list_task_artifacts_missing_session` 返回 source_session_id IS NULL 的任务制品供会话回填；Revision 创建 + current 指针移动在单 `BEGIN IMMEDIATE` 事务内 CAS re-verify expected_revision_id（并发同 expected 只一成功，无孤儿 item 文件），`register_revision_publish` 单事务 BEGIN IMMEDIATE（CAS re-verify current_revision_id + 同 checksum reuse / 否则 revoke old + insert new + sync ArtifactStatus=PUBLISHED + rollback on exception，并发 unique-violation reread）、`register_published`（legacy，revoke old active + insert new）、`delete_published_by_artifact`（DELETE FROM published_artifacts WHERE artifact_id，返回 rowcount，源删除时 purge 全部 publish 行，先于 artifacts 行删除故 FK ON DELETE SET NULL 通常不触发）；`list_attachment_sources` 读 task_attachments 表（不修改该表）供 backfill 游标分页；datetime<->ISO-8601 边界转换
 
+- 配置迁移只读读取：`app/infrastructure/registry/config_bundle_readers.py`，为各 registry 提供导出侧只读读取适配
+- 只读 SQLite 支持：`app/infrastructure/sqlite_support.py`，`open_sqlite(path, read_only=True)` 以 URI `mode=ro` 打开，保证导出与 dry-run 在构造上不可写
+
 ## Utils Layer
 
 - 记忆上下文 scrubber：`app/utils/memory_scrubber.py`，提供 `scrub_memory_context`（一次性正则，剥离完整 `<memory-context>...</memory-context>` 块）和 `StreamingContextScrubber`（有状态机，跨 chunk 维护 in_span/buf，处理流式分块边界的标签截断，未闭合 span 在 `flush()` 丢弃）；`call_llm` 用前者在 finalize 前清理 `final_message`，`stream_events` 用后者对 SSE chunk 逐块 scrub
@@ -228,10 +235,15 @@
 - Compose 部署：`docker/docker-compose.yml`，定义 `n-agent` service、可选根目录 `.env`、端口 `8201:8201`、locals/workspace volume
 - Docker 构建忽略：`docker/Dockerfile.dockerignore`，排除 `.claude`、`.harness`、`.git`、缓存、venv、locals、workspace
 - 本地重建脚本：`docker/restart.sh`，在 docker 目录执行 Docker Compose 重建并后台启动服务
+- 配置迁移导出：`docker/config-export.sh`，把 env/compose/policy/两个 token/oss.env/workspace skills+plugins 内层归档/DB 段 10 个白名单段落打成单个 0600 tar.gz，默认落 `locals/install/`（git-ignored），`--out` 指向仓库内未被忽略目录时退 5；`--no-secrets` 整文件跳过 oss.env 与 token 并按 marker 清空 env 凭据值
+- 配置迁移导入：`docker/config-import.sh`，预检（不解包不落临时文件）-> 宿主文件落地（备份/只读挂载源先建为文件）-> 容器内 `n-agent config import` 写 DB -> 按 `action` 决定是否重启；退出码 0/1/2/3/4，从不执行包内自带的 install.sh
+- 新机单文件入口：`docker/install.sh`，自动定位 checkout（`--repo` 优先于 `N_AGENT_REPO`），定位成功后才探测 docker daemon，参数与被调方退出码原样透传
+- 宿主侧 helper：`docker/config_bundle_files.py`，dotenv 解析/序列化、秘密键剥离、内外双层归档预检、manifest 与成员集合双向核对、宿主报告渲染；纯宿主脚本，不 import 任何 `app.*`
 - 本地产物：`locals/`、`.pytest_cache/`、`__pycache__/`、`*.pyc`、`*.egg-info/` 是运行、测试或构建缓存产物，不作为功能文件映射对象
 
 ## 测试
 
+- 配置迁移测试：`tests/domain/test_config_bundle.py`、`tests/application/test_config_bundle_service.py`、`tests/infrastructure/test_config_bundle_readers.py`、`tests/test_config_bundle_wiring.py`、`tests/test_config_bundle_scripts.py`（宿主脚本与 helper 的 208 例）、`tests/e2e/config-bundle.sh`（Docker 内 export -> dry-run -> import -> 幂等重跑 -> degraded 重跑 -> overwrite 秘密语义 -> 双入口宿主链路）
 - Host Terminal 测试：`tests/domain/test_host_terminal*.py`、`tests/application/test_host_terminal*.py`、`tests/infrastructure/test_host_terminal*.py`、`tests/test_main_host_terminal_wiring.py`、`tests/test_host_terminal_compose.py`；`tests/fixtures/photo-and-upload/photo-upload.py` 仅作为自动化测试 Skill 脚本夹具
 
 - 配置测试：`tests/test_config.py`

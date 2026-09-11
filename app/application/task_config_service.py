@@ -168,6 +168,83 @@ class TaskConfigService(TaskConfigProvider):
             updated_by=saved.updated_by,
         )
 
+    async def replace_overrides(
+        self,
+        overrides: dict[str, Any],
+        expected_version: int,
+        updated_by: str,
+        *,
+        dry_run: bool = False,
+    ) -> ResolvedTaskConfig:
+        """Replace the whole override set (config migration entry point).
+
+        update() is a non-empty patch merge: it cannot express "no overrides at
+        all" and it cannot drop an override the target happens to carry. A
+        config bundle owns the complete override set, so import needs a
+        replace: an empty object is legal and means "no field is overridden".
+
+        The candidate is always validated against THIS machine's env base via
+        validate_task_config -- the caller never assembles a TaskConfig itself.
+        dry_run validates and returns the projection without touching the store.
+        """
+        if not isinstance(overrides, dict):
+            raise TaskConfigValidationError("overrides must be an object")
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 0:
+            raise TaskConfigValidationError("expected_version must be a non-negative int")
+        if not isinstance(updated_by, str) or not updated_by:
+            raise TaskConfigValidationError("updated_by must be a non-empty string")
+        parsed: dict[str, int] = {}
+        for k, v in overrides.items():
+            if k not in TASK_CONFIG_FIELDS:
+                raise TaskConfigValidationError(f"unknown field: {k}")
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise TaskConfigValidationError(f"field {k} must be int")
+            parsed[k] = v
+        replacement = TaskConfigOverrides(**parsed)
+
+        candidate = merge_overrides(self._env_config, replacement)
+        validate_task_config(candidate, self._dispatch_interval)
+        if dry_run:
+            return ResolvedTaskConfig(
+                config=candidate,
+                version=expected_version,
+                overridden_fields=replacement.overridden_fields(),
+            )
+
+        stored = await self._store.get()
+        old_version = stored.version if stored is not None else 0
+        existing = stored.overrides if stored is not None else TaskConfigOverrides()
+        saved = await self._store.save(replacement, expected_version, updated_by)
+        self._last_known_good = candidate
+
+        changed: dict[str, tuple[int, int]] = {}
+        for f in TASK_CONFIG_FIELDS:
+            before_override = getattr(existing, f)
+            before = getattr(self._env_config, f) if before_override is None else before_override
+            after = getattr(candidate, f)
+            if before != after:
+                changed[f] = (before, after)
+        if self._audit_sink is not None:
+            event = TaskConfigAuditEvent(
+                actor=updated_by,
+                updated_at=saved.updated_at,
+                old_version=old_version,
+                new_version=saved.version,
+                changed_fields=changed,
+            )
+            try:
+                await self._audit_sink.record(event)
+            except Exception:
+                logger.warning("task config audit sink failed; config already committed")
+
+        return ResolvedTaskConfig(
+            config=candidate,
+            version=saved.version,
+            overridden_fields=replacement.overridden_fields(),
+            updated_at=saved.updated_at,
+            updated_by=saved.updated_by,
+        )
+
 
 def _env_config(settings: Settings) -> TaskConfig:
     """Build the env-base TaskConfig from Settings (the default layer)."""

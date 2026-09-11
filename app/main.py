@@ -49,6 +49,7 @@ from app.application.policy_audit_service import PolicyAuditService
 from app.application.policy_dashboard_service import PolicyDashboardService
 from app.application.task_security_dashboard_service import TaskSecurityDashboardService
 from app.application.task_config_service import TaskConfigService
+from app.application.config_bundle_service import ConfigBundleService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
 from app.application.schedule_run_service import ScheduleRunService
@@ -112,6 +113,7 @@ from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.context.context_compressor import ContextCompressor
 from app.infrastructure.mcp.sdk_client import McpClientLimits, McpSdkClient
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+from app.infrastructure.registry.config_bundle_readers import build_config_bundle_registries
 from app.infrastructure.registry.in_memory_platform_registry import InMemoryPlatformRegistry
 from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
 from app.infrastructure.registry.sqlite_knowledge_registry import SQLiteKnowledgeBaseRegistry
@@ -441,6 +443,9 @@ class ApplicationServices:
     delegation_run_service: "DelegationRunService | None" = None
     delegation_tool_executor: "DelegateAgentsToolExecutor | None" = None
     child_agent_executor: "ChildAgentExecutor | None" = None
+    # 配置迁移包服务. 默认值形式追加在类尾: 自 usage_service 起本 dataclass 全是
+    # 带默认值字段, 无默认值字段追加会触发 TypeError.
+    config_bundle_service: ConfigBundleService | None = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -1128,6 +1133,21 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     task_config_store = SqliteTaskConfigStore(str(settings.sqlite_path))
     task_config_service = TaskConfigService(
         settings, task_config_store, TaskConfigLoggingSink(),
+    )
+    # 配置迁移包服务. 构造点必须在 task_config_service 之后: 它是十一个协作者中
+    # 最晚构造的一个. 全部经 __init__ 注入 Domain 端口 / 同层 Service.
+    config_bundle_service = ConfigBundleService(
+        provider_registry=registry,
+        knowledge_registry=knowledge_registry,
+        mcp_registry=mcp_registry,
+        external_memory_provider_registry=external_provider_registry,
+        external_memory_config=external_memory_config,
+        plugin_registry=plugin_registry,
+        skill_registry=skill_registry,
+        schedule_service=schedule_service,
+        gateway_registry=gateway_registry,
+        task_config_store=task_config_store,
+        task_config_service=task_config_service,
     )
     # Artifact subsystem wiring (T14). Gated on artifacts_enabled: when False,
     # the entire subsystem is skipped (no service, no callbacks, no backfill,
@@ -1924,6 +1944,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         policy_dashboard_service=PolicyDashboardService(SettingsPolicyProfileProvider(settings)),
         task_security_dashboard_service=TaskSecurityDashboardService(settings, task_config_service),
         task_config_service=task_config_service,
+        config_bundle_service=config_bundle_service,
         tool_approval_service=tool_approval_service,
         image_store=image_store,
         usage_service=usage_service,
@@ -1943,6 +1964,53 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         delegation_run_service=delegation_run_service,
         delegation_tool_executor=delegation_tool_executor,
         child_agent_executor=child_agent_executor,
+    )
+
+
+def build_config_bundle_services(
+    settings: Settings | None = None, *, read_only: bool
+) -> ConfigBundleService:
+    """Assemble ConfigBundleService alone, without the application bootstrap.
+
+    ``build_application_services`` creates schemas, seeds the default provider /
+    knowledge base / skills / plugins and runs the plugin scan. The migration
+    surface must not do any of that: ``config export`` and ``config import
+    --dry-run`` are read-only previews, and a real import writes into a schema
+    that the running service already owns.
+
+    read_only=True opens every table with the SQLite URI ``mode=ro``: a missing
+    database raises instead of being created, no directory or DDL is produced,
+    and any write attempt raises. read_only=False reuses the existing schema
+    through the normal adapters, still without a single seeder or scanner.
+    """
+    settings = settings or Settings()
+    registries = build_config_bundle_registries(settings.sqlite_path, read_only=read_only)
+    # SessionService is only reachable from ScheduleService.import_create, which
+    # a read-only assembly never calls; it is wired the same way in both modes so
+    # the two paths stay one code path.
+    session_service = SessionService(registries.memory_store)
+    schedule_service = ScheduleService(
+        registries.schedule_registry,
+        registries.schedule_calculator,
+        DeterministicPromptSafetyScanner(),
+        session_service,
+        None,
+    )
+    task_config_service = TaskConfigService(
+        settings, registries.task_config_store, TaskConfigLoggingSink(),
+    )
+    return ConfigBundleService(
+        provider_registry=registries.provider_registry,
+        knowledge_registry=registries.knowledge_registry,
+        mcp_registry=registries.mcp_registry,
+        external_memory_provider_registry=registries.external_memory_provider_registry,
+        external_memory_config=registries.external_memory_config,
+        plugin_registry=registries.plugin_registry,
+        skill_registry=registries.skill_registry,
+        schedule_service=schedule_service,
+        gateway_registry=registries.gateway_registry,
+        task_config_store=registries.task_config_store,
+        task_config_service=task_config_service,
     )
 
 
@@ -2038,6 +2106,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         feishu_task: asyncio.Task | None = None
         scheduler_task: asyncio.Task | None = None
         delegation_task: asyncio.Task | None = None
+        # Migration maintenance window: the config bundle importer rewrites the
+        # config tables underneath a running service, so every consumer that
+        # could act on half-imported state stays parked until it is over.
+        _maintenance = services.settings.migration_maintenance
+        if _maintenance:
+            logger.warning(
+                "migration maintenance mode: scheduler, task dispatcher and "
+                "external inbound consumers stay stopped for this boot"
+            )
         try:
             report = await services.skill_service.scan_now()
             logger.info(
@@ -2052,13 +2129,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.info("plugin lifespan scan ok")
         except Exception:
             logger.exception("plugin lifespan scan failed; dashboard refresh available as fallback")
-        if services.settings.scheduler_enabled:
+        if services.settings.scheduler_enabled and not _maintenance:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
         # Task dispatcher (T18). Only start when task_enabled AND schema
         # migration succeeded (task_run_service is bound). Migration failure
         # -> health unhealthy and dispatcher not started (spec).
         if (
             services.settings.task_enabled
+            and not _maintenance
             and services.task_run_service is not None
             and services.task_runner is not None
         ):
@@ -2066,7 +2144,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await services.task_runner.start()
             except Exception:
                 logger.exception("TaskRunner start failed")
-        if services.feishu_im_adapter is not None:
+        if services.feishu_im_adapter is not None and not _maintenance:
             feishu_task = asyncio.create_task(services.feishu_im_adapter.start())
         if services.sandbox_manager is not None:
             try:

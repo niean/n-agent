@@ -49,10 +49,10 @@ N_AGENT_WORKSPACE_ROOT=/workspace
 N_AGENT_AGENT_ITERATION_LIMIT=5
 ```
 
-`docker/docker-compose.yml` 当前挂载：
+`docker/docker-compose.yml` 当前挂载（宿主路径由 `N_AGENT_INSTALL_ROOT` / `N_AGENT_CODE_ROOT` 驱动，未设置时 compose 直接报错）：
 
-- 宿主机 `/Users/niean/install/n-agent/locals` -> 容器 `/app/locals`
-- 宿主机 `/Users/niean/install/n-agent/workspace` -> 容器 `/workspace`
+- 宿主机 `${N_AGENT_INSTALL_ROOT}/locals` -> 容器 `/app/locals`
+- 宿主机 `${N_AGENT_INSTALL_ROOT}/workspace` -> 容器 `/workspace`
 
 因此 SQLite 文件持久化在宿主机 `locals/sessions.db`，文件工具只能访问宿主机 workspace 对应目录。
 

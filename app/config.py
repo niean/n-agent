@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     mcp_max_result_bytes: int = Field(default=262144, ge=1024)
     mcp_allow_private_hosts: bool = Field(default=False)
     gateway_enabled: bool = Field(default=True)
+    # Migration maintenance window (config bundle import). Set by
+    # docker/config-import.sh for the duration of an import and removed again
+    # afterwards, so the user's own scheduler_enabled / feishu_enabled values
+    # never have to be rewritten and restored.
+    migration_maintenance: bool = Field(default=False)
     scheduler_enabled: bool = Field(default=True)
     scheduler_tick_seconds: float = Field(default=30, gt=0)
     scheduler_max_due_per_tick: int = Field(default=5, ge=1, le=100)

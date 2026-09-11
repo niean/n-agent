@@ -11,6 +11,7 @@ from app.domain.external_memory_provider import (
     ExternalMemoryProviderSecret, ExternalMemoryProviderType,
     ExternalMemoryProbeStatus, ExternalMemoryProviderValidationError,
 )
+from app.infrastructure.sqlite_support import open_sqlite
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS external_memory_providers (
@@ -30,8 +31,9 @@ CREATE TABLE IF NOT EXISTS external_memory_providers (
 """
 
 class SQLiteExternalMemoryProviderRegistry(ExternalMemoryProviderRegistry):
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self._db_path = Path(db_path)
+        self._read_only = read_only
 
     def create_tables(self) -> None:
         with self._connect() as conn:
@@ -39,7 +41,7 @@ class SQLiteExternalMemoryProviderRegistry(ExternalMemoryProviderRegistry):
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
+        conn = open_sqlite(self._db_path, read_only=self._read_only)
         conn.row_factory = sqlite3.Row
         return conn
 

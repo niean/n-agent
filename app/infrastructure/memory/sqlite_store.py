@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.infrastructure.sqlite_support import open_sqlite
 from app.domain.context import CONTEXT_SUMMARY_PREFIX
 from app.domain.session import ConversationMessage, ConversationSession, SessionSource, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
@@ -17,11 +18,15 @@ logger = logging.getLogger(__name__)
 
 
 class SQLiteMemoryStore:
-    def __init__(self, path: Path, *, migration_protect_first_n: int = 3, migration_protect_last_n: int = 10):
+    def __init__(self, path: Path, *, migration_protect_first_n: int = 3, migration_protect_last_n: int = 10,
+                 initialize: bool = True, read_only: bool = False):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = read_only
         self._migration_protect_first_n = migration_protect_first_n
         self._migration_protect_last_n = migration_protect_last_n
+        if not initialize or read_only:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
     def initialize(self) -> None:
@@ -109,7 +114,7 @@ class SQLiteMemoryStore:
             _initialize_mcp_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = open_sqlite(self.path, read_only=self._read_only)
         conn.row_factory = sqlite3.Row
         return conn
 

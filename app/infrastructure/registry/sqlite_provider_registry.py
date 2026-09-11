@@ -12,11 +12,15 @@ from app.domain.provider import (
     ProviderNotFoundError,
     ProviderRegistry,
 )
+from app.infrastructure.sqlite_support import open_sqlite
 
 
 class SQLiteProviderRegistry(ProviderRegistry):
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, initialize: bool = True, read_only: bool = False):
         self.path = Path(path)
+        self._read_only = read_only
+        if not initialize or read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute(
@@ -57,7 +61,7 @@ class SQLiteProviderRegistry(ProviderRegistry):
                 pass  # 列已存在
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = open_sqlite(self.path, read_only=self._read_only)
         conn.row_factory = sqlite3.Row
         return conn
 

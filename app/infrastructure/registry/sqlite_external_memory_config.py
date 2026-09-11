@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from app.domain.external_memory import ExternalMemoryConfigRegistry
+from app.infrastructure.sqlite_support import open_sqlite
 
 
 CREATE_TABLE_SQL = """
@@ -17,8 +18,9 @@ CREATE TABLE IF NOT EXISTS external_memory_global_config (
 
 
 class SQLiteExternalMemoryConfig(ExternalMemoryConfigRegistry):
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self._db_path = db_path
+        self._read_only = read_only
 
     def create_tables(self) -> None:
         with self._connect() as conn:
@@ -49,6 +51,6 @@ class SQLiteExternalMemoryConfig(ExternalMemoryConfigRegistry):
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
+        conn = open_sqlite(self._db_path, read_only=self._read_only)
         conn.row_factory = sqlite3.Row
         return conn

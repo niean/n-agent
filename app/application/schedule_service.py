@@ -44,6 +44,10 @@ class ScheduledTaskNotRunnableError(ScheduleServiceError):
         self.code = code
 
 
+class ScheduledTaskLeaseHeldError(ScheduleServiceError):
+    """A migration update was refused because the task holds a valid lease."""
+
+
 @dataclass(frozen=True)
 class ScheduledTaskCreateInput:
     name: str
@@ -69,6 +73,15 @@ class ScheduledTaskUpdateInput:
 
 
 RunNowCallable = Callable[[str], Awaitable[Any]]
+
+
+def _normalize_runnability(
+    enabled: bool, status: ScheduledTaskStatus
+) -> tuple[bool, ScheduledTaskStatus]:
+    """A non-runnable source state never auto-revives on the target machine."""
+    if enabled and status is ScheduledTaskStatus.ACTIVE:
+        return True, ScheduledTaskStatus.ACTIVE
+    return False, ScheduledTaskStatus.PAUSED
 
 
 class ScheduleService:
@@ -114,6 +127,117 @@ class ScheduleService:
 
     async def list(self) -> list[ScheduledTask]:
         return await self.registry.list()
+
+    # ------------------------------------------------------------------
+    # config-bundle migration entry points
+    #
+    # create()/update() cannot be reused as-is: create() only carries
+    # allowed_tools (dropping mode / tool_exposure_policy / allow_confirm_tools),
+    # derives the origin delivery context from `origin`, and always lands the
+    # task active -- which would open a runnable window before the caller can
+    # pause it. update() unconditionally recomputes next_run_at even for a
+    # prompt-only edit. Both migration methods below reuse _validate and
+    # _delivery_target so cron / timezone / prompt safety / delivery context
+    # stay validated by exactly one implementation.
+    # ------------------------------------------------------------------
+    async def import_create(
+        self,
+        *,
+        name: str,
+        prompt: str,
+        cron_expression: str,
+        timezone_value: str,
+        delivery_target: str,
+        origin: dict[str, Any],
+        delivery_context: dict[str, Any],
+        execution_policy: ScheduledExecutionPolicy,
+        enabled: bool,
+        status: ScheduledTaskStatus,
+    ) -> ScheduledTask:
+        """Create a migrated task in its FINAL enabled/status in one write."""
+        expression = ScheduleExpression(cron_expression)
+        tz = ScheduleTimezone(timezone_value)
+        self._validate(expression, tz, prompt)
+        target = self._delivery_target(delivery_target, dict(delivery_context))
+        final_enabled, final_status = _normalize_runnability(enabled, status)
+        # Validation first, then a brand-new empty session: no history is copied.
+        session_id = f"schedule-{uuid4()}"
+        await self.session_service.create_session(session_id, source=SessionSource.SCHEDULE.value)
+        now = datetime.now(timezone.utc)
+        task = ScheduledTask(
+            id=f"sched-{uuid4().hex}",
+            name=name.strip() or "Scheduled Task",
+            prompt=prompt,
+            schedule=expression,
+            timezone=tz,
+            session_id=session_id,
+            origin=dict(origin),
+            delivery_target=target,
+            next_run_at=self.calculator.next_after(expression, now, tz),
+            enabled=final_enabled,
+            status=final_status,
+            execution_policy=execution_policy,
+            created_at=now,
+            updated_at=now,
+        )
+        return await self.registry.create(task)
+
+    async def import_update(
+        self,
+        task_id: str,
+        *,
+        name: str,
+        prompt: str,
+        cron_expression: str,
+        timezone_value: str,
+        delivery_target: str,
+        origin: dict[str, Any],
+        delivery_context: dict[str, Any],
+        execution_policy: ScheduledExecutionPolicy,
+        enabled: bool,
+        status: ScheduledTaskStatus,
+    ) -> ScheduledTask:
+        """Overwrite the carried fields of an existing task.
+
+        id, session_id, lease state and run history are the target's and stay
+        untouched. next_run_at is recomputed only when the schedule parameters
+        or the enabled state actually change.
+        """
+        task = await self.get(task_id)
+        now = datetime.now(timezone.utc)
+        if task.lease_until is not None and task.lease_until > now:
+            raise ScheduledTaskLeaseHeldError(task_id)
+        expression = ScheduleExpression(cron_expression)
+        tz = ScheduleTimezone(timezone_value)
+        self._validate(expression, tz, prompt)
+        target = self._delivery_target(delivery_target, dict(delivery_context))
+        final_enabled, final_status = _normalize_runnability(enabled, status)
+        reschedule = (
+            expression.value != task.schedule.value
+            or tz.value != task.timezone.value
+            or final_enabled != task.enabled
+        )
+        updated = ScheduledTask(
+            **{
+                **task.__dict__,
+                "name": name.strip() or task.name,
+                "prompt": prompt,
+                "schedule": expression,
+                "timezone": tz,
+                "origin": dict(origin),
+                "delivery_target": target,
+                "execution_policy": execution_policy,
+                "enabled": final_enabled,
+                "status": final_status,
+                "next_run_at": (
+                    self.calculator.next_after(expression, now, tz)
+                    if reschedule
+                    else task.next_run_at
+                ),
+                "updated_at": now,
+            }
+        )
+        return await self.registry.update(updated)
 
     async def get(self, task_id: str) -> ScheduledTask:
         task = await self.registry.get(task_id)

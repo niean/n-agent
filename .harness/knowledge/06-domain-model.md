@@ -28,6 +28,7 @@ Agent Runtime
 │   ├── Browser：浏览器会话、操作、接管与宿主/容器双后端
 │   ├── Gateway：统一飞书、CLI/TUI、ACP 的交互消息、入口会话、命令与确认，并路由至ChatCompletionService
 │   ├── Platform：飞书等外部消息平台抽象，生命周期管理
+│   ├── Config Bundle：跨机器搬运配置的打包与幂等导入，只含配置不含任何运行时数据
 │   └── Usage/Observation：模型用量、成本、上下文构成与压缩收益观测
 ├── Shared Kernel
 │   └── Policy：通用决策契约

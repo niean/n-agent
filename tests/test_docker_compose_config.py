@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import shutil
 import subprocess
 
@@ -305,3 +306,97 @@ def test_compose_config_subprocess(compose_name):
         check=False,
     )
     assert completed.returncode == 0
+
+
+def test_machine_local_compose_has_no_hardcoded_home_paths():
+    compose_path = DOCKER_DIR / "docker-compose.yml"
+    if not compose_path.exists():
+        pytest.skip("machine-local docker/docker-compose.yml is absent in a clean checkout")
+    serialized = compose_path.read_text(encoding="utf-8")
+    assert "/Users/niean" not in serialized
+    # 必填形式：裸 ${VAR} 在 compose 下只告警并代入空串
+    assert "${N_AGENT_INSTALL_ROOT:?" in serialized
+    assert "${N_AGENT_CODE_ROOT:?" in serialized
+    assert "${N_AGENT_INSTALL_ROOT}" not in serialized
+    assert "${N_AGENT_CODE_ROOT}" not in serialized
+
+
+def test_env_example_declares_deployment_roots():
+    env = _parse_env_assignments((DOCKER_DIR / ".env.example").read_text(encoding="utf-8"))
+    assert "N_AGENT_INSTALL_ROOT" in env
+    assert "N_AGENT_CODE_ROOT" in env
+
+
+def test_example_compose_keeps_minimal_topology_without_required_roots():
+    serialized = (DOCKER_DIR / "docker-compose.yml.example").read_text(encoding="utf-8")
+    # .example 必须能在没有 docker/.env 的干净 checkout 下 `docker compose config` 成功
+    assert ":?" not in serialized
+
+
+@pytest.mark.parametrize(
+    "install_root, code_root, missing",
+    [
+        (None, "/tmp/code", "N_AGENT_INSTALL_ROOT"),
+        ("", "/tmp/code", "N_AGENT_INSTALL_ROOT"),
+        ("/tmp/install", None, "N_AGENT_CODE_ROOT"),
+        ("/tmp/install", "", "N_AGENT_CODE_ROOT"),
+    ],
+)
+def test_machine_local_compose_requires_both_roots(install_root, code_root, missing):
+    """缺失或空值时 `:?` 必须让 compose 直接报错，而不是代入空串产生错误挂载。"""
+    compose_path = DOCKER_DIR / "docker-compose.yml"
+    if not compose_path.exists():
+        pytest.skip("machine-local docker/docker-compose.yml is absent in a clean checkout")
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI unavailable")
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in {"N_AGENT_INSTALL_ROOT", "N_AGENT_CODE_ROOT"}
+    }
+    if install_root is not None:
+        env["N_AGENT_INSTALL_ROOT"] = install_root
+    if code_root is not None:
+        env["N_AGENT_CODE_ROOT"] = code_root
+    completed = subprocess.run(
+        [
+            "docker", "compose",
+            "--env-file", "/dev/null",
+            "-f", str(compose_path),
+            "config", "--quiet",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert completed.returncode != 0
+    assert missing in completed.stderr
+
+
+def test_machine_local_compose_config_succeeds_when_both_roots_are_set():
+    compose_path = DOCKER_DIR / "docker-compose.yml"
+    if not compose_path.exists():
+        pytest.skip("machine-local docker/docker-compose.yml is absent in a clean checkout")
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI unavailable")
+    env = {
+        **os.environ,
+        "N_AGENT_INSTALL_ROOT": "/tmp/install",
+        "N_AGENT_CODE_ROOT": "/tmp/code",
+    }
+    completed = subprocess.run(
+        [
+            "docker", "compose",
+            "--env-file", "/dev/null",
+            "-f", str(compose_path),
+            "config", "--quiet",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert completed.returncode == 0, completed.stderr

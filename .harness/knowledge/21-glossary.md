@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS） -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS）、Config Bundle 配置迁移术语（Config Bundle/manifest/段/秘密四态/redacted/degraded/action 与 outcome 正交/退出码契约/migration_maintenance/N_AGENT_INSTALL_ROOT） -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -196,3 +196,16 @@
 - draftActivatedSkills / sessionActivatedSkills：Activated Skills 的双轨持久化模型，与 `draftDebugSettings` / `sessionDebugSettings` 同构。`draftActivatedSkills` 仅存内存（用户在新会话或空态选择时），`ensureSession` 仅在 `api.createSession` 成功后把 draft 提升到 `sessionActivatedSkills[currentSessionId]` 并落盘；`createSession` 失败时 draft 与 UI 都保留供重试（不静默丢弃选择）。`sessionActivatedSkills` 的会话键在 `handleDelete` 成功时被清除。
 - getActivatedSkills（前端） / _normalize_activated_skills（后端） / build_context_state 实时过滤（context_service）：Activated Skills 的三层过滤入口，合计构成 defense-in-depth。前端 `getActivatedSkills()` 决定"用户能选什么、上报什么"（cap 10、跳过失效名字、不写 localStorage）；`chat_service._normalize_activated_skills` 只做形状归一（去重/strip/裁剪到 10，不做存在性校验）；`context_service.build_context_state` 用 `await skill_service.list_for_llm()` 实时求交，过滤被禁用/删除的名字并降级异常。三层上限必须一致为 10，前端 cap 与后端 cap 错位会引发 UI 数量与模型实际看到数量不一致。
 - _INTERNAL_OPTION_KEYS：模式三十三定义的内部控制键集合，三处必须同步（agent_graph / openai_compatible / anthropic_provider），包含 `activated_skills`、`external_memory_enabled`、`dashboard_approval_event_queue` 等运行态控制信号。新增内部 key 时必须三处一并加，否则定时任务/unattended worker 会以 `unexpected keyword argument` 整体失败。
+
+## Config Bundle 配置迁移术语
+
+- Config Bundle（配置包）：一台机器的 N-Agent 配置打成的单个 tar.gz，含 env/compose/policy/token/oss.env/workspace 内层归档/DB 段与 manifest。只承载配置，不含会话历史、消息、Usage、Task/Delegation 运行态等任何运行时数据。
+- manifest.json：包的自描述清单，含 schema_version、source、时区感知 created_at、redacted 标志与逐成员 sha256。预检双向核对清单与实际成员集合，多出成员与列而未打的成员都直接拒绝。
+- 段（section）：DB 配置的迁移单位，共 10 个（`SECTION_NAMES`），元组顺序即导入顺序。external_memory_global_config 与 task_config 是单例段，无行时导出 null。
+- 秘密四态：字段缺席 = 保持目标现值；`""` = 明确清除；非空 = 覆盖；`null` = 导出时被脱敏、导入侧保留目标现值并记 degraded。四态不可压缩为三态，否则会误清目标机凭据。
+- redacted（脱敏包）：`--no-secrets` 导出的包，manifest 标记 redacted=true。整文件跳过 oss.env 与两个 token，对混合 env 文件按键名 marker 清值，并显式披露 workspace 文件/URL/参数内嵌凭据的残留风险 —— 不等于"包内无凭据"。
+- degraded（降级）：记录被有意识地部分应用或未应用（缺依赖、脱敏、目标槽位被占、插件版本不匹配），与 FAILED 不同，重复导入可重复报告但不得重复写入。
+- action 与 outcome：`action`(created|updated|none) 回答"是否真的改了目标"，`outcome`(OK|SKIPPED|DEGRADED|FAILED) 回答"这条记录的处置结论"，两者正交；只有 action 可以驱动是否重启。
+- 退出码契约：0 全成功 / 1 部分记录失败其余已应用 / 2 包或参数格式错误且目标未被改动 / 3 运行依赖缺失或启动失败 / 4 只读挂载源被目录占据。`docker/install.sh` 对被调方的码原样透传。
+- migration_maintenance（迁移维护窗口）：B 类 env-only 开关，导入期间关停 scheduler 与飞书长连接以消除后台写入，由 config-import.sh 临时写入并在结束后移除，不改写用户自己的 scheduler_enabled / feishu_enabled 取值。
+- N_AGENT_INSTALL_ROOT / N_AGENT_CODE_ROOT：compose 挂载的宿主安装根与 checkout 根，用 `${VAR:?}` 形式声明，未设置时 compose 直接报错而非代入空串产生错误挂载。

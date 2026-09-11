@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact） -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载） -->
 # 数据与类型边界
 
 ## 领域模型
@@ -163,6 +163,8 @@
 
 Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPOSE_PROJECT_NAME`。
 
+- migration_maintenance (bool, 默认 False)：配置迁移维护窗口。B 类（启动期绑定、env-only），唯一消费点在 `app/main.py` 的 lifespan 内，为 True 时跳过 scheduler 与飞书长连接的启动，使导入期间无后台写入。由 `docker/config-import.sh` 在导入期间写入 `docker/.env` 并在结束后移除，因此不必改写并恢复用户自己的 `scheduler_enabled` / `feishu_enabled` 取值。不进 Dashboard 编辑白名单。
+
 ## SQLite schema
 
 SQLite store 位于 `app/infrastructure/memory/sqlite_store.py`，初始化以下表：
@@ -291,23 +293,25 @@ Chat Session 的外部记忆 profile 由 `ChatCompletionService` 在首轮消息
 - SQLite：`/app/locals/sessions.db`
 - workspace：`/workspace`
 
-当前 compose 挂载策略：
+当前 compose 挂载策略（宿主路径由两个必填变量驱动，不再硬编码具体用户目录）：
 
 ```yaml
 volumes:
-  - /Users/niean/install/n-agent/locals:/app/locals
-  - /Users/niean/install/n-agent/workspace:/workspace
+  - ${N_AGENT_INSTALL_ROOT:?N_AGENT_INSTALL_ROOT is required}/locals:/app/locals
+  - ${N_AGENT_INSTALL_ROOT:?N_AGENT_INSTALL_ROOT is required}/workspace:/workspace
 ```
+
+`N_AGENT_INSTALL_ROOT` 指向宿主安装根（locals/workspace/secrets 的父目录），`N_AGENT_CODE_ROOT` 指向 checkout 根。两者均用 `${VAR:?}` 形式：未设置时 `docker compose config` 直接报错，不代入空串产生错误挂载。`docker/.env.example` 只列空占位，实际值写在 `docker/.env`（不入库）。`docker/docker-compose.yml.example` 保持 `${VAR:-default}` 的最小单服务拓扑不变。下文以 `<install_root>` 代指该变量的值。
 
 因此：
 
-- SQLite 数据保存在宿主机 `/Users/niean/install/n-agent/locals/sessions.db`
+- SQLite 数据保存在宿主机 `<install_root>/locals/sessions.db`
 - 废弃沙盒历史保存在同一 SQLite 的 `sandbox_released_history` 表；释放沙盒会删除 scratch 运行目录，但不会删除该历史表记录
 - execute_code 执行历史保存在同一 SQLite 的 `sandbox_execution_history` 表；Dashboard 兼容读取旧 `tool_calls` 记录，但长期保存以沙盒历史表为准，删除 Chat Session 不会清理该表
-- 文件工具只能访问宿主机 `/Users/niean/install/n-agent/workspace` 对应的容器路径 `/workspace`
-- Host Terminal 的 Policy 与 token 从宿主机 `/Users/niean/install/n-agent/locals/host-terminal-policy.yaml`、`host-terminal.token` 以单文件只读方式挂载到容器；容器和宿主 Bridge 各自加载并校验同一份权威内容，不能把整个 `locals` 目录作为可写授权面
-- 用户 Skill 在容器内使用 `/workspace/skills`，宿主 Bridge 使用对应的 `/Users/niean/install/n-agent/workspace/skills`；Policy 以 Skill 名、相对脚本路径和 SHA-256 绑定允许执行的字节
-- OSS 密钥只保存在宿主机 `/Users/niean/install/n-agent/secrets/oss.env`，默认不由 Docker Compose 自动加载，也不挂载或注入 N-Agent 容器；仅宿主 Bridge 启动被允许的上传脚本时按需读取
+- 文件工具只能访问宿主机 `<install_root>/workspace` 对应的容器路径 `/workspace`
+- Host Terminal 的 Policy 与 token 从宿主机 `<install_root>/locals/host-terminal-policy.yaml`、`host-terminal.token` 以单文件只读方式挂载到容器；容器和宿主 Bridge 各自加载并校验同一份权威内容，不能把整个 `locals` 目录作为可写授权面
+- 用户 Skill 在容器内使用 `/workspace/skills`，宿主 Bridge 使用对应的 `<install_root>/workspace/skills`；Policy 以 Skill 名、相对脚本路径和 SHA-256 绑定允许执行的字节
+- OSS 密钥只保存在宿主机 `<install_root>/secrets/oss.env`，默认不由 Docker Compose 自动加载，也不挂载或注入 N-Agent 容器；仅宿主 Bridge 启动被允许的上传脚本时按需读取
 - Host Terminal Bridge 只监听 `127.0.0.1`；容器客户端通过固定的 `host.docker.internal` 地址访问，不接受 Policy 中的任意远端 URL
 - KB 后端是外部独立服务，Dashboard 中每条 knowledge_bases 记录的 base_url 必须从 N-Agent 运行环境可达；容器内不能使用指向 N-Agent 容器自身的 localhost，应使用 Compose service name、共享 network 或宿主机网关地址
 - N-Agent compose 访问 N-KB 时应把 n-agent 容器加入 N-KB 所在 Docker 网络（`n-kb_default`，external），并以 KB base_url `http://n-kb:8212` 通过 service name 直连。否则 hostname 会被 Docker Desktop 内部 DNS 解析到不可达代理地址，TCP 表面 connect 成功但 HTTP 响应被丢弃，httpx 抛 RemoteProtocolError
@@ -370,3 +374,21 @@ Delegation 子系统复用 sessions.db（统一 schema 版本序列，不独立�
 配置（Settings，`delegation_` 前缀，C 类热重载，默认全关）：delegation_enabled、delegation_realtime_enabled、delegation_task_enabled、delegation_max_children（默认 8）、delegation_max_concurrency（默认 8）、delegation_max_concurrency_per_parent（默认 3）、delegation_max_runtime_seconds（默认 1800）、delegation_member_max_runtime_seconds（默认 900）、delegation_max_total_tokens、delegation_max_tokens_per_child、delegation_result_max_bytes、delegation_structured_result_max_bytes、delegation_event_payload_max_bytes、delegation_member_max_retries（默认 1）。kill switch 关闭只收紧（拒绝新建 + 取消未终结），热重载不扩大既有权限/预算/deadline；main.py `delegation_enabled` gating（false 全部子组件为 None、true 初始化异常 fail-fast）。
 
 会话边界：child execution session 为 `delegation-` 前缀（UUIDv5 派生自 delegation/member ID），对应 SessionSource.DELEGATION 内部触发枚举（同 CURATOR/TASK，不进 im_platforms）；child prompt/逐轮消息不进用户会话或通用 message store。
+
+## Config Bundle 配置迁移数据边界
+
+配置迁移把一台机器的 N-Agent 配置打成单个 tar.gz，在另一台机器上幂等导入。它不迁移会话历史、消息、Usage、Task/Delegation 运行态等任何运行时数据。
+
+包结构与 manifest：外层 tar.gz 含 `manifest.json` + `env/`（docker.env、install-root.env、docker-compose.yml）+ `locals/`（host-terminal-policy.yaml、两个 token）+ `secrets/oss.env` + `workspace/`（skills.tar.gz、plugins.tar.gz 两个内层归档）+ `db/config.json` + `install.sh`。`manifest.json` 携带 `schema_version`（当前 `BUNDLE_SCHEMA_VERSION = 1`，定义在 `app/domain/config_bundle.py`）、`source`、时区感知的 `created_at`、`redacted` 标志，以及 `files` 逐成员 sha256。预检双向核对 `files` 与实际成员集合：多出成员和列而未打的成员都直接拒绝。
+
+DB 段 10 个段落（`SECTION_NAMES`，顺序即导入顺序）：providers、knowledge_bases、mcp_sites、external_memory_providers、external_memory_global_config、plugins、skills、scheduled_tasks、gateway_home_targets、task_config。其中 external_memory_global_config 与 task_config 是单例段（无行时导出 `null`）。skills/plugins 段只迁移启停标志与 config，不迁移文件内容（文件走 workspace 内层归档）。明确排除、不进包：sessions、messages、summaries、tool_calls、tasks 及 task_*、delegations 及 delegation_*、artifacts 及 published_artifacts、usage、sandbox_execution_history、sandbox_released_history、skill_pending/backup、curator_state。
+
+秘密四态语义（导入侧按字段是否出现与取值区分，不能合并为三态）：字段缺席 = 保持目标现值不变；`""` = 明确清除；非空 = 覆盖；`null` = 导出时被 `--no-secrets` 脱敏，导入侧保留目标现值并记 degraded，不当作清除。承载秘密的字段包括 providers.api_key、providers.extra_headers、knowledge_bases.api_key、mcp_sites 的 header/env、plugin_secrets.secret_value、plugins.config 与 extra_config 内的嵌套秘密。
+
+脱敏边界：默认导出为明文包，落地权限 0600 且输出目录必须 git-ignored 或在仓库外，导出时打印明文告警。`--no-secrets` 整文件跳过 `secrets/oss.env` 与两个 token，并对 docker.env / install-root.env 按键名 marker（`_API_KEY`/`_SECRET`/`_TOKEN`/`PASSWORD`/`ACCESS_KEY`/`PRIVATE_KEY`，`_PATH` 结尾除外，因其为容器路径）清空取值，同时对 DB 段结构化脱敏；它不宣称包内无凭据，残留风险（workspace 文件、URL、命令参数内嵌凭据）在报告中显式披露。除 `--stdout` / `--out` 的机器可读载荷外，导出与导入的诊断、日志、差异和报告一律不出现明文秘密，异常只记类型不记 message。
+
+宿主路径与只读挂载源：导入侧按 `--install-root` / `--code-root` 落地，`locals/host-terminal-policy.yaml` 与两个 token 是单文件只读挂载源，必须在任何 compose 调用之前以文件形式存在；该路径若被目录占据则退 4 且不删除既有目录。包内自带的 `install.sh` 从不被执行（导入报告显式声明已忽略），避免包携带的脚本获得执行权。
+
+退出码契约（`docker/config-import.sh`，前端 `docker/install.sh` 原样透传）：0 全部成功；1 部分记录失败、其余已应用；2 包或参数格式错误、目标未被改动；3 运行依赖缺失或服务启动失败；4 只读挂载源被目录占据。该契约是外部可观测行为，任何在"已提交数据库之后"发生的失败都不得报成 2。
+
+只读保证：`--dry-run` 与导出侧读取 DB 均通过 `app/infrastructure/sqlite_support.open_sqlite(path, read_only=True)`（URI `mode=ro`）打开，构造上不可写，不建 schema、不建目录、不落临时文件；目标库不存在时 DB 差异报 unknown 而非报错。

@@ -16,6 +16,7 @@ from app.domain.plugin import (
     PluginValidationError,
     new_plugin_id,
 )
+from app.infrastructure.sqlite_support import open_sqlite
 
 
 def _initialize_plugin_schema(conn: sqlite3.Connection) -> None:
@@ -56,14 +57,17 @@ def _initialize_plugin_schema(conn: sqlite3.Connection) -> None:
 
 
 class SQLitePluginRegistry(PluginRegistry):
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, initialize: bool = True, read_only: bool = False):
         self.path = Path(path)
+        self._read_only = read_only
+        if not initialize or read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             _initialize_plugin_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = open_sqlite(self.path, read_only=self._read_only)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return conn

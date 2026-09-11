@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.domain.mcp import McpProbeStatus, McpSite, McpSiteNotFoundError, McpSiteRegistry, McpTool, McpTransportType
+from app.infrastructure.sqlite_support import open_sqlite
 
 
 def _initialize_mcp_schema(conn: sqlite3.Connection) -> None:
@@ -51,14 +52,17 @@ def _initialize_mcp_schema(conn: sqlite3.Connection) -> None:
 
 
 class SQLiteMcpSiteRegistry(McpSiteRegistry):
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, initialize: bool = True, read_only: bool = False):
         self.path = path
+        self._read_only = read_only
+        if not initialize or read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             _initialize_mcp_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = open_sqlite(self.path, read_only=self._read_only)
         conn.row_factory = sqlite3.Row
         return conn
 

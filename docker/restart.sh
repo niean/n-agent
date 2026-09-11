@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# This file needs bash (arrays, `set -o pipefail`, BASH_SOURCE). It is also
+# invoked as `sh docker/restart.sh` -- by hand and by docker/config-import.sh --
+# so re-exec under bash before any bash-only syntax is parsed. The guard has to
+# stay POSIX sh and has to come first.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -6,6 +14,20 @@ cd "$SCRIPT_DIR"
 
 HOST_HEALTH_URL="${N_AGENT_HOST_HEALTH_URL:-http://127.0.0.1:8201/health}"
 PUBLIC_HEALTH_URL="${N_AGENT_PUBLIC_HEALTH_URL:-http://nagent.localhost/health}"
+# Migration start mode (set by docker/config-import.sh): the target may be a
+# brand-new machine where the public reverse proxy -- which lives outside this
+# compose file -- does not exist yet. In that mode the container and the host
+# port are still hard gates, but the public URL is only required when the
+# caller explicitly configured one. A plain `sh docker/restart.sh` is
+# unaffected and keeps requiring public health unconditionally.
+MIGRATION_START=0
+case "${N_AGENT_MIGRATION_START:-}" in
+  1|true|yes) MIGRATION_START=1 ;;
+esac
+PUBLIC_HEALTH_REQUIRED=1
+if [ "$MIGRATION_START" -eq 1 ] && [ -z "${N_AGENT_PUBLIC_HEALTH_URL:-}" ]; then
+  PUBLIC_HEALTH_REQUIRED=0
+fi
 COMPOSE_STOP_TIMEOUT="${N_AGENT_COMPOSE_STOP_TIMEOUT:-1}"
 CONTAINER_HEALTH_ATTEMPTS="${N_AGENT_CONTAINER_HEALTH_ATTEMPTS:-10}"
 HOST_HEALTH_ATTEMPTS="${N_AGENT_HOST_HEALTH_ATTEMPTS:-6}"
@@ -80,12 +102,24 @@ echo
 # health
 wait_until "container health" "$CONTAINER_HEALTH_ATTEMPTS" container_health
 recover_stale_port_proxy
-wait_until "public health" "$PUBLIC_HEALTH_ATTEMPTS" host_health "$PUBLIC_HEALTH_URL"
+if [ "$MIGRATION_START" -eq 1 ]; then
+  # recover_stale_port_proxy only reaches the host port on its repair path;
+  # a migration start needs one explicit, always-executed host gate.
+  wait_until "host port health" "$HOST_HEALTH_ATTEMPTS" host_health "$HOST_HEALTH_URL"
+fi
 
-echo "curl -fsS ${PUBLIC_HEALTH_URL}"
-if command -v jq >/dev/null 2>&1; then
-  curl -fsS "${CURL_FINAL_ARGS[@]}" "$PUBLIC_HEALTH_URL" | jq .
+FINAL_HEALTH_URL="$PUBLIC_HEALTH_URL"
+if [ "$PUBLIC_HEALTH_REQUIRED" -eq 1 ]; then
+  wait_until "public health" "$PUBLIC_HEALTH_ATTEMPTS" host_health "$PUBLIC_HEALTH_URL"
 else
-  curl -fsS "${CURL_FINAL_ARGS[@]}" "$PUBLIC_HEALTH_URL"
+  FINAL_HEALTH_URL="$HOST_HEALTH_URL"
+  echo "public health skipped (no N_AGENT_PUBLIC_HEALTH_URL configured for this migration start)"
+fi
+
+echo "curl -fsS ${FINAL_HEALTH_URL}"
+if command -v jq >/dev/null 2>&1; then
+  curl -fsS "${CURL_FINAL_ARGS[@]}" "$FINAL_HEALTH_URL" | jq .
+else
+  curl -fsS "${CURL_FINAL_ARGS[@]}" "$FINAL_HEALTH_URL"
   echo
 fi

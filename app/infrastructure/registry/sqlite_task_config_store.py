@@ -24,6 +24,7 @@ from app.domain.task_config import (
     TaskConfigStore,
     TaskConfigStoreError,
 )
+from app.infrastructure.sqlite_support import open_sqlite
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS task_config (
@@ -47,8 +48,11 @@ def _now_utc_iso() -> str:
 class SqliteTaskConfigStore(TaskConfigStore):
     """SQLite single-row task_config store with CAS."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, *, initialize: bool = True, read_only: bool = False) -> None:
         self.path = Path(db_path)
+        self._read_only = read_only
+        if not initialize or read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # fail-fast on init: a corrupted/readonly schema must not let the
         # service run with a broken store (aligns with core SQLite services).
@@ -56,7 +60,7 @@ class SqliteTaskConfigStore(TaskConfigStore):
             _initialize_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+        return open_sqlite(self.path, read_only=self._read_only)
 
     def _get_sync(self) -> StoredTaskConfig | None:
         with self._connect() as conn:

@@ -23,13 +23,18 @@ from app.domain.schedule import (
     ScheduleExpression,
     ScheduleTimezone,
 )
+from app.infrastructure.sqlite_support import open_sqlite
 
 
 class SQLiteScheduledTaskRegistry:
-    def __init__(self, path: Path, calculator: ScheduleCalculator, missed_grace_seconds: int = 300):
+    def __init__(self, path: Path, calculator: ScheduleCalculator, missed_grace_seconds: int = 300,
+                 *, initialize: bool = True, read_only: bool = False):
         self.path = Path(path)
+        self._read_only = read_only
         self.calculator = calculator
         self.missed_grace_seconds = missed_grace_seconds
+        if not initialize or read_only:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -38,7 +43,7 @@ class SQLiteScheduledTaskRegistry:
             _initialize_schedule_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = open_sqlite(self.path, read_only=self._read_only)
         conn.row_factory = sqlite3.Row
         return conn
 
