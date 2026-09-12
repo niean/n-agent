@@ -56,6 +56,22 @@ N_AGENT_AGENT_ITERATION_LIMIT=5
 
 因此 SQLite 文件持久化在宿主机 `locals/sessions.db`，文件工具只能访问宿主机 workspace 对应目录。
 
+## 宿主相机桥接启动
+
+统一入口为 `sh docker/restart.sh`。Compose 启用 `N_AGENT_HOST_TERMINAL_ENABLED`
+时，先由宿主执行 `host/terminal-host.py start`，再重建容器，最后执行
+`host/terminal-host.py check` 检查容器到桥接的连接。桥接以当前用户的独立后台
+进程运行，仅监听 loopback；不随 `docker compose down` 停止，不是开机自启。
+重复启动复用健康进程，不自动执行拍照上传。
+
+启动器读取 Compose 最终配置中的端口、policy/token 挂载和 skills 目录。
+私有 PID、日志和快照放在实际安装目录的 `host-terminal-runtime/`，不在
+容器可写 workspace 内。默认解释器为安装目录的 `host-terminal-venv/bin/python`，
+可用 `HOST_TERMINAL_PYTHON` 指定。首次部署需创建虚拟环境并使用该环境的
+`python -m pip install -r host/terminal-requirements.txt` 安装依赖。
+缺失依赖或健康检查失败时统一入口报错。独立的 Browser Host 仍使用
+`host/browser-host.sh`；它不参与当前相机拍照链路。
+
 ## 文档与规则
 
 - 操作约束见 `.harness/framework/FRAMEWORK.md`

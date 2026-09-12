@@ -86,6 +86,9 @@ recover_stale_port_proxy() {
 }
 
 # restart (bring up all services incl. browser; n-agent depends_on browser healthy)
+# Host hardware access runs outside Docker. Fail before disrupting healthy
+# containers when the enabled bridge cannot start; repeated starts are idempotent.
+python3 "$SCRIPT_DIR/../host/terminal-host.py" start
 docker compose down --timeout "$COMPOSE_STOP_TIMEOUT"
 # Compose can occasionally leave a stopped service container behind after
 # down. Remove any such containers before up reuses their generated names.
@@ -101,6 +104,7 @@ echo
 
 # health
 wait_until "container health" "$CONTAINER_HEALTH_ATTEMPTS" container_health
+python3 "$SCRIPT_DIR/../host/terminal-host.py" check
 recover_stale_port_proxy
 if [ "$MIGRATION_START" -eq 1 ]; then
   # recover_stale_port_proxy only reaches the host port on its repair path;

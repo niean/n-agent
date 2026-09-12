@@ -14,7 +14,25 @@ ENV TZ=Asia/Shanghai \
     SCREEN_HEIGHT=960 \
     SCREEN_DEPTH=24
 
-RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+# Optional apt proxy. A host-side VPN in TUN mode (Clash and friends) NATs every
+# container connection; this layer opens 200+ short-lived ones and exhausts the
+# TUN connection table after ~60s, after which every remaining fetch fails until
+# the build gives up. Routing apt through the VPN's HTTP proxy port uses a single
+# upstream channel instead and sidesteps it. Empty by default so machines without
+# such a proxy (and CI) build unchanged.
+#   docker compose build --build-arg APT_PROXY=http://host.docker.internal:7897
+ARG APT_PROXY=""
+RUN if [ -n "$APT_PROXY" ]; then \
+        printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' \
+            "$APT_PROXY" "$APT_PROXY" > /etc/apt/apt.conf.d/99-proxy; \
+    fi \
+    && printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        > /etc/apt/apt.conf.d/99-retries
+
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g; s|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         chromium \
@@ -34,7 +52,8 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
 # socat: forward Chromium's 127.0.0.1-bound CDP to 0.0.0.0 for container network
 # (installed in a separate layer so the heavy chromium apt layer stays cached).
 RUN apt-get update && apt-get install -y --no-install-recommends socat \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/apt/apt.conf.d/99-proxy
 
 # Playwright Python SDK (used by n-agent to drive the container Chromium via
 # CDP; also available inside the container for diagnostics).

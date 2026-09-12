@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
 # 项目教训
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
@@ -462,3 +462,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 根因：跨 `app/application/config_bundle_service.py`（段编排）、`app/interfaces/cli/commands/config.py`（兜底 except）、`docker/config-import.sh`（退出码解读）三层。错误码是跨进程的唯一可观测契约，而"抛异常"这个动作在不同时刻有完全不同的含义：校验期抛异常时"目标未被改动"为真，执行期抛异常时它已经为假。代码只区分了异常类型，没有区分异常发生的阶段。
 
 教训：设计退出码/错误码契约时，必须为"已经产生副作用之后的失败"预留一个独立码，并在实现里按阶段划界 —— 校验阶段继续抛（错误码准确），执行阶段每个提交单元用一层包裹把失败收敛为报告项（本任务的 `_apply_section`，段级失败记为 `section="*"` 的 FAILED item，从而落到"部分应用"的退 1）。收敛层只记异常类型不记 message，避免把正在写入的取值带进报告。判断"是否需要后续动作（重启/回滚）"只能依据显式的 `action` 字段，不能依据 outcome。同理 POSIX sh 侧：数据库已提交之后调用的 helper 一旦失败，不得让它的非零码成为脚本退出码，必须兜住并取安全默认值。相关：模式四十、P016。
+
+### P047: 宿主 TUN 连接表耗尽会让 apt 在约 60 秒后整体断流，排障禁止用固定窗口轮询和管道退出码
+
+现象：docker/restart.sh 构建 browser 镜像持续失败。首轮报 `ResourceExhausted: ... cannot allocate memory`；把 Docker Desktop VM 从 4096 MiB 调到 8192 MiB 后同样失败；换 tuna 源后改报 apt `exit code: 100`；再加 `Acquire::Retries "8"` + `Queue-Mode "access"` 串行下载仍失败（292 条 Ign、耗时 633 秒）。
+
+根因：宿主 Clash/mihomo 运行在 TUN 模式，容器出网全部经其 NAT。该 apt 层要拉 239 个包，短连接密集建立，约 60 秒后 TUN 连接表耗尽，到 `198.18.0.59:80` 的通路彻底断死且本次构建内不再恢复。构建日志给出确定性证据：0-60.56 秒内第 1-203 个包全部成功（元数据 5901 kB/s），60.56 秒后静默 30 秒（正好等于 `Acquire::http::Timeout`），第 204 个包起无一例外全部失败，8 次重试也全部失败——是硬断点，不是随机丢包。首轮的 OOM 是同一断流的次生后果：apt 的 http method 在半死不活的流上无界缓冲，anon-rss 涨到 7.2 GiB 触发 `global_oom`（`oom-kill: constraint=CONSTRAINT_NONE, task=apt-get`），所以加 VM 内存从原理上不可能修复。修复方式是让 apt 走 Clash 的 HTTP 代理端口（单条上游通道，不进 TUN 的 NAT 表）：Dockerfile 加 `ARG APT_PROXY` 可选开关，compose 经 `${APT_PROXY:-}` 传入并配 `host.docker.internal:host-gateway`，实测 239 包 / 298 MB / 63 秒、Ign=0 Err=0。
+
+教训：(1) 判断网络类构建失败必须先在日志里定位成功与失败的分界点，看清是随机分布还是某个时刻起的整体断流；本例"前 203 个全成功、第 204 个起全失败"一眼排除了丢包率模型，而我此前基于抽样测出的"约 1% 随机失败"完全误导了方向，抽样测试（20 次串行 curl 全通）无法复现只在持续负载下触发的连接表耗尽。(2) 增大重试次数和串行化下载只能对抗独立随机失败，对通路断死无效；这类护栏加上去仍失败时应立即改变假设，而不是继续加码。(3) 构建期 `cannot allocate memory` 不等于 VM 内存不足，必须先取 `~/Library/Containers/com.docker.docker/Data/log/vm/init.log` 里的 `oom-kill` / `Killed process` 行，看清进程、`anon-rss`、是 `global_oom` 还是 cgroup 限额；单个用户态进程 anon-rss 达 GiB 级说明该进程失控，而其失控往往又是上游网络故障的次生现象，不要停在第一层。(4) `198.18.x.x` 是宿主 Clash/mihomo 的 fake-IP 段，容器经宿主 TUN 可达（参考 P001），但可达不等于扛得住高并发短连接；宿主跑 TUN 时，容器内大批量下载应优先走代理端口而非 TUN。(5) 面向宿主特定环境的修复必须做成可选开关（ARG + compose 变量，默认空），不得硬编码进 Dockerfile，否则无 Clash 的机器和 CI 全部构建失败；同时代理配置不能残留进运行时镜像，需在后续层删除。(6) 判定 Docker Desktop 是否启动失败必须依据其自身日志中的明确失败记录，不得用固定时间窗口的进程/日志 mtime 快照推断——冷启动期 `docker info` 会挂起 20-30s，`for i in seq 1 120; do docker info; sleep 1; done` 的迭代数与真实秒数严重不等，我据 60s 内 `pgrep` 无 VM 进程误判"VM 启动静默失败"并执行硬杀，实际守护进程随后自行就绪。探测一律写成 `timeout N docker info`，冷启动至少给 5 分钟。(7) 需要判定退出码的命令禁止直接接管道——`docker compose build ... | tail -30` 的 `$?` 来自 `tail`，我据此误报"构建成功"而实际 EXIT=1；必须写成 `cmd > file 2>&1; echo "EXIT=$?" >> file`，且诊断日志全量落盘后再 grep，禁止在采集端截断。(8) 重启 Docker Desktop 必须硬杀后再启动：`osascript -e 'quit app "Docker"'` 之后仍会残留 8 个左右 com.docker.* 进程，此时 `open -a Docker` 会卡在 GUI 起、VM 不起的状态；正确做法是 quit 后逐个 pkill `Docker Desktop` / `com.docker.backend` / `com.docker.build` / `docker-api-proxy` / `com.docker.vpnkit` / `com.docker.virtualization`，确认残留进程数降到 1 以内再 `open -a Docker`。(9) 修改 Docker Desktop 资源配置属破坏性操作，会停掉所有在跑容器（含其他 Compose 项目），执行前须向用户确认并列出受影响容器，事后主动 `docker start` 还原。
+
+来源：环境排障 260908 browser 镜像构建失败

@@ -45,3 +45,4 @@ __pycache__/
 docker/docker-compose.yml
 docker/.env
 docker/locals/*
+docker/host-terminal-policy.yaml
