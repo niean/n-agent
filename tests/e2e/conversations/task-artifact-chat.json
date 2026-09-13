@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "id": "task-artifact-chat",
+  "title": "Task执行&产出制品chat",
+  "source_session_id": "dashboard-036e890c-dcf8-4f97-a6a8-0cf4fb01355d",
+  "channel": "dashboard",
+  "requires": ["task", "web"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "用task 调研博客网站 https://blog.niean.name/，形成一份简洁的调研报告(500字以内)、以制品形式交付。",
+      "expect": {
+        "rubric": "创建任务并由 worker 调研该博客（web_fetch），任务终态 SUCCEEDED，以制品形式交付 500 字以内中文调研报告，会话出现任务生命周期消息",
+        "tools": ["create_task"]
+      }
+    }
+  ],
+  "side_effects": [
+    {"type": "task_terminal", "status": "succeeded", "timeout": 600},
+    {"type": "artifact_registered", "count": 1, "source_context_ref": "task_id", "kind": "markdown"}
+  ],
+  "cleanup": ["session", "task", "artifact"]
+}

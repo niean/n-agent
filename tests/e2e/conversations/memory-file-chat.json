@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "memory-file-chat",
+  "title": "Memory加载file",
+  "source_session_id": "dashboard-67bf3339-2cb8-47ca-95a2-507b727f23de",
+  "channel": "dashboard",
+  "requires": ["memory-file"],
+  "options": {"external_memory_enabled": ["file_1"]},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "你好",
+      "expect": {
+        "rubric": "首轮在文件记忆 profile file_1 下正常应答问候，无记忆加载报错；会话 external_memory_enabled 锁定为 [\"file_1\"]",
+        "tools": []
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session"]
+}

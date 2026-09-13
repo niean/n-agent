@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "acp-weather-chat",
+  "title": "ACP对话交互",
+  "source_session_id": "acp-fdf60a40-6b9e-4a47-994a-1fef5cf9f02a",
+  "channel": "acp",
+  "requires": ["web"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "查一下 北京天气",
+      "expect": {
+        "rubric": "回答包含北京当前天气（气温、天气状况），数据来自实时抓取，且 ACP 协议流程（initialize/authenticate/session/new/session/prompt）正常完成",
+        "tools": ["web_fetch"]
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session"]
+}

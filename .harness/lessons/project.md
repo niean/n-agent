@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
 # 项目教训
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
@@ -482,3 +482,23 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：(1) 异步生成器的取消语义至少有两条投递路径（aclose 的 GeneratorExit、外层 task 取消经 `__anext__` 的 CancelledError），只测 aclose 无法覆盖生产断连；涉及 SSE 断连行为的修复，E2E 必须用真实 TCP 断连（kill curl），不能只用 TestClient/aclose。(2) consumer 与 producer 是不同 task 时，finally 里无条件 cancel producer 等于把"没人看了"放大成"工作作废"；应区分取消来源，consumer 消失默认让 producer 跑完并持久化结果。(3) `await task` 会把当前 task 的取消转发给被 await 的 task，循环退出后再 await run_task 的写法本身就是一条隐藏取消通道。(4) 本次定位靠三条独立证据链交叉（DB 状态、日志时间线含 title 生成 httpx 请求的甄别、live repro），日志里的 httpx 200 不一定是 Agent run 的 LLM 调用，须用 usage_service 日志区分 ensure_title 的 fire-and-forget 调用。
 
 来源：bug fix 260913 Dashboard 插件执行后未打印 Chat 消息（dashboard-d7a6aa86）
+
+### P049: acp SDK spawn_stdio_transport 用 default_environment() 白名单重建子进程 env，不继承 os.environ，配置类环境变量必须显式传 env
+
+现象：E2E Runner 经 acp SDK 起 `n-agent acp` 子进程后，session/new 始终失败报 "cannot map host cwd to container"；同一命令用 `docker exec` 手动执行（继承 compose env）却正常。ACP 通道三轮全量运行（6/12、8/12）无法建立会话。
+
+根因：acp SDK 的 `spawn_stdio_transport` 内部 `merged_env = dict(default_environment())`，只保留 PATH/HOME 等最小白名单变量，不合并父进程 os.environ；compose 注入的 N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT / N_AGENT_ACP_HOST_WORKSPACE_ROOT / N_AGENT_WORKSPACE_ROOT / N_AGENT_SQLITE_PATH 全部丢失，子进程回落默认 Settings，`map_cwd`（app/interfaces/cli/commands/acp/path_mapping.py）拿不到 container root 无法映射。定位需跨 SDK 源码与 path_mapping 两个文件。修复：Runner 侧新增 `_acp_subprocess_env`（只透传 N_AGENT_* 且排除 N_AGENT_E2E_* 密钥），spawn 时显式 `env=` 传入。
+
+教训：(1) "子进程会继承父进程 env" 对 SDK 封装的 spawn 不成立，SDK 可能用最小白名单重建环境；依赖环境变量配置链路的子进程调用，先在容器内用相同 spawn 路径做探针验证，再跑全量。(2) docker exec 直跑能成功不代表 SDK 路径能成功，两条链路的 env 来源不同（exec 继承 compose 注入，SDK spawn 被白名单 scrub）。(3) 透传 env 时按前缀白名单并显式排除密钥前缀（N_AGENT_E2E_*），避免密钥落子进程命令行/环境泄漏面。
+
+来源：功能迭代 260913 会话 E2E 数据集 Runner（plan-260913-e2e-conversation-dataset, T10 修复点）
+
+### P050: external_memory_enabled 会话锁在首条消息发送时才生效，create 后立即回读配置类 options 会得到 null
+
+现象：E2E Runner 在 session create 成功后立即回读 session detail 校验 `external_memory_enabled`，恒为 null，导致 memory-file-chat 用例误判 FAIL；改为在消息循环内首条消息发送后回读则拿到锁定值 true。
+
+根因：锁应用点在 app/application/chat_service.py:165-167（首条消息发送路径），而非 session create 路径；create 接口只暂存请求值。Runner 最初假设"create 后配置即生效可回读"，与实际落锁时机不符，属实现假设偏差导致的测试代码返工（读回逻辑从 pre-loop 移入消息循环，并按 driver.calls 顺序补断言测试）。
+
+教训：校验"会话级开关是否生效"类证据时，证据采集点必须落在该开关的真实生效点之后（对配置锁类语义，是首次使用而非创建）；对任何"create 写入、send 生效"的两段式语义，回读时序本身就是被测契约的一部分，应固定为测试断言而非调试假设。
+
+来源：功能迭代 260913 会话 E2E 数据集 Runner（plan-260913-e2e-conversation-dataset, T10 修复点）

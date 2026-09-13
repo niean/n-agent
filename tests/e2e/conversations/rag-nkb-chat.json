@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "rag-nkb-chat",
+  "title": "Rag知识检索nkb",
+  "source_session_id": "dashboard-b7781fbd-889c-4552-9459-9e1a51b0c7aa",
+  "channel": "dashboard",
+  "requires": ["nkb"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "新增预算单元，流程是怎样的？",
+      "expect": {
+        "rubric": "调用 search_knowledge 检索 N-KB 知识库，回答基于知识库说明新增预算单元（预单）流程或给出操作指引文档引用，不编造知识库不存在的内容",
+        "tools": ["search_knowledge"]
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session"]
+}

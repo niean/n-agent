@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "id": "browser-login-pod",
+  "title": "Browser执行pod",
+  "source_session_id": "dashboard-1b883fd6-9d25-4557-aad0-2586a9c2383f",
+  "channel": "dashboard",
+  "requires": ["browser", "browser-credentials"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "调用 `browser_navigate` 打开页面 https://a6thn73a795g.meoo.info/#/login。本会话禁用web_fetch工具",
+      "expect": {
+        "rubric": "打开登录页成功，不使用 web_fetch，浏览器会话可观测",
+        "tools": ["browser_navigate"],
+        "forbidden_tools": ["web_fetch"]
+      }
+    },
+    {
+      "id": "m2",
+      "content": "输入账号密码，账号 niean.sail@gmail.com，密码 xxx",
+      "expect": {
+        "rubric": "账号成功输入；密码按敏感字段处理，agent 请求人工接管（sensitive_field_requires_takeover 或等效表述），不强行 type 密码",
+        "tools": [],
+        "forbidden_tools": ["web_fetch"]
+      },
+      "runner_action_after": "browser_type_password"
+    },
+    {
+      "id": "m3",
+      "content": "我已输入密码，请你继续接管。",
+      "expect": {
+        "rubric": "agent 继续操作完成登录（点击登录/提交表单），进入登录后页面",
+        "tools": [],
+        "forbidden_tools": ["web_fetch"]
+      }
+    },
+    {
+      "id": "m4",
+      "content": "点击底部Tab 生日，截图发到对话框",
+      "expect": {
+        "rubric": "点击底部生日 Tab 并截图，对话框可见截图结果",
+        "tools": ["browser_click", "browser_screenshot"],
+        "forbidden_tools": ["web_fetch"]
+      }
+    },
+    {
+      "id": "m5",
+      "content": "结束任务",
+      "expect": {
+        "rubric": "正常收尾应答，无异常工具调用",
+        "tools": [],
+        "forbidden_tools": ["web_fetch"]
+      }
+    },
+    {
+      "id": "m6",
+      "content": "结束浏览器",
+      "expect": {
+        "rubric": "调用 browser_close 关闭浏览器会话，并回读确认 closed 或会话不存在",
+        "tools": ["browser_close"],
+        "forbidden_tools": ["web_fetch"]
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session", "browser_session"]
+}
