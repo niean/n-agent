@@ -802,3 +802,35 @@ async def test_stream_events_detached_closer_does_not_clobber_newer_run(tmp_path
     finally:
         sentinel.cancel()
         runner.clear_run("s-disc-new")
+
+
+@pytest.mark.asyncio
+async def test_stream_events_consumer_task_cancellation_detaches_run(tmp_path):
+    """生产断连路径：消费任务被取消时 CancelledError 经 __anext__ 链传入
+    stream_events（而非 GeneratorExit），run 同样 detach 并在服务端完成。"""
+    from contextlib import suppress
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-disc-cancel"))
+    provider = _BlockingSecondCallProvider()
+    runner = _build_disconnect_runner(tmp_path, store, provider)
+    state = AgentState(session_id="s-disc-cancel", input_messages=[{"role": "user", "content": "calc"}])
+
+    async def consume():
+        async for _event in runner.stream_events(state, "test"):
+            pass
+
+    consumer = asyncio.create_task(consume())
+    # 第二轮 LLM 调用进行中时取消消费任务（模拟 ASGI 断连取消）
+    await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+    consumer.cancel()
+    with suppress(asyncio.CancelledError):
+        await consumer
+
+    provider.release_second.set()
+    assert await _wait_for_assistant_content(store, "s-disc-cancel", "result is 3")
+    for _ in range(100):
+        if "s-disc-cancel" not in runner._running_tasks:
+            break
+        await asyncio.sleep(0.02)
+    assert "s-disc-cancel" not in runner._running_tasks

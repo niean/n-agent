@@ -1072,8 +1072,11 @@ async def test_bridge_notifier_failure_denies_and_executor_not_called(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_bridge_decider_task_cancel_cleans_up(tmp_path):
-    """Graph task cancelled while waiting for approval: executor=0, pending=0."""
+async def test_bridge_decider_task_cancel_detaches_run_and_keeps_pending(tmp_path):
+    """Consumer task cancelled while waiting for approval: the run detaches
+    instead of being cancelled (SSE-disconnect semantics), so the pending
+    approval survives and stays claimable; after claim+complete the detached
+    run executes the tool and finishes."""
     session_id = "s-bridge-task-cancel"
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id=session_id))
@@ -1105,16 +1108,32 @@ async def test_bridge_decider_task_cancel_cleans_up(tmp_path):
             break
         await asyncio.sleep(0.01)
     assert bridge.pending_count == 1
-    # Cancel the graph task while waiting for approval
+    # Cancel the consumer task while the run waits for approval
     task.cancel()
     try:
         await task
     except (asyncio.CancelledError, BaseException):
         pass
-    # Executor NOT called
+    # Executor NOT called yet, and the pending approval survives (the run
+    # detached instead of being cancelled, mirroring an SSE client disconnect)
     assert len(executor.calls) == 0
-    # Bridge pending cleaned up (decider finally block)
+    assert bridge.pending_count == 1
+    # The surviving approval is still claimable; completing it lets the
+    # detached run execute the tool and finish.
+    cid = notifier_records[0]["id"]
+    claim = bridge.claim(
+        cid, "once", actor_id=_bridge_actor_id(), session_key=_bridge_session_key()
+    )
+    bridge.complete(claim)
+    for _ in range(200):
+        if executor.calls and bridge.pending_count == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert len(executor.calls) == 1
+    assert executor.calls[0].name == "manage_schedule"
     assert bridge.pending_count == 0
+    # Detached run completed and unregistered itself.
+    assert session_id not in runner._running_tasks
 
 
 @pytest.mark.asyncio

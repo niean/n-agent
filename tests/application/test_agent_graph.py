@@ -1712,10 +1712,12 @@ async def test_stream_events_forwards_dashboard_approval_event_queue(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_stream_events_disconnect_cleans_up_approval_event_queue(tmp_path):
+async def test_stream_events_disconnect_keeps_approval_claimable_and_run_alive(tmp_path):
     """When the SSE consumer disconnects (aclose) after the approval event is
-    emitted, run_task.cancel() propagates into the decider's await, and the
-    bridge cleans up the pending approval (no leftover claimable pending)."""
+    emitted, the run is detached (not cancelled): the bridge pending approval
+    survives and stays claimable (approval cards are persisted messages, so a
+    user can approve after a page reload), and once approved the run finishes
+    server-side and persists the final message."""
     from app.interfaces.http.dashboard_tool_approval import DashboardToolApprovalBridge
 
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
@@ -1773,14 +1775,21 @@ async def test_stream_events_disconnect_cleans_up_approval_event_queue(tmp_path)
     # Close the iterator (simulates SSE consumer disconnect)
     await gen.aclose()
 
-    # Bridge pending is cleaned up by decider finally block
+    # Detach semantics: the pending approval survives the disconnect and a
+    # same-session claim still approves the tool.
+    assert bridge.pending_count == 1
+    claim_result = bridge.claim(confirmation_id, "s-disconnect", "once")
+    assert claim_result.status == "ok"
+
+    # The detached run finishes server-side and persists the final message.
+    for _ in range(200):
+        if "s-disconnect" not in runner._running_tasks:
+            break
+        await asyncio.sleep(0.02)
+    assert "s-disconnect" not in runner._running_tasks
     assert bridge.pending_count == 0
-    # A subsequent claim cannot approve the tool -- same-session returns
-    # conflict (tombstone), cross-session returns not_found
-    same_session_result = bridge.claim(confirmation_id, "s-disconnect", "once")
-    assert same_session_result.status == "conflict"
-    cross_session_result = bridge.claim(confirmation_id, "s-other", "once")
-    assert cross_session_result.status == "not_found"
+    messages = await store.list_messages("s-disconnect")
+    assert any(m.role == "assistant" and m.content == "typed" for m in messages)
 
 
 @pytest.mark.asyncio

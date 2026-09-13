@@ -1064,7 +1064,7 @@ Dashboard 的 `POST /chat/completions` 原先不注入 `ApprovalDecider`，导�
 - metadata 白名单：`TOOL_APPROVAL_REQUIRED.metadata` 与 SSE envelope 的 `approval` 各恰含 5 字段（confirmation_id/tool_name/description/arguments_summary/expires_at），均 JSON 标量字符串，不含 session/actor/raw 参数/risk 内部结果。
 - claim 语义：跨会话或不存在的 ID 一律 404（不泄露 ID 归属，即使已领取对跨会话也只 404 不 409）；同会话重复 claim 在 tombstone TTL 内稳定 409。tombstone 仅存 session_id+expires_at，不存参数/授权、不可完成 Future、进程重启失效。
 - 严格 stream：`/chat/completions` 仅在依赖齐全且 `stream` 为严格布尔 `True` 时创建 decider；`stream` 非 bool（含 `false`/`"true"`/`1`）一律 `422 dashboard_stream_required` 且不启动 Agent（校验先于 session lookup），省略 stream 默认 `True`。缺 bridge/grant service 时保持 fail-closed、不注册 claim endpoint。
-- 断连清理：SSE 响应 `finally` 对底层 Chat 事件迭代器 `aclose()`，使 ASGI 客户端断连传播到 `stream_events` 的 `run_task.cancel()`，再传播到 decider await 的 `CancelledError`，触发 bridge `finally` 按 identity 清理 pending + 写 tombstone；不得留下断连后可被 endpoint 放行的 Future。
+- 断连语义：SSE 客户端断连（aclose 的 GeneratorExit，或真实 ASGI 断连经 `__anext__` await 链到达的 CancelledError）时 `stream_events` detach 而非 cancel run，run 在服务端跑完并持久化最终消息；pending approval 有意保留（卡片是已持久化消息，刷新后仍可 claim），由 bridge 900s 单调时钟 TTL 兜底 deny + identity 清理 + 写 tombstone，不会留下可无限期被 endpoint 放行的 Future；`interrupt()` 对 detached run 仍生效，registry 仅当仍指向本 run 才由 cleanup waiter 清理。
 - 隔离：approval queue 不来自客户端 payload（先 pop 客户端同名 key）、不送 LLM/executor、不跨请求复用；`/v1/chat/completions` 仍无 decider/fail-closed；既有 Task/Feishu/CLI 审批交互不变。
 
 相关：模式十六（SessionSource）、模式三十三（options 内部 key 过滤，`dashboard_approval_event_queue` 已加入）、D038（通用 confirmation challenge 治理方向）。

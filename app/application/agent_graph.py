@@ -495,14 +495,23 @@ class AgentGraphRunner:
                     yield approval_queue.get_nowait()
         except GeneratorExit:
             # SSE client disconnected (page reload/navigation closed the
-            # stream): detach instead of cancelling so the run finishes
-            # server-side and the final message is persisted to the session.
-            # Persistence happens in the graph nodes (update_memory/finalize),
-            # not in this stream layer, so the consumer going away must not
-            # kill the run.
+            # stream via aclose): detach instead of cancelling so the run
+            # finishes server-side and the final message is persisted to the
+            # session. Persistence happens in the graph nodes
+            # (update_memory/finalize), not in this stream layer, so the
+            # consumer going away must not kill the run.
             detached = True
             raise
         except asyncio.CancelledError:
+            if not run_task.done():
+                # Cancellation hit the consumer, not the run: a real SSE
+                # disconnect reaches here as CancelledError thrown through
+                # the __anext__ await chain (not GeneratorExit), while the
+                # suspension point is the fan-in wait -- never run_task.
+                # Detach and re-raise so the run finishes server-side.
+                detached = True
+                raise
+            # The run itself was cancelled (interrupt()/shutdown): report it.
             yield ChatEvent(ChatEventType.ERROR, error="cancelled", finish_reason="cancelled")
             result = None
         finally:

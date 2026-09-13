@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
 # 项目教训
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
@@ -472,3 +472,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：(1) 判断网络类构建失败必须先在日志里定位成功与失败的分界点，看清是随机分布还是某个时刻起的整体断流；本例"前 203 个全成功、第 204 个起全失败"一眼排除了丢包率模型，而我此前基于抽样测出的"约 1% 随机失败"完全误导了方向，抽样测试（20 次串行 curl 全通）无法复现只在持续负载下触发的连接表耗尽。(2) 增大重试次数和串行化下载只能对抗独立随机失败，对通路断死无效；这类护栏加上去仍失败时应立即改变假设，而不是继续加码。(3) 构建期 `cannot allocate memory` 不等于 VM 内存不足，必须先取 `~/Library/Containers/com.docker.docker/Data/log/vm/init.log` 里的 `oom-kill` / `Killed process` 行，看清进程、`anon-rss`、是 `global_oom` 还是 cgroup 限额；单个用户态进程 anon-rss 达 GiB 级说明该进程失控，而其失控往往又是上游网络故障的次生现象，不要停在第一层。(4) `198.18.x.x` 是宿主 Clash/mihomo 的 fake-IP 段，容器经宿主 TUN 可达（参考 P001），但可达不等于扛得住高并发短连接；宿主跑 TUN 时，容器内大批量下载应优先走代理端口而非 TUN。(5) 面向宿主特定环境的修复必须做成可选开关（ARG + compose 变量，默认空），不得硬编码进 Dockerfile，否则无 Clash 的机器和 CI 全部构建失败；同时代理配置不能残留进运行时镜像，需在后续层删除。(6) 判定 Docker Desktop 是否启动失败必须依据其自身日志中的明确失败记录，不得用固定时间窗口的进程/日志 mtime 快照推断——冷启动期 `docker info` 会挂起 20-30s，`for i in seq 1 120; do docker info; sleep 1; done` 的迭代数与真实秒数严重不等，我据 60s 内 `pgrep` 无 VM 进程误判"VM 启动静默失败"并执行硬杀，实际守护进程随后自行就绪。探测一律写成 `timeout N docker info`，冷启动至少给 5 分钟。(7) 需要判定退出码的命令禁止直接接管道——`docker compose build ... | tail -30` 的 `$?` 来自 `tail`，我据此误报"构建成功"而实际 EXIT=1；必须写成 `cmd > file 2>&1; echo "EXIT=$?" >> file`，且诊断日志全量落盘后再 grep，禁止在采集端截断。(8) 重启 Docker Desktop 必须硬杀后再启动：`osascript -e 'quit app "Docker"'` 之后仍会残留 8 个左右 com.docker.* 进程，此时 `open -a Docker` 会卡在 GUI 起、VM 不起的状态；正确做法是 quit 后逐个 pkill `Docker Desktop` / `com.docker.backend` / `com.docker.build` / `docker-api-proxy` / `com.docker.vpnkit` / `com.docker.virtualization`，确认残留进程数降到 1 以内再 `open -a Docker`。(9) 修改 Docker Desktop 资源配置属破坏性操作，会停掉所有在跑容器（含其他 Compose 项目），执行前须向用户确认并列出受影响容器，事后主动 `docker start` 还原。
 
 来源：环境排障 260908 browser 镜像构建失败
+
+### P048: 单测 aclose() 的 GeneratorExit 不等于生产 ASGI 断连的 CancelledError，修复异步取消语义必须用真实断连路径做 E2E
+
+现象：Dashboard 插件（或任意工具）执行后页面不打印最终 Chat 消息。DB 中只有 3 条消息（user/assistant tool_call/tool 结果），缺最终 assistant 消息，sessions.api_call_count=1；日志显示第二次 LLM 调用 reserve 后 5ms 内 release，随后完全静默，紧接着是 GET /chat 整页刷新。首轮修复只处理 `except GeneratorExit` 分支，单测全绿，但 Docker 真实断连 E2E 仍复现消息丢失。
+
+根因：SSE 客户端断连（页面刷新/导航）在生产中由 Starlette 取消 consumer task，取消以 CancelledError 形式经内层 generator 的 `__anext__()` await 链抛入 `stream_events` 的悬挂点（fan-in 的 `asyncio.wait`，永远不是 run_task）；而单测里的 `agen.aclose()` 投递的是 GeneratorExit，两条路径不同。`stream_events` 旧实现不区分"consumer 被取消"和"run 自己被取消"，任何取消都在 finally 里 `run_task.cancel()`，正在进行的第二次 LLM 调用被中止，最终消息永不生成。另外循环退出后的 `result = await run_task` 会把 consumer 取消转发进 run_task（awaited-task cancellation forwarding）。修复：`stream_events` 对 GeneratorExit 与"run 未完成时的 CancelledError"均 detach（`_detach_run` 后台 waiter 收尾：幂等关 budget、registry 仅当仍指向本 run 才清理、interrupt() 仍生效），run_task 自身被 cancel 才产出 ERROR cancelled 事件。
+
+教训：(1) 异步生成器的取消语义至少有两条投递路径（aclose 的 GeneratorExit、外层 task 取消经 `__anext__` 的 CancelledError），只测 aclose 无法覆盖生产断连；涉及 SSE 断连行为的修复，E2E 必须用真实 TCP 断连（kill curl），不能只用 TestClient/aclose。(2) consumer 与 producer 是不同 task 时，finally 里无条件 cancel producer 等于把"没人看了"放大成"工作作废"；应区分取消来源，consumer 消失默认让 producer 跑完并持久化结果。(3) `await task` 会把当前 task 的取消转发给被 await 的 task，循环退出后再 await run_task 的写法本身就是一条隐藏取消通道。(4) 本次定位靠三条独立证据链交叉（DB 状态、日志时间线含 title 生成 httpx 请求的甄别、live repro），日志里的 httpx 200 不一定是 Agent run 的 LLM 调用，须用 usage_service 日志区分 ensure_title 的 fire-and-forget 调用。
+
+来源：bug fix 260913 Dashboard 插件执行后未打印 Chat 消息（dashboard-d7a6aa86）

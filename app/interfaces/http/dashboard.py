@@ -1873,8 +1873,10 @@ async def _dashboard_sse_with_approval(
     they never pass through the generic OpenAI chunk encoder.
 
     On ASGI client disconnect / response cancellation the underlying
-    Chat-event async iterator is ``aclose()``d. Inside
-    ``AgentGraphRunner.stream_events`` this detaches (rather than cancels)
+    Chat-event async iterator is closed (cancellation reaches it as
+    CancelledError through the ``__anext__`` await chain; the finally
+    ``aclose()`` covers the GeneratorExit path). Inside
+    ``AgentGraphRunner.stream_events`` both detach (rather than cancel)
     the run: the run finishes server-side and persists the final message,
     so a page reload no longer loses an in-flight answer. Pending tool
     approvals survive the disconnect (cards are persisted messages) and
@@ -1896,9 +1898,9 @@ async def _dashboard_sse_with_approval(
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
     finally:
         # Close the underlying iterator on disconnect / cancellation.
-        # stream_events treats this GeneratorExit as client disconnect and
-        # detaches the run (it keeps running server-side) instead of
-        # cancelling it.
+        # stream_events treats both this GeneratorExit and a consumer-side
+        # CancelledError as client disconnect and detaches the run (it keeps
+        # running server-side) instead of cancelling it.
         aclose = getattr(events, "aclose", None)
         if aclose is not None:
             with suppress(Exception):
