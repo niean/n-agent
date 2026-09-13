@@ -5,7 +5,7 @@ metadata:
   version: "1"
   platforms: "linux,macos"
   tags: "n-agent,manual"
-  source: "agent"
+  source: "seed"
 ---
 
 # N-Agent 操作手册

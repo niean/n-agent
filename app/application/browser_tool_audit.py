@@ -27,11 +27,12 @@ _BROWSER_TOOL_NAMES: frozenset[str] = frozenset({
     "browser_type",
     "browser_scroll",
     "browser_screenshot",
+    "browser_close",
 })
 
 
 def is_browser_tool(tool_name: str) -> bool:
-    """Return True if tool_name is one of the 6 browser_* tools."""
+    """Return True if tool_name is one of the 7 browser_* tools."""
     return tool_name in _BROWSER_TOOL_NAMES
 
 
@@ -77,8 +78,11 @@ def project_browser_tool_arguments(tool_name: str, arguments: dict[str, Any]) ->
         return _project_observe(arguments)
     if tool_name == "browser_screenshot":
         return _project_screenshot(arguments)
+    if tool_name == "browser_close":
+        # 无参数工具：投影恒为空 dict。
+        return {}
 
-    # Unreachable: is_browser_tool gates the 6 names above. Defensive.
+    # Unreachable: is_browser_tool gates the 7 names above. Defensive.
     return {}
 
 

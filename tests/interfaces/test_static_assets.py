@@ -1682,6 +1682,14 @@ def test_chat_message_hover_reveals_timestamp_feishu_style(tmp_path):
     assert '.msg[data-time]:hover::before' in css
     assert 'pointer-events: none' in css
 
+    # 首条消息上方无 16px 消息间距可借：hover 时间以 top:-14px 浮于气泡上方，
+    # 滚动容器 .chat-stack__messages 顶部 padding 必须容纳 14px 时间高度并保留原 10px
+    # 视觉留白，否则 overflow-y:auto 裁剪导致首条消息 hover 时间只展示一半
+    messages_rules = _css_rule_bodies(css, '.chat-stack__messages')
+    assert messages_rules, "styles.css missing .chat-stack__messages rule"
+    assert any('padding: 24px 16px 10px' in body for body in messages_rules), \
+        ".chat-stack__messages top padding must reserve room for the -14px hover timestamp"
+
 
 def test_browser_static_assets_and_wiring(tmp_path):
     """T16: browser.js asset served, container present once, script order, source safety."""

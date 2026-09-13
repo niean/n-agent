@@ -4,7 +4,7 @@ description: Guide creating Anthropic-format skills (创建 Anthropic 格式 Ski
 metadata:
   tags: "skill,creation,guide"
   version: "1"
-  source: "agent"
+  source: "seed"
 ---
 
 # Skill 创建指引 (skill-creator)
