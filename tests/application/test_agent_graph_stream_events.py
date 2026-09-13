@@ -651,3 +651,154 @@ async def test_stream_events_without_dispatcher_unchanged(tmp_path):
     assert ChatEventType.DONE in types
     tool_deltas = [e for e in events if e.type is ChatEventType.TOOL_CALL_DELTA]
     assert len(tool_deltas) >= 2
+
+
+# ---------------------------------------------------------------------------
+# Client disconnect (SSE aclose) -- detach instead of cancelling the run
+# ---------------------------------------------------------------------------
+
+
+class _BlockingSecondCallProvider:
+    """First call returns a calculator tool_call; the second call blocks until
+    released, simulating a slow provider so the test can disconnect mid-run."""
+
+    def __init__(self):
+        self.calls = 0
+        self.second_started = asyncio.Event()
+        self.release_second = asyncio.Event()
+
+    async def list_models(self):
+        return [ModelInfo("test", "test", "fake")]
+
+    async def supports_tools(self, model: str):
+        return True
+
+    async def chat(self, messages, tools, stream, model, options):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "calculator", "arguments": '{"expression":"1+2"}'},
+                        }
+                    ],
+                },
+                finish_reason="tool_calls",
+            )
+        self.second_started.set()
+        await self.release_second.wait()
+        return LLMResult(message={"role": "assistant", "content": "result is 3"}, finish_reason="stop")
+
+
+def _build_disconnect_runner(tmp_path, store, provider):
+    return AgentGraphRunner(
+        provider,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+        iteration_limit=3,
+    )
+
+
+async def _consume_until_tool_success(agen):
+    async for event in agen:
+        if event.type is ChatEventType.TOOL_CALL_DELTA and event.tool_call.get("status") == "success":
+            return
+    raise AssertionError("tool success event never emitted")
+
+
+async def _wait_for_assistant_content(store, session_id, content, attempts=100):
+    for _ in range(attempts):
+        messages = await store.list_messages(session_id)
+        if any(m.role == "assistant" and m.content == content for m in messages):
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+@pytest.mark.asyncio
+async def test_stream_events_client_disconnect_does_not_cancel_run(tmp_path):
+    """SSE 断连（aclose）不得取消进行中的 run：run 在服务端完成并持久化最终消息。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-disc"))
+    provider = _BlockingSecondCallProvider()
+    runner = _build_disconnect_runner(tmp_path, store, provider)
+    state = AgentState(session_id="s-disc", input_messages=[{"role": "user", "content": "calc"}])
+
+    agen = runner.stream_events(state, "test")
+    await _consume_until_tool_success(agen)
+    # 第二轮 LLM 调用进行中时模拟客户端断连
+    await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+    await agen.aclose()
+
+    # 断连后 run 继续：释放 provider，最终消息必须持久化
+    provider.release_second.set()
+    assert await _wait_for_assistant_content(store, "s-disc", "result is 3")
+    # 完成后注册表已清理
+    for _ in range(100):
+        if "s-disc" not in runner._running_tasks:
+            break
+        await asyncio.sleep(0.02)
+    assert "s-disc" not in runner._running_tasks
+    assert "s-disc" not in runner._cancel_events
+
+
+@pytest.mark.asyncio
+async def test_stream_events_detached_run_can_be_interrupted(tmp_path):
+    """detach 的 run 仍注册在案，显式 interrupt() 可取消（ACP cancel 语义不变）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-disc-int"))
+    provider = _BlockingSecondCallProvider()
+    runner = _build_disconnect_runner(tmp_path, store, provider)
+    state = AgentState(session_id="s-disc-int", input_messages=[{"role": "user", "content": "calc"}])
+
+    agen = runner.stream_events(state, "test")
+    await _consume_until_tool_success(agen)
+    await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+    await agen.aclose()
+
+    assert "s-disc-int" in runner._running_tasks
+    assert runner.interrupt("s-disc-int") is True
+    provider.release_second.set()
+    # 被 interrupt 的 run 不得写入最终消息
+    await asyncio.sleep(0.3)
+    assert not await _wait_for_assistant_content(store, "s-disc-int", "result is 3", attempts=5)
+    for _ in range(100):
+        if "s-disc-int" not in runner._running_tasks:
+            break
+        await asyncio.sleep(0.02)
+    assert "s-disc-int" not in runner._running_tasks
+
+
+@pytest.mark.asyncio
+async def test_stream_events_detached_closer_does_not_clobber_newer_run(tmp_path):
+    """旧 run detach 完成后的注册表清理不得误删同会话新 run 的注册项。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="s-disc-new"))
+    provider = _BlockingSecondCallProvider()
+    runner = _build_disconnect_runner(tmp_path, store, provider)
+    state = AgentState(session_id="s-disc-new", input_messages=[{"role": "user", "content": "calc"}])
+
+    agen = runner.stream_events(state, "test")
+    await _consume_until_tool_success(agen)
+    await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+    await agen.aclose()
+
+    # 同会话新 run 注册（覆盖旧注册项）
+    sentinel = asyncio.create_task(asyncio.sleep(60))
+    runner._running_tasks["s-disc-new"] = sentinel
+    runner._cancel_events["s-disc-new"] = asyncio.Event()
+    try:
+        provider.release_second.set()
+        assert await _wait_for_assistant_content(store, "s-disc-new", "result is 3")
+        # 旧 run 完成后的清理不得删除新 run 注册项
+        await asyncio.sleep(0.1)
+        assert runner._running_tasks.get("s-disc-new") is sentinel
+    finally:
+        sentinel.cancel()
+        runner.clear_run("s-disc-new")

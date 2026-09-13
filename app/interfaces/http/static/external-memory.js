@@ -445,9 +445,7 @@
     });
     dialog.appendChild(form);
     backdrop.appendChild(dialog);
-    backdrop.addEventListener('click', (event) => {
-      if (event.target === backdrop) closeProjectForm();
-    });
+    // 编辑表单不响应 backdrop 点击关闭，避免误点空白丢失未保存输入；仅通过 × / 取消 显式关闭
     document.body.appendChild(backdrop);
   }
 
@@ -566,9 +564,7 @@
     });
     dialog.appendChild(form);
     backdrop.appendChild(dialog);
-    backdrop.addEventListener('click', (event) => {
-      if (event.target === backdrop) closeEntryForm();
-    });
+    // 编辑表单不响应 backdrop 点击关闭，避免误点空白丢失未保存输入；仅通过 × / 取消 显式关闭
     document.body.appendChild(backdrop);
   }
 
@@ -643,9 +639,7 @@
     });
     dialog.appendChild(form);
     backdrop.appendChild(dialog);
-    backdrop.addEventListener('click', (event) => {
-      if (event.target === backdrop) closeFullContentForm();
-    });
+    // 编辑表单不响应 backdrop 点击关闭，避免误点空白丢失未保存输入；仅通过 × / 取消 显式关闭
     document.body.appendChild(backdrop);
   }
 

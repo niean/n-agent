@@ -200,6 +200,9 @@ class AgentGraphRunner:
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
+        # Strong refs to detached-run cleanup waiters so the event loop does
+        # not GC them while the detached run is still completing.
+        self._detached_run_waiters: set[asyncio.Task] = set()
         self.evolution_service = evolution_service
         self.nudge_interval = nudge_interval
         self.curator_service = curator_service
@@ -227,6 +230,27 @@ class AgentGraphRunner:
     def clear_run(self, session_id: str) -> None:
         self._running_tasks.pop(session_id, None)
         self._cancel_events.pop(session_id, None)
+
+    def _detach_run(self, state: AgentState, run_task: asyncio.Task) -> None:
+        """Let a client-disconnected run finish in the background.
+
+        Keeps the run registry entry until completion so interrupt() still
+        works on a detached run; on completion closes the budget account
+        (same idempotent safety net as the inline finally) and clears the
+        registry -- only when the registry still points at THIS run, so a
+        newer run in the same session is never clobbered.
+        """
+
+        async def _wait_and_cleanup() -> None:
+            with suppress(asyncio.CancelledError, Exception):
+                await run_task
+            await self._budget_service.close(state.run_id)
+            if self._running_tasks.get(state.session_id) is run_task:
+                self.clear_run(state.session_id)
+
+        waiter = asyncio.create_task(_wait_and_cleanup())
+        self._detached_run_waiters.add(waiter)
+        waiter.add_done_callback(self._detached_run_waiters.discard)
 
     async def _dispatch_hook(self, hook_name: str, **kwargs: Any) -> list[Any]:
         """Dispatch a lifecycle hook via the configured dispatcher.
@@ -430,6 +454,7 @@ class AgentGraphRunner:
         run_task = asyncio.create_task(self.run(state, model, stream_options))
         self.register_run(state.session_id, run_task)
         result = None
+        detached = False
         try:
             while not run_task.done():
                 if approval_queue is not None:
@@ -468,19 +493,31 @@ class AgentGraphRunner:
             if approval_queue is not None:
                 while not approval_queue.empty():
                     yield approval_queue.get_nowait()
+        except GeneratorExit:
+            # SSE client disconnected (page reload/navigation closed the
+            # stream): detach instead of cancelling so the run finishes
+            # server-side and the final message is persisted to the session.
+            # Persistence happens in the graph nodes (update_memory/finalize),
+            # not in this stream layer, so the consumer going away must not
+            # kill the run.
+            detached = True
+            raise
         except asyncio.CancelledError:
             yield ChatEvent(ChatEventType.ERROR, error="cancelled", finish_reason="cancelled")
             result = None
         finally:
-            if not run_task.done():
-                run_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await run_task
-            # Close Budget account on any exit (cancel or normal).
-            # finalize already closes on terminal; this is a safety net
-            # for cancel/interrupt. Idempotent -- safe to call twice.
-            await self._budget_service.close(state.run_id)
-            self.clear_run(state.session_id)
+            if detached and not run_task.done():
+                self._detach_run(state, run_task)
+            else:
+                if not run_task.done():
+                    run_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await run_task
+                # Close Budget account on any exit (cancel or normal).
+                # finalize already closes on terminal; this is a safety net
+                # for cancel/interrupt. Idempotent -- safe to call twice.
+                await self._budget_service.close(state.run_id)
+                self.clear_run(state.session_id)
         if result is not None:
             if result.error:
                 # T9: Use result.finish_reason (set by TurnPolicy/finalize) for
