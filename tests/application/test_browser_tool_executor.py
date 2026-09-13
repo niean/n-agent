@@ -31,9 +31,9 @@ from app.domain.tool import (
 # ---------------------------------------------------------------------------
 
 
-def test_returns_six_tool_definitions():
+def test_returns_seven_tool_definitions():
     defs = browser_tool_definitions()
-    assert len(defs) == 6
+    assert len(defs) == 7
     names = {d.name for d in defs}
     assert names == {
         "browser_navigate",
@@ -42,6 +42,7 @@ def test_returns_six_tool_definitions():
         "browser_type",
         "browser_scroll",
         "browser_screenshot",
+        "browser_close",
     }
 
 
@@ -74,6 +75,14 @@ def test_navigate_observe_scroll_screenshot_are_safe_risk():
     assert by_name["browser_observe"].risk_level is RiskLevel.SAFE
     assert by_name["browser_scroll"].risk_level is RiskLevel.SAFE
     assert by_name["browser_screenshot"].risk_level is RiskLevel.SAFE
+
+
+def test_close_is_safe_risk():
+    # close 只拆除当前会话的浏览器（幂等、可经 navigate 重建），不操作外部站点，
+    # 因此与 navigate 同级为 SAFE，用户在对话中一条消息即可关闭。
+    defs = browser_tool_definitions()
+    by_name = {d.name: d for d in defs}
+    assert by_name["browser_close"].risk_level is RiskLevel.SAFE
 
 
 def test_click_type_are_confirm_risk():
@@ -122,6 +131,13 @@ def test_screenshot_schema_has_full_page_optional():
     assert shot.input_schema.get("required", []) == []
 
 
+def test_close_schema_has_no_params():
+    defs = browser_tool_definitions()
+    close = next(d for d in defs if d.name == "browser_close")
+    assert close.input_schema.get("properties", {}) == {}
+    assert close.input_schema.get("required", []) == []
+
+
 # ---------------------------------------------------------------------------
 # Execute: missing session_id / run_id
 # ---------------------------------------------------------------------------
@@ -130,8 +146,19 @@ def test_screenshot_schema_has_full_page_optional():
 class FakeBrowserService:
     def __init__(self) -> None:
         self.execute_calls: list[tuple[str, Any, Any]] = []
+        self.close_calls: list[str] = []
+        self.close_result: bool = True
+        self.close_exception: Exception | None = None
         self.next_result: BrowserActionResult | None = None
         self.next_exception: Exception | None = None
+
+    async def close_session(self, n_agent_session_id: str) -> bool:
+        self.close_calls.append(n_agent_session_id)
+        if self.close_exception is not None:
+            exc = self.close_exception
+            self.close_exception = None
+            raise exc
+        return self.close_result
 
     async def execute_action(self, n_agent_session_id: str, action: Any, run_context: Any) -> BrowserActionResult:
         self.execute_calls.append((n_agent_session_id, action, run_context))
@@ -315,6 +342,56 @@ async def test_execute_screenshot_delegates():
     from app.domain.browser import ScreenshotAction
     assert isinstance(service.execute_calls[0][1], ScreenshotAction)
     assert service.execute_calls[0][1].full_page is True
+
+
+@pytest.mark.asyncio
+async def test_execute_close_delegates_to_service_close_session():
+    service = FakeBrowserService()
+    executor = BrowserToolExecutor(service)
+    request = ToolCallRequest(id="tc-1", name="browser_close", arguments={})
+    result = await executor.execute(request, _ctx())
+    assert result.status is ToolResultStatus.SUCCESS
+    assert service.close_calls == ["nagent-1"]
+    # close 不走 execute_action
+    assert service.execute_calls == []
+    assert result.content["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_execute_close_no_active_session_reports_not_closed():
+    service = FakeBrowserService()
+    service.close_result = False
+    executor = BrowserToolExecutor(service)
+    request = ToolCallRequest(id="tc-1", name="browser_close", arguments={})
+    result = await executor.execute(request, _ctx())
+    assert result.status is ToolResultStatus.SUCCESS
+    assert result.content["closed"] is False
+    assert result.content["error_code"] == "no_browser_session"
+
+
+@pytest.mark.asyncio
+async def test_execute_close_service_exception_maps_to_error():
+    service = FakeBrowserService()
+    service.close_exception = RuntimeError("boom")
+    executor = BrowserToolExecutor(service)
+    request = ToolCallRequest(id="tc-1", name="browser_close", arguments={})
+    result = await executor.execute(request, _ctx())
+    assert result.status is ToolResultStatus.ERROR
+    assert result.content["error"] == "browser_unavailable"
+    # 不泄漏原始异常文本
+    assert "boom" not in str(result.content)
+
+
+@pytest.mark.asyncio
+async def test_execute_close_rejects_unknown_fields():
+    service = FakeBrowserService()
+    executor = BrowserToolExecutor(service)
+    request = ToolCallRequest(
+        id="tc-1", name="browser_close", arguments={"browser_session_id": "x"},
+    )
+    result = await executor.execute(request, _ctx())
+    assert result.status is ToolResultStatus.ERROR
+    assert service.close_calls == []
 
 
 # ---------------------------------------------------------------------------

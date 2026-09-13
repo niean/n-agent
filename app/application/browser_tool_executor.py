@@ -1,8 +1,8 @@
 """BrowserToolExecutor + tool definitions (T8).
 
-Defines the 6 browser tools (browser_navigate, browser_observe, browser_click,
-browser_type, browser_scroll, browser_screenshot) and an executor that
-delegates to BrowserService. The executor:
+Defines the 7 browser tools (browser_navigate, browser_observe, browser_click,
+browser_type, browser_scroll, browser_screenshot, browser_close) and an
+executor that delegates to BrowserService. The executor:
 
 - Requires context.session_id and context.run_id (stable ERROR otherwise).
 - Builds action value objects from arguments, rejecting unknown fields.
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 
 def browser_tool_definitions() -> list[ToolDefinition]:
-    """Return the 6 browser tool definitions.
+    """Return the 7 browser tool definitions.
 
     All definitions:
     - source_type = AGENT
@@ -151,6 +151,20 @@ def browser_tool_definitions() -> list[ToolDefinition]:
             source_type=ToolSourceType.AGENT,
             toolset="browser",
         ),
+        # SAFE：只拆除当前会话的浏览器（幂等、可经 navigate 重建），不操作外部
+        # 站点；用户在对话中要求"关闭浏览器/停止实时视图"时调用。
+        ToolDefinition(
+            name="browser_close",
+            description="Close the current browser session and stop the Dashboard live view. Use when the user asks to close/stop the browser. Idempotent; the result reports whether a session was actually closed.",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            risk_level=RiskLevel.SAFE,
+            source_type=ToolSourceType.AGENT,
+            toolset="browser",
+        ),
     ]
 
 
@@ -166,6 +180,7 @@ _ALLOWED_ARGUMENTS: dict[str, set[str]] = {
     "browser_type": {"element_ref", "document_revision", "text", "clear_first"},
     "browser_scroll": {"element_ref", "document_revision", "dx", "dy"},
     "browser_screenshot": {"full_page"},
+    "browser_close": set(),
 }
 
 
@@ -238,6 +253,28 @@ class BrowserToolExecutor(ToolExecutor):
                 tool_name=tool_name,
                 status=ToolResultStatus.ERROR,
                 content={"error": f"unknown fields: {sorted(unknown)}"},
+            )
+
+        # browser_close 无 action 值对象：直接委托 BrowserService.close_session。
+        if tool_name == "browser_close":
+            try:
+                closed = await self._service.close_session(context.session_id)
+            except Exception:
+                logger.warning("browser close failed", exc_info=True)
+                return ToolResult(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    status=ToolResultStatus.ERROR,
+                    content={"error": "browser_unavailable", "error_code": "service_error"},
+                )
+            content: dict[str, Any] = {"action_type": "close", "closed": bool(closed)}
+            if not closed:
+                content["error_code"] = "no_browser_session"
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+                status=ToolResultStatus.SUCCESS,
+                content=content,
             )
 
         # Build action value object.

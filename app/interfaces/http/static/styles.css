@@ -176,7 +176,9 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 #tab-chat.active { height: calc(100vh - 90px); margin-right: -20px; overflow-y: hidden; }
 /* 三区底色：会话面板外层与标题栏为 --color-bg-subtle；会话面板内容区（panel-body + session-list）与对话框消息区、输入区为 --color-bg-white；右侧边栏状态面板不变。 */
 .chat-stack { display: flex; flex-direction: column; min-width: 0; height: calc(100vh - 80px); background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); border-radius: var(--radius-md); box-shadow: var(--shadow-card); overflow: hidden; }
-.chat-stack__messages { flex: 1; overflow-y: auto; padding: 10px 16px; background: var(--color-bg-white); }
+/* 顶部 padding 24px = hover 时间戳高度 14px（.msg[data-time]::before top:-14px）+ 原 10px 视觉留白；
+   首条消息上方无 16px 消息间距可借，padding 不足时 overflow-y:auto 会裁掉首条消息的 hover 时间。 */
+.chat-stack__messages { flex: 1; overflow-y: auto; padding: 24px 16px 10px; background: var(--color-bg-white); }
 .chat-stack__composer { margin-bottom: 10px; padding: 10px 16px; border-top: 1px solid var(--color-border-light); background: var(--color-bg-white); }
 .chat-stack__hint { margin-top: 6px; color: var(--color-fg-subtle); font-size: 11px; text-align: center; }
 .message-stack { display: flex; flex-direction: column; gap: 16px; width: min(100%, calc(240px + 50%), 1360px); margin-inline: auto; }
@@ -291,7 +293,9 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 /* Hover timestamp (飞书风格): 鼠标悬停消息气泡时，在气泡上方展示小号灰色时间。
    时间文本由 JS 写入 data-time，CSS 用 attr() 取值，避免 innerHTML。
    仅 user/assistant 消息携带 data-time；tool/summary 调试卡不展示。
-   绝对定位浮于 gap 内，不抢占气泡空间，pointer-events:none 不干扰点击。 */
+   绝对定位浮于 gap 内，不抢占气泡空间，pointer-events:none 不干扰点击。
+   首条消息上方无 gap，其悬浮空间由 .chat-stack__messages 顶部 padding 24px 提供；
+   调整 top:-14px 偏移时必须同步调整该 padding，否则首条消息时间被滚动容器裁剪。 */
 .msg[data-time] { position: relative; }
 .msg[data-time]::before {
   content: attr(data-time);
@@ -1007,7 +1011,6 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .browser-actions-item__extra { font-size: var(--font-size-xs); margin-top: 2px; word-break: break-all; }
 .chat-browser-link, .chat-header-link { color: var(--color-primary, #2563eb); text-decoration: none; cursor: pointer; }
 .chat-browser-link:hover, .chat-header-link:hover { color: var(--color-primary-strong, #0969da); text-decoration: none; }
-
 /* T15: Artifact workbench -- two-column layout (left list | right detail).
    Mirrors browser-shell pattern: grid with min-width:0 tracks to prevent
    overflow. Height matches #tab-chat (calc(100vh - 90px)) so both panels'

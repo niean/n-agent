@@ -25,7 +25,7 @@ from app.application.browser_tool_audit import (
 
 
 class TestIsBrowserTool:
-    def test_six_browser_tools_are_true(self):
+    def test_seven_browser_tools_are_true(self):
         names = [
             "browser_navigate",
             "browser_observe",
@@ -33,6 +33,7 @@ class TestIsBrowserTool:
             "browser_type",
             "browser_scroll",
             "browser_screenshot",
+            "browser_close",
         ]
         for name in names:
             assert is_browser_tool(name) is True, f"{name} should be a browser tool"
@@ -251,6 +252,22 @@ class TestBrowserScreenshotProjection:
 
     def test_empty_dict(self):
         result = project_browser_tool_arguments("browser_screenshot", {})
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# browser_close
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserCloseProjection:
+    def test_empty_args_project_to_empty(self):
+        result = project_browser_tool_arguments("browser_close", {})
+        assert result == {}
+
+    def test_unexpected_fields_stripped(self):
+        # schema 无参数；即便传入异常字段也不得出现在投影中
+        result = project_browser_tool_arguments("browser_close", {"evil": "x"})
         assert result == {}
 
 
