@@ -71,6 +71,7 @@ from app.domain.session import (
     ToolCall,
 )
 from app.domain.skill import SkillNotFoundError, SkillReadiness, SkillValidationError
+from app.domain.task import TaskStateError
 from app.domain.tool import ToolDefinition
 
 
@@ -260,6 +261,14 @@ def create_dashboard_router(
             await session_service.delete_session(session_id)
         except SessionNotFoundError as exc:
             return _session_error_response(exc)
+        except TaskStateError as exc:
+            # Pre-delete cascade refuses to remove a session while a related
+            # task is still RUNNING; surface a JSON conflict instead of a
+            # plain-text 500 so the caller can terminate the task and retry.
+            return JSONResponse(
+                status_code=409,
+                content={"error": {"code": "session_delete_conflict", "message": str(exc)}},
+            )
         return Response(status_code=204)
 
     @router.post("/chat/sessions/{session_id}/messages")

@@ -502,3 +502,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：校验"会话级开关是否生效"类证据时，证据采集点必须落在该开关的真实生效点之后（对配置锁类语义，是首次使用而非创建）；对任何"create 写入、send 生效"的两段式语义，回读时序本身就是被测契约的一部分，应固定为测试断言而非调试假设。
 
 来源：功能迭代 260913 会话 E2E 数据集 Runner（plan-260913-e2e-conversation-dataset, T10 修复点）
+
+### P051: 级联删除的领域阻断异常未在路由映射，FastAPI 默认 500 纯文本让前端 JSON.parse 报错掩盖真实原因
+
+现象：Dashboard 删除会话失败，前端仅显示 `Unexpected token 'I', "Internal S"... is not valid JSON`，真实原因（关联 RUNNING task 阻断删除）完全不可见。
+
+根因：删除会话的级联链 dashboard.py DELETE 路由 -> session_service.delete_session -> _delete_session_tasks -> task_service.delete_task 对 RUNNING task 故意抛 TaskStateError（by design 阻断，见 delete_tasks_by_session docstring），但路由只捕获 SessionNotFoundError，TaskStateError 逃逸到 Starlette 默认异常处理返回 500 纯文本 "Internal Server Error"；前端 fetchJson 对任何非 204 响应一律 response.json()，解析失败抛出掩盖真实 message。根因定位需跨 3 个源文件 + Interfaces/Application/Domain 三层，只有容器日志 traceback 能给出答案。
+
+教训：HTTP 路由调用 Application 级联链时，必须把该链可能抛出的领域异常逐一映射到统一 `{"error":{"code","message"}}` JSON 契约（冲突类用 409，对齐 task_routes task_state_invalid），不能只映射 NotFound；"by design 的传播异常"同样是路由的公开契约，漏映射就是把内部异常类型泄漏成 500。排查"前端 JSON.parse 报错"类问题时直接查服务端 traceback，不要在前端猜。相关：P030 Content-Disposition 编码异常逃逸 try/except 变 500 裸响应。
+
+来源：Bug修复 260915 会话删除 500（TaskStateError 未映射 -> session_delete_conflict 409）

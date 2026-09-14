@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import datetime
 import hashlib
@@ -2425,10 +2426,14 @@ class ManifestRecorder:
     每次变更经 atomic_write_json 落盘（不等整轮结束）；resource 合并键为
     type + 精确 ID（ID 未知时稳定 intent_key；workspace_file 用 path）。
     所有持久化值经脱敏入口（构造时注入的 secrets 子串替换为 ***）。
+    公开方法经同一把锁串行化：并行用例共享本记录器时 intent 序号分配、
+    合并定位与落盘不会交错（内部 _find/_upsert/_persist 不加锁，仅由
+    持锁的公开方法调用）。
     """
 
     def __init__(self, path, *, run_id, base_url, environment,
                  started_at=None, secrets=(), resume=False):
+        self._lock = threading.Lock()
         self._path = Path(path)
         self._secrets = tuple(s for s in secrets if s)
         self._intent_seq = 0
@@ -2538,48 +2543,54 @@ class ManifestRecorder:
 
     def intent(self, resource):
         """创建前持久化 intent；服务器 ID 未知时分配稳定 intent_key 并返回。"""
-        res = self._sanitize_resource(resource)
-        if not res.get("id") and res.get("type") != "workspace_file" \
-                and not res.get("intent_key"):
-            self._intent_seq += 1
-            res["intent_key"] = f"intent-{self._intent_seq:04d}"
-        res.setdefault("status", "intent")
-        return self._upsert(res)
+        with self._lock:
+            res = self._sanitize_resource(resource)
+            if not res.get("id") and res.get("type") != "workspace_file" \
+                    and not res.get("intent_key"):
+                self._intent_seq += 1
+                res["intent_key"] = f"intent-{self._intent_seq:04d}"
+            res.setdefault("status", "intent")
+            return self._upsert(res)
 
     def upsert(self, resource):
         """按合并键更新/插入资源；服务器 ID 获得后调用即原子替换清单。"""
-        res = self._sanitize_resource(resource)
-        if "status" not in res or res["status"] is None:
-            res["status"] = "active" if (
-                res.get("id") or res.get("type") == "workspace_file") else "intent"
-        return self._upsert(res)
+        with self._lock:
+            res = self._sanitize_resource(resource)
+            if "status" not in res or res["status"] is None:
+                res["status"] = "active" if (
+                    res.get("id")
+                    or res.get("type") == "workspace_file") else "intent"
+            return self._upsert(res)
 
     def mark_status(self, resource_key, status, detail=None):
         """更新资源状态（intent/active/deleted/failed/unresolved）并持久化。"""
-        if status not in MANIFEST_STATUSES:
-            _fail_manifest(f"资源状态无效: {status!r}")
-        index = self._find(resource_key)
-        if index is None:
-            _fail_manifest(f"清单中不存在该资源: {resource_key!r}")
-        entry = self._manifest["resources"][index]
-        entry["status"] = status
-        if detail is not None:
-            entry["status_detail"] = self._scrub(str(detail))
-        self._persist()
+        with self._lock:
+            if status not in MANIFEST_STATUSES:
+                _fail_manifest(f"资源状态无效: {status!r}")
+            index = self._find(resource_key)
+            if index is None:
+                _fail_manifest(f"清单中不存在该资源: {resource_key!r}")
+            entry = self._manifest["resources"][index]
+            entry["status"] = status
+            if detail is not None:
+                entry["status_detail"] = self._scrub(str(detail))
+            self._persist()
 
     def exempt(self, type_, detail):
         """登记豁免项（telemetry/external），按 (type, detail) 去重。"""
-        if type_ not in MANIFEST_EXEMPTION_TYPES:
-            _fail_manifest(f"豁免类型未知: {type_!r}")
-        detail = self._scrub(_mreq_str(detail, "exempt.detail"))
-        entry = {"type": type_, "detail": detail}
-        if entry not in self._manifest["exemptions"]:
-            self._manifest["exemptions"].append(entry)
-            self._persist()
+        with self._lock:
+            if type_ not in MANIFEST_EXEMPTION_TYPES:
+                _fail_manifest(f"豁免类型未知: {type_!r}")
+            detail = self._scrub(_mreq_str(detail, "exempt.detail"))
+            entry = {"type": type_, "detail": detail}
+            if entry not in self._manifest["exemptions"]:
+                self._manifest["exemptions"].append(entry)
+                self._persist()
 
     def snapshot(self):
         """清单深拷贝（经 JSON 往返保证可序列化）。"""
-        return json.loads(json.dumps(self._manifest))
+        with self._lock:
+            return json.loads(json.dumps(self._manifest))
 
 
 # =============================================================================
@@ -3217,21 +3228,27 @@ def parse_cli_args(argv):
     parser.add_argument("--max-retries", type=int, default=None,
                         help="用例失败后最大重试次数（默认 2；任一尝试通过"
                              "即判该用例通过；0 表示不重试）")
+    parser.add_argument("--parallel", type=int, default=None,
+                        help="用例并行度（默认 3；1 表示串行执行）")
     parser.add_argument("--cleanup-only", metavar="MANIFEST", default=None,
                         help="独立一键清理模式：只按清单清理，不回放")
     args = parser.parse_args(argv)
     if args.max_retries is not None and args.max_retries < 0:
         parser.error("--max-retries 必须为非负整数")
+    if args.parallel is not None and args.parallel < 1:
+        parser.error("--parallel 必须为正整数")
     if args.cleanup_only:
         if args.only is not None or args.keep or args.dataset_dir is not None \
-                or args.max_retries is not None:
+                or args.max_retries is not None or args.parallel is not None:
             parser.error("--cleanup-only 与 --only/--keep/--dataset-dir/"
-                         "--max-retries 互斥")
+                         "--max-retries/--parallel 互斥")
     else:
         if not args.dataset_dir or not args.report_dir:
             parser.error("回放模式必须提供 --dataset-dir 与 --report-dir")
     if args.max_retries is None:
         args.max_retries = 2
+    if args.parallel is None:
+        args.parallel = 3
     return args
 
 
@@ -3935,6 +3952,87 @@ def _cleanup_failed_attempt(case, *, driver, deps, recorder):
               f"{_truncate(str(exc), 200)}", file=sys.stderr)
 
 
+def _run_case_with_retries(case, *, run_id, args, deps, driver, recorder,
+                           judge):
+    """单用例带重试执行，返回 (case_result, runner_error_flag)。
+
+    失败后最多重试 args.max_retries 次，任一尝试 PASS 即判通过。重试用派生
+    run_id（{run_id}-r{N}），会话 ID/CLI 入口键/任务幂等键随尝试天然隔离；
+    每次失败尝试的产物在下次尝试前按 manifest 清理。最终报告取通过尝试
+    （全失败取最后一次）。本函数是并行调度的最小单元：只读写本用例资源，
+    共享的 recorder 由 ManifestRecorder 内部锁保护。
+    """
+    max_attempts = 1 + args.max_retries
+    attempts = []
+    case_result = None
+    case_runner_error = False
+    for attempt in range(1, max_attempts + 1):
+        attempt_run_id = run_id if attempt == 1 else f"{run_id}-r{attempt}"
+        try:
+            case_result, case_runner_error = _run_case(
+                case, run_id=attempt_run_id, dataset_dir=args.dataset_dir,
+                driver=driver, deps=deps, recorder=recorder, judge=judge)
+        except Exception as exc:  # 编排自身缺陷不吞掉：记 runner_error 并继续
+            case_result = _blocked_case_result(
+                case, f"runner_error: {type(exc).__name__}: "
+                      f"{_truncate(str(exc), 300)}")
+            case_runner_error = True
+        attempts.append({"attempt": attempt,
+                         "verdict": case_result["verdict"],
+                         "reason": case_result.get("reason", "")})
+        if case_result["verdict"] == "PASS" or attempt == max_attempts:
+            break
+        print(f"RETRY {case.id} 第 {attempt + 1}/{max_attempts} "
+              f"次尝试（上次失败: "
+              f"{_truncate(case_result.get('reason') or '', 120)}）",
+              file=sys.stderr)
+        _cleanup_failed_attempt(case, driver=driver, deps=deps,
+                                recorder=recorder)
+    case_result["attempts"] = attempts
+    case_result["attempt_count"] = len(attempts)
+    return case_result, case_runner_error
+
+
+def _blocked_worker_result(case, exc):
+    """worker 线程逃逸异常的统一收敛（与 _run_case_with_retries 内兜底同形）。"""
+    return (_blocked_case_result(
+        case, f"runner_error: {type(exc).__name__}: "
+              f"{_truncate(str(exc), 300)}"), True)
+
+
+def _run_cases_parallel(pool, cases, worker):
+    """在线程池上并行执行用例，返回 {case_index: (case_result, runner_error)}。
+
+    KeyboardInterrupt 从 worker future 冒泡或主线程收到 SIGINT/SIGTERM 时：
+    取消未开始的用例、等待进行中的用例结束并收集其结果（避免统一清理与
+    仍在运行的用例竞争资源），随后向上传播中断。
+    """
+    results = {}
+    futures = {pool.submit(worker, case): i for i, case in enumerate(cases)}
+    try:
+        for future in concurrent.futures.as_completed(futures):
+            i = futures[future]
+            try:
+                results[i] = future.result()
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                results[i] = _blocked_worker_result(cases[i], exc)
+    except BaseException:
+        pool.shutdown(wait=True, cancel_futures=True)
+        for future, i in futures.items():
+            if i in results or not future.done():
+                continue
+            try:
+                results[i] = future.result()
+            except KeyboardInterrupt:
+                pass
+            except Exception as exc:
+                results[i] = _blocked_worker_result(cases[i], exc)
+        raise
+    return results
+
+
 def _run_replay_locked(args, deps):
     """回放主流程（运行锁已持有）。返回退出码。"""
     only = None
@@ -3971,53 +4069,34 @@ def _run_replay_locked(args, deps):
               "cleanup": {"kept": False, "deleted": [], "failed": [],
                           "exemptions": []}}
     runner_error = False
-    processed = 0
+
+    def _worker(case):
+        return _run_case_with_retries(
+            case, run_id=run_id, args=args, deps=deps, driver=driver,
+            recorder=recorder, judge=judge)
+
+    results = {}
     try:
-        for case in cases:
-            # 用例级重试：失败后最多重试 args.max_retries 次，任一尝试 PASS
-            # 即判通过。重试用派生 run_id（{run_id}-r{N}），会话 ID/CLI 入口
-            # 键/任务幂等键随尝试天然隔离；每次失败尝试的产物在下次尝试前
-            # 按 manifest 清理。最终报告取通过尝试（全失败取最后一次）。
-            max_attempts = 1 + args.max_retries
-            attempts = []
-            case_result = None
-            case_runner_error = False
-            for attempt in range(1, max_attempts + 1):
-                attempt_run_id = run_id if attempt == 1 \
-                    else f"{run_id}-r{attempt}"
-                try:
-                    case_result, case_runner_error = _run_case(
-                        case, run_id=attempt_run_id,
-                        dataset_dir=args.dataset_dir, driver=driver,
-                        deps=deps, recorder=recorder, judge=judge)
-                except Exception as exc:  # 编排自身缺陷不吞掉：记 runner_error 并继续
-                    case_result = _blocked_case_result(
-                        case, f"runner_error: {type(exc).__name__}: "
-                              f"{_truncate(str(exc), 300)}")
-                    case_runner_error = True
-                attempts.append({"attempt": attempt,
-                                 "verdict": case_result["verdict"],
-                                 "reason": case_result.get("reason", "")})
-                if case_result["verdict"] == "PASS" \
-                        or attempt == max_attempts:
-                    break
-                print(f"RETRY {case.id} 第 {attempt + 1}/{max_attempts} "
-                      f"次尝试（上次失败: "
-                      f"{_truncate(case_result.get('reason') or '', 120)}）",
-                      file=sys.stderr)
-                _cleanup_failed_attempt(case, driver=driver, deps=deps,
-                                        recorder=recorder)
-            case_result["attempts"] = attempts
-            case_result["attempt_count"] = len(attempts)
-            runner_error = runner_error or case_runner_error
-            report["cases"].append(case_result)
-            processed += 1
+        if args.parallel > 1 and len(cases) > 1:
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=args.parallel,
+                    thread_name_prefix="e2e-case") as pool:
+                results = _run_cases_parallel(pool, cases, _worker)
+        else:
+            for i, case in enumerate(cases):
+                results[i] = _worker(case)
     except KeyboardInterrupt:
         runner_error = True
-    # 中断/异常路径：所有已选用例都必须有 verdict。
-    for case in cases[processed:]:
-        report["cases"].append(
-            _blocked_case_result(case, "runner_error: 运行中断，用例未执行"))
+    # 中断/异常路径：所有已选用例都必须有 verdict，顺序与数据集一致。
+    for i, case in enumerate(cases):
+        entry = results.get(i)
+        if entry is None:
+            report["cases"].append(
+                _blocked_case_result(case, "runner_error: 运行中断，用例未执行"))
+            continue
+        case_result, case_runner_error = entry
+        runner_error = runner_error or case_runner_error
+        report["cases"].append(case_result)
     report["summary"]["passed"] = sum(
         1 for c in report["cases"] if c["verdict"] == "PASS")
     report["summary"]["failed"] = report["summary"]["total"] \

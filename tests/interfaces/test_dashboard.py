@@ -744,6 +744,41 @@ def test_chat_session_delete_returns_404_when_missing(tmp_path):
     assert response.json()["error"]["code"] == "session_not_found"
 
 
+def test_chat_session_delete_returns_409_when_task_running(tmp_path):
+    from app.domain.task import TaskStateError
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+
+    asyncio.run(store.create_session(ConversationSession(id="s-busy")))
+    session_service = SessionService(store)
+
+    async def _blocking_handler(session_id):
+        raise TaskStateError(
+            f"cannot delete RUNNING task t_1; terminate first"
+        )
+
+    session_service.add_session_deleting_handler(_blocking_handler)
+    app = FastAPI()
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(create_dashboard_router(
+        session_service,
+        ToolService(_StubExecutor(), builtin_tool_definitions()),
+        ModelService(_StubProvider(), "real-1"),
+        _default_health,
+        memory_store=store,
+    ))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.delete("/chat/sessions/s-busy")
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "session_delete_conflict"
+    assert "t_1" in response.json()["error"]["message"]
+    # Session must survive the blocked delete so the caller can retry.
+    assert client.get("/chat/sessions/s-busy").json()["session"] is not None
+
+
 # ---------------------------------------------------------------------------
 # S6: Dashboard /chat/completions route tests
 # ---------------------------------------------------------------------------

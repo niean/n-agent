@@ -17,7 +17,7 @@ SECRET_NAMES=(
 
 usage() {
   cat >&2 <<'EOF'
-usage: tests/e2e/conversations.sh [--base-url URL] [--only id1,id2] [--keep] [--max-retries N]
+usage: tests/e2e/conversations.sh [--base-url URL] [--only id1,id2] [--keep] [--max-retries N] [--parallel N]
        tests/e2e/conversations.sh --cleanup-only <宿主 manifest 路径>
 EOF
 }
@@ -52,6 +52,8 @@ SEEN_KEEP=0
 SEEN_CLEANUP=0
 SEEN_MAX_RETRIES=0
 MAX_RETRIES_VALUE=""
+SEEN_PARALLEL=0
+PARALLEL_VALUE=""
 MANIFEST_HOST=""
 
 while [ "$#" -gt 0 ]; do
@@ -70,6 +72,13 @@ while [ "$#" -gt 0 ]; do
         ''|*[!0-9]*) echo "conversations.sh: --max-retries 必须为非负整数" >&2; exit 2 ;;
       esac
       MAX_RETRIES_VALUE="$2"; SEEN_MAX_RETRIES=1; shift 2 ;;
+    --parallel)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      case "$2" in
+        ''|*[!0-9]*) echo "conversations.sh: --parallel 必须为正整数" >&2; exit 2 ;;
+      esac
+      [ "$2" -ge 1 ] || { echo "conversations.sh: --parallel 必须为正整数" >&2; exit 2; }
+      PARALLEL_VALUE="$2"; SEEN_PARALLEL=1; shift 2 ;;
     --cleanup-only)
       [ "$#" -ge 2 ] || { usage; exit 2; }
       MODE="cleanup"; MANIFEST_HOST="$2"; SEEN_CLEANUP=1; shift 2 ;;
@@ -78,8 +87,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$SEEN_CLEANUP" -eq 1 ] && { [ "$SEEN_ONLY" -eq 1 ] || [ "$SEEN_KEEP" -eq 1 ] || [ "$SEEN_BASE_URL" -eq 1 ] || [ "$SEEN_MAX_RETRIES" -eq 1 ]; }; then
-  echo "conversations.sh: --cleanup-only 与 --base-url/--only/--keep/--max-retries 互斥" >&2
+if [ "$SEEN_CLEANUP" -eq 1 ] && { [ "$SEEN_ONLY" -eq 1 ] || [ "$SEEN_KEEP" -eq 1 ] || [ "$SEEN_BASE_URL" -eq 1 ] || [ "$SEEN_MAX_RETRIES" -eq 1 ] || [ "$SEEN_PARALLEL" -eq 1 ]; }; then
+  echo "conversations.sh: --cleanup-only 与 --base-url/--only/--keep/--max-retries/--parallel 互斥" >&2
   exit 2
 fi
 
@@ -203,6 +212,7 @@ if [ "$MODE" = "replay" ]; then
   [ "$SEEN_ONLY" -eq 1 ] && RUNNER_ARGS+=(--only "$ONLY_VALUE")
   [ "$SEEN_KEEP" -eq 1 ] && RUNNER_ARGS+=(--keep)
   [ "$SEEN_MAX_RETRIES" -eq 1 ] && RUNNER_ARGS+=(--max-retries "$MAX_RETRIES_VALUE")
+  [ "$SEEN_PARALLEL" -eq 1 ] && RUNNER_ARGS+=(--parallel "$PARALLEL_VALUE")
 else
   RUNNER_ARGS=(--cleanup-only "$CONTAINER_MANIFEST")
 fi

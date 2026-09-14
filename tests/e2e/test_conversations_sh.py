@@ -386,6 +386,34 @@ class TestShellArguments:
         assert result.returncode == 2
         assert sandbox.exec_records() == []
 
+    def test_replay_forwards_parallel(self, sandbox, tmp_path):
+        repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
+
+        result = sandbox.run(repo, ["--parallel", "3"],
+                             inspect_file=inspect_file, checks=checks)
+
+        assert result.returncode == 0, result.stderr
+        argv = sandbox.runner_execs()[0]["argv"]
+        assert argv[-2:] == ["--parallel", "3"]
+
+    def test_parallel_non_numeric_exit_2(self, sandbox, tmp_path):
+        repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
+
+        result = sandbox.run(repo, ["--parallel", "abc"],
+                             inspect_file=inspect_file, checks=checks)
+
+        assert result.returncode == 2
+        assert sandbox.exec_records() == []
+
+    def test_parallel_zero_exit_2(self, sandbox, tmp_path):
+        repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
+
+        result = sandbox.run(repo, ["--parallel", "0"],
+                             inspect_file=inspect_file, checks=checks)
+
+        assert result.returncode == 2
+        assert sandbox.exec_records() == []
+
     def test_cleanup_only_missing_value_exit_2(self, sandbox, tmp_path):
         repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
 
@@ -397,7 +425,8 @@ class TestShellArguments:
 
     @pytest.mark.parametrize("extra", [["--only", "a"], ["--keep"],
                                        ["--base-url", "http://x:1"],
-                                       ["--max-retries", "1"]])
+                                       ["--max-retries", "1"],
+                                       ["--parallel", "2"]])
     def test_cleanup_only_conflicts_exit_2(self, sandbox, tmp_path, extra):
         repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
         manifest = repo / "locals" / "e2e-reports" / "run-1" / "manifest.json"

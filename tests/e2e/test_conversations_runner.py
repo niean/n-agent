@@ -4,6 +4,8 @@ from __future__ import annotations
 import importlib.util
 import sys
 import json
+import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -3692,6 +3694,27 @@ class TestOrchestrationArgs:
                                "--max-retries", "1"])
         assert ei.value.code == 2
 
+    def test_parallel_default_three(self):
+        args = cr.parse_cli_args(["--dataset-dir", "d", "--report-dir", "r"])
+        assert args.parallel == 3
+
+    def test_parallel_zero_exit_two(self):
+        with pytest.raises(SystemExit) as ei:
+            cr.parse_cli_args(["--dataset-dir", "d", "--report-dir", "r",
+                               "--parallel", "0"])
+        assert ei.value.code == 2
+
+    def test_parallel_negative_exit_two(self):
+        with pytest.raises(SystemExit) as ei:
+            cr.parse_cli_args(["--dataset-dir", "d", "--report-dir", "r",
+                               "--parallel", "-2"])
+        assert ei.value.code == 2
+
+    def test_cleanup_only_mutex_parallel(self):
+        with pytest.raises(SystemExit) as ei:
+            cr.parse_cli_args(["--cleanup-only", "m.json", "--parallel", "2"])
+        assert ei.value.code == 2
+
 
 class TestOrchestrationReplay:
     def test_all_pass_exit_zero_and_report(self, tmp_path, capsys):
@@ -3991,9 +4014,10 @@ class TestOrchestrationBlocked:
         driver = _FakeOrchDriver(
             send_outcomes=["r1", cr.ReplayError("boom"), "r3"])
         deps = _orch_deps(tmp_path, driver=driver)
-        # 关闭重试：本用例聚焦单次尝试内的阻断语义。
+        # 关闭重试与并行：本用例聚焦单次尝试内按脚本顺序的阻断语义。
         code = cr.main(["--dataset-dir", str(ds), "--report-dir",
-                        str(tmp_path / "reports"), "--max-retries", "0"],
+                        str(tmp_path / "reports"), "--max-retries", "0",
+                        "--parallel", "1"],
                        deps=deps)
         assert code == 1
         report = _run_report(tmp_path, tmp_path / "reports")
@@ -4002,6 +4026,94 @@ class TestOrchestrationBlocked:
         assert [m["verdict"] for m in c1["messages"]] == ["PASS", "FAIL", "FAIL"]
         assert c1["messages"][1]["reason"].startswith("replay_error: boom")
         assert c1["messages"][2]["reason"] == "blocked_by_previous_failure"
+        assert c2["verdict"] == "PASS"
+
+
+class TestOrchestrationParallel:
+    def test_cases_run_concurrently_by_default(self, tmp_path):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _write_case(ds, "a.json")
+        _write_case(ds, "b.json", id="c2", title="t2",
+                    source_session_id="dashboard-bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee")
+        barrier = threading.Barrier(2)
+
+        class _RendezvousDriver(_FakeOrchDriver):
+            def send(self, session_id, content, image_data_url=None,
+                     options=None):
+                self.calls.append(("send", session_id, content))
+                # 两个用例的 send 必须在并行窗口内会合；串行执行时 barrier
+                # 超时抛 BrokenBarrierError，测试随之失败。
+                barrier.wait(timeout=30)
+                return "resp"
+
+        driver = _RendezvousDriver()
+        deps = _orch_deps(tmp_path, driver=driver)
+        # 不传 --parallel：默认并行度 3 即应并发执行两个用例。
+        code = cr.main(["--dataset-dir", str(ds), "--report-dir",
+                        str(tmp_path / "reports")], deps=deps)
+        assert code == 0
+        report = _run_report(tmp_path, tmp_path / "reports")
+        assert [c["verdict"] for c in report["cases"]] == ["PASS", "PASS"]
+        assert {r["id"] for r in _run_manifest(tmp_path, tmp_path / "reports")
+                ["resources"] if r["type"] == "session"} == {
+            "e2e-testrun1-c1", "e2e-testrun1-c2"}
+
+    def test_report_order_matches_dataset_under_parallel(self, tmp_path):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        for letter, name in (("a", "a.json"), ("b", "b.json"), ("c", "c.json")):
+            _write_case(ds, name, id=f"c{letter}", title=f"t{letter}",
+                        source_session_id=f"dashboard-{letter * 8}-bbbb-cccc-"
+                                          "dddd-eeeeeeeeeeee")
+
+        class _SlowFirstDriver(_FakeOrchDriver):
+            def send(self, session_id, content, image_data_url=None,
+                     options=None):
+                self.calls.append(("send", session_id, content))
+                # ca 最后完成：完成顺序与数据集顺序相反，报告仍须按数据集
+                # 顺序输出。
+                if session_id.endswith("-ca"):
+                    time.sleep(0.5)
+                return "resp"
+
+        driver = _SlowFirstDriver()
+        deps = _orch_deps(tmp_path, driver=driver)
+        code = cr.main(["--dataset-dir", str(ds), "--report-dir",
+                        str(tmp_path / "reports"), "--parallel", "2"],
+                       deps=deps)
+        assert code == 0
+        report = _run_report(tmp_path, tmp_path / "reports")
+        assert [c["id"] for c in report["cases"]] == ["ca", "cb", "cc"]
+        assert [c["verdict"] for c in report["cases"]] == ["PASS"] * 3
+
+    def test_parallel_failure_does_not_block_other_cases(self, tmp_path):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _write_case(ds, "a.json")
+        _write_case(ds, "b.json", id="c2", title="t2",
+                    source_session_id="dashboard-bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+        class _FailOneDriver(_FakeOrchDriver):
+            def send(self, session_id, content, image_data_url=None,
+                     options=None):
+                self.calls.append(("send", session_id, content))
+                if session_id.endswith("-c1"):
+                    raise cr.ReplayError("boom")
+                return "resp"
+
+        driver = _FailOneDriver()
+        deps = _orch_deps(tmp_path, driver=driver)
+        code = cr.main(["--dataset-dir", str(ds), "--report-dir",
+                        str(tmp_path / "reports"), "--max-retries", "0",
+                        "--parallel", "2"],
+                       deps=deps)
+        assert code == 1
+        report = _run_report(tmp_path, tmp_path / "reports")
+        assert report["summary"] == {"total": 2, "passed": 1, "failed": 1}
+        c1, c2 = report["cases"]
+        assert c1["verdict"] == "FAIL"
+        assert c1["messages"][0]["reason"].startswith("replay_error: boom")
         assert c2["verdict"] == "PASS"
 
 
@@ -4215,8 +4327,10 @@ class TestOrchestrationInterrupt:
             send_outcomes=["r1", KeyboardInterrupt("ctrl-c")])
         cleaner = _FakeCleaner()
         deps = _orch_deps(tmp_path, driver=driver, cleaner=cleaner)
+        # 串行执行：中断时机按脚本顺序确定（并行下中断落点不确定）。
         code = cr.main(["--dataset-dir", str(ds), "--report-dir",
-                        str(tmp_path / "reports")], deps=deps)
+                        str(tmp_path / "reports"), "--parallel", "1"],
+                       deps=deps)
         assert code == 2
         # 中断后清理仍尝试恰好一次。
         assert len(cleaner.calls) == 1
@@ -4254,9 +4368,11 @@ class TestOrchestrationInterrupt:
 
         driver = _BoomDriver()
         deps = _orch_deps(tmp_path, driver=driver)
-        # 关闭重试：本用例聚焦 runner_error 记账语义（重试会掩盖单次缺陷）。
+        # 关闭重试与并行：本用例聚焦 runner_error 记账语义（重试会掩盖单次
+        # 缺陷，并行下首次 boomed 落点不确定）。
         code = cr.main(["--dataset-dir", str(ds), "--report-dir",
-                        str(tmp_path / "reports"), "--max-retries", "0"],
+                        str(tmp_path / "reports"), "--max-retries", "0",
+                        "--parallel", "1"],
                        deps=deps)
         assert code == 2
         report = _run_report(tmp_path, tmp_path / "reports")
