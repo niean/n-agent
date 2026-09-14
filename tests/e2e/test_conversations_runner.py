@@ -3538,16 +3538,21 @@ class _FakeOrchDriver:
 
 
 class _FakeJudge:
-    def __init__(self, order=None, passed=True, reason="ok"):
+    def __init__(self, order=None, passed=True, reason="ok", outcomes=None):
         self.calls = []
         self._order = order
         self._passed = passed
         self._reason = reason
+        # 脚本化判定序列：[(passed, reason), ...]，耗尽后回落默认 verdict。
+        self._outcomes = list(outcomes or [])
 
     def judge(self, **kwargs):
         self.calls.append(kwargs)
         if self._order is not None:
             self._order.append("judge")
+        if self._outcomes:
+            passed, reason = self._outcomes.pop(0)
+            return cr.JudgeVerdict(passed, reason)
         return cr.JudgeVerdict(self._passed, self._reason)
 
 
@@ -3670,6 +3675,22 @@ class TestOrchestrationArgs:
         args = cr.parse_cli_args(["--cleanup-only", "m.json"])
         assert args.cleanup_only == "m.json"
         assert args.base_url == "http://127.0.0.1:8201"
+
+    def test_max_retries_default_two(self):
+        args = cr.parse_cli_args(["--dataset-dir", "d", "--report-dir", "r"])
+        assert args.max_retries == 2
+
+    def test_max_retries_negative_exit_two(self):
+        with pytest.raises(SystemExit) as ei:
+            cr.parse_cli_args(["--dataset-dir", "d", "--report-dir", "r",
+                               "--max-retries", "-1"])
+        assert ei.value.code == 2
+
+    def test_cleanup_only_mutex_max_retries(self):
+        with pytest.raises(SystemExit) as ei:
+            cr.parse_cli_args(["--cleanup-only", "m.json",
+                               "--max-retries", "1"])
+        assert ei.value.code == 2
 
 
 class TestOrchestrationReplay:
@@ -3801,6 +3822,73 @@ class TestOrchestrationReplay:
         assert code == 2
 
 
+class TestOrchestrationRetry:
+    def test_second_attempt_pass_marks_case_passed(self, tmp_path, capsys):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _write_case(ds)
+        driver = _FakeOrchDriver()
+        cleaner = _FakeCleaner()
+        # 首次判定 FAIL，第 2 次起回落默认 PASS。
+        judge = _FakeJudge(outcomes=[(False, "rubric 不满足")])
+        deps = _orch_deps(tmp_path, driver=driver, judge=judge, cleaner=cleaner)
+        code = cr.main(["--dataset-dir", str(ds), "--report-dir",
+                        str(tmp_path / "reports")], deps=deps)
+        assert code == 0
+        assert "RETRY c1 第 2/3 次尝试" in capsys.readouterr().err
+        report = _run_report(tmp_path, tmp_path / "reports")
+        assert report["summary"] == {"total": 1, "passed": 1, "failed": 0}
+        case = report["cases"][0]
+        assert case["verdict"] == "PASS"
+        assert case["attempt_count"] == 2
+        assert [a["verdict"] for a in case["attempts"]] == ["FAIL", "PASS"]
+        assert case["attempts"][0]["reason"] == "rubric 不满足"
+        # 重试会话 ID 按派生 run_id 隔离。
+        sids = [c[1] for c in driver.calls if c[0] == "create_session"]
+        assert sids == ["e2e-testrun1-c1", "e2e-testrun1-r2-c1"]
+        # 重试前按 manifest 清理失败尝试产物；运行末统一清理全部会话。
+        assert cleaner.calls[0]["resources"][0]["id"] == "e2e-testrun1-c1"
+        final_sids = {r["id"] for r in cleaner.calls[-1]["resources"]
+                      if r["type"] == "session"}
+        assert final_sids == {"e2e-testrun1-c1", "e2e-testrun1-r2-c1"}
+
+    def test_default_two_retries_exhausted_exit_one(self, tmp_path, capsys):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _write_case(ds)
+        driver = _FakeOrchDriver()
+        judge = _FakeJudge(passed=False, reason="始终失败")
+        deps = _orch_deps(tmp_path, driver=driver, judge=judge)
+        code = cr.main(["--dataset-dir", str(ds), "--report-dir",
+                        str(tmp_path / "reports")], deps=deps)
+        assert code == 1
+        report = _run_report(tmp_path, tmp_path / "reports")
+        case = report["cases"][0]
+        assert case["verdict"] == "FAIL"
+        assert case["reason"] == "始终失败"
+        assert case["attempt_count"] == 3
+        assert [a["attempt"] for a in case["attempts"]] == [1, 2, 3]
+        sids = [c[1] for c in driver.calls if c[0] == "create_session"]
+        assert sids == ["e2e-testrun1-c1", "e2e-testrun1-r2-c1",
+                        "e2e-testrun1-r3-c1"]
+        assert len(judge.calls) == 3
+
+    def test_max_retries_zero_disables_retry(self, tmp_path):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _write_case(ds)
+        driver = _FakeOrchDriver()
+        judge = _FakeJudge(passed=False, reason="rubric 不满足")
+        deps = _orch_deps(tmp_path, driver=driver, judge=judge)
+        code = cr.main(["--dataset-dir", str(ds), "--report-dir",
+                        str(tmp_path / "reports"), "--max-retries", "0"],
+                       deps=deps)
+        assert code == 1
+        report = _run_report(tmp_path, tmp_path / "reports")
+        assert report["cases"][0]["attempt_count"] == 1
+        assert len(judge.calls) == 1
+
+
 class TestOrchestrationWorkspacePrecheck:
     def _task_case(self, **over):
         msg = {"id": "m1", "content": "", "replay_via": "task_api",
@@ -3903,8 +3991,10 @@ class TestOrchestrationBlocked:
         driver = _FakeOrchDriver(
             send_outcomes=["r1", cr.ReplayError("boom"), "r3"])
         deps = _orch_deps(tmp_path, driver=driver)
+        # 关闭重试：本用例聚焦单次尝试内的阻断语义。
         code = cr.main(["--dataset-dir", str(ds), "--report-dir",
-                        str(tmp_path / "reports")], deps=deps)
+                        str(tmp_path / "reports"), "--max-retries", "0"],
+                       deps=deps)
         assert code == 1
         report = _run_report(tmp_path, tmp_path / "reports")
         assert report["summary"] == {"total": 2, "passed": 1, "failed": 1}
@@ -4164,8 +4254,10 @@ class TestOrchestrationInterrupt:
 
         driver = _BoomDriver()
         deps = _orch_deps(tmp_path, driver=driver)
+        # 关闭重试：本用例聚焦 runner_error 记账语义（重试会掩盖单次缺陷）。
         code = cr.main(["--dataset-dir", str(ds), "--report-dir",
-                        str(tmp_path / "reports")], deps=deps)
+                        str(tmp_path / "reports"), "--max-retries", "0"],
+                       deps=deps)
         assert code == 2
         report = _run_report(tmp_path, tmp_path / "reports")
         c1, c2 = report["cases"]
@@ -4237,8 +4329,10 @@ class TestOrchestrationAcp:
         acp = _FakeAcp()
         deps = _orch_deps(tmp_path, driver=_FakeOrchDriver(), acp=acp)
         deps.preflight_fn = lambda case, ctx: ["browser 守护不可用"]
+        # 关闭重试：本用例聚焦单次尝试预检失败的 acp 关闭语义。
         code = cr.main(["--dataset-dir", str(ds), "--report-dir",
-                        str(tmp_path / "reports")], deps=deps)
+                        str(tmp_path / "reports"), "--max-retries", "0"],
+                       deps=deps)
         assert code == 1
         report = _run_report(tmp_path, tmp_path / "reports")
         assert report["cases"][0]["reason"].startswith(
@@ -4259,8 +4353,10 @@ class TestOrchestrationAcp:
         (ws / "out.txt").write_text("existing", encoding="utf-8")
         acp = _FakeAcp()
         deps = _orch_deps(tmp_path, driver=_FakeOrchDriver(), acp=acp)
+        # 关闭重试：本用例聚焦单次尝试前置检查失败的 acp 关闭语义。
         code = cr.main(["--dataset-dir", str(ds), "--report-dir",
-                        str(tmp_path / "reports")], deps=deps)
+                        str(tmp_path / "reports"), "--max-retries", "0"],
+                       deps=deps)
         assert code == 1
         report = _run_report(tmp_path, tmp_path / "reports")
         assert report["cases"][0]["reason"].startswith(

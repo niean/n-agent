@@ -3214,15 +3214,24 @@ def parse_cli_args(argv):
     parser.add_argument("--only", default=None, help="逗号分隔用例 id（默认全部）")
     parser.add_argument("--keep", action="store_true",
                         help="回放后保留测试数据，不自动清理")
+    parser.add_argument("--max-retries", type=int, default=None,
+                        help="用例失败后最大重试次数（默认 2；任一尝试通过"
+                             "即判该用例通过；0 表示不重试）")
     parser.add_argument("--cleanup-only", metavar="MANIFEST", default=None,
                         help="独立一键清理模式：只按清单清理，不回放")
     args = parser.parse_args(argv)
+    if args.max_retries is not None and args.max_retries < 0:
+        parser.error("--max-retries 必须为非负整数")
     if args.cleanup_only:
-        if args.only is not None or args.keep or args.dataset_dir is not None:
-            parser.error("--cleanup-only 与 --only/--keep/--dataset-dir 互斥")
+        if args.only is not None or args.keep or args.dataset_dir is not None \
+                or args.max_retries is not None:
+            parser.error("--cleanup-only 与 --only/--keep/--dataset-dir/"
+                         "--max-retries 互斥")
     else:
         if not args.dataset_dir or not args.report_dir:
             parser.error("回放模式必须提供 --dataset-dir 与 --report-dir")
+    if args.max_retries is None:
+        args.max_retries = 2
     return args
 
 
@@ -3572,7 +3581,7 @@ def _blocked_case_result(case, reason):
             "messages": [{"id": m.id, "verdict": "FAIL",
                           "reason": "blocked_by_previous_failure",
                           "tools_actual": []} for m in case.messages],
-            "side_effects": []}
+            "side_effects": [], "attempts": [], "attempt_count": 0}
 
 
 def _run_case(case, *, run_id, dataset_dir, driver, deps, recorder, judge):
@@ -3897,6 +3906,35 @@ def _write_report(report_path, report, secrets_):
     atomic_write_json(report_path, _scrub_secrets(report, secrets_))
 
 
+def _cleanup_failed_attempt(case, *, driver, deps, recorder):
+    """重试前清理本用例已登记资源（manifest 仍是删除的唯一权威）。
+
+    失败尝试的产物（会话/任务/工作区文件/浏览器会话）不清理会阻断重试：
+    workspace_file 前置检查拒绝已存在路径、非终态任务可能继续写工作区。
+    清理失败不阻断重试——删不掉的工作区文件会让下一次尝试在
+    workspace_file_preexists 前置检查如实 FAIL，残留资源由运行结束的
+    统一清理兜底。
+    """
+    try:
+        resources = [r for r in recorder.snapshot().get("resources", [])
+                     if r.get("case_id") == case.id
+                     and r.get("status") != "deleted"]
+        if not resources:
+            return
+        cleaner = deps.cleaner_factory()
+        cleanup_ctx = _CaseCtx(
+            driver, deps.workspace_root, recorder,
+            deps.browser_helper_factory(driver, env=deps.environ))
+        result = cleaner.clean(resources, cleanup_ctx)
+        failed = result.get("failed", [])
+        if failed:
+            print(f"WARN 用例 {case.id} 重试前清理 {len(failed)} 项失败，"
+                  f"残留资源由运行末统一清理兜底", file=sys.stderr)
+    except Exception as exc:
+        print(f"WARN 用例 {case.id} 重试前清理异常: {type(exc).__name__}: "
+              f"{_truncate(str(exc), 200)}", file=sys.stderr)
+
+
 def _run_replay_locked(args, deps):
     """回放主流程（运行锁已持有）。返回退出码。"""
     only = None
@@ -3936,15 +3974,41 @@ def _run_replay_locked(args, deps):
     processed = 0
     try:
         for case in cases:
-            try:
-                case_result, case_runner_error = _run_case(
-                    case, run_id=run_id, dataset_dir=args.dataset_dir,
-                    driver=driver, deps=deps, recorder=recorder, judge=judge)
-            except Exception as exc:  # 编排自身缺陷不吞掉：记 runner_error 并继续
-                case_result = _blocked_case_result(
-                    case, f"runner_error: {type(exc).__name__}: "
-                          f"{_truncate(str(exc), 300)}")
-                case_runner_error = True
+            # 用例级重试：失败后最多重试 args.max_retries 次，任一尝试 PASS
+            # 即判通过。重试用派生 run_id（{run_id}-r{N}），会话 ID/CLI 入口
+            # 键/任务幂等键随尝试天然隔离；每次失败尝试的产物在下次尝试前
+            # 按 manifest 清理。最终报告取通过尝试（全失败取最后一次）。
+            max_attempts = 1 + args.max_retries
+            attempts = []
+            case_result = None
+            case_runner_error = False
+            for attempt in range(1, max_attempts + 1):
+                attempt_run_id = run_id if attempt == 1 \
+                    else f"{run_id}-r{attempt}"
+                try:
+                    case_result, case_runner_error = _run_case(
+                        case, run_id=attempt_run_id,
+                        dataset_dir=args.dataset_dir, driver=driver,
+                        deps=deps, recorder=recorder, judge=judge)
+                except Exception as exc:  # 编排自身缺陷不吞掉：记 runner_error 并继续
+                    case_result = _blocked_case_result(
+                        case, f"runner_error: {type(exc).__name__}: "
+                              f"{_truncate(str(exc), 300)}")
+                    case_runner_error = True
+                attempts.append({"attempt": attempt,
+                                 "verdict": case_result["verdict"],
+                                 "reason": case_result.get("reason", "")})
+                if case_result["verdict"] == "PASS" \
+                        or attempt == max_attempts:
+                    break
+                print(f"RETRY {case.id} 第 {attempt + 1}/{max_attempts} "
+                      f"次尝试（上次失败: "
+                      f"{_truncate(case_result.get('reason') or '', 120)}）",
+                      file=sys.stderr)
+                _cleanup_failed_attempt(case, driver=driver, deps=deps,
+                                        recorder=recorder)
+            case_result["attempts"] = attempts
+            case_result["attempt_count"] = len(attempts)
             runner_error = runner_error or case_runner_error
             report["cases"].append(case_result)
             processed += 1

@@ -367,6 +367,25 @@ class TestShellArguments:
             "--keep",
         ]
 
+    def test_replay_forwards_max_retries(self, sandbox, tmp_path):
+        repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
+
+        result = sandbox.run(repo, ["--max-retries", "0"],
+                             inspect_file=inspect_file, checks=checks)
+
+        assert result.returncode == 0, result.stderr
+        argv = sandbox.runner_execs()[0]["argv"]
+        assert argv[-2:] == ["--max-retries", "0"]
+
+    def test_max_retries_non_numeric_exit_2(self, sandbox, tmp_path):
+        repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
+
+        result = sandbox.run(repo, ["--max-retries", "abc"],
+                             inspect_file=inspect_file, checks=checks)
+
+        assert result.returncode == 2
+        assert sandbox.exec_records() == []
+
     def test_cleanup_only_missing_value_exit_2(self, sandbox, tmp_path):
         repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
 
@@ -377,7 +396,8 @@ class TestShellArguments:
         assert sandbox.log_lines() == []
 
     @pytest.mark.parametrize("extra", [["--only", "a"], ["--keep"],
-                                       ["--base-url", "http://x:1"]])
+                                       ["--base-url", "http://x:1"],
+                                       ["--max-retries", "1"]])
     def test_cleanup_only_conflicts_exit_2(self, sandbox, tmp_path, extra):
         repo, inspect_file, checks, _ = self._ok_repo(sandbox, tmp_path)
         manifest = repo / "locals" / "e2e-reports" / "run-1" / "manifest.json"
