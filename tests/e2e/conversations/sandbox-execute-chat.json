@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "sandbox-execute-chat",
+  "title": "Sandbox执行chat",
+  "source_session_id": "dashboard-81a98a1c-86bb-4643-b235-af9ae6b1ab8d",
+  "channel": "dashboard",
+  "requires": ["sandbox"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "让 LLM 调 execute_code 的消息，打印'Hello Sandbox'",
+      "image_asset": null,
+      "expect": {
+        "rubric": "execute_code 沙盒执行成功，stdout 含 Hello Sandbox，响应报告执行结果",
+        "tools": ["execute_code"]
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session", "sandbox_history"]
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "multimodal-vision-chat",
+  "title": "Chat多模态交互",
+  "source_session_id": "dashboard-2886e243-4f9d-47a7-98a2-1a54172911a5",
+  "channel": "dashboard",
+  "requires": ["vision"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "识别图片中的内容",
+      "image_asset": "assets/chat-multimodal-1.png",
+      "expect": {
+        "rubric": "正确描述图片内容：简洁的 App/网页界面截图，含标题\"有什么我能帮你的吗？\"与\"对话/工作\"分段选择器（对话为选中态）",
+        "tools": []
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session"]
+}

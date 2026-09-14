@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "cli-weather-chat",
+  "title": "TUI对话交互",
+  "source_session_id": "cli-6d7f1ab0-e0f7-404e-9448-1941b26a239e",
+  "channel": "cli",
+  "requires": ["web"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "查一下 北京天气",
+      "expect": {
+        "rubric": "回答包含北京当前天气（气温、天气状况），数据来自实时抓取，且 CLI 入口正常输出",
+        "tools": ["web_fetch"]
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session"]
+}

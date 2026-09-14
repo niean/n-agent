@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "plugin-hello-chat",
+  "title": "Plugin调用chat",
+  "source_session_id": "dashboard-d1711513-7fcf-495a-a1c8-b65deaf2372c",
+  "channel": "dashboard",
+  "requires": ["plugin-hello"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "hello: name=NieAn",
+      "expect": {
+        "rubric": "调用 hello 插件工具，响应包含 Hello, NieAn!",
+        "tools": ["hello"]
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session"]
+}

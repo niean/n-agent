@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "task-artifact-cmd",
+  "title": "Task命令产出制品",
+  "source_session_id": "dashboard-7376b944-3869-4177-b82a-2ae5e662621a",
+  "channel": "dashboard",
+  "requires": ["task"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "",
+      "replay_via": "task_api",
+      "action_params": {
+        "title": "任务：产出制品",
+        "body": "在工作区创建 task-output-a.txt（内容为 artifact a）和 task-output-b.md（内容为 # artifact b）；完成时调用 task_complete，将这两个文件以 workspace: storage_ref 作为 artifacts 提交",
+        "goal_mode": true,
+        "priority": 2
+      },
+      "expect": {
+        "rubric": "任务创建成功；worker 在工作区创建两个文件且内容正确；task_complete 以 workspace: storage_ref 提交两个制品；任务终态 SUCCEEDED；制品工作台可查到两个制品",
+        "tools": []
+      }
+    }
+  ],
+  "side_effects": [
+    {"type": "task_terminal", "status": "succeeded", "timeout": 600},
+    {"type": "workspace_file", "path": "task-output-a.txt", "expected_content": "artifact a"},
+    {"type": "workspace_file", "path": "task-output-b.md", "expected_content": "# artifact b"},
+    {"type": "artifact_registered", "count": 2, "source_context_ref": "task_id", "storage_ref_prefix": "workspace:"}
+  ],
+  "cleanup": ["session", "task", "artifact", "workspace_file"]
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "id": "skill-weather-chat",
+  "title": "Skill调用天气",
+  "source_session_id": "dashboard-14f292ed-8bfd-412d-9025-2fa7cbdd7ed7",
+  "channel": "dashboard",
+  "requires": ["web"],
+  "options": {},
+  "messages": [
+    {
+      "id": "m1",
+      "content": "查询北京的天气",
+      "expect": {
+        "rubric": "回答包含北京当前天气（气温、天气状况），数据来自实时抓取",
+        "tools": ["web_fetch"]
+      }
+    }
+  ],
+  "side_effects": [],
+  "cleanup": ["session"]
+}
