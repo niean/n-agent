@@ -32,8 +32,8 @@ Terminal intent detection (Manus-aligned):
     ``task_fail``) maps to ``TaskRunOutcome.ABORTED`` -> task FAILED（绕过断路器，
     不重试）。worker 判定无法继续、确定性快速失败时使用；取消（CANCELLED）只认用户
     指令，worker 不得触发取消语义。
-  If no intent event is found, the executor defaults to COMPLETED with the
-  final output as summary.
+  If no intent event is found for the current run, the executor returns FAILED.
+  A final chat reply alone is never proof of task completion.
 
 goal_mode:
   ``run_goal_loop`` runs multiple turns, each calling ``run()`` once. A
@@ -281,7 +281,18 @@ class TaskAgentExecutor:
             trusted_metadata["delegation_capability"] = cap.to_dict()
 
         messages = [
-            {"role": "user", "content": f"work task {task.id}"},
+            {"role": "user", "content": (
+                f"work task {task.id}\n\n"
+                "You are the Task worker executing this claimed task now. "
+                "Call task_show to read the task requirements and progress, then "
+                "perform the work yourself using the available tools. The running "
+                "status refers to your own active execution; do not wait for another "
+                "worker or finish with a status update. When the work is done, call "
+                "task_complete with the result and all requested artifacts (full "
+                "content or verified workspace: storage_ref). A chat reply alone "
+                "does not complete the task. If blocked on a user decision, call "
+                "task_propose_change; if the task cannot be completed, call task_fail."
+            )},
         ]
 
         request = ChatCompletionInput(
@@ -557,8 +568,7 @@ class TaskAgentExecutor:
         when the worker called task_propose_change), maps to WAITING_APPROVAL;
         the actual run finalization is performed by
         TaskRunService.finalize_propose (called inside the tool execution).
-        If no intent event is found, defaults to COMPLETED with the final
-        output as summary.
+        If no intent event is found for the current run, returns FAILED.
         """
         output = ""
         if isinstance(result.message, dict):
@@ -579,7 +589,14 @@ class TaskAgentExecutor:
             )
 
         # Read latest intent event
-        intent = await self._read_latest_intent(task.id, task_run_id)
+        try:
+            intent = await self._read_latest_intent(task.id, task_run_id)
+        except Exception:
+            return TaskAgentResult(
+                status=TaskRunOutcome.FAILED,
+                output=output,
+                error="task completion intent could not be verified",
+            )
         if intent is not None:
             kind = intent.get("kind")
             if kind == "change_proposed":
@@ -622,8 +639,8 @@ class TaskAgentExecutor:
         # finish_reason "length" = BUDGET_EXHAUSTED or ITERATION_LIMIT (worker hit a
         # limit without completing) -> FAILED, not COMPLETED (otherwise a budget-exhausted
         # run is misclassified as SUCCEEDED, causing 看板/Chat 最终结果不一致).
-        # finish_reason "stop" = worker gave a final answer -> COMPLETED with output as
-        # summary (existing behavior).
+        # Even finish_reason "stop" only means the chat turn ended. A status
+        # report or an unsupported success claim must not finalize the task.
         if result.finish_reason == "length":
             return TaskAgentResult(
                 status=TaskRunOutcome.FAILED,
@@ -631,9 +648,9 @@ class TaskAgentExecutor:
                 error=output or "run ended without task_complete (limit reached)",
             )
         return TaskAgentResult(
-            status=TaskRunOutcome.COMPLETED,
+            status=TaskRunOutcome.FAILED,
             output=output,
-            metadata={"summary": output[:500]} if output else {},
+            error="worker ended without task_complete or another terminal intent for this run",
         )
 
     async def _read_latest_intent(
@@ -649,20 +666,28 @@ class TaskAgentExecutor:
         distinguish complete_requested (-> COMPLETED) from change_proposed
         (-> WAITING_APPROVAL) from fail_requested (-> ABORTED).
         """
+        # list_events is ascending and paginated. Reading just the first page
+        # can miss completion or return an obsolete draft after a long run.
+        since = 0
+        latest = None
         try:
-            events = await self.task_registry.list_events(task_id, limit=50)
+            while True:
+                events = await self.task_registry.list_events(task_id, since=since, limit=50)
+                if not events:
+                    return latest
+                for event in events:
+                    if event.run_id != run_id or event.kind not in (
+                        "complete_requested", "change_proposed", "fail_requested",
+                    ):
+                        continue
+                    latest = {**event.payload, "kind": event.kind}
+                next_since = events[-1].id
+                if next_since <= since:
+                    raise RuntimeError("task event cursor did not advance")
+                since = next_since
         except Exception:
-            return None
-        # Search backwards for the latest intent event
-        for event in reversed(events):
-            if event.kind not in ("complete_requested", "change_proposed", "fail_requested"):
-                continue
-            if event.run_id is not None and event.run_id != run_id:
-                continue
-            payload = dict(event.payload)
-            payload["kind"] = event.kind
-            return payload
-        return None
+            logger.exception("task intent read failed: task=%s run=%s", task_id, run_id)
+            raise
 
     # ------------------------------------------------------------------
     # System prompt builder

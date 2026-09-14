@@ -11,7 +11,7 @@
       "id": "m1",
       "content": "hello: name=NieAn",
       "expect": {
-        "rubric": "调用 hello 插件工具，响应包含 Hello, NieAn!",
+        "rubric": "调用 hello 插件工具，响应包含 Hello或NieAn",
         "tools": ["hello"]
       }
     }

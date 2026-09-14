@@ -9,7 +9,7 @@
   "messages": [
     {
       "id": "m1",
-      "content": "用task 调研博客网站 https://blog.niean.name/，形成一份简洁的调研报告(500字以内)、以制品形式交付。",
+      "content": "用task 调研博客网站 https://blog.niean.name/，形成一份简洁的调研报告、以制品形式交付。",
       "expect": {
         "rubric": "创建任务并由 worker 调研该博客（web_fetch），任务终态 SUCCEEDED，以制品形式交付 500 字以内中文调研报告，会话出现任务生命周期消息",
         "tools": ["create_task"]

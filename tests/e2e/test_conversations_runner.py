@@ -3237,6 +3237,21 @@ class TestCleanup:
         assert ("POST", "/chat/tasks/t1/cancel", None) not in driver.calls
         assert driver.paths("DELETE") == ["/chat/tasks/t1"]
 
+    def test_expired_task_treated_terminal_not_recancelled(self):
+        # 服务 stale 回收终态为 expired（7 态机），清理不得再取消或误判不静止。
+        driver = _FakeCleanupDriver()
+        driver.get_raw_map["/chat/tasks/t1"] = [
+            (200, {"task": {"status": "expired"}}),
+            (404, None),
+        ]
+        driver.get_map["/chat/artifacts"] = {"items": [], "next_cursor": None}
+        res = [{"type": "task", "id": "t1", "case_id": "c",
+                "owner_session_id": "s1"}]
+        out = _cleaner().clean(res, _FakeCleanupCtx(driver))
+        assert out["failed"] == []
+        assert ("POST", "/chat/tasks/t1/cancel", None) not in driver.calls
+        assert driver.paths("DELETE") == ["/chat/tasks/t1"]
+
     def test_workspace_file_sha_mismatch_failed_and_untouched(self, tmp_path):
         target = tmp_path / "out.txt"
         target.write_text("tampered", encoding="utf-8")

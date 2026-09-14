@@ -1448,7 +1448,7 @@ def run_preflight(case, ctx):
 # - ctx.task_id：本用例解析出的唯一任务 ID（未解析为 None）；
 # - ctx.task_deadline：任务创建时计算的等待截止（重试不重置）。
 
-TERMINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled"}
+TERMINAL_TASK_STATUSES = {"succeeded", "failed", "cancelled", "expired"}
 
 # 单次 task show 子进程超时上限（deadline 剩余不足时取剩余）。
 _TASK_SHOW_TIMEOUT_CAP = 30.0

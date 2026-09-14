@@ -15,6 +15,7 @@ description: 代码实现
 
 ## Skills
 
+- superpowers/systematic-debugging
 - superpowers/executing-plans
 - superpowers/subagent-driven-development
 

@@ -7,7 +7,7 @@ Tests:
     (task_show / task_complete / task_heartbeat / task_comment /
      task_propose_change / task_cancel)
   - trusted_metadata.task carries claim context
-  - user prompt is "work task {task.id}"
+  - user prompt binds the Task worker role and requires explicit completion
   - Returns terminal intent (does NOT finalize run)
   - TASK_GUIDANCE contains task_propose_change guidance
   - goal_mode multi-turn until judge passes
@@ -72,7 +72,7 @@ class FakeTaskRegistry:
         return tuple(
             e for e in self._events
             if e.task_id == task_id and e.id > since
-        )[-limit:]
+        )[:limit]
 
     async def append_event(self, task_id, kind, payload, run_id=None):
         self.appended_events.append(
@@ -232,7 +232,12 @@ async def test_executor_user_prompt_is_work_task(executor, fake_chat):
     call = fake_chat.complete_calls[0]
     user_msg = call.messages[-1]
     assert user_msg["role"] == "user"
-    assert user_msg["content"] == "work task t_xyz"
+    prompt = user_msg["content"]
+    assert prompt.startswith("work task t_xyz\n")
+    assert "You are the Task worker" in prompt
+    assert "task_show" in prompt
+    assert "task_complete" in prompt
+    assert "artifacts" in prompt
 
 
 @pytest.mark.asyncio
@@ -244,7 +249,7 @@ async def test_executor_request_has_no_system_message(executor, fake_chat):
     call = fake_chat.complete_calls[0]
     roles = [m["role"] for m in call.messages]
     assert roles == ["user"]
-    assert call.messages[0]["content"] == "work task t_1"
+    assert call.messages[0]["content"].startswith("work task t_1\n")
 
 
 @pytest.mark.asyncio
@@ -336,12 +341,68 @@ async def test_executor_propose_change_returns_waiting_approval(executor, fake_r
 
 
 @pytest.mark.asyncio
-async def test_executor_no_intent_defaults_completed(executor, fake_registry):
-    """If no intent event is found, default to COMPLETED."""
+@pytest.mark.parametrize("output", ["worker 正在调研，完成后会通知", "task done", ""])
+async def test_executor_no_intent_returns_failed(executor, fake_chat, fake_registry, output):
+    """A status reply or a claim of success is not an accepted completion."""
     fake_registry._events = []
+    fake_chat.set_result(ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": output}, finish_reason="stop",
+    ))
     task = _task()
     result = await executor.run(task, task_run_id=1, claim_lock="L1")
+    assert result.status == TaskRunOutcome.FAILED
+    assert result.output == output
+    assert "task_complete" in result.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_run_id", [None, 2])
+async def test_executor_ignores_completion_outside_current_run(
+    executor, fake_registry, event_run_id,
+):
+    fake_registry._events = [TaskEvent(
+        id=1, task_id="t_1", kind="complete_requested",
+        payload={"outcome": "completed", "summary": "old result"},
+        run_id=event_run_id, created_at=datetime.now(timezone.utc),
+    )]
+    result = await executor.run(_task(), task_run_id=1, claim_lock="L1")
+    assert result.status == TaskRunOutcome.FAILED
+
+
+@pytest.mark.asyncio
+async def test_executor_reads_latest_intent_beyond_first_event_page(executor, fake_registry):
+    """The registry pages in ascending id order; old completion must not win."""
+    fake_registry._events = [TaskEvent(
+        id=i, task_id="t_1", kind="comment_added", payload={}, run_id=1,
+        created_at=datetime.now(timezone.utc),
+    ) for i in range(1, 121)]
+    fake_registry._events[0] = TaskEvent(
+        id=1, task_id="t_1", kind="complete_requested",
+        payload={"outcome": "completed", "summary": "first draft"}, run_id=1,
+        created_at=datetime.now(timezone.utc),
+    )
+    fake_registry._events.append(TaskEvent(
+        id=121, task_id="t_1", kind="complete_requested",
+        payload={"outcome": "completed", "summary": "final report",
+                 "artifacts": [{"name": "report.md", "content": "verified report"}]},
+        run_id=1, created_at=datetime.now(timezone.utc),
+    ))
+    result = await executor.run(_task(), task_run_id=1, claim_lock="L1")
     assert result.status == TaskRunOutcome.COMPLETED
+    assert result.output == "final report"
+    assert result.artifacts == ({"name": "report.md", "content": "verified report"},)
+
+
+@pytest.mark.asyncio
+async def test_executor_intent_read_failure_cannot_succeed(executor, fake_registry):
+    async def fail(*args, **kwargs):
+        raise RuntimeError("registry unavailable")
+
+    fake_registry.list_events = fail
+    result = await executor.run(_task(), task_run_id=1, claim_lock="L1")
+    assert result.status == TaskRunOutcome.FAILED
+    assert result.error == "task completion intent could not be verified"
 
 
 @pytest.mark.asyncio
@@ -492,6 +553,15 @@ async def test_executor_default_grant_layers_with_explicit_allowed_tools(executo
 # ---------------------------------------------------------------------------
 
 
+def _completed_registry():
+    """Goal judge scenarios start with a completion accepted by task_complete."""
+    return FakeTaskRegistry([TaskEvent(
+        id=1, task_id="t_1", kind="complete_requested",
+        payload={"outcome": "completed", "summary": "did work", "artifacts": []},
+        run_id=1, created_at=datetime.now(timezone.utc),
+    )])
+
+
 class FakeJudgeChatService:
     """Chat service that returns different results for worker vs judge calls."""
 
@@ -545,7 +615,7 @@ async def test_goal_mode_multi_turn_until_judge_passes():
 
     chat = SeqChat()
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=5)
@@ -567,7 +637,7 @@ async def test_goal_mode_max_turns_fails():
 
     chat = FakeJudgeChatService(worker_result, judge_text)
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=1)
@@ -619,7 +689,7 @@ async def test_goal_mode_early_exit_on_consecutive_rejections():
     judge_text = '{"achieved": false, "reason": "incomplete"}'
     chat = FakeJudgeChatService(worker_result, judge_text)
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=10)  # 远大于早退阈值
@@ -642,7 +712,7 @@ async def test_goal_mode_records_judge_feedback():
     )
     judge_text = '{"achieved": false, "reason": "缺 Q3 数据"}'
     chat = FakeJudgeChatService(worker_result, judge_text)
-    registry = FakeTaskRegistry()
+    registry = _completed_registry()
     executor = TaskAgentExecutor(
         chat_service=chat, task_registry=registry,
         prompt_builder=FakePromptBuilder(),
@@ -666,7 +736,7 @@ async def test_goal_mode_invalid_judge_json_is_retryable_failure():
 
     chat = FakeJudgeChatService(worker_result, judge_text)
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=5)
@@ -686,7 +756,7 @@ async def test_judge_has_no_write_tools():
 
     chat = FakeJudgeChatService(worker_result, judge_text)
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=3)
@@ -727,7 +797,7 @@ async def test_judge_fork_sets_persist_messages_false():
 
     chat = FakeJudgeChatService(worker_result, judge_text)
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=3)
@@ -744,7 +814,7 @@ async def test_worker_run_keeps_persist_messages_default_true():
     """worker 路径 persist_messages 保持默认 True（worker 消息仍持久化到会话）。"""
     chat = FakeChatService()
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     await executor.run(_task(), task_run_id=1, claim_lock="L1")
@@ -767,7 +837,7 @@ async def test_goal_mode_judge_json_in_code_block():
 
     chat = FakeJudgeChatService(worker_result, judge_text)
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=3)
@@ -785,7 +855,7 @@ async def test_goal_mode_turn_terminal_returns_immediately():
     )
     chat = FakeChatService(worker_result)
     executor = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     task = _task(goal_mode=True, goal_max_turns=5)
@@ -841,7 +911,7 @@ async def test_judge_does_not_grant_user_task_tools():
     judge_text = '{"achieved": true, "reason": "done"}'
     chat = FakeJudgeChatService(worker_result, judge_text)
     ex = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     await ex.run_goal_loop(
@@ -927,7 +997,7 @@ async def test_judge_does_not_grant_user_approval_task_tools():
     judge_text = '{"achieved": true, "reason": "done"}'
     chat = FakeJudgeChatService(worker_result, judge_text)
     ex = TaskAgentExecutor(
-        chat_service=chat, task_registry=FakeTaskRegistry(),
+        chat_service=chat, task_registry=_completed_registry(),
         prompt_builder=FakePromptBuilder(),
     )
     await ex.run_goal_loop(

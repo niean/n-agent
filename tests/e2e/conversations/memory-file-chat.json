@@ -11,7 +11,7 @@
       "id": "m1",
       "content": "你好",
       "expect": {
-        "rubric": "首轮在文件记忆 profile file_1 下正常应答问候，无记忆加载报错；会话 external_memory_enabled 锁定为 [\"file_1\"]",
+        "rubric": "首轮在文件记忆 profile file_1 下正常应答问候，响应包含关键字`文件记忆1`，无记忆加载报错",
         "tools": []
       }
     }
