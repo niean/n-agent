@@ -928,6 +928,28 @@ class CliDriver:
         return proc.stdout
 
 
+def browse_cli_session_ids(conversation_id):
+    """只读回读 CLI Gateway 会话链接，返回匹配会话 ID 列表。
+
+    cleanup 恢复路径专用：进程在建会话后、真实 ID 落 manifest 前中断时，
+    用 intent 登记的 conversation_id 重新解析。只执行 --browse 读命令，
+    绝不调用会触发建会话的命令；输出非法抛 ReplayError，多个/零个 ID
+    原样返回，由调用方按规则收敛（拒绝猜测）。
+    """
+    out = CliDriver._run(["n-agent", "sessions", "--browse",
+                          "--conversation-id", conversation_id,
+                          "--no-interactive", "--json"])
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise ReplayError(
+            f"cli sessions --browse 输出不是 JSON: {exc}: {out[:200]!r}") from exc
+    if not isinstance(rows, list):
+        raise ReplayError(f"cli sessions --browse 输出非法: {out[:200]!r}")
+    return [r["session_id"] for r in rows
+            if isinstance(r, dict) and r.get("session_id")]
+
+
 class AcpRecordingClient:
     """回放用 ACP Client：session_update 收集 agent_message_chunk 文本；
     request_permission 一律拒绝并记 FAIL 证据；文件/terminal 等宿主能力
@@ -2256,7 +2278,9 @@ _MANIFEST_COMMON_KEYS = {
     "status", "status_detail", "verify", "intent_key",
 }
 _MANIFEST_RESOURCE_KEYS = {
-    "session": _MANIFEST_COMMON_KEYS | {"id"},
+    # conversation_id：cli 渠道 Gateway 入口键，intent 中断时供 cleanup
+    # 只读解析真实会话 ID（拒绝猜测，多个/零个按规则收敛）。
+    "session": _MANIFEST_COMMON_KEYS | {"id", "conversation_id"},
     "task": _MANIFEST_COMMON_KEYS | {"id"},
     "artifact": _MANIFEST_COMMON_KEYS | {"id"},
     # session_id 为 spec 示例中 browser_session 归属会话的兼容键。
@@ -2346,7 +2370,8 @@ def _validate_manifest_resource(res, index, workspace_root):
     if rtype == "artifact" and not res.get("task_id") \
             and not res.get("owner_session_id"):
         _fail_manifest(f"{what} 归属不明: 缺少 task_id/owner_session_id")
-    for opt in ("owner_session_id", "task_id", "intent_key", "session_id"):
+    for opt in ("owner_session_id", "task_id", "intent_key", "session_id",
+                "conversation_id"):
         if res.get(opt) is not None:
             _mreq_id(res[opt], f"{what}.{opt}")
     if res.get("status_detail") is not None:
@@ -2634,7 +2659,8 @@ class Cleaner:
 
     @staticmethod
     def _uid(res):
-        return (res.get("type"), res.get("id") or res.get("path"))
+        return (res.get("type"),
+                res.get("id") or res.get("path") or res.get("intent_key"))
 
     def _mark_deleted(self, deleted, recorder, res):
         deleted.append(res)
@@ -2670,6 +2696,7 @@ class Cleaner:
                 workable.append(res)
 
         blocked = {}
+        self._resolve_intent_sessions(workable, ctx, blocked, deleted)
         self._backfill(workable, ctx, blocked)
         self._mark_blocked(workable, blocked, failed, recorder)
         self._cancel_tasks(workable, ctx, blocked, failed, recorder)
@@ -2717,6 +2744,46 @@ class Cleaner:
                     res, driver, recorder, workable, known_artifacts, blocked)
         # 新补齐的资源同样按删除顺序参与后续阶段。
         workable[:] = build_cleanup_plan(workable)
+
+    def _resolve_intent_sessions(self, workable, ctx, blocked, deleted):
+        """解析无 id 的 intent session（进程在建会话后、真实 ID 落盘前中断）。
+
+        用 intent 登记的 conversation_id 只读回读 Gateway 会话链接：
+        恰一个 ID -> 回填后走正常删除；零个 -> 会话从未建成，直接删除态
+        （不发 HTTP）；多个或回读失败 -> blocked 保留，拒绝猜测删除。
+        无 conversation_id 或无 browser 注入时保持原行为（删除阶段 failed）。
+        """
+        browser = getattr(ctx, "cli_session_browser", None)
+        recorder = getattr(ctx, "recorder", None)
+        for res in list(workable):
+            if res["type"] != "session" or res.get("id"):
+                continue
+            conversation_id = res.get("conversation_id")
+            if not conversation_id or browser is None:
+                continue
+            try:
+                ids = browser(conversation_id)
+            except ReplayError as exc:
+                blocked[self._uid(res)] = (
+                    f"cli 会话只读解析失败，保留: {exc}")
+                continue
+            if len(ids) > 1:
+                blocked[self._uid(res)] = (
+                    f"cli 会话解析不唯一（{len(ids)} 个），拒绝猜测删除")
+                continue
+            if not ids:
+                # 会话从未建成：删除目标即不存在，视为清理成功。
+                self._mark_deleted(deleted, recorder, res)
+                workable.remove(res)
+                continue
+            res["id"] = ids[0]
+            if recorder is not None:
+                new = dict(res)
+                new["status"] = "active"
+                try:
+                    recorder.upsert(new)
+                except ManifestError:
+                    pass  # 进度持久化失败不掩盖清理结果本身
 
     def _backfill_sandbox_history(self, session_res, driver, recorder,
                                   workable, known_history, blocked):
@@ -3262,7 +3329,8 @@ class RunnerDeps:
                  preflight_fn=run_preflight, side_effects_fn=verify_side_effects,
                  run_id_fn=make_run_id, monotonic=time.monotonic,
                  environ=None, workspace_root=None, environment=None,
-                 lock_path=RUN_LOCK_PATH, acp_cwd=None):
+                 lock_path=RUN_LOCK_PATH, acp_cwd=None,
+                 cli_session_browser=browse_cli_session_ids):
         self.driver_factory = driver_factory
         self.cli_driver_factory = cli_driver_factory
         self.acp_driver_factory = acp_driver_factory
@@ -3279,6 +3347,7 @@ class RunnerDeps:
         self.environment = environment or DEFAULT_ENVIRONMENT
         self.lock_path = lock_path
         self.acp_cwd = acp_cwd or str(Path(__file__).resolve().parents[2])
+        self.cli_session_browser = cli_session_browser
 
 
 class _CaseCtx:
@@ -3292,6 +3361,8 @@ class _CaseCtx:
         self.browser_helper = browser_helper
         self.task_id = None
         self.task_deadline = None
+        # cleanup 恢复：按 conversation_id 只读解析 cli 会话 ID 的可注入 callable。
+        self.cli_session_browser = None
 
 
 @contextlib.contextmanager
@@ -3641,14 +3712,18 @@ def _run_case(case, *, run_id, dataset_dir, driver, deps, recorder, judge):
         elif case.channel == "cli":
             conversation_id = e2e_id
             cli = deps.cli_driver_factory()
+            # conversation_id 随 intent 登记：进程在建会话后、真实 ID 落盘前
+            # 中断时，cleanup 可用它只读解析真实会话 ID（见 Cleaner._backfill）。
             intent_res = recorder.intent({
                 "type": "session", "case_id": case.id,
+                "conversation_id": conversation_id,
                 "verify": "detail_session_null"})
             # 首条消息 send 前 prepare 解析真实 cli- 会话 ID。
             session_id = cli.prepare(conversation_id)
             recorder.upsert({"type": "session", "id": session_id,
                              "intent_key": intent_res.get("intent_key"),
                              "case_id": case.id, "status": "active",
+                             "conversation_id": conversation_id,
                              "verify": "detail_session_null"})
             recorder.exempt(
                 "external",
@@ -3942,6 +4017,7 @@ def _cleanup_failed_attempt(case, *, driver, deps, recorder):
         cleanup_ctx = _CaseCtx(
             driver, deps.workspace_root, recorder,
             deps.browser_helper_factory(driver, env=deps.environ))
+        cleanup_ctx.cli_session_browser = deps.cli_session_browser
         result = cleaner.clean(resources, cleanup_ctx)
         failed = result.get("failed", [])
         if failed:
@@ -4117,6 +4193,7 @@ def _run_replay_locked(args, deps):
             cleanup_ctx = _CaseCtx(
                 driver, deps.workspace_root, recorder,
                 deps.browser_helper_factory(driver, env=deps.environ))
+            cleanup_ctx.cli_session_browser = deps.cli_session_browser
             clean_result = cleaner.clean(
                 recorder.snapshot()["resources"], cleanup_ctx)
             report["cleanup"]["deleted"] = clean_result.get("deleted", [])
@@ -4195,6 +4272,7 @@ def _run_cleanup_only_locked(args, deps):
     cleanup_ctx = _CaseCtx(
         driver, deps.workspace_root, recorder,
         deps.browser_helper_factory(driver, env=deps.environ))
+    cleanup_ctx.cli_session_browser = deps.cli_session_browser
     cleanup_failed = False
     try:
         result = cleaner.clean(data["resources"], cleanup_ctx)

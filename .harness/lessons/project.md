@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
 # 项目教训
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
@@ -512,3 +512,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：HTTP 路由调用 Application 级联链时，必须把该链可能抛出的领域异常逐一映射到统一 `{"error":{"code","message"}}` JSON 契约（冲突类用 409，对齐 task_routes task_state_invalid），不能只映射 NotFound；"by design 的传播异常"同样是路由的公开契约，漏映射就是把内部异常类型泄漏成 500。排查"前端 JSON.parse 报错"类问题时直接查服务端 traceback，不要在前端猜。相关：P030 Content-Disposition 编码异常逃逸 try/except 变 500 裸响应。
 
 来源：Bug修复 260915 会话删除 500（TaskStateError 未映射 -> session_delete_conflict 409）
+
+### P052: 派生资源（无持久化 ID 的确定性回退）必须在级联删除与中断恢复两条路径上对称覆盖
+
+现象：会话 E2E 后残留四类脏会话：`task-<uuid5>` worker 会话（任务已删会话还在）、cli/acp/dashboard 渠道会话（运行被 SIGKILL 后 manifest 兜底清理未执行），其中 cli 会话连 manifest 都只有无 id 的 intent，cleanup-only 也救不回。
+
+根因：两处"派生/窗口"不对称。(1) `task_execution_session_id` 三级选择器里，kanban/CLI/API 任务的 worker 会话是确定性派生值 `task-{uuid5(task.id)}`（不持久化），而 `delete_task` 只按持久化的显式 `execution_session_id` 级联删会话——选择器覆盖的路径比删除路径宽，派生会话永久泄漏（本例 task t_8f59df9cc5fc4f1f 已删，task-2bce7436 残留）。(2) cli 渠道登记顺序 intent -> prepare（第一条子进程命令已在服务端建会话，第二条才解析真实 ID）-> upsert，进程在 prepare 窗口内被 kill 后 manifest 只剩无 id intent，_delete_session 直接 failed "缺少 session id"，而恢复所需的 conversation_id（e2e-<run_id>-<case_id>，确定性）当时未登记。根因定位跨 task_session.py / task_service.py / conversations_runner.py 3 个文件 + 线上 DB 时间线比对。
+
+教训：凡"运行时派生、不持久化"的资源标识（选择器/回退值），审查时对照两张清单：读取侧（谁能推出这个标识）与删除侧（级联是否覆盖所有派生分支），二者必须一一对应；凡"先建资源、后知 ID"的登记窗口，intent 必须携带可只读重解析真实 ID 的确定性键（如 conversation_id），否则中断残留不可恢复。排查脏数据时先用 DB created_at 对齐 run 时间线，再按 ID 前缀规则（task- 派生 / cli- / acp- gateway 生成）反推来源渠道，避免把"任务已删"误判为"未曾登记"。
+
+来源：Bug修复 260915 会话 E2E 脏会话（delete_task 派生会话级联 + runner intent conversation_id 恢复）

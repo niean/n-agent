@@ -31,9 +31,10 @@ def task_execution_session_id(task: Task) -> str:
          仅 dashboard /task 任务设置，kanban/CLI/feishu 不设置（origin=None）
       3. ``task_session_id_fallback(task.id)`` -- 确定性回退，跨 run 稳定、无需持久化
 
-    本函数不写回 tasks 表；派生值仅在运行时使用。删除任务时 task_service 按持久化的
-    显式 ``execution_session_id`` 清理（当前 DB NULL -> 不删 origin Chat 会话），
-    不受派生影响。
+    本函数不写回 tasks 表；派生值仅在运行时使用。删除任务时 task_service 级联
+    清理 worker 会话：显式 ``execution_session_id`` 优先；两者均 NULL 时清理
+    派生会话 ``task_session_id_fallback(task_id)``；``origin_session_id``
+    存在时 worker 复用用户 Chat 会话，不删除。
     """
     if task.execution_session_id:
         return task.execution_session_id

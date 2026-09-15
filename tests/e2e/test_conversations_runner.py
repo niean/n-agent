@@ -2809,6 +2809,21 @@ class TestManifestValidation:
         with pytest.raises(cr.ManifestError):
             cr.validate_manifest(m)
 
+    def test_session_conversation_id_accepted_and_validated(self):
+        # cli 渠道 intent 登记 conversation_id，供中断后 cleanup 只读解析真实
+        # 会话 ID；合法值接受，非法字符拒绝。
+        m = self._manifest(resources=[
+            {"type": "session", "case_id": "c", "status": "intent",
+             "intent_key": "intent-0001",
+             "conversation_id": "e2e-r1-c"}])
+        cr.validate_manifest(m)
+        for bad in ("a/b", "a b", "../x", "a..b"):
+            m = self._manifest(resources=[
+                {"type": "session", "case_id": "c", "status": "intent",
+                 "intent_key": "intent-0001", "conversation_id": bad}])
+            with pytest.raises(cr.ManifestError):
+                cr.validate_manifest(m)
+
     @pytest.mark.parametrize("bad_id", (
         "../sessions/victim", "a/b", "a\\b", "a..b", "..",
         "a b", "a\tb", "a\nb", "a\x00b"))
@@ -3078,6 +3093,7 @@ class _FakeCleanupCtx:
         self.workspace_root = workspace_root
         self.browser_helper = browser_helper
         self.recorder = recorder
+        self.cli_session_browser = None
 
 
 class _FakeBrowserCloser:
@@ -3418,6 +3434,74 @@ class TestCleanup:
         assert out["failed"][0]["resource"]["intent_key"] == "intent-0001"
         assert driver.paths("DELETE") == ["/chat/artifacts/a1"]
         assert all("sessions" not in p for _, p, _ in driver.calls)
+
+    def test_intent_session_resolved_via_conversation_id_and_deleted(self):
+        # 中断时 cli 会话已建但真实 ID 未落 manifest：cleanup 用 intent 登记的
+        # conversation_id 只读解析真实 ID，随后走正常删除+回读验证。
+        driver = _FakeCleanupDriver()
+        driver.get_map["/chat/sandbox/execute-code-history"] = []
+        driver.get_raw_map["/chat/sessions/cli-real-1"] = (
+            200, {"session": None})
+        browser_calls = []
+
+        def fake_browser(conversation_id):
+            browser_calls.append(conversation_id)
+            return ["cli-real-1"]
+
+        res = [{"type": "session", "case_id": "c", "status": "intent",
+                "intent_key": "intent-0001",
+                "conversation_id": "e2e-r1-c"}]
+        ctx = _FakeCleanupCtx(driver)
+        ctx.cli_session_browser = fake_browser
+        out = _cleaner().clean(res, ctx)
+        assert browser_calls == ["e2e-r1-c"]
+        assert [r["id"] for r in out["deleted"]] == ["cli-real-1"]
+        assert out["failed"] == []
+        assert driver.paths("DELETE") == ["/chat/sessions/cli-real-1"]
+
+    def test_intent_session_browser_finds_nothing_marked_deleted(self):
+        # 只读解析确认会话从未建成（进程在建会话前被 kill）：无需删除，
+        # 直接视为清理成功，不发任何 HTTP。
+        driver = _FakeCleanupDriver()
+        res = [{"type": "session", "case_id": "c", "status": "intent",
+                "intent_key": "intent-0001",
+                "conversation_id": "e2e-r1-c"}]
+        ctx = _FakeCleanupCtx(driver)
+        ctx.cli_session_browser = lambda cid: []
+        out = _cleaner().clean(res, ctx)
+        assert len(out["deleted"]) == 1
+        assert out["failed"] == []
+        assert driver.calls == []
+
+    def test_intent_session_browser_ambiguous_failed(self):
+        # 解析出多个会话：拒绝猜测删除，记 failed 且不发 DELETE。
+        driver = _FakeCleanupDriver()
+        res = [{"type": "session", "case_id": "c", "status": "intent",
+                "intent_key": "intent-0001",
+                "conversation_id": "e2e-r1-c"}]
+        ctx = _FakeCleanupCtx(driver)
+        ctx.cli_session_browser = lambda cid: ["cli-a", "cli-b"]
+        out = _cleaner().clean(res, ctx)
+        assert out["deleted"] == []
+        assert len(out["failed"]) == 1
+        assert driver.paths("DELETE") == []
+
+    def test_intent_session_browser_error_failed(self):
+        # 只读解析本身失败（如 CLI 不可用）：保留并 failed，不删任何资源。
+        driver = _FakeCleanupDriver()
+        res = [{"type": "session", "case_id": "c", "status": "intent",
+                "intent_key": "intent-0001",
+                "conversation_id": "e2e-r1-c"}]
+        ctx = _FakeCleanupCtx(driver)
+
+        def boom(cid):
+            raise cr.ReplayError("cli rc=1")
+
+        ctx.cli_session_browser = boom
+        out = _cleaner().clean(res, ctx)
+        assert out["deleted"] == []
+        assert len(out["failed"]) == 1
+        assert driver.paths("DELETE") == []
 
     def test_sandbox_history_backfill_error_blocks_session_branch(self):
         # 历史回读 ReplayError：会话及其历史行整体保留，零 DELETE。
@@ -4134,6 +4218,9 @@ class TestOrchestrationCliOrdering:
         manifest = _run_manifest(tmp_path, tmp_path / "reports")
         sessions = [r for r in manifest["resources"] if r["type"] == "session"]
         assert [s["id"] for s in sessions] == ["cli-real-1"]
+        # conversation_id 随会话资源登记：中断后 cleanup 可只读解析真实 ID。
+        assert [s.get("conversation_id") for s in sessions] == \
+            ["e2e-testrun1-c1"]
         assert any(e["type"] == "external"
                    and "cli gateway 入口键 e2e-testrun1-c1" in e["detail"]
                    for e in manifest["exemptions"])

@@ -813,6 +813,32 @@ async def test_delete_task_cleans_execution_session(svc, registry):
 
 
 @pytest.mark.asyncio
+async def test_delete_task_cleans_fallback_execution_session(svc, registry):
+    """无显式 execution_session_id 且无 origin_session_id 的任务（kanban/CLI/API
+    创建），worker 运行在确定性派生会话 task-{uuid5(task_id)}；删除任务必须
+    级联删除该派生会话，否则会话永久泄漏。"""
+    from app.application.task_session import task_session_id_fallback
+
+    task = await svc.create_task(title="x", created_by="u")
+    await svc.delete_task(task.id)
+    assert svc.memory_store.deleted_sessions == [
+        task_session_id_fallback(task.id)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delete_task_keeps_origin_chat_session(svc, registry):
+    """origin_session_id 是用户 Chat 会话（worker 复用它执行），删除任务不得
+    级联删除；无显式 execution_session_id 时也不应误删派生会话之外的会话。"""
+    task = await svc.create_task(title="x", created_by="u")
+    await registry.update_task(
+        task.id, {"origin_session_id": "chat-user-1"}, expected_version=1
+    )
+    await svc.delete_task(task.id)
+    assert svc.memory_store.deleted_sessions == []
+
+
+@pytest.mark.asyncio
 async def test_delete_task_calls_artifact_delete_callback(registry, tmp_path):
     """delete_task best-effort calls artifact_delete_callback(task_id) to remove
     artifacts registered against the task in the separate artifacts DB."""

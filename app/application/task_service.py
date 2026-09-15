@@ -57,7 +57,10 @@ from app.domain.task import (
     TaskValidationError,
     TaskWorkspaceKind,
 )
-from app.application.task_session import task_execution_session_id
+from app.application.task_session import (
+    task_execution_session_id,
+    task_session_id_fallback,
+)
 from app.domain.task_config import TaskConfig, TaskConfigProvider
 from app.domain.task_policy import TaskPolicy
 
@@ -396,15 +399,23 @@ class TaskService:
                 )
 
         # Clean up execution session (not origin session)
-        if task.execution_session_id and self.memory_store is not None:
-            try:
-                await self.memory_store.delete_session(task.execution_session_id)
-            except Exception as exc:
-                logger.warning(
-                    "failed to delete execution session %s: %s",
-                    task.execution_session_id,
-                    exc,
-                )
+        if self.memory_store is not None:
+            # 显式 execution_session_id 直接清理；两者均 NULL 时 worker 运行在
+            # 确定性派生会话 task_session_id_fallback(task_id)（kanban/CLI/API
+            # 任务），同样级联清理，否则派生会话永久泄漏。origin_session_id
+            # 存在时 worker 复用用户 Chat 会话，不得删除。
+            execution_sid = task.execution_session_id
+            if not execution_sid and not task.origin_session_id:
+                execution_sid = task_session_id_fallback(task_id)
+            if execution_sid:
+                try:
+                    await self.memory_store.delete_session(execution_sid)
+                except Exception as exc:
+                    logger.warning(
+                        "failed to delete execution session %s: %s",
+                        execution_sid,
+                        exc,
+                    )
         return True
 
     async def delete_tasks_by_session(self, session_id: str) -> int:
