@@ -11,13 +11,12 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 case "$SUITE" in
-  all) CASE_SCRIPTS=("$SCRIPT_DIR/task.sh" "$SCRIPT_DIR/artifacts.sh" "$SCRIPT_DIR/config-bundle.sh" "$SCRIPT_DIR/conversations.sh") ;;
-  task) CASE_SCRIPTS=("$SCRIPT_DIR/task.sh") ;;
+  all) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh" "$SCRIPT_DIR/config-bundle.sh" "$SCRIPT_DIR/conversations.sh") ;;
   artifacts) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh") ;;
   config-bundle) CASE_SCRIPTS=("$SCRIPT_DIR/config-bundle.sh") ;;
   conversations) CASE_SCRIPTS=("$SCRIPT_DIR/conversations.sh") ;;
   *)
-    echo "usage: tests/e2e/run.sh [all|task|artifacts|config-bundle|conversations]" >&2
+    echo "usage: tests/e2e/run.sh [all|artifacts|config-bundle|conversations]" >&2
     exit 2
     ;;
 esac

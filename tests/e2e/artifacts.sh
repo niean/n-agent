@@ -29,15 +29,58 @@
   TMP_DIR="$(mktemp -d /tmp/e2e-artifacts-XXXXXX)"
   CLEANUP_ARTIFACT_IDS=""
   CLEANUP_TASK_IDS=""
+  CLEANUP_WORKSPACE_FILES=""
+
+  # Poll until the task reaches a terminal state (deletable). Tasks run a
+  # real LLM worker asynchronously; delete_task rejects RUNNING tasks with
+  # TaskStateError, so deleting without waiting leaks the task AND its
+  # derived worker session (task-{uuid5}) as dirty data.
+  # Note: GET /chat/tasks/{id} wraps the task under .task -- reading bare
+  # .status yields null and the wait would return immediately.
+  wait_task_terminal() {
+    local id="$1" attempts="${2:-60}" i status
+    for i in $(seq 1 "$attempts"); do
+      http GET "$BASE_URL/chat/tasks/$id"
+      status="$(json_field '.task.status // .status')"
+      case "$status" in
+        succeeded|failed|cancelled|expired) return 0 ;;
+      esac
+      sleep 1
+    done
+    return 1
+  }
 
   cleanup() {
     # Delete artifacts created during the run.
     for id in $CLEANUP_ARTIFACT_IDS; do
-      curl -fsS -X DELETE "$BASE_URL/chat/artifacts/$id" >/dev/null 2>&1 || true
+      if ! curl -fsS -X DELETE "$BASE_URL/chat/artifacts/$id" >/dev/null 2>&1; then
+        echo "WARN: cleanup failed to delete artifact $id" >&2
+      fi
     done
-    # Delete tasks created during the run.
+    # Delete tasks created during the run. Cancel/delete MUST go through the
+    # server HTTP API: the CLI runs in a separate process whose run_service
+    # has no in-process worker handle, so CLI cancel only writes a
+    # terminate_requested event and waits for lease recovery (~90s+) — too
+    # slow for this cleanup window, and the delete then still hits the RUNNING
+    # guard. The HTTP cancel route terminates the in-process worker at once.
+    # Terminal tasks reject cancel (409) — expected, proceed to delete.
+    # Delete failures must be visible: swallowing them leaks the task and its
+    # derived worker session as dirty data.
     for id in $CLEANUP_TASK_IDS; do
-      docker exec "$CONTAINER" n-agent task delete "$id" --json >/dev/null 2>&1 || true
+      http POST "$BASE_URL/chat/tasks/$id/cancel"
+      if ! wait_task_terminal "$id" 60; then
+        echo "WARN: cleanup task $id not terminal after cancel" >&2
+      fi
+      http DELETE "$BASE_URL/chat/tasks/$id"
+      if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "204" ] && [ "$HTTP_STATUS" != "404" ]; then
+        echo "WARN: cleanup failed to delete task $id (HTTP $HTTP_STATUS)" >&2
+      fi
+    done
+    # Remove workspace files written by section 1c (content_ref workspace:).
+    for f in $CLEANUP_WORKSPACE_FILES; do
+      if ! docker exec "$CONTAINER" rm -f "/workspace/$f" >/dev/null 2>&1; then
+        echo "WARN: cleanup failed to remove workspace file $f" >&2
+      fi
     done
     # Remove temp files.
     rm -rf "$TMP_DIR" 2>/dev/null || true
@@ -138,6 +181,12 @@
   track_task() {
     local id="$1"
     CLEANUP_TASK_IDS="$CLEANUP_TASK_IDS $id"
+  }
+
+  # Track a workspace file (relative name under /workspace) for cleanup.
+  track_workspace_file() {
+    local name="$1"
+    CLEANUP_WORKSPACE_FILES="$CLEANUP_WORKSPACE_FILES $name"
   }
 
   # Count artifacts in list response whose name contains RUN_TAG.
@@ -242,6 +291,8 @@ async def main():
 
 asyncio.run(main())
 PYEOF
+  track_workspace_file "${RUN_TAG}-taskart-1.txt"
+  track_workspace_file "${RUN_TAG}-taskart-2.txt"
 
   # 1d. Manually create 1 Artifact.
   echo "[Artifact E2E] 1d. create 1 manual artifact"
@@ -258,6 +309,22 @@ PYEOF
     exit 1
   fi
   echo "[Artifact E2E] 1e. ok ($TAGGED_COUNT tagged artifacts)"
+
+  # 1f. Settle the task to a terminal state BEFORE the section 2b restart.
+  # The restart kills the in-process worker; an orphaned RUNNING task can
+  # then only be reclaimed by lease expiry (~900s), far beyond the cleanup
+  # window, so the delete would 409 and leak the task + derived worker
+  # session. Cancel via the server HTTP API (terminates the in-process
+  # worker at once; a CLI cancel runs in a separate process and can only
+  # write terminate_requested) and wait for a terminal state. If the task
+  # already finished naturally, cancel 409s — expected, it is terminal.
+  echo "[Artifact E2E] 1f. settle task before restart"
+  http POST "$BASE_URL/chat/tasks/$TASK_ID/cancel"
+  if ! wait_task_terminal "$TASK_ID" 60; then
+    echo "FAIL: task $TASK_ID not terminal within 60s after cancel" >&2
+    exit 1
+  fi
+  echo "[Artifact E2E] 1f. ok (task terminal: $(json_field '.task.status // .status'))"
 
   # ---------------------------------------------------------------------------
   # Section 2: Backfill idempotency

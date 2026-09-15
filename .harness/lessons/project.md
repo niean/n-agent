@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
 # 项目教训
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
@@ -522,3 +522,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：凡"运行时派生、不持久化"的资源标识（选择器/回退值），审查时对照两张清单：读取侧（谁能推出这个标识）与删除侧（级联是否覆盖所有派生分支），二者必须一一对应；凡"先建资源、后知 ID"的登记窗口，intent 必须携带可只读重解析真实 ID 的确定性键（如 conversation_id），否则中断残留不可恢复。排查脏数据时先用 DB created_at 对齐 run 时间线，再按 ID 前缀规则（task- 派生 / cli- / acp- gateway 生成）反推来源渠道，避免把"任务已删"误判为"未曾登记"。
 
 来源：Bug修复 260915 会话 E2E 脏会话（delete_task 派生会话级联 + runner intent conversation_id 恢复）
+
+### P053: E2E 清理 RUNNING 任务的三层叠加失效——CLI 进程边界、响应包装路径、容器重启孤儿
+
+现象：artifacts E2E 每轮泄漏一个 e2e 任务及其派生 worker 会话（task-{uuid5}），cleanup 连修两版仍漏：v1（CLI cancel+wait+delete）delete 仍撞 RUNNING 守卫；v2（改 HTTP cancel/delete）delete 409，且轮询 helper 秒回（从未真正等待）。
+
+根因：三层独立失效叠加，只修任一层都会继续漏。(1) 进程边界：`docker exec n-agent task cancel` 是独立 CLI 进程，其 run_service 无 in-process worker handle，`_cancel_worker_if_active` 返回 False 只写 terminate_requested 事件等待租约回收，而 `cancel_task` 对任何非异常结果都返回 `{"status":"cancelled"}`——CLI 输出"成功"但 DB 里任务仍 running（实证：terminate_requested 到租约回收标记 crashed 间隔 ~90s）。(2) 响应包装：GET /chat/tasks/{id} 返回 `{"task": {...}}`，轮询 helper 用裸 `.status` 提取恒为 null，`!= "running"` 恒真，等待逻辑形同虚设，delete 在任务仍 running 时发出撞 409。(3) 重启孤儿：Section 2b `docker restart` 杀死 in-process worker 后，孤儿 RUNNING 任务只能等 lease（900s）过期才被 `_recover_stale_executions` 回收（无 in-process worker 时不查心跳只查租约），cleanup 窗口内无解——必须在 restart 前把任务收敛到终态。
+
+教训：涉及"异步 worker + 状态机 + 跨进程"的清理逻辑，验证时不能只跑通 happy path 看 PASS，要直接查 DB 确认目标资源计数为 0（WARN 被 `|| true` 类吞掉时输出看上去很干净）；任何"轮询状态等待"helper，先断言它真的能等到——用一次必不成立的条件验证它会超时，否则提取路径错了永远发现不了；容器重启类测试步骤会杀死全部 in-process 状态，凡 restart 前必须显式枚举"哪些运行中资源会变孤儿"并先收敛。相关：P052（派生资源级联对称）、D069（孤儿 RUNNING 任务无自动回收）。
+
+来源：Bug修复 260915 会话 E2E 脏数据（artifacts.sh cleanup 三层修复 + 合同测试锁定）
