@@ -2,8 +2,9 @@ name: n-agent
 
 # 沙盒 Docker 后端开启说明（sandbox_type=docker）：
 #   1) 取消下方 docker.sock 挂载注释；
-#   2) 容器内 docker CLI 可用（见 docker/Dockerfile 中 docker-ce-cli 安装）；
-#   3) 配置 N_AGENT_SANDBOX_DOCKER_HOST_WORKSPACE_ROOT 与
+#   2) 容器内 docker CLI 可用（见 docker/Dockerfile 中 docker.io 安装）；
+#   3) 容器内 docker 组权限（已在 Dockerfile 中配置）；
+#   4) 配置 N_AGENT_SANDBOX_DOCKER_HOST_WORKSPACE_ROOT 与
 #      N_AGENT_SANDBOX_DOCKER_HOST_LOCALS_ROOT 指向宿主路径，须与下方 volumes
 #      挂载源一致（workspace 与 locals 的宿主路径），否则兄弟沙盒容器 -v 挂载
 #      到不存在的宿主目录。scratch 默认复用 locals/sandbox-scratch。
@@ -21,6 +22,9 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    depends_on:
+      browser:
+        condition: service_healthy
     env_file:
       - path: ./.env
         required: false
@@ -43,12 +47,25 @@ services:
       N_AGENT_HOST_TERMINAL_MAX_STDOUT_BYTES: ${N_AGENT_HOST_TERMINAL_MAX_STDOUT_BYTES:-8192}
       N_AGENT_HOST_TERMINAL_MAX_STDERR_BYTES: ${N_AGENT_HOST_TERMINAL_MAX_STDERR_BYTES:-8192}
       N_AGENT_HOST_TERMINAL_MAX_CONCURRENCY: ${N_AGENT_HOST_TERMINAL_MAX_CONCURRENCY:-1}
-      N_AGENT_BROWSER_DEFAULT_BACKEND: ${N_AGENT_BROWSER_DEFAULT_BACKEND:-container}
+      # ACP 路径映射：VsCode ACP Client 发来的 host cwd 须在 HOST_WORKSPACE_ROOT 下，
+      # 否则 session/new 拒绝。HOST root 须与下方 volumes 挂载源一致（或为其父目录），
+      # CONTAINER root 须与挂载目标一致。详见 README.md "ACP 远程接入" 章节。
+      N_AGENT_ACP_HOST_WORKSPACE_ROOT: ${N_AGENT_ACP_HOST_WORKSPACE_ROOT:-/Users/you/code}
+      N_AGENT_ACP_CONTAINER_WORKSPACE_ROOT: /workspace-code
+      # Browser 子域 (T11): container backend connects to the browser service
+      # via CDP on the internal network. Enabled only when N_AGENT_BROWSER_ENABLED=true.
+      N_AGENT_BROWSER_ENABLED: ${N_AGENT_BROWSER_ENABLED:-false}
+      N_AGENT_BROWSER_CONTAINER_ENDPOINT: ${N_AGENT_BROWSER_CONTAINER_ENDPOINT:-http://172.19.0.10:9222}
+      N_AGENT_BROWSER_CONTAINER_PROFILE_RUNTIME_ENDPOINT: ${N_AGENT_BROWSER_CONTAINER_PROFILE_RUNTIME_ENDPOINT:-http://browser:9223}
+      N_AGENT_BROWSER_CONTAINER_NOVNC_ENDPOINT: ${N_AGENT_BROWSER_CONTAINER_NOVNC_ENDPOINT:-http://browser:6080}
       N_AGENT_BROWSER_HOST_BRIDGE_URL: ${N_AGENT_BROWSER_HOST_BRIDGE_URL:-http://host.docker.internal:8766}
       N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH: ${N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH:-/app/locals/host-browser.token}
       N_AGENT_BROWSER_TRUSTED_DEV: ${N_AGENT_BROWSER_TRUSTED_DEV:-false}
     ports:
       - "8201:8201"
+    # Resource limits: bounded CPU/memory for the n-agent service.
+    mem_limit: 1024m
+    cpus: 2.0
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8201/health', timeout=2).read()"]
       interval: 10s
@@ -56,19 +73,68 @@ services:
       retries: 6
       start_period: 10s
     volumes:
+      - ~/app/logs:/app/logs
       - ~/app/locals:/app/locals
       # Create these owner-only files first. They override the writable locals mount.
       - ~/app/locals/host-terminal-policy.yaml:/app/locals/host-terminal-policy.yaml:ro
       - ~/app/locals/host-terminal.token:/app/locals/host-terminal.token:ro
       - ~/app/locals/host-browser.token:/app/locals/host-browser.token:ro
-      - ~/workspace:/workspace
+      - ~/app/workspace:/workspace
+      # ACP 远程接入：挂载宿主代码目录，供 VsCode ACP Client 访问容器内代码文件
+      - ~/code:/workspace-code
       # 沙盒 Docker 后端：sandbox_type=docker 时取消注释，并确保容器内 docker CLI 可用（见 Dockerfile）
       # - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - default
       - n-kb
 
+  # Container browser runtime (T11): Chromium + noVNC for interactive
+  # takeover. CDP (9222) and noVNC (6080) ports are container-network only
+  # (NO host port mapping). n-agent connects via http://browser:9222.
+  # Resource limits enforce CPU/memory/pids/shm bounds per session.
+  browser:
+    build:
+      context: ./browser
+      dockerfile: Dockerfile
+    environment:
+      TZ: Asia/Shanghai
+      CDP_PORT: 9222
+      NOVNC_PORT: 6080
+      VNC_PORT: 5900
+      CHROMIUM_USER_DATA_DIR: /data/profiles
+      SCREEN_WIDTH: 1280
+      SCREEN_HEIGHT: 960
+      SCREEN_DEPTH: 24
+    # NO ports: section -- CDP/noVNC are container-network only.
+    expose:
+      - "9223"
+      - "6080"
+    volumes:
+      - ~/app/browser-profiles:/data/profiles
+    # Resource limits: single-session Chromium with bounded CPU/memory/pids.
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9223/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    networks:
+      default:
+        ipv4_address: 172.19.0.10
+
 networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
   n-kb:
     name: n-kb_default
     external: true
+
+volumes:
+  # Persistent browser profiles (per profile_ref opaque key).
+  browser-profiles:
