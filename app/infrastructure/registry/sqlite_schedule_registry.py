@@ -350,6 +350,20 @@ class SQLiteScheduledTaskRegistry:
             ).fetchall()
         return [self._row_to_execution(row) for row in rows]
 
+    async def list_all_executions(self, limit: int, task_id: str | None = None) -> list[ScheduledTaskExecution]:
+        with self._connect() as conn:
+            if task_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM scheduled_task_executions ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM scheduled_task_executions WHERE task_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (task_id, limit),
+                ).fetchall()
+        return [self._row_to_execution(row) for row in rows]
+
     async def mark_dashboard_unread(self, task_id: str, claim_id: str, lease_owner: str) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -562,6 +576,7 @@ def _initialize_schedule_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due ON scheduled_tasks(enabled, status, next_run_at);
         CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_session ON scheduled_tasks(session_id);
         CREATE INDEX IF NOT EXISTS idx_scheduled_executions_task_created ON scheduled_task_executions(task_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_scheduled_executions_created ON scheduled_task_executions(created_at);
         """
     )
     _migrate_origin_source_type_to_platform(conn)

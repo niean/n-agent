@@ -321,6 +321,14 @@ class ScheduleService:
             raise ScheduleValidationError("execution history limit must be between 1 and 50")
         return await self.registry.list_executions(task_id, limit)
 
+    async def list_all_executions(self, limit: int = 50, task_id: str | None = None):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 200:
+            raise ScheduleValidationError("execution history limit must be between 1 and 200")
+        normalized = task_id if task_id else None
+        if normalized is not None:
+            await self.get(normalized)
+        return await self.registry.list_all_executions(limit, normalized)
+
     async def handle_session_deleted(self, session_id: str) -> int:
         return await self.registry.mark_session_missing(session_id)
 

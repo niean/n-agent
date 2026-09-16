@@ -431,6 +431,256 @@ def test_scheduled_task_run_now_error_contract(tmp_path):
     assert claimed.json()["error"]["code"] == "scheduled_task_claim_conflict"
 
 
+class _FakeAllExecutionsScheduleService(_FakeScheduleService):
+    def __init__(self):
+        super().__init__()
+        self.all_calls = []
+        self.all_executions = []
+        self.all_error = None
+
+    async def list_all_executions(self, limit=50, task_id=None):
+        self.all_calls.append({"limit": limit, "task_id": task_id})
+        if self.all_error is not None:
+            raise self.all_error
+        return list(self.all_executions)
+
+
+def _sample_execution(task_id="task-1", execution_id="execution-1"):
+    from app.domain.schedule import ScheduledTaskExecution, ScheduledTaskExecutionStatus
+    from datetime import datetime, timezone
+
+    return ScheduledTaskExecution(
+        id=execution_id,
+        task_id=task_id,
+        session_id="session-1",
+        claim_id="claim-1",
+        lease_owner="owner-1",
+        status=ScheduledTaskExecutionStatus.SUCCEEDED,
+        claimed_next_run_at=datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc),
+        started_at=datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc),
+        completed_at=datetime(2026, 6, 16, 0, 1, tzinfo=timezone.utc),
+        output="done",
+        error=None,
+        delivery_status="success",
+        delivery_error=None,
+        created_at=datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_scheduled_tasks_executions_all_route_returns_bare_array(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeAllExecutionsScheduleService()
+    schedule.all_executions = [_sample_execution()]
+    app = _build_app(store, schedule_service=schedule)
+    client = TestClient(app)
+
+    response = client.get("/chat/scheduled-tasks/executions")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert isinstance(body, list)
+    assert body == [
+        {
+            "id": "execution-1",
+            "task_id": "task-1",
+            "session_id": "session-1",
+            "status": "succeeded",
+            "claimed_next_run_at": "2026-06-16T00:00:00+00:00",
+            "started_at": "2026-06-16T00:00:00+00:00",
+            "completed_at": "2026-06-16T00:01:00+00:00",
+            "output": "done",
+            "error": None,
+            "delivery_status": "success",
+            "delivery_error": None,
+            "created_at": "2026-06-16T00:00:00+00:00",
+        }
+    ]
+    # static route registered before dynamic /chat/scheduled-tasks/{task_id}
+    router = create_dashboard_router(
+        SessionService(store),
+        ToolService(_StubExecutor(), builtin_tool_definitions()),
+        ModelService(_StubProvider(), "real-1"),
+        _default_health,
+        schedule_service=schedule,
+        memory_store=store,
+    )
+    get_paths = [
+        route.path
+        for route in router.routes
+        if getattr(route, "methods", None) and "GET" in route.methods
+    ]
+    assert get_paths.index("/chat/scheduled-tasks/executions") < get_paths.index("/chat/scheduled-tasks/{task_id}")
+
+
+def test_scheduled_tasks_executions_all_route_passes_params_and_maps_errors(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeAllExecutionsScheduleService()
+    schedule.all_executions = [_sample_execution()]
+    client = TestClient(_build_app(store, schedule_service=schedule))
+
+    ok = client.get("/chat/scheduled-tasks/executions?limit=5&task_id=task-1")
+    assert ok.status_code == 200
+    assert schedule.all_calls[-1] == {"limit": 5, "task_id": "task-1"}
+
+    defaulted = client.get("/chat/scheduled-tasks/executions")
+    assert defaulted.status_code == 200
+    assert schedule.all_calls[-1] == {"limit": 50, "task_id": None}
+
+    schedule.all_error = ScheduleValidationError("bad limit")
+    invalid = client.get("/chat/scheduled-tasks/executions?limit=0")
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "scheduled_task_invalid"
+
+    schedule.all_error = ScheduledTaskNotFoundError("missing")
+    missing = client.get("/chat/scheduled-tasks/executions?task_id=missing")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "scheduled_task_not_found"
+
+    schedule.all_error = RuntimeError("boom")
+    failed = client.get("/chat/scheduled-tasks/executions")
+    assert failed.status_code == 500
+    assert failed.json()["error"]["code"] == "scheduled_task_error"
+    schedule.all_error = None
+
+
+def test_scheduled_tasks_executions_all_route_rejects_unparseable_limit(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeAllExecutionsScheduleService()
+    client = TestClient(_build_app(store, schedule_service=schedule))
+
+    for raw in ("", "1.5", "abc"):
+        response = client.get(f"/chat/scheduled-tasks/executions?limit={raw}")
+        assert response.status_code == 422
+        body = response.json()
+        assert isinstance(body["detail"], list)
+        assert "error" not in body
+
+    assert schedule.all_calls == []
+
+
+def test_scheduled_tasks_executions_all_route_real_chain(tmp_path):
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from app.application.schedule_service import ScheduleService
+    from app.domain.schedule import (
+        DeliveryTarget,
+        PromptSafetyResult,
+        ScheduledTask,
+        ScheduleExpression,
+        ScheduleTimezone,
+    )
+    from app.infrastructure.registry.sqlite_schedule_registry import SQLiteScheduledTaskRegistry
+    from app.infrastructure.schedule.croniter_calculator import CroniterScheduleCalculator
+
+    class AllowScanner:
+        def scan(self, prompt):
+            return PromptSafetyResult(True)
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    calculator = CroniterScheduleCalculator()
+    registry = SQLiteScheduledTaskRegistry(tmp_path / "sessions.db", calculator)
+    schedule = ScheduleService(registry, calculator, AllowScanner(), SessionService(store))
+
+    base = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+
+    def task(task_id):
+        return ScheduledTask(
+            id=task_id,
+            name="Daily",
+            prompt="summarize",
+            schedule=ScheduleExpression("*/5 * * * *"),
+            timezone=ScheduleTimezone("UTC"),
+            session_id="session-1",
+            delivery_target=DeliveryTarget.dashboard(),
+            next_run_at=base,
+        )
+
+    def execution(execution_id, task_id, created_at):
+        from app.domain.schedule import ScheduledTaskExecution, ScheduledTaskExecutionStatus
+
+        return ScheduledTaskExecution(
+            id=execution_id,
+            task_id=task_id,
+            session_id="session-1",
+            claim_id=f"claim-{execution_id}",
+            lease_owner=f"owner-{execution_id}",
+            status=ScheduledTaskExecutionStatus.SUCCEEDED,
+            started_at=created_at,
+            completed_at=created_at,
+            created_at=created_at,
+        )
+
+    async def seed():
+        await registry.create(task("task-a"))
+        await registry.create(task("task-b"))
+        await registry.create(task("task-empty"))
+        for index in range(51):
+            await registry.record_execution_started(
+                execution(f"a-{index:03d}", "task-a", base + timedelta(minutes=index))
+            )
+        for index in range(2):
+            await registry.record_execution_started(
+                execution(f"b-{index}", "task-b", base + timedelta(hours=1, minutes=index))
+            )
+
+    asyncio.run(seed())
+    client = TestClient(_build_app(store, schedule_service=schedule))
+
+    defaulted = client.get("/chat/scheduled-tasks/executions")
+    assert defaulted.status_code == 200
+    assert len(defaulted.json()) == 50
+
+    assert len(client.get("/chat/scheduled-tasks/executions?limit=1").json()) == 1
+    assert len(client.get("/chat/scheduled-tasks/executions?limit=200").json()) == 53
+
+    for raw in ("0", "-1", "201"):
+        invalid = client.get(f"/chat/scheduled-tasks/executions?limit={raw}")
+        assert invalid.status_code == 422
+        assert invalid.json()["error"]["code"] == "scheduled_task_invalid"
+
+    filtered = client.get("/chat/scheduled-tasks/executions?task_id=task-b")
+    assert filtered.status_code == 200
+    assert [item["task_id"] for item in filtered.json()] == ["task-b", "task-b"]
+
+    empty_filter = client.get("/chat/scheduled-tasks/executions?task_id=")
+    assert empty_filter.status_code == 200
+    assert len(empty_filter.json()) == 50
+
+    unknown = client.get("/chat/scheduled-tasks/executions?task_id=missing")
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "scheduled_task_not_found"
+
+    empty = client.get("/chat/scheduled-tasks/executions?task_id=task-empty")
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+    deleted = client.get("/chat/scheduled-tasks/executions?task_id=task-b")
+    asyncio.run(registry.delete("task-b"))
+    gone = client.get("/chat/scheduled-tasks/executions?task_id=task-b")
+    assert deleted.status_code == 200
+    assert gone.status_code == 404
+    assert gone.json()["error"]["code"] == "scheduled_task_not_found"
+
+
+def test_scheduled_tasks_executions_all_route_does_not_regress_existing_routes(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    client = TestClient(_build_app(store, schedule_service=schedule))
+    created = client.post(
+        "/chat/scheduled-tasks",
+        json={"name": "Daily", "prompt": "summarize", "cron_expression": "*/5 * * * *"},
+    ).json()
+
+    detail = client.get(f"/chat/scheduled-tasks/{created['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["id"] == created["id"]
+
+    executions = client.get(f"/chat/scheduled-tasks/{created['id']}/executions?limit=50")
+    assert executions.status_code == 200
+    assert client.get(f"/chat/scheduled-tasks/{created['id']}/executions?limit=51").status_code == 422
+
+
 def test_chat_can_create_session(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     client = TestClient(_build_app(store))

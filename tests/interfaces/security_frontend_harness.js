@@ -345,6 +345,124 @@ async function main() {
     await tick();
   }
 
+  // 13. /scheduled-tasks/security 入口：scope=scheduled-tasks 仅渲染 schedule 一个 sector。
+  // 真实 route state：activeTab=scheduled-tasks-security、renderTab=security、
+  // sidebarTab/currentSubdomain=scheduled-tasks、route.scope=scheduled-tasks。
+  function scheduledTasksState() {
+    return {
+      activeTab: 'scheduled-tasks-security',
+      renderTab: 'security',
+      sidebarTab: 'scheduled-tasks',
+      currentSubdomain: 'scheduled-tasks',
+      route: { scope: 'scheduled-tasks', tab: 'scheduled-tasks-security', renderTab: 'security', sidebarTab: 'scheduled-tasks', topnavParent: 'scheduled-tasks' },
+    };
+  }
+  function findTag(node, tag, out) {
+    out = out || [];
+    if (node && node.tag === tag) out.push(node);
+    ((node && node.children) || []).forEach((c) => findTag(c, tag, out));
+    return out;
+  }
+  let schedScope = null;
+  const schedEnv = freshEnv({ listPolicies: (s) => {
+    schedScope = s; return Promise.resolve(validPayload(s));
+  } });
+  schedEnv.NAGENT.security.init(scheduledTasksState());
+  await tick();
+  ok(schedScope === 'scheduled-tasks', 'scheduled-tasks requests scheduled-tasks scope, got ' + schedScope);
+  ok(policySectors().length === 1, 'scheduled-tasks renders exactly 1 policy sector, got ' + policySectors().length);
+  ok(sectors().length === 1, 'scheduled-tasks no overview sector, total=' + sectors().length);
+  ok(policySectors()[0] && headerText(policySectors()[0]) === '调度策略',
+    'scheduled-tasks single sector is 调度策略 (key schedule), got ' + (policySectors()[0] && headerText(policySectors()[0])));
+  // 无策略编辑入口：成功渲染下不出现任何 button/input
+  const schedEditable = findTag(policySectors()[0], 'button').concat(findTag(policySectors()[0], 'input'));
+  ok(schedEditable.length === 0, 'scheduled-tasks has no policy edit entry (button/input), got ' + schedEditable.length);
+
+  // 14. scheduled-tasks 载荷缺失 schedule 项时显示错误态而非回落全量。
+  const missingSched = validPayload();
+  missingSched.policies = missingSched.policies.filter((p) => p.key !== 'schedule');
+  const missingSchedEnv = freshEnv({ listPolicies: () => Promise.resolve(missingSched) });
+  missingSchedEnv.NAGENT.security.init(scheduledTasksState());
+  await tick();
+  ok(allTexts(elements['tab-security']).join('|').indexOf('策略加载失败') !== -1,
+    'missing schedule policy shows 策略加载失败 (no full-scope fallback)');
+  ok(sectors().length === 0, 'missing schedule policy clears sectors, got ' + sectors().length);
+
+  // 15. 跨 scope 延迟响应：sessions -> scheduled-tasks -> 全局安全及反向切换，旧 scope 不覆盖当前。
+  let resolveStSessions, resolveStGlobal;
+  const stSessions = new Promise((res) => { resolveStSessions = res; });
+  const stGlobal = new Promise((res) => { resolveStGlobal = res; });
+  const raceStEnv = freshEnv({ listPolicies: (scope) => {
+    if (scope === 'sessions') return stSessions;
+    if (scope === 'overview') return stGlobal;
+    return Promise.resolve(validPayload(scope));
+  } });
+  raceStEnv.NAGENT.security.init(stateFor('sessions'));       // token 1, delayed
+  raceStEnv.NAGENT.security.activate(scheduledTasksState());  // token 2, resolves now
+  raceStEnv.NAGENT.security.activate(stateFor('overview'));   // token 3, delayed
+  // scheduled-tasks 为当前 scope（token 3 未返回前 token 2 先落地）
+  raceStEnv.NAGENT.security.activate(scheduledTasksState());  // token 4 (current)
+  await tick();
+  ok(policySectors().length === 1 && headerText(policySectors()[0]) === '调度策略',
+    'current scheduled-tasks renders single 调度策略 sector');
+  resolveStSessions(validPayload('sessions'));
+  await tick();
+  ok(policySectors().length === 1 && headerText(policySectors()[0]) === '调度策略',
+    'late sessions response does not overwrite scheduled-tasks');
+  resolveStGlobal(validPayload('overview'));
+  await tick();
+  ok(policySectors().length === 1 && headerText(policySectors()[0]) === '调度策略',
+    'late global overview response does not overwrite scheduled-tasks');
+  // 反向：scheduled-tasks -> overview，旧 scheduled-tasks 响应不得覆盖
+  let resolveStBack;
+  const stBack = new Promise((res) => { resolveStBack = res; });
+  const raceBackEnv = freshEnv({ listPolicies: (scope) => scope === 'scheduled-tasks'
+    ? stBack : Promise.resolve(validPayload(scope)) });
+  raceBackEnv.NAGENT.security.init(scheduledTasksState());    // delayed
+  raceBackEnv.NAGENT.security.activate(stateFor('overview')); // current
+  await tick();
+  ok(policySectors().length === 11, 'later overview activation renders 11 sectors, got ' + policySectors().length);
+  resolveStBack(validPayload('scheduled-tasks'));
+  await tick();
+  ok(policySectors().length === 11, 'late scheduled-tasks response does not overwrite overview');
+
+  // 16. scheduled-tasks 错误态均可重试：缺少 schedule、载荷无效、网络失败；重试成功仍只显示 schedule。
+  for (const failCase of [
+    { name: 'missing schedule', first: () => { const p = validPayload(); p.policies = p.policies.filter((x) => x.key !== 'schedule'); return Promise.resolve(p); } },
+    { name: 'invalid payload', first: () => Promise.resolve({ profile_version: 'v1', policies: 'broken' }) },
+    { name: 'network failure', first: () => Promise.reject(new Error('offline-secret')) },
+  ]) {
+    let attempt = 0;
+    const scopes = [];
+    const env = freshEnv({ listPolicies: (scope) => {
+      attempt++; scopes.push(scope);
+      if (attempt === 1) return failCase.first();
+      return Promise.resolve(validPayload(scope));
+    } });
+    env.NAGENT.security.init(scheduledTasksState());
+    await tick();
+    const errText = allTexts(elements['tab-security']).join('|');
+    ok(errText.indexOf('策略加载失败') !== -1, 'scheduled-tasks ' + failCase.name + ' shows 策略加载失败');
+    ok(errText.indexOf('offline') === -1, 'scheduled-tasks ' + failCase.name + ' does not leak exception text');
+    ok(errText.indexOf('重试') !== -1, 'scheduled-tasks ' + failCase.name + ' shows retry button');
+    const btn = (function findRetry(node) {
+      if (node && node.tag === 'button' && node.textContent === '重试') return node;
+      for (const child of (node && node.children) || []) {
+        const found = findRetry(child);
+        if (found) return found;
+      }
+      return null;
+    }(elements['tab-security']));
+    ok(!!btn, 'scheduled-tasks ' + failCase.name + ' exposes retry button');
+    if (btn) (btn._listeners.click || []).forEach((fn) => fn());
+    await tick();
+    ok(attempt === 2, 'scheduled-tasks ' + failCase.name + ' retry performs second request');
+    ok(scopes.length === 2 && scopes[0] === 'scheduled-tasks' && scopes[1] === 'scheduled-tasks',
+      'scheduled-tasks ' + failCase.name + ' retry keeps scheduled-tasks scope');
+    ok(policySectors().length === 1 && headerText(policySectors()[0]) === '调度策略',
+      'scheduled-tasks ' + failCase.name + ' retry success renders only 调度策略 sector');
+  }
+
   if (failures) { console.error(failures + ' failure(s)'); process.exit(1); }
   console.log('OK security frontend harness passed');
   process.exit(0);

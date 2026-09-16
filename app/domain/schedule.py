@@ -215,6 +215,9 @@ class ScheduledTaskRegistry(Protocol):
     async def list_executions(self, task_id: str, limit: int) -> list[ScheduledTaskExecution]:
         ...
 
+    async def list_all_executions(self, limit: int, task_id: str | None = None) -> list[ScheduledTaskExecution]:
+        ...
+
     async def mark_dashboard_unread(self, task_id: str, claim_id: str, lease_owner: str) -> bool:
         ...
 

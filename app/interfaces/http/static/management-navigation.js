@@ -43,6 +43,11 @@
       { tab: 'tasks-observations', path: '/tasks/observations', label: '观测', concern: 'observation', scope: 'tasks', topnavParent: 'tasks' },
       { tab: 'tasks-security', path: '/tasks/security', label: '安全', concern: 'security', scope: 'tasks', topnavParent: 'tasks' },
     ],
+    'scheduled-tasks': [
+      { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '管理', concern: 'management', scope: 'scheduled-tasks', topnavParent: 'scheduled-tasks' },
+      { tab: 'scheduled-tasks-observations', path: '/scheduled-tasks/observations', label: '观测', concern: 'observation', scope: 'scheduled-tasks', topnavParent: 'scheduled-tasks' },
+      { tab: 'scheduled-tasks-security', path: '/scheduled-tasks/security', label: '安全', concern: 'security', scope: 'scheduled-tasks', topnavParent: 'scheduled-tasks' },
+    ],
     sessions: [
       { tab: 'sessions', path: '/sessions', label: '管理', concern: 'management', scope: 'sessions', topnavParent: 'sessions' },
       { tab: 'observations-sessions', path: '/sessions/observations', label: '观测', concern: 'observation', scope: 'sessions', topnavParent: 'sessions' },
@@ -86,6 +91,12 @@
     // 顶导归 sessions 子域（左导一级"会话"父项高亮），与 /security/sessions 共享
     // security.js renderer（renderTab='security'），与 /tasks/security 同款范式。
     { paths: ['/sessions/security'], tab: 'security-sessions', renderTab: 'security', sidebarTab: 'sessions', topnavParent: 'sessions', scope: 'sessions' },
+    // /scheduled-tasks/observations 是"定时任务观测"页面的独立 routeConfig entry，
+    // 顶导与左导均归左导一级"定时任务"语义，使用独立 renderer。
+    { paths: ['/scheduled-tasks/observations'], tab: 'scheduled-tasks-observations', renderTab: 'scheduled-tasks-observations', sidebarTab: 'scheduled-tasks', topnavParent: 'scheduled-tasks', scope: 'scheduled-tasks' },
+    // /scheduled-tasks/security 是"定时任务-安全"页面的独立 routeConfig entry，
+    // 与 /tasks/security 同款范式，共享 security.js renderer（renderTab='security'）。
+    { paths: ['/scheduled-tasks/security'], tab: 'scheduled-tasks-security', renderTab: 'security', sidebarTab: 'scheduled-tasks', topnavParent: 'scheduled-tasks', scope: 'scheduled-tasks' },
   ];
   const sidebarOverride = { '/observations/tasks': 'observations-sessions' };
 

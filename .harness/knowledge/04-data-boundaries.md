@@ -237,6 +237,7 @@ idx_plugins_enabled ON plugins(enabled)
 idx_scheduled_tasks_due ON scheduled_tasks(enabled, status, next_run_at)
 idx_scheduled_tasks_session ON scheduled_tasks(session_id)
 idx_scheduled_executions_task_created ON scheduled_task_executions(task_id, created_at)
+idx_scheduled_executions_created ON scheduled_task_executions(created_at)（跨任务执行记录总览 `list_all_executions` 无过滤 ORDER BY created_at DESC 用，幂等迁移随 `_initialize_schedule_schema` 建/复）
 idx_sandbox_released_history_released_at ON sandbox_released_history(released_at)
 idx_sandbox_execution_history_created_at ON sandbox_execution_history(created_at)
 idx_sandbox_execution_history_session_created_at ON sandbox_execution_history(session_id, created_at)

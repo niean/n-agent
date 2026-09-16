@@ -88,7 +88,8 @@ def test_all_tab_paths_return_shell(tmp_path):
         "/memory", "/sandbox",
         "/tools", "/tools/builtin", "/tools/knowledge", "/tools/mcp", "/tools/skill", "/tools/plugin",
         "/tools/external-memory", "/tools/sandbox",
-        "/models", "/observations/sessions", "/observations/modules", "/scheduled-tasks", "/platforms", "/security",
+        "/models", "/observations/sessions", "/observations/modules", "/scheduled-tasks",
+        "/scheduled-tasks/observations", "/scheduled-tasks/security", "/platforms", "/security",
         "/tasks/observations", "/observations/tasks", "/browser", "/browser/session",
     )
     for path in paths:
@@ -173,6 +174,7 @@ def test_static_assets_served(tmp_path):
         "/static/models.js",
         "/static/health.js",
         "/static/scheduled-tasks.js",
+        "/static/scheduled-tasks-observations.js",
         "/static/platforms.js",
         "/static/skills.js",
         "/static/knowledge.js",
@@ -352,6 +354,30 @@ def test_static_assets_contain_expected_logic(tmp_path):
         'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
         'observations-sessions', 'observations-modules', 'security-overview',
     ], f"summary ENTRIES order mismatch: {summary_entry_tabs}"
+    # T6: 定时任务观测页前端接线（容器唯一 + 脚本顺序 + app.js 模块映射）
+    html = client.get('/chat').text
+    assert html.count('id="tab-scheduled-tasks-observations"') == 1, \
+        "index.html must contain exactly one tab-scheduled-tasks-observations container"
+    assert html.index('id="tab-scheduled-tasks"') < html.index('id="tab-scheduled-tasks-observations"'), \
+        "observations container must follow the scheduled-tasks container"
+    assert html.count('/static/scheduled-tasks-observations.js') == 1, \
+        "index.html must load scheduled-tasks-observations.js exactly once"
+    assert html.index('/static/scheduled-tasks.js') < html.index('/static/scheduled-tasks-observations.js'), \
+        "scheduled-tasks-observations.js must load after scheduled-tasks.js"
+    assert html.index('/static/management-ui.js') < html.index('/static/scheduled-tasks-observations.js'), \
+        "scheduled-tasks-observations.js must load after management-ui.js"
+    assert html.index('/static/management-api.js') < html.index('/static/scheduled-tasks-observations.js'), \
+        "scheduled-tasks-observations.js must load after management-api.js"
+    assert html.index('/static/scheduled-tasks-observations.js') < html.index('/static/app.js'), \
+        "scheduled-tasks-observations.js must load before app.js"
+    app_js = client.get('/static/app.js').text
+    assert 'scheduledTasksObservations' in app_js, \
+        "app.js resolveModule must map scheduled-tasks-observations to namespace.scheduledTasksObservations"
+    assert "'scheduled-tasks-observations': false" in app_js, \
+        "app.js initialized must include the scheduled-tasks-observations key"
+    # 安全页仍只有一个 tab-security 容器和 security 初始化键
+    assert html.count('id="tab-security"') == 1, "exactly one tab-security container"
+    assert app_js.count("security: false") == 1, "exactly one security initialized key"
 
 
 def test_platforms_static_assets_contain_readonly_ui(tmp_path):
@@ -928,6 +954,7 @@ def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',
                  '/static/models.js', '/static/health.js', '/static/summary.js', '/static/scheduled-tasks.js',
+                 '/static/scheduled-tasks-observations.js',
                  '/static/skills.js', '/static/knowledge.js', '/static/plugin.js', '/static/external-memory.js',
                  '/static/topnav.js', '/static/tasks-observations.js'):
         body = client.get(path).text
@@ -963,6 +990,7 @@ def test_index_html_links_assets(tmp_path):
         '/static/models.js',
         '/static/health.js',
         '/static/scheduled-tasks.js',
+        '/static/scheduled-tasks-observations.js',
         '/static/skills.js',
         '/static/knowledge.js',
         '/static/plugin.js',

@@ -1277,6 +1277,14 @@ def _register_schedule_routes(router: APIRouter, schedule_service: ScheduleServi
             return _schedule_error_response(exc)
         return _scheduled_task_to_dict(task)
 
+    @router.get("/chat/scheduled-tasks/executions")
+    async def list_all_scheduled_task_executions(task_id: str | None = None, limit: int = 50):
+        try:
+            executions = await schedule_service.list_all_executions(limit=limit, task_id=task_id)
+            return [_scheduled_execution_to_dict(item) for item in executions]
+        except Exception as exc:
+            return _schedule_error_response(exc)
+
     @router.get("/chat/scheduled-tasks/{task_id}")
     async def get_scheduled_task(task_id: str):
         try:

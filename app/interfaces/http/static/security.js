@@ -13,6 +13,7 @@
     sessions: Object.freeze(['turn', 'context', 'llm', 'tool', 'budget', 'information_flow', 'delegation']),
     memory: Object.freeze(['memory']),
     sandbox: Object.freeze(['sandbox']),
+    'scheduled-tasks': Object.freeze(['schedule']),
   });
   const state = { data: null, loading: false, error: '', token: 0, scope: null };
   let initialized = false;

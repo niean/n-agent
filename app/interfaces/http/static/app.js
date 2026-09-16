@@ -8,6 +8,7 @@
     'observations-modules': false,
     'observations-sessions': false,
     'scheduled-tasks': false,
+    'scheduled-tasks-observations': false,
     tasks: false,
     artifacts: false,
     'tasks-observations': false,
@@ -35,6 +36,7 @@
     if (tab === 'tasks') return namespace.tasks;
     if (tab === 'artifacts') return namespace.artifacts;
     if (tab === 'tasks-observations') return namespace.tasksObservations;
+    if (tab === 'scheduled-tasks-observations') return namespace.scheduledTasksObservations;
     if (tab === 'tasks-security') return namespace.tasksSecurity;
     if (tab === 'tools-builtin' || tab === 'tools-mcp') return namespace.tools;
     if (tab === 'tools-skill') return namespace.skills;

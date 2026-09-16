@@ -155,7 +155,7 @@ function loadNavigation(opts) {
   const toggle = makeEl('button');
   toggle.id = 'sidebar-toggle';
 
-  const tabIds = ['summary', 'chat', 'tasks', 'scheduled-tasks', 'sessions', 'memory',
+  const tabIds = ['summary', 'chat', 'tasks', 'scheduled-tasks', 'scheduled-tasks-observations', 'sessions', 'memory',
     'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
     'sandbox', 'executors-host', 'models', 'platforms',
     'observations-sessions', 'observations-modules', 'security',
@@ -747,6 +747,130 @@ ok(componentPopState && componentInitState
   && componentPopState.route === componentInitState.route,
   'component popstate preserves all route state fields');
 ok(componentDirect.pushStateCalls.length === 0, 'component popstate does not pushState');
+
+// ===========================================================================
+// T4: scheduled-tasks subdomain (管理 | 观测 | 安全) — topnavConfig + routeConfig
+// 精确比较三项 tab/path/label/concern/scope/topnavParent 及顺序；两个新路径
+// resolve 到独立 routeConfig entry；详情路径回落管理；三页导航后顶导/左导/标题正确。
+// ===========================================================================
+const expectedScheduledTopnav = [
+  { tab: 'scheduled-tasks', path: '/scheduled-tasks', label: '管理', concern: 'management', scope: 'scheduled-tasks', topnavParent: 'scheduled-tasks' },
+  { tab: 'scheduled-tasks-observations', path: '/scheduled-tasks/observations', label: '观测', concern: 'observation', scope: 'scheduled-tasks', topnavParent: 'scheduled-tasks' },
+  { tab: 'scheduled-tasks-security', path: '/scheduled-tasks/security', label: '安全', concern: 'security', scope: 'scheduled-tasks', topnavParent: 'scheduled-tasks' },
+];
+ok(Array.isArray(nav.topnavConfig['scheduled-tasks']),
+  'T4 A1 topnavConfig[scheduled-tasks] exists');
+ok(nav.topnavConfig['scheduled-tasks'] && nav.topnavConfig['scheduled-tasks'].length === 3,
+  'T4 A1 topnavConfig[scheduled-tasks] has exactly 3 items (got '
+  + (nav.topnavConfig['scheduled-tasks'] && nav.topnavConfig['scheduled-tasks'].length) + ')');
+ok(nav.topnavConfig['scheduled-tasks']
+  && JSON.stringify(nav.topnavConfig['scheduled-tasks']) === JSON.stringify(expectedScheduledTopnav),
+  'T4 A1 topnavConfig[scheduled-tasks] deep-equals 管理|观测|安全 contract in order (got '
+  + JSON.stringify(nav.topnavConfig['scheduled-tasks']) + ')');
+
+// --- T4 A2: /scheduled-tasks/observations resolves to an independent entry ---
+state = nav.resolveRoute('/scheduled-tasks/observations');
+ok(state.activeTab === 'scheduled-tasks-observations',
+  'T4 A2 /scheduled-tasks/observations activeTab (got ' + state.activeTab + ')');
+ok(state.renderTab === 'scheduled-tasks-observations',
+  'T4 A2 /scheduled-tasks/observations renderTab (got ' + state.renderTab + ')');
+ok(state.sidebarTab === 'scheduled-tasks',
+  'T4 A2 /scheduled-tasks/observations sidebarTab (got ' + state.sidebarTab + ')');
+ok(state.currentSubdomain === 'scheduled-tasks',
+  'T4 A2 /scheduled-tasks/observations currentSubdomain (got ' + state.currentSubdomain + ')');
+ok(state.route !== null, 'T4 A2 /scheduled-tasks/observations route non-null (independent entry)');
+if (state.route) {
+  ok(state.route.renderTab === 'scheduled-tasks-observations', 'T4 A2 observations route.renderTab');
+  ok(state.route.sidebarTab === 'scheduled-tasks', 'T4 A2 observations route.sidebarTab');
+  ok(state.route.topnavParent === 'scheduled-tasks', 'T4 A2 observations route.topnavParent');
+  ok(state.route.scope === 'scheduled-tasks', 'T4 A2 observations route.scope');
+  ok(state.route.paths.length === 1 && state.route.paths[0] === '/scheduled-tasks/observations',
+    'T4 A2 observations route.paths is the single canonical path');
+  ok(nav.buildRouteByPath([state.route])['/scheduled-tasks/observations'] === state.route,
+    'T4 A2 buildRouteByPath accepts /scheduled-tasks/observations and maps the same entry');
+}
+
+// --- T4 A3: /scheduled-tasks/security resolves to an independent entry sharing security renderer ---
+state = nav.resolveRoute('/scheduled-tasks/security');
+ok(state.activeTab === 'scheduled-tasks-security',
+  'T4 A3 /scheduled-tasks/security activeTab (got ' + state.activeTab + ')');
+ok(state.renderTab === 'security',
+  'T4 A3 /scheduled-tasks/security renderTab === security (shared renderer, got ' + state.renderTab + ')');
+ok(state.sidebarTab === 'scheduled-tasks',
+  'T4 A3 /scheduled-tasks/security sidebarTab (got ' + state.sidebarTab + ')');
+ok(state.currentSubdomain === 'scheduled-tasks',
+  'T4 A3 /scheduled-tasks/security currentSubdomain (got ' + state.currentSubdomain + ')');
+ok(state.route !== null, 'T4 A3 /scheduled-tasks/security route non-null (independent entry)');
+if (state.route) {
+  ok(state.route.renderTab === 'security', 'T4 A3 security route.renderTab === security');
+  ok(state.route.sidebarTab === 'scheduled-tasks', 'T4 A3 security route.sidebarTab');
+  ok(state.route.topnavParent === 'scheduled-tasks', 'T4 A3 security route.topnavParent');
+  ok(state.route.scope === 'scheduled-tasks', 'T4 A3 security route.scope');
+  ok(state.route.paths.length === 1 && state.route.paths[0] === '/scheduled-tasks/security',
+    'T4 A3 security route.paths is the single canonical path');
+  ok(nav.buildRouteByPath([state.route])['/scheduled-tasks/security'] === state.route,
+    'T4 A3 buildRouteByPath accepts /scheduled-tasks/security and maps the same entry');
+}
+
+// --- T4 A4: detail path /scheduled-tasks/{id} falls back to management ---
+state = nav.resolveRoute('/scheduled-tasks/42');
+ok(state.activeTab === 'scheduled-tasks',
+  'T4 A4 /scheduled-tasks/42 activeTab === scheduled-tasks (got ' + state.activeTab + ')');
+ok(state.route === null, 'T4 A4 /scheduled-tasks/42 route null (no entry)');
+ok(state.currentSubdomain === 'scheduled-tasks',
+  'T4 A4 /scheduled-tasks/42 currentSubdomain === scheduled-tasks (got ' + state.currentSubdomain + ')');
+const scheduledActiveItem = nav.activeTopnavItem(nav.topnavConfig['scheduled-tasks'], state.activeTab);
+ok(scheduledActiveItem !== null && scheduledActiveItem.tab === 'scheduled-tasks'
+  && scheduledActiveItem.path === '/scheduled-tasks',
+  'T4 A4 activeTopnavItem resolves to the 管理 item for the detail path');
+
+// --- T4 A5: three pages navigatePath -> topnav state, leftnav highlight, title ---
+const scheduledNav = loadNavigation({ pathname: '/scheduled-tasks' });
+const scheduledStates = [];
+scheduledNav.win.NAGENT.app = { onTabActivated(s) { scheduledStates.push(s); } };
+const scheduledNavCases = [
+  ['/scheduled-tasks', 'scheduled-tasks', 'scheduled-tasks', '定时任务', 'tab-scheduled-tasks'],
+  ['/scheduled-tasks/observations', 'scheduled-tasks-observations', 'scheduled-tasks-observations', '观测', 'tab-scheduled-tasks-observations'],
+  ['/scheduled-tasks/security', 'scheduled-tasks-security', 'security', '安全', 'tab-security'],
+];
+scheduledNavCases.forEach(([path, expectedActive, expectedRender, expectedTitle, expectedContainer]) => {
+  scheduledNav.nav.navigatePath(path);
+  const s = scheduledStates[scheduledStates.length - 1];
+  ok(s && s.activeTab === expectedActive, 'T4 A5 ' + path + ' activeTab (got ' + (s && s.activeTab) + ')');
+  ok(s && s.renderTab === expectedRender, 'T4 A5 ' + path + ' renderTab (got ' + (s && s.renderTab) + ')');
+  ok(s && s.currentSubdomain === 'scheduled-tasks', 'T4 A5 ' + path + ' currentSubdomain');
+  const sidebarActive = scheduledNav.doc.querySelector('[data-tab="scheduled-tasks"]');
+  ok(sidebarActive && sidebarActive.classList.contains('sidebar__item--active'),
+    'T4 A5 ' + path + ' leftnav 定时任务 highlighted');
+  ok(scheduledNav.byId['topbar-title']._text === expectedTitle,
+    'T4 A5 ' + path + ' topbar title === ' + expectedTitle + ' (got ' + scheduledNav.byId['topbar-title']._text + ')');
+  ok(scheduledNav.byId[expectedContainer] && scheduledNav.byId[expectedContainer].classList.contains('active'),
+    'T4 A5 ' + path + ' activates #' + expectedContainer);
+});
+ok(scheduledNav.byId['tab-scheduled-tasks-security'] === undefined,
+  'T4 A5 no tab-scheduled-tasks-security container is created (security page reuses #tab-security)');
+
+// --- T4 A6: popstate -> /scheduled-tasks/observations resolves to scheduled-tasks subdomain ---
+const scheduledPop = loadNavigation({ pathname: '/scheduled-tasks' });
+const scheduledPopStates = [];
+scheduledPop.win.NAGENT.app = { onTabActivated(s) { scheduledPopStates.push(s); } };
+scheduledPop.nav.initNavigation();
+const scheduledPopListeners = scheduledPop.win._listeners.popstate || [];
+ok(scheduledPopListeners.length >= 1, 'T4 A6 popstate listener registered');
+scheduledPop.win.location.pathname = '/scheduled-tasks/observations';
+scheduledPopListeners.forEach((fn) => fn({ path: '/scheduled-tasks/observations' }));
+const scheduledPopState = scheduledPopStates[scheduledPopStates.length - 1];
+ok(scheduledPopState && scheduledPopState.activeTab === 'scheduled-tasks-observations',
+  'T4 A6 popstate activeTab === scheduled-tasks-observations (got ' + (scheduledPopState && scheduledPopState.activeTab) + ')');
+ok(scheduledPopState && scheduledPopState.renderTab === 'scheduled-tasks-observations',
+  'T4 A6 popstate renderTab === scheduled-tasks-observations');
+ok(scheduledPopState && scheduledPopState.sidebarTab === 'scheduled-tasks',
+  'T4 A6 popstate sidebarTab === scheduled-tasks');
+ok(scheduledPopState && scheduledPopState.currentSubdomain === 'scheduled-tasks',
+  'T4 A6 popstate currentSubdomain === scheduled-tasks (independent entry)');
+ok(scheduledPop.byId['topbar-title']._text === '观测',
+  'T4 A6 popstate topbar title === 观测 (got ' + scheduledPop.byId['topbar-title']._text + ')');
+ok(scheduledPop.pushStateCalls.length === 0, 'T4 A6 popstate does not pushState');
 
 // ===========================================================================
 // T3: TopNav component (topnav.js)

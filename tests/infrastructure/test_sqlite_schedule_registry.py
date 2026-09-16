@@ -380,6 +380,179 @@ async def test_list_executions_returns_recent_history(registry):
     assert executions[0].output == "output-2"
 
 
+_NOW = datetime(2026, 6, 16, 0, 0, tzinfo=timezone.utc)
+
+
+def _execution(execution_id, task_id, created_at, status=ScheduledTaskExecutionStatus.SUCCEEDED, started_at=None):
+    return ScheduledTaskExecution(
+        id=execution_id,
+        task_id=task_id,
+        session_id="session-1",
+        claim_id=f"claim-{execution_id}",
+        lease_owner=f"owner-{execution_id}",
+        status=status,
+        started_at=started_at if started_at is not None else created_at,
+        completed_at=created_at,
+        created_at=created_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_all_executions_orders_filters_and_limits(registry):
+    await registry.create(_task("task-a"))
+    await registry.create(_task("task-b"))
+    # e1..e5 interleaved by created_at; task-b owns e2/e4
+    timeline = [("e1", "task-a"), ("e2", "task-b"), ("e3", "task-a"), ("e4", "task-b"), ("e5", "task-a")]
+    for index, (execution_id, task_id) in enumerate(timeline):
+        await registry.record_execution_started(
+            _execution(execution_id, task_id, _NOW + timedelta(minutes=index))
+        )
+
+    all_executions = await registry.list_all_executions(10)
+    assert [e.id for e in all_executions] == ["e5", "e4", "e3", "e2", "e1"]
+
+    limited = await registry.list_all_executions(2)
+    assert [e.id for e in limited] == ["e5", "e4"]
+
+    # filter first, then limit: must catch limit-then-filter bugs
+    filtered = await registry.list_all_executions(2, task_id="task-b")
+    assert [e.id for e in filtered] == ["e4", "e2"]
+
+    # deleting task-b keeps its execution history
+    assert await registry.delete("task-b") is True
+    all_after_delete = await registry.list_all_executions(10)
+    assert [e.id for e in all_after_delete] == ["e5", "e4", "e3", "e2", "e1"]
+    filtered_after_delete = await registry.list_all_executions(10, task_id="task-b")
+    assert [e.id for e in filtered_after_delete] == ["e4", "e2"]
+
+
+@pytest.mark.asyncio
+async def test_list_all_executions_states_and_ties(registry):
+    await registry.create(_task("task-a"))
+    statuses = [
+        ScheduledTaskExecutionStatus.RUNNING,
+        ScheduledTaskExecutionStatus.SUCCEEDED,
+        ScheduledTaskExecutionStatus.FAILED,
+        ScheduledTaskExecutionStatus.BLOCKED,
+        ScheduledTaskExecutionStatus.SKIPPED_MISSED,
+    ]
+    for index, status in enumerate(statuses):
+        await registry.record_execution_started(
+            _execution(f"state-{status.value}", "task-a", _NOW + timedelta(minutes=index), status=status)
+        )
+    # two records sharing the same created_at
+    tie_at = _NOW + timedelta(minutes=10)
+    await registry.record_execution_started(_execution("tie-1", "task-a", tie_at))
+    await registry.record_execution_started(_execution("tie-2", "task-a", tie_at))
+    # started_at order differs from created_at order: query must use created_at
+    await registry.record_execution_started(
+        _execution("late-created", "task-a", _NOW + timedelta(minutes=20), started_at=_NOW - timedelta(hours=1))
+    )
+    await registry.record_execution_started(
+        _execution("early-created", "task-a", _NOW - timedelta(hours=2), started_at=_NOW + timedelta(hours=1))
+    )
+
+    executions = await registry.list_all_executions(20)
+
+    created_times = [e.created_at for e in executions]
+    assert created_times == sorted(created_times, reverse=True)
+    assert {e.id for e in executions} == {
+        *(f"state-{s.value}" for s in statuses),
+        "tie-1",
+        "tie-2",
+        "late-created",
+        "early-created",
+    }
+    assert {e.status for e in executions} >= set(statuses)
+    assert executions[0].id == "late-created"
+    assert executions[-1].id == "early-created"
+
+
+@pytest.mark.asyncio
+async def test_list_all_executions_limit_50(registry):
+    await registry.create(_task("task-a"))
+    await registry.create(_task("task-b"))
+    for index in range(51):
+        task_id = "task-a" if index % 2 == 0 else "task-b"
+        await registry.record_execution_started(
+            _execution(f"exec-{index:03d}", task_id, _NOW + timedelta(minutes=index))
+        )
+
+    executions = await registry.list_all_executions(50)
+
+    assert len(executions) == 50
+    assert executions[0].id == "exec-050"
+    assert executions[-1].id == "exec-001"
+
+
+def _snapshot_rows(db_path):
+    with sqlite3.connect(db_path) as conn:
+        tasks = conn.execute("SELECT * FROM scheduled_tasks ORDER BY id").fetchall()
+        executions = conn.execute("SELECT * FROM scheduled_task_executions ORDER BY id").fetchall()
+    return tasks, executions
+
+
+def _created_at_index_columns(db_path):
+    with sqlite3.connect(db_path) as conn:
+        info = conn.execute("PRAGMA index_info('idx_scheduled_executions_created')").fetchall()
+    return [row[2] for row in info]
+
+
+@pytest.mark.asyncio
+async def test_created_at_index_migrated_idempotently(tmp_path):
+    # fresh database: index exists with exactly the created_at column
+    fresh_path = tmp_path / "fresh.db"
+    SQLiteScheduledTaskRegistry(fresh_path, CroniterScheduleCalculator())
+    assert _created_at_index_columns(fresh_path) == ["created_at"]
+
+    # existing database upgraded from a pre-index state
+    db_path = tmp_path / "existing.db"
+    registry = SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
+    await registry.create(_task("task-a"))
+    await registry.record_execution_started(_execution("exec-1", "task-a", _NOW))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_scheduled_executions_created")
+    assert _created_at_index_columns(db_path) == []
+    snapshot_before = _snapshot_rows(db_path)
+
+    SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
+    SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
+
+    assert _created_at_index_columns(db_path) == ["created_at"]
+    assert _snapshot_rows(db_path) == snapshot_before
+
+
+@pytest.mark.asyncio
+async def test_created_at_index_initialization_guards(tmp_path):
+    # initialize=False: no migration runs even though not read_only
+    db_path_no_init = tmp_path / "no_init.db"
+    registry = SQLiteScheduledTaskRegistry(db_path_no_init, CroniterScheduleCalculator())
+    await registry.create(_task("task-a"))
+    await registry.record_execution_started(_execution("exec-1", "task-a", _NOW))
+    with sqlite3.connect(db_path_no_init) as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_scheduled_executions_created")
+    snapshot_before = _snapshot_rows(db_path_no_init)
+
+    SQLiteScheduledTaskRegistry(db_path_no_init, CroniterScheduleCalculator(), initialize=False, read_only=False)
+
+    assert _created_at_index_columns(db_path_no_init) == []
+    assert _snapshot_rows(db_path_no_init) == snapshot_before
+
+    # read_only=True: initialization is skipped even when initialize=True
+    db_path_read_only = tmp_path / "read_only.db"
+    registry = SQLiteScheduledTaskRegistry(db_path_read_only, CroniterScheduleCalculator())
+    await registry.create(_task("task-a"))
+    await registry.record_execution_started(_execution("exec-1", "task-a", _NOW))
+    with sqlite3.connect(db_path_read_only) as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_scheduled_executions_created")
+    snapshot_before = _snapshot_rows(db_path_read_only)
+
+    SQLiteScheduledTaskRegistry(db_path_read_only, CroniterScheduleCalculator(), initialize=True, read_only=True)
+
+    assert _created_at_index_columns(db_path_read_only) == []
+    assert _snapshot_rows(db_path_read_only) == snapshot_before
+
+
 def _seed_legacy_origin_row(db_path, task_id: str, origin: dict, delivery_context: dict | None = None) -> None:
     SQLiteScheduledTaskRegistry(db_path, CroniterScheduleCalculator())
     with sqlite3.connect(db_path) as conn:

@@ -18,6 +18,10 @@ class FakeRegistry:
         self.tasks = {}
         self.executions = []
         self.missing_session = None
+        self.last_all = None
+        self.all_executions = []
+        self.get_calls = []
+        self.list_all_calls = []
 
     async def create(self, task):
         self.tasks[task.id] = task
@@ -27,7 +31,13 @@ class FakeRegistry:
         return list(self.tasks.values())
 
     async def get(self, task_id):
+        self.get_calls.append(task_id)
         return self.tasks.get(task_id)
+
+    async def list_all_executions(self, limit, task_id=None):
+        self.last_all = (limit, task_id)
+        self.list_all_calls.append((limit, task_id))
+        return self.all_executions
 
     async def update(self, task):
         self.tasks[task.id] = task
@@ -181,6 +191,84 @@ async def test_schedule_service_list_executions_validates_task_and_limit():
         await service.list_executions(task.id, 51)
     with pytest.raises(ScheduledTaskNotFoundError):
         await service.list_executions("missing", 10)
+
+
+@pytest.mark.asyncio
+async def test_list_all_executions_validates_limit_and_task():
+    service, registry, _ = _service()
+    task = await service.create(ScheduledTaskCreateInput(name="x", prompt="ok", cron_expression="* * * * *"))
+
+    assert await service.list_all_executions() == []
+    assert registry.last_all == (50, None)
+    # 空字符串 task_id 统一为无过滤
+    assert await service.list_all_executions(limit=1, task_id="") == []
+    assert registry.last_all == (1, None)
+    assert await service.list_all_executions(limit=200, task_id=task.id) == []
+    assert registry.last_all == (200, task.id)
+    for bad in (0, 201, -1):
+        with pytest.raises(ScheduleValidationError):
+            await service.list_all_executions(bad)
+    for bad_type in (True, False, "50", "", "abc", 1.5, None):
+        with pytest.raises(ScheduleValidationError):
+            await service.list_all_executions(bad_type)
+    with pytest.raises(ScheduledTaskNotFoundError):
+        await service.list_all_executions(10, "missing")
+
+
+@pytest.mark.asyncio
+async def test_list_all_executions_validation_order_and_passthrough():
+    service, registry, _ = _service()
+    task = await service.create(ScheduledTaskCreateInput(name="x", prompt="ok", cron_expression="* * * * *"))
+
+    # 非法 limit + missing id：先抛 ScheduleValidationError，两个 registry 方法均不调用
+    registry.get_calls.clear()
+    registry.list_all_calls.clear()
+    with pytest.raises(ScheduleValidationError):
+        await service.list_all_executions(0, "missing")
+    assert registry.get_calls == []
+    assert registry.list_all_calls == []
+
+    # task_id="" 不调用 get，直接以 None 查询
+    registry.get_calls.clear()
+    registry.list_all_calls.clear()
+    await service.list_all_executions(task_id="")
+    assert registry.get_calls == []
+    assert registry.list_all_calls == [(50, None)]
+
+    # 非空 id（含首尾空格）原样传入 get、不 trim
+    registry.get_calls.clear()
+    registry.list_all_calls.clear()
+    padded = f" {task.id} "
+    with pytest.raises(ScheduledTaskNotFoundError):
+        await service.list_all_executions(task_id=padded)
+    assert registry.get_calls == [padded]
+    assert registry.list_all_calls == []
+
+    registry.get_calls.clear()
+    registry.list_all_calls.clear()
+    await service.list_all_executions(10, task.id)
+    assert registry.get_calls == [task.id]
+    assert registry.list_all_calls == [(10, task.id)]
+
+    # 非空哨兵列表原样返回
+    registry.get_calls.clear()
+    registry.list_all_calls.clear()
+    sentinel = [object(), object()]
+    registry.all_executions = sentinel
+    assert await service.list_all_executions() is sentinel
+
+    # 模拟 get 成功后任务被并发删除，仍允许返回查询结果
+    original_get = registry.get
+
+    async def get_then_delete(task_id):
+        task_obj = await original_get(task_id)
+        registry.tasks.pop(task_id, None)
+        return task_obj
+
+    registry.get = get_then_delete
+    result = await service.list_all_executions(10, task.id)
+    assert result is sentinel
+    assert task.id not in registry.tasks
 
 
 @pytest.mark.asyncio

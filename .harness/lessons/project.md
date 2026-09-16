@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
 # 项目教训
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
@@ -539,3 +539,10 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：三个 Registry（task/artifact/delegation）对共享的 `locals/sessions.db` 设置 `journal_mode=WAL`；WAL 强制 mmap `-shm` 共享内存索引，而 `locals/` 是 macOS 宿主 bind mount（virtiofs），mmap 语义不完整，并发写入文件大小变化时 mmap 越界即 SIGBUS。`PRAGMA mmap_size=0` 无法关闭 WAL 的 shm mmap（只控制主库文件）
 - 教训：存储引擎选型要核查其对文件系统语义的要求（WAL=mmap）与部署挂载形态的交集；exit 135/139 无 traceback 时优先怀疑 mmap 类信号而非 OOM（OOM 是 137 且 OOMKilled=true）；docker events 的 `die exitCode` + 无前置 kill 是区分"自杀式信号崩溃"与"外部 kill"的关键证据链。修复：全局统一 `journal_mode=DELETE`（`sqlite_support.apply_journal_mode`），代价是写期间全库互斥，busy_timeout 兜底
 - 来源：2026-09-16 会话 e2e 容器 SIGBUS 修复（spec-260916-sqlite-journal-bind-mount）
+
+### P055: 加载态重建 select options 会被浏览器 value 回落语义吞掉当前选中值
+
+- 现象：定时任务观测页选择任务过滤后，请求永远按"全部任务"发出；Node harness 全绿，真实浏览器必现——`startLoad` 先置 loading 重建 options（仅"全部任务"），浏览器对无匹配 option 的 `select.value` 赋值会回落 `selectedIndex=-1`（value 读回 ''），随后的同步块把空值写回过滤状态
+- 根因：HTML 规范中 select 的 value 不是自由属性，赋值无匹配 option 时静默失效；而 Node DOM 桩把 value 当自由属性，测试无法暴露。修复：loading 期间保留既有 option DOM、不同步 value；非 loading 才全量重建（错误/恢复路径先清空过滤状态再重建）
+- 教训：凡涉及原生表单控件选中态的异步重建，harness 桩必须模拟浏览器 value 语义（赋值无匹配 option 得 ''、options 变更时重校验回落首项），否则"桩上绿、浏览器红"；实现侧先捕获当前选中值再触发任何 options 重建
+- 来源：2026-09-16 定时任务顶导标准化 T6 代码质量审查（spec-260916-scheduled-topnav）

@@ -79,6 +79,14 @@
     body: JSON.stringify(payload || {}),
   });
   const listScheduledTaskExecutions = (id, limit) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/executions?limit=${encodeURIComponent(limit || 10)}`);
+  // 跨任务执行记录查询（观测页）：无过滤省略 task_id，默认 limit=50。
+  const listScheduledTaskExecutionsAll = ({ task_id, limit = 50 } = {}) => {
+    const params = new URLSearchParams();
+    if (task_id) params.set('task_id', task_id);
+    params.set('limit', String(limit));
+    const qs = params.toString();
+    return fetchJson(`/chat/scheduled-tasks/executions${qs ? `?${qs}` : ''}`);
+  };
   const runScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/run`, { method: 'POST' });
   const pauseScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/pause`, { method: 'POST' });
   const resumeScheduledTask = (id) => fetchJson(`/chat/scheduled-tasks/${encodeURIComponent(id)}/resume`, { method: 'POST' });
@@ -306,6 +314,7 @@
     createScheduledTask,
     updateScheduledTask,
     listScheduledTaskExecutions,
+    listScheduledTaskExecutionsAll,
     runScheduledTask,
     pauseScheduledTask,
     resumeScheduledTask,
