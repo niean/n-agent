@@ -259,11 +259,13 @@ def test_schema_creates_indexes(tmp_path):
     assert "idx_tasks_assignee_status" not in indexes
 
 
-def test_schema_wal_mode_enabled(tmp_path):
+def test_schema_journal_mode_delete(tmp_path):
+    # WAL 依赖 -shm mmap，在 macOS Docker Desktop bind mount 上会 SIGBUS；
+    # 全局统一 DELETE 回滚日志模式（不依赖 mmap）。
     reg = SQLiteTaskRegistry(str(tmp_path / "t.db"))
     with reg._connect() as conn:
         pragma = conn.execute("PRAGMA journal_mode").fetchone()
-    assert pragma[0].lower() == "wal"
+    assert pragma[0].lower() == "delete"
 
 
 def test_schema_foreign_keys_enabled(tmp_path):

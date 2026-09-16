@@ -167,6 +167,8 @@ Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPO
 
 ## SQLite schema
 
+全局 journal 模式约束：所有写连接统一 `journal_mode=DELETE`（回滚日志），禁止使用 WAL。原因：WAL 强制对 `-shm` 共享内存区做 mmap，而 Docker 部署中 `locals/` 是 macOS 宿主 bind mount（virtiofs），其 mmap 语义不完整，并发写入时会以 SIGBUS（容器 exit 135，无 traceback）杀掉进程。统一入口为 `app/infrastructure/sqlite_support.py` 的 `apply_journal_mode(conn)`；设置点伴随 `busy_timeout`（写期间全库互斥，读写都需等待兜底）。已有 WAL 库首次设置 DELETE 时自动 checkpoint 并清除 `-wal`/`-shm`。代价已接受：写期间读也阻塞，单实例产品写入短促可忽略。
+
 SQLite store 位于 `app/infrastructure/memory/sqlite_store.py`，初始化以下表：
 
 ```sql

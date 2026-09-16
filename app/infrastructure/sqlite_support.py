@@ -13,6 +13,21 @@ from pathlib import Path
 from urllib.parse import quote
 
 
+def apply_journal_mode(conn: sqlite3.Connection) -> None:
+    """Force ``journal_mode=DELETE`` on every writable connection.
+
+    WAL requires mmap of the ``-shm`` shared-memory index; on macOS Docker
+    Desktop host bind mounts (virtiofs/osxfs) mmap is unreliable and kills
+    the process with SIGBUS under concurrent writes. DELETE mode (rollback
+    journal) never mmaps, so it is safe on every deployment target. The
+    trade-off -- readers block during a write -- is acceptable for a
+    single-instance product and is absorbed by ``busy_timeout``.
+    Switching an existing WAL database checkpoints and removes ``-wal`` /
+    ``-shm`` automatically.
+    """
+    conn.execute("PRAGMA journal_mode = DELETE")
+
+
 def open_sqlite(path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
     """Open ``path``. With ``read_only`` the SQLite URI ``mode=ro`` is used:
     a missing file raises instead of being created, and every write raises

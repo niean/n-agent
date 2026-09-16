@@ -37,6 +37,7 @@ from dataclasses import replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.infrastructure.sqlite_support import apply_journal_mode
 from app.domain.artifact import (
     Artifact,
     ArtifactAttachmentSource,
@@ -274,7 +275,7 @@ class SQLiteArtifactRegistry:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=self.BUSY_TIMEOUT_MS / 1000.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
+        apply_journal_mode(conn)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(f"PRAGMA busy_timeout = {self.BUSY_TIMEOUT_MS}")
         return conn

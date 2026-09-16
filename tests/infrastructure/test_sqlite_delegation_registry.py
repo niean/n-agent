@@ -714,3 +714,11 @@ async def test_request_cancel_idempotent_reason(registry):
 async def test_get_result_set_returns_none_before_completion(registry):
     d = await registry.create_or_reconnect(_make_request())
     assert await registry.get_result_set(d.id) is None
+
+
+def test_journal_mode_delete_on_every_connection(tmp_path):
+    """Every connection uses DELETE journal mode (WAL -shm mmap 在 macOS bind mount 会 SIGBUS)。"""
+    reg = SQLiteDelegationRegistry(str(tmp_path / "d.db"))
+    with reg._connect() as conn:
+        val = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert val.lower() == "delete"

@@ -30,6 +30,13 @@ def test_project_harness_config_uses_runtime_values() -> None:
             "model": None,
             "timeoutSeconds": 900,
         },
+        "tests": {
+            "e2e": {
+                "enabled": False,
+                "command": "bash tests/e2e/run.sh",
+                "timeoutSeconds": 900,
+            }
+        },
         "hooks": {"afterFinish": {"enabled": True}},
     }
 
@@ -44,6 +51,13 @@ def test_template_harness_config_is_valid_and_disabled() -> None:
             "provider": "{{三方审阅 Provider 名称，已提供codex}}",
             "model": None,
             "timeoutSeconds": 900,
+        },
+        "tests": {
+            "e2e": {
+                "enabled": False,
+                "command": None,
+                "timeoutSeconds": 900,
+            }
         },
         "hooks": {"afterFinish": {"enabled": False}},
     }
@@ -70,12 +84,10 @@ def test_harness_config_is_registered_in_framework_and_template_scan() -> None:
     assert "scripts/get-config.sh" in framework
 
 
-def test_template_uses_the_same_generic_config_script() -> None:
-    template_script = TEMPLATE_ROOT / ".harness/framework/scripts/get-config.sh"
-
-    assert template_script.read_text(encoding="utf-8") == CONFIG_SCRIPT.read_text(
-        encoding="utf-8"
-    )
+def test_template_config_script_supports_e2e_defaults() -> None:
+    assert _run_config(TEMPLATE_ROOT, "tests.e2e.enabled").stdout == "false\n"
+    assert _run_config(TEMPLATE_ROOT, "tests.e2e.command").stdout == "\n"
+    assert _run_config(TEMPLATE_ROOT, "tests.e2e.timeoutSeconds").stdout == "900\n"
 
 
 def _run_config(
@@ -111,6 +123,9 @@ def test_config_script_reads_project_values() -> None:
     assert _run_config(PROJECT_ROOT, "thirdReview.provider").stdout == "codex\n"
     assert _run_config(PROJECT_ROOT, "thirdReview.model").stdout == "\n"
     assert _run_config(PROJECT_ROOT, "thirdReview.timeoutSeconds").stdout == "900\n"
+    assert _run_config(PROJECT_ROOT, "tests.e2e.enabled").stdout == "false\n"
+    assert _run_config(PROJECT_ROOT, "tests.e2e.command").stdout == "bash tests/e2e/run.sh\n"
+    assert _run_config(PROJECT_ROOT, "tests.e2e.timeoutSeconds").stdout == "900\n"
     assert _run_config(PROJECT_ROOT, "hooks.afterFinish.enabled").stdout == "true\n"
 
 
@@ -121,6 +136,9 @@ def test_config_script_uses_defaults_when_file_is_missing(tmp_path: Path) -> Non
     assert _run_config(root, "thirdReview.provider").stdout == "\n"
     assert _run_config(root, "thirdReview.model").stdout == "\n"
     assert _run_config(root, "thirdReview.timeoutSeconds").stdout == "900\n"
+    assert _run_config(root, "tests.e2e.enabled").stdout == "false\n"
+    assert _run_config(root, "tests.e2e.command").stdout == "\n"
+    assert _run_config(root, "tests.e2e.timeoutSeconds").stdout == "900\n"
     assert _run_config(root, "hooks.afterFinish.enabled").stdout == "false\n"
 
 
@@ -151,6 +169,40 @@ def test_config_script_rejects_invalid_json_and_types(tmp_path: Path) -> None:
     assert "thirdReview.enabled must be boolean" in type_result.stderr
 
 
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        ('{"version": 1, "tests": []}\n', "tests must be an object"),
+        ('{"version": 1, "tests": {"e2e": false}}\n', "tests.e2e must be an object"),
+        (
+            '{"version": 1, "tests": {"e2e": {"enabled": "true"}}}\n',
+            "tests.e2e.enabled must be boolean",
+        ),
+        (
+            '{"version": 1, "tests": {"e2e": {"command": 7}}}\n',
+            "tests.e2e.command must be string or null without control characters",
+        ),
+        (
+            '{"version": 1, "tests": {"e2e": {"timeoutSeconds": 0}}}\n',
+            "tests.e2e.timeoutSeconds must be an integer from 1 to 86400",
+        ),
+        (
+            '{"version": 1, "tests": {"unit": {}}}\n',
+            "tests contains unsupported field: unit",
+        ),
+    ],
+)
+def test_config_script_rejects_invalid_tests_e2e_config(
+    tmp_path: Path, config: str, message: str
+) -> None:
+    root = _build_config_repo(tmp_path, config)
+
+    result = _run_config(root, "tests.e2e.enabled")
+
+    assert result.returncode == 65
+    assert message in result.stderr
+
+
 def test_config_script_rejects_unknown_key(tmp_path: Path) -> None:
     root = _build_config_repo(tmp_path, None)
 
@@ -173,6 +225,9 @@ def test_config_script_has_equivalent_supported_parser_adapters(
         "thirdReview.provider": "codex\n",
         "thirdReview.model": "\n",
         "thirdReview.timeoutSeconds": "900\n",
+        "tests.e2e.enabled": "false\n",
+        "tests.e2e.command": "bash tests/e2e/run.sh\n",
+        "tests.e2e.timeoutSeconds": "900\n",
         "hooks.afterFinish.enabled": "true\n",
     }
     for key, output in expected.items():
