@@ -45,6 +45,8 @@ scope=build_only 时，Step 1 完成后输出结果摘要并结束。
 
 对照 spec_criteria 逐项验证，输出每项通过/不通过。
 
+未明确要求 AI 执行的浏览器验收项标记为“待人工验收”，不计为通过或失败，不阻断后续流程。
+
 通过检查点摘要中包含 'spec_reviewed: true' 标记判断调用方是否已通过 subagent spec review。如果 spec_reviewed 为 true（如 subagent-driven-development 的 spec compliance reviewer），可跳过逐项 spec 合规检查，仅验证：(1) 全部 Blocking 级验收标准，(2) 跨 task 集成点。
 
 ## 严重程度分级

@@ -868,6 +868,7 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .sandbox-history-detail { display: flex; flex-direction: column; gap: 12px; }
 .sandbox-detail-modal-body { max-height: 60vh; overflow-y: auto; padding: 4px 0; }
 .sessions-detail-modal-body { max-height: 60vh; overflow-y: auto; padding: 4px 0; display: flex; flex-direction: column; gap: 12px; }
+.scheduled-exec-detail-modal-body { max-height: 60vh; overflow-y: auto; padding: 4px 0; display: flex; flex-direction: column; gap: 12px; }
 .plugin-detail-modal-body { max-height: 60vh; overflow-y: auto; padding: 4px 0; display: flex; flex-direction: column; gap: 12px; }
 .sandbox-detail-section { display: flex; flex-direction: column; gap: 6px; }
 .sandbox-detail-section__title { font-size: 12px; font-weight: 600; color: var(--color-fg-muted); }

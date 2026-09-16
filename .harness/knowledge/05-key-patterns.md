@@ -1393,3 +1393,12 @@ GET /chat/skills (已存在)
 3. 任何 `docker restart` 步骤之前必须先把自建任务收敛到终态（HTTP cancel + 等待终态）——重启杀死 in-process worker 后，孤儿 RUNNING 任务在无后台回收循环（D069）下只能等 900s 租约过期才被 `_recover_stale_executions` 回收，cleanup 窗口内无解。
 
 删除失败必须 WARN 可见，禁止 `|| true` 静默吞错；Section 写入的 workspace 文件须登记（track_workspace_file）并在 cleanup 删除。该契约由 tests/e2e/test_artifacts_sh.py 静态合同测试锁定（直接读脚本源码正则断言，防回归）。
+
+## 模式四十五：前端布局验收的容器内一次性 Chromium + 裸 CDP 驱动
+
+宿主机无 Playwright、而 DOM 桩 harness 不能替代 CSS 布局验收时，可在 `n-agent-browser-1` 容器内做浏览器实测（容器自带 /usr/bin/chromium 与 node），不引入新依赖：
+
+1. 用独立 user-data-dir 与独立调试端口启动一次性 headless Chromium（如 `chromium --headless=new --remote-debugging-port=9333 --remote-debugging-address=127.0.0.1 --user-data-dir=/tmp/<prof> --no-sandbox about:blank`），与产品托管的 :9223 实例隔离，验收后 pkill + 清理 profile。
+2. 容器内 Node 20 无全局 WebSocket，需用 net+crypto 实现最小 WS 客户端（HTTP Upgrade、客户端帧必须 mask、处理 126/127 扩展长度、分片重组、ping->pong）；Upgrade 的 Host 头必须是 localhost/IP，否则 Chromium 拒绝握手（403 后静默断连）。
+3. 检查脚本经 `docker cp` 传入，以 CDP `Runtime.evaluate`（returnByValue）取布局事实（getBoundingClientRect/getComputedStyle/scrollWidth vs clientWidth）、`Emulation.setDeviceMetricsOverride` 切桌面 1440x900 与窄视口 375x812、`Input.dispatchMouseEvent` 触发 :hover、`el.focus()` 触发 :focus-within、`Fetch.enable` 请求拦截构造空态/错误态/延迟加载态、`performance.getEntriesByType('resource')` 数请求验证无轮询。
+4. 共享标准样式的既有行为（如 375px 下侧栏占 220px 导致 .panel-tips 越出面板被裁切，见 D071）不得记为被测页面缺陷；验收断言应区分"本模块 DOM 问题"与"共享样式/全局布局既有表现"。

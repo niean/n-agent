@@ -1,7 +1,7 @@
 (function (global) {
   'use strict';
   // scheduled-tasks-observations scoped tab.
-  // 跨任务执行记录总览页：任务过滤下拉 + 执行记录表格（最近 50 条）。
+  // 跨任务执行记录总览页：标准 status-panel 骨架 + 执行记录表格（最近 50 条）。
   // Mount Point: <div class="tab-content" id="tab-scheduled-tasks-observations"></div>
   const namespace = global.NAGENT || {};
   const api = namespace.api || {};
@@ -12,21 +12,19 @@
 
   // 异步防护（对齐 tasks-observations.js 的代次模式）：
   // - renderToken 单调递增；每次加载捕获快照，过期响应一律丢弃。
-  // - inflight 记录当前代次 { token, filter, promise }；同代次同过滤共享，
+  // - inflight 记录当前代次 { token, promise }；同代次共享，
   //   过期 finally 不得清除新代次引用（按 promise 身份比对）。
   // - deactivate 递增 token 并释放 inflight；首次 init 未完成的重入经
   //   activate 启动新代次。
   let renderToken = 0;
   let inflight = null;
 
-  let filterTaskId = '';
   let nameById = {};
   let tasksState = 'idle'; // idle | loading | ok | error
   let execState = 'idle'; // idle | loading | ok | error
   let executions = [];
   let notice = '';
-  let recovered = false; // 同一加载周期只自动恢复一次（手动操作重置）
-  let skeleton = null; // { select, refreshBtn, noticeEl, tableEl }
+  let skeleton = null; // { noticeEl, tableEl }
   let modalBackdrop = null;
 
   function root() {
@@ -98,6 +96,13 @@
     return '';
   }
 
+  function deliveryKind(value) {
+    if (value === 'success' || value === 'delivered') return 'success';
+    if (value === 'skipped') return 'warning';
+    if (value === 'failed') return 'danger';
+    return '';
+  }
+
   // ------------------------------------------------------------ 骨架与渲染 --
   function ensureSkeleton() {
     const node = root();
@@ -105,67 +110,29 @@
     if (skeleton) return skeleton;
     node.replaceChildren();
 
-    const header = el('div', 'scheduled-obs-header');
-    appendText(header, 'span', '任务过滤', 'muted');
-    const select = el('select', 'scheduled-obs-filter');
-    select.addEventListener('change', () => onFilterChange(select.value));
-    const refreshBtn = button('刷新', 'btn', () => {
-      recovered = false;
-      startLoad(true);
-    });
-    header.appendChild(select);
-    header.appendChild(refreshBtn);
-    appendText(header, 'span', `最近 ${DEFAULT_LIMIT} 条`, 'muted');
+    const panel = el('section', 'status-panel');
+    const header = el('div', 'panel-header');
+    const titleGroup = el('div', 'panel-title-group');
+    titleGroup.setAttribute('tabindex', '0');
+    titleGroup.setAttribute('aria-describedby', 'scheduled-obs-tips');
+    appendText(titleGroup, 'span', '执行记录', 'panel-title');
+    const tips = appendText(titleGroup, 'span', `跨任务执行总览，展示最近 ${DEFAULT_LIMIT} 条记录`, 'panel-tips muted');
+    tips.id = 'scheduled-obs-tips';
+    tips.setAttribute('role', 'tooltip');
+    header.appendChild(titleGroup);
+    panel.appendChild(header);
 
-    const noticeEl = el('div', 'scheduled-obs-notice');
-    const tableEl = el('div', 'scheduled-obs-table');
-    node.appendChild(header);
-    node.appendChild(noticeEl);
-    node.appendChild(tableEl);
-    skeleton = { select, refreshBtn, noticeEl, tableEl };
-    renderFilterOptions();
+    const body = el('div', 'panel-body');
+    const noticeEl = el('div');
+    const tableEl = el('div');
+    body.appendChild(noticeEl);
+    body.appendChild(tableEl);
+    panel.appendChild(body);
+    node.appendChild(panel);
+    skeleton = { noticeEl, tableEl };
     renderNotice();
     renderTableArea();
     return skeleton;
-  }
-
-  function renderFilterOptions() {
-    if (!skeleton) return;
-    const select = skeleton.select;
-    if (tasksState === 'loading') {
-      // 加载中保留既有选项（含当前过滤），避免重建为仅“全部任务”后浏览器对
-      // 不存在的 option 回落 selectedIndex=-1 而清空 select.value/filterTaskId。
-      // 首次尚无选项时仅补“全部任务”；不重写 select.value/filterTaskId。
-      if (!select.children.length) {
-        const all = document.createElement('option');
-        all.value = '';
-        all.textContent = '全部任务';
-        select.appendChild(all);
-      }
-      return;
-    }
-    // error：nameById 已清空，重建后仅剩“全部任务”（此时 filterTaskId 已被
-    // onTasksError 清空，不会因选项缺失误清过滤）。
-    select.replaceChildren();
-    const all = document.createElement('option');
-    all.value = '';
-    all.textContent = '全部任务';
-    select.appendChild(all);
-    const names = Object.keys(nameById).map((id) => nameById[id]).filter(Boolean);
-    const dup = {};
-    names.forEach((n) => { dup[n] = (dup[n] || 0) + 1; });
-    Object.keys(nameById).forEach((id) => {
-      const name = nameById[id];
-      const option = document.createElement('option');
-      option.value = id;
-      option.textContent = name ? (dup[name] > 1 ? `${name} (${id})` : name) : id;
-      select.appendChild(option);
-    });
-    select.value = filterTaskId || '';
-    if (select.value !== (filterTaskId || '')) {
-      // 选项不存在时浏览器回落；同步内部状态。
-      filterTaskId = select.value;
-    }
   }
 
   function renderNotice() {
@@ -177,18 +144,12 @@
     host.appendChild(button('重试', 'btn', () => { startLoad(true); }));
   }
 
-  function renderClipped(cell, value) {
+  // 列表单元格只做定长截断（无查看按钮），完整内容统一在详情 modal 呈现。
+  function clipText(value) {
     const raw = text(value, '');
-    if (!raw) {
-      cell.textContent = '-';
-      return;
-    }
-    if (raw.length <= TRUNCATE_AT) {
-      cell.textContent = raw;
-      return;
-    }
-    appendText(cell, 'span', `${raw.slice(0, TRUNCATE_AT)}...`);
-    cell.appendChild(button('查看', 'btn', () => showTextModal('完整内容', raw)));
+    if (!raw) return '-';
+    if (raw.length <= TRUNCATE_AT) return raw;
+    return `${raw.slice(0, TRUNCATE_AT)}...`;
   }
 
   function renderTableArea() {
@@ -208,17 +169,19 @@
       appendText(host, 'div', '暂无执行记录', 'empty-state');
       return;
     }
+    const wrap = el('div', 'scheduled-table-wrap');
     const table = el('table', 'document-table scheduled-history-table');
     const thead = document.createElement('thead');
     const headRow = document.createElement('tr');
-    ['开始时间', '任务', '状态', '输出', '错误', '投递'].forEach((label) => appendText(headRow, 'th', label));
+    ['开始时间', '任务', '状态', '输出', '投递', '操作'].forEach((label) => appendText(headRow, 'th', label));
     thead.appendChild(headRow);
     table.appendChild(thead);
     const tbody = document.createElement('tbody');
     // 保留服务端顺序（created_at 倒序），不按显示时间重排。
     executions.forEach((execution) => tbody.appendChild(renderRow(execution)));
     table.appendChild(tbody);
-    host.appendChild(table);
+    wrap.appendChild(table);
+    host.appendChild(wrap);
   }
 
   function renderRow(execution) {
@@ -233,24 +196,17 @@
     row.appendChild(statusCell);
 
     const outputCell = document.createElement('td');
-    renderClipped(outputCell, execution.output);
+    outputCell.textContent = clipText(execution.output);
     row.appendChild(outputCell);
 
-    const errorCell = document.createElement('td');
-    renderClipped(errorCell, execution.error);
-    row.appendChild(errorCell);
-
     const deliveryCell = document.createElement('td');
-    const hasStatus = execution.delivery_status !== null && execution.delivery_status !== undefined && execution.delivery_status !== '';
-    const hasError = execution.delivery_error !== null && execution.delivery_error !== undefined && execution.delivery_error !== '';
-    if (!hasStatus && !hasError) {
-      deliveryCell.textContent = '-';
-    } else {
-      // 投递状态与非空投递错误同时呈现，不因状态存在隐藏失败原因。
-      if (hasStatus) appendText(deliveryCell, 'div', String(execution.delivery_status));
-      if (hasError) appendText(deliveryCell, 'div', String(execution.delivery_error), 'error-state');
-    }
+    // 列表只呈现投递状态，成功/失败详情（投递错误）移入详情 modal；取值与状态列统一用 badge 底色呈现。
+    deliveryCell.appendChild(badge(text(execution.delivery_status), deliveryKind(execution.delivery_status)));
     row.appendChild(deliveryCell);
+
+    const actionCell = document.createElement('td');
+    actionCell.appendChild(button('详情', 'btn', () => showDetailModal(execution)));
+    row.appendChild(actionCell);
     return row;
   }
 
@@ -262,38 +218,77 @@
     }
   }
 
-  // 共享 Modal DOM 范式：.modal-backdrop/.modal-dialog/.modal-header/.modal-close，
-  // 正文 pre.textContent 纯文本，挂 document.body 接入全局焦点/滚动锁。
-  function showTextModal(title, fullText) {
+  function preText(value) {
+    const pre = document.createElement('pre');
+    pre.textContent = text(value);
+    return pre;
+  }
+
+  function detailSection(label, contentNode) {
+    const section = el('div', 'debug-section');
+    appendText(section, 'h4', label);
+    section.appendChild(contentNode);
+    return section;
+  }
+
+  // 详情 modal：执行时间、状态、输出、投递（含失败详情）、错误全量呈现。
+  // 共享 Modal DOM 范式：.modal-backdrop/.modal-dialog + form.providers-form
+  // + .modal-header/.modal-close + <page>-detail-modal-body + providers-form__actions，
+  // 正文纯文本渲染（textContent），挂 document.body 接入全局焦点/滚动锁。
+  function showDetailModal(execution) {
     closeModal();
     const backdrop = el('div', 'modal-backdrop');
     const dialog = el('section', 'modal-dialog');
     dialog.setAttribute('role', 'dialog');
     dialog.setAttribute('aria-modal', 'true');
+    const form = document.createElement('form');
+    form.className = 'providers-form';
     const header = el('div', 'modal-header');
-    appendText(header, 'h4', title || '完整内容');
+    appendText(header, 'h4', '执行详情');
     const closeBtn = button('×', 'modal-close', closeModal);
-    closeBtn.setAttribute('aria-label', '关闭');
+    closeBtn.setAttribute('aria-label', '关闭执行详情弹框');
     header.appendChild(closeBtn);
-    dialog.appendChild(header);
-    const pre = document.createElement('pre');
-    pre.textContent = fullText;
-    dialog.appendChild(pre);
+    form.appendChild(header);
+
+    const body = el('div', 'scheduled-exec-detail-modal-body');
+
+    const infoList = el('div', 'session-info-list');
+    appendText(infoList, 'div', `执行时间: ${formatDate(execution.started_at || execution.created_at)}`);
+    const statusLine = el('div');
+    appendText(statusLine, 'span', '状态: ');
+    statusLine.appendChild(badge(text(execution.status), statusKind(execution.status)));
+    infoList.appendChild(statusLine);
+    const hasStatus = execution.delivery_status !== null && execution.delivery_status !== undefined && execution.delivery_status !== '';
+    const hasError = execution.delivery_error !== null && execution.delivery_error !== undefined && execution.delivery_error !== '';
+    const deliveryLine = el('div');
+    if (!hasStatus && !hasError) {
+      deliveryLine.textContent = '投递: -';
+    } else {
+      // 投递状态与非空投递错误同时呈现，不因状态存在隐藏失败原因；取值与状态列统一用 badge 底色呈现。
+      appendText(deliveryLine, 'span', '投递: ');
+      deliveryLine.appendChild(badge(hasStatus ? text(execution.delivery_status) : '-', deliveryKind(execution.delivery_status)));
+      if (hasError) appendText(deliveryLine, 'div', String(execution.delivery_error), 'error-state');
+    }
+    infoList.appendChild(deliveryLine);
+    body.appendChild(detailSection('基本信息', infoList));
+
+    body.appendChild(detailSection('输出', preText(execution.output)));
+    body.appendChild(detailSection('错误', preText(execution.error)));
+    form.appendChild(body);
+
+    const actions = el('div', 'providers-form__actions');
+    actions.appendChild(button('关闭', 'btn', closeModal));
+    form.appendChild(actions);
+
+    dialog.appendChild(form);
     backdrop.appendChild(dialog);
-    backdrop.addEventListener('click', (event) => {
-      if (event.target === backdrop) closeModal();
-    });
+    // 项目规范：详情 modal 不响应空白处点击，仅经 × / 关闭 按钮显式退出。
     document.body.appendChild(backdrop);
+    closeBtn.focus();
     modalBackdrop = backdrop;
   }
 
   // ------------------------------------------------------------ 加载 --
-  function onFilterChange(value) {
-    recovered = false;
-    filterTaskId = value || '';
-    startLoad(true);
-  }
-
   function onTasksOk(tasks) {
     tasksState = 'ok';
     nameById = {};
@@ -302,30 +297,13 @@
       const name = task.name;
       nameById[task.id] = (name === null || name === undefined || name === '') ? null : String(name);
     });
-    if (filterTaskId && !(filterTaskId in nameById)) {
-      // 列表成功但选中 id 已消失：提示并恢复一次。
-      taskUnavailable();
-      return;
-    }
-    renderFilterOptions();
     renderTableArea();
   }
 
   function onTasksError() {
     tasksState = 'error';
     nameById = {};
-    if (filterTaskId && !recovered) {
-      // 原选中任务时列表失败：清空选择，新代次查询全部记录（丢弃原过滤响应）。
-      recovered = true;
-      filterTaskId = '';
-      startLoad(true);
-      notice = '任务列表加载失败，已切换为全部任务';
-      renderNotice();
-      return;
-    }
-    filterTaskId = '';
     notice = '任务列表加载失败，名称暂以任务 ID 显示';
-    renderFilterOptions();
     renderNotice();
     renderTableArea();
   }
@@ -336,85 +314,63 @@
     renderTableArea();
   }
 
-  function onExecError(err) {
-    if (filterTaskId && err && err.message === 'scheduled_task_not_found' && !recovered) {
-      taskUnavailable();
-      return;
-    }
+  function onExecError() {
     execState = 'error';
     renderTableArea();
   }
 
-  function taskUnavailable() {
-    if (recovered) {
-      filterTaskId = '';
-      renderFilterOptions();
-      renderNotice();
-      return;
-    }
-    recovered = true;
-    filterTaskId = '';
-    startLoad(true);
-    notice = '任务已不可用，已切换为全部任务';
-    renderNotice();
-  }
-
-  // force=false 时同代次同过滤共享 inflight；force=true 启动新代次。
+  // force=false 时同代次共享 inflight；force=true 启动新代次。
+  // 刷新/重试按钮始终 force=true；公开 refresh/activate 共享当前 inflight。
   function startLoad(force) {
     if (!ensureSkeleton()) return Promise.resolve();
     if (!force) {
       const current = validInflight();
-      if (current && current.filter === filterTaskId) return current.promise;
+      if (current) return current.promise;
     }
     renderToken++;
     const token = renderToken;
     tasksState = 'loading';
     execState = 'loading';
     executions = [];
+    nameById = {};
     notice = '';
-    renderFilterOptions();
     renderNotice();
     renderTableArea();
 
-    const filter = filterTaskId;
     const tasksP = Promise.resolve().then(() => api.listScheduledTasks());
-    const execP = Promise.resolve().then(() => api.listScheduledTaskExecutionsAll({
-      task_id: filter || undefined,
-      limit: DEFAULT_LIMIT,
-    }));
+    const execP = Promise.resolve().then(() => api.listScheduledTaskExecutionsAll({ limit: DEFAULT_LIMIT }));
     // 两个请求独立成败：完成一端即更新其负责区域，不等待另一端。
     tasksP.then(
       (tasks) => { if (isCurrent(token)) onTasksOk(tasks); },
-      (err) => { if (isCurrent(token)) onTasksError(err); },
+      () => { if (isCurrent(token)) onTasksError(); },
     );
     execP.then(
       (rows) => { if (isCurrent(token)) onExecOk(rows); },
-      (err) => { if (isCurrent(token)) onExecError(err); },
+      () => { if (isCurrent(token)) onExecError(); },
     );
     const p = Promise.allSettled([tasksP, execP]).then(() => {
       if (inflight && inflight.promise === p) inflight = null;
     });
-    inflight = { token, filter, promise: p };
+    inflight = { token: token, promise: p };
     return p;
   }
 
   function init() {
-    filterTaskId = '';
-    recovered = false;
+    // 复用当前 inflight 必须先于状态/骨架重置，否则待处理响应无处渲染。
+    const current = validInflight();
+    if (current) return current.promise;
     nameById = {};
     executions = [];
     notice = '';
     tasksState = 'idle';
     execState = 'idle';
     skeleton = null;
-    const current = validInflight();
-    if (current) return current.promise;
     return startLoad(true);
   }
 
   function refresh() {
     const current = validInflight();
-    if (current && current.filter === filterTaskId) return current.promise;
+    if (current) return current.promise;
     return startLoad(true);
   }
 

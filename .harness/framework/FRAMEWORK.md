@@ -29,6 +29,8 @@
 
 # 二、执行约束
 
+- 除非用户明确要求，AI 不执行浏览器视觉测试或浏览器结果验收，由人工完成；构建、代码扫描和自动化测试仍按既有规则执行。
+
 ## Workflow 执行
 
 1. 读取定义：立即读取对应的 Workflow 文件（如 `.harness/framework/workflows/iterate-feature.md`）
