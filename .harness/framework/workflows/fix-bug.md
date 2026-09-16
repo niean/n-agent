@@ -41,9 +41,10 @@ Workflow Progress:
 ## Phase 3: 结果验收
 - Agent: Reviewer，主 Agent 内联执行；可传入 model 参数指定扫描 subagent 使用的 LLM 模型
 - 执行 `Skill: 结果验收`（`.harness/framework/skills/harness/verify-acceptance.md`），scope=full，传入变更文件列表和回归验证条件（修复测试通过 + 既有测试无回归 + Bug 现象已消除）
+- 结果验收通过后执行 `Skill: 执行端到端测试`（`.harness/framework/skills/harness/run-e2e-tests/SKILL.md`）；`failed`、`timed_out` 或配置读取失败均视为验收不通过并回到 Phase 2，计入既有最多 3 轮反馈循环；`disabled` 记录为跳过。
 - 不通过时回到 Phase 2 修复（反馈环路），Phase 2 -> Phase 3 的完整循环最多执行 3 轮（含首次），第 3 轮仍不通过时中断流程，向用户输出错误报告（未通过项 + 已尝试的修复方案），等待人工介入决策。用户介入后可选择：(a) 提供修复指导后从 Phase 2 继续（不重置轮次计数），(b) 接受当前状态结束任务，(c) 终止任务
 
-检查点：`[Phase 3 结果验收] 构建: 通过/失败, 扫描: N维度/M违规, 验收标准: K项通过`
+检查点：`[Phase 3 结果验收] 构建: 通过/失败, 扫描: N维度/M违规, 验收标准: K项通过, 端到端测试: disabled/executed/failed/timed_out`
 
 ## Phase 4: 知识回填
 - Agent: Orchestrator

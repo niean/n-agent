@@ -6,6 +6,13 @@
     "model": null,
     "timeoutSeconds": 900
   },
+  "tests": {
+    "e2e": {
+      "enabled": false,
+      "command": "bash tests/e2e/run.sh",
+      "timeoutSeconds": 900
+    }
+  },
   "hooks": {
     "afterFinish": {
       "enabled": true

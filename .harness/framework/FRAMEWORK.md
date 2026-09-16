@@ -121,7 +121,7 @@ Third Review 是 Workflow 内部的通用 Skill，用于在主流程模型产出
 
 ## Harness 运行配置
 
-`.harness/harness.json` 是机器可读运行配置的唯一权威源，使用严格 JSON。所有消费者必须从项目根目录调用 `sh .harness/framework/scripts/get-config.sh <config-key>`，不得自行解析 JSON 或从自然语言推断默认值。脚本首版支持 `thirdReview.enabled`、`thirdReview.provider`、`thirdReview.model`、`thirdReview.timeoutSeconds`、`hooks.afterFinish.enabled`，确定性默认值依次为 `false`、空、空、`900`、`false`；布尔输出为 `true`/`false`，`null` 输出为空行。配置文件缺失时使用默认值；配置存在时严格校验 JSON、`version=1`、字段结构和类型。脚本按 `jq` -> `python3` -> `node` 自动选择可用 JSON 解析器，均不可用时明确失败。`.harness/PROJECT.md` 继续承载人工规则和项目说明，不重复运行值。
+`.harness/harness.json` 是机器可读运行配置的唯一权威源，使用严格 JSON。所有消费者必须从项目根目录调用 `sh .harness/framework/scripts/get-config.sh <config-key>`，不得自行解析 JSON 或从自然语言推断默认值。脚本支持 `thirdReview.enabled`、`thirdReview.provider`、`thirdReview.model`、`thirdReview.timeoutSeconds`、`tests.e2e.enabled`、`tests.e2e.command`、`tests.e2e.timeoutSeconds`、`hooks.afterFinish.enabled`，确定性默认值依次为 `false`、空、空、`900`、`false`、空、`900`、`false`；布尔输出为 `true`/`false`，`null` 输出为空行。配置文件缺失时使用默认值；配置存在时严格校验 JSON、`version=1`、字段结构和类型。脚本按 `jq` -> `python3` -> `node` 自动选择可用 JSON 解析器，均不可用时明确失败。`.harness/PROJECT.md` 继续承载人工规则和项目说明，不重复运行值。
 
 ## Workflows（端到端编排）
 
@@ -150,6 +150,7 @@ Skill 只定义"做什么"和"怎么做"，不声明自身的触发时机；调�
 | 从代码治理知识库 | 人工指令 | .harness/framework/skills/harness-ops/governance-knowledge-fc.md |
 | 回填产品文档 | 人工指令 | .harness/framework/skills/harness-ops/backfill-prd.md |
 | 结果验收 | 功能迭代或Bug修复完成后自动执行，或人工指令 | .harness/framework/skills/harness/verify-acceptance.md |
+| 执行端到端测试 | 迭代功能、精调功能或修复Bug的结果验收通过后 | .harness/framework/skills/harness/run-e2e-tests/SKILL.md |
 | 提取Harness模板 | 人工指令 | .harness/framework/skills/harness-ops/extract-harness-tpl/SKILL.md |
 | 扫描Harness文档 | 人工指令 | .harness/framework/skills/harness-ops/scan-harness.md |
 | 总结任务 | Workflow显式调用 | .harness/framework/skills/harness/summarize-task.md |

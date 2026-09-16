@@ -39,10 +39,11 @@ Workflow Progress:
 ## Phase 3: 编译通过
 - Agent: Orchestrator
 - 执行 `Skill: 结果验收`（`.harness/framework/skills/harness/verify-acceptance.md`），scope=build_only
+- 结果验收通过后执行 `Skill: 执行端到端测试`（`.harness/framework/skills/harness/run-e2e-tests/SKILL.md`）；`failed`、`timed_out` 或配置读取失败均视为不通过并回到 Phase 2，计入既有最多 3 轮反馈循环；`disabled` 记录为跳过。
 - 不通过时回到 Phase 2 修复（反馈环路），Phase 2 -> Phase 3 的完整循环最多执行 3 轮（含首次），第 3 轮仍不通过时中断流程，输出错误报告等待人工介入
 - Phase 3 成功结束后，执行 after-finish Hook：调用 `sh .harness/framework/scripts/get-config.sh hooks.afterFinish.enabled`；输出 `false` 时返回 `hook: disabled` 且不检查 Hook，输出 `true` 时若 `.harness/hooks/after-finish.sh` 存在且为普通可读文件，执行 `sh .harness/hooks/after-finish.sh`，文件不存在返回 `hook: skipped`。配置 getter、文件或 Hook 执行失败不回滚 Phase 3，但必须在最终输出中标注失败命令和退出码
 
-检查点：`[Phase 3 编译通过] 构建: 通过/失败, hook: disabled/skipped/executed/failed`
+检查点：`[Phase 3 编译通过] 构建: 通过/失败, 端到端测试: disabled/executed/failed/timed_out, hook: disabled/skipped/executed/failed`
 
 ---
 

@@ -10,7 +10,7 @@ N-Agent 是一款类 Hermes 的本地 Agent 产品，让个人开发者以低成
 
 ## 运行配置
 
-机器可读的 Harness 运行配置统一位于 `.harness/harness.json`，消费者通过 `sh .harness/framework/scripts/get-config.sh <config-key>` 读取。当前管理 Third Review 与 after-finish Hook；本文件只保留项目说明、知识索引和人工规则，不重复维护运行值或默认值。
+机器可读的 Harness 运行配置统一位于 `.harness/harness.json`，消费者通过 `sh .harness/framework/scripts/get-config.sh <config-key>` 读取。当前管理 Third Review、端到端测试与 after-finish Hook；本文件只保留项目说明、知识索引和人工规则，不重复维护运行值或默认值。
 
 ## 知识库目录
 
@@ -68,18 +68,18 @@ cd /Users/niean/code/github.com/niean/n-agent
 python -m pytest
 ```
 
-### E2E 测试
-E2E 测试执行策略：
-- 所有 E2E 测试必须在 Docker 环境进行，禁止在宿主机直接执行
+### 端到端测试
+端到端测试执行策略：
+- 所有端到端测试必须在 Docker 环境进行，禁止在宿主机直接执行
 - 除标准化单元测试 `python -m pytest` 外，禁止在宿主机直接执行 N-Agent Python 代码
 - 禁止在宿主机直接启动 N-Agent 服务
-- E2E 测试前必须通过 `docker/restart.sh` 重建并启动服务，后续直接通过 `tests/e2e/run.sh` 全部 CLI E2E测试
+- 端到端测试前必须通过 `docker/restart.sh` 重建并启动服务，后续直接通过 `tests/e2e/run.sh` 执行全部 CLI 端到端测试
 
 ```bash
 cd /Users/niean/code/github.com/niean/n-agent 
 # 重建并启动服务
 sh docker/restart.sh
-# 全部 CLI E2E
+# 全部 CLI 端到端测试
 sh tests/e2e/run.sh
 ```
 

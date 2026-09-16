@@ -22,7 +22,7 @@ description: 从当前项目提取可复用的 Harness 工程模板
 蒸馏规则：
 1. CLAUDE.md：直接拷贝，无需修改内容（兼容Claude Code项目环境）
 2. AGENTS.md+FRAMEWORK.md+PROJECT.md+README：剥离项目专属信息，替换为 `{{占位符}}`
-3. `.harness/harness.json`：保留 `version=1` 和完整字段结构；模板中的 Third Review 与 Hook 必须默认关闭，provider 等项目选择使用可保持 JSON 合法的字符串占位符；`.harness/framework/scripts/get-config.sh` 作为通用确定性读取入口原文同步
+3. `.harness/harness.json`：保留 `version=1` 和完整字段结构；模板中的 Third Review、端到端测试与 Hook 必须默认关闭，provider 等项目选择使用可保持 JSON 合法的字符串占位符，`tests.e2e.command` 使用 `null`；`.harness/framework/scripts/get-config.sh` 作为通用确定性读取入口原文同步
 4. 保留通用框架/结构/流程
 5. 通用规范原文保留；项目规范保留骨架，专属条目替换占位符
 6. Subskills 目录仅含通用模板 scan-dimension.md，直接拷贝；扫描维度定义在 `.harness/PROJECT.md` 中，随项目规范一起蒸馏

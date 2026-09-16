@@ -85,6 +85,11 @@ def test_harness_config_is_registered_in_framework_and_template_scan() -> None:
 
 
 def test_template_config_script_supports_e2e_defaults() -> None:
+    template_script = TEMPLATE_ROOT / ".harness/framework/scripts/get-config.sh"
+
+    assert template_script.read_text(encoding="utf-8") == CONFIG_SCRIPT.read_text(
+        encoding="utf-8"
+    )
     assert _run_config(TEMPLATE_ROOT, "tests.e2e.enabled").stdout == "false\n"
     assert _run_config(TEMPLATE_ROOT, "tests.e2e.command").stdout == "\n"
     assert _run_config(TEMPLATE_ROOT, "tests.e2e.timeoutSeconds").stdout == "900\n"
@@ -151,6 +156,14 @@ def test_config_script_deep_merges_partial_config(tmp_path: Path) -> None:
     assert _run_config(root, "thirdReview.provider").stdout == "codex\n"
     assert _run_config(root, "thirdReview.enabled").stdout == "false\n"
     assert _run_config(root, "hooks.afterFinish.enabled").stdout == "false\n"
+
+    tests_root = _build_config_repo(
+        tmp_path / "tests",
+        '{"version": 1, "tests": {"e2e": {"enabled": true}}}\n',
+    )
+    assert _run_config(tests_root, "tests.e2e.enabled").stdout == "true\n"
+    assert _run_config(tests_root, "tests.e2e.command").stdout == "\n"
+    assert _run_config(tests_root, "tests.e2e.timeoutSeconds").stdout == "900\n"
 
 
 def test_config_script_rejects_invalid_json_and_types(tmp_path: Path) -> None:

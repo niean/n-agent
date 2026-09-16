@@ -532,3 +532,10 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 教训：涉及"异步 worker + 状态机 + 跨进程"的清理逻辑，验证时不能只跑通 happy path 看 PASS，要直接查 DB 确认目标资源计数为 0（WARN 被 `|| true` 类吞掉时输出看上去很干净）；任何"轮询状态等待"helper，先断言它真的能等到——用一次必不成立的条件验证它会超时，否则提取路径错了永远发现不了；容器重启类测试步骤会杀死全部 in-process 状态，凡 restart 前必须显式枚举"哪些运行中资源会变孤儿"并先收敛。相关：P052（派生资源级联对称）、D069（孤儿 RUNNING 任务无自动回收）。
 
 来源：Bug修复 260915 会话 E2E 脏数据（artifacts.sh cleanup 三层修复 + 合同测试锁定）
+
+### P054: macOS Docker Desktop bind mount 上 SQLite WAL 的 -shm mmap 会以 SIGBUS 杀进程，无任何 Python traceback
+
+- 现象：n-agent 容器在 e2e 并发写入约 60 秒后崩溃退出，docker events 显示 `die exitCode=135`（128+7=SIGBUS），`OOMKilled=false`，死亡前无 kill 事件，日志无 traceback；概率性触发，同配置前一天全量通过
+- 根因：三个 Registry（task/artifact/delegation）对共享的 `locals/sessions.db` 设置 `journal_mode=WAL`；WAL 强制 mmap `-shm` 共享内存索引，而 `locals/` 是 macOS 宿主 bind mount（virtiofs），mmap 语义不完整，并发写入文件大小变化时 mmap 越界即 SIGBUS。`PRAGMA mmap_size=0` 无法关闭 WAL 的 shm mmap（只控制主库文件）
+- 教训：存储引擎选型要核查其对文件系统语义的要求（WAL=mmap）与部署挂载形态的交集；exit 135/139 无 traceback 时优先怀疑 mmap 类信号而非 OOM（OOM 是 137 且 OOMKilled=true）；docker events 的 `die exitCode` + 无前置 kill 是区分"自杀式信号崩溃"与"外部 kill"的关键证据链。修复：全局统一 `journal_mode=DELETE`（`sqlite_support.apply_journal_mode`），代价是写期间全库互斥，busy_timeout 兜底
+- 来源：2026-09-16 会话 e2e 容器 SIGBUS 修复（spec-260916-sqlite-journal-bind-mount）

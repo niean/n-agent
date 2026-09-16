@@ -30,6 +30,15 @@ case "$requested_key" in
     thirdReview.timeoutSeconds)
         default_value=900
         ;;
+    tests.e2e.enabled)
+        default_value=false
+        ;;
+    tests.e2e.command)
+        default_value=
+        ;;
+    tests.e2e.timeoutSeconds)
+        default_value=900
+        ;;
     hooks.afterFinish.enabled)
         default_value=false
         ;;
@@ -75,10 +84,10 @@ case "$parser" in
                   else .
                   end;
             def valid_optional_string:
-                . == null or (type == "string" and (test("[\\u0000\\r\\n]") | not));
+                . == null or (type == "string" and (index("\u0000") == null and index("\r") == null and index("\n") == null));
             def validate:
                 if type != "object" then fail("root must be an object") else . end
-                | reject_unknown(["version", "thirdReview", "hooks"]; "root")
+                | reject_unknown(["version", "thirdReview", "tests", "hooks"]; "root")
                 | if (has("version") and (.version | type) == "number" and .version == 1)
                   then . else fail("version must be 1") end
                 | if (has("thirdReview") and (.thirdReview | type) != "object")
@@ -98,6 +107,19 @@ case "$parser" in
                       (($third.timeoutSeconds | floor) != $third.timeoutSeconds) or
                       $third.timeoutSeconds < 1 or $third.timeoutSeconds > 86400)
                   then fail("thirdReview.timeoutSeconds must be an integer from 1 to 86400") else . end
+                | if (has("tests") and (.tests | type) != "object") then fail("tests must be an object") else . end
+                | (.tests // {}) as $tests
+                | ($tests | reject_unknown(["e2e"]; "tests")) as $tests
+                | if ($tests | has("e2e")) and ($tests.e2e | type) != "object" then fail("tests.e2e must be an object") else . end
+                | ($tests.e2e // {}) as $e2e
+                | ($e2e | reject_unknown(["enabled", "command", "timeoutSeconds"]; "tests.e2e")) as $e2e
+                | if ($e2e | has("enabled")) and ($e2e.enabled | type) != "boolean"
+                  then fail("tests.e2e.enabled must be boolean") else . end
+                | if ($e2e | has("command")) and (($e2e.command | valid_optional_string) | not)
+                  then fail("tests.e2e.command must be string or null without control characters") else . end
+                | if ($e2e | has("timeoutSeconds")) and
+                     ((($e2e.timeoutSeconds | type) != "number") or (($e2e.timeoutSeconds | floor) != $e2e.timeoutSeconds) or $e2e.timeoutSeconds < 1 or $e2e.timeoutSeconds > 86400)
+                  then fail("tests.e2e.timeoutSeconds must be an integer from 1 to 86400") else . end
                 | (.hooks // {}) as $hooks
                 | ($hooks | reject_unknown(["afterFinish"]; "hooks")) as $hooks
                 | if ($hooks | has("afterFinish")) and ($hooks.afterFinish | type) != "object"
@@ -111,6 +133,9 @@ case "$parser" in
               elif $requested == "thirdReview.provider" then (.thirdReview.provider // "")
               elif $requested == "thirdReview.model" then (.thirdReview.model // "")
               elif $requested == "thirdReview.timeoutSeconds" then (.thirdReview.timeoutSeconds // 900)
+              elif $requested == "tests.e2e.enabled" then (.tests.e2e.enabled // false)
+              elif $requested == "tests.e2e.command" then (.tests.e2e.command // "")
+              elif $requested == "tests.e2e.timeoutSeconds" then (.tests.e2e.timeoutSeconds // 900)
               elif $requested == "hooks.afterFinish.enabled" then (.hooks.afterFinish.enabled // false)
               else fail("unsupported config key: " + $requested)
               end
@@ -158,7 +183,7 @@ except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
 
 if not isinstance(root, dict):
     fail("root must be an object")
-reject_unknown(root, {"version", "thirdReview", "hooks"}, "root")
+reject_unknown(root, {"version", "thirdReview", "tests", "hooks"}, "root")
 version = root.get("version")
 if isinstance(version, bool) or not isinstance(version, (int, float)) or not math.isfinite(version) or version != 1:
     fail("version must be 1")
@@ -184,6 +209,22 @@ if "timeoutSeconds" in third:
     ):
         fail("thirdReview.timeoutSeconds must be an integer from 1 to 86400")
 
+tests = root.get("tests", {})
+if not isinstance(tests, dict): fail("tests must be an object")
+reject_unknown(tests, {"e2e"}, "tests")
+e2e = tests.get("e2e", {})
+if not isinstance(e2e, dict):
+    fail("tests.e2e must be an object")
+reject_unknown(e2e, {"enabled", "command", "timeoutSeconds"}, "tests.e2e")
+if "enabled" in e2e and not isinstance(e2e["enabled"], bool):
+    fail("tests.e2e.enabled must be boolean")
+if "command" in e2e:
+    optional_string(e2e["command"], "tests.e2e.command")
+if "timeoutSeconds" in e2e:
+    timeout = e2e["timeoutSeconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or (isinstance(timeout, float) and not timeout.is_integer()) or not 1 <= timeout <= 86400:
+        fail("tests.e2e.timeoutSeconds must be an integer from 1 to 86400")
+
 hooks = root.get("hooks", {})
 if not isinstance(hooks, dict):
     fail("hooks must be an object")
@@ -200,6 +241,9 @@ values = {
     "thirdReview.provider": third.get("provider") or "",
     "thirdReview.model": third.get("model") or "",
     "thirdReview.timeoutSeconds": third.get("timeoutSeconds", 900),
+    "tests.e2e.enabled": e2e.get("enabled", False),
+    "tests.e2e.command": e2e.get("command") or "",
+    "tests.e2e.timeoutSeconds": e2e.get("timeoutSeconds", 900),
     "hooks.afterFinish.enabled": after.get("enabled", False),
 }
 value = values[os.environ["HARNESS_CONFIG_KEY"]]
@@ -242,7 +286,7 @@ try {
 }
 
 if (root === null || Array.isArray(root) || typeof root !== "object") fail("root must be an object");
-rejectUnknown(root, ["version", "thirdReview", "hooks"], "root");
+rejectUnknown(root, ["version", "thirdReview", "tests", "hooks"], "root");
 if (root.version !== 1) fail("version must be 1");
 
 const third = root.thirdReview === undefined ? {} : root.thirdReview;
@@ -253,6 +297,18 @@ if (third.provider !== undefined) optionalString(third.provider, "thirdReview.pr
 if (third.model !== undefined) optionalString(third.model, "thirdReview.model");
 if (third.timeoutSeconds !== undefined && (!Number.isInteger(third.timeoutSeconds) || third.timeoutSeconds < 1 || third.timeoutSeconds > 86400)) {
   fail("thirdReview.timeoutSeconds must be an integer from 1 to 86400");
+}
+
+const tests = root.tests === undefined ? {} : root.tests;
+if (tests === null || Array.isArray(tests) || typeof tests !== "object") fail("tests must be an object");
+rejectUnknown(tests, ["e2e"], "tests");
+const e2e = tests.e2e === undefined ? {} : tests.e2e;
+if (e2e === null || Array.isArray(e2e) || typeof e2e !== "object") fail("tests.e2e must be an object");
+rejectUnknown(e2e, ["enabled", "command", "timeoutSeconds"], "tests.e2e");
+if (e2e.enabled !== undefined && typeof e2e.enabled !== "boolean") fail("tests.e2e.enabled must be boolean");
+if (e2e.command !== undefined) optionalString(e2e.command, "tests.e2e.command");
+if (e2e.timeoutSeconds !== undefined && (!Number.isInteger(e2e.timeoutSeconds) || e2e.timeoutSeconds < 1 || e2e.timeoutSeconds > 86400)) {
+  fail("tests.e2e.timeoutSeconds must be an integer from 1 to 86400");
 }
 
 const hooks = root.hooks === undefined ? {} : root.hooks;
@@ -268,6 +324,9 @@ const values = {
   "thirdReview.provider": third.provider ?? "",
   "thirdReview.model": third.model ?? "",
   "thirdReview.timeoutSeconds": third.timeoutSeconds ?? 900,
+  "tests.e2e.enabled": e2e.enabled ?? false,
+  "tests.e2e.command": e2e.command ?? "",
+  "tests.e2e.timeoutSeconds": e2e.timeoutSeconds ?? 900,
   "hooks.afterFinish.enabled": after.enabled ?? false,
 };
 process.stdout.write(`${String(values[process.env.HARNESS_CONFIG_KEY])}\n`);
