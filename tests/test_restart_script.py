@@ -25,6 +25,12 @@ def test_restart_removes_stale_compose_containers_before_up(tmp_path):
 set -euo pipefail
 printf '%s\n' "$*" >> "$FAKE_DOCKER_COMMAND_LOG"
 
+if [[ "$*" == "compose config --format json" ]]; then
+  # host/terminal-host.py resolves the compose config before start/check;
+  # answer with host terminal disabled so the bridge is a no-op here.
+  printf '%s\n' '{"services":{"n-agent":{"environment":{"N_AGENT_HOST_TERMINAL_ENABLED":"false"},"volumes":[]}}}'
+  exit 0
+fi
 if [[ "$*" == "compose down "* ]]; then
   exit 0
 fi

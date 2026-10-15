@@ -2174,6 +2174,12 @@ def _stub_restart_environment(bin_dir: Path, *, docker_log: Path, curl_log: Path
         "#!/bin/sh\n"
         f'printf \'%s\\n\' "$*" >> "{docker_log}"\n'
         'case "$* " in\n'
+        # host/terminal-host.py resolves the compose config before start/check;
+        # answer with host terminal disabled so the bridge is a no-op here.
+        '  *"compose config --format json"*) '
+        "printf '%s\\n' "
+        "'{\"services\":{\"n-agent\":{\"environment\":{\"N_AGENT_HOST_TERMINAL_ENABLED\":\"false\"},\"volumes\":[]}}}'"
+        ";;\n"
         f'  *"exec -T n-agent python"*) cat >/dev/null 2>/dev/null; exit {container_health_rc};;\n'
         'esac\n'
         "exit 0\n",

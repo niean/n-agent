@@ -110,6 +110,10 @@ class ScheduledTask:
     updated_at: datetime | None = None
 
 
+CLAIM_REASON_DUE = "due"
+CLAIM_REASON_RUN_NOW = "run_now"
+
+
 @dataclass(frozen=True)
 class ScheduledTaskClaim:
     task: ScheduledTask

@@ -178,7 +178,7 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 
 ### P018: 状态机扁平化/去概念时必须全栈同步清理，E2E 旧状态断言也要改
 
-现象：Task 状态机从 9 状态扁平化为 Manus 7 状态、移除 assignee/依赖图/swarm 时，逐层改 domain enum/field/policy/registry schema/service/run_service/executor/tools/routes/CLI/前端，但 test fixture（test_task_management_tools 引用 BlockKind、test_task_outbound_delivery 引用 TaskStatus.DONE）与 E2E 脚本（task.sh 断言 `"status": "triage"`）未同步，导致 pytest collection ImportError + E2E FAIL。
+现象：Task 状态机从 9 状态扁平化为 Manus 7 状态、移除 assignee/依赖图/swarm 时，逐层改 domain enum/field/policy/registry schema/service/run_service/executor/tools/routes/CLI/前端，但 test fixture（test_task_management_tools 引用 BlockKind、test_task_outbound_delivery 引用 TaskStatus.DONE）与 E2E 脚本（task.sh 断言 `"status": "triage"`）未同步，导致 pytest collection ImportError + E2E FAIL。同类复发（260923）：docker/restart.sh 新增 host/terminal-host.py 前置调用（消费 `docker compose config --format json`），test_restart_script.py 与 test_config_bundle_scripts.py 的 fake docker 桩未实现该子命令，桩返回空 stdout 使桩侧 json.loads 报 "Expecting value"，9 个脚本测试全红；docker-compose.yml.example 增加 browser 服务后 test_docker_compose_config.py 的拓扑断言（services/networks/depends_on）也未同步。
 
 根因：状态值/字段/枚举是跨层契约，移除一个枚举值（如 BlockKind/DONE/TRIAGE）会连带所有引用它的测试 fixture 与 E2E 断言。测试与 E2E 脚本也是契约消费方，常被遗漏。
 

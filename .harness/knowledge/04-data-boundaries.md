@@ -304,7 +304,7 @@ volumes:
   - ${N_AGENT_INSTALL_ROOT:?N_AGENT_INSTALL_ROOT is required}/workspace:/workspace
 ```
 
-`N_AGENT_INSTALL_ROOT` 指向宿主安装根（locals/workspace/secrets 的父目录），`N_AGENT_CODE_ROOT` 指向 checkout 根。两者均用 `${VAR:?}` 形式：未设置时 `docker compose config` 直接报错，不代入空串产生错误挂载。`docker/.env.example` 只列空占位，实际值写在 `docker/.env`（不入库）。`docker/docker-compose.yml.example` 保持 `${VAR:-default}` 的最小单服务拓扑不变。下文以 `<install_root>` 代指该变量的值。
+`N_AGENT_INSTALL_ROOT` 指向宿主安装根（locals/workspace/secrets 的父目录），`N_AGENT_CODE_ROOT` 指向 checkout 根。两者均用 `${VAR:?}` 形式：未设置时 `docker compose config` 直接报错，不代入空串产生错误挂载。`docker/.env.example` 只列空占位，实际值写在 `docker/.env`（不入库）。`docker/docker-compose.yml.example` 保持 `${VAR:-default}` 占位（无 `:?` 必填，干净 checkout 下 `docker compose config` 可通过），拓扑与实际部署一致为 n-agent + browser 双服务。下文以 `<install_root>` 代指该变量的值。
 
 因此：
 

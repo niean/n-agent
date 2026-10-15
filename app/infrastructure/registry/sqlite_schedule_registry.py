@@ -10,6 +10,8 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 from app.domain.schedule import (
+    CLAIM_REASON_DUE,
+    CLAIM_REASON_RUN_NOW,
     DeliveryTarget,
     DeliveryTargetType,
     ScheduledExecutionPolicy,
@@ -127,7 +129,7 @@ class SQLiteScheduledTaskRegistry:
             for row in rows:
                 task = self._row_to_task(row)
                 next_run = self.calculator.next_after(task.schedule, now, task.timezone)
-                claim = self._claim(task, now, lease_seconds, "due", next_run)
+                claim = self._claim(task, now, lease_seconds, CLAIM_REASON_DUE, next_run)
                 # CAS: status + due + lease checked atomically in the WHERE clause.
                 cursor = conn.execute(
                     """
@@ -173,7 +175,7 @@ class SQLiteScheduledTaskRegistry:
                 conn.commit()
                 return None
             task = self._row_to_task(row)
-            claim = self._claim(task, now, lease_seconds, "run_now", task.next_run_at)
+            claim = self._claim(task, now, lease_seconds, CLAIM_REASON_RUN_NOW, task.next_run_at)
             cursor = conn.execute(
                 """
                 UPDATE scheduled_tasks SET lease_until=?, lease_owner=?, claim_id=?, updated_at=?

@@ -308,6 +308,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 - 执行必须有硬超时与异常兜底：`ScheduleRunService._run_executor` 用 `asyncio.wait_for(executor.run, execution_timeout_seconds)` 包裹（默认 600s，须 < lease_seconds 900s），超时或异常都合成 `ScheduledAgentResult(FAILED)`，确保 `run_claim` 始终走到 `record_execution_completed` 释放 lease。否则 executor.run hang（LLM/宿主桥接无响应）或抛异常会让 execution 永远 RUNNING、lease 持有到过期。
 - `recover_stale_executions` 在 `run_now` 与每个调度 tick（`run_due_claims`）claim 前执行，把 stale RUNNING execution 标记 FAILED 并清理过期 lease。stale 判定：(a) 当前 claim 的 lease 已过期，或 (b) claim 已被新 claim 取代（task.claim_id != execution.claim_id，如进程重启或 re-claim 后遗留的孤儿）。只靠 (a) 不够——re-claim 后旧 execution 的 claim_id 不再匹配 task 当前 claim_id，EXISTS 条件不命中，孤儿永远 RUNNING。
 - skipped_missed 只用于 runner 长时间未运行或任务确实错过宽限窗口；不能由正常执行留下的 lease 触发。
+- missed-grace 跳过仅适用于调度 tick 的 due claim；手动 run_now claim（`claim.reason == CLAIM_REASON_RUN_NOW`，常量定义于 `app/domain/schedule.py`）在 `SchedulePolicy.evaluate` 中豁免 missed-grace 检查——手动执行是显式触发，即使任务 next_run_at 因错过 tick 而过期也必须执行，否则手动 run 会被静默记为 skipped_missed 而不运行。
 
 陷阱：把 lease_seconds 当作调度间隔或执行后保留 lease，会让 */5 任务被默认 900 秒 lease 卡成 15 分钟一次，并在 missed_grace_seconds 后持续 skipped_missed。陷阱：recover_stale_executions 只匹配"当前 claim 且 lease 过期"会漏掉被取代的孤儿执行，进程重启或 re-claim 后旧 RUNNING execution 永远停在 running 状态。
 

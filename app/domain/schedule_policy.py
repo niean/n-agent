@@ -23,6 +23,7 @@ from enum import Enum
 
 from app.domain.policy import PolicyOutcome
 from app.domain.schedule import (
+    CLAIM_REASON_RUN_NOW,
     DeliveryTargetType,
     ScheduledExecutionPolicyMode,
     ScheduledTask,
@@ -203,9 +204,15 @@ class SchedulePolicy:
                 reason=f"task not runnable: status={task.status.value} enabled={task.enabled}",
             )
 
-        # past missed grace -> skipped_missed
+        # past missed grace -> skipped_missed (due claims only; a manual
+        # run_now is an explicit trigger and must execute even when the
+        # task's next_run_at is stale from a missed scheduler tick)
         due_at = claim.claimed_next_run_at or task.next_run_at
-        if due_at and (now - due_at) > self._missed_grace:
+        if (
+            claim.reason != CLAIM_REASON_RUN_NOW
+            and due_at
+            and (now - due_at) > self._missed_grace
+        ):
             return ScheduleRunDecision(
                 verdict=PolicyOutcome.ALLOW,
                 missed_action=MissedAction.SKIPPED_MISSED,

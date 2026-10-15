@@ -124,13 +124,13 @@ def test_env_assignment_parser_rejects_duplicate_conflicts():
 
 def test_example_compose_adds_host_bridge_wiring_without_changing_topology():
     document = _load_compose("docker-compose.yml.example")
-    assert set(document["services"]) == {"n-agent"}
-    assert set(document["networks"]) == {"n-kb"}
+    assert set(document["services"]) == {"n-agent", "browser"}
+    assert set(document["networks"]) == {"default", "n-kb"}
 
     service = document["services"]["n-agent"]
     assert service["ports"] == ["8201:8201"]
     assert service["networks"] == ["default", "n-kb"]
-    assert "depends_on" not in service
+    assert service["depends_on"] == {"browser": {"condition": "service_healthy"}}
     environment = service["environment"]
     assert (
         environment["N_AGENT_BROWSER_HOST_BRIDGE_URL"]
@@ -144,11 +144,16 @@ def test_example_compose_adds_host_bridge_wiring_without_changing_topology():
         environment["N_AGENT_BROWSER_TRUSTED_DEV"]
         == "${N_AGENT_BROWSER_TRUSTED_DEV:-false}"
     )
-    assert (
-        environment["N_AGENT_BROWSER_DEFAULT_BACKEND"]
-        == "${N_AGENT_BROWSER_DEFAULT_BACKEND:-container}"
-    )
+    # .env.example documents the default backend; the compose environment
+    # does not pin it.
+    assert "N_AGENT_BROWSER_DEFAULT_BACKEND" not in environment
     assert _host_browser_token_mount(service).endswith(":ro")
+    browser = document["services"]["browser"]
+    assert browser["networks"] == {
+        "default": {"ipv4_address": "172.19.0.10"}
+    }
+    assert browser["expose"] == ["9223", "6080"]
+    assert "ports" not in browser
 
 
 def test_current_machine_compose_adds_host_bridge_wiring_without_forcing_backend():

@@ -55,6 +55,7 @@ def _claim(
     task: ScheduledTask | None = None,
     *,
     claimed_next_run_at: datetime | None = None,
+    reason: str = "due",
 ) -> ScheduledTaskClaim:
     task = task or _task()
     ct = claimed_next_run_at or task.next_run_at
@@ -65,7 +66,7 @@ def _claim(
         lease_until=NOW + timedelta(seconds=900),
         claimed_next_run_at=ct,
         next_run_at=ct,
-        reason="due",
+        reason=reason,
     )
 
 
@@ -104,6 +105,20 @@ class TestSchedulePolicyDecisionTable:
         assert decision.verdict is PolicyOutcome.ALLOW
         assert decision.missed_action is MissedAction.SKIPPED_MISSED
         assert decision.delivery_mode is DeliveryMode.SILENT
+
+    def test_manual_run_now_ignores_stale_next_run_at(self):
+        policy = SchedulePolicy(missed_grace_seconds=300)
+        due_at = NOW
+        now = due_at + timedelta(seconds=301)
+        claim = _claim(
+            _task(next_run_at=due_at),
+            claimed_next_run_at=due_at,
+            reason="run_now",
+        )
+        decision = policy.evaluate(claim, now)
+        assert decision.verdict is PolicyOutcome.ALLOW
+        assert decision.missed_action is MissedAction.RUN_NOW
+        assert decision.delivery_mode is DeliveryMode.DELIVER
 
     def test_exactly_at_grace_boundary_runs_now(self):
         policy = SchedulePolicy(missed_grace_seconds=300)
