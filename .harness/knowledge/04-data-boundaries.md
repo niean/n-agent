@@ -316,6 +316,7 @@ volumes:
 - 用户 Skill 在容器内使用 `/workspace/skills`，宿主 Bridge 使用对应的 `<install_root>/workspace/skills`；Policy 以 Skill 名、相对脚本路径和 SHA-256 绑定允许执行的字节
 - OSS 密钥只保存在宿主机 `<install_root>/secrets/oss.env`，默认不由 Docker Compose 自动加载，也不挂载或注入 N-Agent 容器；仅宿主 Bridge 启动被允许的上传脚本时按需读取
 - Host Terminal Bridge 只监听 `127.0.0.1`；容器客户端通过固定的 `host.docker.internal` 地址访问，不接受 Policy 中的任意远端 URL
+- Host Terminal 语音规则：command target 必须为 `/usr/bin/say`，`args` 配置为单项 `speech_text: true`；该规则只接受一个非空单行文本参数，拒绝以 `-` 开头的选项及控制字符。空格和标点作为 argv 原文传递，不经 Shell；长度仍受 `max_arg_length` / `max_total_args_length` 限制，`max_args` 至少为 1。未配置规则时不授权语音，其他命令和 Skill 保持原有严格参数规则。容器执行器与宿主 Bridge 共用 Domain 校验；规则类型变更后需同时更新容器和重启宿主 Bridge。
 - KB 后端是外部独立服务，Dashboard 中每条 knowledge_bases 记录的 base_url 必须从 N-Agent 运行环境可达；容器内不能使用指向 N-Agent 容器自身的 localhost，应使用 Compose service name、共享 network 或宿主机网关地址
 - N-Agent compose 访问 N-KB 时应把 n-agent 容器加入 N-KB 所在 Docker 网络（`n-kb_default`，external），并以 KB base_url `http://n-kb:8212` 通过 service name 直连。否则 hostname 会被 Docker Desktop 内部 DNS 解析到不可达代理地址，TCP 表面 connect 成功但 HTTP 响应被丢弃，httpx 抛 RemoteProtocolError
 

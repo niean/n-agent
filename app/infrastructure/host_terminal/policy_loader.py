@@ -15,6 +15,7 @@ from app.domain.host_terminal_policy import (
     HostCommandRule,
     HostExactArgRule,
     HostOneOfArgRule,
+    HostSpeechTextArgRule,
     HostPositionalArgRule,
     HostSkillScriptRule,
     HostTerminalPolicySnapshot,
@@ -242,6 +243,8 @@ def _parse_args(value: Any) -> tuple[HostPositionalArgRule, ...]:
             result.append(HostExactArgRule(rule["exact"]))
         elif set(rule) == {"one_of"} and isinstance(rule["one_of"], list):
             result.append(HostOneOfArgRule(tuple(rule["one_of"])))
+        elif set(rule) == {"speech_text"} and rule["speech_text"] is True:
+            result.append(HostSpeechTextArgRule())
         else:
             raise HostTerminalPolicyLoadError("host_policy_schema_invalid")
     return tuple(result)

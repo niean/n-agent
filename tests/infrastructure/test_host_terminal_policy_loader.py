@@ -48,6 +48,24 @@ def test_loads_strict_policy_and_immutable_snapshot(tmp_path: Path) -> None:
     assert isinstance(snapshot.command_rules, tuple)
 
 
+def test_loads_speech_rule_only_for_canonical_say(tmp_path: Path) -> None:
+    from app.domain.host_terminal import HostCommandTarget, HostTerminalExecutionLimits
+    from app.domain.host_terminal_policy import HostTerminalPolicy, HostTerminalPolicyRequest
+
+    path = tmp_path / "policy.yaml"
+    content = _policy().replace("/bin/echo", "/usr/bin/say").replace("exact: hello", "speech_text: true")
+    _write(path, content)
+    snapshot = HostTerminalPolicyLoader(path).load()
+    result = HostTerminalPolicy(snapshot).evaluate(HostTerminalPolicyRequest(
+        HostCommandTarget("/usr/bin/say", ("Hello, 乐乐!",)),
+        HostTerminalExecutionLimits(2, 1024, 1024, 1),
+    ))
+    assert result.allowed
+    for bad in [content.replace("/usr/bin/say", "/bin/sh"), content.replace("speech_text: true", "speech_text: false")]:
+        _write(path, bad)
+        assert not HostTerminalPolicyLoader(path).refresh()
+
+
 @pytest.mark.parametrize(
     "content,reason",
     [

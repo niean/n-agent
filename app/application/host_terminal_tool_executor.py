@@ -118,6 +118,8 @@ def host_terminal_tool_definition(timeout_seconds: int = 120) -> ToolDefinition:
         description=(
             "Execute one administrator-allowlisted host command or linked Skill "
             "script. This is not a general shell and accepts argv only."
+            " For speech, when administrator-enabled, use command /usr/bin/say "
+            "with args=[text]: one non-empty text argument, not shell quoting or options."
         ),
         input_schema={
             "type": "object",
@@ -486,7 +488,10 @@ class HostTerminalToolExecutor:
         ):
             return [], "host_request_invalid"
         args = arguments.get("args")
-        if not host_terminal_arguments_allowed(args, snapshot.limits):
+        if not host_terminal_arguments_allowed(
+            args, snapshot.limits,
+            executable=arguments.get("command") if kind == "command" else None,
+        ):
             return [], "host_arguments_invalid"
         timeout = arguments.get("timeout", snapshot.limits.default_timeout_seconds)
         if (

@@ -166,6 +166,28 @@ async def test_definition_is_strict_agent_host_safe_oneof():
 
 
 @pytest.mark.asyncio
+async def test_speech_preserves_literal_text_and_requires_explicit_policy():
+    from app.domain.host_terminal_policy import HostSpeechTextArgRule
+
+    snapshot = replace(_snapshot(), command_rules=(
+        HostCommandRule("speech", "/usr/bin/say", (HostSpeechTextArgRule(),)),
+    ))
+    executor, client, _ = _executor(snapshot=snapshot)
+    text = "乐乐, let's learn! $HOME; (hello)"
+    result = await executor.execute(ToolCallRequest("speech", "host_terminal", {
+        "target_type": "command", "command": "/usr/bin/say", "args": [text],
+    }))
+    assert result.status is ToolResultStatus.SUCCESS
+    assert client.requests[0].target.args == (text,)
+    denied_executor, denied_client, _ = _executor()
+    denied = await denied_executor.execute(ToolCallRequest("speech", "host_terminal", {
+        "target_type": "command", "command": "/usr/bin/say", "args": [text],
+    }))
+    assert denied.status is ToolResultStatus.PERMISSION_DENIED
+    assert denied_client.requests == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [

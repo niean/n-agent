@@ -36,16 +36,17 @@ def _valid_argument(value: object) -> bool:
 
 
 def host_terminal_arguments_allowed(
-    args: object, limits: "HostTerminalResourceLimits"
+    args: object, limits: "HostTerminalResourceLimits", *, executable: str | None = None
 ) -> bool:
     """Validate argv admission against one immutable Domain limit set."""
     if not isinstance(limits, HostTerminalResourceLimits):
         return False
     if not isinstance(args, (list, tuple)):
         return False
+    validator = _valid_speech_text if executable == "/usr/bin/say" else _valid_argument
     return (
         len(args) <= limits.max_args
-        and all(_valid_argument(arg) for arg in args)
+        and all(validator(arg) for arg in args)
         and all(len(arg) <= limits.max_arg_length for arg in args)
         and sum(len(arg) for arg in args) <= limits.max_total_args_length
     )
@@ -83,14 +84,31 @@ class HostOneOfArgRule:
         return value in self.values
 
 
-HostPositionalArgRule: TypeAlias = HostExactArgRule | HostOneOfArgRule
+def _valid_speech_text(value: object) -> bool:
+    # say receives a single argv element, never shell source. Reject option
+    # injection and control characters while preserving literal punctuation.
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and not value.lstrip().startswith("-")
+        and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+    )
+
+
+@dataclass(frozen=True)
+class HostSpeechTextArgRule:
+    def matches(self, value: str) -> bool:
+        return _valid_speech_text(value)
+
+
+HostPositionalArgRule: TypeAlias = HostExactArgRule | HostOneOfArgRule | HostSpeechTextArgRule
 
 
 def _freeze_positional_rules(
     rules: tuple[HostPositionalArgRule, ...],
 ) -> tuple[HostPositionalArgRule, ...]:
     result = tuple(rules)
-    if any(not isinstance(rule, (HostExactArgRule, HostOneOfArgRule)) for rule in result):
+    if any(not isinstance(rule, (HostExactArgRule, HostOneOfArgRule, HostSpeechTextArgRule)) for rule in result):
         raise ValueError("unknown_positional_argument_rule")
     return result
 
@@ -107,6 +125,9 @@ class HostCommandRule:
         object.__setattr__(
             self, "positional_args", _freeze_positional_rules(self.positional_args)
         )
+        if any(isinstance(arg, HostSpeechTextArgRule) for arg in self.positional_args):
+            if self.executable != "/usr/bin/say" or self.positional_args != (HostSpeechTextArgRule(),):
+                raise ValueError("speech_rule_requires_say_single_text")
 
 
 @dataclass(frozen=True)
@@ -125,6 +146,8 @@ class HostSkillScriptRule:
         object.__setattr__(
             self, "positional_args", _freeze_positional_rules(self.positional_args)
         )
+        if any(isinstance(arg, HostSpeechTextArgRule) for arg in self.positional_args):
+            raise ValueError("speech_rule_requires_say_single_text")
 
 
 HostTerminalRule: TypeAlias = HostCommandRule | HostSkillScriptRule
@@ -205,6 +228,10 @@ class HostTerminalPolicySnapshot:
         for rule in all_rules:
             if len(rule.positional_args) > self.limits.max_args:
                 raise ValueError("rule_arguments_exceed_limits")
+            # Speech is bounded by the request's resource admission, rather
+            # than a finite list of configured literal values.
+            if rule.positional_args == (HostSpeechTextArgRule(),):
+                continue
             values = (
                 (arg.value,)
                 if isinstance(arg, HostExactArgRule)
@@ -226,7 +253,7 @@ class HostTerminalPolicySnapshot:
     @staticmethod
     def _target_key(rule: HostTerminalRule) -> tuple[object, ...]:
         args_key: tuple[object, ...] = tuple(
-            ("exact", arg.value)
+            ("speech_text",) if isinstance(arg, HostSpeechTextArgRule) else ("exact", arg.value)
             if isinstance(arg, HostExactArgRule)
             else (
                 ("exact", arg.values[0])
@@ -295,7 +322,10 @@ class HostTerminalPolicy:
             return self._deny("host_resource_limits_exceeded")
         if not self._resources_allowed(request.requested_limits):
             return self._deny("host_resource_limits_exceeded")
-        if not self._arguments_allowed(request.target.args):
+        if not host_terminal_arguments_allowed(
+            request.target.args, self._snapshot.limits,
+            executable=request.target.executable if isinstance(request.target, HostCommandTarget) else None,
+        ):
             return self._deny("host_arguments_invalid")
 
         for rule in self._snapshot.rules:
@@ -317,9 +347,6 @@ class HostTerminalPolicy:
             and requested.max_stderr_bytes <= limits.max_stderr_bytes
             and requested.max_concurrency <= limits.max_concurrency
         )
-
-    def _arguments_allowed(self, args: tuple[str, ...]) -> bool:
-        return host_terminal_arguments_allowed(args, self._snapshot.limits)
 
     @staticmethod
     def _matches(rule: HostTerminalRule, target: HostTerminalTarget) -> bool:

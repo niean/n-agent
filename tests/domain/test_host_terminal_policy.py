@@ -110,6 +110,33 @@ def test_empty_and_unknown_policy_default_deny() -> None:
     assert unknown.reason == "host_target_not_allowed"
 
 
+@pytest.mark.parametrize("text", ["乐乐，你在学习呢？", "Hello, Lele! Are you studying?", "Read $HOME; (hello) & 'world'"])
+def test_speech_text_is_one_literal_argument(text: str) -> None:
+    from app.domain.host_terminal_policy import HostSpeechTextArgRule
+
+    rule = HostCommandRule("speech", "/usr/bin/say", (HostSpeechTextArgRule(),))
+    policy = HostTerminalPolicy(_snapshot(command_rules=(rule,), limits=_limits(max_arg_length=256)))
+    assert policy.evaluate(_request(HostCommandTarget("/usr/bin/say", (text,)))).allowed
+
+
+@pytest.mark.parametrize("args", [(), ("-o/tmp/out",), ("-f", "/etc/passwd"), ("hello\nworld",), ("\x00",), ("x" * 65,), ("",)])
+def test_speech_rejects_options_controls_and_excess_arguments(args: tuple[str, ...]) -> None:
+    from app.domain.host_terminal_policy import HostSpeechTextArgRule
+
+    rule = HostCommandRule("speech", "/usr/bin/say", (HostSpeechTextArgRule(),))
+    policy = HostTerminalPolicy(_snapshot(command_rules=(rule,)))
+    assert not policy.evaluate(_request(HostCommandTarget("/usr/bin/say", args))).allowed
+
+
+def test_speech_rule_cannot_authorize_another_command_or_skill() -> None:
+    from app.domain.host_terminal_policy import HostSpeechTextArgRule
+
+    with pytest.raises(ValueError):
+        HostCommandRule("shell", "/bin/sh", (HostSpeechTextArgRule(),))
+    with pytest.raises(ValueError):
+        HostSkillScriptRule("script", "photo", "scripts/photo.py", SCRIPT_HASH, (HostSpeechTextArgRule(),))
+
+
 def test_command_requires_exact_executable_args_and_resource_bounds() -> None:
     rule = HostCommandRule(
         rule_id="diagnostic",

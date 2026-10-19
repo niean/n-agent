@@ -82,6 +82,10 @@
 - NFR
     - 测试：修复所有的测试失败
 
+[20261019]
+- FR
+    - 任务：支持语音播放say。语音播放`乐乐，你在学习呢`，提示 host_arguments_invalid，会话ID feishu-de413dea-a5c7-483d-a6ba-fe8e4f1f361c
+
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
