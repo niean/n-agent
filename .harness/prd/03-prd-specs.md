@@ -93,6 +93,7 @@
 - HE
     - HE：VSCode+插件模式，补全Token观测
     - HE：三方审阅，结果存储纳入Harness流程规范，如放到specs/third/目录下
+    - HE：三方审阅，从直接修改、改为给出建议，从而解耦
     - HE：阶段结果，未及时同步到Multica
 - NFR
     - 观测：按照业界通行做法，给N-Agent补全内部观测，尽量遵循OpenTelemetry规范。需要的配套观测组件，也要枚举下，本机已安装Grafana
