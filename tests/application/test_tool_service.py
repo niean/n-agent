@@ -865,6 +865,28 @@ async def test_budget_released_on_cancel():
     assert state.tool_calls_reserved == 0  # released -- no leak
 
 
+def test_installed_definitions_register_real_tool_names():
+    # ToolService 安装的（静态/动态）工具名注册进有界遥测注册表，
+    # 使 execute_tool <name> 展示真实值而非 "other"
+    from app.application.telemetry_semantics import map_tool_name, unregister_tool_name
+
+    service = ToolService(FakeExecutor(), builtin_tool_definitions())
+    custom = ToolDefinition(
+        name="zzz_custom_observed_tool",
+        description="",
+        input_schema={"type": "object", "properties": {}},
+        risk_level=RiskLevel.SAFE,
+        source_type=ToolSourceType.AGENT,
+        toolset="probe",
+    )
+    try:
+        service.set_dynamic_definitions("probe", [custom])
+        assert map_tool_name("zzz_custom_observed_tool") == "zzz_custom_observed_tool"
+        assert map_tool_name("zzz_custom_observed_tool") != "other"
+    finally:
+        unregister_tool_name("zzz_custom_observed_tool")
+
+
 def test_skill_manage_exposed_in_skill_toolset():
     from app.application.skill_service import skill_manage_tool_definition
     d = skill_manage_tool_definition()

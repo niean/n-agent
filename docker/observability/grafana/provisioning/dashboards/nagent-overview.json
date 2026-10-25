@@ -1,0 +1,184 @@
+{
+  "uid": "nagent-overview",
+  "title": "Overview",
+  "tags": ["n-agent", "genai"],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": "Prometheus",
+        "includeAll": true,
+        "multi": false,
+        "query": {
+          "qryType": 1,
+          "query": "label_values(gen_ai_invoke_agent_duration_seconds_count, service_name)"
+        },
+        "current": { "selected": true, "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Agent runs (5m)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(gen_ai_invoke_agent_duration_seconds_count{service_name=~\"$service\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "LLM inference duration p95 (s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_provider_name, gen_ai_request_model) (rate(gen_ai_client_inference_duration_seconds_bucket{service_name=~\"$service\"}[5m])))"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Tool call duration p95 (s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_tool_name) (rate(gen_ai_execute_tool_duration_seconds_bucket{service_name=~\"$service\"}[5m])))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Token usage (tokens/s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "input {{gen_ai_request_model}}",
+          "expr": "sum by (gen_ai_request_model) (rate(gen_ai_client_inference_usage_input_tokens_total{service_name=~\"$service\"}[5m]))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "output {{gen_ai_request_model}}",
+          "expr": "sum by (gen_ai_request_model) (rate(gen_ai_client_inference_usage_output_tokens_total{service_name=~\"$service\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Agent run duration p95 (s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\"}[5m])))"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Inference calls / agent run",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(gen_ai_invoke_agent_inference_calls_sum{service_name=~\"$service\"}[5m])) / sum(rate(gen_ai_invoke_agent_inference_calls_count{service_name=~\"$service\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Tool calls / agent run",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(gen_ai_invoke_agent_tool_calls_sum{service_name=~\"$service\"}[5m])) / sum(rate(gen_ai_invoke_agent_tool_calls_count{service_name=~\"$service\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Turns by source / end reason",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (nagent_source, nagent_end_reason) (rate(nagent_turns_total{service_name=~\"$service\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Context compressions (5m)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 18 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(nagent_context_compressions_total{service_name=~\"$service\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Budget denials (5m)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 18 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(nagent_budget_denied_total{service_name=~\"$service\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Token count p95 (per inference)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 18 },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "input p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gen_ai_client_inference_operation_input_tokens_bucket{service_name=~\"$service\"}[5m])))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "output p95",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(gen_ai_client_inference_operation_output_tokens_bucket{service_name=~\"$service\"}[5m])))"
+        }
+      ]
+    }
+  ]
+}

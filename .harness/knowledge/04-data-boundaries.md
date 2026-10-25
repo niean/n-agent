@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载） -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 12 instrument 的 metric-name-mapping 权威表 + observability compose profile 127.0.0.1 绑定/独立命名卷/SYS_PTRACE 仅 override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；2048 字节观测详情 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -396,3 +396,35 @@ DB 段 10 个段落（`SECTION_NAMES`，顺序即导入顺序）：providers、k
 退出码契约（`docker/config-import.sh`，前端 `docker/install.sh` 原样透传）：0 全部成功；1 部分记录失败、其余已应用；2 包或参数格式错误、目标未被改动；3 运行依赖缺失或服务启动失败；4 只读挂载源被目录占据。该契约是外部可观测行为，任何在"已提交数据库之后"发生的失败都不得报成 2。
 
 只读保证：`--dry-run` 与导出侧读取 DB 均通过 `app/infrastructure/sqlite_support.open_sqlite(path, read_only=True)`（URI `mode=ro`）打开，构造上不可写，不建 schema、不建目录、不落临时文件；目标库不存在时 DB 差异报 unknown 而非报错。
+
+## OTel 可观测数据边界
+
+执行摘要不新增存储表：使用现有 run_id 作为日志 request_id、Span nagent.run_id。会话标识、运行标识及完成阶段摘要只在 ContextVar 中暂存并退出复原；summary 最长 512 字符，由入口、消息数量、调用数、Token 已知性、状态与耗时生成，不含消息正文或原始工具载荷。日志 JSON 顶层保留 event/severity/trace_id/span_id，Collector 把批准的安全字段放在 context；这些标识和摘要不进入 Prometheus dimensions 或 Loki 索引标签。
+
+OTel 观测信号不新增 SQLite 表；trace/metric/log 经 OTLP gRPC 出进程，profile 经 Pyroscope /ingest 出进程；本地仅进程内 ring buffer（非持久化）。唯一例外是自检页外链运行时配置表 otel_link_config（见下）。
+
+配置模型（Settings，B 类 env-only，`N_AGENT_OTEL_` / `N_AGENT_PROFILING_` 前缀，不进 Dashboard 编辑白名单）：
+
+- otel_enabled（bool，默认 False）：总开关；关闭时零 SDK 装配，Application facade 退化为 NoopSpan。
+- otel_exporter_otlp_endpoint（str，默认空）：OTLP gRPC endpoint；空 = local-only 模式（建 provider 不建网络 exporter）。URL 经 field_validator 禁止 userinfo/query/fragment（对齐 browser navigate 的 sanitize 语义）。
+- otel_traces_sample_ratio（float，默认 1.0）：Trace 采样率，ParentBased(TraceIdRatioBased)。
+- otel_grafana_metrics_base_url / otel_grafana_logs_base_url / otel_grafana_profile_base_url / otel_grafana_traces_base_url（str，默认空）：自检页浏览器外链（宿主可访问地址），分别对应 Metric/Log/Profile/Trace，前三者为 Grafana 大盘、Trace 为 Grafana Explore（Tempo）；旧 otel_jaeger_base_url 仅在新 Trace 字段为空时回退，DB trace_base_url overrides/CAS 语义不变；Profile 用 Grafana 大盘代替 Pyroscope UI；空时隐藏对应链接；同为禁 userinfo/query/fragment 的 origin 校验集合。
+- profiling_enabled（bool，默认 False，独立于 otel_enabled）：py-spy 连续 profiling 开关；启用时 profiling_pyroscope_endpoint 必填（跨字段校验 `_validate_profiling_config`）。
+- profiling_pyroscope_endpoint（str）、profiling_interval_seconds（int，默认 60，ge=10 le=300）：上传地址与窗口间隔。
+- 浏览器外链的 service label 由组装根注入 setup.SERVICE_NAME（单一来源），未注入时省略该参数。
+
+自检页外链运行时配置（C 类，对齐 task_config 模式）：单行表 `otel_link_config`（id INTEGER PRIMARY KEY CHECK(id=1)、config_json TEXT、version INTEGER CHECK>=1、updated_at、updated_by），复用 sessions.db 独立连接（`SqliteTaskConfigStore` 同款 asyncio.to_thread 包装）；config_json 存三态 overrides（key 缺席=不覆盖沿用 env 默认、null=显式清空隐藏链接、非空字符串=覆盖），四键 metrics/logs/profile/trace 对应上述四个 base_url env 项，值同受禁 userinfo/query/fragment 的 origin 校验。`OtelLinkConfigService.current()` 运行面热重载读（read-through Store，异常降级 last-known-good/env），`update(partial, expected_version)` 合并 overrides -> 校验 -> CAS 保存 -> best-effort 审计（`OtelLinkConfigLoggingSink` 结构化 JSON 脱敏投影，不含明文 URL 之外的敏感面）；`GET/PATCH /chat/observations/otel/links`（no-store，错误码 otel_link_config_invalid 422/conflict 409/load_failed 500）；dashboard.py `GET /chat/observations/otel` 响应在注入 service 时合并 links 字段。
+
+Dashboard snapshot API 键白名单（`app/interfaces/http/dashboard.py` `_OTEL_SNAPSHOT_KEYS`，Interfaces 只消费注入的 snapshot callable，不 import observability 内部）：status、mode、instance_id、sample_ratio、semconv_version、instruments、signals、spans、dropped_after_deadline；`_OTEL_SNAPSHOT_FIELD_CAP`=256 限字符串长度。
+
+ring buffer 数据边界：`RING_BUFFER_MAX`=100（setup.py），只存 `_RING_BUFFER_ALLOWED_ATTR_KEYS` 精确枚举白名单内的 span 投影（不存完整 Span/events/exceptions/Resource，字符串有 cap）；敏感属性（gen_ai.input/output.messages、tool.call.arguments/result、system_instructions、tool.definitions）不采集，不存在于任何缓冲/导出路径。
+
+Prometheus 指标名翻译：12 个 instrument 的 OTel 名到 Prometheus 名权威表在 `docker/observability/metric-name-mapping.md`（Counter 加 `_total`、秒 Histogram 加 `_seconds`、token 等括号单位不产生后缀）；新增 instrument 必须同步该表。
+
+Docker Compose 数据边界：观测后端 6 服务（otel-collector/jaeger/prometheus/grafana/pyroscope/loki）挂 `COMPOSE_PROFILES=observability`，端口一律 `127.0.0.1` 绑定（Grafana 宿主侧改绑 13000 避开 3000）；Collector/Prometheus/Loki 不发布宿主端口（Loki 仅容器内网 + Grafana 代理）；配置只读挂载自 `docker/observability/`（otel-collector.yaml、jaeger/config.yaml、prometheus.yml、pyroscope.yaml、loki.yaml、grafana/provisioning/*）；Grafana 大盘 UID nagent-overview/nagent-metrics/nagent-logs/nagent-infra；应用侧稳定资源指标（system.*/process.* cpu/mem/disk/network，由 opentelemetry-instrumentation-system-metrics 0.66b1 + psutil 产生）随业务指标同一 OTLP remote write 通路；观测栈组件自监控经 Prometheus scrape 四目标（prometheus-self/otel-collector:8888/loki:3100/pyroscope:4040）；观测栈容器卷为独立命名卷（prometheus-data/grafana-data/pyroscope-data/loki-data，数据不落 `<install_root>/locals`；Loki retention 168h 与 Prometheus/Pyroscope 对齐）；日志数据流：应用 OTLP -> Collector logs 管线（transform/loki_json 行体 JSON 化）-> Loki 主交付 + debug exporter stdout 证据，Loki 仅索引 resource label（service_name/service_instance_id），其余属性进 structured metadata（无 label 基数爆炸）；profiling 的 SYS_PTRACE 能力仅经 docker-compose.observability.yml override 合入（Profile 验收时经 COMPOSE_FILE），无 privileged、无 host PID；观测验收使用 `N_AGENT_COMPOSE_STOP_TIMEOUT=10` 平滑停栈。`docker/.env.example` 新增 Observability/Profiling 段空占位（`N_AGENT_OTEL_ENABLED=false` 等实际值写 docker/.env，n-agent 经 env_file 接收）。
+
+## 观测详情数据边界
+
+新增 Settings `otel_content_max_bytes`（环境变量 `N_AGENT_OTEL_CONTENT_MAX_BYTES`，默认 2048，gt=0，启动绑定）。不新增数据库表或详情附件存储。固定字段为 user_message、assistant_message、system_prompt、input_messages、tool_definitions、output_messages、tool_arguments、tool_result、error、http_request、http_response、log_fields；每项 `{content, original_bytes, truncated}`，流式可带 incomplete/observed_bytes。original_bytes 为完整脱敏文本 UTF-8 长度，无法计算时为未知（stderr null，OTel/Loki 键缺席）；observed_bytes 为已观察字节数（HTTP 传输字节或 LLM 字符串增量），不等于完整脱敏长度。Log 顶层 details、OTLP/span 的 `nagent.details.<field>.<metadata>` 与 Collector 的显式逐字段投影共享该合同；不将正文写入 metric labels 或自检 snapshot。
+
+Tempo 使用 tempo-data:/var/tempo 独立命名卷（WAL/blocks），168h 保留，API 3200 仅绑定 127.0.0.1，OTLP 4317 仅容器内网。Prometheus exemplar 存储保存代表性 Trace/Span 关联；其保留与时序常规样本不同，不承诺每个指标点都有 Trace。

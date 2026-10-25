@@ -1,0 +1,18 @@
+# Profile 采样专用 Compose override（SYS_PTRACE）。
+#
+# 用途：py-spy attach 当前容器内 Python PID 需要 SYS_PTRACE 能力。按 spec
+# 第 5/7 节约束，该能力仅通过本 override 显式赋给 n-agent，且仅在 Profile
+# 验收时经 COMPOSE_FILE 显式合入（执行合同 item 22）：
+#
+#   export COMPOSE_FILE="$PWD/docker/docker-compose.yml:$PWD/docker/docker-compose.observability.yml"
+#   export COMPOSE_PROFILES=observability N_AGENT_COMPOSE_STOP_TIMEOUT=10
+#
+# 约束：
+# - 仅 cap_add SYS_PTRACE；不使用 privileged，不使用 host PID namespace，
+#   不对宿主或任意 PID 采样（应用只采当前 Python PID）；
+# - 普通 observability profile（未合入本 override）不提升任何权限；
+# - 未启用 Profile 时不得合入本文件。
+services:
+  n-agent:
+    cap_add:
+      - SYS_PTRACE

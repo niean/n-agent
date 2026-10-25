@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode, urlparse
 from uuid import uuid4
 
 from fastapi import APIRouter, Body, Header, Request
@@ -42,6 +46,7 @@ from app.application.session_bootstrap import SessionBootstrapReader
 from app.application.session_service import SessionService
 from app.application.skill_service import SkillInput, SkillScanReport, SkillScanWarning, SkillService
 from app.application.tool_service import ToolService
+from app.domain.otel_link_config import OtelLinkConfigProvider
 from app.domain.knowledge import (
     DuplicateKnowledgeBaseError,
     KnowledgeBase,
@@ -75,6 +80,8 @@ from app.domain.task import TaskStateError
 from app.domain.tool import ToolDefinition
 
 
+logger = logging.getLogger(__name__)
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 DependencySnapshot = dict
@@ -83,6 +90,118 @@ HealthProvider = Callable[[], DependencySnapshot]
 # Server-side Dashboard actor constant.  NEVER derived from header, body,
 # metadata, session, or any client-supplied value.
 _DASHBOARD_ACTOR = "dashboard"
+
+# ---------------------------------------------------------------------------
+# Observability self-check (T8). The diagnostic API only consumes the
+# injected snapshot callable -- no OTel SDK import in interfaces. Snapshot
+# keys are whitelisted and every string is capped, so unknown/unsafe snapshot
+# content (credentials, raw exceptions, full config) never reaches the client.
+# ---------------------------------------------------------------------------
+
+_OTEL_API_PATH = "/chat/observations/otel"
+_OTEL_SNAPSHOT_FIELD_CAP = 256
+_OTEL_SNAPSHOT_KEYS = (
+    "status",
+    "mode",
+    "instance_id",
+    "sample_ratio",
+    "semconv_version",
+    "instruments",
+    "signals",
+    "spans",
+    "dropped_after_deadline",
+)
+# The browser-link service label has no local default: the composition
+# root injects setup.SERVICE_NAME (single source); when not injected the
+# service param is simply omitted from the links.
+_OTEL_API_NOTES = {
+    "delivery_counts": (
+        "per-signal delivery/failure_count reflect exporter/upload call "
+        "results (public export return values), not SDK internals"
+    ),
+    "queue_drops": (
+        "queue-drop counters are not exposed by the SDK batch span/log "
+        "processors; failures are counted from exporter results only"
+    ),
+}
+
+
+def _sanitize_observability_value(value: Any, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        return value[:_OTEL_SNAPSHOT_FIELD_CAP]
+    if isinstance(value, float):
+        # Non-finite floats would break strict JSON encoding downstream.
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if depth >= 8:
+        return None
+    if isinstance(value, dict):
+        return {
+            str(key)[:64]: _sanitize_observability_value(val, depth + 1)
+            for key, val in list(value.items())[:64]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_observability_value(item, depth + 1) for item in list(value)[:128]]
+    return None
+
+
+def _sanitized_endpoint_host_port(endpoint: str) -> str | None:
+    """Reduce the OTLP endpoint to host[:port]; never scheme/path/creds."""
+    if not endpoint:
+        return None
+    try:
+        parsed = urlparse(endpoint)
+        port = parsed.port
+    except ValueError:
+        port = None
+    except Exception:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    if not port:
+        return host
+    # IPv6 hosts need brackets to stay unambiguous (e.g. [::1]:4318).
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _external_otel_link(base_url: str, time_iso: str, service_name: str, *, is_trace: bool = False) -> str | None:
+    """Build a browser link from a configured base_url only.
+
+    http/https with a hostname and no userinfo; the configured subpath (and
+    existing query) is preserved, service/time params are appended
+    URL-encoded, fragments are dropped. Unconfigured/invalid -> hidden."""
+    if not base_url:
+        return None
+    try:
+        parsed = urlparse(base_url)
+    except Exception:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    clean = base_url.split("#", 1)[0]
+    params: dict[str, str] = {}
+    if service_name:
+        params["service"] = service_name
+    params["time"] = time_iso
+    # Grafana Explore needs its pane schema, not generic service/time params.
+    # Preserve configured reverse-proxy subpaths and legacy dashboard links.
+    if is_trace and parsed.path.rstrip("/").endswith("/explore"):
+        query = "{" + ("resource.service.name=" + json.dumps(service_name, ensure_ascii=False) if service_name else "") + "}"
+        params = {
+            "schemaVersion": "1",
+            "panes": json.dumps({"trace": {
+                "datasource": "nagent-tempo",
+                "queries": [{"refId": "A", "queryType": "traceql", "query": query,
+                             "datasource": {"type": "tempo", "uid": "nagent-tempo"}}],
+                "range": {"from": "now-1h", "to": "now"},
+            }}, ensure_ascii=False),
+        }
+    separator = "&" if "?" in clean else "?"
+    return clean + separator + urlencode(params)
 
 
 from app.application.external_memory_provider_service import ExternalMemoryProviderService
@@ -130,6 +249,13 @@ def create_dashboard_router(
     tool_approval_service=None,
     artifact_service=None,
     settings=None,
+    observability_snapshot: Callable[[], dict] | None = None,
+    otel_grafana_metrics_base_url: str = "",
+    otel_grafana_logs_base_url: str = "",
+    otel_grafana_profile_base_url: str = "",
+    otel_jaeger_base_url: str = "",
+    otel_service_name: str = "",
+    otel_link_config_service: OtelLinkConfigProvider | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -140,6 +266,7 @@ def create_dashboard_router(
     @router.get("/observations/sessions", response_class=HTMLResponse)
     @router.get("/observations/sessions/{session_id}", response_class=HTMLResponse)
     @router.get("/observations/modules", response_class=HTMLResponse)
+    @router.get("/observations/otel", response_class=HTMLResponse)
     @router.get("/sessions", response_class=HTMLResponse)
     @router.get("/memory", response_class=HTMLResponse)
     @router.get("/tools", response_class=HTMLResponse)
@@ -223,6 +350,71 @@ def create_dashboard_router(
             settings,
             no_vnc_proxy=browser_novnc_proxy,
         )
+
+    # ------------------------------------------------------------------
+    # Observability self-check (T8): read-only diagnostic API. Excluded
+    # from automatic spans (instrumentors.EXCLUDED_HTTP_PATHS); never
+    # probes backends and never opens new network connections.
+    @router.get(_OTEL_API_PATH)
+    async def observations_otel():
+        payload: dict = {
+            "status": "disabled",
+            "mode": "disabled",
+            "instance_id": None,
+            "sample_ratio": None,
+            "semconv_version": None,
+            "instruments": [],
+            "signals": {},
+            "spans": [],
+            "dropped_after_deadline": 0,
+            "exporter_endpoint": _sanitized_endpoint_host_port(
+                getattr(settings, "otel_exporter_otlp_endpoint", "")
+                if settings is not None
+                else ""
+            ),
+            "links": {},
+            "notes": dict(_OTEL_API_NOTES),
+        }
+        if observability_snapshot is not None:
+            try:
+                raw = observability_snapshot() or {}
+            except Exception:
+                # Read failure keeps the payload readable and reports
+                # degraded with a safe code; never a fake healthy and
+                # never the raw exception.
+                payload["status"] = "degraded"
+                payload["notes"]["read_error"] = "snapshot_unavailable"
+            else:
+                for key in _OTEL_SNAPSHOT_KEYS:
+                    if key in raw:
+                        payload[key] = _sanitize_observability_value(raw[key])
+        time_iso = datetime.now(timezone.utc).isoformat()
+        base_urls = {
+            "Metric": otel_grafana_metrics_base_url,
+            "Log": otel_grafana_logs_base_url,
+            "Trace": otel_jaeger_base_url,
+            "Profile": otel_grafana_profile_base_url,
+        }
+        if otel_link_config_service is not None:
+            # current() returns the already-merged env+DB config (hot-reload);
+            # the dashboard consumes it verbatim, no re-merge. Any failure
+            # degrades to the env base so the page stays usable.
+            try:
+                resolved = await otel_link_config_service.current()
+            except Exception:
+                logger.warning("otel link config current() failed; using env base urls")
+            else:
+                base_urls = {
+                    "Metric": resolved.metric_base_url,
+                    "Log": resolved.log_base_url,
+                    "Trace": resolved.trace_base_url,
+                    "Profile": resolved.profile_base_url,
+                }
+        for name, base_url in base_urls.items():
+            link = _external_otel_link(base_url, time_iso, otel_service_name, is_trace=name == "Trace")
+            if link:
+                payload["links"][name] = link
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @router.get("/chat/sessions")
     async def sessions():

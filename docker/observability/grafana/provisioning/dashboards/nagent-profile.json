@@ -1,0 +1,49 @@
+{
+    "uid": "nagent-profile",
+    "title": "Profile",
+    "tags": [
+        "n-agent",
+        "genai"
+    ],
+    "timezone": "browser",
+    "schemaVersion": 41,
+    "version": 1,
+    "refresh": "",
+    "time": {
+        "from": "now-30m",
+        "to": "now"
+    },
+    "description": "CPU 火焰图（osp Profile 统一放 Grafana，独立看板）。数据源 Pyroscope -> {service_name=n-agent}，profileType process_cpu，与 spike 锁定契约一致。采样周期由 profiling_interval_seconds 控制（默认 60s），时间窗粒度即采样窗。",
+    "panels": [
+        {
+            "id": 1,
+            "type": "flamegraph",
+            "title": "CPU Flame Graph",
+            "datasource": {
+                "type": "grafana-pyroscope-datasource",
+                "uid": "P02E4190217B50628"
+            },
+            "gridPos": {
+                "h": 20,
+                "w": 24,
+                "x": 0,
+                "y": 0
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "datasource": {
+                        "type": "grafana-pyroscope-datasource",
+                        "uid": "P02E4190217B50628"
+                    },
+                    "queryType": "profile",
+                    "labelSelector": "{service_name=\"n-agent\"}",
+                    "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+                    "groupBy": [],
+                    "includeExemplars": false,
+                    "maxNodes": 2048
+                }
+            ]
+        }
+    ]
+}

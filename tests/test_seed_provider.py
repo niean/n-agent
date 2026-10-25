@@ -27,10 +27,14 @@ def _settings(tmp_path: Path) -> Settings:
 def test_provider_factory_dispatches_by_provider_type(monkeypatch: pytest.MonkeyPatch):
     from datetime import datetime, timezone
 
-    def fake_anthropic_init(self, base_url, api_key, default_model, extra_headers=None, client=None):
+    def fake_anthropic_init(
+        self, base_url, api_key, default_model, extra_headers=None, client=None,
+        telemetry_callback=None,
+    ):
         self.base_url = base_url
         self.default_model = default_model
         self.client = client
+        self._telemetry_callback = telemetry_callback
 
     monkeypatch.setattr(AnthropicProvider, "__init__", fake_anthropic_init)
     now = datetime.now(timezone.utc)

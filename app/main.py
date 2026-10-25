@@ -6,7 +6,7 @@ import logging
 import shutil
 import sys
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -49,6 +49,7 @@ from app.application.policy_audit_service import PolicyAuditService
 from app.application.policy_dashboard_service import PolicyDashboardService
 from app.application.task_security_dashboard_service import TaskSecurityDashboardService
 from app.application.task_config_service import TaskConfigService
+from app.application.otel_link_config_service import OtelLinkConfigService
 from app.application.config_bundle_service import ConfigBundleService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
@@ -77,7 +78,7 @@ from app.application.delegation_tool_executor import (
 from app.domain.delegation_policy import DelegationPolicy
 from app.application.task_agent_executor import TaskAgentExecutor
 from app.application.task_run_service import TaskRunService
-from app.application.task_runner import TaskRunner
+from app.application.task_runner import TaskRunner, TASK_RUNNER_STARTED_LOG_TEMPLATE, TASK_RUNNER_STOPPED_LOG_TEMPLATE
 from app.application.task_service import TaskService
 from app.application.task_session import (
     task_execution_session_id,
@@ -142,7 +143,9 @@ from app.infrastructure.registry.sqlite_delegation_registry import (
 )
 from app.infrastructure.registry.sqlite_task_registry import SQLiteTaskRegistry
 from app.infrastructure.registry.sqlite_task_config_store import SqliteTaskConfigStore
+from app.infrastructure.registry.sqlite_otel_link_config_store import SqliteOtelLinkConfigStore
 from app.infrastructure.policy.task_config_logging_sink import TaskConfigLoggingSink
+from app.infrastructure.policy.otel_link_config_logging_sink import OtelLinkConfigLoggingSink
 from app.infrastructure.tools.builtin import BUILTIN_TOOL_NAMES, build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.infrastructure.tools.schedule_management import ScheduleManagementToolExecutor
@@ -162,6 +165,7 @@ from app.infrastructure.memory.builtin_project import BuiltinProjectMemory
 from app.infrastructure.registry.sqlite_external_memory_config import SQLiteExternalMemoryConfig
 from app.interfaces.feishu_im_adapter import FeishuImAdapter
 from app.interfaces.http.dashboard import STATIC_DIR, create_dashboard_router
+from app.interfaces.http.otel_link_config_routes import register_otel_link_config_routes
 from app.interfaces.http.dashboard_tool_approval import DashboardToolApprovalBridge
 from app.interfaces.http.openai_compatible import create_openai_compatible_router
 from app.interfaces.http.platforms import create_platforms_router
@@ -249,6 +253,93 @@ if TYPE_CHECKING:
     from app.infrastructure.sandbox.manager import SandboxManager as _SandboxManager
 
 
+# Composition-root seed of vetted safe log events (raw record.msg template
+# -> fixed event code). Exact template match only; values are never
+# interpolated into the projected JSON line or OTel body. Templates are
+# shared constants also used by their call sites (main lifespan /
+# usage_service), so registration cannot drift from production records.
+_SKILL_SCAN_OK_LOG_TEMPLATE = "skill startup scan ok skills=%s warnings=%s"
+_PLUGIN_SCAN_OK_LOG_TEMPLATE = "plugin lifespan scan ok"
+_ARTIFACT_BACKFILL_LOG_TEMPLATE = "artifact backfill ok processed=%s created=%s skipped=%s failed=%s"
+_ARTIFACT_SESSION_BACKFILL_LOG_TEMPLATE = "artifact session backfill ok processed=%s updated=%s skipped=%s failed=%s"
+_ARTIFACT_KIND_BACKFILL_LOG_TEMPLATE = "artifact kind backfill ok processed=%s updated=%s skipped=%s failed=%s"
+_ARTIFACT_ORPHAN_BACKFILL_LOG_TEMPLATE = "artifact orphan backfill ok processed=%s deleted=%s skipped=%s failed=%s"
+_ARTIFACT_REVISION_LOG_TEMPLATE = "artifact revision migration ok processed=%s migrated=%s skipped=%s failed=%s"
+
+_APP_SAFE_LOG_EVENTS: tuple[tuple[str, str], ...] = (
+    (_SKILL_SCAN_OK_LOG_TEMPLATE, "skill_scan_ok"),
+    (_PLUGIN_SCAN_OK_LOG_TEMPLATE, "plugin_scan_ok"),
+    (TASK_RUNNER_STARTED_LOG_TEMPLATE, "task_runner_started"),
+    (TASK_RUNNER_STOPPED_LOG_TEMPLATE, "task_runner_stopped"),
+    (_ARTIFACT_BACKFILL_LOG_TEMPLATE, "artifact_backfill_completed"),
+    (_ARTIFACT_SESSION_BACKFILL_LOG_TEMPLATE, "artifact_session_backfill_completed"),
+    (_ARTIFACT_KIND_BACKFILL_LOG_TEMPLATE, "artifact_kind_backfill_completed"),
+    (_ARTIFACT_ORPHAN_BACKFILL_LOG_TEMPLATE, "artifact_orphan_backfill_completed"),
+    (_ARTIFACT_REVISION_LOG_TEMPLATE, "artifact_revision_migration_completed"),
+    ("artifact backfill failed", "artifact_backfill_failed"),
+    ("artifact session backfill failed", "artifact_session_backfill_failed"),
+    ("artifact kind backfill failed", "artifact_kind_backfill_failed"),
+    ("artifact orphan backfill failed", "artifact_orphan_backfill_failed"),
+    ("artifact revision migration failed", "artifact_revision_migration_failed"),
+    ("skill startup scan failed; dashboard refresh available as fallback", "skill_scan_failed"),
+    ("plugin lifespan scan failed; dashboard refresh available as fallback", "plugin_scan_failed"),
+    ("TaskRunner start failed", "task_runner_start_failed"),
+    ("TaskRunner stop failed", "task_runner_stop_failed"),
+    ("dispatch_once tick failed", "task_dispatch_failed"),
+    ("worker crashed unexpectedly: task=%s run=%s", "task_worker_crashed"),
+    ("worker %s did not cancel within grace; leaving", "task_worker_cancel_timeout"),
+)
+
+
+def _configure_execution_logging() -> None:
+    """Bind trusted execution facts without changing external log formatting."""
+    from app.application.telemetry_semantics import (
+        EXECUTION_LOG_TEMPLATE, execution_log_snapshot,
+    )
+    from app.infrastructure.observability.logging import (
+        configure_execution_context, register_safe_event,
+    )
+    from app.application.telemetry_details import validate_details, flatten_details, project_details
+    configure_execution_context(execution_log_snapshot, validate_details=validate_details,
+                                flatten_details=flatten_details, project_details=project_details)
+    register_safe_event(EXECUTION_LOG_TEMPLATE, "execution_completed")
+    register_safe_event("budget_denied kind=%s", "budget_denied")
+
+
+def _wire_log_sanitizer(information_flow_service, max_bytes: int = 2048) -> None:
+    """Atomically publish the ready log sanitizer + span-attr sanitizer.
+
+    Spec-261027: called only once the InformationFlowService secret catalog
+    exists, so the whole security-annotated assembly reaches consumers in one
+    publish (no half-wired window). Before this runs, startup logs use the
+    baseline credential rules. The same ``LogSanitizer``
+    instance backs both the stderr/OTel projection and the span-attribute
+    sanitizer, so a known secret is redacted in every outlet.
+    """
+    from app.application.telemetry_semantics import configure_span_attribute_sanitizer
+    from app.application.telemetry_details import configure_details
+    from app.infrastructure.observability.logging import (
+        LogSanitizer,
+        prepare_sanitizer,
+    )
+
+    secrets = frozenset()
+    try:
+        catalog = getattr(information_flow_service, "secrets", None)
+        catalog_secrets = getattr(catalog, "secret_values", None)
+        if catalog_secrets:
+            secrets = frozenset(v for v in catalog_secrets if isinstance(v, str) and v)
+    except Exception:
+        secrets = frozenset()
+    sanitizer = LogSanitizer()
+    sanitizer.configure_secret_catalog(secrets)
+    prepare_sanitizer(sanitizer, max_bytes=max_bytes)
+    configure_span_attribute_sanitizer(sanitizer.sanitize)
+    configure_details(sanitizer.sanitize, max_bytes)
+    from app.infrastructure.observability.http_capture import configure_capture_limit
+    configure_capture_limit(max_bytes)
+
+
 def _configure_logging() -> None:
     """Configure root logger so application INFO logs are visible.
 
@@ -256,13 +347,41 @@ def _configure_logging() -> None:
     导致应用层 logger.info() 因 root logger 无 handler 且 effective level 回落
     到 WARNING 而完全静默（仅 uvicorn.access logger 单独配置仍可见）。这里在
     FastAPI 工厂启动时显式配置 root logger，保证 HTTP 服务的应用日志可见。
-    CLI 只复用本模块的服务装配，不应因此开启 INFO 日志。basicConfig 幂等：
-    root logger 已有 handler 时（如 pytest 已配置）不覆盖。
+    CLI 只复用本模块的服务装配，不应因此开启 INFO 日志。
+
+    日志合同（spec-261024-otel-observability）：应用自有 stderr handler 使用
+    安全 JSON formatter（仅白名单字段与事件码，消息正文/参数/异常不外发）；
+    已有外部 handler 的格式不被覆盖。观测启用且存在 LoggerProvider 时 root
+    恰好附加一个投影副本 OTel bridge（本地 local-only 模式无 LoggerProvider，
+    故不附加）。import 本模块无副作用。
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    from app.application.usage_service import API_CALL_LOG_TEMPLATE
+    from app.infrastructure.observability.logging import (
+        SafeEventJsonFormatter,
+        SafeLogFilter,
+        ensure_sanitizer,
+        attach_observability_log_bridge,
+        register_safe_event,
     )
+
+    ensure_sanitizer()
+    _configure_execution_logging()
+    for template, event_code in (
+        *_APP_SAFE_LOG_EVENTS,
+        (API_CALL_LOG_TEMPLATE, "llm_api_call"),
+    ):
+        register_safe_event(template, event_code)
+    root = logging.getLogger()
+    if not root.handlers:
+        # basicConfig-equivalent, but with the safe JSON formatter (and
+        # skipped entirely when an external consumer already configured
+        # handlers -- their formats stay untouched).
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(SafeEventJsonFormatter())
+        handler.addFilter(SafeLogFilter())
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+    attach_observability_log_bridge()
 
 
 logger = logging.getLogger(__name__)
@@ -296,12 +415,43 @@ class _BuiltinWebFetcherAdapter:
             return {"status": "error", "error": str(exc)}
 
 
+def _make_provider_factory(settings: Settings, telemetry: Any):
+    """Build the provider factory, binding the chat-attempt telemetry
+    callback (facade method) into every OpenAI-compatible provider."""
+    from app.application.telemetry_semantics import register_model_name
+
+    telemetry_callback = (
+        telemetry.begin_chat_attempt if settings.otel_enabled else None
+    )
+
+    def _provider_factory(cfg: ProviderConfig, api_key: str):
+        # Bounded registrar: the configured model becomes an allowed value so
+        # map_model_name emits its real name instead of "other" (low-card;
+        # per-request overrides stay bounded and unregistered -> "other").
+        try:
+            register_model_name(cfg.model)
+        except Exception:  # observability-only, never affects business
+            pass
+        if cfg.provider_type == "openai-compatible":
+            return OpenAICompatibleProvider(
+                cfg.base_url, api_key, cfg.model,
+                telemetry_callback=telemetry_callback,
+            )
+        if cfg.provider_type == "anthropic":
+            return AnthropicProvider(
+                cfg.base_url, api_key, cfg.model, cfg.extra_headers,
+                telemetry_callback=telemetry_callback,
+            )
+        raise RuntimeError(f"unsupported provider_type: {cfg.provider_type}")
+
+    return _provider_factory
+
+
 def _provider_factory(cfg: ProviderConfig, api_key: str):
-    if cfg.provider_type == "openai-compatible":
-        return OpenAICompatibleProvider(cfg.base_url, api_key, cfg.model)
-    if cfg.provider_type == "anthropic":
-        return AnthropicProvider(cfg.base_url, api_key, cfg.model, cfg.extra_headers)
-    raise RuntimeError(f"unsupported provider_type: {cfg.provider_type}")
+    """Legacy no-telemetry factory kept for direct tests/back-compat."""
+    from app.application.telemetry_semantics import NoopTelemetry
+
+    return _make_provider_factory(Settings(), NoopTelemetry())(cfg, api_key)
 
 
 def _run_sync(coro):
@@ -446,6 +596,13 @@ class ApplicationServices:
     # 配置迁移包服务. 默认值形式追加在类尾: 自 usage_service 起本 dataclass 全是
     # 带默认值字段, 无默认值字段追加会触发 TypeError.
     config_bundle_service: ConfigBundleService | None = None
+    # Observability (T5): OTel runtime handle + shared semantics facade.
+    observability_handle: Any = None
+    telemetry: Any = None
+    # OTel link config (C 类运行时配置): assembled unconditionally, like
+    # task_config_service, so saved overrides apply regardless of the
+    # otel_enabled B 类开关.
+    otel_link_config_service: OtelLinkConfigService | None = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -486,8 +643,54 @@ def _validate_host_terminal_host_mapping(
         raise ValueError("host_terminal_host_mapping_invalid")
 
 
-def build_application_services(settings: Settings | None = None) -> ApplicationServices:
+def build_application_services(
+    settings: Settings | None = None, *, observability_handle: Any = None
+) -> ApplicationServices:
     settings = settings or Settings()
+    if observability_handle is None:
+        # Lazy import so tests can patch the setup module; also keeps the
+        # disabled path free of any OTel SDK import at module load.
+        from app.infrastructure.observability.setup import configure_observability
+
+        observability_handle = configure_observability(settings)
+    from app.application.telemetry_semantics import NoopTelemetry, SemanticsTelemetry
+
+    telemetry = SemanticsTelemetry() if settings.otel_enabled else NoopTelemetry()
+    # Profiler composition-root wiring (T8): one sampler per Python PID,
+    # created lazily per PID (fork-invariant), shared by the HTTP lifespan
+    # and application_runtime (both assemble through this builder). Started
+    # after construction/fork; registration gives the handle the 2s-bounded
+    # stop callback included in the overall shutdown budget. The on_status
+    # bridge keeps the profile signal in sync with the sampler (attach,
+    # per-window failures/backoff, 3-strikes sampler_disabled). Note: if a
+    # later step below raises, the already-started daemon sampler keeps
+    # running until process exit -- register-with-handle happens before
+    # start() precisely so shutdown still recovers it within its budget.
+    if settings.profiling_enabled and observability_handle is not None:
+        from app.infrastructure.observability.profiling import get_or_create_profiler
+
+        on_status = getattr(observability_handle, "profiler_on_status", None)
+        profiler = get_or_create_profiler(
+            settings,
+            instance_id=getattr(observability_handle, "instance_id", None),
+            **({"on_status": on_status()} if callable(on_status) else {}),
+        )
+        if profiler is not None:
+            profiler.register_with_handle(observability_handle)
+            if profiler.start():
+                # Clear the assembly-time profiler_not_configured fault:
+                # the sampler is attached, so the signal must not keep the
+                # overall status permanently degraded.
+                mark_attached = getattr(
+                    observability_handle, "mark_profiler_attached", None
+                )
+                if callable(mark_attached):
+                    mark_attached()
+            else:
+                logger.warning(
+                    "observability profiler failed to start; profile "
+                    "signal stays degraded with the sampler error code"
+                )
     memory_store = SQLiteMemoryStore(
         settings.sqlite_path,
         migration_protect_first_n=settings.context_compression_protect_first_n,
@@ -496,7 +699,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     summarizer = HeuristicSummarizer()
     registry = SQLiteProviderRegistry(settings.sqlite_path)
     gateway_registry = SQLiteGatewaySessionRegistry(settings.sqlite_path)
-    holder = ActiveProviderHolder(_provider_factory)
+    holder = ActiveProviderHolder(_make_provider_factory(settings, telemetry))
     _run_sync(_seed_and_activate(registry, holder, settings))
     provider_service = ProviderService(registry, holder)
     builtin_executor = build_builtin_tool_executor(
@@ -543,6 +746,13 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     audit_service = PolicyAuditService(audit_sink)
     # Budget + InformationFlow services (created early so ToolService can enforce)
     information_flow_service = InformationFlowService.from_settings(settings, audit_service=audit_service)
+    # Security-annotated startup assembly: publish the ready log sanitizer once
+    # the secret catalog exists (spec-261027). Errors must not break service
+    # assembly; logging stays in safe event-only mode if this fails.
+    try:
+        _wire_log_sanitizer(information_flow_service, settings.otel_content_max_bytes)
+    except Exception:
+        logger.exception("failed to wire log sanitizer; staying in safe event-only mode")
     budget_service = BudgetService(
         BudgetPolicyConfig(
             max_wall_seconds=settings.budget_max_wall_seconds,
@@ -556,6 +766,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
             max_sandbox_callback_calls=settings.budget_max_sandbox_callback_calls,
         ),
         audit_service=audit_service,
+        telemetry=telemetry,
     )
     tool_service = ToolService(
         CompositeToolExecutor(routes),
@@ -563,6 +774,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         budget_service=budget_service,
         information_flow_service=information_flow_service,
         audit_service=audit_service,
+        telemetry=telemetry,
     )
     mcp_service = McpService(mcp_registry, mcp_client, tool_service)
     mcp_management_executor = McpManagementToolExecutor(mcp_service)
@@ -947,6 +1159,7 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         hook_dispatcher=plugin_service,
         browser_guidance=BROWSER_GUIDANCE if settings.browser_enabled else None,
         artifact_guidance=ARTIFACT_GUIDANCE if settings.artifacts_enabled else None,
+        telemetry=telemetry,
     )
     session_service = SessionService(
         memory_store,
@@ -1133,6 +1346,21 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
     task_config_store = SqliteTaskConfigStore(str(settings.sqlite_path))
     task_config_service = TaskConfigService(
         settings, task_config_store, TaskConfigLoggingSink(),
+    )
+    # OTel link config service is assembled unconditionally (outside
+    # otel_enabled): it is C 类运行时配置, the dashboard management API and
+    # the rendered links must work even when OTel export is disabled.
+    # SqliteOtelLinkConfigStore creates its table idempotently in __init__
+    # (fail-fast), never inside a request. The migration read-only assembly
+    # (build_config_bundle_services) deliberately does not construct it.
+    otel_link_config_store = SqliteOtelLinkConfigStore(str(settings.sqlite_path))
+    otel_link_config_service = OtelLinkConfigService(
+        otel_link_config_store,
+        OtelLinkConfigLoggingSink(),
+        metric_base_url=settings.otel_grafana_metrics_base_url,
+        log_base_url=settings.otel_grafana_logs_base_url,
+        trace_base_url=(settings.otel_grafana_traces_base_url or settings.otel_jaeger_base_url),
+        profile_base_url=settings.otel_grafana_profile_base_url,
     )
     # 配置迁移包服务. 构造点必须在 task_config_service 之后: 它是十一个协作者中
     # 最晚构造的一个. 全部经 __init__ 注入 Domain 端口 / 同层 Service.
@@ -1964,6 +2192,9 @@ def build_application_services(settings: Settings | None = None) -> ApplicationS
         delegation_run_service=delegation_run_service,
         delegation_tool_executor=delegation_tool_executor,
         child_agent_executor=child_agent_executor,
+        observability_handle=observability_handle,
+        telemetry=telemetry,
+        otel_link_config_service=otel_link_config_service,
     )
 
 
@@ -2097,9 +2328,66 @@ def _default_browser_actor_resolver(request: Any) -> str | None:
     return "dashboard-operator"
 
 
+@contextmanager
+def application_runtime(settings: Settings | None = None):
+    """Shared entry lifecycle for non-HTTP entries (CLI chat, ACP server).
+
+    Configures observability once, assembles the application services
+    against that handle, and guarantees the handle is shut down exactly
+    once -- including on the exception path.
+    """
+    from app.infrastructure.observability.setup import configure_observability
+
+    _configure_execution_logging()
+    settings = settings or Settings()
+    handle = configure_observability(settings)
+    # Log bridge only when a root handler already exists: ACP installs its
+    # own stderr handler before entering, so its INFO events reach OTel;
+    # bare CLI chat keeps the logging.lastResort behavior (attaching a
+    # handler unconditionally would suppress lastResort and make WARNING+
+    # tracebacks vanish from stderr). Disabled/local-only handles attach
+    # nothing (gated inside attach_observability_log_bridge).
+    from app.infrastructure.observability.logging import attach_observability_log_bridge
+    temporary_loggers = []
+    if logging.getLogger().handlers:
+        attach_observability_log_bridge()
+    elif handle.mode == "otlp":
+        # Export execution summaries without installing a root handler, so
+        # unrelated CLI warnings still reach logging.lastResort.
+        from app.application import telemetry_semantics
+        for name in (telemetry_semantics.__name__, "app.infrastructure.observability.logging"):
+            execution_logger = logging.getLogger(name)
+            temporary_loggers.append((execution_logger, execution_logger.handlers[:], execution_logger.level))
+            attach_observability_log_bridge(logger=execution_logger)
+            execution_logger.setLevel(logging.INFO)
+    try:
+        services = build_application_services(settings, observability_handle=handle)
+        yield services
+    finally:
+        for execution_logger, original_handlers, original_level in temporary_loggers:
+            for handler in execution_logger.handlers[:]:
+                if handler not in original_handlers:
+                    execution_logger.removeHandler(handler)
+            execution_logger.setLevel(original_level)
+        try:
+            handle.shutdown()
+        except Exception:
+            logger.exception("observability shutdown failed")
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
+    from app.infrastructure.observability.setup import SERVICE_NAME
+
     _configure_logging()
     services = build_application_services(settings)
+    # Observability is configured during service assembly (above); now that
+    # a LoggerProvider may exist, attach the OTel log bridge (no-op when
+    # disabled or local-only, and idempotent).
+    from app.infrastructure.observability.logging import (
+        attach_observability_log_bridge,
+    )
+
+    attach_observability_log_bridge()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -2118,7 +2406,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             report = await services.skill_service.scan_now()
             logger.info(
-                "skill startup scan ok skills=%s warnings=%s",
+                _SKILL_SCAN_OK_LOG_TEMPLATE,
                 report.skills_count,
                 len(report.warnings),
             )
@@ -2126,7 +2414,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.exception("skill startup scan failed; dashboard refresh available as fallback")
         try:
             await services.plugin_service.scan()
-            logger.info("plugin lifespan scan ok")
+            logger.info(_PLUGIN_SCAN_OK_LOG_TEMPLATE)
         except Exception:
             logger.exception("plugin lifespan scan failed; dashboard refresh available as fallback")
         if services.settings.scheduler_enabled and not _maintenance:
@@ -2161,8 +2449,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     batch_size=100
                 )
                 logger.info(
-                    "artifact backfill ok processed=%s created=%s "
-                    "skipped=%s failed=%s",
+                    _ARTIFACT_BACKFILL_LOG_TEMPLATE,
                     stats.get("processed", 0),
                     stats.get("created", 0),
                     stats.get("skipped", 0),
@@ -2179,8 +2466,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 if sstats.get("processed", 0):
                     logger.info(
-                        "artifact session backfill ok processed=%s "
-                        "updated=%s skipped=%s failed=%s",
+                        _ARTIFACT_SESSION_BACKFILL_LOG_TEMPLATE,
                         sstats.get("processed", 0),
                         sstats.get("updated", 0),
                         sstats.get("skipped", 0),
@@ -2198,8 +2484,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 if kstats.get("processed", 0):
                     logger.info(
-                        "artifact kind backfill ok processed=%s "
-                        "updated=%s skipped=%s failed=%s",
+                        _ARTIFACT_KIND_BACKFILL_LOG_TEMPLATE,
                         kstats.get("processed", 0),
                         kstats.get("updated", 0),
                         kstats.get("skipped", 0),
@@ -2217,8 +2502,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 if ostats.get("processed", 0):
                     logger.info(
-                        "artifact orphan backfill ok processed=%s "
-                        "deleted=%s skipped=%s failed=%s",
+                        _ARTIFACT_ORPHAN_BACKFILL_LOG_TEMPLATE,
                         ostats.get("processed", 0),
                         ostats.get("deleted", 0),
                         ostats.get("skipped", 0),
@@ -2234,8 +2518,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     batch_size=100
                 )
                 logger.info(
-                    "artifact revision migration ok processed=%s "
-                    "migrated=%s skipped=%s failed=%s",
+                    _ARTIFACT_REVISION_LOG_TEMPLATE,
                     mstats.get("processed", 0),
                     mstats.get("migrated", 0),
                     mstats.get("skipped", 0),
@@ -2330,6 +2613,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 )
                 except Exception:
                     logger.exception("browser shutdown failed")
+        # Observability handle shutdown (T5): bounded flush of all signals;
+        # failures are logged, never block the rest of the lifespan teardown.
+        if services.observability_handle is not None:
+            try:
+                services.observability_handle.shutdown()
+            except Exception:
+                logger.exception("observability shutdown failed")
 
     app = FastAPI(title="N-Agent", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -2338,43 +2628,65 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # T3: One DashboardToolApprovalBridge shared with the same
     # GatewayToolApprovalService instance that GatewayService holds.
     dashboard_tool_approval_bridge = DashboardToolApprovalBridge()
-    app.include_router(
-        create_dashboard_router(
-            services.session_service,
-            services.tool_service,
-            services.model_service,
-            services.health_snapshot,
-            provider_service=services.provider_service,
-            mcp_service=services.mcp_service,
-            schedule_service=services.schedule_service,
-            skill_service=services.skill_service,
-            plugin_service=services.plugin_service,
-            knowledge_service=services.knowledge_service,
-            external_memory_service=services.external_memory_service,
-            external_memory_provider_service=services.external_memory_provider_service,
-            sandbox_dashboard_service=services.sandbox_dashboard_service,
-            host_terminal_dashboard_service=services.host_terminal_dashboard_service,
-            usage_service=services.usage_service,
-            memory_store=services.memory_store,
-            chat_service=services.chat_service,
-            policy_dashboard_service=services.policy_dashboard_service,
-            skill_pending_store=services.skill_pending_store,
-            skill_usage_store=services.skill_usage_store,
-            image_store=services.image_store,
-            task_security_dashboard_service=services.task_security_dashboard_service,
-            task_config_service=services.task_config_service,
-            task_service=services.task_service,
-            task_run_service=services.task_run_service,
-            browser_dashboard_service=services.browser_dashboard_service,
-            browser_confirmation_service=services.browser_confirmation_service,
-            browser_novnc_proxy=services.browser_novnc_proxy,
-            browser_actor_resolver=_default_browser_actor_resolver,
-            dashboard_tool_approval_bridge=dashboard_tool_approval_bridge,
-            tool_approval_service=services.tool_approval_service,
-            artifact_service=services.artifact_service,
-            settings=services.settings,
-        )
+    dashboard_router = create_dashboard_router(
+        services.session_service,
+        services.tool_service,
+        services.model_service,
+        services.health_snapshot,
+        provider_service=services.provider_service,
+        mcp_service=services.mcp_service,
+        schedule_service=services.schedule_service,
+        skill_service=services.skill_service,
+        plugin_service=services.plugin_service,
+        knowledge_service=services.knowledge_service,
+        external_memory_service=services.external_memory_service,
+        external_memory_provider_service=services.external_memory_provider_service,
+        sandbox_dashboard_service=services.sandbox_dashboard_service,
+        host_terminal_dashboard_service=services.host_terminal_dashboard_service,
+        usage_service=services.usage_service,
+        memory_store=services.memory_store,
+        chat_service=services.chat_service,
+        policy_dashboard_service=services.policy_dashboard_service,
+        skill_pending_store=services.skill_pending_store,
+        skill_usage_store=services.skill_usage_store,
+        image_store=services.image_store,
+        task_security_dashboard_service=services.task_security_dashboard_service,
+        task_config_service=services.task_config_service,
+        task_service=services.task_service,
+        task_run_service=services.task_run_service,
+        browser_dashboard_service=services.browser_dashboard_service,
+        browser_confirmation_service=services.browser_confirmation_service,
+        browser_novnc_proxy=services.browser_novnc_proxy,
+        browser_actor_resolver=_default_browser_actor_resolver,
+        dashboard_tool_approval_bridge=dashboard_tool_approval_bridge,
+        tool_approval_service=services.tool_approval_service,
+        artifact_service=services.artifact_service,
+        settings=services.settings,
+        # Observability self-check (T8): the Dashboard consumes only the
+        # injected snapshot callable + browser link base_urls; it never
+        # touches the OTel SDK itself.
+        observability_snapshot=(
+            services.observability_handle.snapshot
+            if services.observability_handle is not None
+            else None
+        ),
+        otel_grafana_metrics_base_url=services.settings.otel_grafana_metrics_base_url,
+        otel_grafana_logs_base_url=services.settings.otel_grafana_logs_base_url,
+        otel_grafana_profile_base_url=services.settings.otel_grafana_profile_base_url,
+        otel_jaeger_base_url=(services.settings.otel_grafana_traces_base_url or services.settings.otel_jaeger_base_url),
+        # Single source for the browser-link service label (setup.py).
+        otel_service_name=SERVICE_NAME,
+        # Same instance held by ApplicationServices: the dashboard renders
+        # resolved links and the management API below mutates it.
+        otel_link_config_service=services.otel_link_config_service,
     )
+    # OTel link config management API (GET/PATCH /chat/observations/otel/links).
+    # Optional injection: when no service is wired the route stays absent and
+    # the frontend disables the config entry on 404. Registered before
+    # include_router so inclusion semantics cannot drop it.
+    if services.otel_link_config_service is not None:
+        register_otel_link_config_routes(dashboard_router, services.otel_link_config_service)
+    app.include_router(dashboard_router)
     # Published artifact routes at app root (GET /p/{publish_id} and
     # /p/{publish_id}/content). Registered only when artifact_service is
     # wired (artifacts_enabled=True).
@@ -2389,4 +2701,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             delegation_service=services.delegation_service,
             registry=services.delegation_registry,
         )
+    # Instrument the FastAPI app (T5) before it is handed to the server.
+    # Only when OTel is enabled: instrument_app registers the global
+    # httpx/sqlite3 instrumentors, which a disabled deployment must not
+    # carry. Lazy import so tests can patch the instrumentors module.
+    if services.settings.otel_enabled:
+        from app.infrastructure.observability.instrumentors import instrument_app
+
+        instrument_app(app)
     return app

@@ -24,11 +24,17 @@ from app.application.host_terminal_capability import (
     is_photo_capability_result,
 )
 from app.application.skill_service import skill_manage_tool_definition
+from app.application.telemetry_details import project_details
+from app.application.telemetry_semantics import (
+    NoopTelemetry,
+    register_tool_name,
+)
 
 if TYPE_CHECKING:
     from app.application.budget_service import BudgetService
     from app.application.information_flow_service import InformationFlowService
     from app.application.policy_audit_service import PolicyAuditService
+    from app.application.telemetry_semantics import SemanticsTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +81,14 @@ class ToolService:
         budget_service: "BudgetService | None" = None,
         information_flow_service: "InformationFlowService | None" = None,
         audit_service: "PolicyAuditService | None" = None,
+        telemetry: "SemanticsTelemetry | None" = None,
     ):
         self.policy = policy if policy is not None else ToolPolicy()
         for definition in definitions:
             self.policy.validate_definition(definition)
         self.executor = executor
         self.definitions = {definition.name: definition for definition in definitions}
+        self._register_tool_names(self.definitions)
         self.dynamic_definitions: dict[str, dict[str, ToolDefinition]] = {}
         self._suppressed_static_names: dict[str, set[str]] = {}
         self._evaluated_executions: WeakKeyDictionary[
@@ -90,6 +98,7 @@ class ToolService:
         self._budget_service = budget_service
         self._information_flow_service = information_flow_service
         self._audit_service = audit_service
+        self._telemetry = telemetry if telemetry is not None else NoopTelemetry()
 
     def replace_dynamic_definitions(
         self,
@@ -153,6 +162,19 @@ class ToolService:
         # --- Phase 6: atomic commit ---
         self.dynamic_definitions[source_key] = kept_dynamic
         self._suppressed_static_names[source_key] = suppressed
+        self._register_tool_names(kept_dynamic)
+
+    @staticmethod
+    def _register_tool_names(definitions: dict[str, ToolDefinition]) -> None:
+        """Make live tool names observable through the bounded telemetry
+        registry so ``execute_tool <name>`` shows the real value instead of
+        collapsing to ``other``. Observability-only; a full registry never
+        breaks tool registration (names simply stay unknown -> ``other``)."""
+        for name in definitions:
+            try:
+                register_tool_name(name)
+            except Exception:  # pragma: no cover - observability isolation
+                pass
 
     def set_dynamic_definitions(self, source_key: str, definitions: list[ToolDefinition]) -> None:
         """Backward-compatible alias for ``replace_dynamic_definitions`` with
@@ -297,6 +319,43 @@ class ToolService:
         *,
         evaluation: ToolExecutionEvaluation | None = None,
     ) -> ToolResult:
+        with self._telemetry.tool_execution(
+            tool=request.name,
+            call_id=request.id,
+        ) as tool_tel:
+            try:
+                if not isinstance(self._telemetry, NoopTelemetry):
+                    tool_tel['details'] = project_details(tool_arguments=request.arguments)
+            except Exception:
+                pass
+            try:
+                result = await self._execute(request, context, evaluation=evaluation, tool_tel=tool_tel)
+            except BaseException as exc:
+                try:
+                    if not isinstance(self._telemetry, NoopTelemetry):
+                        tool_tel.setdefault('details', {}).update(project_details(error=str(exc)))
+                except Exception:
+                    pass
+                raise
+            try:
+                if not isinstance(self._telemetry, NoopTelemetry):
+                    tool_tel.setdefault('details', {}).update(project_details(tool_result=result.content))
+            except Exception:
+                pass
+            return result
+
+    async def _execute(
+        self,
+        request: ToolCallRequest,
+        context: ToolExecutionContext | None = None,
+        *,
+        evaluation: ToolExecutionEvaluation | None = None,
+        tool_tel: dict | None = None,
+    ) -> ToolResult:
+        def _tel_outcome(**fields):
+            if tool_tel is not None:
+                tool_tel.update(fields)
+
         if evaluation is not None:
             try:
                 definition = self._definition_for_evaluation(request, evaluation)
@@ -319,14 +378,26 @@ class ToolService:
                     ToolResultStatus.ERROR,
                     {"error": "tool not found"},
                 )
+        if tool_tel is not None and getattr(definition, "risk_level", None) is not None:
+            tool_tel["risk_level"] = (
+                definition.risk_level.value
+                if hasattr(definition.risk_level, "value")
+                else definition.risk_level
+            )
         decision = self.policy.evaluate_execution(definition, request, context)
         if decision.outcome is not PolicyOutcome.ALLOW:
+            _tel_outcome(
+                policy_outcome=decision.outcome.value
+                if hasattr(decision.outcome, "value")
+                else str(decision.outcome),
+            )
             return ToolResult(
                 request.id,
                 request.name,
                 ToolResultStatus.PERMISSION_DENIED,
                 {"error": "permission_denied", "reason": decision.reason},
             )
+        _tel_outcome(policy_outcome="allow")
 
         # --- Tool Budget enforcement (T12 S3) ---
         # Reserve a tool call before any executor. If denied, executor is NOT called.
@@ -398,6 +469,7 @@ class ToolService:
                     pass  # Keep original request if JSON round-trip fails
 
         # --- Execute tool ---
+        _tel_outcome(executed=True)
         try:
             try:
                 result = await self.executor.execute(working_request, context)
@@ -413,6 +485,10 @@ class ToolService:
             if reservation is not None and self._budget_service is not None:
                 await self._budget_service.release(run_id, reservation)
             raise
+
+        _tel_outcome(
+            outcome="success" if result.status is ToolResultStatus.SUCCESS else "error"
+        )
 
         # --- Budget settle (success/unknown usage) ---
         if reservation is not None and self._budget_service is not None:

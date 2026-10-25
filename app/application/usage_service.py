@@ -14,6 +14,14 @@ from app.domain.usage import (
 
 logger = logging.getLogger(__name__)
 
+# Safe log event template (T6): registered in the composition root's
+# _APP_SAFE_LOG_EVENTS so the OTel log projection can emit its event code.
+# Shared constant -- the registration and this call site must byte-match.
+API_CALL_LOG_TEMPLATE = (
+    "API call: model=%s provider=%s in=%d out=%d cache_r=%d cache_w=%d "
+    "reason=%d total=%d norm=%d latency=%dms"
+)
+
 
 class UsageService:
     def __init__(
@@ -105,7 +113,7 @@ class UsageService:
             return
         cost = self.estimate_cost(usage, model or "", provider or "")
         logger.info(
-            "API call: model=%s provider=%s in=%d out=%d cache_r=%d cache_w=%d reason=%d total=%d norm=%d latency=%dms",
+            API_CALL_LOG_TEMPLATE,
             model, provider, usage.input_tokens, usage.output_tokens,
             usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens,
             usage.total_tokens, usage.normalized_tokens, latency_ms or 0,

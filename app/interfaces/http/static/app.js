@@ -7,6 +7,7 @@
     models: false,
     'observations-modules': false,
     'observations-sessions': false,
+    'observations-otel': false,
     'scheduled-tasks': false,
     'scheduled-tasks-observations': false,
     tasks: false,
@@ -47,6 +48,7 @@
     if (tab === 'executors-host') return namespace.host;
     if (tab === 'observations-sessions') return namespace.observations;
     if (tab === 'observations-modules') return namespace.status;
+    if (tab === 'observations-otel') return namespace.observationsOtel;
     if (tab === 'security') return namespace.security;
     if (tab === 'browser') return namespace.browser;
     return null;

@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RESTART_SCRIPT = ROOT / "docker" / "restart.sh"
@@ -12,7 +14,8 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
-def test_restart_removes_stale_compose_containers_before_up(tmp_path):
+def _make_fake_restart_env(tmp_path):
+    """Fake docker/curl/sleep/jq on PATH; returns (env, command_log)."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     stale_marker = tmp_path / "stale-container"
@@ -63,6 +66,12 @@ exit 0
             "FAKE_DOCKER_STALE_MARKER": str(stale_marker),
         }
     )
+    return env, command_log
+
+
+def _run_restart_script(tmp_path, extra_env):
+    env, command_log = _make_fake_restart_env(tmp_path)
+    env.update(extra_env)
     completed = subprocess.run(
         ["bash", str(RESTART_SCRIPT)],
         cwd=ROOT,
@@ -71,10 +80,38 @@ exit 0
         text=True,
         check=False,
     )
-
     assert completed.returncode == 0, completed.stderr
-    commands = command_log.read_text(encoding="utf-8").splitlines()
+    return command_log.read_text(encoding="utf-8").splitlines()
+
+
+def test_restart_removes_stale_compose_containers_before_up(tmp_path):
+    commands = _run_restart_script(tmp_path, {})
     down_index = next(i for i, command in enumerate(commands) if command.startswith("compose down "))
     rm_index = next(i for i, command in enumerate(commands) if command.startswith("compose rm "))
     up_index = next(i for i, command in enumerate(commands) if command.startswith("compose up "))
     assert down_index < rm_index < up_index
+
+
+@pytest.mark.parametrize(
+    "stop_timeout, expected_timeout",
+    [
+        # 默认保持 1 秒（既有重建规则不受观测验收影响）
+        (None, "1"),
+        # 观测验收环境显式 10 秒，须贯穿到 compose down --timeout
+        ("10", "10"),
+    ],
+)
+def test_restart_propagates_compose_stop_timeout(tmp_path, stop_timeout, expected_timeout):
+    """N_AGENT_COMPOSE_STOP_TIMEOUT 默认 1s 且逐值传入 compose down --timeout。"""
+    extra_env = (
+        {}
+        if stop_timeout is None
+        else {"N_AGENT_COMPOSE_STOP_TIMEOUT": stop_timeout}
+    )
+    if stop_timeout is None:
+        os.environ.pop("N_AGENT_COMPOSE_STOP_TIMEOUT", None)
+    commands = _run_restart_script(tmp_path, extra_env)
+    down_command = next(
+        command for command in commands if command.startswith("compose down ")
+    )
+    assert down_command == f"compose down --timeout {expected_timeout}"

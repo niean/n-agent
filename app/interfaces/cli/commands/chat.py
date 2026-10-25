@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from app.interfaces.cli.cli_chat_adapter import CliChatAdapter
 from app.interfaces.cli.render import make_console, render_markdown, render_status
@@ -10,10 +11,20 @@ from app.interfaces.cli.repl import ReplRunner
 from app.interfaces.cli.streaming import consume_stream
 
 
-def _build_services() -> Any:
-    from app.main import build_application_services
+@contextmanager
+def _services_scope() -> Iterator[Any]:
+    """Hold application services for one CLI chat command.
 
-    return build_application_services()
+    Production path: the shared application_runtime context manager
+    (configure observability once, shutdown exactly once, including the
+    exception path). Tests replace this scope with a fake that yields
+    prebuilt services.
+    """
+    # Call-time import so a patched app.main.application_runtime is honored.
+    from app.main import application_runtime
+
+    with application_runtime() as services:
+        yield services
 
 
 def run(args) -> int:
@@ -22,21 +33,21 @@ def run(args) -> int:
         return 2
     conversation_id = args.conversation_id or args.session_source or "local"
 
-    services = _build_services()
-    console = make_console()
-    client = CliChatAdapter(services.gateway_service)
+    with _services_scope() as services:
+        console = make_console()
+        client = CliChatAdapter(services.gateway_service)
 
-    if args.message:
-        return asyncio.run(_send_once(client, args.message, conversation_id, args.no_stream, console))
+        if args.message:
+            return asyncio.run(_send_once(client, args.message, conversation_id, args.no_stream, console))
 
-    if not sys.stdin.isatty():
-        data = sys.stdin.read()
-        if not data.strip():
-            render_status("no message provided on stdin", "error", console)
-            return 2
-        return asyncio.run(_send_once(client, data.strip(), conversation_id, args.no_stream, console))
+        if not sys.stdin.isatty():
+            data = sys.stdin.read()
+            if not data.strip():
+                render_status("no message provided on stdin", "error", console)
+                return 2
+            return asyncio.run(_send_once(client, data.strip(), conversation_id, args.no_stream, console))
 
-    return asyncio.run(_run_repl(client, console, conversation_id))
+        return asyncio.run(_run_repl(client, console, conversation_id))
 
 
 async def _send_once(client: CliChatAdapter, text: str, conversation_id: str, no_stream: bool, console: Any) -> int:

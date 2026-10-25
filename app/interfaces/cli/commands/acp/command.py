@@ -91,14 +91,12 @@ def _run_setup() -> int:
 def _run_server() -> int:
     _configure_logging()
     try:
-        import asyncio
+        from app.main import application_runtime
 
-        import acp
-        from app.interfaces.cli.commands.acp.agent import NAgentACPAgent
-
-        services = _load_services()
-        agent = NAgentACPAgent(services, services.settings)
-        asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
+        # Hold the observability runtime for the whole server lifetime
+        # (configure once, shutdown exactly once, including on exceptions).
+        with application_runtime() as services:
+            _serve(services)
         return 0
     except KeyboardInterrupt:
         return 0
@@ -106,3 +104,14 @@ def _run_server() -> int:
         logging.getLogger(__name__).exception("ACP server failed")
         print(f"ACP server error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
+
+
+def _serve(services: Any) -> None:
+    """Run the ACP stdio JSON-RPC loop against assembled services."""
+    import asyncio
+
+    import acp
+    from app.interfaces.cli.commands.acp.agent import NAgentACPAgent
+
+    agent = NAgentACPAgent(services, services.settings)
+    asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))

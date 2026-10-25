@@ -39,8 +39,10 @@ from app.infrastructure.tools.composite import CompositeToolExecutor
 class FakeProvider:
     def __init__(self):
         self.calls = 0
+        self.model_list_calls = 0
 
     async def list_models(self):
+        self.model_list_calls += 1
         return [ModelInfo("test", "test", "fake")]
 
     async def supports_tools(self, model: str):

@@ -127,7 +127,8 @@ async def test_logging_sink_outputs_only_allowed_fields(caplog):
     ]
     assert len(log_records) == 1
 
-    payload = json.loads(log_records[0].message)
+    assert log_records[0].msg == "policy_decision %s"
+    payload = json.loads(log_records[0].args[0])
 
     expected_keys = {
         "policy", "version", "decision_kind", "reason", "outcome",
@@ -168,7 +169,7 @@ async def test_logging_sink_does_not_leak_sensitive_fields(caplog):
     ]
     assert len(log_records) == 1
 
-    raw_line = log_records[0].message
+    raw_line = log_records[0].args[0]
     payload = json.loads(raw_line)
 
     forbidden_keys = (
@@ -201,7 +202,8 @@ async def test_logging_sink_serializes_none_outcome_for_non_admission(caplog):
     ]
     assert len(log_records) == 1
 
-    payload = json.loads(log_records[0].message)
+    assert log_records[0].msg == "policy_decision %s"
+    payload = json.loads(log_records[0].args[0])
     assert payload["outcome"] is None
     assert payload["decision_kind"] == "plan"
 

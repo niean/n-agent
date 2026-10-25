@@ -269,7 +269,90 @@ class Settings(BaseSettings):
     delegation_cancel_retry_max_attempts: int = Field(default=5, ge=1)
     delegation_cancel_retry_max_backoff_seconds: int = Field(default=60, gt=0)
 
+    # Observability 配置（B 类启动期 env-only，Dashboard 无写入口）. N_AGENT_ 前缀.
+    # OTel tracing 总开关；endpoint 为空表示 local-only（ConsoleSpanExporter）
+    otel_enabled: bool = Field(default=False)
+    # B 类启动期 env-only；每个命名详情正文的 UTF-8 字节上限。
+    otel_content_max_bytes: int = Field(default=2048, gt=0)
+    # 仅支持显式 http/https 的 gRPC endpoint（http 对应 insecure、https 验证系统 CA），
+    # 禁止 userinfo/query/fragment，不提供关闭 TLS 验证的开关
+    otel_exporter_otlp_endpoint: str = Field(default="")
+    otel_traces_sample_ratio: float = Field(
+        default=1.0, ge=0, le=1, allow_inf_nan=False
+    )
+    # 以下 base_url 仅浏览器外链用途，非空须为合法 http/https URL；
+    # Metric/Log/Profile 分别对应 Grafana 大盘，Trace 对应 Grafana Explore（Tempo）
+    otel_grafana_metrics_base_url: str = Field(default="")
+    otel_grafana_logs_base_url: str = Field(default="")
+    otel_grafana_profile_base_url: str = Field(default="")
+    otel_grafana_traces_base_url: str = Field(default="")
+    # Legacy explicit Jaeger link; new deployments use Grafana traces above.
+    otel_jaeger_base_url: str = Field(default="")
+    # Profiling 独立于 otel_enabled；启用须提供合法 http/https 上传地址
+    profiling_enabled: bool = Field(default=False)
+    profiling_pyroscope_endpoint: str = Field(default="")
+    profiling_interval_seconds: int = Field(default=60, ge=10, le=300)
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
+
+    @staticmethod
+    def _validate_http_url(value: str, field_name: str) -> str:
+        """Validate an optional http/https URL: empty is allowed; non-empty
+        must have an explicit http/https scheme, a host, and no
+        userinfo/query/fragment."""
+        if value == "":
+            return value
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"{field_name} must be an http/https URL "
+                f"(invalid scheme: {parsed.scheme!r})"
+            )
+        if not parsed.netloc:
+            raise ValueError(
+                f"{field_name} must include a host "
+                f"(relative URLs are not allowed)"
+            )
+        if parsed.username or parsed.password:
+            raise ValueError(f"{field_name} must not contain userinfo")
+        if parsed.query:
+            raise ValueError(f"{field_name} must not contain a query")
+        if parsed.fragment:
+            raise ValueError(f"{field_name} must not contain a fragment")
+        return value
+
+    @field_validator("otel_exporter_otlp_endpoint")
+    @classmethod
+    def validate_otel_exporter_otlp_endpoint(cls, value: str) -> str:
+        return cls._validate_http_url(
+            value, "otel_exporter_otlp_endpoint"
+        )
+
+    @field_validator(
+        "otel_grafana_metrics_base_url",
+        "otel_grafana_logs_base_url",
+        "otel_grafana_profile_base_url",
+        "otel_grafana_traces_base_url",
+        "otel_jaeger_base_url",
+        "profiling_pyroscope_endpoint",
+    )
+    @classmethod
+    def validate_observability_urls(cls, value: str) -> str:
+        # field name is not known per-field here; use a generic message with
+        # the value itself for context
+        return cls._validate_http_url(value, "observability base/endpoint URL")
+
+    @model_validator(mode="after")
+    def _validate_profiling_config(self) -> "Settings":
+        """When profiling_enabled is True, a valid pyroscope upload endpoint
+        is required. No validation when disabled (allows local-only mode)."""
+        if self.profiling_enabled:
+            if not self.profiling_pyroscope_endpoint.strip():
+                raise ValueError(
+                    "profiling_pyroscope_endpoint is required when "
+                    "profiling_enabled is True"
+                )
+        return self
 
     @field_validator("sandbox_type")
     @classmethod

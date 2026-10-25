@@ -1,0 +1,40 @@
+# Jaeger v2（jaegertracing/jaeger:2.22.0）采用 OTel collector 配置式 YAML，
+# 不使用 v1 的 COLLECTOR_OTLP_ENABLED 等 env。OTLP gRPC 直收 4317；
+# 本地开发使用内存存储（jaeger_storage extension），容器重启丢失 —— 自检与
+# 文档必须呈现该限制，不得伪装持久化。
+# 注：该镜像不含 health_check 扩展（仅 healthcheckv2 等），且无 shell/wget，
+# 故 compose 不为其定义 healthcheck；其他服务不得依赖其 healthy。
+extensions:
+  jaeger_storage:
+    backends:
+      memstore:
+        memory:
+          max_traces: 10000
+  jaeger_query:
+    storage:
+      traces: memstore
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: memstore
+
+service:
+  extensions: [jaeger_storage, jaeger_query]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS）、Config Bundle 配置迁移术语（Config Bundle/manifest/段/秘密四态/redacted/degraded/action 与 outcome 正交/退出码契约/migration_maintenance/N_AGENT_INSTALL_ROOT） -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS）、Config Bundle 配置迁移术语（Config Bundle/manifest/段/秘密四态/redacted/degraded/action 与 outcome 正交/退出码契约/migration_maintenance/N_AGENT_INSTALL_ROOT）、OTel 可观测术语（GenAI semconv/invoke_agent/chat/execute_tool span/ChatAttempt/caller-owns-end/OTLP/sample ratio/ring buffer/spike/metric-name-mapping/observability handle/profiler bridge/Pyroscope v2 ingest/观测失败隔离/LogSanitizer/上下文现场 live scene/三重封口 triple-seal） -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -209,3 +209,31 @@
 - 退出码契约：0 全成功 / 1 部分记录失败其余已应用 / 2 包或参数格式错误且目标未被改动 / 3 运行依赖缺失或启动失败 / 4 只读挂载源被目录占据。`docker/install.sh` 对被调方的码原样透传。
 - migration_maintenance（迁移维护窗口）：B 类 env-only 开关，导入期间关停 scheduler 与飞书长连接以消除后台写入，由 config-import.sh 临时写入并在结束后移除，不改写用户自己的 scheduler_enabled / feishu_enabled 取值。
 - N_AGENT_INSTALL_ROOT / N_AGENT_CODE_ROOT：compose 挂载的宿主安装根与 checkout 根，用 `${VAR:?}` 形式声明，未设置时 compose 直接报错而非代入空串产生错误挂载。
+
+## OTel 可观测术语
+
+- OTel（OpenTelemetry）：N-Agent 内部观测的标准协议族，覆盖 Log/Trace/Metric/Profile 四信号，经 OTLP 导出到后端栈；Domain 零 OTel 依赖，SDK 隔离在 Infrastructure。
+- GenAI semconv：OTel GenAI 语义约定（草案优先、无双层结构）。N-Agent 遵循草案命名：span invoke_agent n-agent / chat {model} / execute_tool {tool} / compress；属性优先 gen_ai.*（gen_ai.operation.name、gen_ai.request.model、gen_ai.usage.input_tokens 等），nagent.* 仅补充 GenAI 未覆盖的项目信号，不提供敏感属性的双层等价物。
+- invoke_agent span：一次 Agent 运行的根 span（name `invoke_agent n-agent`，SpanKind INTERNAL），经 context detach 成为独立 trace 根；调用方拥有 end（caller-owns-end）。
+- chat span：单次 Provider 往返 span（name `chat {model}`，SpanKind CLIENT），由 ChatAttempt 状态机驱动，携带 usage input/output tokens 与 finish reasons；LLM 客户端 max_retries=0 保证一 attempt 一 span。
+- execute_tool span：单次工具执行 span（name `execute_tool {tool}`，INTERNAL）；ToolPolicy deny/budget deny 不执行 executor，走 record_tool_denial/record_budget_denied 计数。
+- ChatAttempt：Application 层 usage 记录状态机（telemetry_semantics.py），一次 Provider 真实往返对应一次进入；hook 接口 ChatAttemptHook 由 Infrastructure telemetry_hook.py 的 ChatAttemptHook/ProviderTelemetryCallback 实现，openai_compatible 与 anthropic_provider 共享消费。
+- OTLP：OpenTelemetry Line Protocol，gRPC 导出协议；N-Agent 用 opentelemetry-exporter-otlp-proto-grpc 导出到 Collector。
+- sample ratio（采样率）：Trace 采样比例（N_AGENT_OTEL_TRACES_SAMPLE_RATIO），ParentBased(TraceIdRatioBased)；Metric/Log 不采样。
+- ring buffer（快照环形缓冲）：Observability handle 内保存最近 span 投影的有界缓冲（100 条上限），Dashboard OTel 自检页经 `_OTEL_SNAPSHOT_KEYS` 精确枚举 key 白名单投影读取；只存白名单属性，不存完整 Span/events/Resource。
+- caller-owns-end span 协议：span 由开启它的调用方负责 end 的约定；facade 只 make-current 不 end，防止 Infrastructure 层越权终结 Application 拥有的生命周期。
+- spike（技术验证 spike）：实现前的短周期验证实验（如 py-spy 0.4.2 + Pyroscope 1.21.1 的 ingest 合同 spike），结论固化为代码注释/文档后再实现。
+- metric-name-mapping：OTel 指标名到 Prometheus 指标名的翻译规则权威表（docker/observability/metric-name-mapping.md）：`.`/`-` 转 `_`，Counter 加 `_total`，秒 Histogram 加 `_seconds`（不再加 `_total`），token 等 `{...}` 括号单位不产生后缀。
+- observability handle：configure_observability(settings) 返回的运行句柄（disabled/local/export 三 mode），持有 TracerProvider/MeterProvider/LoggerProvider 与 ring buffer；`_published` 缓存防止 reconfigure 时句柄泄漏；main.py application_runtime contextmanager 统一 configure -> build -> yield -> shutdown。
+- profiler bridge：main.py 装配的 py-spy 桥（profiler_on_status/mark_profiler_attached），把 Infrastructure 侧连续 profiling 状态透传给观测自检页；py-spy 串行窗口循环按 per-PID registry 运行，仅 SYS_PTRACE（profiling compose override），无 privileged/host PID。
+- Pyroscope v2 ingest：连续 profiling 上传合同，POST /ingest `name=n-agent&format=folded&units=samples&aggregationType=sum`；v1 legacy 端点会静默丢弃 folded 上传。
+- observability failure isolation（观测失败不破坏业务）：telemetry facade 全路径 best-effort——OTel SDK/exporter/注入异常一律吞掉只留日志，观测链路永不打断对话/工具/压缩主流程。
+- LogSanitizer：纯函数日志脱敏器（`app/infrastructure/observability/sanitizer.py`），固定规则（Authorization Bearer/Basic、URL userinfo、凭据字段值、完整 JWT、PEM 私钥）+ 注入密钥目录，命中一律不可逆替换为 `[REDACTED]`；每次 sanitize 取原子版本快照，最左最长优先、单趟重入安全；跨 Log 与 span 属性共享。
+- 上下文现场（live scene）：`_scene_var` ContextVar 携带的实时执行现场（operation/iteration/message_count/tool/call_id/risk_level/model/provider/stream），在 agent_run/iteration_scope/tool_execution/ChatAttempt 作用域发布、退出 reset 恢复；`execution_log_snapshot()` 合并 `{scene, completion, execution_ids}` 供每条日志携带执行阶段上下文。
+- 三重封口（triple-seal）：spec-261027 后 Log JSON 与 Trace span event 允许"脱敏后正文/异常"，环状缓冲/指标/Profile 仍精确枚举 key 白名单零正文；未注册/未知模板或未安装 sanitizer 时日志只输出安全事件码（未知回落 `log_event_unknown`），绝不输出未脱敏插值正文。
+
+
+## 关联观测
+- Tempo：替换 Jaeger 的 Trace 存储后端，应用继续经 Collector OTLP 导出；Grafana 数据源 UID 为 nagent-tempo。
+- Exemplar：某次指标测量的代表性样本，携带 Trace/Span ID；Grafana 通过 Prometheus exemplar 跳转 Tempo，不构成普通时序 label，不覆盖全部请求。
+- Trace to logs：Grafana Tempo 数据源 tracesToLogsV2 基于服务标签、Trace ID 与时间窗口检索 Loki；日志 derivedFields 提供反向 Tempo 链接。

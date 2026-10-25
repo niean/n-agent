@@ -5,7 +5,7 @@ import dataclasses
 import json
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.application.external_memory_manager import ExternalMemoryManager
 from app.application.policy_projections import (
@@ -17,6 +17,7 @@ from app.application.prompt_builder import build_system_prompt
 from app.application.runtime_memory_service import RuntimeMemoryService
 from app.application.policy_snapshot import RunPolicySnapshot
 from app.application.tool_service import ToolService
+from app.application.telemetry_semantics import NoopTelemetry
 from app.domain.agent import AgentState, RunStatus
 from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextEngine, ProviderContext
 from app.domain.context_policy import ContextPlan, ContextPolicy, DefaultContextPolicy
@@ -24,6 +25,9 @@ from app.domain.memory import MemoryStore
 from app.domain.session import ConversationMessage, Summary
 from app.domain.tool_policy import ToolExposurePolicy
 from app.utils.content_utils import extract_text, prepend_text_part
+
+if TYPE_CHECKING:
+    from app.application.telemetry_semantics import SemanticsTelemetry
 
 
 logger = logging.getLogger(__name__)
@@ -53,6 +57,7 @@ class ContextService:
         context_policy: ContextPolicy | None = None,
         browser_guidance: str | None = None,
         artifact_guidance: str | None = None,
+        telemetry: "SemanticsTelemetry | None" = None,
     ):
         self.memory_store = memory_store
         self.tool_service = tool_service
@@ -65,6 +70,7 @@ class ContextService:
         self._context_policy = context_policy or DefaultContextPolicy()
         self._browser_guidance = browser_guidance
         self._artifact_guidance = artifact_guidance
+        self._telemetry = telemetry if telemetry is not None else NoopTelemetry()
 
     # ------------------------------------------------------------------
     # Engine config extraction (for ContextPolicy request)
@@ -312,13 +318,18 @@ class ContextService:
                 enabled_override=enabled_override,
             )
 
-        result = await self.context_engine.compress(
-            non_system,
-            existing_summary=state.summary,
-            force=force,
-        )
-        if not result.compressed:
-            return state
+        with self._telemetry.compression() as comp_tel:
+            result = await self.context_engine.compress(
+                non_system,
+                existing_summary=state.summary,
+                force=force,
+            )
+            if not result.compressed:
+                comp_tel["outcome"] = "skipped"
+                return state
+            comp_tel["outcome"] = "compressed"
+            comp_tel["before_tokens"] = result.original_tokens
+            comp_tel["after_tokens"] = result.compressed_tokens
 
         summary_dicts = [
             m for m in result.messages

@@ -5,8 +5,10 @@ import json
 import logging
 
 from app.domain.policy import PolicyAuditEvent, PolicyAuditSink
+from app.infrastructure.observability.logging import policy_audit_context, register_safe_event
 
 logger = logging.getLogger(__name__)
+POLICY_DECISION_LOG_TEMPLATE = "policy_decision %s"
 
 
 class LoggingPolicyAuditSink:
@@ -29,4 +31,6 @@ class LoggingPolicyAuditSink:
             "policy_scope": event.policy_scope,
             "occurred_at": event.occurred_at,
         }
-        logger.info(json.dumps(payload, ensure_ascii=False))
+        register_safe_event(POLICY_DECISION_LOG_TEMPLATE, "policy_decision")
+        with policy_audit_context(payload):
+            logger.info(POLICY_DECISION_LOG_TEMPLATE, json.dumps(payload, ensure_ascii=False))

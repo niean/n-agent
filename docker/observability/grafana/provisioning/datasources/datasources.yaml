@@ -1,0 +1,56 @@
+apiVersion: 1
+
+# 内部数据源一律使用 compose 服务名；浏览器外链由应用配置的 base_url 提供，
+# 不得在大盘中混用宿主地址。
+# Remove only the replaced datasource from existing grafana-data volumes.
+deleteDatasources:
+  - name: Jaeger
+    orgId: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: nagent-tempo
+  - name: Tempo
+    uid: nagent-tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: P8E80F9AEF21F6940
+        spanStartTimeShift: '-5s'
+        spanEndTimeShift: '5s'
+        tags:
+          - key: service.name
+            value: service_name
+        filterByTraceID: true
+        filterBySpanID: false
+  - name: Pyroscope
+    uid: P02E4190217B50628
+    type: grafana-pyroscope-datasource
+    access: proxy
+    url: http://pyroscope:4040
+  - name: Loki
+    uid: P8E80F9AEF21F6940
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      # 应用日志为 JSON 行（trace_id/span_id 字段），派生字段把日志行直接
+      # 链接到 Tempo trace，实现 Log -> Trace 关联跳转。
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id"\s*:\s*"([0-9a-f]{32})"'
+          # Escape provisioning environment substitution; Grafana expands raw
+          # only when opening the link for a particular log line.
+          datasourceUid: nagent-tempo
+          url: '$${__value.raw}'
+          urlDisplayLabel: '查看 Tempo Trace'

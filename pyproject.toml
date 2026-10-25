@@ -28,6 +28,16 @@ dependencies = [
   "python-docx==1.1.2",
   "python-pptx==1.0.2",
   "openpyxl==3.1.5",
+  # observability: pinned per T9 spike (locals/harness_tmp/t9 evidence), see D072
+  "opentelemetry-api==1.45.1",
+  "opentelemetry-sdk==1.45.1",
+  "opentelemetry-exporter-otlp-proto-grpc==1.45.1",
+  "opentelemetry-instrumentation-fastapi==0.66b1",
+  "opentelemetry-instrumentation-httpx==0.66b1",
+  "opentelemetry-instrumentation-sqlite3==0.66b1",
+  "opentelemetry-instrumentation-system-metrics==0.66b1",
+  "psutil>=5.9,<8",
+  "py-spy==0.4.2",
 ]
 
 [project.scripts]

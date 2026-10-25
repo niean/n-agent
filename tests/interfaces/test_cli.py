@@ -46,6 +46,16 @@ class FakeServices:
         return {"provider": {"status": "ok"}, "gateway": {"status": "ok"}}
 
 
+def _fake_scope(services):
+    from contextlib import contextmanager
+
+    @contextmanager
+    def scope():
+        yield services
+
+    return scope
+
+
 def test_cli_status_prints_health(monkeypatch, capsys):
     monkeypatch.setattr(status_cmd, "_build_services", lambda: FakeServices())
 
@@ -59,7 +69,7 @@ def test_cli_status_prints_health(monkeypatch, capsys):
 
 def test_cli_chat_sends_message(monkeypatch, capsys):
     services = FakeServices()
-    monkeypatch.setattr(chat_cmd, "_build_services", lambda: services)
+    monkeypatch.setattr(chat_cmd, "_services_scope", _fake_scope(services))
 
     exit_code = main(["chat", "hello", "--session-source", "cli-test"])
 

@@ -1,5 +1,26 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障 -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
 # 项目教训
+
+### P065: 信息完整性必须检查采集、投影和入库全链路
+
+- 现象：逐个补 Span 后，其他调用仍缺请求内容、异常原因和流式输出；未注册日志被统一折叠，Collector 也漏传详情。
+- 根因：把事件注册和字段白名单当成内容丢弃开关，只验证“有日志”，没有验证日志能解释操作、输入、结果和失败原因。
+- 教训：默认保留有界脱敏正文、异常、extra；HTTP 观察实际消费字节，EOF/关闭后完成；中断保留脱敏前缀和诚实标志。凭据逐字段遮盖，Token 数值保留。回归同时验证业务 IO 不变、上下文隔离、Trace/Log 等值与实际 Loki/Tempo 入库。
+- 来源：2026-10-27 全面可观测审计，test_information_completeness.py。
+
+### P064: 过滤自动埋点时，要保留能够解释请求的安全信息
+
+- 现象：出站 HTTP Span 只剩 GET/200，没有目标、事件或同 Span 日志，无法判断一次执行中外部请求的用途。
+- 根因：白名单过滤掉 HTTPX 的原始 URL，却没有提供安全替代；代理同时禁止全部事件；HTTPX 普通日志在传输 Span 退出后才生成，无法替代自身完成日志。
+- 教训：request hook 投影安全主机、分段脱敏路由和静态代码调用位置；未知路径保留结构词，只模板化动态或敏感片段，不把整条路径抹掉；response hook 补状态；结束前由已投影元数据生成一次事件和同 Span 日志，原始 URL 不直接导出；正文经统一脱敏限长投影保留。覆盖真实 SDK、HTTPX 同步/异步、错误、取消和未采样场景。
+- 来源：2026-10-27 出站 HTTP 观测补全；Span 377df317cbfe6179，test_http_client_observation.py。
+
+### P063: 动态审计正文不能作为事件模板，执行现场不能代替日志内容
+
+- 现象：Loki 中大量 Policy 审计与 HTTPX INFO 变为 `log_event_unknown`；只带模型和操作现场的占位记录仍持续写入。
+- 根因：Policy sink 直接将动态 JSON 作为 record.msg，无法匹配固定模板注册表；Collector 又把继承的非空执行现场当作保留条件。
+- 教训：有业务价值的日志使用固定模板和脱敏结构化字段；低级别 unknown 只有现场而无正文、详情或异常时过滤，WARNING/ERROR 保留。用实际 sink、应用 stderr、OTel bridge 和 Collector 配置验证同一规则。
+- 来源：2026-10-27 unknown 日志治理；近 24 小时 609 条来源审计，test_log_event_governance.py 与 test_main_logging.py 回归。
 
 AI 自主维护，人工可通过提示或建议触发新增/修正。
 项目教训绑定{{项目名称}}，不随 Harness 模板提取。
@@ -553,3 +574,46 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：运行容器挂载的是安装目录的策略，而非 checkout 的 locals；该策略仅允许无参数拍照且 `max_args=0`。任意语音文本还需要显式文本规则，原 exact/one_of 规则及通用 Shell 字符过滤无法表达自然语言。
 - 教训：先通过 docker inspect 确定实际数据和策略路径，再读取会话工具原参数与结果并复现校验；同时检查目标授权、参数数量和文本字符规则。自然语言规则必须限定到固定可执行文件和单个 argv，不能全局放开宿主参数。Domain 规则更新要同时部署容器与宿主常驻桥接。
 - 来源：2026-10-19 修复语音播放，feishu-de413dea-a5c7-483d-a6ba-fe8e4f1f361c。
+
+### P057: OTel 埋点在真实 Provider 下"静默死亡"——start_as_current_span 用于调用方持有语义时上下文全错
+
+- 现象：单测（fake/in-memory provider）全绿的 trace 埋点，切换到真实 OTLP BatchSpanProcessor 后 Jaeger 里几乎无业务 span 或层级混乱；Docker 冒烟才发现
+- 根因：`start_as_current_span` 是"进入即激活、退出即结束"的自包含语义；N-Agent 的 span 协议是调用方持有（caller-owns-end，跨 stream/工具迭代/预算路径控制结束时机），误用它导致 span 在错误的上下文窗口内结束、父级关系丢失。修复为 `start_span` + `trace.use_span` 显式包裹使用窗口。附带多个真实 API 陷阱：histogram 桶参数是 `explicit_bucket_boundaries_advisory` 而非直觉的 explicit_bucket_boundaries；PrometheusRemoteWriteExporter 经 `__getattr__` 委托改 temporality；其有界队列配置 key 是 `remote_write_queue` 而非通例 sending_queue
+- 教训：OTel SDK 的"门面 API"与"显式生命周期 API"不可互换；异步/流式/多阶段用例一律 start_span + use_span。凡依赖 SDK 内部 kwargs/嵌套配置的封装，必须对着运行安装目录里的包源码核验参数名与结构（本任务 T2/T3 均由"要求实现者读取已安装包源码"的审查环拦下）
+- 来源：2026-10-26 OTel 观测补全 T2/T3 审查修复（plan-261024-otel-observability）
+
+### P058: 敏感属性过滤用前缀匹配会被命名空间"免费搭车"——枚举白名单 + 全出口哨兵才是正解
+
+- 现象：自检快照 API 中出现 gen_ai.input.messages 等 Opt-in 敏感属性原文；按 GenAI 规范这些属性根本不应采集，但 ring buffer 属性过滤按 `gen_ai.`/`nagent.` 前缀放行，凡是规范命名空间的键都自动通过
+- 根因：前缀过滤的本意是"放行自家命名空间"，但 GenAI semconv 的命名空间下同时存在必须采集的常规属性和 Opt-in 敏感属性，前缀无法区分采集政策；tracer 级预过滤白名单只挡了导出路径，快照 ring buffer 是第二个独立出口，两个出口规则不同步
+- 教训：敏感数据出口的过滤规则必须是精确枚举键集合（与语义常量同源生成），且每个出口（导出 span、ring buffer 快照、日志桥、自检 API 序列化）都要有独立的秘密哨兵测试注入全部敏感键逐项断言缺席；审查中该哨兵测试抓到真实漏洞。命名空间信任不能替代键级白名单
+- 来源：2026-10-26 OTel 观测补全 T10 哨兵测试（plan-261024-otel-observability）
+
+### P059: 可观测组件的重复 configure 会泄漏全局 Provider——可重入装配必须有发布缓存
+
+- 现象：profiling 与 otel 两开关先后触发 `configure_observability` 时，旧 TracerProvider/导出线程不被回收；多次 restart/重配置后句柄累积，degraded 但"已发布"状态被误报为健康
+- 根因：全局 TraceProvider/MeterProvider 只在首次设置时生效，后续 set 无效但新组装的对象（线程、导出器、sampler 句柄）仍被创建并存活；无发布缓存时每次 configure 都重建全量组件
+- 教训：凡涉及不可逆全局单例的装配函数（OTel Provider、全局 logging handler），必须实现 `_published` 式发布缓存：已发布则复用既有句柄、只更新可变状态；组合根的生命周期 contextmanager（configure→build→yield→shutdown）要与该缓存配合，保证 shutdown 一次性、幂等
+- 来源：2026-10-26 OTel 观测补全 T3 质量复审（plan-261024-otel-observability）
+
+### P060: 关联字段扩展后，搜索等待条件也必须随之收紧
+
+- 现象：为 LLM 和工具 Span 传播会话 ID 后，旧冒烟按任意会话匹配返回了尚无根 Span 的局部 Trace。
+- 根因：旧查询假设只有 Agent 根 Span 携带会话 ID；采集和查询之间的隐含合同没有显式表达。
+- 教训：按会话搜索执行结果时同时要求根操作名，日志必须在对应 Span 结束前生成；出口验证要比较 stderr、Jaeger、Loki 的实际摘要与标识。
+- 来源：2026-10-26 执行摘要改进。
+
+### P061: Span 代理必须继承 OTel API 类型才能传播父级
+
+- 现象：HTTP 和 invoke_agent 分属不同 Trace；代理看似暴露 get_span_context，但 Agent 仍另起根。
+- 根因：get_current_span 检查 isinstance(Span)，普通包装类被替换为 INVALID_SPAN；仅使用假 Span 的单测没有发现 SDK 类型约束。
+- 教训：安全属性代理实现 API Span，显式代理 is_recording/update_name；用真实 SDK 验证 HTTP、SSE 子任务和手动 Agent Span 的 trace_id 与 parent_span_id。搜索和计数必须按 Agent 子树，不能假设 Agent 永远是 Trace 根。
+- 来源：2026-10-26 HTTP/Agent 链路 Bug 修复。
+
+
+### P062: Exemplar 必须在对应操作的 span 退出前记录
+
+- 现象：真实 SDK 测试发现工具耗时 exemplar 的 Trace ID 正确，Span ID 却指向父 Agent。
+- 根因：tool_execution 的 record_execute_tool_duration 放在外层 finally，执行时工具 span 已退出，current span 回退为 Agent。
+- 教训：需要关联具体操作时，把 histogram 记录放在对应 span 的 finally 内；使用真实 SDK 验证 Agent/LLM/工具 exemplar 的 Trace ID 和 Span ID，不能只验证同 Trace。
+- 来源：plan-261027-tempo-correlation，tests/infrastructure/observability/test_exemplars.py（RED→GREEN）。

@@ -6,6 +6,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
+from app.infrastructure.llm.telemetry_hook import (
+    NOOP_CHAT_ATTEMPT as _NOOP_CHAT_ATTEMPT,
+)
+from app.infrastructure.llm.telemetry_hook import ProviderTelemetryCallback, optional_hook
 
 _INTERNAL_OPTION_KEYS = {
     "tool_execution_context",
@@ -41,16 +45,24 @@ class AnthropicProvider:
         default_model: str,
         extra_headers: dict[str, str] | None = None,
         client: Any | None = None,
+        telemetry_callback: ProviderTelemetryCallback | None = None,
     ):
         self.base_url = base_url
         self.default_model = default_model
+        self._telemetry_callback = telemetry_callback
         if client is None:
             import anthropic
 
+            # SDK transparent retry is disabled DELIBERATELY and
+            # unconditionally (telemetry on or off): a retry is a new LLM
+            # round-trip that spends real tokens, so it must surface as its
+            # own chat attempt rather than being silently absorbed inside
+            # the SDK (same lifecycle rule as the OpenAI-compatible client).
             client = anthropic.AsyncAnthropic(
                 api_key=api_key or "not-needed",
                 base_url=base_url or None,
                 default_headers=extra_headers or None,
+                max_retries=0,
             )
         self.client = client
 
@@ -71,6 +83,18 @@ class AnthropicProvider:
 
     async def supports_tools(self, model: str) -> bool:
         return True
+
+    def _begin_attempt(self, model: str, stream: bool):
+        """Start one chat attempt under the telemetry callback (no-op when
+        the callback is not injected)."""
+        if self._telemetry_callback is None:
+            return _NOOP_CHAT_ATTEMPT
+        try:
+            return self._telemetry_callback(
+                model=model, stream=stream, provider="anthropic"
+            )
+        except Exception:
+            return _NOOP_CHAT_ATTEMPT
 
     async def chat(
         self,
@@ -99,9 +123,99 @@ class AnthropicProvider:
             kwargs["tools"] = converted_tools
         if stream:
             kwargs["stream"] = True
-            return _stream_events(await self.client.messages.create(**kwargs))
-        response = await self.client.messages.create(**kwargs)
-        return _normalize_response(response)
+            return self._stream(kwargs, selected_model)
+        attempt = self._begin_attempt(selected_model, False)
+        with attempt:
+            optional_hook(attempt, "set_input", kwargs["messages"],
+                          tools=kwargs.get("tools"), system=kwargs.get("system"))
+            response = await self.client.messages.create(**kwargs)
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                attempt.set_usage(
+                    getattr(usage, "input_tokens", None),
+                    getattr(usage, "output_tokens", None),
+                )
+            stop_reason = getattr(response, "stop_reason", None)
+            attempt.set_finish_reasons(
+                _FINISH_REASON_MAP.get(stop_reason, stop_reason)
+            )
+            result = _normalize_response(response)
+            optional_hook(attempt, "set_output", result.message)
+            return result
+
+    async def _stream(
+        self, kwargs: dict[str, Any], model: str
+    ) -> AsyncIterator[LLMEvent]:
+        yield LLMEvent(LLMEventType.MESSAGE_START)
+        current_tool: dict[str, Any] | None = None
+        block_index = -1
+        attempt = self._begin_attempt(model, True)
+        with attempt:
+            optional_hook(attempt, "set_input", kwargs["messages"],
+                          tools=kwargs.get("tools"), system=kwargs.get("system"))
+            try:
+                stream = await self.client.messages.create(**kwargs)
+                async for event in stream:
+                    event_type = _get(event, "type")
+                    if event_type == "message_start":
+                        usage = _get(_get(event, "message"), "usage")
+                        if usage is not None:
+                            attempt.set_usage(
+                                _get(usage, "input_tokens"),
+                                _get(usage, "output_tokens"),
+                            )
+                    elif event_type == "content_block_start":
+                        block_index += 1
+                        event_index = _get(event, "index")
+                        if type(event_index) is int and event_index >= 0:
+                            block_index = event_index
+                        block = _get(event, "content_block")
+                        if _get(block, "type") == "tool_use":
+                            initial_input = _get(block, "input")
+                            optional_hook(attempt, "append_output_tool_delta", block_index,
+                                          id=_get(block, "id"), name=_get(block, "name"))
+                            if initial_input:
+                                try:
+                                    for piece in json.JSONEncoder(ensure_ascii=False).iterencode(initial_input):
+                                        optional_hook(attempt, "append_output_tool_delta", block_index, arguments=piece)
+                                except (TypeError, ValueError):
+                                    optional_hook(attempt, "mark_output_incomplete")
+                            current_tool = {"id": _get(block, "id"), "name": _get(block, "name"), "arguments": ""}
+                            yield LLMEvent(LLMEventType.TOOL_CALL_DELTA, tool_call=dict(current_tool))
+                    elif event_type == "content_block_delta":
+                        delta = _get(event, "delta")
+                        delta_type = _get(delta, "type")
+                        if delta_type == "text_delta":
+                            optional_hook(attempt, "append_output_text", _get(delta, "text") or "")
+                            yield LLMEvent(LLMEventType.CONTENT_DELTA, content=_get(delta, "text") or "")
+                        elif delta_type == "input_json_delta":
+                            event_index = _get(event, "index")
+                            optional_hook(attempt, "append_output_tool_delta",
+                                          event_index if type(event_index) is int else max(block_index, 0),
+                                          arguments=_get(delta, "partial_json") or "")
+                            if current_tool is None:
+                                current_tool = {"id": None, "name": None, "arguments": ""}
+                            current_tool["arguments"] += _get(delta, "partial_json") or ""
+                            yield LLMEvent(LLMEventType.TOOL_CALL_DELTA, tool_call=dict(current_tool))
+                    elif event_type == "message_delta":
+                        delta = _get(event, "delta")
+                        usage = _get(event, "usage")
+                        if usage is not None:
+                            attempt.set_usage(
+                                _get(usage, "input_tokens"),
+                                _get(usage, "output_tokens"),
+                            )
+                        stop_reason = _get(delta, "stop_reason")
+                        if stop_reason is not None:
+                            attempt.set_finish_reasons(
+                                _FINISH_REASON_MAP.get(stop_reason, stop_reason)
+                            )
+                        yield LLMEvent(LLMEventType.MESSAGE_DONE, finish_reason=_FINISH_REASON_MAP.get(_get(delta, "stop_reason"), _get(delta, "stop_reason")))
+            except Exception as exc:
+                error_text = str(exc)
+                optional_hook(attempt, "set_error_detail", error_text)
+                attempt.set_error(type(exc).__name__)
+                yield LLMEvent(LLMEventType.ERROR, error=error_text)
 
 
 def _provider_options(model: str, options: dict[str, Any]) -> dict[str, Any]:
@@ -362,35 +476,6 @@ def _usage_to_dict(usage: Any) -> dict[str, Any]:
     if isinstance(usage, dict):
         return dict(usage)
     return {key: value for key, value in vars(usage).items() if value is not None}
-
-
-async def _stream_events(stream: AsyncIterator[Any]) -> AsyncIterator[LLMEvent]:
-    yield LLMEvent(LLMEventType.MESSAGE_START)
-    current_tool: dict[str, Any] | None = None
-    try:
-        async for event in stream:
-            event_type = _get(event, "type")
-            if event_type == "content_block_start":
-                block = _get(event, "content_block")
-                if _get(block, "type") == "tool_use":
-                    current_tool = {"id": _get(block, "id"), "name": _get(block, "name"), "arguments": ""}
-                    yield LLMEvent(LLMEventType.TOOL_CALL_DELTA, tool_call=dict(current_tool))
-            elif event_type == "content_block_delta":
-                delta = _get(event, "delta")
-                delta_type = _get(delta, "type")
-                if delta_type == "text_delta":
-                    yield LLMEvent(LLMEventType.CONTENT_DELTA, content=_get(delta, "text") or "")
-                elif delta_type == "input_json_delta":
-                    if current_tool is None:
-                        current_tool = {"id": None, "name": None, "arguments": ""}
-                    current_tool["arguments"] += _get(delta, "partial_json") or ""
-                    yield LLMEvent(LLMEventType.TOOL_CALL_DELTA, tool_call=dict(current_tool))
-            elif event_type == "message_delta":
-                delta = _get(event, "delta")
-                yield LLMEvent(LLMEventType.MESSAGE_DONE, finish_reason=_FINISH_REASON_MAP.get(_get(delta, "stop_reason"), _get(delta, "stop_reason")))
-        return
-    except Exception as exc:
-        yield LLMEvent(LLMEventType.ERROR, error=str(exc))
 
 
 def _get(value: Any, key: str) -> Any:

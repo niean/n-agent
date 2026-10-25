@@ -20,9 +20,10 @@
     { tab: 'artifacts', path: '/artifacts', label: '制品' },
     { tab: 'models', path: '/models', label: '模型' },
     { tab: 'platforms', path: '/platforms', label: '平台' },
-    { tab: 'observations', label: '观测', parent: true, children: ['observations-sessions', 'observations-modules'] },
+    { tab: 'observations', label: '观测', parent: true, children: ['observations-sessions', 'observations-modules', 'observations-otel'] },
     { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', parentTab: 'observations' },
     { tab: 'observations-modules', path: '/observations/modules', label: '组件', parentTab: 'observations' },
+    { tab: 'observations-otel', path: '/observations/otel', label: 'OTel', parentTab: 'observations' },
     { tab: 'security', label: '安全', parent: true, children: ['security-overview', 'security-sessions', 'security-memory', 'security-sandbox'] },
     { tab: 'security-overview', path: '/security', label: '概览', parentTab: 'security' },
     { tab: 'security-sessions', path: '/security/sessions', label: '会话', parentTab: 'security' },
@@ -59,6 +60,9 @@
     'observations-modules': [
       { tab: 'observations-modules', path: '/observations/modules', label: '组件', concern: 'observation', scope: 'observations-modules', topnavParent: 'observations-modules' },
     ],
+    'observations-otel': [
+      { tab: 'observations-otel', path: '/observations/otel', label: 'OTel', concern: 'observation', scope: 'observations-otel', topnavParent: 'observations-otel' },
+    ],
     'security-overview': [
       { tab: 'security-overview', path: '/security', label: '概览', concern: 'security', scope: 'overview', topnavParent: 'security' },
     ],
@@ -83,6 +87,9 @@
     { paths: ['/observations/sessions'], tab: 'observations-sessions', renderTab: 'observations-sessions', sidebarTab: 'observations-sessions', topnavParent: 'observations', scope: 'observations' },
     // /observations/modules 是左导二级"观测-组件"入口，使用组件私有顶导作用域。
     { paths: ['/observations/modules'], tab: 'observations-modules', renderTab: 'observations-modules', sidebarTab: 'observations-modules', topnavParent: 'observations-modules', scope: 'observations-modules' },
+    // /observations/otel 是左导二级"观测-OTel"独立入口，自检页使用私有顶导作用域
+    // （与组件页同款范式：独立 routeConfig entry + 独立顶导/左导菜单）。
+    { paths: ['/observations/otel'], tab: 'observations-otel', renderTab: 'observations-otel', sidebarTab: 'observations-otel', topnavParent: 'observations-otel', scope: 'observations-otel' },
     { paths: ['/security'], tab: 'security-overview', renderTab: 'security', sidebarTab: 'security-overview', topnavParent: 'security', scope: 'overview' },
     { paths: ['/security/sessions'], tab: 'security-sessions', renderTab: 'security', sidebarTab: 'security-sessions', topnavParent: 'security', scope: 'sessions' },
     { paths: ['/security/memory'], tab: 'security-memory', renderTab: 'security', sidebarTab: 'security-memory', topnavParent: 'security', scope: 'memory' },

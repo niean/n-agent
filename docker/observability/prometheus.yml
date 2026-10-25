@@ -1,0 +1,26 @@
+# Prometheus -- remote write receiver 由 compose command 的
+# --web.enable-remote-write-receiver 显式启用；本文件为观测栈自监控抓取
+# （业务指标经 Collector remote write 进来，不经 scrape）。
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus-self
+    static_configs:
+      - targets: ["localhost:9090"]
+  # Collector 自身 telemetry（otelcol_*：管线吞吐/内存/重试/丢弃）
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]
+  # Loki 自监控（写入/查询/丢弃）
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+  # Pyroscope 自监控（ingest/查询）
+  - job_name: pyroscope
+    static_configs:
+      - targets: ["pyroscope:4040"]
+  # Tempo self-monitoring (trace ingest/query).
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]

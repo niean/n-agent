@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose、文件管理规则和 Dashboard 前端（modal/alert/按钮/菜单/时间渲染） -->
+<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose、文件管理规则、Dashboard 前端（modal/alert/按钮/菜单/时间渲染）和 OTel 可观测（B 类 env-only 配置、DDD 分层边界、敏感属性三重封口、metric-name-mapping 权威表）；2048 字节观测详情 -->
 # 约定与约束（实现细节）
 
 本文件是项目实现规范约定的权威来源，`.harness/PROJECT.md` "项目规范"各节为摘要引用，以本文件为准。
@@ -78,7 +78,20 @@ Docker Compose 项目隔离使用：
 
 - `COMPOSE_PROJECT_NAME=n-agent`
 
+OTel 可观测（B 类 env-only，不进 Dashboard 编辑白名单；endpoint 类 URL 禁 userinfo/query/fragment，空 endpoint = local-only 不建网络 exporter）：
+
+观测行为的统一规范见 [07-observability.md](07-observability.md)，包括根 Span 完成日志、默认上下文与脱敏详情、Trace 降噪和信号关联；本文件保留配置与实现约束。
+
+- `N_AGENT_OTEL_ENABLED`、`N_AGENT_OTEL_EXPORTER_OTLP_ENDPOINT`、`N_AGENT_OTEL_TRACES_SAMPLE_RATIO`、`N_AGENT_OTEL_GRAFANA_METRICS_BASE_URL`、`N_AGENT_OTEL_GRAFANA_LOGS_BASE_URL`、`N_AGENT_OTEL_GRAFANA_PROFILE_BASE_URL`、`N_AGENT_OTEL_GRAFANA_TRACES_BASE_URL`（Grafana Explore；旧 `N_AGENT_OTEL_JAEGER_BASE_URL` 仅作新字段为空时的显式兼容回退）
+- `N_AGENT_PROFILING_ENABLED`、`N_AGENT_PROFILING_PYROSCOPE_ENDPOINT`、`N_AGENT_PROFILING_INTERVAL_SECONDS`（profiling 独立于 otel_enabled，启用须提供合法 http/https 上传地址）
+
+OTel 实现约定：Domain 零 OTel 依赖；Application 只允许 opentelemetry-api（唯一消费点 `app/application/telemetry_semantics.py`）；SDK/exporter/instrumentation 只允许出现在 `app/infrastructure/observability/`；Interfaces 只消费注入的 snapshot callable。原始敏感属性仍由白名单封口；消息、提示词和工具输入输出仅经固定字段、共享脱敏与 UTF-8 限长后进入详情通道，由 `tests/architecture/test_observability_secret_sentinels.py` 哨兵验证可读正文和凭据遮盖，HTTP 自动 Span 可携带统一投影后的详情；ring buffer/指标/Profile 仍无正文。Prometheus 指标名翻译以 `docker/observability/metric-name-mapping.md` 为权威表，新增 instrument 必须同步。详见 05-key-patterns.md 模式四十六、四十七。
+
 ## Docker Compose 默认值
+
+执行摘要：`telemetry_semantics.py` 的 Agent/ChatAttempt/工具完成路径使用固定模板生成 `nagent.summary`，并在 Span 结束前发出 `execution_completed` 日志。`session_id` 和 `request_id`（复用 run_id）经 ContextVar 传播；日志只消费组装根注入的安全快照，不从原始 LogRecord.extra 或消息正文提取。未知 usage 分量保持未知；错误、拒绝、取消独立记录。Collector 将显式枚举的执行字段写入 JSON 行 `context`，不得整体复制任意 attributes。
+
+Trace 降噪：FastAPI 仅采集 `/chat/completions`、`/v1/chat/completions` 两个对话入口（兼容查询参数和尾斜杠），页面、静态资源、管理接口和轮询不生成入站 Span。关闭 ASGI receive/send Span，HTTPX/SQLite 自动 CLIENT Span 仅在有效父操作下采集。HTTP SERVER -> invoke_agent -> LLM/工具/出站 HTTP 继承同一 Trace；CLI 等无 HTTP 父级时 Agent 自然成为根。`_FilteringSpan` 必须实现 OTel API Span 类型，不能仅依赖 duck typing，否则 get_current_span 会返回无效上下文。规则在 `app/infrastructure/observability/instrumentors.py` 维护。
 
 只考虑 Docker Compose 运行时，推荐容器内路径：
 
@@ -177,3 +190,13 @@ docker exec n-agent-n-agent-1 n-agent <验收子命令及参数>
 - Docker Compose 挂载的 workspace 是文件工具边界，不应挂载过大的敏感目录
 - Provider API Key 只通过环境变量注入，不写入镜像
 - Docker build 可使用国内 PyPI 镜像加速，但不得在镜像层写入密钥
+
+## 观测详情限长与出口约定
+
+`N_AGENT_OTEL_CONTENT_MAX_BYTES` 为 B 类启动期 env-only 正整数，默认 2048，重启生效；不纳入 Dashboard/DB 热改配置。上限按每个命名详情项 content 的 UTF-8 字节计算，元数据不计入正文预算，整条日志可大于该值。结构化敏感键/媒体先遮盖，字符串键和值在 JSON 转义前通过共享 sanitizer，最后按 UTF-8 安全截断。未安装或脱敏失败时关闭详情。已投影内容仅验证，不重复脱敏。未知 original_bytes 在 stderr 为 null，在 OTel/Loki 可省略，禁止伪造为 0。
+
+流式临时预算为正文上限四倍，超限/错误/取消保留脱敏限长前缀并标记 truncated/incomplete；无法确定完整长度时 original_bytes 为未知。observed_bytes 表示实际观察字节，HTTP 为传输字节，LLM 为字符串增量；先合并有界原始内容再统一脱敏。Anthropic 非空初始结构化 tool input 增量编码后保留。semantics 静态边界仅精确允许纯 stdlib telemetry_details 依赖，其他业务/SDK 依赖继续拒绝。
+
+
+## 关联指标、Trace 与日志
+业务耗时 histogram 必须在对应 span 仍为 current 时记录，SDK 默认 trace-based exemplar filter 仅关联 sampled span；不得把 trace_id/span_id 加入普通 Metric label 或 Loki 索引 label。Collector 使用 OTLP→Tempo 与 prometheusremotewrite 管线，Prometheus 启用 exemplar-storage；Grafana Tempo 固定 UID nagent-tempo，Loki 保留既有 UID，配置三向关联。Trace 入口为 Grafana Explore，保留反向代理子路径并生成 TraceQL 服务过滤；其他外链保持既有语义。

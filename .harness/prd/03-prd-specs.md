@@ -11,96 +11,47 @@
 
 ## 需求列表
 
-[20260901]
-- HE
-    - HE：提取项目Harness Diff，去除项目特化后、更新到模板。Diff至少包括：三方审阅新增provider claude-code。Harness模板仓库：/Users/niean/code/github.com/niean/harness-tpl
-- FR
-    - 安全：参考观测、将安全拆分为左导二级菜单，至少包括会话、记忆、沙盒
-    - 会话：会话，新增顶导菜单`安全`、放到`观测`右侧，页面复用`左导安全/会话-顶导会话`，独立路由、顶导（遵循同页面多入口规范）
-
-[20260905]
-- FR
-    - 概览：任务数，显示0、不符合预期
-    - 定时任务：任务列表，第一列改名为`任务名称`，并按第一列正序排序。三方审阅用 claude-code
-
-[20260907]
-- HE
-    - HE：Multica，WF 迭代功能，未展示P3-P6的消息、只展示了P7结果
-- FR
-    - 定时任务：任务列表，第二列改名、从`调度`改为`调度表达式`
-    - 会话：左导会话-顶导安全，去掉sector`整体概览`
-    - 左导：定时任务菜单位置调整，放到`会话`后、`任务`前。使用Workflow:迭代功能
-    - 左导：分割线调整，将定时任务-任务间的分割线、调整到对话-会话之间。使用Workflow:精调功能
-
-[20260909]
-- FR
-    - 安装：我正在新Mac上安装N-Agent，希望能够将本机N-Agent的配置数据、一键导入到新机器(支持多台多次导入)。你帮我出一个配置初始化的解决方案，然后给出配置信息列表，等我Check没问题后、落地实施。
-
-[20260910]
-- HE
-    - HE：调度者检查Agent声明，包括角色、能力、约束
-
-[20260912]
-- FR
-    - 安装：拍照上传执行失败
-
-[20260913]
-- NFR
-    - 测试：将现存 12 个非委派会话固化为用户视角 E2E 回归数据集，重大变更后一键全量回归，由 LLM Judge 自动判定；测试数据逻辑隔离、一键准确删除（不漏删、不误删）。除委派类型的会话外，还需剔除掉 Feishu机器人chat、Sandbox执行feishu、Schedule定点报时、Schedule拍照上传 这几个对话
-- FR
-    - 记忆：文件记忆，编辑modal风格和项目规范的不一致，如点击空白处会导致modal退出，请按项目标准规范、修改modal
-    - 插件：插件执行后，未打印Chat消息
-    - 对话：对话框，第一条消息太靠上，导致时间hover只能展示出一半
-    - 执行：通过对话框，无法关闭浏览器的`实时视图`，我希望能够主动关闭浏览器使用
-
-[20260914]
-- NFR
-    - 测试：对话E2E测试
-        - 优化：会话E2E测试，失败后支持重试、最多重试2次，只要1次通过、就算通过；据此，修改代码逻辑
-        - 问题：对话E2E测试 task-aec1ab40-b7ce-54af-9f4f-9c993b6e0714 未被清理，找出原因、彻底修复
-
-[20260915]
-- NFR
-    - 测试：对话E2E测试优化，支持会话并行跑、并行度设置为3
-    - 测试：对话E2E测试优化，隔离测试数据、定期安全删除
-    - 测试：E2E测试，清除掉Task任务 相关的测试，主要在task.sh?
-
-[20260916]
-- HE
-    - HE：E2E测试标准化，抽象为Skill，加入到迭代功能、精调功能、修复Bug工作流中，并支持配置化（如是否开启、执行命令、超时时间等），失败后重试和阻塞
-    - HE：如无明确命令要求，AI不做浏览器视觉测试或结果验收（由人来做更快）
-- FR
-    - 定时任务：顶导标准化，改造为管理、观测、安全（类似`会话`顶导）
-    - 定时任务：观测页，干掉任务过滤，表格采用项目标准样式
-    - 定时任务：观测页面组件样式优化。干掉列表头上的`刷新`按钮；干掉列`错误`；新增列`操作`，支持`详情`按钮，点击弹出modal、modal使用项目标准样式，将执行时间、状态、输出、投递、错误等信息放到详情modal中；`投递`列不再展示成功或失败的详情，`输出`列不再展示`查看`按钮(已在详情modal中)
-
-[20260917]
-- HE
-    - HE：知识库、流程分离，知识库存储在模块Git，流程给多个Git使用、存储在流程平台，流程要耦合知识库结构规范。按照这个思路，prd、spec、plan、lesson属于知识库还是流程呢？一个项目涉及多模块Git协同开发时，prd、spec、plan跟项目走(一个)还是分解到各个模块Git？
-
-[20260923]
-- NFR
-    - 测试：修复所有的测试失败
-
 [20261019]
 - FR
-    - 任务：支持语音播放say。语音播放`乐乐，你在学习呢`，提示 host_arguments_invalid，会话ID feishu-de413dea-a5c7-483d-a6ba-fe8e4f1f361c
+    - 任务：支持语音播放say。语音播放`XX，你在学习呢`，提示 host_arguments_invalid，会话ID feishu-de413dea-a5c7-483d-a6ba-fe8e4f1f361c
+
+[20261024]
+- NFR
+    - 观测：[KF]补全OTel可观测。按照业界规范，给N-Agent补全内部观测，要求遵循OTel规范。你需要设计好各种观测信号的用法、暴露方式，包括Log、Trace、Metric、Profile，我也希望借助这次任务、完整认识Agent观测
+        - 观测：OTel，页面FE样式规范化，修改页面样式，使全方面遵循项目的FE样式&组件规范
+        - 观测：Log，Grafana Logs大盘没数据
+        - 观测：Profile，用Grafana大盘代替Pyroscope，后端存储继续使用Pyroscope
+        - 观测：Trace，链路日志数据存在Jaeger内存，未使用外部持久化存储如ES/CK
+        - 观测：OTel，外部链接名称改为Metric、Log、Trace、Profile，Metric、Log、Profile地址对应到Grafana大盘
+        - 观测：Trace，/static http的日志很多、扰乱了Agent执行逻辑信息，看下如何优化
+        - 观测：Trace/Log，增加执行摘要信息，方便对齐对话
+        - 观测：Trace，大部分http请求只有1个span，不涉及Agent执行过程、可干掉；疑似Bug，对话页面的http请求和`invoke_agent n-agent`没有串上
+        - 其它：Nginx，增加本地域名和路由，grafana.localhost => Grafana，jaeger.localhost => Jaeger，pyroscope.localhost => Pyroscope，注意ws等特殊情况。Nginx配置地址 /Users/niean/install/nginx
+        - 观测：OTel，Metric、Log、Trace、Profile的外部链接，支持用弹出框自定义配置，要遵循项目FE规范
+        - 观测：Log，关联的Jaeger地址不对
+        - 观测：Grafana，默认主题色改为Light，时段改为-30m
+        - 观测：Log，每行日志的信息太少、只有少数结构化字段，我希望每条日志都要有上下文现场(先不要考虑性能、存储成本等问题)
+        - 观测：Trace，组件从Jaeger更换到Grafana Tempo，进而实现metric 用 exemplar 串 trace、trace 串 Loki 日志。评估是否可行
+        - 观测：Log/Trace中，`xx other`如chat other、execute_tool other，为什么展示other、而不是真实的取值
+        - HE：抽象N-Agent的观测规范，至少包括信号承载组件(如Jaeger)、打点位置(如Trace覆盖Agent执行过程)、信号和标准字段等。对于OTel规范已涵盖的，简洁介绍、同时说明出自OTel。要求必须说人话，保持极简
+        - 观测：Trace，Http根Span补全Log
+
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - HE
+    - HE：三方审阅，从直接修改、改为给出建议，从而解耦
     - HE：VSCode+插件模式，补全Token观测
     - HE：三方审阅，结果存储纳入Harness流程规范，如放到specs/third/目录下
-    - HE：三方审阅，从直接修改、改为给出建议，从而解耦
     - HE：阶段结果，未及时同步到Multica
 - NFR
-    - 观测：按照业界通行做法，给N-Agent补全内部观测，尽量遵循OpenTelemetry规范。需要的配套观测组件，也要枚举下，本机已安装Grafana
     - 知识：UDS，详细原理、Go样例
     - 集成：N-Agent套装，集成N-KB；发布镜像，完成一键冷启动
     - 任务：LLM请求未命中缓存读，分析原因
 - FR
+    - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离
     - 任务：持久化执行环境，让任务拥有快照、可恢复(如执行`sh docker/restart.sh`后自动恢复)
     - 沙盒：远程沙盒，包括云沙盒、私有VM沙盒

@@ -12,10 +12,12 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from app.application.skill_evolution_service import SkillEvolutionService
+    from app.application.telemetry_semantics import SemanticsTelemetry
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
 
+from app.application.telemetry_details import project_details
 from app.application.budget_service import BudgetService
 from app.application.browser_tool_audit import project_browser_tool_arguments
 from app.application.context_service import ContextService
@@ -28,6 +30,7 @@ from app.application.policy_snapshot import (
     RunPolicySnapshot,
 )
 from app.application.runtime_memory_service import RuntimeMemoryService
+from app.application.telemetry_semantics import NoopTelemetry, clear_run_context
 from app.application.tool_service import (
     ToolExecutionEvaluation,
     ToolNotFoundError,
@@ -73,6 +76,14 @@ from app.utils.memory_scrubber import scrub_memory_context
 
 logger = logging.getLogger(__name__)
 
+
+async def run_isolated(coro):
+    """Await ``coro`` detached from the caller's run/iteration telemetry
+    context (resident background tasks must not attribute their work to a
+    user session)."""
+    clear_run_context()
+    return await coro
+
 # Internal control keys in options that are NOT generation params and must
 # not be recorded as part of the Provider Request. Mirrors the filter in
 # OpenAICompatibleProvider._INTERNAL_OPTION_KEYS; duplicated here to keep
@@ -112,6 +123,20 @@ _END_REASON_TO_FINISH_REASON: dict[EndReason, str] = {
     EndReason.CANCELLED: "error",
     EndReason.DEADLINE: "length",
     EndReason.BUDGET_EXHAUSTED: "length",
+    EndReason.TOOL_CALLS: "tool_calls",
+}
+# Telemetry end_reason is mapped from the Domain EndReason at finalize
+# (trusted server-side fact) -- NOT reverse-engineered from the collapsed
+# finish_reason string, which cannot distinguish LENGTH/DEADLINE/
+# BUDGET_EXHAUSTED (all "length") or TOOL_CALLS (no mapping at all).
+_END_REASON_TO_TELEMETRY: dict[EndReason, str] = {
+    EndReason.STOP: "completed",
+    EndReason.ERROR: "error",
+    EndReason.ITERATION_LIMIT: "max_iterations",
+    EndReason.LENGTH: "length",
+    EndReason.CANCELLED: "cancelled",
+    EndReason.DEADLINE: "deadline",
+    EndReason.BUDGET_EXHAUSTED: "budget_denied",
     EndReason.TOOL_CALLS: "tool_calls",
 }
 
@@ -157,6 +182,7 @@ class AgentGraphRunner:
         hook_dispatcher: HookDispatcherProtocol | None = None,
         browser_dashboard_service: Any = None,
         browser_host_grant_ttl_seconds: int = 300,
+        telemetry: "SemanticsTelemetry | None" = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -196,7 +222,17 @@ class AgentGraphRunner:
             runtime_memory_service=self._runtime_memory,
             browser_guidance=browser_guidance,
             artifact_guidance=artifact_guidance,
+            telemetry=telemetry,
         )
+        self._telemetry = telemetry if telemetry is not None else NoopTelemetry()
+        # Telemetry end reason per run_id, set by finalize from the Domain
+        # EndReason (trusted) and consumed by run()'s finally block.
+        self._run_end_reasons: dict[str, str] = {}
+        # Iteration of the chat that produced the pending tool calls, per
+        # run_id: execute_tools runs after call_llm already incremented
+        # iteration_count, so the tool spans need the requesting chat's
+        # iteration threaded explicitly to match its chat span.
+        self._pending_tool_iterations: dict[str, int] = {}
         self.graph = self._build_graph()
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
@@ -314,42 +350,94 @@ class AgentGraphRunner:
         )
         finish_reason = "error"
         error: str | None = None
-        try:
-            cfg: dict[str, Any] = {
-                "configurable": {"model": model, "options": state.run_options},
-            }
-            max_iter_opt = (
-                state.run_options.get("max_iterations") if state.run_options else None
-            )
-            iter_limit = int(max_iter_opt) if max_iter_opt else self.iteration_limit
-            # LangGraph recursion_limit: 每轮迭代约 2-3 节点（call_llm/execute_tools/
-            # update_memory），consolidation fork 传 max_iterations=64 需高限；默认
-            # iteration_limit 也给足余量，避免 GraphRecursionError 提前打断。
-            cfg["recursion_limit"] = max(iter_limit * 3, 25)
-            result = await self.graph.ainvoke(state, cfg)
-            result = AgentState(**result) if isinstance(result, dict) else result
-            finish_reason = result.finish_reason or "stop"
-            error = result.error
-            return result
-        except asyncio.CancelledError:
-            # Close Budget account on cancel (release unsettled reservations)
-            error = error or "cancelled"
-            await self._budget_service.close(state.run_id)
-            raise
-        except Exception as exc:
-            error = str(exc)
-            raise
-        finally:
-            # T10: on_turn_end -- exactly once per turn (normal, provider-exception,
-            # tool-exception, cancel, iteration-limit). Observer hook; callers
-            # ignore the return value.
-            await self._dispatch_hook(
-                "on_turn_end",
-                session_id=state.session_id,
-                finish_reason=finish_reason,
-                error=error,
-            )
-            self._run_start_times.pop(state.run_id, None)
+        cancelled = False
+        result_state: AgentState | None = None
+        run_tel = self._telemetry.agent_run(
+            session_id=state.session_id,
+            source=snapshot.run_context.source if snapshot is not None else (state.message_source or "api"),
+            run_id=state.run_id,
+            message_count=len(state.input_messages),
+        )
+        with run_tel as run_handle:
+            try:
+                if not isinstance(self._telemetry, NoopTelemetry):
+                    last_user = next((m for m in reversed(state.input_messages) if m.get('role') == 'user'), None)
+                    run_handle.details.update(project_details(user_message=last_user))
+            except Exception:
+                pass
+            try:
+                cfg: dict[str, Any] = {
+                    "configurable": {"model": model, "options": state.run_options},
+                }
+                max_iter_opt = (
+                    state.run_options.get("max_iterations") if state.run_options else None
+                )
+                iter_limit = int(max_iter_opt) if max_iter_opt else self.iteration_limit
+                # LangGraph recursion_limit: 每轮迭代约 2-3 节点（call_llm/execute_tools/
+                # update_memory），consolidation fork 传 max_iterations=64 需高限；默认
+                # iteration_limit 也给足余量，避免 GraphRecursionError 提前打断。
+                cfg["recursion_limit"] = max(iter_limit * 3, 25)
+                result = await self.graph.ainvoke(state, cfg)
+                result = AgentState(**result) if isinstance(result, dict) else result
+                result_state = result
+                finish_reason = result.finish_reason or "stop"
+                error = result.error
+                return result
+            except asyncio.CancelledError:
+                # Close Budget account on cancel (release unsettled reservations)
+                cancelled = True
+                error = error or "cancelled"
+                await self._budget_service.close(state.run_id)
+                raise
+            except Exception as exc:
+                error = str(exc)
+                raise
+            finally:
+                try:
+                    final = result_state or state
+                    if final.final_message is not None and not isinstance(self._telemetry, NoopTelemetry):
+                        run_handle.details.update(project_details(assistant_message=final.final_message))
+                except Exception:
+                    pass
+                # T10: on_turn_end -- exactly once per turn (normal, provider-exception,
+                # tool-exception, cancel, iteration-limit). Observer hook; callers
+                # ignore the return value.
+                await self._dispatch_hook(
+                    "on_turn_end",
+                    session_id=state.session_id,
+                    finish_reason=finish_reason,
+                    error=error,
+                )
+                self._run_start_times.pop(state.run_id, None)
+                # Telemetry end reason (trusted server-side facts only).
+                # Priority: Domain EndReason recorded by finalize (exact,
+                # distinguishes LENGTH/DEADLINE/BUDGET_EXHAUSTED/TOOL_CALLS)
+                # > budget_exhausted flag > cancel flag > error > completed.
+                self._pending_tool_iterations.pop(state.run_id, None)
+                try:
+                    end_reason = self._run_end_reasons.pop(state.run_id, None)
+                    if end_reason is None:
+                        final = result_state if result_state is not None else state
+                        if getattr(final, "budget_exhausted", False):
+                            end_reason = "budget_denied"
+                        elif cancelled:
+                            end_reason = "cancelled"
+                        elif error:
+                            end_reason = "error"
+                        else:
+                            end_reason = "completed"
+                    run_handle.end_reason = end_reason
+                    final = result_state if result_state is not None else state
+                    if cancelled or end_reason == "cancelled":
+                        run_handle.outcome = "cancelled"
+                    elif end_reason in {"budget_denied", "approval_denied"}:
+                        run_handle.outcome = "denied"
+                    elif error or final.run_status == RunStatus.FAILED:
+                        run_handle.outcome = "error"
+                    else:
+                        run_handle.outcome = "success"
+                except Exception:
+                    pass
 
     def _build_turn_input(self, state: AgentState) -> TurnEvaluationInput:
         """Build TurnEvaluationInput from AgentState + runtime facts.
@@ -884,13 +972,15 @@ class AgentGraphRunner:
 
             # 5. provider.chat (Provider Adapter = pure protocol conversion)
             try:
-                result = await self.llm_provider.chat(
-                    working_messages_for_call,
-                    tools,
-                    False,
-                    selected_model,
-                    options,
-                )
+                chat_iteration = state.iteration_count
+                with self._telemetry.iteration(chat_iteration, message_count=len(working_messages_for_call)):
+                    result = await self.llm_provider.chat(
+                        working_messages_for_call,
+                        tools,
+                        False,
+                        selected_model,
+                        options,
+                    )
             except Exception:
                 # Release budget reservation on provider failure
                 await self._budget_service.release(state.run_id, reservation)
@@ -931,6 +1021,9 @@ class AgentGraphRunner:
             state.pending_tool_calls = result.message.get("tool_calls") or []
             if state.pending_tool_calls:
                 state.assistant_tool_messages.append(result.message)
+                # Thread the requesting chat's iteration to execute_tools so
+                # tool spans carry the same nagent.iteration as this chat span.
+                self._pending_tool_iterations[state.run_id] = chat_iteration
             state.working_messages.append(result.message)
 
             # T10: post_llm_call -- after provider success + protocol normalization
@@ -1008,6 +1101,18 @@ class AgentGraphRunner:
         return state
 
     async def execute_tools(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
+        # The tool-execution node runs OUTSIDE call_llm's iteration scope
+        # (and after call_llm already incremented iteration_count); thread
+        # the requesting chat's iteration explicitly so execute_tool spans
+        # (and denial records) carry the same nagent.iteration as the chat
+        # span that requested the tool.
+        tool_iteration = self._pending_tool_iterations.pop(
+            state.run_id, state.iteration_count
+        )
+        with self._telemetry.iteration(tool_iteration):
+            return await self._execute_tools(state, config)
+
+    async def _execute_tools(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
         if self.is_cancelled(state.session_id):
             raise asyncio.CancelledError()
         state.tool_results = []
@@ -1299,17 +1404,30 @@ class AgentGraphRunner:
                 result.tool_name, state.session_id, exc_info=True,
             )
 
-    @staticmethod
     def _permission_denied_result(
+        self,
         request: ToolCallRequest,
         reason: str,
     ) -> ToolResult:
-        return ToolResult(
+        # Policy/approval denial before ToolService.execute: record one short
+        # denied-execution span (the executor path records its own).
+        result = ToolResult(
             tool_call_id=request.id,
             tool_name=request.name,
             status=ToolResultStatus.PERMISSION_DENIED,
             content={"error": "permission_denied", "reason": reason},
         )
+        try:
+            self._telemetry.record_tool_denial(tool=request.name, call_id=request.id,
+                                             arguments=request.arguments, result=result.content)
+        except TypeError:
+            try:
+                self._telemetry.record_tool_denial(tool=request.name, call_id=request.id)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return result
 
     @staticmethod
     def _project_approval_arguments(
@@ -1624,6 +1742,11 @@ class AgentGraphRunner:
         decision = self._evaluate_turn(state)
         if decision.terminal and decision.end_reason is not None:
             end_reason = decision.end_reason
+            # Record the exact Domain EndReason for run()'s telemetry
+            # finally block (before it collapses into finish_reason).
+            self._run_end_reasons[state.run_id] = _END_REASON_TO_TELEMETRY[
+                end_reason
+            ]
             if end_reason == EndReason.ITERATION_LIMIT and not state.error:
                 state.error = "iteration limit reached"
                 state.finish_reason = _END_REASON_TO_FINISH_REASON[end_reason]
@@ -1774,7 +1897,9 @@ class AgentGraphRunner:
             ).total_seconds()
             try:
                 asyncio.create_task(
-                    self.curator_service.maybe_run_curator(idle_for_seconds=idle)
+                    run_isolated(
+                        self.curator_service.maybe_run_curator(idle_for_seconds=idle)
+                    )
                 )
             except Exception:
                 logger.warning(

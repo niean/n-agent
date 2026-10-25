@@ -931,6 +931,14 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .health-k { color: var(--color-fg-subtle); white-space: nowrap; }
 .health-v { color: var(--color-fg-default); word-break: break-word; }
 
+/* ===== OTel self-check page (observations-otel.js) ===== */
+/* kv 行复用共享 policy-item/policy-k/policy-v，列表复用 document-table，
+   状态复用 badge；此处仅补充本页私有的链接列表与强调文本样式。 */
+.otel-links { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: var(--font-size-md); }
+.otel-link { color: var(--color-primary-strong); text-decoration: none; }
+.otel-link:hover { text-decoration: underline; }
+.otel-strong { font-weight: 600; color: var(--color-fg-default); }
+
 /* ===== Task Kanban (tasks.js) ===== */
 .tasks-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 .tasks-archived-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: var(--font-size-sm); color: var(--color-fg-subtle); }

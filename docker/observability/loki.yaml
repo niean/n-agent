@@ -1,0 +1,41 @@
+# Loki 单节点本地配置（观测栈 profile 专用）：
+# - 关闭多租户 auth（本地 127.0.0.1 内网 + 不发布宿主端口，无凭据面）
+# - filesystem 存储 + 7 天保留，与 Prometheus/Pyroscope 保留对齐
+# - 原生 OTLP 接收（/otlp/v1/logs，默认开启，无需额外配置）；
+#   resource service.name 映射为 service_name label，LogQL 用
+#   {service_name="n-agent"} 选择应用日志
+# - OTLP record 的属性默认进 structured metadata（可查询、不膨胀 label 基数），
+#   trace_id 跳转经 Grafana 数据源 derivedFields 实现（见 datasources.yaml）
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: "2024-04-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 168h
+
+compactor:
+  retention_enabled: true
+  delete_request_store: filesystem

@@ -1,0 +1,5 @@
+# Pyroscope 1.21.1 -- 单机模式，profile 数据落命名卷并按 7 天保留
+#（compactor_blocks_retention_period=168h）。ingest 合同见 T9 spike：
+# /ingest?name=n-agent&format=folded&units=samples&aggregationType=sum
+limits:
+  compactor_blocks_retention_period: 168h

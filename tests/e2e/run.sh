@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# This script needs bash (arrays, ${BASH_SOURCE}); it is also invoked as
+# `sh tests/e2e/run.sh`, so re-exec under bash before any bash-only syntax
+# is parsed (same guard pattern as docker/restart.sh).
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec bash "$0" "$@"
+fi
+
+# Environment note (observability smoke, plan item 23): COMPOSE_FILE /
+# COMPOSE_PROFILES / N_AGENT_COMPOSE_STOP_TIMEOUT are inherited untouched,
+# because the restart below re-evaluates them. Observability acceptance
+# runs with COMPOSE_PROFILES=observability (and, for the Profile branch,
+# COMPOSE_FILE merging docker/docker-compose.observability.yml) plus the
+# N_AGENT_OTEL_* / N_AGENT_PROFILING_* values in docker/.env.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,12 +24,13 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 case "$SUITE" in
-  all) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh" "$SCRIPT_DIR/config-bundle.sh" "$SCRIPT_DIR/conversations.sh") ;;
+  all) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh" "$SCRIPT_DIR/config-bundle.sh" "$SCRIPT_DIR/conversations.sh" "$SCRIPT_DIR/otel_smoke.sh") ;;
   artifacts) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh") ;;
   config-bundle) CASE_SCRIPTS=("$SCRIPT_DIR/config-bundle.sh") ;;
   conversations) CASE_SCRIPTS=("$SCRIPT_DIR/conversations.sh") ;;
+  otel-smoke) CASE_SCRIPTS=("$SCRIPT_DIR/otel_smoke.sh") ;;
   *)
-    echo "usage: tests/e2e/run.sh [all|artifacts|config-bundle|conversations]" >&2
+    echo "usage: tests/e2e/run.sh [all|artifacts|config-bundle|conversations|otel-smoke]" >&2
     exit 2
     ;;
 esac

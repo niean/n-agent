@@ -39,6 +39,7 @@ N-Agent 是一款类 Hermes 的本地 Agent 产品，让个人开发者以低成
 - 数据结构/存储变化 -> .harness/knowledge/04-data-boundaries.md
 - 新源文件 -> .harness/knowledge/22-file-map.md
 - 新跨文件模式 -> .harness/knowledge/05-key-patterns.md
+- 可观测规范 -> .harness/knowledge/07-observability.md
 - 产品方向调整 -> 提示用户，人工更新 .harness/prd/01-prd-sense.md
 
 ## 教训库加载路径
@@ -112,6 +113,7 @@ sh tests/e2e/run.sh
 | .harness/knowledge/04-data-boundaries.md | 新增/修改 SQLite schema、配置项、协议字段、localStorage 键、Delegation 7 表结构时 |
 | .harness/knowledge/05-key-patterns.md | 复用既有跨文件模式（DDD 边界、ToolPolicy 审批、Skill 自进化、Artifact 写穿/发布/删除、Activated Skills 三层过滤、多 Agent 委派）时 |
 | .harness/knowledge/06-domain-model.md | 需要快速了解 DDD 业务架构、子域、核心流程、关键模型和外部边界时 |
+| .harness/knowledge/07-observability.md | 新增或修改 Trace、Log、Metric、Profile 打点、上下文详情、降噪与信号关联时 |
 | .harness/knowledge/21-glossary.md | 对术语不清楚时 |
 | .harness/knowledge/22-file-map.md | 确定功能对应源文件时 |
 | .harness/prd/02-prd-baseline.md | 确认功能需求与产品约束时 |

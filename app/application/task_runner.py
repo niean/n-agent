@@ -21,6 +21,8 @@ from uuid import uuid4
 from app.domain.task import Task
 
 logger = logging.getLogger(__name__)
+TASK_RUNNER_STARTED_LOG_TEMPLATE = "TaskRunner started (interval=%ss)"
+TASK_RUNNER_STOPPED_LOG_TEMPLATE = "TaskRunner stopped"
 
 
 class TaskRunner:
@@ -174,7 +176,7 @@ class TaskRunner:
         self._stop_event = asyncio.Event()
         self._loop_task = asyncio.create_task(self._loop())
         logger.info(
-            "TaskRunner started (interval=%ss)", self.interval_seconds
+            TASK_RUNNER_STARTED_LOG_TEMPLATE, self.interval_seconds
         )
 
     async def stop(self) -> None:
@@ -204,7 +206,7 @@ class TaskRunner:
             self._running_workers.clear()
             self._token_to_run.clear()
             self._run_meta.clear()
-        logger.info("TaskRunner stopped")
+        logger.info(TASK_RUNNER_STOPPED_LOG_TEMPLATE)
 
     async def _loop(self) -> None:
         """Periodic tick: dispatch_once every interval until stop."""

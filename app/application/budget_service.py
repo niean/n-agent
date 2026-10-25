@@ -41,6 +41,9 @@ from app.domain.policy import PolicyAuditEvent, PolicyDecisionKind, PolicyOutcom
 
 if TYPE_CHECKING:
     from app.application.policy_audit_service import PolicyAuditService
+    from app.application.telemetry_semantics import SemanticsTelemetry
+
+from app.application.telemetry_semantics import NoopTelemetry
 
 logger = logging.getLogger(__name__)
 
@@ -294,15 +297,25 @@ class BudgetService:
     it adds pre-call reservation + hard caps.
     """
 
+    # Telemetry kind labels for nagent.budget.denied (bounded vocabulary).
+    _BUDGET_DENIED_KIND_LABELS = {
+        BudgetReserveKind.LLM_CALL: "llm_denied",
+        BudgetReserveKind.TOOL_CALL: "budget_exhausted",
+        BudgetReserveKind.SANDBOX_RESOURCE: "sandbox_denied",
+        BudgetReserveKind.WALL_TIME: "budget_exhausted",
+    }
+
     def __init__(
         self,
         config: BudgetPolicyConfig,
         audit_service: "PolicyAuditService | None" = None,
+        telemetry: "SemanticsTelemetry | None" = None,
     ) -> None:
         self._domain_config = _to_domain_config(config)
         self._policy = BudgetPolicy(self._domain_config)
         self._accounts: dict[str, RunBudgetAccount] = {}
         self._audit_service = audit_service
+        self._telemetry = telemetry if telemetry is not None else NoopTelemetry()
 
     def _get_or_create_account(self, run_id: str) -> RunBudgetAccount:
         account = self._accounts.get(run_id)
@@ -343,6 +356,17 @@ class BudgetService:
         account = self._get_or_create_account(run_id)
         decision = await account.reserve(request)
         await self._audit_reserve(decision, run_id, request)
+        # Single authoritative denial point: nagent.budget.denied is counted
+        # here (by kind) and nowhere else in the call graph.
+        if decision.outcome is PolicyOutcome.DENY:
+            try:
+                self._telemetry.record_budget_denied(
+                    self._BUDGET_DENIED_KIND_LABELS.get(
+                        decision.kind, "budget_exhausted"
+                    )
+                )
+            except Exception:
+                logger.warning("budget denial telemetry failed", exc_info=True)
         return decision
 
     async def _audit_reserve(

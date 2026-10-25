@@ -1095,14 +1095,14 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
         'chat', 'sessions', 'scheduled-tasks', 'tasks', 'memory',
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
         'executors', 'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
-        'observations', 'observations-sessions', 'observations-modules', 'security',
+        'observations', 'observations-sessions', 'observations-modules', 'observations-otel', 'security',
         'security-overview', 'security-sessions', 'security-memory', 'security-sandbox',
     ]
     expected_hrefs = [
         '/chat', '/sessions', '/scheduled-tasks', '/tasks', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/artifacts', '/models', '/platforms',
-        '/observations/sessions', '/observations/modules', '/security',
+        '/observations/sessions', '/observations/modules', '/observations/otel', '/security',
         '/security/sessions', '/security/memory', '/security/sandbox',
     ]
     sidebar_data_tabs = _re.findall(r'data-tab="([^"]*)"', sidebar_html)

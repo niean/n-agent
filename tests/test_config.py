@@ -1008,3 +1008,307 @@ def test_settings_published_base_url_empty_is_valid(
         published_base_url="",
     )
     assert s.published_base_url == ""
+
+
+# ---------------------------------------------------------------------------
+# Observability (OTel + profiling) settings
+# ---------------------------------------------------------------------------
+
+_OTEL_ENV_KEYS = (
+    "N_AGENT_OTEL_ENABLED",
+    "N_AGENT_OTEL_EXPORTER_OTLP_ENDPOINT",
+    "N_AGENT_OTEL_TRACES_SAMPLE_RATIO",
+    "N_AGENT_OTEL_GRAFANA_METRICS_BASE_URL",
+    "N_AGENT_OTEL_GRAFANA_LOGS_BASE_URL",
+    "N_AGENT_OTEL_GRAFANA_PROFILE_BASE_URL",
+    "N_AGENT_OTEL_GRAFANA_TRACES_BASE_URL",
+    "N_AGENT_OTEL_JAEGER_BASE_URL",
+    "N_AGENT_PROFILING_ENABLED",
+    "N_AGENT_PROFILING_PYROSCOPE_ENDPOINT",
+    "N_AGENT_PROFILING_INTERVAL_SECONDS",
+)
+
+
+def _clean_otel_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _OTEL_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
+class TestObservabilitySettings:
+    def test_defaults(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+        )
+        assert s.otel_enabled is False
+        assert s.otel_exporter_otlp_endpoint == ""
+        assert s.otel_traces_sample_ratio == 1.0
+        assert s.otel_grafana_metrics_base_url == ""
+        assert s.otel_grafana_logs_base_url == ""
+        assert s.otel_grafana_profile_base_url == ""
+        assert s.otel_grafana_traces_base_url == ""
+        assert s.otel_jaeger_base_url == ""
+        assert s.profiling_enabled is False
+        assert s.profiling_pyroscope_endpoint == ""
+        assert s.profiling_interval_seconds == 60
+
+    def test_env_mapping(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        _clean_otel_env(monkeypatch)
+        monkeypatch.setenv("N_AGENT_OTEL_ENABLED", "true")
+        monkeypatch.setenv("N_AGENT_OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel:4317")
+        monkeypatch.setenv("N_AGENT_OTEL_TRACES_SAMPLE_RATIO", "0.5")
+        monkeypatch.setenv("N_AGENT_OTEL_GRAFANA_METRICS_BASE_URL", "http://grafana:3000/d/nagent-metrics")
+        monkeypatch.setenv("N_AGENT_OTEL_GRAFANA_LOGS_BASE_URL", "http://grafana:3000/d/nagent-logs")
+        monkeypatch.setenv("N_AGENT_OTEL_GRAFANA_PROFILE_BASE_URL", "http://grafana:3000/d/nagent-profile")
+        monkeypatch.setenv("N_AGENT_OTEL_JAEGER_BASE_URL", "http://jaeger:16686")
+        monkeypatch.setenv("N_AGENT_PROFILING_ENABLED", "true")
+        monkeypatch.setenv("N_AGENT_PROFILING_PYROSCOPE_ENDPOINT", "http://pyroscope:4040")
+        monkeypatch.setenv("N_AGENT_PROFILING_INTERVAL_SECONDS", "120")
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+        )
+        assert s.otel_enabled is True
+        assert s.otel_exporter_otlp_endpoint == "http://otel:4317"
+        assert s.otel_traces_sample_ratio == 0.5
+        assert s.otel_grafana_metrics_base_url == "http://grafana:3000/d/nagent-metrics"
+        assert s.otel_grafana_logs_base_url == "http://grafana:3000/d/nagent-logs"
+        assert s.otel_grafana_profile_base_url == "http://grafana:3000/d/nagent-profile"
+        assert s.otel_jaeger_base_url == "http://jaeger:16686"
+        assert s.profiling_enabled is True
+        assert s.profiling_pyroscope_endpoint == "http://pyroscope:4040"
+        assert s.profiling_interval_seconds == 120
+
+    @pytest.mark.parametrize("ratio", [1.5, -0.1, float("nan"), float("inf"), float("-inf")])
+    def test_sample_ratio_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ratio: float
+    ):
+        _clean_otel_env(monkeypatch)
+        with pytest.raises(ValidationError):
+            Settings(
+                sqlite_path=str(tmp_path / "sessions.db"),
+                workspace_root=str(tmp_path),
+                _env_file=None,
+                otel_traces_sample_ratio=ratio,
+            )
+
+    @pytest.mark.parametrize("ratio", [0, 0.001, 0.5, 1])
+    def test_sample_ratio_accepts_bounds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ratio: float
+    ):
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            otel_traces_sample_ratio=ratio,
+        )
+        assert s.otel_traces_sample_ratio == ratio
+
+    @pytest.mark.parametrize("endpoint", [
+        "ftp://otel:4317",                     # non-http scheme
+        "otel:4317",                           # no scheme
+        "https://user:pass@otel:4317",         # userinfo
+        "http://otel:4317?v=1",                # query
+        "http://otel:4317#frag",               # fragment
+        "http://",                             # no host
+    ])
+    def test_otlp_endpoint_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ):
+        _clean_otel_env(monkeypatch)
+        with pytest.raises(ValidationError):
+            Settings(
+                sqlite_path=str(tmp_path / "sessions.db"),
+                workspace_root=str(tmp_path),
+                _env_file=None,
+                otel_enabled=True,
+                otel_exporter_otlp_endpoint=endpoint,
+            )
+
+    @pytest.mark.parametrize("endpoint", ["http://otel:4317", "https://otel.example.com:4317"])
+    def test_otlp_endpoint_accepts_valid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ):
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            otel_enabled=True,
+            otel_exporter_otlp_endpoint=endpoint,
+        )
+        assert s.otel_exporter_otlp_endpoint == endpoint
+
+    @pytest.mark.parametrize("field", [
+        "otel_grafana_metrics_base_url",
+        "otel_grafana_logs_base_url",
+        "otel_grafana_profile_base_url",
+        "otel_grafana_traces_base_url",
+        "otel_jaeger_base_url",
+    ])
+    @pytest.mark.parametrize("url", [
+        "ftp://example.com",
+        "example.com",
+        "https://user:pass@example.com",
+        "https://example.com?q=1",
+        "https://example.com#frag",
+        "https://",
+    ])
+    def test_dashboard_base_url_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, url: str
+    ):
+        _clean_otel_env(monkeypatch)
+        with pytest.raises(ValidationError):
+            Settings(
+                sqlite_path=str(tmp_path / "sessions.db"),
+                workspace_root=str(tmp_path),
+                _env_file=None,
+                **{field: url},
+            )
+
+    def test_dashboard_base_url_accepts_valid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            otel_grafana_metrics_base_url="http://grafana:3000/d/nagent-metrics",
+            otel_grafana_logs_base_url="http://grafana:3000/d/nagent-logs",
+            otel_grafana_profile_base_url="http://grafana:3000/d/nagent-profile",
+            otel_jaeger_base_url="http://jaeger:16686/search",
+        )
+        assert s.otel_grafana_metrics_base_url == "http://grafana:3000/d/nagent-metrics"
+        assert s.otel_grafana_logs_base_url == "http://grafana:3000/d/nagent-logs"
+        assert s.otel_grafana_profile_base_url == "http://grafana:3000/d/nagent-profile"
+        assert s.otel_jaeger_base_url == "http://jaeger:16686/search"
+
+    def test_profiling_enabled_requires_valid_endpoint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        _clean_otel_env(monkeypatch)
+        with pytest.raises(ValidationError):
+            Settings(
+                sqlite_path=str(tmp_path / "sessions.db"),
+                workspace_root=str(tmp_path),
+                _env_file=None,
+                profiling_enabled=True,
+                profiling_pyroscope_endpoint="",
+            )
+
+    @pytest.mark.parametrize("endpoint", ["ftp://pyroscope:4040", "pyroscope:4040", "not a url"])
+    def test_profiling_enabled_rejects_invalid_endpoint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ):
+        _clean_otel_env(monkeypatch)
+        with pytest.raises(ValidationError):
+            Settings(
+                sqlite_path=str(tmp_path / "sessions.db"),
+                workspace_root=str(tmp_path),
+                _env_file=None,
+                profiling_enabled=True,
+                profiling_pyroscope_endpoint=endpoint,
+            )
+
+    @pytest.mark.parametrize("interval", [9, 301, 0, -1])
+    def test_profiling_interval_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interval: int
+    ):
+        _clean_otel_env(monkeypatch)
+        with pytest.raises(ValidationError):
+            Settings(
+                sqlite_path=str(tmp_path / "sessions.db"),
+                workspace_root=str(tmp_path),
+                _env_file=None,
+                profiling_interval_seconds=interval,
+            )
+
+    @pytest.mark.parametrize("interval", [10, 60, 300])
+    def test_profiling_interval_accepts_bounds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interval: int
+    ):
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            profiling_interval_seconds=interval,
+        )
+        assert s.profiling_interval_seconds == interval
+
+    def test_profiling_independent_of_otel(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Profile 独立开启且 OTel 关闭合法
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            otel_enabled=False,
+            profiling_enabled=True,
+            profiling_pyroscope_endpoint="http://pyroscope:4040",
+        )
+        assert s.otel_enabled is False
+        assert s.profiling_enabled is True
+
+    def test_both_disabled_and_local_only_valid(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            otel_enabled=False,
+            otel_exporter_otlp_endpoint="",
+            profiling_enabled=False,
+            profiling_pyroscope_endpoint="",
+        )
+        assert s.otel_enabled is False
+        assert s.otel_exporter_otlp_endpoint == ""
+        assert s.profiling_enabled is False
+
+    def test_unreachable_but_valid_endpoint_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # 合法但不可达 endpoint 不作为配置错误拒绝启动；构造 Settings 不连接后端
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            otel_enabled=True,
+            otel_exporter_otlp_endpoint="http://definitely-not-reachable.invalid:4317",
+            profiling_enabled=True,
+            profiling_pyroscope_endpoint="http://definitely-not-reachable.invalid:4040",
+        )
+        assert s.otel_enabled is True
+        assert s.profiling_enabled is True
+
+    def test_empty_endpoint_valid_when_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # otel_enabled=True 且 endpoint 为空 = local-only，合法
+        _clean_otel_env(monkeypatch)
+        s = Settings(
+            sqlite_path=str(tmp_path / "sessions.db"),
+            workspace_root=str(tmp_path),
+            _env_file=None,
+            otel_enabled=True,
+            otel_exporter_otlp_endpoint="",
+        )
+        assert s.otel_exporter_otlp_endpoint == ""
+
+
+def test_grafana_trace_url_is_validated(monkeypatch):
+    monkeypatch.setenv("N_AGENT_OTEL_GRAFANA_TRACES_BASE_URL", "https://grafana.example.com/grafana/explore")
+    settings = Settings(_env_file=None)
+    assert settings.otel_grafana_traces_base_url == "https://grafana.example.com/grafana/explore"
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, otel_grafana_traces_base_url="https://user:secret@grafana.example.com/explore")

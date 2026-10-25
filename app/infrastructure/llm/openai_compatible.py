@@ -22,10 +22,32 @@ _INTERNAL_OPTION_KEYS = {
 }
 
 
+from app.infrastructure.llm.telemetry_hook import (
+    NOOP_CHAT_ATTEMPT as _NOOP_CHAT_ATTEMPT,
+)
+from app.infrastructure.llm.telemetry_hook import ProviderTelemetryCallback, optional_hook
+
+
 class OpenAICompatibleProvider:
-    def __init__(self, base_url: str, api_key: str, default_model: str, client: Any | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        default_model: str,
+        client: Any | None = None,
+        telemetry_callback: ProviderTelemetryCallback | None = None,
+    ):
         self.default_model = default_model
-        self.client = client or AsyncOpenAI(base_url=base_url, api_key=api_key or "not-needed")
+        self._telemetry_callback = telemetry_callback
+        # SDK transparent retry is disabled DELIBERATELY and unconditionally
+        # (telemetry on or off): a retry is a new LLM round-trip that spends
+        # real tokens, so it must surface as its own chat attempt / its own
+        # observable request rather than being silently absorbed inside the
+        # SDK (spec lifecycle rules). Retrying, when wanted, belongs to the
+        # caller (the agent loop), not the transport client.
+        self.client = client or AsyncOpenAI(
+            base_url=base_url, api_key=api_key or "not-needed", max_retries=0
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         try:
@@ -59,6 +81,16 @@ class OpenAICompatibleProvider:
                 return info.supports_tools
         return True
 
+    def _begin_attempt(self, model: str, stream: bool):
+        """Start one chat attempt under the telemetry callback (no-op when
+        the callback is not injected)."""
+        if self._telemetry_callback is None:
+            return _NOOP_CHAT_ATTEMPT
+        try:
+            return self._telemetry_callback(model=model, stream=stream, provider="openai")
+        except Exception:
+            return _NOOP_CHAT_ATTEMPT
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -76,35 +108,77 @@ class OpenAICompatibleProvider:
         if tools:
             kwargs["tools"] = tools
         if stream:
+            # Ask the SDK to emit a final usage-only chunk so streaming
+            # usage is observable (no per-chunk token counts needed).
+            kwargs.setdefault("stream_options", {"include_usage": True})
             return self._stream(kwargs)
-        response = await self.client.chat.completions.create(**kwargs)
-        choice = response.choices[0]
-        message = choice.message
-        return LLMResult(
-            message=_message_to_dict(message),
-            finish_reason=choice.finish_reason or "stop",
-            usage=getattr(response, "usage", None).model_dump() if getattr(response, "usage", None) else {},
-            raw=None,
-        )
+        attempt = self._begin_attempt(kwargs["model"], False)
+        with attempt:
+            optional_hook(attempt, "set_input", kwargs["messages"],
+                          tools=kwargs.get("tools"), system=kwargs.get("system"))
+            response = await self.client.chat.completions.create(**kwargs)
+            choice = response.choices[0]
+            message = choice.message
+            usage = getattr(response, "usage", None)
+            usage_dict = (
+                usage.model_dump() if hasattr(usage, "model_dump") and usage else {}
+            )
+            attempt.set_finish_reasons(choice.finish_reason or "stop")
+            if usage is not None:
+                attempt.set_usage(
+                    getattr(usage, "prompt_tokens", None),
+                    getattr(usage, "completion_tokens", None),
+                )
+            normalized_message = _message_to_dict(message)
+            optional_hook(attempt, "set_output", normalized_message)
+            return LLMResult(
+                message=normalized_message,
+                finish_reason=choice.finish_reason or "stop",
+                usage=usage_dict,
+                raw=None,
+            )
 
     async def _stream(self, kwargs: dict[str, Any]) -> AsyncIterator[LLMEvent]:
         yield LLMEvent(LLMEventType.MESSAGE_START)
-        try:
-            stream = await self.client.chat.completions.create(**kwargs)
-            async for chunk in stream:
-                choice = chunk.choices[0]
-                delta = choice.delta
-                content = getattr(delta, "content", None)
-                if content:
-                    yield LLMEvent(LLMEventType.CONTENT_DELTA, content=content)
-                tool_calls = getattr(delta, "tool_calls", None)
-                if tool_calls:
-                    for tool_call in tool_calls:
-                        yield LLMEvent(LLMEventType.TOOL_CALL_DELTA, tool_call=_tool_call_to_dict(tool_call))
-                if choice.finish_reason:
-                    yield LLMEvent(LLMEventType.MESSAGE_DONE, finish_reason=choice.finish_reason)
-        except Exception as exc:
-            yield LLMEvent(LLMEventType.ERROR, error=str(exc))
+        attempt = self._begin_attempt(kwargs["model"], True)
+        with attempt:
+            optional_hook(attempt, "set_input", kwargs["messages"],
+                          tools=kwargs.get("tools"), system=kwargs.get("system"))
+            try:
+                stream = await self.client.chat.completions.create(**kwargs)
+                async for chunk in stream:
+                    # usage-only final chunk: empty choices, usage payload
+                    if not chunk.choices:
+                        usage = getattr(chunk, "usage", None)
+                        if usage is not None:
+                            attempt.set_usage(
+                                getattr(usage, "prompt_tokens", None),
+                                getattr(usage, "completion_tokens", None),
+                            )
+                        continue
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    content = getattr(delta, "content", None)
+                    if content:
+                        optional_hook(attempt, "append_output_text", content)
+                        yield LLMEvent(LLMEventType.CONTENT_DELTA, content=content)
+                    tool_calls = getattr(delta, "tool_calls", None)
+                    if tool_calls:
+                        for tool_call in tool_calls:
+                            function = _get(tool_call, "function")
+                            optional_hook(attempt, "append_output_tool_delta",
+                                          _get(tool_call, "index"), id=_get(tool_call, "id"),
+                                          name=_get(function, "name"),
+                                          arguments=_get(function, "arguments"))
+                            yield LLMEvent(LLMEventType.TOOL_CALL_DELTA, tool_call=_tool_call_to_dict(tool_call))
+                    if choice.finish_reason:
+                        attempt.set_finish_reasons(choice.finish_reason)
+                        yield LLMEvent(LLMEventType.MESSAGE_DONE, finish_reason=choice.finish_reason)
+            except Exception as exc:
+                error_text = str(exc)
+                optional_hook(attempt, "set_error_detail", error_text)
+                attempt.set_error(type(exc).__name__)
+                yield LLMEvent(LLMEventType.ERROR, error=error_text)
 
 
 def _provider_options(options: dict[str, Any]) -> dict[str, Any]:
@@ -154,3 +228,7 @@ def _tool_call_to_dict(tool_call: Any) -> dict[str, Any]:
             "arguments": _normalize_arguments(getattr(function, "arguments", "") if function else ""),
         },
     }
+
+
+def _get(value: Any, key: str) -> Any:
+    return value.get(key) if isinstance(value, dict) else getattr(value, key, None)

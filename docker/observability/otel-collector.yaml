@@ -1,0 +1,246 @@
+# OTel Collector (contrib) 配置 -- spec 7：三条 pipeline + memory_limiter + batch，
+# 有界发送队列与受限重试；debug exporter 仅用于 logs 管线的详细度交付合同。
+# Collector 默认仅容器内网接收（compose 不发布宿主端口）。
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  # Log 行体改写：OTLP record 的 body 只有安全事件码，trace_id/span_id 在
+  # record 级字段里（Loki 会放入 structured metadata，行内不可 grep）。
+  # 改写为 JSON 行后 Grafana Loki 数据源的 derivedFields 才能用
+  # "trace_id":"([0-9a-f]+)" 从日志行跳转 Tempo；debug exporter 输出
+  # 的事件码与 trace_id 字符串不变（冒烟证据不受影响）。
+  transform/loki_json:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          # Preserve the original body string (the sanitized message/event code)
+          # before the JSON line rewrite below caches it as "message".
+          - 'set(cache["orig_body"], body)'
+          # Explicit field projection: application-approved execution facts only.
+          - 'set(cache["execution"], {})'
+          - 'set(cache["execution"]["session_id"], attributes["session_id"]) where attributes["session_id"] != nil'
+          - 'set(cache["execution"]["request_id"], attributes["request_id"]) where attributes["request_id"] != nil'
+          - 'set(cache["execution"]["source"], attributes["source"]) where attributes["source"] != nil'
+          - 'set(cache["execution"]["operation"], attributes["operation"]) where attributes["operation"] != nil'
+          - 'set(cache["execution"]["before_tokens"], attributes["before_tokens"]) where attributes["before_tokens"] != nil'
+          - 'set(cache["execution"]["after_tokens"], attributes["after_tokens"]) where attributes["after_tokens"] != nil'
+          - 'set(cache["execution"]["nagent.observation.error"], attributes["nagent.observation.error"]) where attributes["nagent.observation.error"] != nil'
+          - 'set(cache["execution"]["policy.name"], attributes["policy.name"]) where attributes["policy.name"] != nil'
+          - 'set(cache["execution"]["policy.version"], attributes["policy.version"]) where attributes["policy.version"] != nil'
+          - 'set(cache["execution"]["policy.decision_kind"], attributes["policy.decision_kind"]) where attributes["policy.decision_kind"] != nil'
+          - 'set(cache["execution"]["policy.reason"], attributes["policy.reason"]) where attributes["policy.reason"] != nil'
+          - 'set(cache["execution"]["policy.outcome"], attributes["policy.outcome"]) where attributes["policy.outcome"] != nil'
+          - 'set(cache["execution"]["policy.run_id"], attributes["policy.run_id"]) where attributes["policy.run_id"] != nil'
+          - 'set(cache["execution"]["policy.session_id"], attributes["policy.session_id"]) where attributes["policy.session_id"] != nil'
+          - 'set(cache["execution"]["policy.policy_scope"], attributes["policy.policy_scope"]) where attributes["policy.policy_scope"] != nil'
+          - 'set(cache["execution"]["policy.occurred_at"], attributes["policy.occurred_at"]) where attributes["policy.occurred_at"] != nil'
+          - 'set(cache["execution"]["http.request.method"], attributes["http.request.method"]) where attributes["http.request.method"] != nil'
+          - 'set(cache["execution"]["http.route"], attributes["http.route"]) where attributes["http.route"] != nil'
+          - 'set(cache["execution"]["http.response.status_code"], attributes["http.response.status_code"]) where attributes["http.response.status_code"] != nil'
+          - 'set(cache["execution"]["server.address"], attributes["server.address"]) where attributes["server.address"] != nil'
+          - 'set(cache["execution"]["server.port"], attributes["server.port"]) where attributes["server.port"] != nil'
+          - 'set(cache["execution"]["url.template"], attributes["url.template"]) where attributes["url.template"] != nil'
+          - 'set(cache["execution"]["nagent.http.caller"], attributes["nagent.http.caller"]) where attributes["nagent.http.caller"] != nil'
+          - 'set(cache["execution"]["error.type"], attributes["error.type"]) where attributes["error.type"] != nil'
+          - 'set(cache["execution"]["summary"], attributes["summary"]) where attributes["summary"] != nil'
+          - 'set(cache["execution"]["duration_ms"], attributes["duration_ms"]) where attributes["duration_ms"] != nil'
+          - 'set(cache["execution"]["outcome"], attributes["outcome"]) where attributes["outcome"] != nil'
+          - 'set(cache["execution"]["error_type"], attributes["error_type"]) where attributes["error_type"] != nil'
+          - 'set(cache["execution"]["message_count"], attributes["message_count"]) where attributes["message_count"] != nil'
+          - 'set(cache["execution"]["inference_calls"], attributes["inference_calls"]) where attributes["inference_calls"] != nil'
+          - 'set(cache["execution"]["tool_calls"], attributes["tool_calls"]) where attributes["tool_calls"] != nil'
+          - 'set(cache["execution"]["input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil'
+          - 'set(cache["execution"]["output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil'
+          - 'set(cache["execution"]["usage_known"], attributes["usage_known"]) where attributes["usage_known"] != nil'
+          - 'set(cache["execution"]["end_reason"], attributes["end_reason"]) where attributes["end_reason"] != nil'
+          - 'set(cache["execution"]["model"], attributes["model"]) where attributes["model"] != nil'
+          - 'set(cache["execution"]["provider"], attributes["provider"]) where attributes["provider"] != nil'
+          - 'set(cache["execution"]["iteration"], attributes["iteration"]) where attributes["iteration"] != nil'
+          - 'set(cache["execution"]["stream"], attributes["stream"]) where attributes["stream"] != nil'
+          - 'set(cache["execution"]["finish_reason"], attributes["finish_reason"]) where attributes["finish_reason"] != nil'
+          - 'set(cache["execution"]["tool"], attributes["tool"]) where attributes["tool"] != nil'
+          - 'set(cache["execution"]["call_id"], attributes["call_id"]) where attributes["call_id"] != nil'
+          - 'set(cache["execution"]["risk_level"], attributes["risk_level"]) where attributes["risk_level"] != nil'
+          - 'set(cache["execution"]["policy_outcome"], attributes["policy_outcome"]) where attributes["policy_outcome"] != nil'
+          - 'set(cache["execution"]["executed"], attributes["executed"]) where attributes["executed"] != nil'
+          # Approved detail envelopes: explicit fields and metadata only.
+          - 'set(cache["details"], {})'
+          - 'set(cache["details"]["http_request"], {}) where attributes["nagent.details.http_request.content"] != nil'
+          - 'set(cache["details"]["http_request"]["content"], attributes["nagent.details.http_request.content"]) where attributes["nagent.details.http_request.content"] != nil'
+          - 'set(cache["details"]["http_request"]["original_bytes"], attributes["nagent.details.http_request.original_bytes"]) where attributes["nagent.details.http_request.original_bytes"] != nil'
+          - 'set(cache["details"]["http_request"]["truncated"], attributes["nagent.details.http_request.truncated"]) where attributes["nagent.details.http_request.truncated"] != nil'
+          - 'set(cache["details"]["http_request"]["incomplete"], attributes["nagent.details.http_request.incomplete"]) where attributes["nagent.details.http_request.incomplete"] != nil'
+          - 'set(cache["details"]["http_request"]["observed_bytes"], attributes["nagent.details.http_request.observed_bytes"]) where attributes["nagent.details.http_request.observed_bytes"] != nil'
+          - 'set(cache["details"]["http_response"], {}) where attributes["nagent.details.http_response.content"] != nil'
+          - 'set(cache["details"]["http_response"]["content"], attributes["nagent.details.http_response.content"]) where attributes["nagent.details.http_response.content"] != nil'
+          - 'set(cache["details"]["http_response"]["original_bytes"], attributes["nagent.details.http_response.original_bytes"]) where attributes["nagent.details.http_response.original_bytes"] != nil'
+          - 'set(cache["details"]["http_response"]["truncated"], attributes["nagent.details.http_response.truncated"]) where attributes["nagent.details.http_response.truncated"] != nil'
+          - 'set(cache["details"]["http_response"]["incomplete"], attributes["nagent.details.http_response.incomplete"]) where attributes["nagent.details.http_response.incomplete"] != nil'
+          - 'set(cache["details"]["http_response"]["observed_bytes"], attributes["nagent.details.http_response.observed_bytes"]) where attributes["nagent.details.http_response.observed_bytes"] != nil'
+          - 'set(cache["details"]["log_fields"], {}) where attributes["nagent.details.log_fields.content"] != nil'
+          - 'set(cache["details"]["log_fields"]["content"], attributes["nagent.details.log_fields.content"]) where attributes["nagent.details.log_fields.content"] != nil'
+          - 'set(cache["details"]["log_fields"]["original_bytes"], attributes["nagent.details.log_fields.original_bytes"]) where attributes["nagent.details.log_fields.original_bytes"] != nil'
+          - 'set(cache["details"]["log_fields"]["truncated"], attributes["nagent.details.log_fields.truncated"]) where attributes["nagent.details.log_fields.truncated"] != nil'
+          - 'set(cache["details"]["log_fields"]["incomplete"], attributes["nagent.details.log_fields.incomplete"]) where attributes["nagent.details.log_fields.incomplete"] != nil'
+          - 'set(cache["details"]["log_fields"]["observed_bytes"], attributes["nagent.details.log_fields.observed_bytes"]) where attributes["nagent.details.log_fields.observed_bytes"] != nil'
+          - 'set(cache["details"]["user_message"], {}) where attributes["nagent.details.user_message.content"] != nil'
+          - 'set(cache["details"]["user_message"]["content"], attributes["nagent.details.user_message.content"]) where attributes["nagent.details.user_message.content"] != nil'
+          - 'set(cache["details"]["user_message"]["original_bytes"], attributes["nagent.details.user_message.original_bytes"]) where attributes["nagent.details.user_message.content"] != nil and attributes["nagent.details.user_message.original_bytes"] != nil'
+          - 'set(cache["details"]["user_message"]["truncated"], attributes["nagent.details.user_message.truncated"]) where attributes["nagent.details.user_message.content"] != nil and attributes["nagent.details.user_message.truncated"] != nil'
+          - 'set(cache["details"]["user_message"]["incomplete"], attributes["nagent.details.user_message.incomplete"]) where attributes["nagent.details.user_message.content"] != nil and attributes["nagent.details.user_message.incomplete"] != nil'
+          - 'set(cache["details"]["user_message"]["observed_bytes"], attributes["nagent.details.user_message.observed_bytes"]) where attributes["nagent.details.user_message.content"] != nil and attributes["nagent.details.user_message.observed_bytes"] != nil'
+          - 'set(cache["details"]["assistant_message"], {}) where attributes["nagent.details.assistant_message.content"] != nil'
+          - 'set(cache["details"]["assistant_message"]["content"], attributes["nagent.details.assistant_message.content"]) where attributes["nagent.details.assistant_message.content"] != nil'
+          - 'set(cache["details"]["assistant_message"]["original_bytes"], attributes["nagent.details.assistant_message.original_bytes"]) where attributes["nagent.details.assistant_message.content"] != nil and attributes["nagent.details.assistant_message.original_bytes"] != nil'
+          - 'set(cache["details"]["assistant_message"]["truncated"], attributes["nagent.details.assistant_message.truncated"]) where attributes["nagent.details.assistant_message.content"] != nil and attributes["nagent.details.assistant_message.truncated"] != nil'
+          - 'set(cache["details"]["assistant_message"]["incomplete"], attributes["nagent.details.assistant_message.incomplete"]) where attributes["nagent.details.assistant_message.content"] != nil and attributes["nagent.details.assistant_message.incomplete"] != nil'
+          - 'set(cache["details"]["assistant_message"]["observed_bytes"], attributes["nagent.details.assistant_message.observed_bytes"]) where attributes["nagent.details.assistant_message.content"] != nil and attributes["nagent.details.assistant_message.observed_bytes"] != nil'
+          - 'set(cache["details"]["system_prompt"], {}) where attributes["nagent.details.system_prompt.content"] != nil'
+          - 'set(cache["details"]["system_prompt"]["content"], attributes["nagent.details.system_prompt.content"]) where attributes["nagent.details.system_prompt.content"] != nil'
+          - 'set(cache["details"]["system_prompt"]["original_bytes"], attributes["nagent.details.system_prompt.original_bytes"]) where attributes["nagent.details.system_prompt.content"] != nil and attributes["nagent.details.system_prompt.original_bytes"] != nil'
+          - 'set(cache["details"]["system_prompt"]["truncated"], attributes["nagent.details.system_prompt.truncated"]) where attributes["nagent.details.system_prompt.content"] != nil and attributes["nagent.details.system_prompt.truncated"] != nil'
+          - 'set(cache["details"]["system_prompt"]["incomplete"], attributes["nagent.details.system_prompt.incomplete"]) where attributes["nagent.details.system_prompt.content"] != nil and attributes["nagent.details.system_prompt.incomplete"] != nil'
+          - 'set(cache["details"]["system_prompt"]["observed_bytes"], attributes["nagent.details.system_prompt.observed_bytes"]) where attributes["nagent.details.system_prompt.content"] != nil and attributes["nagent.details.system_prompt.observed_bytes"] != nil'
+          - 'set(cache["details"]["input_messages"], {}) where attributes["nagent.details.input_messages.content"] != nil'
+          - 'set(cache["details"]["input_messages"]["content"], attributes["nagent.details.input_messages.content"]) where attributes["nagent.details.input_messages.content"] != nil'
+          - 'set(cache["details"]["input_messages"]["original_bytes"], attributes["nagent.details.input_messages.original_bytes"]) where attributes["nagent.details.input_messages.content"] != nil and attributes["nagent.details.input_messages.original_bytes"] != nil'
+          - 'set(cache["details"]["input_messages"]["truncated"], attributes["nagent.details.input_messages.truncated"]) where attributes["nagent.details.input_messages.content"] != nil and attributes["nagent.details.input_messages.truncated"] != nil'
+          - 'set(cache["details"]["input_messages"]["incomplete"], attributes["nagent.details.input_messages.incomplete"]) where attributes["nagent.details.input_messages.content"] != nil and attributes["nagent.details.input_messages.incomplete"] != nil'
+          - 'set(cache["details"]["input_messages"]["observed_bytes"], attributes["nagent.details.input_messages.observed_bytes"]) where attributes["nagent.details.input_messages.content"] != nil and attributes["nagent.details.input_messages.observed_bytes"] != nil'
+          - 'set(cache["details"]["tool_definitions"], {}) where attributes["nagent.details.tool_definitions.content"] != nil'
+          - 'set(cache["details"]["tool_definitions"]["content"], attributes["nagent.details.tool_definitions.content"]) where attributes["nagent.details.tool_definitions.content"] != nil'
+          - 'set(cache["details"]["tool_definitions"]["original_bytes"], attributes["nagent.details.tool_definitions.original_bytes"]) where attributes["nagent.details.tool_definitions.content"] != nil and attributes["nagent.details.tool_definitions.original_bytes"] != nil'
+          - 'set(cache["details"]["tool_definitions"]["truncated"], attributes["nagent.details.tool_definitions.truncated"]) where attributes["nagent.details.tool_definitions.content"] != nil and attributes["nagent.details.tool_definitions.truncated"] != nil'
+          - 'set(cache["details"]["tool_definitions"]["incomplete"], attributes["nagent.details.tool_definitions.incomplete"]) where attributes["nagent.details.tool_definitions.content"] != nil and attributes["nagent.details.tool_definitions.incomplete"] != nil'
+          - 'set(cache["details"]["tool_definitions"]["observed_bytes"], attributes["nagent.details.tool_definitions.observed_bytes"]) where attributes["nagent.details.tool_definitions.content"] != nil and attributes["nagent.details.tool_definitions.observed_bytes"] != nil'
+          - 'set(cache["details"]["output_messages"], {}) where attributes["nagent.details.output_messages.content"] != nil'
+          - 'set(cache["details"]["output_messages"]["content"], attributes["nagent.details.output_messages.content"]) where attributes["nagent.details.output_messages.content"] != nil'
+          - 'set(cache["details"]["output_messages"]["original_bytes"], attributes["nagent.details.output_messages.original_bytes"]) where attributes["nagent.details.output_messages.content"] != nil and attributes["nagent.details.output_messages.original_bytes"] != nil'
+          - 'set(cache["details"]["output_messages"]["truncated"], attributes["nagent.details.output_messages.truncated"]) where attributes["nagent.details.output_messages.content"] != nil and attributes["nagent.details.output_messages.truncated"] != nil'
+          - 'set(cache["details"]["output_messages"]["incomplete"], attributes["nagent.details.output_messages.incomplete"]) where attributes["nagent.details.output_messages.content"] != nil and attributes["nagent.details.output_messages.incomplete"] != nil'
+          - 'set(cache["details"]["output_messages"]["observed_bytes"], attributes["nagent.details.output_messages.observed_bytes"]) where attributes["nagent.details.output_messages.content"] != nil and attributes["nagent.details.output_messages.observed_bytes"] != nil'
+          - 'set(cache["details"]["tool_arguments"], {}) where attributes["nagent.details.tool_arguments.content"] != nil'
+          - 'set(cache["details"]["tool_arguments"]["content"], attributes["nagent.details.tool_arguments.content"]) where attributes["nagent.details.tool_arguments.content"] != nil'
+          - 'set(cache["details"]["tool_arguments"]["original_bytes"], attributes["nagent.details.tool_arguments.original_bytes"]) where attributes["nagent.details.tool_arguments.content"] != nil and attributes["nagent.details.tool_arguments.original_bytes"] != nil'
+          - 'set(cache["details"]["tool_arguments"]["truncated"], attributes["nagent.details.tool_arguments.truncated"]) where attributes["nagent.details.tool_arguments.content"] != nil and attributes["nagent.details.tool_arguments.truncated"] != nil'
+          - 'set(cache["details"]["tool_arguments"]["incomplete"], attributes["nagent.details.tool_arguments.incomplete"]) where attributes["nagent.details.tool_arguments.content"] != nil and attributes["nagent.details.tool_arguments.incomplete"] != nil'
+          - 'set(cache["details"]["tool_arguments"]["observed_bytes"], attributes["nagent.details.tool_arguments.observed_bytes"]) where attributes["nagent.details.tool_arguments.content"] != nil and attributes["nagent.details.tool_arguments.observed_bytes"] != nil'
+          - 'set(cache["details"]["tool_result"], {}) where attributes["nagent.details.tool_result.content"] != nil'
+          - 'set(cache["details"]["tool_result"]["content"], attributes["nagent.details.tool_result.content"]) where attributes["nagent.details.tool_result.content"] != nil'
+          - 'set(cache["details"]["tool_result"]["original_bytes"], attributes["nagent.details.tool_result.original_bytes"]) where attributes["nagent.details.tool_result.content"] != nil and attributes["nagent.details.tool_result.original_bytes"] != nil'
+          - 'set(cache["details"]["tool_result"]["truncated"], attributes["nagent.details.tool_result.truncated"]) where attributes["nagent.details.tool_result.content"] != nil and attributes["nagent.details.tool_result.truncated"] != nil'
+          - 'set(cache["details"]["tool_result"]["incomplete"], attributes["nagent.details.tool_result.incomplete"]) where attributes["nagent.details.tool_result.content"] != nil and attributes["nagent.details.tool_result.incomplete"] != nil'
+          - 'set(cache["details"]["tool_result"]["observed_bytes"], attributes["nagent.details.tool_result.observed_bytes"]) where attributes["nagent.details.tool_result.content"] != nil and attributes["nagent.details.tool_result.observed_bytes"] != nil'
+          - 'set(cache["details"]["error"], {}) where attributes["nagent.details.error.content"] != nil'
+          - 'set(cache["details"]["error"]["content"], attributes["nagent.details.error.content"]) where attributes["nagent.details.error.content"] != nil'
+          - 'set(cache["details"]["error"]["original_bytes"], attributes["nagent.details.error.original_bytes"]) where attributes["nagent.details.error.content"] != nil and attributes["nagent.details.error.original_bytes"] != nil'
+          - 'set(cache["details"]["error"]["truncated"], attributes["nagent.details.error.truncated"]) where attributes["nagent.details.error.content"] != nil and attributes["nagent.details.error.truncated"] != nil'
+          - 'set(cache["details"]["error"]["incomplete"], attributes["nagent.details.error.incomplete"]) where attributes["nagent.details.error.content"] != nil and attributes["nagent.details.error.incomplete"] != nil'
+          - 'set(cache["details"]["error"]["observed_bytes"], attributes["nagent.details.error.observed_bytes"]) where attributes["nagent.details.error.content"] != nil and attributes["nagent.details.error.observed_bytes"] != nil'
+          # Read the fixed event code from attributes (never from the body);
+          # unknown/missing events are the fixed diagnostic code.
+          - 'set(cache["event"], attributes["event"]) where attributes["event"] != nil'
+          - 'set(cache["event"], "log_event_unknown") where attributes["event"] == nil'
+          - 'set(cache["message"], cache["orig_body"])'
+          # Sanitized exception/stack already flat-dotted by the app projection.
+          - 'set(cache["exception"], {"type": attributes["exception.type"], "message": attributes["exception.message"], "stacktrace": attributes["exception.stacktrace"]}) where attributes["exception.type"] != nil'
+          - 'set(cache["stack"], attributes["stack"]) where attributes["stack"] != nil'
+          # 无活跃 span 时 OTTL 的 trace_id.string 为全零；带全零字段会生成
+          # 指向空 trace 的伪 Tempo 链接，故无关联日志不含 trace 字段。
+          - 'set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "message": cache["message"], "context": {"execution": cache["execution"]}, "details": cache["details"], "exception": cache["exception"], "stack": cache["stack"], "trace_id": trace_id.string, "span_id": span_id.string}) where trace_id.string != "00000000000000000000000000000000"'
+          - 'set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "message": cache["message"], "context": {"execution": cache["execution"]}, "details": cache["details"], "exception": cache["exception"], "stack": cache["stack"]}) where trace_id.string == "00000000000000000000000000000000"'
+  # Drop low-severity placeholders even when they inherited an execution scene.
+  # Preserve details, readable messages, exceptions/stacks and warnings/errors.
+  filter/empty_unknown_logs:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'body["event"] == "log_event_unknown" and severity_number < SEVERITY_NUMBER_WARN and Len(body["details"]) == 0 and (body["message"] == nil or body["message"] == "" or body["message"] == "log_event_unknown") and body["exception"] == nil and (body["stack"] == nil or body["stack"] == "")'
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 512
+
+exporters:
+  # Trace -> Tempo OTLP receiver（内网服务名）
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+      queue_size: 2048
+    retry_on_failure:
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 60s
+  # Metric -> Prometheus remote write receiver
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    resource_to_telemetry_conversion:
+      enabled: true
+    remote_write_queue:
+      enabled: true
+      queue_size: 2048
+    retry_on_failure:
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 60s
+  # Log -> Loki 原生 OTLP HTTP 接收（/otlp/v1/logs）
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    sending_queue:
+      enabled: true
+      queue_size: 2048
+    retry_on_failure:
+      initial_interval: 1s
+      max_interval: 5s
+      max_elapsed_time: 60s
+  # Log -> Collector stdout（详细度必须能输出安全 body/关联字段，normal 仅计数不达标）
+  debug:
+    verbosity: detailed
+
+service:
+  extensions: [health_check]
+  # 自身 telemetry 暴露给 Prometheus 抓取（新版默认不绑外部地址；用 readers
+  # 显式声明 pull exporter，prometheus-self 监控才能从容器网络抓到）。
+  telemetry:
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  # 注意：logs level 保持默认 info —— debug exporter 的输出以 info 级别写入，
+  # 设为 warn 会把 logs 管线的交付证据一并吞掉。
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/loki_json, filter/empty_unknown_logs, batch]
+      # Loki 为主交付后端；debug exporter 保留交付证据（stdout 输出）
+      exporters: [otlphttp/loki, debug]
