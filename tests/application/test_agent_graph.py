@@ -283,6 +283,7 @@ async def test_agent_graph_executes_tool_loop_and_finalizes(tmp_path):
     state = await runner.run(AgentState(session_id="s1", input_messages=[{"role": "user", "content": "calc"}]), "test")
 
     assert state.final_message["content"] == "result is 3"
+    assert runner.llm_provider.model_list_calls == 0
     assert (await store.list_tool_calls("s1"))[0].tool_name == "calculator"
 
 

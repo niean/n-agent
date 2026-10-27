@@ -53,7 +53,7 @@ from app.domain.llm_policy import (
 )
 from app.domain.memory import MemoryStore, Summarizer
 from app.domain.policy import ExecutionMode, PolicyOutcome
-from app.domain.provider import LLMEventType, LLMProvider, LLMResult, ModelInfo, resolve_model
+from app.domain.provider import LLMEventType, LLMProvider, LLMResult, resolve_model
 from app.domain.session import TaskState, ToolCall
 from app.domain.tool import (
     ApprovalDecision,
@@ -210,7 +210,6 @@ class AgentGraphRunner:
         self._budget_service = budget_service or BudgetService(BudgetPolicyConfig())
         self._llm_policy = llm_policy or LLMPolicy()
         self._llm_config = llm_config or LLMConfig()
-        self._model_cache: list[ModelInfo] | None = None
         self.context_service = context_service or ContextService(
             memory_store,
             tool_service=tool_service,
@@ -723,56 +722,22 @@ class AgentGraphRunner:
                 return "user"
         return "user"
 
-    def _build_provider_capabilities(
-        self,
-        model_infos: list[ModelInfo] | None = None,
-    ) -> tuple[ProviderCapability, ...]:
-        """Build LLM-owned ProviderCapability snapshot from the active provider.
+    def _build_provider_capabilities(self) -> tuple[ProviderCapability, ...]:
+        """Use active configuration without remote model discovery.
 
-        Reads ``current_config`` (ProviderConfig) when available (ActiveProviderHolder).
-        Falls back to ``default_model`` attr for raw providers (test doubles,
-        OpenAICompatibleProvider used directly).
-
-        ``supports_tools`` is projected from ``ModelInfo.supports_tools`` when
-        a matching model is found in ``model_infos``; defaults to True when
-        no model info is available.
+        OpenAI-compatible adapters assume tool support; model-list responses
+        do not add capability information. Vision remains configuration-owned.
         """
         config = getattr(self.llm_provider, "current_config", None)
-        if config is not None:
-            supports_vision = getattr(config, "supports_vision", False)
-            if self.vision_capability is not None:
-                supports_vision = self.vision_capability()
-            model_id = getattr(config, "model", "")
-            supports_tools = True
-            if model_infos:
-                for mi in model_infos:
-                    if mi.id == model_id:
-                        supports_tools = mi.supports_tools
-                        break
-            return (
-                ProviderCapability(
-                    provider_id=getattr(config, "id", "default"),
-                    model_id=model_id,
-                    supports_tools=supports_tools,
-                    supports_vision=supports_vision,
-                ),
-            )
-        # Fallback for raw providers (test doubles)
-        supports_vision = False
+        supports_vision = getattr(config, "supports_vision", False)
         if self.vision_capability is not None:
             supports_vision = self.vision_capability()
-        default_model = getattr(self.llm_provider, "default_model", None) or ""
-        supports_tools = True
-        if model_infos:
-            for mi in model_infos:
-                if mi.id == default_model:
-                    supports_tools = mi.supports_tools
-                    break
         return (
             ProviderCapability(
-                provider_id="default",
-                model_id=default_model,
-                supports_tools=supports_tools,
+                provider_id=getattr(config, "id", "default"),
+                model_id=(getattr(config, "model", "") if config is not None
+                          else getattr(self.llm_provider, "default_model", None) or ""),
+                supports_tools=True,
                 supports_vision=supports_vision,
             ),
         )
@@ -882,12 +847,7 @@ class AgentGraphRunner:
             # 3. ModelSelection via LLMPolicy
             # LLMPolicy checks placeholder resolution, tool/vision/context-window
             # capabilities, and ProviderConstraints (from InformationFlow decision).
-            if self._model_cache is None:
-                try:
-                    self._model_cache = await self.llm_provider.list_models()
-                except Exception:
-                    self._model_cache = []
-            provider_caps = self._build_provider_capabilities(self._model_cache)
+            provider_caps = self._build_provider_capabilities()
             requirements = self._build_model_requirements(
                 working_messages_for_call, tools, state,
             )

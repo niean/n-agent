@@ -1440,3 +1440,5 @@ HTTP 完成日志：两个对话入口的 HTTP SERVER Span 在结束前只记一
 Policy 审计由 `LoggingPolicyAuditSink` 使用固定 `policy_decision %s` 模板。独立 `policy_audit_context` 同步绑定领域事件的固定字段，日志适配器逐字段脱敏并投影为 `policy.*`，Collector 显式复制到 `context.execution`；不信任任意 record.extra，也不把动态 JSON 当模板。绑定退出后立即恢复，避免下一条业务日志继承审计事实。
 
 正文默认每项 2048 字节；流式响应独立有界累积，超限或不完整时保留脱敏限长前缀与诚实元数据，finish 释放缓存。未知长度不伪造数值；HTTP auto span 允许统一投影详情，ring buffer/metrics/Profile 仍不携带正文。
+
+Agent 模型选择不调用远程 `list_models`，也不维护模型列表缓存：直接读取当前 Provider 配置中的模型、Provider ID 与视觉能力。OpenAI-compatible 工具支持沿用适配器默认值 True，远程模型列表不提供额外能力事实。模型发现仅用于模型管理页、`/models` 命令及对外模型列表接口，不能作为每次 Agent 执行的前置网络依赖。
