@@ -3,3 +3,18 @@
 # /ingest?name=n-agent&format=folded&units=samples&aggregationType=sum
 limits:
   compactor_blocks_retention_period: 168h
+
+# Persist the bucket as well as the ingester's /data. Without a bucket the
+# compactor retention above does not govern local-only profiling history.
+storage:
+  backend: filesystem
+  filesystem:
+    dir: /var/lib/pyroscope
+
+pyroscopedb:
+  # v1.21.1 disk percentage calculation has a block/byte unit mismatch.
+  # Zero is ignored by ingester v1.21.1, so use explicit positive thresholds.
+  # The 1GiB guard avoids the default 10GiB trigger on small Docker disks;
+  # uploaded local blocks still clean normally and the bucket retains 7 days.
+  min_free_disk_gb: 1
+  min_disk_available_percentage: 0.01

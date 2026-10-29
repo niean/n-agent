@@ -1,0 +1,190 @@
+# Shared backend: restart.sh (default restart; stop / migrate / compose subcommands) in this directory.
+name: n-observability
+
+services:
+  otel-collector:
+    networks: [default, telemetry]
+    image: otel/opentelemetry-collector-contrib:0.137.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    expose:
+      - "4317"
+      - "4318"
+    # 宿主 OTLP 接入默认关闭（spec 7：默认仅容器内网接收）；需要宿主接入时取消注释：
+    # ports:
+    #   - "127.0.0.1:4317:4317"
+    stop_grace_period: 15s
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  tempo:
+    networks: [default]
+    image: grafana/tempo:2.9.0
+    command: ["-config.file=/etc/tempo/config.yaml"]
+    # Named volume starts owned by root; match the other local observability stores.
+    user: "0:0"
+    volumes:
+      - ./tempo.yaml:/etc/tempo/config.yaml:ro
+      - tempo-data:/var/tempo
+    expose:
+      - "4317"
+    ports:
+      - "127.0.0.1:3200:3200"
+    stop_grace_period: 15s
+    mem_limit: 512m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  prometheus:
+    networks: [default]
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-remote-write-receiver
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    stop_grace_period: 15s
+    mem_limit: 512m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    networks: [default]
+    image: grafana/grafana:13.0.11
+    # 本地 127.0.0.1 只读观测 UI：匿名 Viewer，无登录凭据（不引入秘密）。
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # 宿主侧改绑 13000 避开常见被占用的 3000（按部署机实际情况调整）
+      - "127.0.0.1:13000:3000"
+    stop_grace_period: 15s
+    mem_limit: 512m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  pyroscope:
+    networks: [default, telemetry]
+    image: grafana/pyroscope:1.21.1
+    # 注：pyroscope 镜像为 distroless（无 shell/wget/curl），无可用 in-image
+    # 探针，故不定义 healthcheck；依赖方不得对其使用 service_healthy 条件。
+    command: ["-config.file=/etc/pyroscope/config.yaml"]
+    volumes:
+      - ./pyroscope.yaml:/etc/pyroscope/config.yaml:ro
+      - pyroscope-data:/var/lib/pyroscope
+      - pyroscope-storage:/data
+      - pyroscope-compactor:/data-compactor
+      - pyroscope-metastore:/data-metastore
+    ports:
+      - "127.0.0.1:4040:4040"
+    stop_grace_period: 15s
+    mem_limit: 512m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  loki:
+    networks: [default]
+    image: grafana/loki:3.5.5
+    # 日志后端：原生 OTLP 接收（/otlp/v1/logs），Grafana 经 Loki 数据源查询；
+    # 默认不发布宿主端口（与 Prometheus 一致，仅容器内网 + Grafana 代理）。
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    expose:
+      - "3100"
+    stop_grace_period: 15s
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  default: {}
+  telemetry:
+    name: n-telemetry
+    external: true
+
+volumes:
+  tempo-data:
+    external: true
+    name: ${N_OBSERVABILITY_TEMPO_VOLUME:-n-observability_tempo-data}
+  prometheus-data:
+    external: true
+    name: ${N_OBSERVABILITY_PROMETHEUS_VOLUME:-n-observability_prometheus-data}
+  grafana-data:
+    external: true
+    name: ${N_OBSERVABILITY_GRAFANA_VOLUME:-n-observability_grafana-data}
+  loki-data:
+    external: true
+    name: ${N_OBSERVABILITY_LOKI_VOLUME:-n-observability_loki-data}
+  pyroscope-data:
+    external: true
+    name: ${N_OBSERVABILITY_PYROSCOPE_VOLUME:-n-observability_pyroscope-data}
+  pyroscope-storage:
+    external: true
+    name: ${N_OBSERVABILITY_PYROSCOPE_DATA_VOLUME:-n-observability_pyroscope-storage}
+  pyroscope-compactor:
+    external: true
+    name: ${N_OBSERVABILITY_PYROSCOPE_COMPACTOR_VOLUME:-n-observability_pyroscope-compactor}
+  pyroscope-metastore:
+    external: true
+    name: ${N_OBSERVABILITY_PYROSCOPE_METASTORE_VOLUME:-n-observability_pyroscope-metastore}

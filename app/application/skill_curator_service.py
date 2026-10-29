@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from app.application.telemetry_semantics import business_operation
 from app.domain.curator_policy import CuratorPolicy, CuratorPolicyRequest
 from app.domain.policy import PolicyOutcome
 from app.domain.session import SessionSource
@@ -380,11 +381,19 @@ class SkillCuratorService:
     # ------------------------------------------------------------------
 
     async def run_curator_review(
+        self, synchronous: bool = True, dry_run: bool = False,
+        consolidate: bool | None = None, on_summary: Callable[[str], None] | None = None,
+    ) -> CuratorRunResult:
+        with business_operation("curator.run", source="curator", detached=True) as facts:
+            return await self._run_curator_review(synchronous, dry_run, consolidate, on_summary, _trace_facts=facts)
+
+    async def _run_curator_review(
         self,
         synchronous: bool = True,
         dry_run: bool = False,
         consolidate: bool | None = None,
         on_summary: Callable[[str], None] | None = None,
+        *, _trace_facts: dict | None = None,
     ) -> CuratorRunResult:
         """执行一次 curator review。
 
@@ -397,6 +406,8 @@ class SkillCuratorService:
         7. on_summary
         """
         if self._in_flight:
+            if _trace_facts is not None:
+                _trace_facts["outcome"] = "skipped"
             return CuratorRunResult(
                 started_at=_now_iso(),
                 auto_transitions=CuratorTransitions(),
@@ -420,6 +431,8 @@ class SkillCuratorService:
                 try:
                     await self.backup_store.snapshot()
                 except Exception as e:
+                    if _trace_facts is not None:
+                        _trace_facts["outcome"] = "failed"
                     backup_error = f"backup failed: {e}"
                     errors.append({"phase": "backup", "error": backup_error})
                     counts = CuratorTransitions()
@@ -472,6 +485,8 @@ class SkillCuratorService:
                 llm_meta["summary"] = "skipped (consolidation off)"
 
             prefix = "dry-run auto: " if dry_run else "auto: "
+            if _trace_facts is not None and (errors or llm_meta.get("error")):
+                _trace_facts["outcome"] = "failed"
             final_summary = f"{prefix}{auto_summary}; llm: {llm_meta.get('summary', 'no change')}"
 
             await self._finalize_run(
@@ -490,6 +505,8 @@ class SkillCuratorService:
                 summary_so_far=final_summary,
             )
         except Exception as e:
+            if _trace_facts is not None:
+                _trace_facts["outcome"] = "failed"
             logger.warning("run_curator_review failed: %s", e, exc_info=True)
             errors.append({"phase": "orchestrator", "error": str(e)})
             try:
@@ -527,6 +544,7 @@ class SkillCuratorService:
                 max_iterations=cfg.consolidate_max_iterations,
                 allow_toolsets={"skills"},
                 ingress_source=SessionSource.CURATOR.value,
+                _within_curator=True,
             )
             summary = result.final_text[:240] if result.final_text else (
                 result.error or "no change"

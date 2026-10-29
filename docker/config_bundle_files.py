@@ -567,6 +567,64 @@ def _check_env_member(arcname: str, payload: bytes) -> None:
                 "be represented in a Compose env file")
 
 
+def check_business_compose(payload: bytes) -> None:
+    """Refuse the former bundled backend before importing deployment files.
+
+    Host tooling is stdlib-only. Accept ordinary block services or JSON, and
+    refuse service aliases/flow YAML that cannot be safely inspected here.
+    """
+    names = {"otel-collector", "tempo", "prometheus", "grafana", "pyroscope", "loki"}
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PreflightError("env/docker-compose.yml is not UTF-8") from exc
+    refused = False
+    if text.lstrip().startswith("{"):
+        try:
+            services = json.loads(text).get("services", {})
+            refused = not isinstance(services, dict) or bool(names.intersection(services))
+        except (ValueError, AttributeError):
+            refused = True
+    else:
+        in_services, child_indent = False, None
+        found = False
+        for line in text.splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if not line[0].isspace():
+                in_services = False
+                match = re.fullmatch(r"services\s*:\s*(.*?)\s*(?:#.*)?", line)
+                if match:
+                    found = True
+                    value = match.group(1).split("#", 1)[0].strip()
+                    if value and value != "{}":
+                        refused = True  # Includes service aliases and flow maps.
+                    in_services = not value
+                    child_indent = None
+                continue
+            if not in_services:
+                continue
+            indent = len(line) - len(line.lstrip())
+            if child_indent is None:
+                child_indent = indent
+            if indent != child_indent:
+                continue
+            key = line.strip().split(":", 1)[0].strip()
+            if key.startswith('"'):
+                try:
+                    key = json.loads(key)
+                except ValueError:
+                    refused = True
+            elif key.startswith("'") and key.endswith("'"):
+                key = key[1:-1].replace("''", "'")
+            if key in names or not re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+                refused = True
+        refused = refused or not found
+    if refused:
+        raise PreflightError("legacy embedded observability stack in env/docker-compose.yml; "
+                             "use explicit block-style business services and split observability before importing")
+
+
 def preflight_bundle(path: Path, *, max_members: int, max_file_bytes: int,
                      max_total_bytes: int) -> dict:
     if max_members > HARD_MAX_MEMBERS:
@@ -582,7 +640,7 @@ def preflight_bundle(path: Path, *, max_members: int, max_file_bytes: int,
         raise PreflightError(f"bundle is not a readable file: {path}")
 
     budget = _Budget(max_members, max_file_bytes, max_total_bytes)
-    keep = ("manifest.json", "db/config.json", "env/docker.env",
+    keep = ("manifest.json", "db/config.json", "env/docker.env", "env/docker-compose.yml",
             "env/install-root.env") + _NESTED_ARCHIVES
     try:
         with path.open("rb") as stream:
@@ -646,6 +704,8 @@ def preflight_bundle(path: Path, *, max_members: int, max_file_bytes: int,
     for arcname in ("env/docker.env", "env/install-root.env"):
         if arcname in buffered:
             _check_env_member(arcname, buffered[arcname])
+    if "env/docker-compose.yml" in buffered:
+        check_business_compose(buffered["env/docker-compose.yml"])
     if "db/config.json" in digests:
         payload = buffered.get("db/config.json")
         if payload is None:
@@ -1053,6 +1113,12 @@ def _cmd_host_apply(args) -> int:
         return 2
 
     raw_manifest = members.get("manifest.json")
+    if "env/docker-compose.yml" in members:
+        try:
+            check_business_compose(members["env/docker-compose.yml"])
+        except PreflightError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     if raw_manifest is None:
         print("error: manifest.json disappeared between preflight and apply",
               file=sys.stderr)

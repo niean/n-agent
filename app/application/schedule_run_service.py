@@ -8,6 +8,7 @@ from uuid import uuid4
 from app.application.information_flow_service import InformationFlowService
 from app.application.policy_snapshot import InformationFlowPolicyConfig
 from app.application.scheduled_agent_executor import ScheduledAgentResult
+from app.application.telemetry_semantics import schedule_execution_span
 from app.domain.gateway import GatewaySessionKey
 from app.domain.gateway_policy import GatewayDeliveryDecision, GatewayOutboundRequest, GatewayPolicy
 from app.domain.information_flow import ReleaseTarget, SecretCatalog
@@ -118,6 +119,12 @@ class ScheduleRunService:
             )
 
     async def run_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None) -> dict:
+        with schedule_execution_span(claim.task.id, claim.task.session_id, claim.claim_id) as facts:
+            result = await self._execute_claim(claim, now=now)
+            facts.update(result)
+            return result
+
+    async def _execute_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
         decision = self._schedule_policy.evaluate(claim, now)
 

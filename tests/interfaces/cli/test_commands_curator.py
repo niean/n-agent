@@ -42,8 +42,10 @@ def _mock_services():
 
 
 def _patch(monkeypatch, services=None):
+    from contextlib import nullcontext
     services = services or _mock_services()
     monkeypatch.setattr(curator, "_load_services", lambda: services)
+    monkeypatch.setattr(curator, "_services_scope", lambda: nullcontext(services))
     return services
 
 
@@ -133,3 +135,23 @@ def test_run_routes_all_subcommands():
         # run 会调 _load_services（真实装配），跳过实际执行，只验证路由不返回 None
         # 这里只验证 dispatch 表完整
         assert cmd in curator.run.__code__.co_consts or True  # 路由表覆盖
+
+
+def test_curator_run_closes_application_runtime_on_error(monkeypatch):
+    from contextlib import contextmanager
+    import app.main
+    services = _mock_services()
+    services.skill_curator_service.run_curator_review.side_effect = RuntimeError("failed")
+    lifecycle = []
+    @contextmanager
+    def runtime():
+        lifecycle.append("open")
+        try:
+            yield services
+        finally:
+            lifecycle.append("shutdown")
+    monkeypatch.setattr(app.main, "application_runtime", runtime)
+    monkeypatch.setattr(curator, "_load_services", lambda: services)
+    with pytest.raises(RuntimeError, match="failed"):
+        curator._cmd_run(_args(curator_command="run", dry_run=True, consolidate=True))
+    assert lifecycle == ["open", "shutdown"]

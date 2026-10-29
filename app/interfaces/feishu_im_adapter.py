@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from app.application.gateway_service import GatewayService
+from app.application.telemetry_semantics import business_operation
 from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, InteractionMessage, InteractionResponse
 from app.domain.platform import Platform
 from app.interfaces.feishu_tool_approval import (
@@ -73,6 +74,10 @@ class FeishuImAdapter:
             raise
 
     async def handle_event(self, payload: dict[str, Any]) -> None:
+        with business_operation("feishu.event", source="feishu"):
+            await self._handle_event(payload)
+
+    async def _handle_event(self, payload: dict[str, Any]) -> None:
         self._cleanup_confirmation_cache()
         if _is_card_action(payload):
             await self._handle_card_action(payload)

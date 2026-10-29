@@ -1,0 +1,64 @@
+{
+  "uid": "nkb-profile",
+  "title": "N-KB Profile",
+  "tags": [
+    "n-kb",
+    "observability"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "description": "沿用N-Agent的CPU Profile查询。仅服务级，不支持实例或逐Trace精确关联；采样关闭/时间窗无样本时无数据。",
+  "panels": [
+    {
+      "id": 1,
+      "type": "flamegraph",
+      "title": "CPU Flame Graph",
+      "datasource": {
+        "type": "grafana-pyroscope-datasource",
+        "uid": "P02E4190217B50628"
+      },
+      "gridPos": {
+        "h": 20,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-pyroscope-datasource",
+            "uid": "P02E4190217B50628"
+          },
+          "queryType": "profile",
+          "labelSelector": "{service_name=\"n-kb\"}",
+          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+          "groupBy": [],
+          "includeExemplars": false,
+          "maxNodes": 2048
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": []
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "N-KB 大盘",
+      "tags": [
+        "n-kb"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true
+    }
+  ]
+}

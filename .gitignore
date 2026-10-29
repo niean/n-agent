@@ -44,5 +44,7 @@ data/*
 __pycache__/
 docker/docker-compose.yml
 docker/.env
+docker/observability/.volumes.json
+docker/observability/.lifecycle.lock
 docker/locals/*
 docker/host-terminal-policy.yaml

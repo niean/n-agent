@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Mapping, Protocol
 
+from app.application.telemetry_semantics import business_operation
 from app.domain.delegation import (
     DelegationMember,
     DelegationMemberStatus,
@@ -139,12 +140,25 @@ class DelegationRunService:
                 member.delegation_id, reason="kill_switch"
             )
             return
-        result = await self._execute_member(claimed)
-        await self._registry.finish_member(
-            member.delegation_id, member.ordinal,
-            claim_lock=claim_lock, result=result,
-            expected_version=claimed.version,
-        )
+        # The first event is created atomically with the delegation. Never use
+        # the ambient tick context, which may belong to a different parent.
+        carrier = {}
+        try:
+            events = await self._registry.list_events(member.delegation_id, limit=1)
+            if events and events[0].kind == "created":
+                carrier = events[0].payload.get("trace_context", {}) or {}
+        except Exception:
+            pass  # Correlation lookup failure must not stop business execution.
+        with business_operation("delegation.member", source="delegation", session_id=claimed.execution_session_id,
+                                parent_carrier=carrier, identifiers={"nagent.delegation.id": member.delegation_id,
+                                "nagent.delegation.member_id": claimed.id, "nagent.delegation.role": claimed.role.value}) as facts:
+            result = await self._execute_member(claimed)
+            facts["outcome"] = result.status.value
+            await self._registry.finish_member(
+                member.delegation_id, member.ordinal,
+                claim_lock=claim_lock, result=result,
+                expected_version=claimed.version,
+            )
 
     async def _execute_member(self, member: DelegationMember) -> DelegationResult:
         try:

@@ -16,7 +16,7 @@
     - 任务：支持语音播放say。语音播放`XX，你在学习呢`，提示 host_arguments_invalid，会话ID feishu-de413dea-a5c7-483d-a6ba-fe8e4f1f361c
 
 [20261024]
-- NFR
+- FR
     - 观测：[KF]补全OTel可观测。按照业界规范，给N-Agent补全内部观测，要求遵循OTel规范。你需要设计好各种观测信号的用法、暴露方式，包括Log、Trace、Metric、Profile，我也希望借助这次任务、完整认识Agent观测
         - 观测：OTel，页面FE样式规范化，修改页面样式，使全方面遵循项目的FE样式&组件规范
         - 观测：Log，Grafana Logs大盘没数据
@@ -35,10 +35,20 @@
         - 观测：Log/Trace中，`xx other`如chat other、execute_tool other，为什么展示other、而不是真实的取值
         - HE：抽象N-Agent的观测规范，至少包括信号承载组件(如Jaeger)、打点位置(如Trace覆盖Agent执行过程)、信号和标准字段等。对于OTel规范已涵盖的，简洁介绍、同时说明出自OTel。要求必须说人话，保持极简
         - 观测：Trace，Http根Span补全Log
+        - 观测：Trace/Log，补全Http的请求和回执信息，不能以安全+白名单之名、阉割关键信息，全面检查并修复、不要casebycase
 
 [20261027]
 - FR
     - 会话：Graph，移除执行前的模型列表请求list_models，Provider配置由配管来保障
+
+[20261029]
+- FR
+    - 观测：访问nkb实现Trace串联。背景是，N-KB正在按照N-Agent的规范，接入OTel观测能力
+        - 蒸馏：Httpx的Trace传递规范，核心是Header traceparent和tracestate
+
+[20261031]
+- FR
+    - 观测：定时任务，补全定时任务应用层根Span；全面检查，补全AgentRun的入口层根Span
 
 
 ---
@@ -55,6 +65,7 @@
     - 集成：N-Agent套装，集成N-KB；发布镜像，完成一键冷启动
     - 任务：LLM请求未命中缓存读，分析原因
 - FR
+    - 观测：nkb补全观测，确保trace可连通
     - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离
     - 任务：持久化执行环境，让任务拥有快照、可恢复(如执行`sh docker/restart.sh`后自动恢复)

@@ -1,0 +1,611 @@
+{
+  "uid": "nkb-overview",
+  "title": "N-KB Overview",
+  "tags": [
+    "n-kb",
+    "observability"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": "Prometheus",
+        "includeAll": true,
+        "multi": false,
+        "query": {
+          "qryType": 1,
+          "query": "label_values(nkb_document_upload_duration_seconds_count, service_name)"
+        },
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "N-KB 大盘",
+      "tags": [
+        "n-kb"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "上传吞吐（按终态）",
+      "description": "success/error/cancelled 单列，先对每序列 rate 再汇总。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(nkb_document_uploads_total{service_name=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "上传耗时 p95",
+      "description": "覆盖全部终态；跨实例按bucket聚合，不平均实例分位数。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nkb_document_upload_duration_seconds_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "索引吞吐（按终态）",
+      "description": "success/error/cancelled 单列，先对每序列 rate 再汇总。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 15,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(nkb_index_jobs_total{service_name=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "索引耗时 p95",
+      "description": "覆盖全部终态；跨实例按bucket聚合，不平均实例分位数。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nkb_index_duration_seconds_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "检索吞吐（按终态）",
+      "description": "success/error/cancelled 单列，先对每序列 rate 再汇总。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(nkb_retrieval_requests_total{service_name=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "检索耗时 p95",
+      "description": "覆盖全部终态；跨实例按bucket聚合，不平均实例分位数。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nkb_retrieval_duration_seconds_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "MCP status吞吐（按终态）",
+      "description": "success/error/cancelled 单列，先对每序列 rate 再汇总。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(nkb_mcp_requests_total{service_name=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "MCP status耗时 p95",
+      "description": "覆盖全部终态；跨实例按bucket聚合，不平均实例分位数。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nkb_mcp_duration_seconds_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "上传错误率",
+      "description": "分母success+error，取消单列。未产生error序列或分母为零时无数据。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(nkb_document_uploads_total{service_name=~\"$service\",outcome=\"error\"}[$__rate_interval])) / (sum(rate(nkb_document_uploads_total{service_name=~\"$service\",outcome=~\"success|error\"}[$__rate_interval])) > 0)",
+          "legendFormat": "error / completed",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "索引错误率",
+      "description": "分母success+error，取消单列。未产生error序列或分母为零时无数据。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(nkb_index_jobs_total{service_name=~\"$service\",outcome=\"error\"}[$__rate_interval])) / (sum(rate(nkb_index_jobs_total{service_name=~\"$service\",outcome=~\"success|error\"}[$__rate_interval])) > 0)",
+          "legendFormat": "error / completed",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "检索错误率",
+      "description": "分母success+error，取消单列。未产生error序列或分母为零时无数据。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(nkb_retrieval_requests_total{service_name=~\"$service\",outcome=\"error\"}[$__rate_interval])) / (sum(rate(nkb_retrieval_requests_total{service_name=~\"$service\",outcome=~\"success|error\"}[$__rate_interval])) > 0)",
+          "legendFormat": "error / completed",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "索引阶段耗时 p95",
+      "description": "parse/split/embed/write，全部终态。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(nkb_index_stage_duration_seconds_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "成功索引 chunk 分布 p95",
+      "description": "仅成功索引的实际chunk数。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 6,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nkb_index_chunks_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "chunks p95",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "成功索引 chunk 速率",
+      "description": "仅成功索引chunk总量/秒。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 15,
+        "y": 23
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(nkb_index_chunks_sum{service_name=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "chunks/s",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "成功检索结果数 p95",
+      "description": "仅成功检索，0结果有独立bucket。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nkb_retrieval_results_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "results p95",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "成功检索空命中率",
+      "description": "零结果bucket / 成功结果样本数；零分母无数据。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(nkb_retrieval_results_bucket{service_name=~\"$service\",le=\"0\"}[$__rate_interval])) / (sum(rate(nkb_retrieval_results_count{service_name=~\"$service\"}[$__rate_interval])) > 0)",
+          "legendFormat": "empty / success",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Embedding 耗时 p95",
+      "description": "仅真实embedding调用；包含失败，按配置模型分组。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, gen_ai_request_model) (rate(gen_ai_client_operation_duration_seconds_bucket{service_name=~\"$service\"}[$__rate_interval])))",
+          "legendFormat": "{{gen_ai_request_model}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Embedding 输入 Token 速率",
+      "description": "Histogram sum为已知token总量，未知用量不补零。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (gen_ai_request_model) (rate(gen_ai_client_token_usage_sum{service_name=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{gen_ai_request_model}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "进程 CPU 时间速率",
+      "description": "CPU秒/秒；不等同于核数归一的CPU百分比。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 35
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_instance_id) (rate(process_cpu_time_seconds_total{service_name=~\"$service\"}[$__rate_interval]))",
+          "legendFormat": "{{service_instance_id}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "进程内存 RSS",
+      "description": "同N-Agent SystemMetricsInstrumentor的process.memory.usage。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 41
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_instance_id) (process_memory_usage_bytes{service_name=~\"$service\"})",
+          "legendFormat": "{{service_instance_id}}",
+          "exemplar": true
+        }
+      ]
+    }
+  ]
+}

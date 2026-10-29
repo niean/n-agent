@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
 # 项目教训
 
 ### P065: 信息完整性必须检查采集、投影和入库全链路
@@ -617,3 +617,31 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：tool_execution 的 record_execute_tool_duration 放在外层 finally，执行时工具 span 已退出，current span 回退为 Agent。
 - 教训：需要关联具体操作时，把 histogram 记录放在对应 span 的 finally 内；使用真实 SDK 验证 Agent/LLM/工具 exemplar 的 Trace ID 和 Span ID，不能只验证同 Trace。
 - 来源：plan-261027-tempo-correlation，tests/infrastructure/observability/test_exemplars.py（RED→GREEN）。
+
+### P066: 观测契约测试须隔离日志级别缓存
+
+- 现象：新增 N-KB Trace 测试独立通过，先于既有 HTTP 观测测试运行时，后者 11 个完成日志断言失败。
+- 根因：新测试在默认级别调用 logger.info，缓存 INFO 未启用；旧测试用 monkeypatch 直接修改 logger.level，不会触发 logging 的缓存失效机制。
+- 教训：观测测试除恢复全局传输包装、provider 绑定和注册标志外，也要隔离会被调用路径更新的日志缓存。新 fixture 临时替换目标 logger 的缓存并恢复原对象，合跑完整观测组确认顺序隔离；修改测试日志级别时优先使用 setLevel。
+- 来源：plan-261029-link-nkb-traces，相关合跑 RED 11 failed/89 passed，隔离后 GREEN 100 passed；完整观测组 224 passed/1 skipped。
+
+### P069: 后台关联必须绑定业务归属而非领取时的上下文
+
+- 现象：后台 review/Curator 可能继承触发对话；委派被前台或后台全局 tick 领取时父链不同；跨组回归还出现 HTTP 正文被提前截断。
+- 根因：asyncio 派生任务复制 OTel 上下文，清理业务 ContextVars 不等于断开 Trace；全局 tick 会领取不同委派的成员；旧测试注入4字节预算后仅恢复详情配置，遗漏 HTTP 缓冲和日志预算。
+- 教训：先定义同步父子与后台独立 Trace+Link 的边界。队列/委派在创建事务保存仅含 traceparent 的元数据，执行按所属记录恢复，缺失时独立成根而非使用领取者；真实 SDK 验证双父并发、恢复、重连、取消和错误返回。修改跨模块配置的测试必须恢复所有消费者，不能只恢复单个配置对象。
+- 来源：plan-261031-fix-agent-trace-ingress；首次入口RED 14项，状态补充RED，预算隔离最小复现RED 9项；扩大回归3996 passed/1 skipped。
+
+### P068: Agent Trace 存在不代表后台业务入口完整
+
+- 现象：定时拍照任务有 Agent Trace 和 exemplar，但根节点直接是 invoke_agent，缺少定时任务入口及后续投递。
+- 根因：只有 Agent 执行创建 Span，ScheduleRunService 未在共享 claim 入口建立覆盖整个生命周期的父 Span。
+- 教训：后台任务在业务执行入口创建 Span，跨 await 保持上下文并覆盖结果投递；同时验证自动与手动路径的真实 SDK 父子关系，不能只凭 exemplar 存在判断完整性。
+- 来源：Trace 071740bf92e0c90e32fef86b800b1e5b；test_schedule_span_contains_agent_and_delivery 两入口 RED 缺少入口 Span，修复后通过。
+
+### P067: 保留卷映射不能替代历史样本与有效配置验收
+
+- 现象：共享观测迁移复用了全部八卷，Trace/Log/Metric/Grafana固定样本一致，但Pyroscope最早61个分钟桶减少。
+- 根因：原Pyroscope为local-only；168h compactor配置未覆盖本地4h低磁盘清理。v1.21.1磁盘比例单位偏差结合不足10GiB空间，使启动清理成为高置信度原因；实际删除事件缺少旧Debug证据，不能伪称直接证明。零阈值修复也无效，因为该版本只接受正数覆盖默认值。
+- 教训：切换前保存实际挂载、历史查询及必要原始块备份；新服务就绪不代表历史完整。持久bucket与本地热数据策略分别验证，检查版本真实默认值及覆盖条件。发现不可恢复的历史缺口必须如实保留验收限制，不能用聚合快照伪造原始样本。
+- 来源：plan-261029-split-observability-stack、D079；源码核对与双端固定窗口查询。

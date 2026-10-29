@@ -27,6 +27,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol
 
+from app.application.telemetry_semantics import capture_trace_context
 from app.application.delegation_request_parser import (
     DelegationError,    DelegationRequestParser,
 )
@@ -187,6 +188,7 @@ class DelegationService:
                 budget_total_tokens=total_budget,
                 members=members,
                 snapshot=snapshot,
+                trace_context=capture_trace_context(),
             )
             delegation = await self._registry.create_or_reconnect(create_request)
         except DelegationConflictError as exc:

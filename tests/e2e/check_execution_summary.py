@@ -1,5 +1,6 @@
 """Compare delivered completion records with Tempo without printing log bodies."""
 import json
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -59,7 +60,7 @@ def read_stderr(path):
     return records
 
 
-def fetch(trace_id, start):
+def fetch(trace_id, start, compose_script=None):
     deadline = time.monotonic() + 60
     selector = '{service_name="n-agent"}'
     last_error = None
@@ -67,8 +68,15 @@ def fetch(trace_id, start):
         try:
             def query(endpoint, params):
                 url = "http://loki:3100/loki/api/v1/" + endpoint + "?" + urllib.parse.urlencode(params)
-                with urllib.request.urlopen(url, timeout=max(.1, min(5, deadline - time.monotonic()))) as response:
-                    payload = json.load(response)
+                timeout = max(.1, min(5, deadline - time.monotonic()))
+                if compose_script:
+                    raw = subprocess.check_output(
+                        ["sh", compose_script, "compose", "exec", "-T", "prometheus", "wget", "-q", "-T", "5", "-O", "-", url],
+                        timeout=timeout + 2)
+                    payload = json.loads(raw)
+                else:
+                    with urllib.request.urlopen(url, timeout=timeout) as response:
+                        payload = json.load(response)
                 assert payload.get("status") == "success", "Loki query failed"
                 return payload["data"]
             records = []
@@ -79,7 +87,7 @@ def fetch(trace_id, start):
             if len({r.get("span_id") for r in records if r.get("event") == "execution_completed" and r.get("trace_id") == trace_id and execution_fields(r).get("request_id")}) == 4:
                 series = query("series", {"match[]": selector, "start": start, "end": str(time.time_ns())})
                 return {"records": records, "series": series}
-        except (OSError, ValueError, AssertionError) as error:
+        except (OSError, ValueError, AssertionError, subprocess.SubprocessError) as error:
             last_error = type(error).__name__
         time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise SystemExit("Loki completion delivery timed out (60s; error class: %s)" % last_error)
@@ -87,7 +95,7 @@ def fetch(trace_id, start):
 
 if __name__ == "__main__":
     if sys.argv[1] == "fetch":
-        print(json.dumps(fetch(sys.argv[2], sys.argv[3]), ensure_ascii=False))
+        print(json.dumps(fetch(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None), ensure_ascii=False))
     else:
         trace = json.load(open(sys.argv[2]))
         if sys.argv[1] == "stderr":

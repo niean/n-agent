@@ -6,7 +6,7 @@
 #   - Tempo /api/search and /api/traces/{id} via loopback 127.0.0.1:3200;
 #     OTLP JSON normalization is handled by tempo_query.py.
 #   - Prometheus / Pyroscope / Grafana: Prometheus has NO host port and is
-#     queried from inside the n-agent container over the compose network;
+#     queried from inside the independent observability project;
 #     Grafana/Pyroscope are queried on their 127.0.0.1 host bindings
 #
 # Self-gating (plan item 23):
@@ -15,7 +15,7 @@
 #       N_AGENT_PROFILING_ENABLED -> Profile (Pyroscope) assertion set
 #   - with both switches off the script asserts the disabled behavior of
 #     the self-check API and exits 0, so `run.sh all` stays green for
-#     users without the observability profile.
+#     users without the shared observability stack.
 #
 # Deterministic fixture: a fixed fake OpenAI-compatible LLM server runs
 # INSIDE the n-agent container (127.0.0.1:9999) and is wired through the
@@ -82,6 +82,7 @@ CHAT_FINISH=""
 # ---------------------------------------------------------------------------
 
 compose() { (cd "$DOCKER_DIR" && docker compose "$@"); }
+obs_compose() { sh "$DOCKER_DIR/observability/restart.sh" compose "$@"; }
 
 fail() {
   echo "FAIL: $*" >&2
@@ -158,16 +159,9 @@ recreate_nagent() { # recreate only n-agent to apply docker/.env changes
 # ---------------------------------------------------------------------------
 
 prom_query_raw() { # prom_query_raw <promql> -> raw JSON on stdout
-  compose exec -T n-agent python3 - "$1" <<'PY'
-import sys
-import urllib.parse
-import urllib.request
-
-query = sys.argv[1]
-url = "http://prometheus:9090/api/v1/query?" + urllib.parse.urlencode({"query": query})
-with urllib.request.urlopen(url, timeout=15) as resp:
-    print(resp.read().decode())
-PY
+  local url
+  url="$(python3 -c 'import sys, urllib.parse; print("http://localhost:9090/api/v1/query?" + urllib.parse.urlencode({"query":sys.argv[1]}))' "$1")"
+  obs_compose exec -T prometheus wget -q -T 15 -O - "$url"
 }
 
 prom_sum() { # prom_sum <promql> -> float (sum over series; 0 when absent)
@@ -818,8 +812,7 @@ check_execution_summaries() {
   local trace_file="$1" since="$2"
   python3 "$SCRIPT_DIR/check_execution_summary.py" stderr "$trace_file" "$TMP_DIR/nagent-stderr.log" \
     || fail "stderr execution summaries differ from Tempo spans"
-  compose exec -T n-agent python - fetch "$TRACE_ID" "$since" \
-    < "$SCRIPT_DIR/check_execution_summary.py" > "$TMP_DIR/loki-summary.json" \
+  python3 "$SCRIPT_DIR/check_execution_summary.py" fetch "$TRACE_ID" "$since" "$DOCKER_DIR/observability/restart.sh" > "$TMP_DIR/loki-summary.json" \
     || fail "Loki completion delivery failed"
   assert_no_sentinel "$TMP_DIR/loki-summary.json" "Loki completion logs"
   python3 "$SCRIPT_DIR/check_execution_summary.py" loki "$trace_file" "$TMP_DIR/loki-summary.json" \
@@ -911,21 +904,10 @@ print(trace['traceId'])
   echo "[otel-smoke] checking Prometheus exemplar -> Tempo Trace -> Loki"
   local exemplar_attempt exemplar_ok=0
   for exemplar_attempt in $(seq 1 "$PROM_POLL_ATTEMPTS"); do
-    if compose exec -T n-agent python - "$TRACE_ID" <<'PYEX'
-import json
-import sys
-import time
-from urllib.parse import urlencode
-from urllib.request import urlopen
-trace_id = sys.argv[1]
-query = urlencode({"query": 'gen_ai_invoke_agent_duration_seconds_bucket{service_name="n-agent"}',
-                   "start": time.time() - 600, "end": time.time()})
-with urlopen("http://prometheus:9090/api/v1/query_exemplars?" + query, timeout=5) as response:
-    payload = json.load(response)
-assert payload["status"] == "success"
-assert any(e.get("labels", {}).get("trace_id") == trace_id
-           for series in payload["data"] for e in series.get("exemplars", [])), "matching exemplar not ready"
-PYEX
+    local exemplar_url exemplar_json
+    exemplar_url="$(python3 -c 'import time, urllib.parse; print("http://localhost:9090/api/v1/query_exemplars?" + urllib.parse.urlencode({"query": "gen_ai_invoke_agent_duration_seconds_bucket{service_name=\"n-agent\"}", "start": time.time()-600, "end": time.time()}))')"
+    if exemplar_json="$(obs_compose exec -T prometheus wget -q -T 5 -O - "$exemplar_url")" \
+      && python3 -c 'import json,sys; p=json.loads(sys.argv[1]); assert p["status"] == "success"; assert any(e.get("labels",{}).get("trace_id")==sys.argv[2] for s in p["data"] for e in s.get("exemplars",[]))' "$exemplar_json" "$TRACE_ID"
     then
       exemplar_ok=1
       break
@@ -976,7 +958,7 @@ PY
   # collector stdout keeps the structured body + correlation fields
   local collector_ok=1
   for i in $(seq 1 30); do
-    compose logs otel-collector --since "$t_turn" > "$TMP_DIR/collector.log" 2>/dev/null || true
+    obs_compose logs otel-collector --since "$t_turn" > "$TMP_DIR/collector.log" 2>/dev/null || true
     if grep -q "llm_api_call" "$TMP_DIR/collector.log" \
       && grep -qF "$TRACE_ID" "$TMP_DIR/collector.log"; then
       collector_ok=0
@@ -1173,16 +1155,16 @@ run_persistence_checks() {
   local before prom_id pyro_id
   # global sum across instances: history from earlier runs must survive
   before="$(prom_sum "sum(nagent_turns_total)")"
-  prom_id="$(compose ps -q prometheus)"
-  pyro_id="$(compose ps -q pyroscope)"
-  [ -n "$prom_id" ] || fail "prometheus container not running (observability profile required)"
+  prom_id="$(obs_compose ps -q prometheus)"
+  pyro_id="$(obs_compose ps -q pyroscope)"
+  [ -n "$prom_id" ] || fail "prometheus container not running (shared observability deployment required)"
   [ -n "$pyro_id" ] || fail "pyroscope container not running"
   local before_ms
   before_ms="$(now_ms)"
   docker restart "$prom_id" "$pyro_id" >/dev/null || fail "observability container restart failed"
   local i ready=1
   for i in $(seq 1 60); do
-    if compose exec -T prometheus wget -q -O - "http://localhost:9090/-/ready" >/dev/null 2>&1; then
+    if obs_compose exec -T prometheus wget -q -O - "http://localhost:9090/-/ready" >/dev/null 2>&1; then
       ready=0
       break
     fi

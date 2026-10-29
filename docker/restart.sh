@@ -89,6 +89,13 @@ recover_stale_port_proxy() {
 # Host hardware access runs outside Docker. Fail before disrupting healthy
 # containers when the enabled bridge cannot start; repeated starts are idempotent.
 python3 "$SCRIPT_DIR/../host/terminal-host.py" start
+# Validate before touching resources. Shared observability has an independent
+# lifecycle; business restarts only ensure its external transport network.
+docker compose config --quiet
+if ! docker network inspect n-telemetry >/dev/null 2>&1; then
+    docker network create --driver bridge n-telemetry >/dev/null 2>&1 \
+        || docker network inspect n-telemetry >/dev/null
+fi
 docker compose down --timeout "$COMPOSE_STOP_TIMEOUT"
 # Compose can occasionally leave a stopped service container behind after
 # down. Remove any such containers before up reuses their generated names.

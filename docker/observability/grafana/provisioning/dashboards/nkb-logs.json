@@ -1,0 +1,153 @@
+{
+  "uid": "nkb-logs",
+  "title": "N-KB Logs",
+  "tags": [
+    "n-kb",
+    "observability"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 41,
+  "version": 1,
+  "refresh": "",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "P8E80F9AEF21F6940"
+        },
+        "includeAll": true,
+        "allValue": ".+",
+        "multi": false,
+        "refresh": 1,
+        "query": {
+          "type": 1,
+          "label": "service_name",
+          "refId": "LokiVariableQuery"
+        },
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "N-KB 大盘",
+      "tags": [
+        "n-kb"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true
+    }
+  ],
+  "panels": [
+    {
+      "id": 3,
+      "title": "Log rate (all vs error)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "loki",
+        "uid": "P8E80F9AEF21F6940"
+      },
+      "description": "OTLP资源service_instance_id为Loki结构化元数据/默认资源label；TraceID字段通过既有derivedFields返回Tempo。",
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate({service_name=~\"$service\"}[5m]))",
+          "legendFormat": "all",
+          "datasource": {
+            "type": "loki",
+            "uid": "P8E80F9AEF21F6940"
+          },
+          "queryType": "range",
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate({service_name=~\"$service\"} |= \"ERROR\" [5m]))",
+          "legendFormat": "error",
+          "datasource": {
+            "type": "loki",
+            "uid": "P8E80F9AEF21F6940"
+          },
+          "queryType": "range",
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "title": "Application logs",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "P8E80F9AEF21F6940"
+      },
+      "description": "OTLP资源service_instance_id为Loki结构化元数据/默认资源label；TraceID字段通过既有derivedFields返回Tempo。",
+      "gridPos": {
+        "h": 18,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=~\"$service\"}",
+          "datasource": {
+            "type": "loki",
+            "uid": "P8E80F9AEF21F6940"
+          },
+          "queryType": "range",
+          "editorMode": "code"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Errors only",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "P8E80F9AEF21F6940"
+      },
+      "description": "OTLP资源service_instance_id为Loki结构化元数据/默认资源label；TraceID字段通过既有derivedFields返回Tempo。",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=~\"$service\"} |= \"ERROR\"",
+          "datasource": {
+            "type": "loki",
+            "uid": "P8E80F9AEF21F6940"
+          },
+          "queryType": "range",
+          "editorMode": "code"
+        }
+      ]
+    }
+  ]
+}

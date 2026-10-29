@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from app.application.telemetry_semantics import business_operation
 
 if TYPE_CHECKING:
     from app.application.chat_service import ChatCompletionInput
@@ -111,6 +112,20 @@ class SkillEvolutionService:
             self._in_flight -= 1
 
     async def run_background_review(
+        self, session_id: str, digest: str, prompt: str | None = None,
+        max_iterations: int | None = None, timeout_seconds: int | None = None,
+        allow_toolsets: set[str] | None = None, ingress_source: str | None = None,
+        *, _within_curator: bool = False,
+    ) -> BackgroundReviewResult:
+        with business_operation("skill.review", source=ingress_source or "other", session_id=session_id,
+                                detached=not _within_curator) as facts:
+            result = await self._run_background_review(session_id, digest, prompt, max_iterations,
+                                                       timeout_seconds, allow_toolsets, ingress_source)
+            if result.error:
+                facts["outcome"] = "failed"
+            return result
+
+    async def _run_background_review(
         self,
         session_id: str,
         digest: str,
@@ -179,6 +194,8 @@ class SkillEvolutionService:
                 self.chat.complete(request),
                 timeout=used_timeout,
             )
+            if getattr(result, "finish_reason", None) == "error":
+                return BackgroundReviewResult(error="background_review_agent_failed")
             return _extract_review_result(result)
         except Exception as e:
             logger.warning(

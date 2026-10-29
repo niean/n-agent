@@ -1412,7 +1412,7 @@ OTel span/usage 的生命周期权威必须与业务生命周期同侧，否则�
 
 1. caller-owns-end：业务调用方持有 Span 作用域；`telemetry_semantics.py` 的 contextmanager 创建并绑定 Span，在 finally 中结束和恢复上下文。业务完成日志与关联指标须在结束前记录。Infrastructure 的 SDK flush/shutdown 不替代业务作用域的结束职责。
 2. ChatAttempt 状态机：一次 Provider 真实往返对应恰好一次 ChatAttempt 进入；LLM 客户端（openai_compatible/anthropic_provider）max_retries=0，重试交由上层策略，保证 usage token/duration 不跨 attempt 混算。hook 接口（ChatAttemptHook/ProviderTelemetryCallback，infrastructure/llm/telemetry_hook.py）由两个 provider 共享消费，NoopChatAttempt 提供 OTel 禁用时的零成本回退——Application 不感知 hook 存在。
-3. HTTP -> Agent 连续 Trace：对话入口的 HTTP SERVER Span 为 invoke_agent INTERNAL Span 的父级；两者及后续模型/工具沿用同一 trace_id。无 HTTP 父级的 CLI/后台 Agent 自然成为根。SSE 断连后的运行可继续，仍保留最初 HTTP 父 Span 的关联，不因 HTTP 已结束而重建 Trace。自动采集代理须继承 OTel API Span，确保 SDK 能读到有效的当前 Span。测试按 Agent 子树汇总，避免将同一 HTTP 下的标题生成等辅助调用算入 Agent 次数。
+3. HTTP -> Agent 连续 Trace：对话入口的 HTTP SERVER Span 为 invoke_agent INTERNAL Span 的父级；两者及后续模型/工具沿用同一 trace_id。CLI/后台工作由应用业务入口 Span 包裹 Agent，具体边界见模式四十九与 `07-observability.md`。SSE 断连后的运行可继续，仍保留最初 HTTP 父 Span 的关联，不因 HTTP 已结束而重建 Trace。自动采集代理须继承 OTel API Span，确保 SDK 能读到有效的当前 Span。测试按 Agent 子树汇总，避免将同一 HTTP 下的标题生成等辅助调用算入 Agent 次数。
 
 ## 模式四十七：观测失败永不破坏业务 + 敏感出口三重封口 + 组装根防泄漏
 
@@ -1425,10 +1425,10 @@ HTTP 完成日志：两个对话入口的 HTTP SERVER Span 在结束前只记一
 可观测是横切能力，其失败语义与安全边界必须独立于业务主流程：
 
 1. observability-failure-never-breaks-business：telemetry facade 全路径 best-effort——OTel SDK 未装配/异常、span 属性设置失败、exporter 不可达，一律吞掉只留日志；对话、工具执行、上下文压缩在 OTel 任何一级故障下行为不变。OTel 禁用时 facade 退化为 NoopSpan（set_attribute/set_status 全 no-op），业务代码无需条件分支。
-2. 敏感出口三重封口：opt-in 敏感属性（gen_ai.input/output.messages、tool.call.arguments/result、system_instructions、tool.definitions）不采集，由三处独立白名单封口——(a) tracer 级属性白名单（facade 只 set 显式枚举的 gen_ai.*/nagent.* 键）；(b) ring buffer `_RING_BUFFER_ALLOWED_ATTR_KEYS` 精确枚举 key 集合（setup.py，快照只投影白名单键）；(c) 日志 formatter 统一脱敏限长（logging.py，注册表负责稳定事件名，未注册可读正文保留；仅过滤明确重复的低级别库噪声）。新增可导出属性必须三处同步评审。
+2. 敏感出口三重封口：原始凭据、媒体和未脱敏正文不得进入观测出口；gen_ai.input/output.messages、tool.call.arguments/result、system_instructions、tool.definitions 等原始敏感属性不直接放行。业务正文只经显式 `nagent.details.*` 通道统一脱敏限长后进入 Log/Span；ring buffer、Metric、Profile 不带业务正文。各出口以精确枚举字段分别审查，不按 `gen_ai.`/`nagent.` 前缀授权。日志注册表只决定稳定事件名，未注册但有效的脱敏内容仍保留；仅过滤明确重复或空占位噪声。权威规则见 `07-observability.md`。
 3. injected-callable snapshot：Interfaces 不 import observability 内部——Dashboard `GET /chat/observations/otel` 只消费组装根注入的 snapshot callable，响应键由 `_OTEL_SNAPSHOT_KEYS` 九键白名单 + 字段 cap 限定；观测内部结构（handle 字段、ring buffer 实现）不在 API 合同中，重构内部不破坏接口。
 4. 组装根防句柄泄漏：`configure_observability` 幂等发布——handle 持 `_published` 标志，已发布的 provider 集不重复 set TracerProvider/MeterProvider/LoggerProvider；`_published` 缓存防止 create_app 与 application_runtime 在同进程先后进入时（如测试装配）旧 handle shutdown 泄漏全局 provider 或新 handle 被旧引用覆盖。`application_runtime` contextmanager（main.py）统一 configure -> build -> yield -> shutdown（含异常路径），CLI chat/ACP 与 HTTP 进程共享同一装配语义。
-5. 哨兵测试锁定敏感面：`tests/architecture/test_observability_secret_sentinels.py` 用静态/运行时哨兵断言敏感载荷不出现在任何采集、缓冲、导出路径——敏感数据出口不靠评审维持，靠测试维持。
+5. 哨兵测试锁定敏感面：`tests/architecture/test_observability_secret_sentinels.py` 用静态/运行时哨兵断言原始凭据和未脱敏载荷不进入任何出口；允许正文的出口另验证脱敏投影，ring buffer/Metric/Profile 则验证零业务正文。每个独立出口都要测试，不能用一个导出器的通过结果替代其他出口。
 6. 自检页外链 C 类运行时配置复用 task_config 模式：B 类 env 默认值（otel_grafana_*_base_url/otel_jaeger_base_url）之上叠加 sessions.db 单行表 `otel_link_config`（id=1 CHECK/config_json 三态 overrides：缺席=沿用 env、null=显式清空隐藏、非空=覆盖/version CAS/updated_at/updated_by）；Domain 纯模型+端口 -> SQLite store 严格解析+单事务 CAS -> Application `current()` 热重载 read-through（异常降级 last-known-good/env）与 `update()` 合并-CAS-审计链 -> 审计 sink 脱敏投影 -> GET/PATCH `/chat/observations/otel/links` no-store + invalid/conflict/load_failed 三错误码 -> dashboard.py snapshot 响应合并 links 字段（service 可选注入，未注入行为不变）。新增同类"少量标量运行时配置"时按此模板复制，不另造模式。
 
 7. 上下文现场 + 共享脱敏正文恢复（spec-261027）：每条日志（stderr JSON + OTel projection + span event）携带实时执行现场与插值后可读、已脱敏的正文/异常。a) 实时现场 `_scene_var` ContextVar 在 agent_run/iteration_scope/tool_execution/ChatAttempt 作用域发布（`_SCENE_OPERATION_MASK` 阻子操作继承父现场、scope token 退出 reset 恢复），`execution_log_snapshot()={scene,completion,execution_ids}`。b) 纯函数 LogSanitizer（固定规则 + 注入密钥目录 + 原子版本快照 + `[REDACTED]` 全量不可逆）跨 Log 与 span 属性共享，main.py `_wire_log_sanitizer` 从 information_flow_service.secrets.secret_values 读目录后原子发布。c) 正文恢复有守卫：启动即安装基础 sanitizer，默认保留脱敏正文/异常，未注册日志使用通用事件名；密钥目录在服务装配时补充。d) span 属性经注入的安全 callable（`configure_span_attribute_sanitizer`）`_set_attr` 先脱敏再写，bridge 把脱敏正文/异常以 span event（事件码为 name、扁平点式属性、created 纳秒时间戳）附着活跃 span。e) 封口收敛：环状缓冲/指标/Profile 仍零正文（白名单 key），Log 与 span event 放口到"脱敏正文"。新增日志敏感出口时必须复用 LogSanitizer 并审阅三重封口边界。
@@ -1442,3 +1442,9 @@ Policy 审计由 `LoggingPolicyAuditSink` 使用固定 `policy_decision %s` 模�
 正文默认每项 2048 字节；流式响应独立有界累积，超限或不完整时保留脱敏限长前缀与诚实元数据，finish 释放缓存。未知长度不伪造数值；HTTP auto span 允许统一投影详情，ring buffer/metrics/Profile 仍不携带正文。
 
 Agent 模型选择不调用远程 `list_models`，也不维护模型列表缓存：直接读取当前 Provider 配置中的模型、Provider ID 与视觉能力。OpenAI-compatible 工具支持沿用适配器默认值 True，远程模型列表不提供额外能力事实。模型发现仅用于模型管理页、`/models` 命令及对外模型列表接口，不能作为每次 Agent 执行的前置网络依赖。
+
+## 模式四十九：业务入口生命周期与异步 Trace 归属
+
+应用业务入口的生命周期观测统一使用 `telemetry_semantics.business_operation`。同步入口保留父子关系；独立后台工作用新 Trace + Link；持久化委派只从所属创建事件恢复 traceparent，不能继承领取 tick 的上下文。固定操作名称、覆盖范围及旧记录行为以 `07-observability.md` 为权威，事件载体以 `04-data-boundaries.md` 为权威。
+
+通用验收复用 `07-observability.md` 的“验收清单”：不仅断言 Span 存在，还核对真实 SDK 的直接父级、Link、采样和 exemplar 的双 ID，后端查询关联及历史样本另留证据。异步隔离分别处理业务现场与 OTel 上下文，错误返回与异常同样纳入状态判断，配置测试恢复所有被修改的消费者。

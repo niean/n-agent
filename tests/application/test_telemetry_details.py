@@ -109,8 +109,11 @@ def test_main_injects_catalog_and_budget(monkeypatch):
     from types import SimpleNamespace
     from app.main import _wire_log_sanitizer
     from app.infrastructure.observability import logging as obs
+    from app.infrastructure.observability import http_capture
     from app.application import telemetry_semantics as ts
     monkeypatch.setattr(obs, '_sanitizer', obs._sanitizer)
+    monkeypatch.setattr(obs, '_content_max_bytes', obs._content_max_bytes)
+    monkeypatch.setattr(http_capture, '_content_limit', http_capture._content_limit)
     monkeypatch.setattr(ts, '_span_attr_sanitizer', ts._span_attr_sanitizer)
     _wire_log_sanitizer(SimpleNamespace(secrets=SimpleNamespace(secret_values={'secret'})), max_bytes=4)
     result = project_details(error='secret!')['error']

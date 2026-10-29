@@ -14,6 +14,7 @@ from app.application.policy_snapshot import IngressFacts
 from app.application.schedule_service import ScheduledTaskCreateInput, ScheduleService
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService
+from app.application.telemetry_semantics import business_operation
 from app.domain.gateway import (
     GatewayConfirmationAction,
     GatewayConfirmationChoice,
@@ -450,10 +451,17 @@ class GatewayService:
         return self.gateway_policy.evaluate_inbound(policy_request)
 
     async def handle_message(
+        self, event: InteractionMessage, *, approval_decider: ApprovalDecider | None = None,
+    ) -> InteractionResponse:
+        with business_operation("gateway.message", source=event.session_key.source_value) as facts:
+            return await self._handle_message(event, approval_decider=approval_decider, _trace_facts=facts)
+
+    async def _handle_message(
         self,
         event: InteractionMessage,
         *,
         approval_decider: ApprovalDecider | None = None,
+        _trace_facts: dict | None = None,
     ) -> InteractionResponse:
         message_id = str(event.metadata.get("message_id", ""))
         processed = await self.registry.mark_event_processed(event.session_key.source_value, event.id, message_id)
@@ -497,6 +505,8 @@ class GatewayService:
             )
         )
         assert isinstance(result, ChatCompletionResult)
+        if result.finish_reason == "error" and _trace_facts is not None:
+            _trace_facts["outcome"] = "failed"
         return _response(result.session_id, str(result.message.get("content", "")))
 
     async def handle_confirmation(
@@ -517,6 +527,27 @@ class GatewayService:
         )
 
     async def handle_message_stream(
+        self, event: InteractionMessage, *, model_override: str | None = None,
+        options_override: dict[str, Any] | None = None,
+        trusted_metadata_override: dict[str, Any] | None = None,
+        approval_decider: ApprovalDecider | None = None,
+        allowed_confirm_tools_override: dict[str, Any] | None = None,
+    ) -> AsyncIterator[ChatEvent]:
+        with business_operation("gateway.message", source=event.session_key.source_value) as facts:
+            stream = self._handle_message_stream(
+                event, model_override=model_override, options_override=options_override,
+                trusted_metadata_override=trusted_metadata_override, approval_decider=approval_decider,
+                allowed_confirm_tools_override=allowed_confirm_tools_override,
+            )
+            try:
+                async for item in stream:
+                    if item.type is ChatEventType.ERROR:
+                        facts["outcome"] = "cancelled" if item.finish_reason == "cancelled" else "failed"
+                    yield item
+            finally:
+                await stream.aclose()
+
+    async def _handle_message_stream(
         self,
         event: InteractionMessage,
         *,
@@ -611,8 +642,11 @@ class GatewayService:
             )
             yield ChatEvent(ChatEventType.DONE)
             return
-        async for evt in stream:
-            yield evt
+        try:
+            async for evt in stream:
+                yield evt
+        finally:
+            await stream.aclose()
 
     def discard_confirmation(self, confirmation_id: str) -> None:
         self.command_service.discard_confirmation(confirmation_id)

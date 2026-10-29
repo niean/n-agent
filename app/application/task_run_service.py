@@ -47,6 +47,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.task_session import task_execution_session_id
+from app.application.telemetry_semantics import business_operation
 from app.domain.policy import PolicyOutcome
 from app.domain.task import (
     ClaimResult,
@@ -446,6 +447,12 @@ class TaskRunService:
         run_id: int,
         claim_lock: str,
     ) -> None:
+        with business_operation("task.run", source="task", session_id=task_execution_session_id(task), run_id=str(run_id), detached=True,
+                                identifiers={"nagent.task.id": task.id, "nagent.task.run_id": run_id}) as facts:
+            outcome = await self._run_claim(task, run_id, claim_lock)
+            facts["outcome"] = outcome
+
+    async def _run_claim(self, task: Task, run_id: int, claim_lock: str) -> str:
         """Execute a single claim with hard timeout and CAS finalize.
 
         This is the worker entry point called by the dispatcher's spawn.
@@ -488,6 +495,7 @@ class TaskRunService:
             )
 
         await self._finalize_run(task, run_id, claim_lock, agent_result)
+        return agent_result.status.value
 
     async def _execute_task(self, task: Task, run_id: int, claim_lock: str):
         """Run the executor, handling goal_mode vs single-turn."""

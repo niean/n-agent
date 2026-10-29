@@ -49,7 +49,9 @@ from app.application.telemetry_details import (
 
 from opentelemetry import trace
 from opentelemetry import metrics
-from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.context import Context
+from opentelemetry.trace import Link, SpanKind, Status, StatusCode
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 SEMCONV_VERSION = "semantic-conventions-genai main @ 2026-10-24 (Development)"
 
@@ -188,6 +190,11 @@ def _complete(span, operation, start, *, details=None, **facts):
             summary = (f"Agent 执行：{outcome}，结束原因 {facts.get('end_reason', 'other')}，"
                        f"输入消息 {facts.get('message_count', '未知')} 条，模型调用 {facts.get('inference_calls', 0)} 次，"
                        f"工具调用 {facts.get('tool_calls', 0)} 次；{tokens}；耗时 {duration:.1f} ms。")
+        elif operation == "schedule.execute":
+            summary = (f"定时任务执行：{outcome}，"
+                       f"投递状态 {facts.get('delivery_status', '未投递')}；耗时 {duration:.1f} ms。")
+        elif operation in _BUSINESS_OPERATIONS:
+            summary = f"{_BUSINESS_OPERATIONS[operation]}：{outcome}；耗时 {duration:.1f} ms。"
         elif operation == "chat":
             summary = (f"模型调用 {facts.get('model', 'other')}（{facts.get('provider', 'other')}）：{outcome}，"
                        f"上下文消息 {facts.get('message_count', '未知')} 条，结束原因 {facts.get('finish_reason', '未知')}；"
@@ -410,7 +417,7 @@ _KNOWN_PROVIDERS = frozenset({
 
 _KNOWN_SOURCES = frozenset({
     "api", "cli", "acp", "dashboard", "chat", "http", "task", "schedule",
-    "feishu", "dingtalk", "wecom", "curator",
+    "feishu", "dingtalk", "wecom", "curator", "delegation",
 })
 
 _KNOWN_OUTCOMES = frozenset({
@@ -701,6 +708,9 @@ def _reset_registries_for_tests() -> None:
 class _NoopSpan(trace.NonRecordingSpan):
     """Non-recording fallback span (subclass of the API's own type)."""
 
+    def __init__(self):
+        super().__init__(trace.INVALID_SPAN_CONTEXT)
+
     def set_attribute(self, *_args, **_kwargs) -> None:  # pragma: no cover
         pass
 
@@ -753,9 +763,9 @@ def _mark_span_error(span, exc: BaseException) -> None:
         pass
 
 
-def _start_span(name: str, kind: SpanKind):
+def _start_span(name: str, kind: SpanKind, **kwargs):
     try:
-        span = get_tracer().start_span(name, kind=kind)
+        span = get_tracer().start_span(name, kind=kind, **kwargs)
         ids = _execution_ids.get() or {}
         for key, attribute in (("session_id", GEN_AI_CONVERSATION_ID), ("request_id", NAGENT_RUN_ID), ("source", NAGENT_SOURCE)):
             if key in ids:
@@ -789,6 +799,130 @@ def _end_span(span) -> None:
         span.end()
     except Exception:
         pass
+
+
+@contextmanager
+def business_operation(operation, *, source=None, session_id=None, run_id=None,
+                       identifiers=None, detached=False, parent_carrier=None):
+    """Own an application lifecycle; detached work links to its trigger.
+
+    Explicit carriers never fall back to the worker/tick's ambient context.
+    Only trusted server identifiers and bounded outcomes reach telemetry.
+    """
+    if operation not in _BUSINESS_OPERATIONS:
+        raise ValueError("unknown business telemetry operation")
+    kwargs = {}
+    try:
+        if parent_carrier is not None:
+            kwargs["context"] = _extract_trace_context(parent_carrier)
+        elif detached:
+            parent = trace.get_current_span().get_span_context()
+            kwargs["context"] = Context()
+            if parent.is_valid:
+                kwargs["links"] = [Link(parent)]
+    except Exception:
+        kwargs = {"context": Context()} if detached or parent_carrier is not None else {}
+    variables = (_iteration_var, _run_stats_var, _execution_ids, _completion, _message_count, _scene_var)
+    cleared = [(variable, variable.set(None)) for variable in variables]
+    ids = {k: v for k, v in {"source": map_source(source) if source else None,
+           "session_id": _safe_id(session_id), "request_id": _safe_id(run_id)}.items() if v is not None}
+    _execution_ids.set(ids)
+    _scene_var.set({"operation": operation})
+    span = _start_span(operation, SpanKind.INTERNAL, **kwargs)
+    for key, value in (identifiers or {}).items():
+        if key in _BUSINESS_IDENTIFIERS:
+            _set_attr(span, key, _safe_id(str(value)) or "other")
+    facts = {}
+    start = time.monotonic()
+    try:
+        with _span_scope(span):
+            try:
+                yield facts
+            except (asyncio.CancelledError, GeneratorExit):
+                facts["outcome"] = "cancelled"
+                raise
+            except BaseException as exc:
+                facts["outcome"] = "error"
+                _mark_span_error(span, exc)
+                raise
+            finally:
+                outcome = facts.get("outcome", "success")
+                outcome = outcome if outcome in _BUSINESS_OUTCOMES else "other"
+                if outcome in {"error", "failed", "timed_out", "crashed"}:
+                    try:
+                        span.set_status(Status(StatusCode.ERROR))
+                    except Exception:
+                        pass
+                _complete(span, operation, start, outcome=outcome)
+    finally:
+        _end_span(span)
+        for variable, token in reversed(cleared):
+            variable.reset(token)
+
+
+_BUSINESS_OPERATIONS = {
+    "gateway.message": "网关消息处理", "feishu.event": "飞书事件处理",
+    "task.run": "后台任务执行", "delegation.member": "委派成员执行",
+    "skill.review": "技能后台审查", "curator.run": "技能整理执行",
+}
+_BUSINESS_IDENTIFIERS = frozenset({
+    "nagent.task.id", "nagent.task.run_id", "nagent.delegation.id",
+    "nagent.delegation.member_id", "nagent.delegation.role",
+})
+_BUSINESS_OUTCOMES = frozenset({
+    "success", "succeeded", "completed", "failed", "timed_out", "crashed",
+    "cancelled", "error", "blocked", "skipped", "aborted", "waiting_approval",
+})
+
+
+def capture_trace_context():
+    """Capture only W3C traceparent, never baggage, user data or credentials."""
+    try:
+        carrier = {}
+        TraceContextTextMapPropagator().inject(carrier)
+        return {"traceparent": carrier["traceparent"]} if "traceparent" in carrier else {}
+    except Exception:
+        return {}
+
+
+def _extract_trace_context(carrier):
+    try:
+        value = carrier.get("traceparent", "") if isinstance(carrier, dict) else ""
+        if not isinstance(value, str) or not re.fullmatch(r"00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}", value):
+            return Context()
+        return TraceContextTextMapPropagator().extract({"traceparent": value}, context=Context())
+    except Exception:
+        return Context()
+
+
+@contextmanager
+def schedule_execution_span(task_id: str, session_id: str, claim_id: str):
+    """Keep the schedule lifecycle current through agent execution and delivery."""
+    span = _start_span("schedule.execute", SpanKind.INTERNAL)
+    _set_attr(span, NAGENT_SOURCE, "schedule")
+    _set_attr(span, GEN_AI_CONVERSATION_ID, _safe_id(session_id) or "other")
+    _set_attr(span, "nagent.schedule.task_id", _safe_id(task_id) or "other")
+    _set_attr(span, "nagent.schedule.claim_id", _safe_id(claim_id) or "other")
+    result = {}
+    start = time.monotonic()
+    try:
+        with _span_scope(span):
+            try:
+                yield result
+            except BaseException:
+                result["status"] = "error"
+                raise
+            finally:
+                _complete(span, "schedule.execute", start,
+                          outcome=result.get("status", "unknown"),
+                          delivery_status=result.get("delivery_status"))
+                if result.get("delivery_status"):
+                    _set_attr(span, "nagent.schedule.delivery_status", result["delivery_status"])
+    except BaseException as exc:
+        _mark_span_error(span, exc)
+        raise
+    finally:
+        _end_span(span)
 
 
 @contextmanager

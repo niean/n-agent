@@ -214,26 +214,28 @@
 
 - OTel（OpenTelemetry）：N-Agent 内部观测的标准协议族，覆盖 Log/Trace/Metric/Profile 四信号，经 OTLP 导出到后端栈；Domain 零 OTel 依赖，SDK 隔离在 Infrastructure。
 - GenAI semconv：OTel GenAI 语义约定（草案优先、无双层结构）。N-Agent 遵循草案命名：span invoke_agent n-agent / chat {model} / execute_tool {tool} / compress；属性优先 gen_ai.*（gen_ai.operation.name、gen_ai.request.model、gen_ai.usage.input_tokens 等），nagent.* 仅补充 GenAI 未覆盖的项目信号，不提供敏感属性的双层等价物。
-- invoke_agent span：一次 Agent 运行的根 span（name `invoke_agent n-agent`，SpanKind INTERNAL），经 context detach 成为独立 trace 根；调用方拥有 end（caller-owns-end）。
+- invoke_agent span：一次 Agent 运行的操作 Span（name `invoke_agent n-agent`，SpanKind INTERNAL），通常位于接口或应用业务入口 Span 下，不等同于整条 Trace 的根；调用方负责生命周期，遵循 caller-owns-end。
+- 业务入口 Span：接口或应用层对一次业务用例的观测边界，覆盖准入、编排、Agent 和必要收尾；本地入口可继承有效上游父级，因此不要求它总是全局 Trace 根。具体名称与范围见 `07-observability.md`。
+- Span Link：表达操作间因果关联的引用，不是 parent_span_id。独立后台任务可用新 Trace + Link 关联触发者；同一业务流程内的同步子操作仍使用父子关系。
 - chat span：单次 Provider 往返 span（name `chat {model}`，SpanKind CLIENT），由 ChatAttempt 状态机驱动，携带 usage input/output tokens 与 finish reasons；LLM 客户端 max_retries=0 保证一 attempt 一 span。
 - execute_tool span：单次工具执行 span（name `execute_tool {tool}`，INTERNAL）；ToolPolicy deny/budget deny 不执行 executor，走 record_tool_denial/record_budget_denied 计数。
 - ChatAttempt：Application 层 usage 记录状态机（telemetry_semantics.py），一次 Provider 真实往返对应一次进入；hook 接口 ChatAttemptHook 由 Infrastructure telemetry_hook.py 的 ChatAttemptHook/ProviderTelemetryCallback 实现，openai_compatible 与 anthropic_provider 共享消费。
 - OTLP：OpenTelemetry Line Protocol，gRPC 导出协议；N-Agent 用 opentelemetry-exporter-otlp-proto-grpc 导出到 Collector。
 - sample ratio（采样率）：Trace 采样比例（N_AGENT_OTEL_TRACES_SAMPLE_RATIO），ParentBased(TraceIdRatioBased)；Metric/Log 不采样。
 - ring buffer（快照环形缓冲）：Observability handle 内保存最近 span 投影的有界缓冲（100 条上限），Dashboard OTel 自检页经 `_OTEL_SNAPSHOT_KEYS` 精确枚举 key 白名单投影读取；只存白名单属性，不存完整 Span/events/Resource。
-- caller-owns-end span 协议：span 由开启它的调用方负责 end 的约定；facade 只 make-current 不 end，防止 Infrastructure 层越权终结 Application 拥有的生命周期。
+- caller-owns-end span 协议：Span 生命周期由开启它的业务作用域负责，辅助绑定不提前 end；在自身活跃时发完成日志和对应指标，在 finally 中结束并恢复上下文。Infrastructure 的 flush/shutdown 不替代业务作用域结束。
 - spike（技术验证 spike）：实现前的短周期验证实验（如 py-spy 0.4.2 + Pyroscope 1.21.1 的 ingest 合同 spike），结论固化为代码注释/文档后再实现。
 - metric-name-mapping：OTel 指标名到 Prometheus 指标名的翻译规则权威表（docker/observability/metric-name-mapping.md）：`.`/`-` 转 `_`，Counter 加 `_total`，秒 Histogram 加 `_seconds`（不再加 `_total`），token 等 `{...}` 括号单位不产生后缀。
 - observability handle：configure_observability(settings) 返回的运行句柄（disabled/local/export 三 mode），持有 TracerProvider/MeterProvider/LoggerProvider 与 ring buffer；`_published` 缓存防止 reconfigure 时句柄泄漏；main.py application_runtime contextmanager 统一 configure -> build -> yield -> shutdown。
 - profiler bridge：main.py 装配的 py-spy 桥（profiler_on_status/mark_profiler_attached），把 Infrastructure 侧连续 profiling 状态透传给观测自检页；py-spy 串行窗口循环按 per-PID registry 运行，仅 SYS_PTRACE（profiling compose override），无 privileged/host PID。
 - Pyroscope v2 ingest：连续 profiling 上传合同，POST /ingest `name=n-agent&format=folded&units=samples&aggregationType=sum`；v1 legacy 端点会静默丢弃 folded 上传。
-- observability failure isolation（观测失败不破坏业务）：telemetry facade 全路径 best-effort——OTel SDK/exporter/注入异常一律吞掉只留日志，观测链路永不打断对话/工具/压缩主流程。
+- observability failure isolation（观测失败不破坏业务）：观测 SDK、导出、投影和关联读取故障隔离在观测侧，可降级并保留安全诊断；业务 IO、返回值及业务异常/取消传播保持原有语义，不能吞掉业务失败。
 - LogSanitizer：纯函数日志脱敏器（`app/infrastructure/observability/sanitizer.py`），固定规则（Authorization Bearer/Basic、URL userinfo、凭据字段值、完整 JWT、PEM 私钥）+ 注入密钥目录，命中一律不可逆替换为 `[REDACTED]`；每次 sanitize 取原子版本快照，最左最长优先、单趟重入安全；跨 Log 与 span 属性共享。
 - 上下文现场（live scene）：`_scene_var` ContextVar 携带的实时执行现场（operation/iteration/message_count/tool/call_id/risk_level/model/provider/stream），在 agent_run/iteration_scope/tool_execution/ChatAttempt 作用域发布、退出 reset 恢复；`execution_log_snapshot()` 合并 `{scene, completion, execution_ids}` 供每条日志携带执行阶段上下文。
-- 三重封口（triple-seal）：spec-261027 后 Log JSON 与 Trace span event 允许"脱敏后正文/异常"，环状缓冲/指标/Profile 仍精确枚举 key 白名单零正文；未注册/未知模板或未安装 sanitizer 时日志只输出安全事件码（未知回落 `log_event_unknown`），绝不输出未脱敏插值正文。
+- 三重封口（triple-seal）：原始敏感数据不得进入任何出口；Log/Span 的显式详情通道允许统一脱敏限长后的正文/异常，自检缓冲、Metric、Profile 不带业务正文。字段按精确枚举白名单审核；模板未注册时仍保留有效脱敏内容，使用 application_log/library_log/diagnostic_log 等通用事件名，仅在脱敏器未就绪时退回安全事件码。详见 `07-observability.md`。
 
 
 ## 关联观测
 - Tempo：替换 Jaeger 的 Trace 存储后端，应用继续经 Collector OTLP 导出；Grafana 数据源 UID 为 nagent-tempo。
-- Exemplar：某次指标测量的代表性样本，携带 Trace/Span ID；Grafana 通过 Prometheus exemplar 跳转 Tempo，不构成普通时序 label，不覆盖全部请求。
+- Exemplar：某次指标测量的代表性样本，携带 Trace/Span ID；Grafana 通过 Prometheus exemplar 跳转 Tempo，不构成普通时序 label，不覆盖全部请求。有样本不证明入口完整，缺少样本也不能单独证明没有 Trace；关联合同须同时核对 Trace ID 与 Span ID。
 - Trace to logs：Grafana Tempo 数据源 tracesToLogsV2 基于服务标签、Trace ID 与时间窗口检索 Loki；日志 derivedFields 提供反向 Tempo 链接。

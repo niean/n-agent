@@ -193,6 +193,8 @@ docker exec n-agent-n-agent-1 n-agent <验收子命令及参数>
 
 ## 观测详情限长与出口约定
 
+观测共性规范和验收口径以 `07-observability.md` 的“共性规范”“验收清单”为权威。本文件保留开发约束摘要：业务入口覆盖全生命周期，同步父子与独立后台 Link 分别表达；完成日志及 histogram 在对应 Span 活跃时记录；失败、拒绝、取消、超时和错误返回如实区分。观测故障不得影响业务 IO 或异常传播，装配幂等且退出统一收尾。新增打点同步核对采集、投影、Collector、存储及查询契约，并用真实 SDK 与后端证据验证；测试修改的所有全局配置消费者须恢复。
+
 `N_AGENT_OTEL_CONTENT_MAX_BYTES` 为 B 类启动期 env-only 正整数，默认 2048，重启生效；不纳入 Dashboard/DB 热改配置。上限按每个命名详情项 content 的 UTF-8 字节计算，元数据不计入正文预算，整条日志可大于该值。结构化敏感键/媒体先遮盖，字符串键和值在 JSON 转义前通过共享 sanitizer，最后按 UTF-8 安全截断。未安装或脱敏失败时关闭详情。已投影内容仅验证，不重复脱敏。未知 original_bytes 在 stderr 为 null，在 OTel/Loki 可省略，禁止伪造为 0。
 
 流式临时预算为正文上限四倍，超限/错误/取消保留脱敏限长前缀并标记 truncated/incomplete；无法确定完整长度时 original_bytes 为未知。observed_bytes 表示实际观察字节，HTTP 为传输字节，LLM 为字符串增量；先合并有界原始内容再统一脱敏。Anthropic 非空初始结构化 tool input 增量编码后保留。semantics 静态边界仅精确允许纯 stdlib telemetry_details 依赖，其他业务/SDK 依赖继续拒绝。
@@ -200,3 +202,9 @@ docker exec n-agent-n-agent-1 n-agent <验收子命令及参数>
 
 ## 关联指标、Trace 与日志
 业务耗时 histogram 必须在对应 span 仍为 current 时记录，SDK 默认 trace-based exemplar filter 仅关联 sampled span；不得把 trace_id/span_id 加入普通 Metric label 或 Loki 索引 label。Collector 使用 OTLP→Tempo 与 prometheusremotewrite 管线，Prometheus 启用 exemplar-storage；Grafana Tempo 固定 UID nagent-tempo，Loki 保留既有 UID，配置三向关联。Trace 入口为 Grafana Explore，保留反向代理子路径并生成 TraceQL 服务过滤；其他外链保持既有语义。
+
+exemplar 是代表性关联样本，不覆盖全部执行；有无 exemplar 不能单独判定 Trace 是否存在或入口是否完整。排障须核对查询窗口、筛选、采样及实际后端，不能为补关联而增加高基数标签；历史缺口保持原状并如实记录。
+
+## 共享观测部署约定
+
+观测栈生命周期脚本仅放 `docker/observability/`，使用独立 Compose 项目 n-observability，清除继承的 COMPOSE_* 并固定文件/项目目录。业务不依赖观测服务启动成功；跨项目经 external n-telemetry 连接，Collector/Pyroscope保留稳定别名。旧栈迁移前核对真实卷及标签，保留Pyroscope匿名卷映射，失败先停止新写入者再恢复旧服务，禁止删除卷。停止入口不操作业务。Config Bundle拒绝旧内嵌观测Compose，需先更新部署配置后重新导出。

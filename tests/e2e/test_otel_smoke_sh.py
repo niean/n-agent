@@ -266,7 +266,8 @@ class TestExecutionSummary:
     def test_delivery_check_is_wired_after_stderr(self, smoke):
         assert 'check_execution_summary.py' in smoke
         assert smoke.index('"application stderr JSON logs"') < smoke.index('check_execution_summaries "$TMP_DIR/trace-good.json"')
-        assert 'compose exec -T n-agent python - fetch' in smoke
+        assert 'python3 "$SCRIPT_DIR/check_execution_summary.py" fetch' in smoke
+        assert '"$DOCKER_DIR/observability/restart.sh"' in smoke
 
     def test_matches_all_spans_and_rejects_indexed_identifiers(self):
         import importlib.util
@@ -299,3 +300,12 @@ class TestExecutionSummary:
             logs[1]["context"]["execution"][field] = original
         with pytest.raises(AssertionError):
             module.check(trace, logs, [{"service_name": "n-agent", "request_id": "run"}])
+
+
+def test_shared_backend_queries_use_independent_compose():
+    source = SMOKE_SOURCE.read_text()
+    assert 'obs_compose exec -T prometheus wget' in source
+    assert 'obs_compose logs otel-collector' in source
+    assert '$(obs_compose ps -q prometheus)' in source
+    assert 'compose exec -T n-agent python3 - "$1"' not in source
+    assert 'if compose exec -T n-agent python - "$TRACE_ID"' not in source

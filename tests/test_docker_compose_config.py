@@ -144,13 +144,13 @@ def test_env_assignment_parser_rejects_duplicate_conflicts():
 def test_example_compose_adds_host_bridge_wiring_without_changing_topology():
     document = _load_compose("docker-compose.yml.example")
     assert set(document["services"]) == (
-        {"n-agent", "browser"} | set(OBSERVABILITY_SERVICES)
+        {"n-agent", "browser"}
     )
-    assert set(document["networks"]) == {"default", "n-kb"}
+    assert set(document["networks"]) == {"default", "n-kb", "telemetry"}
 
     service = document["services"]["n-agent"]
     assert service["ports"] == ["8201:8201"]
-    assert service["networks"] == ["default", "n-kb"]
+    assert service["networks"] == ["default", "n-kb", "telemetry"]
     assert service["depends_on"] == {"browser": {"condition": "service_healthy"}}
     environment = service["environment"]
     assert (
@@ -180,13 +180,13 @@ def test_example_compose_adds_host_bridge_wiring_without_changing_topology():
 def test_current_machine_compose_adds_host_bridge_wiring_without_forcing_backend():
     document = _load_compose("docker-compose.yml")
     assert set(document["services"]) == (
-        {"n-agent", "browser"} | set(OBSERVABILITY_SERVICES)
+        {"n-agent", "browser"}
     )
-    assert set(document["networks"]) == {"default", "n-kb"}
+    assert set(document["networks"]) == {"default", "n-kb", "telemetry"}
 
     service = document["services"]["n-agent"]
     assert service["ports"] == ["8201:8201"]
-    assert service["networks"] == ["default", "n-kb"]
+    assert service["networks"] == ["default", "n-kb", "telemetry"]
     assert service["depends_on"] == {"browser": {"condition": "service_healthy"}}
     environment = service["environment"]
     assert (
@@ -237,7 +237,7 @@ def test_container_browser_uses_4_by_3_viewport():
 )
 def test_compose_host_bridge_is_not_exposed_or_given_host_networking(compose_name):
     document = _load_compose(compose_name)
-    serialized = (DOCKER_DIR / compose_name).read_text(encoding="utf-8")
+    serialized = (DOCKER_DIR / "observability/docker-compose.yml").read_text(encoding="utf-8")
     for service in document["services"].values():
         assert "network_mode" not in service
         assert "extra_hosts" not in service
@@ -436,7 +436,7 @@ def test_machine_local_compose_config_succeeds_when_both_roots_are_set():
 
 
 def _load_observability_compose(compose_name: str = "docker-compose.yml") -> dict:
-    document = _load_compose(compose_name)
+    document = _load_compose("observability/docker-compose.yml")
     for name in OBSERVABILITY_SERVICES:
         assert name in document["services"], (
             f"observability profile service missing: {name}"
@@ -452,10 +452,8 @@ def test_observability_services_are_profile_isolated(compose_name):
     document = _load_observability_compose(compose_name)
     for name in OBSERVABILITY_SERVICES:
         service = document["services"][name]
-        assert "observability" in service.get("profiles", []), (
-            f"{name} must declare the observability profile"
-        )
-    n_agent = document["services"]["n-agent"]
+        assert not service.get("profiles"), f"{name} must start in the independent project"
+    n_agent = _load_compose(compose_name)["services"]["n-agent"]
     depends_on = n_agent.get("depends_on", {})
     assert set(depends_on) == {"browser"}, (
         f"n-agent must not hard-depend on observability services: {set(depends_on)}"
@@ -497,7 +495,7 @@ def test_observability_profile_disabled_by_default_compose_services(compose_name
 
     assert _services() == {"n-agent", "browser"}
     assert _services("--profile", "observability") == (
-        {"n-agent", "browser"} | set(OBSERVABILITY_SERVICES)
+        {"n-agent", "browser"}
     )
 
 
@@ -538,7 +536,7 @@ def test_observability_images_are_version_pinned(compose_name):
     }
     for name, image in expected_images.items():
         assert document["services"][name]["image"] == image
-    serialized = (DOCKER_DIR / compose_name).read_text(encoding="utf-8")
+    serialized = (DOCKER_DIR / "observability/docker-compose.yml").read_text(encoding="utf-8")
     assert ":latest" not in serialized
 
 
@@ -560,7 +558,8 @@ def test_prometheus_enables_remote_write_receiver_and_retention(compose_name):
 )
 def test_observability_stop_grace_period_at_least_10s(compose_name):
     document = _load_observability_compose(compose_name)
-    for name in ("n-agent", *OBSERVABILITY_SERVICES):
+    assert _grace_seconds(_load_compose(compose_name)["services"]["n-agent"]["stop_grace_period"]) >= 10
+    for name in OBSERVABILITY_SERVICES:
         service = document["services"][name]
         grace = _grace_seconds(service["stop_grace_period"])
         assert grace >= 10, f"{name} stop_grace_period must be >= 10s, got {grace}"
@@ -857,7 +856,7 @@ def test_tempo_correlation_and_persistent_storage():
     assert config["compactor"]["compaction"]["block_retention"] == "168h"
     assert config["storage"]["trace"]["backend"] == "local"
     for name in ("docker-compose.yml.example", "docker-compose.yml"):
-        compose = _load_compose(name)
+        compose = _load_observability_compose(name)
         assert "tempo-data:/var/tempo" in compose["services"]["tempo"]["volumes"]
         assert "--enable-feature=exemplar-storage" in compose["services"]["prometheus"]["command"]
     path = DOCKER_DIR / "observability/grafana/provisioning/datasources/datasources.yaml"

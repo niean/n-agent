@@ -602,8 +602,8 @@ class SQLiteDelegationRegistry:
             conn.execute(
                 "INSERT INTO delegation_events (delegation_id, kind, "
                 "payload_json, member_ordinal, run_id, created_at) "
-                "VALUES (?, 'created', '{}', NULL, ?, ?)",
-                (delegation_id, req.parent.run_id, now),
+                "VALUES (?, 'created', ?, NULL, ?, ?)",
+                (delegation_id, json.dumps({"trace_context": dict(req.trace_context)}, ensure_ascii=False), req.parent.run_id, now),
             )
             conn.commit()
             row = conn.execute(

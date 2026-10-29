@@ -90,6 +90,7 @@ services:
     networks:
       - default
       - n-kb
+      - telemetry
 
   # Container browser runtime (T11): Chromium + noVNC for interactive
   # takeover. CDP (9222) and noVNC (6080) ports are container-network only
@@ -129,165 +130,6 @@ services:
       default:
         ipv4_address: 172.19.0.10
 
-  # ---------------------------------------------------------------------------
-  # 观测后端栈（spec 7，profile=observability）：Collector 三 pipeline
-  # （traces->Tempo / metrics->Prometheus remote write / logs->Loki+stdout 证据）。
-  # 仅启用 profile 不会打开应用 OTel 开关（N_AGENT_OTEL_ENABLED 来自 .env）；
-  # n-agent 不依赖这些服务，后端不可达仅降级观测。
-  # UI 端口绑定 127.0.0.1；Collector/Prometheus 默认不发布宿主端口。
-  # Tempo 使用独立持久卷，Trace 保留 7 天。
-  # ---------------------------------------------------------------------------
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.137.0
-    profiles: ["observability"]
-    command: ["--config=/etc/otelcol-contrib/config.yaml"]
-    volumes:
-      - ./observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
-    expose:
-      - "4317"
-      - "4318"
-    # 宿主 OTLP 接入默认关闭（spec 7：默认仅容器内网接收）；需要宿主接入时取消注释：
-    # ports:
-    #   - "127.0.0.1:4317:4317"
-    stop_grace_period: 15s
-    mem_limit: 384m
-    cpus: 0.5
-    healthcheck:
-      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  tempo:
-    image: grafana/tempo:2.9.0
-    profiles: ["observability"]
-    command: ["-config.file=/etc/tempo/config.yaml"]
-    # Named volume starts owned by root; match the other local observability stores.
-    user: "0:0"
-    volumes:
-      - ./observability/tempo.yaml:/etc/tempo/config.yaml:ro
-      - tempo-data:/var/tempo
-    expose:
-      - "4317"
-    ports:
-      - "127.0.0.1:3200:3200"
-    stop_grace_period: 15s
-    mem_limit: 512m
-    cpus: 0.5
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  prometheus:
-    image: prom/prometheus:v3.15.1
-    profiles: ["observability"]
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=7d
-      - --web.enable-remote-write-receiver
-      - --enable-feature=exemplar-storage
-    volumes:
-      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
-    stop_grace_period: 15s
-    mem_limit: 512m
-    cpus: 0.5
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9090/-/healthy"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  grafana:
-    image: grafana/grafana:13.0.11
-    profiles: ["observability"]
-    # 本地 127.0.0.1 只读观测 UI：匿名 Viewer，无登录凭据（不引入秘密）。
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_AUTH_DISABLE_LOGIN_FORM: "false"
-      GF_USERS_DEFAULT_THEME: light
-    volumes:
-      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
-      - grafana-data:/var/lib/grafana
-    ports:
-      # 宿主侧改绑 13000 避开常见被占用的 3000（按部署机实际情况调整）
-      - "127.0.0.1:13000:3000"
-    stop_grace_period: 15s
-    mem_limit: 512m
-    cpus: 0.5
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  pyroscope:
-    image: grafana/pyroscope:1.21.1
-    profiles: ["observability"]
-    # 注：pyroscope 镜像为 distroless（无 shell/wget/curl），无可用 in-image
-    # 探针，故不定义 healthcheck；依赖方不得对其使用 service_healthy 条件。
-    command: ["-config.file=/etc/pyroscope/config.yaml"]
-    volumes:
-      - ./observability/pyroscope.yaml:/etc/pyroscope/config.yaml:ro
-      - pyroscope-data:/var/lib/pyroscope
-    ports:
-      - "127.0.0.1:4040:4040"
-    stop_grace_period: 15s
-    mem_limit: 512m
-    cpus: 0.5
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  loki:
-    image: grafana/loki:3.5.5
-    profiles: ["observability"]
-    # 日志后端：原生 OTLP 接收（/otlp/v1/logs），Grafana 经 Loki 数据源查询；
-    # 默认不发布宿主端口（与 Prometheus 一致，仅容器内网 + Grafana 代理）。
-    command: ["-config.file=/etc/loki/config.yaml"]
-    volumes:
-      - ./observability/loki.yaml:/etc/loki/config.yaml:ro
-      - loki-data:/loki
-    expose:
-      - "3100"
-    stop_grace_period: 15s
-    mem_limit: 384m
-    cpus: 0.5
-    healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3100/ready"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 networks:
   default:
@@ -298,14 +140,6 @@ networks:
     name: n-kb_default
     external: true
 
-volumes:
-  # Persistent browser profiles (per profile_ref opaque key).
-  browser-profiles:
-  # 观测栈命名卷：Prometheus 指标 7 天（--storage.tsdb.retention.time=7d）、
-  # Pyroscope profile 7 天（compactor_blocks_retention_period=168h）、
-  # Grafana 状态、Loki 日志 7 天（limits_config.retention_period=168h）；由 compose 统一管理。
-  tempo-data:
-  prometheus-data:
-  grafana-data:
-  pyroscope-data:
-  loki-data:
+  telemetry:
+    name: n-telemetry
+    external: true

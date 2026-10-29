@@ -940,6 +940,8 @@ class DelegationCreateRequest:
     budget_total_tokens: int
     members: tuple[DelegationMember, ...]
     snapshot: PolicySnapshotRecord
+    # Opaque W3C correlation metadata, captured by the application, not policy.
+    trace_context: Mapping[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

@@ -115,3 +115,11 @@ def test_restart_propagates_compose_stop_timeout(tmp_path, stop_timeout, expecte
         command for command in commands if command.startswith("compose down ")
     )
     assert down_command == f"compose down --timeout {expected_timeout}"
+
+
+def test_restart_only_ensures_shared_network_before_business_down(tmp_path):
+    commands = _run_restart_script(tmp_path, {})
+    network = next(i for i, c in enumerate(commands) if c.startswith("network inspect n-telemetry"))
+    down = next(i for i, c in enumerate(commands) if c.startswith("compose down "))
+    assert network < down
+    assert not any("n-observability" in c or "observability/restart.sh" in c for c in commands)

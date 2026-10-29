@@ -92,3 +92,4 @@
 | D077 | OTel SDK LoggingHandler 弃用警告：既有 test_main_logging 双入口幂等测试触发上游 DeprecationWarning；394 项观测回归零警告，补充 440 项回归仅此既存警告。后续应统一评估 instrumentation-logging handler 迁移，非本次详情采集引入。 | low | plan-261027-observability-details | 2026-10-27 | open |
 
 | D078 | 既有测试全局详情配置隔离：test_main_otel_link_config_wiring 装配会发布 telemetry_details._config，随后运行 test_execution_summary 的原始文本哨兵断言时会失败；单独运行该测试文件 16 项通过，按应用测试在前、装配测试独立运行 568+12 项通过。需统一 fixture 恢复 details/sanitizer 全局状态，并更新正文采集后的旧哨兵语义。 | low | plan-261027-tempo-correlation | 2026-10-27 | resolved：2026-10-27 为执行摘要测试增加可恢复配置隔离；异常用例分别验证开启/关闭详情与凭据脱敏，原失败顺序的相关70项全部通过 |
+| D079 | 既有 Pyroscope 未配置 storage bucket，168h compactor 保留期未覆盖本地低磁盘清理；v1.21.1 可用磁盘比例计算单位偏差结合不足10GiB空间，重启时可能清理超过4h的本地块。迁移固定样本有61个分钟桶减少，未找到原始块备份，聚合查询快照已保存；必须配置持久bucket与可靠的本地清理策略，旧样本缺口不可伪造恢复。 | high | plan-261029-split-observability-stack | 2026-10-29 | mitigated：已配置持久filesystem bucket及有效1GiB/1%阈值；旧61分钟桶缺口无原块备份，保留聚合快照并明确验收限制 |

@@ -462,3 +462,51 @@ async def _wait_for(predicate, attempts: int = 20) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("background scheduled task did not finish")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["due", "manual"])
+async def test_schedule_span_contains_agent_and_delivery(monkeypatch, entry):
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from app.application import telemetry_semantics as ts
+
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(ts, "get_tracer", lambda: provider.get_tracer("test"))
+    contexts = []
+
+    class Executor:
+        async def run(self, task):
+            with ts.invoke_agent_span(session_id=task.session_id, source="schedule"):
+                contexts.append(trace.get_current_span().get_span_context())
+            return ScheduledAgentResult(ScheduledTaskExecutionStatus.SUCCEEDED, output="done")
+
+    class Delivery:
+        async def deliver(self, target, content):
+            contexts.append(trace.get_current_span().get_span_context())
+            return DeliveryResult("success")
+
+    registry = FakeRegistry(_claim())
+    service = ScheduleRunService(registry, Executor(), Delivery())
+    try:
+        if entry == "manual":
+            await service.run_now("task-1", now=NOW)
+            await _wait_for(lambda: bool(registry.delivered))
+        else:
+            await service.run_due_claims(now=NOW)
+        spans = exporter.get_finished_spans()
+        schedule = next((s for s in spans if s.name == "schedule.execute"), None)
+        assert schedule is not None, "scheduled execution must have an entry span"
+        agent = next(s for s in spans if s.name == "invoke_agent n-agent")
+        assert agent.parent.span_id == schedule.context.span_id
+        assert contexts[0].trace_id == contexts[1].trace_id == schedule.context.trace_id
+        assert contexts[1].span_id == schedule.context.span_id
+        assert schedule.attributes["nagent.schedule.task_id"] == "task-1"
+        assert schedule.attributes["nagent.outcome"] == "succeeded"
+        assert not trace.get_current_span().get_span_context().is_valid
+    finally:
+        provider.shutdown()

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 是 Python Agent 服务，提供 OpenAI-compatible HTTP API、LangGraph Agent Runtime、SQLite Memory、Tool Registry、Dashboard 和 Docker Compose 部署 -->
+<!-- SUMMARY: N-Agent 是 Python Agent 服务，提供 OpenAI-compatible HTTP API、LangGraph Agent Runtime、SQLite Memory、Tool Registry、Dashboard 和 Docker Compose 部署（业务与共享观测独立项目） -->
 # 项目概览
 
 ## 一句话
@@ -79,3 +79,7 @@ N_AGENT_AGENT_ITERATION_LIMIT=5
 - DDD 架构边界见 `.harness/knowledge/02-architecture.md`
 - 数据与存储边界见 `.harness/knowledge/04-data-boundaries.md`
 - 文件职责见 `.harness/knowledge/22-file-map.md`
+
+## 共享观测栈部署
+
+共享后端由 `sh docker/observability/restart.sh` 独立部署，停止用 `sh docker/observability/restart.sh stop`；旧内嵌观测栈先用 `sh docker/observability/restart.sh migrate` 迁移。业务 `sh docker/restart.sh` 只管理 Agent/browser，确保 external n-telemetry 存在，不启动或停止共享后端。具体配置、数据保护及N-KB接入见 `07-observability.md`。

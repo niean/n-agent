@@ -23,6 +23,18 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "docker" / "config-export.sh"
 HELPER = ROOT / "docker" / "config_bundle_files.py"
 
+
+def test_legacy_embedded_observability_compose_is_rejected_before_apply():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("bundle_stack_guard", HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    with pytest.raises(helper.PreflightError, match="observability"):
+        helper.check_business_compose(b"services:\n  n-agent: {}\n  otel-collector: {}\n")
+    with pytest.raises(helper.PreflightError, match="observability"):
+        helper.check_business_compose(b"services: {n-agent: {image: x}, tempo: {image: grafana/tempo:2.9.0}}\n")
+    helper.check_business_compose(b"services:\n  n-agent: {}\n  browser: {}\n")
+
 CANARY = "sk-canary-must-never-be-printed"
 
 
@@ -960,6 +972,29 @@ def _preflight(tmp_path, bundle, *extra) -> subprocess.CompletedProcess:
     return _run(["sh", str(IMPORT_SCRIPT), str(bundle), "--preflight-only",
                  "--install-root", str(tmp_path / "never"), *extra],
                 cwd=ROOT, env=_import_env(tmp_path))
+
+
+@pytest.mark.parametrize("compose", [
+    b"services:\n  n-agent: {}\n  tempo: {image: grafana/tempo:2.9.0}\n",
+    b"services: {n-agent: {image: x}, tempo: {image: grafana/tempo:2.9.0}}\n",
+])
+def test_legacy_stack_bundle_rejected_by_real_entrypoints_without_writes(tmp_path, compose):
+    bundle = _make_valid_bundle(tmp_path, replace={"env/docker-compose.yml": compose})
+    preflight = subprocess.run(["python3", str(HELPER), "preflight", str(bundle)], capture_output=True, text=True)
+    assert preflight.returncode == 2 and "observability" in preflight.stderr
+    repo = tmp_path / "repo"
+    (repo / "docker").mkdir(parents=True)
+    target = repo / "docker/docker-compose.yml"
+    target.write_text("existing business configuration\n")
+    before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    install = tmp_path / "install"
+    result = subprocess.run([
+        "python3", str(HELPER), "host-apply", str(bundle), "--install-root", str(install),
+        "--code-root", str(repo), "--repo-dir", str(repo), "--mode", "overwrite",
+    ], capture_output=True, text=True)
+    assert result.returncode == 2 and "observability" in result.stderr
+    assert not install.exists()
+    assert before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
 
 
 def _run_import(repo: Path, bundle: Path, *args: str,

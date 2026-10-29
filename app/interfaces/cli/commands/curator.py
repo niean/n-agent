@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -18,6 +19,13 @@ def _load_services() -> Any:
     from app.main import build_application_services
 
     return build_application_services()
+
+
+@contextmanager
+def _services_scope():
+    from app.main import application_runtime
+    with application_runtime() as services:
+        yield services
 
 
 def run(args) -> int:
@@ -50,14 +58,14 @@ def _cmd_status(args) -> int:
 
 def _cmd_run(args) -> int:
     fmt = resolve_format(args)
-    services = _load_services()
     dry = bool(getattr(args, "dry_run", False))
     consolidate = True if bool(getattr(args, "consolidate", False)) else None
-    result = asyncio.run(
-        services.skill_curator_service.run_curator_review(
-            dry_run=dry, consolidate=consolidate
+    with _services_scope() as services:
+        result = asyncio.run(
+            services.skill_curator_service.run_curator_review(
+                dry_run=dry, consolidate=consolidate
+            )
         )
-    )
     render_action(
         {
             "started_at": result.started_at,
