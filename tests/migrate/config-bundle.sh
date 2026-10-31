@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
-# E2E for the configuration migration bundle (plan T9).
+# Docker migration tests for the configuration bundle (plan T9).
 #
-# Runs against the already-running Docker container (run.sh restarts it once
-# before the suites). Every database this suite touches is a throwaway file
+# The shared environment wrapper rebuilds the Docker service before running
+# this standalone migration suite. Every database it touches is a throwaway file
 # under /tmp inside the container, selected per `docker exec` with
 # N_AGENT_SQLITE_PATH (app/config.py: env_prefix N_AGENT_): the live
 # deployment database at /app/locals/sessions.db is never written by this
@@ -26,7 +26,7 @@
 # sha256 digests and prints booleans only.
 
 # Isolate autonomous skill evolution for this suite and every child/restart.
-source "$(dirname "${BASH_SOURCE[0]}")/environment.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/../e2e/environment.sh"
 e2e_environment default "$0" "$@"
 
 (
@@ -101,7 +101,7 @@ $haystack"
   # Section 0: fixed compose context -> container id
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 0. resolve the container through the fixed compose context"
+  echo "[ConfigBundle Migration] 0. resolve the container through the fixed compose context"
 
   command -v python3 >/dev/null 2>&1 ||
     fail "this suite needs host python3 (docker/config-import.sh needs it too)"
@@ -112,7 +112,7 @@ $haystack"
     -f "$REPO_ROOT/docker/docker-compose.yml"
   )
   CONTAINER="$(docker compose "${COMPOSE_ARGS[@]}" ps -q n-agent)"
-  [ -n "$CONTAINER" ] || fail "the n-agent service is not running (run.sh restarts it first)"
+  [ -n "$CONTAINER" ] || fail "the n-agent service is not running after environment setup"
   docker exec "$CONTAINER" true >/dev/null 2>&1 ||
     fail "cannot exec into the resolved container $CONTAINER"
 
@@ -128,7 +128,7 @@ $haystack"
   # Section 1: a canary source database, built without the app bootstrap
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 1. build the canary source database"
+  echo "[ConfigBundle Migration] 1. build the canary source database"
 
   cpy <<'PYEOF'
 import json
@@ -251,7 +251,7 @@ PYEOF
   # Section 2: export -- section whitelist, runtime fields, four-state secrets
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 2. export the source: whitelist, runtime fields, secrets"
+  echo "[ConfigBundle Migration] 2. export the source: whitelist, runtime fields, secrets"
 
   ncli source.db config export --out "$CDIR/full.json" 2>/dev/null
   ncli source.db config export --out "$CDIR/redacted.json" --redact-secrets 2>/dev/null
@@ -386,7 +386,7 @@ PYEOF
   # Section 3: dry run into an empty target -- zero side effects
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 3. dry run into an empty target leaves no trace"
+  echo "[ConfigBundle Migration] 3. dry run into an empty target leaves no trace"
 
   # An empty bundle is what creates the target schema, so the dry run below
   # runs against a real, empty, already-created database.
@@ -434,13 +434,13 @@ $after_ls"
     fail "a dry run against a missing database must fail, got rc=0: $missing_out"
   probe_ls="$(docker exec "$CONTAINER" sh -c "cd '$CDIR/probe' && ls -1a | sort")"
   assert_not_contains "$probe_ls" "missing.db" "a dry run must not create the database"
-  echo "[ConfigBundle E2E]    dry run: db unchanged ($before_sha), no schema on a missing path (rc=$missing_rc)"
+  echo "[ConfigBundle Migration]    dry run: db unchanged ($before_sha), no schema on a missing path (rc=$missing_rc)"
 
   # ---------------------------------------------------------------------------
   # Section 4: the real import
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 4. real merge import into the target"
+  echo "[ConfigBundle Migration] 4. real merge import into the target"
 
   # No --with-schedules: a migrated schedule must land disabled and paused.
   real_report="$(ncli target/target.db config import --file "$CDIR/full.json" --json --mode merge)"
@@ -523,7 +523,7 @@ PYEOF
   # Section 5: idempotent rerun, then a degraded rerun that still writes nothing
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 5. rerun merge: complete fixture skipped, degraded fixture writes nothing"
+  echo "[ConfigBundle Migration] 5. rerun merge: complete fixture skipped, degraded fixture writes nothing"
 
   stable_sha="$(docker exec "$CONTAINER" sh -c "sha256sum '$CDIR/target/target.db'" | awk '{print $1}')"
   [ -n "$stable_sha" ] || fail "cannot checksum the target database"
@@ -606,7 +606,7 @@ PYEOF
   # Section 6: overwrite mode and the four secret states
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 6. overwrite: fields updated, secret set/cleared/kept/untouched"
+  echo "[ConfigBundle Migration] 6. overwrite: fields updated, secret set/cleared/kept/untouched"
 
   cpy <<'PYEOF'
 import hashlib
@@ -716,7 +716,7 @@ PYEOF
   # Section 7: the host bundle chain (plan T7 S13) through both entry points
   # ---------------------------------------------------------------------------
 
-  echo "[ConfigBundle E2E] 7. host bundle chain: config-import.sh and install.sh agree"
+  echo "[ConfigBundle Migration] 7. host bundle chain: config-import.sh and install.sh agree"
 
   STAGE="$HOST_TMP/stage"
   SCRATCH="$HOST_TMP/scratch"
@@ -805,7 +805,7 @@ print("LEAK " + ",".join(found) if found else "CLEAN")
   DOCKER_ENV_SHA_AFTER="$(shasum -a 256 "$DOCKER_ENV" | awk '{print $1}')"
   [ "$DOCKER_ENV_SHA_BEFORE" = "$DOCKER_ENV_SHA_AFTER" ] ||
     fail "docker/.env changed during the suite ($DOCKER_ENV_SHA_BEFORE -> $DOCKER_ENV_SHA_AFTER)"
-  echo "[ConfigBundle E2E]    docker/.env unchanged, live deployment carries no $RUN_TAG record"
+  echo "[ConfigBundle Migration]    docker/.env unchanged, live deployment carries no $RUN_TAG record"
 
-  echo "[ConfigBundle E2E] PASS"
+  echo "[ConfigBundle Migration] PASS"
 )

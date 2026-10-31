@@ -282,6 +282,8 @@ class Task:
 
     # 归档 (软删标志，非状态)
     is_archived: bool = False
+    # Opaque trigger carrier; automatic retries/recovery must not replace it.
+    trace_context: dict[str, str] = field(default_factory=dict)
 
     # -----------------------------------------------------------------
     # State transition contract

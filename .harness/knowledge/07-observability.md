@@ -60,16 +60,26 @@ HTTP SERVER（对话请求）
 
 - 入站 HTTP 只采集 `/chat/completions`、`/v1/chat/completions`，兼容查询参数和尾斜杠。`/static`、页面、健康检查、管理接口和轮询不创建入站 Span。
 - 关闭 ASGI receive/send Span。HTTPX/SQLite 自动 CLIENT Span 必须有有效父操作；不为独立后台探测等请求创建孤儿 Span。
-- CLI/ACP 经 `gateway.message`、飞书事件经 `feishu.event -> gateway.message`、后台 Task 经 `task.run` 进入 Agent；业务入口 Span 覆盖准入/编排与收尾，不能仅以 `invoke_agent` 存在或有 exemplar 判断入口完整。Gateway 流式 Span 持续到实际消费结束，关闭向内传递；错误事件区分执行失败与取消。
+- HTTPX/SQLite 由 `build_application_services` 在 SDK 配置后、业务客户端构造前调用 `instrument_clients` 进程级幂等注册，覆盖 HTTP、CLI、ACP；不能只依赖 FastAPI `instrument_app`。禁用观测时不注册；客户端注册失败不阻止独立的服务端中间件安装。E2E 除 Agent Trace 外，逐模型核对 HTTP 子 Span、请求/响应 payload 与完成事件；尚未通过校验的 Trace 持续回读，失败仍保留链接。
+- CLI 经 `cli.request -> gateway.message`、ACP 经 SDK 的 `acp.request -> gateway.message`、飞书事件经 `feishu.event -> gateway.message`、后台 Task 经 `task.run` 进入 Agent；业务入口 Span 覆盖准入/编排与收尾，不能仅以 `invoke_agent` 存在或有 exemplar 判断入口完整。CLI 单次消息（流式/非流式、REPL 每轮）建立明确入口，不以整个终端会话为边界；继承有效上游上下文，无上游时为根 Span。CLI 与 Gateway 流式 Span 持续到实际消费结束，关闭向内传递；错误事件区分执行失败与取消。CLI 入口复用统一详情能力记录请求、实际输出和失败前缀，不额外创建 ACP 入口。
 - 模型调用和工具调用通常是 Agent 下的兄弟，工具不能挂到已结束的模型 Span 下。真实请求尝试各记一次，不重复打点。
 - 定时任务在 `ScheduleRunService.run_claim()` 创建 `schedule.execute` 入口 Span，覆盖策略检查、执行记录、Agent 与投递；自动触发和手动运行复用该入口。Agent Span 继承其上下文，投递发生在 Agent Span 结束后、定时任务 Span 结束前。记录 task/claim/session 标识、执行与投递状态及完成摘要；任务 prompt 与执行结果通过统一详情通道先脱敏再限长，不进入普通属性、指标或自检缓冲。
-- Task 的 `task.run` 包含 worker/Judge 多轮、终态处理及通知；独立后台 Task 使用新 Trace，并通过 Span Link 关联触发者。`skill.review`、`curator.run` 同样使用独立 Trace + Link；Curator 内部 review 保持同 Trace 的父子关系。后台独立操作清理继承的业务现场并在退出时恢复；`clear_run_context()` 本身只清理业务 ContextVars，不代表 OTel Trace 已隔离。
+- Task 的 `task.run` 包含 worker/Judge 多轮、终态处理及通知。有明确上游的任务，首次执行、自动重试和进程恢复均复用上游 Trace ID，各 Run 创建不同 Span；对话、CMD、API、人工点击、定时触发统一适用。创建时持久化服务端捕获的 traceparent，每次 Run 从该 carrier 恢复直接父级，不继承领取 tick，也不因重试改写上游。`POST /chat/tasks` 创建 `task.submit` 入口并提取远程 traceparent；独立 CLI 创建命令使用 `cli.request` 和 application_runtime 收尾。仅缺少或无效上下文的任务可以建立根 Trace，必须用 `nagent.task.trace_context=missing|invalid` 显式标记；正常继承为 `inherited`。历史 Trace 不补造。
+- `skill.review`、`curator.run` 使用独立 Trace + Link；Curator 内部 review 保持同 Trace 的父子关系。后台独立操作清理继承的业务现场并在退出时恢复；`clear_run_context()` 本身只清理业务 ContextVars，不代表 OTel Trace 已隔离。
 - 委派按所属 delegation 的服务端 traceparent 恢复到 `delegation.member -> invoke_agent`，禁止继承领取 tick 的偶然父级。原始关联随创建事务持久化，重连不覆盖；旧记录、损坏值或关联读取失败创建独立 member 业务根。保留未采样标志，不将 baggage/正文/凭据持久化。固定 source 映射包含 `delegation`。
 - 应用入口统一由 `business_operation` 管理完成摘要、失败/取消状态和现场恢复；仅接受固定操作名及标识白名单，不新增高基数指标标签。Tracer 故障回落到有效构造的非记录 Span，不阻断业务。CLI Curator run 通过 `application_runtime` 在成功或异常退出时收尾导出。
 - 每个业务入口自身记录本次请求与实际结果，不能用子 Agent/模型已有详情替代。Gateway、Task、Schedule、委派与后台审查统一使用 `details.input_messages/output_messages/error` 等既有白名单字段，经 `project_details` 投影后交给入口作用域的 `facts["details"]`；完成时同一份信封进入该 Span 和关联完成日志。流式结果沿消费路径有界收集，避免 delta 与最终消息重复计数，关闭/失败保留安全前缀并标明 incomplete；不得提前消费流。拒绝、跳过等无 Agent 输出的路径记录实际返回状态，不伪造回复。
 - Curator 入口的请求详情包括运行参数、有效整理开关/阈值和候选技能事实，结果详情包括实际返回结构、已完成迁移计数、模型整理结果/工具调用及错误；不得只存 summary_so_far。迁移完成时立即保存观测事实，后续报告失败或取消不将已完成计数重置为零，未完成结果标记 incomplete。所有入口验收须断言真实内容与异常分支，只有字段存在不算 payload 完整；短输出验证脱敏，超长输出另验截断。
 - 同一同步执行链中的 HTTP、Agent、工具和依赖继承同一 Trace；独立后台工作的关联按上述 Link 规则处理。SSE 断连后继续执行的 Agent 保留原关联，不另建 Trace。
 - 谁开启 Span，谁负责结束；完成日志和关联指标先记录，再结束。异常、拒绝、取消分别表达，不伪装成功。
+
+## 追踪外部记忆
+
+- `ExternalMemoryManager` 在实际调用 provider 时创建 `memory.prompt/prefetch/sync/pre_compress/tool <provider>`，探测由 `ExternalMemoryProviderService` 创建 `memory.probe <provider>`。provider 名限定 builtin、multi-project、mem0、honcho、holographic，其余归 other；沿用业务 source/session，不新增指标标签。禁用、策略拒绝及熔断跳过不伪造 provider 已调用。
+- mem0/Honcho 共用的 urllib 客户端通过 `observability/urllib_capture.py` 复用 HTTPX 的安全目标投影、完成日志、详情脱敏与限长；每次实际请求仅有一个 CLIENT Span，覆盖 open、实际读取及 close，注入当前 CLIENT 的标准传播上下文。保留原 URL 安全检查、timeout、响应大小限制和异常语义；无有效父操作时不创建 HTTP 孤儿 Trace。
+- mem0 预取线程在启动处复制 ContextVars，在线程内以 `memory.search mem0` 覆盖完整搜索；调用方等待到期记录 timed_out，后台搜索继续归属原调用链，不能继承后续请求的上下文。后台结果为空、后台失败与等待超时分别记录；缓存复用不伪造新的 HTTP 调用。
+- Honcho/mem0 自动召回与同步内部捕获的异常同步标记当前 memory 操作失败，工具的 `success=false` 同样标为 failed；保持原有空结果、返回值和异常隔离。sync 的结果只记录方法已返回，不声称远端异步记忆已完成持久化。
+- Holographic 的本地 SQLite、builtin 和 multi-project 文件记忆复用公共操作 Span；不伪造 HTTP 调用。请求、召回内容、工具参数与结果仅走统一 details 通道；Honcho workspace/peer/conclusion ID 在 HTTP 路径中模板化。
 
 ## 串联 N-Agent 与 N-KB Trace
 
@@ -177,6 +187,7 @@ GenAI 采用 `telemetry_semantics.py` 声明的草案依据，变更时集中迁
 - exemplar 只覆盖部分测量，不用于逐次执行审计。排查缺失先核对时间窗、指标与服务筛选、采样和导出，再直接查询 Trace；不得为了关联而将执行 ID 加入指标标签。
 - AgentRun 三个 histogram（duration/inference_calls/tool_calls）统一携带经 map_source 归一的 nagent.source，由本次受信 RunContext 提供，不能用会话创建来源或投递平台替代。Chat 为 dashboard/api，GW 保留 feishu/cli/acp/dingtalk/wecom，定时执行为 schedule，Task worker/Judge 为 task，委派 child 为 delegation；Skill 自进化审查为 skill_review，周期维护的模型整理为 curator；其他已知枚举保留，未知归 other。SkillEvolutionService 将有效来源同时传给 skill.review 入口与内部受信 gateway.source，再经 ChatCompletionService 构造 RunContext，避免入口 other、Agent api 的双重回落；复用会话不改变原会话来源。测量在当前 Agent Span 内记录，exemplar 关联该 Agent Span，入口差异通过序列 nagent_source 与 Trace 入口共同体现。
 - Grafana Overview/Metrics 的 Source 多选仅筛选 AgentRun/turns，模型/工具/Token 等面板标明服务级。Source All=`.*` 包含历史缺失来源序列，指定来源时不包含；历史来源不回填、不伪装为 other，历史图例保留分位数/调用类型后缀。平均调用数使用 histogram _sum/_count（零调用运行计入分母），exemplar 单次测量与 p95/p99 含义不同；耗时面板通过同页 ?viewPanel 链接查看底层 bucket 面板，保留反向代理子路径和筛选条件。
+- 观测执行来源与 XUI 入口、会话来源分别建模：`skill_review` 标识原会话内触发的后台自进化 AgentRun，复用原 `session_id` 且不持久化审查消息，不新增 XUI 入口或会话筛选类型；Curator 模型整理使用独立的 `curator-…` 会话，执行来源与会话来源均为 `curator`。
 - Trace 使用 ParentBased + 比例采样，继承父级采样决定；Log/Metric 不因 Trace 未采样而丢弃。
 - Dashboard 自检只保留当前进程最近 100 条已结束、被采样 Span 的少量安全字段；每页 10 条，重启清空，不代表完整历史。
 

@@ -363,6 +363,10 @@ artifacts_root 存储边界（`settings.artifacts_root`，默认 `/app/locals/ar
 
 Artifact 尺寸阈值配置（Settings，`artifact_` 前缀，gt=0）：artifact_read_max_bytes（默认 64KB）、artifact_diff_max_bytes（默认 1MB）、artifact_diff_max_lines（默认 20000）、artifact_diff_max_output_chars（默认 200000）、artifact_export_max_bytes（默认 50MB）；artifacts_enabled=False 时 artifact 工具/路由/迁移/Exporter 均不装配。
 
+## Task Trace 上下文数据边界
+
+`Task.trace_context` 为 Domain 不透明字典；SQLite `tasks.trace_context_json TEXT NOT NULL DEFAULT '{}'` 与任务创建同事务写入，旧库按列存在性幂等迁移。仅由 Application 捕获服务端当前 W3C traceparent，不保存 baggage、tracestate、正文或凭据，不参与业务权限。创建 API 不接受该字段，普通及批量编辑拒绝 trace_context / trace_context_json 覆盖；claim、自动重试、恢复和人工操作沿用原上下文。Run 从持久化 carrier 显式恢复；空值标 missing，损坏或无效值标 invalid，不从调度器 tick 猜测上游，也不补造历史关系。Task 运行数据仍不进入 Config Bundle。
+
 ## Delegation 子系统数据边界
 
 Delegation 子系统复用 sessions.db（统一 schema 版本序列，不独立猜测 user_version），新增 7 表（`app/infrastructure/registry/sqlite_delegation_registry.py`）：

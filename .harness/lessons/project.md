@@ -1,6 +1,27 @@
 <!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
 # 项目教训
 
+### P075: 客户端自动埋点必须覆盖独立入口，验收须沿实际传输链
+
+- 现象：ACP Trace 有 chat Span，却没有下游 LLM HTTP Span；E2E 只检查 Agent Trace 而通过。
+- 根因：HTTPX/SQLite 全局注册被绑定到 FastAPI create_app，独立 CLI/ACP 进程只配置 SDK。服务端进程的全局包装不能跨进程生效。
+- 教训：公共装配在 SDK 配置后、业务客户端创建前注册客户端埋点，服务端中间件保留独立时机与失败边界。真实 SDK 验证 chat -> HTTP、实际请求/结果、同 Span Event/Log、短输出脱敏、长输出限长和流式关闭。E2E 持续跟踪未通过的 Trace，不能被后续合法搜索命中掩盖；后端查询不可用与采集缺失分开诊断，保留失败尝试。
+- 来源：verify-261031-fix-client-http-tracing；相关785项通过，CLI/ACP实际6个HTTP与Tempo/Loki内容一致；全套E2E中Tempo OOM已登记D082，恢复后任务重试成功。
+
+### P074: 异步任务必须按业务归属持久化上游上下文
+
+- 现象：同一 Task 首次执行和自动重试显示为两个未关联的根 Trace，无法从触发对话查看完整任务链。
+- 根因：Task 未持久化触发时的上下文，run_claim 每次 detached=True；HTTP 管理创建与独立 CLI 创建也缺少可捕获的入口 Span。
+- 教训：在创建事务中保存服务端 traceparent，首次执行、自动重试和恢复只从所属 Task 恢复，不能继承 dispatcher tick；仅无效/缺失上下文允许明确标记的根 Trace。用真实 SDK、SQLite 重开、独立进程以及 Tempo 验证同 Trace、不同 Run Span、直接父级和未采样继承。
+- 来源：2026-10-31 修复 Task Trace 上下文，TaskService / TaskRunService / SQLiteTaskRegistry / HTTP/CLI 入口。
+
+### P073: E2E 功能通过不能代替逐消息 Trace 现场验收
+
+- 现象：12 个真实会话用例功能通过，最终报告却都没有 Trace；Tempo 实际存在相关记录。
+- 根因：会话 runner 未接入仅供 OTel smoke 使用的 Trace 报告链路，退出码只验证业务结果；Task 的执行会话还可能复用 origin 或由 uuid5 派生，不能只查持久化 execution_session_id。
+- 教训：Trace 报告必须逐消息/尝试，在清理前按真实会话、来源、时间窗口回读后端详情并保存；同会话 Task 须核对 Task ID 与全部 Run ID 的结束根 Span，不能互借 Trace 或看到第一轮就成功。开启 OTel 时缺失现场必须影响验收，纯管理检查则明确不产生对话 Trace 的原因。
+- 来源：2026-10-31 修复 E2E Trace 报告，conversations_runner.py / trace_report.py / result_report.py。
+
 ### P065: 信息完整性必须检查采集、投影和入库全链路
 
 - 现象：逐个补 Span 后，其他调用仍缺请求内容、异常原因和流式输出；未注册日志被统一折叠，Collector 也漏传详情。
@@ -638,6 +659,7 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：只有 Agent 执行创建 Span，ScheduleRunService 未在共享 claim 入口建立覆盖整个生命周期的父 Span。
 - 教训：后台任务在业务执行入口创建 Span，跨 await 保持上下文并覆盖结果投递；同时验证自动与手动路径的真实 SDK 父子关系，不能只凭 exemplar 存在判断完整性。
 - 来源：Trace 071740bf92e0c90e32fef86b800b1e5b；test_schedule_span_contains_agent_and_delivery 两入口 RED 缺少入口 Span，修复后通过。
+- 同类入口：ACP 的 acp.request 由 SDK 自动创建，CLI 只有 gateway.message，不能假定不同协议具有相同自动埋点。对比真实根 Span 与 scope 后，在 CliChatAdapter 单次消息边界补 cli.request，覆盖流式和非流式；证据见 verify-261031-fix-cli-entry.md。
 
 ### P070: 补入口 Span 必须复用已有详情能力并验证实际载荷
 
@@ -646,6 +668,7 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 教训：修复可观测问题须按全部业务入口列出请求、实际结果、异常和流式关闭路径，复用 project_details 与有界流累积；先看 payload 断言失败，再验证同 Span 的完成日志、安全限长与故障隔离。补层级不能视为入口验收完成；局部禁正文规则不得覆盖统一脱敏详情通道。审查发现流式 finish 和异常字符串化也可能抛错，须故障注入证明原业务异常与取消不变。
 - 来源：2026-10-31 修复入口 payload；第一轮 RED 12 failed/30 passed，同类入口 RED 4 failed/23 passed；故障隔离 RED 2 failed；飞书图片/卡片 RED 2 failed；证据见 verify-261031-fix-entry-payloads.md。
 - 再次复核：Curator 只将 summary_so_far 写入 output，旧测试仅断言字段存在，未验证候选、迁移与模型结果，导致同类遗漏再次被错误验收。补实际内容断言先RED 2项；另复现后续失败/取消丢失已完成迁移RED 2项。修复后140项通过。新增短/长输出分开验证，防止截断先移除敏感字段使脱敏测试假绿；投影故障与取消组合验证原取消不变。见 verify-261031-fix-curator-payloads.md。
+- 外部记忆复核：HTTPX 自动埋点不能覆盖共享 urllib 客户端，mem0 的 threading.Thread 也不自动继承 ContextVars；仅有 execute_tool 无法覆盖自动召回与回合同步。沿共享传输层补 CLIENT、在启动线程处复制上下文，并在公共管理层区分 provider 操作；对内部捕获异常、返回 success=false、等待超时后后台继续等分别保留真实状态与原 Trace。证据见 verify-261031-fix-memory-tracing.md。
 
 ### P067: 保留卷映射不能替代历史样本与有效配置验收
 

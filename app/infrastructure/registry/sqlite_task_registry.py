@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     last_heartbeat_at TEXT,
     result TEXT,
     idempotency_key TEXT,
-    is_archived INTEGER NOT NULL DEFAULT 0
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    trace_context_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS task_runs (
@@ -251,6 +252,7 @@ _ENUM_FIELDS: frozenset[str] = frozenset({
 _FIELD_TO_COLUMN: dict[str, str] = {
     "skills": "skills_json",
     "execution_policy": "execution_policy_json",
+    "trace_context": "trace_context_json",
 }
 
 # Fields that cannot be updated via update_task
@@ -363,6 +365,8 @@ def _field_value_to_storage(field_name: str, value: Any) -> Any:
         return 1 if value else 0
     if field_name == "skills":
         return _json_dumps(list(value))
+    if field_name == "trace_context":
+        return _json_dumps(value)
     if field_name == "execution_policy":
         if isinstance(value, TaskExecutionPolicy):
             return _json_dumps({"allowed_tools": list(value.allowed_tools)})
@@ -436,6 +440,8 @@ class SQLiteTaskRegistry:
                 conn.execute(
                     "ALTER TABLE tasks ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0"
                 )
+            if "trace_context_json" not in task_cols:
+                conn.execute("ALTER TABLE tasks ADD COLUMN trace_context_json TEXT NOT NULL DEFAULT '{}'")
 
             # Now that is_archived is guaranteed to exist, create indexes
             # that reference it. Safe on both new and legacy DBs.
@@ -550,6 +556,7 @@ class SQLiteTaskRegistry:
             result=row["result"],
             idempotency_key=row["idempotency_key"],
             is_archived=bool(row["is_archived"]),
+            trace_context=_json_loads(row["trace_context_json"], {"traceparent": "invalid"}),
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> TaskRun:
@@ -651,6 +658,7 @@ class SQLiteTaskRegistry:
             task.result,
             task.idempotency_key,
             1 if task.is_archived else 0,
+            _json_dumps(task.trace_context),
         )
 
     _INSERT_TASK_SQL = """
@@ -664,9 +672,9 @@ class SQLiteTaskRegistry:
             project_id, tenant, board, origin_session_id,
             execution_session_id, consecutive_failures, worker_token,
             last_failure_error, last_heartbeat_at, result, idempotency_key,
-            is_archived
+            is_archived, trace_context_json
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
 

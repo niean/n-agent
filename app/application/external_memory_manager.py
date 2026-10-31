@@ -8,6 +8,8 @@ import time
 from collections import defaultdict
 from typing import Any, Callable
 
+from app.application.telemetry_semantics import memory_operation
+from app.application.telemetry_details import project_details
 from app.domain.memory_provider import ExternalMemoryProvider
 from app.domain.tool import RiskLevel, ToolDefinition, ToolSourceType
 
@@ -389,7 +391,9 @@ class ExternalMemoryManager:
                 )
                 continue
             try:
-                block = provider.system_prompt_block()
+                with memory_operation("prompt", provider_name) as facts:
+                    block = provider.system_prompt_block()
+                    facts["details"].update(project_details(output_messages=block))
             except Exception as exc:
                 logger.warning(
                     "Memory provider %s failed to build system prompt block: %s",
@@ -437,7 +441,9 @@ class ExternalMemoryManager:
                 )
                 continue
             try:
-                content = provider.prefetch(query, session_id=session_id)
+                with memory_operation("prefetch", provider_name, session_id=session_id, input_messages=query) as facts:
+                    content = provider.prefetch(query, session_id=session_id)
+                    facts["details"].update(project_details(output_messages=content))
                 if content.strip():
                     blocks.append(f'<provider name="{provider_name}">\n{content}\n</provider>')
             except Exception as exc:
@@ -487,7 +493,12 @@ class ExternalMemoryManager:
                 )
                 continue
             try:
-                provider.sync_turn(user_content, assistant_content, session_id=session_id)
+                with memory_operation("sync", provider_name, session_id=session_id, input_messages=[
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": assistant_content},
+                ]) as facts:
+                    provider.sync_turn(user_content, assistant_content, session_id=session_id)
+                    facts["details"].update(project_details(output_messages={"returned": True}))
             except Exception as exc:
                 logger.warning(
                     "Memory provider %s failed to sync turn: %s",
@@ -530,7 +541,9 @@ class ExternalMemoryManager:
                 )
                 continue
             try:
-                content = provider.on_pre_compress(messages)
+                with memory_operation("pre_compress", provider_name, session_id=session_id, input_messages=messages) as facts:
+                    content = provider.on_pre_compress(messages)
+                    facts["details"].update(project_details(output_messages=content))
             except Exception as exc:
                 logger.warning(
                     "Memory provider %s failed on pre-compress: %s",
@@ -600,9 +613,16 @@ class ExternalMemoryManager:
                 "error": "provider in cooldown",
             })
         try:
-            result = provider.handle_tool_call(
-                tool_name, args, agent_context=agent_context, session_id=session_id
-            )
+            with memory_operation("tool", provider_name, session_id=session_id, tool_arguments={"tool": tool_name, "arguments": args}) as facts:
+                result = provider.handle_tool_call(
+                    tool_name, args, agent_context=agent_context, session_id=session_id
+                )
+                facts["details"].update(project_details(tool_result=result))
+                try:
+                    if json.loads(result).get("success") is False:
+                        facts["outcome"] = "failed"
+                except (ValueError, TypeError, AttributeError):
+                    pass  # Observation must preserve even non-conforming provider results.
         except Exception as exc:
             logger.warning(
                 "Memory provider %s failed to handle tool %s: %s",

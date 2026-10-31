@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from contextvars import copy_context
 from typing import Any
 
 from app.domain.memory_provider import ExternalMemoryProvider
+from app.application.telemetry_semantics import memory_operation, record_memory_failure
+from app.application.telemetry_details import project_details
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,7 @@ class Mem0Adapter(ExternalMemoryProvider):
         self._prefetch_query = ""
         self._prefetch_result = ""
         self._prefetch_done = False
+        self._prefetch_failed = False
 
     @classmethod
     def factory(cls, *, http_client, config: dict[str, Any], secret: str | None) -> "Mem0Adapter":
@@ -103,6 +107,8 @@ class Mem0Adapter(ExternalMemoryProvider):
         if thread is not None:
             thread.join(timeout=_PREFETCH_WAIT_SECS)
         cached = self._consume_cached(query)
+        if cached is None:
+            record_memory_failure("mem0 prefetch wait deadline exceeded", outcome="timed_out")
         return cached or ""
 
     def _start_prefetch(self, query: str) -> None:
@@ -116,8 +122,10 @@ class Mem0Adapter(ExternalMemoryProvider):
             self._prefetch_query = query
             self._prefetch_result = ""
             self._prefetch_done = False
+            self._prefetch_failed = False
+            context = copy_context()
             thread = threading.Thread(
-                target=self._run_prefetch, args=(query,),
+                target=context.run, args=(self._run_prefetch, query),
                 daemon=True, name="mem0-prefetch",
             )
             self._prefetch_thread = thread
@@ -125,14 +133,19 @@ class Mem0Adapter(ExternalMemoryProvider):
 
     def _run_prefetch(self, query: str) -> None:
         body = ""
+        failed = False
         try:
-            body = self._search_backend(query)
+            with memory_operation("search", "mem0", input_messages=query) as facts:
+                body = self._search_backend(query)
+                facts["details"].update(project_details(output_messages=body))
         except Exception as exc:
+            failed = True
             logger.debug("Mem0 prefetch failed: %s", exc)
         with self._prefetch_lock:
             if self._prefetch_query == query:
                 self._prefetch_result = body
                 self._prefetch_done = True
+                self._prefetch_failed = failed
 
     def _search_backend(self, query: str) -> str:
         """同步搜索 mem0 API，返回格式化的记忆文本。无结果返回空。"""
@@ -157,6 +170,8 @@ class Mem0Adapter(ExternalMemoryProvider):
         with self._prefetch_lock:
             if self._prefetch_query == query and self._prefetch_done:
                 result = self._prefetch_result
+                if self._prefetch_failed:
+                    record_memory_failure("mem0 prefetch backend failed")
                 self._prefetch_result = ""
                 self._prefetch_done = False
                 return result
@@ -181,6 +196,7 @@ class Mem0Adapter(ExternalMemoryProvider):
                 headers=self._auth_headers(),
             )
         except Exception as exc:
+            record_memory_failure(exc)
             logger.warning("Mem0 sync_turn failed: %s", exc)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:

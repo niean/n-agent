@@ -57,7 +57,7 @@ class TestRunShIntegration:
             line for line in run_sh.splitlines() if "all)" in line
         )
         assert "otel_smoke.sh" in all_line, "all 列表未接入观测冒烟"
-        for suite in ("artifacts.sh", "config-bundle.sh", "conversations.sh"):
+        for suite in ("artifacts.sh", "conversations.sh"):
             assert suite in all_line, f"既有 suite {suite} 被移除"
 
     def test_usage_lists_otel_smoke(self, run_sh):

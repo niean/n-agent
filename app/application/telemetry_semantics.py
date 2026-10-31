@@ -865,12 +865,56 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
 
 
 _BUSINESS_OPERATIONS = {
+    "cli.request": "CLI 请求处理",
     "gateway.message": "网关消息处理", "feishu.event": "飞书事件处理",
     "task.run": "后台任务执行", "delegation.member": "委派成员执行",
+    "task.submit": "任务提交",
     "skill.review": "技能后台审查", "curator.run": "技能整理执行",
 }
+_MEMORY_PROVIDERS = frozenset({"builtin", "multi-project", "mem0", "honcho", "holographic", "other"})
+_MEMORY_OPERATIONS = {
+    "prefetch": "记忆召回", "sync": "记忆同步", "tool": "记忆工具调用",
+    "prompt": "记忆提示装配", "pre_compress": "记忆压缩前抢救", "probe": "记忆探测",
+    "search": "记忆后台搜索",
+}
+_BUSINESS_OPERATIONS.update({
+    f"memory.{operation} {provider}": label
+    for operation, label in _MEMORY_OPERATIONS.items() for provider in _MEMORY_PROVIDERS
+})
+_memory_facts = contextvars.ContextVar("memory_observation_facts", default=None)
+
+
+@contextmanager
+def memory_operation(operation, provider, *, session_id=None, **inputs):
+    """Bounded provider operations; raw content only enters projected details."""
+    if operation not in _MEMORY_OPERATIONS:
+        raise ValueError("unknown memory telemetry operation")
+    provider = provider if provider in _MEMORY_PROVIDERS else "other"
+    inherited = _execution_ids.get() or {}
+    with business_operation(f"memory.{operation} {provider}", source=inherited.get("source"),
+                            session_id=session_id or inherited.get("session_id")) as facts:
+        facts["details"] = project_details(**inputs)
+        token = _memory_facts.set(facts)
+        try:
+            yield facts
+        finally:
+            _memory_facts.reset(token)
+
+
+def record_memory_failure(exc, *, outcome="failed"):
+    """Reflect provider-handled failures without changing their fallback behavior."""
+    try:
+        facts = _memory_facts.get()
+        if facts is not None:
+            facts["outcome"] = outcome if outcome in {"failed", "timed_out"} else "failed"
+            facts["details"].update(project_details(error=str(exc)))
+    except Exception:
+        pass
+
+
 _BUSINESS_IDENTIFIERS = frozenset({
     "nagent.task.id", "nagent.task.run_id", "nagent.delegation.id",
+    "nagent.task.trace_context",
     "nagent.delegation.member_id", "nagent.delegation.role",
 })
 _BUSINESS_OUTCOMES = frozenset({
@@ -897,6 +941,13 @@ def _extract_trace_context(carrier):
         return TraceContextTextMapPropagator().extract({"traceparent": value}, context=Context())
     except Exception:
         return Context()
+
+
+def task_trace_context_status(carrier):
+    """A bounded diagnostic; an invalid persisted parent never inherits a tick."""
+    if trace.get_current_span(_extract_trace_context(carrier)).get_span_context().is_valid:
+        return "inherited"
+    return "missing" if not carrier else "invalid"
 
 
 @contextmanager

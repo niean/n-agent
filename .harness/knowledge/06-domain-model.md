@@ -456,7 +456,6 @@ N-Agent 用户入口类型，有如下几类：
 | ACP Agent | Stdio+JSON | NAgentACPAgent | GatewayService → ChatCompletionService | app/interfaces/cli/commands/acp/ |
 | 定时任务执行 | - | SchedulerRunner | ScheduleRunService → ChatCompletionService | app/application/scheduler_runner.py |
 | 任务执行 | - | TaskRunner | TaskRunService → ChatCompletionService | app/application/task_runner.py |
-| Skill 自进化审查 | - | AgentGraphRunner finalize 后异步触发 | SkillEvolutionService → ChatCompletionService | app/application/skill_evolution_service.py |
 | Skill 周期维护 | - / Stdio+行式文本 | 空闲周期检查 / CLI Curator 命令 | SkillCuratorService；模型整理时经 SkillEvolutionService → ChatCompletionService | app/application/skill_curator_service.py；app/interfaces/cli/commands/curator.py |
 
 其中，
@@ -467,8 +466,7 @@ N-Agent 用户入口类型，有如下几类：
 - ACP协议生命周期保留在 NAgentACPAgent 中。
 - 定时任务执行由 SchedulerRunner 定时触发，并通过 ScheduleRunService->ScheduledAgentExecutor 直接调用 ChatCompletionService，执行结果再由 ScheduleOutboundDelivery 投递。
 - 任务执行由 TaskRunner 触发，并通过 TaskRunService->TaskAgentExecutor 直接调用 ChatCompletionService。
-- Skill 自进化审查在前台 AgentRun finalize 后满足审查触发条件时，由 SkillEvolutionService 异步启动独立 AgentRun；根操作为 `skill.review`，入口与内部 AgentRun 来源统一为 `skill_review`，通过 Span Link 关联触发它的前台执行。`skill_view` 是该运行可调用的工具，不是入口。
-- Skill 周期维护在满足空闲与维护周期条件时触发，也可由 CLI 手动运行；根操作为 `curator.run`。规则维护本身不启动 AgentRun；启用模型整理且存在候选技能时，复用 SkillEvolutionService，形成 `curator.run → skill.review → invoke_agent`，来源为 `curator`。
+- Skill 周期维护在满足空闲与维护周期条件时触发，也可由 CLI 手动运行；根操作为 `curator.run`。规则维护本身不启动 AgentRun；启用模型整理且存在候选技能时，复用 SkillEvolutionService，使用独立的 `curator-…` 会话，形成 `curator.run → skill.review → invoke_agent`，来源为 `curator`。
 
 
 ---
@@ -537,6 +535,10 @@ ConversationMessage + Summary
 ## Skill自进化
 
 Skill 自进化是 Agent Runtime 对会话摘要的后台审查，把可复用、非平凡工作流沉淀为受治理的技能。每隔N轮对话触发1次自进化审查。
+
+前台 AgentRun finalize 后满足触发条件时，SkillEvolutionService 经 ChatCompletionService 异步启动独立 AgentRun，复用原对话的 `session_id`，以 `persist_messages=False` 执行，不持久化审查消息，也不改变原会话来源。因此它不构成独立 XUI 入口或会话筛选类型。
+
+审查根操作为 `skill.review`，根操作与内部 AgentRun 的观测执行来源均为 `skill_review`，通过 Span Link 关联触发它的前台执行。独立 AgentRun 与独立会话是不同概念；`skill_review` 仅标识此次执行来源。`skill_view` 是审查可调用的工具。
 
 ```text
 会话摘要 digest

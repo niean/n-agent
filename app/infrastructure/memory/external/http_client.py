@@ -8,6 +8,8 @@ from typing import Any
 from urllib import request as urlrequest
 from urllib.parse import urlencode, urlparse
 
+from app.infrastructure.observability.urllib_capture import observe_urllib_request
+
 _DEFAULT_TIMEOUT = 10.0
 _DEFAULT_MAX_BYTES = 1024 * 1024  # 1MB
 
@@ -57,21 +59,25 @@ class ExternalMemoryHttpClient:
             h.setdefault("Content-Type", "application/json")
         req = urlrequest.Request(final_url, data=data, method=method, headers=h)
         opener = self._opener()
-        resp = opener.open(req, timeout=self._timeout)
-        try:
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > self._max_bytes:
-                    raise ValueError(f"response exceeds max_bytes={self._max_bytes}")
-                chunks.append(chunk)
-            body = b"".join(chunks)
-        finally:
-            resp.close()
+        with observe_urllib_request(req) as observation:
+            resp = opener.open(req, timeout=self._timeout)
+            observation.response(resp)
+            try:
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    observation.chunk(chunk)
+                    total += len(chunk)
+                    if total > self._max_bytes:
+                        raise ValueError(f"response exceeds max_bytes={self._max_bytes}")
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+                observation.finish(complete=True)
+            finally:
+                resp.close()
         if not body:
             return None
         try:

@@ -51,7 +51,14 @@
     - 观测：定时任务，补全定时任务应用层根Span；全面检查，补全AgentRun的入口层根Span
         - 迭代：定时任务、任务、GW等入口，补全请求和结果payload。chat已出过类似问题，你要找出原因(规范错误、还是模型不长记性)、加上教训，避免OTel Trace再犯相似问题
     - 观测：Grafana，examplar当前只关联LLM指标上，我希望examplar能体现出AgentRun入口差异，如Chat、GW、定时任务、任务等。如何增加metric及examplar、以及如何修改Grafana大盘？请实施
-    - 会话：FE，会话如何关联Grafana大盘，是否为会话定制观测Grafana大盘？业界有没有成熟实践？比如，会话链接跳转对应的观测大盘页面(Trace、Log、Token消耗等)。
+    - 测试：E2E，结果关联Trace，方便人工审阅
+        - 观测：mem0，调用路径存在Trace埋点缺口，请修复；其它外置memory，也要查漏补缺
+        - 任务：对于有明确上游的任务，任务的首次执行、自动重试、进程恢复 都应该复用上游TraceID；上游包括 对话、CMD、API、人工点击、定时触发等。只有缺少上下文的任务，才允许创建根 Trace（且要显式标注为异类）
+        - 测试：E2E，Config Bundle移出E2E测试，可归类为install或migrate测试；测试结果打平展示在消息框，列`分类|用例|结果|TraceID|链接`，分类有对话、制品、OTel => 结果可以放到 locals/e2e-reports/${测试ID}/result.md
+        - 对话：会话，筛选是否缺少类型 `Skill自进化`、是否跟`Curator`地位相似？答：否，Skill自进化没有独立会话、复用sessionid
+        - 对话：标题生成，是否能从LLM、改为本地算法生成？答：是。标题改为本地算法生成，LLM异步生成需在.env中开启配置
+
+    - 会话：对话，如何关联Trace信号？比如，记录对话和Trace对应关系。业界有没有成熟产品实践？
 
 
 ---

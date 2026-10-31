@@ -2,8 +2,9 @@
 
 ``instrument_app(app)`` installs FastAPI middleware instrumentation while
 the middleware stack is still unbuilt (it must be called from
-``create_app`` before returning, never from lifespan), and registers the
-global httpx/sqlite3 instrumentors exactly once per process.
+``create_app`` before returning, never from lifespan). ``instrument_clients``
+registers global httpx/sqlite3 instrumentors once per process from shared
+service assembly, including independent CLI/ACP processes.
 
 Safety rules (spec-261024-otel-observability, Components 1 & 4):
 
@@ -92,11 +93,12 @@ _HTTP_RESOURCE_SEGMENTS = frozenset({
     "tenants", "projects", "sessions", "conversations", "tasks", "runs",
     "messages", "memories", "files", "documents", "artifacts", "agents",
     "threads", "assistants", "models", "search", "downloads", "uploads",
+    "workspaces", "peers", "conclusions",
 })
 _HTTP_ACTION_SEGMENTS = frozenset({
     "search", "list", "create", "batch", "count", "status", "health", "me",
     "metadata", "config", "schema", "query", "import", "export", "upload",
-    "download", "content", "versions", "revisions", "completions",
+    "download", "content", "versions", "revisions", "completions", "add",
 })
 _HTTP_CREDENTIAL_SEGMENTS = frozenset({
     "token", "tokens", "key", "keys", "api-key", "api_key", "apikey", "secret",
@@ -670,8 +672,6 @@ def instrument_app(
 
 
 def _instrument_app(app: Any, settings: Any, tracer_provider: Any) -> bool:
-    global _HTTPX_REGISTERED, _SQLITE3_REGISTERED, _HTTP_CAPTURE_REGISTERED
-
     if settings is None:
         try:
             from app.config import Settings
@@ -696,6 +696,8 @@ def _instrument_app(app: Any, settings: Any, tracer_provider: Any) -> bool:
         provider = trace_api.get_tracer_provider()
     filtering_provider = _FilteringTracerProvider(provider)
 
+    clients_ready = instrument_clients(settings=settings, tracer_provider=provider)
+
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
     app.add_middleware(_HttpAccessFactsMiddleware)
@@ -705,6 +707,33 @@ def _instrument_app(app: Any, settings: Any, tracer_provider: Any) -> bool:
         excluded_urls=_fastapi_excluded_urls(),
         exclude_spans=["receive", "send"],
     )
+
+    return clients_ready
+
+
+def instrument_clients(*, settings: Any = None, tracer_provider: Any = None) -> bool:
+    """Register HTTPX capture and SQLite once for HTTP, CLI and ACP alike.
+
+    Call after SDK setup and before constructing services/clients. Transport
+    capture stays inside the HTTPX span and observes only business-consumed
+    bytes, using the existing sanitized, bounded details projection.
+    """
+    try:
+        return _instrument_clients(settings, tracer_provider)
+    except Exception as exc:
+        try:
+            _logger.warning("instrument_clients: automatic instrumentation skipped (%s)",
+                            type(exc).__name__)
+        except Exception:
+            pass
+        return False
+
+
+def _instrument_clients(settings: Any, tracer_provider: Any) -> bool:
+    global _HTTPX_REGISTERED, _SQLITE3_REGISTERED, _HTTP_CAPTURE_REGISTERED
+
+    provider = tracer_provider if tracer_provider is not None else trace_api.get_tracer_provider()
+    filtering_provider = _FilteringTracerProvider(provider)
 
     # Global instrumentors: exactly once per process. The registration flag
     # is committed only AFTER the instrumentor call succeeds -- if

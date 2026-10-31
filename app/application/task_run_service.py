@@ -47,7 +47,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.task_session import task_execution_session_id
-from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_semantics import business_operation, task_trace_context_status
 from app.application.telemetry_details import project_details
 from app.domain.policy import PolicyOutcome
 from app.domain.task import (
@@ -448,8 +448,10 @@ class TaskRunService:
         run_id: int,
         claim_lock: str,
     ) -> None:
-        with business_operation("task.run", source="task", session_id=task_execution_session_id(task), run_id=str(run_id), detached=True,
-                                identifiers={"nagent.task.id": task.id, "nagent.task.run_id": run_id}) as facts:
+        carrier = task.trace_context or {}
+        with business_operation("task.run", source="task", session_id=task_execution_session_id(task), run_id=str(run_id), parent_carrier=carrier,
+                                identifiers={"nagent.task.id": task.id, "nagent.task.run_id": run_id,
+                                             "nagent.task.trace_context": task_trace_context_status(carrier)}) as facts:
             facts["details"] = project_details(input_messages={"title": task.title, "body": task.body})
             outcome = await self._run_claim(task, run_id, claim_lock, _trace_facts=facts)
             facts["outcome"] = outcome

@@ -71,6 +71,7 @@ python -m pytest
 
 ### 端到端测试
 端到端测试执行策略：
+- 用户明确要求执行 E2E 时，用户指令优先于 `tests.e2e.enabled` 等本地启停配置，必须执行；该开关只控制工作流自动触发，不得据此跳过人工明确要求的测试。
 - 所有端到端测试必须在 Docker 环境进行，禁止在宿主机直接执行
 - 除标准化单元测试 `python -m pytest` 外，禁止在宿主机直接执行 N-Agent Python 代码
 - 禁止在宿主机直接启动 N-Agent 服务
@@ -86,11 +87,12 @@ sh tests/e2e/run.sh
 
 ### E2E 结果展示约定
 
-- 结果总结按 `用例 | 结果 | Trace ID | 现场` 展示；结果使用 PASS / FAIL / SKIP，重试须说明次数，不仅输出整体 PASS。
-- 有实际 Trace ID 时，现场列使用 `[查看Trace](完整URL)`，必须携带该次用例的真实 32 位十六进制 Trace ID，直接进入 Grafana Explore 的 Tempo 查询；禁止只给 Explore 首页、用例名或 exemplar 链接。
+- 测试结果列表写入 `locals/e2e-reports/${测试ID}/result.md`，以单张表打平展示，列为 `分类 | 用例 | 结果 | TraceID | 链接`；分类为对话、制品、OTel；结果使用 PASS / FAIL / SKIP，重试须说明次数，不仅输出整体 PASS。
+- 有实际 Trace ID 时，链接列使用 `[查看Trace](完整URL)`，必须携带该次用例的真实 32 位十六进制 Trace ID，直接进入 Grafana Explore 的 Tempo 查询；禁止只给 Explore 首页、用例名或 exemplar 链接。
 - 链接沿用应用自检接口 `links.Trace` 的配置地址，保留域名、子路径和 orgId；使用 Tempo 数据源 `nagent-tempo`，编码 Explore panes，queryType=traceql、query=实际 Trace ID。不得把 session_id / tool_call_id 当作 Trace ID。
 - 一个用例有多条 Trace 时按消息、尝试或运行分别列出；失败时保留已取得的 Trace。未执行、OTel 未启用、未采集到 Trace 或不产生 Trace 的检查必须注明原因，不生成空链接或借用其他用例链接。
-- 汇总须给出报告文件位置。OTel E2E 由 `tests/e2e/result_report.py` 生成 `locals/e2e-reports/<run-id>/report.md` 和 `report.json`；JSON 保存 case id/name/result/trace_id/trace_url/reason，Markdown 与终端使用上述表格。报告持久化不依赖测试会话保留，也不等待 exemplar。
+- 消息框只给简短 Summary 和本地可点击的 `[result.md](绝对路径)` 链接，不展开结果列表；Summary 按平铺结果行统计，包含失败的尝试和清理结果，不称为用例数。OTel E2E 由 `tests/e2e/result_report.py` 生成 `locals/e2e-reports/<run-id>/result.md` 和 `report.json`（兼容保留 `report.md`）；JSON 保存 case category/id/name/result/trace_id/trace_url/reason，Markdown 使用上述表格；终端只输出按结果行统计的 PASS / FAIL / SKIP Summary 和 `result.md` 路径。`tests/e2e/run.sh` 将本次对话、制品、OTel 子报告汇总到同一 `result.md` / `report.json`，保留每次尝试、消息和 Trace 的独立行；失败保留报告与日志。报告持久化不依赖测试会话保留，也不等待 exemplar。
+- Config Bundle 属于 migrate 测试，独立入口 `bash tests/migrate/config-bundle.sh`，仍在 Docker 内执行；不纳入 `tests/e2e/run.sh`。
 
 ## 扫描维度
 

@@ -126,6 +126,7 @@ from app.infrastructure.schedule.croniter_calculator import CroniterScheduleCalc
 from app.infrastructure.schedule.outbound import ScheduleOutboundDelivery
 from app.infrastructure.schedule.prompt_safety import DeterministicPromptSafetyScanner
 from app.infrastructure.session.llm_title_generator import LLMTitleGenerator
+from app.infrastructure.session.local_title_generator import LocalTitleGenerator
 from app.infrastructure.skill.file_loader import SkillFileLoader, SkillFileLoaderConfig
 from app.infrastructure.skill.seed_runner import seed_default_skills
 from app.infrastructure.skill.skill_usage_store import SkillUsageStore
@@ -656,6 +657,12 @@ def build_application_services(
     from app.application.telemetry_semantics import NoopTelemetry, SemanticsTelemetry
 
     telemetry = SemanticsTelemetry() if settings.otel_enabled else NoopTelemetry()
+    if settings.otel_enabled:
+        # Shared by HTTP and independent CLI/ACP processes. Register before
+        # constructing SDK clients; FastAPI middleware has its own lifecycle.
+        from app.infrastructure.observability.instrumentors import instrument_clients
+
+        instrument_clients(settings=settings)
     # Profiler composition-root wiring (T8): one sampler per Python PID,
     # created lazily per PID (fork-invariant), shared by the HTTP lifespan
     # and application_runtime (both assemble through this builder). Started
@@ -1163,7 +1170,10 @@ def build_application_services(
     )
     session_service = SessionService(
         memory_store,
-        title_generator=LLMTitleGenerator(holder, lambda: holder.current_model),
+        title_generator=(
+            LLMTitleGenerator(holder, lambda: holder.current_model)
+            if settings.session_title_llm_enabled else LocalTitleGenerator()
+        ),
         external_memory_manager=external_memory_manager,
         hook_dispatcher=plugin_service,
     )

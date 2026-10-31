@@ -32,6 +32,9 @@ def test_caller_identifies_application_function_without_reading_arguments():
     ("/search/alice@example.com/results", "/search/{id}/results"),
     ("/private/PRIVATE", "/private/{redacted}"),
     ("/v1/memories/search", "/v1/memories/search"),
+    ("/v3/memories/add/", "/v3/memories/add"),
+    ("/v3/workspaces/alice/peers/bob/card", "/v3/workspaces/{id}/peers/{id}/card"),
+    ("/v3/workspaces/alice/conclusions/secret-fact", "/v3/workspaces/{id}/conclusions/{id}"),
     ("/v1/models?token=PRIVATE#PRIVATE", "/v1/models"),
     ("/api/12345/health", "/api/{id}/health"),
 ])

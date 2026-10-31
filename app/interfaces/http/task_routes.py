@@ -30,12 +30,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, File, Form, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
 from app.interfaces.http._content_disposition import build_content_disposition
 from app.application.task_run_service import TaskRunService
 from app.application.task_service import TaskService
+from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
 from app.domain.task import (
     BulkUpdateCommand,
     BulkUpdateItem,
@@ -199,7 +201,18 @@ def register_task_routes(
         }
 
     @router.post("/chat/tasks")
-    async def create_task(payload: dict = Body(default_factory=dict)):
+    async def create_task(request: Request, payload: dict = Body(default_factory=dict)):
+        # This management write is a real task trigger; ordinary polling stays untraced.
+        carrier = {"traceparent": request.headers["traceparent"]} if "traceparent" in request.headers else None
+        with business_operation("task.submit", source="api", parent_carrier=carrier) as facts:
+            facts["details"] = project_details(input_messages=payload)
+            response = await create_task_payload(payload)
+            status = getattr(response, "status_code", 200)
+            facts["outcome"] = "failed" if status >= 400 else "success"
+            facts["details"].update(project_details(output_messages=response if isinstance(response, dict) else {"status_code": status}))
+            return response
+
+    async def create_task_payload(payload: dict):
         try:
             scheduled_at = None
             raw_scheduled = payload.get("scheduled_at")

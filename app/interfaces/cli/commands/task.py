@@ -15,6 +15,8 @@ from app.interfaces.cli.render import (
     render_data,
     resolve_format,
 )
+from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
 
 
 def _load_task_service() -> Any:
@@ -136,7 +138,19 @@ def _cmd_delete(args) -> int:
 
 
 def _cmd_create(args) -> int:
-    service = _load_task_service()
+    from app.main import application_runtime
+
+    with application_runtime() as services:
+        with business_operation("cli.request", source="cli") as facts:
+            facts["details"] = project_details(input_messages={"title": args.title, "body": getattr(args, "body", None)})
+            result = _create_task(args, services.task_service, facts)
+            facts["outcome"] = "skipped" if services.task_service is None else ("success" if result == 0 else "failed")
+            if "output_messages" not in facts["details"]:
+                facts["details"].update(project_details(output_messages={"exit_code": result}))
+            return result
+
+
+def _create_task(args, service, facts) -> int:
     if service is None:
         return _disabled()
     kwargs: dict[str, Any] = {"title": args.title, "created_by": getattr(args, "created_by", "") or "cli"}
@@ -165,6 +179,7 @@ def _cmd_create(args) -> int:
             dt = dt.replace(tzinfo=timezone.utc)
         kwargs["scheduled_at"] = dt
     task = asyncio.run(service.create_task(**kwargs))
+    facts["details"].update(project_details(output_messages=_task_to_dict(task)))
     fmt = resolve_format(args)
     render_data(_task_to_dict(task), fmt=fmt, console=make_console())
     return 0

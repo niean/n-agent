@@ -69,7 +69,7 @@ Agent Runtime 只依赖 LLMProvider 端口，不直接依赖具体 Provider SDK�
 多 Provider 注册表 + 单一 active provider 的运行时模型由 `ActiveProviderHolder` 适配。
 
 规则：
-- Holder 是 Application 层适配器，实现 Domain `LLMProvider` 协议；下游 Application 服务（ChatCompletionService、AgentGraphRunner、SessionService 的 LLMTitleGenerator、ModelService）只依赖 LLMProvider 端口，不感知背后是热切换实现。
+- Holder 是 Application 层适配器，实现 Domain `LLMProvider` 协议；下游消费者（ChatCompletionService、AgentGraphRunner、ModelService，以及启用 LLM 标题时的 LLMTitleGenerator）只依赖 LLMProvider 端口，不感知背后是热切换实现。标题默认使用本地算法；仅 `N_AGENT_SESSION_TITLE_LLM_ENABLED=true` 时组装 LLMTitleGenerator。
 - 注入 `Callable[[ProviderConfig, str], LLMProvider]` 工厂；swap 时通过 `asyncio.Lock` 保护，重新构造底层 provider 实例。
 - `current_model` / `current_config` 属性供 ModelService.default_model / LLMTitleGenerator.model 以 Callable 形式动态读取，避免 active 切换后老 model 残留。
 - 进行中的请求继续使用调用前抓到的旧 provider 引用，新切换不抢占；保证当前 SSE 流不中断。
@@ -1385,6 +1385,8 @@ GET /chat/skills (已存在)
 
 中断恢复（进程被 kill 后残留）：cli 渠道的 Gateway 入口键 `conversation_id`（`e2e-<run_id>-<case_id>`）随 session intent 一并登记——prepare 的第一条子进程命令已在服务端建成 `cli-<uuid>` 会话、第二条 `--browse` 才解析真实 ID，进程在该窗口内被 kill 时 manifest 只剩无 id 的 intent；Cleaner `_resolve_intent_sessions` 对无 id 且带 conversation_id 的 intent session 用只读 `--browse` 重新解析：恰一个 ID 回填后走正常删除，零个视为从未建成直接删除态，多个拒绝猜测记 failed（acp/dashboard 渠道 intent 分别因 upsert 窗口极小、id 预生成而不需要此路径）。会话删除的任务侧级联见模式十六：`delete_task` 清理 worker 会话按显式 `execution_session_id` -> 无显式且无 origin 时清理派生 `task-{uuid5(task.id)}`（kanban/CLI/API 任务的 worker 会话，不级联会永久泄漏）-> origin_session_id 存在时跳过（worker 复用用户 Chat 会话，禁删）。
 
+Trace 证据先于清理持久化：`trace_report.py` 按每条消息的纳秒时间窗口、真实会话 ID 和 `nagent.source` 查询 Tempo 并回读详情，不能拿工具 ID、会话 ID、其他尝试或同会话的后台运行替代。Task 使用相同的执行会话选择规则（显式执行会话 -> origin -> 确定性 uuid5），额外匹配 `task.run` 的 Task ID 与任务详情中所有已开始 Run ID，等待全部结束入口 Span 到齐；进入 Agent 前失败的 Run 也有入口 Span 现场。有上游时这些 Run Span 属于上游 Trace，不要求各 Run 独立 Trace。采集有总 deadline；启用 OTel 时消息缺 Trace、关联失败或详情不可读均使该尝试失败，已采集现场仍保留。每次尝试在重试清理前独立落盘，最终 JSON/Markdown/终端列出逐消息、尝试和后台 Task 现场；无 OTel、未执行、纯管理/文件配置检查分别注明原因，不生成假链接。
+
 ## 模式四十四：E2E 宿主编排脚本的 RUNNING 任务清理契约
 
 创建真实 Task（异步 LLM worker）的 E2E 脚本（tests/e2e/artifacts.sh）cleanup 必须同时满足三层约束，缺一层就会泄漏任务 + 派生 worker 会话（task-{uuid5}）：
@@ -1416,6 +1418,8 @@ OTel span/usage 的生命周期权威必须与业务生命周期同侧，否则�
 
 ## 模式四十七：观测失败永不破坏业务 + 敏感出口三重封口 + 组装根防泄漏
 
+客户端埋点与 HTTP 服务端中间件分开装配：公共 `build_application_services` 在 SDK 配置后调用 `instrument_clients`，覆盖独立 CLI/ACP 进程；`create_app` 仅另外安装 FastAPI 中间件，兼容直接 `instrument_app` 的调用仍幂等注册客户端。HTTPX 捕获继续复用统一请求/响应投影、实际消费字节与延迟收尾；注册客户端失败不得连带阻止 SERVER Span。不得用手动 chat Span 的存在替代下游 HTTP payload 验收。
+
 执行摘要扩展：`telemetry_semantics.execution_log_snapshot` 返回当前可信会话/运行标识，以及仅在完成日志同步发出期间存在的阶段摘要。`main._configure_execution_logging` 注入日志适配器，stderr 与 OTLP 使用同一字段白名单。完成摘要须在 Span 活跃时生成并发出，之后才 end/reset，避免日志缺少 trace_id 或跨请求串号。AgentGraph 向 `with agent_run(...) as run_handle` 的 yield 句柄写入结束事实，返回失败与异常失败均需正确 outcome。无 root handler 的 CLI 为语义完成日志与 HTTP 完成日志临时安装桥，退出移除并复原 level，保留 root lastResort 行为。
 
 HTTP 完成日志：两个对话入口的 HTTP SERVER Span 在结束前只记一次 `http_request_completed`，显式绑定自身 Trace/Span ID，携带方法、路由、状态码、耗时与结果；流式响应等最终响应体结束才记录。`_HttpAccessFactsMiddleware` 补齐未采样 Span 的响应事实，日志不依赖 Trace 是否采样；异常、取消和日志失败不改变业务传播。HTTP 现场通过独立 ContextVar 同步投影到 stderr/OTLP，不继承子操作详情，请求/响应正文、查询参数与请求头按统一详情投影保留，凭据逐字段遮盖；管理写请求记录独立访问 Log，不制造孤儿 Span。
@@ -1445,6 +1449,6 @@ Agent 模型选择不调用远程 `list_models`，也不维护模型列表缓存
 
 ## 模式四十九：业务入口生命周期与异步 Trace 归属
 
-应用业务入口的生命周期观测统一使用 `telemetry_semantics.business_operation`。同步入口保留父子关系；独立后台工作用新 Trace + Link；持久化委派只从所属创建事件恢复 traceparent，不能继承领取 tick 的上下文。固定操作名称、覆盖范围及旧记录行为以 `07-observability.md` 为权威，事件载体以 `04-data-boundaries.md` 为权威。
+应用业务入口的生命周期观测统一使用 `telemetry_semantics.business_operation`。同步入口保留父子关系；Task 从创建时原子保存的 trace_context 恢复，上游 Trace ID 覆盖首次执行、自动重试及进程恢复，每次 task.run 独立 Span；其他独立后台工作按规定使用新 Trace + Link。持久化委派只从所属创建事件恢复 traceparent，Task/委派都不能继承领取 tick 的上下文。Task 仅在上下文缺失/无效时创建明确标记的根 Trace。固定操作名称、覆盖范围及旧记录行为以 `07-observability.md` 为权威，载体以 `04-data-boundaries.md` 为权威。
 
 通用验收复用 `07-observability.md` 的“验收清单”：不仅断言 Span 存在，还核对真实 SDK 的直接父级、Link、采样和 exemplar 的双 ID，后端查询关联及历史样本另留证据。异步隔离分别处理业务现场与 OTel 上下文，错误返回与异常同样纳入状态判断，配置测试恢复所有被修改的消费者。

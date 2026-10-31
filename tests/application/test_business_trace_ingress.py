@@ -51,6 +51,81 @@ def named(exporter, name):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_cli_request_is_explicit_entry_above_gateway(sdk, streaming):
+    from app.interfaces.cli.cli_chat_adapter import CliChatAdapter
+
+    _, exporter = sdk
+    harness = Harness()
+
+    async def events():
+        yield ChatEvent(ChatEventType.CONTENT_DELTA, content="done")
+        yield ChatEvent(ChatEventType.MESSAGE_DONE, content="done")
+
+    async def complete(request):
+        if request.stream:
+            return events()
+        return ChatCompletionResult(session_id=request.session_id, model="test", message={"content": "done"})
+
+    harness.chat_service.complete = complete
+    client = CliChatAdapter(harness.service())
+    if streaming:
+        async for _ in client.send_stream("hello", "local"):
+            assert not any(s.name == "cli.request" for s in exporter.get_finished_spans())
+    else:
+        await client.send("hello", "local")
+    entry = named(exporter, "cli.request")
+    gateway = named(exporter, "gateway.message")
+    assert entry.parent is None
+    assert gateway.parent.span_id == entry.context.span_id
+    assert gateway.context.trace_id == entry.context.trace_id
+    assert entry.end_time >= gateway.end_time
+    assert entry.attributes["nagent.source"] == "cli"
+    assert "hello" in entry.attributes["nagent.details.input_messages.content"]
+    content = entry.attributes["nagent.details.output_messages.content"]
+    assert content == "done" if streaming else content == '[{"content": "done"}]'
+    assert not trace.get_current_span().get_span_context().is_valid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,expected", [("error", "failed"), ("cancelled", "cancelled"), ("close", "cancelled"), ("raise", "error")])
+async def test_cli_request_stream_failure_and_close_restore_context(sdk, mode, expected):
+    from app.interfaces.cli.cli_chat_adapter import CliChatAdapter
+
+    tracer, exporter = sdk
+    closed = []
+
+    async def events(*args, **kwargs):
+        try:
+            yield ChatEvent(ChatEventType.CONTENT_DELTA, content="prefix")
+            if mode == "raise":
+                raise RuntimeError("broken")
+            yield ChatEvent(ChatEventType.ERROR, error="broken", finish_reason=mode)
+        finally:
+            closed.append(True)
+
+    client = CliChatAdapter(SimpleNamespace(handle_message_stream=events))
+    with tracer.start_as_current_span("caller") as caller:
+        stream = client.send_stream("hello", "local")
+        if mode == "close":
+            await anext(stream)
+            await stream.aclose()
+        elif mode == "raise":
+            with pytest.raises(RuntimeError, match="broken"):
+                async for _ in stream:
+                    pass
+        else:
+            async for _ in stream:
+                pass
+        assert trace.get_current_span() is caller
+    entry = named(exporter, "cli.request")
+    assert entry.parent.span_id == caller.get_span_context().span_id
+    assert entry.attributes["nagent.outcome"] == expected
+    assert entry.attributes["nagent.details.output_messages.content"] == "prefix"
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["cli", "acp", "feishu"])
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_gateway_entry_contains_agent_and_stream_consumption(sdk, source, streaming):

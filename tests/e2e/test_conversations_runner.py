@@ -3708,6 +3708,7 @@ def _orch_deps(tmp_path, *, driver, judge=None, cleaner=None, cli=None,
         environment="test-env",
         lock_path=str(tmp_path / "run.lock"),
         acp_cwd=str(tmp_path),
+        trace_collector_fn=lambda result, driver, environ: None,
     )
 
 
@@ -3801,6 +3802,47 @@ class TestOrchestrationArgs:
 
 
 class TestOrchestrationReplay:
+    def test_trace_collection_precedes_cleanup_and_persists_each_message(self, tmp_path):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _write_case(ds)
+        cleaner = _FakeCleaner()
+        deps = _orch_deps(tmp_path, driver=_FakeOrchDriver(), cleaner=cleaner)
+        def collect(result, driver, environ):
+            assert not cleaner.calls
+            msg = result["messages"][0]
+            ctx = msg["trace_context"]
+            assert ctx["session_id"] == "e2e-testrun1-c1"
+            assert 0 < ctx["start_ns"] < ctx["end_ns"]
+            msg["traces"] = [{"trace_id": "a" * 32, "trace_url": "https://trace.example"}]
+        deps.trace_collector_fn = collect
+        reports = tmp_path / "reports"
+        assert cr.main(["--dataset-dir", str(ds), "--report-dir", str(reports)], deps=deps) == 0
+        report = _run_report(tmp_path, reports)
+        assert report["cases"][0]["attempts"][0]["messages"][0]["traces"][0]["trace_id"] == "a" * 32
+        assert "a" * 32 in (reports / "testrun1" / "result.md").read_text()
+
+    def test_missing_trace_fails_and_retry_keeps_first_attempt(self, tmp_path):
+        ds = tmp_path / "ds"
+        ds.mkdir()
+        _write_case(ds)
+        deps = _orch_deps(tmp_path, driver=_FakeOrchDriver())
+        calls = []
+        def collect(result, driver, environ):
+            calls.append(result)
+            result["messages"][0]["trace_reason"] = "missing trace"
+            result["messages"][0]["traces"] = [{"trace_id": str(len(calls)) * 32}]
+            result.update(verdict="FAIL", reason="trace_incomplete")
+        deps.trace_collector_fn = collect
+        reports = tmp_path / "reports"
+        code = cr.main(["--dataset-dir", str(ds), "--report-dir", str(reports),
+                        "--max-retries", "1"], deps=deps)
+        assert code == 1
+        attempts = _run_report(tmp_path, reports)["cases"][0]["attempts"]
+        assert len(attempts) == 2
+        assert attempts[0]["messages"][0]["traces"][0]["trace_id"] == "1" * 32
+        assert attempts[1]["messages"][0]["traces"][0]["trace_id"] == "2" * 32
+
     def test_all_pass_exit_zero_and_report(self, tmp_path, capsys):
         ds = tmp_path / "ds"
         ds.mkdir()
@@ -3814,6 +3856,9 @@ class TestOrchestrationReplay:
         assert code == 0
         out = capsys.readouterr().out
         assert f"REPORT_DIR {tmp_path / 'reports' / 'testrun1'}" in out
+        assert f"RESULT_FILE {tmp_path / 'reports' / 'testrun1' / 'result.md'}" in out
+        assert "Summary（结果行）: PASS 1 | FAIL 0 | SKIP 0" in out
+        assert "| 分类 |" not in out
         report = _run_report(tmp_path, tmp_path / "reports")
         assert report["run_id"] == "testrun1"
         assert report["summary"] == {"total": 1, "passed": 1, "failed": 0}

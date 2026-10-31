@@ -104,7 +104,7 @@ def test_existing_compose_selection_survives(sandbox):
     assert [Path(p).name for p in records[1]["files"]] == ["custom.yml", "telemetry.yml"]
 
 
-@pytest.mark.parametrize("name", ["run.sh", "artifacts.sh", "config-bundle.sh", "conversations.sh", "otel_smoke.sh"])
+@pytest.mark.parametrize("name", ["run.sh", "artifacts.sh", "conversations.sh", "otel_smoke.sh"])
 def test_every_entry_uses_default_isolation(name):
     source = (ROOT / "tests/e2e" / name).read_text()
     assert 'e2e_environment default "$0"' in source
@@ -116,3 +116,9 @@ def test_invalid_suite_does_not_touch_docker(sandbox):
     result = subprocess.run(["bash", str(scripts / "run.sh"), "invalid-suite"], env=env, text=True, capture_output=True)
     assert result.returncode == 2
     assert not log.exists()
+
+
+def test_migration_entry_reuses_docker_isolation():
+    source = (ROOT / "tests/migrate/config-bundle.sh").read_text()
+    assert '/../e2e/environment.sh"' in source
+    assert 'e2e_environment default "$0"' in source

@@ -34,6 +34,7 @@ import concurrent.futures
 import contextlib
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -49,6 +50,12 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+_trace_spec = importlib.util.spec_from_file_location(
+    "e2e_trace_report", Path(__file__).with_name("trace_report.py"))
+_trace_report = importlib.util.module_from_spec(_trace_spec)
+_trace_spec.loader.exec_module(_trace_report)
 
 # =============================================================================
 # 第一节: 异常与常量
@@ -3330,7 +3337,8 @@ class RunnerDeps:
                  run_id_fn=make_run_id, monotonic=time.monotonic,
                  environ=None, workspace_root=None, environment=None,
                  lock_path=RUN_LOCK_PATH, acp_cwd=None,
-                 cli_session_browser=browse_cli_session_ids):
+                 cli_session_browser=browse_cli_session_ids,
+                 trace_collector_fn=_trace_report.collect_case):
         self.driver_factory = driver_factory
         self.cli_driver_factory = cli_driver_factory
         self.acp_driver_factory = acp_driver_factory
@@ -3348,6 +3356,7 @@ class RunnerDeps:
         self.lock_path = lock_path
         self.acp_cwd = acp_cwd or str(Path(__file__).resolve().parents[2])
         self.cli_session_browser = cli_session_browser
+        self.trace_collector_fn = trace_collector_fn
 
 
 class _CaseCtx:
@@ -3557,9 +3566,7 @@ def _worker_tool_evidence(driver, task_id):
     task = payload.get("task") if isinstance(payload.get("task"), dict) else payload
     if not isinstance(task, dict):
         return {"error": "task detail invalid response"}
-    worker_sid = task.get("execution_session_id") or task.get("origin_session_id")
-    if not worker_sid:
-        worker_sid = f"task-{uuid.uuid5(uuid.NAMESPACE_URL, str(task_id))}"
+    worker_sid = _trace_report.worker_session_id(task, task_id)
     calls = [normalize_tool_call(t) for t in driver.tool_calls(worker_sid)]
     return {"worker_session_id": worker_sid,
             "tool_calls": [_tool_evidence_item(t) for t in calls]}
@@ -3800,11 +3807,18 @@ def _run_case(case, *, run_id, dataset_dir, driver, deps, recorder, judge):
                 if msg.image_asset else None
             send_started = deps.monotonic()
             response_text = None
+            msg_res["trace_context"] = {
+                "session_id": session_id, "start_ns": time.time_ns(),
+                "replay_via": msg.replay_via, "source": case.channel,
+            }
+            # Persist the same object for every send/error/early-continue path.
+            msg_results[idx] = msg_res
             try:
                 if msg.replay_via == "task_api":
                     task_info = _create_task_via_api(
                         ctx, deps, run_id=run_id, case=case, msg=msg)
                     ctx.task_id = task_info["id"]
+                    msg_res["trace_context"]["task_id"] = ctx.task_id
                     ctx.task_deadline = task_info["deadline"]
                     response_text = (
                         f"task_api 任务已创建: id={task_info['id']} "
@@ -3875,6 +3889,7 @@ def _run_case(case, *, run_id, dataset_dir, driver, deps, recorder, judge):
                 tid = _extract_task_id_from_tools(new)
                 if tid:
                     ctx.task_id = tid
+                    msg_res["trace_context"]["task_id"] = tid
                     # 聊天创建按请求发出时间保守计算预算。
                     ctx.task_deadline = send_started + _task_terminal_timeout(case)
                     recorder.upsert({
@@ -3950,7 +3965,17 @@ def _run_case(case, *, run_id, dataset_dir, driver, deps, recorder, judge):
             msg_results[idx] = msg_res
             context.append({"user": _truncate(msg.content, 500),
                             "assistant": _truncate(response_text, 500)})
+    except Exception as exc:
+        runner_error = True
+        blocked = True
+        result["reason"] = f"runner_error: {type(exc).__name__}: {_truncate(str(exc), 300)}"
     finally:
+        ended = time.time_ns()
+        sent_messages = [m for m in msg_results if m.get("trace_context")]
+        for index, message in enumerate(sent_messages):
+            message["trace_context"]["end_ns"] = (
+                sent_messages[index + 1]["trace_context"]["start_ns"]
+                if index + 1 < len(sent_messages) else ended)
         # acp.start() 成功后的所有出口（含步骤 3/4 提前 return）统一在此关闭。
         if acp is not None:
             acp.close()
@@ -3980,7 +4005,7 @@ def _run_case(case, *, run_id, dataset_dir, driver, deps, recorder, judge):
     # 8. 用例 verdict 汇总。
     failed_msgs = [m for m in msg_results if m["verdict"] != "PASS"]
     failed_ses = [s for s in result["side_effects"] if s.get("verdict") != "PASS"]
-    if not failed_msgs and not failed_ses:
+    if not failed_msgs and not failed_ses and not runner_error:
         result["verdict"] = "PASS"
         result["reason"] = ""
     elif not result["reason"]:
@@ -3995,7 +4020,12 @@ def _run_case(case, *, run_id, dataset_dir, driver, deps, recorder, judge):
 
 def _write_report(report_path, report, secrets_):
     """报告落盘：统一脱敏 + 原子写。"""
-    atomic_write_json(report_path, _scrub_secrets(report, secrets_))
+    safe = _scrub_secrets(report, secrets_)
+    atomic_write_json(report_path, safe)
+    if "cases" in safe:
+        markdown = _trace_report.render_report(safe)
+        (report_path.parent / "result.md").write_text(markdown, encoding="utf-8")
+        report_path.with_suffix(".md").write_text(markdown, encoding="utf-8")
 
 
 def _cleanup_failed_attempt(case, *, driver, deps, recorder):
@@ -4053,9 +4083,23 @@ def _run_case_with_retries(case, *, run_id, args, deps, driver, recorder,
                 case, f"runner_error: {type(exc).__name__}: "
                       f"{_truncate(str(exc), 300)}")
             case_runner_error = True
+        sent = [m for m in case_result["messages"] if m.get("trace_context")]
+        if sent:
+            sent[-1]["trace_context"]["end_ns"] = time.time_ns()
+        try:
+            deps.trace_collector_fn(case_result, driver, deps.environ)
+        except Exception as exc:
+            case_result.update(verdict="FAIL", reason=f"trace_collection_error: {type(exc).__name__}")
+            case_runner_error = True
         attempts.append({"attempt": attempt,
                          "verdict": case_result["verdict"],
-                         "reason": case_result.get("reason", "")})
+                         "reason": case_result.get("reason", ""),
+                         "messages": case_result["messages"]})
+        # Failed attempts must survive retry cleanup and process interruption.
+        evidence_dir = Path(args.report_dir) / run_id / "attempts"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(evidence_dir / f"{case.id}-{attempt}.json", _scrub_secrets(
+            attempts[-1], [deps.environ.get(_BROWSER_PASSWORD_ENV) or ""]))
         if case_result["verdict"] == "PASS" or attempt == max_attempts:
             break
         print(f"RETRY {case.id} 第 {attempt + 1}/{max_attempts} "
@@ -4208,6 +4252,8 @@ def _run_replay_locked(args, deps):
     report["cleanup"]["exemptions"] = recorder.snapshot().get("exemptions", [])
     report["finished_at"] = datetime.datetime.now().isoformat(timespec="seconds")
     _write_report(report_path, report, secrets_)
+    print(_trace_report.render_summary(_scrub_secrets(report, secrets_)))
+    print(f"RESULT_FILE {report_dir / 'result.md'}")
     print(f"REPORT_DIR {report_dir}")
     return compute_exit_code(any_fail, runner_error, cleanup_failed)
 

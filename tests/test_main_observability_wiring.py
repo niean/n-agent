@@ -83,6 +83,22 @@ def fake_observability(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_build_registers_client_instrumentation_before_services(
+    tmp_path, fake_observability, monkeypatch, enabled
+):
+    import app.main as main_module
+    from app.infrastructure.observability import instrumentors
+
+    calls = []
+    monkeypatch.setattr(instrumentors, "instrument_clients",
+                        lambda **kwargs: calls.append(kwargs) or True, raising=False)
+    services = main_module.build_application_services(_settings(tmp_path, otel_enabled=enabled))
+    assert len(calls) == int(enabled)
+    if enabled:
+        assert calls[0]["settings"] is services.settings
+
+
 def test_build_constructs_handle_once_and_no_background_threads(
     tmp_path, fake_observability
 ):

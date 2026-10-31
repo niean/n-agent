@@ -63,6 +63,7 @@ from app.application.task_session import (
 )
 from app.domain.task_config import TaskConfig, TaskConfigProvider
 from app.domain.task_policy import TaskPolicy
+from app.application.telemetry_semantics import capture_trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +288,7 @@ class TaskService:
             goal_mode=goal_mode,
             goal_max_turns=goal_max_turns,
             idempotency_key=idempotency_key,
+            trace_context=capture_trace_context(),
         )
         created = await self.registry.create_task(task)
         await self.registry.append_event(
@@ -331,6 +333,8 @@ class TaskService:
         fields: Mapping[str, Any],
         expected_version: int,
     ) -> Task:
+        if {"trace_context", "trace_context_json"}.intersection(fields):
+            raise TaskValidationError("task trigger context is immutable")
         task = await self.get_task(task_id)
         if task.status == TaskStatus.RUNNING:
             raise TaskStateError(
@@ -350,6 +354,8 @@ class TaskService:
         # Pre-check: reject if any task is RUNNING or any item tries to set
         # status (status must go through action methods).
         for item in command.items:
+            if {"trace_context", "trace_context_json"}.intersection(item.fields):
+                raise TaskValidationError("task trigger context is immutable")
             if "status" in item.fields:
                 raise TaskStateError(
                     "status cannot be changed via bulk_update; use action methods"

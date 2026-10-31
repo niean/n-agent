@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from app.application.external_memory_manager import ExternalMemoryManager
+from app.application.telemetry_semantics import memory_operation
+from app.application.telemetry_details import project_details
 from app.domain.external_memory_provider import (
     ExternalMemoryProviderConfig, ExternalMemoryProviderNotFoundError,
     ExternalMemoryProviderRegistry, ExternalMemoryProviderType,
@@ -126,6 +128,13 @@ class ExternalMemoryProviderService(ActiveExternalMemoryReader):
 
     def probe(self, id: str) -> ExternalMemoryProbeStatus:
         cfg = self.get(id)
+        with memory_operation("probe", cfg.provider_type.value) as facts:
+            status = self._probe(id, cfg)
+            facts["outcome"] = "failed" if status == ExternalMemoryProbeStatus.FAILED else "success"
+            facts["details"].update(project_details(output_messages={"status": status.value}))
+            return status
+
+    def _probe(self, id: str, cfg: ExternalMemoryProviderConfig) -> ExternalMemoryProbeStatus:
         secret = self._registry.get_secret(id)
         factory = self._factories[cfg.provider_type]
         adapter = factory(self._build_adapter_config(cfg), secret.api_key if secret else None)

@@ -5,6 +5,7 @@ import logging
 from typing import Any
 
 from app.domain.memory_provider import ExternalMemoryProvider
+from app.application.telemetry_semantics import record_memory_failure
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,7 @@ class HonchoAdapter(ExternalMemoryProvider):
                 query={"summary": "true", "peer_target": self._user_id},
             )
         except Exception as exc:
+            record_memory_failure(exc)
             logger.warning("Honcho prefetch failed: %s", exc)
             return ""
         if not isinstance(ctx, dict):
@@ -228,6 +230,7 @@ class HonchoAdapter(ExternalMemoryProvider):
                 headers=self._auth_headers(),
             )
         except Exception as exc:
+            record_memory_failure(exc)
             logger.warning("Honcho sync_turn failed: %s", exc)
 
     def on_session_end(self, session_id: str) -> None:
