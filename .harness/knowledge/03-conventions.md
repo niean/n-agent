@@ -130,6 +130,7 @@ Trace 降噪：FastAPI 仅采集 `/chat/completions`、`/v1/chat/completions` �
 
 - 标准化单元测试允许直接在宿主开发环境执行，测试命令：`python -m pytest`
 - 所有端到端测试必须在 Docker 环境进行，禁止在宿主机直接执行
+- E2E 默认关闭 Skill 自进化后台审查与 Curator 周期维护：各 shell 入口通过 `tests/e2e/environment.sh` 的临时 Compose override 设置，子套件和 OTel 容器重建继承，结束恢复原部署。只有专门验证 Skill 自进化的独立用例可调用 `e2e_environment skill-evolution "$0" "$@"` 显式开启后台审查；普通用例固定使用 `default`，不提供全局开启开关。
 - 除标准化单元测试 `python -m pytest` 外，禁止在宿主机直接执行 N-Agent Python 代码
 - 禁止在宿主机直接启动 N-Agent 服务
 - 端到端测试前必须执行 `cd docker && ./restart.sh` 重建并启动服务，后续直接通过 `docker exec n-agent-n-agent-1 n-agent <子命令及参数>` 调用容器内 N-Agent

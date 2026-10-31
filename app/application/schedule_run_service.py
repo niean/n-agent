@@ -9,6 +9,7 @@ from app.application.information_flow_service import InformationFlowService
 from app.application.policy_snapshot import InformationFlowPolicyConfig
 from app.application.scheduled_agent_executor import ScheduledAgentResult
 from app.application.telemetry_semantics import schedule_execution_span
+from app.application.telemetry_details import project_details
 from app.domain.gateway import GatewaySessionKey
 from app.domain.gateway_policy import GatewayDeliveryDecision, GatewayOutboundRequest, GatewayPolicy
 from app.domain.information_flow import ReleaseTarget, SecretCatalog
@@ -120,11 +121,13 @@ class ScheduleRunService:
 
     async def run_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None) -> dict:
         with schedule_execution_span(claim.task.id, claim.task.session_id, claim.claim_id) as facts:
-            result = await self._execute_claim(claim, now=now)
+            facts["details"] = project_details(input_messages={"name": claim.task.name, "prompt": claim.task.prompt})
+            result = await self._execute_claim(claim, now=now, _trace_facts=facts)
             facts.update(result)
+            facts["details"].setdefault("output_messages", project_details(output_messages=result).get("output_messages"))
             return result
 
-    async def _execute_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None) -> dict:
+    async def _execute_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None, _trace_facts=None) -> dict:
         now = now or datetime.now(timezone.utc)
         decision = self._schedule_policy.evaluate(claim, now)
 
@@ -143,6 +146,8 @@ class ScheduleRunService:
 
         # --- Post-claim deny: record blocked and complete claim normally ---
         if decision.verdict is PolicyOutcome.DENY:
+            if _trace_facts is not None:
+                _trace_facts["details"].update(project_details(error=decision.reason))
             status = ScheduledTaskExecutionStatus.BLOCKED
             completed = self._completed(execution, status, started_at, error=decision.reason)
             await self.registry.record_execution_completed(completed)
@@ -157,6 +162,8 @@ class ScheduleRunService:
         # --- Run the agent (bounded by execution_timeout; on timeout/error we
         # still record completion so the lease is released instead of leaking) ---
         result = await self._run_executor(claim.task)
+        if _trace_facts is not None:
+            _trace_facts["details"].update(project_details(output_messages=result.output, error=result.error))
         completed = self._completed(execution, result.status, started_at, result.output, result.error)
         if not await self.registry.record_execution_completed(completed):
             return {"task_id": claim.task.id, "status": "stale"}

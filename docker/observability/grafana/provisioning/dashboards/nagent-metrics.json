@@ -8,7 +8,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 41,
-  "version": 1,
+  "version": 2,
   "refresh": "",
   "time": {
     "from": "now-30m",
@@ -32,6 +32,27 @@
           "text": "All",
           "value": "$__all"
         }
+      },
+      {
+        "name": "source",
+        "label": "Source / 入口",
+        "type": "query",
+        "datasource": "Prometheus",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "sort": 1,
+        "query": {
+          "qryType": 1,
+          "query": "label_values(nagent_turns_total{service_name=~\"$service\"}, nagent_source)"
+        },
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "description": "dashboard/api、feishu/cli/acp 等 GW 细分、schedule、task、delegation；未知为 other。"
       }
     ]
   },
@@ -56,9 +77,10 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(nagent_turns_total{service_name=~\"$service\"}[5m]))"
+          "expr": "sum(rate(nagent_turns_total{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[5m]))"
         }
-      ]
+      ],
+      "description": "按本次执行入口筛选。历史无来源标签数据仅在 All 中可见，不补造来源。"
     },
     {
       "id": 2,
@@ -82,7 +104,8 @@
           "refId": "A",
           "expr": "sum(rate(gen_ai_client_inference_duration_seconds_count{service_name=~\"$service\"}[5m]))"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
       "id": 3,
@@ -106,7 +129,8 @@
           "refId": "A",
           "expr": "sum(rate(gen_ai_execute_tool_duration_seconds_count{service_name=~\"$service\"}[5m]))"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
       "id": 4,
@@ -130,7 +154,8 @@
           "refId": "A",
           "expr": "sum(rate(gen_ai_client_inference_usage_input_tokens_total{service_name=~\"$service\"}[5m]))"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
       "id": 5,
@@ -154,7 +179,8 @@
           "refId": "A",
           "expr": "sum(rate(gen_ai_client_inference_usage_output_tokens_total{service_name=~\"$service\"}[5m]))"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
       "id": 6,
@@ -178,10 +204,152 @@
           "refId": "A",
           "expr": "sum(increase(nagent_budget_denied_total{service_name=~\"$service\"}[5m]))"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
       "id": 7,
+      "type": "timeseries",
+      "title": "Agent run latency by source (p50/p95/p99)",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source\\ p50$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知 p50"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source\\ p95$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知 p95"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source\\ p99$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知 p99"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, nagent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])))",
+          "legendFormat": "{{nagent_source}} p50",
+          "range": true,
+          "instant": false,
+          "exemplar": true
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, nagent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])))",
+          "legendFormat": "{{nagent_source}} p95",
+          "range": true,
+          "instant": false,
+          "exemplar": true
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le, nagent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])))",
+          "legendFormat": "{{nagent_source}} p99",
+          "range": true,
+          "instant": false,
+          "exemplar": true
+        }
+      ],
+      "description": "按本次 AgentRun 受信入口分组；Source 支持多选。历史无来源标签数据在 All 中保留，显示为历史未知。星点是已采样的单次运行耗时，不是分位数值；exemplar 不覆盖每次执行。可从面板链接查看原始 histogram buckets 与 exemplar，并跳转 Tempo 完整入口链。",
+      "links": [
+        {
+          "title": "查看原始 AgentRun histogram / exemplar",
+          "url": "?viewPanel=8&${service:queryparam}&${source:queryparam}&from=$__from&to=$__to",
+          "targetBlank": false
+        }
+      ],
+      "options": {
+        "legend": {
+          "showLegend": false
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "AgentRun raw histogram / exemplars",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "description": "来源筛选下的原始累计 bucket 计数，用于查看原始 exemplar 并跳转 Tempo。曲线为累计计数，exemplar 测量值为单次耗时（秒），两者单位不同；延迟趋势请看上方分位数面板。",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source\\ ≤\\ .+\\ s$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知 ≤ ${__field.labels.le} s"
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}",
+          "legendFormat": "{{nagent_source}} ≤ {{le}} s",
+          "exemplar": true,
+          "range": true,
+          "instant": false
+        }
+      ],
+      "options": {
+        "legend": {
+          "showLegend": false
+        }
+      }
+    },
+    {
+      "id": 9,
       "type": "timeseries",
       "title": "LLM inference latency (p50/p95/p99)",
       "datasource": "Prometheus",
@@ -189,7 +357,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 15
       },
       "fieldConfig": {
         "defaults": {
@@ -216,10 +384,11 @@
           "legendFormat": "p99",
           "exemplar": true
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
-      "id": 8,
+      "id": 10,
       "type": "timeseries",
       "title": "Turn rate by end reason",
       "datasource": "Prometheus",
@@ -227,24 +396,41 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 15
       },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source\\ /\\ .+$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知 / ${__field.labels.nagent_end_reason}"
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (nagent_end_reason) (rate(nagent_turns_total{service_name=~\"$service\"}[5m]))",
-          "legendFormat": "{{nagent_end_reason}}"
+          "expr": "sum by (nagent_source, nagent_end_reason) (rate(nagent_turns_total{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{nagent_source}} / {{nagent_end_reason}}",
+          "range": true,
+          "instant": false,
+          "exemplar": false
         }
-      ]
+      ],
+      "description": "按本次执行入口筛选。历史无来源标签数据仅在 All 中可见，不补造来源。"
     },
     {
-      "id": 9,
+      "id": 11,
       "type": "timeseries",
       "title": "Token throughput by model (input)",
       "datasource": "Prometheus",
@@ -252,7 +438,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 23
       },
       "fieldConfig": {
         "defaults": {
@@ -271,10 +457,11 @@
           "expr": "sum by (gen_ai_request_model) (rate(gen_ai_client_inference_usage_output_tokens_total{service_name=~\"$service\"}[5m]))",
           "legendFormat": "out {{gen_ai_request_model}}"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
-      "id": 10,
+      "id": 12,
       "type": "timeseries",
       "title": "Turn rate by source",
       "datasource": "Prometheus",
@@ -282,32 +469,49 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 23
       },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知"
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (nagent_source) (rate(nagent_turns_total{service_name=~\"$service\"}[5m]))",
-          "legendFormat": "{{nagent_source}}"
+          "expr": "sum by (nagent_source) (rate(nagent_turns_total{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{nagent_source}}",
+          "range": true,
+          "instant": false,
+          "exemplar": false
         }
-      ]
+      ],
+      "description": "按本次执行入口筛选。历史无来源标签数据仅在 All 中可见，不补造来源。"
     },
     {
-      "id": 11,
+      "id": 13,
       "type": "timeseries",
-      "title": "Execution duration p95 (tool / agent run)",
+      "title": "Tool execution duration p95 (service)",
       "datasource": "Prometheus",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 24
+        "y": 31
       },
       "fieldConfig": {
         "defaults": {
@@ -321,17 +525,12 @@
           "expr": "histogram_quantile(0.95, sum by (le) (rate(gen_ai_execute_tool_duration_seconds_bucket{service_name=~\"$service\"}[5m])))",
           "legendFormat": "tool p95",
           "exemplar": true
-        },
-        {
-          "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\"}[5m])))",
-          "legendFormat": "agent run p95",
-          "exemplar": true
         }
-      ]
+      ],
+      "description": "工具服务级耗时，不受 Source 入口筛选影响。"
     },
     {
-      "id": 12,
+      "id": 14,
       "type": "timeseries",
       "title": "Guardrails (compression / budget denial rate)",
       "datasource": "Prometheus",
@@ -339,7 +538,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 24
+        "y": 31
       },
       "fieldConfig": {
         "defaults": {
@@ -358,10 +557,11 @@
           "expr": "sum(rate(nagent_budget_denied_total{service_name=~\"$service\"}[5m]))",
           "legendFormat": "budget denials"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
-      "id": 13,
+      "id": 15,
       "type": "timeseries",
       "title": "Token count per inference (p95)",
       "datasource": "Prometheus",
@@ -369,7 +569,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 39
       },
       "fieldConfig": {
         "defaults": {
@@ -388,37 +588,71 @@
           "expr": "histogram_quantile(0.95, sum by (le) (rate(gen_ai_client_inference_operation_output_tokens_bucket{service_name=~\"$service\"}[5m])))",
           "legendFormat": "output p95"
         }
-      ]
+      ],
+      "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
     },
     {
-      "id": 14,
+      "id": 16,
       "type": "timeseries",
-      "title": "Calls per agent run",
+      "title": "Calls per agent run by source",
       "datasource": "Prometheus",
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 39
       },
       "fieldConfig": {
         "defaults": {
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source\\ inference\\ /\\ run$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知 inference / run"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^nagent_source\\ tool\\ /\\ run$"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "历史未知 tool / run"
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(gen_ai_invoke_agent_inference_calls_count{service_name=~\"$service\"}[5m])) / clamp_min(sum(rate(gen_ai_invoke_agent_duration_seconds_count{service_name=~\"$service\"}[5m])), 1e-9)",
-          "legendFormat": "inference / run"
+          "expr": "sum by (nagent_source) (rate(gen_ai_invoke_agent_inference_calls_sum{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])) / clamp_min(sum by (nagent_source) (rate(gen_ai_invoke_agent_inference_calls_count{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{nagent_source}} inference / run",
+          "range": true,
+          "instant": false,
+          "exemplar": false
         },
         {
           "refId": "B",
-          "expr": "sum(rate(gen_ai_invoke_agent_tool_calls_count{service_name=~\"$service\"}[5m])) / clamp_min(sum(rate(gen_ai_invoke_agent_duration_seconds_count{service_name=~\"$service\"}[5m])), 1e-9)",
-          "legendFormat": "tool / run"
+          "expr": "sum by (nagent_source) (rate(gen_ai_invoke_agent_tool_calls_sum{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])) / clamp_min(sum by (nagent_source) (rate(gen_ai_invoke_agent_tool_calls_count{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{nagent_source}} tool / run",
+          "range": true,
+          "instant": false,
+          "exemplar": false
         }
-      ]
+      ],
+      "description": "按本次执行入口筛选。历史无来源标签数据仅在 All 中可见，不补造来源。"
     }
-  ]
+  ],
+  "description": "Source 筛选仅作用于 AgentRun 和 Turns；LLM、工具、Token、压缩和预算面板为服务级统计。"
 }

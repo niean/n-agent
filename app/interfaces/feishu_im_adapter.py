@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from app.application.gateway_service import GatewayService
 from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
 from app.domain.gateway import GatewayConfirmationChoice, GatewaySessionKey, InteractionMessage, InteractionResponse
 from app.domain.platform import Platform
 from app.interfaces.feishu_tool_approval import (
@@ -74,17 +75,25 @@ class FeishuImAdapter:
             raise
 
     async def handle_event(self, payload: dict[str, Any]) -> None:
-        with business_operation("feishu.event", source="feishu"):
-            await self._handle_event(payload)
+        with business_operation("feishu.event", source="feishu") as facts:
+            # Exclude transport headers, verification tokens and media bodies.
+            message = payload.get("event", {}).get("message", {})
+            facts["details"] = project_details(input_messages={"message_type": message.get("message_type"),
+                "content": message.get("content") if message.get("message_type") == "text" else "[REDACTED MEDIA]"})
+            if _is_card_action(payload):
+                value = payload.get("event", {}).get("action", {}).get("value", {})
+                facts["details"] = project_details(input_messages={"choice": value.get("choice"),
+                    "confirmation_kind": value.get("confirmation_kind")})
+            await self._handle_event(payload, _trace_facts=facts)
 
-    async def _handle_event(self, payload: dict[str, Any]) -> None:
+    async def _handle_event(self, payload: dict[str, Any], *, _trace_facts=None) -> None:
         self._cleanup_confirmation_cache()
         if _is_card_action(payload):
-            await self._handle_card_action(payload)
+            await self._handle_card_action(payload, _trace_facts=_trace_facts)
             return
-        await self._handle_message(payload)
+        await self._handle_message(payload, _trace_facts=_trace_facts)
 
-    async def _handle_message(self, payload: dict[str, Any]) -> None:
+    async def _handle_message(self, payload: dict[str, Any], *, _trace_facts=None) -> None:
         verified = self.feishu_client.verify_long_connection_event(payload)
         event = verified.get("event", {})
         message = event.get("message", {})
@@ -93,7 +102,7 @@ class FeishuImAdapter:
         if message_type == "image":
             if message.get("chat_type") == "group":
                 return
-            await self._handle_image_message(verified, event, message, chat_id)
+            await self._handle_image_message(verified, event, message, chat_id, _trace_facts=_trace_facts)
             return
         if message_type != "text":
             if chat_id:
@@ -146,6 +155,8 @@ class FeishuImAdapter:
                 thread_id,
             ),
         )
+        if _trace_facts is not None:
+            _trace_facts["details"].update(project_details(output_messages=[{"content": m.content} for m in response.messages]))
         if response.metadata.get("duplicate"):
             return
         await self._send_response(response, receive_id, receive_id_type, platform_session_id, thread_id)
@@ -156,33 +167,39 @@ class FeishuImAdapter:
         event: dict[str, Any],
         message: dict[str, Any],
         chat_id: str,
+        *, _trace_facts=None,
     ) -> None:
         message_id = _clean_text(message.get("message_id"))
         image_key = _image_key(message.get("content", ""))
+        async def reject(text):
+            if _trace_facts is not None:
+                _trace_facts["details"].update(project_details(output_messages=text))
+            await self.feishu_client.send_text(chat_id, text)
+
         if not image_key:
             if chat_id:
-                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+                await reject("图片格式无效或过大")
             return
         try:
             data, mime = await self.feishu_client.download_image(message_id, image_key)
         except ValueError:
             if chat_id:
-                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+                await reject("图片格式无效或过大")
             return
         except Exception:
             if chat_id:
-                await self.feishu_client.send_text(chat_id, "图片下载失败，请重试")
+                await reject("图片下载失败，请重试")
             return
         media_type = mime or "image/png"
         if not media_type.startswith("image/"):
             if chat_id:
-                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+                await reject("图片格式无效或过大")
             return
         try:
             encoded = base64.b64encode(data).decode("ascii")
         except (binascii.Error, ValueError):
             if chat_id:
-                await self.feishu_client.send_text(chat_id, "图片格式无效或过大")
+                await reject("图片格式无效或过大")
             return
         data_url = f"data:{media_type};base64,{encoded}"
         sender = event.get("sender", {}).get("sender_id", {})
@@ -223,6 +240,8 @@ class FeishuImAdapter:
                 thread_id,
             ),
         )
+        if _trace_facts is not None:
+            _trace_facts["details"].update(project_details(output_messages=[{"content": m.content} for m in response.messages]))
         if response.metadata.get("duplicate"):
             return
         await self._send_response(response, receive_id, receive_id_type, platform_session_id, thread_id)
@@ -275,7 +294,7 @@ class FeishuImAdapter:
             session_grant_checker=self.gateway_service.is_tool_granted,
         )
 
-    async def _handle_card_action(self, payload: dict[str, Any]) -> None:
+    async def _handle_card_action(self, payload: dict[str, Any], *, _trace_facts=None) -> None:
         verified = self.feishu_client.verify_card_action_event(payload)
         event = verified.get("event", {})
         operator = event.get("operator", {})
@@ -293,7 +312,7 @@ class FeishuImAdapter:
         slash_owned = self.gateway_service.owns_confirmation(confirmation_id)
         if tool_owned:
             if confirmation_kind != "tool_policy":
-                await self._send_confirmation_error(chat_id, actor_id, "确认类型无效")
+                await self._send_confirmation_error(chat_id, actor_id, "确认类型无效", _trace_facts=_trace_facts)
                 return
             try:
                 claim = self._tool_approval_bridge.claim(
@@ -304,7 +323,7 @@ class FeishuImAdapter:
                     actor_id=actor_id,
                 )
             except FeishuToolApprovalError as exc:
-                await self._send_confirmation_error(chat_id, actor_id, str(exc))
+                await self._send_confirmation_error(chat_id, actor_id, str(exc), _trace_facts=_trace_facts)
                 return
 
             stored = self._last_confirmations.get(confirmation_id)
@@ -317,12 +336,14 @@ class FeishuImAdapter:
                 choice,
             )
             self._last_confirmations.pop(confirmation_id, None)
+            if _trace_facts is not None:
+                _trace_facts["details"].update(project_details(output_messages={"choice": choice, "status": "accepted"}))
             return
         if not slash_owned or confirmation_kind not in {"", "slash_command"}:
-            await self._send_confirmation_error(chat_id, actor_id, "确认已失效")
+            await self._send_confirmation_error(chat_id, actor_id, "确认已失效", _trace_facts=_trace_facts)
             return
         if choice not in {"once", "trust_session", "cancel"}:
-            await self._send_confirmation_error(chat_id, actor_id, "确认选项无效")
+            await self._send_confirmation_error(chat_id, actor_id, "确认选项无效", _trace_facts=_trace_facts)
             return
 
         stored = self._last_confirmations.get(confirmation_id)
@@ -343,6 +364,8 @@ class FeishuImAdapter:
             GatewayConfirmationChoice(choice),
             on_consumed=disable_card,
         )
+        if _trace_facts is not None:
+            _trace_facts["details"].update(project_details(output_messages=[{"content": m.content} for m in response.messages]))
         if not self.gateway_service.owns_confirmation(confirmation_id):
             self._last_confirmations.pop(confirmation_id, None)
         await self._send_response(response, chat_id, "chat_id", platform_session_id, thread_id)
@@ -376,7 +399,10 @@ class FeishuImAdapter:
         chat_id: str,
         actor_id: str,
         message: str,
+        *, _trace_facts=None,
     ) -> None:
+        if _trace_facts is not None:
+            _trace_facts["details"].update(project_details(output_messages=message))
         receive_id = chat_id or actor_id
         if receive_id:
             await self.feishu_client.send_text(

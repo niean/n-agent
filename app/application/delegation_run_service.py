@@ -21,6 +21,7 @@ import asyncio
 from typing import Any, Mapping, Protocol
 
 from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
 from app.domain.delegation import (
     DelegationMember,
     DelegationMemberStatus,
@@ -152,8 +153,12 @@ class DelegationRunService:
         with business_operation("delegation.member", source="delegation", session_id=claimed.execution_session_id,
                                 parent_carrier=carrier, identifiers={"nagent.delegation.id": member.delegation_id,
                                 "nagent.delegation.member_id": claimed.id, "nagent.delegation.role": claimed.role.value}) as facts:
+            facts["details"] = project_details(input_messages={"title": claimed.title, "instruction": claimed.instruction})
             result = await self._execute_member(claimed)
             facts["outcome"] = result.status.value
+            facts["details"].update(project_details(output_messages={"status": result.status.value, "summary": result.summary,
+                "structured_data": dict(result.structured_data) if result.structured_data is not None else None,
+                "artifact_refs": result.artifact_refs}, error=result.error_message))
             await self._registry.finish_member(
                 member.delegation_id, member.ordinal,
                 claim_lock=claim_lock, result=result,

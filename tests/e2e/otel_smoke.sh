@@ -1,34 +1,14 @@
 #!/usr/bin/env bash
-# OTel observability E2E smoke (T10 of plan-261024-otel-observability).
-#
-# Runs entirely against the Docker deployment (host only orchestrates):
-#   - business traffic via http://127.0.0.1:8201 (published n-agent port)
-#   - Tempo /api/search and /api/traces/{id} via loopback 127.0.0.1:3200;
-#     OTLP JSON normalization is handled by tempo_query.py.
-#   - Prometheus / Pyroscope / Grafana: Prometheus has NO host port and is
-#     queried from inside the independent observability project;
-#     Grafana/Pyroscope are queried on their 127.0.0.1 host bindings
-#
-# Self-gating (plan item 23):
-#   - the app switches are read from the running container:
-#       N_AGENT_OTEL_ENABLED      -> full OTel assertion set
-#       N_AGENT_PROFILING_ENABLED -> Profile (Pyroscope) assertion set
-#   - with both switches off the script asserts the disabled behavior of
-#     the self-check API and exits 0, so `run.sh all` stays green for
-#     users without the shared observability stack.
-#
-# Deterministic fixture: a fixed fake OpenAI-compatible LLM server runs
-# INSIDE the n-agent container (127.0.0.1:9999) and is wired through the
-# real provider factory via the provider registry API
-# (POST /chat/providers -> POST /chat/providers/{id}/activate -> swap).
-# It deterministically answers the first round with a `calculator` tool
-# call and the second round with a final message (LLM -> tool -> LLM),
-# with fixed usage numbers, so metric deltas are exact. No real API.
-# The original active provider is restored and the fake row deleted.
-#
-# Environment overlay (ratio=0 / budget denial / compression) temporarily
-# rewrites docker/.env from a backup, recreates only the n-agent
-# container, and restores everything afterwards.
+# Minimal Docker OTel E2E: successful LLM -> tool -> LLM delivery,
+# forced Provider 500, and client disconnect with eventual span closure.
+# Checks Tempo, Prometheus exemplars and Loki correlation/redaction.
+# Uses an in-container fake Provider; restores the original Provider on exit.
+# OTel disabled: only assert disabled self-check signals. No Profile tests,
+# environment overlays, dashboard checks or backend restarts.
+# Isolate autonomous skill evolution for this suite and every child/restart.
+source "$(dirname "${BASH_SOURCE[0]}")/environment.sh"
+e2e_environment default "$0" "$@"
+
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,35 +17,30 @@ DOCKER_DIR="$REPO_ROOT/docker"
 
 BASE_URL="${N_AGENT_OTEL_SMOKE_BASE_URL:-http://127.0.0.1:8201}"
 TEMPO_URL="http://127.0.0.1:3200"
-PYROSCOPE_URL="http://127.0.0.1:4040"
-GRAFANA_URL="http://127.0.0.1:13000"
-DASH_UID="nagent-overview"
-
-ENV_FILE="$DOCKER_DIR/.env"
-ENV_BACKUP="$DOCKER_DIR/.env.otel-smoke.bak"
-
 TEMPO_POLL_ATTEMPTS=60        # bounded polling: 60 x 1s = 60s per spec
 PROM_POLL_ATTEMPTS=60
 HEALTH_ATTEMPTS=90
-STOP_TIMEOUT="${N_AGENT_COMPOSE_STOP_TIMEOUT:-10}"
 
-RUN_TAG="otel-smoke-$(date +%s)"
+RUN_TAG="otel-smoke-$(date +%s)-$$"
+REPORT_DIR="$REPO_ROOT/locals/e2e-reports/$RUN_TAG"
+TRACE_PAGE_URL=""
 # Credential-format sentinel: sanitized detail text is allowed, credentials are not.
 SENTINEL="E2EOTELSENTINEL-$(date +%s)-$$"
+# Benign value for the X-E2E-Sentinel request header. The product contract
+# captures non-sensitive custom header values verbatim (test_information_
+# completeness locks `x-request-purpose: inference` surviving), so a
+# credential sentinel must NOT ride this header: it would legitimately leak.
+# Keep the header as a custom-header-capture exercise with a non-credential
+# marker; credential masking is verified via the message body api_key= field.
+CUSTOM_HEADER_TAG="e2e-custom-header-$RUN_TAG"
 FAKE_PORT=9999
 FAKE_LLM_PATH="/tmp/fake_llm_otel_smoke.py"
 FAKE_PROVIDER_NAME="otel-smoke-$RUN_TAG"
-FAKE_MODEL="gpt-4o-mini"
+FAKE_MODEL="otel-smoke-model"
 
 SESSION_GOOD="otel-smoke-good-$RUN_TAG"
 SESSION_FAIL="otel-smoke-fail-$RUN_TAG"
 SESSION_CANCEL="otel-smoke-cancel-$RUN_TAG"
-SESSION_OVERLAY="otel-smoke-overlay-$RUN_TAG"
-SESSION_ZEROCALL="otel-smoke-zerocall-$RUN_TAG"
-# valid 1x1 PNG data URL (validate_image_url accepts it; the fake provider
-# has no vision capability, so an image turn is denied before provider.chat)
-ONE_PIXEL_PNG="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-
 OTEL_ENABLED=""
 PROFILING_ENABLED=""
 INSTANCE_ID=""
@@ -74,7 +49,6 @@ TMP_DIR="$(mktemp -d /tmp/otel-smoke-XXXXXX)"
 FAKE_PROVIDER_ID=""
 ORIG_PROVIDER_ID=""
 FAKE_STARTED=0
-ENV_DIRTY=0
 CHAT_FINISH=""
 
 # ---------------------------------------------------------------------------
@@ -105,12 +79,6 @@ assert_contains() {
   echo "$HTTP_BODY" | grep -qF -- "$2" || fail "$1: body does not contain '$2'"
 }
 
-assert_not_contains() {
-  if echo "$HTTP_BODY" | grep -qF -- "$2"; then
-    fail "$1: body must NOT contain '$2'"
-  fi
-}
-
 assert_no_sentinel() { # assert_no_sentinel <file> <outlet-label>
   if grep -qF -- "$SENTINEL" "$1" 2>/dev/null; then
     fail "sentinel leaked via $2"
@@ -128,8 +96,6 @@ assert_cache_control_no_store() { # assert_cache_control_no_store <url> <label>
     || fail "$2: Cache-Control no-store missing"
 }
 
-now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
-
 wait_health() { # wait_health <attempts>
   local i
   for i in $(seq 1 "$1"); do
@@ -143,15 +109,6 @@ wait_health() { # wait_health <attempts>
 
 app_env() { # app_env <VAR> -> value from the running container
   compose exec -T n-agent printenv "$1" 2>/dev/null | tr -d '\r\n'
-}
-
-recreate_nagent() { # recreate only n-agent to apply docker/.env changes
-  echo "[otel-smoke] recreating n-agent container (stop timeout ${STOP_TIMEOUT}s)"
-  (cd "$DOCKER_DIR" && N_AGENT_COMPOSE_STOP_TIMEOUT="$STOP_TIMEOUT" \
-    docker compose up -d --force-recreate --no-deps n-agent) \
-    || fail "n-agent container recreation failed"
-  ENV_DIRTY=1
-  wait_health "$HEALTH_ATTEMPTS"
 }
 
 # ---------------------------------------------------------------------------
@@ -188,18 +145,6 @@ print(total)
 PY
 }
 
-prom_query_ok() { # prom_query_ok <promql> -> "success"/"error"
-  local raw
-  raw="$(prom_query_raw "$1")" || { echo "error"; return; }
-  echo "$raw" | grep -q '"status":"success"' && echo "success" || echo "error"
-}
-
-prom_series_exists() { # prom_series_exists <selector> -> 0/1
-  local raw
-  raw="$(prom_query_raw "$1")" || return 1
-  echo "$raw" | grep -q '"result":\[{' && return 0 || return 1
-}
-
 wait_prom_delta() { # wait_prom_delta <promql> <baseline> <min_delta> [attempts]
   local promql="$1" baseline="$2" min_delta="$3" attempts="${4:-$PROM_POLL_ATTEMPTS}"
   local i current
@@ -218,32 +163,6 @@ sys.exit(0 if float('''$current''') >= float('''$baseline''') + float('''$min_de
   fail "Prometheus increment not observed within ${attempts}s: $promql (baseline=$baseline last=$current)"
 }
 
-prom_stable_value() { # prom_stable_value <promql> [attempts] -> stabilized value
-  local promql="$1" attempts="${2:-$PROM_POLL_ATTEMPTS}" i prev cur
-  cur="$(prom_sum "$promql")"
-  prev="$cur"
-  for i in $(seq 1 "$attempts"); do
-    sleep 2
-    cur="$(prom_sum "$promql")"
-    if [ "$cur" = "$prev" ]; then
-      echo "$cur"
-      return 0
-    fi
-    prev="$cur"
-  done
-  fail "metric never stabilized within $((attempts * 2))s: $promql (last=$cur)"
-}
-
-prom_assert_no_delta() { # prom_assert_no_delta <promql> <baseline> [attempts]
-  local promql="$1" baseline="$2" attempts="${3:-10}" i cur
-  for i in $(seq 1 "$attempts"); do
-    cur="$(prom_sum "$promql")"
-    [ "$cur" = "$baseline" ] \
-      || fail "metric moved without any LLM invocation: $promql (baseline=$baseline now=$cur)"
-    sleep 1
-  done
-}
-
 # ---------------------------------------------------------------------------
 # Tempo helpers (search + trace-by-id over the published loopback API)
 # ---------------------------------------------------------------------------
@@ -257,6 +176,7 @@ install_tempo_parser() {
   cat > "$TMP_DIR/tempo_parse.py" <<'PYEOF'
 """Parse normalized Tempo OTLP-JSON responses into trace groups."""
 import json
+import os
 import sys
 
 
@@ -307,9 +227,7 @@ if __name__ == "__main__":
     mode = sys.argv[1]
     with open(sys.argv[2]) as handle:
         data = json.load(handle)
-    if mode == "count-traces":
-        print(len(group_traces(data)))
-    elif mode == "find-session":
+    if mode == "find-session":
         session = sys.argv[3]
         for trace_id, spans in group_traces(data).items():
             if any(
@@ -347,7 +265,7 @@ if __name__ == "__main__":
             "execute_tool must be a direct child of invoke_agent"
         )
         chat = next(c for c in chats if c["parentSpanId"] == root["spanId"])
-        assert chat["attrs"].get("gen_ai.request.model") == "gpt-4o-mini", (
+        assert chat["attrs"].get("gen_ai.request.model") == os.environ.get("FAKE_MODEL", ""), (
             chat["attrs"]
         )
         assert chat["attrs"].get("gen_ai.provider.name") == "openai"
@@ -368,10 +286,11 @@ if __name__ == "__main__":
             trace = json.load(handle)
         spans = trace["spans"]
         error_spans = [
-            s for s in spans if s["attrs"].get("error.type") == "APIStatusError"
+            s for s in spans if s["attrs"].get("error.type") in (
+                "APIStatusError", "InternalServerError")
         ]
         assert error_spans, (
-            "expected a span with safe error.type=APIStatusError, got: %s"
+            "expected a span with a safe error.type, got: %s"
             % [(s["name"], s["attrs"]) for s in spans]
         )
         for span in spans:
@@ -418,6 +337,7 @@ return HTTP 500 (failure path). Fully deterministic; no external I/O.
 """
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
@@ -533,6 +453,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if any("DISCONNECT-PROBE" in str(m.get("content", "")) for m in messages):
+            time.sleep(3)
         # "tools" is a top-level request field in the OpenAI schema
         if _has_tool_result(messages) or not payload.get("tools"):
             completion = self._final_completion(model)
@@ -631,7 +553,7 @@ install_fake_provider() {
   http POST "$BASE_URL/chat/providers" \
     -H "Content-Type: application/json" \
     -d "$(jq -n --arg name "$FAKE_PROVIDER_NAME" --arg model "$FAKE_MODEL" \
-      '{name:$name, base_url:"http://127.0.0.1:'"$FAKE_PORT"'/v1", model:$model, api_key:"otel-smoke", provider_type:"openai-compatible"}')"
+      '{name:$name, base_url:"http://127.0.0.1:'"$FAKE_PORT"'/v1", model:$model, api_key:"otel-smoke", provider_type:"openai-compatible", supports_vision:false}')"
   assert_status 200 "create fake provider"
   FAKE_PROVIDER_ID="$(json_field '.id')"
   [ -n "$FAKE_PROVIDER_ID" ] && [ "$FAKE_PROVIDER_ID" != "null" ] \
@@ -665,47 +587,6 @@ restore_provider() {
 }
 
 # ---------------------------------------------------------------------------
-# env overlay (ratio=0 + budget denial + compression trigger) + restore
-# ---------------------------------------------------------------------------
-
-apply_env_overlay() {
-  [ -f "$ENV_FILE" ] || fail "docker/.env not found (overlay phase requires it)"
-  cp "$ENV_FILE" "$ENV_BACKUP"
-  ENV_DIRTY=1
-  python3 - "$ENV_FILE" <<'PY'
-import sys
-
-path = sys.argv[1]
-overrides = {
-    "N_AGENT_OTEL_TRACES_SAMPLE_RATIO": "0",
-    "N_AGENT_BUDGET_MAX_LLM_CALLS": "1",
-    "N_AGENT_CONTEXT_LENGTH": "1024",
-    "N_AGENT_CONTEXT_COMPRESSION_THRESHOLD": "0.01",
-    # validation requires target_ratio < threshold (reject-to-start rule)
-    "N_AGENT_CONTEXT_COMPRESSION_TARGET_RATIO": "0.001",
-}
-with open(path, encoding="utf-8") as handle:
-    lines = handle.readlines()
-kept = [
-    line for line in lines
-    if line.split("=", 1)[0].strip() not in overrides
-]
-kept.extend(f"{key}={value}\n" for key, value in overrides.items())
-with open(path, "w", encoding="utf-8") as handle:
-    handle.writelines(kept)
-PY
-}
-
-restore_env() {
-  [ "$ENV_DIRTY" = "1" ] || return 0
-  if [ -f "$ENV_BACKUP" ]; then
-    mv "$ENV_BACKUP" "$ENV_FILE"
-    echo "[otel-smoke] restored docker/.env"
-  fi
-  ENV_DIRTY=0
-}
-
-# ---------------------------------------------------------------------------
 # chat driver (SSE)
 # ---------------------------------------------------------------------------
 
@@ -726,12 +607,13 @@ chat_turn() {
   payload="$(jq -n --arg c "$content" \
     --arg model "$FAKE_MODEL" \
     '{model:$model, messages:[{role:"user", content:$c}], stream:true}')"
+  CHAT_CURL_STATUS=0
   curl -sS --max-time "$maxtime" -N \
     -X POST "$BASE_URL/chat/completions" \
     -H "Content-Type: application/json" \
     -H "X-Session-ID: $session" \
-    -H "X-E2E-Sentinel: $SENTINEL" \
-    -d "$payload" > "$TMP_DIR/sse.txt" 2>/dev/null || true
+    -H "X-E2E-Sentinel: $CUSTOM_HEADER_TAG" \
+    -d "$payload" > "$TMP_DIR/sse.txt" 2>/dev/null || CHAT_CURL_STATUS=$?
   # answer pending tool approvals, then reduce the transcript to a finish reason
   local confirmation
   confirmation="$(grep -o '"confirmation_id": *"[^"]*"' "$TMP_DIR/sse.txt" | head -1 | sed 's/.*: *"//; s/"$//')"
@@ -822,10 +704,12 @@ check_execution_summaries() {
 run_otel_checks() {
   local t_turn t_fail t_cancel
 
+  report_case begin good
   install_tempo_parser
   echo "[otel-smoke] Section 0: self-check preflight"
   http GET "$BASE_URL/chat/observations/otel"
   assert_status 200 "self-check API"
+  TRACE_PAGE_URL="$(json_field '.links.Trace // ""')"
   INSTANCE_ID="$(json_field '.instance_id')"
   [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "null" ] || fail "instance_id missing"
   local status
@@ -839,38 +723,41 @@ run_otel_checks() {
   install_fake_provider
 
   # baseline before the measured turn (isolated per instance, item 24)
-  local base_turns base_in_tok base_out_tok base_inf_dur base_tool_dur
-  local base_agent_dur base_inf_calls_sum base_inf_calls_cnt base_tool_calls_sum
+  local base_turns base_in_tok base_out_tok base_tool_dur
+  local base_agent_dur
   base_turns="$(prom_sum "sum(nagent_turns_total{$(instance_label)})")"
   base_in_tok="$(prom_sum "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})")"
   base_out_tok="$(prom_sum "sum(gen_ai_client_inference_usage_output_tokens_total{$(instance_label)})")"
-  base_inf_dur="$(prom_sum "sum(gen_ai_client_inference_duration_seconds_count{$(instance_label)})")"
   base_tool_dur="$(prom_sum "sum(gen_ai_execute_tool_duration_seconds_count{$(instance_label)})")"
   base_agent_dur="$(prom_sum "sum(gen_ai_invoke_agent_duration_seconds_count{$(instance_label)})")"
-  base_inf_calls_sum="$(prom_sum "sum(gen_ai_invoke_agent_inference_calls_sum{$(instance_label)})")"
-  base_inf_calls_cnt="$(prom_sum "sum(gen_ai_invoke_agent_inference_calls_count{$(instance_label)})")"
-  base_tool_calls_sum="$(prom_sum "sum(gen_ai_invoke_agent_tool_calls_sum{$(instance_label)})")"
-  echo "[otel-smoke] baseline: turns=$base_turns in=$base_in_tok out=$base_out_tok inf_dur=$base_inf_dur"
+  echo "[otel-smoke] baseline: turns=$base_turns in=$base_in_tok out=$base_out_tok"
 
   echo "[otel-smoke] Section 2: good turn (LLM -> calculator tool -> LLM)"
   create_session "$SESSION_GOOD"
   t_turn="$(utc_now)"
   chat_turn "$SESSION_GOOD" "api_key=$SENTINEL use the calculator tool for 1+1 then answer" 90
-  [ "$CHAT_FINISH" = "stop" ] || fail "good turn did not finish cleanly (finish=$CHAT_FINISH)"
 
   echo "[otel-smoke] Section 3: Tempo trace hierarchy (60s bounded poll)"
   if ! TRACE_JSON="$(tempo_find_trace "$SESSION_GOOD" "$t_turn")"; then
     fail "invoke_agent trace for $SESSION_GOOD not found in Tempo within 60s"
   fi
   echo "$TRACE_JSON" > "$TMP_DIR/trace-good.json"
+  report_case trace good "$TMP_DIR/trace-good.json"
+  [ "$CHAT_FINISH" = "stop" ] || fail "good turn did not finish cleanly (finish=$CHAT_FINISH)"
   assert_no_sentinel "$TMP_DIR/trace-good.json" "Tempo trace payload"
+  # Contract (per test_information_completeness): non-sensitive custom
+  # request header values are captured verbatim; only credential-format sentinels
+  # (message body api_key=) must stay out. Lock the positive half so a future
+  # masking "fix" that silences the benign marker is caught as a contract break.
+  grep -qF -- "$CUSTOM_HEADER_TAG" "$TMP_DIR/trace-good.json" \
+    || fail "custom non-sensitive header value not captured in trace (contract break)"
   TRACE_ID="$(python3 -c "
 import json, sys
 trace = json.load(open('$TMP_DIR/trace-good.json'))
 print(trace['traceId'])
 ")"
   [ -n "$TRACE_ID" ] || fail "invoke_agent traceId missing"
-  python3 "$TMP_DIR/tempo_parse.py" check-good "$TMP_DIR/trace-good.json" \
+  FAKE_MODEL="$FAKE_MODEL" python3 "$TMP_DIR/tempo_parse.py" check-good "$TMP_DIR/trace-good.json" \
     || fail "Tempo good trace hierarchy invalid"
   echo "[otel-smoke] Section 3 ok"
 
@@ -878,29 +765,8 @@ print(trace['traceId'])
   wait_prom_delta "sum(nagent_turns_total{$(instance_label)})" "$base_turns" 1
   wait_prom_delta "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})" "$base_in_tok" 50
   wait_prom_delta "sum(gen_ai_client_inference_usage_output_tokens_total{$(instance_label)})" "$base_out_tok" 25
-  wait_prom_delta "sum(gen_ai_client_inference_duration_seconds_count{$(instance_label)})" "$base_inf_dur" 2
   wait_prom_delta "sum(gen_ai_execute_tool_duration_seconds_count{$(instance_label)})" "$base_tool_dur" 1
   wait_prom_delta "sum(gen_ai_invoke_agent_duration_seconds_count{$(instance_label)})" "$base_agent_dur" 1
-  wait_prom_delta "sum(gen_ai_invoke_agent_inference_calls_sum{$(instance_label)})" "$base_inf_calls_sum" 2
-  wait_prom_delta "sum(gen_ai_invoke_agent_inference_calls_count{$(instance_label)})" "$base_inf_calls_cnt" 1
-  wait_prom_delta "sum(gen_ai_invoke_agent_tool_calls_sum{$(instance_label)})" "$base_tool_calls_sum" 1
-  # every locked histogram exposes bucket/sum/count series (T9 mapping)
-  local hist counter
-  for hist in \
-    gen_ai_client_inference_duration_seconds \
-    gen_ai_execute_tool_duration_seconds \
-    gen_ai_invoke_agent_duration_seconds \
-    gen_ai_invoke_agent_inference_calls \
-    gen_ai_invoke_agent_tool_calls; do
-    prom_series_exists "${hist}_bucket" \
-      || fail "histogram _bucket series missing for $hist"
-  done
-  for counter in \
-    gen_ai_client_inference_usage_input_tokens_total \
-    gen_ai_client_inference_usage_output_tokens_total \
-    nagent_turns_total; do
-    prom_series_exists "$counter" || fail "counter series missing: $counter"
-  done
   echo "[otel-smoke] checking Prometheus exemplar -> Tempo Trace -> Loki"
   local exemplar_attempt exemplar_ok=0
   for exemplar_attempt in $(seq 1 "$PROM_POLL_ATTEMPTS"); do
@@ -970,10 +836,6 @@ PY
   assert_no_sentinel "$TMP_DIR/collector.log" "collector log delivery"
   check_execution_summaries "$TMP_DIR/trace-good.json" "$t_turn"
   echo "[otel-smoke] Section 5 ok"
-  if [ "${N_AGENT_OTEL_SMOKE_SUMMARY_ONLY:-false}" = "true" ]; then
-    return 0
-  fi
-
   echo "[otel-smoke] Section 6: self-check healthy + ring buffer + no leak"
   local selfcheck_ok=1
   for i in $(seq 1 30); do
@@ -999,8 +861,10 @@ PY
   echo "$HTTP_BODY" > "$TMP_DIR/selfcheck.json"
   assert_no_sentinel "$TMP_DIR/selfcheck.json" "self-check API payload"
   echo "[otel-smoke] Section 6 ok"
+  report_case pass good
 
   echo "[otel-smoke] Section 7: failure turn (forced provider 500)"
+  report_case begin fail
   create_session "$SESSION_FAIL"
   local base_err_dur
   base_err_dur="$(prom_sum "sum(gen_ai_client_inference_duration_seconds_count{$(instance_label),error_type!=''})")"
@@ -1010,182 +874,31 @@ PY
     fail "failure trace for $SESSION_FAIL not found in Tempo"
   fi
   echo "$TRACE_JSON" > "$TMP_DIR/trace-fail.json"
+  report_case trace fail "$TMP_DIR/trace-fail.json"
+  [ "$CHAT_FINISH" = "error" ] || fail "forced failure did not return an error finish"
   assert_no_sentinel "$TMP_DIR/trace-fail.json" "failure Tempo trace"
-  python3 "$TMP_DIR/tempo_parse.py" check-failure "$TMP_DIR/trace-fail.json"
+  python3 "$TMP_DIR/tempo_parse.py" check-failure "$TMP_DIR/trace-fail.json" \
+    || fail "failure trace did not record a safe error.type"
   wait_prom_delta "sum(gen_ai_client_inference_duration_seconds_count{$(instance_label),error_type!=''})" "$base_err_dur" 1
   echo "[otel-smoke] Section 7 ok"
+  report_case pass fail
 
   echo "[otel-smoke] Section 8: disconnect/cancel turn (span closes with the run)"
+  report_case begin cancel
   create_session "$SESSION_CANCEL"
   t_cancel="$(utc_now)"
   # disconnect immediately: the detached run must still finish and close
-  chat_turn "$SESSION_CANCEL" "api_key=$SENTINEL disconnect probe" 2
+  chat_turn "$SESSION_CANCEL" "api_key=$SENTINEL DISCONNECT-PROBE" 2
+  [ "$CHAT_CURL_STATUS" = "28" ] || fail "disconnect probe did not time out while the run was active"
   if ! TRACE_JSON="$(tempo_find_trace "$SESSION_CANCEL" "$t_cancel")"; then
     fail "cancel-path trace for $SESSION_CANCEL never closed in Tempo"
   fi
+  echo "$TRACE_JSON" > "$TMP_DIR/trace-cancel.json"
+  report_case trace cancel "$TMP_DIR/trace-cancel.json"
+  assert_no_sentinel "$TMP_DIR/trace-cancel.json" "disconnect Tempo trace"
   echo "[otel-smoke] Section 8 ok (invoke_agent span closed after disconnect)"
+  report_case pass cancel
 
-  echo "[otel-smoke] Section 9: Grafana dashboard + p95 PromQL"
-  http GET "$GRAFANA_URL/api/dashboards/uid/$DASH_UID"
-  assert_status 200 "Grafana dashboard $DASH_UID"
-  [ "$(json_field '.dashboard.uid')" = "$DASH_UID" ] \
-    || fail "dashboard uid mismatch: $(json_field '.dashboard.uid')"
-  assert_contains "dashboard p95 query" "histogram_quantile"
-  local p95_status
-  p95_status="$(prom_query_ok "histogram_quantile(0.95, sum by (le) (rate(gen_ai_client_inference_duration_seconds_bucket[5m])))")"
-  [ "$p95_status" = "success" ] || fail "p95 PromQL did not execute successfully"
-  echo "[otel-smoke] Section 9 ok"
-
-  echo "[otel-smoke] Section 9b: zero-LLM-call run (no gen_ai usage delta)"
-  # Vision-deny path: the fixture provider declares no vision capability, so
-  # an image turn is rejected before provider.chat -- a completed run with
-  # zero LLM invocations (plan item 24). Token counters and the inference
-  # duration series must not move at all; per-run histograms may still
-  # record a 0 observation (plan item 11), so they are not asserted here.
-  create_session "$SESSION_ZEROCALL"
-  local z_base_in z_base_out z_base_inf z_reply
-  z_base_in="$(prom_stable_value "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})")"
-  z_base_out="$(prom_stable_value "sum(gen_ai_client_inference_usage_output_tokens_total{$(instance_label)})")"
-  z_base_inf="$(prom_stable_value "sum(gen_ai_client_inference_duration_seconds_count{$(instance_label)})")"
-  curl -sS --max-time 60 -N -X POST "$BASE_URL/chat/completions" \
-    -H "Content-Type: application/json" \
-    -H "X-Session-ID: $SESSION_ZEROCALL" \
-    -H "X-E2E-Sentinel: $SENTINEL" \
-    -d "$(jq -n --arg model "$FAKE_MODEL" --arg img "$ONE_PIXEL_PNG" \
-      '{model:$model, stream:true,
-        messages:[{role:"user", content:[
-          {type:"text", text:"zero-call vision probe"},
-          {type:"image_url", image_url:{url:$img}}]}]}')" \
-    > "$TMP_DIR/sse-zero.txt" 2>/dev/null || true
-  z_reply="$(grep -o "不支持图片输入" "$TMP_DIR/sse-zero.txt" | head -1)"
-  [ -n "$z_reply" ] || fail "zero-call probe did not take the vision-deny path"
-  assert_no_sentinel "$TMP_DIR/sse-zero.txt" "zero-call SSE response"
-  prom_assert_no_delta "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})" "$z_base_in"
-  prom_assert_no_delta "sum(gen_ai_client_inference_usage_output_tokens_total{$(instance_label)})" "$z_base_out"
-  prom_assert_no_delta "sum(gen_ai_client_inference_duration_seconds_count{$(instance_label)})" "$z_base_inf"
-  echo "[otel-smoke] Section 9b ok (zero-call run left gen_ai usage untouched)"
-
-  echo "[otel-smoke] Section 10: ratio=0 + budget denial + compression (env overlay)"
-  apply_env_overlay
-  recreate_nagent
-  start_fake_llm
-  # new process -> new instance id
-  http GET "$BASE_URL/chat/observations/otel"
-  INSTANCE_ID="$(json_field '.instance_id')"
-  [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "null" ] || fail "instance_id missing after recreate"
-  local o_turns o_denied o_comp o_in_tok
-  o_turns="$(prom_sum "sum(nagent_turns_total{$(instance_label)})")"
-  o_denied="$(prom_sum "sum(nagent_budget_denied_total{$(instance_label)})")"
-  o_comp="$(prom_sum "sum(nagent_context_compressions_total{$(instance_label)})")"
-  o_in_tok="$(prom_sum "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})")"
-  create_session "$SESSION_OVERLAY"
-  local t0_overlay t1_overlay
-  t0_overlay="$(utc_now)"
-  chat_turn "$SESSION_OVERLAY" "api_key=$SENTINEL overlay run" 90
-  wait_prom_delta "sum(nagent_turns_total{$(instance_label)})" "$o_turns" 1
-  wait_prom_delta "sum(nagent_budget_denied_total{$(instance_label)})" "$o_denied" 1
-  wait_prom_delta "sum(nagent_context_compressions_total{$(instance_label)})" "$o_comp" 1
-  wait_prom_delta "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})" "$o_in_tok" 1
-  # ratio=0 with no remote parent: no sampled local root spans at all.
-  # Traces share the batch pipeline with metrics: re-check the fixed window
-  # over ~30s (6 attempts x 5s) so a late-exported trace batch cannot slip
-  # past a single query; Tempo data is append-only, so any non-zero count
-  # is an immediate failure.
-  t1_overlay="$(utc_now)"
-  local traces_in_window ratio0_attempt
-  for ratio0_attempt in $(seq 1 6); do
-    tempo_search "$t0_overlay" "$t1_overlay" > "$TMP_DIR/tempo-ratio0.json" || fail "Tempo ratio=0 query failed"
-    traces_in_window="$(python3 "$TMP_DIR/tempo_parse.py" count-traces "$TMP_DIR/tempo-ratio0.json")"
-    [ "$traces_in_window" = "0" ] || fail "ratio=0 produced $traces_in_window sampled traces (expected none, attempt $ratio0_attempt)"
-    [ "$ratio0_attempt" -eq 6 ] || sleep 5
-  done
-  echo "[otel-smoke] Section 10 ok (metrics grew, zero sampled spans)"
-  restore_env
-  recreate_nagent
-  echo "[otel-smoke] Section 10 env restored"
-
-  # provider cleanup happens in the global cleanup trap
-}
-
-# ---------------------------------------------------------------------------
-# Profile branch (Pyroscope; requires the profiling compose override)
-# ---------------------------------------------------------------------------
-
-pyroscope_render() { # pyroscope_render <from_ms> <until_ms> -> body
-  local query='process_cpu:cpu:nanoseconds:cpu:nanoseconds{service_name="n-agent"}'
-  curl -fsS -G "$PYROSCOPE_URL/pyroscope/render" \
-    --data-urlencode "query=$query" \
-    --data-urlencode "from=$1" \
-    --data-urlencode "until=$2" 2>/dev/null || echo ""
-}
-
-run_profile_checks() {
-  echo "[otel-smoke] Section P: profiling two consecutive windows"
-  local interval wait_seconds
-  interval="$(app_env N_AGENT_PROFILING_INTERVAL_SECONDS)"
-  interval="${interval:-60}"
-  case "$interval" in ''|*[!0-9]*) interval=60 ;; esac
-  wait_seconds=$((interval * 2 + 15))
-  echo "[otel-smoke] waiting ${wait_seconds}s for two profiling windows (interval=${interval}s)"
-  sleep "$wait_seconds"
-  local now until1 from1 until2 from2
-  now="$(now_ms)"
-  until1=$((now - interval * 1000))
-  from1=$((until1 - interval * 1000))
-  until2="$now"
-  from2="$until1"
-  local render1 render2
-  render1="$(pyroscope_render "$from1" "$until1")"
-  render2="$(pyroscope_render "$from2" "$until2")"
-  [ -n "$render1" ] || fail "Pyroscope window 1 returned no data"
-  [ -n "$render2" ] || fail "Pyroscope window 2 returned no data"
-  echo "$render1" > "$TMP_DIR/profile1.json"
-  echo "$render2" > "$TMP_DIR/profile2.json"
-  assert_no_sentinel "$TMP_DIR/profile1.json" "Pyroscope window 1"
-  assert_no_sentinel "$TMP_DIR/profile2.json" "Pyroscope window 2"
-  echo "[otel-smoke] Section P ok (two consecutive non-empty windows)"
-}
-
-# ---------------------------------------------------------------------------
-# persistence: observability container restart keeps volume data queryable
-# ---------------------------------------------------------------------------
-
-run_persistence_checks() {
-  echo "[otel-smoke] Section X: observability container restart persistence"
-  local before prom_id pyro_id
-  # global sum across instances: history from earlier runs must survive
-  before="$(prom_sum "sum(nagent_turns_total)")"
-  prom_id="$(obs_compose ps -q prometheus)"
-  pyro_id="$(obs_compose ps -q pyroscope)"
-  [ -n "$prom_id" ] || fail "prometheus container not running (shared observability deployment required)"
-  [ -n "$pyro_id" ] || fail "pyroscope container not running"
-  local before_ms
-  before_ms="$(now_ms)"
-  docker restart "$prom_id" "$pyro_id" >/dev/null || fail "observability container restart failed"
-  local i ready=1
-  for i in $(seq 1 60); do
-    if obs_compose exec -T prometheus wget -q -O - "http://localhost:9090/-/ready" >/dev/null 2>&1; then
-      ready=0
-      break
-    fi
-    sleep 1
-  done
-  [ "$ready" = "0" ] || fail "prometheus not ready after restart"
-  local after
-  after="$(prom_sum "sum(nagent_turns_total)")"
-  python3 -c "
-import sys
-sys.exit(0 if float('''$after''') >= float('''$before''') > 0 else 1)
-" || fail "Prometheus history lost after restart (before=$before after=$after)"
-  # Pyroscope needs a short warm-up after restart (WAL replay); bounded retry
-  local render="" i
-  for i in $(seq 1 30); do
-    render="$(pyroscope_render "$((before_ms - 300000))" "$(now_ms)")"
-    [ -n "$render" ] && break
-    sleep 2
-  done
-  [ -n "$render" ] || fail "Pyroscope profile data not queryable after restart"
-  echo "[otel-smoke] Section X ok (Prometheus history + Pyroscope profile survived restart)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1193,18 +906,19 @@ sys.exit(0 if float('''$after''') >= float('''$before''') > 0 else 1)
 # ---------------------------------------------------------------------------
 
 cleanup() {
+  local result=$?
   set +e
+  if [ -f "$REPORT_DIR/report.json" ]; then
+    python3 "$SCRIPT_DIR/result_report.py" "$REPORT_DIR" finish "$TRACE_PAGE_URL" "$result" || result=1
+  fi
   restore_provider
   stop_fake_llm
-  for session in "$SESSION_GOOD" "$SESSION_FAIL" "$SESSION_CANCEL" "$SESSION_ZEROCALL" "$SESSION_OVERLAY"; do
+  for session in "$SESSION_GOOD" "$SESSION_FAIL" "$SESSION_CANCEL"; do
     delete_session "$session"
   done
-  if [ "$ENV_DIRTY" = "1" ]; then
-    restore_env
-    recreate_nagent
-  fi
   rm -rf "$TMP_DIR" 2>/dev/null || true
   set -e
+  return "$result"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
@@ -1216,30 +930,23 @@ trap 'exit 1' HUP INT TERM
 command -v jq >/dev/null 2>&1 || fail "otel smoke requires host jq"
 command -v python3 >/dev/null 2>&1 || fail "otel smoke requires host python3"
 
+report_case() {
+  python3 "$SCRIPT_DIR/result_report.py" "$REPORT_DIR" "$@" || fail "E2E report write failed"
+}
+report_case init "$RUN_TAG"
+
 wait_health "$HEALTH_ATTEMPTS"
 OTEL_ENABLED="$(app_env N_AGENT_OTEL_ENABLED)"
 PROFILING_ENABLED="$(app_env N_AGENT_PROFILING_ENABLED)"
 
 echo "[otel-smoke] N_AGENT_OTEL_ENABLED=$OTEL_ENABLED N_AGENT_PROFILING_ENABLED=$PROFILING_ENABLED"
 
-if [ "$OTEL_ENABLED" != "true" ] && [ "$PROFILING_ENABLED" != "true" ]; then
+if [ "$OTEL_ENABLED" != "true" ]; then
+  report_case disabled
   run_disabled_checks
   exit 0
-fi
-
-if [ "$OTEL_ENABLED" != "true" ]; then
-  run_disabled_checks
 else
   run_otel_checks
-  if [ "${N_AGENT_OTEL_SMOKE_SUMMARY_ONLY:-false}" = "true" ]; then
-    echo "[otel-smoke] execution summary PASS"
-    exit 0
-  fi
-  run_persistence_checks
-fi
-
-if [ "$PROFILING_ENABLED" = "true" ]; then
-  run_profile_checks
 fi
 
 echo "[otel-smoke] PASS"

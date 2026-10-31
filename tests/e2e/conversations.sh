@@ -43,6 +43,7 @@ resolve_file() {
 }
 
 # ---- 参数解析（互斥按参数是否出现判断，不看值是否为空）----
+ORIGINAL_ARGS=("$@")
 MODE="replay"
 BASE_URL="$DEFAULT_BASE_URL"
 ONLY_VALUE=""
@@ -90,6 +91,12 @@ done
 if [ "$SEEN_CLEANUP" -eq 1 ] && { [ "$SEEN_ONLY" -eq 1 ] || [ "$SEEN_KEEP" -eq 1 ] || [ "$SEEN_BASE_URL" -eq 1 ] || [ "$SEEN_MAX_RETRIES" -eq 1 ] || [ "$SEEN_PARALLEL" -eq 1 ]; }; then
   echo "conversations.sh: --cleanup-only 与 --base-url/--only/--keep/--max-retries/--parallel 互斥" >&2
   exit 2
+fi
+
+# Cleanup-only never sends turns and must not restart the deployment.
+if [ "$MODE" = replay ]; then
+  source "$SCRIPT_DIR/environment.sh"
+  e2e_environment default "$0" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
 fi
 
 # ---- 回放模式：先重建服务（run.sh 已重建则跳过），成功后再 inspect ----

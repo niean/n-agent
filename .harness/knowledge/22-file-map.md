@@ -441,8 +441,9 @@
 - `app/infrastructure/observability/logging.py`、`docker/observability/otel-collector.yaml`：可信 details 的 stderr/OTLP/span event 与 Loki 显式白名单投影。
 - `tests/application/test_telemetry_details.py`、`test_telemetry_operation_details.py`、`tests/infrastructure/test_provider_content_telemetry.py`：限长/脱敏、操作采集和双 Provider 生命周期回归；既有 execution_summary_logging、secret_sentinels、observability_boundaries 与 Compose 测试守卫两出口和依赖边界。
 
-- Tempo API 冒烟适配：tests/e2e/tempo_query.py（search + trace-by-id、hex/base64 OTLP ID 归一化、总 deadline、命中后空详情失败），tests/e2e/test_tempo_query.py；tests/e2e/otel_smoke.sh 验证 Prometheus exemplar→Tempo→Loki（SUMMARY_ONLY 模式保留三信号验收）。
+- Tempo API 冒烟适配：tests/e2e/tempo_query.py（search + trace-by-id、hex/base64 OTLP ID 归一化、总 deadline、命中后空详情失败），tests/e2e/test_tempo_query.py；tests/e2e/otel_smoke.sh 仅保留成功链路的 Prometheus exemplar→Tempo→Loki 关联与脱敏、Provider 500、客户端断连后三类检查，固定模拟模型 otel-smoke-model；不再包含环境覆盖、Grafana、Profile 或后端重启专项。tests/e2e/result_report.py + test_result_report.py 生成并验证逐用例结果表、真实 Trace ID 的 Grafana Explore 直达链接和失败现场保留，持久化到 locals/e2e-reports/<run-id>/report.{md,json}。
 - 真实 SDK exemplar 合同：tests/infrastructure/observability/test_exemplars.py，验证 Agent/ChatAttempt/tool_execution 的 Trace/Span ID 与 sampled/unsampled/no-span 行为。
+- AgentRun 来源合同：`tests/infrastructure/observability/test_exemplars.py` 验证三个 histogram 的固定来源、零调用均值、异常/取消/并发/嵌套与 exemplar Agent Span 身份；`tests/test_agent_source_dashboards.py` 校验 Overview/Metrics 的 Source 筛选、来源图例、分位数 exemplar 和调用均值查询。
 
 - `app/infrastructure/observability/http_capture.py`：同步/异步 HTTP 实际消费字节的有界采集、压缩/表单/文本解析、流式完成协议；统一投影请求/响应详情，不预读业务流。
 - `tests/infrastructure/observability/test_information_completeness.py`：未注册日志、异常、extra、HTTP 正文、并发隔离、流式中断/取消与管理写日志的完整性回归。

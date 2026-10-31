@@ -84,6 +84,14 @@ sh docker/restart.sh
 sh tests/e2e/run.sh
 ```
 
+### E2E 结果展示约定
+
+- 结果总结按 `用例 | 结果 | Trace ID | 现场` 展示；结果使用 PASS / FAIL / SKIP，重试须说明次数，不仅输出整体 PASS。
+- 有实际 Trace ID 时，现场列使用 `[查看Trace](完整URL)`，必须携带该次用例的真实 32 位十六进制 Trace ID，直接进入 Grafana Explore 的 Tempo 查询；禁止只给 Explore 首页、用例名或 exemplar 链接。
+- 链接沿用应用自检接口 `links.Trace` 的配置地址，保留域名、子路径和 orgId；使用 Tempo 数据源 `nagent-tempo`，编码 Explore panes，queryType=traceql、query=实际 Trace ID。不得把 session_id / tool_call_id 当作 Trace ID。
+- 一个用例有多条 Trace 时按消息、尝试或运行分别列出；失败时保留已取得的 Trace。未执行、OTel 未启用、未采集到 Trace 或不产生 Trace 的检查必须注明原因，不生成空链接或借用其他用例链接。
+- 汇总须给出报告文件位置。OTel E2E 由 `tests/e2e/result_report.py` 生成 `locals/e2e-reports/<run-id>/report.md` 和 `report.json`；JSON 保存 case id/name/result/trace_id/trace_url/reason，Markdown 与终端使用上述表格。报告持久化不依赖测试会话保留，也不等待 exemplar。
+
 ## 扫描维度
 
 代码扫描使用的维度及规则来源。下表路径均相对于 `.harness/knowledge/` 目录：

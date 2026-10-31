@@ -25,6 +25,10 @@
 # in-container with secrets.token_hex and every assertion about them compares
 # sha256 digests and prints booleans only.
 
+# Isolate autonomous skill evolution for this suite and every child/restart.
+source "$(dirname "${BASH_SOURCE[0]}")/environment.sh"
+e2e_environment default "$0" "$@"
+
 (
   set -eu
   set -o pipefail

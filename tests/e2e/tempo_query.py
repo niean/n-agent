@@ -21,7 +21,7 @@ def normalize_id(value, size):
         return ""
     if re.fullmatch(r"[0-9a-fA-F]{%d}" % (size * 2), value):
         return value.lower()
-    raw = base64.b64decode(value, validate=True)
+    raw = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
     if len(raw) != size:
         raise ValueError("invalid OTLP identifier size")
     return raw.hex()
@@ -62,7 +62,14 @@ def search(base_url, start, end, timeout=5):
         raise ValueError("Tempo smoke search truncated; narrow the time range")
     batches = []
     for trace in traces:
-        trace_id = normalize_id(trace["traceID"], 16)
+        search_id = trace.get("traceID", "")
+        # Tempo search emits hex IDs without leading zeroes; OTLP detail
+        # fields still use the strict full-width hex/base64 decoder above.
+        trace_id = (search_id.lower().zfill(32)
+                    if re.fullmatch(r"[0-9a-fA-F]{1,32}", search_id)
+                    else normalize_id(search_id, 16))
+        if not trace_id:
+            raise ValueError("Tempo search hit missing trace ID")
         detail = resource_spans(get(base_url + "/api/traces/" + trace_id))
         spans = [s for b in detail for scope in b["scopeSpans"] for s in scope.get("spans", [])]
         if not spans or any(s["traceId"] != trace_id or not s["spanId"] for s in spans):

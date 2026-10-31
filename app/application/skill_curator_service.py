@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
 from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
 from app.domain.curator_policy import CuratorPolicy, CuratorPolicyRequest
 from app.domain.policy import PolicyOutcome
 from app.domain.session import SessionSource
@@ -385,7 +386,27 @@ class SkillCuratorService:
         consolidate: bool | None = None, on_summary: Callable[[str], None] | None = None,
     ) -> CuratorRunResult:
         with business_operation("curator.run", source="curator", detached=True) as facts:
-            return await self._run_curator_review(synchronous, dry_run, consolidate, on_summary, _trace_facts=facts)
+            facts["curator_input"] = {"synchronous": synchronous, "dry_run": dry_run, "consolidate": consolidate}
+            facts["curator_output"] = {}
+            result = None
+            try:
+                result = await self._run_curator_review(synchronous, dry_run, consolidate, on_summary, _trace_facts=facts)
+                return result
+            finally:
+                # Project the actual execution facts once, through the shared
+                # sanitizer and byte budget. Telemetry must not change results.
+                try:
+                    output = asdict(result) if result is not None else {}
+                    output.update(facts["curator_output"])
+                    fields = {"input_messages": facts["curator_input"], "output_messages": output}
+                    if output.get("errors") or output.get("llm", {}).get("error"):
+                        fields["error"] = {"errors": output.get("errors", []), "llm_error": output.get("llm", {}).get("error")}
+                    details = project_details(**fields)
+                    if result is None and "output_messages" in details:
+                        details["output_messages"]["incomplete"] = True
+                    facts["details"] = details
+                except Exception:
+                    pass
 
     async def _run_curator_review(
         self,
@@ -420,11 +441,27 @@ class SkillCuratorService:
             consolidate = cfg.consolidate
         errors: list[dict] = []
         backup_error: str | None = None
+        if _trace_facts is not None:
+            _trace_facts["curator_output"]["errors"] = errors
         try:
             rows = await self.skill_usage_store.list_curator_managed(
                 prune_seeds=cfg.prune_seeds, protected_names=self._protected_seeds
             )
             has_candidates = len(rows) > 0
+            if _trace_facts is not None:
+                try:
+                    _trace_facts["curator_input"].update(
+                        consolidate=consolidate,
+                        config={"stale_after_days": cfg.stale_after_days,
+                                "archive_after_days": cfg.archive_after_days, "prune_seeds": cfg.prune_seeds},
+                        candidates=[{"name": row.name, "source": row.source, "state": row.state,
+                                     "pinned": row.pinned, "use_count": row.use_count,
+                                     "view_count": row.view_count, "patch_count": row.patch_count,
+                                     "last_activity_at": row.last_activity_at, "activity_count": row.activity_count}
+                                    for row in rows],
+                    )
+                except Exception:
+                    pass
 
             # backup fail-closed（非 dry_run 且有候选）
             if not dry_run and has_candidates:
@@ -455,6 +492,11 @@ class SkillCuratorService:
             counts, trans_errors = await self.apply_automatic_transitions(
                 now=start, dry_run=dry_run
             )
+            if _trace_facts is not None:
+                try:
+                    _trace_facts["curator_output"]["auto_transitions"] = asdict(counts)
+                except Exception:
+                    pass
             errors.extend(trans_errors)
 
             auto_parts = []
@@ -483,6 +525,8 @@ class SkillCuratorService:
                 errors.append({"phase": "consolidation", "error": "evolution_service missing"})
             else:
                 llm_meta["summary"] = "skipped (consolidation off)"
+            if _trace_facts is not None:
+                _trace_facts["curator_output"]["llm"] = llm_meta
 
             prefix = "dry-run auto: " if dry_run else "auto: "
             if _trace_facts is not None and (errors or llm_meta.get("error")):

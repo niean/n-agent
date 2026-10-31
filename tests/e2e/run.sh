@@ -35,6 +35,10 @@ case "$SUITE" in
     ;;
 esac
 
+# Isolate autonomous skill evolution for this suite and every child/restart.
+source "$(dirname "${BASH_SOURCE[0]}")/environment.sh"
+e2e_environment default "$0" "$@"
+
 (cd "$REPO_ROOT/docker" && ./restart.sh)
 # 通知 conversations.sh 跳过重复重建（inspect 使用重建后的最新 Mounts）
 export N_AGENT_E2E_REBUILT=1

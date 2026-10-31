@@ -119,7 +119,7 @@ subagent 为性能优化手段，非流程成败条件。所有使用 subagent �
 
 Third Review 是 Workflow 内部的通用 Skill，用于在主流程模型产出关键文档后引入可替换 provider 审阅并修正文件。能力默认关闭；项目启用后，spec/plan 顺序固定为：文档 Skill 自带 Review Loop -> `Skill: 三方审阅` -> Third Review Skill 内的主流程复审。它不新增 Phase、不改变 GATE，也不替代前序 Review Loop。
 
-流程、输入、provider 选择、输出、失败确认和跳过状态的唯一权威定义是 `.harness/framework/skills/harness/third-review/SKILL.md`。项目开关和默认 provider/model/timeout 定义在 `.harness/harness.json` 的 `thirdReview` 配置中，并通过统一配置脚本获取；Workflow 只决定调用时机并传入当前 Task 的文件路径与 Review Loop evidence，不直接调用 runner、provider 或读取 provider 环境变量。
+流程、输入、provider 选择、输出、失败确认和跳过状态的唯一权威定义是 `.harness/framework/skills/harness/third-review/SKILL.md`。主 Agent 为 Codex 时使用 Claude Code 审阅，主 Agent 为 Claude Code 时使用 Codex 审阅，由调用方按该 Skill 的映射显式传入 provider；用户对当前调用的明确指定优先。项目开关和兜底 provider/model/timeout 定义在 `.harness/harness.json` 的 `thirdReview` 配置中，并通过统一配置脚本获取；Workflow 只决定调用时机并传入当前 Task 的文件路径与 Review Loop evidence，不直接调用 runner、provider 或读取 provider 环境变量。
 
 ## Harness 运行配置
 

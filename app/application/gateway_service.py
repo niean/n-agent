@@ -15,6 +15,7 @@ from app.application.schedule_service import ScheduledTaskCreateInput, ScheduleS
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService
 from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details, StreamDetailsAccumulator
 from app.domain.gateway import (
     GatewayConfirmationAction,
     GatewayConfirmationChoice,
@@ -454,7 +455,10 @@ class GatewayService:
         self, event: InteractionMessage, *, approval_decider: ApprovalDecider | None = None,
     ) -> InteractionResponse:
         with business_operation("gateway.message", source=event.session_key.source_value) as facts:
-            return await self._handle_message(event, approval_decider=approval_decider, _trace_facts=facts)
+            facts["details"] = project_details(input_messages=[{"role": "user", "content": _content_from_interaction(event)}])
+            result = await self._handle_message(event, approval_decider=approval_decider, _trace_facts=facts)
+            facts["details"].update(project_details(output_messages=[{"content": m.content} for m in result.messages]))
+            return result
 
     async def _handle_message(
         self,
@@ -534,6 +538,11 @@ class GatewayService:
         allowed_confirm_tools_override: dict[str, Any] | None = None,
     ) -> AsyncIterator[ChatEvent]:
         with business_operation("gateway.message", source=event.session_key.source_value) as facts:
+            facts["details"] = project_details(input_messages=[{"role": "user", "content": _content_from_interaction(event)}])
+            output = StreamDetailsAccumulator()
+            saw_delta = False
+            finished = False
+            capture_failed = False
             stream = self._handle_message_stream(
                 event, model_override=model_override, options_override=options_override,
                 trusted_metadata_override=trusted_metadata_override, approval_decider=approval_decider,
@@ -541,11 +550,29 @@ class GatewayService:
             )
             try:
                 async for item in stream:
+                    try:
+                        if item.type is ChatEventType.CONTENT_DELTA:
+                            saw_delta = True
+                            output.append_text(item.content)
+                        elif item.type is ChatEventType.MESSAGE_DONE:
+                            if not saw_delta:
+                                output.append_text(item.content)
+                            saw_delta = False
+                    except Exception:
+                        capture_failed = True
                     if item.type is ChatEventType.ERROR:
                         facts["outcome"] = "cancelled" if item.finish_reason == "cancelled" else "failed"
+                        facts["details"].update(project_details(error=item.error))
                     yield item
+                finished = True
             finally:
-                await stream.aclose()
+                try:
+                    await stream.aclose()
+                finally:
+                    try:
+                        facts["details"].update(output.finish(incomplete=capture_failed or not finished or facts.get("outcome") in {"failed", "cancelled"}))
+                    except Exception:
+                        pass  # Observation failure must preserve stream close/cancellation.
 
     async def _handle_message_stream(
         self,

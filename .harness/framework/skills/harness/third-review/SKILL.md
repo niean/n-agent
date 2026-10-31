@@ -18,7 +18,16 @@ Require:
 - `review_loop_evidence`: current-Task evidence that the corresponding Review Loop completed and corrected this exact target.
 - `spec_file`: required only for `plan`; it must be the distinct associated spec and evidence must show that its Phase 2 GATE was confirmed.
 
-Accept optional non-empty `provider` and `model`. Resolve `provider` in this order: explicit Skill input, non-empty `HARNESS_THIRD_REVIEW_PROVIDER`, then the output of `get-config.sh thirdReview.provider`. Resolve `model` in the same order using `HARNESS_THIRD_REVIEW_MODEL` and `get-config.sh thirdReview.model`; an empty getter result is absent. Resolve timeout from valid `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS`, then `get-config.sh thirdReview.timeoutSeconds`. Reject unresolved or placeholder-valued provider configuration instead of assuming a built-in provider. Reject NUL or newline in model and reject NUL in any input. Treat empty optional values as absent. Evidence is invalid when it belongs to another Task, path, document revision, or retry.
+Accept optional non-empty `provider` and `model`. Choose the review provider from the identity of the main Agent, rather than the model used by a subagent:
+
+| Main Agent | Review provider |
+|---|---|
+| Codex | `claude-code` |
+| Claude Code | `codex` |
+
+For these two main Agents, pass the mapped provider as explicit Skill input on every spec/plan invocation; this takes precedence over environment and project provider defaults. Do not fall back to reviewing with the same provider if the mapped CLI is unavailable or fails; follow the existing failure flow. A user explicitly selecting a provider for the current invocation takes precedence over this mapping. Do not infer Agent identity from which CLI binaries happen to be installed.
+
+For other or unknown main Agent identities, resolve `provider` in this order: explicit Skill input, non-empty `HARNESS_THIRD_REVIEW_PROVIDER`, then the output of `get-config.sh thirdReview.provider`. Resolve `model` in the same order using `HARNESS_THIRD_REVIEW_MODEL` and `get-config.sh thirdReview.model`; an empty getter result is absent. Resolve timeout from valid `HARNESS_THIRD_REVIEW_TIMEOUT_SECONDS`, then `get-config.sh thirdReview.timeoutSeconds`. Reject unresolved or placeholder-valued provider configuration instead of assuming a built-in provider. Reject NUL or newline in model and reject NUL in any input. Treat empty optional values as absent. Evidence is invalid when it belongs to another Task, path, document revision, or retry.
 
 Bundled providers are `codex` and `claude-code`. Their standalone CLI paths may be overridden with `HARNESS_THIRD_REVIEW_CODEX_BIN` and `HARNESS_THIRD_REVIEW_CLAUDE_CODE_BIN`. Both adapters reject binaries resolved from VS Code extension directories and run in one foreground non-interactive turn under the runner deadline. `claude-code` uses `--safe-mode` with only the built-in Read/Edit tools and `acceptEdits`, preserving CLI OAuth/keychain authentication while disabling project customizations; it directly reads and edits the runner-selected target like the Codex provider and emits the five-field text summary without an intermediate edit protocol.
 

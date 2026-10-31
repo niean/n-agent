@@ -348,19 +348,19 @@ INSTRUMENTS: Dict[str, Instrument] = {
             name=INSTRUMENT_INVOKE_AGENT_DURATION,
             kind="histogram",
             unit="s",
-            allowed_dimensions=(GEN_AI_AGENT_NAME, "error.type"),
+            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_SOURCE, "error.type"),
         ),
         Instrument(
             name=INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS,
             kind="histogram",
             unit="{inference_call}",
-            allowed_dimensions=(GEN_AI_AGENT_NAME,),
+            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_SOURCE),
         ),
         Instrument(
             name=INSTRUMENT_INVOKE_AGENT_TOOL_CALLS,
             kind="histogram",
             unit="{tool_call}",
-            allowed_dimensions=(GEN_AI_AGENT_NAME,),
+            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_SOURCE),
         ),
         Instrument(
             name=INSTRUMENT_TURNS,
@@ -417,7 +417,7 @@ _KNOWN_PROVIDERS = frozenset({
 
 _KNOWN_SOURCES = frozenset({
     "api", "cli", "acp", "dashboard", "chat", "http", "task", "schedule",
-    "feishu", "dingtalk", "wecom", "curator", "delegation",
+    "feishu", "dingtalk", "wecom", "curator", "delegation", "skill_review",
 })
 
 _KNOWN_OUTCOMES = frozenset({
@@ -843,6 +843,10 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
                 raise
             except BaseException as exc:
                 facts["outcome"] = "error"
+                try:
+                    facts.setdefault("details", {}).update(project_details(error=str(exc)))
+                except Exception:
+                    pass
                 _mark_span_error(span, exc)
                 raise
             finally:
@@ -853,7 +857,7 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
                         span.set_status(Status(StatusCode.ERROR))
                     except Exception:
                         pass
-                _complete(span, operation, start, outcome=outcome)
+                _complete(span, operation, start, outcome=outcome, details=facts.get("details"))
     finally:
         _end_span(span)
         for variable, token in reversed(cleared):
@@ -909,11 +913,16 @@ def schedule_execution_span(task_id: str, session_id: str, claim_id: str):
         with _span_scope(span):
             try:
                 yield result
-            except BaseException:
+            except BaseException as exc:
                 result["status"] = "error"
+                try:
+                    result.setdefault("details", {}).update(project_details(error=str(exc)))
+                except Exception:
+                    pass
                 raise
             finally:
                 _complete(span, "schedule.execute", start,
+                          details=result.get("details"),
                           outcome=result.get("status", "unknown"),
                           delivery_status=result.get("delivery_status"))
                 if result.get("delivery_status"):
@@ -1161,18 +1170,20 @@ def record_invoke_agent_durations_and_calls(
     error_type: Optional[str],
     inference_calls: int,
     tool_calls: int,
+    source: object = None,
 ) -> None:
     error_dims = _error_dim(error_type)
-    _record(INSTRUMENT_INVOKE_AGENT_DURATION, seconds, {GEN_AI_AGENT_NAME: agent, **error_dims})
+    dims = {GEN_AI_AGENT_NAME: agent, NAGENT_SOURCE: map_source(source)}
+    _record(INSTRUMENT_INVOKE_AGENT_DURATION, seconds, {**dims, **error_dims})
     _record(
         INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS,
         inference_calls,
-        {GEN_AI_AGENT_NAME: agent},
+        dims,
     )
     _record(
         INSTRUMENT_INVOKE_AGENT_TOOL_CALLS,
         tool_calls,
-        {GEN_AI_AGENT_NAME: agent},
+        dims,
     )
 
 
@@ -1628,7 +1639,8 @@ class SemanticsTelemetry:
                     try:
                         record_turn(source, end_reason)
                         record_invoke_agent_durations_and_calls(DEFAULT_AGENT_NAME, time.monotonic() - start,
-                                                               error_type, stats.inference_calls, stats.tool_calls)
+                                                               error_type, stats.inference_calls, stats.tool_calls,
+                                                               source=source)
                     except Exception:
                         pass
         finally:

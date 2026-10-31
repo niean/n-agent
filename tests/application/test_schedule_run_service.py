@@ -467,6 +467,9 @@ async def _wait_for(predicate, attempts: int = 20) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["due", "manual"])
 async def test_schedule_span_contains_agent_and_delivery(monkeypatch, entry):
+    from app.application import telemetry_details as td
+    from app.infrastructure.observability.sanitizer import LogSanitizer
+    monkeypatch.setattr(td, "_config", (LogSanitizer().sanitize, 2048))
     from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -507,6 +510,8 @@ async def test_schedule_span_contains_agent_and_delivery(monkeypatch, entry):
         assert contexts[1].span_id == schedule.context.span_id
         assert schedule.attributes["nagent.schedule.task_id"] == "task-1"
         assert schedule.attributes["nagent.outcome"] == "succeeded"
+        assert "summarize" in schedule.attributes["nagent.details.input_messages.content"]
+        assert "done" in schedule.attributes["nagent.details.output_messages.content"]
         assert not trace.get_current_span().get_span_context().is_valid
     finally:
         provider.shutdown()

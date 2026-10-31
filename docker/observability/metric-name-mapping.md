@@ -48,6 +48,23 @@ Counter 示例（nagent_turns_total / gen_ai_client_inference_usage_input_tokens
 gen_ai_provider_name、gen_ai_token_modality、nagent_source、nagent_end_reason）。
 维度名同样按 `.` -> `_` 翻译（nagent.source -> nagent_source）。
 
+### 2026-10-31：AgentRun 来源维度
+
+三个既有 histogram（gen_ai.invoke_agent.duration / inference_calls / tool_calls）增加
+`nagent.source`，落库标签为 `nagent_source`；名称、单位及 instrument 数量不变。
+来源由本次受信 RunContext 提供：dashboard/api、feishu/cli/acp/dingtalk/wecom、
+schedule、task、delegation、skill_review（技能自进化审查）、curator，以及枚举保留的 chat/http；缺失或未知归 other。
+不使用会话创建来源、任务发起平台或投递平台替代本次执行来源。
+
+Agent Span 仍为 current 时记录三个测量，SDK exemplar 保留该 Agent 的 trace_id/span_id，
+执行标识不加入时序标签。inference_calls/tool_calls 的 `_sum / _count` 表示每次运行的
+平均调用数；零调用运行仍进入 `_count`，`_count / _count` 不能表示调用次数。
+
+Overview/Metrics 的 Source 多选变量仅筛选 AgentRun/turns；模型、工具等保持服务级。
+All 使用 `.*`，包含历史缺失来源标签的序列；指定来源时排除这些历史序列。
+历史标签缺失不能补造为 other。exemplar 为采样例子，单次耗时不等于面板分位数。
+本节是新增维度契约，不改变上方 2026-10-25 名称实测日期；本次后端验证另记任务计划。
+
 大盘 p95 查询模板（已在大盘 JSON 中采用实际名称）：
 
 ```promql

@@ -62,10 +62,12 @@ HTTP SERVER（对话请求）
 - 关闭 ASGI receive/send Span。HTTPX/SQLite 自动 CLIENT Span 必须有有效父操作；不为独立后台探测等请求创建孤儿 Span。
 - CLI/ACP 经 `gateway.message`、飞书事件经 `feishu.event -> gateway.message`、后台 Task 经 `task.run` 进入 Agent；业务入口 Span 覆盖准入/编排与收尾，不能仅以 `invoke_agent` 存在或有 exemplar 判断入口完整。Gateway 流式 Span 持续到实际消费结束，关闭向内传递；错误事件区分执行失败与取消。
 - 模型调用和工具调用通常是 Agent 下的兄弟，工具不能挂到已结束的模型 Span 下。真实请求尝试各记一次，不重复打点。
-- 定时任务在 `ScheduleRunService.run_claim()` 创建 `schedule.execute` 入口 Span，覆盖策略检查、执行记录、Agent 与投递；自动触发和手动运行复用该入口。Agent Span 继承其上下文，投递发生在 Agent Span 结束后、定时任务 Span 结束前。记录 task/claim/session 标识、执行与投递状态及完成摘要，不记录任务 prompt。
+- 定时任务在 `ScheduleRunService.run_claim()` 创建 `schedule.execute` 入口 Span，覆盖策略检查、执行记录、Agent 与投递；自动触发和手动运行复用该入口。Agent Span 继承其上下文，投递发生在 Agent Span 结束后、定时任务 Span 结束前。记录 task/claim/session 标识、执行与投递状态及完成摘要；任务 prompt 与执行结果通过统一详情通道先脱敏再限长，不进入普通属性、指标或自检缓冲。
 - Task 的 `task.run` 包含 worker/Judge 多轮、终态处理及通知；独立后台 Task 使用新 Trace，并通过 Span Link 关联触发者。`skill.review`、`curator.run` 同样使用独立 Trace + Link；Curator 内部 review 保持同 Trace 的父子关系。后台独立操作清理继承的业务现场并在退出时恢复；`clear_run_context()` 本身只清理业务 ContextVars，不代表 OTel Trace 已隔离。
 - 委派按所属 delegation 的服务端 traceparent 恢复到 `delegation.member -> invoke_agent`，禁止继承领取 tick 的偶然父级。原始关联随创建事务持久化，重连不覆盖；旧记录、损坏值或关联读取失败创建独立 member 业务根。保留未采样标志，不将 baggage/正文/凭据持久化。固定 source 映射包含 `delegation`。
 - 应用入口统一由 `business_operation` 管理完成摘要、失败/取消状态和现场恢复；仅接受固定操作名及标识白名单，不新增高基数指标标签。Tracer 故障回落到有效构造的非记录 Span，不阻断业务。CLI Curator run 通过 `application_runtime` 在成功或异常退出时收尾导出。
+- 每个业务入口自身记录本次请求与实际结果，不能用子 Agent/模型已有详情替代。Gateway、Task、Schedule、委派与后台审查统一使用 `details.input_messages/output_messages/error` 等既有白名单字段，经 `project_details` 投影后交给入口作用域的 `facts["details"]`；完成时同一份信封进入该 Span 和关联完成日志。流式结果沿消费路径有界收集，避免 delta 与最终消息重复计数，关闭/失败保留安全前缀并标明 incomplete；不得提前消费流。拒绝、跳过等无 Agent 输出的路径记录实际返回状态，不伪造回复。
+- Curator 入口的请求详情包括运行参数、有效整理开关/阈值和候选技能事实，结果详情包括实际返回结构、已完成迁移计数、模型整理结果/工具调用及错误；不得只存 summary_so_far。迁移完成时立即保存观测事实，后续报告失败或取消不将已完成计数重置为零，未完成结果标记 incomplete。所有入口验收须断言真实内容与异常分支，只有字段存在不算 payload 完整；短输出验证脱敏，超长输出另验截断。
 - 同一同步执行链中的 HTTP、Agent、工具和依赖继承同一 Trace；独立后台工作的关联按上述 Link 规则处理。SSE 断连后继续执行的 Agent 保留原关联，不另建 Trace。
 - 谁开启 Span，谁负责结束；完成日志和关联指标先记录，再结束。异常、拒绝、取消分别表达，不伪装成功。
 
@@ -173,6 +175,8 @@ GenAI 采用 `telemetry_semantics.py` 声明的草案依据，变更时集中迁
 - 指标名称、单位和允许维度集中在 `telemetry_semantics.py`；Prometheus 实际名称以 `docker/observability/metric-name-mapping.md` 为准，新增指标同步维护。
 - Histogram 在对应 Span 仍为 current 时记录，供已采样 Span 产生 exemplar。缺失 Token 不伪造为零；费用以 Usage 账本为准。
 - exemplar 只覆盖部分测量，不用于逐次执行审计。排查缺失先核对时间窗、指标与服务筛选、采样和导出，再直接查询 Trace；不得为了关联而将执行 ID 加入指标标签。
+- AgentRun 三个 histogram（duration/inference_calls/tool_calls）统一携带经 map_source 归一的 nagent.source，由本次受信 RunContext 提供，不能用会话创建来源或投递平台替代。Chat 为 dashboard/api，GW 保留 feishu/cli/acp/dingtalk/wecom，定时执行为 schedule，Task worker/Judge 为 task，委派 child 为 delegation；Skill 自进化审查为 skill_review，周期维护的模型整理为 curator；其他已知枚举保留，未知归 other。SkillEvolutionService 将有效来源同时传给 skill.review 入口与内部受信 gateway.source，再经 ChatCompletionService 构造 RunContext，避免入口 other、Agent api 的双重回落；复用会话不改变原会话来源。测量在当前 Agent Span 内记录，exemplar 关联该 Agent Span，入口差异通过序列 nagent_source 与 Trace 入口共同体现。
+- Grafana Overview/Metrics 的 Source 多选仅筛选 AgentRun/turns，模型/工具/Token 等面板标明服务级。Source All=`.*` 包含历史缺失来源序列，指定来源时不包含；历史来源不回填、不伪装为 other，历史图例保留分位数/调用类型后缀。平均调用数使用 histogram _sum/_count（零调用运行计入分母），exemplar 单次测量与 p95/p99 含义不同；耗时面板通过同页 ?viewPanel 链接查看底层 bucket 面板，保留反向代理子路径和筛选条件。
 - Trace 使用 ParentBased + 比例采样，继承父级采样决定；Log/Metric 不因 Trace 未采样而丢弃。
 - Dashboard 自检只保留当前进程最近 100 条已结束、被采样 Span 的少量安全字段；每页 10 条，重启清空，不代表完整历史。
 
@@ -190,7 +194,7 @@ GenAI 采用 `telemetry_semantics.py` 声明的草案依据，变更时集中迁
 | 入口与生命周期 | 真实入口、子步骤、直接父级或因果关联完整；必要收尾仍在观测边界内；完成记录、资源释放与上下文恢复不重复或遗漏 |
 | 异步与恢复 | 不同上游并发、异步派生、重试及重启恢复后仍按操作归属关联；缺失关联时明确降级，不继承无关执行的上下文 |
 | 状态与数据流 | 正常、异常、错误返回、拒绝、超时、取消和断连分别验证；输入输出与异常传播不变；截断、中断和未知长度明确标识 |
-| 信息与安全 | 允许记录的信息足以解释操作；各出口同一操作的标识与语义一致；敏感字段、分片敏感值及各独立出口均有防泄漏验证 |
+| 信息与安全 | 对每个真实入口断言请求与实际结果详情非空且可读，不能仅检查 Span 存在、父子关系和状态；各出口同一操作的标识、详情与语义一致；敏感字段、分片敏感值及各独立出口均有防泄漏验证 |
 | 指标与关联 | 实际指标名称、单位、维度、基数和增量符合定义；采样决定与关联标识正确；使用到的跨信号查询链可实测，不要求每次执行都有样本 |
 | 运行与隔离 | 故障注入不改变原有行为；重复初始化不泄漏；正常与异常退出均清理；测试恢复全局对象、回调、缓存和配置，检查顺序依赖 |
 | 部署与历史 | 切换前后固定样本、实际持久化位置、生效配置及各存储层保留策略可核对；缺口、可恢复范围与回退方式明确 |

@@ -148,10 +148,35 @@ async def test_review_ingress_source_sets_gateway_source(svc):
 
 
 @pytest.mark.asyncio
-async def test_review_ingress_source_none_omits_gateway_source(svc):
-    # nudge 触发的 background review 复用既有用户 session，不注入 gateway.source，保持现状回落
+async def test_review_default_source_is_skill_review(svc):
+    # Reusing a user session must not turn a background run into an API ingress.
     svc.chat.complete = AsyncMock(return_value=MagicMock(message={"content": ""}))
     await svc.run_background_review(session_id="s1", digest="x")
     request = svc.chat.complete.call_args.args[0]
-    assert "gateway.source" not in request.trusted_metadata
+    assert request.trusted_metadata["gateway.source"] == "skill_review"
     assert request.trusted_metadata["skill_write_origin"] == "background_review"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_source", ["dashboard", "api", "feishu"])
+async def test_review_source_reaches_real_chat_snapshot_without_changing_session(tmp_path, session_source):
+    from app.application.chat_service import ChatCompletionService
+    from app.application.policy_snapshot import RunPolicySnapshotFactory, SettingsPolicyProfileProvider
+    from app.application.session_service import SessionService
+    from app.config import Settings
+    from app.domain.session import ConversationSession
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+    from tests.application.test_chat_service import RecordingRunner
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="user-session", source=session_source))
+    runner = RecordingRunner()
+    chat = ChatCompletionService(
+        store, runner, SessionService(store),
+        policy_snapshot_factory=RunPolicySnapshotFactory(SettingsPolicyProfileProvider(Settings())),
+    )
+    evolution = SkillEvolutionService(chat, MagicMock())
+    await evolution.run_background_review("user-session", "digest")
+    assert runner.options["_policy_snapshot"].run_context.source == "skill_review"
+    assert (await store.get_session("user-session")).source == session_source
+    assert runner.calls[0]["state"].persist_messages is False

@@ -639,9 +639,31 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 教训：后台任务在业务执行入口创建 Span，跨 await 保持上下文并覆盖结果投递；同时验证自动与手动路径的真实 SDK 父子关系，不能只凭 exemplar 存在判断完整性。
 - 来源：Trace 071740bf92e0c90e32fef86b800b1e5b；test_schedule_span_contains_agent_and_delivery 两入口 RED 缺少入口 Span，修复后通过。
 
+### P070: 补入口 Span 必须复用已有详情能力并验证实际载荷
+
+- 现象：chat 已支持脱敏输入输出，后续 gateway.message、schedule.execute、task.run 等入口仍只有根 Span、状态和完成摘要。
+- 根因：入口作用域没有将 details 传给 _complete，调用方也未采集载荷；新增真实 SDK 测试仅验证父子关系、生命周期和状态，没有请求/结果断言。规范同时残留定时任务“不记录任务 prompt”，与默认保留脱敏有效信息的权威原则冲突。实现与验收遗漏是主要原因，错误的局部约束是共同原因，不能归咎于缺少现有详情能力。
+- 教训：修复可观测问题须按全部业务入口列出请求、实际结果、异常和流式关闭路径，复用 project_details 与有界流累积；先看 payload 断言失败，再验证同 Span 的完成日志、安全限长与故障隔离。补层级不能视为入口验收完成；局部禁正文规则不得覆盖统一脱敏详情通道。审查发现流式 finish 和异常字符串化也可能抛错，须故障注入证明原业务异常与取消不变。
+- 来源：2026-10-31 修复入口 payload；第一轮 RED 12 failed/30 passed，同类入口 RED 4 failed/23 passed；故障隔离 RED 2 failed；飞书图片/卡片 RED 2 failed；证据见 verify-261031-fix-entry-payloads.md。
+- 再次复核：Curator 只将 summary_so_far 写入 output，旧测试仅断言字段存在，未验证候选、迁移与模型结果，导致同类遗漏再次被错误验收。补实际内容断言先RED 2项；另复现后续失败/取消丢失已完成迁移RED 2项。修复后140项通过。新增短/长输出分开验证，防止截断先移除敏感字段使脱敏测试假绿；投影故障与取消组合验证原取消不变。见 verify-261031-fix-curator-payloads.md。
+
 ### P067: 保留卷映射不能替代历史样本与有效配置验收
 
 - 现象：共享观测迁移复用了全部八卷，Trace/Log/Metric/Grafana固定样本一致，但Pyroscope最早61个分钟桶减少。
 - 根因：原Pyroscope为local-only；168h compactor配置未覆盖本地4h低磁盘清理。v1.21.1磁盘比例单位偏差结合不足10GiB空间，使启动清理成为高置信度原因；实际删除事件缺少旧Debug证据，不能伪称直接证明。零阈值修复也无效，因为该版本只接受正数覆盖默认值。
 - 教训：切换前保存实际挂载、历史查询及必要原始块备份；新服务就绪不代表历史完整。持久bucket与本地热数据策略分别验证，检查版本真实默认值及覆盖条件。发现不可恢复的历史缺口必须如实保留验收限制，不能用聚合快照伪造原始样本。
 - 来源：plan-261029-split-observability-stack、D079；源码核对与双端固定窗口查询。
+
+### P071: Grafana 新导航须覆盖子路径与历史图例
+
+- 现象：AgentRun 来源大盘初版原始指标链接使用 /explore，子路径部署会丢失前缀；历史来源统一显示名还让 p50/p95/p99 与模型/工具均值曲线重名。
+- 根因：初版契约只检查链接存在 bucket 名和历史显示名，没有验证导航目标与图例保留的信息。
+- 教训：同一大盘的原始指标查看优先使用相对 ?viewPanel 跳转并携带时间/筛选参数；历史来源显示须保留分位数、调用类型和动态标签后缀。配置测试检查目标面板真实存在与后缀，后端查询再验证指标/exemplar/Span 一致，不能用 JSON 字符串存在代替行为语义。
+- 来源：plan-261031-observe-agent-run-sources，扫描发现2项并修复，统一241项通过；8来源24 exemplar经Prometheus/Tempo验证。
+
+### P072: 后台派生 AgentRun 必须显式声明本次执行来源
+
+- 现象：Trace b99f52a64f534011b9d0c4c1d00b92f6 的 skill.review 根 Span 为 other，内部 invoke_agent 及 exemplar 序列为 api。
+- 根因：SkillEvolutionService 默认 ingress_source=None，外层观测回落 other；内部请求省略受信 gateway.source，ChatCompletionService 构造 RunContext 时默认 api。复用用户会话不等于继承该次运行入口。
+- 教训：后台派生入口在公开编排边界确定固定来源，同时传给业务入口观测和内部受信请求；显式 curator 等来源保持原值。分别验证原会话来源不变、真实 Chat 快照、SDK exemplar Span 身份及实际后端标签，不通过改名指标或重写历史掩盖上游缺失。
+- 来源：verify-261031-fix-skill-review-source；RED 3 failed/23 passed，GREEN 276 passed；Docker 合成真实审查/Chat快照通路验证 skill_review 与 curator 的根Span/Agent/exemplar一致。

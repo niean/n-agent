@@ -114,6 +114,7 @@ class Sandbox:
     def make_repo(self, repo: Path) -> Path:
         (repo / "tests" / "e2e" / "conversations").mkdir(parents=True)
         shutil.copy2(SCRIPT_SOURCE, repo / "tests" / "e2e" / "conversations.sh")
+        shutil.copy2(SCRIPT_SOURCE.with_name("environment.sh"), repo / "tests" / "e2e" / "environment.sh")
         (repo / "docker").mkdir(parents=True)
         _write_executable(repo / "docker" / "restart.sh", RESTART_STUB)
         return repo
@@ -130,6 +131,7 @@ class Sandbox:
         env = {
             "PATH": f"{self.bin_dir}:/usr/bin:/bin",
             "DOCKER_STUB_LOG": str(self.log),
+            "N_AGENT_E2E_ENVIRONMENT": "default",
             "DOCKER_STUB_INSPECT": str(inspect_file),
             "DOCKER_STUB_CHECKS": json.dumps(checks or {}),
             "DOCKER_STUB_EXEC_RC": exec_rc,

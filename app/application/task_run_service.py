@@ -48,6 +48,7 @@ from uuid import uuid4
 
 from app.application.task_session import task_execution_session_id
 from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
 from app.domain.policy import PolicyOutcome
 from app.domain.task import (
     ClaimResult,
@@ -449,10 +450,11 @@ class TaskRunService:
     ) -> None:
         with business_operation("task.run", source="task", session_id=task_execution_session_id(task), run_id=str(run_id), detached=True,
                                 identifiers={"nagent.task.id": task.id, "nagent.task.run_id": run_id}) as facts:
-            outcome = await self._run_claim(task, run_id, claim_lock)
+            facts["details"] = project_details(input_messages={"title": task.title, "body": task.body})
+            outcome = await self._run_claim(task, run_id, claim_lock, _trace_facts=facts)
             facts["outcome"] = outcome
 
-    async def _run_claim(self, task: Task, run_id: int, claim_lock: str) -> str:
+    async def _run_claim(self, task: Task, run_id: int, claim_lock: str, *, _trace_facts=None) -> str:
         """Execute a single claim with hard timeout and CAS finalize.
 
         This is the worker entry point called by the dispatcher's spawn.
@@ -494,6 +496,8 @@ class TaskRunService:
                 error=f"execution error: {exc}",
             )
 
+        if _trace_facts is not None:
+            _trace_facts["details"].update(project_details(output_messages=agent_result.output, error=agent_result.error))
         await self._finalize_run(task, run_id, claim_lock, agent_result)
         return agent_result.status.value
 

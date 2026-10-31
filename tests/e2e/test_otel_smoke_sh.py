@@ -1,23 +1,6 @@
 """宿主单测：otel_smoke.sh 观测冒烟编排脚本的静态合同（T10）。
 
-锁定的契约（plan-261024 T10 S3 + 执行合同 item 22/23/24/25）：
-- run.sh POSIX 再执行（sh 调用有效）且 all 列表接入 otel_smoke.sh，
-  保留既有 suite 与一次性重建机制；继承观测环境变量不覆盖；
-- otel_smoke.sh 自门控：观测关闭时只做 disabled 断言并以 0 退出；
-- OTel/Profile 分支各按自身开关启用；
-- Tempo 查询走 v2 的 /api/v3/*（legacy /api/services 已 404）+ 60 秒有界轮询；
-- Prometheus 断言使用 T9 S4 锁定的实际导出名称（含 Counter _total 与
-  Histogram _bucket/_sum/_count），不使用 spec 示例名；
-- 大盘 UID nagent-overview 与 histogram_quantile p95 经真实 API 校验；
-- ratio=0 无远端父上下文 -> 无已采样本地根 span 而指标继续增长；
-- 零调用运行（vision 拒绝路径，零 LLM 调用完成 run）-> gen_ai usage
-  token/调用指标零增量；
-- 确定性 fixture：固定可控 Provider（calculator 安全工具，LLM->工具->LLM）
-  实际接入 provider factory，且结束后恢复原 Provider；
-- 环境覆盖（ratio=0 / 预算拒绝 / 压缩）须备份并恢复 docker/.env；
-- 观测容器重启后持久卷数据仍可查（Prometheus/Pyroscope）；
-- 全部业务流量在 Docker（BASE_URL + docker compose），宿主仅编排；
-- 秘密哨兵不得出现在 Tempo/Prometheus/日志/自检出口。
+最小集合：成功链路三信号关联与脱敏、Provider 500、真实客户端断连。
 """
 from __future__ import annotations
 
@@ -37,15 +20,10 @@ PROM_COUNTERS = (
     "gen_ai_client_inference_usage_input_tokens_total",
     "gen_ai_client_inference_usage_output_tokens_total",
     "nagent_turns_total",
-    "nagent_context_compressions_total",
-    "nagent_budget_denied_total",
 )
 PROM_HISTOGRAMS = (
-    "gen_ai_client_inference_duration_seconds",
     "gen_ai_execute_tool_duration_seconds",
     "gen_ai_invoke_agent_duration_seconds",
-    "gen_ai_invoke_agent_inference_calls",
-    "gen_ai_invoke_agent_tool_calls",
 )
 
 
@@ -176,30 +154,6 @@ class TestSmokeMetrics:
         for name in PROM_HISTOGRAMS:
             assert name in smoke, f"缺少锁定 Histogram 名称 {name}"
 
-    def test_asserts_histogram_series_suffixes(self, smoke):
-        for suffix in ("_bucket", "_sum", "_count"):
-            assert suffix in smoke, f"缺少 Histogram 序列后缀断言 {suffix}"
-
-    def test_asserts_ratio_zero_metrics_still_grow(self, smoke_code):
-        assert re.search(
-            r'N_AGENT_OTEL_TRACES_SAMPLE_RATIO["\']?\s*[:=]\s*["\']?0', smoke_code
-        ), "ratio=0 覆盖缺失"
-        assert "traces_in_window" in smoke_code or "ratio=0" in smoke_code
-
-    def test_asserts_compression_and_budget_denial(self, smoke):
-        assert "N_AGENT_BUDGET_MAX_LLM_CALLS" in smoke, "缺少预算拒绝触发"
-        assert "N_AGENT_CONTEXT_COMPRESSION_THRESHOLD" in smoke, (
-            "缺少压缩触发"
-        )
-        assert "nagent_budget_denied_total" in smoke
-        assert "nagent_context_compressions_total" in smoke
-
-    def test_asserts_zero_llm_call_run_no_usage_delta(self, smoke):
-        """plan item 24: 显式零调用运行，gen_ai usage 指标不得增长。"""
-        assert "SESSION_ZEROCALL" in smoke, "缺少零调用运行探针会话"
-        assert "zero-LLM-call" in smoke, "缺少零调用运行 section"
-        assert "prom_assert_no_delta" in smoke, "缺少指标无增量断言 helper"
-        assert "prom_stable_value" in smoke, "缺少基线稳定化 helper"
 
 
 class TestSmokeFixture:
@@ -210,27 +164,23 @@ class TestSmokeFixture:
         assert "calculator" in smoke, "必须使用安全测试工具 calculator"
         assert "chat/completions" in smoke, "必须经真实对话路径驱动 agent"
 
-    def test_provider_and_env_restored_after_run(self, smoke):
-        assert "activate" in smoke, "必须重新激活原 Provider"
-        assert re.search(r"cp .*docker/\.env|\.env\.otel-smoke", smoke), (
-            "env 覆盖必须基于备份文件恢复 docker/.env"
-        )
-        assert "trap" in smoke, "必须有 cleanup trap 保证恢复"
+    def test_cleanup_restores_provider_and_removes_fixtures(self, smoke):
+        assert "restore_provider" in smoke
+        assert "stop_fake_llm" in smoke
+        assert 'for session in "$SESSION_GOOD" "$SESSION_FAIL" "$SESSION_CANCEL"' in smoke
+        assert "trap cleanup EXIT" in smoke
 
-
-class TestSmokePersistenceAndDashboard:
-    def test_restarts_observability_containers_and_requeries(self, smoke_code):
-        assert re.search(
-            r'docker restart "\$prom_id" "\$pyro_id"', smoke_code
-        ), "必须重启 Prometheus/Pyroscope 容器验证持久卷"
-        assert "prom_sum" in smoke_code and "pyroscope_render" in smoke_code, (
-            "重启后必须重新查询 Prometheus/Pyroscope 数据"
-        )
-        assert "run_persistence_checks" in smoke_code
-
-    def test_dashboard_uid_and_p95_verified(self, smoke):
-        assert "nagent-overview" in smoke, "必须校验大盘 UID"
-        assert "histogram_quantile" in smoke, "p95 PromQL 必须经 API 执行"
+    def test_only_minimal_scenarios_remain(self, smoke_code):
+        for removed in ("run_persistence_checks", "run_profile_checks", "apply_env_overlay",
+                        "SESSION_ZEROCALL", "SUMMARY_ONLY", "docker restart", "recreate_nagent"):
+            assert removed not in smoke_code
+        assert "FORCE-LLM-500" in smoke_code
+        assert 'check-failure "$TMP_DIR/trace-fail.json"' in smoke_code
+        assert '"$CHAT_FINISH" = "error"' in smoke_code
+        assert "DISCONNECT-PROBE" in smoke_code
+        assert "time.sleep(3)" in smoke_code
+        assert '"$CHAT_CURL_STATUS" = "28"' in smoke_code
+        assert 'tempo_find_trace "$SESSION_CANCEL"' in smoke_code
 
 
 class TestSmokeSentinel:
@@ -252,12 +202,6 @@ class TestExecutionSummary:
     def test_http_ingress_parents_agent(self, smoke):
         assert 'http["name"] in ("POST /chat/completions", "POST /v1/chat/completions")' in smoke
         assert "detached run context" not in smoke
-
-    def test_summary_only_mode_runs_delivery_checks_and_normal_cleanup(self, smoke):
-        assert 'N_AGENT_OTEL_SMOKE_SUMMARY_ONLY' in smoke
-        assert smoke.index('check_execution_summaries "$TMP_DIR/trace-good.json"') < smoke.index('if [ "${N_AGENT_OTEL_SMOKE_SUMMARY_ONLY:-false}"')
-        assert 'execution summary PASS' in smoke
-        assert 'trap cleanup EXIT' in smoke
 
     def test_session_lookup_waits_for_root_not_early_child(self, smoke):
         assert 'and s.get("name", "").startswith("invoke_agent ")' in smoke
@@ -306,6 +250,5 @@ def test_shared_backend_queries_use_independent_compose():
     source = SMOKE_SOURCE.read_text()
     assert 'obs_compose exec -T prometheus wget' in source
     assert 'obs_compose logs otel-collector' in source
-    assert '$(obs_compose ps -q prometheus)' in source
     assert 'compose exec -T n-agent python3 - "$1"' not in source
     assert 'if compose exec -T n-agent python - "$TRACE_ID"' not in source

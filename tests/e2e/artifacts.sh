@@ -11,6 +11,10 @@
 # container with default config (enabled); a disabled-mode run requires a
 # separate N_AGENT_ARTIFACTS_ENABLED=false invocation.
 
+# Isolate autonomous skill evolution for this suite and every child/restart.
+source "$(dirname "${BASH_SOURCE[0]}")/environment.sh"
+e2e_environment default "$0" "$@"
+
 (
   set -eu
   set -o pipefail

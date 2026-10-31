@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
 
 if TYPE_CHECKING:
     from app.application.chat_service import ChatCompletionInput
@@ -117,12 +118,15 @@ class SkillEvolutionService:
         allow_toolsets: set[str] | None = None, ingress_source: str | None = None,
         *, _within_curator: bool = False,
     ) -> BackgroundReviewResult:
-        with business_operation("skill.review", source=ingress_source or "other", session_id=session_id,
+        ingress_source = ingress_source or "skill_review"
+        with business_operation("skill.review", source=ingress_source, session_id=session_id,
                                 detached=not _within_curator) as facts:
+            facts["details"] = project_details(input_messages={"digest": digest}, system_prompt=prompt or _SKILL_REVIEW_PROMPT)
             result = await self._run_background_review(session_id, digest, prompt, max_iterations,
                                                        timeout_seconds, allow_toolsets, ingress_source)
             if result.error:
                 facts["outcome"] = "failed"
+            facts["details"].update(project_details(output_messages={"content": result.final_text, "tool_calls": result.tool_calls}, error=result.error))
             return result
 
     async def _run_background_review(
@@ -147,10 +151,10 @@ class SkillEvolutionService:
         toolset to skills-only (excluding memory). Defaults preserve the
         existing nudge-triggered background review behavior.
 
-        ``ingress_source`` lets the Curator consolidation fork declare its
-        session source (curator) so the lazily-created session is attributed
-        correctly instead of falling back to ``api`` (模式十六). The nudge
-        path leaves it None because it reuses an existing user session.
+        ``ingress_source`` identifies this execution, independently of the
+        reused session's original source. The public wrapper defaults nudge
+        reviews to ``skill_review``; Curator consolidation declares ``curator``.
+        Both are forwarded so the internal AgentRun does not fall back to API.
         """
         try:
             used_toolsets = (

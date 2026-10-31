@@ -49,6 +49,9 @@
 [20261031]
 - FR
     - 观测：定时任务，补全定时任务应用层根Span；全面检查，补全AgentRun的入口层根Span
+        - 迭代：定时任务、任务、GW等入口，补全请求和结果payload。chat已出过类似问题，你要找出原因(规范错误、还是模型不长记性)、加上教训，避免OTel Trace再犯相似问题
+    - 观测：Grafana，examplar当前只关联LLM指标上，我希望examplar能体现出AgentRun入口差异，如Chat、GW、定时任务、任务等。如何增加metric及examplar、以及如何修改Grafana大盘？请实施
+    - 会话：FE，会话如何关联Grafana大盘，是否为会话定制观测Grafana大盘？业界有没有成熟实践？比如，会话链接跳转对应的观测大盘页面(Trace、Log、Token消耗等)。
 
 
 ---
