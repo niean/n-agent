@@ -10,11 +10,19 @@ from uuid import uuid4
 
 from app.infrastructure.sqlite_support import open_sqlite
 from app.domain.context import CONTEXT_SUMMARY_PREFIX
+from app.domain.agent_run import current_run
 from app.domain.session import ConversationMessage, ConversationSession, SessionSource, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
 from app.infrastructure.registry.sqlite_mcp_registry import _initialize_mcp_schema
+from app.infrastructure.registry.sqlite_agent_run_registry import validate_run_session
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_projection_write(conn: sqlite3.Connection, session_id: str) -> None:
+    binding = current_run.get()
+    if binding is not None and binding.session_id == session_id:
+        validate_run_session(conn, binding.run_id, session_id)
 
 
 class SQLiteMemoryStore:
@@ -105,6 +113,14 @@ class SQLiteMemoryStore:
             self._migrate_add_is_summarized_column(conn)
             self._migrate_add_source_column(conn)
             self._migrate_add_card_column(conn)
+            for table in ("messages", "tool_calls"):
+                columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if "run_id" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN run_id TEXT")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_run ON {table}(run_id)")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+            if "origin_kind" not in columns:
+                conn.execute("ALTER TABLE messages ADD COLUMN origin_kind TEXT NOT NULL DEFAULT 'legacy_unknown'")
             self._migrate_mark_legacy_middle_summarized(
                 conn,
                 protect_first_n=self._migration_protect_first_n,
@@ -174,12 +190,15 @@ class SQLiteMemoryStore:
         return normalized
 
     async def append_message(self, session_id: str, message: ConversationMessage) -> ConversationMessage:
-        await self.create_session(ConversationSession(id=session_id))
+        if message.run_id is None:
+            await self.create_session(ConversationSession(id=session_id))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            validate_run_session(conn, message.run_id, session_id)
             conn.execute(
                 """
-                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized, source, card_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized, source, card_json, run_id, origin_kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -194,6 +213,8 @@ class SQLiteMemoryStore:
                     1 if message.is_summarized else 0,
                     message.source,
                     json.dumps(message.card, ensure_ascii=False) if message.card is not None else None,
+                    message.run_id,
+                    message.origin_kind,
                 ),
             )
             conn.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (message.created_at.isoformat(), session_id))
@@ -220,10 +241,11 @@ class SQLiteMemoryStore:
                 if row is None:
                     conn.execute("ROLLBACK")
                     return None
+                validate_run_session(conn, message.run_id, session_id)
                 conn.execute(
                     """
-                    INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized, source, card_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO messages(id, session_id, role, content_json, created_at, provider_message_id, tool_call_id, name, is_summary, is_summarized, source, card_json, run_id, origin_kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message.id,
@@ -238,6 +260,8 @@ class SQLiteMemoryStore:
                         1 if message.is_summarized else 0,
                         message.source,
                         json.dumps(message.card, ensure_ascii=False) if message.card is not None else None,
+                        message.run_id,
+                        message.origin_kind,
                     ),
                 )
                 # updated_at = max(原值, message.created_at)，防迟到客户端时间令活动时间倒退
@@ -272,17 +296,22 @@ class SQLiteMemoryStore:
                 is_summarized=bool(row["is_summarized"]) if "is_summarized" in row.keys() else False,
                 source=row["source"] if "source" in row.keys() else None,
                 card=self._decode_message_card(row),
+                run_id=row["run_id"] if "run_id" in row.keys() else None,
+                origin_kind=row["origin_kind"] if "origin_kind" in row.keys() else "legacy_unknown",
             )
             for row in rows
         ]
 
     async def save_tool_call(self, tool_call: ToolCall) -> ToolCall:
-        await self.create_session(ConversationSession(id=tool_call.session_id))
+        if tool_call.run_id is None:
+            await self.create_session(ConversationSession(id=tool_call.session_id))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            validate_run_session(conn, tool_call.run_id, tool_call.session_id)
             conn.execute(
                 """
-                INSERT OR REPLACE INTO tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, status, duration_ms, created_at, run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     tool_call.id,
@@ -294,6 +323,7 @@ class SQLiteMemoryStore:
                     tool_call.status,
                     tool_call.duration_ms,
                     tool_call.created_at.isoformat(),
+                    tool_call.run_id,
                 ),
             )
         return tool_call
@@ -342,10 +372,13 @@ class SQLiteMemoryStore:
             status=row["status"],
             duration_ms=row["duration_ms"],
             created_at=datetime.fromisoformat(row["created_at"]),
+            run_id=row["run_id"] if "run_id" in row.keys() else None,
         )
 
     async def save_task_state(self, task_state: TaskState) -> TaskState:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _validate_projection_write(conn, task_state.session_id)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO task_states(session_id, status, iteration_count, last_error, updated_at)
@@ -375,6 +408,8 @@ class SQLiteMemoryStore:
 
     async def save_summary(self, summary: Summary) -> Summary:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _validate_projection_write(conn, summary.session_id)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO summaries(session_id, summary, source_message_id, updated_at)
@@ -393,6 +428,8 @@ class SQLiteMemoryStore:
 
     async def delete_summary_messages(self, session_id: str) -> int:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _validate_projection_write(conn, session_id)
             cur = conn.execute(
                 "DELETE FROM messages WHERE session_id = ? AND is_summary = 1",
                 (session_id,),
@@ -410,13 +447,16 @@ class SQLiteMemoryStore:
             raise ValueError("summary message content must be str")
         if not message.content.startswith(CONTEXT_SUMMARY_PREFIX):
             raise ValueError(f"summary message content must start with {CONTEXT_SUMMARY_PREFIX!r}")
-        await self.create_session(ConversationSession(id=session_id))
+        if message.run_id is None:
+            await self.create_session(ConversationSession(id=session_id))
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            validate_run_session(conn, message.run_id, session_id)
             conn.execute(
                 """
                 INSERT INTO messages(id, session_id, role, content_json, created_at,
-                    provider_message_id, tool_call_id, name, is_summary, is_summarized, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    provider_message_id, tool_call_id, name, is_summary, is_summarized, source, run_id, origin_kind)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.id,
@@ -430,6 +470,8 @@ class SQLiteMemoryStore:
                     1,
                     0,
                     message.source,
+                    message.run_id,
+                    message.origin_kind,
                 ),
             )
             conn.execute(
@@ -442,6 +484,8 @@ class SQLiteMemoryStore:
         if not message_ids:
             return 0
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _validate_projection_write(conn, session_id)
             cur = conn.execute(
                 "UPDATE messages SET is_summarized = 1 WHERE session_id = ? AND id IN (%s)"
                 % ",".join("?" * len(message_ids)),
@@ -449,11 +493,49 @@ class SQLiteMemoryStore:
             )
             return cur.rowcount
 
+    async def assert_session_deletable(self, session_id: str) -> None:
+        with self._connect() as conn:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'").fetchone() is None:
+                return
+            if conn.execute(
+                "SELECT 1 FROM agent_runs WHERE session_id=? AND status IN ('pending','running') LIMIT 1",
+                (session_id,),
+            ).fetchone() is not None:
+                raise ValueError("session_has_active_agent_runs")
+
     async def delete_session(self, session_id: str) -> bool:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing_tables = {r["name"] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()}
+            if "agent_runs" in existing_tables:
+                if conn.execute(
+                    "SELECT 1 FROM agent_runs WHERE session_id=? AND status IN ('pending','running') LIMIT 1",
+                    (session_id,),
+                ).fetchone() is not None:
+                    raise ValueError("session_has_active_agent_runs")
+                if "trace_links" in existing_tables:
+                    conn.execute(
+                        "DELETE FROM trace_links WHERE biz_type='agent_run' AND biz_id IN (SELECT id FROM agent_runs WHERE session_id=?)",
+                        (session_id,),
+                    )
+                for column in ("parent_run_id", "retry_of_run_id"):
+                    conn.execute(
+                        f"UPDATE agent_runs SET {column}=NULL WHERE {column} IN (SELECT id FROM agent_runs WHERE session_id=?)",
+                        (session_id,),
+                    )
+                for table, column in (
+                    ("tasks", "created_by_run_id"), ("tasks", "pending_trigger_run_id"),
+                    ("task_runs", "trigger_run_id"), ("scheduled_task_executions", "trigger_run_id"),
+                    ("delegations", "canonical_parent_run_id"),
+                ):
+                    if table in existing_tables and column in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}:
+                        conn.execute(
+                            f"UPDATE {table} SET {column}=NULL WHERE {column} IN (SELECT id FROM agent_runs WHERE session_id=?)",
+                            (session_id,),
+                        )
+                conn.execute("DELETE FROM agent_runs WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM gateway_session_links WHERE session_id = ?", (session_id,))
             conn.execute("UPDATE gateway_conversations SET active_session_id = NULL WHERE active_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
@@ -566,8 +648,8 @@ class SQLiteMemoryStore:
                 conn.execute(
                     """
                     INSERT INTO messages(id, session_id, role, content_json, created_at,
-                        provider_message_id, tool_call_id, name, is_summary, is_summarized, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        provider_message_id, tool_call_id, name, is_summary, is_summarized, source, origin_kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_msg_id,
@@ -581,6 +663,7 @@ class SQLiteMemoryStore:
                         mrow["is_summary"] if "is_summary" in mrow.keys() else 0,
                         mrow["is_summarized"] if "is_summarized" in mrow.keys() else 0,
                         mrow["source"] if "source" in mrow.keys() else None,
+                        "context_copy",
                     ),
                 )
             # Clone tool_calls: regenerate ids, rebuild message_id linkage via msg_id_map.
@@ -843,6 +926,7 @@ def _migrate_session_id_prefixes(conn: sqlite3.Connection) -> None:
     ).fetchall()}
     session_id_tables = [
         "messages", "tool_calls", "task_states", "summaries",
+        "agent_runs", "usage_records", "compression_stats",
         "sandbox_execution_history", "sandbox_released_history",
         "scheduled_tasks", "scheduled_task_executions",
         "gateway_session_links",

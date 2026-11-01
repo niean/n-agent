@@ -43,7 +43,7 @@ from app.application.schedule_service import (
     ScheduleValidationError,
 )
 from app.application.session_bootstrap import SessionBootstrapReader
-from app.application.session_service import SessionService
+from app.application.session_service import SessionBusyError, SessionService
 from app.application.skill_service import SkillInput, SkillScanReport, SkillScanWarning, SkillService
 from app.application.tool_service import ToolService
 from app.domain.otel_link_config import OtelLinkConfigProvider
@@ -451,7 +451,7 @@ def create_dashboard_router(
     async def delete_session(session_id: str):
         try:
             await session_service.delete_session(session_id)
-        except SessionNotFoundError as exc:
+        except (SessionNotFoundError, SessionBusyError) as exc:
             return _session_error_response(exc)
         except TaskStateError as exc:
             # Pre-delete cascade refuses to remove a session while a related
@@ -966,6 +966,11 @@ def create_dashboard_router(
 
 
 def _session_error_response(exc: Exception) -> JSONResponse:
+    if isinstance(exc, SessionBusyError):
+        return JSONResponse(
+            status_code=409,
+            content={"error": {"code": "session_busy", "message": str(exc)}},
+        )
     if isinstance(exc, SessionNotFoundError):
         return JSONResponse(
             status_code=404,
@@ -1957,6 +1962,8 @@ def _message_to_dict(message: ConversationMessage) -> dict:
         content = content.get("content", "")
     data = {
         "id": message.id,
+        "run_id": message.run_id,
+        "origin_kind": message.origin_kind,
         "role": message.role,
         "content": content,
         "tool_call_id": message.tool_call_id,
@@ -1988,6 +1995,7 @@ def _task_state_to_dict(task_state: TaskState) -> dict:
 def _tool_call_to_dict(tool_call: ToolCall) -> dict:
     return {
         "id": tool_call.id,
+        "run_id": tool_call.run_id,
         "session_id": tool_call.session_id,
         "tool_name": tool_call.tool_name,
         "arguments": _normalize_tool_call_arguments(tool_call.arguments),

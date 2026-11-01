@@ -684,9 +684,23 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 教训：同一大盘的原始指标查看优先使用相对 ?viewPanel 跳转并携带时间/筛选参数；历史来源显示须保留分位数、调用类型和动态标签后缀。配置测试检查目标面板真实存在与后缀，后端查询再验证指标/exemplar/Span 一致，不能用 JSON 字符串存在代替行为语义。
 - 来源：plan-261031-observe-agent-run-sources，扫描发现2项并修复，统一241项通过；8来源24 exemplar经Prometheus/Tempo验证。
 
+### P076: 执行账本必须验证跨业务取消与故障收尾
+
+- 现象：AgentRun 已取消但 TaskRun 仍运行；终态写失败被重复收尾覆盖成所有权错误；数据库退出清理失败跳过其他子系统；委派重启后丢失已知父执行。
+- 根因：通用执行身份、异步 Task 控制、业务尝试和旧 capability 分属不同生命周期；只测各层成功路径，未定义责任交接及故障分类。
+- 教训：显式用户取消、进程退出和所有权丢失分别表达；用真实 Graph/Chat/业务账组合验证状态及租约释放；收尾只由当前责任方执行并保留原始异常，各子系统关闭独立隔离。新账本父身份独立持久化，恢复时不从旧授权标识猜测关联。真实装配测试必须恢复发布到模块的全局观测设置。
+- 来源：spec-261101-model-agent-runtime-er 核心规范审查 R1–R9 及红绿修复。
+
 ### P072: 后台派生 AgentRun 必须显式声明本次执行来源
 
 - 现象：Trace b99f52a64f534011b9d0c4c1d00b92f6 的 skill.review 根 Span 为 other，内部 invoke_agent 及 exemplar 序列为 api。
 - 根因：SkillEvolutionService 默认 ingress_source=None，外层观测回落 other；内部请求省略受信 gateway.source，ChatCompletionService 构造 RunContext 时默认 api。复用用户会话不等于继承该次运行入口。
 - 教训：后台派生入口在公开编排边界确定固定来源，同时传给业务入口观测和内部受信请求；显式 curator 等来源保持原值。分别验证原会话来源不变、真实 Chat 快照、SDK exemplar Span 身份及实际后端标签，不通过改名指标或重写历史掩盖上游缺失。
 - 来源：verify-261031-fix-skill-review-source；RED 3 failed/23 passed，GREEN 276 passed；Docker 合成真实审查/Chat快照通路验证 skill_review 与 curator 的根Span/Agent/exemplar一致。
+
+### P077: 跨平台测试应验证底层合同并复现真实打包环境
+
+- 现象：SQLite 已切换 DELETE 且数据完整，测试仍因 -shm 路径存在失败；macOS 归档夹具偶发混入 ._. 成员，正式导出器却未产生该问题。
+- 根因：把底层侧文件生命周期误当数据库模式合同；测试打包遗漏正式导出器的 COPYFILE_DISABLE 环境约定，未主动制造扩展属性。
+- 教训：以底层实际返回值、持久数据和并发保护验证安全，不直接 unlink 侧文件追求通过。归档夹具复制完整环境，并用真实扩展属性构造反例；不能放宽导入清单校验来容忍夹具污染。
+- 来源：D086/D087；原失败与真实 macOS 元数据反例均完成红绿闭环，相关282项存储及212项归档回归通过。

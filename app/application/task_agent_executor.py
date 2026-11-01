@@ -61,6 +61,7 @@ from app.application.task_tools import (
     TASK_TOOL_SHOW,
     USER_TASK_APPROVAL_TOOL_NAMES,
 )
+from app.domain.agent_run import RunCancelledError, RunOwnershipLost
 from app.domain.policy import ExecutionMode
 from app.domain.task import Task, TaskRunOutcome
 from app.domain.task_config import TaskConfig, TaskConfigProvider
@@ -297,6 +298,8 @@ class TaskAgentExecutor:
 
         request = ChatCompletionInput(
             model=task.model_override or "N-Agent",
+            task_run_id=task_run_id,
+            execution_kind="task_worker",
             messages=messages,
             stream=False,
             session_id=execution_session_id,
@@ -314,6 +317,8 @@ class TaskAgentExecutor:
 
         try:
             result = await self.chat_service.complete(request)
+        except (RunCancelledError, RunOwnershipLost):
+            raise
         except asyncio.TimeoutError:
             return TaskAgentResult(
                 status=TaskRunOutcome.TIMED_OUT,
@@ -489,6 +494,8 @@ class TaskAgentExecutor:
 
         request = ChatCompletionInput(
             model=task.model_override or "N-Agent",
+            task_run_id=task_run_id,
+            execution_kind="task_judge",
             messages=[
                 {"role": "user", "content": f"judge task {task.id}: has the goal been achieved?"},
             ],
@@ -519,6 +526,8 @@ class TaskAgentExecutor:
 
         try:
             result = await self.chat_service.complete(request)
+        except (RunCancelledError, RunOwnershipLost):
+            raise
         except Exception as exc:
             logger.warning("judge fork failed: task=%s err=%s", task.id, exc)
             return None

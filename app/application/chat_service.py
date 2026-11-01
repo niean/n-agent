@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, TYPE_CHECKING
@@ -10,6 +12,7 @@ if TYPE_CHECKING:
     from app.application.delegation_parent_adapter import RealtimeDelegationAdapter
 
 from app.application.agent_graph import AgentGraphRunner
+from app.application.agent_run_service import AgentRunService, RunExecution
 from app.application.events import ChatEvent, ChatEventType
 from app.application.information_flow_service import InformationFlowService
 from app.application.policy_snapshot import (
@@ -22,6 +25,7 @@ from app.application.runtime_memory_service import RuntimeMemoryService
 from app.application.session_bootstrap import SessionBootstrapReader, SessionDescriptor
 from app.application.session_service import SessionService
 from app.domain.agent import AgentState
+from app.domain.agent_run import bind_run, current_run
 from app.domain.information_flow import ReleaseTarget, SecretCatalog
 from app.domain.memory import MemoryStore
 from app.domain.session import ConversationSession, SessionSource
@@ -47,6 +51,7 @@ _PROCESS_MESSAGE_SOURCES = frozenset({
 # Upper bound on skills the chat composer may activate for a single run; keeps the
 # Activated Skills prompt section bounded regardless of client payload size.
 _MAX_ACTIVATED_SKILLS = 10
+logger = logging.getLogger(__name__)
 
 
 class ActiveExternalMemoryReader(Protocol):
@@ -76,6 +81,12 @@ class ChatCompletionInput:
     # out of the user-visible Chat history. Default True preserves existing
     # behavior for all other callers.
     persist_messages: bool = True
+    parent_run_id: str | None = None
+    retry_of_run_id: str | None = None
+    task_run_id: int | None = None
+    schedule_execution_id: str | None = None
+    delegation_member_id: str | None = None
+    execution_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,7 @@ class ChatCompletionResult:
     message: dict[str, Any]
     finish_reason: str = "stop"
     usage: dict[str, Any] = field(default_factory=dict)
+    run_id: str | None = None
 
 
 class ChatCompletionService:
@@ -101,6 +113,7 @@ class ChatCompletionService:
         session_bootstrap_reader: SessionBootstrapReader | None = None,
         delegation_adapter: "RealtimeDelegationAdapter | None" = None,
         delegation_config: Any | None = None,
+        agent_run_service: AgentRunService | None = None,
     ):
         self.memory_store = memory_store
         self.graph_runner = graph_runner
@@ -118,6 +131,7 @@ class ChatCompletionService:
         )
         self._delegation_adapter = delegation_adapter
         self._delegation_config = delegation_config
+        self.agent_run_service = agent_run_service
 
     async def compress_session(self, session_id: str) -> dict[str, Any]:
         """Force compress a session's context without LLM call.
@@ -128,6 +142,57 @@ class ChatCompletionService:
         return await self.graph_runner.compress_session(session_id)
 
     async def complete(self, request: ChatCompletionInput) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
+        if self.agent_run_service is None:
+            return await self._complete(request)
+        first_user = next((extract_text(m.get("content", "")) for m in request.messages if m.get("role") == "user"), "")
+        if request.persist_messages and _is_compress_slash(first_user):
+            return await self._complete(request)
+        session_id = request.session_id or f"api-{uuid4()}"
+        ingress = request.ingress_facts or IngressFacts(
+            run_id=str(uuid4()), session_id=session_id,
+            source=str(request.trusted_metadata.get("gateway.source") or "api"),
+            actor_id=str(request.trusted_metadata.get("actor_id") or "") or None,
+            execution_mode=self._execution_mode_from_request(request),
+            trusted_claims=dict(request.trusted_metadata),
+        )
+        if ingress.session_id != session_id:
+            raise ValueError("policy_context_invalid: ingress session mismatch")
+        request = dataclasses.replace(request, session_id=session_id, ingress_facts=ingress)
+        await self._runtime_memory.create_session_if_allowed(ConversationSession(id=session_id, source=ingress.source))
+        parent = current_run.get()
+        foreground = ingress.execution_mode.value == "realtime" and ingress.source not in {"task", "schedule", "curator", "delegation", "skill_review"}
+        binding = await self.agent_run_service.register(
+            run_id=ingress.run_id, session_id=session_id, source=ingress.source,
+            execution_kind=request.execution_kind or ("dialogue" if foreground else ingress.source),
+            parent_run_id=request.parent_run_id or (parent.run_id if parent else None),
+            retry_of_run_id=request.retry_of_run_id, task_run_id=request.task_run_id,
+            schedule_execution_id=request.schedule_execution_id,
+            delegation_member_id=request.delegation_member_id, foreground=foreground,
+        )
+        execution = RunExecution(binding)
+        try:
+            with bind_run(binding):
+                result = await self._complete(request, execution=execution)
+            return dataclasses.replace(result, run_id=binding.run_id) if isinstance(result, ChatCompletionResult) else result
+        except BaseException as exc:
+            if not execution.graph_owns_terminal:
+                status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                try:
+                    await self.agent_run_service.finish(
+                        binding, status, "cancelled" if status == "cancelled" else "error",
+                        error=type(exc).__name__,
+                    )
+                except Exception as cleanup_error:
+                    exc.add_note(f"agent_run_terminal_write_failed: {type(cleanup_error).__name__}")
+                    logger.error(
+                        "agent run preparation cleanup failed: run_id=%s error_type=%s",
+                        binding.run_id, type(cleanup_error).__name__,
+                    )
+            raise
+
+    async def _complete(
+        self, request: ChatCompletionInput, *, execution: RunExecution | None = None,
+    ) -> ChatCompletionResult | AsyncIterator[ChatEvent]:
         session_id = request.session_id or f"api-{uuid4()}"
         snapshot = await self._build_policy_snapshot(request, session_id)
         if snapshot is not None:
@@ -218,12 +283,14 @@ class ChatCompletionService:
         message_source = session_source if session_source in _PROCESS_MESSAGE_SOURCES else None
         state = AgentState(
             session_id=session_id,
-            run_id=snapshot.run_context.run_id if snapshot is not None else str(uuid4()),
+            run_id=snapshot.run_context.run_id if snapshot is not None else (request.ingress_facts.run_id if request.ingress_facts is not None else str(uuid4())),
             input_messages=normalized_messages,
             persist_messages=request.persist_messages,
             message_source=message_source,
         )
         options = dict(request.options)
+        if execution is not None:
+            options["_agent_run_execution"] = execution
         options["persist_messages"] = request.persist_messages
         if snapshot is not None:
             options["_policy_snapshot"] = snapshot

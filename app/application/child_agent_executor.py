@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 from typing import Any, Mapping, Protocol
+from uuid import uuid4
+from app.domain.agent_run import RunCancelledError
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult
 from app.domain.delegation import DelegationMember, DelegationResult, DelegationMemberStatus
@@ -61,6 +63,7 @@ class ChildAgentExecutor:
         model: str,
         parent_capability: Mapping[str, Any],
         deadline_at: str | None,
+        canonical_parent_run_id: str | None = None,
     ) -> DelegationResult:
         """Run ``member`` as a child agent and return its ``DelegationResult``.
 
@@ -80,8 +83,14 @@ class ChildAgentExecutor:
             session_id=session_id,
             session_title=member.title,
             persist_messages=False,
+            parent_run_id=canonical_parent_run_id,
+            delegation_member_id=member.id,
+            execution_kind=f"delegation_{member.role.value}",
             ingress_facts=self._build_ingress_facts(
-                parent_capability, execution_session_id=session_id
+                parent_capability, execution_session_id=session_id,
+                granted_tools=granted_tools,
+                delegation_id=member.delegation_id,
+                member_id=member.id,
             ),
             trusted_metadata={
                 "granted_tools": list(granted_tools),
@@ -98,6 +107,8 @@ class ChildAgentExecutor:
 
         try:
             result = await self._chat.complete(request)
+        except RunCancelledError:
+            raise
         except Exception:
             return DelegationResult(
                 status=DelegationMemberStatus.FAILED,
@@ -145,11 +156,12 @@ class ChildAgentExecutor:
 
     @staticmethod
     def _build_ingress_facts(
-        parent_capability: Mapping[str, Any], *, execution_session_id: str
+        parent_capability: Mapping[str, Any], *, execution_session_id: str,
+        granted_tools: tuple[str, ...] = (), delegation_id: str = "", member_id: str = "",
     ):
         from app.application.policy_snapshot import IngressFacts
         return IngressFacts(
-            run_id=parent_capability.get("run_id", ""),
+            run_id=f"delegation-run-{uuid4().hex}",
             # Policy snapshot admission binds IngressFacts to the request's
             # isolated child session. The parent session remains available
             # only as a trusted claim; using it here rejects every child with
@@ -162,6 +174,9 @@ class ChildAgentExecutor:
                 "parent_source": parent_capability.get("source", ""),
                 "parent_scope_id": parent_capability.get("scope_id", ""),
                 "parent_session_id": parent_capability.get("session_id", ""),
+                "parent_run_id": parent_capability.get("run_id", ""),
+                "granted_tools": list(granted_tools),
+                "delegation": {"delegation_id": delegation_id, "member_id": member_id},
             },
         )
 

@@ -10,6 +10,7 @@ from app.application.policy_snapshot import InformationFlowPolicyConfig
 from app.application.scheduled_agent_executor import ScheduledAgentResult
 from app.application.telemetry_semantics import schedule_execution_span
 from app.application.telemetry_details import project_details
+from app.domain.agent_run import RunCancelledError, current_run
 from app.domain.gateway import GatewaySessionKey
 from app.domain.gateway_policy import GatewayDeliveryDecision, GatewayOutboundRequest, GatewayPolicy
 from app.domain.information_flow import ReleaseTarget, SecretCatalog
@@ -70,12 +71,16 @@ class ScheduleRunService:
         claim = await self.registry.claim_task_for_run_now(task_id, now, self.lease_seconds)
         if claim is None:
             return {"task_id": task_id, "status": "not_claimed"}
-        asyncio.create_task(self._run_claim_safe(claim, now))
+        binding = current_run.get()
+        asyncio.create_task(self._run_claim_safe(
+            claim, now, trigger_run_id=binding.run_id if binding is not None else None
+        ))
         return {"task_id": task_id, "status": "triggered", "claim_id": claim.claim_id}
 
-    async def _run_claim_safe(self, claim: ScheduledTaskClaim, now: datetime | None = None) -> None:
+    async def _run_claim_safe(self, claim: ScheduledTaskClaim, now: datetime | None = None,
+                              *, trigger_run_id: str | None = None) -> None:
         try:
-            await self.run_claim(claim, now=now)
+            await self.run_claim(claim, now=now, trigger_run_id=trigger_run_id)
         except Exception:
             logger.exception("scheduled task run failed: task_id=%s", claim.task.id)
 
@@ -90,7 +95,8 @@ class ScheduleRunService:
         if self.recover_missing_origin_sessions is not None:
             await self.recover_missing_origin_sessions()
 
-    async def _run_executor(self, task: ScheduledTask) -> ScheduledAgentResult:
+    async def _run_executor(self, task: ScheduledTask, *, execution_id: str,
+                            trigger_run_id: str | None = None) -> ScheduledAgentResult:
         """Run the scheduled executor with a hard timeout and exception guard.
 
         A hung executor.run (e.g. LLM provider or host bridge not responding)
@@ -99,8 +105,13 @@ class ScheduleRunService:
         run_claim still records completion and releases the lease.
         """
         try:
+            linked_executor = getattr(self.executor, "run_for_execution", None)
+            invocation = (
+                linked_executor(task, execution_id=execution_id, parent_run_id=trigger_run_id)
+                if callable(linked_executor) else self.executor.run(task)
+            )
             return await asyncio.wait_for(
-                self.executor.run(task), timeout=self.execution_timeout_seconds
+                invocation, timeout=self.execution_timeout_seconds
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -112,6 +123,11 @@ class ScheduleRunService:
                 ScheduledTaskExecutionStatus.FAILED,
                 error=f"execution timed out after {self.execution_timeout_seconds}s",
             )
+        except RunCancelledError:
+            return ScheduledAgentResult(
+                ScheduledTaskExecutionStatus.CANCELLED,
+                error="cancelled by request",
+            )
         except Exception as exc:
             logger.exception("scheduled task execution raised: task_id=%s", task.id)
             return ScheduledAgentResult(
@@ -119,15 +135,18 @@ class ScheduleRunService:
                 error=f"execution error: {exc}",
             )
 
-    async def run_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None) -> dict:
+    async def run_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None,
+                        trigger_run_id: str | None = None) -> dict:
         with schedule_execution_span(claim.task.id, claim.task.session_id, claim.claim_id) as facts:
             facts["details"] = project_details(input_messages={"name": claim.task.name, "prompt": claim.task.prompt})
-            result = await self._execute_claim(claim, now=now, _trace_facts=facts)
+            result = await self._execute_claim(claim, now=now, _trace_facts=facts,
+                                               trigger_run_id=trigger_run_id)
             facts.update(result)
             facts["details"].setdefault("output_messages", project_details(output_messages=result).get("output_messages"))
             return result
 
-    async def _execute_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None, _trace_facts=None) -> dict:
+    async def _execute_claim(self, claim: ScheduledTaskClaim, *, now: datetime | None = None,
+                             _trace_facts=None, trigger_run_id: str | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
         decision = self._schedule_policy.evaluate(claim, now)
 
@@ -141,6 +160,7 @@ class ScheduleRunService:
             claimed_next_run_at=claim.claimed_next_run_at,
             started_at=started_at,
             status=ScheduledTaskExecutionStatus.RUNNING,
+            trigger_run_id=trigger_run_id,
         )
         await self.registry.record_execution_started(execution)
 
@@ -161,12 +181,17 @@ class ScheduleRunService:
 
         # --- Run the agent (bounded by execution_timeout; on timeout/error we
         # still record completion so the lease is released instead of leaking) ---
-        result = await self._run_executor(claim.task)
+        result = await self._run_executor(
+            claim.task, execution_id=execution.id, trigger_run_id=trigger_run_id
+        )
         if _trace_facts is not None:
             _trace_facts["details"].update(project_details(output_messages=result.output, error=result.error))
         completed = self._completed(execution, result.status, started_at, result.output, result.error)
         if not await self.registry.record_execution_completed(completed):
             return {"task_id": claim.task.id, "status": "stale"}
+
+        if result.status is ScheduledTaskExecutionStatus.CANCELLED:
+            return {"task_id": claim.task.id, "status": result.status.value}
 
         # --- Silent: ends BEFORE any outbound client call ---
         if decision.delivery_mode is DeliveryMode.SILENT:

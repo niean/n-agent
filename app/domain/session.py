@@ -57,6 +57,8 @@ class ConversationMessage:
     is_summarized: bool = False
     source: str | None = None
     card: dict[str, Any] | None = None
+    run_id: str | None = None
+    origin_kind: str = "notification"
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class ToolCall:
     duration_ms: int = 0
     message_id: str | None = None
     created_at: datetime = field(default_factory=utc_now)
+    run_id: str | None = None
 
 
 @dataclass(frozen=True)

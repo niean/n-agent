@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 SessionDeletedHandler = Callable[[str], Any]
 
 
+class SessionBusyError(Exception):
+    """Deletion is blocked while the Session has an active execution."""
+
+
 @runtime_checkable
 class HookDispatcherProtocol(Protocol):
     """Duck-typed dispatcher for plugin lifecycle hooks.
@@ -158,6 +162,16 @@ class SessionService:
         existing = await self.memory_store.get_session(session_id)
         if existing is None:
             raise SessionNotFoundError(session_id)
+        # Check before business cleanup callbacks; the store repeats this
+        # check atomically with deletion to reject a concurrently started Run.
+        assert_deletable = getattr(self.memory_store, "assert_session_deletable", None)
+        if assert_deletable is not None:
+            try:
+                await assert_deletable(session_id)
+            except ValueError as exc:
+                if str(exc) == "session_has_active_agent_runs":
+                    raise SessionBusyError("session has active AgentRuns") from exc
+                raise
         # T10: save existing.source before delete for on_session_end dispatch.
         existing_source = existing.source
         await self._invoke_session_deleting_handlers(session_id)
@@ -170,7 +184,12 @@ class SessionService:
                     session_id,
                     exc,
                 )
-        deleted = await self.memory_store.delete_session(session_id)
+        try:
+            deleted = await self.memory_store.delete_session(session_id)
+        except ValueError as exc:
+            if str(exc) == "session_has_active_agent_runs":
+                raise SessionBusyError("session has active AgentRuns") from exc
+            raise
         if not deleted:
             raise SessionNotFoundError(session_id)
         # T10: on_session_end -- after persist-delete success, using pre-delete source.

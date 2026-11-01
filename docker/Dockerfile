@@ -20,7 +20,8 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors
 COPY pyproject.toml ./
 COPY app ./app
 #RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple .
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple .
+# Image construction intentionally installs into the container's system Python.
+RUN pip install --root-user-action=ignore -i https://pypi.tuna.tsinghua.edu.cn/simple .
 
 EXPOSE 8201
 

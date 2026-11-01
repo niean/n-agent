@@ -163,6 +163,7 @@ class UsageRecord:
     tools: str | None = None
     generation_params: str | None = None
     normalized_tokens: int = 0
+    run_id: str | None = None
 
 
 @dataclass(frozen=True)

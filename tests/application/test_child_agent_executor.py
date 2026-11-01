@@ -123,6 +123,23 @@ async def test_child_persist_messages_false():
 
 
 @pytest.mark.asyncio
+async def test_each_child_attempt_has_independent_execution_identity():
+    fake = FakeChatService()
+    exe = ChildAgentExecutor(chat_service=fake, clock=FakeClock())
+    member = _make_member()
+    await exe.execute(member=member, model="m", parent_capability=_parent_capability(), deadline_at=None, canonical_parent_run_id="r1")
+    first = fake.captured
+    await exe.execute(member=member, model="m", parent_capability=_parent_capability(), deadline_at=None, canonical_parent_run_id="r1")
+    second = fake.captured
+    assert first.ingress_facts.run_id != "r1"
+    assert first.ingress_facts.run_id != second.ingress_facts.run_id
+    assert first.parent_run_id == "r1"
+    assert first.delegation_member_id == member.id
+    assert first.ingress_facts.trusted_claims["parent_run_id"] == "r1"
+    assert first.ingress_facts.trusted_claims["granted_tools"] == list(member.allowed_tools)
+
+
+@pytest.mark.asyncio
 async def test_child_uses_member_title_for_isolated_session():
     """Persist-disabled child sessions still appear in session storage for
     policy bootstrap, so they need the member's meaningful title."""

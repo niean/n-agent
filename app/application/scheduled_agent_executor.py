@@ -28,7 +28,15 @@ class ScheduledAgentExecutor:
         self.chat_service = chat_service
         self.scanner = scanner
 
-    async def run(self, task: ScheduledTask) -> ScheduledAgentResult:
+    async def run_for_execution(
+        self, task: ScheduledTask, *, execution_id: str, parent_run_id: str | None = None,
+    ) -> ScheduledAgentResult:
+        return await self.run(task, execution_id=execution_id, parent_run_id=parent_run_id)
+
+    async def run(
+        self, task: ScheduledTask, *, execution_id: str | None = None,
+        parent_run_id: str | None = None,
+    ) -> ScheduledAgentResult:
         safety = self.scanner.scan(task.prompt)
         if not safety.allowed:
             return ScheduledAgentResult(ScheduledTaskExecutionStatus.BLOCKED, error=safety.reason)
@@ -42,6 +50,9 @@ class ScheduledAgentExecutor:
                 ],
                 stream=False,
                 session_id=task.session_id,
+                schedule_execution_id=execution_id,
+                parent_run_id=parent_run_id,
+                execution_kind="schedule",
                 ingress_facts=IngressFacts(
                     run_id=f"schedule-{uuid4()}",
                     session_id=task.session_id,

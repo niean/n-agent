@@ -2,7 +2,7 @@
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
-- AgentRun：一次 Agent 运行的领域对象，包含会话、输入消息、运行状态、迭代计数、错误和结束原因。
+- AgentRun：一次完整 Agent 执行的持久身份，统一承载对话、Task Worker/Judge、定时、委派、审查及 Curator；agent_runs 是执行事实账本。RunBinding 为进程内所有权绑定，AgentState 为运行时工作状态；app/domain/agent.py 原 AgentRun DTO 保留兼容，不是持久账本。
 - AgentState：Agent Runtime 在运行过程中传递的状态，包含工作消息、待执行工具调用、工具结果、摘要、状态和迭代次数。
 - Application Layer：应用层，负责编排用例和 LangGraph 状态图，依赖 Domain 端口，不依赖 Infrastructure 具体实现。
 - ChatEvent：Application 层输出的聊天运行事件，供 Interfaces 层编码为 OpenAI-compatible SSE chunk 或非流式响应；含 `metadata: dict[str, Any]` 字段携带 Gateway confirmation/duplicate 等事件元信息，避免 CLI 解析中文提示文案提取结构化数据。

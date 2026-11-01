@@ -156,6 +156,8 @@ from app.infrastructure.task.outbound import TaskOutboundDelivery
 from app.infrastructure.usage.context_breakdown_calculator import ContextBreakdownCalculatorImpl
 from app.infrastructure.usage.pricing_table import InMemoryPricingProvider
 from app.infrastructure.usage.sqlite_usage_recorder import SqliteUsageRecorder
+from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+from app.application.agent_run_service import AgentRunService
 from app.domain.external_memory import ExternalMemoryConfigRegistry
 from app.domain.external_memory_provider import ExternalMemoryProviderType
 from app.application.external_memory_manager import ExternalMemoryManager
@@ -573,6 +575,7 @@ class ApplicationServices:
     tool_approval_service: GatewayToolApprovalService
     image_store: LocalImageStore
     usage_service: UsageService | None = None
+    agent_run_service: AgentRunService | None = None
     sandbox_dashboard_service: "SandboxDashboardService | None" = None
     sandbox_manager: "_SandboxManager | None" = None
     host_terminal_dashboard_service: "HostTerminalDashboardService | None" = None
@@ -1145,6 +1148,7 @@ def build_application_services(
     # so they can be wired into ToolService for封口 enforcement.
     llm_policy = LLMPolicy()
     llm_config = LLMConfig(fallback_enabled=settings.llm_fallback_enabled)
+    agent_run_service = AgentRunService(SQLiteAgentRunRegistry(settings.sqlite_path))
     graph_runner = AgentGraphRunner(
         holder,
         tool_service,
@@ -1167,6 +1171,7 @@ def build_application_services(
         browser_guidance=BROWSER_GUIDANCE if settings.browser_enabled else None,
         artifact_guidance=ARTIFACT_GUIDANCE if settings.artifacts_enabled else None,
         telemetry=telemetry,
+        agent_run_service=agent_run_service,
     )
     session_service = SessionService(
         memory_store,
@@ -1225,6 +1230,7 @@ def build_application_services(
         session_bootstrap_reader=SessionBootstrapReader(memory_store),
         delegation_adapter=realtime_delegation_adapter,
         delegation_config=delegation_config,
+        agent_run_service=agent_run_service,
     )
     # Delegation service layer (built after chat_service because
     # ChildAgentExecutor wraps it). Registered as a tool route + dynamic
@@ -2159,6 +2165,7 @@ def build_application_services(
         mcp_service=mcp_service,
         chat_service=chat_service,
         session_service=session_service,
+        agent_run_service=agent_run_service,
         model_service=model_service,
         gateway_registry=gateway_registry,
         gateway_service=gateway_service,
@@ -2374,6 +2381,12 @@ def application_runtime(settings: Settings | None = None):
         services = build_application_services(settings, observability_handle=handle)
         yield services
     finally:
+        run_service = getattr(locals().get("services"), "agent_run_service", None)
+        if run_service is not None:
+            try:
+                run_service.close_nowait()
+            except Exception:
+                logger.exception("AgentRun service shutdown failed")
         for execution_logger, original_handlers, original_level in temporary_loggers:
             for handler in execution_logger.handlers[:]:
                 if handler not in original_handlers:
@@ -2401,6 +2414,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if services.agent_run_service is not None:
+            await services.agent_run_service.start()
         feishu_task: asyncio.Task | None = None
         scheduler_task: asyncio.Task | None = None
         delegation_task: asyncio.Task | None = None
@@ -2556,6 +2571,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            if services.agent_run_service is not None:
+                try:
+                    await services.agent_run_service.close()
+                except Exception:
+                    logger.exception("AgentRun service shutdown failed")
             if scheduler_task is not None:
                 services.scheduler_runner.stop()
                 scheduler_task.cancel()
@@ -2632,6 +2652,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 logger.exception("observability shutdown failed")
 
     app = FastAPI(title="N-Agent", lifespan=lifespan)
+    from app.domain.agent_run import RunAdmissionConflict, RunCancelledError
+
+    @app.exception_handler(RunAdmissionConflict)
+    async def run_admission_conflict(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=409, content={"error": {"code": "agent_run_foreground_busy", "message": "Session already has an active foreground execution"}})
+
+    @app.exception_handler(RunCancelledError)
+    async def run_cancelled(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=409, content={"error": {"code": "agent_run_cancelled", "message": "Execution cancelled by request"}})
+
+    if services.agent_run_service is not None:
+        from app.interfaces.http.agent_run_routes import create_agent_run_router
+        app.include_router(create_agent_run_router(services.agent_run_service))
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.include_router(create_openai_compatible_router(services.chat_service, services.model_service, services.memory_store))
     app.include_router(create_platforms_router(services.platform_service))

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from app.domain.agent_run import current_run
+from app.infrastructure.registry.sqlite_agent_run_registry import validate_run_session
 
 from app.domain.usage import (
     CanonicalUsage, CompressionStat, OverviewStats, SessionUsageStats,
@@ -71,6 +73,9 @@ class SqliteUsageRecorder:
             )
             # usage_records migration: add requested_model / trigger_type / request_messages / response_message columns if missing
             ur_cols = {row[1] for row in conn.execute("PRAGMA table_info(usage_records)").fetchall()}
+            if "run_id" not in ur_cols:
+                conn.execute("ALTER TABLE usage_records ADD COLUMN run_id TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_records_run ON usage_records(run_id)")
             if "requested_model" not in ur_cols:
                 conn.execute("ALTER TABLE usage_records ADD COLUMN requested_model TEXT")
             if "trigger_type" not in ur_cols:
@@ -125,18 +130,23 @@ class SqliteUsageRecorder:
         now = datetime.now(timezone.utc).isoformat()
         conn = self._connect()
         try:
+            binding = current_run.get()
+            run_id = binding.run_id if binding is not None and binding.session_id == session_id else None
+            conn.execute("BEGIN IMMEDIATE")
+            validate_run_session(conn, run_id, session_id)
             conn.execute(
                 """INSERT INTO usage_records
                    (session_id, model, provider, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens,
                     total_tokens, estimated_cost_usd, cost_status, latency_ms, created_at,
-                    requested_model, trigger_type, request_messages, response_message, tools, generation_params)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    requested_model, trigger_type, request_messages, response_message, tools, generation_params, run_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, model, provider, usage.input_tokens, usage.output_tokens,
                     usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens,
                     usage.total_tokens, float(cost.amount_usd), cost.status, latency_ms, now,
                     requested_model, trigger_type, request_messages, response_message, tools, generation_params,
+                    run_id,
                 ),
             )
             conn.execute(
@@ -340,6 +350,7 @@ class SqliteUsageRecorder:
             response_message=resp_msg,
             tools=tools,
             generation_params=gen_params,
+            run_id=row["run_id"] if "run_id" in keys else None,
             normalized_tokens=compute_normalized_tokens(
                 row["input_tokens"], row["cache_read_tokens"], row["output_tokens"],
             ),

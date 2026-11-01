@@ -134,6 +134,20 @@ async def test_executor_calls_chat_service(executor, fake_chat):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("judge", [False, True])
+async def test_ownership_loss_is_not_a_retryable_worker_or_judge_failure(executor, fake_chat, monkeypatch, judge):
+    from app.domain.agent_run import RunOwnershipLost
+
+    async def lost(*args):
+        raise RunOwnershipLost("agent_run_ownership_lost")
+
+    monkeypatch.setattr(fake_chat, "complete", lost)
+    invocation = executor._run_judge if judge else executor.run
+    with pytest.raises(RunOwnershipLost):
+        await invocation(_task(), 1, "claim")
+
+
+@pytest.mark.asyncio
 async def test_executor_source_is_task(executor, fake_chat):
     task = _task()
     await executor.run(task, task_run_id=1, claim_lock="L1")

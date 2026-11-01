@@ -117,6 +117,54 @@ class FakeDelivery:
 
 
 @pytest.mark.asyncio
+async def test_explicit_agent_cancel_completes_schedule_without_delivery():
+    from app.domain.agent_run import RunCancelledError
+
+    class CancelledExecutor:
+        async def run(self, task):
+            raise RunCancelledError("agent-run")
+
+    registry = FakeRegistry(_claim())
+    delivery = FakeDelivery()
+    service = ScheduleRunService(registry, CancelledExecutor(), delivery)
+    result = await service.run_claim(_claim(), now=NOW)
+    assert result["status"] == "cancelled"
+    assert registry.completed[0].status.value == "cancelled"
+    assert delivery.contents == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancellation_keeps_schedule_result_unknown():
+    class ShutdownExecutor:
+        async def run(self, task):
+            raise asyncio.CancelledError()
+
+    registry = FakeRegistry(_claim())
+    service = ScheduleRunService(registry, ShutdownExecutor(), FakeDelivery())
+    with pytest.raises(asyncio.CancelledError):
+        await service.run_claim(_claim(), now=NOW)
+    assert registry.completed == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_passes_exact_persisted_business_execution_identity():
+    class LinkedExecutor:
+        received = None
+
+        async def run_for_execution(self, task, *, execution_id, parent_run_id):
+            self.received = (execution_id, parent_run_id)
+            return ScheduledAgentResult(ScheduledTaskExecutionStatus.SUCCEEDED, output="done")
+
+    registry = FakeRegistry(_claim())
+    executor = LinkedExecutor()
+    service = ScheduleRunService(registry, executor, FakeDelivery())
+    await service.run_claim(_claim(), now=NOW, trigger_run_id="manual-trigger")
+    assert executor.received == (registry.started[0].id, "manual-trigger")
+    assert registry.started[0].trigger_run_id == "manual-trigger"
+    assert registry.completed[0].trigger_run_id == "manual-trigger"
+
+
+@pytest.mark.asyncio
 async def test_run_due_claims_recovers_missing_origin_sessions_before_claiming():
     registry = FakeRegistry(_claim())
     recovered = []

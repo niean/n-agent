@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS delegations (
     parent_source TEXT NOT NULL,
     parent_scope_id TEXT NOT NULL,
     parent_run_id TEXT NOT NULL,
+    canonical_parent_run_id TEXT,
     parent_session_id TEXT NOT NULL,
     delegation_key TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
@@ -371,6 +373,9 @@ class SQLiteDelegationRegistry:
         with self._connect() as conn:
             self._verify_existing_shapes(conn)
             conn.executescript(DELEGATION_SCHEMA_SQL)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(delegations)")}
+            if "canonical_parent_run_id" not in columns:
+                conn.execute("ALTER TABLE delegations ADD COLUMN canonical_parent_run_id TEXT")
             conn.commit()
 
     @staticmethod
@@ -432,6 +437,7 @@ class SQLiteDelegationRegistry:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             cancellation_reason=row["cancellation_reason"],
+            canonical_parent_run_id=row["canonical_parent_run_id"],
         )
 
     @staticmethod
@@ -533,6 +539,11 @@ class SQLiteDelegationRegistry:
                 return self._row_to_delegation(existing)
 
             # Create new delegation.
+            if req.canonical_parent_run_id is not None:
+                parent = conn.execute("SELECT session_id FROM agent_runs WHERE id=?",
+                                      (req.canonical_parent_run_id,)).fetchone()
+                if parent is None or parent[0] != req.parent.session_id:
+                    raise ValueError("delegation_canonical_parent_invalid")
             now = self._clock_now()
             delegation_id = str(uuid.uuid4())
             snapshot_id = f"snap-{delegation_id}"
@@ -552,14 +563,14 @@ class SQLiteDelegationRegistry:
                 "status, join_policy, aggregation, deadline_at, "
                 "policy_snapshot_id, budget_total_tokens, "
                 "budget_reserved_tokens, budget_settled_tokens, version, "
-                "first_run_id, cancellation_reason, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,'pending',?,?,?,?,?,0,0,1,NULL,NULL,?,?)",
+                "first_run_id, cancellation_reason, created_at, updated_at, canonical_parent_run_id) "
+                "VALUES (?,?,?,?,?,?,?,'pending',?,?,?,?,?,0,0,1,NULL,NULL,?,?,?)",
                 (
                     delegation_id, req.parent.source, req.parent.scope_id,
                     req.parent.run_id, req.parent.session_id,
                     req.delegation_key, req.fingerprint,
                     join_policy.value, aggregation.value, req.deadline_at,
-                    snapshot_id, req.budget_total_tokens, now, now,
+                    snapshot_id, req.budget_total_tokens, now, now, req.canonical_parent_run_id,
                 ),
             )
             # Insert members.
@@ -653,6 +664,13 @@ class SQLiteDelegationRegistry:
         # 子表（members/policy_snapshots/results/events/budget_ledger/
         # cancel_outbox）经 FK ON DELETE CASCADE 一并清理。
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_runs'").fetchone():
+                conn.execute("""UPDATE agent_runs SET business_owner_deleted_at=?
+                    WHERE delegation_member_id IN (
+                        SELECT m.id FROM delegation_members m JOIN delegations d
+                        ON d.id=m.delegation_id WHERE d.parent_session_id=?)""",
+                    (time.time(), parent_session_id))
             cur = conn.execute(
                 "DELETE FROM delegations WHERE parent_session_id = ?",
                 (parent_session_id,),

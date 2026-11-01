@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol
 
 from app.application.telemetry_semantics import capture_trace_context
+from app.domain.agent_run import current_run
 from app.application.delegation_request_parser import (
     DelegationError,    DelegationRequestParser,
 )
@@ -178,6 +179,12 @@ class DelegationService:
                 norm_children, deadline_at, aggregation, aggregator_instruction
             )
             total_budget = self._total_budget(norm_children, aggregation)
+            execution = current_run.get()
+            canonical_parent_run_id = (
+                execution.run_id
+                if execution is not None and execution.run_id == parent_capability.get("run_id")
+                else None
+            )
             create_request = DelegationCreateRequest(
                 parent=self._build_parent_ref(parent_capability),
                 delegation_key=key,
@@ -189,6 +196,7 @@ class DelegationService:
                 members=members,
                 snapshot=snapshot,
                 trace_context=capture_trace_context(),
+                canonical_parent_run_id=canonical_parent_run_id,
             )
             delegation = await self._registry.create_or_reconnect(create_request)
         except DelegationConflictError as exc:

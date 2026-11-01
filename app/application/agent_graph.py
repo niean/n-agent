@@ -22,6 +22,7 @@ from app.application.budget_service import BudgetService
 from app.application.browser_tool_audit import project_browser_tool_arguments
 from app.application.context_service import ContextService
 from app.application.events import ChatEvent, ChatEventType
+from app.application.agent_run_service import AgentRunService, RunExecution
 from app.application.external_memory_manager import ExternalMemoryManager
 from app.application.information_flow_service import InformationFlowService
 from app.application.policy_snapshot import (
@@ -30,7 +31,8 @@ from app.application.policy_snapshot import (
     RunPolicySnapshot,
 )
 from app.application.runtime_memory_service import RuntimeMemoryService
-from app.application.telemetry_semantics import NoopTelemetry, clear_run_context
+from app.application.telemetry_semantics import NoopTelemetry, clear_run_context, capture_trace_context
+from app.domain.agent_run import RunBinding, RunCancelledError, bind_run, check_current_run, current_run
 from app.application.tool_service import (
     ToolExecutionEvaluation,
     ToolNotFoundError,
@@ -82,7 +84,8 @@ async def run_isolated(coro):
     context (resident background tasks must not attribute their work to a
     user session)."""
     clear_run_context()
-    return await coro
+    with bind_run(None):
+        return await coro
 
 # Internal control keys in options that are NOT generation params and must
 # not be recorded as part of the Provider Request. Mirrors the filter in
@@ -95,6 +98,7 @@ _INTERNAL_OPTION_KEYS = {
     "external_memory_enabled",
     "stream_event_sink",
     "_policy_snapshot",
+    "_agent_run_execution",
     "force_compress",
     "max_iterations",
     "persist_messages",
@@ -183,6 +187,7 @@ class AgentGraphRunner:
         browser_dashboard_service: Any = None,
         browser_host_grant_ttl_seconds: int = 300,
         telemetry: "SemanticsTelemetry | None" = None,
+        agent_run_service: AgentRunService | None = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -192,6 +197,7 @@ class AgentGraphRunner:
         self._turn_timeout_seconds = turn_timeout_seconds
         self._turn_policy = TurnPolicy()
         self._run_start_times: dict[str, float] = {}
+        self._ledger_end_reasons: dict[str, str] = {}
         self.external_memory_manager = external_memory_manager
         self.vision_capability = vision_capability
         self.usage_service = usage_service
@@ -224,6 +230,7 @@ class AgentGraphRunner:
             telemetry=telemetry,
         )
         self._telemetry = telemetry if telemetry is not None else NoopTelemetry()
+        self.agent_run_service = agent_run_service
         # Telemetry end reason per run_id, set by finalize from the Domain
         # EndReason (trusted) and consumed by run()'s finally block.
         self._run_end_reasons: dict[str, str] = {}
@@ -244,10 +251,14 @@ class AgentGraphRunner:
         self._last_finalize_at: datetime | None = None
 
     def register_run(self, session_id: str, task: asyncio.Task) -> None:
+        if self.agent_run_service is not None:
+            return
         self._running_tasks[session_id] = task
         self._cancel_events[session_id] = asyncio.Event()
 
     def interrupt(self, session_id: str) -> bool:
+        if self.agent_run_service is not None:
+            return self.agent_run_service.cancel_session(session_id)
         if session_id not in self._running_tasks:
             return False
         event = self._cancel_events.get(session_id)
@@ -259,6 +270,8 @@ class AgentGraphRunner:
         return True
 
     def is_cancelled(self, session_id: str) -> bool:
+        if self.agent_run_service is not None and current_run.get() is not None:
+            return self.agent_run_service.is_cancelled(current_run.get().run_id)
         event = self._cancel_events.get(session_id)
         return event is not None and event.is_set()
 
@@ -327,6 +340,64 @@ class AgentGraphRunner:
         return graph.compile()
 
     async def run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
+        options = dict(options or {})
+        execution = options.pop("_agent_run_execution", None)
+        if self.agent_run_service is None:
+            return await self._run(state, model, options)
+        if not isinstance(execution, RunExecution):
+            raise RuntimeError("agent_run_registration_required")
+        binding = execution.binding
+        execution.graph_owns_terminal = True
+        activated = False
+        with bind_run(binding):
+            try:
+                if binding.run_id != state.run_id or binding.session_id != state.session_id:
+                    raise ValueError("agent_run_identity_mismatch")
+                await self.agent_run_service.activate(binding, asyncio.current_task())
+                activated = True
+                result = await self._run(state, model, options)
+            except RunCancelledError as exc:
+                # Activation can report an already-persisted pending cancel.
+                # Do not replace that known terminal with a failed write.
+                if activated:
+                    own_cancel = exc.run_id == binding.run_id
+                    await self._finish_failed_execution(
+                        binding, "cancelled" if own_cancel else "failed",
+                        "cancelled" if own_cancel else "error", exc,
+                    )
+                raise
+            except asyncio.CancelledError as exc:
+                explicit_cancel = self.agent_run_service.was_cancel_requested(state.run_id)
+                reason = self._ledger_end_reasons.pop(state.run_id, "cancelled")
+                await self._finish_failed_execution(binding, "cancelled", reason, exc)
+                if explicit_cancel:
+                    raise RunCancelledError(state.run_id) from exc
+                raise
+            except BaseException as exc:
+                reason = self._ledger_end_reasons.pop(state.run_id, "error")
+                await self._finish_failed_execution(binding, "failed", reason, exc)
+                raise
+            reason = self._ledger_end_reasons.pop(state.run_id, result.finish_reason or "stop")
+            await self.agent_run_service.finish(
+                binding, "failed" if result.error or result.run_status == RunStatus.FAILED else "completed",
+                reason, error="execution_error" if result.error else None,
+            )
+            return result
+
+    async def _finish_failed_execution(
+        self, binding: RunBinding, status: str, reason: str, primary: BaseException,
+    ) -> None:
+        """Record a known failure without replacing the failure being reported."""
+        try:
+            await self.agent_run_service.finish(binding, status, reason, error=type(primary).__name__)
+        except Exception as cleanup_error:
+            primary.add_note(f"agent_run_terminal_write_failed: {type(cleanup_error).__name__}")
+            logger.error(
+                "agent run failure persistence failed: run_id=%s error_type=%s",
+                binding.run_id, type(cleanup_error).__name__,
+            )
+
+    async def _run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
         state.run_options = dict(options or {})
         # Mirror persist_messages from options into the state field so that
         # update_memory / finalize / execute_tools can read it without re-checking
@@ -358,6 +429,19 @@ class AgentGraphRunner:
             message_count=len(state.input_messages),
         )
         with run_tel as run_handle:
+            if self.agent_run_service is not None:
+                try:
+                    carrier = capture_trace_context()
+                    trace_id = carrier.get("traceparent", "").split("-")[1] if carrier else None
+                    if trace_id:
+                        self.agent_run_service.link_trace("agent_run", state.run_id, trace_id)
+                        row = self.agent_run_service.get(state.run_id)
+                        if row and row.get("task_run_id") is not None:
+                            self.agent_run_service.link_trace("task_run", str(row["task_run_id"]), trace_id)
+                        if row and row.get("schedule_execution_id") is not None:
+                            self.agent_run_service.link_trace("scheduled_task_execution", str(row["schedule_execution_id"]), trace_id)
+                except Exception:
+                    logger.warning("agent run trace association failed", exc_info=True)
             try:
                 if not isinstance(self._telemetry, NoopTelemetry):
                     last_user = next((m for m in reversed(state.input_messages) if m.get('role') == 'user'), None)
@@ -426,6 +510,8 @@ class AgentGraphRunner:
                         else:
                             end_reason = "completed"
                     run_handle.end_reason = end_reason
+                    if self.agent_run_service is not None:
+                        self._ledger_end_reasons[state.run_id] = end_reason
                     final = result_state if result_state is not None else state
                     if cancelled or end_reason == "cancelled":
                         run_handle.outcome = "cancelled"
@@ -580,6 +666,9 @@ class AgentGraphRunner:
             if approval_queue is not None:
                 while not approval_queue.empty():
                     yield approval_queue.get_nowait()
+        except RunCancelledError:
+            yield ChatEvent(ChatEventType.ERROR, error="cancelled", finish_reason="cancelled")
+            result = None
         except GeneratorExit:
             # SSE client disconnected (page reload/navigation closed the
             # stream via aclose): detach instead of cancelling so the run
@@ -601,6 +690,13 @@ class AgentGraphRunner:
             # The run itself was cancelled (interrupt()/shutdown): report it.
             yield ChatEvent(ChatEventType.ERROR, error="cancelled", finish_reason="cancelled")
             result = None
+        except Exception as exc:
+            logger.error(
+                "agent run stream failed: run_id=%s error_type=%s",
+                state.run_id, type(exc).__name__,
+            )
+            yield ChatEvent(ChatEventType.ERROR, error="agent_run_execution_failed", finish_reason="error")
+            result = None
         finally:
             if detached and not run_task.done():
                 self._detach_run(state, run_task)
@@ -612,7 +708,13 @@ class AgentGraphRunner:
                 # Close Budget account on any exit (cancel or normal).
                 # finalize already closes on terminal; this is a safety net
                 # for cancel/interrupt. Idempotent -- safe to call twice.
-                await self._budget_service.close(state.run_id)
+                try:
+                    await self._budget_service.close(state.run_id)
+                except Exception as exc:
+                    logger.error(
+                        "agent run stream budget cleanup failed: run_id=%s error_type=%s",
+                        state.run_id, type(exc).__name__,
+                    )
                 self.clear_run(state.session_id)
         if result is not None:
             if result.error:
@@ -806,6 +908,7 @@ class AgentGraphRunner:
         return False
 
     async def call_llm(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
+        await check_current_run()
         if self.is_cancelled(state.session_id):
             raise asyncio.CancelledError()
         configurable = (config or {}).get("configurable", {})
@@ -1061,6 +1164,7 @@ class AgentGraphRunner:
         return state
 
     async def execute_tools(self, state: AgentState, config: Optional[RunnableConfig] = None) -> AgentState:
+        await check_current_run()
         # The tool-execution node runs OUTSIDE call_llm's iteration scope
         # (and after call_llm already incremented iteration_count); thread
         # the requesting chat's iteration explicitly so execute_tool spans
@@ -1628,6 +1732,7 @@ class AgentGraphRunner:
         )
 
     async def update_memory(self, state: AgentState) -> AgentState:
+        await check_current_run()
         if self.is_cancelled(state.session_id):
             raise asyncio.CancelledError()
         assistant_messages = [*state.assistant_tool_messages]
@@ -1688,6 +1793,7 @@ class AgentGraphRunner:
         return extract_text(final_message.get("content", ""))
 
     async def finalize(self, state: AgentState) -> AgentState:
+        await check_current_run()
         # T10: pre_finalize -- at finalize node entry, before persisting final
         # message. Observer hook.
         await self._dispatch_hook(

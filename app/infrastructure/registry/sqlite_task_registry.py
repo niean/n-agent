@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from collections.abc import Mapping
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
@@ -256,7 +257,7 @@ _FIELD_TO_COLUMN: dict[str, str] = {
 }
 
 # Fields that cannot be updated via update_task
-_IMMUTABLE_FIELDS: frozenset[str] = frozenset({"id", "created_at"})
+_IMMUTABLE_FIELDS: frozenset[str] = frozenset({"id", "created_at", "created_by_run_id"})
 
 # Boolean fields stored as 0/1
 _BOOLEAN_FIELDS: frozenset[str] = frozenset({
@@ -426,6 +427,8 @@ class SQLiteTaskRegistry:
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(task_runs)")
             }
+            if "trigger_run_id" not in run_cols:
+                conn.execute("ALTER TABLE task_runs ADD COLUMN trigger_run_id TEXT")
             if "lease_seconds" not in run_cols:
                 conn.execute(
                     "ALTER TABLE task_runs ADD COLUMN lease_seconds INTEGER"
@@ -436,6 +439,9 @@ class SQLiteTaskRegistry:
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(tasks)")
             }
+            for name in ("created_by_run_id", "pending_trigger_run_id"):
+                if name not in task_cols:
+                    conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} TEXT")
             if "is_archived" not in task_cols:
                 conn.execute(
                     "ALTER TABLE tasks ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0"
@@ -557,6 +563,8 @@ class SQLiteTaskRegistry:
             idempotency_key=row["idempotency_key"],
             is_archived=bool(row["is_archived"]),
             trace_context=_json_loads(row["trace_context_json"], {"traceparent": "invalid"}),
+            created_by_run_id=row["created_by_run_id"],
+            pending_trigger_run_id=row["pending_trigger_run_id"],
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> TaskRun:
@@ -577,6 +585,7 @@ class SQLiteTaskRegistry:
             summary=row["summary"],
             metadata=_json_loads(row["metadata_json"], {}),
             error=row["error"],
+            trigger_run_id=row["trigger_run_id"],
         )
 
     def _row_to_event(self, row: sqlite3.Row) -> TaskEvent:
@@ -659,6 +668,8 @@ class SQLiteTaskRegistry:
             task.idempotency_key,
             1 if task.is_archived else 0,
             _json_dumps(task.trace_context),
+            task.created_by_run_id,
+            task.pending_trigger_run_id,
         )
 
     _INSERT_TASK_SQL = """
@@ -672,9 +683,9 @@ class SQLiteTaskRegistry:
             project_id, tenant, board, origin_session_id,
             execution_session_id, consecutive_failures, worker_token,
             last_failure_error, last_heartbeat_at, result, idempotency_key,
-            is_archived, trace_context_json
+            is_archived, trace_context_json, created_by_run_id, pending_trigger_run_id
         ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     """
 
@@ -837,6 +848,14 @@ class SQLiteTaskRegistry:
     def _delete_task_sync(self, task_id: str) -> bool:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "agent_runs" in tables:
+                conn.execute("""UPDATE agent_runs SET business_owner_deleted_at=?
+                    WHERE task_run_id IN (SELECT id FROM task_runs WHERE task_id=?)""",
+                    (time.time(), task_id))
+            if "trace_links" in tables:
+                conn.execute("""DELETE FROM trace_links WHERE biz_type='task_run'
+                    AND biz_id IN (SELECT CAST(id AS TEXT) FROM task_runs WHERE task_id=?)""", (task_id,))
             cursor = conn.execute(
                 "DELETE FROM tasks WHERE id = ?", (task_id,)
             )
@@ -885,8 +904,8 @@ class SQLiteTaskRegistry:
                 INSERT INTO task_runs (
                     task_id, profile, status, claim_lock, claim_expires,
                     worker_token, max_runtime_seconds, lease_seconds,
-                    started_at, created_at
-                ) VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, created_at, trigger_run_id
+                ) VALUES (?, 'default', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -898,6 +917,7 @@ class SQLiteTaskRegistry:
                     lease_seconds,
                     _dt_to_str(now),
                     _dt_to_str(now),
+                    task.pending_trigger_run_id,
                 ),
             )
             run_id = run_cursor.lastrowid
@@ -907,6 +927,7 @@ class SQLiteTaskRegistry:
                 UPDATE tasks SET
                     status = ?, claim_lock = ?, claim_expires = ?,
                     current_run_id = ?, worker_token = ?,
+                    pending_trigger_run_id = NULL,
                     started_at = COALESCE(started_at, ?),
                     last_heartbeat_at = ?,
                     version = version + 1, updated_at = ?

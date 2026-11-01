@@ -18,6 +18,7 @@ class ScheduledTaskExecutionStatus(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     BLOCKED = "blocked"
     SKIPPED_MISSED = "skipped_missed"
 
@@ -142,6 +143,7 @@ class ScheduledTaskExecution:
     delivery_status: str | None = None
     delivery_error: str | None = None
     created_at: datetime | None = None
+    trigger_run_id: str | None = None
 
 
 @dataclass(frozen=True)

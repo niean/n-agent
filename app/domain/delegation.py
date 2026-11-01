@@ -386,6 +386,8 @@ class Delegation:
 
     # cancel
     cancellation_reason: str | None = None
+    # Canonical execution identity is independent of the legacy capability.
+    canonical_parent_run_id: str | None = None
 
     # ------------------------------------------------------------------
     # Factory
@@ -942,6 +944,7 @@ class DelegationCreateRequest:
     snapshot: PolicySnapshotRecord
     # Opaque W3C correlation metadata, captured by the application, not policy.
     trace_context: Mapping[str, str] = field(default_factory=dict)
+    canonical_parent_run_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

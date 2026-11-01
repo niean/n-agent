@@ -63,6 +63,17 @@ async def test_executor_blocks_without_calling_chat_service():
 
 
 @pytest.mark.asyncio
+async def test_executor_links_actual_scheduled_execution():
+    chat = FakeChatService()
+    await ScheduledAgentExecutor(chat, FakeScanner()).run_for_execution(
+        _task(), execution_id="scheduled-attempt", parent_run_id="manual-trigger"
+    )
+    assert chat.requests[0].schedule_execution_id == "scheduled-attempt"
+    assert chat.requests[0].parent_run_id == "manual-trigger"
+    assert chat.requests[0].execution_kind == "schedule"
+
+
+@pytest.mark.asyncio
 async def test_executor_passes_allowed_tools_grant_via_trusted_metadata():
     """Per-task tool grants flow into trusted_metadata so ChatCompletionService
     can expose the granted SAFE tools (e.g. host_terminal) under safe_only."""

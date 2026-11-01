@@ -129,6 +129,8 @@ Trace 降噪：FastAPI 仅采集 `/chat/completions`、`/v1/chat/completions` �
 
 ## 测试
 
+SQLite 模式迁移测试以 SQLite 返回的 journal_mode、提交数据完整性、重开连接后的模式、主库独立读取和活跃读事务保护为合同；不把 -shm 路径存在当作仍在使用 WAL，也不手工删除侧文件掩盖失败。归档夹具须复制正式导出器的打包环境（包括 COPYFILE_DISABLE=1），并用真实扩展属性验证 macOS AppleDouble 元数据不会混入清单。
+
 - 标准化单元测试允许直接在宿主开发环境执行，测试命令：`python -m pytest`
 - 所有端到端测试必须在 Docker 环境进行，禁止在宿主机直接执行
 - E2E 默认关闭 Skill 自进化后台审查与 Curator 周期维护：各 shell 入口通过 `tests/e2e/environment.sh` 的临时 Compose override 设置，子套件和 OTel 容器重建继承，结束恢复原部署。只有专门验证 Skill 自进化的独立用例可调用 `e2e_environment skill-evolution "$0" "$@"` 显式开启后台审查；普通用例固定使用 `default`，不提供全局开启开关。

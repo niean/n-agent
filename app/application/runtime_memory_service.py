@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from typing import Any
 
+from app.domain.agent_run import current_run
 from app.domain.memory import MemoryStore
 from app.domain.memory_policy import (
     MemoryAccessDecision,
@@ -41,6 +43,11 @@ from app.domain.session import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _message_run_id(session_id: str) -> str | None:
+    binding = current_run.get()
+    return binding.run_id if binding is not None and binding.session_id == session_id else None
 
 
 class MemoryAccessDeniedError(Exception):
@@ -249,11 +256,14 @@ class RuntimeMemoryService:
         await self._audit(decision, MemoryOperation.WRITE_MESSAGE, session_id)
         if decision.verdict is not PolicyOutcome.ALLOW:
             raise MemoryAccessDeniedError(decision, MemoryOperation.WRITE_MESSAGE)
+        run_id = _message_run_id(session_id)
         message = ConversationMessage(
             role="tool",
             content=content,
             tool_call_id=tool_call_id,
             name=name,
+            run_id=run_id,
+            origin_kind="agent" if run_id else "notification",
         )
         return await self._store.append_message(session_id, message)
 
@@ -271,7 +281,11 @@ class RuntimeMemoryService:
         await self._audit(decision, MemoryOperation.WRITE_MESSAGE, session_id)
         if decision.verdict is not PolicyOutcome.ALLOW:
             raise MemoryAccessDeniedError(decision, MemoryOperation.WRITE_MESSAGE)
-        message = ConversationMessage(role=role, content=content, source=source)
+        run_id = _message_run_id(session_id)
+        message = ConversationMessage(
+            role=role, content=content, source=source, run_id=run_id,
+            origin_kind="agent" if run_id else "notification",
+        )
         return await self._store.append_message(session_id, message)
 
     async def append_system_named_message(
@@ -317,6 +331,9 @@ class RuntimeMemoryService:
         await self._audit(decision, MemoryOperation.WRITE_MESSAGE, tool_call.session_id)
         if decision.verdict is not PolicyOutcome.ALLOW:
             raise MemoryAccessDeniedError(decision, MemoryOperation.WRITE_MESSAGE)
+        run_id = _message_run_id(tool_call.session_id)
+        if run_id is not None:
+            tool_call = replace(tool_call, run_id=run_id)
         return await self._store.save_tool_call(tool_call)
 
     # ------------------------------------------------------------------
@@ -386,6 +403,9 @@ class RuntimeMemoryService:
         await self._audit(decision, MemoryOperation.WRITE_SUMMARY, session_id)
         if decision.verdict is not PolicyOutcome.ALLOW:
             raise MemoryAccessDeniedError(decision, MemoryOperation.WRITE_SUMMARY)
+        run_id = _message_run_id(session_id)
+        if run_id is not None:
+            message = replace(message, run_id=run_id, origin_kind="agent")
         return await self._store.append_summary_message(session_id, message)
 
     async def mark_messages_summarized_if_allowed(

@@ -22,6 +22,7 @@ from typing import Any, Mapping, Protocol
 
 from app.application.telemetry_semantics import business_operation
 from app.application.telemetry_details import project_details
+from app.domain.agent_run import RunCancelledError
 from app.domain.delegation import (
     DelegationMember,
     DelegationMemberStatus,
@@ -34,7 +35,8 @@ from app.domain.delegation import (
 class _ChildExecutorLike(Protocol):
     async def execute(self, *, member: DelegationMember, model: str,
                       parent_capability: Mapping[str, Any],
-                      deadline_at: str | None) -> DelegationResult: ...
+                      deadline_at: str | None,
+                      canonical_parent_run_id: str | None = None) -> DelegationResult: ...
 
 
 class _ClockLike(Protocol):
@@ -180,6 +182,15 @@ class DelegationRunService:
                 # as a real model id by providers and can be rejected.
                 member=member, model="N-Agent",
                 parent_capability=parent_cap, deadline_at=deadline_at,
+                canonical_parent_run_id=delegation.canonical_parent_run_id if delegation else None,
+            )
+        except RunCancelledError:
+            return DelegationResult(
+                status=DelegationMemberStatus.CANCELLED,
+                error_code="agent_run_cancelled",
+                error_message="member execution cancelled",
+                started_at=member.started_at,
+                ended_at=self._clock.now_iso(),
             )
         except asyncio.CancelledError:
             raise

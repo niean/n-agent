@@ -14,18 +14,27 @@ from urllib.parse import quote
 
 
 def apply_journal_mode(conn: sqlite3.Connection) -> None:
-    """Force ``journal_mode=DELETE`` on every writable connection.
+    """Require ``journal_mode=DELETE`` for this writable connection.
 
     WAL requires mmap of the ``-shm`` shared-memory index; on macOS Docker
     Desktop host bind mounts (virtiofs/osxfs) mmap is unreliable and kills
     the process with SIGBUS under concurrent writes. DELETE mode (rollback
-    journal) never mmaps, so it is safe on every deployment target. The
+    journal) avoids WAL's shared-memory mapping requirement. The
     trade-off -- readers block during a write -- is acceptable for a
     single-instance product and is absorbed by ``busy_timeout``.
-    Switching an existing WAL database checkpoints and removes ``-wal`` /
-    ``-shm`` automatically.
+    SQLite owns the WAL checkpoint and mode transition. An old ``-shm``
+    pathname can remain on some VFS/runtime combinations; its presence is
+    not the journal-mode authority and we must not unlink it ourselves.
+    Require SQLite to confirm DELETE rather than assuming the PRAGMA took
+    effect (for example, an in-memory database can only return MEMORY).
     """
-    conn.execute("PRAGMA journal_mode = DELETE")
+    cursor = conn.execute("PRAGMA journal_mode = DELETE")
+    try:
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+    if not rows or str(rows[0][0]).lower() != "delete":
+        raise sqlite3.OperationalError("sqlite_journal_mode_delete_required")
 
 
 def open_sqlite(path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:

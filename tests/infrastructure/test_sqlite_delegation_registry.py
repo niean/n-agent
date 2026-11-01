@@ -466,6 +466,43 @@ async def test_create_or_reconnect_creates_delegation_and_members(registry):
 
 
 @pytest.mark.asyncio
+async def test_agent_runs_link_member_retries_and_keep_deleted_owner_history(registry):
+    from app.domain.agent_run import RunBinding
+    from app.domain.session import ConversationSession
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+    from app.application.agent_run_service import AgentRunService
+
+    memory = SQLiteMemoryStore(registry.path)
+    await memory.create_session(ConversationSession(id="delegation-sess-0"))
+    ledger = SQLiteAgentRunRegistry(registry.path)
+    runs = AgentRunService(ledger)
+    delegation = await registry.create_or_reconnect(_make_request())
+    member = (await registry.list_members(delegation.id))[0]
+    for run_id in ("attempt-one", "attempt-two"):
+        binding = await runs.register(run_id=run_id, session_id=member.execution_session_id,
+            source="delegation", execution_kind="delegation_worker",
+            delegation_member_id=member.id)
+        await runs.finish(binding, "completed", "stop")
+    assert ledger.get("attempt-two")["retry_of_run_id"] == "attempt-one"
+    await registry.delete_by_parent_session("s1")
+    assert ledger.get("attempt-two")["business_owner_deleted_at"] is not None
+    assert ledger.get("attempt-two")["delegation_member_id"] == member.id
+    await runs.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_delegation_migration_keeps_canonical_parent_unknown(registry):
+    delegation = await registry.create_or_reconnect(_make_request())
+    with registry._connect() as conn:
+        conn.execute("ALTER TABLE delegations DROP COLUMN canonical_parent_run_id")
+    migrated = SQLiteDelegationRegistry(str(registry.path))
+    restored = await migrated.get(delegation.id)
+    assert restored.parent.run_id == delegation.parent.run_id
+    assert restored.canonical_parent_run_id is None
+
+
+@pytest.mark.asyncio
 async def test_create_or_reconnect_idempotent_same_fingerprint(registry):
     req = _make_request()
     d1 = await registry.create_or_reconnect(req)

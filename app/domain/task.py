@@ -284,6 +284,10 @@ class Task:
     is_archived: bool = False
     # Opaque trigger carrier; automatic retries/recovery must not replace it.
     trace_context: dict[str, str] = field(default_factory=dict)
+    # Creation provenance is immutable; the pending trigger is consumed by
+    # the next claim, so automatic retries never inherit a stale trigger.
+    created_by_run_id: str | None = None
+    pending_trigger_run_id: str | None = None
 
     # -----------------------------------------------------------------
     # State transition contract
@@ -557,6 +561,7 @@ class TaskRun:
     summary: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    trigger_run_id: str | None = None
 
 
 @dataclass(frozen=True)

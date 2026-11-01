@@ -151,6 +151,45 @@ def run_service(registry):
 
 
 @pytest.mark.asyncio
+async def test_restart_restores_canonical_parent_without_synthesizing_capability(run_service, registry):
+    from dataclasses import replace
+    from app.domain.session import ConversationSession
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+    memory = SQLiteMemoryStore(registry.path)
+    await memory.create_session(ConversationSession(id="s1"))
+    ledger = SQLiteAgentRunRegistry(registry.path)
+    ledger.register(run_id="registered-parent", session_id="s1", source="api",
+                    execution_kind="dialogue", process_id="process", owner_token="token", lease_seconds=60)
+    request = replace(_make_request(parent=_make_parent(run_id="registered-parent")),
+                      canonical_parent_run_id="registered-parent")
+    delegation = await registry.create_or_reconnect(request)
+    member = (await registry.list_members(delegation.id))[0]
+    await run_service._execute_member(member)
+    call = run_service._test_chat.calls[-1]
+    assert call.parent_run_id == "registered-parent"
+    assert call.ingress_facts.trusted_claims["parent_run_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_legacy_restart_does_not_guess_canonical_parent(run_service, registry):
+    delegation = await registry.create_or_reconnect(_make_request())
+    member = (await registry.list_members(delegation.id))[0]
+    await run_service._execute_member(member)
+    assert run_service._test_chat.calls[-1].parent_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_agent_run_cancel_finalizes_member_as_cancelled(run_service, registry):
+    from app.domain.agent_run import RunCancelledError
+    delegation = await registry.create_or_reconnect(_make_request())
+    run_service._test_chat.raise_exc = RunCancelledError("cancelled-child")
+    await run_service.tick()
+    members = await registry.list_members(delegation.id)
+    assert all(member.status is DelegationMemberStatus.CANCELLED for member in members)
+
+
+@pytest.mark.asyncio
 async def test_tick_claims_pending_members_and_spawns(run_service, registry):
     d = await registry.create_or_reconnect(_make_request())
     await run_service.tick()

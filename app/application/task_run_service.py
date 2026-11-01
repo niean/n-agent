@@ -49,6 +49,7 @@ from uuid import uuid4
 from app.application.task_session import task_execution_session_id
 from app.application.telemetry_semantics import business_operation, task_trace_context_status
 from app.application.telemetry_details import project_details
+from app.domain.agent_run import RunCancelledError
 from app.domain.policy import PolicyOutcome
 from app.domain.task import (
     ClaimResult,
@@ -465,7 +466,8 @@ class TaskRunService:
         error), the service performs ONE-SHOT finish_run CAS via the
         unified ``_finish`` path.
 
-        All exceptions are caught so the asyncio.Task never propagates.
+        Execution errors and explicit Run cancellations are normalized here.
+        Process/parent cancellation propagates for the existing recovery path.
         """
         cfg = await self._snapshot()
         max_runtime = task.max_runtime_seconds or cfg.task_max_runtime_seconds
@@ -488,6 +490,11 @@ class TaskRunService:
             agent_result = TaskAgentResult(
                 status=TaskRunOutcome.TIMED_OUT,
                 error=f"execution timed out after {timeout}s",
+            )
+        except RunCancelledError:
+            agent_result = TaskAgentResult(
+                status=TaskRunOutcome.TERMINATED,
+                error="terminated by request",
             )
         except Exception as exc:
             logger.exception(

@@ -319,6 +319,8 @@ class ToolService:
         *,
         evaluation: ToolExecutionEvaluation | None = None,
     ) -> ToolResult:
+        from app.domain.agent_run import check_current_run
+        await check_current_run()
         with self._telemetry.tool_execution(
             tool=request.name,
             call_id=request.id,
@@ -469,6 +471,8 @@ class ToolService:
                     pass  # Keep original request if JSON round-trip fails
 
         # --- Execute tool ---
+        from app.domain.agent_run import check_current_run
+        await check_current_run()
         _tel_outcome(executed=True)
         try:
             try:

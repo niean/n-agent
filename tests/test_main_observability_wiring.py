@@ -272,6 +272,19 @@ def test_application_runtime_shuts_down_on_exception(tmp_path, fake_observabilit
     assert fake_observability.handle.shutdown_calls == 1
 
 
+def test_application_runtime_run_cleanup_failure_still_shuts_down_observability(tmp_path, fake_observability, monkeypatch):
+    import app.main as main_module
+
+    class BrokenRuns:
+        def close_nowait(self):
+            raise RuntimeError("run cleanup unavailable")
+
+    monkeypatch.setattr(main_module, "build_application_services", lambda *args, **kwargs: SimpleNamespace(agent_run_service=BrokenRuns()))
+    with main_module.application_runtime(_settings(tmp_path, otel_enabled=True)):
+        pass
+    assert fake_observability.handle.shutdown_calls == 1
+
+
 # ---------------------------------------------------------------------------
 # CLI entries hold/close the same handle
 # ---------------------------------------------------------------------------

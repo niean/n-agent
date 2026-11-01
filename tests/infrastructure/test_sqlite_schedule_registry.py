@@ -56,6 +56,45 @@ async def test_registry_initializes_schema_and_crud(registry):
 
 
 @pytest.mark.asyncio
+async def test_scheduled_execution_preserves_manual_trigger_provenance(registry):
+    await registry.create(_task())
+    execution = ScheduledTaskExecution(
+        id="manual-execution", task_id="task-1", session_id="session-1",
+        claim_id="claim", lease_owner="owner",
+        status=ScheduledTaskExecutionStatus.RUNNING, trigger_run_id="trigger-run",
+    )
+    await registry.record_execution_started(execution)
+    loaded = (await registry.list_executions("task-1", 10))[0]
+    assert loaded.trigger_run_id == "trigger-run"
+    registry.initialize()
+    assert (await registry.list_executions("task-1", 10))[0].trigger_run_id == "trigger-run"
+
+
+@pytest.mark.asyncio
+async def test_schedule_definition_delete_preserves_execution_trace_and_agent_owner(registry):
+    from app.domain.session import ConversationSession
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+
+    memory = SQLiteMemoryStore(registry.path)
+    await memory.create_session(ConversationSession(id="session-1"))
+    ledger = SQLiteAgentRunRegistry(registry.path)
+    await registry.create(_task())
+    execution = ScheduledTaskExecution(
+        id="retained-execution", task_id="task-1", session_id="session-1",
+        claim_id="claim", lease_owner="owner", status=ScheduledTaskExecutionStatus.SUCCEEDED,
+    )
+    await registry.record_execution_started(execution)
+    ledger.register(run_id="agent", session_id="session-1", source="schedule",
+        execution_kind="schedule", process_id="process", owner_token="token",
+        lease_seconds=60, schedule_execution_id=execution.id)
+    ledger.add_trace_link("scheduled_task_execution", execution.id, "1" * 32)
+    await registry.delete("task-1")
+    assert ledger.get("agent")["business_owner_deleted_at"] is None
+    assert len(ledger.trace_links("scheduled_task_execution", execution.id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_registry_persists_execution_policy_allowed_tools(registry):
     from app.domain.schedule import ScheduledExecutionPolicy
 

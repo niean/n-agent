@@ -530,6 +530,22 @@ async def test_create_task_basic(svc, registry):
     assert any(e.kind == "created" for e in events)
 
 
+@pytest.mark.asyncio
+async def test_task_creation_and_manual_retry_capture_distinct_run_provenance(svc, registry):
+    from app.domain.agent_run import RunBinding, bind_run
+
+    with bind_run(RunBinding("creator", "session", "token", "process")):
+        task = await svc.create_task(title="created in conversation")
+    assert task.created_by_run_id == "creator"
+    assert task.pending_trigger_run_id == "creator"
+    await registry.update_task(task.id, {"status": TaskStatus.FAILED}, task.version)
+    with bind_run(RunBinding("retry-trigger", "session", "token", "process")):
+        await svc.retry_task(task.id)
+    retried = await svc.get_task(task.id)
+    assert retried.created_by_run_id == "creator"
+    assert retried.pending_trigger_run_id == "retry-trigger"
+
+
 class _FakeConfigProvider:
     def __init__(self, config):
         self._config = config

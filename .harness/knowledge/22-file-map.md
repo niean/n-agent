@@ -1,6 +1,16 @@
 <!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批、Host Terminal 宿主执行链路、Skill 自进化治理、Artifact 制品工作台和 Delegation 多 Agent 委派（delegation_service/run_service/child_agent_executor/tool_executor/parent_adapter + SQLite 7 表 + API/CLI）、Config Bundle 配置迁移（config_bundle_service + domain/config_bundle + config_bundle_readers + sqlite_support + docker/ 四个宿主脚本 + CLI config export|import）、会话 E2E 数据集 Runner（conversations.sh/conversations_runner.py + 12 JSON 数据集 + manifest 权威清理 + LLM Judge）、OTel 可观测（application/telemetry_semantics + infrastructure/observability 四件套 + llm/telemetry_hook + Dashboard OTel 自检页 + docker/observability 后端栈 + 自检页外链 C 类运行时配置 otel_link_config 全链路 + 全层测试套件）；2048 字节观测详情 -->
 # 功能与文件映射
 
+## AgentRun 账本
+
+- app/domain/agent_run.py：所有权绑定、ContextVar、Registry 端口。
+- app/application/agent_run_service.py：登记、租约、取消、收敛及 Trace 正反查询。
+- app/application/agent_run_retry_policy.py：从类型化前序事实选择重试关联，不依赖 SQLite。
+- app/infrastructure/registry/sqlite_agent_run_registry.py：agent_runs/trace_links、归属校验及失效持有者隔离。
+- app/interfaces/http/agent_run_routes.py：Session 执行历史、详情和逐 Run 取消。
+- tests/application/test_agent_run_service.py、test_chat_run_registration.py、test_session_agent_run_deletion.py；tests/infrastructure/test_agent_run_records.py、test_agent_run_business_links.py；tests/interfaces/test_agent_run_routes.py：执行生命周期、归属与删除回归。
+- tests/application/test_agent_run_business_cancellation.py、test_agent_run_retry_policy.py、tests/test_main_agent_run_shutdown.py：真实 Task Worker/Judge 取消、应用层重试规则、退出隔离及取消错误协议。
+
 ## 公共客户端 HTTP 观测
 
 - `app/infrastructure/observability/instrumentors.py`：`instrument_clients` 负责进程级 HTTPX/SQLite 注册；`instrument_app` 另装配 FastAPI 中间件，客户端故障不阻断服务端采集。`app/main.py` 的公共服务装配在 SDK 就绪后、业务客户端创建前调用公共注册。

@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from app.domain.agent_run import current_run
 
 from app.domain.task import (
     BulkUpdateCommand,
@@ -265,6 +266,8 @@ class TaskService:
                 return existing
 
         now = datetime.now(timezone.utc)
+        execution = current_run.get()
+        triggering_run_id = execution.run_id if execution is not None else None
         task = Task(
             id=f"t_{uuid4().hex[:16]}",
             title=title.strip(),
@@ -289,6 +292,8 @@ class TaskService:
             goal_max_turns=goal_max_turns,
             idempotency_key=idempotency_key,
             trace_context=capture_trace_context(),
+            created_by_run_id=triggering_run_id,
+            pending_trigger_run_id=triggering_run_id,
         )
         created = await self.registry.create_task(task)
         await self.registry.append_event(
@@ -817,6 +822,7 @@ class TaskService:
         task = await self.get_task(task_id)
         # Domain validation (raises TaskStateError unless FAILED / EXPIRED)
         updated = task.retry()
+        execution = current_run.get()
         await self.registry.update_task(
             task_id,
             {
@@ -824,6 +830,7 @@ class TaskService:
                 "claim_lock": None,
                 "claim_expires": None,
                 "current_run_id": None,
+                "pending_trigger_run_id": execution.run_id if execution is not None else None,
             },
             task.version,
         )

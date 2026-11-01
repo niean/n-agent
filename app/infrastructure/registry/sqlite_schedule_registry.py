@@ -103,6 +103,8 @@ class SQLiteScheduledTaskRegistry:
 
     async def delete(self, task_id: str) -> bool:
         with self._connect() as conn:
+            # Execution history survives definition deletion, so its valid
+            # AgentRun and Trace associations must survive as well.
             cursor = conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
             return cursor.rowcount > 0
 
@@ -209,8 +211,8 @@ class SQLiteScheduledTaskRegistry:
                 """
                 INSERT INTO scheduled_task_executions(id, task_id, session_id, claim_id, lease_owner,
                     claimed_next_run_at, started_at, completed_at, status, output, error,
-                    delivery_status, delivery_error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    delivery_status, delivery_error, created_at, trigger_run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._execution_params(execution),
             )
@@ -476,6 +478,7 @@ class SQLiteScheduledTaskRegistry:
             execution.delivery_status,
             execution.delivery_error,
             _iso(execution.created_at or _now()),
+            execution.trigger_run_id,
         )
 
     def _row_to_execution(self, row: sqlite3.Row) -> ScheduledTaskExecution:
@@ -494,6 +497,7 @@ class SQLiteScheduledTaskRegistry:
             delivery_status=row["delivery_status"],
             delivery_error=row["delivery_error"],
             created_at=_parse_optional(row["created_at"]),
+            trigger_run_id=row["trigger_run_id"],
         )
 
     def _row_to_task(self, row: sqlite3.Row) -> ScheduledTask:
@@ -581,6 +585,9 @@ def _initialize_schedule_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_scheduled_executions_created ON scheduled_task_executions(created_at);
         """
     )
+    execution_columns = {row[1] for row in conn.execute("PRAGMA table_info(scheduled_task_executions)")}
+    if "trigger_run_id" not in execution_columns:
+        conn.execute("ALTER TABLE scheduled_task_executions ADD COLUMN trigger_run_id TEXT")
     _migrate_origin_source_type_to_platform(conn)
 
 

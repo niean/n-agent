@@ -1,6 +1,14 @@
 <!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界、Skill 自进化写入治理、Activated Skills 选择流（前端按会话持久化 + chat_service 归一 + context_service 实时求交 + prompt_builder 注入 ## Activated Skills + _INTERNAL_OPTION_KEYS 隔离 Provider）、Task、Browser、Artifact 与 Delegation 多 Agent 委派子域（17 个领域 Policy）、Config Bundle 配置迁移子域（宿主 sh 脚本编排 + 容器内 CLI 导入 + 段级失败收敛与退出码契约）、OTel 可观测子域（GenAI semconv、Domain 零 OTel、application 仅 opentelemetry-api、SDK 隔离在 infrastructure/observability、OTLP 导出 + 5 服务后端栈 + py-spy 连续 profiling + 自检页外链 C 类运行时配置 otel_link_config + 每条日志实时现场 live scene ContextVar 与 LogSanitizer 脱敏正文/异常恢复、span event 携带脱敏正文、三重封口 Log/span event 放开口）；2048 字节观测详情 -->
 # 架构与模块边界
 
+## AgentRun 执行账本
+
+ChatCompletionService 在消息写入前登记，AgentGraphRunner 激活及收尾；Task、Schedule、委派、审查、Curator 共用此入口。AgentRunService 依赖 Domain Registry 端口，由 main 注入 SQLiteAgentRunRegistry。账本失败阻止执行；Trace 映射失败只报告。Session 与业务 TaskRun/ScheduledTaskExecution 保留，AgentState 不是持久执行账。
+
+Run 控制取消，Session interrupt 只指向当前前台交互执行，后台不占前台槽。进程 UUID、所有权 token 和租约隔离失效持有者，失联收敛为 not_started/interrupted，未知 ended_at 保持空；无 checkpoint、自动重放或跨进程取消路由。
+
+RunExecution 明确 Chat 准备阶段与 Graph 接管后的唯一收尾责任；收尾失败不覆盖原异常。显式 RunCancelledError 由 Task/Schedule/Delegation 各自归一为业务取消并提交终态，进程退出 CancelledError 与所有权丢失不冒充用户取消。AgentRunRetryPolicy 位于 Application，SQLite 仅返回类型化前序事实与保存明确关联。
+
 ## 架构定位
 
 本项目当前阶段是后续持续迭代到完整 Agent 能力的架构基线，不是一次性 demo。当前阶段只实现既定验收范围，但领域模型、端口和模块边界必须支持后续扩展 Provider、工具生态、长期 Memory、权限审批、多 Agent、自动化任务、可观测性和部署运行环境。

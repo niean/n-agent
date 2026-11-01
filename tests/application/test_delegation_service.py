@@ -123,6 +123,33 @@ def setup(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_registered_parent_is_persisted_separately_from_capability(setup):
+    from app.application.agent_run_service import AgentRunService
+    from app.domain.agent_run import bind_run
+    from app.domain.session import ConversationSession
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+    svc, registry, run_svc, chat, clock = setup
+    memory = SQLiteMemoryStore(registry.path)
+    await memory.create_session(ConversationSession(id="s1"))
+    runs = AgentRunService(SQLiteAgentRunRegistry(registry.path))
+    parent = await runs.register("r1", "s1", "api", "dialogue")
+    try:
+        with bind_run(parent):
+            result = await svc.delegate(
+                parent_capability=_parent_capability(), delegation_key="canonical",
+                children=[_child_spec("w0")], join_policy="all_completed",
+                aggregation="parent", timeout_seconds=60,
+            )
+        delegation = await registry.get(result.delegation_id)
+        assert delegation.canonical_parent_run_id == parent.run_id
+        assert chat.calls[0].parent_run_id == parent.run_id
+    finally:
+        await runs.finish(parent, "completed", "stop")
+        await runs.close()
+
+
+@pytest.mark.asyncio
 async def test_delegate_creates_and_returns_resultset(setup):
     svc, registry, run_svc, chat, clock = setup
     result = await svc.delegate(

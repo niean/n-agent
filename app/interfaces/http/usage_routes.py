@@ -169,6 +169,7 @@ def register_usage_routes(
         return [
             {
                 "id": r.id,
+                "run_id": r.run_id,
                 "model": r.model,
                 "requested_model": r.requested_model,
                 "trigger_type": r.trigger_type,

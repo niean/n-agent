@@ -57,6 +57,26 @@ def registry(tmp_path):
     return SQLiteTaskRegistry(str(tmp_path / "tasks.db"))
 
 
+@pytest.mark.asyncio
+async def test_claim_consumes_trigger_without_reusing_creation_origin(registry):
+    task = Task(id="origin-task", title="origin", created_by_run_id="creator",
+                pending_trigger_run_id="trigger")
+    await registry.create_task(task)
+    claimed = await registry.claim_task(task.id, "claim-one", 60)
+    assert claimed.run.trigger_run_id == "trigger"
+    assert claimed.task.created_by_run_id == "creator"
+    assert claimed.task.pending_trigger_run_id is None
+    # The dispatcher must not interpret the original creator as the
+    # direct trigger for a later automatic attempt.
+    await registry.update_task(task.id, {
+        "status": TaskStatus.QUEUED, "claim_lock": None,
+        "claim_expires": None, "current_run_id": None,
+    }, claimed.task.version)
+    retried = await registry.claim_task(task.id, "claim-two", 60)
+    assert retried.run.trigger_run_id is None
+    assert retried.task.created_by_run_id == "creator"
+
+
 def _task(
     task_id: str = "t_1",
     title: str = "test task",

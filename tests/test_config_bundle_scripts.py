@@ -1264,8 +1264,10 @@ def _repack_like_the_exporter(bundle: Path, out: Path) -> Path:
     """
     staging = out.parent / f"{out.stem}-staging"
     staging.mkdir(parents=True)
-    subprocess.run(["tar", "-xzf", str(bundle), "-C", str(staging)], check=True)
-    subprocess.run(["tar", "-czf", str(out), "-C", str(staging), "."], check=True)
+    # Match the real exporter, including macOS extended-attribute suppression.
+    environment = {**os.environ, "COPYFILE_DISABLE": "1"}
+    subprocess.run(["tar", "-xzf", str(bundle), "-C", str(staging)], check=True, env=environment)
+    subprocess.run(["tar", "-czf", str(out), "-C", str(staging), "."], check=True, env=environment)
     return out
 
 
@@ -1280,6 +1282,27 @@ def test_preflight_accepts_a_bundle_packed_the_way_the_exporter_packs_it(tmp_pat
     r = _preflight(tmp_path, repacked)
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / "never").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="AppleDouble metadata is produced by macOS tar")
+def test_repacked_fixture_omits_actual_macos_directory_metadata(tmp_path, monkeypatch):
+    monkeypatch.delenv("COPYFILE_DISABLE", raising=False)
+    output = tmp_path / "metadata.tar.gz"
+    staging = output.parent / f"{output.stem}-staging"
+    original_mkdir = Path.mkdir
+
+    def mkdir_with_metadata(path, *args, **kwargs):
+        result = original_mkdir(path, *args, **kwargs)
+        if path == staging:
+            subprocess.run(["xattr", "-w", "com.apple.metadata:test", "fixture metadata", str(path)], check=True)
+        return result
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_with_metadata)
+    repacked = _repack_like_the_exporter(_make_valid_bundle(tmp_path), output)
+    with tarfile.open(repacked, "r:gz") as archive:
+        assert not any(part.startswith("._") for name in archive.getnames() for part in Path(name).parts)
+    result = _preflight(tmp_path, repacked)
+    assert result.returncode == 0, result.stderr
 
 
 def test_preflight_still_rejects_a_regular_file_member_with_no_name(tmp_path):

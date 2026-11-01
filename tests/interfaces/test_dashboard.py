@@ -994,6 +994,22 @@ def test_chat_session_delete_returns_404_when_missing(tmp_path):
     assert response.json()["error"]["code"] == "session_not_found"
 
 
+def test_chat_session_delete_returns_409_when_agent_run_active(tmp_path):
+    import asyncio
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+
+    path = tmp_path / "sessions.db"
+    store = SQLiteMemoryStore(path)
+    asyncio.run(store.create_session(ConversationSession(id="s-busy")))
+    registry = SQLiteAgentRunRegistry(path)
+    registry.register(run_id="run", session_id="s-busy", source="api", execution_kind="chat",
+                      process_id="process", owner_token="token", lease_seconds=60)
+    client = TestClient(_build_app(store))
+    response = client.delete("/chat/sessions/s-busy")
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "session_busy"
+
+
 def test_chat_session_delete_returns_409_when_task_running(tmp_path):
     from app.domain.task import TaskStateError
 

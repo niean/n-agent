@@ -7,7 +7,7 @@
 
 `AgentState`（`app/domain/agent.py`）：Agent Runtime 的运行状态，字段包括 session_id、input_messages、working_messages、pending_tool_calls、tool_results、summary、run_status、iteration_count、error、final_message、finish_reason。该模型属于 Domain，不包含 LangGraph 类型。
 
-`AgentRun`（`app/domain/agent.py`）：一次 Agent 运行的领域对象，包含 session_id、input_messages、id、status、iteration_count、error、end_reason。
+持久执行身份在 `agent_runs`；`RunBinding`/`AgentRunRegistry`（`app/domain/agent_run.py`）定义所有权及存储端口。`app/domain/agent.py` 的旧 `AgentRun` DTO 保留兼容，运行期使用 AgentState，不把旧 DTO 当作已持久化的账本。
 
 `ConversationSession`（`app/domain/session.py`）：会话聚合根，字段包括 id、title、source、external_memory_enabled、created_at、updated_at、acp_metadata。external_memory_enabled 是会话级外部记忆 profile 锁定值，首轮消息前可由 Chat/Dashboard 选择，首轮后不可变；未锁定的新会话为 null，发送首轮时写入规范化列表。acp_metadata 是 ACP 会话元数据（host cwd、container cwd、ACP session id 等映射信息），仅 `source="acp"` 的会话写入，其他来源会话为 null。
 
@@ -166,6 +166,18 @@ Docker Compose 项目名不属于应用配置，由 Docker Compose 读取 `COMPO
 - migration_maintenance (bool, 默认 False)：配置迁移维护窗口。B 类（启动期绑定、env-only），唯一消费点在 `app/main.py` 的 lifespan 内，为 True 时跳过 scheduler 与飞书长连接的启动，使导入期间无后台写入。由 `docker/config-import.sh` 在导入期间写入 `docker/.env` 并在结束后移除，因此不必改写并恢复用户自己的 `scheduler_enabled` / `feishu_enabled` 取值。不进 Dashboard 编辑白名单。
 
 ## SQLite schema
+
+apply_journal_mode 消费并关闭 PRAGMA 游标，确认实际返回 DELETE；不支持切换或数据库锁冲突时明确失败。侧文件生命周期由 SQLite/VFS 管理，残留 -shm 路径不是 WAL 生效的依据，不由应用直接删除。迁移必须保留已提交数据，不能破坏并发读取快照。
+
+agent_runs 记录 Session、入口、用途、独立父/重试身份、至多一种业务归属及租约终态。messages/tool_calls/usage_records 增加可空 run_id，写事务校验 Session 与当前所有权；消息 origin_kind 区分 agent/notification/legacy_unknown/context_copy，历史不猜测回填。task_states/summaries 仍为 Session 投影，写入同样隔离失效持有者。persist_messages=False 只保留最小执行事实。
+
+Task 创建保存 created_by_run_id，pending_trigger_run_id 在 claim 时移入 TaskRun.trigger_run_id。定时执行透传真实 ScheduledTaskExecution ID。删除 Task/委派成员后保留的 Run 填 business_owner_deleted_at；定时定义删除仍保留执行历史。活跃 Run 阻止 Session 删除；终态 Session 清理删除其执行账与映射，其他可空父/触发引用清空。前置业务清理与最终删除不是跨服务原子事务。
+
+trace_links 以 biz_type/biz_id/trace_id 唯一映射 AgentRun、TaskRun、ScheduledTaskExecution；服务校验真实业务身份，不把映射存在当作后端可查询。Trace 传播保持原合同。
+
+delegations.canonical_parent_run_id 是可空的新账本关联，新增委派从匹配的真实执行绑定写入，重启后用于子执行 parent_run_id；旧行保持 NULL，和旧 parent_run_id/capability 合同分开。委派成员登记还校验 execution_session_id 或 delegation-{member_id} fallback。定时执行新增 cancelled 终态；用户取消不投递普通运行结果。
+
+前序执行事实按业务尝试和 created_at 排序，同时间戳按 SQLite 已有 rowid 插入顺序确定先后，不以随机 Run ID 判断前序。pending 取消若已失去租约则拒绝并返回冲突，数据库故障不冒充正常冲突。
 
 全局 journal 模式约束：所有写连接统一 `journal_mode=DELETE`（回滚日志），禁止使用 WAL。原因：WAL 强制对 `-shm` 共享内存区做 mmap，而 Docker 部署中 `locals/` 是 macOS 宿主 bind mount（virtiofs），其 mmap 语义不完整，并发写入时会以 SIGBUS（容器 exit 135，无 traceback）杀掉进程。统一入口为 `app/infrastructure/sqlite_support.py` 的 `apply_journal_mode(conn)`；设置点伴随 `busy_timeout`（写期间全库互斥，读写都需等待兜底）。已有 WAL 库首次设置 DELETE 时自动 checkpoint 并清除 `-wal`/`-shm`。代价已接受：写期间读也阻塞，单实例产品写入短促可忽略。
 
