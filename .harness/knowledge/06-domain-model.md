@@ -1,17 +1,16 @@
-<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，说明子域、核心流程、关键模型和外部边界。要求字数少、足够简洁 -->
+<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，以 AgentRun 介绍对话、任务、定时与委派执行，以及核心模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
-本文介绍自研通用Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 以 LangGraph 编排 TurnLoop，用领域驱动设计（DDD）隔离业务核心与外部实现，支撑持续演进。
+本文介绍自研通用 Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 以 AgentRun 组织一次执行，用 LangGraph 编排模型和工具调用，用领域驱动设计（DDD）隔离业务核心与外部实现。
 
-核心流程：接收对话请求，加载会话上下文，循环"调用模型→按需执行工具"直至产出最终回答，更新会话与外部记忆，返回同步或流式结果。
-
+核心流程：接收请求、登记执行(即AgentRun)，加载上下文，循环"调用模型→按需执行工具"、直至本次执行结束；会话与外部记忆按策略更新，结果可同步或流式返回。请求来源包括：用户对话、后台任务、定时任务触发、多Agent委派等。
 
 ## 领域划分
 
 ```text
 Agent Runtime
 ├── 核心子域
-│   ├── TurnLoop：单轮对话执行编排，包括上下文准备、LLM交互、工具执行、记忆更新、结束判断
+│   ├── AgentRun：一次 Agent 执行的记录、控制与编排，包括上下文准备、模型和工具调用、结果保存
 │   ├── Context：组装模型输入视图，包括基础消息上下文、约束过滤后的工具定义等
 │   ├── LLM：模型交互子域，负责Provider Request(请求)构造、模型调用、响应解析
 │   ├── Memory：记忆管理，包括会话记忆、跨会话的外部记忆
@@ -19,6 +18,8 @@ Agent Runtime
 ├── 支撑子域
 │   ├── Schedule：定时任务定义、调度、租约执行与结果投递
 │   ├── Task：目标型后台任务的状态、调度、执行、审批与产物
+│   ├── Artifact：制品内容、版本、预览、编辑、导出与发布
+│   ├── Delegation：把工作分给多个 Agent，并汇合结果
 │   ├── Knowledge：KB的SPI定义、实例管理，通过search_knowledge检索知识
 │   ├── MCP：MCP site 注册与工具同步，把远程 MCP server 工具暴露给 LLM 调用
 │   ├── Plugin：本地插件包扫描、启停、配置和工具动态注入
@@ -47,11 +48,14 @@ flowchart TB
     Gateway("Gateway\n飞书IM / CLI-TUI / ACP")
     Schedule("Schedule\n定时任务Runner")
     Task("Task\n任务Runner")
+    Delegation("Delegation\n委派成员")
+    Review("技能审查 / 模型整理")
   end
 
   subgraph Runtime["Agent Runtime"]
     Chat("ChatCompletion")
-    Loop("AgentGraphRunner\nTurnLoop")
+    Run("AgentRunService\n执行记录与控制")
+    Loop("AgentGraphRunner\n执行编排")
     Context("ContextService")
     LLM("LLMProvider")
     Tool("ToolService")
@@ -79,7 +83,12 @@ flowchart TB
   Gateway --> Chat
   Schedule --> Chat
   Task --> Chat
+  Delegation --> Chat
+  Review --> Chat
+  Chat -->|登记执行| Run
   Chat --> Loop
+  Loop -->|启动与结束| Run
+  Run --> Storage
   Loop --> Context
   Loop --> LLM
   Loop --> Tool
@@ -104,8 +113,11 @@ flowchart TB
 ```
 
 
-## TurnLoop
-Agent会话之单轮对话，是Agent的核心业务流程，FSM状态图如下：
+## AgentRun
+
+AgentRun 记录 Agent 的一次执行：谁触发、做什么、是否完成、为何结束。系统可查询或取消执行；子执行和重试各有独立记录。对话中的一个轮次Turn，底层就是一次AgentRun。
+
+执行过程如下：
 
 ```mermaid
 %% align: left
@@ -121,7 +133,7 @@ stateDiagram-v2
   finalize --> [*]
 ```
 
-单轮对话 SD时序图如下：`ChatCompletionService.complete` → `AgentGraphRunner`（LangGraph.Graph.StateGraph）
+执行时序如下：`ChatCompletionService.complete` → `AgentGraphRunner`（LangGraph.Graph.StateGraph）。图中 Memory 表示经 RuntimeMemoryService 访问 MemoryStore；消息、工具及用量仅在允许保留时写入。`/compress` 只压缩上下文，不启动 AgentRun。
 
 ```mermaid
 %% align: left
@@ -129,6 +141,7 @@ sequenceDiagram
   autonumber
   participant Chat as ChatCompletionService
   participant Session as SessionService
+  participant Run as AgentRunService
   participant Graph as AgentGraphRunner
   participant Context as ContextService
   participant LLM as LLMProvider
@@ -137,8 +150,10 @@ sequenceDiagram
   participant Usage as UsageService
   participant External as ExternalMemoryManager
 
-  Chat->>Session: create_session(session_id)
-  Session->>Memory: create_session (INSERT OR IGNORE)
+  Chat->>Memory: create_session (INSERT OR IGNORE)
+  opt 非 /compress
+    Chat->>Run: 登记 AgentRun，失败则不继续
+  end
   Chat->>Memory: lock_session_external_memory(enabled, slots)
 
   alt /compress
@@ -153,13 +168,14 @@ sequenceDiagram
       Context->>Usage: record_compression
     end
     Chat-->>Chat: 提前返回，不写 user 消息
-  else 普通对话
+  else 执行工作
     loop 每条 user 消息
-      Chat->>Memory: append_message(role=user)
+      Chat->>Memory: append_message(role=user, run_id)
     end
     Chat->>Session: ensure_title(first_user_message)
     Session-->>Memory: update_session_title（异步成功时）
     Chat->>Graph: run / stream_events
+    Graph->>Run: 标记开始
 
     Graph->>Context: prepare_context(state)
     Context->>Memory: list_messages + get_summary
@@ -184,7 +200,7 @@ sequenceDiagram
       LLM-->>Graph: final_message + tool_calls + usage
       Graph->>Graph: scrub_memory_context(final_message)
       opt provider 返回 usage
-        Graph->>Usage: record_call
+        Graph->>Usage: record_call（关联当前 run_id）
       end
 
       opt 存在 pending_tool_calls
@@ -193,24 +209,26 @@ sequenceDiagram
           opt memory provider 工具
             Tool->>External: handle_tool_call
           end
-          Graph->>Memory: save_tool_call
+          Graph->>Memory: save_tool_call（含 run_id）
         end
       end
 
-      Graph->>Memory: append_message(role=assistant)
+      Graph->>Memory: append_message(role=assistant, run_id)
       opt 存在工具结果
-        Graph->>Memory: append_message(role=tool)
+        Graph->>Memory: append_message(role=tool, run_id)
       end
       Graph->>Memory: save_task_state(running / failed)
     end
 
     opt error 且无 final_message
-      Graph->>Memory: append_message(role=assistant, 友好错误文案)
+      Graph->>Memory: append_message(role=assistant, 友好错误文案, run_id)
     end
     opt 存在 final_message
       Graph->>External: sync_all(user, assistant)
     end
     Graph->>Memory: save_task_state(completed / failed)
+    Graph->>Run: 保存结束状态和原因
+    Graph-->>Chat: 返回结果或错误
   end
 ```
 
@@ -230,8 +248,8 @@ Context Frame
 │  └─ ConversationMessage：head + latest summary + tail
 │     └─ compression：历史消息滚动压缩，最新摘要latest summary
 │
-├─ 3. Turn Context
-│  ├─ 本轮 input messages
+├─ 3. Run Context
+│  ├─ 本次 input messages
 │  └─ 外部记忆-动态检索：call_llm 前 prepend 到 本轮用户输入user message
 │
 ├─ 4. Tool Context
@@ -377,7 +395,7 @@ Tool
 │   ├── ToolDefinition：工具定义，主要是能力描述，不包含 handler
 │   ├── ToolCallRequest：调用请求，包含 id、name、arguments
 │   ├── ToolPolicy：执行管控，治理工具的校验、暴露、执行、审批要求
-│   ├── ToolExecutionContext：执行上下文，携带授权和可信运行信息，仅限单轮对话
+│   ├── ToolExecutionContext：执行上下文，携带授权和可信运行信息，仅限本次执行
 │   ├── ToolExecutor：执行接口，定义SPI，具体实现属于各支撑子域或 Infrastructure
 │   └── ToolResult：执行结果，包含状态、内容和耗时
 └─ Infrastructure：CompositeToolExecutor 按工具名路由到具体 ToolExecutor
@@ -388,8 +406,8 @@ Tool
 ```text
 ContextService 通过 ToolService 生成可见 tool definitions
   -> LLM 返回 tool_calls
-  -> TurnLoop 构造 ToolCallRequest
-  -> TurnLoop 拿到执行授权(如需)，过程是：ToolService 查找 ToolDefinition，调用 ToolPolicy、生成 PolicyDecision，TurnLoop根据 PolicyDecision 发起审批、获得执行授权
+  -> AgentGraphRunner 构造 ToolCallRequest
+  -> ToolService 查找 ToolDefinition，调用 ToolPolicy 并生成 PolicyDecision；需要审批时，AgentGraphRunner 根据决策发起审批、取得执行授权
   -> ToolService 执行前复判 ToolPolicy
   -> ToolExecutor 执行具体能力
   -> ToolResult 作为 role=tool 消息回流 LLM
@@ -449,7 +467,7 @@ N-Agent 用户入口类型，有如下几类：
 
 | 入口  | 传输+编码协议 | 适配器 | 应用层 | 适配器源文件 |
 |:-----|:------------|:------|:------|:-----------|
-| Dashboard 管理 API | HTTP+JSON | create_*\_router / register_*\_routes | 不进入 Agent Runtime | app/interfaces/http/ |
+| Dashboard 管理 API | HTTP+JSON | create_*\_router / register_*\_routes | 查询和管理，不启动 AgentRun | app/interfaces/http/ |
 | OpenAI 兼容对话 API | HTTP/SSE+JSON | create_openai_compatible_router | ChatCompletionService | app/interfaces/http/openai_compatible.py |
 | 飞书 IM 长连接 | WebSocket+JSON | FeishuImAdapter | GatewayService → ChatCompletionService | app/interfaces/feishu_im_adapter.py |
 | TUI/CLI Chat | Stdio+行式文本 | CliChatAdapter | GatewayService → ChatCompletionService | app/interfaces/cli/ |
@@ -460,7 +478,7 @@ N-Agent 用户入口类型，有如下几类：
 
 其中，
 
-- 管理API不进入 ChatCompletionService/Agent Loop；
+- 管理 API 不启动 AgentRun；
 - OpenAI 兼容对话 API 直接进入 ChatCompletionService；
 - 飞书 IM、TUI/CLI、ACP 的用户消息先经 GatewayService 统一做入口会话、消息管理，再进入 ChatCompletionService。
 - ACP协议生命周期保留在 NAgentACPAgent 中。
@@ -475,19 +493,20 @@ N-Agent 用户入口类型，有如下几类：
 
 ## 产品形态
 
-对话=交互问答；定时任务=定时触发投递；任务=目标驱动异步后台执行，任务状态机 + 意图分解 + 多次AgentRun + 汇总 + Artifact。
+对话处理用户消息，定时任务按计划工作并投递结果，后台任务通过任务状态机组织目标执行。它们都可调用 AgentRun，任务还可多次执行并汇总结果与 Artifact。
 
 ```text
-①对话 ChatCompletion：
+①对话：
 用户提问 → AgentRun → 回复消息
 
 ②定时任务 Schedule：
-定时触发 -> ChatCompletion -> 结果投递
+定时触发 → AgentRun → 结果投递
 
 ③任务 Task：
-用户交代目标 → 意图分解 → 多次 ChatCompletionService → 汇总 + Artifact
-
+提交目标 → Task → TaskRun → 一个或多个 AgentRun → 汇总 + Artifact
 ```
+
+TaskRun 记录一次任务尝试，其中可多次调用 Agent 处理或检查结果。对话中的 AgentRun 也可通过工具创建 Task，交给后台执行。
 
 ## 工具概念
 - Skill：结构化Prompt，指导LLM怎么想、怎么说，进而完成功能。Skill定义**业务逻辑**，主决策而非执行，这是和其它工具的区别
@@ -536,9 +555,11 @@ ConversationMessage + Summary
 
 Skill 自进化是 Agent Runtime 对会话摘要的后台审查，把可复用、非平凡工作流沉淀为受治理的技能。每隔N轮对话触发1次自进化审查。
 
-前台 AgentRun finalize 后满足触发条件时，SkillEvolutionService 经 ChatCompletionService 异步启动独立 AgentRun，复用原对话的 `session_id`，以 `persist_messages=False` 执行，不持久化审查消息，也不改变原会话来源。因此它不构成独立 XUI 入口或会话筛选类型。
+前台 AgentRun 在 finalize 阶段满足开关、间隔和并发条件时，SkillEvolutionService 经 ChatCompletionService 异步启动独立的审查 AgentRun，技能修改仍受 SkillPolicy 管控。
 
-审查根操作为 `skill.review`，根操作与内部 AgentRun 的观测执行来源均为 `skill_review`，通过 Span Link 关联触发它的前台执行。独立 AgentRun 与独立会话是不同概念；`skill_review` 仅标识此次执行来源。`skill_view` 是审查可调用的工具。
+审查复用原对话的 `session_id`，设置 `persist_messages=False`，不保存审查消息，也不改变原会话来源。因此它没有单独的 XUI 入口或会话筛选类型。
+
+审查根操作为 `skill.review`，根操作与内部 AgentRun 的观测来源均为 `skill_review`，通过 Span Link 关联触发它的前台执行。`skill_view` 是审查可调用的工具，修改已有技能前须先读取目标。
 
 ```text
 会话摘要 digest
@@ -590,7 +611,7 @@ flowchart LR
 
 ## Artifact
 
-制品是 Agent 产出的长文本或文件。
+Artifact 支撑域统一管理 Agent 产出或用户提交的长文本和文件，包括内容、版本、预览、编辑、导出与发布。
 
 ```text
 Agent 判断内容适合保存为制品
@@ -605,6 +626,8 @@ Agent 判断内容适合保存为制品
 
 每次改内容都会留下历史版本，可比较或回退；改完已发布内容后，重新发布才会更新公开内容。
 
+发布会生成独立快照。删除源制品不会删除已发布的快照；撤销发布会使公开链接失效。
+
 
 ## 多Agent委派
 
@@ -614,7 +637,7 @@ Agent 判断内容适合保存为制品
 父 Agent 调用 delegate_agents
   -> 校验服务端授权、子任务、工具、预算和超时
   -> 按 delegation_key 创建或接回同一批委派
-  -> 子 Agent 在隔离会话中并行执行
+  -> 子 Agent 在隔离会话中以各自的 AgentRun 并行执行
   -> 按 join_policy 汇合结果
   -> 脱敏后作为 ToolResult 返回父 Agent
 ```
@@ -636,6 +659,8 @@ Agent 判断内容适合保存为制品
 | Profile | 运行期间持续采样函数调用栈 | Pyroscope |
 
 Trace、Metric、Log 的结构和关联方式沿用 [OTel](https://opentelemetry.io/docs/concepts/signals/)，通过 OTLP 发给 Collector 收集转发；Profile 当前独立上传。统一用Grafana做报表展示。
+
+从执行记录可以查找相关 Trace，追踪这次工作的模型和工具调用。
 
 观测信号的字段规范，分为三类 OTel通用、GenAI草案、项目特化：
 
@@ -807,21 +832,22 @@ Interfaces -> Application -> Domain
 Infrastructure -> Domain
 ```
 
-- Domain：按领域划分定义 TurnLoop、Context、LLM、Memory、Tool 等核心子域，Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation 等支撑子域的领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
+- Domain：按领域划分定义 AgentRun、Context、LLM、Memory、Tool 等核心子域，Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation 等支撑子域的领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
 - Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
 - Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
 
-Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层的 TurnLoop 实现细节。
+Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现。LangGraph 只是 Application 层执行循环的实现细节。
 
 ## 请求链路
 ```text
-客户端请求
-  -> ChatCompletionService 创建/读取会话并写入用户消息
-  -> AgentGraphRunner 准备上下文（prepare_context）
+对话、任务、定时或委派请求
+  -> ChatCompletionService 创建/读取会话，登记 AgentRun，再按策略写入用户消息
+  -> AgentGraphRunner 标记开始，准备上下文（prepare_context）
   -> LLMProvider 调用模型
   -> ToolService 校验 ToolPolicy；AgentGraphRunner 按决策编排审批；ToolService 复判后执行
-  -> MemoryStore 写入助手消息、工具调用、任务状态和摘要
+  -> MemoryStore 按策略保存消息、工具记录、最新运行状态和摘要
+  -> AgentRunService 记录结束状态和原因
   -> 返回 ChatCompletion 或 SSE 事件
 ```
 
@@ -829,19 +855,22 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 
 | 归属 | 类型 | 模型 | 说明 |
 |------|------|------|------|
-| TurnLoop | 运行模型 | AgentRun / AgentState / RunStatus / EndReason | 单次 Agent 运行、图内状态、运行阶段和结束原因 |
+| AgentRun | 执行记录 | AgentRun | 一次执行的来源、状态、结束原因及业务归属 |
+| AgentRun | 运行状态 | AgentState | 执行中的输入、中间结果和待处理工具调用 |
+| AgentRun | 运行阶段与结束判断 | RunStatus / EndReason | 图内运行阶段和结束原因 |
+| AgentRun | 端口 | AgentRunRegistry | 执行记录的保存和查询 |
 | Context | 值对象 | ProviderContext | 本次模型调用可见的 messages 与 tools |
 | Context | 值对象 | ContextCompressionResult | 压缩后的消息、摘要、token 和被摘要消息索引 |
 | Context | 端口 | ContextEngine | 判断并执行消息上下文压缩 |
 | LLM | 值对象 | ModelInfo / LLMEvent / LLMResult | 模型信息、流式事件和标准调用结果 |
 | LLM | 值对象 | ProviderConfig | Provider 脱敏配置，不包含 api_key 明文 |
 | LLM | 端口 | LLMProvider / ProviderRegistry | 模型调用与 Provider 配置注册边界 |
-| Memory | 聚合根 | ConversationSession | 会话主实体，串联消息、工具调用、任务状态和摘要 |
-| Memory | 实体 | ConversationMessage / ToolCall / TaskState / Summary | 会话消息、工具审计、任务状态和滚动摘要 |
+| Memory | 聚合根 | ConversationSession | 会话主实体，串联消息、工具调用、最新运行状态和摘要 |
+| Memory | 实体 | ConversationMessage / ToolCall / TaskState / Summary | 会话消息、工具审计、会话最新运行状态和滚动摘要 |
 | Memory | 端口 | MemoryStore / Summarizer / TitleGenerator | 会话持久化、摘要和标题生成边界 |
 | Memory | 值对象 | ExternalMemoryProviderConfig / ExternalMemoryProviderSecret | 检索记忆 Provider 的脱敏配置与独立密钥 |
 | Memory | 端口 | ExternalMemoryProvider / ExternalMemoryProviderRegistry | 外部记忆读写与检索记忆 Provider 注册边界 |
-| Tool | 值对象 | ToolDefinition / ToolCallRequest / ToolExecutionContext / ToolResult | 工具定义、调用、单轮授权上下文和执行结果 |
+| Tool | 值对象 | ToolDefinition / ToolCallRequest / ToolExecutionContext / ToolResult | 工具定义、调用、本次执行的授权和结果 |
 | Tool | 值对象 | RiskLevel / ToolExposurePolicy | 工具风险等级与模型暴露范围 |
 | Tool | 领域策略 | ToolPolicy | 工具定义校验、暴露、执行决策和一次授权 |
 | Tool | 端口 | ToolExecutor | 屏蔽具体工具 handler |
@@ -871,9 +900,15 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | Schedule | 值对象 | DeliveryTarget / DeliveryResult / ScheduledExecutionPolicy | 投递目标、结果和无人值守执行策略 |
 | Schedule | 端口 | ScheduledTaskRegistry / ScheduleCalculator / PromptSafetyScanner / OutboundDelivery | 任务持久化、调度计算、Prompt 安全和投递边界 |
 | Task | 聚合根 | Task | 目标型后台任务及其状态机 |
-| Task | 实体 | TaskRun / TaskComment / TaskEvent / TaskAttachment / TaskArtifact | 执行记录、留言、事件、附件和产物 |
+| Task | 实体 | TaskRun | 一次任务尝试，可调用多个 AgentRun |
+| Task | 实体 | TaskComment / TaskEvent / TaskAttachment / TaskArtifact | 留言、事件、附件和产物 |
 | Task | 端口 | TaskRegistry / TaskDispatcher / TaskNotifier | 任务持久化、派发与通知边界 |
 | Task | 领域策略 | TaskPolicy | 状态迁移、claim 与失败处理 |
+| Artifact | 聚合根 | Artifact | 制品来源、所属会话、当前版本和状态 |
+| Artifact | 实体 | ArtifactRevision / PublishedArtifact | 不可变的内容版本与独立发布快照 |
+| Artifact | 值对象 | ArtifactKind / ArtifactSource / ArtifactStatus | 制品类型、来源和状态 |
+| Artifact | 端口 | ArtifactRegistry / ArtifactContentStore / ArtifactExporter | 元数据保存、内容存取和格式导出 |
+| Artifact | 领域策略 | ArtifactPolicy | 编辑、发布、删除准入及二进制制品的公开限制 |
 | Browser | 实体 | BrowserSession | 浏览器会话与状态机 |
 | Browser | 值对象 | NavigateAction / ObserveAction / ClickAction / TypeAction / ScrollAction / ScreenshotAction | 浏览器操作契约 |
 | Browser | 端口 | BrowserBackend / BrowserSessionRegistry | 浏览器后端与会话持久化边界 |
@@ -892,7 +927,7 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | Usage/Observation | 值对象 | SessionUsageStats / ContextBreakdown / UsageRecord / CompressionStat | 会话累计、上下文构成、调用和压缩记录 |
 | Usage/Observation | 端口 | UsageRecorder / PricingProvider / ContextBreakdownCalculator | 用量持久化、定价查询和上下文分类边界 |
 | Shared Kernel | 共享协议 | Policy / PolicyOutcome / PolicyDecision / PolicyAuditEvent / PolicyAuditSink / ExecutionMode / PolicyDecisionKind | 各领域策略共用的评估协议、决策语言和审计通道 |
-| Policy Mesh | 领域策略 | TurnPolicy / ContextPolicy / LLMPolicy / ToolPolicy / MemoryPolicy / SandboxPolicy / GatewayPolicy / SchedulePolicy / BudgetPolicy / InformationFlowPolicy / HostTerminalPolicy / SkillPolicy / CuratorPolicy / TaskPolicy / BrowserPolicy | 15 个独立领域 Policy，各自治理一个维度，不跨域导入 |
+| Policy Mesh | 领域策略 | TurnPolicy / ContextPolicy / LLMPolicy / ToolPolicy / MemoryPolicy / SandboxPolicy / GatewayPolicy / SchedulePolicy / BudgetPolicy / InformationFlowPolicy / HostTerminalPolicy / SkillPolicy / CuratorPolicy / TaskPolicy / BrowserPolicy / ArtifactPolicy / DelegationPolicy | 17 个独立领域 Policy，各自治理一个维度，不跨域导入 |
 | Policy Mesh | 值对象 | BudgetReservationDecision / InformationReleaseDecision / MemoryAccessDecision / SandboxExecutionGrant | 领域 Policy 的 typed decision |
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
@@ -907,7 +942,7 @@ ConversationSession
 └── Summary              1:0..1
 ```
 
-SQLite Memory 默认使用 `sessions.db`。业务上以 session 为中心保存对话上下文；`AgentState` 只表示单次运行状态，不作为 SQLite 聚合根直接持久化。
+SQLite Memory 默认使用 `sessions.db`。消息、工具记录保存在 Session 中，并可关联来源 AgentRun；TaskState 只保留会话最新运行状态。`AgentState` 只表示执行中的状态，不作为 SQLite 聚合根直接持久化；不保留消息的内部执行也有 AgentRun 记录。
 
 外部记忆已由 `ExternalMemoryManager` 管理三槽：builtin、multi-project、external-query。新会话默认不启用任何外部记忆；builtin、文件记忆和检索记忆都需显式勾选。
 
@@ -942,7 +977,7 @@ LLM tool_calls
 
 公共 Policy 不是独立全局核心子域，也没有中央 PolicyService。`app/domain/policy.py` 提供 Shared Kernel：`Policy` Protocol、`PolicyOutcome`（allow/deny/require_approval）、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink` Protocol、`ExecutionMode`、`PolicyDecisionKind`（admission/plan/selection/allocation）、`RunPolicyContext`。
 
-Policy Mesh 由 15 个独立领域 Policy 组成，每个治理一个维度，不跨域导入：
+Policy Mesh 由 17 个独立领域 Policy 组成，每个治理一个维度，不跨域导入：
 
 | Policy | 文件 | 治理维度 | Domain 决策类型 |
 |--------|------|---------|----------------|
@@ -961,6 +996,8 @@ Policy Mesh 由 15 个独立领域 Policy 组成，每个治理一个维度，�
 | CuratorPolicy | `curator_policy.py` | Skill 周期维护与归档决策 | PolicyOutcome |
 | TaskPolicy | `task_policy.py` | Task 状态迁移、claim 与失败处理 | PolicyOutcome |
 | BrowserPolicy | `browser_policy.py` | 浏览器后端准入、操作、截图与接管 | BrowserPolicyDecision |
+| ArtifactPolicy | `artifact_policy.py` | 制品编辑、发布、删除准入与公开内容安全 | ArtifactPolicyOutcome |
+| DelegationPolicy | `delegation_policy.py` | 委派准入、工具权限与预算 | PolicyOutcome |
 
 Application 层封口执行：`ToolService.execute`（ToolPolicy + Budget + InformationFlow）、`ModelService.call_llm`（LLMPolicy + Budget）、`RuntimeMemoryService`（MemoryPolicy）、`SandboxToolExecutor`（SandboxPolicy + Budget）、`GatewayService`（GatewayPolicy）、`ScheduleRunService`（SchedulePolicy）、`ContextService`（ContextPolicy）、`AgentGraphRunner`（TurnPolicy）、`HostTerminalToolExecutor`（HostTerminalPolicy）、`SkillService`（SkillPolicy）、`SkillCuratorService`（CuratorPolicy）、`TaskRunService`（TaskPolicy）、`BrowserService`（BrowserPolicy）。
 
@@ -979,7 +1016,7 @@ Application 层封口执行：`ToolService.execute`（ToolPolicy + Budget + Info
 - 用例编排、Prompt、LangGraph Runtime 放 Application。
 - FastAPI、Dashboard、OpenAI-compatible 协议适配放 Interfaces。
 - SQLite、HTTP Client、具体工具 handler、Provider Adapter 放 Infrastructure。
-- 跨领域只复用 Policy 决策语言（Shared Kernel）；具体规则归对应领域的 `XPolicy`，当前有 15 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy、HostTerminalPolicy、SkillPolicy、CuratorPolicy、TaskPolicy、BrowserPolicy），Policy 间不跨域导入。
+- 跨领域只复用 Policy 决策语言（Shared Kernel）；具体规则归对应领域的 `XPolicy`，当前有 17 个领域 Policy（TurnPolicy、ContextPolicy、LLMPolicy、ToolPolicy、MemoryPolicy、SandboxPolicy、GatewayPolicy、SchedulePolicy、BudgetPolicy、InformationFlowPolicy、HostTerminalPolicy、SkillPolicy、CuratorPolicy、TaskPolicy、BrowserPolicy、ArtifactPolicy、DelegationPolicy），Policy 间不跨域导入。
 - 新增外部能力时先定义端口，再实现 Infrastructure Adapter。
 
 ## 概念

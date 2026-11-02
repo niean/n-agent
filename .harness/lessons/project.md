@@ -1,5 +1,19 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
 # 项目教训
+
+### P077: 记忆预取预算应覆盖正常云端延迟，不能把成功请求误判为服务异常
+
+- 现象：对话反复出现 `memory.prefetch mem0` 超时，目标 Trace 中后台搜索与 HTTP 请求却均为成功。
+- 根因：mem0 搜索实际耗时约 1.61 秒，略超过 1.5 秒预取等待预算；调用方先按超时返回空结果，后台请求约 0.1 秒后正常完成。根因定位跨越 Mem0Adapter 与 memory_operation 的父子 Span 时序。
+- 教训：调整自动记忆预算前应读取后台搜索及 HTTP 子 Span，区分等待预算与真实服务失败。预算应覆盖观测到的正常延迟并保留最终超时边界；回归须证明预算内迟到结果会注入上下文，预算外仍如实记录 timed_out，不能只隐藏错误状态。
+- 来源：2026-11-02 修复 trace ca0df63a6f12466ccfac9fd35629e757；等待预算 1.5 秒调整为 3 秒，1.75 秒延迟用例 RED 后转 GREEN，全量 8914 项通过。
+
+### P076: 过程消息展示须按工具调用结构判断，不能只看来源或正文是否为空
+
+- 现象：realtime 会话把两段“正在查询/正在调用工具”的模型正文显示为普通答复，刷新后仍存在；它们与最终天气答复属于同一 Run。
+- 根因：AgentGraphRunner 为续轮模型上下文持久化带正文和 tool_calls 的 assistant 中间步，Dashboard API 将其投影为独立 content 与顶层 tool_calls；前端只按 source 隐藏 task/curator 推理，再用正文是否可见兜底，导致 source=None 且正文非空的工具调用中间步被渲染。根因定位跨 agent_graph.py、dashboard.py、chat.js。
+- 教训：模型上下文持久化与对话框展示是两个契约，不应为隐藏过程消息删除上下文记录。前端应将带非空 tool_calls 的 assistant 统一识别为中间步，正文非空也不例外；无 tool_calls 的最终答复和 schedule 投递继续展示。回归必须同时覆盖泄露形态与 schedule 可见性，避免重演 P024 的过宽过滤。
+- 来源：2026-11-02 修复 dashboard-f381858e-9bf8-49c7-94e0-e4173d6d49ff 过程消息泄露；chat_frontend_harness RED 3 项、修复后全量 8913 项通过。
 
 ### P075: 客户端自动埋点必须覆盖独立入口，验收须沿实际传输链
 

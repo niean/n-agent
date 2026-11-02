@@ -16,6 +16,7 @@ from app.infrastructure.sqlite_support import open_sqlite
 _ACTIVE = ("pending", "running")
 _TERMINAL = frozenset({"completed", "failed", "cancelled"})
 _BUSINESS_TABLES = {"agent_run": "agent_runs", "task_run": "task_runs", "scheduled_task_execution": "scheduled_task_executions"}
+_TOOL_CALL_COUNT_BATCH = 500
 
 
 def validate_run_session(conn: sqlite3.Connection, run_id: str | None, session_id: str) -> None:
@@ -217,14 +218,42 @@ class SQLiteAgentRunRegistry:
                 WHERE id=? AND owner_token=? AND process_id=? AND status='pending'""",
                 (time.time(), binding.run_id, binding.owner_token, binding.process_id))
 
+    def _tool_call_counts(self, conn: sqlite3.Connection, session_id: str, run_ids: list[str]) -> dict[str, int]:
+        """Count persisted tool calls per run within one session; batches parameters."""
+        if not run_ids:
+            return {}
+        # tool_calls 由 memory store 建表；裸 registry（无该表）兼容降级为全 0。
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_calls'").fetchone() is None:
+            return {}
+        counts: dict[str, int] = {}
+        for start in range(0, len(run_ids), _TOOL_CALL_COUNT_BATCH):
+            chunk = run_ids[start:start + _TOOL_CALL_COUNT_BATCH]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT run_id, COUNT(*) FROM tool_calls WHERE session_id=? AND run_id IN ({placeholders}) GROUP BY run_id",
+                (session_id, *chunk),
+            )
+            counts.update({row[0]: row[1] for row in rows})
+        return counts
+
+    def _project_with_tool_call_counts(self, conn: sqlite3.Connection, session_id: str, rows: list[dict]) -> list[dict]:
+        """Shared read projection for get/list: attach per-run tool call counts."""
+        counts = self._tool_call_counts(conn, session_id, [row["id"] for row in rows])
+        for row in rows:
+            row["tool_call_count"] = counts.get(row["id"], 0)
+        return rows
+
     def get(self, run_id: str) -> dict | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM agent_runs WHERE id=?", (run_id,)).fetchone()
-            return dict(row) if row is not None else None
+            if row is None:
+                return None
+            return self._project_with_tool_call_counts(conn, row["session_id"], [dict(row)])[0]
 
     def list_for_session(self, session_id: str) -> list[dict]:
         with self.connect() as conn:
-            return [dict(row) for row in conn.execute("SELECT * FROM agent_runs WHERE session_id=? ORDER BY created_at,id", (session_id,))]
+            rows = [dict(row) for row in conn.execute("SELECT * FROM agent_runs WHERE session_id=? ORDER BY created_at,id", (session_id,))]
+            return self._project_with_tool_call_counts(conn, session_id, rows)
 
     def add_trace_link(self, biz_type: str, biz_id: str, trace_id: str) -> None:
         if biz_type not in _BUSINESS_TABLES or not re.fullmatch(r"[0-9a-fA-F]{32}", trace_id) or int(trace_id, 16) == 0:

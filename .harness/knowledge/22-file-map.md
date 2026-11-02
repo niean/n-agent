@@ -41,7 +41,7 @@
 
 ## Domain Layer
 
-- Agent 运行模型：`app/domain/agent.py`，定义 `AgentRun`、`AgentState`、`RunStatus`、`EndReason`
+- Agent 运行时状态：`app/domain/agent.py`，定义 `AgentState`、`RunStatus`、`EndReason`，并保留兼容数据类 `AgentRun`；持久执行身份与存储端口见 `app/domain/agent_run.py`
 - 会话与消息模型：`app/domain/session.py`，定义 `SessionSource`（公共枚举，含 9 个一级会话来源 dashboard/api/cli/feishu/dingtalk/wecom/acp/schedule/curator 与 `im_platforms()` classmethod，详见 05-key-patterns.md 模式十六）、`ConversationSession`（`has_default_title` 领域行为、`DEFAULT_SESSION_TITLE` 常量，`source: str` 默认 `SessionSource.API.value`）、`ConversationMessage`（含消息级 `source` 字段，区分非真人 task/schedule/curator user 消息；仅 user 消息由 ChatCompletionService 按受信入口赋值，与 ConversationSession.source 会话入口分离；末尾默认 `card: dict[str, Any] | None = None` 字段，承载 `ui.task_lifecycle` 系统消息的结构化交互载荷，不破坏既有位置/关键字构造）、`ToolCall`、`TaskState`、`Summary`、`TitleGenerator` 端口、`SessionNotFoundError`、`SessionValidationError`
 - Policy Shared Kernel：`app/domain/policy.py`，定义通用 `Policy` Protocol、`PolicyOutcome`、`PolicyDecision`、`PolicyAuditEvent`、`PolicyAuditSink`、`ExecutionMode`、`PolicyDecisionKind`、`RunPolicyContext`；不包含具体业务规则
 - 工具领域模型：`app/domain/tool.py`，定义 `RiskLevel`、`ToolSourceType`、`ToolDefinition`、`ToolCallRequest`、`ApprovalRequest`、`ApprovalDecision`、`ToolExecutionContext`、`ToolResult`、`ToolExecutor`；`ToolDefinition` 不含 handler，`ToolExecutor` 是 SPI

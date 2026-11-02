@@ -248,18 +248,189 @@ def test_chat_js_node_syntax_check():
     assert result.returncode == 0, result.stderr
 
 
-def test_chat_frontend_harness():
+def _run_harness_process():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node not available")
-    result = subprocess.run(
+    return subprocess.run(
         [node, str(HARNESS_JS)],
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def test_chat_frontend_harness():
+    result = _run_harness_process()
     assert result.returncode == 0, result.stdout + result.stderr
     assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_harness_render_and_format():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_harness_live_capture():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_harness_session_isolation():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_harness_trace_links():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_assets():
+    """T5: Run footer 轻量入口 -- management-api 三接口 + footer CSS 规则。"""
+    api_js = (STATIC_DIR / "management-api.js").read_text(encoding="utf-8")
+    assert "const listSessionRuns = (id) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}/runs`);" in api_js
+    assert (
+        "const getSessionRun = (id, runId) => "
+        "fetchJson(`/chat/sessions/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`);" in api_js
+    )
+    assert "const getOtelLinks = () => fetchJson('/chat/observations/otel/links');" in api_js
+    for name in ("listSessionRuns,", "getSessionRun,", "getOtelLinks,"):
+        assert name in api_js
+
+    styles = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+    footer = _css_rule_bodies(styles, ".chat-run-footer")
+    assert footer and "color: var(--color-fg-subtle)" in footer[0] and "min-height: 28px" in footer[0]
+    assert "opacity: 0" in footer[0] and "pointer-events: none" in footer[0]
+    assert "display: none" not in footer[0] and "visibility: hidden" not in footer[0]
+    turn = _css_rule_bodies(styles, ".chat-turn")
+    assert turn and "flex-direction: column" in turn[0] and "max-width: 92%" in turn[0]
+    assistant_turn = _css_rule_bodies(styles, ".chat-turn--assistant")
+    assert assistant_turn and "max-width: 80%" in assistant_turn[0]
+    time_rule = _css_rule_bodies(styles, ".chat-run-footer__time")
+    assert time_rule and "margin-left: 0" in time_rule[0] and "font-size: 11px" in time_rule[0]
+    right_time_rule = _css_rule_bodies(styles, ".chat-turn--right .chat-run-footer__time")
+    assert right_time_rule and "margin-left: auto" in right_time_rule[0]
+    action_time_rule = _css_rule_bodies(styles, ".chat-run-footer__actions:not(:empty) + .chat-run-footer__time")
+    assert not action_time_rule, "parent flex gap must not be duplicated by timestamp margin"
+    footer_rule = _css_rule_bodies(styles, ".chat-run-footer")
+    assert footer_rule and "gap: 4px" in footer_rule[0]
+    actions_rule = _css_rule_bodies(styles, ".chat-run-footer__actions")
+    assert actions_rule and "display: flex" in actions_rule[0]
+    empty_actions_rule = _css_rule_bodies(styles, ".chat-run-footer__actions:empty")
+    assert empty_actions_rule and "display: none" in empty_actions_rule[0]
+    revealed = _css_rule_bodies(styles, ".chat-turn:focus-within > .chat-run-footer")
+    assert revealed and "opacity: 1" in revealed[0] and "pointer-events: auto" in revealed[0]
+    assert _css_rule_bodies(styles, ".chat-turn:hover > .chat-run-footer")
+    touch_blocks = _css_media_blocks(styles, "@media (hover: none), (pointer: coarse)")
+    assert touch_blocks and "opacity: 1" in touch_blocks[0] and "pointer-events: auto" in touch_blocks[0]
+    reduced_blocks = _css_media_blocks(styles, "@media (prefers-reduced-motion: reduce)")
+    assert reduced_blocks and any(
+        ".chat-run-footer" in block and "transition: none" in block for block in reduced_blocks
+    )
+    action = _css_rule_bodies(styles, ".chat-run-footer__action")
+    assert action and "width: 26px" in action[0] and "height: 26px" in action[0]
+    hover = _css_rule_bodies(styles, ".chat-run-footer__action:hover")
+    assert hover and "background: var(--color-bg-hover)" in hover[0]
+    focus = _css_rule_bodies(styles, ".chat-run-footer__action:focus-visible")
+    assert focus and "outline: 2px solid var(--color-primary)" in focus[0]
+
+
+def test_chat_run_footer_detail_harness_open_and_tabs():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_detail_harness_meta_and_tools():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_detail_harness_trace():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_detail_harness_stale_requests():
+    result = _run_harness_process()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "all tests passed" in result.stdout
+
+
+def test_chat_run_footer_detail_assets():
+    """T6: Run 详情 tab -- 第三 tab HTML 结构 + 详情视图 CSS 规则。"""
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    styles = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+    tree = _HtmlTree(html)
+
+    # 第三 tab 按钮：role/aria 与既有工具/制品 tab 一致
+    btn_nodes = tree.find_all(lambda n: n["attrs"].get("id") == "chat-tab-run-button")
+    assert len(btn_nodes) == 1
+    btn = btn_nodes[0]
+    assert btn["tag"] == "button"
+    assert btn["attrs"].get("type") == "button"
+    assert btn["attrs"].get("role") == "tab"
+    assert btn["attrs"].get("data-tab") == "run"
+    assert btn["attrs"].get("aria-selected") == "false"
+    assert btn["attrs"].get("aria-controls") == "chat-tab-run"
+    assert btn["attrs"].get("tabindex") == "-1"
+
+    # tablist 内三个 tab，顺序 工具/制品/Run
+    tablist = [n for n in tree.ancestors(btn) if n["attrs"].get("role") == "tablist"][-1]
+    tab_ids = [c["attrs"].get("id") for c in tablist["children"]]
+    assert tab_ids == ["chat-tab-tool-button", "chat-tab-artifact-button", "chat-tab-run-button"]
+
+    # Run 面板：role/aria-labelledby 与既有面板一致，初始隐藏
+    panel_nodes = tree.find_all(lambda n: n["attrs"].get("id") == "chat-tab-run")
+    assert len(panel_nodes) == 1
+    panel = panel_nodes[0]
+    assert panel["attrs"].get("role") == "tabpanel"
+    assert panel["attrs"].get("aria-labelledby") == "chat-tab-run-button"
+    assert "hidden" in panel["attrs"]
+    panels_parent = [n for n in tree.ancestors(panel) if any(
+        c["attrs"].get("id") == "chat-tab-tool" for c in n["children"]
+    )][-1]
+    panel_ids = [c["attrs"].get("id") for c in panels_parent["children"] if c["attrs"].get("id")]
+    assert panel_ids == ["chat-tab-tool", "chat-tab-artifact", "chat-tab-run"]
+
+    # 详情容器：aria-live=polite，初始占位
+    detail_nodes = tree.find_all(lambda n: n["attrs"].get("id") == "chat-run-detail")
+    assert len(detail_nodes) == 1
+    detail = detail_nodes[0]
+    assert detail["attrs"].get("aria-live") == "polite"
+    assert detail["children"] == [] or not detail["children"]
+
+    # CSS：状态色分类 + 详情视图布局规则
+    ok_rule = _css_rule_bodies(styles, ".run-status--ok")
+    assert ok_rule and "var(--color-success-fg)" in ok_rule[0]
+    bad_rule = _css_rule_bodies(styles, ".run-status--bad")
+    assert bad_rule and "var(--color-danger-fg)" in bad_rule[0]
+    warn_rule = _css_rule_bodies(styles, ".run-status--warn")
+    assert warn_rule and "var(--color-warning-fg)" in warn_rule[0]
+    neutral_rule = _css_rule_bodies(styles, ".run-status--neutral")
+    assert neutral_rule and neutral_rule[0].strip()
+    unknown_rule = _css_rule_bodies(styles, ".run-status--unknown")
+    assert unknown_rule and unknown_rule[0].strip()
+    overview = _css_rule_bodies(styles, ".run-detail__overview")
+    assert overview and "var(--color-border-light)" in overview[0] and "var(--color-bg-subtle)" in overview[0]
+    sections = _css_rule_bodies(styles, ".run-detail__section")
+    assert sections and "var(--color-border-light)" in sections[0] and "var(--radius-sm)" in sections[0]
+    for selector in (
+        ".run-detail",
+        ".run-detail__status",
+        ".run-detail__meta-row",
+        ".run-detail__error",
+        ".run-detail__tool-args",
+        ".run-detail__trace-link",
+    ):
+        assert _css_rule_bodies(styles, selector), f"styles.css must define {selector}"
 
 
 def test_chat_session_source_filter_uses_standard_modal():

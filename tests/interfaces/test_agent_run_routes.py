@@ -6,7 +6,7 @@ from app.interfaces.http.agent_run_routes import create_agent_run_router
 
 
 class Runs:
-    row = {"id": "run", "session_id": "chat", "status": "running", "owner_token": "private", "process_id": "private", "lease_expires_at": 42}
+    row = {"id": "run", "session_id": "chat", "status": "running", "owner_token": "private", "process_id": "private", "lease_expires_at": 42, "tool_call_count": 3}
 
     def get(self, run_id):
         return self.row if run_id == "run" else None
@@ -33,6 +33,22 @@ async def test_run_api_hides_ownership_and_checks_session_scope():
         assert response.json()["trace_links"][0]["availability"] == "unknown"
         assert (await client.post("/chat/sessions/other/runs/run/cancel")).status_code == 404
         assert (await client.post("/chat/sessions/chat/runs/run/cancel")).json()["cancel_requested"]
+
+
+@pytest.mark.asyncio
+async def test_run_footer_api_projects_integer_tool_call_count_and_hides_ownership():
+    app = FastAPI()
+    app.include_router(create_agent_run_router(Runs()))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        detail = (await client.get("/chat/sessions/chat/runs/run")).json()
+        listing = (await client.get("/chat/sessions/chat/runs")).json()
+    assert detail["tool_call_count"] == 3
+    assert listing[0]["tool_call_count"] == 3
+    for row in (detail, listing[0]):
+        assert isinstance(row["tool_call_count"], int)
+        assert "owner_token" not in row
+        assert "process_id" not in row
+        assert "lease_expires_at" not in row
 
 
 @pytest.mark.asyncio

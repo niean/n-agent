@@ -164,6 +164,7 @@
             <div class="chat-tabs" role="tablist" aria-label="侧栏信息">
               <button class="chat-tab chat-tab--active" id="chat-tab-tool-button" role="tab" type="button" data-tab="tool" aria-selected="true" aria-controls="chat-tab-tool" tabindex="0">工具调用</button>
               <button class="chat-tab" id="chat-tab-artifact-button" role="tab" type="button" data-tab="artifact" aria-selected="false" aria-controls="chat-tab-artifact" tabindex="-1">制品信息</button>
+              <button class="chat-tab" id="chat-tab-run-button" role="tab" type="button" data-tab="run" aria-selected="false" aria-controls="chat-tab-run" tabindex="-1">执行详情</button>
             </div>
             <div class="chat-tab-panels">
               <div class="chat-tab-content" id="chat-tab-tool" role="tabpanel" aria-labelledby="chat-tab-tool-button">
@@ -173,6 +174,9 @@
               </div>
               <div class="chat-tab-content" id="chat-tab-artifact" role="tabpanel" aria-labelledby="chat-tab-artifact-button" hidden>
                 <div id="chat-artifact-list" class="artifacts-list__items" aria-live="polite">暂未选择会话</div>
+              </div>
+              <div class="chat-tab-content" id="chat-tab-run" role="tabpanel" aria-labelledby="chat-tab-run-button" hidden>
+                <div id="chat-run-detail" aria-live="polite">暂未选择 Run</div>
               </div>
             </div>
           </div>

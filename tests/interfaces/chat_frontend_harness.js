@@ -123,14 +123,19 @@ function makeEl() {
       // 匹配单段简单选择器（id / class / tag）
       const matchSimple = (node, part) => {
         if (!node) return false;
-        if (part.charAt(0) === '#') {
-          return node._attrs && node._attrs.id === part.slice(1);
+        // 复合段支持：tag#id.cls1.cls2（按 '.' 分段，首段可为 tag/#id/空）
+        const segs = String(part).split('.');
+        const head = segs[0];
+        if (head.charAt(0) === '#') {
+          if (!(node._attrs && node._attrs.id === head.slice(1))) return false;
+        } else if (head) {
+          if (node.tagName !== head.toUpperCase()) return false;
         }
-        if (part.charAt(0) === '.') {
-          const cls = part.slice(1);
-          return !!(node.className && node.className.split(/\s+/).indexOf(cls) !== -1);
+        for (let si = 1; si < segs.length; si++) {
+          if (!segs[si]) return false;
+          if (!(node.className && node.className.split(/\s+/).indexOf(segs[si]) !== -1)) return false;
         }
-        return node.tagName === part.toUpperCase();
+        return true;
       };
       // 单段：走深度优先查找第一个匹配
       if (parts.length === 1) {
@@ -188,14 +193,19 @@ function makeEl() {
       const parts = sel.split(/\s+/).filter(Boolean);
       const matchSimple = (node, part) => {
         if (!node) return false;
-        if (part.charAt(0) === '#') {
-          return node._attrs && node._attrs.id === part.slice(1);
+        // 复合段支持：tag#id.cls1.cls2（按 '.' 分段，首段可为 tag/#id/空）
+        const segs = String(part).split('.');
+        const head = segs[0];
+        if (head.charAt(0) === '#') {
+          if (!(node._attrs && node._attrs.id === head.slice(1))) return false;
+        } else if (head) {
+          if (node.tagName !== head.toUpperCase()) return false;
         }
-        if (part.charAt(0) === '.') {
-          const cls = part.slice(1);
-          return !!(node.className && node.className.split(/\s+/).indexOf(cls) !== -1);
+        for (let si = 1; si < segs.length; si++) {
+          if (!segs[si]) return false;
+          if (!(node.className && node.className.split(/\s+/).indexOf(segs[si]) !== -1)) return false;
         }
-        return node.tagName === part.toUpperCase();
+        return true;
       };
       const out = [];
       if (parts.length === 1) {
@@ -375,6 +385,16 @@ let getSessionDetailCalls = [];
 let getSessionDetailHandler = null;
 let deleteSessionCalls = [];
 let deleteSessionHandler = null;
+// T5(Run footer): runs 列表 / Run 详情 / OTel 链接配置 replaceable handlers + 调用记录
+let listSessionRunsCalls = [];
+let listSessionRunsHandler = null;
+let getSessionRunCalls = [];
+let getSessionRunHandler = null;
+let getOtelLinksCalls = [];
+let getOtelLinksHandler = null;
+// T6(Run 详情 tab): 工具调用 replaceable handler + 调用记录
+let getSessionToolCallsCalls = [];
+let getSessionToolCallsHandler = null;
 const localStorageData = new Map();
 
 function makeTimerEnv() {
@@ -413,6 +433,14 @@ function freshStubs(options) {
   getSessionDetailHandler = null;
   deleteSessionCalls = [];
   deleteSessionHandler = null;
+  listSessionRunsCalls = [];
+  listSessionRunsHandler = null;
+  getSessionRunCalls = [];
+  getSessionRunHandler = null;
+  getOtelLinksCalls = [];
+  getOtelLinksHandler = null;
+  getSessionToolCallsCalls = [];
+  getSessionToolCallsHandler = null;
   const messageStack = makeEl();
   const input = makeEl();
   input.value = '';
@@ -465,6 +493,23 @@ function freshStubs(options) {
   chatTabArtifact.className = 'chat-tab-content';
   chatTabArtifact.setAttribute('role', 'tabpanel');
   chatTabArtifact.hidden = true;
+  // T6: Run 详情 tab（匹配 index.html 静态模板第三 tab）
+  const chatTabRunButton = makeEl();
+  chatTabRunButton.tagName = 'BUTTON';
+  chatTabRunButton.className = 'chat-tab';
+  chatTabRunButton.dataset.tab = 'run';
+  chatTabRunButton.setAttribute('role', 'tab');
+  chatTabRunButton.setAttribute('aria-selected', 'false');
+  chatTabRunButton.setAttribute('aria-controls', 'chat-tab-run');
+  chatTabRunButton.setAttribute('tabindex', '-1');
+  const chatTabRun = makeEl();
+  chatTabRun.className = 'chat-tab-content';
+  chatTabRun.setAttribute('role', 'tabpanel');
+  chatTabRun.setAttribute('aria-labelledby', 'chat-tab-run-button');
+  chatTabRun.hidden = true;
+  const chatRunDetail = makeEl();
+  chatRunDetail.setAttribute('aria-live', 'polite');
+  chatRunDetail.textContent = '暂未选择 Run';
   const chatArtifactList = makeEl();
   chatArtifactList.className = 'artifacts-list__items';
   chatArtifactList.textContent = '暂未选择会话';
@@ -476,6 +521,9 @@ function freshStubs(options) {
   byIdMap['chat-tab-artifact-button'] = chatTabArtifactButton;
   byIdMap['chat-tab-tool'] = chatTabTool;
   byIdMap['chat-tab-artifact'] = chatTabArtifact;
+  byIdMap['chat-tab-run-button'] = chatTabRunButton;
+  byIdMap['chat-tab-run'] = chatTabRun;
+  byIdMap['chat-run-detail'] = chatRunDetail;
   byIdMap['chat-artifact-list'] = chatArtifactList;
   // T3: 左侧会话面板结构（匹配 index.html 静态模板）
   const hasId = (id) => !missingIds.has(id);
@@ -577,7 +625,27 @@ function freshStubs(options) {
       if (getSessionDetailHandler) return getSessionDetailHandler(id);
       return Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null });
     },
-    getSessionToolCalls: () => Promise.resolve([]),
+    getSessionToolCalls: (id) => {
+      getSessionToolCallsCalls.push({ id });
+      if (getSessionToolCallsHandler) return getSessionToolCallsHandler(id);
+      return Promise.resolve([]);
+    },
+    // T5(Run footer): runs 列表 / Run 详情 / OTel 链接配置；数组 DTO 直接消费（不假定 {items:...}）
+    listSessionRuns: (id) => {
+      listSessionRunsCalls.push({ id });
+      if (listSessionRunsHandler) return listSessionRunsHandler(id);
+      return Promise.resolve([]);
+    },
+    getSessionRun: (id, runId) => {
+      getSessionRunCalls.push({ id, runId });
+      if (getSessionRunHandler) return getSessionRunHandler(id, runId);
+      return Promise.resolve(null);
+    },
+    getOtelLinks: () => {
+      getOtelLinksCalls.push({});
+      if (getOtelLinksHandler) return getOtelLinksHandler();
+      return Promise.resolve({ config: {} });
+    },
     renameSession: () => Promise.resolve({}),
     // T5: listSkills 不走全局 fetch；直接返回已解析的 {skills: [...]}；由 listSkillsHandler 替换用于倒序/失败场景
     listSkills: () => {
@@ -795,6 +863,15 @@ function freshStubs(options) {
     getGetSessionDetailCalls: () => getSessionDetailCalls.slice(),
     setDeleteSessionHandler: (handler) => { deleteSessionHandler = handler; },
     getDeleteSessionCalls: () => deleteSessionCalls.slice(),
+    // T5(Run footer): handlers / 调用记录
+    setListSessionRunsHandler: (handler) => { listSessionRunsHandler = handler; },
+    getListSessionRunsCalls: () => listSessionRunsCalls.slice(),
+    setGetSessionRunHandler: (handler) => { getSessionRunHandler = handler; },
+    getGetSessionRunCalls: () => getSessionRunCalls.slice(),
+    setGetOtelLinksHandler: (handler) => { getOtelLinksHandler = handler; },
+    getGetOtelLinksCalls: () => getOtelLinksCalls.slice(),
+    setGetSessionToolCallsHandler: (handler) => { getSessionToolCallsHandler = handler; },
+    getGetSessionToolCallsCalls: () => getSessionToolCallsCalls.slice(),
     // T5: capture/target/bubble click 派发（document + 祖先 + 目标 + 真实 stopPropagation/preventDefault）
     fireClick: (el) => {
       if (!el) return null;
@@ -818,6 +895,7 @@ function loadChat(options) {
     TextDecoder,
     TextEncoder,
     URLSearchParams,
+    URL,
     encodeURIComponent,
     setInterval: env.timerEnv.setInterval,
     clearInterval: env.timerEnv.clearInterval,
@@ -853,17 +931,19 @@ function loadChat(options) {
   return env;
 }
 
+function _lastMessageBubble(env) {
+  const messages = env.messageStack.querySelectorAll('.msg');
+  return messages.length ? messages[messages.length - 1] : null;
+}
+
 function lastSystemText(env) {
-  const kids = env.messageStack._kids;
-  if (!kids.length) return null;
-  return kids[kids.length - 1].textContent;
+  const el = _lastMessageBubble(env);
+  return el ? el.textContent : null;
 }
 
 // Extract summary / body of the last system message (details > [summary, pre]).
 function _lastSystemDetails(env) {
-  const kids = env.messageStack._kids;
-  if (!kids.length) return null;
-  const el = kids[kids.length - 1];
+  const el = _lastMessageBubble(env);
   return (el && el._kids && el._kids[0]) ? el._kids[0] : null;
 }
 function lastSystemSummary(env) {
@@ -885,7 +965,7 @@ async function testPartialMessageRefresh() {
   const first = { messages: [{ id: 'tool-1', role: 'tool', content: '{"step":1}' }] };
   await env.chat.applySessionDetail(first);
   const oldTool = env.messageStack._kids[0];
-  oldTool._kids[0].open = true;
+  oldTool.querySelector('details').open = true;
 
   await env.chat.applySessionDetail({
     messages: [
@@ -895,14 +975,14 @@ async function testPartialMessageRefresh() {
   }, { partialMessages: true });
   const refreshedTool = env.messageStack._kids[0];
   ok(refreshedTool !== oldTool, 'merged tool group updates only its changed node');
-  ok(refreshedTool._kids[0].open === true, 'expanded tool call remains expanded after partial refresh');
+  ok(refreshedTool.querySelector('details').open === true, 'expanded tool call remains expanded after partial refresh');
 
   const taskEnv = loadChat();
   await taskEnv.chat.applySessionDetail({
     messages: [{ id: 'task-1', role: 'system', name: 'ui.task_lifecycle', content: '[任务状态] 等待执行' }],
   });
   const oldTask = taskEnv.messageStack._kids[0];
-  oldTask._kids[0].open = true;
+  oldTask.querySelector('details').open = true;
   await taskEnv.chat.applySessionDetail({
     messages: [
       { id: 'task-1', role: 'system', name: 'ui.task_lifecycle', content: '[任务状态] 等待执行' },
@@ -911,7 +991,7 @@ async function testPartialMessageRefresh() {
   }, { partialMessages: true });
   const refreshedTask = taskEnv.messageStack._kids[0];
   ok(refreshedTask !== oldTask, 'merged task status updates only its changed node');
-  ok(refreshedTask._kids[0].open === true, 'expanded task status remains expanded after partial refresh');
+  ok(refreshedTask.querySelector('details').open === true, 'expanded task status remains expanded after partial refresh');
 }
 
 // ===========================================================================
@@ -1078,7 +1158,7 @@ async function runIntegration() {
   env.input.value = '/task create 标题';
   await env.chat.send();
   const lastKid = env.messageStack._kids[env.messageStack._kids.length - 1];
-  const hasImg = env.messageStack._kids.some((k) => k._kids && k._kids.some((gc) => gc.tagName === 'IMG'));
+  const hasImg = env.messageStack.querySelectorAll('img').length > 0;
   ok(!hasImg, 'malicious title renders no IMG node (textContent only)');
   ok(lastKid && lastKid.textContent.indexOf('<img src=x onerror=alert(1)>') !== -1, 'malicious title preserved as text (got ' + JSON.stringify(lastKid && lastKid.textContent) + ')');
 
@@ -1098,7 +1178,7 @@ async function runIntegration() {
   ok(appendCalls.length > 0 && appendCalls[0].content.indexOf('执行命令') !== -1, 'command record persisted first (got ' + JSON.stringify(appendCalls[0].content) + ')');
   ok(lastSystemSummary(env) === '任务指令', 'system summary is 任务指令 by name (got ' + JSON.stringify(lastSystemSummary(env)) + ')');
   // 合并：命令记录 + 回执渲染为同一条任务指令气泡（非两条）
-  const taskCmdBubbles = env.messageStack._kids.filter(k => k && k.dataset && k.dataset.name === 'ui.task_command');
+  const taskCmdBubbles = env.messageStack.querySelectorAll('.msg').filter(k => k && k.dataset && k.dataset.name === 'ui.task_command');
   ok(taskCmdBubbles.length === 1, 'command record + result merged into 1 task-command bubble (got ' + taskCmdBubbles.length + ')');
 
   // === truncation: oversize content truncated with suffix; DOM body contains POST body ===
@@ -1269,7 +1349,7 @@ async function runIntegration() {
     { id: 'msg_' + (raceAppendBase + 2), role: 'system', name: 'ui.task_command', content: '当前会话无关联任务' },
   ];
   await env.chat.applySessionDetail(detailWith('s1', raceMsgs), { partialMessages: true });
-  const raceTaskCards = env.messageStack._kids.filter((k) => k && k.dataset && k.dataset.name === 'ui.task_command');
+  const raceTaskCards = env.messageStack.querySelectorAll('.msg').filter((k) => k && k.dataset && k.dataset.name === 'ui.task_command');
   ok(raceTaskCards.length === 1, 'task command refresh race replaces optimistic card instead of duplicating it (got ' + raceTaskCards.length + ')');
 
   // ===========================================================================
@@ -1281,7 +1361,7 @@ async function runIntegration() {
     const kids = stack._kids || [];
     for (const k of kids) {
       if (!k.textContent || k.textContent.indexOf(needle) === -1) continue;
-      const details = k._kids && k._kids[0];
+      const details = k.querySelector('details');
       if (details && 'open' in details) return details;
     }
     return null;
@@ -1322,7 +1402,7 @@ async function runIntegration() {
   ok(mergedText.indexOf('执行命令') === -1, 'merged card does NOT contain m5 task_command (independent) (got ' + JSON.stringify(mergedText) + ')');
   ok(mergedText.indexOf('[任务状态]') === -1, 'merged card headers stripped, content kept');
   // m2-m4 合并为 1 卡片 + m5 独立 1 卡片 = 2 张 task 卡片（非 1 张，非 4 张）
-  const taskCards = env.messageStack._kids.filter(k => k && k.dataset && (k.dataset.name === 'ui.task_command' || k.dataset.name === 'ui.task_lifecycle'));
+  const taskCards = env.messageStack.querySelectorAll('.msg').filter(k => k && k.dataset && (k.dataset.name === 'ui.task_command' || k.dataset.name === 'ui.task_lifecycle'));
   ok(taskCards.length === 2, 'm2-m4 merged into 1 + m5 independent = 2 task cards (got ' + taskCards.length + ')');
   // m5 task_command 独立卡片 summary = 任务指令
   const cmdCard = taskCards.find((k) => k.dataset.name === 'ui.task_command');
@@ -1352,7 +1432,7 @@ async function runIntegration() {
   await env.waitMicro();
 
   function findResultEl(needle) {
-    return env.messageStack._kids.find((k) => k && k.className === 'msg assistant' && k.textContent && k.textContent.indexOf(needle) !== -1);
+    return env.messageStack.querySelectorAll('.msg.assistant').find((k) => k && k.textContent && k.textContent.indexOf(needle) !== -1);
   }
   // 所有结束情况均渲染为普通消息（className 'msg assistant'）
   const succeededEl = findResultEl('任务已完成');
@@ -1369,8 +1449,8 @@ async function runIntegration() {
   // 正文以普通消息渲染（textContent 可见）
   ok(succeededEl && succeededEl.textContent.indexOf('已交付调研报告') !== -1, 'SUCCEEDED content visible');
   ok(failedEl && failedEl.textContent.indexOf('工具不可用') !== -1, 'FAILED content visible');
-  // 普通消息附带 Hover 时间
-  ok(succeededEl && succeededEl.dataset && succeededEl.dataset.time, 'ui.task_result has hover time');
+  // 旧气泡顶部 data-time 已移除，时间由通用消息容器渲染到 footer。
+  ok(succeededEl && succeededEl.dataset && !succeededEl.dataset.time, 'ui.task_result has no legacy header timestamp');
 }
 
 // ===========================================================================
@@ -1624,9 +1704,9 @@ async function runIntegration() {
 // curator 为内部维护）；realtime（api/dashboard/无 source）assistant 正常渲染；
 // 进程来源 user/tool 消息不受影响。Regression: worker CoT "The task requires
 // querying weather..." 泄露为普通气泡。
-// schedule 例外：其 assistant 消息是定时任务投递记录（无独立 ui.task_result
-// 卡片机制），必须在 Dashboard 对话框可见；空内容（仅 tool_calls 的中间步）仍
-// 由 hasVisibleContent 隐藏。Regression: 定时任务投递记录被误隐藏。
+// schedule 例外：其最终 assistant 消息是定时任务投递记录（无独立 ui.task_result
+// 卡片机制），必须在 Dashboard 对话框可见；带 tool_calls 的中间步即使带正文也隐藏。
+// Regression: 定时任务投递记录被误隐藏、realtime 工具调用中间步泄露。
 // ===========================================================================
 (function testProcessAssistantReasoningHidden() {
   const env = loadChat();
@@ -1655,6 +1735,33 @@ async function runIntegration() {
     'dashboard-sourced assistant rendered');
   ok(shouldRenderMessage({ role: 'assistant', content: 'reply' }) === true,
     'untagged assistant rendered');
+
+  // realtime 带正文的工具调用中间步仍是过程消息；最终答复没有 tool_calls，保持可见。
+  ok(shouldRenderMessage({
+    role: 'assistant',
+    source: null,
+    content: '我来帮您查询天气。先看看是否有您之前保存的常用地点，同时加载天气查询技能。',
+    tool_calls: [
+      { id: 'call-memory', function: { name: 'mem0_search', arguments: '{"query":"常用地点"}' } },
+      { id: 'call-skill', function: { name: 'skill_view', arguments: '{"name":"weather"}' } },
+    ],
+  }) === false, 'realtime assistant content with tool calls hidden');
+  ok(shouldRenderMessage({
+    role: 'assistant',
+    source: null,
+    content: '已确认您的偏好：未指定城市时默认查询**北京**。正在获取实时天气。',
+    tool_calls: [
+      { id: 'call-weather', function: { name: 'web_fetch', arguments: '{"url":"https://wttr.in/Beijing?format=j2"}' } },
+    ],
+  }) === false, 'second realtime assistant tool-calling step hidden');
+  ok(shouldRenderMessage({ role: 'assistant', source: null, content: '北京当前晴，气温 12°C。' }) === true,
+    'final realtime assistant answer remains rendered');
+  ok(shouldRenderMessage({
+    role: 'assistant',
+    source: 'schedule',
+    content: '正在获取定时天气。',
+    tool_calls: [{ id: 'call-weather', function: { name: 'web_fetch', arguments: '{}' } }],
+  }) === false, 'schedule tool-calling intermediate step hidden');
 
   // 进程来源 user 消息仍渲染（折叠卡片，不受 assistant 隐藏影响）
   ok(shouldRenderMessage({ role: 'user', source: 'task', content: 'work task t1' }) === true,
@@ -2712,11 +2819,9 @@ async function testToolApprovalCard() {
     ok(badExpires[0].textContent === '过期时间: not-a-date',
       'invalid expires_at falls back to raw text (got "' + badExpires[0].textContent + '")');
 
-    // --- message hover time rendered in UTC+8, not browser local timezone ---
-    // 2020-01-01T00:00:00Z -> UTC+8 2020-01-01 08:00；年份 != 当前年 -> 年/月/日 HH:mm。
+    // --- 旧 data-time 不再写入气泡；footer 的 UTC+8 实际渲染由通用 footer 场景覆盖 ---
     const tzMsg = env.chat.createMessageElement({ role: 'user', content: 'hi', created_at: '2020-01-01T00:00:00Z', name: null });
-    ok(tzMsg.dataset.time === '2020/1/1 08:00',
-      'message time rendered in UTC+8 (got "' + tzMsg.dataset.time + '")');
+    ok(!tzMsg.dataset.time, 'message bubble does not carry legacy data-time');
 
     // Three buttons
     const btns3 = findByClass(cards3[0], 'tool-approval-card__btn');
@@ -3108,13 +3213,15 @@ async function testSidePanelAndArtifacts() {
   await env.waitMicro();
   const tb = env.byIdMap['chat-tab-tool-button'];
   const ab = env.byIdMap['chat-tab-artifact-button'];
+  // T6: 第三 tab（Run 详情）加入键盘循环；End 直达末位（run），Home 回首位
+  const rb = env.byIdMap['chat-tab-run-button'];
   let r = env.fireKeydown(tb, 'ArrowRight');
   ok(r.prevented === true && ab.classList.contains('chat-tab--active'), 'ArrowRight -> artifact active + prevented');
   r = env.fireKeydown(ab, 'ArrowLeft');
   ok(r.prevented === true && tb.classList.contains('chat-tab--active'), 'ArrowLeft -> tool active + prevented');
   r = env.fireKeydown(tb, 'End');
-  ok(r.prevented === true && ab.classList.contains('chat-tab--active'), 'End -> artifact active');
-  r = env.fireKeydown(ab, 'Home');
+  ok(r.prevented === true && rb.classList.contains('chat-tab--active'), 'End -> run (third tab) active');
+  r = env.fireKeydown(rb, 'Home');
   ok(r.prevented === true && tb.classList.contains('chat-tab--active'), 'Home -> tool active');
 
   // 5. renderArtifactPanel 有会话+items：send 触发 ensureSession -> 加载 -> renderer -> nav
@@ -4253,6 +4360,1253 @@ async function testSkillPicker() {
   }
 }
 
+// ===========================================================================
+// T5(Run footer): 对话 Turn 底部 Run 轻量入口（结果 · 耗时 · 工具 + 详情/Trace）
+// ===========================================================================
+function _messageFooters(env) {
+  return _collectByClass(env.messageStack, 'chat-run-footer');
+}
+function _runFooters(env) {
+  return _messageFooters(env).filter((footer) => _runFooterLinks(footer).some(
+    (link) => link.getAttribute('aria-label') === '查看执行详情'
+  ));
+}
+function _runFooterLinks(footer) {
+  return footer && typeof footer.querySelectorAll === 'function' ? footer.querySelectorAll('a') : [];
+}
+function _runFooterTraceLink(footer) {
+  return _runFooterLinks(footer).find((a) => a.getAttribute('aria-label') === '查看 Trace') || null;
+}
+async function _settle(env, n) { for (let i = 0; i < (n || 10); i++) await env.waitMicro(); }
+function _runRow(overrides) {
+  return Object.assign({
+    id: 'run-1', session_id: 's1', status: 'completed', source: 'dashboard',
+    execution_kind: 'chat', started_at: 1000, ended_at: 1018, end_reason: 'stop',
+    error: null, tool_call_count: 3,
+  }, overrides || {});
+}
+// 建会话并选中：使 currentSessionId 就绪（footer 批次逻辑依赖当前会话归属校验）
+async function _prepareSession(env, id, messages) {
+  sessionsList = [{ id, title: id }];
+  env.win.NAGENT.api.getSessionDetail = () => Promise.resolve({ session: { id }, messages, summary: null, task_state: null });
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem(id));
+  await _settle(env);
+}
+
+// --- 渲染范围 / 状态映射 / 耗时与计数格式 / 失败降级 ---
+async function testRunFooterRenderAndFormat() {
+  // 通用 footer：user/system/assistant 均有气泡外时间；无 Run 身份不显示操作，无时间不补造。
+  const genericEnv = loadChat();
+  genericEnv.setListSessionRunsHandler(() => Promise.resolve([]));
+  await _prepareSession(genericEnv, 's-generic', [
+    { id: 'gu', role: 'user', content: '问', created_at: '2020-01-01T00:00:00Z' },
+    { id: 'gs', role: 'system', name: 'ui.notice', content: '系统', created_at: '2020-01-01T00:00:01Z' },
+    { id: 'ga', role: 'assistant', content: '流式片段', created_at: null },
+  ]);
+  const genericFooters = _messageFooters(genericEnv);
+  ok(genericFooters.length === 3, 'all message bubble types receive generic footer');
+  ok(genericFooters[0].querySelector('.chat-run-footer__time').textContent === '2020/1/1 08:00'
+    && genericFooters[1].querySelector('.chat-run-footer__time').textContent !== '',
+    'user and system timestamps render in footer using UTC+8');
+  ok(genericFooters[2].querySelector('.chat-run-footer__time').textContent === '',
+    'transient message without created_at does not invent timestamp');
+  ok(_runFooters(genericEnv).length === 0, 'generic footers do not invent Run actions');
+
+  // 1. 仅 assistant+run_id 渲染 Run 操作；同 Run 多消息各一个操作组
+  let env = loadChat();
+  const msgs2 = [
+    { id: 'm1', role: 'user', content: '问题' },
+    { id: 'm2', role: 'assistant', content: '回答一', run_id: 'run-1', created_at: '2020-01-01T00:00:00Z' },
+    { id: 'm3', role: 'assistant', content: '回答二', run_id: 'run-1' },
+    { id: 'm4', role: 'assistant', content: '无身份' },
+    { id: 'm5', role: 'system', name: 'ui.task_lifecycle', content: '[任务状态] 运行' },
+  ];
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+  env.setGetSessionRunHandler(() => Promise.resolve(_runRow({ id: 'run-1', trace_links: [] })));
+  await _prepareSession(env, 's1', msgs2);
+  let footers = _runFooters(env);
+  ok(footers.length === 2, 'same run on 2 assistant messages -> exactly 2 footers (got ' + footers.length + ')');
+  const f0 = footers[0];
+  const bubble = env.messageStack.querySelector('.msg.assistant');
+  ok(!!bubble && bubble.parentNode === f0.parentNode && bubble.parentNode.classList.contains('chat-turn')
+    && bubble.parentNode !== env.messageStack,
+    'footer is outside assistant bubble in a shared turn wrapper');
+  ok(f0 && f0.querySelector('.chat-run-footer__time').textContent === '2020/1/1 08:00'
+    && f0.textContent.indexOf('已完成') === -1 && f0.textContent.indexOf('18秒') === -1
+    && f0.textContent.indexOf('工具调用') === -1 && _runFooterLinks(f0).length === 1,
+    'Run reconciliation preserves timestamp and shows no visible run metadata');
+  const detailAction = _runFooterLinks(f0)[0];
+  ok(detailAction.getAttribute('aria-label') === '查看执行详情'
+    && detailAction.getAttribute('title') === '详情'
+    && !!detailAction.querySelector('svg'),
+    'Details icon has accessible label, native hover tooltip and SVG');
+  ok(footers[1] && _runFooterLinks(footers[1]).length === 1, 'same-run footers keep identical icon-only actions');
+  ok(_collectByClass(env.messageStack, 'msg').filter((m) => m.className.indexOf('user') !== -1
+    && _collectByClass(m, 'chat-run-footer').length).length === 0, 'user message has no footer');
+
+  // 2. 重复刷新：每消息最多一个 footer
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: msgs2, summary: null, task_state: null });
+  await _settle(env);
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: msgs2, summary: null, task_state: null }, { partialMessages: true });
+  await _settle(env);
+  ok(_runFooters(env).length === 2, 'repeat refresh keeps one footer per message (got ' + _runFooters(env).length + ')');
+
+  // 3. 状态全映射及未知
+  env = loadChat();
+  let statusRow = _runRow({ id: 'r', status: 'completed' });
+  env.setListSessionRunsHandler(() => Promise.resolve([statusRow]));
+  env.setGetSessionRunHandler(() => Promise.resolve(statusRow));
+  const statusMsgs = [{ id: 'm', role: 'assistant', content: '回复', run_id: 'r' }];
+  await _prepareSession(env, 's1', statusMsgs);
+  const statusCases = [
+    ['completed', '已完成'], ['failed', '失败'], ['cancelled', '已取消'], ['interrupted', '已中断'],
+    ['running', '运行中'], ['pending', '运行中'], ['not_started', '未开始'], ['mystery', '未知'],
+  ];
+  for (const [status, label] of statusCases) {
+    statusRow = _runRow({ id: 'r', status });
+    await env.chat.applySessionDetail({ session: { id: 's1' }, messages: statusMsgs, summary: null, task_state: null });
+    await _settle(env);
+    const fs = _runFooters(env);
+    ok(fs.length === 1 && fs[0].textContent.trim() === '' && fs[0].textContent.indexOf(label) === -1,
+      'status ' + status + ' remains out of icon-only footer');
+  }
+
+  // 4. 耗时（Unix 秒差取整 / 零 / 倒序 / 非法 / 非有限）与计数（0/正数/缺失/负数/分数/Infinity/NaN/字符串）
+  env = loadChat();
+  let fmtRow = _runRow({ id: 'r' });
+  env.setListSessionRunsHandler(() => Promise.resolve([fmtRow]));
+  env.setGetSessionRunHandler(() => Promise.resolve(fmtRow));
+  const fmtMsgs = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'r' }];
+  await _prepareSession(env, 's1', fmtMsgs);
+  const noCount = _runRow({ id: 'r' });
+  delete noCount.tool_call_count;
+  const fmtCases = [
+    [_runRow({ id: 'r', started_at: 1000, ended_at: 1018.9, tool_call_count: 2 }), '18秒', '工具调用 2 次'],
+    [_runRow({ id: 'r', started_at: 1000, ended_at: 1000, tool_call_count: 0 }), '0秒', '未调用工具'],
+    [_runRow({ id: 'r', started_at: 1010, ended_at: 1000, tool_call_count: 1 }), '—', '工具调用 1 次'],
+    [_runRow({ id: 'r', started_at: null, ended_at: 1000, tool_call_count: 1 }), '—', '工具调用 1 次'],
+    [_runRow({ id: 'r', started_at: 1000, ended_at: null, tool_call_count: 1 }), '—', '工具调用 1 次'],
+    [_runRow({ id: 'r', started_at: '1000', ended_at: 1000, tool_call_count: 1 }), '—', '工具调用 1 次'],
+    [_runRow({ id: 'r', started_at: NaN, ended_at: 1000, tool_call_count: 1 }), '—', '工具调用 1 次'],
+    [_runRow({ id: 'r', started_at: Infinity, ended_at: Infinity, tool_call_count: 1 }), '—', '工具调用 1 次'],
+    [_runRow({ id: 'r', tool_call_count: '3' }), '18秒', '工具调用数未知'],
+    [_runRow({ id: 'r', tool_call_count: 1.5 }), '18秒', '工具调用数未知'],
+    [_runRow({ id: 'r', tool_call_count: -1 }), '18秒', '工具调用数未知'],
+    [_runRow({ id: 'r', tool_call_count: NaN }), '18秒', '工具调用数未知'],
+    [_runRow({ id: 'r', tool_call_count: Infinity }), '18秒', '工具调用数未知'],
+    [noCount, '18秒', '工具调用数未知'],
+  ];
+  for (const [row, dur, tool] of fmtCases) {
+    fmtRow = row;
+    await env.chat.applySessionDetail({ session: { id: 's1' }, messages: fmtMsgs, summary: null, task_state: null });
+    await _settle(env);
+    const fs = _runFooters(env);
+    const text = fs[0] ? fs[0].textContent : '';
+    ok(text.trim() === '' && text.indexOf(dur) === -1 && text.indexOf(tool) === -1,
+      'duration/tool formatting does not leak into icon-only footer');
+  }
+
+  // 5. 初次失败隐藏；恢复渲染；刷新失败保留快照；成功空列表清除；列表持续失败时详情兜底
+  env = loadChat();
+  let listFail = true;
+  let detailFail = true;
+  const oneMsg = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'r' }];
+  env.setListSessionRunsHandler(() => listFail ? Promise.reject(new Error('boom')) : Promise.resolve([_runRow({ id: 'r' })]));
+  env.setGetSessionRunHandler(() => detailFail ? Promise.reject(new Error('boom')) : Promise.resolve(_runRow({ id: 'r', trace_links: [] })));
+  await _prepareSession(env, 's1', oneMsg);
+  ok(_runFooters(env).length === 0, 'first list+detail failure hides footer (got ' + _runFooters(env).length + ')');
+  listFail = false;
+  detailFail = false;
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: oneMsg, summary: null, task_state: null });
+  await _settle(env);
+  ok(_runFooters(env).length === 1, 'recovered batch renders footer');
+  const snapshotText = _runFooters(env)[0].textContent;
+  listFail = true;
+  detailFail = true;
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: oneMsg, summary: null, task_state: null });
+  await _settle(env);
+  ok(_runFooters(env).length === 1 && _runFooters(env)[0].textContent === snapshotText,
+    'refresh failure keeps last snapshot footer (got ' + JSON.stringify(_runFooters(env)[0] && _runFooters(env)[0].textContent) + ')');
+  env.setListSessionRunsHandler(() => Promise.resolve([]));
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: oneMsg, summary: null, task_state: null });
+  await _settle(env);
+  ok(_runFooters(env).length === 0, 'successful empty list clears orphan footer (got ' + _runFooters(env).length + ')');
+  // 列表首次失败（无成功快照）时详情快照兜底渲染；新 env 避免上一成功空列表快照干扰
+  env = loadChat();
+  env.setListSessionRunsHandler(() => Promise.reject(new Error('boom')));
+  env.setGetSessionRunHandler(() => Promise.resolve(_runRow({ id: 'r', trace_links: [] })));
+  const oneMsg2 = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'r' }];
+  await _prepareSession(env, 's1', oneMsg2);
+  ok(_runFooters(env).length === 1, 'list first failure: detail snapshot renders footer (got ' + _runFooters(env).length + ')');
+}
+
+// --- 直播：终结 chunk 身份捕获 / 强制刷新 / 无身份不猜测 ---
+async function testRunFooterLiveCapture() {
+  // 终结 chunk 携带 run_id → 强制 getSessionRun，陈旧 running 缓存不可代替请求
+  let env = loadChat();
+  sessionsList = [];
+  let detailMsgs = [];
+  let sessionDetailCalls = 0;
+  env.win.NAGENT.api.getSessionDetail = () => {
+    sessionDetailCalls++;
+    return Promise.resolve({ session: { id: createdSessionId }, messages: detailMsgs, summary: null, task_state: null });
+  };
+  let listRows = [];
+  env.setListSessionRunsHandler(() => Promise.resolve(listRows));
+  let detailRow = _runRow({ id: 'run-live', status: 'running', ended_at: null, tool_call_count: 1 });
+  let runDetailCalls = 0;
+  env.setGetSessionRunHandler(() => { runDetailCalls++; return Promise.resolve(detailRow); });
+
+  // 第一轮：终结 chunk 不带 run_id（旧形态）→ 仅消息重载；批次把 running 快照写入缓存
+  detailMsgs = [
+    { id: 'u1', role: 'user', content: '第一问' },
+    { id: 'a1', role: 'assistant', content: '第一答', run_id: 'run-live' },
+  ];
+  listRows = [_runRow({ id: 'run-live', status: 'running', ended_at: null, tool_call_count: 1 })];
+  env.input.value = '第一问';
+  const textChunk = 'data: ' + JSON.stringify({ choices: [{ delta: { content: '第一答' } }] }) + '\n\n';
+  const doneNoId = 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n';
+  env.enqueueSseChunks([textChunk, doneNoId]);
+  await env.chat.send();
+  await _settle(env);
+  ok(runDetailCalls === 1, 'turn1: batch queued one detail request for running row (got ' + runDetailCalls + ')');
+  let footers = _runFooters(env);
+  ok(footers.length === 1 && footers[0].dataset.runId === 'run-live' && footers[0].textContent.trim() === '',
+    'turn1: running list row still produces icon-only footer');
+  const callsAfterTurn1 = runDetailCalls;
+  // 非终态详情跨批次重排：新批次重新请求 running Run（终态缓存才跳过）
+  await env.chat.applySessionDetail({ session: { id: createdSessionId }, messages: detailMsgs, summary: null, task_state: null });
+  await _settle(env);
+  ok(runDetailCalls === callsAfterTurn1 + 1,
+    'non-terminal detail requeued on next batch (got ' + runDetailCalls + ', want ' + (callsAfterTurn1 + 1) + ')');
+
+  // 第二轮：终结 chunk 携带 run_id → 强制刷新（缓存命中也不替代请求）→ 完成态覆盖
+  detailRow = _runRow({ id: 'run-live', status: 'completed', ended_at: 1018, tool_call_count: 4 });
+  env.input.value = '第二问';
+  const doneWithId = 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], run_id: 'run-live' }) + '\n\n';
+  env.enqueueSseChunks([textChunk, doneWithId]);
+  await env.chat.send();
+  await _settle(env);
+  ok(runDetailCalls > callsAfterTurn1, 'terminal chunk with run_id forces fresh getSessionRun (stale running cache not reused)');
+  footers = _runFooters(env);
+  ok(footers.length === 1 && footers[0].dataset.runId === 'run-live' && footers[0].textContent.trim() === '',
+    'turn2: forced refresh preserves matched icon-only footer');
+  ok(sessionDetailCalls >= 2, 'stream end reloads persisted messages (got ' + sessionDetailCalls + ')');
+
+  // 中途 chunk run_id 不捕获；ERROR 无身份不猜测（仅重载）
+  env = loadChat();
+  sessionsList = [];
+  let reloads2 = 0;
+  env.win.NAGENT.api.getSessionDetail = () => {
+    reloads2++;
+    return Promise.resolve({ session: { id: createdSessionId }, messages: [], summary: null, task_state: null });
+  };
+  env.setListSessionRunsHandler(() => Promise.resolve([]));
+  let runDetailCalls2 = 0;
+  env.setGetSessionRunHandler(() => { runDetailCalls2++; return Promise.resolve(_runRow({ id: 'x' })); });
+  const midWithId = 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: '部分' } }], run_id: 'run-x' }) + '\n\n';
+  const errNoId = 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: 'err' }, finish_reason: 'error' }] }) + '\n\n';
+  env.input.value = 'hi';
+  env.enqueueSseChunks([midWithId, errNoId]);
+  await env.chat.send();
+  await _settle(env);
+  ok(runDetailCalls2 === 0, 'mid-stream/ERROR without identity: no guessed getSessionRun (got ' + runDetailCalls2 + ')');
+  ok(reloads2 >= 1, 'error stream end still reloads messages (got ' + reloads2 + ')');
+
+  // 断连（fetch reject）：无身份仅重载
+  env = loadChat();
+  sessionsList = [];
+  let reloads3 = 0;
+  env.win.NAGENT.api.getSessionDetail = () => {
+    reloads3++;
+    return Promise.resolve({ session: { id: createdSessionId }, messages: [], summary: null, task_state: null });
+  };
+  env.setListSessionRunsHandler(() => Promise.resolve([]));
+  let runDetailCalls3 = 0;
+  env.setGetSessionRunHandler(() => { runDetailCalls3++; return Promise.resolve(_runRow({ id: 'x' })); });
+  env.setFetchHandler('/chat/completions', () => Promise.reject(new Error('network_failed')));
+  env.input.value = 'hi';
+  await env.chat.send();
+  await _settle(env);
+  ok(runDetailCalls3 === 0, 'disconnected stream without identity: no getSessionRun (got ' + runDetailCalls3 + ')');
+  ok(reloads3 >= 1, 'disconnected stream end reloads messages (got ' + reloads3 + ')');
+}
+
+// --- 会话 A→B→A / 删除 / 旧批次迟到 ---
+async function testRunFooterSessionIsolation() {
+  let env = loadChat();
+  let resolveAList = null;
+  let aListCalls = 0;
+  env.setListSessionRunsHandler((id) => {
+    if (id === 'sA') {
+      aListCalls++;
+      if (aListCalls === 1) return new Promise((res) => { resolveAList = res; });
+      return Promise.resolve([_runRow({ id: 'run-a' })]);
+    }
+    return Promise.resolve([_runRow({ id: 'run-b', status: 'failed', ended_at: 1020, tool_call_count: 0, error: 'x' })]);
+  });
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({
+    id: runId, status: runId === 'run-a' ? 'completed' : 'failed', ended_at: 1019, trace_links: [],
+  })));
+  sessionsList = [{ id: 'sA', title: 'sA' }, { id: 'sB', title: 'sB' }];
+  env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({
+    session: { id },
+    messages: [{ id: 'm-' + id, role: 'assistant', content: 'x', run_id: id === 'sA' ? 'run-a' : 'run-b' }],
+    summary: null, task_state: null,
+  });
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem('sA'));
+  await _settle(env, 4);
+  env.fireClick(env.findSessionItem('sB'));
+  await _settle(env);
+  let footers = _runFooters(env);
+  ok(footers.length === 1 && footers[0].dataset.runId === 'run-b',
+    'switch to B before A list resolves: B footer identity correct');
+  if (resolveAList) resolveAList([_runRow({ id: 'run-a' })]);
+  await _settle(env);
+  footers = _runFooters(env);
+  ok(footers.length === 1 && footers[0].dataset.runId === 'run-b',
+    'late A list resolution does not corrupt B footer identity');
+  env.fireClick(env.findSessionItem('sA'));
+  await _settle(env);
+  footers = _runFooters(env);
+  ok(footers.length === 1 && footers[0].dataset.runId === 'run-a',
+    'switch back to A renders A footer identity');
+
+  // 迟到详情不串台；删除当前会话清 footer 并使批次失效
+  env = loadChat();
+  let resolveBDetail = null;
+  env.setListSessionRunsHandler((id) => Promise.resolve([_runRow({ id: id === 'sB' ? 'run-b' : 'run-c' })]));
+  env.setGetSessionRunHandler((id, runId) => {
+    if (runId === 'run-b') return new Promise((res) => { resolveBDetail = res; });
+    return Promise.resolve(_runRow({ id: runId, trace_links: [] }));
+  });
+  sessionsList = [{ id: 'sB', title: 'sB' }, { id: 'sC', title: 'sC' }];
+  env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({
+    session: { id },
+    messages: [{ id: 'm-' + id, role: 'assistant', content: 'x', run_id: id === 'sB' ? 'run-b' : 'run-c' }],
+    summary: null, task_state: null,
+  });
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem('sB'));
+  await _settle(env, 4);
+  env.fireClick(env.findSessionItem('sC'));
+  await _settle(env);
+  let footers2 = _runFooters(env);
+  ok(footers2.length === 1 && footers2[0].dataset.runId === 'run-c',
+    'C footer from own row identity');
+  if (resolveBDetail) resolveBDetail(_runRow({ id: 'run-b', status: 'cancelled' }));
+  await _settle(env);
+  footers2 = _runFooters(env);
+  ok(footers2.length === 1 && footers2[0].dataset.runId === 'run-c',
+    'late B detail does not corrupt C footer identity');
+  env.win.NAGENT.modal.confirm = () => Promise.resolve(true);
+  env.setDeleteSessionHandler(() => Promise.resolve({}));
+  // 定位当前会话（sC）条目内的删除按钮，避免误删其他会话
+  let delBtn = null;
+  for (const it of env.document.querySelectorAll('.session-item')) {
+    if (!(it.dataset && it.dataset.sessionId === 'sC')) continue;
+    delBtn = (function visit(n) {
+      for (const c of (n._kids || [])) {
+        if (c.tagName === 'BUTTON' && c.getAttribute('aria-label') === '删除会话') return c;
+        const r = visit(c);
+        if (r) return r;
+      }
+      return null;
+    })(it);
+    break;
+  }
+  ok(!!delBtn, 'delete button found for current session');
+  if (delBtn) {
+    delBtn.click();
+    await _settle(env);
+    ok(_runFooters(env).length === 0, 'deleting current session clears footers (got ' + _runFooters(env).length + ')');
+  }
+}
+
+// --- Trace：队列去重/并发上限/排序筛选/配置状态/URL 合同 ---
+async function testRunFooterTraceAndQueue() {
+  // 有界队列：并发上限 4、同 Run 去重、完成后补位
+  let env = loadChat();
+  const runIds = ['r1', 'r2', 'r3', 'r4', 'r5', 'r6'];
+  const queueMsgs = runIds.map((rid, i) => ({ id: 'm' + i, role: 'assistant', content: 'x' + i, run_id: rid }));
+  queueMsgs.push({ id: 'm-dup', role: 'assistant', content: 'dup', run_id: 'r1' });
+  let inflight = 0;
+  let maxInflight = 0;
+  let started = [];
+  const resolvers = {};
+  const done = {};
+  env.setGetSessionRunHandler((id, runId) => {
+    started.push(runId);
+    inflight++;
+    maxInflight = Math.max(maxInflight, inflight);
+    return new Promise((res) => {
+      resolvers[runId] = () => {
+        if (done[runId]) return;
+        done[runId] = true;
+        inflight--;
+        res(_runRow({ id: runId, trace_links: [] }));
+      };
+    });
+  });
+  env.setListSessionRunsHandler(() => Promise.resolve(runIds.map((rid) => _runRow({ id: rid }))));
+  await _prepareSession(env, 's1', queueMsgs);
+  await _settle(env, 6);
+  ok(started.length === 4, 'bounded queue starts exactly 4 detail requests (got ' + started.length + ')');
+  ok(maxInflight <= 4, 'concurrency bounded at 4 (got ' + maxInflight + ')');
+  ok(started.filter((r) => r === 'r1').length === 1, 'same run from multiple messages merged into one request');
+  resolvers.r1();
+  resolvers.r2();
+  await _settle(env, 4);
+  ok(started.length === 6, 'completed requests release queue slots (got ' + started.length + ')');
+  ok(maxInflight <= 4, 'still bounded after refill (got ' + maxInflight + ')');
+  Object.keys(resolvers).forEach((k) => resolvers[k]());
+  await _settle(env, 6);
+  ok(_runFooters(env).length === 7, 'all candidate messages have footers (got ' + _runFooters(env).length + ')');
+
+  // Trace 排序/筛选/首条 + 空关联降级 + 不借用邻近 Run + 无需点击详情
+  env = loadChat();
+  const ID_UPPER = 'A1'.repeat(16);
+  const ID_LOWER = 'a1'.repeat(16);
+  const ID_OTHER = 'b2'.repeat(16);
+  const ID_ZERO = '0'.repeat(32);
+  const detailByRun = {
+    'run-t': _runRow({ id: 'run-t', trace_links: [
+      { trace_id: ID_OTHER, created_at: '2026-01-02T00:00:00Z', id: 'l2' },
+      { trace_id: 'ZZZ-not-hex', created_at: '2026-01-01T00:00:00Z', id: 'l0' },
+      { trace_id: ID_UPPER, created_at: '2026-01-01T00:00:00Z', id: 'l1' },
+      { trace_id: ID_ZERO, created_at: '2026-01-03T00:00:00Z', id: 'l3' },
+    ] }),
+    'run-e': _runRow({ id: 'run-e', trace_links: [] }),
+  };
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(detailByRun[runId] || _runRow({ id: runId, trace_links: [] })));
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-t' }), _runRow({ id: 'run-e' })]));
+  env.setGetOtelLinksHandler(() => Promise.resolve({ config: { trace_base_url: 'https://grafana.example/grafana/explore?orgId=1' }, version: 1, overridden_fields: [] }));
+  const tMsgs = [
+    { id: 'mt', role: 'assistant', content: 't', run_id: 'run-t' },
+    { id: 'me', role: 'assistant', content: 'e', run_id: 'run-e' },
+  ];
+  await _prepareSession(env, 's1', tMsgs);
+  const tf = _runFooters(env);
+  ok(tf.length === 2, 'two footers rendered (got ' + tf.length + ')');
+  const traceLink = _runFooterTraceLink(tf[0]);
+  ok(!!traceLink, 'Trace link appears without clicking 详情 (got footer ' + JSON.stringify(tf[0] && tf[0].textContent) + ')');
+  ok(traceLink && traceLink.getAttribute('aria-label') === '查看 Trace'
+    && traceLink.getAttribute('title') === 'Trace' && !!traceLink.querySelector('svg'),
+    'Trace icon has accessible label, native hover tooltip and SVG');
+  const href = traceLink ? traceLink.href : '';
+  ok(href.indexOf(encodeURIComponent(ID_LOWER)) !== -1 && href.indexOf(ID_UPPER) === -1,
+    'trace id normalized to lowercase in link (got ' + href + ')');
+  ok(href.indexOf('traceql') !== -1 && href.indexOf('nagent-tempo') !== -1, 'link carries traceql panes with nagent-tempo datasource');
+  ok(href.indexOf(encodeURIComponent('ZZZ-not-hex')) === -1 && href.indexOf(encodeURIComponent(ID_ZERO)) === -1
+    && href.indexOf(encodeURIComponent(ID_OTHER)) === -1, 'invalid/all-zero/other-run trace ids absent');
+  const ef = tf[1];
+  ok(ef && ef.textContent.trim() === '' && !_runFooterTraceLink(ef),
+    'empty valid links omit Trace action without footer text');
+  ok(traceLink && traceLink.target === '_blank' && traceLink.rel === 'noopener', 'Trace link opens new window with noopener');
+
+  // 配置失败重试 / 配置更新 / 未配置
+  env = loadChat();
+  let otelFail = true;
+  let baseUrl = 'https://grafana.example/grafana/explore?orgId=1';
+  env.setGetOtelLinksHandler(() => otelFail ? Promise.reject(new Error('cfg')) : Promise.resolve({ config: { trace_base_url: baseUrl } }));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [{ trace_id: ID_LOWER, created_at: '2026-01-01T00:00:00Z', id: 'l1' }] })));
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'r1' })]));
+  const oneMsg = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'r1' }];
+  await _prepareSession(env, 's1', oneMsg);
+  let cf = _runFooters(env)[0];
+  ok(cf && cf.textContent.trim() === '' && !_runFooterTraceLink(cf),
+    'config failure omits Trace action without footer text');
+  otelFail = false;
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: oneMsg, summary: null, task_state: null });
+  await _settle(env);
+  cf = _runFooters(env)[0];
+  const link1 = _runFooterTraceLink(cf);
+  ok(!!link1, 'next batch retries config -> Trace link appears (got ' + JSON.stringify(cf && cf.textContent) + ')');
+  baseUrl = 'https://grafana2.example/explore?orgId=7';
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: oneMsg, summary: null, task_state: null });
+  await _settle(env);
+  const link2 = _runFooterTraceLink(_runFooters(env)[0]);
+  ok(!!link2 && link2.href !== (link1 && link1.href) && link2.href.indexOf('grafana2.example') !== -1,
+    'config update picked up on next batch (got ' + (link2 && link2.href) + ')');
+  env.setGetOtelLinksHandler(() => Promise.resolve({ config: {} }));
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: oneMsg, summary: null, task_state: null });
+  await _settle(env);
+  cf = _runFooters(env)[0];
+  ok(cf && cf.textContent.trim() === '' && !_runFooterTraceLink(cf),
+    'valid links without base url omit Trace action without footer text');
+
+  // buildTraceUrl 合同：与 tests/e2e/result_report.py::trace_url 一致
+  const btu = env.chat.buildTraceUrl;
+  ok(typeof btu === 'function', 'buildTraceUrl exposed');
+  const tid = 'ABCDEF0123456789ABCDEF0123456789';
+  const base = 'http://grafana.example/grafana/explore?orgId=1&left=%7Bold%7D&panes=%7Bold%7D&schemaVersion=9&panes=dup#frag';
+  const panesJson = JSON.stringify({ trace: {
+    datasource: 'nagent-tempo',
+    queries: [{ refId: 'A', queryType: 'traceql', query: tid.toLowerCase(), datasource: { type: 'tempo', uid: 'nagent-tempo' } }],
+    range: { from: 'now-1h', to: 'now' },
+  } });
+  const expected = 'http://grafana.example/grafana/explore?orgId=1&schemaVersion=1&panes=' + encodeURIComponent(panesJson);
+  ok(btu(base, tid) === expected, 'trace url mirrors result_report.py::trace_url (got ' + btu(base, tid) + ')');
+  ok(btu('https://h/p', '0'.repeat(32)) === null, 'all-zero trace id rejected');
+  ok(btu('https://h/p', 'abc') === null, 'short trace id rejected');
+  ok(btu('https://h/p', 'zzz' + 'f'.repeat(29)) === null, 'non-hex trace id rejected');
+  ok(btu('ftp://h/p', tid) === null, 'non-http(s) base rejected');
+  ok(btu('http://user:pass@h/p', tid) === null, 'userinfo base rejected');
+  ok(btu('not a url', tid) === null, 'unparsable base rejected');
+  ok(btu('', tid) === null, 'empty base rejected');
+  const got2 = btu('https://g.example/o/org-9/grafana/explore?orgId=9', 'B'.repeat(32));
+  ok(!!got2 && got2.indexOf('https://g.example/o/org-9/grafana/explore') === 0
+    && got2.indexOf('explore/explore') === -1 && got2.indexOf('#') === -1 && got2.indexOf('orgId=9') !== -1,
+    'subpath/orgId preserved, no explore append, hash cleared (got ' + got2 + ')');
+}
+
+// --- 批次并行：runs 请求在消息渲染完成前发起；迟到消息仍触发对账 ---
+async function testRunFooterBatchParallelPrefetch() {
+  const env = loadChat();
+  let stackMsgCountAtListFetch = -1;
+  env.setListSessionRunsHandler(() => {
+    // 在请求发起时刻记录消息栈状态：批次先于渲染开启时该值为 0
+    stackMsgCountAtListFetch = _collectByClass(env.messageStack, 'msg').length;
+    return Promise.resolve([_runRow({ id: 'run-p', trace_links: [] })]);
+  });
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  let releaseDetail = null;
+  const gate = new Promise((res) => { releaseDetail = res; });
+  env.win.NAGENT.api.getSessionDetail = () => gate.then(() => Promise.resolve({
+    session: { id: 's1' },
+    messages: [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-p' }],
+    summary: null, task_state: null,
+  }));
+  sessionsList = [{ id: 's1', title: 's1' }];
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem('s1'));
+  await env.waitMicro();
+  ok(env.getListSessionRunsCalls().length === 0,
+    'runs fetch waits for session detail resolution before batch start (got ' + env.getListSessionRunsCalls().length + ')');
+  releaseDetail();
+  await _settle(env);
+  ok(stackMsgCountAtListFetch === 0,
+    'runs list fetch initiated before message rendering completes (msg nodes at fetch time: ' + stackMsgCountAtListFetch + ')');
+  ok(_runFooters(env).length === 1, 'late-arrival reconcile still renders footer (got ' + _runFooters(env).length + ')');
+}
+
+// --- 账本未注入：无 listSessionRuns/getSessionRun/getOtelLinks 时对话行为完全不变 ---
+async function testRunFooterLedgerAbsent() {
+  const env = loadChat();
+  delete env.win.NAGENT.api.listSessionRuns;
+  delete env.win.NAGENT.api.getSessionRun;
+  delete env.win.NAGENT.api.getOtelLinks;
+  let toolCallsCalls = 0;
+  const baseToolCalls = env.win.NAGENT.api.getSessionToolCalls;
+  env.win.NAGENT.api.getSessionToolCalls = () => { toolCallsCalls++; return baseToolCalls(); };
+  await _prepareSession(env, 's1', [
+    { id: 'm1', role: 'user', content: '问' },
+    { id: 'm2', role: 'assistant', content: '答' },
+  ]);
+  ok(_runFooters(env).length === 0, 'ledger absent: zero footers (got ' + _runFooters(env).length + ')');
+  const bubbleCount = _collectByClass(env.messageStack, 'msg').length;
+  ok(bubbleCount === 2, 'ledger absent: messages render normally (got ' + bubbleCount + ')');
+  ok(toolCallsCalls >= 1, 'ledger absent: tool-calls loading still works (got ' + toolCallsCalls + ')');
+  let threw = null;
+  try {
+    await env.chat.applySessionDetail({ session: { id: 's1' }, messages: [{ id: 'm2', role: 'assistant', content: '答' }], summary: null, task_state: null });
+    await _settle(env);
+  } catch (error) { threw = error; }
+  ok(!threw, 'ledger absent: session refresh does not throw' + (threw ? ' (' + threw.message + ')' : ''));
+  ok(_runFooters(env).length === 0, 'ledger absent: still zero footers after refresh');
+  // 直播路径：终结 chunk 携带 run_id 但账本 API 缺失，收尾不得抛错、不得尝试详情请求
+  let threwSend = null;
+  env.input.value = 'hi';
+  env.enqueueSseChunks(['data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: 'x' }, finish_reason: 'stop' }], run_id: 'run-x' }) + '\n\n']);
+  try { await env.chat.send(); await _settle(env); } catch (error) { threwSend = error; }
+  ok(!threwSend, 'ledger absent: live stream completion does not throw' + (threwSend ? ' (' + threwSend.message + ')' : ''));
+  ok(_runFooters(env).length === 0, 'ledger absent: no footer after live stream');
+}
+
+// --- 详情队列韧性：force 抢占在途请求（去重窗口完好）+ reconcile 抛错不死锁 ---
+async function testRunFooterDetailQueueResilience() {
+  // (a) force 抢占：陈旧响应不误删新 holder、不发重复请求、getRunDetail 以新数据结算
+  let env = loadChat();
+  let calls = [];
+  let releaseA = null;
+  const gateA = new Promise((res) => { releaseA = res; });
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-s', status: 'running', ended_at: null })]));
+  env.setGetSessionRunHandler((id, runId) => {
+    calls.push(runId);
+    if (calls.length === 1) return gateA.then(() => _runRow({ id: runId, status: 'running', ended_at: null }));
+    return Promise.resolve(_runRow({ id: runId, status: 'completed', ended_at: 1018 }));
+  });
+  await _prepareSession(env, 's1', [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-s' }]);
+  ok(calls.length === 1, 'supersede: initial detail request issued (got ' + calls.length + ')');
+  const forcedPromise = env.chat.getRunDetail('s1', 'run-s', { force: true });
+  await env.waitMicro();
+  ok(calls.length === 2, 'supersede: forced request issued while old one still in flight (got ' + calls.length + ')');
+  releaseA();
+  const freshRow = await forcedPromise;
+  await _settle(env);
+  ok(calls.length === 2, 'supersede: no duplicate request after stale resolution (got ' + calls.length + ')');
+  ok(!!freshRow && freshRow.status === 'completed',
+    'getRunDetail resolves with fresh forced row (got ' + JSON.stringify(freshRow && freshRow.status) + ')');
+  const sf = _runFooters(env);
+  ok(sf.length === 1 && sf[0].dataset.runId === 'run-s' && sf[0].textContent.trim() === '',
+    'supersede: fresh forced data retains icon-only footer');
+
+  // (b) reconcile 抛错一次：finally 仍释放槽位并补位，队列不死锁
+  env = loadChat();
+  const runIds2 = ['q1', 'q2', 'q3', 'q4', 'q5', 'q6'];
+  const resolvers2 = {};
+  let inflightCalls = [];
+  env.setGetSessionRunHandler((id, runId) => {
+    inflightCalls.push(runId);
+    return new Promise((res) => { resolvers2[runId] = () => res(_runRow({ id: runId, trace_links: [] })); });
+  });
+  env.setListSessionRunsHandler(() => Promise.resolve(runIds2.map((rid) => _runRow({ id: rid }))));
+  const qMsgs = runIds2.map((rid, i) => ({ id: 'q' + i, role: 'assistant', content: 'x', run_id: rid }));
+  await _prepareSession(env, 's1', qMsgs);
+  await _settle(env, 4);
+  ok(inflightCalls.length === 4, 'resilience: queue starts 4 requests (got ' + inflightCalls.length + ')');
+  // 仅下一次 reconcile 抛错：reconcile 是唯一对 messageStack 调 querySelectorAll('.msg.assistant') 的代码
+  const qStack = env.messageStack;
+  const origQSA = qStack.querySelectorAll;
+  let reconcileThrew = false;
+  qStack.querySelectorAll = function (sel) {
+    if (!reconcileThrew && sel === '.msg.assistant') { reconcileThrew = true; throw new Error('reconcile-boom'); }
+    return origQSA.call(this, sel);
+  };
+  resolvers2.q2();
+  await _settle(env, 4);
+  ok(reconcileThrew, 'resilience: reconcile threw once during detail completion');
+  ok(inflightCalls.length >= 5,
+    'resilience: throw did not deadlock queue, waiting request pumped (got ' + inflightCalls.length + ')');
+  qStack.querySelectorAll = origQSA;
+  Object.keys(resolvers2).forEach((k) => resolvers2[k]());
+  await _settle(env, 8);
+  ok(inflightCalls.length === 6, 'resilience: all queued requests completed (got ' + inflightCalls.length + ')');
+  ok(_runFooters(env).length === 6, 'resilience: footers intact after reconcile throw (got ' + _runFooters(env).length + ')');
+}
+
+// ===========================================================================
+// T6(Run 详情 tab): 点 footer 详情 -> 展开侧栏 + 激活 Run tab + 详情读取归属
+// ===========================================================================
+function _runFooterDetailLink(footer) {
+  return _runFooterLinks(footer).find((a) => a.getAttribute('aria-label') === '查看执行详情') || null;
+}
+function _clickRunDetail(env, footer) {
+  const link = _runFooterDetailLink(footer);
+  ok(!!link, 'footer has 详情 link');
+  if (link) env.fireClick(link);
+}
+function _detailMetaValue(detail, label) {
+  const rows = detail.querySelectorAll('.run-detail__meta-row');
+  for (const row of rows) {
+    const k = row.querySelector('.run-detail__meta-label');
+    const v = row.querySelector('.run-detail__meta-value');
+    if (k && v && k.textContent === label) return v;
+  }
+  return null;
+}
+
+// --- 打开：展开侧栏 / 激活 Run tab / loading 清旧 / 每次打开刷新 / 键盘焦点 ---
+async function testRunFooterDetailOpenAndTabs() {
+  let env = loadChat();
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  await _prepareSession(env, 's1', [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-1' }]);
+  const shell = env.byIdMap['chat-shell'];
+  ok(shell.classList.contains('chat-shell--side-collapsed'), 'sidebar starts collapsed');
+  const runBtn = env.byIdMap['chat-tab-run-button'];
+  const runPanel = env.byIdMap['chat-tab-run'];
+  const toolBtn = env.byIdMap['chat-tab-tool-button'];
+  const artBtn = env.byIdMap['chat-tab-artifact-button'];
+  ok(runBtn.getAttribute('aria-selected') === 'false' && runPanel.hidden === true,
+    'Run tab initially inactive');
+
+  // 点击 footer 详情：同步展开 + 激活 Run tab + loading 清除旧内容
+  _clickRunDetail(env, _runFooters(env)[0]);
+  ok(!shell.classList.contains('chat-shell--side-collapsed'), 'clicking footer detail expands sidebar');
+  ok(env.byIdMap['chat-side-toggle-btn'].getAttribute('aria-expanded') === 'true',
+    'expand helper syncs aria-expanded to true');
+  ok(runBtn.getAttribute('aria-selected') === 'true' && runBtn.getAttribute('tabindex') === '0',
+    'Run tab activated on open');
+  ok(runPanel.hidden === false && env.byIdMap['chat-tab-tool'].hidden === true
+    && env.byIdMap['chat-tab-artifact'].hidden === true, 'Run panel visible, other panels hidden');
+  ok(env.byIdMap['chat-run-detail'].textContent === '加载中...',
+    'open clears previous content and shows loading (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent) + ')');
+  await _settle(env);
+  const detail = env.byIdMap['chat-run-detail'];
+  ok(detail.textContent.indexOf('执行详情') !== -1, 'detail shows title Run 详情');
+  const overview = detail.querySelector('.run-detail__overview');
+  ok(!!overview && !!overview.querySelector('.run-detail__header')
+    && !!overview.querySelector('.run-detail__meta'),
+    'detail groups status header and metadata in overview card');
+  ok(!!detail.querySelector('.run-detail__section--tools')
+    && !!detail.querySelector('.run-detail__section--trace'),
+    'detail renders distinct tool and Trace groups');
+  ok(detail.textContent.indexOf('已完成') !== -1, 'detail shows status text');
+  ok(_detailMetaValue(detail, '耗时') && _detailMetaValue(detail, '耗时').textContent === '18秒',
+    'detail reuses footer duration (18秒)');
+  ok(_detailMetaValue(detail, '来源') && _detailMetaValue(detail, '来源').textContent === 'dashboard',
+    'detail shows source');
+  ok(_detailMetaValue(detail, '结束原因') && _detailMetaValue(detail, '结束原因').textContent === 'stop',
+    'detail shows end_reason');
+  ok(detail.textContent.indexOf('未调用工具') !== -1, 'empty tool calls shows 未调用工具');
+
+  // 侧栏已展开时再次打开不收起；再次打开的 loading 清除已渲染的旧详情内容
+  _clickRunDetail(env, _runFooters(env)[0]);
+  ok(!shell.classList.contains('chat-shell--side-collapsed'), 'reopen keeps sidebar expanded');
+  ok(env.byIdMap['chat-run-detail'].textContent === '加载中...',
+    'reopen loading clears previously rendered detail content');
+  await _settle(env);
+  artBtn.click();
+  ok(artBtn.getAttribute('aria-selected') === 'true' && runBtn.getAttribute('aria-selected') === 'false',
+    'manual tab switch still works with third tab present');
+
+  // 键盘：方向键循环覆盖第三 tab，焦点跟随；Home/End 直达首尾
+  toolBtn.focus();
+  toolBtn.dispatchEvent({ type: 'keydown', key: 'ArrowRight', preventDefault: () => {} });
+  ok(artBtn.getAttribute('aria-selected') === 'true', 'ArrowRight tool -> artifact');
+  artBtn.dispatchEvent({ type: 'keydown', key: 'ArrowRight', preventDefault: () => {} });
+  ok(runBtn.getAttribute('aria-selected') === 'true' && env.document.activeElement === runBtn,
+    'ArrowRight artifact -> run with focus moved');
+  runBtn.dispatchEvent({ type: 'keydown', key: 'ArrowRight', preventDefault: () => {} });
+  ok(toolBtn.getAttribute('aria-selected') === 'true', 'ArrowRight wraps run -> tool');
+  runBtn.dispatchEvent({ type: 'keydown', key: 'ArrowLeft', preventDefault: () => {} });
+  ok(artBtn.getAttribute('aria-selected') === 'true', 'ArrowLeft run -> artifact');
+  toolBtn.dispatchEvent({ type: 'keydown', key: 'End', preventDefault: () => {} });
+  ok(runBtn.getAttribute('aria-selected') === 'true' && env.document.activeElement === runBtn,
+    'End on first tab reaches third tab');
+  runBtn.dispatchEvent({ type: 'keydown', key: 'Home', preventDefault: () => {} });
+  ok(toolBtn.getAttribute('aria-selected') === 'true' && env.document.activeElement === toolBtn,
+    'Home on third tab returns to first tab');
+
+  // 每次打开刷新：同批次内复用工具缓存；新批次后重新读取工具调用
+  env = loadChat();
+  let toolsPayload = [];
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  env.setGetSessionToolCallsHandler(() => Promise.resolve(toolsPayload));
+  const msgs = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-1' }];
+  await _prepareSession(env, 's1', msgs);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  const callsAfterFirstOpen = env.getGetSessionToolCallsCalls().filter((c) => c.id === 's1').length;
+  ok(callsAfterFirstOpen >= 1, 'open fetches session tool calls');
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.getGetSessionToolCallsCalls().filter((c) => c.id === 's1').length === callsAfterFirstOpen,
+    'same-batch reopen reuses batch tool cache');
+  // 新批次：批内自动重发详情打开（计划修订），工具缓存失效并重读——无需点击即渲染新批次工具
+  toolsPayload = [{ run_id: 'run-1', tool_name: 'tool_new', duration_ms: 7, arguments: { k: 'v' } }];
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: msgs, summary: null, task_state: null });
+  await _settle(env);
+  const detailBatch = env.byIdMap['chat-run-detail'];
+  ok(detailBatch.textContent.indexOf('tool_new') !== -1 && detailBatch.textContent.indexOf('7ms') !== -1
+    && detailBatch.textContent.indexOf('加载中') === -1,
+    'new batch re-issues detail open and renders refreshed tool calls without click');
+  const callsAfterBatch = env.getGetSessionToolCallsCalls().filter((c) => c.id === 's1').length;
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.getGetSessionToolCallsCalls().filter((c) => c.id === 's1').length === callsAfterBatch,
+    'same-batch re-click reuses batch tool cache');
+  const detail2 = env.byIdMap['chat-run-detail'];
+  ok(detail2.textContent.indexOf('tool_new') !== -1 && detail2.textContent.indexOf('7ms') !== -1,
+    'new-batch tool calls rendered after re-click');
+  // 切换会话后占位恢复
+  env = loadChat();
+  env.setListSessionRunsHandler((id) => Promise.resolve([_runRow({ id: id === 'sB' ? 'run-b' : 'run-a' })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  sessionsList = [{ id: 'sA', title: 'sA' }, { id: 'sB', title: 'sB' }];
+  env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({
+    session: { id },
+    messages: [{ id: 'm-' + id, role: 'assistant', content: 'x', run_id: id === 'sA' ? 'run-a' : 'run-b' }],
+    summary: null, task_state: null,
+  });
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem('sA'));
+  await _settle(env, 4);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent.indexOf('执行详情') !== -1, 'detail open on sA');
+  env.fireClick(env.findSessionItem('sB'));
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
+    'session switch resets detail placeholder (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent) + ')');
+
+  // 用户折叠侧栏后（Run tab 仍激活），同会话新批次的后台重发不得弹回展开；
+  // 面板内容仍在新批次 token 下刷新
+  env = loadChat();
+  let collapsedToolsPayload = [];
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  env.setGetSessionToolCallsHandler(() => Promise.resolve(collapsedToolsPayload));
+  const collapsedMsgs = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-1' }];
+  await _prepareSession(env, 's1', collapsedMsgs);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  const collapsedShell = env.byIdMap['chat-shell'];
+  ok(!collapsedShell.classList.contains('chat-shell--side-collapsed'), 'sidebar expanded after open');
+  collapsedShell.classList.add('chat-shell--side-collapsed');
+  collapsedToolsPayload = [{ run_id: 'run-1', tool_name: 'tool_bg', duration_ms: 3, arguments: null }];
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: collapsedMsgs, summary: null, task_state: null });
+  await _settle(env);
+  ok(collapsedShell.classList.contains('chat-shell--side-collapsed'),
+    'background reissue does not re-expand user-collapsed sidebar');
+  const bgDetail = env.byIdMap['chat-run-detail'];
+  ok(bgDetail.textContent.indexOf('tool_bg') !== -1 && bgDetail.textContent.indexOf('3ms') !== -1
+    && bgDetail.textContent.indexOf('加载中') === -1,
+    'background reissue still refreshes panel content under new token');
+}
+
+// --- 元信息与工具列表：状态色 / Run ID 截断 / 缺失降级 / 安全参数摘要 ---
+async function testRunFooterDetailMetaAndTools() {
+  // 状态色分类：completed 绿 / failed+cancelled 红 / interrupted+not_started 非成功色 /
+  // running+pending 中性 / 未知灰
+  const statusCases = [
+    ['completed', '已完成', 'run-status--ok'],
+    ['failed', '失败', 'run-status--bad'],
+    ['cancelled', '已取消', 'run-status--bad'],
+    ['interrupted', '已中断', 'run-status--warn'],
+    ['not_started', '未开始', 'run-status--warn'],
+    ['running', '运行中', 'run-status--neutral'],
+    ['pending', '运行中', 'run-status--neutral'],
+    ['mystery', '未知', 'run-status--unknown'],
+  ];
+  for (const [status, label, cls] of statusCases) {
+    const env = loadChat();
+    const rid = 'run-' + status;
+    env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: rid, status })]));
+    env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, status, trace_links: [] })));
+    await _prepareSession(env, 's1', [{ id: 'm', role: 'assistant', content: 'x', run_id: rid }]);
+    await _settle(env);
+    _clickRunDetail(env, _runFooters(env)[0]);
+    await _settle(env);
+    const detail = env.byIdMap['chat-run-detail'];
+    const statusEl = detail.querySelector('.run-detail__status');
+    ok(!!statusEl && statusEl.textContent === label,
+      'status ' + status + ' -> text ' + label + ' (got ' + JSON.stringify(statusEl && statusEl.textContent) + ')');
+    ok(!!statusEl && statusEl.className.indexOf(cls) !== -1,
+      'status ' + status + ' -> class ' + cls + ' (got ' + JSON.stringify(statusEl && statusEl.className) + ')');
+  }
+
+  // Run ID 中段截断（title 全量）、source/end_reason 缺失 —、开始时间与 error 块
+  let env = loadChat();
+  const longId = 'run-' + 'abcdef1234567890' + 'WXYZ9876543210';
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: longId })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({
+    id: runId, trace_links: [], source: null, end_reason: null, error: 'boom failed',
+  })));
+  await _prepareSession(env, 's1', [{ id: 'm', role: 'assistant', content: 'x', run_id: longId }]);
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  let detail = env.byIdMap['chat-run-detail'];
+  const idEl = _detailMetaValue(detail, 'Run ID');
+  ok(!!idEl && idEl.textContent.indexOf('…') !== -1 && idEl.textContent.length < longId.length
+    && idEl.textContent.indexOf(longId.slice(0, 8)) === 0,
+    'long run id middle-truncated (got ' + JSON.stringify(idEl && idEl.textContent) + ')');
+  ok(!!idEl && idEl.getAttribute('title') === longId, 'run id title keeps full id');
+  ok(_detailMetaValue(detail, '来源') && _detailMetaValue(detail, '来源').textContent === '—',
+    'missing source shows —');
+  ok(_detailMetaValue(detail, '结束原因') && _detailMetaValue(detail, '结束原因').textContent === '—',
+    'missing end_reason shows —');
+  const startedEl = _detailMetaValue(detail, '开始时间');
+  // 期望值按 UTC+8 偏移 + getUTC* 分量手工拼出（与知识库约定一致），不依赖运行环境时区
+  const startedTz = new Date(1000 * 1000 + 8 * 3600 * 1000);
+  const padTz = (n) => (n < 10 ? '0' + n : '' + n);
+  const expectedStarted = startedTz.getUTCFullYear() + '-' + padTz(startedTz.getUTCMonth() + 1) + '-'
+    + padTz(startedTz.getUTCDate()) + ' ' + padTz(startedTz.getUTCHours()) + ':'
+    + padTz(startedTz.getUTCMinutes()) + ':' + padTz(startedTz.getUTCSeconds());
+  ok(!!startedEl && startedEl.textContent === expectedStarted,
+    'started_at unix seconds renders full UTC+8 datetime (got ' + JSON.stringify(startedEl && startedEl.textContent)
+    + ', expected ' + JSON.stringify(expectedStarted) + ')');
+  const errorEl = detail.querySelector('.run-detail__error');
+  ok(!!errorEl && errorEl.textContent === 'boom failed' && errorEl.className.indexOf('run-status--bad') !== -1,
+    'non-empty string error renders red error block');
+  ok(detail.textContent.indexOf('undefined') === -1, 'no undefined leaked into detail');
+
+  // 开始时间非法/非有限/无效日期 -> —（每个变体独立 Run，终态缓存不串行）；error 非空字符串才显示错误块
+  env = loadChat();
+  const metaVariants = [
+    [_runRow({ started_at: '1000' }), 'started_at-string'],
+    [_runRow({ started_at: NaN }), 'started_at-NaN'],
+    [_runRow({ started_at: Infinity }), 'started_at-Infinity'],
+    [_runRow({ started_at: 1e21 }), 'started_at-invalid-date'],
+    [_runRow({ started_at: null }), 'started_at-null'],
+    [_runRow({ error: null }), 'error-null'],
+    [_runRow({ error: '' }), 'error-empty'],
+    [_runRow({ error: 123 }), 'error-number'],
+    [_runRow({ error: undefined }), 'error-undefined'],
+  ];
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-base' })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  await _prepareSession(env, 's1', [{ id: 'm0', role: 'assistant', content: 'x', run_id: 'run-base' }]);
+  for (let vi = 0; vi < metaVariants.length; vi++) {
+    const overrides = metaVariants[vi][0];
+    const tag = metaVariants[vi][1];
+    const rid = 'run-variant-' + vi;
+    env.setListSessionRunsHandler(() => Promise.resolve([_runRow(Object.assign({}, overrides, { id: rid }))]));
+    env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow(Object.assign({}, overrides, { id: rid, trace_links: [] }))));
+    await env.chat.applySessionDetail({ session: { id: 's1' }, messages: [{ id: 'm', role: 'assistant', content: 'x', run_id: rid }], summary: null, task_state: null });
+    await _settle(env);
+    _clickRunDetail(env, _runFooters(env)[0]);
+    await _settle(env);
+    const d = env.byIdMap['chat-run-detail'];
+    if (tag.indexOf('error-') === 0) {
+      ok(!d.querySelector('.run-detail__error'), tag + ' renders no error block');
+    } else {
+      const startedEl2 = _detailMetaValue(d, '开始时间');
+      ok(!!startedEl2 && startedEl2.textContent === '—',
+        tag + ' -> — (got ' + JSON.stringify(startedEl2 && startedEl2.textContent) + ')');
+    }
+  }
+
+  // 工具列表：run_id 精确过滤、duration 变体、参数摘要（对象/空值/截断/不可序列化）
+  env = loadChat();
+  let toolsPayload = [
+    { run_id: 'run-1', tool_name: 'tool_a', duration_ms: 12, arguments: { x: 1 } },
+    { run_id: 'run-other', tool_name: 'tool_noise', duration_ms: 5, arguments: {} },
+  ];
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  env.setGetSessionToolCallsHandler(() => Promise.resolve(toolsPayload));
+  const toolMsgs = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-1' }];
+  await _prepareSession(env, 's1', toolMsgs);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  detail = env.byIdMap['chat-run-detail'];
+  let nameEls = detail.querySelectorAll('.run-detail__tool-name');
+  ok(nameEls.length === 1 && nameEls[0].textContent === 'tool_a',
+    'tool calls filtered by run_id (got ' + JSON.stringify(nameEls.map((n) => n.textContent)) + ')');
+  ok(detail.textContent.indexOf('tool_noise') === -1, 'other run tool calls not shown');
+  let durEl = detail.querySelector('.run-detail__tool-duration');
+  ok(!!durEl && durEl.textContent === '12ms', 'duration_ms milliseconds shown (got ' + JSON.stringify(durEl && durEl.textContent) + ')');
+  let argsEl = detail.querySelector('.run-detail__tool-args');
+  ok(!!argsEl && argsEl.textContent === '{"x":1}', 'object arguments serialized to single-line JSON');
+  ok(!!argsEl && argsEl.getAttribute('title') === '{"x":1}', 'arguments title keeps full safe text');
+
+  // duration 变体：0 有效，缺失/负数/字符串/NaN/Infinity —，1.5 有限非负有效
+  const durCases = [
+    [0, '0ms'], [undefined, '—'], [-5, '—'], ['12', '—'], [NaN, '—'], [Infinity, '—'], [1.5, '1.5ms'],
+  ];
+  for (const [ms, label] of durCases) {
+    toolsPayload = [{ run_id: 'run-1', tool_name: 'tool_z', duration_ms: ms, arguments: null }];
+    await env.chat.applySessionDetail({ session: { id: 's1' }, messages: toolMsgs, summary: null, task_state: null });
+    await _settle(env);
+    _clickRunDetail(env, _runFooters(env)[0]);
+    await _settle(env);
+    const dEl = env.byIdMap['chat-run-detail'].querySelector('.run-detail__tool-duration');
+    ok(!!dEl && dEl.textContent === label,
+      'duration_ms ' + JSON.stringify(ms) + ' -> ' + label + ' (got ' + JSON.stringify(dEl && dEl.textContent) + ')');
+  }
+
+  // 参数变体：空值 —、长文本截断 80 字符（title 全量）、不可序列化 —
+  const circular = {};
+  circular.self = circular;
+  const longJson = JSON.stringify({ payload: 'y'.repeat(200) });
+  const argCases = [
+    [null, '—', null],
+    [undefined, '—', null],
+    [{ payload: 'y'.repeat(200) }, longJson.slice(0, 80) + '…', longJson],
+    [circular, '—', null],
+  ];
+  for (const [args, expectedText, expectedTitle] of argCases) {
+    toolsPayload = [{ run_id: 'run-1', tool_name: 'tool_arg', duration_ms: 1, arguments: args }];
+    await env.chat.applySessionDetail({ session: { id: 's1' }, messages: toolMsgs, summary: null, task_state: null });
+    await _settle(env);
+    _clickRunDetail(env, _runFooters(env)[0]);
+    await _settle(env);
+    const aEl = env.byIdMap['chat-run-detail'].querySelector('.run-detail__tool-args');
+    const argLabel = args === circular ? 'circular' : (args === null || args === undefined ? String(args) : JSON.stringify(args).slice(0, 20));
+    ok(!!aEl && aEl.textContent === expectedText,
+      'arguments ' + argLabel + ' -> summary (got '
+        + JSON.stringify(aEl && aEl.textContent.slice(0, 30)) + ')');
+    if (expectedTitle !== null) {
+      ok(!!aEl && aEl.getAttribute('title') === expectedTitle, 'long arguments title keeps full text');
+    }
+  }
+
+  // 工具读取失败 / null 响应：元信息保留，工具区无法加载；空数组与过滤后为空均未调用工具
+  env.setGetSessionToolCallsHandler(() => Promise.reject(new Error('boom')));
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: toolMsgs, summary: null, task_state: null });
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  detail = env.byIdMap['chat-run-detail'];
+  ok(detail.textContent.indexOf('无法加载工具调用') !== -1,
+    'tool fetch failure -> 无法加载工具调用 (got ' + JSON.stringify(detail.textContent.slice(0, 80)) + ')');
+  ok(detail.textContent.indexOf('已完成') !== -1 && detail.textContent.indexOf('执行详情') !== -1,
+    'run meta kept on tool failure');
+  ok(detail.querySelectorAll('.run-detail__trace-link').length === 0 && detail.textContent.indexOf('无 Trace 记录') !== -1,
+    'trace section still rendered on tool failure');
+  env.setGetSessionToolCallsHandler(() => Promise.resolve(null));
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: toolMsgs, summary: null, task_state: null });
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent.indexOf('无法加载工具调用') !== -1,
+    'null tool response -> 无法加载工具调用');
+  env.setGetSessionToolCallsHandler(() => Promise.resolve([]));
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: toolMsgs, summary: null, task_state: null });
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent.indexOf('未调用工具') !== -1,
+    'empty tool array -> 未调用工具');
+  env.setGetSessionToolCallsHandler(() => Promise.resolve([{ run_id: 'other-run', tool_name: 'n', duration_ms: 1 }]));
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: toolMsgs, summary: null, task_state: null });
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent.indexOf('未调用工具') !== -1,
+    'calls only for other runs -> 未调用工具');
+
+  // Run 404 / 详情读取失败：只显示无法加载执行详情，不留上一 Run 内容
+  env = loadChat();
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+  env.setGetSessionRunHandler(() => Promise.resolve(null)); // 404 -> null
+  env.setGetSessionToolCallsHandler(() => Promise.resolve([{ run_id: 'run-1', tool_name: 't', duration_ms: 1 }]));
+  await _prepareSession(env, 's1', [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-1' }]);
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent === '无法加载执行详情',
+    'run 404 -> 无法加载执行详情 (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent) + ')');
+  ok(env.byIdMap['chat-run-detail'].querySelectorAll('.run-detail__meta-row').length === 0,
+    '404 leaves no stale run content');
+  // 详情请求异常同样降级
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-err' })]));
+  env.setGetSessionRunHandler(() => Promise.reject(new Error('boom')));
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-err' }], summary: null, task_state: null });
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent === '无法加载执行详情',
+    'run detail fetch error -> 无法加载执行详情');
+}
+
+// --- Run 详情 Trace 区：逐条链接（前 8 位 ID）/ 无记录 / 未配置 / 加载失败 ---
+async function testRunFooterDetailTrace() {
+  const ID_A = 'a1'.repeat(16);
+  const ID_B = 'b2'.repeat(16);
+  const ID_C = 'c3'.repeat(16);
+  const baseUrl = 'https://grafana.example/grafana/explore?orgId=1';
+  let env = loadChat();
+  const traceLinks = [
+    { trace_id: ID_B, created_at: '2026-01-02T00:00:00Z', id: 'l2' },
+    { trace_id: 'ZZZ-not-hex', created_at: '2026-01-01T00:00:00Z', id: 'l0' },
+    { trace_id: ID_A.toUpperCase(), created_at: '2026-01-01T00:00:00Z', id: 'l1' },
+    { trace_id: ID_C, created_at: '2026-01-03T00:00:00Z', id: 'l3' },
+  ];
+  env.setGetOtelLinksHandler(() => Promise.resolve({ config: { trace_base_url: baseUrl } }));
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: traceLinks })));
+  await _prepareSession(env, 's1', [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-1' }]);
+  await _settle(env);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  const detail = env.byIdMap['chat-run-detail'];
+  const links = detail.querySelectorAll('.run-detail__trace-link');
+  ok(links.length === 3, 'all valid trace links listed, invalid filtered (got ' + links.length + ')');
+  const expectedOrder = [ID_A, ID_B, ID_C];
+  for (let i = 0; i < expectedOrder.length; i++) {
+    const a = links[i];
+    ok(!!a && a.textContent === expectedOrder[i].slice(0, 8),
+      'trace link ' + i + ' shows first 8 chars of id (got ' + JSON.stringify(a && a.textContent) + ')');
+    ok(!!a && a.getAttribute('title') === expectedOrder[i], 'trace link title keeps full id');
+    ok(!!a && a.href === env.chat.buildTraceUrl(baseUrl, expectedOrder[i]),
+      'trace link href matches buildTraceUrl contract');
+    ok(!!a && a.target === '_blank' && a.rel === 'noopener',
+      'trace link opens new window with noopener');
+  }
+  ok(detail.textContent.indexOf('00000000') === -1, 'no all-zero/invalid ids rendered');
+
+  // 无记录 / 未配置 / 加载失败 三态区分
+  const traceEnv = async (otelHandler, traceLinksValue) => {
+    const e = loadChat();
+    e.setGetOtelLinksHandler(otelHandler);
+    e.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-1' })]));
+    e.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: traceLinksValue })));
+    await _prepareSession(e, 's1', [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-1' }]);
+    await _settle(e);
+    _clickRunDetail(e, _runFooters(e)[0]);
+    await _settle(e);
+    return e;
+  };
+  let e2 = await traceEnv(() => Promise.resolve({ config: { trace_base_url: baseUrl } }), []);
+  ok(e2.byIdMap['chat-run-detail'].textContent.indexOf('无 Trace 记录') !== -1
+    && e2.byIdMap['chat-run-detail'].querySelectorAll('.run-detail__trace-link').length === 0,
+    'empty trace links -> 无 Trace 记录 without links');
+  e2 = await traceEnv(() => Promise.resolve({ config: {} }), traceLinks);
+  ok(e2.byIdMap['chat-run-detail'].textContent.indexOf('Trace 地址未配置') !== -1
+    && e2.byIdMap['chat-run-detail'].querySelectorAll('.run-detail__trace-link').length === 0,
+    'valid links without base url -> Trace 地址未配置, no empty link');
+  e2 = await traceEnv(() => Promise.reject(new Error('cfg')), traceLinks);
+  ok(e2.byIdMap['chat-run-detail'].textContent.indexOf('无法加载 Trace 入口') !== -1
+    && e2.byIdMap['chat-run-detail'].querySelectorAll('.run-detail__trace-link').length === 0,
+    'otel config failure -> 无法加载 Trace 入口, not disguised as 无记录');
+  // 降级优先级与 footer 对齐：otel 失败优先于空链接（配置失败无法确认“确实无记录”）
+  e2 = await traceEnv(() => Promise.reject(new Error('cfg')), []);
+  ok(e2.byIdMap['chat-run-detail'].textContent.indexOf('无法加载 Trace 入口') !== -1
+    && e2.byIdMap['chat-run-detail'].textContent.indexOf('无 Trace 记录') === -1,
+    'otel failure + empty links -> 无法加载 Trace 入口 wins over 无 Trace 记录');
+  // otel loading 不与“未配置”混淆：侧栏与 footer 一致不表态（不出链接、不出降级文案）
+  e2 = await traceEnv(() => new Promise(() => {}), traceLinks);
+  ok(e2.byIdMap['chat-run-detail'].querySelectorAll('.run-detail__trace-link').length === 0
+    && e2.byIdMap['chat-run-detail'].textContent.indexOf('Trace 地址未配置') === -1
+    && e2.byIdMap['chat-run-detail'].textContent.indexOf('无法加载 Trace 入口') === -1,
+    'otel loading -> no links and no unset/failed note, consistent with footer');
+}
+
+// --- 选中请求归属：快速 A→B / 同会话新批次 / 切换与删除会话后旧请求不提交 ---
+async function testRunFooterDetailStaleRequests() {
+  // (a) 快速选 Run A→B：A 迟到不提交
+  let env = loadChat();
+  let releaseA = null;
+  env.setListSessionRunsHandler(() => Promise.resolve([
+    _runRow({ id: 'run-a', source: 'dashboard' }),
+    _runRow({ id: 'run-b', source: 'cli' }),
+  ]));
+  env.setGetSessionRunHandler((id, runId) => {
+    if (runId === 'run-a') {
+      return new Promise((res) => { releaseA = (row) => res(row); });
+    }
+    return Promise.resolve(_runRow({ id: runId, source: 'cli', end_reason: 'done-b', trace_links: [] }));
+  });
+  const abMsgs = [
+    { id: 'ma', role: 'assistant', content: 'a', run_id: 'run-a' },
+    { id: 'mb', role: 'assistant', content: 'b', run_id: 'run-b' },
+  ];
+  await _prepareSession(env, 's1', abMsgs);
+  await _settle(env);
+  let linkA = null;
+  let linkB = null;
+  for (const f of _runFooters(env)) {
+    const link = _runFooterLinks(f).find((x) => x.getAttribute('aria-label') === '查看执行详情');
+    if (f.dataset.runId === 'run-a') linkA = link; else linkB = link;
+  }
+  ok(!!linkA && !!linkB, 'both footers expose detail links');
+  env.fireClick(linkA);
+  ok(env.byIdMap['chat-run-detail'].textContent === '加载中...', 'A open shows loading');
+  env.fireClick(linkB);
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent.indexOf('done-b') !== -1,
+    'B renders immediately (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent.slice(0, 60)) + ')');
+  releaseA(_runRow({ id: 'run-a', source: 'dashboard', end_reason: 'late-a', trace_links: [] }));
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent.indexOf('done-b') !== -1
+    && env.byIdMap['chat-run-detail'].textContent.indexOf('late-a') === -1,
+    'late A response does not overwrite B detail');
+
+  // (b) 同会话新批次：旧打开请求不提交；新批次自动重发打开（计划修订），
+  // 最终面板在新 token 下重渲染成功，而非停留在“加载中...”
+  env = loadChat();
+  let releaseA2 = null;
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-a' })]));
+  env.setGetSessionRunHandler((id, runId) => new Promise((res) => {
+    releaseA2 = () => res(_runRow({ id: runId, end_reason: 'late-a', trace_links: [] }));
+  }));
+  const aMsgs = [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-a' }];
+  await _prepareSession(env, 's1', aMsgs);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  ok(env.byIdMap['chat-run-detail'].textContent === '加载中...', 'open shows loading');
+  await env.chat.applySessionDetail({ session: { id: 's1' }, messages: aMsgs, summary: null, task_state: null });
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent === '加载中...',
+    'new batch re-issues open and keeps loading until shared request settles');
+  releaseA2();
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent.indexOf('late-a') !== -1
+    && env.byIdMap['chat-run-detail'].textContent.indexOf('加载中') === -1,
+    'panel re-renders under new batch token, stale open did not strand loading (got '
+      + JSON.stringify(env.byIdMap['chat-run-detail'].textContent.slice(0, 80)) + ')');
+
+  // (c) 切换会话：清选中与占位，旧请求不提交
+  env = loadChat();
+  let releaseA3 = null;
+  env.setListSessionRunsHandler((id) => Promise.resolve([_runRow({ id: id === 'sB' ? 'run-b' : 'run-a' })]));
+  env.setGetSessionRunHandler((id, runId) => {
+    if (runId === 'run-a') {
+      return new Promise((res) => { releaseA3 = () => res(_runRow({ id: runId, end_reason: 'late-a', trace_links: [] })); });
+    }
+    return Promise.resolve(_runRow({ id: runId, trace_links: [] }));
+  });
+  sessionsList = [{ id: 'sA', title: 'sA' }, { id: 'sB', title: 'sB' }];
+  env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({
+    session: { id },
+    messages: [{ id: 'm-' + id, role: 'assistant', content: 'x', run_id: id === 'sA' ? 'run-a' : 'run-b' }],
+    summary: null, task_state: null,
+  });
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem('sA'));
+  await _settle(env, 4);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  ok(env.byIdMap['chat-run-detail'].textContent === '加载中...', 'switch scenario: open shows loading');
+  env.fireClick(env.findSessionItem('sB'));
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
+    'session switch clears selection to placeholder (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent) + ')');
+  releaseA3();
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
+    'late A after session switch does not commit');
+
+  // (d) 删除当前会话：清选中与占位，旧请求不提交
+  env = loadChat();
+  let releaseA4 = null;
+  env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: 'run-a' })]));
+  env.setGetSessionRunHandler((id, runId) => new Promise((res) => {
+    releaseA4 = () => res(_runRow({ id: runId, end_reason: 'late-a', trace_links: [] }));
+  }));
+  sessionsList = [{ id: 'sA', title: 'sA' }];
+  env.win.NAGENT.api.getSessionDetail = (id) => Promise.resolve({
+    session: { id },
+    messages: [{ id: 'm', role: 'assistant', content: 'x', run_id: 'run-a' }],
+    summary: null, task_state: null,
+  });
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem('sA'));
+  await _settle(env, 4);
+  _clickRunDetail(env, _runFooters(env)[0]);
+  ok(env.byIdMap['chat-run-detail'].textContent === '加载中...', 'delete scenario: open shows loading');
+  env.win.NAGENT.modal.confirm = () => Promise.resolve(true);
+  env.setDeleteSessionHandler(() => Promise.resolve({}));
+  let delBtn = null;
+  for (const it of env.document.querySelectorAll('.session-item')) {
+    if (!(it.dataset && it.dataset.sessionId === 'sA')) continue;
+    delBtn = (function visit(n) {
+      for (const c of (n._kids || [])) {
+        if (c.tagName === 'BUTTON' && c.getAttribute('aria-label') === '删除会话') return c;
+        const r = visit(c);
+        if (r) return r;
+      }
+      return null;
+    })(it);
+    break;
+  }
+  ok(!!delBtn, 'delete button found for current session');
+  if (delBtn) {
+    delBtn.click();
+    await _settle(env);
+    ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
+      'session delete clears selection to placeholder (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent) + ')');
+    releaseA4();
+    await _settle(env);
+    ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
+      'late A after session delete does not commit');
+    ok(_runFooters(env).length === 0, 'delete clears footers as before');
+  }
+}
+
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
@@ -4265,6 +5619,17 @@ runIntegration().then(async () => {
   await testSessionSourceFilter();
   await testSessionSearch();
   await testSkillPicker();
+  await testRunFooterRenderAndFormat();
+  await testRunFooterLiveCapture();
+  await testRunFooterSessionIsolation();
+  await testRunFooterTraceAndQueue();
+  await testRunFooterBatchParallelPrefetch();
+  await testRunFooterLedgerAbsent();
+  await testRunFooterDetailQueueResilience();
+  await testRunFooterDetailOpenAndTabs();
+  await testRunFooterDetailMetaAndTools();
+  await testRunFooterDetailTrace();
+  await testRunFooterDetailStaleRequests();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

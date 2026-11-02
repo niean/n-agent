@@ -15,6 +15,10 @@
   const createSession = (id) => fetchJson(`/chat/sessions?session_id=${encodeURIComponent(id)}`, { method: 'POST' });
   const getSessionDetail = (id) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}`);
   const getSessionToolCalls = (id) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}/tool-calls`);
+  // T5(Run footer): Run 执行账本读取（数组 DTO 直接消费，不假定 {items:...} 包装）
+  const listSessionRuns = (id) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}/runs`);
+  const getSessionRun = (id, runId) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}`);
+  const getOtelLinks = () => fetchJson('/chat/observations/otel/links');
   const renameSession = (id, title) => fetchJson(`/chat/sessions/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -289,6 +293,9 @@
     createSession,
     getSessionDetail,
     getSessionToolCalls,
+    listSessionRuns,
+    getSessionRun,
+    getOtelLinks,
     renameSession,
     deleteSession,
     appendSessionMessage,

@@ -1,5 +1,6 @@
 # tests/infrastructure/test_mem0_adapter.py
 import json
+import threading
 import pytest
 from app.infrastructure.memory.external.mem0 import Mem0Adapter
 
@@ -78,6 +79,21 @@ def test_prefetch_returns_formatted_memory_when_results_exist(adapter):
     assert body["rerank"] is True
     assert body["top_k"] == 10
     assert headers["Authorization"] == "Token sk-x"
+
+
+def test_prefetch_waits_for_normal_mem0_latency(adapter, monkeypatch):
+    a, http = adapter
+    http.responses[("POST", "https://api.mem0.ai/v3/memories/search/")] = {
+        "results": [{"memory": "likes spicy food"}],
+    }
+    original_search = a._search_backend
+
+    def delayed_search(query):
+        threading.Event().wait(1.75)
+        return original_search(query)
+
+    monkeypatch.setattr(a, "_search_backend", delayed_search)
+    assert "likes spicy food" in a.prefetch("q", session_id="s1")
 
 
 def test_prefetch_returns_empty_when_no_results(adapter):

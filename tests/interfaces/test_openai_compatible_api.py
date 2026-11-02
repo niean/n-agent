@@ -1,10 +1,13 @@
+import json
 from contextlib import ExitStack
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.application.agent_graph import AgentGraphRunner
-from app.application.chat_service import ChatCompletionService
+from app.application.chat_service import ChatCompletionResult, ChatCompletionService
+from app.application.events import ChatEvent, ChatEventType
 from app.application.model_service import ModelService
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
@@ -95,8 +98,6 @@ def build_client(tmp_path, provider=None, tool_service=None):
     )
     chat = ChatCompletionService(store, runner, SessionService(store))
     models = ModelService(provider, "test-model")
-    from fastapi import FastAPI
-
     app = FastAPI()
     app.include_router(create_openai_compatible_router(chat, models, store))
     if _test_client_stack is None:
@@ -636,3 +637,193 @@ def test_api_header_pointing_to_feishu_session_returns_409(tmp_path):
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "api_session_scope_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# T4: OpenAI-compatible Run 轻量入口 (run_footer) 响应合同
+# ---------------------------------------------------------------------------
+
+class _RunFooterChatService:
+    """Stub ChatCompletionService：非流式返回预置结果，流式返回预置事件序列。"""
+
+    def __init__(self, result=None, events=None):
+        self._result = result
+        self._events = events
+
+    async def complete(self, request):
+        if request.stream:
+            async def _gen():
+                for event in self._events:
+                    yield event
+            return _gen()
+        return self._result
+
+
+def _run_footer_result(run_id=None, finish_reason="stop"):
+    return ChatCompletionResult(
+        session_id="s-footer",
+        model="test-model",
+        message={"role": "assistant", "content": "hello"},
+        finish_reason=finish_reason,
+        usage={"total_tokens": 3},
+        run_id=run_id,
+    )
+
+
+def _run_footer_client(chat_service):
+    app = FastAPI()
+    # memory_store 传 None：跳过 session bootstrap，run_footer 只关心响应合同。
+    app.include_router(create_openai_compatible_router(chat_service, ModelService(FakeProvider(), "test-model"), None))
+    return TestClient(app)
+
+
+def _run_footer_stream_text(chat_service):
+    client = _run_footer_client(chat_service)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "s-footer"},
+        json={"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+    ) as response:
+        assert response.headers["content-type"].startswith("text/event-stream")
+        return "".join(response.iter_text())
+
+
+def _parse_sse(text: str):
+    """解析 SSE 响应体为 (chunk 列表, done_seen)。"""
+    chunks = []
+    done_seen = False
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):]
+        if payload == "[DONE]":
+            done_seen = True
+            continue
+        chunks.append(json.loads(payload))
+    return chunks, done_seen
+
+
+def test_run_footer_non_stream_success_includes_run_id(tmp_path):
+    """非流式成功：持久化 run_id 以顶层 run_footer 键透出，Open-WebUI 依赖的既有字段不回退。"""
+    chat_service = _RunFooterChatService(result=_run_footer_result(run_id="run-abc-123"))
+    client = _run_footer_client(chat_service)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "s-footer"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == "run-abc-123"
+    assert body["id"].startswith("chatcmpl-")
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "N-Agent"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["message"] == {"role": "assistant", "content": "hello"}
+    assert body["usage"] == {"total_tokens": 3}
+
+
+def test_run_footer_non_stream_omits_run_id_without_identity(tmp_path):
+    """无账本/无身份：run_id 键整体缺省，不输出空值。"""
+    chat_service = _RunFooterChatService(result=_run_footer_result(run_id=None))
+    client = _run_footer_client(chat_service)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "s-footer"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert "run_id" not in response.json()
+
+
+def test_run_footer_non_stream_error_keeps_http_error_contract(tmp_path):
+    """非流式异常：保留既有 500 状态与错误结构，不变成成功响应，也不透出 run_id。"""
+    chat_service = _RunFooterChatService(
+        result=_run_footer_result(run_id="run-abc-123", finish_reason="error"),
+    )
+    client = _run_footer_client(chat_service)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": "s-footer"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["type"] == "server_error"
+    assert "run_id" not in body
+
+
+def test_run_footer_stream_message_done_carries_run_id_and_mid_stream_does_not(tmp_path):
+    """流式：仅 MESSAGE_DONE 顶层携带 run_id；中途事件 metadata 即使被人为注入也不输出。"""
+    chat_service = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.CONTENT_DELTA, content="he", metadata={"run_id": "run-abc-123"}),
+        ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop", metadata={"run_id": "run-abc-123"}),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text = _run_footer_stream_text(chat_service)
+
+    chunks, done_seen = _parse_sse(text)
+    assert done_seen is True
+    by_finish_reason = {}
+    for chunk in chunks:
+        assert chunk["id"].startswith("chatcmpl-")
+        assert chunk["object"] == "chat.completion.chunk"
+        by_finish_reason.setdefault(chunk["choices"][0]["finish_reason"], []).append(chunk)
+    # 中途 CONTENT_DELTA chunk（finish_reason 为 None）不携带 run_id
+    mid_chunks = by_finish_reason[None]
+    assert any(c["choices"][0]["delta"] == {"content": "he"} for c in mid_chunks)
+    for chunk in mid_chunks:
+        assert "run_id" not in chunk
+    # MESSAGE_DONE chunk 顶层携带 run_id
+    done_chunks = by_finish_reason["stop"]
+    assert len(done_chunks) == 1
+    assert done_chunks[0]["run_id"] == "run-abc-123"
+    # [DONE] 行保持原样
+    assert "data: [DONE]" in text
+
+
+def test_run_footer_stream_error_carries_run_id(tmp_path):
+    """流式 ERROR：结束 chunk 顶层携带 run_id，finish_reason 保持 error。"""
+    chat_service = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.ERROR, error="provider down", metadata={"run_id": "run-err-1"}),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text = _run_footer_stream_text(chat_service)
+
+    chunks, done_seen = _parse_sse(text)
+    assert done_seen is True
+    error_chunks = [c for c in chunks if c["choices"][0]["finish_reason"] == "error"]
+    assert len(error_chunks) == 1
+    assert error_chunks[0]["run_id"] == "run-err-1"
+    assert error_chunks[0]["choices"][0]["delta"] == {"content": "provider down"}
+
+
+def test_run_footer_stream_omits_run_id_without_identity(tmp_path):
+    """流式无身份：MESSAGE_DONE 无 metadata 或 run_id 为空串时键缺省。"""
+    chat_service = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.CONTENT_DELTA, content="he", metadata={"run_id": "run-abc-123"}),
+        ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop"),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text = _run_footer_stream_text(chat_service)
+    chunks, _ = _parse_sse(text)
+    assert all("run_id" not in chunk for chunk in chunks)
+
+    chat_service_empty = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop", metadata={"run_id": ""}),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text_empty = _run_footer_stream_text(chat_service_empty)
+    chunks_empty, _ = _parse_sse(text_empty)
+    assert all("run_id" not in chunk for chunk in chunks_empty)

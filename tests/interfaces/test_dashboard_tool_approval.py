@@ -1144,3 +1144,42 @@ async def test_cross_session_claim_does_not_affect_original_pending() -> None:
     assert r2.status == "ok"
     await task
     assert bridge.pending_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Run 轻量入口 (run_footer)：审批 envelope 与 [DONE] 原样
+# ---------------------------------------------------------------------------
+
+async def test_run_footer_approval_envelope_and_done_untouched() -> None:
+    """run_footer 编码合同不得改写审批 envelope 和 [DONE] 行。
+
+    审批事件 metadata 中即使被人为注入 run_id，envelope 结构保持
+    {object, approval} 原样；MESSAGE_DONE chunk 顶层携带 run_id；
+    [DONE] 行保持字节形态。
+    """
+    from app.application.events import ChatEvent
+    from app.interfaces.http.dashboard import _dashboard_sse_with_approval
+
+    approval_metadata = {"confirmation_id": "c-1", "tool_name": "browser_click"}
+
+    async def _events():
+        yield ChatEvent(ChatEventType.TOOL_APPROVAL_REQUIRED, metadata=approval_metadata)
+        yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop", metadata={"run_id": "run-abc-123"})
+        yield ChatEvent(ChatEventType.DONE)
+
+    lines = [line async for line in _dashboard_sse_with_approval(_events())]
+
+    assert len(lines) == 3
+    # 审批 envelope 原样：仅 object/approval 两个顶层键，不注入 run_footer
+    assert lines[0].startswith("data: ")
+    envelope = json.loads(lines[0][len("data: "):])
+    assert set(envelope.keys()) == {"object", "approval"}
+    assert envelope["object"] == "n-agent.tool_approval"
+    assert envelope["approval"] == approval_metadata
+    # MESSAGE_DONE chunk 顶层携带 run_id
+    chunk = json.loads(lines[1][len("data: "):])
+    assert chunk["object"] == "chat.completion.chunk"
+    assert chunk["run_id"] == "run-abc-123"
+    assert chunk["choices"][0]["finish_reason"] == "stop"
+    # [DONE] 原样
+    assert lines[2] == "data: [DONE]\n\n"

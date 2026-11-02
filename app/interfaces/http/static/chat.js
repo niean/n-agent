@@ -164,6 +164,9 @@
     // fetchJson 失败抛 new Error(code)，无 HTTP status；按 error.message 识别
     if (e && e.message === 'session_not_found') {
       stopAutoRefresh();
+      // T6: 会话已不存在——驱逐其 runs/详情快照并清 Run 详情选中与占位
+      evictRunCachesForSession(sessionId);
+      resetRunDetailPanel();
       currentSessionId = null;
       renderArtifactPanel();
       renderedMessageVersion = null;
@@ -1187,6 +1190,12 @@
     // OpenAI chunk: append text delta (existing behavior)
     var content = (json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content) || '';
     if (content && streaming) streaming.textContent += content;
+    // T5(Run footer): 终结 chunk（MESSAGE_DONE/ERROR，finish_reason 非空）顶层携带 run_id；
+    // 中途 chunk / [DONE] / 审批 envelope 不携带。绑定发送代次与流会话，流收尾强制刷新详情。
+    var finishReason = json.choices && json.choices[0] && json.choices[0].finish_reason;
+    if (finishReason != null && typeof json.run_id === 'string' && json.run_id) {
+      liveStreamRunCapture = { generation: sendGeneration, sessionId: streamSessionId, runId: json.run_id };
+    }
     return true;
   }
 
@@ -1291,8 +1300,6 @@
         el.appendChild(document.createTextNode(' '));
         el.appendChild(link);
       }
-      const timeLabel = formatMessageTime(message.created_at);
-      if (timeLabel) el.dataset.time = timeLabel;
       return el;
     }
     // T10: ui.artifact card -- name / version / publish-status badge / fixed
@@ -1341,8 +1348,6 @@
         textNode.textContent = text;
         el.appendChild(textNode);
       }
-      const timeLabel = formatMessageTime(message.created_at);
-      if (timeLabel) el.dataset.time = timeLabel;
       return el;
     }
     if (message.role === 'tool') {
@@ -1422,9 +1427,11 @@
       el.appendChild(details);
       return el;
     }
-    // user/assistant/ui.task_result 消息：附加 Hover 时间（飞书风格），由 CSS ::before 展示
-    const timeLabel = formatMessageTime(message.created_at);
-    if (timeLabel) el.dataset.time = timeLabel;
+    // 消息时间由 createMessageContainer 统一渲染到气泡下方 footer 右侧。
+    // T5(Run footer): assistant 消息携带 run_id 时记录身份，footer 对账仅匹配该身份
+    if (message.role === 'assistant' && typeof message.run_id === 'string' && message.run_id) {
+      el.dataset.runId = message.run_id;
+    }
     // work task / judge task 单独卡片（1-message group）：样式打平 ui.task_lifecycle 任务状态卡片，
     // 折叠卡片（details 默认 open=false），summary 固定=任务状态（与合并卡、standalone lifecycle 一致），pre = 原始 content；
     // 与 ui.task_command/ui.task_lifecycle 折叠卡片结构一致（details+summary+pre），
@@ -1475,15 +1482,17 @@
     if (message && message.card && message.card.kind === 'tool_approval_resolution') return false;
     if (message.is_summary) return true;
     if (message.role === 'tool') return true;
+    // 工具调用中间步即使带有正文也属于过程消息；最终答复没有 tool_calls。
+    if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length) return false;
     // 进程来源（task/curator）的 assistant 推理属 worker 内部思考过程，不在
     // Dashboard 对话框展示：worker 推理虽落库供 goal_mode 续轮与 LLM 上下文，
     // 但对用户不可见（task 经 ui.task_lifecycle/ui.task_result 卡片对外，curator
     // 为内部维护）。worker 的工具调用结果仍按工具调试卡片独立渲染；realtime
     // （api/dashboard/无 source）assistant 正常渲染。Regression: worker CoT
     // "The task requires querying weather..." 泄露为普通 assistant 气泡。
-    // schedule 例外：其 assistant 消息是定时任务投递记录（无独立 ui.task_result
-    // 卡片机制），必须在 Dashboard 对话框可见；空内容（仅 tool_calls 的中间步）
-    // 由下方 hasVisibleContent 兜底隐藏。Regression: 定时任务投递记录被误隐藏。
+    // schedule 例外：其最终 assistant 消息是定时任务投递记录（无独立 ui.task_result
+    // 卡片机制），必须在 Dashboard 对话框可见；带 tool_calls 的中间步已在上方隐藏。
+    // Regression: 定时任务投递记录被误隐藏。
     if (message.role === 'assistant' && PROCESS_SOURCES.has(message.source) && message.source !== 'schedule') return false;
     return hasVisibleContent(message.content);
   }
@@ -1510,10 +1519,37 @@
     if (!stack) return null;
     const empty = stack.querySelector('.empty-hero');
     if (empty) clearNode(stack);
-    const el = createMessageElement({ role, content, created_at: createdAt, name: name || null });
-    stack.appendChild(el);
+    const message = { role, content, created_at: createdAt, name: name || null };
+    const el = createMessageElement(message);
+    stack.appendChild(createMessageContainer(el, message));
     scrollToBottom();
     return el;
+  }
+
+  function buildMessageFooter(timeLabel) {
+    const footer = document.createElement('div');
+    footer.className = 'chat-run-footer';
+    const actions = document.createElement('div');
+    actions.className = 'chat-run-footer__actions';
+    footer.appendChild(actions);
+    const time = document.createElement('span');
+    time.className = 'chat-run-footer__time';
+    time.textContent = timeLabel || '';
+    footer.appendChild(time);
+    return footer;
+  }
+
+  function createMessageContainer(el, message) {
+    if (!el || !el.classList.contains('msg')) return el;
+    const container = document.createElement('div');
+    const rightAligned = el.classList.contains('user') || el.classList.contains('msg--process-card');
+    const centered = el.classList.contains('error');
+    container.className = 'chat-turn' + (rightAligned ? ' chat-turn--right' : '')
+      + (centered ? ' chat-turn--center' : '')
+      + (el.classList.contains('assistant') ? ' chat-turn--assistant' : '');
+    container.appendChild(el);
+    container.appendChild(buildMessageFooter(formatMessageTime(message && message.created_at)));
+    return container;
   }
 
   function messageRenderKey(message, index) {
@@ -1555,7 +1591,7 @@
       if (!visibleMessages.length) { showEmptyState(); return; }
       visibleMessages.forEach((message, index) => {
         const key = messageRenderKey(message, index);
-        const el = createMessageElement(message, cardStates, taskDecisions, approvalDecisions);
+        const el = createMessageContainer(createMessageElement(message, cardStates, taskDecisions, approvalDecisions), message);
         el.dataset.messageKey = key;
         stack.appendChild(el);
         renderedMessageNodes.set(key, el);
@@ -1571,7 +1607,7 @@
       nextKeys.add(key);
       const existing = renderedMessageNodes.get(key);
       if (existing && renderedMessageFingerprints.get(key) === fingerprint) return;
-      const el = createMessageElement(message, cardStates, taskDecisions, approvalDecisions);
+      const el = createMessageContainer(createMessageElement(message, cardStates, taskDecisions, approvalDecisions), message);
       el.dataset.messageKey = key;
       if (existing && existing.parentNode === stack) {
         preserveDetailsState(existing, el);
@@ -1978,6 +2014,9 @@
       delete sessionActivatedSkills[session.id];
       saveActivatedSkills();
     }
+    // T6: 驱逐被删会话的 runs/详情快照，并清 Run 详情选中与占位
+    evictRunCachesForSession(session.id);
+    resetRunDetailPanel();
     if (currentSessionId === session.id) {
       stopAutoRefresh();
       renderedMessageVersion = null;
@@ -2001,7 +2040,10 @@
     if (activeStreamEl) {
       disableApprovalCards(activeStreamEl);
     }
+    // T6: 切换会话即驱逐上一会话的 runs/详情快照，并清 Run 详情选中与占位
+    if (currentSessionId && currentSessionId !== id) evictRunCachesForSession(currentSessionId);
     currentSessionId = id;
+    resetRunDetailPanel();
     renderArtifactPanel();
     draftExternalMemoryConfig = null;
     setHeader(id);
@@ -2236,9 +2278,14 @@
       applySessionExternalMemoryState(detail);
       renderExternalMemoryUI();
     }
+    // T5(Run footer): 批次在消息渲染前开启——runs 列表 / OTel 配置与消息渲染并行发起，
+    // 批次代次在此捕获；渲染完成后先对账一次，批次响应返回时各自再次触发对账
+    // （messages 与 runs 任一先返回均可）。
+    beginRunFooterBatch();
     // Await state resolution + render before restoring scroll / updating info,
     // so clickable actions are not inserted mid-render.
     await renderSessionMessages(detail, { partial: options.partialMessages === true });
+    reconcileRunFooters();
     // 会话视图链接：浏览器视图实时判定；任务/定时任务用缓存，任务关联消息数变化时失效重拉。
     if (currentSessionId) {
       const cached = sessionViewLinksCache[currentSessionId];
@@ -2379,6 +2426,729 @@
     }
   }
 
+  // ============================================================
+  // T5(Run footer): 对话 Turn 底部 Run 轻量入口
+  // 数据权威源是 AgentRun 执行账本（/chat/sessions/{id}/runs 与
+  // /chat/sessions/{id}/runs/{runId}），前端缓存只是读取快照。
+  // 模块结构：常量 -> 状态 -> 格式化/Trace 工具 -> footer 渲染 ->
+  // 对账（reconcile）-> 批次加载（runs 列表 / OTel 配置）->
+  // 有界详情队列 -> 直播身份捕获（processSSEData/send 协作）。
+  // ============================================================
+  const RUN_STATUS_TEXT = {
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+    interrupted: '已中断',
+    running: '运行中',
+    pending: '运行中',
+    not_started: '未开始',
+  };
+  const RUN_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+  const RUN_DETAIL_QUEUE_LIMIT = 4;
+  const RUN_FOOTER_TRACE_UNSET = 'Trace 地址未配置';
+  const RUN_FOOTER_TRACE_EMPTY = '无 Trace 记录';
+  const RUN_FOOTER_TRACE_FAILED = '无法加载 Trace 入口';
+
+  // 会话加载批次代次：每次 applySessionDetail 开启新批次，旧批次响应按 token 丢弃
+  let sessionLoadToken = 0;
+  // 直播身份捕获：终结 chunk run_id 绑定发送代次 + 流会话，流收尾强制刷新详情
+  let sendGeneration = 0;
+  let liveStreamRunCapture = null;
+  // 详情点击钩子：默认空操作，Run 详情视图（T6）接管时注入
+  let runFooterDetailHandler = null;
+  // OTel 链接配置（全局资源）：loading | ok | failed；每批次重新读取，失败不永久缓存
+  let otelLinksState = { state: 'loading' };
+  let otelLinksInflight = null;
+  // runs 列表快照：sessionId -> {state:'ok'|'failed', rows, token}
+  const runListCache = {};
+  // Run 详情快照：键为 sessionId 换行 runId -> {state:'ok'|'failed', row, token, live}
+  const runDetailCache = {};
+  // 有界详情队列：去重 + 并发上限 + 批次尝试令牌（防陈旧缓存替代刷新）
+  const runDetailInflight = new Map();
+  let runDetailWaiting = [];
+  let runDetailActive = 0;
+  const runDetailAttemptToken = {};
+
+  function setRunFooterDetailHandler(handler) {
+    runFooterDetailHandler = typeof handler === 'function' ? handler : null;
+  }
+
+  function runStatusText(status) {
+    return Object.prototype.hasOwnProperty.call(RUN_STATUS_TEXT, status) ? RUN_STATUS_TEXT[status] : '未知';
+  }
+
+  // 耗时：Unix 秒差取整；缺失、非有限或结束早于开始显示 "—"
+  function runDurationText(row) {
+    const started = row ? row.started_at : null;
+    const ended = row ? row.ended_at : null;
+    if (typeof started !== 'number' || !isFinite(started)) return '—';
+    if (typeof ended !== 'number' || !isFinite(ended)) return '—';
+    if (ended < started) return '—';
+    return Math.floor(ended - started) + '秒';
+  }
+
+  // 工具段：仅非负整数可信；缺失/负数/分数/非有限/字符串降级为未知，不伪装成零
+  function runToolCallText(row) {
+    const count = row ? row.tool_call_count : undefined;
+    if (typeof count === 'number' && isFinite(count) && Math.floor(count) === count && count >= 0) {
+      return count > 0 ? '工具调用 ' + count + ' 次' : '未调用工具';
+    }
+    return '工具调用数未知';
+  }
+
+  function normalizeTraceId(value) {
+    if (typeof value !== 'string') return null;
+    const id = value.trim().toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(id)) return null;
+    if (id === '00000000000000000000000000000000') return null;
+    return id;
+  }
+
+  // 与 tests/e2e/result_report.py::trace_url 严格对齐：保留域名/子路径/orgId 等非冲突参数，
+  // 替换 panes/left/right/schemaVersion，清 hash；仅允许无用户名密码的 http/https；不追加 /explore。
+  function buildTraceUrl(baseUrl, traceId) {
+    const id = normalizeTraceId(traceId);
+    if (!id || typeof baseUrl !== 'string' || !baseUrl) return null;
+    let url;
+    try { url = new URL(baseUrl); } catch (error) { return null; }
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || !url.hostname) return null;
+    if (url.username || url.password) return null;
+    url.searchParams.delete('panes');
+    url.searchParams.delete('left');
+    url.searchParams.delete('right');
+    url.searchParams.delete('schemaVersion');
+    const panes = { trace: {
+      datasource: 'nagent-tempo',
+      queries: [{ refId: 'A', queryType: 'traceql', query: id, datasource: { type: 'tempo', uid: 'nagent-tempo' } }],
+      range: { from: 'now-1h', to: 'now' },
+    } };
+    url.searchParams.append('schemaVersion', '1');
+    url.searchParams.append('panes', JSON.stringify(panes));
+    url.hash = '';
+    return url.toString();
+  }
+
+  // 详情 trace_links 排序（created_at、id 稳定排序）后过滤有效 trace_id；footer 取首条
+  function runTraceLinks(row) {
+    const links = row && Array.isArray(row.trace_links) ? row.trace_links : null;
+    if (!links) return null;
+    const sorted = links.slice().sort((a, b) => {
+      const ka = String((a && a.created_at != null) ? a.created_at : '');
+      const kb = String((b && b.created_at != null) ? b.created_at : '');
+      if (ka !== kb) return ka < kb ? -1 : 1;
+      const ia = String((a && a.id != null) ? a.id : '');
+      const ib = String((b && b.id != null) ? b.id : '');
+      if (ia !== ib) return ia < ib ? -1 : 1;
+      return 0;
+    });
+    const valid = [];
+    for (let i = 0; i < sorted.length; i++) {
+      const id = normalizeTraceId(sorted[i] && sorted[i].trace_id);
+      if (id) valid.push({ id, link: sorted[i] });
+    }
+    return valid;
+  }
+
+  function runTraceBaseUrl() {
+    if (!otelLinksState || otelLinksState.state !== 'ok') return null;
+    const data = otelLinksState.data;
+    const base = data && data.config && data.config.trace_base_url;
+    return (typeof base === 'string' && base.trim()) ? base.trim() : null;
+  }
+
+  // Trace 展示统一决策：footer 与 Run 详情侧栏共用同一三态判定，避免两侧降级文案漂移。
+  // 优先级：详情读取失败 > otel 配置失败（空链接时同样优先——配置失败无法确认“确实无记录”）
+  // > 空链接 > loading（footer 与侧栏均不表态，不与“未配置”混淆）> 未配置 > 首条链接。
+  // 返回 { note } | { url, links, base } | null（null = 无链接可出且无降级文案）。
+  // traceState: 'ok'（详情已取得，traceRow 含 trace_links）| 'failed'（详情失败）| undefined（详情未定）
+  function resolveRunTraceDisplay(traceRow, traceState) {
+    if (traceState === 'failed') return { note: RUN_FOOTER_TRACE_FAILED };
+    if (traceState !== 'ok') return null;
+    const links = runTraceLinks(traceRow);
+    if (!links || !links.length) {
+      if (otelLinksState && otelLinksState.state === 'failed') return { note: RUN_FOOTER_TRACE_FAILED };
+      return { note: RUN_FOOTER_TRACE_EMPTY };
+    }
+    if (!otelLinksState || otelLinksState.state === 'loading') return null;
+    if (otelLinksState.state === 'failed') return { note: RUN_FOOTER_TRACE_FAILED };
+    const base = runTraceBaseUrl();
+    if (!base) return { note: RUN_FOOTER_TRACE_UNSET };
+    const url = buildTraceUrl(base, links[0].id);
+    if (!url) return { note: RUN_FOOTER_TRACE_UNSET };
+    return { url, links, base };
+  }
+
+  function createRunFooterAction(label, tooltip, iconKind) {
+    const link = document.createElement('a');
+    link.className = 'chat-run-footer__action chat-run-footer__action--' + iconKind;
+    link.setAttribute('aria-label', label);
+    link.setAttribute('title', tooltip);
+    const svg = createSvgElement('svg', {
+      viewBox: '0 0 24 24', width: '16', height: '16', fill: 'none', 'aria-hidden': 'true',
+    });
+    const paths = iconKind === 'detail'
+      ? ['M8 6h11M8 12h11M8 18h11', 'M4 6h.01M4 12h.01M4 18h.01']
+      : ['M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1',
+        'M14 11a5 5 0 0 0-7.1-.1l-2 2A5 5 0 0 0 12 20l1.1-1.1'];
+    paths.forEach((d) => svg.appendChild(createSvgElement('path', {
+      d, stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+    })));
+    link.appendChild(svg);
+    return link;
+  }
+
+  function buildRunFooterElement(sessionId, runId, row, trace, sig, timeLabel) {
+    const footer = buildMessageFooter(timeLabel);
+    footer.dataset.runId = runId;
+    footer.dataset.sig = sig;
+    const actions = footer.querySelector('.chat-run-footer__actions');
+    const detailLink = createRunFooterAction('查看执行详情', '详情', 'detail');
+    detailLink.href = '#';
+    detailLink.addEventListener('click', (event) => {
+      event.preventDefault();
+      if (typeof runFooterDetailHandler === 'function') runFooterDetailHandler(sessionId, runId);
+    });
+    actions.appendChild(detailLink);
+    if (trace && trace.url) {
+      const traceLink = createRunFooterAction('查看 Trace', 'Trace', 'trace');
+      traceLink.href = trace.url;
+      traceLink.target = '_blank';
+      traceLink.rel = 'noopener';
+      actions.appendChild(traceLink);
+    }
+    return footer;
+  }
+
+  // footer 数据解析：列表快照与详情快照按批次代次取较新者；
+  // 强制刷新（live）的详情始终最新（直播身份捕获绑定，不受批次代次约束）。
+  // 返回 {remove:true} | {row:null}（无数据，保持现状）| {row, traceRow, traceState}
+  function resolveFooterData(sessionId, runId) {
+    const list = runListCache[sessionId];
+    const detail = runDetailCache[sessionId + '\n' + runId];
+    const listOk = !!(list && list.state === 'ok');
+    const listRow = listOk ? (list.rows || []).find((r) => r && r.id === runId) : null;
+    const detailOk = !!(detail && detail.state === 'ok' && detail.row);
+    if (listOk && !listRow && !(detailOk && detail.live)) return { remove: true };
+    if (detailOk && detail.live) return { row: detail.row, traceRow: detail.row, traceState: 'ok' };
+    if (listOk && listRow) {
+      if (detailOk && (detail.token || 0) > (list.token || 0)) {
+        return { row: detail.row, traceRow: detail.row, traceState: 'ok' };
+      }
+      return {
+        row: listRow,
+        traceRow: detailOk ? detail.row : listRow,
+        traceState: detail ? (detailOk ? 'ok' : 'failed') : undefined,
+      };
+    }
+    if (detailOk) return { row: detail.row, traceRow: detail.row, traceState: 'ok' };
+    return { row: null };
+  }
+
+  function findRunFooterChild(el) {
+    if (!el || typeof el.querySelector !== 'function') return null;
+    try { return el.querySelector('.chat-run-footer') || null; } catch (error) { return null; }
+  }
+
+  // 对账：扫描当前会话消息栈中的 assistant 气泡，按 dataset.runId 维护 footer；
+  // 同一消息最多一个 footer；签名未变化的 footer 原样保留（避免焦点丢失）。
+  function reconcileRunFooters() {
+    const stack = ui.byId('chat-message-stack');
+    if (!stack || typeof api.listSessionRuns !== 'function' || !currentSessionId) return;
+    const bubbles = stack.querySelectorAll('.msg.assistant');
+    for (let i = 0; i < bubbles.length; i++) {
+      const el = bubbles[i];
+      const container = el.parentNode && el.parentNode.classList
+        && el.parentNode.classList.contains('chat-turn') ? el.parentNode : el;
+      const runId = el.dataset ? el.dataset.runId : null;
+      const footer = findRunFooterChild(container);
+      const timeEl = footer ? footer.querySelector('.chat-run-footer__time') : null;
+      const timeLabel = timeEl ? timeEl.textContent : '';
+      if (!runId) continue;
+      const data = resolveFooterData(currentSessionId, runId);
+      if (data.remove) {
+        if (footer) container.replaceChild(buildMessageFooter(timeLabel), footer);
+        continue;
+      }
+      if (!data.row) {
+        // 尚无任何快照：保持现状（首次失败不渲染）；列表已明确失败时按消息身份
+        // 排详情请求兜底（去重/批次令牌/终态缓存由队列内部处理，列表未定时不抢跑）
+        const list = runListCache[currentSessionId];
+        if (list && list.state === 'failed') ensureRunDetailQueued(currentSessionId, runId);
+        continue;
+      }
+      ensureRunDetailQueued(currentSessionId, runId);
+      const trace = resolveRunTraceDisplay(data.traceRow, data.traceState);
+      const sig = [
+        runStatusText(data.row.status),
+        runDurationText(data.row),
+        runToolCallText(data.row),
+        (trace && trace.url) ? trace.url : ((trace && trace.note) || ''),
+      ].join('|');
+      if (footer) {
+        if (footer.dataset.sig === sig) continue;
+        container.replaceChild(buildRunFooterElement(currentSessionId, runId, data.row, trace, sig, timeLabel), footer);
+      } else {
+        container.appendChild(buildRunFooterElement(currentSessionId, runId, data.row, trace, sig, timeLabel));
+      }
+    }
+  }
+
+  // 批次起点：applySessionDetail 每次进入开启新批次（列表 + OTel 配置并行）
+  function beginRunFooterBatch() {
+    if (!currentSessionId || typeof api.listSessionRuns !== 'function') return;
+    const sessionId = currentSessionId;
+    const token = ++sessionLoadToken;
+    fetchRunList(sessionId, token);
+    fetchOtelLinks(token);
+    // 计划修订（T6 审阅，见 plan-261101-add-turn-run-footer.md 审阅驱动的计划修订记录）：
+    // 同会话新批次不再让已选 Run 详情停留在“加载中...”——旧请求仍由四重归属校验
+    // 丢弃（不提交语义不变），此处以新批次 token 重发打开。仅在 Run tab 正在
+    // 展示/加载本会话详情时重发，且不抢焦点（避免批次刷新偷焦点）。
+    if (selectedRunDetail && selectedRunDetail.sessionId === sessionId
+      && activeSideTab === 'run') {
+      openRunDetail(sessionId, selectedRunDetail.runId, { focus: false });
+    }
+  }
+
+  function commitRunListFailure(sessionId) {
+    const prev = runListCache[sessionId];
+    if (!prev || prev.state !== 'ok') runListCache[sessionId] = { state: 'failed', rows: [] };
+  }
+
+  async function fetchRunList(sessionId, token) {
+    let rows = null;
+    try {
+      rows = await api.listSessionRuns(sessionId);
+    } catch (error) {
+      rows = null;
+    }
+    if (sessionId !== currentSessionId || token !== sessionLoadToken) return; // 旧批次丢弃
+    if (Array.isArray(rows)) runListCache[sessionId] = { state: 'ok', rows, token };
+    else commitRunListFailure(sessionId);
+    try { reconcileRunFooters(); } catch (error) { /* 渲染异常不影响数据提交与后续批次 */ }
+  }
+
+  function fetchOtelLinks(token) {
+    if (typeof api.getOtelLinks !== 'function') {
+      otelLinksState = { state: 'failed' };
+      return;
+    }
+    if (otelLinksInflight) {
+      // 并发合并：直接复用在途请求；配置为全局资源，每个批次都会重新发起读取
+      //（不缓存批次信息，热更新或恢复后由下一批次生效）
+      return;
+    }
+    otelLinksState = { state: 'loading' };
+    // inflight 必须无条件释放：reconcile 渲染异常不得让后续批次永久合并进死 promise
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      otelLinksInflight = null;
+      otelLinksState = result.ok ? { state: 'ok', data: result.data } : { state: 'failed' };
+      try { reconcileRunFooters(); } catch (error) { /* 渲染异常不阻断后续批次 */ }
+    };
+    otelLinksInflight = api.getOtelLinks()
+      .then((data) => settle({ ok: true, data }))
+      .catch(() => settle({ ok: false }));
+  }
+
+  function findRunDetailWaiting(key) {
+    for (let i = 0; i < runDetailWaiting.length; i++) {
+      if (runDetailWaiting[i] && runDetailWaiting[i].key === key) return runDetailWaiting[i];
+    }
+    return null;
+  }
+
+  // 详情请求入队：终态缓存直接复用；非终态（running/pending）每个批次重新排队，
+  // 保证运行中的 Run 在后续刷新中更新；force（直播捕获）绕过一切缓存判断。
+  function ensureRunDetailQueued(sessionId, runId, options) {
+    const force = !!(options && options.force === true);
+    if (typeof api.getSessionRun !== 'function' || !sessionId || !runId) return;
+    const key = sessionId + '\n' + runId;
+    if (!force) {
+      const cached = runDetailCache[key];
+      if (cached && cached.state === 'ok' && cached.row && RUN_TERMINAL_STATUSES.has(cached.row.status)) return;
+      if (runDetailAttemptToken[key] === sessionLoadToken) return; // 本批次已排队
+      if (findRunDetailWaiting(key) || runDetailInflight.has(key)) return;
+    } else if (runDetailInflight.has(key)) {
+      const holder = runDetailInflight.get(key);
+      if (holder) holder.stale = true; // 陈旧响应不得提交缓存
+    }
+    const waiting = findRunDetailWaiting(key);
+    if (waiting) {
+      if (force) waiting.force = true;
+      runDetailAttemptToken[key] = sessionLoadToken;
+      return;
+    }
+    runDetailWaiting.push({ key, sessionId, runId, token: sessionLoadToken, force });
+    runDetailAttemptToken[key] = sessionLoadToken;
+    pumpRunDetailQueue();
+  }
+
+  function pumpRunDetailQueue() {
+    while (runDetailActive < RUN_DETAIL_QUEUE_LIMIT && runDetailWaiting.length) {
+      const item = runDetailWaiting.shift();
+      runDetailActive++;
+      const holder = { stale: false };
+      runDetailInflight.set(item.key, holder);
+      runRequestRunDetail(item, holder).catch(() => { /* 渲染异常已在 finally 释放队列资源，兜底避免未处理拒绝 */ });
+    }
+  }
+
+  async function runRequestRunDetail(item, holder) {
+    let row = null;
+    try {
+      row = await api.getSessionRun(item.sessionId, item.runId);
+    } catch (error) {
+      row = null;
+    }
+    try {
+      if (!holder.stale) {
+        const valid = !!(row && typeof row === 'object' && row.id === item.runId);
+        if (valid) {
+          runDetailCache[item.key] = { state: 'ok', row, token: item.token, live: item.force === true };
+        } else if (!item.force) {
+          runDetailCache[item.key] = { state: 'failed', token: item.token };
+        }
+        // force 失败不覆盖缓存：已有 footer 保留最后成功快照
+      }
+      const shouldReconcile = item.force
+        ? item.sessionId === currentSessionId
+        : (item.sessionId === currentSessionId && item.token === sessionLoadToken);
+      if (shouldReconcile) reconcileRunFooters();
+    } finally {
+      // holder 身份校验：force 抢占会覆盖 Map 条目，陈旧响应不得误删新 holder 的去重窗口
+      if (runDetailInflight.get(item.key) === holder) runDetailInflight.delete(item.key);
+      runDetailActive--;
+      // 本 key 已无在途/等待请求时结算 getRunDetail 等待者（force 抢占时由新 holder 结算）
+      if (!runDetailInflight.has(item.key) && !findRunDetailWaiting(item.key)) settleRunDetailWaiters(item.key);
+      pumpRunDetailQueue();
+    }
+  }
+
+  // getRunDetail 等待者：T6 的 openRunDetail 将用 getRunDetail 复用缓存/在途请求（awaitable）
+  const runDetailWaiters = new Map();
+
+  function settleRunDetailWaiters(key) {
+    const waiters = runDetailWaiters.get(key);
+    if (!waiters) return;
+    runDetailWaiters.delete(key);
+    for (let i = 0; i < waiters.length; i++) waiters[i]();
+  }
+
+  // T6(Run 详情视图)：openRunDetail 通过该访问器复用正在进行的请求（spec：详情可复用缓存/在途）。
+  // 返回 Promise<row|null>：ok 缓存直接命中；否则经有界队列请求，完成时以最新快照结算
+  // （失败或 force 抢占后仍由后续完成者结算为 null/最新行）。running 快照同批次不会自动
+  // 重取，需要强制刷新时传 {force:true}。
+  function getRunDetail(sessionId, runId, options) {
+    const force = !!(options && options.force === true);
+    const key = sessionId + '\n' + runId;
+    const cached = runDetailCache[key];
+    if (!force && cached && cached.state === 'ok' && cached.row) return Promise.resolve(cached.row);
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        const entry = runDetailCache[key];
+        resolve(entry && entry.state === 'ok' && entry.row ? entry.row : null);
+      };
+      let waiters = runDetailWaiters.get(key);
+      if (!waiters) { waiters = []; runDetailWaiters.set(key, waiters); }
+      waiters.push(finish);
+      ensureRunDetailQueued(sessionId, runId, { force });
+      // 入队未产生在途/等待请求（终态缓存命中或队列内部去重跳过）时立即结算
+      if (!runDetailInflight.has(key) && !findRunDetailWaiting(key)) settleRunDetailWaiters(key);
+    });
+  }
+
+  // ============================================================
+  // T6(Run 详情 tab)：侧栏 Run 详情视图与选中请求归属。
+  // 点 footer 详情 -> expandSidePanel + activateSideTab('run') -> 读取
+  // Run 详情（复用 T5 getRunDetail 缓存/在途请求）+ 工具调用（按批次缓存）
+  // -> 渲染元信息 / 错误 / 工具 / Trace。返回时四重归属校验。
+  // ============================================================
+  const RUN_DETAIL_ARG_SUMMARY_LIMIT = 80;
+  let runDetailRequestSeq = 0;
+  let selectedRunDetail = null; // { sessionId, runId } | null
+  // 工具调用按批次缓存：仅本批次已完成的读取可复用；新批次（含运行前旧读取）强制重取
+  let runToolCallsCache = null; // { sessionId, token, promise } | null
+
+  // 状态色分类：completed 绿；failed/cancelled 红；interrupted/not_started 明确非成功色；
+  // running/pending 中性；未知灰
+  function runStatusClass(status) {
+    if (status === 'completed') return 'run-status--ok';
+    if (status === 'failed' || status === 'cancelled') return 'run-status--bad';
+    if (status === 'interrupted' || status === 'not_started') return 'run-status--warn';
+    if (status === 'running' || status === 'pending') return 'run-status--neutral';
+    return 'run-status--unknown';
+  }
+
+  // Run ID 中段截断：长 ID 首尾各 8 位 + 省略号；title 保留全量
+  function runIdShortText(runId) {
+    const id = String(runId == null ? '' : runId);
+    if (id.length <= 19) return id;
+    return id.slice(0, 8) + '…' + id.slice(id.length - 8);
+  }
+
+  // 开始时间：仅有限数字且 Date 有效才转换（Unix 秒乘 1000），统一按 UTC+8 渲染完整日期时间（复用 formatTime）
+  function runStartedAtText(row) {
+    const started = row ? row.started_at : null;
+    if (typeof started !== 'number' || !isFinite(started)) return '—';
+    const date = new Date(started * 1000);
+    if (isNaN(date.getTime())) return '—';
+    return formatTime(date.getTime());
+  }
+
+  // 参数安全序列化：try/catch + undefined 处理 + 折叠为单行；不可序列化/空值返回 null（显示 —）
+  function runArgSummaryFull(value) {
+    if (value === null || typeof value === 'undefined') return null;
+    let text;
+    try {
+      text = JSON.stringify(value);
+    } catch (error) {
+      return null;
+    }
+    if (typeof text !== 'string') return null;
+    text = text.replace(/\s+/g, ' ').trim();
+    return text || null;
+  }
+
+  // 工具耗时：有限非负毫秒数有效（0 有效），缺失/负数/非有限 —
+  function runToolDurationText(call) {
+    const ms = call ? call.duration_ms : null;
+    if (typeof ms === 'number' && isFinite(ms) && ms >= 0) return ms + 'ms';
+    return '—';
+  }
+
+  function renderRunDetailMetaRow(label, valueText, valueTitle) {
+    const row = document.createElement('div');
+    row.className = 'run-detail__meta-row';
+    const labelEl = document.createElement('span');
+    labelEl.className = 'run-detail__meta-label';
+    labelEl.textContent = label;
+    const valueEl = document.createElement('span');
+    valueEl.className = 'run-detail__meta-value';
+    valueEl.textContent = valueText;
+    if (valueTitle) valueEl.setAttribute('title', valueTitle);
+    row.appendChild(labelEl);
+    row.appendChild(valueEl);
+    return row;
+  }
+
+  // 工具区：当前会话工具调用按 run_id 精确过滤；请求失败/null 与空数组区分；
+  // 参数摘要单行截断 80 字符、title 保留完整安全文本；全部 textContent，不拼 HTML
+  function renderRunDetailTools(target, calls, runId) {
+    const section = document.createElement('div');
+    section.className = 'run-detail__section run-detail__section--tools';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'run-detail__section-title';
+    titleEl.textContent = '工具调用';
+    section.appendChild(titleEl);
+    if (!Array.isArray(calls)) {
+      const failEl = document.createElement('div');
+      failEl.className = 'run-detail__section-note run-status--unknown';
+      failEl.textContent = '无法加载工具调用';
+      section.appendChild(failEl);
+      target.appendChild(section);
+      return;
+    }
+    const mine = calls.filter((call) => call && call.run_id === runId);
+    if (!mine.length) {
+      const emptyEl = document.createElement('div');
+      emptyEl.className = 'run-detail__section-note';
+      emptyEl.textContent = '未调用工具';
+      section.appendChild(emptyEl);
+      target.appendChild(section);
+      return;
+    }
+    for (let i = 0; i < mine.length; i++) {
+      const call = mine[i];
+      const item = document.createElement('div');
+      item.className = 'run-detail__tool';
+      const line = document.createElement('div');
+      line.className = 'run-detail__tool-line';
+      const nameEl = document.createElement('span');
+      nameEl.className = 'run-detail__tool-name';
+      nameEl.textContent = (typeof call.tool_name === 'string' && call.tool_name) ? call.tool_name : '—';
+      const durEl = document.createElement('span');
+      durEl.className = 'run-detail__tool-duration';
+      durEl.textContent = runToolDurationText(call);
+      line.appendChild(nameEl);
+      line.appendChild(durEl);
+      const argsEl = document.createElement('div');
+      argsEl.className = 'run-detail__tool-args';
+      const fullArgs = runArgSummaryFull(call.arguments);
+      if (fullArgs === null) {
+        argsEl.textContent = '—';
+      } else {
+        argsEl.textContent = fullArgs.length > RUN_DETAIL_ARG_SUMMARY_LIMIT
+          ? fullArgs.slice(0, RUN_DETAIL_ARG_SUMMARY_LIMIT) + '…'
+          : fullArgs;
+        argsEl.setAttribute('title', fullArgs);
+      }
+      item.appendChild(line);
+      item.appendChild(argsEl);
+      section.appendChild(item);
+    }
+    target.appendChild(section);
+  }
+
+  // Trace 区：与 footer 共用 resolveRunTraceDisplay 三态判定（otel 失败优先于空链接，
+  // loading 不与“未配置”混淆——此时 footer 不表态，侧栏同样只保留标题不出降级文案）；
+  // 逐条展示前 8 位 ID 链接，不生成空链接
+  function renderRunDetailTrace(target, row) {
+    const section = document.createElement('div');
+    section.className = 'run-detail__section run-detail__section--trace';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'run-detail__section-title';
+    titleEl.textContent = 'Trace';
+    section.appendChild(titleEl);
+    const resolved = resolveRunTraceDisplay(row, 'ok');
+    if (resolved && resolved.note) {
+      const noteEl = document.createElement('div');
+      noteEl.className = 'run-detail__section-note';
+      noteEl.textContent = resolved.note;
+      section.appendChild(noteEl);
+      target.appendChild(section);
+      return;
+    }
+    if (resolved && resolved.links && resolved.base) {
+      for (let i = 0; i < resolved.links.length; i++) {
+        const url = buildTraceUrl(resolved.base, resolved.links[i].id);
+        if (!url) continue;
+        const linkEl = document.createElement('a');
+        linkEl.className = 'run-detail__trace-link';
+        linkEl.href = url;
+        linkEl.target = '_blank';
+        linkEl.rel = 'noopener';
+        linkEl.textContent = resolved.links[i].id.slice(0, 8);
+        linkEl.setAttribute('title', resolved.links[i].id);
+        section.appendChild(linkEl);
+      }
+    }
+    target.appendChild(section);
+  }
+
+  function renderRunDetail(target, row, calls, runId) {
+    clearNode(target);
+    const wrap = document.createElement('div');
+    wrap.className = 'run-detail';
+    const overview = document.createElement('section');
+    overview.className = 'run-detail__overview';
+    const header = document.createElement('div');
+    header.className = 'run-detail__header';
+    const titleEl = document.createElement('span');
+    titleEl.className = 'run-detail__title';
+    titleEl.textContent = '执行详情';
+    const statusEl = document.createElement('span');
+    statusEl.className = 'run-detail__status ' + runStatusClass(row.status);
+    statusEl.textContent = runStatusText(row.status);
+    header.appendChild(titleEl);
+    header.appendChild(statusEl);
+    overview.appendChild(header);
+
+    const meta = document.createElement('div');
+    meta.className = 'run-detail__meta';
+    meta.appendChild(renderRunDetailMetaRow('Run ID', runIdShortText(row.id),
+      row.id == null ? null : String(row.id)));
+    meta.appendChild(renderRunDetailMetaRow('来源',
+      (typeof row.source === 'string' && row.source) ? row.source : '—'));
+    meta.appendChild(renderRunDetailMetaRow('结束原因',
+      (typeof row.end_reason === 'string' && row.end_reason) ? row.end_reason : '—'));
+    meta.appendChild(renderRunDetailMetaRow('开始时间', runStartedAtText(row)));
+    meta.appendChild(renderRunDetailMetaRow('耗时', runDurationText(row)));
+    overview.appendChild(meta);
+
+    // error 仅非空字符串显示红色错误块，不显示 undefined/null/空串/数字
+    if (typeof row.error === 'string' && row.error) {
+      const errorEl = document.createElement('div');
+      errorEl.className = 'run-detail__error run-status--bad';
+      errorEl.textContent = row.error;
+      overview.appendChild(errorEl);
+    }
+    wrap.appendChild(overview);
+
+    renderRunDetailTools(wrap, calls, runId);
+    renderRunDetailTrace(wrap, row);
+    target.appendChild(wrap);
+  }
+
+  // 工具调用读取：本批次内复用已完成读取（token 绑定 sessionLoadToken）；
+  // 新批次强制重取，运行前工具缓存不可复用
+  function fetchRunToolCallsForDetail(sessionId) {
+    if (runToolCallsCache && runToolCallsCache.sessionId === sessionId
+      && runToolCallsCache.token === sessionLoadToken) {
+      return runToolCallsCache.promise;
+    }
+    const promise = (async () => api.getSessionToolCalls(sessionId))();
+    runToolCallsCache = { sessionId, token: sessionLoadToken, promise };
+    return promise;
+  }
+
+  // 详情点击接管（T5 footer 详情链接注入）：展开侧栏并激活 Run tab，随后读取
+  // Run 详情与工具调用。每次打开刷新；开始即清旧 Run 内容显示 loading。
+  // 返回时四重归属校验（Session / 批次 token / 请求序号 / 选中 Run）：
+  // 快速选 Run A→B 后 A 迟到、同会话新批次、切换/删除会话后的旧请求均不提交。
+  // options.focus 为 false 时不移动焦点，也不展开侧栏（批次自动重发为后台渲染，
+  // 用户折叠侧栏后不得被批次刷新弹回展开）；用户点击打开（默认 focus）保持展开行为
+  async function openRunDetail(sessionId, runId, options) {
+    const focusTab = !(options && options.focus === false);
+    const target = ui.byId('chat-run-detail');
+    if (!target || !sessionId || !runId) return;
+    if (focusTab) expandSidePanel();
+    activateSideTab('run', focusTab);
+    const token = sessionLoadToken;
+    const seq = ++runDetailRequestSeq;
+    selectedRunDetail = { sessionId, runId };
+    clearNode(target);
+    target.textContent = '加载中...';
+    const [detailRes, toolsRes] = await Promise.allSettled([
+      getRunDetail(sessionId, runId),
+      fetchRunToolCallsForDetail(sessionId),
+    ]);
+    if (sessionId !== currentSessionId || token !== sessionLoadToken
+      || seq !== runDetailRequestSeq
+      || !selectedRunDetail || selectedRunDetail.sessionId !== sessionId
+      || selectedRunDetail.runId !== runId) return;
+    const row = (detailRes && detailRes.status === 'fulfilled') ? detailRes.value : null;
+    if (!row || typeof row !== 'object') {
+      // Run 详情失败（含 404）：只显示错误，不留上一 Run 内容
+      clearNode(target);
+      target.textContent = '无法加载执行详情';
+      return;
+    }
+    // 详情成功：同分区缓存已由 getRunDetail 提交，对账 footer 保持一致
+    try { reconcileRunFooters(); } catch (error) { /* 渲染异常不影响详情展示 */ }
+    renderRunDetail(target, row, (toolsRes && toolsRes.status === 'fulfilled') ? toolsRes.value : null, runId);
+  }
+
+  // 会话切换/删除：清选中与占位，旧请求经四重校验自然丢弃
+  function resetRunDetailPanel() {
+    selectedRunDetail = null;
+    runDetailRequestSeq++;
+    runToolCallsCache = null;
+    const target = ui.byId('chat-run-detail');
+    if (target) {
+      clearNode(target);
+      target.textContent = '暂未选择 Run';
+    }
+  }
+
+  // 会话级缓存驱逐：切换/删除会话时清理该会话的 runs 列表与 Run 详情快照（防慢泄漏）
+  function evictRunCachesForSession(sessionId) {
+    if (!sessionId) return;
+    delete runListCache[sessionId];
+    const prefix = sessionId + '\n';
+    for (const key of Object.keys(runDetailCache)) {
+      if (key.indexOf(prefix) === 0) delete runDetailCache[key];
+    }
+    for (const key of Object.keys(runDetailAttemptToken)) {
+      if (key.indexOf(prefix) === 0) delete runDetailAttemptToken[key];
+    }
+  }
+
   // /task slash 命令统一用法与错误码映射。错误码来自 task_routes 的 _task_error_response
   // （fetchJson 失败时 throw new Error(code)），映射为可读说明并保留原码。
   const TASK_USAGE = '用法：/task create <title> [--body <text>] [--priority <n>] [--goal] | list | approve|reject <id> [--note <text>] | cancel|retry <id>';
@@ -2459,9 +3229,12 @@
   }
 
   function _lastMessageEl(stack) {
-    if (stack.lastElementChild) return stack.lastElementChild;
-    const kids = stack._kids || [];
-    return kids.length ? kids[kids.length - 1] : null;
+    const last = stack.lastElementChild || (() => {
+      const kids = stack._kids || [];
+      return kids.length ? kids[kids.length - 1] : null;
+    })();
+    if (!last) return null;
+    return last.classList && last.classList.contains('chat-turn') ? last.querySelector('.msg') : last;
   }
 
   function _detailsPre(el) {
@@ -2500,8 +3273,11 @@
     if (!el || !messageId || !el.dataset) return;
     if (el.dataset.messageKey) return;
     const key = String(messageId);
+    const node = el.parentNode && el.parentNode.classList
+      && el.parentNode.classList.contains('chat-turn') ? el.parentNode : el;
     el.dataset.messageKey = key;
-    renderedMessageNodes.set(key, el);
+    node.dataset.messageKey = key;
+    renderedMessageNodes.set(key, node);
     // Deliberately omit a fingerprint: the next authoritative snapshot must
     // replace the optimistic content with its canonical grouped content.
     renderedMessageFingerprints.delete(key);
@@ -2825,6 +3601,9 @@
     // must use THIS id, not a subsequently-switched global currentSessionId.
     const streamSessionId = currentSessionId;
     activeStreamEl = streaming;
+    // T5(Run footer): 新的发送代次；终结 chunk 捕获的 run_id 绑定该代次
+    sendGeneration++;
+    liveStreamRunCapture = null;
     var reader = null;
     try {
       const res = await fetch('/chat/completions', {
@@ -2890,6 +3669,15 @@
       // Stream end/failure: disable outstanding approval cards (no late POST)
       disableApprovalCards(streaming);
       activeStreamEl = null;
+      // T5(Run footer): 直播捕获到终结 chunk 身份时强制刷新该 Run 详情；
+      // 陈旧 running 缓存不可替代请求。无身份（断连/本地停止/旧形态）不猜测，
+      // 仅依赖下方消息重载后的关联对账。
+      const captured = liveStreamRunCapture;
+      liveStreamRunCapture = null;
+      if (captured && captured.generation === sendGeneration && captured.sessionId === streamSessionId
+        && typeof api.getSessionRun === 'function') {
+        ensureRunDetailQueued(streamSessionId, captured.runId, { force: true });
+      }
       setSending(false);
       await refreshCurrentSession();
       input.focus();
@@ -2904,27 +3692,44 @@
     btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   }
 
+  // 切换按钮定位：展开时移入侧栏 header（右上角），收起时回到对话区 header。
+  // querySelector 按 class 定位 header；宿主 DOM 缺失时（如测试桩）跳过移动，不影响 toggle 语义。
+  // T6 提取为模块级共享逻辑：bindSideToggle 的点击与 expandSidePanel 的程序化展开共用。
+  function placeSideToggleBtn() {
+    const btn = ui.byId('chat-side-toggle-btn');
+    const shell = ui.byId('chat-shell');
+    if (!btn || !shell) return;
+    const stackHeader = shell.querySelector('.chat-stack > .panel-header');
+    const sidePanel = ui.byId('chat-side-panel');
+    const sideHeader = sidePanel ? sidePanel.querySelector('.panel-header') : null;
+    const collapsed = shell.classList.contains('chat-shell--side-collapsed');
+    const target = (collapsed || !sideHeader) ? stackHeader : sideHeader;
+    if (target && target !== btn.parentNode) target.appendChild(btn);
+  }
+
   function bindSideToggle() {
     const btn = ui.byId('chat-side-toggle-btn');
     const shell = ui.byId('chat-shell');
     if (!btn || !shell) return;
-    // 展开/收起按钮视作右侧边栏的一部分：展开时移入侧栏 header（右上角），收起时回到对话区 header。
-    // querySelector 按 class 定位 header；宿主 DOM 缺失时（如测试桩）跳过移动，不影响 toggle 语义。
-    const stackHeader = shell.querySelector('.chat-stack > .panel-header');
-    const sidePanel = ui.byId('chat-side-panel');
-    const sideHeader = sidePanel ? sidePanel.querySelector('.panel-header') : null;
-    function placeToggleBtn() {
-      const collapsed = shell.classList.contains('chat-shell--side-collapsed');
-      const target = (collapsed || !sideHeader) ? stackHeader : sideHeader;
-      if (target && target !== btn.parentNode) target.appendChild(btn);
-    }
     btn.addEventListener('click', () => {
       shell.classList.toggle('chat-shell--side-collapsed');
-      placeToggleBtn();
+      placeSideToggleBtn();
       syncSideCollapse();
     });
-    placeToggleBtn();
+    placeSideToggleBtn();
     syncSideCollapse();
+  }
+
+  // T6(Run 详情)：可复用侧栏展开 helper。已展开时幂等返回；展开后与点击路径一致地
+  // 重新定位切换按钮并同步 aria-expanded。
+  function expandSidePanel() {
+    const shell = ui.byId('chat-shell');
+    if (!shell) return false;
+    if (!shell.classList.contains('chat-shell--side-collapsed')) return true;
+    shell.classList.remove('chat-shell--side-collapsed');
+    placeSideToggleBtn();
+    syncSideCollapse();
+    return true;
   }
 
   function syncSessionsCollapse() {
@@ -2961,16 +3766,14 @@
   }
 
   function activateSideTab(value, focus) {
-    if (value !== 'tool' && value !== 'artifact') return;
+    if (value !== 'tool' && value !== 'artifact' && value !== 'run') return;
     activeSideTab = value;
-    const toolBtn = ui.byId('chat-tab-tool-button');
-    const artBtn = ui.byId('chat-tab-artifact-button');
-    const toolPanel = ui.byId('chat-tab-tool');
-    const artPanel = ui.byId('chat-tab-artifact');
     const tabs = [
-      { btn: toolBtn, panel: toolPanel, key: 'tool' },
-      { btn: artBtn, panel: artPanel, key: 'artifact' },
+      { btn: ui.byId('chat-tab-tool-button'), panel: ui.byId('chat-tab-tool'), key: 'tool' },
+      { btn: ui.byId('chat-tab-artifact-button'), panel: ui.byId('chat-tab-artifact'), key: 'artifact' },
+      { btn: ui.byId('chat-tab-run-button'), panel: ui.byId('chat-tab-run'), key: 'run' },
     ];
+    let focusBtn = null;
     tabs.forEach((t) => {
       const active = t.key === value;
       if (t.btn) {
@@ -2979,17 +3782,16 @@
         t.btn.setAttribute('tabindex', active ? '0' : '-1');
       }
       if (t.panel) t.panel.hidden = !active;
+      if (active) focusBtn = t.btn;
     });
-    const focusBtn = value === 'tool' ? toolBtn : artBtn;
     if (focus && focusBtn && typeof focusBtn.focus === 'function') focusBtn.focus();
   }
 
   function bindTabSwitch() {
-    const toolBtn = ui.byId('chat-tab-tool-button');
-    const artBtn = ui.byId('chat-tab-artifact-button');
     const tabs = [
-      { btn: toolBtn, key: 'tool' },
-      { btn: artBtn, key: 'artifact' },
+      { btn: ui.byId('chat-tab-tool-button'), key: 'tool' },
+      { btn: ui.byId('chat-tab-artifact-button'), key: 'artifact' },
+      { btn: ui.byId('chat-tab-run-button'), key: 'run' },
     ];
     tabs.forEach((t, idx) => {
       if (!t.btn) return;
@@ -3818,6 +4620,8 @@
     bindSideToggle();
     bindSessionsToggle();
     bindTabSwitch();
+    // T6: footer 详情链接由 openRunDetail 接管（T5 预留注入点）
+    setRunFooterDetailHandler(openRunDetail);
     renderArtifactPanel();
     document.addEventListener('click', handleMemoryDocumentClick);
     document.addEventListener('click', handleSettingsDocumentClick);
@@ -3877,5 +4681,5 @@
   }
 
   global.NAGENT = namespace;
-  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, getActivatedSkills, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload, isSuccessfulBrowserScreenshot, setHeader, buildHeaderLinks, loadSessionViewLinks };
+  global.NAGENT.chat = { init, parseTaskCommand, runTaskCommand, send, createMessageElement, validateTaskCard, validateToolApprovalCard, resolveToolApprovalDecisions, groupTaskMessages, applySessionDetail, shouldRenderMessage, getDebugSettings, setDebugSettings, getActivatedSkills, createSSEParser, renderToolApprovalCard, disableApprovalCards, isValidApprovalPayload, isSuccessfulBrowserScreenshot, setHeader, buildHeaderLinks, loadSessionViewLinks, buildTraceUrl, setRunFooterDetailHandler, reconcileRunFooters, getRunDetail };
 }(window));

@@ -205,6 +205,8 @@ def test_mem0_late_worker_retains_original_trace(sdk, monkeypatch):
         request = next(s for s in spans if s.kind is trace.SpanKind.CLIENT)
         entry = next(s for s in spans if s.name == "memory.prefetch mem0")
         assert entry.attributes["nagent.outcome"] == "timed_out"
+        assert entry.status.status_code.name == "ERROR"
+        assert "nagent.details.error.content" in entry.attributes
         assert worker.context.trace_id == first.get_span_context().trace_id
         assert worker.context.trace_id != second.get_span_context().trace_id
         assert request.parent.span_id == worker.context.span_id

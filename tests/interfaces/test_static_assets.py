@@ -484,12 +484,12 @@ def test_chat_side_panel_has_tab_structure(tmp_path):
     assert 'side-toggle__panel' in html
     assert '更多信息' in html
 
-    # 3. tablist has exactly two tabs (tool/artifact) with consistent attributes
+    # 3. tablist has exactly three tabs (tool/artifact/run) with consistent attributes
     tablist_match = _re.search(r'role="tablist"[^>]*>(.*?)</div>\s*<div[^>]*chat-tab-panels', html, _re.DOTALL)
     assert tablist_match, "tablist not found"
     tablist_inner = tablist_match.group(1)
     tabs = _re.findall(r'<button[^>]*role="tab"[^>]*>', tablist_inner)
-    assert len(tabs) == 2, f"expected 2 tabs, got {len(tabs)}"
+    assert len(tabs) == 3, f"expected 3 tabs, got {len(tabs)}"
     # tool tab: active, aria-selected=true, tabindex=0
     assert 'data-tab="tool"' in tablist_inner
     assert 'aria-selected="true"' in tablist_inner
@@ -499,21 +499,28 @@ def test_chat_side_panel_has_tab_structure(tmp_path):
     assert 'data-tab="artifact"' in tablist_inner
     assert 'aria-selected="false"' in tablist_inner
     assert 'tabindex="-1"' in tablist_inner
+    # run tab (T6): not active, aria-selected=false, tabindex=-1
+    assert 'data-tab="run"' in tablist_inner
     # aria-controls references panel ids
     assert 'aria-controls="chat-tab-tool"' in tablist_inner
     assert 'aria-controls="chat-tab-artifact"' in tablist_inner
+    assert 'aria-controls="chat-tab-run"' in tablist_inner
 
-    # 4. Two tabpanels with correct aria-labelledby; artifact panel hidden
+    # 4. Three tabpanels with correct aria-labelledby; artifact/run panels hidden
     tabpanels = _re.findall(r'<div[^>]*role="tabpanel"[^>]*>', html)
-    assert len(tabpanels) == 2, f"expected 2 tabpanels, got {len(tabpanels)}"
+    assert len(tabpanels) == 3, f"expected 3 tabpanels, got {len(tabpanels)}"
     assert 'aria-labelledby="chat-tab-tool-button"' in html
     assert 'aria-labelledby="chat-tab-artifact-button"' in html
+    assert 'aria-labelledby="chat-tab-run-button"' in html
     artifact_panel_match = _re.search(r'<div[^>]*id="chat-tab-artifact"[^>]*>', html)
     assert artifact_panel_match, "artifact tabpanel not found"
     assert 'hidden' in artifact_panel_match.group(0), "artifact panel must be hidden by default"
     tool_panel_match = _re.search(r'<div[^>]*id="chat-tab-tool"[^>]*>', html)
     assert tool_panel_match, "tool tabpanel not found"
     assert 'hidden' not in tool_panel_match.group(0), "tool panel must not be hidden"
+    run_panel_match = _re.search(r'<div[^>]*id="chat-tab-run"[^>]*>', html)
+    assert run_panel_match, "run tabpanel not found"
+    assert 'hidden' in run_panel_match.group(0), "run panel must be hidden by default"
 
     # 5. Original debug-sections preserved once each, inside tool panel
     assert html.count('id="chat-summary"') == 1
@@ -948,6 +955,21 @@ def test_chat_session_column_width_stays_fixed_when_debug_toggles(tmp_path):
     css = client.get('/static/styles.css').text
     assert 'grid-template-columns: 280px minmax(0, 2fr) 280px' in css
     assert 'grid-template-columns: 280px minmax(0, 1fr)' in css
+
+
+def test_chat_messages_have_visible_top_gap(tmp_path):
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    rules = _css_rule_bodies(css, '.chat-stack__messages')
+    assert rules and 'padding: 20px 16px 10px' in rules[0]
+
+
+def test_chat_side_panel_empty_hints_use_auxiliary_font_size(tmp_path):
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    for selector in ('#chat-artifact-list', '#chat-run-detail'):
+        rules = _css_rule_bodies(css, selector)
+        assert rules and 'font-size: var(--font-size-sm)' in rules[0]
 
 
 def test_static_assets_use_safe_text_rendering(tmp_path):
@@ -1681,17 +1703,17 @@ def test_styles_css_contains_summary_message_styles(tmp_path):
 
 
 def test_chat_message_hover_reveals_timestamp_feishu_style(tmp_path):
-    """PRD 03-prd-specs: Chat框鼠标 Hover 展示消息时间，样式、格式参考飞书消息。
-    chat.js 读取服务端 created_at 并按 今天/昨天/今年/往年 分级格式化，写入 data-time；
-    styles.css 在 .msg:hover 时通过 attr(data-time) 在气泡上方展示小号灰色时间。"""
+    """消息时间从 created_at 格式化后渲染到气泡下方 footer 右侧，随消息容器 hover 显示。"""
     client = _client(tmp_path)
     chat_js = client.get('/static/chat.js').text
     css = client.get('/static/styles.css').text
 
     # JS: 时间格式化函数，消费服务端 created_at，分级输出（今天 HH:mm / 昨天 / 月日 / 年月日）
     assert 'function formatMessageTime' in chat_js
-    assert 'formatMessageTime(message.created_at)' in chat_js
-    assert "el.dataset.time = timeLabel" in chat_js
+    assert 'formatMessageTime(message && message.created_at)' in chat_js
+    assert "buildMessageFooter(formatMessageTime(message && message.created_at))" in chat_js
+    assert "time.textContent = timeLabel || ''" in chat_js
+    assert "el.dataset.time = timeLabel" not in chat_js
     assert "'昨天 '" in chat_js
     assert '86400000' in chat_js
     # 发送用户消息时携带客户端时间戳，Hover 即刻可见（流式结束后由 refresh 用服务端时间覆盖）
@@ -1704,19 +1726,20 @@ def test_chat_message_hover_reveals_timestamp_feishu_style(tmp_path):
     assert 'function formatTime' in chat_js
     assert 'formatTime(approval.expires_at)' in chat_js
 
-    # CSS: hover 时通过 attr(data-time) 展示小号灰色时间，不抢占气泡空间
-    assert 'content: attr(data-time)' in css
-    assert '.msg[data-time]::before' in css
-    assert '.msg[data-time]:hover::before' in css
+    # CSS: 左侧气泡 footer 时间居左，右侧气泡保持居右；旧气泡顶部伪元素已移除
+    assert '.chat-run-footer__time' in css
+    time_rules = _css_rule_bodies(css, '.chat-run-footer__time')
+    assert time_rules and any('margin-left: 0' in body for body in time_rules)
+    right_time_rules = _css_rule_bodies(css, '.chat-turn--right .chat-run-footer__time')
+    assert right_time_rules and any('margin-left: auto' in body for body in right_time_rules)
+    assert '.chat-turn:hover > .chat-run-footer' in css
+    assert 'content: attr(data-time)' not in css
+    assert '.msg[data-time]::before' not in css
     assert 'pointer-events: none' in css
 
-    # 首条消息上方无 16px 消息间距可借：hover 时间以 top:-14px 浮于气泡上方，
-    # 滚动容器 .chat-stack__messages 顶部 padding 必须容纳 14px 时间高度并保留原 10px
-    # 视觉留白，否则 overflow-y:auto 裁剪导致首条消息 hover 时间只展示一半
-    messages_rules = _css_rule_bodies(css, '.chat-stack__messages')
-    assert messages_rules, "styles.css missing .chat-stack__messages rule"
-    assert any('padding: 24px 16px 10px' in body for body in messages_rules), \
-        ".chat-stack__messages top padding must reserve room for the -14px hover timestamp"
+    # footer 始终保留最小高度，显隐不改变消息布局
+    footer_rules = _css_rule_bodies(css, '.chat-run-footer')
+    assert footer_rules and any('min-height: 28px' in body for body in footer_rules)
 
 
 def test_browser_static_assets_and_wiring(tmp_path):

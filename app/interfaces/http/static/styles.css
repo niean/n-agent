@@ -176,9 +176,7 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 #tab-chat.active { height: calc(100vh - 90px); margin-right: -20px; overflow-y: hidden; }
 /* 三区底色：会话面板外层与标题栏为 --color-bg-subtle；会话面板内容区（panel-body + session-list）与对话框消息区、输入区为 --color-bg-white；右侧边栏状态面板不变。 */
 .chat-stack { display: flex; flex-direction: column; min-width: 0; height: calc(100vh - 80px); background: var(--color-bg-subtle); border: 1px solid var(--color-border-muted); border-radius: var(--radius-md); box-shadow: var(--shadow-card); overflow: hidden; }
-/* 顶部 padding 24px = hover 时间戳高度 14px（.msg[data-time]::before top:-14px）+ 原 10px 视觉留白；
-   首条消息上方无 16px 消息间距可借，padding 不足时 overflow-y:auto 会裁掉首条消息的 hover 时间。 */
-.chat-stack__messages { flex: 1; overflow-y: auto; padding: 24px 16px 10px; background: var(--color-bg-white); }
+.chat-stack__messages { flex: 1; overflow-y: auto; padding: 20px 16px 10px; background: var(--color-bg-white); }
 .chat-stack__composer { margin-bottom: 10px; padding: 10px 16px; border-top: 1px solid var(--color-border-light); background: var(--color-bg-white); }
 .chat-stack__hint { margin-top: 6px; color: var(--color-fg-subtle); font-size: 11px; text-align: center; }
 .message-stack { display: flex; flex-direction: column; gap: 16px; width: min(100%, calc(240px + 50%), 1360px); margin-inline: auto; }
@@ -193,7 +191,7 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .chat-tab-panels { flex: 1 1 auto; min-height: 0; min-width: 0; overflow-y: auto; padding: 10px 12px; }
 .chat-tab-content { min-width: 0; }
 .chat-tab-content[hidden] { display: none; }
-#chat-artifact-list { min-width: 0; }
+#chat-artifact-list, #chat-run-detail { min-width: 0; font-size: var(--font-size-sm); }
 
 /* Composer: 豆包风格圆角容器，容纳预览+textarea+图标按钮行；
    .chat-stack__composer 与 .chat-stack__messages 统一白底（--color-bg-white），
@@ -255,6 +253,58 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .chat-task-artifact-line { margin-top: 4px; }
 .chat-task-artifact-line:first-child { margin-top: 0; }
 
+/* 通用消息 footer：左侧气泡的操作与时间均居左，右侧气泡时间居右；显隐不改变布局高度。 */
+.chat-turn { display: flex; flex-direction: column; align-self: flex-start; max-width: 92%; min-width: 0; }
+.chat-turn--assistant, .chat-turn--right { max-width: 80%; }
+.chat-turn--right { align-self: flex-end; }
+.chat-turn--center { align-self: center; }
+.chat-turn > .msg { align-self: stretch; max-width: 100%; }
+.chat-run-footer { display: flex; align-items: center; gap: 4px; min-height: 28px; padding: 2px 4px 0; color: var(--color-fg-subtle); opacity: 0; pointer-events: none; transition: opacity 0.15s ease; }
+.chat-turn:hover > .chat-run-footer,
+.chat-turn:focus-within > .chat-run-footer { opacity: 1; pointer-events: auto; }
+.chat-run-footer__actions { display: flex; align-items: center; gap: 4px; }
+.chat-run-footer__actions:empty { display: none; }
+.chat-run-footer__time { margin-left: 0; font-size: 11px; line-height: 1; white-space: nowrap; }
+.chat-turn--right .chat-run-footer__time { margin-left: auto; }
+.chat-run-footer__action { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: var(--radius-sm); color: var(--color-fg-subtle); text-decoration: none; }
+.chat-run-footer__action:hover { color: var(--color-fg-default); background: var(--color-bg-hover); }
+.chat-run-footer__action:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+.chat-run-footer__action svg { display: block; }
+@media (hover: none), (pointer: coarse) {
+  .chat-run-footer { opacity: 1; pointer-events: auto; }
+}
+
+/* Run 详情：概览、工具与 Trace 分组卡片，状态色沿用既有语义 token。 */
+.run-detail { display: flex; flex-direction: column; gap: 12px; color: var(--color-fg-default); font-size: 13px; }
+.run-detail__overview,
+.run-detail__section { padding: 10px; border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); background: var(--color-bg-subtle); }
+.run-detail__overview { display: flex; flex-direction: column; gap: 10px; }
+.run-detail__header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--color-border-light); }
+.run-detail__title { font-size: var(--font-size-md); font-weight: 600; }
+.run-detail__status { flex: 0 0 auto; padding: 2px 6px; border-radius: var(--radius-sm); background: var(--color-bg-white); font-size: 12px; font-weight: 600; }
+.run-status--ok { color: var(--color-success-fg); }
+.run-status--bad { color: var(--color-danger-fg); }
+.run-status--warn { color: var(--color-warning-fg); }
+.run-status--neutral { color: var(--color-fg-default); }
+.run-status--unknown { color: var(--color-fg-subtle); }
+.run-detail__meta { display: flex; flex-direction: column; gap: 6px; }
+.run-detail__meta-row { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; min-width: 0; }
+.run-detail__meta-label { color: var(--color-fg-muted); font-size: 12px; }
+.run-detail__meta-value { min-width: 0; overflow-wrap: anywhere; }
+.run-detail__error { padding: 6px 8px; border-radius: var(--radius-sm); background: var(--color-danger-bg); color: var(--color-danger-fg); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.run-detail__section { display: flex; flex-direction: column; gap: 8px; }
+.run-detail__section-title { color: var(--color-fg-default); font-size: 12px; font-weight: 600; }
+.run-detail__section-note { color: var(--color-fg-subtle); font-size: 12px; }
+.run-detail__tool { display: flex; flex-direction: column; gap: 4px; padding: 8px; border-radius: var(--radius-sm); background: var(--color-bg-white); }
+.run-detail__tool + .run-detail__tool { border-top: 1px solid var(--color-border-light); }
+.run-detail__tool-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.run-detail__tool-name { min-width: 0; overflow-wrap: anywhere; font-weight: 500; }
+.run-detail__tool-duration { flex: 0 0 auto; color: var(--color-fg-muted); font-size: 12px; }
+.run-detail__tool-args { color: var(--color-fg-subtle); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.run-detail__trace-link { align-self: flex-start; max-width: 100%; color: var(--color-primary); text-decoration: none; overflow-wrap: anywhere; }
+.run-detail__trace-link:hover { text-decoration: underline; }
+.run-detail__trace-link:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+
 /* Task lifecycle interactive card (T6/T7): inline card with action buttons + revise textarea.
    Reuses existing tokens (msg.system palette, radius, spacing). Stale/unavailable only
    render body + feedback, no buttons or textarea created. */
@@ -289,29 +339,6 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .tool-approval-card__expires { font-size: 12px; color: var(--color-fg-subtle); }
 .tool-approval-card__actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .tool-approval-card__feedback { font-size: 12px; color: var(--color-fg-subtle); min-height: 16px; margin-top: 6px; }
-
-/* Hover timestamp (飞书风格): 鼠标悬停消息气泡时，在气泡上方展示小号灰色时间。
-   时间文本由 JS 写入 data-time，CSS 用 attr() 取值，避免 innerHTML。
-   仅 user/assistant 消息携带 data-time；tool/summary 调试卡不展示。
-   绝对定位浮于 gap 内，不抢占气泡空间，pointer-events:none 不干扰点击。
-   首条消息上方无 gap，其悬浮空间由 .chat-stack__messages 顶部 padding 24px 提供；
-   调整 top:-14px 偏移时必须同步调整该 padding，否则首条消息时间被滚动容器裁剪。 */
-.msg[data-time] { position: relative; }
-.msg[data-time]::before {
-  content: attr(data-time);
-  position: absolute;
-  top: -14px;
-  font-size: 11px;
-  line-height: 1;
-  color: var(--color-fg-subtle);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.15s ease;
-  white-space: nowrap;
-}
-.msg.user[data-time]::before { right: 2px; }
-.msg.assistant[data-time]::before { left: 2px; }
-.msg[data-time]:hover::before { opacity: 1; }
 
 /* Image preview lightbox */
 .image-preview-modal { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(15,23,42,.85); cursor: zoom-out; }
@@ -370,7 +397,7 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
 .chat-session-toggle-btn[aria-expanded="false"] .session-toggle__panel { fill: currentColor; fill-opacity: 0.18; }
 @media (prefers-reduced-motion: reduce) {
   .chat-side-toggle-btn, .chat-session-toggle-btn, #chat-session-expand-btn { transition: none; }
-  .side-toggle__panel, .session-toggle__panel { transition: none; }
+  .side-toggle__panel, .session-toggle__panel, .chat-run-footer { transition: none; }
 }
 .status-badge { display: inline-block; padding: 3px 8px; border-radius: var(--radius-pill); font-size: 11px; }
 .status-badge.running { color: #0369a1; background: #e0f2fe; }

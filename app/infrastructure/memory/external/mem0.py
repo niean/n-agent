@@ -12,7 +12,7 @@ from app.application.telemetry_details import project_details
 
 logger = logging.getLogger(__name__)
 
-_PREFETCH_WAIT_SECS = 1.5
+_PREFETCH_WAIT_SECS = 3.0
 _PREFETCH_TOP_K = 10
 
 _PROFILE_SCHEMA = {

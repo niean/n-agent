@@ -1792,3 +1792,193 @@ async def test_v1_chat_completions_still_fail_closed_no_approval(tmp_path):
         })
         assert r.status_code == 200
         assert "n-agent.tool_approval" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# T3: Dashboard Run 轻量入口 (run_footer) 响应合同
+# ---------------------------------------------------------------------------
+
+from app.application.chat_service import ChatCompletionResult
+
+
+class _RunFooterChatService:
+    """Stub ChatCompletionService：非流式返回预置结果，流式返回预置事件序列。"""
+
+    def __init__(self, result=None, events=None):
+        self._result = result
+        self._events = events
+
+    async def complete(self, request):
+        if request.stream:
+            async def _gen():
+                for event in self._events:
+                    yield event
+            return _gen()
+        return self._result
+
+
+def _parse_sse(text: str):
+    """Parse an SSE body into (chunk objects, done_seen)."""
+    chunks = []
+    done_seen = False
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        payload = line[len("data: "):]
+        if payload == "[DONE]":
+            done_seen = True
+            continue
+        chunks.append(_json.loads(payload))
+    return chunks, done_seen
+
+
+def _run_footer_result(run_id=None, finish_reason="stop"):
+    return ChatCompletionResult(
+        session_id="s-footer",
+        model="test-model",
+        message={"role": "assistant", "content": "hello"},
+        finish_reason=finish_reason,
+        usage={"total_tokens": 3},
+        run_id=run_id,
+    )
+
+
+async def _run_footer_stream_text(tmp_path, chat_service, name="s-footer"):
+    store = SQLiteMemoryStore(tmp_path / f"{name}.db")
+    app = _build_app(store, chat_service=chat_service)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(f"/chat/sessions?session_id={name}")
+        async with client.stream(
+            "POST",
+            "/chat/completions",
+            headers={"X-Session-ID": name},
+            json={"model": "test-model", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        ) as response:
+            assert response.headers["content-type"].startswith("text/event-stream")
+            return "".join([chunk async for chunk in response.aiter_text()])
+
+
+async def test_run_footer_non_stream_success_includes_run_id(tmp_path):
+    """非流式成功：持久化 run_id 以顶层 run_footer 键透出，既有字段不回退。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    chat_service = _RunFooterChatService(result=_run_footer_result(run_id="run-abc-123"))
+    client = TestClient(_build_app(store, chat_service=chat_service))
+    client.post("/chat/sessions?session_id=s-footer")
+
+    response = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "s-footer"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == "run-abc-123"
+    assert body["object"] == "chat.completion"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["message"] == {"role": "assistant", "content": "hello"}
+    assert body["usage"] == {"total_tokens": 3}
+
+
+async def test_run_footer_non_stream_omits_run_id_without_identity(tmp_path):
+    """无账本/无身份：run_id 键整体缺省，不输出空值。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    chat_service = _RunFooterChatService(result=_run_footer_result(run_id=None))
+    client = TestClient(_build_app(store, chat_service=chat_service))
+    client.post("/chat/sessions?session_id=s-footer")
+
+    response = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "s-footer"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert "run_id" not in response.json()
+
+
+async def test_run_footer_non_stream_error_keeps_http_error_contract(tmp_path):
+    """非流式异常：保留既有 500 状态与错误结构，不变成成功响应。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    chat_service = _RunFooterChatService(
+        result=_run_footer_result(run_id="run-abc-123", finish_reason="error"),
+    )
+    client = TestClient(_build_app(store, chat_service=chat_service), raise_server_exceptions=False)
+    client.post("/chat/sessions?session_id=s-footer")
+
+    response = client.post(
+        "/chat/completions",
+        headers={"X-Session-ID": "s-footer"},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"]["type"] == "server_error"
+    assert "run_id" not in body
+
+
+async def test_run_footer_stream_message_done_carries_run_id_and_mid_stream_does_not(tmp_path):
+    """流式：仅 MESSAGE_DONE 顶层携带 run_id；中途事件 metadata 即使被人为注入也不输出。"""
+    chat_service = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.CONTENT_DELTA, content="he", metadata={"run_id": "run-abc-123"}),
+        ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop", metadata={"run_id": "run-abc-123"}),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text = await _run_footer_stream_text(tmp_path, chat_service)
+
+    chunks, done_seen = _parse_sse(text)
+    assert done_seen is True
+    by_object = {}
+    for chunk in chunks:
+        assert chunk["object"] == "chat.completion.chunk"
+        by_object.setdefault(chunk["choices"][0]["finish_reason"], []).append(chunk)
+    # 中途 CONTENT_DELTA chunk（finish_reason 为 None）不携带 run_id
+    mid_chunks = by_object[None]
+    assert any(c["choices"][0]["delta"] == {"content": "he"} for c in mid_chunks)
+    for chunk in mid_chunks:
+        assert "run_id" not in chunk
+    # MESSAGE_DONE chunk 顶层携带 run_id
+    done_chunks = by_object["stop"]
+    assert len(done_chunks) == 1
+    assert done_chunks[0]["run_id"] == "run-abc-123"
+
+
+async def test_run_footer_stream_error_carries_run_id(tmp_path):
+    """流式 ERROR：结束 chunk 顶层携带 run_id，finish_reason 保持 error。"""
+    chat_service = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.ERROR, error="provider down", metadata={"run_id": "run-err-1"}),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text = await _run_footer_stream_text(tmp_path, chat_service)
+
+    chunks, done_seen = _parse_sse(text)
+    assert done_seen is True
+    error_chunks = [c for c in chunks if c["choices"][0]["finish_reason"] == "error"]
+    assert len(error_chunks) == 1
+    assert error_chunks[0]["run_id"] == "run-err-1"
+    assert error_chunks[0]["choices"][0]["delta"] == {"content": "provider down"}
+
+
+async def test_run_footer_stream_omits_run_id_without_identity(tmp_path):
+    """流式无身份：MESSAGE_DONE 无 metadata 或 run_id 为空串时键缺省。"""
+    chat_service = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.CONTENT_DELTA, content="he", metadata={"run_id": "run-abc-123"}),
+        ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop"),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text = await _run_footer_stream_text(tmp_path, chat_service)
+    chunks, _ = _parse_sse(text)
+    assert all("run_id" not in chunk for chunk in chunks)
+
+    chat_service_empty = _RunFooterChatService(events=[
+        ChatEvent(ChatEventType.MESSAGE_START),
+        ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason="stop", metadata={"run_id": ""}),
+        ChatEvent(ChatEventType.DONE),
+    ])
+    text_empty = await _run_footer_stream_text(tmp_path, chat_service_empty, name="s-footer-empty")
+    chunks_empty, _ = _parse_sse(text_empty)
+    assert all("run_id" not in chunk for chunk in chunks_empty)

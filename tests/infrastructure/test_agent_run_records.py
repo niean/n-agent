@@ -115,3 +115,118 @@ async def test_expired_owner_cannot_overwrite_session_projections(tmp_path):
         await store.save_task_state(TaskState(session_id="b", status="idle"))
     assert (await store.get_task_state("a")).status == "completed"
     assert (await store.get_summary("a")).summary == "current"
+
+
+@pytest.mark.asyncio
+async def test_run_footer_counts_all_tool_calls_per_run_on_real_records(tmp_path):
+    path = tmp_path / "sessions.db"
+    store = SQLiteMemoryStore(path)
+    await store.create_session(ConversationSession(id="a"))
+    await store.create_session(ConversationSession(id="b"))
+    registry = SQLiteAgentRunRegistry(path)
+    registry.register(run_id="run-parent", session_id="a", source="api", execution_kind="chat",
+                      process_id="process", owner_token="owner", lease_seconds=60)
+    registry.register(run_id="run-child", session_id="a", source="api", execution_kind="chat",
+                      process_id="process", owner_token="owner", lease_seconds=60, parent_run_id="run-parent")
+    registry.register(run_id="run-zero", session_id="a", source="api", execution_kind="chat",
+                      process_id="process", owner_token="owner", lease_seconds=60)
+    registry.register(run_id="run-other", session_id="b", source="api", execution_kind="chat",
+                      process_id="process", owner_token="owner", lease_seconds=60)
+    parent_binding = RunBinding("run-parent", "a", "owner", "process")
+    registry.activate(parent_binding, 60)
+    registry.finish(parent_binding, "completed", "done")
+    child_binding = RunBinding("run-child", "a", "owner", "process")
+    registry.activate(child_binding, 60)
+    registry.finish(child_binding, "failed", "tool error")
+    # 同名多次不去重；失败/执行中记录同样计数；父子 Run 各自独立计数。
+    for index in range(3):
+        await store.save_tool_call(ToolCall(id=f"tc-read-{index}", session_id="a", tool_name="read", arguments={}, run_id="run-parent"))
+    await store.save_tool_call(ToolCall(id="tc-failed", session_id="a", tool_name="read", arguments={}, status="failed", run_id="run-parent"))
+    await store.save_tool_call(ToolCall(id="tc-running", session_id="a", tool_name="write", arguments={}, status="running", run_id="run-parent"))
+    await store.save_tool_call(ToolCall(id="tc-child", session_id="a", tool_name="read", arguments={}, run_id="run-child"))
+    await store.save_tool_call(ToolCall(id="tc-other", session_id="b", tool_name="read", arguments={}, run_id="run-other"))
+    # 其它会话的脏数据（run 归属他会的 run-parent）不得混入本会话计数。
+    with sqlite3.connect(path) as conn:
+        conn.execute("INSERT INTO tool_calls(id,session_id,tool_name,arguments_json,status,duration_ms,created_at,run_id) "
+                     "VALUES ('tc-foreign','b','read','{}','completed',0,'2026-01-01T00:00:00+00:00','run-parent')")
+    assert registry.get("run-zero")["tool_call_count"] == 0
+    assert registry.get("run-parent")["tool_call_count"] == 5
+    assert registry.get("run-child")["tool_call_count"] == 1
+    assert registry.get("run-other")["tool_call_count"] == 1
+    assert registry.get("missing") is None
+    listed = registry.list_for_session("a")
+    assert [row["id"] for row in listed] == ["run-parent", "run-child", "run-zero"]
+    assert {row["id"]: row["tool_call_count"] for row in listed} == {"run-parent": 5, "run-child": 1, "run-zero": 0}
+    for row in listed:
+        assert row["tool_call_count"] == registry.get(row["id"])["tool_call_count"]
+    assert registry.list_for_session("no-such-session") == []
+
+
+@pytest.mark.asyncio
+async def test_run_footer_count_batches_reads_beyond_single_query_param_limit(tmp_path, monkeypatch):
+    path = tmp_path / "sessions.db"
+    store = SQLiteMemoryStore(path)
+    await store.create_session(ConversationSession(id="a"))
+    registry = SQLiteAgentRunRegistry(path)
+    run_ids = [f"run-{index:04d}" for index in range(600)]
+    for run_id in run_ids:
+        registry.register(run_id=run_id, session_id="a", source="api", execution_kind="chat",
+                          process_id="process", owner_token="owner", lease_seconds=60)
+    with sqlite3.connect(path) as conn:
+        conn.executemany(
+            "INSERT INTO tool_calls(id,session_id,tool_name,arguments_json,status,duration_ms,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)",
+            [(f"tc-{run_id}", "a", "read", "{}", "completed", 0, "2026-01-01T00:00:00+00:00", run_id) for run_id in run_ids],
+        )
+    statements = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    try:
+        rows = registry.list_for_session("a")
+    finally:
+        monkeypatch.undo()
+    assert {row["id"]: row["tool_call_count"] for row in rows} == {run_id: 1 for run_id in run_ids}
+    with sqlite3.connect(path) as conn:
+        expected_order = [row[0] for row in conn.execute("SELECT id FROM agent_runs WHERE session_id=? ORDER BY created_at,id", ("a",))]
+    assert [row["id"] for row in rows] == expected_order
+    count_queries = [statement for statement in statements if "FROM tool_calls" in statement]
+    # 600 条 run 超过单条查询参数上限（LIMIT 500）：必须分批读取且未退化为逐条查询，
+    # 不钉住具体批次数。
+    assert len(count_queries) >= 2
+
+
+def test_run_footer_bare_registry_without_tool_calls_table_counts_zero(tmp_path):
+    path = tmp_path / "sessions.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, source TEXT NOT NULL, external_memory_enabled_json TEXT)")
+        conn.execute("INSERT INTO sessions VALUES ('a','t','2026-01-01','2026-01-01','api',NULL)")
+    registry = SQLiteAgentRunRegistry(path)
+    registry.register(run_id="run-a", session_id="a", source="api", execution_kind="chat",
+                      process_id="process", owner_token="owner", lease_seconds=60)
+    assert registry.get("run-a")["tool_call_count"] == 0
+    rows = registry.list_for_session("a")
+    assert [row["id"] for row in rows] == ["run-a"]
+    assert [row["tool_call_count"] for row in rows] == [0]
+    assert registry.list_for_session("no-such-session") == []
+
+
+def test_run_footer_count_does_not_swallow_sql_errors_when_tool_calls_exists(tmp_path):
+    path = tmp_path / "sessions.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, source TEXT NOT NULL, external_memory_enabled_json TEXT)")
+        conn.execute("INSERT INTO sessions VALUES ('a','t','2026-01-01','2026-01-01','api',NULL)")
+    registry = SQLiteAgentRunRegistry(path)
+    registry.register(run_id="run-a", session_id="a", source="api", execution_kind="chat",
+                      process_id="process", owner_token="owner", lease_seconds=60)
+    # tool_calls 表存在但缺少 run_id 列：计数查询必须报错，而不是吞成 0。
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE tool_calls (id TEXT PRIMARY KEY, session_id TEXT NOT NULL)")
+    with pytest.raises(sqlite3.OperationalError):
+        registry.get("run-a")
+    with pytest.raises(sqlite3.OperationalError):
+        registry.list_for_session("a")

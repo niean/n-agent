@@ -173,7 +173,11 @@ class ChatCompletionService:
         try:
             with bind_run(binding):
                 result = await self._complete(request, execution=execution)
-            return dataclasses.replace(result, run_id=binding.run_id) if isinstance(result, ChatCompletionResult) else result
+            if isinstance(result, ChatCompletionResult):
+                return dataclasses.replace(result, run_id=binding.run_id)
+            if isinstance(result, AsyncIterator):
+                return _run_footer_stream(result, binding.run_id)
+            return result
         except BaseException as exc:
             if not execution.graph_owns_terminal:
                 status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
@@ -653,6 +657,33 @@ def _format_compress_status(status: dict[str, Any]) -> str:
     if reason:
         return f"压缩未执行: {reason}"
     return "压缩未执行"
+
+
+def _run_footer_stream(
+    iterator: AsyncIterator[ChatEvent], run_id: str,
+) -> AsyncIterator[ChatEvent]:
+    """为登记运行的流式事件补写终局身份（Run 轻量入口）。
+
+    身份在包装创建时从 binding 显式捕获（不读 current_run）；对 MESSAGE_DONE/
+    ERROR 合并 metadata 写入 binding 身份：缺失或与 binding 冲突时均以 binding
+    身份覆盖，完全一致时不重复替换。中途事件与 DONE 原样透传。try/finally 将
+    aclose 传递到底层迭代器，保持取消传播与 detach 语义不变。
+    """
+
+    async def _stamped() -> AsyncIterator[ChatEvent]:
+        try:
+            async for event in iterator:
+                if event.type in (ChatEventType.MESSAGE_DONE, ChatEventType.ERROR):
+                    existing = event.metadata.get("run_id")
+                    if existing != run_id:
+                        event = dataclasses.replace(
+                            event, metadata={**event.metadata, "run_id": run_id}
+                        )
+                yield event
+        finally:
+            await iterator.aclose()
+
+    return _stamped()
 
 
 async def _compress_status_stream(content: str) -> AsyncIterator[ChatEvent]:

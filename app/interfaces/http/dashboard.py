@@ -2145,17 +2145,25 @@ def _dashboard_chunk_for_event(event: ChatEvent) -> dict[str, Any]:
         finish_reason = "error"
     elif event.type is ChatEventType.MESSAGE_DONE:
         finish_reason = event.finish_reason or "stop"
-    return {
+    chunk = {
         "id": f"chatcmpl-{uuid4()}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": "N-Agent",
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
+    # Run 轻量入口：仅结束事件（MESSAGE_DONE/ERROR）透出 chat_service 打点的
+    # 持久化 run_id；中途事件 metadata 即使被人为注入 run_id 也不输出，
+    # 审批 envelope 与 [DONE] 不经过本编码器，形态不受影响。
+    if event.type in (ChatEventType.MESSAGE_DONE, ChatEventType.ERROR):
+        run_id = event.metadata.get("run_id")
+        if isinstance(run_id, str) and run_id:
+            chunk["run_id"] = run_id
+    return chunk
 
 
 def _dashboard_completion_response(result: ChatCompletionResult) -> dict[str, Any]:
-    return {
+    payload = {
         "id": f"chatcmpl-{uuid4()}",
         "object": "chat.completion",
         "created": int(time.time()),
@@ -2169,3 +2177,7 @@ def _dashboard_completion_response(result: ChatCompletionResult) -> dict[str, An
         ],
         "usage": result.usage,
     }
+    # Run 轻量入口：无账本/无身份时 result.run_id 为 None，键整体缺省。
+    if result.run_id:
+        payload["run_id"] = result.run_id
+    return payload
