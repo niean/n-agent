@@ -286,7 +286,7 @@ def _reset_setup_state():
 def make_handle(loader=None, **overrides):
     kwargs = {"otel_enabled": True}
     kwargs.update(overrides)
-    return setup.configure_observability(_settings(**kwargs), sdk_loader=loader)
+    return setup.configure_observability(_settings(**kwargs), sdk_loader=loader, semantics=ts)
 
 
 def make_enabled_loader() -> FakeLoader:
@@ -607,7 +607,7 @@ class TestSnapshot:
         names = [i["name"] for i in snap["instruments"]]
         assert len(names) == 12
         assert "gen_ai.client.inference.duration" in names
-        assert "nagent.turns" in names
+        assert "nagent.agent.runs" in names
 
     def test_span_buffer_bounds_and_caps(self):
         loader = make_enabled_loader()
@@ -890,14 +890,14 @@ class TestSemanticsParameter:
     def test_semantics_module_is_parameterizable(self):
         stub = SimpleNamespace(
             SEMCONV_VERSION="stub-semconv-1",
-            INSTRUMENTS={"nagent.turns": ts.INSTRUMENTS["nagent.turns"]},
+            INSTRUMENTS={"nagent.agent.runs": ts.INSTRUMENTS["nagent.agent.runs"]},
         )
         handle = setup.configure_observability(
             _settings(otel_enabled=False), semantics=stub
         )
         snap = handle.snapshot()
         assert snap["semconv_version"] == "stub-semconv-1"
-        assert [i["name"] for i in snap["instruments"]] == ["nagent.turns"]
+        assert [i["name"] for i in snap["instruments"]] == ["nagent.agent.runs"]
 
 
 # ---------------------------------------------------------------------------
@@ -914,8 +914,12 @@ _SMOKE_SCRIPT = """
 import json, time
 from app.config import Settings
 from app.application import telemetry_semantics as ts
+from app.application.telemetry_contract import EXECUTION_ATTRIBUTE_KEYS, CONTENT_ATTRIBUTE_KEYS
 from app.infrastructure.observability import setup
 
+# Match the composition root's trusted semantic and content-free ring wiring.
+setup.configure_semantics_registry(ts)
+setup.configure_ring_buffer_attributes(EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS)
 h = setup.configure_observability(Settings(_env_file=None, otel_enabled=True))
 assert h.status == "healthy", h.status
 assert h.snapshot()["mode"] == "local_only"
@@ -923,6 +927,19 @@ with ts.invoke_agent_span(session_id="smoke", source="cli", run_id="r1"):
     with ts.chat_span("gpt-4o", provider="openai"):
         pass
 snap = h.snapshot()
+assert snap["semconv_version"] == ts.SEMCONV_VERSION, snap
+assert {item["name"]: (item["kind"], item["unit"], item["allowed_dimensions"])
+        for item in snap["instruments"]} == {
+            name: (instrument.kind, instrument.unit, list(instrument.allowed_dimensions))
+            for name, instrument in ts.INSTRUMENTS.items()}, snap["instruments"]
+assert len(snap["instruments"]) == 12
+child, parent = snap["spans"]
+assert child["trace_id"] == parent["trace_id"]
+assert child["parent_span_id"] == parent["span_id"]
+assert parent["parent_span_id"] is None
+assert parent["attributes"]["nagent.agent.run_id"] == "r1"
+assert parent["attributes"]["nagent.agent.source"] == "cli"
+assert all(not CONTENT_ATTRIBUTE_KEYS.intersection(span["attributes"]) for span in snap["spans"])
 names = [s["name"] for s in snap["spans"]]
 assert names == ["chat gpt-4o", "invoke_agent n-agent"], names
 ts.record_turn("cli", "completed")
@@ -931,14 +948,21 @@ h.shutdown()
 dt = time.monotonic() - t0
 assert dt < 5.0, dt
 final = h.snapshot()
-assert final["signals"]["metrics"].get("local_instruments") == ["nagent.turns"], final
+local = final["signals"]["metrics"].get("local_instruments", [])
+assert [name for name in local if name in ts.INSTRUMENTS] == ["nagent.agent.runs"], local
+assert local.count("nagent.agent.runs") == 1, local
+assert all(name in ts.INSTRUMENTS or name.startswith(("system.", "process.", "cpython."))
+           for name in local), local
+assert final["signals"]["metrics"]["system_metrics"] == "started", final
+assert any(name.startswith("system.") for name in local), local
+assert any(name.startswith("process.") for name in local), local
 print("SMOKE_OK", json.dumps({"spans": names, "shutdown_seconds": round(dt, 3)}))
 """
 
 
 class TestRealSdkSmoke:
     def test_real_sdk_local_only_roundtrip(self):
-        if not os.environ.get("NGAGENT_OTEL_SDK_SMOKE"):
+        if not os.environ.get("NAGENT_OTEL_SDK_SMOKE"):
             pytest.skip("set NAGENT_OTEL_SDK_SMOKE=1 to run the real-SDK smoke")
         repo_root = Path(__file__).resolve().parents[3]
         proc = subprocess.run(

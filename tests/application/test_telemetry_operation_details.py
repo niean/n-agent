@@ -124,6 +124,6 @@ def test_broken_error_string_preserves_completion_and_releases_stream(capture):
         with attempt:
             attempt.append_output_text('private partial output')
             raise BrokenError()
-    assert capture[1][0]['outcome'] == 'error'
+    assert capture[1][0]['outcome'] == 'failure'
     assert capture[1][0]['details']['output_messages']['incomplete']
     assert attempt._output_accumulator is None

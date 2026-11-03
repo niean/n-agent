@@ -20,8 +20,8 @@ def test_completion_snapshot_contract(monkeypatch):
     monkeypatch.setattr(ts.logger, 'info', lambda template: logs.append((template, snapshot())))
     tel = ts.SemanticsTelemetry()
     with tel.agent_run('session', 'cli', 'request', message_count=2):
-        assert snapshot() == {'session_id': 'session', 'request_id': 'request',
-                              'source': 'cli', 'operation': 'invoke_agent',
+        assert snapshot() == {'session_id': 'session', 'agent_run_id': 'request',
+                              'agent_source': 'cli', 'operation': 'invoke_agent',
                               'message_count': 2}
         with tel.iteration(1, message_count=3):
             with tel.begin_chat_attempt(model='gpt-4o', stream=False) as attempt:
@@ -29,11 +29,11 @@ def test_completion_snapshot_contract(monkeypatch):
                 attempt.set_finish_reasons(['PRIVATE-SENTINEL'])
         # after the chat attempt exits, the agent_run scene is restored
         assert snapshot()['operation'] == 'invoke_agent'
-        assert snapshot()['request_id'] == 'request'
+        assert snapshot()['agent_run_id'] == 'request'
         tel.record_tool_denial('terminal', 'call')
     assert snapshot() == {}
     assert [record['operation'] for _, record in logs] == ['chat', 'execute_tool', 'invoke_agent']
-    assert all(template == 'execution_completed' for template, _ in logs)
+    assert [template for template, _ in logs] == ['nagent.model.completed', 'nagent.tool.completed', 'nagent.agent.completed']
     assert logs[0][1]['message_count'] == 3
     assert logs[0][1]['finish_reason'] == 'other'
     assert logs[-1][1]['input_tokens'] == 0
@@ -50,7 +50,7 @@ async def test_cleanup_and_concurrency(monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             with ts.SemanticsTelemetry().agent_run(identity, 'cli', identity):
                 await asyncio.sleep(0)
-                assert snapshot()['request_id'] == identity
+                assert snapshot()['agent_run_id'] == identity
                 raise asyncio.CancelledError()
         assert snapshot() == {}
     await asyncio.gather(run('a'), run('b'))
@@ -66,7 +66,7 @@ def test_usage_knownness_and_span_lifecycle(monkeypatch, usage, expected):
         span = ts.trace.get_current_span()
         assert span.ended == 0
         record = ts.execution_log_snapshot()
-        assert span.attributes[ts.NAGENT_SUMMARY] == record['summary']
+        assert span.attributes[f"nagent.{ts.resolve_operation(record['operation']).object}.summary"] == record['summary']
         logs.append(record)
     monkeypatch.setattr(ts.logger, 'info', capture)
     tel = ts.SemanticsTelemetry()
@@ -84,7 +84,7 @@ def test_usage_knownness_and_span_lifecycle(monkeypatch, usage, expected):
     for span in tracer.spans:
         assert span.ended == 1
         assert span.attributes[ts.GEN_AI_CONVERSATION_ID] == 'session'
-        assert span.attributes[ts.NAGENT_RUN_ID] == 'request'
+        assert span.attributes[ts.NAGENT_AGENT_RUN_ID] == 'request'
 
 
 @pytest.mark.parametrize('failure_type', [ValueError, asyncio.CancelledError])
@@ -128,8 +128,8 @@ def test_nested_context_restores_and_clear_detaches(monkeypatch):
     with tel.agent_run('outer', 'cli', 'outer'):
         with tel.iteration(4, message_count=9):
             with tel.agent_run('inner', 'chat', 'inner'):
-                assert ts.execution_log_snapshot()['request_id'] == 'inner'
-            assert ts.execution_log_snapshot()['request_id'] == 'outer'
+                assert ts.execution_log_snapshot()['agent_run_id'] == 'inner'
+            assert ts.execution_log_snapshot()['agent_run_id'] == 'outer'
             ts.clear_run_context()
             assert ts.execution_log_snapshot() == {}
             assert ts.current_iteration() is None
@@ -137,8 +137,8 @@ def test_nested_context_restores_and_clear_detaches(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('end_reason,failed,expected', [
-    ('budget_denied', False, 'denied'), ('deadline', True, 'error'),
-    ('max_iterations', True, 'error'), ('error', True, 'error'),
+    ('budget_denied', False, 'denied'), ('deadline', True, 'failure'),
+    ('max_iterations', True, 'failure'), ('error', True, 'failure'),
     ('cancelled', True, 'cancelled'), ('completed', False, 'success'),
 ])
 async def test_graph_returned_status_controls_completion(tmp_path, monkeypatch, end_reason, failed, expected):

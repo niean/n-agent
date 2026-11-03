@@ -55,8 +55,8 @@ def test_export_validation_and_null_omission():
     item = {'output_messages': {'content': 'limit', 'original_bytes': None,
                                'truncated': True, 'incomplete': True, 'observed_bytes': 99}}
     flat = flatten_details(item)
-    assert flat['nagent.details.output_messages.observed_bytes'] == 99
-    assert 'nagent.details.output_messages.original_bytes' not in flat
+    assert flat['nagent.content.output_messages_observed_bytes'] == 99
+    assert 'nagent.content.output_messages_original_bytes' not in flat
 
 
 def test_stream_cross_chunk_secret_and_tool_deltas():

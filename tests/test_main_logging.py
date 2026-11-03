@@ -131,7 +131,6 @@ _JSON_FIELDS = (
     "event",
     "trace_id",
     "span_id",
-    "session_id",
 )
 
 
@@ -213,7 +212,8 @@ def test_json_stderr_line_fields_without_active_span():
         # No active span/session: correlation fields are null, never fabricated.
         assert payload["trace_id"] is None
         assert payload["span_id"] is None
-        assert payload["session_id"] is None
+        assert "gen_ai.conversation.id" not in payload
+        assert "session_id" not in payload
         assert payload["severity"] == "WARNING"
         assert payload["logger"] == "app.test.json"
         # Free text never reaches the JSON line.
@@ -550,19 +550,23 @@ def test_session_id_only_from_trusted_server_context():
         _, stream = _capture_json_line(root)
         logger = logging.getLogger("app.test.session")
         # Session-like data in client-controlled log arguments is ignored.
-        logger.warning("session=%s", "CLIENT-SESSION-SPOOF")
+        logger.warning("session=%s", "CLIENT-SESSION-SPOOF",
+                       extra={"session_id": "EXTRA-SPOOF", "gen_ai.conversation.id": "EXTRA-SPOOF"})
         payload = json.loads(stream.getvalue().strip().splitlines()[-1])
-        assert payload["session_id"] is None
+        assert "gen_ai.conversation.id" not in payload
+        assert "session_id" not in payload
         assert "CLIENT-SESSION-SPOOF" in payload["message"]
         # Explicit trusted binding (server-side AgentState domain) is used,
         # via the context-managed wrapper (always reset on exit).
         with bound_log_session("sess-trusted-1"):
             logger.warning("another")
             payload = json.loads(stream.getvalue().strip().splitlines()[-1])
-            assert payload["session_id"] == "sess-trusted-1"
+            assert payload["gen_ai.conversation.id"] == "sess-trusted-1"
+            assert "session_id" not in payload
         logger.warning("after reset")
         payload = json.loads(stream.getvalue().strip().splitlines()[-1])
-        assert payload["session_id"] is None
+        assert "gen_ai.conversation.id" not in payload
+        assert "session_id" not in payload
     finally:
         _restore_root(saved_handlers, saved_level)
         _reset_event_registry()
@@ -596,7 +600,8 @@ def test_session_id_falls_back_to_span_conversation_attribute():
         finally:
             otel_context.detach(token)
         payload = json.loads(stream.getvalue().strip())
-        assert payload["session_id"] == "sess-from-agent-state"
+        assert payload["gen_ai.conversation.id"] == "sess-from-agent-state"
+        assert "session_id" not in payload
     finally:
         _restore_root(saved_handlers, saved_level)
         _reset_event_registry()
@@ -706,10 +711,15 @@ def test_application_runtime_double_entry_attach_is_idempotent(monkeypatch):
         root = logging.getLogger()
         root.addHandler(logging.StreamHandler(sys.stderr))
         root.setLevel(logging.INFO)
-        with application_runtime():
-            pass
-        with application_runtime():
-            pass
+        import pytest
+        # First attachment constructs the pinned SDK handler; the second
+        # must reuse it and therefore must not construct/warn again.
+        with pytest.warns(DeprecationWarning, match="LoggingHandler.*deprecated") as deprecated:
+            with application_runtime():
+                pass
+            with application_runtime():
+                pass
+        assert len(deprecated) == 1
         bridges = [h for h in root.handlers if isinstance(h, obs_logging.SafeLogBridge)]
         assert len(bridges) == 1, "double entry must leave exactly one bridge"
     finally:

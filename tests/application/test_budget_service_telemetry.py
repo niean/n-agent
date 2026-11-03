@@ -1,6 +1,6 @@
 """T5 telemetry wiring tests: BudgetService denial accounting.
 
-Covers (plan T5 S1): nagent.budget.denied is recorded by kind, only at the
+Covers (plan T5 S1): nagent.budget.denials is recorded by kind, only at the
 authoritative denial point (BudgetService.reserve); allowed reserves,
 settle and release record nothing; the per-instrument dimension-cardinality
 cap merges overflow series into the fixed overflow dimension set.
@@ -56,7 +56,7 @@ def meter(monkeypatch):
 
 
 def _denied_records(meter):
-    return meter.counters["nagent.budget.denied"].records
+    return meter.counters["nagent.budget.denials"].records
 
 
 @pytest.mark.asyncio
@@ -72,7 +72,7 @@ async def test_llm_call_denial_recorded_once_by_kind(meter):
     assert first.outcome is PolicyOutcome.ALLOW
     assert second.outcome is PolicyOutcome.DENY
     # allowed reserve records nothing; denial counted exactly once
-    assert _denied_records(meter) == [(1, {"nagent.kind": "llm_denied"})]
+    assert _denied_records(meter) == [(1, {"nagent.budget.kind": "llm_denied"})]
 
 
 @pytest.mark.asyncio
@@ -85,7 +85,7 @@ async def test_tool_call_denial_recorded_by_kind(meter):
     from app.domain.policy import PolicyOutcome
 
     assert decision.outcome is PolicyOutcome.DENY
-    assert _denied_records(meter) == [(1, {"nagent.kind": "budget_exhausted"})]
+    assert _denied_records(meter) == [(1, {"nagent.budget.kind": "budget_exhausted"})]
 
 
 def test_kind_label_map_covers_all_reserve_kinds():
@@ -107,7 +107,7 @@ async def test_settle_and_release_record_nothing(meter):
     await service.release("run-3", reservation2)
     await service.close("run-3")
 
-    assert "nagent.budget.denied" not in meter.counters
+    assert "nagent.budget.denials" not in meter.counters
 
 
 @pytest.mark.asyncio

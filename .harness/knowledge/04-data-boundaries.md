@@ -418,7 +418,7 @@ DB 段 10 个段落（`SECTION_NAMES`，顺序即导入顺序）：providers、k
 
 ## OTel 可观测数据边界
 
-执行摘要不新增存储表：使用现有 run_id 作为日志 request_id、Span nagent.run_id。会话标识、运行标识及完成阶段摘要只在 ContextVar 中暂存并退出复原；summary 最长 512 字符，由入口、消息数量、调用数、Token 已知性、状态与耗时生成，不含消息正文或原始工具载荷。日志 JSON 顶层保留 event/severity/trace_id/span_id，Collector 把批准的安全字段放在 context；这些标识和摘要不进入 Prometheus dimensions 或 Loki 索引标签。
+执行摘要不新增存储表：真实 AgentRun、TaskRun、请求分别使用 nagent.agent.run_id、nagent.task.run_id、nagent.request.id，禁止把内部 run_id 一概当成 AgentRun。会话标识、运行标识及完成阶段摘要只在 ContextVar 中暂存并退出复原；summary 最长 512 字符，由入口、消息数量、调用数、Token 已知性、状态与耗时生成，不含消息正文或原始工具载荷。日志 JSON 顶层保留 event/severity/trace_id/span_id，Collector 把批准的安全字段放在 context；这些标识和摘要不进入 Prometheus dimensions 或 Loki 索引标签。
 
 OTel 观测信号不新增 SQLite 表；trace/metric/log 经 OTLP gRPC 出进程，profile 经 Pyroscope /ingest 出进程；本地仅进程内 ring buffer（非持久化）。唯一例外是自检页外链运行时配置表 otel_link_config（见下）。
 
@@ -444,7 +444,7 @@ Docker Compose 数据边界：观测后端 6 服务（otel-collector/tempo/prome
 
 ## 观测详情数据边界
 
-新增 Settings `otel_content_max_bytes`（环境变量 `N_AGENT_OTEL_CONTENT_MAX_BYTES`，默认 2048，gt=0，启动绑定）。不新增数据库表或详情附件存储。固定字段为 user_message、assistant_message、system_prompt、input_messages、tool_definitions、output_messages、tool_arguments、tool_result、error、http_request、http_response、log_fields；每项 `{content, original_bytes, truncated}`，流式可带 incomplete/observed_bytes。original_bytes 为完整脱敏文本 UTF-8 长度，无法计算时为未知（stderr null，OTel/Loki 键缺席）；observed_bytes 为已观察字节数（HTTP 传输字节或 LLM 字符串增量），不等于完整脱敏长度。Log 顶层 details、OTLP/span 的 `nagent.details.<field>.<metadata>` 与 Collector 的显式逐字段投影共享该合同；不将正文写入 metric labels 或自检 snapshot。
+新增 Settings `otel_content_max_bytes`（环境变量 `N_AGENT_OTEL_CONTENT_MAX_BYTES`，默认 2048，gt=0，启动绑定）。不新增数据库表或详情附件存储。固定字段为 user_message、assistant_message、system_prompt、input_messages、tool_definitions、output_messages、tool_arguments、tool_result、error、http_request、http_response、log_fields；每项 `{content, original_bytes, truncated}`，流式可带 incomplete/observed_bytes。original_bytes 为完整脱敏文本 UTF-8 长度，无法计算时为未知（stderr null，OTel/Loki 键缺席）；observed_bytes 为已观察字节数（HTTP 传输字节或 LLM 字符串增量），不等于完整脱敏长度。Log 顶层 details、OTLP/span 的 `nagent.content.<field>` 及 `_original_bytes/_truncated/_incomplete/_observed_bytes` 后缀与 Collector 的显式逐字段投影共享该合同；不将正文写入 metric labels 或自检 snapshot。
 
 Tempo 使用 tempo-data:/var/tempo 独立命名卷（WAL/blocks），168h 保留，API 3200 仅绑定 127.0.0.1，OTLP 4317 仅容器内网。Prometheus exemplar 存储保存代表性 Trace/Span 关联；其保留与时序常规样本不同，不承诺每个指标点都有 Trace。
 

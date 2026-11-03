@@ -19,7 +19,7 @@ RUN_SOURCE = REPO_ROOT / "tests" / "e2e" / "run.sh"
 PROM_COUNTERS = (
     "gen_ai_client_inference_usage_input_tokens_total",
     "gen_ai_client_inference_usage_output_tokens_total",
-    "nagent_turns_total",
+    "nagent_agent_runs_total",
 )
 PROM_HISTOGRAMS = (
     "gen_ai_execute_tool_duration_seconds",
@@ -143,7 +143,7 @@ class TestSmokeTempo:
         assert "invoke_agent" in smoke
         assert "gen_ai.request.model" in smoke
         assert "gen_ai.tool.name" in smoke
-        assert "nagent.policy_outcome" in smoke
+        assert "nagent.tool.policy_outcome" in smoke
         assert "execute_tool" in smoke
 
 
@@ -221,22 +221,23 @@ class TestExecutionSummary:
         spec.loader.exec_module(module)
         spans, logs = [], []
         for i, operation in enumerate(("invoke_agent", "chat", "chat", "execute_tool")):
-            attrs = {"nagent.summary": "structural summary", "gen_ai.conversation.id": "session", "nagent.run_id": "run"}
+            obj = {"invoke_agent": "agent", "chat": "model", "execute_tool": "tool"}[operation]
+            attrs = {f"nagent.{obj}.summary": "structural summary", "gen_ai.conversation.id": "session", "nagent.agent.run_id": "run"}
             spans.append({"name": operation + " fixture", "spanId": str(i), "parentSpanId": "" if i == 0 else "0", "attrs": attrs})
-            logs.append({"event": "execution_completed", "trace_id": "trace", "span_id": str(i), "context": {"operation": operation, "summary": "structural summary", "session_id": "session", "request_id": "run", "duration_ms": 1, "outcome": "success"}})
+            logs.append({"event": f"nagent.{obj}.completed", "trace_id": "trace", "span_id": str(i), "context": {**attrs, "gen_ai.operation.name": operation, f"nagent.{obj}.duration_ms": 1, f"nagent.{obj}.outcome": "success"}})
         logs = [{**record, "context": {"execution": record["context"]}} for record in logs]
         trace = {"traceId": "trace", "spans": spans}
         module.check(trace, logs, [{"service_name": "n-agent"}])
         # HTTP ingress can contain title generation outside the Agent subtree.
         sibling = {"name": "chat title", "spanId": "title", "parentSpanId": "http", "attrs": {}}
         module.check({**trace, "spans": spans + [sibling]}, logs + [
-            {"event": "execution_completed", "trace_id": "trace", "span_id": "title"}
+            {"event": "nagent.model.completed", "trace_id": "trace", "span_id": "title"}
         ], [])
         with pytest.raises(AssertionError):
             module.check(trace, logs[:-1], [])
         with pytest.raises(AssertionError):
             module.check(trace, logs + [logs[0]], [])
-        for field in ("summary", "session_id", "request_id"):
+        for field in ("nagent.model.summary", "gen_ai.conversation.id", "nagent.agent.run_id"):
             original = logs[1]["context"]["execution"][field]
             logs[1]["context"]["execution"][field] = "mismatch"
             with pytest.raises(AssertionError):

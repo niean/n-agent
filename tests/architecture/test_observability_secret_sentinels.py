@@ -82,11 +82,9 @@ FORBIDDEN_LABELS = (
 def _ring_allowed_keys() -> set[str]:
     """The exact attribute keys the span ring buffer may store (mirrors
     setup.py: GenAI + nagent.* constants + error.type)."""
-    keys = {"error.type"}
-    for name, value in vars(ts).items():
-        if name.startswith(("GEN_AI_", "NAGENT_")) and isinstance(value, str):
-            keys.add(value)
-    return keys
+    from app.application.telemetry_contract import EXECUTION_ATTRIBUTE_KEYS, CONTENT_ATTRIBUTE_KEYS
+    return EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS
+
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +259,7 @@ def test_manual_genai_span_tree_attributes_are_whitelisted():
         assert _no_sentinel(span["name"])
     # source passes through the bounded mapping, never raw
     root = next(s for s in spans if s["name"] == ts.invoke_agent_span_name())
-    assert root["attrs"][ts.NAGENT_SOURCE] == "dashboard"
+    assert root["attrs"][ts.NAGENT_AGENT_SOURCE] == "dashboard"
 
 
 def test_span_name_helpers_never_embed_raw_payloads():
@@ -273,11 +271,11 @@ def test_span_name_helpers_never_embed_raw_payloads():
     assert ts.map_model_name(S_URL) == "other"
     assert ts.map_tool_name(S_TOOL_PAYLOAD) == "other"
     assert ts.map_provider_name(SENTINEL) == "other"
-    assert ts.map_source(S_SQL) == "other"
+    assert ts.map_source(S_SQL) == "unknown"
     assert ts.map_error_type(S_EXCEPTION) == "other"
     assert ts.map_end_reason(S_MESSAGE) == "other"
     assert ts.map_kind(S_URL) == "other"
-    assert ts.map_outcome(SENTINEL) == "other"
+    assert ts.map_outcome(SENTINEL) == "unknown"
 
 
 def test_genai_optin_attributes_have_no_constants_or_helpers():
@@ -527,7 +525,6 @@ def test_json_formatter_unknown_event_leaks_nothing(sentinel_sanitizer):
         "event",
         "trace_id",
         "span_id",
-        "session_id",
         "service.name",
         "service.instance.id",
     ):
@@ -786,6 +783,8 @@ def test_approved_details_channel_redacts_and_stays_out_of_ring_and_auto_spans(m
     from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor, InMemoryLogRecordExporter
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+    from app.application.telemetry_contract import project_execution_attributes, completion_event, EXECUTION_ATTRIBUTE_KEYS, CONTENT_ATTRIBUTE_KEYS
+    monkeypatch.setattr(obs_setup, '_RING_BUFFER_ALLOWED_ATTR_KEYS', EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS)
     configure_details(sentinel_sanitizer.sanitize)
     spans = InMemorySpanExporter()
     provider = TracerProvider()
@@ -799,7 +798,9 @@ def test_approved_details_channel_redacts_and_stays_out_of_ring_and_auto_spans(m
     with pytest.warns(DeprecationWarning, match="LoggingHandler.*deprecated"):
         sdk_handler = LoggingHandler(logger_provider=log_provider)
     bridge = obs_logging.SafeLogBridge(otel_handler=sdk_handler)
-    obs_logging.configure_execution_context(ts.execution_log_snapshot, validate_details=validate_details, flatten_details=flatten_details)
+    obs_logging.configure_execution_context(ts.execution_log_snapshot, validate_details=validate_details, flatten_details=flatten_details,
+        project_context=project_execution_attributes, completion_event=completion_event,
+        execution_keys=EXECUTION_ATTRIBUTE_KEYS, content_keys=CONTENT_ATTRIBUTE_KEYS)
     monkeypatch.setattr(ts, 'get_tracer', lambda: provider.get_tracer('approved-details'))
     ts_logger = logging.getLogger(ts.__name__)
     previous = ts_logger.level
@@ -817,25 +818,25 @@ def test_approved_details_channel_redacts_and_stays_out_of_ring_and_auto_spans(m
             attempt.set_input([{'role': 'user', 'content': S_MESSAGE}], tools=[{'password': 'structured-secret'}])
             attempt.set_output({'role': 'assistant', 'content': 'a' * 3000})
         span = spans.get_finished_spans()[0]
-        payload = next(p for p in payloads if p.get('operation') == 'chat')
+        payload = next(p for p in payloads if p.get('gen_ai.operation.name') == 'chat')
         details = payload['details']
         assert '[REDACTED]' in details['input_messages']['content']
         assert details['output_messages']['truncated'] is True
         assert len(details['output_messages']['content'].encode()) <= 2048
         assert details['output_messages']['original_bytes'] > 2048
         flat = flatten_details(details)
-        log_record = next(r.log_record for r in logs.get_finished_logs() if r.log_record.attributes.get('operation') == 'chat')
+        log_record = next(r.log_record for r in logs.get_finished_logs() if r.log_record.attributes.get('gen_ai.operation.name') == 'chat')
         for key, value in flat.items():
             assert span.attributes[key] == log_record.attributes[key] == value
             assert any(e.attributes.get(key) == value for e in span.events)
         assert SENTINEL not in str(span.attributes) + str(log_record.attributes) + json.dumps(payload)
         assert 'structured-secret' not in str(flat)
-        assert all(not key.startswith('nagent.details.') for entry in ring.snapshot_spans() for key in entry['attributes'])
+        assert all(not key.startswith('nagent.content.') for entry in ring.snapshot_spans() for key in entry['attributes'])
         auto = instrumentors._FilteringTracerProvider(provider).get_tracer('auto').start_span('auto')
         for key, value in flat.items():
             auto.set_attribute(key, value)
         auto.end()
-        assert not any(k.startswith('nagent.details.') for k in spans.get_finished_spans()[-1].attributes)
+        assert not any(k.startswith('nagent.content.') for k in spans.get_finished_spans()[-1].attributes)
     finally:
         ts_logger.removeHandler(sink)
         ts_logger.removeHandler(bridge)

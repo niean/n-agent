@@ -81,10 +81,10 @@ async def test_runtime_sdk_http_parent_payload_and_completion(
             assert child.parent.span_id == chat.get_span_context().span_id
             assert child.context.trace_id == chat.get_span_context().trace_id
             assert len(logs) == 1
-            assert "useful input" in child.attributes["nagent.details.http_request.content"]
+            assert "useful input" in child.attributes["nagent.content.http_request"]
             expected = "backend failed" if mode == "error" else "visible-prefix" if mode == "long" else reply
             if mode != "cancelled":
-                assert expected in child.attributes["nagent.details.http_response.content"]
+                assert expected in child.attributes["nagent.content.http_response"]
             # OpenAI stops at [DONE] and closes without reading transport EOF.
             assert logs[0]["outcome"] == {"error": "error", "cancelled": "cancelled", "sse": "incomplete"}.get(mode, "completed")
             if mode == "sse":
@@ -94,7 +94,7 @@ async def test_runtime_sdk_http_parent_payload_and_completion(
             if mode == "long":
                 assert logs[0]["details"]["http_response"]["truncated"]
             assert "PRIVATE-CREDENTIAL" not in str(child.attributes) + str(child.events) + str(logs)
-            assert len([e for e in child.events if e.name == "http_client_completed"]) == 1
+            assert len([e for e in child.events if e.name == "nagent.http.completed"]) == 1
         finally:
             await provider.client.close()
 

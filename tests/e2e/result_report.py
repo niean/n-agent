@@ -65,10 +65,52 @@ def render_table(cases):
     return "\n".join(lines) + "\n"
 
 
+def group_cases(cases):
+    """Group explicit case identities; message/Trace rows are evidence, not cases."""
+    groups = {}
+    for case in cases:
+        key = (case["category"], case.get("case_id", case["id"]))
+        groups.setdefault(key, []).append(case)
+    return groups
+
+
+def split_attempts(cases):
+    groups = group_cases(cases)
+    latest = {key: max(row.get("attempt", 1) for row in rows) for key, rows in groups.items()}
+    final, retries = [], []
+    for row in cases:
+        key = (row["category"], row.get("case_id", row["id"]))
+        target = final if row.get("attempt", 1) == latest[key] else retries
+        target.append(row)
+    return final, retries
+
+
+def render_sections(cases):
+    final, retries = split_attempts(cases)
+    return ("## 最终结果\n\n" + render_table(final) +
+            "\n## 重试记录\n\n" + render_table(retries) +
+            ("\n无重试记录。\n" if not retries else ""))
+
+
 def render_summary(cases):
-    counts = {result: sum(case["result"] == result for case in cases)
-              for result in ("PASS", "FAIL", "SKIP")}
-    return "Summary（结果行）: " + " | ".join(f"{key} {value}" for key, value in counts.items())
+    final, _ = split_attempts(cases)
+    counts = {result: 0 for result in ("PASS", "FAIL", "SKIP")}
+    for rows in group_cases(final).values():
+        results = {row.get("attempt_result", row["result"]) for row in rows}
+        results.update(row["result"] for row in rows)
+        result = ("FAIL" if results - {"PASS", "SKIP"} else
+                  "SKIP" if "SKIP" in results else "PASS")
+        counts[result] += 1
+    total = sum(counts.values())
+    retried = sum(max(row.get("attempt", 1) for row in rows) > 1
+                  for rows in group_cases(cases).values())
+    if not total:
+        outcome = "无测试结果"
+    elif counts["PASS"] == total:
+        outcome = f"全部通过（{total}/{total}）"
+    else:
+        outcome = f'通过{counts["PASS"]}/{total}（失败{counts["FAIL"]}，跳过{counts["SKIP"]}）'
+    return f"最终结果：{outcome}；其中{retried}/{total}个用例进行了重试。"
 
 
 def aggregate_report(run_id, directories, exit_code):
@@ -92,7 +134,7 @@ def write_report(directory, report):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     markdown = (f'E2E：{report["suite"]}；运行：{report["run_id"]}；退出码：{report.get("exit_code", "执行中")}\n\n' +
-                render_table(report["cases"]))
+                render_sections(report["cases"]))
     if report["suite"] == "otel-smoke":
         markdown += "\n说明：Provider 500 用例的 PASS 表示预期错误已正确记录。\n"
     (directory / "result.md").write_text(markdown)

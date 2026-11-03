@@ -165,17 +165,17 @@ class TestInstruments:
         ("gen_ai.execute_tool.duration", "histogram", "s",
          {"gen_ai.tool.name", "gen_ai.tool.type", "gen_ai.agent.name", "error.type"}),
         ("gen_ai.invoke_agent.duration", "histogram", "s",
-         {"gen_ai.agent.name", "nagent.source", "error.type"}),
+         {"gen_ai.agent.name", "nagent.agent.source", "error.type"}),
         ("gen_ai.invoke_agent.inference_calls", "histogram", "{inference_call}",
-         {"gen_ai.agent.name", "nagent.source"}),
+         {"gen_ai.agent.name", "nagent.agent.source"}),
         ("gen_ai.invoke_agent.tool_calls", "histogram", "{tool_call}",
-         {"gen_ai.agent.name", "nagent.source"}),
-        ("nagent.turns", "counter", "1",
-         {"nagent.source", "nagent.end_reason"}),
-        ("nagent.context.compressions", "counter", "1",
-         {"nagent.outcome"}),
-        ("nagent.budget.denied", "counter", "1",
-         {"nagent.kind"}),
+         {"gen_ai.agent.name", "nagent.agent.source"}),
+        ("nagent.agent.runs", "counter", "1",
+         {"nagent.agent.source", "nagent.agent.end_reason"}),
+        ("nagent.context.compression_attempts", "counter", "1",
+         {"nagent.context.outcome"}),
+        ("nagent.budget.denials", "counter", "1",
+         {"nagent.budget.kind"}),
     ]
 
     def test_twelve_instruments_declared(self):
@@ -201,9 +201,9 @@ class TestInstruments:
         assert ts.INSTRUMENT_INVOKE_AGENT_DURATION == "gen_ai.invoke_agent.duration"
         assert ts.INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS == "gen_ai.invoke_agent.inference_calls"
         assert ts.INSTRUMENT_INVOKE_AGENT_TOOL_CALLS == "gen_ai.invoke_agent.tool_calls"
-        assert ts.INSTRUMENT_TURNS == "nagent.turns"
-        assert ts.INSTRUMENT_CONTEXT_COMPRESSIONS == "nagent.context.compressions"
-        assert ts.INSTRUMENT_BUDGET_DENIED == "nagent.budget.denied"
+        assert ts.INSTRUMENT_AGENT_RUNS == "nagent.agent.runs"
+        assert ts.INSTRUMENT_CONTEXT_COMPRESSION_ATTEMPTS == "nagent.context.compression_attempts"
+        assert ts.INSTRUMENT_BUDGET_DENIALS == "nagent.budget.denials"
 
 
 # ---------------------------------------------------------------------------
@@ -234,17 +234,17 @@ class TestHistogramBuckets:
 
 class TestNagentAttributes:
     def test_supplement_attribute_constants(self):
-        assert ts.NAGENT_SOURCE == "nagent.source"
-        assert ts.NAGENT_END_REASON == "nagent.end_reason"
-        assert ts.NAGENT_ITERATION == "nagent.iteration"
-        assert ts.NAGENT_RUN_ID == "nagent.run_id"
-        assert ts.NAGENT_POLICY_OUTCOME == "nagent.policy_outcome"
-        assert ts.NAGENT_RISK_LEVEL == "nagent.risk_level"
-        assert ts.NAGENT_USAGE_KNOWN == "nagent.usage_known"
-        assert ts.NAGENT_BEFORE_TOKENS == "nagent.before_tokens"
-        assert ts.NAGENT_AFTER_TOKENS == "nagent.after_tokens"
-        assert ts.NAGENT_OUTCOME == "nagent.outcome"
-        assert ts.NAGENT_KIND == "nagent.kind"
+        assert ts.NAGENT_AGENT_SOURCE == "nagent.agent.source"
+        assert ts.NAGENT_AGENT_END_REASON == "nagent.agent.end_reason"
+        assert ts.NAGENT_AGENT_ITERATION == "nagent.agent.iteration"
+        assert ts.NAGENT_AGENT_RUN_ID == "nagent.agent.run_id"
+        assert ts.NAGENT_TOOL_POLICY_OUTCOME == "nagent.tool.policy_outcome"
+        assert ts.NAGENT_TOOL_RISK_LEVEL == "nagent.tool.risk_level"
+        assert ts.NAGENT_MODEL_USAGE_KNOWN == "nagent.model.usage_known"
+        assert ts.NAGENT_CONTEXT_BEFORE_TOKENS == "nagent.context.before_tokens"
+        assert ts.NAGENT_CONTEXT_AFTER_TOKENS == "nagent.context.after_tokens"
+        assert ts.NAGENT_CONTEXT_OUTCOME == "nagent.context.outcome"
+        assert ts.NAGENT_BUDGET_KIND == "nagent.budget.kind"
 
     def test_risk_level_fixed_enum(self):
         assert {v.value for v in ts.RiskLevel} == {"safe", "confirm", "dangerous"}
@@ -395,7 +395,7 @@ class TestRealTracerContract:
         assert span.attributes[ts.GEN_AI_PROVIDER_NAME] == "openai"
         assert span.attributes[ts.GEN_AI_REQUEST_MODEL] == "gpt-4o"
         assert span.attributes[ts.GEN_AI_REQUEST_STREAM] is True
-        assert span.attributes[ts.NAGENT_ITERATION] == 2
+        assert span.attributes[ts.NAGENT_AGENT_ITERATION] == 2
         assert span.ended == 1
 
     def test_span_error_path_sets_safe_error_type_and_status(self, tracer):
@@ -418,8 +418,8 @@ class TestRealTracerContract:
         span = tracer.spans[0]
         assert span.name == "invoke_agent n-agent"
         assert span.attributes[ts.GEN_AI_CONVERSATION_ID] == "s1"
-        assert span.attributes[ts.NAGENT_SOURCE] == "cli"
-        assert span.attributes[ts.NAGENT_RUN_ID] == "r1"
+        assert span.attributes[ts.NAGENT_AGENT_SOURCE] == "cli"
+        assert span.attributes[ts.NAGENT_AGENT_RUN_ID] == "r1"
         assert span.attributes[ts.GEN_AI_AGENT_NAME] == "n-agent"
         assert span.ended == 1
 
@@ -427,9 +427,9 @@ class TestRealTracerContract:
         with ts.compress_span(before_tokens=100, after_tokens=40):
             pass
         span = tracer.spans[0]
-        assert span.name == "nagent.context.compress"
-        assert span.attributes[ts.NAGENT_BEFORE_TOKENS] == 100
-        assert span.attributes[ts.NAGENT_AFTER_TOKENS] == 40
+        assert span.name == "context.compress"
+        assert span.attributes[ts.NAGENT_CONTEXT_BEFORE_TOKENS] == 100
+        assert span.attributes[ts.NAGENT_CONTEXT_AFTER_TOKENS] == 40
         assert span.ended == 1
 
     def test_agent_name_centralized_constant(self):
@@ -561,12 +561,12 @@ class TestFakeMeterContract:
 
     def test_turn_end_reason_has_own_vocabulary(self, meter):
         ts.record_turn(source="cli", end_reason="completed")
-        counter = meter.counters[ts.INSTRUMENT_TURNS]
+        counter = meter.counters[ts.INSTRUMENT_AGENT_RUNS]
         _value, attrs = counter.records[0]
-        assert attrs[ts.NAGENT_END_REASON] == "completed"
+        assert attrs[ts.NAGENT_AGENT_END_REASON] == "completed"
         ts.record_turn(source="cli", end_reason="mystery-reason")
         _value, attrs = counter.records[1]
-        assert attrs[ts.NAGENT_END_REASON] == "other"
+        assert attrs[ts.NAGENT_AGENT_END_REASON] == "other"
 
 
 # ---------------------------------------------------------------------------
@@ -587,9 +587,9 @@ class TestCardinalityGuard:
         assert ts.map_error_type("TimeoutError") == "TimeoutError"
         assert ts.map_error_type("some unique failure message text") == "other"
         assert ts.map_source("cli") == "cli"
-        assert ts.map_source("mystery-source") == "other"
-        assert ts.map_outcome("compressed") == "compressed"
-        assert ts.map_outcome("mystery-outcome") == "other"
+        assert ts.map_source("mystery-source") == "unknown"
+        assert ts.map_outcome("compressed") == "success"
+        assert ts.map_outcome("mystery-outcome") == "unknown"
         # end_reason has its own bounded vocabulary (turn-end values),
         # including the Domain EndReason vocabulary emitted by the graph
         # (_END_REASON_TO_TELEMETRY) that finish_reason cannot distinguish
@@ -616,27 +616,27 @@ class TestCardinalityGuard:
         assert ts.dimension_series_count(inst) == 1000
 
     def test_guard_counts_across_readers_and_calls(self):
-        inst = ts.INSTRUMENT_TURNS
+        inst = ts.INSTRUMENT_AGENT_RUNS
         for i in range(1200):
-            ts.guard_dimensions(inst, {ts.NAGENT_SOURCE: f"src-{i}"})
+            ts.guard_dimensions(inst, {ts.NAGENT_AGENT_SOURCE: f"src-{i}"})
         assert ts.dimension_series_count(inst) == 1000
 
     def test_guard_is_per_instrument(self):
-        inst_a = ts.INSTRUMENT_TURNS
-        inst_b = ts.INSTRUMENT_BUDGET_DENIED
+        inst_a = ts.INSTRUMENT_AGENT_RUNS
+        inst_b = ts.INSTRUMENT_BUDGET_DENIALS
         for i in range(999):
-            ts.guard_dimensions(inst_a, {ts.NAGENT_SOURCE: f"src-{i}"})
+            ts.guard_dimensions(inst_a, {ts.NAGENT_AGENT_SOURCE: f"src-{i}"})
         # a different instrument has an independent budget
-        dims = ts.guard_dimensions(inst_b, {ts.NAGENT_KIND: "kind-new"})
-        assert dims[ts.NAGENT_KIND] == "kind-new"
+        dims = ts.guard_dimensions(inst_b, {ts.NAGENT_BUDGET_KIND: "kind-new"})
+        assert dims[ts.NAGENT_BUDGET_KIND] == "kind-new"
 
     def test_guard_reuses_known_series(self):
-        inst = ts.INSTRUMENT_TURNS
+        inst = ts.INSTRUMENT_AGENT_RUNS
         for i in range(999):
-            ts.guard_dimensions(inst, {ts.NAGENT_SOURCE: f"src-{i}"})
+            ts.guard_dimensions(inst, {ts.NAGENT_AGENT_SOURCE: f"src-{i}"})
         # repeating an existing series never overflows
-        dims = ts.guard_dimensions(inst, {ts.NAGENT_SOURCE: "src-0"})
-        assert dims[ts.NAGENT_SOURCE] == "src-0"
+        dims = ts.guard_dimensions(inst, {ts.NAGENT_AGENT_SOURCE: "src-0"})
+        assert dims[ts.NAGENT_AGENT_SOURCE] == "src-0"
 
 
 # ---------------------------------------------------------------------------
@@ -660,8 +660,8 @@ class TestConcurrency:
             try:
                 for i in range(400):
                     ts.guard_dimensions(
-                        ts.INSTRUMENT_TURNS,
-                        {ts.NAGENT_SOURCE: f"src-{worker_id}-{i}"},
+                        ts.INSTRUMENT_AGENT_RUNS,
+                        {ts.NAGENT_AGENT_SOURCE: f"src-{worker_id}-{i}"},
                     )
             except Exception as exc:  # pragma: no cover
                 errors.append(exc)
@@ -672,7 +672,7 @@ class TestConcurrency:
         for t in threads:
             t.join()
         assert not errors
-        assert ts.dimension_series_count(ts.INSTRUMENT_TURNS) == 1000
+        assert ts.dimension_series_count(ts.INSTRUMENT_AGENT_RUNS) == 1000
 
     def test_register_tool_name_thread_safe_and_capped(self):
         import threading
@@ -701,7 +701,7 @@ class TestConcurrency:
             ts._registered_tools.clear()
 
     def test_overflow_dimension_key_is_reserved(self):
-        assert set(ts.OVERFLOW_DIMENSIONS) == {"__nagent.overflow__"}
+        assert set(ts.OVERFLOW_DIMENSIONS) == {"nagent.metric.overflow"}
 
 
 # ---------------------------------------------------------------------------
@@ -786,20 +786,20 @@ class TestSpanAttributeSanitizer:
             ts._complete(span, "invoke_agent", span_start := 0.0,
                          message_count=2, inference_calls=1, tool_calls=0,
                          end_reason="completed", outcome="success")
-        summary = tracer.spans[0].attributes[ts.NAGENT_SUMMARY]
+        summary = tracer.spans[0].attributes[ts.NAGENT_AGENT_SUMMARY]
         assert self._SECRET not in summary
 
     def test_dynamic_string_attr_sanitized(self, sanitizer, tracer):
         with ts.invoke_agent_span(session_id="s1", source="cli", run_id="r1") as span:
             # inject a raw secret-bearing string via _set_attr directly
-            span.attributes[ts.NAGENT_SUMMARY] = "probe"
-            ts._set_attr(span, ts.NAGENT_SUMMARY, f"prefix {self._SECRET} suffix")
-        assert "prefix [REDACTED] suffix" == tracer.spans[0].attributes[ts.NAGENT_SUMMARY]
+            span.attributes[ts.NAGENT_AGENT_SUMMARY] = "probe"
+            ts._set_attr(span, ts.NAGENT_AGENT_SUMMARY, f"prefix {self._SECRET} suffix")
+        assert "prefix [REDACTED] suffix" == tracer.spans[0].attributes[ts.NAGENT_AGENT_SUMMARY]
 
     def test_uninstalled_sanitizer_still_writes_dynamic(self, tracer):
         with ts.invoke_agent_span(session_id="s1", source="cli", run_id="r1") as span:
-            ts._set_attr(span, ts.NAGENT_SUMMARY, f"pre {self._SECRET} post")
-        assert f"pre {self._SECRET} post" == tracer.spans[0].attributes[ts.NAGENT_SUMMARY]
+            ts._set_attr(span, ts.NAGENT_AGENT_SUMMARY, f"pre {self._SECRET} post")
+        assert f"pre {self._SECRET} post" == tracer.spans[0].attributes[ts.NAGENT_AGENT_SUMMARY]
 
     def test_sanitizer_raise_omits_dynamic_attr(self, monkeypatch, tracer):
         def boom(text):
@@ -807,7 +807,7 @@ class TestSpanAttributeSanitizer:
         ts.configure_span_attribute_sanitizer(boom)
         try:
             with ts.invoke_agent_span(session_id="s1", source="cli", run_id="r1") as span:
-                ts._set_attr(span, ts.NAGENT_SUMMARY, "anything")
-            assert ts.NAGENT_SUMMARY not in tracer.spans[0].attributes
+                ts._set_attr(span, ts.NAGENT_AGENT_SUMMARY, "anything")
+            assert ts.NAGENT_AGENT_SUMMARY not in tracer.spans[0].attributes
         finally:
             ts.configure_span_attribute_sanitizer(None)

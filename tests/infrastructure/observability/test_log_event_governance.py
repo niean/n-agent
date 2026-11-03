@@ -71,16 +71,16 @@ async def test_policy_decision_has_fixed_event_and_sanitized_structured_facts(mo
     assert len(emitted) == 1
     template, payload, projected = emitted[0]
     assert template == "policy_decision %s"
-    assert payload["event"] == "policy_decision"
-    assert payload["policy.name"] == projected.__dict__["policy.name"] == "tool"
-    assert payload["policy.outcome"] == "deny"
-    assert payload["policy.run_id"] == "r1"
-    assert payload["policy.session_id"] == "s1"
-    assert payload["policy.reason"] == "blocked [REDACTED]"
+    assert payload["event"] == "nagent.policy.decided"
+    assert payload["nagent.policy.name"] == projected.__dict__["nagent.policy.name"] == "tool"
+    assert payload["nagent.policy.outcome"] == "deny"
+    assert "nagent.agent.run_id" not in payload
+    assert "gen_ai.conversation.id" not in payload
+    assert payload["nagent.policy.reason"] == "blocked [REDACTED]"
     assert "sentinel-private-value" not in json.dumps(payload)
     assert "sentinel-private-value" not in str(projected.__dict__)
     after = logging.LogRecord("app.other", logging.WARNING, __file__, 1, "other", (), None)
-    assert "policy.name" not in json.loads(obs.SafeEventJsonFormatter().format(after))
+    assert "nagent.policy.name" not in json.loads(obs.SafeEventJsonFormatter().format(after))
 
 
 def test_lifecycle_templates_are_registered():

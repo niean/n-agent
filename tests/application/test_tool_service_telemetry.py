@@ -171,9 +171,9 @@ async def test_allow_outcome_success(tracer, meter):
     assert span.ended == 1
     assert span.attributes[ts.GEN_AI_TOOL_NAME] == "calculator"
     assert span.attributes[ts.GEN_AI_TOOL_TYPE] == "function"
-    assert span.attributes[ts.NAGENT_POLICY_OUTCOME] == "allow"
-    assert span.attributes[ts.NAGENT_OUTCOME] == "success"
-    assert span.attributes[ts.NAGENT_RISK_LEVEL] == "safe"
+    assert span.attributes[ts.NAGENT_TOOL_POLICY_OUTCOME] == "allow"
+    assert span.attributes["nagent.tool.outcome"] == "success"
+    assert span.attributes[ts.NAGENT_TOOL_RISK_LEVEL] == "safe"
     assert len(_duration_records(meter)) == 1
     value, dims = _duration_records(meter)[0]
     assert value >= 0
@@ -195,8 +195,8 @@ async def test_policy_deny_never_reaches_executor(tracer, meter):
     assert executor.calls == []
     spans = _tool_spans(tracer)
     assert len(spans) == 1
-    assert spans[0].attributes[ts.NAGENT_POLICY_OUTCOME] == "deny"
-    assert spans[0].attributes[ts.NAGENT_OUTCOME] == "denied"
+    assert spans[0].attributes[ts.NAGENT_TOOL_POLICY_OUTCOME] == "deny"
+    assert spans[0].attributes["nagent.tool.outcome"] == "denied"
     # counted exactly once
     assert len(_duration_records(meter)) == 1
 
@@ -211,8 +211,8 @@ async def test_require_approval_outcome(tracer, meter):
     assert result.status is ToolResultStatus.PERMISSION_DENIED
     assert executor.calls == []
     span = _tool_spans(tracer)[0]
-    assert span.attributes[ts.NAGENT_POLICY_OUTCOME] == "require_approval"
-    assert span.attributes[ts.NAGENT_OUTCOME] == "denied"
+    assert span.attributes[ts.NAGENT_TOOL_POLICY_OUTCOME] == "require_approval"
+    assert span.attributes["nagent.tool.outcome"] == "denied"
 
 
 @pytest.mark.asyncio
@@ -225,7 +225,7 @@ async def test_executor_exception_records_error_and_propagates(tracer, meter):
 
     span = _tool_spans(tracer)[0]
     assert span.ended == 1
-    assert span.attributes[ts.NAGENT_OUTCOME] == "error"
+    assert span.attributes["nagent.tool.outcome"] == "failure"
     assert span.attributes["error.type"] == "other"  # RuntimeError -> bounded value
     _value, dims = _duration_records(meter)[0]
     assert dims["error.type"] == "other"
@@ -240,7 +240,7 @@ async def test_error_result_outcome_uses_tool_error_sentinel(tracer, meter):
 
     assert result.status is ToolResultStatus.ERROR
     span = _tool_spans(tracer)[0]
-    assert span.attributes[ts.NAGENT_OUTCOME] == "error"
+    assert span.attributes["nagent.tool.outcome"] == "failure"
     _value, dims = _duration_records(meter)[0]
     assert dims["error.type"] == "tool_error"  # sentinel, not a fabricated class name
 
@@ -255,7 +255,7 @@ async def test_cancelled_outcome(tracer, meter):
 
     span = _tool_spans(tracer)[0]
     assert span.ended == 1
-    assert span.attributes[ts.NAGENT_OUTCOME] == "cancelled"
+    assert span.attributes["nagent.tool.outcome"] == "cancelled"
 
 
 @pytest.mark.asyncio

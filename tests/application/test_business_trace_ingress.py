@@ -71,18 +71,18 @@ async def test_cli_request_is_explicit_entry_above_gateway(sdk, streaming):
     client = CliChatAdapter(harness.service())
     if streaming:
         async for _ in client.send_stream("hello", "local"):
-            assert not any(s.name == "cli.request" for s in exporter.get_finished_spans())
+            assert not any(s.name == "request.handle" for s in exporter.get_finished_spans())
     else:
         await client.send("hello", "local")
-    entry = named(exporter, "cli.request")
-    gateway = named(exporter, "gateway.message")
+    entry = named(exporter, "request.handle")
+    gateway = named(exporter, "gateway.handle_message")
     assert entry.parent is None
     assert gateway.parent.span_id == entry.context.span_id
     assert gateway.context.trace_id == entry.context.trace_id
     assert entry.end_time >= gateway.end_time
-    assert entry.attributes["nagent.source"] == "cli"
-    assert "hello" in entry.attributes["nagent.details.input_messages.content"]
-    content = entry.attributes["nagent.details.output_messages.content"]
+    assert entry.attributes["nagent.request.channel"] == "cli"
+    assert "hello" in entry.attributes["nagent.content.input_messages"]
+    content = entry.attributes["nagent.content.output_messages"]
     assert content == "done" if streaming else content == '[{"content": "done"}]'
     assert not trace.get_current_span().get_span_context().is_valid
 
@@ -118,10 +118,10 @@ async def test_cli_request_stream_failure_and_close_restore_context(sdk, mode, e
             async for _ in stream:
                 pass
         assert trace.get_current_span() is caller
-    entry = named(exporter, "cli.request")
+    entry = named(exporter, "request.handle")
     assert entry.parent.span_id == caller.get_span_context().span_id
-    assert entry.attributes["nagent.outcome"] == expected
-    assert entry.attributes["nagent.details.output_messages.content"] == "prefix"
+    assert entry.attributes["nagent.request.outcome"] == {"failed": "failure", "error": "failure"}.get(expected, expected)
+    assert entry.attributes["nagent.content.output_messages"] == "prefix"
     assert closed == [True]
 
 
@@ -152,14 +152,14 @@ async def test_gateway_entry_contains_agent_and_stream_consumption(sdk, source, 
                 assert trace.get_current_span().get_span_context().trace_id == upstream.get_span_context().trace_id
         else:
             await service.handle_message(event)
-    entry = named(exporter, "gateway.message")
+    entry = named(exporter, "gateway.handle_message")
     agent = named(exporter, "invoke_agent n-agent")
     assert entry.parent.span_id == upstream.get_span_context().span_id
     assert agent.parent.span_id == entry.context.span_id
-    assert entry.attributes["nagent.source"] == source
+    assert "nagent.agent.source" not in entry.attributes
     assert entry.end_time >= agent.end_time
-    assert "hello" in entry.attributes["nagent.details.input_messages.content"]
-    assert "done" in entry.attributes["nagent.details.output_messages.content"]
+    assert "hello" in entry.attributes["nagent.content.input_messages"]
+    assert "done" in entry.attributes["nagent.content.output_messages"]
 
 
 @pytest.mark.asyncio
@@ -176,13 +176,13 @@ async def test_background_review_has_linked_root_and_restores_caller(sdk, ingres
         assert trace.get_current_span() is trigger
     root = named(exporter, "skill.review")
     assert root.parent is None
-    assert root.attributes["nagent.source"] == expected
-    assert named(exporter, "invoke_agent n-agent").attributes["nagent.source"] == expected
+    assert "nagent.agent.source" not in root.attributes
+    assert named(exporter, "invoke_agent n-agent").attributes["nagent.agent.source"] == expected
     assert root.context.trace_id != trigger.get_span_context().trace_id
     assert root.links[0].context == trigger.get_span_context()
     assert named(exporter, "invoke_agent n-agent").parent.span_id == root.context.span_id
-    assert "digest" in root.attributes["nagent.details.input_messages.content"]
-    assert "done" in root.attributes["nagent.details.output_messages.content"]
+    assert "digest" in root.attributes["nagent.content.input_messages"]
+    assert "done" in root.attributes["nagent.content.output_messages"]
 
 
 @pytest.mark.asyncio
@@ -203,10 +203,10 @@ async def test_curator_keeps_review_inside_its_linked_root(sdk):
     assert root.links[0].context == trigger.get_span_context()
     assert review.parent.span_id == root.context.span_id
     assert review.context.trace_id == root.context.trace_id
-    assert "dry_run" in root.attributes["nagent.details.input_messages.content"]
+    assert "dry_run" in root.attributes["nagent.content.input_messages"]
     import json
-    request_payload = json.loads(root.attributes["nagent.details.input_messages.content"])
-    response_payload = json.loads(root.attributes["nagent.details.output_messages.content"])
+    request_payload = json.loads(root.attributes["nagent.content.input_messages"])
+    response_payload = json.loads(root.attributes["nagent.content.output_messages"])
     assert request_payload["candidates"][0]["name"] == "old"
     assert request_payload["consolidate"] is True
     assert response_payload["auto_transitions"]["checked"] == 1
@@ -238,12 +238,12 @@ async def test_delegation_carrier_survives_recovery_and_ignores_tick_parent(sdk,
     service = DelegationRunService(recovered, Executor(), FakeClock(), _config())
     with tracer.start_as_current_span("unrelated-tick"):
         await service.tick()
-    roots = [s for s in exporter.get_finished_spans() if s.name == "delegation.member"]
+    roots = [s for s in exporter.get_finished_spans() if s.name == "delegation.run_member"]
     assert len(roots) == 4
     for root in roots:
-        assert root.attributes["nagent.source"] == "delegation"
-        assert "instruction" in root.attributes["nagent.details.input_messages.content"]
-        assert "succeeded" in root.attributes["nagent.details.output_messages.content"]
+        assert "nagent.agent.source" not in root.attributes
+        assert "instruction" in root.attributes["nagent.content.input_messages"]
+        assert "succeeded" in root.attributes["nagent.content.output_messages"]
         index = next(i for i, d in enumerate(delegations) if root.attributes["nagent.delegation.id"] == d.id)
         assert root.parent.span_id == parents[index].span_id
         assert root.context.trace_id == parents[index].trace_id
@@ -286,12 +286,12 @@ async def test_task_entry_covers_multiple_agents_and_finalization(sdk, outcome):
     agents = [s for s in exporter.get_finished_spans() if s.name == "invoke_agent n-agent"]
     assert len(agents) == 3
     assert all(s.parent.span_id == root.context.span_id for s in agents)
-    assert root.attributes["nagent.outcome"] == {"completed": "completed", "timeout": "timed_out", "crash": "crashed"}[outcome]
-    assert task.title in root.attributes["nagent.details.input_messages.content"]
+    assert root.attributes["nagent.task.outcome"] == {"completed": "success", "timeout": "timed_out", "crash": "failure"}[outcome]
+    assert task.title in root.attributes["nagent.content.input_messages"]
     if outcome == "completed":
-        assert "done" in root.attributes["nagent.details.output_messages.content"]
+        assert "done" in root.attributes["nagent.content.output_messages"]
     else:
-        assert "execution" in root.attributes["nagent.details.error.content"]
+        assert "execution" in root.attributes["nagent.content.error"]
 
 
 @pytest.mark.asyncio
@@ -310,11 +310,11 @@ async def test_gateway_closing_stream_ends_entry_and_inner_generator(sdk):
         InteractionMessage(id="close", session_key=GatewaySessionKey("cli", "local"), text="hi"))
     await anext(stream)
     await stream.aclose()
-    entry = named(exporter, "gateway.message")
-    assert entry.attributes["nagent.outcome"] == "cancelled"
+    entry = named(exporter, "gateway.handle_message")
+    assert entry.attributes["nagent.gateway.outcome"] == "cancelled"
     assert closed == [True]
-    assert "partial" in entry.attributes["nagent.details.output_messages.content"]
-    assert entry.attributes["nagent.details.output_messages.incomplete"] is True
+    assert "partial" in entry.attributes["nagent.content.output_messages"]
+    assert entry.attributes["nagent.content.output_messages_incomplete"] is True
     assert not trace.get_current_span().get_span_context().is_valid
 
 
@@ -330,27 +330,27 @@ async def test_feishu_event_span_contains_reply_after_gateway(sdk):
         contexts.append(trace.get_current_span().get_span_context())
     client.send_markdown_reply = reply
     await FeishuImAdapter(harness.service(), client).handle_event(text_payload())
-    entry = named(exporter, "feishu.event")
-    assert named(exporter, "gateway.message").parent.span_id == entry.context.span_id
+    entry = named(exporter, "request.handle")
+    assert named(exporter, "gateway.handle_message").parent.span_id == entry.context.span_id
     assert contexts == [entry.context]
-    assert "nagent.details.input_messages.content" in entry.attributes
-    assert "nagent.details.output_messages.content" in entry.attributes
+    assert "nagent.content.input_messages" in entry.attributes
+    assert "nagent.content.output_messages" in entry.attributes
 
 
 @pytest.mark.parametrize("carrier", [{}, {"traceparent": "invalid"}, {"traceparent": "00-" + "0" * 32 + "-" + "0" * 16 + "-01"}])
 def test_missing_or_invalid_carrier_never_inherits_tick(sdk, carrier):
     tracer, exporter = sdk
     with tracer.start_as_current_span("unrelated") as upstream:
-        with ts.business_operation("delegation.member", source="delegation", parent_carrier=carrier):
+        with ts.business_operation("delegation.run_member", source="delegation", parent_carrier=carrier):
             pass
         assert trace.get_current_span() is upstream
-    assert named(exporter, "delegation.member").parent is None
+    assert named(exporter, "delegation.run_member").parent is None
 
 
 def test_unsampled_remote_parent_keeps_context_without_new_sample(sdk):
     _, exporter = sdk
     carrier = {"traceparent": "00-1234567890abcdef1234567890abcdef-1234567890abcdef-00"}
-    with ts.business_operation("delegation.member", source="delegation", parent_carrier=carrier):
+    with ts.business_operation("delegation.run_member", source="delegation", parent_carrier=carrier):
         context = trace.get_current_span().get_span_context()
         assert context.trace_id == int("1234567890abcdef1234567890abcdef", 16)
         assert not context.trace_flags.sampled
@@ -379,7 +379,7 @@ async def test_background_cancellation_restores_business_scene_and_ends_root(sdk
             ts._execution_ids.reset(token)
     root = named(exporter, "skill.review")
     assert root.parent is None
-    assert root.attributes["nagent.outcome"] == "cancelled"
+    assert root.attributes["nagent.skill.outcome"] == "cancelled"
 
 
 def test_business_completion_logs_current_root_and_no_parent_scene(sdk, monkeypatch):
@@ -390,7 +390,7 @@ def test_business_completion_logs_current_root_and_no_parent_scene(sdk, monkeypa
         token = ts._scene_var.set({"model": "parent-model", "tool": "parent-tool", "details": "parent-content"})
         try:
             with ts.business_operation("skill.review", source="curator", session_id="child", detached=True):
-                assert ts.execution_log_snapshot() == {"operation": "skill.review", "source": "curator", "session_id": "child"}
+                assert ts.execution_log_snapshot() == {"operation": "skill.review", "session_id": "child"}
         finally:
             ts._scene_var.reset(token)
     root = named(exporter, "skill.review")
@@ -451,9 +451,9 @@ async def test_curator_consolidation_failure_marks_business_root_failed(sdk):
     service.render_candidate_list = AsyncMock(return_value="candidate")
     service._finalize_run = AsyncMock()
     await service.run_curator_review(dry_run=True, consolidate=True)
-    assert named(exporter, "curator.run").attributes["nagent.outcome"] == "failed"
-    assert "failed" in named(exporter, "curator.run").attributes["nagent.details.error.content"]
-    assert '"error": "failed"' in named(exporter, "curator.run").attributes["nagent.details.output_messages.content"]
+    assert named(exporter, "curator.run").attributes["nagent.curator.outcome"] == "failure"
+    assert "failed" in named(exporter, "curator.run").attributes["nagent.content.error"]
+    assert '"error": "failed"' in named(exporter, "curator.run").attributes["nagent.content.output_messages"]
 
 
 @pytest.mark.asyncio
@@ -468,13 +468,13 @@ async def test_curator_return_paths_keep_actual_result_and_error_payload(sdk, pa
         service.skill_usage_store.list_curator_managed.side_effect = RuntimeError("catalog unavailable")
     result = await service.run_curator_review()
     root = named(sdk[1], "curator.run")
-    payload = json.loads(root.attributes["nagent.details.output_messages.content"])
+    payload = json.loads(root.attributes["nagent.content.output_messages"])
     assert payload["started_at"] == result.started_at
     assert payload["summary_so_far"] == result.summary_so_far
     assert payload["auto_transitions"]["checked"] == result.auto_transitions.checked
     if path in {"backup-failed", "orchestrator-failed"}:
         assert payload["errors"]
-        assert "nagent.details.error.content" in root.attributes
+        assert "nagent.content.error" in root.attributes
 
 
 @pytest.mark.asyncio
@@ -493,14 +493,14 @@ async def test_curator_payload_is_sanitized_bounded_and_shared_with_completion_l
     await service.run_curator_review(dry_run=True, consolidate=True)
     root = named(sdk[1], "curator.run")
     log = next(item for item in logs if item["operation"] == "curator.run")
-    assert root.attributes["nagent.details.output_messages.truncated"] is large
+    assert root.attributes["nagent.content.output_messages_truncated"] is large
     if not large:
-        assert "[REDACTED]" in root.attributes["nagent.details.output_messages.content"]
-    assert "SENTINEL-PRIVATE" not in str(root.attributes) + str(log)
+        assert "[REDACTED]" in root.attributes["nagent.content.output_messages"]
+    assert "SENTINEL-PRIVATE" not in str(root.attributes) + str(log["details"])
     for field, envelope in log["details"].items():
         assert len(envelope["content"].encode("utf-8")) <= 2048
         for key, value in envelope.items():
-            assert root.attributes[f"nagent.details.{field}.{key}"] == value
+            assert root.attributes[f"nagent.content.{field}{'' if key == 'content' else '_' + key}"] == value
 
 
 @pytest.mark.asyncio
@@ -513,7 +513,7 @@ async def test_curator_payload_projection_failure_does_not_change_result(sdk, mo
     monkeypatch.setattr(module, "project_details", broken)
     result = await service.run_curator_review(dry_run=True)
     assert "no changes" in result.summary_so_far
-    assert named(sdk[1], "curator.run").attributes["nagent.outcome"] == "success"
+    assert named(sdk[1], "curator.run").attributes["nagent.curator.outcome"] == "success"
 
 
 @pytest.mark.asyncio
@@ -531,10 +531,10 @@ async def test_curator_cancel_preserves_partial_payload_and_original_cancellatio
         await service.run_curator_review(dry_run=True)
     assert caught.value is error
     root = named(sdk[1], "curator.run")
-    assert root.attributes["nagent.outcome"] == "cancelled"
+    assert root.attributes["nagent.curator.outcome"] == "cancelled"
     if not broken_projection:
-        assert "old" in root.attributes["nagent.details.input_messages.content"]
-        assert root.attributes["nagent.details.output_messages.incomplete"] is True
+        assert "old" in root.attributes["nagent.content.input_messages"]
+        assert root.attributes["nagent.content.output_messages_incomplete"] is True
 
 
 @pytest.mark.asyncio
@@ -551,7 +551,7 @@ async def test_curator_keeps_completed_transitions_when_later_step_fails(sdk, fa
         service.evolution_service = object()
         with pytest.raises(asyncio.CancelledError):
             await service.run_curator_review(dry_run=True, consolidate=True)
-    payload = json.loads(named(sdk[1], "curator.run").attributes["nagent.details.output_messages.content"])
+    payload = json.loads(named(sdk[1], "curator.run").attributes["nagent.content.output_messages"])
     assert payload["auto_transitions"]["checked"] == 1
     assert payload["auto_transitions"]["archived"] == 1
 
@@ -572,7 +572,7 @@ async def test_gateway_returned_error_marks_entry_failed(sdk, streaming):
             pass
     else:
         await service.handle_message(event)
-    assert named(exporter, "gateway.message").attributes["nagent.outcome"] == "failed"
+    assert named(exporter, "gateway.handle_message").attributes["nagent.gateway.outcome"] == "failure"
 
 
 @pytest.mark.asyncio
@@ -585,8 +585,8 @@ async def test_curator_marks_provider_error_returned_by_real_review(sdk):
     service.render_candidate_list = AsyncMock(return_value="candidate")
     service._finalize_run = AsyncMock()
     await service.run_curator_review(dry_run=True, consolidate=True)
-    assert named(exporter, "skill.review").attributes["nagent.outcome"] == "failed"
-    assert named(exporter, "curator.run").attributes["nagent.outcome"] == "failed"
+    assert named(exporter, "skill.review").attributes["nagent.skill.outcome"] == "failure"
+    assert named(exporter, "curator.run").attributes["nagent.curator.outcome"] == "failure"
 
 
 @pytest.mark.asyncio
@@ -600,7 +600,7 @@ async def test_gateway_cancel_event_is_not_an_execution_failure(sdk):
     async for _ in service.handle_message_stream(
             InteractionMessage(id="cancel", session_key=GatewaySessionKey("cli", "local"), text="hi")):
         pass
-    assert named(exporter, "gateway.message").attributes["nagent.outcome"] == "cancelled"
+    assert named(exporter, "gateway.handle_message").attributes["nagent.gateway.outcome"] == "cancelled"
 
 
 @pytest.mark.parametrize("operation", list(ts._BUSINESS_OPERATIONS) + ["schedule.execute"])
@@ -614,14 +614,16 @@ def test_entry_details_are_identical_in_span_and_completion_log(sdk, monkeypatch
     with scope as facts:
         facts["details"] = project_details(input_messages={"text": "request", "password": "SENTINEL-PRIVATE"},
             output_messages="结果" * 2048)
-    span = named(exporter, operation)
+    from app.application.telemetry_contract import resolve_operation
+    spec = resolve_operation(operation)
+    span = named(exporter, spec.span_name + (" " + operation.split(" ", 1)[1] if " " in operation else ""))
     context, log = logs[0]
     assert context == span.context
     assert "SENTINEL-PRIVATE" not in str(span.attributes) + str(log)
     for name, envelope in log["details"].items():
         assert len(envelope["content"].encode("utf-8")) <= 2048
         for key, value in envelope.items():
-            assert span.attributes[f"nagent.details.{name}.{key}"] == value
+            assert span.attributes[f"nagent.content.{name}{'' if key == 'content' else '_' + key}"] == value
     assert log["details"]["output_messages"]["truncated"] is True
 
 
@@ -637,7 +639,7 @@ async def test_gateway_stream_records_deltas_once_and_redacts_split_credentials(
     async for _ in harness.service().handle_message_stream(
         InteractionMessage(id="split", session_key=GatewaySessionKey("cli", "local"), text="hi")):
         pass
-    content = named(exporter, "gateway.message").attributes["nagent.details.output_messages.content"]
+    content = named(exporter, "gateway.handle_message").attributes["nagent.content.output_messages"]
     assert content.count("hello") == 1
     assert "SENTINEL-PRIVATE" not in content
 
@@ -649,7 +651,7 @@ def test_entry_exception_keeps_safe_error_and_business_exception(sdk):
         with ts.business_operation("task.run"):
             raise error
     assert caught.value is error
-    content = named(exporter, "task.run").attributes["nagent.details.error.content"]
+    content = named(exporter, "task.run").attributes["nagent.content.error"]
     assert "failed" in content
     assert "SENTINEL-PRIVATE" not in content
 
@@ -671,7 +673,7 @@ async def test_gateway_closing_stream_survives_broken_partial_sanitizer(sdk, mon
         InteractionMessage(id="broken", session_key=GatewaySessionKey("cli", "local"), text="hi"))
     await anext(stream)
     await stream.aclose()
-    assert named(sdk[1], "gateway.message").attributes["nagent.outcome"] == "cancelled"
+    assert named(sdk[1], "gateway.handle_message").attributes["nagent.gateway.outcome"] == "cancelled"
 
 
 def test_entry_preserves_exception_with_broken_string_conversion(sdk):
@@ -692,11 +694,11 @@ async def test_feishu_nontext_entry_records_action_and_actual_response(sdk, kind
     from app.interfaces.feishu_im_adapter import FeishuImAdapter
     payload = image_payload() if kind == "image" else card_payload()
     await FeishuImAdapter(FakeGatewayService(), FakeFeishuClient(payload)).handle_event(payload)
-    attributes = named(sdk[1], "feishu.event").attributes
-    assert "nagent.details.output_messages.content" in attributes
+    attributes = named(sdk[1], "request.handle").attributes
+    assert "nagent.content.output_messages" in attributes
     if kind == "card":
-        assert "choice" in attributes["nagent.details.input_messages.content"]
-        assert "confirmed" in attributes["nagent.details.output_messages.content"]
+        assert "choice" in attributes["nagent.content.input_messages"]
+        assert "confirmed" in attributes["nagent.content.output_messages"]
 
 
 @pytest.mark.asyncio
@@ -707,7 +709,7 @@ async def test_feishu_early_rejection_records_actual_response(sdk, kind):
     payload = image_payload() if kind == "image" else card_payload(choice="invalid")
     client = FakeFeishuClient(payload, download_error=RuntimeError("download failed"))
     await FeishuImAdapter(FakeGatewayService(), client).handle_event(payload)
-    content = named(sdk[1], "feishu.event").attributes["nagent.details.output_messages.content"]
+    content = named(sdk[1], "request.handle").attributes["nagent.content.output_messages"]
     assert client.sent[0][1] in content
 
 

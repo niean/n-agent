@@ -61,11 +61,11 @@ def test_chat_requires_downstream_http_payload_and_completion(missing):
     chat = {**span(), "spanId": "11" * 8, "parentSpanId": agent["spanId"], "name": "chat model"}
     http = {**span(), "spanId": "22" * 8, "parentSpanId": chat["spanId"], "name": "POST llm.example /v1/chat/completions",
             "attributes": [{"key": "http.request.method", "value": {"stringValue": "POST"}},
-                           {"key": "nagent.details.http_request.content", "value": {"stringValue": "useful request"}},
-                           {"key": "nagent.details.http_response.content", "value": {"stringValue": "useful response"}}],
-            "events": [{"name": "http_client_completed"}]}
+                           {"key": "nagent.content.http_request", "value": {"stringValue": "useful request"}},
+                           {"key": "nagent.content.http_response", "value": {"stringValue": "useful response"}}],
+            "events": [{"name": "nagent.http.completed"}]}
     if missing in {"request", "response"}:
-        http["attributes"] = [a for a in http["attributes"] if a["key"] != f"nagent.details.http_{missing}.content"]
+        http["attributes"] = [a for a in http["attributes"] if a["key"] != f"nagent.content.http_{missing}"]
     if missing == "event":
         http["events"] = []
     def get(url, timeout):
@@ -247,7 +247,7 @@ def test_worker_session_matches_production_selection(task, expected):
 
 def test_shared_session_worker_cannot_substitute_for_origin_message():
     worker = span()
-    worker["attributes"].append({"key": "nagent.source", "value": {"stringValue": "task"}})
+    worker["attributes"].append({"key": "nagent.agent.source", "value": {"stringValue": "task"}})
     def get(url, timeout):
         return {"traces": [{"traceID": TRACE}]} if "/api/search?" in url else payload(worker)
     with pytest.raises(support().TraceCollectionError):
@@ -256,7 +256,7 @@ def test_shared_session_worker_cannot_substitute_for_origin_message():
 
 def test_task_trace_requires_matching_task_root():
     worker = span()
-    worker["attributes"].append({"key": "nagent.source", "value": {"stringValue": "task"}})
+    worker["attributes"].append({"key": "nagent.agent.source", "value": {"stringValue": "task"}})
     root = span()
     root["name"] = "task.run"
     root["attributes"].append({"key": "nagent.task.id", "value": {"stringValue": "other-task"}})
@@ -269,12 +269,12 @@ def test_task_trace_requires_matching_task_root():
 def test_task_trace_accepts_completed_matching_run_and_rejects_origin():
     worker_id = "ef" * 16
     worker = span(trace=worker_id)
-    worker["attributes"].append({"key": "nagent.source", "value": {"stringValue": "task"}})
+    worker["attributes"].append({"key": "nagent.agent.source", "value": {"stringValue": "task"}})
     root = span(trace=worker_id)
     root.update(name="task.run", endTimeUnixNano="10500000000")
     root["attributes"].append({"key": "nagent.task.id", "value": {"stringValue": "t1"}})
     origin = span()
-    origin["attributes"].append({"key": "nagent.source", "value": {"stringValue": "dashboard"}})
+    origin["attributes"].append({"key": "nagent.agent.source", "value": {"stringValue": "dashboard"}})
     def get(url, timeout):
         if "/api/search?" in url:
             return {"traces": [{"traceID": TRACE}, {"traceID": worker_id}]}
@@ -334,7 +334,7 @@ def test_task_waits_for_every_expected_run_not_just_first_completed_root():
             return {"traces": [{"traceID": t} for t in ids]}
         tid = url.rsplit("/", 1)[-1]
         worker = span(trace=tid)
-        worker["attributes"].append({"key": "nagent.source", "value": {"stringValue": "task"}})
+        worker["attributes"].append({"key": "nagent.agent.source", "value": {"stringValue": "task"}})
         root = span(trace=tid)
         root.update(name="task.run", endTimeUnixNano="10500000000")
         root["attributes"].extend([
@@ -351,12 +351,12 @@ def test_task_waits_for_every_expected_run_not_just_first_completed_root():
     assert polls[0] >= 4
 
 
-def test_summary_counts_flattened_trace_rows_and_cleanup_failure():
+def test_summary_counts_final_cases_and_cleanup_failure():
     module = support()
     report = {"run_id": "r1", "cases": [{"id": "c1", "verdict": "PASS",
         "messages": [{"id": "m1", "verdict": "PASS", "traces": [
             {"trace_id": TRACE, "trace_url": BASE},
             {"trace_id": "cd" * 16, "trace_url": BASE}]}]}],
         "cleanup": {"failed": [{"reason": "delete failed"}]}}
-    assert module.render_summary(report) == "Summary（结果行）: PASS 2 | FAIL 1 | SKIP 0"
+    assert module.render_summary(report) == "最终结果：通过1/2（失败1，跳过0）；其中0/2个用例进行了重试。"
     assert "套件清理 | FAIL" in module.render_report(report)

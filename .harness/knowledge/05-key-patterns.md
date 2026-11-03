@@ -132,6 +132,7 @@ N-Agent 拥有知识检索 SPI，`search_knowledge` safe tool 按 LLM 显式传�
 - SQLite 是 Infrastructure 实现，不能泄漏到 Application 用例和 Interfaces。
 - 摘要策略先简单可替换，后续可升级为模型驱动压缩、session search 和长期 Memory。
 - AgentGraph 中用于跨节点传递的一次性状态（如 tool_results）在写入 MemoryStore 后必须清空，避免后续节点循环重复持久化同一运行事件。
+- 外部记忆按 AgentRun 召回一次，结果保存于 `AgentState.external_memory_context`（`None` 为未召回，空串为已读取但无上下文）；每次模型请求均将快照前置到最后一条非摘要 user 消息的副本，工具循环和压缩后继续复用。快照不进入 `working_messages`、会话历史或摘要，新 run 独立召回；权限读取仍经 RuntimeMemoryService，按需记忆工具保持可用。
 - Chat Session 的外部记忆选择是上下文契约，不是普通 UI 偏好：首轮发送前可选择，首轮后由 `sessions.external_memory_enabled_json` 锁定，后续轮次必须使用同一 profile。
 - 默认 profile 是 `[]`；系统记忆（builtin）和文件记忆都需首轮前显式勾选。文件记忆最多选择一个，可与系统记忆（builtin）同时启用。已有历史消息但没有锁定值的 legacy session 首次触达时锁定到 `[]`。
 - 锁定原因：外部记忆会进入 system prompt 或当前轮 memory context，若同一 session 中途切换，会改变 provider message 前缀，降低 LLM prefix cache 命中率，并让历史回答与新文件记忆混用。
@@ -205,6 +206,7 @@ ChatCompletionService 首轮锁定 `external_memory_enabled` 时，需区分"客
 - `has_override` 用字段存在性判断（`"external_memory_enabled" in request.options`），区分"未传字段"与"显式传空数组/显式传 ['builtin']"，避免把 UI 默认状态误当作用户选择。
 - `ActiveExternalMemoryReader` 端口保留（`ExternalMemoryProviderService.get_active_provider_names` 读 manager 内存、无 IO），但不再消费于默认 profile 派生；接口留存供未来别处使用。
 - 检索记忆 provider 的 per-session 启用复用现有 `enabled_override` 机制：`_is_enabled(name, override)` 当 override 含 external-query provider 名时返回 True，无需改 SPI。
+- 模型工具面也必须遵循会话选择：`ContextService.build_provider_context()` 在 ToolPolicy 暴露过滤后，用 `state.run_options.external_memory_enabled` 和 `ExternalMemoryManager.is_tool_enabled()` 过滤记忆工具；全局装载不代表本会话启用，不修改全局工具定义。文件记忆按实际项目名判定，不把 multi-project adapter 名当启用项；执行端同时校验目标 project 属于本次允许集合。目录不可读时安全降级为空项目集合，不让文件记忆故障中断模型工具投影。直接调用未选工具仍由执行端拒绝。
 - `ExternalMemoryManager.list_providers()` 对 external-query slot 的 active provider 输出 `{"name", "enabled_global": False, "slot": "external-query", "active": True}`；`enabled_global` 恒为 False（不走 global_config），`active` 表示 adapter 已装载。builtin/multi-project 不输出 `active` 字段。
 - 前端 chat.js 勾选区：builtin 与 external-query slot 的 provider 默认都不勾选；external-query 仅当 `active` 时显示（不依赖 `enabled_global`）。互斥按 slot 分组，仅 multi-project 之间互斥（文件记忆最多 1 个），external-query 与 multi-project 可共存。checkbox 带 `data-slot` 属性。`externalMemoryTouched` 标志：用户未操作时不发送 `options.external_memory_enabled` 字段，操作后发送显式值。
 
@@ -568,7 +570,7 @@ ACP event bridge 规则：
 
 7. LangGraph Agent Loop（`AgentGraphRunner.run` → `graph.ainvoke`，详见模式三）
    - `prepare_context`：加载历史与摘要，构造 `working_messages=[system_prompt, ...history, ...input]`，并按需压缩；`build_system_prompt(external_memory_manager, enabled_override)` 生成 system prompt
-   - `call_llm`：检查 `iteration_count >= iteration_limit`（默认 10）；`tool_service.list_openai_tools(safe_only?, context)`；外部记忆 `prefetch_all` 把记忆上下文拼到本次 user message 前（不修改 state）；`llm_provider.chat(api_messages, tools, False, model, options)`；`scrub_memory_context(final_message.content)` 清理回显；`pending_tool_calls = result.message.tool_calls or []`
+   - `call_llm`：检查 `iteration_count >= iteration_limit`（默认 10）；`tool_service.list_openai_tools(safe_only?, context)`；外部记忆首次经 `prefetch_all` 读取为 run 快照，每次请求复用并拼到最后一条非摘要 user message 副本前（不修改 working_messages）；`llm_provider.chat(api_messages, tools, False, model, options)`；`scrub_memory_context(final_message.content)` 清理回显；`pending_tool_calls = result.message.tool_calls or []`
    - `_after_llm` 路由：error→finalize / pending_tool_calls→execute_tools / 否则→update_memory
    - `execute_tools`：每个 tool_call 先 yield `TOOL_CALL_DELTA(pending)`；Approval gate（CONFIRM 风险 + `approval_decider` 注入时触发，CLI 默认无 decider）；`tool_service.execute(request, effective_context)`；yield `TOOL_CALL_DELTA(success|error, duration_ms)`；`memory_store.save_tool_call` 持久化；tool result append 到 `working_messages`
    - `update_memory`：assistant message（含 tool_calls）+ tool result 落库；`save_task_state(running|failed, iteration_count)`；外部记忆 `pre_compress_all` 提取 rescued_context；`summarizer.summarize` → `save_summary`
@@ -670,7 +672,7 @@ LLM 摘要失败回退：
 外部记忆 pre_compress_all 迁移：
 - `pre_compress_all` 从 `update_memory` 迁移到 `prepare_context` 的压缩阶段，仅在真正压缩时调用提取 rescued_context
 - `update_memory` 不再生成 summary（摘要职责迁移至上下文准备阶段），避免双路径重复生成
-- `prefetch_all` 仍留在 `call_llm` 节点做临时注入，不修改 state.working_messages
+- `prefetch_all` 在 `call_llm` 首次读取为 run 快照，工具循环复用；注入仅修改请求副本，不修改 state.working_messages
 
 摘要持久化边界（双标记 + 双写降级）：
 - `messages` 表新增 `is_summary INTEGER NOT NULL DEFAULT 0` 列 + partial index `idx_messages_summary_session`；`ConversationMessage.is_summary` 为 bool
@@ -1389,7 +1391,7 @@ GET /chat/skills (已存在)
 
 中断恢复（进程被 kill 后残留）：cli 渠道的 Gateway 入口键 `conversation_id`（`e2e-<run_id>-<case_id>`）随 session intent 一并登记——prepare 的第一条子进程命令已在服务端建成 `cli-<uuid>` 会话、第二条 `--browse` 才解析真实 ID，进程在该窗口内被 kill 时 manifest 只剩无 id 的 intent；Cleaner `_resolve_intent_sessions` 对无 id 且带 conversation_id 的 intent session 用只读 `--browse` 重新解析：恰一个 ID 回填后走正常删除，零个视为从未建成直接删除态，多个拒绝猜测记 failed（acp/dashboard 渠道 intent 分别因 upsert 窗口极小、id 预生成而不需要此路径）。会话删除的任务侧级联见模式十六：`delete_task` 清理 worker 会话按显式 `execution_session_id` -> 无显式且无 origin 时清理派生 `task-{uuid5(task.id)}`（kanban/CLI/API 任务的 worker 会话，不级联会永久泄漏）-> origin_session_id 存在时跳过（worker 复用用户 Chat 会话，禁删）。
 
-Trace 证据先于清理持久化：`trace_report.py` 按每条消息的纳秒时间窗口、真实会话 ID 和 `nagent.source` 查询 Tempo 并回读详情，不能拿工具 ID、会话 ID、其他尝试或同会话的后台运行替代。Task 使用相同的执行会话选择规则（显式执行会话 -> origin -> 确定性 uuid5），额外匹配 `task.run` 的 Task ID 与任务详情中所有已开始 Run ID，等待全部结束入口 Span 到齐；进入 Agent 前失败的 Run 也有入口 Span 现场。有上游时这些 Run Span 属于上游 Trace，不要求各 Run 独立 Trace。采集有总 deadline；启用 OTel 时消息缺 Trace、关联失败或详情不可读均使该尝试失败，已采集现场仍保留。每次尝试在重试清理前独立落盘，最终 JSON/Markdown/终端列出逐消息、尝试和后台 Task 现场；无 OTel、未执行、纯管理/文件配置检查分别注明原因，不生成假链接。
+Trace 证据先于清理持久化：`trace_report.py` 按每条消息的纳秒时间窗口、真实会话 ID 和 `nagent.agent.source` 查询 Tempo 并回读详情，不能拿工具 ID、会话 ID、其他尝试或同会话的后台运行替代。Task 使用相同的执行会话选择规则（显式执行会话 -> origin -> 确定性 uuid5），额外匹配 `task.run` 的 Task ID 与任务详情中所有已开始 Run ID，等待全部结束入口 Span 到齐；进入 Agent 前失败的 Run 也有入口 Span 现场。有上游时这些 Run Span 属于上游 Trace，不要求各 Run 独立 Trace。采集有总 deadline；启用 OTel 时消息缺 Trace、关联失败或详情不可读均使该尝试失败，已采集现场仍保留。每次尝试在重试清理前独立落盘，最终 JSON/Markdown/终端列出逐消息、尝试和后台 Task 现场；无 OTel、未执行、纯管理/文件配置检查分别注明原因，不生成假链接。
 
 ## 模式四十四：E2E 宿主编排脚本的 RUNNING 任务清理契约
 
@@ -1433,7 +1435,7 @@ HTTP 完成日志：两个对话入口的 HTTP SERVER Span 在结束前只记一
 可观测是横切能力，其失败语义与安全边界必须独立于业务主流程：
 
 1. observability-failure-never-breaks-business：telemetry facade 全路径 best-effort——OTel SDK 未装配/异常、span 属性设置失败、exporter 不可达，一律吞掉只留日志；对话、工具执行、上下文压缩在 OTel 任何一级故障下行为不变。OTel 禁用时 facade 退化为 NoopSpan（set_attribute/set_status 全 no-op），业务代码无需条件分支。
-2. 敏感出口三重封口：原始凭据、媒体和未脱敏正文不得进入观测出口；gen_ai.input/output.messages、tool.call.arguments/result、system_instructions、tool.definitions 等原始敏感属性不直接放行。业务正文只经显式 `nagent.details.*` 通道统一脱敏限长后进入 Log/Span；ring buffer、Metric、Profile 不带业务正文。各出口以精确枚举字段分别审查，不按 `gen_ai.`/`nagent.` 前缀授权。日志注册表只决定稳定事件名，未注册但有效的脱敏内容仍保留；仅过滤明确重复或空占位噪声。权威规则见 `07-observability.md`。
+2. 敏感出口三重封口：原始凭据、媒体和未脱敏正文不得进入观测出口；gen_ai.input/output.messages、tool.call.arguments/result、system_instructions、tool.definitions 等原始敏感属性不直接放行。业务正文只经显式 `nagent.content.<field>` 通道统一脱敏限长后进入 Log/Span；ring buffer、Metric、Profile 不带业务正文。各出口以精确枚举字段分别审查，不按 `gen_ai.`/`nagent.` 前缀授权。日志注册表只决定稳定事件名，未注册但有效的脱敏内容仍保留；仅过滤明确重复或空占位噪声。权威规则见 `07-observability.md`。
 3. injected-callable snapshot：Interfaces 不 import observability 内部——Dashboard `GET /chat/observations/otel` 只消费组装根注入的 snapshot callable，响应键由 `_OTEL_SNAPSHOT_KEYS` 九键白名单 + 字段 cap 限定；观测内部结构（handle 字段、ring buffer 实现）不在 API 合同中，重构内部不破坏接口。
 4. 组装根防句柄泄漏：`configure_observability` 幂等发布——handle 持 `_published` 标志，已发布的 provider 集不重复 set TracerProvider/MeterProvider/LoggerProvider；`_published` 缓存防止 create_app 与 application_runtime 在同进程先后进入时（如测试装配）旧 handle shutdown 泄漏全局 provider 或新 handle 被旧引用覆盖。`application_runtime` contextmanager（main.py）统一 configure -> build -> yield -> shutdown（含异常路径），CLI chat/ACP 与 HTTP 进程共享同一装配语义。
 5. 哨兵测试锁定敏感面：`tests/architecture/test_observability_secret_sentinels.py` 用静态/运行时哨兵断言原始凭据和未脱敏载荷不进入任何出口；允许正文的出口另验证脱敏投影，ring buffer/Metric/Profile 则验证零业务正文。每个独立出口都要测试，不能用一个导出器的通过结果替代其他出口。
@@ -1445,7 +1447,7 @@ HTTP 完成日志：两个对话入口的 HTTP SERVER Span 在结束前只记一
 
 采集点使用 project_details 将实际请求/响应投影成固定字段 envelope，先遮盖结构化凭据和媒体，再对叶子和键脱敏，最后序列化/UTF-8 限长。原始对象不被修改，任意对象 repr 不进入详情。ChatAttempt 在最终 Provider kwargs 和响应边界记录；工具 span 保留参数/最终 ToolResult，Agent span 保留用户消息/插件转换后的最终回复。_complete 同时写 span 属性和 completion snapshot，日志从注入的可信快照只验证/展平，避免二次脱敏导致两出口不一致。Collector 只复制固定详情字段；应用自有 stderr、OTel bridge 与 Collector 都过滤无正文/详情/异常的低级别 unknown，继承的现场不作为保留理由；WARNING/ERROR 继续保留。
 
-Policy 审计由 `LoggingPolicyAuditSink` 使用固定 `policy_decision %s` 模板。独立 `policy_audit_context` 同步绑定领域事件的固定字段，日志适配器逐字段脱敏并投影为 `policy.*`，Collector 显式复制到 `context.execution`；不信任任意 record.extra，也不把动态 JSON 当模板。绑定退出后立即恢复，避免下一条业务日志继承审计事实。
+Policy 审计由 `LoggingPolicyAuditSink` 使用固定 `policy_decision %s` 模板。独立 `policy_audit_context` 同步绑定领域事件的固定字段，日志适配器逐字段脱敏并投影为 `nagent.policy.*`，Collector 显式复制到 `context.execution`；不信任任意 record.extra，也不把动态 JSON 当模板。绑定退出后立即恢复，避免下一条业务日志继承审计事实。事件名为 nagent.policy.decided；旧领域事件 run/session ID 含义混杂，身份只取受信执行快照，不能直接改名为 AgentRun/会话。统一操作、八种完成结果及三段属性的权威定义见 07-observability.md。
 
 正文默认每项 2048 字节；流式响应独立有界累积，超限或不完整时保留脱敏限长前缀与诚实元数据，finish 释放缓存。未知长度不伪造数值；HTTP auto span 允许统一投影详情，ring buffer/metrics/Profile 仍不携带正文。
 

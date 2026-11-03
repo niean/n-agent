@@ -13,7 +13,7 @@
     "from": "now-30m",
     "to": "now"
   },
-  "description": "沿用N-Agent的CPU Profile查询。仅服务级，不支持实例或逐Trace精确关联；采样关闭/时间窗无样本时无数据。",
+  "description": "采用规范化观测契约；旧时间段因字段变更可能不完整，不兼容聚合历史字段。",
   "panels": [
     {
       "id": 1,

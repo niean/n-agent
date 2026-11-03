@@ -24,7 +24,7 @@ Rules implemented here (spec-261024-otel-observability, Components 1):
   SDK cleanup runs off the event loop in a worker thread and data after
   the deadline is dropped.
 
-Only imports ``app.config`` and ``app.application.telemetry_semantics``
+Only imports ``app.config``; Application semantic registries are injected
 plus the OTel SDK/exporters -- never interfaces/domain/business modules.
 """
 from __future__ import annotations
@@ -38,7 +38,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
 from app.config import Settings
-from app.application import telemetry_semantics as ts
+
 
 SERVICE_NAME = "n-agent"
 UNKNOWN_VERSION = "unknown"
@@ -229,19 +229,29 @@ class _DeliveryStatusWrapper:
 # ---------------------------------------------------------------------------
 
 # Ring-buffer attribute whitelist: the EXACT enumerated key set (GenAI +
-# nagent.* semantics constants + error.type). A prefix rule would be too
+# injected semantic contract minus content). A prefix rule would be too
 # wide -- e.g. the sensitive GenAI Opt-in attributes (gen_ai.input.messages
 # and friends) share the gen_ai. prefix and must never be stored, and any
 # future nagent.* key would silently enter the self-check payload without
 # review. Keys outside this set never reach the snapshot.
-_RING_BUFFER_ALLOWED_ATTR_KEYS = frozenset(
-    {
-        value
-        for name, value in vars(ts).items()
-        if name.startswith(("GEN_AI_", "NAGENT_")) and isinstance(value, str)
-    }
-    | {"error.type"}
-)
+_semantics_registry = SimpleNamespace(SEMCONV_VERSION="unknown", INSTRUMENTS={})
+
+
+def configure_semantics_registry(semantics):
+    """Bind an Application-owned immutable schema without a reverse import."""
+    global _semantics_registry
+    _semantics_registry = semantics
+
+
+_RING_BUFFER_ALLOWED_ATTR_KEYS = frozenset({"error.type", "gen_ai.operation.name", "gen_ai.conversation.id"})
+
+
+def configure_ring_buffer_attributes(keys=()):
+    """Install the composition root's reviewed, content-free public schema."""
+    global _RING_BUFFER_ALLOWED_ATTR_KEYS
+    _RING_BUFFER_ALLOWED_ATTR_KEYS = frozenset(keys)
+
+
 _SCALAR_ATTR_TYPES = (str, bool, int, float)
 
 
@@ -493,7 +503,7 @@ class ObservabilityHandle:
         self._local_metric_exporter = local_metric_exporter
         # Semantics registry (module-like object providing SEMCONV_VERSION
         # and INSTRUMENTS); parameterized for template extraction.
-        self._semantics = semantics if semantics is not None else ts
+        self._semantics = semantics if semantics is not None else _semantics_registry
         self._stop_callbacks: List[Callable[[], None]] = []
         self._shutdown_lock = threading.Lock()
         self._shutdown_done = False

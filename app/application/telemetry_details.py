@@ -128,8 +128,8 @@ def validate_details(details) -> dict:
     return result
 
 
-def flatten_details(details, prefix='nagent.details.') -> dict:
-    return {f'{prefix}{name}.{key}': value for name, item in validate_details(details).items()
+def flatten_details(details, prefix='nagent.content.') -> dict:
+    return {f'{prefix}{name}' + (f'_{key}' if key != 'content' else ''): value for name, item in validate_details(details).items()
             for key, value in item.items() if value is not None}
 
 

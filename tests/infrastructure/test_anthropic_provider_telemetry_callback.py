@@ -209,8 +209,8 @@ async def test_non_stream_success_records_usage(tracer, meter):
     assert span.ended == 1
     assert span.attributes[ts.GEN_AI_USAGE_INPUT_TOKENS] == 10
     assert span.attributes[ts.GEN_AI_USAGE_OUTPUT_TOKENS] == 5
-    assert span.attributes[ts.NAGENT_USAGE_KNOWN] is True
-    assert span.attributes[ts.GEN_AI_RESPONSE_FINISH_REASONS] == "stop"
+    assert span.attributes[ts.NAGENT_MODEL_USAGE_KNOWN] is True
+    assert tuple(span.attributes[ts.GEN_AI_RESPONSE_FINISH_REASONS]) == ("stop",)
     input_records, output_records = _token_records(meter)
     assert [v for v, _ in input_records] == [10]
     assert [v for v, _ in output_records] == [5]
@@ -226,7 +226,7 @@ async def test_missing_usage_not_fabricated_as_zero(tracer, meter):
 
     assert result.usage == {}
     span = _chat_span(tracer)[0]
-    assert span.attributes[ts.NAGENT_USAGE_KNOWN] is False
+    assert span.attributes[ts.NAGENT_MODEL_USAGE_KNOWN] is False
     assert ts.GEN_AI_USAGE_INPUT_TOKENS not in span.attributes
     assert ts.GEN_AI_USAGE_OUTPUT_TOKENS not in span.attributes
     input_records, output_records = _token_records(meter)
@@ -283,7 +283,7 @@ async def test_stream_records_usage_from_message_events(tracer, meter):
     assert span.ended == 1
     assert span.attributes[ts.GEN_AI_USAGE_INPUT_TOKENS] == 10
     assert span.attributes[ts.GEN_AI_USAGE_OUTPUT_TOKENS] == 5
-    assert span.attributes[ts.GEN_AI_RESPONSE_FINISH_REASONS] == "stop"
+    assert tuple(span.attributes[ts.GEN_AI_RESPONSE_FINISH_REASONS]) == ("stop",)
     input_records, output_records = _token_records(meter)
     assert [v for v, _ in input_records] == [10]
     assert [v for v, _ in output_records] == [5]
@@ -323,7 +323,7 @@ async def test_stream_cancel_still_records_confirmed_usage(tracer, meter):
     span = _chat_span(tracer)[0]
     assert span.ended == 1
     assert span.attributes[ts.GEN_AI_USAGE_INPUT_TOKENS] == 10
-    assert span.attributes[ts.NAGENT_USAGE_KNOWN] is False  # output unknown
+    assert span.attributes[ts.NAGENT_MODEL_USAGE_KNOWN] is False  # output unknown
     input_records, _ = _token_records(meter)
     assert [v for v, _ in input_records] == [10]
 

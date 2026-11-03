@@ -61,7 +61,7 @@
         "type": "loki",
         "uid": "P8E80F9AEF21F6940"
       },
-      "description": "OTLP资源service_instance_id为Loki结构化元数据/默认资源label；TraceID字段通过既有derivedFields返回Tempo。",
+      "description": "规范属性保存在 context.execution（例如 nkb.index.operation/outcome），安全内容信封保存在 details；完成事件 nkb.document/index/retrieval/model/mcp/http.completed。HTTP 由 nkb.http.direction 区分；index 由 nkb.index.operation 区分 run 与阶段。取消与拒绝不自动视为技术错误。旧时间范围可能不完整。",
       "gridPos": {
         "h": 6,
         "w": 24,
@@ -82,7 +82,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum(rate({service_name=~\"$service\"} |= \"ERROR\" [5m]))",
+          "expr": "sum(rate({service_name=~\"$service\"} | json | severity=\"ERROR\" [5m]))",
           "legendFormat": "error",
           "datasource": {
             "type": "loki",
@@ -101,7 +101,7 @@
         "type": "loki",
         "uid": "P8E80F9AEF21F6940"
       },
-      "description": "OTLP资源service_instance_id为Loki结构化元数据/默认资源label；TraceID字段通过既有derivedFields返回Tempo。",
+      "description": "规范属性保存在 context.execution（例如 nkb.index.operation/outcome），安全内容信封保存在 details；完成事件 nkb.document/index/retrieval/model/mcp/http.completed。HTTP 由 nkb.http.direction 区分；index 由 nkb.index.operation 区分 run 与阶段。取消与拒绝不自动视为技术错误。旧时间范围可能不完整。",
       "gridPos": {
         "h": 18,
         "w": 24,
@@ -129,7 +129,7 @@
         "type": "loki",
         "uid": "P8E80F9AEF21F6940"
       },
-      "description": "OTLP资源service_instance_id为Loki结构化元数据/默认资源label；TraceID字段通过既有derivedFields返回Tempo。",
+      "description": "规范属性保存在 context.execution（例如 nkb.index.operation/outcome），安全内容信封保存在 details；完成事件 nkb.document/index/retrieval/model/mcp/http.completed。HTTP 由 nkb.http.direction 区分；index 由 nkb.index.operation 区分 run 与阶段。取消与拒绝不自动视为技术错误。旧时间范围可能不完整。",
       "gridPos": {
         "h": 10,
         "w": 24,
@@ -139,7 +139,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service_name=~\"$service\"} |= \"ERROR\"",
+          "expr": "{service_name=~\"$service\"} | json | severity=\"ERROR\"",
           "datasource": {
             "type": "loki",
             "uid": "P8E80F9AEF21F6940"
@@ -149,5 +149,6 @@
         }
       ]
     }
-  ]
+  ],
+  "description": "采用规范化观测契约；旧时间段因字段变更可能不完整，不兼容聚合历史字段。"
 }

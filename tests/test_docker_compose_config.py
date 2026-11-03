@@ -655,13 +655,8 @@ def test_collector_config_three_pipelines_bounded_queues():
     statements = loki_transform["log_statements"][0]["statements"]
     assert any('"trace_id": trace_id.string' in s for s in statements)
     # Preserve only the approved execution facts, never arbitrary log extras.
-    fields = {
-        "session_id", "request_id", "source", "operation", "summary", "duration_ms",
-        "outcome", "error_type", "message_count", "inference_calls", "tool_calls",
-        "input_tokens", "output_tokens", "usage_known", "end_reason", "model", "provider",
-        "iteration", "stream", "finish_reason", "tool", "call_id", "risk_level",
-        "policy_outcome", "executed",
-    }
+    from app.application.telemetry_contract import EXECUTION_ATTRIBUTE_KEYS, CONTENT_ATTRIBUTE_KEYS
+    fields = EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS
     for key in fields:
         assert any(f'attributes["{key}"]' in s and 'cache["execution"]' in s for s in statements)
     # event 取自 attributes（不存在时回到固定诊断码），绝不退回 body 作事件码。
@@ -693,8 +688,12 @@ def test_collector_config_three_pipelines_bounded_queues():
     ):
         assert guard in condition
     assert 'Len(body["context"]["execution"])' not in condition
-    for key in ("name", "version", "decision_kind", "reason", "outcome", "run_id", "session_id", "policy_scope", "occurred_at"):
-        assert any(f'attributes["policy.{key}"]' in s and 'cache["execution"]' in s for s in statements)
+    for key in ("name", "version", "decision_kind", "reason", "outcome", "scope", "occurred_at"):
+        assert any(f'attributes["nagent.policy.{key}"]' in s and 'cache["execution"]' in s for s in statements)
+    # Old N-KB execution keys belong to its independent branch only.
+    nagent_statements = [s for s in statements if 'resource.attributes["service.name"] == "n-kb"' not in s]
+    for key in ("source", "session_id", "request_id", "summary", "outcome", "operation", "policy.name"):
+        assert not any(f'attributes["{key}"]' in s for s in nagent_statements)
 
     exporters = config["exporters"]
     jaeger_endpoint = exporters["otlp/tempo"]["endpoint"]
@@ -839,10 +838,12 @@ def test_collector_projects_only_approved_detail_fields_and_keeps_detail_logs():
     config = yaml.safe_load((DOCKER_DIR / 'observability/otel-collector.yaml').read_text())
     statements = config['processors']['transform/loki_json']['log_statements'][0]['statements']
     assert 'set(cache["details"], {})' in statements
-    for name in ('user_message', 'assistant_message', 'system_prompt', 'input_messages',
-                 'tool_definitions', 'output_messages', 'tool_arguments', 'tool_result', 'error'):
+    from app.application.telemetry_contract import CONTENT_FIELDS
+    for name in CONTENT_FIELDS:
         for metadata in ('content', 'original_bytes', 'truncated', 'incomplete', 'observed_bytes'):
-            assert any(f'attributes["nagent.details.{name}.{metadata}"]' in s and f'cache["details"]["{name}"]["{metadata}"]' in s for s in statements)
+            attribute = f'nagent.content.{name}' + ('' if metadata == 'content' else f'_{metadata}')
+            assert any(f'attributes["{attribute}"]' in s and f'cache["details"]["{name}"]["{metadata}"]' in s for s in statements)
+    assert not any('attributes["nagent.details.' in s for s in statements)
     bodies = [s for s in statements if s.startswith('set(body,')]
     assert len(bodies) == 2
     assert all('"details": cache["details"]' in s for s in bodies)

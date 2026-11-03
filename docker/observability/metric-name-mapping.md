@@ -10,7 +10,9 @@ telemetry_semantics.py 的 12 个 instrument 名称/单位/维度合成导出到
 （--web.enable-remote-write-receiver）。合成 Resource service.name=n-agent-synth；
 resource_to_telemetry_conversion.enabled=true 使 service_name 成为 PromQL 可用 label。
 
-## 映射表（12 instrument，Prometheus 端实际名称）
+## 映射表（12 instrument，目标名称）
+
+三个新 Counter（第 10–12 行）于 2026-11-03 经真实 OTLP → Collector → Prometheus 验证，使用隔离的 service.name=n-agent-synth、service.instance.id=semantic-probe-261103；不计入业务 N-Agent 运行数。真实 Agent 请求另验证了 nagent_agent_runs_total 及三个 Agent Histogram 的 nagent_agent_source 维度，现场来源为 dashboard。新证据保存在 locals/observability-migration/switch-261103/new-metric-probe-*.json 和 new-agent-source-*.json；不将本次结果记为 2026-10-25 实测。其余标准 instrument 沿用原实测名称。
 
 Prometheus 翻译规则实测：`.` 与 `-` 转 `_`；Counter 加 `_total`；Histogram（单位 s）
 加 `_seconds` 且不再加 `_total`；`{...}` 括号单位（token/inference_call/tool_call）不产生
@@ -27,9 +29,9 @@ Prometheus 翻译规则实测：`.` 与 `-` 转 `_`；Counter 加 `_total`；His
 | 7 | gen_ai.invoke_agent.duration | Histogram / s | gen_ai_invoke_agent_duration_seconds_bucket / _sum / _count |
 | 8 | gen_ai.invoke_agent.inference_calls | Histogram / {inference_call} | gen_ai_invoke_agent_inference_calls_bucket / _sum / _count |
 | 9 | gen_ai.invoke_agent.tool_calls | Histogram / {tool_call} | gen_ai_invoke_agent_tool_calls_bucket / _sum / _count |
-| 10 | nagent.turns | Counter / 1 | nagent_turns_total |
-| 11 | nagent.context.compressions | Counter / 1 | nagent_context_compressions_total |
-| 12 | nagent.budget.denied | Counter / 1 | nagent_budget_denied_total |
+| 10 | nagent.agent.runs | Counter / 1 | nagent_agent_runs_total |
+| 11 | nagent.context.compression_attempts | Counter / 1 | nagent_context_compression_attempts_total |
+| 12 | nagent.budget.denials | Counter / 1 | nagent_budget_denials_total |
 
 实测存在的裸 Histogram 基名（供 T10 断言 `_bucket/_sum/_count` 后缀时参考）：
 - gen_ai_client_inference_operation_input_tokens
@@ -40,30 +42,30 @@ Prometheus 翻译规则实测：`.` 与 `-` 转 `_`；Counter 加 `_total`；His
 - gen_ai_invoke_agent_inference_calls
 - gen_ai_invoke_agent_tool_calls
 
-## 维度（labels）实测
+## 维度（labels）契约与既有实测
 
-Counter 示例（nagent_turns_total / gen_ai_client_inference_usage_input_tokens_total）：
+Counter 示例（nagent_agent_runs_total / gen_ai_client_inference_usage_input_tokens_total）：
 `service_name`、`service_instance_id`、`service_version`、`job`、`instance`、
 `telemetry_sdk_*`，以及 instrument 允许维度（如 gen_ai_request_model、
-gen_ai_provider_name、gen_ai_token_modality、nagent_source、nagent_end_reason）。
-维度名同样按 `.` -> `_` 翻译（nagent.source -> nagent_source）。
+gen_ai_provider_name、gen_ai_token_modality、nagent_agent_source、nagent_agent_end_reason）。
+维度名同样按 `.` -> `_` 翻译（nagent.agent.source -> nagent_agent_source）。
 
-### 2026-10-31：AgentRun 来源维度
+### 2026-11-03：AgentRun 来源维度契约与后端验证
 
 三个既有 histogram（gen_ai.invoke_agent.duration / inference_calls / tool_calls）增加
-`nagent.source`，落库标签为 `nagent_source`；名称、单位及 instrument 数量不变。
+`nagent.agent.source`，落库标签为 `nagent_agent_source`；名称、单位及 instrument 数量不变。
 来源由本次受信 RunContext 提供：dashboard/api、feishu/cli/acp/dingtalk/wecom、
-schedule、task、delegation、skill_review（技能自进化审查）、curator，以及枚举保留的 chat/http；缺失或未知归 other。
+schedule、task、delegation、skill_review（技能自进化审查）、curator，缺失或未知归 unknown，旧 chat/http 不再作为有效来源。
 不使用会话创建来源、任务发起平台或投递平台替代本次执行来源。
 
 Agent Span 仍为 current 时记录三个测量，SDK exemplar 保留该 Agent 的 trace_id/span_id，
 执行标识不加入时序标签。inference_calls/tool_calls 的 `_sum / _count` 表示每次运行的
 平均调用数；零调用运行仍进入 `_count`，`_count / _count` 不能表示调用次数。
 
-Overview/Metrics 的 Source 多选变量仅筛选 AgentRun/turns；模型、工具等保持服务级。
+Overview/Metrics 的 Source 多选变量仅筛选 Agent 运行；模型、工具等保持服务级。
 All 使用 `.*`，包含历史缺失来源标签的序列；指定来源时排除这些历史序列。
 历史标签缺失不能补造为 other。exemplar 为采样例子，单次耗时不等于面板分位数。
-本节是新增维度契约，不改变上方 2026-10-25 名称实测日期；本次后端验证另记任务计划。
+本节新增维度已由真实 Agent 请求验证，不改变上方 2026-10-25 名称实测日期；本次后端验证另记任务计划。
 
 大盘 p95 查询模板（已在大盘 JSON 中采用实际名称）：
 

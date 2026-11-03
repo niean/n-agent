@@ -88,8 +88,8 @@ def test_external_memory_http_has_client_span_and_propagation(sdk, monkeypatch):
     assert child.parent.span_id == parent.get_span_context().span_id
     assert requests[0].get_header("Traceparent").split("-")[2] == format(child.context.span_id, "016x")
     assert child.attributes["http.response.status_code"] == 200
-    assert "tea" in child.attributes["nagent.details.http_request.content"]
-    assert "likes tea" in child.attributes["nagent.details.http_response.content"]
+    assert "tea" in child.attributes["nagent.content.http_request"]
+    assert "likes tea" in child.attributes["nagent.content.http_response"]
     assert "PRIVATE" not in str(child.attributes) + str(child.events)
     assert result["results"][0]["memory"] == "likes tea"
 
@@ -123,7 +123,7 @@ def test_manager_observes_automatic_memory_calls(sdk, provider):
     for operation in ("prefetch", "sync"):
         span = next(s for s in spans if s.name == f"memory.{operation} {provider}")
         assert span.parent.span_id == parent.get_span_context().span_id
-        assert "tea" in span.attributes["nagent.details.input_messages.content"]
+        assert "tea" in span.attributes["nagent.content.input_messages"]
 
 
 @pytest.mark.parametrize("method", ["get", "post", "put", "delete"])
@@ -153,7 +153,7 @@ def test_shared_http_lifecycle(sdk, monkeypatch, method, mode):
     assert span.attributes["url.template"] == "/v3/workspaces/{id}/peers/{id}/card"
     assert span.status.status_code.name == ("ERROR" if failure is not None or mode == "oversize" else "UNSET")
     assert "PRIVATE" not in str(span.attributes) + str(span.events)
-    assert len([e for e in span.events if e.name == "http_client_completed"]) == 1
+    assert len([e for e in span.events if e.name == "nagent.http.completed"]) == 1
     assert not trace.get_current_span().get_span_context().is_valid
 
 
@@ -168,7 +168,7 @@ def test_handled_sync_failure_is_not_reported_as_success(sdk, monkeypatch, provi
     with tracer.start_as_current_span("agent"):
         manager.sync_all("tea", "ok", session_id="session", agent_context="primary", enabled_override=[provider])
     span = next(s for s in exporter.get_finished_spans() if s.name == f"memory.sync {provider}")
-    assert span.attributes["nagent.outcome"] == "failed"
+    assert span.attributes["nagent.memory.outcome"] == "failure"
     assert span.status.status_code.name == "ERROR"
     assert "PRIVATE" not in str(span.attributes) + str(span.events)
 
@@ -204,9 +204,9 @@ def test_mem0_late_worker_retains_original_trace(sdk, monkeypatch):
         worker = next(s for s in spans if s.name == "memory.search mem0")
         request = next(s for s in spans if s.kind is trace.SpanKind.CLIENT)
         entry = next(s for s in spans if s.name == "memory.prefetch mem0")
-        assert entry.attributes["nagent.outcome"] == "timed_out"
+        assert entry.attributes["nagent.memory.outcome"] == "timed_out"
         assert entry.status.status_code.name == "ERROR"
-        assert "nagent.details.error.content" in entry.attributes
+        assert "nagent.content.error" in entry.attributes
         assert worker.context.trace_id == first.get_span_context().trace_id
         assert worker.context.trace_id != second.get_span_context().trace_id
         assert request.parent.span_id == worker.context.span_id
@@ -233,10 +233,10 @@ def test_holographic_real_store_recall_and_tool_failure(sdk, tmp_path):
                                              agent_context="primary", session_id="session", enabled_override=["holographic"])
             assert json.loads(result)["success"] is False
         spans = exporter.get_finished_spans()
-        tools = [s for s in spans if s.name == "memory.tool holographic"]
-        assert [s.attributes["nagent.outcome"] for s in tools] == ["success", "failed"]
+        tools = [s for s in spans if s.name == "memory.execute_tool holographic"]
+        assert [s.attributes["nagent.memory.outcome"] for s in tools] == ["success", "failure"]
         recall = next(s for s in spans if s.name == "memory.prefetch holographic")
-        assert "tea preference" in recall.attributes["nagent.details.output_messages.content"]
+        assert "tea preference" in recall.attributes["nagent.content.output_messages"]
     finally:
         adapter.shutdown()
 

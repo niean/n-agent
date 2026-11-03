@@ -69,24 +69,23 @@ _execution_context = None
 _details_validator = None
 _details_flattener = None
 _details_projector = None
-EXECUTION_STRING_FIELDS = frozenset({
-    "session_id", "request_id", "source", "operation", "summary", "outcome",
-    "error_type", "end_reason", "model", "provider", "finish_reason", "tool",
-    "call_id", "risk_level", "policy_outcome",
-})
-EXECUTION_COUNT_FIELDS = frozenset({
-    "message_count", "inference_calls", "tool_calls", "input_tokens",
-    "output_tokens", "iteration", "before_tokens", "after_tokens",
-})
-EXECUTION_BOOL_FIELDS = frozenset({"usage_known", "stream", "executed"})
+_context_projector = None
+_completion_event = None
+_execution_keys = frozenset()
+_content_keys = frozenset()
 
-HTTP_COMPLETED_EVENT = "http_request_completed"
-HTTP_CLIENT_COMPLETED_EVENT = "http_client_completed"
+HTTP_COMPLETED_EVENT = "nagent.http.completed"
+HTTP_CLIENT_COMPLETED_EVENT = "nagent.http.completed"
 _http_request_context = contextvars.ContextVar("nagent_http_request_log", default=None)
 _policy_audit_context = contextvars.ContextVar("nagent_policy_audit_log", default=None)
+_HTTP_ATTRIBUTE_KEYS = frozenset({
+    "http.request.method", "http.route", "http.response.status_code",
+    "server.address", "server.port", "url.template", "error.type",
+})
 _POLICY_AUDIT_FIELDS = frozenset({
-    "policy", "version", "decision_kind", "reason", "outcome", "run_id",
-    "session_id", "policy_scope", "occurred_at",
+    "nagent.policy.name", "nagent.policy.version", "nagent.policy.decision_kind",
+    "nagent.policy.reason", "nagent.policy.outcome", "nagent.policy.scope",
+    "nagent.policy.occurred_at", "nagent.agent.run_id", "gen_ai.conversation.id",
 })
 
 
@@ -100,9 +99,9 @@ def policy_audit_context(payload):
         _policy_audit_context.reset(token)
 
 
-def log_http_request_completed(method, route, status_code, duration_ms, outcome, *, details=None):
+def log_http_request_completed(method, route, status_code, duration_ms, outcome, *, details=None, event_emitted=False, request_facts=None):
     """Emit bounded HTTP facts through both existing safe log outlets."""
-    facts = {"operation": "http_request", "duration_ms": duration_ms,
+    facts = {"operation": "http.server", "nagent.http.direction": "server", "duration_ms": duration_ms,
              "outcome": outcome}
     facts["http.request.method"] = method if method in {
         "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"
@@ -114,18 +113,40 @@ def log_http_request_completed(method, route, status_code, duration_ms, outcome,
     facts["summary"] = f"HTTP {facts['http.request.method']} {route}；状态 {status_code if status_code is not None else '无响应'}，{outcome}；耗时 {duration_ms:.1f} ms。"
     template = "http_request_completed %s"
     register_safe_event(template, HTTP_COMPLETED_EVENT)
-    token = _http_request_context.set({**facts, "details": details or {}})
+    token = _http_request_context.set({**facts, "details": details or {}, "_completion_event_emitted": event_emitted, "_request_facts": request_facts})
     try:
         logging.getLogger(__name__).info(template, facts["summary"])
     finally:
         _http_request_context.reset(token)
 
 
+def project_http_attributes(facts, *, request_facts=None):
+    """Project trusted HTTP completion facts with standard protocol metadata."""
+    facts = dict(facts)
+    if "http.request.method" not in facts and "http.method" in facts:
+        facts["http.request.method"] = facts["http.method"]
+    if "http.response.status_code" not in facts and "http.status_code" in facts:
+        facts["http.response.status_code"] = facts["http.status_code"]
+    if facts.get("operation") == "http.server" and not facts.get("summary"):
+        status = facts.get("http.response.status_code")
+        facts["summary"] = f"HTTP {facts.get('http.request.method')} {facts.get('http.route')}；状态 {status if status is not None else '无响应'}，{facts.get('outcome')}；耗时 {facts.get('duration_ms', 0):.1f} ms。"
+    projected = {**_safe_execution_context(facts), **{k: v for k, v in facts.items()
+        if k in _HTTP_ATTRIBUTE_KEYS}}
+    # Entry identity comes only from the HTTP adapter's separate trusted
+    # binding, never generic instrumentation attributes or LogRecord extras.
+    if (facts.get("operation") == "http.server" and isinstance(request_facts, Mapping)
+            and request_facts.get("nagent.request.operation") == "handle"
+            and request_facts.get("nagent.request.channel") in {"api", "dashboard"}):
+        projected.update({"nagent.request.operation": "handle",
+                          "nagent.request.channel": request_facts["nagent.request.channel"]})
+    return projected
+
+
 def log_http_client_completed(facts):
     """Publish already-projected request metadata while its client span is current."""
     template = "http_client_completed %s"
     register_safe_event(template, HTTP_CLIENT_COMPLETED_EVENT)
-    token = _http_request_context.set({**_safe_execution_context(), **facts})
+    token = _http_request_context.set(dict(facts))
     try:
         logging.getLogger(__name__).info(template, facts["summary"])
     finally:
@@ -133,9 +154,15 @@ def log_http_client_completed(facts):
 
 
 def configure_execution_context(snapshot=None, *, validate_details=None, flatten_details=None,
-                                project_details=None) -> None:
+                                project_details=None, project_context=None, completion_event=None,
+                                execution_keys=(), content_keys=()) -> None:
     """Inject a trusted synchronous safe-facts snapshot, or clear it."""
     global _execution_context, _details_validator, _details_flattener, _details_projector
+    global _context_projector, _completion_event, _execution_keys, _content_keys
+    _context_projector = project_context if callable(project_context) else None
+    _completion_event = completion_event if callable(completion_event) else None
+    _execution_keys = frozenset(execution_keys)
+    _content_keys = frozenset(content_keys)
     _execution_context = snapshot if callable(snapshot) else None
     _details_validator = validate_details if callable(validate_details) else None
     _details_flattener = flatten_details if callable(flatten_details) else None
@@ -168,17 +195,19 @@ def _safe_execution_context(snapshot=None) -> Dict[str, object]:
         snapshot = _execution_snapshot() if snapshot is None else snapshot
         if not isinstance(snapshot, Mapping):
             return {}
+        projected = _context_projector(snapshot) if _context_projector is not None else {}
         out = {}
-        for key, value in snapshot.items():
-            if key in EXECUTION_STRING_FIELDS and isinstance(value, str):
-                out[key] = value[:512 if key == "summary" else 256]
-            elif key in EXECUTION_COUNT_FIELDS and type(value) is int and value >= 0:
+        for key, value in projected.items():
+            if key not in _execution_keys or key in _content_keys:
+                continue
+            if isinstance(value, str):
+                out[key] = _sanitize(value)[:512 if key.endswith('.summary') else 256]
+            elif type(value) in (int, float) and math.isfinite(value) and value >= 0:
                 out[key] = value
-            elif key in EXECUTION_BOOL_FIELDS and type(value) is bool:
+            elif type(value) is bool:
                 out[key] = value
-            elif key == "duration_ms" and type(value) in (int, float):
-                if math.isfinite(value) and value >= 0:
-                    out[key] = value
+            elif isinstance(value, (list, tuple)) and all(isinstance(item, str) for item in value):
+                out[key] = tuple(_sanitize(item)[:256] for item in value[:32])
         return out
     except Exception:
         return {}
@@ -305,6 +334,7 @@ class Prepared:
     Fields are only populated once a sanitizer is installed; otherwise the
     record stays collapsed to the fixed event code."""
     event: str
+    completion_event_emitted: bool = False
     scene: Dict[str, object] = field(default_factory=dict)
     details: Dict[str, object] = field(default_factory=dict)
     message: Optional[str] = None
@@ -363,21 +393,39 @@ def _prepare_record(record: logging.LogRecord) -> Prepared:
     scene = _safe_execution_context(snapshot)
     if event in (HTTP_COMPLETED_EVENT, HTTP_CLIENT_COMPLETED_EVENT) and _http_request_context.get() is not None:
         # HTTP completion owns its scene; do not inherit the last child operation.
-        scene = dict(_http_request_context.get())
-        details_snapshot = {"details": scene.pop("details", {})}
+        http_scene = dict(_http_request_context.get())
+        completed = http_scene.get("_http_projection")
+        if isinstance(completed, Mapping):
+            # Sink-owned, already sanitized HTTP projection; never read extras
+            # or live parent state. Recheck the exact outlet schema only.
+            allowed = (_execution_keys - _content_keys) | _HTTP_ATTRIBUTE_KEYS
+            scene = {key: value for key, value in completed.items() if key in allowed
+                     and (type(value) in (str, bool, int)
+                          or type(value) is float and math.isfinite(value))}
+        else:
+            scene = project_http_attributes(http_scene, request_facts=http_scene.get("_request_facts"))
+        details_snapshot = {"details": http_scene.pop("details", {})}
     else:
         details_snapshot = snapshot
-    if event == "policy_decision" and _sanitizer_installed():
+    if event == "nagent.policy.decided" and _sanitizer_installed():
         audit = _policy_audit_context.get()
         if isinstance(audit, Mapping):
             for key in _POLICY_AUDIT_FIELDS:
                 value = audit.get(key)
                 if isinstance(value, str):
                     try:
-                        name = "name" if key == "policy" else key
-                        scene["policy." + name] = _sanitize(value)[:1024 if key == "reason" else 256]
+                        scene[key] = _sanitize(value)[:1024 if key == "nagent.policy.reason" else 256]
                     except Exception:
                         pass  # Fail closed for a field whose sanitization fails.
+    if (_completion_event is not None and snapshot.get('_completion_event_emitted')
+            and record.name == 'app.application.telemetry_semantics'):
+        expected = _completion_event(snapshot.get('operation'))
+        if record.msg == expected:
+            event = expected
+    completion_event_emitted = bool((snapshot.get('_completion_event_emitted')
+        and _completion_event is not None and record.name == 'app.application.telemetry_semantics'
+        and record.msg == _completion_event(snapshot.get('operation')))
+        or (_http_request_context.get() or {}).get('_completion_event_emitted'))
     details = {}
     if _sanitizer_installed() and _details_validator is not None and isinstance(snapshot, Mapping):
         try:
@@ -385,10 +433,10 @@ def _prepare_record(record: logging.LogRecord) -> Prepared:
             details = _details_validator(details_snapshot.get("details"))
         except Exception:
             pass
-    if "session_id" not in scene:
+    if "gen_ai.conversation.id" not in scene:
         session_id = _current_session_id(record)
         if session_id:
-            scene["session_id"] = session_id
+            scene["gen_ai.conversation.id"] = session_id
     if _sanitizer_installed() and readable:
         standard = logging.LogRecord("", 0, "", 0, "", (), None).__dict__
         extra = {k: v for k, v in vars(record).items()
@@ -400,7 +448,7 @@ def _prepare_record(record: logging.LogRecord) -> Prepared:
         # Safe event-only mode: no restored body for unregistered/unknown
         # (ad-hoc, untrusted) templates, and none until a sanitizer exists.
         # Only vetted registered templates regain a readable, sanitized body.
-        return Prepared(event=event, scene=scene, details=details)
+        return Prepared(event=event, completion_event_emitted=completion_event_emitted, scene=scene, details=details)
     if event == UNKNOWN_EVENT_CODE:
         event = "application_log" if record.name.startswith("app.") else "diagnostic_log" if record.levelno >= logging.WARNING else "library_log"
     try:
@@ -415,8 +463,23 @@ def _prepare_record(record: logging.LogRecord) -> Prepared:
     exception = _format_exception(record.exc_info)
     stack_info = record.stack_info
     stack = _bounded_text(stack_info, multiplier=4) if isinstance(stack_info, str) and stack_info else None
-    return Prepared(event=event, scene=scene, details=details, message=message,
+    return Prepared(event=event, completion_event_emitted=completion_event_emitted, scene=scene, details=details, message=message,
                     exception=exception, stack=stack)
+
+
+def trusted_log_identities():
+    """Only execution binding/span identity proves AgentRun and conversation ownership.
+
+    PolicyAuditEvent's legacy run_id/session_id can identify browser sessions,
+    requests or budget ledgers, so those fields must never be relabeled here.
+    """
+    scene = _safe_execution_context()
+    identities = {key: value for key, value in scene.items()
+                  if key in {"nagent.agent.run_id", "gen_ai.conversation.id"} and value}
+    conversation = _current_session_id(None)
+    if conversation and "gen_ai.conversation.id" not in identities:
+        identities["gen_ai.conversation.id"] = conversation
+    return identities
 
 
 def _current_session_id(record: logging.LogRecord) -> Optional[str]:
@@ -527,9 +590,6 @@ class SafeEventJsonFormatter(logging.Formatter):
             "event": prepared.event,
             "trace_id": trace_id,
             "span_id": span_id,
-            "session_id": scene.get(
-                "session_id", _current_session_id(record)
-            ),
             "service.name": service_name,
             "service.instance.id": instance_id,
         }
@@ -670,6 +730,8 @@ class SafeLogBridge(logging.Handler):
         to OTel scalar/string-array types (no nested dicts). Failures are
         observability-only and swallowed by the caller, and the independent
         LogRecord delivery never depends on this."""
+        if prepared.completion_event_emitted:
+            return
         span = trace.get_current_span()
         if span is None or not getattr(span, "is_recording", lambda: False)():
             return

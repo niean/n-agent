@@ -1,5 +1,26 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
 # 项目教训
+
+### P080: 临时记忆注入须覆盖完整工具循环
+
+- 现象：首个模型请求已携带默认北京的 mem0 记忆，读取 weather 技能后第二个请求丢失记忆，模型再次调用 mem0_profile。
+- 根因：ContextService 只在最后消息为 user 时注入请求副本，而 AgentGraph 仅向原始 working_messages 追加 assistant/tool；下一次投影时记忆既不在历史中，也未重新注入。
+- 教训：长期存储、run 级召回快照和单次模型请求应分别管理。每回合读取一次，工具循环的每次请求都投影同一快照；空结果也需记住，且不污染持久化历史。验收必须覆盖至少两次模型调用，不能只检查首个请求。
+- 来源：2026-11-03，trace 92306f54125e9fca3e046a7e93d6ff61、span cd50739342bfea75；回归证据见 .harness/specs/verify/verify-261103-retain-memory-context.md。
+
+### P079: 记忆工具可见性与执行权限必须使用同一份会话选择
+
+- 现象：会话只勾选文件记忆，模型仍调用 mem0_profile，执行端返回 provider not enabled。
+- 根因：记忆工具按全局装载状态注册，模型上下文只经过 ToolPolicy 暴露过滤，未使用会话 profile；执行端却使用 enabled_override。文件记忆还有 adapter 名 multi-project 与选择项项目名不一致的问题。
+- 教训：模型工具投影与实际路由都应按 provider 归属解析同一份会话选择，文件工具额外检查目标项目；筛选只缩小原安全策略允许的集合，不修改全局工具表。回归同时验证模型实际工具列表、跨会话不泄露、未选工具拒绝、所选文件可写和目录故障降级。
+- 来源：2026-11-03 修复 Trace e654314e3123d705288846a612dfd3f8 / Span 4d6a5360786ef809；新增 tests/application/test_memory_tool_visibility.py。
+
+### P078: 观测历史清理须核对锁定后端的真实响应和删除粒度
+
+- 现象：历史工具单测通过，真实 Tempo 空时窗和省略前导零的 TraceID 却被误判；Loki 查询接受的纳秒整数不能用于同版本删除接口。完整盘点还发现 27 条同时包含 N-Agent/N-KB 的 Trace，不能按整条删除。
+- 根因：模拟响应假设零值字段始终存在、TraceID 始终是 32 位、查询与删除共用时间格式；未在同版本源码和实际响应中验证这些边界。共享 Trace 的删除粒度也不同于按服务查询的粒度。
+- 教训：使用锁定版本源码与真实只读盘点建立边界测试，再生成可执行清单。默认零值和 ID 规范化必须有接口依据；时间精度、完整枚举和整条 Trace 的归属分别验证。安全集合与受阻集合分开报告，只有全部检查完成后才生成安全 allowlist；提交、不可查询和物理回收分别记录。冻结后重验选择集，官方工具离线执行，并校验被保护的旧数据与新数据。
+- 来源：2026-11-03 统一观测语义任务；历史工具 54 项测试，508 条安全旧 Trace 清理后全部 404，31 条保护 Trace 指纹一致；具体证据见 locals/observability-migration/switch-261103/。
 
 ### P077: 记忆预取预算应覆盖正常云端延迟，不能把成功请求误判为服务异常
 

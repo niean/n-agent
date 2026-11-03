@@ -75,21 +75,40 @@
     - 对话：traceid=ca0df63a6f12466ccfac9fd35629e757、spanid=320f35438eec33fd，记忆加载`memory.prefetch mem0`多次超时报错，修复下
     - 对话：对话框，第一条消息和顶部挨得太近了，需要流出Gap
 
+[20261103]
+- NFR
+    - 观测：统一观测语义，以OTel标准为主，明确自定义规范
+    - 对话：修复首轮后mem0记忆丢失问题。现象是，第1轮user msg少了mem0记忆，导致llm重新做了一次mem0检索
+
+[20261104]
+- FR
+    - 观测：长度限制，调整到1024000，当前有太多有效信息被截断了
+    - 对话：执行详情，当没有选中执行时，按时间正序、展示执行列表(含链接)，点击链接可加载对应的执行详情
+    - 技能：新增wake-codex技能，先遇到skill注册问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新问题(需要手动改配置文件host-terminal-policy.yaml没有Dashboard)，非常不方便
+    - 定时任务：结果投递，当前只支持飞书IM、不支持N-Agent对话，而wake-codex只需投递到对话框
+    - 技能：photo-and-upload，健康状态显示archived，不符合预期。现场如下
+        ```
+        答：因为页面的“健康状态”和扫描结果来自两份独立记录，重新扫描没有同步恢复健康状态。
+
+        当前数据库是：
+
+        - 技能注册表：`photo-and-upload` 为 `available / ok`。
+        - 使用记录：`skill_usage.state` 仍为 `archived`，页面直接显示这个字段。
+
+        代码中还有一个问题：删除单个关联文件（`REMOVE_FILE`）也会把整个 Skill 标为 `archived`，见 [skill_service.py:683](/Users/niean/code/github.com/niean/n-agent/app/application/skill_service.py:683)。而重新扫描只更新注册表，不更新这条使用记录。
+
+        所以现在显示的是残留的归档状态，与扫描后的可用状态不一致；这个标签本身不参与宿主脚本执行入口的检查。需要将使用记录恢复为 `active`，并修正删除关联文件时误归档整个 Skill 的逻辑。
+        ```
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
-- HE
-    - HE：三方审阅，从直接修改、改为给出建议，从而解耦
-    - HE：VSCode+插件模式，补全Token观测
-    - HE：三方审阅，结果存储纳入Harness流程规范，如放到specs/third/目录下
-    - HE：阶段结果，未及时同步到Multica
-- NFR
-    - 知识：UDS，详细原理、Go样例
-    - 集成：N-Agent套装，集成N-KB；发布镜像，完成一键冷启动
-    - 任务：LLM请求未命中缓存读，分析原因
 - FR
+    - 观测：Prifile，当前按服务和进程采样，使用 py-spy → Pyroscope；尚未接入 OTel Profiles
+    - 观测：引入Langfuse，尽量复用OTel组件(如Collector)；现有的OTel能力全部留下、跟Langfuse并存
+    - 评测：增加evaluate能力
+    - 评测：E2E测试中Agent相关的，是否能转为评测的一部分
     - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离
     - 任务：持久化执行环境，让任务拥有快照、可恢复(如执行`sh docker/restart.sh`后自动恢复)
@@ -100,17 +119,16 @@
     - 产品：资源隔离，支持Tenant|WorkSpace|Project(如E2E对话测试隔离)
     - 产品：对标DSH，发现值得参考的技术架构、产品功能
     - 调度：支持MoA
-- 行研
-    - 范围：2026年7月下旬至10月中旬，以下为公开发布及趋势判断，非独立实测
-    - 产品：Meta Muse、OpenAI Dots，常驻Agent配备独立电脑和浏览器，离线持续推进目标、遇到决策再找人。参考：[Muse](https://about.fb.com/news/2026/09/introducing-muse-personal-ai-agent)、[Dots](https://learn.chatgpt.com/docs/dots)
-    - 产品：Manus 2.0，事件触发自动化、专属云电脑、可人工编辑的创作工作台；Cue为Agent配置邮箱、电话、钱包和电脑，支持群聊协作（早期开放）。参考：[Manus 2.0](https://manus.im/blog/introducing-manus-2-0)
-    - 产品：Asana AI Teammates共享项目计划、上下文和治理；Salesforce Agentforce结合模型推理与确定性规则，面向具体岗位落地。参考：[Asana](https://forum.asana.com/t/agentic-work-management-is-here-your-easy-button-for-ai-productivity-across-every-team/1155667)、[Agentforce](https://www.salesforce.com/ap/news/press-releases/2026/09/14/ph-salesforce-expands-agentforce-with-a-new-portfolio-of-ai-agents-built-for-high-value-work/)
-    - 技术：OpenAI Agents API托管Harness、会话编排、压缩和恢复（公测）；异步工具调用、执行中纠偏、子Agent委派，让长任务可持续沟通和调整。参考：[OpenAI更新](https://developers.openai.com/api/docs/changelog)
-    - 技术：Claude Browser Use结合页面结构与元素引用；Skills API正式化，支持按需压缩、对话中增改工具、仓库文件管理Agent资源。参考：[Claude更新](https://platform.claude.com/docs/en/release-notes/overview)
-    - 安全：NVIDIA OpenShell执行运行时策略，Sentry在独立硬件信任域监控和隔离越界行为，安全边界下沉到模型和Harness之外。参考：[NVIDIA](https://nvidianews.nvidia.com/news/open-agent-safety-platform)
-    - 科研：Anthropic报告Claude Agent搜索生物数据、筛选候选，再由人工实验验证，形成探索、假设、验证闭环。参考：[Claude科研](https://www.anthropic.com/news/claude-discovers-novel-enzyme-system)
-    - 思路：单次任务转向持续责任；执行环境成为核心能力；多Agent需要分工、共享状态和预算；Harness影响成本和完成质量；自由推理结合确定性流程；交付物支持人工接管、编辑后继续迭代
-    - 借鉴：N-Agent优先研究持久任务与恢复、事件触发、可审计记忆与技能、独立执行边界、人工接管体验
+- HE
+    - HE：三方审阅，从直接修改、改为给出建议，从而解耦
+    - HE：VSCode+插件模式，补全Token观测
+    - HE：三方审阅，结果存储纳入Harness流程规范，如放到specs/third/目录下
+    - HE：阶段结果，未及时同步到Multica
+- NFR
+    - 知识：UDS，详细原理、Go样例
+    - 集成：N-Agent套装，集成N-KB；发布镜像，完成一键冷启动
+    - 任务：LLM请求未命中缓存读，分析原因
+    - 行研：已整理到 .harness/specs/research/research-agent-industry.md（2026年7月下旬至10月中旬）
 
 [待验证]
 - 上下文

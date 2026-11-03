@@ -508,6 +508,17 @@ async def test_call_llm_still_calls_prefetch_all_for_temp_injection():
     # But the LLM call must have received the injected context
     assert "<memory-context>" in str(fake_llm.last_kwargs.get("messages", []))
 
+    # The next model call follows a tool result, but must retain the same
+    # recalled context without another backend read or persisted injection.
+    state.working_messages.append({"role": "tool", "content": "weather skill"})
+    await runner.call_llm(state)
+    assert fake_emm.prefetch_calls == 1
+    assert "<memory-context>" in str(fake_llm.last_kwargs.get("messages", []))
+    assert not any(
+        "<memory-context>" in str(m.get("content", ""))
+        for m in state.working_messages
+    )
+
 
 class FakeMemoryStoreWithHistory(FakeMemoryStore):
     """FakeMemoryStore that returns pre-populated history from list_messages."""

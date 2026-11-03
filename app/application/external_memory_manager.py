@@ -353,13 +353,19 @@ class ExternalMemoryManager:
     ) -> list[str]:
         if not hasattr(provider, "list_projects"):
             return []
-        available_projects = set(provider.list_projects())  # type: ignore[attr-defined]
         if enabled_override is not None:
             candidates = enabled_override
         elif self._enabled_providers is not None:
             candidates = list(self._enabled_providers)
         else:
             candidates = []
+        if not candidates:
+            return []
+        try:
+            available_projects = set(provider.list_projects())  # type: ignore[attr-defined]
+        except OSError:
+            logger.warning("File memory catalog unavailable; project access denied")
+            return []
         return [name for name in candidates if name in available_projects]
 
     def build_system_prompt(self, enabled_override: list[str] | None = None) -> str:
@@ -557,6 +563,22 @@ class ExternalMemoryManager:
                 rescued.append(content.strip())
         return "\n\n".join(rescued)
 
+    def is_tool_enabled(
+        self, tool_name: str, enabled_override: list[str] | None = None,
+    ) -> bool:
+        """Resolve session visibility from the same provider ownership as execution.
+
+        File memory is selected by project name, not by its adapter name.
+        This lookup must not mutate global definitions or provider selection.
+        """
+        provider = self._tool_to_provider.get(tool_name)
+        if provider is None:
+            return False
+        provider_name = self._safe_provider_name(provider)
+        if provider_name == _MULTI_PROJECT_PROVIDER_NAME:
+            return bool(self._enabled_multi_project_names(provider, enabled_override))
+        return self._is_enabled(provider_name, enabled_override)
+
     def get_tool_definitions(self) -> list[ToolDefinition]:
         """返回注册时缓存的 provider 工具定义。
 
@@ -600,8 +622,11 @@ class ExternalMemoryManager:
         # external-query slot 工具在 swap 进行中时拒绝调用
         if slot == _EXTERNAL_QUERY_SLOT and self._swap_lock.locked():
             return json.dumps({"success": False, "error": "provider_swapping"})
-        if not self._is_enabled(provider_name, enabled_override):
+        if not self.is_tool_enabled(tool_name, enabled_override):
             return json.dumps({"success": False, "error": "provider not enabled"})
+        if provider_name == _MULTI_PROJECT_PROVIDER_NAME:
+            if args.get("project") not in self._enabled_multi_project_names(provider, enabled_override):
+                return json.dumps({"success": False, "error": "project not enabled"})
         if self._breaker.is_open(provider_name):
             logger.info(
                 "Memory provider %s in cooldown, skip tool %s",

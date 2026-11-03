@@ -1,0 +1,305 @@
+{
+  "checked_on": "2026-11-02",
+  "scope": "GitHub API metadata; mutable latest pointers, not a deployed-version audit",
+  "repositories": [
+    {
+      "repository": "langfuse/langfuse",
+      "repository_metadata": {
+        "html_url": "https://github.com/langfuse/langfuse",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-11-02T13:15:27Z",
+        "stargazers_count": 36885,
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "spdx_id": "NOASSERTION",
+          "url": null,
+          "node_id": "MDc6TGljZW5zZTA="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/langfuse/langfuse/releases/tag/v4.72.0",
+        "tag_name": "v4.72.0",
+        "published_at": "2026-10-29T16:14:48Z",
+        "target_commitish": "main"
+      }
+    },
+    {
+      "repository": "comet-ml/opik",
+      "repository_metadata": {
+        "html_url": "https://github.com/comet-ml/opik",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-11-02T13:17:30Z",
+        "stargazers_count": 23119,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/comet-ml/opik/releases/tag/2.2.138",
+        "tag_name": "2.2.138",
+        "published_at": "2026-11-02T10:48:55Z",
+        "target_commitish": "main"
+      }
+    },
+    {
+      "repository": "Arize-ai/phoenix",
+      "repository_metadata": {
+        "html_url": "https://github.com/Arize-ai/phoenix",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-11-02T13:13:41Z",
+        "stargazers_count": 12102,
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "spdx_id": "NOASSERTION",
+          "url": null,
+          "node_id": "MDc6TGljZW5zZTA="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/Arize-ai/phoenix/releases/tag/arize-phoenix-client-v3.6.0",
+        "tag_name": "arize-phoenix-client-v3.6.0",
+        "published_at": "2026-10-30T03:37:14Z",
+        "target_commitish": "a30fc7e9f4da37e200301f435e3cdfa8ba4ca524"
+      }
+    },
+    {
+      "repository": "lmnr-ai/lmnr",
+      "repository_metadata": {
+        "html_url": "https://github.com/lmnr-ai/lmnr",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-11-02T11:00:26Z",
+        "stargazers_count": 3469,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/lmnr-ai/lmnr/releases/tag/v0.3.3",
+        "tag_name": "v0.3.3",
+        "published_at": "2026-11-02T10:30:28Z",
+        "target_commitish": "main"
+      }
+    },
+    {
+      "repository": "langwatch/langwatch",
+      "repository_metadata": {
+        "html_url": "https://github.com/langwatch/langwatch",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-11-02T13:19:36Z",
+        "stargazers_count": 5003,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/langwatch/langwatch/releases/tag/mcp-server%40v3.1.0",
+        "tag_name": "mcp-server@v3.1.0",
+        "published_at": "2026-11-02T09:56:31Z",
+        "target_commitish": "925c58b928839e1b743475e60ff2668598483ab3"
+      }
+    },
+    {
+      "repository": "mlflow/mlflow",
+      "repository_metadata": {
+        "html_url": "https://github.com/mlflow/mlflow",
+        "default_branch": "master",
+        "archived": false,
+        "pushed_at": "2026-11-02T13:15:20Z",
+        "stargazers_count": 28627,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/mlflow/mlflow/releases/tag/v3.17.2",
+        "tag_name": "v3.17.2",
+        "published_at": "2026-10-21T03:51:13Z",
+        "target_commitish": "master"
+      }
+    },
+    {
+      "repository": "openlit/openlit",
+      "repository_metadata": {
+        "html_url": "https://github.com/openlit/openlit",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-11-02T10:34:28Z",
+        "stargazers_count": 2900,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/openlit/openlit/releases/tag/openlit-2.1.1",
+        "tag_name": "openlit-2.1.1",
+        "published_at": "2026-10-26T10:17:17Z",
+        "target_commitish": "1ed8bb7359a8978178e4abadda17d75adb04697d"
+      }
+    },
+    {
+      "repository": "Helicone/helicone",
+      "repository_metadata": {
+        "html_url": "https://github.com/Helicone/helicone",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-10-28T15:59:52Z",
+        "stargazers_count": 6252,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/Helicone/helicone/releases/tag/v2025.08.21-1",
+        "tag_name": "v2025.08.21-1",
+        "published_at": "2025-08-21T18:47:38Z",
+        "target_commitish": "main"
+      }
+    },
+    {
+      "repository": "Agenta-AI/agenta",
+      "repository_metadata": {
+        "html_url": "https://github.com/Agenta-AI/agenta",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-11-02T08:53:30Z",
+        "stargazers_count": 4879,
+        "license": {
+          "key": "other",
+          "name": "Other",
+          "spdx_id": "NOASSERTION",
+          "url": null,
+          "node_id": "MDc6TGljZW5zZTA="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/Agenta-AI/agenta/releases/tag/v0.128.0",
+        "tag_name": "v0.128.0",
+        "published_at": "2026-10-30T20:09:28Z",
+        "target_commitish": "3546fbf812d203c60f752910fe12f91e148ed02f"
+      }
+    },
+    {
+      "repository": "AgentOps-AI/agentops",
+      "repository_metadata": {
+        "html_url": "https://github.com/AgentOps-AI/agentops",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-06-25T08:25:03Z",
+        "stargazers_count": 5936,
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit",
+          "node_id": "MDc6TGljZW5zZTEz"
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/AgentOps-AI/agentops/releases/tag/0.4.21",
+        "tag_name": "0.4.21",
+        "published_at": "2025-08-29T06:36:28Z",
+        "target_commitish": "main"
+      }
+    },
+    {
+      "repository": "traceloop/openllmetry",
+      "repository_metadata": {
+        "html_url": "https://github.com/traceloop/openllmetry",
+        "default_branch": "main",
+        "archived": false,
+        "pushed_at": "2026-10-19T10:49:59Z",
+        "stargazers_count": 7518,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/traceloop/openllmetry/releases/tag/0.62.4",
+        "tag_name": "0.62.4",
+        "published_at": "2026-09-29T10:41:17Z",
+        "target_commitish": "main"
+      }
+    },
+    {
+      "repository": "wandb/weave",
+      "repository_metadata": {
+        "html_url": "https://github.com/wandb/weave",
+        "default_branch": "master",
+        "archived": false,
+        "pushed_at": "2026-11-01T03:05:48Z",
+        "stargazers_count": 1145,
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "spdx_id": "Apache-2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/wandb/weave/releases/tag/v0.54.0",
+        "tag_name": "v0.54.0",
+        "published_at": "2026-10-23T17:10:06Z",
+        "target_commitish": "master"
+      }
+    },
+    {
+      "repository": "eunomia-bpf/agentsight",
+      "repository_metadata": {
+        "html_url": "https://github.com/eunomia-bpf/agentsight",
+        "default_branch": "master",
+        "archived": false,
+        "pushed_at": "2026-10-31T16:43:25Z",
+        "stargazers_count": 768,
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit",
+          "node_id": "MDc6TGljZW5zZTEz"
+        }
+      },
+      "latest_release": {
+        "html_url": "https://github.com/eunomia-bpf/agentsight/releases/tag/v1.0.35",
+        "tag_name": "v1.0.35",
+        "published_at": "2026-10-23T10:22:27Z",
+        "target_commitish": "c1574366122a90c451bca6a84713e28813ab95e2"
+      }
+    }
+  ]
+}

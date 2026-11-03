@@ -41,21 +41,30 @@ from app.infrastructure.observability import instrumentors
 from app.infrastructure.observability import logging as obs_logging
 
 # Auto-instrumentation attribute whitelist (the module's public contract).
-ALLOWED_ATTRS = instrumentors.ALLOWED_AUTO_ATTRIBUTES
+ALLOWED_ATTRS = instrumentors.ALLOWED_AUTO_ATTRIBUTES | {"nagent.http.operation", "nagent.http.direction", "nagent.http.outcome", "nagent.http.summary", "nagent.http.duration_ms", "nagent.request.operation", "nagent.request.channel"}
 
 
+@pytest.mark.parametrize("path,channel", [("/chat/completions", "dashboard"), ("/v1/chat/completions", "api")])
 @pytest.mark.parametrize("mode", ["normal", "stream", "error", "unsampled", "unsampled_error"])
-def test_http_completion_log_matches_server_span(mode, monkeypatch):
+def test_http_completion_log_matches_server_span(mode, monkeypatch, path, channel):
     from opentelemetry import trace
     from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
     from starlette.responses import StreamingResponse
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
+    log_exporter = InMemoryLogRecordExporter()
+    log_provider = LoggerProvider()
+    log_provider.add_log_record_processor(SimpleLogRecordProcessor(log_exporter))
+    with pytest.warns(DeprecationWarning, match="LoggingHandler.*deprecated"):
+        sdk_handler = LoggingHandler(logger_provider=log_provider)
+    bridge = obs_logging.SafeLogBridge(otel_handler=sdk_handler)
 
     spans, logs, contexts = [], [], []
     provider = TracerProvider(sampler=ALWAYS_OFF if mode.startswith("unsampled") else ALWAYS_ON)
     provider.add_span_processor(SimpleSpanProcessor(_ListSpanExporter(spans)))
     app = FastAPI()
 
-    @app.post("/chat/completions")
+    @app.post(path)
     async def complete():
         contexts.append(trace.get_current_span().get_span_context())
         if mode.endswith("error"):
@@ -84,9 +93,10 @@ def test_http_completion_log_matches_server_span(mode, monkeypatch):
     monkeypatch.setattr(logger, "level", logging.INFO)
     handler = Capture()
     logger.addHandler(handler)
+    logger.addHandler(bridge)
     try:
         with TestClient(app, raise_server_exceptions=False) as client:
-            response = client.post("/chat/completions?secret=hidden", json={"secret": "body"})
+            response = client.post(path + "?secret=hidden", json={"secret": "body"})
             client.get("/health")
         assert response.status_code == (500 if mode.endswith("error") else 200)
         assert len(logs) == 1  # no duplicate end or health-check access event
@@ -94,20 +104,40 @@ def test_http_completion_log_matches_server_span(mode, monkeypatch):
         assert payload["trace_id"] == format(contexts[0].trace_id, "032x")
         assert payload["span_id"] == format(contexts[0].span_id, "016x")
         assert payload["http.request.method"] == "POST"
-        assert payload["http.route"] == "/chat/completions"
+        assert payload["http.route"] == path
         assert payload["http.response.status_code"] == response.status_code
-        assert payload["duration_ms"] >= 0
-        assert payload["outcome"] == ("error" if mode.endswith("error") else "completed")
-        for key in ("http.request.method", "http.route", "http.response.status_code", "duration_ms"):
+        assert payload["nagent.request.operation"] == "handle"
+        assert payload["nagent.request.channel"] == channel
+        exported_log, = log_exporter.get_finished_logs()
+        sdk_log = exported_log.log_record
+        assert sdk_log.trace_id == contexts[0].trace_id
+        assert sdk_log.span_id == contexts[0].span_id
+        for key in ("nagent.request.operation", "nagent.request.channel"):
+            assert getattr(projected, key) == sdk_log.attributes[key] == payload[key]
+            assert key not in instrumentors.ALLOWED_AUTO_ATTRIBUTES
+        assert payload["nagent.http.direction"] == "server"
+        assert payload["nagent.http.duration_ms"] >= 0
+        assert payload["nagent.http.outcome"] == ("failure" if mode.endswith("error") else "success")
+        for key in ("http.request.method", "http.route", "http.response.status_code", "nagent.http.duration_ms"):
             assert getattr(projected, key) == payload[key]
         assert "secret" not in json.dumps(payload)
         if mode == "stream":
             assert response.content == b"firstlast"
         if mode.startswith("unsampled"):
             assert not spans
+        else:
+            server = next(s for s in spans if s.context.span_id == contexts[0].span_id)
+            assert server.attributes["nagent.request.operation"] == "handle"
+            assert server.attributes["nagent.request.channel"] == channel
+            events = [event for event in server.events if event.name == "nagent.http.completed"]
+            assert len(events) == 1
+            for key in ("nagent.request.operation", "nagent.request.channel", "nagent.http.direction", "nagent.http.operation", "nagent.http.outcome", "nagent.http.summary", "nagent.http.duration_ms"):
+                assert events[0].attributes[key] == server.attributes[key] == payload[key]
     finally:
         logger.removeHandler(handler)
+        logger.removeHandler(bridge)
         provider.shutdown()
+        log_provider.shutdown()
 
 
 def test_http_completion_log_failure_does_not_break_response_or_span(instrumented, monkeypatch):
@@ -345,7 +375,7 @@ def test_fastapi_exception_events_and_status_description_blocked(instrumented):
     assert server
     span = server[0]
     # exception events (message/stacktrace) are never collected
-    assert all(e.name == "http_request_completed" for e in span.events)
+    assert all(e.name == "nagent.http.completed" for e in span.events)
     # status description may carry exception messages -> stripped
     if span.status is not None:
         assert not getattr(span.status, "description", None)
@@ -497,3 +527,44 @@ class TestSystemMetrics:
 
         monkeypatch.setattr(builtins, "__import__", _missing)
         assert instrumentors.instrument_system_metrics(object()) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('business_error', [False, True])
+async def test_request_channel_sdk_write_failure_does_not_preempt_asgi_business(monkeypatch, business_error):
+    from opentelemetry import trace
+    provider = TracerProvider()
+    backing = provider.get_tracer('entry-sdk-fault').start_span('server', kind=trace.SpanKind.SERVER)
+    def broken(attributes):
+        raise RuntimeError('SDK attribute write failed')
+    monkeypatch.setattr(backing, 'set_attributes', broken)
+    span = instrumentors._FilteringSpan(backing, http_attributes={
+        'http.request.method': 'POST', 'http.route': '/v1/chat/completions'})
+    calls = []
+    failure = ValueError('real business failure')
+    async def business(scope, receive, send):
+        calls.append(scope['path'])
+        if business_error:
+            raise failure
+        await send({'type': 'http.response.start', 'status': 204})
+        await send({'type': 'http.response.body', 'body': b''})
+    async def receive():
+        return {'type': 'http.request', 'body': b'', 'more_body': False}
+    async def send(message):
+        calls.append(message['type'])
+    middleware = instrumentors._HttpAccessFactsMiddleware(business)
+    try:
+        with trace.use_span(span, end_on_exit=False, record_exception=False, set_status_on_exception=False):
+            if business_error:
+                with pytest.raises(ValueError) as caught:
+                    await middleware({'type': 'http', 'method': 'POST', 'path': '/v1/chat/completions'}, receive, send)
+                assert caught.value is failure
+            else:
+                await middleware({'type': 'http', 'method': 'POST', 'path': '/v1/chat/completions'}, receive, send)
+        assert calls[0] == '/v1/chat/completions'
+        assert span._http_entry_facts == {'nagent.request.operation': 'handle', 'nagent.request.channel': 'api'}
+        if not business_error:
+            assert calls[1:] == ['http.response.start', 'http.response.body']
+    finally:
+        backing.end()
+        provider.shutdown()

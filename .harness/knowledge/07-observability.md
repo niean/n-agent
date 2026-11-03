@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收 -->
+<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 十类观测映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收 -->
 # 规范可观测行为
 
 观测回答：做了什么、为何结束、哪里慢、消耗多少。“共性规范”和“验收清单”独立于业务领域、项目、语言、框架及后端选型，可直接复用于其他系统；其余章节记录本项目的实现约定。本文是观测规范的权威源，架构、约定、模式及术语文档维护各自边界并引用本文。具体采集行为以对应观测能力启用为前提；本项目业务费用以 Usage 账本为准。
@@ -55,18 +55,18 @@ HTTP SERVER（对话请求）
 └─ invoke_agent（一次 Agent 执行）
    ├─ chat（每次真实模型请求）→ 出站 HTTP
    ├─ execute_tool（每次工具调用）→ 工具依赖
-   └─ nagent.context.compress（上下文压缩）→ 压缩模型调用
+   └─ context.compress（上下文压缩）→ 压缩模型调用
 ```
 
 - 入站 HTTP 只采集 `/chat/completions`、`/v1/chat/completions`，兼容查询参数和尾斜杠。`/static`、页面、健康检查、管理接口和轮询不创建入站 Span。
 - 关闭 ASGI receive/send Span。HTTPX/SQLite 自动 CLIENT Span 必须有有效父操作；不为独立后台探测等请求创建孤儿 Span。
 - HTTPX/SQLite 由 `build_application_services` 在 SDK 配置后、业务客户端构造前调用 `instrument_clients` 进程级幂等注册，覆盖 HTTP、CLI、ACP；不能只依赖 FastAPI `instrument_app`。禁用观测时不注册；客户端注册失败不阻止独立的服务端中间件安装。E2E 除 Agent Trace 外，逐模型核对 HTTP 子 Span、请求/响应 payload 与完成事件；尚未通过校验的 Trace 持续回读，失败仍保留链接。
-- CLI 经 `cli.request -> gateway.message`、ACP 经 SDK 的 `acp.request -> gateway.message`、飞书事件经 `feishu.event -> gateway.message`、后台 Task 经 `task.run` 进入 Agent；业务入口 Span 覆盖准入/编排与收尾，不能仅以 `invoke_agent` 存在或有 exemplar 判断入口完整。CLI 单次消息（流式/非流式、REPL 每轮）建立明确入口，不以整个终端会话为边界；继承有效上游上下文，无上游时为根 Span。CLI 与 Gateway 流式 Span 持续到实际消费结束，关闭向内传递；错误事件区分执行失败与取消。CLI 入口复用统一详情能力记录请求、实际输出和失败前缀，不额外创建 ACP 入口。
+- CLI 经 `request.handle -> gateway.handle_message`、ACP 经 SDK 的 `request.handle -> gateway.handle_message`、飞书事件经 `request.handle -> gateway.handle_message`、后台 Task 经 `task.run` 进入 Agent；业务入口 Span 覆盖准入/编排与收尾，不能仅以 `invoke_agent` 存在或有 exemplar 判断入口完整。CLI 单次消息（流式/非流式、REPL 每轮）建立明确入口，不以整个终端会话为边界；继承有效上游上下文，无上游时为根 Span。CLI 与 Gateway 流式 Span 持续到实际消费结束，关闭向内传递；错误事件区分执行失败与取消。CLI 入口复用统一详情能力记录请求、实际输出和失败前缀，不额外创建 ACP 入口。
 - 模型调用和工具调用通常是 Agent 下的兄弟，工具不能挂到已结束的模型 Span 下。真实请求尝试各记一次，不重复打点。
-- 定时任务在 `ScheduleRunService.run_claim()` 创建 `schedule.execute` 入口 Span，覆盖策略检查、执行记录、Agent 与投递；自动触发和手动运行复用该入口。Agent Span 继承其上下文，投递发生在 Agent Span 结束后、定时任务 Span 结束前。记录 task/claim/session 标识、执行与投递状态及完成摘要；任务 prompt 与执行结果通过统一详情通道先脱敏再限长，不进入普通属性、指标或自检缓冲。
-- Task 的 `task.run` 包含 worker/Judge 多轮、终态处理及通知。有明确上游的任务，首次执行、自动重试和进程恢复均复用上游 Trace ID，各 Run 创建不同 Span；对话、CMD、API、人工点击、定时触发统一适用。创建时持久化服务端捕获的 traceparent，每次 Run 从该 carrier 恢复直接父级，不继承领取 tick，也不因重试改写上游。`POST /chat/tasks` 创建 `task.submit` 入口并提取远程 traceparent；独立 CLI 创建命令使用 `cli.request` 和 application_runtime 收尾。仅缺少或无效上下文的任务可以建立根 Trace，必须用 `nagent.task.trace_context=missing|invalid` 显式标记；正常继承为 `inherited`。历史 Trace 不补造。
+- 定时任务在 `ScheduleRunService.run_claim()` 创建 `schedule.run` 入口 Span，覆盖策略检查、执行记录、Agent 与投递；自动触发和手动运行复用该入口。Agent Span 继承其上下文，投递发生在 Agent Span 结束后、定时任务 Span 结束前。记录 task/claim/session 标识、执行与投递状态及完成摘要；任务 prompt 与执行结果通过统一详情通道先脱敏再限长，不进入普通属性、指标或自检缓冲。
+- Task 的 `task.run` 包含 worker/Judge 多轮、终态处理及通知。有明确上游的任务，首次执行、自动重试和进程恢复均复用上游 Trace ID，各 Run 创建不同 Span；对话、CMD、API、人工点击、定时触发统一适用。创建时持久化服务端捕获的 traceparent，每次 Run 从该 carrier 恢复直接父级，不继承领取 tick，也不因重试改写上游。`POST /chat/tasks` 创建 `task.submit` 入口并提取远程 traceparent；独立 CLI 创建命令使用 `request.handle` 和 application_runtime 收尾。仅缺少或无效上下文的任务可以建立根 Trace，必须用 `nagent.task.trace_context=missing|invalid` 显式标记；正常继承为 `inherited`。历史 Trace 不补造。
 - `skill.review`、`curator.run` 使用独立 Trace + Link；Curator 内部 review 保持同 Trace 的父子关系。后台独立操作清理继承的业务现场并在退出时恢复；`clear_run_context()` 本身只清理业务 ContextVars，不代表 OTel Trace 已隔离。
-- 委派按所属 delegation 的服务端 traceparent 恢复到 `delegation.member -> invoke_agent`，禁止继承领取 tick 的偶然父级。原始关联随创建事务持久化，重连不覆盖；旧记录、损坏值或关联读取失败创建独立 member 业务根。保留未采样标志，不将 baggage/正文/凭据持久化。固定 source 映射包含 `delegation`。
+- 委派按所属 delegation 的服务端 traceparent 恢复到 `delegation.run_member -> invoke_agent`，禁止继承领取 tick 的偶然父级。原始关联随创建事务持久化，重连不覆盖；旧记录、损坏值或关联读取失败创建独立 member 业务根。保留未采样标志，不将 baggage/正文/凭据持久化。固定 source 映射包含 `delegation`。
 - 应用入口统一由 `business_operation` 管理完成摘要、失败/取消状态和现场恢复；仅接受固定操作名及标识白名单，不新增高基数指标标签。Tracer 故障回落到有效构造的非记录 Span，不阻断业务。CLI Curator run 通过 `application_runtime` 在成功或异常退出时收尾导出。
 - 每个业务入口自身记录本次请求与实际结果，不能用子 Agent/模型已有详情替代。Gateway、Task、Schedule、委派与后台审查统一使用 `details.input_messages/output_messages/error` 等既有白名单字段，经 `project_details` 投影后交给入口作用域的 `facts["details"]`；完成时同一份信封进入该 Span 和关联完成日志。流式结果沿消费路径有界收集，避免 delta 与最终消息重复计数，关闭/失败保留安全前缀并标明 incomplete；不得提前消费流。拒绝、跳过等无 Agent 输出的路径记录实际返回状态，不伪造回复。
 - Curator 入口的请求详情包括运行参数、有效整理开关/阈值和候选技能事实，结果详情包括实际返回结构、已完成迁移计数、模型整理结果/工具调用及错误；不得只存 summary_so_far。迁移完成时立即保存观测事实，后续报告失败或取消不将已完成计数重置为零，未完成结果标记 incomplete。所有入口验收须断言真实内容与异常分支，只有字段存在不算 payload 完整；短输出验证脱敏，超长输出另验截断。
@@ -75,9 +75,9 @@ HTTP SERVER（对话请求）
 
 ## 追踪外部记忆
 
-- `ExternalMemoryManager` 在实际调用 provider 时创建 `memory.prompt/prefetch/sync/pre_compress/tool <provider>`，探测由 `ExternalMemoryProviderService` 创建 `memory.probe <provider>`。provider 名限定 builtin、multi-project、mem0、honcho、holographic，其余归 other；沿用业务 source/session，不新增指标标签。禁用、策略拒绝及熔断跳过不伪造 provider 已调用。
+- `ExternalMemoryManager` 在实际调用 provider 时创建 `memory.prepare_prompt/prefetch/sync/pre_compress/execute_tool`，探测由 `ExternalMemoryProviderService` 创建 `memory.probe`。provider 名限定 builtin、multi-project、mem0、honcho、holographic，其余归 other；沿用业务 source/session，不新增指标标签。禁用、策略拒绝及熔断跳过不伪造 provider 已调用。
 - mem0/Honcho 共用的 urllib 客户端通过 `observability/urllib_capture.py` 复用 HTTPX 的安全目标投影、完成日志、详情脱敏与限长；每次实际请求仅有一个 CLIENT Span，覆盖 open、实际读取及 close，注入当前 CLIENT 的标准传播上下文。保留原 URL 安全检查、timeout、响应大小限制和异常语义；无有效父操作时不创建 HTTP 孤儿 Trace。
-- mem0 预取线程在启动处复制 ContextVars，在线程内以 `memory.search mem0` 覆盖完整搜索；调用方等待到期记录 timed_out，后台搜索继续归属原调用链，不能继承后续请求的上下文。后台结果为空、后台失败与等待超时分别记录；缓存复用不伪造新的 HTTP 调用。
+- mem0 预取线程在启动处复制 ContextVars，在线程内以 `memory.search` 覆盖完整搜索；调用方等待到期记录 timed_out，后台搜索继续归属原调用链，不能继承后续请求的上下文。后台结果为空、后台失败与等待超时分别记录；缓存复用不伪造新的 HTTP 调用。
 - Honcho/mem0 自动召回与同步内部捕获的异常同步标记当前 memory 操作失败，工具的 `success=false` 同样标为 failed；保持原有空结果、返回值和异常隔离。sync 的结果只记录方法已返回，不声称远端异步记忆已完成持久化。
 - Holographic 的本地 SQLite、builtin 和 multi-project 文件记忆复用公共操作 Span；不伪造 HTTP 调用。请求、召回内容、工具参数与结果仅走统一 details 通道；Honcho workspace/peer/conclusion ID 在 HTTP 路径中模板化。
 
@@ -114,11 +114,11 @@ invoke_agent（N-Agent）
 
 | 位置 | 完成日志 | 内容 |
 |---|---|---|
-| HTTP SERVER Span | `http_request_completed`，每请求一次 | 方法、路由、状态码、耗时、结果；显式关联该 HTTP Span |
-| HTTPX 出站 Span | `http_client_completed`，每次传输一次 | 目标主机/端口、脱敏路由模板、代码调用位置、方法、状态、耗时、结果；同时写入该 Span 的 Events 和同 Span ID 的 Log |
-| Agent（含 CLI/后台根 Span） | `execution_completed` | 结束原因、消息数、模型/工具调用数、Token、耗时、可读摘要 |
-| 模型和工具 | `execution_completed` | 当前模型/工具、调用结果、用量/策略、耗时、可读摘要与详情 |
-| 上下文压缩、预算拒绝 | `execution_completed` / `budget_denied` | 压缩前后 Token、耗时、结果与异常；预算拒绝的类别及现场 |
+| HTTP SERVER Span | `nagent.http.completed`，每请求一次 | 方法、路由、状态码、耗时、结果；显式关联该 HTTP Span |
+| HTTPX 出站 Span | `nagent.http.completed`，每次传输一次 | 目标主机/端口、脱敏路由模板、代码调用位置、方法、状态、耗时、结果；同时写入该 Span 的 Events 和同 Span ID 的 Log |
+| Agent 执行 | `nagent.agent.completed` | 结束原因、消息数、模型/工具调用数、Token、耗时、可读摘要 |
+| 模型和工具 | `nagent.model.completed` / `nagent.tool.completed` | 当前模型/工具、调用结果、用量/策略、耗时、可读摘要与详情 |
+| 上下文压缩、预算拒绝 | `nagent.context.completed` / `nagent.budget.denied` | 压缩前后 Token、耗时、结果与异常；预算拒绝的类别及现场 |
 
 入站 HTTP 流式响应在最终响应体发送后记录完成日志；取消或异常保持真实结果，尚未发响应时不伪造状态码。日志不依赖 Trace 是否采样。补齐日志仅对新请求生效。
 
@@ -137,7 +137,7 @@ HTTP 的实际请求与响应写入 `details.http_request/http_response`，包�
 
 事件按价值治理：
 
-- Policy 审计使用固定模板 `policy_decision %s`，事件为 `policy_decision`；策略、版本、决策、原因、运行和会话等经独立 ContextVar 脱敏后输出为 `policy.*` 字段。不把动态 JSON 注册为模板，也不逐条注册日志正文。
+- Policy 审计使用固定模板 `policy_decision %s`，事件为 `nagent.policy.decided`；策略事实经独立 ContextVar 脱敏后输出为 `nagent.policy.*` 字段；身份仅取受信执行快照。不把动态 JSON 注册为模板，也不逐条注册日志正文。
 - 启动、迁移、TaskRunner 等稳定业务事件继续注册模板，便于分类；注册不是输出可读日志的前提。
 - 仅过滤已被结构化事件替代的 HTTPX/HTTPcore 普通 INFO、Lark 连接成功与 OPA 注册噪声，以及观测自流量。其他有效应用/库日志默认保留；带上下文但没有内容的占位仍过滤。
 - WARNING/ERROR 保留来源、级别、当前安全上下文、脱敏正文和异常；外部已有日志 handler 的配置不改写。Profile 失败保留脱敏诊断；导出器失败日志只进 stderr，避免递归进入故障中的导出管线。
@@ -149,7 +149,7 @@ HTTPX 原始请求返回日志不是模型返回内容。它通常在传输 Span
 | 情况 | 处理规则 |
 |---|---|
 | HTTPX 原始 DEBUG/INFO 只有 unknown 与继承的上下文 | 过滤；不为消除 unknown 批量注册第三方模板，不放开原始 URL |
-| 有效父操作中的出站请求 | 在自身 Span 结束前各写一次 `http_client_completed` Event 与 Log，携带目标、脱敏路径、调用位置、状态、耗时和结果 |
+| 有效父操作中的出站请求 | 在自身 Span 结束前各写一次 `nagent.http.completed` Event 与 Log，携带目标、脱敏路径、调用位置、状态、耗时和结果 |
 | HTTPX WARNING/ERROR 或有实际详情的诊断 | 默认保留脱敏正文与异常；稳定事件名可补注册，不以未注册为由折叠内容 |
 | 无有效父操作的普通请求、观测后端自流量 | 沿用降噪规则，不为补日志而创建孤儿 Span 或递归记录导出请求 |
 
@@ -165,38 +165,325 @@ HTTPX 原始请求返回日志不是模型返回内容。它通常在传输 Span
 - `max_tokens`、`input_tokens` 等数值配置/计数不是凭据，不遮盖。Anthropic 初始工具输入同样保留并脱敏，不因非空而丢弃整次输出。
 - 脱敏或投影不可用时给出明确说明。业务 Span 与自动 HTTP Span 可通过同一详情通道携带正文；Metric、Profile、最近 Span 缓冲不带正文。DB Span 保留操作和表名，不采集原始参数。
 
-## 字段与关联
+## N-Agent 观测：统一语义设计
 
-| 来源 | 约定 |
+统一语义设计先回答“观察谁、做什么、发生了什么、结果怎样、如何关联”，再规定字段和测量。Span、Log/Event、Metric 使用同一套含义，采集、导出、存储和查询沿用这套定义。
+
+语义内容以本节为权威。面向外部的文章与语义附录同步维护对象、操作、属性、事件、结果、身份、指标和内容出口边界；示例可以精简，字段含义、枚举、统计范围与实现状态保持一致。变更任一项时，同时核对规范、文章正文和附录。
+
+### 整体模型
+
+| 概念 | 回答什么 | 示例 |
+|---|---|---|
+| 观测信号 Signals | 用哪类数据观察系统 | Trace 看执行链，Log 看现场，Metric 看统计，Profile 看代码热点 |
+| 记录结构 Fields | 一条记录自带哪些基本部分 | Span 的名称、时间、状态、父级和事件；Log 的时间、级别和正文 |
+| 观测对象 Objects | 描述谁 | Agent、模型、工具、任务、请求 |
+| 操作分类 Operations | 对这个对象做什么 | invoke_agent、execute_tool、task.run |
+| 观测属性 Attributes | 有哪些具体事实 | 工具名、Agent 来源、处理结果、耗时 |
+| 事件 Events | 某个时刻发生了什么 | 工具处理完成、策略作出决定、预算拒绝 |
+| 状态 State | 对象当前处于哪一步 | Task 正在运行、等待审批 |
+| 结果 Outcome | 本次操作怎样结束 | success、denied、cancelled |
+| 关联身份 Identity | 属于哪个实例、哪次运行、哪条链 | 会话 ID、AgentRun ID、TaskRun ID、Trace/Span ID |
+| 指标 Metrics | 如何统计多次观测 | 运行数、耗时分布、Token 增量 |
+
+```mermaid
+flowchart LR
+    A["业务事实：对象、操作、身份与结果"] --> B["统一语义契约"]
+    B --> C["Span：过程与耗时"]
+    B --> D["Log / Event：当时的事实"]
+    B --> E["Metric：按规定维度统计"]
+    C --> F["存储、查询与展示"]
+    D --> F
+    E --> F
+```
+
+例如一次 `read_file` 工具调用：对象是 tool，操作是 execute_tool；Span 名可以是 `execute_tool read_file`，属性记录工具名、所属 AgentRun 和工具自己的结果；结束时记录 `nagent.tool.completed`，并测量一次 `gen_ai.execute_tool.duration`。Metric 只使用该指标允许的维度。
+
+Profile 当前按服务和进程采样，使用 py-spy → Pyroscope；尚未接入 OTel Profiles。
+
+### 记录结构 Fields
+
+| 记录 | 常用结构字段 | 说明 |
+|---|---|---|
+| Span | Trace ID、Span ID、父 Span ID、name、kind、开始/结束时间、status、events、links | 标识当前步骤、父子关系、操作名称、调用方向、耗时、状态及关联事件 |
+| Log | 时间、严重程度、正文、Trace ID、Span ID | 记录当时发生的事实，并关联执行步骤 |
+| Metric | 名称、说明、单位、数据点、exemplar | 记录计数或分布；部分数据点可关联到具体 Trace |
+| Resource | attributes | 记录数据来自哪个服务实例 |
+| InstrumentationScope | 名称、版本 | 记录由哪套埋点产生 |
+
+Resource 保存服务身份信息：服务叫什么、运行哪个版本、具体是哪一个实例。InstrumentationScope 说明由哪套埋点产生数据。业务对象和运行身份通过下文的属性记录。
+
+### 观测对象 Objects
+
+对象是统一命名词汇。属性描述的事实属于谁，就使用谁的对象名；不同步骤可以携带同一个 AgentRun 身份，各自记录自己的结果。
+
+| 对象 | 描述什么 | 主要事实 |
+|---|---|---|
+| agent | 一次 AgentRun | 来源、运行 ID、轮次、结束原因、范围内调用数和用量 |
+| model | 一次模型请求尝试 | 模型、消息数、Token、用量是否已知、结束原因 |
+| tool | 一次工具请求的准入与执行 | 工具名、审批状态、风险、是否实际执行 |
+| context | 一次上下文压缩 | 压缩前后 Token、本次压缩的结果 |
+| task | 任务及一次 TaskRun | 任务 ID、TaskRun ID、业务状态、恢复的关联 |
+| delegation | 一次委派成员执行 | 委派 ID、成员 ID、角色 |
+| schedule | 一次定时任务领取、执行和投递 | 任务 ID、领取 ID、投递状态 |
+| memory | 一次记忆操作 | 操作、Provider、处理结果 |
+| skill | 一次后台技能审查 | 审查操作及结果 |
+| curator | 一次技能整理 | 整理操作及结果 |
+| gateway | 一次网关消息处理 | 消息处理操作及结果 |
+| request | 一次入口请求 | 渠道、请求 ID、处理结果 |
+| http | 一次 HTTP 传输 | 调用位置、server/client 方向、方法、状态码及耗时 |
+| budget | 预算类别及拒绝事实 | 预算类别 |
+| policy | 一次策略决定 | 策略、版本、决定种类、原因、决定结果和作用域 |
+| observation | 观测过程自身的诊断 | 观测降级或投影错误 |
+| metric | 指标采集自身的状态 | 超出基数限制后的归并标识 |
+| content | 脱敏且有界的内容详情 | 正文及长度、截断、中断信息 |
+
+CLI、ACP、飞书等记录在 request.channel；request 用于入口请求。context 专门描述压缩；各操作的 summary、outcome、duration_ms 归所属对象。summary 保存本次操作的完成摘要，记忆或上下文的正文走内容通道。
+
+### 操作分类 Operations
+
+标准操作名写入 `gen_ai.operation.name`。自定义操作名称使用 `<object>.<action>`，动作写入 `nagent.<object>.operation`，例如 `task.run` 对应 `nagent.task.operation=run`。模型名、工具名、记忆 Provider 等受控名称可以附在 Span 名后，唯一 ID 和正文不进入操作名称。
+
+| 标准 / 自定义 | 操作名称 | 对象 | 记录什么 |
+|---|---|---|---|
+| 标准 | `invoke_agent` | Agent | 一次真实 AgentRun |
+| 标准 | `chat` | 模型 | 一次模型请求；每次重试分别记录 |
+| 标准 | `execute_tool` | 工具 | 一次工具请求，包括拒绝或执行失败 |
+| 自定义 | `context.compress` | 上下文 | 一次压缩处理 |
+| 自定义 | `task.submit`、`task.run` | Task | 提交任务、后台执行任务 |
+| 自定义 | `delegation.run_member` | 委派 | 执行一个委派成员 |
+| 自定义 | `schedule.run` | 定时任务 | 一次领取、执行和投递 |
+| 自定义 | `memory.prepare_prompt`、`memory.prefetch`、`memory.sync`、`memory.pre_compress`、`memory.execute_tool`、`memory.probe`、`memory.search` | 记忆 | 实际发生的装配、读取、同步或工具操作 |
+| 自定义 | `skill.review` | 技能 | 后台技能审查 |
+| 自定义 | `curator.run` | Curator | 一次技能整理 |
+| 自定义 | `gateway.handle_message` | 网关 | 处理一条网关消息 |
+| 自定义 | `request.handle` | 请求 | 处理入口请求；API、Dashboard、CLI、ACP、飞书由 channel 区分 |
+
+API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际 channel；HTTP/DB 沿用自动埋点的名称。未知操作记录 `nagent.observation.error=unknown_object`，保留安全日志和已知关联。
+
+操作分类和属性可用于 Span、Log/Event 和 Metric。每个指标明确选择允许的维度，执行 ID 和正文不作普通指标标签。
+
+### 观测属性 Attributes
+
+项目属性使用 `nagent.<object>.<attribute>` 三段命名，对象和属性使用小写 snake_case。OTel 已有且满足用途的标准属性保留原名，如 service.name、gen_ai.request.model、gen_ai.conversation.id。
+
+下表记录本项目当前使用的字段。GenAI 依据为 `semantic-conventions-genai main @ 2026-10-24 (Development)`，该日期记录现有契约，标准升级需单独核对。允许的字段按实际事实采集，缺失的身份省略。
+
+属性类型由同一份契约校验：ID 和文本使用字符串，计数使用非负整数，bool 只用于布尔事实；耗时为有限非负数，模型结束原因保留字符串数组。类型错误的属性省略，业务继续处理。
+
+| 分类 | 对象或操作 | 属性名 | 类型或含义 | 所在位置及采集边界 |
+|---|---|---|---|---|
+| 通用标准 | 服务实例 | `service.name`、`service.version`、`service.instance.id` | string；服务叫什么、运行哪个版本、具体是哪一个服务实例 | Resource，随 Trace/Log/Metric 提供；N-Agent 与 N-KB 身份独立 |
+| 通用标准 | HTTP server/client | `http.request.method`、`http.response.status_code`、`http.route` | string/int/string；方法、实际响应码、路由模板 | HTTP Span 和完成 Log/Event；无响应不伪造状态码 |
+| 通用标准 | 出站 HTTP | `server.address`、`server.port`、`url.template` | string/int/string；请求对方的地址、端口、路径模板，如 `/sessions/{session_id}` | HTTP Span、Log/Event，路径中的实际 ID 等已替换 |
+| 通用标准 | HTTP/DB | `http.method`、`http.status_code`、`http.scheme`、`net.peer.name`；`db.system`、`db.system.name`、`db.operation`、`db.operation.name`、`db.collection.name` | 自动埋点锁定版本允许的新旧标准字段 | 精确白名单；不记录原始 SQL/参数，不作为新增项目字段命名依据 |
+| 通用标准 | 错误/异常 | `error.type`；`exception.type`、`exception.message`、`exception.stacktrace` | 安全错误类别、脱敏异常文本和堆栈 | 各出口单独审核；不把拒绝或取消自动当作技术错误 |
+| GenAI 标准操作 | Agent/模型/工具 | `gen_ai.operation.name` | `invoke_agent` / `chat` / `execute_tool` | Span、完成 Log/Event；工具正常、拒绝和异常均显式设置；不把自定义动作写入此标准键 |
+| 项目自定义 | 自定义操作所属对象 | `nagent.<object>.operation` | string；该对象执行的动作，如 task 的 run | 具体值见操作分类表；HTTP 保留自动埋点的请求名称 |
+| GenAI 标准 | 模型 | `gen_ai.provider.name`、`gen_ai.request.model`、`gen_ai.response.model`、`gen_ai.request.stream` | string/string/string/bool；Provider、请求/实际响应模型、流式 | 模型事实；响应模型只在已知时记录，指定指标只用允许维度 |
+| GenAI 标准 | 会话/Agent | `gen_ai.conversation.id`、`gen_ai.agent.name` | string；会话身份、Agent 名称 | Span/完成日志中的受信关联；会话 ID 不作普通指标标签 |
+| GenAI 标准 | 工具 | `gen_ai.tool.name`、`gen_ai.tool.type`、`gen_ai.tool.call.id` | string；工具名、类型、实际调用 ID | 工具 Span/完成事实；调用 ID 不作指标标签 |
+| GenAI 标准 | 模型/Agent | `gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens` | int；已知用量 | 模型及 Agent 汇总分别计算，未知不伪造零 |
+| GenAI 标准 | 模型/Token | `gen_ai.response.finish_reasons`、`gen_ai.token.modality` | string[]/string；模型结束原因、Token 模态 | 前者与 Agent end_reason 分开；后者仅指定 Token Counter 维度 |
+| 项目自定义 | Agent | `nagent.agent.source`、`nagent.agent.run_id`、`nagent.agent.iteration` | string/string/int；本次 Agent 执行来源、真实 AgentRun ID、轮次 | 受信绑定后可随模型/工具子步骤继承；尚无 Agent 归属时省略；不使用 TaskRun 或请求 ID 冒充 |
+| 项目自定义 | Agent | `nagent.agent.end_reason`、`nagent.agent.message_count`、`nagent.agent.inference_calls`、`nagent.agent.tool_calls`、`nagent.agent.usage_known` | string/int/int/int/bool；结束原因、范围内计数与汇总用量已知性 | Agent 完成事实；工具计数仅实际执行，模型计数按请求尝试；不重复叠加 child Agent |
+| 项目自定义 | 模型 | `nagent.model.message_count`、`nagent.model.usage_known` | int/bool；单次模型输入消息数、用量已知性 | 模型事实，不混用 Agent 范围计数 |
+| 项目自定义 | 工具 | `nagent.tool.policy_outcome`、`nagent.tool.risk_level`、`nagent.tool.executed` | string/string/bool；审批状态、风险、是否实际执行 | allow/deny/approved/require_approval 与统一操作结果分开，拒绝时 executed=false |
+| 项目自定义 | 压缩 | `nagent.context.before_tokens`、`nagent.context.after_tokens` | int；压缩前后 Token | 只在实际有此事实时记录 |
+| 项目自定义 | 各操作所属对象 | `nagent.<object>.outcome`、`nagent.<object>.summary`、`nagent.<object>.duration_ms` | string/string/number；操作结果、安全有界完成摘要、耗时 | agent/model/tool/context/task/delegation/schedule/memory/skill/curator/gateway/request/http 各自归属；summary 不是上下文摘要正文，duration 不替代 Span 时间，不作 Metric 维度 |
+| 项目自定义 | 请求 | `nagent.request.channel`、`nagent.request.id` | string；入口渠道、真实请求身份 | CLI/ACP/飞书分别 cli/acp/feishu；HTTP server 记录实际渠道；channel 与 Agent source 分开 |
+| 项目自定义 | Task | `nagent.task.id`、`nagent.task.run_id`、`nagent.task.trace_context`、`nagent.task.state` | string；任务、真实 TaskRun、上下文恢复结果、业务状态 | trace_context=inherited/missing/invalid；running/waiting_approval 等状态不冒充完成结果 |
+| 项目自定义 | 委派 | `nagent.delegation.id`、`nagent.delegation.member_id`、`nagent.delegation.role` | string；委派、成员、角色 | 受信业务入口标识，不作普通指标标签 |
+| 项目自定义 | 定时任务 | `nagent.schedule.task_id`、`nagent.schedule.claim_id`、`nagent.schedule.delivery_status` | string；任务、领取、投递结果 | 执行结果与投递结果分开 |
+| 项目自定义 | 记忆 | `nagent.memory.provider` | string；builtin/multi-project/mem0/honcho/holographic/other | provider 独立于操作名，缓存或跳过不伪造远端执行 |
+| 项目自定义 | HTTP | `nagent.http.caller`、`nagent.http.direction` | string；脱敏调用位置、server/client | Span 与同一次完成 Log/Event 统一事实 |
+| 项目自定义 | 预算/观测/指标 | `nagent.budget.kind`、`nagent.observation.error`、`nagent.metric.overflow` | string/string/bool；预算类别、观测降级诊断、有界维度归并 | unknown_object 保留安全业务日志，不猜所属对象；overflow 为 bool，不是业务 ID |
+| 项目自定义 | Policy 安全检查 | `nagent.policy.name`、`nagent.policy.version`、`nagent.policy.decision_kind`、`nagent.policy.reason`、`nagent.policy.outcome`、`nagent.policy.scope`、`nagent.policy.occurred_at` | string；策略、版本、决策种类、原因、allow/deny/require_approval、作用域、审计时间 | `LoggingPolicyAuditSink` → 独立 ContextVar → 安全 Log/Event；reason 最多 1024 字符，其余字符串最多 256；无决定不补造 |
+| 项目自定义 | 内容 | `nagent.content.<field>`、`nagent.content.<field>_original_bytes`、`nagent.content.<field>_truncated`、`nagent.content.<field>_incomplete`、`nagent.content.<field>_observed_bytes` | string/int/bool/bool/int；安全正文、完整脱敏长度、截断、中断、已观察长度 | 固定 12×5 精确字段集合；Log/Span/Event 默认每项 2048 字节；Metric/Profile/ring buffer 不含正文 |
+
+### 事件、状态与结果
+
+操作描述“做什么”，事件记录“发生了什么”。自定义事件使用 `nagent.<object>.<event>`，与属性共用对象词汇。
+
+| 事件 | 记录什么 | 关键事实 |
+|---|---|---|
+| `nagent.<object>.completed` | 对应业务操作已结束 | 同一操作分类、所属对象的 outcome/summary/duration_ms |
+| `nagent.http.completed` | HTTP 传输已结束 | direction=server/client、标准 HTTP 字段及本次结果 |
+| `nagent.policy.decided` | 策略已作出决定 | 策略、原因、allow/deny/require_approval |
+| `nagent.budget.denied` | 发生一次实际预算拒绝 | 预算类别 |
+| application_log / library_log / diagnostic_log | 普通业务、库或诊断日志 | 脱敏正文、异常与可用现场 |
+
+completed 表示结束。完成 Log 和 Span Event 使用相同事件名和完成事实，在所属 Span 仍活跃时记录；未采样仍保留 Log，缺少可记录 Span 时只输出已有的安全日志。API/Dashboard 复用的 HTTP 入口沿用 HTTP 完成事件。
+
+操作的完成结果统一为八种：
+
+| 完成结果 | 含义 |
 |---|---|
-| OTel 通用 | `service.name`、`service.version`、`service.instance.id`；Trace/Span 标识、父关系、时间与状态；Log 时间、级别和正文 |
-| [OTel GenAI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) | `gen_ai.operation.name`、Agent/会话、Provider/模型、工具、输入输出 Token、模型结束原因 |
-| N-Agent 补充 | `nagent.*`：运行、入口、轮次、执行结束原因、策略、压缩、摘要等项目字段 |
+| success | 本次操作按预期完成；compressed 等在确有完成压缩时归此 |
+| failure | 异常或明确失败返回；aborted 无取消证据时归失败 |
+| denied | 准入、权限或预算拒绝，不自动表示检查器故障 |
+| cancelled | 有实际取消事实，包括 CancelledError/GeneratorExit |
+| timed_out | 有明确超时事实 |
+| skipped | 按规则未执行 |
+| deferred | 本次处理已结束，工作等待审批或其他条件；waiting_approval/blocked 不等于成功 |
+| unknown | 缺失或无法识别的结果，不伪装成功 |
 
-GenAI 采用 `telemetry_semantics.py` 声明的草案依据，变更时集中迁移。OTel 已覆盖的含义不再另起等价名字；脱敏详情走项目的 `nagent.details.*` 通道。
+运行中不预写 success。failure/timed_out 对应 SpanStatus.ERROR；denied/skipped/deferred/cancelled 用各自结果说明，不自动标为技术错误。HTTP 仍按协议自己的错误规则记录。
 
-- 相同 `trace_id` 表示同一执行链；子 Span 的 `parent_span_id` 等于直接父 Span 的 `span_id`。日志通常只有当前 `trace_id/span_id`，不额外复制父 ID。
-- Grafana 用 Metric exemplar 跳 Trace，用 Trace ID 从 Tempo 查 Loki，再从日志跳回 Tempo。HTTP 根 Span 的日志不包含全部子操作详情，查整条链用 Trace ID。
-- 运行、会话、Trace/Span ID 不作普通 Metric 标签或 Loki 索引标签；日志可以用结构化元数据保存这些标识。
+| 字段或概念 | 表达什么 | 示例 |
+|---|---|---|
+| 所属对象的 outcome | 本次操作的完成结果 | task.outcome=deferred |
+| task.state | Task 当前业务状态 | waiting_approval、running |
+| policy.outcome | 策略的决定 | allow、deny、require_approval |
+| tool.policy_outcome | 工具审批事实 | 按工具链路记录实际批准、拒绝或等待审批状态 |
+| agent.end_reason | Agent 为什么结束 | 正常结束、达到预算、用户停止等受控原因 |
+| gen_ai.response.finish_reasons | 模型为什么停止生成 | stop、length 等模型结束原因 |
 
-## Metric、采样与自检
+表中省略 nagent 前缀的项目字段沿用属性表全名。等待审批的 Task 可以同时记录 state=waiting_approval、outcome=deferred；模型的 length 结束原因按实际处理结果判断，不能直接推成失败。
 
-- Counter 记累计量，Histogram 记每次测量值及分布。指标包括 Agent/模型/工具耗时、调用次数、Token、执行结果、压缩与预算拒绝。
-- 指标名称、单位和允许维度集中在 `telemetry_semantics.py`；Prometheus 实际名称以 `docker/observability/metric-name-mapping.md` 为准，新增指标同步维护。
-- Histogram 在对应 Span 仍为 current 时记录，供已采样 Span 产生 exemplar。缺失 Token 不伪造为零；费用以 Usage 账本为准。
-- exemplar 只覆盖部分测量，不用于逐次执行审计。排查缺失先核对时间窗、指标与服务筛选、采样和导出，再直接查询 Trace；不得为了关联而将执行 ID 加入指标标签。
-- AgentRun 三个 histogram（duration/inference_calls/tool_calls）统一携带经 map_source 归一的 nagent.source，由本次受信 RunContext 提供，不能用会话创建来源或投递平台替代。Chat 为 dashboard/api，GW 保留 feishu/cli/acp/dingtalk/wecom，定时执行为 schedule，Task worker/Judge 为 task，委派 child 为 delegation；Skill 自进化审查为 skill_review，周期维护的模型整理为 curator；其他已知枚举保留，未知归 other。SkillEvolutionService 将有效来源同时传给 skill.review 入口与内部受信 gateway.source，再经 ChatCompletionService 构造 RunContext，避免入口 other、Agent api 的双重回落；复用会话不改变原会话来源。测量在当前 Agent Span 内记录，exemplar 关联该 Agent Span，入口差异通过序列 nagent_source 与 Trace 入口共同体现。
-- Grafana Overview/Metrics 的 Source 多选仅筛选 AgentRun/turns，模型/工具/Token 等面板标明服务级。Source All=`.*` 包含历史缺失来源序列，指定来源时不包含；历史来源不回填、不伪装为 other，历史图例保留分位数/调用类型后缀。平均调用数使用 histogram _sum/_count（零调用运行计入分母），exemplar 单次测量与 p95/p99 含义不同；耗时面板通过同页 ?viewPanel 链接查看底层 bucket 面板，保留反向代理子路径和筛选条件。
-- 观测执行来源与 XUI 入口、会话来源分别建模：`skill_review` 标识原会话内触发的后台自进化 AgentRun，复用原 `session_id` 且不持久化审查消息，不新增 XUI 入口或会话筛选类型；Curator 模型整理使用独立的 `curator-…` 会话，执行来源与会话来源均为 `curator`。
-- Trace 使用 ParentBased + 比例采样，继承父级采样决定；Log/Metric 不因 Trace 未采样而丢弃。
-- Dashboard 自检只保留当前进程最近 100 条已结束、被采样 Span 的少量安全字段；每页 10 条，重启清空，不代表完整历史。
+### 身份与跨信号关联
 
-## 实现边界与故障隔离
+| 身份 | 字段 | 代表什么 |
+|---|---|---|
+| AgentRun | `nagent.agent.run_id` | 一次真实 Agent 执行 |
+| Task / TaskRun | `nagent.task.id` / `nagent.task.run_id` | 任务及一次后台运行 |
+| 请求 | `nagent.request.id` | 一次实际入口请求 |
+| 会话 | `gen_ai.conversation.id` | 多轮交互所属会话 |
+| 委派 / 成员 | `nagent.delegation.id` / `nagent.delegation.member_id` | 委派及其成员 |
+| 定时领取 | `nagent.schedule.task_id` / `nagent.schedule.claim_id` | 定时任务及本次领取 |
+| Trace / Span | 记录结构中的 Trace ID / Span ID | 执行链及链内步骤 |
 
-- Domain 不依赖 OTel，可携带不透明的关联元数据；Application 通过 `telemetry_semantics.py` 使用 OTel API；SDK、导出器和自动埋点位于 Infrastructure。接口入口可调用应用层业务观测作用域；Dashboard 自检只消费注入的快照，不访问观测内部实现。
-- 观测开关、采样、导出地址和详情上限为启动期环境变量；Dashboard 外链覆盖配置可运行时修改。
-- 装配幂等，退出统一 flush/shutdown。导出和采样使用有界队列与预算；失败可降级或丢弃观测数据，不能阻断业务或吞掉业务异常。
-- 新增打点同时检查字段白名单、脱敏、Collector 投影和自动化验证；日志与 Trace 的字段和用量口径保持一致。
+AgentRun、TaskRun 和请求分别使用自己的 ID。真实身份由服务端执行现场绑定；没有 AgentRun 时省略 agent.run_id。模型、工具、HTTP 等子步骤可以携带所属 Agent 的身份，同时保留自己的结果和摘要。
+
+入口渠道与 Agent 来源分别记录：
+
+| 属性 | 含义 | 固定取值 |
+|---|---|---|
+| `nagent.request.channel` | 本次请求从哪个入口进入 | api/dashboard/cli/acp/feishu/dingtalk/wecom/unknown |
+| `nagent.agent.source` | 本次 AgentRun 由什么来源触发 | api/dashboard/cli/acp/feishu/dingtalk/wecom/task/schedule/delegation/skill_review/curator/unknown |
+
+例如飞书请求提交后台任务：入口 channel=feishu，Task worker 内的 Agent source=task；原入口通过 Trace 和任务身份关联。后台技能审查使用 skill_review，可复用原会话；Curator 整理使用 curator 和独立 curator-… 会话。Agent 的本次来源由执行现场提供，会话来源保持自己的含义。未知来源使用 unknown，不适用的字段省略。
+
+同步调用继承直接父级；Task 从所属任务记录恢复创建时的 traceparent，首次执行、重试和恢复沿用上游 Trace，每个 TaskRun 创建独立 Span。委派同样从所属创建记录恢复。独立技能审查、Curator 等按既定边界创建新 Trace + Link。后台 worker 使用所属业务记录，退出恢复上下文，并行 child 隔离可变结果。
+
+同一次操作由 Span 记录过程、完成 Log/Event 记录结束事实、Metric 记录允许的测量。Trace/Span ID 串起信号；exemplar 是部分测量的关联样本。会话和运行 ID 不进入普通 Metric/Loki 索引标签。
+
+### 指标 Metrics
+
+每个 instrument 固定名称、类型、单位、触发点和维度。测量发生在所属 Span 仍活跃时，完成 Event/Log 不再触发一次额外计数。
+
+| 目标 instrument | 类型/单位 | 一次测量表示什么 | 允许维度 |
+|---|---|---|---|
+| gen_ai.client.inference.usage.input_tokens | Counter/{token} | 一次模型尝试的已知输入 Token 增量 | 标准 operation/provider/request.model/token.modality |
+| gen_ai.client.inference.usage.output_tokens | Counter/{token} | 一次模型尝试的已知输出 Token 增量 | 同上 |
+| gen_ai.client.inference.operation.input_tokens | Histogram/{token} | 一次模型尝试的输入 Token 数 | 标准 operation/provider/request.model、error.type |
+| gen_ai.client.inference.operation.output_tokens | Histogram/{token} | 一次模型尝试的输出 Token 数 | 同上 |
+| gen_ai.client.inference.duration | Histogram/s | 一次模型尝试的实际持续时间，流式到关闭/结束 | 标准 operation/provider/request.model、error.type |
+| gen_ai.execute_tool.duration | Histogram/s | 一次工具请求的处理耗时，包括准入拒绝的短处理 | 标准 tool.name/tool.type/agent.name、error.type |
+| gen_ai.invoke_agent.duration | Histogram/s | 一次 AgentRun 的实际持续时间 | 标准 agent.name、nagent.agent.source、error.type |
+| gen_ai.invoke_agent.inference_calls | Histogram/{inference_call} | 本次 AgentRun 实际模型调用数，包括零次 | 标准 agent.name、nagent.agent.source |
+| gen_ai.invoke_agent.tool_calls | Histogram/{tool_call} | 本次 AgentRun 实际执行工具数，不把准入拒绝算执行 | 标准 agent.name、nagent.agent.source |
+| nagent.agent.runs | Counter/1 | 一次 AgentRun 结束，成功失败均计数 | nagent.agent.source、nagent.agent.end_reason |
+| nagent.context.compression_attempts | Counter/1 | 一次压缩处理结束，成功失败跳过分别标明 | nagent.context.outcome |
+| nagent.budget.denials | Counter/1 | 一次实际预算拒绝 | nagent.budget.kind |
+
+表中的标准 operation/provider/request.model 分别指 gen_ai.operation.name/gen_ai.provider.name/gen_ai.request.model。gen_ai.token.modality 仅用于两项 Token Counter。九个 gen_ai instrument 沿用仓库锁定草案契约；Prometheus 实际名称及后端实测依据见 `docker/observability/metric-name-mapping.md`。
+
+Counter 记录累计增量，Histogram 记录单次测量及其分布。模型重试逐次测量，未知 Token 保持未知；一次 AgentRun 结束计一次运行，一次压缩处理结束计一次尝试，一次实际预算拒绝计一次拒绝。Agent 汇总只统计自身范围，工具准入拒绝时 executed=false，工具执行数不增加。业务费用仍以 Usage 账本为准。
+
+维度沿用属性名，落 Prometheus 后转换为 nagent_agent_source、nagent_agent_end_reason、nagent_context_outcome、nagent_budget_kind 等标签。Grafana Source 只筛选 Agent 运行相关面板；模型、工具和 Token 面板保持服务级。Source All 使用 `.*`，选定来源按 nagent_agent_source 筛选。平均调用次数使用 histogram 的 _sum/_count，零调用运行保留在分母中；exemplar 单次测量与 p95/p99 分位数分别解释。外链保留反向代理子路径和筛选条件。
+
+### 内容与出口
+
+固定内容字段如下，均通过统一脱敏、有界详情通道记录。
+
+| 内容字段 | 表达什么 |
+|---|---|
+| input_messages | 本次操作的输入消息 |
+| user_message | 用户消息 |
+| assistant_message | 助手消息 |
+| system_prompt | 系统提示词 |
+| tool_definitions | 提供给模型的工具定义 |
+| output_messages | 本次操作的实际输出消息 |
+| tool_arguments | 工具调用参数 |
+| tool_result | 工具实际返回结果 |
+| error | 异常或错误详情 |
+| http_request | HTTP 请求详情 |
+| http_response | HTTP 响应详情 |
+| log_fields | 日志的结构化详情 |
+
+每项共五个属性：正文 `nagent.content.<field>`，以及 original_bytes、truncated、incomplete、observed_bytes 四项元数据。正文先统一脱敏，再按每项默认 2048 字节限长；流式中断保留安全前缀。完整长度未知时省略 original_bytes，observed_bytes 只表示已观察到的长度。
+
+原始 gen_ai.input.messages/output.messages、system_instructions、tool.definitions、tool.call.arguments/result 经安全内容通道投影。Log/Span/Event 可以接收脱敏有界详情；Metric、Profile、自检 ring buffer 不带业务正文。各出口使用精确字段允许集合，未审阅字段不因 gen_ai/nagent 前缀自动进入出口。
+
+Collector 可以将内容属性整理成 `details.<field>.{content,original_bytes,truncated,incomplete,observed_bytes}`。stderr/Loki 的 context.execution 保存规范属性；event、severity、message、trace_id/span_id、details 等日志结构字段沿用自己的名称。
+
+Policy 的 AgentRun 和会话身份取自受信执行快照。领域审计事件的旧 run/session 字段存在含义混用，缺乏真实绑定时省略。安全观测动作称 check，领域 `Policy.evaluate()` API 保持原有职责；当前策略证据通过 Log/Event 记录，独立 policy.check Span 尚未接入。
+
+### Langfuse 类型映射
+
+以下按真实对象和操作解释映射关系，供后续适配使用；当前尚未安装 Langfuse 或完成外部平台验收。映射保留身份、父关系、Link 和安全详情。
+
+| Langfuse 类型 | N-Agent 对应与边界 |
+|---|---|
+| event | 完成、审计、诊断事实；原生 Span Event 不保证自动成为独立 observation |
+| span | HTTP/DB、普通业务操作和压缩；不全标成 Agent |
+| generation | 实际 chat 模型请求及其用量、消息；Usage 账本仍为费用权威 |
+| agent | invoke_agent；Task/Gateway 入口不因含 Agent 就当成 agent |
+| tool | execute_tool，正常、拒绝、异常均有标准 operation 属性；拒绝不等于已执行 |
+| chain | 有实际编排含义的步骤；普通转换不伪装 workflow |
+| retriever | 实际检索步骤；搜索工具/N-KB HTTP 链不等于已有专用标准 retrieval Span |
+| evaluator | 当前无统一专用质量评估 Span/结果契约，不能只凭 Judge 名称认定 |
+| embedding | 当前无统一专用 embeddings Span |
+| guardrail | 实际安全检查证据；当前 Policy Log/Event 不等于独立 guardrail Span，普通选择/分配也不全归此 |
+
+安全检查与质量评分分别建模。Policy 的选择、分配和安全决定按实际含义判断；工具名含 search、步骤名含 review/Judge 都不足以自动确定 retriever 或 evaluator 类型。
+
+### 实现与故障隔离
+
+| 层次 | 职责 |
+|---|---|
+| Domain | 业务对象、状态和策略；携带不透明关联元数据 |
+| Application 契约 | telemetry_contract.py 定义固定对象、操作、属性及类型、结果、事件和可记录指标；无 SDK/IO |
+| Application 采集 | telemetry_semantics.py 管理操作生命周期、完成事实及测量；telemetry_details.py 管理安全内容 |
+| 组装根 | main.py 注入注册表、投影函数及精确白名单 |
+| Infrastructure | SDK、自动埋点、日志桥、ring buffer、导出与 Profile；消费注入的契约 |
+| Collector / Grafana | 按同一字段协议整理、存储、查询和展示；N-KB 使用自己的服务身份和独立投影分支 |
+
+Application 采集使用 OTel API，SDK 与导出器位于 Infrastructure，Domain 不依赖 OTel。入口先保存可信事实，SDK 写属性、日志或导出失败时隔离故障，业务输入输出、异常、取消和数据流消费保持原样。
+
+观测开关、采样、导出地址和详情上限在启动时由环境变量配置；Dashboard 外链可运行时修改。Trace 使用 ParentBased + 比例采样，继承父级决定；Log/Metric 不随 Trace 未采样而丢弃。初始化与释放幂等，队列、基数、重试及 flush/shutdown 有明确预算。
+
+自检缓冲只保留当前进程最近 100 条已结束、被采样 Span 的安全字段，每页 10 条，重启清空。新增打点同时核对契约、字段类型、脱敏、出口、Collector、查询与实际后端证据；运行健康和单个 Span 存在只证明对应检查项。
+
+## 实施与历史数据边界
+
+当前代码和实际部署已使用统一契约。2026-11-03 的真实后端验收覆盖正常调用、Provider 失败和客户端中断，Tempo/Loki/Prometheus 关联通过；三个新 Counter 的名称另经隔离合成服务验证。
+
+随后按用户“历史观测数据，全部清空”的追加指令，于 2026-11-03 11:42:01（Asia/Shanghai）重建七个观测数据卷，清空共享栈现存 Trace/Log/Metric/Profile，包含 N-KB、混合 Trace 和先前验收记录；Grafana 配置卷、业务数据库和用户文件保留。应用及观测容器重建后重新采集，旧观测快照和回滚包已删除。重置前查询均为空、待删除请求为 0，新的四类信号已入库。证据见 locals/observability-reset-261103/。本次显式清空授权独立于日常部署的数据保留规则；旧定向清理报告保留为过程记录。
+
+历史工具 `docker/observability/history-cleanup.py` 独立于 app，默认清单/dry-run；只允许明确起止时间内 service.name=n-agent 的旧观测，manifest 记录实际版本、选择器、数量/完整枚举状态和内容 hash，apply 必须匹配并重验证。Prometheus 使用受限 delete_series，admin API 不可用时报告 blocked；Loki 的提交、查询过滤和物理处理完成分别报告；Tempo 仅允许官方同版本工具按审核过的完整 TraceID 清单删除整条 Trace，不直接改 WAL/块，不以 limit=50 样本冒充完整枚举。混合 N-Agent/N-KB、跨截止点或资源归属未知的 Trace 不删。实际停写/flush、部署与后端运维由独立步骤执行，未执行不得记完成。
+
+旧数据只有在支持完整可靠导出、身份不变转换和重导入时才迁移，否则受限删除；无法证明隔离即 blocked。共享 N-KB、新契约数据、业务账本/SQLite、Profile、用户文件和八个 external 共享卷均不得附带清空。固定切换前样本与操作证据保存在 locals/observability-migration/，不以删除业务账本旧 trace_id 链接来掩盖缺失 Trace。
+
+工具由运维在受控 Docker 容器内运行，挂载脚本和独立证据目录，不挂 docker socket。参数 start/cutoff 是明确 Unix 秒，窗口为 [start, cutoff)；Prometheus end 使用 cutoff 前一毫秒，Loki 删除参数使用 RFC3339 毫秒格式，inclusive end 为 cutoff 前一毫秒，Tempo 对完整 Trace 的全部 Span 逐项检查。cutoff 必须在旧写入者已停写并 flush 后、新写入者启动前确定。示例命令中的路径是容器挂载路径，值由现场清单替换：
+
+```sh
+python /ops/history-cleanup.py prometheus --url http://prometheus:9090 --start START --cutoff CUTOFF --manifest /evidence/prometheus.json
+python /ops/history-cleanup.py prometheus --url http://prometheus:9090 --manifest /evidence/prometheus.json --apply --confirm-sha256 REVIEWED_SHA256
+```
+
+backend 可选 prometheus/loki/tempo。首次清单使用排他创建避免覆盖基线；apply 不改清单，终端 JSON 结果应另存证据。hash 是清单完整性和人工审阅绑定，不替代操作环境的权限控制。Prometheus 只处理三个旧项目 Counter，以及携带旧 nagent_source 的受影响 Agent Histogram；旧 overflow 标签另按相同服务/时间窗口枚举，未发现只说明该窗口不存在，出现未确认的翻译键则单独 residual blocked，不猜选择器。admin API 未启用时如实失败；若现场临时启用，只在运维 override 保留原 command 并追加 --web.enable-admin-api，操作后移除，不永久修改共享栈默认配置。
+
+Tempo 从一小时窗口开始，对饱和或未完成的搜索继续分窗，最小一秒仍不全则 blocked；总请求 2048、总预算 300 秒，单请求 60 秒。allowlist 仅在全部窗口完整且所有候选检查完成后输出，内容只包含归属/时间安全的 Trace。dry_run_argv 使用 tempo-cli 2.9.0 官方 rewrite-blocks drop-traces，不带 --drop-trace；实际暂停/flush、快照、冻结后重验证与官方工具写入由运维执行。工具 apply 对无受阻候选的 Tempo 清单仍明确返回 external offline rewrite required；含受阻候选的清单拒绝 apply，不能把生成命令当作删除完成。Loki 3.5.5 的 delete parseTime 不接受纳秒整数；RFC3339 被转为 UnixMilli。清单中的 precision_gap 明确保留 (cutoff−1ms, cutoff) 最后不足一毫秒为未验证残留，不能宣称已覆盖；运维需证明旧停写到 cutoff 的空窗足够，或盘点该残留。查询计数仍覆盖完整目标窗口，与可删除窗口分开。重跑按 model.Time JSON 的十进制秒值精确换算毫秒匹配请求起止，不截断整数秒；报告已提交请求的原始 status；submitted/filtered/processed 与物理清理证据分别核对，默认取消窗口不缩短。网络或部分操作失败不宣称整体成功；Prometheus tombstoned 也不等于已物理回收磁盘。
+
+接口依据：[Prometheus HTTP API](https://prometheus.io/docs/prometheus/latest/querying/api/)、[Loki HTTP API](https://grafana.com/docs/loki/latest/reference/loki-http-api/)、[Tempo CLI](https://grafana.com/docs/tempo/latest/operations/tempo_cli/)；具体同版本 CLI 参数以现场 2.9.0 help 证据为准。Loki 精度依据锁定源码 [v3.5.5 request_handler.go](https://github.com/grafana/loki/blob/v3.5.5/pkg/compactor/deletion/request_handler.go)、[DeleteRequest](https://github.com/grafana/loki/blob/v3.5.5/pkg/compactor/deletion/delete_request.go)，JSON 时间表示依据其锁定依赖 [prometheus/common v0.62.0 model.Time](https://github.com/prometheus/common/blob/v0.62.0/model/time.go)。
+
+Tempo 2.9.0 的 [SearchMetrics](https://github.com/grafana/tempo/blob/v2.9.0/pkg/tempopb/tempo.proto) 使用 proto3 uint32 job 计数，[HTTP combiner](https://github.com/grafana/tempo/blob/v2.9.0/modules/frontend/combiner/common.go) 使用默认 jsonpb.Marshaler，零字段会省略。工具仅将明确存在的空 metrics 对象且没有 Trace 的响应识别为合法零 job 空窗；metrics 整体缺失、null、异常类型、非法 job 值或真正未完成的窗口仍阻止完整枚举。该兼容修正不放宽 Trace 归属、时间、饱和搜索与请求预算检查。
+
+Tempo 2.9.0 的 [TraceID 编码](https://github.com/grafana/tempo/blob/v2.9.0/pkg/util/traceid.go) 会省略前导零，解析时支持奇数长度补零并还原 16 字节。历史工具接受 1–32 位非零十六进制 ID，统一小写并左补零到 32 位后去重、获取完整 Trace 和生成 allowlist；这是同一 128 位身份的规范表示。空值、非十六进制、超过 32 位和全零 ID 均阻止清理，整条 Trace 的服务及时间检查不变。
+
+Tempo 清单分别报告 enumeration_complete、inspection_complete、candidate/eligible/blocked/inspected/uninspected 数量。完成全部枚举和逐条检查后，纯 N-Agent 且全部 Span 在窗口内的 ID 才进入 eligible_trace_ids；混合服务、未知资源或时间、跨窗 Trace 留在 blocked_traces 并记录 ID 与原因。存在受阻 Trace 时整体仍为 partially_eligible_with_blocked_residual，不能称清理完成；官方 dry_run_argv 仅包含安全组，运维冻结后再次验证。枚举或检查失败、预算不足时不输出可执行 allowlist，已检查数量只是诊断，不代表剩余候选安全；枚举未完成时 candidate_count 只是已发现数量。脚本仍不自行执行 Tempo 删除，原有证据清单不覆盖。
 
 ## 验收清单
 
@@ -215,6 +502,7 @@ GenAI 采用 `telemetry_semantics.py` 声明的草案依据，变更时集中迁
 
 | 文件 | 职责 |
 |---|---|
+| `app/application/telemetry_contract.py` | 固定对象、操作、结果、内容字段、精确属性集合及属性类型 |
 | `app/application/telemetry_semantics.py` | Span、指标、业务完成日志与实时现场 |
 | `app/application/telemetry_details.py` | 固定详情投影、脱敏与限长 |
 | `app/infrastructure/observability/instrumentors.py` | 自动埋点、请求范围、HTTP 完成时机 |

@@ -131,20 +131,20 @@ async def test_logging_sink_outputs_only_allowed_fields(caplog):
     payload = json.loads(log_records[0].args[0])
 
     expected_keys = {
-        "policy", "version", "decision_kind", "reason", "outcome",
-        "run_id", "session_id", "policy_scope", "occurred_at",
+        "nagent.policy.name", "nagent.policy.version", "nagent.policy.decision_kind", "nagent.policy.reason", "nagent.policy.outcome",
+        "nagent.policy.scope", "nagent.policy.occurred_at",
     }
     assert set(payload.keys()) == expected_keys
 
-    assert payload["policy"] == "tool"
-    assert payload["version"] == "tool-v1"
-    assert payload["decision_kind"] == "admission"
-    assert payload["reason"] == "safe_tool"
-    assert payload["outcome"] == "allow"
-    assert payload["run_id"] == "run-1"
-    assert payload["session_id"] == "s1"
-    assert payload["policy_scope"] == "system"
-    assert payload["occurred_at"] == "2026-07-14T00:00:00Z"
+    assert payload["nagent.policy.name"] == "tool"
+    assert payload["nagent.policy.version"] == "tool-v1"
+    assert payload["nagent.policy.decision_kind"] == "admission"
+    assert payload["nagent.policy.reason"] == "safe_tool"
+    assert payload["nagent.policy.outcome"] == "allow"
+    assert "nagent.agent.run_id" not in payload
+    assert "gen_ai.conversation.id" not in payload
+    assert payload["nagent.policy.scope"] == "system"
+    assert payload["nagent.policy.occurred_at"] == "2026-07-14T00:00:00Z"
 
 
 async def test_logging_sink_does_not_leak_sensitive_fields(caplog):
@@ -204,8 +204,8 @@ async def test_logging_sink_serializes_none_outcome_for_non_admission(caplog):
 
     assert log_records[0].msg == "policy_decision %s"
     payload = json.loads(log_records[0].args[0])
-    assert payload["outcome"] is None
-    assert payload["decision_kind"] == "plan"
+    assert payload["nagent.policy.outcome"] is None
+    assert payload["nagent.policy.decision_kind"] == "plan"
 
 
 def test_logging_sink_conforms_to_policy_audit_sink_protocol():

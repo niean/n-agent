@@ -122,10 +122,10 @@ async def test_anthropic_nonempty_initial_input_is_omitted_without_serialization
         result = [e async for e in stream]
         assert result[-1].finish_reason == 'tool_calls'
         attrs = tracer.spans[0].attributes
-        assert not attrs.get('nagent.details.output_messages.incomplete', False)
+        assert not attrs.get('nagent.content.output_messages_incomplete', False)
         assert 'initial-sensitive' not in str(attrs)
-        assert 'lookup' in attrs['nagent.details.output_messages.content']
-        assert '[REDACTED]' in attrs['nagent.details.output_messages.content']
+        assert 'lookup' in attrs['nagent.content.output_messages']
+        assert '[REDACTED]' in attrs['nagent.content.output_messages']
     finally:
         configure_details(None)
 
@@ -171,12 +171,12 @@ async def test_stream_lifecycle_content_details_are_bounded_and_fail_closed(kind
             _ = [event async for event in stream]
         attrs = tracer.spans[0].attributes
         assert 'never-export' not in str(attrs)
-        prefix = 'nagent.details.output_messages.'
-        assert attrs[prefix + 'truncated'] is (termination != 'complete')
+        prefix = 'nagent.content.output_messages'
+        assert attrs[prefix + '_truncated'] is (termination != 'complete')
         if termination != 'complete':
-            assert attrs[prefix + 'incomplete'] is True
+            assert attrs[prefix + '_incomplete'] is True
         else:
-            assert 'lookup' in attrs[prefix + 'content']
+            assert 'lookup' in attrs[prefix]
         assert tracer.spans[0].ended == 1
     finally:
         configure_details(None)

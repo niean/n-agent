@@ -3857,7 +3857,7 @@ class TestOrchestrationReplay:
         out = capsys.readouterr().out
         assert f"REPORT_DIR {tmp_path / 'reports' / 'testrun1'}" in out
         assert f"RESULT_FILE {tmp_path / 'reports' / 'testrun1' / 'result.md'}" in out
-        assert "Summary（结果行）: PASS 1 | FAIL 0 | SKIP 0" in out
+        assert "最终结果：全部通过（1/1）；其中0/1个用例进行了重试。" in out
         assert "| 分类 |" not in out
         report = _run_report(tmp_path, tmp_path / "reports")
         assert report["run_id"] == "testrun1"

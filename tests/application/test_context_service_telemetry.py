@@ -1,6 +1,6 @@
 """T5 telemetry wiring tests: ContextService compression.
 
-Covers (plan T5 S1): compress span + nagent.context.compressions counter
+Covers (plan T5 S1): compress span + nagent.context.compression_attempts counter
 with compressed / skipped / failed outcomes; the compression LLM chat span
 (parent of the compress span) nests under it via the current span context.
 """
@@ -175,7 +175,7 @@ def _service(engine, telemetry):
 
 
 def _compressions(meter):
-    return meter.counters["nagent.context.compressions"].records
+    return meter.counters["nagent.context.compression_attempts"].records
 
 
 @pytest.mark.asyncio
@@ -187,18 +187,18 @@ async def test_compression_compressed_outcome_and_parent_chat_span(tracer, meter
     state = await service.compress_prepared_context(_state())
 
     assert state.summary  # compression applied
-    spans = tracer.by_name("nagent.context.compress")
+    spans = tracer.by_name("context.compress")
     assert len(spans) == 1
     span = spans[0]
     assert span.ended == 1
-    assert span.attributes[ts.NAGENT_OUTCOME] == "compressed"
-    assert span.attributes[ts.NAGENT_BEFORE_TOKENS] == 1200
-    assert span.attributes[ts.NAGENT_AFTER_TOKENS] == 200
-    assert _compressions(meter) == [(1, {"nagent.outcome": "compressed"})]
+    assert span.attributes[ts.NAGENT_CONTEXT_OUTCOME] == "success"
+    assert span.attributes[ts.NAGENT_CONTEXT_BEFORE_TOKENS] == 1200
+    assert span.attributes[ts.NAGENT_CONTEXT_AFTER_TOKENS] == 200
+    assert _compressions(meter) == [(1, {"nagent.context.outcome": "success"})]
     # the compression chat span is a child of the compress span
     chat_spans = tracer.by_name("chat gpt-4o")
     assert len(chat_spans) == 1
-    assert chat_spans[0].parent_name == "nagent.context.compress"
+    assert chat_spans[0].parent_name == "context.compress"
 
 
 @pytest.mark.asyncio
@@ -209,9 +209,9 @@ async def test_compression_skipped_outcome(tracer, meter):
 
     state = await service.compress_prepared_context(_state())
 
-    span = tracer.by_name("nagent.context.compress")[0]
-    assert span.attributes[ts.NAGENT_OUTCOME] == "skipped"
-    assert _compressions(meter) == [(1, {"nagent.outcome": "skipped"})]
+    span = tracer.by_name("context.compress")[0]
+    assert span.attributes[ts.NAGENT_CONTEXT_OUTCOME] == "skipped"
+    assert _compressions(meter) == [(1, {"nagent.context.outcome": "skipped"})]
 
 
 @pytest.mark.asyncio
@@ -223,10 +223,10 @@ async def test_compression_failed_outcome_on_engine_error(tracer, meter):
     with pytest.raises(RuntimeError):
         await service.compress_prepared_context(_state())
 
-    span = tracer.by_name("nagent.context.compress")[0]
+    span = tracer.by_name("context.compress")[0]
     assert span.ended == 1
-    assert span.attributes[ts.NAGENT_OUTCOME] == "failed"
-    assert _compressions(meter) == [(1, {"nagent.outcome": "failed"})]
+    assert span.attributes[ts.NAGENT_CONTEXT_OUTCOME] == "failure"
+    assert _compressions(meter) == [(1, {"nagent.context.outcome": "failure"})]
 
 
 @pytest.mark.asyncio
@@ -239,8 +239,8 @@ async def test_no_compression_plan_records_nothing(tracer, meter):
     state.run_options = {}  # no force; short context -> plan.compression is None
     await service.compress_prepared_context(state)
 
-    assert tracer.by_name("nagent.context.compress") == []
-    assert "nagent.context.compressions" not in meter.counters
+    assert tracer.by_name("context.compress") == []
+    assert "nagent.context.compression_attempts" not in meter.counters
 
 
 @pytest.mark.asyncio

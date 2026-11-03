@@ -26,7 +26,7 @@ def check(trace, records, series=None):
     for operation, count in expected.items():
         assert sum(s["name"].split()[0] == operation for s in spans) == count, "unexpected span count"
     expected_ids = {s["spanId"] for s in spans}
-    delivered = [r for r in records if r.get("event") == "execution_completed" and r.get("trace_id") == trace["traceId"] and r.get("span_id") in expected_ids]
+    delivered = [r for r in records if r.get("event") in {"nagent.agent.completed", "nagent.model.completed", "nagent.tool.completed"} and r.get("trace_id") == trace["traceId"] and r.get("span_id") in expected_ids]
     assert len(delivered) == 4, "expected four completion records"
     for span in spans:
         matches = [r for r in delivered if r.get("span_id") == span["spanId"]]
@@ -34,12 +34,14 @@ def check(trace, records, series=None):
         record = matches[0]
         fields = execution_fields(record)
         attrs = span["attrs"]
-        assert fields.get("operation") == span["name"].split()[0], "operation mismatch"
-        for field, attr in (("summary", "nagent.summary"), ("session_id", "gen_ai.conversation.id"), ("request_id", "nagent.run_id")):
+        obj = {"invoke_agent": "agent", "chat": "model", "execute_tool": "tool"}[span["name"].split()[0]]
+        assert fields.get("gen_ai.operation.name") == span["name"].split()[0], "operation mismatch"
+        summary = f"nagent.{obj}.summary"
+        for field, attr in ((summary, summary), ("gen_ai.conversation.id", "gen_ai.conversation.id"), ("nagent.agent.run_id", "nagent.agent.run_id")):
             assert fields.get(field) and fields[field] == attrs.get(attr), "completion field differs from span"
-        assert len(fields["summary"]) <= 512, "summary exceeds bound"
-        assert isinstance(fields.get("duration_ms"), (int, float)) and fields["duration_ms"] >= 0, "duration missing"
-        assert fields.get("outcome"), "outcome missing"
+        assert len(fields[summary]) <= 512, "summary exceeds bound"
+        assert isinstance(fields.get(f"nagent.{obj}.duration_ms"), (int, float)) and fields[f"nagent.{obj}.duration_ms"] >= 0, "duration missing"
+        assert fields.get(f"nagent.{obj}.outcome"), "outcome missing"
     # /series returns real indexed labels; query_range stream can also contain
     # structured metadata and therefore cannot establish index cardinality.
     forbidden = {"session_id", "request_id", "summary", "trace_id", "span_id", "nagent_run_id", "nagent_summary", "gen_ai_conversation_id"}
@@ -80,11 +82,11 @@ def fetch(trace_id, start, compose_script=None):
                 assert payload.get("status") == "success", "Loki query failed"
                 return payload["data"]
             records = []
-            data = query("query_range", {"query": selector + ' |= "execution_completed" |= ' + json.dumps(trace_id), "start": start, "end": str(time.time_ns()), "limit": "1000"})
+            data = query("query_range", {"query": selector + ' |~ "nagent[.](agent|model|tool)[.]completed" |= ' + json.dumps(trace_id), "start": start, "end": str(time.time_ns()), "limit": "1000"})
             for stream in data["result"]:
                 for value in stream["values"]:
                     records.append(json.loads(value[1]))
-            if len({r.get("span_id") for r in records if r.get("event") == "execution_completed" and r.get("trace_id") == trace_id and execution_fields(r).get("request_id")}) == 4:
+            if len({r.get("span_id") for r in records if r.get("event") in {"nagent.agent.completed", "nagent.model.completed", "nagent.tool.completed"} and r.get("trace_id") == trace_id and execution_fields(r).get("nagent.agent.run_id")}) == 4:
                 series = query("series", {"match[]": selector, "start": start, "end": str(time.time_ns())})
                 return {"records": records, "series": series}
         except (OSError, ValueError, AssertionError, subprocess.SubprocessError) as error:

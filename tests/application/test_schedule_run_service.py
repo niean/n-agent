@@ -550,16 +550,16 @@ async def test_schedule_span_contains_agent_and_delivery(monkeypatch, entry):
         else:
             await service.run_due_claims(now=NOW)
         spans = exporter.get_finished_spans()
-        schedule = next((s for s in spans if s.name == "schedule.execute"), None)
+        schedule = next((s for s in spans if s.name == "schedule.run"), None)
         assert schedule is not None, "scheduled execution must have an entry span"
         agent = next(s for s in spans if s.name == "invoke_agent n-agent")
         assert agent.parent.span_id == schedule.context.span_id
         assert contexts[0].trace_id == contexts[1].trace_id == schedule.context.trace_id
         assert contexts[1].span_id == schedule.context.span_id
         assert schedule.attributes["nagent.schedule.task_id"] == "task-1"
-        assert schedule.attributes["nagent.outcome"] == "succeeded"
-        assert "summarize" in schedule.attributes["nagent.details.input_messages.content"]
-        assert "done" in schedule.attributes["nagent.details.output_messages.content"]
+        assert schedule.attributes["nagent.schedule.outcome"] == "success"
+        assert "summarize" in schedule.attributes["nagent.content.input_messages"]
+        assert "done" in schedule.attributes["nagent.content.output_messages"]
         assert not trace.get_current_span().get_span_context().is_valid
     finally:
         provider.shutdown()

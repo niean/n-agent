@@ -1,4 +1,6 @@
 """Execution context survives both log outlets without trusting record extras."""
+from tests.infrastructure.observability._contract import configure
+
 import json
 import logging
 import sys
@@ -11,10 +13,10 @@ from app.infrastructure.observability import logging as obs
 @pytest.fixture(autouse=True)
 def empty_context():
     if hasattr(obs, "configure_execution_context"):
-        obs.configure_execution_context(None)
+        configure(None)
     yield
     if hasattr(obs, "configure_execution_context"):
-        obs.configure_execution_context(None)
+        configure(None)
 
 
 def record():
@@ -22,6 +24,7 @@ def record():
                             "untrusted %s", ("secret-content",), None)
     rec.session_id = "spoofed-session"
     rec.summary = "secret-summary"
+    setattr(rec, "nagent.agent.summary", "spoofed-canonical-summary")
     return rec
 
 
@@ -30,7 +33,9 @@ def test_same_safe_fields_in_stderr_and_otlp_projection():
     expected = {"session_id": "s1", "request_id": "r1", "source": "dashboard",
                 "operation": "invoke_agent", "summary": "Agent 完成", "duration_ms": 12.5,
                 "inference_calls": 2, "tool_calls": 1, "usage_known": False}
-    obs.configure_execution_context(lambda: dict(expected, arbitrary="secret-extra"))
+    configure(lambda expected=dict(expected): dict(expected, agent_source="dashboard", agent_run_id="r1", arbitrary="secret-extra"))
+    from app.application.telemetry_contract import project_execution_attributes
+    expected = project_execution_attributes(dict(expected, agent_source="dashboard", agent_run_id="r1"))
     original = record()
     payload = json.loads(obs.SafeEventJsonFormatter().format(original))
     projected = obs.project_record(original)
@@ -47,20 +52,23 @@ def test_untrusted_extra_does_not_create_summary():
     payload = json.loads(obs.SafeEventJsonFormatter().format(record()))
     projected = obs.project_record(record())
     assert "summary" not in payload and not hasattr(projected, "summary")
-    assert payload["session_id"] != "spoofed-session"
+    assert "nagent.agent.summary" not in payload and not hasattr(projected, "nagent.agent.summary")
+    assert payload.get("gen_ai.conversation.id") != "spoofed-session"
 
 
 def test_callback_failure_is_safe_and_wrong_types_are_rejected():
     assert callable(getattr(obs, "configure_execution_context", None))
     def broken():
         raise RuntimeError("secret")
-    obs.configure_execution_context(broken)
+    configure(broken)
     assert obs.project_record(record()).msg == obs.UNKNOWN_EVENT_CODE
     assert "secret" not in obs.SafeEventJsonFormatter().format(record())
-    obs.configure_execution_context(lambda: {"summary": {"secret": "x"}, "duration_ms": float("nan"),
-                                            "inference_calls": True, "request_id": ["secret"]})
+    configure(lambda: {"operation": "invoke_agent", "summary": {"secret": "x"}, "duration_ms": float("nan"),
+                       "inference_calls": True, "agent_run_id": ["secret"]})
     payload = json.loads(obs.SafeEventJsonFormatter().format(record()))
-    assert not any(key in payload for key in ("summary", "duration_ms", "inference_calls", "request_id"))
+    projected = obs.project_record(record())
+    keys = ("nagent.agent.summary", "nagent.agent.duration_ms", "nagent.agent.inference_calls", "nagent.agent.run_id")
+    assert not any(key in payload or hasattr(projected, key) for key in keys)
 
 
 def test_real_completed_event_matches_span_and_restores_context(monkeypatch):
@@ -69,7 +77,7 @@ def test_real_completed_event_matches_span_and_restores_context(monkeypatch):
     assert callable(getattr(obs, "configure_execution_context", None))
     tracer = FakeTracer()
     monkeypatch.setattr(ts, "get_tracer", lambda: tracer)
-    obs.configure_execution_context(ts.execution_log_snapshot)
+    configure(ts.execution_log_snapshot)
     obs.register_safe_event(ts.EXECUTION_LOG_TEMPLATE, "execution_completed")
     records = []
     class Capture(logging.Handler):
@@ -86,12 +94,12 @@ def test_real_completed_event_matches_span_and_restores_context(monkeypatch):
     finally:
         logger.removeHandler(handler)
         logger.setLevel(previous)
-    completed = [(p, r) for p, r in records if p["event"] == "execution_completed"]
+    completed = [(p, r) for p, r in records if p["event"] == "nagent.agent.completed"]
     assert len(completed) == 1
     payload, projected = completed[0]
     span = next(s for s in tracer.spans if s.name.startswith("invoke_agent"))
-    assert payload["summary"] == span.attributes[ts.NAGENT_SUMMARY] == projected.summary
-    assert payload["session_id"] == "s1" and payload["request_id"] == "r1"
+    assert payload["nagent.agent.summary"] == span.attributes["nagent.agent.summary"] == getattr(projected, "nagent.agent.summary")
+    assert payload["gen_ai.conversation.id"] == "s1" and payload["nagent.agent.run_id"] == "r1"
     assert ts.execution_log_snapshot() == {}
 
 
@@ -176,7 +184,7 @@ def test_approved_details_are_identical_in_all_log_outlets(monkeypatch, ready_sa
     def snapshot():
         calls.append(True)
         return {'summary': 'done', 'details': details}
-    obs.configure_execution_context(snapshot, validate_details=validate_details, flatten_details=flatten_details)
+    configure(snapshot, validate_details=validate_details, flatten_details=flatten_details)
     rec = record()
     rec.details = {'user_message': {'content': 'spoofed'}}
     payload = json.loads(obs.SafeEventJsonFormatter().format(rec))
@@ -204,7 +212,30 @@ def test_approved_details_are_identical_in_all_log_outlets(monkeypatch, ready_sa
 def test_untrusted_details_and_unwired_validator_fail_closed():
     rec = record()
     rec.details = {'user_message': {'content': 'secret'}}
-    obs.configure_execution_context(lambda: {'details': rec.details})
+    configure(lambda: {'details': rec.details})
     payload = json.loads(obs.SafeEventJsonFormatter().format(rec))
     assert 'details' not in payload
-    assert not any(k.startswith('nagent.details.') for k in vars(obs.project_record(rec)))
+    assert not any(k.startswith('nagent.content.') for k in vars(obs.project_record(rec)))
+
+
+@pytest.mark.parametrize('snapshot,key', [
+    ({'summary': True}, 'nagent.agent.summary'),
+    ({'summary': ['not a summary']}, 'nagent.agent.summary'),
+    ({'duration_ms': True}, 'nagent.agent.duration_ms'),
+    ({'duration_ms': '12'}, 'nagent.agent.duration_ms'),
+    ({'inference_calls': True}, 'nagent.agent.inference_calls'),
+    ({'inference_calls': 2.5}, 'nagent.agent.inference_calls'),
+    ({'agent_run_id': ['not an ID']}, 'nagent.agent.run_id'),
+    ({'agent_run_id': 12}, 'nagent.agent.run_id'),
+    ({'usage_known': 1}, 'nagent.agent.usage_known'),
+    ({'outcome': False}, 'nagent.agent.outcome'),
+    ({'nagent.agent.outcome': False}, 'nagent.agent.outcome'),
+    ({'session_id': ['not a conversation']}, 'gen_ai.conversation.id'),
+])
+def test_canonical_attribute_types_are_enforced_by_the_single_projector(snapshot, key):
+    from app.application.telemetry_contract import project_execution_attributes
+    facts = {'operation': 'invoke_agent', **snapshot}
+    assert key not in project_execution_attributes(facts)
+    configure(lambda: facts)
+    assert key not in json.loads(obs.SafeEventJsonFormatter().format(record()))
+    assert not hasattr(obs.project_record(record()), key)

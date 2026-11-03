@@ -303,10 +303,17 @@ def _configure_execution_logging() -> None:
         configure_execution_context, register_safe_event,
     )
     from app.application.telemetry_details import validate_details, flatten_details, project_details
-    configure_execution_context(execution_log_snapshot, validate_details=validate_details,
+    from app.application.telemetry_contract import project_execution_attributes, completion_event, EXECUTION_ATTRIBUTE_KEYS, CONTENT_ATTRIBUTE_KEYS
+    from app.infrastructure.observability.setup import configure_ring_buffer_attributes, configure_semantics_registry
+    from app.application import telemetry_semantics
+    configure_semantics_registry(telemetry_semantics)
+    configure_ring_buffer_attributes(EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS)
+    configure_execution_context(execution_log_snapshot, project_context=project_execution_attributes,
+                                completion_event=completion_event, execution_keys=EXECUTION_ATTRIBUTE_KEYS,
+                                content_keys=CONTENT_ATTRIBUTE_KEYS, validate_details=validate_details,
                                 flatten_details=flatten_details, project_details=project_details)
     register_safe_event(EXECUTION_LOG_TEMPLATE, "execution_completed")
-    register_safe_event("budget_denied kind=%s", "budget_denied")
+    register_safe_event("budget_denied kind=%s", "nagent.budget.denied")
 
 
 def _wire_log_sanitizer(information_flow_service, max_bytes: int = 2048) -> None:
@@ -656,6 +663,7 @@ def build_application_services(
         # disabled path free of any OTel SDK import at module load.
         from app.infrastructure.observability.setup import configure_observability
 
+        _configure_execution_logging()
         observability_handle = configure_observability(settings)
     from app.application.telemetry_semantics import NoopTelemetry, SemanticsTelemetry
 

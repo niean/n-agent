@@ -46,6 +46,9 @@ from typing import Dict, Iterator, Optional
 from app.application.telemetry_details import (
     project_details, validate_details, flatten_details, StreamDetailsAccumulator,
 )
+from app.application.telemetry_contract import (
+    resolve_operation, normalize_outcome, project_execution_attributes, completion_event,
+)
 
 from opentelemetry import trace
 from opentelemetry import metrics
@@ -89,29 +92,29 @@ GEN_AI_TOOL_TYPE = "gen_ai.tool.type"
 # nagent.* supplement attributes (GenAI-uncovered project signals only)
 # ---------------------------------------------------------------------------
 
-NAGENT_SOURCE = "nagent.source"
-NAGENT_END_REASON = "nagent.end_reason"
-NAGENT_ITERATION = "nagent.iteration"
-NAGENT_RUN_ID = "nagent.run_id"
-NAGENT_POLICY_OUTCOME = "nagent.policy_outcome"
-NAGENT_RISK_LEVEL = "nagent.risk_level"
-NAGENT_USAGE_KNOWN = "nagent.usage_known"
-NAGENT_BEFORE_TOKENS = "nagent.before_tokens"
-NAGENT_AFTER_TOKENS = "nagent.after_tokens"
-NAGENT_OUTCOME = "nagent.outcome"
-NAGENT_KIND = "nagent.kind"
-NAGENT_SUMMARY = "nagent.summary"
-NAGENT_DURATION_MS = "nagent.duration_ms"
-NAGENT_MESSAGE_COUNT = "nagent.message_count"
-NAGENT_INFERENCE_CALLS = "nagent.inference_calls"
-NAGENT_TOOL_CALLS = "nagent.tool_calls"
-NAGENT_EXECUTED = "nagent.executed"
+NAGENT_AGENT_SOURCE = "nagent.agent.source"
+NAGENT_AGENT_END_REASON = "nagent.agent.end_reason"
+NAGENT_AGENT_ITERATION = "nagent.agent.iteration"
+NAGENT_AGENT_RUN_ID = "nagent.agent.run_id"
+NAGENT_TOOL_POLICY_OUTCOME = "nagent.tool.policy_outcome"
+NAGENT_TOOL_RISK_LEVEL = "nagent.tool.risk_level"
+NAGENT_MODEL_USAGE_KNOWN = "nagent.model.usage_known"
+NAGENT_CONTEXT_BEFORE_TOKENS = "nagent.context.before_tokens"
+NAGENT_CONTEXT_AFTER_TOKENS = "nagent.context.after_tokens"
+NAGENT_CONTEXT_OUTCOME = "nagent.context.outcome"
+NAGENT_BUDGET_KIND = "nagent.budget.kind"
+NAGENT_AGENT_SUMMARY = "nagent.agent.summary"
+NAGENT_AGENT_DURATION_MS = "nagent.agent.duration_ms"
+NAGENT_AGENT_MESSAGE_COUNT = "nagent.agent.message_count"
+NAGENT_AGENT_INFERENCE_CALLS = "nagent.agent.inference_calls"
+NAGENT_AGENT_TOOL_CALLS = "nagent.agent.tool_calls"
+NAGENT_TOOL_EXECUTED = "nagent.tool.executed"
 
 EXECUTION_LOG_TEMPLATE = "execution_completed"
 logger = logging.getLogger(__name__)
 _execution_ids = contextvars.ContextVar("nagent_execution_ids", default=None)
 _completion = contextvars.ContextVar("nagent_completion", default=None)
-_message_count = contextvars.ContextVar("nagent_message_count", default=None)
+_message_count = contextvars.ContextVar("nagent.agent.message_count", default=None)
 
 # Live execution scene: current operation-scoped facts published by each
 # instrumented scope (Spec-261027). asyncio tasks copy the context, so
@@ -127,7 +130,7 @@ _scene_var: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
 _SCENE_OPERATION_MASK = frozenset({
     "operation", "model", "provider", "stream", "tool", "call_id",
     "risk_level", "policy_outcome", "executed", "outcome", "finish_reason",
-    "summary", "error_type", "end_reason", "usage_known",
+    "summary", "error_type", "end_reason", "usage_known", "message_count", "duration_ms",
     "inference_calls", "tool_calls", "input_tokens", "output_tokens",
 })
 
@@ -165,7 +168,7 @@ def _scene_publish(overrides: Dict[str, object]) -> None:
     """Re-publish scene with ``overrides`` mid-scope (business-confirmed facts
     such as executed/policy_outcome/usage). The scope's enter token still
     restores the parent on exit."""
-    current = _scene_var.get() or {}
+    current = dict(_scene_var.get() or {})
     current.update({k: v for k, v in overrides.items() if v is not None})
     _scene_var.set(current)
 
@@ -176,15 +179,11 @@ def _complete(span, operation, start, *, details=None, **facts):
         projected = validate_details(details)
         if projected:
             facts['details'] = projected
-            for key, value in flatten_details(projected).items():
-                try:
-                    span.set_attribute(key, value)
-                except Exception:
-                    pass
         facts = {k: v for k, v in facts.items() if v is not None}
         facts.update(operation=operation, duration_ms=max(0.0, (time.monotonic() - start) * 1000))
         duration = facts["duration_ms"]
-        outcome = facts.get("outcome", "other")
+        outcome = normalize_outcome(facts.get("outcome"))
+        facts['outcome'] = outcome
         tokens = f"输入 Token {facts.get('input_tokens', '未知')}，输出 Token {facts.get('output_tokens', '未知')}"
         if operation == "invoke_agent":
             summary = (f"Agent 执行：{outcome}，结束原因 {facts.get('end_reason', 'other')}，"
@@ -208,20 +207,28 @@ def _complete(span, operation, start, *, details=None, **facts):
                        f"策略 {facts.get('policy_outcome', 'other')}；耗时 {duration:.1f} ms。")
         summary = summary[:512]
         facts["summary"] = summary
-        attributes = {
-            "summary": NAGENT_SUMMARY, "duration_ms": NAGENT_DURATION_MS,
-            "message_count": NAGENT_MESSAGE_COUNT, "inference_calls": NAGENT_INFERENCE_CALLS,
-            "tool_calls": NAGENT_TOOL_CALLS, "executed": NAGENT_EXECUTED,
-            "outcome": NAGENT_OUTCOME, "end_reason": NAGENT_END_REASON,
-            "usage_known": NAGENT_USAGE_KNOWN, "input_tokens": GEN_AI_USAGE_INPUT_TOKENS,
-            "output_tokens": GEN_AI_USAGE_OUTPUT_TOKENS, "error_type": "error.type",
-        }
-        for key, attribute in attributes.items():
-            if key in facts:
-                _set_attr(span, attribute, facts[key])
-        token = _completion.set(facts)
+        attributes = project_execution_attributes({**execution_log_snapshot(), **facts})
+        attributes.update(flatten_details(projected))
+        attributes = _sanitize_attributes(attributes)
+        for attribute, value in attributes.items():
+            try:
+                span.set_attribute(attribute, value)
+            except Exception:
+                pass
+        event = completion_event(operation)
         try:
-            logger.info(EXECUTION_LOG_TEMPLATE)
+            if event and span.is_recording():
+                span.add_event(event, attributes=attributes)
+        except Exception:
+            pass
+        if outcome in {'failure', 'timed_out'}:
+            try:
+                span.set_status(Status(StatusCode.ERROR))
+            except Exception:
+                pass
+        token = _completion.set({**facts, "_completion_event_emitted": True})
+        try:
+            logger.info(event or EXECUTION_LOG_TEMPLATE)
         finally:
             _completion.reset(token)
     except Exception:
@@ -270,9 +277,9 @@ INSTRUMENT_EXECUTE_TOOL_DURATION = "gen_ai.execute_tool.duration"
 INSTRUMENT_INVOKE_AGENT_DURATION = "gen_ai.invoke_agent.duration"
 INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS = "gen_ai.invoke_agent.inference_calls"
 INSTRUMENT_INVOKE_AGENT_TOOL_CALLS = "gen_ai.invoke_agent.tool_calls"
-INSTRUMENT_TURNS = "nagent.turns"
-INSTRUMENT_CONTEXT_COMPRESSIONS = "nagent.context.compressions"
-INSTRUMENT_BUDGET_DENIED = "nagent.budget.denied"
+INSTRUMENT_AGENT_RUNS = "nagent.agent.runs"
+INSTRUMENT_CONTEXT_COMPRESSION_ATTEMPTS = "nagent.context.compression_attempts"
+INSTRUMENT_BUDGET_DENIALS = "nagent.budget.denials"
 
 
 INSTRUMENTS: Dict[str, Instrument] = {
@@ -348,37 +355,37 @@ INSTRUMENTS: Dict[str, Instrument] = {
             name=INSTRUMENT_INVOKE_AGENT_DURATION,
             kind="histogram",
             unit="s",
-            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_SOURCE, "error.type"),
+            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_AGENT_SOURCE, "error.type"),
         ),
         Instrument(
             name=INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS,
             kind="histogram",
             unit="{inference_call}",
-            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_SOURCE),
+            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_AGENT_SOURCE),
         ),
         Instrument(
             name=INSTRUMENT_INVOKE_AGENT_TOOL_CALLS,
             kind="histogram",
             unit="{tool_call}",
-            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_SOURCE),
+            allowed_dimensions=(GEN_AI_AGENT_NAME, NAGENT_AGENT_SOURCE),
         ),
         Instrument(
-            name=INSTRUMENT_TURNS,
+            name=INSTRUMENT_AGENT_RUNS,
             kind="counter",
             unit="1",
-            allowed_dimensions=(NAGENT_SOURCE, NAGENT_END_REASON),
+            allowed_dimensions=(NAGENT_AGENT_SOURCE, NAGENT_AGENT_END_REASON),
         ),
         Instrument(
-            name=INSTRUMENT_CONTEXT_COMPRESSIONS,
+            name=INSTRUMENT_CONTEXT_COMPRESSION_ATTEMPTS,
             kind="counter",
             unit="1",
-            allowed_dimensions=(NAGENT_OUTCOME,),
+            allowed_dimensions=(NAGENT_CONTEXT_OUTCOME,),
         ),
         Instrument(
-            name=INSTRUMENT_BUDGET_DENIED,
+            name=INSTRUMENT_BUDGET_DENIALS,
             kind="counter",
             unit="1",
-            allowed_dimensions=(NAGENT_KIND,),
+            allowed_dimensions=(NAGENT_BUDGET_KIND,),
         ),
     )
 }
@@ -514,11 +521,20 @@ def map_provider_name(provider: object) -> str:
 
 
 def map_source(source: object) -> str:
-    return _safe_known(source, _KNOWN_SOURCES)
+    return source if isinstance(source, str) and source in _KNOWN_SOURCES - {'chat', 'http'} else 'unknown'
 
 
 def map_outcome(outcome: object) -> str:
-    return _safe_known(outcome, _KNOWN_OUTCOMES)
+    return normalize_outcome(outcome)
+
+
+def _operation_outcome(exc, value):
+    """Actual terminal exceptions take precedence over any earlier result."""
+    return normalize_outcome(
+        'failure' if exc is not None else value,
+        cancelled=isinstance(exc, (asyncio.CancelledError, GeneratorExit)),
+        timed_out=isinstance(exc, TimeoutError),
+    )
 
 
 def map_end_reason(end_reason: object) -> str:
@@ -611,19 +627,19 @@ def unregister_model_name(model: str) -> None:
 
 
 def invoke_agent_span_name() -> str:
-    return f"invoke_agent {DEFAULT_AGENT_NAME}"
+    return f"{resolve_operation('invoke_agent').span_name} {DEFAULT_AGENT_NAME}"
 
 
 def chat_span_name(model: object) -> str:
-    return f"chat {map_model_name(model)}"
+    return f"{resolve_operation('chat').span_name} {map_model_name(model)}"
 
 
 def execute_tool_span_name(tool: object) -> str:
-    return f"execute_tool {map_tool_name(tool)}"
+    return f"{resolve_operation('execute_tool').span_name} {map_tool_name(tool)}"
 
 
 def compress_span_name() -> str:
-    return "nagent.context.compress"
+    return resolve_operation('context_compression').span_name
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +665,7 @@ _OVERFLOW_SERIES_KEY = ("__nagent_overflow__",)
 
 # Reserved overflow dimension key (double-underscore namespaced so it can
 # never collide with a real dimension).
-OVERFLOW_DIMENSIONS: Dict[str, str] = {"__nagent.overflow__": "true"}
+OVERFLOW_DIMENSIONS: Dict[str, str] = {"nagent.metric.overflow": True}
 
 _dimension_series: Dict[str, set] = {}
 _dimension_guard_lock = threading.Lock()
@@ -734,20 +750,36 @@ def configure_span_attribute_sanitizer(callable_) -> None:
         _span_attr_sanitizer = callable_ if callable(callable_) else None
 
 
-def _set_attr(span, key: str, value) -> None:
-    try:
-        if isinstance(value, str):
-            with _span_attr_sanitizer_lock:
-                sanitizer = _span_attr_sanitizer
+def _sanitize_attributes(attributes):
+    """Return one fail-closed set for every public attribute consumer."""
+    with _span_attr_sanitizer_lock:
+        sanitizer = _span_attr_sanitizer
+    sanitized = {}
+    for key, value in attributes.items():
+        try:
             if sanitizer is not None:
-                value = sanitizer(value)
-                if not isinstance(value, str):
-                    # A non-str return violates the contract; drop the attr so
-                    # a bad/adversarial sanitizer can never inject data.
-                    return
-        span.set_attribute(key, value)
-    except Exception:  # observability-only failure must never affect business
-        pass
+                if isinstance(value, str):
+                    value = sanitizer(value)
+                    if not isinstance(value, str):
+                        continue
+                elif isinstance(value, (list, tuple)):
+                    strings = [sanitizer(item) if isinstance(item, str) else item for item in value]
+                    if any(isinstance(original, str) and not isinstance(clean, str)
+                           for original, clean in zip(value, strings)):
+                        continue
+                    value = tuple(strings)
+            sanitized[key] = value
+        except Exception:
+            continue
+    return sanitized
+
+
+def _set_attr(span, key: str, value) -> None:
+    for attribute, sanitized in _sanitize_attributes({key: value}).items():
+        try:
+            span.set_attribute(attribute, sanitized)
+        except Exception:
+            pass
 
 
 def _safe_error_type(exc: BaseException) -> str:
@@ -757,7 +789,8 @@ def _safe_error_type(exc: BaseException) -> str:
 def _mark_span_error(span, exc: BaseException) -> None:
     """Record a safe error type only -- no messages, no stacktraces."""
     try:
-        span.set_status(Status(StatusCode.ERROR))
+        if not isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+            span.set_status(Status(StatusCode.ERROR))
         span.set_attribute("error.type", _safe_error_type(exc))
     except Exception:
         pass
@@ -767,7 +800,7 @@ def _start_span(name: str, kind: SpanKind, **kwargs):
     try:
         span = get_tracer().start_span(name, kind=kind, **kwargs)
         ids = _execution_ids.get() or {}
-        for key, attribute in (("session_id", GEN_AI_CONVERSATION_ID), ("request_id", NAGENT_RUN_ID), ("source", NAGENT_SOURCE)):
+        for key, attribute in (("session_id", GEN_AI_CONVERSATION_ID), ("agent_run_id", NAGENT_AGENT_RUN_ID), ("agent_source", NAGENT_AGENT_SOURCE)):
             if key in ids:
                 _set_attr(span, attribute, ids[key])
         return span
@@ -809,8 +842,6 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
     Explicit carriers never fall back to the worker/tick's ambient context.
     Only trusted server identifiers and bounded outcomes reach telemetry.
     """
-    if operation not in _BUSINESS_OPERATIONS:
-        raise ValueError("unknown business telemetry operation")
     kwargs = {}
     try:
         if parent_carrier is not None:
@@ -822,13 +853,22 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
                 kwargs["links"] = [Link(parent)]
     except Exception:
         kwargs = {"context": Context()} if detached or parent_carrier is not None else {}
+    inherited_ids = dict(_execution_ids.get() or {}) if not detached and parent_carrier is None else {}
     variables = (_iteration_var, _run_stats_var, _execution_ids, _completion, _message_count, _scene_var)
     cleared = [(variable, variable.set(None)) for variable in variables]
-    ids = {k: v for k, v in {"source": map_source(source) if source else None,
-           "session_id": _safe_id(session_id), "request_id": _safe_id(run_id)}.items() if v is not None}
+    spec = resolve_operation(operation)
+    ids = {k: v for k, v in {"session_id": _safe_id(session_id),
+           'run_id' if spec and spec.object == 'task' else 'id': _safe_id(run_id)}.items() if v is not None}
+    ids.update({key: value for key, value in inherited_ids.items() if key in {'agent_run_id', 'agent_source'}})
+    ids.update({key: value for key, value in (identifiers or {}).items() if key in _BUSINESS_IDENTIFIERS})
     _execution_ids.set(ids)
     _scene_var.set({"operation": operation})
-    span = _start_span(operation, SpanKind.INTERNAL, **kwargs)
+    span_name = spec.span_name if spec else 'unknown'
+    if spec and spec.object == 'memory' and ' ' in operation:
+        span_name += ' ' + operation.split(' ', 1)[1]
+    span = _start_span(span_name, SpanKind.INTERNAL, **kwargs)
+    for key, value in project_execution_attributes({**ids, 'operation': operation}).items():
+        _set_attr(span, key, value)
     for key, value in (identifiers or {}).items():
         if key in _BUSINESS_IDENTIFIERS:
             _set_attr(span, key, _safe_id(str(value)) or "other")
@@ -838,11 +878,13 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
         with _span_scope(span):
             try:
                 yield facts
-            except (asyncio.CancelledError, GeneratorExit):
-                facts["outcome"] = "cancelled"
+            except (asyncio.CancelledError, GeneratorExit) as exc:
+                facts["outcome"] = _operation_outcome(exc, None)
+                facts['error_type'] = _safe_error_type(exc)
                 raise
             except BaseException as exc:
-                facts["outcome"] = "error"
+                facts["outcome"] = _operation_outcome(exc, None)
+                facts['error_type'] = _safe_error_type(exc)
                 try:
                     facts.setdefault("details", {}).update(project_details(error=str(exc)))
                 except Exception:
@@ -851,13 +893,15 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
                 raise
             finally:
                 outcome = facts.get("outcome", "success")
-                outcome = outcome if outcome in _BUSINESS_OUTCOMES else "other"
+                if spec and spec.object == 'task' and outcome in {'running', 'waiting_approval', 'blocked'}:
+                    facts.setdefault('state', outcome)
+                outcome = normalize_outcome(outcome)
                 if outcome in {"error", "failed", "timed_out", "crashed"}:
                     try:
                         span.set_status(Status(StatusCode.ERROR))
                     except Exception:
                         pass
-                _complete(span, operation, start, outcome=outcome, details=facts.get("details"))
+                _complete(span, operation, start, **{**facts, 'outcome': outcome})
     finally:
         _end_span(span)
         for variable, token in reversed(cleared):
@@ -865,7 +909,7 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
 
 
 _BUSINESS_OPERATIONS = {
-    "cli.request": "CLI 请求处理",
+    "cli.request": "CLI 请求处理", "acp.request": "ACP 请求处理",
     "gateway.message": "网关消息处理", "feishu.event": "飞书事件处理",
     "task.run": "后台任务执行", "delegation.member": "委派成员执行",
     "task.submit": "任务提交",
@@ -891,7 +935,7 @@ def memory_operation(operation, provider, *, session_id=None, **inputs):
         raise ValueError("unknown memory telemetry operation")
     provider = provider if provider in _MEMORY_PROVIDERS else "other"
     inherited = _execution_ids.get() or {}
-    with business_operation(f"memory.{operation} {provider}", source=inherited.get("source"),
+    with business_operation(f"memory.{operation} {provider}", source=inherited.get("agent_source"),
                             session_id=session_id or inherited.get("session_id")) as facts:
         facts["details"] = project_details(**inputs)
         token = _memory_facts.set(facts)
@@ -953,11 +997,14 @@ def task_trace_context_status(carrier):
 @contextmanager
 def schedule_execution_span(task_id: str, session_id: str, claim_id: str):
     """Keep the schedule lifecycle current through agent execution and delivery."""
-    span = _start_span("schedule.execute", SpanKind.INTERNAL)
-    _set_attr(span, NAGENT_SOURCE, "schedule")
+    span = _start_span("schedule.run", SpanKind.INTERNAL)
+    _set_attr(span, 'nagent.schedule.operation', 'run')
     _set_attr(span, GEN_AI_CONVERSATION_ID, _safe_id(session_id) or "other")
     _set_attr(span, "nagent.schedule.task_id", _safe_id(task_id) or "other")
     _set_attr(span, "nagent.schedule.claim_id", _safe_id(claim_id) or "other")
+    scene_token = _scene_set({'operation': 'schedule.execute', 'session_id': _safe_id(session_id),
+                             'nagent.schedule.task_id': _safe_id(task_id),
+                             'nagent.schedule.claim_id': _safe_id(claim_id)}, mask=True)
     result = {}
     start = time.monotonic()
     try:
@@ -965,7 +1012,8 @@ def schedule_execution_span(task_id: str, session_id: str, claim_id: str):
             try:
                 yield result
             except BaseException as exc:
-                result["status"] = "error"
+                result["status"] = _operation_outcome(exc, None)
+                result['error_type'] = _safe_error_type(exc)
                 try:
                     result.setdefault("details", {}).update(project_details(error=str(exc)))
                 except Exception:
@@ -975,6 +1023,7 @@ def schedule_execution_span(task_id: str, session_id: str, claim_id: str):
                 _complete(span, "schedule.execute", start,
                           details=result.get("details"),
                           outcome=result.get("status", "unknown"),
+                          error_type=result.get('error_type'),
                           delivery_status=result.get("delivery_status"))
                 if result.get("delivery_status"):
                     _set_attr(span, "nagent.schedule.delivery_status", result["delivery_status"])
@@ -983,6 +1032,7 @@ def schedule_execution_span(task_id: str, session_id: str, claim_id: str):
         raise
     finally:
         _end_span(span)
+        _scene_var.reset(scene_token)
 
 
 @contextmanager
@@ -998,9 +1048,9 @@ def invoke_agent_span(
     if session_id:
         _set_attr(span, GEN_AI_CONVERSATION_ID, _safe_id(session_id) or "other")
     if source:
-        _set_attr(span, NAGENT_SOURCE, map_source(source))
+        _set_attr(span, NAGENT_AGENT_SOURCE, map_source(source))
     if run_id:
-        _set_attr(span, NAGENT_RUN_ID, _safe_id(run_id) or "other")
+        _set_attr(span, NAGENT_AGENT_RUN_ID, _safe_id(run_id) or "other")
     try:
         with _span_scope(span):
             yield span
@@ -1030,7 +1080,7 @@ def chat_span(
     if stream is not None:
         _set_attr(span, GEN_AI_REQUEST_STREAM, stream)
     if iteration is not None:
-        _set_attr(span, NAGENT_ITERATION, iteration)
+        _set_attr(span, NAGENT_AGENT_ITERATION, iteration)
     try:
         with _span_scope(span):
             yield span
@@ -1052,18 +1102,19 @@ def execute_tool_span(
     policy_outcome: Optional[str] = None,
 ) -> Iterator[object]:
     span = _start_span(execute_tool_span_name(tool), SpanKind.INTERNAL)
+    _set_attr(span, GEN_AI_OPERATION_NAME, 'execute_tool')
     _set_attr(span, GEN_AI_TOOL_NAME, map_tool_name(tool))
     if call_id:
         _set_attr(span, GEN_AI_TOOL_CALL_ID, _safe_id(call_id) or "other")
     _set_attr(span, GEN_AI_TOOL_TYPE, tool_type)
     _set_attr(span, GEN_AI_AGENT_NAME, agent)
     if iteration is not None:
-        _set_attr(span, NAGENT_ITERATION, iteration)
+        _set_attr(span, NAGENT_AGENT_ITERATION, iteration)
     if risk_level is not None:
         level = RiskLevel.from_value(risk_level)
-        _set_attr(span, NAGENT_RISK_LEVEL, level.value if level else "other")
+        _set_attr(span, NAGENT_TOOL_RISK_LEVEL, level.value if level else "other")
     if policy_outcome:
-        _set_attr(span, NAGENT_POLICY_OUTCOME, policy_outcome)
+        _set_attr(span, NAGENT_TOOL_POLICY_OUTCOME, policy_outcome)
     try:
         with _span_scope(span):
             yield span
@@ -1083,11 +1134,11 @@ def compress_span(
     # GenAI has no context-compression convention; this is the project
     # supplement signal (single canonical name).
     span = _start_span(compress_span_name(), SpanKind.INTERNAL)
-    _set_attr(span, NAGENT_OUTCOME, map_outcome(outcome))
+    _set_attr(span, 'nagent.context.operation', 'compress')
     if before_tokens is not None:
-        _set_attr(span, NAGENT_BEFORE_TOKENS, before_tokens)
+        _set_attr(span, NAGENT_CONTEXT_BEFORE_TOKENS, before_tokens)
     if after_tokens is not None:
-        _set_attr(span, NAGENT_AFTER_TOKENS, after_tokens)
+        _set_attr(span, NAGENT_CONTEXT_AFTER_TOKENS, after_tokens)
     try:
         with _span_scope(span):
             yield span
@@ -1163,18 +1214,18 @@ def _error_dim(error_type: Optional[str]) -> Dict[str, str]:
 
 def record_turn(source: object, end_reason: object) -> None:
     _record(
-        INSTRUMENT_TURNS,
+        INSTRUMENT_AGENT_RUNS,
         1,
-        {NAGENT_SOURCE: map_source(source), NAGENT_END_REASON: map_end_reason(end_reason)},
+        {NAGENT_AGENT_SOURCE: map_source(source), NAGENT_AGENT_END_REASON: map_end_reason(end_reason)},
     )
 
 
 def record_context_compression(outcome: object) -> None:
-    _record(INSTRUMENT_CONTEXT_COMPRESSIONS, 1, {NAGENT_OUTCOME: map_outcome(outcome)})
+    _record(INSTRUMENT_CONTEXT_COMPRESSION_ATTEMPTS, 1, {NAGENT_CONTEXT_OUTCOME: map_outcome(outcome)})
 
 
 def record_budget_denied(kind: object) -> None:
-    _record(INSTRUMENT_BUDGET_DENIED, 1, {NAGENT_KIND: map_kind(kind)})
+    _record(INSTRUMENT_BUDGET_DENIALS, 1, {NAGENT_BUDGET_KIND: map_kind(kind)})
 
 
 def record_inference_duration(
@@ -1224,7 +1275,7 @@ def record_invoke_agent_durations_and_calls(
     source: object = None,
 ) -> None:
     error_dims = _error_dim(error_type)
-    dims = {GEN_AI_AGENT_NAME: agent, NAGENT_SOURCE: map_source(source)}
+    dims = {GEN_AI_AGENT_NAME: agent, NAGENT_AGENT_SOURCE: map_source(source)}
     _record(INSTRUMENT_INVOKE_AGENT_DURATION, seconds, {**dims, **error_dims})
     _record(
         INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS,
@@ -1261,6 +1312,7 @@ def record_inference_tokens(
     if modality is not None:
         base[GEN_AI_TOKEN_MODALITY] = modality
     op_dims = dict(base)
+    op_dims.pop(GEN_AI_TOKEN_MODALITY, None)
     op_dims.update(_error_dim(error_type))
     if input_tokens is not None and input_tokens >= 0:
         _record(INSTRUMENT_INFERENCE_INPUT_TOKENS, input_tokens, dict(base))
@@ -1291,7 +1343,7 @@ class _RunStats:
 
 
 _iteration_var: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
-    "nagent_iteration", default=None
+    "nagent.agent.iteration", default=None
 )
 _run_stats_var: contextvars.ContextVar[Optional[_RunStats]] = contextvars.ContextVar(
     "nagent_run_stats", default=None
@@ -1529,14 +1581,12 @@ class ChatAttempt:
                     _set_attr(self._span, GEN_AI_USAGE_OUTPUT_TOKENS, self._output_tokens)
                 _set_attr(
                     self._span,
-                    NAGENT_USAGE_KNOWN,
+                    NAGENT_MODEL_USAGE_KNOWN,
                     self._input_tokens is not None and self._output_tokens is not None,
                 )
                 if self._error_type is not None:
                     _set_attr(self._span, "error.type", map_error_type(self._error_type))
-            error_type = self._error_type
-            if error_type is None and exc is not None:
-                error_type = type(exc).__name__
+            error_type = type(exc).__name__ if exc is not None else self._error_type
             stats = current_run_stats()
             if stats is not None:
                 stats.input_known &= self._input_tokens is not None
@@ -1563,7 +1613,7 @@ class ChatAttempt:
                       finish_reason=self._finish_reason, input_tokens=self._input_tokens,
                       output_tokens=self._output_tokens,
                       usage_known=self._input_tokens is not None and self._output_tokens is not None,
-                      outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "error" if error_type else "success",
+                      outcome=_operation_outcome(exc, 'failure' if error_type else 'success'),
                       error_type=map_error_type(error_type) if error_type else None)
             record_inference_duration(
                 self._model, self._provider, self._operation, elapsed, error_type
@@ -1647,8 +1697,8 @@ class SemanticsTelemetry:
         stats = _RunStats()
         token = _run_stats_var.set(stats)
         ids_token = _execution_ids.set({k: v for k, v in {
-            "session_id": _safe_id(session_id), "request_id": _safe_id(run_id),
-            "source": map_source(source),
+            "session_id": _safe_id(session_id), "agent_run_id": _safe_id(run_id),
+            "agent_source": map_source(source),
         }.items() if v is not None})
         iteration_token = _iteration_var.set(None)
         count_token = _message_count.set(None)
@@ -1666,19 +1716,19 @@ class SemanticsTelemetry:
                     exc = caught
                     raise
                 finally:
-                    end_reason = map_end_reason(handle.end_reason or (
-                        "cancelled" if isinstance(exc, asyncio.CancelledError) else "error" if exc else "completed"))
+                    end_reason = map_end_reason(
+                        ('cancelled' if isinstance(exc, (asyncio.CancelledError, GeneratorExit)) else 'deadline' if isinstance(exc, TimeoutError) else 'error')
+                        if exc is not None else handle.end_reason or 'completed')
                     error_type = _safe_error_type(exc) if exc else None
-                    if isinstance(exc, asyncio.CancelledError) or end_reason == "cancelled":
+                    if end_reason == "cancelled":
                         outcome = "cancelled"
-                    elif exc is not None:
-                        outcome = "error"
                     elif handle.outcome is not None:
                         outcome = map_outcome(handle.outcome)
                     elif end_reason == "error":
                         outcome = "error"
                     else:
                         outcome = "success"
+                    outcome = _operation_outcome(exc, outcome)
                     _complete(span, "invoke_agent", start, details={**handle.details, **(project_details(error=str(exc)) if exc else {})}, message_count=message_count,
                               inference_calls=stats.inference_calls, tool_calls=stats.tool_calls,
                               input_tokens=stats.input_tokens if stats.input_known else None,
@@ -1729,24 +1779,19 @@ class SemanticsTelemetry:
                 finally:
                     if holder.get("outcome") is not None:
                         outcome = holder["outcome"]
-                    elif exc is not None:
-                        outcome = (
-                            "cancelled"
-                            if isinstance(exc, asyncio.CancelledError)
-                            else "error"
-                        )
                     elif holder.get("executed"):
                         outcome = "success"
                     else:
                         outcome = "denied"
+                    outcome = _operation_outcome(exc, outcome)
                     _set_attr(
-                        span, NAGENT_POLICY_OUTCOME, _safe_known(holder.get("policy_outcome") or "deny", frozenset({"allow", "deny", "approved", "require_approval"}))
+                        span, NAGENT_TOOL_POLICY_OUTCOME, _safe_known(holder.get("policy_outcome") or "deny", frozenset({"allow", "deny", "approved", "require_approval"}))
                     )
-                    _set_attr(span, NAGENT_OUTCOME, map_outcome(outcome))
+                    _set_attr(span, 'nagent.tool.outcome', map_outcome(outcome))
                     holder_risk = holder.get("risk_level")
                     if holder_risk is not None:
                         level = RiskLevel.from_value(holder_risk)
-                        _set_attr(span, NAGENT_RISK_LEVEL, level.value if level else "other")
+                        _set_attr(span, NAGENT_TOOL_RISK_LEVEL, level.value if level else "other")
                     stats = current_run_stats()
                     if stats is not None and holder.get("executed"):
                         stats.tool_calls += 1
@@ -1756,12 +1801,12 @@ class SemanticsTelemetry:
                               risk_level=level.value if level else "other",
                               policy_outcome=_safe_known(holder.get("policy_outcome") or "deny", frozenset({"allow", "deny", "approved", "require_approval"})),
                               executed=bool(holder.get("executed")), outcome=map_outcome(outcome),
-                              error_type=_safe_error_type(exc) if exc else "tool_error" if outcome == "error" else None)
+                              error_type=_safe_error_type(exc) if exc else "tool_error" if normalize_outcome(outcome) == "failure" else None)
                     try:
                         error_type = None
                         if exc is not None:
                             error_type = type(exc).__name__
-                        elif outcome == "error":
+                        elif normalize_outcome(outcome) == "failure":
                             # Error-status result without a real exception: use the
                             # safe sentinel, never a fabricated exception class name.
                             error_type = "tool_error"
@@ -1788,20 +1833,18 @@ class SemanticsTelemetry:
                 policy_outcome="deny",
                 iteration=current_iteration(),
             ) as span:
-                _set_attr(span, NAGENT_OUTCOME, "denied")
+                _set_attr(span, 'nagent.tool.outcome', "denied")
                 level = RiskLevel.from_value(risk_level)
                 _complete(span, "execute_tool", start, details=project_details(tool_arguments=arguments, tool_result=result), tool=map_tool_name(tool), call_id=_safe_id(call_id),
                           iteration=current_iteration(), risk_level=level.value if level else "other",
                           policy_outcome="deny", executed=False, outcome="denied", error_type="denied")
-            record_execute_tool_duration(
-                tool,
-                "function",
-                DEFAULT_AGENT_NAME,
-                time.monotonic() - start,
-                # "denied" sentinel: denied durations stay separable from
-                # successful ones in gen_ai.execute_tool.duration.
-                "denied",
-            )
+                record_execute_tool_duration(
+                    tool,
+                    "function",
+                    DEFAULT_AGENT_NAME,
+                    time.monotonic() - start,
+                    "denied",
+                )
         except Exception:
             pass
 
@@ -1809,7 +1852,11 @@ class SemanticsTelemetry:
 
     def record_budget_denied(self, kind):
         record_budget_denied(kind)
-        logger.warning("budget_denied kind=%s", map_kind(kind))
+        token = _completion.set({'_event': 'nagent.budget.denied', 'nagent.budget.kind': map_kind(kind)})
+        try:
+            logger.warning("budget_denied kind=%s", map_kind(kind))
+        finally:
+            _completion.reset(token)
 
     # -- context compression -------------------------------------------------
 
@@ -1828,27 +1875,20 @@ class SemanticsTelemetry:
                     exc = caught
                     raise
                 finally:
-                    if comp.get("outcome") is not None:
-                        outcome = comp["outcome"]
-                    elif exc is not None:
-                        outcome = "failed"
-                    else:
-                        outcome = "skipped"
-                    _set_attr(span, NAGENT_OUTCOME, map_outcome(outcome))
+                    outcome = _operation_outcome(exc, comp.get('outcome') or 'skipped')
+                    _set_attr(span, NAGENT_CONTEXT_OUTCOME, map_outcome(outcome))
                     if comp.get("before_tokens") is not None:
-                        _set_attr(span, NAGENT_BEFORE_TOKENS, comp["before_tokens"])
+                        _set_attr(span, NAGENT_CONTEXT_BEFORE_TOKENS, comp["before_tokens"])
                     if comp.get("after_tokens") is not None:
-                        _set_attr(span, NAGENT_AFTER_TOKENS, comp["after_tokens"])
+                        _set_attr(span, NAGENT_CONTEXT_AFTER_TOKENS, comp["after_tokens"])
                     _complete(span, "context_compression", start,
                               details=project_details(error=str(exc)) if exc else {},
                               outcome=outcome, before_tokens=comp.get("before_tokens"),
+                              error_type=_safe_error_type(exc) if exc is not None else None,
                               after_tokens=comp.get("after_tokens"))
+                    record_context_compression(outcome)
         finally:
             _scene_var.reset(scene_token)
-            try:
-                record_context_compression(outcome)
-            except Exception:
-                pass
 
     # -- iteration / chat attempt --------------------------------------------
 

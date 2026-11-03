@@ -74,7 +74,7 @@ def test_aggregate_flattens_all_categories_and_retains_trace(tmp_path):
     merged = report.aggregate_report("all-1", [tmp_path / name for name in ("conv-1", "art-1", "otel-1")], 1)
     report.write_report(tmp_path / "all-1", merged)
     markdown = (tmp_path / "all-1/report.md").read_text()
-    assert markdown.count("| 分类 | 用例 | 结果 | TraceID | 链接 |") == 1
+    assert markdown.count("| 分类 | 用例 | 结果 | TraceID | 链接 |") == 2
     assert all(f"| {category} |" in markdown for category in ("对话", "制品", "OTel"))
     assert "a" * 32 in markdown and "[查看Trace](" in markdown
     assert len(merged["cases"]) == 5
@@ -135,6 +135,54 @@ def test_cli_writes_result_file_and_prints_only_summary_and_location(tmp_path):
     completed = subprocess.run(["python3", tool, str(tmp_path), "finish", "", "0"],
                                check=True, text=True, capture_output=True)
     assert (tmp_path / "result.md").read_text() == (tmp_path / "report.md").read_text()
-    assert "Summary（结果行）: PASS 0 | FAIL 0 | SKIP 3" in completed.stdout
+    assert "最终结果：通过0/3（失败0，跳过3）；其中0/3个用例进行了重试。" in completed.stdout
     assert f"RESULT_FILE {tmp_path / 'result.md'}" in completed.stdout
     assert "| 分类 |" not in completed.stdout
+
+
+def test_report_separates_last_attempt_from_previous_attempts_with_identical_tables(tmp_path):
+    def row(attempt, result):
+        return {"category": "对话", "id": f"c1-{attempt}", "case_id": "c1",
+                "attempt": attempt, "attempt_result": result, "name": f"c1 / 尝试{attempt}",
+                "result": result, "trace_id": None, "trace_url": None, "reason": "未取得 Trace"}
+    state = {"run_id": "retry", "suite": "all", "cases": [row(3, "PASS"), row(1, "FAIL"), row(2, "FAIL")]}
+    report.write_report(tmp_path, state)
+    markdown = (tmp_path / "result.md").read_text()
+    final, retries = markdown.split("## 最终结果\n\n")[1].split("## 重试记录\n\n")
+    header = "| 分类 | 用例 | 结果 | TraceID | 链接 |\n|---|---|---|---|---|"
+    assert header in final and header in retries
+    assert "尝试3" in final and "尝试1" not in final and "尝试2" not in final
+    assert "尝试1" in retries and "尝试2" in retries and "尝试3" not in retries
+    assert report.render_summary(state["cases"]) == "最终结果：全部通过（1/1）；其中1/1个用例进行了重试。"
+    assert json.loads((tmp_path / "report.json").read_text())["cases"] == state["cases"]
+
+
+def test_summary_counts_cases_not_messages_traces_or_retry_attempts():
+    cases = [
+        {"category": "对话", "case_id": "c1", "attempt": attempt, "attempt_result": result,
+         "result": result, "id": f"message-{i}"}
+        for attempt, result in ((1, "FAIL"), (2, "PASS")) for i in range(3)
+    ]
+    cases += [{"category": "OTel", "id": "c1", "result": "FAIL"}]
+    assert report.render_summary(cases) == "最终结果：通过1/2（失败1，跳过0）；其中1/2个用例进行了重试。"
+
+
+def test_aggregate_preserves_retry_identity_from_conversation_report(tmp_path):
+    source = {"run_id": "conv", "cases": [{"id": "c1", "verdict": "PASS", "attempts": [
+        {"attempt": 1, "verdict": "FAIL", "messages": [{"id": "m1", "verdict": "FAIL"}]},
+        {"attempt": 2, "verdict": "PASS", "messages": [{"id": "m1", "verdict": "PASS"}]},
+    ]}]}
+    (tmp_path / "report.json").write_text(json.dumps(source))
+    merged = report.aggregate_report("all", [tmp_path], 0)
+    assert all(c["case_id"] == "c1" and c["attempt"] in (1, 2) for c in merged["cases"])
+    assert report.render_summary(merged["cases"]) == "最终结果：全部通过（1/1）；其中1/1个用例进行了重试。"
+
+
+@pytest.mark.parametrize("last_result", ["PASS", "FAIL"])
+def test_summary_presents_final_eighteen_cases_before_retry_count(last_result):
+    cases = [{"category": "对话", "id": f"c{i}", "result": "PASS"} for i in range(17)]
+    cases += [{"category": "对话", "id": "retry", "case_id": "retry", "attempt": attempt,
+               "attempt_result": result, "result": result}
+              for attempt, result in ((1, "FAIL"), (2, "FAIL"), (3, last_result))]
+    expected = "全部通过（18/18）" if last_result == "PASS" else "通过17/18（失败1，跳过0）"
+    assert report.render_summary(cases) == f"最终结果：{expected}；其中1/18个用例进行了重试。"

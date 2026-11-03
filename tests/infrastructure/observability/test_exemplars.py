@@ -55,7 +55,7 @@ def test_duration_exemplars_keep_current_trace_without_metric_labels(monkeypatch
                          for m in s.metrics if m.name in AGENT_HISTOGRAMS}
         assert set(agent_metrics) == set(AGENT_HISTOGRAMS)
         for values in agent_metrics.values():
-            assert all(p.attributes[ts.NAGENT_SOURCE] == ("other" if mode == "no-span" else "cli")
+            assert all(p.attributes[ts.NAGENT_AGENT_SOURCE] == ("unknown" if mode == "no-span" else "cli")
                        for p in values)
             if mode != "sampled":
                 assert all(not p.exemplars for p in values)
@@ -95,8 +95,8 @@ def agent_points(reader):
 
 
 def assert_agent_point(point, source, context):
-    assert point.attributes[ts.NAGENT_SOURCE] == source
-    assert set(point.attributes) <= {ts.GEN_AI_AGENT_NAME, ts.NAGENT_SOURCE, "error.type"}
+    assert point.attributes[ts.NAGENT_AGENT_SOURCE] == source
+    assert set(point.attributes) <= {ts.GEN_AI_AGENT_NAME, ts.NAGENT_AGENT_SOURCE, "error.type"}
     assert point.exemplars
     assert all(e.trace_id == context.trace_id and e.span_id == context.span_id
                for e in point.exemplars)
@@ -105,9 +105,9 @@ def assert_agent_point(point, source, context):
 @pytest.mark.parametrize("source,expected", [
     *[(value, value) for value in (
         "dashboard", "api", "feishu", "cli", "acp", "dingtalk", "wecom",
-        "schedule", "task", "delegation", "chat", "http", "curator", "skill_review",
+        "schedule", "task", "delegation", "curator", "skill_review",
     )],
-    (None, "other"), ("unknown-unique-user-id", "other"),
+    ("chat", "unknown"), ("http", "unknown"), (None, "unknown"), ("unknown-unique-user-id", "unknown"),
 ])
 def test_agent_histograms_preserve_bounded_source_and_agent_exemplar(source_sdk, source, expected):
     reader, facade = source_sdk
@@ -146,7 +146,7 @@ def test_zero_call_runs_remain_in_mean_denominator(source_sdk):
     for name, expected_sum in ((ts.INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS, 3),
                                (ts.INSTRUMENT_INVOKE_AGENT_TOOL_CALLS, 2)):
         assert len(points[name]) == 1
-        assert points[name][0].attributes[ts.NAGENT_SOURCE] == "task"
+        assert points[name][0].attributes[ts.NAGENT_AGENT_SOURCE] == "task"
         assert points[name][0].count == 2
         assert points[name][0].sum == expected_sum
 
@@ -183,7 +183,7 @@ async def test_concurrent_and_nested_runs_restore_source_and_exemplar(source_sdk
     for name, values in agent_points(reader).items():
         assert len(values) == len(contexts)
         for point in values:
-            source = point.attributes[ts.NAGENT_SOURCE]
+            source = point.attributes[ts.NAGENT_AGENT_SOURCE]
             assert point.count == 1
             assert_agent_point(point, source, contexts[source])
             if name == ts.INSTRUMENT_INVOKE_AGENT_INFERENCE_CALLS:

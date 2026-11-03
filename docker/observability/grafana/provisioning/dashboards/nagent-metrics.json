@@ -45,7 +45,7 @@
         "sort": 1,
         "query": {
           "qryType": 1,
-          "query": "label_values(nagent_turns_total{service_name=~\"$service\"}, nagent_source)"
+          "query": "label_values(nagent_agent_runs_total{service_name=~\"$service\"}, nagent_agent_source)"
         },
         "current": {
           "selected": true,
@@ -77,7 +77,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(nagent_turns_total{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[5m]))"
+          "expr": "sum(rate(nagent_agent_runs_total{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[5m]))"
         }
       ],
       "description": "按本次执行入口筛选。历史无来源标签数据仅在 All 中可见，不补造来源。"
@@ -202,7 +202,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(nagent_budget_denied_total{service_name=~\"$service\"}[5m]))"
+          "expr": "sum(increase(nagent_budget_denials_total{service_name=~\"$service\"}[5m]))"
         }
       ],
       "description": "服务级统计，按 Service 筛选，不受 Source 入口筛选影响。"
@@ -226,7 +226,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source\\ p50$"
+              "options": "^nagent_agent_source\\ p50$"
             },
             "properties": [
               {
@@ -238,7 +238,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source\\ p95$"
+              "options": "^nagent_agent_source\\ p95$"
             },
             "properties": [
               {
@@ -250,7 +250,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source\\ p99$"
+              "options": "^nagent_agent_source\\ p99$"
             },
             "properties": [
               {
@@ -264,24 +264,24 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.50, sum by (le, nagent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])))",
-          "legendFormat": "{{nagent_source}} p50",
+          "expr": "histogram_quantile(0.50, sum by (le, nagent_agent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval])))",
+          "legendFormat": "{{nagent_agent_source}} p50",
           "range": true,
           "instant": false,
           "exemplar": true
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le, nagent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])))",
-          "legendFormat": "{{nagent_source}} p95",
+          "expr": "histogram_quantile(0.95, sum by (le, nagent_agent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval])))",
+          "legendFormat": "{{nagent_agent_source}} p95",
           "range": true,
           "instant": false,
           "exemplar": true
         },
         {
           "refId": "C",
-          "expr": "histogram_quantile(0.99, sum by (le, nagent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])))",
-          "legendFormat": "{{nagent_source}} p99",
+          "expr": "histogram_quantile(0.99, sum by (le, nagent_agent_source) (rate(gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval])))",
+          "legendFormat": "{{nagent_agent_source}} p99",
           "range": true,
           "instant": false,
           "exemplar": true
@@ -321,7 +321,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source\\ ≤\\ .+\\ s$"
+              "options": "^nagent_agent_source\\ ≤\\ .+\\ s$"
             },
             "properties": [
               {
@@ -335,8 +335,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}",
-          "legendFormat": "{{nagent_source}} ≤ {{le}} s",
+          "expr": "gen_ai_invoke_agent_duration_seconds_bucket{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}",
+          "legendFormat": "{{nagent_agent_source}} ≤ {{le}} s",
           "exemplar": true,
           "range": true,
           "instant": false
@@ -406,12 +406,12 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source\\ /\\ .+$"
+              "options": "^nagent_agent_source\\ /\\ .+$"
             },
             "properties": [
               {
                 "id": "displayName",
-                "value": "历史未知 / ${__field.labels.nagent_end_reason}"
+                "value": "历史未知 / ${__field.labels.nagent_agent_end_reason}"
               }
             ]
           }
@@ -420,8 +420,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (nagent_source, nagent_end_reason) (rate(nagent_turns_total{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval]))",
-          "legendFormat": "{{nagent_source}} / {{nagent_end_reason}}",
+          "expr": "sum by (nagent_agent_source, nagent_agent_end_reason) (rate(nagent_agent_runs_total{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{nagent_agent_source}} / {{nagent_agent_end_reason}}",
           "range": true,
           "instant": false,
           "exemplar": false
@@ -479,7 +479,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source$"
+              "options": "^nagent_agent_source$"
             },
             "properties": [
               {
@@ -493,8 +493,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (nagent_source) (rate(nagent_turns_total{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval]))",
-          "legendFormat": "{{nagent_source}}",
+          "expr": "sum by (nagent_agent_source) (rate(nagent_agent_runs_total{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval]))",
+          "legendFormat": "{{nagent_agent_source}}",
           "range": true,
           "instant": false,
           "exemplar": false
@@ -532,7 +532,7 @@
     {
       "id": 14,
       "type": "timeseries",
-      "title": "Guardrails (compression / budget denial rate)",
+      "title": "Guardrails (compression attempts / budget denial rate)",
       "datasource": "Prometheus",
       "gridPos": {
         "h": 8,
@@ -549,12 +549,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(nagent_context_compressions_total{service_name=~\"$service\"}[5m]))",
-          "legendFormat": "compressions"
+          "expr": "sum(rate(nagent_context_compression_attempts_total{service_name=~\"$service\"}[5m]))",
+          "legendFormat": "compression attempts"
         },
         {
           "refId": "B",
-          "expr": "sum(rate(nagent_budget_denied_total{service_name=~\"$service\"}[5m]))",
+          "expr": "sum(rate(nagent_budget_denials_total{service_name=~\"$service\"}[5m]))",
           "legendFormat": "budget denials"
         }
       ],
@@ -610,7 +610,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source\\ inference\\ /\\ run$"
+              "options": "^nagent_agent_source\\ inference\\ /\\ run$"
             },
             "properties": [
               {
@@ -622,7 +622,7 @@
           {
             "matcher": {
               "id": "byRegexp",
-              "options": "^nagent_source\\ tool\\ /\\ run$"
+              "options": "^nagent_agent_source\\ tool\\ /\\ run$"
             },
             "properties": [
               {
@@ -636,16 +636,16 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (nagent_source) (rate(gen_ai_invoke_agent_inference_calls_sum{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])) / clamp_min(sum by (nagent_source) (rate(gen_ai_invoke_agent_inference_calls_count{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "{{nagent_source}} inference / run",
+          "expr": "sum by (nagent_agent_source) (rate(gen_ai_invoke_agent_inference_calls_sum{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval])) / clamp_min(sum by (nagent_agent_source) (rate(gen_ai_invoke_agent_inference_calls_count{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{nagent_agent_source}} inference / run",
           "range": true,
           "instant": false,
           "exemplar": false
         },
         {
           "refId": "B",
-          "expr": "sum by (nagent_source) (rate(gen_ai_invoke_agent_tool_calls_sum{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])) / clamp_min(sum by (nagent_source) (rate(gen_ai_invoke_agent_tool_calls_count{service_name=~\"$service\",nagent_source=~\"${source:regex}\"}[$__rate_interval])), 1e-9)",
-          "legendFormat": "{{nagent_source}} tool / run",
+          "expr": "sum by (nagent_agent_source) (rate(gen_ai_invoke_agent_tool_calls_sum{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval])) / clamp_min(sum by (nagent_agent_source) (rate(gen_ai_invoke_agent_tool_calls_count{service_name=~\"$service\",nagent_agent_source=~\"${source:regex}\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{nagent_agent_source}} tool / run",
           "range": true,
           "instant": false,
           "exemplar": false

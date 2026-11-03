@@ -17,7 +17,11 @@ _PREFETCH_TOP_K = 10
 
 _PROFILE_SCHEMA = {
     "name": "mem0_profile",
-    "description": "Retrieve all stored memories about the user. Use at conversation start.",
+    "description": (
+        "Retrieve the user's full memory profile when explicitly requested or "
+        "when auto-recalled context is insufficient. Do not call merely because "
+        "a conversation starts."
+    ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 _SEARCH_SCHEMA = {

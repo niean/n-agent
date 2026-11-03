@@ -219,8 +219,8 @@ async def test_non_stream_success_records_usage(tracer, meter):
     assert span.ended == 1
     assert span.attributes[ts.GEN_AI_USAGE_INPUT_TOKENS] == 10
     assert span.attributes[ts.GEN_AI_USAGE_OUTPUT_TOKENS] == 5
-    assert span.attributes[ts.NAGENT_USAGE_KNOWN] is True
-    assert span.attributes[ts.GEN_AI_RESPONSE_FINISH_REASONS] == "stop"
+    assert span.attributes[ts.NAGENT_MODEL_USAGE_KNOWN] is True
+    assert tuple(span.attributes[ts.GEN_AI_RESPONSE_FINISH_REASONS]) == ("stop",)
     input_records, output_records = _token_records(meter)
     assert input_records == [
         (10, {"gen_ai.operation.name": "chat", "gen_ai.provider.name": "openai", "gen_ai.request.model": "gpt-4o"})
@@ -240,7 +240,7 @@ async def test_missing_usage_not_fabricated_as_zero(tracer, meter):
 
     assert result.usage == {}
     span = _chat_span(tracer)[0]
-    assert span.attributes[ts.NAGENT_USAGE_KNOWN] is False
+    assert span.attributes[ts.NAGENT_MODEL_USAGE_KNOWN] is False
     assert ts.GEN_AI_USAGE_INPUT_TOKENS not in span.attributes
     assert ts.GEN_AI_USAGE_OUTPUT_TOKENS not in span.attributes
     input_records, output_records = _token_records(meter)
@@ -258,7 +258,7 @@ async def test_partial_usage_judged_per_component(tracer, meter):
     span = _chat_span(tracer)[0]
     assert span.attributes[ts.GEN_AI_USAGE_INPUT_TOKENS] == 7
     assert ts.GEN_AI_USAGE_OUTPUT_TOKENS not in span.attributes
-    assert span.attributes[ts.NAGENT_USAGE_KNOWN] is False
+    assert span.attributes[ts.NAGENT_MODEL_USAGE_KNOWN] is False
     input_records, output_records = _token_records(meter)
     assert [v for v, _ in input_records] == [7]
     assert output_records == []

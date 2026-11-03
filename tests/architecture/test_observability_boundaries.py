@@ -169,7 +169,7 @@ def test_telemetry_semantics_module_exists():
 def test_telemetry_semantics_imports_only_api_and_stdlib():
     # The pure content projector is the sole permitted Application dependency.
     app_offenders = [name for name in _violations(SEMANTICS_PATH, ("app",))
-                     if not _matches_any(name, ("app.application.telemetry_details",))]
+                     if not _matches_any(name, ("app.application.telemetry_details", "app.application.telemetry_contract"))]
     assert not app_offenders, (
         "telemetry_semantics must not import business modules: "
         f"{app_offenders}"
@@ -212,11 +212,10 @@ def test_observability_never_imports_business_modules():
             if _matches_any(bound, ("app.domain", "app.interfaces")):
                 offenders.append(f"{path.relative_to(ROOT)}: {bound}")
             elif _matches_any(bound, ("app.application",)):
-                if not _matches_any(bound, (ALLOWED_APPLICATION_IMPORT,)):
-                    offenders.append(f"{path.relative_to(ROOT)}: {bound}")
+                offenders.append(f"{path.relative_to(ROOT)}: {bound}")
     assert not offenders, (
         "observability infrastructure must not import business modules "
-        f"(only {ALLOWED_APPLICATION_IMPORT} and app.config allowed): "
+        f"(app.config allowed; semantic schema is injected): "
         f"{offenders}"
     )
 
@@ -234,7 +233,6 @@ def test_observability_imports_stay_within_config_semantics_and_self():
                 bound,
                 (
                     "app.config",
-                    ALLOWED_APPLICATION_IMPORT,
                     "app.infrastructure.observability",
                 ),
             )
@@ -242,7 +240,7 @@ def test_observability_imports_stay_within_config_semantics_and_self():
                 offenders.append(f"{path.relative_to(ROOT)}: {bound}")
     assert not offenders, (
         f"observability app.* imports must stay within app.config / "
-        f"{ALLOWED_APPLICATION_IMPORT} / app.infrastructure.observability: "
+        f"app.infrastructure.observability: "
         f"{offenders}"
     )
 

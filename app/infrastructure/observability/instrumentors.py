@@ -248,6 +248,7 @@ class _FilteringSpan(trace_api.Span):
         self._http_capture = None
         self._http_details = {}
         self._http_context = {}
+        self._http_entry_facts = {}
         self._http_incomplete = False
 
     def __getattr__(self, name: str) -> Any:
@@ -265,6 +266,15 @@ class _FilteringSpan(trace_api.Span):
             if self._http_attributes is not None:
                 self._http_attributes.update(filtered)
             self._span.set_attributes(filtered)
+
+    def bind_request_channel(self, channel):
+        """Only the trusted HTTP route adapter may bind entry identity."""
+        if not self._http_client and channel in {"api", "dashboard"}:
+            self._http_entry_facts = {"nagent.request.operation": "handle", "nagent.request.channel": channel}
+            try:
+                self._span.set_attributes(self._http_entry_facts)
+            except Exception:
+                pass  # SDK writes must not preempt the ASGI business call.
 
     def record_exception(
         self,
@@ -314,7 +324,7 @@ class _FilteringSpan(trace_api.Span):
         if self._http_attributes is not None and not self._http_logged:
             self._http_logged = True
             try:
-                from app.infrastructure.observability.logging import log_http_request_completed, flatten_observation_details
+                from app.infrastructure.observability.logging import log_http_request_completed, flatten_observation_details, project_http_attributes
 
                 attrs = self._http_attributes
                 status = attrs.get("http.response.status_code", attrs.get("http.status_code"))
@@ -325,15 +335,20 @@ class _FilteringSpan(trace_api.Span):
                 # Bind the server span explicitly, including unsampled contexts.
                 with trace_api.use_span(self, end_on_exit=False, record_exception=False,
                                         set_status_on_exception=False):
+                    duration_ms = max(0.0, (time.monotonic() - self._http_started) * 1000)
+                    projected = project_http_attributes({**attrs, "operation": "http.server", "nagent.http.direction": "server",
+                                                        "outcome": outcome, "duration_ms": duration_ms},
+                                                        request_facts=self._http_entry_facts)
+                    self._span.set_attributes(projected)
                     log_http_request_completed(
                         attrs.get("http.request.method", attrs.get("http.method")),
                         attrs.get("http.route"), status,
-                        max(0.0, (time.monotonic() - self._http_started) * 1000), outcome,
+                        duration_ms, outcome, event_emitted=True, request_facts=self._http_entry_facts,
                         **({"details": self._http_details} if self._http_details else {}),
                     )
                     flat = flatten_observation_details(self._http_details)
                     self._span.set_attributes(flat)
-                    self._span.add_event("http_request_completed", attributes=flat)
+                    self._span.add_event("nagent.http.completed", attributes={**projected, **flat})
             except Exception:
                 pass  # Logging failure must never prevent ending the span.
         self._span.end(end_time)
@@ -343,13 +358,13 @@ class _FilteringSpan(trace_api.Span):
             return
         self._http_logged = True
         try:
-            from app.infrastructure.observability.logging import log_http_client_completed, flatten_observation_details
+            from app.infrastructure.observability.logging import log_http_client_completed, flatten_observation_details, project_http_attributes
 
             facts = dict(self._http_attributes)
             status = facts.get("http.response.status_code")
             outcome = "cancelled" if self._http_cancelled else "error" if self._http_error or (
                 type(status) is int and status >= 400) else "incomplete" if self._http_incomplete else "completed" if status else "incomplete"
-            facts.update(operation="http_client", outcome=outcome,
+            facts.update(operation="http.client", outcome=outcome,
                          duration_ms=max(0.0, (time.monotonic() - self._http_started) * 1000))
             if self._http_error:
                 facts["error.type"] = self._http_error
@@ -358,17 +373,22 @@ class _FilteringSpan(trace_api.Span):
                                 f"{facts['url.template']}；调用位置 {facts['nagent.http.caller']}；"
                                 f"状态 {status if status is not None else '无响应'}，{outcome}；"
                                 f"耗时 {facts['duration_ms']:.1f} ms。")
+            # Freeze one HTTP-owned projection for every outlet. The Application
+            # schema keeps only approved shared identity from the captured parent;
+            # agent-local outcome/summary/duration cannot enter an HTTP result.
+            facts["nagent.http.direction"] = "client"
+            projected = project_http_attributes({**self._http_context, **facts})
             # This is the sole allowlisted event on an auto client span. The
             # generic proxy add_event/record_exception remain closed.
             try:
                 flat = flatten_observation_details(self._http_details)
-                self._span.set_attributes(flat)
-                self._span.add_event("http_client_completed", attributes={**facts, **flat})
+                self._span.set_attributes({**projected, **flat})
+                self._span.add_event("nagent.http.completed", attributes={**projected, **flat})
             except Exception:
                 pass
             with trace_api.use_span(self, end_on_exit=False, record_exception=False,
                                     set_status_on_exception=False):
-                log_http_client_completed({**self._http_context, **facts, "details": self._http_details})
+                log_http_client_completed({**facts, "_http_projection": projected, "details": self._http_details, "_completion_event_emitted": True})
         except Exception:
             pass
 
@@ -569,6 +589,9 @@ class _HttpAccessFactsMiddleware:
 
     async def __call__(self, scope, receive, send):
         span = trace_api.get_current_span()
+        channel = {"/chat/completions": "dashboard", "/v1/chat/completions": "api"}.get(scope.get("path"))
+        if channel and isinstance(span, _FilteringSpan):
+            span.bind_request_channel(channel)
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         untraced = not isinstance(span, _FilteringSpan) or span._http_attributes is None or span._http_client

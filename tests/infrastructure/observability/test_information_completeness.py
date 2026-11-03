@@ -1,4 +1,6 @@
 """End-to-end information must survive projection without changing business IO."""
+from tests.infrastructure.observability._contract import configure
+
 import json
 import logging
 
@@ -21,11 +23,11 @@ def content_wiring(monkeypatch):
     sanitizer.configure_secret_catalog({"PRIVATE-CREDENTIAL"})
     monkeypatch.setattr(obs, "_sanitizer", sanitizer)
     details.configure_details(sanitizer.sanitize)
-    obs.configure_execution_context(None, validate_details=details.validate_details,
+    configure(None, validate_details=details.validate_details,
                                     flatten_details=details.flatten_details,
                                     project_details=details.project_details)
     yield
-    obs.configure_execution_context(None)
+    configure(None)
     details.configure_details(None)
 
 
@@ -51,9 +53,22 @@ def test_application_logs_and_unregistered_exceptions_are_readable(content_wirin
 
 def test_http_request_response_details_share_span_event_and_log(content_wiring, monkeypatch):
     from app.infrastructure.observability import http_capture
+    from app.application import telemetry_semantics as ts
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
+    from tests.infrastructure.observability._contract import configure
+    configure(ts.execution_log_snapshot, validate_details=details.validate_details,
+              flatten_details=details.flatten_details, project_details=details.project_details)
+    log_exporter = InMemoryLogRecordExporter()
+    log_provider = LoggerProvider()
+    log_provider.add_log_record_processor(SimpleLogRecordProcessor(log_exporter))
+    with pytest.warns(DeprecationWarning, match="LoggingHandler.*deprecated"):
+        sdk_handler = LoggingHandler(logger_provider=log_provider)
+    bridge = obs.SafeLogBridge(otel_handler=sdk_handler)
     spans, logs = [], []
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(_ListSpanExporter(spans)))
+    monkeypatch.setattr(ts, "get_tracer", lambda: provider.get_tracer("agent-http"))
 
     def respond(request):
         assert json.loads(request.content)["prompt"] == "useful input"
@@ -67,14 +82,16 @@ def test_http_request_response_details_share_span_event_and_log(content_wiring, 
 
     class Capture(logging.Handler):
         def emit(self, record):
-            if obs.event_code_for(record) == "http_client_completed":
+            if obs.event_code_for(record) == "nagent.http.completed":
                 logs.append(json.loads(obs.SafeEventJsonFormatter().format(record)))
     logger = logging.getLogger(obs.__name__)
     monkeypatch.setattr(logger, "level", logging.INFO)
     handler = Capture()
     logger.addHandler(handler)
+    logger.addHandler(bridge)
     try:
-        with provider.get_tracer("test").start_as_current_span("agent"):
+        with ts.SemanticsTelemetry().agent_run(session_id="s1", run_id="r1", source="api"):
+            ts._scene_publish({"outcome": "denied", "summary": "parent-only", "duration_ms": 999})
             response = client.post("https://backend.example/api/infer?q=visible&token=PRIVATE-CREDENTIAL",
                 headers={"Authorization": "Bearer PRIVATE-CREDENTIAL", "x-request-purpose": "inference"},
                 json={"prompt": "useful input", "max_tokens": 123, "password": "PRIVATE-CREDENTIAL"})
@@ -87,11 +104,19 @@ def test_http_request_response_details_share_span_event_and_log(content_wiring, 
         assert "useful output" in log["details"]["http_response"]["content"]
         assert "PRIVATE-CREDENTIAL" not in json.dumps(log)
         child = next(s for s in spans if s.context.span_id == int(log["span_id"], 16))
-        assert "useful input" in child.attributes["nagent.details.http_request.content"]
-        assert "useful output" in child.events[-1].attributes["nagent.details.http_response.content"]
+        sdk_log, = log_exporter.get_finished_logs()
+        event, = [event for event in child.events if event.name == "nagent.http.completed"]
+        for key, value in {"nagent.agent.run_id": "r1", "gen_ai.conversation.id": "s1"}.items():
+            assert child.attributes[key] == event.attributes[key] == sdk_log.log_record.attributes[key] == log[key] == value
+        for attributes in (child.attributes, event.attributes, sdk_log.log_record.attributes, log):
+            assert not {"nagent.agent.outcome", "nagent.agent.summary", "nagent.agent.duration_ms"}.intersection(attributes)
+        assert "useful input" in child.attributes["nagent.content.http_request"]
+        assert "useful output" in child.events[-1].attributes["nagent.content.http_response"]
         assert "PRIVATE-CREDENTIAL" not in str(child.attributes) + str(child.events)
     finally:
         logger.removeHandler(handler)
+        logger.removeHandler(bridge)
+        log_provider.shutdown()
         client.close()
         provider.shutdown()
 

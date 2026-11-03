@@ -62,7 +62,7 @@ def test_outbound_request_has_target_event_and_correlated_log(sampled, status, m
 
     class Capture(logging.Handler):
         def emit(self, record):
-            if obs.event_code_for(record) == "http_client_completed":
+            if obs.event_code_for(record) == "nagent.http.completed":
                 logs.append(json.loads(obs.SafeEventJsonFormatter().format(record)))
 
     logger = logging.getLogger(obs.__name__)
@@ -88,18 +88,19 @@ def test_outbound_request_has_target_event_and_correlated_log(sampled, status, m
                 assert client.get("https://user:PRIVATE@models.example/v1/models?token=PRIVATE#PRIVATE").status_code == status
         assert len(logs) == 1
         log = logs[0]
+        assert log["nagent.http.direction"] == "client"
         assert log["server.address"] == "models.example"
         assert log["url.template"] == "/v1/models"
         assert log["nagent.http.caller"].endswith(":list_models")
         assert log["span_id"] != format(parent.get_span_context().span_id, "016x")
         assert "models.example" in log["message"] and "list_models" in log["message"]
-        assert log["outcome"] == ("completed" if status == 200 else "error")
+        assert log["nagent.http.outcome"] == ("success" if status == 200 else "failure")
         assert "PRIVATE" not in json.dumps(log)
         if sampled:
             span = next(s for s in spans if s.context.span_id == int(log["span_id"], 16))
             assert span.parent.span_id == parent.get_span_context().span_id
             assert span.attributes["server.address"] == "models.example"
-            assert len([e for e in span.events if e.name == "http_client_completed"]) == 1
+            assert len([e for e in span.events if e.name == "nagent.http.completed"]) == 1
             assert "PRIVATE" not in str(span.attributes) + str(span.events)
         else:
             assert not spans
@@ -156,7 +157,7 @@ async def test_async_outbound_lifecycle_and_redacted_unknown_path(mode, monkeypa
         assert facts["url.template"] == "/private/{redacted}"
         assert facts["outcome"] == {"failure": "error", "cancelled": "cancelled"}.get(mode, "completed")
         child = next(s for s in spans if s.context.span_id == span_id)
-        assert len([e for e in child.events if e.name == "http_client_completed"]) == 1
+        assert len([e for e in child.events if e.name == "nagent.http.completed"]) == 1
         assert "PRIVATE" not in str(child.attributes) + str(child.events) + str(facts)
     finally:
         await client.aclose()

@@ -75,3 +75,6 @@ class AgentState:
     # preserves existing assistant rendering. Set by ChatCompletionService from
     # session_source; read by AgentGraphRunner when persisting assistant msgs.
     message_source: str | None = None
+    # Run-scoped recall snapshot, separate from persisted conversation messages.
+    # None means not read yet; an empty string is a completed read with no context.
+    external_memory_context: str | None = None

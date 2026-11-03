@@ -233,10 +233,10 @@ async def test_run_creates_exactly_one_invoke_agent_span(tmp_path, tracer, meter
     assert span.ended == 1
     assert span.attributes[ts.GEN_AI_CONVERSATION_ID] == "s1"
     assert span.attributes[ts.GEN_AI_AGENT_NAME] == "n-agent"
-    assert span.attributes[ts.NAGENT_RUN_ID]  # trusted run_id from state
+    assert span.attributes[ts.NAGENT_AGENT_RUN_ID]  # trusted run_id from state
     # turn metric: end_reason completed; zero-call histograms still recorded
-    assert meter.counters["nagent.turns"].records == [
-        (1, {"nagent.source": "api", "nagent.end_reason": "completed"})
+    assert meter.counters["nagent.agent.runs"].records == [
+        (1, {"nagent.agent.source": "api", "nagent.agent.end_reason": "completed"})
     ]
     calls_hist = meter.histograms["gen_ai.invoke_agent.inference_calls"]
     assert [v for v, _ in calls_hist.records] == [0]
@@ -266,13 +266,13 @@ async def test_run_counts_inference_and_tool_calls(tmp_path, tracer, meter):
     assert all(s.parent_name == "invoke_agent n-agent" for s in chat_spans)
     # iteration context reaches the callback: first call iteration 0, second 1
     assert provider.iterations_seen == [0, 1]
-    assert [s.attributes[ts.NAGENT_ITERATION] for s in chat_spans] == [0, 1]
+    assert [s.attributes[ts.NAGENT_AGENT_ITERATION] for s in chat_spans] == [0, 1]
     # execute_tools runs inside the same iteration scope: the tool span
     # carries the same iteration number as the chat span that requested it
     tool_spans = [s for s in tracer.spans if s.name.startswith("execute_tool ")]
     assert len(tool_spans) == 1
-    assert tool_spans[0].attributes[ts.NAGENT_ITERATION] == 0
-    assert tool_spans[0].attributes[ts.NAGENT_ITERATION] == chat_spans[0].attributes[ts.NAGENT_ITERATION]
+    assert tool_spans[0].attributes[ts.NAGENT_AGENT_ITERATION] == 0
+    assert tool_spans[0].attributes[ts.NAGENT_AGENT_ITERATION] == chat_spans[0].attributes[ts.NAGENT_AGENT_ITERATION]
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +313,7 @@ async def test_run_exception_closes_span_once_and_records_error(tmp_path, tracer
     assert spans[0].status is not None
     assert spans[0].status.status_code is ts.StatusCode.ERROR
     assert spans[0].attributes["error.type"] == "other"  # RuntimeError -> safe value
-    assert meter.counters["nagent.turns"].records[0][1]["nagent.end_reason"] == "error"
+    assert meter.counters["nagent.agent.runs"].records[0][1]["nagent.agent.end_reason"] == "error"
 
 
 @pytest.mark.asyncio
@@ -332,7 +332,7 @@ async def test_run_cancel_closes_span_once_and_records_cancelled(tmp_path, trace
     spans = tracer.by_name("invoke_agent n-agent")
     assert len(spans) == 1
     assert spans[0].ended == 1
-    assert meter.counters["nagent.turns"].records[0][1]["nagent.end_reason"] == "cancelled"
+    assert meter.counters["nagent.agent.runs"].records[0][1]["nagent.agent.end_reason"] == "cancelled"
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +408,7 @@ async def test_detached_run_span_ends_with_actual_run(tmp_path, tracer, meter):
     assert len(spans) == 1
     assert spans[0].ended == 1  # closed by the actual run, not the generator
     # turn metric was still recorded exactly once by the detached run
-    assert len(meter.counters["nagent.turns"].records) == 1
+    assert len(meter.counters["nagent.agent.runs"].records) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -577,8 +577,8 @@ async def test_budget_denial_produces_no_chat_span_and_counts_denied_once(
     assert provider.calls == 0
     assert [s for s in tracer.spans if s.name.startswith("chat ")] == []
     # counted exactly once at the authoritative denial point (BudgetService)
-    assert meter.counters["nagent.budget.denied"].records == [
-        (1, {"nagent.kind": "llm_denied"})
+    assert meter.counters["nagent.budget.denials"].records == [
+        (1, {"nagent.budget.kind": "llm_denied"})
     ]
 
 

@@ -5,7 +5,7 @@ import json
 import logging
 
 from app.domain.policy import PolicyAuditEvent, PolicyAuditSink
-from app.infrastructure.observability.logging import policy_audit_context, register_safe_event
+from app.infrastructure.observability.logging import policy_audit_context, register_safe_event, trusted_log_identities
 
 logger = logging.getLogger(__name__)
 POLICY_DECISION_LOG_TEMPLATE = "policy_decision %s"
@@ -21,16 +21,15 @@ class LoggingPolicyAuditSink:
 
     async def record(self, event: PolicyAuditEvent) -> None:
         payload = {
-            "policy": event.policy,
-            "version": event.version,
-            "decision_kind": event.decision_kind.value,
-            "reason": event.reason,
-            "outcome": event.outcome.value if event.outcome is not None else None,
-            "run_id": event.run_id,
-            "session_id": event.session_id,
-            "policy_scope": event.policy_scope,
-            "occurred_at": event.occurred_at,
+            "nagent.policy.name": event.policy,
+            "nagent.policy.version": event.version,
+            "nagent.policy.decision_kind": event.decision_kind.value,
+            "nagent.policy.reason": event.reason,
+            "nagent.policy.outcome": event.outcome.value if event.outcome is not None else None,
+            **trusted_log_identities(),
+            "nagent.policy.scope": event.policy_scope,
+            "nagent.policy.occurred_at": event.occurred_at,
         }
-        register_safe_event(POLICY_DECISION_LOG_TEMPLATE, "policy_decision")
+        register_safe_event(POLICY_DECISION_LOG_TEMPLATE, "nagent.policy.decided")
         with policy_audit_context(payload):
             logger.info(POLICY_DECISION_LOG_TEMPLATE, json.dumps(payload, ensure_ascii=False))

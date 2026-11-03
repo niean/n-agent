@@ -15,7 +15,7 @@ from app.infrastructure.registry.sqlite_task_registry import SQLiteTaskRegistry
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recover", [False, True])
-@pytest.mark.parametrize("source", ["conversation", "cli.request", "api.request", "manual.click", "schedule.execute"])
+@pytest.mark.parametrize("source", ["conversation", "request.handle", "api.request", "manual.click", "schedule.run"])
 async def test_task_trigger_survives_sqlite_reopen_and_automatic_retry(sdk, tmp_path, recover, source):
     tracer, exporter = sdk
     path = str(tmp_path / "tasks.db")
@@ -149,10 +149,10 @@ def test_cli_task_creation_owns_runtime_and_trigger(sdk, tmp_path, monkeypatch):
     task = asyncio.run(registry.list_tasks()).items[0]
     assert task.trace_context.get("traceparent")
     assert closed == [True]
-    entry = named(exporter, "cli.request")
+    entry = named(exporter, "request.handle")
     assert entry.context.trace_id == int(task.trace_context["traceparent"].split("-")[1], 16)
-    assert "cli" in entry.attributes["nagent.details.input_messages.content"]
-    assert task.id in entry.attributes["nagent.details.output_messages.content"]
+    assert "cli" in entry.attributes["nagent.content.input_messages"]
+    assert task.id in entry.attributes["nagent.content.output_messages"]
 
 
 @pytest.mark.asyncio

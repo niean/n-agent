@@ -90,9 +90,9 @@ OTel 实现约定：Domain 零 OTel 依赖；Application 只允许 opentelemetry
 
 ## Docker Compose 默认值
 
-执行摘要：`telemetry_semantics.py` 的 Agent/ChatAttempt/工具完成路径使用固定模板生成 `nagent.summary`，并在 Span 结束前发出 `execution_completed` 日志。`session_id` 和 `request_id`（复用 run_id）经 ContextVar 传播；日志只消费组装根注入的安全快照，不从原始 LogRecord.extra 或消息正文提取。未知 usage 分量保持未知；错误、拒绝、取消独立记录。Collector 将显式枚举的执行字段写入 JSON 行 `context`，不得整体复制任意 attributes。
+执行摘要：对象、操作、事件与结果遵守 07-observability.md 的统一契约；自定义属性为 nagent.<object>.<attribute>，完成时记录所属对象的 summary/outcome/duration_ms 与 nagent.<object>.completed。AgentRun、TaskRun、请求和会话身份分开，channel 不等于 agent.source。日志只消费组装根注入的安全快照，不信任原始 LogRecord.extra。未知 usage 分量保持未知；八种操作结果、策略决定与业务状态分别表达。Collector 仅投影精确枚举的安全字段到 context.execution，不整体复制任意 attributes。
 
-Trace 降噪：FastAPI 仅采集 `/chat/completions`、`/v1/chat/completions` 两个对话入口（兼容查询参数和尾斜杠），页面、静态资源、管理接口和轮询不生成入站 Span。关闭 ASGI receive/send Span，HTTPX/SQLite 自动 CLIENT Span 仅在有效父操作下采集。HTTP SERVER -> invoke_agent -> LLM/工具/出站 HTTP 继承同一 Trace；CLI 等无 HTTP 父级时 Agent 自然成为根。`_FilteringSpan` 必须实现 OTel API Span 类型，不能仅依赖 duck typing，否则 get_current_span 会返回无效上下文。规则在 `app/infrastructure/observability/instrumentors.py` 维护。
+Trace 降噪：FastAPI 仅采集 `/chat/completions`、`/v1/chat/completions` 两个对话入口（兼容查询参数和尾斜杠），页面、静态资源、管理接口和轮询不生成入站 Span。关闭 ASGI receive/send Span，HTTPX/SQLite 自动 CLIENT Span 仅在有效父操作下采集。HTTP SERVER -> invoke_agent -> LLM/工具/出站 HTTP 继承同一 Trace；CLI 等入口由 request.handle/gateway.handle_message 覆盖准入与收尾，无有效上游时入口为根。`_FilteringSpan` 必须实现 OTel API Span 类型，不能仅依赖 duck typing，否则 get_current_span 会返回无效上下文。规则在 `app/infrastructure/observability/instrumentors.py` 维护。
 
 只考虑 Docker Compose 运行时，推荐容器内路径：
 

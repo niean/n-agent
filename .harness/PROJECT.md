@@ -87,11 +87,12 @@ sh tests/e2e/run.sh
 
 ### E2E 结果展示约定
 
-- 测试结果列表写入 `locals/e2e-reports/${测试ID}/result.md`，以单张表打平展示，列为 `分类 | 用例 | 结果 | TraceID | 链接`；分类为对话、制品、OTel；结果使用 PASS / FAIL / SKIP，重试须说明次数，不仅输出整体 PASS。
+- 测试结果列表写入 `locals/e2e-reports/${测试ID}/result.md`：第一节“最终结果”展示每个用例最后一次尝试，第二节“重试记录”展示此前尝试；两节都使用相同表格，列为 `分类 | 用例 | 结果 | TraceID | 链接`。分类为对话、制品、OTel；结果使用 PASS / FAIL / SKIP。没有重试时保留空表并说明无重试记录。
 - 有实际 Trace ID 时，链接列使用 `[查看Trace](完整URL)`，必须携带该次用例的真实 32 位十六进制 Trace ID，直接进入 Grafana Explore 的 Tempo 查询；禁止只给 Explore 首页、用例名或 exemplar 链接。
 - 链接沿用应用自检接口 `links.Trace` 的配置地址，保留域名、子路径和 orgId；使用 Tempo 数据源 `nagent-tempo`，编码 Explore panes，queryType=traceql、query=实际 Trace ID。不得把 session_id / tool_call_id 当作 Trace ID。
 - 一个用例有多条 Trace 时按消息、尝试或运行分别列出；失败时保留已取得的 Trace。未执行、OTel 未启用、未采集到 Trace 或不产生 Trace 的检查必须注明原因，不生成空链接或借用其他用例链接。
-- 消息框只给简短 Summary 和本地可点击的 `[result.md](绝对路径)` 链接，不展开结果列表；Summary 按平铺结果行统计，包含失败的尝试和清理结果，不称为用例数。OTel E2E 由 `tests/e2e/result_report.py` 生成 `locals/e2e-reports/<run-id>/result.md` 和 `report.json`（兼容保留 `report.md`）；JSON 保存 case category/id/name/result/trace_id/trace_url/reason，Markdown 使用上述表格；终端只输出按结果行统计的 PASS / FAIL / SKIP Summary 和 `result.md` 路径。`tests/e2e/run.sh` 将本次对话、制品、OTel 子报告汇总到同一 `result.md` / `report.json`，保留每次尝试、消息和 Trace 的独立行；失败保留报告与日志。报告持久化不依赖测试会话保留，也不等待 exemplar。
+- 消息框只给简短概述和本地可点击的 `[result.md](绝对路径)` 链接，不展开结果列表；先说最终结果（如“全部通过（18/18）”或“通过17/18”），再说“其中1/18个用例进行了重试”。统计按分类和用例身份分组，只计最后一次尝试，同一用例的消息和多条 Trace 不重复计数；重试用例只计一次，清理失败作为独立失败检查计入，不能显示为全部通过。跳过、未完成或未知结果不得算通过。
+- OTel E2E 由 `tests/e2e/result_report.py` 生成 `locals/e2e-reports/<run-id>/result.md` 和 `report.json`（兼容保留 `report.md`）；JSON 保留所有尝试和 Trace 证据，会话投影行额外记录 case_id/attempt/attempt_result，供分节与汇总使用，不从展示名称反推身份。`tests/e2e/run.sh` 将本次对话、制品、OTel 子报告汇总为同一份两节报告及 JSON，终端只输出概述和结果路径；失败保留报告与日志。报告持久化不依赖测试会话保留，也不等待 exemplar。
 - Config Bundle 属于 migrate 测试，独立入口 `bash tests/migrate/config-bundle.sh`，仍在 Docker 内执行；不纳入 `tests/e2e/run.sh`。
 
 ## 扫描维度
@@ -123,7 +124,7 @@ sh tests/e2e/run.sh
 | .harness/knowledge/04-data-boundaries.md | 新增/修改 SQLite schema、配置项、协议字段、localStorage 键、Delegation 7 表结构时 |
 | .harness/knowledge/05-key-patterns.md | 复用既有跨文件模式（DDD 边界、ToolPolicy 审批、Skill 自进化、Artifact 写穿/发布/删除、Activated Skills 三层过滤、多 Agent 委派）时 |
 | .harness/knowledge/06-domain-model.md | 需要快速了解 DDD 业务架构、子域、核心流程、关键模型和外部边界时 |
-| .harness/knowledge/07-observability.md | 新增或修改 Trace、Log、Metric、Profile 打点、上下文详情、降噪与信号关联时 |
+| .harness/knowledge/07-observability.md | 理解 N-Agent 观测统一语义设计，或新增修改对象、操作、属性、事件、指标、信号关联、Policy 与 Langfuse 映射、详情及采集边界时 |
 | .harness/knowledge/21-glossary.md | 对术语不清楚时 |
 | .harness/knowledge/22-file-map.md | 确定功能对应源文件时 |
 | .harness/prd/02-prd-baseline.md | 确认功能需求与产品约束时 |

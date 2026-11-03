@@ -239,3 +239,7 @@
 - Tempo：替换 Jaeger 的 Trace 存储后端，应用继续经 Collector OTLP 导出；Grafana 数据源 UID 为 nagent-tempo。
 - Exemplar：某次指标测量的代表性样本，携带 Trace/Span ID；Grafana 通过 Prometheus exemplar 跳转 Tempo，不构成普通时序 label，不覆盖全部请求。有样本不证明入口完整，缺少样本也不能单独证明没有 Trace；关联合同须同时核对 Trace ID 与 Span ID。
 - Trace to logs：Grafana Tempo 数据源 tracesToLogsV2 基于服务标签、Trace ID 与时间窗口检索 Loki；日志 derivedFields 提供反向 Tempo 链接。
+
+## 观测身份与结果
+
+AgentRun 是一次 Agent 执行，TaskRun 是一次后台任务运行，请求 ID 是一次入口请求的身份；三者不是同一种 run_id。request.channel 表示入口渠道，agent.source 表示本次 Agent 执行来源。completed 事件只表示处理结束，结果使用 success/failure/denied/cancelled/timed_out/skipped/deferred/unknown；审批状态、业务状态和结束原因分别保存。字段与测量权威见 07-observability.md。

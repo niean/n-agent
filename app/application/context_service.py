@@ -448,36 +448,42 @@ class ContextService:
     def build_provider_messages(self, state: AgentState) -> list[dict[str, Any]]:
         """Build provider-visible messages, including temporary memory retrieval.
 
-        T7: The ContextPlan's InjectionPlan is currently advisory. The executor
-        implements equivalent injection logic here (inject into the last message
-        if its role is "user"). Note a subtle difference: the plan's
-        InjectionPlan targets the last non-summary user message found via
-        reversed(candidate messages); this executor targets the last working
-        message if it is "user" (which includes input_messages appended after
-        history). TODO: wire plan.injection.target_message_id directly in a
-        future refactor for full consistency.
+        Recall once per run, then project the snapshot onto the latest
+        non-summary user message on every model call, including after tools or
+        compression. Never write recalled data into conversation history.
         """
         if not self.external_memory_manager or not state.working_messages:
             return state.working_messages
 
-        last_idx = len(state.working_messages) - 1
+        last_idx = next(
+            (
+                idx for idx in range(len(state.working_messages) - 1, -1, -1)
+                if state.working_messages[idx].get("role") == "user"
+                and not extract_text(
+                    state.working_messages[idx].get("content", "")
+                ).startswith(CONTEXT_SUMMARY_PREFIX)
+            ),
+            None,
+        )
+        if last_idx is None:
+            return state.working_messages
         last_msg = state.working_messages[last_idx]
         api_messages = state.working_messages.copy()
         enabled_override: list[str] | None = state.run_options.get("external_memory_enabled")
-        if last_msg.get("role") == "user":
+        if state.external_memory_context is None:
             query_text = extract_text(last_msg["content"])
-            memory_context = self._runtime_memory.read_external_if_allowed(
+            state.external_memory_context = self._runtime_memory.read_external_if_allowed(
                 query_text,
                 session_id=state.session_id,
                 enabled_override=enabled_override,
             )
-            if memory_context:
-                last_msg_copy = last_msg.copy()
-                last_msg_copy["content"] = prepend_text_part(
-                    last_msg["content"],
-                    memory_context + "\n\n",
-                )
-                api_messages[last_idx] = last_msg_copy
+        if state.external_memory_context:
+            last_msg_copy = last_msg.copy()
+            last_msg_copy["content"] = prepend_text_part(
+                last_msg["content"],
+                state.external_memory_context + "\n\n",
+            )
+            api_messages[last_idx] = last_msg_copy
         return api_messages
 
     def build_provider_context(self, state: AgentState, options: dict[str, Any]) -> ProviderContext:
@@ -498,6 +504,16 @@ class ContextService:
                 exposure_policy,
                 context=options.get("tool_execution_context") if isinstance(options, dict) else None,
             )
+            if self.external_memory_manager is not None:
+                # Loaded providers are globally routable; only the locked session
+                # profile determines which memory tools this model may see.
+                manager = self.external_memory_manager
+                enabled_override = state.run_options.get("external_memory_enabled")
+                tools = [
+                    tool for tool in tools
+                    if not manager.has_tool(tool["function"]["name"])
+                    or manager.is_tool_enabled(tool["function"]["name"], enabled_override)
+                ]
         return ProviderContext(messages=messages, tools=tools)
 
 

@@ -271,7 +271,7 @@ if __name__ == "__main__":
         assert chat["attrs"].get("gen_ai.provider.name") == "openai"
         assert chat["attrs"].get("gen_ai.operation.name") == "chat"
         assert tool["attrs"].get("gen_ai.tool.name") == "calculator"
-        assert tool["attrs"].get("nagent.policy_outcome") == "allow", tool["attrs"]
+        assert tool["attrs"].get("nagent.tool.policy_outcome") == "allow", tool["attrs"]
         assert tool["attrs"].get("gen_ai.tool.type") == "function"
         assert root["attrs"].get("gen_ai.operation.name") == "invoke_agent"
         assert root["attrs"].get("gen_ai.agent.name") == "n-agent"
@@ -725,7 +725,7 @@ run_otel_checks() {
   # baseline before the measured turn (isolated per instance, item 24)
   local base_turns base_in_tok base_out_tok base_tool_dur
   local base_agent_dur
-  base_turns="$(prom_sum "sum(nagent_turns_total{$(instance_label)})")"
+  base_turns="$(prom_sum "sum(nagent_agent_runs_total{$(instance_label)})")"
   base_in_tok="$(prom_sum "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})")"
   base_out_tok="$(prom_sum "sum(gen_ai_client_inference_usage_output_tokens_total{$(instance_label)})")"
   base_tool_dur="$(prom_sum "sum(gen_ai_execute_tool_duration_seconds_count{$(instance_label)})")"
@@ -762,7 +762,7 @@ print(trace['traceId'])
   echo "[otel-smoke] Section 3 ok"
 
   echo "[otel-smoke] Section 4: Prometheus GenAI metric increments"
-  wait_prom_delta "sum(nagent_turns_total{$(instance_label)})" "$base_turns" 1
+  wait_prom_delta "sum(nagent_agent_runs_total{$(instance_label)})" "$base_turns" 1
   wait_prom_delta "sum(gen_ai_client_inference_usage_input_tokens_total{$(instance_label)})" "$base_in_tok" 50
   wait_prom_delta "sum(gen_ai_client_inference_usage_output_tokens_total{$(instance_label)})" "$base_out_tok" 25
   wait_prom_delta "sum(gen_ai_execute_tool_duration_seconds_count{$(instance_label)})" "$base_tool_dur" 1

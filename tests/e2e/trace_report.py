@@ -69,10 +69,10 @@ def _verify_chat_http(spans, roots):
         for client in clients:
             attrs = {a["key"]: a.get("value", {}).get("stringValue")
                      for a in client.get("attributes", [])}
-            if any(not attrs.get("nagent.details.http_" + field + ".content")
+            if any(not attrs.get("nagent.content.http_" + field)
                    for field in ("request", "response")):
                 raise ValueError("HTTP Span 缺少请求或结果 payload")
-            if not any(e.get("name") == "http_client_completed" for e in client.get("events", [])):
+            if not any(e.get("name") == "nagent.http.completed" for e in client.get("events", [])):
                 raise ValueError("HTTP Span 缺少完成事件")
 
 
@@ -107,7 +107,7 @@ class TraceCollector:
                 query = ('{resource.service.name="n-agent" && '
                          'span.gen_ai.conversation.id=' + json.dumps(session_id))
                 if source:
-                    query += ' && span.nagent.source=' + json.dumps(source)
+                    query += ' && span.nagent.agent.source=' + json.dumps(source)
                 query += '}'
                 params = urlencode({"q": query, "start": start_ns // 1_000_000_000,
                                     "end": math.ceil(end_ns / 1_000_000_000), "limit": 1000})
@@ -148,7 +148,7 @@ class TraceCollector:
                         started = int(s.get("startTimeUnixNano", 0))
                         if (attrs.get("gen_ai.conversation.id") == session_id
                                 and start_ns <= started < end_ns
-                                and (not source or attrs.get("nagent.source") == source)
+                                and (not source or attrs.get("nagent.agent.source") == source)
                                 and s.get("name", "").startswith("invoke_agent")):
                             matching.append(s)
                     if task_id:
@@ -247,27 +247,32 @@ def _trace_failure(message, reason):
 
 def report_cases(report):
     rows = []
-    def add(name, result, trace=None, reason=""):
+    def add(name, result, trace=None, reason="", *, case_id, attempt, attempt_result):
         trace = trace or {}
         rows.append({"category": "对话", "id": name, "name": name, "result": result,
                      "trace_id": trace.get("trace_id"), "trace_url": trace.get("trace_url"),
-                     "reason": reason})
+                     "reason": reason, "case_id": case_id, "attempt": attempt,
+                     "attempt_result": attempt_result})
     for case in report["cases"]:
         attempts = case.get("attempts") or [{"attempt": 1, **case}]
         for attempt in attempts:
-            if attempt.get("verdict") != "PASS":
-                add(f'{case["id"]} / 尝试{attempt["attempt"]} / 验收汇总', "FAIL",
-                    reason=attempt.get("reason") or "用例未通过，见消息现场")
+            identity = {"case_id": case["id"], "attempt": attempt["attempt"],
+                        "attempt_result": attempt.get("verdict", "FAIL")}
+            if attempt.get("verdict") != "PASS" or not attempt.get("messages"):
+                add(f'{case["id"]} / 尝试{attempt["attempt"]} / 验收汇总',
+                    attempt.get("verdict", "FAIL"),
+                    reason=attempt.get("reason") or "无消息 Trace，见用例验收记录", **identity)
             for message in attempt.get("messages", []):
                 name = f'{case["id"]} / 尝试{attempt["attempt"]} / {message["id"]}'
                 for trace in message.get("traces") or [{}]:
                     label = name + (" / Task" if trace.get("kind") == "task" else "")
                     add(label, message["verdict"], trace,
-                        message.get("trace_reason") or message.get("reason") or "未执行，未产生 Trace")
+                        message.get("trace_reason") or message.get("reason") or "未执行，未产生 Trace", **identity)
                 if message.get("traces") and message.get("trace_reason"):
-                    add(name + " / Trace 验收", "FAIL", reason=message["trace_reason"])
+                    add(name + " / Trace 验收", "FAIL", reason=message["trace_reason"], **identity)
     if report.get("cleanup", {}).get("failed"):
-        add("套件清理", "FAIL", reason="清理失败，详见 report.json 和运行日志")
+        add("套件清理", "FAIL", reason="清理失败，详见 report.json 和运行日志",
+            case_id="__cleanup__", attempt=1, attempt_result="FAIL")
     return rows
 
 
@@ -277,4 +282,4 @@ def render_summary(report):
 
 def render_report(report):
     return (f'E2E：conversations；运行：{report["run_id"]}\n\n' +
-            _report.render_table(report_cases(report)))
+            _report.render_sections(report_cases(report)))
