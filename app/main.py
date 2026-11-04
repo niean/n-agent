@@ -316,7 +316,7 @@ def _configure_execution_logging() -> None:
     register_safe_event("budget_denied kind=%s", "nagent.budget.denied")
 
 
-def _wire_log_sanitizer(information_flow_service, max_bytes: int = 2048) -> None:
+def _wire_log_sanitizer(information_flow_service, max_bytes: int = 1024000) -> None:
     """Atomically publish the ready log sanitizer + span-attr sanitizer.
 
     Spec-261027: called only once the InformationFlowService secret catalog

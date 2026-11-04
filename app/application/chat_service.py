@@ -269,14 +269,16 @@ class ChatCompletionService:
                 message={"role": "assistant", "content": content},
                 finish_reason="stop",
             )
+        persisted_input_message_ids: list[str] = []
         for message in normalized_messages:
             if message.get("role") == "user":
                 if request.persist_messages:
-                    await self._runtime_memory.append_user_message(
+                    persisted_message = await self._runtime_memory.append_user_message(
                         session_id,
                         message.get("content", ""),
                         source=session_source,
                     )
+                    persisted_input_message_ids.append(persisted_message.id)
         if request.persist_messages:
             await self.session_service.ensure_title(session_id, str(first_user_message))
         # Process-origin runs (task/schedule/curator workers) tag their assistant
@@ -289,6 +291,7 @@ class ChatCompletionService:
             session_id=session_id,
             run_id=snapshot.run_context.run_id if snapshot is not None else (request.ingress_facts.run_id if request.ingress_facts is not None else str(uuid4())),
             input_messages=normalized_messages,
+            persisted_input_message_ids=persisted_input_message_ids,
             persist_messages=request.persist_messages,
             message_source=message_source,
         )

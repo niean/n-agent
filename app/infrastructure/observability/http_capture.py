@@ -13,7 +13,7 @@ from opentelemetry import trace
 
 from . import logging as logs
 
-_content_limit = 2048
+_content_limit = 1024000
 
 
 def configure_capture_limit(max_bytes):

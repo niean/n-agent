@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批、Host Terminal 宿主执行链路、Skill 自进化治理、Artifact 制品工作台和 Delegation 多 Agent 委派（delegation_service/run_service/child_agent_executor/tool_executor/parent_adapter + SQLite 7 表 + API/CLI）、Config Bundle 配置迁移（config_bundle_service + domain/config_bundle + config_bundle_readers + sqlite_support + docker/ 四个宿主脚本 + CLI config export|import）、会话 E2E 数据集 Runner（conversations.sh/conversations_runner.py + 12 JSON 数据集 + manifest 权威清理 + LLM Judge）、OTel 可观测（application/telemetry_semantics + infrastructure/observability 四件套 + llm/telemetry_hook + Dashboard OTel 自检页 + docker/observability 后端栈 + 自检页外链 C 类运行时配置 otel_link_config 全链路 + 全层测试套件）；2048 字节观测详情 -->
+<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批、Host Terminal 宿主执行链路、Skill 自进化治理、Artifact 制品工作台和 Delegation 多 Agent 委派（delegation_service/run_service/child_agent_executor/tool_executor/parent_adapter + SQLite 7 表 + API/CLI）、Config Bundle 配置迁移（config_bundle_service + domain/config_bundle + config_bundle_readers + sqlite_support + docker/ 四个宿主脚本 + CLI config export|import）、会话 E2E 数据集 Runner（conversations.sh/conversations_runner.py + 12 JSON 数据集 + manifest 权威清理 + LLM Judge）、OTel 可观测（application/telemetry_semantics + infrastructure/observability 四件套 + llm/telemetry_hook + Dashboard OTel 自检页 + docker/observability 后端栈 + 自检页外链 C 类运行时配置 otel_link_config 全链路 + 全层测试套件）；1024000 字节观测详情 -->
 # 功能与文件映射
 
 - 回合记忆快照：`app/domain/agent.py` 的 `AgentState.external_memory_context` 保存 run 内召回结果；`app/application/context_service.py` 对每次模型请求副本注入；`tests/application/test_context_memory_snapshot.py` 覆盖工具循环、空结果、压缩后重建及 run 隔离，`tests/application/test_agent_graph_compress_context.py` 覆盖 AgentGraph 二次模型调用。
@@ -466,7 +466,7 @@
 ## 观测详情文件映射
 
 - `app/application/telemetry_details.py`：固定字段投影、结构化凭据/媒体遮盖、注入 sanitizer、UTF-8 限长与元数据、出口校验/展平、有界 StreamDetailsAccumulator。
-- `app/config.py` / `app/main.py`：默认 2048 字节的 env-only 配置、共享 sanitizer/预算与日志验证器注入。
+- `app/config.py` / `app/main.py`：默认 1024000 字节的 env-only 配置、共享 sanitizer/预算与日志验证器注入。
 - `app/application/telemetry_semantics.py`、`tool_service.py`、`agent_graph.py`：模型、工具、Agent 详情采集和完成日志/span 一致投影。
 - `app/infrastructure/llm/telemetry_hook.py`、`openai_compatible.py`、`anthropic_provider.py`：最终传输请求、标准化响应、流式增量与旧 hook 安全兼容。
 - `app/infrastructure/observability/logging.py`、`docker/observability/otel-collector.yaml`：可信 details 的 stderr/OTLP/span event 与 Loki 显式白名单投影。

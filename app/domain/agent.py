@@ -78,3 +78,7 @@ class AgentState:
     # Run-scoped recall snapshot, separate from persisted conversation messages.
     # None means not read yet; an empty string is a completed read with no context.
     external_memory_context: str | None = None
+    # IDs returned when this run's input messages were persisted. Context
+    # assembly excludes only these history rows before appending input_messages.
+    # Kept on state (not provider options) so graph round-trips retain identity.
+    persisted_input_message_ids: list[str] = field(default_factory=list)

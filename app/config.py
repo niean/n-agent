@@ -274,7 +274,7 @@ class Settings(BaseSettings):
     # OTel tracing 总开关；endpoint 为空表示 local-only（ConsoleSpanExporter）
     otel_enabled: bool = Field(default=False)
     # B 类启动期 env-only；每个命名详情正文的 UTF-8 字节上限。
-    otel_content_max_bytes: int = Field(default=2048, gt=0)
+    otel_content_max_bytes: int = Field(default=1024000, gt=0)
     # 仅支持显式 http/https 的 gRPC endpoint（http 对应 insecure、https 验证系统 CA），
     # 禁止 userinfo/query/fragment，不提供关闭 TLS 验证的开关
     otel_exporter_otlp_endpoint: str = Field(default="")

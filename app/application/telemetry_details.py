@@ -12,7 +12,7 @@ FIELDS = frozenset(('user_message', 'assistant_message', 'system_prompt',
                     'tool_arguments', 'tool_result', 'error', 'http_request',
                     'http_response', 'log_fields'))
 _METADATA = frozenset(('content', 'original_bytes', 'truncated', 'incomplete', 'observed_bytes'))
-_config: tuple[Callable[[str], str] | None, int] = (None, 2048)
+_config: tuple[Callable[[str], str] | None, int] = (None, 1024000)
 _SENSITIVE = re.compile(r'api.?key|token|password|authorization|cookie|credential|secret|private.?key', re.I)
 _MEDIA = re.compile(r'^data:[^,]*;base64,', re.I)
 _TOKEN_COUNTS = frozenset(('max_tokens', 'max_completion_tokens', 'max_output_tokens',
@@ -20,7 +20,7 @@ _TOKEN_COUNTS = frozenset(('max_tokens', 'max_completion_tokens', 'max_output_to
                           'reasoning_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
 
 
-def configure_details(sanitizer: Callable[[str], str] | None, max_bytes: int = 2048) -> None:
+def configure_details(sanitizer: Callable[[str], str] | None, max_bytes: int = 1024000) -> None:
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValueError('max_bytes must be a positive integer')
     global _config

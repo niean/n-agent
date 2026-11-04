@@ -407,30 +407,40 @@ def test_chat_run_footer_detail_assets():
     assert detail["attrs"].get("aria-live") == "polite"
     assert detail["children"] == [] or not detail["children"]
 
-    # CSS：状态色分类 + 详情视图布局规则
-    ok_rule = _css_rule_bodies(styles, ".run-status--ok")
-    assert ok_rule and "var(--color-success-fg)" in ok_rule[0]
-    bad_rule = _css_rule_bodies(styles, ".run-status--bad")
-    assert bad_rule and "var(--color-danger-fg)" in bad_rule[0]
-    warn_rule = _css_rule_bodies(styles, ".run-status--warn")
-    assert warn_rule and "var(--color-warning-fg)" in warn_rule[0]
-    neutral_rule = _css_rule_bodies(styles, ".run-status--neutral")
-    assert neutral_rule and neutral_rule[0].strip()
-    unknown_rule = _css_rule_bodies(styles, ".run-status--unknown")
-    assert unknown_rule and unknown_rule[0].strip()
+    # CSS：详情视图布局规则；状态元信息不使用专用状态样式
+    assert not _css_rule_bodies(styles, ".run-detail__status")
+    assert not _css_rule_bodies(styles, ".run-status--ok")
+    assert not _css_rule_bodies(styles, ".run-status--warn")
+    assert not _css_rule_bodies(styles, ".run-status--neutral")
     overview = _css_rule_bodies(styles, ".run-detail__overview")
     assert overview and "var(--color-border-light)" in overview[0] and "var(--color-bg-subtle)" in overview[0]
     sections = _css_rule_bodies(styles, ".run-detail__section")
     assert sections and "var(--color-border-light)" in sections[0] and "var(--radius-sm)" in sections[0]
     for selector in (
+        ".run-list",
+        ".run-list__row",
+        ".run-list__time",
+        ".run-list__link",
         ".run-detail",
-        ".run-detail__status",
+        ".run-detail__back",
         ".run-detail__meta-row",
         ".run-detail__error",
         ".run-detail__tool-args",
         ".run-detail__trace-link",
     ):
         assert _css_rule_bodies(styles, selector), f"styles.css must define {selector}"
+    list_rows = _css_rule_bodies(styles, ".run-list__row")
+    assert list_rows and "grid-template-columns: minmax(max-content, 1fr) auto" in list_rows[0]
+    list_times = _css_rule_bodies(styles, ".run-list__time")
+    assert list_times and "min-width: max-content" in list_times[0] and "white-space: nowrap" in list_times[0]
+    assert "overflow: hidden" not in list_times[0] and "text-overflow: ellipsis" not in list_times[0]
+    list_links = _css_rule_bodies(styles, ".run-list__link")
+    assert list_links and "white-space: nowrap" in list_links[0]
+    source = CHAT_JS.read_text(encoding="utf-8")
+    assert "返回执行列表" not in source
+    assert "back.textContent = '返回列表'" in source
+    assert "link.textContent = '详情'" in source
+    assert "run-list__status" not in source
 
 
 def test_chat_session_source_filter_uses_standard_modal():

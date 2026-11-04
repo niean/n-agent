@@ -5049,6 +5049,14 @@ async function testRunFooterDetailOpenAndTabs() {
     && !!detail.querySelector('.run-detail__section--trace'),
     'detail renders distinct tool and Trace groups');
   ok(detail.textContent.indexOf('已完成') !== -1, 'detail shows status text');
+  const metaLabels = Array.from(overview.querySelector('.run-detail__meta').querySelectorAll('.run-detail__meta-label'))
+    .map((label) => label.textContent);
+  ok(metaLabels.join('|') === 'Run ID|来源|状态|结束原因|开始时间|耗时',
+    'detail metadata orders source, status, then end reason (got ' + JSON.stringify(metaLabels) + ')');
+  ok(_detailMetaValue(detail, '状态') && _detailMetaValue(detail, '状态').textContent === '已完成',
+    'detail shows status as a metadata field');
+  ok(overview.querySelector('.run-detail__header').querySelector('.run-detail__status') === null,
+    'detail header no longer contains the status field');
   ok(_detailMetaValue(detail, '耗时') && _detailMetaValue(detail, '耗时').textContent === '18秒',
     'detail reuses footer duration (18秒)');
   ok(_detailMetaValue(detail, '来源') && _detailMetaValue(detail, '来源').textContent === 'dashboard',
@@ -5136,8 +5144,8 @@ async function testRunFooterDetailOpenAndTabs() {
   ok(env.byIdMap['chat-run-detail'].textContent.indexOf('执行详情') !== -1, 'detail open on sA');
   env.fireClick(env.findSessionItem('sB'));
   await _settle(env);
-  ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
-    'session switch resets detail placeholder (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent) + ')');
+  ok(env.byIdMap['chat-run-detail'].querySelector('.run-list__link').dataset.runId === 'run-b',
+    'session switch resets selection and shows the new session run list');
 
   // 用户折叠侧栏后（Run tab 仍激活），同会话新批次的后台重发不得弹回展开；
   // 面板内容仍在新批次 token 下刷新
@@ -5164,21 +5172,19 @@ async function testRunFooterDetailOpenAndTabs() {
     'background reissue still refreshes panel content under new token');
 }
 
-// --- 元信息与工具列表：状态色 / Run ID 截断 / 缺失降级 / 安全参数摘要 ---
+// --- 元信息与工具列表：普通状态文本 / Run ID 截断 / 缺失降级 / 安全参数摘要 ---
 async function testRunFooterDetailMetaAndTools() {
-  // 状态色分类：completed 绿 / failed+cancelled 红 / interrupted+not_started 非成功色 /
-  // running+pending 中性 / 未知灰
   const statusCases = [
-    ['completed', '已完成', 'run-status--ok'],
-    ['failed', '失败', 'run-status--bad'],
-    ['cancelled', '已取消', 'run-status--bad'],
-    ['interrupted', '已中断', 'run-status--warn'],
-    ['not_started', '未开始', 'run-status--warn'],
-    ['running', '运行中', 'run-status--neutral'],
-    ['pending', '运行中', 'run-status--neutral'],
-    ['mystery', '未知', 'run-status--unknown'],
+    ['completed', '已完成'],
+    ['failed', '失败'],
+    ['cancelled', '已取消'],
+    ['interrupted', '已中断'],
+    ['not_started', '未开始'],
+    ['running', '运行中'],
+    ['pending', '运行中'],
+    ['mystery', '未知'],
   ];
-  for (const [status, label, cls] of statusCases) {
+  for (const [status, label] of statusCases) {
     const env = loadChat();
     const rid = 'run-' + status;
     env.setListSessionRunsHandler(() => Promise.resolve([_runRow({ id: rid, status })]));
@@ -5188,11 +5194,12 @@ async function testRunFooterDetailMetaAndTools() {
     _clickRunDetail(env, _runFooters(env)[0]);
     await _settle(env);
     const detail = env.byIdMap['chat-run-detail'];
-    const statusEl = detail.querySelector('.run-detail__status');
+    const statusEl = _detailMetaValue(detail, '状态');
     ok(!!statusEl && statusEl.textContent === label,
       'status ' + status + ' -> text ' + label + ' (got ' + JSON.stringify(statusEl && statusEl.textContent) + ')');
-    ok(!!statusEl && statusEl.className.indexOf(cls) !== -1,
-      'status ' + status + ' -> class ' + cls + ' (got ' + JSON.stringify(statusEl && statusEl.className) + ')');
+    ok(!!statusEl && statusEl.className === 'run-detail__meta-value'
+      && detail.querySelector('.run-detail__status') === null,
+      'status ' + status + ' uses plain metadata styling (got ' + JSON.stringify(statusEl && statusEl.className) + ')');
   }
 
   // Run ID 中段截断（title 全量）、source/end_reason 缺失 —、开始时间与 error 块
@@ -5551,12 +5558,12 @@ async function testRunFooterDetailStaleRequests() {
   ok(env.byIdMap['chat-run-detail'].textContent === '加载中...', 'switch scenario: open shows loading');
   env.fireClick(env.findSessionItem('sB'));
   await _settle(env);
-  ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
-    'session switch clears selection to placeholder (got ' + JSON.stringify(env.byIdMap['chat-run-detail'].textContent) + ')');
+  ok(env.byIdMap['chat-run-detail'].querySelector('.run-list__link').dataset.runId === 'run-b',
+    'session switch clears selection and shows run-b');
   releaseA3();
   await _settle(env);
-  ok(env.byIdMap['chat-run-detail'].textContent === '暂未选择 Run',
-    'late A after session switch does not commit');
+  ok(env.byIdMap['chat-run-detail'].querySelector('.run-list__link').dataset.runId === 'run-b',
+    'late A after session switch does not overwrite the new session list');
 
   // (d) 删除当前会话：清选中与占位，旧请求不提交
   env = loadChat();
@@ -5607,6 +5614,64 @@ async function testRunFooterDetailStaleRequests() {
 }
 
 
+async function testUnselectedSessionRunList() {
+  let env = loadChat();
+  env.setListSessionRunsHandler(() => Promise.resolve([
+    _runRow({ id: 'run-late', created_at: 30, started_at: 30 }),
+    _runRow({ id: 'run-early', created_at: 10, started_at: 10 }),
+    _runRow({ id: 'run-middle', created_at: 20, started_at: 20 }),
+  ]));
+  env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  // 没有关联消息的执行也必须显示；列表不触发逐执行详情读取。
+  await _prepareSession(env, 'list-session', []);
+  const target = env.byIdMap['chat-run-detail'];
+  const list = target.querySelector('.run-list');
+  const rows = target.querySelectorAll('.run-list__row');
+  const links = target.querySelectorAll('.run-list__link');
+  ok(links.length === 3 && links[0].dataset.runId === 'run-early'
+    && links[1].dataset.runId === 'run-middle' && links[2].dataset.runId === 'run-late',
+    'unselected list includes every ledger run in chronological order without messages');
+  ok(!!list && list.tagName === 'DIV' && list.getAttribute('role') === 'list'
+    && list.querySelectorAll('ol').length === 0 && list.querySelectorAll('li').length === 0,
+    'run list uses an unnumbered list structure');
+  ok(rows.length === 3 && rows.every((row, index) => row._kids.length === 2
+    && row._kids[0].classList.contains('run-list__time')
+    && row._kids[0].textContent === '1970-01-01 08:00:' + (index === 0 ? '10' : index === 1 ? '20' : '30')
+    && row._kids[1] === links[index]
+    && links[index].textContent === '详情'
+    && row._kids[0].querySelectorAll('a').length === 0
+    && row.querySelectorAll('.run-list__status').length === 0),
+    'each run row has a complete plain-text time and a final detail link without status or Run ID');
+  env.fireClick(links[1]);
+  await _settle(env);
+  ok(_detailMetaValue(target, 'Run ID').textContent === 'run-middle',
+    'run list link opens the corresponding existing detail view');
+  const detail = target.querySelector('.run-detail');
+  const traceSection = target.querySelector('.run-detail__section--trace');
+  const header = detail.querySelector('.run-detail__header');
+  const back = target.querySelector('.run-detail__back');
+  ok(!!back && back.tagName === 'A' && back.textContent === '返回列表'
+    && !back.classList.contains('btn') && back.parentNode === header
+    && header._kids[header._kids.length - 1] === back
+    && header.querySelector('.run-detail__title').textContent === '执行详情'
+    && traceSection.parentNode === detail && traceSection.querySelector('.run-detail__back') === null
+    && detail.querySelectorAll('.run-detail__back').length === 1
+    && target.textContent.indexOf('返回执行列表') === -1,
+    'text-only back link is the final header child, to the right of the detail title');
+  env.fireClick(back);
+  ok(target.querySelectorAll('.run-list__link').length === 3, 'back restores the session run list');
+
+  env = loadChat();
+  env.setListSessionRunsHandler(() => Promise.resolve([]));
+  await _prepareSession(env, 'empty-session', []);
+  ok(env.byIdMap['chat-run-detail'].textContent === '暂无执行记录', 'empty ledger has explicit empty state');
+
+  env = loadChat();
+  env.setListSessionRunsHandler(() => Promise.reject(new Error('offline')));
+  await _prepareSession(env, 'failed-session', []);
+  ok(env.byIdMap['chat-run-detail'].textContent === '无法加载执行列表', 'list failure differs from empty ledger');
+}
+
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
@@ -5630,6 +5695,7 @@ runIntegration().then(async () => {
   await testRunFooterDetailMetaAndTools();
   await testRunFooterDetailTrace();
   await testRunFooterDetailStaleRequests();
+  await testUnselectedSessionRunList();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

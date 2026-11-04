@@ -279,7 +279,7 @@ def bound_log_session(session_id: Optional[str]):
 
 _sanitizer: Optional[LogSanitizer] = None
 _sanitizer_lock = threading.Lock()
-_content_max_bytes = 2048
+_content_max_bytes = 1024000
 
 
 def ensure_sanitizer():
@@ -295,7 +295,7 @@ def prepare_sanitizer(sanitizer: Optional[LogSanitizer], *, max_bytes=None) -> N
     global _sanitizer, _content_max_bytes
     with _sanitizer_lock:
         _sanitizer = sanitizer
-        _content_max_bytes = max_bytes if type(max_bytes) is int and max_bytes > 0 else 2048
+        _content_max_bytes = max_bytes if type(max_bytes) is int and max_bytes > 0 else 1024000
 
 
 def configure_secret_catalog(known_secrets: object) -> None:

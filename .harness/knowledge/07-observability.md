@@ -160,7 +160,11 @@ HTTPX 原始请求返回日志不是模型返回内容。它通常在传输 Span
 ## 详情：先脱敏，再限长
 
 - 只接受固定详情字段，经 `project_details` 投影。凭据、Cookie、密钥和媒体数据先遮盖，字符串键和值再统一脱敏，最后按 UTF-8 限长。
-- `N_AGENT_OTEL_CONTENT_MAX_BYTES` 默认每项 2048 字节；限制单项 `content`，不是整条日志。元数据保留 `original_bytes`、`truncated`，必要时带 `incomplete/observed_bytes`；未知长度保持未知。
+- Loki `limits_config.max_line_size` 显式为 144MB：按 12 个详情项、message/exception.message 各 1 份和两类 stack 各 4 份的预算，共 22 × 1024000 × 6 = 135168000 字节（JSON 最坏转义），另留信封及上下文余量，防止应用上限提高后整条日志被下游丢弃。Collector 在组装 JSON 行后清空 N-Agent/N-KB attributes，正文不进入 structured metadata，因此不扩大该独立预算。此行上限适配默认正文预算；人工上调正文预算时需同步审查下游行预算。
+- `N_AGENT_OTEL_CONTENT_MAX_BYTES` 默认每项 1024000 字节；限制单项 `content`，不是整条日志。元数据保留 `original_bytes`、`truncated`，必要时带 `incomplete/observed_bytes`；未知长度保持未知。
+- Tempo 2.9 的 `distributor.max_attribute_bytes` 显式设为 `0`，关闭其默认 2048 字节的 Span/Event 属性二次截断；正文预算与完整性元数据由应用投影统一生成。后端截断不会改写应用的 `*_truncated`，验收须同时核对生效配置和入库内容的 UTF-8 长度/摘要。整批接收与整条 Trace 的拒绝预算仍独立生效，不能把单项正文预算当作整条 Trace 的容量保证；已经入库的缺失正文不会因改配置恢复。依据：[Tempo 2.9 截断条件](https://github.com/grafana/tempo/blob/v2.9.0/modules/distributor/distributor.go#L701-L730)。
+- Trace 传输按 12 × 1024000 × 2（Span 与完成 Event）= 24576000 字节正文加信封预算：Collector 与 Tempo 的 OTLP gRPC 接收显式为 32MiB，Tempo 内部 gRPC 收发、querier frontend worker 发送及 `overrides.defaults.global.max_bytes_per_trace` 同为 32MiB；Collector OTLP HTTP 接收为 160MiB，承接 JSON 最坏六倍转义。避免原默认 4MiB OTLP、5MB Trace、16MiB 内部发送拒绝合法详情。此预算保障单个上述规模的 Trace，不保证任意多个满载 Trace 合批或任意长多 Span Trace；队列、批次数和内存限额继续独立约束。配置提升后必须用原失败合批与完整单 Trace 回读验证，不以分批避开实际拒绝。
+- Tempo `overrides.defaults.ingestion.burst_size_bytes` 同设为 32MiB，允许单次合法信封通过令牌桶；持续 `rate_limit_bytes` 保持默认 15000000 字节/秒。默认 20000000 字节 burst 即使令牌已回满也不能接受 24576000 字节的正文信封，等待或仅提高接收限制都无效。
 - 流式内容有界累积；超限、失败或取消时保留已脱敏的可读前缀，标注 truncated/incomplete/observed_bytes；无法得知完整脱敏长度时 original_bytes 保持未知。跨分片凭据和未闭合密钥值也须遮盖。
 - `max_tokens`、`input_tokens` 等数值配置/计数不是凭据，不遮盖。Anthropic 初始工具输入同样保留并脱敏，不因非空而丢弃整次输出。
 - 脱敏或投影不可用时给出明确说明。业务 Span 与自动 HTTP Span 可通过同一详情通道携带正文；Metric、Profile、最近 Span 缓冲不带正文。DB Span 保留操作和表名，不采集原始参数。
@@ -299,7 +303,7 @@ API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际
 | 项目自定义 | HTTP | `nagent.http.caller`、`nagent.http.direction` | string；脱敏调用位置、server/client | Span 与同一次完成 Log/Event 统一事实 |
 | 项目自定义 | 预算/观测/指标 | `nagent.budget.kind`、`nagent.observation.error`、`nagent.metric.overflow` | string/string/bool；预算类别、观测降级诊断、有界维度归并 | unknown_object 保留安全业务日志，不猜所属对象；overflow 为 bool，不是业务 ID |
 | 项目自定义 | Policy 安全检查 | `nagent.policy.name`、`nagent.policy.version`、`nagent.policy.decision_kind`、`nagent.policy.reason`、`nagent.policy.outcome`、`nagent.policy.scope`、`nagent.policy.occurred_at` | string；策略、版本、决策种类、原因、allow/deny/require_approval、作用域、审计时间 | `LoggingPolicyAuditSink` → 独立 ContextVar → 安全 Log/Event；reason 最多 1024 字符，其余字符串最多 256；无决定不补造 |
-| 项目自定义 | 内容 | `nagent.content.<field>`、`nagent.content.<field>_original_bytes`、`nagent.content.<field>_truncated`、`nagent.content.<field>_incomplete`、`nagent.content.<field>_observed_bytes` | string/int/bool/bool/int；安全正文、完整脱敏长度、截断、中断、已观察长度 | 固定 12×5 精确字段集合；Log/Span/Event 默认每项 2048 字节；Metric/Profile/ring buffer 不含正文 |
+| 项目自定义 | 内容 | `nagent.content.<field>`、`nagent.content.<field>_original_bytes`、`nagent.content.<field>_truncated`、`nagent.content.<field>_incomplete`、`nagent.content.<field>_observed_bytes` | string/int/bool/bool/int；安全正文、完整脱敏长度、截断、中断、已观察长度 | 固定 12×5 精确字段集合；Log/Span/Event 默认每项 1024000 字节；Metric/Profile/ring buffer 不含正文 |
 
 ### 事件、状态与结果
 
@@ -412,7 +416,7 @@ Counter 记录累计增量，Histogram 记录单次测量及其分布。模型�
 | http_response | HTTP 响应详情 |
 | log_fields | 日志的结构化详情 |
 
-每项共五个属性：正文 `nagent.content.<field>`，以及 original_bytes、truncated、incomplete、observed_bytes 四项元数据。正文先统一脱敏，再按每项默认 2048 字节限长；流式中断保留安全前缀。完整长度未知时省略 original_bytes，observed_bytes 只表示已观察到的长度。
+每项共五个属性：正文 `nagent.content.<field>`，以及 original_bytes、truncated、incomplete、observed_bytes 四项元数据。正文先统一脱敏，再按每项默认 1024000 字节限长；流式中断保留安全前缀。完整长度未知时省略 original_bytes，observed_bytes 只表示已观察到的长度。
 
 原始 gen_ai.input.messages/output.messages、system_instructions、tool.definitions、tool.call.arguments/result 经安全内容通道投影。Log/Span/Event 可以接收脱敏有界详情；Metric、Profile、自检 ring buffer 不带业务正文。各出口使用精确字段允许集合，未审阅字段不因 gen_ai/nagent 前缀自动进入出口。
 

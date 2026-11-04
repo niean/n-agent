@@ -2698,6 +2698,7 @@
     if (!currentSessionId || typeof api.listSessionRuns !== 'function') return;
     const sessionId = currentSessionId;
     const token = ++sessionLoadToken;
+    renderSessionRunList();
     fetchRunList(sessionId, token);
     fetchOtelLinks(token);
     // 计划修订（T6 审阅，见 plan-261101-add-turn-run-footer.md 审阅驱动的计划修订记录）：
@@ -2725,6 +2726,7 @@
     if (sessionId !== currentSessionId || token !== sessionLoadToken) return; // 旧批次丢弃
     if (Array.isArray(rows)) runListCache[sessionId] = { state: 'ok', rows, token };
     else commitRunListFailure(sessionId);
+    renderSessionRunList();
     try { reconcileRunFooters(); } catch (error) { /* 渲染异常不影响数据提交与后续批次 */ }
   }
 
@@ -2875,16 +2877,6 @@
   // 工具调用按批次缓存：仅本批次已完成的读取可复用；新批次（含运行前旧读取）强制重取
   let runToolCallsCache = null; // { sessionId, token, promise } | null
 
-  // 状态色分类：completed 绿；failed/cancelled 红；interrupted/not_started 明确非成功色；
-  // running/pending 中性；未知灰
-  function runStatusClass(status) {
-    if (status === 'completed') return 'run-status--ok';
-    if (status === 'failed' || status === 'cancelled') return 'run-status--bad';
-    if (status === 'interrupted' || status === 'not_started') return 'run-status--warn';
-    if (status === 'running' || status === 'pending') return 'run-status--neutral';
-    return 'run-status--unknown';
-  }
-
   // Run ID 中段截断：长 ID 首尾各 8 位 + 省略号；title 保留全量
   function runIdShortText(runId) {
     const id = String(runId == null ? '' : runId);
@@ -2997,7 +2989,7 @@
 
   // Trace 区：与 footer 共用 resolveRunTraceDisplay 三态判定（otel 失败优先于空链接，
   // loading 不与“未配置”混淆——此时 footer 不表态，侧栏同样只保留标题不出降级文案）；
-  // 逐条展示前 8 位 ID 链接，不生成空链接
+  // 逐条展示前 8 位 ID 链接，不生成空链接。
   function renderRunDetailTrace(target, row) {
     const section = document.createElement('div');
     section.className = 'run-detail__section run-detail__section--trace';
@@ -3011,10 +3003,7 @@
       noteEl.className = 'run-detail__section-note';
       noteEl.textContent = resolved.note;
       section.appendChild(noteEl);
-      target.appendChild(section);
-      return;
-    }
-    if (resolved && resolved.links && resolved.base) {
+    } else if (resolved && resolved.links && resolved.base) {
       for (let i = 0; i < resolved.links.length; i++) {
         const url = buildTraceUrl(resolved.base, resolved.links[i].id);
         if (!url) continue;
@@ -3042,11 +3031,17 @@
     const titleEl = document.createElement('span');
     titleEl.className = 'run-detail__title';
     titleEl.textContent = '执行详情';
-    const statusEl = document.createElement('span');
-    statusEl.className = 'run-detail__status ' + runStatusClass(row.status);
-    statusEl.textContent = runStatusText(row.status);
+    const back = document.createElement('a');
+    back.className = 'run-detail__back';
+    back.href = '#';
+    back.textContent = '返回列表';
+    back.addEventListener('click', (event) => {
+      event.preventDefault();
+      resetRunDetailPanel();
+      renderSessionRunList();
+    });
     header.appendChild(titleEl);
-    header.appendChild(statusEl);
+    header.appendChild(back);
     overview.appendChild(header);
 
     const meta = document.createElement('div');
@@ -3055,6 +3050,7 @@
       row.id == null ? null : String(row.id)));
     meta.appendChild(renderRunDetailMetaRow('来源',
       (typeof row.source === 'string' && row.source) ? row.source : '—'));
+    meta.appendChild(renderRunDetailMetaRow('状态', runStatusText(row.status)));
     meta.appendChild(renderRunDetailMetaRow('结束原因',
       (typeof row.end_reason === 'string' && row.end_reason) ? row.end_reason : '—'));
     meta.appendChild(renderRunDetailMetaRow('开始时间', runStartedAtText(row)));
@@ -3073,6 +3069,63 @@
     renderRunDetailTools(wrap, calls, runId);
     renderRunDetailTrace(wrap, row);
     target.appendChild(wrap);
+  }
+
+  // 未选中执行时展示整个会话账本，不依赖消息是否携带 run_id。
+  function renderSessionRunList() {
+    const target = ui.byId('chat-run-detail');
+    if (!target || selectedRunDetail) return;
+    const sessionId = currentSessionId;
+    const snapshot = sessionId && runListCache[sessionId];
+    clearNode(target);
+    if (!sessionId) {
+      target.textContent = '暂未选择 Run';
+      return;
+    }
+    if (!snapshot) {
+      target.textContent = '加载执行列表中...';
+      return;
+    }
+    if (snapshot.state !== 'ok') {
+      target.textContent = '无法加载执行列表';
+      return;
+    }
+    const rows = (snapshot.rows || []).filter((row) => row && typeof row.id === 'string' && row.id);
+    rows.sort((a, b) => {
+      const time = (row) => typeof row.created_at === 'number' && isFinite(row.created_at)
+        ? row.created_at : (typeof row.started_at === 'number' && isFinite(row.started_at) ? row.started_at : Infinity);
+      const delta = time(a) - time(b);
+      return (delta && !isNaN(delta)) ? delta : (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    });
+    if (!rows.length) {
+      target.textContent = '暂无执行记录';
+      return;
+    }
+    const list = document.createElement('div');
+    list.className = 'run-list';
+    list.setAttribute('role', 'list');
+    rows.forEach((row) => {
+      const item = document.createElement('div');
+      item.className = 'run-list__row';
+      item.setAttribute('role', 'listitem');
+      const startedEl = document.createElement('span');
+      startedEl.className = 'run-list__time';
+      startedEl.textContent = runStartedAtText(row);
+      const link = document.createElement('a');
+      link.className = 'run-list__link';
+      link.href = '#';
+      link.title = row.id;
+      link.dataset.runId = row.id;
+      link.textContent = '详情';
+      link.addEventListener('click', (event) => {
+        event.preventDefault();
+        if (currentSessionId === sessionId) openRunDetail(sessionId, row.id);
+      });
+      item.appendChild(startedEl);
+      item.appendChild(link);
+      list.appendChild(item);
+    });
+    target.appendChild(list);
   }
 
   // 工具调用读取：本批次内复用已完成读取（token 绑定 sessionLoadToken）；

@@ -274,18 +274,26 @@ pre { max-height: 320px; overflow: auto; padding: var(--space-6); margin: 0; col
   .chat-run-footer { opacity: 1; pointer-events: auto; }
 }
 
-/* Run 详情：概览、工具与 Trace 分组卡片，状态色沿用既有语义 token。 */
+/* Run 列表：无编号两列行，首列完整显示时间，末列提供详情入口。 */
+.run-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; }
+.run-list__row { display: grid; grid-template-columns: minmax(max-content, 1fr) auto; align-items: center; gap: 10px; min-width: 0; padding: 9px 10px; border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); background: var(--color-bg-white); }
+.run-list__row:hover { border-color: var(--color-border-default); background: var(--color-bg-subtle); }
+.run-list__time { min-width: max-content; color: var(--color-fg-muted); font-size: 12px; white-space: nowrap; }
+.run-list__link { justify-self: end; color: var(--color-primary); font-size: 12px; white-space: nowrap; text-align: right; text-decoration: none; }
+.run-list__link:hover { text-decoration: underline; }
+.run-list__link:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
+
+/* Run 详情：概览、工具与 Trace 分组卡片。 */
 .run-detail { display: flex; flex-direction: column; gap: 12px; color: var(--color-fg-default); font-size: 13px; }
+.run-detail__back { flex: 0 0 auto; color: var(--color-primary); font-size: var(--font-size-sm); white-space: nowrap; text-decoration: none; }
+.run-detail__back:hover { text-decoration: underline; }
+.run-detail__back:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }
 .run-detail__overview,
 .run-detail__section { padding: 10px; border: 1px solid var(--color-border-light); border-radius: var(--radius-sm); background: var(--color-bg-subtle); }
 .run-detail__overview { display: flex; flex-direction: column; gap: 10px; }
 .run-detail__header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--color-border-light); }
 .run-detail__title { font-size: var(--font-size-md); font-weight: 600; }
-.run-detail__status { flex: 0 0 auto; padding: 2px 6px; border-radius: var(--radius-sm); background: var(--color-bg-white); font-size: 12px; font-weight: 600; }
-.run-status--ok { color: var(--color-success-fg); }
 .run-status--bad { color: var(--color-danger-fg); }
-.run-status--warn { color: var(--color-warning-fg); }
-.run-status--neutral { color: var(--color-fg-default); }
 .run-status--unknown { color: var(--color-fg-subtle); }
 .run-detail__meta { display: flex; flex-direction: column; gap: 6px; }
 .run-detail__meta-row { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; min-width: 0; }

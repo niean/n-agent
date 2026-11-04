@@ -11,7 +11,7 @@ from app.application.skill_service import (
 from app.domain.skill import Skill, SkillFrontmatter, SkillReadiness, SkillNotFoundError, SkillSource
 
 
-def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path=None, chat_selectable=True, source=SkillSource.USER):
+def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path=None, chat_selectable=True, source=SkillSource.USER, last_scan_status="ok", last_scan_error=None):
     fm = SkillFrontmatter(
         name=name, description="d", version="", platforms=["linux"], tags=[],
         related_skills=[], author="", license="", setup_help=None,
@@ -20,8 +20,8 @@ def _skill(name, readiness=SkillReadiness.AVAILABLE, enabled=True, relative_path
     return Skill(
         id=f"id-{name}", name=name, relative_path=relative_path or f"{name}/SKILL.md",
         description="d", platforms=["linux"], frontmatter=fm,
-        enabled=enabled, readiness=readiness, last_scan_status="ok",
-        last_scan_error=None, last_seen_at=None,
+        enabled=enabled, readiness=readiness, last_scan_status=last_scan_status,
+        last_scan_error=last_scan_error, last_seen_at=None,
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
         chat_selectable=chat_selectable, source=source,
     )
@@ -122,9 +122,13 @@ async def test_resolve_script_bytes_returns_immutable_path_free_facts():
         _skill("disabled", enabled=False),
         _skill("unsupported", readiness=SkillReadiness.UNSUPPORTED),
         _skill("scan-error", readiness=SkillReadiness.SCAN_ERROR),
+        _skill("format-warning", last_scan_status="warning", last_scan_error="format_warning"),
+        _skill("injection", last_scan_status="warning", last_scan_error="injection_warning"),
+        _skill("unscanned", last_scan_status=None),
     ],
 )
 async def test_resolve_script_bytes_requires_enabled_ready_scan_success(skill):
+    """host 脚本解析保持严格扫描门控：format warning 也必须在 SKILL.md 侧修复。"""
     registry, loader = FakeRegistry(), FakeLoader()
     await registry.upsert_skill(skill)
     service = SkillService(registry, loader)

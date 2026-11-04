@@ -829,9 +829,11 @@ def test_env_example_documents_observability_switches():
 
 
 @pytest.mark.parametrize('compose_name', ['docker-compose.yml.example', 'docker-compose.yml'])
-def test_content_budget_defaults_to_2048_in_compose(compose_name):
+def test_content_budget_defaults_to_1024000_in_compose(compose_name):
+    loki = yaml.safe_load((DOCKER_DIR / 'observability/loki.yaml').read_text())
+    assert loki['limits_config']['max_line_size'] == '144MB'
     environment = _load_compose(compose_name)['services']['n-agent']['environment']
-    assert environment['N_AGENT_OTEL_CONTENT_MAX_BYTES'] == '${N_AGENT_OTEL_CONTENT_MAX_BYTES:-2048}'
+    assert environment['N_AGENT_OTEL_CONTENT_MAX_BYTES'] == '${N_AGENT_OTEL_CONTENT_MAX_BYTES:-1024000}'
 
 
 def test_collector_projects_only_approved_detail_fields_and_keeps_detail_logs():

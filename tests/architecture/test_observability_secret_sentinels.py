@@ -785,7 +785,7 @@ def test_approved_details_channel_redacts_and_stays_out_of_ring_and_auto_spans(m
 
     from app.application.telemetry_contract import project_execution_attributes, completion_event, EXECUTION_ATTRIBUTE_KEYS, CONTENT_ATTRIBUTE_KEYS
     monkeypatch.setattr(obs_setup, '_RING_BUFFER_ALLOWED_ATTR_KEYS', EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS)
-    configure_details(sentinel_sanitizer.sanitize)
+    configure_details(sentinel_sanitizer.sanitize, max_bytes=2048)
     spans = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(spans))

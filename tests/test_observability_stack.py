@@ -73,6 +73,40 @@ def test_pyroscope_uses_persisted_bucket_and_explicit_nonzero_disk_thresholds():
     assert config["limits"]["compactor_blocks_retention_period"] == "168h"
 
 
+def test_tempo_preserves_application_content_and_completeness_metadata():
+    config = yaml.safe_load((STACK / "tempo.yaml").read_text())
+    # Tempo 2.9 defaults to 2048 bytes and silently clips both Span and Event
+    # attributes without updating the application's *_truncated metadata.
+    # Application project_details owns the UTF-8 content budget instead.
+    assert config["distributor"].get("max_attribute_bytes") == 0
+
+
+def test_trace_transport_budgets_accept_all_details_on_span_and_event():
+    tempo = yaml.safe_load((STACK / "tempo.yaml").read_text())
+    collector = yaml.safe_load((STACK / "otel-collector.yaml").read_text())
+    # Twelve independently bounded fields may be repeated on the completed
+    # Span's Event. Protobuf preserves UTF-8; OTLP JSON can escape each byte.
+    content_bytes = 12 * 1024000 * 2
+    proto_budget = 32 * 1024 * 1024
+    json_budget = 160 * 1024 * 1024
+    assert content_bytes < proto_budget < json_budget
+    assert content_bytes * 6 < json_budget
+    protocols = collector["receivers"]["otlp"]["protocols"]
+    assert protocols["grpc"].get("max_recv_msg_size_mib") == 32
+    assert protocols["http"].get("max_request_body_size") == json_budget
+    tempo_grpc = tempo["distributor"]["receivers"]["otlp"]["protocols"]["grpc"]
+    assert tempo_grpc.get("max_recv_msg_size_mib") == 32
+    assert tempo["server"].get("grpc_server_max_recv_msg_size") == proto_budget
+    assert tempo.get("overrides", {}).get("defaults", {}).get("global", {}).get("max_bytes_per_trace") == proto_budget
+    assert tempo["server"].get("grpc_server_max_send_msg_size") == proto_budget
+    worker = tempo.get("querier", {}).get("frontend_worker", {}).get("grpc_client_config", {})
+    assert worker.get("max_send_msg_size") == proto_budget
+    ingestion = tempo["overrides"]["defaults"].get("ingestion", {})
+    assert ingestion.get("burst_size_bytes") == proto_budget
+    # Permit one legal envelope without raising sustained ingestion throughput.
+    assert "rate_limit_bytes" not in ingestion
+
+
 @pytest.fixture
 def engine(tmp_path, monkeypatch):
     mod = load_manager()

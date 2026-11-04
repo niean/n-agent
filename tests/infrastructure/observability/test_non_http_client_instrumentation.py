@@ -27,6 +27,7 @@ async def test_runtime_sdk_http_parent_payload_and_completion(
     monkeypatch.setattr(setup, "configure_observability", lambda settings: SimpleNamespace(
         mode="local", shutdown=lambda: None))
     settings = _settings(tmp_path, otel_enabled=True)
+    settings.otel_content_max_bytes = 2048
     settings.profiling_enabled = False
     logs = []
     monkeypatch.setattr(obs, "log_http_client_completed", lambda facts: logs.append(dict(facts)))

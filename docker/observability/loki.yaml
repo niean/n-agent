@@ -35,6 +35,11 @@ schema_config:
 
 limits_config:
   retention_period: 168h
+  # 12 detail fields + message/exception (1 each) + two stacks (4 each),
+  # each bounded by 1024000 bytes; JSON escaping can expand bytes by 6x.
+  # 22 * 1024000 * 6 = 135168000 bytes, plus envelope/context headroom.
+  # Collector clears content attributes before export: metadata keeps its default.
+  max_line_size: 144MB
 
 compactor:
   retention_enabled: true

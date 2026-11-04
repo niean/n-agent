@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose、文件管理规则、Dashboard 前端（modal/alert/按钮/菜单/时间渲染）和 OTel 可观测（B 类 env-only 配置、DDD 分层边界、敏感属性三重封口、metric-name-mapping 权威表）；2048 字节观测详情 -->
+<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose、文件管理规则、Dashboard 前端（modal/alert/按钮/菜单/时间渲染）和 OTel 可观测（B 类 env-only 配置、DDD 分层边界、敏感属性三重封口、metric-name-mapping 权威表）；1024000 字节观测详情 -->
 # 约定与约束（实现细节）
 
 本文件是项目实现规范约定的权威来源，`.harness/PROJECT.md` "项目规范"各节为摘要引用，以本文件为准。
@@ -199,7 +199,13 @@ docker exec n-agent-n-agent-1 n-agent <验收子命令及参数>
 
 观测共性规范和验收口径以 `07-observability.md` 的“共性规范”“验收清单”为权威。本文件保留开发约束摘要：业务入口覆盖全生命周期，同步父子与独立后台 Link 分别表达；完成日志及 histogram 在对应 Span 活跃时记录；失败、拒绝、取消、超时和错误返回如实区分。观测故障不得影响业务 IO 或异常传播，装配幂等且退出统一收尾。新增打点同步核对采集、投影、Collector、存储及查询契约，并用真实 SDK 与后端证据验证；测试修改的所有全局配置消费者须恢复。
 
-`N_AGENT_OTEL_CONTENT_MAX_BYTES` 为 B 类启动期 env-only 正整数，默认 2048，重启生效；不纳入 Dashboard/DB 热改配置。上限按每个命名详情项 content 的 UTF-8 字节计算，元数据不计入正文预算，整条日志可大于该值。结构化敏感键/媒体先遮盖，字符串键和值在 JSON 转义前通过共享 sanitizer，最后按 UTF-8 安全截断。未安装或脱敏失败时关闭详情。已投影内容仅验证，不重复脱敏。未知 original_bytes 在 stderr 为 null，在 OTel/Loki 可省略，禁止伪造为 0。
+`N_AGENT_OTEL_CONTENT_MAX_BYTES` 为 B 类启动期 env-only 正整数，默认 1024000，重启生效；不纳入 Dashboard/DB 热改配置。上限按每个命名详情项 content 的 UTF-8 字节计算，元数据不计入正文预算，整条日志可大于该值。结构化敏感键/媒体先遮盖，字符串键和值在 JSON 转义前通过共享 sanitizer，最后按 UTF-8 安全截断。未安装或脱敏失败时关闭详情。已投影内容仅验证，不重复脱敏。未知 original_bytes 在 stderr 为 null，在 OTel/Loki 可省略，禁止伪造为 0。
+
+Tempo 配置必须显式关闭默认的单属性二次截断（`distributor.max_attribute_bytes: 0`），保留应用正文与截断元数据的一致性；部署后核对实际 `/status/config`，用超过 2048 字节的内容回读 Span 和 Event，而非只检查属性存在。整批/整条 Trace 的独立容量与历史缺口边界见 `07-observability.md`。
+
+默认详情预算的下游传输合同：OTLP gRPC 接收和 Tempo 内部 Trace 收发/单 Trace 上限为 32MiB，Collector OTLP HTTP 接收为 160MiB；按 12 个字段在 Span/Event 各一份和 JSON 最坏转义计算并留信封余量。调整字段数或正文预算时同步审查接收、存储、查询发送预算，并做实际满载回读；不将分批成功当作原失败合批已修复。
+
+Tempo ingestion burst 同为 32MiB，持续 rate 保持默认；令牌桶 burst 必须至少容纳单次合法信封，不能把默认 20MB burst 拒绝误判成瞬时负载或靠等待恢复。
 
 流式临时预算为正文上限四倍，超限/错误/取消保留脱敏限长前缀并标记 truncated/incomplete；无法确定完整长度时 original_bytes 为未知。observed_bytes 表示实际观察字节，HTTP 为传输字节，LLM 为字符串增量；先合并有界原始内容再统一脱敏。Anthropic 非空初始结构化 tool input 增量编码后保留。semantics 静态边界仅精确允许纯 stdlib telemetry_details 依赖，其他业务/SDK 依赖继续拒绝。
 

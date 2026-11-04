@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 12 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；2048 字节观测详情 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 12 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；1024000 字节观测详情 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -6,6 +6,8 @@
 完整 DDD 子域划分、聚合实体和应用服务调用流见 `.harness/knowledge/06-domain-model.md`。
 
 `AgentState`（`app/domain/agent.py`）：Agent Runtime 的运行状态，字段包括 session_id、input_messages、working_messages、pending_tool_calls、tool_results、summary、run_status、iteration_count、error、final_message、finish_reason。该模型属于 Domain，不包含 LangGraph 类型。
+
+`AgentState.persisted_input_message_ids` 为本次输入与落盘副本的运行期关联，类型 `list[str]`、默认独立空列表，追加在 dataclass 末尾以兼容既有位置构造。仅由 `ChatCompletionService` 收集本次 `append_user_message` 返回的真实消息 ID；`ContextService` 在历史候选选择前排除这些 ID，随后追加完整 `input_messages`，不同 ID 的同文历史仍保留。`persist_messages=False` 或未落盘输入时为空，不按内容猜测关联。该字段随 Graph 状态及 `AgentState(**result)` 恢复，不新增数据库列、不进入 Provider options 或消息协议。
 
 持久执行身份在 `agent_runs`；`RunBinding`/`AgentRunRegistry`（`app/domain/agent_run.py`）定义所有权及存储端口。`app/domain/agent.py` 的旧 `AgentRun` DTO 保留兼容，运行期使用 AgentState，不把旧 DTO 当作已持久化的账本。
 
@@ -444,7 +446,7 @@ Docker Compose 数据边界：观测后端 6 服务（otel-collector/tempo/prome
 
 ## 观测详情数据边界
 
-新增 Settings `otel_content_max_bytes`（环境变量 `N_AGENT_OTEL_CONTENT_MAX_BYTES`，默认 2048，gt=0，启动绑定）。不新增数据库表或详情附件存储。固定字段为 user_message、assistant_message、system_prompt、input_messages、tool_definitions、output_messages、tool_arguments、tool_result、error、http_request、http_response、log_fields；每项 `{content, original_bytes, truncated}`，流式可带 incomplete/observed_bytes。original_bytes 为完整脱敏文本 UTF-8 长度，无法计算时为未知（stderr null，OTel/Loki 键缺席）；observed_bytes 为已观察字节数（HTTP 传输字节或 LLM 字符串增量），不等于完整脱敏长度。Log 顶层 details、OTLP/span 的 `nagent.content.<field>` 及 `_original_bytes/_truncated/_incomplete/_observed_bytes` 后缀与 Collector 的显式逐字段投影共享该合同；不将正文写入 metric labels 或自检 snapshot。
+新增 Settings `otel_content_max_bytes`（环境变量 `N_AGENT_OTEL_CONTENT_MAX_BYTES`，默认 1024000，gt=0，启动绑定）。不新增数据库表或详情附件存储。固定字段为 user_message、assistant_message、system_prompt、input_messages、tool_definitions、output_messages、tool_arguments、tool_result、error、http_request、http_response、log_fields；每项 `{content, original_bytes, truncated}`，流式可带 incomplete/observed_bytes。original_bytes 为完整脱敏文本 UTF-8 长度，无法计算时为未知（stderr null，OTel/Loki 键缺席）；observed_bytes 为已观察字节数（HTTP 传输字节或 LLM 字符串增量），不等于完整脱敏长度。Log 顶层 details、OTLP/span 的 `nagent.content.<field>` 及 `_original_bytes/_truncated/_incomplete/_observed_bytes` 后缀与 Collector 的显式逐字段投影共享该合同；不将正文写入 metric labels 或自检 snapshot。
 
 Tempo 使用 tempo-data:/var/tempo 独立命名卷（WAL/blocks），168h 保留，API 3200 仅绑定 127.0.0.1，OTLP 4317 仅容器内网。Prometheus exemplar 存储保存代表性 Trace/Span 关联；其保留与时序常规样本不同，不承诺每个指标点都有 Trace。
 

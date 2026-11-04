@@ -3,12 +3,20 @@
 auth_enabled: false
 server:
   http_listen_port: 3200
+  # Internal distributor/ingester RPC must accept one full detail envelope.
+  grpc_server_max_recv_msg_size: 33554432
+  grpc_server_max_send_msg_size: 33554432
 distributor:
+  # Application details own the UTF-8 budget and completeness metadata.
+  # Tempo's 2048-byte default silently clips Span/Event values after projection.
+  max_attribute_bytes: 0
   receivers:
     otlp:
       protocols:
         grpc:
           endpoint: 0.0.0.0:4317
+          # 12 fields * 1024000 bytes * Span/Event copies, plus envelope.
+          max_recv_msg_size_mib: 32
 ingester:
   max_block_duration: 5m
 compactor:
@@ -21,5 +29,18 @@ storage:
       path: /var/tempo/wal
     local:
       path: /var/tempo/blocks
+overrides:
+  defaults:
+    ingestion:
+      # Accept one full envelope; keep the default sustained rate unchanged.
+      burst_size_bytes: 33554432
+    global:
+      # Trace-wide cap is independent of application per-field truncation.
+      max_bytes_per_trace: 33554432
+querier:
+  frontend_worker:
+    grpc_client_config:
+      # Querier returns the complete Trace through this internal stream.
+      max_send_msg_size: 33554432
 usage_report:
   reporting_enabled: false

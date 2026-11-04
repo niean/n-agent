@@ -512,7 +512,8 @@ async def test_build_context_state_dedupes_persisted_user_message(tmp_path):
     from app.domain.session import ConversationMessage
     user_msg = {"role": "user", "content": "新增预单的六层"}
     # Simulate ChatService persisting user message before graph run
-    await store.append_message("s-dedup", ConversationMessage(role="user", content=user_msg["content"]))
+    persisted = ConversationMessage(role="user", content=user_msg["content"])
+    await store.append_message("s-dedup", persisted)
     provider = DirectProvider()
     runner = AgentGraphRunner(
         provider,
@@ -520,7 +521,10 @@ async def test_build_context_state_dedupes_persisted_user_message(tmp_path):
         store,
         HeuristicSummarizer(),
     )
-    state = AgentState(session_id="s-dedup", input_messages=[user_msg])
+    state = AgentState(
+        session_id="s-dedup", input_messages=[user_msg],
+        persisted_input_message_ids=[persisted.id],
+    )
     await runner.context_service.build_context_state(state)
     user_count = sum(1 for m in state.working_messages if m.get("role") == "user")
     assert user_count == 1, f"expected 1 user message, got {user_count}: {state.working_messages}"

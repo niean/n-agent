@@ -97,7 +97,7 @@ def test_completed_overflow_is_still_incomplete():
 def test_settings_env_positive(monkeypatch):
     from app.config import Settings
     monkeypatch.delenv('N_AGENT_OTEL_CONTENT_MAX_BYTES', raising=False)
-    assert Settings(_env_file=None).otel_content_max_bytes == 2048
+    assert Settings(_env_file=None).otel_content_max_bytes == 1024000
     monkeypatch.setenv('N_AGENT_OTEL_CONTENT_MAX_BYTES', '17')
     assert Settings(_env_file=None).otel_content_max_bytes == 17
     monkeypatch.setenv('N_AGENT_OTEL_CONTENT_MAX_BYTES', '0')

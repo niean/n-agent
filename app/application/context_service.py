@@ -167,7 +167,11 @@ class ContextService:
         # 历史 role=system 消息（ui.task_command 命令记录 / ui.task_lifecycle 生命周期 /
         # ui.task_result 最终结果）是 UI 通知，排除出模型候选、压缩与外部记忆钩子；运行时
         # system prompt 仍由 build_system_prompt 构建并作为 working_messages[0]，不落盘。
-        eligible_messages = [m for m in messages if m.role != "system"]
+        persisted_input_ids = set(state.persisted_input_message_ids)
+        eligible_messages = [
+            m for m in messages
+            if m.role != "system" and m.id not in persisted_input_ids
+        ]
         summary = await self._runtime_memory.get_summary_if_allowed(state.session_id)
         enabled_override = state.run_options.get("external_memory_enabled")
 
@@ -193,7 +197,7 @@ class ContextService:
         # -- Execute message selection --
         # NOTE: plan.selected_message_ids is currently advisory. The executor
         # uses _build_latest_compressed_context + _sanitize_conversation_tool_pairs
-        # + _dedupe_trailing, which implement equivalent selection logic.
+        # after excluding this run's persisted input IDs above.
         # There is a subtle edge-case divergence: the policy's _select_messages
         # drops ALL is_summarized non-summary messages when a latest summary
         # exists; the executor's _build_latest_compressed_context keeps
@@ -205,7 +209,6 @@ class ContextService:
         context_messages = _sanitize_conversation_tool_pairs(
             _build_latest_compressed_context(eligible_messages)
         )
-        context_messages = _dedupe_trailing(context_messages, state.input_messages)
         state.context_message_ids = [m.id for m in context_messages]
 
         skills_index: str | None = None
@@ -634,27 +637,3 @@ def _build_latest_compressed_context(messages: list[ConversationMessage]) -> lis
     head_ids = {m.id for m in head}
     tail = [m for m in kept_non_summary if m.id not in head_ids]
     return [*head, latest_summary, *tail]
-
-
-def _msg_role_content_key(msg: Any) -> tuple[str, str]:
-    """Normalize a message to a (role, content_text) key for dedup comparison."""
-    role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
-    content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-    if isinstance(content, list):
-        content = json.dumps(content, default=str, ensure_ascii=False)
-    elif not isinstance(content, str):
-        content = str(content or "")
-    return (role or "", content)
-
-
-def _dedupe_trailing(history: list, inputs: list) -> list:
-    """Drop trailing history entries that already appear in inputs."""
-    if not inputs:
-        return history
-    n = len(inputs)
-    if len(history) < n:
-        return history
-    tail = history[-n:]
-    if all(_msg_role_content_key(t) == _msg_role_content_key(i) for t, i in zip(tail, inputs)):
-        return history[:-n]
-    return history

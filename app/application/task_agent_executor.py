@@ -190,9 +190,7 @@ class TaskAgentExecutor:
         execution_run_id = f"task-run-{uuid4().hex[:12]}"
 
         # system prompt 由 ContextService 运行时构建（build_system_prompt，含固定 Task Guidance），
-        # 不在 request 中传 system 消息，避免 working_messages 出现重复 system + 重复 user
-        # （request 的 user 经 ChatCompletionService 持久化进 history，又经 input 重复；
-        # 且 request 的 system 打头会破坏 _dedupe_trailing 对 user 的去重）。
+        # request 只传任务输入，避免重复提供同一份 Task Guidance。
 
         # Build granted tools and permitted managed tools
         # 防递归（Task 7）：即便 task.execution_policy.allowed_tools 被误配置为

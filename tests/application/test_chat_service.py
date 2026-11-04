@@ -78,6 +78,150 @@ def _build_service(store, tmp_path):
     return ChatCompletionService(store, runner, session_service)
 
 
+class InputRecordingProvider(FakeProvider):
+    def __init__(self, *, use_tool=False):
+        self.calls = []
+        self.use_tool = use_tool
+
+    async def chat(self, messages, tools, stream, model, options):
+        assert "persisted_input_message_ids" not in options
+        assert all("persisted_input_message_ids" not in message for message in messages)
+        self.calls.append([dict(message) for message in messages])
+        if self.use_tool and len(self.calls) == 1:
+            return LLMResult(
+                message={
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{
+                        "id": "calculate-once", "type": "function",
+                        "function": {"name": "calculator", "arguments": '{"expression":"1+2"}'},
+                    }],
+                },
+                finish_reason="tool_calls",
+            )
+        return LLMResult(message={"role": "assistant", "content": "done"}, finish_reason="stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inputs", [
+    [{"role": "user", "content": "current"}],
+    [{"role": "system", "content": "scheduled instructions"}, {"role": "user", "content": "current"}],
+    [{"role": "user", "content": "first"}, {"role": "system", "content": "instructions"},
+     {"role": "user", "content": "current"}],
+])
+async def test_current_input_is_not_replayed_from_persisted_history(tmp_path, inputs):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    provider = InputRecordingProvider(use_tool=True)
+    runner = AgentGraphRunner(
+        provider, ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store, HeuristicSummarizer(),
+    )
+    service = ChatCompletionService(store, runner, SessionService(store))
+    await service.complete(ChatCompletionInput(
+        model="test", messages=inputs, stream=False, session_id="current-input",
+    ))
+
+    expected = [message for message in inputs if message["role"] == "user"]
+    assert len(provider.calls) == 2  # Includes the follow-up after a real calculator call.
+    for messages in provider.calls:
+        assert [message for message in messages if message["role"] == "user"] == expected
+        for message in inputs:
+            assert messages.count(message) == 1
+    stored_users = [message for message in await store.list_messages("current-input") if message.role == "user"]
+    assert len(stored_users) == len(expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_messages", [True, False])
+async def test_identical_history_is_distinct_from_current_input(tmp_path, persist_messages):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="same-content"))
+    old = ConversationMessage(role="user", content="same")
+    await store.append_message("same-content", old)
+    provider = InputRecordingProvider()
+    runner = AgentGraphRunner(
+        provider, ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store, HeuristicSummarizer(),
+    )
+    service = ChatCompletionService(store, runner, SessionService(store))
+    await service.complete(ChatCompletionInput(
+        model="test", messages=[{"role": "user", "content": "same"}],
+        stream=False, session_id="same-content", persist_messages=persist_messages,
+    ))
+
+    users = [message for message in provider.calls[0] if message["role"] == "user"]
+    assert users == [{"role": "user", "content": "same"}] * 2
+    stored_users = [message for message in await store.list_messages("same-content") if message.role == "user"]
+    assert stored_users[0].id == old.id
+    assert len(stored_users) == (2 if persist_messages else 1)
+
+
+@pytest.mark.asyncio
+async def test_input_identity_survives_state_restore_and_context_rebuild(tmp_path):
+    from dataclasses import asdict
+    from app.application.context_service import ContextService
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    service = _build_service_with_runner(store, runner)
+    inputs = [{"role": "system", "content": "instructions"}, {"role": "user", "content": "current"}]
+    await service.complete(ChatCompletionInput(
+        model="test", messages=inputs, stream=False, session_id="restored-input",
+    ))
+    # LangGraph returns the state as a field dictionary before AgentState reconstruction.
+    state = AgentState(**asdict(runner.calls[0]["state"]))
+    stored = await store.list_messages("restored-input")
+    assert state.persisted_input_message_ids == [message.id for message in stored]
+    context = ContextService(store)
+    for _ in range(2):
+        await context.build_context_state(state)
+        assert state.working_messages[1:] == inputs
+        assert state.context_message_ids == []
+
+
+@pytest.mark.asyncio
+async def test_compression_marks_history_ids_without_replaying_current_input(tmp_path):
+    from app.application.context_service import ContextService
+
+    inputs = [{"role": "system", "content": "instructions"}, {"role": "user", "content": "same"}]
+
+    class CapturingCompressionEngine:
+        async def compress(self, messages, **kwargs):
+            self.messages = list(messages)
+            return ContextCompressionResult(
+                messages=[{"role": "user", "content": CONTEXT_SUMMARY_PREFIX + "history"}, *inputs],
+                summary="history", compressed=True, skipped_reason=None,
+                original_tokens=100, compressed_tokens=20, summarized_message_indices=[0, 1],
+            )
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="compress-input"))
+    old_user = ConversationMessage(role="user", content="same")
+    old_assistant = ConversationMessage(role="assistant", content="previous reply")
+    for message in (old_user, old_assistant):
+        await store.append_message("compress-input", message)
+    runner = RecordingRunner()
+    await _build_service_with_runner(store, runner).complete(ChatCompletionInput(
+        model="test", messages=inputs, stream=False, session_id="compress-input",
+    ))
+    state = runner.calls[0]["state"]
+    state.run_options = {"force_compress": True}
+    engine = CapturingCompressionEngine()
+    context = ContextService(store, context_engine=engine)
+    await context.build_context_state(state)
+    assert state.context_message_ids == [old_user.id, old_assistant.id]
+    await context.compress_prepared_context(state)
+    assert engine.messages == [
+        {"role": "user", "content": "same"},
+        {"role": "assistant", "content": "previous reply"},
+        *inputs,
+    ]  # Current input still participates in compression/token-budget decisions.
+    stored = {message.id: message for message in await store.list_messages("compress-input")}
+    assert stored[old_user.id].is_summarized is True
+    assert stored[old_assistant.id].is_summarized is True
+    assert all(stored[message_id].is_summarized is False for message_id in state.persisted_input_message_ids)
+    assert state.working_messages[-2:] == inputs
+
+
 @pytest.mark.asyncio
 async def test_chat_service_non_stream_returns_message(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")

@@ -1,6 +1,22 @@
 <!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
 # 项目教训
 
+### P082: 本次输入的历史副本须按消息身份排除
+
+- 现象：定时任务模型调用 Span `8244159c20354f96` 的输入出现两份相同 user 指令，中间夹有定时任务 system 指令；另发现不持久化输入与历史末尾同文时，旧去重逻辑会误删真实历史。
+- 根因：ChatCompletionService 先保存 user 消息，再把完整本次输入传入 ContextService；后者靠历史尾部与整组输入的 role/content 比较去重。`[system,user]` 与只落盘的 `[user]` 不匹配，而不同轮次的同文输入又可能被误认成同一消息。
+- 教训：持久历史与本次输入的关联须传递真实消息 ID，不从文本或角色位置推断。本次新落盘 ID 在上下文历史候选选择前排除，完整本次输入只拼接一次；历史同文不同 ID 保留，未落盘输入不触发历史排除。回归同时覆盖持久化开关、运行状态恢复、工具循环及压缩标记的 ID 对齐。
+- 来源：2026-11-04 修复输入重复装配；红绿及验收证据见 `.harness/specs/verify/verify-261104-fix-input-message-duplication.md`。
+
+### P081: 应用限长元数据不能证明后端未再次截断
+
+- 现象：Trace `40519b4e8dec9617fe43469498aff668`、Span `f05bf49d0f7e628a` 的 input_messages/system_prompt/tool_definitions 均只存 2048 个 UTF-8 字节，original_bytes 分别为 23839/14605/7500，truncated 却均为 false。
+- 根因：应用的 1024000 字节预算未触发，Tempo 2.9 的 distributor 默认 max_attribute_bytes=2048 在入库前静默二次截断属性，不会更新应用定义的截断标志；原配置未显式覆盖，运行时截断计数为 33。
+- 教训：正文预算和完整性元数据必须由同一投影维护，下游不再做无元数据的二次截断。核对锁定版本的默认值、实际配置和截断指标；真实回读比较 UTF-8 字节与摘要，覆盖 Span 和 Event，不能以字段存在或 truncated=false 证明完整。整条 Trace 的拒绝预算与单项预算分别验证，历史缺失不能补造。
+- 来源：2026-11-04 修复 Tempo 属性截断；tempo.yaml 显式 max_attribute_bytes=0，配置合同 RED 1 failed、GREEN 32 passed；现场与红绿摘要见 locals/harness_tmp/tempo-truncation-evidence.md。
+- 后续验收：关闭属性截断后，3 条安全合成 Trace 约 4.3MiB 的 Collector 合批被 Tempo OTLP receiver 默认 4MiB 拒绝，ResourceExhausted 导致 dropped_items=3。同时核对到 5MB 整 Trace 与 16MiB 内部发送限制。按完整 12 项在 Span/Event 各一份设置 32MiB protobuf/单 Trace/内部发送预算，JSON 接收为 160MiB；容量合同 RED 后 GREEN 33 passed。排查容量须贯穿接收、入库、查询回复，不只检查 server9095 而遗漏独立的 OTLP4317 receiver；真实满载回读证据由验收追加。
+- 满载复核：24.576MB 正文信封仍被默认 20MB ingestion burst 永久拒收，实际日志 batch size=24579755、dropped_items=1；burst 小于单次合法信封，等待令牌恢复无效。将 ingestion.burst_size_bytes 对齐 32MiB，持续 rate 保持默认 15MB/s，新增合同再次 RED 1 failed→GREEN 33 passed。容量核对同时包含速率令牌桶的单次 burst，不能只查传输与存储上限。
+
 ### P080: 临时记忆注入须覆盖完整工具循环
 
 - 现象：首个模型请求已携带默认北京的 mem0 记忆，读取 weather 技能后第二个请求丢失记忆，模型再次调用 mem0_profile。
@@ -739,3 +755,10 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：把底层侧文件生命周期误当数据库模式合同；测试打包遗漏正式导出器的 COPYFILE_DISABLE 环境约定，未主动制造扩展属性。
 - 教训：以底层实际返回值、持久数据和并发保护验证安全，不直接 unlink 侧文件追求通过。归档夹具复制完整环境，并用真实扩展属性构造反例；不能放宽导入清单校验来容忍夹具污染。
 - 来源：D086/D087；原失败与真实 macOS 元数据反例均完成红绿闭环，相关282项存储及212项归档回归通过。
+
+### P078: 宿主执行面按严格扫描门控，warning 必须在内容侧修复
+
+- 现象：定时任务 host_terminal skill_script 解析报 `skill_script_not_found`（Trace e293cdb4b8331cf1b9e7c1e9546d2d63 span 24b647be05bb4fa3），而 skill 磁盘与 registry 均在、enabled、readiness=available，仅 `last_scan_status=warning`（format_warning，SKILL.md 缺中文别名括号）。
+- 根因：`resolve_script_bytes` 按 `last_scan_status="ok"` 严格门控，扫描 warning（即使扫描层设计为非阻断入册）会静默使已授权定时任务失败；错误码 `skill_script_not_found` 无法区分"不存在"与"格式瑕疵被拦"。
+- 教训：宿主执行面比聊天暴露面更严格是设计决策（用户确认，曾试放宽为 format_warning 白名单后改回严格门控）：扫描 warning 必须在 SKILL.md 内容侧修复并重扫（`POST /chat/skills/refresh`）后才能执行脚本，禁止用放宽下游门控的方式绕过内容问题；同时核对策略文件（host-terminal-policy.yaml）规则 sha256 与脚本一致并升 version 触发快照重载。排障时先对比 registry 的 last_scan_status/error 与 skill 可用性展示的差异。
+- 来源：fix-bug workflow；内容侧修复后重扫 status=ok，严格门控测试覆盖 format_warning/injection_warning/None 阻断分支。

@@ -320,7 +320,12 @@ class SkillService:
     async def resolve_script_bytes(
         self, skill_name: str, script_relative_path: str
     ) -> SkillScriptBytes:
-        """Resolve bytes only for a ready, enabled, successfully scanned Skill."""
+        """Resolve bytes only for a ready, enabled, successfully scanned Skill.
+
+        Host script resolution keeps a strict scan gate: only skills whose
+        last scan finished clean (``last_scan_status == "ok"``) are
+        resolvable; format warnings must be fixed at the SKILL.md source.
+        """
         skill = await self.registry.get_skill(skill_name)
         if (
             skill is None

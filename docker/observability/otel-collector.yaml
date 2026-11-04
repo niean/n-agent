@@ -10,8 +10,12 @@ receivers:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
+        # 12 fields * 1024000 UTF-8 bytes * Span/Event copies + envelope.
+        max_recv_msg_size_mib: 32
       http:
         endpoint: 0.0.0.0:4318
+        # Same payload with worst-case six-byte JSON escaping, plus envelope.
+        max_request_body_size: 167772160
 
 processors:
   memory_limiter:
