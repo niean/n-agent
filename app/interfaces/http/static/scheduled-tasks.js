@@ -56,6 +56,7 @@
     const node = document.createElement('button');
     node.type = 'button';
     node.className = className || 'btn';
+    node.style.fontSize = 'var(--font-size-md)';
     node.textContent = label;
     node.addEventListener('click', onClick);
     return node;
@@ -218,8 +219,19 @@
   }
 
   function openTaskForm(task) {
-    state.modal = { type: 'form', task: task || null, error: '' };
+    const delivery = task && task.delivery || {};
+    const kind = delivery.kind || (task && task.delivery_target) || 'silent';
+    const draft = {
+      name: task ? task.name : '', prompt: task ? task.prompt : '',
+      cron: task ? task.cron_expression : '', timezone: task ? task.timezone : 'Asia/Shanghai',
+      tools: task ? (task.allowed_tools || []).join(',') : '', session: task ? task.session_id : '',
+      deliveryKind: kind, deliveryId: delivery.conversation_id || '', deliveryDirty: !task,
+    };
+    const modal = { type: 'form', task: task || null, draft, error: '', generation: 0,
+      sessions: [], selectedSession: null, total: null, offset: 0, loading: false, sessionsError: '', selectedError: '' };
+    state.modal = modal;
     showModal();
+    loadDeliverySessions(modal, true);
   }
 
   // 详情作为独立页面视图，URL 形如 /scheduled-tasks/{task_id}。
@@ -312,78 +324,185 @@
     parent.appendChild(header);
   }
 
+  function deliveryName(delivery) {
+    return delivery.kind === 'feishu' ? '飞书IM' : delivery.kind === 'silent' || delivery.kind === 'dashboard' ? '不投递飞书IM' : '历史接收会话';
+  }
+
+  function deliveryLocation(delivery) {
+    return delivery.kind === 'dashboard' || delivery.kind === 'silent' ? '不投递飞书IM' : delivery.label;
+  }
+
+  function deliveryReason(reason) {
+    const reasons = {
+      platform_unavailable: '飞书连接不可用', unsupported_platform: '历史平台暂不支持投递',
+      home_target_not_configured: '尚未配置默认通知会话', invalid_legacy_target: '历史接收位置不完整',
+      conversation_not_found: '接收会话已不存在', same_chat_representative: '同一父聊天请使用可选的代表会话',
+      unknown_chat_type: '聊天类型尚未确认', ambiguous_chat_type: '聊天类型存在冲突',
+      unsupported_address_type: '聊天类型尚未确认或暂不支持', address_type_conflict: '聊天类型存在冲突',
+      snapshot_mismatch: '接收会话已变化，请重新选择', unsupported_target: '暂不支持此接收位置',
+      invalid_delivery_target: '接收位置无效', invalid_import_target: '导入的接收位置无效',
+    };
+    return reasons[reason] || (reason ? '接收位置当前不可用，请重新选择或刷新' : '状态未知');
+  }
+
+  // Accept the original gateway projection while preferring the stable delivery-prefixed aliases.
+  function deliverySession(item) {
+    return { id: item.id, delivery_available: item.delivery_available,
+      delivery_chat_name: item.delivery_chat_name,
+      delivery_label: item.delivery_label ?? item.label,
+      delivery_unavailable_reason: item.delivery_unavailable_reason ?? item.unavailable_reason,
+      delivery_parent_chat: item.delivery_parent_chat ?? item.parent_chat };
+  }
+
+  function currentDeliveryRequest(modal, generation) {
+    return state.modal === modal && modal.generation === generation;
+  }
+
+  // Each modal load owns a generation; late responses cannot mutate another draft.
+  async function loadDeliverySessions(modal, reset) {
+    if (state.modal !== modal || (modal.loading && !reset)) return;
+    if (reset) {
+      modal.generation += 1;
+      modal.sessions = []; modal.sessionIds = new Set(); modal.total = null; modal.offset = 0; modal.sessionsError = ''; modal.selectedError = '';
+    }
+    const generation = modal.generation;
+    modal.loading = true;
+    showModal();
+    if (reset && modal.draft.deliveryId) {
+      const selectedId = modal.draft.deliveryId;
+      (async () => {
+        try {
+          const item = await api.getGatewaySession('feishu', selectedId);
+          if (!item || item.id !== selectedId) throw new Error('当前会话响应不完整');
+          if (!currentDeliveryRequest(modal, generation) || modal.draft.deliveryId !== selectedId) return;
+          modal.selectedSession = deliverySession(item);
+        } catch (_) {
+          if (!currentDeliveryRequest(modal, generation) || modal.draft.deliveryId !== selectedId) return;
+          modal.selectedError = '当前接收会话加载失败；保留原选择，请刷新浏览器后重试。';
+        }
+        if (currentDeliveryRequest(modal, generation)) showModal();
+      })();
+    }
+    try {
+      do {
+        const offset = modal.offset;
+        const page = await api.listGatewaySessions('feishu', { limit: 20, offset });
+        if (!currentDeliveryRequest(modal, generation)) return;
+
+        if (!page || !Array.isArray(page.items) || !Number.isInteger(page.total) || page.total < 0 ||
+            page.offset !== offset || page.limit !== 20 || (modal.total !== null && page.total !== modal.total) ||
+            page.items.length > page.limit || offset + page.items.length > page.total ||
+            (!page.items.length && offset < page.total)) throw new Error('分页数据不完整');
+        for (const item of page.items) {
+          if (!item || typeof item.id !== 'string' || !item.id || modal.sessionIds.has(item.id)) throw new Error('分页会话重复或缺失');
+          modal.sessionIds.add(item.id);
+        }
+        modal.sessions.push(...page.items.filter(item => item.delivery_available === true).map(deliverySession));
+        modal.total = page.total; modal.offset += page.items.length;
+      } while (modal.offset < modal.total);
+    } catch (_) {
+      if (!currentDeliveryRequest(modal, generation)) return;
+      modal.sessionsError = '接收会话加载失败或列表已变化，请刷新浏览器后重试。';
+    }
+    if (currentDeliveryRequest(modal, generation)) { modal.loading = false; showModal(); }
+  }
+
+  function renderDeliveryPicker(parent, modal) {
+    const draft = modal.draft;
+    const selectedId = draft.deliveryId;
+    const rows = modal.sessions.slice();
+    const selected = modal.selectedSession;
+    if (selectedId && selected && selected.id === selectedId && selected.delivery_available === true && !rows.some(item => item.id === selectedId)) rows.unshift(selected);
+    const unresolved = (selectedId && !rows.some(item => item.id === selectedId)) ||
+      (!draft.deliveryDirty && draft.deliveryKind === 'feishu' && !selectedId);
+    const field = selectField('飞书IM接收会话', '', [['', '不投递飞书IM']]);
+    if (unresolved) {
+      const placeholder = document.createElement('option');
+      placeholder.value = '__saved_unavailable__'; placeholder.disabled = true;
+      placeholder.textContent = '请选择接收会话';
+      field.input.appendChild(placeholder);
+    }
+    for (const item of rows) {
+      const option = document.createElement('option');
+      option.value = item.id;
+      option.textContent = `${item.delivery_label || '未命名飞书聊天'}${item.delivery_parent_chat ? ` · ${item.delivery_parent_chat}` : ''}${item.delivery_chat_name ? `（${item.delivery_chat_name}）` : ''}`;
+      field.input.appendChild(option);
+    }
+    field.input.value = unresolved ? '__saved_unavailable__' : selectedId;
+    field.input.addEventListener('change', () => {
+      const item = rows.find(item => item.id === field.input.value);
+      if (field.input.value !== '' && !item) return;
+      draft.deliveryId = item ? item.id : '';
+      draft.deliveryKind = item ? 'feishu' : 'silent'; draft.deliveryDirty = true;
+      modal.selectedSession = item || null; modal.selectedError = ''; modal.error = '';
+      showModal();
+    });
+    parent.appendChild(field.label);
+    if (modal.loading) appendText(parent, 'div', '加载接收会话中…', 'loading-state');
+    if (modal.sessionsError) appendText(parent, 'div', modal.sessionsError, 'error-state');
+    if (modal.selectedError) appendText(parent, 'div', modal.selectedError, 'error-state');
+    if (!modal.loading && !modal.sessionsError && rows.length === 0) appendText(parent, 'div', '暂无可用飞书会话，请在飞书中建立会话后刷新浏览器。', 'empty-state');
+  }
+
   function renderTaskForm(parent) {
-    const task = state.modal.task;
+    const modal = state.modal;
+    const task = modal.task;
+    const draft = modal.draft;
     const isEdit = Boolean(task);
-    const isOrigin = task && task.delivery_target === 'origin';
+    const hasOrigin = task && (task.delivery_target === 'origin' || Object.keys(task.origin || {}).length > 0);
     const form = document.createElement('form');
     form.className = 'providers-form scheduled-task-form';
     renderModalHeader(form, isEdit ? '编辑' : '新增');
-    if (state.modal.error) appendText(form, 'div', state.modal.error, 'error-state');
-
-    const grid = document.createElement('div');
-    grid.className = 'scheduled-modal-grid';
-    const name = inputField('名称', 'text', task ? task.name : '', '例如：每日总结');
-    const cron = inputField('Cron 表达式', 'text', task ? task.cron_expression : '', '*/30 * * * *');
-    const timezone = inputField('时区', 'text', task ? task.timezone : 'Asia/Shanghai', 'Asia/Shanghai');
-    const tools = inputField('允许的工具', 'text', task ? (task.allowed_tools || []).join(',') : '', '逗号分隔，如 host_terminal');
-    grid.appendChild(name.label);
-    grid.appendChild(cron.label);
-    grid.appendChild(timezone.label);
-    grid.appendChild(tools.label);
-
-    if (!isOrigin) {
-      const target = selectField('投递目标', task ? task.delivery_target : 'dashboard', [['dashboard', 'Dashboard'], ['silent', 'Silent']]);
-      const session = inputField('Session ID', 'text', task ? task.session_id : '', '留空则后端创建');
-      grid.appendChild(target.label);
-      grid.appendChild(session.label);
-      form._target = target.input;
-      form._session = session.input;
-    } else {
-      const notice = document.createElement('div');
-      notice.className = 'scheduled-origin-notice';
-      notice.textContent = 'Origin 任务的投递目标和会话由 Gateway 管理，Dashboard 仅允许编辑名称、调度、时区、允许的工具和 Prompt。';
-      grid.appendChild(notice);
-    }
+    if (modal.error) appendText(form, 'div', modal.error, 'error-state');
+    const grid = el('div', 'scheduled-modal-grid');
+    const bind = (label, type, key, placeholder, parent) => {
+      const field = inputField(label, type, draft[key], placeholder);
+      field.input.addEventListener('input', () => { draft[key] = field.input.value; });
+      parent.appendChild(field.label);
+      return field.input;
+    };
+    bind('名称', 'text', 'name', '例如：每日总结', grid);
+    bind('Cron 表达式', 'text', 'cron', '*/30 * * * *', grid);
+    bind('时区', 'text', 'timezone', 'Asia/Shanghai', grid);
+    bind('允许的工具', 'text', 'tools', '逗号分隔，如 host_terminal', grid);
+    if (!hasOrigin) bind('Session ID', 'text', 'session', '留空则后端创建', grid);
+    renderDeliveryPicker(grid, modal);
     form.appendChild(grid);
-
-    const prompt = inputField('Prompt', 'textarea', task ? task.prompt : '', '输入定时执行的提示词');
-    form.appendChild(prompt.label);
-
-    const actions = document.createElement('div');
-    actions.className = 'providers-form__actions';
+    bind('Prompt', 'textarea', 'prompt', '输入定时执行的提示词', form);
+    const actions = el('div', 'providers-form__actions');
     actions.appendChild(button('取消', 'btn', closeModal));
-    const submit = document.createElement('button');
-    submit.type = 'submit';
-    submit.className = 'btn btn--primary';
-    submit.textContent = isEdit ? '保存' : '创建';
-    actions.appendChild(submit);
-    form.appendChild(actions);
-
+    const submit = button(isEdit ? '保存' : '创建', 'btn btn--primary', () => {});
+    submit.type = 'submit'; submit.disabled = Boolean(modal.saving);
+    actions.appendChild(submit); form.appendChild(actions);
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const payload = {
-        name: name.input.value,
-        cron_expression: cron.input.value,
-        timezone: timezone.input.value,
-        prompt: prompt.input.value,
-        allowed_tools: tools.input.value,
-      };
-      if (!isOrigin) {
-        payload.delivery_target = form._target.value;
-        if (form._session.value) payload.session_id = form._session.value;
+      if (state.modal !== modal || modal.saving) return;
+      const payload = { name: draft.name, cron_expression: draft.cron, timezone: draft.timezone,
+        prompt: draft.prompt, allowed_tools: draft.tools };
+      if (!hasOrigin && draft.session) payload.session_id = draft.session;
+      if (draft.deliveryDirty) {
+        if (draft.deliveryKind === 'feishu') {
+          if (draft.deliveryId) {
+            const item = modal.sessions.find(row => row.id === draft.deliveryId) || modal.selectedSession;
+            if (!item || item.id !== draft.deliveryId || item.delivery_available !== true || modal.selectedError) {
+              modal.error = '请选择可用的飞书接收会话。'; showModal(); return;
+            }
+            payload.delivery_target = 'feishu'; payload.delivery_conversation_id = draft.deliveryId;
+          } else { modal.error = '请选择飞书接收会话。'; showModal(); return; }
+        } else if (draft.deliveryKind === 'silent') payload.delivery_target = draft.deliveryKind;
+        else { modal.error = '请选择飞书IM接收会话。'; showModal(); return; }
       }
+      modal.saving = true; modal.error = ''; showModal();
       try {
         if (isEdit) await api.updateScheduledTask(task.id, payload);
         else await api.createScheduledTask(payload);
-        closeModal();
-        await refresh();
+        if (state.modal !== modal) return;
+        closeModal(); await refresh();
       } catch (error) {
-        state.modal.error = error.message || 'scheduled_task_save_failed';
-        showModal();
+        if (state.modal !== modal) return;
+        modal.saving = false; modal.error = error.message || 'scheduled_task_save_failed'; showModal();
       }
     });
-
     parent.appendChild(form);
   }
 
@@ -467,7 +586,11 @@
       ['Cron', task.cron_expression],
       ['时区', task.timezone],
       ['状态', task.status],
-      ['投递目标', task.delivery_target],
+      ['飞书IM接收会话', deliveryName(task.delivery || {})],
+      ['当前接收会话', task.delivery && deliveryLocation(task.delivery)],
+      ['投递状态', task.delivery && task.delivery.available ? '可用' : '不可用'],
+      ['不可用原因', task.delivery && task.delivery.available ? '无' : deliveryReason(task.delivery && task.delivery.reason)],
+      ['默认通知会话', task.delivery && task.delivery.home ? (task.delivery.home_configured ? '已配置' : '未配置') : '不适用'],
       ['Session', task.session_id],
       ['下次运行', formatDate(task.next_run_at)],
       ['创建时间', formatDate(task.created_at)],
@@ -475,8 +598,6 @@
     ].forEach(([key, value]) => grid.appendChild(detailItem(key, value)));
     cardBody.appendChild(grid);
     cardBody.appendChild(detailBlock('Prompt', task.prompt));
-    cardBody.appendChild(detailBlock('Origin', JSON.stringify(task.origin || {}, null, 2)));
-    cardBody.appendChild(detailBlock('Delivery Context', JSON.stringify(task.delivery_context || {}, null, 2)));
     cardBody.appendChild(renderExecutions(detail.executions));
     card.appendChild(cardBody);
     wrapper.appendChild(card);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
@@ -109,9 +110,12 @@ class FeishuImAdapter:
                 await self.feishu_client.send_text(chat_id, "不支持该消息类型")
             return
         content = _text_content(message.get("content", ""))
-        if message.get("chat_type") == "group" and "</at>" not in content:
-            return
-        content = _strip_at(content).strip()
+        mention_pattern = None
+        if message.get("chat_type") == "group":
+            mention_pattern = _mention_pattern(message.get("mentions"))
+            if "</at>" not in content and not (mention_pattern and re.search(mention_pattern, content)):
+                return
+        content = _strip_at(content, mention_pattern).strip()
         sender = event.get("sender", {}).get("sender_id", {})
         open_id = _clean_text(sender.get("open_id"))
         thread_id = _clean_text(message.get("thread_id"))
@@ -559,7 +563,23 @@ def _image_key(raw: str | dict[str, Any]) -> str:
     return _clean_text(payload.get("image_key"))
 
 
-def _strip_at(text: str) -> str:
-    if "</at>" not in text:
-        return text
-    return text.split("</at>", 1)[1]
+def _mention_pattern(mentions: Any) -> str | None:
+    if not isinstance(mentions, list):
+        return None
+    keys = {
+        mention["key"]
+        for mention in mentions
+        if isinstance(mention, dict)
+        and isinstance(mention.get("key"), str)
+        and mention["key"].startswith("@")
+        and len(mention["key"]) > 1
+    }
+    if not keys:
+        return None
+    return r"(?<!\w)(?:" + "|".join(re.escape(key) for key in sorted(keys, key=len, reverse=True)) + r")(?!\w)"
+
+
+def _strip_at(text: str, mention_pattern: str | None = None) -> str:
+    if "</at>" in text:
+        return text.split("</at>", 1)[1]
+    return re.sub(mention_pattern, "", text) if mention_pattern else text

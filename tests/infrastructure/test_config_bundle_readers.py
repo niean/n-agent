@@ -111,3 +111,25 @@ def test_write_set_does_not_seed_or_scan(tmp_path: Path, monkeypatch):
             monkeypatch.setattr(app_main, name, lambda *a, _n=name, **k: calls.append(_n))
     build_config_bundle_registries(tmp_path / "sessions.db", read_only=False)
     assert calls == []
+
+
+def test_read_only_legacy_gateway_can_freeze_delivery_evidence_without_ddl(tmp_path):
+    import asyncio
+    from app.application.schedule_delivery_service import ScheduleDeliveryService
+    from app.domain.platform import Platform
+    db_path = tmp_path / 'sessions.db'
+    writable = _seed_writable(db_path)
+    # Model a database created before receive_id_type was introduced.
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('ALTER TABLE gateway_conversations DROP COLUMN receive_id_type')
+        conn.execute(
+            'INSERT INTO gateway_conversations(id, platform, platform_session_id, thread_id, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            ('legacy', 'feishu', 'chat', '', '', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+        )
+    before = db_path.read_bytes()
+    readers = build_config_bundle_registries(db_path, read_only=True)
+    resolver = ScheduleDeliveryService(readers.gateway_registry, readers.schedule_registry, lambda _: 'unavailable')
+    assert dict(asyncio.run(resolver.capture_local_evidence())) == {}
+    rows = asyncio.run(readers.gateway_registry.find_conversations(Platform.FEISHU, 'chat'))
+    assert rows and rows[0].receive_id_type is None
+    assert db_path.read_bytes() == before

@@ -171,7 +171,7 @@ class SQLiteGatewaySessionRegistry:
                 rows = conn.execute(
                     """
                     SELECT * FROM gateway_conversations
-                    ORDER BY updated_at DESC
+                    ORDER BY updated_at DESC, id DESC
                     LIMIT ? OFFSET ?
                     """,
                     (limit, offset),
@@ -181,13 +181,43 @@ class SQLiteGatewaySessionRegistry:
                     """
                     SELECT * FROM gateway_conversations
                     WHERE platform = ?
-                    ORDER BY updated_at DESC
+                    ORDER BY updated_at DESC, id DESC
                     LIMIT ? OFFSET ?
                     """,
                     (platform.value, limit, offset),
                 ).fetchall()
         conversations = [_conversation_from_row(row) for row in rows]
         return [conversation for conversation in conversations if conversation is not None]
+
+    async def get_conversation(self, conversation_id: str) -> GatewayConversation | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM gateway_conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+        return _conversation_from_row(row) if row is not None else None
+
+    async def find_conversations(self, platform: Platform, receive_id: str) -> list[GatewayConversation]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM gateway_conversations
+                WHERE platform = ? AND platform_session_id = ?
+                ORDER BY updated_at DESC, id DESC
+                """,
+                (platform.value, receive_id),
+            ).fetchall()
+        conversations = [_conversation_from_row(row) for row in rows]
+        return [conversation for conversation in conversations if conversation is not None]
+
+    async def record_delivery_address(self, key: GatewaySessionKey, receive_id_type: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE gateway_conversations SET receive_id_type = ?
+                WHERE platform = ? AND platform_session_id = ? AND thread_id = ?
+                """,
+                (receive_id_type, *key.conversation_parts),
+            )
 
     async def count_conversations(self, platform: Platform) -> int:
         with self._connect() as conn:
@@ -254,6 +284,9 @@ def _initialize_gateway_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(gateway_conversations)").fetchall()}
+    if "receive_id_type" not in columns:
+        conn.execute("ALTER TABLE gateway_conversations ADD COLUMN receive_id_type TEXT")
 
 
 def _migrate_processed_events_message_id_nullable(conn: sqlite3.Connection) -> None:
@@ -371,6 +404,7 @@ def _conversation_from_row(row: sqlite3.Row) -> GatewayConversation | None:
         thread_id=row["thread_id"],
         display_name=row["display_name"],
         active_session_id=row["active_session_id"],
+        receive_id_type=row["receive_id_type"] if "receive_id_type" in row.keys() else None,
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
     )

@@ -323,6 +323,7 @@ async def test_silent_delivery_ends_before_outbound_call():
 
     assert delivery.contents == []
     assert registry.completed[0].status is ScheduledTaskExecutionStatus.SUCCEEDED
+    assert registry.dashboard_unread is False
 
 
 @pytest.mark.asyncio
@@ -510,6 +511,98 @@ async def _wait_for(predicate, attempts: int = 20) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("background scheduled task did not finish")
+
+
+def _feishu_target():
+    return DeliveryTarget.feishu({"conversation_id": "conv", "platform": "feishu",
+                                  "receive_id": "oc_selected", "receive_id_type": "chat_id"})
+
+
+class VerifiedDelivery:
+    def __init__(self, code=None):
+        self.code = code
+        self.targets = []
+
+    async def validate_snapshot(self, target):
+        from app.application.schedule_delivery_service import ScheduleDeliveryError
+        self.targets.append(target)
+        if self.code:
+            raise ScheduleDeliveryError(self.code)
+        return target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,reason", [(None, None),
+    ("conversation_not_found", "target_deleted"), ("platform_unavailable", "platform_unavailable"),
+    ("unsupported_address_type", "target_unverified"), ("snapshot_mismatch", "target_mismatch")])
+async def test_explicit_feishu_verified_without_origin_and_failure_preserves_execution(code, reason):
+    task = _task(delivery_target=_feishu_target())
+    registry = FakeRegistry(_claim(task=task))
+    delivery = FakeDelivery()
+    resolver = VerifiedDelivery(code)
+    service = ScheduleRunService(registry,
+        FakeExecutor(ScheduledAgentResult(ScheduledTaskExecutionStatus.SUCCEEDED, output="saved dialogue")),
+        delivery, delivery_service=resolver)
+    await service.run_due_claims(now=NOW)
+    assert delivery.contents == ([] if reason else ["saved dialogue"])
+    assert resolver.targets == [task.delivery_target]
+    assert registry.completed[0].output == "saved dialogue"
+    assert registry.completed[0].status is ScheduledTaskExecutionStatus.SUCCEEDED
+    assert registry.delivered[0].delivery_error == reason
+    assert registry.dashboard_unread is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["resolver", "authorization", "information_flow"])
+async def test_explicit_feishu_fails_closed_before_sending(failure):
+    from app.domain.policy import PolicyDecision
+    registry = FakeRegistry(_claim(task=_task(delivery_target=_feishu_target())))
+    delivery = FakeDelivery()
+    flow = FakeInformationFlow(allowed=failure != "information_flow")
+    service = ScheduleRunService(registry,
+        FakeExecutor(ScheduledAgentResult(ScheduledTaskExecutionStatus.SUCCEEDED, output="done")),
+        delivery, information_flow_service=flow,
+        delivery_service=None if failure == "resolver" else VerifiedDelivery())
+    if failure == "authorization":
+        class Deny:
+            def evaluate(self, request):
+                return PolicyDecision(PolicyOutcome.DENY, "denied")
+        service._delivery_authorization_policy = Deny()
+    await service.run_due_claims(now=NOW)
+    assert delivery.contents == []
+    assert registry.delivered[0].delivery_error == {
+        "resolver": "target_unverified", "authorization": "authorization_denied",
+        "information_flow": "information_flow_denied"}[failure]
+    assert registry.dashboard_unread is False
+
+
+@pytest.mark.asyncio
+async def test_explicit_delivery_uses_claim_snapshot_and_keeps_dialogue_on_send_failure():
+    from dataclasses import replace
+
+    task = _task(delivery_target=_feishu_target())
+    claim = _claim(task=task)
+    registry = FakeRegistry(claim)
+    resolver = VerifiedDelivery()
+
+    class EditingExecutor:
+        async def run(self, claimed_task):
+            registry.claim = _claim(task=replace(task, delivery_target=DeliveryTarget.dashboard()))
+            return ScheduledAgentResult(ScheduledTaskExecutionStatus.SUCCEEDED, output="saved dialogue")
+
+    class FailedDelivery:
+        async def deliver(self, target, content):
+            assert target == task.delivery_target
+            assert content == "saved dialogue"
+            raise RuntimeError("secret oc_selected")
+
+    service = ScheduleRunService(registry, EditingExecutor(), FailedDelivery(), delivery_service=resolver)
+    await service.run_claim(claim, now=NOW)
+    assert resolver.targets == [task.delivery_target]
+    assert registry.completed[0].output == "saved dialogue"
+    assert registry.delivered[0].delivery_error == "send_failed"
+    assert registry.delivered[0].status is ScheduledTaskExecutionStatus.SUCCEEDED
+    assert registry.dashboard_unread is False
 
 
 @pytest.mark.asyncio

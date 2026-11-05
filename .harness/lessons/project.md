@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
 # 项目教训
 
 ### P082: 本次输入的历史副本须按消息身份排除
@@ -762,3 +762,24 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：`resolve_script_bytes` 按 `last_scan_status="ok"` 严格门控，扫描 warning（即使扫描层设计为非阻断入册）会静默使已授权定时任务失败；错误码 `skill_script_not_found` 无法区分"不存在"与"格式瑕疵被拦"。
 - 教训：宿主执行面比聊天暴露面更严格是设计决策（用户确认，曾试放宽为 format_warning 白名单后改回严格门控）：扫描 warning 必须在 SKILL.md 内容侧修复并重扫（`POST /chat/skills/refresh`）后才能执行脚本，禁止用放宽下游门控的方式绕过内容问题；同时核对策略文件（host-terminal-policy.yaml）规则 sha256 与脚本一致并升 version 触发快照重载。排障时先对比 registry 的 last_scan_status/error 与 skill 可用性展示的差异。
 - 来源：fix-bug workflow；内容侧修复后重扫 status=ok，严格门控测试覆盖 format_warning/injection_warning/None 阻断分支。
+
+### P083: 可编辑投递方式不能改成来源级强制默认值
+
+- 现象：用户希望飞书来源定时任务可在 Dashboard 切换为 silent，初版却在创建、迁移及执行层强制禁用所有飞书通知，前端没有新增编辑入口。
+- 根因：把一次任务的可编辑投递选择误解成整类来源的默认策略；Dashboard 还按当前 delivery_target=origin 判断来源，切为 silent 后会丢失对来源会话的编辑保护。
+- 教训：分别核对创建默认值、显式更新、省略字段及运行消费四个合同；来源身份使用持久 origin，投递类型只表达当前选择。通过 origin→silent→origin 往返校验来源地址和独立会话不变，禁止在执行层按平台覆写用户配置。进一步通用化时将来源与显式接收目标分离，服务端解析会话身份；导入前冻结本机证据，防止同批写入自证，证据故障仍保持条目级失败隔离。
+- 来源：2026-11-05 定时任务投递编辑需求澄清；修正 Dashboard API/FE，恢复创建、迁移和执行层原行为，补充应用层与接口回归用例；单测按项目默认策略未执行。
+
+### P084: 飞书群提及夹具必须匹配真实 SDK 消息结构
+
+- 现象：新群已加入机器人并发送提及消息，定时任务接收列表仍无该群。
+- 根因：真实消息含 @_user_1 与 mentions 数组，适配器只认 </at>，在 Gateway 创建会话前返回；旧测试仅使用手工 XML 夹具。
+- 教训：先沿 API、registry、入站过滤追踪缺失边界，再用飞书真实返回结构建立回归；提及匹配需消费已验证元数据并保护完整 token 边界，不能靠手工写入 registry 掩盖入站问题。
+- 来源：2026-11-05 群投递目标缺失排查，修复 app/interfaces/feishu_im_adapter.py 并补 tests/interfaces/test_feishu_im_adapter.py；单测未执行；用户重新提及后已核验真实入站：目标群记录为 chat_id，接收列表 API 返回 delivery_available=true。
+
+### P085: 单一动作跨多份存储时各分支必须对齐真实物理效果
+
+- 现象：技能 photo-and-upload 的 Dashboard 健康状态显示 archived，与注册表 available/ok 不一致；对技能删除单个关联文件后整技能从注册表消失。
+- 根因：manage_skill 的 REMOVE_FILE 分支照搬 DELETE 语义（registry.delete_skill + usage.set_state("archived")），而 loader.remove_linked_file 只移走单个关联文件、SKILL.md 仍在；重扫按磁盘恢复注册表，但 scan_now 不更新 usage，两份记录漂移出"注册表可用、usage=archived"残留。
+- 教训：一个写动作横跨文件系统/注册表/使用记录多份存储时，每个分支的 registry/usage 更新必须与 loader 的真实物理效果一一对应，不得复用其它动作的存储更新代码；为"扫描后自动恢复"写代码时要同步设计对账的失败语义（本例 fail-fast：任一恢复失败 scan_now 整体失败，不降级 warning、不产出伪成功报告）。排障先对比 usage.state 与 registry last_scan_status 两份独立记录。
+- 来源：2026-11-05 iterate-feature（spec-261105-skill-usage-state-reconcile）；修复 manage_skill REMOVE_FILE 分支与 scan_now fail-fast 对账，33 个新测试覆盖；结果验收 3 维度扫描 0 违规。

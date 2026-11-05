@@ -19,6 +19,16 @@ class ScheduleOutboundDelivery:
             return DeliveryResult("skipped")
         if target.target_type is DeliveryTargetType.DASHBOARD:
             return DeliveryResult("success")
+        if target.target_type is DeliveryTargetType.FEISHU:
+            context = target.context
+            if (self.feishu_client is None or context.get("platform") != "feishu"
+                    or context.get("receive_id_type") != "chat_id" or not context.get("receive_id")):
+                return DeliveryResult("failed", "send_failed")
+            try:
+                await self.feishu_client.send_markdown_reply(context["receive_id"], content, "chat_id")
+            except Exception:
+                return DeliveryResult("failed", "send_failed")
+            return DeliveryResult("success")
         context = target.context
         platform_value = context.get("platform")
         if not platform_value:

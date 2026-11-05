@@ -546,3 +546,84 @@ def test_send_markdown_reply_post_failure_falls_back_to_text():
     assert types == ["post", "text"]
     text_body = json.loads(message_requests[-1].content)
     assert json.loads(text_body["content"])["text"] == content
+
+
+@pytest.mark.asyncio
+async def test_chat_name_reads_authenticated_endpoint_and_caches(monkeypatch):
+    import httpx
+    from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
+    calls = []
+    def respond(request):
+        calls.append(request)
+        if '/auth/' in request.url.path:
+            return httpx.Response(200, json={'tenant_access_token': 'test-token', 'expire': 7200})
+        assert request.headers['Authorization'] == 'Bearer test-token'
+        return httpx.Response(200, json={'code': 0, 'data': {'name': '每日报告群'}})
+    async with httpx.AsyncClient(base_url='https://open.feishu.cn', transport=httpx.MockTransport(respond)) as http:
+        client = FeishuClient(FeishuConfig('app', 'secret'), http)
+        assert await client.get_chat_name('oc_chat') == '每日报告群'
+        assert await client.get_chat_name('oc_chat') == '每日报告群'
+        assert len(calls) == 2
+        assert calls[-1].url.path == '/open-apis/im/v1/chats/oc_chat'
+        for i in range(260):
+            await client.get_chat_name(f'oc_{i}')
+        assert len(client._chat_names) <= 256
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [{'code': 1, 'data': {'name': 'ignored'}}, {'code': 0, 'data': {'name': ''}}, {'code': 0, 'data': {'name': 42}}, {'code': 0, 'data': None}])
+async def test_chat_name_invalid_responses_are_optional_and_cached(payload):
+    import httpx
+    from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
+    calls = []
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json=payload)
+    async with httpx.AsyncClient(base_url='https://open.feishu.cn', transport=httpx.MockTransport(respond)) as http:
+        client = FeishuClient(FeishuConfig('app', 'secret'), http)
+        client._tenant_access_token = 'test-token'
+        client._tenant_access_token_expires_at = float('inf')
+        assert await client.get_chat_name('oc_chat') is None
+        assert await client.get_chat_name('oc_chat') is None
+        assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['timeout', 'http'])
+async def test_chat_name_network_failure_is_optional(failure):
+    import httpx
+    from app.infrastructure.feishu.client import FeishuClient, FeishuConfig
+    def respond(request):
+        if failure == 'timeout':
+            raise httpx.ReadTimeout('private details', request=request)
+        return httpx.Response(403)
+    async with httpx.AsyncClient(base_url='https://open.feishu.cn', transport=httpx.MockTransport(respond)) as http:
+        client = FeishuClient(FeishuConfig('app', 'secret'), http)
+        assert await client.get_chat_name('oc_chat') is None
+
+
+@pytest.mark.asyncio
+async def test_chat_name_cache_expires_with_shorter_failure_ttl(monkeypatch):
+    from app.infrastructure.feishu import client as module
+    now = [100.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: now[0])
+    calls = []
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={'code': 0, 'data': {'name': '' if len(calls) == 1 else '群名'}})
+    async with httpx.AsyncClient(base_url='https://open.feishu.cn', transport=httpx.MockTransport(respond)) as http:
+        subject = FeishuClient(FeishuConfig('app', 'secret'), http)
+        subject._tenant_access_token = 'test-token'
+        subject._tenant_access_token_expires_at = float('inf')
+        assert await subject.get_chat_name('oc_chat') is None
+        now[0] += 14
+        assert await subject.get_chat_name('oc_chat') is None
+        assert len(calls) == 1
+        now[0] += 2
+        assert await subject.get_chat_name('oc_chat') == '群名'
+        now[0] += 299
+        assert await subject.get_chat_name('oc_chat') == '群名'
+        assert len(calls) == 2
+        now[0] += 2
+        assert await subject.get_chat_name('oc_chat') == '群名'
+        assert len(calls) == 3

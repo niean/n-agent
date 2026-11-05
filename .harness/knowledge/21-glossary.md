@@ -181,6 +181,7 @@
 
 ## Delegation 委派术语
 
+- 产品功能与执行来源：产品功能描述用户要完成的业务，如对话、后台任务、定时任务，不包括多 Agent 委派。多 Agent 委派是完成既有业务时的内部并行提效机制，负责分派执行与汇总结果；执行来源可以包括多 Agent 委派（`delegation`），用于标识 AgentRun 的触发与归属。产品功能列表不得将多 Agent 委派与对话、后台任务、定时任务并列，也不得根据执行来源枚举推导产品功能列表。
 - Delegation：多 Agent 委派聚合根（`app/domain/delegation.py`），深度固定 1、一次创建后 worker 集合与可选 aggregator 不可变；状态机 pending/running/joining/succeeded/failed/cancelling/cancelled/expired；同 (parent.source, parent.scope_id, delegation_key) 唯一，同 key 同规范化指纹重放返回原委派，不同指纹返回 delegation_conflict。
 - DelegationParentRef：父来源不透明引用（source 取 realtime|task、scope_id、run_id、session_id）；领域层不解析这些 ID，scope 只能由服务端 capability 填入，调用参数不接受 parent ref。
 - delegation_key / fingerprint：父作用域内稳定语义键（NFC+strip+lower 规范化）与请求规范化指纹（SHA-256），共同承载模型重试/Task retry/网络重放的幂等；空白、自动生成或服务端静默改写均被拒绝。

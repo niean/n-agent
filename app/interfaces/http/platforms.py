@@ -44,6 +44,14 @@ def create_platforms_router(platform_service: PlatformService) -> APIRouter:
             return _platform_error_response(exc)
         return _page_to_dict(page)
 
+    @router.get("/chat/gateways/{platform}/sessions/{conversation_id}")
+    async def get_platform_session(platform: str, conversation_id: str):
+        try:
+            row = await platform_service.get_platform_session(platform, conversation_id)
+        except (PlatformInvalidError, PlatformNotFoundError) as exc:
+            return _platform_error_response(exc)
+        return {**_conversation_to_dict(row), **await platform_service.project_conversation(row)}
+
     return router
 
 
@@ -65,7 +73,7 @@ def _detail_to_dict(detail: PlatformDetail) -> dict[str, Any]:
 
 def _page_to_dict(page: PaginatedSessions) -> dict[str, Any]:
     return {
-        "items": [_conversation_to_dict(item) for item in page.items],
+        "items": [{**_conversation_to_dict(item), **page.projections.get(item.id, {})} for item in page.items],
         "total": page.total,
         "limit": page.limit,
         "offset": page.offset,

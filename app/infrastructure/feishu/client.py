@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import asyncio
 from typing import Any, Awaitable, Callable
@@ -30,6 +31,8 @@ class FeishuClient:
     def __init__(self, config: FeishuConfig, http_client: httpx.AsyncClient | None = None):
         self.config = config
         self.http_client = http_client or httpx.AsyncClient(base_url="https://open.feishu.cn", timeout=10)
+        self._chat_names: OrderedDict[str, tuple[float, str | None]] = OrderedDict()
+        self._chat_name_locks = [asyncio.Lock() for _ in range(4)]
         self._tenant_access_token = ""
         self._tenant_access_token_expires_at = 0.0
 
@@ -79,6 +82,37 @@ class FeishuClient:
                     pass
 
         await asyncio.to_thread(run_lark)
+
+    async def get_chat_name(self, receive_id: str) -> str | None:
+        """Best-effort display metadata; never changes delivery authorization."""
+        if not isinstance(receive_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", receive_id):
+            return None
+        async with self._chat_name_locks[hash(receive_id) % len(self._chat_name_locks)]:
+            cached = self._chat_names.get(receive_id)
+            if cached and cached[0] > time.monotonic():
+                self._chat_names.move_to_end(receive_id)
+                return cached[1]
+            name = None
+            try:
+                async with asyncio.timeout(1.5):
+                    token = await self.get_tenant_access_token()
+                    response = await self.http_client.get(
+                        f"/open-apis/im/v1/chats/{receive_id}",
+                        headers={"Authorization": f"Bearer {token}"}, timeout=1.5,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    value = data.get("name") if isinstance(data, dict) else None
+                    if isinstance(payload, dict) and payload.get("code") == 0 and isinstance(value, str) and value.strip():
+                        name = value.strip()
+            except Exception:
+                pass
+            self._chat_names[receive_id] = (time.monotonic() + (300 if name else 15), name)
+            self._chat_names.move_to_end(receive_id)
+            while len(self._chat_names) > 256:
+                self._chat_names.popitem(last=False)
+            return name
 
     async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> None:
         tenant_access_token = await self.get_tenant_access_token()

@@ -753,3 +753,14 @@ async def test_claim_does_not_set_last_status_skipped_missed(registry):
 
     assert task is not None
     assert task.last_status is not ScheduledTaskExecutionStatus.SKIPPED_MISSED
+
+
+@pytest.mark.asyncio
+async def test_feishu_delivery_context_round_trips_through_sqlite(registry):
+    from dataclasses import replace
+    context = {"platform": "feishu", "receive_id": "oc_1", "receive_id_type": "chat_id", "thread_id": "thread", "conversation_id": "conversation", "display_name": "测试群"}
+    task = replace(_task(), delivery_target=DeliveryTarget.feishu(context))
+    await registry.create(task)
+    loaded = await registry.get(task.id)
+    assert loaded.delivery_target == task.delivery_target
+    assert loaded.delivery_target.context == context

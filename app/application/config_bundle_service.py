@@ -22,12 +22,14 @@ from __future__ import annotations
 import inspect
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from uuid import uuid4
+
+from app.application.schedule_delivery_service import ScheduleDeliveryService, ScheduleDeliveryError
 
 from app.domain.config_bundle import (
     BUNDLE_SCHEMA_VERSION,
@@ -165,6 +167,8 @@ class _ImportContext:
     with_schedules: bool
     dry_run: bool
     pre_existing: dict[str, list[str]] | None
+    delivery_evidence: Mapping[str, frozenset[str]] | None = None
+    delivery_evidence_failed: bool = False
 
     def pre_existing_for(self, section: str, current: set[str]) -> set[str]:
         """Natural keys the target already had before this run.
@@ -255,6 +259,8 @@ def _mark_failed(item: ImportItemReport, exc: Exception) -> None:
     item.outcome = ImportOutcome.FAILED
     item.action = ImportAction.NONE
     item.reasons.append(f"write failed: {type(exc).__name__}")
+    if isinstance(exc, ScheduleDeliveryError):
+        item.reasons.append("先在目标实例对应飞书会话给机器人发消息以建立可信入站证据，再重试")
     logger.error(
         "config bundle import: %s/%s failed with %s at %s",
         item.section,
@@ -318,7 +324,10 @@ class ConfigBundleService:
         gateway_registry: GatewaySessionRegistry,
         task_config_store: TaskConfigStore,
         task_config_service: "TaskConfigService",
+        *,
+        schedule_delivery_service: ScheduleDeliveryService | None = None,
     ) -> None:
+        self._schedule_delivery = schedule_delivery_service
         self._providers = provider_registry
         self._knowledge = knowledge_registry
         self._mcp = mcp_registry
@@ -581,11 +590,22 @@ class ConfigBundleService:
         before the global enabled-name set can be resolved against them.
         """
         self._validate_bundle(bundle)
+        delivery_evidence = None
+        delivery_evidence_failed = False
+        if self._schedule_delivery is not None:
+            try:
+                # Capture before every section write; keep read failures local
+                # to FEISHU items and never retry against newly imported data.
+                delivery_evidence = await self._schedule_delivery.capture_local_evidence()
+            except Exception:  # noqa: BLE001 - preserve per-item import isolation
+                delivery_evidence_failed = True
         ctx = _ImportContext(
             mode=mode,
             with_schedules=with_schedules,
             dry_run=dry_run,
             pre_existing=pre_existing,
+            delivery_evidence=delivery_evidence,
+            delivery_evidence_failed=delivery_evidence_failed,
         )
         sections = bundle.sections
         items: list[ImportItemReport] = []
@@ -718,6 +738,8 @@ class ConfigBundleService:
         _validate_enum_field(sections["gateway_home_targets"], "platform", Platform, "gateway_home_targets")
         _validate_enum_field(sections["scheduled_tasks"], "status", ScheduledTaskStatus, "scheduled_tasks")
         for row in sections["scheduled_tasks"]:
+            if row.get("delivery_target") == "feishu" and not isinstance(row.get("delivery_context"), dict):
+                raise ConfigBundleValidationError("scheduled_tasks", "delivery_context must be an object")
             policy = row.get("execution_policy")
             if not isinstance(policy, dict):
                 raise ConfigBundleValidationError(
@@ -1289,6 +1311,11 @@ class ConfigBundleService:
                 f"{len(matches)} target tasks share this name; refusing to guess which one to update"
             )
             return
+        if matches and ctx.mode is ImportMode.MERGE:
+            item.outcome = ImportOutcome.SKIPPED
+            item.action = ImportAction.NONE
+            item.reasons.append("target already has this scheduled task; merge keeps it untouched")
+            return
         policy = _execution_policy_of(row)
         # A schedule only ever comes back enabled when the operator asked for it
         # AND the source task was runnable.
@@ -1306,6 +1333,16 @@ class ConfigBundleService:
             "enabled": enabled,
             "status": status,
         }
+        if payload["delivery_target"] == "feishu":
+            if ctx.delivery_evidence_failed:
+                raise ScheduleDeliveryError("local_evidence_unavailable")
+            if self._schedule_delivery is None:
+                raise ScheduleDeliveryError("delivery_resolver_unavailable")
+            canonical = await self._schedule_delivery.rebind_import(
+                payload["delivery_context"], local_types=ctx.delivery_evidence,
+            )
+            payload["delivery_context"] = canonical.context
+            payload["delivery_evidence"] = ctx.delivery_evidence
         if not matches:
             if not ctx.dry_run:
                 await self._schedules.import_create(**payload)
@@ -1313,11 +1350,6 @@ class ConfigBundleService:
             return
 
         existing = matches[0]
-        if ctx.mode is ImportMode.MERGE:
-            item.outcome = ImportOutcome.SKIPPED
-            item.action = ImportAction.NONE
-            item.reasons.append("target already has this scheduled task; merge keeps it untouched")
-            return
         if _scheduled_task_equal(existing, payload):
             item.outcome = ImportOutcome.SKIPPED
             item.action = ImportAction.NONE

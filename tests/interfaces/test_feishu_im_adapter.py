@@ -313,6 +313,50 @@ async def test_long_connection_group_message_without_mention_is_ignored():
     assert client.sent == []
 
 
+async def test_group_sdk_mention_records_chat_and_removes_placeholder():
+    payload = text_payload("@_user_1 hello", chat_type="group")
+    payload["event"]["message"]["mentions"] = [
+        {"key": "@_user_1", "id": {"open_id": "ou_bot"}, "name": "Bot"}
+    ]
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(payload)
+
+    await FeishuImAdapter(gateway, client).handle_event(payload)
+
+    assert len(gateway.events) == 1
+    assert gateway.events[0].text == "hello"
+    assert gateway.events[0].session_key.platform_session_id == "oc_1"
+    assert gateway.events[0].metadata["receive_id_type"] == "chat_id"
+    assert client.reactions == [("msg-1", "Typing")]
+
+
+@pytest.mark.parametrize("mentions", [
+    None, [], [{"key": "@_user_2"}], [None], [{"key": ""}],
+    {"key": "@_user_1"}, "@_user_1", [{"key": 1}],
+])
+async def test_group_placeholder_without_matching_structured_mention_is_ignored(mentions):
+    payload = text_payload("@_user_1 hello", chat_type="group")
+    payload["event"]["message"]["mentions"] = mentions
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(payload)
+
+    await FeishuImAdapter(gateway, client).handle_event(payload)
+
+    assert gateway.events == []
+    assert client.reactions == []
+    assert client.sent == []
+
+
+async def test_sdk_mention_removal_preserves_surrounding_text_and_other_placeholders():
+    payload = text_payload("before @_user_1 after @_user_10", chat_type="group")
+    payload["event"]["message"]["mentions"] = [{"key": "@_user_1"}]
+    gateway = FakeGatewayService()
+
+    await FeishuImAdapter(gateway, FakeFeishuClient(payload)).handle_event(payload)
+
+    assert gateway.events[0].text == "before  after @_user_10"
+
+
 async def test_long_connection_text_message_calls_gateway_and_replies():
     gateway = FakeGatewayService()
     client = FakeFeishuClient(text_payload("<at user_id=\"bot\">bot</at> hello", chat_type="group"))
@@ -320,7 +364,7 @@ async def test_long_connection_text_message_calls_gateway_and_replies():
 
     await adapter.handle_event({})
 
-    assert gateway.events[0].text.endswith("hello")
+    assert gateway.events[0].text == "hello"
     assert gateway.events[0].metadata["message_id"] == "msg-1"
     assert gateway.events[0].metadata["platform"] == "feishu"
     assert gateway.events[0].metadata["receive_id"] == "oc_1"
@@ -739,6 +783,9 @@ async def test_realtime_tool_context_passes_session_id_and_exposes_approval_tool
     from app.domain.tool import ToolDefinition
 
     class _Registry:
+        async def record_delivery_address(self, key, receive_id_type):
+            pass
+
         def __init__(self):
             self.active = {}
             self.links = {}
@@ -847,3 +894,16 @@ async def test_realtime_tool_context_passes_session_id_and_exposes_approval_tool
     # Shared ToolService DEFAULT surface contains the three approval tools
     tool_names = _default_exposed_tool_names_with_approval_tools()
     assert {"approve_task", "reject_task", "revise_task"}.issubset(tool_names)
+
+
+@pytest.mark.parametrize("kind,chat_id", [("text", "oc_1"), ("text", ""), ("image", "oc_1"), ("image", "")])
+async def test_verified_messages_provide_chat_address_evidence_only_for_chat_id(kind, chat_id):
+    payload = text_payload() if kind == "text" else image_payload()
+    payload["event"]["message"]["chat_id"] = chat_id
+    gateway = FakeGatewayService()
+    client = FakeFeishuClient(payload, image_bytes=b"\x89PNG\r\n\x1a\n")
+    await FeishuImAdapter(gateway, client).handle_event({})
+    event = gateway.events[0]
+    assert event.metadata["platform"] == "feishu"
+    assert event.metadata["receive_id"] == event.session_key.platform_session_id
+    assert event.metadata["receive_id_type"] == ("chat_id" if chat_id else "open_id")

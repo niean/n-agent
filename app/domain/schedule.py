@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Any, Protocol
 from uuid import uuid4
 
+from app.domain.policy import PolicyDecision, PolicyOutcome
+
 
 class ScheduledTaskStatus(str, Enum):
     ACTIVE = "active"
@@ -29,6 +31,7 @@ class ScheduledExecutionPolicyMode(str, Enum):
 
 class DeliveryTargetType(str, Enum):
     ORIGIN = "origin"
+    FEISHU = "feishu"
     DASHBOARD = "dashboard"
     SILENT = "silent"
 
@@ -51,6 +54,10 @@ class DeliveryTarget:
     @classmethod
     def origin(cls, context: dict[str, Any]) -> DeliveryTarget:
         return cls(DeliveryTargetType.ORIGIN, dict(context))
+
+    @classmethod
+    def feishu(cls, context: dict[str, Any]) -> DeliveryTarget:
+        return cls(DeliveryTargetType.FEISHU, dict(context))
 
     @classmethod
     def dashboard(cls) -> DeliveryTarget:
@@ -235,3 +242,31 @@ class ScheduledTaskRegistry(Protocol):
 
     async def list_recoverable_origin_tasks(self) -> list[ScheduledTask]:
         ...
+
+
+@dataclass(frozen=True)
+class ScheduledDeliveryAuthorizationRequest:
+    platform: str
+    address_type: str
+    conversation_verified: bool
+    address_matches: bool
+    platform_available: bool
+
+
+class ScheduledDeliveryAuthorizationPolicy:
+    """Authorize explicit delivery using facts verified by Application."""
+
+    def evaluate(self, request: ScheduledDeliveryAuthorizationRequest) -> PolicyDecision:
+        allowed = (
+            request.platform == "feishu"
+            and request.address_type == "chat_id"
+            and request.conversation_verified is True
+            and request.address_matches is True
+            and request.platform_available is True
+        )
+        return PolicyDecision(
+            outcome=PolicyOutcome.ALLOW if allowed else PolicyOutcome.DENY,
+            reason="scheduled_delivery_authorized" if allowed else "scheduled_delivery_denied",
+            policy="scheduled_delivery_authorization",
+            version="1",
+        )

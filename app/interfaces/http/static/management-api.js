@@ -98,6 +98,8 @@
 
   const listPlatforms = () => fetchJson('/chat/gateways');
   const getPlatform = (platform) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}`);
+  const listGatewaySessions = (platform, { limit = 20, offset = 0 } = {}) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}/sessions?limit=${encodeURIComponent(limit)}&offset=${encodeURIComponent(offset)}`);
+  const getGatewaySession = (platform, id) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}/sessions/${encodeURIComponent(id)}`);
   const listPlatformSessions = (platform, limit, offset) => fetchJson(`/chat/gateways/${encodeURIComponent(platform)}/sessions?limit=${encodeURIComponent(limit || 20)}&offset=${encodeURIComponent(offset || 0)}`);
 
   const listPolicies = () => fetchJson('/chat/policies');
@@ -329,6 +331,8 @@
     listPlatforms,
     getPlatform,
     listPlatformSessions,
+    listGatewaySessions,
+    getGatewaySession,
     listPolicies,
     listMcpSites,
     probeMcpSite,

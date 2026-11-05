@@ -31,7 +31,7 @@ def test_domain_has_no_framework_or_infrastructure_imports():
 
 
 def test_policy_domain_modules_do_not_cross_domain_boundary():
-    for module in ("policy.py", "tool_policy.py", "budget.py", "budget_policy.py", "gateway_policy.py", "memory_policy.py", "turn_policy.py", "sandbox_policy.py", "schedule_policy.py"):
+    for module in ("policy.py", "tool_policy.py", "budget.py", "budget_policy.py", "gateway_policy.py", "memory_policy.py", "turn_policy.py", "sandbox_policy.py", "schedule_policy.py", "schedule.py"):
         modules = imported_modules(ROOT / "app/domain" / module)
         forbidden = (
             "app.application",

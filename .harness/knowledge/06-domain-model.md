@@ -1,19 +1,20 @@
-<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，以 AgentRun 介绍对话、任务、定时与委派执行，以及核心模型和外部边界。要求字数少、足够简洁 -->
+<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，以 Session 串联会话上下文、以 AgentRun 表达对话、任务、定时与委派执行，以及核心模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
-本文介绍自研通用 Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 以 AgentRun 组织一次执行，用 LangGraph 编排模型和工具调用，用领域驱动设计（DDD）隔离业务核心与外部实现。
+本文介绍自研通用 Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 支持对话、任务、定时任务等功能，以 Session（会话）为核心业务模型，以 AgentRun 表达一次执行，用 LangGraph 编排模型和工具调用，用领域驱动设计（DDD）隔离业务核心与外部实现。
 
-核心流程：接收请求、登记执行(即AgentRun)，加载上下文，循环"调用模型→按需执行工具"、直至本次执行结束；会话与外部记忆按策略更新，结果可同步或流式返回。请求来源包括：用户对话、后台任务、定时任务触发、多Agent委派等。
+核心流程：用户对话、后台任务、或定时任务自动触发后，N-Agent 创建或复用 Session，登记 AgentRun，准备上下文，循环“调用模型 → 按需执行工具”，直至本次执行结束；会话与外部记忆按策略更新，结果可同步或流式返回。
 
 ## 领域划分
 
 ```text
 Agent Runtime
 ├── 核心子域
+│   ├── Session：会话身份与生命周期，串联消息、摘要与执行记录，为 Agent 执行提供会话上下文归属边界
 │   ├── AgentRun：一次 Agent 执行的记录、控制与编排，包括上下文准备、模型和工具调用、结果保存
 │   ├── Context：组装模型输入视图，包括基础消息上下文、约束过滤后的工具定义等
 │   ├── LLM：模型交互子域，负责Provider Request(请求)构造、模型调用、响应解析
-│   ├── Memory：记忆管理，包括会话记忆、跨会话的外部记忆
+│   ├── Memory：会话记忆与跨会话外部记忆的保存、更新和检索
 │   └── Tool：工具契约与执行编排，把模型 tool_calls 转换为受控的工具执行
 ├── 支撑子域
 │   ├── Schedule：定时任务定义、调度、租约执行与结果投递
@@ -111,6 +112,16 @@ flowchart TB
   style Loop fill:#fef08a,stroke:#ca8a04,stroke-width:3px,font-weight:bold
 
 ```
+
+## Session
+
+Session 是N-Agent的核心业务模型，负责串联消息、摘要和执行记录。当前所有 Agent 执行都必须归属一个 Session，包括对话、后台任务、定时任务。
+
+- 对话：同一会话的多轮交互复用 Session，每轮执行各有一条 AgentRun 记录。
+- 后台任务：任务可以先独立创建；执行时优先使用指定会话，其次复用来源对话的会话，否则自动创建该任务专用的会话，后续执行继续复用。
+- 定时任务：创建时绑定 Session，通常自动创建专用会话，也可按规则绑定指定会话；每次触发执行都使用绑定的会话。
+
+除对话外，对于后台任务、定时任务等，用户无需显式创建Session，系统会自动创建或复用。
 
 
 ## AgentRun
@@ -361,6 +372,8 @@ LLM
 ## Memory
 
 Memory 有两条持久化边界：会话记忆保存当前 session 的运行事实，外部记忆保存跨 session 知识。
+
+`ConversationSession` 是 Session 的聚合根，当前会话及关联记忆通过 `MemoryStore` 持久化。
 
 ```text
 Memory
@@ -832,7 +845,7 @@ Interfaces -> Application -> Domain
 Infrastructure -> Domain
 ```
 
-- Domain：按领域划分定义 AgentRun、Context、LLM、Memory、Tool 等核心子域，Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation 等支撑子域的领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
+- Domain：按领域划分定义 AgentRun、Session、Context、LLM、Memory、Tool 等核心子域，Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation 等支撑子域的领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
 - Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
 - Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
@@ -865,9 +878,10 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | LLM | 值对象 | ModelInfo / LLMEvent / LLMResult | 模型信息、流式事件和标准调用结果 |
 | LLM | 值对象 | ProviderConfig | Provider 脱敏配置，不包含 api_key 明文 |
 | LLM | 端口 | LLMProvider / ProviderRegistry | 模型调用与 Provider 配置注册边界 |
-| Memory | 聚合根 | ConversationSession | 会话主实体，串联消息、工具调用、最新运行状态和摘要 |
+| Session | 聚合根 | ConversationSession | 会话身份与生命周期，关联消息、摘要和 AgentRun 执行记录 |
+| Session | 端口 | TitleGenerator | 会话标题生成边界 |
 | Memory | 实体 | ConversationMessage / ToolCall / TaskState / Summary | 会话消息、工具审计、会话最新运行状态和滚动摘要 |
-| Memory | 端口 | MemoryStore / Summarizer / TitleGenerator | 会话持久化、摘要和标题生成边界 |
+| Memory | 端口 | MemoryStore / Summarizer | 会话及关联记忆持久化、摘要生成边界 |
 | Memory | 值对象 | ExternalMemoryProviderConfig / ExternalMemoryProviderSecret | 检索记忆 Provider 的脱敏配置与独立密钥 |
 | Memory | 端口 | ExternalMemoryProvider / ExternalMemoryProviderRegistry | 外部记忆读写与检索记忆 Provider 注册边界 |
 | Tool | 值对象 | ToolDefinition / ToolCallRequest / ToolExecutionContext / ToolResult | 工具定义、调用、本次执行的授权和结果 |
@@ -932,10 +946,11 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 
 Prompt 属于 Application Runtime 上下文，由 `build_system_prompt` 构造，不作为 Domain 模型，也不写入 Memory。
 
-## Memory 业务关系
+## Session 与 Memory 业务关系
 
 ```text
 ConversationSession
+├── AgentRun             1:N（通过 session_id 关联）
 ├── ConversationMessage  1:N
 ├── ToolCall             1:N
 ├── TaskState            1:0..1

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 12 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；1024000 字节观测详情 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 12 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -194,7 +194,7 @@ tool_calls(id, session_id, message_id, tool_name, arguments_json, result_json, s
 task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
 providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_headers_json, is_active, supports_vision, created_at, updated_at)
-gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at)
+gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at, receive_id_type)
 gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
 gateway_processed_events(id, platform, event_id, message_id, created_at)
 gateway_home_targets(platform, receive_id, receive_id_type, thread_id, display_name, updated_at)
@@ -451,3 +451,19 @@ Docker Compose 数据边界：观测后端 6 服务（otel-collector/tempo/prome
 Tempo 使用 tempo-data:/var/tempo 独立命名卷（WAL/blocks），168h 保留，API 3200 仅绑定 127.0.0.1，OTLP 4317 仅容器内网。Prometheus exemplar 存储保存代表性 Trace/Span 关联；其保留与时序常规样本不同，不承诺每个指标点都有 Trace。
 
 Pyroscope 配置 filesystem bucket 到已持久化 /var/lib/pyroscope，compactor 保留168h；/data 保留 ingester 热数据。v1.21.1 的低磁盘百分比计算单位偏差可能过早清理本地块，因此显式设置 min_free_disk_gb=1、min_disk_available_percentage=0.01（零值会被上游忽略），保留正常已上传块清理与 bucket 保留策略；不使用 disable_enforcement 导致本地无限保留。旧本地only部署曾出现61个分钟桶的样本减少，详情见 D079。
+
+## 定时任务投递目标编辑
+
+投递与创建渠道分离：delivery_target 支持 dashboard、silent、feishu，origin 只保留历史兼容。默认值不变；所有方式保留任务执行对话，dashboard 标记未读，silent 不外发、不标未读，feishu 外发成功或失败均不增加 Dashboard 未读。
+
+Dashboard 创建和更新的 delivery_conversation_id 只允许与显式 feishu 同时提交，值为已连接飞书会话内部 ID；服务端生成独立 context（conversation_id/platform/receive_id/receive_id_type），前端不能提交原始 origin、delivery_context、receive_id/type。省略目标完整保留；显式 null、空白、错误类型、未知枚举或非法字段组合返回422。切为 dashboard/silent 清空独立 context，再切回显式 feishu 必须重新选择。编辑目标不改变来源及任务 session。历史飞书来源可由持久 origin 恢复旧投递规则，不伪造来源以授权新目标。
+
+gateway_conversations.receive_id_type 可空，写模式幂等加列，只读旧库缺列按 None 读取、不执行 DDL。可信飞书入站在平台、地址与身份匹配时记录 chat_id；未知类型不靠前缀猜测，仅从本机精确匹配的可信记录、home 或历史 ORIGIN 任务取得证据，冲突失败关闭，FEISHU 快照不能自证。删除 N-Agent 会话关联不删除投递地址；分页为 updated_at DESC,id DESC，不以 active_session_id 判断能否投递。
+
+GET /chat/gateways/feishu/sessions 保留原分页包裹及字段，增加 delivery_available、delivery_unavailable_reason、delivery_label、delivery_parent_chat、delivery_is_representative、platform_status，以及可空群名备注 delivery_chat_name，兼容已有无前缀字段；地址类型未知的会话仍返回且禁选。单 ID 路径 /chat/gateways/{platform}/sessions/{conversation_id} 可回显不在首页的当前目标。相同聊天线程按最早 created_at,id 选稳定代表，新选择发父聊天、不承诺回复线程。标签附 opaque 父聊天标识供选择前区分，不新增原始地址。
+
+任务响应保留原 API 字段，增加 delivery 白名单投影：kind/conversation_id/label/available/reason/legacy/home/home_configured/legacy_restore_available。旧飞书 origin 按实际 home 优先语义显示目标；target=home 未配置时明确不可用。旧目标可只读映射到实际 home 优先地址对应的可信代表会话 ID，供表单回显，不改变既有投递语义。FE 只保留“飞书IM接收会话”选择框，选项为“不投递飞书IM”及可用聊天（标识附群名备注），不展示不可用聊天。打开弹窗自动加载全部分页，无刷新接收会话或加载更多按钮；失败可刷新浏览器重试。弹窗不重复展示当前接收位置、结果保留、线程或来源会话等说明备注。新建未选聊天显式提交 silent；旧配置普通编辑仍省略投递字段，只有明确改选或关闭才更新，已有不可用目标保留草稿原ID，选择框仅使用通用占位，未修改时不改变原配置。继续使用独立草稿、单项回显及异步代次保护，不展示原始上下文 JSON。
+
+新 feishu context 作为认领快照，运行时按已保存原行重新核验平台、地址、类型与在线状态，不重选代表、不受 home 覆盖；校验、授权、信息流释放任一步失败都不发送，不改变已完成的执行记录。
+
+Config Bundle 保存完整目标，但导入忽略源实例内部 ID，按目标实例可信平台、地址、类型精确重绑定；不迁移 Gateway 运行身份。每次导入在任何段写入前冻结本机 home/ORIGIN 证据到本次 _ImportContext，预解析及 ScheduleService 写入前二次重绑复用同一不可变映射，空映射不回读 live evidence。merge 先跳过，dry-run 同样解析但不写入；无法匹配或证据读取失败按相关 feishu 条目失败并给入站修复指引，其他段继续，保持原退出码。失败不创建孤儿 session、不半覆盖原任务；离线配置迁移不构造外部客户端。

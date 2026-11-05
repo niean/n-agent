@@ -180,3 +180,57 @@ async def test_gateway_registry_deletes_session_link_and_clears_active(tmp_path)
 
     assert await registry.get_active_session(key) is None
     assert await registry.list_session_links(key) == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_address_survives_link_deletion_and_exact_identity_lookup(tmp_path):
+    registry = SQLiteGatewaySessionRegistry(tmp_path / "gateway.db")
+    key = GatewaySessionKey(Platform.FEISHU, "oc_1", "thread")
+    await registry.record_delivery_address(key, "chat_id")
+    assert await registry.find_conversations(Platform.FEISHU, "oc_1") == []
+    link = await registry.create_session_link(key, "s1")
+    await registry.record_delivery_address(GatewaySessionKey(Platform.FEISHU, "oc_1"), "chat_id")
+    assert (await registry.get_conversation(link.conversation_id)).receive_id_type is None
+    await registry.record_delivery_address(key, "chat_id")
+    await registry.delete_session_link("s1")
+    stored = await registry.get_conversation(link.conversation_id)
+    assert stored.active_session_id is None
+    assert stored.receive_id_type == "chat_id"
+    assert await registry.find_conversations(Platform.FEISHU, "oc_1") == [stored]
+    other = await registry.create_session_link(GatewaySessionKey(Platform.FEISHU, "oc_1", "other-thread"), "s2")
+    assert {row.id for row in await registry.find_conversations(Platform.FEISHU, "oc_1")} == {stored.id, other.conversation_id}
+    assert (await registry.get_conversation(other.conversation_id)).receive_id_type is None
+    assert await registry.find_conversations(Platform.FEISHU, "oc_1' OR 1=1 --") == []
+    assert await registry.get_conversation("missing") is None
+
+
+@pytest.mark.asyncio
+async def test_old_delivery_schema_read_only_then_idempotent_upgrade(tmp_path):
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE gateway_conversations (id TEXT PRIMARY KEY, platform TEXT, platform_session_id TEXT, thread_id TEXT, display_name TEXT, active_session_id TEXT, created_at TEXT, updated_at TEXT)")
+        conn.execute("INSERT INTO gateway_conversations VALUES ('old', 'feishu', 'oc_1', '', 'Old', NULL, ?, ?)", ("2026-01-01T00:00:00+00:00",) * 2)
+    readonly = SQLiteGatewaySessionRegistry(path, read_only=True)
+    assert (await readonly.get_conversation("old")).receive_id_type is None
+    assert (await readonly.list_conversations())[0].receive_id_type is None
+    assert (await readonly.find_conversations(Platform.FEISHU, "oc_1"))[0].receive_id_type is None
+    with sqlite3.connect(path) as conn:
+        assert "receive_id_type" not in {row[1] for row in conn.execute("PRAGMA table_info(gateway_conversations)")}
+    registry = SQLiteGatewaySessionRegistry(path)
+    registry.initialize()
+    assert (await registry.get_conversation("old")).receive_id_type is None
+    await registry.record_delivery_address(GatewaySessionKey(Platform.FEISHU, "oc_1"), "chat_id")
+    assert (await registry.get_conversation("old")).receive_id_type == "chat_id"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", [None, Platform.FEISHU])
+async def test_conversation_pagination_breaks_timestamp_ties_by_id(tmp_path, platform):
+    registry = SQLiteGatewaySessionRegistry(tmp_path / "gateway.db")
+    for index in range(3):
+        await registry.create_session_link(GatewaySessionKey(Platform.FEISHU, f"oc_{index}"), f"s{index}")
+    with sqlite3.connect(registry.path) as conn:
+        conn.execute("UPDATE gateway_conversations SET updated_at = '2026-01-01T00:00:00+00:00'")
+    all_rows = await registry.list_conversations(platform)
+    pages = [await registry.list_conversations(platform, limit=1, offset=i) for i in range(3)]
+    assert [page[0].id for page in pages] == sorted([row.id for row in all_rows], reverse=True)

@@ -90,28 +90,20 @@
 
 [20261105]
 - FR
-    - 技能：新增wake-codex技能，先遇到skill注册问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新问题(需要手动改配置文件host-terminal-policy.yaml没有Dashboard)，非常不方便
-    - 定时任务：结果投递，希望只投递到定时任务的对话框、关掉飞书IM，但Dashboard接口会忽略飞书来源任务的投递目标修改、无法改为slient，以及FE上无法修改
-    - 定时任务：通过对话方式新增，当前只能通过飞书IM信道，希望新增自带对话框信号
-    - 技能：photo-and-upload，健康状态显示archived，不符合预期。现场如下
-        ```
-        答：因为页面的“健康状态”和扫描结果来自两份独立记录，重新扫描没有同步恢复健康状态。
+    - 定时任务：结果投递，默认只投递到定时任务对话框、不投递飞书IM信道，同时支持在FE上修改、放开飞书IM投递(可能需要修改接口)
+        - 飞书：支持群聊模式。包括投递定时任务的结果到飞书群，群里@机器人后N-Agent自动发现群ID、并放到飞书IM信道的选择列表中（FE布局较差，记录TODO将来修复）
+    - 定时任务：通过自带对话框信道、增删改定时任，当前只支持飞书IM信道、未支持自带对话框
+    - 技能：修复健康状态。photo-and-upload，健康状态显示archived，不符合预期
+    - 观测：Metric，补全读缓存Token、写缓存Token、缓存命中率、归一化Token等指标。先按照业界规范、定义观测语义，然后再补全埋点统计，最后加到Grafana大盘。归一化Token是本项目特有的定义，应该有一个计算规则，提取出来、做成观测语义契约
+        - 文档：新增契约，更新到 locals/blog/design-agent-observability.md
 
-        当前数据库是：
-
-        - 技能注册表：`photo-and-upload` 为 `available / ok`。
-        - 使用记录：`skill_usage.state` 仍为 `archived`，页面直接显示这个字段。
-
-        代码中还有一个问题：删除单个关联文件（`REMOVE_FILE`）也会把整个 Skill 标为 `archived`，见 [skill_service.py:683](/Users/niean/code/github.com/niean/n-agent/app/application/skill_service.py:683)。而重新扫描只更新注册表，不更新这条使用记录。
-
-        所以现在显示的是残留的归档状态，与扫描后的可用状态不一致；这个标签本身不参与宿主脚本执行入口的检查。需要将使用记录恢复为 `active`，并修正删除关联文件时误归档整个 Skill 的逻辑。
-        ```
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - FR
+    - 技能：新增wake-codex技能操作不便，先遇到skill注册问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新问题(需要改配置文件host-terminal-policy.yaml、没有Dashboard操作入口)
     - 观测：Prifile，当前按服务和进程采样，使用 py-spy → Pyroscope；尚未接入 OTel Profiles
     - 观测：引入Langfuse，尽量复用OTel组件(如Collector)；现有的OTel能力全部留下、跟Langfuse并存
     - 评测：增加evaluate能力

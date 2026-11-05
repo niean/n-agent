@@ -700,11 +700,21 @@ class GatewayService:
     async def _resolve_session_id(self, event: InteractionMessage) -> str:
         link = await self.registry.get_active_session(event.session_key)
         if link is not None:
-            return link.session_id
-        prefix, source = _session_id_prefix_and_source(event.session_key)
-        session_id = f"{prefix}-{uuid4()}"
-        await self.session_service.create_session(session_id, source=source)
-        await self.registry.create_session_link(event.session_key, session_id)
+            session_id = link.session_id
+        else:
+            prefix, source = _session_id_prefix_and_source(event.session_key)
+            session_id = f"{prefix}-{uuid4()}"
+            await self.session_service.create_session(session_id, source=source)
+            await self.registry.create_session_link(event.session_key, session_id)
+        key = event.session_key
+        if (
+            key.platform is Platform.FEISHU
+            and key.platform_session_id
+            and event.metadata.get("platform") == key.source_value
+            and event.metadata.get("receive_id") == key.platform_session_id
+            and event.metadata.get("receive_id_type") == "chat_id"
+        ):
+            await self.registry.record_delivery_address(key, "chat_id")
         return session_id
 
 

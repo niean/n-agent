@@ -89,6 +89,7 @@ class GatewayConversation:
     active_session_id: str | None
     created_at: datetime
     updated_at: datetime
+    receive_id_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,15 @@ class GatewayConfirmationRequest:
 
 
 class GatewaySessionRegistry(Protocol):
+    async def get_conversation(self, conversation_id: str) -> GatewayConversation | None:
+        ...
+
+    async def find_conversations(self, platform: Platform, receive_id: str) -> list[GatewayConversation]:
+        ...
+
+    async def record_delivery_address(self, key: GatewaySessionKey, receive_id_type: str) -> None:
+        ...
+
     async def get_active_session(self, key: GatewaySessionKey) -> GatewaySessionLink | None:
         ...
 

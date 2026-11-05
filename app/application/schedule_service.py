@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from app.application.schedule_delivery_service import ScheduleDeliveryService, ScheduleDeliveryError
 from app.application.session_service import SessionService
 from app.domain.schedule import (
     DeliveryTarget,
@@ -58,6 +59,7 @@ class ScheduledTaskCreateInput:
     origin: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
     allowed_tools: tuple[str, ...] = ()
+    delivery_conversation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ class ScheduledTaskUpdateInput:
     origin: dict[str, Any] | None = None
     session_id: str | None = None
     allowed_tools: tuple[str, ...] | None = None
+    delivery_conversation_id: str | None = None
 
 
 RunNowCallable = Callable[[str], Awaitable[Any]]
@@ -92,20 +95,25 @@ class ScheduleService:
         scanner: PromptSafetyScanner,
         session_service: SessionService,
         run_now_handler: RunNowCallable | None = None,
+        delivery_service: ScheduleDeliveryService | None = None,
     ):
         self.registry = registry
         self.calculator = calculator
         self.scanner = scanner
         self.session_service = session_service
         self.run_now_handler = run_now_handler
+        self.delivery_service = delivery_service
 
     async def create(self, request: ScheduledTaskCreateInput) -> ScheduledTask:
+        self._validate_delivery_selection(request.delivery_target, request.delivery_conversation_id)
         expression = ScheduleExpression(request.cron_expression)
         timezone_value = ScheduleTimezone(request.timezone)
         self._validate(expression, timezone_value, request.prompt)
-        target = self._delivery_target(request.delivery_target, request.origin)
+        target = await self._resolve_delivery_target(
+            request.delivery_target, request.origin, request.delivery_conversation_id
+        )
         session_id = request.session_id
-        if session_id is None or target.target_type is DeliveryTargetType.ORIGIN:
+        if session_id is None or target.target_type in (DeliveryTargetType.ORIGIN, DeliveryTargetType.FEISHU):
             session_id = f"schedule-{uuid4()}"
             await self.session_service.create_session(session_id, source=SessionSource.SCHEDULE.value)
         now = datetime.now(timezone.utc)
@@ -140,6 +148,16 @@ class ScheduleService:
     # _delivery_target so cron / timezone / prompt safety / delivery context
     # stay validated by exactly one implementation.
     # ------------------------------------------------------------------
+    async def _import_delivery_target(
+        self, kind: str, context: dict[str, Any],
+        evidence: Mapping[str, frozenset[str]] | None,
+    ) -> DeliveryTarget:
+        if kind != DeliveryTargetType.FEISHU.value:
+            return self._delivery_target(kind, dict(context))
+        if self.delivery_service is None:
+            raise ScheduleDeliveryError("delivery_resolver_unavailable")
+        return await self.delivery_service.rebind_import(context, local_types=evidence)
+
     async def import_create(
         self,
         *,
@@ -153,12 +171,13 @@ class ScheduleService:
         execution_policy: ScheduledExecutionPolicy,
         enabled: bool,
         status: ScheduledTaskStatus,
+        delivery_evidence: Mapping[str, frozenset[str]] | None = None,
     ) -> ScheduledTask:
         """Create a migrated task in its FINAL enabled/status in one write."""
         expression = ScheduleExpression(cron_expression)
         tz = ScheduleTimezone(timezone_value)
         self._validate(expression, tz, prompt)
-        target = self._delivery_target(delivery_target, dict(delivery_context))
+        target = await self._import_delivery_target(delivery_target, delivery_context, delivery_evidence)
         final_enabled, final_status = _normalize_runnability(enabled, status)
         # Validation first, then a brand-new empty session: no history is copied.
         session_id = f"schedule-{uuid4()}"
@@ -196,6 +215,7 @@ class ScheduleService:
         execution_policy: ScheduledExecutionPolicy,
         enabled: bool,
         status: ScheduledTaskStatus,
+        delivery_evidence: Mapping[str, frozenset[str]] | None = None,
     ) -> ScheduledTask:
         """Overwrite the carried fields of an existing task.
 
@@ -210,7 +230,7 @@ class ScheduleService:
         expression = ScheduleExpression(cron_expression)
         tz = ScheduleTimezone(timezone_value)
         self._validate(expression, tz, prompt)
-        target = self._delivery_target(delivery_target, dict(delivery_context))
+        target = await self._import_delivery_target(delivery_target, delivery_context, delivery_evidence)
         final_enabled, final_status = _normalize_runnability(enabled, status)
         reschedule = (
             expression.value != task.schedule.value
@@ -246,16 +266,18 @@ class ScheduleService:
         return task
 
     async def update(self, task_id: str, request: ScheduledTaskUpdateInput) -> ScheduledTask:
+        self._validate_delivery_selection(request.delivery_target, request.delivery_conversation_id)
         task = await self.get(task_id)
         expression = ScheduleExpression(request.cron_expression or task.schedule.value)
         timezone_value = ScheduleTimezone(request.timezone or task.timezone.value)
         prompt = request.prompt if request.prompt is not None else task.prompt
         self._validate(expression, timezone_value, prompt)
         origin = request.origin if request.origin is not None else task.origin
-        delivery_target = self._delivery_target(
-            request.delivery_target or task.delivery_target.target_type.value,
-            origin,
-        )
+        delivery_target = task.delivery_target
+        if request.delivery_target is not None:
+            delivery_target = await self._resolve_delivery_target(
+                request.delivery_target, task.origin, request.delivery_conversation_id, task
+            )
         execution_policy = task.execution_policy
         if request.allowed_tools is not None:
             execution_policy = ScheduledExecutionPolicy(
@@ -360,7 +382,12 @@ class ScheduleService:
             raise ScheduleValidationError(safety.reason)
 
     def _delivery_target(self, target: str, origin: dict[str, Any]) -> DeliveryTarget:
-        target_type = DeliveryTargetType(target)
+        try:
+            target_type = DeliveryTargetType(target)
+        except (ValueError, TypeError) as exc:
+            raise ScheduleDeliveryContextError("unsupported_delivery_target") from exc
+        if target_type is DeliveryTargetType.FEISHU:
+            raise ScheduleDeliveryContextError("delivery_conversation_required")
         if target_type is DeliveryTargetType.ORIGIN:
             if origin.get("target") != "home" and (not origin.get("receive_id") or not origin.get("receive_id_type")):
                 raise ScheduleDeliveryContextError("origin delivery requires receive_id and receive_id_type")
@@ -368,3 +395,38 @@ class ScheduleService:
         if target_type is DeliveryTargetType.SILENT:
             return DeliveryTarget.silent()
         return DeliveryTarget.dashboard()
+
+    async def _resolve_delivery_target(
+        self,
+        target: str,
+        origin: dict[str, Any],
+        conversation_id: str | None,
+        task: ScheduledTask | None = None,
+    ) -> DeliveryTarget:
+        try:
+            target_type = DeliveryTargetType(target)
+        except (ValueError, TypeError) as exc:
+            raise ScheduleDeliveryContextError("unsupported_delivery_target") from exc
+        if target_type is DeliveryTargetType.FEISHU:
+            if conversation_id is not None:
+                if not isinstance(conversation_id, str) or not conversation_id.strip():
+                    raise ScheduleDeliveryContextError("delivery_conversation_required")
+                if self.delivery_service is None:
+                    raise ScheduleDeliveryContextError("delivery_service_unavailable")
+                return await self.delivery_service.resolve_selection(conversation_id)
+            if task is not None and task.delivery_target.target_type is DeliveryTargetType.FEISHU:
+                return task.delivery_target
+            raise ScheduleDeliveryContextError("delivery_conversation_required")
+        if target_type is DeliveryTargetType.ORIGIN and task is not None:
+            if task.origin.get("platform") != "feishu":
+                raise ScheduleDeliveryContextError("origin_delivery_unavailable")
+        return self._delivery_target(target_type.value, origin)
+
+    @staticmethod
+    def _validate_delivery_selection(target: str | None, conversation_id: str | None) -> None:
+        if conversation_id is None:
+            return
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ScheduleDeliveryContextError("delivery_conversation_required")
+        if target != DeliveryTargetType.FEISHU.value:
+            raise ScheduleDeliveryContextError("delivery_conversation_requires_feishu")

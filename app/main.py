@@ -54,6 +54,7 @@ from app.application.config_bundle_service import ConfigBundleService
 from app.application.provider_service import ProviderCreateInput, ProviderService
 from app.application.runtime_provider import ActiveProviderHolder
 from app.application.schedule_run_service import ScheduleRunService
+from app.application.schedule_delivery_service import ScheduleDeliveryService
 from app.application.schedule_service import ScheduleService
 from app.application.scheduled_agent_executor import ScheduledAgentExecutor
 from app.application.scheduler_runner import SchedulerRunner
@@ -560,6 +561,7 @@ class ApplicationServices:
     gateway_registry: SQLiteGatewaySessionRegistry
     gateway_service: GatewayService
     schedule_service: ScheduleService
+    schedule_delivery_service: ScheduleDeliveryService
     scheduler_runner: SchedulerRunner
     skill_service: SkillService
     skill_usage_store: SkillUsageStore
@@ -1320,6 +1322,16 @@ def build_application_services(
         schedule_calculator,
         missed_grace_seconds=settings.scheduler_missed_grace_seconds,
     )
+    def schedule_platform_status(platform):
+        # Called only after composition is complete; share live platform lifecycle.
+        return platform_service._compose_status(
+            platform_registry.get(platform), platform_registry.get_lifecycle(platform),
+        )[0]
+
+    schedule_delivery_service = ScheduleDeliveryService(
+        gateway_registry, schedule_registry, schedule_platform_status,
+        chat_name_resolver=feishu_client.get_chat_name if feishu_client else None,
+    )
     scheduled_agent_executor = ScheduledAgentExecutor(chat_service, schedule_scanner)
     schedule_run_service = ScheduleRunService(
         schedule_registry,
@@ -1330,6 +1342,7 @@ def build_application_services(
         missed_grace_seconds=settings.scheduler_missed_grace_seconds,
         execution_timeout_seconds=settings.scheduler_execution_timeout_seconds,
         information_flow_service=information_flow_service,
+        delivery_service=schedule_delivery_service,
     )
     schedule_service = ScheduleService(
         schedule_registry,
@@ -1337,6 +1350,7 @@ def build_application_services(
         schedule_scanner,
         session_service,
         schedule_run_service.run_now,
+        delivery_service=schedule_delivery_service,
     )
     schedule_run_service.recover_missing_origin_sessions = schedule_service.recover_missing_origin_sessions
     scheduler_runner = SchedulerRunner(schedule_run_service, settings.scheduler_tick_seconds)
@@ -1400,6 +1414,7 @@ def build_application_services(
         gateway_registry=gateway_registry,
         task_config_store=task_config_store,
         task_config_service=task_config_service,
+        schedule_delivery_service=schedule_delivery_service,
     )
     # Artifact subsystem wiring (T14). Gated on artifacts_enabled: when False,
     # the entire subsystem is skipped (no service, no callbacks, no backfill,
@@ -2132,7 +2147,7 @@ def build_application_services(
         if feishu_im_adapter is not None:
             lifecycles[Platform.FEISHU] = feishu_im_adapter
     platform_registry = InMemoryPlatformRegistry(descriptors, lifecycles)
-    platform_service = PlatformService(platform_registry, gateway_registry)
+    platform_service = PlatformService(platform_registry, gateway_registry, schedule_delivery_service)
     if task_service is not None:
         async def _delete_session_tasks(session_id: str) -> None:
             # Run before MemoryStore deletes the session: SQLite's task FK uses
@@ -2178,6 +2193,7 @@ def build_application_services(
         gateway_registry=gateway_registry,
         gateway_service=gateway_service,
         schedule_service=schedule_service,
+        schedule_delivery_service=schedule_delivery_service,
         scheduler_runner=scheduler_runner,
         skill_service=skill_service,
         skill_usage_store=skill_usage_store,
@@ -2245,12 +2261,16 @@ def build_config_bundle_services(
     # a read-only assembly never calls; it is wired the same way in both modes so
     # the two paths stay one code path.
     session_service = SessionService(registries.memory_store)
+    schedule_delivery_service = ScheduleDeliveryService(
+        registries.gateway_registry, registries.schedule_registry, lambda platform: "unavailable",
+    )
     schedule_service = ScheduleService(
         registries.schedule_registry,
         registries.schedule_calculator,
         DeterministicPromptSafetyScanner(),
         session_service,
         None,
+        delivery_service=schedule_delivery_service,
     )
     task_config_service = TaskConfigService(
         settings, registries.task_config_store, TaskConfigLoggingSink(),
@@ -2267,6 +2287,7 @@ def build_config_bundle_services(
         gateway_registry=registries.gateway_registry,
         task_config_store=registries.task_config_store,
         task_config_service=task_config_service,
+        schedule_delivery_service=schedule_delivery_service,
     )
 
 
@@ -2689,6 +2710,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         provider_service=services.provider_service,
         mcp_service=services.mcp_service,
         schedule_service=services.schedule_service,
+        schedule_delivery_service=services.schedule_delivery_service,
         skill_service=services.skill_service,
         plugin_service=services.plugin_service,
         knowledge_service=services.knowledge_service,

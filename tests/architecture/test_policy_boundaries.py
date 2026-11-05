@@ -270,6 +270,24 @@ def test_policy_registration_counts():
     assert POLICY_FILE_OWN_DOMAIN["artifact_policy.py"] == {"app.domain.artifact"}
 
 
+def test_embedded_schedule_delivery_authorization_uses_only_pure_facts():
+    # Embedded in the schedule types module: do not register that whole module
+    # as a separate policy module, since SchedulePolicy consumes its types.
+    tree = ast.parse((DOMAIN / 'schedule.py').read_text())
+    modules = _imported_modules(DOMAIN / 'schedule.py')
+    assert modules <= {'__future__', 'dataclasses', 'datetime', 'enum', 'typing', 'uuid', 'app.domain.policy'}
+    policy = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                  and node.name == 'ScheduledDeliveryAuthorizationPolicy')
+    methods = [node for node in policy.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    assert [method.name for method in methods] == ['evaluate']
+    assert not any(isinstance(node, (ast.Await, ast.AsyncFunctionDef)) for node in ast.walk(policy))
+    assert [ast.unparse(node.func) for node in ast.walk(policy) if isinstance(node, ast.Call)] == ['PolicyDecision']
+    assert _class_field_types((DOMAIN / 'schedule.py').read_text(), 'ScheduledDeliveryAuthorizationRequest') == {
+        'platform': 'str', 'address_type': 'str', 'conversation_verified': 'bool',
+        'address_matches': 'bool', 'platform_available': 'bool',
+    }
+
+
 def test_run_policy_snapshot_has_delegation_config():
     """RunPolicySnapshot must carry a delegation typed config (the 11th)."""
     source = (APPLICATION / "policy_snapshot.py").read_text()

@@ -391,3 +391,165 @@ async def test_schedule_service_update_sets_and_preserves_allowed_tools():
 
     reset = await service.update(task.id, ScheduledTaskUpdateInput(allowed_tools=("host_terminal", "other")))
     assert reset.execution_policy.allowed_tools == ("host_terminal", "other")
+
+
+@pytest.mark.asyncio
+async def test_feishu_delivery_can_switch_to_silent_and_back_without_changing_session():
+    service, _, _ = _service()
+    origin = {"platform": "feishu", "receive_id": "oc_1", "receive_id_type": "chat_id", "thread_id": "thread-1"}
+    task = await service.create(ScheduledTaskCreateInput(
+        name="feishu", prompt="ok", cron_expression="* * * * *",
+        delivery_target="origin", origin=origin,
+    ))
+    assert task.delivery_target == DeliveryTarget.origin(origin)
+    unchanged = await service.update(task.id, ScheduledTaskUpdateInput(name="Renamed"))
+    assert unchanged.delivery_target == task.delivery_target
+    silent = await service.update(task.id, ScheduledTaskUpdateInput(delivery_target="silent"))
+    assert silent.delivery_target == DeliveryTarget.silent()
+    assert silent.origin == origin
+    assert silent.session_id == task.session_id
+    restored = await service.update(task.id, ScheduledTaskUpdateInput(delivery_target="origin"))
+    assert restored.delivery_target == DeliveryTarget.origin(origin)
+    assert restored.origin == origin
+    assert restored.session_id == task.session_id
+
+
+class FakeDeliveryService:
+    def __init__(self):
+        self.selected = []
+
+    async def resolve_selection(self, conversation_id):
+        self.selected.append(conversation_id)
+        return DeliveryTarget.feishu(dict(conversation_id=conversation_id, platform='feishu',
+                                          receive_id='chat-' + conversation_id, receive_id_type='chat_id'))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('origin', [{}, {'platform': 'feishu', 'receive_id': 'source', 'receive_id_type': 'chat_id'}])
+async def test_explicit_feishu_selection_preserves_source_and_has_independent_session(origin):
+    service, _, _ = _service()
+    resolver = service.delivery_service = FakeDeliveryService()
+    task = await service.create(ScheduledTaskCreateInput(
+        'x', 'ok', '* * * * *', delivery_target='feishu', delivery_conversation_id='one',
+        origin=origin, session_id='source-session'))
+    assert task.origin == origin
+    assert task.session_id.startswith('schedule-')
+    for request in (ScheduledTaskUpdateInput(name='renamed'), ScheduledTaskUpdateInput(delivery_target='feishu')):
+        unchanged = await service.update(task.id, request)
+        assert unchanged.delivery_target == task.delivery_target
+        assert unchanged.origin == origin
+        assert unchanged.session_id == task.session_id
+    assert resolver.selected == ['one']
+    selected = await service.update(task.id, ScheduledTaskUpdateInput(delivery_target='feishu', delivery_conversation_id='two'))
+    assert selected.delivery_target.context['conversation_id'] == 'two'
+    assert selected.origin == origin and selected.session_id == task.session_id
+    silent = await service.update(task.id, ScheduledTaskUpdateInput(delivery_target='silent'))
+    assert silent.delivery_target.context == {}
+    with pytest.raises(ScheduleDeliveryContextError):
+        await service.update(task.id, ScheduledTaskUpdateInput(delivery_target='feishu'))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target', ['unknown', '', 'feishu'])
+async def test_invalid_target_fails_before_session_or_registry_mutation(target):
+    service, registry, _ = _service()
+    with pytest.raises(ScheduleDeliveryContextError):
+        await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *', delivery_target=target))
+    assert not service.session_service.created and not registry.tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('origin', [{}, {'platform': 'other', 'receive_id': 'x', 'receive_id_type': 'chat_id'}])
+async def test_origin_restore_uses_only_trusted_feishu_source(origin):
+    service, _, _ = _service()
+    task = await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *', origin=origin))
+    with pytest.raises(ScheduleDeliveryContextError):
+        await service.update(task.id, ScheduledTaskUpdateInput(delivery_target='origin',
+            origin={'platform': 'feishu', 'receive_id': 'forged', 'receive_id_type': 'chat_id'}))
+
+
+@pytest.mark.asyncio
+async def test_feishu_resolver_rejection_has_no_side_effects():
+    from app.application.schedule_delivery_service import ScheduleDeliveryError
+
+    class RejectedDeliveryService:
+        async def resolve_selection(self, conversation_id):
+            raise ScheduleDeliveryError('conversation_not_found')
+
+    service, registry, _ = _service()
+    service.delivery_service = RejectedDeliveryService()
+    with pytest.raises(ScheduleDeliveryError, match='conversation_not_found'):
+        await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *',
+            delivery_target='feishu', delivery_conversation_id='missing'))
+    assert not service.session_service.created and not registry.tasks
+    task = await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *'))
+    with pytest.raises(ScheduleDeliveryError):
+        await service.update(task.id, ScheduledTaskUpdateInput(name='changed',
+            delivery_target='feishu', delivery_conversation_id='missing'))
+    assert registry.tasks[task.id] == task
+    with pytest.raises(ScheduleDeliveryContextError):
+        await service.update(task.id, ScheduledTaskUpdateInput(delivery_target='unknown'))
+    assert registry.tasks[task.id] == task
+
+
+@pytest.mark.asyncio
+async def test_dashboard_switch_clears_feishu_snapshot():
+    service, _, _ = _service()
+    service.delivery_service = FakeDeliveryService()
+    task = await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *',
+        delivery_target='feishu', delivery_conversation_id='one'))
+    updated = await service.update(task.id, ScheduledTaskUpdateInput(delivery_target='dashboard'))
+    assert updated.delivery_target == DeliveryTarget.dashboard()
+    assert updated.origin == task.origin and updated.session_id == task.session_id
+
+
+@pytest.mark.asyncio
+async def test_explicit_feishu_requires_configured_resolver():
+    service, registry, _ = _service()
+    with pytest.raises(ScheduleDeliveryContextError, match='delivery_service_unavailable'):
+        await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *',
+            delivery_target='feishu', delivery_conversation_id='one'))
+    assert not service.session_service.created and not registry.tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target', ['dashboard', 'silent', 'origin'])
+async def test_create_rejects_conversation_id_on_other_targets(target):
+    service, registry, _ = _service()
+    resolver = service.delivery_service = FakeDeliveryService()
+    with pytest.raises(ScheduleDeliveryContextError, match='delivery_conversation_requires_feishu'):
+        await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *',
+            delivery_target=target, delivery_conversation_id='one'))
+    assert not resolver.selected and not registry.tasks and not service.session_service.created
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('target', [None, 'dashboard', 'silent', 'origin'])
+async def test_update_rejects_conversation_id_without_explicit_feishu(target):
+    service, registry, _ = _service()
+    resolver = service.delivery_service = FakeDeliveryService()
+    task = await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *'))
+    sessions = list(service.session_service.created)
+    with pytest.raises(ScheduleDeliveryContextError, match='delivery_conversation_requires_feishu'):
+        await service.update(task.id, ScheduledTaskUpdateInput(name='changed',
+            delivery_target=target, delivery_conversation_id='one'))
+    assert registry.tasks[task.id] == task and not resolver.selected
+    assert service.session_service.created == sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('conversation_id', ['', '   ', 123, False])
+async def test_create_and_update_reject_invalid_conversation_ids_before_resolution(conversation_id):
+    service, registry, _ = _service()
+    resolver = service.delivery_service = FakeDeliveryService()
+    with pytest.raises(ScheduleDeliveryContextError, match='delivery_conversation_required'):
+        await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *',
+            delivery_target='feishu', delivery_conversation_id=conversation_id))
+    assert not registry.tasks and not service.session_service.created
+    task = await service.create(ScheduledTaskCreateInput('x', 'ok', '* * * * *'))
+    sessions = list(service.session_service.created)
+    with pytest.raises(ScheduleDeliveryContextError, match='delivery_conversation_required'):
+        await service.update(task.id, ScheduledTaskUpdateInput(name='changed',
+            delivery_target='feishu', delivery_conversation_id=conversation_id))
+    assert registry.tasks[task.id] == task and not resolver.selected
+    assert service.session_service.created == sessions

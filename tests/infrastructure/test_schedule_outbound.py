@@ -142,3 +142,24 @@ async def test_feishu_send_exception_returns_failed_result():
 
     assert result.status == "failed"
     assert "send failed" in result.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", [False, True])
+async def test_explicit_feishu_ignores_home_and_redacts_send_errors(fail):
+    class Client(FakeFeishuClient):
+        async def send_markdown_reply(self, receive_id, content, receive_id_type):
+            if fail:
+                raise RuntimeError("secret oc_selected")
+            self.calls.append((receive_id, content, receive_id_type))
+
+    async def home(platform):
+        raise AssertionError("explicit delivery must not resolve home")
+
+    client = Client()
+    result = await ScheduleOutboundDelivery(client, home).deliver(
+        DeliveryTarget.feishu({"conversation_id": "conv", "platform": "feishu",
+                               "receive_id": "oc_selected", "receive_id_type": "chat_id"}), "done")
+    assert result.status == ("failed" if fail else "success")
+    assert result.error == ("send_failed" if fail else None)
+    assert client.calls == ([] if fail else [("oc_selected", "done", "chat_id")])

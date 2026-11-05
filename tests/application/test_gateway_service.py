@@ -13,6 +13,9 @@ from app.domain.tool import ToolDefinition
 
 
 class FakeGatewayRegistry:
+    async def record_delivery_address(self, key, receive_id_type):
+        pass
+
     def __init__(self):
         self.active: dict[tuple[str, str, str], str] = {}
         self.links: dict[tuple[str, str, str], list[GatewaySessionLink]] = {}
@@ -1167,3 +1170,31 @@ async def test_realtime_tool_context_passes_session_id_and_exposes_approval_tool
     # Shared ToolService DEFAULT surface contains the three approval tools
     tool_names = _default_exposed_tool_names_with_approval_tools()
     assert {"approve_task", "reject_task", "revise_task"}.issubset(tool_names)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("metadata,expected", [
+    ({"platform": "feishu", "receive_id": "oc_1", "receive_id_type": "chat_id"}, True),
+    ({"platform": "feishu", "receive_id": "oc_other", "receive_id_type": "chat_id"}, False),
+    ({"platform": "cli", "receive_id": "oc_1", "receive_id_type": "chat_id"}, False),
+    ({"platform": "feishu", "receive_id": "oc_1", "receive_id_type": "open_id"}, False),
+    ({}, False),
+])
+async def test_resolve_session_records_only_matching_chat_address_even_on_reuse(reuse, metadata, expected):
+    harness = Harness()
+    key = GatewaySessionKey(Platform.FEISHU, "oc_1")
+    calls = []
+
+    async def record_delivery_address(key, receive_id_type):
+        assert key.conversation_parts in harness.registry.active
+        calls.append((key, receive_id_type))
+
+    harness.registry.record_delivery_address = record_delivery_address
+    if reuse:
+        await harness.registry.create_session_link(key, "existing")
+    service = harness.service()
+    first = await service._resolve_session_id(InteractionMessage("event", key, "hello", metadata))
+    assert calls == ([(key, "chat_id")] if expected else [])
+    assert await service._resolve_session_id(InteractionMessage("event2", key, "hello")) == first
+    assert calls == ([(key, "chat_id")] if expected else [])

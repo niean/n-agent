@@ -155,3 +155,32 @@ async def test_platform_service_rejects_invalid_and_unregistered_platforms():
         await service.get_platform("unknown")
     with pytest.raises(PlatformNotFoundError):
         await service.get_platform("dingtalk")
+
+
+@pytest.mark.asyncio
+async def test_single_conversation_lookup_preserves_unavailable_current_id():
+    row = _conversation(Platform.FEISHU, 'oc_a', active_session_id=None)
+    gateway = FakeGatewayRegistry([row])
+    async def lookup(identifier):
+        return row if identifier == row.id else None
+    gateway.get_conversation = lookup
+    service = PlatformService(InMemoryPlatformRegistry([_descriptor()]), gateway)
+    assert (await service.get_platform_session('feishu', row.id)).id == row.id
+    with pytest.raises(PlatformNotFoundError):
+        await service.get_platform_session('feishu', 'missing')
+
+
+@pytest.mark.asyncio
+async def test_candidate_projection_preserves_page_and_unknown_rows():
+    rows = [_conversation(Platform.FEISHU, 'oc_a'), _conversation(Platform.FEISHU, 'oc_b')]
+    class Delivery:
+        async def project_conversations(self, rows):
+            return {row.id: await self.project_conversation(row) for row in rows}
+
+        async def project_conversation(self, row):
+            return dict(delivery_available=False, unavailable_reason='unsupported_address_type', label='飞书聊天')
+    service = PlatformService(InMemoryPlatformRegistry([_descriptor()]), FakeGatewayRegistry(rows), Delivery())
+    page = await service.list_platform_sessions('feishu', limit=1, offset=1)
+    assert (page.total, page.limit, page.offset) == (2, 1, 1)
+    assert page.items == rows[1:]
+    assert page.projections[rows[1].id]['delivery_available'] is False

@@ -315,6 +315,15 @@ class SkillService:
         skills, warnings = await self.loader.scan()
         await self.registry.replace_all_skills(skills)
         normalized = [_normalize_warning(w) for w in warnings]
+        if self.usage is not None:
+            # 对账自愈：磁盘在而 usage.state=archived 的残留记录恢复 active。
+            # fail-fast：任一 get/restore_skill 失败立即向上传播原异常，
+            # 不降级 warning、不返回伪成功报告。
+            for skill in skills:
+                record = await self.usage.get(skill.name)
+                if record is None or record.state != "archived":
+                    continue
+                await self.usage.restore_skill(skill.name)
         return SkillScanReport(skills_count=len(skills), warnings=normalized)
 
     async def resolve_script_bytes(
@@ -645,9 +654,9 @@ class SkillService:
                 rf = self.loader.remove_linked_file(existing, request.file_path)
                 if asyncio.iscoroutine(rf):
                     await rf
-                rd = self.registry.delete_skill(name)
-                if asyncio.iscoroutine(rd):
-                    await rd
+                up = self.registry.upsert_skill(existing)
+                if asyncio.iscoroutine(up):
+                    await up
         except SkillPatchConflictError:
             raise
         except SkillWriteError as exc:
@@ -685,7 +694,7 @@ class SkillService:
             if asyncio.iscoroutine(ip):
                 await ip
 
-        if action in {SkillWriteAction.DELETE, SkillWriteAction.REMOVE_FILE}:
+        if action == SkillWriteAction.DELETE:
             ss = self.usage.set_state(name, "archived")
             if asyncio.iscoroutine(ss):
                 await ss

@@ -32,6 +32,7 @@ from app.application.provider_service import (
     ProviderService,
     ProviderUpdateInput,
 )
+from app.application.schedule_delivery_service import ScheduleDeliveryError, ScheduleDeliveryService
 from app.application.schedule_service import (
     ScheduledTaskCreateInput,
     ScheduledTaskNotFoundError,
@@ -256,6 +257,7 @@ def create_dashboard_router(
     otel_jaeger_base_url: str = "",
     otel_service_name: str = "",
     otel_link_config_service: OtelLinkConfigProvider | None = None,
+    schedule_delivery_service: ScheduleDeliveryService | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -761,7 +763,7 @@ def create_dashboard_router(
     if mcp_service is not None:
         _register_mcp_routes(router, mcp_service)
     if schedule_service is not None:
-        _register_schedule_routes(router, schedule_service)
+        _register_schedule_routes(router, schedule_service, schedule_delivery_service)
     if skill_service is not None:
         _register_skill_routes(router, skill_service, skill_pending_store, skill_usage_store)
     if plugin_service is not None:
@@ -1448,16 +1450,27 @@ def _register_provider_routes(router: APIRouter, provider_service: ProviderServi
         return _provider_to_dict(cfg)
 
 
-def _register_schedule_routes(router: APIRouter, schedule_service: ScheduleService) -> None:
+def _register_schedule_routes(
+    router: APIRouter, schedule_service: ScheduleService,
+    delivery_service: ScheduleDeliveryService | None = None,
+) -> None:
+    async def task_response(task):
+        result = _scheduled_task_to_dict(task)
+        if delivery_service is not None:
+            result["delivery"] = await delivery_service.project_task(task)
+        return result
+
     @router.get("/chat/scheduled-tasks")
     async def list_scheduled_tasks():
-        return [_scheduled_task_to_dict(task) for task in await schedule_service.list()]
+        try:
+            return [await task_response(task) for task in await schedule_service.list()]
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
+            return _schedule_error_response(exc)
 
     @router.post("/chat/scheduled-tasks")
     async def create_scheduled_task(payload: dict = Body(...)):
-        if payload.get("delivery_target") == "origin" or payload.get("origin") or payload.get("delivery_context"):
-            return _schedule_error_response(ScheduleDeliveryContextError("Dashboard cannot create origin delivery tasks"))
         try:
+            _validate_schedule_delivery_payload(payload, creating=True)
             task = await schedule_service.create(
                 ScheduledTaskCreateInput(
                     name=payload.get("name", ""),
@@ -1465,14 +1478,15 @@ def _register_schedule_routes(router: APIRouter, schedule_service: ScheduleServi
                     cron_expression=payload.get("cron_expression", ""),
                     timezone=payload.get("timezone", "Asia/Shanghai"),
                     delivery_target=payload.get("delivery_target", "dashboard"),
+                    delivery_conversation_id=payload.get("delivery_conversation_id"),
                     origin={},
                     session_id=payload.get("session_id"),
                     allowed_tools=_normalize_allowed_tools(payload.get("allowed_tools")),
                 )
             )
-        except ScheduleServiceError as exc:
+            return await task_response(task)
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
-        return _scheduled_task_to_dict(task)
 
     @router.get("/chat/scheduled-tasks/executions")
     async def list_all_scheduled_task_executions(task_id: str | None = None, limit: int = 50):
@@ -1486,52 +1500,52 @@ def _register_schedule_routes(router: APIRouter, schedule_service: ScheduleServi
     async def get_scheduled_task(task_id: str):
         try:
             task = await schedule_service.get(task_id)
-        except ScheduleServiceError as exc:
+            return await task_response(task)
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
-        return _scheduled_task_to_dict(task)
 
     @router.patch("/chat/scheduled-tasks/{task_id}")
     async def update_scheduled_task(task_id: str, payload: dict = Body(...)):
         try:
             task = await schedule_service.get(task_id)
             request = _scheduled_task_update_input(payload, task)
-            return _scheduled_task_to_dict(await schedule_service.update(task_id, request))
-        except ScheduleServiceError as exc:
+            return await task_response(await schedule_service.update(task_id, request))
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
 
     @router.get("/chat/scheduled-tasks/{task_id}/executions")
     async def list_scheduled_task_executions(task_id: str, limit: int = 10):
         try:
             return [_scheduled_execution_to_dict(item) for item in await schedule_service.list_executions(task_id, limit)]
-        except ScheduleServiceError as exc:
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
 
     @router.post("/chat/scheduled-tasks/{task_id}/pause")
     async def pause_scheduled_task(task_id: str):
         try:
-            return _scheduled_task_to_dict(await schedule_service.pause(task_id))
-        except ScheduleServiceError as exc:
+            return await task_response(await schedule_service.pause(task_id))
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
 
     @router.post("/chat/scheduled-tasks/{task_id}/resume")
     async def resume_scheduled_task(task_id: str):
         try:
-            return _scheduled_task_to_dict(await schedule_service.resume(task_id))
-        except ScheduleServiceError as exc:
+            return await task_response(await schedule_service.resume(task_id))
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
 
     @router.post("/chat/scheduled-tasks/{task_id}/run")
     async def run_scheduled_task(task_id: str):
         try:
             return await schedule_service.run_now(task_id)
-        except ScheduleServiceError as exc:
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
 
     @router.delete("/chat/scheduled-tasks/{task_id}")
     async def delete_scheduled_task(task_id: str):
         try:
             await schedule_service.delete(task_id)
-        except ScheduleServiceError as exc:
+        except (ScheduleServiceError, ScheduleDeliveryError) as exc:
             return _schedule_error_response(exc)
         return Response(status_code=204)
 
@@ -1861,25 +1875,39 @@ def _scheduled_execution_to_dict(execution) -> dict:
     }
 
 
+def _validate_schedule_delivery_payload(payload: dict, *, creating: bool = False) -> None:
+    # Presence matters: null/empty raw facts are still attempts to supply authority.
+    if any(key in payload for key in ("origin", "delivery_context", "receive_id", "receive_id_type")):
+        raise ScheduleDeliveryContextError("client_delivery_context_forbidden")
+    if "delivery_target" in payload:
+        target = payload["delivery_target"]
+        if not isinstance(target, str) or target not in {"dashboard", "silent", "feishu", "origin"}:
+            raise ScheduleDeliveryContextError("unsupported_delivery_target")
+        if creating and target == "origin":
+            raise ScheduleDeliveryContextError("origin_delivery_unavailable")
+    if "delivery_conversation_id" in payload:
+        conversation_id = payload["delivery_conversation_id"]
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ScheduleDeliveryContextError("delivery_conversation_required")
+        if payload.get("delivery_target") != "feishu":
+            raise ScheduleDeliveryContextError("delivery_conversation_requires_feishu")
+
+
 def _scheduled_task_update_input(payload: dict, task) -> ScheduledTaskUpdateInput:
-    if task.delivery_target.target_type.value == "origin":
-        return ScheduledTaskUpdateInput(
-            name=payload.get("name"),
-            prompt=payload.get("prompt"),
-            cron_expression=payload.get("cron_expression"),
-            timezone=payload.get("timezone"),
-            allowed_tools=_payload_allowed_tools(payload),
-        )
-    delivery_target = payload.get("delivery_target")
-    if delivery_target == "origin":
-        raise ScheduleDeliveryContextError("Dashboard cannot create origin delivery tasks")
+    _validate_schedule_delivery_payload(payload)
+    target = payload.get("delivery_target")
+    if target == "origin":
+        origin = task.origin
+        if origin.get("platform") != "feishu" or not (
+            origin.get("target") == "home" or (origin.get("receive_id") and origin.get("receive_id_type"))
+        ):
+            raise ScheduleDeliveryContextError("origin_delivery_unavailable")
     return ScheduledTaskUpdateInput(
-        name=payload.get("name"),
-        prompt=payload.get("prompt"),
-        cron_expression=payload.get("cron_expression"),
-        timezone=payload.get("timezone"),
-        delivery_target=delivery_target,
-        session_id=payload.get("session_id"),
+        name=payload.get("name"), prompt=payload.get("prompt"),
+        cron_expression=payload.get("cron_expression"), timezone=payload.get("timezone"),
+        delivery_target=target,
+        delivery_conversation_id=payload.get("delivery_conversation_id"),
+        session_id=None if task.origin or task.delivery_target.target_type.value == "origin" else payload.get("session_id"),
         allowed_tools=_payload_allowed_tools(payload),
     )
 
@@ -1907,7 +1935,7 @@ def _schedule_error_response(exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=404, content={"error": {"code": "scheduled_task_not_found", "message": str(exc)}})
     if isinstance(exc, ScheduledTaskNotRunnableError):
         return JSONResponse(status_code=409, content={"error": {"code": exc.code, "message": str(exc)}})
-    if isinstance(exc, ScheduleDeliveryContextError):
+    if isinstance(exc, (ScheduleDeliveryContextError, ScheduleDeliveryError)):
         return JSONResponse(status_code=422, content={"error": {"code": "scheduled_task_delivery_context_invalid", "message": str(exc)}})
     if isinstance(exc, ScheduleValidationError):
         return JSONResponse(status_code=422, content={"error": {"code": "scheduled_task_invalid", "message": str(exc)}})

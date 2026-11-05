@@ -1601,3 +1601,193 @@ async def test_a_structurally_invalid_bundle_still_raises_before_any_write(targe
             bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False
         )
     assert target.registries.provider_registry.rows == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dry_run', [True, False])
+async def test_feishu_import_rebinds_twice_with_same_frozen_evidence(target, bundle, dry_run):
+    from app.domain.schedule import DeliveryTarget
+    from types import MappingProxyType
+    class Resolver:
+        def __init__(self):
+            self.evidence = MappingProxyType({})
+            self.calls = []
+        async def capture_local_evidence(self):
+            return self.evidence
+        async def rebind_import(self, context, local_types=None):
+            assert local_types is self.evidence
+            self.calls.append(dict(context))
+            return DeliveryTarget.feishu(dict(context, conversation_id='local'))
+    resolver = Resolver()
+    target.svc._schedule_delivery = resolver
+    target.registries.schedule_service.delivery_service = resolver
+    task = bundle.sections['scheduled_tasks'][0]
+    task.update(delivery_target='feishu', delivery_context=dict(platform='feishu', receive_id='chat', receive_id_type='chat_id', conversation_id='foreign'))
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=dry_run)
+    item = next(i for i in report.items if i.section == 'scheduled_tasks')
+    assert item.outcome is ImportOutcome.CREATED
+    assert len(resolver.calls) == (1 if dry_run else 2)
+    tasks = await target.registries.schedule_service.registry.list()
+    if dry_run:
+        assert tasks == []
+        assert target.registries.schedule_service.session_service.created == []
+    else:
+        assert tasks[0].delivery_target.context['conversation_id'] == 'local'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dry_run', [True, False])
+async def test_feishu_import_without_resolver_fails_closed(target, bundle, dry_run):
+    task = bundle.sections['scheduled_tasks'][0]
+    task.update(delivery_target='feishu', delivery_context=dict(platform='feishu', receive_id='chat', receive_id_type='chat_id'))
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=dry_run)
+    item = next(i for i in report.items if i.section == 'scheduled_tasks')
+    assert item.outcome is ImportOutcome.FAILED
+    assert item.action is ImportAction.NONE
+    assert '可信入站证据' in ' '.join(item.reasons)
+    assert await target.registries.schedule_service.registry.list() == []
+    assert target.registries.schedule_service.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_same_bundle_origin_cannot_authorize_later_feishu(target, bundle):
+    from app.application.schedule_delivery_service import ScheduleDeliveryService
+    from app.domain.gateway import GatewayConversation
+    from copy import deepcopy
+    gateway = target.svc._gateway
+    async def find(platform, address):
+        return [GatewayConversation('local', Platform.FEISHU, address, '', '', None, _NOW, _NOW, None)]
+    gateway.find_conversations = find
+    resolver = ScheduleDeliveryService(gateway, target.registries.schedule_service.registry, lambda _: 'disconnected')
+    target.svc._schedule_delivery = resolver
+    target.registries.schedule_service.delivery_service = resolver
+    original = bundle.sections['scheduled_tasks'][0]
+    original.update(delivery_target='origin', origin=dict(platform='feishu', receive_id='chat', receive_id_type='chat_id'), delivery_context=dict(platform='feishu', receive_id='chat', receive_id_type='chat_id'))
+    later = deepcopy(original)
+    later.update(name='later-feishu', delivery_target='feishu')
+    bundle.sections['scheduled_tasks'].append(later)
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    items = [i for i in report.items if i.section == 'scheduled_tasks']
+    assert [i.outcome for i in items] == [ImportOutcome.CREATED, ImportOutcome.FAILED]
+    assert len(await target.registries.schedule_service.registry.list()) == 1
+    assert len(target.registries.schedule_service.session_service.created) == 1
+
+
+@pytest.mark.asyncio
+async def test_second_rebind_failure_creates_no_session(target, bundle):
+    from app.application.schedule_delivery_service import ScheduleDeliveryError
+    from app.domain.schedule import DeliveryTarget
+    class Resolver:
+        calls = 0
+        async def capture_local_evidence(self):
+            return {}
+        async def rebind_import(self, context, local_types=None):
+            self.calls += 1
+            if self.calls == 2:
+                raise ScheduleDeliveryError('conversation_not_found')
+            return DeliveryTarget.feishu(dict(context, conversation_id='local'))
+    resolver = Resolver()
+    target.svc._schedule_delivery = resolver
+    target.registries.schedule_service.delivery_service = resolver
+    bundle.sections['scheduled_tasks'][0].update(delivery_target='feishu', delivery_context=dict(platform='feishu', receive_id='chat', receive_id_type='chat_id'))
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    assert next(i for i in report.items if i.section == 'scheduled_tasks').outcome is ImportOutcome.FAILED
+    assert await target.registries.schedule_service.registry.list() == []
+    assert target.registries.schedule_service.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_merge_existing_feishu_skips_resolution(target, bundle):
+    await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    bundle.sections['scheduled_tasks'][0].update(delivery_target='feishu', delivery_context={})
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    assert next(i for i in report.items if i.section == 'scheduled_tasks').outcome is ImportOutcome.SKIPPED
+
+
+@pytest.mark.asyncio
+async def test_overwrite_second_rebind_failure_keeps_original_task(target, bundle):
+    from app.application.schedule_delivery_service import ScheduleDeliveryError
+    from app.domain.schedule import DeliveryTarget
+    await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    before = (await target.registries.schedule_service.registry.list())[0]
+    sessions = list(target.registries.schedule_service.session_service.created)
+    class Resolver:
+        calls = 0
+        async def capture_local_evidence(self):
+            return {}
+        async def rebind_import(self, context, local_types=None):
+            self.calls += 1
+            if self.calls == 2:
+                raise ScheduleDeliveryError('conversation_not_found')
+            return DeliveryTarget.feishu(dict(context, conversation_id='local'))
+    resolver = Resolver()
+    target.svc._schedule_delivery = resolver
+    target.registries.schedule_service.delivery_service = resolver
+    bundle.sections['scheduled_tasks'][0].update(prompt='new prompt', delivery_target='feishu', delivery_context=dict(platform='feishu', receive_id='chat', receive_id_type='chat_id'))
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.OVERWRITE, with_schedules=False, dry_run=False)
+    assert next(i for i in report.items if i.section == 'scheduled_tasks').outcome is ImportOutcome.FAILED
+    assert (await target.registries.schedule_service.registry.list())[0] == before
+    assert target.registries.schedule_service.session_service.created == sessions
+
+
+@pytest.mark.asyncio
+async def test_feishu_context_shape_is_validated_before_any_section_write(target, bundle):
+    bundle.sections['scheduled_tasks'][0].update(delivery_target='feishu', delivery_context=['bad'])
+    with pytest.raises(ConfigBundleValidationError):
+        await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    assert await target.registries.schedule_service.registry.list() == []
+    assert await target.registries.provider_registry.list_providers() == []
+
+
+@pytest.mark.asyncio
+async def test_export_preserves_full_feishu_snapshot_without_gateway_sessions(svc):
+    from app.domain.schedule import DeliveryTarget
+    task = (await svc._schedules.registry.list())[0]
+    context = dict(conversation_id='local-id', platform='feishu', receive_id='chat-address', receive_id_type='chat_id')
+    await svc._schedules.registry.update(replace(task, delivery_target=DeliveryTarget.feishu(context)))
+    exported = await svc.export_bundle(redact_secrets=True)
+    row = exported.sections['scheduled_tasks'][0]
+    assert row['delivery_target'] == 'feishu'
+    assert row['delivery_context'] == context
+    assert set(exported.sections) == set(SECTION_NAMES)
+    assert 'gateway_conversations' not in exported.sections
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('with_feishu', [False, True])
+async def test_delivery_capture_failure_is_contained_to_feishu_items(target, bundle, with_feishu):
+    class BrokenResolver:
+        async def capture_local_evidence(self):
+            raise RuntimeError('private-address-and-secret')
+        async def rebind_import(self, context, local_types=None):
+            pytest.fail('failed snapshot must never fall back to live evidence')
+    resolver = BrokenResolver()
+    target.svc._schedule_delivery = resolver
+    target.registries.schedule_service.delivery_service = resolver
+    if with_feishu:
+        bundle.sections['scheduled_tasks'][0].update(delivery_target='feishu', delivery_context=dict(platform='feishu', receive_id='chat', receive_id_type='chat_id'))
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    assert await target.registries.provider_registry.list_providers()
+    item = next(i for i in report.items if i.section == 'scheduled_tasks')
+    assert item.outcome is (ImportOutcome.FAILED if with_feishu else ImportOutcome.CREATED)
+    assert report.exit_code == (1 if with_feishu else 0)
+    assert 'private-address-and-secret' not in str(report.to_dict())
+    if with_feishu:
+        assert item.action is ImportAction.NONE
+        assert '可信入站证据' in ' '.join(item.reasons)
+        assert target.registries.schedule_service.session_service.created == []
+
+
+@pytest.mark.asyncio
+async def test_existing_feishu_merge_skips_despite_capture_failure(target, bundle):
+    await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    class BrokenResolver:
+        async def capture_local_evidence(self):
+            raise RuntimeError('private-address-and-secret')
+        async def rebind_import(self, context, local_types=None):
+            pytest.fail('merge skip must precede resolution')
+    target.svc._schedule_delivery = BrokenResolver()
+    bundle.sections['scheduled_tasks'][0].update(delivery_target='feishu', delivery_context={})
+    report = await target.svc.import_bundle(bundle, mode=ImportMode.MERGE, with_schedules=False, dry_run=False)
+    assert next(i for i in report.items if i.section == 'scheduled_tasks').outcome is ImportOutcome.SKIPPED
+    assert report.exit_code == 0

@@ -141,3 +141,23 @@ def test_maintenance_mode_starts_no_background_consumer(tmp_path: Path):
     maintenance = _settings(tmp_path)
     maintenance = maintenance.model_copy(update={"migration_maintenance": True})
     assert maintenance.migration_maintenance is True
+
+
+def test_http_bundle_and_schedule_share_delivery_resolver(tmp_path):
+    services = build_application_services(_settings(tmp_path))
+    resolver = services.schedule_delivery_service
+    assert services.config_bundle_service._schedule_delivery is resolver
+    assert services.schedule_service.delivery_service is resolver
+
+
+def test_cli_bundle_uses_offline_shared_resolver(tmp_path):
+    from app.main import build_config_bundle_services
+    service = build_config_bundle_services(_settings(tmp_path), read_only=False)
+    resolver = service._schedule_delivery
+    assert service._schedules.delivery_service is resolver
+    assert resolver.gateway_registry is service._gateway
+    assert resolver.schedule_registry is service._schedules.registry
+    from app.domain.platform import Platform
+    assert resolver.platform_status(Platform.FEISHU) == 'unavailable'
+    from tests.test_main_schedule_delivery_wiring import _assert_missing_platform_denies_delivery
+    _assert_missing_platform_denies_delivery(resolver, service._schedules.session_service)

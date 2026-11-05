@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from app.application.information_flow_service import InformationFlowService
 from app.application.policy_snapshot import InformationFlowPolicyConfig
+from app.application.schedule_delivery_service import ScheduleDeliveryError, ScheduleDeliveryService
 from app.application.scheduled_agent_executor import ScheduledAgentResult
 from app.application.telemetry_semantics import schedule_execution_span
 from app.application.telemetry_details import project_details
@@ -24,6 +25,8 @@ from app.domain.schedule import (
     ScheduledTaskExecution,
     ScheduledTaskExecutionStatus,
     ScheduledTaskRegistry,
+    ScheduledDeliveryAuthorizationPolicy,
+    ScheduledDeliveryAuthorizationRequest,
 )
 from app.domain.schedule_policy import (
     DeliveryMode,
@@ -49,6 +52,7 @@ class ScheduleRunService:
         schedule_policy: SchedulePolicy | None = None,
         information_flow_service: InformationFlowService | None = None,
         gateway_policy: GatewayPolicy | None = None,
+        delivery_service: ScheduleDeliveryService | None = None,
     ):
         self.registry = registry
         self.executor = executor
@@ -63,6 +67,8 @@ class ScheduleRunService:
             SecretCatalog(),
         )
         self._gateway_policy = gateway_policy or GatewayPolicy()
+        self._delivery_service = delivery_service
+        self._delivery_authorization_policy = ScheduledDeliveryAuthorizationPolicy()
 
     async def run_now(self, task_id: str, *, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
@@ -227,6 +233,42 @@ class ScheduleRunService:
         # Dashboard: no external client call, no Gateway check needed.
         if target.target_type is DeliveryTargetType.DASHBOARD:
             return await self.outbound_delivery.deliver(target, content)
+
+        if target.target_type is DeliveryTargetType.FEISHU:
+            if self._delivery_service is None:
+                return DeliveryResult("failed", "target_unverified")
+            try:
+                target = await self._delivery_service.validate_snapshot(target)
+            except ScheduleDeliveryError as exc:
+                reason = {
+                    "conversation_not_found": "target_deleted",
+                    "snapshot_mismatch": "target_mismatch",
+                    "platform_unavailable": "platform_unavailable",
+                }.get(exc.code, "target_unverified")
+                return DeliveryResult("failed", reason)
+            except Exception:
+                return DeliveryResult("failed", "target_unverified")
+            context = target.context
+            authorization = self._delivery_authorization_policy.evaluate(
+                ScheduledDeliveryAuthorizationRequest(
+                    platform=context.get("platform", ""),
+                    address_type=context.get("receive_id_type", ""),
+                    conversation_verified=True,
+                    address_matches=True,
+                    platform_available=True,
+                )
+            )
+            if authorization.outcome is not PolicyOutcome.ALLOW:
+                return DeliveryResult("failed", "authorization_denied")
+            release = self._information_flow.release(content, ReleaseTarget.GATEWAY,
+                                                     origin="scheduled_delivery")
+            if not release.allowed or release.content is None:
+                return DeliveryResult("failed", "information_flow_denied")
+            try:
+                result = await self.outbound_delivery.deliver(target, release.content)
+            except Exception:
+                return DeliveryResult("failed", "send_failed")
+            return result if result.status == "success" else DeliveryResult("failed", "send_failed")
 
         # ORIGIN: external client call -- go through the full pipeline.
         # 1. InformationFlow release (GATEWAY target) -- sanitize content.

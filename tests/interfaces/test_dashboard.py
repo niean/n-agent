@@ -98,7 +98,7 @@ class _FakeScheduleService:
                 "schedule": ScheduleExpression(request.cron_expression or task.schedule.value),
                 "timezone": ScheduleTimezone(request.timezone or task.timezone.value),
                 "session_id": request.session_id if request.session_id is not None else task.session_id,
-                "delivery_target": DeliveryTarget.silent() if request.delivery_target == "silent" else task.delivery_target,
+                "delivery_target": (DeliveryTarget.silent() if request.delivery_target == "silent" else DeliveryTarget.origin(task.origin) if request.delivery_target == "origin" else task.delivery_target),
             }
         )
         self.tasks = [updated if item.id == task_id else item for item in self.tasks]
@@ -156,7 +156,7 @@ class _ChatProvider:
         return LLMResult({"role": "assistant", "content": "hello"}, "stop")
 
 
-def _build_app(store, health=None, model_service=None, provider_service=None, schedule_service=None, chat_service=None):
+def _build_app(store, health=None, model_service=None, provider_service=None, schedule_service=None, chat_service=None, delivery_service=None):
     tool_service = ToolService(_StubExecutor(), builtin_tool_definitions())
     model_service = model_service or ModelService(_StubProvider(), "real-1")
     if chat_service is None:
@@ -176,6 +176,7 @@ def _build_app(store, health=None, model_service=None, provider_service=None, sc
         health or _default_health,
         provider_service=provider_service,
         schedule_service=schedule_service,
+        schedule_delivery_service=delivery_service,
         memory_store=store,
         chat_service=chat_service,
     ))
@@ -375,9 +376,54 @@ def test_scheduled_task_origin_payloads_are_protected(tmp_path):
     assert create_origin.status_code == 422
     assert create_origin.json()["error"]["code"] == "scheduled_task_delivery_context_invalid"
     assert create_context.status_code == 422
+    assert patched.status_code == 422
+    assert schedule.updated_requests == []
+
+
+def test_dashboard_preserves_feishu_delivery_unless_explicitly_changed(tmp_path):
+    from app.domain.schedule import DeliveryTarget, ScheduledTask, ScheduleExpression, ScheduleTimezone
+    from datetime import datetime, timezone
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    origin = {"platform": "feishu", "target": "home"}
+    schedule.tasks.append(ScheduledTask(
+        id="feishu-1",
+        name="Feishu",
+        prompt="prompt",
+        schedule=ScheduleExpression("0 9 * * *"),
+        timezone=ScheduleTimezone("Asia/Shanghai"),
+        session_id="session-feishu",
+        delivery_target=DeliveryTarget.origin(origin),
+        origin=origin,
+        next_run_at=datetime(2026, 6, 16, tzinfo=timezone.utc),
+    ))
+    client = TestClient(_build_app(store, schedule_service=schedule))
+
+    patched = client.patch(
+        "/chat/scheduled-tasks/feishu-1",
+        json={"delivery_target": "origin", "session_id": "changed"},
+    )
+
     assert patched.status_code == 200
-    assert schedule.updated_requests[-1].name == "Renamed"
+    assert patched.json()["delivery_target"] == "origin"
+    assert schedule.updated_requests[-1].delivery_target == "origin"
+    assert schedule.updated_requests[-1].session_id is None
+
+    unchanged = client.patch("/chat/scheduled-tasks/feishu-1", json={"name": "Renamed"})
+    assert unchanged.status_code == 200
+    assert unchanged.json()["delivery_target"] == "origin"
     assert schedule.updated_requests[-1].delivery_target is None
+
+    silent = client.patch("/chat/scheduled-tasks/feishu-1", json={"delivery_target": "silent"})
+    assert silent.status_code == 200
+    assert silent.json()["delivery_target"] == "silent"
+    restored = client.patch("/chat/scheduled-tasks/feishu-1", json={"delivery_target": "origin", "session_id": "changed"})
+    assert restored.status_code == 200
+    assert restored.json()["delivery_target"] == "origin"
+    assert restored.json()["origin"] == origin
+    assert restored.json()["session_id"] == "session-feishu"
+    assert schedule.updated_requests[-1].delivery_target == "origin"
     assert schedule.updated_requests[-1].session_id is None
     assert schedule.updated_requests[-1].origin is None
 
@@ -1982,3 +2028,118 @@ async def test_run_footer_stream_omits_run_id_without_identity(tmp_path):
     text_empty = await _run_footer_stream_text(tmp_path, chat_service_empty, name="s-footer-empty")
     chunks_empty, _ = _parse_sse(text_empty)
     assert all("run_id" not in chunk for chunk in chunks_empty)
+
+
+def test_schedule_delivery_payload_presence_validation(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    schedule = _FakeScheduleService()
+    client = TestClient(_build_app(store, schedule_service=schedule))
+    base = {"name": "test", "prompt": "p", "cron_expression": "* * * * *"}
+    created = client.post("/chat/scheduled-tasks", json=base).json()
+    bad = [{"delivery_target": value} for value in [None, "", " ", [], 3, "unknown"]]
+    bad += [{key: value} for key in ["origin", "delivery_context", "receive_id", "receive_id_type"] for value in [None, {}, ""]]
+    bad += [{"delivery_conversation_id": "c"}, {"delivery_target": "silent", "delivery_conversation_id": "c"}]
+    bad += [{"delivery_target": "feishu", "delivery_conversation_id": value} for value in [None, "", " ", 1, []]]
+    for payload in bad:
+        for method, url, body in [(client.post, "/chat/scheduled-tasks", {**base, **payload}),
+                                  (client.patch, f"/chat/scheduled-tasks/{created['id']}", payload)]:
+            response = method(url, json=body)
+            assert response.status_code == 422, (payload, response.text)
+    assert len(schedule.created_requests) == 1
+    assert schedule.updated_requests == []
+
+
+def test_schedule_delivery_selection_forwarding_and_safe_errors(tmp_path):
+    from app.application.schedule_delivery_service import ScheduleDeliveryError
+    class Schedule(_FakeScheduleService):
+        async def create(self, request):
+            if request.delivery_target == "feishu":
+                self.created_requests.append(request)
+                raise ScheduleDeliveryError("conversation_not_found")
+            return await super().create(request)
+        async def update(self, task_id, request):
+            if request.delivery_target == "feishu":
+                self.updated_requests.append(request)
+                raise ScheduleDeliveryError("conversation_not_found")
+            return await super().update(task_id, request)
+    schedule = Schedule()
+    client = TestClient(_build_app(SQLiteMemoryStore(tmp_path / "db"), schedule_service=schedule))
+    base = {"name": "test", "prompt": "p", "cron_expression": "* * * * *"}
+    task = client.post("/chat/scheduled-tasks", json=base).json()
+    selection = {"delivery_target": "feishu", "delivery_conversation_id": "missing"}
+    for response in [client.post("/chat/scheduled-tasks", json={**base, **selection}),
+                     client.patch(f"/chat/scheduled-tasks/{task['id']}", json=selection)]:
+        assert response.status_code == 422
+        assert response.json()["error"]["message"] == "conversation_not_found"
+    assert schedule.created_requests[-1].delivery_conversation_id == "missing"
+    assert schedule.updated_requests[-1].delivery_conversation_id == "missing"
+
+
+def test_schedule_delivery_projection_on_every_task_response(tmp_path):
+    class Projection:
+        async def project_task(self, task):
+            return {"kind": "dashboard", "available": True, "label": "Dashboard", "reason": None}
+    client = TestClient(_build_app(SQLiteMemoryStore(tmp_path / "db"), schedule_service=_FakeScheduleService(), delivery_service=Projection()))
+    created = client.post("/chat/scheduled-tasks", json={"name": "t", "prompt": "p", "cron_expression": "* * * * *"})
+    path = f"/chat/scheduled-tasks/{created.json()['id']}"
+    responses = [created, client.get(path), client.patch(path, json={"name": "new"}),
+                 client.post(path + "/pause"), client.post(path + "/resume")]
+    bodies = [r.json() for r in responses] + client.get("/chat/scheduled-tasks").json()
+    for body in bodies:
+        assert body["delivery"] == {"kind": "dashboard", "available": True, "label": "Dashboard", "reason": None}
+        assert "delivery_context" in body and "origin" in body
+
+
+def test_schedule_task_projection_legacy_home_and_restore_eligibility():
+    import asyncio
+    import json
+    from datetime import datetime, timezone
+    from app.application.schedule_delivery_service import ScheduleDeliveryService
+    from app.domain.gateway import GatewayHomeTarget
+    from app.domain.platform import Platform
+    from app.domain.schedule import DeliveryTarget, ScheduledTask, ScheduleExpression, ScheduleTimezone
+
+    class Gateway:
+        home = None
+        async def get_home_target(self, platform):
+            return self.home
+    gateway = Gateway()
+    resolver = ScheduleDeliveryService(gateway, None, lambda _: "connected")
+    origin = {"platform": "feishu", "target": "home"}
+    def task(target, source=origin):
+        return ScheduledTask(id="t", name="n", prompt="p", schedule=ScheduleExpression("* * * * *"),
+                             timezone=ScheduleTimezone("Asia/Shanghai"), session_id="s", origin=source,
+                             delivery_target=target, next_run_at=datetime.now(timezone.utc))
+    async def check():
+        missing = await resolver.project_task(task(DeliveryTarget.origin(origin)))
+        assert missing["kind"] == "feishu" and missing["legacy"] is True
+        assert missing["home"] is True and missing["home_configured"] is False
+        assert missing["available"] is False and missing["reason"] == "home_target_not_configured"
+        gateway.home = GatewayHomeTarget(Platform.FEISHU, "PRIVATE-CHAT", "chat_id")
+        configured = await resolver.project_task(task(DeliveryTarget.origin(origin)))
+        assert configured["available"] is True and configured["home_configured"] is True
+        assert configured["label"] == "默认通知会话"
+        assert configured["legacy_restore_available"] is True
+        concrete = {"platform": "feishu", "receive_id": "PRIVATE-ORIGIN", "receive_id_type": "chat_id"}
+        concrete_task = task(DeliveryTarget.origin(concrete), concrete)
+        preferred_home = await resolver.project_task(concrete_task)
+        assert preferred_home["home"] is True and preferred_home["home_configured"] is True
+        assert preferred_home["label"] == "默认通知会话" and preferred_home["available"] is True
+        gateway.home = None
+        fallback = await resolver.project_task(concrete_task)
+        assert fallback["home"] is False and fallback["label"] == "历史飞书聊天"
+        assert fallback["available"] is True
+        assert "PRIVATE" not in json.dumps([preferred_home, fallback])
+        silent = await resolver.project_task(task(DeliveryTarget.silent()))
+        assert silent["kind"] == "silent" and silent["legacy_restore_available"] is True
+        foreign = await resolver.project_task(task(DeliveryTarget.origin({"platform": "telegram", "receive_id": "PRIVATE"}),
+                                                 {"platform": "telegram", "receive_id": "PRIVATE"}))
+        assert foreign["kind"] == "telegram" and foreign["legacy_restore_available"] is False
+        assert foreign["label"] == "历史投递目标（未知平台，需重新连接）"
+        dingtalk = {"platform": "dingtalk", "receive_id": "PRIVATE"}
+        known_foreign = await resolver.project_task(task(DeliveryTarget.origin(dingtalk), dingtalk))
+        assert known_foreign["kind"] == "dingtalk"
+        assert known_foreign["label"] == "历史钉钉投递目标（需重新连接）"
+        assert known_foreign["legacy_restore_available"] is False
+        assert "PRIVATE" not in json.dumps([configured, foreign])
+    asyncio.run(check())
