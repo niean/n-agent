@@ -681,6 +681,8 @@ PYEOF
     -d "$(jq -n --arg c "$LARGE_INLINE" --arg n "${RUN_TAG}-large-inline" \
       '{name:$n, kind:"text", content:$c}')"
   assert_status 413 "inline over 256KB rejected"
+  http GET "$BASE_URL/health" --max-time 5
+  assert_status 200 "server responsive after rejected inline upload"
   echo "[Artifact E2E] 9a. ok (inline over-limit -> 413)"
 
   # 9b. File upload > 20 MB -> 413.
@@ -690,6 +692,8 @@ PYEOF
     -F "kind=text" \
     -F "file=@$TMP_DIR/over-max.txt;type=text/plain"
   assert_status 413 "file over 20MB rejected"
+  http GET "$BASE_URL/health" --max-time 5
+  assert_status 200 "server responsive after rejected multipart upload"
   echo "[Artifact E2E] 9b. ok (file over-limit -> 413)"
 
   # 9c. Publish artifact > 10 MB -> 422 (publish_blocked: size_over_limit).

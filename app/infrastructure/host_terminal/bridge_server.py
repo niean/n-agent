@@ -19,6 +19,12 @@ import threading
 import time
 from typing import Any, Callable
 
+from app.domain.host_script_grant import HostScriptGrant, merge_script_grants
+from app.infrastructure.host_terminal.script_grant_store import (
+    HostScriptGrantStore,
+    HostScriptGrantStoreError,
+)
+
 from app.domain.host_terminal import (
     HostCommandTarget,
     HostSkillScriptTarget,
@@ -144,6 +150,10 @@ class HostTerminalBridge:
         self._validate_authority_paths()
         self._validate_trusted_roots()
         self._cleanup_stale_snapshots()
+        self.grant_store = HostScriptGrantStore(
+            config.snapshot_root,
+            forbidden_roots=(config.skills_root, *config.model_writable_roots),
+        )
 
     @property
     def healthy(self) -> bool:
@@ -195,6 +205,57 @@ class HostTerminalBridge:
             if any(_group_exists(pgid) for pgid in self._active_processes):
                 self._mark_unhealthy()
 
+    def script_grants_payload(self, payload: Any) -> tuple[int, dict[str, Any]]:
+        try:
+            if not isinstance(payload, dict) or set(payload) != {"operation", "grant"}:
+                raise ValueError
+            operation = payload["operation"]
+            if operation == "list" and payload["grant"] is None:
+                values = self.grant_store.list()
+            elif operation in ("grant", "revoke"):
+                grant = HostScriptGrant.from_dict(payload["grant"])
+                if grant.state != ("active" if operation == "grant" else "revoked"):
+                    raise ValueError
+                if operation == "grant":
+                    fd = None
+                    try:
+                        source, fd = self._read_skill_source(
+                            HostSkillScriptTarget(
+                                grant.skill_name,
+                                grant.script_relative_path,
+                                grant.sha256,
+                                (),
+                            )
+                        )
+                        if hashlib.sha256(source).hexdigest() != grant.sha256:
+                            return 409, {
+                                "grants": [],
+                                "error_code": "host_script_grants_source_mismatch",
+                            }
+                    finally:
+                        if fd is not None:
+                            os.close(fd)
+                values = self.grant_store.apply(operation, grant)
+            else:
+                raise ValueError
+            return 200, {"grants": [g.to_dict() for g in values], "error_code": None}
+        except HostScriptGrantStoreError as exc:
+            return (
+                409 if exc.error_code == "host_script_grants_stale_revision" else 503
+            ), {"grants": [], "error_code": exc.error_code}
+        except _BridgeDenied:
+            return 409, {
+                "grants": [],
+                "error_code": "host_script_grants_source_mismatch",
+            }
+        except (ValueError, TypeError):
+            return 400, {
+                "grants": [],
+                "error_code": "host_script_grants_invalid_request",
+            }
+        except Exception:
+            return 503, {"grants": [], "error_code": "host_script_grants_unavailable"}
+
     def execute_payload(
         self,
         payload: Any,
@@ -239,6 +300,10 @@ class HostTerminalBridge:
                 )
             target = request["target"]
             limits = request["limits"]
+            try:
+                snapshot = merge_script_grants(snapshot, self.grant_store.list())
+            except HostScriptGrantStoreError:
+                pass  # Independent YAML authorization remains available.
             decision = HostTerminalPolicy(snapshot).evaluate(
                 HostTerminalPolicyRequest(target=target, requested_limits=limits)
             )
@@ -1149,7 +1214,7 @@ def make_server(
                     _response("", time.monotonic(), error_code="host_bridge_auth_failed"),
                 )
                 return
-            if self.path != "/v1/execute":
+            if self.path not in {"/v1/execute", "/v1/script-grants"}:
                 self._send(404, _response("", time.monotonic(), error_code="not_found"))
                 return
             if self.headers.get_content_type() != "application/json":
@@ -1199,19 +1264,31 @@ def make_server(
                 return
             try:
                 payload = json.loads(body)
-            except (UnicodeDecodeError, json.JSONDecodeError):
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                 self._send(
                     400,
                     _response("", time.monotonic(), error_code="host_bridge_invalid_request"),
                 )
                 return
-            status_code, response = bridge.execute_payload(
-                payload, disconnected=lambda: _peer_disconnected(self.connection)
-            )
+            if self.path == "/v1/script-grants":
+                status_code, response = bridge.script_grants_payload(payload)
+            else:
+                status_code, response = bridge.execute_payload(
+                    payload, disconnected=lambda: _peer_disconnected(self.connection)
+                )
             self._send(status_code, response)
 
         def _send(self, status_code: int, payload: dict[str, Any]) -> None:
-            encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            if self.path == "/v1/script-grants" and set(payload) != {"grants", "error_code"}:
+                payload = {
+                    "grants": [],
+                    "error_code": payload.get(
+                        "error_code", "host_script_grants_invalid_request"
+                    ),
+                }
+            encoded = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
             try:
                 # send_response() adds a version-bearing Server header.
                 self.send_response_only(status_code)

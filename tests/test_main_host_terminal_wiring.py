@@ -62,6 +62,55 @@ async def test_default_disabled_has_no_definition_or_route(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_skill_auto_discovery_enabled_without_host_authorization(tmp_path):
+    services = build_application_services(_settings(tmp_path))
+    assert services.skill_service.auto_refresh is True
+    assert services.skill_service.host_script_grants is None
+
+
+@pytest.mark.asyncio
+async def test_host_script_grants_wired_to_skill_and_executor(tmp_path):
+    policy, token = _write_authority_files(tmp_path)
+    services = build_application_services(_settings(
+        tmp_path, host_terminal_enabled=True,
+        host_terminal_bridge_url="http://host.docker.internal:8765",
+        host_terminal_policy_path=policy, host_terminal_token_path=token,
+        **_host_mapping(tmp_path),
+    ))
+    grants = services.skill_service.host_script_grants
+    assert grants is not None
+    executor = services.tool_service.executor.routes["host_terminal"]
+    assert executor._script_grant_service is grants
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("maintenance", [False, True])
+async def test_auto_discovery_lifecycle_stops_and_respects_maintenance(tmp_path, monkeypatch, maintenance):
+    import asyncio
+    import app.main as main_module
+
+    settings = _settings(tmp_path, migration_maintenance=maintenance, task_enabled=False)
+    services = build_application_services(settings)
+    entered = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def refresh_loop():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(services.skill_service, "run_auto_refresh", refresh_loop, raising=False)
+    monkeypatch.setattr(main_module, "build_application_services", lambda _: services)
+    application = main_module.create_app(settings)
+    async with application.router.lifespan_context(application):
+        await asyncio.sleep(0)
+        assert entered.is_set() is (not maintenance)
+    assert stopped.is_set() is (not maintenance)
+
+
+@pytest.mark.asyncio
 async def test_valid_authority_registers_definition_and_route_without_bridge_probe(tmp_path):
     policy, token = _write_authority_files(tmp_path)
     services = build_application_services(_settings(

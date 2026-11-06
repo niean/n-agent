@@ -107,6 +107,8 @@ from app.infrastructure.host_terminal.http_client import (
     HostTerminalHttpClientConfig,
 )
 from app.infrastructure.host_terminal.policy_loader import HostTerminalPolicyLoader
+from app.application.host_script_grant_service import HostScriptGrantService
+from app.infrastructure.host_terminal.script_intent_store import SQLiteHostScriptIntentStore
 from app.infrastructure.image_store import LocalImageStore
 from app.infrastructure.knowledge.http_adapters import HttpKnowledgeRetrieverConfig, KnowledgeHttpRetrieverFactory
 from app.infrastructure.llm.anthropic_provider import AnthropicProvider
@@ -307,7 +309,9 @@ def _configure_execution_logging() -> None:
     from app.application.telemetry_contract import project_execution_attributes, completion_event, EXECUTION_ATTRIBUTE_KEYS, CONTENT_ATTRIBUTE_KEYS
     from app.infrastructure.observability.setup import configure_ring_buffer_attributes, configure_semantics_registry
     from app.application import telemetry_semantics
+    from app.domain.usage import compute_normalized_tokens
     configure_semantics_registry(telemetry_semantics)
+    telemetry_semantics.set_normalized_token_computer(compute_normalized_tokens)
     configure_ring_buffer_attributes(EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS)
     configure_execution_context(execution_log_snapshot, project_context=project_execution_attributes,
                                 completion_event=completion_event, execution_keys=EXECUTION_ATTRIBUTE_KEYS,
@@ -830,6 +834,7 @@ def build_application_services(
         guard_agent_created=settings.skills_guard_agent_created,
         backup_enabled=settings.skills_backup_enabled,
         format_validator=SkillFormatValidator(),
+        auto_refresh=True,
     )
     skill_executor = SkillToolExecutor(skill_service)
     for definition in skill_tool_definitions():
@@ -903,6 +908,11 @@ def build_application_services(
                         max_response_bytes=settings.host_terminal_max_response_bytes,
                     )
                 )
+                host_script_grants = HostScriptGrantService(
+                    store=SQLiteHostScriptIntentStore(settings.sqlite_path),
+                    client=host_client,
+                    skill_service=skill_service,
+                )
                 host_terminal_executor = HostTerminalToolExecutor(
                     client=host_client,
                     skill_service=skill_service,
@@ -914,7 +924,9 @@ def build_application_services(
                     max_concurrency=settings.host_terminal_max_concurrency,
                     audit_service=audit_service,
                     image_persister=image_store,
+                    script_grant_service=host_script_grants,
                 )
+                skill_service.host_script_grants = host_script_grants
                 host_definition = host_terminal_tool_definition(
                     settings.host_terminal_tool_timeout_seconds
                 )
@@ -2448,6 +2460,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         feishu_task: asyncio.Task | None = None
         scheduler_task: asyncio.Task | None = None
         delegation_task: asyncio.Task | None = None
+        skill_refresh_task: asyncio.Task | None = None
         # Migration maintenance window: the config bundle importer rewrites the
         # config tables underneath a running service, so every consumer that
         # could act on half-imported state stays parked until it is over.
@@ -2471,6 +2484,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.info(_PLUGIN_SCAN_OK_LOG_TEMPLATE)
         except Exception:
             logger.exception("plugin lifespan scan failed; dashboard refresh available as fallback")
+        if not _maintenance:
+            skill_refresh_task = asyncio.create_task(services.skill_service.run_auto_refresh())
         if services.settings.scheduler_enabled and not _maintenance:
             scheduler_task = asyncio.create_task(services.scheduler_runner.run())
         # Task dispatcher (T18). Only start when task_enabled AND schema
@@ -2600,6 +2615,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            if skill_refresh_task is not None:
+                skill_refresh_task.cancel()
+                try:
+                    await skill_refresh_task
+                except asyncio.CancelledError:
+                    pass
             if services.agent_run_service is not None:
                 try:
                     await services.agent_run_service.close()

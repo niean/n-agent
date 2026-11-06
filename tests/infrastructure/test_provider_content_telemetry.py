@@ -200,3 +200,173 @@ async def test_legacy_hook_without_content_methods_remains_compatible(kind):
                 if kind == 'openai' else NS(content=[{'type': 'text', 'text': 'ok'}], stop_reason='end_turn'))
     result = await provider(kind, Client(response), Legacy()).chat([], [], False, '', {})
     assert result.message['content'] == 'ok'
+
+
+def test_hook_protocol_and_noops_have_set_cache_usage():
+    from app.infrastructure.llm.telemetry_hook import (
+        ChatAttemptHook, NoopChatAttempt, NOOP_CHAT_ATTEMPT,
+    )
+    assert callable(ChatAttemptHook.set_cache_usage)
+    NoopChatAttempt().set_cache_usage(cache_read_tokens=1, cache_write_tokens=2)
+    NOOP_CHAT_ATTEMPT.set_cache_usage()
+    from app.application.telemetry_semantics import NoopChatAttempt as AppNoop
+    AppNoop().set_cache_usage(cache_read_tokens=1)
+
+
+def test_optional_hook_isolates_missing_and_failing_cache_method():
+    from app.infrastructure.llm.telemetry_hook import optional_hook, NoopChatAttempt
+
+    class Legacy:
+        pass
+
+    class Broken:
+        def set_cache_usage(self, **kwargs):
+            raise RuntimeError('boom')
+
+    # missing method, failing method, noop handle and non-handle are all isolated
+    optional_hook(Legacy(), 'set_cache_usage', cache_read_tokens=50)
+    optional_hook(Broken(), 'set_cache_usage', cache_read_tokens=50)
+    optional_hook(NoopChatAttempt(), 'set_cache_usage', cache_read_tokens=50)
+    optional_hook(None, 'set_cache_usage', cache_read_tokens=50)
+
+
+def _openai_usage(prompt=None, completion=None, cached='missing'):
+    usage = NS(prompt_tokens=prompt, completion_tokens=completion)
+    if cached != 'missing':
+        usage.prompt_tokens_details = NS(cached_tokens=cached)
+    return usage
+
+
+def _openai_response(usage, content='ok'):
+    return NS(choices=[NS(message=NS(role='assistant', content=content), finish_reason='stop')],
+              usage=usage)
+
+
+def _call(hook, name):
+    return next((c for c in hook.calls if c[0] == name), None)
+
+
+@pytest.mark.asyncio
+async def test_openai_non_stream_extracts_cache_and_fixes_input():
+    hook = Attempt()
+    result = await provider('openai', Client(_openai_response(
+        _openai_usage(prompt=150, completion=10, cached=50))), hook).chat([], [], False, '', {})
+    assert result.message['content'] == 'ok'
+    assert _call(hook, 'set_usage')[1] == (100, 10)  # Ti = prompt - cached
+    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': None}
+
+
+@pytest.mark.asyncio
+async def test_openai_missing_cached_tokens_leaves_input_unknown():
+    hook = Attempt()
+    await provider('openai', Client(_openai_response(
+        _openai_usage(prompt=150, completion=10))), hook).chat([], [], False, '', {})
+    assert _call(hook, 'set_usage')[1] == (None, 10)  # no prompt-as-Ti, no 0-subtraction
+    assert _call(hook, 'set_cache_usage') is None
+
+
+@pytest.mark.asyncio
+async def test_openai_cached_exceeds_prompt_is_invalid():
+    hook = Attempt()
+    await provider('openai', Client(_openai_response(
+        _openai_usage(prompt=150, completion=10, cached=200))), hook).chat([], [], False, '', {})
+    assert _call(hook, 'set_usage')[1] == (None, 10)  # conflict: no truncation cover-up
+    assert _call(hook, 'set_cache_usage') is None
+
+
+@pytest.mark.asyncio
+async def test_openai_prompt_missing_but_cached_valid_keeps_tic():
+    hook = Attempt()
+    await provider('openai', Client(_openai_response(
+        _openai_usage(prompt=None, completion=10, cached=50))), hook).chat([], [], False, '', {})
+    assert _call(hook, 'set_usage')[1] == (None, 10)
+    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': None}
+
+
+@pytest.mark.asyncio
+async def test_openai_invalid_component_types_are_rejected():
+    hook = Attempt()
+    await provider('openai', Client(_openai_response(
+        _openai_usage(prompt='150', completion=True, cached=1.5))), hook).chat([], [], False, '', {})
+    assert _call(hook, 'set_usage')[1] == (None, None)
+    assert _call(hook, 'set_cache_usage') is None
+
+
+@pytest.mark.asyncio
+async def test_openai_stream_usage_chunks_cover_both_shapes():
+    hook = Attempt()
+    usage_full = _openai_usage(prompt=150, completion=10, cached=50)
+    items = [NS(choices=[NS(delta=NS(content='hello', tool_calls=None), finish_reason=None)]),
+             NS(choices=[NS(delta=NS(content=None, tool_calls=None), finish_reason='stop')], usage=usage_full),
+             NS(choices=[], usage=_openai_usage(prompt=150, completion=10, cached=50))]
+    stream = await provider('openai', Client(events(items)), hook).chat([{'role': 'user', 'content': 'q'}], [], True, '', {})
+    output = [e async for e in stream]
+    # both usage-bearing chunks extracted; content delta not lost
+    assert ('append_output_text', ('hello',), {}) in hook.calls
+    assert output[-1].finish_reason == 'stop'
+    set_usages = [c for c in hook.calls if c[0] == 'set_usage']
+    assert set_usages[-1][1] == (100, 10)
+    cache_calls = [c for c in hook.calls if c[0] == 'set_cache_usage']
+    assert cache_calls[-1][2] == {'cache_read_tokens': 50, 'cache_write_tokens': None}
+
+
+def _anthropic_usage(input_tokens=None, output_tokens=None, cache_read='missing', cache_write='missing'):
+    usage = NS(input_tokens=input_tokens, output_tokens=output_tokens)
+    if cache_read != 'missing':
+        usage.cache_read_input_tokens = cache_read
+    if cache_write != 'missing':
+        usage.cache_creation_input_tokens = cache_write
+    return usage
+
+
+def _anthropic_response(usage, text='ok'):
+    return NS(content=[{'type': 'text', 'text': text}], stop_reason='end_turn', usage=usage)
+
+
+@pytest.mark.asyncio
+async def test_anthropic_non_stream_passes_cache_buckets():
+    hook = Attempt()
+    result = await provider('anthropic', Client(_anthropic_response(
+        _anthropic_usage(100, 10, cache_read=50, cache_write=20))), hook).chat([], [], False, '', {})
+    assert result.message['content'] == 'ok'
+    assert _call(hook, 'set_usage')[1] == (100, 10)
+    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': 20}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_start_then_delta_replacement():
+    hook = Attempt()
+    items = [{'type': 'message_start',
+              'message': {'usage': {'input_tokens': 100, 'output_tokens': 1,
+                                    'cache_read_input_tokens': 50, 'cache_creation_input_tokens': 20}}},
+             {'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': 'hello'}},
+             {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'},
+              'usage': {'output_tokens': 10}}]
+    stream = await provider('anthropic', Client(events(items)), hook).chat([{'role': 'user', 'content': 'q'}], [], True, '', {})
+    output = [e async for e in stream]
+    assert output[-1].finish_reason == 'stop'  # end_turn mapped to unified vocabulary
+    # delta's cumulative output replaces the start value; delta lacks cache
+    # fields so the start values survive (None never erases)
+    set_usages = [c for c in hook.calls if c[0] == 'set_usage']
+    assert set_usages[0][1] == (100, 1)
+    assert set_usages[-1][1] == (None, 10)
+    cache_calls = [c for c in hook.calls if c[0] == 'set_cache_usage']
+    assert cache_calls[0][2] == {'cache_read_tokens': 50, 'cache_write_tokens': 20}
+    assert cache_calls[-1][2] == {'cache_read_tokens': None, 'cache_write_tokens': None}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_partial_cache_buckets():
+    hook = Attempt()
+    await provider('anthropic', Client(_anthropic_response(
+        _anthropic_usage(100, 10, cache_read=50))), hook).chat([], [], False, '', {})
+    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': None}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_invalid_component_types_are_rejected():
+    hook = Attempt()
+    await provider('anthropic', Client(_anthropic_response(
+        _anthropic_usage('100', True, cache_read=1.5, cache_write=-1))), hook).chat([], [], False, '', {})
+    assert _call(hook, 'set_usage')[1] == (None, None)
+    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': None, 'cache_write_tokens': None}

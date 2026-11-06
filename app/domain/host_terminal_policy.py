@@ -36,14 +36,22 @@ def _valid_argument(value: object) -> bool:
 
 
 def host_terminal_arguments_allowed(
-    args: object, limits: "HostTerminalResourceLimits", *, executable: str | None = None
+    args: object,
+    limits: "HostTerminalResourceLimits",
+    *,
+    executable: str | None = None,
+    allow_any_args: bool = False,
 ) -> bool:
     """Validate argv admission against one immutable Domain limit set."""
     if not isinstance(limits, HostTerminalResourceLimits):
         return False
     if not isinstance(args, (list, tuple)):
         return False
-    validator = _valid_speech_text if executable == "/usr/bin/say" else _valid_argument
+    validator = (
+        (lambda value: isinstance(value, str) and "\x00" not in value)
+        if allow_any_args
+        else (_valid_speech_text if executable == "/usr/bin/say" else _valid_argument)
+    )
     return (
         len(args) <= limits.max_args
         and all(validator(arg) for arg in args)
@@ -138,7 +146,11 @@ class HostSkillScriptRule:
     sha256: str
     positional_args: tuple[HostPositionalArgRule, ...]
 
+    allow_any_args: bool = False
+
     def __post_init__(self) -> None:
+        if type(self.allow_any_args) is not bool:
+            raise ValueError("invalid_allow_any_args")
         _require_text(self.rule_id, "rule_id")
         _require_skill_name(self.skill_name)
         _require_relative_script_path(self.script_relative_path)
@@ -322,9 +334,27 @@ class HostTerminalPolicy:
             return self._deny("host_resource_limits_exceeded")
         if not self._resources_allowed(request.requested_limits):
             return self._deny("host_resource_limits_exceeded")
+        auto_args = any(
+            isinstance(r, HostSkillScriptRule)
+            and r.allow_any_args
+            and isinstance(request.target, HostSkillScriptTarget)
+            and (r.skill_name, r.script_relative_path, r.sha256)
+            == (
+                request.target.skill_name,
+                request.target.script_relative_path,
+                request.target.sha256,
+            )
+            for r in self._snapshot.rules
+        )
         if not host_terminal_arguments_allowed(
-            request.target.args, self._snapshot.limits,
-            executable=request.target.executable if isinstance(request.target, HostCommandTarget) else None,
+            request.target.args,
+            self._snapshot.limits,
+            allow_any_args=auto_args,
+            executable=(
+                request.target.executable
+                if isinstance(request.target, HostCommandTarget)
+                else None
+            ),
         ):
             return self._deny("host_arguments_invalid")
 
@@ -362,6 +392,8 @@ class HostTerminalPolicy:
             )
         else:
             return False
+        if isinstance(rule, HostSkillScriptRule) and rule.allow_any_args:
+            return identity_matches
         return identity_matches and len(rule.positional_args) == len(target.args) and all(
             arg_rule.matches(value)
             for arg_rule, value in zip(rule.positional_args, target.args, strict=True)

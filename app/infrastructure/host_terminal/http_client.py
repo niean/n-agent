@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from app.domain.host_script_grant import HostScriptGrant
+
 from app.domain.host_terminal import (
     HostCommandTarget,
     HostSkillScriptTarget,
@@ -130,6 +132,73 @@ class HostTerminalHttpClient:
         except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as exc:
             raise HostTerminalBridgeClientError("host_bridge_unavailable") from exc
         return _parse_response(body, request)
+
+    async def script_grants(
+        self, operation: str, grant: HostScriptGrant | None = None
+    ) -> list[HostScriptGrant]:
+        if (
+            operation not in ("list", "grant", "revoke")
+            or (operation == "list") != (grant is None)
+            or (grant is not None and not isinstance(grant, HostScriptGrant))
+        ):
+            raise HostTerminalBridgeClientError("host_script_grants_invalid_request")
+        timeout = httpx.Timeout(
+            connect=self._config.connect_timeout_seconds,
+            read=self._config.read_timeout_seconds,
+            write=self._config.connect_timeout_seconds,
+            pool=self._config.connect_timeout_seconds,
+        )
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                transport=self._config.transport,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self._config.base_url.rstrip('/')}/v1/script-grants",
+                    headers={AUTH_HEADER: self._token.decode("utf-8")},
+                    json={
+                        "operation": operation,
+                        "grant": grant.to_dict() if grant else None,
+                    },
+                ) as response:
+                    if response.status_code == 401:
+                        raise HostTerminalBridgeClientError("host_bridge_auth_failed")
+                    raw = await _read_bounded(response, self._config.max_response_bytes)
+                    status = response.status_code
+        except HostTerminalBridgeClientError:
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.ProtocolError) as exc:
+            raise HostTerminalBridgeClientError("host_bridge_unavailable") from exc
+        try:
+            data = json.loads(raw)
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"grants", "error_code"}
+                or not isinstance(data["grants"], list)
+            ):
+                raise ValueError
+            if status != 200:
+                code = data["error_code"]
+                if data["grants"] or code not in {
+                    "host_script_grants_invalid_request",
+                    "host_script_grants_unavailable",
+                    "host_script_grants_stale_revision",
+                    "host_script_grants_source_mismatch",
+                    "host_bridge_invalid_request",
+                }:
+                    raise ValueError
+                raise HostTerminalBridgeClientError(code)
+            if data["error_code"] is not None:
+                raise ValueError
+            values = [HostScriptGrant.from_dict(g) for g in data["grants"]]
+            if len({g.identity for g in values}) != len(values):
+                raise ValueError
+            return values
+        except (ValueError, TypeError, UnicodeDecodeError, RecursionError) as exc:
+            raise HostTerminalBridgeClientError("host_bridge_invalid_response") from exc
 
 
 async def _read_bounded(response: httpx.Response, maximum: int) -> bytes:

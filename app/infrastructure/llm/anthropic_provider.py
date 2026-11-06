@@ -9,7 +9,9 @@ from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, re
 from app.infrastructure.llm.telemetry_hook import (
     NOOP_CHAT_ATTEMPT as _NOOP_CHAT_ATTEMPT,
 )
-from app.infrastructure.llm.telemetry_hook import ProviderTelemetryCallback, optional_hook
+from app.infrastructure.llm.telemetry_hook import (
+    ProviderTelemetryCallback, optional_hook, validated_count,
+)
 
 _INTERNAL_OPTION_KEYS = {
     "tool_execution_context",
@@ -131,10 +133,7 @@ class AnthropicProvider:
             response = await self.client.messages.create(**kwargs)
             usage = getattr(response, "usage", None)
             if usage is not None:
-                attempt.set_usage(
-                    getattr(usage, "input_tokens", None),
-                    getattr(usage, "output_tokens", None),
-                )
+                _report_anthropic_usage(attempt, usage)
             stop_reason = getattr(response, "stop_reason", None)
             attempt.set_finish_reasons(
                 _FINISH_REASON_MAP.get(stop_reason, stop_reason)
@@ -160,10 +159,7 @@ class AnthropicProvider:
                     if event_type == "message_start":
                         usage = _get(_get(event, "message"), "usage")
                         if usage is not None:
-                            attempt.set_usage(
-                                _get(usage, "input_tokens"),
-                                _get(usage, "output_tokens"),
-                            )
+                            _report_anthropic_usage(attempt, usage)
                     elif event_type == "content_block_start":
                         block_index += 1
                         event_index = _get(event, "index")
@@ -201,10 +197,7 @@ class AnthropicProvider:
                         delta = _get(event, "delta")
                         usage = _get(event, "usage")
                         if usage is not None:
-                            attempt.set_usage(
-                                _get(usage, "input_tokens"),
-                                _get(usage, "output_tokens"),
-                            )
+                            _report_anthropic_usage(attempt, usage)
                         stop_reason = _get(delta, "stop_reason")
                         if stop_reason is not None:
                             attempt.set_finish_reasons(
@@ -216,6 +209,31 @@ class AnthropicProvider:
                 optional_hook(attempt, "set_error_detail", error_text)
                 attempt.set_error(type(exc).__name__)
                 yield LLMEvent(LLMEventType.ERROR, error=error_text)
+
+
+def _report_anthropic_usage(attempt: Any, usage: Any) -> None:
+    """Observability-only reporting: each event's valid known buckets replace
+    the attempt's snapshot (never accumulate); ``None`` never erases a known
+    value and invalid components are dropped here (strict validation, no
+    implicit conversion). Extraction or hook failures never change business.
+
+    Streaming note: message_delta usage usually only carries the cumulative
+    output_tokens (cache buckets arrive on message_start) -- passing None for
+    missing fields relies on the attempt's no-erase semantics.
+    """
+    try:
+        ti = _get(usage, "input_tokens")
+        to = _get(usage, "output_tokens")
+        tic = _get(usage, "cache_read_input_tokens")
+        ticw = _get(usage, "cache_creation_input_tokens")
+        optional_hook(attempt, "set_usage",
+                      ti if validated_count(ti) else None,
+                      to if validated_count(to) else None)
+        optional_hook(attempt, "set_cache_usage",
+                      cache_read_tokens=tic if validated_count(tic) else None,
+                      cache_write_tokens=ticw if validated_count(ticw) else None)
+    except Exception:
+        pass
 
 
 def _provider_options(model: str, options: dict[str, Any]) -> dict[str, Any]:

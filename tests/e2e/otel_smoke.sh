@@ -330,10 +330,10 @@ install_fake_llm() {
 """Deterministic OpenAI-compatible fake LLM for the observability smoke.
 
 Round 1 (no tool message in history): tool_call for `calculator`
-{"expression": "1+1"}, usage prompt=10 completion=5.
+{"expression": "1+1"}, usage prompt=10 completion=5 (cached=0).
 Round 2 (a tool message exists): final content, usage prompt=40
-completion=20. A user message containing FORCE-LLM-500 makes the server
-return HTTP 500 (failure path). Fully deterministic; no external I/O.
+completion=20 (cached=0). A user message containing FORCE-LLM-500 makes the
+server return HTTP 500 (failure path). Fully deterministic; no external I/O.
 """
 import json
 import sys
@@ -345,8 +345,20 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
 TOOL_NAME = "calculator"
 TOOL_ARGS = "{\"expression\": \"1+1\"}"
 FINAL_TEXT = "TOOL-ROUND-COMPLETE answer=2"
-USAGE_TOOL = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-USAGE_FINAL = {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60}
+USAGE_TOOL = {
+    "prompt_tokens": 10,
+    "completion_tokens": 5,
+    "total_tokens": 15,
+    # spec-261105 Ti semantics: without cached_tokens the input component is
+    # unknown and never fabricated; cached=0 makes input known (10-0).
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
+USAGE_FINAL = {
+    "prompt_tokens": 40,
+    "completion_tokens": 20,
+    "total_tokens": 60,
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
 
 
 def _wants_error(messages):

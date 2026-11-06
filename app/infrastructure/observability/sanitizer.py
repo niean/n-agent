@@ -86,8 +86,9 @@ _PAT_AUTHORIZATION = re.compile(
 )
 # URL userinfo: scheme://user:pass@host -> scheme://[REDACTED]@host
 # scheme (group1), userinfo (group2), "@" (group3); redact group2, keep the @.
+# Start only at a token boundary; possessive runs cannot retry each suffix.
 _PAT_URL_USERINFO = re.compile(
-    r"(?i)([a-z][a-z0-9+.-]*://)([^/\r\n\s@]+)(@)"
+    r"(?i)(?<![a-z0-9+.-])([0-9+.-]*+[a-z][a-z0-9+.-]*+://)([^/\r\n\s@]++)(@)"
 )
 # Credential fields: keep name + separator, redact value. Forms:
 #   name=value / name: value / name : "value" / "name": "value" / ?name=value
@@ -96,12 +97,14 @@ _PAT_URL_USERINFO = re.compile(
 # ``_PAT_AUTHORIZATION`` (keeps the "Bearer "/"Basic " scheme) so the two rules
 # never double-hits the same segment.
 _PAT_CREDENTIAL_QUOTED = re.compile(
-    r'(?i)("[\w.-]*(?:api[_-]?key|apikey|token|password|passwd|pwd|secret)[\w.-]*"'
+    r'(?i)("(?=[\w.-]*(?:api[_-]?key|apikey|token|password|passwd|pwd|secret))[\w.-]*+"'
     r')(\s*:\s*")([^"]*)(?:"|$)'
 )
+# Inspect each whole field name once, then consume it without backtracking.
+# An unanchored greedy prefix retries every suffix of large ordinary words.
 _PAT_CREDENTIAL_RAW = re.compile(
-    r"(?i)([\w.-]*(?:api[_-]?key|apikey|token|password|passwd|pwd|secret)"
-    r"[\w.-]*)(\s*[:=]\s*|\s*:\s*)([^\s,\";&]+)"
+    r"(?i)(?<![\w.-])(?=[\w.-]*(?:api[_-]?key|apikey|token|password|passwd|pwd|secret))"
+    r"([\w.-]++)(\s*+[:=]\s*+)([^\s,\";&]+)"
 )
 # JWT: three base64url segments (no capture group -> whole match redacted).
 _PAT_JWT = re.compile(

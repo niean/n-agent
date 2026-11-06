@@ -105,6 +105,12 @@ class ImagePersister(Protocol):
     async def persist(self, source_url: str, mime_hint: str | None = None) -> str | None: ...
 
 
+class ScriptGrantSnapshotProvider(Protocol):
+    async def effective_snapshot(
+        self, base: HostTerminalPolicySnapshot
+    ) -> HostTerminalPolicySnapshot: ...
+
+
 def host_terminal_tool_definition(timeout_seconds: int = 120) -> ToolDefinition:
     common_properties: dict[str, Any] = {
         "args": {
@@ -169,6 +175,7 @@ class HostTerminalToolExecutor:
         max_concurrency: int = 1,
         audit_service: PolicyAuditService | None = None,
         image_persister: ImagePersister | None = None,
+        script_grant_service: ScriptGrantSnapshotProvider | None = None,
     ) -> None:
         self._client = client
         self._skill_service = skill_service
@@ -180,6 +187,7 @@ class HostTerminalToolExecutor:
         self._max_concurrency = max_concurrency
         self._audit_service = audit_service
         self._image_persister = image_persister
+        self._script_grant_service = script_grant_service
         self.last_health_code = "host_bridge_not_checked"
 
     async def execute(
@@ -247,6 +255,8 @@ class HostTerminalToolExecutor:
         # Refresh once, then pin this exact immutable object for the whole call.
         await asyncio.to_thread(self._policy_loader.refresh)
         snapshot = self._policy_loader.snapshot
+        if snapshot is not None and self._script_grant_service is not None:
+            snapshot = await self._script_grant_service.effective_snapshot(snapshot)
         if snapshot is None or not snapshot.rules:
             await self._audit(
                 request,
@@ -488,9 +498,16 @@ class HostTerminalToolExecutor:
         ):
             return [], "host_request_invalid"
         args = arguments.get("args")
+        auto_args = kind == "skill_script" and any(
+            rule.allow_any_args
+            and rule.skill_name == arguments.get("skill")
+            and rule.script_relative_path == arguments.get("script")
+            for rule in snapshot.skill_script_rules
+        )
         if not host_terminal_arguments_allowed(
             args, snapshot.limits,
             executable=arguments.get("command") if kind == "command" else None,
+            allow_any_args=auto_args,
         ):
             return [], "host_arguments_invalid"
         timeout = arguments.get("timeout", snapshot.limits.default_timeout_seconds)

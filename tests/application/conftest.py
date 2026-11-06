@@ -4,6 +4,21 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def wire_normalized_token_computer():
+    """Mirror production wiring (app/main.py): bind the Domain rule so
+    normalized-token metrics are recorded in application-layer tests."""
+    from app.application import telemetry_semantics
+    from app.domain.usage import compute_normalized_tokens
+
+    previous = telemetry_semantics._normalized_token_computer
+    telemetry_semantics.set_normalized_token_computer(compute_normalized_tokens)
+    try:
+        yield
+    finally:
+        telemetry_semantics.set_normalized_token_computer(previous)
+
+
+@pytest.fixture(autouse=True)
 def close_idle_event_loop_before_sync_test(request):
     """Do not let asyncio.run() orphan pytest-asyncio's idle clean loop."""
     if request.node.get_closest_marker("asyncio") is not None:

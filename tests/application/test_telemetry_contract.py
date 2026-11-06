@@ -210,6 +210,24 @@ def test_memory_provider_is_not_model_provider():
     assert 'gen_ai.provider.name' not in attrs
 
 
+def test_model_cache_attributes_registered():
+    from app.application import telemetry_contract as tc
+    assert 'cache_read_tokens' in tc.OBJECT_ATTRIBUTES['model']
+    assert 'cache_write_tokens' in tc.OBJECT_ATTRIBUTES['model']
+    assert 'nagent.model.normalized_tokens' not in {f'nagent.model.{f}' for f in tc.OBJECT_ATTRIBUTES['model']}
+    assert tc.ATTRIBUTE_TYPES['nagent.model.cache_read_tokens'] == 'integer'
+    assert tc.ATTRIBUTE_TYPES['nagent.model.cache_write_tokens'] == 'integer'
+
+
+def test_model_instruments_include_cache_and_normalized():
+    from app.application import telemetry_contract as tc
+    model_insts = tc._instruments['model']
+    for name in ('nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens',
+                 'nagent.model.normalized_tokens', 'nagent.model.cache_eligible_prompt_tokens',
+                 'nagent.model.cache_eligible_read_tokens'):
+        assert name in model_insts
+
+
 def test_unknown_operation_keeps_completion_log(monkeypatch):
     logs = []
     monkeypatch.setattr(ts.logger, 'info', lambda _: logs.append(ts.execution_log_snapshot()))

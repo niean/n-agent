@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
 # 项目教训
 
 ### P082: 本次输入的历史副本须按消息身份排除
@@ -783,3 +783,10 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：manage_skill 的 REMOVE_FILE 分支照搬 DELETE 语义（registry.delete_skill + usage.set_state("archived")），而 loader.remove_linked_file 只移走单个关联文件、SKILL.md 仍在；重扫按磁盘恢复注册表，但 scan_now 不更新 usage，两份记录漂移出"注册表可用、usage=archived"残留。
 - 教训：一个写动作横跨文件系统/注册表/使用记录多份存储时，每个分支的 registry/usage 更新必须与 loader 的真实物理效果一一对应，不得复用其它动作的存储更新代码；为"扫描后自动恢复"写代码时要同步设计对账的失败语义（本例 fail-fast：任一恢复失败 scan_now 整体失败，不降级 warning、不产出伪成功报告）。排障先对比 usage.state 与 registry last_scan_status 两份独立记录。
 - 来源：2026-11-05 iterate-feature（spec-261105-skill-usage-state-reconcile）；修复 manage_skill REMOVE_FILE 分支与 scan_now fail-fast 对账，33 个新测试覆盖；结果验收 3 维度扫描 0 违规。
+
+### P086: HTTP 观测收尾的正则脱敏也会阻塞整个服务
+
+- 现象：制品 E2E 的 inline 超限请求已经返回 413，下一条 21MB 文件上传与 Dashboard、health 一起无响应；两次 py-spy 栈均停在主线程 sanitizer.py 的 pattern.sub。
+- 根因：HTTP 中间件在事件循环内同步投影请求详情；凭据和 URL 规则的无边界贪婪前缀对 262145 个连续 a 逐后缀重试。另有 multipart 截断路径在解析文件元信息前对整个原始文件正文脱敏，放大处理成本。
+- 教训：先由真实栈和独立进程限时测试区分业务返回与日志收尾；凭据规则从完整词元边界匹配并避免重复回溯，multipart 文件正文不送入文本脱敏器，截断文本字段单独保护。E2E 不能只断言拒绝状态，还要限时检查后续请求可用。
+- 来源：2026-11-06 Dashboard E2E 无响应修复；RED 4 failed，另补URL前缀兼容红绿测试4项；针对性 GREEN 55 passed；观测/安全/架构回归341 passed、1 skipped，制品接口等143 passed；Docker 制品 E2E 通过。

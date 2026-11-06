@@ -23,6 +23,7 @@ from app.application.task_config_service import TaskConfigService
 from app.config import Settings
 from app.domain.config_bundle import (
     BUNDLE_SCHEMA_VERSION,
+    ImportAction,
     SECTION_NAMES,
     ConfigBundleValidationError,
     ImportMode,

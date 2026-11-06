@@ -176,10 +176,20 @@ class TestInstruments:
          {"nagent.context.outcome"}),
         ("nagent.budget.denials", "counter", "1",
          {"nagent.budget.kind"}),
+        ("nagent.model.cache_read_tokens", "counter", "{token}",
+         {"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model"}),
+        ("nagent.model.cache_write_tokens", "counter", "{token}",
+         {"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model"}),
+        ("nagent.model.normalized_tokens", "counter", "{token}",
+         {"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model"}),
+        ("nagent.model.cache_eligible_prompt_tokens", "counter", "{token}",
+         {"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model"}),
+        ("nagent.model.cache_eligible_read_tokens", "counter", "{token}",
+         {"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model"}),
     ]
 
-    def test_twelve_instruments_declared(self):
-        assert len(ts.INSTRUMENTS) == 12
+    def test_seventeen_instruments_declared(self):
+        assert len(ts.INSTRUMENTS) == 17
 
     def test_instruments_match_spec_table(self):
         by_name = {i.name: i for i in ts.INSTRUMENTS.values()}
@@ -204,6 +214,11 @@ class TestInstruments:
         assert ts.INSTRUMENT_AGENT_RUNS == "nagent.agent.runs"
         assert ts.INSTRUMENT_CONTEXT_COMPRESSION_ATTEMPTS == "nagent.context.compression_attempts"
         assert ts.INSTRUMENT_BUDGET_DENIALS == "nagent.budget.denials"
+        assert ts.INSTRUMENT_MODEL_CACHE_READ == "nagent.model.cache_read_tokens"
+        assert ts.INSTRUMENT_MODEL_CACHE_WRITE == "nagent.model.cache_write_tokens"
+        assert ts.INSTRUMENT_MODEL_NORMALIZED == "nagent.model.normalized_tokens"
+        assert ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT == "nagent.model.cache_eligible_prompt_tokens"
+        assert ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ == "nagent.model.cache_eligible_read_tokens"
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +582,184 @@ class TestFakeMeterContract:
         ts.record_turn(source="cli", end_reason="mystery-reason")
         _value, attrs = counter.records[1]
         assert attrs[ts.NAGENT_AGENT_END_REASON] == "other"
+
+
+class TestCacheAndNormalizedTokens:
+    @pytest.fixture
+    def meter(self, monkeypatch):
+        ts._instrument_cache.clear()
+        fake = FakeMeter()
+        monkeypatch.setattr(ts, "get_meter", lambda: fake)
+        yield fake
+        ts._instrument_cache.clear()
+
+    @staticmethod
+    def _total(meter, name):
+        return sum(v for v, _ in meter.counters[name].records) if name in meter.counters else 0
+
+    def test_openai_cache_write_normalized_and_eligible(self, meter):
+        ts.record_inference_tokens(
+            "gpt-test", "openai", "chat", 100, 10,
+            cache_read_tokens=50, cache_write_tokens=None,
+        )
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_READ) == 50
+        assert ts.INSTRUMENT_MODEL_CACHE_WRITE not in meter.counters
+        assert self._total(meter, ts.INSTRUMENT_MODEL_NORMALIZED) == 160
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 150
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ) == 50
+        _v, attrs = meter.counters[ts.INSTRUMENT_MODEL_CACHE_READ].records[0]
+        assert attrs["gen_ai.operation.name"] == "chat"
+        assert attrs["gen_ai.provider.name"] == ts.map_provider_name("openai")
+        assert attrs["gen_ai.request.model"] == ts.map_model_name("gpt-test")
+
+    def test_anthropic_eligibility_needs_all_three(self, meter):
+        ts.record_inference_tokens(
+            "claude-test", "anthropic", "chat", 100, 10,
+            cache_read_tokens=50, cache_write_tokens=None,
+        )
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 0
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ) == 0
+        ts.record_inference_tokens(
+            "claude-test", "anthropic", "chat", 100, 10,
+            cache_read_tokens=50, cache_write_tokens=20,
+        )
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 170
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ) == 50
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_WRITE) == 20
+
+    def test_unknown_provider_never_produces_eligible(self, meter):
+        ts.record_inference_tokens(
+            "mystery", "vendor-x", "chat", 100, 10, cache_read_tokens=50,
+        )
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 0
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ) == 0
+
+    def test_unknown_components_skip(self, meter):
+        ts.record_inference_tokens(
+            "gpt-test", "openai", "chat", 100, None,
+            cache_read_tokens=None, cache_write_tokens=None,
+        )
+        assert self._total(meter, ts.INSTRUMENT_INFERENCE_INPUT_TOKENS) == 100
+        assert ts.INSTRUMENT_MODEL_CACHE_READ not in meter.counters
+        assert ts.INSTRUMENT_MODEL_NORMALIZED not in meter.counters
+        assert ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT not in meter.counters
+
+    def test_invalid_values_rejected(self, meter):
+        for bad in (True, -1, 1.5, "50", float("inf")):
+            ts.record_inference_tokens(
+                "gpt-test", "openai", "chat", bad, 10,
+                cache_read_tokens=bad, cache_write_tokens=bad,
+            )
+        assert self._total(meter, ts.INSTRUMENT_INFERENCE_INPUT_TOKENS) == 0
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_READ) == 0
+        assert self._total(meter, ts.INSTRUMENT_MODEL_NORMALIZED) == 0
+        # output 10 recorded 5 times (bad inputs do not block valid output)
+        assert self._total(meter, ts.INSTRUMENT_INFERENCE_OUTPUT_TOKENS) == 50
+
+    def test_explicit_zero_is_known(self, meter):
+        ts.record_inference_tokens(
+            "gpt-test", "openai", "chat", 0, 0,
+            cache_read_tokens=0, cache_write_tokens=None,
+        )
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_READ) == 0
+        assert ts.INSTRUMENT_MODEL_CACHE_READ in meter.counters
+        assert self._total(meter, ts.INSTRUMENT_MODEL_NORMALIZED) == 0
+        assert ts.INSTRUMENT_MODEL_NORMALIZED in meter.counters
+        assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 0
+        assert ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT in meter.counters
+
+    def test_new_instruments_registered(self):
+        for name in (
+            ts.INSTRUMENT_MODEL_CACHE_READ,
+            ts.INSTRUMENT_MODEL_CACHE_WRITE,
+            ts.INSTRUMENT_MODEL_NORMALIZED,
+            ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT,
+            ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ,
+        ):
+            inst = ts.INSTRUMENTS[name]
+            assert inst.kind == "counter"
+            assert inst.unit == "{token}"
+            assert set(inst.allowed_dimensions) == {
+                ts.GEN_AI_OPERATION_NAME, ts.GEN_AI_PROVIDER_NAME, ts.GEN_AI_REQUEST_MODEL,
+            }
+
+
+class TestChatAttemptCacheUsage:
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        records = []
+        monkeypatch.setattr(
+            ts, "_record", lambda name, value, dims: records.append((name, value, dims))
+        )
+        tracer = FakeTracer()
+        monkeypatch.setattr(ts, "get_tracer", lambda: tracer)
+        return records, tracer
+
+    @staticmethod
+    def _total(records, name):
+        return sum(v for n, v, _ in records if n == name)
+
+    def test_noop_attempt_has_set_cache_usage(self):
+        ts._NOOP_CHAT_ATTEMPT.set_cache_usage(cache_read_tokens=1, cache_write_tokens=2)
+        ts.NoopChatAttempt().set_cache_usage()
+
+    def test_set_cache_usage_replaces_and_none_preserves(self, captured):
+        records, _ = captured
+        with ts.ChatAttempt(model="gpt-4o", stream=False, provider="anthropic") as attempt:
+            attempt.set_cache_usage(cache_read_tokens=50, cache_write_tokens=20)
+            attempt.set_cache_usage(cache_read_tokens=None)  # None must not erase
+            attempt.set_cache_usage(cache_read_tokens=True, cache_write_tokens=-1)  # invalid
+            assert attempt._cache_read_tokens == 50
+            assert attempt._cache_write_tokens == 20
+        names = [n for n, _, _ in records]
+        assert names.count(ts.INSTRUMENT_MODEL_CACHE_READ) == 1
+        assert names.count(ts.INSTRUMENT_MODEL_CACHE_WRITE) == 1
+
+    def test_exit_records_once_with_span_attrs_anthropic(self, captured):
+        records, tracer = captured
+        with ts.ChatAttempt(model="gpt-4o", stream=False, provider="anthropic") as attempt:
+            attempt.set_usage(100, 10)
+            attempt.set_cache_usage(cache_read_tokens=50, cache_write_tokens=20)
+            attempt.set_usage(100, 10)  # repeated snapshot updates, still one settle
+        span = tracer.spans[0]
+        assert span.attributes["nagent.model.cache_read_tokens"] == 50
+        assert span.attributes["nagent.model.cache_write_tokens"] == 20
+        assert self._total(records, ts.INSTRUMENT_INFERENCE_INPUT_TOKENS) == 100
+        assert self._total(records, ts.INSTRUMENT_INFERENCE_OUTPUT_TOKENS) == 10
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_READ) == 50
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_WRITE) == 20
+        assert self._total(records, ts.INSTRUMENT_MODEL_NORMALIZED) == 160
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 170
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ) == 50
+        assert len(tracer.spans) == 1
+
+    def test_exit_records_once_with_span_attrs_openai(self, captured):
+        records, _ = captured
+        with ts.ChatAttempt(model="gpt-4o", stream=False, provider="openai") as attempt:
+            attempt.set_usage(100, 10)
+            attempt.set_cache_usage(cache_read_tokens=50)
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 150
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ) == 50
+        assert ts.INSTRUMENT_MODEL_CACHE_WRITE not in [n for n, _, _ in records]
+
+    def test_failure_still_records_known_usage(self, captured):
+        records, _ = captured
+        with pytest.raises(RuntimeError):
+            with ts.ChatAttempt(model="gpt-4o", stream=False, provider="anthropic") as attempt:
+                attempt.set_usage(100, 10)
+                attempt.set_cache_usage(cache_read_tokens=50, cache_write_tokens=20)
+                raise RuntimeError("boom")
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_READ) == 50
+        assert self._total(records, ts.INSTRUMENT_MODEL_NORMALIZED) == 160
+        assert self._total(records, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT) == 170
+
+    def test_unknown_cache_components_produce_no_measurements(self, captured):
+        records, _ = captured
+        with ts.ChatAttempt(model="gpt-4o", stream=False, provider="anthropic") as attempt:
+            attempt.set_usage(100, 10)
+        assert ts.INSTRUMENT_MODEL_CACHE_READ not in [n for n, _, _ in records]
+        assert ts.INSTRUMENT_MODEL_NORMALIZED not in [n for n, _, _ in records]
+        assert ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT not in [n for n, _, _ in records]
 
 
 # ---------------------------------------------------------------------------

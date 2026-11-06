@@ -100,6 +100,8 @@ processors:
           - 'set(cache["execution"]["nagent.memory.provider"], attributes["nagent.memory.provider"]) where attributes["nagent.memory.provider"] != nil'
           - 'set(cache["execution"]["nagent.memory.summary"], attributes["nagent.memory.summary"]) where attributes["nagent.memory.summary"] != nil'
           - 'set(cache["execution"]["nagent.metric.overflow"], attributes["nagent.metric.overflow"]) where attributes["nagent.metric.overflow"] != nil'
+          - 'set(cache["execution"]["nagent.model.cache_read_tokens"], attributes["nagent.model.cache_read_tokens"]) where attributes["nagent.model.cache_read_tokens"] != nil'
+          - 'set(cache["execution"]["nagent.model.cache_write_tokens"], attributes["nagent.model.cache_write_tokens"]) where attributes["nagent.model.cache_write_tokens"] != nil'
           - 'set(cache["execution"]["nagent.model.duration_ms"], attributes["nagent.model.duration_ms"]) where attributes["nagent.model.duration_ms"] != nil'
           - 'set(cache["execution"]["nagent.model.message_count"], attributes["nagent.model.message_count"]) where attributes["nagent.model.message_count"] != nil'
           - 'set(cache["execution"]["nagent.model.operation"], attributes["nagent.model.operation"]) where attributes["nagent.model.operation"] != nil'

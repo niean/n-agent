@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from types import SimpleNamespace
-from typing import Dict, Iterator, Optional
+from typing import Callable, Dict, Iterator, Optional
 
 from app.application.telemetry_details import (
     project_details, validate_details, flatten_details, StreamDetailsAccumulator,
@@ -99,6 +99,8 @@ NAGENT_AGENT_RUN_ID = "nagent.agent.run_id"
 NAGENT_TOOL_POLICY_OUTCOME = "nagent.tool.policy_outcome"
 NAGENT_TOOL_RISK_LEVEL = "nagent.tool.risk_level"
 NAGENT_MODEL_USAGE_KNOWN = "nagent.model.usage_known"
+NAGENT_MODEL_CACHE_READ_TOKENS = "nagent.model.cache_read_tokens"
+NAGENT_MODEL_CACHE_WRITE_TOKENS = "nagent.model.cache_write_tokens"
 NAGENT_CONTEXT_BEFORE_TOKENS = "nagent.context.before_tokens"
 NAGENT_CONTEXT_AFTER_TOKENS = "nagent.context.after_tokens"
 NAGENT_CONTEXT_OUTCOME = "nagent.context.outcome"
@@ -132,6 +134,7 @@ _SCENE_OPERATION_MASK = frozenset({
     "risk_level", "policy_outcome", "executed", "outcome", "finish_reason",
     "summary", "error_type", "end_reason", "usage_known", "message_count", "duration_ms",
     "inference_calls", "tool_calls", "input_tokens", "output_tokens",
+    "cache_read_tokens", "cache_write_tokens",
 })
 
 
@@ -185,6 +188,9 @@ def _complete(span, operation, start, *, details=None, **facts):
         outcome = normalize_outcome(facts.get("outcome"))
         facts['outcome'] = outcome
         tokens = f"输入 Token {facts.get('input_tokens', '未知')}，输出 Token {facts.get('output_tokens', '未知')}"
+        if facts.get("cache_read_tokens") is not None or facts.get("cache_write_tokens") is not None:
+            tokens += (f"，缓存读 {facts.get('cache_read_tokens', '未知')}"
+                       f" / 缓存写 {facts.get('cache_write_tokens', '未知')}")
         if operation == "invoke_agent":
             summary = (f"Agent 执行：{outcome}，结束原因 {facts.get('end_reason', 'other')}，"
                        f"输入消息 {facts.get('message_count', '未知')} 条，模型调用 {facts.get('inference_calls', 0)} 次，"
@@ -280,6 +286,11 @@ INSTRUMENT_INVOKE_AGENT_TOOL_CALLS = "gen_ai.invoke_agent.tool_calls"
 INSTRUMENT_AGENT_RUNS = "nagent.agent.runs"
 INSTRUMENT_CONTEXT_COMPRESSION_ATTEMPTS = "nagent.context.compression_attempts"
 INSTRUMENT_BUDGET_DENIALS = "nagent.budget.denials"
+INSTRUMENT_MODEL_CACHE_READ = "nagent.model.cache_read_tokens"
+INSTRUMENT_MODEL_CACHE_WRITE = "nagent.model.cache_write_tokens"
+INSTRUMENT_MODEL_NORMALIZED = "nagent.model.normalized_tokens"
+INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT = "nagent.model.cache_eligible_prompt_tokens"
+INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ = "nagent.model.cache_eligible_read_tokens"
 
 
 INSTRUMENTS: Dict[str, Instrument] = {
@@ -386,6 +397,36 @@ INSTRUMENTS: Dict[str, Instrument] = {
             kind="counter",
             unit="1",
             allowed_dimensions=(NAGENT_BUDGET_KIND,),
+        ),
+        Instrument(
+            name=INSTRUMENT_MODEL_CACHE_READ,
+            kind="counter",
+            unit="{token}",
+            allowed_dimensions=(GEN_AI_OPERATION_NAME, GEN_AI_PROVIDER_NAME, GEN_AI_REQUEST_MODEL),
+        ),
+        Instrument(
+            name=INSTRUMENT_MODEL_CACHE_WRITE,
+            kind="counter",
+            unit="{token}",
+            allowed_dimensions=(GEN_AI_OPERATION_NAME, GEN_AI_PROVIDER_NAME, GEN_AI_REQUEST_MODEL),
+        ),
+        Instrument(
+            name=INSTRUMENT_MODEL_NORMALIZED,
+            kind="counter",
+            unit="{token}",
+            allowed_dimensions=(GEN_AI_OPERATION_NAME, GEN_AI_PROVIDER_NAME, GEN_AI_REQUEST_MODEL),
+        ),
+        Instrument(
+            name=INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT,
+            kind="counter",
+            unit="{token}",
+            allowed_dimensions=(GEN_AI_OPERATION_NAME, GEN_AI_PROVIDER_NAME, GEN_AI_REQUEST_MODEL),
+        ),
+        Instrument(
+            name=INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ,
+            kind="counter",
+            unit="{token}",
+            allowed_dimensions=(GEN_AI_OPERATION_NAME, GEN_AI_PROVIDER_NAME, GEN_AI_REQUEST_MODEL),
         ),
     )
 }
@@ -1289,6 +1330,58 @@ def record_invoke_agent_durations_and_calls(
     )
 
 
+def _valid_count(value: object) -> bool:
+    """Strict usage-component validity: real non-negative ints only.
+
+    Python ``bool`` is an ``int`` subclass but is not a count; floats,
+    strings and non-finite values are never implicitly converted.
+    Explicit 0 is a known value.
+    """
+    return type(value) is int and value >= 0
+
+
+# The normalized-token rule authority is app/domain/usage.py. This module
+# must stay free of business imports (see module docstring + architecture
+# boundary tests), so the composition root (app/main.py) injects the Domain
+# function here at startup -- the formula is never copied into this module.
+NormalizedTokenComputer = Callable[[int, int, int], int]
+_normalized_token_computer: Optional[NormalizedTokenComputer] = None
+_normalized_computer_warned = False
+
+
+def set_normalized_token_computer(computer: NormalizedTokenComputer) -> None:
+    """Bind the Domain normalization rule (composition-root wiring)."""
+    global _normalized_token_computer
+    _normalized_token_computer = computer
+
+
+def _compute_normalized(input_tokens: int, cache_read_tokens: int, output_tokens: int) -> Optional[int]:
+    global _normalized_computer_warned
+    computer = _normalized_token_computer
+    if computer is None:
+        if not _normalized_computer_warned:
+            _normalized_computer_warned = True
+            try:
+                logger.warning(
+                    "normalized token computer not wired; nagent.model.normalized_tokens is not recorded"
+                )
+            except Exception:
+                pass
+        return None
+    try:
+        return computer(input_tokens, cache_read_tokens, output_tokens)
+    except Exception:
+        return None
+
+
+# Providers whose protocol has no cache-write concept. Cache-write is only
+# produced by Anthropic-style APIs; for these providers cache_write is
+# *inapplicable* (not merely unknown), which makes the cache-hit-rate
+# denominator decidable from Ti + Tic alone. Any other provider is never
+# presumed cache-write-free.
+_CACHE_WRITE_INAPPLICABLE_PROVIDERS = frozenset({"openai", "openai-compatible"})
+
+
 def record_inference_tokens(
     model: object,
     provider: object,
@@ -1297,12 +1390,16 @@ def record_inference_tokens(
     output_tokens: Optional[int],
     error_type: Optional[str] = None,
     modality: Optional[str] = None,
+    *,
+    cache_read_tokens: Optional[int] = None,
+    cache_write_tokens: Optional[int] = None,
 ) -> None:
     """Record token usage.
 
     Only known, non-negative components are recorded -- a missing usage
     is never fabricated as 0 (callers mark ``nagent.usage_known=false``
-    on the span instead).
+    on the span instead). The normalized value is always derived here from
+    the Domain rule; callers never supply their own normalized figure.
     """
     base = {
         GEN_AI_OPERATION_NAME: operation,
@@ -1314,12 +1411,46 @@ def record_inference_tokens(
     op_dims = dict(base)
     op_dims.pop(GEN_AI_TOKEN_MODALITY, None)
     op_dims.update(_error_dim(error_type))
-    if input_tokens is not None and input_tokens >= 0:
+    ti_known = _valid_count(input_tokens)
+    to_known = _valid_count(output_tokens)
+    tic_known = _valid_count(cache_read_tokens)
+    ticw_known = _valid_count(cache_write_tokens)
+    if ti_known:
         _record(INSTRUMENT_INFERENCE_INPUT_TOKENS, input_tokens, dict(base))
         _record(INSTRUMENT_OPERATION_INPUT_TOKENS, input_tokens, op_dims)
-    if output_tokens is not None and output_tokens >= 0:
+    if to_known:
         _record(INSTRUMENT_INFERENCE_OUTPUT_TOKENS, output_tokens, dict(base))
         _record(INSTRUMENT_OPERATION_OUTPUT_TOKENS, output_tokens, op_dims)
+    # Cache/normalized counters use the plain three-dimension dict (no
+    # modality / error.type), matching their declared allowed dimensions.
+    cache_dims = dict(base)
+    if tic_known:
+        _record(INSTRUMENT_MODEL_CACHE_READ, cache_read_tokens, dict(cache_dims))
+    if ticw_known:
+        _record(INSTRUMENT_MODEL_CACHE_WRITE, cache_write_tokens, dict(cache_dims))
+    if ti_known and tic_known and to_known:
+        normalized = _compute_normalized(input_tokens, cache_read_tokens, output_tokens)
+        if normalized is not None:
+            _record(INSTRUMENT_MODEL_NORMALIZED, normalized, dict(cache_dims))
+    # Cache-hit-rate eligibility: only attempts whose full prompt total is
+    # decidable enter the two support counters, so the derived ratio always
+    # compares like with like.
+    if provider in _CACHE_WRITE_INAPPLICABLE_PROVIDERS:
+        if ti_known and tic_known and not ticw_known:
+            _record(
+                INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT,
+                input_tokens + cache_read_tokens,
+                dict(cache_dims),
+            )
+            _record(INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ, cache_read_tokens, dict(cache_dims))
+    else:
+        if ti_known and tic_known and ticw_known:
+            _record(
+                INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT,
+                input_tokens + cache_read_tokens + cache_write_tokens,
+                dict(cache_dims),
+            )
+            _record(INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ, cache_read_tokens, dict(cache_dims))
 
 
 # ---------------------------------------------------------------------------
@@ -1421,6 +1552,9 @@ class NoopChatAttempt:
     def set_usage(self, input_tokens, output_tokens) -> None:  # noqa: D401
         pass
 
+    def set_cache_usage(self, *, cache_read_tokens=None, cache_write_tokens=None) -> None:
+        pass
+
     def set_finish_reasons(self, reasons) -> None:
         pass
 
@@ -1471,6 +1605,8 @@ class ChatAttempt:
         self._start = 0.0
         self._input_tokens: Optional[int] = None
         self._output_tokens: Optional[int] = None
+        self._cache_read_tokens: Optional[int] = None
+        self._cache_write_tokens: Optional[int] = None
         self._error_type: Optional[str] = None
         self._finish_reason = None
         self._details = {}
@@ -1547,10 +1683,31 @@ class ChatAttempt:
             pass
 
     def set_usage(self, input_tokens, output_tokens) -> None:
-        if isinstance(input_tokens, int) and input_tokens >= 0:
+        """Record a usage snapshot; each valid known bucket replaces the
+        previous value (never accumulates), invalid values are ignored."""
+        if _valid_count(input_tokens):
             self._input_tokens = input_tokens
-        if isinstance(output_tokens, int) and output_tokens >= 0:
+        if _valid_count(output_tokens):
             self._output_tokens = output_tokens
+        usage_known = _valid_count(self._input_tokens) and _valid_count(self._output_tokens)
+        _scene_publish({
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
+            "usage_known": usage_known or None,
+        })
+
+    def set_cache_usage(self, *, cache_read_tokens=None, cache_write_tokens=None) -> None:
+        """Record a cache-usage snapshot; valid known buckets replace the
+        previous value, ``None`` never erases a known value, invalid values
+        are ignored (strict ``_valid_count`` rule, no implicit conversion)."""
+        if _valid_count(cache_read_tokens):
+            self._cache_read_tokens = cache_read_tokens
+        if _valid_count(cache_write_tokens):
+            self._cache_write_tokens = cache_write_tokens
+        _scene_publish({
+            "cache_read_tokens": self._cache_read_tokens,
+            "cache_write_tokens": self._cache_write_tokens,
+        })
 
     def set_finish_reasons(self, reasons) -> None:
         if reasons is None:
@@ -1579,6 +1736,10 @@ class ChatAttempt:
                     _set_attr(self._span, GEN_AI_USAGE_INPUT_TOKENS, self._input_tokens)
                 if self._output_tokens is not None:
                     _set_attr(self._span, GEN_AI_USAGE_OUTPUT_TOKENS, self._output_tokens)
+                if self._cache_read_tokens is not None:
+                    _set_attr(self._span, NAGENT_MODEL_CACHE_READ_TOKENS, self._cache_read_tokens)
+                if self._cache_write_tokens is not None:
+                    _set_attr(self._span, NAGENT_MODEL_CACHE_WRITE_TOKENS, self._cache_write_tokens)
                 _set_attr(
                     self._span,
                     NAGENT_MODEL_USAGE_KNOWN,
@@ -1612,6 +1773,8 @@ class ChatAttempt:
                       iteration=current_iteration(), message_count=_message_count.get(), stream=self._stream,
                       finish_reason=self._finish_reason, input_tokens=self._input_tokens,
                       output_tokens=self._output_tokens,
+                      cache_read_tokens=self._cache_read_tokens,
+                      cache_write_tokens=self._cache_write_tokens,
                       usage_known=self._input_tokens is not None and self._output_tokens is not None,
                       outcome=_operation_outcome(exc, 'failure' if error_type else 'success'),
                       error_type=map_error_type(error_type) if error_type else None)
@@ -1625,6 +1788,8 @@ class ChatAttempt:
                 self._input_tokens,
                 self._output_tokens,
                 error_type,
+                cache_read_tokens=self._cache_read_tokens,
+                cache_write_tokens=self._cache_write_tokens,
             )
         except Exception:
             pass  # observability-only failure must never affect business

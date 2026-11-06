@@ -155,6 +155,68 @@ def _executor(snapshot=None, client=None):
 
 
 @pytest.mark.asyncio
+async def test_auto_script_uses_fresh_grant_and_literal_bounded_argv():
+    from app.domain.host_script_grant import HostScriptGrant, merge_script_grants
+
+    grant = HostScriptGrant(
+        "auto-demo", "scripts/run.py", DIGEST, 1, "foreground",
+        "2026-11-06T00:00:00Z", "active",
+    )
+
+    class Grants:
+        calls = 0
+
+        async def effective_snapshot(self, base):
+            self.calls += 1
+            return merge_script_grants(base, [grant] if self.calls == 1 else [])
+
+    grants = Grants()
+    client = _Client()
+    loader = _Loader(_command_snapshot())
+    executor = HostTerminalToolExecutor(
+        client=client, skill_service=_Skills(), policy_loader=loader,
+        script_grant_service=grants,
+    )
+    arguments = {
+        "target_type": "skill_script", "skill": "auto-demo",
+        "script": "scripts/run.py", "args": ["hello world", "$HOME;literal"],
+    }
+    allowed = await executor.execute(ToolCallRequest("auto-1", "host_terminal", arguments))
+    assert allowed.status is ToolResultStatus.SUCCESS
+    assert client.requests[0].target.args == ("hello world", "$HOME;literal")
+    assert client.requests[0].n_agent_content_digest == loader.snapshot.content_digest
+
+    denied = await executor.execute(ToolCallRequest("auto-2", "host_terminal", arguments))
+    assert denied.status is not ToolResultStatus.SUCCESS
+    assert grants.calls == 2
+    assert len(client.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_script_arguments_still_respect_size_limits():
+    from app.domain.host_script_grant import HostScriptGrant, merge_script_grants
+
+    class Grants:
+        async def effective_snapshot(self, base):
+            return merge_script_grants(base, [HostScriptGrant(
+                "auto-demo", "scripts/run.py", DIGEST, 1, "foreground",
+                "2026-11-06T00:00:00Z", "active",
+            )])
+
+    client = _Client()
+    executor = HostTerminalToolExecutor(
+        client=client, skill_service=_Skills(), policy_loader=_Loader(_command_snapshot()),
+        script_grant_service=Grants(),
+    )
+    result = await executor.execute(ToolCallRequest("auto-large", "host_terminal", {
+        "target_type": "skill_script", "skill": "auto-demo",
+        "script": "scripts/run.py", "args": ["x" * 65],
+    }))
+    assert result.status is ToolResultStatus.ERROR
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
 async def test_definition_is_strict_agent_host_safe_oneof():
     definition = host_terminal_tool_definition()
     assert definition.source_type is ToolSourceType.AGENT

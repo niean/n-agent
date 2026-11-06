@@ -7,10 +7,45 @@ userinfo），叠加注入的已知密钥精确值；全部输出统一 ``[REDAC
 from __future__ import annotations
 
 import re
+import multiprocessing
 
 import pytest
 
 from app.infrastructure.observability.sanitizer import LogSanitizer
+
+
+def _sanitize_long_text(text, result):
+    result.send(LogSanitizer().sanitize(text) == text)
+    result.close()
+
+
+@pytest.mark.parametrize('text', ['a' * 262145, 'token' * 52429,
+                                       'a' * 262145 + '://host/path'],
+                         ids=['long-word', 'repeated-credential-name', 'long-url-scheme'])
+def test_long_noncredential_text_completes_within_budget(text):
+    # A separate process bounds failures even when re holds the GIL.
+    context = multiprocessing.get_context('spawn')
+    reader, writer = context.Pipe(duplex=False)
+    process = context.Process(target=_sanitize_long_text, args=(text, writer))
+    process.start()
+    try:
+        process.join(4)
+        assert not process.is_alive(), 'sanitizer blocked on long noncredential text'
+        assert process.exitcode == 0
+        assert reader.poll() and reader.recv()
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join()
+        reader.close()
+        writer.close()
+
+
+def test_redacts_credentials_with_long_field_names():
+    name = 'a' * 10000 + '_api_key_suffix'
+    sanitizer = LogSanitizer()
+    assert sanitizer.sanitize(name + '=sensitive') == name + '=[REDACTED]'
+    assert sanitizer.sanitize('"' + name + '":"sensitive"') == '"' + name + '":"[REDACTED]"'
 
 
 def _s(*rules):
@@ -47,6 +82,12 @@ def test_redacts_url_userinfo_whole_segment():
     out = s.sanitize("GET http://alice:hunter2@host/p?q=1")
     assert out == "GET http://[REDACTED]@host/p?q=1"
     assert "alice" not in out and "hunter2" not in out
+
+
+@pytest.mark.parametrize('prefix', ['123', '-', '.', '+'])
+def test_url_redaction_preserves_nonletter_prefix(prefix):
+    assert _s().sanitize(prefix + 'https://alice:hunter2@host/path') == (
+        prefix + 'https://[REDACTED]@host/path')
 
 
 # ---------------------------------------------------------------------------

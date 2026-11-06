@@ -2103,6 +2103,8 @@ def test_schedule_task_projection_legacy_home_and_restore_eligibility():
         home = None
         async def get_home_target(self, platform):
             return self.home
+        async def find_conversations(self, platform, receive_id):
+            return []
     gateway = Gateway()
     resolver = ScheduleDeliveryService(gateway, None, lambda _: "connected")
     origin = {"platform": "feishu", "target": "home"}

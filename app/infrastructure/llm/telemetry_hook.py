@@ -29,6 +29,9 @@ class ChatAttemptHook(Protocol):
 
     def set_usage(self, input_tokens: Any, output_tokens: Any) -> None: ...
 
+    def set_cache_usage(self, *, cache_read_tokens: Any = None,
+                        cache_write_tokens: Any = None) -> None: ...
+
     def set_finish_reasons(self, reasons: Any) -> None: ...
 
     def set_response_model(self, model: Any) -> None: ...
@@ -53,6 +56,16 @@ def optional_hook(attempt: Any, method: str, *args: Any, **kwargs: Any) -> None:
         pass
 
 
+def validated_count(value: Any) -> bool:
+    """Strict usage-component validity shared by provider adapters.
+
+    Real non-negative ints only; ``bool`` is an ``int`` subclass but not a
+    count, and floats/strings are never implicitly converted. Explicit 0 is
+    a known value. Mirrors Application's ``_valid_count`` rule.
+    """
+    return type(value) is int and value >= 0
+
+
 class NoopChatAttempt:
     def set_input(self, messages, tools=None, system=None) -> None:
         pass
@@ -73,6 +86,9 @@ class NoopChatAttempt:
         pass
 
     def set_usage(self, input_tokens, output_tokens) -> None:
+        pass
+
+    def set_cache_usage(self, *, cache_read_tokens=None, cache_write_tokens=None) -> None:
         pass
 
     def set_finish_reasons(self, reasons) -> None:

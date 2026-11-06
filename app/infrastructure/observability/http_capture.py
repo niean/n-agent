@@ -48,9 +48,6 @@ class Body:
         content_type = self.headers.get("content-type", "").lower()
         if content_type.startswith(("image/", "audio/", "video/", "application/octet-stream")):
             return {"type": "binary", "bytes": self.observed}
-        text = bytes(self.data).decode("utf-8", errors="replace")
-        if not self.complete or self.overflow:
-            text = logs._sanitize_partial(text)
         if content_type.startswith("multipart/"):
             message = BytesParser(policy=email_policy).parsebytes(
                 b"Content-Type: " + self.headers.get("content-type", "").encode("latin1")
@@ -59,9 +56,16 @@ class Body:
             for part in message.iter_parts():
                 name = part.get_param("name", header="content-disposition") or "part"
                 raw = part.get_payload(decode=True) or b""
-                fields[name] = {"filename": part.get_filename(), "bytes": len(raw),
-                                "content_type": part.get_content_type()} if part.get_filename() else raw.decode("utf-8", errors="replace")
+                if part.get_filename() is not None:
+                    fields[name] = {"filename": part.get_filename(), "bytes": len(raw),
+                                    "content_type": part.get_content_type()}
+                else:
+                    value = raw.decode("utf-8", errors="replace")
+                    fields[name] = logs._sanitize_partial(value) if not self.complete or self.overflow else value
             return fields
+        text = bytes(self.data).decode("utf-8", errors="replace")
+        if not self.complete or self.overflow:
+            text = logs._sanitize_partial(text)
         try:
             return json.loads(text)
         except ValueError:

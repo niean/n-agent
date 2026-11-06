@@ -161,6 +161,17 @@ def test_management_write_is_logged_without_creating_an_orphan_span(content_wiri
     assert "PRIVATE-CREDENTIAL" not in str(emitted)
 
 
+def test_partial_multipart_does_not_sanitize_raw_file_bytes(content_wiring, monkeypatch):
+    from app.infrastructure.observability import http_capture
+    body = http_capture.Body({'content-type': 'multipart/form-data; boundary=audit'})
+    body.append(b'--audit\r\nContent-Disposition: form-data; name="file"; filename="sample.txt"\r\n\r\nPRIVATE-FILE-BYTES')
+    def sanitize_partial(text):
+        assert 'PRIVATE-FILE-BYTES' not in text
+        return text
+    monkeypatch.setattr(obs, '_sanitize_partial', sanitize_partial)
+    assert 'PRIVATE-FILE-BYTES' not in str(body.value())
+
+
 def test_partial_gzip_and_multipart_information_is_readable_and_bounded(content_wiring):
     import gzip
     from app.infrastructure.observability.http_capture import Body

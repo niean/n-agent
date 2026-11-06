@@ -94,10 +94,13 @@ def meter(monkeypatch):
     ts._reset_dimension_guard_for_tests()
 
 
-def _usage(prompt=None, completion=None):
+def _usage(prompt=None, completion=None, cached='missing'):
     if prompt is None and completion is None:
         return None
-    return SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion)
+    usage = SimpleNamespace(prompt_tokens=prompt, completion_tokens=completion)
+    if cached != 'missing':
+        usage.prompt_tokens_details = SimpleNamespace(cached_tokens=cached)
+    return usage
 
 
 def _response(content="hi", finish_reason="stop", usage=None):
@@ -142,7 +145,7 @@ def _stream_chunks():
         chunk(delta_content="he"),
         chunk(delta_content="llo"),
         chunk(finish_reason="stop"),
-        chunk(with_choice=False, usage=_usage(prompt=10, completion=5)),  # usage-only
+        chunk(with_choice=False, usage=_usage(prompt=10, completion=5, cached=0)),  # usage-only
     ]
 
 
@@ -208,7 +211,7 @@ def _token_records(meter):
 @pytest.mark.asyncio
 async def test_non_stream_success_records_usage(tracer, meter):
     telemetry = SemanticsTelemetry()
-    provider, _ = _provider(_response(usage=_usage(10, 5)), telemetry.begin_chat_attempt)
+    provider, _ = _provider(_response(usage=_usage(10, 5, cached=0)), telemetry.begin_chat_attempt)
 
     result = await provider.chat([], [], False, "", {})
 
@@ -251,7 +254,7 @@ async def test_missing_usage_not_fabricated_as_zero(tracer, meter):
 @pytest.mark.asyncio
 async def test_partial_usage_judged_per_component(tracer, meter):
     telemetry = SemanticsTelemetry()
-    provider, _ = _provider(_response(usage=_usage(prompt=7)), telemetry.begin_chat_attempt)
+    provider, _ = _provider(_response(usage=_usage(prompt=7, cached=0)), telemetry.begin_chat_attempt)
 
     await provider.chat([], [], False, "", {})
 
@@ -262,6 +265,23 @@ async def test_partial_usage_judged_per_component(tracer, meter):
     input_records, output_records = _token_records(meter)
     assert [v for v, _ in input_records] == [7]
     assert output_records == []
+
+
+@pytest.mark.asyncio
+async def test_openai_input_without_cached_tokens_is_unknown(tracer, meter):
+    # Ti semantics correction (spec-261105): prompt_tokens alone no longer
+    # stands in for the non-cached input; without cached_tokens the input
+    # component is unknown and never fabricated (not from prompt, not 0).
+    telemetry = SemanticsTelemetry()
+    provider, _ = _provider(_response(usage=_usage(prompt=7)), telemetry.begin_chat_attempt)
+
+    await provider.chat([], [], False, "", {})
+
+    span = _chat_span(tracer)[0]
+    assert ts.GEN_AI_USAGE_INPUT_TOKENS not in span.attributes
+    assert span.attributes[ts.NAGENT_MODEL_USAGE_KNOWN] is False
+    input_records, _ = _token_records(meter)
+    assert input_records == []
 
 
 @pytest.mark.asyncio

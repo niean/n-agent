@@ -44,7 +44,7 @@ for _old, _action in {'prompt': 'prepare_prompt', 'prefetch': 'prefetch', 'sync'
 OBJECTS = frozenset({'agent', 'model', 'tool', 'context', 'task', 'delegation', 'schedule', 'memory', 'skill', 'curator', 'gateway', 'request', 'http', 'budget', 'policy', 'observation', 'metric', 'content'})
 OBJECT_ATTRIBUTES = MappingProxyType({
     'agent': ('source', 'run_id', 'iteration', 'end_reason', 'message_count', 'inference_calls', 'tool_calls', 'usage_known'),
-    'model': ('message_count', 'usage_known'), 'tool': ('policy_outcome', 'risk_level', 'executed'),
+    'model': ('message_count', 'usage_known', 'cache_read_tokens', 'cache_write_tokens'), 'tool': ('policy_outcome', 'risk_level', 'executed'),
     'context': ('before_tokens', 'after_tokens'), 'task': ('id', 'run_id', 'trace_context', 'state'),
     'delegation': ('id', 'member_id', 'role'), 'schedule': ('task_id', 'claim_id', 'delivery_status'),
     'memory': ('provider',), 'request': ('channel', 'id'), 'http': ('caller', 'direction'),
@@ -63,7 +63,7 @@ _standard_local = {
 }
 _instruments = {
     'agent': ('gen_ai.invoke_agent.duration', 'gen_ai.invoke_agent.inference_calls', 'gen_ai.invoke_agent.tool_calls', 'nagent.agent.runs'),
-    'model': ('gen_ai.client.inference.usage.input_tokens', 'gen_ai.client.inference.usage.output_tokens', 'gen_ai.client.inference.operation.input_tokens', 'gen_ai.client.inference.operation.output_tokens', 'gen_ai.client.inference.duration'),
+    'model': ('gen_ai.client.inference.usage.input_tokens', 'gen_ai.client.inference.usage.output_tokens', 'gen_ai.client.inference.operation.input_tokens', 'gen_ai.client.inference.operation.output_tokens', 'gen_ai.client.inference.duration', 'nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens', 'nagent.model.normalized_tokens', 'nagent.model.cache_eligible_prompt_tokens', 'nagent.model.cache_eligible_read_tokens'),
     'tool': ('gen_ai.execute_tool.duration',), 'context': ('nagent.context.compression_attempts',),
 }
 
@@ -88,7 +88,7 @@ _attribute_types.update({key: 'integer' for key in (
     'gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens',
     'nagent.agent.iteration', 'nagent.agent.message_count',
     'nagent.agent.inference_calls', 'nagent.agent.tool_calls',
-    'nagent.model.message_count', 'nagent.context.before_tokens', 'nagent.context.after_tokens',
+    'nagent.model.message_count', 'nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens', 'nagent.context.before_tokens', 'nagent.context.after_tokens',
 )})
 _attribute_types.update({key: 'boolean' for key in (
     'gen_ai.request.stream', 'nagent.agent.usage_known', 'nagent.model.usage_known',

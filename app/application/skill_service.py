@@ -214,6 +214,8 @@ class SkillService:
         guard_agent_created: bool = True,
         backup_enabled: bool = True,
         format_validator: SkillFormatValidator | None = None,
+        auto_refresh: bool = False,
+        host_script_grants: Any | None = None,
     ):
         self.registry = registry
         self.loader = loader
@@ -225,6 +227,10 @@ class SkillService:
         self.guard_agent_created = guard_agent_created
         self.backup_enabled = backup_enabled
         self.format_validator = format_validator
+        self.last_auto_refresh_error: str | None = None
+        self.auto_refresh = auto_refresh
+        self.host_script_grants = host_script_grants
+        self._mutation_lock = asyncio.Lock()
         self._bg_read_targets: set[str] = set()
 
     async def list_skills(self, include_disabled: bool = True) -> list[Skill]:
@@ -312,6 +318,35 @@ class SkillService:
         return await self.registry.set_chat_selectable(name, value)
 
     async def scan_now(self) -> SkillScanReport:
+        async with self._mutation_lock:
+            try:
+                report = await self._scan_unlocked()
+            except Exception:
+                self.last_auto_refresh_error = "scan_failed"
+                raise
+            self.last_auto_refresh_error = None
+            return report
+
+    async def run_auto_refresh(self, interval_seconds: float = 5) -> None:
+        while True:
+            error = None
+            try:
+                await self.scan_now()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                error = "scan_failed"
+            if self.host_script_grants is not None:
+                try:
+                    await self.host_script_grants.sync()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    error = error or "pending_sync"
+            self.last_auto_refresh_error = error
+            await asyncio.sleep(interval_seconds)
+
+    async def _scan_unlocked(self) -> SkillScanReport:
         skills, warnings = await self.loader.scan()
         await self.registry.replace_all_skills(skills)
         normalized = [_normalize_warning(w) for w in warnings]
@@ -425,7 +460,13 @@ class SkillService:
         self._bg_read_targets.add(skill_name)
 
     async def manage_skill(
-        self, request: SkillManageRequest
+        self, request: SkillManageRequest, *, trusted_write: bool = False
+    ) -> SkillManageResult:
+        async with self._mutation_lock:
+            return await self._manage_unlocked(request, trusted_write=trusted_write)
+
+    async def _manage_unlocked(
+        self, request: SkillManageRequest, *, trusted_write: bool = False
     ) -> SkillManageResult:
         """Unified write entry-point with policy, guard, backup, and staging."""
         if (
@@ -565,6 +606,7 @@ class SkillService:
                     "file_path": request.file_path,
                     "file_content": request.file_content,
                     "category": request.category,
+                    "_trusted_write": trusted_write,
                 },
                 state="pending",
                 error=None,
@@ -596,6 +638,16 @@ class SkillService:
                         summary="", diff=None,
                         error=f"backup_failed: {exc}",
                     )
+
+        # Prepared is durable before the loader touches script bytes.
+        script_intent = None
+        if (trusted_write and self.host_script_grants is not None
+                and action == SkillWriteAction.WRITE_FILE
+                and request.file_path.startswith("scripts/")
+                and request.file_path.endswith(".py")):
+            script_intent = await self.host_script_grants.prepare_write(
+                name, request.file_path, request.file_content, origin.value
+            )
 
         # -- Step 6: dispatch to loader ------------------------------------
         try:
@@ -666,6 +718,19 @@ class SkillService:
                 summary="", diff=None, error=f"write_failed: {exc}",
             )
 
+        if script_intent is not None:
+            await self.host_script_grants.commit_write(script_intent.revision)
+        pending_revoke = False
+        if self.host_script_grants is not None and action in {
+            SkillWriteAction.DELETE, SkillWriteAction.REMOVE_FILE
+        }:
+            try:
+                pending_revoke = not await self.host_script_grants.revoke_skill(
+                    name, request.file_path if action == SkillWriteAction.REMOVE_FILE else None
+                )
+            except Exception:
+                pending_revoke = True
+
         # -- Step 7: update usage ------------------------------------------
         if action == SkillWriteAction.CREATE:
             new_usage = SkillUsage(
@@ -699,8 +764,29 @@ class SkillService:
             if asyncio.iscoroutine(ss):
                 await ss
 
+        # File writes stay successful even if discovery or bridge sync fails.
+        sync_summary = ""
+        if self.auto_refresh:
+            try:
+                await self._scan_unlocked()
+                self.last_auto_refresh_error = None
+            except Exception:
+                self.last_auto_refresh_error = "scan_failed"
+                sync_summary = " scan_failed pending_sync"
+        if script_intent is not None:
+            if not sync_summary:
+                try:
+                    await self.host_script_grants.sync()
+                    rows = await self.host_script_grants.list_grants()
+                    if not any(r["revision"] == script_intent.revision and r["state"] == "active" for r in rows):
+                        sync_summary = " pending_sync"
+                except Exception:
+                    sync_summary = " pending_sync"
+
         # -- Step 8: return success ----------------------------------------
-        summary = f"{action.value} {name}"
+        summary = f"{action.value} {name}{sync_summary}"
+        if pending_revoke:
+            summary += " pending_revoke"
         diff = request.new_string or request.content or ""
         return SkillManageResult(
             success=True, staged=False, pending_id=None,
@@ -748,7 +834,9 @@ class SkillService:
             approved_replay=True,
         )
 
-        result = await self.manage_skill(request)
+        result = await self.manage_skill(
+            request, trusted_write=payload.get("_trusted_write") is True
+        )
 
         if result.success:
             clr = self.pending.clear(pending_id)
@@ -1382,7 +1470,7 @@ class SkillManageToolExecutor(ToolExecutor):
                 absorbed_into=str(args.get("absorbed_into") or ""),
                 approved_replay=False,
             )
-            result = await self.service.manage_skill(manage_request)
+            result = await self.service.manage_skill(manage_request, trusted_write=True)
 
             if result.success or result.staged:
                 return ToolResult(

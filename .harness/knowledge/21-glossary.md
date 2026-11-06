@@ -120,6 +120,8 @@
 - Host Terminal Policy：容器与宿主 Bridge 独立加载的同一份执行授权配置，按命令目标/argv 或 `skill_name + relative_path + SHA-256` 进行 fail-closed 校验；合法 reload 发布不可变快照，非法 reload 保留 last-good 快照。
 - shell 语义（shell semantics）：terminal 工具的状态映射约定。非零退出码表示命令已执行但失败（如 `exit 7`、command-not-found returncode=127），映射为 `SandboxStatus.SUCCESS`；仅命令执行超时映射为 `TIMEOUT`（returncode=124），仅 spawn/write 失败映射为 `ERROR`（returncode=-1）。与 execute_code 的 Python 语义不同（非零退出码在 Python 中为 ERROR）。
 - CanonicalUsage：Domain 值对象（`app/domain/usage.py`），归一化后的 token 五桶（input/output/cache_read/cache_write/reasoning），由 `UsageService.normalize_usage` 从 Provider 原始 usage dict（OpenAI/Anthropic 不同键名）转换而来；`prompt_tokens` = input + cache_read、`total_tokens` = 五桶之和为派生属性。raw_usage 保留原始 dict。
+- 归一化 Token（Tn）：本项目特有的固定权重折算量，`Tn = Ti + 0.2×Tic + 5×To`（Ti 非缓存输入、Tic 缓存读、To 输出；缓存写/推理不参与），先对每次模型尝试按 `int(round(...))` 折算再累加。系数与计算的唯一权威源是 `app/domain/usage.py` 常量与 `compute_normalized_tokens`；观测侧经组合根注入引用、不复制公式，是折算量而非真实 token 数，不代表实际费用（费用以 Usage 账本为准）。
+- 缓存命中率（派生指标）：无独立 ratio instrument，由 PromQL `cache_eligible_read / cache_eligible_prompt` 派生（分母 > 0，无流量不出数据）。cache-eligible 尝试：Anthropic 需 Ti/Tic/Ticw 全部已知（分母 Ti+Tic+Ticw）；OpenAI-compatible 需 Ti/Tic 已知且缓存写不适用（分母 Ti+Tic）；未知 provider 不预设 cache-write-free、不入分母。
 - UsageCost：Domain 值对象（`app/domain/usage.py`），成本估算结果，含 amount_usd（Decimal str）、status（`estimated`/`unknown`）、pricing_version。`estimated` 表示价格表命中，`unknown` 表示未命中且 amount_usd=0。
 - PricingEntry：Domain 值对象（`app/domain/usage.py`），模型定价条目，含 model_pattern、provider、input/output/cache_read/cache_write 各项 cost_per_million（Decimal）、pricing_version、source_url。Infrastructure 的 InMemoryPricingProvider 按 model 前缀最长匹配查表。
 - SessionUsageStats：Domain 值对象（`app/domain/usage.py`），会话级累计统计，对应 sessions 表新增的 token/cost/api_call_count 列。

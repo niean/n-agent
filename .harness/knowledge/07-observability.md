@@ -292,6 +292,7 @@ API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际
 | 项目自定义 | Agent | `nagent.agent.source`、`nagent.agent.run_id`、`nagent.agent.iteration` | string/string/int；本次 Agent 执行来源、真实 AgentRun ID、轮次 | 受信绑定后可随模型/工具子步骤继承；尚无 Agent 归属时省略；不使用 TaskRun 或请求 ID 冒充 |
 | 项目自定义 | Agent | `nagent.agent.end_reason`、`nagent.agent.message_count`、`nagent.agent.inference_calls`、`nagent.agent.tool_calls`、`nagent.agent.usage_known` | string/int/int/int/bool；结束原因、范围内计数与汇总用量已知性 | Agent 完成事实；工具计数仅实际执行，模型计数按请求尝试；不重复叠加 child Agent |
 | 项目自定义 | 模型 | `nagent.model.message_count`、`nagent.model.usage_known` | int/bool；单次模型输入消息数、用量已知性 | 模型事实，不混用 Agent 范围计数 |
+| 项目自定义 | 模型 | `nagent.model.cache_read_tokens`、`nagent.model.cache_write_tokens` | int；单次模型尝试的已知缓存读/写 Token | 仅已知时记录，未知省略不伪造零；缓存写仅 Anthropic 提供 |
 | 项目自定义 | 工具 | `nagent.tool.policy_outcome`、`nagent.tool.risk_level`、`nagent.tool.executed` | string/string/bool；审批状态、风险、是否实际执行 | allow/deny/approved/require_approval 与统一操作结果分开，拒绝时 executed=false |
 | 项目自定义 | 压缩 | `nagent.context.before_tokens`、`nagent.context.after_tokens` | int；压缩前后 Token | 只在实际有此事实时记录 |
 | 项目自定义 | 各操作所属对象 | `nagent.<object>.outcome`、`nagent.<object>.summary`、`nagent.<object>.duration_ms` | string/string/number；操作结果、安全有界完成摘要、耗时 | agent/model/tool/context/task/delegation/schedule/memory/skill/curator/gateway/request/http 各自归属；summary 不是上下文摘要正文，duration 不替代 Span 时间，不作 Metric 维度 |
@@ -390,12 +391,31 @@ AgentRun、TaskRun 和请求分别使用自己的 ID。真实身份由服务端�
 | nagent.agent.runs | Counter/1 | 一次 AgentRun 结束，成功失败均计数 | nagent.agent.source、nagent.agent.end_reason |
 | nagent.context.compression_attempts | Counter/1 | 一次压缩处理结束，成功失败跳过分别标明 | nagent.context.outcome |
 | nagent.budget.denials | Counter/1 | 一次实际预算拒绝 | nagent.budget.kind |
+| nagent.model.cache_read_tokens | Counter/{token} | 一次模型尝试的已知缓存读 Token 增量 | operation/provider/request.model |
+| nagent.model.cache_write_tokens | Counter/{token} | 一次模型尝试的已知缓存写 Token 增量 | operation/provider/request.model |
+| nagent.model.normalized_tokens | Counter/{token} | 一次模型尝试按归一化规则折算的 Token 量（逐尝试折算后累加） | operation/provider/request.model |
+| nagent.model.cache_eligible_prompt_tokens | Counter/{token} | 可判定命中率尝试的完整 prompt 总量（Anthropic 为 Ti+Tic+Ticw，OpenAI-compatible 为 Ti+Tic） | operation/provider/request.model |
+| nagent.model.cache_eligible_read_tokens | Counter/{token} | 上述可判定尝试的缓存读 Tic | operation/provider/request.model |
 
 表中的标准 operation/provider/request.model 分别指 gen_ai.operation.name/gen_ai.provider.name/gen_ai.request.model。gen_ai.token.modality 仅用于两项 Token Counter。九个 gen_ai instrument 沿用仓库锁定草案契约；Prometheus 实际名称及后端实测依据见 `docker/observability/metric-name-mapping.md`。
+
+五个缓存与归一化 instrument 仅设 Counter，用于累计与速率观察，无单次测量分布需求，不设 Histogram；维度复用 operation/provider/request.model 三维，不新增高基数维度。缓存命中率为派生定义，等于缓存读速率除以可判定 prompt 总量速率（PromQL 速率比值），不建比率 instrument；分母为零或无流量时结果为空，不补零。缓存写仅 Anthropic 提供，OpenAI-compatible 协议无此概念，不适用即保持未知，不伪造。
 
 Counter 记录累计增量，Histogram 记录单次测量及其分布。模型重试逐次测量，未知 Token 保持未知；一次 AgentRun 结束计一次运行，一次压缩处理结束计一次尝试，一次实际预算拒绝计一次拒绝。Agent 汇总只统计自身范围，工具准入拒绝时 executed=false，工具执行数不增加。业务费用仍以 Usage 账本为准。
 
 维度沿用属性名，落 Prometheus 后转换为 nagent_agent_source、nagent_agent_end_reason、nagent_context_outcome、nagent_budget_kind 等标签。Grafana Source 只筛选 Agent 运行相关面板；模型、工具和 Token 面板保持服务级。Source All 使用 `.*`，选定来源按 nagent_agent_source 筛选。平均调用次数使用 histogram 的 _sum/_count，零调用运行保留在分母中；exemplar 单次测量与 p95/p99 分位数分别解释。外链保留反向代理子路径和筛选条件。
+
+### 归一化 Token
+
+归一化 Token 是本项目特有的固定权重折算量：Tn = Ti + 0.2×Tic + 5×To，其中 Ti 为非缓存输入、Tic 为缓存读、To 为输出。系数与计算的唯一权威源是 `app/domain/usage.py` 的 NORMALIZED_TOKEN_INPUT_COEFFICIENT、NORMALIZED_TOKEN_CACHE_READ_COEFFICIENT、NORMALIZED_TOKEN_OUTPUT_COEFFICIENT 常量与 compute_normalized_tokens 函数，观测侧引用 Domain 计算，不复制公式。归一化 Token 是折算量，不是真实 token 数，也不代表不同模型或 Provider 的实际价格、账单或节省费用；业务费用仍以 Usage 账本为准。
+
+逐次尝试折算后累加：每次模型尝试先按 int(round(Ti + 0.2×Tic + 5×To)) 得整数，再由 Counter 累加。多次尝试的累加结果可能不等于对汇总桶折算后舍入，面板不得用汇总公式替代 Counter。分项未知不折算不伪造：Ti、Tic、To 三项全部已知才记录 nagent.model.normalized_tokens；缓存写 Ticw 不参与公式，其未知不阻断计算。
+
+缓存命中率分母口径：Anthropic 需 Ti、Tic、Ticw 全部已知，分母为 Ti+Tic+Ticw；OpenAI-compatible 需 Ti、Tic 已知且缓存写明确不适用，分母为 Ti+Tic，退化为 cached/prompt_tokens 口径。其它缺失桶不据此推断为零；不满足可判定条件的尝试仍记录各自已知桶，但不进入两个命中率支撑 Counter。
+
+Ti 语义修正：自 2026-11-05 部署起，gen_ai.usage.input_tokens 与既有 input Counter/Histogram 的测量值统一为非缓存输入 Ti，OpenAI 侧由 prompt_tokens（含缓存命中）修正为 prompt_tokens - cached_tokens，Anthropic 侧语义不变。此为对既有 instrument 的语义修正，历史数据不回补；混合新旧版本或跨切换时间的速率窗口不解释为统一 Ti。Usage 账本五桶口径不受影响。
+
+命名决定：新增 instrument 使用项目命名 nagent.model.cache_read_tokens、nagent.model.cache_write_tokens、nagent.model.normalized_tokens、nagent.model.cache_eligible_prompt_tokens、nagent.model.cache_eligible_read_tokens，缓存 span 属性使用前两个同名键。它们是项目扩展，不宣称为 OTel 标准；既有 gen_ai instrument 沿用仓库锁定草案契约，不随本次升级 semconv。
 
 ### 内容与出口
 
@@ -455,6 +475,8 @@ Policy 的 AgentRun 和会话身份取自受信执行快照。领域审计事件
 | Collector / Grafana | 按同一字段协议整理、存储、查询和展示；N-KB 使用自己的服务身份和独立投影分支 |
 
 Application 采集使用 OTel API，SDK 与导出器位于 Infrastructure，Domain 不依赖 OTel。入口先保存可信事实，SDK 写属性、日志或导出失败时隔离故障，业务输入输出、异常、取消和数据流消费保持原样。
+
+HTTP 收尾的脱敏同样不得阻塞事件循环：凭据字段和 URL 规则从完整词元边界开始匹配，避免对长正文逐后缀回溯；回归测试使用独立进程限时验证长普通文本、重复凭据词和长 URL scheme。multipart 先分离文件元信息与文本字段，文件正文不进入文本脱敏器；截断或未读完的文本字段仍单独执行前缀脱敏。制品 E2E 在 inline 与 multipart 超限拒绝后以有超时的健康检查验证服务仍能处理后续请求。
 
 观测开关、采样、导出地址和详情上限在启动时由环境变量配置；Dashboard 外链可运行时修改。Trace 使用 ParentBased + 比例采样，继承父级决定；Log/Metric 不随 Trace 未采样而丢弃。初始化与释放幂等，队列、基数、重试及 flush/shutdown 有明确预算。
 

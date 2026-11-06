@@ -605,11 +605,30 @@ class TestSnapshot:
         assert snap["sample_ratio"] == 1.0
         assert snap["semconv_version"] == ts.SEMCONV_VERSION
         names = [i["name"] for i in snap["instruments"]]
-        assert len(names) == 12
+        assert len(names) == 17
         assert "gen_ai.client.inference.duration" in names
         assert "nagent.agent.runs" in names
+        assert "nagent.model.normalized_tokens" in names
 
     def test_span_buffer_bounds_and_caps(self):
+        # Self-contained wiring: the ring-buffer allowlist is a process-global
+        # set by the composition root; this test must not depend on another
+        # test file having configured it first.
+        from app.application.telemetry_contract import (
+            CONTENT_ATTRIBUTE_KEYS, EXECUTION_ATTRIBUTE_KEYS,
+        )
+        from app.infrastructure.observability import setup as obs_setup
+
+        previous_allowlist = obs_setup._RING_BUFFER_ALLOWED_ATTR_KEYS
+        obs_setup.configure_ring_buffer_attributes(
+            EXECUTION_ATTRIBUTE_KEYS - CONTENT_ATTRIBUTE_KEYS
+        )
+        try:
+            self._run_span_buffer_bounds_and_caps()
+        finally:
+            obs_setup.configure_ring_buffer_attributes(previous_allowlist)
+
+    def _run_span_buffer_bounds_and_caps(self):
         loader = make_enabled_loader()
         handle = make_handle(
             loader, otel_exporter_otlp_endpoint="http://otel-collector:4317"
@@ -932,7 +951,7 @@ assert {item["name"]: (item["kind"], item["unit"], item["allowed_dimensions"])
         for item in snap["instruments"]} == {
             name: (instrument.kind, instrument.unit, list(instrument.allowed_dimensions))
             for name, instrument in ts.INSTRUMENTS.items()}, snap["instruments"]
-assert len(snap["instruments"]) == 12
+assert len(snap["instruments"]) == 17
 child, parent = snap["spans"]
 assert child["trace_id"] == parent["trace_id"]
 assert child["parent_span_id"] == parent["span_id"]

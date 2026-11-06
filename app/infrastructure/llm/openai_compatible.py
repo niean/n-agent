@@ -25,7 +25,9 @@ _INTERNAL_OPTION_KEYS = {
 from app.infrastructure.llm.telemetry_hook import (
     NOOP_CHAT_ATTEMPT as _NOOP_CHAT_ATTEMPT,
 )
-from app.infrastructure.llm.telemetry_hook import ProviderTelemetryCallback, optional_hook
+from app.infrastructure.llm.telemetry_hook import (
+    ProviderTelemetryCallback, optional_hook, validated_count,
+)
 
 
 class OpenAICompatibleProvider:
@@ -125,10 +127,7 @@ class OpenAICompatibleProvider:
             )
             attempt.set_finish_reasons(choice.finish_reason or "stop")
             if usage is not None:
-                attempt.set_usage(
-                    getattr(usage, "prompt_tokens", None),
-                    getattr(usage, "completion_tokens", None),
-                )
+                _report_openai_usage(attempt, usage)
             normalized_message = _message_to_dict(message)
             optional_hook(attempt, "set_output", normalized_message)
             return LLMResult(
@@ -147,14 +146,13 @@ class OpenAICompatibleProvider:
             try:
                 stream = await self.client.chat.completions.create(**kwargs)
                 async for chunk in stream:
-                    # usage-only final chunk: empty choices, usage payload
+                    # usage may arrive on the usage-only final chunk (empty
+                    # choices) or ride along a normal chunk; extract it first,
+                    # then keep processing this chunk's choices as usual.
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        _report_openai_usage(attempt, usage)
                     if not chunk.choices:
-                        usage = getattr(chunk, "usage", None)
-                        if usage is not None:
-                            attempt.set_usage(
-                                getattr(usage, "prompt_tokens", None),
-                                getattr(usage, "completion_tokens", None),
-                            )
                         continue
                     choice = chunk.choices[0]
                     delta = choice.delta
@@ -183,6 +181,49 @@ class OpenAICompatibleProvider:
 
 def _provider_options(options: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in options.items() if key not in _INTERNAL_OPTION_KEYS}
+
+
+def _extract_openai_usage(usage: Any) -> tuple[Any, Any, Any]:
+    """Split OpenAI-compatible usage into (ti, to, tic); cache-write is not
+    applicable in this protocol and is never reported.
+
+    Ti (non-cached input) is only computed when both prompt_tokens and
+    cached_tokens are valid known ints with cached <= prompt; a missing
+    cached_tokens leaves the input unknown (never prompt-as-Ti, never
+    0-subtraction), and cached > prompt invalidates both (no truncation
+    cover-up). An independently valid cached_tokens with an unusable prompt
+    still reports the cache read. Output validity is judged on its own.
+    """
+    prompt = _get(usage, "prompt_tokens")
+    completion = _get(usage, "completion_tokens")
+    details = _get(usage, "prompt_tokens_details")
+    cached = _get(details, "cached_tokens") if details is not None else None
+    ti: Any = None
+    tic: Any = None
+    prompt_valid = validated_count(prompt)
+    cached_valid = validated_count(cached)
+    if prompt_valid and cached_valid:
+        if cached <= prompt:
+            ti, tic = prompt - cached, cached
+    elif cached_valid:
+        tic = cached
+    return ti, (completion if validated_count(completion) else None), tic
+
+
+def _report_openai_usage(attempt: Any, usage: Any) -> None:
+    """Observability-only reporting: extraction or hook failures must never
+    change the business result (isolated here, not via __exit__ alone)."""
+    try:
+        ti, to, tic = _extract_openai_usage(usage)
+        optional_hook(attempt, "set_usage", ti, to)
+        if tic is not None:
+            # cache_write is explicitly None: in this protocol it is
+            # inapplicable (not merely unknown), which keeps the derived
+            # cache-hit-rate denominator decidable from Ti + Tic.
+            optional_hook(attempt, "set_cache_usage",
+                          cache_read_tokens=tic, cache_write_tokens=None)
+    except Exception:
+        pass
 
 
 def _message_to_dict(message: Any) -> dict[str, Any]:

@@ -94,19 +94,22 @@
         - 飞书：支持群聊模式。包括投递定时任务的结果到飞书群，群里@机器人后N-Agent自动发现群ID、并放到飞书IM信道的选择列表中（FE布局较差，记录TODO将来修复）
     - 定时任务：通过自带对话框信道、增删改定时任，当前只支持飞书IM信道、未支持自带对话框
     - 技能：修复健康状态。photo-and-upload，健康状态显示archived，不符合预期
-    - 观测：Metric，补全读缓存Token、写缓存Token、缓存命中率、归一化Token等指标。先按照业界规范、定义观测语义，然后再补全埋点统计，最后加到Grafana大盘。归一化Token是本项目特有的定义，应该有一个计算规则，提取出来、做成观测语义契约
-        - 文档：新增契约，更新到 locals/blog/design-agent-observability.md
+    - 观测：Metric补全缓存Token，包括读/写缓存Token、缓存命中率、归一化Token等指标。先按照业界规范、定义观测语义，然后再补全埋点统计，最后加到Grafana大盘。归一化Token是本项目特有的定义，应该有一个计算规则，提取出来、做成观测语义契约
+        - 迭代：新增的Token指标契约，更新到 locals/blog/design-agent-observability.md
 
+[20261106]
+- FR
+    - 任务：spanid=96337564aa1678d7，任务失败愿意`judge returned unparseable result`，但有效工作是达成的。帮优化judge result
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - FR
-    - 技能：新增wake-codex技能操作不便，先遇到skill注册问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新问题(需要改配置文件host-terminal-policy.yaml、没有Dashboard操作入口)
+    - 技能：新增wake-codex技能操作不便，先遇到skill注册不自动问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新不自动问题(需要改配置文件host-terminal-policy.yaml、没有Dashboard操作入口)
     - 观测：Prifile，当前按服务和进程采样，使用 py-spy → Pyroscope；尚未接入 OTel Profiles
     - 观测：引入Langfuse，尽量复用OTel组件(如Collector)；现有的OTel能力全部留下、跟Langfuse并存
-    - 评测：增加evaluate能力
+    - 评测：增加 evaluate 能力
     - 评测：E2E测试中Agent相关的，是否能转为评测的一部分
     - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离
