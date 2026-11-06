@@ -228,6 +228,7 @@ class SkillService:
         self.backup_enabled = backup_enabled
         self.format_validator = format_validator
         self.last_auto_refresh_error: str | None = None
+        self.last_auto_sync_error: str | None = None
         self.auto_refresh = auto_refresh
         self.host_script_grants = host_script_grants
         self._mutation_lock = asyncio.Lock()
@@ -329,21 +330,22 @@ class SkillService:
 
     async def run_auto_refresh(self, interval_seconds: float = 5) -> None:
         while True:
-            error = None
             try:
                 await self.scan_now()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                error = "scan_failed"
+                # scan_now records the failure while holding the mutation lock.
+                # Revocation retries must continue even when scanning is broken.
+                pass
+            self.last_auto_sync_error = None
             if self.host_script_grants is not None:
                 try:
                     await self.host_script_grants.sync()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    error = error or "pending_sync"
-            self.last_auto_refresh_error = error
+                    self.last_auto_sync_error = "pending_sync"
             await asyncio.sleep(interval_seconds)
 
     async def _scan_unlocked(self) -> SkillScanReport:
@@ -729,7 +731,15 @@ class SkillService:
                     name, request.file_path if action == SkillWriteAction.REMOVE_FILE else None
                 )
             except Exception:
-                pending_revoke = True
+                # A bridge outage is represented by False only after the
+                # service durably stores pending_revoke. Unexpected failures
+                # cannot promise a retry, even though removal already happened.
+                return SkillManageResult(
+                    success=False, staged=False, pending_id=None,
+                    skill_name=name, action=action,
+                    summary=f"{action.value} {name} completed; revocation_failed",
+                    diff=None, error="revocation_persistence_failed",
+                )
 
         # -- Step 7: update usage ------------------------------------------
         if action == SkillWriteAction.CREATE:

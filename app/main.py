@@ -964,6 +964,8 @@ def build_application_services(
         host_terminal_executor,
         memory_store,
         host_terminal_health_reason,
+        script_grant_service=skill_service.host_script_grants,
+        skill_service=skill_service,
     )
 
     # Plugin 装配

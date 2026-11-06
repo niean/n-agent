@@ -1,7 +1,7 @@
-"""Read-only Dashboard views for the host_terminal executor.
+"""Dashboard views and automatic script grant revocation for host_terminal.
 
 Aggregates the policy loader, tool executor health and tool_call history into
-stable, desensitized view objects. No write operations.
+stable, desensitized view objects.
 
 The service only reads published attributes of its dependencies:
 - HostTerminalPolicySnapshotProvider.snapshot / last_error_code
@@ -147,11 +147,33 @@ def datetime_min_sentinel():
 
 
 class HostTerminalDashboardService:
-    def __init__(self, policy_loader, tool_executor, memory_store, unavailable_reason):
+    def __init__(self, policy_loader, tool_executor, memory_store, unavailable_reason,
+                 script_grant_service=None, skill_service=None):
         self._policy_loader = policy_loader
         self._tool_executor = tool_executor
         self._memory_store = memory_store
         self._unavailable_reason = unavailable_reason
+        self._script_grant_service = script_grant_service
+        self._skill_service = skill_service
+
+    def _grant_diagnostics(self):
+        return {
+            "scan_error": getattr(self._skill_service, "last_auto_refresh_error", None),
+            "sync_error": getattr(self._skill_service, "last_auto_sync_error", None),
+        }
+
+    async def list_script_grants(self) -> dict[str, Any]:
+        grants = (await self._script_grant_service.list_grants()
+                  if self._script_grant_service is not None else [])
+        return {"enabled": self._script_grant_service is not None,
+                "grants": [{**grant, "revision": str(grant["revision"])} for grant in grants],
+                **self._grant_diagnostics()}
+
+    async def revoke_script_grant(self, revision: int) -> dict[str, Any]:
+        if self._script_grant_service is None:
+            raise ValueError("host_script_grants_disabled")
+        result = await self._script_grant_service.revoke(revision)
+        return {**result, "revision": str(result["revision"])}
 
     @property
     def _snapshot(self):
@@ -159,6 +181,7 @@ class HostTerminalDashboardService:
 
     async def get_status(self) -> dict[str, Any]:
         snapshot = self._snapshot
+        diagnostics = self._grant_diagnostics() if self._skill_service is not None else {}
         last_error = (
             self._policy_loader.last_error_code if self._policy_loader is not None else None
         )
@@ -171,10 +194,12 @@ class HostTerminalDashboardService:
                 "policy_content_digest": None,
                 "policy_last_error": last_error,
                 "limits_summary": None,
+                **diagnostics,
             }
         limits = snapshot.limits
         return {
             "enabled": True,
+            **diagnostics,
             "health_code": self._tool_executor.last_health_code,
             "policy_version": snapshot.version,
             "policy_loaded_at": snapshot.loaded_at.isoformat() if snapshot.loaded_at else None,

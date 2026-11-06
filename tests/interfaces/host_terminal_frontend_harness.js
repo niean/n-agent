@@ -1,8 +1,8 @@
 // Node behavior harness for app/interfaces/http/static/host.js
 // No external deps. Mocks DOM + NAGENT.ui/api just enough to exercise load()
-// and assert: 3 panels when enabled, unavailable placeholder when enabled:false,
+// and assert: 4 panels when enabled, unavailable placeholder when enabled:false,
 // status failure shows version-mismatch error (not "未启用"), per-panel error
-// isolation, and no write-operation buttons.
+// isolation, and confirmed grant revocation.
 // Usage: node tests/interfaces/host_terminal_frontend_harness.js
 const fs = require('fs');
 const path = require('path');
@@ -18,7 +18,7 @@ function makeEl(tag) {
     appendChild(n) { this.children.push(n); return n; },
     append(...ns) { ns.forEach((n) => this.children.push(n)); },
     replaceChildren() { this.children = []; },
-    addEventListener() {},
+    addEventListener(name, fn) { (this.events || (this.events = {}))[name] = fn; },
     removeEventListener() {},
     querySelector(sel) {
       const cls = sel.replace(/^\./, '');
@@ -56,21 +56,23 @@ function makeUi(dom) {
   };
 }
 
-function makeApi({ status, policy, history, statusReject }) {
+function makeApi({ status, policy, history, statusReject, grants, grantsReject, revoke }) {
   return {
     host: {
       getStatus: () => (statusReject ? Promise.reject(new Error('request_failed')) : Promise.resolve(status)),
       getPolicy: () => Promise.resolve(policy),
       listHistory: () => Promise.resolve(history),
+      listScriptGrants: () => grantsReject ? Promise.reject(new Error('grants_offline')) : Promise.resolve(grants || {enabled:true, grants:[]}),
+      revokeScriptGrant: revoke || (() => Promise.resolve({success:true})),
     },
   };
 }
 
-function loadHost(api, ui, dom) {
+function loadHost(api, ui, dom, modal) {
   const sandbox = {
     window: {},
     document: dom,
-    NAGENT: { ui, api },
+    NAGENT: { ui, api, modal },
     Promise,
     Date,
     isNaN,
@@ -120,7 +122,7 @@ async function run() {
   let dom = makeDom('tab-executors-host');
   let host = loadHost(makeApi({ status: enabledStatus, policy: enabledPolicy, history: [] }), makeUi(dom), dom);
   await host.load();
-  assert(dom.root.children.length === 3, 'enabled 时渲染 3 个面板，实际 ' + dom.root.children.length);
+  assert(dom.root.children.length === 4, 'enabled 时渲染 4 个面板，实际 ' + dom.root.children.length);
   const titles = dom.root.children.map((c) => c.children[0] && c.children[0].children[0] && c.children[0].children[0].textContent);
   assert(titles.indexOf('执行器状态') >= 0 && titles.indexOf('授权策略') >= 0 && titles.indexOf('执行历史') >= 0, '三个面板标题正确: ' + JSON.stringify(titles));
 
@@ -143,10 +145,68 @@ async function run() {
   dom = makeDom('tab-executors-host');
   host = loadHost(makeApi({ status: null, policy: enabledPolicy, history: [], statusReject: true }), makeUi(dom), dom);
   await host.load();
-  assert(dom.root.children.length === 3, 'status 失败仍渲染 3 面板，实际 ' + dom.root.children.length);
+  assert(dom.root.children.length === 4, 'status 失败仍渲染 4 面板，实际 ' + dom.root.children.length);
   const statusPanelText = collectText(dom.root.children[0]);
   assert(statusPanelText.indexOf('未启用') < 0, 'status 失败不误报未启用');
   assert(statusPanelText.indexOf('部署版本') >= 0 || statusPanelText.indexOf('加载状态失败') >= 0, 'status 失败显示版本不匹配/加载失败');
+
+
+  // Grant actions exercise actual event handlers, including precision and failure persistence.
+  function findButton(el, label) {
+    if (el.tag === 'button' && el.textContent === label) return el;
+    for (const child of el.children) { const found = findButton(child, label); if (found) return found; }
+    return null;
+  }
+  let confirmed = false, revokes = [], alerts = [];
+  const row = {revision:'9007199254740993', skill_name:'demo', script_relative_path:'scripts/run.py', sha256:'a'.repeat(64), origin:'foreground', updated_at:'2026-11-06T00:00:00Z', state:'stale', error:'hash_mismatch'};
+  dom = makeDom('tab-executors-host');
+  host = loadHost(makeApi({status:enabledStatus, policy:enabledPolicy, history:[], grants:{enabled:true,grants:[row]}, revoke:async (id) => {revokes.push(id); return {success:false,state:'pending_revoke',error:'pending_sync'};}}), makeUi(dom), dom, {confirm:async()=>confirmed,alert:async(m)=>alerts.push(m)});
+  await host.load();
+  let button = findButton(dom.root, '撤销');
+  assert(!!button, '授权行有撤销按钮');
+  assert(collectText(dom.root).includes('foreground') && collectText(dom.root).includes('hash_mismatch') && collectText(dom.root).includes('2026-11-06 08:00:00'), '授权显示来源、错误与 UTC+8 时间');
+  if (button) {
+    await button.events.click();
+    assert(revokes.length === 0, '取消确认不撤销');
+    confirmed = true;
+    await button.events.click();
+    assert(revokes[0] === row.revision, '确认撤销保留大 revision 字符串精度');
+    assert(alerts[0].includes('pending_sync'), '待撤销错误调用共享 alert');
+    assert(collectText(dom.root).includes('pending_revoke') && collectText(dom.root).includes('pending_sync'), '刷新列表后保留待撤销状态与错误');
+  }
+  dom = makeDom('tab-executors-host');
+  let releaseRevoke;
+  host = loadHost(makeApi({status:enabledStatus,policy:enabledPolicy,history:[],grants:{enabled:true,grants:[row]},revoke:()=>new Promise((resolve,reject)=>{releaseRevoke=reject;})}),makeUi(dom),dom,{confirm:async()=>true,alert:async(m)=>alerts.push(m)});
+  await host.load();
+  button = findButton(dom.root, '撤销');
+  const pendingClick = button.events.click();
+  await new Promise(setImmediate);
+  assert(button.disabled === true, '撤销请求期间禁用按钮');
+  releaseRevoke(new Error('host_script_grants_stale_revision'));
+  await pendingClick;
+  assert(collectText(dom.root).includes('host_script_grants_stale_revision'), '旧 revision 错误刷新后仍可见');
+  dom = makeDom('tab-executors-host');
+  host = loadHost(makeApi({status:enabledStatus,policy:enabledPolicy,history:[],grants:{enabled:true,grants:[{...row,state:'prepared'}]}}),makeUi(dom),dom);
+  await host.load();
+  assert(!findButton(dom.root, '撤销'), 'prepared 意图不可撤销');
+  dom = makeDom('tab-executors-host');
+  host = loadHost(makeApi({status:enabledStatus,policy:enabledPolicy,history:[],grantsReject:true}),makeUi(dom),dom);
+  await host.load();
+  assert(collectText(dom.root.children[0]).includes('ok') && collectText(dom.root).includes('grants_offline'), '授权列表错误不影响状态面板');
+
+  dom = makeDom('tab-executors-host');
+  let grantReads = 0;
+  alerts = [];
+  const reloadApi = makeApi({status:enabledStatus,policy:enabledPolicy,history:[]});
+  reloadApi.host.listScriptGrants = async () => {
+    if (grantReads++) throw new Error('reload_offline');
+    return {enabled:true,grants:[row]};
+  };
+  host = loadHost(reloadApi,makeUi(dom),dom,{confirm:async()=>true,alert:async(m)=>alerts.push(m)});
+  await host.load();
+  await findButton(dom.root, '撤销').events.click();
+  assert(alerts.some((message)=>message.includes('reload_offline')), '撤销后重新加载失败调用共享 alert');
+  assert(collectText(dom.root).includes('reload_offline'), '撤销后重新加载失败保留行内错误');
 
   if (failures) { console.error(`\n${failures} assertion(s) failed`); process.exit(1); }
   console.log('\nall host frontend harness assertions passed');

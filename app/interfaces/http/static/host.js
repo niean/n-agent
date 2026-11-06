@@ -60,11 +60,13 @@
     const statusPanel = buildPanel('执行器状态', 'host-status-card');
     const policyPanel = buildPanel('授权策略', 'host-policy-card');
     const historyPanel = buildPanel('执行历史', 'host-history-card');
-    node.append(statusPanel, policyPanel, historyPanel);
+    const grantsPanel = buildPanel('自动脚本授权', 'host-grants-card');
+    node.append(statusPanel, policyPanel, historyPanel, grantsPanel);
     ui.renderLoading(statusPanel.querySelector('.panel-body'), '加载状态...');
     ui.renderLoading(policyPanel.querySelector('.panel-body'), '加载策略...');
     ui.renderLoading(historyPanel.querySelector('.panel-body'), '加载历史...');
     return {
+      grants: grantsPanel.querySelector('.panel-body'),
       status: statusPanel.querySelector('.panel-body'),
       policy: policyPanel.querySelector('.panel-body'),
       history: historyPanel.querySelector('.panel-body'),
@@ -101,6 +103,8 @@
       ['加载时间', formatTime(status.policy_loaded_at)],
       ['内容摘要', status.policy_content_digest || '-'],
       ['加载错误', status.policy_last_error || '-'],
+      ['自动扫描错误', status.scan_error || '-'],
+      ['自动同步错误', status.sync_error || '-'],
     ];
     rows.forEach(([k, v]) => grid.appendChild(policyItem(k, v)));
     if (status.limits_summary) {
@@ -226,8 +230,65 @@
     const close2 = document.createElement('button'); close2.type = 'button'; close2.className = 'btn'; close2.textContent = '关闭'; close2.addEventListener('click', () => backdrop.remove());
     actions.appendChild(close2); form.appendChild(actions);
     dialog.appendChild(form); backdrop.appendChild(dialog);
-    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
     document.body.appendChild(backdrop); closeBtn.focus();
+  }
+
+  function renderGrants(node, data, feedback) {
+    ui.clear(node);
+    const explanation = document.createElement('p');
+    explanation.textContent = 'N-Agent 受控写入的脚本自动授权；外部文件变更不会自动获得信任。撤销自动授权后，显式 YAML 精确规则仍可授权。';
+    node.appendChild(explanation);
+    if (feedback) node.appendChild(policyItem('撤销结果', feedback));
+    if (data.scan_error) node.appendChild(policyItem('扫描错误', data.scan_error));
+    if (data.sync_error) node.appendChild(policyItem('同步错误', data.sync_error));
+    if (!data.enabled) { node.appendChild(policyItem('状态', '自动授权未启用')); return; }
+    const table = renderRulesTable('授权记录', ['Skill', '脚本', '来源', 'SHA256', '更新时间', '状态', '错误', '操作'], [], '无自动脚本授权');
+    const tbody = table.children[1].children[1];
+    if ((data.grants || []).length) tbody.replaceChildren();
+    (data.grants || []).forEach((grant) => {
+      const row = document.createElement('tr');
+      appendCell(row, grant.skill_name);
+      appendCell(row, grant.script_relative_path);
+      appendCell(row, grant.origin);
+      const hash = appendCell(row, grant.sha256 ? grant.sha256.slice(0, 12) + '…' : '-');
+      hash.setAttribute('title', grant.sha256 || '');
+      appendCell(row, formatTime(grant.updated_at));
+      appendCell(row, grant.state);
+      appendCell(row, grant.error);
+      const actions = document.createElement('td');
+      if (['pending', 'active', 'stale', 'pending_revoke'].includes(grant.state)) {
+        const button = document.createElement('button');
+        button.type = 'button'; button.className = 'btn btn--danger'; button.textContent = '撤销';
+        button.style.fontSize = 'var(--font-size-md)';
+        button.addEventListener('click', async () => {
+          if (button.disabled) return;
+          button.disabled = true;
+          let feedback = null;
+          try {
+            if (!(await namespace.modal.confirm(`确认撤销 ${grant.skill_name}/${grant.script_relative_path} 的自动授权？`))) return;
+            const result = await hostApi().revokeScriptGrant(grant.revision);
+            if (!result.success) {
+              feedback = `${result.state || 'pending_revoke'}: ${result.error || 'pending_sync'}`;
+              await namespace.modal.alert('撤销尚未完成：' + feedback);
+            }
+          } catch (error) {
+            feedback = error && error.message ? error.message : String(error);
+            await namespace.modal.alert('撤销失败：' + feedback);
+          } finally {
+            button.disabled = false;
+          }
+          try { renderGrants(node, await hostApi().listScriptGrants(), feedback); }
+          catch (error) {
+            const reloadError = '加载授权失败：' + (error && error.message ? error.message : String(error));
+            renderGrants(node, data, feedback ? feedback + '；' + reloadError : reloadError);
+            await namespace.modal.alert(reloadError);
+          }
+        });
+        actions.appendChild(button);
+      }
+      row.appendChild(actions); tbody.appendChild(row);
+    });
+    node.appendChild(table);
   }
 
   async function load() {
@@ -240,6 +301,7 @@
       host.getStatus(),
       host.getPolicy(),
       host.listHistory(),
+      host.listScriptGrants(),
     ]);
     const statusRes = results[0];
     // Only an explicit enabled:false shows the full-page unavailable placeholder.
@@ -254,6 +316,7 @@
     renderResult(panels.status, statusRes, renderStatus, '加载状态失败（部署版本可能不匹配）: ');
     renderResult(panels.policy, results[1], renderPolicy, '加载策略失败: ');
     renderResult(panels.history, results[2], renderHistory, '加载历史失败: ');
+    renderResult(panels.grants, results[3], renderGrants, '加载授权失败: ');
   }
 
   namespace.host = { init: load, refresh: load, load: load };

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 17 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 17 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -467,3 +467,13 @@ GET /chat/gateways/feishu/sessions 保留原分页包裹及字段，增加 deliv
 新 feishu context 作为认领快照，运行时按已保存原行重新核验平台、地址、类型与在线状态，不重选代表、不受 home 覆盖；校验、授权、信息流释放任一步失败都不发送，不改变已完成的执行记录。
 
 Config Bundle 保存完整目标，但导入忽略源实例内部 ID，按目标实例可信平台、地址、类型精确重绑定；不迁移 Gateway 运行身份。每次导入在任何段写入前冻结本机 home/ORIGIN 证据到本次 _ImportContext，预解析及 ScheduleService 写入前二次重绑复用同一不可变映射，空映射不回读 live evidence。merge 先跳过，dry-run 同样解析但不写入；无法匹配或证据读取失败按相关 feishu 条目失败并给入站修复指引，其他段继续，保持原退出码。失败不创建孤儿 session、不半覆盖原任务；离线配置迁移不构造外部客户端。
+
+## 受控脚本授权存储边界
+
+应用 SQLite 的 host_script_intents 保存 revision 主键、skill_name、script_relative_path、sha256、origin、updated_at、state、error。状态为 prepared/pending/active/pending_revoke/revoked；展示只取每脚本最新非 prepared 记录，没有时才展示 prepared，避免失败写入隐藏旧的可撤销授权。prepared 不自动授权；状态更新按 revision 和原状态 CAS。新受控写入的 revision 取 UTC 微秒、本机最大值加一、宿主该身份最大值加一的最大值；旧意图重试不重新分配版本。
+
+HostScriptGrant 的 origin 仅为 foreground/background_review，脚本必须是规范 scripts/*.py 路径，授权绑定精确 SHA-256。宿主默认将最新授权及 tombstone 写到 host-terminal-runtime/snapshots-script-grants/grants.json，目录 0700、文件 0600、当前用户所有，使用目录 fd、NOFOLLOW、非阻塞读取后验证普通文件、锁、原子替换和 fsync；拒绝模型可写目录重叠。损坏文件只关闭自动授权，仍可按 YAML 手工授权执行。
+
+POST /v1/script-grants 使用现有宿主 token、请求体大小和读取期限，operation 为 list/grant/revoke，grant 为严格结构或 list 时 null；响应为 grants 和 error_code。grant 由宿主重新读取脚本核对哈希，同 revision 幂等，旧 revision 不覆盖新状态，同 revision 撤销后不能恢复。撤销失败仅在意图已持久化时报告 pending_revoke 并重试；数据库持久化失败使当前请求失败，明确文件移除可能已完成。
+
+Config Bundle 不导出 host_script_intents、宿主授权文件、Policy 或 token，也不从导入 Skill 标签重建权限。Dashboard revision 以十进制字符串传输，避免浏览器整数精度损失；界面状态 stale 是 active 授权与当前扫描或文件哈希不一致的投影，不会自动刷新授权。

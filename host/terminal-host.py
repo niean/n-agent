@@ -11,13 +11,103 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
+import stat
 import subprocess
 import sys
 import time
 import urllib.request
+import urllib.error
 
 REPO = Path(__file__).resolve().parents[1]
 MODULE = "app.infrastructure.host_terminal.bridge_server"
+
+
+def _script_grants_supported(opener, port: str, token_path: Path) -> bool:
+    """Probe the authenticated protocol without executing a host command."""
+    try:
+        fd = os.open(token_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as token_file:
+            metadata = os.fstat(token_file.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & ~0o600
+            ):
+                raise ValueError("invalid host terminal token permissions")
+            raw_token = token_file.read(4097)
+        token = raw_token.removesuffix(b"\n").decode("utf-8")
+        if not 32 <= len(raw_token) <= 4096 or "\n" in token or "\r" in token:
+            raise ValueError("invalid host terminal token")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/script-grants",
+            data=b'{"operation":"list","grant":null}',
+            headers={"Content-Type": "application/json", "X-N-Agent-Host-Token": token},
+            method="POST",
+        )
+        try:
+            with opener.open(request, timeout=2) as response:
+                body, status = response.read(1048577), 200
+        except urllib.error.HTTPError as error:
+            try:
+                if error.code == 404:
+                    return False
+                body, status = error.read(1048577), error.code
+            finally:
+                error.close()
+        if len(body) > 1048576:
+            raise ValueError("host terminal protocol response is too large")
+        payload = json.loads(body)
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"grants", "error_code"}
+            or not isinstance(payload["grants"], list)
+            or not (
+                (status == 200 and payload["error_code"] is None)
+                or (status == 503 and payload["error_code"] == "host_script_grants_unavailable")
+            )
+        ):
+            raise ValueError("host terminal protocol probe failed")
+        return True
+    except (OSError, UnicodeError, ValueError, RecursionError) as error:
+        raise ValueError("host terminal authorization protocol probe failed") from error
+
+
+def _managed_bridge(pid: int, port: str) -> bool:
+    process = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True,
+    )
+    words = process.stdout.split()
+    return any(
+        words[index:index + 2] == ["-m", MODULE]
+        for index in range(len(words) - 1)
+    ) and any(
+        words[index:index + 2] == ["--port", port]
+        for index in range(len(words) - 1)
+    )
+
+
+def _stop_legacy_bridge(pid: int, port: str) -> None:
+    if not _managed_bridge(pid, port):
+        raise ValueError("refusing to stop an unmanaged host terminal process")
+    try:
+        # SIGINT unwinds the old server's finally block and cleans up its children.
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not _managed_bridge(pid, port):
+            return
+        time.sleep(0.1)
+    if _managed_bridge(pid, port):
+        os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not _managed_bridge(pid, port):
+            return
+        time.sleep(0.1)
+    raise ValueError("legacy host terminal bridge did not stop")
 
 
 def main() -> int:
@@ -78,12 +168,18 @@ def main() -> int:
         if pid_file.exists():
             pid = pid_file.read_text().strip()
             if pid.isdigit():
-                process = subprocess.run(["ps", "-p", pid, "-o", "command="], capture_output=True, text=True)
-                if MODULE in process.stdout and f"--port {port}" in process.stdout:
+                if _managed_bridge(int(pid), port):
                     if not healthy():
                         raise ValueError("existing host terminal bridge is unhealthy; inspect bridge.log")
-                    print(f"host-terminal: healthy (pid {pid}, port {port})")
-                    return 0
+                    if _script_grants_supported(
+                        opener, port, host_path(env["N_AGENT_HOST_TERMINAL_TOKEN_PATH"])
+                    ):
+                        print(f"host-terminal: healthy (pid {pid}, port {port})")
+                        return 0
+                    if action == "status":
+                        raise ValueError("host terminal bridge protocol is outdated; run start to upgrade")
+                    _stop_legacy_bridge(int(pid), port)
+                    print("host-terminal: upgrading authorization protocol")
         if action == "status":
             raise ValueError("host terminal bridge is not running")
         if healthy():

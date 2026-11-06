@@ -99,14 +99,14 @@
 
 [20261106]
 - FR
-    - 任务：spanid=96337564aa1678d7，任务失败愿意`judge returned unparseable result`，但有效工作是达成的。帮优化judge result
+    - 技能：新增wake-codex技能操作不便，先遇到skill注册不自动问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新不自动问题(需要改配置文件host-terminal-policy.yaml、没有Dashboard操作入口)
+    - 任务：spanid=96337564aa1678d7，任务失败原因 `judge returned unparseable result`，但有效工作是达成的。帮优化judge result，避免这种低级错误
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - FR
-    - 技能：新增wake-codex技能操作不便，先遇到skill注册不自动问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新不自动问题(需要改配置文件host-terminal-policy.yaml、没有Dashboard操作入口)
     - 观测：Prifile，当前按服务和进程采样，使用 py-spy → Pyroscope；尚未接入 OTel Profiles
     - 观测：引入Langfuse，尽量复用OTel组件(如Collector)；现有的OTel能力全部留下、跟Langfuse并存
     - 评测：增加 evaluate 能力

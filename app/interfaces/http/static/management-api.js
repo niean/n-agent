@@ -202,7 +202,7 @@
     releaseSandbox,
   };
 
-  // Host terminal dashboard endpoints - read-only, no write ops (see host_terminal_routes.py)
+  // Host terminal dashboard views and automatic grant revocation (see host_terminal_routes.py)
   const getHostStatus = () => fetchJson('/chat/host/status');
   const getHostPolicy = () => fetchJson('/chat/host/policy');
   const listHostHistory = (sessionId, limit) => {
@@ -215,6 +215,8 @@
     return fetchJson(`/chat/host/history${qs ? `?${qs}` : ''}`);
   };
   const host = {
+    listScriptGrants: () => fetchJson('/chat/host/script-grants'),
+    revokeScriptGrant: (revision) => fetchJson(`/chat/host/script-grants/${encodeURIComponent(revision)}/revoke`, { method: 'POST' }),
     getStatus: getHostStatus,
     getPolicy: getHostPolicy,
     listHistory: listHostHistory,

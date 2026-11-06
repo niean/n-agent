@@ -141,3 +141,87 @@ async def test_scan_failure_keeps_written_file_pending_in_summary():
     assert svc.last_auto_refresh_error == "scan_failed"
     svc.host_script_grants.commit_write.assert_awaited_once()
     svc.host_script_grants.sync.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stalled_old_loop_sync_cannot_clear_newer_scan_failure(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+    from app.application.host_script_grant_service import HostScriptGrantService
+    from app.infrastructure.host_terminal.script_intent_store import (
+        SQLiteHostScriptIntentStore,
+    )
+
+    svc = service()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    async def stalled_sync():
+        entered.set()
+        await release.wait()
+        completed.set()
+
+    svc.host_script_grants.sync.side_effect = stalled_sync
+    task = asyncio.create_task(svc.run_auto_refresh(60))
+    try:
+        await entered.wait()
+        svc.loader.scan.side_effect = RuntimeError("new scan failed")
+        with pytest.raises(RuntimeError):
+            await svc.scan_now()
+        release.set()
+        await completed.wait()
+        await asyncio.sleep(0)
+        assert svc.last_auto_refresh_error == "scan_failed"
+        client = SimpleNamespace(script_grants=AsyncMock(return_value=[]))
+        grants = HostScriptGrantService(
+            SQLiteHostScriptIntentStore(tmp_path / "db"), client, svc
+        )
+        intent = await grants.prepare_write(
+            "demo", "scripts/a.py", "hello", "foreground"
+        )
+        await grants.commit_write(intent.revision)
+        await grants.sync()
+        assert (await grants.list_grants())[0]["error"] == "scan_blocked"
+        assert client.script_grants.await_count == 1
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_revoke_persistence_failure_fails_request_without_claiming_pending():
+    import json
+    from app.domain.tool import ToolCallRequest, ToolResultStatus
+
+    svc = service()
+    svc.loader.remove_linked_file = AsyncMock()
+    svc.host_script_grants.revoke_skill = AsyncMock(
+        side_effect=RuntimeError("/private/secret/database.sqlite token=secret")
+    )
+    request = SkillManageRequestBuilder.remove_file(
+        "demo", "scripts/a.py", SkillWriteOrigin.FOREGROUND
+    )
+    result = await svc.manage_skill(request, trusted_write=True)
+    assert not result.success
+    assert result.error == "revocation_persistence_failed"
+    assert result.summary == "remove_file demo completed; revocation_failed"
+    assert "pending" not in result.summary
+    tool_result = await SkillManageToolExecutor(svc).execute(
+        ToolCallRequest(
+            id="1",
+            name="skill_manage",
+            arguments={
+                "action": "remove_file",
+                "name": "demo",
+                "file_path": "scripts/a.py",
+            },
+        )
+    )
+    assert tool_result.status is ToolResultStatus.ERROR
+    assert json.loads(tool_result.content) == {
+        "success": False,
+        "error": "revocation_persistence_failed",
+    }
+    assert "/private" not in tool_result.content and "secret" not in tool_result.content

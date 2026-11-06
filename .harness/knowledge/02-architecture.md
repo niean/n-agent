@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界、Skill 自进化写入治理、Activated Skills 选择流（前端按会话持久化 + chat_service 归一 + context_service 实时求交 + prompt_builder 注入 ## Activated Skills + _INTERNAL_OPTION_KEYS 隔离 Provider）、Task、Browser、Artifact 与 Delegation 多 Agent 委派子域（17 个领域 Policy）、Config Bundle 配置迁移子域（宿主 sh 脚本编排 + 容器内 CLI 导入 + 段级失败收敛与退出码契约）、OTel 可观测子域（GenAI semconv、Domain 零 OTel、application 仅 opentelemetry-api、Domain 公式经组合根注入 telemetry_semantics（set_normalized_token_computer）、SDK 隔离在 infrastructure/observability、OTLP 导出 + 5 服务后端栈 + py-spy 连续 profiling + 自检页外链 C 类运行时配置 otel_link_config + 每条日志实时现场 live scene ContextVar 与 LogSanitizer 脱敏正文/异常恢复、span event 携带脱敏正文、三重封口 Log/span event 放开口）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结 -->
+<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界、Skill 自进化写入治理、Activated Skills 选择流（前端按会话持久化 + chat_service 归一 + context_service 实时求交 + prompt_builder 注入 ## Activated Skills + _INTERNAL_OPTION_KEYS 隔离 Provider）、Task、Browser、Artifact 与 Delegation 多 Agent 委派子域（17 个领域 Policy）、Config Bundle 配置迁移子域（宿主 sh 脚本编排 + 容器内 CLI 导入 + 段级失败收敛与退出码契约）、OTel 可观测子域（GenAI semconv、Domain 零 OTel、application 仅 opentelemetry-api、Domain 公式经组合根注入 telemetry_semantics（set_normalized_token_computer）、SDK 隔离在 infrastructure/observability、OTLP 导出 + 5 服务后端栈 + py-spy 连续 profiling + 自检页外链 C 类运行时配置 otel_link_config + 每条日志实时现场 live scene ContextVar 与 LogSanitizer 脱敏正文/异常恢复、span event 携带脱敏正文、三重封口 Log/span event 放开口）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销 -->
 # 架构与模块边界
 
 ## AgentRun 执行账本
@@ -144,3 +144,11 @@ Policy Mesh 是 N-Agent 的运行时治理层，由 17 个领域 Policy + Shared
 ## 观测详情通道
 
 Application 新增纯 stdlib 投影器 `telemetry_details.py`，通过组装根注入 LogSanitizer 与启动期上限；semantics 仅额外依赖该纯投影器，不导入业务或 Infrastructure。固定详情字段在 Provider 实际传输输入/输出、ToolService 执行和 Agent 用户输入/最终回复处采集；同一脱敏有界 envelope 供 span 属性和完成日志使用。日志验证/展平 callable 由 main 注入，Infrastructure 不反向导入投影器。原始 GenAI opt-in、DB SQL 参数、ring buffer、metrics/Profile 继续排除正文；HTTP 实际消费的请求/响应经统一投影进入 Log details 与 span `nagent.details.*` 通道，流式完成或关闭后才结束 Span。
+
+## 自动发现技能与授权受控脚本
+
+SkillService 在组合根启用 auto_refresh；成功写入后重扫，lifespan 每 5 秒扫描运行中新增或更新的技能，扫描和写入共用 mutation lock，保留启停与聊天可选状态。维护模式暂停周期扫描和授权重试，退出取消并等待任务。last_auto_refresh_error 与 last_auto_sync_error 分开维护，避免旧同步覆盖新扫描失败。
+
+HostScriptGrantService 仅接收 SkillManageToolExecutor 服务端绑定的 trusted_write（审批后的受控 replay 保留该来源）。WRITE_FILE 写 scripts/*.py 前以 payload 的 UTF-8 字节计算哈希并持久化 prepared，成功后转 pending，扫描严格通过后自动向宿主同步。目录扫描、SkillSource、frontmatter、外部写入都不能授予权限；历史脚本须经受控重写，不能凭标签追认。
+
+宿主 Bridge 经认证协议独立核对源文件字节，保存私有授权和撤销 tombstone，执行前合并有效授权并使用原有固定目录 fd 和私有字节快照。容器 executor 每次读取新鲜宿主授权，不缓存过时权限；桥接不可用或授权存储损坏时仅保留独立 YAML 手工规则。自动规则仅在 active 时替代同脚本身份的 YAML 规则；撤销后 YAML 精确规则可独立生效。可变 argv 原样传递，仍受参数数量、长度、超时和并发限制。

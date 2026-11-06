@@ -989,6 +989,16 @@ async def test_export_covers_all_ten_sections(svc):
 
 
 @pytest.mark.asyncio
+async def test_export_never_transfers_host_script_authorization(svc):
+    bundle = await svc.export_bundle(redact_secrets=False)
+    assert not {
+        "host_script_intents", "host_script_grants", "host_terminal_policy", "host_terminal_token",
+    } & bundle.sections.keys()
+    for skill in bundle.sections["skills"]:
+        assert not {"sha256", "revision", "origin", "grant", "authorization"} & skill.keys()
+
+
+@pytest.mark.asyncio
 async def test_export_carries_plaintext_secret_when_not_redacted(svc):
     bundle = await svc.export_bundle(redact_secrets=False)
     assert bundle.sections["providers"][0]["api_key"] == "sk-live"
