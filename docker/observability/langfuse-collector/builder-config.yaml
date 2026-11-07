@@ -1,0 +1,22 @@
+dist:
+  module: nagent.local/otelcol
+  name: otelcol-contrib
+  description: N-Agent Collector with isolated Langfuse link sanitation
+  version: 0.137.0
+  output_path: /build/dist
+extensions:
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/healthcheckextension v0.137.0
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.137.0
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.137.0
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.137.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/filterprocessor v0.137.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.137.0
+  - gomod: nagent.local/linkprocessor v0.0.0
+    path: /build/linkprocessor
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.137.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.137.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.137.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/exporter/prometheusremotewriteexporter v0.137.0

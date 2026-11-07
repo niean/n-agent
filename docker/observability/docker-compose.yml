@@ -15,8 +15,12 @@ services:
     # ports:
     #   - "127.0.0.1:4317:4317"
     stop_grace_period: 15s
-    mem_limit: 384m
+    mem_limit: 512m
+    memswap_limit: 512m
     cpus: 0.5
+    environment:
+      GOMEMLIMIT: 192MiB
+      GOMAXPROCS: "2"
     healthcheck:
       test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
       interval: 15s
@@ -44,7 +48,11 @@ services:
       - "127.0.0.1:3200:3200"
     stop_grace_period: 15s
     mem_limit: 512m
+    memswap_limit: 512m
     cpus: 0.5
+    environment:
+      GOMEMLIMIT: 320MiB
+      GOMAXPROCS: "2"
     logging:
       driver: json-file
       options:
@@ -60,12 +68,19 @@ services:
       - --storage.tsdb.retention.time=7d
       - --web.enable-remote-write-receiver
       - --enable-feature=exemplar-storage
+      - --auto-gomemlimit.ratio=0.625
+      - --query.max-concurrency=2
+      - --query.max-samples=2000000
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     stop_grace_period: 15s
     mem_limit: 512m
+    memswap_limit: 512m
     cpus: 0.5
+    environment:
+      GOMEMLIMIT: 160MiB
+      GOMAXPROCS: "2"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:9090/-/healthy"]
       interval: 15s
@@ -87,6 +102,8 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_AUTH_DISABLE_LOGIN_FORM: "false"
       GF_USERS_DEFAULT_THEME: light
+      GOMEMLIMIT: 160MiB
+      GOMAXPROCS: "2"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana-data:/var/lib/grafana
@@ -95,6 +112,7 @@ services:
       - "127.0.0.1:13000:3000"
     stop_grace_period: 15s
     mem_limit: 512m
+    memswap_limit: 512m
     cpus: 0.5
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
@@ -124,7 +142,11 @@ services:
       - "127.0.0.1:4040:4040"
     stop_grace_period: 15s
     mem_limit: 512m
+    memswap_limit: 512m
     cpus: 0.5
+    environment:
+      GOMEMLIMIT: 128MiB
+      GOMAXPROCS: "2"
     logging:
       driver: json-file
       options:
@@ -143,8 +165,12 @@ services:
     expose:
       - "3100"
     stop_grace_period: 15s
-    mem_limit: 384m
+    mem_limit: 512m
+    memswap_limit: 512m
     cpus: 0.5
+    environment:
+      GOMEMLIMIT: 128MiB
+      GOMAXPROCS: "2"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:3100/ready"]
       interval: 15s

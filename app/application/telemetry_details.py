@@ -10,7 +10,8 @@ import re
 FIELDS = frozenset(('user_message', 'assistant_message', 'system_prompt',
                     'input_messages', 'tool_definitions', 'output_messages',
                     'tool_arguments', 'tool_result', 'error', 'http_request',
-                    'http_response', 'log_fields'))
+                    'http_response', 'log_fields', 'retrieval_query', 'retrieval_results',
+                    'judge_verdict', 'judge_reason'))
 _METADATA = frozenset(('content', 'original_bytes', 'truncated', 'incomplete', 'observed_bytes'))
 _config: tuple[Callable[[str], str] | None, int] = (None, 1024000)
 _SENSITIVE = re.compile(r'api.?key|token|password|authorization|cookie|credential|secret|private.?key', re.I)

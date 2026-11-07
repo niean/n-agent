@@ -253,7 +253,7 @@ async def test_openai_non_stream_extracts_cache_and_fixes_input():
         _openai_usage(prompt=150, completion=10, cached=50))), hook).chat([], [], False, '', {})
     assert result.message['content'] == 'ok'
     assert _call(hook, 'set_usage')[1] == (100, 10)  # Ti = prompt - cached
-    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': None}
+    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': 0}
 
 
 @pytest.mark.asyncio
@@ -280,7 +280,7 @@ async def test_openai_prompt_missing_but_cached_valid_keeps_tic():
     await provider('openai', Client(_openai_response(
         _openai_usage(prompt=None, completion=10, cached=50))), hook).chat([], [], False, '', {})
     assert _call(hook, 'set_usage')[1] == (None, 10)
-    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': None}
+    assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': 50, 'cache_write_tokens': 0}
 
 
 @pytest.mark.asyncio
@@ -307,7 +307,7 @@ async def test_openai_stream_usage_chunks_cover_both_shapes():
     set_usages = [c for c in hook.calls if c[0] == 'set_usage']
     assert set_usages[-1][1] == (100, 10)
     cache_calls = [c for c in hook.calls if c[0] == 'set_cache_usage']
-    assert cache_calls[-1][2] == {'cache_read_tokens': 50, 'cache_write_tokens': None}
+    assert cache_calls[-1][2] == {'cache_read_tokens': 50, 'cache_write_tokens': 0}
 
 
 def _anthropic_usage(input_tokens=None, output_tokens=None, cache_read='missing', cache_write='missing'):
@@ -370,3 +370,36 @@ async def test_anthropic_invalid_component_types_are_rejected():
         _anthropic_usage('100', True, cache_read=1.5, cache_write=-1))), hook).chat([], [], False, '', {})
     assert _call(hook, 'set_usage')[1] == (None, None)
     assert _call(hook, 'set_cache_usage')[2] == {'cache_read_tokens': None, 'cache_write_tokens': None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['openai', 'anthropic'])
+@pytest.mark.parametrize('streaming', [False, True])
+async def test_final_parameters_reported_before_sdk_create(kind, streaming):
+    hook = Attempt()
+    response = (NS(choices=[NS(message=NS(role='assistant', content='ok'), finish_reason='stop')])
+                if kind == 'openai' else NS(content=[], stop_reason='end_turn'))
+    class CheckingClient(Client):
+        async def create(self, **kwargs):
+            parameters = next(c for c in hook.calls if c[0] == 'set_model_parameters')[1][0]
+            assert parameters == {key: value for key, value in kwargs.items() if key in ("temperature", "max_tokens")}
+            assert "messages" not in parameters
+            return await super().create(**kwargs)
+    client = CheckingClient(events([]) if streaming else response)
+    result = await provider(kind, client, hook).chat([], [], streaming, '', {'temperature': .3, 'max_tokens': 123})
+    if streaming:
+        _ = [event async for event in result]
+    assert client.kwargs['max_tokens'] == 123
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['openai', 'anthropic'])
+@pytest.mark.parametrize('streaming', [False, True])
+async def test_actual_response_model_is_reported(kind, streaming):
+    hook = Attempt()
+    response = (NS(model='actual-response', choices=[NS(message=NS(role='assistant', content='ok'), finish_reason='stop')])
+                if kind == 'openai' else NS(model='actual-response', content=[], stop_reason='end_turn'))
+    items = [NS(model='actual-response', choices=[])] if kind == 'openai' else [{'type': 'message_start', 'message': {'model': 'actual-response'}}]
+    result = await provider(kind, Client(events(items) if streaming else response), hook).chat([], [], streaming, '', {})
+    if streaming:
+        _ = [event async for event in result]
+    assert ('set_response_model', ('actual-response',), {}) in hook.calls

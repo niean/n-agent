@@ -8,11 +8,17 @@ composition root; Infrastructure never imports Application.
 """
 from __future__ import annotations
 
+import math
+
 from typing import Any, Optional, Protocol
 
 
 class ChatAttemptHook(Protocol):
     """Duck-typed chat-attempt handle (see telemetry_semantics.ChatAttempt)."""
+
+    def set_model_parameters(self, parameters: Any) -> None: ...
+
+    def set_raw_usage(self, raw_usage: Any) -> None: ...
 
     def set_input(self, messages: Any, tools: Any = None, system: Any = None) -> None: ...
 
@@ -67,6 +73,12 @@ def validated_count(value: Any) -> bool:
 
 
 class NoopChatAttempt:
+    def set_model_parameters(self, parameters):
+        pass
+
+    def set_raw_usage(self, raw_usage):
+        pass
+
     def set_input(self, messages, tools=None, system=None) -> None:
         pass
 
@@ -108,3 +120,15 @@ class NoopChatAttempt:
 
 
 NOOP_CHAT_ATTEMPT = NoopChatAttempt()
+
+
+def report_model_parameters(attempt: Any, parameters: Any) -> None:
+    """Expose only finite numerical request facts to optional callbacks."""
+    try:
+        names = ('temperature', 'top_p', 'top_k', 'max_tokens', 'max_completion_tokens',
+                 'max_output_tokens', 'frequency_penalty', 'presence_penalty')
+        safe = {key: parameters[key] for key in names if key in parameters
+                and type(parameters[key]) in (int, float) and math.isfinite(parameters[key])}
+        optional_hook(attempt, 'set_model_parameters', safe)
+    except Exception:
+        pass

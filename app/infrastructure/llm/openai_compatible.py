@@ -23,6 +23,7 @@ _INTERNAL_OPTION_KEYS = {
 
 
 from app.infrastructure.llm.telemetry_hook import (
+    report_model_parameters,
     NOOP_CHAT_ATTEMPT as _NOOP_CHAT_ATTEMPT,
 )
 from app.infrastructure.llm.telemetry_hook import (
@@ -118,7 +119,10 @@ class OpenAICompatibleProvider:
         with attempt:
             optional_hook(attempt, "set_input", kwargs["messages"],
                           tools=kwargs.get("tools"), system=kwargs.get("system"))
+            report_model_parameters(attempt, kwargs)
             response = await self.client.chat.completions.create(**kwargs)
+            if _get(response, "model"):
+                optional_hook(attempt, "set_response_model", _get(response, "model"))
             choice = response.choices[0]
             message = choice.message
             usage = getattr(response, "usage", None)
@@ -144,8 +148,11 @@ class OpenAICompatibleProvider:
             optional_hook(attempt, "set_input", kwargs["messages"],
                           tools=kwargs.get("tools"), system=kwargs.get("system"))
             try:
+                report_model_parameters(attempt, kwargs)
                 stream = await self.client.chat.completions.create(**kwargs)
                 async for chunk in stream:
+                    if _get(chunk, "model"):
+                        optional_hook(attempt, "set_response_model", _get(chunk, "model"))
                     # usage may arrive on the usage-only final chunk (empty
                     # choices) or ride along a normal chunk; extract it first,
                     # then keep processing this chunk's choices as usual.
@@ -185,7 +192,7 @@ def _provider_options(options: dict[str, Any]) -> dict[str, Any]:
 
 def _extract_openai_usage(usage: Any) -> tuple[Any, Any, Any]:
     """Split OpenAI-compatible usage into (ti, to, tic); cache-write is not
-    applicable in this protocol and is never reported.
+    applicable in this protocol (reported as known zero).
 
     Ti (non-cached input) is only computed when both prompt_tokens and
     cached_tokens are valid known ints with cached <= prompt; a missing
@@ -214,14 +221,18 @@ def _report_openai_usage(attempt: Any, usage: Any) -> None:
     """Observability-only reporting: extraction or hook failures must never
     change the business result (isolated here, not via __exit__ alone)."""
     try:
+        raw = {key: _get(usage, key) for key in ('prompt_tokens', 'completion_tokens')}
+        details = _get(usage, 'prompt_tokens_details')
+        raw['prompt_tokens_details'] = {'cached_tokens': _get(details, 'cached_tokens')}
+        optional_hook(attempt, "set_raw_usage", raw)
         ti, to, tic = _extract_openai_usage(usage)
         optional_hook(attempt, "set_usage", ti, to)
         if tic is not None:
-            # cache_write is explicitly None: in this protocol it is
+            # cache_write is known zero: in this protocol it is
             # inapplicable (not merely unknown), which keeps the derived
             # cache-hit-rate denominator decidable from Ti + Tic.
             optional_hook(attempt, "set_cache_usage",
-                          cache_read_tokens=tic, cache_write_tokens=None)
+                          cache_read_tokens=tic, cache_write_tokens=0)
     except Exception:
         pass
 

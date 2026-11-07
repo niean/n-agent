@@ -246,3 +246,9 @@
 ## 观测身份与结果
 
 AgentRun 是一次 Agent 执行，TaskRun 是一次后台任务运行，请求 ID 是一次入口请求的身份；三者不是同一种 run_id。request.channel 表示入口渠道，agent.source 表示本次 Agent 执行来源。completed 事件只表示处理结束，结果使用 success/failure/denied/cancelled/timed_out/skipped/deferred/unknown；审批状态、业务状态和结束原因分别保存。字段与测量权威见 07-observability.md。
+
+## Langfuse 并存观测
+
+- Langfuse Observation：Langfuse 对 OTel Span 的平台投影；本项目实际映射 agent、generation、tool 和普通 span，保留相同 Trace/Span 身份，不替代 AgentRun 或 Usage 账本。
+- ocb：OpenTelemetry Collector Builder，用固定版本组件组装发行镜像；本项目仅为 Langfuse 分支增加 Link 属性清理组件，默认禁用模式仍使用原 contrib 镜像。
+- 序列化字节队列：发送队列按编码数据字节有界，16MiB 是队列预算，不是整个 Collector 的堆内存上限；副本、在途请求与其他信号仍共同占用进程资源。

@@ -38,6 +38,7 @@ overrides:
       # Trace-wide cap is independent of application per-field truncation.
       max_bytes_per_trace: 33554432
 querier:
+  max_concurrent_queries: 1
   frontend_worker:
     grpc_client_config:
       # Querier returns the complete Trace through this internal stream.

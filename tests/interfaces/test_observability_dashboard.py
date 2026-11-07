@@ -665,10 +665,17 @@ let fetchCalls = 0;
   ok(text.indexOf('execute_tool {tool}') !== -1, 'restricted span summaries rendered');
   ok(text.indexOf('not exposed by SDK batch processors') !== -1, 'queue-drop limitation note rendered');
   const anchors = liveQuery(container, (el) => el.tag === 'a' && el._attrs.href);
-  ok(anchors.length === 1, 'server link rendered as a single anchor');
+  ok(anchors.length === 2, 'server link and fixed Langfuse link rendered as anchors');
   ok(anchors[0] && anchors[0]._attrs.target === '_blank', 'external link opens in a new window');
   const rel = anchors[0] ? String(anchors[0]._attrs.rel || '') : '';
   ok(rel.indexOf('noopener') !== -1 && rel.indexOf('noreferrer') !== -1, 'external link uses noopener noreferrer');
+  const langfuse = anchors.find((el) => el._text === 'Langfuse');
+  ok(langfuse && langfuse._attrs.href === 'http://langfuse.localhost/project/n-agent-local-project/sessions',
+    'Langfuse link uses the exact local sessions URL');
+  ok(langfuse && langfuse._attrs.target === '_blank', 'Langfuse link opens in a new window');
+  const langfuseRel = langfuse ? String(langfuse._attrs.rel || '') : '';
+  ok(langfuseRel.indexOf('noopener') !== -1 && langfuseRel.indexOf('noreferrer') !== -1,
+    'Langfuse link uses noopener noreferrer');
   // textContent-only: every rendered value went through textContent nodes
   // (the mock records them as _text; there is no HTML channel in the mock).
   ok(descendants(container).every((el) => el._attrs.innerHTML === undefined),
@@ -747,8 +754,6 @@ let fetchCalls = 0;
     const patchCalls = () => fetchCalls.filter((c) => c.options.method === 'PATCH');
 
     const alerts = [];
-    let confirmResult = true;
-    let confirmImpl = null;
     const snapshotCalls = [];
     const win4 = {
       NAGENT: {
@@ -756,7 +761,6 @@ let fetchCalls = 0;
         api: { fetchJson(url) { const d = defer(); snapshotCalls.push(d); return d.p; } },
         modal: {
           alert(msg) { alerts.push(String(msg)); return Promise.resolve(); },
-          confirm(msg) { alerts.push('confirm:' + String(msg)); return confirmImpl ? confirmImpl() : Promise.resolve(confirmResult); },
         },
       },
       location: { pathname: '/observations/otel' },
@@ -788,12 +792,16 @@ let fetchCalls = 0;
       return findBackdrop();
     };
 
-    // A: entry button renders even with an empty link list
+    // A: entry button and fixed Langfuse link render without configured links
     const initP = mod4.init();
     snapshotCalls[0].res(basePayload);
     await initP;
+    const emptyLinks = liveQuery(modalContainer, (el) => el.tag === 'a' && el._attrs.href);
+    ok(emptyLinks.length === 1 && emptyLinks[0]._text === 'Langfuse'
+      && emptyLinks[0]._attrs.href === 'http://langfuse.localhost/project/n-agent-local-project/sessions',
+    'fixed Langfuse link renders even without configured links');
     const configBtn = findButton(modalContainer, '配置链接');
-    ok(configBtn, '配置链接 entry renders even when links list is empty');
+    ok(configBtn, '配置链接 entry renders without configured links');
     ok(configBtn && configBtn._cls.has('btn'), 'entry uses the standard .btn class');
     ok(configBtn && configBtn._parent && configBtn._parent._cls.has('panel-header'), 'entry sits in the panel header row');
 
@@ -808,7 +816,7 @@ let fetchCalls = 0;
     ok(bodyText(bd).indexOf('修改后留空表示跟随环境变量默认配置，未修改字段保持原配置') !== -1, 'muted hint rendered');
     ok(fetchCalls.length === 1 && fetchCalls[0].url === '/chat/observations/otel/links', 'open issues GET on the admin API');
     ok(findButton(bd, '保存').disabled === true, 'save disabled while loading');
-    ok(findButton(bd, '恢复默认').disabled === true, 'restore disabled while loading');
+    ok(!findButton(bd, '恢复默认'), 'restore button is not rendered');
     const dialogEl = bd._kids[0];
     ok(dialogEl && dialogEl.tag === 'section' && dialogEl.className === 'modal-dialog', 'dialog is section.modal-dialog');
     ok(dialogEl && dialogEl._attrs.role === 'dialog' && dialogEl._attrs['aria-modal'] === 'true', 'dialog carries role/aria-modal');
@@ -819,9 +827,8 @@ let fetchCalls = 0;
     const actionsEl = liveQuery(bd, (el) => el._cls.has('providers-form__actions'))[0];
     ok(actionsEl, 'footer uses providers-form__actions');
     const actionTexts = actionsEl ? actionsEl._kids.map((k) => k._text) : [];
-    ok(actionTexts.join('|') === '恢复默认|取消|保存', 'footer order: restore(left)/cancel/save (got ' + actionTexts.join(',') + ')');
-    ok(actionsEl && actionsEl._kids[0].style.marginRight === 'auto', 'restore pinned left via marginRight:auto');
-    ok(actionsEl && actionsEl._kids[2]._cls.has('btn--primary'), 'save uses btn--primary');
+    ok(actionTexts.join('|') === '取消|保存', 'footer order: cancel/save (got ' + actionTexts.join(',') + ')');
+    ok(actionsEl && actionsEl._kids[1]._cls.has('btn--primary'), 'save uses btn--primary');
     slowGetB.res(okResponse(configDto));
     await flush();
     const inputs = inputsOf(bd);
@@ -831,7 +838,7 @@ let fetchCalls = 0;
     const text1 = bodyText(bd);
     ok(text1.indexOf('跟随环境') !== -1, 'env-following state label rendered');
     ok(text1.indexOf('已禁用') !== -1, 'disabled state label rendered');
-    ok(text1.indexOf('自定义') !== -1, 'custom state label rendered');
+    ok(text1.indexOf('自定义') === -1, 'custom state label is not rendered');
     const followBtns = liveQuery(bd, (el) => el.tag === 'button' && el._text === '跟随环境');
     ok(followBtns.length === 4, 'every row owns a 跟随环境 marker button');
     ok(followBtns.filter((b) => !b.hidden).length === 1, 'only the disabled row exposes 跟随环境');
@@ -906,30 +913,6 @@ let fetchCalls = 0;
     ok(alerts.some((m) => m.indexOf('重新打开弹窗') !== -1), '409 alert asks to reopen the modal');
     clickEl(findButton(bd, '取消'));
     await flush();
-
-    // H: restore-default cancel writes nothing
-    fetchCalls.length = 0;
-    confirmResult = false;
-    bd = await openModal();
-    clickEl(findButton(bd, '恢复默认'));
-    await flush();
-    ok(patchCalls().length === 0, 'cancelled restore sends no PATCH');
-    ok(findBackdrop(), 'cancelled restore keeps the modal open');
-    ok(findButton(bd, '保存').disabled === false, 'cancel releases the submit lock');
-
-    // I: confirmed restore PATCHes every field null once
-    confirmResult = true;
-    fetchQueue.push(okResponse(configDto));
-    clickEl(findButton(bd, '恢复默认'));
-    await flush();
-    ok(patchCalls().length === 1, 'confirmed restore sends one PATCH');
-    const patch4 = JSON.parse(patchCalls()[0].options.body);
-    ok(patch4.expected_version === 3 && patch4.metric_base_url === null && patch4.log_base_url === null
-      && patch4.trace_base_url === null && patch4.profile_base_url === null,
-      'restore sends null for all four fields');
-    ok(!findBackdrop(), 'successful restore closes the modal');
-    snapshotCalls[snapshotCalls.length - 1].res(basePayload);
-    await waitFor(() => findButton(modalContainer, '配置链接'));
 
     // J: double submit during a slow PATCH sends exactly once
     fetchCalls.length = 0;
@@ -1019,7 +1002,7 @@ let fetchCalls = 0;
     traceInput.value = 'https://new.example.com/t';
     fireInput(traceInput);
     const stateLabels = liveQuery(bd, (el) => el._cls.has('otel-link-config__state'));
-    ok(stateLabels[2]._text === '自定义', 'state label follows the typed input');
+    ok(stateLabels[2]._text === '', 'typed input does not render a custom state label');
     fetchQueue.push(okResponse(configDto));
     submitForm(bd);
     await waitFor(() => !findBackdrop());
@@ -1054,31 +1037,6 @@ let fetchCalls = 0;
     ok(findButton(bd, '保存').disabled === false, '422 re-enables save');
     clickEl(findButton(bd, '取消'));
     await flush();
-
-    // R: the restore confirm wait holds the submit lock
-    fetchCalls.length = 0;
-    bd = await openModal();
-    const pendingConfirm = defer();
-    confirmImpl = () => pendingConfirm.p;
-    clickEl(findButton(bd, '恢复默认'));
-    await flush();
-    ok(findButton(bd, '保存').disabled === true, 'confirm wait disables save');
-    ok(findButton(bd, '恢复默认').disabled === true, 'confirm wait disables restore');
-    submitForm(bd);
-    clickEl(findButton(bd, '恢复默认'));
-    await flush();
-    ok(patchCalls().length === 0, 'no PATCH while the confirm is pending');
-    fetchQueue.push(okResponse(configDto));
-    pendingConfirm.res(true);
-    await waitFor(() => !findBackdrop());
-    ok(patchCalls().length === 1, 'exactly one PATCH after the confirm resolves');
-    const patchR = JSON.parse(patchCalls()[0].options.body);
-    ok(patchR.metric_base_url === null && patchR.log_base_url === null
-      && patchR.trace_base_url === null && patchR.profile_base_url === null,
-      'the single restore PATCH nulls every field');
-    confirmImpl = null;
-    snapshotCalls[snapshotCalls.length - 1].res(basePayload);
-    await waitFor(() => findButton(modalContainer, '配置链接'));
 
     // S: closing the modal invalidates an in-flight GET
     const slowGetS = defer();

@@ -48,3 +48,4 @@ docker/observability/.volumes.json
 docker/observability/.lifecycle.lock
 docker/locals/*
 docker/host-terminal-policy.yaml
+docker/langfuse/.lifecycle.lock

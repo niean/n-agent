@@ -1168,6 +1168,28 @@ def build_application_services(
         InMemoryPricingProvider(),
         ContextBreakdownCalculatorImpl(),
     )
+    def estimate_attempt_cost(raw_usage, model, provider, buckets):
+        """Price confirmed buckets from this attempt without writing the ledger."""
+        if provider == 'anthropic':
+            required = [raw_usage.get(key) for key in (
+                'input_tokens', 'output_tokens', 'cache_read_input_tokens',
+                'cache_creation_input_tokens')]
+        else:
+            required = [raw_usage.get('prompt_tokens'), raw_usage.get('completion_tokens'),
+                        (raw_usage.get('prompt_tokens_details') or {}).get('cached_tokens')]
+        if not all(type(value) is int and value >= 0 for value in (*required, *buckets)):
+            return None
+        usage = usage_service.normalize_usage(raw_usage, provider)
+        normalized = (usage.input_tokens, usage.output_tokens,
+                      usage.cache_read_tokens, usage.cache_write_tokens)
+        if usage.request_count != 1 or normalized != buckets:
+            return None
+        cost = usage_service.estimate_cost(usage, model, provider)
+        # Decimal/string conversion belongs at the business composition boundary.
+        return dict(amount_usd=float(cost.amount_usd), status=cost.status,
+                    pricing_version=cost.pricing_version)
+
+    telemetry.set_cost_estimator(estimate_attempt_cost)
     # information_flow_service and budget_service are created earlier (before ToolService)
     # so they can be wired into ToolService for封口 enforcement.
     llm_policy = LLMPolicy()

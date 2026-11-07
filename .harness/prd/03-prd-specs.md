@@ -101,16 +101,22 @@
 - FR
     - 技能：新增wake-codex技能操作不便，先遇到skill注册不自动问题(需在Dashboard手动触发扫描)，后遇到本机执行脚本注册/更新不自动问题(需要改配置文件host-terminal-policy.yaml、没有Dashboard操作入口)
     - 任务：spanid=96337564aa1678d7，任务失败原因 `judge returned unparseable result`，但有效工作是达成的。帮优化judge result，避免这种低级错误
+    - 观测：Profile，当前按服务和进程采样，使用 py-spy → Pyroscope；尚未接入 OTel Profiles
+        - 结论：OTel Profiles尚处于Alpha阶段，暂不修改当前Profile信号链路
+    - 评测：如何增加 evaluate 能力？当前的E2E测试中Agent相关的，是否能转为evaluate的一部分
+        - 结论：E2E测试可以作为smoke eval
+    - 观测：[KF]引入Langfuse组件，尽量复用OTel组件(如Collector)；现有的OTel能力全部保留，跟Langfuse并存
+        - 迭代：Langfuse组件的内存设置太大了、容易打爆宿主，帮缩小、满足N-Agent常规使用即可(数据量不大)
+        - 迭代：Langfuse 原生接收 OTLP/HTTP，但现有字段仍需映射，才能正确展示 Agent、模型、工具及其输入输出 => 将字段映射、更新到观测语义
+        - 迭代：OTel页增加Langfuse链接，Dashboard 观测-OTel页/外部，增加 Langfuse链接(http://langfuse.localhost/project/n-agent-local-project/sessions)
+        - 迭代：OTel到Langfuse语义字段映射，缺少rag吗？按照Langfuse的能力，对N-Agent已具备的功能做映射
+
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - FR
-    - 观测：Prifile，当前按服务和进程采样，使用 py-spy → Pyroscope；尚未接入 OTel Profiles
-    - 观测：引入Langfuse，尽量复用OTel组件(如Collector)；现有的OTel能力全部留下、跟Langfuse并存
-    - 评测：增加 evaluate 能力
-    - 评测：E2E测试中Agent相关的，是否能转为评测的一部分
     - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离
     - 任务：持久化执行环境，让任务拥有快照、可恢复(如执行`sh docker/restart.sh`后自动恢复)
@@ -121,6 +127,7 @@
     - 产品：资源隔离，支持Tenant|WorkSpace|Project(如E2E对话测试隔离)
     - 产品：对标DSH，发现值得参考的技术架构、产品功能
     - 调度：支持MoA
+    - 评测：补全evaluate
 - HE
     - HE：三方审阅，从直接修改、改为给出建议，从而解耦
     - HE：VSCode+插件模式，补全Token观测

@@ -45,6 +45,10 @@ goal_mode:
 """
 from __future__ import annotations
 
+from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
+
+import ast
 import asyncio
 import json
 import logging
@@ -458,7 +462,7 @@ class TaskAgentExecutor:
     # ------------------------------------------------------------------
 
     async def _run_judge(
-        self, task: Task, task_run_id: int, claim_lock: str,
+        self, task: Task, task_run_id: int, claim_lock: str, *, _format_retry: bool = False,
     ) -> JudgeResult | None:
         """Run a judge fork to evaluate goal achievement.
 
@@ -495,7 +499,16 @@ class TaskAgentExecutor:
             task_run_id=task_run_id,
             execution_kind="task_judge",
             messages=[
-                {"role": "user", "content": f"judge task {task.id}: has the goal been achieved?"},
+                {"role": "user", "content": (
+                    f"judge task {task.id}: has the goal been achieved? "
+                    'Call task_show, then return ONLY strict JSON: '
+                    '{"achieved": true, "reason": "brief evidence"} '
+                    'or {"achieved": false, "reason": "missing or wrong results"}. '
+                    'Use double quotes and JSON true/false, not Python True/False.'
+                    + (" Your previous evaluation could not be parsed. Re-evaluate the "
+                       "existing completion evidence and correct the response format; "
+                       "do not repeat the worker's work." if _format_retry else "")
+                )},
             ],
             stream=False,
             session_id=execution_session_id,
@@ -522,38 +535,65 @@ class TaskAgentExecutor:
             persist_messages=False,
         )
 
-        try:
-            result = await self.chat_service.complete(request)
-        except (RunCancelledError, RunOwnershipLost):
-            raise
-        except Exception as exc:
-            logger.warning("judge fork failed: task=%s err=%s", task.id, exc)
-            return None
+        with business_operation('task.evaluate', session_id=execution_session_id,
+                                run_id=str(task_run_id), identifiers={'nagent.task.id': task.id}) as facts:
+            facts['judge_attempt'] = 2 if _format_retry else 1
+            try:
+                result = await self.chat_service.complete(request)
+            except RunCancelledError as exc:
+                facts.update(outcome='cancelled', error_type='cancelled', _cancelled_exception=exc)
+                raise
+            except RunOwnershipLost:
+                raise
+            except Exception as exc:
+                facts.update(outcome='failure', error_type='other', details=project_details(error=str(exc)))
+                logger.warning("judge fork failed: task=%s err=%s", task.id, exc)
+                return None
 
-        return self._parse_judge_result(result)
+            verdict = self._parse_judge_result(result)
+            if verdict is None:
+                facts.update(outcome='failure', error_type='other',
+                             details=project_details(error='judge result could not be parsed'))
+            else:
+                facts.update(achieved=verdict.achieved, details=project_details(
+                    judge_verdict={'achieved': verdict.achieved}, judge_reason=verdict.reason))
+        if verdict is None and not _format_retry:
+            # A format error is not a goal rejection. Retry only the read-only
+            # evaluator with a fresh AgentRun, preserving the worker's completion.
+            return await self._run_judge(task, task_run_id, claim_lock, _format_retry=True)
+        return verdict
 
     def _parse_judge_result(self, result: Any) -> JudgeResult | None:
-        """Parse the judge's JSON response. Returns None on failure."""
+        """Recover a verdict's syntax, but never coerce its decision or evidence."""
         if not isinstance(result, ChatCompletionResult):
             return None
         content = result.message.get("content", "")
-        if not isinstance(content, str):
+        if not isinstance(content, str) or len(content) > 16_384:
             return None
-        # Try to extract JSON from the response
         try:
-            # The judge might wrap JSON in markdown or add extra text
             json_str = content.strip()
-            if "```" in json_str:
-                # Extract from code block
-                start = json_str.find("{")
-                end = json_str.rfind("}") + 1
-                if start >= 0 and end > start:
-                    json_str = json_str[start:end]
-            parsed = json.loads(json_str)
-            achieved = bool(parsed.get("achieved", False))
-            reason = str(parsed.get("reason", ""))
-            return JudgeResult(achieved=achieved, reason=reason)
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError:
+                # Accept one object surrounded by Markdown/prose. Keeping the
+                # entire first-to-last brace range rejects conflicting verdicts.
+                start, end = json_str.find("{"), json_str.rfind("}")
+                if start < 0 or end < start:
+                    return None
+                json_str = json_str[start:end + 1]
+                try:
+                    parsed = json.loads(json_str)
+                except json.JSONDecodeError:
+                    # Some providers emit Python dict literals (single quotes /
+                    # True / False). literal_eval accepts data only, never code.
+                    parsed = ast.literal_eval(json_str)
+            if not isinstance(parsed, dict) or type(parsed.get("achieved")) is not bool:
+                return None
+            reason = parsed.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return None
+            return JudgeResult(achieved=parsed["achieved"], reason=reason.strip())
+        except (ValueError, TypeError, SyntaxError, RecursionError) as exc:
             logger.warning("judge parse failed: %s content=%r", exc, content[:200])
             return None
 

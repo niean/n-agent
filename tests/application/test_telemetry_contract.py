@@ -189,8 +189,9 @@ def test_outcomes():
 
 def test_content_allowlist_is_exact_and_fixed():
     from app.application import telemetry_contract as c
-    assert len(c.CONTENT_FIELDS) == 12
-    assert len(c.CONTENT_ATTRIBUTE_KEYS) == 60
+    assert len(c.CONTENT_FIELDS) == 16
+    assert all(len(c.operation_content_fields(spec.object, spec.action)) <= 12 for spec in c.OPERATIONS.values())
+    assert len(c.CONTENT_ATTRIBUTE_KEYS) == 80
     assert all(len(key.split('.')) == 3 for key in c.CONTENT_ATTRIBUTE_KEYS)
     assert 'nagent.content.input_messages_observed_bytes' in c.CONTENT_ATTRIBUTE_KEYS
 

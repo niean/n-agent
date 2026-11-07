@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host-only lifecycle for the shared stack. No application imports or secrets."""
 import argparse
+import importlib.util
 import fcntl
 import json
 import os
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import threading
 import time
+
+MODULE_DIRECTORY = Path(__file__).resolve().parent
 
 SERVICES = ("otel-collector", "tempo", "prometheus", "grafana", "pyroscope", "loki")
 VOLUMES = {
@@ -38,6 +41,23 @@ class Stack:
         self.directory = Path(directory).resolve()
         self.mapping_file = self.directory / ".volumes.json"
         self.progress = progress
+        self._langfuse_prepared = False
+        self._langfuse = None
+
+    @staticmethod
+    def langfuse_module():
+        source = MODULE_DIRECTORY / "langfuse-config.py"
+        spec = importlib.util.spec_from_file_location("observability_langfuse", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def langfuse(self):
+        if not self._langfuse_prepared:
+            module = self.langfuse_module()
+            self._langfuse = module.prepare(self.directory, MODULE_DIRECTORY.parents[1])
+            self._langfuse_prepared = True
+        return self._langfuse
 
     def report(self, message):
         if self.progress:
@@ -64,7 +84,7 @@ class Stack:
             temporary = Path(out.name)
         temporary.replace(self.mapping_file)
 
-    def run(self, *args, check=True, env=None, live=False, label=None):
+    def run(self, *args, check=True, env=None, live=False, label=None, timeout=240):
         # Do not echo full arguments or resolved Compose config: diagnostic
         # queries may contain credentials. Lifecycle output can stream as-is.
         label = label or f"docker {args[0]}"
@@ -78,10 +98,11 @@ class Stack:
             reporter.start()
         try:
             return subprocess.run(["docker", *args], text=True, capture_output=not live,
-                                  check=check, env=env, timeout=240)
+                                  check=check, env=env, timeout=timeout)
         except subprocess.CalledProcessError as exc:
-            # Docker output for this stack contains no application env values.
-            raise StackError(f"Docker command failed: {label} (exit {exc.returncode}): {(exc.stderr or '').strip()}") from exc
+            # Enabled Compose errors may include generated Authorization headers.
+            detail = "credential-bearing output withheld" if self._langfuse else (exc.stderr or "").strip()
+            raise StackError(f"Docker command failed: {label} (exit {exc.returncode}): {detail}") from None
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise StackError(f"Docker command unavailable or timed out: {label}") from exc
         finally:
@@ -89,17 +110,22 @@ class Stack:
             if reporter is not None:
                 reporter.join()
 
-    def compose(self, *args, mapping=None, check=True, live=False):
+    def compose(self, *args, mapping=None, check=True, live=False, timeout=240):
         env = {k: v for k, v in os.environ.items() if not k.startswith("COMPOSE_")}
         selected = self.mapping() if mapping is None else mapping
         env.update({VOLUMES[k][2]: v for k, v in selected.items()})
         env_file = self.directory / ".env"
         if not env_file.is_file():
             env_file = self.directory / ".env.example"
+        selected_langfuse = self.langfuse()
+        override = ["--file", str(selected_langfuse["override"])] if selected_langfuse else []
+        # Never stream Docker diagnostics from a credential-bearing config.
+        if selected_langfuse:
+            live = False
         return self.run("compose", "--project-name", "n-observability",
                         "--project-directory", str(self.directory),
                         "--env-file", str(env_file), "--file", str(self.directory / "docker-compose.yml"),
-                        *args, env=env, check=check, live=live, label=f"docker compose {args[0]}")
+                        *override, *args, env=env, check=check, live=live, label=f"docker compose {args[0]}", timeout=timeout)
 
     def preflight(self, mapping=None):
         self.report("检查 Compose 配置、网络及持久卷映射")
@@ -182,6 +208,25 @@ class Stack:
         raise StackError(f"shared stack readiness timed out: {last}")
 
     def deploy(self):
+        selected_langfuse = self.langfuse()
+        if selected_langfuse:
+            self.preflight()
+            self.report("核验 Langfuse 就绪与项目认证")
+            credentials = selected_langfuse["credentials"]
+            module = selected_langfuse["module"]
+            module.Stack.verify_project(credentials)
+            import urllib.request
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), module.NoRedirect())
+                with opener.open(f"http://127.0.0.1:{credentials.get('LANGFUSE_PORT', '13001')}/api/public/health", timeout=10) as response:
+                    if response.status != 200:
+                        raise ValueError("not ready")
+            except Exception:
+                raise StackError("Langfuse readiness check failed") from None
+            self.report("构建固定版本 Collector（资源受限，最长900秒）")
+            self.compose("build", "otel-collector", timeout=900)
+            self.report("验证原配置及 Langfuse 新增配置")
+            self.compose("run", "--rm", "--no-deps", "otel-collector", "validate", "--config=/etc/otelcol-contrib/config.yaml", "--config=/etc/otelcol-contrib/langfuse.json")
         self.report("开始部署/重启共享观测栈 n-observability")
         config = self.preflight()
         self.report("检查旧观测容器与持久卷写入冲突")
@@ -197,7 +242,10 @@ class Stack:
         # Bind-mounted configuration contents are not part of Compose's
         # container config hash. Recreate this project to apply config edits.
         self.report("启动/重建观测服务（实时显示 Docker 输出）")
-        self.compose("up", "-d", "--force-recreate", live=True)
+        if selected_langfuse:
+            self.compose("up", "-d", "--no-deps", "--force-recreate", "otel-collector", live=True)
+        else:
+            self.compose("up", "-d", "--force-recreate", live=True)
         self.report("等待服务就绪（轮询窗口 150s）")
         self.wait_ready()
         self.compose("ps", live=True)
@@ -209,6 +257,8 @@ class Stack:
         self.report("停止完成")
 
     def migrate(self, project, backups, legacy_compose):
+        if self.langfuse_module().settings(self.directory, MODULE_DIRECTORY.parents[1])[0]:
+            raise StackError("Langfuse mode does not support migrate; migrate with N_OBSERVABILITY_LANGFUSE_ENABLED=false first")
         self.report("检查旧观测栈及迁移条件")
         if not NAME.fullmatch(project) or project == "n-observability":
             raise StackError("invalid legacy project")
@@ -320,9 +370,18 @@ def main():
             except BlockingIOError as exc:
                 raise StackError("another observability lifecycle operation is running") from exc
         if args.action == "compose":
+            selected_langfuse = stack.langfuse()
+            if selected_langfuse and args.args[0] == "config" and tuple(args.args) != ("config", "--quiet"):
+                raise StackError("enabled mode permits only compose config --quiet; generated credentials are private")
             result = stack.compose(*args.args, check=False)
+            if stack._langfuse:
+                if args.args[0] == "config" and "--quiet" not in args.args:
+                    raise StackError("enabled mode permits only compose config --quiet; generated credentials are private")
+                if result.returncode:
+                    raise StackError("Docker Compose failed; credential-bearing output withheld")
             sys.stdout.write(result.stdout)
-            sys.stderr.write(result.stderr)
+            if not stack._langfuse:
+                sys.stderr.write(result.stderr)
             return result.returncode
         if args.action == "migrate":
             options = argparse.ArgumentParser()
@@ -334,7 +393,7 @@ def main():
             parser.error("unexpected arguments")
         else:
             getattr(stack, args.action)()
-    except (StackError, OSError, ValueError) as exc:
+    except (StackError, OSError, ValueError, RuntimeError) as exc:
         print(f"observability: {exc}", file=sys.stderr)
         return 1
     finally:

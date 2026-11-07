@@ -20,8 +20,8 @@ receivers:
 processors:
   memory_limiter:
     check_interval: 1s
-    limit_mib: 256
-    spike_limit_mib: 64
+    limit_mib: 160
+    spike_limit_mib: 32
   # Log 行体改写：OTLP record 的 body 只有安全事件码，trace_id/span_id 在
   # record 级字段里（Loki 会放入 structured metadata，行内不可 grep）。
   # 改写为 JSON 行后 Grafana Loki 数据源的 derivedFields 才能用
@@ -152,7 +152,49 @@ processors:
           - 'set(cache["execution"]["server.port"], attributes["server.port"]) where attributes["server.port"] != nil'
           - 'set(cache["execution"]["url.template"], attributes["url.template"]) where attributes["url.template"] != nil'
           # Approved detail envelopes: explicit fields and metadata only.
+          - 'set(cache["execution"]["nagent.knowledge.operation"], attributes["nagent.knowledge.operation"]) where attributes["nagent.knowledge.operation"] != nil'
+          - 'set(cache["execution"]["nagent.knowledge.outcome"], attributes["nagent.knowledge.outcome"]) where attributes["nagent.knowledge.outcome"] != nil'
+          - 'set(cache["execution"]["nagent.knowledge.summary"], attributes["nagent.knowledge.summary"]) where attributes["nagent.knowledge.summary"] != nil'
+          - 'set(cache["execution"]["nagent.knowledge.duration_ms"], attributes["nagent.knowledge.duration_ms"]) where attributes["nagent.knowledge.duration_ms"] != nil'
+          - 'set(cache["execution"]["nagent.task.achieved"], attributes["nagent.task.achieved"]) where attributes["nagent.task.achieved"] != nil'
+          - 'set(cache["execution"]["nagent.task.judge_attempt"], attributes["nagent.task.judge_attempt"]) where attributes["nagent.task.judge_attempt"] != nil'
+          - 'set(cache["execution"]["nagent.model.completion_start_time"], attributes["nagent.model.completion_start_time"]) where attributes["nagent.model.completion_start_time"] != nil'
+          - 'set(cache["execution"]["nagent.model.cost_usd"], attributes["nagent.model.cost_usd"]) where attributes["nagent.model.cost_usd"] != nil'
+          - 'set(cache["execution"]["nagent.model.cost_status"], attributes["nagent.model.cost_status"]) where attributes["nagent.model.cost_status"] != nil'
+          - 'set(cache["execution"]["nagent.model.pricing_version"], attributes["nagent.model.pricing_version"]) where attributes["nagent.model.pricing_version"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.temperature"], attributes["nagent.model.parameter.temperature"]) where attributes["nagent.model.parameter.temperature"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.top_p"], attributes["nagent.model.parameter.top_p"]) where attributes["nagent.model.parameter.top_p"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.top_k"], attributes["nagent.model.parameter.top_k"]) where attributes["nagent.model.parameter.top_k"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.max_tokens"], attributes["nagent.model.parameter.max_tokens"]) where attributes["nagent.model.parameter.max_tokens"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.max_completion_tokens"], attributes["nagent.model.parameter.max_completion_tokens"]) where attributes["nagent.model.parameter.max_completion_tokens"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.max_output_tokens"], attributes["nagent.model.parameter.max_output_tokens"]) where attributes["nagent.model.parameter.max_output_tokens"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.frequency_penalty"], attributes["nagent.model.parameter.frequency_penalty"]) where attributes["nagent.model.parameter.frequency_penalty"] != nil'
+          - 'set(cache["execution"]["nagent.model.parameter.presence_penalty"], attributes["nagent.model.parameter.presence_penalty"]) where attributes["nagent.model.parameter.presence_penalty"] != nil'
           - 'set(cache["details"], {})'
+          - 'set(cache["details"]["retrieval_query"], {}) where attributes["nagent.content.retrieval_query"] != nil'
+          - 'set(cache["details"]["retrieval_query"]["content"], attributes["nagent.content.retrieval_query"]) where attributes["nagent.content.retrieval_query"] != nil'
+          - 'set(cache["details"]["retrieval_query"]["original_bytes"], attributes["nagent.content.retrieval_query_original_bytes"]) where attributes["nagent.content.retrieval_query_original_bytes"] != nil'
+          - 'set(cache["details"]["retrieval_query"]["truncated"], attributes["nagent.content.retrieval_query_truncated"]) where attributes["nagent.content.retrieval_query_truncated"] != nil'
+          - 'set(cache["details"]["retrieval_query"]["incomplete"], attributes["nagent.content.retrieval_query_incomplete"]) where attributes["nagent.content.retrieval_query_incomplete"] != nil'
+          - 'set(cache["details"]["retrieval_query"]["observed_bytes"], attributes["nagent.content.retrieval_query_observed_bytes"]) where attributes["nagent.content.retrieval_query_observed_bytes"] != nil'
+          - 'set(cache["details"]["retrieval_results"], {}) where attributes["nagent.content.retrieval_results"] != nil'
+          - 'set(cache["details"]["retrieval_results"]["content"], attributes["nagent.content.retrieval_results"]) where attributes["nagent.content.retrieval_results"] != nil'
+          - 'set(cache["details"]["retrieval_results"]["original_bytes"], attributes["nagent.content.retrieval_results_original_bytes"]) where attributes["nagent.content.retrieval_results_original_bytes"] != nil'
+          - 'set(cache["details"]["retrieval_results"]["truncated"], attributes["nagent.content.retrieval_results_truncated"]) where attributes["nagent.content.retrieval_results_truncated"] != nil'
+          - 'set(cache["details"]["retrieval_results"]["incomplete"], attributes["nagent.content.retrieval_results_incomplete"]) where attributes["nagent.content.retrieval_results_incomplete"] != nil'
+          - 'set(cache["details"]["retrieval_results"]["observed_bytes"], attributes["nagent.content.retrieval_results_observed_bytes"]) where attributes["nagent.content.retrieval_results_observed_bytes"] != nil'
+          - 'set(cache["details"]["judge_verdict"], {}) where attributes["nagent.content.judge_verdict"] != nil'
+          - 'set(cache["details"]["judge_verdict"]["content"], attributes["nagent.content.judge_verdict"]) where attributes["nagent.content.judge_verdict"] != nil'
+          - 'set(cache["details"]["judge_verdict"]["original_bytes"], attributes["nagent.content.judge_verdict_original_bytes"]) where attributes["nagent.content.judge_verdict_original_bytes"] != nil'
+          - 'set(cache["details"]["judge_verdict"]["truncated"], attributes["nagent.content.judge_verdict_truncated"]) where attributes["nagent.content.judge_verdict_truncated"] != nil'
+          - 'set(cache["details"]["judge_verdict"]["incomplete"], attributes["nagent.content.judge_verdict_incomplete"]) where attributes["nagent.content.judge_verdict_incomplete"] != nil'
+          - 'set(cache["details"]["judge_verdict"]["observed_bytes"], attributes["nagent.content.judge_verdict_observed_bytes"]) where attributes["nagent.content.judge_verdict_observed_bytes"] != nil'
+          - 'set(cache["details"]["judge_reason"], {}) where attributes["nagent.content.judge_reason"] != nil'
+          - 'set(cache["details"]["judge_reason"]["content"], attributes["nagent.content.judge_reason"]) where attributes["nagent.content.judge_reason"] != nil'
+          - 'set(cache["details"]["judge_reason"]["original_bytes"], attributes["nagent.content.judge_reason_original_bytes"]) where attributes["nagent.content.judge_reason_original_bytes"] != nil'
+          - 'set(cache["details"]["judge_reason"]["truncated"], attributes["nagent.content.judge_reason_truncated"]) where attributes["nagent.content.judge_reason_truncated"] != nil'
+          - 'set(cache["details"]["judge_reason"]["incomplete"], attributes["nagent.content.judge_reason_incomplete"]) where attributes["nagent.content.judge_reason_incomplete"] != nil'
+          - 'set(cache["details"]["judge_reason"]["observed_bytes"], attributes["nagent.content.judge_reason_observed_bytes"]) where attributes["nagent.content.judge_reason_observed_bytes"] != nil'
           - 'set(cache["details"]["http_request"], {}) where attributes["nagent.content.http_request"] != nil'
           - 'set(cache["details"]["http_request"]["content"], attributes["nagent.content.http_request"]) where attributes["nagent.content.http_request"] != nil'
           - 'set(cache["details"]["http_request"]["original_bytes"], attributes["nagent.content.http_request_original_bytes"]) where attributes["nagent.content.http_request_original_bytes"] != nil'
@@ -396,8 +438,8 @@ processors:
         - 'body["event"] == "log_event_unknown" and severity_number < SEVERITY_NUMBER_WARN and Len(body["details"]) == 0 and (body["message"] == nil or body["message"] == "" or body["message"] == "log_event_unknown") and body["exception"] == nil and (body["stack"] == nil or body["stack"] == "")'
   batch:
     timeout: 5s
-    send_batch_size: 512
-    send_batch_max_size: 512
+    send_batch_size: 64
+    send_batch_max_size: 64
 
 exporters:
   # Trace -> Tempo OTLP receiver（内网服务名）
@@ -407,7 +449,11 @@ exporters:
       insecure: true
     sending_queue:
       enabled: true
-      queue_size: 2048
+      sizer: bytes
+      queue_size: 33554432
+      num_consumers: 1
+      block_on_overflow: false
+      wait_for_result: false
     retry_on_failure:
       initial_interval: 1s
       max_interval: 5s
@@ -419,7 +465,7 @@ exporters:
       enabled: true
     remote_write_queue:
       enabled: true
-      queue_size: 2048
+      queue_size: 32
     retry_on_failure:
       initial_interval: 1s
       max_interval: 5s
@@ -429,7 +475,11 @@ exporters:
     endpoint: http://loki:3100/otlp
     sending_queue:
       enabled: true
-      queue_size: 2048
+      sizer: bytes
+      queue_size: 33554432
+      num_consumers: 1
+      block_on_overflow: false
+      wait_for_result: false
     retry_on_failure:
       initial_interval: 1s
       max_interval: 5s

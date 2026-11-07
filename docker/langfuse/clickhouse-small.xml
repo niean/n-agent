@@ -1,0 +1,29 @@
+<clickhouse>
+    <!-- Small local workload: leave room outside tracked allocations. -->
+    <max_server_memory_usage>1476395008</max_server_memory_usage>
+    <mark_cache_size>16777216</mark_cache_size>
+    <primary_index_cache_size>16777216</primary_index_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <index_mark_cache_size>8388608</index_mark_cache_size>
+    <index_uncompressed_cache_size>0</index_uncompressed_cache_size>
+    <query_cache><max_size_in_bytes>0</max_size_in_bytes></query_cache>
+    <background_pool_size>2</background_pool_size>
+    <background_schedule_pool_size>4</background_schedule_pool_size>
+    <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
+    <background_distributed_schedule_pool_size>2</background_distributed_schedule_pool_size>
+    <background_buffer_flush_schedule_pool_size>2</background_buffer_flush_schedule_pool_size>
+    <merges_mutations_memory_usage_soft_limit>67108864</merges_mutations_memory_usage_soft_limit>
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>0</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_mutation>0</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>0</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+    <!-- Keep diagnostics, with small buffers rather than million-row queues. -->
+    <query_log><max_size_rows>1024</max_size_rows><reserved_size_rows>128</reserved_size_rows><buffer_size_rows_flush_threshold>512</buffer_size_rows_flush_threshold></query_log>
+    <query_thread_log><max_size_rows>1024</max_size_rows><reserved_size_rows>128</reserved_size_rows><buffer_size_rows_flush_threshold>512</buffer_size_rows_flush_threshold></query_thread_log>
+    <part_log><max_size_rows>1024</max_size_rows><reserved_size_rows>128</reserved_size_rows><buffer_size_rows_flush_threshold>512</buffer_size_rows_flush_threshold></part_log>
+    <trace_log><max_size_rows>1024</max_size_rows><reserved_size_rows>128</reserved_size_rows><buffer_size_rows_flush_threshold>512</buffer_size_rows_flush_threshold></trace_log>
+    <text_log><max_size_rows>1024</max_size_rows><reserved_size_rows>128</reserved_size_rows><buffer_size_rows_flush_threshold>512</buffer_size_rows_flush_threshold></text_log>
+    <metric_log><max_size_rows>1024</max_size_rows><reserved_size_rows>128</reserved_size_rows><buffer_size_rows_flush_threshold>512</buffer_size_rows_flush_threshold></metric_log>
+    <asynchronous_metric_log><max_size_rows>1024</max_size_rows><reserved_size_rows>128</reserved_size_rows><buffer_size_rows_flush_threshold>512</buffer_size_rows_flush_threshold></asynchronous_metric_log>
+</clickhouse>

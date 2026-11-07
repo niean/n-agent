@@ -7,6 +7,7 @@ from typing import Any
 
 from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
 from app.infrastructure.llm.telemetry_hook import (
+    report_model_parameters,
     NOOP_CHAT_ATTEMPT as _NOOP_CHAT_ATTEMPT,
 )
 from app.infrastructure.llm.telemetry_hook import (
@@ -130,7 +131,10 @@ class AnthropicProvider:
         with attempt:
             optional_hook(attempt, "set_input", kwargs["messages"],
                           tools=kwargs.get("tools"), system=kwargs.get("system"))
+            report_model_parameters(attempt, kwargs)
             response = await self.client.messages.create(**kwargs)
+            if _get(response, "model"):
+                optional_hook(attempt, "set_response_model", _get(response, "model"))
             usage = getattr(response, "usage", None)
             if usage is not None:
                 _report_anthropic_usage(attempt, usage)
@@ -153,10 +157,14 @@ class AnthropicProvider:
             optional_hook(attempt, "set_input", kwargs["messages"],
                           tools=kwargs.get("tools"), system=kwargs.get("system"))
             try:
+                report_model_parameters(attempt, kwargs)
                 stream = await self.client.messages.create(**kwargs)
                 async for event in stream:
                     event_type = _get(event, "type")
                     if event_type == "message_start":
+                        response_model = _get(_get(event, "message"), "model")
+                        if response_model:
+                            optional_hook(attempt, "set_response_model", response_model)
                         usage = _get(_get(event, "message"), "usage")
                         if usage is not None:
                             _report_anthropic_usage(attempt, usage)
@@ -222,6 +230,7 @@ def _report_anthropic_usage(attempt: Any, usage: Any) -> None:
     missing fields relies on the attempt's no-erase semantics.
     """
     try:
+        optional_hook(attempt, "set_raw_usage", {key: _get(usage, key) for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")})
         ti = _get(usage, "input_tokens")
         to = _get(usage, "output_tokens")
         tic = _get(usage, "cache_read_input_tokens")

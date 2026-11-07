@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 是 Python Agent 服务，提供 OpenAI-compatible HTTP API、LangGraph Agent Runtime、SQLite Memory、Tool Registry、Dashboard 和 Docker Compose 部署（业务与共享观测独立项目） -->
+<!-- SUMMARY: N-Agent 是 Python Agent 服务，提供 OpenAI-compatible HTTP API、LangGraph Agent Runtime、SQLite Memory、Tool Registry、Dashboard 和 Docker Compose 部署（业务与共享观测独立项目）；Langfuse独立部署与Collector并存 -->
 # 项目概览
 
 ## 一句话
@@ -83,3 +83,9 @@ N_AGENT_AGENT_ITERATION_LIMIT=5
 ## 共享观测栈部署
 
 共享后端由 `sh docker/observability/restart.sh` 独立部署，停止用 `sh docker/observability/restart.sh stop`；旧内嵌观测栈先用 `sh docker/observability/restart.sh migrate` 迁移。业务 `sh docker/restart.sh` 只管理 Agent/browser，确保 external n-telemetry 存在，不启动或停止共享后端。具体配置、数据保护及N-KB接入见 `07-observability.md`。
+
+## Langfuse 本地部署
+
+`docker/langfuse/` 是独立项目 n-langfuse，包含 Web、Worker、PostgreSQL、ClickHouse、Redis、MinIO。首次执行 `sh docker/langfuse/restart.sh init` 生成本地 0600 配置，再执行 `sh docker/langfuse/restart.sh start`；须先有共享观测创建的 external n-telemetry 网络。默认 UI 为 http://127.0.0.1:13001，管理员为 admin@n-agent.local，密码只保存在 docker/langfuse/.env。停止使用同入口的 stop，保留持久卷。
+
+Langfuse 复用现有 OTel 采集，在 Collector 增加可选 traces/langfuse 分支；原 Tempo、Loki、Prometheus、Pyroscope、Grafana 与自检继续保留。代码默认关闭该分支；在共享观测 .env 设置 N_OBSERVABILITY_LANGFUSE_ENABLED=true 后执行 `sh docker/observability/restart.sh` 启用。本机已持久启用。具体字段、安全、故障与验收边界见 07-observability.md。

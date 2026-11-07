@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界、Skill 自进化写入治理、Activated Skills 选择流（前端按会话持久化 + chat_service 归一 + context_service 实时求交 + prompt_builder 注入 ## Activated Skills + _INTERNAL_OPTION_KEYS 隔离 Provider）、Task、Browser、Artifact 与 Delegation 多 Agent 委派子域（17 个领域 Policy）、Config Bundle 配置迁移子域（宿主 sh 脚本编排 + 容器内 CLI 导入 + 段级失败收敛与退出码契约）、OTel 可观测子域（GenAI semconv、Domain 零 OTel、application 仅 opentelemetry-api、Domain 公式经组合根注入 telemetry_semantics（set_normalized_token_computer）、SDK 隔离在 infrastructure/observability、OTLP 导出 + 5 服务后端栈 + py-spy 连续 profiling + 自检页外链 C 类运行时配置 otel_link_config + 每条日志实时现场 live scene ContextVar 与 LogSanitizer 脱敏正文/异常恢复、span event 携带脱敏正文、三重封口 Log/span event 放开口）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销 -->
+<!-- SUMMARY: N-Agent 当前阶段与后续完整 Agent 能力的 DDD 架构边界、依赖方向和核心模块原则，含 ToolPolicy 审批、Host Terminal 宿主执行边界、Skill 自进化写入治理、Activated Skills 选择流（前端按会话持久化 + chat_service 归一 + context_service 实时求交 + prompt_builder 注入 ## Activated Skills + _INTERNAL_OPTION_KEYS 隔离 Provider）、Task、Browser、Artifact 与 Delegation 多 Agent 委派子域（17 个领域 Policy）、Config Bundle 配置迁移子域（宿主 sh 脚本编排 + 容器内 CLI 导入 + 段级失败收敛与退出码契约）、OTel 可观测子域（GenAI semconv、Domain 零 OTel、application 仅 opentelemetry-api、Domain 公式经组合根注入 telemetry_semantics（set_normalized_token_computer）、SDK 隔离在 infrastructure/observability、OTLP 导出 + 5 服务后端栈 + py-spy 连续 profiling + 自检页外链 C 类运行时配置 otel_link_config + 每条日志实时现场 live scene ContextVar 与 LogSanitizer 脱敏正文/异常恢复、span event 携带脱敏正文、三重封口 Log/span event 放开口）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销；Langfuse独立部署与Collector并存 -->
 # 架构与模块边界
 
 ## AgentRun 执行账本
@@ -152,3 +152,13 @@ SkillService 在组合根启用 auto_refresh；成功写入后重扫，lifespan 
 HostScriptGrantService 仅接收 SkillManageToolExecutor 服务端绑定的 trusted_write（审批后的受控 replay 保留该来源）。WRITE_FILE 写 scripts/*.py 前以 payload 的 UTF-8 字节计算哈希并持久化 prepared，成功后转 pending，扫描严格通过后自动向宿主同步。目录扫描、SkillSource、frontmatter、外部写入都不能授予权限；历史脚本须经受控重写，不能凭标签追认。
 
 宿主 Bridge 经认证协议独立核对源文件字节，保存私有授权和撤销 tombstone，执行前合并有效授权并使用原有固定目录 fd 和私有字节快照。容器 executor 每次读取新鲜宿主授权，不缓存过时权限；桥接不可用或授权存储损坏时仅保留独立 YAML 手工规则。自动规则仅在 active 时替代同脚本身份的 YAML 规则；撤销后 YAML 精确规则可独立生效。可变 argv 原样传递，仍受参数数量、长度、超时和并发限制。
+
+## Langfuse 并行出口
+
+应用仍只有原 OTel API/SDK、采样与 Collector 地址，不引入 Langfuse SDK，不修改 Domain/Application 或业务数据库。Langfuse Web/Worker 及四种存储运行于 docker/langfuse/ 独立项目；仅 Web 接入 n-telemetry，其余依赖在私有网络。
+
+共享 Collector 的 traces/langfuse 管线负责服务过滤、精确安全投影、Langfuse 字段映射、有界异步发送。Tempo 原副本不变，Log/Metric/Profile 保持原路径。0.137.0 的 OTTL 无法逐 Link 清理属性，因此启用模式使用同版本官方组件的 ocb 发行，额外 linksanitize processor 只清空 Link 属性并生成安全 ID/flags 关联元数据；MutatesData 声明保证 fanout 副本隔离。默认禁用模式仍使用原 contrib 镜像。配置和构建均在 docker/observability/，无应用依赖反向引用。
+
+## Langfuse 语义边界
+
+Application 以 knowledge.search/task.evaluate 描述检索和单次 Judge；Provider 通过可选钩子报告最终参数、实际响应模型及用量，组合根在 UsageService 创建后注入纯费用估算回调。Collector 仅消费这些事实，业务不依赖 Langfuse SDK。

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 十类观测映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收 -->
+<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 类型、模型参数/首输出时间/费用与检索评估映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收；Langfuse独立部署与Collector并存 -->
 # 规范可观测行为
 
 观测回答：做了什么、为何结束、哪里慢、消耗多少。“共性规范”和“验收清单”独立于业务领域、项目、语言、框架及后端选型，可直接复用于其他系统；其余章节记录本项目的实现约定。本文是观测规范的权威源，架构、约定、模式及术语文档维护各自边界并引用本文。具体采集行为以对应观测能力启用为前提；本项目业务费用以 Usage 账本为准。
@@ -40,7 +40,7 @@ Pyroscope 使用持久 filesystem bucket `/var/lib/pyroscope` 与 ingester `/dat
 
 | 信号 | 用途 | 当前组件 |
 |---|---|---|
-| Trace | 看一次执行及各步骤的关系、耗时 | OTel → Collector → Tempo |
+| Trace | 看一次执行及各步骤的关系、耗时 | OTel → Collector → Tempo；可选并行 Langfuse |
 | Log | 看执行现场、输入输出、结束原因和异常 | 应用 stderr；OTel → Collector → Loki |
 | Metric | 看调用量、耗时分布、Token 和失败统计 | OTel → Collector → Prometheus |
 | Profile | 找进程内的代码热点 | py-spy → Pyroscope |
@@ -231,6 +231,7 @@ Resource 保存服务身份信息：服务叫什么、运行哪个版本、具�
 | delegation | 一次委派成员执行 | 委派 ID、成员 ID、角色 |
 | schedule | 一次定时任务领取、执行和投递 | 任务 ID、领取 ID、投递状态 |
 | memory | 一次记忆操作 | 操作、Provider、处理结果 |
+| knowledge | 一次实际知识检索 | query、命中结果和调用结果；外层工具与后端 HTTP 分开 |
 | skill | 一次后台技能审查 | 审查操作及结果 |
 | curator | 一次技能整理 | 整理操作及结果 |
 | gateway | 一次网关消息处理 | 消息处理操作及结果 |
@@ -254,7 +255,8 @@ CLI、ACP、飞书等记录在 request.channel；request 用于入口请求。co
 | 标准 | `chat` | 模型 | 一次模型请求；每次重试分别记录 |
 | 标准 | `execute_tool` | 工具 | 一次工具请求，包括拒绝或执行失败 |
 | 自定义 | `context.compress` | 上下文 | 一次压缩处理 |
-| 自定义 | `task.submit`、`task.run` | Task | 提交任务、后台执行任务 |
+| 自定义 | `task.submit`、`task.run`、`task.evaluate` | Task | 提交、后台执行、单次 Judge 调用与解析 |
+| 自定义 | `knowledge.search` | Knowledge | 校验通过后实际调用检索后端 |
 | 自定义 | `delegation.run_member` | 委派 | 执行一个委派成员 |
 | 自定义 | `schedule.run` | 定时任务 | 一次领取、执行和投递 |
 | 自定义 | `memory.prepare_prompt`、`memory.prefetch`、`memory.sync`、`memory.pre_compress`、`memory.execute_tool`、`memory.probe`、`memory.search` | 记忆 | 实际发生的装配、读取、同步或工具操作 |
@@ -269,7 +271,7 @@ API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际
 
 ### 观测属性 Attributes
 
-项目属性使用 `nagent.<object>.<attribute>` 三段命名，对象和属性使用小写 snake_case。OTel 已有且满足用途的标准属性保留原名，如 service.name、gen_ai.request.model、gen_ai.conversation.id。
+项目属性默认使用 `nagent.<object>.<attribute>` 三段命名，对象和属性使用小写 snake_case；模型参数仅允许固定枚举的 `nagent.model.parameter.<参数名>` 后缀，不放行任意嵌套键。OTel 已有且满足用途的标准属性保留原名，如 service.name、gen_ai.request.model、gen_ai.conversation.id。
 
 下表记录本项目当前使用的字段。GenAI 依据为 `semantic-conventions-genai main @ 2026-10-24 (Development)`，该日期记录现有契约，标准升级需单独核对。允许的字段按实际事实采集，缺失的身份省略。
 
@@ -304,7 +306,9 @@ API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际
 | 项目自定义 | HTTP | `nagent.http.caller`、`nagent.http.direction` | string；脱敏调用位置、server/client | Span 与同一次完成 Log/Event 统一事实 |
 | 项目自定义 | 预算/观测/指标 | `nagent.budget.kind`、`nagent.observation.error`、`nagent.metric.overflow` | string/string/bool；预算类别、观测降级诊断、有界维度归并 | unknown_object 保留安全业务日志，不猜所属对象；overflow 为 bool，不是业务 ID |
 | 项目自定义 | Policy 安全检查 | `nagent.policy.name`、`nagent.policy.version`、`nagent.policy.decision_kind`、`nagent.policy.reason`、`nagent.policy.outcome`、`nagent.policy.scope`、`nagent.policy.occurred_at` | string；策略、版本、决策种类、原因、allow/deny/require_approval、作用域、审计时间 | `LoggingPolicyAuditSink` → 独立 ContextVar → 安全 Log/Event；reason 最多 1024 字符，其余字符串最多 256；无决定不补造 |
-| 项目自定义 | 内容 | `nagent.content.<field>`、`nagent.content.<field>_original_bytes`、`nagent.content.<field>_truncated`、`nagent.content.<field>_incomplete`、`nagent.content.<field>_observed_bytes` | string/int/bool/bool/int；安全正文、完整脱敏长度、截断、中断、已观察长度 | 固定 12×5 精确字段集合；Log/Span/Event 默认每项 1024000 字节；Metric/Profile/ring buffer 不含正文 |
+| 项目自定义 | 内容 | `nagent.content.<field>`、`nagent.content.<field>_original_bytes`、`nagent.content.<field>_truncated`、`nagent.content.<field>_incomplete`、`nagent.content.<field>_observed_bytes` | string/int/bool/bool/int；安全正文、完整脱敏长度、截断、中断、已观察长度 | 固定 16×5 精确字段集合，按操作限制且单操作不超过原 12 项预算；默认每项 1024000 字节；Metric/Profile/ring buffer 不含正文 |
+
+模型参数扩展为精确枚举的 `nagent.model.parameter.<参数名>`，值为有限数，合法负 penalty 保留，bool 不作为数值。`nagent.model.completion_start_time` 为实际首流式输出的 UTC RFC3339 时间；`nagent.model.cost_usd` 为有限非负 USD，`cost_status/pricing_version` 表示既有估算及其版本。`task.evaluate` 使用 `nagent.task.achieved`（bool）与 `nagent.task.judge_attempt`（正整数）。这些字段不是自由前缀出口，未枚举或错误类型仍被丢弃。
 
 ### 事件、状态与结果
 
@@ -435,6 +439,8 @@ Ti 语义修正：自 2026-11-05 部署起，gen_ai.usage.input_tokens 与既有
 | http_request | HTTP 请求详情 |
 | http_response | HTTP 响应详情 |
 | log_fields | 日志的结构化详情 |
+| retrieval_query / retrieval_results | 专用检索输入和结果 |
+| judge_verdict / judge_reason | 专用 Judge 结论和理由 |
 
 每项共五个属性：正文 `nagent.content.<field>`，以及 original_bytes、truncated、incomplete、observed_bytes 四项元数据。正文先统一脱敏，再按每项默认 1024000 字节限长；流式中断保留安全前缀。完整长度未知时省略 original_bytes，observed_bytes 只表示已观察到的长度。
 
@@ -446,22 +452,51 @@ Policy 的 AgentRun 和会话身份取自受信执行快照。领域审计事件
 
 ### Langfuse 类型映射
 
-以下按真实对象和操作解释映射关系，供后续适配使用；当前尚未安装 Langfuse 或完成外部平台验收。映射保留身份、父关系、Link 和安全详情。
+按真实业务操作投影，保留父子关系、身份和安全详情。
 
 | Langfuse 类型 | N-Agent 对应与边界 |
 |---|---|
-| event | 完成、审计、诊断事实；原生 Span Event 不保证自动成为独立 observation |
-| span | HTTP/DB、普通业务操作和压缩；不全标成 Agent |
-| generation | 实际 chat 模型请求及其用量、消息；Usage 账本仍为费用权威 |
-| agent | invoke_agent；Task/Gateway 入口不因含 Agent 就当成 agent |
-| tool | execute_tool，正常、拒绝、异常均有标准 operation 属性；拒绝不等于已执行 |
-| chain | 有实际编排含义的步骤；普通转换不伪装 workflow |
-| retriever | 实际检索步骤；搜索工具/N-KB HTTP 链不等于已有专用标准 retrieval Span |
-| evaluator | 当前无统一专用质量评估 Span/结果契约，不能只凭 Judge 名称认定 |
-| embedding | 当前无统一专用 embeddings Span |
-| guardrail | 实际安全检查证据；当前 Policy Log/Event 不等于独立 guardrail Span，普通选择/分配也不全归此 |
+| event | 保留原生 OTel Span Event，不重复生成独立 observation |
+| span | HTTP/DB、提交、普通业务操作和压缩；未知操作及未核实 N-KB 操作回落此类型 |
+| generation | 实际 chat 模型尝试，保留消息、模型、参数、已知 Token 和可归属费用 |
+| agent | invoke_agent，一次真实 AgentRun |
+| tool | execute_tool；拒绝、失败与是否实际执行分开 |
+| chain | task.run、delegation.run_member、schedule.run、gateway.handle_message、skill.review、curator.run 的真实编排 |
+| retriever | knowledge.search、memory.prefetch、memory.search 的实际读取；外层搜索工具仍为 tool |
+| evaluator | task.evaluate，一次 Goal Mode Judge 调用并解析；格式重试为同级节点，否定 verdict 仍是评估成功 |
+| embedding | 本仓库没有独立向量生成契约；N-KB 未核实前保持 span |
+| guardrail | 未接入独立内容防护 Span；Policy Log/Event 保留审计，普通审批不冒充内容安全检查 |
 
-安全检查与质量评分分别建模。Policy 的选择、分配和安全决定按实际含义判断；工具名含 search、步骤名含 review/Judge 都不足以自动确定 retriever 或 evaluator 类型。
+### Langfuse 字段映射
+
+实现位于 docker/observability/langfuse-config.py，Application 固定契约与 Provider 采集钩子提供事实。
+
+| OTel 事实 | Langfuse 字段 | 处理方式 |
+|---|---|---|
+| 标准 gen_ai.operation.name、自定义 nagent.<object>.operation | langfuse.observation.type | 按服务和精确操作判定上表类型；不根据任意名称猜测 |
+| 可信会话、Agent/Task/委派等身份 | langfuse.session.id、observation.metadata.<原字段名> | 会话和运行身份分别保存，不互相冒充 |
+| 请求/实际响应模型 | observation.model.name | 仅 chat；响应模型优先，请求模型兜底 |
+| 模型最终数值参数 | observation.model.parameters | temperature、top_p、top_k、max_tokens、max_completion_tokens、max_output_tokens、frequency_penalty、presence_penalty；有限数，bool 不算数值 |
+| 流式首个非空文本或工具增量时间 | observation.completion_start_time | UTC RFC3339，只记录一次；空流和无首输出证据的非流式省略 |
+| 已知输入、输出、缓存读、缓存写 | observation.usage_details | 四桶互斥，未知不补零；Agent 汇总只进 metadata |
+| 同次调用的已知 USD 估算 | observation.cost_details.total | 复用 UsageService，四桶及原始用量匹配、estimated 且有 pricing_version 才发送；不重复写账 |
+| 模型/Provider/结束原因、已知性、Agent 统计、压缩 Token、记忆 Provider、结果 | observation.metadata.<原字段名> | 保留规范类型；布尔、计数和字符串数组不混用 |
+| 消息、工具参数/结果 | observation.input/output | 工具专用正文优先，其次完整消息，最后单条消息；只选一份 |
+| retrieval_query/retrieval_results | observation.input/output | 仅 knowledge.search 的安全检索输入输出 |
+| judge_verdict/judge_reason | observation.output / observation.metadata.judge_reason | 仅 task.evaluate；结论属于评估输出，理由保留安全信封；未采集评估对象时不伪造 input，achieved/attempt 另存 metadata |
+| 所选正文来源及完整性 | observation.metadata.input/output | 每次选择重建 source/original_bytes/truncated/incomplete/observed_bytes 信封，未知项省略 |
+| system_prompt、tool_definitions、error | observation.metadata.<字段名> | 独立脱敏有界信封，不覆盖主输入输出；异常正文不进 status_message |
+| 真实 ERROR 状态、受控 error.type | observation.level/status_message | 只按真实 Span ERROR 设置级别；拒绝、取消、等待审批和否定 verdict 不自动升级 |
+| 受信 service.version、合规 deployment.environment.name | langfuse.release/environment | 仅 N-Agent；投影后 Resource 仅保留 service.name，外来 langfuse.* 清除 |
+| 根业务入口自身安全输入输出 | langfuse.trace.input/output | 仅上表六种 chain 且父 Span 为空；无法明确入口时省略，子步骤不覆盖 |
+
+表中 observation.* 均以 langfuse. 为前缀。正文先统一脱敏并按 UTF-8 限长，单项默认 1024000 字节；完整性信封随所选来源整体替换。新增四种详情仅允许对应检索或评估操作使用；普通操作仍最多十二种详情，专用操作仅允许自身两种正文和 error，不扩大传输预算。
+
+Provider 只向观测钩子报告最终请求的数值白名单和必要用量标量，不传递任意 options 或凭据。费用是现有定价表的 USD 估算，账本仍由 UsageService 负责；缺失定价、原始桶、版本或归属证据时不发送费用。未知 Token 不补零，OpenAI 协议不适用的缓存写是已知零。
+
+AgentGraph 当前以非流式方式调用 Provider；HTTP SSE 输出不等于模型传输流式。因此常规 Graph 对话不填首 Token 时间，completion_start_time 只在实际使用 Provider 流式接口并观察到增量时产生。
+
+类型、字段和安全清理只在独立 Langfuse 副本生效；Tempo 保留原属性，Trace/Span/父关系与采样不重排。Link 清空属性，安全 IDs/flags 保存于 metadata.links。N-KB 专用检索、embedding、内容安全防护、Prompt 托管、数据集实验与 Score API 尚无已核实的集成；Judge verdict 不冒充 Langfuse Score。没有经审核的可信用户身份时省略 user.id。
 
 ### 实现与故障隔离
 
@@ -543,3 +578,37 @@ Pyroscope旧策略诊断依据：[v1.21.1磁盘统计](https://github.com/grafan
 ## N-KB 专用共享大盘
 
 `docker/observability/grafana/provisioning/dashboards/nkb-overview.json`、`nkb-logs.json`、`nkb-profile.json`沿用现有provider与数据源UID；固定UID为nkb-overview/nkb-logs/nkb-profile。业务13项指标和系统CPU/RSS映射见 `docker/observability/nkb-metric-name-mapping.md`，该表为锁定版本静态依据，不能称为后端实测。service/instance regex多选；Profile仍仅服务级。Collector对service.name=n-kb显式投影固定执行事实及11项nkb.details详情信封，承接N-KB统一脱敏限长的query、有限结果和异常；JSON body构造后清空N-KB日志attributes，避免未知字段经Loki metadata透传。既有N-Agent管线不变。
+
+## 部署 Langfuse 并行观测
+
+- 独立部署入口为 docker/langfuse/restart.sh，支持 init/start/restart/stop/status/compose；秘密初始化幂等，已有完整凭据不覆写。镜像固定版本，Web/Worker 同为4.76.0，存储版本与 MinIO digest 以该目录 Compose 为准。认证探针禁代理、禁重定向并限制响应长度，启动后核对实际项目 ID，不能仅以容器健康判断初始化成功。
+- 先部署共享观测，再启动 Langfuse；共享 .env 设置 N_OBSERVABILITY_LANGFUSE_ENABLED=true 后执行 `sh docker/observability/restart.sh`。启用时预检、核验项目认证、构建镜像、真实 validate 两份配置后只重建 Collector。首次 ocb 构建需要下载组件依赖，预算900秒，缓存后重建较快。
+- 分支 OTLP/HTTP endpoint 为 http://n-langfuse-web:3000/api/public/otel/v1/traces，使用项目 Basic 认证与 x-langfuse-ingestion-version=4；不配置 gRPC 接入。服务白名单为 n-agent/n-kb；N-Agent 按标准及自定义操作映射 agent/generation/tool/chain/retriever/evaluator，其余为 span；详见本文件类型与字段映射。N-KB 未核实专用契约时仍为 span，不开放正文。
+- session、run、结果、完整性、模型及用量按精确键映射；输入输出优先完整 messages，工具优先专用 arguments/result。Langfuse 仅保留一次正文，原始重复大属性及 Event 正文不再附带；未知字段与外来 langfuse.* 先清除。独立 Link processor 保留原身份/flags/tracestate，清空其属性，并把安全 IDs/flags 放入 metadata.links；原 Tempo 副本不受影响。
+- 每批最多1 Span，exporter 队列按序列化字节限制16MiB，2消费者，满时不阻塞；单请求10秒，重试总预算60秒。故障批次可能丢弃，恢复只保证新数据可交付，不承诺回放。共享进程仍有资源耦合，指标增量固定当前 service_instance_id，验收需用故障计数增量及真实业务在原三信号的交付证明隔离，不能只看健康状态。
+- 关闭分流并仅重建 Collector：`N_OBSERVABILITY_LANGFUSE_ENABLED=false sh docker/observability/restart.sh compose up -d --no-deps --force-recreate otel-collector`；恢复使用普通共享观测 restart。Langfuse 可以独立 stop，不停止原观测栈或业务。
+- 专用验收入口为 `bash tests/e2e/langfuse_smoke.sh`，业务和探针在 Docker 中执行，包含实际模型/calculator、双端操作树/用量/安全详情、未采样/并发、停机/认证/慢响应/队列耗尽、恢复、持久化与固定历史样本。报告记录每次尝试、真实 Trace 和独立会话/容器/原环境清理结果；已确认 Trace 不重复读取大正文。浏览器展示仍按人工清单验收。
+- Dashboard 观测-OTel 页的“外部”区域固定展示 Langfuse 会话链接 `http://langfuse.localhost/project/n-agent-local-project/sessions`，不依赖四链运行时配置，新窗口打开并带 noopener/noreferrer。
+- 既有 Tempo 512MiB 查询容量问题见 D082：多轮审计旧大 Trace 曾 OOM；仅重启原容器恢复且保留卷，不把缓存重置视为容量问题根治。历史对照只证明固定样本，不代表全部历史数据完整性。
+
+## 限制本地小数据量观测内存
+
+2026-11-07曾按N-Agent常规低并发使用收紧默认资源至4.25GiB；后续页面查询暴露Web堆OOM与ClickHouse总内存拒绝，已提高两者预算，原总额不再代表当前部署。memswap_limit等于mem_limit，硬上限不是预占内存，运行时堆、缓存和并发另行约束。
+
+| 组件 | 容器上限 | 内部预算 |
+|---|---|---|
+| Langfuse Web | 2GiB | Node old-space 1024MiB、UV线程2；512MiB堆在页面查询中反复OOM，已提高预算 |
+| Langfuse Worker | 512MiB | Node old-space 256MiB，摄取/Trace并发2、其他工作并发1、写批次100 |
+| ClickHouse | 2GiB | 服务跟踪上限1408MiB、单查询128MiB、查询线程2、后台merge池2、缓存与诊断日志缓冲缩小；原704MiB总上限触发页面查询拒绝 |
+| PostgreSQL | 128MiB | shared_buffers 32MiB、work_mem 2MiB、维护16MiB、连接30；Web/Worker各5连接 |
+| Redis | 64MiB | maxmemory 32MiB，仍用AOF/noeviction |
+| MinIO | 192MiB | GOMEMLIMIT 128MiB、GOMAXPROCS 2、API并发16 |
+| Collector | 256MiB | GOMEMLIMIT 192MiB、limiter 160MiB/spike32MiB，批次64；Tempo/Loki各32MiB字节队列、各1消费者，remote-write队列32批 |
+| Tempo | 512MiB | GOMEMLIMIT 320MiB、查询并发1；保留原查询余量 |
+| Prometheus | 256MiB | 自动Go堆比例0.625、查询并发2/max_samples 2000000 |
+| Grafana | 256MiB | GOMEMLIMIT 160MiB |
+| Loki / Pyroscope | 各192MiB | GOMEMLIMIT各128MiB，Loki查询并发1/并行度2 |
+
+原小内存方案Langfuse合计2.625GiB，OTel栈合计1.625GiB；当前实际容器限额以Compose为准。ClickHouse参数分别在docker/langfuse/clickhouse-small.xml及clickhouse-users-small.xml只读挂载；不改变数据卷、采样、详情上限和7天保留策略。首次试探的ClickHouse512MiB与Web384MiB堆无法稳定完成正常启动/查询，预算须结合页面持续查询核验，不能仅凭短时冒烟成功判断稳定。
+
+小内存验证报告：locals/e2e-reports/small-memory-20261107-064431-92466/result.md。真实模型/calculator对话、Tempo/Langfuse同树及用量/正文、Loki关联、Prometheus增量、固定历史/Profiles和精确会话清理均通过。此配置面向本地小数据量，不代表大批量导出或高并发分析容量。

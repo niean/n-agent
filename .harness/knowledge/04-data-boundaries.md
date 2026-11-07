@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 17 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销 -->
+<!-- SUMMARY: N-Agent 的领域数据模型、配置模型、SQLite schema、协议边界和 Docker Compose 数据挂载边界，含 Host Terminal 宿主侧密钥与只读权威文件边界、Artifact 制品工作台表与 artifacts_root 存储边界、Delegation 委派 7 表（delegations/members/policy_snapshots/results/events/budget_ledger/cancel_outbox）与 delegation_* 配置、delegation- 前缀 child 会话边界、Dashboard 浏览器侧 localStorage（nagent.chat.debug / nagent.chat.activated-skills / nagent.chat.session-source-filter.v1，按前缀归类不进 DB/模型消息/日志/Artifact）、Config Bundle 配置迁移边界（10 段 DB 白名单 + 排除全部运行时数据 + 秘密四态语义 + manifest sha256 双向核对 + 0/1/2/3/4 退出码契约 + N_AGENT_INSTALL_ROOT/N_AGENT_CODE_ROOT 驱动挂载）、OTel 可观测边界（N_AGENT_OTEL_*/N_AGENT_PROFILING_* B 类 env-only 配置 + endpoint 禁 userinfo/query/fragment 校验 + _OTEL_SNAPSHOT_KEYS 快照键白名单 + ring buffer 100 条上限/精确 key 白名单 + 17 instrument 的 metric-name-mapping 权威表 + n-observability独立Compose/external n-telemetry/八个external卷/127.0.0.1绑定/SYS_PTRACE仅业务override + 自检页外链 C 类运行时配置 otel_link_config 单行表三态 overrides/version CAS + GET/PATCH /chat/observations/otel/links）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销；Langfuse独立部署与Collector并存 -->
 # 数据与类型边界
 
 ## 领域模型
@@ -477,3 +477,15 @@ HostScriptGrant 的 origin 仅为 foreground/background_review，脚本必须是
 POST /v1/script-grants 使用现有宿主 token、请求体大小和读取期限，operation 为 list/grant/revoke，grant 为严格结构或 list 时 null；响应为 grants 和 error_code。grant 由宿主重新读取脚本核对哈希，同 revision 幂等，旧 revision 不覆盖新状态，同 revision 撤销后不能恢复。撤销失败仅在意图已持久化时报告 pending_revoke 并重试；数据库持久化失败使当前请求失败，明确文件移除可能已完成。
 
 Config Bundle 不导出 host_script_intents、宿主授权文件、Policy 或 token，也不从导入 Skill 标签重建权限。Dashboard revision 以十进制字符串传输，避免浏览器整数精度损失；界面状态 stale 是 active 授权与当前扫描或文件哈希不一致的投影，不会自动刷新授权。
+
+## Langfuse 并存数据边界
+
+不新增 N-Agent SQLite 表或应用 Settings。N_OBSERVABILITY_LANGFUSE_ENABLED、LANGFUSE_ENV_FILE、LANGFUSE_OTEL_ENDPOINT 是共享观测启动期 env-only 参数，进程环境优先于共享 .env；相对凭据路径以仓库根解析。禁用时不读取 Langfuse 凭据，迁移需先禁用新分支。
+
+Langfuse 独立的五个卷为 postgres-data、clickhouse-data、clickhouse-logs、redis-data、minio-data（项目 n-langfuse），不复用或删除原八个观测 external 卷。密钥和管理员密码仅在 docker/langfuse/.env（0600）；LANGFUSE_PORT/LANGFUSE_S3_PORT 可启动期覆盖，默认 loopback 13001/19090，不发布数据库、Worker 或 MinIO 管理控制台。
+
+Collector 派生配置位于 locals/harness_tmp/langfuse-collector/，目录0700、文件0600，内容 hash 命名且原子发布，不替换已挂载 inode。认证仅进入新增 HTTP exporter，不进入应用、Dashboard、指标或报告。新增正文仅投影现有已脱敏且每项最多1024000 UTF-8字节的字段；未知 usage 不填0，缓存读写与普通输入为不重叠用量桶。费用仍以 Usage 账本为准。
+
+## Langfuse 语义边界
+
+观测固定详情包含 retrieval_query/retrieval_results/judge_verdict/judge_reason，仅允许相应专用操作；普通操作仍最多十二项。模型参数为有限数值白名单，费用必须有同次调用的完整已知桶及定价版本；不新增数据库表或运行配置。具体属性与出口规则见 07-observability.md。

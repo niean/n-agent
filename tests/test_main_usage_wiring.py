@@ -53,3 +53,24 @@ def test_usage_recorder_uses_same_sqlite_path(tmp_path: Path):
     # we verify it via the public init() being callable again idempotently)
     import asyncio
     asyncio.run(recorder.init())
+
+
+def test_model_cost_estimator_is_injected_after_usage_service(tmp_path):
+    settings = _settings(tmp_path)
+    settings.otel_enabled = True
+    services = build_application_services(settings)
+    telemetry = services.telemetry
+    # The provider factory was created earlier and holds this bound method.
+    callback = telemetry.begin_chat_attempt
+    attempt = callback(model='gpt-4o', stream=False, provider='openai')
+    estimator = attempt._cost_estimator
+    raw = {'prompt_tokens': 10, 'completion_tokens': 4,
+           'prompt_tokens_details': {'cached_tokens': 2}}
+    result = estimator(raw, 'gpt-4o', 'openai', (8, 4, 2, 0))
+    assert result['status'] == 'estimated'
+    assert result['pricing_version']
+    assert result['amount_usd'] >= 0
+    assert estimator(raw, 'gpt-4o', 'openai', (10, 4, 2, 0)) is None
+    unknown = estimator(raw, 'no-pricing-model', 'openai', (8, 4, 2, 0))
+    assert unknown['status'] == 'unknown'
+    assert estimator({'prompt_tokens': 10, 'completion_tokens': 4}, 'gpt-4o', 'openai', (10, 4, 0, 0)) is None

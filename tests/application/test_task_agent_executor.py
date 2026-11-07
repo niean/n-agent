@@ -597,6 +597,62 @@ class FakeJudgeChatService:
         return self._worker_result
 
 
+@pytest.mark.parametrize("content", [
+    "{'achieved': True, 'reason': 'both workspace artifacts verified'}",
+    '```python\n{\'achieved\': False, \'reason\': \'missing artifact\'}\n```',
+    'Verdict: {"achieved": true, "reason": "verified {a} and b"}\nDone.',
+])
+def test_judge_recovers_unambiguous_verdict_formats(executor, content):
+    result = ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": content}, finish_reason="stop",
+    )
+    verdict = executor._parse_judge_result(result)
+    assert verdict is not None
+    assert verdict.achieved is ("False" not in content)
+    assert verdict.reason
+
+
+@pytest.mark.parametrize("content", [
+    '[]', 'null', 'true', '1', '{}',
+    '{"achieved": "false", "reason": "missing"}',
+    '{"achieved": 1, "reason": "done"}',
+    '{"achieved": true}', '{"achieved": true, "reason": null}',
+    '{"achieved": true, "reason": "  "}',
+    '{"achieved": true, "reason": []}',
+    '{"achieved": true, "reason": "yes"} {"achieved": false, "reason": "no"}',
+    "{'achieved': bool(1), 'reason': 'done'}",
+])
+def test_judge_rejects_invalid_or_ambiguous_verdict(executor, content):
+    result = ChatCompletionResult(
+        session_id="task-t_1", model="N-Agent",
+        message={"role": "assistant", "content": content}, finish_reason="stop",
+    )
+    assert executor._parse_judge_result(result) is None
+
+
+@pytest.mark.asyncio
+async def test_judge_format_retry_does_not_repeat_worker():
+    class RepairChat(FakeJudgeChatService):
+        async def complete(self, request):
+            if request.trusted_metadata.get("judge"):
+                count = sum(bool(c.trusted_metadata.get("judge")) for c in self.complete_calls)
+                self._judge_result_text = 'unparseable' if count == 0 else '{"achieved": true, "reason": "verified"}'
+            return await super().complete(request)
+
+    chat = RepairChat(FakeChatService()._result, "")
+    executor = TaskAgentExecutor(chat_service=chat, task_registry=_completed_registry(), prompt_builder=FakePromptBuilder())
+    result = await executor.run_goal_loop(_task(goal_mode=True), 1, "L1")
+    assert result.status == TaskRunOutcome.COMPLETED
+    assert len([c for c in chat.complete_calls if not c.trusted_metadata.get("judge")]) == 1
+    judges = [c for c in chat.complete_calls if c.trusted_metadata.get("judge")]
+    assert len(judges) == 2
+    assert all(c.persist_messages is False for c in judges)
+    assert judges[0].ingress_facts.run_id != judges[1].ingress_facts.run_id
+    assert all(c.trusted_metadata["permitted_managed_tools"] == ["task_show"] for c in judges)
+    assert "strict JSON" in judges[1].messages[-1]["content"]
+
+
 @pytest.mark.asyncio
 async def test_goal_mode_multi_turn_until_judge_passes():
     worker_result = ChatCompletionResult(
@@ -757,6 +813,8 @@ async def test_goal_mode_invalid_judge_json_is_retryable_failure():
     result = await executor.run_goal_loop(task, task_run_id=1, claim_lock="L1")
     assert result.status == TaskRunOutcome.FAILED
     assert "judge" in (result.error or "").lower()
+    assert len([c for c in chat.complete_calls if c.trusted_metadata.get("judge")]) == 2
+    assert len([c for c in chat.complete_calls if not c.trusted_metadata.get("judge")]) == 1
 
 
 @pytest.mark.asyncio

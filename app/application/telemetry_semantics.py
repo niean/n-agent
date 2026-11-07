@@ -34,6 +34,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import math
+from datetime import datetime, timezone
 import re
 import threading
 import time
@@ -47,7 +49,7 @@ from app.application.telemetry_details import (
     project_details, validate_details, flatten_details, StreamDetailsAccumulator,
 )
 from app.application.telemetry_contract import (
-    resolve_operation, normalize_outcome, project_execution_attributes, completion_event,
+    resolve_operation, normalize_outcome, project_execution_attributes, completion_event, operation_content_fields,
 )
 
 from opentelemetry import trace
@@ -179,7 +181,9 @@ def _scene_publish(overrides: Dict[str, object]) -> None:
 def _complete(span, operation, start, *, details=None, **facts):
     """Emit a fixed structural description only while the completed span is current."""
     try:
-        projected = validate_details(details)
+        spec = resolve_operation(operation)
+        allowed = operation_content_fields(spec.object, spec.action) if spec else frozenset()
+        projected = {key: value for key, value in validate_details(details).items() if key in allowed}
         if projected:
             facts['details'] = projected
         facts = {k: v for k, v in facts.items() if v is not None}
@@ -900,7 +904,7 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
     spec = resolve_operation(operation)
     ids = {k: v for k, v in {"session_id": _safe_id(session_id),
            'run_id' if spec and spec.object == 'task' else 'id': _safe_id(run_id)}.items() if v is not None}
-    ids.update({key: value for key, value in inherited_ids.items() if key in {'agent_run_id', 'agent_source'}})
+    ids = {**{key: value for key, value in inherited_ids.items() if key in {'agent_run_id', 'agent_source', 'session_id'}}, **ids}
     ids.update({key: value for key, value in (identifiers or {}).items() if key in _BUSINESS_IDENTIFIERS})
     _execution_ids.set(ids)
     _scene_var.set({"operation": operation})
@@ -924,13 +928,20 @@ def business_operation(operation, *, source=None, session_id=None, run_id=None,
                 facts['error_type'] = _safe_error_type(exc)
                 raise
             except BaseException as exc:
-                facts["outcome"] = _operation_outcome(exc, None)
-                facts['error_type'] = _safe_error_type(exc)
-                try:
-                    facts.setdefault("details", {}).update(project_details(error=str(exc)))
-                except Exception:
-                    pass
-                _mark_span_error(span, exc)
+                # Business boundaries may recognize their own domain cancellation.
+                # Match the exact rethrown exception so an earlier cancellation
+                # classification cannot hide an unrelated execution failure.
+                cancelled = facts.pop('_cancelled_exception', None) is exc
+                if cancelled:
+                    facts.update(outcome='cancelled', error_type='cancelled')
+                else:
+                    facts["outcome"] = _operation_outcome(exc, None)
+                    facts['error_type'] = _safe_error_type(exc)
+                    try:
+                        facts.setdefault("details", {}).update(project_details(error=str(exc)))
+                    except Exception:
+                        pass
+                    _mark_span_error(span, exc)
                 raise
             finally:
                 outcome = facts.get("outcome", "success")
@@ -953,7 +964,7 @@ _BUSINESS_OPERATIONS = {
     "cli.request": "CLI 请求处理", "acp.request": "ACP 请求处理",
     "gateway.message": "网关消息处理", "feishu.event": "飞书事件处理",
     "task.run": "后台任务执行", "delegation.member": "委派成员执行",
-    "task.submit": "任务提交",
+    "task.submit": "任务提交", "task.evaluate": "任务评估", "knowledge.search": "知识检索",
     "skill.review": "技能后台审查", "curator.run": "技能整理执行",
 }
 _MEMORY_PROVIDERS = frozenset({"builtin", "multi-project", "mem0", "honcho", "holographic", "other"})
@@ -1531,6 +1542,12 @@ def clear_run_context() -> None:
 class NoopChatAttempt:
     """No-op replacement returned when telemetry is disabled."""
 
+    def set_model_parameters(self, parameters):
+        pass
+
+    def set_raw_usage(self, raw_usage):
+        pass
+
     def set_input(self, messages, tools=None, system=None):
         pass
 
@@ -1595,8 +1612,12 @@ class ChatAttempt:
         stream: Optional[bool],
         provider: Optional[str] = "openai",
         operation: str = "chat",
+        cost_estimator=None,
     ):
         self._model = model
+        self._cost_estimator = cost_estimator
+        self._raw_usage = {}
+        self._completion_started = False
         self._provider = provider
         self._operation = operation
         self._stream = stream
@@ -1633,6 +1654,55 @@ class ChatAttempt:
             stats.inference_calls += 1
         return self
 
+    def set_model_parameters(self, parameters):
+        from app.application.telemetry_contract import MODEL_PARAMETER_NAMES, _valid_attribute_value
+        try:
+            for name in MODEL_PARAMETER_NAMES:
+                value = parameters.get(name)
+                key = f'nagent.model.parameter.{name}'
+                if _valid_attribute_value(key, value) and self._span is not None:
+                    _set_attr(self._span, key, value)
+        except Exception:
+            pass
+
+    def set_raw_usage(self, raw_usage):
+        # Retain only scalar accounting facts, never arbitrary SDK metadata.
+        try:
+            fields = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens') if self._provider == 'anthropic' else ('prompt_tokens', 'completion_tokens')
+            for key in fields:
+                value = raw_usage.get(key)
+                if _valid_count(value):
+                    self._raw_usage[key] = value
+            if self._provider != 'anthropic':
+                cached = (raw_usage.get('prompt_tokens_details') or {}).get('cached_tokens')
+                if _valid_count(cached):
+                    self._raw_usage['prompt_tokens_details'] = {'cached_tokens': cached}
+        except Exception:
+            pass
+
+    def _first_output(self):
+        if self._stream and not self._completion_started and self._span is not None:
+            self._completion_started = True
+            _set_attr(self._span, 'nagent.model.completion_start_time', datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
+
+    def _record_cost(self):
+        try:
+            buckets = (self._input_tokens, self._output_tokens, self._cache_read_tokens, self._cache_write_tokens)
+            if not callable(self._cost_estimator) or not all(_valid_count(v) for v in buckets):
+                return
+            result = self._cost_estimator(self._raw_usage, self._model, self._provider, buckets)
+            if not isinstance(result, dict):
+                return
+            amount = result.get('amount_usd')
+            version = result.get('pricing_version')
+            if (result.get('status') == 'estimated' and isinstance(version, str) and version.strip()
+                    and type(amount) in (int, float) and math.isfinite(amount) and amount >= 0):
+                _set_attr(self._span, 'nagent.model.cost_usd', amount)
+                _set_attr(self._span, 'nagent.model.cost_status', 'estimated')
+                _set_attr(self._span, 'nagent.model.pricing_version', version)
+        except Exception:
+            pass
+
     def set_input(self, messages, tools=None, system=None):
         try:
             ordinary = messages
@@ -1662,6 +1732,8 @@ class ChatAttempt:
 
     def append_output_text(self, text):
         try:
+            if isinstance(text, str) and text:
+                self._first_output()
             if self._output_accumulator is None:
                 self._output_accumulator = StreamDetailsAccumulator()
             self._output_accumulator.append_text(text)
@@ -1670,6 +1742,8 @@ class ChatAttempt:
 
     def append_output_tool_delta(self, index, id=None, name=None, arguments=None):
         try:
+            if any(isinstance(v, str) and v for v in (id, name, arguments)):
+                self._first_output()
             if self._output_accumulator is None:
                 self._output_accumulator = StreamDetailsAccumulator()
             self._output_accumulator.append_tool_delta(index, id=id, name=name, arguments=arguments)
@@ -1732,6 +1806,7 @@ class ChatAttempt:
         try:
             elapsed = time.monotonic() - self._start
             if self._span is not None:
+                self._record_cost()
                 if self._input_tokens is not None:
                     _set_attr(self._span, GEN_AI_USAGE_INPUT_TOKENS, self._input_tokens)
                 if self._output_tokens is not None:
@@ -1814,6 +1889,9 @@ class ChatAttempt:
 class NoopTelemetry:
     """Default facade when observability is disabled: every hook is a no-op."""
 
+    def set_cost_estimator(self, estimator):
+        pass
+
     def agent_run(self, session_id=None, source=None, run_id=None, message_count=None):
         handle = SimpleNamespace(end_reason=None, outcome=None, details={})
         return _nullcontext_yielding(handle)
@@ -1854,6 +1932,9 @@ class SemanticsTelemetry:
     untouched, spans are closed exactly once in ``finally``, and every
     metric goes through the bounded safe mappings.
     """
+
+    def set_cost_estimator(self, estimator):
+        self._cost_estimator = estimator if callable(estimator) else None
 
     # -- agent run ---------------------------------------------------------
 
@@ -2064,5 +2145,6 @@ class SemanticsTelemetry:
         self, *, model, stream, provider="openai", operation="chat"
     ) -> ChatAttempt:
         return ChatAttempt(
-            model=model, stream=stream, provider=provider, operation=operation
+            model=model, stream=stream, provider=provider, operation=operation,
+            cost_estimator=getattr(self, "_cost_estimator", None),
         )

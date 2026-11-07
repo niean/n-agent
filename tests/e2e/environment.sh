@@ -51,13 +51,21 @@ print(":".join(str(Path(p).resolve()) for p in paths))
   printf '{"services":{"n-agent":{"environment":{"N_AGENT_SKILLS_BACKGROUND_REVIEW_ENABLED":"%s","N_AGENT_SKILLS_CURATOR_ENABLED":"false"}}}}\n' \
     "$enabled" > "$tmp/override.json"
   restore() {
-    local result=$?
+    local result=$? restore_status=PASS
     trap - EXIT
     # Preserve test failures; restoration failures must fail a successful run.
     if ! (cd "$root/docker" && COMPOSE_FILE="$original_files" \
       docker compose up -d --force-recreate --no-deps --wait n-agent); then
       echo "E2E environment: failed to restore original n-agent deployment" >&2
+      restore_status=FAIL
       [ "$result" -ne 0 ] || result=1
+    fi
+    if [ -n "${N_AGENT_E2E_RESTORE_STATUS_FILE:-}" ]; then
+      local status_tmp="${N_AGENT_E2E_RESTORE_STATUS_FILE}.tmp.$$"
+      if ! (umask 077; printf '%s\n' "$restore_status" > "$status_tmp" &&
+          mv "$status_tmp" "$N_AGENT_E2E_RESTORE_STATUS_FILE"); then
+        result=1
+      fi
     fi
     rm -rf "$tmp"
     exit "$result"

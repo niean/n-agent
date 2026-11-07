@@ -13,6 +13,7 @@
   const CONTAINER_ID = 'tab-observations-otel';
   const OTEL_API_URL = '/chat/observations/otel';
   const LINKS_CONFIG_API_URL = '/chat/observations/otel/links';
+  const LANGFUSE_URL = 'http://langfuse.localhost/project/n-agent-local-project/sessions';
   const LINK_CONFIG_FIELDS = [
     ['metric_base_url', 'Metric'],
     ['log_base_url', 'Log'],
@@ -272,7 +273,7 @@
     const body = el('div', 'panel-body');
     section.appendChild(header);
     section.appendChild(body);
-    const links = data.links || {};
+    const links = Object.assign({}, data.links || {}, { Langfuse: LANGFUSE_URL });
     const names = Object.keys(links);
     if (!names.length) {
       body.appendChild(el('div', 'muted empty-state', '未配置外部链接'));
@@ -392,7 +393,7 @@
     } else if (input.value.trim() === '') {
       label = (overridden && original === '') ? '已禁用' : '跟随环境';
     } else if (overridden || input.value.trim() !== original.trim()) {
-      label = '自定义';
+      label = '';
     } else {
       label = '跟随环境';
     }
@@ -472,11 +473,8 @@
     form.appendChild(body);
     form.appendChild(el('div', 'providers-form__hint muted', '修改后留空表示跟随环境变量默认配置，未修改字段保持原配置'));
     const footer = ui.el('div', 'providers-form__actions');
-    const restoreBtn = modalButton('btn btn--danger', '恢复默认');
-    restoreBtn.style.marginRight = 'auto';
     const cancelBtn = modalButton('btn', '取消');
     const saveBtn = modalButton('btn btn--primary', '保存', 'submit');
-    footer.appendChild(restoreBtn);
     footer.appendChild(cancelBtn);
     footer.appendChild(saveBtn);
     form.appendChild(footer);
@@ -500,13 +498,11 @@
     }
     function setButtons() {
       saveBtn.disabled = state.submitting || !state.snapshot;
-      restoreBtn.disabled = state.submitting || !state.snapshot;
     }
 
     closeBtn.addEventListener('click', function () { close(); });
     cancelBtn.addEventListener('click', function () { close(); });
     form.addEventListener('submit', function (ev) { ev.preventDefault(); onSubmit(); });
-    restoreBtn.addEventListener('click', function () { onRestore(); });
 
     function renderLoadError(message, allowRetry) {
       body.replaceChildren();
@@ -631,36 +627,6 @@
         if (!alive()) return;
         close();
         alertShared('链接配置已保存');
-        runLoad(true);
-      } catch (err) {
-        if (!alive()) return;
-        handlePatchError(err);
-      }
-    }
-
-    async function onRestore() {
-      if (state.submitting || !state.snapshot) return;
-      // Take the submit lock before awaiting the shared confirm so neither a
-      // second restore nor a save can issue a PATCH while waiting.
-      state.submitting = true;
-      setButtons();
-      // Missing shared confirm defaults to "not confirmed": never write.
-      const confirmed = (namespace.modal && typeof namespace.modal.confirm === 'function')
-        ? await namespace.modal.confirm('确认恢复默认？所有字段将跟随环境变量配置。')
-        : false;
-      if (!alive()) return;
-      if (!confirmed) {
-        state.submitting = false;
-        setButtons();
-        return;
-      }
-      const payload = { expected_version: state.snapshot.version };
-      LINK_CONFIG_FIELDS.forEach(function (pair) { payload[pair[0]] = null; });
-      try {
-        await sendPatch(payload);
-        if (!alive()) return;
-        close();
-        alertShared('已恢复默认链接配置');
         runLoad(true);
       } catch (err) {
         if (!alive()) return;

@@ -29,6 +29,7 @@ _definitions = {
     'nagent.context.compress': ('context', 'compress', None),
     'context.compress': ('context', 'compress', None),
     'task.submit': ('task', 'submit', None), 'task.run': ('task', 'run', None),
+    'task.evaluate': ('task', 'evaluate', None), 'knowledge.search': ('knowledge', 'search', None),
     'delegation.member': ('delegation', 'run_member', None),
     'delegation.run_member': ('delegation', 'run_member', None),
     'schedule.execute': ('schedule', 'run', None), 'schedule.run': ('schedule', 'run', None),
@@ -41,17 +42,18 @@ _definitions = {
 }
 for _old, _action in {'prompt': 'prepare_prompt', 'prefetch': 'prefetch', 'sync': 'sync', 'pre_compress': 'pre_compress', 'tool': 'execute_tool', 'probe': 'probe', 'search': 'search', 'prepare_prompt': 'prepare_prompt', 'execute_tool': 'execute_tool'}.items():
     _definitions[f'memory.{_old}'] = ('memory', _action, None)
-OBJECTS = frozenset({'agent', 'model', 'tool', 'context', 'task', 'delegation', 'schedule', 'memory', 'skill', 'curator', 'gateway', 'request', 'http', 'budget', 'policy', 'observation', 'metric', 'content'})
+OBJECTS = frozenset({'agent', 'model', 'tool', 'context', 'task', 'delegation', 'schedule', 'memory', 'skill', 'curator', 'gateway', 'request', 'http', 'budget', 'policy', 'observation', 'metric', 'content', 'knowledge'})
+MODEL_PARAMETER_NAMES = ('temperature', 'top_p', 'top_k', 'max_tokens', 'max_completion_tokens', 'max_output_tokens', 'frequency_penalty', 'presence_penalty')
 OBJECT_ATTRIBUTES = MappingProxyType({
     'agent': ('source', 'run_id', 'iteration', 'end_reason', 'message_count', 'inference_calls', 'tool_calls', 'usage_known'),
-    'model': ('message_count', 'usage_known', 'cache_read_tokens', 'cache_write_tokens'), 'tool': ('policy_outcome', 'risk_level', 'executed'),
-    'context': ('before_tokens', 'after_tokens'), 'task': ('id', 'run_id', 'trace_context', 'state'),
+    'model': ('message_count', 'usage_known', 'cache_read_tokens', 'cache_write_tokens', 'completion_start_time', 'cost_usd', 'cost_status', 'pricing_version', *(f'parameter.{key}' for key in MODEL_PARAMETER_NAMES)), 'tool': ('policy_outcome', 'risk_level', 'executed'),
+    'context': ('before_tokens', 'after_tokens'), 'task': ('id', 'run_id', 'trace_context', 'state', 'achieved', 'judge_attempt'),
     'delegation': ('id', 'member_id', 'role'), 'schedule': ('task_id', 'claim_id', 'delivery_status'),
     'memory': ('provider',), 'request': ('channel', 'id'), 'http': ('caller', 'direction'),
     'budget': ('kind',), 'policy': ('name', 'version', 'decision_kind', 'reason', 'outcome', 'scope', 'occurred_at'),
     'observation': ('error',), 'metric': ('overflow',),
 })
-CONTENT_FIELDS = ('input_messages', 'user_message', 'assistant_message', 'system_prompt', 'tool_definitions', 'output_messages', 'tool_arguments', 'tool_result', 'error', 'http_request', 'http_response', 'log_fields')
+CONTENT_FIELDS = ('input_messages', 'user_message', 'assistant_message', 'system_prompt', 'tool_definitions', 'output_messages', 'tool_arguments', 'tool_result', 'error', 'http_request', 'http_response', 'log_fields', 'retrieval_query', 'retrieval_results', 'judge_verdict', 'judge_reason')
 CONTENT_ATTRIBUTE_KEYS = frozenset(f'nagent.content.{field}{suffix}' for field in CONTENT_FIELDS for suffix in ('', '_original_bytes', '_truncated', '_incomplete', '_observed_bytes'))
 _standard = {'session_id': 'gen_ai.conversation.id', 'model': 'gen_ai.request.model', 'provider': 'gen_ai.provider.name', 'response_model': 'gen_ai.response.model', 'tool': 'gen_ai.tool.name', 'call_id': 'gen_ai.tool.call.id', 'input_tokens': 'gen_ai.usage.input_tokens', 'output_tokens': 'gen_ai.usage.output_tokens', 'finish_reason': 'gen_ai.response.finish_reasons', 'stream': 'gen_ai.request.stream', 'error_type': 'error.type'}
 OUTCOMES = frozenset({'success', 'failure', 'denied', 'cancelled', 'timed_out', 'skipped', 'deferred', 'unknown'})
@@ -68,9 +70,19 @@ _instruments = {
 }
 
 
+def operation_content_fields(obj, action):
+    if (obj, action) == ('knowledge', 'search'):
+        return frozenset(('retrieval_query', 'retrieval_results', 'error'))
+    if (obj, action) == ('task', 'evaluate'):
+        return frozenset(('judge_verdict', 'judge_reason', 'error'))
+    return frozenset(CONTENT_FIELDS[:-4])
+
+
 def _operation_spec(obj, action, standard):
     local = frozenset(f'nagent.{obj}.{field}' for field in (*OBJECT_ATTRIBUTES.get(obj, ()), 'outcome', 'summary', 'duration_ms'))
-    local |= frozenset(_standard_local.get(obj, ())) | {'error.type'} | CONTENT_ATTRIBUTE_KEYS
+    fields = operation_content_fields(obj, action)
+    content_keys = frozenset(f'nagent.content.{field}{suffix}' for field in fields for suffix in ('', '_original_bytes', '_truncated', '_incomplete', '_observed_bytes'))
+    local |= frozenset(_standard_local.get(obj, ())) | {'error.type'} | content_keys
     local |= {'gen_ai.operation.name'} if standard else {f'nagent.{obj}.operation'}
     return OperationSpec(obj, action, standard, standard or f'{obj}.{action}', f'nagent.{obj}.completed', local, SHARED_ATTRIBUTES, OUTCOMES, _instruments.get(obj, ()))
 
@@ -92,7 +104,7 @@ _attribute_types.update({key: 'integer' for key in (
 )})
 _attribute_types.update({key: 'boolean' for key in (
     'gen_ai.request.stream', 'nagent.agent.usage_known', 'nagent.model.usage_known',
-    'nagent.tool.executed', 'nagent.metric.overflow',
+    'nagent.tool.executed', 'nagent.metric.overflow', 'nagent.task.achieved',
 )})
 _attribute_types.update({f'nagent.{spec.object}.duration_ms': 'number' for spec in OPERATIONS.values()})
 _attribute_types.update({f'nagent.content.{field}_{suffix}': kind
@@ -100,6 +112,9 @@ _attribute_types.update({f'nagent.content.{field}_{suffix}': kind
         ('original_bytes', 'integer'), ('observed_bytes', 'integer'),
         ('truncated', 'boolean'), ('incomplete', 'boolean'))})
 _attribute_types['gen_ai.response.finish_reasons'] = 'string_array'
+_attribute_types['nagent.task.judge_attempt'] = 'positive_integer'
+_attribute_types.update({f'nagent.model.parameter.{key}': 'finite_signed_number' for key in MODEL_PARAMETER_NAMES})
+_attribute_types['nagent.model.cost_usd'] = 'number'
 ATTRIBUTE_TYPES = MappingProxyType(_attribute_types)
 
 
@@ -107,10 +122,14 @@ def _valid_attribute_value(key, value):
     kind = ATTRIBUTE_TYPES.get(key)
     if kind == 'string':
         return isinstance(value, str)
+    if kind == 'positive_integer':
+        return type(value) is int and value > 0
     if kind == 'integer':
         return type(value) is int and value >= 0
     if kind == 'boolean':
         return type(value) is bool
+    if kind == 'finite_signed_number':
+        return type(value) in (int, float) and math.isfinite(value)
     if kind == 'number':
         return (type(value) is int and value >= 0
                 or type(value) is float and math.isfinite(value) and value >= 0)

@@ -1,0 +1,188 @@
+name: n-langfuse
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+x-dependencies: &dependencies
+  postgres: {condition: service_healthy}
+  redis: {condition: service_healthy}
+  clickhouse: {condition: service_healthy}
+  minio: {condition: service_healthy}
+x-environment: &environment
+  HOSTNAME: 0.0.0.0
+  NEXTAUTH_URL: http://127.0.0.1:${LANGFUSE_PORT:-13001}
+  DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Run init}@postgres:5432/langfuse?connection_limit=5&pool_timeout=20
+  SALT: ${SALT:?Run init}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run init}
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: langfuse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Run init}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_AUTH:?Run init}
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Run init}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Run init}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://127.0.0.1:${LANGFUSE_S3_PORT:-19090}
+  LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+services:
+  langfuse-web:
+    <<: *common
+    image: docker.langfuse.com/langfuse/langfuse:4.76.0
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
+    depends_on: *dependencies
+    ports: ["127.0.0.1:${LANGFUSE_PORT:-13001}:3000"]
+    networks:
+      default: {}
+      telemetry:
+        aliases: [n-langfuse-web]
+    environment:
+      <<: *environment
+      NODE_OPTIONS: --max-old-space-size=1024
+      UV_THREADPOOL_SIZE: "2"
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Run init}
+      LANGFUSE_INIT_ORG_ID: n-agent-local-org
+      LANGFUSE_INIT_ORG_NAME: N-Agent Local
+      LANGFUSE_INIT_PROJECT_ID: n-agent-local-project
+      LANGFUSE_INIT_PROJECT_NAME: N-Agent
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:?Run init}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:?Run init}
+      LANGFUSE_INIT_USER_EMAIL: admin@n-agent.local
+      LANGFUSE_INIT_USER_NAME: N-Agent Admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?Run init}
+      AUTH_DISABLE_SIGNUP: "true"
+      AUTH_SESSION_MAX_AGE: "525600"
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/public/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+      start_period: 30s
+  langfuse-worker:
+    <<: *common
+    image: docker.langfuse.com/langfuse/langfuse-worker:4.76.0
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 2
+    depends_on: *dependencies
+    environment:
+      <<: *environment
+      NODE_OPTIONS: --max-old-space-size=256
+      UV_THREADPOOL_SIZE: "2"
+      LANGFUSE_OTEL_INGESTION_QUEUE_PROCESSING_CONCURRENCY: "2"
+      LANGFUSE_OTEL_INGESTION_SECONDARY_QUEUE_PROCESSING_CONCURRENCY: "1"
+      LANGFUSE_INGESTION_QUEUE_PROCESSING_CONCURRENCY: "2"
+      LANGFUSE_INGESTION_SECONDARY_QUEUE_PROCESSING_CONCURRENCY: "1"
+      LANGFUSE_TRACE_UPSERT_WORKER_CONCURRENCY: "2"
+      LANGFUSE_EVAL_CREATOR_WORKER_CONCURRENCY: "1"
+      LANGFUSE_EVAL_EXECUTION_WORKER_CONCURRENCY: "1"
+      LANGFUSE_LLM_AS_JUDGE_EXECUTION_WORKER_CONCURRENCY: "1"
+      LANGFUSE_INGESTION_CLICKHOUSE_WRITE_BATCH_SIZE: "100"
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3030/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 50
+      start_period: 30s
+  postgres:
+    <<: *common
+    image: postgres:17.6-alpine3.22
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: langfuse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run init}
+    command: [postgres, -c, shared_buffers=32MB, -c, work_mem=2MB, -c, maintenance_work_mem=16MB, -c, max_connections=30]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD, pg_isready, -U, postgres, -d, langfuse]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    <<: *common
+    image: redis:7.4.5-alpine3.21
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 0.5
+    environment:
+      REDISCLI_AUTH: ${REDIS_AUTH:?Run init}
+    command: [redis-server, --requirepass, "${REDIS_AUTH:?Run init}", --appendonly, "yes", --maxmemory, 32mb, --maxmemory-policy, noeviction]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  clickhouse:
+    <<: *common
+    image: clickhouse/clickhouse-server:26.3.62.3
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Run init}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      - ./clickhouse-small.xml:/etc/clickhouse-server/config.d/small.xml:ro
+      - ./clickhouse-users-small.xml:/etc/clickhouse-server/users.d/small.xml:ro
+    healthcheck:
+      test: [CMD, wget, --quiet, --spider, http://127.0.0.1:8123/ping]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+  minio:
+    <<: *common
+    image: cgr.dev/chainguard/minio@sha256:aea6c163749e1caca37f907976dcf337177ddf5f558808f2aa591618fd3a6eef
+    mem_limit: 512m
+    memswap_limit: 512m
+    cpus: 1
+    entrypoint: /bin/sh
+    command: ['-c', 'mkdir -p /data/langfuse && exec minio server --address ":9000" --console-address ":9001" /data']
+    environment:
+      GOMEMLIMIT: 128MiB
+      GOMAXPROCS: "2"
+      MINIO_API_REQUESTS_MAX: "16"
+      MINIO_ROOT_USER: langfuse
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Run init}
+    ports: ["127.0.0.1:${LANGFUSE_S3_PORT:-19090}:9000"]
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: [CMD, mc, ready, local]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+volumes:
+  postgres-data: {}
+  redis-data: {}
+  clickhouse-data: {}
+  clickhouse-logs: {}
+  minio-data: {}
+networks:
+  default: {}
+  telemetry:
+    external: true
+    name: n-telemetry

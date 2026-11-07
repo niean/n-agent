@@ -1497,3 +1497,9 @@ assistant 消息底部 Run footer（`结果 · 耗时 · 工具` + 详情 + Trac
 扫描状态只在扫描锁内更新，同步错误单独记录，避免慢网络响应覆盖较新扫描失败。撤销成功需同时确认宿主持久化与本机 CAS 提交；持久化异常不能假装已进入待重试。Dashboard 使用当前记录字符串 revision 定位撤销，202 表示 pending_revoke，失败与列表重载失败均使用共享错误 Modal。
 
 宿主启动器复用新协议健康进程；检测到旧协议时，仅 start 会核验已知 PID 的模块与精确端口、用 SIGINT 触发旧进程 finally 清理后重启，status 不升级。认证探测只 list、不执行脚本，不输出 token。
+
+## 模式：并行观测出口独立投影
+
+新增平台复用已有采集与身份，在 Collector 分支处理副本；平台字段、认证、过滤与队列不侵入业务模型。可修改处理器声明 MutatesData，使用真实原后端与新后端的哨兵对照证明副本隔离；不能只验证新平台字段正确而忽略原链路被改写。
+
+Langfuse 实现见 docker/observability/langfuse-config.py 与 langfuse-collector/；派生配置先原子发布、实际 validate，再重建单一 Collector。后端故障验收使用当前实例指标增量与同窗口失败/队列增量，不复用历史累计计数。字段与部署权威统一引用 07-observability.md。

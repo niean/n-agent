@@ -34,6 +34,8 @@ schema_config:
         period: 24h
 
 limits_config:
+  max_query_parallelism: 2
+  tsdb_max_query_parallelism: 2
   retention_period: 168h
   # 12 detail fields + message/exception (1 each) + two stacks (4 each),
   # each bounded by 1024000 bytes; JSON escaping can expand bytes by 6x.
@@ -44,3 +46,7 @@ limits_config:
 compactor:
   retention_enabled: true
   delete_request_store: filesystem
+
+# Local small-data queries share one worker.
+querier:
+  max_concurrent: 1

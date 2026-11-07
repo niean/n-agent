@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批、Host Terminal 宿主执行链路、Skill 自进化治理、Artifact 制品工作台和 Delegation 多 Agent 委派（delegation_service/run_service/child_agent_executor/tool_executor/parent_adapter + SQLite 7 表 + API/CLI）、Config Bundle 配置迁移（config_bundle_service + domain/config_bundle + config_bundle_readers + sqlite_support + docker/ 四个宿主脚本 + CLI config export|import）、会话 E2E 数据集 Runner（conversations.sh/conversations_runner.py + 12 JSON 数据集 + manifest 权威清理 + LLM Judge）、OTel 可观测（application/telemetry_semantics + infrastructure/observability 四件套 + llm/telemetry_hook + Dashboard OTel 自检页 + docker/observability 后端栈 + 自检页外链 C 类运行时配置 otel_link_config 全链路 + 全层测试套件）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销 -->
+<!-- SUMMARY: N-Agent 当前源码、测试、配置、Docker 部署和 Harness 任务文件的职责映射，含 ToolPolicy 审批、Host Terminal 宿主执行链路、Skill 自进化治理、Artifact 制品工作台和 Delegation 多 Agent 委派（delegation_service/run_service/child_agent_executor/tool_executor/parent_adapter + SQLite 7 表 + API/CLI）、Config Bundle 配置迁移（config_bundle_service + domain/config_bundle + config_bundle_readers + sqlite_support + docker/ 四个宿主脚本 + CLI config export|import）、会话 E2E 数据集 Runner（conversations.sh/conversations_runner.py + 12 JSON 数据集 + manifest 权威清理 + LLM Judge）、OTel 可观测（application/telemetry_semantics + infrastructure/observability 四件套 + llm/telemetry_hook + Dashboard OTel 自检页 + docker/observability 后端栈 + 自检页外链 C 类运行时配置 otel_link_config 全链路 + 全层测试套件）；1024000 字节观测详情；通用定时任务投递与来源隔离、可信飞书会话及导入证据冻结；Skill 自动发现与受控 Python 脚本自动授权、宿主私有授权记录和撤销；Langfuse独立部署与Collector并存 -->
 # 功能与文件映射
 
 - 回合记忆快照：`app/domain/agent.py` 的 `AgentState.external_memory_context` 保存 run 内召回结果；`app/application/context_service.py` 对每次模型请求副本注入；`tests/application/test_context_memory_snapshot.py` 覆盖工具循环、空结果、压缩后重建及 run 隔离，`tests/application/test_agent_graph_compress_context.py` 覆盖 AgentGraph 二次模型调用。
@@ -270,7 +270,7 @@
 - OTel 外链配置审计 sink：`app/infrastructure/policy/otel_link_config_logging_sink.py`，`OtelLinkConfigLoggingSink` 结构化 JSON 日志（actor/old_version/new_version/changed before-after 脱敏投影），best-effort 失败记 warning 不回滚
 - OTel 外链配置服务：`app/application/otel_link_config_service.py`，定义 `OtelLinkConfigService`（实现 `OtelLinkConfigProvider`）；`current()` 运行面热重载读（read-through Store，异常降级 last-known-good/env 快照）；`update(partial, expected_version)` 合并 overrides -> 校验 -> CAS 保存 -> 更新 last-known-good -> best-effort 审计；拒绝空 patch/未知字段/非法 expected_version
 - OTel 外链配置路由：`app/interfaces/http/otel_link_config_routes.py`，`register_otel_link_config_routes(router, service)` 注册 `GET/PATCH /chat/observations/otel/links`（均 no-store）；PATCH body `{expected_version, links:{...}}` CAS 更新，错误映射 422 otel_link_config_invalid/409 otel_link_config_conflict/500 otel_link_config_load_failed 不泄漏详情
-- Dashboard OTel 自检页模块：`app/interfaces/http/static/observations-otel.js`，渲染根 `tab-observations-otel`（左导观测下新增"OTel"二级菜单）：OTel 状态/mode/采样率/semconv 版本/信号交付计数/instrument 列表/ring buffer 近期 span 表格 + Grafana/Tempo/Pyroscope 外链（base_url 未配置时隐藏）+ py-spy profiler attach 状态；"配置链接"按钮 + 标准 Modal 弹窗编辑四链（清空=null 隐藏、留空缺席=沿用 env），提交 PATCH /chat/observations/otel/links 后重渲染；全 textContent 安全渲染；异步 renderToken/isActive guard
+- Dashboard OTel 自检页模块：`app/interfaces/http/static/observations-otel.js`，渲染根 `tab-observations-otel`（左导观测下新增"OTel"二级菜单）：OTel 状态/mode/采样率/semconv 版本/信号交付计数/instrument 列表/ring buffer 近期 span 表格 + Grafana/Tempo/Pyroscope 外链（base_url 未配置时隐藏）+ 固定 Langfuse 会话外链（`http://langfuse.localhost/project/n-agent-local-project/sessions`，始终显示）+ py-spy profiler attach 状态；"配置链接"按钮 + 标准 Modal 弹窗编辑四链（清空=null 隐藏、留空缺席=沿用 env），提交 PATCH /chat/observations/otel/links 后重渲染；全 textContent 安全渲染；异步 renderToken/isActive guard
 - Dashboard 导航与模板（修改）：`app/interfaces/http/static/management-navigation.js`（tabConfig 观测 children 加 `observations-otel`、tabByPath/routeConfig 新增 `/observations/otel` 私有 entry、topnavConfig 单项顶导 scope）、`app/interfaces/http/static/index.html`（左导 OTel 菜单项 + `tab-observations-otel` 容器 + observations-otel.js script 标签）、`app/interfaces/http/static/app.js`（initialized/resolveModule 新增 observations-otel 桥接）
 - CLI 入口（修改）：`app/interfaces/cli/commands/chat.py` 与 `app/interfaces/cli/commands/acp/command.py`，非 HTTP 入口统一经 main.py `application_runtime` contextmanager 进入（configure observability -> build services -> yield -> shutdown），保证 CLI chat/ACP 会话与 HTTP 进程同等观测生命周期
 
@@ -460,7 +460,7 @@
 
 ## 统一观测契约与历史工具
 
-- `app/application/telemetry_contract.py`：固定对象、动作、标准操作、完成事件、八种结果、允许属性及 12×5 内容键；`tests/application/test_telemetry_contract.py` 使用真实 SDK 验证工具标准 operation 和异常/作用域边界。
+- `app/application/telemetry_contract.py`：固定对象、动作、标准操作、完成事件、八种结果、允许属性及 16×5 固定内容键（按操作限制，普通操作仍最多 12 项）；`tests/application/test_telemetry_contract.py` 使用真实 SDK 验证工具标准 operation 和异常/作用域边界。
 - `docker/observability/history-cleanup.py`、`tests/test_observability_history_cleanup.py`：无 app 导入的受限历史清单/dry-run/apply 与安全校验；不自动获取 Docker socket，不代表实际清理已完成。
 
 ## 观测详情文件映射
@@ -515,3 +515,14 @@
 - host/terminal-host.py：新授权协议探测，start 升级已核验的旧桥接进程，status 无升级副作用。
 - app/application/host_terminal_dashboard_service.py、app/interfaces/http/host_terminal_routes.py、static/host.js、static/management-api.js：自动授权列表、诊断和撤销；revision 使用字符串。
 - tests/domain/test_host_script_grant.py、tests/infrastructure/test_host_script_grants.py、test_host_script_intent_store.py、tests/application/test_host_script_grant_service.py、test_skill_auto_registration.py、test_host_script_automation_integration.py、tests/test_terminal_host_launcher.py：授权模型、异常文件/协议、持久化、可信写入、竞态、实际执行与升级回归。
+
+## Langfuse 并行观测文件
+
+- docker/langfuse/docker-compose.yml、.env.example、manage-stack.py、restart.sh：独立六服务部署、固定版本/卷/网络、字面配置和幂等秘密初始化、认证/就绪与独立生命周期。
+- docker/observability/langfuse-config.py：精确字段投影、独立 Langfuse 管线、有界发送与受限原子配置发布；manage-stack.py 消费可选 override；otel-collector.yaml 同步 Loki 规范字段与详情白名单，Tempo 导出和队列预算保持原样。
+- docker/observability/langfuse-collector/Dockerfile、builder-config.yaml、linkprocessor/：固定0.137.0官方组件的 ocb 镜像与 Link 属性清理/安全关联投影；Go测试在Docker构建内执行。
+- tests/test_langfuse_stack.py、test_langfuse_collector.py：初始化、秘密/命令隔离、配置映射及启停边界回归。
+- tests/e2e/langfuse_smoke.sh、langfuse_smoke.py、test_langfuse_smoke.py：Docker 双后端交付和故障验收、同树/时间/正文/用量、真实业务及安全报告与清理。environment.sh 可选恢复结果文件让专用报告记录外层恢复失败，默认行为不变；test_environment_sh.py 覆盖该边界。
+- docker/langfuse/clickhouse-small.xml、clickhouse-users-small.xml：小数据量部署的服务内存、缓存、后台池、诊断缓冲和每查询预算；通过Compose只读挂载，不改变持久化卷或表结构。两套栈的内存预算权威见07-observability.md“限制本地小数据量观测内存”。
+
+- Langfuse 语义补齐：tests/application/test_langfuse_semantics.py 覆盖真实 SDK 的检索、Judge、取消、详情和模型参数/首输出/费用；tests/test_langfuse_collector.py 覆盖精确投影，tests/e2e/langfuse_smoke.py 查询双后端实际字段。

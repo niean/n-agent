@@ -122,3 +122,15 @@ def test_migration_entry_reuses_docker_isolation():
     source = (ROOT / "tests/migrate/config-bundle.sh").read_text()
     assert '/../e2e/environment.sh"' in source
     assert 'e2e_environment default "$0"' in source
+
+
+@pytest.mark.parametrize('rc,restore_rc,status,expected',[(0,0,'PASS',0),(7,0,'PASS',7),(0,9,'FAIL',1),(7,9,'FAIL',7)])
+def test_optional_restore_status_is_atomic_and_preserves_exit(sandbox,rc,restore_rc,status,expected):
+    scripts,log,env=sandbox
+    marker=scripts/'restore-status'
+    env['N_AGENT_E2E_RESTORE_STATUS_FILE']=str(marker)
+    result,_,_=run_case(sandbox,rc=rc,restore_rc=restore_rc)
+    assert result.returncode==expected
+    assert marker.read_text()==status+'\n'
+    assert marker.stat().st_mode & 0o777==0o600
+    assert not list(scripts.glob('restore-status.tmp.*'))

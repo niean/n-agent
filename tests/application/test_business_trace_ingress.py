@@ -611,9 +611,10 @@ def test_entry_details_are_identical_in_span_and_completion_log(sdk, monkeypatch
     monkeypatch.setattr(ts.logger, "info", lambda *args: logs.append(
         (trace.get_current_span().get_span_context(), ts.execution_log_snapshot())))
     scope = ts.schedule_execution_span("task", "session", "claim") if operation == "schedule.execute" else ts.business_operation(operation)
+    input_field, output_field = ('retrieval_query', 'retrieval_results') if operation == 'knowledge.search' else ('judge_verdict', 'judge_reason') if operation == 'task.evaluate' else ('input_messages', 'output_messages')
     with scope as facts:
-        facts["details"] = project_details(input_messages={"text": "request", "password": "SENTINEL-PRIVATE"},
-            output_messages="结果" * 2048)
+        facts["details"] = project_details(**{input_field: {"text": "request", "password": "SENTINEL-PRIVATE"},
+            output_field: "结果" * 2048})
     from app.application.telemetry_contract import resolve_operation
     spec = resolve_operation(operation)
     span = named(exporter, spec.span_name + (" " + operation.split(" ", 1)[1] if " " in operation else ""))
@@ -624,7 +625,7 @@ def test_entry_details_are_identical_in_span_and_completion_log(sdk, monkeypatch
         assert len(envelope["content"].encode("utf-8")) <= 2048
         for key, value in envelope.items():
             assert span.attributes[f"nagent.content.{name}{'' if key == 'content' else '_' + key}"] == value
-    assert log["details"]["output_messages"]["truncated"] is True
+    assert log["details"][output_field]["truncated"] is True
 
 
 @pytest.mark.asyncio

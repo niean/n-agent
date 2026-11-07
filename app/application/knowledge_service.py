@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -195,7 +198,15 @@ class KnowledgeService:
             top_k=top_k if top_k is not None else base.default_top_k,
             min_score=min_score if min_score is not None else base.default_min_score,
         )
-        return await self.retriever_factory.get(base.base_type).search(base, request, secret)
+        backend = self.retriever_factory.get(base.base_type)
+        with business_operation('knowledge.search') as facts:
+            facts['details'] = project_details(retrieval_query=request.query)
+            result = await backend.search(base, request, secret)
+            try:
+                facts['details'].update(project_details(retrieval_results=_result_to_dict(result)))
+            except Exception:
+                pass
+            return result
 
     async def knowledge_tool_definition(self) -> ToolDefinition:
         bases = [base for base in await self.registry.list_bases() if base.enabled]

@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
 # 项目教训
 
 ### P082: 本次输入的历史副本须按消息身份排除
@@ -790,3 +790,24 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：HTTP 中间件在事件循环内同步投影请求详情；凭据和 URL 规则的无边界贪婪前缀对 262145 个连续 a 逐后缀重试。另有 multipart 截断路径在解析文件元信息前对整个原始文件正文脱敏，放大处理成本。
 - 教训：先由真实栈和独立进程限时测试区分业务返回与日志收尾；凭据规则从完整词元边界匹配并避免重复回溯，multipart 文件正文不送入文本脱敏器，截断文本字段单独保护。E2E 不能只断言拒绝状态，还要限时检查后续请求可用。
 - 来源：2026-11-06 Dashboard E2E 无响应修复；RED 4 failed，另补URL前缀兼容红绿测试4项；针对性 GREEN 55 passed；观测/安全/架构回归341 passed、1 skipped，制品接口等143 passed；Docker 制品 E2E 通过。
+
+### P087: Collector 属性白名单必须逐个核验 Link 出口
+
+- 现象：Langfuse 分流设计预期通过现有 transform 统一清理属性，源码核验发现 Link 不在可遍历上下文内。
+- 根因：Collector contrib 0.137.0 的 transform 仅遍历 resource/scope/span/spanevent；redaction 也未处理 Link。span.links 为 ptrace.SpanLinkSlice，String/ParseJSON 不能读出或重建其身份与属性。正常业务 Link(parent) 无属性不能证明出口已封闭。
+- 教训：新增平台出口先核对真实版本的数据访问能力；既要保留关联又要清理属性时，在该分支增加声明 MutatesData 的最小 processor，使用恶意 Link 属性与原后端副本对照验证，不以配置成功或正常样本代替安全证据。
+- 来源：2026-11-06 接入 Langfuse 计划 T2 实施前核验；固定0.137.0 ocb镜像与Go测试通过，真实双端哨兵证明仅Langfuse副本清理、Tempo原Link属性保留；2026-11-07专用Docker验收16/16最终通过。
+
+### P088: 重启期间的指标增量验收必须绑定当前实例
+
+- 现象：真实模型与 calculator 调用成功，Tempo、Langfuse 和 Loki 均能查到执行，但并发验收仍在 Prometheus 增量阶段超时。
+- 根因：测试使用全局 sum(nagent_agent_runs_total) 作为基线；业务容器重建后旧 service_instance_id 时序尚未过期，随后旧时序退出查询结果，使总和下降，不能代表当前实例本次执行的增量。
+- 教训：从本次业务自检读取 instance_id，指标前后查询固定 service_instance_id；并发用例各自保留独立 Trace，再串行汇总报告，不把历史实例退出误判为导出失败。
+- 来源：2026-11-07 接入 Langfuse 计划 T3，真实双端操作树与用量核验定位假失败；实例过滤的回归及随后并发场景通过。
+
+### P089: 缩小观测内存要同时验证启动与内部预算
+
+- 现象：Langfuse小数据量部署仍占较多内存；直接压ClickHouse到512MiB会拒绝查询，Web384MiB old-space会在启动时触发V8 heap OOM。
+- 根因：容器硬上限不等于数据库缓存、诊断缓冲和线程池预算；程序代码映射、运行时原生开销、启动迁移与健康探针也占内存，数据少不意味着基础占用可任意缩小。
+- 教训：同时限制堆/缓存/后台池/查询并发，并用真实启动、常规入库查询和历史样本验证下限；给Web/ClickHouse实测余量，不能只把mem_limit数值改小。保留既有数据卷与采集合同，资源预算独立于详情限长和保留期。
+- 来源：2026-11-07观测内存精调，总上限10GiB降到4.25GiB；小内存Docker常规验收3/3通过。
