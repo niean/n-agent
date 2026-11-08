@@ -627,6 +627,20 @@ class TestCacheAndNormalizedTokens:
         assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ) == 50
         assert self._total(meter, ts.INSTRUMENT_MODEL_CACHE_WRITE) == 20
 
+    @pytest.mark.parametrize("provider", ["openai", "openai-compatible"])
+    @pytest.mark.parametrize("input_tokens,cache_read_tokens", [(100, 50), (0, 0)])
+    def test_openai_explicit_zero_cache_write_keeps_hit_rate_eligible(
+        self, meter, provider, input_tokens, cache_read_tokens,
+    ):
+        ts.record_inference_tokens(
+            "gpt-test", provider, "chat", input_tokens, 10,
+            cache_read_tokens=cache_read_tokens, cache_write_tokens=0,
+        )
+        prompt = meter.counters[ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT]
+        read = meter.counters[ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ]
+        assert [v for v, _ in prompt.records] == [input_tokens + cache_read_tokens]
+        assert [v for v, _ in read.records] == [cache_read_tokens]
+
     def test_unknown_provider_never_produces_eligible(self, meter):
         ts.record_inference_tokens(
             "mystery", "vendor-x", "chat", 100, 10, cache_read_tokens=50,

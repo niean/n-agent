@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 类型、模型参数/首输出时间/费用与检索评估映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收；Langfuse独立部署与Collector并存 -->
+<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 类型、模型参数/首输出时间/费用与检索评估映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收；Langfuse独立部署与Collector并存；N-KB专属Langfuse投影契约 -->
 # 规范可观测行为
 
 观测回答：做了什么、为何结束、哪里慢、消耗多少。“共性规范”和“验收清单”独立于业务领域、项目、语言、框架及后端选型，可直接复用于其他系统；其余章节记录本项目的实现约定。本文是观测规范的权威源，架构、约定、模式及术语文档维护各自边界并引用本文。具体采集行为以对应观测能力启用为前提；本项目业务费用以 Usage 账本为准。
@@ -34,7 +34,7 @@ networks:
     name: n-telemetry
 ```
 
-N-KB 的 OTel exporter 配置指向 `http://otel-collector:4317`（gRPC）或 `http://otel-collector:4318`（HTTP，按其SDK配置路径）；Profile可使用 `http://pyroscope:4040`。保持独立 service.name（如 n-kb），不复制业务方的 COMPOSE_PROJECT_NAME 或观测后端服务定义。共享网络由观测部署入口创建；N-KB首次启动前需确保该网络存在。N-KB专属详情字段仍需其与Collector投影契约对齐。
+N-KB 的 OTel exporter 配置指向 `http://otel-collector:4317`（gRPC）或 `http://otel-collector:4318`（HTTP，按其SDK配置路径）；Profile可使用 `http://pyroscope:4040`。保持独立 service.name（如 n-kb），不复制业务方的 COMPOSE_PROJECT_NAME 或观测后端服务定义。共享网络由观测部署入口创建；N-KB首次启动前需确保该网络存在。N-KB 详情字段已按 Langfuse 投影契约对齐（见下文 N-KB 专属投影契约）；Tempo/Loki 分支保留原属性。
 
 Pyroscope 使用持久 filesystem bucket `/var/lib/pyroscope` 与 ingester `/data` 双层存储。原 local-only 配置中，168h compactor 保留期不控制本地低磁盘清理；v1.21.1 可用比例计算偏差可能在不足10GiB空间时删除4h前本地块。本次启用 bucket，将低磁盘策略改为有效的非零阈值（1GiB/1%；该版本只接受大于0的覆盖值，不能用0关闭默认策略），保留已上传本地块正常清理与7天bucket保留。迁移发现的一小时旧Profile样本差异及无法恢复的限制记录于 D079，不等同于历史数据全部验证通过。
 
@@ -294,7 +294,7 @@ API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际
 | 项目自定义 | Agent | `nagent.agent.source`、`nagent.agent.run_id`、`nagent.agent.iteration` | string/string/int；本次 Agent 执行来源、真实 AgentRun ID、轮次 | 受信绑定后可随模型/工具子步骤继承；尚无 Agent 归属时省略；不使用 TaskRun 或请求 ID 冒充 |
 | 项目自定义 | Agent | `nagent.agent.end_reason`、`nagent.agent.message_count`、`nagent.agent.inference_calls`、`nagent.agent.tool_calls`、`nagent.agent.usage_known` | string/int/int/int/bool；结束原因、范围内计数与汇总用量已知性 | Agent 完成事实；工具计数仅实际执行，模型计数按请求尝试；不重复叠加 child Agent |
 | 项目自定义 | 模型 | `nagent.model.message_count`、`nagent.model.usage_known` | int/bool；单次模型输入消息数、用量已知性 | 模型事实，不混用 Agent 范围计数 |
-| 项目自定义 | 模型 | `nagent.model.cache_read_tokens`、`nagent.model.cache_write_tokens` | int；单次模型尝试的已知缓存读/写 Token | 仅已知时记录，未知省略不伪造零；缓存写仅 Anthropic 提供 |
+| 项目自定义 | 模型 | `nagent.model.cache_read_tokens`、`nagent.model.cache_write_tokens` | int；单次模型尝试的已知缓存读/写 Token | 仅已知时记录，未知省略不伪造零；OpenAI 协议不适用的缓存写明确记为已知零 |
 | 项目自定义 | 工具 | `nagent.tool.policy_outcome`、`nagent.tool.risk_level`、`nagent.tool.executed` | string/string/bool；审批状态、风险、是否实际执行 | allow/deny/approved/require_approval 与统一操作结果分开，拒绝时 executed=false |
 | 项目自定义 | 压缩 | `nagent.context.before_tokens`、`nagent.context.after_tokens` | int；压缩前后 Token | 只在实际有此事实时记录 |
 | 项目自定义 | 各操作所属对象 | `nagent.<object>.outcome`、`nagent.<object>.summary`、`nagent.<object>.duration_ms` | string/string/number；操作结果、安全有界完成摘要、耗时 | agent/model/tool/context/task/delegation/schedule/memory/skill/curator/gateway/request/http 各自归属；summary 不是上下文摘要正文，duration 不替代 Span 时间，不作 Metric 维度 |
@@ -403,7 +403,7 @@ AgentRun、TaskRun 和请求分别使用自己的 ID。真实身份由服务端�
 
 表中的标准 operation/provider/request.model 分别指 gen_ai.operation.name/gen_ai.provider.name/gen_ai.request.model。gen_ai.token.modality 仅用于两项 Token Counter。九个 gen_ai instrument 沿用仓库锁定草案契约；Prometheus 实际名称及后端实测依据见 `docker/observability/metric-name-mapping.md`。
 
-五个缓存与归一化 instrument 仅设 Counter，用于累计与速率观察，无单次测量分布需求，不设 Histogram；维度复用 operation/provider/request.model 三维，不新增高基数维度。缓存命中率为派生定义，等于缓存读速率除以可判定 prompt 总量速率（PromQL 速率比值），不建比率 instrument；分母为零或无流量时结果为空，不补零。缓存写仅 Anthropic 提供，OpenAI-compatible 协议无此概念，不适用即保持未知，不伪造。
+五个缓存与归一化 instrument 仅设 Counter，用于累计与速率观察，无单次测量分布需求，不设 Histogram；维度复用 operation/provider/request.model 三维，不新增高基数维度。缓存命中率为派生定义，等于缓存读速率除以可判定 prompt 总量速率（PromQL 速率比值），不建比率 instrument；分母为零或无流量时结果为空，不补零。缓存写仅 Anthropic 有实际写入用量，OpenAI-compatible 协议无此概念，adapter 将明确不适用报告为已知零；未知的真实用量仍不补零。
 
 Counter 记录累计增量，Histogram 记录单次测量及其分布。模型重试逐次测量，未知 Token 保持未知；一次 AgentRun 结束计一次运行，一次压缩处理结束计一次尝试，一次实际预算拒绝计一次拒绝。Agent 汇总只统计自身范围，工具准入拒绝时 executed=false，工具执行数不增加。业务费用仍以 Usage 账本为准。
 
@@ -415,7 +415,7 @@ Counter 记录累计增量，Histogram 记录单次测量及其分布。模型�
 
 逐次尝试折算后累加：每次模型尝试先按 int(round(Ti + 0.2×Tic + 5×To)) 得整数，再由 Counter 累加。多次尝试的累加结果可能不等于对汇总桶折算后舍入，面板不得用汇总公式替代 Counter。分项未知不折算不伪造：Ti、Tic、To 三项全部已知才记录 nagent.model.normalized_tokens；缓存写 Ticw 不参与公式，其未知不阻断计算。
 
-缓存命中率分母口径：Anthropic 需 Ti、Tic、Ticw 全部已知，分母为 Ti+Tic+Ticw；OpenAI-compatible 需 Ti、Tic 已知且缓存写明确不适用，分母为 Ti+Tic，退化为 cached/prompt_tokens 口径。其它缺失桶不据此推断为零；不满足可判定条件的尝试仍记录各自已知桶，但不进入两个命中率支撑 Counter。
+缓存命中率分母口径：Anthropic 需 Ti、Tic、Ticw 全部已知，分母为 Ti+Tic+Ticw；OpenAI-compatible 需 Ti、Tic 已知且缓存写明确不适用，兼容 adapter 显式整数0和旧调用缺席表示，分母为 Ti+Tic，退化为 cached/prompt_tokens 口径。其它缺失桶不据此推断为零；不满足可判定条件的尝试仍记录各自已知桶，但不进入两个命中率支撑 Counter。
 
 Ti 语义修正：自 2026-11-05 部署起，gen_ai.usage.input_tokens 与既有 input Counter/Histogram 的测量值统一为非缓存输入 Ti，OpenAI 侧由 prompt_tokens（含缓存命中）修正为 prompt_tokens - cached_tokens，Anthropic 侧语义不变。此为对既有 instrument 的语义修正，历史数据不回补；混合新旧版本或跨切换时间的速率窗口不解释为统一 Ti。Usage 账本五桶口径不受影响。
 
@@ -457,14 +457,14 @@ Policy 的 AgentRun 和会话身份取自受信执行快照。领域审计事件
 | Langfuse 类型 | N-Agent 对应与边界 |
 |---|---|
 | event | 保留原生 OTel Span Event，不重复生成独立 observation |
-| span | HTTP/DB、提交、普通业务操作和压缩；未知操作及未核实 N-KB 操作回落此类型 |
+| span | HTTP/DB、提交、普通业务操作和压缩；未知操作回落此类型 |
 | generation | 实际 chat 模型尝试，保留消息、模型、参数、已知 Token 和可归属费用 |
 | agent | invoke_agent，一次真实 AgentRun |
 | tool | execute_tool；拒绝、失败与是否实际执行分开 |
 | chain | task.run、delegation.run_member、schedule.run、gateway.handle_message、skill.review、curator.run 的真实编排 |
 | retriever | knowledge.search、memory.prefetch、memory.search 的实际读取；外层搜索工具仍为 tool |
 | evaluator | task.evaluate，一次 Goal Mode Judge 调用并解析；格式重试为同级节点，否定 verdict 仍是评估成功 |
-| embedding | 本仓库没有独立向量生成契约；N-KB 未核实前保持 span |
+| embedding | 本仓库没有独立向量生成契约，N-Agent 不产生此类型；N-KB 的 embeddings 按其专属投影契约映射为 embedding，见下节 |
 | guardrail | 未接入独立内容防护 Span；Policy Log/Event 保留审计，普通审批不冒充内容安全检查 |
 
 ### Langfuse 字段映射
@@ -487,7 +487,7 @@ Policy 的 AgentRun 和会话身份取自受信执行快照。领域审计事件
 | 所选正文来源及完整性 | observation.metadata.input/output | 每次选择重建 source/original_bytes/truncated/incomplete/observed_bytes 信封，未知项省略 |
 | system_prompt、tool_definitions、error | observation.metadata.<字段名> | 独立脱敏有界信封，不覆盖主输入输出；异常正文不进 status_message |
 | 真实 ERROR 状态、受控 error.type | observation.level/status_message | 只按真实 Span ERROR 设置级别；拒绝、取消、等待审批和否定 verdict 不自动升级 |
-| 受信 service.version、合规 deployment.environment.name | langfuse.release/environment | 仅 N-Agent；投影后 Resource 仅保留 service.name，外来 langfuse.* 清除 |
+| 受信 service.version、合规 deployment.environment.name | langfuse.release/environment | 两条 Langfuse 管线均投影；投影后 Resource 仅保留 service.name，外来 langfuse.* 清除 |
 | 根业务入口自身安全输入输出 | langfuse.trace.input/output | 仅上表六种 chain 且父 Span 为空；无法明确入口时省略，子步骤不覆盖 |
 
 表中 observation.* 均以 langfuse. 为前缀。正文先统一脱敏并按 UTF-8 限长，单项默认 1024000 字节；完整性信封随所选来源整体替换。新增四种详情仅允许对应检索或评估操作使用；普通操作仍最多十二种详情，专用操作仅允许自身两种正文和 error，不扩大传输预算。
@@ -496,7 +496,28 @@ Provider 只向观测钩子报告最终请求的数值白名单和必要用量�
 
 AgentGraph 当前以非流式方式调用 Provider；HTTP SSE 输出不等于模型传输流式。因此常规 Graph 对话不填首 Token 时间，completion_start_time 只在实际使用 Provider 流式接口并观察到增量时产生。
 
-类型、字段和安全清理只在独立 Langfuse 副本生效；Tempo 保留原属性，Trace/Span/父关系与采样不重排。Link 清空属性，安全 IDs/flags 保存于 metadata.links。N-KB 专用检索、embedding、内容安全防护、Prompt 托管、数据集实验与 Score API 尚无已核实的集成；Judge verdict 不冒充 Langfuse Score。没有经审核的可信用户身份时省略 user.id。
+类型、字段和安全清理只在独立 Langfuse 副本生效；Tempo 保留原属性，Trace/Span/父关系与采样不重排。Link 清空属性，安全 IDs/flags 保存于 metadata.links。内容安全防护、Prompt 托管、数据集实验与 Score API 对 N-Agent 与 N-KB 尚无已核实的集成；N-KB 的检索与 embedding 经独立第二管线投影，见下节。Judge verdict 不冒充 Langfuse Score。没有经审核的可信用户身份时省略 user.id。
+
+### N-KB 专属投影契约
+
+N-KB 应用不使用本仓的统一语义采集；其 Langfuse 投影完全由共享 Collector 的 traces/langfuse-kb 管线完成（langfuse-config.py 的 span_statements_kb），白名单、类型守卫与事件清单均独立于 n-agent 分支，不复用只接受 nagent.* 的白名单。filter 按服务拆分：traces/langfuse 仅放行 service.name=n-agent，traces/langfuse-kb 仅放行 service.name=n-kb，n-agent 投影输出保持等价。
+
+类型按精确操作判别投影，不按名称猜测；多个专用判别同时存在时回落 span 并省略专用正文，不依赖语句顺序决定类型；未知操作回落 span。
+
+| N-KB 操作判别 | Langfuse 类型 | 边界 |
+|---|---|---|
+| `nkb.retrieval.operation=search` | retriever | 名称 retrieval.search；正文来自 nkb.content.retrieval_input/retrieval_output |
+| `nkb.index.operation=run` | chain | 名称 index.run；仅全局根（`parent_span_id == SpanID(0x0000000000000000)`）且正文存在时写 langfuse.trace.input/output；HTTP 或上游父级存在时不提升为根 |
+| `gen_ai.operation.name=embeddings` | embedding | 名称 embeddings；model.name=gen_ai.request.model；usage_details.input 由 nkb.model.usage_known=true 且非负整数门控，真实零保留、未知省略 |
+| 其余操作（document.upload、index.parse/split/embed/write、mcp.status、request.handle、http 等） | span | 默认类型，无专用正文 |
+
+Span 名只使用固定操作名（retrieval.search、index.run、embeddings），未知类型使用 span。内容源精确映射：chain 取 nkb.content.index_input/index_result，retriever 取 nkb.content.retrieval_input/retrieval_output，embedding 取 nkb.content.embedding_input（不导出 embedding_result 或向量）；缺失方向独立省略，失败或取消不合成成功输出。正文均先经 N-KB 应用侧统一脱敏限长，四项完整性元数据（original_bytes/truncated/incomplete/observed_bytes）随信封保留，缺失不补造。
+
+投影前先清除外来 langfuse.* 与未登记 nkb.*：属性先按 KB 白名单收窄，再逐键执行镜像 N-KB telemetry_contract 的类型与枚举守卫（操作与 outcome 枚举、provider、ID 与 model 长度模式、duration 非负有限数、计数非负 int 且拒绝 bool），非白名单值在投影前删除。metadata 仅允许 nkb.index/retrieval 的 operation/outcome/duration_ms、nkb.index.document_id/job_id/chunk_count、nkb.retrieval.result_count、nkb.model.usage_known、gen_ai.provider.name 和 error.type。Span Event 仅保留 N-KB 登记完成事件与类型正确的安全事实，异常事件正文与未知属性清空；Scope 清空，Resource 投影后仅保留 service.name，release/environment 沿用受限模式校验。不投影 langfuse.session.id（N-KB 无 gen_ai.conversation.id）、model.parameters 与 cost_details；level=ERROR 仅真实 Span ERROR，status_message 仅来自 N-KB outcome（failure/timed_out）与固定 error.type 枚举（unsupported_file_type/file_too_large/embedding_failed/vector_index_failed/sqlite_failed/timeout/other），不复制异常文本。N-KB 业务字段细节以 N-KB 仓 .harness/knowledge/07-observability.md 为权威，不在本文重复。
+
+部署事实：Langfuse 使用单一共享项目 n-agent-local-project 承载 N-Agent 与 N-KB 两个服务的 span，实现跨服务 Trace 关联展示——两服务共享同一 W3C traceparent 时，两条 Langfuse 管线投影的 span 以相同 Trace ID 写入同一项目，Langfuse 内合并为完整父子树；KB 投影不改写 parent/trace id，trace 级正文（langfuse.trace.name/input/output）由根门控保证仅一方写入（每条管线仅全局根 span 写 trace 正文，跨服务 trace 中 KB span 因存在上游父级不写正文）。凭据与主项目同组：LANGFUSE_INIT_PROJECT_PUBLIC_KEY/SECRET_KEY 经宿主 docker/langfuse/.env（0600）同时供给两条 Langfuse exporter，不设 LANGFUSE_KB_PROJECT_* 独立凭据；KB 分支 endpoint 由 LANGFUSE_KB_OTEL_ENDPOINT 配置，默认与 n-agent 共用端点，可独立校验。两条 Langfuse exporter 使用独立有界队列和 batch；N-KB 不新增自有 Langfuse 开关，共享 N_OBSERVABILITY_LANGFUSE_ENABLED 关闭时两条管线同时停用。
+
+验收入口：tests/test_langfuse_collector.py、tests/test_langfuse_stack.py 与 tests/e2e/langfuse_smoke.sh（真实 fork 双管线、共享 Trace 合并与故障注入）；N-KB 侧人工验收见 N-KB 仓 .harness/specs/verify/verify-261107-langfuse-parallel-observability.md。
 
 ### 实现与故障隔离
 
@@ -581,13 +602,16 @@ Pyroscope旧策略诊断依据：[v1.21.1磁盘统计](https://github.com/grafan
 
 ## 部署 Langfuse 并行观测
 
-- 独立部署入口为 docker/langfuse/restart.sh，支持 init/start/restart/stop/status/compose；秘密初始化幂等，已有完整凭据不覆写。镜像固定版本，Web/Worker 同为4.76.0，存储版本与 MinIO digest 以该目录 Compose 为准。认证探针禁代理、禁重定向并限制响应长度，启动后核对实际项目 ID，不能仅以容器健康判断初始化成功。
+- 独立部署入口为 docker/langfuse/restart.sh，支持 init/start/restart/stop/status/compose；秘密初始化幂等，已有完整凭据不覆写。镜像固定版本，Web/Worker 同为4.76.0，存储版本与 MinIO digest 以该目录 Compose 为准。认证探针禁代理、禁重定向并限制响应长度，启动后核对 n-agent-local-project 的实际项目 ID，不能仅以容器健康判断初始化成功。
 - 先部署共享观测，再启动 Langfuse；共享 .env 设置 N_OBSERVABILITY_LANGFUSE_ENABLED=true 后执行 `sh docker/observability/restart.sh`。启用时预检、核验项目认证、构建镜像、真实 validate 两份配置后只重建 Collector。首次 ocb 构建需要下载组件依赖，预算900秒，缓存后重建较快。
-- 分支 OTLP/HTTP endpoint 为 http://n-langfuse-web:3000/api/public/otel/v1/traces，使用项目 Basic 认证与 x-langfuse-ingestion-version=4；不配置 gRPC 接入。服务白名单为 n-agent/n-kb；N-Agent 按标准及自定义操作映射 agent/generation/tool/chain/retriever/evaluator，其余为 span；详见本文件类型与字段映射。N-KB 未核实专用契约时仍为 span，不开放正文。
+- 分支 OTLP/HTTP endpoint 为 http://n-langfuse-web:3000/api/public/otel/v1/traces，使用项目 Basic 认证与 x-langfuse-ingestion-version=4；不配置 gRPC 接入。Langfuse 分流按服务拆分为两条管线：traces/langfuse 仅放行 n-agent，N-Agent 按标准及自定义操作映射 agent/generation/tool/chain/retriever/evaluator，其余为 span，详见本文件类型与字段映射；traces/langfuse-kb 仅放行 n-kb，契约见上文 N-KB 专属投影契约。
 - session、run、结果、完整性、模型及用量按精确键映射；输入输出优先完整 messages，工具优先专用 arguments/result。Langfuse 仅保留一次正文，原始重复大属性及 Event 正文不再附带；未知字段与外来 langfuse.* 先清除。独立 Link processor 保留原身份/flags/tracestate，清空其属性，并把安全 IDs/flags 放入 metadata.links；原 Tempo 副本不受影响。
 - 每批最多1 Span，exporter 队列按序列化字节限制16MiB，2消费者，满时不阻塞；单请求10秒，重试总预算60秒。故障批次可能丢弃，恢复只保证新数据可交付，不承诺回放。共享进程仍有资源耦合，指标增量固定当前 service_instance_id，验收需用故障计数增量及真实业务在原三信号的交付证明隔离，不能只看健康状态。
 - 关闭分流并仅重建 Collector：`N_OBSERVABILITY_LANGFUSE_ENABLED=false sh docker/observability/restart.sh compose up -d --no-deps --force-recreate otel-collector`；恢复使用普通共享观测 restart。Langfuse 可以独立 stop，不停止原观测栈或业务。
-- 专用验收入口为 `bash tests/e2e/langfuse_smoke.sh`，业务和探针在 Docker 中执行，包含实际模型/calculator、双端操作树/用量/安全详情、未采样/并发、停机/认证/慢响应/队列耗尽、恢复、持久化与固定历史样本。报告记录每次尝试、真实 Trace 和独立会话/容器/原环境清理结果；已确认 Trace 不重复读取大正文。浏览器展示仍按人工清单验收。
+- N-KB 与 N-Agent 共用单一 Langfuse 项目 n-agent-local-project 与同一组项目 Basic 凭据，无第二项目及 LANGFUSE_KB_PROJECT_* 独立凭据；两服务共享 W3C trace id 的 span 在同项目内合并为完整父子树（跨服务 Trace 关联），trace 级正文由根门控保证仅一方写入。KB 分支 endpoint 由 LANGFUSE_KB_OTEL_ENDPOINT 配置，默认与 n-agent 共用端点，可独立校验。
+- 专用验收入口为 `bash tests/e2e/langfuse_smoke.sh`，业务和探针在 Docker 中执行，包含实际模型/calculator、双端操作树/用量/安全详情、未采样/并发、停机/认证/慢响应/队列耗尽、恢复、持久化与固定历史样本，以及 N-KB 双管线投影、跨服务共享 Trace 合并（同 Trace ID 父子树）与故障注入场景。报告记录每次尝试、真实 Trace 和独立会话/容器/原环境清理结果；已确认 Trace 不重复读取大正文。浏览器展示仍按人工清单验收。
+- 常规 `tests/e2e/run.sh` 的 OTel 子套件增加“OTel 与 Langfuse 数值一致性”：先结束原固定模型场景并恢复真实 Provider，再复用 Runner.business 连续调用3次 calculator 流式请求。otel_langfuse_comparison.sh 仅编排 Docker 探针，otel_langfuse_comparison.py 固定当前 service_instance_id，对比 Prometheus 原始计数器增量与相同 Trace 的 Tempo/Langfuse 用量和时间。整数严格一致；耗时允许每样本5ms或1%，p95检查直方图CDF及原始分位样本落桶，不声称分位数数值相等。主结果表仅一行“查看对比结果”，指向 comparison/comparison.md（指标表、逐调用Trace列表），JSON及原始快照同目录持久化，汇总重定位链接。未配置Langfuse或未启用Collector分支为SKIP；已启用但后端故障、未知用量或探针失败不能宣称全部通过，失败保留证据并清理精确归属会话及探针容器。
+- 数值对比调用遵守E2E会话生命周期：业务请求前持久化 owned-sessions.jsonl，逐次调用在 finally 中按本轮run_id、精确会话ID与来源校验清理，删除后必须回读404或session=null；活动Run先通过所属会话的HTTP cancel接口取消，再有界重试删除。失败会话也清理，仅保留报告与后端Trace证据。Shell退出或中断时先停止原探针，避免会话重建竞争，再启动该临时容器执行 --cleanup-only 重放清单，随后删除容器；清理不依赖Langfuse凭据或后端健康，失败必须使该用例FAIL。
 - Dashboard 观测-OTel 页的“外部”区域固定展示 Langfuse 会话链接 `http://langfuse.localhost/project/n-agent-local-project/sessions`，不依赖四链运行时配置，新窗口打开并带 noopener/noreferrer。
 - 既有 Tempo 512MiB 查询容量问题见 D082：多轮审计旧大 Trace 曾 OOM；仅重启原容器恢复且保留卷，不把缓存重置视为容量问题根治。历史对照只证明固定样本，不代表全部历史数据完整性。
 

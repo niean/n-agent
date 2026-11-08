@@ -173,10 +173,102 @@ def synthetic_payload():
     return trace,payload,{'sentinels':sentinels,'long_input':large_in,'long_output':large_out,'observation_count':len(spans)}
 
 
-def queue_metrics(text):
+def kb_synthetic_payload():
+    """Synthetic N-KB spans covering every projection branch; sentinels are controlled fake secrets."""
+    trace=uuid.uuid4().hex; remote=uuid.uuid4().hex; now=time.time_ns()
+    sentinels=['e2e-kb-private-'+x for x in ('unknown','injected','resource','scope','name','status','event','event-attr','link','nagent')]
+    suffix={'original_bytes':64,'observed_bytes':32,'truncated':True,'incomplete':True}
+    def content(field,body,meta=True):
+        attrs={f'nkb.content.{field}':body}
+        if meta: attrs.update({f'nkb.content.{field}_{key}':value for key,value in suffix.items()})
+        return attrs
+    def span(tid,identifier,extra,parent=None,error=False,events=None):
+        s={'traceId':tid,'spanId':f'{identifier:016x}','name':sentinels[4],'startTimeUnixNano':str(now+identifier),
+           'endTimeUnixNano':str(now+1000000+identifier),
+           'attributes':[attr(key,value) for key,value in {'langfuse.observation.input':sentinels[1],
+             'langfuse.session.id':sentinels[1],'gen_ai.conversation.id':sentinels[1],
+             'nagent.agent.run_id':sentinels[9],'nagent.content.input_messages':sentinels[9],
+             'unknown.leak':sentinels[0],**extra}.items()],
+           'status':{'code':2 if error else 1,'message':sentinels[5]},
+           'events':events if events is not None else [{'name':sentinels[6],'timeUnixNano':str(now),
+              'attributes':[attr('unknown.event',sentinels[7])]}],
+           'links':[{'traceId':'c'*32,'spanId':'d'*16,'attributes':[attr('unknown.link',sentinels[8])]}]}
+        if parent: s['parentSpanId']=parent
+        return s
+    # One registered event with a legal fact plus a disguised secret fact and an unknown attribute.
+    legal_event={'name':'nkb.index.completed','timeUnixNano':str(now),
+        'attributes':[attr('nkb.index.outcome','success'),attr('unknown.event',sentinels[7]),
+                      attr('error.type','SQLinjection-evil')]}
+    trace_spans=[
+      # Global-root index.run: chain with observation and trace bodies.
+      span(trace,1,{'nkb.index.operation':'run','nkb.index.outcome':'success','nkb.index.duration_ms':12.5,
+        'nkb.index.document_id':'doc-e2e','nkb.index.job_id':'job-e2e','nkb.index.chunk_count':7,
+        **content('index_input','kb index input'),**content('index_result','kb index result')},events=[legal_event]),
+      span(trace,2,{'nkb.retrieval.operation':'search','nkb.retrieval.outcome':'success','nkb.retrieval.duration_ms':3.25,
+        'nkb.retrieval.result_count':2,**content('retrieval_input','kb query'),**content('retrieval_output','kb snippets')},parent=f'{1:016x}'),
+      # Generation with known usage, no completeness metadata on the input.
+      span(trace,3,{'gen_ai.operation.name':'embeddings','nkb.model.usage_known':True,'gen_ai.usage.input_tokens':5,
+        'gen_ai.request.model':'e2e-embed-model','gen_ai.provider.name':'ollama',
+        **content('embedding_input','kb embed prefix',meta=False)},parent=f'{1:016x}'),
+      # A real zero must survive; an unknown count must be omitted entirely.
+      span(trace,4,{'gen_ai.operation.name':'embeddings','nkb.model.usage_known':True,'gen_ai.usage.input_tokens':0,
+        'gen_ai.request.model':'e2e-embed-model'},parent=f'{1:016x}'),
+      span(trace,5,{'gen_ai.operation.name':'embeddings','nkb.model.usage_known':False,
+        'gen_ai.request.model':'e2e-embed-model'},parent=f'{1:016x}'),
+      # Unregistered operations fall back to a plain span with no body.
+      span(trace,6,{'nkb.mcp.operation':'status','nkb.mcp.outcome':'success'},parent=f'{1:016x}'),
+      # Content for an operation that never opens it must be deleted, not projected.
+      span(trace,7,{'nkb.widget.operation':'frobnicate',**content('embedding_input','unopened body secret')},parent=f'{1:016x}'),
+      # Two discriminators at once is a producer bug: plain span, no bodies.
+      span(trace,8,{'nkb.retrieval.operation':'search','nkb.index.operation':'run',**content('retrieval_input','conflict body')},parent=f'{1:016x}'),
+      # A nested run stays chain but must never write trace bodies.
+      span(trace,9,{'nkb.index.operation':'run','nkb.index.outcome':'success',
+        **content('index_input','nested input'),**content('index_result','nested result')},parent=f'{1:016x}'),
+      # Illegal types and enums are each dropped by their typed guard.
+      span(trace,10,{'nkb.index.operation':'delete','nkb.index.duration_ms':True,'nkb.retrieval.duration_ms':True,
+        'nkb.index.chunk_count':'three','nkb.model.usage_known':1,'nkb.index.outcome':'exploded',
+        'error.type':'tool_error'},parent=f'{1:016x}'),
+      # Real ERROR: level and a fixed status_message only.
+      span(trace,11,{'nkb.retrieval.operation':'search','nkb.retrieval.outcome':'failure','error.type':'timeout'},parent=f'{1:016x}',error=True),
+      # A chain without content keeps neither direction.
+      span(trace,12,{'nkb.index.operation':'run','nkb.index.outcome':'success'},parent=f'{1:016x}')]
+    # A remote parent must never promote the run to a trace root.
+    remote_spans=[span(remote,0xfe,{'nkb.index.operation':'run','nkb.index.outcome':'success',
+        **content('index_input','remote input'),**content('index_result','remote result')},parent='1234567890abcdef')]
+    def resource(spans):
+        return {'resource':{'attributes':[attr('service.name','n-kb'),attr('service.version','e2e-kb-release'),
+            attr('deployment.environment.name','e2e'),attr('unknown.resource',sentinels[2])]},
+            'scopeSpans':[{'scope':{'name':sentinels[3],'version':sentinels[3],
+                'attributes':[attr('unknown.scope',sentinels[3])]},'spans':spans}]}
+    payload={'resourceSpans':[resource(trace_spans),resource(remote_spans)]}
+    expected={'trace':trace,'remote':remote,'sentinels':sentinels,'model':'e2e-embed-model',
+      'index_input':'kb index input','index_result':'kb index result',
+      'retrieval_input':'kb query','retrieval_output':'kb snippets','embedding_input':'kb embed prefix',
+      'nested_input':'nested input','nested_result':'nested result',
+      'remote_input':'remote input','remote_result':'remote result',
+      'counts':{trace:12,remote:1}}
+    return payload,expected
+
+
+def kb_probe_payload(body='kb fault probe'):
+    """One root index.run span used by fault injection and recovery probes."""
+    trace=uuid.uuid4().hex; now=time.time_ns()
+    payload={'resourceSpans':[{'resource':{'attributes':[attr('service.name','n-kb'),attr('service.version','e2e-kb-release'),
+        attr('deployment.environment.name','e2e')]},
+        'scopeSpans':[{'spans':[{'traceId':trace,'spanId':'1234567890abcdef','name':'index.run',
+        'startTimeUnixNano':str(now),'endTimeUnixNano':str(now+1000000),
+        'attributes':[attr(key,value) for key,value in {'nkb.index.operation':'run','nkb.index.outcome':'success',
+          'nkb.content.index_input':body,'nkb.content.index_input_original_bytes':len(body.encode()),
+          'nkb.content.index_input_observed_bytes':len(body.encode()),'nkb.content.index_input_truncated':False,
+          'nkb.content.index_input_incomplete':False}.items()]}]}]}]}
+    return trace,payload
+
+
+def exporter_queue_metrics(text, exporter):
     totals={'failed':0.0,'size':0.0}
     for line in text.splitlines():
-        if 'exporter="otlphttp/langfuse"' not in line: continue
+        # The closing quote keeps the -kb exporter out of the n-agent branch.
+        if f'exporter="{exporter}"' not in line: continue
         if line.strip().startswith('otelcol_exporter_enqueue_failed_spans'):
             totals['failed']+=float(line.rsplit(' ',1)[1])
         elif line.strip().startswith('otelcol_exporter_queue_size'):
@@ -184,11 +276,21 @@ def queue_metrics(text):
     return totals
 
 
+def queue_metrics(text):
+    return exporter_queue_metrics(text,'otlphttp/langfuse')
+
+
+def kb_queue_metrics(text):
+    return exporter_queue_metrics(text,'otlphttp/langfuse-kb')
+
+
 def failure_metrics(text):
-    totals={'langfuse':0.0,'original':0.0}
+    totals={'langfuse':0.0,'kb':0.0,'original':0.0}
     for line in text.splitlines():
         if not line.strip().startswith('otelcol_exporter_send_failed_'): continue
-        target='langfuse' if 'exporter="otlphttp/langfuse"' in line else 'original'
+        if 'exporter="otlphttp/langfuse-kb"' in line: target='kb'
+        elif 'exporter="otlphttp/langfuse"' in line: target='langfuse'
+        else: target='original'
         totals[target]+=float(line.rsplit(' ',1)[1])
     return totals
 
@@ -257,6 +359,100 @@ def compare_backends(tempo,rows):
                 assert row['metadata']['nagent.model.cost_status']=='estimated'
 
 
+def assert_kb_projection(rows,remote,expected):
+    """Project n-kb API observations: types, bodies, metadata, usage, root-only trace bodies."""
+    by_id={row['id']:row for row in rows}
+    assert len(rows)==12 and set(by_id)=={f'{i:016x}' for i in range(1,13)}
+    def envelope(row,key):
+        value=row['metadata'][key]
+        return json.loads(value) if isinstance(value,str) else value
+    root=by_id[f'{1:016x}']
+    assert root['type']=='CHAIN' and root['name']=='index.run'
+    assert root['input']==expected['index_input'] and root['output']==expected['index_result']
+    assert root['level']!='ERROR'
+    meta=root['metadata']
+    assert meta['nkb.index.operation']=='run' and meta['nkb.index.outcome']=='success'
+    assert meta['nkb.index.duration_ms']==12.5 and meta['nkb.index.chunk_count']==7
+    assert meta['nkb.index.document_id']=='doc-e2e' and meta['nkb.index.job_id']=='job-e2e'
+    assert envelope(root,'input')=={'source':'index_input','original_bytes':64,'observed_bytes':32,'truncated':True,'incomplete':True}
+    assert envelope(root,'output')['source']=='index_result'
+    retriever=by_id[f'{2:016x}']
+    assert retriever['type']=='RETRIEVER' and retriever['name']=='retrieval.search'
+    assert retriever['input']==expected['retrieval_input'] and retriever['output']==expected['retrieval_output']
+    assert retriever['metadata']['nkb.retrieval.result_count']==2
+    assert retriever['level']!='ERROR'
+    embedding=by_id[f'{3:016x}']
+    assert embedding['type']=='EMBEDDING' and embedding['name']=='embeddings'
+    assert embedding['input']==expected['embedding_input'] and embedding.get('output') is None
+    assert embedding['usageDetails']=={'input':5,'total':5}
+    assert embedding['model']==expected['model']
+    zero=by_id[f'{4:016x}']
+    assert zero['usageDetails']=={'input':0,'total':0}
+    unknown=by_id[f'{5:016x}']
+    assert not unknown.get('usageDetails') and unknown.get('input') is None
+    assert unknown['model']==expected['model']
+    for i in (6,7,8):
+        row=by_id[f'{i:016x}']
+        assert row['type']=='SPAN' and row['name']=='span'
+        assert row.get('input') is None and row.get('output') is None
+    nested=by_id[f'{9:016x}']
+    assert nested['type']=='CHAIN'
+    assert nested['input']==expected['nested_input'] and nested['output']==expected['nested_result']
+    illegal=by_id[f'{10:016x}']
+    assert illegal['type']=='SPAN'
+    for key in ('nkb.index.chunk_count','error.type','nkb.model.usage_known','nkb.index.duration_ms','nkb.index.outcome'):
+        assert key not in illegal['metadata']
+    failure=by_id[f'{11:016x}']
+    assert failure['type']=='RETRIEVER' and failure['level']=='ERROR' and failure['statusMessage']=='timeout'
+    assert failure.get('output') is None
+    childless=by_id[f'{12:016x}']
+    assert childless['type']=='CHAIN' and childless.get('input') is None and childless.get('output') is None
+    only=remote[0]
+    assert only['type']=='CHAIN' and only['input']==expected['remote_input'] and only['output']==expected['remote_result']
+    assert only['parentObservationId']=='1234567890abcdef'
+    for row in rows+remote: assert not row.get('sessionId')
+    for sentinel in expected['sentinels']:
+        assert sentinel not in json.dumps(rows+remote)
+
+
+def assert_kb_trace_bodies(documents,expected):
+    """Trace bodies exist only for the global-root index.run; the remote-parent run stays observation-level."""
+    assert documents['trace']['input']==expected['index_input'] and documents['trace']['output']==expected['index_result']
+    assert documents['remote'].get('input') is None and documents['remote'].get('output') is None
+
+
+def assert_shared_project_purity(agent_rows,kb_rows,remote_rows,agent_expected,kb_expected):
+    """One shared project: each projected trace carries only its own service's data."""
+    for sentinel in kb_expected['sentinels']:
+        assert sentinel not in json.dumps(agent_rows)
+    for sentinel in agent_expected['sentinels']:
+        assert sentinel not in json.dumps(kb_rows+remote_rows)
+
+
+def shared_trace_payload():
+    """Cross-service trace correlation: one trace id, an n-agent root and an n-kb child.
+
+    Both pipelines share the Langfuse project, so the two projected spans must
+    land in one trace tree; the KB projection keeps parent/trace ids untouched
+    and only the n-agent root writes the trace-level body.
+    """
+    trace=uuid.uuid4().hex; now=time.time_ns()
+    agent={'traceId':trace,'spanId':'a'*16,'name':'chat','startTimeUnixNano':str(now),
+        'endTimeUnixNano':str(now+1000000),
+        'attributes':[attr('gen_ai.operation.name','chat'),attr('nagent.content.input_messages','agent parent input'),
+            attr('gen_ai.conversation.id','e2e-langfuse-'+trace)]}
+    child={'traceId':trace,'spanId':'b'*16,'parentSpanId':'a'*16,'name':'retrieval.search','startTimeUnixNano':str(now+1),
+        'endTimeUnixNano':str(now+1000001),
+        'attributes':[attr('nkb.retrieval.operation','search'),attr('nkb.retrieval.outcome','success'),
+            attr('nkb.content.retrieval_input','kb child input')]}
+    payload={'resourceSpans':[
+        {'resource':{'attributes':[attr('service.name','n-agent'),attr('service.version','e2e-release')]},
+         'scopeSpans':[{'spans':[agent]}]},
+        {'resource':{'attributes':[attr('service.name','n-kb'),attr('service.version','e2e-kb-release')]},
+         'scopeSpans':[{'spans':[child]}]}]}
+    return trace,payload
+
+
 def serve():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     class Slow(BaseHTTPRequestHandler):
@@ -301,6 +497,7 @@ class Runner:
         for line in Path('/credentials').read_text().splitlines():
             key,sep,value=line.partition('=')
             if sep: credentials[key]=value.strip('"\'')
+        # Single shared Langfuse project: one Basic credential reads both services' spans.
         auth=base64.b64encode((credentials['LANGFUSE_INIT_PROJECT_PUBLIC_KEY']+':'+credentials['LANGFUSE_INIT_PROJECT_SECRET_KEY']).encode()).decode()
         self.get=lambda url:request(url,headers={'Authorization':'Basic '+auth})
         self.app='http://n-agent-n-agent-1:8000'
@@ -310,7 +507,7 @@ class Runner:
         self.instance_id=status['instance_id']
         self.report=Report(directory,run_id,status['links']['Trace'])
         self.manifest=SessionManifest(directory,run_id)
-        if plan: self.report.plan(['synthetic','business','sampling','concurrent','history','fault-web','fault-auth','fault-slow','saturation','fault-queue','persisted','sessions-cleanup','trace-audit','cleanup','environment-cleanup','orchestration'])
+        if plan: self.report.plan(['synthetic','kb-synthetic','business','sampling','concurrent','history','fault-web','fault-web-kb','kb-recovered','fault-auth','fault-slow','saturation','fault-queue','fault-queue-kb','persisted','sessions-cleanup','trace-audit','cleanup','environment-cleanup','orchestration'])
         self.trace=None
 
     def check(self,key,fn):
@@ -472,6 +669,108 @@ class Runner:
         query='sum(nagent_agent_runs_total{service_instance_id='+json.dumps(self.instance_id)+'})'
         rows=request('http://prometheus:9090/api/v1/query?'+urlencode({'query':query}))['data']['result']
         return sum(float(row['value'][1]) for row in rows)
+
+    def collector_kb_queue(self):
+        with urlopen('http://otel-collector:8888/metrics',timeout=5) as response:
+            return kb_queue_metrics(response.read().decode())
+
+    def kb_synthetic(self):
+        """Real fork, both pipelines, one combined POST: projection, shared-project merge, baselines."""
+        agent_trace,agent_payload,agent_expected=synthetic_payload()
+        kb_payload,kb_expected=kb_synthetic_payload()
+        merge_trace,merge_payload=shared_trace_payload()
+        request('http://otel-collector:4318/v1/traces',
+                {'resourceSpans':agent_payload['resourceSpans']+kb_payload['resourceSpans']+merge_payload['resourceSpans']})
+        self.trace=[agent_trace,kb_expected['trace'],kb_expected['remote'],merge_trace]
+        def counted(trace,count):
+            return poll(lambda:(rows if len(rows:=observations(self.get,trace))==count else None))
+        rows=counted(kb_expected['trace'],kb_expected['counts'][kb_expected['trace']])
+        remote=counted(kb_expected['remote'],kb_expected['counts'][kb_expected['remote']])
+        assert_kb_projection(rows,remote,kb_expected)
+        # Langfuse v4 events_only has no single-trace read API; the trace-body
+        # projection is proven field-exact by the real-fork isolated-IO test.
+        # The live evidence for root gating is the projected traceName.
+        assert next(row for row in rows if row['id']=='0000000000000001')['traceName']=='index.run'
+        assert remote[0]['traceName'] is None
+        agent_rows=counted(agent_trace,agent_expected['observation_count'])
+        assert not any(row['id']=='ffffffffffffffff' for row in agent_rows+rows+remote)
+        ids={row['id'] for row in agent_rows}
+        def complete_tempo():
+            document=self.tempo(agent_trace)
+            return document if ids<=set(original_spans(document)) else None
+        tempo=poll(complete_tempo)
+        # The n-agent output baseline is structurally re-proven with KB spans inside the same collector.
+        compare_backends(tempo,agent_rows)
+        # Cross-service trace correlation: a shared trace id merges the n-agent
+        # root and the n-kb child into one tree inside the single project.
+        merge_rows=counted(merge_trace,2)
+        merge={row['id']:row for row in merge_rows}
+        agent_root=merge['a'*16]; kb_child=merge['b'*16]
+        assert agent_root['type']=='GENERATION' and agent_root['name']=='chat'
+        assert agent_root['parentObservationId'] is None
+        assert agent_root['sessionId']=='e2e-langfuse-'+merge_trace
+        assert agent_root['traceName']=='chat'
+        assert agent_root['input']=='agent parent input'
+        assert kb_child['type']=='RETRIEVER' and kb_child['name']=='retrieval.search'
+        assert kb_child['parentObservationId']=='a'*16
+        assert not kb_child.get('sessionId') and not kb_child.get('traceName')
+        assert kb_child['input']=='kb child input'
+        self.confirmed_trace=[agent_trace,kb_expected['trace'],kb_expected['remote'],merge_trace]
+        assert_shared_project_purity(agent_rows,rows,remote,agent_expected,kb_expected)
+        # The four-signal branch keeps every raw KB span, sentinels included.
+        poll(lambda:self.tempo(kb_expected['trace']),seconds=60)
+        poll(lambda:self.tempo(kb_expected['remote']),seconds=60)
+        serialized=json.dumps(self.tempo(kb_expected['trace']))
+        assert 'nkb.retrieval.operation' in serialized and 'nkb.index.operation' in serialized
+        for sentinel in kb_expected['sentinels']: assert sentinel in serialized
+        return {'kb_observations':len(rows)+len(remote),'agent_observations':len(agent_rows),
+                'agent_baseline':'compare_backends PASS with KB spans in the same collector',
+                'shared_project_merge':{'trace_id':merge_trace,'agent_root':'a'*16,'kb_child':'b'*16},
+                'tempo_keeps_raw':True,
+                'trace_root_bodies_only':True,'remote_parent_never_root':True}
+
+    def fault_web_kb(self):
+        """Langfuse down: the KB exporter fails while Tempo still receives the KB trace."""
+        baseline=self.collector_failures()
+        trace,payload=kb_probe_payload(); self.trace=trace
+        request('http://otel-collector:4318/v1/traces',payload)
+        after=poll(lambda:(value if (value:=self.collector_failures())['kb']>baseline['kb'] else None),seconds=90)
+        assert after['original']==baseline['original']
+        poll(lambda:self.tempo(trace),seconds=60)
+        self.confirmed_trace=trace
+        return {'trace_id':trace,'exporter_failures_after':after,'tempo_received':True}
+
+    def kb_recovered(self):
+        """After recovery a fresh KB probe delivers complete results again."""
+        trace,payload=kb_probe_payload(); self.trace=trace
+        request('http://otel-collector:4318/v1/traces',payload)
+        rows=poll(lambda:(rows if (rows:=observations(self.get,trace)) else None),seconds=120)
+        self.confirmed_trace=trace
+        row=rows[0]
+        assert row['type']=='CHAIN' and row['input']=='kb fault probe'
+        assert row['output'] is None
+        return {'trace_id':trace,'delivered_after_recovery':True,'result_unchanged':True}
+
+    def fault_queue_kb(self):
+        """KB exporter queue saturation drops overflow without blocking; Tempo still receives."""
+        baseline=self.collector_kb_queue(); failures=self.collector_failures()
+        peak=baseline['size']; traces=[]
+        for _ in range(32):
+            trace,payload=kb_probe_payload('q'*1000000)
+            request('http://otel-collector:4318/v1/traces',payload,timeout=5)
+            traces.append(trace)
+            current=self.collector_kb_queue(); peak=max(peak,current['size'])
+            if current['failed']>baseline['failed']: break
+            time.sleep(.1)
+        current=poll(lambda:(value if (value:=self.collector_kb_queue())['failed']>baseline['failed'] else None),seconds=15)
+        assert peak<=16777216
+        poll(lambda:self.tempo(traces[0]),seconds=60)
+        after=self.collector_failures()
+        assert after['langfuse']==failures['langfuse'] and after['original']==failures['original']
+        self.confirmed_trace=traces[0]
+        return {'kb_enqueue_failed_delta':current['failed']-baseline['failed'],'peak_queue_bytes':peak,
+                'queue_capacity_bytes':16777216,'kb_traces_sent':len(traces),'tempo_canary':traces[0],
+                'other_exporters_unaffected':True}
 
     def collector_failures(self):
         with urlopen('http://otel-collector:8888/metrics',timeout=5) as response:
@@ -643,11 +942,14 @@ def main():
     if sys.argv[1:] == ['serve']: return serve()
     directory,run_id,action=sys.argv[1:4]
     runner=Runner(directory,run_id)
-    actions={'synthetic':runner.synthetic,'business':runner.business,'sampling':lambda:runner.business(sampled=False),
+    actions={'synthetic':runner.synthetic,'kb-synthetic':runner.kb_synthetic,'business':runner.business,
+      'sampling':lambda:runner.business(sampled=False),
       'saturation':runner.saturation,'history':runner.history,'persisted':runner.persisted,'concurrent':runner.concurrent,
-      'sessions-cleanup':runner.cleanup_sessions}
+      'kb-recovered':runner.kb_recovered,'sessions-cleanup':runner.cleanup_sessions}
     success=True
     if action=='fault-queue': success=runner.check(action,runner.fault_queue)
+    elif action=='fault-queue-kb': success=runner.check(action,runner.fault_queue_kb)
+    elif action=='fault-web-kb': success=runner.check(action,runner.fault_web_kb)
     elif action.startswith('fault-'): success=runner.check(action,runner.fault)
     elif action=='cleanup': runner.report.record('cleanup',sys.argv[4],reason='Docker deployment restoration')
     elif action=='orchestration': runner.report.record('orchestration',sys.argv[4],reason='专用Docker测试阶段编排完成')

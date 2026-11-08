@@ -1,7 +1,9 @@
 """宿主 stdlib 报告工具：记录用例结果，生成 Grafana Tempo 直达链接。"""
 from __future__ import annotations
 
+import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -33,7 +35,8 @@ def new_report(run_id):
          "trace_url": None, "reason": "未执行"}
         for key, name in (("good", "成功调用与三信号关联"),
                           ("fail", "Provider 500 错误记录"),
-                          ("cancel", "客户端断连后 Span 收尾"))
+                          ("cancel", "客户端断连后 Span 收尾"),
+                          ("langfuse-comparison", "OTel 与 Langfuse 数值一致性"))
     ]}
 
 
@@ -58,10 +61,14 @@ def render_table(cases):
         return str(value or "").replace("|", "\\|").replace("\n", " ")
     lines = ["| 分类 | 用例 | 结果 | TraceID | 链接 |", "|---|---|---|---|---|"]
     for case in cases:
-        link = f'[查看Trace]({case["trace_url"]})' if case["trace_url"] else (
+        link = f'[查看对比结果]({case["comparison_path"]})' if case.get("comparison_path") else (
+            f'[查看Trace]({case["trace_url"]})' if case["trace_url"] else (
             case["reason"] or ("Trace 页面地址未配置" if case["trace_id"] else "未取得 Trace"))
+        )
+        trace = (f'{len(case["trace_ids"])} 条，见对比结果' if case.get("comparison_path") else
+                 case["trace_id"] or "—")
         lines.append("| " + " | ".join(cell(value) for value in (
-            case["category"], case["name"], case["result"], case["trace_id"] or "—", link)) + " |")
+            case["category"], case["name"], case["result"], trace, link)) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -114,7 +121,6 @@ def render_summary(cases):
 
 
 def aggregate_report(run_id, directories, exit_code):
-    import importlib.util
     spec = importlib.util.spec_from_file_location("e2e_trace_report", Path(__file__).with_name("trace_report.py"))
     support = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(support)
@@ -124,7 +130,11 @@ def aggregate_report(run_id, directories, exit_code):
         path = Path(directory) / "report.json"
         source = json.loads(path.read_text())
         sources.append(str(path))
-        cases.extend(source["cases"] if source.get("suite") else support.report_cases(source))
+        rows = source["cases"] if source.get("suite") else support.report_cases(source)
+        for case in rows:
+            if case.get("comparison_path"):
+                case["comparison_path"] = str((Path(directory) / case["comparison_path"]).resolve())
+        cases.extend(rows)
     return {"run_id": run_id, "suite": "all", "exit_code": exit_code,
             "sources": sources, "cases": cases}
 
@@ -132,6 +142,9 @@ def aggregate_report(run_id, directories, exit_code):
 def write_report(directory, report):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    for case in report["cases"]:
+        if case.get("comparison_path") and Path(case["comparison_path"]).is_absolute():
+            case["comparison_path"] = os.path.relpath(case["comparison_path"], directory)
     (directory / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     markdown = (f'E2E：{report["suite"]}；运行：{report["run_id"]}；退出码：{report.get("exit_code", "执行中")}\n\n' +
                 render_sections(report["cases"]))
@@ -166,6 +179,30 @@ def main():
                 case["reason"] = "OTel 未启用"
         elif action == "finish":
             finish(report, args[0], int(args[1]))
+        elif action == "comparison":
+            data = json.loads((Path(directory) / args[0]).read_text())
+            if data["result"] not in ("PASS", "FAIL", "SKIP"):
+                raise ValueError("comparison has no final result")
+            case = next(c for c in report["cases"] if c["id"] == "langfuse-comparison")
+            case.update(result=data["result"], reason=data.get("reason", ""),
+                        comparison_path=str(Path(args[0]).with_suffix(".md")),
+                        trace_ids=[c["trace_id"] for c in data["calls"] if c.get("trace_url")],
+                        evidence=data)
+        elif action in ("comparison-error", "comparison-skip"):
+            module_spec = importlib.util.spec_from_file_location("otel_langfuse_comparison", Path(__file__).with_name("otel_langfuse_comparison.py"))
+            module = importlib.util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(module)
+            artifact = Path(directory) / "comparison" / "comparison.json"
+            data = json.loads(artifact.read_text()) if artifact.exists() else {"checks": [], "calls": []}
+            result = "FAIL" if action == "comparison-error" else "SKIP"
+            data.update(result=result, reason=args[0])
+            module.write_comparison(artifact.parent, data)
+            case = next(c for c in report["cases"] if c["id"] == "langfuse-comparison")
+            case.update(result=result, reason=args[0], comparison_path="comparison/comparison.md",
+                        trace_ids=[c["trace_id"] for c in data["calls"] if c.get("trace_url")], evidence=data)
+        elif action == "skip":
+            case = next(c for c in report["cases"] if c["id"] == args[0])
+            case.update(result="SKIP", reason=args[1])
         else:
             case = next(c for c in report["cases"] if c["id"] == args[0])
             if action == "begin":

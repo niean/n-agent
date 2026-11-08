@@ -269,10 +269,23 @@
     try { localStorage.setItem(SIDEBAR_PREF_KEY, expanded ? '1' : '0'); } catch (_) { /* ignore */ }
   }
 
+  function applySidebarTooltips(expanded) {
+    const items = document.querySelectorAll('.sidebar__nav > .sidebar__item, .sidebar__nav > .sidebar__group > .sidebar__item--parent');
+    items.forEach((item) => {
+      const label = item.querySelector(':scope > .sidebar__item-label');
+      if (!label) return;
+      const name = label.textContent.trim();
+      item.setAttribute('aria-label', name);
+      if (expanded) item.removeAttribute('title');
+      else item.setAttribute('title', name);
+    });
+  }
+
   function applySidebarExpanded(expanded) {
     const toggle = document.getElementById('sidebar-toggle');
     document.body.classList.toggle('sidebar-expanded', expanded);
     if (toggle) toggle.setAttribute('aria-expanded', String(expanded));
+    applySidebarTooltips(expanded);
   }
 
   function readSubmenuPref(parentTab) {
@@ -303,8 +316,8 @@
     const toggle = document.getElementById('sidebar-toggle');
     if (toggle) {
       toggle.addEventListener('click', () => {
-        const expanded = document.body.classList.toggle('sidebar-expanded');
-        toggle.setAttribute('aria-expanded', String(expanded));
+        const expanded = !document.body.classList.contains('sidebar-expanded');
+        applySidebarExpanded(expanded);
         writeSidebarPref(expanded);
         if (expanded) {
           tabConfig.filter((c) => c.parent).forEach((c) => {

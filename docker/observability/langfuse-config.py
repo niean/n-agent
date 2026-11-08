@@ -23,15 +23,25 @@ COUNT_KEYS = ('nagent.agent.iteration', 'nagent.agent.message_count', 'nagent.ag
 CUSTOM_TYPES = {'task.run': 'chain', 'delegation.run_member': 'chain', 'schedule.run': 'chain', 'gateway.handle_message': 'chain', 'skill.review': 'chain', 'curator.run': 'chain', 'knowledge.search': 'retriever', 'memory.prefetch': 'retriever', 'memory.search': 'retriever', 'task.evaluate': 'evaluator'}
 # This is a fixed diagnostic enum, never a pass-through of arbitrary error text.
 ERROR_TYPES = ('TimeoutError', 'ConnectionError', 'CancelledError', 'ValueError', 'ValidationError', 'RateLimitError', 'BadRequestError', 'AuthenticationError', 'PermissionDeniedError', 'NotFoundError', 'PolicyDenied', 'APIError', 'APIConnectionError', 'APITimeoutError', 'APIStatusError', 'APIResponseValidationError', 'InternalServerError', 'ConflictError', 'UnprocessableEntityError', 'OverloadedError', 'RequestTooLargeError', 'tool_error', 'denied', 'cancelled', 'other')
+# N-KB projection vocabulary mirrors app/application/telemetry_contract.py.
+KB_ERROR_TYPES = ('unsupported_file_type', 'file_too_large', 'embedding_failed', 'vector_index_failed', 'sqlite_failed', 'timeout', 'other')
+KB_METADATA_KEYS = ('nkb.index.operation', 'nkb.index.outcome', 'nkb.index.duration_ms', 'nkb.retrieval.operation', 'nkb.retrieval.outcome', 'nkb.retrieval.duration_ms', 'nkb.index.document_id', 'nkb.index.job_id', 'nkb.index.chunk_count', 'nkb.retrieval.result_count', 'nkb.model.usage_known', 'gen_ai.provider.name', 'error.type')
+KB_CONTENT = ('index_input', 'index_result', 'retrieval_input', 'retrieval_output', 'embedding_input')
+KB_SPAN_KEYS = tuple(dict.fromkeys(('gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model', 'gen_ai.usage.input_tokens', 'error.type', *KB_METADATA_KEYS, *(f'nkb.content.{field}{suffix}' for field in KB_CONTENT for suffix in ('', *(f'_{x}' for x in SUFFIXES))))))
+KB_BOOL_KEYS = ('nkb.model.usage_known',)
+KB_OUTCOMES = ('success', 'failure', 'denied', 'cancelled', 'timed_out', 'skipped', 'deferred', 'unknown')
+KB_OPERATIONS = {'nkb.index.operation': ('run', 'parse', 'split', 'embed', 'write'), 'nkb.retrieval.operation': ('search',)}
+KB_EVENTS = ('nkb.document.completed', 'nkb.index.completed', 'nkb.retrieval.completed', 'nkb.model.completed', 'nkb.mcp.completed', 'nkb.http.completed')
+KB_EVENT_KEYS = ('error.type', 'nkb.model.usage_known', *(f'nkb.{obj}.outcome' for obj in ('document', 'index', 'retrieval', 'model', 'mcp', 'request', 'http')))
 
 
-def value_guard(key):
+def value_guard(key, error_types=ERROR_TYPES):
     """OTTL's typed guards reject malformed source attributes before projection."""
     value = f'attributes["{key}"]'
-    if key in BOOL_KEYS or key.endswith(('_truncated', '_incomplete')):
+    if key in BOOL_KEYS or key in KB_BOOL_KEYS or key.endswith(('_truncated', '_incomplete')):
         return f'IsBool({value})'
     if key == 'error.type':
-        return 'IsString(' + value + ') and (' + ' or '.join(f'{value} == {json.dumps(error)}' for error in ERROR_TYPES) + ')'
+        return 'IsString(' + value + ') and (' + ' or '.join(f'{value} == {json.dumps(error)}' for error in error_types) + ')'
     if key == 'nagent.task.judge_attempt':
         return f'IsInt({value}) and {value} > 0'
     if key in COUNT_KEYS or key.endswith(('_original_bytes', '_observed_bytes')):
@@ -48,6 +58,35 @@ def value_guard(key):
     return f'IsString({value})'
 
 
+def kb_value_guard(key):
+    """KB guards mirror N-KB telemetry_contract.valid_attribute exactly."""
+    value = f'attributes["{key}"]'
+    if key in KB_OPERATIONS:
+        return 'IsString(' + value + ') and (' + ' or '.join(f'{value} == {json.dumps(action)}' for action in KB_OPERATIONS[key]) + ')'
+    if key.endswith('.outcome'):
+        return 'IsString(' + value + ') and (' + ' or '.join(f'{value} == {json.dumps(outcome)}' for outcome in KB_OUTCOMES) + ')'
+    if key == 'gen_ai.provider.name':
+        return f'IsString({value}) and {value} == "ollama"'
+    if key == 'gen_ai.operation.name':
+        return f'IsString({value}) and {value} == "embeddings"'
+    if key in ('nkb.index.document_id', 'nkb.index.job_id'):
+        # Raw regex literals cannot appear inside f-string expressions on
+        # Python < 3.12 (PEP 701); precompute to stay 3.11-compatible.
+        id_pattern = r'^[\w.:/-]{1,128}$'
+        return f'IsString({value}) and IsMatch({value}, {json.dumps(id_pattern)})'
+    if key == 'gen_ai.request.model':
+        model_pattern = r'^[\w.:/@_-]{1,64}$'
+        return f'IsString({value}) and IsMatch({value}, {json.dumps(model_pattern)})'
+    if key.endswith('.duration_ms'):
+        # Contract "number": non-negative finite int or double; a finite double
+        # equals itself and lies inside IEEE's finite range. Bools never pass.
+        finite = f'((IsInt({value})) or (IsDouble({value}) and {value} == {value} and {value} <= 1.7976931348623157e308 and {value} >= -1.7976931348623157e308))'
+        return f'{finite} and {value} >= 0'
+    if key in ('nkb.index.chunk_count', 'nkb.retrieval.result_count'):
+        return f'IsInt({value}) and {value} >= 0'
+    return value_guard(key, KB_ERROR_TYPES)
+
+
 def validate_endpoint(endpoint):
     try:
         parsed = urlsplit(endpoint)
@@ -62,7 +101,7 @@ def validate_endpoint(endpoint):
 
 def settings(directory, root):
     """Read only our literal settings from shared dotenv; leave base Compose semantics alone."""
-    keys = ('N_OBSERVABILITY_LANGFUSE_ENABLED', 'LANGFUSE_ENV_FILE', 'LANGFUSE_OTEL_ENDPOINT')
+    keys = ('N_OBSERVABILITY_LANGFUSE_ENABLED', 'LANGFUSE_ENV_FILE', 'LANGFUSE_OTEL_ENDPOINT', 'LANGFUSE_KB_OTEL_ENDPOINT')
     values = {}
     path = Path(directory) / '.env'
     if path.is_file():
@@ -81,9 +120,11 @@ def settings(directory, root):
     path = Path(values.get(keys[1], 'docker/langfuse/.env'))
     path = path if path.is_absolute() else Path(root) / path
     endpoint = values.get(keys[2], DEFAULT_ENDPOINT)
+    kb_endpoint = values.get(keys[3], DEFAULT_ENDPOINT)
     if enabled in ('true', '1'):
         validate_endpoint(endpoint)
-    return enabled in ('true', '1'), path, endpoint
+        validate_endpoint(kb_endpoint)
+    return enabled in ('true', '1'), path, endpoint, kb_endpoint
 
 
 def span_statements():
@@ -185,13 +226,108 @@ def span_statements():
     return statements
 
 
-def build_config(public_key, secret_key, endpoint=DEFAULT_ENDPOINT):
+def span_statements_kb():
+    """KB projection: an independent allowlist mirroring N-KB's telemetry contract."""
+    kb = 'resource.attributes["service.name"] == "n-kb"'
+    embed = f'{kb} and attributes["gen_ai.operation.name"] == "embeddings"'
+    retrieval = f'{kb} and attributes["nkb.retrieval.operation"] == "search"'
+    index_run = f'{kb} and attributes["nkb.index.operation"] == "run"'
+    statements = [f'keep_keys(attributes, {json.dumps(KB_SPAN_KEYS)})', 'set(status.message, "")']
+    # The purge is first. Guards run before comparisons or downstream copying.
+    for key in KB_SPAN_KEYS:
+        statements.append(f'delete_key(attributes, "{key}") where attributes["{key}"] != nil and not ({kb_value_guard(key)})')
+    statements += ['set(cache["entry"], false)', 'set(name, "span")', 'set(attributes["langfuse.observation.type"], "span")']
+    for condition, operation, kind in ((retrieval, 'retrieval.search', 'retriever'), (index_run, 'index.run', 'chain')):
+        statements += [f'set(name, "{operation}") where {condition}', f'set(attributes["langfuse.observation.type"], "{kind}") where {condition}']
+    statements.append(f'set(cache["entry"], true) where {index_run}')
+    statements += [f'set(name, "embeddings") where {embed}', f'set(attributes["langfuse.observation.type"], "embedding") where {embed}']
+    # Any two discriminators at once is a producer bug: fall back to a plain
+    # span and never let the conflicting entry flag or body survive.
+    retrieval_op = 'attributes["nkb.retrieval.operation"] == "search"'
+    index_op = 'attributes["nkb.index.operation"] == "run"'
+    embeddings_op = 'attributes["gen_ai.operation.name"] == "embeddings"'
+    conflict = f'{kb} and (({retrieval_op} and {index_op}) or ({retrieval_op} and {embeddings_op}) or ({index_op} and {embeddings_op}))'
+    statements += [f'set(name, "span") where {conflict}', f'set(attributes["langfuse.observation.type"], "span") where {conflict}', f'set(cache["entry"], false) where {conflict}']
+    # Trace bodies only ever come from the global root span.
+    statements.append('set(attributes["langfuse.trace.name"], name) where parent_span_id == SpanID(0x0000000000000000)')
+    for source, target in [('service.version', 'langfuse.release'), ('deployment.environment.name', 'langfuse.environment')]:
+        value = f'resource.attributes["{source}"]'
+        pattern = r'^[a-zA-Z0-9][a-zA-Z0-9._+/-]{0,199}$' if source == 'service.version' else r'^[a-z0-9][a-z0-9_-]{0,39}$'
+        condition = f'{kb} and IsString({value}) and IsMatch({value}, {json.dumps(pattern)})'
+        if source == 'deployment.environment.name':
+            condition += f' and not IsMatch({value}, "^langfuse")'
+        statements.append(f'set(attributes["{target}"], {value}) where {condition}')
+    statements += ['set(cache["metadata"], {})']
+    for key in KB_METADATA_KEYS:
+        statements.append(f'set(cache["metadata"]["{key}"], attributes["{key}"]) where {kb} and attributes["{key}"] != nil')
+
+    def envelope(field, target, kind):
+        # Each replacement assigns a fresh envelope keyed on the projected type,
+        # so conflict fallbacks and missing suffixes cannot leak between bodies.
+        source = f'nkb.content.{field}'
+        condition = f'{kb} and attributes["langfuse.observation.type"] == "{kind}" and IsString(attributes["{source}"])'
+        result = [f'set({target}, {{"source": "{field}"}}) where {condition}']
+        for suffix in SUFFIXES:
+            key = f'{source}_{suffix}'
+            result.append(f'set({target}["{suffix}"], attributes["{key}"]) where {condition} and attributes["{key}"] != nil')
+        return condition, result
+
+    # Missing directions and missing suffixes stay absent; output is only ever
+    # copied from a real attribute, never synthesized for a failed run.
+    for field, direction, kind in [('index_input', 'input', 'chain'), ('index_result', 'output', 'chain'), ('retrieval_input', 'input', 'retriever'), ('retrieval_output', 'output', 'retriever'), ('embedding_input', 'input', 'embedding')]:
+        target = f'cache["metadata"]["{direction}"]'
+        condition, body = envelope(field, target, kind)
+        statements += [f'set(attributes["langfuse.observation.{direction}"], attributes["nkb.content.{field}"]) where {condition}', *body]
+    for direction in ('input', 'output'):
+        statements.append(f'set(attributes["langfuse.trace.{direction}"], attributes["langfuse.observation.{direction}"]) where {kb} and cache["entry"] == true and parent_span_id == SpanID(0x0000000000000000) and attributes["langfuse.observation.{direction}"] != nil')
+    statements += ['set(cache["usage"], {})']
+    projected_embedding = f'{kb} and attributes["langfuse.observation.type"] == "embedding"'
+    statements.append(f'set(cache["usage"]["input"], attributes["gen_ai.usage.input_tokens"]) where {projected_embedding} and attributes["nkb.model.usage_known"] == true and IsInt(attributes["gen_ai.usage.input_tokens"]) and attributes["gen_ai.usage.input_tokens"] >= 0')
+    statements.append(f'set(attributes["langfuse.observation.usage_details"], String(cache["usage"])) where {projected_embedding} and Len(cache["usage"]) > 0')
+    model = 'attributes["gen_ai.request.model"]'
+    model_pattern = r'^[\w.:/@_-]{1,64}$'
+    statements.append(f'set(attributes["langfuse.observation.model.name"], {model}) where {projected_embedding} and IsString({model}) and IsMatch({model}, {json.dumps(model_pattern)})')
+    statements.append('set(attributes["langfuse.observation.level"], "ERROR") where status.code == STATUS_CODE_ERROR')
+    # Fallback only for execution failure/timeouts; outcome alone never sets
+    # level. Only index/retrieval outcomes survive the span allowlist.
+    for obj in ('index', 'retrieval'):
+        for outcome in ('failure', 'timed_out'):
+            statements.append(f'set(attributes["langfuse.observation.status_message"], "{outcome}") where status.code == STATUS_CODE_ERROR and attributes["nkb.{obj}.outcome"] == "{outcome}"')
+    for error in KB_ERROR_TYPES:
+        statements.append(f'set(attributes["langfuse.observation.status_message"], "{error}") where status.code == STATUS_CODE_ERROR and attributes["error.type"] == "{error}"')
+    envelope_keys = ('input', 'output')
+    for key in (*KB_METADATA_KEYS, *envelope_keys):
+        source = f'cache["metadata"]["{key}"]'
+        value = f'String({source})' if key in envelope_keys else source
+        statements.append(f'set(attributes["langfuse.observation.metadata.{key}"], {value}) where {source} != nil')
+    final = ('langfuse.observation.type', 'langfuse.trace.name', 'langfuse.release', 'langfuse.environment', 'langfuse.trace.input', 'langfuse.trace.output', 'langfuse.observation.input', 'langfuse.observation.output', *(f'langfuse.observation.metadata.{key}' for key in (*KB_METADATA_KEYS, *envelope_keys)), 'langfuse.observation.usage_details', 'langfuse.observation.model.name', 'langfuse.observation.level', 'langfuse.observation.status_message')
+    statements += [f'keep_keys(attributes, {json.dumps(final)})']
+    return statements
+
+
+def build_config(public_key, secret_key, endpoint=DEFAULT_ENDPOINT, kb_endpoint=DEFAULT_ENDPOINT):
+    # The KB pipeline targets the shared n-agent Langfuse project: one Basic
+    # credential pair for both exporters, so spans from n-agent and n-kb that
+    # share a W3C trace id merge into a single tree. kb_endpoint stays
+    # independently configurable (defaults to the shared endpoint).
     validate_endpoint(endpoint)
+    validate_endpoint(kb_endpoint)
     auth = base64.b64encode(f'{public_key}:{secret_key}'.encode()).decode()
     event_keys = ('error.type', 'nagent.tool.executed', 'nagent.tool.policy_outcome', *('nagent.' + obj + '.outcome' for obj in OBJECTS))
     safe_events = [f'nagent.{obj}.completed' for obj in OBJECTS]
+    # Event facts re-run the KB guards, so a secret wearing a legal key is
+    # dropped before it can reach the KB project; unknown events are renamed.
+    kb_spanevent = [f'keep_keys(attributes, {json.dumps(KB_EVENT_KEYS)})']
+    kb_spanevent += [f'delete_key(attributes, "{key}") where attributes["{key}"] != nil and not ({kb_value_guard(key)})' for key in KB_EVENT_KEYS]
+    kb_spanevent.append('set(name, "event") where not IsMatch(name, "^(' + '|'.join(x.replace('.', '[.]') for x in KB_EVENTS) + ')$")')
+
+    def exporter(auth_value, target):
+        return {'traces_endpoint': target, 'headers': {'Authorization': 'Basic ' + auth_value, 'x-langfuse-ingestion-version': '4'}, 'timeout': '10s',
+            'sending_queue': dict(enabled=True, sizer='bytes', queue_size=16777216, block_on_overflow=False, wait_for_result=False, num_consumers=2),
+            'retry_on_failure': dict(initial_interval='1s', max_interval='5s', max_elapsed_time='60s')}
+
     return {'processors': {
-        'filter/langfuse': {'error_mode': 'propagate', 'traces': {'span': ['resource.attributes["service.name"] != "n-agent" and resource.attributes["service.name"] != "n-kb"']}},
+        'filter/langfuse': {'error_mode': 'propagate', 'traces': {'span': ['resource.attributes["service.name"] != "n-agent"']}},
         'transform/langfuse': {'error_mode': 'propagate', 'trace_statements': [
             {'context': 'scope', 'statements': ['set(name, "")', 'set(version, "")', 'keep_keys(attributes, [])']},
             {'context': 'span', 'statements': span_statements()},
@@ -200,11 +336,19 @@ def build_config(public_key, secret_key, endpoint=DEFAULT_ENDPOINT):
         ]},
         'linksanitize/langfuse': {},
         'batch/langfuse': {'timeout': '1s', 'send_batch_size': 1, 'send_batch_max_size': 1},
-    }, 'exporters': {'otlphttp/langfuse': {
-        'traces_endpoint': endpoint, 'headers': {'Authorization': 'Basic ' + auth, 'x-langfuse-ingestion-version': '4'}, 'timeout': '10s',
-        'sending_queue': dict(enabled=True, sizer='bytes', queue_size=16777216, block_on_overflow=False, wait_for_result=False, num_consumers=2),
-        'retry_on_failure': dict(initial_interval='1s', max_interval='5s', max_elapsed_time='60s'),
-    }}, 'service': {'pipelines': {'traces/langfuse': {'receivers': ['otlp'], 'processors': ['memory_limiter', 'filter/langfuse', 'transform/langfuse', 'linksanitize/langfuse', 'batch/langfuse'], 'exporters': ['otlphttp/langfuse']}}}}
+        'filter/langfuse-kb': {'error_mode': 'propagate', 'traces': {'span': ['resource.attributes["service.name"] != "n-kb"']}},
+        'transform/langfuse-kb': {'error_mode': 'propagate', 'trace_statements': [
+            {'context': 'scope', 'statements': ['set(name, "")', 'set(version, "")', 'keep_keys(attributes, [])']},
+            {'context': 'span', 'statements': span_statements_kb()},
+            {'context': 'resource', 'statements': ['keep_keys(attributes, ["service.name"])']},
+            {'context': 'spanevent', 'statements': kb_spanevent},
+        ]},
+        'linksanitize/langfuse-kb': {},
+        'batch/langfuse-kb': {'timeout': '1s', 'send_batch_size': 1, 'send_batch_max_size': 1},
+    }, 'exporters': {'otlphttp/langfuse': exporter(auth, endpoint), 'otlphttp/langfuse-kb': exporter(auth, kb_endpoint)}, 'service': {'pipelines': {
+        'traces/langfuse': {'receivers': ['otlp'], 'processors': ['memory_limiter', 'filter/langfuse', 'transform/langfuse', 'linksanitize/langfuse', 'batch/langfuse'], 'exporters': ['otlphttp/langfuse']},
+        'traces/langfuse-kb': {'receivers': ['otlp'], 'processors': ['memory_limiter', 'filter/langfuse-kb', 'transform/langfuse-kb', 'linksanitize/langfuse-kb', 'batch/langfuse-kb'], 'exporters': ['otlphttp/langfuse-kb']},
+    }}}
 
 
 def publish_json(directory, value):
@@ -246,12 +390,14 @@ def load_credentials(root, path):
 
 
 def prepare(directory, root):
-    enabled, env_file, endpoint = settings(directory, root)
+    enabled, env_file, endpoint, kb_endpoint = settings(directory, root)
     if not enabled:
         return None
     module, values = load_credentials(root, env_file)
     folder = Path(root) / 'locals/harness_tmp/langfuse-collector'
-    config = publish_json(folder, build_config(values['LANGFUSE_INIT_PROJECT_PUBLIC_KEY'], values['LANGFUSE_INIT_PROJECT_SECRET_KEY'], endpoint))
+    config = publish_json(folder, build_config(
+        values['LANGFUSE_INIT_PROJECT_PUBLIC_KEY'], values['LANGFUSE_INIT_PROJECT_SECRET_KEY'], endpoint,
+        kb_endpoint=kb_endpoint))
     command = ['--config=/etc/otelcol-contrib/config.yaml', '--config=/etc/otelcol-contrib/langfuse.json']
     override = publish_json(folder, {'services': {'otel-collector': {
         # The private 0600 bind is owned by the invoking host account.

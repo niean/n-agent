@@ -88,9 +88,9 @@ sh tests/e2e/run.sh
 ### E2E 结果展示约定
 
 - 测试结果列表写入 `locals/e2e-reports/${测试ID}/result.md`：第一节“最终结果”展示每个用例最后一次尝试，第二节“重试记录”展示此前尝试；两节都使用相同表格，列为 `分类 | 用例 | 结果 | TraceID | 链接`。分类为对话、制品、OTel；结果使用 PASS / FAIL / SKIP。没有重试时保留空表并说明无重试记录。
-- 有实际 Trace ID 时，链接列使用 `[查看Trace](完整URL)`，必须携带该次用例的真实 32 位十六进制 Trace ID，直接进入 Grafana Explore 的 Tempo 查询；禁止只给 Explore 首页、用例名或 exemplar 链接。
+- 普通 Trace 用例有实际 Trace ID 时，链接列使用 `[查看Trace](完整URL)`，必须携带该次用例的真实 32 位十六进制 Trace ID，直接进入 Grafana Explore 的 Tempo 查询；禁止只给 Explore 首页、用例名或 exemplar 链接。OTel 与 Langfuse 数值一致性用例只展示一行，链接列使用 `[查看对比结果](相对路径)` 指向包含指标数值对比与 Agent 调用 Trace 列表的 comparison.md，TraceID 列展示条数；真实 Trace 直达链接保存在该对比报告中。汇总报告须重定位相对路径，不丢失子报告链接。
 - 链接沿用应用自检接口 `links.Trace` 的配置地址，保留域名、子路径和 orgId；使用 Tempo 数据源 `nagent-tempo`，编码 Explore panes，queryType=traceql、query=实际 Trace ID。不得把 session_id / tool_call_id 当作 Trace ID。
-- 一个用例有多条 Trace 时按消息、尝试或运行分别列出；失败时保留已取得的 Trace。未执行、OTel 未启用、未采集到 Trace 或不产生 Trace 的检查必须注明原因，不生成空链接或借用其他用例链接。
+- 普通 Trace 用例有多条 Trace 时按消息、尝试或运行分别列出；数值一致性用例的多条 Trace 在对比报告中列出。失败时保留已取得的 Trace。未执行、OTel 未启用、未采集到 Trace 或不产生 Trace 的检查必须注明原因，不生成空链接或借用其他用例链接。
 - 消息框只给简短概述和本地可点击的 `[result.md](绝对路径)` 链接，不展开结果列表；先说最终结果（如“全部通过（18/18）”或“通过17/18”），再说“其中1/18个用例进行了重试”。统计按分类和用例身份分组，只计最后一次尝试，同一用例的消息和多条 Trace 不重复计数；重试用例只计一次，清理失败作为独立失败检查计入，不能显示为全部通过。跳过、未完成或未知结果不得算通过。
 - OTel E2E 由 `tests/e2e/result_report.py` 生成 `locals/e2e-reports/<run-id>/result.md` 和 `report.json`（兼容保留 `report.md`）；JSON 保留所有尝试和 Trace 证据，会话投影行额外记录 case_id/attempt/attempt_result，供分节与汇总使用，不从展示名称反推身份。`tests/e2e/run.sh` 将本次对话、制品、OTel 子报告汇总为同一份两节报告及 JSON，终端只输出概述和结果路径；失败保留报告与日志。报告持久化不依赖测试会话保留，也不等待 exemplar。
 - Config Bundle 属于 migrate 测试，独立入口 `bash tests/migrate/config-bundle.sh`，仍在 Docker 内执行；不纳入 `tests/e2e/run.sh`。

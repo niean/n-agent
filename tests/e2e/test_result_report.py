@@ -11,6 +11,29 @@ report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
 
 
+def test_otel_case_links_comparison_instead_of_one_trace_and_aggregate_rebases(tmp_path):
+    child = tmp_path / "otel"
+    artifact = child / "comparison" / "comparison.md"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text("# 指标数值对比\n\nAgent 调用 Trace 列表\n")
+    state = report.new_report("comparison-run")
+    case = next((c for c in state["cases"] if c["id"] == "langfuse-comparison"), None)
+    assert case is not None, "OTel E2E 必须注册数值一致性用例"
+    case.update(result="PASS", comparison_path="comparison/comparison.md", trace_ids=["a" * 32, "b" * 32])
+    report.finish(state, "http://grafana.localhost/explore", 0)
+    report.write_report(child, state)
+    text = (child / "result.md").read_text()
+    assert "[查看对比结果](comparison/comparison.md)" in text
+    assert "[查看Trace]" not in text
+    assert "2 条，见对比结果" in text
+    parent = tmp_path / "all"
+    merged = report.aggregate_report("all", [child], 0)
+    report.write_report(parent, merged)
+    row = next(c for c in merged["cases"] if c["id"] == "langfuse-comparison")
+    assert (parent / row["comparison_path"]).resolve() == artifact.resolve()
+    assert "[查看对比结果](../otel/comparison/comparison.md)" in (parent / "result.md").read_text()
+
+
 def test_trace_link_keeps_configured_origin_subpath_and_org():
     trace_id = "60dd333cd9bcbe72451017f4bd3d639d"
     url = report.trace_url("https://grafana.example/grafana/explore?orgId=2&panes=old", trace_id)
@@ -77,7 +100,7 @@ def test_aggregate_flattens_all_categories_and_retains_trace(tmp_path):
     assert markdown.count("| 分类 | 用例 | 结果 | TraceID | 链接 |") == 2
     assert all(f"| {category} |" in markdown for category in ("对话", "制品", "OTel"))
     assert "a" * 32 in markdown and "[查看Trace](" in markdown
-    assert len(merged["cases"]) == 5
+    assert len(merged["cases"]) == 6
 
 
 def test_e2e_runner_excludes_config_bundle_and_aggregates_reports():
@@ -135,7 +158,7 @@ def test_cli_writes_result_file_and_prints_only_summary_and_location(tmp_path):
     completed = subprocess.run(["python3", tool, str(tmp_path), "finish", "", "0"],
                                check=True, text=True, capture_output=True)
     assert (tmp_path / "result.md").read_text() == (tmp_path / "report.md").read_text()
-    assert "最终结果：通过0/3（失败0，跳过3）；其中0/3个用例进行了重试。" in completed.stdout
+    assert "最终结果：通过0/4（失败0，跳过4）；其中0/4个用例进行了重试。" in completed.stdout
     assert f"RESULT_FILE {tmp_path / 'result.md'}" in completed.stdout
     assert "| 分类 |" not in completed.stdout
 

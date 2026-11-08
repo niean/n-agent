@@ -959,6 +959,12 @@ if [ "$OTEL_ENABLED" != "true" ]; then
   exit 0
 else
   run_otel_checks
+  # The numerical comparison uses the deployment's real model, not the fixture.
+  restore_provider
+  stop_fake_llm
+  report_case begin langfuse-comparison
+  bash "$SCRIPT_DIR/otel_langfuse_comparison.sh" "$REPORT_DIR" "$RUN_TAG" "$(compose ps -q n-agent)" \
+    || fail "OTel/Langfuse numerical comparison failed; see comparison/comparison.md"
 fi
 
 echo "[otel-smoke] PASS"

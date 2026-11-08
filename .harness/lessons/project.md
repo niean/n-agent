@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：E2E会话清理与真实Run身份/进程中断（P091）、OpenAI缓存写已知零与命中率Counter准入漂移（P090）、观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
 # 项目教训
 
 ### P082: 本次输入的历史副本须按消息身份排除
@@ -811,3 +811,17 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：容器硬上限不等于数据库缓存、诊断缓冲和线程池预算；程序代码映射、运行时原生开销、启动迁移与健康探针也占内存，数据少不意味着基础占用可任意缩小。
 - 教训：同时限制堆/缓存/后台池/查询并发，并用真实启动、常规入库查询和历史样本验证下限；给Web/ClickHouse实测余量，不能只把mem_limit数值改小。保留既有数据卷与采集合同，资源预算独立于详情限长和保留期。
 - 来源：2026-11-07观测内存精调，总上限10GiB降到4.25GiB；小内存Docker常规验收3/3通过。
+
+### P090: 缓存写的已知零必须与命中率准入同步
+
+- 现象：真实 OpenAI-compatible 请求的 Tempo/Langfuse 四桶用量与 Prometheus 原始 Token Counter 一致，但缓存命中率为空，两个 eligible Counter 未产生。
+- 根因：openai_compatible._report_openai_usage 将协议不适用的缓存写明确报告为整数0；telemetry_semantics.record_inference_tokens 仍要求写桶未知，未同步新表示，旧单测只覆盖 None。
+- 教训：区分未知、不适用与已知零；跨 Span 和 Metric 的派生准入须覆盖真实 adapter 输出，并对账同一实例的原始 Counter 增量及同一批 Trace。OpenAI 命中率分母 Ti+Tic 兼容显式0和旧调用缺席，不能把无计数器当作零流量或查询误差。
+- 来源：2026-11-08 OTel/Langfuse 一致性核验；原始快照见 locals/e2e-reports/metrics-consistency-261108/，4个回归组合先红后绿。
+
+### P091: E2E清理须用真实HTTP形状验证中断路径
+
+- 现象：正常calculator对账会话均已删除，运行中断时清理却报ValueError，活动Run未立即取消。
+- 根因：清理代码及首版单测夹具把Run列表的身份写成run_id，实际HTTP列表透传账本字段id；成功路径在查询Run之前已删除会话，因此无法暴露此分支。Python finally也不能覆盖默认SIGTERM或强制终止。
+- 教训：请求前登记精确会话归属；每次调用finally清理并回读，Shell中断先终止客户端再重放清单，避免会话重建竞争。涉及取消的夹具使用真实协议字段，并以运行中Agent调用的SIGTERM验证兜底，清理失败不得宣称通过。
+- 来源：2026-11-08数值对比E2E生命周期精调；错误Run身份先红后绿，真实活动调用SIGTERM后确认会话不存在、探针已移除，证据位于 locals/harness_tmp/compare-session-lifecycle/。

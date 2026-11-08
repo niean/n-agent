@@ -1292,6 +1292,34 @@ def test_tools_submenu_nav(tmp_path):
     assert "border-left-color" not in child_active_rule
 
 
+def test_collapsed_sidebar_tooltips_cover_every_top_level_item(tmp_path):
+    client = _client(tmp_path)
+    html = client.get('/chat').text
+    nav_js = client.get('/static/management-navigation.js').text
+    sidebar_html = re.search(
+        r'<aside[^>]*id="app-sidebar"[^>]*>(.*?)</aside>', html, re.DOTALL,
+    ).group(1)
+    items = re.findall(
+        r'<(?:a|button) class="sidebar__item(?: sidebar__item--parent)?"[^>]*>'
+        r'.*?<span class="sidebar__item-label">([^<]+)</span>',
+        sidebar_html,
+        re.DOTALL,
+    )
+    assert items == [
+        '对话', '会话', '定时任务', '任务', '记忆', '工具', '执行器',
+        '制品', '模型', '平台', '观测', '安全',
+    ]
+
+    tooltip_body = _js_function_body(nav_js, 'applySidebarTooltips')
+    assert "'.sidebar__nav > .sidebar__item, .sidebar__nav > .sidebar__group > .sidebar__item--parent'" in tooltip_body
+    assert "item.querySelector(':scope > .sidebar__item-label')" in tooltip_body
+    assert "item.setAttribute('aria-label', name)" in tooltip_body
+    assert "if (expanded) item.removeAttribute('title')" in tooltip_body
+    assert "else item.setAttribute('title', name)" in tooltip_body
+    expanded_body = _js_function_body(nav_js, 'applySidebarExpanded')
+    assert 'applySidebarTooltips(expanded)' in expanded_body
+
+
 def test_sidebar_dividers_keep_their_height_when_submenus_expand(tmp_path):
     """左导纵向空间不足时，分割线不能被 Flex 布局压缩为零。"""
     client = _client(tmp_path)

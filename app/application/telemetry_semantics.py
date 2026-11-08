@@ -1447,7 +1447,9 @@ def record_inference_tokens(
     # decidable enter the two support counters, so the derived ratio always
     # compares like with like.
     if provider in _CACHE_WRITE_INAPPLICABLE_PROVIDERS:
-        if ti_known and tic_known and not ticw_known:
+        # OpenAI adapters report the inapplicable write bucket as known zero.
+        # Older callers leave it absent; both representations keep Ti+Tic known.
+        if ti_known and tic_known and (cache_write_tokens is None or (ticw_known and cache_write_tokens == 0)):
             _record(
                 INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT,
                 input_tokens + cache_read_tokens,

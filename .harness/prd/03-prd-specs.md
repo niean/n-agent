@@ -111,6 +111,10 @@
         - 迭代：OTel页增加Langfuse链接，Dashboard 观测-OTel页/外部，增加 Langfuse链接(http://langfuse.localhost/project/n-agent-local-project/sessions)
         - 迭代：OTel到Langfuse语义字段映射，缺少rag吗？按照Langfuse的能力，对N-Agent已具备的功能做映射
 
+[20261108]
+- FR
+    - 观测：E2E测试，增加OTel/Langfuse对比校验，包括指标数值、Trace链路等
+    - 前端：左导收起时hover提示，一级菜单图标要有hover，告知用户这是什么菜单
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
@@ -137,7 +141,6 @@
     - 知识：UDS，详细原理、Go样例
     - 集成：N-Agent套装，集成N-KB；发布镜像，完成一键冷启动
     - 任务：LLM请求未命中缓存读，分析原因
-    - 行研：已整理到 .harness/specs/research/research-agent-industry.md（2026年7月下旬至10月中旬）
 
 [待验证]
 - 上下文

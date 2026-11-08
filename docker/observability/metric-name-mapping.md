@@ -14,7 +14,7 @@ resource_to_telemetry_conversion.enabled=true 使 service_name 成为 PromQL 可
 
 三个新 Counter（第 10–12 行）于 2026-11-03 经真实 OTLP → Collector → Prometheus 验证，使用隔离的 service.name=n-agent-synth、service.instance.id=semantic-probe-261103；不计入业务 N-Agent 运行数。真实 Agent 请求另验证了 nagent_agent_runs_total 及三个 Agent Histogram 的 nagent_agent_source 维度，现场来源为 dashboard。新证据保存在 locals/observability-migration/switch-261103/new-metric-probe-*.json 和 new-agent-source-*.json；不将本次结果记为 2026-10-25 实测。其余标准 instrument 沿用原实测名称。
 
-五个缓存与归一化 Token Counter（第 13–17 行）为 2026-11-05 新增（spec-261105-cache-token-metrics）：命名决定为项目 nagent.model.* 命名（不宣称 OTel 标准，既有 gen_ai instrument 不升级 semconv），依据见 .harness/knowledge/07-observability.md "归一化 Token" 小节。下表 Prometheus 名称为按既有翻译规则（`.`/`-` 转 `_`、Counter 加 `_total`、`{token}` 无单位后缀）的预测名称，待部署后真实 Collector 导出核对，实测确认前不作映射结论。维度契约无变化：五个新 instrument 复用既有三维（operation/provider/request.model）。
+五个缓存与归一化 Token Counter（第 13–17 行）为 2026-11-05 新增（spec-261105-cache-token-metrics）：命名决定为项目 nagent.model.* 命名（不宣称 OTel 标准，既有 gen_ai instrument 不升级 semconv），依据见 .harness/knowledge/07-observability.md "归一化 Token" 小节。五个实际 Prometheus 名称已于2026-11-08通过真实calculator请求、Collector导出与Prometheus查询确认；原始快照位于 locals/e2e-reports/metrics-consistency-261108-fixed/prometheus-after.json，并与相同21个Span的Langfuse用量对账通过。维度契约无变化：五个新 instrument 复用既有三维（operation/provider/request.model）。
 
 Prometheus 翻译规则实测：`.` 与 `-` 转 `_`；Counter 加 `_total`；Histogram（单位 s）
 加 `_seconds` 且不再加 `_total`；`{...}` 括号单位（token/inference_call/tool_call）不产生
@@ -34,11 +34,11 @@ Prometheus 翻译规则实测：`.` 与 `-` 转 `_`；Counter 加 `_total`；His
 | 10 | nagent.agent.runs | Counter / 1 | nagent_agent_runs_total |
 | 11 | nagent.context.compression_attempts | Counter / 1 | nagent_context_compression_attempts_total |
 | 12 | nagent.budget.denials | Counter / 1 | nagent_budget_denials_total |
-| 13 | nagent.model.cache_read_tokens | Counter / {token} | nagent_model_cache_read_tokens_total（预测，待实测） |
-| 14 | nagent.model.cache_write_tokens | Counter / {token} | nagent_model_cache_write_tokens_total（预测，待实测） |
-| 15 | nagent.model.normalized_tokens | Counter / {token} | nagent_model_normalized_tokens_total（预测，待实测） |
-| 16 | nagent.model.cache_eligible_prompt_tokens | Counter / {token} | nagent_model_cache_eligible_prompt_tokens_total（预测，待实测） |
-| 17 | nagent.model.cache_eligible_read_tokens | Counter / {token} | nagent_model_cache_eligible_read_tokens_total（预测，待实测） |
+| 13 | nagent.model.cache_read_tokens | Counter / {token} | nagent_model_cache_read_tokens_total |
+| 14 | nagent.model.cache_write_tokens | Counter / {token} | nagent_model_cache_write_tokens_total |
+| 15 | nagent.model.normalized_tokens | Counter / {token} | nagent_model_normalized_tokens_total |
+| 16 | nagent.model.cache_eligible_prompt_tokens | Counter / {token} | nagent_model_cache_eligible_prompt_tokens_total |
+| 17 | nagent.model.cache_eligible_read_tokens | Counter / {token} | nagent_model_cache_eligible_read_tokens_total |
 
 实测存在的裸 Histogram 基名（供 T10 断言 `_bucket/_sum/_count` 后缀时参考）：
 - gen_ai_client_inference_operation_input_tokens

@@ -22,7 +22,7 @@ def load(name='langfuse-config'):
 def test_new_pipeline_is_independent_and_bounded():
     m = load()
     doc = m.build_config('public', 'secret')
-    assert set(doc['service']['pipelines']) == {'traces/langfuse'}
+    assert set(doc['service']['pipelines']) == {'traces/langfuse', 'traces/langfuse-kb'}
     pipe = doc['service']['pipelines']['traces/langfuse']
     assert pipe['processors'] == ['memory_limiter', 'filter/langfuse', 'transform/langfuse', 'linksanitize/langfuse', 'batch/langfuse']
     exporter = doc['exporters']['otlphttp/langfuse']
@@ -100,7 +100,7 @@ def test_shared_env_process_priority_and_repo_relative_path(tmp_path, monkeypatc
     (tmp_path / '.env').write_text('N_OBSERVABILITY_LANGFUSE_ENABLED=true\nLANGFUSE_ENV_FILE=custom.env\nOTHER=$(never-run)\n')
     monkeypatch.delenv('N_OBSERVABILITY_LANGFUSE_ENABLED', raising=False)
     monkeypatch.delenv('LANGFUSE_ENV_FILE', raising=False)
-    assert m.settings(tmp_path, ROOT) == (True, ROOT / 'custom.env', m.DEFAULT_ENDPOINT)
+    assert m.settings(tmp_path, ROOT) == (True, ROOT / 'custom.env', m.DEFAULT_ENDPOINT, m.DEFAULT_ENDPOINT)
     monkeypatch.setenv('N_OBSERVABILITY_LANGFUSE_ENABLED', 'false')
     assert m.settings(tmp_path, ROOT)[0] is False
 
@@ -132,7 +132,7 @@ def test_judge_verdict_is_evaluation_output_not_input():
 
 def test_enabled_override_can_read_private_config_without_changing_secret_mode(tmp_path, monkeypatch):
     m = load()
-    monkeypatch.setattr(m, 'settings', lambda directory, root: (True, tmp_path / '.env', m.DEFAULT_ENDPOINT))
+    monkeypatch.setattr(m, 'settings', lambda directory, root: (True, tmp_path / '.env', m.DEFAULT_ENDPOINT, m.DEFAULT_ENDPOINT))
     monkeypatch.setattr(m, 'load_credentials', lambda root, path: (None, {'LANGFUSE_INIT_PROJECT_PUBLIC_KEY': 'p', 'LANGFUSE_INIT_PROJECT_SECRET_KEY': 's'}))
     result = m.prepare(tmp_path, tmp_path)
     service = json.loads(result['override'].read_text())['services']['otel-collector']
@@ -238,6 +238,55 @@ def test_completion_timestamp_guard_validates_calendar(timestamp, valid):
     assert bool(re.fullmatch(pattern, timestamp)) is valid
 
 
+def kb_guard_accepts(guard, value):
+    """Evaluate a generated KB guard against a Python value the way OTTL would type it."""
+    import math
+    import re
+    if 'IsBool(' in guard:
+        return isinstance(value, bool)
+    if 'IsMatch(' in guard:
+        pattern = json.loads(guard.rsplit(', ', 1)[1][:-1])
+        return isinstance(value, str) and re.fullmatch(pattern, value) is not None
+    if 'IsInt(' in guard or 'IsDouble(' in guard:
+        # OTTL booleans pass neither IsInt nor IsDouble; NaN fails self-equality.
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and value == value and value != math.inf and value != -math.inf and value >= 0)
+    # Enum guards: IsString(...) and (value == "a" or value == "b" ...).
+    allowed = [json.loads(item) for item in re.findall(r'== ("(?:[^"\\]|\\.)*")', guard)]
+    return isinstance(value, str) and value in allowed
+
+
+@pytest.mark.parametrize('key,value,expected', [
+    ('nkb.index.document_id', 'a' * 129, False),  # 超长 ID 拒绝
+    ('nkb.index.document_id', 'a.b:c-d/e', True),
+    ('nkb.index.job_id', 'job-123_456:789', True),
+    ('nkb.retrieval.duration_ms', 12.5, True),  # 浮点 duration 接受
+    ('nkb.index.duration_ms', 0, True),
+    ('nkb.index.duration_ms', True, False),  # bool duration 拒绝
+    ('nkb.retrieval.duration_ms', float('nan'), False),
+    ('nkb.retrieval.duration_ms', float('inf'), False),
+    ('nkb.retrieval.duration_ms', -0.5, False),
+    ('nkb.retrieval.outcome', 'exploded', False),  # 非枚举 outcome 拒绝
+    ('nkb.retrieval.outcome', 'timed_out', True),
+    ('nkb.index.operation', 'delete', False),
+    ('nkb.index.operation', 'run', True),
+    ('gen_ai.request.model', 'm' * 65, False),  # 超 64 字符 model 拒绝
+    ('gen_ai.request.model', 'qwen3:0.6b', True),
+    ('gen_ai.operation.name', 'chat', False),  # embeddings 之外拒绝
+    ('gen_ai.operation.name', 'embeddings', True),
+    ('gen_ai.provider.name', 'openai', False),
+    ('gen_ai.provider.name', 'ollama', True),
+    ('error.type', 'timeout', True),
+    ('error.type', 'tool_error', False),
+    ('nkb.model.usage_known', True, True),
+    ('nkb.model.usage_known', 1, False),
+    ('nkb.index.chunk_count', 3, True),
+    ('nkb.index.chunk_count', True, False),
+])
+def test_kb_guards_reject_and_accept_real_values(key, value, expected):
+    assert kb_guard_accepts(load().kb_value_guard(key), value) is expected
+
+
 @pytest.mark.parametrize('direction,fields', [
     ('input', ('user_message', 'input_messages', 'tool_arguments')),
     ('output', ('assistant_message', 'output_messages', 'tool_result')),
@@ -285,3 +334,213 @@ def test_content_selection_replaces_envelope_before_copying_completeness(directi
         key = f'{source}_{suffix}'
         expected.append(f'set({target}["{suffix}"], attributes["{key}"]) where {condition} and attributes["{key}"] != nil')
     assert statements[index + 2:index + 6] == expected
+
+
+def test_kb_pipeline_and_projection_contract():
+    m = load()
+    config = m.build_config('pk-na', 'sk-na')
+    pipelines = config['service']['pipelines']
+    assert set(pipelines) == {'traces/langfuse', 'traces/langfuse-kb'}
+    # n-agent 管线收窄：filter 只认 n-agent；KB 管线只认 n-kb
+    assert config['processors']['filter/langfuse']['traces']['span'] == \
+        ['resource.attributes["service.name"] != "n-agent"']
+    assert config['processors']['filter/langfuse-kb']['traces']['span'] == \
+        ['resource.attributes["service.name"] != "n-kb"']
+    kb_exporter = config['exporters']['otlphttp/langfuse-kb']
+    assert kb_exporter['traces_endpoint'] == m.DEFAULT_ENDPOINT
+    # KB exporter 与主 exporter 使用同一组项目凭据（同项目共享），traces_endpoint 可独立配置
+    agent_exporter = config['exporters']['otlphttp/langfuse']
+    assert kb_exporter['headers']['Authorization'] == agent_exporter['headers']['Authorization']
+    assert kb_exporter['headers']['Authorization'] == 'Basic ' + __import__('base64').b64encode(b'pk-na:sk-na').decode()
+    assert kb_exporter['headers']['x-langfuse-ingestion-version'] == '4'
+    # 队列/批处理参数与 n-agent exporter 等价
+    assert kb_exporter['sending_queue'] == config['exporters']['otlphttp/langfuse']['sending_queue']
+    kb_pipeline = pipelines['traces/langfuse-kb']
+    assert kb_pipeline == {'receivers': ['otlp'], 'processors': ['memory_limiter', 'filter/langfuse-kb', 'transform/langfuse-kb', 'linksanitize/langfuse-kb', 'batch/langfuse-kb'], 'exporters': ['otlphttp/langfuse-kb']}
+
+
+def test_kb_span_statements_type_mapping():
+    m = load()
+    text = '\n'.join(m.span_statements_kb())
+    # 精确操作判别，不按名称猜测
+    assert 'attributes["nkb.retrieval.operation"] == "search"' in text
+    assert 'attributes["nkb.index.operation"] == "run"' in text
+    assert 'attributes["gen_ai.operation.name"] == "embeddings"' in text
+    assert 'resource.attributes["service.name"] == "n-kb"' in text
+    assert 'gen_ai.operation.name"] == "chat"' not in text  # 不混入 n-agent 判别
+    # 类型：retriever/chain/embedding；默认 span；冲突回落
+    for kind in ('"retriever"', '"chain"', '"embedding"'):
+        assert f'set(attributes["langfuse.observation.type"], {kind})' in text
+    assert 'set(cache["entry"], false) where' in text  # 冲突回落重置
+    # trace 正文仅全局根 chain
+    assert 'parent_span_id == SpanID(0x0000000000000000)' in text
+    assert 'cache["entry"] == true' in text
+    # 内容源精确映射
+    for field in ('index_input', 'index_result', 'retrieval_input', 'retrieval_output', 'embedding_input'):
+        assert f'nkb.content.{field}' in text
+    assert 'nkb.content.embedding_result' not in text  # 不导出 embedding_result/向量
+    assert 'langfuse.session.id' not in text  # N-KB 无会话身份
+    # embedding 字段：model.name 与 usage（usage_known 门控）
+    assert 'gen_ai.request.model' in text
+    assert 'attributes["nkb.model.usage_known"] == true' in text
+    # KB error.type 枚举
+    assert '"unsupported_file_type"' in text and '"timeout"' in text
+    assert '"tool_error"' not in text  # 不混用 n-agent 枚举
+
+
+def test_kb_exporter_reuses_main_project_credentials():
+    # 单共享项目：KB 投影与 n-agent 投影写入同一 Langfuse 项目，凭据同主项目
+    config = load().build_config('pk-na', 'sk-na', kb_endpoint='http://kb-endpoint:3000/api/public/otel/v1/traces')
+    agent_exporter = config['exporters']['otlphttp/langfuse']
+    kb_exporter = config['exporters']['otlphttp/langfuse-kb']
+    assert kb_exporter['headers']['Authorization'] == agent_exporter['headers']['Authorization']
+    # traces_endpoint 可不同：KB 分支 endpoint 保留独立配置能力
+    assert agent_exporter['traces_endpoint'] != kb_exporter['traces_endpoint']
+    assert kb_exporter['traces_endpoint'] == 'http://kb-endpoint:3000/api/public/otel/v1/traces'
+
+
+def test_kb_value_guards_mirror_telemetry_contract():
+    m = load()
+    # duration_ms 是契约的 number：接受非负有限 int/double，不强制 int
+    duration = m.kb_value_guard('nkb.retrieval.duration_ms')
+    assert 'IsDouble' in duration and '>= 0' in duration and 'IsBool' not in duration
+    assert 'IsInt' in duration and 'IsDouble' in duration  # int 与 double 都接受
+    assert m.kb_value_guard('nkb.index.duration_ms') == duration.replace('nkb.retrieval', 'nkb.index')
+    # 计数：IsInt >= 0（bool 不是 int）
+    assert m.kb_value_guard('nkb.index.chunk_count') == 'IsInt(attributes["nkb.index.chunk_count"]) and attributes["nkb.index.chunk_count"] >= 0'
+    assert m.kb_value_guard('nkb.retrieval.result_count') == 'IsInt(attributes["nkb.retrieval.result_count"]) and attributes["nkb.retrieval.result_count"] >= 0'
+    assert m.kb_value_guard('gen_ai.usage.input_tokens') == 'IsInt(attributes["gen_ai.usage.input_tokens"]) and attributes["gen_ai.usage.input_tokens"] >= 0'
+    assert m.kb_value_guard('nkb.model.usage_known') == 'IsBool(attributes["nkb.model.usage_known"])'
+    # operation 精确枚举（源自 telemetry_contract OPERATIONS）
+    operation = m.kb_value_guard('nkb.index.operation')
+    for action in ('run', 'parse', 'split', 'embed', 'write'):
+        assert f'"{action}"' in operation
+    assert '"search"' not in operation
+    assert '"search"' in m.kb_value_guard('nkb.retrieval.operation')
+    # outcome 精确枚举
+    outcome = m.kb_value_guard('nkb.retrieval.outcome')
+    for value in ('success', 'failure', 'denied', 'cancelled', 'timed_out', 'skipped', 'deferred', 'unknown'):
+        assert f'"{value}"' in outcome
+    # provider 精确枚举
+    assert '== "ollama"' in m.kb_value_guard('gen_ai.provider.name')
+    # id/model 长度与字符模式
+    assert '{1,128}' in m.kb_value_guard('nkb.index.document_id')
+    assert '{1,128}' in m.kb_value_guard('nkb.index.job_id')
+    assert '{1,64}' in m.kb_value_guard('gen_ai.request.model')
+    # error.type 用 KB 枚举，不混 n-agent 枚举
+    error = m.kb_value_guard('error.type')
+    for value in ('unsupported_file_type', 'file_too_large', 'embedding_failed', 'vector_index_failed', 'sqlite_failed', 'timeout', 'other'):
+        assert f'"{value}"' in error
+    assert 'tool_error' not in error and 'TimeoutError' not in error
+
+
+def test_kb_settings_kb_endpoint_priority_and_disabled_skip(tmp_path, monkeypatch):
+    m = load()
+    (tmp_path / '.env').write_text('N_OBSERVABILITY_LANGFUSE_ENABLED=true\nLANGFUSE_KB_OTEL_ENDPOINT=http://kb-dotenv:3000/api/public/otel/v1/traces\n')
+    monkeypatch.delenv('N_OBSERVABILITY_LANGFUSE_ENABLED', raising=False)
+    monkeypatch.delenv('LANGFUSE_KB_OTEL_ENDPOINT', raising=False)
+    assert m.settings(tmp_path, ROOT) == (True, ROOT / 'docker/langfuse/.env', m.DEFAULT_ENDPOINT, 'http://kb-dotenv:3000/api/public/otel/v1/traces')
+    # 进程环境优先于 dotenv
+    monkeypatch.setenv('LANGFUSE_KB_OTEL_ENDPOINT', 'http://kb-env:3000/api/public/otel/v1/traces')
+    assert m.settings(tmp_path, ROOT)[3] == 'http://kb-env:3000/api/public/otel/v1/traces'
+    monkeypatch.delenv('LANGFUSE_KB_OTEL_ENDPOINT')
+    # 重复键拒绝
+    (tmp_path / '.env').write_text('N_OBSERVABILITY_LANGFUSE_ENABLED=true\nLANGFUSE_KB_OTEL_ENDPOINT=http://a/x\nLANGFUSE_KB_OTEL_ENDPOINT=http://b/x\n')
+    with pytest.raises(ValueError, match='Duplicate'):
+        m.settings(tmp_path, ROOT)
+    # 启用时非法 KB endpoint 拒绝
+    (tmp_path / '.env').write_text('N_OBSERVABILITY_LANGFUSE_ENABLED=true\nLANGFUSE_KB_OTEL_ENDPOINT=ftp://bad/x\n')
+    with pytest.raises(ValueError):
+        m.settings(tmp_path, ROOT)
+    # 禁用时不校验未使用的 endpoint
+    (tmp_path / '.env').write_text('N_OBSERVABILITY_LANGFUSE_ENABLED=false\nLANGFUSE_KB_OTEL_ENDPOINT=ftp://bad/x\n')
+    enabled, _, _, _ = m.settings(tmp_path, ROOT)
+    assert enabled is False
+
+
+def test_kb_prepare_uses_main_credentials_only_and_disabled_short_circuits(tmp_path, monkeypatch):
+    m = load()
+    monkeypatch.setattr(m, 'settings', lambda directory, root: (True, tmp_path / '.env', m.DEFAULT_ENDPOINT, m.DEFAULT_ENDPOINT))
+    monkeypatch.setattr(m, 'load_credentials', lambda root, path: (None, {'LANGFUSE_INIT_PROJECT_PUBLIC_KEY': 'p', 'LANGFUSE_INIT_PROJECT_SECRET_KEY': 's'}))
+    # 单共享项目：prepare 只需主项目凭据，无 LANGFUSE_KB_PROJECT_* 也能发布
+    result = m.prepare(tmp_path, tmp_path)
+    config = json.loads(result['config'].read_text())
+    assert config['exporters']['otlphttp/langfuse-kb']['headers']['Authorization'] == config['exporters']['otlphttp/langfuse']['headers']['Authorization']
+    # 禁用时在读凭据前退出
+    monkeypatch.setattr(m, 'settings', lambda directory, root: (False, tmp_path / '.env', m.DEFAULT_ENDPOINT, m.DEFAULT_ENDPOINT))
+    reads = []
+    monkeypatch.setattr(m, 'load_credentials', lambda root, path: reads.append(path))
+    assert m.prepare(tmp_path, tmp_path) is None and reads == []
+
+
+def test_kb_transform_contexts_and_event_masking():
+    m = load()
+    contexts = m.build_config('p', 's')['processors']['transform/langfuse-kb']['trace_statements']
+    assert [c['context'] for c in contexts] == ['scope', 'span', 'resource', 'spanevent']
+    assert contexts[0]['statements'] == ['set(name, "")', 'set(version, "")', 'keep_keys(attributes, [])']
+    assert contexts[2]['statements'] == ['keep_keys(attributes, ["service.name"])']
+    spanevent = json.dumps(contexts[3]['statements'])
+    for event in ('nkb.document.completed', 'nkb.index.completed', 'nkb.retrieval.completed', 'nkb.model.completed', 'nkb.mcp.completed', 'nkb.http.completed'):
+        assert event.replace('.', '[.]') in spanevent  # IsMatch 内的转义形式
+    assert any('set(name, "event") where not IsMatch(name,' in s for s in contexts[3]['statements'])  # 异常/未知事件固定名称
+    assert 'nkb.content.' not in spanevent  # 事件不透传正文
+    # 伪装成合法键的秘密字符串会被类型/枚举守卫删除
+    delete = next(s for s in contexts[3]['statements'] if 'delete_key(attributes, "error.type")' in s)
+    assert 'IsString' in delete and '"timeout"' in delete and '"tool_error"' not in delete
+
+
+def test_kb_envelopes_are_independent_and_never_synthesize():
+    m = load()
+    statements = m.span_statements_kb()
+    bodies = [s for s in statements if s.startswith('set(attributes["langfuse.observation.input"], attributes["nkb.content.') or s.startswith('set(attributes["langfuse.observation.output"], attributes["nkb.content.')]
+    # chain in/out、retriever in/out、embedding in；embedding 无 output
+    assert len(bodies) == 5
+    assert all('IsString(attributes["nkb.content.' in s for s in bodies)
+    assert all('attributes["langfuse.observation.type"] ==' in s for s in bodies)
+    # 失败/取消不合成成功 output：output 只可能来自真实属性拷贝
+    for s in statements:
+        if s.startswith('set(attributes["langfuse.observation.output"], attributes'):
+            assert s.startswith('set(attributes["langfuse.observation.output"], attributes["nkb.content.')
+    # 每个方向替换全新 envelope，suffix 独立缺失不补造
+    fresh = [s for s in statements if '{"source": "' in s]
+    assert len(fresh) == 5
+    assert all('where' in s for s in fresh)
+    for s in statements:
+        if '["original_bytes"]' in s or '["truncated"]' in s or '["incomplete"]' in s or '["observed_bytes"]' in s:
+            assert '!= nil' in s
+
+
+def test_kb_conflict_fallback_covers_all_pairs_without_residue():
+    m = load()
+    statements = m.span_statements_kb()
+    conflict = next(s for s in statements if s.startswith('set(cache["entry"], false) where '))
+    pairs = [
+        ('attributes["nkb.retrieval.operation"] == "search"', 'attributes["nkb.index.operation"] == "run"'),
+        ('attributes["nkb.retrieval.operation"] == "search"', 'attributes["gen_ai.operation.name"] == "embeddings"'),
+        ('attributes["nkb.index.operation"] == "run"', 'attributes["gen_ai.operation.name"] == "embeddings"'),
+    ]
+    for first, second in pairs:
+        assert f'{first} and {second}' in conflict
+    reset = [s for s in statements if s.startswith('set(') and ' where ' in conflict and s.endswith(f'where {conflict.split(" where ", 1)[1]}')]
+    assert any(s.startswith('set(name, "span") where ') for s in reset)
+    assert any(s.startswith('set(attributes["langfuse.observation.type"], "span") where ') for s in reset)
+    # 回落后不得残留 model/usage：二者以投影后 type == embedding 为条件
+    for s in statements:
+        if s.startswith('set(') and ('langfuse.observation.model.name' in s or 'cache["usage"]["input"]' in s or 'langfuse.observation.usage_details' in s):
+            assert 'attributes["langfuse.observation.type"] == "embedding"' in s
+            assert 'gen_ai.operation.name' not in s
+
+
+def test_kb_usage_tokens_gate_real_values_only():
+    usage = next(s for s in load().span_statements_kb() if 'cache["usage"]["input"]' in s)
+    # 真实 0 通过（>= 0）；unknown 缺失不投影；负数与 bool 被 IsInt/>=0 拒绝
+    assert 'attributes["nkb.model.usage_known"] == true' in usage
+    assert 'IsInt(attributes["gen_ai.usage.input_tokens"])' in usage
+    assert 'attributes["gen_ai.usage.input_tokens"] >= 0' in usage
+
+
+def test_kb_trace_bodies_require_global_root_entry():
+    for s in load().span_statements_kb():
+        if 'set(attributes["langfuse.trace.input"]' in s or 'set(attributes["langfuse.trace.output"]' in s:
+            assert 'parent_span_id == SpanID(0x0000000000000000)' in s
+            assert 'cache["entry"] == true' in s

@@ -52,9 +52,13 @@ stack=m.Stack(root/'docker/observability',progress=False)
 selected=stack.langfuse()
 if mode!='restore':
     cfg=json.loads(selected['config'].read_text())
-    exporter=cfg['exporters']['otlphttp/langfuse']
-    if mode=='auth': exporter['headers']['Authorization']='Basic ZTJlLWJhZDplMmUtYmFk'
-    else: exporter['traces_endpoint']='http://'+slow+':9988/v1/traces'
+    if mode=='auth':
+        # One shared credential: a rejected Basic breaks both Langfuse pipelines.
+        for exporter in ('otlphttp/langfuse','otlphttp/langfuse-kb'):
+            cfg['exporters'][exporter]['headers']['Authorization']='Basic ZTJlLWJhZDplMmUtYmFk'
+    else:
+        target='otlphttp/langfuse-kb' if mode=='slow-kb' else 'otlphttp/langfuse'
+        cfg['exporters'][target]['traces_endpoint']='http://'+slow+':9988/v1/traces'
     mod=stack.langfuse_module()
     path=mod.publish_json(root/'locals/harness_tmp/langfuse-collector',cfg)
     override=json.loads(selected['override'].read_text())
@@ -103,13 +107,15 @@ container_created=1
 docker network connect n-observability_default "$name" || exit 1
 docker network connect n-agent_default "$name" || exit 1
 docker start "$name" >/dev/null || exit 1
-for action in synthetic business sampling concurrent history; do probe "$action" || result=1; done
+for action in synthetic kb-synthetic business sampling concurrent history; do probe "$action" || result=1; done
 web_stopped=1
 sh "$root/docker/langfuse/restart.sh" compose stop langfuse-web >"$tmp/web-stop.log" 2>&1 || exit 1
 probe fault-web || result=1
+probe fault-web-kb || result=1
 sh "$root/docker/langfuse/restart.sh" start >"$tmp/web-start.log" 2>&1 || exit 1
 web_stopped=0
 probe business || result=1
+probe kb-recovered || result=1
 collector_changed=1
 python3 "$tmp/collector.py" "$root" auth "$slow" >"$tmp/auth.log" 2>&1 || exit 1
 probe fault-auth || result=1
@@ -125,6 +131,12 @@ probe fault-slow || result=1
 probe saturation || result=1
 probe fault-queue || result=1
 python3 "$tmp/collector.py" "$root" restore "$slow" >"$tmp/slow-restore.log" 2>&1 || exit 1
+collector_changed=0
+probe business || result=1
+collector_changed=1
+python3 "$tmp/collector.py" "$root" slow-kb "$slow" >"$tmp/slow-kb.log" 2>&1 || exit 1
+probe fault-queue-kb || result=1
+python3 "$tmp/collector.py" "$root" restore "$slow" >"$tmp/slow-kb-restore.log" 2>&1 || exit 1
 collector_changed=0
 probe business || result=1
 sh "$root/docker/langfuse/restart.sh" compose restart langfuse-web >"$tmp/web-restart.log" 2>&1 || exit 1
