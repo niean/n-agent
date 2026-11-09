@@ -116,11 +116,17 @@
     - 观测：E2E测试，增加OTel/Langfuse对比校验，包括指标数值、Trace链路等
     - 前端：左导收起时hover提示，一级菜单图标要有hover，告知用户这是什么菜单
 
+[20261109]
+- FR
+    - 成本：补全Langfuse中的cost分析。补全N-Agent/N-KB在Langfuse中的cost分析，服务端统一计价，经OTel同源分发到Langfuse和现有观测栈。
+        - spec: spec-261109-model-cost-observability.md
+
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - FR
+    - 评测：补全Langfuse中的score分析。补全N-Agent/N-KB在Langfuse中的score分析，是否对应正式的evaluate能力？服务端统一评估分数，经OTel同源分发到Langfuse和现有观测栈，帮我做正式的设计spec
     - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离
     - 任务：持久化执行环境，让任务拥有快照、可恢复(如执行`sh docker/restart.sh`后自动恢复)
@@ -131,7 +137,6 @@
     - 产品：资源隔离，支持Tenant|WorkSpace|Project(如E2E对话测试隔离)
     - 产品：对标DSH，发现值得参考的技术架构、产品功能
     - 调度：支持MoA
-    - 评测：补全evaluate
 - HE
     - HE：三方审阅，从直接修改、改为给出建议，从而解耦
     - HE：VSCode+插件模式，补全Token观测

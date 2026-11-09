@@ -7,3 +7,6 @@ active/*
 
 verify/*
 !verify/.gitkeep
+
+research/*
+!research/.gitkeep

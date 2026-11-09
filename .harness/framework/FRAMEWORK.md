@@ -146,6 +146,7 @@ Skill 只定义"做什么"和"怎么做"，不声明自身的触发时机；调�
 | Skill | 调用场景 | 文件 |
 |-------|------|------|
 | 加载知识库 | Workflow显式调用，或人工指令 | .harness/framework/skills/harness/load-knowledge.md |
+| 调研行业 | 人工指令 | .harness/framework/skills/harness/research/SKILL.md |
 | 回填知识库 | Workflow显式调用，或人工指令 | .harness/framework/skills/harness/backfill-knowledge.md |
 | 归档任务文件 | Workflow显式调用，或人工指令 | .harness/framework/skills/harness/archive-task-files.md |
 | 从教训回填知识库 | 人工指令 | .harness/framework/skills/harness-ops/backfill-knowledge-fl.md |
@@ -212,11 +213,12 @@ Phase 间交接使用结构化检查点摘要，每条摘要为单行，整个�
 
 AI 通过 `.harness/specs/` 和 `.harness/plans/` 自主管理设计文档和实现计划（目录结构见"仓库结构"）。
 
-### Spec 与 Plan
+### Spec、Plan 与 Research
 
 - Spec 命名：`spec-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/brainstorming.md`
 - Plan 命名：`plan-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/writing-plans.md`
 - Verify 命名：`verify-{YYMMDD}-{desc}.md`，模板见 `.harness/framework/skills/superpowers/writing-verify.md`
+- Research 命名：`research-{YYMMDD}-{desc}.md`，存放于 `.harness/specs/research/`
 - Spec 触发：默认必须产出 spec；用户显式要求跳过、或指令显式要求跳过时，可省略 spec
 - Spec 是一次性产物，实现完成后持久性知识通过 Phase 5 回填 knowledge/
 - 同一窗口内第 2+ 次迭代复用同一计划文件
