@@ -39,6 +39,11 @@ class LLMResult:
     finish_reason: str = "stop"
     usage: dict[str, Any] = field(default_factory=dict)
     raw: Any = None
+    # 受信计价身份 (billing_provider, billing_model)：由 ActiveProviderHolder
+    # 在 Provider 实例选择同一作用域解析并携带（组合根受信配置，请求方与
+    # Provider 适配器不能覆盖）。账本路径据此与观测路径共用同一身份，
+    # 记录时不重读运行时当前配置；裸 Provider（非 holder）为 None。
+    billing_identity: tuple[str, str] | None = None
 
 
 class LLMProvider(Protocol):

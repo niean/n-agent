@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose、文件管理规则、Dashboard 前端（modal/alert/按钮/菜单/时间渲染）和 OTel 可观测（B 类 env-only 配置、DDD 分层边界、敏感属性三重封口、metric-name-mapping 权威表）；1024000 字节观测详情 -->
+<!-- SUMMARY: N-Agent 的实现约定，包括 Python/DDD 分层、测试、错误处理、安全、Docker Compose、文件管理规则、Dashboard 前端（modal/alert/按钮/菜单/时间渲染）和 OTel 可观测（B 类 env-only 配置、DDD 分层边界、敏感属性三重封口、metric-name-mapping 权威表）；模型成本计价 B 类 env-only 配置（定价目录路径/预期哈希/计价身份映射）；1024000 字节观测详情 -->
 # 约定与约束（实现细节）
 
 本文件是项目实现规范约定的权威来源，`.harness/PROJECT.md` "项目规范"各节为摘要引用，以本文件为准。
@@ -87,6 +87,12 @@ OTel 可观测（B 类 env-only，不进 Dashboard 编辑白名单；endpoint �
 - `N_AGENT_PROFILING_ENABLED`、`N_AGENT_PROFILING_PYROSCOPE_ENDPOINT`、`N_AGENT_PROFILING_INTERVAL_SECONDS`（profiling 独立于 otel_enabled，启用须提供合法 http/https 上传地址）
 
 OTel 实现约定：Domain 零 OTel 依赖；Application 只允许 opentelemetry-api（唯一消费点 `app/application/telemetry_semantics.py`）；SDK/exporter/instrumentation 只允许出现在 `app/infrastructure/observability/`；Interfaces 只消费注入的 snapshot callable。原始敏感属性仍由白名单封口；消息、提示词和工具输入输出仅经固定字段、共享脱敏与 UTF-8 限长后进入详情通道，由 `tests/architecture/test_observability_secret_sentinels.py` 哨兵验证可读正文和凭据遮盖，HTTP 自动 Span 可携带统一投影后的详情；ring buffer/指标/Profile 仍无正文。Prometheus 指标名翻译以 `docker/observability/metric-name-mapping.md` 为权威表，新增 instrument 必须同步。详见 05-key-patterns.md 模式四十六、四十七。
+
+模型成本计价配置（B 类 env-only，不进 Dashboard 编辑白名单，启动期绑定；行为语义见 07-observability.md 成本语义章节）：
+
+- `N_AGENT_PRICING_CATALOG_PATH`：版本化价格目录 JSON 文件路径；Docker 部署以只读挂载提供（默认 `/etc/n-agent/model-pricing.json`，对应 `docker/observability/model-pricing.json`）。
+- `N_AGENT_PRICING_CATALOG_EXPECTED_SHA256`：目录内容的预期 JCS（RFC 8785）规范化 SHA-256；缺失按目录不可用处理，不符时目录失效（成本 unknown），业务继续。
+- `N_AGENT_MODEL_BILLING_IDENTITY_MAP`：受信计价身份映射 JSON 数组（provider_id + 请求模型 -> billing_provider/billing_model），启动期精确映射注入组合根，不信任请求 options、URL 或响应模型覆盖；默认空表示全部 identity_unresolved。
 
 ## Docker Compose 默认值
 

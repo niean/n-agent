@@ -16,9 +16,9 @@ def test_otel_case_links_comparison_instead_of_one_trace_and_aggregate_rebases(t
     artifact = child / "comparison" / "comparison.md"
     artifact.parent.mkdir(parents=True)
     artifact.write_text("# 指标数值对比\n\nAgent 调用 Trace 列表\n")
-    state = report.new_report("comparison-run")
+    state = report.new_report("comparison-run", comparison_only=True)
     case = next((c for c in state["cases"] if c["id"] == "langfuse-comparison"), None)
-    assert case is not None, "OTel E2E 必须注册数值一致性用例"
+    assert case is not None, "手动报告必须注册数值一致性用例"
     case.update(result="PASS", comparison_path="comparison/comparison.md", trace_ids=["a" * 32, "b" * 32])
     report.finish(state, "http://grafana.localhost/explore", 0)
     report.write_report(child, state)
@@ -100,7 +100,7 @@ def test_aggregate_flattens_all_categories_and_retains_trace(tmp_path):
     assert markdown.count("| 分类 | 用例 | 结果 | TraceID | 链接 |") == 2
     assert all(f"| {category} |" in markdown for category in ("对话", "制品", "OTel"))
     assert "a" * 32 in markdown and "[查看Trace](" in markdown
-    assert len(merged["cases"]) == 6
+    assert len(merged["cases"]) == 5
 
 
 def test_e2e_runner_excludes_config_bundle_and_aggregates_reports():
@@ -158,7 +158,7 @@ def test_cli_writes_result_file_and_prints_only_summary_and_location(tmp_path):
     completed = subprocess.run(["python3", tool, str(tmp_path), "finish", "", "0"],
                                check=True, text=True, capture_output=True)
     assert (tmp_path / "result.md").read_text() == (tmp_path / "report.md").read_text()
-    assert "最终结果：通过0/4（失败0，跳过4）；其中0/4个用例进行了重试。" in completed.stdout
+    assert "最终结果：通过0/3（失败0，跳过3）；其中0/3个用例进行了重试。" in completed.stdout
     assert f"RESULT_FILE {tmp_path / 'result.md'}" in completed.stdout
     assert "| 分类 |" not in completed.stdout
 
@@ -209,3 +209,8 @@ def test_summary_presents_final_eighteen_cases_before_retry_count(last_result):
               for attempt, result in ((1, "FAIL"), (2, "FAIL"), (3, last_result))]
     expected = "全部通过（18/18）" if last_result == "PASS" else "通过17/18（失败1，跳过0）"
     assert report.render_summary(cases) == f"最终结果：{expected}；其中1/18个用例进行了重试。"
+
+
+def test_default_otel_report_excludes_manual_comparison():
+    assert [c["id"] for c in report.new_report("default")["cases"]] == ["good", "fail", "cancel"]
+    assert [c["id"] for c in report.new_report("manual", comparison_only=True)["cases"]] == ["langfuse-comparison"]

@@ -85,6 +85,18 @@ sh docker/restart.sh
 sh tests/e2e/run.sh
 ```
 
+### OTel/Langfuse 数值一致性（仅人工显式调用）
+
+- 不纳入常规 E2E、OTel 冒烟及工作流自动验收；“运行全部 E2E”不包含此项。仅人工明确要求“运行 OTel/Langfuse 数值一致性测试”时执行。
+- 保留现有探针、成本测试环境部署/还原、会话清理及对比报告能力。执行前仍须重建服务；探针在 Docker 内运行。使用独立报告目录：
+
+```bash
+sh docker/restart.sh
+run_id="otel-langfuse-manual-$(date +%Y%m%d-%H%M%S)-$$"
+app_container="$(cd docker && docker compose ps -q n-agent)"
+bash tests/e2e/otel_langfuse_comparison.sh "$PWD/locals/e2e-reports/$run_id" "$run_id" "$app_container"
+```
+
 ### E2E 结果展示约定
 
 - 测试结果列表写入 `locals/e2e-reports/${测试ID}/result.md`：第一节“最终结果”展示每个用例最后一次尝试，第二节“重试记录”展示此前尝试；两节都使用相同表格，列为 `分类 | 用例 | 结果 | TraceID | 链接`。分类为对话、制品、OTel；结果使用 PASS / FAIL / SKIP。没有重试时保留空表并说明无重试记录。

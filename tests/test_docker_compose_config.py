@@ -109,11 +109,32 @@ def test_docker_compose_config():
     assert "FROM python:3.11-slim" in dockerfile
     assert "ENV TZ=Asia/Shanghai" in dockerfile
     assert "tzdata" in dockerfile
+    # Playwright 的 node driver 依赖 libatomic.so.1；浮动基础镜像（Debian
+    # trixie slim）不自带该库，缺失时 async_playwright().start() 直接失败
+    # （"Connection closed while reading from the driver"），所有 browser
+    # 工具随之 browser_unavailable。安装列表必须显式包含 libatomic1。
+    assert "libatomic1" in dockerfile
     assert "/etc/localtime" in dockerfile
     assert '"uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8201"' in dockerfile
     assert "N_AGENT_KB_ENABLED" in env
     assert "N_AGENT_KB_BASE_URL" in env
     assert "http://n-kb:8212" in env
+
+
+def test_docker_compose_example_documents_pricing_wiring():
+    """评审修复（第三轮）：冷启动模板必须携带与实际部署同构的成本计价接线
+    （版本化价格目录只读挂载 + 锁定内容哈希 + 受信计价身份映射 env，B 类启动期
+    env-only），否则新部署无法复现接线；E2E 经部署期环境变量覆盖注入测试
+    目录与身份映射（override 追加挂载点，不改动本模板）。"""
+    compose = (DOCKER_DIR / "docker-compose.yml.example").read_text()
+    assert "N_AGENT_PRICING_CATALOG_PATH" in compose
+    assert "N_AGENT_PRICING_CATALOG_EXPECTED_SHA256" in compose
+    assert "N_AGENT_MODEL_BILLING_IDENTITY_MAP" in compose
+    # 容器内默认路径与版本化价格目录挂载（与实际部署 docker-compose.yml 同构）
+    assert "N_AGENT_PRICING_CATALOG_PATH: ${N_AGENT_PRICING_CATALOG_PATH:-/etc/n-agent/model-pricing.json}" in compose
+    assert "./observability/model-pricing.json:/etc/n-agent/model-pricing.json:ro" in compose
+    # 版本化价格目录的锁定内容哈希（JCS 规范化 SHA-256）作为 env 默认值
+    assert "3f31783a1b457ce213b8482a23243dbfd00e16e8ed7ff9086ca600d2be1ec19f" in compose
 
 
 def test_env_example_documents_host_cdp_without_enabling_browser_by_default():

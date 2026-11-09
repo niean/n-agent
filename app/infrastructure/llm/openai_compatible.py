@@ -219,18 +219,32 @@ def _extract_openai_usage(usage: Any) -> tuple[Any, Any, Any]:
 
 def _report_openai_usage(attempt: Any, usage: Any) -> None:
     """Observability-only reporting: extraction or hook failures must never
-    change the business result (isolated here, not via __exit__ alone)."""
+    change the business result (isolated here, not via __exit__ alone).
+
+    The raw usage channel preserves field presence faithfully: a key is only
+    submitted when the field exists in the response, and an existing but
+    invalid value is passed through as-is (the attempt judges validity --
+    presence-with-invalid is never conflated with absence).
+    """
     try:
-        raw = {key: _get(usage, key) for key in ('prompt_tokens', 'completion_tokens')}
-        details = _get(usage, 'prompt_tokens_details')
-        raw['prompt_tokens_details'] = {'cached_tokens': _get(details, 'cached_tokens')}
+        raw: dict[str, Any] = {}
+        for key in ("prompt_tokens", "completion_tokens"):
+            value = _get(usage, key)
+            if value is not None:
+                raw[key] = value
+        details = _get(usage, "prompt_tokens_details")
+        if details is not None:
+            raw["prompt_tokens_details"] = {
+                "cached_tokens": _get(details, "cached_tokens")
+            }
         optional_hook(attempt, "set_raw_usage", raw)
         ti, to, tic = _extract_openai_usage(usage)
         optional_hook(attempt, "set_usage", ti, to)
         if tic is not None:
             # cache_write is known zero: in this protocol it is
             # inapplicable (not merely unknown), which keeps the derived
-            # cache-hit-rate denominator decidable from Ti + Tic.
+            # cache-hit-rate denominator decidable from Ti + Tic. The cost
+            # fact path declares cache_write not_applicable separately.
             optional_hook(attempt, "set_cache_usage",
                           cache_read_tokens=tic, cache_write_tokens=0)
     except Exception:

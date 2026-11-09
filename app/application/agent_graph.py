@@ -1152,6 +1152,10 @@ class AgentGraphRunner:
                         response_message=usage_resp.content if usage_resp.allowed else None,
                         tools=usage_tools_result.content if (usage_tools_result and usage_tools_result.allowed) else None,
                         generation_params=gen_params_json_cache,
+                        # 尝试冻结的受信计价身份（实例选择期随 LLMResult 携带，
+                        # 含 None=未解析）：账本与观测共用同一计价结果，不在
+                        # 记录时重读切换后的当前配置
+                        billing_identity=result.billing_identity,
                     )
                 except Exception:
                     logger.exception(

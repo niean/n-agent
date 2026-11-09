@@ -42,7 +42,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Callable, Dict, Iterator, Optional
 
 from app.application.telemetry_details import (
@@ -113,6 +113,16 @@ NAGENT_AGENT_MESSAGE_COUNT = "nagent.agent.message_count"
 NAGENT_AGENT_INFERENCE_CALLS = "nagent.agent.inference_calls"
 NAGENT_AGENT_TOOL_CALLS = "nagent.agent.tool_calls"
 NAGENT_TOOL_EXECUTED = "nagent.tool.executed"
+NAGENT_MODEL_COST_STATUS = "nagent.model.cost_status"
+NAGENT_MODEL_COST_REASON = "nagent.model.cost_reason"
+NAGENT_MODEL_COST_CURRENCY = "nagent.model.cost_currency"
+NAGENT_MODEL_COST_DECIMAL = "nagent.model.cost_decimal"
+NAGENT_MODEL_COST_USD = "nagent.model.cost_usd"
+NAGENT_MODEL_COST_COMPONENT = "nagent.model.cost_component"
+NAGENT_MODEL_PRICE_ID = "nagent.model.price_id"
+NAGENT_MODEL_PRICING_VERSION = "nagent.model.pricing_version"
+NAGENT_MODEL_BILLING_PROVIDER = "nagent.model.billing_provider"
+NAGENT_MODEL_BILLING_MODEL = "nagent.model.billing_model"
 
 EXECUTION_LOG_TEMPLATE = "execution_completed"
 logger = logging.getLogger(__name__)
@@ -295,6 +305,9 @@ INSTRUMENT_MODEL_CACHE_WRITE = "nagent.model.cache_write_tokens"
 INSTRUMENT_MODEL_NORMALIZED = "nagent.model.normalized_tokens"
 INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT = "nagent.model.cache_eligible_prompt_tokens"
 INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ = "nagent.model.cache_eligible_read_tokens"
+INSTRUMENT_MODEL_COST = "nagent.model.cost"
+INSTRUMENT_MODEL_COST_COMPONENTS = "nagent.model.cost_components"
+INSTRUMENT_MODEL_COST_ATTEMPTS = "nagent.model.cost_attempts"
 
 
 INSTRUMENTS: Dict[str, Instrument] = {
@@ -432,6 +445,32 @@ INSTRUMENTS: Dict[str, Instrument] = {
             unit="{token}",
             allowed_dimensions=(GEN_AI_OPERATION_NAME, GEN_AI_PROVIDER_NAME, GEN_AI_REQUEST_MODEL),
         ),
+        Instrument(
+            name=INSTRUMENT_MODEL_COST,
+            kind="counter",
+            unit="USD",
+            allowed_dimensions=(
+                GEN_AI_OPERATION_NAME, NAGENT_MODEL_BILLING_PROVIDER, NAGENT_MODEL_BILLING_MODEL,
+            ),
+        ),
+        Instrument(
+            name=INSTRUMENT_MODEL_COST_COMPONENTS,
+            kind="counter",
+            unit="USD",
+            allowed_dimensions=(
+                GEN_AI_OPERATION_NAME, NAGENT_MODEL_BILLING_PROVIDER, NAGENT_MODEL_BILLING_MODEL,
+                NAGENT_MODEL_COST_COMPONENT,
+            ),
+        ),
+        Instrument(
+            name=INSTRUMENT_MODEL_COST_ATTEMPTS,
+            kind="counter",
+            unit="{attempt}",
+            allowed_dimensions=(
+                GEN_AI_OPERATION_NAME, NAGENT_MODEL_BILLING_PROVIDER, NAGENT_MODEL_BILLING_MODEL,
+                NAGENT_MODEL_COST_STATUS, NAGENT_MODEL_COST_REASON,
+            ),
+        ),
     )
 }
 
@@ -563,6 +602,47 @@ def map_model_name(model: object) -> str:
 
 def map_provider_name(provider: object) -> str:
     return _safe_known(provider, _KNOWN_PROVIDERS)
+
+
+# 受信计价身份的 provider 侧固定集合（计价目录 billing_provider 词汇 + other）。
+# 与请求 provider（_KNOWN_PROVIDERS）分列：计费身份是 env-only 受信配置，不是
+# 请求方事实，两个集合各自有界演进互不牵连。
+_KNOWN_BILLING_PROVIDERS = frozenset({
+    "openai", "anthropic", "google", "azure", "bedrock", "ollama",
+    "deepseek", "volcengine",
+})
+
+# 成本无法估算的八类原因（与 Domain UnknownReason 词汇一致；本模块不导入
+# 业务模块，词汇在此固定镜像，变更须同步 app/domain/cost.py）。
+_KNOWN_COST_REASONS = frozenset({
+    "missing_usage", "invalid_usage", "price_not_found", "price_ambiguous",
+    "unsupported_pricing", "identity_unresolved", "pricing_unavailable",
+    "amount_unrepresentable",
+})
+
+# 成本分项桶词汇（与 Domain BUCKETS 一致）及各桶的 Span/Log 金额键。
+COST_BUCKETS = ("input", "output", "cache_read", "cache_write")
+NAGENT_MODEL_COST_BUCKET_KEYS: MappingProxyType = MappingProxyType({
+    "input": "nagent.model.cost_input_usd",
+    "output": "nagent.model.cost_output_usd",
+    "cache_read": "nagent.model.cost_cache_read_usd",
+    "cache_write": "nagent.model.cost_cache_write_usd",
+})
+
+
+def map_billing_provider(provider: object) -> str:
+    return _safe_known(provider, _KNOWN_BILLING_PROVIDERS)
+
+
+def map_billing_model(model: object) -> str:
+    """受信计费模型名的长度约束投影（不白名单化：目录 billing_model 是
+    env-only 受信开放集合，白名单会把真实计费身份折叠成 other）。"""
+    if not isinstance(model, str):
+        return "other"
+    cleaned = model.strip()
+    if not cleaned or len(cleaned) > _MAX_NAME_LENGTH:
+        return "other"
+    return cleaned
 
 
 def map_source(source: object) -> str:
@@ -1466,6 +1546,139 @@ def record_inference_tokens(
             _record(INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ, cache_read_tokens, dict(cache_dims))
 
 
+def _finite_nonneg_number(value: object) -> bool:
+    """金额守卫：真实有限非负 int/float（bool 不是金额），显式 0 合法。"""
+    return (type(value) in (int, float) and math.isfinite(value) and value >= 0)
+
+
+def _cost_facts_from_result(result: object) -> dict:
+    """estimator 结果 -> Span/Log 同键成本事实（不重算成本，只做安全投影）。
+
+    estimated 携带全部金额/分项/decimal/版本/price_id/受信身份；unknown 只携带
+    status/reason（白名单内）/currency，且保留目录加载成功时的 pricing_version
+    与唯一命中价格项后的 price_id（目录失效或未定位价格项省略），绝不输出任何
+    金额。非法或未知形态整组省略（延续旧防御行为），观测失败永不破坏业务。
+    """
+    try:
+        if not isinstance(result, dict):
+            return {}
+        status = result.get("status")
+        if status not in ("estimated", "unknown"):
+            return {}
+        facts = {NAGENT_MODEL_COST_STATUS: status}
+        currency = result.get("currency")
+        facts[NAGENT_MODEL_COST_CURRENCY] = (
+            currency if isinstance(currency, str) and currency.strip() else "USD"
+        )
+        billing_provider = result.get("billing_provider")
+        if isinstance(billing_provider, str) and billing_provider.strip():
+            facts[NAGENT_MODEL_BILLING_PROVIDER] = map_billing_provider(billing_provider)
+        billing_model = result.get("billing_model")
+        if isinstance(billing_model, str) and billing_model.strip():
+            facts[NAGENT_MODEL_BILLING_MODEL] = map_billing_model(billing_model)
+        if status == "unknown":
+            reason = result.get("reason")
+            if isinstance(reason, str) and reason in _KNOWN_COST_REASONS:
+                facts[NAGENT_MODEL_COST_REASON] = reason
+            version = result.get("pricing_version")
+            if isinstance(version, str) and version.strip():
+                facts[NAGENT_MODEL_PRICING_VERSION] = version
+            # 唯一命中价格项后的 unknown 保留 price_id 供追溯；未定位到
+            # 价格项的 unknown 该键缺省（组合根不携带即不投影）
+            price_id = result.get("price_id")
+            if isinstance(price_id, str) and price_id.strip():
+                facts[NAGENT_MODEL_PRICE_ID] = price_id
+            return facts
+        # estimated：核心三键缺一即整组省略（旧契约：缺有效版本视为无效结果）
+        amount = result.get("amount_usd")
+        version = result.get("pricing_version")
+        if not (isinstance(version, str) and version.strip()):
+            return {}
+        if not _finite_nonneg_number(amount):
+            return {}
+        facts[NAGENT_MODEL_COST_USD] = float(amount)
+        facts[NAGENT_MODEL_PRICING_VERSION] = version
+        decimal_str = result.get("cost_decimal")
+        if isinstance(decimal_str, str) and decimal_str.strip():
+            facts[NAGENT_MODEL_COST_DECIMAL] = decimal_str
+        price_id = result.get("price_id")
+        if isinstance(price_id, str) and price_id.strip():
+            facts[NAGENT_MODEL_PRICE_ID] = price_id
+        components = result.get("components")
+        if isinstance(components, dict):
+            for bucket in COST_BUCKETS:
+                value = components.get(bucket)
+                if _finite_nonneg_number(value):
+                    facts[NAGENT_MODEL_COST_BUCKET_KEYS[bucket]] = float(value)
+        return facts
+    except Exception:
+        return {}
+
+
+def record_model_cost(operation: object, result: object) -> None:
+    """Record the three cost Counters for one finalized attempt.
+
+    Consumes the RAW estimator result and re-validates internally: Metric
+    recording is unconditional for any dict result with a known status, so a
+    malformed estimated result (missing/blank pricing_version or a
+    non-representable amount) still counts the attempt as ``unknown``
+    (downgrade reason follows T1 order: pricing_unavailable before
+    amount_unrepresentable) while no amount is ever emitted for it. Metric
+    recording is independent of span sampling/recording state; the estimated
+    branch always adds (explicit zero included) and the unknown branch only
+    counts the attempt. Metric dimensions go through the bounded safe
+    mappings; the metric model label goes through the ``map_model_name``
+    whitelist (unknown -> ``other``) to keep counter cardinality bounded,
+    while span/metadata billing identity keeps the raw billing projection
+    (``map_billing_model``). Reason is whitelisted against the fixed
+    eight-value vocabulary (estimated is pinned to ``none``).
+    """
+    try:
+        if not isinstance(result, dict):
+            return
+        status = result.get("status")
+        if status not in ("estimated", "unknown"):
+            return
+        amount = result.get("amount_usd")
+        version = result.get("pricing_version")
+        reason = result.get("reason")
+        downgrade_reason = None
+        if status == "estimated" and not (isinstance(version, str) and version.strip()):
+            status, downgrade_reason = "unknown", "pricing_unavailable"
+        if status == "estimated" and not _finite_nonneg_number(amount):
+            status, downgrade_reason = "unknown", "amount_unrepresentable"
+        dims = {
+            GEN_AI_OPERATION_NAME: operation if isinstance(operation, str) and operation else "other",
+            NAGENT_MODEL_BILLING_PROVIDER: map_billing_provider(result.get("billing_provider")),
+            NAGENT_MODEL_BILLING_MODEL: map_model_name(result.get("billing_model")),
+        }
+        attempt_dims = dict(dims)
+        attempt_dims[NAGENT_MODEL_COST_STATUS] = status
+        if status == "estimated":
+            attempt_dims[NAGENT_MODEL_COST_REASON] = "none"
+        elif downgrade_reason is not None:
+            attempt_dims[NAGENT_MODEL_COST_REASON] = downgrade_reason
+        elif isinstance(reason, str) and reason in _KNOWN_COST_REASONS:
+            attempt_dims[NAGENT_MODEL_COST_REASON] = reason
+        _record(INSTRUMENT_MODEL_COST_ATTEMPTS, 1, attempt_dims)
+        if status != "estimated":
+            return
+        if _finite_nonneg_number(amount):
+            _record(INSTRUMENT_MODEL_COST, float(amount), dict(dims))
+        components = result.get("components")
+        if isinstance(components, dict):
+            for bucket in COST_BUCKETS:
+                value = components.get(bucket)
+                if _finite_nonneg_number(value):
+                    _record(
+                        INSTRUMENT_MODEL_COST_COMPONENTS,
+                        float(value),
+                        {**dims, NAGENT_MODEL_COST_COMPONENT: bucket},
+                    )
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Run context (ContextVar): per-run stats + current iteration
 #
@@ -1592,6 +1805,31 @@ class NoopChatAttempt:
 
 _NOOP_CHAT_ATTEMPT = NoopChatAttempt()
 
+# 成本四桶的初始有效性：全部 unknown（协议适用性由组合根的 raw 视图裁决）。
+_COST_BUCKET_STATES_INIT: MappingProxyType = MappingProxyType({
+    "input": "unknown", "output": "unknown",
+    "cache_read": "unknown", "cache_write": "unknown",
+})
+
+# Provider raw usage 字段 -> 成本桶（Anthropic 平铺字段一一对应）。
+_ANTHROPIC_RAW_BUCKET_FIELDS: tuple[tuple[str, str], ...] = (
+    ("input_tokens", "input"),
+    ("output_tokens", "output"),
+    ("cache_read_input_tokens", "cache_read"),
+    ("cache_creation_input_tokens", "cache_write"),
+)
+
+# Anthropic cache TTL 拆分事实的已知键（cache_creation 请求/响应事实通道）。
+_CACHE_TTL_FACT_KEYS: tuple[str, ...] = (
+    "ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens",
+)
+
+
+# 受信计价身份冻结哨兵：区分"请求未启动、身份未冻结"（旧调用契约：未经
+# __enter__ 的直接 estimator 调用，由组合根在收口时解析）与"请求已启动但
+# 身份未解析"（冻结为 None，不得追溯重解析）。
+_BILLING_IDENTITY_UNSET = object()
+
 
 class ChatAttempt:
     """One LLM round-trip attempt: one chat span + duration/token metrics.
@@ -1615,9 +1853,12 @@ class ChatAttempt:
         provider: Optional[str] = "openai",
         operation: str = "chat",
         cost_estimator=None,
+        billing_identity_resolver=None,
     ):
         self._model = model
         self._cost_estimator = cost_estimator
+        self._billing_identity_resolver = billing_identity_resolver
+        self._billing_identity = _BILLING_IDENTITY_UNSET
         self._raw_usage = {}
         self._completion_started = False
         self._provider = provider
@@ -1635,6 +1876,14 @@ class ChatAttempt:
         self._details = {}
         self._output_accumulator = None
         self._output_incomplete = False
+        # 成本通道：桶级有效性（known/unknown/invalid）、finalization 防重入、
+        # 收口产出的 Span/Log 同键成本事实。_cache_ttl_invalid 追踪 Anthropic
+        # cache TTL 拆分子字段级的"存在但非法"状态（key 级独立维护：该子字段
+        # 自身恢复合法值才解除；期间合法 cache_write 总额不得解除桶 invalid）
+        self._cost_bucket_states = dict(_COST_BUCKET_STATES_INIT)
+        self._cache_ttl_invalid: set = set()
+        self._finalized = False
+        self._cost_facts: Optional[dict] = None
 
     def __enter__(self) -> "ChatAttempt":
         self._span_cm = chat_span(
@@ -1646,6 +1895,16 @@ class ChatAttempt:
         )
         self._span = self._span_cm.__enter__()
         self._start = time.monotonic()
+        # 请求启动时冻结受信计价身份：provider 运行时切换（swap/fallback）
+        # 后，在飞请求仍按启动时身份计价（并发隔离）；启动时未解析保持
+        # 未解析，finalization 不追溯重解析。解析失败按 None 冻结（观测侧
+        # 隔离，不影响业务）。
+        resolver = self._billing_identity_resolver
+        if callable(resolver):
+            try:
+                self._billing_identity = resolver(self._model, self._provider)
+            except Exception:
+                self._billing_identity = None
         self._scene_token = _scene_set(
             {"operation": self._operation, "model": map_model_name(self._model),
              "provider": map_provider_name(self._provider), "stream": self._stream},
@@ -1669,18 +1928,99 @@ class ChatAttempt:
 
     def set_raw_usage(self, raw_usage):
         # Retain only scalar accounting facts, never arbitrary SDK metadata.
+        # 成本通道语义与 UsageService.attempt_usage_from_raw 一致：字段缺席
+        # （含 None）不改变桶现状；合法值进入累计视图并解除"曾非法"标记；
+        # 存在但非法标记该桶 invalid（曾非法），由 finalization 判 invalid_usage。
         try:
-            fields = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens') if self._provider == 'anthropic' else ('prompt_tokens', 'completion_tokens')
-            for key in fields:
-                value = raw_usage.get(key)
-                if _valid_count(value):
-                    self._raw_usage[key] = value
-            if self._provider != 'anthropic':
-                cached = (raw_usage.get('prompt_tokens_details') or {}).get('cached_tokens')
-                if _valid_count(cached):
-                    self._raw_usage['prompt_tokens_details'] = {'cached_tokens': cached}
+            if not isinstance(raw_usage, dict):
+                return
+            if self._provider == 'anthropic':
+                for key, bucket in _ANTHROPIC_RAW_BUCKET_FIELDS:
+                    value = raw_usage.get(key)
+                    if value is None:
+                        continue
+                    if _valid_count(value):
+                        self._raw_usage[key] = value
+                        # TTL 子字段仍处于非法状态时，合法 cache_write 平铺总额
+                        # 不得解除 TTL 侧的 invalid 标记（该桶的恢复由子字段
+                        # 自身恢复合法值触发）
+                        if not (bucket == 'cache_write' and self._cache_ttl_invalid):
+                            self._clear_bucket_invalid(bucket)
+                    else:
+                        self._cost_bucket_states[bucket] = 'invalid'
+                # cache TTL 拆分事实（presence 保留；条件计价事实经 raw_usage
+                # 透传给组合根）。子字段级状态独立维护：存在但非法记入
+                # _cache_ttl_invalid（该子字段自身恢复合法值才移除）；任一子
+                # 字段仍非法期间 cache_write 桶保持 invalid（收口为
+                # invalid_usage），合法值进入累计视图但不解除桶标记。
+                breakdown = raw_usage.get('cache_creation')
+                if isinstance(breakdown, dict):
+                    merged = dict(self._raw_usage.get('cache_creation') or {})
+                    ttl_was_invalid = bool(self._cache_ttl_invalid)
+                    for ttl_key in _CACHE_TTL_FACT_KEYS:
+                        value = breakdown.get(ttl_key)
+                        if value is None:
+                            continue  # 缺席不改状态
+                        if _valid_count(value):
+                            merged[ttl_key] = value
+                            self._cache_ttl_invalid.discard(ttl_key)
+                        else:
+                            self._cache_ttl_invalid.add(ttl_key)
+                    if self._cache_ttl_invalid:
+                        self._cost_bucket_states['cache_write'] = 'invalid'
+                    elif ttl_was_invalid:
+                        # 全部曾非法的 TTL 子字段均恢复合法：解除 TTL 侧 invalid
+                        # 门禁，桶有效性交由 raw 视图与快照通道重新裁决
+                        self._clear_bucket_invalid('cache_write')
+                    self._raw_usage['cache_creation'] = merged
+            else:
+                prompt = raw_usage.get('prompt_tokens')
+                completion = raw_usage.get('completion_tokens')
+                details = raw_usage.get('prompt_tokens_details')
+                cached = details.get('cached_tokens') if isinstance(details, dict) else None
+                prompt_valid = _valid_count(prompt)
+                cached_valid = _valid_count(cached)
+                if completion is not None:
+                    if _valid_count(completion):
+                        self._raw_usage['completion_tokens'] = completion
+                        self._clear_bucket_invalid('output')
+                    else:
+                        self._cost_bucket_states['output'] = 'invalid'
+                if prompt is not None:
+                    if prompt_valid:
+                        self._raw_usage['prompt_tokens'] = prompt
+                        self._clear_bucket_invalid('input')
+                    else:
+                        self._cost_bucket_states['input'] = 'invalid'
+                if cached is not None:
+                    if cached_valid:
+                        self._raw_usage['prompt_tokens_details'] = {'cached_tokens': cached}
+                        self._clear_bucket_invalid('cache_read')
+                    else:
+                        self._cost_bucket_states['cache_read'] = 'invalid'
+                if prompt_valid and cached_valid and cached > prompt:
+                    # cached > prompt：input 差值非法（与 attempt_usage_from_raw
+                    # 的负差值同判 invalid_usage），不覆盖、不静默截断
+                    self._cost_bucket_states['input'] = 'invalid'
         except Exception:
             pass
+
+    def _mark_bucket(self, bucket: str, value) -> None:
+        """快照通道（set_usage/set_cache_usage）的桶有效性：合法建立 known
+        （恢复有效性），非法标记 invalid（曾非法），None 视为缺席不改变现状。
+        cache_write 桶在 TTL 子字段仍非法期间不得解除 invalid（合法总额不
+        清除 TTL 侧非法标记，避免用陈旧 TTL 条件事实产出 estimated）。"""
+        if value is None:
+            return
+        if bucket == 'cache_write' and self._cache_ttl_invalid:
+            self._cost_bucket_states[bucket] = 'invalid'
+            return
+        self._cost_bucket_states[bucket] = 'known' if _valid_count(value) else 'invalid'
+
+    def _clear_bucket_invalid(self, bucket: str) -> None:
+        """合法 raw 字段解除"曾非法"标记（恢复为 unknown，由 raw 视图裁决）。"""
+        if self._cost_bucket_states.get(bucket) == 'invalid':
+            self._cost_bucket_states[bucket] = 'unknown'
 
     def _first_output(self):
         if self._stream and not self._completion_started and self._span is not None:
@@ -1688,20 +2028,33 @@ class ChatAttempt:
             _set_attr(self._span, 'nagent.model.completion_start_time', datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
 
     def _record_cost(self):
+        """Finalization 收口：消费同一 AttemptCost 结果，产出 Span/Log 同键
+        成本事实与三个 Counter。Metric 记录不进 span.is_recording()/sampled
+        判断，且对原始结果无条件调用（内部再校验：畸形 estimated 仍计
+        attempts 并按 T1 顺序降级 unknown）。Span/Log 事实投影仅在投影非空
+        时落笔；estimator 缺失/异常/拒绝（None）时不产出成本事实。"""
         try:
-            buckets = (self._input_tokens, self._output_tokens, self._cache_read_tokens, self._cache_write_tokens)
-            if not callable(self._cost_estimator) or not all(_valid_count(v) for v in buckets):
+            estimator = self._cost_estimator
+            if not callable(estimator):
                 return
-            result = self._cost_estimator(self._raw_usage, self._model, self._provider, buckets)
-            if not isinstance(result, dict):
-                return
-            amount = result.get('amount_usd')
-            version = result.get('pricing_version')
-            if (result.get('status') == 'estimated' and isinstance(version, str) and version.strip()
-                    and type(amount) in (int, float) and math.isfinite(amount) and amount >= 0):
-                _set_attr(self._span, 'nagent.model.cost_usd', amount)
-                _set_attr(self._span, 'nagent.model.cost_status', 'estimated')
-                _set_attr(self._span, 'nagent.model.pricing_version', version)
+            buckets = (self._input_tokens, self._output_tokens,
+                       self._cache_read_tokens, self._cache_write_tokens)
+            states = tuple(self._cost_bucket_states[bucket] for bucket in COST_BUCKETS)
+            if self._billing_identity is _BILLING_IDENTITY_UNSET:
+                # 旧调用契约：未经 __enter__ 的直接调用，身份未冻结，由组合
+                # 根闭包按其原语义在收口时解析
+                result = estimator(self._raw_usage, self._model, self._provider,
+                                   buckets, states)
+            else:
+                # 请求启动时冻结的身份（含 None=启动时未解析）随本次尝试
+                # 携带到收口，组合根不得再读切换后的当前配置
+                result = estimator(self._raw_usage, self._model, self._provider,
+                                   buckets, states, self._billing_identity)
+            if isinstance(result, dict):
+                record_model_cost(self._operation, result)
+            facts = _cost_facts_from_result(result)
+            if facts:
+                self._cost_facts = facts
         except Exception:
             pass
 
@@ -1765,6 +2118,8 @@ class ChatAttempt:
             self._input_tokens = input_tokens
         if _valid_count(output_tokens):
             self._output_tokens = output_tokens
+        self._mark_bucket('input', input_tokens)
+        self._mark_bucket('output', output_tokens)
         usage_known = _valid_count(self._input_tokens) and _valid_count(self._output_tokens)
         _scene_publish({
             "input_tokens": self._input_tokens,
@@ -1780,6 +2135,8 @@ class ChatAttempt:
             self._cache_read_tokens = cache_read_tokens
         if _valid_count(cache_write_tokens):
             self._cache_write_tokens = cache_write_tokens
+        self._mark_bucket('cache_read', cache_read_tokens)
+        self._mark_bucket('cache_write', cache_write_tokens)
         _scene_publish({
             "cache_read_tokens": self._cache_read_tokens,
             "cache_write_tokens": self._cache_write_tokens,
@@ -1805,10 +2162,13 @@ class ChatAttempt:
         _scene_publish({"error_type": map_error_type(error_type) if error_type else None})
 
     def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._finalized:
+            return False  # finalization 恰一次：重入直接返回
+        self._finalized = True
         try:
             elapsed = time.monotonic() - self._start
+            self._record_cost()
             if self._span is not None:
-                self._record_cost()
                 if self._input_tokens is not None:
                     _set_attr(self._span, GEN_AI_USAGE_INPUT_TOKENS, self._input_tokens)
                 if self._output_tokens is not None:
@@ -1854,7 +2214,8 @@ class ChatAttempt:
                       cache_write_tokens=self._cache_write_tokens,
                       usage_known=self._input_tokens is not None and self._output_tokens is not None,
                       outcome=_operation_outcome(exc, 'failure' if error_type else 'success'),
-                      error_type=map_error_type(error_type) if error_type else None)
+                      error_type=map_error_type(error_type) if error_type else None,
+                      **(self._cost_facts or {}))
             record_inference_duration(
                 self._model, self._provider, self._operation, elapsed, error_type
             )
@@ -1894,6 +2255,9 @@ class NoopTelemetry:
     def set_cost_estimator(self, estimator):
         pass
 
+    def set_billing_identity_resolver(self, resolver):
+        pass
+
     def agent_run(self, session_id=None, source=None, run_id=None, message_count=None):
         handle = SimpleNamespace(end_reason=None, outcome=None, details={})
         return _nullcontext_yielding(handle)
@@ -1917,7 +2281,10 @@ class NoopTelemetry:
     def iteration(self, iteration, message_count=None):
         return _nullcontext_yielding(None)
 
-    def begin_chat_attempt(self, *, model, stream, provider="openai", operation="chat"):
+    def begin_chat_attempt(self, *, model, stream, provider="openai",
+                           operation="chat", billing_identity_resolver=None):
+        """No-op facade：接受并忽略实例绑定身份解析器（协议形状与
+        SemanticsTelemetry 保持一致，工厂包装回调对两种 facade 透明）。"""
         return _NOOP_CHAT_ATTEMPT
 
 
@@ -1937,6 +2304,10 @@ class SemanticsTelemetry:
 
     def set_cost_estimator(self, estimator):
         self._cost_estimator = estimator if callable(estimator) else None
+
+    def set_billing_identity_resolver(self, resolver):
+        """注入受信计价身份解析器（组合根在请求启动时经 ChatAttempt 冻结）。"""
+        self._billing_identity_resolver = resolver if callable(resolver) else None
 
     # -- agent run ---------------------------------------------------------
 
@@ -2144,9 +2515,15 @@ class SemanticsTelemetry:
         return iteration_scope(iteration, message_count)
 
     def begin_chat_attempt(
-        self, *, model, stream, provider="openai", operation="chat"
+        self, *, model, stream, provider="openai", operation="chat",
+        billing_identity_resolver=None,
     ) -> ChatAttempt:
         return ChatAttempt(
             model=model, stream=stream, provider=provider, operation=operation,
             cost_estimator=getattr(self, "_cost_estimator", None),
+            billing_identity_resolver=(
+                billing_identity_resolver
+                if callable(billing_identity_resolver)
+                else getattr(self, "_billing_identity_resolver", None)
+            ),
         )

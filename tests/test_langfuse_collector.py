@@ -244,6 +244,12 @@ def kb_guard_accepts(guard, value):
     import re
     if 'IsBool(' in guard:
         return isinstance(value, bool)
+    if 'Len(' in guard:
+        match = re.search(r'<= (\d+)', guard)
+        assert match is not None, f'Len guard without bounded limit: {guard!r}'
+        limit = int(match.group(1))
+        if not isinstance(value, str) or len(value) > limit:
+            return False
     if 'IsMatch(' in guard:
         pattern = json.loads(guard.rsplit(', ', 1)[1][:-1])
         return isinstance(value, str) and re.fullmatch(pattern, value) is not None
@@ -544,3 +550,388 @@ def test_kb_trace_bodies_require_global_root_entry():
         if 'set(attributes["langfuse.trace.input"]' in s or 'set(attributes["langfuse.trace.output"]' in s:
             assert 'parent_span_id == SpanID(0x0000000000000000)' in s
             assert 'cache["entry"] == true' in s
+
+
+# T5 成本观测投影：8 类不可估原因（与 app/domain/cost.py UnknownReason 词汇一致）。
+COST_REASONS = ('missing_usage', 'invalid_usage', 'price_not_found', 'price_ambiguous',
+                'unsupported_pricing', 'identity_unresolved', 'pricing_unavailable',
+                'amount_unrepresentable')
+COST_AMOUNT_KEYS = ('nagent.model.cost_usd', 'nagent.model.cost_input_usd',
+                    'nagent.model.cost_output_usd', 'nagent.model.cost_cache_read_usd',
+                    'nagent.model.cost_cache_write_usd')
+NKB_COST_KEYS = ('nkb.model.cost_status', 'nkb.model.cost_reason', 'nkb.model.cost_currency',
+                 'nkb.model.cost_decimal', 'nkb.model.pricing_version', 'nkb.model.price_id',
+                 'nkb.model.billing_provider', 'nkb.model.billing_model')
+NKB_COST_AMOUNT_KEYS = ('nkb.model.cost_usd', 'nkb.model.cost_input_usd')
+
+
+def cost_group_statements(statements):
+    ok_gates = [s for s in statements if s.startswith('set(cache["cost"]["ok"], true) where ')]
+    assert len(ok_gates) == 2
+    return ok_gates
+
+
+def test_estimated_group_gate_requires_complete_applicable_buckets():
+    statements = load().span_statements()
+    chat_gate = next(s for s in cost_group_statements(statements)
+                     if 'attributes["gen_ai.operation.name"] == "chat"' in s)
+    embed_gate = next(s for s in cost_group_statements(statements)
+                      if 'attributes["gen_ai.operation.name"] == "embeddings"' in s)
+    for gate in (chat_gate, embed_gate):
+        assert 'attributes["nagent.model.cost_status"] == "estimated"' in gate
+        assert 'attributes["nagent.model.cost_currency"] == "USD"' in gate
+        assert 'attributes["nagent.model.cost_reason"] == nil' in gate
+        assert 'attributes["nagent.model.cost_usd"] != nil' in gate
+        assert 'attributes["nagent.model.cost_decimal"] != nil' in gate
+        for key in ('pricing_version', 'price_id', 'billing_provider', 'billing_model'):
+            assert f'attributes["nagent.model.{key}"] != ""' in gate
+    # chat 适用分项为 input/output/cache_read，write 可缺席；缺适用桶不能当 0。
+    for bucket in ('input', 'output', 'cache_read'):
+        assert f'attributes["nagent.model.cost_{bucket}_usd"] != nil' in chat_gate
+    assert 'cost_cache_write_usd' not in chat_gate
+    # embeddings 仅 input 分项。
+    assert 'attributes["nagent.model.cost_input_usd"] != nil' in embed_gate
+    for bucket in ('output', 'cache_read', 'cache_write'):
+        assert f'cost_{bucket}_usd' not in embed_gate
+
+
+def test_group_rejection_drops_amounts_and_blocks_model_name():
+    statements = load().span_statements()
+    # 整组拒绝时丢弃金额键（含 decimal）；unknown 组的残留金额走同一条删除。
+    for key in (*COST_AMOUNT_KEYS, 'nagent.model.cost_decimal'):
+        assert any(s.startswith(f'delete_key(attributes, "{key}") where cache["cost"]["ok"] == false and attributes["{key}"] != nil')
+                   for s in statements)
+    # estimated 组带受控 reason 属生产者矛盾：整组拒绝时一并丢弃。
+    assert any(s.startswith('delete_key(attributes, "nagent.model.cost_reason") where attributes["nagent.model.cost_status"] == "estimated" and cache["cost"]["ok"] == false')
+               for s in statements)
+    # model.name 只允许合法 estimated 组：unknown 或残缺 estimated 均阻断自动推价。
+    named = [s for s in statements if 'set(attributes["langfuse.observation.model.name"]' in s]
+    assert len(named) == 2
+    for s in named:
+        assert 'attributes["nagent.model.cost_status"] == "estimated"' in s
+        assert 'cache["cost"]["ok"] == true' in s
+        assert 'attributes["gen_ai.request.model"]' in s or 'attributes["gen_ai.response.model"]' in s
+
+
+def test_model_display_prefers_known_request_over_response_alias():
+    statements = load().span_statements()
+    named = [s for s in statements if s.startswith('set(attributes["langfuse.observation.model.name"],')]
+    # ark-code-latest 请求的响应别名会归一为 other，不能覆盖请求模型。
+    assert 'attributes["gen_ai.response.model"]' in named[0]
+    assert 'attributes["gen_ai.request.model"]' in named[1]
+    assert 'attributes["gen_ai.request.model"] != "other"' in named[1]
+
+
+def test_cost_tolerance_is_double_bound_within_ottl_capability():
+    statements = load().span_statements()
+    downgrade = next(s for s in statements if s.startswith('set(cache["cost"]["ok"], false) where '))
+    assert 'cache["cost"]["ok"] == true and not (' in downgrade
+    # 锁定镜像不含 Abs：容差用四次比较的析取表达 |err| <= max(abs, rel)。
+    assert 'Abs(' not in downgrade
+    assert '0.000000000001' in downgrade
+    assert '0.000000001' in downgrade
+    for operator in ('<=', '>='):
+        assert operator in downgrade
+    # 求和只包含适用桶：input 不限操作，output/cache_read/cache_write 仅 chat。
+    sums = [s for s in statements if s.startswith('set(cache["cost"]["sum"], cache["cost"]["sum"] + ')]
+    assert len(sums) == 4
+    for source in COST_AMOUNT_KEYS[1:]:
+        sum_line = next(s for s in sums if f'attributes["{source}"]' in s)
+        assert 'cache["cost"]["ok"] == true' in sum_line
+        if source.endswith(('output_usd', 'cache_read_usd', 'cache_write_usd')):
+            assert 'attributes["gen_ai.operation.name"] == "chat"' in sum_line
+
+
+def test_cost_details_shape_is_spec_example_and_tokens_stay_separate():
+    statements = load().span_statements()
+    envelope = next(s for s in statements
+                    if s.startswith('set(cache["cost_details"], {"total": attributes["nagent.model.cost_usd"]}) where '))
+    assert 'cache["cost"]["ok"] == true' in envelope
+    projection = next(s for s in statements
+                      if s.startswith('set(attributes["langfuse.observation.cost_details"], String(cache["cost_details"])) where '))
+    assert 'cache["cost"]["ok"] == true' in projection
+    assert statements.index(envelope) < statements.index(projection)
+    for bucket in ('input', 'output', 'cache_read', 'cache_write'):
+        body = next(s for s in statements if s.startswith(f'set(cache["cost_details"]["{bucket}"], '))
+        assert 'cache["cost"]["ok"] == true' in body
+    # usage_details 只包含真实 Token 桶，严禁放入费用。
+    usage = next(s for s in statements if 'langfuse.observation.usage_details' in s and 'String(cache["usage"])' in s)
+    assert 'cost' not in usage
+
+
+def test_cost_and_original_model_metadata_are_projected():
+    statements = load().span_statements()
+    text = '\n'.join(statements)
+    for key in ('nagent.model.cost_status', 'nagent.model.cost_reason', 'nagent.model.cost_currency',
+                'nagent.model.cost_decimal', 'nagent.model.pricing_version', 'nagent.model.price_id',
+                'nagent.model.billing_provider', 'nagent.model.billing_model',
+                'gen_ai.request.model', 'gen_ai.response.model'):
+        assert f'langfuse.observation.metadata.{key}' in text
+    # 原始模型键保留在 metadata；顶层 model.name 只在合法 estimated 组投影。
+
+
+@pytest.mark.parametrize('key,value,expected', [
+    ('nagent.model.cost_usd', 0.5, True), ('nagent.model.cost_usd', 0, True),
+    ('nagent.model.cost_usd', -0.5, False), ('nagent.model.cost_usd', float('nan'), False),
+    ('nagent.model.cost_usd', float('inf'), False), ('nagent.model.cost_usd', True, False),
+    ('nagent.model.cost_input_usd', 1.25, True), ('nagent.model.cost_input_usd', -1, False),
+    ('nagent.model.cost_output_usd', 2, True), ('nagent.model.cost_cache_read_usd', 0.0, True),
+    ('nagent.model.cost_cache_write_usd', -0.0 - 0.5, False),
+    ('nagent.model.cost_decimal', '0', True), ('nagent.model.cost_decimal', '0.000012', True),
+    ('nagent.model.cost_decimal', '12', True), ('nagent.model.cost_decimal', '1E-5', False),
+    ('nagent.model.cost_decimal', '-0.5', False), ('nagent.model.cost_decimal', '+1', False),
+    ('nagent.model.cost_decimal', '.5', False), ('nagent.model.cost_decimal', 'x', False),
+    ('nagent.model.cost_reason', 'missing_usage', True),
+    ('nagent.model.cost_reason', 'amount_unrepresentable', True),
+    ('nagent.model.cost_reason', 'none', False), ('nagent.model.cost_reason', 'exploded', False),
+    ('nagent.model.cost_currency', 'USD', True), ('nagent.model.cost_currency', 'EUR', False),
+    ('nagent.model.cost_status', 'estimated', True), ('nagent.model.cost_status', 'unknown', True),
+    ('nagent.model.cost_status', 'pending', False),
+    ('nagent.model.price_id', 'openai/gpt-4o', True), ('nagent.model.price_id', 'p' * 129, False),
+    ('nagent.model.price_id', '', False),
+    ('nagent.model.pricing_version', 'e2e-v1', True), ('nagent.model.pricing_version', 'v' * 129, True),
+    ('nagent.model.pricing_version', 'v' * 130, False), ('nagent.model.pricing_version', 'a\x01b', False),
+    ('nagent.model.pricing_version', '', False),
+    ('nagent.model.billing_provider', 'openai', True), ('nagent.model.billing_provider', 'bedrock', True),
+    ('nagent.model.billing_provider', 'p' * 65, False), ('nagent.model.billing_provider', 'a\x01b', False),
+    ('nagent.model.billing_model', 'gpt-4o', True), ('nagent.model.billing_model', 'qwen3:0.6b', True),
+    ('nagent.model.billing_model', 'm' * 65, False), ('nagent.model.billing_model', 'b\x7f', False),
+    # duration_ms 是契约 number（毫秒 double）：非负有限数值通过，字符串形态拒绝
+    #（attempt-10：IsString 默认分支删除 double duration，metadata 投影恒空）。
+    ('nagent.model.duration_ms', 383.23, True), ('nagent.model.duration_ms', 0, True),
+    ('nagent.model.duration_ms', 57, True),
+    ('nagent.model.duration_ms', '383.2', False), ('nagent.model.duration_ms', True, False),
+    ('nagent.model.duration_ms', -0.5, False), ('nagent.model.duration_ms', float('nan'), False),
+    ('nagent.model.duration_ms', float('inf'), False),
+])
+def test_cost_guards_reject_and_accept_real_values(key, value, expected):
+    assert kb_guard_accepts(load().value_guard(key), value) is expected
+
+
+@pytest.mark.parametrize('key,value,expected', [
+    ('nkb.model.cost_status', 'estimated', True), ('nkb.model.cost_status', 'unknown', True),
+    ('nkb.model.cost_status', 'pending', False),
+    ('nkb.model.cost_reason', 'none', True), ('nkb.model.cost_reason', 'missing_usage', True),
+    ('nkb.model.cost_reason', 'amount_unrepresentable', True), ('nkb.model.cost_reason', 'exploded', False),
+    ('nkb.model.cost_currency', 'USD', True), ('nkb.model.cost_currency', 'eur', False),
+    ('nkb.model.cost_usd', 0.25, True), ('nkb.model.cost_usd', -1, False),
+    ('nkb.model.cost_usd', True, False), ('nkb.model.cost_input_usd', 0, True),
+    ('nkb.model.cost_decimal', '0.000012', True), ('nkb.model.cost_decimal', '.5', False),
+    ('nkb.model.cost_decimal', '1e-5', False), ('nkb.model.cost_decimal', '-1', False),
+    ('nkb.model.cost_decimal', '1' * 65, True), ('nkb.model.cost_decimal', '1' * 340, True),
+    ('nkb.model.cost_decimal', '1' * 341, False),
+    ('nkb.model.cost_decimal', '0.' + '0' * 75 + '1', True),
+    ('nkb.model.pricing_version', '2026-11-09-init', True), ('nkb.model.pricing_version', 'v' * 130, False),
+    ('nkb.model.pricing_version', 'v' * 129, True),
+    ('nkb.model.price_id', 'openai/gpt-4o', True), ('nkb.model.price_id', 'p' * 129, False),
+    ('nkb.model.billing_provider', 'ollama', True), ('nkb.model.billing_provider', 'other', True),
+    ('nkb.model.billing_provider', 'openai', False),
+    ('nkb.model.billing_model', 'qwen3:0.6b', True), ('nkb.model.billing_model', 'm' * 65, False),
+    ('nkb.model.billing_model', 'b\x02', False),
+])
+def test_kb_cost_guards_mirror_contract(key, value, expected):
+    assert kb_guard_accepts(load().kb_value_guard(key), value) is expected
+
+
+def test_kb_cost_group_projection_and_pricing_block():
+    statements = load().span_statements_kb()
+    text = '\n'.join(statements)
+    for key in NKB_COST_KEYS:
+        assert f'langfuse.observation.metadata.{key}' in text
+    # 成本金额只走 cost_details 分项投影，绝不进入 metadata。
+    for key in NKB_COST_AMOUNT_KEYS:
+        assert f'langfuse.observation.metadata.{key}' not in text
+    gate = next(s for s in statements if s.startswith('set(cache["cost"]["ok"], true) where '))
+    assert 'attributes["langfuse.observation.type"] == "embedding"' in gate
+    assert 'attributes["nkb.model.cost_status"] == "estimated"' in gate
+    assert 'attributes["nkb.model.cost_currency"] == "USD"' in gate
+    assert 'attributes["nkb.model.cost_reason"] == nil' in gate
+    for key in ('cost_usd', 'cost_decimal', 'cost_input_usd'):
+        assert f'attributes["nkb.model.{key}"] != nil' in gate
+    for key in ('pricing_version', 'price_id', 'billing_provider', 'billing_model'):
+        assert f'attributes["nkb.model.{key}"] != ""' in gate
+    assert 'cost_output_usd' not in gate and 'cost_cache_read_usd' not in gate and 'cost_cache_write_usd' not in gate
+    # cost_details 单 input 分项 + total。
+    envelope = next(s for s in statements
+                    if s.startswith('set(cache["cost_details"], {"total": attributes["nkb.model.cost_usd"]}) where '))
+    assert 'cache["cost"]["ok"] == true' in envelope
+    assert any(s.startswith('set(cache["cost_details"]["input"], attributes["nkb.model.cost_input_usd"]) where ')
+               and 'cache["cost"]["ok"] == true' in s for s in statements)
+    assert not any('cost_details"]["output"' in s or 'cost_details"]["cache_read"' in s or 'cost_details"]["cache_write"' in s
+                   for s in statements)
+    projection = next(s for s in statements
+                      if s.startswith('set(attributes["langfuse.observation.cost_details"], String(cache["cost_details"])) where '))
+    assert 'attributes["langfuse.observation.type"] == "embedding"' in projection
+    # 整组拒绝丢弃金额键；冲突回落（type 重置为 span）同样不投影金额。
+    for key in ('nkb.model.cost_usd', 'nkb.model.cost_input_usd', 'nkb.model.cost_decimal'):
+        assert any(s.startswith(f'delete_key(attributes, "{key}") where cache["cost"]["ok"] == false and attributes["{key}"] != nil')
+                   for s in statements)
+    final = [s for s in statements if s.startswith('keep_keys(attributes,')][-1]
+    assert 'langfuse.observation.cost_details' in final
+
+
+def test_kb_model_name_projection_only_for_valid_estimated_group():
+    statements = load().span_statements_kb()
+    named = [s for s in statements if 'set(attributes["langfuse.observation.model.name"]' in s]
+    assert len(named) == 1
+    assert 'attributes["nkb.model.cost_status"] == "estimated"' in named[0]
+    assert 'cache["cost"]["ok"] == true' in named[0]
+    assert 'attributes["langfuse.observation.type"] == "embedding"' in named[0]
+
+
+# ---------------------------------------------------------------------------
+# 评审修复（第三轮）
+# ---------------------------------------------------------------------------
+
+
+def test_kb_unknown_embedding_retains_raw_model_in_metadata():
+    """KB unknown 尝试不投影原生 model.name（阻断自动推价），但原始请求
+    模型键必须保留进安全 metadata（spec L151：unknown 仍可按 metadata 中
+    模型分析）——与 N-Agent 管线同语义（FACTS 含 gen_ai.request.model）。
+    metadata-only 投影：不得新增 model.name 自动推价通道。"""
+    statements = load().span_statements_kb()
+    assert any(s.startswith('set(cache["metadata"]["gen_ai.request.model"], '
+                            'attributes["gen_ai.request.model"])')
+               for s in statements)
+    text = '\n'.join(statements)
+    assert 'langfuse.observation.metadata.gen_ai.request.model' in text
+    final = [s for s in statements if s.startswith('keep_keys(attributes,')][-1]
+    assert 'langfuse.observation.metadata.gen_ai.request.model' in final
+    # model.name 仍仅在合法 estimated 组投影（既有阻断不回归）
+    named = [s for s in statements if 'set(attributes["langfuse.observation.model.name"]' in s]
+    assert len(named) == 1
+    assert 'attributes["nkb.model.cost_status"] == "estimated"' in named[0]
+    # gen_ai.request.model 不进入顶层 model.name 投影之外的新通道（仅 metadata）
+    assert sum('gen_ai.request.model' in s for s in statements) >= 2
+
+
+def test_unknown_group_requires_reason_and_no_amounts_nagent():
+    """N-Agent 管线 unknown 组显式校验（spec L153：unknown 必须有受控
+    reason 且不得携带任何金额）：缺 reason 或携带任一金额/分项/decimal 登记
+    整组非法（illegal），语句先于 purge——合法形态的残留金额不会被守卫
+    删除，不得伪装成"合法缺席"逃逸登记。"""
+    statements = load().span_statements()
+    gates = [s for s in statements
+             if s.startswith('set(cache["cost"]["illegal"], true) where attributes["nagent.model.cost_status"] == "unknown"')]
+    assert len(gates) == 1
+    gate = gates[0]
+    assert 'attributes["nagent.model.cost_reason"] == nil' in gate
+    for key in (*COST_AMOUNT_KEYS, 'nagent.model.cost_decimal'):
+        assert f'attributes["{key}"] != nil' in gate
+    # 登记先于字段清理（purge 删除非法金额后不得逃逸）、先于成组放行门
+    text = '\n'.join(statements)
+    assert text.index('set(cache["cost"]["illegal"], false)') < text.index(gate)
+    assert text.index(gate) < text.index('delete_key(attributes, "nagent.model.cost_usd")')
+
+
+def test_unknown_group_requires_reason_and_no_amounts_kb():
+    """KB 管线 unknown 组同语义显式校验。KB 契约的 estimated 判定固定携带
+    cost_reason=none，因此 unknown 上的 none 属生产者矛盾，一并登记非法。"""
+    statements = load().span_statements_kb()
+    gates = [s for s in statements
+             if s.startswith('set(cache["cost"]["illegal"], true) where attributes["nkb.model.cost_status"] == "unknown"')]
+    assert len(gates) == 1
+    gate = gates[0]
+    assert 'attributes["nkb.model.cost_reason"] == nil' in gate
+    assert 'attributes["nkb.model.cost_reason"] == "none"' in gate
+    for key in (*NKB_COST_AMOUNT_KEYS, 'nkb.model.cost_decimal'):
+        assert f'attributes["{key}"] != nil' in gate
+    text = '\n'.join(statements)
+    assert text.index('set(cache["cost"]["illegal"], false)') < text.index(gate)
+    assert text.index(gate) < text.index('delete_key(attributes, "nkb.model.cost_usd")')
+
+
+# ---------------------------------------------------------------------------
+# 评审修复（第二轮）：非法成本字段必须先于字段清理登记整组非法状态。
+# 字段清理（purge）先删除非法属性、成组校验后行会让整组"伪装合法"逃逸：
+# estimated 带非法 reason（清理后伪装成 reason 缺席）、非法可选 cache_write
+# 分项（清理后伪装成缺席）都必须整组拒绝（不投影 cost_details、丢弃金额与
+# decimal、阻断 model.name 自动推价）；合法诊断键保留进 metadata 供拒绝审计
+# （真实 0.137.0 fork 行为级锁定的验收语义）。
+# ---------------------------------------------------------------------------
+
+NAGENT_COST_GROUP_KEYS = (*COST_AMOUNT_KEYS, 'nagent.model.cost_decimal',
+                          'nagent.model.cost_status', 'nagent.model.cost_currency',
+                          'nagent.model.cost_reason', 'nagent.model.pricing_version',
+                          'nagent.model.price_id', 'nagent.model.billing_provider',
+                          'nagent.model.billing_model')
+NKB_COST_GROUP_KEYS = ('nkb.model.cost_usd', 'nkb.model.cost_input_usd',
+                       'nkb.model.cost_decimal', 'nkb.model.cost_status',
+                       'nkb.model.cost_reason', 'nkb.model.cost_currency',
+                       'nkb.model.pricing_version', 'nkb.model.price_id',
+                       'nkb.model.billing_provider', 'nkb.model.billing_model')
+
+
+def _illegal_detection_statements(statements, group_keys):
+    return [s for s in statements
+            if s.startswith('set(cache["cost"]["illegal"], true) where ')]
+
+
+def test_illegal_cost_field_rejects_whole_group_surviving_cleanup():
+    """任何成本相关字段"存在但非法"必须在字段清理（purge）之前登记
+    cache["cost"]["illegal"]：非法字段被清理删除后，成组校验不得把该组
+    当作合法放行（estimated 缺 reason / 可选分项缺席的伪装形态）。"""
+    statements = load().span_statements()
+    text = '\n'.join(statements)
+    purge = text.index('delete_key(attributes, "nagent.model.cost_usd")')
+    detection = text.index('set(cache["cost"]["illegal"], false)')
+    assert detection < purge  # 非法登记先于字段清理
+    illegal_sets = _illegal_detection_statements(statements, NAGENT_COST_GROUP_KEYS)
+    for key in NAGENT_COST_GROUP_KEYS:
+        assert any(s.startswith(f'set(cache["cost"]["illegal"], true) where attributes["{key}"] != nil and not (')
+                   for s in illegal_sets), key
+    # 成组放行（chat/embeddings 两条 ok 门）必须带 not illegal
+    for gate in cost_group_statements(statements):
+        assert 'cache["cost"]["illegal"] == false' in gate
+    # cache["cost"] 不得在非法登记之后整体重置（会抹掉非法状态）
+    assert text.index('set(cache["cost"], {})') < detection
+
+
+def test_illegal_group_rejection_blocks_projections_and_keeps_audit_diagnostics():
+    """非法整组拒绝：cost_details/model.name 经 ok==false 门禁阻断（不部分
+    成功），金额与 decimal 在 ok==false 时删除；合法诊断键（status/reason/
+    currency/版本/price_id/计费身份）保留进 metadata 供拒绝审计——真实
+    0.137.0 fork 行为级锁定（tests/e2e/test_langfuse_smoke.py）要求拒绝状态
+    可在 metadata 审计，非法字段自身已由 purge 守卫删除，不再整组删除诊断键。"""
+    statements = load().span_statements()
+    for key in (*NAGENT_COST_GROUP_KEYS,):
+        assert not any(
+            s.startswith(f'delete_key(attributes, "{key}") where cache["cost"]["illegal"] == true')
+            for s in statements
+        ), key
+    for key in (*COST_AMOUNT_KEYS, 'nagent.model.cost_decimal'):
+        assert any(s.startswith(f'delete_key(attributes, "{key}") where cache["cost"]["ok"] == false and attributes["{key}"] != nil')
+                   for s in statements), key
+    named = [s for s in statements if 'set(attributes["langfuse.observation.model.name"]' in s]
+    assert len(named) == 2
+    for s in named:
+        # ok 恒 false 的非法组无法通过该门禁（与 unknown 同一反推价闸门）
+        assert 'cache["cost"]["ok"] == true' in s
+    metadata = [s for s in statements if 'set(cache["metadata"]["nagent.model.cost_status"]' in s]
+    assert metadata  # 诊断键随存活属性进入 metadata（拒绝审计）
+
+
+def test_kb_illegal_cost_field_rejects_whole_group_surviving_cleanup():
+    """KB 管线同语义：非法成本字段先登记整组非法，再进入字段清理；
+    非法组整组拒绝（cost_details/model.name 经 ok==false 门禁阻断），合法
+    诊断键保留进 metadata 供拒绝审计，不整组删除诊断键。"""
+    statements = load().span_statements_kb()
+    text = '\n'.join(statements)
+    purge = text.index('delete_key(attributes, "nkb.model.cost_status")')
+    detection = text.index('set(cache["cost"]["illegal"], false)')
+    assert detection < purge
+    illegal_sets = _illegal_detection_statements(statements, NKB_COST_GROUP_KEYS)
+    for key in NKB_COST_GROUP_KEYS:
+        assert any(s.startswith(f'set(cache["cost"]["illegal"], true) where attributes["{key}"] != nil and not (')
+                   for s in illegal_sets), key
+    gate = next(s for s in statements if s.startswith('set(cache["cost"]["ok"], true) where '))
+    assert 'cache["cost"]["illegal"] == false' in gate
+    assert text.index('set(cache["cost"], {})') < detection
+    for key in NKB_COST_GROUP_KEYS:
+        assert not any(
+            s.startswith(f'delete_key(attributes, "{key}") where cache["cost"]["illegal"] == true')
+            for s in statements
+        ), key
+    for key in (*NKB_COST_AMOUNT_KEYS, 'nkb.model.cost_decimal'):
+        assert any(s.startswith(f'delete_key(attributes, "{key}") where cache["cost"]["ok"] == false and attributes["{key}"] != nil')
+                   for s in statements), key

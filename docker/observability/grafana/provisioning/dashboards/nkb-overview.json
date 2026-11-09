@@ -606,6 +606,181 @@
           "exemplar": true
         }
       ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "已知成本 (API 估算)",
+      "description": "窗口内已知 API 成本累计（USD，Embedding 计价，API 估算，非真实账单）。守卫：同窗口 estimated attempts > 0，全未知或无调用显示无数据；真实零价 estimated 显示 0。Prometheus increase 是时间窗估算，不作为精确账单。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "min": 0,
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(nkb_model_cost_USD_total{service_name=~\"$service\"}[$__rate_interval])) and on() (sum(increase(nkb_model_cost_attempts_total{service_name=~\"$service\",nkb_model_cost_status=\"estimated\"}[$__rate_interval])) > 0)",
+          "legendFormat": "已知成本",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "成本速率 (API 估算)",
+      "description": "已知成本速率 USD/s（API 估算）。守卫：同窗口 estimated attempts > 0，全未知或无调用显示无数据；真实零价 estimated 显示 0。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "min": 0,
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(nkb_model_cost_USD_total{service_name=~\"$service\"}[$__rate_interval])) and on() (sum(rate(nkb_model_cost_attempts_total{service_name=~\"$service\",nkb_model_cost_status=\"estimated\"}[$__rate_interval])) > 0)",
+          "legendFormat": "USD/s",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "已知成本 by 计费身份 (API 估算)",
+      "description": "按受信计费身份（billing provider/model）分组的窗口内已知成本（API 估算）。守卫：同窗口 estimated attempts > 0，全未知或无调用显示无数据；真实零价 estimated 显示 0。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "min": 0,
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (gen_ai_operation_name, nkb_model_billing_provider, nkb_model_billing_model) (increase(nkb_model_cost_USD_total{service_name=~\"$service\"}[$__rate_interval])) and on() (sum(increase(nkb_model_cost_attempts_total{service_name=~\"$service\",nkb_model_cost_status=\"estimated\"}[$__rate_interval])) > 0)",
+          "legendFormat": "{{nkb_model_billing_provider}}/{{nkb_model_billing_model}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "成本分项占比 (API 估算)",
+      "description": "Embedding 成本分项（input）占比，在 cost_components Counter 内部按分项/分项合计计算；分项加总与 total 成本分开查询，禁止相加。守卫：同窗口 estimated attempts > 0。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (nkb_model_cost_component) (increase(nkb_model_cost_components_USD_total{service_name=~\"$service\"}[$__rate_interval])) / on() group_left() (sum(increase(nkb_model_cost_components_USD_total{service_name=~\"$service\"}[$__rate_interval])) > 0) and on() (sum(increase(nkb_model_cost_attempts_total{service_name=~\"$service\",nkb_model_cost_status=\"estimated\"}[$__rate_interval])) > 0)",
+          "legendFormat": "{{nkb_model_cost_component}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "计价覆盖率 (API 估算)",
+      "description": "计价覆盖率 = estimated attempts / 全部 cost_attempts；相同筛选、窗口、实例集合，先 rate 再 sum。分母为零显示无数据，不补 100%；分子缺序列而分母>0 时显示 0%。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(rate(nkb_model_cost_attempts_total{service_name=~\"$service\",nkb_model_cost_status=\"estimated\"}[$__rate_interval])) or 0 * sum(rate(nkb_model_cost_attempts_total{service_name=~\"$service\"}[$__rate_interval]))) / (sum(rate(nkb_model_cost_attempts_total{service_name=~\"$service\"}[$__rate_interval])) > 0)",
+          "legendFormat": "estimated / attempts",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "未知计价次数 by 原因",
+      "description": "cost_status=unknown 的尝试按不可估原因分组计数。全未知时金额面板显示无数据，仅此面板展示未知次数；无 unknown 流量时不补零。",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 58
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "无数据"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (nkb_model_cost_reason) (increase(nkb_model_cost_attempts_total{service_name=~\"$service\",nkb_model_cost_status=\"unknown\"}[$__rate_interval]))",
+          "legendFormat": "{{nkb_model_cost_reason}}",
+          "exemplar": true
+        }
+      ]
     }
   ],
   "description": "采用规范化观测契约；旧时间段因字段变更可能不完整，不兼容聚合历史字段。"

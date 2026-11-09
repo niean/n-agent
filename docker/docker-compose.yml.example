@@ -62,6 +62,13 @@ services:
       N_AGENT_BROWSER_HOST_BRIDGE_URL: ${N_AGENT_BROWSER_HOST_BRIDGE_URL:-http://host.docker.internal:8766}
       N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH: ${N_AGENT_BROWSER_HOST_BRIDGE_TOKEN_PATH:-/app/locals/host-browser.token}
       N_AGENT_BROWSER_TRUSTED_DEV: ${N_AGENT_BROWSER_TRUSTED_DEV:-false}
+      # 成本计价目录（B 类启动期 env-only）：默认挂载随仓库交付的版本化价格目录，
+      # 本地 embedding 显式零价，商业费用按固定峰时价/汇率估算。
+      # E2E 通过部署期环境变量覆盖注入测试目录与受信计价身份映射
+      # （override 追加新挂载点，不改动本模板）。
+      N_AGENT_PRICING_CATALOG_PATH: ${N_AGENT_PRICING_CATALOG_PATH:-/etc/n-agent/model-pricing.json}
+      N_AGENT_PRICING_CATALOG_EXPECTED_SHA256: ${N_AGENT_PRICING_CATALOG_EXPECTED_SHA256:-3f31783a1b457ce213b8482a23243dbfd00e16e8ed7ff9086ca600d2be1ec19f}
+      N_AGENT_MODEL_BILLING_IDENTITY_MAP: ${N_AGENT_MODEL_BILLING_IDENTITY_MAP:-}
     ports:
       - "8201:8201"
     # 观测退出预算：应用 5 秒观测 shutdown 需在容器强杀前完成（spec 7）。
@@ -85,6 +92,8 @@ services:
       - ~/app/workspace:/workspace
       # ACP 远程接入：挂载宿主代码目录，供 VsCode ACP Client 访问容器内代码文件
       - ~/code:/workspace-code
+      # 成本计价目录（只读；E2E 覆盖注入测试目录时经 override 追加新挂载点）
+      - ./observability/model-pricing.json:/etc/n-agent/model-pricing.json:ro
       # 沙盒 Docker 后端：sandbox_type=docker 时取消注释，并确保容器内 docker CLI 可用（见 Dockerfile）
       # - /var/run/docker.sock:/var/run/docker.sock
     networks:

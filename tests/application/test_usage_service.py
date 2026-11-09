@@ -1,6 +1,7 @@
 # tests/application/test_usage_service.py
 import pytest
 from app.application.usage_service import UsageService
+from app.domain.cost import CatalogResolution, PricingCatalogEntry
 from app.domain.usage import (
     CanonicalUsage, UsageCost, PricingEntry, ContextBreakdown,
     OverviewStats, SessionUsageSummary,
@@ -33,6 +34,8 @@ class FakeRecorder:
 
 
 class FakePricing:
+    """PricingProvider 兼容入口的 fake（新计价路径不再消费，仅验证旧构造兼容）。"""
+
     def get_pricing(self, model, provider):
         if "gpt-4o" in model:
             return PricingEntry(
@@ -42,6 +45,40 @@ class FakePricing:
                 pricing_version="2026-07", source_url="test",
             )
         return None
+
+
+class FakeCatalog:
+    """价格目录解析协议的 fake：与 JsonPricingCatalog 同语义的内存精确匹配。"""
+
+    def __init__(self, entries, pricing_version="test-v1@abc"):
+        self._entries = entries
+        self._pricing_version = pricing_version
+
+    def resolve(self, identity, operation, facts=None):
+        provider, model = identity
+        matched = [
+            entry for entry in self._entries
+            if entry.billing_provider == provider
+            and entry.operation == operation
+            and (entry.billing_model == model or model in entry.aliases)
+        ]
+        if len(matched) > 1:
+            return CatalogResolution.ambiguous(
+                tuple(sorted(e.price_id for e in matched)), self._pricing_version
+            )
+        if not matched:
+            return CatalogResolution.not_found(self._pricing_version)
+        return CatalogResolution.unique(matched[0], self._pricing_version)
+
+
+def _gpt4o_catalog_entry():
+    return PricingCatalogEntry(
+        price_id="p-gpt4o-test",
+        billing_provider="openai",
+        billing_model="gpt-4o",
+        operation="chat",
+        unit_prices={"input": "5", "output": "15", "cache_read": "2.5"},
+    )
 
 
 class FakeBreakdownCalculator:
@@ -61,18 +98,49 @@ async def test_normalize_usage_openai():
 
 @pytest.mark.asyncio
 async def test_estimate_cost_known_model():
-    svc = UsageService(FakeRecorder(), FakePricing(), FakeBreakdownCalculator())
-    u = CanonicalUsage(input_tokens=1000000, output_tokens=500000)
+    """新计价路径：Domain 纯计算器 + 目录；knownness 保留自 raw_usage
+    （不从 CanonicalUsage 默认 0 推断已知）。"""
+    svc = UsageService(
+        FakeRecorder(), FakePricing(), FakeBreakdownCalculator(),
+        pricing_catalog=FakeCatalog([_gpt4o_catalog_entry()]),
+        billing_identity_resolver=lambda model, provider: ("openai", model),
+    )
+    # raw_usage 与 CanonicalUsage 数值一致（prompt=1000000、cached=0、completion=500000）
+    raw = {
+        "prompt_tokens": 1000000, "completion_tokens": 500000,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
+    u = CanonicalUsage(input_tokens=1000000, output_tokens=500000, raw_usage=raw)
     cost = svc.estimate_cost(u, "gpt-4o", "openai")
     assert cost.status == "estimated"
     assert float(cost.amount_usd) == pytest.approx(12.5, rel=0.01)
+    assert cost.price_id == "p-gpt4o-test"
+    assert cost.pricing_version
 
 
 @pytest.mark.asyncio
 async def test_estimate_cost_unknown_model():
+    """受信计价身份缺失：unknown 且保持旧账本数字占位形态。"""
     svc = UsageService(FakeRecorder(), FakePricing(), FakeBreakdownCalculator())
-    u = CanonicalUsage(input_tokens=100, output_tokens=50)
+    raw = {"prompt_tokens": 100, "completion_tokens": 50}
+    u = CanonicalUsage(input_tokens=100, output_tokens=50, raw_usage=raw)
     cost = svc.estimate_cost(u, "unknown-model", "unknown")
+    assert cost.status == "unknown"
+    assert float(cost.amount_usd) == 0
+    assert cost.price_id is None
+    assert cost.components is None
+
+
+@pytest.mark.asyncio
+async def test_estimate_cost_raw_usage_missing_is_unknown():
+    """raw_usage 不足（缺席）=> unknown，不从 CanonicalUsage 默认 0 推断已知。"""
+    svc = UsageService(
+        FakeRecorder(), FakePricing(), FakeBreakdownCalculator(),
+        pricing_catalog=FakeCatalog([_gpt4o_catalog_entry()]),
+        billing_identity_resolver=lambda model, provider: ("openai", model),
+    )
+    u = CanonicalUsage(input_tokens=100, output_tokens=50)
+    cost = svc.estimate_cost(u, "gpt-4o", "openai")
     assert cost.status == "unknown"
     assert float(cost.amount_usd) == 0
 
@@ -80,11 +148,18 @@ async def test_estimate_cost_unknown_model():
 @pytest.mark.asyncio
 async def test_record_call_persists():
     recorder = FakeRecorder()
-    svc = UsageService(recorder, FakePricing(), FakeBreakdownCalculator())
-    raw = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+    svc = UsageService(
+        recorder, FakePricing(), FakeBreakdownCalculator(),
+        pricing_catalog=FakeCatalog([_gpt4o_catalog_entry()]),
+        billing_identity_resolver=lambda model, provider: ("openai", model),
+    )
+    raw = {
+        "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
     await svc.record_call("sess-1", "gpt-4o", "openai", raw, latency_ms=200, provider_kind="openai")
     assert len(recorder.calls) == 1
-    _, model, _, usage, cost, latency, _, _, _, _, _, _ = recorder.calls[0]
+    _, model, _, usage, cost, latency, *_ = recorder.calls[0]
     assert model == "gpt-4o"
     assert usage.input_tokens == 100
     assert cost.status == "estimated"

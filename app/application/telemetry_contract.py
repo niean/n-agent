@@ -46,7 +46,7 @@ OBJECTS = frozenset({'agent', 'model', 'tool', 'context', 'task', 'delegation', 
 MODEL_PARAMETER_NAMES = ('temperature', 'top_p', 'top_k', 'max_tokens', 'max_completion_tokens', 'max_output_tokens', 'frequency_penalty', 'presence_penalty')
 OBJECT_ATTRIBUTES = MappingProxyType({
     'agent': ('source', 'run_id', 'iteration', 'end_reason', 'message_count', 'inference_calls', 'tool_calls', 'usage_known'),
-    'model': ('message_count', 'usage_known', 'cache_read_tokens', 'cache_write_tokens', 'completion_start_time', 'cost_usd', 'cost_status', 'pricing_version', *(f'parameter.{key}' for key in MODEL_PARAMETER_NAMES)), 'tool': ('policy_outcome', 'risk_level', 'executed'),
+    'model': ('message_count', 'usage_known', 'cache_read_tokens', 'cache_write_tokens', 'completion_start_time', 'cost_usd', 'cost_status', 'cost_reason', 'cost_currency', 'cost_decimal', 'cost_input_usd', 'cost_output_usd', 'cost_cache_read_usd', 'cost_cache_write_usd', 'pricing_version', 'price_id', 'billing_provider', 'billing_model', *(f'parameter.{key}' for key in MODEL_PARAMETER_NAMES)), 'tool': ('policy_outcome', 'risk_level', 'executed'),
     'context': ('before_tokens', 'after_tokens'), 'task': ('id', 'run_id', 'trace_context', 'state', 'achieved', 'judge_attempt'),
     'delegation': ('id', 'member_id', 'role'), 'schedule': ('task_id', 'claim_id', 'delivery_status'),
     'memory': ('provider',), 'request': ('channel', 'id'), 'http': ('caller', 'direction'),
@@ -65,7 +65,7 @@ _standard_local = {
 }
 _instruments = {
     'agent': ('gen_ai.invoke_agent.duration', 'gen_ai.invoke_agent.inference_calls', 'gen_ai.invoke_agent.tool_calls', 'nagent.agent.runs'),
-    'model': ('gen_ai.client.inference.usage.input_tokens', 'gen_ai.client.inference.usage.output_tokens', 'gen_ai.client.inference.operation.input_tokens', 'gen_ai.client.inference.operation.output_tokens', 'gen_ai.client.inference.duration', 'nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens', 'nagent.model.normalized_tokens', 'nagent.model.cache_eligible_prompt_tokens', 'nagent.model.cache_eligible_read_tokens'),
+    'model': ('gen_ai.client.inference.usage.input_tokens', 'gen_ai.client.inference.usage.output_tokens', 'gen_ai.client.inference.operation.input_tokens', 'gen_ai.client.inference.operation.output_tokens', 'gen_ai.client.inference.duration', 'nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens', 'nagent.model.normalized_tokens', 'nagent.model.cache_eligible_prompt_tokens', 'nagent.model.cache_eligible_read_tokens', 'nagent.model.cost', 'nagent.model.cost_components', 'nagent.model.cost_attempts'),
     'tool': ('gen_ai.execute_tool.duration',), 'context': ('nagent.context.compression_attempts',),
 }
 
@@ -115,6 +115,9 @@ _attribute_types['gen_ai.response.finish_reasons'] = 'string_array'
 _attribute_types['nagent.task.judge_attempt'] = 'positive_integer'
 _attribute_types.update({f'nagent.model.parameter.{key}': 'finite_signed_number' for key in MODEL_PARAMETER_NAMES})
 _attribute_types['nagent.model.cost_usd'] = 'number'
+# 成本金额分项与 cost_usd 同款守卫：有限非负数值
+_attribute_types.update({f'nagent.model.cost_{bucket}_usd': 'number' for bucket in (
+    'input', 'output', 'cache_read', 'cache_write')})
 ATTRIBUTE_TYPES = MappingProxyType(_attribute_types)
 
 

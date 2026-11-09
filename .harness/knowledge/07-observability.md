@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 类型、模型参数/首输出时间/费用与检索评估映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收；Langfuse独立部署与Collector并存；N-KB专属Langfuse投影契约 -->
+<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 类型、模型参数/首输出时间/费用与检索评估映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收；模型成本语义（AttemptCost 生命周期、8 原因判定顺序、计价身份冻结/实例绑定、账本观测同源、3 个成本 Counter 与实测名称、Langfuse 成组校验/unknown 不推价、Grafana 面板语义、E2E 对账口径）；Langfuse独立部署与Collector并存；N-KB专属Langfuse投影契约 -->
 # 规范可观测行为
 
 观测回答：做了什么、为何结束、哪里慢、消耗多少。“共性规范”和“验收清单”独立于业务领域、项目、语言、框架及后端选型，可直接复用于其他系统；其余章节记录本项目的实现约定。本文是观测规范的权威源，架构、约定、模式及术语文档维护各自边界并引用本文。具体采集行为以对应观测能力启用为前提；本项目业务费用以 Usage 账本为准。
@@ -117,7 +117,7 @@ invoke_agent（N-Agent）
 | HTTP SERVER Span | `nagent.http.completed`，每请求一次 | 方法、路由、状态码、耗时、结果；显式关联该 HTTP Span |
 | HTTPX 出站 Span | `nagent.http.completed`，每次传输一次 | 目标主机/端口、脱敏路由模板、代码调用位置、方法、状态、耗时、结果；同时写入该 Span 的 Events 和同 Span ID 的 Log |
 | Agent 执行 | `nagent.agent.completed` | 结束原因、消息数、模型/工具调用数、Token、耗时、可读摘要 |
-| 模型和工具 | `nagent.model.completed` / `nagent.tool.completed` | 当前模型/工具、调用结果、用量/策略、耗时、可读摘要与详情 |
+| 模型和工具 | `nagent.model.completed` / `nagent.tool.completed` | 当前模型/工具、调用结果、用量/成本事实、策略、耗时、可读摘要与详情 |
 | 上下文压缩、预算拒绝 | `nagent.context.completed` / `nagent.budget.denied` | 压缩前后 Token、耗时、结果与异常；预算拒绝的类别及现场 |
 
 入站 HTTP 流式响应在最终响应体发送后记录完成日志；取消或异常保持真实结果，尚未发响应时不伪造状态码。日志不依赖 Trace 是否采样。补齐日志仅对新请求生效。
@@ -295,6 +295,7 @@ API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际
 | 项目自定义 | Agent | `nagent.agent.end_reason`、`nagent.agent.message_count`、`nagent.agent.inference_calls`、`nagent.agent.tool_calls`、`nagent.agent.usage_known` | string/int/int/int/bool；结束原因、范围内计数与汇总用量已知性 | Agent 完成事实；工具计数仅实际执行，模型计数按请求尝试；不重复叠加 child Agent |
 | 项目自定义 | 模型 | `nagent.model.message_count`、`nagent.model.usage_known` | int/bool；单次模型输入消息数、用量已知性 | 模型事实，不混用 Agent 范围计数 |
 | 项目自定义 | 模型 | `nagent.model.cache_read_tokens`、`nagent.model.cache_write_tokens` | int；单次模型尝试的已知缓存读/写 Token | 仅已知时记录，未知省略不伪造零；OpenAI 协议不适用的缓存写明确记为已知零 |
+| 项目自定义 | 模型 | `nagent.model.cost_status`、`nagent.model.cost_reason`、`nagent.model.cost_currency`、`nagent.model.cost_decimal`、`nagent.model.cost_input_usd`、`nagent.model.cost_output_usd`、`nagent.model.cost_cache_read_usd`、`nagent.model.cost_cache_write_usd`、`nagent.model.pricing_version`、`nagent.model.price_id`、`nagent.model.billing_provider`、`nagent.model.billing_model` | string；单次模型尝试的 AttemptCost 投影：状态、unknown 受控原因（estimated 省略）、币种（USD）、规范十进制总额、适用分项（不适用桶省略）、价格版本、价格项 ID、受信计价身份 | 语义与判定顺序见成本语义章节；unknown 不写任何金额与分项；price_id 仅 estimated 或唯一命中后的 unknown 保留 |
 | 项目自定义 | 工具 | `nagent.tool.policy_outcome`、`nagent.tool.risk_level`、`nagent.tool.executed` | string/string/bool；审批状态、风险、是否实际执行 | allow/deny/approved/require_approval 与统一操作结果分开，拒绝时 executed=false |
 | 项目自定义 | 压缩 | `nagent.context.before_tokens`、`nagent.context.after_tokens` | int；压缩前后 Token | 只在实际有此事实时记录 |
 | 项目自定义 | 各操作所属对象 | `nagent.<object>.outcome`、`nagent.<object>.summary`、`nagent.<object>.duration_ms` | string/string/number；操作结果、安全有界完成摘要、耗时 | agent/model/tool/context/task/delegation/schedule/memory/skill/curator/gateway/request/http 各自归属；summary 不是上下文摘要正文，duration 不替代 Span 时间，不作 Metric 维度 |
@@ -308,7 +309,7 @@ API/Dashboard 的 request.handle 事实复用原 HTTP SERVER Span，携带实际
 | 项目自定义 | Policy 安全检查 | `nagent.policy.name`、`nagent.policy.version`、`nagent.policy.decision_kind`、`nagent.policy.reason`、`nagent.policy.outcome`、`nagent.policy.scope`、`nagent.policy.occurred_at` | string；策略、版本、决策种类、原因、allow/deny/require_approval、作用域、审计时间 | `LoggingPolicyAuditSink` → 独立 ContextVar → 安全 Log/Event；reason 最多 1024 字符，其余字符串最多 256；无决定不补造 |
 | 项目自定义 | 内容 | `nagent.content.<field>`、`nagent.content.<field>_original_bytes`、`nagent.content.<field>_truncated`、`nagent.content.<field>_incomplete`、`nagent.content.<field>_observed_bytes` | string/int/bool/bool/int；安全正文、完整脱敏长度、截断、中断、已观察长度 | 固定 16×5 精确字段集合，按操作限制且单操作不超过原 12 项预算；默认每项 1024000 字节；Metric/Profile/ring buffer 不含正文 |
 
-模型参数扩展为精确枚举的 `nagent.model.parameter.<参数名>`，值为有限数，合法负 penalty 保留，bool 不作为数值。`nagent.model.completion_start_time` 为实际首流式输出的 UTC RFC3339 时间；`nagent.model.cost_usd` 为有限非负 USD，`cost_status/pricing_version` 表示既有估算及其版本。`task.evaluate` 使用 `nagent.task.achieved`（bool）与 `nagent.task.judge_attempt`（正整数）。这些字段不是自由前缀出口，未枚举或错误类型仍被丢弃。
+模型参数扩展为精确枚举的 `nagent.model.parameter.<参数名>`，值为有限数，合法负 penalty 保留，bool 不作为数值。`nagent.model.completion_start_time` 为实际首流式输出的 UTC RFC3339 时间。模型成本键由 Domain `AttemptCost` 经 finalization 一次投影：`cost_usd` 为有限非负 USD（estimated 才写），`cost_status`（estimated/unknown）每次实际请求必写，`cost_reason` 仅 unknown 携带受控枚举，`cost_decimal` 为总额规范十进制字符串，`pricing_version`/`price_id` 按 AttemptCost 不变量携带，`billing_provider/billing_model` 为受信计价身份投影。`task.evaluate` 使用 `nagent.task.achieved`（bool）与 `nagent.task.judge_attempt`（正整数）。这些字段不是自由前缀出口，未枚举或错误类型仍被丢弃。
 
 ### 事件、状态与结果
 
@@ -400,6 +401,9 @@ AgentRun、TaskRun 和请求分别使用自己的 ID。真实身份由服务端�
 | nagent.model.normalized_tokens | Counter/{token} | 一次模型尝试按归一化规则折算的 Token 量（逐尝试折算后累加） | operation/provider/request.model |
 | nagent.model.cache_eligible_prompt_tokens | Counter/{token} | 可判定命中率尝试的完整 prompt 总量（Anthropic 为 Ti+Tic+Ticw，OpenAI-compatible 为 Ti+Tic） | operation/provider/request.model |
 | nagent.model.cache_eligible_read_tokens | Counter/{token} | 上述可判定尝试的缓存读 Tic | operation/provider/request.model |
+| nagent.model.cost | Counter/USD | 一次模型尝试的 estimated 成本金额增量；显式零价 add(0)，unknown 不加金额 | gen_ai.operation.name、nagent.model.billing_provider/billing_model |
+| nagent.model.cost_components | Counter/USD | 同次尝试各适用桶的分项金额增量 | 上述维度 + nagent.model.cost_component（input/output/cache_read/cache_write） |
+| nagent.model.cost_attempts | Counter/{attempt} | 一次模型尝试结束，estimated/unknown 均计数，与采样无关 | 上述维度 + nagent.model.cost_status、nagent.model.cost_reason（estimated 固定 none） |
 
 表中的标准 operation/provider/request.model 分别指 gen_ai.operation.name/gen_ai.provider.name/gen_ai.request.model。gen_ai.token.modality 仅用于两项 Token Counter。九个 gen_ai instrument 沿用仓库锁定草案契约；Prometheus 实际名称及后端实测依据见 `docker/observability/metric-name-mapping.md`。
 
@@ -420,6 +424,21 @@ Counter 记录累计增量，Histogram 记录单次测量及其分布。模型�
 Ti 语义修正：自 2026-11-05 部署起，gen_ai.usage.input_tokens 与既有 input Counter/Histogram 的测量值统一为非缓存输入 Ti，OpenAI 侧由 prompt_tokens（含缓存命中）修正为 prompt_tokens - cached_tokens，Anthropic 侧语义不变。此为对既有 instrument 的语义修正，历史数据不回补；混合新旧版本或跨切换时间的速率窗口不解释为统一 Ti。Usage 账本五桶口径不受影响。
 
 命名决定：新增 instrument 使用项目命名 nagent.model.cache_read_tokens、nagent.model.cache_write_tokens、nagent.model.normalized_tokens、nagent.model.cache_eligible_prompt_tokens、nagent.model.cache_eligible_read_tokens，缓存 span 属性使用前两个同名键。它们是项目扩展，不宣称为 OTel 标准；既有 gen_ai instrument 沿用仓库锁定草案契约，不随本次升级 semconv。
+
+### 模型成本语义（AttemptCost）
+
+服务端统一计价是观测侧成本的唯一权威事实：Domain `app/domain/cost.py` 定义无 SDK 的计价值对象与纯计算器，`app/infrastructure/usage/pricing_catalog.py` 提供版本化价格目录适配，Application 在单次模型尝试 finalization 时计算一次 `AttemptCost`，三个观测出口（Span 属性 + 同义完成日志 + 独立 Counter）只投影该结果，不重算。
+
+- 生命周期：每次真实模型请求恰好一次。重试、fallback 各自产生独立 AttemptCost；流式多次 usage 按桶替换最终合法累计快照，非法更新使桶无效、后续合法完整快照可恢复；异常/取消原样传播，无实际请求的拒绝不进入 ChatAttempt。计算结果不可变，观测与账本消费同一结果。
+- 四桶与已知性：input/output/cache_read/cache_write 每桶为 `TokenValue`（known/unknown/not_applicable）；not_applicable 只能由 Provider 协议适配器声明（OpenAI 无 cache_write 概念等），不输出虚构零 Token。精确 Decimal 计算，分项 Decimal 和严格等于总额；金额不可表示为有限 double 时按 amount_unrepresentable 标 unknown，不输出伪值。
+- 未知原因受控：`UnknownReason` 八值，判定顺序固定 identity_unresolved -> invalid_usage -> missing_usage -> pricing_unavailable -> price_not_found -> price_ambiguous -> unsupported_pricing -> amount_unrepresentable；多个原因同时存在时取顺序最优先者（目录失效时 pricing_unavailable 优先于 TTL 组合的 unsupported_pricing）。unknown 不携带任何金额、分项或 decimal；price_id 在已唯一定位价格项的 unknown 上保留，未唯一定位的不携带（两仓组合根均透传）。金额序列化界：canonical decimal 字符串每侧至多 340 位，超界金额不可投影完整 decimal，按 amount_unrepresentable 标 unknown（判定序中位于最后，不影响更早原因）；该界与两仓遥测契约（681 字符上限）及 Collector 守卫对齐，estimated 不会在下游被静默丢字段。
+- Anthropic TTL 条件事实：账本与观测共用 `cache_ttl_facts` 三态——缺事实或任一在场子字段非法（整组拒绝）返回 None；恰好一个非零合法子字段且其拆分和等于 cache_creation 总量时返回 `{"cache_ttl": ...}` 条件事实（拆分未覆盖总量即"同一已计价条件"不成立，转 unsupported 标记）；两个及以上非零合法子字段（混合 TTL）返回显式 unsupported 标记。unsupported 标记在目录价格匹配前先取目录可用性结论：目录失效按 pricing_unavailable 收口，目录可用才转 unsupported_pricing，无条件价格项对混合 TTL 不可达（不得套用单一 TTL 单价）。零值子字段不构成在用 TTL；总量为 0 无需条件（estimated 零价语义不变）；响应未拆分 cache_creation 时不适用合并规则。TTL 校验与桶解析共用同一次嵌套/平铺 usage 解包视图，嵌套形态与平铺形态同结论。
+- 计价身份：`(billing_provider, billing_model)` 由启动期受信配置映射（`N_AGENT_MODEL_BILLING_IDENTITY_MAP`）提供，请求启动时冻结并绑定到实际选中 Provider 实例（流式先选实例后进上下文也不错位）；Provider 适配器不能覆盖，请求 options/URL/响应模型不能覆盖，配置无映射的身份记 identity_unresolved，不猜。账本与观测共用同一冻结身份与同一计价入口（账本 `record_call` 使用尝试冻结身份），不出现同一响应两种结论。
+- 账本与观测同源：UsageService.estimate_cost 走同一 Domain 纯计算器与目录；账本兼容形态下 unknown 仍写旧 `amount_usd="0"` 占位，该占位不被观测当已知。业务费用以 Usage 账本为准的口径不变，观测成本是对同一事实的三信号投影。
+- 指标：三个 Counter 见指标表。Prometheus 实测名称为 `nagent_model_cost_USD_total`、`nagent_model_cost_components_USD_total`、`nagent_model_cost_attempts_total`（USD 单位实测产生字面 `_USD` 后缀，禁止凭规则猜测）；实测依据见 `docker/observability/metric-name-mapping.md`。Counter 维度受控，模型走 map_model_name 白名单（未登记归 other），price_id/pricing_version/trace_id/session 不作指标标签；estimated 显式零也 add(0)；Metric 不进 is_recording/sampled 判断，未采样仍计数。
+- Langfuse 投影（两条管线同语义）：cost_details 从逐字段守卫升级为成组校验，不部分成功。estimated 组合法投影 `{"input","output","cache_read","cache_write","total"}`（不适用桶省略），要求 currency=USD、reason 缺省、cost_usd 与 cost_decimal 齐全、全部适用分项齐全、版本/price_id/受信身份合法、分项 double 和与 total 误差在容差内；非法字段在清洗前先逐键登记 illegal，整组拒绝（不投影 cost_details、丢弃金额与 decimal），合法诊断键（status/currency/版本/price_id/计费身份）保留进 metadata 供拒绝审计，独立合法 Token 保留。unknown 组必须有受控 reason 且无任何金额，否则同样整组拒绝。unknown 不推价：`observation.model.name` 仅在 cost_status=estimated 时投影，原始模型键保留在 metadata；N-Agent 与 N-KB 两条管线行为一致。
+- Grafana 面板语义（nagent-metrics.json、nkb-overview.json 各 6 个成本面板）：金额面板标题为"已知成本"并注明 API 估算；成本查询以同窗口 estimated attempts > 0 作显示守卫，全未知与无调用显示无数据，真实零价 estimated 显示 0；计价覆盖率分母为 0 显示无数据、不补 100%，分子缺序列而分母大于 0 显示 0%；分项占比与 total 分开查询，禁止相加；未知原因按 cost_reason 分组。结构由 `tests/test_cost_dashboards.py` 锁定；人工浏览器验收未执行（AC13 单独标记）。
+- E2E 对账口径：`tests/e2e/otel_langfuse_comparison.py` 对每条模型叶比较本地 Decimal 预期、Tempo 属性、Langfuse costDetails 与同次完成日志，cost_decimal 三后端逐字节一致（Tempo 属性与完成日志为逐字节权威，Langfuse metadata 数字形态经规范化等值比对）；已知零值桶在目录不计价时跳过（0 桶贡献恒 0），非零无价仍 pricing_unavailable。Metric 对账按服务拆分 Counter（nagent 行配 N-Agent 三 Counter、nkb 行配 N-KB 三 Counter），total/components 分离、attempts 精确相等，窗口内无并发无重启。模型耗时对账使用采集器投影的 `nagent.model.duration_ms`（与直方图同源同口径），缺投影显式 SKIP 不放行；Agent/工具组耗时为不同测量边界，按既有容差核对。采样边界：报告只称"已观测下界"，不按采样率反推支出。最终验收 17/17 全绿、对比全 PASS（价格版本与哈希见对比报告），AC13 人工浏览器验收未执行。
 
 ### 内容与出口
 
@@ -475,11 +494,11 @@ Policy 的 AgentRun 和会话身份取自受信执行快照。领域审计事件
 |---|---|---|
 | 标准 gen_ai.operation.name、自定义 nagent.<object>.operation | langfuse.observation.type | 按服务和精确操作判定上表类型；不根据任意名称猜测 |
 | 可信会话、Agent/Task/委派等身份 | langfuse.session.id、observation.metadata.<原字段名> | 会话和运行身份分别保存，不互相冒充 |
-| 请求/实际响应模型 | observation.model.name | 仅 chat；响应模型优先，请求模型兜底 |
+| 请求/实际响应模型 | observation.model.name | 仅 chat 且合法 estimated 成本组（unknown 阻断自动推价，原始模型保留在 metadata）；非空且非 other 的请求模型优先，响应模型兜底，避免响应别名被归一为 other 后覆盖配置展示名 |
 | 模型最终数值参数 | observation.model.parameters | temperature、top_p、top_k、max_tokens、max_completion_tokens、max_output_tokens、frequency_penalty、presence_penalty；有限数，bool 不算数值 |
 | 流式首个非空文本或工具增量时间 | observation.completion_start_time | UTC RFC3339，只记录一次；空流和无首输出证据的非流式省略 |
 | 已知输入、输出、缓存读、缓存写 | observation.usage_details | 四桶互斥，未知不补零；Agent 汇总只进 metadata |
-| 同次调用的已知 USD 估算 | observation.cost_details.total | 复用 UsageService，四桶及原始用量匹配、estimated 且有 pricing_version 才发送；不重复写账 |
+| 同次调用的 AttemptCost 成本事实 | observation.cost_details、observation.metadata.<成本字段> | 服务端统一计价成组校验后投影：cost_details 含适用分项与 total（unknown 整组拒绝不投影）；cost_status/reason/currency/pricing_version/price_id/计费身份/cost_decimal 进 metadata，非法组拒绝保留审计诊断；unknown 阻断自动推价，不重复写账 |
 | 模型/Provider/结束原因、已知性、Agent 统计、压缩 Token、记忆 Provider、结果 | observation.metadata.<原字段名> | 保留规范类型；布尔、计数和字符串数组不混用 |
 | 消息、工具参数/结果 | observation.input/output | 工具专用正文优先，其次完整消息，最后单条消息；只选一份 |
 | retrieval_query/retrieval_results | observation.input/output | 仅 knowledge.search 的安全检索输入输出 |
@@ -492,7 +511,7 @@ Policy 的 AgentRun 和会话身份取自受信执行快照。领域审计事件
 
 表中 observation.* 均以 langfuse. 为前缀。正文先统一脱敏并按 UTF-8 限长，单项默认 1024000 字节；完整性信封随所选来源整体替换。新增四种详情仅允许对应检索或评估操作使用；普通操作仍最多十二种详情，专用操作仅允许自身两种正文和 error，不扩大传输预算。
 
-Provider 只向观测钩子报告最终请求的数值白名单和必要用量标量，不传递任意 options 或凭据。费用是现有定价表的 USD 估算，账本仍由 UsageService 负责；缺失定价、原始桶、版本或归属证据时不发送费用。未知 Token 不补零，OpenAI 协议不适用的缓存写是已知零。
+Provider 只向观测钩子报告最终请求的数值白名单和必要用量标量，不传递任意 options 或凭据。费用来自服务端统一计价（Domain AttemptCost 纯计算器 + 版本化价格目录），每次尝试 finalization 恰计算一次，Span/完成日志/Counter/Langfuse 消费同一结果；unknown 与组校验失败不推价不投影金额，账本仍由 UsageService 负责。未知 Token 不补零，OpenAI 协议不适用的缓存写是已知零。
 
 AgentGraph 当前以非流式方式调用 Provider；HTTP SSE 输出不等于模型传输流式。因此常规 Graph 对话不填首 Token 时间，completion_start_time 只在实际使用 Provider 流式接口并观察到增量时产生。
 
@@ -508,12 +527,12 @@ N-KB 应用不使用本仓的统一语义采集；其 Langfuse 投影完全由�
 |---|---|---|
 | `nkb.retrieval.operation=search` | retriever | 名称 retrieval.search；正文来自 nkb.content.retrieval_input/retrieval_output |
 | `nkb.index.operation=run` | chain | 名称 index.run；仅全局根（`parent_span_id == SpanID(0x0000000000000000)`）且正文存在时写 langfuse.trace.input/output；HTTP 或上游父级存在时不提升为根 |
-| `gen_ai.operation.name=embeddings` | embedding | 名称 embeddings；model.name=gen_ai.request.model；usage_details.input 由 nkb.model.usage_known=true 且非负整数门控，真实零保留、未知省略 |
+| `gen_ai.operation.name=embeddings` | embedding | 名称 embeddings；model.name=gen_ai.request.model 仅 cost_status=estimated（unknown 阻断自动推价）；usage_details.input 由 nkb.model.usage_known=true 且非负整数门控，真实零保留、未知省略；cost_details={input,total} 经成本成组校验投影，成本状态/原因/币种/版本/price_id/计费身份经 metadata 导出 |
 | 其余操作（document.upload、index.parse/split/embed/write、mcp.status、request.handle、http 等） | span | 默认类型，无专用正文 |
 
 Span 名只使用固定操作名（retrieval.search、index.run、embeddings），未知类型使用 span。内容源精确映射：chain 取 nkb.content.index_input/index_result，retriever 取 nkb.content.retrieval_input/retrieval_output，embedding 取 nkb.content.embedding_input（不导出 embedding_result 或向量）；缺失方向独立省略，失败或取消不合成成功输出。正文均先经 N-KB 应用侧统一脱敏限长，四项完整性元数据（original_bytes/truncated/incomplete/observed_bytes）随信封保留，缺失不补造。
 
-投影前先清除外来 langfuse.* 与未登记 nkb.*：属性先按 KB 白名单收窄，再逐键执行镜像 N-KB telemetry_contract 的类型与枚举守卫（操作与 outcome 枚举、provider、ID 与 model 长度模式、duration 非负有限数、计数非负 int 且拒绝 bool），非白名单值在投影前删除。metadata 仅允许 nkb.index/retrieval 的 operation/outcome/duration_ms、nkb.index.document_id/job_id/chunk_count、nkb.retrieval.result_count、nkb.model.usage_known、gen_ai.provider.name 和 error.type。Span Event 仅保留 N-KB 登记完成事件与类型正确的安全事实，异常事件正文与未知属性清空；Scope 清空，Resource 投影后仅保留 service.name，release/environment 沿用受限模式校验。不投影 langfuse.session.id（N-KB 无 gen_ai.conversation.id）、model.parameters 与 cost_details；level=ERROR 仅真实 Span ERROR，status_message 仅来自 N-KB outcome（failure/timed_out）与固定 error.type 枚举（unsupported_file_type/file_too_large/embedding_failed/vector_index_failed/sqlite_failed/timeout/other），不复制异常文本。N-KB 业务字段细节以 N-KB 仓 .harness/knowledge/07-observability.md 为权威，不在本文重复。
+投影前先清除外来 langfuse.* 与未登记 nkb.*：属性先按 KB 白名单收窄，再逐键执行镜像 N-KB telemetry_contract 的类型与枚举守卫（操作与 outcome 枚举、provider、ID 与 model 长度模式、duration 非负有限数、计数非负 int 且拒绝 bool），非白名单值在投影前删除。metadata 仅允许 nkb.index/retrieval 的 operation/outcome/duration_ms、nkb.index.document_id/job_id/chunk_count、nkb.retrieval.result_count、nkb.model.usage_known、成本事实（cost_status/cost_reason/cost_currency/cost_input_usd/cost_decimal/pricing_version/price_id/billing_provider/billing_model，逐键守卫）、gen_ai.provider.name、gen_ai.request.model（unknown 保留原始模型供分析）和 error.type。Span Event 仅保留 N-KB 登记完成事件与类型正确的安全事实，异常事件正文与未知属性清空；Scope 清空，Resource 投影后仅保留 service.name，release/environment 沿用受限模式校验。不投影 langfuse.session.id（N-KB 无 gen_ai.conversation.id）与 model.parameters；cost_details 经成本成组校验投影（estimated 单 input 分项 + total，非法组 fail-closed 拒绝；unknown 组必须有受控 reason 且无金额），`observation.model.name` 仅 cost_status=estimated 投影阻断自动推价（见上文成本语义章节）；level=ERROR 仅真实 Span ERROR，status_message 仅来自 N-KB outcome（failure/timed_out）与固定 error.type 枚举（unsupported_file_type/file_too_large/embedding_failed/vector_index_failed/sqlite_failed/timeout/other），不复制异常文本。N-KB 业务字段细节以 N-KB 仓 .harness/knowledge/07-observability.md 为权威，不在本文重复。
 
 部署事实：Langfuse 使用单一共享项目 n-agent-local-project 承载 N-Agent 与 N-KB 两个服务的 span，实现跨服务 Trace 关联展示——两服务共享同一 W3C traceparent 时，两条 Langfuse 管线投影的 span 以相同 Trace ID 写入同一项目，Langfuse 内合并为完整父子树；KB 投影不改写 parent/trace id，trace 级正文（langfuse.trace.name/input/output）由根门控保证仅一方写入（每条管线仅全局根 span 写 trace 正文，跨服务 trace 中 KB span 因存在上游父级不写正文）。凭据与主项目同组：LANGFUSE_INIT_PROJECT_PUBLIC_KEY/SECRET_KEY 经宿主 docker/langfuse/.env（0600）同时供给两条 Langfuse exporter，不设 LANGFUSE_KB_PROJECT_* 独立凭据；KB 分支 endpoint 由 LANGFUSE_KB_OTEL_ENDPOINT 配置，默认与 n-agent 共用端点，可独立校验。两条 Langfuse exporter 使用独立有界队列和 batch；N-KB 不新增自有 Langfuse 开关，共享 N_OBSERVABILITY_LANGFUSE_ENABLED 关闭时两条管线同时停用。
 
@@ -610,7 +629,7 @@ Pyroscope旧策略诊断依据：[v1.21.1磁盘统计](https://github.com/grafan
 - 关闭分流并仅重建 Collector：`N_OBSERVABILITY_LANGFUSE_ENABLED=false sh docker/observability/restart.sh compose up -d --no-deps --force-recreate otel-collector`；恢复使用普通共享观测 restart。Langfuse 可以独立 stop，不停止原观测栈或业务。
 - N-KB 与 N-Agent 共用单一 Langfuse 项目 n-agent-local-project 与同一组项目 Basic 凭据，无第二项目及 LANGFUSE_KB_PROJECT_* 独立凭据；两服务共享 W3C trace id 的 span 在同项目内合并为完整父子树（跨服务 Trace 关联），trace 级正文由根门控保证仅一方写入。KB 分支 endpoint 由 LANGFUSE_KB_OTEL_ENDPOINT 配置，默认与 n-agent 共用端点，可独立校验。
 - 专用验收入口为 `bash tests/e2e/langfuse_smoke.sh`，业务和探针在 Docker 中执行，包含实际模型/calculator、双端操作树/用量/安全详情、未采样/并发、停机/认证/慢响应/队列耗尽、恢复、持久化与固定历史样本，以及 N-KB 双管线投影、跨服务共享 Trace 合并（同 Trace ID 父子树）与故障注入场景。报告记录每次尝试、真实 Trace 和独立会话/容器/原环境清理结果；已确认 Trace 不重复读取大正文。浏览器展示仍按人工清单验收。
-- 常规 `tests/e2e/run.sh` 的 OTel 子套件增加“OTel 与 Langfuse 数值一致性”：先结束原固定模型场景并恢复真实 Provider，再复用 Runner.business 连续调用3次 calculator 流式请求。otel_langfuse_comparison.sh 仅编排 Docker 探针，otel_langfuse_comparison.py 固定当前 service_instance_id，对比 Prometheus 原始计数器增量与相同 Trace 的 Tempo/Langfuse 用量和时间。整数严格一致；耗时允许每样本5ms或1%，p95检查直方图CDF及原始分位样本落桶，不声称分位数数值相等。主结果表仅一行“查看对比结果”，指向 comparison/comparison.md（指标表、逐调用Trace列表），JSON及原始快照同目录持久化，汇总重定位链接。未配置Langfuse或未启用Collector分支为SKIP；已启用但后端故障、未知用量或探针失败不能宣称全部通过，失败保留证据并清理精确归属会话及探针容器。
+- “OTel 与 Langfuse 数值一致性”仅支持人工明确指令触发，不纳入 `tests/e2e/run.sh` 或 `otel_smoke.sh`；独立命令见 PROJECT.md。使用部署的真实 Provider，复用 Runner.business 连续调用3次 calculator 流式请求。otel_langfuse_comparison.sh 仅编排 Docker 探针，otel_langfuse_comparison.py 固定当前 service_instance_id，对比 Prometheus 原始计数器增量与相同 Trace 的 Tempo/Langfuse 用量和时间。整数严格一致；耗时允许每样本5ms或1%，p95检查直方图CDF及原始分位样本落桶，不声称分位数数值相等。主结果表仅一行“查看对比结果”，指向 comparison/comparison.md（指标表、逐调用Trace列表），JSON及原始快照同目录持久化，汇总重定位链接。未配置Langfuse或未启用Collector分支为SKIP；已启用但后端故障、未知用量或探针失败不能宣称全部通过，失败保留证据并清理精确归属会话及探针容器。
 - 数值对比调用遵守E2E会话生命周期：业务请求前持久化 owned-sessions.jsonl，逐次调用在 finally 中按本轮run_id、精确会话ID与来源校验清理，删除后必须回读404或session=null；活动Run先通过所属会话的HTTP cancel接口取消，再有界重试删除。失败会话也清理，仅保留报告与后端Trace证据。Shell退出或中断时先停止原探针，避免会话重建竞争，再启动该临时容器执行 --cleanup-only 重放清单，随后删除容器；清理不依赖Langfuse凭据或后端健康，失败必须使该用例FAIL。
 - Dashboard 观测-OTel 页的“外部”区域固定展示 Langfuse 会话链接 `http://langfuse.localhost/project/n-agent-local-project/sessions`，不依赖四链运行时配置，新窗口打开并带 noopener/noreferrer。
 - 既有 Tempo 512MiB 查询容量问题见 D082：多轮审计旧大 Trace 曾 OOM；仅重启原容器恢复且保留卷，不把缓存重置视为容量问题根治。历史对照只证明固定样本，不代表全部历史数据完整性。
@@ -636,3 +655,11 @@ Pyroscope旧策略诊断依据：[v1.21.1磁盘统计](https://github.com/grafan
 原小内存方案Langfuse合计2.625GiB，OTel栈合计1.625GiB；当前实际容器限额以Compose为准。ClickHouse参数分别在docker/langfuse/clickhouse-small.xml及clickhouse-users-small.xml只读挂载；不改变数据卷、采样、详情上限和7天保留策略。首次试探的ClickHouse512MiB与Web384MiB堆无法稳定完成正常启动/查询，预算须结合页面持续查询核验，不能仅凭短时冒烟成功判断稳定。
 
 小内存验证报告：locals/e2e-reports/small-memory-20261107-064431-92466/result.md。真实模型/calculator对话、Tempo/Langfuse同树及用量/正文、Loki关联、Prometheus增量、固定历史/Profiles和精确会话清理均通过。此配置面向本地小数据量，不代表大批量导出或高并发分析容量。
+
+## 配置当前目录估算口径
+
+2026-11-10 发布 `2026-11-10-peak-fx7-v1` 目录，两仓内容与部署哈希一致。
+本地 bge-m3 embedding 显式零价；商业 Token 按人民币峰时标准 API 目录价、
+固定 1 USD = 7 CNY 换算，不随峰谷或汇率自动更新。ark-code-latest 保留展示名，
+按用户指定使用 DeepSeek V4.1 Flash 标准价替代估算，套餐实际扣款不在本估算内。
+来源、适用范围及换算说明见 `docker/observability/model-pricing-policy.md`。

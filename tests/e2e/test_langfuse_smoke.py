@@ -351,6 +351,9 @@ def kb_expected_rows(expected):
         base.update(fields); return base
     index_meta={'nkb.index.operation':'run','nkb.index.outcome':'success','nkb.index.duration_ms':12.5,
                 'nkb.index.document_id':'doc-e2e','nkb.index.job_id':'job-e2e','nkb.index.chunk_count':7}
+    kb_meta={'nkb.model.cost_status':'estimated','nkb.model.cost_currency':'USD',
+             'nkb.model.pricing_version':'e2e-kb-v1','nkb.model.price_id':'e2e-embed-price',
+             'nkb.model.billing_provider':'ollama','nkb.model.billing_model':'e2e-embed-model'}
     rows=[
       row(1,type='CHAIN',name='index.run',traceName='index.run',input=expected['index_input'],output=expected['index_result'],
           metadata={**index_meta,'input':envelope('index_input'),'output':envelope('index_result')}),
@@ -358,10 +361,12 @@ def kb_expected_rows(expected):
           metadata={'nkb.retrieval.operation':'search','nkb.retrieval.outcome':'success','nkb.retrieval.duration_ms':3.25,
                     'nkb.retrieval.result_count':2,'input':envelope('retrieval_input'),'output':envelope('retrieval_output')}),
       row(3,type='EMBEDDING',name='embeddings',input=expected['embedding_input'],model=expected['model'],
-          usageDetails={'input':5,'total':5},metadata={'gen_ai.provider.name':'ollama','input':envelope('embedding_input',complete=False)}),
+          usageDetails={'input':5,'total':5},costDetails={'input':0.125,'total':0.125},
+          metadata={'gen_ai.provider.name':'ollama','input':envelope('embedding_input',complete=False),**kb_meta}),
       row(4,type='EMBEDDING',name='embeddings',model=expected['model'],usageDetails={'input':0,'total':0},
-          metadata={'nkb.model.usage_known':True}),
-      row(5,type='EMBEDDING',name='embeddings',model=expected['model'],metadata={'nkb.model.usage_known':False}),
+          costDetails={'input':0,'total':0},metadata={'nkb.model.usage_known':True,**kb_meta}),
+      row(5,type='EMBEDDING',name='embeddings',
+          metadata={'nkb.model.usage_known':False,'nkb.model.cost_status':'unknown','nkb.model.cost_reason':'missing_usage'}),
       row(6,type='SPAN',name='span'),row(7,type='SPAN',name='span'),row(8,type='SPAN',name='span'),
       row(9,type='CHAIN',name='index.run',input=expected['nested_input'],output=expected['nested_result'],
           metadata={'nkb.index.operation':'run','nkb.index.outcome':'success'}),
@@ -414,6 +419,8 @@ def test_kb_projection_assertions_fail_on_real_mutations():
         (0,{**rows[0],'type':'GENERATION'}),                                # 类型映射错误
         (3,{**rows[3],'usageDetails':{}}),                                   # 真实零丢失
         (4,{**rows[4],'usageDetails':{'input':1,'total':1}}),                # unknown 被补造
+        (3,{**rows[3],'costDetails':{'input':1,'total':1}}),                 # 成本分项被篡改
+        (4,{**rows[4],'model':expected['model']}),                           # unknown 组被推价
         (8,{**rows[8],'input':'tampered nested body'}),                      # 嵌套 run 正文被篡改
         (9,{**rows[9],'metadata':{'nkb.index.chunk_count':3}}),              # 非法类型守卫泄漏
         (10,{**rows[10],'statusMessage':'TimeoutError(...)'}),               # 非枚举 status_message
@@ -773,12 +780,22 @@ def assert_kb_export(spans,expected):
     assert embedding['langfuse.observation.input']==expected['embedding_input']
     assert 'langfuse.observation.output' not in embedding
     assert json.loads(embedding['langfuse.observation.usage_details'])=={'input':5}
+    # T5 成本组：estimated 组投影 cost_details 与受控 metadata；model.name 照常投影。
+    assert json.loads(embedding['langfuse.observation.cost_details'])=={'input':0.125,'total':0.125}
     assert embedding['langfuse.observation.model.name']==expected['model']
+    assert embedding['langfuse.observation.metadata.nkb.model.cost_status']=='estimated'
+    assert embedding['langfuse.observation.metadata.nkb.model.price_id']=='e2e-embed-price'
+    assert embedding['langfuse.observation.metadata.nkb.model.billing_model']=='e2e-embed-model'
+    assert 'langfuse.observation.metadata.nkb.model.cost_usd' not in embedding
     assert json.loads(embedding['langfuse.observation.metadata.input'])=={'source':'embedding_input'}
     assert json.loads(attrs(4)['langfuse.observation.usage_details'])=={'input':0}
+    assert json.loads(attrs(4)['langfuse.observation.cost_details'])=={'input':0,'total':0}
     assert 'langfuse.observation.usage_details' not in attrs(5)
-    assert attrs(5)['langfuse.observation.model.name']==expected['model']
+    # unknown 组阻断自动推价：model.name 不投影，受控 reason 保留在 metadata。
+    assert 'langfuse.observation.model.name' not in attrs(5)
     assert attrs(5)['langfuse.observation.metadata.nkb.model.usage_known'] is False
+    assert attrs(5)['langfuse.observation.metadata.nkb.model.cost_status']=='unknown'
+    assert attrs(5)['langfuse.observation.metadata.nkb.model.cost_reason']=='missing_usage'
     for identifier in (6,7,8):
         a=attrs(identifier)
         assert a['langfuse.observation.type']=='span' and by_id[f'{identifier:016x}']['name']=='span'
@@ -818,7 +835,7 @@ def assert_kb_export(spans,expected):
 
 @pytest.mark.skipif(not fork_available(),reason='real fork image n-agent-langfuse-collector:0.137.0 unavailable')
 def test_real_fork_dual_pipeline_isolated_io():
-    """AC: 真实 0.137.0 fork + 隔离 IO 双管线；n-agent 输出与 HEAD 基线逐字段等价。"""
+    """AC: 真实 0.137.0 fork + 隔离 IO 双管线；n-agent 输出与 HEAD 基线在非成本 span 上逐字段等价（T5 成本投影有意变更，chat span 按新契约单独断言）。"""
     import shutil,subprocess,tempfile,uuid
     m=module()
     config=collector_module()
@@ -851,9 +868,84 @@ def test_real_fork_dual_pipeline_isolated_io():
     for sentinel in (*kb_expected['sentinels'],*agent_expected['sentinels']):
         assert sentinel not in json.dumps(buckets['n-agent'])
         assert sentinel not in json.dumps(buckets['n-kb'])
-    keep={f'{i:016x}' for i in range(1,19)}
+    # T5 成本观测投影有意改变成本相关输出（成组守卫、cost_details 分项、新增
+    # metadata、model.name 门控）；与 HEAD 的基线等价只覆盖不受 T5 影响的 span。
+    keep={f'{i:016x}' for i in range(1,19) if i!=2}
     def normalized(bucket):
         return sorted((span for span in bucket if span['spanId'] in keep),key=lambda span:span['spanId'])
     assert normalized(buckets['n-agent'])==normalized(baseline_buckets['n-agent'])
     sample=next(span for span in buckets['n-agent'] if span['spanId']=='0000000000000002')
     assert sample['attrs']['langfuse.observation.input']=='short exact input'
+    # 合法 estimated 组：cost_details 分项 + total；model.name 照常投影。
+    assert json.loads(sample['attrs']['langfuse.observation.cost_details'])=={'input':0.05,'output':0.05,'cache_read':0.025,'total':0.125}
+    assert sample['attrs']['langfuse.observation.model.name']=='e2e-model'
+    for key,value in (('langfuse.observation.metadata.nagent.model.cost_status','estimated'),
+                      ('langfuse.observation.metadata.nagent.model.cost_currency','USD'),
+                      ('langfuse.observation.metadata.nagent.model.cost_decimal','0.125'),
+                      ('langfuse.observation.metadata.nagent.model.price_id','e2e-price'),
+                      ('langfuse.observation.metadata.nagent.model.billing_provider','openai'),
+                      ('langfuse.observation.metadata.nagent.model.billing_model','e2e-model'),
+                      ('langfuse.observation.metadata.gen_ai.request.model','e2e-model')):
+        assert sample['attrs'][key]==value
+    assert 'langfuse.observation.metadata.nagent.model.cost_usd' not in sample['attrs']
+
+
+def test_real_fork_illegal_cost_groups_fail_closed():
+    """AC: 非法组真实送入 0.137.0 fork 必须整体 fail-closed：不投影 cost_details、
+    不投影 model.name（阻断自动推价）、金额与 decimal 不残留；独立合法 Token 不受影响。"""
+    m=module()
+    config=collector_module()
+    _,payload,_=m.synthetic_payload()
+    chat=next(span for span in payload['resourceSpans'][0]['scopeSpans'][0]['spans']
+              if span['spanId']=='0000000000000002')
+    def unwrap(node):
+        if not isinstance(node, dict):
+            return node
+        if 'arrayValue' in node:
+            return [unwrap(next(iter(item.values()))) for item in node['arrayValue']['values']]
+        return unwrap(next(iter(node.values())))
+    base={a['key']:unwrap(a['value']) for a in chat['attributes']}
+    assert base['nagent.model.cost_status']=='estimated'
+    variants=[
+        # (a) estimated 缺 cost_decimal；(b) 非 USD；(c) 分项合计超容差；
+        # (d) estimated 携带 reason；(e) unknown 携带金额。
+        (0x11,lambda a:a.pop('nagent.model.cost_decimal')),
+        (0x12,lambda a:a.__setitem__('nagent.model.cost_currency','EUR')),
+        (0x13,lambda a:a.__setitem__('nagent.model.cost_input_usd',0.5)),
+        (0x14,lambda a:a.__setitem__('nagent.model.cost_reason','missing_usage')),
+        (0x15,lambda a:a.__setitem__('nagent.model.cost_status','unknown')),
+    ]
+    spans=[]; expected_status={}
+    for sid,mutate in variants:
+        attrs=dict(base)
+        mutate(attrs)
+        expected_status[f'{sid:016x}']=attrs['nagent.model.cost_status']
+        spans.append({**chat,'spanId':f'{sid:016x}',
+                      'attributes':[m.attr(k,v) for k,v in attrs.items()]})
+    illegal={'resourceSpans':[{'resource':payload['resourceSpans'][0]['resource'],
+                               'scopeSpans':[{'scope':{'name':'e2e','version':'e2e'},'spans':spans}]}]}
+    import shutil,tempfile
+    root=SOURCE.parents[2]
+    scratch=Path(tempfile.mkdtemp(prefix='fork-illegal-',dir=root/'locals/harness_tmp'))
+    try:
+        buckets=run_fork(lambda port:isolated_config(config.build_config('pk-e2e','sk-e2e'),port),
+                         illegal,scratch/'current',{'n-agent':len(spans)})
+    finally:
+        shutil.rmtree(scratch,ignore_errors=True)
+    by_id={span['spanId']:span['attrs'] for span in buckets['n-agent']}
+    assert set(by_id)=={f'{sid:016x}' for sid,_ in variants}
+    amounts=('nagent.model.cost_usd','nagent.model.cost_input_usd','nagent.model.cost_output_usd',
+             'nagent.model.cost_cache_read_usd','nagent.model.cost_cache_write_usd')
+    for sid,_ in variants:
+        attrs=by_id[f'{sid:016x}']
+        assert 'langfuse.observation.cost_details' not in attrs
+        assert 'langfuse.observation.model.name' not in attrs
+        for key in (*amounts,'nagent.model.cost_decimal'):
+            assert f'langfuse.observation.metadata.{key}' not in attrs
+        # 独立合法 Token 不受成组拒绝影响，usage_details 原样投影。
+        assert json.loads(attrs['langfuse.observation.usage_details'])['input']==3
+        # 拒绝状态可在 metadata 审计。
+        assert attrs['langfuse.observation.metadata.nagent.model.cost_status']==expected_status[f'{sid:016x}']
+    # estimated 组携带受控 reason 属生产者矛盾：整组拒绝时一并丢弃。
+    assert 'langfuse.observation.metadata.nagent.model.cost_reason' not in by_id[f'{0x14:016x}']
+    assert by_id[f'{0x15:016x}']['langfuse.observation.metadata.nagent.model.cost_status']=='unknown'

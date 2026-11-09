@@ -186,10 +186,20 @@ class TestInstruments:
          {"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model"}),
         ("nagent.model.cache_eligible_read_tokens", "counter", "{token}",
          {"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model"}),
+        ("nagent.model.cost", "counter", "USD",
+         {"gen_ai.operation.name", "nagent.model.billing_provider",
+          "nagent.model.billing_model"}),
+        ("nagent.model.cost_components", "counter", "USD",
+         {"gen_ai.operation.name", "nagent.model.billing_provider",
+          "nagent.model.billing_model", "nagent.model.cost_component"}),
+        ("nagent.model.cost_attempts", "counter", "{attempt}",
+         {"gen_ai.operation.name", "nagent.model.billing_provider",
+          "nagent.model.billing_model", "nagent.model.cost_status",
+          "nagent.model.cost_reason"}),
     ]
 
-    def test_seventeen_instruments_declared(self):
-        assert len(ts.INSTRUMENTS) == 17
+    def test_twenty_instruments_declared(self):
+        assert len(ts.INSTRUMENTS) == 20
 
     def test_instruments_match_spec_table(self):
         by_name = {i.name: i for i in ts.INSTRUMENTS.values()}
@@ -219,6 +229,9 @@ class TestInstruments:
         assert ts.INSTRUMENT_MODEL_NORMALIZED == "nagent.model.normalized_tokens"
         assert ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_PROMPT == "nagent.model.cache_eligible_prompt_tokens"
         assert ts.INSTRUMENT_MODEL_CACHE_ELIGIBLE_READ == "nagent.model.cache_eligible_read_tokens"
+        assert ts.INSTRUMENT_MODEL_COST == "nagent.model.cost"
+        assert ts.INSTRUMENT_MODEL_COST_COMPONENTS == "nagent.model.cost_components"
+        assert ts.INSTRUMENT_MODEL_COST_ATTEMPTS == "nagent.model.cost_attempts"
 
 
 # ---------------------------------------------------------------------------
@@ -806,6 +819,12 @@ class TestCardinalityGuard:
         assert ts.map_end_reason("deadline") == "deadline"
         assert ts.map_end_reason("tool_calls") == "tool_calls"
         assert ts.map_end_reason("mystery-end") == "other"
+        # 计费身份维度有自己的有界词汇（provider 固定集合 + other；model 仅
+        # 长度约束，不白名单化——目录 billing_model 是受信开放集合）
+        assert ts.map_billing_provider("openai") == "openai"
+        assert ts.map_billing_provider("weird-provider") == "other"
+        assert ts.map_billing_model("gpt-test") == "gpt-test"
+        assert ts.map_billing_model("m" * 500) == "other"
 
     def test_guard_caps_series_at_1000_per_instrument(self):
         inst = ts.INSTRUMENT_INVOKE_AGENT_DURATION

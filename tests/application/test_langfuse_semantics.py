@@ -186,8 +186,8 @@ def test_model_parameters_and_first_output(spans, stream):
 def test_model_cost_uses_same_attempt_raw_and_independent_buckets(spans):
     telemetry = ts.SemanticsTelemetry()
     calls = []
-    def estimate(raw, model, provider, buckets):
-        calls.append((raw, model, provider, buckets))
+    def estimate(raw, model, provider, buckets, bucket_states):
+        calls.append((raw, model, provider, buckets, bucket_states))
         return {'amount_usd': .001, 'status': 'estimated', 'pricing_version': 'v1'}
     telemetry.set_cost_estimator(estimate)
     with telemetry.begin_chat_attempt(model='actual-model', stream=True, provider='openai') as attempt:
@@ -197,7 +197,8 @@ def test_model_cost_uses_same_attempt_raw_and_independent_buckets(spans):
         attempt.set_cache_usage(cache_read_tokens=2, cache_write_tokens=0)
     attrs = spans.get_finished_spans()[0].attributes
     assert attrs['nagent.model.cost_usd'] == .001
-    assert calls == [({'prompt_tokens': 10, 'prompt_tokens_details': {'cached_tokens': 2}, 'completion_tokens': 4}, 'actual-model', 'openai', (8, 4, 2, 0))]
+    assert attrs['nagent.model.cost_status'] == 'estimated'
+    assert calls == [({'prompt_tokens': 10, 'prompt_tokens_details': {'cached_tokens': 2}, 'completion_tokens': 4}, 'actual-model', 'openai', (8, 4, 2, 0), ('known', 'known', 'known', 'known'))]
 
 @pytest.mark.parametrize('result', [None, {}, {'amount_usd': True, 'status': 'estimated', 'pricing_version': 'v1'}, {'amount_usd': float('nan'), 'status': 'estimated', 'pricing_version': 'v1'}, {'amount_usd': -1, 'status': 'estimated', 'pricing_version': 'v1'}, {'amount_usd': 0, 'status': 'unknown', 'pricing_version': 'v1'}, {'amount_usd': 0, 'status': 'estimated', 'pricing_version': ''}])
 def test_invalid_cost_omitted(spans, result):
@@ -238,5 +239,8 @@ def test_unknown_usage_and_estimation_error_are_isolated(spans):
         with telemetry.begin_chat_attempt(model='actual', stream=False) as attempt:
             attempt.set_usage(1, 2)
             attempt.set_cache_usage(cache_read_tokens=0 if known else None, cache_write_tokens=0)
-    assert len(calls) == 1
+    # T4：finalization 恒定收口成本（桶不完整也调用 estimator，由 raw 视图
+    # 裁决 unknown 原因）；estimator 异常被隔离，不产出成本事实
+    assert len(calls) == 2
     assert all('nagent.model.cost_usd' not in span.attributes for span in spans.get_finished_spans())
+    assert all('nagent.model.cost_status' not in span.attributes for span in spans.get_finished_spans())

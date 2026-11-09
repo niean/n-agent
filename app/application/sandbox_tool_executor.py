@@ -199,7 +199,7 @@ class SandboxToolExecutor:
             if result is None:
                 result = await self._run_sandbox(
                     code, code_hash, session_id, trusted_metadata, request.id,
-                    enabled_tools, grant, budget_reservation,
+                    enabled_tools, grant, budget_reservation, budget_run_id,
                 )
         except Exception as exc:
             # Release budget on any unexpected exception
@@ -264,6 +264,7 @@ class SandboxToolExecutor:
         enabled_tools,
         grant: SandboxExecutionGrant | None = None,
         budget_reservation=None,
+        budget_run_id: str | None = None,
     ) -> ToolResult:
         async with self.sandbox_manager.acquire_session_lock(session_id):
             sandbox = await self.sandbox_manager.get_or_create(

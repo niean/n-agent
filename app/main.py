@@ -8,6 +8,7 @@ import sys
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -91,9 +92,10 @@ from app.application.task_tools import (
     user_task_tool_definitions,
 )
 from app.application.tool_service import ToolService, builtin_tool_definitions, schedule_tool_definitions
-from app.application.usage_service import UsageService
+from app.application.usage_service import UsageService, cache_ttl_facts
 from app.application.vision_tool_executor import VisionAnalyzeToolExecutor
-from app.config import Settings
+from app.config import Settings, parse_model_billing_identity_map
+from app.domain.cost import BUCKETS
 from app.domain.knowledge import KnowledgeBaseType
 from app.domain.llm_policy import LLMConfig, LLMPolicy
 from app.domain.platform import Platform, PlatformDescriptor, PlatformKind, PlatformRegistry
@@ -157,7 +159,8 @@ from app.infrastructure.tools.task_management import TaskManagementToolExecutor
 from app.infrastructure.tools.user_task_management import UserTaskToolExecutor
 from app.infrastructure.task.outbound import TaskOutboundDelivery
 from app.infrastructure.usage.context_breakdown_calculator import ContextBreakdownCalculatorImpl
-from app.infrastructure.usage.pricing_table import InMemoryPricingProvider
+from app.infrastructure.usage.pricing_catalog import JsonPricingCatalog
+from app.infrastructure.usage.pricing_table import CatalogPricingProvider
 from app.infrastructure.usage.sqlite_usage_recorder import SqliteUsageRecorder
 from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
 from app.application.agent_run_service import AgentRunService
@@ -430,14 +433,34 @@ class _BuiltinWebFetcherAdapter:
             return {"status": "error", "error": str(exc)}
 
 
-def _make_provider_factory(settings: Settings, telemetry: Any):
+def _make_provider_factory(settings: Settings, telemetry: Any,
+                           billing_identity_map: Any | None = None):
     """Build the provider factory, binding the chat-attempt telemetry
-    callback (facade method) into every OpenAI-compatible provider."""
+    callback (facade method) into every OpenAI-compatible provider.
+
+    计价身份与 Provider 实例绑定：每个 provider 实例由其配置在工厂期绑定
+    自己的身份解析闭包（(配置 ID, 请求模型) -> 受信身份），观测侧 ChatAttempt
+    经该闭包冻结的身份永远对应实际服务请求的实例——即使实例选定与迭代消费
+    之间发生 active provider 热切换（并发隔离，身份不读切换后的当前配置）。
+    """
     from app.application.telemetry_semantics import register_model_name
 
     telemetry_callback = (
         telemetry.begin_chat_attempt if settings.otel_enabled else None
     )
+
+    def _bind_instance_identity(config_id: str):
+        """返回绑定到该 provider 实例配置的遥测回调包装：attempt 的身份
+        解析器按本实例的配置 ID 在受信映射中精确查找，不接受调用方覆盖。"""
+        def callback(*, model, stream, provider):
+            return telemetry.begin_chat_attempt(
+                model=model, stream=stream, provider=provider,
+                billing_identity_resolver=(
+                    lambda requested_model, _provider:
+                    billing_identity_map.get((config_id, requested_model))
+                ),
+            )
+        return callback
 
     def _provider_factory(cfg: ProviderConfig, api_key: str):
         # Bounded registrar: the configured model becomes an allowed value so
@@ -447,15 +470,20 @@ def _make_provider_factory(settings: Settings, telemetry: Any):
             register_model_name(cfg.model)
         except Exception:  # observability-only, never affects business
             pass
+        instance_callback = telemetry_callback
+        # 仅在受信身份映射实际配置时绑定实例级解析器；空映射保持直连回调
+        # （空映射查询恒 None，与全局 resolver 收口行为一致，不改变既有接线契约）
+        if telemetry_callback is not None and billing_identity_map:
+            instance_callback = _bind_instance_identity(cfg.id)
         if cfg.provider_type == "openai-compatible":
             return OpenAICompatibleProvider(
                 cfg.base_url, api_key, cfg.model,
-                telemetry_callback=telemetry_callback,
+                telemetry_callback=instance_callback,
             )
         if cfg.provider_type == "anthropic":
             return AnthropicProvider(
                 cfg.base_url, api_key, cfg.model, cfg.extra_headers,
-                telemetry_callback=telemetry_callback,
+                telemetry_callback=instance_callback,
             )
         raise RuntimeError(f"unsupported provider_type: {cfg.provider_type}")
 
@@ -660,6 +688,45 @@ def _validate_host_terminal_host_mapping(
         raise ValueError("host_terminal_host_mapping_invalid")
 
 
+def _attempt_cost_result(
+    *,
+    status: str,
+    reason: str | None,
+    pricing_version: str | None = None,
+    price_id: str | None = None,
+    amount_usd: float = 0.0,
+    cost_decimal: str | None = None,
+    components: dict | None = None,
+    identity: tuple[str, str] | None = None,
+) -> dict:
+    """AttemptCost 的观测结果 dict（T4 扩展契约，老键语义不变）。
+
+    unknown 沿用旧 0.0 金额占位（观测侧不消费该占位）；estimated 由调用方
+    覆盖 amount_usd/cost_decimal/components。currency 固定 USD（Domain 不变量）；
+    受信计费身份（已知时）随结果携带，供观测出口做安全投影。
+    """
+    return {
+        "amount_usd": amount_usd,
+        "status": status,
+        "pricing_version": pricing_version,
+        "price_id": price_id,
+        "cost_decimal": cost_decimal,
+        "components": components,
+        "currency": "USD",
+        "reason": reason,
+        "billing_provider": identity[0] if identity else None,
+        "billing_model": identity[1] if identity else None,
+    }
+
+
+def _canonical_decimal_string(value) -> str:
+    """规范十进制字符串（无指数、无冗余尾零），供 cost_decimal 三后端逐字节
+    一致。金额已通过 double 可表示性判定（有效数字有限，局部高精度安全）。"""
+    with localcontext() as ctx:
+        ctx.prec = 60
+        return format(Decimal(value).normalize(), "f")
+
+
 def build_application_services(
     settings: Settings | None = None, *, observability_handle: Any = None
 ) -> ApplicationServices:
@@ -671,7 +738,9 @@ def build_application_services(
 
         _configure_execution_logging()
         observability_handle = configure_observability(settings)
-    from app.application.telemetry_semantics import NoopTelemetry, SemanticsTelemetry
+    from app.application.telemetry_semantics import (
+        NoopTelemetry, SemanticsTelemetry, _BILLING_IDENTITY_UNSET,
+    )
 
     telemetry = SemanticsTelemetry() if settings.otel_enabled else NoopTelemetry()
     if settings.otel_enabled:
@@ -723,7 +792,15 @@ def build_application_services(
     summarizer = HeuristicSummarizer()
     registry = SQLiteProviderRegistry(settings.sqlite_path)
     gateway_registry = SQLiteGatewaySessionRegistry(settings.sqlite_path)
-    holder = ActiveProviderHolder(_make_provider_factory(settings, telemetry))
+    # 受信计价身份映射：启动期解析一次，同时注入 holder（账本侧实例选择期
+    # 解析）与 provider 工厂（观测侧身份与实例绑定），两条路径同源
+    billing_identity_map = parse_model_billing_identity_map(
+        settings.model_billing_identity_map
+    )
+    holder = ActiveProviderHolder(
+        _make_provider_factory(settings, telemetry, billing_identity_map),
+        billing_identity_map=billing_identity_map,
+    )
     _run_sync(_seed_and_activate(registry, holder, settings))
     provider_service = ProviderService(registry, holder)
     builtin_executor = build_builtin_tool_executor(
@@ -1163,33 +1240,105 @@ def build_application_services(
     # SQLiteMemoryStore.initialize() runs in its __init__.
     usage_recorder = SqliteUsageRecorder(str(settings.sqlite_path))
     _run_sync(usage_recorder.init())
+    # 版本化价格目录：启动期加载一次；未配置或失效时业务继续、成本按
+    # pricing_unavailable 处理。同一实例注入 UsageService 与 estimator 闭包。
+    pricing_catalog = JsonPricingCatalog.load(
+        settings.pricing_catalog_path, settings.pricing_catalog_expected_sha256
+    )
     usage_service = UsageService(
         usage_recorder,
-        InMemoryPricingProvider(),
+        CatalogPricingProvider(pricing_catalog),
         ContextBreakdownCalculatorImpl(),
+        pricing_catalog=pricing_catalog,
+        billing_identity_resolver=lambda model, provider: holder.billing_identity(model),
     )
-    def estimate_attempt_cost(raw_usage, model, provider, buckets):
-        """Price confirmed buckets from this attempt without writing the ledger."""
-        if provider == 'anthropic':
-            required = [raw_usage.get(key) for key in (
-                'input_tokens', 'output_tokens', 'cache_read_input_tokens',
-                'cache_creation_input_tokens')]
+    def estimate_attempt_cost(raw_usage, model, provider, buckets, bucket_states=None,
+                              billing_identity=_BILLING_IDENTITY_UNSET):
+        """Price confirmed buckets from this attempt without writing the ledger.
+
+        受信计价身份由 ChatAttempt 在请求启动时冻结并随本次尝试传入
+        （billing_identity 参数）；finalization 不再读取切换后的当前配置，
+        在飞请求不受 provider 运行时切换影响（并发隔离）。启动时未解析的
+        身份冻结为 None，此后即使映射可匹配也不追溯解析。仅旧调用契约
+        （未经 __enter__ 的直接调用，哨兵缺省）保留收口时解析。Provider
+        适配器、请求 options、URL 与响应模型不能覆盖。原始 usage 已知性由
+        UsageService 保留（字段缺席与存在但非法区分），判定顺序与原因归口
+        Domain 纯计算器。ChatAttempt 桶状态（T4）：invalid（曾非法且未恢复）
+        按 T1 顺序在计价前收口为 invalid_usage；known 桶必须与 raw 视图逐值
+        一致，不一致拒绝计价（保持旧 None 契约）；unknown 桶交给 raw 视图
+        裁决。Anthropic cache TTL 拆分事实经与账本路径共用的
+        cache_ttl_facts 透传为条件事实。结果 dict 携带成本完整事实（向后
+        兼容：老键语义不变，unknown 沿用 0.0 占位、观测侧不消费）。
+        """
+        if not isinstance(raw_usage, dict) or len(buckets) != len(BUCKETS):
+            return None
+        if bucket_states is not None and len(bucket_states) != len(BUCKETS):
+            return None
+        attempt_usage = usage_service.attempt_usage_from_raw(raw_usage, provider)
+        if billing_identity is _BILLING_IDENTITY_UNSET:
+            # 旧调用契约：身份未冻结，收口时从 holder 解析（保持原语义）
+            identity = holder.billing_identity(model)
         else:
-            required = [raw_usage.get('prompt_tokens'), raw_usage.get('completion_tokens'),
-                        (raw_usage.get('prompt_tokens_details') or {}).get('cached_tokens')]
-        if not all(type(value) is int and value >= 0 for value in (*required, *buckets)):
-            return None
-        usage = usage_service.normalize_usage(raw_usage, provider)
-        normalized = (usage.input_tokens, usage.output_tokens,
-                      usage.cache_read_tokens, usage.cache_write_tokens)
-        if usage.request_count != 1 or normalized != buckets:
-            return None
-        cost = usage_service.estimate_cost(usage, model, provider)
+            # 请求启动时冻结的受信身份（None=启动时未解析，不追溯）
+            identity = billing_identity
+        if identity is None:
+            return _attempt_cost_result(status="unknown", reason="identity_unresolved")
+        if bucket_states is None:
+            # 旧调用契约：由确认桶取值派生状态（None=未知，合法计数=known）
+            bucket_states = tuple(
+                "known" if type(value) is int and value >= 0
+                else "invalid" if value is not None else "unknown"
+                for value in buckets
+            )
+        invalid = False
+        for bucket, confirmed, state in zip(BUCKETS, buckets, bucket_states):
+            token_value = attempt_usage.buckets[bucket]
+            if token_value.kind == "not_applicable":
+                continue
+            if state == "invalid":
+                invalid = True
+                continue
+            if state == "known" and (token_value.kind != "known" or token_value.value != confirmed):
+                return None
+        if invalid:
+            return _attempt_cost_result(
+                status="unknown", reason="invalid_usage", identity=identity,
+                pricing_version=pricing_catalog.pricing_version)
+        # TTL 条件事实与计价入口与账本路径共用（usage_service.cache_ttl_facts
+        # + calculate_attempt_cost），两条路径对同一响应产出同一结论；混合
+        # 合法 TTL 由 cache_ttl_facts 返回 CACHE_TTL_UNSUPPORTED 哨兵并在
+        # calculate_attempt_cost 内于目录价格匹配前收口 unsupported_pricing
+        # （无条件条目不可达）
+        facts = cache_ttl_facts(raw_usage)
+        cost = usage_service.calculate_attempt_cost(attempt_usage, identity, facts)
+        if cost.status != "estimated":
+            # unknown 结果按旧观测契约只回 status；金额占位不再被视为已知
+            # 成本（观测侧不消费该占位）。目录加载成功的 unknown 保留版本，
+            # 目录失效（版本为 None）时省略。唯一命中价格项后的 unknown 保留
+            # price_id（spec：未定位到价格项的 unknown 不携带）。
+            return _attempt_cost_result(
+                status="unknown", reason=cost.reason.value, identity=identity,
+                pricing_version=cost.pricing_version or pricing_catalog.pricing_version,
+                price_id=cost.price_id)
         # Decimal/string conversion belongs at the business composition boundary.
-        return dict(amount_usd=float(cost.amount_usd), status=cost.status,
-                    pricing_version=cost.pricing_version)
+        return {
+            "amount_usd": float(cost.amount_usd),
+            "status": "estimated",
+            "pricing_version": cost.pricing_version,
+            "price_id": cost.price_id,
+            "cost_decimal": _canonical_decimal_string(cost.amount_usd),
+            "components": {bucket: float(value) for bucket, value in cost.components.items()},
+            "currency": cost.currency,
+            "reason": None,
+            "billing_provider": identity[0],
+            "billing_model": identity[1],
+        }
 
     telemetry.set_cost_estimator(estimate_attempt_cost)
+    # 受信计价身份解析器：ChatAttempt 在请求启动时经此冻结身份并在飞携带，
+    # finalization 不重读 holder（运行时 provider 切换的并发隔离）
+    telemetry.set_billing_identity_resolver(
+        lambda model, provider: holder.billing_identity(model))
     # information_flow_service and budget_service are created earlier (before ToolService)
     # so they can be wired into ToolService for封口 enforcement.
     llm_policy = LLMPolicy()

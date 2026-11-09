@@ -819,6 +819,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 教训：区分未知、不适用与已知零；跨 Span 和 Metric 的派生准入须覆盖真实 adapter 输出，并对账同一实例的原始 Counter 增量及同一批 Trace。OpenAI 命中率分母 Ti+Tic 兼容显式0和旧调用缺席，不能把无计数器当作零流量或查询误差。
 - 来源：2026-11-08 OTel/Langfuse 一致性核验；原始快照见 locals/e2e-reports/metrics-consistency-261108/，4个回归组合先红后绿。
 
+### P092: 模型展示不能被归一化响应别名覆盖
+
+- 现象：Langfuse cost 按模型仅显示 bge-m3 与 other，ark-code-latest 请求的费用落入 other。
+- 根因：telemetry_semantics 将未登记响应别名归一为 other；Collector 先写请求模型、再无条件写响应模型，覆盖已识别的请求展示名。费用及受信计价身份本身正确。
+- 教训：请求模型、响应模型和计价身份分开保留；展示优先已识别请求名，响应仅兜底，不让占位值覆盖有意义的身份。按实际存储版本查询 events_full，而非仅检查旧 observations 表。
+- 来源：2026-11-10 会话 dashboard-dc8379ed-599b-44ef-9524-e4ecd1127ed4；四个真实 GENERATION 与 Collector 回归测试先红后绿。
+
 ### P091: E2E清理须用真实HTTP形状验证中断路径
 
 - 现象：正常calculator对账会话均已删除，运行中断时清理却报ValueError，活动Run未立即取消。

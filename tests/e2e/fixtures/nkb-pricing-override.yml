@@ -1,0 +1,15 @@
+# E2E 测试价格目录 override（T8 联合验收专用）。
+# 仅在 E2E 部署 n-kb 时以
+#   docker compose -f docker-compose.yml -f <本文件> up -d n-kb
+# 方式叠加；默认部署（不带本 override）仍使用出厂空目录
+# /etc/n-kb/model-pricing.json（哈希 3c73291e...，prices: []）。
+# 目录文件来自 N-Agent 相邻仓的 E2E fixture（content_version=e2e-test-261109），
+# 与 N-Agent 服务注入的测试目录同文件同哈希；宿主路径可用
+# E2E_PRICING_CATALOG_HOST_PATH 覆盖（相对路径按 compose 项目目录 n-kb/docker 解析）。
+services:
+  n-kb:
+    environment:
+      N_KB_PRICING_CATALOG_PATH: /etc/n-kb/model-pricing-e2e.json
+      N_KB_PRICING_CATALOG_EXPECTED_SHA256: "1536ca56d137af4f903d3ca43b589e986cfddfb3395a2e0a357d537bdb40c758"
+    volumes:
+      - ${E2E_PRICING_CATALOG_HOST_PATH:-../../n-agent/tests/e2e/fixtures/model-pricing-e2e.json}:/etc/n-kb/model-pricing-e2e.json:ro

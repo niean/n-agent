@@ -225,12 +225,36 @@ def _report_anthropic_usage(attempt: Any, usage: Any) -> None:
     value and invalid components are dropped here (strict validation, no
     implicit conversion). Extraction or hook failures never change business.
 
+    The raw usage channel preserves field presence faithfully: a key is only
+    submitted when the field exists in the response, and an existing but
+    invalid value is passed through as-is (the attempt judges validity --
+    presence-with-invalid is never conflated with absence).
+
     Streaming note: message_delta usage usually only carries the cumulative
     output_tokens (cache buckets arrive on message_start) -- passing None for
     missing fields relies on the attempt's no-erase semantics.
     """
     try:
-        optional_hook(attempt, "set_raw_usage", {key: _get(usage, key) for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")})
+        raw: dict[str, Any] = {}
+        for key in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                    "cache_creation_input_tokens"):
+            value = _get(usage, key)
+            if value is not None:
+                raw[key] = value
+        # cache TTL 拆分事实（presence 保留）：组合根据此派生条件计价的
+        # cache_ttl 事实。子字段存在但非法时由 attempt 侧将 cache_write 桶
+        # 标记为曾非法（最终收口为 invalid_usage，而非退化成缺失事实的
+        # unsupported_pricing）；非法值不进入累计视图，已保留的合法值不擦除，
+        # 后续合法值按 no-erase 规则恢复桶有效性。
+        creation = _get(usage, "cache_creation")
+        if creation is not None:
+            breakdown: dict[str, Any] = {}
+            for ttl_key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"):
+                value = _get(creation, ttl_key)
+                if value is not None:
+                    breakdown[ttl_key] = value
+            raw["cache_creation"] = breakdown
+        optional_hook(attempt, "set_raw_usage", raw)
         ti = _get(usage, "input_tokens")
         to = _get(usage, "output_tokens")
         tic = _get(usage, "cache_read_input_tokens")

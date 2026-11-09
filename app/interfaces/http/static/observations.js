@@ -65,6 +65,25 @@
     return '$' + n.toFixed(6);
   }
 
+  const COST_AGGREGATE_NOTE = '仅累计已知估算费用，未知费用未计入；零值不代表全部调用免费';
+
+  // 展示守卫：只接受非空十进制数值字符串或有限非负 number；其余一律显示
+  // 未知。账本累计金额只含 estimated 部分，缺失/非法不得伪装成 $0。
+  function formatDisplayCost(value) {
+    let n;
+    if (typeof value === 'number') {
+      n = value;
+    } else if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed || !/^\d+(\.\d+)?([eE][+-]?\d+)?$/.test(trimmed)) return '未知';
+      n = Number(trimmed);
+    } else {
+      return '未知';
+    }
+    if (!isFinite(n) || n < 0) return '未知';
+    return formatCost(n);
+  }
+
   function formatPercent(part, total) {
     if (!total || total <= 0) return '0%';
     const pct = (part / total) * 100;
@@ -196,6 +215,7 @@
       { label: '缓存写', value: formatNumber(stats.cache_write_tokens) },
       { label: '缓存命中率', value: formatCacheHitRate(stats) },
       { label: '归一化 Token', value: formatNumber(stats.normalized_tokens) },
+      { label: '费用', value: formatDisplayCost(stats.estimated_cost_usd), title: COST_AGGREGATE_NOTE },
       { label: 'API 调用数', value: formatNumber(stats.api_call_count) },
     ];
     cards.forEach((c) => {
@@ -205,6 +225,7 @@
       const label = ui.el('div', 'stat-card__label');
       label.textContent = c.label;
       card.append(value, label);
+      if (c.title) card.title = c.title;
       bar.appendChild(card);
     });
     body.appendChild(bar);
@@ -237,9 +258,11 @@
     const table = ui.el('table', 'document-table');
     const thead = ui.el('thead');
     const trh = ui.el('tr');
-    ['标题', '来源', 'ID', '对话轮数', 'API 调用', '归一化 Token', '操作'].forEach((h) => {
-      if (h === '对话轮数' || h === 'API 调用' || h === '归一化 Token') appendNumericHeaderCell(trh, h);
-      else appendHeaderCell(trh, h);
+    ['标题', '来源', 'ID', '对话轮数', 'API 调用', '归一化 Token', '费用', '操作'].forEach((h) => {
+      const th = (h === '对话轮数' || h === 'API 调用' || h === '归一化 Token' || h === '费用')
+        ? appendNumericHeaderCell(trh, h)
+        : appendHeaderCell(trh, h);
+      if (h === '费用') th.title = COST_AGGREGATE_NOTE;
     });
     thead.appendChild(trh);
     table.appendChild(thead);
@@ -260,6 +283,9 @@
       appendNumericCell(tr, formatNumber(s.turn_count));
       const apiTd = appendNumericCell(tr, formatNumber(s.api_call_count));
       const normTd = appendNumericCell(tr, formatNumber(s.normalized_tokens));
+      // 会话级 cost_status 只反映末次尝试，estimated_cost_usd 是累计已知金额，
+      // 列展示不做状态门控（缺失/非法由 formatDisplayCost 显示未知）。
+      appendNumericCell(tr, formatDisplayCost(s.estimated_cost_usd));
       const actionTd = ui.el('td');
       actionTd.style.textAlign = 'center';
       const detailBtn = ui.el('button', 'btn btn--primary');
@@ -328,6 +354,7 @@
       { label: '缓存写', value: formatNumber(stats.cache_write_tokens) },
       { label: '缓存命中率', value: formatCacheHitRate(stats) },
       { label: '归一化 Token', value: formatNumber(stats.normalized_tokens) },
+      { label: '费用', value: formatDisplayCost(stats.estimated_cost_usd), title: COST_AGGREGATE_NOTE },
       { label: 'API 调用数', value: formatNumber(stats.api_call_count) },
     ];
     cards.forEach((c) => {
@@ -337,6 +364,7 @@
       const label = ui.el('div', 'stat-card__label');
       label.textContent = c.label;
       card.append(value, label);
+      if (c.title) card.title = c.title;
       bar.appendChild(card);
     });
     body.appendChild(bar);
@@ -624,8 +652,8 @@
       const table = ui.el('table', 'document-table');
       const thead = ui.el('thead');
       const trh = ui.el('tr');
-      ['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)', '操作'].forEach((h) => {
-        if (['输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)'].includes(h)) appendNumericHeaderCell(trh, h);
+      ['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '费用', '延迟(ms)', '操作'].forEach((h) => {
+        if (['输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '费用', '延迟(ms)'].includes(h)) appendNumericHeaderCell(trh, h);
         else appendHeaderCell(trh, h);
       });
       thead.appendChild(trh);
@@ -662,6 +690,7 @@
           formatNumber(r.cache_write_tokens),
           formatCacheHitRate(r),
           formatNumber(r.normalized_tokens),
+          (r.cost_status === 'estimated' ? formatDisplayCost(r.estimated_cost_usd) : '未知'),
           r.latency_ms != null ? formatNumber(r.latency_ms) : '-',
         ].forEach((c) => {
           appendNumericCell(tr, c);

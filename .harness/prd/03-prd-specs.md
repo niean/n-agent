@@ -120,13 +120,19 @@
 - FR
     - 成本：补全Langfuse中的cost分析。补全N-Agent/N-KB在Langfuse中的cost分析，服务端统一计价，经OTel同源分发到Langfuse和现有观测栈。
         - spec: spec-261109-model-cost-observability.md
+        - 迭代：Dashboard 会话-观测页，增加费用cost统计，包括整体概览、会话列表(在`归一化 Token`后新增`费用`列)；观测-会话页，也新增费用cost统计，包括会话总览、API 调用历史(在`归一化`后新增`费用`列)。FE样式，要严格遵循项目规范，相同组件Follow现有样式
+
+[20261110]
+- FR
+    - 评测：[KF]建立evaluation子域，统一执行评估、管理版本和保存结果。补全N-Agent/N-KB在Langfuse中的score分析，是否需要N-Agent具备正式的evaluate能力、还是托管到Langfuse？是否需要服务端统一评估分数，经OTel同源分发到Langfuse和现有观测栈？我希望实现一套符合业界标准的evaluate方案
+        - spec: spec-261109-design-evaluation.md
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - FR
-    - 评测：补全Langfuse中的score分析。补全N-Agent/N-KB在Langfuse中的score分析，是否对应正式的evaluate能力？服务端统一评估分数，经OTel同源分发到Langfuse和现有观测栈，帮我做正式的设计spec
+    - 架构：定义应用Runtime SPI和语义标准，让Agent应用可以自由切换Runtime、无需修改业务代码。借鉴Claude Managed Agents的解耦思路，分离Session、Harness与Sandbox，用户拥有Session数据权限，Agent团队负责Harness，执行环境团队负责Sandbox，业务团队则只需专注于Agent应用逻辑
     - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离
     - 任务：持久化执行环境，让任务拥有快照、可恢复(如执行`sh docker/restart.sh`后自动恢复)
@@ -138,7 +144,9 @@
     - 产品：对标DSH，发现值得参考的技术架构、产品功能
     - 调度：支持MoA
 - HE
-    - HE：三方审阅，从直接修改、改为给出建议，从而解耦
+    - HE：三方审阅，在spec/plan基础上，增加代码Diff审阅
+        - 代码审阅：审阅本次修改的代码Diff，重点检查①架构和代码遵循项目规范、②功能符合spec/plan定义，最多列出10个问题。=> 将代码Diff审阅抽象为独立Skill，可组合到工作流Phase，约定好审阅输入参数(如变更的文件)，约定审阅结果的目录(./codes/)、文件(follow spec/plan)、内容格式规范；负责审阅的Provider产出意见，但不直接修改
+    - HE：三方审阅，spec/plan审阅从直接修改、改为给出建议，从而保留现场和解耦
     - HE：VSCode+插件模式，补全Token观测
     - HE：三方审阅，结果存储纳入Harness流程规范，如放到specs/third/目录下
     - HE：阶段结果，未及时同步到Multica

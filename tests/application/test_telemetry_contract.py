@@ -229,6 +229,56 @@ def test_model_instruments_include_cache_and_normalized():
         assert name in model_insts
 
 
+def test_model_cost_attributes_registered():
+    """T4：成本属性键登记进 OBJECT_ATTRIBUTES['model'] / 类型表，金额分项
+    与 cost_usd 同款 number 守卫。"""
+    from app.application import telemetry_contract as tc
+    for field in ('cost_status', 'cost_reason', 'cost_currency', 'cost_decimal',
+                  'cost_input_usd', 'cost_output_usd', 'cost_cache_read_usd',
+                  'cost_cache_write_usd', 'price_id', 'billing_provider', 'billing_model'):
+        assert f'nagent.model.{field}' in tc.EXECUTION_ATTRIBUTE_KEYS, field
+        assert field in tc.OBJECT_ATTRIBUTES['model'], field
+    assert tc.ATTRIBUTE_TYPES['nagent.model.cost_status'] == 'string'
+    assert tc.ATTRIBUTE_TYPES['nagent.model.cost_reason'] == 'string'
+    assert tc.ATTRIBUTE_TYPES['nagent.model.cost_decimal'] == 'string'
+    assert tc.ATTRIBUTE_TYPES['nagent.model.price_id'] == 'string'
+    assert tc.ATTRIBUTE_TYPES['nagent.model.billing_provider'] == 'string'
+    assert tc.ATTRIBUTE_TYPES['nagent.model.billing_model'] == 'string'
+    for field in ('cost_input_usd', 'cost_output_usd', 'cost_cache_read_usd', 'cost_cache_write_usd'):
+        assert tc.ATTRIBUTE_TYPES[f'nagent.model.{field}'] == 'number', field
+
+
+def test_model_instruments_include_cost_counters():
+    from app.application import telemetry_contract as tc
+    model_insts = tc._instruments['model']
+    for name in ('nagent.model.cost', 'nagent.model.cost_components', 'nagent.model.cost_attempts'):
+        assert name in model_insts
+
+
+def test_cost_sentinel_attributes_never_pass_whitelist():
+    """哨兵：伪造 langfuse.* 属性、未知 metadata、错误类型属性不能通过白名单；
+    合法成本键保留且类型不符时丢弃。"""
+    from app.application.telemetry_contract import project_execution_attributes
+    attrs = project_execution_attributes({
+        'operation': 'chat',
+        'langfuse.observation.model.name': 'gpt-4o',
+        'langfuse.metadata.injected': 'payload',
+        'metadata': {'evil': 1},
+        'nagent.model.free_text': 'injected',
+        'nagent.model.cost_status': 'estimated',
+        'nagent.model.cost_reason': 7,
+        'nagent.model.cost_usd': '0.1',
+        'nagent.model.cost_decimal': 0.5,
+        'nagent.model.billing_provider': 3,
+    })
+    assert attrs['nagent.model.cost_status'] == 'estimated'
+    for key in ('langfuse.observation.model.name', 'langfuse.metadata.injected',
+                'metadata', 'nagent.model.free_text', 'nagent.model.cost_reason',
+                'nagent.model.cost_usd', 'nagent.model.cost_decimal',
+                'nagent.model.billing_provider'):
+        assert key not in attrs
+
+
 def test_unknown_operation_keeps_completion_log(monkeypatch):
     logs = []
     monkeypatch.setattr(ts.logger, 'info', lambda _: logs.append(ts.execution_log_snapshot()))

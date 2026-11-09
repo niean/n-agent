@@ -449,8 +449,11 @@ async def test_budget_reserve_settle_wraps_sandbox_execution(tmp_path: Path):
     # After settle, the budget state should reflect actual usage
     state = budget_service.get_state("s1")
     assert state is not None
-    # sandbox_seconds_reserved should be the actual duration (0.01s from _success_result)
-    assert state.sandbox_seconds_reserved >= 0
+    # Reserved estimate was max_seconds=30 (sandbox_timeout_seconds) and
+    # max_callback_calls=50; settle must adjust them to the actual usage
+    # (duration_seconds=0.01, tool_calls_made=0 from _success_result).
+    assert state.sandbox_seconds_reserved == pytest.approx(0.01)
+    assert state.sandbox_callback_calls_reserved == 0
 
 
 @pytest.mark.asyncio

@@ -56,6 +56,7 @@ class FakeUsageService:
         response_message: str | None = None,
         tools: str | None = None,
         generation_params: str | None = None,
+        billing_identity=None,
     ) -> None:
         self.record_calls.append({
             "session_id": session_id,
@@ -70,6 +71,7 @@ class FakeUsageService:
             "response_message": response_message,
             "tools": tools,
             "generation_params": generation_params,
+            "billing_identity": billing_identity,
         })
 
     async def record_compression(
@@ -106,6 +108,50 @@ class FakeContextEngine:
 
     async def compress(self, messages, *, current_tokens=None, force=False, existing_summary=""):
         return self._result
+
+
+@pytest.mark.asyncio
+async def test_call_llm_passes_attempt_frozen_billing_identity_to_ledger(tmp_path):
+    """账本路径使用尝试冻结身份：graph 必须把 LLMResult 上实例选择期冻结的
+    billing_identity 透传给 record_call，不得让账本在记录时重读当前配置
+    （同一调用使用同一计价结果）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="sess-frozen-identity"))
+
+    usage_dict = {"prompt_tokens": 150, "completion_tokens": 20,
+                  "prompt_tokens_details": {"cached_tokens": 50}}
+    provider = UsageCapturingProvider(usage=usage_dict)
+
+    async def chat_with_identity(messages, tools, stream, model, options):
+        provider.call_count += 1
+        provider.last_model = model
+        return LLMResult(
+            message={"role": "assistant", "content": "ok"},
+            finish_reason="stop",
+            usage=dict(usage_dict),
+            raw=None,
+            billing_identity=("openai", "gpt-test"),
+        )
+
+    provider.chat = chat_with_identity  # type: ignore[method-assign]
+    usage_service = FakeUsageService()
+    runner = AgentGraphRunner(
+        llm_provider=provider,
+        tool_service=ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        memory_store=store,
+        summarizer=HeuristicSummarizer(),
+        usage_service=usage_service,
+    )
+    state = AgentState(
+        session_id="sess-frozen-identity",
+        input_messages=[{"role": "user", "content": "hi"}],
+        working_messages=[{"role": "user", "content": "hi"}],
+    )
+    await runner.call_llm(state)
+    assert len(usage_service.record_calls) == 1
+    call = usage_service.record_calls[0]
+    # 账本收到实例选择期冻结的受信身份
+    assert call["billing_identity"] == ("openai", "gpt-test")
 
 
 @pytest.mark.asyncio

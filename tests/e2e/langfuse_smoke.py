@@ -139,6 +139,10 @@ def synthetic_payload():
           'nagent.model.parameter.temperature':0.25,'nagent.model.parameter.presence_penalty':-1,
           'nagent.model.completion_start_time':datetime.fromtimestamp(now/1e9,timezone.utc).isoformat().replace('+00:00','Z'),
           'nagent.model.cost_usd':0.125,'nagent.model.cost_status':'estimated','nagent.model.pricing_version':'e2e-v1',
+          'nagent.model.cost_currency':'USD',
+          'nagent.model.cost_decimal':'0.125','nagent.model.price_id':'e2e-price','nagent.model.billing_provider':'openai',
+          'nagent.model.billing_model':'e2e-model','nagent.model.cost_input_usd':0.05,'nagent.model.cost_output_usd':0.05,
+          'nagent.model.cost_cache_read_usd':0.025,
           'nagent.content.system_prompt':'safe policy','nagent.content.tool_definitions':'safe tool schema',
           'nagent.content.input_messages':'short exact input','nagent.content.output_messages':'short exact output'}),
         ('execute_tool', {'nagent.tool.executed':False,'nagent.tool.policy_outcome':'deny','nagent.tool.outcome':'denied',
@@ -199,6 +203,13 @@ def kb_synthetic_payload():
     legal_event={'name':'nkb.index.completed','timeUnixNano':str(now),
         'attributes':[attr('nkb.index.outcome','success'),attr('unknown.event',sentinels[7]),
                       attr('error.type','SQLinjection-evil')]}
+    def cost_group(amount, decimal):
+        """T5 合法 estimated 成本组：金额、decimal 与受信计费身份齐全。"""
+        return {'nkb.model.cost_status':'estimated','nkb.model.cost_currency':'USD',
+                'nkb.model.cost_usd':amount,'nkb.model.cost_input_usd':amount,
+                'nkb.model.cost_decimal':decimal,'nkb.model.pricing_version':'e2e-kb-v1',
+                'nkb.model.price_id':'e2e-embed-price','nkb.model.billing_provider':'ollama',
+                'nkb.model.billing_model':'e2e-embed-model'}
     trace_spans=[
       # Global-root index.run: chain with observation and trace bodies.
       span(trace,1,{'nkb.index.operation':'run','nkb.index.outcome':'success','nkb.index.duration_ms':12.5,
@@ -209,12 +220,15 @@ def kb_synthetic_payload():
       # Generation with known usage, no completeness metadata on the input.
       span(trace,3,{'gen_ai.operation.name':'embeddings','nkb.model.usage_known':True,'gen_ai.usage.input_tokens':5,
         'gen_ai.request.model':'e2e-embed-model','gen_ai.provider.name':'ollama',
+        **cost_group(0.125,'0.125'),
         **content('embedding_input','kb embed prefix',meta=False)},parent=f'{1:016x}'),
       # A real zero must survive; an unknown count must be omitted entirely.
       span(trace,4,{'gen_ai.operation.name':'embeddings','nkb.model.usage_known':True,'gen_ai.usage.input_tokens':0,
-        'gen_ai.request.model':'e2e-embed-model'},parent=f'{1:016x}'),
+        'gen_ai.request.model':'e2e-embed-model',**cost_group(0,'0')},parent=f'{1:016x}'),
+      # unknown 组：受控 reason、无金额，model.name 不得投影（阻断自动推价）。
       span(trace,5,{'gen_ai.operation.name':'embeddings','nkb.model.usage_known':False,
-        'gen_ai.request.model':'e2e-embed-model'},parent=f'{1:016x}'),
+        'gen_ai.request.model':'e2e-embed-model','nkb.model.cost_status':'unknown',
+        'nkb.model.cost_reason':'missing_usage'},parent=f'{1:016x}'),
       # Unregistered operations fall back to a plain span with no body.
       span(trace,6,{'nkb.mcp.operation':'status','nkb.mcp.outcome':'success'},parent=f'{1:016x}'),
       # Content for an operation that never opens it must be deleted, not projected.
@@ -386,11 +400,22 @@ def assert_kb_projection(rows,remote,expected):
     assert embedding['input']==expected['embedding_input'] and embedding.get('output') is None
     assert embedding['usageDetails']=={'input':5,'total':5}
     assert embedding['model']==expected['model']
+    # T5 成本组：estimated 组投影 cost_details 单 input 分项与受控 metadata。
+    assert embedding['costDetails']=={'input':0.125,'total':0.125}
+    for key,value in (('nkb.model.cost_status','estimated'),('nkb.model.cost_currency','USD'),
+                      ('nkb.model.pricing_version','e2e-kb-v1'),('nkb.model.price_id','e2e-embed-price'),
+                      ('nkb.model.billing_provider','ollama'),('nkb.model.billing_model','e2e-embed-model')):
+        assert embedding['metadata'][key]==value
+    assert 'nkb.model.cost_usd' not in embedding['metadata']
     zero=by_id[f'{4:016x}']
     assert zero['usageDetails']=={'input':0,'total':0}
+    assert zero['costDetails']=={'input':0,'total':0}
     unknown=by_id[f'{5:016x}']
     assert not unknown.get('usageDetails') and unknown.get('input') is None
-    assert unknown['model']==expected['model']
+    # unknown 组阻断自动推价：model 不投影，受控 reason 进 metadata。
+    assert unknown.get('model') is None
+    assert unknown['metadata']['nkb.model.cost_status']=='unknown'
+    assert unknown['metadata']['nkb.model.cost_reason']=='missing_usage'
     for i in (6,7,8):
         row=by_id[f'{i:016x}']
         assert row['type']=='SPAN' and row['name']=='span'

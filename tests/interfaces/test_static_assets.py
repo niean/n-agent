@@ -627,7 +627,7 @@ def test_observations_cache_metrics_split_read_and_write(tmp_path):
     assert 'function formatCacheHitRate(item)' in observations_js
     assert 'return formatPercent(read, input + read + write)' in observations_js
     assert "{ label: '缓存读', value: formatNumber(stats.cache_read_tokens) },\n      { label: '缓存写', value: formatNumber(stats.cache_write_tokens) }" in observations_js
-    assert "['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)', '操作']" in observations_js
+    assert "['时间', '模型', '调起类型', '输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '费用', '延迟(ms)', '操作']" in observations_js
     assert "formatNumber(r.cache_read_tokens),\n          formatNumber(r.cache_write_tokens),\n          formatCacheHitRate(r)" in observations_js
     assert '缓存 Token' not in observations_js
 
@@ -644,8 +644,8 @@ def test_fe_list_numeric_columns_are_right_aligned_and_grouped(tmp_path):
     assert "return n.toLocaleString()" in observations_js
     assert "function appendNumericHeaderCell(row, label)" in observations_js
     assert "function appendNumericCell(row, value)" in observations_js
-    assert "if (h === '对话轮数' || h === 'API 调用' || h === '归一化 Token') appendNumericHeaderCell(trh, h)" in observations_js
-    assert "['输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '延迟(ms)'].includes(h)" in observations_js
+    assert "const th = (h === '对话轮数' || h === 'API 调用' || h === '归一化 Token' || h === '费用')" in observations_js
+    assert "['输入', '输出', '缓存读', '缓存写', '命中率', '归一化', '费用', '延迟(ms)'].includes(h)" in observations_js
     assert "['压缩前', '压缩后', '节省', '压缩比'].includes(h)" in observations_js
     assert "function openCompressionModal" in observations_js
     assert "openCompressionModal(c)" in observations_js

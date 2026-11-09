@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS）、Config Bundle 配置迁移术语（Config Bundle/manifest/段/秘密四态/redacted/degraded/action 与 outcome 正交/退出码契约/migration_maintenance/N_AGENT_INSTALL_ROOT）、OTel 可观测术语（GenAI semconv/invoke_agent/chat/execute_tool span/ChatAttempt/caller-owns-end/OTLP/sample ratio/ring buffer/spike/metric-name-mapping/observability handle/profiler bridge/Pyroscope v2 ingest/观测失败隔离/LogSanitizer/上下文现场 live scene/三重封口 triple-seal） -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS）、Config Bundle 配置迁移术语（Config Bundle/manifest/段/秘密四态/redacted/degraded/action 与 outcome 正交/退出码契约/migration_maintenance/N_AGENT_INSTALL_ROOT）、OTel 可观测术语（GenAI semconv/invoke_agent/chat/execute_tool span/ChatAttempt/caller-owns-end/OTLP/sample ratio/ring buffer/spike/metric-name-mapping/observability handle/profiler bridge/Pyroscope v2 ingest/观测失败隔离/LogSanitizer/上下文现场 live scene/三重封口 triple-seal）、模型成本观测术语（AttemptCost/计价身份/TokenValue/content_version@sha256/JCS/成组校验/计价覆盖率） -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -131,6 +131,20 @@
 - ContextBreakdownCalculator：Domain 端口（`app/domain/usage.py`），定义 `compute(system_prompt, tool_definitions, messages, external_memory_block) -> ContextBreakdown`。Infrastructure 的 ContextBreakdownCalculatorImpl 实现，复用 ContextCompressor 的 ~4 chars/token 估算逻辑。
 - usage_records：SQLite 表，持久化每次 LLM 调用的 usage 明细，由 SqliteUsageRecorder.record_call 写入；sessions 表同步累加 token/cost/api_call_count。
 - compression_stats：SQLite 表，持久化上下文压缩前后的 token 对比，由 SqliteUsageRecorder.record_compression 写入；`tokens_saved` 用 `max(before-after, 0)` clamp 防止负值。
+
+## 模型成本观测术语
+
+- AttemptCost：单次模型尝试的成本事实值对象（`app/domain/cost.py`，frozen dataclass，schema_version=1），finalization 恰计算一次；status 取 estimated/unknown，estimated 携带 USD 总额、适用分项、pricing_version/price_id，unknown 只携带受控 reason。不变量：分项 Decimal 和严格等于总额、unknown 无金额。Span/完成日志/Counter/Langfuse 消费同一结果。
+- AttemptUsage：单次尝试的四桶用量事实（`app/domain/cost.py`），每桶为 TokenValue；保留原始已知性，不从 CanonicalUsage 默认 0 推断。
+- TokenValue：用量桶三态值对象：known（非负 int，真实值）、unknown（缺失或非法，保持未知）、not_applicable（协议不适用，只能由 Provider 适配器声明，如 OpenAI 无 cache_write）；unknown/not_applicable 都不补零。
+- UnknownReason：AttemptCost unknown 的 8 值受控枚举（missing_usage/invalid_usage/price_not_found/price_ambiguous/unsupported_pricing/identity_unresolved/pricing_unavailable/amount_unrepresentable）；多因并存按固定判定顺序取最优先者。
+- 计价身份（billing identity）：`(billing_provider, billing_model)`，由启动期受信映射 `N_AGENT_MODEL_BILLING_IDENTITY_MAP` 提供，请求启动时冻结并绑定实际选中 Provider 实例；请求 options/URL/响应模型不能覆盖；无映射记 identity_unresolved。账本与观测共用同一冻结身份。
+- content_version@sha256：价格目录版本标识 = 目录内 `content_version` 字段 + 实际内容哈希（JCS 规范化 SHA-256，与启动期预期哈希核对）；版本与哈希共同锁定目录内容，不重标历史成本。
+- JCS（RFC 8785）：JSON Canonicalization Scheme，JSON 规范化序列化标准；价格目录哈希对 JCS 规范化后的 UTF-8 字节计算，实现位于 `app/infrastructure/usage/pricing_catalog.py`（仓内最小实现，含官方向量测试），禁止用 sort_keys 的 json.dumps 冒充。
+- 成组校验：Langfuse 投影侧成本字段成组守卫，不部分成功——estimated 组要求币种/原因缺省/金额与 decimal 齐全/适用分项齐全/身份合法/容差内，非法字段整组拒绝（不投影 cost_details 与 model.name），合法诊断键保留进 metadata 供审计，独立合法 Token 保留；unknown 组必须有 reason 且无金额。
+- unknown 不推价：cost_status != estimated 时 Langfuse 不投影 observation.model.name，阻断平台按模型名自动推价掩盖未知；原始模型键保留在 metadata 供分析。
+- 计价覆盖率（派生指标）：estimated attempts 除以全部 cost_attempts（先 rate/increase 再 sum）；分母为 0 显示无数据不补 100%，分子缺序列显示 0%；采样下样本覆盖率不代表全部请求的计价情况，报告只称已观测下界。
+- 计价覆盖率报告口径：数值一致性 E2E 报告中的 coverage estimated N + unknown M，同一用例只计一次；混合未知的总金额称已观测下界，不按采样率外推。
 
 ## Dashboard 顶导菜单术语
 

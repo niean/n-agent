@@ -19,6 +19,9 @@
 | nkb.retrieval.requests | nkb_retrieval_requests_total | counter / 1 | nkb.retrieval.outcome | 不适用 |
 | nkb.retrieval.results | nkb_retrieval_results (_bucket / _sum / _count) | histogram / {result} | 无业务维度 | 0, 1, 2, 3, 5, 8, 10, 20, 50, 100 |
 | nkb.retrieval.duration | nkb_retrieval_duration_seconds (_bucket / _sum / _count) | histogram / s | nkb.retrieval.outcome | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0 |
+| nkb.model.cost | nkb_model_cost_USD_total | counter / USD | gen_ai.operation.name, nkb.model.billing_provider, nkb.model.billing_model | 不适用 |
+| nkb.model.cost_components | nkb_model_cost_components_USD_total | counter / USD | gen_ai.operation.name, nkb.model.billing_provider, nkb.model.billing_model, nkb.model.cost_component | 不适用 |
+| nkb.model.cost_attempts | nkb_model_cost_attempts_total | counter / {attempt} | gen_ai.operation.name, nkb.model.billing_provider, nkb.model.billing_model, nkb.model.cost_status, nkb.model.cost_reason | 不适用 |
 
 系统指标沿用N-Agent SystemMetricsInstrumentor 0.66b1：process.cpu.time（ObservableCounter/s）→process_cpu_time_seconds_total，process.memory.usage（ObservableUpDownCounter/By）→process_memory_usage_bytes。按service_instance_id分组；没有业务流量也周期采集。其他系统/进程指标由同一instrumentor导出，本地摘要仅登记安全子集，不暴露设备或接口。
 
@@ -51,9 +54,11 @@ Trace入口由N-KB页面生成Tempo Explore，数据源nagent-tempo；既有Temp
 | process.memory.virtual | process_memory_virtual_bytes | up_down_counter / By | 无 |
 | process.thread.count | process_thread_count | up_down_counter / 无 | 无 |
 
+三个成本 Counter（nkb.model.cost / cost_components / cost_attempts）为 2026-11-09 新增（T5 成本观测投影）。三个实际 Prometheus 名称经合成探针（真实 OTLP -> 共享 Collector -> Prometheus remote write -> API 查询）实测锁定：隔离 service.name=n-agent-synth、service.instance.id=semantic-probe-261109，不计入业务流量；原始输出存于 N-Agent 仓库 locals/observability-migration/cost-probe-261109/。USD 单位实测产生字面 `_USD` 后缀，{attempt} 不产生后缀；维度实测与上表一致（点转下划线，如 nkb_model_billing_provider、nkb_model_cost_component、nkb_model_cost_status、nkb_model_cost_reason）。禁止凭规则猜测成本指标名称，一律以本表实测名称为准。
+
 ## 规范化迁移与证据边界
 
-项目维度精确使用 nkb.document.outcome、nkb.index.outcome/stage、nkb.retrieval.outcome、nkb.mcp.operation/outcome。Prometheus 标签将点转换为下划线，例如 nkb_document_outcome、nkb_index_stage、nkb_mcp_operation；GenAI 标准维度不变。ID、正文、详情不进入指标维度或新增 Loki 索引标签。所有十三项 instrument 的名称、类型、单位和桶边界保持原值。
+项目维度精确使用 nkb.document.outcome、nkb.index.outcome/stage、nkb.retrieval.outcome、nkb.mcp.operation/outcome。Prometheus 标签将点转换为下划线，例如 nkb_document_outcome、nkb_index_stage、nkb_mcp_operation；GenAI 标准维度不变。ID、正文、详情不进入指标维度或新增 Loki 索引标签。所有十六项 instrument 的名称、类型、单位和桶边界保持原值。
 
 完成事件统一为 nkb.document.completed、nkb.index.completed、nkb.retrieval.completed、nkb.model.completed、nkb.mcp.completed、nkb.http.completed。index run/阶段由 nkb.index.operation 区分；HTTP server/client 由 nkb.http.direction 区分。旧 nkb.operation.completed、nkb.index.stage.completed、nkb.embedding.completed、http_request_completed/http_client_completed 与旧 nkb.outcome/document_id/chunk_count/result_count、nkb.filter.*、裸 operation/stage/outcome 不再写出。nkb.content.FIELD 及下划线后缀元数据映射 details.FIELD.content/original_bytes/truncated/incomplete/observed_bytes。
 

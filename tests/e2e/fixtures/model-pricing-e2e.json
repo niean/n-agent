@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "content_version": "e2e-test-261109",
+  "currency": "USD",
+  "prices": [
+    {
+      "price_id": "e2e-chat-vector-ab",
+      "billing_provider": "openai",
+      "billing_model": "e2e-cost-model",
+      "operation": "chat",
+      "aliases": [],
+      "unit_prices": {"input": "2", "output": "10", "cache_read": "0.2", "cache_write": null},
+      "source_url": "file://tests/e2e/fixtures/model-pricing-e2e.json",
+      "verified_at": "2026-11-09"
+    },
+    {
+      "price_id": "e2e-embed-vector-c",
+      "billing_provider": "ollama",
+      "billing_model": "bge-m3",
+      "operation": "embeddings",
+      "aliases": [],
+      "unit_prices": {"input": "0.1", "output": null, "cache_read": null, "cache_write": null},
+      "source_url": "file://tests/e2e/fixtures/model-pricing-e2e.json",
+      "verified_at": "2026-11-09"
+    },
+    {
+      "price_id": "e2e-embed-zero",
+      "billing_provider": "ollama",
+      "billing_model": "e2e-zero-model",
+      "operation": "embeddings",
+      "aliases": [],
+      "unit_prices": {"input": "0", "output": null, "cache_read": null, "cache_write": null},
+      "source_url": "file://tests/e2e/fixtures/model-pricing-e2e.json",
+      "verified_at": "2026-11-09"
+    }
+  ]
+}

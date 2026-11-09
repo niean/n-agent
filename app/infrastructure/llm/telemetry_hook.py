@@ -53,11 +53,17 @@ class ProviderTelemetryCallback(Protocol):
 
 
 def optional_hook(attempt: Any, method: str, *args: Any, **kwargs: Any) -> None:
-    """Content hooks are optional on legacy duck-typed handles and isolated."""
+    """Content hooks are optional on legacy duck-typed handles.
+
+    Capability is detected via getattr/callable BEFORE the call; failures of
+    an existing hook stay isolated. TypeError is never caught-and-replayed
+    (no signature guessing): a handle either implements the hook or not.
+    """
+    callback = getattr(attempt, method, None)
+    if not callable(callback):
+        return
     try:
-        callback = getattr(attempt, method, None)
-        if callable(callback):
-            callback(*args, **kwargs)
+        callback(*args, **kwargs)
     except Exception:
         pass
 

@@ -10,15 +10,26 @@ telemetry_semantics.py 的 12 个 instrument 名称/单位/维度合成导出到
 （--web.enable-remote-write-receiver）。合成 Resource service.name=n-agent-synth；
 resource_to_telemetry_conversion.enabled=true 使 service_name 成为 PromQL 可用 label。
 
-## 映射表（17 instrument，目标名称）
+## 映射表（20 instrument，目标名称）
 
 三个新 Counter（第 10–12 行）于 2026-11-03 经真实 OTLP → Collector → Prometheus 验证，使用隔离的 service.name=n-agent-synth、service.instance.id=semantic-probe-261103；不计入业务 N-Agent 运行数。真实 Agent 请求另验证了 nagent_agent_runs_total 及三个 Agent Histogram 的 nagent_agent_source 维度，现场来源为 dashboard。新证据保存在 locals/observability-migration/switch-261103/new-metric-probe-*.json 和 new-agent-source-*.json；不将本次结果记为 2026-10-25 实测。其余标准 instrument 沿用原实测名称。
 
 五个缓存与归一化 Token Counter（第 13–17 行）为 2026-11-05 新增（spec-261105-cache-token-metrics）：命名决定为项目 nagent.model.* 命名（不宣称 OTel 标准，既有 gen_ai instrument 不升级 semconv），依据见 .harness/knowledge/07-observability.md "归一化 Token" 小节。五个实际 Prometheus 名称已于2026-11-08通过真实calculator请求、Collector导出与Prometheus查询确认；原始快照位于 locals/e2e-reports/metrics-consistency-261108-fixed/prometheus-after.json，并与相同21个Span的Langfuse用量对账通过。维度契约无变化：五个新 instrument 复用既有三维（operation/provider/request.model）。
 
 Prometheus 翻译规则实测：`.` 与 `-` 转 `_`；Counter 加 `_total`；Histogram（单位 s）
-加 `_seconds` 且不再加 `_total`；`{...}` 括号单位（token/inference_call/tool_call）不产生
-后缀。每个 Histogram 导出 `_bucket` / `_sum` / `_count` 三条序列。
+加 `_seconds` 且不再加 `_total`；`{...}` 括号单位（token/inference_call/tool_call/attempt）不产生
+后缀。USD 货币单位实测产生字面 `_USD` 后缀（2026-11-09 探针锁定）。每个 Histogram 导出 `_bucket` / `_sum` / `_count` 三条序列。
+
+三个成本 Counter（第 18–20 行）为 2026-11-09 新增（T5 成本观测投影）：
+nagent.model.cost / nagent.model.cost_components / nagent.model.cost_attempts。
+三个实际 Prometheus 名称已于 2026-11-09 经合成探针（真实 OTLP → 共享 Collector →
+Prometheus remote write → /api/v1/label/__name__/values 与 /api/v1/series）实测锁定；
+隔离 service.name=n-agent-synth、service.instance.id=semantic-probe-261109，不计入业务
+N-Agent 运行数。方法与原始输出存于 locals/observability-migration/cost-probe-261109/。
+维度实测：cost 与 cost_components 携带 gen_ai_operation_name、nagent_model_billing_provider、
+nagent_model_billing_model（components 另加 nagent_model_cost_component）；cost_attempts
+另加 nagent_model_cost_status 与 nagent_model_cost_reason。注意成本名称含 `_USD` 后缀，
+与预期的 nagent_model_cost_total 不同——禁止凭规则猜测，一律以本表实测名称为准。
 
 | # | Instrument（telemetry_semantics 常量） | 类型/单位 | Prometheus 实际名称 |
 |---|---|---|---|
@@ -39,6 +50,9 @@ Prometheus 翻译规则实测：`.` 与 `-` 转 `_`；Counter 加 `_total`；His
 | 15 | nagent.model.normalized_tokens | Counter / {token} | nagent_model_normalized_tokens_total |
 | 16 | nagent.model.cache_eligible_prompt_tokens | Counter / {token} | nagent_model_cache_eligible_prompt_tokens_total |
 | 17 | nagent.model.cache_eligible_read_tokens | Counter / {token} | nagent_model_cache_eligible_read_tokens_total |
+| 18 | nagent.model.cost | Counter / USD | nagent_model_cost_USD_total |
+| 19 | nagent.model.cost_components | Counter / USD | nagent_model_cost_components_USD_total |
+| 20 | nagent.model.cost_attempts | Counter / {attempt} | nagent_model_cost_attempts_total |
 
 实测存在的裸 Histogram 基名（供 T10 断言 `_bucket/_sum/_count` 后缀时参考）：
 - gen_ai_client_inference_operation_input_tokens

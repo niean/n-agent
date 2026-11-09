@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 # 归一化 Token 系数：Tn = Ti + Tic*0.2 + To*5
 # Ti 标准输入(系数1)，Tic 输入缓存(2折)，To 输出(5倍单价)
@@ -63,6 +63,10 @@ class UsageCost:
     amount_usd: str  # Decimal as string to preserve precision
     status: str  # "estimated" | "unknown"
     pricing_version: str | None = None
+    # 以下为尝试成本扩展字段（默认 None 保持既有构造兼容）：estimated 才
+    # 携带；unknown 保持全空，旧 API 数字占位不得被观测当已知成本。
+    price_id: str | None = None
+    components: Mapping[str, str] | None = None  # 桶 -> 金额十进制字符串
 
 
 @dataclass(frozen=True)

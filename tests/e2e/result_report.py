@@ -29,14 +29,16 @@ def trace_url(base_url, trace_id):
     return urlunsplit((base.scheme, base.netloc, base.path, urlencode(params), ""))
 
 
-def new_report(run_id):
-    return {"run_id": run_id, "suite": "otel-smoke", "cases": [
+def new_report(run_id, *, comparison_only=False):
+    cases = (("langfuse-comparison", "OTel 与 Langfuse 数值一致性"),) if comparison_only else (
+        ("good", "成功调用与三信号关联"),
+        ("fail", "Provider 500 错误记录"),
+        ("cancel", "客户端断连后 Span 收尾"),
+    )
+    return {"run_id": run_id, "suite": "otel-langfuse-comparison" if comparison_only else "otel-smoke", "cases": [
         {"category": "OTel", "id": key, "name": name, "result": "SKIP", "trace_id": None,
          "trace_url": None, "reason": "未执行"}
-        for key, name in (("good", "成功调用与三信号关联"),
-                          ("fail", "Provider 500 错误记录"),
-                          ("cancel", "客户端断连后 Span 收尾"),
-                          ("langfuse-comparison", "OTel 与 Langfuse 数值一致性"))
+        for key, name in cases
     ]}
 
 
@@ -157,8 +159,8 @@ def write_report(directory, report):
 def main():
     directory, action, *args = sys.argv[1:]
     path = Path(directory) / "report.json"
-    if action == "init":
-        report = new_report(args[0])
+    if action in ("init", "init-comparison"):
+        report = new_report(args[0], comparison_only=action == "init-comparison")
     elif action in ("missing", "suite-failure"):
         report = {"run_id": args[0], "suite": "missing-report", "exit_code": int(args[3]),
                   "cases": [{"category": args[1], "id": args[2], "name": args[2],

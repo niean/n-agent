@@ -605,10 +605,11 @@ class TestSnapshot:
         assert snap["sample_ratio"] == 1.0
         assert snap["semconv_version"] == ts.SEMCONV_VERSION
         names = [i["name"] for i in snap["instruments"]]
-        assert len(names) == 17
+        assert len(names) == 20
         assert "gen_ai.client.inference.duration" in names
         assert "nagent.agent.runs" in names
         assert "nagent.model.normalized_tokens" in names
+        assert "nagent.model.cost_attempts" in names
 
     def test_span_buffer_bounds_and_caps(self):
         # Self-contained wiring: the ring-buffer allowlist is a process-global

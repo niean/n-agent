@@ -10,11 +10,18 @@ repo_root=$1
 
 # Codex 二进制解析（用户约束：只允许 ChatGPT 桌面版内置的 Codex Exec，禁用 vscode 扩展插件内置二进制）：
 # 1. HARNESS_THIRD_REVIEW_CODEX_BIN 显式指定
-# 2. ChatGPT.app 内置 codex（/Applications/ChatGPT.app/Contents/Resources/codex）
+# 2. ChatGPT.app 内置 codex（新布局 codex-cli/bin/codex，旧布局 Resources/codex）
 # 3. PATH 查找，但拒绝解析到 .vscode/extensions 下的扩展内置二进制
 codex_bin=${HARNESS_THIRD_REVIEW_CODEX_BIN:-}
-if [ -z "$codex_bin" ] && [ -x "/Applications/ChatGPT.app/Contents/Resources/codex" ]; then
-    codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex"
+if [ -z "$codex_bin" ]; then
+    for candidate in \
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex" \
+        "/Applications/ChatGPT.app/Contents/Resources/codex"; do
+        if [ -x "$candidate" ]; then
+            codex_bin=$candidate
+            break
+        fi
+    done
 fi
 if [ -z "$codex_bin" ]; then
     codex_bin=$(command -v codex 2>/dev/null || true)

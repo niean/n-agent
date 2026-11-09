@@ -1,3 +1,5 @@
+import json
+import re
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
@@ -294,6 +296,20 @@ class Settings(BaseSettings):
     profiling_pyroscope_endpoint: str = Field(default="")
     profiling_interval_seconds: int = Field(default=60, ge=10, le=300)
 
+    # 定价目录配置（B 类启动期 env-only，Dashboard 无写入口）
+    # 目录 JSON 路径；为空表示成本目录不可用（成本按 pricing_unavailable 处理）
+    pricing_catalog_path: str = Field(default="")
+    # 目录内容的预期 SHA-256（64 位十六进制小写）；两服务部署必须提供同一预
+    # 期值；为空按目录不可用处理
+    pricing_catalog_expected_sha256: str = Field(default="")
+    # 受信计价身份映射（B 类启动期 env-only，Dashboard 无写入口）。JSON 数
+    # 组，每项 {"provider_id","requested_model","billing_provider","billing_model"}
+    # 均为非空字符串；由组合根解析为 (provider_id, requested_model) ->
+    # (billing_provider, billing_model) 精确映射并绑定到运行时 provider 持有
+    # 器。未配置或无命中 => 成本按 identity_unresolved 处理，不猜测计价身份；
+    # 请求 options、URL、响应模型不参与映射。
+    model_billing_identity_map: str = Field(default="")
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @staticmethod
@@ -320,6 +336,17 @@ class Settings(BaseSettings):
             raise ValueError(f"{field_name} must not contain a query")
         if parsed.fragment:
             raise ValueError(f"{field_name} must not contain a fragment")
+        return value
+
+    @field_validator("pricing_catalog_expected_sha256")
+    @classmethod
+    def validate_pricing_catalog_expected_sha256(cls, value: str) -> str:
+        # 非空时必须是 64 位十六进制小写（与目录内容的 SHA-256 核对格式一致）
+        if value != "" and not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(
+                "pricing_catalog_expected_sha256 must be 64 lowercase hex chars "
+                f"(got {len(value)} chars)"
+            )
         return value
 
     @field_validator("otel_exporter_otlp_endpoint")
@@ -570,3 +597,52 @@ class Settings(BaseSettings):
                 seen.add(item)
                 result.append(item)
         return result
+
+
+_IDENTITY_MAP_ENTRY_FIELDS = frozenset(
+    {"provider_id", "requested_model", "billing_provider", "billing_model"}
+)
+
+
+def parse_model_billing_identity_map(
+    raw: str,
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """解析受信计价身份映射（启动期 env-only 精确映射，B 类安全策略）。
+
+    输入为 Settings.model_billing_identity_map 原始字符串：JSON 数组，每项
+    含且仅含 provider_id / requested_model / billing_provider / billing_model
+    四个非空字符串字段。返回 (provider_id, requested_model) ->
+    (billing_provider, billing_model) 精确映射；重复键视为配置错误。非法输
+    入 fail-fast（启动期绑定，禁止带可疑配置运行）。
+    """
+    if not raw or not raw.strip():
+        return {}
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("model_billing_identity_map 不是合法 JSON") from error
+    if not isinstance(document, list):
+        raise ValueError("model_billing_identity_map 必须是 JSON 数组")
+    result: dict[tuple[str, str], tuple[str, str]] = {}
+    for item in document:
+        if not isinstance(item, dict) or set(item.keys()) != _IDENTITY_MAP_ENTRY_FIELDS:
+            raise ValueError(
+                "model_billing_identity_map 每项必须且只能包含 "
+                "provider_id/requested_model/billing_provider/billing_model"
+            )
+        values = {}
+        for key in sorted(_IDENTITY_MAP_ENTRY_FIELDS):
+            value = item[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"model_billing_identity_map 字段 {key} 必须是非空字符串"
+                )
+            values[key] = value
+        key = (values["provider_id"], values["requested_model"])
+        if key in result:
+            raise ValueError(
+                "model_billing_identity_map 存在重复的 provider_id+requested_model "
+                f"映射: {values['provider_id']}/{values['requested_model']}"
+            )
+        result[key] = (values["billing_provider"], values["billing_model"])
+    return result
