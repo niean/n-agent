@@ -49,6 +49,7 @@
     if (tab === 'observations-sessions') return namespace.observations;
     if (tab === 'observations-modules') return namespace.status;
     if (tab === 'observations-otel') return namespace.observationsOtel;
+    if (tab === 'evaluations') return namespace.evaluations;
     if (tab === 'security') return namespace.security;
     if (tab === 'browser') return namespace.browser;
     return null;

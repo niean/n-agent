@@ -16,6 +16,7 @@ from .commands import (
     curator,
     delegation,
     doctor,
+    evaluate,
     knowledge,
     logs,
     mcp,
@@ -352,6 +353,86 @@ def _build_task_parser(subparsers) -> None:
     _fmt(propose_p)
 
 
+def _build_evaluate_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "evaluate", help="Evaluation closed-loop commands (offline experiments + gate)"
+    )
+    sub = parser.add_subparsers(dest="evaluate_command", required=True)
+
+    run_p = sub.add_parser("run", help="Execute an experiment and evaluate the gate")
+    run_p.add_argument("--dataset", required=True, help="Dataset manifest directory")
+    run_p.add_argument("--name", required=True, help="Experiment name")
+    run_p.add_argument(
+        "--evaluator", required=True, help="Comma-separated definition_id@version"
+    )
+    run_p.add_argument("--replicates", type=int, default=1)
+    run_p.add_argument("--seed", default=None)
+    run_p.add_argument("--baseline-id", default=None)
+    run_p.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=900.0,
+        help=(
+            "Max seconds to wait for async scoring jobs to reach terminal "
+            "state before computing the gate (default 900)"
+        ),
+    )
+    run_p.add_argument("--policy", default=None, help="Gate policy JSON path")
+    run_p.add_argument(
+        "--target-config", default=None, help="Frozen target config as JSON object"
+    )
+    _add_format_flags(run_p)
+
+    replay_p = sub.add_parser(
+        "replay", help="Re-score existing evidence snapshots (no target calls)"
+    )
+    replay_p.add_argument("--name", required=True)
+    replay_p.add_argument(
+        "--source-sample-ids", required=True, help="Comma-separated sample ids"
+    )
+    replay_p.add_argument("--evaluator", required=True)
+    replay_p.add_argument("--dataset-id", required=True)
+    replay_p.add_argument("--dataset-version", required=True)
+    replay_p.add_argument("--dataset-hash", required=True)
+    replay_p.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=900.0,
+        help=(
+            "Max seconds to wait for async scoring jobs to reach terminal "
+            "state before computing the gate (default 900)"
+        ),
+    )
+    replay_p.add_argument("--policy", default=None, help="Gate policy JSON path")
+    replay_p.add_argument("--target-config", default=None)
+    _add_format_flags(replay_p)
+
+    show_p = sub.add_parser("show", help="List results of an experiment")
+    show_p.add_argument("--experiment-id", required=True)
+    show_p.add_argument("--limit", type=int, default=50)
+    show_p.add_argument(
+        "--cursor",
+        default=None,
+        help="Opaque pagination cursor from a previous show call (next_cursor)",
+    )
+    _add_format_flags(show_p)
+
+    compare_p = sub.add_parser(
+        "compare", help="Paired non-inferiority comparison against a baseline"
+    )
+    compare_p.add_argument("--candidate-id", required=True)
+    compare_p.add_argument("--baseline-id", required=True)
+    compare_p.add_argument("--policy", required=True, help="Gate policy JSON path")
+    _add_format_flags(compare_p)
+
+    retry_p = sub.add_parser(
+        "retry-delivery", help="Re-queue a stuck delivery (retry_wait/dead_letter)"
+    )
+    retry_p.add_argument("--sink", required=True)
+    retry_p.add_argument("--result-id", required=True)
+    _add_format_flags(retry_p)
+
+
 def _build_delegation_parser(subparsers) -> None:
     parser = subparsers.add_parser("delegation", help="Delegation commands")
     sub = parser.add_subparsers(dest="delegation_command", required=True)
@@ -685,6 +766,7 @@ def build_parser(
     _build_acp_parser(subparsers)
     _build_task_parser(subparsers)
     _build_delegation_parser(subparsers)
+    _build_evaluate_parser(subparsers)
     browser_host_parser = subparsers.add_parser(
         "browser-host", help="Run the bounded Browser Host Bridge"
     )
@@ -777,6 +859,7 @@ _DISPATCH = {
     "acp": acp.run,
     "task": task.run,
     "delegation": delegation.run,
+    "evaluate": evaluate.run,
     "usage": usage.run,
     "browser-host": browser_host.run,
 }

@@ -50,6 +50,24 @@ def new_checks_report(run_id, keys):
         for key in keys]}
 
 
+# T22 评估闭环套件（evaluation_e2e.sh）：用例身份与脚本内 report_case begin
+# 一一对应；reconciliation 覆盖 AC11 三元对账，experiment 覆盖 AC09
+# execute/replay，fault 覆盖 AC12 故障矩阵，unlinked 覆盖 AC08。
+EVALUATION_CASES = (
+    ("reconciliation", "固定 3 样本三元对账（账本/Langfuse/Loki）"),
+    ("experiment", "execute/replay 实验真实可见"),
+    ("fault", "Langfuse 停机/错误认证与恢复补发"),
+    ("unlinked", "未采样与迟到样本边界"),
+)
+
+
+def new_evaluation_report(run_id):
+    return {"run_id": run_id, "suite": "evaluation-e2e", "cases": [
+        {"category": "评估", "id": key, "name": name, "result": "SKIP", "trace_id": None,
+         "trace_url": None, "reason": "未执行"}
+        for key, name in EVALUATION_CASES]}
+
+
 def finish(report, base_url, exit_code):
     report["exit_code"] = exit_code
     for case in report["cases"]:
@@ -161,6 +179,8 @@ def main():
     path = Path(directory) / "report.json"
     if action in ("init", "init-comparison"):
         report = new_report(args[0], comparison_only=action == "init-comparison")
+    elif action == "init-evaluation":
+        report = new_evaluation_report(args[0])
     elif action in ("missing", "suite-failure"):
         report = {"run_id": args[0], "suite": "missing-report", "exit_code": int(args[3]),
                   "cases": [{"category": args[1], "id": args[2], "name": args[2],

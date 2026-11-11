@@ -126,12 +126,16 @@
 - FR
     - 评测：[KF]建立evaluation子域，统一执行评估、管理版本和保存结果。补全N-Agent/N-KB在Langfuse中的score分析，是否需要N-Agent具备正式的evaluate能力、还是托管到Langfuse？是否需要服务端统一评估分数，经OTel同源分发到Langfuse和现有观测栈？我希望实现一套符合业界标准的evaluate方案
         - spec: spec-261109-design-evaluation.md
+        - 代码审阅：审阅本次修改的代码Diff，重点检查①架构和代码遵循项目规范、②功能符合spec/plan定义，最多列出30个问题。spec: spec-261109-design-evaluation.md，plan: plan-261110-evaluation-closed-loop.md
+        - 功能补全：参考Langfuse，对当前的`评估`能力做增删改，spec spec-261112-evaluation-workbench.md 
+        - 迭代：按照项目FE规范，优化评测相关的FE
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。
 
 [待办]
 - FR
+    - 观测：Agent作为业务流程的上游或下游节点时，有哪些关键的观测语义、是否有业务标准？类似Google提出的RPC服务黄金四指标，我希望Agent应用也有这样的黄金指标
     - 架构：定义应用Runtime SPI和语义标准，让Agent应用可以自由切换Runtime、无需修改业务代码。借鉴Claude Managed Agents的解耦思路，分离Session、Harness与Sandbox，用户拥有Session数据权限，Agent团队负责Harness，执行环境团队负责Sandbox，业务团队则只需专注于Agent应用逻辑
     - 上下文：参考CC微压缩、完整压缩，优化现有压缩方案
     - 会话：会话恢复 => 上下文隔离 => 功能隔离

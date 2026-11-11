@@ -407,10 +407,13 @@ class TestAssembly:
         assert attrs["service.version"]
         assert attrs["service.instance.id"] == snap["instance_id"]
 
-        # Sampler: ParentBased(root=TraceIdRatioBased(ratio))
+        # Sampler: TrustedExperimentSampler(ParentBased(root=TraceIdRatioBased))
+        # T13（spec 11.1）：受信实验覆盖仅作用于服务端可信实验上下文的根 span，
+        # 委托链保持 ParentBased(TraceIdRatioBased) 语义
         sampler = tracer_provider.sampler
-        assert type(sampler).__name__ == "ParentBased"
-        assert sampler._root.rate == 0.5
+        assert type(sampler).__name__ == "TrustedExperimentSampler"
+        assert type(sampler.base).__name__ == "ParentBased"
+        assert sampler.base._root.rate == 0.5
 
         # Queue sizes and batch sizes via processor kwargs
         bsp = [

@@ -110,5 +110,75 @@ histogram_quantile(0.95,
   process_cpu 火焰图。
 
 
+## 评估遥测（T10，n-eval-v1）
+
+评估遥测新增 8 个 ObservableGauge（24h 质量窗口，spec 12.3）+ 5 个
+producer 高水位累计 Gauge + 队列深度 Gauge + worker/投递常规
+Counter/Histogram。来源模块 app/application/evaluation_telemetry.py；
+Gauge 回调只读内存快照（后台刷新读 SQLiteEvaluationStore 只读查询
+query_window_snapshot / query_producer_snapshot），每 service/profile/mode
+组仅单一 exporter owner 导出。
+
+名称按上方实测翻译规则推导（`.`→`_`；Counter 加 `_total`；Histogram 单位
+s 加 `_seconds` 且不再加 `_total`；`{...}` 括号单位不产生后缀；unit `1`
+Gauge 加 `_ratio` 后缀——T22 E2E 经真实 OTLP→Prometheus 管线实测修正，
+早前"1 单位不产生后缀"的假设不成立）。T11 Collector 核对与 T22 E2E 将以真实 OTLP→Prometheus
+管线复测本节名称；在此之前以本表为准，禁止凭规则猜测。
+
+| # | Instrument（evaluation_telemetry 常量） | 类型/单位 | Prometheus 目标名称 |
+|---|---|---|---|
+| 21 | nagent.evaluation.window.succeeded | Gauge / 1 | nagent_evaluation_window_succeeded_ratio |
+| 22 | nagent.evaluation.window.skipped | Gauge / 1 | nagent_evaluation_window_skipped_ratio |
+| 23 | nagent.evaluation.window.error | Gauge / 1 | nagent_evaluation_window_error_ratio |
+| 24 | nagent.evaluation.window.unlinked | Gauge / 1 | nagent_evaluation_window_unlinked_ratio |
+| 25 | nagent.evaluation.window.numeric_sum | Gauge / 1 | nagent_evaluation_window_numeric_sum_ratio |
+| 26 | nagent.evaluation.window.numeric_count | Gauge / 1 | nagent_evaluation_window_numeric_count_ratio |
+| 27 | nagent.evaluation.window.boolean_pass | Gauge / 1 | nagent_evaluation_window_boolean_pass_ratio |
+| 28 | nagent.evaluation.window.boolean_count | Gauge / 1 | nagent_evaluation_window_boolean_count_ratio |
+| 29 | nagent.evaluation.producer.eligible | Gauge / {job} | nagent_evaluation_producer_eligible |
+| 30 | nagent.evaluation.producer.selected | Gauge / {job} | nagent_evaluation_producer_selected |
+| 31 | nagent.evaluation.producer.captured | Gauge / {job} | nagent_evaluation_producer_captured |
+| 32 | nagent.evaluation.producer.capture_error | Gauge / {job} | nagent_evaluation_producer_capture_error |
+| 33 | nagent.evaluation.producer.queue_full | Gauge / {job} | nagent_evaluation_producer_queue_full |
+| 34 | nagent.evaluation.worker.queue_depth | Gauge / {job} | nagent_evaluation_worker_queue_depth |
+| 35 | nagent.evaluation.worker.calls | Counter / {call} | nagent_evaluation_worker_calls_total |
+| 36 | nagent.evaluation.worker.duration | Histogram / s | nagent_evaluation_worker_duration_seconds_bucket / _sum / _count |
+| 37 | nagent.evaluation.delivery.failures | Counter / {failure} | nagent_evaluation_delivery_failures_total |
+
+维度契约（T10）：
+- window.*（21–28）质量标签只允许 `target.service`（nagent/n-kb/other）、
+  `metric_profile`（<=16 个活跃定义版本注册表，`definition_id@version`）、
+  `mode`（online/execute/replay/other）、`status`（succeeded/skipped/error/
+  unlinked；numeric_sum/numeric_count/boolean_pass/boolean_count 恒为
+  succeeded）。dataset_id、case_id、result_id、run_id、session_id、
+  trace_id、模型任意名称、query 与 KB 文档 ID 禁止做标签（测试哨兵锁定）。
+  window.* 不使用 rate()，24h 窗口 current 视图快照，不与 producer 累计
+  分母混算。
+- producer.*（29–33）与 queue_depth（34）无 instrument 标签（跨
+  producer/counter epoch 汇总；覆盖率口径为"自当前 counter epoch 起"）。
+- worker.calls（35）携带 `nagent.evaluation.outcome`
+  （succeeded/skipped/error/other）；worker.duration（36）同维度；
+  delivery.failures（37）携带 `nagent.evaluation.sink`
+  （langfuse/otel/other）与 `error.type`（评估错误封闭词汇/other）。
+- LogRecord 事件 `gen_ai.evaluation.result`（n-eval-v1，字段集与 schema
+  hash 见 tests/application/fixtures/evaluation_telemetry_n_eval_v1.json）
+  与 `evaluation.run` Trace 走日志/Trace 管线，不进 Prometheus 映射表。
+
+Collector 投影边界（T11）：
+- logs 管线（transform/loki_json 评估分支，事件门控）：仅放行注册事件
+  `gen_ai.evaluation.result` 的封闭字段白名单（`nagent.evaluation.*` +
+  `gen_ai.evaluation.name/score.*` + `error.type`；集合与 n-eval-v1 字段集
+  一致，以 tests/application/fixtures/evaluation_telemetry_n_eval_v1.json
+  的 fields 除去 event.name/explanation 为准，测试交叉校验）；explanation
+  与日志原文不投影（不进行体、不进 Loki 索引标签/structured metadata）；
+  未注册事件保持既有 unknown/过滤语义；外来 `langfuse.*` 属性在日志管线
+  无任何投影通道。业务日志行体形状与 unknown 过滤条件由静态测试逐字节
+  锁定（业务输出等价，tests/test_langfuse_collector.py T11 节）。
+- traces/langfuse 管线：`evaluation.run` span 映射 evaluator；
+  实验身份 `nagent.evaluation.experiment.id/name/dataset_id/item_id/
+  root_observation_id`（受信本地编排注入）精确映射为
+  `langfuse.experiment.*`，客户端 baggage/header 永不直接投影；KB 分支
+  白名单与 Link sanitizer 行为不变。
+
 ## 迁移既有 Trace 入口
 新部署设置 N_AGENT_OTEL_GRAFANA_TRACES_BASE_URL 为浏览器可访问的 Grafana /explore（支持反向代理子路径）。已保存的 Dashboard trace_base_url override 优先于 env：通过 GET /chat/observations/otel/links 读取 version，再以 PATCH 和 expected_version 仅更新 trace_base_url；也可传 null 清除该覆盖、沿用 env。不要改写其他外链，也不自动覆盖用户自定义配置。本次本地部署已通过 CAS 将旧 Jaeger 链接迁移到既有 Grafana 公网入口的 /explore。

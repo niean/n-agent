@@ -13,7 +13,8 @@
   const CONTAINER_ID = 'tab-observations-otel';
   const OTEL_API_URL = '/chat/observations/otel';
   const LINKS_CONFIG_API_URL = '/chat/observations/otel/links';
-  const LANGFUSE_URL = 'http://langfuse.localhost/project/n-agent-local-project/sessions';
+  // m6：Langfuse 会话 URL 单源（management-ui.js ui.LANGFUSE_SESSIONS_URL）
+  const LANGFUSE_URL = ui.LANGFUSE_SESSIONS_URL;
   const LINK_CONFIG_FIELDS = [
     ['metric_base_url', 'Metric'],
     ['log_base_url', 'Log'],

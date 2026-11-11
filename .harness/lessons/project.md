@@ -1,5 +1,12 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：E2E会话清理与真实Run身份/进程中断（P091）、OpenAI缓存写已知零与命中率Counter准入漂移（P090）、观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：空态/加载/错误辅助文字字号须在共享状态类显式声明 token，禁止依赖 body 继承（P094）、bind-mount 配置的容器不随文件更新重载（collector 配置漂移致评估投影缺失，P093）、E2E会话清理与真实Run身份/进程中断（P091）、OpenAI缓存写已知零与命中率Counter准入漂移（P090）、观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
 # 项目教训
+
+### P094: 辅助文字字号必须在共享类显式声明，禁止依赖继承
+
+- 现象：评测工作台七个视图的空态提示（`.empty-state`）字体明显偏大；同一问题此前已在对话框右边栏（`#chat-artifact-list`、`#chat-run-detail`）出现并修过一次，用户第二次反馈。
+- 根因：`body` 未声明 font-size，浏览器默认 16px；共享状态类 `.empty-state, .loading-state, .error-state` 只设了颜色/间距/边框，没有字号声明，所有挂载点继承 16px，而面板正文与辅助文字口径是 12-13px。右边栏那次只在两个容器上补了 `font-size: var(--font-size-sm)`（见 test_static_assets.py::test_chat_side_panel_empty_hints_use_auxiliary_font_size），没有治共享类，其他页面继续踩坑。
+- 教训：空态、加载、错误、hint/note 等辅助性文字的字号必须在共享类（而非逐个消费容器）显式使用 `var(--font-size-sm)` 等 token，禁止依赖继承；新增状态类先查共享类是否已覆盖视觉属性。修复同类问题时先判断根因在共享类还是消费方，能上收就不只补当前容器，并补静态合同锁共享类，防止第三次复发。
+- 来源：2026-11-12 评测 FE 规范对齐后续精调；styles.css 共享状态类加 `font-size: var(--font-size-sm); line-height: 1.5`，新增 test_static_assets.py::test_shared_state_classes_use_auxiliary_font_size（RED→GREEN，125 passed）；规范回填 knowledge/03-conventions.md Dashboard 前端章节。
 
 ### P082: 本次输入的历史副本须按消息身份排除
 
@@ -825,6 +832,13 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：telemetry_semantics 将未登记响应别名归一为 other；Collector 先写请求模型、再无条件写响应模型，覆盖已识别的请求展示名。费用及受信计价身份本身正确。
 - 教训：请求模型、响应模型和计价身份分开保留；展示优先已识别请求名，响应仅兜底，不让占位值覆盖有意义的身份。按实际存储版本查询 events_full，而非仅检查旧 observations 表。
 - 来源：2026-11-10 会话 dashboard-dc8379ed-599b-44ef-9524-e4ecd1127ed4；四个真实 GENERATION 与 Collector 回归测试先红后绿。
+
+### P093: bind-mount 配置的容器不会随文件更新重载
+
+- 现象：评估 E2E 三元对账 Loki 腿全 MISSING；Loki 有 gen_ai.evaluation.result 行但为 log_event_unknown 业务形状（message 含事件码、无 result_id 评估信封），otel-collector 容器同时处于 unhealthy。
+- 根因：otel-collector.yaml 为 ro bind-mount，collector 仅启动时加载一次；T11 评估投影分支写入配置晚于容器上次启动（34 小时前），运行实例没有评估投影分支。docker/restart.sh 只重建 n-agent 栈，不重启观测栈容器。
+- 教训：依赖采集端投影的 E2E 断言（如评估事件信封）执行前必须确认运行中 collector 加载的是当前配置——版本漂移时先重启 collector（docker restart n-observability-otel-collector-1）再断言；"文件已改"不等于"运行中生效"。unhealthy 健康状态可作为配置漂移的旁证但不能替代显式确认。
+- 来源：2026-11-11 评估 E2E recon Loki MISSING 排障；重启 collector 后 healthy，教训同步 eval-e2e 重跑验证。
 
 ### P091: E2E清理须用真实HTTP形状验证中断路径
 

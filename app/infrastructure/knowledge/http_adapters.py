@@ -10,6 +10,7 @@ from app.domain.knowledge import (
     KnowledgeBase,
     KnowledgeBaseSecret,
     KnowledgeBaseType,
+    KnowledgeEvaluationContext,
     KnowledgeProbeError,
     KnowledgeRetriever,
     KnowledgeSearchError,
@@ -72,6 +73,7 @@ class NkbKnowledgeRetriever(KnowledgeRetriever):
             base_type=base.base_type,
             query=request.query,
             results=snippets,
+            evaluation_context=_parse_evaluation_context(data.get("evaluation_context")),
         )
 
 
@@ -203,6 +205,31 @@ def _map_nkb_result(item: Any) -> KnowledgeSnippet:
         score=_optional_float(item.get("score")),
         source=source,
         metadata=metadata,
+        document_id=_optional_str(item.get("document_id")),
+        document_revision=_optional_str(item.get("document_revision")),
+        chunk_id=_optional_str(item.get("chunk_id")),
+        chunk_content_hash=_optional_str(item.get("chunk_content_hash")),
+    )
+
+
+def _parse_evaluation_context(value: Any) -> KnowledgeEvaluationContext | None:
+    """解析响应可选 evaluation_context；缺失/畸形一律返回 None（旧响应兼容）。
+
+    retrieval_id 是评估身份的必需坐标（spec 7.2），缺失视为未提供上下文。
+    """
+    if not isinstance(value, dict):
+        return None
+    retrieval_id = value.get("retrieval_id")
+    if not isinstance(retrieval_id, str) or not retrieval_id:
+        return None
+    corpus_revision = value.get("corpus_revision")
+    trace_ref = value.get("trace_ref")
+    integrity = value.get("integrity")
+    return KnowledgeEvaluationContext(
+        retrieval_id=retrieval_id,
+        corpus_revision=corpus_revision if isinstance(corpus_revision, str) else None,
+        trace_ref=trace_ref if isinstance(trace_ref, dict) else None,
+        integrity=integrity if isinstance(integrity, dict) else None,
     )
 
 
@@ -231,7 +258,11 @@ def _metadata_from_item(item: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_metadata, dict):
         metadata.update(raw_metadata)
     for key, value in item.items():
-        if key not in {"id", "chunk_id", "document_id", "title", "content", "snippet", "text", "score", "source", "metadata"}:
+        if key not in {
+            "id", "chunk_id", "document_id", "document_revision",
+            "chunk_content_hash", "evaluation_context",
+            "title", "content", "snippet", "text", "score", "source", "metadata",
+        }:
             metadata[key] = value
     return metadata
 

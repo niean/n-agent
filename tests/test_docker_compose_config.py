@@ -689,10 +689,17 @@ def test_collector_config_three_pipelines_bounded_queues():
     assert any('attributes["exception.type"]' in s and 'cache["exception"]' in s for s in statements)
     assert any('attributes["stack"]' in s and 'cache["stack"]' in s for s in statements)
     branches = [s for s in statements if s.startswith('set(body,')]
-    assert len(branches) == 2
+    # 业务 2 条 + 评估事件门控 2 条（T11：评估行体独立交付，全部带事件门）。
+    assert len(branches) == 4
+    business_branches = [s for s in branches if 'attributes["event.name"]' not in s]
+    assert len(business_branches) == 2
     # context.execution 嵌套（本轮 spec 迁移目标）。
-    assert all('"context": {"execution": cache["execution"]}' in s for s in branches)
+    assert all('"context": {"execution": cache["execution"]}' in s for s in business_branches)
     assert not any('"context": attributes' in s for s in statements)
+    for s in branches:
+        if 'attributes["event.name"]' in s:
+            assert 'attributes["event.name"] == "gen_ai.evaluation.result"' in s
+            assert '"evaluation": cache["evaluation"]' in s
 
     empty_filter = processors["filter/empty_unknown_logs"]
     assert empty_filter["error_mode"] == "ignore"
@@ -868,8 +875,12 @@ def test_collector_projects_only_approved_detail_fields_and_keeps_detail_logs():
             assert any(f'attributes["{attribute}"]' in s and f'cache["details"]["{name}"]["{metadata}"]' in s for s in statements)
     assert not any('attributes["nagent.details.' in s for s in statements)
     bodies = [s for s in statements if s.startswith('set(body,')]
-    assert len(bodies) == 2
-    assert all('"details": cache["details"]' in s for s in bodies)
+    # 业务 2 条 + 评估事件门控 2 条（T11）；details 通道仅业务行体携带。
+    assert len(bodies) == 4
+    business_bodies = [s for s in bodies if 'attributes["event.name"]' not in s]
+    assert len(business_bodies) == 2
+    assert all('"details": cache["details"]' in s for s in business_bodies)
+    assert not any('"details"' in s for s in bodies if 'attributes["event.name"]' in s)
     assert not any('set(cache["details"], attributes)' in s for s in statements)
     condition = config['processors']['filter/empty_unknown_logs']['logs']['log_record'][0]
     assert 'Len(body["details"]) == 0' in condition

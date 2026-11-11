@@ -14,7 +14,7 @@ CONTENT = ('input_messages', 'output_messages', 'user_message', 'assistant_messa
 SUFFIXES = ('original_bytes', 'truncated', 'incomplete', 'observed_bytes')
 OBJECTS = ('agent', 'model', 'tool', 'context', 'task', 'delegation', 'schedule', 'memory', 'skill', 'curator', 'gateway', 'request', 'http', 'budget', 'policy', 'observation', 'knowledge')
 IDENTITY = ('gen_ai.agent.name', 'nagent.agent.run_id', 'nagent.agent.source', 'nagent.agent.iteration', 'nagent.request.id', 'nagent.request.channel', 'nagent.task.id', 'nagent.task.run_id', 'nagent.task.state', 'nagent.delegation.id', 'nagent.delegation.member_id', 'nagent.delegation.role', 'nagent.schedule.task_id', 'nagent.schedule.claim_id', 'nagent.schedule.delivery_status')
-FACTS = ('error.type', 'nagent.tool.executed', 'nagent.tool.policy_outcome', 'nagent.tool.risk_level', 'gen_ai.tool.name', 'gen_ai.tool.call.id', 'gen_ai.tool.type', 'gen_ai.provider.name', 'gen_ai.response.finish_reasons', 'gen_ai.request.stream', 'nagent.model.usage_known', 'nagent.model.message_count', 'nagent.model.duration_ms', 'nagent.model.cost_reason', 'nagent.model.cost_currency', 'nagent.model.cost_decimal', 'nagent.model.price_id', 'nagent.model.billing_provider', 'nagent.model.billing_model', 'nagent.agent.end_reason', 'nagent.agent.message_count', 'nagent.agent.inference_calls', 'nagent.agent.tool_calls', 'nagent.agent.usage_known', 'nagent.context.before_tokens', 'nagent.context.after_tokens', 'nagent.memory.provider', 'nagent.task.achieved', 'nagent.task.judge_attempt', 'gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens', 'nagent.model.cost_status', 'nagent.model.pricing_version', 'gen_ai.request.model', 'gen_ai.response.model', *(f'nagent.{obj}.{field}' for obj in OBJECTS for field in ('operation', 'outcome')))
+FACTS = ('error.type', 'nagent.tool.executed', 'nagent.tool.policy_outcome', 'nagent.tool.risk_level', 'gen_ai.tool.name', 'gen_ai.tool.call.id', 'gen_ai.tool.type', 'gen_ai.provider.name', 'gen_ai.response.finish_reasons', 'gen_ai.request.stream', 'nagent.model.usage_known', 'nagent.model.message_count', 'nagent.model.duration_ms', 'nagent.model.cost_reason', 'nagent.model.cost_currency', 'nagent.model.cost_decimal', 'nagent.model.price_id', 'nagent.model.billing_provider', 'nagent.model.billing_model', 'nagent.agent.end_reason', 'nagent.agent.message_count', 'nagent.agent.inference_calls', 'nagent.agent.tool_calls', 'nagent.agent.usage_known', 'nagent.context.before_tokens', 'nagent.context.after_tokens', 'nagent.memory.provider', 'nagent.task.achieved', 'nagent.task.judge_attempt', 'gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens', 'nagent.model.cost_status', 'nagent.model.pricing_version', 'gen_ai.request.model', 'gen_ai.response.model', *(f'nagent.{obj}.{field}' for obj in OBJECTS for field in ('operation', 'outcome')), 'nagent.evaluation.operation')
 PARAMETERS = ('temperature', 'top_p', 'top_k', 'max_tokens', 'max_completion_tokens', 'max_output_tokens', 'frequency_penalty', 'presence_penalty')
 MODEL = ('gen_ai.request.model', 'gen_ai.response.model', 'nagent.model.completion_start_time', *(f'nagent.model.parameter.{key}' for key in PARAMETERS))
 # 成本金额键（cost_usd 与四个分项桶）；decimal 是受控十进制字符串，单独守卫。
@@ -27,7 +27,18 @@ COST_COMPONENT_KEYS = COST_AMOUNT_KEYS[1:]
 COST_TOLERANCE_STATEMENT = ('set(cache["cost"]["ok"], false) where cache["cost"]["ok"] == true and not '
                             '(({sum} <= {total} + 0.000000000001 and {sum} >= {total} - 0.000000000001) or '
                             '({sum} <= {total} + {total} * 0.000000001 and {sum} >= {total} - {total} * 0.000000001))')
-SPAN_KEYS = tuple(dict.fromkeys(('gen_ai.operation.name', 'gen_ai.conversation.id', *IDENTITY, *FACTS, *MODEL, *COST_AMOUNT_KEYS, *(f'nagent.content.{field}{suffix}' for field in CONTENT for suffix in ('', *(f'_{x}' for x in SUFFIXES))))))
+# T11 评估投影边界（spec 11.2/12.1）：受信本地编排注入的实验身份经封闭白名单
+# 映射为 langfuse.experiment.*；evaluation.run 评估 Trace 独立映射 evaluator。
+# 客户端 baggage/header 永不直接投影：映射只认 nagent.evaluation.experiment.*
+# 源键，purge 守卫先删非法形态，再精确映射；源键不入 metadata（仅顶层投影）。
+EXPERIMENT_ATTRIBUTE_MAP = (
+    ('nagent.evaluation.experiment.id', 'langfuse.experiment.id'),
+    ('nagent.evaluation.experiment.name', 'langfuse.experiment.name'),
+    ('nagent.evaluation.experiment.dataset_id', 'langfuse.experiment.dataset_id'),
+    ('nagent.evaluation.experiment.item_id', 'langfuse.experiment.item_id'),
+    ('nagent.evaluation.experiment.root_observation_id', 'langfuse.experiment.root_observation_id'),
+)
+SPAN_KEYS = tuple(dict.fromkeys(('gen_ai.operation.name', 'gen_ai.conversation.id', *IDENTITY, *FACTS, *MODEL, *COST_AMOUNT_KEYS, *(source for source, _ in EXPERIMENT_ATTRIBUTE_MAP), *(f'nagent.content.{field}{suffix}' for field in CONTENT for suffix in ('', *(f'_{x}' for x in SUFFIXES))))))
 BOOL_KEYS = ('nagent.tool.executed', 'gen_ai.request.stream', 'nagent.model.usage_known', 'nagent.agent.usage_known', 'nagent.task.achieved')
 COUNT_KEYS = ('nagent.agent.iteration', 'nagent.agent.message_count', 'nagent.agent.inference_calls', 'nagent.agent.tool_calls', 'nagent.model.message_count', 'nagent.context.before_tokens', 'nagent.context.after_tokens', 'gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'nagent.model.cache_read_tokens', 'nagent.model.cache_write_tokens')
 CUSTOM_TYPES = {'task.run': 'chain', 'delegation.run_member': 'chain', 'schedule.run': 'chain', 'gateway.handle_message': 'chain', 'skill.review': 'chain', 'curator.run': 'chain', 'knowledge.search': 'retriever', 'memory.prefetch': 'retriever', 'memory.search': 'retriever', 'task.evaluate': 'evaluator'}
@@ -101,6 +112,14 @@ def value_guard(key, error_types=ERROR_TYPES):
         # excludes numeric, boolean and nested list values at this boundary.
         pattern = r'^\[("([^"\\]|\\.)*"(, ?"([^"\\]|\\.)*")*)?\]$'
         return f'IsList({value}) and IsMatch(String({value}), {json.dumps(pattern)})'
+    if key == 'nagent.evaluation.operation':
+        # evaluation.run 评估 Trace 判别键：固定单一值（producer 常量，
+        # app/application/evaluation_telemetry.EVALUATION_SPAN_NAME）。
+        return f'IsString({value}) and {value} == "evaluation.run"'
+    if key.startswith('nagent.evaluation.experiment.'):
+        # 受信实验身份：有界开放标识（ID 模式）；name 拒绝控制字符。
+        pattern = r'^[^\x00-\x1f\x7f]{1,64}$' if key.endswith('.name') else r'^[\w.:/-]{1,128}$'
+        return f'IsString({value}) and IsMatch({value}, {json.dumps(pattern)})'
     if key.endswith('.duration_ms'):
         # Contract "number": non-negative finite int or double; a finite double
         # equals itself and lies inside IEEE's finite range. Bools never pass.
@@ -253,6 +272,14 @@ def span_statements():
         statements += [f'set(name, "{operation}") where {condition}', f'set(attributes["langfuse.observation.type"], "{kind}") where {condition}']
         if kind == 'chain':
             statements += [f'set(cache["entry"], true) where {condition}']
+    # T11 评估投影边界：evaluation.run 评估 Trace（异步评分独立 Trace，Link
+    # 指向真实业务目标）独立映射 evaluator；实验身份仅来自受信本地编排注入
+    # 的 nagent.evaluation.experiment.*（purge 守卫已先删非法形态），精确
+    # 映射为 langfuse.experiment.*，客户端 baggage/header 永不直接投影。
+    eval_run = f'{agent} and attributes["nagent.evaluation.operation"] == "evaluation.run"'
+    statements += [f'set(name, "evaluation.run") where {eval_run}', f'set(attributes["langfuse.observation.type"], "evaluator") where {eval_run}']
+    for source, target in EXPERIMENT_ATTRIBUTE_MAP:
+        statements.append(f'set(attributes["{target}"], attributes["{source}"]) where {agent} and attributes["{source}"] != nil')
     statements += ['set(attributes["langfuse.trace.name"], name) where parent_span_id == SpanID(0x0000000000000000)', 'set(attributes["langfuse.session.id"], attributes["gen_ai.conversation.id"]) where IsString(attributes["gen_ai.conversation.id"])']
     for source, target in [('service.version', 'langfuse.release'), ('deployment.environment.name', 'langfuse.environment')]:
         value = f'resource.attributes["{source}"]'
@@ -369,7 +396,7 @@ def span_statements():
         source = f'cache["metadata"]["{key}"]'
         value = f'String({source})' if key in envelope_keys else source
         statements.append(f'set(attributes["langfuse.observation.metadata.{key}"], {value}) where {source} != nil')
-    final = ('langfuse.observation.type', 'langfuse.trace.name', 'langfuse.session.id', 'langfuse.release', 'langfuse.environment', 'langfuse.trace.input', 'langfuse.trace.output', 'langfuse.observation.input', 'langfuse.observation.output', *(f'langfuse.observation.metadata.{key}' for key in (*metadata_keys, *envelope_keys)), 'langfuse.observation.usage_details', 'langfuse.observation.model.name', 'langfuse.observation.model.parameters', 'langfuse.observation.completion_start_time', 'langfuse.observation.cost_details', 'langfuse.observation.level', 'langfuse.observation.status_message')
+    final = ('langfuse.observation.type', 'langfuse.trace.name', 'langfuse.session.id', 'langfuse.release', 'langfuse.environment', 'langfuse.trace.input', 'langfuse.trace.output', 'langfuse.observation.input', 'langfuse.observation.output', *(f'langfuse.observation.metadata.{key}' for key in (*metadata_keys, *envelope_keys)), 'langfuse.observation.usage_details', 'langfuse.observation.model.name', 'langfuse.observation.model.parameters', 'langfuse.observation.completion_start_time', 'langfuse.observation.cost_details', 'langfuse.observation.level', 'langfuse.observation.status_message', *(target for _, target in EXPERIMENT_ATTRIBUTE_MAP))
     statements += [f'keep_keys(attributes, {json.dumps(final)})']
     return statements
 

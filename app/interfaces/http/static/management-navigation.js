@@ -24,6 +24,14 @@
     { tab: 'observations-sessions', path: '/observations/sessions', label: '会话', parentTab: 'observations' },
     { tab: 'observations-modules', path: '/observations/modules', label: '组件', parentTab: 'observations' },
     { tab: 'observations-otel', path: '/observations/otel', label: 'OTel', parentTab: 'observations' },
+    { tab: 'evaluations', label: '评估', parent: true, children: ['evaluations-overview', 'evaluations-datasets', 'evaluations-evaluators', 'evaluations-experiments', 'evaluations-results', 'evaluations-annotations'] },
+    { tab: 'evaluations-overview', path: '/evaluations', label: '概览', parentTab: 'evaluations' },
+    { tab: 'evaluations-datasets', path: '/evaluations/datasets', label: '数据集', parentTab: 'evaluations' },
+    { tab: 'evaluations-evaluators', path: '/evaluations/evaluators', label: '评估器', parentTab: 'evaluations' },
+    { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验', parentTab: 'evaluations' },
+    { tab: 'evaluations-results', path: '/evaluations/results', label: '结果', parentTab: 'evaluations' },
+    { tab: 'evaluations-annotations', path: '/evaluations/annotations', label: '人工标注', parentTab: 'evaluations' },
+    { tab: 'evaluations-review', path: '/evaluations/review', label: '待复核', parentTab: 'evaluations' },
     { tab: 'security', label: '安全', parent: true, children: ['security-overview', 'security-sessions', 'security-memory', 'security-sandbox'] },
     { tab: 'security-overview', path: '/security', label: '概览', parentTab: 'security' },
     { tab: 'security-sessions', path: '/security/sessions', label: '会话', parentTab: 'security' },
@@ -63,6 +71,27 @@
     'observations-otel': [
       { tab: 'observations-otel', path: '/observations/otel', label: 'OTel', concern: 'observation', scope: 'observations-otel', topnavParent: 'observations-otel' },
     ],
+    'evaluations-overview': [
+      { tab: 'evaluations-overview', path: '/evaluations', label: '概览', concern: 'evaluation', scope: 'overview', topnavParent: 'evaluations-overview' },
+    ],
+    'evaluations-datasets': [
+      { tab: 'evaluations-datasets', path: '/evaluations/datasets', label: '数据集', concern: 'evaluation', scope: 'datasets', topnavParent: 'evaluations-datasets' },
+    ],
+    'evaluations-evaluators': [
+      { tab: 'evaluations-evaluators', path: '/evaluations/evaluators', label: '评估器', concern: 'evaluation', scope: 'evaluators', topnavParent: 'evaluations-evaluators' },
+    ],
+    'evaluations-experiments': [
+      { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验', concern: 'evaluation', scope: 'experiments', topnavParent: 'evaluations-experiments' },
+    ],
+    'evaluations-results': [
+      { tab: 'evaluations-results', path: '/evaluations/results', label: '结果', concern: 'evaluation', scope: 'results', topnavParent: 'evaluations-results' },
+    ],
+    'evaluations-annotations': [
+      { tab: 'evaluations-annotations', path: '/evaluations/annotations', label: '人工标注', concern: 'evaluation', scope: 'annotations', topnavParent: 'evaluations-annotations' },
+    ],
+    'evaluations-review': [
+      { tab: 'evaluations-review', path: '/evaluations/review', label: '待复核', concern: 'evaluation', scope: 'review', topnavParent: 'evaluations-review' },
+    ],
     'security-overview': [
       { tab: 'security-overview', path: '/security', label: '概览', concern: 'security', scope: 'overview', topnavParent: 'security' },
     ],
@@ -90,6 +119,15 @@
     // /observations/otel 是左导二级"观测-OTel"独立入口，自检页使用私有顶导作用域
     // （与组件页同款范式：独立 routeConfig entry + 独立顶导/左导菜单）。
     { paths: ['/observations/otel'], tab: 'observations-otel', renderTab: 'observations-otel', sidebarTab: 'observations-otel', topnavParent: 'observations-otel', scope: 'observations-otel' },
+    { paths: ['/evaluations'], tab: 'evaluations-overview', renderTab: 'evaluations', sidebarTab: 'evaluations-overview', topnavParent: 'evaluations-overview', scope: 'overview' },
+    { paths: ['/evaluations/datasets'], tab: 'evaluations-datasets', renderTab: 'evaluations', sidebarTab: 'evaluations-datasets', topnavParent: 'evaluations-datasets', scope: 'datasets' },
+    { paths: ['/evaluations/evaluators'], tab: 'evaluations-evaluators', renderTab: 'evaluations', sidebarTab: 'evaluations-evaluators', topnavParent: 'evaluations-evaluators', scope: 'evaluators' },
+    { paths: ['/evaluations/experiments'], tab: 'evaluations-experiments', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'experiments' },
+    { paths: ['/evaluations/results'], tab: 'evaluations-results', renderTab: 'evaluations', sidebarTab: 'evaluations-results', topnavParent: 'evaluations-results', scope: 'results' },
+    { paths: ['/evaluations/annotations'], tab: 'evaluations-annotations', renderTab: 'evaluations', sidebarTab: 'evaluations-annotations', topnavParent: 'evaluations-annotations', scope: 'annotations' },
+    // /evaluations/review 是旧"待复核"兼容页：不在左导 children，但
+    // routeConfig/topnav 保留，深链仍可解析（顶部跳转链接属视图改造）。
+    { paths: ['/evaluations/review'], tab: 'evaluations-review', renderTab: 'evaluations', sidebarTab: 'evaluations-review', topnavParent: 'evaluations-review', scope: 'review' },
     { paths: ['/security'], tab: 'security-overview', renderTab: 'security', sidebarTab: 'security-overview', topnavParent: 'security', scope: 'overview' },
     { paths: ['/security/sessions'], tab: 'security-sessions', renderTab: 'security', sidebarTab: 'security-sessions', topnavParent: 'security', scope: 'sessions' },
     { paths: ['/security/memory'], tab: 'security-memory', renderTab: 'security', sidebarTab: 'security-memory', topnavParent: 'security', scope: 'memory' },
@@ -136,6 +174,7 @@
     observations: 'observations-sessions',
     executors: 'sandbox',
     security: 'security-overview',
+    evaluations: 'evaluations-overview',
   };
 
   function isParent(name) {
@@ -348,6 +387,6 @@
   global.NAGENT.navigation = {
     initNavigation, navigateTo, switchTab: navigateTo, tabNames, pathByTab,
     resolveRoute, applyRoute, navigatePath, activeTopnavItem, buildRouteByPath,
-    topnavConfig, selectedTabFromPath, DEFAULT_CHILD,
+    topnavConfig, selectedTabFromPath, DEFAULT_CHILD, tabConfig,
   };
 }(window));

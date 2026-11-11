@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from app.application.telemetry_semantics import business_operation
-from app.application.telemetry_details import project_details
-
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from app.application.telemetry_semantics import business_operation
+from app.application.telemetry_details import project_details
+
+logger = logging.getLogger(__name__)
 
 from app.domain.knowledge import (
     KnowledgeBackendSearchRequest,
@@ -76,9 +79,17 @@ class KnowledgeProbeInput:
 
 
 class KnowledgeService:
-    def __init__(self, registry: KnowledgeBaseRegistry, retriever_factory: KnowledgeRetrieverFactory):
+    def __init__(
+        self,
+        registry: KnowledgeBaseRegistry,
+        retriever_factory: KnowledgeRetrieverFactory,
+        evaluation_capture: Any = None,
+    ):
         self.registry = registry
         self.retriever_factory = retriever_factory
+        # 线上评估捕获（T16）：鸭子类型，仅使用 .buffer.record_retrieval；
+        # None（缺省）时检索路径零感知，完全向后兼容
+        self.evaluation_capture = evaluation_capture
 
     async def list_bases(self) -> list[KnowledgeBase]:
         return await self.registry.list_bases()
@@ -142,6 +153,12 @@ class KnowledgeService:
         )
 
     async def delete_base(self, kb_id: str) -> None:
+        """删除 KB 注册项（本方法仅表示本地注册项删除）。
+
+        接口缝（T18）：不冒充远端文档删除——远端 KB 内文档的删除由 T17
+        认证消息进入评估子域删除传播（evaluation_deletion.handle_
+        document_deleted）；评估证据是否随注册项删除由 evaluation 子域
+        按 document 维度 tombstone 决策，不在本方法内代行。"""
         await self.get_base(kb_id)
         await self.registry.delete_base(kb_id)
 
@@ -202,11 +219,41 @@ class KnowledgeService:
         with business_operation('knowledge.search') as facts:
             facts['details'] = project_details(retrieval_query=request.query)
             result = await backend.search(base, request, secret)
+            # T16: 在真实检索结果返回处就地登记评估证据（稳定身份来自
+            # 响应可选 evaluation_context / 稳定版本字段），绝不再查询 KB
+            # 重建上下文。best-effort：登记异常不影响检索业务结果。
+            self._record_retrieval_evidence(result)
             try:
                 facts['details'].update(project_details(retrieval_results=_result_to_dict(result)))
             except Exception:
                 pass
             return result
+
+    def _record_retrieval_evidence(self, result: KnowledgeSearchResult) -> None:
+        capture = self.evaluation_capture
+        if capture is None:
+            return
+        try:
+            from app.application.evaluation_capture import (
+                capture_session_key,
+                retrieval_record_from_result,
+            )
+
+            session_id = capture_session_key()
+            if not session_id:
+                # 无运行上下文（管理面探测 / 直调检索）不属于 Agent 消费
+                # 场景，不登记
+                return
+            capture.buffer.record_retrieval(
+                session_id,
+                retrieval_record_from_result(result),
+            )
+        except Exception:
+            logger.warning(
+                "knowledge retrieval evaluation capture failed for kb=%s",
+                result.kb_id,
+                exc_info=True,
+            )
 
     async def knowledge_tool_definition(self) -> ToolDefinition:
         bases = [base for base in await self.registry.list_bases() if base.enabled]

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.application.agent_graph import AgentGraphRunner
 from app.application.artifact_service import ArtifactService, ArtifactServiceConfig
@@ -648,6 +648,24 @@ class ApplicationServices:
     # task_config_service, so saved overrides apply regardless of the
     # otel_enabled B 类开关.
     otel_link_config_service: OtelLinkConfigService | None = None
+    # Evaluation 子域服务 (T20). None when evaluation_enabled=False（B 类
+    # 总闸关闭：worker/路由/捕获 hook/Judge 全部缺省，E2E 兼容）。
+    evaluation_config_service: Any = None
+    evaluation_store: Any = None
+    evaluation_ledger_service: Any = None
+    evaluation_evidence_store: Any = None
+    evaluation_worker: Any = None
+    evaluation_delivery_worker: Any = None
+    evaluation_capture: Any = None
+    evaluation_deletion_service: Any = None
+    evaluation_review_service: Any = None
+    evaluation_gauge_holder: Any = None
+    evaluation_langfuse_sink: Any = None
+    # 评估工作台管理面服务（T8 组合根装配；None when evaluation_enabled=
+    # False）。HTTP 组合根专用，CLI 容器 EvaluationServices 不承载。
+    evaluation_admin_service: Any = None
+    evaluation_annotation_service: Any = None
+    evaluation_analytics_service: Any = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -725,6 +743,239 @@ def _canonical_decimal_string(value) -> str:
     with localcontext() as ctx:
         ctx.prec = 60
         return format(Decimal(value).normalize(), "f")
+
+
+# ---------------------------------------------------------------------------
+# Evaluation 子域组合根助手（T20）
+# ---------------------------------------------------------------------------
+
+# worker 日调用预算启用时的估算参数（无定价目录能力的部署用 token 口径）
+DEFAULT_EVALUATION_PER_CALL_TOKENS: int = 2000
+
+
+def _evaluation_capture_policy(config_service: Any):
+    """C 类配置 -> T16 抽样策略（捕获点逐次查询；enabled=False 返回
+    None 表示捕获总闸关闭）。current_sync 永不抛错（内部 fail-safe
+    last-known-good），捕获路径绝不阻塞业务。"""
+    from app.application.evaluation_capture import EvaluationSamplingPolicy
+
+    cfg = config_service.current_sync()
+    if not cfg.evaluation_enabled:
+        return None
+    return EvaluationSamplingPolicy(
+        policy_version=cfg.evaluation_sampling_policy_version,
+        rate=cfg.evaluation_sampling_rate,
+        failure_rate=cfg.evaluation_failure_sampling_rate,
+    )
+
+
+def _evaluation_current_call_ceiling(
+    config_service: Any, *, static_fallback: int = 0
+) -> int | None:
+    """C 类日调用上限热读（worker 预留点逐次查询；#11）。current_sync
+    内部 fail-safe（last-known-good），0 = 显式不设上限 -> None；热读
+    异常回退启动期静态值（24 项三方审阅 #15——回退 None 会让 worker
+    预算预留失效，等于绕过启动期保护）。"""
+    try:
+        cfg = config_service.current_sync()
+    except Exception:
+        logger.warning(
+            "evaluation call ceiling hot read failed; falling back to "
+            "startup static value",
+            exc_info=True,
+        )
+        ceiling = int(static_fallback or 0)
+        return ceiling or None
+    ceiling = int(cfg.evaluation_daily_call_ceiling or 0)
+    return ceiling or None
+
+
+def _evaluation_capacity_usage(store: Any, snapshots_root: Path):
+    """容量探针：pending 作业数（queued/running）+ 证据正文总字节。
+
+    只读直连账本 DB（评估子域独立文件），失败按 0 容量容忍放行——
+    探针失败不应阻断捕获（service 层 None=不判定语义不适用于此处，
+    返回零值保证保守放行而非误拒）。"""
+    import sqlite3 as _sqlite3
+
+    from app.application.evaluation_service import EvaluationCapacityUsage
+
+    try:
+        conn = _sqlite3.connect(str(store.path))
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM evaluation_jobs "
+                "WHERE status IN ('queued', 'running')"
+            ).fetchone()
+            pending_jobs = int(row[0] if row else 0)
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("evaluation capacity probe (jobs) failed", exc_info=True)
+        pending_jobs = 0
+    evidence_bytes = 0
+    try:
+        if snapshots_root.exists():
+            for path in snapshots_root.rglob("*.json"):
+                try:
+                    evidence_bytes += path.stat().st_size
+                except OSError:
+                    continue
+    except Exception:
+        logger.warning("evaluation capacity probe (bytes) failed", exc_info=True)
+    return EvaluationCapacityUsage(
+        pending_jobs=pending_jobs, evidence_bytes=evidence_bytes
+    )
+
+
+async def _evaluation_evidence_sweep_loop(
+    evidence_store: Any,
+    *,
+    interval_seconds: float = 3600.0,
+) -> None:
+    """证据 TTL 回收生产调度（#18）：周期执行 evidence_store.sweep()。
+
+    sweep 单轮有界（max_files 预算），失败隔离为 warning 不中断循环；
+    停止经任务取消（lifespan 取消语义，与 gauge 刷新循环一致）。此前
+    sweep 只有测试调用，生产从未调度——过期证据与崩溃残留临时文件
+    永不回收。"""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            report = await evidence_store.sweep()
+            deleted = int(report.get("deleted_files", 0) or 0)
+            if deleted:
+                logger.info(
+                    "evaluation evidence sweep: deleted_files=%s", deleted
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "evaluation evidence sweep failed", exc_info=True
+            )
+
+
+def _langfuse_sink_settings_ready(settings: Settings) -> bool:
+    """Langfuse sink 连接完整性校验（B 类四字段同时为空或同时非空）。
+
+    返回 True 表示 sink 已配置；False 表示 sink 关闭；部分设置抛
+    ValueError（装配期 fail-fast，不静默降级）。"""
+    fields = (
+        settings.evaluation_langfuse_base_url,
+        settings.evaluation_langfuse_public_key,
+        settings.evaluation_langfuse_secret_key,
+        settings.evaluation_langfuse_project,
+    )
+    if all(fields):
+        return True
+    if not any(fields):
+        return False
+    raise ValueError(
+        "evaluation_langfuse_base_url/public_key/secret_key/project 必须"
+        "同时提供或同时为空（B 类启动期绑定）"
+    )
+
+
+def _evaluation_judge_cfg(settings: Settings) -> tuple[str, str, str]:
+    """Judge provider B 类三字段元组（判定用单一来源）。
+
+    worker 装配 fail-fast、工作台 judge_ready 与 lifespan 预设注册
+    共用同一元组，避免三字段清单多处拷贝漂移。"""
+    return (
+        settings.evaluation_judge_provider_base_url,
+        settings.evaluation_judge_provider_api_key,
+        settings.evaluation_judge_provider_model,
+    )
+
+
+def _evaluation_judge_ready(settings: Settings) -> bool:
+    """Judge 是否已配置（对齐 _langfuse_sink_settings_ready 先例）。
+
+    三字段同时非空返回 True；同时为空返回 False（Judge 未配置）；
+    部分提供抛 ValueError（装配期 fail-fast，不静默降级）。"""
+    fields = _evaluation_judge_cfg(settings)
+    if any(fields) and not all(fields):
+        raise ValueError(
+            "evaluation_judge_provider_base_url/api_key/model 必须同时"
+            "提供或同时为空（B 类启动期绑定）"
+        )
+    return all(fields)
+
+
+class _EvaluationJudgeNotConfiguredError(Exception):
+    """未配置 Judge 或指标无对应 Judge（n1：专用异常类替代动态贴
+    error_type 属性；worker 按 error_type 分类终结 job，不重试）。"""
+
+    error_type = "permanent_error"
+
+
+class _EvaluationJudgeDispatch:
+    """按 definition.metric_name 路由到 LLMJudgeEvaluator 实例。
+
+    未配置 Judge 或未知指标抛专用异常（error_type='permanent_error'）：
+    worker 按 error_type 分类终结 job（不重试），不冒充网络错误。"""
+
+    def __init__(self, by_metric: dict) -> None:
+        self._by_metric = by_metric
+
+    async def evaluate(self, definition: Any, snapshot: Any) -> Any:
+        evaluator = self._by_metric.get(definition.metric_name)
+        if evaluator is None:
+            raise _EvaluationJudgeNotConfiguredError(
+                "judge provider 未配置或指标无对应 Judge: "
+                f"{definition.metric_name!r}"
+            )
+        return await evaluator.evaluate(definition, snapshot)
+
+    async def aclose(self) -> None:
+        """关闭全部底层 Judge HTTP 客户端（组合根生命周期收口）。"""
+        for evaluator in self._by_metric.values():
+            try:
+                await evaluator.aclose()
+            except Exception:
+                logger.warning(
+                    "judge evaluator close failed", exc_info=True
+                )
+
+
+async def _evaluation_gauge_refresh_loop(
+    holder: Any,
+    store: Any,
+    *,
+    capture_counters: Any = None,
+    interval_seconds: float = 30.0,
+) -> None:
+    """Gauge 快照刷新循环（T10/T20）：读取 store 只读快照 + 本地捕获
+    计数合并 producer 五指标，喂给 EvaluationSnapshotHolder。
+
+    - producer 字段口径：store producer_state（N-KB producer 上报的
+      高水位）与本地 CAPTURE_COUNTERS（n-agent producer）同键逐项相加
+      ——两者是不同 producer 的累计计数，经同一聚合 Gauge 汇总；
+    - T17 PRODUCER_INGRESS_COUNTERS（接收端健康键集与五指标不同）不
+      并入本 Gauge（口径单源），经 producer_ingress_counters() 只读
+      快照供 T21 管理面展示；
+    - 刷新失败经 holder.record_refresh_failure 计数（refresh_gauges_
+      from_store 内部隔离），不中断循环；停止经任务取消。"""
+    from app.application.evaluation_telemetry import refresh_gauges_from_store
+
+    while True:
+        try:
+            await refresh_gauges_from_store(holder, store)
+            if capture_counters is not None:
+                producer = dict(holder.get().get("producer") or {})
+                local = capture_counters.snapshot()
+                merged = {
+                    key: int(producer.get(key, 0) or 0)
+                    + int(local.get(key, 0) or 0)
+                    for key in set(producer) | set(local)
+                }
+                holder.update(producer=merged)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("evaluation gauge refresh loop error", exc_info=True)
+        await asyncio.sleep(interval_seconds)
 
 
 def build_application_services(
@@ -809,11 +1060,293 @@ def build_application_services(
         web_fetch_max_bytes=settings.web_fetch_max_bytes,
         web_fetch_allow_private_urls=settings.web_fetch_allow_private_urls,
     )
+    # ------------------------------------------------------------------
+    # Evaluation 子域（T20）。B 类 evaluation_enabled 总闸：False 时整个
+    # 子域不装配（worker/投递 worker/捕获 hook/删除接线/Judge 全部缺省，
+    # producer 路由不注册——404 语义与既有 gating 模式一致）；True 时
+    # 任何初始化失败向上传播（fail-fast，对齐 task_enabled 模式）。
+    # ------------------------------------------------------------------
+    evaluation_config_service: Any = None
+    evaluation_store: Any = None
+    evaluation_ledger_service: Any = None
+    evaluation_worker: Any = None
+    evaluation_delivery_worker: Any = None
+    evaluation_capture: Any = None
+    evaluation_deletion_service: Any = None
+    evaluation_review_service: Any = None
+    evaluation_gauge_holder: Any = None
+    evaluation_langfuse_sink: Any = None
+    evidence_store: Any = None
+    if settings.evaluation_enabled:
+        from app.application.evaluation_config import EvaluationConfigService
+        from app.application.evaluation_deletion import EvaluationDeletionService
+        from app.application.evaluation_service import (
+            EvaluationService as EvaluationLedgerService,
+        )
+        from app.application.evaluation_telemetry import (
+            EvaluationSnapshotHolder,
+        )
+        from app.application.evaluation_worker import EvaluationWorker
+        from app.infrastructure.evaluation.config_store import (
+            SqliteEvaluationConfigStore,
+        )
+        from app.infrastructure.evaluation.delivery_worker import (
+            EvaluationDeliveryWorker,
+        )
+        from app.infrastructure.evaluation.evidence_store import (
+            LocalEvidenceStore as EvaluationLocalEvidenceStore,
+        )
+        from app.infrastructure.evaluation.langfuse_sink import LangfuseScoreSink
+        from app.infrastructure.evaluation.store import (
+            SQLiteEvaluationStore as EvaluationSQLiteStore,
+        )
+
+        # 独立账本 DB（B 类路径配置，测试隔离用 tmp 目录）；schema 迁移
+        # 在构造器内完成，失败即 fail-fast
+        evaluation_db_path = Path(settings.evaluation_ledger_path)
+        evaluation_db_path.parent.mkdir(parents=True, exist_ok=True)
+        evaluation_store = EvaluationSQLiteStore(str(evaluation_db_path))
+        evaluation_config_store = SqliteEvaluationConfigStore(
+            str(evaluation_db_path)
+        )
+        evaluation_config_service = EvaluationConfigService(
+            settings, evaluation_config_store
+        )
+        # C 类当前解析配置（含 DB 覆盖）：worker 并发/预算在启动期读取
+        # 生效；sampling/enabled 由捕获点 per-capture 查询热重载
+        _resolved_eval_config = _run_sync(
+            evaluation_config_service.get_resolved()
+        ).config
+        evidence_store = EvaluationLocalEvidenceStore(
+            Path(settings.evaluation_snapshots_root),
+            evaluation_store,
+            retention=timedelta(days=settings.evaluation_evidence_retention_days),
+        )
+        # Langfuse sink 就绪判定与投递 sink 清单单源（人评投递登记与
+        # 投递 worker 共用，spec 145/262 每 result 投递）；OTel 启用时
+        # 追加 otel sink（#13：结果事件同走持久投递闭环，崩溃可恢复）
+        _langfuse_settings_ready = _langfuse_sink_settings_ready(settings)
+        _otel_sink_ready = bool(settings.otel_enabled)
+        _EVALUATION_DELIVERY_SINK_SPECS: tuple[dict[str, str], ...] = (
+            (
+                ({"sink": "langfuse", "projection_version": "v1"},)
+                if _langfuse_settings_ready
+                else ()
+            )
+            + (
+                ({"sink": "otel", "projection_version": "v1"},)
+                if _otel_sink_ready
+                else ()
+            )
+        )
+        evaluation_ledger_service = EvaluationLedgerService(
+            evaluation_store,
+            enabled=True,
+            # 容量探针契约是 Awaitable（CapacityUsageProvider）：同步
+            # 探针（sqlite 直读 + 证据目录全量 rglob）经 to_thread 进
+            # 工作线程执行，避免阻塞事件循环（T20/C1+m6）
+            capacity_usage_provider=lambda: asyncio.to_thread(
+                _evaluation_capacity_usage,
+                evaluation_store,
+                Path(settings.evaluation_snapshots_root),
+            ),
+            max_pending_jobs=settings.evaluation_max_pending_jobs,
+            max_evidence_bytes=settings.evaluation_max_evidence_bytes,
+            # 人评投递登记（T22）：与投递 worker 共用同一 sink 清单
+            # （spec 145/262：每个 result 都有 sink 投递；无真实身份的
+            # unlinked 判定由投递 worker 投影时落）
+            delivery_sink_specs=_EVALUATION_DELIVERY_SINK_SPECS,
+        )
+        # 捕获编排（T16）：sampling/enabled 经 policy_provider 逐次查询
+        # C 类配置（热重载即时生效）。m5：评估链路脱敏单源——组合根
+        # 构造同一 LogSanitizer redactor 注入 capture 与 langfuse sink；
+        # capture 内建凭据形态正则保留为第二层（快照期兜底，覆盖
+        # LogSanitizer 固定规则之外的凭据形态），分工明确不漂移
+        from app.application.evaluation_capture import EvaluationCaptureService
+        from app.infrastructure.observability.logging import LogSanitizer
+
+        _evaluation_redactor = LogSanitizer().sanitize
+
+        evaluation_capture = EvaluationCaptureService(
+            policy_provider=lambda: _evaluation_capture_policy(
+                evaluation_config_service
+            ),
+            evidence_store=evidence_store,
+            evaluation_service=evaluation_ledger_service,
+            queue_maxsize=settings.evaluation_capture_queue_maxsize,
+            redactor=_evaluation_redactor,
+        )
+        # #28：本地 producer 捕获计数持久化——重启不归零 + counter epoch
+        # 稳定（Gauge 覆盖率口径跨重启一致）；仅 evaluation 启用时装配
+        from app.application.evaluation_capture import (
+            PersistingCaptureCounters,
+        )
+
+        evaluation_capture.counters = PersistingCaptureCounters(
+            evaluation_store
+        )
+        # 删除传播（T18）：注册为 session post-delete handler（tombstone
+        # 先行，post-delete 失败不阻塞业务删除）；langfuse 就绪时注册其
+        # 为 langfuse sink 的外部删除端（DELETE /api/public/scores/{id}，
+        # 删除任务经重复回读核对收敛）
+        evaluation_langfuse_sink = None
+        if _langfuse_settings_ready:
+            evaluation_langfuse_sink = LangfuseScoreSink(
+                base_url=settings.evaluation_langfuse_base_url,
+                public_key=settings.evaluation_langfuse_public_key,
+                secret_key=settings.evaluation_langfuse_secret_key,
+                project=settings.evaluation_langfuse_project,
+                config_store=evaluation_store,
+                redactor=_evaluation_redactor,
+            )
+        # 复核/导出（T21 管理面）：待复核队列与审核后受控导出（金标由
+        # 审核人提供、身份键拒绝、T12 fail-fast 校验、审批来源审计落账
+        # 本）。数据集根目录按 artifacts_root 同款模式解析：相对路径锚
+        # 定 workspace_root，避免 cwd 漂移。
+        evaluation_export_datasets_root = Path(
+            settings.evaluation_export_datasets_root
+        )
+        if not evaluation_export_datasets_root.is_absolute():
+            evaluation_export_datasets_root = (
+                settings.workspace_root / evaluation_export_datasets_root
+            )
+        evaluation_export_datasets_root = (
+            evaluation_export_datasets_root.resolve()
+        )
+        evaluation_export_datasets_root.mkdir(parents=True, exist_ok=True)
+        from app.application.evaluation_review import EvaluationReviewService
+
+        evaluation_review_service = EvaluationReviewService(
+            store=evaluation_store,
+            datasets_root=evaluation_export_datasets_root,
+            # M1/M3：待复核条目附样本真实 query（金标仍只来自审核人）
+            evidence_reader=evidence_store,
+        )
+        # Judge evaluator（B 类三字段同时为空 = Judge 未配置；部分设置
+        # fail-fast，由 _evaluation_judge_ready 统一判定）。dispatch 按
+        # definition.metric_name 路由到四个 LLMJudgeEvaluator 实例；
+        # 未配置时 evaluate 抛永久错误（worker 按 error_type 分类，不重试）。
+        _judge_ready = _evaluation_judge_ready(settings)
+        from app.infrastructure.evaluation.judge_provider import (
+            JUDGE_EVALUATOR_FACTORIES,
+        )
+
+        _judge_evaluators = {
+            metric: factory(
+                base_url=settings.evaluation_judge_provider_base_url,
+                api_key=settings.evaluation_judge_provider_api_key,
+                model=settings.evaluation_judge_provider_model,
+                timeout_seconds=settings.evaluation_judge_timeout_seconds,
+            )
+            for metric, factory in (
+                JUDGE_EVALUATOR_FACTORIES.items() if _judge_ready else []
+            )
+        }
+        # #12 fail-fast：Judge 已配置但日调用上限未设（C 类 0 = 不设上限）
+        # 时拒绝启动——无上限的自动 Judge 调用会让评估成本失控（spec 13
+        # 预算纪律）。显式关闭 Judge 请清空 provider 三字段。
+        if _judge_evaluators and (
+            (_resolved_eval_config.evaluation_daily_call_ceiling or 0) <= 0
+        ):
+            raise ValueError(
+                "evaluation_daily_call_ceiling 必须为正整数（Judge 已配置，"
+                "禁止无日调用上限的自动评估；如需关闭请清空 "
+                "evaluation_judge_provider_* 配置）"
+            )
+        from app.application.evaluation_calibration import (
+            calibration_status_from_store,
+        )
+        evaluation_worker = EvaluationWorker(
+            evaluation_store,
+            evaluator=_EvaluationJudgeDispatch(_judge_evaluators),
+            evidence_store=evidence_store,
+            sinks=(
+                [dict(spec) for spec in _EVALUATION_DELIVERY_SINK_SPECS]
+            ),
+            claimant="n-agent-main",
+            lease_seconds=settings.evaluation_worker_lease_seconds,
+            shutdown_grace_seconds=(
+                float(settings.evaluation_worker_shutdown_grace_seconds)
+            ),
+            llm_concurrency=_resolved_eval_config.evaluation_worker_concurrency,
+            daily_call_ceiling=(
+                _resolved_eval_config.evaluation_daily_call_ceiling or None
+            ),
+            # C 类日调用上限热读（#11）：预留时读当前 C 类配置（Dashboard
+            # 编辑即时生效）；并发仍为启动期绑定（重启后生效）
+            daily_call_ceiling_provider=lambda: (
+                _evaluation_current_call_ceiling(
+                    evaluation_config_service,
+                    static_fallback=settings.evaluation_daily_call_ceiling,
+                )
+            ),
+            # 校准状态查询注入（#9）：此前生产 worker 从未接线，llm_judge
+            # 结果一律按 advisory（calibration）落库，校准报告形同虚设
+            calibration_status_provider=lambda definition: (
+                calibration_status_from_store(evaluation_store, definition)
+            ),
+            per_call_token_estimate=DEFAULT_EVALUATION_PER_CALL_TOKENS,
+        )
+        # Langfuse sink（T9）：实例已在删除传播装配处构造（同一实例供
+        # 投递 worker 与外部删除端复用）；四字段同时为空 = sink 关闭。
+        # OTel sink（#13）：otel 启用时注册 OtelScoreSink，结果事件走
+        # 持久投递闭环（deliveries 行管理，崩溃恢复）。任一出口就绪即
+        # 装配投递 worker（仅 langfuse 未配置而 otel 启用也成立）。
+        _delivery_sinks: dict[str, Any] = {}
+        if evaluation_langfuse_sink is not None:
+            _delivery_sinks["langfuse"] = evaluation_langfuse_sink
+        if _otel_sink_ready:
+            from app.infrastructure.evaluation.otel_sink import OtelScoreSink
+
+            _delivery_sinks["otel"] = OtelScoreSink()
+        if _delivery_sinks:
+            # T22 收口（T20 遗留接缝）：注入真实可关联状态——账本中的
+            # sample 都是捕获/producer 选中的样本（sampled 恒真），OTel
+            # 开关取 B 类 settings；缺省 fail-safe（全 unlinked）会让
+            # Score 永不出站，闭环死点。
+            evaluation_delivery_worker = EvaluationDeliveryWorker(
+                evaluation_store,
+                sinks=_delivery_sinks,
+                claimant="n-agent-main",
+                lease_seconds=settings.evaluation_worker_lease_seconds,
+                shutdown_grace_seconds=(
+                    float(settings.evaluation_worker_shutdown_grace_seconds)
+                ),
+                linkability_provider=lambda: {
+                    "otel_enabled": settings.otel_enabled,
+                    "sampled": True,
+                },
+            )
+        # 删除服务在投递 worker 之后构造并注入出口闸（24 项三方审阅
+        # #9）：删除期间暂停出口、等待在途发送收敛（spec §14 删除竞态
+        # 保护）；无投递 worker（单进程嵌入/测试）时 None 走直接处理
+        # 分支
+        evaluation_deletion_service = EvaluationDeletionService(
+            store=evaluation_store,
+            evidence_store=evidence_store,
+            external_deleters=(
+                {"langfuse": evaluation_langfuse_sink}
+                if evaluation_langfuse_sink is not None
+                else None
+            ),
+            delivery_worker=evaluation_delivery_worker,
+        )
+        # producer Gauge 快照持有者（T10）：刷新循环在 lifespan 内启动，
+        # producer 字段 = store producer_state 快照 + 本地捕获计数合并。
+        # Gauge 注册走 telemetry_semantics 代理 meter（OTel 禁用为 no-op）
+        from app.application.evaluation_telemetry import EvaluationGauges
+
+        evaluation_gauge_holder = EvaluationSnapshotHolder()
+        EvaluationGauges(snapshot=evaluation_gauge_holder)
     knowledge_registry = SQLiteKnowledgeBaseRegistry(settings.sqlite_path)
     knowledge_factory = KnowledgeHttpRetrieverFactory(
         HttpKnowledgeRetrieverConfig(timeout_seconds=settings.kb_timeout_seconds)
     )
-    knowledge_service = KnowledgeService(knowledge_registry, knowledge_factory)
+    knowledge_service = KnowledgeService(
+        knowledge_registry,
+        knowledge_factory,
+        evaluation_capture=evaluation_capture,
+    )
     _run_sync(_seed_legacy_knowledge_base(knowledge_service, settings))
     kb_executor = KnowledgeToolExecutor(knowledge_service)
     mcp_registry = SQLiteMcpSiteRegistry(settings.sqlite_path)
@@ -876,6 +1409,7 @@ def build_application_services(
         information_flow_service=information_flow_service,
         audit_service=audit_service,
         telemetry=telemetry,
+        evaluation_capture=evaluation_capture,
     )
     mcp_service = McpService(mcp_registry, mcp_client, tool_service)
     mcp_management_executor = McpManagementToolExecutor(mcp_service)
@@ -1344,6 +1878,45 @@ def build_application_services(
     llm_policy = LLMPolicy()
     llm_config = LLMConfig(fallback_enabled=settings.llm_fallback_enabled)
     agent_run_service = AgentRunService(SQLiteAgentRunRegistry(settings.sqlite_path))
+    # 评估工作台管理面服务（T8 组合根装配）：admin/annotation/analytics。
+    # 在 agent_run_service 构造后装配（agent_run_lookup 闭包延迟到调用期
+    # 解析真实 Run）；judge_ready 读 judge provider B 类配置状态（三字段
+    # 同时非空即就绪，与 worker judge evaluator 装配同一判定）。
+    evaluation_admin_service = None
+    evaluation_annotation_service = None
+    evaluation_analytics_service = None
+    if settings.evaluation_enabled and evaluation_store is not None:
+        from app.application.evaluation_admin import EvaluationAdminService
+        from app.application.evaluation_analytics import (
+            EvaluationAnalyticsService,
+        )
+        from app.application.evaluation_annotation import AnnotationService
+
+        evaluation_admin_service = EvaluationAdminService(
+            evaluation_store,
+            judge_ready=lambda: _evaluation_judge_ready(settings),
+            evaluation_service=evaluation_ledger_service,
+        )
+        evaluation_analytics_service = EvaluationAnalyticsService(evaluation_store)
+        evaluation_annotation_service = AnnotationService(
+            evaluation_store,
+            evaluation_ledger_service,
+            evidence_reader=evidence_store,
+            agent_run_lookup=(
+                lambda subject_id: asyncio.to_thread(
+                    agent_run_service.registry.get, subject_id
+                )
+            ),
+            # 读侧 tombstone 门禁（spec 4.4）：复用写侧同一匹配语义
+            tombstone_reader=(
+                lambda kind, subject_id, subject_revision: asyncio.to_thread(
+                    evaluation_store.has_deletion_tombstone,
+                    kind,
+                    subject_id,
+                    subject_revision,
+                )
+            ),
+        )
     graph_runner = AgentGraphRunner(
         holder,
         tool_service,
@@ -1367,6 +1940,7 @@ def build_application_services(
         artifact_guidance=ARTIFACT_GUIDANCE if settings.artifacts_enabled else None,
         telemetry=telemetry,
         agent_run_service=agent_run_service,
+        evaluation_capture=evaluation_capture,
     )
     session_service = SessionService(
         memory_store,
@@ -1376,6 +1950,11 @@ def build_application_services(
         ),
         external_memory_manager=external_memory_manager,
         hook_dispatcher=plugin_service,
+        on_session_deleted_handlers=(
+            [evaluation_deletion_service.handle_session_deleted]
+            if evaluation_deletion_service is not None
+            else None
+        ),
     )
     # Delegation subsystem (T6-T14). Gated on delegation_enabled: when False,
     # the entire subsystem is skipped (no registry/service/executor, no
@@ -2421,6 +3000,177 @@ def build_application_services(
         observability_handle=observability_handle,
         telemetry=telemetry,
         otel_link_config_service=otel_link_config_service,
+        evaluation_config_service=evaluation_config_service,
+        evaluation_store=evaluation_store,
+        evaluation_ledger_service=evaluation_ledger_service,
+        evaluation_evidence_store=(
+            evidence_store if settings.evaluation_enabled else None
+        ),
+        evaluation_worker=evaluation_worker,
+        evaluation_delivery_worker=evaluation_delivery_worker,
+        evaluation_capture=evaluation_capture,
+        evaluation_deletion_service=evaluation_deletion_service,
+        evaluation_review_service=evaluation_review_service,
+        evaluation_gauge_holder=evaluation_gauge_holder,
+        evaluation_langfuse_sink=evaluation_langfuse_sink,
+        evaluation_admin_service=evaluation_admin_service,
+        evaluation_annotation_service=evaluation_annotation_service,
+        evaluation_analytics_service=evaluation_analytics_service,
+    )
+
+
+@dataclass(frozen=True)
+class EvaluationServices:
+    """评估子域 CLI 服务装配（T14/T22；组合根权威装配属 T20）。
+
+    store/service/gate 为 evaluate CLI 的 show/retry-delivery/compare 与
+    门禁计算提供依赖；experiment_runner 自 T22 起接线（T20 延期项收口）：
+    retrieval 目标经 KBDirectTargetRunner 直调 N-KB（settings.kb_enabled
+    且 base_url 就绪时），agent_run 目标未接线（ChatCompletionService 组合
+    属应用全图，CLI 运行时按 target_unwired 逐项诚实上报）。
+    """
+
+    store: Any
+    service: Any
+    gate: Any
+    experiment_runner: Any | None = None
+
+
+def _evaluation_kb_retrieve(settings: Settings):
+    """KB 直调检索闭包（T22 AC09 组合根）：NkbKnowledgeRetriever 驱动，
+    返回 KBDirectTargetRunner 契约的响应映射（retrieval_id / trace 身份 /
+    corpus_revision / 稳定 chunk 身份结果）。evaluation_context 缺失时
+    retrieval_id 为空串（编排层过滤空检索，不伪造身份）。"""
+    from datetime import datetime as _Datetime
+
+    from app.domain.knowledge import (
+        KnowledgeBackendSearchRequest,
+        KnowledgeBase,
+        KnowledgeBaseType,
+        KnowledgeProbeStatus,
+    )
+    from app.infrastructure.knowledge.http_adapters import (
+        HttpKnowledgeRetrieverConfig,
+        NkbKnowledgeRetriever,
+    )
+
+    retriever = NkbKnowledgeRetriever(
+        HttpKnowledgeRetrieverConfig(
+            base_url=settings.kb_base_url,
+            timeout_seconds=settings.kb_timeout_seconds,
+        )
+    )
+    now = _Datetime.now()
+    base = KnowledgeBase(
+        id="evaluation-cli",
+        name="evaluation-cli",
+        description="evaluate CLI 直调检索（组合根装配）",
+        base_type=KnowledgeBaseType.N_KB,
+        base_url=settings.kb_base_url,
+        dataset_id="",
+        api_key_present=False,
+        enabled=True,
+        default_top_k=settings.kb_default_top_k,
+        default_min_score=settings.kb_default_min_score,
+        last_probe_status=KnowledgeProbeStatus.UNKNOWN,
+        last_probe_error=None,
+        last_probed_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+    async def retrieve(request: dict) -> dict:
+        result = await retriever.search(
+            base,
+            KnowledgeBackendSearchRequest(
+                query=str(request.get("query") or ""),
+                top_k=int(request.get("top_k") or settings.kb_default_top_k),
+                min_score=settings.kb_default_min_score,
+            ),
+        )
+        context = result.evaluation_context
+        trace_ref = (context.trace_ref or {}) if context else {}
+        return {
+            "retrieval_id": context.retrieval_id if context else "",
+            "trace_id": trace_ref.get("trace_id"),
+            "span_id": trace_ref.get("span_id"),
+            "corpus_revision": context.corpus_revision if context else None,
+            "results": [
+                {
+                    "document_id": snippet.document_id or "",
+                    "document_revision": snippet.document_revision or "",
+                    "chunk_id": snippet.chunk_id or "",
+                    "rank": index + 1,
+                    "snippet": snippet.content,
+                }
+                for index, snippet in enumerate(result.results)
+            ],
+        }
+
+    return retrieve
+
+
+def build_evaluation_services(
+    settings: Settings | None = None,
+) -> EvaluationServices:
+    """组装评估子域 CLI 依赖（独立账本 locals/evaluations.db，plan 架构节）。
+
+    T22 起接线 experiment_runner（T20 延期项收口）：retrieval 目标经 KB
+    直调适配执行 execute/replay（KB 未启用时逐项 target_unwired 上报）；
+    agent_run 目标经 AgentHTTPTargetRunner 调运行中的 N-Agent 服务
+    （evaluation_agent_base_url 非空时接线，#3 收口），未配置时保持
+    target_unwired 诚实上报。证据目录与快照保留沿用 B 类 settings；
+    enabled=True 仅覆盖 CLI 显式发起的实验/查询用例。"""
+    from pathlib import Path as _Path
+
+    from app.application.evaluation_experiment import EvaluationExperimentRunner
+    from app.application.evaluation_gate import EvaluationGate
+    from app.application.evaluation_service import EvaluationService
+    from app.infrastructure.evaluation.evidence_store import LocalEvidenceStore
+    from app.infrastructure.evaluation.store import SQLiteEvaluationStore
+    from app.infrastructure.evaluation.target_runner import (
+        AgentHTTPTargetRunner,
+        CompositeTargetRunner,
+        KBDirectTargetRunner,
+        build_frozen_environment,
+        experiment_item_root_scope,
+    )
+
+    settings = settings or Settings()
+    db_path = _Path(settings.evaluation_ledger_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLiteEvaluationStore(str(db_path))
+    service = EvaluationService(store, enabled=True)
+    runners: dict[str, Any] = {}
+    if settings.kb_enabled and settings.kb_base_url:
+        runners["retrieval"] = KBDirectTargetRunner(
+            retrieve=_evaluation_kb_retrieve(settings)
+        )
+    if settings.evaluation_agent_base_url:
+        runners["agent_run"] = AgentHTTPTargetRunner(
+            base_url=settings.evaluation_agent_base_url,
+            model=settings.provider_model,
+        )
+    snapshots_root = _Path(settings.evaluation_snapshots_root)
+    snapshots_root.mkdir(parents=True, exist_ok=True)
+    # 实验快照与线上 capture 同一 LogSanitizer redactor（24 项三方审阅
+    # #6）：运行时目标输出未经脱敏不得落盘并进入外部 Judge
+    from app.infrastructure.observability.logging import LogSanitizer
+
+    runner = EvaluationExperimentRunner(
+        service=service,
+        ledger=store,
+        target_runner=CompositeTargetRunner(runners=runners),
+        evidence=LocalEvidenceStore(snapshots_root, store),
+        experiment_root_scope=experiment_item_root_scope,
+        environment_fingerprint=build_frozen_environment,
+        redactor=LogSanitizer().sanitize,
+    )
+    return EvaluationServices(
+        store=store,
+        service=service,
+        gate=EvaluationGate(),
+        experiment_runner=runner,
     )
 
 
@@ -2674,6 +3424,101 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await services.task_runner.start()
             except Exception:
                 logger.exception("TaskRunner start failed")
+        # Evaluation 子域生命周期（T20）：捕获队列 / 投递 worker / 评估
+        # worker / 删除重试循环 / Gauge 刷新循环。worker 初始化失败仅
+        # 记录不阻断其它子系统（对齐 TaskRunner start 失败语义）；启动
+        # 顺序（T8 修正，spec 4.3 回填时序）：投递 worker -> 评估 worker
+        # -> 删除 runner -> 注册预设 -> usage 一次性回填 -> 捕获队列 ->
+        # Gauge 刷新 -> 证据 sweep。注册与回填先于 capture.start 完成，
+        # 捕获队列启动后产生的样本才能按已启用定义展开线上作业。
+        evaluation_refresh_task: asyncio.Task | None = None
+        evaluation_sweep_task: asyncio.Task | None = None
+        if (
+            services.settings.evaluation_enabled
+            and not _maintenance
+            and services.evaluation_worker is not None
+        ):
+            if services.evaluation_delivery_worker is not None:
+                try:
+                    await services.evaluation_delivery_worker.start()
+                except Exception:
+                    logger.exception("evaluation delivery worker start failed")
+            try:
+                await services.evaluation_worker.start()
+            except Exception:
+                logger.exception("evaluation worker start failed")
+            if services.evaluation_deletion_service is not None:
+                try:
+                    await services.evaluation_deletion_service.start()
+                except Exception:
+                    logger.exception("evaluation deletion runner start failed")
+            # C1（质量修复轮）+ #1 + T8：启动期幂等注册定义——
+            # feedback.helpful（chat.js Run 详情反馈引用）与 spec 8 正式
+            # 指标预设（自动 evaluator 的生产注册入口：线上样本作业展开
+            # 与离线实验都以已注册定义为准，此前生产从未注册自动定义，
+            # 评估闭环死点）。save_definition 同版本同内容幂等重放，每次
+            # 启动重复注册安全。注册完成后执行一次性 usage 回填（T8，
+            # spec 4.3）：migrations 账本独立数据回填版本标记，检查标记、
+            # 回填与记录标记同事务提交，重启跳过；仅自动定义启用，
+            # human 永不启用。注册失败时跳过本次回填（下次启动重试注册
+            # 成功后回填链路才成立——否则空库回填会先行提交 version=1001
+            # 标记，注册重试成功后回填被跳过，预设自动定义永久停用）；
+            # 回填自身失败仅记录不阻断启动。
+            if services.evaluation_ledger_service is not None:
+                ledger_service = services.evaluation_ledger_service
+                try:
+                    await ledger_service.register_feedback_helpful_definition()
+                    preset_model = (
+                        services.settings.evaluation_judge_provider_model
+                        if _evaluation_judge_ready(services.settings)
+                        else None
+                    )
+                    await ledger_service.register_preset_definitions(
+                        preset_model
+                    )
+                except Exception:
+                    logger.exception(
+                        "evaluation preset definitions register failed"
+                    )
+                else:
+                    # usage 一次性回填（T8，spec 4.3）仅在注册成功后执行：
+                    # 注册失败（瞬态故障）跳过本次回填，下次启动注册重试
+                    # 成功后再回填；回填自身失败仅记录，不阻断后续启动
+                    # 步骤（capture.start 继续）。
+                    if services.evaluation_admin_service is not None:
+                        admin_service = services.evaluation_admin_service
+                        try:
+                            await admin_service.backfill_definition_usage(
+                                actor="startup-migration"
+                            )
+                        except Exception:
+                            logger.exception(
+                                "evaluation definition usage backfill failed"
+                            )
+            if services.evaluation_capture is not None:
+                try:
+                    await services.evaluation_capture.start()
+                except Exception:
+                    logger.exception("evaluation capture queue start failed")
+            if services.evaluation_gauge_holder is not None:
+                evaluation_refresh_task = asyncio.create_task(
+                    _evaluation_gauge_refresh_loop(
+                        services.evaluation_gauge_holder,
+                        services.evaluation_store,
+                        capture_counters=(
+                            services.evaluation_capture.counters
+                            if services.evaluation_capture is not None
+                            else None
+                        ),
+                    )
+                )
+            # 证据 TTL 回收生产调度（#18）：小时级周期 sweep（单轮有界）
+            if services.evaluation_evidence_store is not None:
+                evaluation_sweep_task = asyncio.create_task(
+                    _evaluation_evidence_sweep_loop(
+                        services.evaluation_evidence_store,
+                    )
+                )
         if services.feishu_im_adapter is not None and not _maintenance:
             feishu_task = asyncio.create_task(services.feishu_im_adapter.start())
         if services.sandbox_manager is not None:
@@ -2814,6 +3659,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await services.task_runner.stop()
                 except Exception:
                     logger.exception("TaskRunner stop failed")
+            # Evaluation 子域关停（T20）：有界等待（各 worker 内建
+            # shutdown grace）。停止顺序（m1 修正）：gauge 刷新 ->
+            # capture -> worker -> delivery worker -> deletion runner
+            # -> Judge/HTTP 客户端释放——先停生产侧及其消费者（捕获
+            # 停止后不再产生新样本，worker/delivery 排空在途），再停
+            # 删除侧（deletion runner 需在 delivery 之后停止以复用其
+            # 出口闸语义），最后释放客户端连接池；非严格逆序是有意
+            # 选择，理由如上。
+            if evaluation_refresh_task is not None:
+                evaluation_refresh_task.cancel()
+                try:
+                    await evaluation_refresh_task
+                except asyncio.CancelledError:
+                    pass
+            if evaluation_sweep_task is not None:
+                evaluation_sweep_task.cancel()
+                try:
+                    await evaluation_sweep_task
+                except asyncio.CancelledError:
+                    pass
+            if services.evaluation_capture is not None:
+                try:
+                    await services.evaluation_capture.stop()
+                except Exception:
+                    logger.exception("evaluation capture queue stop failed")
+            if services.evaluation_worker is not None:
+                try:
+                    await services.evaluation_worker.stop()
+                except Exception:
+                    logger.exception("evaluation worker stop failed")
+            if services.evaluation_delivery_worker is not None:
+                try:
+                    await services.evaluation_delivery_worker.stop()
+                except Exception:
+                    logger.exception("evaluation delivery worker stop failed")
+            if services.evaluation_deletion_service is not None:
+                try:
+                    await services.evaluation_deletion_service.stop()
+                except Exception:
+                    logger.exception("evaluation deletion runner stop failed")
+            if services.evaluation_worker is not None:
+                # m2：经公共方法收口 Judge HTTP 客户端生命周期（不穿透
+                # 私有属性）
+                try:
+                    await services.evaluation_worker.close_evaluator()
+                except Exception:
+                    logger.exception("evaluation judge client close failed")
+            # M1：Langfuse sink HTTP 客户端（连接池）由组合根持有引用并
+            # 在关停区释放；未发生投递/禁用时 aclose 幂等无害
+            if services.evaluation_langfuse_sink is not None:
+                try:
+                    await services.evaluation_langfuse_sink.aclose()
+                except Exception:
+                    logger.exception("evaluation langfuse sink close failed")
             if feishu_task is not None:
                 feishu_task.cancel()
                 try:
@@ -2890,6 +3789,71 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if services.agent_run_service is not None:
         from app.interfaces.http.agent_run_routes import create_agent_run_router
         app.include_router(create_agent_run_router(services.agent_run_service))
+    # Evaluation producer 接收端（T17/T20）：仅 evaluation_enabled 时注册
+    # （禁用 404，与子域 gating 语义一致）；B 类凭据经认证器注入，
+    # max_message_bytes 锁定 settings.evaluation_producer_max_bytes。
+    if services.evaluation_store is not None:
+        from app.interfaces.http.evaluation_routes import (
+            BearerTokenProducerAuthenticator,
+            register_evaluation_producer_routes,
+        )
+
+        register_evaluation_producer_routes(
+            app,
+            authenticator=BearerTokenProducerAuthenticator(
+                services.settings.evaluation_producer_token, service="n-kb"
+            ),
+            evaluation_service=services.evaluation_ledger_service,
+            deletion_service=services.evaluation_deletion_service,
+            evidence_store=services.evaluation_evidence_store,
+            max_message_bytes=services.settings.evaluation_producer_max_bytes,
+        )
+    # Availability is readable even when the B-class switch leaves the subsystem unassembled.
+    @app.get("/chat/evaluations/status")
+    async def evaluation_status():
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            content={"enabled": services.evaluation_config_service is not None},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # 评估管理面路由（T21）：/chat/evaluations/*（Dashboard 同源调用，
+    # 无认证头，错误契约统一 _err）。evaluation_config_service 就绪时
+    # 注册（与 producer 同一 gating 语义：B 类总闸关闭即 404）。
+    if services.evaluation_config_service is not None:
+        from app.interfaces.http.evaluation_routes import (
+            register_evaluation_management_routes,
+        )
+
+        register_evaluation_management_routes(
+            app,
+            evaluation_service=services.evaluation_ledger_service,
+            config_service=services.evaluation_config_service,
+            review_service=services.evaluation_review_service,
+            retention_days=services.settings.evaluation_evidence_retention_days,
+            # #15：人评 agent_run 目标服务端核验（真实 Run 才接受反馈）
+            agent_run_lookup=(
+                (
+                    lambda subject_id: asyncio.to_thread(
+                        services.agent_run_service.registry.get, subject_id
+                    )
+                )
+                if services.agent_run_service is not None
+                else None
+            ),
+            # Task 9：评估工作台管理面（评估器/人工标注/分析）——只读
+            # 投影（标注队列列表、结果快照分页）同样经 Application 用例
+            # 编排（AnnotationService.list_queue /
+            # EvaluationService.list_results_snapshot），不直调账本端口
+            evaluation_admin_service=services.evaluation_admin_service,
+            evaluation_annotation_service=(
+                services.evaluation_annotation_service
+            ),
+            evaluation_analytics_service=(
+                services.evaluation_analytics_service
+            ),
+        )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.include_router(create_openai_compatible_router(services.chat_service, services.model_service, services.memory_store))
     app.include_router(create_platforms_router(services.platform_service))

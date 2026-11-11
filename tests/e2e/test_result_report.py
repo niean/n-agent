@@ -140,12 +140,18 @@ def test_runner_aggregates_only_current_children_and_keeps_failure(tmp_path, fai
             f'#!/bin/sh\necho "REPORT_DIR /app/locals/e2e-reports/{name}"\nexit {7 if failed_suite == name else 0}\n')
     for name in ("artifacts", "conversations", "otel_smoke"):
         (scripts / f"{name}.sh").chmod(0o755)
+    eval_child = repo / "locals/e2e-reports/evaluation_e2e"
+    eval_child.mkdir(parents=True)
+    (eval_child / "report.json").write_text(json.dumps(report.new_evaluation_report("eval")))
+    (scripts / "evaluation_e2e.sh").write_text(
+        '#!/bin/sh\necho "REPORT_DIR /app/locals/e2e-reports/evaluation_e2e"\nexit 0\n')
+    (scripts / "evaluation_e2e.sh").chmod(0o755)
     completed = subprocess.run(["bash", str(scripts / "run.sh")], text=True, capture_output=True, env=os.environ)
     assert completed.returncode == (1 if failed_suite == "missing" else 7 if failed_suite else 0), completed.stdout + completed.stderr
     summaries = list((repo / "locals/e2e-reports").glob("e2e-*/report.json"))
     assert len(summaries) == 1
     merged = json.loads(summaries[0].read_text())
-    assert {c["category"] for c in merged["cases"]} == ({"对话", "制品"} if failed_suite else {"对话", "制品", "OTel"})
+    assert {c["category"] for c in merged["cases"]} == ({"对话", "制品"} if failed_suite else {"对话", "制品", "OTel", "评估"})
     assert merged["exit_code"] == completed.returncode
     if failed_suite:
         assert any(case["result"] == "FAIL" for case in merged["cases"])
@@ -214,3 +220,17 @@ def test_summary_presents_final_eighteen_cases_before_retry_count(last_result):
 def test_default_otel_report_excludes_manual_comparison():
     assert [c["id"] for c in report.new_report("default")["cases"]] == ["good", "fail", "cancel"]
     assert [c["id"] for c in report.new_report("manual", comparison_only=True)["cases"]] == ["langfuse-comparison"]
+
+
+def test_evaluation_suite_report_has_four_cases_and_persists(tmp_path):
+    state = report.new_evaluation_report("eval-1")
+    assert state["suite"] == "evaluation-e2e"
+    assert [case["id"] for case in state["cases"]] == [
+        "reconciliation", "experiment", "fault", "unlinked"]
+    assert all(case["category"] == "评估" for case in state["cases"])
+    state["cases"][0].update(result="PASS", reason="")
+    report.finish(state, "http://grafana.localhost/explore", 0)
+    report.write_report(tmp_path, state)
+    markdown = (tmp_path / "result.md").read_text()
+    assert "| 评估 |" in markdown
+    assert "三元对账" in markdown

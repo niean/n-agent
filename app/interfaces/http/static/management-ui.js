@@ -146,6 +146,12 @@
   global.NAGENT = namespace;
   global.NAGENT.ui = { byId, clear, appendText, appendBadge, renderJson, renderEmpty, renderLoading, renderError, el };
   global.NAGENT.modal = { confirm, alert };
+  // Langfuse 会话入口单源常量（m6）：应用自检 links 配置
+  // （/chat/observations/otel/links）只含 Metric/Log/Trace/Profile 四个
+  // 后端地址，不含 Langfuse 会话入口，故此处为唯一权威字面量；
+  // evaluation.js / chat.js / observations-otel.js 一律引用本值，禁止
+  // 复制字面量。docker 域名变更时同步此常量。
+  global.NAGENT.ui.LANGFUSE_SESSIONS_URL = 'http://langfuse.localhost/project/n-agent-local-project/sessions';
 
   function openModalBackdrops() {
     return Array.from(document.querySelectorAll('.modal-backdrop')).filter(

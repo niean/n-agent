@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，以 Session 串联会话上下文、以 AgentRun 表达对话、任务、定时与委派执行，以及核心模型和外部边界。要求字数少、足够简洁 -->
+<!-- SUMMARY: N-Agent 的 DDD 业务架构速览，以 Session 串联会话上下文、以 AgentRun 表达对话、任务、定时与委派执行，Evaluation 串联真实流量抽样检查、人工标注回流数据集与变更效果对比，以及核心模型和外部边界。要求字数少、足够简洁 -->
 # Agent 领域模型
 
 本文介绍自研通用 Agent Runtime [N-Agent](https://github.com/niean/n-agent)。N-Agent 支持对话、任务、定时任务等功能，以 Session（会话）为核心业务模型，以 AgentRun 表达一次执行，用 LangGraph 编排模型和工具调用，用领域驱动设计（DDD）隔离业务核心与外部实现。
@@ -31,6 +31,7 @@ Agent Runtime
 │   ├── Gateway：统一飞书、CLI/TUI、ACP 的交互消息、入口会话、命令与确认，并路由至ChatCompletionService
 │   ├── Platform：飞书等外部消息平台抽象，生命周期管理
 │   ├── Config Bundle：跨机器搬运配置的打包与幂等导入，只含配置不含任何运行时数据
+│   ├── Evaluation：真实流量抽样检查、人工标注回流数据集与变更效果对比
 │   └── Usage/Observation：模型用量、成本、上下文构成与压缩收益观测
 ├── Shared Kernel
 │   └── Policy：通用决策契约
@@ -658,9 +659,25 @@ Agent 判断内容适合保存为制品
 多Agent委派入口，包括实时对话、Task worker。多Agent委派禁止递归，只支持一层；子 Agent 看不到父会话，也不能继续委派、审批任务或使用管理写工具。
 
 
-## 观测设计
+## Evaluation评估
 
-完整规范见 [07-observability.md](07-observability.md)；本节保留领域速览与精简打点样例。
+评估子域有两个作用：
+
+- ①对真实流量抽样检查，发现回答、检索或任务执行中的质量问题。
+- ②用固定数据集，对比变更前后的效果，判断改动是否有效、是否引入退步。
+
+真实流量中的样本，经人工标注与审核后可沉淀为数据集。后续更换模型、修改提示词或检索策略时，用同一版本数据集和评分标准分别评估变更前后；根据结果改进并上线，再继续抽样检查。
+
+```mermaid
+%% align: left
+flowchart LR
+    A(①真实流量抽样检查) -->|人工标注| B((固定数据集))
+    B -->|运行评估| C(②对比变更前后效果)
+    C -->|改进上线| A
+```
+
+
+## 观测设计
 
 观测解决四件事：做了什么、为何结束、哪里慢、消耗多少。各类观测信号，分布如下：
 
@@ -845,7 +862,7 @@ Interfaces -> Application -> Domain
 Infrastructure -> Domain
 ```
 
-- Domain：按领域划分定义 AgentRun、Session、Context、LLM、Memory、Tool 等核心子域，Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation 等支撑子域的领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
+- Domain：按领域划分定义 AgentRun、Session、Context、LLM、Memory、Tool 等核心子域，Skill、Knowledge、MCP、Plugin、Platform、Gateway、Schedule、Sandbox、Usage/Observation、Evaluation 等支撑子域的领域模型、值对象和端口协议；Policy 作为 Shared Kernel 只统一协议、结果枚举和决策值对象，具体规则归各领域 `XPolicy`。
 - Application：编排 Agent Runtime、Prompt 构建、工具调度、会话流程和响应事件。
 - Infrastructure：实现 OpenAI-compatible Provider、SQLite Memory、内置工具、Knowledge SQLite registry、Knowledge HTTP adapter 和配置加载。
 - Interfaces：提供 FastAPI、OpenAI-compatible API、Dashboard、SSE 和协议转换。
@@ -940,6 +957,9 @@ Domain 不依赖 FastAPI、LangGraph、SQLite、OpenAI SDK 或具体工具实现
 | Usage/Observation | 值对象 | CanonicalUsage / UsageCost / PricingEntry | Token 归一化、成本和模型定价 |
 | Usage/Observation | 值对象 | SessionUsageStats / ContextBreakdown / UsageRecord / CompressionStat | 会话累计、上下文构成、调用和压缩记录 |
 | Usage/Observation | 端口 | UsageRecorder / PricingProvider / ContextBreakdownCalculator | 用量持久化、定价查询和上下文分类边界 |
+| Evaluation | 值对象 | EvidenceSnapshot / EvaluatorDefinition / EvaluationValue | 脱敏证据快照、版本化评分标准与评分值 |
+| Evaluation | 数据集与实验模型 | DatasetManifest / DatasetCase / ExperimentItemRecord / AttemptRecord | 固定版本测试题、实验项与执行尝试 |
+| Evaluation | 端口 | EvaluationStore / EvidenceStore / Evaluator / EvaluationTargetRunner / ScoreSink | 评估记录与证据保存、评分、目标执行及结果投递边界 |
 | Shared Kernel | 共享协议 | Policy / PolicyOutcome / PolicyDecision / PolicyAuditEvent / PolicyAuditSink / ExecutionMode / PolicyDecisionKind | 各领域策略共用的评估协议、决策语言和审计通道 |
 | Policy Mesh | 领域策略 | TurnPolicy / ContextPolicy / LLMPolicy / ToolPolicy / MemoryPolicy / SandboxPolicy / GatewayPolicy / SchedulePolicy / BudgetPolicy / InformationFlowPolicy / HostTerminalPolicy / SkillPolicy / CuratorPolicy / TaskPolicy / BrowserPolicy / ArtifactPolicy / DelegationPolicy | 17 个独立领域 Policy，各自治理一个维度，不跨域导入 |
 | Policy Mesh | 值对象 | BudgetReservationDecision / InformationReleaseDecision / MemoryAccessDecision / SandboxExecutionGrant | 领域 Policy 的 typed decision |

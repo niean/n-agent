@@ -1,0 +1,44 @@
+{
+  "event_name": "gen_ai.evaluation.result",
+  "explanation_max_bytes": 512,
+  "fields": [
+    "error.type",
+    "event.name",
+    "gen_ai.evaluation.explanation",
+    "gen_ai.evaluation.name",
+    "gen_ai.evaluation.score.label",
+    "gen_ai.evaluation.score.value",
+    "nagent.evaluation.evaluation_span_id",
+    "nagent.evaluation.evaluation_trace_id",
+    "nagent.evaluation.metric_profile",
+    "nagent.evaluation.mode",
+    "nagent.evaluation.result_id",
+    "nagent.evaluation.skip_reason",
+    "nagent.evaluation.status",
+    "nagent.evaluation.target.kind",
+    "nagent.evaluation.target.service",
+    "nagent.evaluation.target.subject_id",
+    "nagent.evaluation.target.subject_revision",
+    "nagent.evaluation.target_completed_at",
+    "nagent.evaluation.target_link"
+  ],
+  "official": {
+    "content": {
+      "attributes": {
+        "gen_ai.evaluation.explanation": "short redacted summary only",
+        "gen_ai.evaluation.name": "required; evaluator/metric name",
+        "gen_ai.evaluation.score.label": "categorical label",
+        "gen_ai.evaluation.score.value": "numeric/boolean emitted as finite number (boolean 0/1)"
+      },
+      "event": "gen_ai.evaluation.result",
+      "project_extensions": "nagent.evaluation.*",
+      "reference": "semantic-conventions-genai main @ 2026-10-24 (Development)",
+      "state": "Development"
+    },
+    "content_hash": "e83012aa1b7f8217910204f57bc549b401517bd3125c6d286ebabed3bb11a336",
+    "reference": "semantic-conventions-genai main @ 2026-10-24 (Development)"
+  },
+  "pinned_otel_sdk": "1.45.1",
+  "schema_hash": "5c22ecd72e4fc43b0ce6400698ab118d8734dd6a760081acde3cacd00e18b7cb",
+  "schema_version": "n-eval-v1"
+}

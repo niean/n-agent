@@ -24,12 +24,13 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 case "$SUITE" in
-  all) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh" "$SCRIPT_DIR/conversations.sh" "$SCRIPT_DIR/otel_smoke.sh") ;;
+  all) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh" "$SCRIPT_DIR/conversations.sh" "$SCRIPT_DIR/otel_smoke.sh" "$SCRIPT_DIR/evaluation_e2e.sh") ;;
   artifacts) CASE_SCRIPTS=("$SCRIPT_DIR/artifacts.sh") ;;
   conversations) CASE_SCRIPTS=("$SCRIPT_DIR/conversations.sh") ;;
   otel-smoke) CASE_SCRIPTS=("$SCRIPT_DIR/otel_smoke.sh") ;;
+  evaluation-e2e) CASE_SCRIPTS=("$SCRIPT_DIR/evaluation_e2e.sh") ;;
   *)
-    echo "usage: tests/e2e/run.sh [all|artifacts|conversations|otel-smoke]" >&2
+    echo "usage: tests/e2e/run.sh [all|artifacts|conversations|otel-smoke|evaluation-e2e]" >&2
     exit 2
     ;;
 esac
@@ -75,9 +76,10 @@ for case_script in "${CASE_SCRIPTS[@]}"; do
         REPORT_DIRS+=("$child_report")
         found_report=1
       fi
-    done < <(sed -n 's/^REPORT_DIR //p' "$REPORT_DIR/$(basename "$case_script").log")
+    done < <(LC_ALL=C sed -n 's/^REPORT_DIR //p' "$REPORT_DIR/$(basename "$case_script").log")
     category=对话
     [ "$(basename "$case_script")" != otel_smoke.sh ] || category=OTel
+    [ "$(basename "$case_script")" != evaluation_e2e.sh ] || category=评估
     if [ "$found_report" -eq 1 ] && [ "$case_result" -ne 0 ]; then
       failure_dir="$REPORT_DIR/$(basename "$case_script" .sh)-failure"
       python3 "$SCRIPT_DIR/result_report.py" "$failure_dir" suite-failure "$RUN_ID" "$category" "$(basename "$case_script") / 套件执行或清理" "$case_result"

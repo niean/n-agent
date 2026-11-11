@@ -87,6 +87,21 @@
           <a class="sidebar__item sidebar__item--child" href="/observations/otel" data-tab="observations-otel"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">OTel</span></a>
         </div>
       </div>
+      <div class="sidebar__group" data-tab-group="evaluations">
+        <button class="sidebar__item sidebar__item--parent" type="button" data-tab="evaluations" aria-expanded="false">
+          <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M9 4H5v17h14V4h-4M9 3h6v4H9V3ZM8 13l2 2 5-5M8 18h8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+          <span class="sidebar__item-label">评估</span>
+          <span class="sidebar__item-chevron" aria-hidden="true">▸</span>
+        </button>
+        <div class="sidebar__submenu" data-submenu-of="evaluations">
+          <a class="sidebar__item sidebar__item--child" href="/evaluations" data-tab="evaluations-overview"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">概览</span></a>
+          <a class="sidebar__item sidebar__item--child" href="/evaluations/datasets" data-tab="evaluations-datasets"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">数据集</span></a>
+          <a class="sidebar__item sidebar__item--child" href="/evaluations/evaluators" data-tab="evaluations-evaluators"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">评估器</span></a>
+          <a class="sidebar__item sidebar__item--child" href="/evaluations/experiments" data-tab="evaluations-experiments"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">实验</span></a>
+          <a class="sidebar__item sidebar__item--child" href="/evaluations/results" data-tab="evaluations-results"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">结果</span></a>
+          <a class="sidebar__item sidebar__item--child" href="/evaluations/annotations" data-tab="evaluations-annotations"><span class="sidebar__item-icon" aria-hidden="true"></span><span class="sidebar__item-label">人工标注</span></a>
+        </div>
+      </div>
       <div class="sidebar__group" data-tab-group="security">
         <button class="sidebar__item sidebar__item--parent" type="button" data-tab="security" aria-expanded="false">
           <span class="sidebar__item-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 3v6c0 5-3.4 7.7-8 9-4.6-1.3-8-4-8-9V6l8-3Z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
@@ -326,6 +341,7 @@
 
     <div class="tab-content" id="tab-observations-sessions"></div>
     <div class="tab-content" id="tab-observations-otel"></div>
+    <div class="tab-content" id="tab-evaluations"></div>
     <div class="tab-content" id="tab-security"></div>
     <div class="tab-content" id="tab-browser"></div>
   </main>
@@ -352,6 +368,7 @@
   <script src="/static/host.js"></script>
   <script src="/static/observations.js"></script>
   <script src="/static/observations-otel.js"></script>
+  <script src="/static/evaluation.js"></script>
   <script src="/static/security.js"></script>
   <script src="/static/topnav.js"></script>
   <script src="/static/tasks-observations.js"></script>

@@ -69,6 +69,25 @@ class KnowledgeSnippet:
     score: float | None
     source: str | None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # 评估证据用的稳定身份（可选，兼容旧响应缺省 None；spec 7.2）
+    document_id: str | None = None
+    document_revision: str | None = None
+    chunk_id: str | None = None
+    chunk_content_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class KnowledgeEvaluationContext:
+    """N-KB 检索响应附带的评估上下文（可选；spec 7.2 evaluation_context）。
+
+    retrieval_id 是每次真实检索的唯一 ID，是 KB metric 幂等身份的坐标；
+    corpus_revision 关联语料版本；trace_ref 携带真实 Trace 身份（无则空）。
+    """
+
+    retrieval_id: str
+    corpus_revision: str | None = None
+    trace_ref: dict[str, Any] | None = None
+    integrity: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +97,8 @@ class KnowledgeSearchResult:
     base_type: KnowledgeBaseType
     query: str
     results: list[KnowledgeSnippet]
+    # 评估上下文（可选；旧响应缺省 None，保持兼容）
+    evaluation_context: KnowledgeEvaluationContext | None = None
 
 
 class KnowledgeBaseNotFoundError(Exception):

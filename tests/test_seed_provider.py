@@ -128,7 +128,11 @@ def test_build_application_services_wires_scheduler(tmp_path: Path):
 
     assert services.schedule_service is not None
     assert services.scheduler_runner is not None
-    assert services.session_service.on_session_deleted == services.schedule_service.handle_session_deleted
+    # evaluation_enabled 默认 true：构造期 handler 列表首项是评估删除处理
+    # 器（main.py），调度处理器随后追加；断言其已注册而非恒为首项
+    handlers = services.session_service._on_session_deleted_handlers
+    assert services.schedule_service.handle_session_deleted in handlers
+    assert services.evaluation_deletion_service.handle_session_deleted in handlers
     assert services.health_snapshot()["scheduler"]["status"] == "disabled"
 
 

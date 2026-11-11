@@ -436,6 +436,33 @@ processors:
           - 'set(cache["details"]["retrieval_output"]["truncated"], attributes["nkb.content.retrieval_output_truncated"]) where resource.attributes["service.name"] == "n-kb" and attributes["nkb.content.retrieval_output"] != nil and attributes["nkb.content.retrieval_output_truncated"] != nil'
           - 'set(cache["details"]["retrieval_output"]["incomplete"], attributes["nkb.content.retrieval_output_incomplete"]) where resource.attributes["service.name"] == "n-kb" and attributes["nkb.content.retrieval_output"] != nil and attributes["nkb.content.retrieval_output_incomplete"] != nil'
           - 'set(cache["details"]["retrieval_output"]["observed_bytes"], attributes["nkb.content.retrieval_output_observed_bytes"]) where resource.attributes["service.name"] == "n-kb" and attributes["nkb.content.retrieval_output"] != nil and attributes["nkb.content.retrieval_output_observed_bytes"] != nil'
+          # ===== 评估事件投影边界（T11，spec 12.1 n-eval-v1）=====
+          # 仅注册事件 gen_ai.evaluation.result 进入评估投影：封闭字段白名单
+          # 逐键显式复制（nagent.evaluation.* + gen_ai.evaluation.name/
+          # score.*）；explanation 与日志原文永不投影（不进行体、不进 Loki
+          # 索引标签/structured metadata）；未注册事件不进入本分支，保持既有
+          # unknown/过滤语义；外来 langfuse.* 属性在本管线无任何投影通道。
+          # 下方事件判别别名必须先于既有 event 读取与 unknown 回退语句，
+          # 否则评估事件码被回退覆盖、评估记录被当作 unknown 过滤。
+          - 'set(attributes["event"], attributes["event.name"]) where attributes["event.name"] == "gen_ai.evaluation.result"'
+          - 'set(cache["evaluation"], {}) where attributes["event.name"] == "gen_ai.evaluation.result"'
+          - 'set(cache["evaluation"]["error.type"], attributes["error.type"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["error.type"] != nil'
+          - 'set(cache["evaluation"]["gen_ai.evaluation.name"], attributes["gen_ai.evaluation.name"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["gen_ai.evaluation.name"] != nil'
+          - 'set(cache["evaluation"]["gen_ai.evaluation.score.label"], attributes["gen_ai.evaluation.score.label"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["gen_ai.evaluation.score.label"] != nil'
+          - 'set(cache["evaluation"]["gen_ai.evaluation.score.value"], attributes["gen_ai.evaluation.score.value"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["gen_ai.evaluation.score.value"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.evaluation_span_id"], attributes["nagent.evaluation.evaluation_span_id"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.evaluation_span_id"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.evaluation_trace_id"], attributes["nagent.evaluation.evaluation_trace_id"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.evaluation_trace_id"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.metric_profile"], attributes["nagent.evaluation.metric_profile"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.metric_profile"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.mode"], attributes["nagent.evaluation.mode"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.mode"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.result_id"], attributes["nagent.evaluation.result_id"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.result_id"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.skip_reason"], attributes["nagent.evaluation.skip_reason"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.skip_reason"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.status"], attributes["nagent.evaluation.status"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.status"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.target.kind"], attributes["nagent.evaluation.target.kind"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.target.kind"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.target.service"], attributes["nagent.evaluation.target.service"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.target.service"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.target.subject_id"], attributes["nagent.evaluation.target.subject_id"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.target.subject_id"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.target.subject_revision"], attributes["nagent.evaluation.target.subject_revision"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.target.subject_revision"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.target_completed_at"], attributes["nagent.evaluation.target_completed_at"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.target_completed_at"] != nil'
+          - 'set(cache["evaluation"]["nagent.evaluation.target_link"], attributes["nagent.evaluation.target_link"]) where attributes["event.name"] == "gen_ai.evaluation.result" and attributes["nagent.evaluation.target_link"] != nil'
           # Read the fixed event code from attributes (never from the body);
           # unknown/missing events are the fixed diagnostic code.
           - 'set(cache["event"], attributes["event"]) where attributes["event"] != nil'
@@ -448,6 +475,17 @@ processors:
           # 指向空 trace 的伪 Tempo 链接，故无关联日志不含 trace 字段。
           - 'set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "message": cache["message"], "context": {"execution": cache["execution"]}, "details": cache["details"], "exception": cache["exception"], "stack": cache["stack"], "trace_id": trace_id.string, "span_id": span_id.string}) where trace_id.string != "00000000000000000000000000000000"'
           - 'set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "message": cache["message"], "context": {"execution": cache["execution"]}, "details": cache["details"], "exception": cache["exception"], "stack": cache["stack"]}) where trace_id.string == "00000000000000000000000000000000"'
+          # 评估事件行体独立交付（T11）：封闭 evaluation 信封覆盖业务行体形状，
+          # linked 携带 trace 关联、unlinked 不携带伪 Tempo 链接字段。这两条
+          # 必须保持在业务行体装配语句之后（last-writer-wins：前移会被业务
+          # 行体覆盖评估信封）。
+          - 'set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "evaluation": cache["evaluation"], "trace_id": trace_id.string, "span_id": span_id.string}) where attributes["event.name"] == "gen_ai.evaluation.result" and trace_id.string != "00000000000000000000000000000000"'
+          - 'set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "evaluation": cache["evaluation"]}) where attributes["event.name"] == "gen_ai.evaluation.result" and trace_id.string == "00000000000000000000000000000000"'
+          # 评估记录属性显式清空：白名单之外的任何属性（含外来 langfuse.*）
+          # 不进入 Loki structured metadata/索引标签。该语句必须存在——服务级
+          # 清空语句只覆盖 n-agent/n-kb，无法覆盖非 n-agent 服务伪造的评估
+          # 记录（与另两条清空语句的先后顺序无语义依赖）。
+          - 'set(attributes, {}) where attributes["event.name"] == "gen_ai.evaluation.result"'
           # N-Agent attributes are explicitly projected above, never arbitrary Loki metadata.
           - 'set(attributes, {}) where resource.attributes["service.name"] == "n-agent"'
           # N-KB attributes are already explicitly represented in the JSON body.

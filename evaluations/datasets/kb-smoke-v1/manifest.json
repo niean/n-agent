@@ -1,0 +1,758 @@
+{
+  "schema_version": "1",
+  "dataset_id": "kb-smoke-v1",
+  "dataset_version": "1",
+  "role": "smoke",
+  "quality_note": "冒烟规模数据集：仅用于评估管道冒烟验证与联调，样本量不足以宣称总体质量；门禁不得据此宣称总体质量，正式发布基准需使用更大规模数据集。",
+  "corpus_note": "冻结测试语料：fixtures/test-corpus.json（sha256 见各 case 的 fixture_sha256），全部 qrels 身份必须能在该语料中解析，语料内容为合成数据。",
+  "target_kind": "retrieval",
+  "dataset_hash": "9f70ca24cbb38d6e20597aa5355985d30cadf800591caea89aa044ef6f86bc96",
+  "cases": [
+    {
+      "case_id": "kb-smoke-normal-01",
+      "input": {
+        "turns": [
+          {
+            "query": "如何在 Smoke Demo 中创建一条笔记？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c01",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-overview-c02",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-normal-02",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 的任务提醒怎么设置？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c03",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c02",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-normal-03",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 免费版的配额上限是多少？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-overview-c04",
+          "grade": 2
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-normal-04",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 1.3 版本新增了什么功能？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-changelog-c04",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c04",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-normal-05",
+      "input": {
+        "turns": [
+          {
+            "query": "怎么导出 Smoke Demo 的全部数据？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c05",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c06",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-normal-06",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 支持笔记版本历史吗？保留多少个版本？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c05",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-changelog-c05",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-normal-07",
+      "input": {
+        "turns": [
+          {
+            "query": "如何在 Smoke Demo 的看板视图中移动任务？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c05",
+          "grade": 2
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-normal-08",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 的循环任务如何配置？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "normal",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c04",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-changelog-c04",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-partial-01",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 里怎么重命名笔记本？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "partial-relevance",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c02",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c03",
+          "grade": 1
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c04",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-partial-02",
+      "input": {
+        "turns": [
+          {
+            "query": "登录 Smoke Demo 时验证码收不到怎么办？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "partial-relevance",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c01",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c04",
+          "grade": 1
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c02",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-partial-03",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 的搜索支持按标签过滤吗？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "partial-relevance",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c04",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c03",
+          "grade": 1
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c05",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-partial-04",
+      "input": {
+        "turns": [
+          {
+            "query": "归档后的任务在哪里找回？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "partial-relevance",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c06",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c05",
+          "grade": 1
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c03",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-partial-05",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 的同步冲突如何解决？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "partial-relevance",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c02",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c03",
+          "grade": 1
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c06",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-empty-01",
+      "input": {
+        "turns": [
+          {
+            "query": "列出带标签 release-notes 的同步冲突说明",
+            "top_k": 5,
+            "filters": {
+              "tag": "eval-empty-tag"
+            }
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "empty-result",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c02",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c03",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-empty-02",
+      "input": {
+        "turns": [
+          {
+            "query": "在工作区 smoke-eval-empty 中搜索任务归档说明",
+            "top_k": 5,
+            "filters": {
+              "workspace": "smoke-eval-empty"
+            }
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "empty-result",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c06",
+          "grade": 2
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-empty-03",
+      "input": {
+        "turns": [
+          {
+            "query": "检索作者标记为 eval-empty-author 的变更记录",
+            "top_k": 5,
+            "filters": {
+              "author": "eval-empty-author"
+            }
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "empty-result",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-changelog-c03",
+          "grade": 2
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-changelog-c06",
+          "grade": 1
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-empty-04",
+      "input": {
+        "turns": [
+          {
+            "query": "在语言过滤器 lang=smoke-empty-lang 下检索通知设置帮助",
+            "top_k": 5,
+            "filters": {
+              "lang": "smoke-empty-lang"
+            }
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "empty-result",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c04",
+          "grade": 2
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "metric_applicability": {
+        "kb.recall_at_5": true,
+        "kb.ndcg_at_5": true,
+        "kb.mrr_at_5": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-noanswer-01",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 的创始人是谁？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "no-answer",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-overview-c03",
+          "grade": 0
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-overview-c05",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "no_answer": true,
+      "metric_applicability": {
+        "kb.recall_at_5": false,
+        "kb.ndcg_at_5": false,
+        "kb.mrr_at_5": false,
+        "kb.no_answer_task": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-noanswer-02",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 服务端密钥轮换的操作步骤是什么？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "no-answer",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-overview-c05",
+          "grade": 0
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c06",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "no_answer": true,
+      "metric_applicability": {
+        "kb.recall_at_5": false,
+        "kb.ndcg_at_5": false,
+        "kb.mrr_at_5": false,
+        "kb.no_answer_task": true
+      }
+    },
+    {
+      "case_id": "kb-smoke-noanswer-03",
+      "input": {
+        "turns": [
+          {
+            "query": "Smoke Demo 内部数据库的表结构是什么？",
+            "top_k": 5,
+            "filters": {}
+          }
+        ]
+      },
+      "target_kind": "retrieval",
+      "slice": "no-answer",
+      "qrels": [
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-troubleshooting-c03",
+          "grade": 0
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-notes-c04",
+          "grade": 0
+        },
+        {
+          "corpus_revision": "kb-smoke-corpus-r1",
+          "document_revision": "r1",
+          "chunk_id": "smoke-doc-tasks-c06",
+          "grade": 0
+        }
+      ],
+      "corpus_revision": "kb-smoke-corpus-r1",
+      "fixture": "fixtures/test-corpus.json",
+      "fixture_sha256": "3332adbfdfe315084bd76a5aa5a33e389aef6320c1714608e8e8bf0fbb0df8fc",
+      "no_answer": true,
+      "metric_applicability": {
+        "kb.recall_at_5": false,
+        "kb.ndcg_at_5": false,
+        "kb.mrr_at_5": false,
+        "kb.no_answer_task": true
+      }
+    }
+  ]
+}

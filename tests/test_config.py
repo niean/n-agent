@@ -1312,3 +1312,10 @@ def test_grafana_trace_url_is_validated(monkeypatch):
     assert settings.otel_grafana_traces_base_url == "https://grafana.example.com/grafana/explore"
     with pytest.raises(ValueError):
         Settings(_env_file=None, otel_grafana_traces_base_url="https://user:secret@grafana.example.com/explore")
+
+
+def test_evaluation_enabled_by_default_and_env_can_disable(monkeypatch):
+    monkeypatch.delenv('N_AGENT_EVALUATION_ENABLED', raising=False)
+    assert Settings(_env_file=None).evaluation_enabled is True
+    monkeypatch.setenv('N_AGENT_EVALUATION_ENABLED', 'false')
+    assert Settings(_env_file=None).evaluation_enabled is False

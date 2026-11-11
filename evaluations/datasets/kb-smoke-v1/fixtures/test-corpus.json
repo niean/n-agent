@@ -1,0 +1,161 @@
+{
+  "corpus_revision": "kb-smoke-corpus-r1",
+  "description": "kb-smoke-v1 冻结测试语料（合成内容，仅冒烟评估用）",
+  "documents": [
+    {
+      "document_id": "smoke-doc-overview",
+      "document_revision": "r1",
+      "title": "Smoke Demo 产品概览",
+      "chunks": [
+        {
+          "chunk_id": "smoke-doc-overview-c01",
+          "text": "Smoke Demo 是一个面向个人开发者的演示用笔记与任务管理服务，提供笔记、任务、检索与基础协作能力。"
+        },
+        {
+          "chunk_id": "smoke-doc-overview-c02",
+          "text": "快速开始：注册演示账号后，通过网页端或命令行工具登录，即可创建第一个笔记与任务。"
+        },
+        {
+          "chunk_id": "smoke-doc-overview-c03",
+          "text": "角色说明：演示环境提供 owner、member 与 viewer 三种角色，权限粒度到笔记本与任务看板。"
+        },
+        {
+          "chunk_id": "smoke-doc-overview-c04",
+          "text": "免费版配额：单账号最多 500 条笔记、200 个任务，附件总容量 1 GB，超出后需要升级演示计划。"
+        },
+        {
+          "chunk_id": "smoke-doc-overview-c05",
+          "text": "常见问题：Smoke Demo 不提供内置代码编译器，也不承载任何真实生产数据，全部内容均为演示用途。"
+        },
+        {
+          "chunk_id": "smoke-doc-overview-c06",
+          "text": "数据边界：演示环境的全部数据每日重置一次，重置窗口为 UTC 02:00，期间只读。"
+        }
+      ]
+    },
+    {
+      "document_id": "smoke-doc-notes",
+      "document_revision": "r1",
+      "title": "Smoke Demo 笔记功能",
+      "chunks": [
+        {
+          "chunk_id": "smoke-doc-notes-c01",
+          "text": "创建笔记：在笔记页点击新建，输入标题与正文后保存；笔记支持 Markdown 与纯文本两种格式。"
+        },
+        {
+          "chunk_id": "smoke-doc-notes-c02",
+          "text": "编辑与重命名：打开笔记后可修改标题与正文；笔记本（集合）的重命名入口在侧边栏的集合菜单中。"
+        },
+        {
+          "chunk_id": "smoke-doc-notes-c03",
+          "text": "标签：每条笔记最多 8 个标签，标签支持颜色标记；检索页可按标签组合过滤笔记。"
+        },
+        {
+          "chunk_id": "smoke-doc-notes-c04",
+          "text": "搜索：笔记检索支持标题全文匹配与标签过滤，检索结果按更新时间排序，前 50 条分页返回。"
+        },
+        {
+          "chunk_id": "smoke-doc-notes-c05",
+          "text": "版本历史：笔记每次保存生成一个版本，保留最近 30 个版本，可随时回滚到任意历史版本。"
+        },
+        {
+          "chunk_id": "smoke-doc-notes-c06",
+          "text": "导出：支持将单条笔记导出为 Markdown 文件，或批量导出整个笔记本为归档包。"
+        }
+      ]
+    },
+    {
+      "document_id": "smoke-doc-tasks",
+      "document_revision": "r1",
+      "title": "Smoke Demo 任务功能",
+      "chunks": [
+        {
+          "chunk_id": "smoke-doc-tasks-c01",
+          "text": "创建任务：在任务看板点击新建卡片，填写标题、负责人与截止日期后保存。"
+        },
+        {
+          "chunk_id": "smoke-doc-tasks-c02",
+          "text": "截止日期：任务支持具体日期与相对期限两种写法，到期前 24 小时发送一次提醒。"
+        },
+        {
+          "chunk_id": "smoke-doc-tasks-c03",
+          "text": "提醒设置：提醒通过站内信与邮件双通道发送，可在个人设置中关闭任一通道。"
+        },
+        {
+          "chunk_id": "smoke-doc-tasks-c04",
+          "text": "循环任务：按天、周、月设置重复规则，循环任务完成后自动生成下一个周期的实例。"
+        },
+        {
+          "chunk_id": "smoke-doc-tasks-c05",
+          "text": "看板视图：看板按状态列组织任务，拖拽卡片即可变更状态；列顺序支持自定义。"
+        },
+        {
+          "chunk_id": "smoke-doc-tasks-c06",
+          "text": "归档：完成任务可归档，归档任务从看板消失但保留在归档列表，可搜索并恢复。"
+        }
+      ]
+    },
+    {
+      "document_id": "smoke-doc-changelog",
+      "document_revision": "r1",
+      "title": "Smoke Demo 变更记录",
+      "chunks": [
+        {
+          "chunk_id": "smoke-doc-changelog-c01",
+          "text": "1.0：首个演示版本，提供笔记、任务与基础检索能力。"
+        },
+        {
+          "chunk_id": "smoke-doc-changelog-c02",
+          "text": "1.1：新增笔记标签颜色标记，修复检索分页在末页重复返回的问题。"
+        },
+        {
+          "chunk_id": "smoke-doc-changelog-c03",
+          "text": "1.2：任务看板支持自定义列顺序，归档列表新增按归档时间排序。"
+        },
+        {
+          "chunk_id": "smoke-doc-changelog-c04",
+          "text": "1.3：新增循环任务能力，任务提醒支持双通道配置。"
+        },
+        {
+          "chunk_id": "smoke-doc-changelog-c05",
+          "text": "1.4：笔记版本历史保留数量从 10 提升到 30，新增批量导出笔记本。"
+        },
+        {
+          "chunk_id": "smoke-doc-changelog-c06",
+          "text": "1.5：检索接口返回稳定片段标识，支持按工作区过滤（演示用）。"
+        }
+      ]
+    },
+    {
+      "document_id": "smoke-doc-troubleshooting",
+      "document_revision": "r1",
+      "title": "Smoke Demo 故障排查",
+      "chunks": [
+        {
+          "chunk_id": "smoke-doc-troubleshooting-c01",
+          "text": "登录问题：验证码未收到时，先检查垃圾箱与手机拦截记录；演示环境验证码统一延迟约 60 秒送达。"
+        },
+        {
+          "chunk_id": "smoke-doc-troubleshooting-c02",
+          "text": "同步冲突：同一笔记在两端同时编辑时，保留时间戳较新的版本，被覆盖版本进入版本历史。"
+        },
+        {
+          "chunk_id": "smoke-doc-troubleshooting-c03",
+          "text": "性能：笔记列表超过 1000 条时建议按笔记本拆分；演示环境不做性能承诺。"
+        },
+        {
+          "chunk_id": "smoke-doc-troubleshooting-c04",
+          "text": "通知：站内信实时送达；邮件通知依赖演示邮件服务，可能延迟数分钟。"
+        },
+        {
+          "chunk_id": "smoke-doc-troubleshooting-c05",
+          "text": "数据导出：全部数据导出入口在设置页，生成归档包后 24 小时内有效。"
+        },
+        {
+          "chunk_id": "smoke-doc-troubleshooting-c06",
+          "text": "联系支持：演示环境不设人工支持，问题请通过示例邮箱 support@example.com 反馈。"
+        }
+      ]
+    }
+  ]
+}

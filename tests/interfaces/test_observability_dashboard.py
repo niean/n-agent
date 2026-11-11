@@ -644,6 +644,9 @@ let fetchCalls = 0;
     el: (tag, cls) => { const n = makeEl(tag); if (cls) String(cls).split(/\s+/).filter(Boolean).forEach((c) => n._cls.add(c)); return n; },
     renderLoading: (parent, msg) => { const d = makeEl('div'); d.textContent = msg || '加载中...'; parent.appendChild(d); },
     renderError: (parent, msg) => { const d = makeEl('div'); d.textContent = msg || '加载失败'; parent.appendChild(d); },
+    // m6：Langfuse 会话 URL 单源在 management-ui.js（真实加载顺序在
+    // observations-otel.js 之前）；VM 桩同契约提供
+    LANGFUSE_SESSIONS_URL: 'http://langfuse.localhost/project/n-agent-local-project/sessions',
   };
   const win = {
     NAGENT: { ui: ui, api: { fetchJson(url) { fetchCalls++; ok(url === '/chat/observations/otel', 'module fetches the self-check API (got ' + url + ')'); return Promise.resolve(snapshotPayload); } } },

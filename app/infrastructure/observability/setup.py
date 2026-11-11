@@ -413,11 +413,19 @@ class _BoundedLocalMetricExporter:
 
 
 def _build_sampler(ratio: float):
-    """ParentBased(TraceIdRatioBased(ratio)): the ratio only constrains
-    parentless local roots; parent decisions (incl. remote) are inherited."""
+    """TrustedExperimentSampler(ParentBased(TraceIdRatioBased(ratio))): the
+    ratio only constrains parentless local roots; parent decisions (incl.
+    remote) are inherited. T13 (spec 11.1): the trusted-experiment wrapper
+    force-samples ONLY the server-side trusted experiment-item root (private
+    context token, never client header/baggage); child spans keep the
+    ParentBased behavior below."""
     from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
-    return ParentBased(TraceIdRatioBased(ratio))
+    from app.infrastructure.observability.experiment_sampler import (
+        TrustedExperimentSampler,
+    )
+
+    return TrustedExperimentSampler(ParentBased(TraceIdRatioBased(ratio)))
 
 
 # ---------------------------------------------------------------------------

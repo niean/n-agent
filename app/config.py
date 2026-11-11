@@ -310,6 +310,77 @@ class Settings(BaseSettings):
     # 请求 options、URL、响应模型不参与映射。
     model_billing_identity_map: str = Field(default="")
 
+    # Evaluation producer 接收端配置（B 类启动期 env-only，Dashboard 无写
+    # 入口）。服务专属 Bearer 凭据（绑定 service=n-kb）；为空表示 producer
+    # 通道关闭（所有请求 401）。禁止硬编码默认凭据，凭据不落库不进日志。
+    evaluation_producer_token: str = Field(default="")
+    # 单条 producer 消息 UTF-8 字节上限（与证据快照 2MiB 上限对齐；超限 413）
+    evaluation_producer_max_bytes: int = Field(default=2097152, gt=0)
+    # agent_run 实验目标的 N-Agent 服务地址（#3，B 类 env-only）：CLI 进
+    # 程不重建应用全图，agent_run 目标经该地址的 OpenAI 兼容端点执行；
+    # 空串 = agent_run 目标未接线（CompositeTargetRunner 按
+    # target_unwired 诚实上报，不影响 retrieval 目标）
+    evaluation_agent_base_url: str = Field(default="")
+
+    # Evaluation 子域总闸与生命周期上限（B 类启动期 env-only，Dashboard 无
+    # 写入口）。evaluation_enabled=False 时整个子域不装配（worker/路由/
+    # 捕获 hook/Judge 调用全部缺省，E2E 兼容）；True 时装配失败 fail-fast。
+    evaluation_enabled: bool = Field(default=True)
+    # 评估独立账本 DB 与证据正文目录（与业务 sessions.db 分离）
+    evaluation_ledger_path: str = Field(default="locals/evaluations.db")
+    evaluation_snapshots_root: str = Field(default="locals/evaluation_snapshots")
+    # 审核后导出数据集根目录（B 类 env-only，T21 受控导出）：导出
+    # manifest 与 fixture/rubric 落盘位置，相对路径在装配时 resolve 到
+    # workspace_root 下
+    evaluation_export_datasets_root: str = Field(
+        default="locals/evaluation-datasets"
+    )
+    # C 类 worker 并发的 B 类部署上限（C evaluation_worker_concurrency 不得
+    # 超过此值；跨字段约束在 domain validate_evaluation_config 单一来源）
+    evaluation_worker_max_concurrency: int = Field(default=4, ge=1, le=16)
+    # worker C 类基线（DB 覆盖可改；当前装配下启动期生效）
+    evaluation_worker_concurrency: int = Field(default=1, ge=1)
+    evaluation_worker_lease_seconds: int = Field(default=300, gt=0)
+    evaluation_worker_shutdown_grace_seconds: int = Field(default=30, gt=0)
+    # Judge 日调用预算（C 类基线；0 = 不设上限）
+    evaluation_daily_call_ceiling: int = Field(default=0, ge=0)
+    # 捕获 C 类基线：抽样率/policy 版本（DB 覆盖可热改，捕获点即时生效）
+    evaluation_capture_enabled: bool = Field(default=False)
+    evaluation_sampling_rate: float = Field(
+        default=0.0, ge=0, le=1, allow_inf_nan=False
+    )
+    evaluation_failure_sampling_rate: float = Field(
+        default=0.0, ge=0, le=1, allow_inf_nan=False
+    )
+    evaluation_sampling_policy_version: str = Field(default="capture-sampling-v1")
+    # 捕获队列容量（B 类生命周期上限；C 并发/队列不得超过 B 允许范围）
+    evaluation_capture_queue_maxsize: int = Field(default=1000, ge=1)
+    # 证据正文保留天数（B 类保留边界；TTL 回收；spec 13 快照保留 7 天）
+    evaluation_evidence_retention_days: int = Field(default=7, ge=1)
+    # 待执行作业上限（B 类容量边界；spec 343 默认 10000）
+    evaluation_max_pending_jobs: int = Field(default=10000, ge=1)
+    # 证据目录总容量上限（B 类容量边界；spec 343 默认 256 MiB）
+    evaluation_max_evidence_bytes: int = Field(
+        default=256 * 1024 * 1024, gt=0
+    )
+    # Langfuse sink 连接（B 类启动期绑定；四字段须同时为空或同时非空，
+    # 部分设置在装配期 fail-fast）。base_url 有意不走 Settings 的
+    # _validate_http_url（n2）：默认空 = sink 禁用必须放行（gating 语义
+    # 与 provider_base_url 的"总以非空装配"不同），非空时的 scheme/host/
+    # 内嵌凭据校验保持在装配期由 LangfuseScoreSink._validate_base_url
+    # 执行（组合根 fail-fast）
+    evaluation_langfuse_base_url: str = Field(default="")
+    evaluation_langfuse_public_key: str = Field(default="")
+    evaluation_langfuse_secret_key: str = Field(default="")
+    evaluation_langfuse_project: str = Field(default="")
+    # Judge 独立 Provider 连接（B 类启动期绑定；三字段须同时为空或同时
+    # 非空，部分设置在装配期 fail-fast）。base_url 同上：禁用态（空串）
+    # 不校验，非空时由 judge provider 构造期校验（保持装配期校验）
+    evaluation_judge_provider_base_url: str = Field(default="")
+    evaluation_judge_provider_api_key: str = Field(default="")
+    evaluation_judge_provider_model: str = Field(default="")
+    evaluation_judge_timeout_seconds: int = Field(default=60, ge=5, le=600)
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 
     @staticmethod
@@ -400,6 +471,17 @@ class Settings(BaseSettings):
                 "(must be 'host_cdp' or 'container')"
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_evaluation_subsystem(self) -> "Settings":
+        # C 并发基线不得超过 B 类部署上限（domain validate_evaluation_config
+        # 对 DB 覆盖层执行同一约束；此处为 env 基线的启动期同源校验）
+        if self.evaluation_worker_concurrency > self.evaluation_worker_max_concurrency:
+            raise ValueError(
+                "evaluation_worker_concurrency must be <= "
+                "evaluation_worker_max_concurrency"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_context_compression_ratios(self) -> "Settings":

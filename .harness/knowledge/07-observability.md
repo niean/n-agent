@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 类型、模型参数/首输出时间/费用与检索评估映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收；模型成本语义（AttemptCost 生命周期、8 原因判定顺序、计价身份冻结/实例绑定、账本观测同源、3 个成本 Counter 与实测名称、Langfuse 成组校验/unknown 不推价、Grafana 面板语义、E2E 对账口径）；Langfuse独立部署与Collector并存；N-KB专属Langfuse投影契约 -->
+<!-- SUMMARY: N-Agent 可观测权威规范：六项共性原则、业务入口与异步归属、N-Agent 观测统一语义设计、对象/操作/属性/事件/结果/身份与指标、Policy 安全审计、Langfuse 类型、模型参数/首输出时间/费用与检索评估映射、完成日志、脱敏有界详情、低基数指标与 exemplar、故障隔离、真实 SDK/后端证据和历史数据验收；模型成本语义（AttemptCost 生命周期、8 原因判定顺序、计价身份冻结/实例绑定、账本观测同源、3 个成本 Counter 与实测名称、Langfuse 成组校验/unknown 不推价、Grafana 面板语义、E2E 对账口径）；Langfuse独立部署与Collector并存；N-KB专属Langfuse投影契约；Evaluation 评估观测统一语义（gen_ai.evaluation.result 事件/独立 Trace+Link/窗口 Gauge _ratio 实测命名/Langfuse v3 scores 对账/投递状态语义） -->
 # 规范可观测行为
 
 观测回答：做了什么、为何结束、哪里慢、消耗多少。“共性规范”和“验收清单”独立于业务领域、项目、语言、框架及后端选型，可直接复用于其他系统；其余章节记录本项目的实现约定。本文是观测规范的权威源，架构、约定、模式及术语文档维护各自边界并引用本文。具体采集行为以对应观测能力启用为前提；本项目业务费用以 Usage 账本为准。
@@ -663,3 +663,13 @@ Pyroscope旧策略诊断依据：[v1.21.1磁盘统计](https://github.com/grafan
 固定 1 USD = 7 CNY 换算，不随峰谷或汇率自动更新。ark-code-latest 保留展示名，
 按用户指定使用 DeepSeek V4.1 Flash 标准价替代估算，套餐实际扣款不在本估算内。
 来源、适用范围及换算说明见 `docker/observability/model-pricing-policy.md`。
+
+## 评估观测统一语义
+
+评估子域观测遵循六项共性原则，评估独立 Trace 与业务目标身份关联。权威实现锚点：app/application/evaluation_telemetry.py、telemetry_semantics.py 评估段、docker/observability/otel-collector.yaml 评估投影分支、metric-name-mapping.md 21-28 行。
+
+- 事件：gen_ai.evaluation.result（评估结果事件，扁平点式属性携带 result_id/metric_name/metric_version/status/typed_value/target 身份），经 collector 投影分支以业务形状落 Loki，可按 result_id 与目标 subject_id 关联；未登记字段与外来 langfuse.* 属性被过滤，无未脱敏正文。
+- Trace：评估 Trace 与业务 Trace 分离（experiment 项根经受信 experiment_sampler 独立采样，spec 11.1；OTel 禁用时实验分析标 unavailable），因果以 Link 指向业务目标真实身份，多轮与异步 Task 不改写业务 Trace。
+- 指标：评估窗口 Gauge（24h current 视图）12 个，nagent.evaluation.window.*；标签维度 target.service/metric_profile/mode/status/sampling_cohort（random/failure，空串与未知收敛 other——随机与故障定向 cohort 分离，spec 7.1/AC17）；unit=1 的 Gauge 经 collector 导出实测名带 _ratio 后缀（nagent_evaluation_window_succeeded_ratio 等），producer/queue_depth 类无后缀——映射表以真实管线复测为准（T22 实测修正）。producer 通道另发 evaluation.producer-state.v1 持久累计计数（高水位幂等，重建换 counter_epoch）。
+- Langfuse 投影：评估 Score 经 ScoreSink 投影（judge/human/deterministic 各自独立 ScoreConfig，如 agent.answer_relevance.judge-v1）；4.76.0 events_only 合同下查询走 /api/public/v3/scores，条目无 traceId/sessionId/comment，对账以冻结 payload 的 external_id（UUIDv5）与 v3 回读 id 精确匹配；comment 敏感哨兵改查冻结投递 payload。
+- 投递状态语义：OTel SDK enqueue 不等于后端 ACK（OTel 事件状态 pending/emitted/failed，重复发布可能、同 result_id 不变，Loki 按 result_id 去重）；Langfuse 只有 API 成功且回读匹配才 verified，accepted 与 verified 分开保存。

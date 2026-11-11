@@ -875,6 +875,16 @@ def configure_span_attribute_sanitizer(callable_) -> None:
         _span_attr_sanitizer = callable_ if callable(callable_) else None
 
 
+def sanitize_attributes(attributes):
+    """Public attribute-sanitization entry point (fail-closed, same set as
+    every internal span-attribute consumer).
+
+    Infrastructure adapters that build spans outside this module (e.g.
+    experiment item roots) must call this function instead of reaching into
+    the private ``_sanitize_attributes``."""
+    return _sanitize_attributes(attributes)
+
+
 def _sanitize_attributes(attributes):
     """Return one fail-closed set for every public attribute consumer."""
     with _span_attr_sanitizer_lock:

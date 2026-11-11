@@ -972,6 +972,20 @@ def test_chat_side_panel_empty_hints_use_auxiliary_font_size(tmp_path):
         assert rules and 'font-size: var(--font-size-sm)' in rules[0]
 
 
+def test_shared_state_classes_use_auxiliary_font_size(tmp_path):
+    """空态/加载/错误为辅助文字，共享类必须显式声明辅助字号 token，
+    禁止依赖 body 继承（浏览器默认 16px，相对 12-13px 面板正文偏大）。"""
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    for selector in ('.empty-state', '.loading-state', '.error-state'):
+        rules = _css_rule_bodies(css, selector)
+        assert rules, f'缺少共享状态类 {selector} 规则'
+        assert 'font-size: var(--font-size-sm)' in rules[0], (
+            f'{selector} 必须显式使用辅助字号 token，不得依赖 body 继承'
+        )
+        assert '16px' not in rules[0]
+
+
 def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',
@@ -1117,14 +1131,16 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
         'chat', 'sessions', 'scheduled-tasks', 'tasks', 'memory',
         'tools', 'tools-knowledge', 'tools-mcp', 'tools-skill', 'tools-plugin', 'tools-builtin',
         'executors', 'sandbox', 'executors-host', 'browser', 'artifacts', 'models', 'platforms',
-        'observations', 'observations-sessions', 'observations-modules', 'observations-otel', 'security',
+        'observations', 'observations-sessions', 'observations-modules', 'observations-otel', 'evaluations', 'evaluations-overview', 'evaluations-datasets', 'evaluations-evaluators', 'evaluations-experiments', 'evaluations-results', 'evaluations-annotations',
+        'security',
         'security-overview', 'security-sessions', 'security-memory', 'security-sandbox',
     ]
     expected_hrefs = [
         '/chat', '/sessions', '/scheduled-tasks', '/tasks', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/artifacts', '/models', '/platforms',
-        '/observations/sessions', '/observations/modules', '/observations/otel', '/security',
+        '/observations/sessions', '/observations/modules', '/observations/otel', '/evaluations', '/evaluations/datasets', '/evaluations/evaluators', '/evaluations/experiments', '/evaluations/results', '/evaluations/annotations',
+        '/security',
         '/security/sessions', '/security/memory', '/security/sandbox',
     ]
     sidebar_data_tabs = _re.findall(r'data-tab="([^"]*)"', sidebar_html)
@@ -1307,7 +1323,7 @@ def test_collapsed_sidebar_tooltips_cover_every_top_level_item(tmp_path):
     )
     assert items == [
         '对话', '会话', '定时任务', '任务', '记忆', '工具', '执行器',
-        '制品', '模型', '平台', '观测', '安全',
+        '制品', '模型', '平台', '观测', '评估', '安全',
     ]
 
     tooltip_body = _js_function_body(nav_js, 'applySidebarTooltips')
@@ -2076,3 +2092,25 @@ def test_chat_skill_composer_wiring():
     assert '.chat-skill {' in styles
     sk_block = styles[styles.index('.chat-skill {'):styles.index('.chat-skill {') + 200]
     assert 'position: relative' in sk_block
+
+
+def test_evaluation_config_modal_parses_numeric_fields():
+    """M4（质量复审）：评估配置弹窗的数值字段必须经数值解析后提交——
+    输入框取值恒为字符串，直接入 patch 会被 domain 数值类型校验拒绝
+    （422），Dashboard 无法保存 4 个数值配置字段。静态合同锁定解析
+    路径存在且覆盖全部数值键。"""
+    body = (STATIC_DIR / 'evaluation.js').read_text()
+    assert 'NUMERIC_CONFIG_FIELDS' in body, (
+        "evaluation.js lacks NUMERIC_CONFIG_FIELDS numeric field map"
+    )
+    for key in (
+        'evaluation_sampling_rate',
+        'evaluation_failure_sampling_rate',
+        'evaluation_worker_concurrency',
+        'evaluation_daily_call_ceiling',
+    ):
+        assert key in body, f"evaluation.js config modal missing {key}"
+    # 数值解析必须走 Number 解析而非字符串直传
+    assert re.search(r'Number\.(parseFloat|parseInt)', body), (
+        "evaluation.js config modal does not parse numeric fields with Number"
+    )

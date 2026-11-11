@@ -156,3 +156,80 @@ def test_delegation_cross_field_per_child_le_total():
             delegation_max_total_tokens=1000,
             delegation_max_tokens_per_child=2000,
         )
+
+
+# ---------------------------------------------------------------------------
+# Evaluation 子域 B 类 env（T20）
+# ---------------------------------------------------------------------------
+
+
+def test_evaluation_b_class_defaults():
+    s = Settings()
+    # 总闸默认 true（子域默认装配就绪；显式 env=false 停用，test_config
+    # 覆盖 env 停用路径）。自动采集默认仍关（capture_enabled=False +
+    # 采样率 0），线上捕获需 C 类运行时开启。
+    assert s.evaluation_enabled is True
+    assert s.evaluation_ledger_path == "locals/evaluations.db"
+    assert s.evaluation_snapshots_root == "locals/evaluation_snapshots"
+    assert s.evaluation_worker_max_concurrency == 4
+    assert s.evaluation_worker_concurrency == 1
+    assert s.evaluation_worker_lease_seconds == 300
+    assert s.evaluation_worker_shutdown_grace_seconds == 30
+    assert s.evaluation_daily_call_ceiling == 0
+    assert s.evaluation_capture_enabled is False
+    assert s.evaluation_sampling_rate == 0.0
+    assert s.evaluation_failure_sampling_rate == 0.0
+    assert s.evaluation_sampling_policy_version == "capture-sampling-v1"
+    assert s.evaluation_capture_queue_maxsize == 1000
+    assert s.evaluation_evidence_retention_days == 7
+    # B 类容量边界（spec 343 默认值）
+    assert s.evaluation_max_pending_jobs == 10000
+    assert s.evaluation_max_evidence_bytes == 256 * 1024 * 1024
+    # B 类凭据/endpoint：默认空（禁用态），无硬编码默认凭据
+    assert s.evaluation_producer_token == ""
+    assert s.evaluation_producer_max_bytes == 2 * 1024 * 1024
+    assert s.evaluation_langfuse_base_url == ""
+    assert s.evaluation_langfuse_public_key == ""
+    assert s.evaluation_langfuse_secret_key == ""
+    assert s.evaluation_langfuse_project == ""
+    assert s.evaluation_judge_provider_base_url == ""
+    assert s.evaluation_judge_provider_api_key == ""
+    assert s.evaluation_judge_provider_model == ""
+    assert s.evaluation_judge_timeout_seconds == 60
+
+
+def test_evaluation_concurrency_over_b_ceiling_rejected():
+    with pytest.raises(ValidationError):
+        Settings(
+            evaluation_worker_concurrency=5,
+            evaluation_worker_max_concurrency=4,
+        )
+
+
+def test_evaluation_rate_bounds_reject_out_of_range():
+    with pytest.raises(ValidationError):
+        Settings(evaluation_sampling_rate=1.5)
+    with pytest.raises(ValidationError):
+        Settings(evaluation_failure_sampling_rate=-0.1)
+
+
+def test_evaluation_gt_zero_fields_reject_zero():
+    for field_name in (
+        "evaluation_worker_lease_seconds",
+        "evaluation_worker_shutdown_grace_seconds",
+        "evaluation_capture_queue_maxsize",
+        "evaluation_evidence_retention_days",
+        "evaluation_producer_max_bytes",
+        "evaluation_worker_max_concurrency",
+        "evaluation_worker_concurrency",
+    ):
+        with pytest.raises(ValidationError):
+            Settings(**{field_name: 0})
+
+
+def test_evaluation_judge_timeout_bounds():
+    Settings(evaluation_judge_timeout_seconds=600)
+    with pytest.raises(ValidationError):
+        Settings(evaluation_judge_timeout_seconds=4)
+    with pytest.raises(ValidationError):
+        Settings(evaluation_judge_timeout_seconds=601)

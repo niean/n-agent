@@ -3068,7 +3068,99 @@
 
     renderRunDetailTools(wrap, calls, runId);
     renderRunDetailTrace(wrap, row);
+    renderRunDetailFeedback(wrap, runId);
     target.appendChild(wrap);
+  }
+
+  // Run 评估反馈入口（T21）：有用/无用人工反馈 + Langfuse 会话外链。
+  // 反馈经 POST /chat/evaluations/feedback（definition_id=feedback.helpful，
+  // target agent_run/<runId>）；actor 由服务端可信上下文绑定，不随载荷
+  // 上报；request_key 幂等键防双击重复 revision（m4）。渲染
+  // textContent-only，错误经 NAGENT.modal.alert（禁原生弹窗）。
+  // Langfuse 会话 URL 单源引用 management-ui.js（m6），不复制字面量。
+  const RUN_FEEDBACK_DEFINITION = 'feedback.helpful';
+
+  function renderRunDetailFeedback(wrap, runId) {
+    if (!runId || typeof runId !== 'string') return;
+    const evaluationApi = (global.NAGENT && global.NAGENT.api
+      && global.NAGENT.api.evaluations) || null;
+    if (!evaluationApi) return;
+    const langfuseUrl = (global.NAGENT.ui && global.NAGENT.ui.LANGFUSE_SESSIONS_URL) || '';
+    const section = document.createElement('section');
+    section.className = 'run-detail__feedback';
+    const header = document.createElement('div');
+    header.className = 'run-detail__header';
+    const titleEl = document.createElement('span');
+    titleEl.className = 'run-detail__title';
+    titleEl.textContent = '评估反馈';
+    header.appendChild(titleEl);
+    const langfuseLink = document.createElement('a');
+    langfuseLink.className = 'otel-link';
+    if (langfuseUrl) {
+      langfuseLink.href = langfuseUrl;
+      langfuseLink.target = '_blank';
+      langfuseLink.rel = 'noopener noreferrer';
+      langfuseLink.textContent = 'Langfuse 会话';
+      header.appendChild(langfuseLink);
+    }
+    section.appendChild(header);
+
+    const statusEl = document.createElement('span');
+    statusEl.className = 'run-detail__feedback-status';
+    statusEl.textContent = '';
+    let submitting = false;
+
+    async function submitFeedback(value, label) {
+      if (submitting) return;
+      submitting = true;
+      statusEl.textContent = '提交中...';
+      try {
+        const result = await evaluationApi.submitFeedback({
+          target: {
+            service: 'n-agent',
+            kind: 'agent_run',
+            subject_id: runId,
+            subject_revision: 'v1',
+          },
+          definition_id: RUN_FEEDBACK_DEFINITION,
+          definition_version: 'v1',
+          value: value,
+          // Mi9：幂等键带分钟级时间片——同一时间片内重复提交复用同 key
+          // （同 payload 复用，防双击重复 revision），跨时间片的再次反馈
+          // 产生新 key（永久 key 会让用户"改回另一侧"永远 409 冲突）；
+          // 双击主防线是 submitting 标志，时间片只是幂等兜底
+          request_key: 'run-feedback:' + runId + ':' + (value ? 'up' : 'down')
+            + ':' + Math.floor(Date.now() / 60000),
+        });
+        statusEl.textContent = '已反馈（' + label + '，revision ' + result.revision + '）';
+      } catch (err) {
+        statusEl.textContent = '';
+        const modal = global.NAGENT && global.NAGENT.modal;
+        if (modal && typeof modal.alert === 'function') {
+          modal.alert('反馈提交失败：' + (err && err.message ? err.message : '') + '（评估未启用或服务异常）');
+        }
+      } finally {
+        submitting = false;
+      }
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'run-detail__feedback-actions';
+    const helpfulBtn = document.createElement('button');
+    helpfulBtn.type = 'button';
+    helpfulBtn.className = 'btn';
+    helpfulBtn.textContent = '有用';
+    helpfulBtn.addEventListener('click', () => submitFeedback(true, '有用'));
+    const unhelpfulBtn = document.createElement('button');
+    unhelpfulBtn.type = 'button';
+    unhelpfulBtn.className = 'btn';
+    unhelpfulBtn.textContent = '无用';
+    unhelpfulBtn.addEventListener('click', () => submitFeedback(false, '无用'));
+    actions.appendChild(helpfulBtn);
+    actions.appendChild(unhelpfulBtn);
+    actions.appendChild(statusEl);
+    section.appendChild(actions);
+    wrap.appendChild(section);
   }
 
   // 未选中执行时展示整个会话账本，不依赖消息是否携带 run_id。

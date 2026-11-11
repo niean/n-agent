@@ -6,9 +6,23 @@
     const data = response.status === 204 ? null : await response.json();
     if (!response.ok) {
       const code = data && data.error && data.error.code ? data.error.code : 'request_failed';
-      throw new Error(code);
+      const error = new Error(code);
+      // 业务错误正文挂 error.data（如 422 incomparable_experiments 的
+      // diff_dimensions），供消费方展示可公开差异维度
+      error.data = data;
+      throw error;
     }
     return data;
+  }
+
+  // 评估管理面查询串（T21）：跳过空值，值 encodeURIComponent。
+  function buildEvaluationQuery(params) {
+    if (!params) return '';
+    const parts = Object.keys(params).filter((key) => {
+      const value = params[key];
+      return value !== undefined && value !== null && value !== '';
+    }).map((key) => key + '=' + encodeURIComponent(params[key]));
+    return parts.length ? ('?' + parts.join('&')) : '';
   }
 
   const listSessions = () => fetchJson('/chat/sessions');
@@ -368,6 +382,41 @@
     host,
     browser,
     usage,
+    // 评估闭环管理面（T21）：/chat/evaluations/* 同源调用
+    evaluations: {
+      status: () => fetchJson('/chat/evaluations/status'),
+      listDatasets: () => fetchJson('/chat/evaluations/datasets'),
+      getDataset: (id, version) => fetchJson('/chat/evaluations/datasets/' + encodeURIComponent(id) + '/' + encodeURIComponent(version)),
+      importDataset: (body) => fetchJson('/chat/evaluations/datasets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+      overview: () => fetchJson('/chat/evaluations/overview'),
+      listExperiments: (params) => fetchJson('/chat/evaluations/experiments' + buildEvaluationQuery(params)),
+      getExperiment: (id) => fetchJson('/chat/evaluations/experiments/' + encodeURIComponent(id)),
+      createExperiment: (body) => fetchJson('/chat/evaluations/experiments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      listResults: (params) => fetchJson('/chat/evaluations/results' + buildEvaluationQuery(params)),
+      getResult: (id) => fetchJson('/chat/evaluations/results/' + encodeURIComponent(id)),
+      submitFeedback: (body) => fetchJson('/chat/evaluations/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      getConfig: () => fetchJson('/chat/evaluations/config'),
+      patchConfig: (body) => fetchJson('/chat/evaluations/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      retryDelivery: (body) => fetchJson('/chat/evaluations/deliveries/retry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      listReviewQueue: (params) => fetchJson('/chat/evaluations/review-queue' + buildEvaluationQuery(params)),
+      exportReviewQueue: (body) => fetchJson('/chat/evaluations/review-queue/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      // 评估器管理（Task 11/spec 4.2-4.3）：能力目录 + 定义列表/详情/
+      // 版本创建 + 单版本在线启停（CAS expected_revision）
+      listEvaluators: (params) => fetchJson('/chat/evaluations/evaluators' + buildEvaluationQuery(params)),
+      getEvaluator: (id, version) => fetchJson('/chat/evaluations/evaluators/' + encodeURIComponent(id) + '/' + encodeURIComponent(version)),
+      createEvaluator: (body) => fetchJson('/chat/evaluations/evaluators', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      setEvaluatorUsage: (id, version, body) => fetchJson('/chat/evaluations/evaluators/' + encodeURIComponent(id) + '/' + encodeURIComponent(version) + '/usage', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      getCapabilities: () => fetchJson('/chat/evaluations/evaluators/capabilities'),
+      // 人工标注（Task 12/spec 4.4）：标注队列/上下文/受约束提交（request_key
+      // 重放 + expected_revision CAS；actor 由服务端注入，不在载荷传递）
+      listAnnotations: (params) => fetchJson('/chat/evaluations/annotations' + buildEvaluationQuery(params)),
+      getAnnotation: (sourceResultId) => fetchJson('/chat/evaluations/annotations/' + encodeURIComponent(sourceResultId)),
+      submitAnnotation: (sourceResultId, body) => fetchJson('/chat/evaluations/annotations/' + encodeURIComponent(sourceResultId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      // 概览分析（Task 13/spec 4.5）：时间窗/过滤聚合与 UTC+8 日期桶
+      getAnalytics: (params) => fetchJson('/chat/evaluations/analytics' + buildEvaluationQuery(params)),
+      // 只读实验对比（Task 13/spec 4.6）：{candidate_id,baseline_id,policy?}
+      compareExperiments: (body) => fetchJson('/chat/evaluations/experiments/compare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+    },
     task: {
       board: () => fetchJson('/chat/tasks/board'),
       list: (params) => fetchJson('/chat/tasks' + (params && params.status ? ('?status=' + encodeURIComponent(params.status)) : '')),

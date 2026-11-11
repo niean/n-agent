@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS）、Config Bundle 配置迁移术语（Config Bundle/manifest/段/秘密四态/redacted/degraded/action 与 outcome 正交/退出码契约/migration_maintenance/N_AGENT_INSTALL_ROOT）、OTel 可观测术语（GenAI semconv/invoke_agent/chat/execute_tool span/ChatAttempt/caller-owns-end/OTLP/sample ratio/ring buffer/spike/metric-name-mapping/observability handle/profiler bridge/Pyroscope v2 ingest/观测失败隔离/LogSanitizer/上下文现场 live scene/三重封口 triple-seal）、模型成本观测术语（AttemptCost/计价身份/TokenValue/content_version@sha256/JCS/成组校验/计价覆盖率） -->
+<!-- SUMMARY: N-Agent 与后续完整 Agent 能力相关术语定义，含 Gateway/CLI/ACP、ToolPolicy、Host Terminal、Context 与 Usage 观测、Skill 自进化、Artifact 制品工作台术语（ArtifactRevision/CAS/publish_sync_state/rollback/diff/Exporter/ui.artifact 卡片/artifact_guidance）、Delegation 多 Agent 委派术语（Delegation/delegation_key/fingerprint/join policy/delegate_agents/delegation capability/cancel outbox）、Activated Skills 会话级激活技能术语（draftActivatedSkills / sessionActivatedSkills 双轨 / 三层过滤 / _INTERNAL_OPTION_KEYS）、Config Bundle 配置迁移术语（Config Bundle/manifest/段/秘密四态/redacted/degraded/action 与 outcome 正交/退出码契约/migration_maintenance/N_AGENT_INSTALL_ROOT）、OTel 可观测术语（GenAI semconv/invoke_agent/chat/execute_tool span/ChatAttempt/caller-owns-end/OTLP/sample ratio/ring buffer/spike/metric-name-mapping/observability handle/profiler bridge/Pyroscope v2 ingest/观测失败隔离/LogSanitizer/上下文现场 live scene/三重封口 triple-seal）、模型成本观测术语（AttemptCost/计价身份/TokenValue/content_version@sha256/JCS/成组校验/计价覆盖率）、统一评估闭环术语（Sample/EvidenceSnapshot/Job/Result/Delivery/external_id/unlinked/dead_letter/ScoreSink/四态门禁/execute/replay/人工反馈/删除传播 tombstone/评估窗口指标/评估器能力目录/DefinitionUsage/材料 hash/标注队列/金标导出回流/描述性对比） -->
 # 术语表
 
 - Agent Runtime：Agent 的内部运行机制，负责加载上下文、调用 LLM、执行工具、更新 Memory、判断结束条件，并产出应用级运行事件。
@@ -266,3 +266,26 @@ AgentRun 是一次 Agent 执行，TaskRun 是一次后台任务运行，请求 I
 - Langfuse Observation：Langfuse 对 OTel Span 的平台投影；本项目实际映射 agent、generation、tool 和普通 span，保留相同 Trace/Span 身份，不替代 AgentRun 或 Usage 账本。
 - ocb：OpenTelemetry Collector Builder，用固定版本组件组装发行镜像；本项目仅为 Langfuse 分支增加 Link 属性清理组件，默认禁用模式仍使用原 contrib 镜像。
 - 序列化字节队列：发送队列按编码数据字节有界，16MiB 是队列预算，不是整个 Collector 的堆内存上限；副本、在途请求与其他信号仍共同占用进程资源。
+
+## 统一评估闭环
+
+- 评估样本（Sample）：producer 按 target 上报的评估输入行，producer_event_id 全局幂等（同 ID 同 hash 重放复用、同 ID 异 hash 409）。样本携带 snapshot_ref/snapshot_hash 指向 EvidenceSnapshot。
+- EvidenceSnapshot：脱敏证据快照，content 构造期冻结为 MappingProxyType 并按 canonical JSON 算 sha256；超过 2MiB 拒绝构造（EvidenceSnapshotOversizedError）。读取时按 Mapping 直读，不得 json.loads。
+- 评估作业（Job）：样本 x 评估定义展开出的评分任务；同一 job/metric 至多一个终态 result（部分唯一索引保证）。llm_judge 作业由 worker 异步领取评分，deterministic 作业即时计算。
+- 评估结果（Result）：一次评分的正式事实（value/skipped/error）；低分仍 succeeded，超时/解析失败为 error，缺参考为 skipped。
+- 投递（Delivery）：result 向外部 sink（Langfuse/OTel）的投影任务，状态机 pending/accepted/verified/retry_wait/failed/unlinked/disabled/dead_letter；lease CAS 保证单一持有者；冻结 payload 幂等（重投复用同 external_id）。
+- external_id：投递的 Langfuse Score 预登记身份，UUIDv5(NAMESPACE_URL, "{project}:{result_id}:{projection_version}")；同 result 重投必然同 ID，是 read_back 降级合同下目标一致性的确定性保证。
+- unlinked：无真实目标身份（未采样/无 Trace/主体已删除）的投递终态——本地 result 有效、外部不伪造 Trace 关联，不产生 Score 或产生后按删除任务收敛。
+- dead_letter：24h 退避窗口耗尽或不可恢复冲突的投递隔离终态，仅管理员显式 retry-delivery 补发。
+- ScoreSink / projection_version：外部 Score 投影适配器端口与投影版本（当前 v1）；人类反馈、Judge、确定性指标各自独立 ScoreConfig（如 agent.answer_relevance.judge-v1 / *.human-v1）。
+- 四态门禁：gate_pass / gate_fail / inconclusive / infrastructure_error，退出码 0/1/3/2；状态收敛优先级 infrastructure_error > gate_fail > inconclusive > gate_pass。Judge error 阻断门禁；未校准指标仅 advisory；证据缺失留分母（系统异常不吞，读失败上抛转 infrastructure_error）。
+- execute / replay 实验：execute 逐 case 冻结配置重调目标（每 replicate/attempt 独立会话防污染）；replay 只对既有 EvidenceSnapshot 重评分、绝不调目标，源类型映射固定 REPLAY_SOURCE_KIND_MAP（agent_run->experiment_item、retrieval->retrieval、experiment_item->experiment_item），评分定义 kind 必须匹配映射。
+- 人工反馈（session feedback）：Run 级有用/无用反馈，definition_version 锁定 + revision CAS，历史保留、统计取最新 revision；同 definition+subject 上自动与人评冲突构成 disputed 复核项。
+- 删除传播（tombstone）：会话/文档删除生成不含正文的 tombstone，撤销待执行 job 与 pending delivery；发送中删除的投递不得转 verified（改判 unlinked(subject_deleted)），并按预登记 external_id 走外部删除任务。
+- 评估窗口指标：nagent.evaluation.window.* Gauge（24h current 视图），OTel 导出实测名带 _ratio 后缀（unit 1 Gauge 的 Prometheus 命名行为）；producer/queue_depth 无后缀。
+- 评估器能力目录（capabilities catalog）：创建评估定义的合法能力集合，由 EvaluationService._PRESET_* 预设属性派生单源，前端表单与服务端校验同源；能力/参数越界抛 UnsupportedCapabilityError（422，路由按 exc.code 显式映射）。
+- DefinitionUsage（在线使用状态）：definition_id+version 维度的使用计数行；预设定义注册成功后一次性回填（迁移账本独立版本段 1001），停用不消失、重启不复活。
+- 材料 hash（material_hash）：评估定义评分材料的内容指纹；llm_judge 恒为 sha256(rubric)，服务端按公式生成、客户端不传（传入显式拒绝）。
+- 标注队列（annotation queue）：人工标注待办列表，目标/定义身份由服务端从 source_result 派生（客户端不自带）；提交生成新 result 并保留同完整线程 supersedes，原自动结果不变。
+- 金标导出回流（audit export）：人工标注审核导出生成新数据集版本（dataset_id/版本/哈希/audit_id 可对应），不将自动评分当金标，原数据集版本保持不变。
+- 描述性对比（descriptive compare）：同数据集基线实验的配对指标对比，只读、不产生通过/失败门禁结论；异数据集/冻结配置不兼容抛 IncomparableExperimentsError。

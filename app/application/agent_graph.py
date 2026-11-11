@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timezone
 import json
 import logging
@@ -23,6 +24,7 @@ from app.application.browser_tool_audit import project_browser_tool_arguments
 from app.application.context_service import ContextService
 from app.application.events import ChatEvent, ChatEventType
 from app.application.agent_run_service import AgentRunService, RunExecution
+from app.application.evaluation_capture import derive_agent_run_subject
 from app.application.external_memory_manager import ExternalMemoryManager
 from app.application.information_flow_service import InformationFlowService
 from app.application.policy_snapshot import (
@@ -31,7 +33,7 @@ from app.application.policy_snapshot import (
     RunPolicySnapshot,
 )
 from app.application.runtime_memory_service import RuntimeMemoryService
-from app.application.telemetry_semantics import NoopTelemetry, clear_run_context, capture_trace_context
+from app.application.telemetry_semantics import NoopTelemetry, capture_trace_context, clear_run_context
 from app.domain.agent_run import RunBinding, RunCancelledError, bind_run, check_current_run, current_run
 from app.application.tool_service import (
     ToolExecutionEvaluation,
@@ -188,6 +190,7 @@ class AgentGraphRunner:
         browser_host_grant_ttl_seconds: int = 300,
         telemetry: "SemanticsTelemetry | None" = None,
         agent_run_service: AgentRunService | None = None,
+        evaluation_capture: Any = None,
     ):
         self.llm_provider = llm_provider
         self.tool_service = tool_service
@@ -249,6 +252,23 @@ class AgentGraphRunner:
         self.nudge_interval = nudge_interval
         self.curator_service = curator_service
         self._last_finalize_at: datetime | None = None
+        # T16: 线上评估捕获（best-effort；鸭子类型 EvaluationCaptureService，
+        # None 缺省时 finalize 路径零感知）
+        self.evaluation_capture = evaluation_capture
+        # T16: 每次 run 的模型名（finalize 捕获快照需要；随 run_id 记录并在
+        # finalize 捕获时清除；容量超限按插入序淘汰最旧，不清空全部——
+        # 并发在途 run 的条目不被误伤）
+        self._run_models: OrderedDict[str, str] = OrderedDict()
+
+    # T16: 模型名容量上限（异常路径残留的条目按插入序淘汰）
+    _RUN_MODELS_MAX = 1024
+
+    def _remember_run_model(self, run_id: str, model: str) -> None:
+        """按插入序记录 run 模型名；容量超限淘汰最旧，不清空全部
+        （并发在途 run 的条目不被误伤）。"""
+        if len(self._run_models) >= self._RUN_MODELS_MAX:
+            self._run_models.popitem(last=False)
+        self._run_models[run_id] = model
 
     def register_run(self, session_id: str, task: asyncio.Task) -> None:
         if self.agent_run_service is not None:
@@ -399,6 +419,9 @@ class AgentGraphRunner:
 
     async def _run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
         state.run_options = dict(options or {})
+        # T16: 记录本次 run 的模型名供 finalize 捕获快照使用（异常路径未
+        # 被 finalize 清除的残留条目按插入序淘汰最旧，不误伤并发在途 run）
+        self._remember_run_model(state.run_id, model)
         # Mirror persist_messages from options into the state field so that
         # update_memory / finalize / execute_tools can read it without re-checking
         # run_options. Caller may set either AgentState.persist_messages directly
@@ -1979,6 +2002,36 @@ class AgentGraphRunner:
                 )
         if state.persist_messages:
             self._last_finalize_at = datetime.now(timezone.utc)
+
+        # T16: 线上评估捕获钩子（best-effort）。业务 finalize 已完成，捕获
+        # 放在最后且整体 try/except 隔离：捕获/入队异常只计 capture_error
+        # 并告警，绝不回滚业务成功，也绝不等待网络或 Judge（入队为同步
+        # put_nowait，持久化由生命周期托管的后台消费者执行）。
+        if self.evaluation_capture is not None:
+            try:
+                self.evaluation_capture.capture_agent_run(
+                    subject_id=derive_agent_run_subject(
+                        state.session_id, state.input_messages,
+                    ),
+                    session_id=state.session_id,
+                    run_id=state.run_id,
+                    query=self._extract_user_content(state.input_messages),
+                    final_answer=(
+                        extract_text(state.final_message.get("content", ""))
+                        if state.final_message else ""
+                    ),
+                    model=self._run_models.pop(state.run_id, None),
+                    failed=state.error is not None,
+                    error=state.error,
+                    finish_reason=state.finish_reason,
+                    trace_carrier=capture_trace_context(),
+                )
+            except Exception:
+                logger.warning(
+                    "evaluation capture hook failed for session=%s",
+                    state.session_id,
+                    exc_info=True,
+                )
 
         return state
 

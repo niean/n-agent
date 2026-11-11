@@ -239,7 +239,8 @@ def test_completion_timestamp_guard_validates_calendar(timestamp, valid):
 
 
 def kb_guard_accepts(guard, value):
-    """Evaluate a generated KB guard against a Python value the way OTTL would type it."""
+    """Evaluate a generated OTTL guard (KB keys and N-Agent evaluation
+    identity keys alike) against a Python value the way OTTL would type it."""
     import math
     import re
     if 'IsBool(' in guard:
@@ -935,3 +936,243 @@ def test_kb_illegal_cost_field_rejects_whole_group_surviving_cleanup():
     for key in (*NKB_COST_AMOUNT_KEYS, 'nkb.model.cost_decimal'):
         assert any(s.startswith(f'delete_key(attributes, "{key}") where cache["cost"]["ok"] == false and attributes["{key}"] != nil')
                    for s in statements), key
+
+
+# ---------------------------------------------------------------------------
+# T11: 评估投影边界（Collector logs 管线评估事件 transform + langfuse
+# experiment 映射，spec 11.2/12.1 n-eval-v1）。全部为静态 YAML/Python 校验，
+# 不需要真实 Collector。
+# ---------------------------------------------------------------------------
+
+EVALUATION_LOG_EVENT = 'gen_ai.evaluation.result'
+# logs 管线评估封闭字段白名单（对应 app/application/evaluation_telemetry.py
+# _EVAL_SCHEMA_FIELDS，排除 event.name 本身；explanation 有意缺席——不投影）。
+EVALUATION_LOG_WHITELIST = (
+    'error.type',
+    'gen_ai.evaluation.name',
+    'gen_ai.evaluation.score.label',
+    'gen_ai.evaluation.score.value',
+    'nagent.evaluation.evaluation_span_id',
+    'nagent.evaluation.evaluation_trace_id',
+    'nagent.evaluation.metric_profile',
+    'nagent.evaluation.mode',
+    'nagent.evaluation.result_id',
+    'nagent.evaluation.skip_reason',
+    'nagent.evaluation.status',
+    'nagent.evaluation.target.kind',
+    'nagent.evaluation.target.service',
+    'nagent.evaluation.target.subject_id',
+    'nagent.evaluation.target.subject_revision',
+    'nagent.evaluation.target_completed_at',
+    'nagent.evaluation.target_link',
+)
+# 受信本地编排注入的实验身份（spec 11.2：客户端 baggage 永不直接投影）。
+EXPERIMENT_ATTRIBUTE_MAP = (
+    ('nagent.evaluation.experiment.id', 'langfuse.experiment.id'),
+    ('nagent.evaluation.experiment.name', 'langfuse.experiment.name'),
+    ('nagent.evaluation.experiment.dataset_id', 'langfuse.experiment.dataset_id'),
+    ('nagent.evaluation.experiment.item_id', 'langfuse.experiment.item_id'),
+    ('nagent.evaluation.experiment.root_observation_id', 'langfuse.experiment.root_observation_id'),
+)
+ZERO_TRACE = '00000000000000000000000000000000'
+# 固定业务 fixture：业务行体两条装配语句 + unknown 过滤条件的逐字节锁定。
+BUSINESS_BODY_LINKED = ('set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "message": cache["message"], "context": {"execution": cache["execution"]}, "details": cache["details"], "exception": cache["exception"], "stack": cache["stack"], "trace_id": trace_id.string, "span_id": span_id.string}) '
+                        f'where trace_id.string != "{ZERO_TRACE}"')
+BUSINESS_BODY_UNLINKED = ('set(body, {"severity": severity_text, "logger": instrumentation_scope.name, "event": cache["event"], "message": cache["message"], "context": {"execution": cache["execution"]}, "details": cache["details"], "exception": cache["exception"], "stack": cache["stack"]}) '
+                          f'where trace_id.string == "{ZERO_TRACE}"')
+BUSINESS_FILTER_CONDITION = ('body["event"] == "log_event_unknown" and severity_number < SEVERITY_NUMBER_WARN and '
+                             'Len(body["details"]) == 0 and (body["message"] == nil or body["message"] == "" or body["message"] == "log_event_unknown") '
+                             'and body["exception"] == nil and (body["stack"] == nil or body["stack"] == "")')
+
+
+def collector_config():
+    import yaml
+    path = DIRECTORY / 'otel-collector.yaml'
+    assert path.is_file(), 'missing otel-collector.yaml'
+    return yaml.safe_load(path.read_text(encoding='utf-8'))
+
+
+def collector_statements():
+    return collector_config()['processors']['transform/loki_json']['log_statements'][0]['statements']
+
+
+def test_evaluation_log_projection_is_event_gated_closed_whitelist():
+    """logs 管线评估分支：仅注册事件 gen_ai.evaluation.result 进入评估投影，
+    封闭白名单逐键显式复制（nagent.evaluation.* + gen_ai.evaluation.name/
+    score.*）；事件判别别名先于既有 event 读取，unknown 回退不吞评估事件码。"""
+    statements = collector_statements()
+    gate = f'attributes["event.name"] == "{EVALUATION_LOG_EVENT}"'
+    # 白名单与生产者契约夹具交叉校验：两侧不得独立漂移（explanation 有意
+    # 缺席、event.name 由事件判别表达）。
+    fixture = json.loads((ROOT / 'tests/application/fixtures/evaluation_telemetry_n_eval_v1.json').read_text())
+    assert set(fixture['fields']) - {'event.name', 'gen_ai.evaluation.explanation'} == set(EVALUATION_LOG_WHITELIST)
+    alias = f'set(attributes["event"], attributes["event.name"]) where {gate}'
+    assert alias in statements
+    # 别名先于既有 event 读取与 unknown 回退（回退不会覆盖评估事件码）。
+    assert statements.index(alias) < statements.index('set(cache["event"], attributes["event"]) where attributes["event"] != nil')
+    assert statements.index(alias) < statements.index('set(cache["event"], "log_event_unknown") where attributes["event"] == nil')
+    expected = [f'set(cache["evaluation"]["{key}"], attributes["{key}"]) where {gate} and attributes["{key}"] != nil'
+                for key in EVALUATION_LOG_WHITELIST]
+    envelope = [s for s in statements if s.startswith('set(cache["evaluation"]["')]
+    assert envelope == expected
+    # 白名单信封先于评估行体覆盖与属性清空。
+    body = next(s for s in statements if s.startswith('set(body,') and gate in s)
+    assert statements.index(envelope[0]) < statements.index(body)
+    assert statements.index(body) < statements.index(f'set(attributes, {{}}) where {gate}')
+
+
+def test_evaluation_log_body_branches_and_attribute_clearing():
+    """评估行体独立交付：linked 携带 trace 关联、unlinked 不携带；行体只含
+    封闭 evaluation 信封（无 message/details/execution 通道）；评估记录属性
+    显式清空，白名单之外任何属性不进 Loki structured metadata/索引标签。"""
+    statements = collector_statements()
+    gate = f'attributes["event.name"] == "{EVALUATION_LOG_EVENT}"'
+    bodies = [s for s in statements if s.startswith('set(body,') and gate in s]
+    assert len(bodies) == 2
+    linked = next(s for s in bodies if '"trace_id": trace_id.string' in s)
+    unlinked = next(s for s in bodies if '"trace_id"' not in s)
+    assert f'and trace_id.string != "{ZERO_TRACE}"' in linked
+    assert f'and trace_id.string == "{ZERO_TRACE}"' in unlinked
+    for s in bodies:
+        assert '"evaluation": cache["evaluation"]' in s
+        assert '"event": cache["event"]' in s
+        for forbidden in ('"message"', 'cache["details"]', 'cache["execution"]', 'cache["exception"]', 'cache["stack"]'):
+            assert forbidden not in s
+    clearing = f'set(attributes, {{}}) where {gate}'
+    assert clearing in statements
+    # 评估属性清空先于既有 n-agent/n-kb 清空（覆盖非 n-agent 服务的伪造记录）。
+    assert statements.index(clearing) < statements.index('set(attributes, {}) where resource.attributes["service.name"] == "n-agent"')
+    # last-writer-wins：评估行体必须后于业务行体装配——若评估块前移，业务
+    # 行体会覆盖评估信封，此断言立即失败。
+    eval_bodies = [s for s in bodies]
+    assert statements.index(BUSINESS_BODY_LINKED) < statements.index(eval_bodies[0])
+    assert statements.index(BUSINESS_BODY_UNLINKED) < statements.index(eval_bodies[1])
+
+
+def test_evaluation_logs_explanation_body_and_foreign_langfuse_sentinels():
+    """哨兵：explanation 永不投影进 Loki（行体/标签/metadata 全无通道）；
+    外来 langfuse.* 属性在日志管线无任何投影通道；未注册事件不进入评估
+    投影（评估语句全部带注册事件门）。"""
+    statements = collector_statements()
+    text = '\n'.join(statements)
+    assert 'explanation' not in text
+    assert 'langfuse.' not in text
+    gate = 'attributes["event.name"] == "gen_ai.evaluation.result"'
+    for s in statements:
+        if 'gen_ai.evaluation' in s or 'nagent.evaluation' in s or 'cache["evaluation"]' in s:
+            assert gate in s, s
+    # 事件门精确匹配注册事件名：任何含 event.name 判别的语句只认注册事件。
+    for s in statements:
+        if 'attributes["event.name"]' in s:
+            assert 'attributes["event.name"] == "gen_ai.evaluation.result"' in s, s
+
+
+def test_business_log_output_equivalence_fixture():
+    """业务副本输出等价的静态锁定（plan T11：同一 Collector 文件允许新增
+    评估分支，不能要求整文件 diff 为空）。固定业务 fixture = 业务行体两条
+    装配语句 + unknown 过滤条件的逐字节锁定 + 分支门控结构断言：评估分支
+    只新增带评估事件匹配器的语句，业务语句不触碰任何评估状态，业务行体
+    形状与过滤条件保持逐字节不变。"""
+    statements = collector_statements()
+    # 业务行体 fixture 逐字节不变（形状与顺序锁）。
+    assert BUSINESS_BODY_LINKED in statements
+    assert BUSINESS_BODY_UNLINKED in statements
+    business = [s for s in statements if 'attributes["event.name"]' not in s]
+    evaluation = [s for s in statements if 'attributes["event.name"]' in s]
+    assert evaluation and len(business) + len(evaluation) == len(statements)
+    for s in business:
+        assert 'cache["evaluation"]' not in s and 'event.name' not in s
+    for s in evaluation:
+        assert 'attributes["event.name"] == "gen_ai.evaluation.result"' in s, s
+    doc = collector_config()
+    conditions = doc['processors']['filter/empty_unknown_logs']['logs']['log_record']
+    assert conditions == [BUSINESS_FILTER_CONDITION]
+    # 管线与 processor 集合不变：评估分支实现为 transform/loki_json 内的
+    # 事件门控语句块（前置独立 processor 会被既有 JSON 行改写覆盖，无法
+    # 独立交付），不新增 processor、不改管线编排。
+    assert set(doc['processors']) == {'memory_limiter', 'transform/loki_json', 'filter/empty_unknown_logs', 'batch'}
+    assert doc['service']['pipelines']['logs']['processors'] == ['memory_limiter', 'transform/loki_json', 'filter/empty_unknown_logs', 'batch']
+    assert doc['service']['pipelines']['traces']['processors'] == ['memory_limiter', 'batch']
+
+
+def test_evaluation_run_span_maps_to_evaluator_type():
+    """traces/langfuse：evaluation.run 评估 Trace 独立映射 evaluator（区别于
+    task.evaluate 的业务内评估）；判别键 nagent.evaluation.operation 须在
+    span 白名单中存活并随 metadata 审计。"""
+    m = load()
+    statements = m.span_statements()
+    agent = 'resource.attributes["service.name"] == "n-agent"'
+    condition = f'{agent} and attributes["nagent.evaluation.operation"] == "evaluation.run"'
+    named = f'set(name, "evaluation.run") where {condition}'
+    typed = f'set(attributes["langfuse.observation.type"], "evaluator") where {condition}'
+    assert named in statements and typed in statements
+    # 映射在 custom 操作映射之后、trace.name 装配之前（根 Trace 名跟随）。
+    assert statements.index(named) < statements.index(next(s for s in statements if 'langfuse.trace.name' in s))
+    # 判别键在 span 白名单（keep_keys）与 metadata（FACTS 审计）中存活。
+    assert statements[0].startswith('keep_keys(attributes,') and 'nagent.evaluation.operation' in statements[0]
+    text = '\n'.join(statements)
+    assert 'langfuse.observation.metadata.nagent.evaluation.operation' in text
+
+
+def test_experiment_identity_maps_to_langfuse_experiment_only_from_trusted_source():
+    """实验身份精确映射 langfuse.experiment.*：源键仅限受信本地编排注入的
+    nagent.evaluation.experiment.*（purge 守卫先行），任意客户端 baggage/
+    header 属性无投影通道；五个目标键全部进入最终 keep_keys。"""
+    m = load()
+    # 模块常量与本地契约锁一致：新增第 6 对映射必须同步更新测试，不得逃逸。
+    assert m.EXPERIMENT_ATTRIBUTE_MAP == EXPERIMENT_ATTRIBUTE_MAP
+    statements = m.span_statements()
+    agent = 'resource.attributes["service.name"] == "n-agent"'
+    for source, target in EXPERIMENT_ATTRIBUTE_MAP:
+        expected = f'set(attributes["{target}"], attributes["{source}"]) where {agent} and attributes["{source}"] != nil'
+        assert expected in statements, source
+        assert any(s.startswith(f'delete_key(attributes, "{source}") where attributes["{source}"] != nil and not (')
+                   for s in statements), source
+    final = [s for s in statements if s.startswith('keep_keys(attributes,')][-1]
+    for _, target in EXPERIMENT_ATTRIBUTE_MAP:
+        assert target in final, target
+    # 唯一投影通道：langfuse.experiment.* 只能来自 nagent.evaluation.experiment.*
+    for s in statements:
+        if 'langfuse.experiment.' in s and s.startswith('set('):
+            assert 'nagent.evaluation.experiment.' in s, s
+    # 源键全部在 span 白名单中存活（keep_keys 先删后映射）。
+    assert all(source in statements[0] for source, _ in EXPERIMENT_ATTRIBUTE_MAP)
+
+
+@pytest.mark.parametrize('key,value,expected', [
+    ('nagent.evaluation.operation', 'evaluation.run', True),
+    ('nagent.evaluation.operation', 'run', False),
+    ('nagent.evaluation.operation', 'other', False),
+    ('nagent.evaluation.experiment.id', 'exp-1', True),
+    ('nagent.evaluation.experiment.id', 'a' * 128, True),
+    ('nagent.evaluation.experiment.id', 'a' * 129, False),
+    ('nagent.evaluation.experiment.dataset_id', 'ds_1.2:3', True),
+    ('nagent.evaluation.experiment.dataset_id', 'bad id', False),
+    ('nagent.evaluation.experiment.item_id', 'case-1-rep-2', True),
+    ('nagent.evaluation.experiment.item_id', 'a' * 129, False),
+    ('nagent.evaluation.experiment.root_observation_id', '0123456789abcdef', True),
+    ('nagent.evaluation.experiment.root_observation_id', '', False),
+    ('nagent.evaluation.experiment.name', 'my experiment', True),
+    ('nagent.evaluation.experiment.name', 'x' * 64, True),
+    ('nagent.evaluation.experiment.name', 'x' * 65, False),
+    ('nagent.evaluation.experiment.name', 'bad\x01name', False),
+])
+def test_evaluation_identity_guards_reject_and_accept_real_values(key, value, expected):
+    assert kb_guard_accepts(load().value_guard(key), value) is expected
+
+
+def test_evaluation_projection_never_touches_kb_branch_or_link_sanitizer():
+    """原 KB 分支白名单不变、Link sanitizer 行为不变（空配置 = ocb 默认
+    属性清空、保留关联 ID）；评估字段不进入任何 spanevent 白名单。"""
+    m = load()
+    config = m.build_config('p', 's')
+    assert config['processors']['linksanitize/langfuse'] == {}
+    assert config['processors']['linksanitize/langfuse-kb'] == {}
+    assert config['processors']['batch/langfuse']['send_batch_max_size'] == 1
+    assert config['processors']['batch/langfuse-kb']['send_batch_max_size'] == 1
+    kb_text = '\n'.join(m.span_statements_kb())
+    assert 'nagent.evaluation' not in kb_text and 'langfuse.experiment' not in kb_text
+    assert not any('nagent.evaluation' in key for key in m.KB_SPAN_KEYS)
+    for name in ('transform/langfuse', 'transform/langfuse-kb'):
+        events = json.dumps(config['processors'][name]['trace_statements'][3]['statements'])
+        assert 'nagent.evaluation' not in events, name

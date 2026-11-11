@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from weakref import WeakKeyDictionary
 
 from app.domain.policy import PolicyAuditEvent, PolicyDecisionKind, PolicyDecision, PolicyOutcome
@@ -82,6 +82,7 @@ class ToolService:
         information_flow_service: "InformationFlowService | None" = None,
         audit_service: "PolicyAuditService | None" = None,
         telemetry: "SemanticsTelemetry | None" = None,
+        evaluation_capture: Any = None,
     ):
         self.policy = policy if policy is not None else ToolPolicy()
         for definition in definitions:
@@ -99,6 +100,9 @@ class ToolService:
         self._information_flow_service = information_flow_service
         self._audit_service = audit_service
         self._telemetry = telemetry if telemetry is not None else NoopTelemetry()
+        # 线上评估捕获（T16）：鸭子类型，仅使用 .buffer.record_tool；
+        # None（缺省）时工具路径零感知，完全向后兼容
+        self.evaluation_capture = evaluation_capture
 
     def replace_dynamic_definitions(
         self,
@@ -344,7 +348,54 @@ class ToolService:
                     tool_tel.setdefault('details', {}).update(project_details(tool_result=result.content))
             except Exception:
                 pass
+            # T16: 工具轨迹证据就地登记（服务端可信结果，best-effort 不影响
+            # 工具业务结果）
+            self._record_evaluation_evidence(request, context, result)
             return result
+
+    def _record_evaluation_evidence(
+        self,
+        request: ToolCallRequest,
+        context: ToolExecutionContext | None,
+        result: ToolResult,
+    ) -> None:
+        capture = self.evaluation_capture
+        if capture is None:
+            return
+        # 权限拒绝同样登记（24 项三方审阅 #17）：拒绝是工具契约的违规
+        # 事实（spec 8 权限拒绝计 False），只登记"允许的工具轨迹"会让
+        # 线上 agent.tool_contract 对权限拒绝虚假通过
+        try:
+            from app.application.evaluation_capture import (
+                capture_session_key,
+                jsonable_excerpt,
+            )
+
+            session_id = capture_session_key(
+                explicit=context.session_id if context is not None else None,
+            )
+            if not session_id:
+                return
+
+            capture.buffer.record_tool(session_id, {
+                "call_id": request.id,
+                "tool": request.name,
+                "status": (
+                    result.status.value
+                    if isinstance(result.status, ToolResultStatus)
+                    else str(result.status)
+                ),
+                "duration_ms": result.duration_ms,
+                "terminal": bool(result.terminal),
+                # 副作用证明：服务端实际结果摘要（非模型自述）
+                "result_excerpt": jsonable_excerpt(result.content),
+            })
+        except Exception:
+            logger.warning(
+                "tool evaluation evidence capture failed for tool=%s",
+                request.name,
+                exc_info=True,
+            )
 
     async def _execute(
         self,
