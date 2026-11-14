@@ -258,5 +258,34 @@ class Mem0Adapter(ExternalMemoryProvider):
     def shutdown(self) -> None:
         return None
 
+    def provision(self, fact: str) -> None:
+        """隔离专用空间预置（评估场景 fixture，plan T7）：向本实例绑定的
+        专用 user/agent namespace 写入合成事实。失败向上抛（binder
+        回收并 blocked），不静默。"""
+        if not self.is_available():
+            raise RuntimeError("mem0 backend unavailable")
+        self._http.post(
+            f"{self._base_url}/memories/add/",
+            json={
+                "messages": [{"role": "user", "content": fact}],
+                "user_id": self._user_id,
+                "agent_id": self._agent_id,
+                # Approved synthetic fixture: preserve bytes, skip asynchronous
+                # extraction/rephrasing. Normal conversation writes are unchanged.
+                "infer": False,
+            },
+            headers=self._auth_headers(),
+        )
+
+    def delete_all(self) -> None:
+        """删除本专用命名空间全部记忆（评估场景精确清理）。"""
+        if not self.is_available():
+            raise RuntimeError("mem0 backend unavailable")
+        self._http.post(
+            f"{self._base_url}/memories/delete/",
+            json={"filters": {"user_id": self._user_id}},
+            headers=self._auth_headers(),
+        )
+
     def _auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Token {self._api_key}"}

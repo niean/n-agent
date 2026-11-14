@@ -113,14 +113,16 @@ class TestCapabilities:
             (e["metric_name"], e["target_kind"], e["output_type"])
             for e in deterministic
         }
-        # metrics_deterministic 五指标的目标适配（kb.* -> retrieval /
+        # metrics_deterministic 六指标的目标适配（kb.* -> retrieval /
         # agent.* -> agent_run），与 worker _DETERMINISTIC_HANDLERS 一致
+        # （plan T3 新增 agent.scenario_assertions）
         assert got == {
             ("kb.recall_at_5", "retrieval", "number"),
             ("kb.ndcg_at_5", "retrieval", "number"),
             ("kb.mrr_at_5", "retrieval", "number"),
             ("agent.task_success", "agent_run", "boolean"),
             ("agent.tool_contract", "agent_run", "boolean"),
+            ("agent.scenario_assertions", "agent_run", "boolean"),
         }
         assert all(
             e["executable"] is True and e["judge_required"] is False
@@ -168,13 +170,14 @@ class TestCapabilities:
             for e in catalog["entries"]
             if e["executable"]
         }
-        # judge_ready=False：可执行组合只有 deterministic 五指标
+        # judge_ready=False：可执行组合只有 deterministic 六指标
         assert executable == {
             ("kb.recall_at_5", "deterministic", "retrieval"),
             ("kb.ndcg_at_5", "deterministic", "retrieval"),
             ("kb.mrr_at_5", "deterministic", "retrieval"),
             ("agent.task_success", "deterministic", "agent_run"),
             ("agent.tool_contract", "deterministic", "agent_run"),
+            ("agent.scenario_assertions", "deterministic", "agent_run"),
         }
 
 

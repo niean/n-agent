@@ -792,10 +792,22 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   assert.match(root.textContent, /暂无有效评分/);
   assert.doesNotMatch(root.textContent, /0%/);
 
-  // E2) 结果筛选 + 游标分页：首页无游标无上一页；下一页携带 next_cursor；
-  //     上一页从历史游标栈回退；过滤变更重置游标；"暂无翻页"提示移除
+  // E2) 结果筛选 + 游标分页：首页上一页禁用占位（标准 pager 不隐藏）；
+  //     下一页携带 next_cursor；上一页从历史游标栈回退；过滤变更重置游标；
+  //     "暂无翻页"提示移除
   //     （注意：响应在每次渲染时取数，翻页按钮捕获当次响应的 next_cursor，
   //     mock 需在点击前更新）
+  const pagerButton = (label, scope) =>
+    find(scope || root, node => node.tag === 'button' && node.textContent === label);
+  const assertPagerState = (label, enabled) => {
+    const node = pagerButton(label);
+    assert.ok(node, 'pager 须始终渲染按钮: ' + label);
+    if (enabled) {
+      assert.ok(!node.disabled, label + ' 须可用');
+    } else {
+      assert.equal(node.disabled, true, label + ' 须禁用');
+    }
+  };
   const resultRow = {
     result_id: 'res-1', metric_name: 'kb.recall_at_5', provenance: 'automatic',
     status: 'value', passed: true, typed_value: 0.8, created_at: '2026-11-12T00:00:00+00:00',
@@ -806,8 +818,9 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     '首页不得携带游标或过滤');
   assert.match(root.textContent, /res-1/);
   assert.doesNotMatch(root.textContent, /暂无翻页/, '固定 50 条"暂无翻页"提示须移除');
-  assert.ok(!findButton('上一页', root), '首页不得渲染上一页');
-  assert.ok(findButton('下一页', root), '有 next_cursor 须渲染下一页');
+  assertPagerState('上一页', false);
+  assertPagerState('下一页', true);
+  assert.match(root.textContent, /第 1 页/, 'pager 须展示页码 info');
   resultsPage = { items: [resultRow], next_cursor: 'tok3' };
   await findButton('下一页', root).handlers.click();
   await flush();
@@ -816,14 +829,14 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   await findButton('下一页', root).handlers.click();
   await flush();
   assert.equal(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))).cursor, 'tok3');
-  assert.ok(!findButton('下一页', root), '末页无下一页');
+  assertPagerState('下一页', false);
   await findButton('上一页', root).handlers.click();
   await flush();
   assert.equal(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))).cursor, 'tok2', '上一页从游标栈回退');
   await findButton('上一页', root).handlers.click();
   await flush();
   assert.deepEqual(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))), { limit: 50 }, '回到首页不携带游标');
-  assert.ok(!findButton('上一页', root), '首页无上一页');
+  assertPagerState('上一页', false);
 
   // E2b) 过滤维度（时间/目标类型/DefinitionKey/provenance/状态）进入查询；
   //      过滤变更重置游标；跨渲染保留用户选择
@@ -1822,6 +1835,10 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       coverage: { results_total: 1234, value_results: 1000, error_or_skipped_results: 234 },
       distribution: {
         'm-1': { results_total: 1234, passed: 1000, failed: 200, error_or_skipped: 34 },
+        'numeric-perfect': { results_total: 1, passed: 0, failed: 0, error_or_skipped: 0,
+          numeric_count: 1, numeric_mean: 1, numeric_min: 1, numeric_max: 1 },
+        'numeric-zero': { results_total: 1, passed: 0, failed: 0, error_or_skipped: 0,
+          numeric_count: 1, numeric_mean: 0, numeric_min: 0, numeric_max: 0 },
       },
       delivery_status: {
         langfuse: { total: 1234, verified: 1000, pending: 230, dead_letter: 4 },
@@ -1838,6 +1855,13 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     for (const label of ['结果数', '通过', '质量不通过', '异常跳过']) {
       const th = findTh(body, label);
       assert.ok(th && hasClass(th, 'document-table__numeric'), '分布 numeric 列: ' + label);
+    }
+    for (const [metric, score] of [['numeric-perfect', '1'], ['numeric-zero', '0']]) {
+      const row = find(body, node => node.tag === 'tr'
+        && node.children.some(child => child.textContent === metric));
+      assert.deepEqual(row.children.map(child => child.textContent),
+        [metric, '1', '-', '-', '1', score, score, score, '0'],
+        '数值评分显示真实分数，布尔通过数为不适用');
     }
     const deliveryCounts = find(body, node => hasClass(node, 'evaluations-delivery-counts'));
     assert.ok(deliveryCounts, '投递计数去徽章化容器');

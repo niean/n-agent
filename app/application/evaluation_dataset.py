@@ -41,9 +41,18 @@ from app.domain.evaluation.models import (
     DatasetManifest,
     EvaluationValidationError,
 )
+from app.domain.evaluation.scenario import (
+    ScenarioCase,
+    ScenarioValidationError,
+)
 
-# manifest schema 版本；字段语义破坏性变化时递增并迁移
+# manifest schema 版本闭集；字段语义破坏性变化时递增并迁移。
+# schema "1"：原有行为、hash 与结果字节不变；schema "2"：场景契约扩展
+# （scenario.py），未知版本显式拒绝（不静默降级）。历史常量保留供
+# schema 1 生成方与既有测试引用。
 DATASET_SCHEMA_VERSION = "1"
+DATASET_SCHEMA_VERSION_2 = "2"
+DATASET_SCHEMA_VERSIONS = (DATASET_SCHEMA_VERSION, DATASET_SCHEMA_VERSION_2)
 
 # 数据集目录内的 manifest 文件名
 MANIFEST_FILENAME = "manifest.json"
@@ -145,10 +154,10 @@ def _validate_manifest(content: Any, base_dir: Path) -> DatasetManifest:
             raise DatasetManifestError(f"manifest 缺少必填字段: {field_name}")
 
     schema_version = content["schema_version"]
-    if schema_version != DATASET_SCHEMA_VERSION:
+    if not isinstance(schema_version, str) or schema_version not in DATASET_SCHEMA_VERSIONS:
         raise DatasetManifestError(
             f"不支持的 manifest schema_version: {schema_version!r}，"
-            f"仅支持 {DATASET_SCHEMA_VERSION!r}"
+            f"仅支持 {DATASET_SCHEMA_VERSIONS}（字符串形式，拒绝整型字面量）"
         )
 
     dataset_id = _require_str(content["dataset_id"], "dataset_id")
@@ -172,14 +181,14 @@ def _validate_manifest(content: Any, base_dir: Path) -> DatasetManifest:
         raise DatasetManifestError("cases 必须是非空数组")
 
     cases = tuple(
-        _validate_case(case, index=index, base_dir=base_dir)
+        _validate_case(case, index=index, base_dir=base_dir, schema_version=schema_version)
         for index, case in enumerate(cases_raw)
     )
     _require_unique_case_ids(cases)
 
     try:
         return DatasetManifest(
-            schema_version=DATASET_SCHEMA_VERSION,
+            schema_version=schema_version,
             dataset_id=dataset_id,
             dataset_version=dataset_version,
             dataset_hash=declared_hash,
@@ -213,11 +222,37 @@ def _require_unique_case_ids(cases: tuple[DatasetCase, ...]) -> None:
 
 
 def _validate_case(
-    case: Any, index: int, base_dir: Path
+    case: Any, index: int, base_dir: Path, schema_version: str
 ) -> DatasetCase:
     where = f"cases[{index}]"
     if not isinstance(case, Mapping):
         raise DatasetManifestError(f"{where} 必须是 JSON 对象: {type(case).__name__}")
+    scenario: ScenarioCase | None = None
+    if schema_version == DATASET_SCHEMA_VERSION_2:
+        unknown = sorted(set(case) - _CASE_SCHEMA2_ALLOWED_FIELDS)
+        if unknown:
+            raise DatasetManifestError(
+                f"{where} 存在 schema 2 未注册字段（拒绝静默过滤）: {unknown}"
+            )
+        # 场景数据集不扩展 TARGET_KINDS：profile 承载执行形态，target_kind
+        # 固定为 agent_run，保证既有评分器与 admission 语义可识别
+        if case.get("target_kind") != "agent_run":
+            raise DatasetManifestError(
+                f"{where} schema 2 target_kind 必须登记为 'agent_run'，"
+                f"执行形态由 scenario.execution.profile 承载: "
+                f"{case.get('target_kind')!r}"
+            )
+        scenario_raw = case.get("scenario")
+        if not isinstance(scenario_raw, Mapping):
+            raise DatasetManifestError(
+                f"{where} schema 2 必须携带 scenario JSON 对象"
+            )
+        try:
+            scenario = ScenarioCase.from_mapping(scenario_raw)
+        except ScenarioValidationError as exc:
+            raise DatasetManifestError(
+                f"{where} scenario 契约校验失败: {exc}"
+            ) from exc
     for field_name in _CASE_REQUIRED_FIELDS:
         if field_name not in case:
             raise DatasetManifestError(f"{where} 缺少必填字段: {field_name}")
@@ -267,9 +302,31 @@ def _validate_case(
             cleanup_rule=cleanup_rule,
             no_answer=no_answer,
             metric_applicability=applicability or None,
+            scenario=scenario,
         )
     except EvaluationValidationError as exc:
         raise DatasetManifestError(f"case {case_id!r}: {exc}") from exc
+
+
+# schema 2 case 允许的字段（顶层键精确闭集；未知字段前置拒绝，不做静默过滤）
+_CASE_SCHEMA2_ALLOWED_FIELDS = frozenset({
+    "case_id",
+    "input",
+    "target_kind",
+    "slice",
+    "expected_output",
+    "qrels",
+    "rubric_ref",
+    "rubric_sha256",
+    "fixture",
+    "fixture_sha256",
+    "corpus_revision",
+    "allowed_side_effects",
+    "cleanup_rule",
+    "no_answer",
+    "metric_applicability",
+    "scenario",
+})
 
 
 def _validate_case_identity(case: Mapping[str, Any], where: str) -> tuple[str, Mapping[str, Any], str]:

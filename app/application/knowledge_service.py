@@ -372,4 +372,8 @@ def _snippet_to_dict(snippet: KnowledgeSnippet) -> dict[str, Any]:
         "score": snippet.score,
         "source": snippet.source,
         "metadata": snippet.metadata,
+        "document_id": snippet.document_id,
+        "document_revision": snippet.document_revision,
+        "chunk_id": snippet.chunk_id,
+        "chunk_content_hash": snippet.chunk_content_hash,
     }

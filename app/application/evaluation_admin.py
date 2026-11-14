@@ -128,7 +128,7 @@ class EvaluationAdminService:
     def capabilities(self) -> dict[str, Any]:
         """当前执行器真实支持的评估能力目录（spec 4.2）。
 
-        - deterministic：五指标固定内置公式组合，始终可执行；
+        - deterministic：六指标固定内置公式组合，始终可执行；
         - llm_judge：judge_required=True，Judge 未配置（judge_ready()
           为 False）时 executable=False；
         - human：online_forbidden=True（人工评估不进在线统计，spec 6.2），

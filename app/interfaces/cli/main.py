@@ -432,6 +432,25 @@ def _build_evaluate_parser(subparsers) -> None:
     retry_p.add_argument("--result-id", required=True)
     _add_format_flags(retry_p)
 
+    # 离线转换子命令（plan T2）：只加载转换依赖，不初始化业务服务
+    convert_p = sub.add_parser(
+        "convert-e2e",
+        help="Offline-convert E2E conversation cases into a schema 2 review package",
+    )
+    convert_p.add_argument(
+        "--source-dir", required=True,
+        help="Directory containing source E2E conversation JSON files",
+    )
+    convert_p.add_argument("--out", required=True, help="Output directory")
+    convert_p.add_argument(
+        "--dataset-id", default="agent-e2e-scenarios",
+        help="Target dataset id (default agent-e2e-scenarios)",
+    )
+    convert_p.add_argument(
+        "--dataset-version", default="1",
+        help="Target dataset version (default 1)",
+    )
+
 
 def _build_delegation_parser(subparsers) -> None:
     parser = subparsers.add_parser("delegation", help="Delegation commands")

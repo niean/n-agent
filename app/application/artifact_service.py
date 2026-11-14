@@ -2423,6 +2423,12 @@ class ArtifactService:
             source_context_ref=task_id,
             source_session_id=session_id,
             summary=task_artifact.summary,
+            # finish_run 不持久化提交的 TaskArtifact：workspace 原始 ref
+            # 固化为 origin_ref 标签（评估场景证据核对用，有界摘要）
+            labels=(
+                (f"origin_ref={task_artifact.storage_ref}",)
+                if is_workspace_ref else None
+            ),
             created_by=_ACTOR,
         )
         initial_revision = ArtifactRevision(

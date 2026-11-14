@@ -311,8 +311,182 @@ async def test_execute_invokes_frozen_config_per_case_replicate(tmp_path):
     assert target_frozen_configs(target.calls) == [frozen] * 6
 
 
+async def test_execute_honors_case_ids_subset(tmp_path):
+    """执行单显式 case_ids 子集只执行子集（plan T8：R2 三题子集入口）；
+    未知 case_id 按契约违规 fail-fast，不静默跑全量。"""
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    await _definitions(store, _definition("agent.task_success", "experiment_item"))
+    target = FakeTargetRunner()
+    runner = _runner(store, target)
+    dataset = _manifest(_agent_case("case-1"), _agent_case("case-2"))
+    report = await runner.execute(
+        ExecuteExperimentRequest(
+            dataset=dataset,
+            name="exp-subset",
+            target_config={"model": "gpt-x"},
+            evaluator_set=(("agent.task_success", "v1"),),
+            case_ids=("case-2",),
+        )
+    )
+    assert {item.case_id for item in report.items} == {"case-2"}
+    assert len(report.items) == 1
+    assert target.call_count == 1
+    with pytest.raises(EvaluationValidationError):
+        await runner.execute(
+            ExecuteExperimentRequest(
+                dataset=dataset,
+                name="exp-unknown",
+                target_config={"model": "gpt-x"},
+                evaluator_set=(("agent.task_success", "v1"),),
+                case_ids=("nope",),
+            )
+        )
+
+
 def target_frozen_configs(calls) -> list[dict]:
     return [req["target_config"] for _, req in calls]
+
+
+def _scenario_case(case_id: str = "sc-1", *, profile: str = "dashboard") -> DatasetCase:
+    from app.domain.evaluation.scenario import ScenarioCase
+
+    return DatasetCase(
+        case_id=case_id,
+        input={"turns": [{"message": "hi"}]},
+        target_kind="agent_run",
+        expected_output="ok",
+        scenario=ScenarioCase.from_mapping({
+            "execution": {
+                "profile": profile,
+                "steps": [
+                    {"step_id": "turn-1", "action": "chat",
+                     "payload": {"message": "hi"}}
+                ],
+                "timeout_seconds": 300,
+            },
+            "requirements": {},
+            "options": {},
+            "assertions": [
+                {"assertion_type": "result_contains", "params": {"text": "hi"},
+                 "step_id": "turn-1"}
+            ],
+            "expected_output": {"steps": {"turn-1": {"rubric": "回答"}}},
+            "bindings": {},
+            "lifecycle": {
+                "release_rule": "release_active_resources",
+                "retention_rule": "retain_evidence_default",
+            },
+            "required_metrics": {"语义正确": "agent.scenario_quality"},
+            "source": {
+                "repo_path": "tests/e2e/conversations/x.json",
+                "source_case_id": "x",
+                "source_sha256": "b" * 64,
+                "rules_version": "e2e-conversion-v1",
+                "transformations": [],
+            },
+            "comparison_scope": "fixed_fixture",
+        }),
+    )
+
+
+async def test_scenario_profile_reaches_target_runner_request(tmp_path):
+    """场景 case 的执行 profile 随请求进入 target runner：基础设施按
+    profile 选择正式适配器（spec 101：两个 runner 按 profile 选择并存）。"""
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    await _definitions(store, _definition("agent.task_success", "experiment_item"))
+    target = FakeTargetRunner()
+    runner = _runner(store, target)
+    dataset = _manifest(_scenario_case("sc-1"))
+    await runner.execute(
+        ExecuteExperimentRequest(
+            dataset=dataset,
+            name="exp-sc",
+            target_config={},
+            evaluator_set=(("agent.task_success", "v1"),),
+            replicates=1,
+            seed="seed-42",
+        )
+    )
+    assert target.calls[0][1]["profile"] == "dashboard"
+
+
+async def test_task_action_snapshot_preserves_real_request_without_fake_chat(tmp_path):
+    from dataclasses import replace
+    import json
+
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    await _definitions(store, _definition("agent.task_success", "experiment_item"))
+    evidence = FakeEvidence()
+    task = {"title": "生成文件", "body": "创建两个文件", "priority": 2, "goal_mode": True}
+    case = replace(_scenario_case(), input={"turns": [{"step_id": "turn-1", "action": "task_create", "task": task}]})
+    observed = {"status": "complete", "steps": [{"step_id": "turn-1", "task_id": "t1", "answer": None}],
+                "tasks": [{"task_id": "t1", "status": "succeeded"}]}
+    target = FakeTargetRunner(results=[{"status": "succeeded", "output": {"scenario_evidence": observed},
+                                       "side_effects": [], "retrievals": [], "run_id": None}])
+    await _runner(store, target, evidence=evidence).execute(ExecuteExperimentRequest(
+        dataset=_manifest(case), name="task evidence", target_config={}, evaluator_set=(("agent.task_success", "v1"),)))
+    turn = evidence.saved[0][1].content["turns"][0]
+    assert json.loads(turn["request"]) == task
+    assert turn["answer"] is None
+
+
+async def test_legacy_scenario_document_deletion_revokes_real_registered_sample(tmp_path):
+    from app.application.evaluation_deletion import EvaluationDeletionService
+
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    await _definitions(store, _definition("agent.task_success", "experiment_item"))
+    observed = {"status": "complete", "steps": [], "retrievals": [
+        {"backend": "n_kb", "results": [{"document_id": "legacy-doc", "document_revision": None}]}]}
+    target = FakeTargetRunner(results=[{"status": "succeeded", "output": {"scenario_evidence": observed},
+                                       "side_effects": [], "retrievals": [], "run_id": "r1"}])
+    report = await _runner(store, target).execute(ExecuteExperimentRequest(
+        dataset=_manifest(_scenario_case()), name="legacy source", target_config={},
+        evaluator_set=(("agent.task_success", "v1"),)))
+    result = await EvaluationDeletionService(store=store).handle_document_deleted("legacy-doc", "upstream-rev")
+    assert result["samples"] == 1
+    assert result["cleared_sample_ids"] == list(report.items[0].sample_ids)
+
+
+async def test_scenario_source_session_deletion_revokes_experiment_sample(tmp_path):
+    from app.application.evaluation_deletion import EvaluationDeletionService
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    await _definitions(store, _definition("agent.task_success", "experiment_item"))
+    observed = {"status": "complete", "steps": [{"step_id": "t1", "run_id": "earlier-run"},
+                {"step_id": "t2", "run_id": "last-run"}],
+                "tasks": [{"task_id": "task-1", "runs": [{"run_id": 7, "agent_runs": [
+                    {"run_id": "worker-run", "session_id": "worker-session"}]}]}]}
+    result = {"status": "succeeded", "run_id": "last-run", "retrievals": [], "side_effects": [],
+              "output": {"session_id": "source-session", "scenario_evidence": observed}}
+    dataset = _manifest(_scenario_case())
+    targets = EvaluationExperimentRunner._evidence_targets(result, dataset)
+    identities = {(t["subject_kind"], t["subject_id"]) for t in targets}
+    assert {("session", "source-session"), ("agent_run", "earlier-run"),
+            ("agent_run", "last-run"), ("agent_run", "worker-run"),
+            ("session", "worker-session")} <= identities
+    report = await _runner(store, FakeTargetRunner(results=[result])).execute(ExecuteExperimentRequest(
+        dataset=dataset, name="source deletion", target_config={}, evaluator_set=(("agent.task_success", "v1"),)))
+    deletion = await EvaluationDeletionService(store=store).handle_session_deleted("source-session")
+    assert deletion["cleared_sample_ids"] == list(report.items[0].sample_ids)
+
+
+async def test_non_scenario_request_carries_no_profile(tmp_path):
+    """非场景 case 请求不携带 profile：旧 runner 行为不变。"""
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    await _definitions(store, _definition("agent.task_success", "experiment_item"))
+    target = FakeTargetRunner()
+    runner = _runner(store, target)
+    dataset = _manifest(_agent_case("case-1"))
+    await runner.execute(
+        ExecuteExperimentRequest(
+            dataset=dataset,
+            name="exp-a",
+            target_config={},
+            evaluator_set=(("agent.task_success", "v1"),),
+            replicates=1,
+            seed="seed-42",
+        )
+    )
+    assert "profile" not in target.calls[0][1]
 
 
 async def test_execute_isolates_session_per_case_and_replicate_shares_multi_turn(tmp_path):

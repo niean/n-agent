@@ -58,6 +58,52 @@ def _settings(
     return Settings(**kwargs)
 
 
+@pytest.mark.asyncio
+async def test_scenario_artifact_record_reads_bounded_actual_content():
+    from types import SimpleNamespace
+    from app.main import _scenario_artifact_record
+
+    art = SimpleNamespace(id="a1", name="report.md", kind="markdown", labels=["origin_ref=workspace:report.md"])
+    class Reader:
+        async def get_content(self, artifact_id):
+            assert artifact_id == "a1"
+            return "# 实际报告".encode(), art
+    row = await _scenario_artifact_record(Reader(), art)
+    assert row["content"] == "# 实际报告"
+    assert row["origin_ref"] == "workspace:report.md"
+
+
+@pytest.mark.asyncio
+async def test_scenario_memory_intent_precedes_write_and_failure_is_recoverable():
+    from app.main import _scenario_prepare_memory
+    events = []
+    class Ledger:
+        async def register_intent(self, intent): events.append("intent")
+        async def confirm_owned(self, *args, **kwargs): events.append("owned")
+        async def mark_unknown(self, *args, **kwargs): events.append("unknown")
+    class Binder:
+        def prepare(self, *args, **kwargs):
+            events.append("write")
+            assert events[0] == "intent"
+            raise RuntimeError("prepare disconnected")
+    with pytest.raises(RuntimeError):
+        await _scenario_prepare_memory(Binder(), Ledger(), "session-1", "mem0-e2e-test", "合成事实",
+                                       {"execution_id": "exec1", "case_id": "memory-case"})
+    assert events == ["intent", "write", "unknown"]
+
+
+@pytest.mark.asyncio
+async def test_scenario_worker_refs_use_agent_registry_not_task_run_integer():
+    from app.main import _scenario_task_agent_runs
+    class Registry:
+        def list_for_session(self, session_id):
+            assert session_id == "worker-session"
+            return [{"id": "agent-worker-1", "session_id": session_id, "task_run_id": 7},
+                    {"id": "unrelated", "session_id": session_id, "task_run_id": 8}]
+    refs = await _scenario_task_agent_runs(Registry(), "worker-session", {7})
+    assert refs == {7: [{"run_id": "agent-worker-1", "session_id": "worker-session"}]}
+
+
 # ---------------------------------------------------------------------------
 # 禁用：无副作用
 # ---------------------------------------------------------------------------

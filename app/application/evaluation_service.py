@@ -39,6 +39,7 @@ import base64
 import copy
 import hashlib
 import json
+import math
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -786,6 +787,11 @@ class EvaluationService:
             "output_type": "boolean",
         },
         {
+            "definition_id": "agent.scenario_assertions",
+            "target_kind": "agent_run",
+            "output_type": "boolean",
+        },
+        {
             "definition_id": "kb.recall_at_5",
             "target_kind": "retrieval",
             "output_type": "number",
@@ -822,6 +828,13 @@ class EvaluationService:
             "definition_id": "kb.context_relevance",
             "target_kind": "retrieval",
             "required_fields": ("query", "chunks"),
+        },
+        {
+            # plan T3：场景语义质量（逐轮 0/0.5/1，最终分取最低档）；
+            # turns 证据槽由 judge_provider 按轮展开（request/answer/rubric）
+            "definition_id": "agent.scenario_quality",
+            "target_kind": "agent_run",
+            "required_fields": ("turns", "scenario_evidence"),
         },
     )
 
@@ -881,7 +894,7 @@ class EvaluationService:
             defs.append(
                 EvaluatorDefinition(
                     definition_id=preset["definition_id"],
-                    version="v1",
+                    version="v2" if preset["definition_id"] == "agent.scenario_quality" else "v1",
                     metric_name=preset["definition_id"],
                     target_kind=preset["target_kind"],
                     method="llm_judge",
@@ -902,6 +915,11 @@ class EvaluationService:
                     ci_admissible=True,
                 )
             )
+        # Keep the immutable v1 preset available for existing requests/replays;
+        # only v2 opts into observed execution evidence.
+        scenario_v2 = next((d for d in defs if d.metric_name == "agent.scenario_quality"), None)
+        if scenario_v2 is not None:
+            defs.append(replace(scenario_v2, version="v1", required_fields=("turns",)))
         return cls._with_experiment_variants(tuple(defs))
 
     @classmethod
@@ -914,7 +932,8 @@ class EvaluationService:
         variants = tuple(
             replace(
                 definition,
-                version=cls.EXPERIMENT_PRESET_VERSION,
+                version=("experiment-v2" if definition.metric_name == "agent.scenario_quality"
+                         and definition.version == "v2" else cls.EXPERIMENT_PRESET_VERSION),
                 target_kind="experiment_item",
             )
             for definition in definitions
@@ -929,7 +948,15 @@ class EvaluationService:
         以已注册定义为准：生产不注册则自动 evaluator 永不执行（此前只有
         feedback.helpful 与测试内注册的定义存在，#1）。"""
         for definition in self.preset_definitions(judge_model):
-            await self.register_definition(definition)
+            try:
+                await self.register_definition(definition)
+            except EvaluationConflictError:
+                # 启用/更换 Judge 不覆盖既有不可变定义，也不让一个旧预设
+                # 阻断后续 experiment_item 镜像的注册。新内容得到稳定版本。
+                content_hash = _sha256_hex(definition_to_mapping(definition))
+                await self.register_definition(replace(
+                    definition, version=definition.version + "-" + content_hash[:16],
+                ))
 
     # ------------------------------------------------------------------
     # submit_sample
@@ -1734,7 +1761,7 @@ class EvaluationService:
             # #20：命中 5000 行扫描帽时显式标记——覆盖率/分布按已扫描
             # 部分聚合，消费方（Dashboard/导出）不得把它当全量口径
             scan_truncated = True
-        distribution: dict[str, dict[str, int]] = {}
+        distribution: dict[str, dict[str, Any]] = {}
         value_count = 0
         for row in results:
             metric = row.get("metric_name") or ""
@@ -1745,6 +1772,10 @@ class EvaluationService:
                     "passed": 0,
                     "failed": 0,
                     "error_or_skipped": 0,
+                    "numeric_count": 0,
+                    "numeric_mean": None,
+                    "numeric_min": None,
+                    "numeric_max": None,
                 },
             )
             bucket["results_total"] += 1
@@ -1754,6 +1785,15 @@ class EvaluationService:
                     bucket["passed"] += 1
                 elif row.get("passed") is False:
                     bucket["failed"] += 1
+                value = row.get("typed_value")
+                # bool is an int subclass; it is a verdict, not a numeric score.
+                if type(value) in (int, float) and math.isfinite(value):
+                    bucket["numeric_count"] += 1
+                    count = bucket["numeric_count"]
+                    previous = bucket["numeric_mean"]
+                    bucket["numeric_mean"] = value if count == 1 else previous + (value - previous) / count
+                    bucket["numeric_min"] = value if count == 1 else min(bucket["numeric_min"], value)
+                    bucket["numeric_max"] = value if count == 1 else max(bucket["numeric_max"], value)
             else:
                 bucket["error_or_skipped"] += 1
         # M4：投递聚合下沉到 store（单次 JOIN + GROUP BY），代替逐行

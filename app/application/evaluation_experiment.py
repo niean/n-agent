@@ -73,6 +73,7 @@ skipped(evidence_missing) 处理（不伪造 false/0），待 T16/T20 接线真�
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 from contextlib import AbstractContextManager
@@ -252,6 +253,12 @@ class ExecuteExperimentRequest:
     replicates: int = 1
     seed: str | None = None
     baseline_id: str | None = None
+    # 执行单身份：场景资源账目（memory_binding intent）的归属键；host-side
+    # 直调（无执行单）为空串，prepare 只返回 receipt 不登记
+    execution_id: str = ""
+    # 显式 case 子集（plan T5/T8）：None 执行全量；子集必须是数据集
+    # case 的真子集（未知 case_id 契约违规 fail-fast）
+    case_ids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -383,7 +390,7 @@ class EvaluationExperimentRunner:
     # ------------------------------------------------------------------
 
     async def execute(
-        self, request: ExecuteExperimentRequest
+        self, request: ExecuteExperimentRequest, *, on_started: Any = None
     ) -> ExperimentRunReport:
         """execute 模式：冻结配置逐 case 重新调用目标并生成评分样本。"""
         self._validate_replicates(request.replicates)
@@ -393,6 +400,20 @@ class EvaluationExperimentRunner:
         evaluator_keys = self._definition_keys(definitions)
         dataset = request.dataset
         self._validate_case_kinds(dataset)
+        # 显式子集（plan T8）：执行单 case_ids 必须是数据集 case 的子集；
+        # 未知 case_id 契约违规 fail-fast（与 submit 侧 select_case_ids 同语义）
+        if request.case_ids is not None:
+            known = {case.case_id for case in dataset.cases}
+            unknown = sorted(set(request.case_ids) - known)
+            if unknown:
+                raise EvaluationValidationError(
+                    f"case_ids 含未知 case: {unknown}"
+                )
+            selected = tuple(
+                case for case in dataset.cases if case.case_id in set(request.case_ids)
+            )
+        else:
+            selected = tuple(dataset.cases)
         root_defs, retrieval_defs = self._split_definitions(definitions)
         started = await self._service.start_experiment(
             StartExperimentRequest(
@@ -406,6 +427,8 @@ class EvaluationExperimentRunner:
                 manifest_json=self._manifest_json(dataset),
             )
         )
+        if on_started is not None:
+            await on_started(started)
         frozen = self._build_frozen_snapshot(
             mode="execute",
             started=started,
@@ -420,13 +443,13 @@ class EvaluationExperimentRunner:
             "dataset_id=%s cases=%d replicates=%d metrics=%d",
             started.experiment_id,
             dataset.dataset_id,
-            len(dataset.cases),
+            len(selected),
             request.replicates,
             len(metric_names),
         )
         items: list[ExperimentItemRecord] = []
         cleanup_failures = 0
-        for case in dataset.cases:
+        for case in selected:
             for replicate in range(request.replicates):
                 # 单项异常隔离：非契约异常（存储故障、适配器意外崩溃）
                 # 记为该项 error 结局，运行继续；契约违规保持 fail-fast
@@ -440,6 +463,7 @@ class EvaluationExperimentRunner:
                         target_config=dict(request.target_config),
                         root_defs=root_defs,
                         retrieval_defs=retrieval_defs,
+                        execution_id=request.execution_id,
                     )
                 except EvaluationValidationError:
                     raise
@@ -566,6 +590,7 @@ class EvaluationExperimentRunner:
         target_config: Mapping[str, Any],
         root_defs: tuple[DefinitionKey, ...],
         retrieval_defs: tuple[DefinitionKey, ...],
+        execution_id: str = "",
     ) -> ExperimentItemRecord:
         item_id = experiment_item_id(case.case_id, replicate)
         namespace = session_namespace(experiment_id, case.case_id)
@@ -596,6 +621,31 @@ class EvaluationExperimentRunner:
                 replicate=replicate,
                 target_config=target_config,
                 turns=turns,
+                profile=(
+                    case.scenario.execution.profile
+                    if case.scenario is not None
+                    else None
+                ),
+                scenario_options=(
+                    {
+                        key: value
+                        for key, value in (
+                            ("external_memory_enabled", case.scenario.options.external_memory_enabled),
+                        )
+                        if value is not None
+                    }
+                    if case.scenario is not None
+                    else None
+                ),
+                scenario_context=(
+                    {
+                        "execution_id": execution_id,
+                        "case_id": case.case_id,
+                    }
+                    if case.scenario is not None
+                    else None
+                ),
+                scenario_files=_scenario_file_paths(case),
             )
             if final_result is None:
                 outcome = (
@@ -620,6 +670,8 @@ class EvaluationExperimentRunner:
                         item_id=item_id,
                         result=final_result,
                         root=root,
+                        frozen_target_model=target_config.get("target_model"),
+                        execution_fingerprint=target_config.get("execution_fingerprint"),
                     )
                 except EvidenceSnapshotOversizedError:
                     outcome = "skipped"
@@ -690,6 +742,10 @@ class EvaluationExperimentRunner:
         replicate: int,
         target_config: Mapping[str, Any],
         turns: tuple[Mapping[str, Any], ...],
+        profile: str | None = None,
+        scenario_options: Mapping[str, Any] | None = None,
+        scenario_context: Mapping[str, Any] | None = None,
+        scenario_files: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, Any] | None, list[AttemptRecord]]:
         """业务执行 attempt 循环（从 _execute_item 抽出）：返回最终成功结果
         （无成功为 None）与全部 attempt 记录（重试不覆盖）。"""
@@ -698,18 +754,29 @@ class EvaluationExperimentRunner:
             # 每 attempt 独立会话：重试在全新会话内完整重放全部轮次
             session_id = f"{namespace}-r{replicate}-a{attempt_index}"
             started_at = self._clock().astimezone(timezone.utc).isoformat()
+            # 场景 case 携带执行 profile：基础设施按 profile 选择正式适配器
+            # （spec 101：两个 runner 按 profile 选择并存）；非场景 case 不携带
+            request: dict[str, Any] = {
+                "mode": "execute",
+                "target_config": dict(target_config),
+                "session": {
+                    "namespace": namespace,
+                    "session_id": session_id,
+                },
+                "turns": [dict(turn) for turn in turns],
+            }
+            if profile is not None:
+                request["profile"] = profile
+            if scenario_options:
+                request["scenario_options"] = dict(scenario_options)
+            if scenario_context:
+                request["scenario_context"] = dict(scenario_context)
+            if scenario_files:
+                # T10：场景声明的工作区文件清单（适配器按此收集文件证据）
+                request["scenario_files"] = list(scenario_files)
             try:
                 result = await self._target_runner.run_target(
-                    business_target,
-                    {
-                        "mode": "execute",
-                        "target_config": dict(target_config),
-                        "session": {
-                            "namespace": namespace,
-                            "session_id": session_id,
-                        },
-                        "turns": [dict(turn) for turn in turns],
-                    },
+                    business_target, request
                 )
             except EvaluationValidationError:
                 raise
@@ -756,6 +823,22 @@ class EvaluationExperimentRunner:
             )
             if status == "succeeded":
                 return result, attempts
+            # 失败尝试的证据摘要必须可见（不留诊断盲区，T11/T12 教训）：
+            # transport/business 失败时适配器可能随错误返回部分证据
+            evidence = (result.get("output") or {}).get("scenario_evidence") or {}
+            acp_block = evidence.get("acp") or {}
+            logger.warning(
+                "evaluation target attempt failed: profile=%s status=%s "
+                "error_type=%s reason=%s stages=%s stderr=%s",
+                profile, status, result.get("error_type"),
+                str(evidence.get("reason") or "")[:300],
+                json.dumps(
+                    acp_block.get("stages")
+                    or (evidence.get("cli") or {}).get("steps") or [],
+                    ensure_ascii=False,
+                )[:600],
+                str(acp_block.get("stderr") or "")[-1500:],
+            )
             if not self._retry_allowed(result):
                 return None, attempts
         return None, attempts
@@ -785,6 +868,8 @@ class EvaluationExperimentRunner:
         item_id: str,
         result: Mapping[str, Any],
         root: ExperimentRootHandle,
+        frozen_target_model: str | None = None,
+        execution_fingerprint: str | None = None,
     ) -> tuple[str, str]:
         output = result.get("output") or {}
         turns = extract_turns(case)
@@ -872,6 +957,12 @@ class EvaluationExperimentRunner:
             "turns": turns,
             "final_answer": output.get("final_answer"),
             "completion_reported": bool(output.get("completion_reported", False)),
+            "execution_fingerprint": execution_fingerprint,
+            "target_model": (
+                output.get("model_response_version")
+                if output.get("model_response_version") not in (None, "", "N-Agent", "n-agent")
+                else frozen_target_model
+            ),
             "tool_calls": list(output.get("tool_calls") or []),
             "side_effect_evidence": output.get("side_effect_evidence"),
             "allowed_tools": list(output.get("allowed_tools") or []),
@@ -900,6 +991,46 @@ class EvaluationExperimentRunner:
             "contexts": chunk_texts or None,
             "query": query_text or None,
         }
+        # plan T3/T6：schema 2 场景负载落快照——assertions 来自 case 冻结
+        # 契约（JSON 形态），scenario_evidence 来自目标适配器经正式端口
+        # 采集的证据（缺证据时适配器上报 unavailable/incomplete，此处
+        # 原样透传，不合成不补齐）
+        if case.scenario is not None:
+            content["assertions"] = [
+                {
+                    "assertion_type": assertion.assertion_type,
+                    "params": dict(assertion.params),
+                    "step_id": assertion.step_id,
+                }
+                for assertion in case.scenario.assertions
+            ]
+            content["scenario_evidence"] = output.get("scenario_evidence")
+            # 逐轮 Judge 槽位（agent.scenario_quality）：request=输入消息
+            # 文本、answer=正式端口归属的真实轮次回答（scenario_evidence
+            # steps 按 step_id 对齐）、rubric=冻结契约逐轮 rubric。扩展
+            # 输入 turn 而非替换——原始输入（含内联图片 messages）保留
+            # 在快照中；某轮缺真实回答时 answer 为 None，Judge 按缺证据
+            # 本地 skipped，不合成文本
+            answers = {
+                str(step.get("step_id")): step.get("answer")
+                for step in (
+                    (output.get("scenario_evidence") or {}).get("steps") or []
+                )
+                if isinstance(step, Mapping)
+            }
+            rubrics = case.scenario.expected_output.steps
+            projected_turns: list[dict[str, Any]] = []
+            for turn in turns:
+                projected = dict(turn)
+                step_id = str(projected.get("step_id") or "")
+                projected["request"] = str(projected.get("message") or "")
+                if projected.get("action") == "task_create":
+                    projected["request"] = json.dumps(projected.get("task") or {}, ensure_ascii=False)
+                projected["answer"] = answers.get(step_id)
+                expected_step = rubrics.get(step_id) or {}
+                projected["rubric"] = expected_step.get("rubric")
+                projected_turns.append(projected)
+            content["turns"] = projected_turns
         # 快照期脱敏双层（24 项三方审阅 #6）：先注入 redactor（组合根
         # 注入的 LogSanitizer），后内建 _default_redact 兜底——与线上
         # capture 同一结构；运行时目标输出同样可能携带敏感正文。不采用
@@ -1055,6 +1186,37 @@ class EvaluationExperimentRunner:
                 result.get("retrievals") or ()
             )
         )
+        observed = (result.get("output") or {}).get("scenario_evidence") or {}
+        seen = {(t["subject_kind"], t["subject_id"]) for t in targets}
+
+        def add_identity(kind: str, subject_id: Any) -> None:
+            if not isinstance(subject_id, str) or not subject_id or (kind, subject_id) in seen:
+                return
+            seen.add((kind, subject_id))
+            targets.append({"source_service": "n-agent", "subject_kind": kind,
+                            "subject_id": subject_id, "subject_revision": ""})
+
+        add_identity("session", (result.get("output") or {}).get("session_id"))
+        if isinstance(observed, Mapping):
+            for step in observed.get("steps") or ():
+                if isinstance(step, Mapping):
+                    add_identity("agent_run", step.get("run_id"))
+            for task in observed.get("tasks") or ():
+                if not isinstance(task, Mapping):
+                    continue
+                add_identity("session", task.get("session_id"))
+                for run in task.get("runs") or ():
+                    if not isinstance(run, Mapping):
+                        continue
+                    # TaskRun.id is an integer, not an AgentRun identity.
+                    for agent_run in run.get("agent_runs") or ():
+                        if isinstance(agent_run, Mapping):
+                            add_identity("agent_run", agent_run.get("run_id"))
+                            add_identity("session", agent_run.get("session_id"))
+            targets.extend(EvaluationExperimentRunner._document_targets(
+                [entry for entry in observed.get("retrievals") or ()
+                 if isinstance(entry, Mapping) and entry.get("backend") == "n_kb"]
+            ))
         return tuple(targets)
 
     @staticmethod
@@ -1068,7 +1230,9 @@ class EvaluationExperimentRunner:
         targets: list[Mapping[str, Any]] = []
         seen_documents: set[tuple[str, str]] = set()
         for entry in entries:
-            if not isinstance(entry, Mapping) or not entry.get("retrieval_id"):
+            if not isinstance(entry, Mapping):
+                continue
+            if not entry.get("retrieval_id") and entry.get("backend") != "n_kb":
                 continue
             for chunk in entry.get("chunks") or entry.get("results") or ():
                 if not isinstance(chunk, Mapping):
@@ -1529,6 +1693,23 @@ def replay_experiment_name(name: str) -> str:
     if not name:
         raise EvaluationValidationError("实验名称不能为空")
     return name if name.endswith("-replay") else f"{name}-replay"
+
+
+def _scenario_file_paths(case: DatasetCase) -> tuple[str, ...]:
+    """场景 case 声明的工作区文件路径（file_content 断言投影，T10）。
+
+    适配器按此清单收集文件证据（受控端口安全读取），证据读取后按
+    实际 hash 登记资源 intent；非场景 case 返回空。"""
+    if case.scenario is None:
+        return ()
+    paths: list[str] = []
+    for assertion in case.scenario.assertions:
+        if assertion.assertion_type != "file_content":
+            continue
+        filename = assertion.params.get("filename")
+        if isinstance(filename, str) and filename and filename not in paths:
+            paths.append(filename)
+    return tuple(paths)
 
 
 def extract_turns(case: DatasetCase) -> tuple[Mapping[str, Any], ...]:

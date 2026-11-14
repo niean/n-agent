@@ -44,6 +44,15 @@ def test_default_base_url_is_v3():
     assert a._base_url == "https://api.mem0.ai/v3"
 
 
+def test_fixture_provision_stores_exact_fact_without_async_extraction(adapter):
+    a, http = adapter
+    a.provision("喜欢樱桃")
+    body = http.calls[-1][2]
+    assert body["infer"] is False
+    assert body["messages"] == [{"role": "user", "content": "喜欢樱桃"}]
+    assert body["user_id"] == "u1" and body["agent_id"] == "a1"
+
+
 def test_empty_base_url_falls_back_to_v3():
     # base_url 为空字符串（Dashboard 留空）时同样回退到官方 V3 endpoint，
     # 否则 urlparse 得到空 scheme，触发 http_client 的 "unsupported scheme:" 错误

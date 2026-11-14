@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime, timezone
 
 import httpx
@@ -47,6 +48,32 @@ def make_base(
         created_at=now,
         updated_at=now,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("matching", [True, False])
+async def test_legacy_nkb_revision_uses_verified_content_snapshot(matching):
+    text = "新增预算单元请使用新增预单链接。"
+
+    async def handler(request):
+        if request.url.path == "/retrieval/search":
+            return httpx.Response(200, json={"results": [{"document_id": "d1", "chunk_id": "c1",
+                "snippet": text, "source": {"uri": "https://example.test/doc"}, "score": 1}]})
+        if request.url.path == "/documents/d1":
+            return httpx.Response(200, json={"id": "d1", "title": "流程说明", "status": "indexed"})
+        assert request.url.path == "/documents/d1/content"
+        return httpx.Response(200, json={"document_id": "d1", "text": text if matching else "另一个版本"})
+
+    result = await NkbKnowledgeRetriever(HttpKnowledgeRetrieverConfig(
+        transport=httpx.MockTransport(handler))).search(make_base(), KnowledgeBackendSearchRequest(query="新增预单"))
+    item = result.results[0]
+    if matching:
+        assert item.title == "流程说明"
+        assert item.document_revision is None
+        assert item.metadata["document_snapshot_sha256"] == hashlib.sha256(text.encode()).hexdigest()
+        assert item.metadata["document_snapshot_source"] == "verified_document_content"
+    else:
+        assert item.document_revision is None
 
 
 @pytest.mark.asyncio

@@ -921,6 +921,38 @@ def _sha(content) -> str:
 
 
 class TestQueries:
+    async def test_experiment_distribution_preserves_numeric_scores(self, store):
+        await store.save_experiment({
+            "experiment_id": "exp-scores", "dataset_id": "ds", "dataset_version": "1",
+            "dataset_hash": "a" * 64, "target_config_hash": "b" * 64,
+            "evaluator_set_hash": "c" * 64, "status": "created",
+        })
+        cases = [
+            ("score", 1.0, None, "value"), ("score", 0.0, None, "value"),
+            ("score", 0.5, None, "value"), ("score", None, None, "error"),
+            ("bool", True, True, "value"), ("bool", False, False, "value"),
+            ("category", "good", None, "value"),
+        ]
+        for index, (metric, value, passed, status) in enumerate(cases):
+            sample = await store.save_sample({"service": "n-agent", "producer_event_id": f"score-{index}"})
+            job = await store.save_job({"sample_id": sample, "definition_id": metric,
+                                        "definition_version": "1", "experiment_id": "exp-scores"})
+            await store.save_result({"job_id": job, "provenance": "automatic",
+                                     "metric_name": metric, "status": status,
+                                     "typed_value": value, "passed": passed})
+        overview = await make_service(store).experiment_overview("exp-scores")
+        score = overview["distribution"]["score"]
+        assert score["numeric_count"] == 3
+        assert score["numeric_mean"] == 0.5
+        assert score["numeric_min"] == 0.0
+        assert score["numeric_max"] == 1.0
+        assert (score["passed"], score["failed"], score["error_or_skipped"]) == (0, 0, 1)
+        boolean = overview["distribution"]["bool"]
+        assert (boolean["passed"], boolean["failed"]) == (1, 1)
+        for metric in ("bool", "category"):
+            assert overview["distribution"][metric]["numeric_count"] == 0
+            assert overview["distribution"][metric]["numeric_mean"] is None
+
     async def _seed_results(self, store, service, count: int = 5):
         result_ids = []
         for index in range(count):
@@ -963,7 +995,8 @@ class TestQueries:
                 break
             cursor = page.next_cursor
 
-        assert collected == seeded
+        # 时间倒序：收集顺序与写入顺序相反，且不重不漏
+        assert collected == seeded[::-1]
 
     async def test_filter_by_status_and_experiment(self, store):
         service = make_service(store)
@@ -1009,7 +1042,7 @@ class TestQueries:
         # 超上限按 200 封顶：不报错、正常返回当前页
         seeded = await self._seed_results(store, service)
         page = await service.list_results(limit=500)
-        assert [item["result_id"] for item in page.items] == seeded
+        assert [item["result_id"] for item in page.items] == seeded[::-1]
 
     async def test_invalid_cursor_rejected(self, store):
         service = make_service(store)
@@ -1402,22 +1435,25 @@ class TestRecordProducerStateContract:
 
 
 async def test_preset_definitions_shapes(store):
-    """#1：spec 8 正式指标预设定义形状——9 个（5 deterministic + 4
-    judge），target_kind / method / judge 字段与目录一致。"""
+    """#1：spec 8 正式指标预设定义形状——11 个（6 deterministic + 5
+    judge，plan T3 新增 agent.scenario_assertions/scenario_quality），
+    target_kind / method / judge 字段与目录一致。"""
     defs = EvaluationService.preset_definitions("judge-model-a")
-    # 9 正式 + 5 experiment_item variant（agent_run 预设镜像，同 metric
+    # 11 正式 + 7 experiment_item variant（agent_run 预设镜像，同 metric
     # 名、版本域 experiment-v1；24 项三方审阅 #1）
-    assert len(defs) == 14
+    assert len(defs) == 20
     by_id = {(d.definition_id, d.version): d for d in defs}
-    assert len(by_id) == 14
+    assert len(by_id) == 20
     defs_v1 = {d.definition_id: d for d in defs if d.version == "v1"}
     variants = [d for d in defs if d.version == "experiment-v1"]
     assert {d.definition_id for d in variants} == {
         "agent.task_success",
         "agent.tool_contract",
+        "agent.scenario_assertions",
         "agent.answer_correctness",
         "agent.answer_relevance",
         "rag.faithfulness",
+        "agent.scenario_quality",
     }
     for variant in variants:
         base = defs_v1[variant.definition_id]
@@ -1428,6 +1464,7 @@ async def test_preset_definitions_shapes(store):
     deterministic = {
         "agent.task_success": "agent_run",
         "agent.tool_contract": "agent_run",
+        "agent.scenario_assertions": "agent_run",
         "kb.recall_at_5": "retrieval",
         "kb.ndcg_at_5": "retrieval",
         "kb.mrr_at_5": "retrieval",
@@ -1441,6 +1478,7 @@ async def test_preset_definitions_shapes(store):
         "agent.answer_correctness": "agent_run",
         "agent.answer_relevance": "agent_run",
         "rag.faithfulness": "agent_run",
+        "agent.scenario_quality": "agent_run",
         "kb.context_relevance": "retrieval",
     }
     for definition_id, kind in judges.items():
@@ -1451,8 +1489,26 @@ async def test_preset_definitions_shapes(store):
     # Judge 未配置：只注册 deterministic 预设（llm_judge 定义必须声明
     # judge_model，domain 不变量；注册即死条目，不注册）
     no_judge = EvaluationService.preset_definitions(None)
-    assert len(no_judge) == 7
+    # 6 deterministic 正式 + 3 个 agent_run deterministic 镜像 variant
+    assert len(no_judge) == 9
     assert all(d.method == "deterministic" for d in no_judge)
+
+
+async def test_preset_model_change_registers_new_versions_without_overwrite(store):
+    service = EvaluationService(store, enabled=True)
+    await service.register_preset_definitions("judge-original")
+    original = await store.get_definition("agent.answer_correctness", "v1")
+    await service.register_preset_definitions("judge-new")
+    unchanged = await store.get_definition("agent.answer_correctness", "v1")
+    assert unchanged["definition_hash"] == original["definition_hash"]
+    definitions = await store.list_definitions(target_kind="experiment_item")
+    candidates = [row for row in definitions if row["definition_id"] == "agent.answer_correctness"]
+    assert len(candidates) == 2
+    new = await store.get_definition("agent.answer_correctness", next(row["version"] for row in candidates if row["version"] != "experiment-v1"))
+    assert new["definition"]["judge_model"] == "judge-new"
+    before = len(await store.list_definitions())
+    await service.register_preset_definitions("judge-new")
+    assert len(await store.list_definitions()) == before
 
 
 async def test_register_preset_definitions_idempotent(store):

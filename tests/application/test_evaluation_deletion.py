@@ -718,6 +718,16 @@ class TestDocumentDeletion:
         assert job["status"] == "queued"
         assert await store.is_subject_deleted("document", "doc-1", "dr-8") is False
 
+    async def test_unknown_revision_is_conservatively_revoked_and_late_write_rejected(self, store, clock):
+        await store.save_definition(_definition_payload())
+        sample_id = await _save_sample(store, evidence_targets=[_document_target(revision="")])
+        job_id = await store.save_job(_job_payload(sample_id))
+        await make_service(store, clock=clock).handle_document_deleted("doc-1", "dr-7")
+        assert (await store.get_job(job_id))["status"] == "cancelled"
+        with pytest.raises(EvaluationDeletionConflictError):
+            await _save_sample(store, producer_event_id="late-unknown-revision",
+                               evidence_targets=[_document_target(revision="")])
+
     async def test_late_sample_with_deleted_revision_rejected(self, store, clock):
         service = make_service(store, clock=clock)
         await service.handle_document_deleted("doc-1", "dr-7")

@@ -828,7 +828,13 @@
         box.appendChild(content);
         frame.form.appendChild(box);
       });
-      formActions(frame.form, '关闭');
+      const actions = formActions(frame.form, '关闭');
+      if (executions && data.target_kind === 'agent_run') {
+        actions.appendChild(actionButton('发起实验', () => {
+          closeBackdrop(frame.backdrop);
+          executions.openCreate(data, token);
+        }));
+      }
       mountDetailModal(frame);
     } catch (err) {
       if (token !== renderToken) return;
@@ -891,9 +897,18 @@
 
   async function renderExperiments(body, token) {
     body.textContent = '';
+    if (executions && body.evaluationsHeaderActions) {
+      body.evaluationsHeaderActions.textContent = '';
+      body.evaluationsHeaderActions.appendChild(actionButton('发起实验', () => executions.openCreate(null, token)));
+    }
     const seq = ++viewRequestSeq.experiments;
     const wrap = el('div', 'evaluations-experiments');
     body.appendChild(wrap);
+    if (executions) {
+      const executionList = el('div', 'evaluations-block');
+      wrap.appendChild(executionList);
+      executions.renderList(executionList, token);
+    }
     const dataBody = el('div', 'evaluations-data-body');
     wrap.appendChild(dataBody);
     showLoading(dataBody, '实验列表加载中...');
@@ -910,7 +925,7 @@
     const items = Array.isArray(data.items) ? data.items : [];
     if (!items.length) {
       dataBody.appendChild(el('div', 'empty-state',
-        '暂无实验。实验由 execute/replay 评估作业创建，可通过 CLI evaluate 发起。'
+        '暂无实验。实验由 execute/replay 评估作业创建；可通过「发起实验」启动数据集测试，也可通过 CLI evaluate 发起。'
           + '当前列表未设置筛选条件。'));
       return;
     }
@@ -976,11 +991,16 @@
       form.appendChild(blockTitle('指标分布'));
       const distRows = distKeys.map((metric) => {
         const bucket = distribution[metric] || {};
+        const hasVerdicts = (bucket.passed || 0) + (bucket.failed || 0) > 0;
         return [
           metric,
           bucket.results_total,
-          bucket.passed,
-          bucket.failed,
+          hasVerdicts ? bucket.passed : null,
+          hasVerdicts ? bucket.failed : null,
+          bucket.numeric_count || null,
+          bucket.numeric_mean,
+          bucket.numeric_min,
+          bucket.numeric_max,
           bucket.error_or_skipped,
         ];
       });
@@ -989,8 +1009,14 @@
           { label: '结果数', numeric: true },
           { label: '通过', numeric: true },
           { label: '质量不通过', numeric: true },
+          { label: '评分数', numeric: true },
+          { label: '均分', numeric: true },
+          { label: '最低分', numeric: true },
+          { label: '最高分', numeric: true },
           { label: '异常跳过', numeric: true }],
         distRows)));
+      form.appendChild(el('div', 'evaluations-note',
+        '通过/质量不通过仅统计已有布尔判定；数值评分展示实际分数，未设置通过阈值时不判定通过。'));
     }
 
     // 投递状态（按 sink 聚合）+ Langfuse 会话入口
@@ -1372,15 +1398,21 @@
     if (token !== renderToken || seq !== viewRequestSeq.results) return;
     dataBody.textContent = '';
     const items = Array.isArray(data.items) ? data.items : [];
-    // 游标分页（spec 4.5）：上一页走历史游标栈回退，无上一页时隐藏按钮；
-    // 下一页携带响应 next_cursor 入栈。pager 先于空态构建：第 2+ 页返回
-    // 空 items 时仍保留"上一页"入口，避免用户被卡死在空页
+    // 游标分页（spec 4.5）：上一页走历史游标栈回退，下一页携带响应
+    // next_cursor 入栈。pager 对齐项目标准（observations-pager）：右对齐、
+    // 页码 info、按钮始终占位、边界态禁用而非隐藏；pager 先于空态构建，
+    // 第 2+ 页返回空 items 时仍保留"上一页"入口，避免用户被卡死在空页
     const pagerRow = el('div', 'evaluations-pager');
+    const pageInfo = el('span', 'evaluations-pager__info');
+    pageInfo.textContent = '第 ' + (resultsPageIndex + 1) + ' 页';
+    pagerRow.appendChild(pageInfo);
     if (resultsPageIndex > 0) {
       pagerRow.appendChild(actionButton('上一页', () => {
         resultsPageIndex -= 1;
         renderResults(body, renderToken);
       }));
+    } else {
+      pagerRow.appendChild(disabledButton('上一页'));
     }
     if (data.next_cursor) {
       const nextCursor = String(data.next_cursor);
@@ -1390,6 +1422,8 @@
         resultsPageIndex += 1;
         renderResults(body, renderToken);
       }));
+    } else {
+      pagerRow.appendChild(disabledButton('下一页'));
     }
     if (!items.length) {
       // 空态三分支：空分页优先（保留上一页入口），其次按有无筛选给下一步
@@ -2581,6 +2615,7 @@
   }
 
   function deactivate() {
+    if (executions) executions.deactivate();
     renderToken++;
     inflight = null;
     floatingTips.length = 0;
@@ -2590,6 +2625,11 @@
     }
   }
 
+  const executions = namespace.evaluationExecutions ? namespace.evaluationExecutions.createController({
+    api: api.evaluations, el, actionButton, buildFrame, formActions, mountDetailModal, closeBackdrop,
+    filterItem, kvRow, table, scrollTable, formatTime, blockTitle,
+    isCurrent: token => token === renderToken && isActive(), openExperimentModal,
+  }) : null;
   namespace.evaluations = { init: init, refresh: refresh, activate: init, deactivate: deactivate };
   global.NAGENT = namespace;
 }(window));

@@ -1127,7 +1127,8 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .evaluations-filter__label { font-size: var(--font-size-sm); color: var(--color-fg-muted); }
 .evaluations-filter__help { font-size: var(--font-size-xs); color: var(--color-fg-subtle); }
 .evaluations-filter-group { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-bottom: var(--space-6); min-width: 0; }
-.evaluations-pager { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-top: var(--space-6); }
+.evaluations-pager { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: var(--space-4); margin-top: var(--space-6); }
+.evaluations-pager__info { font-size: var(--font-size-sm); color: var(--color-fg-muted); font-variant-numeric: tabular-nums; }
 .evaluations-panel .evaluations-table-scroll,
 .evaluations-modal .evaluations-table-scroll { width: 100%; max-width: 100%; min-width: 0; overflow-x: auto; }
 .evaluations-panel .evaluations-table-scroll .document-table th.document-table__numeric,

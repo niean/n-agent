@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -666,6 +666,7 @@ class ApplicationServices:
     evaluation_admin_service: Any = None
     evaluation_annotation_service: Any = None
     evaluation_analytics_service: Any = None
+    evaluation_execution_service: Any = None
 
 
 def _validate_host_terminal_host_mapping(
@@ -856,6 +857,86 @@ async def _evaluation_evidence_sweep_loop(
             )
 
 
+async def _scenario_prepare_memory(binder: Any, ledger: Any, session_id: str,
+                                   alias: str, fact: str, context: Any = None) -> Any:
+    """Persist ownership intent before a possibly partial external write."""
+    execution_id = str((context or {}).get("execution_id") or "")
+    case_id = str((context or {}).get("case_id") or "")
+    business_key = None
+    if execution_id and case_id and ledger is not None:
+        from app.domain.evaluation.scenario_resources import ResourceIntent
+        business_key = f"{execution_id}:{case_id}:memory_binding:{session_id}.{alias}"
+        await ledger.register_intent(ResourceIntent(
+            business_key=business_key, execution_id=execution_id, case_id=case_id,
+            resource_kind="memory_binding", release_rule="release_active_resources",
+            retention_rule="retain_evidence_default", external_id=f"{session_id}|{alias}",
+        ))
+    try:
+        receipt = await asyncio.to_thread(binder.prepare, session_id, alias, fact=fact)
+    except BaseException:
+        if business_key:
+            await ledger.mark_unknown(business_key, reason="memory prepare failed or cancelled")
+        raise
+    if business_key:
+        ref = str(receipt.get("project_dir") or receipt.get("user_id") or "")
+        await ledger.confirm_owned(business_key, external_id=f"{session_id}|{alias}", ref=ref)
+    return receipt
+
+
+async def _scenario_task_agent_runs(service: Any, session_id: str, task_run_ids: set[int]) -> dict[int, list]:
+    """Use registered AgentRuns belonging to these TaskRuns, not task IDs."""
+    refs: dict[int, list] = {}
+    for run in await asyncio.to_thread(service.list_for_session, session_id):
+        task_run_id = run.get("task_run_id")
+        if task_run_id in task_run_ids and run.get("session_id") == session_id:
+            refs.setdefault(task_run_id, []).append({"run_id": run["id"], "session_id": session_id})
+    return refs
+
+
+async def _scenario_artifact_record(service: Any, art: Any) -> dict[str, Any]:
+    """Read the actual task artifact body for evaluation, never its summary."""
+    kind = art.kind.value if hasattr(art.kind, "value") else str(art.kind)
+    row = {"id": art.id, "name": art.name, "kind": kind,
+           "origin_ref": next((str(label)[len("origin_ref="):] for label in (art.labels or ())
+                               if str(label).startswith("origin_ref=")), None)}
+    if kind in ("markdown", "text", "document", "code", "html", "json", "data", "csv"):
+        data, _ = await service.get_content(art.id)
+        if len(data) > 256 * 1024:
+            raise ValueError("artifact evidence exceeds 256 KiB; refusing partial content")
+        row["content"] = data.decode("utf-8")
+    return row
+
+
+async def _evaluation_ledger_maintenance_loop(
+    ledger: Any,
+    *,
+    interval_seconds: float = 300.0,
+) -> None:
+    """场景资源账本生产调度（D110/D111）：周期 expire_retention（保留期
+    TTL 到期清理）+ recover_stalled（租约过期的未收敛账目收养恢复）。
+    此前两者只有测试与一次性对账调用，生产从未调度——遗留 owned/
+    unknown 账目无人收敛、retained 记录 TTL 到期不清理。失败隔离为
+    warning 不中断循环；停止经任务取消（与证据 sweep 循环一致）。"""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await ledger.expire_retention()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "evaluation ledger retention sweep failed", exc_info=True
+            )
+        try:
+            await ledger.recover_stalled()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "evaluation ledger stalled recovery failed", exc_info=True
+            )
+
+
 def _langfuse_sink_settings_ready(settings: Settings) -> bool:
     """Langfuse sink 连接完整性校验（B 类四字段同时为空或同时非空）。
 
@@ -910,16 +991,198 @@ class _EvaluationJudgeNotConfiguredError(Exception):
     error_type = "permanent_error"
 
 
+class _ScenarioActiveStopper:
+    """场景活跃资源停止端口（plan T9：browser 真实关闭）。
+
+    browser：按 browser_session_id 回查会话——不存在或已 closed 视为
+    已释放（幂等，不做二次关闭）；活跃会话经其绑定的 n_agent 会话
+    调用既有 close_session 真实关闭，并在关闭后复核状态。task/
+    acp_process/sandbox 真实停止通道随 T10+ 接入（当前生产装配无该
+    类场景账目，返回 stopped 保持端口契约完整）。
+
+    关闭失败不伪装 released：复核未 closed 时抛出，账本记录保持
+    owned，由 recover_interrupted 再次收敛。browser_closer 由组合根
+    后段回填（BrowserService 在账本之后创建，同
+    _ScenarioEvidenceDeleter 的 memory_binder 回填模式）。"""
+
+    def __init__(self) -> None:
+        self._browser_closer: Any = None
+        self._task_closer: Any = None
+        self._acp_closer: Any = None
+
+    def bind_browser_closer(self, closer: Any) -> None:
+        self._browser_closer = closer
+
+    def bind_task_closer(self, closer: Any) -> None:
+        self._task_closer = closer
+
+    def bind_acp_closer(self, closer: Any) -> None:
+        self._acp_closer = closer
+
+    async def stop(
+        self, resource_kind: str, external_id: str,
+        process_identity: str | None = None,
+    ) -> str:
+        if resource_kind == "task":
+            # T10：回读终态在先——已终态（如固定命令题释放前已 succeeded）
+            # 幂等视为已释放，不做二次取消（cancel_task 对终态抛
+            # TaskStateError）；非终态取消并回读终态才算释放。取消失败/
+            # 未终态抛出，账本记录保持 owned 由 recover_interrupted 再次收敛
+            closer = self._task_closer
+            if closer is None:
+                raise RuntimeError("task stopper 未接线 task_closer")
+            last_error: Exception | None = None
+            for _ in range(2):
+                try:
+                    task = await closer.get_task(str(external_id))
+                    status = getattr(task, "status", None)
+                    value = getattr(status, "value", status)
+                    if str(value) in ("cancelled", "succeeded", "failed",
+                                      "expired"):
+                        return "stopped"
+                    await closer.cancel_task(str(external_id))
+                    task = await closer.get_task(str(external_id))
+                    status = getattr(task, "status", None)
+                    value = getattr(status, "value", status)
+                    if str(value) in ("cancelled", "succeeded", "failed",
+                                      "expired"):
+                        return "stopped"
+                    last_error = RuntimeError(
+                        f"task {external_id} 取消后未回读到终态（当前 {value}）"
+                    )
+                except Exception as exc:  # noqa: BLE001 - 如实重试
+                    last_error = exc
+            raise RuntimeError(
+                f"task {external_id} 释放失败: {last_error}"
+            )
+        if resource_kind == "acp_process":
+            # T12：按登记进程身份停止进程组（PID 复用防护：启动时刻
+            # 不符拒绝杀，manual_attention）。runner 正常路径已在
+            # run_target 结束时停止子进程，此处为中断场景安全网。
+            closer = self._acp_closer
+            if closer is None:
+                raise RuntimeError("acp stopper 未接线 acp_closer")
+            return await closer(str(external_id), process_identity)
+        if resource_kind != "browser":
+            return "stopped"
+        closer = self._browser_closer
+        if closer is None:
+            raise RuntimeError("browser stopper 未接线 browser_closer")
+        session = await closer.get_session_by_id(str(external_id))
+        if session is None:
+            return "stopped"
+        status = getattr(session, "status", None)
+        if getattr(status, "value", status) == "closed":
+            return "stopped"
+        bound = getattr(session, "bound_n_agent_session_id", None)
+        if not bound:
+            raise RuntimeError(
+                f"browser session {external_id} 缺少绑定的 n_agent 会话"
+            )
+        last_error: Exception | None = None
+        for _ in range(2):
+            try:
+                await closer.close_session(str(bound))
+            except Exception as exc:  # noqa: BLE001 - 关闭失败如实重试
+                last_error = exc
+                continue
+            session = await closer.get_session_by_id(str(external_id))
+            if session is None:
+                return "stopped"
+            status = getattr(session, "status", None)
+            if getattr(status, "value", status) == "closed":
+                return "stopped"
+            last_error = RuntimeError("close_session 后会话仍未 closed")
+        raise RuntimeError(
+            f"browser session {external_id} 关闭失败: {last_error}"
+        )
+
+
+class _ScenarioWorkspaceFileDeleter:
+    """场景工作区文件删除端口（T10）：删除前复核内容 hash。
+
+    hash 变更（清理时 worker 仍写入）返回 hash_changed 拒删；文件已
+    不存在视为已释放（幂等）；只删 workspace_root 内的普通文件。"""
+
+    def __init__(self, workspace_root: Any) -> None:
+        self._workspace_root = workspace_root
+
+    async def delete_file(self, ref: str, expected_sha256: str) -> str:
+        import hashlib as _hashlib
+        from pathlib import Path as _Path
+
+        from app.infrastructure.evaluation.workspace_file_reader import (
+            WorkspaceFileError,
+            read_workspace_file,
+        )
+
+        root = _Path(self._workspace_root).resolve()
+        relative = _Path(str(ref))
+        if (
+            relative.is_absolute() or ".." in relative.parts
+            or not relative.parts
+        ):
+            raise WorkspaceFileError("workspace path invalid")
+        target = root / relative
+        if not target.exists():
+            return "deleted"
+        if not target.is_file():
+            raise WorkspaceFileError("workspace requires regular file")
+        data = target.read_bytes()
+        digest = _hashlib.sha256(data).hexdigest()
+        if expected_sha256 and digest != expected_sha256:
+            return "hash_changed"
+        target.unlink()
+        return "deleted"
+
+
+class _ScenarioEvidenceDeleter:
+    """场景证据清理端口：路由到既有删除传播端口（tombstone/撤销语义
+    不变，spec 6.2）。session 走 handle_session_deleted（账本可重入
+    守卫防递归）；memory_binding 走场景记忆 binder 精确删除专用空间
+    （T7）；未接线的证据类别 fail-fast，不假装删除成功。"""
+
+    def __init__(self, deletion_service: Any, memory_binder: Any = None) -> None:
+        self._deletion_service = deletion_service
+        self._memory_binder = memory_binder
+
+    async def delete_evidence(self, resource: Any) -> None:
+        kind = resource.get("resource_kind")
+        if kind == "session" and self._deletion_service is not None:
+            await self._deletion_service.handle_session_deleted(
+                str(resource.get("external_id") or ""),
+                reason="scenario_evidence_cleanup",
+            )
+            return
+        if kind == "memory_binding" and self._memory_binder is not None:
+            external_id = str(resource.get("external_id") or "")
+            session_id, _, alias = external_id.rpartition("|")
+            if not session_id or not alias:
+                raise NotImplementedError(
+                    f"memory_binding external_id 形状非法: {external_id!r}"
+                )
+            self._memory_binder.delete(session_id, alias)
+            return
+        raise NotImplementedError(
+            f"场景证据清理端口未接线: {kind!r}（随对应通道任务接入）"
+        )
+
+
 class _EvaluationJudgeDispatch:
     """按 definition.metric_name 路由到 LLMJudgeEvaluator 实例。
 
     未配置 Judge 或未知指标抛专用异常（error_type='permanent_error'）：
     worker 按 error_type 分类终结 job（不重试），不冒充网络错误。"""
 
-    def __init__(self, by_metric: dict) -> None:
+    def __init__(self, by_metric: dict, *, configuration_fingerprint: Any = None) -> None:
         self._by_metric = by_metric
+        self._configuration_fingerprint = configuration_fingerprint
 
     async def evaluate(self, definition: Any, snapshot: Any) -> Any:
+        expected = snapshot.content.get("execution_fingerprint") if snapshot is not None else None
+        if expected and self._configuration_fingerprint is not None:
+            if expected != await self._configuration_fingerprint():
+                raise _EvaluationJudgeNotConfiguredError("experiment configuration changed")
         evaluator = self._by_metric.get(definition.metric_name)
         if evaluator is None:
             raise _EvaluationJudgeNotConfiguredError(
@@ -1256,9 +1519,13 @@ def build_application_services(
         from app.application.evaluation_calibration import (
             calibration_status_from_store,
         )
+        async def _execution_configuration_fingerprint():
+            from app.infrastructure.evaluation.execution_runtime import execution_configuration
+            return await execution_configuration(settings, holder, registry)
+
         evaluation_worker = EvaluationWorker(
             evaluation_store,
-            evaluator=_EvaluationJudgeDispatch(_judge_evaluators),
+            evaluator=_EvaluationJudgeDispatch(_judge_evaluators, configuration_fingerprint=_execution_configuration_fingerprint),
             evidence_store=evidence_store,
             sinks=(
                 [dict(spec) for spec in _EVALUATION_DELIVERY_SINK_SPECS]
@@ -1321,6 +1588,19 @@ def build_application_services(
         # #9）：删除期间暂停出口、等待在途发送收敛（spec §14 删除竞态
         # 保护）；无投递 worker（单进程嵌入/测试）时 None 走直接处理
         # 分支
+        # plan T4/T5：场景资源账本（共享评估账本 DB；独立释放/保留账目）。
+        # TTL 到期清理与用户删除优先撤销共用同一账本；删除传播经
+        # scenario_resource_ledger 注入（用户删除始终优先，spec 6.2）
+        from app.application.evaluation_scenario_resources import (
+            ScenarioResourceLedger,
+        )
+        from app.infrastructure.evaluation.scenario_store import (
+            SQLiteScenarioResourceStore,
+        )
+
+        evaluation_scenario_resource_store = SQLiteScenarioResourceStore(
+            str(evaluation_store.path)
+        )
         evaluation_deletion_service = EvaluationDeletionService(
             store=evaluation_store,
             evidence_store=evidence_store,
@@ -1330,6 +1610,49 @@ def build_application_services(
                 else None
             ),
             delivery_worker=evaluation_delivery_worker,
+        )
+        # 双向依赖拆环：账本证据清理路由到删除传播，删除传播撤销回调
+        # 账本——构造后注入（账本可重入守卫防递归，见 ledger 实现）。
+        # memory_binder 在组合根后段创建（execution service 装配点），
+        # 届时回填到 deleter（T7 memory_binding TTL 到期精确删除）
+        _scenario_evidence_deleter = _ScenarioEvidenceDeleter(
+            evaluation_deletion_service
+        )
+        # T9：browser 走真实停止端口（关闭后复核）；BrowserService 在
+        # 组合根后段创建，届时回填 browser_closer
+        _scenario_active_stopper = _ScenarioActiveStopper()
+
+        from app.infrastructure.evaluation.scenario_process import (
+            kill_process_identity as _scenario_kill_process_identity,
+        )
+
+        async def _scenario_acp_closer(
+            external_id: str, process_identity: str | None,
+        ) -> str:
+            if not process_identity:
+                raise RuntimeError(
+                    f"acp_process 账目缺少进程身份（manual_attention）: "
+                    f"{external_id!r}"
+                )
+            return await _scenario_kill_process_identity(process_identity)
+
+        _scenario_active_stopper.bind_acp_closer(_scenario_acp_closer)
+        # T10：工作区文件删除端口（hash 复核；清理时 worker 仍写入 ->
+        # hash_changed 拒删）
+        _scenario_workspace_file_deleter = _ScenarioWorkspaceFileDeleter(
+            settings.workspace_root
+        )
+        evaluation_scenario_resource_ledger = ScenarioResourceLedger(
+            evaluation_scenario_resource_store,
+            stopper=_scenario_active_stopper,
+            file_deleter=_scenario_workspace_file_deleter,
+            evidence_deleter=_scenario_evidence_deleter,
+            evidence_retention_seconds=float(
+                settings.evaluation_evidence_retention_days * 86400
+            ),
+        )
+        evaluation_deletion_service.set_scenario_resource_ledger(
+            evaluation_scenario_resource_ledger
         )
         # producer Gauge 快照持有者（T10）：刷新循环在 lifespan 内启动，
         # producer 字段 = store producer_state 快照 + 本地捕获计数合并。
@@ -2789,6 +3112,17 @@ def build_application_services(
             graph_runner._browser_host_grant_ttl_seconds = (
                 settings.browser_host_grant_ttl_seconds
             )
+            # T9：账本 stopper 回填真实 browser 关闭端口（组合根顺序：
+            # 账本先于 BrowserService 创建，同 evidence deleter 回填模式）。
+            # stopper 仅在 evaluation 子域装配（evaluation_enabled 分支内
+            # 赋值）：evaluation 关闭（如 CLI 子进程递归防护
+            # N_AGENT_EVALUATION_ENABLED=false）时接线随之关闭，禁止
+            # 引用未赋值局部变量（T11 S4 实测 UnboundLocalError）
+            if settings.evaluation_enabled:
+                _scenario_active_stopper.bind_browser_closer(browser_service)
+        # T10：账本 stopper 回填真实 task 取消端口（cancel + 回读终态）
+        if settings.task_enabled and settings.evaluation_enabled:
+            _scenario_active_stopper.bind_task_closer(task_service)
 
     def health_snapshot() -> dict:
         memory_status = "ok"
@@ -2941,6 +3275,504 @@ def build_application_services(
         async def _release_sandbox_on_session_deleted(session_id: str) -> None:
             await sandbox_manager.release(session_id, reason="session")
         session_service.add_session_deleted_handler(_release_sandbox_on_session_deleted)
+    evaluation_execution_service = None
+    evaluation_scenario_memory_binder = None
+    if evaluation_store is not None and evaluation_worker is not None:
+        # T7 场景记忆隔离：binder + 会话绑定 overlay（不替换全局 Provider）
+        from app.infrastructure.evaluation.scenario_memory import (
+            ScenarioMemoryBinder,
+            ScenarioMemoryError,
+        )
+
+        mem0_config = None
+        mem0_secret = None
+        if external_memory_manager is not None:
+            for cfg in external_provider_registry.list_providers():
+                if not cfg.enabled or cfg.provider_type != ExternalMemoryProviderType.MEM0:
+                    continue
+                secret = external_provider_registry.get_secret(cfg.id)
+                mem0_config = dict(cfg.extra_config)
+                mem0_secret = secret.api_key if secret else None
+                break
+        mem0_factory = None
+        if mem0_config is not None:
+            from app.infrastructure.memory.external.mem0 import Mem0Adapter
+
+            def mem0_factory(config):
+                return Mem0Adapter.factory(
+                    http_client=external_http_client, config=config,
+                    secret=mem0_secret,
+                )
+        evaluation_scenario_memory_binder = ScenarioMemoryBinder(
+            file_root=Path(settings.workspace_root) / "locals/evaluation-scenario-memory",
+            mem0_factory=mem0_factory,
+            mem0_base_config=mem0_config or {},
+        )
+        _scenario_evidence_deleter._memory_binder = evaluation_scenario_memory_binder
+        if external_memory_manager is not None:
+            external_memory_manager.set_binding_resolver(
+                evaluation_scenario_memory_binder.resolve
+            )
+        # 服务端 fixture 事实（合成测试事实，非个人记忆；plan T7）
+        _SCENARIO_MEMORY_FACTS = {
+            "file_1": "文件记忆1",
+            "mem0-e2e-test": "喜欢樱桃",
+        }
+
+        async def _scenario_session_prepare(
+            session_id: str, alias: str, context: Any = None,
+        ) -> Any:
+            fact = _SCENARIO_MEMORY_FACTS.get(alias)
+            if fact is None:
+                raise ScenarioMemoryError(f"未知场景记忆别名: {alias!r}")
+            return await _scenario_prepare_memory(
+                evaluation_scenario_memory_binder, evaluation_scenario_resource_ledger,
+                session_id, alias, fact, context,
+            )
+
+        # T9：浏览器证据读取（正式端口 list_sessions，只透传 id/status/
+        # closed_at）与账目观察（owned 回填登记）。浏览器服务未启用时
+        # 读取抛错——适配层按 unknown 记录上报，closed 断言不借此通过
+        async def _scenario_browser_state_reader(session_id: str) -> Any:
+            if browser_dashboard_service_obj is None:
+                raise RuntimeError("browser dashboard service 未启用")
+            sessions = await browser_dashboard_service_obj.list_sessions(
+                str(session_id)
+            )
+            return [
+                {
+                    "id": item.get("id"),
+                    "status": item.get("status"),
+                    "closed_at": item.get("closed_at"),
+                }
+                for item in sessions if isinstance(item, dict)
+            ]
+
+        async def _scenario_browser_observer(
+            session_id: str, records: Any, context: Any = None,
+        ) -> None:
+            if not isinstance(records, list):
+                return
+            context = context if isinstance(context, dict) else {}
+            execution_id = str(context.get("execution_id") or "")
+            case_id = str(context.get("case_id") or "")
+            if not execution_id:
+                return
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                await evaluation_scenario_resource_ledger.observe_browser_session(
+                    execution_id=execution_id,
+                    case_id=case_id,
+                    browser_session_id=record.get("browser_session_id"),
+                )
+
+        # T10：Task/制品/文件端口（组合根）。task intent 纪律：副作用前
+        # 登记（business_key={execution}:{case}:task:{step}，固定幂等键
+        # 由 create_task 幂等回查兜底）、成功回填 owned、断网标记 unknown
+        # （等待幂等键回查收敛，不重跑目标）
+        async def _scenario_task_intent_before(payload: Any, context: Any) -> str:
+            from app.domain.evaluation.scenario_resources import ResourceIntent
+
+            context = context if isinstance(context, dict) else {}
+            execution_id = str(context.get("execution_id") or "")
+            case_id = str(context.get("case_id") or "")
+            step_id = str(context.get("step_id") or "")
+            if not (execution_id and case_id and step_id):
+                raise RuntimeError(
+                    "task_create 缺少执行上下文（execution_id/case_id/step_id），"
+                    "拒绝无归属副作用"
+                )
+            business_key = f"{execution_id}:{case_id}:task:{step_id}"
+            await evaluation_scenario_resource_ledger.register_intent(
+                ResourceIntent(
+                    business_key=business_key,
+                    execution_id=execution_id,
+                    case_id=case_id,
+                    resource_kind="task",
+                    release_rule="release_active_resources",
+                    retention_rule="retain_evidence_default",
+                    external_id=None,
+                    ref=None,
+                    expected_sha256=None,
+                    process_identity=None,
+                )
+            )
+            return business_key
+
+        async def _scenario_task_intent_confirmed(
+            business_key: str, task_id: str,
+        ) -> None:
+            await evaluation_scenario_resource_ledger.confirm_owned(
+                business_key, external_id=str(task_id),
+            )
+
+        async def _scenario_task_intent_unknown(
+            business_key: str, reason: str,
+        ) -> None:
+            await evaluation_scenario_resource_ledger.mark_unknown(
+                business_key, reason=reason,
+            )
+
+        async def _scenario_task_creator(
+            payload: Mapping[str, Any], session_id: str, context: Any = None,
+        ) -> dict[str, Any]:
+            from app.domain.task import TaskWorkspaceKind
+
+            context = context if isinstance(context, dict) else {}
+            task = await task_service.create_task(
+                title=str(payload.get("title") or "评估场景任务"),
+                body=str(payload.get("body") or ""),
+                goal_mode=bool(payload.get("goal_mode")),
+                priority=int(payload.get("priority") or 0),
+                created_by="evaluation-experiment",
+                # 固定幂等键：重复任务不重建（重试经幂等回查命中既有任务）
+                idempotency_key=(
+                    f"eval:{context.get('execution_id')}:"
+                    f"{context.get('case_id')}:{context.get('step_id')}"
+                ),
+                workspace_kind=TaskWorkspaceKind.SCRATCH,
+                origin_session_id=str(session_id) or None,
+            )
+            return {
+                "task_id": task.id,
+                "title": task.title,
+                "status": task.status.value,
+            }
+
+        async def _scenario_task_reader(task_id: str) -> dict[str, Any]:
+            task = await task_service.get_task(str(task_id))
+            return {
+                "task_id": task.id,
+                "title": task.title,
+                "status": task.status.value,
+                "created_at": (
+                    task.created_at.isoformat() if task.created_at else None
+                ),
+                "updated_at": (
+                    task.updated_at.isoformat() if task.updated_at else None
+                ),
+            }
+
+        async def _scenario_task_runs_reader(task_id: str) -> list[dict[str, Any]]:
+            runs = await task_service.list_runs(str(task_id))
+            from app.application.task_session import task_execution_session_id
+            task = await task_service.get_task(str(task_id))
+            agent_refs = await _scenario_task_agent_runs(
+                agent_run_service, task_execution_session_id(task), {run.id for run in runs},
+            )
+            return [
+                {
+                    "run_id": run.id,
+                    "agent_runs": agent_refs.get(run.id, []),
+                    "status": (
+                        run.status.value
+                        if hasattr(run.status, "value") else str(run.status)
+                    ),
+                    "outcome": (
+                        run.outcome.value
+                        if run.outcome is not None
+                        and hasattr(run.outcome, "value") else None
+                    ),
+                    "started_at": (
+                        run.started_at.isoformat() if run.started_at else None
+                    ),
+                    "ended_at": (
+                        run.ended_at.isoformat() if run.ended_at else None
+                    ),
+                    # worker run 内工具记录（如 web_fetch）随 metadata 透传
+                    "tools": list((run.metadata or {}).get("tools") or []),
+                    # TaskRun 无 artifacts 字段（finish_run 不持久化提交
+                    # 制品）；原始 storage_ref 由注册侧 origin_ref 标签
+                    # 承载，经制品列表端口透出
+                }
+                for run in runs
+            ]
+
+        async def _scenario_artifact_lister(
+            source_context_ref: str, *, cursor: Mapping[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            from app.domain.artifact import ArtifactListCursor
+            domain_cursor = None if cursor is None else ArtifactListCursor(
+                updated_at=datetime.fromisoformat(cursor["updated_at"]) if cursor.get("updated_at") else None,
+                artifact_id=str(cursor["artifact_id"]),
+            )
+            page = await artifact_service.list_artifacts(
+                source_kind=ArtifactSource.TASK_ARTIFACT,
+                source_context_ref=str(source_context_ref),
+                limit=50,
+                cursor=domain_cursor,
+            )
+            next_cursor = page.next_cursor
+            if next_cursor is not None and not isinstance(next_cursor, dict):
+                next_cursor = {
+                    "updated_at": (
+                        next_cursor.updated_at.isoformat()
+                        if getattr(next_cursor, "updated_at", None) else None
+                    ),
+                    "artifact_id": str(
+                        getattr(next_cursor, "artifact_id", "") or ""
+                    ),
+                }
+            return {
+                "items": [
+                    await _scenario_artifact_record(artifact_service, art)
+                    for art in page.items
+                ],
+                "next_cursor": next_cursor,
+            }
+
+        async def _scenario_workspace_file_reader(rel_path: str) -> Any:
+            from app.infrastructure.evaluation.workspace_file_reader import (
+                read_workspace_file,
+            )
+
+            return read_workspace_file(settings.workspace_root, str(rel_path))
+
+        async def _scenario_workspace_resource_observer(
+            evidence: Any, context: Any = None,
+        ) -> None:
+            """文件（实际 hash）与制品（注册 id）进入资源账目（T10）。
+
+            workspace_file 在 settle 时经删除端口 hash 复核删除（清理时
+            worker 仍写入 -> 拒删）；artifact 走保留期（到期正常删除
+            传播）。读取失败/缺失的记录（无 sha256/id）不登记——无归属
+            可释放。"""
+            context = context if isinstance(context, dict) else {}
+            execution_id = str(context.get("execution_id") or "")
+            case_id = str(context.get("case_id") or "")
+            if not (execution_id and case_id):
+                raise RuntimeError("资源登记缺少执行上下文")
+            for record in (evidence or {}).get("files") or []:
+                if not isinstance(record, dict) or not record.get("sha256"):
+                    continue
+                await evaluation_scenario_resource_ledger.observe_owned(
+                    execution_id=execution_id,
+                    case_id=case_id,
+                    resource_kind="workspace_file",
+                    external_id=str(record.get("filename")),
+                    ref=str(record.get("filename")),
+                    expected_sha256=str(record.get("sha256")),
+                )
+            for record in (evidence or {}).get("artifacts") or []:
+                if not isinstance(record, dict) or not record.get("id"):
+                    continue
+                await evaluation_scenario_resource_ledger.observe_owned(
+                    execution_id=execution_id,
+                    case_id=case_id,
+                    resource_kind="artifact",
+                    external_id=str(record.get("id")),
+                    ref=str(record.get("name") or ""),
+                )
+
+        # T11：CLI 通道资源账目钩子（会话经真实 Gateway 建，副作用前
+        # 登记 cli_conversation intent；解析失败标 unknown，不重跑）
+        async def _scenario_cli_intent_before(
+            conversation_id: str, context: Any,
+        ) -> str:
+            from app.domain.evaluation.scenario_resources import ResourceIntent
+
+            context = context if isinstance(context, dict) else {}
+            execution_id = str(context.get("execution_id") or "")
+            case_id = str(context.get("case_id") or "")
+            if not (execution_id and case_id):
+                raise RuntimeError(
+                    "CLI 会话缺少执行上下文（execution_id/case_id），"
+                    "拒绝无归属副作用"
+                )
+            business_key = (
+                f"{execution_id}:{case_id}:cli_conversation:{conversation_id}"
+            )
+            await evaluation_scenario_resource_ledger.register_intent(
+                ResourceIntent(
+                    business_key=business_key,
+                    execution_id=execution_id,
+                    case_id=case_id,
+                    resource_kind="cli_conversation",
+                    release_rule="release_active_resources",
+                    retention_rule="retain_evidence_default",
+                    external_id=None,
+                    ref=str(conversation_id)[:512],
+                    expected_sha256=None,
+                    process_identity=None,
+                )
+            )
+            return business_key
+
+        async def _scenario_cli_intent_confirmed(
+            business_key: str, session_id: str, conversation_id: str,
+        ) -> None:
+            await evaluation_scenario_resource_ledger.confirm_owned(
+                business_key,
+                external_id=str(session_id),
+                ref=str(conversation_id)[:512],
+            )
+
+        async def _scenario_cli_intent_unknown(
+            business_key: str, reason: str,
+        ) -> None:
+            await evaluation_scenario_resource_ledger.mark_unknown(
+                business_key, reason=reason,
+            )
+
+        # CLI 会话工具证据经正式 HTTP 端口（与 dashboard 通道同端口）；
+        # 读取失败抛出由适配器按 incomplete 如实记录
+        async def _scenario_cli_tool_reader(session_id: str) -> list:
+            import httpx as _httpx
+
+            async with _httpx.AsyncClient(
+                base_url=settings.dashboard_base_url, timeout=30.0,
+            ) as client:
+                response = await client.get(
+                    f"/chat/sessions/{session_id}/tool-calls",
+                )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"tool-calls port HTTP {response.status_code}"
+                )
+            return list(response.json() or [])
+
+        from app.infrastructure.evaluation.scenario_adapters import (
+            ScenarioCliRunner,
+        )
+
+        _scenario_cli_runner = ScenarioCliRunner(
+            tool_reader=_scenario_cli_tool_reader,
+            cli_intent_before=_scenario_cli_intent_before,
+            cli_intent_confirmed=_scenario_cli_intent_confirmed,
+            cli_intent_unknown=_scenario_cli_intent_unknown,
+            redactor=LogSanitizer().sanitize,
+        )
+
+        # T12：真实 ACP 通道接线（复用 T11 进程/环境所有权与脱敏器）。
+        # spawn 每项独立 n-agent acp 子进程；intent 钩子与 CLI 同纪律。
+        async def _scenario_acp_intent_before(
+            process_identity: str, context: Any,
+        ) -> str:
+            from app.domain.evaluation.scenario_resources import ResourceIntent
+
+            context = context if isinstance(context, dict) else {}
+            execution_id = str(context.get("execution_id") or "")
+            case_id = str(context.get("case_id") or "")
+            conversation_id = str(context.get("session_ref") or "")
+            if not (execution_id and case_id):
+                raise RuntimeError(
+                    "ACP 进程缺少执行上下文（execution_id/case_id），"
+                    "拒绝无归属副作用"
+                )
+            business_key = (
+                f"{execution_id}:{case_id}:acp_process:{conversation_id}"
+            )
+            await evaluation_scenario_resource_ledger.register_intent(
+                ResourceIntent(
+                    business_key=business_key,
+                    execution_id=execution_id,
+                    case_id=case_id,
+                    resource_kind="acp_process",
+                    release_rule="release_active_resources",
+                    retention_rule="retain_evidence_default",
+                    external_id=None,
+                    ref=conversation_id[:512] or None,
+                    expected_sha256=None,
+                    process_identity=str(process_identity),
+                )
+            )
+            return business_key
+
+        async def _scenario_acp_intent_confirmed(
+            business_key: str, session_id: str, conversation_id: str,
+        ) -> None:
+            from app.domain.evaluation.scenario_resources import ResourceIntent
+
+            await evaluation_scenario_resource_ledger.confirm_owned(
+                business_key,
+                external_id=str(session_id),
+                ref=str(conversation_id)[:512],
+            )
+            # ACP 会话是服务端持久证据：登记 session 保留意图
+            execution_id, case_id = business_key.split(":")[:2]
+            await evaluation_scenario_resource_ledger.register_intent(
+                ResourceIntent(
+                    business_key=(
+                        f"{execution_id}:{case_id}:session:{session_id}"
+                    ),
+                    execution_id=execution_id,
+                    case_id=case_id,
+                    resource_kind="session",
+                    release_rule="release_active_resources",
+                    retention_rule="retain_evidence_default",
+                    external_id=str(session_id),
+                    ref=str(conversation_id)[:512],
+                    expected_sha256=None,
+                    process_identity=None,
+                )
+            )
+
+        async def _scenario_acp_intent_unknown(
+            business_key: str, reason: str,
+        ) -> None:
+            await evaluation_scenario_resource_ledger.mark_unknown(
+                business_key, reason=reason,
+            )
+
+        from app.infrastructure.evaluation.scenario_adapters import (
+            ScenarioAcpRunner,
+            SdkAcpDriver,
+        )
+        from app.infrastructure.evaluation.scenario_process import (
+            spawn_process as _scenario_spawn_process,
+        )
+
+        def _scenario_acp_spawn():
+            return _scenario_spawn_process(
+                ["n-agent", "acp"],
+                stderr_sink=_scenario_acp_stderr_sink,
+            )
+
+        def _scenario_acp_stderr_sink(text: str) -> None:
+            # stderr 走应用日志（不污染协议通道）；证据侧另行脱敏有界
+            logger.debug("acp agent stderr: %s", text.rstrip())
+
+        _scenario_acp_runner = ScenarioAcpRunner(
+            spawn=_scenario_acp_spawn,
+            # session/new 的 cwd 必须可映射（map_cwd）：runner 以自身
+            # _cwd 调 driver.new_session(cwd)，故 cwd 须传给 runner
+            # 本体；ACP 容器根优先（/workspace-code），未配置时退回
+            # 工作区根
+            driver_factory=SdkAcpDriver,
+            cwd=str(
+                settings.acp_container_workspace_root or settings.workspace_root
+            ),
+            tool_reader=_scenario_cli_tool_reader,
+            acp_intent_before=_scenario_acp_intent_before,
+            acp_intent_confirmed=_scenario_acp_intent_confirmed,
+            acp_intent_unknown=_scenario_acp_intent_unknown,
+            redactor=LogSanitizer().sanitize,
+        )
+
+        from app.infrastructure.evaluation.execution_runtime import build_execution_service
+        evaluation_execution_service = build_execution_service(
+            settings=settings, holder=holder, registry=registry, chat=chat_service,
+            service=evaluation_ledger_service, ledger=evaluation_store,
+            review=evaluation_review_service, evidence=evidence_store,
+            worker=evaluation_worker, config_service=evaluation_config_service,
+            session_prepare=_scenario_session_prepare,
+            scenario_memory_facts=_SCENARIO_MEMORY_FACTS,
+            browser_state_reader=_scenario_browser_state_reader,
+            browser_observer=_scenario_browser_observer,
+            resource_ledger=evaluation_scenario_resource_ledger,
+            cli_runner=_scenario_cli_runner,
+            task_creator=_scenario_task_creator,
+            task_reader=_scenario_task_reader,
+            task_runs_reader=_scenario_task_runs_reader,
+            artifact_lister=_scenario_artifact_lister,
+            workspace_file_reader=_scenario_workspace_file_reader,
+            task_intent_before=_scenario_task_intent_before,
+            task_intent_confirmed=_scenario_task_intent_confirmed,
+            task_intent_unknown=_scenario_task_intent_unknown,
+            workspace_resource_observer=_scenario_workspace_resource_observer,
+            acp_runner=_scenario_acp_runner,
+        )
     memory_store.migrate_session_id_prefixes()
     return ApplicationServices(
         settings=settings,
@@ -3016,6 +3848,7 @@ def build_application_services(
         evaluation_admin_service=evaluation_admin_service,
         evaluation_annotation_service=evaluation_annotation_service,
         evaluation_analytics_service=evaluation_analytics_service,
+        evaluation_execution_service=evaluation_execution_service,
     )
 
 
@@ -3433,6 +4266,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 捕获队列启动后产生的样本才能按已启用定义展开线上作业。
         evaluation_refresh_task: asyncio.Task | None = None
         evaluation_sweep_task: asyncio.Task | None = None
+        evaluation_ledger_maintenance_task: asyncio.Task | None = None
         if (
             services.settings.evaluation_enabled
             and not _maintenance
@@ -3495,6 +4329,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             logger.exception(
                                 "evaluation definition usage backfill failed"
                             )
+            if services.evaluation_execution_service is not None and services.evaluation_worker.is_running:
+                await services.evaluation_execution_service.start()
             if services.evaluation_capture is not None:
                 try:
                     await services.evaluation_capture.start()
@@ -3517,6 +4353,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 evaluation_sweep_task = asyncio.create_task(
                     _evaluation_evidence_sweep_loop(
                         services.evaluation_evidence_store,
+                    )
+                )
+            # 场景资源账本生产调度（D110/D111）：保留期 TTL + 停滞恢复；
+            # 非场景组合（resource_ledger 未注入）不启动
+            if (
+                services.evaluation_execution_service is not None
+                and services.evaluation_execution_service.resource_ledger
+                is not None
+            ):
+                evaluation_ledger_maintenance_task = asyncio.create_task(
+                    _evaluation_ledger_maintenance_loop(
+                        services.evaluation_execution_service.resource_ledger,
                     )
                 )
         if services.feishu_im_adapter is not None and not _maintenance:
@@ -3679,6 +4527,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await evaluation_sweep_task
                 except asyncio.CancelledError:
                     pass
+            if evaluation_ledger_maintenance_task is not None:
+                evaluation_ledger_maintenance_task.cancel()
+                try:
+                    await evaluation_ledger_maintenance_task
+                except asyncio.CancelledError:
+                    pass
+            if services.evaluation_execution_service is not None:
+                await services.evaluation_execution_service.stop()
             if services.evaluation_capture is not None:
                 try:
                     await services.evaluation_capture.stop()
@@ -3852,6 +4708,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ),
             evaluation_analytics_service=(
                 services.evaluation_analytics_service
+            ),
+        )
+    if services.evaluation_execution_service is not None:
+        from app.interfaces.http.evaluation_execution_routes import register_evaluation_execution_routes
+        register_evaluation_execution_routes(
+            app,
+            service=services.evaluation_execution_service,
+            preflight=(
+                services.evaluation_execution_service.preflight
+                if services.evaluation_execution_service is not None
+                else None
             ),
         )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

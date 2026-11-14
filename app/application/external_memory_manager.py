@@ -127,6 +127,47 @@ class ExternalMemoryManager:
         self._external_query_provider: ExternalMemoryProvider | None = None
         self._tool_surface_callbacks: list[Callable[[], None]] = []
         self._swap_lock = threading.Lock()
+        # T7 场景记忆 overlay：按 (session_id, 逻辑别名) 归属保护解析独立
+        # Provider 实例。只做查询期解析，不注册/替换全局 Provider。
+        self._binding_resolver: Callable[[str, str], Any] | None = None
+
+    def set_binding_resolver(
+        self, resolver: Callable[[str, str], Any] | None
+    ) -> None:
+        """注入会话绑定解析器（评估场景记忆隔离，plan T7）。"""
+        self._binding_resolver = resolver
+
+    def _bound_providers(
+        self,
+        session_id: str | None,
+        enabled_override: list[str] | None,
+    ) -> list[tuple[str, Any]]:
+        """enabled_override 中非全局 Provider 名的逻辑别名 -> 绑定实例。
+
+        归属保护：resolver 只对绑定的 (session_id, alias) 返回实例；
+        未解析到的别名跳过（不降级到全局 Provider）。"""
+        if (
+            self._binding_resolver is None
+            or not enabled_override
+            or not session_id
+        ):
+            return []
+        known = {self._safe_provider_name(p) for p in self._providers}
+        resolved: list[tuple[str, Any]] = []
+        for alias in enabled_override:
+            if alias in known:
+                continue
+            try:
+                provider = self._binding_resolver(session_id, str(alias))
+            except Exception as exc:
+                logger.warning(
+                    "Scenario memory binding resolve failed for %r: %s",
+                    alias, exc,
+                )
+                continue
+            if provider is not None:
+                resolved.append((f"scenario:{alias}", provider))
+        return resolved
 
     def add_provider(self, provider: ExternalMemoryProvider) -> None:
         """注册提供者。
@@ -461,6 +502,20 @@ class ExternalMemoryManager:
                 self._breaker.record_failure(provider_name)
                 continue
             self._breaker.record_success(provider_name)
+        # T7 overlay：场景绑定实例随会话解析（独立空间，非全局注册）
+        for bound_name, provider in self._bound_providers(session_id, enabled_override):
+            try:
+                with memory_operation("prefetch", bound_name, session_id=session_id, input_messages=query) as facts:
+                    content = provider.prefetch(query, session_id=session_id)
+                    facts["details"].update(project_details(output_messages=content))
+                if content.strip():
+                    blocks.append(f'<provider name="{bound_name}">\n{content}\n</provider>')
+            except Exception as exc:
+                logger.warning(
+                    "Scenario memory provider %s failed to prefetch: %s",
+                    bound_name, self._format_exception(exc),
+                )
+                continue
         if not blocks:
             return ""
         return (
@@ -514,6 +569,14 @@ class ExternalMemoryManager:
                 self._breaker.record_failure(provider_name)
                 continue
             self._breaker.record_success(provider_name)
+        for bound_name, provider in self._bound_providers(session_id, enabled_override):
+            try:
+                provider.sync_turn(user_content, assistant_content, session_id=session_id)
+            except Exception as exc:
+                logger.warning(
+                    "Scenario memory provider %s failed to sync turn: %s",
+                    bound_name, self._format_exception(exc),
+                )
 
     def pre_compress_all(
         self,
@@ -559,6 +622,17 @@ class ExternalMemoryManager:
                 self._breaker.record_failure(provider_name)
                 continue
             self._breaker.record_success(provider_name)
+            if content and content.strip():
+                rescued.append(content.strip())
+        for bound_name, provider in self._bound_providers(session_id, enabled_override):
+            try:
+                content = provider.on_pre_compress(messages)
+            except Exception as exc:
+                logger.warning(
+                    "Scenario memory provider %s failed on pre-compress: %s",
+                    bound_name, self._format_exception(exc),
+                )
+                continue
             if content and content.strip():
                 rescued.append(content.strip())
         return "\n\n".join(rescued)

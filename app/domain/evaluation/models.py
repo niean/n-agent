@@ -19,6 +19,7 @@ from decimal import Decimal
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from app.domain.evaluation.scenario import ScenarioCase
 from app.domain.evaluation.state import SkipReason
 
 # 评估事实 schema 版本；字段语义变化时递增
@@ -605,9 +606,16 @@ class DatasetCase:
     cleanup_rule: str = ""
     no_answer: bool = False
     metric_applicability: Mapping[str, bool] | None = None
+    # schema 2 场景扩展（scenario.py）；schema 1 case 无此负载，保持 None。
+    # 场景契约本身由 ScenarioCase 构造期校验，本 VO 只锁定类型不变量。
+    scenario: ScenarioCase | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.case_id, "case_id")
+        if self.scenario is not None and not isinstance(self.scenario, ScenarioCase):
+            raise EvaluationValidationError(
+                "scenario 必须是 ScenarioCase 或 None"
+            )
         if not isinstance(self.input, Mapping):
             raise EvaluationValidationError("input 必须是 Mapping")
         _require_valid_kind(self.target_kind, "target_kind")

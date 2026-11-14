@@ -1296,7 +1296,7 @@ async def test_query_results_page_pagination_filters_and_cursor(tmp_path):
         _human_result_payload(feedback_id, typed_value=True)
     )
 
-    # keyset 分页：limit=2 走完全部 4 条，不重不漏
+    # keyset 分页：limit=2 走完全部 4 条，不重不漏；时间倒序（最新在前）
     collected = []
     cursor = None
     while True:
@@ -1305,11 +1305,15 @@ async def test_query_results_page_pagination_filters_and_cursor(tmp_path):
         if next_cursor is None:
             break
         cursor = next_cursor
-    assert collected == result_ids + [human_result_id]
+    assert collected == [human_result_id] + result_ids[::-1]
 
-    # definition 过滤：automatic 经 jobs、human 经 feedback
+    # 首页第一条即最新写入的结果
+    first_page, _ = await store.query_results_page(limit=1)
+    assert [r["result_id"] for r in first_page] == [human_result_id]
+
+    # definition 过滤：automatic 经 jobs、human 经 feedback；同样倒序
     rows, _ = await store.query_results_page(definition_id="def-A")
-    assert [r["result_id"] for r in rows] == result_ids[:2]
+    assert [r["result_id"] for r in rows] == result_ids[:2][::-1]
     rows, _ = await store.query_results_page(definition_id="def-feedback")
     assert [r["result_id"] for r in rows] == [human_result_id]
 
@@ -1330,6 +1334,42 @@ async def test_query_results_page_pagination_filters_and_cursor(tmp_path):
     # 非法游标拒绝
     with pytest.raises(EvaluationValidationError):
         await store.query_results_page(cursor="garbage")
+
+
+async def test_query_results_page_desc_tie_breaks_by_result_id(
+    tmp_path, monkeypatch
+):
+    """同 created_at 时按 result_id 倒序兜底，保证 keyset 排序稳定不重不漏。"""
+    from app.infrastructure.evaluation import store as store_module
+
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    fixed_now = "2026-11-14T08:30:00+00:00"
+    monkeypatch.setattr(store_module, "_iso", lambda dt=None: fixed_now)
+
+    result_ids = []
+    for index, result_id in enumerate(("a" * 32, "z" * 32, "m" * 32)):
+        sample_id = await store.save_sample(
+            _sample_payload(producer_event_id=f"evt-tie-{index}")
+        )
+        job_id = await store.save_job(
+            _job_payload(
+                sample_id,
+                idempotency_key=f"idem-tie-{index}",
+            )
+        )
+        result_ids.append(
+            await store.save_result(
+                _auto_result_payload(job_id, result_id=result_id)
+            )
+        )
+
+    rows, next_cursor = await store.query_results_page(limit=2)
+    assert [r["result_id"] for r in rows] == ["z" * 32, "m" * 32]
+    page2, next_cursor = await store.query_results_page(
+        limit=2, cursor=next_cursor
+    )
+    assert [r["result_id"] for r in page2] == ["a" * 32]
+    assert next_cursor is None
 
 
 async def test_save_feedback_with_result_rolls_back_on_result_insert_failure(

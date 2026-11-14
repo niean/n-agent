@@ -2081,6 +2081,56 @@ class TestRegisterFromTaskArtifact:
         assert result.source_context_ref == "task-1"
 
     @pytest.mark.asyncio
+    async def test_workspace_origin_ref_persisted_as_label(self):
+        """T10 S4 缺口：finish_run 不持久化提交的 TaskArtifact，原始
+        workspace: storage_ref 在注册后无处可查（证据核对退化成 basename
+        兜底）——注册时把原始 ref 固化为 origin_ref 标签（有界摘要）。"""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        ws_ref = "workspace:scratch/task-output-a.txt"
+        store.seed(ws_ref, b"artifact a")
+        svc = _make_service(registry=registry, content_store=store)
+        ta = TaskArtifact(
+            type="file",
+            name="task-output-a.txt",
+            mime="text/plain",
+            size=10,
+            storage_ref=ws_ref,
+            source_task_id="task-1",
+            summary="artifact a",
+            checksum=_sha256(b"artifact a"),
+        )
+        result = await svc.register_from_task_artifact(ta, "task-1", 1, 0)
+        assert result is not None
+        assert result.labels is not None
+        assert f"origin_ref={ws_ref}" in result.labels
+
+    @pytest.mark.asyncio
+    async def test_inline_artifact_has_no_origin_ref_label(self):
+        """内联路径（非 workspace ref）不添加 origin_ref 标签——无原始
+        文件 ref 可回查，证据核对按内联语义处理。"""
+        registry = FakeArtifactRegistry()
+        store = FakeArtifactContentStore()
+        svc = _make_service(registry=registry, content_store=store)
+        ta = TaskArtifact(
+            type="text",
+            name="inline-note.md",
+            mime="text/markdown",
+            size=5,
+            storage_ref="",
+            source_task_id="task-2",
+            summary="hello",
+            checksum="",
+            content="hello",
+        )
+        result = await svc.register_from_task_artifact(ta, "task-2", 1, 0)
+        assert result is not None
+        assert not any(
+            str(label).startswith("origin_ref=")
+            for label in (result.labels or ())
+        )
+
+    @pytest.mark.asyncio
     async def test_infers_kind_from_name_when_mime_empty(self):
         """Task artifacts submitted without mime fall back to filename ext.
 

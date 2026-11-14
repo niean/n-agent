@@ -11,6 +11,8 @@ RunExecution 明确 Chat 准备阶段与 Graph 接管后的唯一收尾责任；
 
 ## 架构定位
 
+Dashboard 实验执行由 EvaluationExecutionService 编排：受控加载已导入数据集、校验兼容评分器、冻结连接身份、持久幂等入队，后台调用既有 EvaluationExperimentRunner 与服务端 ChatCompletionTargetRunner。执行队列独立于评分作业，queued/running/scoring/completed 与质量分数分开；全局租约与 CAS 防止重复执行，过期 running 标记 interrupted，恢复 scoring 只等待既有评分。CLI 和旧登记接口语义保持。前端执行模块复用现有评估页 UI helpers 与样式。
+
 本项目当前阶段是后续持续迭代到完整 Agent 能力的架构基线，不是一次性 demo。当前阶段只实现既定验收范围，但领域模型、端口和模块边界必须支持后续扩展 Provider、工具生态、长期 Memory、权限审批、多 Agent、自动化任务、可观测性和部署运行环境。
 
 ## 分层

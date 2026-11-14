@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.application.evaluation_dataset import (
+    DATASET_SCHEMA_VERSIONS,
     DatasetManifestError,
     compute_dataset_hash,
     load_dataset_manifest,
@@ -290,27 +291,42 @@ class EvaluationReviewService:
 
     async def import_dataset(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         self._dataset_directory(payload.get('dataset_id'), payload.get('dataset_version'))
+        schema_version = payload.get('schema_version', '1')
+        if schema_version not in DATASET_SCHEMA_VERSIONS:
+            raise EvaluationValidationError(
+                f"不支持的 schema_version: {schema_version!r}，仅允许 "
+                f"{DATASET_SCHEMA_VERSIONS}（字符串形式）"
+            )
         cases = payload.get('cases')
         if not isinstance(cases, list) or not cases:
             raise EvaluationValidationError("cases 必须是非空数组")
         # Browser imports carry inline data, never server-side file references.
+        # 声明素材的 case 才必须提供 fixture_content；无素材 case（如
+        # hello/weather/task 场景）不携带 fixture 也合法——schema 2 场景
+        # 契约的确定性证据来自执行而非静态素材。
         for case in cases:
-            if (not isinstance(case, dict) or 'fixture_content' not in case
+            if (not isinstance(case, dict)
                     or any(key in case for key in ('fixture', 'rubric_ref'))):
-                raise EvaluationValidationError("导入用例必须提供 fixture_content，不接受服务端文件引用")
-        result = dict(await self.export_reviewed_dataset(payload))
+                raise EvaluationValidationError(
+                    "导入用例不接受服务端文件引用（fixture/rubric_ref）"
+                )
+        result = dict(await self.export_reviewed_dataset(
+            payload, require_fixture=False,
+        ))
         result.pop('manifest_path', None)
         return result
 
     async def export_reviewed_dataset(
-        self, payload: Mapping[str, Any]
+        self, payload: Mapping[str, Any], *, require_fixture: bool = True
     ) -> Mapping[str, Any]:
         # Imports and review exports share the same immutable version namespace.
         async with self._dataset_write_lock:
-            return await self._export_reviewed_dataset(payload)
+            return await self._export_reviewed_dataset(
+                payload, require_fixture=require_fixture,
+            )
 
     async def _export_reviewed_dataset(
-        self, payload: Mapping[str, Any]
+        self, payload: Mapping[str, Any], *, require_fixture: bool = True
     ) -> Mapping[str, Any]:
         """审核后导出新 manifest（受控路径）。
 
@@ -366,8 +382,17 @@ class EvaluationReviewService:
 
         # 先做形态校验（无副作用），再统一落盘：任一 case 非法时不出
         # 现半截文件
+        schema_version = payload.get("schema_version", "1")
+        if schema_version not in DATASET_SCHEMA_VERSIONS:
+            raise EvaluationValidationError(
+                f"不支持的 schema_version: {schema_version!r}，仅允许 "
+                f"{DATASET_SCHEMA_VERSIONS}（字符串形式）"
+            )
         prepared = [
-            self._prepare_export_case(case, index=index, base_dir=dataset_dir)
+            self._prepare_export_case(
+                case, index=index, base_dir=dataset_dir,
+                require_fixture=require_fixture,
+            )
             for index, case in enumerate(cases)
         ]
 
@@ -382,6 +407,7 @@ class EvaluationReviewService:
             dataset_id,
             dataset_version,
             target_kind,
+            schema_version,
         )
         # M1：审计写入纳入回滚保护——失败时清理本次写入的 manifest 与
         # 配对文件，避免"有数据集无审计"且同版本重试 409 永不可恢复
@@ -423,6 +449,7 @@ class EvaluationReviewService:
         dataset_id: str,
         dataset_version: str,
         target_kind: str,
+        schema_version: str = "1",
     ) -> tuple[dict[str, Any], list[Path]]:
         """同步落盘 + T12 权威加载器回读校验（工作线程内执行）。
 
@@ -439,7 +466,7 @@ class EvaluationReviewService:
                     written.append(target)
             manifest_cases = prepared
             content: dict[str, Any] = {
-                "schema_version": "1",
+                "schema_version": schema_version,
                 "dataset_id": dataset_id,
                 "dataset_version": dataset_version,
                 "target_kind": target_kind,
@@ -514,7 +541,8 @@ class EvaluationReviewService:
 
     @classmethod
     def _prepare_export_case(
-        cls, case: Any, *, index: int, base_dir: Path
+        cls, case: Any, *, index: int, base_dir: Path,
+        require_fixture: bool = True,
     ) -> dict[str, Any]:
         """case 形态校验与内联内容物化准备（无副作用）。
 
@@ -566,16 +594,16 @@ class EvaluationReviewService:
             )
             case["fixture_sha256"] = hashlib.sha256(fixture_bytes).hexdigest()
             write_files.append((case["fixture"], fixture_bytes))
-        else:
-            if not isinstance(case.get("fixture"), str) or not case["fixture"]:
-                raise EvaluationValidationError(
-                    f"{where} 缺少 fixture：提供 fixture_content 或已落盘"
-                    " 文件引用"
-                )
+        elif isinstance(case.get("fixture"), str) and case["fixture"]:
             # 预落盘模式：存在性 + sha 快速校验（T12 回读仍兜底）
             cls._require_paired_file(
                 case, path_field="fixture", sha_field="fixture_sha256",
                 base_dir=base_dir, where=where,
+            )
+        elif require_fixture:
+            raise EvaluationValidationError(
+                f"{where} 缺少 fixture：提供 fixture_content 或已落盘"
+                " 文件引用"
             )
         if "rubric_content" in case:
             rubric_raw = case.pop("rubric_content")

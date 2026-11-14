@@ -977,7 +977,9 @@ time.sleep(10)
 
 
 def test_truncation_timeout_cleanup_and_immediate_busy(tmp_path: Path) -> None:
-    source = b"import time\nprint('x' * 100)\ntime.sleep(1)\n"
+    # sleep 时长须显著大于 timeout_seconds=1：负载下 1s 对 1s 是构造性
+    # 竞态，进程可能赶在超时窗口内正常退出而断言 timeout 失败
+    source = b"import time\nprint('x' * 100)\ntime.sleep(3)\n"
     bridge = _bridge(tmp_path, _skill_policy(source))
     script = Path(bridge.config.skills_root) / "camera" / "scripts" / "run.py"
     _secure_write(script, source)

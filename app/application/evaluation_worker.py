@@ -61,6 +61,9 @@ from app.domain.evaluation.errors import (
     EvaluationDeletionConflictError,
     EvaluationLeaseError,
 )
+from app.application.evaluation_scenario_assertions import (
+    evaluate_scenario_assertions,
+)
 from app.domain.evaluation.metrics_deterministic import (
     ChunkIdentity,
     SideEffectEvidence,
@@ -316,6 +319,8 @@ _DETERMINISTIC_HANDLERS: dict[str, Callable[[Mapping[str, Any]], EvaluationValue
     "kb.mrr_at_5": _kb_metric_value("kb.mrr_at_5"),
     "agent.task_success": _task_success_value,
     "agent.tool_contract": _tool_contract_value,
+    # plan T3：场景断言确定性判定（application 层内聚模块，只依赖 domain）
+    "agent.scenario_assertions": evaluate_scenario_assertions,
 }
 
 
@@ -498,6 +503,10 @@ class EvaluationWorker:
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        return self._loop_task is not None and not self._loop_task.done()
 
     async def start(self) -> None:
         """启动常驻轮询循环（幂等）。"""

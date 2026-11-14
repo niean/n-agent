@@ -93,6 +93,120 @@ _DATASET_IDENTITY_FIELDS: tuple[str, ...] = (
 )
 
 
+# 场景比较分组不可混同的原因说明（plan T8，spec 124：不同证据/fixture
+# 修订的结果给出差异原因；live_smoke 只做当次行为与来源检查）
+COMPARISON_REASON_SCOPE = (
+    "不同 comparison_scope（fixed_fixture/live_smoke/channel_smoke）的"
+    "结果不混成同一可比总体；live_smoke/channel_smoke 只做当次行为与"
+    "来源检查，前后结果仅描述性对比"
+)
+COMPARISON_REASON_DIMENSION = (
+    "不同 profile/fixture/binding 的场景结果不可比（执行通道、素材或"
+    "隔离绑定不同）"
+)
+NON_SCENARIO_GROUP_NOTE = (
+    "非场景 case 无 comparison 元数据，不与场景结果混同比较"
+)
+
+
+def build_scenario_comparison_groups(
+    cases: list[Any],
+) -> dict[str, Any]:
+    """场景 case 比较分组（plan T8，spec 4.1/124）。
+
+    纯函数、确定性：按 (comparison_scope, execution.profile, fixture,
+    bindings 材料) 分组；派生固定题（source.derived_from）单列标注在
+    derived_case_ids，不顶替源题；非场景 case 单独成组并给出不可比
+    原因。输出形状：
+
+    ``{"groups": [{scope, profile, fixture, bindings, case_ids,
+    derived_case_ids, note}], "reasons": [...]}``
+    """
+    grouped: dict[tuple, dict[str, Any]] = {}
+    order: list[tuple] = []
+    for case in cases:
+        if not isinstance(case, Mapping):
+            continue
+        case_id = str(case.get("case_id") or "")
+        if not case_id:
+            continue
+        scenario = case.get("scenario")
+        if not isinstance(scenario, Mapping):
+            key = ("\x00non_scenario", None, None, ())
+            group = grouped.get(key)
+            if group is None:
+                group = {
+                    "scope": None,
+                    "profile": None,
+                    "fixture": None,
+                    "bindings": [],
+                    "case_ids": [],
+                    "derived_case_ids": [],
+                    "note": NON_SCENARIO_GROUP_NOTE,
+                }
+                grouped[key] = group
+                order.append(key)
+            group["case_ids"].append(case_id)
+            continue
+        execution = (
+            scenario.get("execution")
+            if isinstance(scenario.get("execution"), Mapping)
+            else {}
+        )
+        source = (
+            scenario.get("source")
+            if isinstance(scenario.get("source"), Mapping)
+            else {}
+        )
+        bindings_raw = (
+            scenario.get("bindings")
+            if isinstance(scenario.get("bindings"), Mapping)
+            else {}
+        )
+        binding_sig = tuple(
+            sorted(
+                f"{alias}:{binding.get('material') or ''}"
+                for alias, binding in bindings_raw.items()
+                if isinstance(binding, Mapping)
+            )
+        )
+        fixture = case.get("fixture")
+        fixture_sig = str(fixture) if isinstance(fixture, str) and fixture else None
+        profile = str(execution.get("profile") or "")
+        scope = str(scenario.get("comparison_scope") or "")
+        key = (scope, profile, fixture_sig, binding_sig)
+        group = grouped.get(key)
+        if group is None:
+            note = (
+                "live_smoke 只做当次行为与来源检查，前后结果仅描述性对比"
+                if scope == "live_smoke"
+                else (
+                    "channel_smoke 只做当次通道行为检查，不与固定基准混同比较"
+                    if scope == "channel_smoke"
+                    else None
+                )
+            )
+            group = {
+                "scope": scope or None,
+                "profile": profile or None,
+                "fixture": fixture_sig,
+                "bindings": list(binding_sig),
+                "case_ids": [],
+                "derived_case_ids": [],
+                "note": note,
+            }
+            grouped[key] = group
+            order.append(key)
+        group["case_ids"].append(case_id)
+        derived = source.get("derived_from")
+        if isinstance(derived, str) and derived:
+            group["derived_case_ids"].append(case_id)
+    return {
+        "groups": [grouped[key] for key in order],
+        "reasons": [COMPARISON_REASON_SCOPE, COMPARISON_REASON_DIMENSION],
+    }
+
+
 class IncomparableExperimentsError(EvaluationValidationError):
     """候选/基线实验不可比（spec 4.6/9：HTTP 422 incomparable_experiments，
     Task 9 注册路由映射）。

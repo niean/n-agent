@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
+import logging
 from typing import Any
+from urllib.parse import quote
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from app.domain.knowledge import (
     KnowledgeBackendSearchRequest,
@@ -67,6 +72,8 @@ class NkbKnowledgeRetriever(KnowledgeRetriever):
         except (TypeError, ValueError) as exc:
             raise KnowledgeSearchError(_safe_message("N-KB search failed", exc, secret)) from exc
 
+        snippets = await self._verify_legacy_snapshots(base, snippets)
+
         return KnowledgeSearchResult(
             kb_id=base.id,
             kb_name=base.name,
@@ -75,6 +82,53 @@ class NkbKnowledgeRetriever(KnowledgeRetriever):
             results=snippets,
             evaluation_context=_parse_evaluation_context(data.get("evaluation_context")),
         )
+
+    async def _verify_legacy_snapshots(self, base, snippets):
+        """Use a content-addressed, verified source snapshot for old N-KB APIs.
+
+        This is not an asserted index revision: the exact retrieved text must
+        exist in the authoritative document response. Missing/mismatched source
+        content stays unversioned and cannot satisfy the evaluation assertion.
+        """
+        verified = {}
+        async with httpx.AsyncClient(timeout=self.config.timeout_seconds,
+                                     transport=self.config.transport, follow_redirects=False) as client:
+            for item in snippets:
+                doc_id = item.document_id
+                if item.document_revision or not doc_id or not item.chunk_id:
+                    continue
+                if doc_id in verified:
+                    continue
+                verified[doc_id] = None
+                path = f"{_base_url(self.config, base)}/documents/{quote(doc_id, safe='')}"
+                try:
+                    document = await client.get(path)
+                    document.raise_for_status()
+                    content = await client.get(path + "/content")
+                    content.raise_for_status()
+                    doc, source = document.json(), content.json()
+                    if (not isinstance(doc, dict) or doc.get("id") != doc_id
+                            or doc.get("status") != "indexed" or not isinstance(source, dict)
+                            or source.get("document_id") != doc_id or not isinstance(source.get("text"), str)):
+                        continue
+                    verified[doc_id] = (doc, source["text"])
+                except (httpx.HTTPError, ValueError):
+                    # Legacy enrichment is optional; never synthesize a version
+                    # or discard the actual retrieval just because GET failed.
+                    logger.warning("N-KB document snapshot unavailable; retrieval remains unversioned")
+        enriched = []
+        for item in snippets:
+            snapshot = verified.get(item.document_id)
+            if item.document_revision or not snapshot or not item.content or item.content not in snapshot[1]:
+                enriched.append(item)
+                continue
+            doc, text = snapshot
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            enriched.append(replace(item, title=item.title or _optional_str(doc.get("title")),
+                chunk_content_hash=item.chunk_content_hash or hashlib.sha256(item.content.encode("utf-8")).hexdigest(),
+                metadata={**item.metadata, "document_snapshot_source": "verified_document_content",
+                          "document_snapshot_sha256": digest}))
+        return enriched
 
 
 class RagflowKnowledgeRetriever(KnowledgeRetriever):
@@ -196,6 +250,10 @@ def _map_nkb_result(item: Any) -> KnowledgeSnippet:
     if not isinstance(item, dict):
         raise ValueError("result must be an object")
     metadata = _metadata_from_item(item)
+    # Reserved local verification fields cannot be asserted by the search
+    # payload itself; only the authoritative document GET checks above set them.
+    metadata.pop("document_snapshot_source", None)
+    metadata.pop("document_snapshot_sha256", None)
     source = _coerce_source(item.get("source")) or _optional_str(item.get("document_id"))
     title = _optional_str(item.get("title")) or _metadata_title(item.get("metadata"))
     return KnowledgeSnippet(

@@ -124,11 +124,19 @@
 
 [20261110]
 - FR
-    - 评测：[KF]建立evaluation子域，统一执行评估、管理版本和保存结果。补全N-Agent/N-KB在Langfuse中的score分析，是否需要N-Agent具备正式的evaluate能力、还是托管到Langfuse？是否需要服务端统一评估分数，经OTel同源分发到Langfuse和现有观测栈？我希望实现一套符合业界标准的evaluate方案
+    - 评估：[KF]建立evaluation子域，统一执行评估、管理版本和保存结果。补全N-Agent/N-KB在Langfuse中的score分析，是否需要N-Agent具备正式的evaluate能力、还是托管到Langfuse？是否需要服务端统一评估分数，经OTel同源分发到Langfuse和现有观测栈？我希望实现一套符合业界标准的evaluate方案
         - spec: spec-261109-design-evaluation.md
         - 代码审阅：审阅本次修改的代码Diff，重点检查①架构和代码遵循项目规范、②功能符合spec/plan定义，最多列出30个问题。spec: spec-261109-design-evaluation.md，plan: plan-261110-evaluation-closed-loop.md
         - 功能补全：参考Langfuse，对当前的`评估`能力做增删改，spec spec-261112-evaluation-workbench.md 
         - 迭代：按照项目FE规范，优化评测相关的FE
+        - 迭代：实验，支持通过Dashboard发起实验
+        - 迭代：结果，表格改为项目标准样式，同时按时间倒序排列
+
+[20261114]
+- FR
+    - 评估：evaluation子域迭代优化
+        - 迭代：E2E测试，导入为数据集、且支持进行实验。对应的 spec: spec-261114-expand-e2e-experiments.md、plan: plan-261114-expand-e2e-experiments.md，已经三方审阅过，你可以进行编码等后续环节
+        - 迭代：数值指标的分数增加阈值，转化为通过/不通过的结论
 
 ---
 以下事项尚未确定，AI不应该阅读、修改、或当做任务目标。

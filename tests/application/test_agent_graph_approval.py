@@ -1125,8 +1125,14 @@ async def test_bridge_decider_task_cancel_detaches_run_and_keeps_pending(tmp_pat
         cid, "once", actor_id=_bridge_actor_id(), session_key=_bridge_session_key()
     )
     bridge.complete(claim)
+    # 注销发生在 detached run 的最末尾（工具执行之后），等待条件必须包含
+    # _running_tasks 清理，否则最后一条断言与 run 收尾存在竞态（时序 flaky）
     for _ in range(200):
-        if executor.calls and bridge.pending_count == 0:
+        if (
+            executor.calls
+            and bridge.pending_count == 0
+            and session_id not in runner._running_tasks
+        ):
             break
         await asyncio.sleep(0.01)
     assert len(executor.calls) == 1

@@ -104,6 +104,7 @@ class EvaluationDeletionService:
         evidence_store: Any = None,
         external_deleters: Mapping[str, ExternalDeleter] | None = None,
         delivery_worker: DeliveryGate | None = None,
+        scenario_resource_ledger: Any = None,
         clock: Callable[[], datetime] | None = None,
         converge_wait_seconds: float = DEFAULT_CONVERGE_WAIT_SECONDS,
         deletion_retry_delay_seconds: float = (
@@ -117,6 +118,9 @@ class EvaluationDeletionService:
             external_deleters or {}
         )
         self._delivery_worker = delivery_worker
+        # plan T4：场景资源账本（可选）。用户删除优先（spec 6.2）——
+        # 源会话/文档删除时同步撤销场景资源保留期并立即清理证据
+        self._scenario_resource_ledger = scenario_resource_ledger
         self._clock = clock or (
             lambda: datetime.now(timezone.utc)
         )
@@ -205,6 +209,10 @@ class EvaluationDeletionService:
                 if flag and payload["subject_kind"] == "result"
             )
         )
+        # plan T4：场景资源撤销（用户删除优先，保留期立即失效）
+        report["scenario_resources"] = await self._revoke_scenario_resources(
+            "session", session_id
+        )
         return {
             "subject_kind": "session",
             "subject_id": session_id,
@@ -240,15 +248,40 @@ class EvaluationDeletionService:
                 ("n-kb", "document_revision", document_id, document_revision),
                 ("n-agent", "document", document_id, document_revision),
                 ("n-agent", "document_revision", document_id, document_revision),
+                # Unversioned legacy snapshots cannot prove they belong to a
+                # different revision: any deletion of this document revokes them.
+                ("n-kb", "document", document_id, ""),
+                ("n-kb", "document_revision", document_id, ""),
+                ("n-agent", "document", document_id, ""),
+                ("n-agent", "document_revision", document_id, ""),
             ]
         )
         report = await self._cascade_samples(sample_ids)
+        # plan T4：场景资源撤销（按文档版本精确匹配，其他版本不受影响）
+        report["scenario_resources"] = await self._revoke_scenario_resources(
+            "document", document_id, revision=document_revision
+        )
         return {
             "subject_kind": "document",
             "subject_id": document_id,
             "subject_revision": document_revision,
             **report,
         }
+
+    async def _revoke_scenario_resources(
+        self, source_kind: str, source_id: str, *, revision: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        """撤销挂接在该源上的场景资源保留（未接线账本时为 None）。"""
+        ledger = self._scenario_resource_ledger
+        if ledger is None:
+            return None
+        return await ledger.revoke_sources(
+            source_kind, source_id, revision=revision
+        )
+
+    def set_scenario_resource_ledger(self, ledger: Any) -> None:
+        """构造后注入场景资源账本（与删除传播互相引用，拆环注入）。"""
+        self._scenario_resource_ledger = ledger
 
     async def _collect_subject_samples(
         self, lookups: Sequence[tuple[str, str, str, str | None]]

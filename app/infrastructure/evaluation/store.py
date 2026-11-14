@@ -4132,14 +4132,18 @@ class SQLiteEvaluationStore:
         parsed: Mapping[str, Any] | None,
         limit: int,
     ) -> tuple[list[Mapping[str, Any]], str | None, str | None]:
-        """兼容分支：T5 旧行为（旧两段式游标，无快照上界）。"""
+        """兼容分支：T5 旧行为（旧两段式游标，无快照上界）。
+
+        时间倒序（最新在前）：游标记录本页最旧一行，下一页用 < 边界继续
+        向更旧方向翻页；同时间戳以 result_id 倒序兜底保证稳定排序。
+        """
         where, params = self._results_page_filter_conditions(filters)
         if parsed is not None:
-            where.append("(r.created_at, r.result_id) > (?, ?)")
+            where.append("(r.created_at, r.result_id) < (?, ?)")
             params.extend([parsed["created_at"], parsed["result_id"]])
         sql = (
             self._RESULTS_PAGE_FROM_SQL + " AND ".join(where) +
-            " ORDER BY r.created_at, r.result_id LIMIT ?"
+            " ORDER BY r.created_at DESC, r.result_id DESC LIMIT ?"
         )
         params.append(limit + 1)
         with self._connect() as conn:
@@ -4159,7 +4163,11 @@ class SQLiteEvaluationStore:
         parsed: Mapping[str, Any] | None,
         limit: int,
     ) -> tuple[list[Mapping[str, Any]], str | None, str | None]:
-        """游标 v2 分支：完整过滤 + 快照上界 + fingerprint 绑定。"""
+        """游标 v2 分支：完整过滤 + 快照上界 + fingerprint 绑定。
+
+        时间倒序（最新在前）：快照上界仍由 snap 限定新增数据不进入本次
+        分页；游标记录本页最旧一行，下一页用 < 边界向更旧方向翻页。
+        """
         limit = min(limit, _RESULTS_PAGE_MAX_LIMIT)
         where, params = self._results_page_filter_conditions(filters)
         if filters["definition_version"] is not None:
@@ -4184,11 +4192,11 @@ class SQLiteEvaluationStore:
         where.append("r.created_at < ?")
         params.append(snap)
         if parsed is not None:
-            where.append("(r.created_at, r.result_id) > (?, ?)")
+            where.append("(r.created_at, r.result_id) < (?, ?)")
             params.extend([parsed["created_at"], parsed["result_id"]])
         sql = (
             self._RESULTS_PAGE_FROM_SQL + " AND ".join(where) +
-            " ORDER BY r.created_at, r.result_id LIMIT ?"
+            " ORDER BY r.created_at DESC, r.result_id DESC LIMIT ?"
         )
         params.append(limit + 1)
         with self._connect() as conn:
@@ -5097,6 +5105,7 @@ class SQLiteEvaluationStore:
         "     OR (t.subject_kind IN ('document', 'document_revision') "
         "         AND et.subject_kind IN ('document', 'document_revision'))) "
         "AND (t.subject_revision = '' "
+        "     OR (et.subject_revision = '' AND et.subject_kind IN ('document', 'document_revision')) "
         "     OR t.subject_revision = et.subject_revision)"
     )
 
@@ -5153,9 +5162,10 @@ class SQLiteEvaluationStore:
             "SELECT 1 FROM evaluation_deletion_tombstones "
             f"WHERE subject_kind IN ({placeholders}) "
             "AND subject_id = ? "
-            "AND (subject_revision = '' OR subject_revision = ?) "
+            "AND (subject_revision = '' OR subject_revision = ? OR ?) "
             "LIMIT 1",
-            (*variants, subject_id, subject_revision or ""),
+            (*variants, subject_id, subject_revision or "",
+             subject_kind in self._DOCUMENT_KIND_VARIANTS and not subject_revision),
         ).fetchone()
         return row is not None
 
@@ -5174,6 +5184,14 @@ class SQLiteEvaluationStore:
             ):
                 return True
         return False
+
+    async def is_sample_evidence_deleted(self, sample_id: str) -> bool:
+        """Read-side evidence guard uses the same tombstone join as commit."""
+        return await asyncio.to_thread(self._is_sample_evidence_deleted_sync, sample_id)
+
+    def _is_sample_evidence_deleted_sync(self, sample_id: str) -> bool:
+        with self._connect() as conn:
+            return self._sample_id_blocked_by_tombstone(conn, sample_id)
 
     def _sample_id_blocked_by_tombstone(
         self, conn: sqlite3.Connection, sample_id: str

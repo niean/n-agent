@@ -370,3 +370,17 @@ async def test_tool_executor_success_and_validation_errors():
     assert missing.status is ToolResultStatus.ERROR
     assert "kb_id" in missing.content["error"]
     assert unknown.status is ToolResultStatus.ERROR
+
+
+def test_tool_projection_preserves_authoritative_document_and_chunk_identity():
+    from app.application.knowledge_service import _snippet_to_dict
+    from app.domain.knowledge import KnowledgeSnippet
+
+    item = KnowledgeSnippet(id="c1", title="Title", content="Text", score=1, source="url",
+                            document_id="d1", document_revision="rev7", chunk_id="c1",
+                            chunk_content_hash="a" * 64)
+    projected = _snippet_to_dict(item)
+    assert projected["document_id"] == "d1"
+    assert projected["document_revision"] == "rev7"
+    assert projected["chunk_id"] == "c1"
+    assert projected["chunk_content_hash"] == "a" * 64

@@ -10,7 +10,7 @@
 - token 上限 input 12000 / output 1000：超限按定义 skipped（evidence_oversized），
   不静默截断；输出被 max_tokens 截断（finish_reason=length）按 format_error 拒绝；
 - temperature 默认 0；记录实际响应模型与 usage；max_retries=0；
-- 四个 Judge 指标工厂；correctness/relevance 只接受 0/0.5/1；
+- 五个 Judge 指标工厂；correctness/relevance 只接受 0/0.5/1；
   correctness 缺 reference 本地 skipped 不调用 Judge；
   faithfulness 分母为全部声明、无声明 skipped；kb.context_relevance 逐片段
   0/0.5/1 均值、空结果=0、失败检索=error；
@@ -18,6 +18,8 @@
 - 不读取 Task 控制 verdict；self_judge 标记透传 provenance。
 """
 from __future__ import annotations
+
+from dataclasses import replace
 
 import json
 
@@ -41,6 +43,19 @@ from app.infrastructure.evaluation.judge_provider import (
 BASE_URL = "http://judge.test/v1"
 API_KEY = "judge-secret"
 CONFIG_MODEL = "judge-config-model"
+
+
+async def test_self_judge_uses_frozen_definition_model():
+    recorder = []
+    judge = _make_judge("agent.answer_correctness", recorder,
+                        lambda request: _chat_response(_score_payload(1)))
+    definition = replace(_definition(), judge_model="frozen-selected-model")
+    try:
+        result = await judge.evaluate(definition, _snapshot(_correctness_content(target_model="frozen-selected-model")))
+        assert result["provenance"]["self_judge"] is True
+        assert json.loads(recorder[0].content)["model"] == "frozen-selected-model"
+    finally:
+        await judge.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -462,12 +477,13 @@ async def test_records_actual_response_model_and_usage():
 # ---------------------------------------------------------------------------
 
 
-def test_factories_cover_four_judge_metrics():
+def test_factories_cover_five_judge_metrics():
     assert set(JUDGE_EVALUATOR_FACTORIES) == {
         "agent.answer_correctness",
         "agent.answer_relevance",
         "rag.faithfulness",
         "kb.context_relevance",
+        "agent.scenario_quality",
     }
     for metric_name, factory in JUDGE_EVALUATOR_FACTORIES.items():
         judge = factory(

@@ -61,6 +61,7 @@ def run(args) -> int:
         "show": _cmd_show,
         "compare": _cmd_compare,
         "retry-delivery": _cmd_retry_delivery,
+        "convert-e2e": _cmd_convert_e2e,
     }
     handler = dispatch.get(args.evaluate_command)
     if handler is None:
@@ -415,4 +416,64 @@ def _cmd_retry_delivery(args) -> int:
     render_data(
         dict(result), fmt=resolve_format(args), console=make_console()
     )
+    return 0
+
+
+def _cmd_convert_e2e(args) -> int:
+    """离线 E2E 会话样例转换（plan T2）。
+
+    只加载转换依赖（纯数据变换），不初始化业务服务、不触网、不写
+    evaluations.db。产物：
+    - {out}/manifest.json      待审核 manifest 载荷（含 dataset_hash）
+    - {out}/coverage.json      覆盖报告（含 unsupported 清单）
+    - {out}/dataset/{id}/{ver}/ 权威布局数据集（manifest + 素材），
+      经 T12 权威加载器回读校验
+    """
+    import json
+    from pathlib import Path
+
+    from app.application.evaluation_e2e_conversion import (
+        convert_e2e_conversations,
+    )
+
+    try:
+        result = convert_e2e_conversations(
+            args.source_dir,
+            dataset_id=args.dataset_id,
+            dataset_version=args.dataset_version,
+        )
+    except Exception as exc:  # noqa: BLE001 - 操作失败统一 2
+        return _operational_failure(exc)
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = dict(result.manifest)
+    manifest["dataset_hash"] = __import__(
+        "app.application.evaluation_dataset", fromlist=["compute_dataset_hash"]
+    ).compute_dataset_hash(manifest)
+    (out / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out / "coverage.json").write_text(
+        json.dumps(result.coverage, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    dataset_dir = out / "dataset" / args.dataset_id / args.dataset_version
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    for rel_path, content in result.materials:
+        target = dataset_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    (dataset_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    from app.application.evaluation_dataset import load_dataset_manifest
+
+    try:
+        load_dataset_manifest(dataset_dir / "manifest.json")
+    except Exception as exc:  # noqa: BLE001
+        return _operational_failure(exc)
+    summary = dict(result.coverage["summary"])
+    summary["output"] = str(out)
+    print(json.dumps(summary, ensure_ascii=False))
     return 0
