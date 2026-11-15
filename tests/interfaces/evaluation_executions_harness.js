@@ -20,7 +20,25 @@ class Element {
 function find(node, predicate) { if (predicate(node)) return node; for (const child of node.children) { const found = find(child, predicate); if (found) return found; } }
 const document = { body: new Element('body'), createElement: tag => new Element(tag) };
 const el = (tag, cls, text) => { const n = new Element(tag); n.className = cls; if (text !== undefined) n.textContent = text; return n; };
-const actionButton = (text, fn) => { const b = el('button', 'btn', text); b.type = 'button'; b.addEventListener('click', fn); return b; };
+const actionButton = (text, fn) => { const b = el('button', 'btn', text); b.type = 'button'; b.disabled = false; b.addEventListener('click', fn); return b; };
+const disabledButton = (text) => { const b = el('button', 'btn', text); b.type = 'button'; b.disabled = true; return b; };
+const LIST_PAGE_SIZE = 20;
+// 与 evaluation.js 共享 pagerBar 同构：evaluations-pager + info + 始终占位按钮
+const pagerBar = (options) => {
+  const row = el('div', 'evaluations-pager');
+  const info = el('span', 'evaluations-pager__info');
+  const pageNo = options.pageIndex + 1;
+  const totalPages = options.totalPages !== undefined
+    ? options.totalPages
+    : pageNo + (options.hasNext ? 1 : 0);
+  info.textContent = '第 ' + pageNo + '/' + totalPages + ' 页';
+  row.appendChild(info);
+  if (options.hasPrev) row.appendChild(actionButton('上一页', options.onPrev));
+  else row.appendChild(disabledButton('上一页'));
+  if (options.hasNext) row.appendChild(actionButton('下一页', options.onNext));
+  else row.appendChild(disabledButton('下一页'));
+  return row;
+};
 let active = true, failSubmission = true, phase = 'scoring', capabilitiesReady = true, detailCalls = 0;
 let preflightRunnable = true;
 let listCursor = null, failList = false;
@@ -46,7 +64,8 @@ const api = {
 const context = { document, NAGENT: {}, setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout: () => {}, crypto: { randomUUID: () => 'request-'+submissions.length }, Node: Element };
 context.window = context;
 vm.runInNewContext(fs.readFileSync('app/interfaces/http/static/evaluation-executions.js', 'utf8'), context);
-const controller = context.NAGENT.evaluationExecutions.createController({ api, el, actionButton,
+const controller = context.NAGENT.evaluationExecutions.createController({ api, el, actionButton, disabledButton,
+  pagerBar, LIST_PAGE_SIZE,
   buildFrame: title => { const backdrop = el('div','modal-backdrop'); const form = el('form','providers-form'); const closeBtn = actionButton('关闭', () => backdrop.remove()); backdrop.append(form,closeBtn); return {backdrop, form, closeBtn}; },
   formActions: (form, cancel, submit) => { const actions = el('div','providers-form__actions'); actions.append(actionButton(cancel, () => form.parentElement.remove())); if (submit) { const b=actionButton(submit,()=>{}); b.type='submit'; b.className='btn btn--primary'; actions.append(b); } form.append(actions); return actions; },
   mountDetailModal: frame => document.body.append(frame.backdrop), closeBackdrop: node => node.remove(),
@@ -94,33 +113,77 @@ const controller = context.NAGENT.evaluationExecutions.createController({ api, e
   const callsBefore=detailCalls;
   for (const timer of timers.splice(0)) await timer();
   assert.equal(detailCalls,callsBefore,'底部关闭后不再请求执行详情');
+  // 多版本 flat 契约回归：数据集页聚合仅为前端展示，发起实验仍消费扁平
+  // items——同 ID 全部有效版本可选，invalid 与非 agent_run 目标排除
+  const realListDatasets = api.listDatasets.bind(api);
+  api.listDatasets = async () => ({ items: [
+    dataset,
+    { dataset_id: 'agent-e2e-v1', dataset_version: '2', dataset_hash: 'b'.repeat(64), target_kind: 'agent_run', case_count: 2, status: 'valid' },
+    { dataset_id: 'agent-e2e-v1', dataset_version: '3', dataset_hash: 'x', target_kind: 'agent_run', case_count: 1, status: 'invalid' },
+    { dataset_id: 'other-retrieval', dataset_version: '1', dataset_hash: 'y', target_kind: 'retrieval', case_count: 1, status: 'valid' },
+  ] });
+  await controller.openCreate(null, 1);
+  const mvForm = find(document.body, n => n.tag === 'form');
+  const datasetSelect = find(mvForm, n => n.name === 'dataset');
+  assert.equal(datasetSelect.className, 'select-control', '数据集下拉须接入共享 .select-control 外观');
+  const options = datasetSelect.children.filter(n => n.tag === 'option');
+  assert.equal(options.length, 2, '两个有效 agent_run 版本可选，invalid/retrieval 排除');
+  assert.ok(options.some(o => o.textContent.includes('agent-e2e-v1 / 1')), '版本 1 在选项中');
+  assert.ok(options.some(o => o.textContent.includes('agent-e2e-v1 / 2')), '版本 2 在选项中');
+  assert.ok(!options.some(o => /\/ 3|other-retrieval/.test(o.textContent)), 'invalid 与 retrieval 不出现');
+  datasetSelect.value = '1';
+  datasetSelect.handlers.change();
+  assert.equal(find(mvForm, n => n.name === 'dataset_hash').value, 'b'.repeat(64),
+    '切换版本后 hash 随选项更新');
+  find(mvForm, n => n.tag === 'button' && n.textContent === '取消'
+    && n.parentElement.className === 'providers-form__actions').handlers.click();
+  api.listDatasets = realListDatasets;
+
   phase='completed'; await controller.openDetail('execution-one',1);
   assert.ok(document.body.textContent.includes('执行完成'));
   assert.ok(document.body.textContent.includes('已登记保留'), '详情展示保留账目状态');
   assert.ok(document.body.textContent.includes('保留登记:2'), '展示保留登记数量');
   assert.ok(!document.body.textContent.includes('测试通过'));
-  // 执行记录列表：无手动刷新按钮，区块标题走 blockTitle，无游标时不渲染分页行
+  // 执行记录列表：无手动刷新按钮，不渲染区块标题行（入口名即执行任务，标题冗余）；
+  // 共享 pagerBar 始终占位——首页无 next_cursor 时下一页禁用而非隐藏。
   const listBody = new Element('div');
   await controller.renderList(listBody, 1);
-  assert.ok(listBody.textContent.includes('实验执行'));
-  assert.ok(find(listBody, n => n.className === 'evaluations-block-title'), '区块标题复用 blockTitle');
+  assert.ok(!listBody.textContent.includes('实验执行'), '列表页不再渲染实验执行区块标题');
+  assert.equal(find(listBody, n => n.className === 'evaluations-block-title'), undefined,
+    '列表页不挂载 blockTitle 行组件');
   assert.ok(!listBody.textContent.includes('刷新执行记录'), '手动刷新按钮应删除，Tab 重入即重新加载');
-  assert.ok(!find(listBody, n => n.className === 'evaluations-pager'), '首页无游标不渲染分页行');
-  // next_cursor 存在时渲染 evaluations-pager + 下一页，点击携带游标
+  assert.equal(listCalls.at(-1).limit, 20, '统一每页 20 条');
+  assert.equal(listCalls.at(-1).cursor, undefined, '首页请求无游标');
+  const homePager = find(listBody, n => n.className === 'evaluations-pager');
+  assert.ok(homePager, '首页仍渲染共享 evaluations-pager');
+  assert.match(homePager.textContent, /第 1\/1 页/, '无 next_cursor 时已知页数下界为 1');
+  const homeNext = find(homePager, n => n.tag === 'button' && n.textContent === '下一页');
+  const homePrev = find(homePager, n => n.tag === 'button' && n.textContent === '上一页');
+  assert.equal(homeNext.disabled, true, '无 next_cursor 时下一页禁用占位');
+  assert.equal(homePrev.disabled, true, '首页上一页禁用占位');
+  // next_cursor 存在时下一页可用，点击携带游标入栈
   listCursor = 'tok2';
   await controller.renderList(listBody, 1);
   const pager = find(listBody, n => n.className === 'evaluations-pager');
   assert.ok(pager, '分页按钮统一收纳进 evaluations-pager');
   const nextBtn = find(listBody, n => n.tag === 'button' && n.textContent === '下一页');
   assert.ok(nextBtn, '分页文案与评估结果列表一致');
+  assert.equal(nextBtn.disabled, false);
   await nextBtn.handlers.click();
   assert.equal(listCalls.at(-1).cursor, 'tok2', '下一页携带 next_cursor');
-  // 带游标渲染时出现上一页，点击回到无游标首页
-  await controller.renderList(listBody, 1, 'tok2');
+  assert.equal(listCalls.at(-1).limit, 20);
+  // 第 2 页出现可用上一页，点击从游标栈回退到无游标首页
   const prevBtn = find(listBody, n => n.tag === 'button' && n.textContent === '上一页');
   assert.ok(prevBtn);
+  assert.equal(prevBtn.disabled, false);
   await prevBtn.handlers.click();
-  assert.equal(listCalls.at(-1).cursor, undefined, '上一页回到最新一页');
+  assert.equal(listCalls.at(-1).cursor, undefined, '上一页从栈回退到首页');
+  // 视图入口 renderList 重置回首页（生命周期合同）
+  listCursor = 'tok3';
+  await nextBtn.handlers.click();
+  assert.equal(listCalls.at(-1).cursor, 'tok2');
+  await controller.renderList(listBody, 1);
+  assert.equal(listCalls.at(-1).cursor, undefined, '重入视图回第 1 页');
   // 加载失败：清空旧内容并提供重试入口，重试后恢复
   failList = true;
   await controller.renderList(listBody, 1);

@@ -256,7 +256,8 @@ class EvaluatorDefinition:
 
     定义变化创建新版本（definition_id + version 唯一），实验开始时锁定
     版本。material_hash 记录 rubric / prompt / code 材料的 SHA-256；
-    llm_judge 方法必须声明 judge_model。预算为该定义的 USD 上限
+    llm_judge 的 judge_model=None 表示跟随组合根默认供给（Provider/env
+    基线），显式字符串则冻结该模型。预算为该定义的 USD 上限
     （Decimal），None 表示未设上限。
     """
 
@@ -303,8 +304,9 @@ class EvaluatorDefinition:
         self._validate_material_hash()
         if self.judge_model is not None:
             _require_non_empty_str(self.judge_model, "judge_model")
-        if self.method == "llm_judge" and not self.judge_model:
-            raise EvaluationValidationError("llm_judge 方法必须声明 judge_model")
+        # llm_judge 的 judge_model=None = 跟随组合根默认供给（spec：未
+        # 冻结定义允许不锁定模型）；显式空串仍被 _require_non_empty_str
+        # 拒绝（空串 = 未声明，不是"跟随默认"）
         object.__setattr__(self, "judge_params", MappingProxyType(dict(self.judge_params)))
         if not isinstance(self.timeout_seconds, int) or isinstance(
             self.timeout_seconds, bool

@@ -34,6 +34,7 @@ from app.infrastructure.evaluation.judge_provider import (
     JudgeFormatError,
     JudgePermanentError,
     JudgeProviderError,
+    JudgeSupplyOverride,
     JudgeTransientError,
     LLMJudgeEvaluator,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "JudgeTransientError",
     "JudgeFormatError",
     "JudgePermanentError",
+    "JudgeSupplyOverride",
     "JUDGE_EVALUATOR_FACTORIES",
     "LangfuseScoreSink",
     "LangfuseSinkError",

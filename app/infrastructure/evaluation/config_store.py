@@ -80,6 +80,11 @@ class SqliteEvaluationConfigStore(EvaluationConfigStore):
             ) from exc
         if not isinstance(data, dict):
             raise EvaluationConfigStoreError("config_json 必须是 JSON 对象")
+        # 读时归一（legacy 迁移）：仅此一键，不写回存储，下一次 CAS 保存
+        # 自然移除。字段改名 evaluation_judge_model -> evaluation_judge_provider_id
+        # 后，存量 DB 行中的旧键在读路径剥离；旧键值任意类型均丢弃，不校验
+        # 不回退（绝不静默回退原则不受迁移影响）。PATCH/replace 载荷仍严格拒绝。
+        data.pop("evaluation_judge_model", None)
         overrides = EvaluationConfigOverrides.from_dict(data)
         if not isinstance(version, int) or isinstance(version, bool) or version < 1:
             raise EvaluationConfigStoreError("version 必须是 >= 1 的整数")

@@ -9,12 +9,17 @@
   const terminal = new Set(['completed', 'failed', 'interrupted']);
 
   function createController(deps) {
-    const { api, el, actionButton, buildFrame, formActions, mountDetailModal, closeBackdrop,
-      filterItem, kvRow, table, scrollTable, formatTime, isCurrent, openExperimentModal, blockTitle } = deps;
+    const { api, el, actionButton, disabledButton, buildFrame, formActions, mountDetailModal, closeBackdrop,
+      filterItem, kvRow, table, scrollTable, formatTime, isCurrent, openExperimentModal, blockTitle,
+      pagerBar, LIST_PAGE_SIZE } = deps;
     let frame = null;
     let timer = null;
     let generation = 0;
     let listGeneration = 0;
+    // 执行列表游标栈：栈首空串代表无游标首页，前进压入响应 next_cursor，
+    // 回退从栈取历史游标；页码仅用于 pager 展示。
+    let execCursorStack = [''];
+    let execPageIndex = 0;
 
     function deactivate() {
       generation++;
@@ -47,7 +52,7 @@
         : 'execution-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
     }
 
-    async function openCreate(preselected, token) {
+    async function openCreate(preselected, token, onCreated) {
       deactivate();
       const seq = generation;
       let caps, data;
@@ -69,6 +74,8 @@
       name.name = 'name'; name.required = true; name.maxLength = 200;
       name.value = '评估实验 ' + formatTime(new Date().toISOString());
       const dataset = document.createElement('select');
+      // 共享下拉外观：自定义 chevron 与右侧边距（见 styles.css .select-control）
+      dataset.className = 'select-control';
       dataset.name = 'dataset';
       datasets.forEach((item, index) => {
         const option = el('option', '', item.dataset_id + ' / ' + item.dataset_version);
@@ -186,6 +193,8 @@
           const result = await api.createExecution(Object.assign({}, body, { request_key: submittedBody.requestKey }));
           if (!alive(token, seq, own)) return;
           await openDetail(result.execution_id, token);
+          // 创建成功后刷新执行列表回首页；数据集详情等旧入口不传回调时行为不变
+          if (typeof onCreated === 'function') onCreated();
         } catch (failure) {
           if (!alive(token, seq, own)) return;
           error.hidden = false; error.textContent = '提交失败：' + failure.message + '。输入已保留，可重试。';
@@ -197,31 +206,53 @@
       mount(own);
     }
 
-    async function renderList(body, token, cursor) {
+    // 视图入口渲染：统一从首页重新取数（生命周期合同），游标栈与页码归零。
+    async function renderList(body, token) {
+      execCursorStack = [''];
+      execPageIndex = 0;
+      return renderPage(body, token);
+    }
+
+    // 视图内翻页渲染：复用游标栈，不重置页码。
+    async function renderPage(body, token) {
       const seq = ++listGeneration;
+      const cursor = execCursorStack[execPageIndex];
       body.textContent = '';
-      body.appendChild(blockTitle('实验执行'));
       body.appendChild(el('div', 'loading-state', '执行记录加载中...'));
       try {
-        const data = await api.listExecutions({ limit: 20, cursor });
+        const params = { limit: LIST_PAGE_SIZE };
+        if (cursor) params.cursor = cursor;
+        const data = await api.listExecutions(params);
         if (!isCurrent(token) || seq !== listGeneration) return;
         body.textContent = '';
-        body.appendChild(blockTitle('实验执行'));
         const rows = (data.items || []).map(item => [item.name, item.dataset_id + '/' + item.dataset_version,
           labels[item.phase] || item.phase, formatTime(item.created_at), actionButton('查看执行', () => openDetail(item.execution_id, token))]);
         if (rows.length) body.appendChild(scrollTable(table(['实验名称', '数据集', '执行状态', '创建时间', '操作'], rows)));
         else body.appendChild(el('div', 'empty-state', '暂无执行记录，可通过「发起实验」启动。'));
-        // 游标分页与评估结果列表同款：evaluations-pager 行 + 上一页/下一页短文案
-        const pager = el('div', 'evaluations-pager');
-        if (cursor) pager.appendChild(actionButton('上一页', () => renderList(body, token)));
-        if (data.next_cursor) pager.appendChild(actionButton('下一页', () => renderList(body, token, data.next_cursor)));
-        if (pager.children.length) body.appendChild(pager);
+        // 统一 pagerBar：按钮始终占位、边界禁用、先于空态构建。
+        const nextCursor = data.next_cursor ? String(data.next_cursor) : '';
+        body.appendChild(pagerBar({
+          pageIndex: execPageIndex,
+          hasPrev: execPageIndex > 0,
+          hasNext: !!nextCursor,
+          onPrev: () => {
+            execPageIndex -= 1;
+            return renderPage(body, token);
+          },
+          onNext: () => {
+            execCursorStack = execCursorStack.slice(0, execPageIndex + 1);
+            execCursorStack.push(nextCursor);
+            execPageIndex += 1;
+            return renderPage(body, token);
+          },
+        }));
       } catch (error) {
         if (!isCurrent(token) || seq !== listGeneration) return;
         body.textContent = '';
-        body.appendChild(blockTitle('实验执行'));
         body.appendChild(el('div', 'error-state', '执行记录加载失败：' + error.message));
-        body.appendChild(actionButton('重试', () => renderList(body, token, cursor)));
+        // 执行接口错误码统一泛化为 execution_invalid，无法唯一判定游标失效，
+        // 保留同目标页重试（cursor 与页码不变），不做清栈跳转。
+        body.appendChild(actionButton('重试', () => renderPage(body, token)));
       }
     }
 

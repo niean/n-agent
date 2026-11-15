@@ -402,6 +402,9 @@
       submitFeedback: (body) => fetchJson('/chat/evaluations/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
       getConfig: () => fetchJson('/chat/evaluations/config'),
       patchConfig: (body) => fetchJson('/chat/evaluations/config', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
+      // Judge 模型配置读取（plan-261115 T6）：GET 投影（供给只读 +
+      // default_model 编辑基线），写入走上方 patchConfig
+      getJudgeModel: () => fetchJson('/chat/evaluations/judge-model'),
       retryDelivery: (body) => fetchJson('/chat/evaluations/deliveries/retry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),
       listReviewQueue: (params) => fetchJson('/chat/evaluations/review-queue' + buildEvaluationQuery(params)),
       exportReviewQueue: (body) => fetchJson('/chat/evaluations/review-queue/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),

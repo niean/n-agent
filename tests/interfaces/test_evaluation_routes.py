@@ -1021,7 +1021,7 @@ class _ManagementHarness:
     producer 端点不注册（管理面独立注册函数），凭据同源保护沿用
     Dashboard 约束（无 CORS、同文件错误契约）。"""
 
-    def __init__(self, tmp_path: Any) -> None:
+    def __init__(self, tmp_path: Any, *, judge_supply: Any = None) -> None:
         self.store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
         self.evidence_store = LocalEvidenceStore(
             tmp_path / "evidence", self.store
@@ -1047,9 +1047,13 @@ class _ManagementHarness:
         )
         # Task 9：评估工作台管理面三服务（admin/annotation/analytics）
         self.annotation_evidence_reader = _FakeAnnotationEvidenceReader()
+
+        async def _judge_ready() -> bool:
+            return True
+
         self.admin_service = EvaluationAdminService(
             self.store,
-            judge_ready=lambda: True,
+            judge_ready=_judge_ready,
             evaluation_service=self.evaluation_service,
         )
         self.annotation_service = AnnotationService(
@@ -1074,6 +1078,7 @@ class _ManagementHarness:
             evaluation_admin_service=self.admin_service,
             evaluation_annotation_service=self.annotation_service,
             evaluation_analytics_service=self.analytics_service,
+            judge_supply=judge_supply,
         )
         self.client = TestClient(self.app)
         self.tmp_path = tmp_path
@@ -1564,6 +1569,210 @@ class TestManagementConfig:
             "expected_version": 1,
         })
         assert over.status_code == 422
+
+
+class TestJudgeModelEndpoint:
+    """judge-model 供给投影端点（T5）：GET /chat/evaluations/judge-model。
+
+    单次严格读 get_resolved()，resolved 快照整体传给组合根注入的 async
+    judge_supply 投影（供给命中/missing/host 脱敏判定，路由层不读 env、
+    不触碰凭据、不依赖 infrastructure 类型）；default_provider_id 与
+    config_version 取同一 resolved（绑定一致，不读 current()）。
+    judge_supply 未注入时返回安全缺省（供给字段全空/False；非空 id 不
+    伪报 missing——缺少查表能力不能断言记录不存在）。no-store 与既有
+    管理面 GET 端点一致。"""
+
+    FIELDS = {
+        "default_provider_id",
+        "default_provider_name",
+        "default_provider_model",
+        "default_provider_missing",
+        "judge_ready",
+        "supply_source",
+        "effective_model",
+        "env_baseline_model",
+        "provider_base_url_host",
+        "config_version",
+    }
+
+    def test_returns_safe_defaults_without_judge_supply(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        resp = mgmt.get("/chat/evaluations/judge-model")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) == self.FIELDS
+        # judge_supply 未注入：供给字段按安全缺省（judge 未配置语义）
+        assert body["judge_ready"] is False
+        assert body["supply_source"] is None
+        assert body["effective_model"] is None
+        assert body["provider_base_url_host"] is None
+        assert body["env_baseline_model"] is None
+        # C 类配置零覆盖基线（harness env judge 模型为空）
+        assert body["default_provider_id"] == ""
+        assert body["default_provider_name"] is None
+        assert body["default_provider_model"] is None
+        assert body["default_provider_missing"] is False
+        assert body["config_version"] == 0
+
+    def test_supply_projection_receives_resolved_snapshot(
+        self, tmp_path: Any
+    ) -> None:
+        seen: list[Any] = []
+
+        async def supply(resolved: Any) -> dict[str, Any]:
+            seen.append(resolved)
+            return {
+                "default_provider_id": (
+                    resolved.config.evaluation_judge_provider_id
+                ),
+                "default_provider_name": "judge-provider",
+                "default_provider_model": "provider-judge-model",
+                "default_provider_missing": False,
+                "judge_ready": True,
+                "supply_source": "provider",
+                "effective_model": "provider-judge-model",
+                "env_baseline_model": None,
+                "provider_base_url_host": "https://judge.example.com",
+                "config_version": resolved.version,
+            }
+
+        harness = _ManagementHarness(tmp_path, judge_supply=supply)
+        service = harness.config_service
+        original_resolved = service.get_resolved
+        captured: list[Any] = []
+
+        async def counting_resolved() -> Any:
+            resolved = await original_resolved()
+            captured.append(resolved)
+            return resolved
+
+        service.get_resolved = counting_resolved
+        resp = harness.get("/chat/evaluations/judge-model")
+        assert resp.status_code == 200
+        body = resp.json()
+        # 投影收到端点读到的同一 resolved 快照（id 与 config_version
+        # 绑定一致，不重复读取、不读 current()）
+        assert len(captured) == 1
+        assert seen and seen[0] is captured[0]
+        assert body["default_provider_id"] == (
+            captured[0].config.evaluation_judge_provider_id
+        )
+        assert body["config_version"] == captured[0].version
+        assert body["default_provider_name"] == "judge-provider"
+        assert body["default_provider_model"] == "provider-judge-model"
+        assert body["default_provider_missing"] is False
+        assert body["judge_ready"] is True
+        assert body["supply_source"] == "provider"
+        assert body["effective_model"] == "provider-judge-model"
+        assert body["provider_base_url_host"] == "https://judge.example.com"
+        assert resp.headers["cache-control"] == "no-store"
+
+    def test_injected_missing_flag_passes_through(self, tmp_path: Any) -> None:
+        async def supply(resolved: Any) -> dict[str, Any]:
+            return {
+                "default_provider_id": (
+                    resolved.config.evaluation_judge_provider_id
+                ),
+                "default_provider_name": None,
+                "default_provider_model": None,
+                "default_provider_missing": True,
+                "judge_ready": False,
+                "supply_source": None,
+                "effective_model": None,
+                "env_baseline_model": None,
+                "provider_base_url_host": None,
+                "config_version": resolved.version,
+            }
+
+        harness = _ManagementHarness(tmp_path, judge_supply=supply)
+        resp = harness.get("/chat/evaluations/judge-model")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["default_provider_missing"] is True
+        assert body["judge_ready"] is False
+        assert body["supply_source"] is None
+
+    def test_defaults_do_not_fake_missing_for_unresolved_id(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        # T4：C 类覆盖字段是 evaluation_judge_provider_id（T1 语义）；
+        # 首次设置 id 且同 PATCH 设正数预算（domain 统一预算条件）
+        ok = mgmt.patch("/chat/evaluations/config", {
+            "patch": {
+                "evaluation_judge_provider_id": "m1",
+                "evaluation_daily_call_ceiling": 10,
+            },
+            "expected_version": 0,
+        })
+        assert ok.status_code == 200
+        resp = mgmt.get("/chat/evaluations/judge-model")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["default_provider_id"] == "m1"
+        assert body["config_version"] == 1
+        # judge_supply 未注入（无查表能力）：不得把非空 id 伪报为 missing
+        assert body["default_provider_missing"] is False
+        assert body["default_provider_name"] is None
+        assert body["default_provider_model"] is None
+        assert body["judge_ready"] is False
+
+    def test_patch_judge_model_via_config_endpoint(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        ok = mgmt.patch("/chat/evaluations/config", {
+            "patch": {
+                "evaluation_judge_provider_id": "m1",
+                "evaluation_daily_call_ceiling": 10,
+            },
+            "expected_version": 0,
+        })
+        assert ok.status_code == 200
+        assert ok.json()["config"]["evaluation_judge_provider_id"] == "m1"
+        # 首尾空白拒绝（不静默 trim）
+        invalid = mgmt.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_judge_provider_id": " m"},
+            "expected_version": 1,
+        })
+        assert invalid.status_code == 422
+        assert invalid.json()["error"]["code"] == "config_invalid"
+
+    def test_get_resolved_called_once_and_no_store(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        service = mgmt.config_service
+        original_resolved = service.get_resolved
+        original_current = service.current
+        resolved_calls: list[int] = []
+        current_calls: list[int] = []
+
+        async def counting_resolved() -> Any:
+            resolved_calls.append(1)
+            return await original_resolved()
+
+        async def counting_current() -> Any:
+            current_calls.append(1)
+            return await original_current()
+
+        service.get_resolved = counting_resolved
+        service.current = counting_current
+        resp = mgmt.get("/chat/evaluations/judge-model")
+        assert resp.status_code == 200
+        # 单次严格读取；热读 current() 不在端点路径上
+        assert len(resolved_calls) == 1
+        assert current_calls == []
+        assert resp.headers["cache-control"] == "no-store"
+
+    def test_get_resolved_failure_maps_to_500(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        async def boom() -> Any:
+            raise RuntimeError("boom")
+
+        mgmt.config_service.get_resolved = boom
+        resp = mgmt.get("/chat/evaluations/judge-model")
+        assert resp.status_code == 500
+        assert resp.json()["error"]["code"] == "internal_error"
 
 
 class TestManagementDeliveryRetry:
@@ -2401,7 +2610,6 @@ class TestDatasetManagement:
         payload['dataset_id'] = '..'
         assert mgmt.post('/chat/evaluations/datasets', payload).status_code == 422
 
-    @pytest.mark.asyncio
     async def test_concurrent_import_keeps_version_immutable(self, mgmt):
         import asyncio
         from app.domain.evaluation.errors import EvaluationConflictError

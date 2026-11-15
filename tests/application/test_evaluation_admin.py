@@ -1,7 +1,7 @@
 # app.application.evaluation_admin 用例测试（plan-261112 Task 5 S1）。
 #
 # 覆盖评估器管理用例：
-# - capabilities()：能力目录（deterministic 五指标固定组合 / llm_judge 就绪
+# - capabilities()：能力目录（deterministic 六指标固定组合 / llm_judge 就绪
 #   门控 / human online_forbidden），未注册组合不得宣称可执行
 # - create_definition：服务端构造 EvaluatorDefinition（白名单、未知参数拒
 #   绝、material_hash 服务端生成）、unsupported_capability、幂等与冲突
@@ -37,8 +37,13 @@ def store(tmp_path):
 
 @pytest.fixture
 def admin(store):
+    # T4：judge_ready 改为 async callable（组合根供给判定含 Provider
+    # secret 异步读取，无同步变体）
+    async def _judge_ready() -> bool:
+        return False
+
     return EvaluationAdminService(
-        store, judge_ready=lambda: False, service="dashboard"
+        store, judge_ready=_judge_ready, service="dashboard"
     )
 
 
@@ -104,8 +109,8 @@ async def _enable_usage(store, definition_id, version):
 
 
 class TestCapabilities:
-    def test_deterministic_entries_fixed_combos(self, admin):
-        catalog = admin.capabilities()
+    async def test_deterministic_entries_fixed_combos(self, admin):
+        catalog = await admin.capabilities()
         deterministic = [
             e for e in catalog["entries"] if e["method"] == "deterministic"
         ]
@@ -129,29 +134,35 @@ class TestCapabilities:
             for e in deterministic
         )
 
-    def test_judge_entries_gated_on_judge_ready(self, store):
+    async def test_judge_entries_gated_on_judge_ready(self, store):
+        async def _off() -> bool:
+            return False
+
         admin_off = EvaluationAdminService(
-            store, judge_ready=lambda: False, service="dashboard"
+            store, judge_ready=_off, service="dashboard"
         )
-        catalog = admin_off.capabilities()
+        catalog = await admin_off.capabilities()
         judge = [e for e in catalog["entries"] if e["method"] == "llm_judge"]
         assert judge
         assert all(e["judge_required"] is True for e in judge)
         assert all(e["executable"] is False for e in judge)
         assert catalog["judge_configured"] is False
 
+        async def _on() -> bool:
+            return True
+
         admin_on = EvaluationAdminService(
-            store, judge_ready=lambda: True, service="dashboard"
+            store, judge_ready=_on, service="dashboard"
         )
-        catalog_on = admin_on.capabilities()
+        catalog_on = await admin_on.capabilities()
         judge_on = [
             e for e in catalog_on["entries"] if e["method"] == "llm_judge"
         ]
         assert all(e["executable"] is True for e in judge_on)
         assert catalog_on["judge_configured"] is True
 
-    def test_human_entries_forbidden_online(self, admin):
-        catalog = admin.capabilities()
+    async def test_human_entries_forbidden_online(self, admin):
+        catalog = await admin.capabilities()
         human = [e for e in catalog["entries"] if e["method"] == "human"]
         assert human
         assert all(e["online_forbidden"] is True for e in human)
@@ -163,8 +174,8 @@ class TestCapabilities:
             "categorical",
         }
 
-    def test_no_unregistered_combo_claimed_executable(self, admin):
-        catalog = admin.capabilities()
+    async def test_no_unregistered_combo_claimed_executable(self, admin):
+        catalog = await admin.capabilities()
         executable = {
             (e["metric_name"], e["method"], e["target_kind"])
             for e in catalog["entries"]
@@ -256,9 +267,9 @@ class TestCreateDefinition:
             )
 
     async def test_llm_judge_validations(self, admin):
-        # 缺 judge_model（domain 不变量）
+        # 显式空串仍拒绝（空串 = 未声明，不是跟随默认；T4 起 None 合法）
         with pytest.raises(EvaluationValidationError):
-            await admin.create_definition(judge_payload(judge_model=None))
+            await admin.create_definition(judge_payload(judge_model=""))
         # 未知 judge 参数拒绝
         with pytest.raises(EvaluationValidationError):
             await admin.create_definition(
@@ -652,3 +663,109 @@ class TestSetDefinitionUsage:
                 "ghost.metric", "v1",
                 online_enabled=True, expected_revision=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# T5: llm_judge judge_model 新写入口校验（validate_model_name_string 单一来源）
+# ---------------------------------------------------------------------------
+
+
+class TestLlmJudgeModelNameValidation:
+    """judge_model 只在新写入口（create_definition）校验：非空字符串、
+    <=200 codepoints、无控制字符、无首尾空白；历史/冻结定义加载不重新
+    校验（load 路径不因规则收紧而破裂）。"""
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            " ",        # 全空白 -> 既有"必须声明"错误
+            "",         # 空串 -> 既有"必须声明"错误（空串 != 跟随默认）
+            " x",       # 首部空白 -> 校验器拒绝
+            "x ",       # 尾部空白 -> 校验器拒绝
+            "a\nb",     # 控制字符 -> 校验器拒绝
+            "x" * 201,  # 超长（BMP）
+            "a" * 200 + "\U00020000",  # 超长含非 BMP（按 codepoints 计）
+            123,        # 非字符串
+            True,
+        ],
+    )
+    async def test_invalid_judge_model_rejected(
+        self, admin, bad
+    ) -> None:
+        with pytest.raises(EvaluationValidationError):
+            await admin.create_definition(judge_payload(judge_model=bad))
+
+    async def test_none_judge_model_follows_default(self, admin) -> None:
+        """T4：judge_model=None（载荷缺省）= 跟随组合根默认供给，创建
+        成功且定义材料不含模型（后续 Provider 热切换不影响该定义）。"""
+        outcome = await admin.create_definition(
+            judge_payload(judge_model=None)
+        )
+        assert outcome["definition"]["judge_model"] is None
+        # 显式缺省（键不存在）同语义
+        payload = judge_payload()
+        payload.pop("judge_model")
+        omitted = await admin.create_definition(payload)
+        assert omitted["definition"]["judge_model"] is None
+
+    async def test_valid_judge_model_unchanged_behavior(self, admin) -> None:
+        outcome = await admin.create_definition(
+            judge_payload(judge_model="judge-model.v2-x")
+        )
+        # 原值保留：不静默 trim、不改写
+        assert outcome["definition"]["judge_model"] == "judge-model.v2-x"
+
+    async def test_material_independent_of_default_config(self, admin) -> None:
+        """默认模型配置变化不影响定义材料：judge_model 由载荷锁定，
+        material_hash 只含 rubric，两版本同材料 -> 同 hash。"""
+        first = await admin.create_definition(
+            judge_payload(
+                judge_params={"temperature": 0, "rubric": "same rubric"}
+            )
+        )
+        second = await admin.create_definition(
+            judge_payload(
+                version="v2",
+                judge_params={"temperature": 0, "rubric": "same rubric"},
+            )
+        )
+        assert first["definition"]["material_hash"] == (
+            second["definition"]["material_hash"]
+        )
+        assert first["definition"]["judge_model"] == (
+            second["definition"]["judge_model"]
+        )
+
+    async def test_frozen_definitions_not_revalidated_on_load(
+        self, admin
+    ) -> None:
+        """历史定义（judge_model 含首尾空白，新规则下非法写入）加载不
+        重新校验：list/detail 正常返回原值。"""
+        from app.domain.evaluation.models import EvaluatorDefinition
+
+        legacy = EvaluatorDefinition(
+            definition_id="legacy.judge",
+            version="v1",
+            metric_name="agent.answer_relevance",
+            target_kind="agent_run",
+            method="llm_judge",
+            required_fields=("request", "answer"),
+            evidence_policy="snapshot",
+            output_type="number",
+            range_or_categories=None,
+            direction="higher_is_better",
+            material_hash={},
+            judge_model=" legacy-model ",
+            judge_params={},
+            timeout_seconds=60,
+            budget=None,
+            ci_admissible=False,
+        )
+        await admin._evaluation_service.register_definition(legacy)
+        listed = await admin.list_definitions(method="llm_judge")
+        assert any(
+            item["definition_id"] == "legacy.judge"
+            for item in listed["items"]
+        )
+        detail = await admin.get_definition_detail("legacy.judge", "v1")
+        assert detail["definition"]["judge_model"] == " legacy-model "

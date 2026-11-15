@@ -852,10 +852,10 @@ class EvaluationService:
         """spec 8 正式指标目录的预设定义（v1，不可变；启动期幂等注册）。
 
         - deterministic 五个：worker 内建 handler 执行；
-        - llm_judge 四个：judge_model 取组合根 Judge Provider 配置；
-          domain 不变量要求 llm_judge 定义必须声明 judge_model，Judge
-          未配置（None）时只注册 deterministic 预设（llm_judge 定义无
-          法执行，注册即死条目）；
+        - llm_judge 四个：judge_model 取组合根 Judge 供给（env 基线或
+          None = 跟随组合根默认供给）；T4 起 Judge 未配置（None）也注册
+          llm_judge 预设——定义跟随默认供给，Provider 就绪后即可执行
+          （不再"注册即死条目"）；
         - human（feedback.helpful）单独注册，不在此清单。
         """
         defs: list[EvaluatorDefinition] = []
@@ -886,10 +886,6 @@ class EvaluationService:
                     ci_admissible=True,
                 )
             )
-        if not judge_model:
-            # Judge 未配置：llm_judge 定义必须声明 judge_model（domain
-            # 不变量），只注册 deterministic 预设
-            return cls._with_experiment_variants(tuple(defs))
         for preset in cls._PRESET_JUDGE:
             defs.append(
                 EvaluatorDefinition(

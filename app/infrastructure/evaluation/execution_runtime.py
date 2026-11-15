@@ -146,17 +146,26 @@ class ProfileRoutingTargetRunner:
         return result
 
 
-def build_execution_service(*, settings, holder, registry, chat, service, ledger, review, evidence, worker, config_service, session_prepare=None, scenario_memory_facts=None, browser_state_reader=None, browser_observer=None, resource_ledger=None, task_creator=None, task_reader=None, task_runs_reader=None, artifact_lister=None, workspace_file_reader=None, task_intent_before=None, task_intent_confirmed=None, task_intent_unknown=None, workspace_resource_observer=None, cli_runner=None, acp_runner=None):
+def build_execution_service(*, settings, holder, registry, chat, service, ledger, review, evidence, worker, config_service, session_prepare=None, scenario_memory_facts=None, browser_state_reader=None, browser_observer=None, resource_ledger=None, task_creator=None, task_reader=None, task_runs_reader=None, artifact_lister=None, workspace_file_reader=None, task_intent_before=None, task_intent_confirmed=None, task_intent_unknown=None, workspace_resource_observer=None, cli_runner=None, acp_runner=None, judge_state=None):
     async def readiness():
         current = holder.current_config
         worker_ready = worker.is_running
         enabled = config_service.current_sync().evaluation_enabled
-        judge_ready = bool(settings.evaluation_judge_provider_base_url and settings.evaluation_judge_provider_api_key and settings.evaluation_judge_provider_model)
+        # T4：组合根注入的 async Judge 状态 callable——每次 await 当前
+        # 有效供给状态（C 类 Provider 引用供给 OR env 基线），judge_model
+        # /self_judge 同用本次有效模型；未注入时回落 env-only 旧判据
+        if judge_state is not None:
+            state = await judge_state()
+            judge_ready = bool(state.get("ready"))
+            judge_model = state.get("model") or None
+        else:
+            judge_ready = bool(settings.evaluation_judge_provider_base_url and settings.evaluation_judge_provider_api_key and settings.evaluation_judge_provider_model)
+            judge_model = settings.evaluation_judge_provider_model or None
         return {
             "ready": bool(current and worker_ready and enabled), "worker_ready": worker_ready,
             "judge_ready": judge_ready, "target_model": current.model if current else None,
-            "judge_model": settings.evaluation_judge_provider_model or None,
-            "self_judge": bool(current and current.model == settings.evaluation_judge_provider_model),
+            "judge_model": judge_model,
+            "self_judge": bool(current and judge_model and current.model == judge_model),
             "supports_vision": bool(current and current.supports_vision),
             "config_fingerprint": await execution_configuration(settings, holder, registry),
         }

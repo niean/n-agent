@@ -12,8 +12,15 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import json
+import logging
+import uuid
+from datetime import timezone
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -58,7 +65,6 @@ def _settings(
     return Settings(**kwargs)
 
 
-@pytest.mark.asyncio
 async def test_scenario_artifact_record_reads_bounded_actual_content():
     from types import SimpleNamespace
     from app.main import _scenario_artifact_record
@@ -73,7 +79,6 @@ async def test_scenario_artifact_record_reads_bounded_actual_content():
     assert row["origin_ref"] == "workspace:report.md"
 
 
-@pytest.mark.asyncio
 async def test_scenario_memory_intent_precedes_write_and_failure_is_recoverable():
     from app.main import _scenario_prepare_memory
     events = []
@@ -92,7 +97,6 @@ async def test_scenario_memory_intent_precedes_write_and_failure_is_recoverable(
     assert events == ["intent", "write", "unknown"]
 
 
-@pytest.mark.asyncio
 async def test_scenario_worker_refs_use_agent_registry_not_task_run_integer():
     from app.main import _scenario_task_agent_runs
     class Registry:
@@ -738,6 +742,166 @@ def test_judge_without_call_ceiling_fails_fast(tmp_path: Path):
     assert services.evaluation_worker is not None
 
 
+async def test_enabled_judge_injects_default_supply_resolver(tmp_path, monkeypatch, caplog):
+    """T4 组合根：5 个 LLMJudgeEvaluator 注入 default_supply_resolver。
+
+    resolver 热读 evaluation_judge_provider_id（C 类 DB 覆盖）：
+    - 无引用 -> None（回落构造 env 基线）；
+    - 引用存在且 Provider 为 openai-compatible、base_url/model/secret
+      齐备 -> JudgeSupplyOverride（api_key 取自 registry.get_secret）；
+    - 引用清除（空串）后回落；
+    - get_provider / get_secret 异常 -> None + 固定诊断（不含 URL/密钥）；
+    - 等待中取消必须传播（CancelledError 不被吞）。"""
+    services = build_application_services(
+        _settings(tmp_path, evaluation_enabled=True)
+    )
+    from app.infrastructure.evaluation.judge_provider import (
+        JUDGE_EVALUATOR_FACTORIES,
+        LLMJudgeEvaluator,
+    )
+    from app.infrastructure.evaluation import JudgeSupplyOverride
+
+    by_metric = services.evaluation_worker._evaluator._by_metric
+    assert set(by_metric) == set(JUDGE_EVALUATOR_FACTORIES)
+    assert len(by_metric) == 5
+    assert all(isinstance(e, LLMJudgeEvaluator) for e in by_metric.values())
+    resolvers = [e._default_supply_resolver for e in by_metric.values()]
+    assert all(r is not None for r in resolvers)
+    # 同一组合根注入同一个 resolver 函数
+    assert len({id(r) for r in resolvers}) == 1
+    resolver = resolvers[0]
+
+    # 无引用（provider_id 空）-> None
+    assert await resolver() is None
+
+    # 引用完整 Provider -> JudgeSupplyOverride，api_key 来自 registry
+    from app.application.provider_service import ProviderCreateInput
+
+    created = await services.provider_service.create_provider(
+        ProviderCreateInput(
+            name="judge-provider",
+            base_url="https://judge.example.com/v1",
+            model="provider-judge-model",
+            api_key="sk-secret-1",
+        )
+    )
+    await services.evaluation_config_service.update(
+        {
+            "evaluation_judge_provider_id": created.id,
+            "evaluation_daily_call_ceiling": 10,
+        },
+        expected_version=0,
+        updated_by="test",
+    )
+    supply = await resolver()
+    assert isinstance(supply, JudgeSupplyOverride)
+    assert supply.base_url == "https://judge.example.com/v1"
+    assert supply.model == "provider-judge-model"
+    assert supply.api_key == "sk-secret-1"
+
+    # 热重载：删除引用（空串）后回落 None
+    await services.evaluation_config_service.update(
+        {"evaluation_judge_provider_id": ""},
+        expected_version=1,
+        updated_by="test",
+    )
+    assert await resolver() is None
+
+    # Provider 类型不符 -> None
+    other = await services.provider_service.create_provider(
+        ProviderCreateInput(
+            name="judge-provider-2",
+            base_url="https://judge.example.com/v1",
+            model="provider-judge-model",
+            api_key="sk-secret-2",
+        )
+    )
+    await services.provider_registry.update_provider(
+        other.id, provider_type="anthropic"
+    )
+    await services.evaluation_config_service.update(
+        {"evaluation_judge_provider_id": other.id},
+        expected_version=2,
+        updated_by="test",
+    )
+    assert await resolver() is None
+
+    # secret 缺失 -> None
+    await services.provider_registry.update_provider(
+        other.id, provider_type="openai-compatible", clear_api_key=True
+    )
+    assert await resolver() is None
+
+    # get_provider 异常 -> None + 固定诊断（不含 URL/密钥）
+    await services.evaluation_config_service.update(
+        {"evaluation_judge_provider_id": created.id},
+        expected_version=3,
+        updated_by="test",
+    )
+    original_get_provider = services.provider_service.get_provider
+
+    async def _boom_provider(provider_id):
+        raise RuntimeError("registry exploded")
+
+    monkeypatch.setattr(
+        services.provider_service, "get_provider", _boom_provider
+    )
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        assert await resolver() is None
+
+    # get_secret 异常 -> None + 同一固定诊断
+    monkeypatch.setattr(
+        services.provider_service, "get_provider", original_get_provider
+    )
+    original_get_secret = services.provider_registry.get_secret
+
+    async def _boom_secret(provider_id):
+        raise RuntimeError("secret store exploded")
+
+    monkeypatch.setattr(
+        services.provider_registry, "get_secret", _boom_secret
+    )
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        assert await resolver() is None
+    monkeypatch.setattr(
+        services.provider_registry, "get_secret", original_get_secret
+    )
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "app.main"
+    ]
+    assert sum(
+        "evaluation default judge supply resolution failed" in message
+        for message in messages
+    ) >= 2
+    blob = "\n".join(messages)
+    assert "sk-secret" not in blob
+    assert "judge.example.com" not in blob
+    assert "registry exploded" not in blob
+    assert "secret store exploded" not in blob
+
+    # resolver 等待中取消传播（CancelledError 不被吞、不产生 warning）
+    caplog.clear()
+
+    async def _cancelled():
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        services.evaluation_config_service, "current", _cancelled
+    )
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        with pytest.raises(asyncio.CancelledError):
+            await resolver()
+    assert not [
+        record
+        for record in caplog.records
+        if record.name == "app.main"
+        and "evaluation default judge supply resolution failed"
+        in record.getMessage()
+    ]
+
+
 @pytest.mark.parametrize('enabled', [False, True])
 def test_evaluation_availability_and_shell_routes(tmp_path: Path, enabled: bool):
     client = TestClient(create_app(_settings(tmp_path, evaluation_enabled=enabled)))
@@ -745,7 +909,7 @@ def test_evaluation_availability_and_shell_routes(tmp_path: Path, enabled: bool)
     assert response.status_code == 200
     assert response.json() == {'enabled': enabled}
     assert response.headers['cache-control'] == 'no-store'
-    for path in ('/evaluations', '/evaluations/datasets', '/evaluations/evaluators', '/evaluations/experiments', '/evaluations/results', '/evaluations/annotations', '/evaluations/review'):
+    for path in ('/evaluations', '/evaluations/datasets', '/evaluations/evaluators', '/evaluations/capabilities', '/evaluations/executions', '/evaluations/experiments', '/evaluations/results', '/evaluations/annotations', '/evaluations/review'):
         shell = client.get(path)
         assert shell.status_code == 200
         assert 'id="tab-evaluations"' in shell.text
@@ -759,11 +923,12 @@ def test_evaluation_availability_and_shell_routes(tmp_path: Path, enabled: bool)
 # ---------------------------------------------------------------------------
 
 
-def test_enabled_assembles_workbench_services(tmp_path: Path):
+async def test_enabled_assembles_workbench_services(tmp_path: Path):
     """T8：评估工作台三服务装配进 HTTP 组合根（ApplicationServices 可选
     新字段，默认 None）。
 
-    - admin：judge_ready 回调读 judge provider B 类配置状态；
+    - admin：judge_ready 为 async callable（T4：合并判定 env 三字段就绪
+      OR Provider 供给完整，secret 经 registry 异步读取）；
     - annotation：注入 evidence_reader / agent_run_lookup / tombstone_reader；
     - analytics：store 只读装配；
     - EvaluationServices 是 CLI 专用容器，不承载这些 HTTP 服务；
@@ -784,8 +949,9 @@ def test_enabled_assembles_workbench_services(tmp_path: Path):
     assert isinstance(
         services.evaluation_analytics_service, EvaluationAnalyticsService
     )
-    # Judge 未配置（B 类三字段空）-> judge_ready False；配置齐全 -> True
-    assert services.evaluation_admin_service._judge_ready() is False
+    # Judge 未配置（B 类三字段空、无 Provider 引用）-> judge_ready False；
+    # 配置齐全 -> True
+    assert await services.evaluation_admin_service._judge_ready() is False
     judge_dir = tmp_path / "judge"
     judge_dir.mkdir()
     ready = build_application_services(
@@ -798,7 +964,7 @@ def test_enabled_assembles_workbench_services(tmp_path: Path):
             evaluation_daily_call_ceiling=100,
         )
     )
-    assert ready.evaluation_admin_service._judge_ready() is True
+    assert await ready.evaluation_admin_service._judge_ready() is True
     # annotation 读侧接缝注入（证据 / 真实 Run / tombstone 门禁）
     assert services.evaluation_annotation_service._evidence_reader is not None
     assert (
@@ -1132,3 +1298,870 @@ def test_backfill_once_rolls_back_on_failure(tmp_path: Path, monkeypatch):
             assert row["usage"]["online_enabled"] is False
         else:
             assert row["usage"]["online_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# T5: judge-model 供给投影（组合根共享判定 + 端点字段绑定 + host 脱敏）
+# ---------------------------------------------------------------------------
+
+
+def _judge_model_settings(tmp_path: Path, **overrides) -> Settings:
+    return _settings(
+        tmp_path,
+        evaluation_enabled=True,
+        **overrides,
+    )
+
+
+class _NullProviderService:
+    """投影测试假 ProviderService：无任何 Provider 记录。"""
+
+    async def get_provider(self, provider_id: str) -> None:
+        return None
+
+
+class _NullSecretRegistry:
+    """投影测试假 registry：无密钥（空 id 时不应被触达）。"""
+
+    async def get_secret(self, provider_id: str) -> None:
+        return None
+
+
+async def _judge_projection(
+    resolved: Any,
+    settings: Settings,
+    *,
+    provider_service: Any = None,
+    registry: Any = None,
+) -> dict[str, Any]:
+    """调用组合根投影（缺省注入空查表假实现）。"""
+    import app.main as main_module
+
+    return await main_module._judge_supply_projection(
+        resolved,
+        settings,
+        provider_service=(
+            provider_service if provider_service is not None
+            else _NullProviderService()
+        ),
+        registry=(
+            registry if registry is not None else _NullSecretRegistry()
+        ),
+    )
+
+
+async def _resolved_for(tmp_path: Path, settings: Settings) -> Any:
+    """以真实 EvaluationConfigService 产出 resolved 快照（无 DB 行）。"""
+    from app.infrastructure.evaluation.config_store import (
+        SqliteEvaluationConfigStore,
+    )
+
+    config_service = EvaluationConfigService(
+        settings,
+        SqliteEvaluationConfigStore(str(Path(tmp_path) / "config.db")),
+    )
+    return await config_service.get_resolved()
+
+
+async def test_judge_supply_projection_env_baseline_redacts_provider_base_url(
+    tmp_path: Path,
+):
+    """供给投影只暴露 host：凭据/端口/路径/查询串/片段/API Key 一律不
+    出现；env 基线就绪时 supply_source=env、effective_model 取基线模型。"""
+    settings = _judge_model_settings(
+        tmp_path,
+        evaluation_judge_provider_base_url=(
+            "http://user:secret@127.0.0.1:9999/v1?q=1#frag"
+        ),
+        evaluation_judge_provider_api_key="sk-test",
+        evaluation_judge_provider_model="env-judge-model",
+        evaluation_daily_call_ceiling=10,
+    )
+    projection = await _judge_projection(
+        await _resolved_for(tmp_path, settings), settings
+    )
+    assert projection["judge_ready"] is True
+    assert projection["supply_source"] == "env"
+    assert projection["effective_model"] == "env-judge-model"
+    assert projection["env_baseline_model"] == "env-judge-model"
+    assert projection["provider_base_url_host"] == "http://127.0.0.1"
+    assert projection["default_provider_id"] == ""
+    assert projection["config_version"] == 0
+    assert projection["default_provider_missing"] is False
+    assert projection["default_provider_name"] is None
+    assert projection["default_provider_model"] is None
+    blob = json.dumps(projection)
+    assert "user:secret" not in blob
+    assert "9999" not in blob
+    assert "/v1" not in blob
+    assert "q=1" not in blob
+    assert "sk-test" not in blob
+    # 原始 URL 绝不回显
+    assert "user:secret@127.0.0.1:9999/v1?q=1#frag" not in blob
+
+
+async def test_judge_supply_projection_env_empty_safe_defaults(
+    tmp_path: Path,
+):
+    """env 全空且未设置 Provider 引用：无供给安全缺省。"""
+    settings = _judge_model_settings(tmp_path)
+    projection = await _judge_projection(
+        await _resolved_for(tmp_path, settings), settings
+    )
+    assert projection["judge_ready"] is False
+    assert projection["supply_source"] is None
+    assert projection["effective_model"] is None
+    assert projection["env_baseline_model"] is None
+    assert projection["provider_base_url_host"] is None
+    assert projection["default_provider_id"] == ""
+    assert projection["default_provider_missing"] is False
+    assert projection["default_provider_name"] is None
+    assert projection["default_provider_model"] is None
+
+
+async def test_judge_supply_projection_provider_hit(tmp_path: Path):
+    """Provider 命中：supply_source=provider，host 取 provider.base_url
+    脱敏，effective_model 取供给模型；env 基线仍单独投影（此处为空）。"""
+    from app.application.provider_service import ProviderCreateInput
+
+    services = build_application_services(_judge_model_settings(tmp_path))
+    created = await services.provider_service.create_provider(
+        ProviderCreateInput(
+            name="judge-provider",
+            base_url=(
+                "https://user:pw@judge.example.com:8443/v1/chat?x=1#frag"
+            ),
+            model="provider-judge-model",
+            api_key="sk-provider-secret",
+        )
+    )
+    await services.evaluation_config_service.update(
+        {
+            "evaluation_judge_provider_id": created.id,
+            "evaluation_daily_call_ceiling": 10,
+        },
+        expected_version=0,
+        updated_by="test",
+    )
+    projection = await _judge_projection(
+        await services.evaluation_config_service.get_resolved(),
+        services.settings,
+        provider_service=services.provider_service,
+        registry=services.provider_registry,
+    )
+    assert projection["judge_ready"] is True
+    assert projection["supply_source"] == "provider"
+    assert projection["effective_model"] == "provider-judge-model"
+    assert projection["provider_base_url_host"] == (
+        "https://judge.example.com"
+    )
+    assert projection["default_provider_id"] == created.id
+    assert projection["config_version"] == 1
+    assert projection["default_provider_name"] == "judge-provider"
+    assert projection["default_provider_model"] == "provider-judge-model"
+    assert projection["default_provider_missing"] is False
+    assert projection["env_baseline_model"] is None
+    blob = json.dumps(projection)
+    assert "user:pw" not in blob
+    assert "8443" not in blob
+    assert "/v1" not in blob
+    assert "sk-provider-secret" not in blob
+
+
+async def test_judge_supply_projection_provider_record_missing(
+    tmp_path: Path,
+):
+    """非空 id 但记录不存在：default_provider_missing=True（如实投影，
+    不冒充其他失败形态）；env 全空时无供给。"""
+    services = build_application_services(_judge_model_settings(tmp_path))
+    await services.evaluation_config_service.update(
+        {
+            "evaluation_judge_provider_id": "m1",
+            "evaluation_daily_call_ceiling": 10,
+        },
+        expected_version=0,
+        updated_by="test",
+    )
+    projection = await _judge_projection(
+        await services.evaluation_config_service.get_resolved(),
+        services.settings,
+        provider_service=services.provider_service,
+        registry=services.provider_registry,
+    )
+    assert projection["default_provider_id"] == "m1"
+    assert projection["default_provider_missing"] is True
+    assert projection["default_provider_name"] is None
+    assert projection["default_provider_model"] is None
+    assert projection["judge_ready"] is False
+    assert projection["supply_source"] is None
+    assert projection["effective_model"] is None
+    assert projection["provider_base_url_host"] is None
+
+
+async def test_judge_supply_projection_provider_secret_missing(
+    tmp_path: Path,
+):
+    """记录存在但缺密钥：不构成供给（supply_source=None），但记录本身
+    不算 missing，name/model 照常投影。"""
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    from app.domain.provider import ProviderConfig
+    from app.infrastructure.registry.sqlite_provider_registry import (
+        SQLiteProviderRegistry,
+    )
+
+    registry = SQLiteProviderRegistry(tmp_path / "sessions.db")
+    now = _datetime(2026, 1, 1, tzinfo=_timezone.utc)
+    created = await registry.create_provider(
+        ProviderConfig(
+            id="",
+            name="no-secret",
+            provider_type="openai-compatible",
+            base_url="https://judge.example.com/v1",
+            model="m",
+            api_key_present=False,
+            is_active=False,
+            extra_headers=None,
+            created_at=now,
+            updated_at=now,
+        ),
+        "",
+    )
+    services = build_application_services(_judge_model_settings(tmp_path))
+    await services.evaluation_config_service.update(
+        {
+            "evaluation_judge_provider_id": created.id,
+            "evaluation_daily_call_ceiling": 10,
+        },
+        expected_version=0,
+        updated_by="test",
+    )
+    projection = await _judge_projection(
+        await services.evaluation_config_service.get_resolved(),
+        services.settings,
+        provider_service=services.provider_service,
+        registry=services.provider_registry,
+    )
+    assert projection["default_provider_missing"] is False
+    assert projection["default_provider_name"] == "no-secret"
+    assert projection["default_provider_model"] == "m"
+    assert projection["judge_ready"] is False
+    assert projection["supply_source"] is None
+    assert projection["effective_model"] is None
+    assert projection["provider_base_url_host"] is None
+
+
+async def test_judge_supply_projection_anthropic_provider_not_eligible(
+    tmp_path: Path,
+):
+    """provider_type 非 openai-compatible（Anthropic）：不构成 Judge 供给，
+    但记录不算 missing，name/model 照常投影。"""
+    from app.application.provider_service import ProviderCreateInput
+
+    services = build_application_services(_judge_model_settings(tmp_path))
+    created = await services.provider_service.create_provider(
+        ProviderCreateInput(
+            name="anthropic-judge",
+            base_url="https://api.anthropic.com",
+            model="claude-3",
+            api_key="sk-ant",
+            provider_type="anthropic",
+        )
+    )
+    await services.evaluation_config_service.update(
+        {
+            "evaluation_judge_provider_id": created.id,
+            "evaluation_daily_call_ceiling": 10,
+        },
+        expected_version=0,
+        updated_by="test",
+    )
+    projection = await _judge_projection(
+        await services.evaluation_config_service.get_resolved(),
+        services.settings,
+        provider_service=services.provider_service,
+        registry=services.provider_registry,
+    )
+    assert projection["default_provider_missing"] is False
+    assert projection["default_provider_name"] == "anthropic-judge"
+    assert projection["default_provider_model"] == "claude-3"
+    assert projection["judge_ready"] is False
+    assert projection["supply_source"] is None
+    assert projection["effective_model"] is None
+    assert projection["provider_base_url_host"] is None
+
+
+def test_judge_supply_projection_registry_error_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """registry 读取异常：投影路径不吞错（向上传播，端点按既有系统错误
+    映射 500，不伪装缺失）；供给闭包外层捕获回落 None——共享判定但不
+    共享吞错策略。"""
+    from app.application.provider_service import ProviderCreateInput
+
+    async def _case() -> None:
+        services = build_application_services(_judge_model_settings(tmp_path))
+        created = await services.provider_service.create_provider(
+            ProviderCreateInput(
+                name="judge-provider",
+                base_url="https://judge.example.com/v1",
+                model="provider-judge-model",
+                api_key="sk-x",
+            )
+        )
+        await services.evaluation_config_service.update(
+            {
+                "evaluation_judge_provider_id": created.id,
+                "evaluation_daily_call_ceiling": 10,
+            },
+            expected_version=0,
+            updated_by="test",
+        )
+
+        async def boom(provider_id: str) -> None:
+            raise RuntimeError("registry unavailable")
+
+        monkeypatch.setattr(
+            services.provider_registry, "get_secret", boom
+        )
+
+        import app.main as main_module
+
+        resolved = await services.evaluation_config_service.get_resolved()
+        with pytest.raises(RuntimeError, match="registry unavailable"):
+            await main_module._judge_supply_projection(
+                resolved,
+                services.settings,
+                provider_service=services.provider_service,
+                registry=services.provider_registry,
+            )
+
+        # 供给闭包（运行 resolver）外层吞错回落 None
+        evaluator = next(
+            iter(services.evaluation_worker._evaluator._by_metric.values())
+        )
+        assert await evaluator._default_supply_resolver() is None
+
+    asyncio.run(_case())
+
+
+def test_judge_supply_host_redaction_parameterized():
+    """host 脱敏参数化：仅保留 scheme://host（IPv6 保留方括号），剥离
+    userinfo/端口/path/query/fragment；解析失败/无 scheme/无 host -> None。"""
+    import app.main as main_module
+
+    cases = [
+        ("http://user:secret@127.0.0.1:9999/v1?q=1#f", "http://127.0.0.1"),
+        ("https://judge.example.com:8443/x?y=2#z", "https://judge.example.com"),
+        ("http://[::1]:8201", "http://[::1]"),
+        ("http://[2001:db8::1]:8080/v1", "http://[2001:db8::1]"),
+        ("", None),
+        ("http://[", None),
+        ("//127.0.0.1:9999/v1", None),
+        ("http:///v1", None),
+    ]
+    for raw, expected in cases:
+        assert main_module._redact_base_url_host(raw) == expected, raw
+
+
+def test_judge_model_endpoint_disabled_route_not_registered(tmp_path: Path):
+    """B 类总闸关闭：路由未注册 -> 404（与 producer 端点同 gating）。"""
+    app = create_app(_settings(tmp_path))
+    client = TestClient(app)
+    resp = client.get("/chat/evaluations/judge-model")
+    assert resp.status_code == 404
+
+
+def test_judge_model_endpoint_env_empty_readiness_and_default_patch(
+    tmp_path: Path,
+):
+    """judge 三字段全空：无供给 judge_ready False；C 类覆盖设置非空 id
+    但记录不存在 -> default_provider_missing=True（缺失如实投影）。"""
+    app = create_app(_judge_model_settings(tmp_path))
+    client = TestClient(app)
+    resp = client.get("/chat/evaluations/judge-model")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["judge_ready"] is False
+    assert body["supply_source"] is None
+    assert body["effective_model"] is None
+    assert body["provider_base_url_host"] is None
+    assert body["default_provider_id"] == ""
+    assert body["default_provider_missing"] is False
+
+    # T4：C 类覆盖字段为 evaluation_judge_provider_id（T1 语义）；首次
+    # 设置 id 且同 PATCH 设正数预算（domain 统一预算条件）
+    patch = client.patch(
+        "/chat/evaluations/config",
+        json={
+            "patch": {
+                "evaluation_judge_provider_id": "m1",
+                "evaluation_daily_call_ceiling": 10,
+            },
+            "expected_version": 0,
+        },
+    )
+    assert patch.status_code == 200
+    after = client.get("/chat/evaluations/judge-model").json()
+    assert after["default_provider_id"] == "m1"
+    # 记录不存在 -> 如实 missing（非伪装、非安全缺省 False）
+    assert after["default_provider_missing"] is True
+    assert after["default_provider_name"] is None
+    assert after["default_provider_model"] is None
+    # readiness 不受 C 覆盖影响（env 全空且记录缺失，无供给）
+    assert after["judge_ready"] is False
+    assert after["supply_source"] is None
+    assert after["provider_base_url_host"] is None
+
+
+def test_judge_model_endpoint_env_ready_hides_credentials(tmp_path: Path):
+    """judge env 三字段齐备：judge_ready True；host 脱敏不回显凭据。"""
+    app = create_app(
+        _judge_model_settings(
+            tmp_path,
+            evaluation_judge_provider_base_url=(
+                "http://user:secret@127.0.0.1:9999/v1"
+            ),
+            evaluation_judge_provider_api_key="sk-test",
+            evaluation_judge_provider_model="env-judge",
+            evaluation_daily_call_ceiling=10,
+        )
+    )
+    client = TestClient(app)
+    resp = client.get("/chat/evaluations/judge-model")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["judge_ready"] is True
+    assert body["supply_source"] == "env"
+    assert body["effective_model"] == "env-judge"
+    assert body["env_baseline_model"] == "env-judge"
+    assert body["provider_base_url_host"] == "http://127.0.0.1"
+    assert body["default_provider_id"] == ""
+    assert body["default_provider_missing"] is False
+    blob = str(body)
+    assert "user:secret" not in blob
+    assert "sk-test" not in blob
+    assert "9999" not in blob
+
+
+def test_judge_model_endpoint_provider_hit(tmp_path: Path):
+    """Provider 命中端到端：host 取 provider.base_url 脱敏，
+    supply_source=provider；default_provider_id 与 config_version 同一
+    resolved 绑定；密钥不进响应。"""
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    from app.domain.provider import ProviderConfig
+    from app.infrastructure.registry.sqlite_provider_registry import (
+        SQLiteProviderRegistry,
+    )
+
+    async def _seed() -> None:
+        registry = SQLiteProviderRegistry(tmp_path / "sessions.db")
+        now = _datetime(2026, 1, 1, tzinfo=_timezone.utc)
+        await registry.create_provider(
+            ProviderConfig(
+                id="judge-p1",
+                name="judge-provider",
+                provider_type="openai-compatible",
+                base_url=(
+                    "https://user:pw@judge.example.com:8443/v1?x=1#f"
+                ),
+                model="provider-judge-model",
+                api_key_present=True,
+                is_active=False,
+                extra_headers=None,
+                created_at=now,
+                updated_at=now,
+            ),
+            "sk-secret-1",
+        )
+
+    asyncio.run(_seed())
+    app = create_app(_judge_model_settings(tmp_path))
+    client = TestClient(app)
+    patch = client.patch(
+        "/chat/evaluations/config",
+        json={
+            "patch": {
+                "evaluation_judge_provider_id": "judge-p1",
+                "evaluation_daily_call_ceiling": 10,
+            },
+            "expected_version": 0,
+        },
+    )
+    assert patch.status_code == 200
+    resp = client.get("/chat/evaluations/judge-model")
+    assert resp.status_code == 200
+    assert resp.headers["cache-control"] == "no-store"
+    body = resp.json()
+    assert body["judge_ready"] is True
+    assert body["supply_source"] == "provider"
+    assert body["effective_model"] == "provider-judge-model"
+    assert body["provider_base_url_host"] == "https://judge.example.com"
+    assert body["default_provider_id"] == "judge-p1"
+    assert body["default_provider_name"] == "judge-provider"
+    assert body["default_provider_model"] == "provider-judge-model"
+    assert body["default_provider_missing"] is False
+    assert body["config_version"] == 1
+    assert body["env_baseline_model"] is None
+    blob = str(body)
+    assert "user:pw" not in blob
+    assert "8443" not in blob
+    assert "sk-secret-1" not in blob
+
+
+def test_judge_model_endpoint_registry_error_maps_to_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """registry 读取异常：投影路径按既有系统错误映射 500 internal_error
+    （不伪装缺失），响应含 no-store。"""
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    from app.domain.provider import ProviderConfig
+    from app.infrastructure.registry.sqlite_provider_registry import (
+        SQLiteProviderRegistry,
+    )
+
+    async def _seed() -> None:
+        registry = SQLiteProviderRegistry(tmp_path / "sessions.db")
+        now = _datetime(2026, 1, 1, tzinfo=_timezone.utc)
+        await registry.create_provider(
+            ProviderConfig(
+                id="judge-p1",
+                name="judge-provider",
+                provider_type="openai-compatible",
+                base_url="https://judge.example.com/v1",
+                model="provider-judge-model",
+                api_key_present=True,
+                is_active=False,
+                extra_headers=None,
+                created_at=now,
+                updated_at=now,
+            ),
+            "sk-secret-1",
+        )
+
+    asyncio.run(_seed())
+    app = create_app(_judge_model_settings(tmp_path))
+    client = TestClient(app)
+    patch = client.patch(
+        "/chat/evaluations/config",
+        json={
+            "patch": {
+                "evaluation_judge_provider_id": "judge-p1",
+                "evaluation_daily_call_ceiling": 10,
+            },
+            "expected_version": 0,
+        },
+    )
+    assert patch.status_code == 200
+
+    original = SQLiteProviderRegistry.get_secret
+
+    async def flaky(self: Any, provider_id: str) -> str:
+        if provider_id == "judge-p1":
+            raise RuntimeError("registry unavailable")
+        return await original(self, provider_id)
+
+    monkeypatch.setattr(SQLiteProviderRegistry, "get_secret", flaky)
+
+    resp = client.get("/chat/evaluations/judge-model")
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "internal_error"
+    assert resp.headers["cache-control"] == "no-store"
+
+
+# ---------------------------------------------------------------------------
+# T4: 组合根装配、就绪与预算（Provider 供给 + 启动预算校验 + worker 集成）
+# ---------------------------------------------------------------------------
+
+
+def _write_raw_provider_id_zero_ceiling_row(tmp_path: Path) -> None:
+    """存量覆盖造数（provider_id 非空 + ceiling=0）：CAS update 造数会被
+    统一预算条件拦截，用原始 SQL 模拟"规则生效前落库"的存量数据。"""
+    import json as _json
+    import sqlite3
+
+    import app.main as main_module
+    from app.infrastructure.evaluation.config_store import (
+        SqliteEvaluationConfigStore,
+    )
+
+    db_path = tmp_path / "evaluations.db"
+    SqliteEvaluationConfigStore(str(db_path))  # 确保表已建
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO evaluation_config (id, config_json, version, "
+            "updated_at, updated_by) VALUES (1, ?, 7, ?, ?)",
+            (
+                _json.dumps(
+                    {
+                        "evaluation_judge_provider_id": "provider-a",
+                        "evaluation_daily_call_ceiling": 0,
+                    }
+                ),
+                "2026-01-01T00:00:00+00:00",
+                "pre-rule-writer",
+            ),
+        )
+
+
+def test_startup_provider_reference_with_zero_ceiling_fails_fast(tmp_path: Path):
+    """T4 启动预算校验：持久化覆盖 provider_id 非空但 ceiling 0 -> 启动
+    ValueError（严格 get_resolved 校验，current 的非法覆盖回退不得掩盖
+    "有引用无预算"）。"""
+    _write_raw_provider_id_zero_ceiling_row(tmp_path)
+    with pytest.raises(ValueError, match="evaluation_daily_call_ceiling"):
+        build_application_services(
+            _settings(tmp_path, evaluation_enabled=True)
+        )
+
+
+def test_startup_partial_judge_env_fails_fast_even_with_complete_provider(
+    tmp_path: Path,
+):
+    """T4：B 类三字段部分提供仍 fail-fast——即使 registry 已有完整
+    Provider（partial env 是装配错误，不是"未配置"）。"""
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    from app.domain.provider import ProviderConfig
+    from app.infrastructure.registry.sqlite_provider_registry import (
+        SQLiteProviderRegistry,
+    )
+
+    async def _seed() -> None:
+        registry = SQLiteProviderRegistry(tmp_path / "sessions.db")
+        now = _datetime(2026, 1, 1, tzinfo=_timezone.utc)
+        await registry.create_provider(
+            ProviderConfig(
+                id="",
+                name="judge-provider",
+                provider_type="openai-compatible",
+                base_url="https://judge.example.com/v1",
+                model="provider-judge-model",
+                api_key_present=True,
+                is_active=False,
+                extra_headers=None,
+                created_at=now,
+                updated_at=now,
+            ),
+            "sk-secret-1",
+        )
+
+    asyncio.run(_seed())
+    with pytest.raises(ValueError, match="必须同时"):
+        build_application_services(
+            _settings(
+                tmp_path,
+                evaluation_enabled=True,
+                evaluation_judge_provider_base_url="https://judge.example.com",
+                # api_key / model 缺失 -> partial env
+            )
+        )
+
+
+class _FakeJudgeTransport(httpx.AsyncBaseTransport):
+    """零网络 Judge transport：计数请求并返回固定结构化输出。"""
+
+    def __init__(self) -> None:
+        self.calls: list[httpx.Request] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls.append(request)
+        content = json.dumps(
+            {"value": 1, "reason": "ok", "evidence_refs": []}
+        )
+        return httpx.Response(
+            200,
+            json={
+                "model": "provider-judge-model",
+                "choices": [
+                    {
+                        "message": {"content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            },
+            request=request,
+        )
+
+
+class _MemoryEvidenceStore:
+    """内存 EvidenceStore：按 ref 存取 EvidenceSnapshot。"""
+
+    def __init__(self) -> None:
+        self._snapshots: dict[str, Any] = {}
+
+    def put(self, snapshot: Any) -> str:
+        ref = f"snapshots/{uuid.uuid4().hex}"
+        self._snapshots[ref] = snapshot
+        return ref
+
+    async def load_snapshot(self, snapshot_ref: str) -> Any:
+        return self._snapshots[snapshot_ref]
+
+
+async def test_worker_provider_supply_roundtrip_with_budget(tmp_path: Path):
+    """T4 worker 集成：真实 dispatch + worker 跑 Provider 请求。
+
+    - Provider 引用就绪：job 成功，reserve/settle 日预算账本仍执行，
+      Judge 网络请求恰好一次（fake transport 计数）；
+    - 清除引用且 env 全空：下一 job permanent_error 终结（不重试、
+      零网络），后续 job 继续处理；
+    - 重新设置 Provider：恢复成功。"""
+    from app.application.evaluation_service import (
+        DefinitionKey,
+        EvaluationService,
+        SubmitSampleRequest,
+    )
+    from app.domain.evaluation.models import (
+        EvaluatorDefinition,
+        EvaluationTarget,
+        EvidenceSnapshot,
+    )
+
+    services = build_application_services(
+        _settings(tmp_path, evaluation_enabled=True)
+    )
+    from app.application.provider_service import ProviderCreateInput
+
+    created = await services.provider_service.create_provider(
+        ProviderCreateInput(
+            name="judge-provider",
+            base_url="https://judge.example.com/v1",
+            model="provider-judge-model",
+            api_key="sk-worker-secret",
+        )
+    )
+
+    async def set_reference(provider_id: str, version: int) -> None:
+        await services.evaluation_config_service.update(
+            {
+                "evaluation_judge_provider_id": provider_id,
+                "evaluation_daily_call_ceiling": 10,
+            },
+            expected_version=version,
+            updated_by="test",
+        )
+
+    await set_reference(created.id, 0)
+
+    # 零网络：替换全部 Judge 适配器的 transport（组合根真 evaluator，
+    # 供给 resolver 仍走组合根闭包）
+    transport = _FakeJudgeTransport()
+    for evaluator in (
+        services.evaluation_worker._evaluator._by_metric.values()
+    ):
+        evaluator._transport = transport
+
+    # worker 证据库换内存 fake（组合根 LocalEvidenceStore 面向捕获流，
+    # 集成测试只关心快照按 ref 可读）
+    evidence = _MemoryEvidenceStore()
+    services.evaluation_worker._evidence_store = evidence
+
+    store = services.evaluation_store
+    ledger = EvaluationService(store, enabled=True)
+    definition = EvaluatorDefinition(
+        definition_id="agent.answer_correctness",
+        version="v1",
+        metric_name="agent.answer_correctness",
+        target_kind="agent_run",
+        method="llm_judge",
+        required_fields=(),
+        evidence_policy="snapshot",
+        output_type="number",
+        range_or_categories=None,
+        direction="higher_is_better",
+        material_hash={},
+        judge_model=None,  # T4：跟随组合根默认供给
+        judge_params={},
+        timeout_seconds=60,
+        budget=None,
+        ci_admissible=False,
+    )
+    await ledger.register_definition(definition)
+
+    async def submit_job() -> str:
+        snapshot = EvidenceSnapshot(
+            content={
+                "request": "q",
+                "answer": "a",
+                "reference": "r",
+            },
+            redaction_version="redaction.v1",
+        )
+        ref = evidence.put(snapshot)
+        target = EvaluationTarget(
+            service="n-agent",
+            kind="agent_run",
+            subject_id=f"subject-{uuid.uuid4().hex[:6]}",
+            subject_revision="rev-1",
+        )
+        outcome = await ledger.submit_sample(
+            SubmitSampleRequest(
+                producer_event_id=f"evt-{uuid.uuid4().hex[:12]}",
+                service="n-agent",
+                target=target,
+                snapshot_ref=ref,
+                snapshot_hash="a" * 64,
+                definitions=(
+                    DefinitionKey(definition.definition_id, definition.version),
+                ),
+            )
+        )
+        assert len(outcome.job_ids) == 1
+        return outcome.job_ids[0]
+
+    async def run_until_terminal(job_id: str) -> dict[str, Any]:
+        for _ in range(200):
+            row = await store.get_job(job_id)
+            if row["status"] in {"succeeded", "skipped", "error", "cancelled"}:
+                return row
+            await asyncio.sleep(0.01)
+        raise AssertionError("job did not reach terminal state")
+
+    # 1) Provider 就绪：job 成功 + 预算账本仍执行 + Provider 请求恰一次
+    job_1 = await submit_job()
+    await services.evaluation_worker.run_once()
+    row_1 = await run_until_terminal(job_1)
+    assert row_1["status"] == "succeeded"
+    assert len(transport.calls) == 1
+    budget = await store.get_daily_budget(
+        datetime.datetime.now(tz=timezone.utc).date().isoformat()
+    )
+    assert budget["settled_calls"] == 1
+
+    # 2) 清除引用且 env 全空：下一 job permanent_error、不重试、零网络
+    await services.evaluation_config_service.update(
+        {"evaluation_judge_provider_id": ""},
+        expected_version=1,
+        updated_by="test",
+    )
+    job_2 = await submit_job()
+    await services.evaluation_worker.run_once()
+    row_2 = await run_until_terminal(job_2)
+    assert row_2["status"] == "error"
+    attempts = await store.list_attempts(job_2)
+    judged = [a for a in attempts if a.get("ended_at")]
+    assert len(judged) == 1  # 不重试
+    assert judged[0]["error_type"] == "permanent_error"
+    assert len(transport.calls) == 1  # 零网络
+    # 后续 job 继续处理（worker 不卡死）
+    job_3 = await submit_job()
+    await services.evaluation_worker.run_once()
+    row_3 = await run_until_terminal(job_3)
+    assert row_3["status"] == "error"
+    assert len(transport.calls) == 1
+
+    # 3) 重新设置 Provider：恢复成功
+    await set_reference(created.id, 2)
+    job_4 = await submit_job()
+    await services.evaluation_worker.run_once()
+    row_4 = await run_until_terminal(job_4)
+    assert row_4["status"] == "succeeded"
+    assert len(transport.calls) == 2

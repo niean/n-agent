@@ -276,11 +276,27 @@ class TestEvaluatorDefinition:
         definition = EvaluatorDefinition(**kwargs)
         assert definition.judge_model == "gpt-4o-mini"
 
-    def test_llm_judge_requires_judge_model(self):
+    def test_llm_judge_rejects_empty_judge_model(self):
+        """T4：llm_judge 显式空串仍拒绝（空串=未声明，不是跟随默认）。"""
         kwargs = _valid_definition_kwargs()
         kwargs["method"] = "llm_judge"
+        kwargs["judge_model"] = ""
         with pytest.raises(EvaluationValidationError):
             EvaluatorDefinition(**kwargs)
+
+    def test_llm_judge_allows_none_follows_default(self):
+        """T4：judge_model=None 表示跟随组合根默认供给（Provider/env
+        基线），domain 不变量不再强制 llm_judge 声明模型。"""
+        kwargs = _valid_definition_kwargs()
+        kwargs["method"] = "llm_judge"
+        kwargs["judge_params"] = {"temperature": 0}
+        definition = EvaluatorDefinition(**kwargs)
+        assert definition.judge_model is None
+
+    def test_non_judge_methods_reject_judge_model_string(self):
+        """非 llm_judge 方法的 judge_model 语义不变（None 合法）。"""
+        kwargs = _valid_definition_kwargs()
+        assert EvaluatorDefinition(**kwargs).judge_model is None
 
     @pytest.mark.parametrize(
         "field, bad",

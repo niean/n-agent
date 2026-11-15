@@ -56,6 +56,21 @@ class TestNavigationRegistration:
             assert "topnavParent: 'evaluations-" + view + "'" in entry
             assert "scope: '" + view + "'" in entry
 
+    def test_executions_route_shares_experiments_subdomain(self) -> None:
+        """执行任务是实验子域的独立 routeConfig entry：独立 path/tab/scope，
+        但 sidebarTab/topnavParent 归属 experiments，与能力目录同范式。"""
+        content = _read("management-navigation.js")
+        match = re.search(
+            r"\{ paths: \['/evaluations/executions'\][^}]*}", content
+        )
+        assert match is not None
+        entry = match.group(0)
+        assert "tab: 'evaluations-executions'" in entry
+        assert "renderTab: 'evaluations'" in entry
+        assert "sidebarTab: 'evaluations-experiments'" in entry
+        assert "topnavParent: 'evaluations-experiments'" in entry
+        assert "scope: 'executions'" in entry
+
     def test_evaluations_is_independent_parent(self) -> None:
         content = _read("management-navigation.js")
         observations = re.search(r"tab: 'observations'.*?children: \[([^\]]*)\]", content)
@@ -73,17 +88,108 @@ class TestNavigationRegistration:
         assert topnav_m is not None, "缺少 topnavConfig"
         assert "evaluations" in topnav_m.group(1)
 
-    def test_topnav_evaluators_annotations_single_element_scopes(self) -> None:
-        """新增两页顶导：单元素数组、concern 'evaluation'、scope 各自归属。"""
+    def test_topnav_annotations_single_element_scope(self) -> None:
+        """人工标注页顶导：单元素数组、concern 'evaluation'、scope 各自归属。"""
         content = _read("management-navigation.js")
-        for view in ("evaluators", "annotations"):
-            m = re.search(r"'evaluations-" + view + r"': \[(.*?)\n    \]", content, re.S)
-            assert m is not None, f"topnavConfig 缺少 evaluations-{view}"
-            block = m.group(1)
-            assert block.count("{ tab:") == 1, f"evaluations-{view} 顶导必须是单元素数组"
-            assert "concern: 'evaluation'" in block
-            assert "scope: '" + view + "'" in block
-            assert "topnavParent: 'evaluations-" + view + "'" in block
+        m = re.search(r"'evaluations-annotations': \[(.*?)\n    \]", content, re.S)
+        assert m is not None, "topnavConfig 缺少 evaluations-annotations"
+        block = m.group(1)
+        assert block.count("{ tab:") == 1, "evaluations-annotations 顶导必须是单元素数组"
+        assert "concern: 'evaluation'" in block
+        assert "scope: 'annotations'" in block
+        assert "topnavParent: 'evaluations-annotations'" in block
+
+    def test_topnav_evaluators_has_three_entries(self) -> None:
+        """评估器左导子域顶导三入口：能力目录 + 评估器 + 模型，顺序固定，
+        共享 topnavParent，各自独立 path/scope（同 /tasks/observations 范式）。"""
+        content = _read("management-navigation.js")
+        m = re.search(r"'evaluations-evaluators': \[(.*?)\n    \]", content, re.S)
+        assert m is not None, "topnavConfig 缺少 evaluations-evaluators"
+        block = m.group(1)
+        assert block.count("{ tab:") == 3, "评估器子域顶导必须是三元素数组"
+        cap_m = re.search(
+            r"\{ tab: 'evaluations-capabilities', path: '/evaluations/capabilities', "
+            r"label: '能力目录', concern: 'evaluation', scope: 'capabilities', "
+            r"topnavParent: 'evaluations-evaluators' \}",
+            block,
+        )
+        eva_m = re.search(
+            r"\{ tab: 'evaluations-evaluators', path: '/evaluations/evaluators', "
+            r"label: '评估器', concern: 'evaluation', scope: 'evaluators', "
+            r"topnavParent: 'evaluations-evaluators' \}",
+            block,
+        )
+        jm_m = re.search(
+            r"\{ tab: 'evaluations-judge-model', path: '/evaluations/judge-model', "
+            r"label: '模型', concern: 'evaluation', scope: 'judge-model', "
+            r"topnavParent: 'evaluations-evaluators' \}",
+            block,
+        )
+        assert cap_m and eva_m and jm_m, "顶导三入口条目字段不符"
+        assert cap_m.start() < eva_m.start() < jm_m.start(), \
+            "能力目录必须排在评估器之前，模型排在评估器之后"
+
+    def test_capabilities_route_shares_evaluators_sidebar_subdomain(self) -> None:
+        """能力目录独立 routeConfig entry：独立 path/tab/scope，
+        但 sidebarTab/topnavParent 与评估器页相同（顶导是左导的子域）。"""
+        content = _read("management-navigation.js")
+        match = re.search(
+            r"\{ paths: \['/evaluations/capabilities'\][^}]*}", content
+        )
+        assert match is not None
+        entry = match.group(0)
+        assert "tab: 'evaluations-capabilities'" in entry
+        assert "renderTab: 'evaluations'" in entry
+        assert "sidebarTab: 'evaluations-evaluators'" in entry
+        assert "topnavParent: 'evaluations-evaluators'" in entry
+        assert "scope: 'capabilities'" in entry
+        # 能力目录不进左导 children（与 review 兼容页同范式）
+        parent = re.search(
+            r"tab: 'evaluations', label: '评估', parent: true, children: \[([^\]]*)\]",
+            content,
+        )
+        assert parent is not None
+        assert "evaluations-capabilities" not in parent.group(1)
+
+    def test_judge_model_route_shares_evaluators_sidebar_subdomain(self) -> None:
+        """模型页独立 routeConfig entry：独立 path/tab/scope，但
+        sidebarTab/topnavParent 与评估器页相同（顶导是左导的子域）。"""
+        content = _read("management-navigation.js")
+        match = re.search(
+            r"\{ paths: \['/evaluations/judge-model'\][^}]*}", content
+        )
+        assert match is not None
+        entry = match.group(0)
+        assert "tab: 'evaluations-judge-model'" in entry
+        assert "renderTab: 'evaluations'" in entry
+        assert "sidebarTab: 'evaluations-evaluators'" in entry
+        assert "topnavParent: 'evaluations-evaluators'" in entry
+        assert "scope: 'judge-model'" in entry
+        # 模型页不进左导 children（与能力目录同范式）
+        parent = re.search(
+            r"tab: 'evaluations', label: '评估', parent: true, children: \[([^\]]*)\]",
+            content,
+        )
+        assert parent is not None
+        assert "evaluations-judge-model" not in parent.group(1)
+
+    def test_sidebar_landing_uses_first_topnav_item(self) -> None:
+        """左导落地规则：navigateTo 经 sidebarLandingPath 收敛到子域顶导首项 path，
+        评估器子域首项为能力目录；无顶导 tab 回落 pathByTab。"""
+        content = _read("management-navigation.js")
+        assert "function sidebarLandingPath(name)" in content
+        landing_m = re.search(
+            r"function sidebarLandingPath\(name\) \{(.*?)\n  \}", content, re.S
+        )
+        assert landing_m is not None
+        block = landing_m.group(1)
+        assert "topnavConfig[name]" in block
+        assert "items[0].path" in block
+        assert "pathByTab[name]" in block
+        navigate_m = re.search(r"function navigateTo\(name\) \{(.*?)\n  \}", content, re.S)
+        assert navigate_m is not None
+        assert "sidebarLandingPath(name)" in navigate_m.group(1)
+        assert "pathByTab[name]" not in navigate_m.group(1)
 
     def test_app_js_resolve_module_maps_evaluations(self) -> None:
         content = _read("app.js")
@@ -105,6 +211,30 @@ class TestIndexHtml:
         assert 'data-submenu-of="evaluations"' in content
         for view in ("overview", "datasets", "evaluators", "experiments", "results", "annotations"):
             assert content.count('data-tab="evaluations-' + view + '"') == 1
+
+    def test_sidebar_evaluators_lands_on_capabilities(self) -> None:
+        """左导"评估器"href 与 SPA 落地规则一致：指向顶导首项能力目录，
+        data-tab 保持 evaluations-evaluators（侧栏高亮仍归评估器子域）。"""
+        content = _read("index.html")
+        item_m = re.search(
+            r'<a class="sidebar__item sidebar__item--child"[^>]*data-tab="evaluations-evaluators"[^>]*>.*?</a>',
+            content, re.S,
+        )
+        assert item_m is not None
+        assert 'href="/evaluations/capabilities"' in item_m.group(0)
+        assert '/evaluations/evaluators"' not in item_m.group(0)
+
+    def test_sidebar_experiments_lands_on_executions(self) -> None:
+        """左导"实验"href 与 SPA 落地规则一致：指向顶导首项执行任务，
+        data-tab 保持 evaluations-experiments（侧栏高亮仍归实验子域）。"""
+        content = _read("index.html")
+        item_m = re.search(
+            r'<a class="sidebar__item sidebar__item--child"[^>]*data-tab="evaluations-experiments"[^>]*>.*?</a>',
+            content, re.S,
+        )
+        assert item_m is not None
+        assert 'href="/evaluations/executions"' in item_m.group(0)
+        assert '/evaluations/experiments"' not in item_m.group(0)
 
     def test_sidebar_evaluation_children_order_and_review_removed(self) -> None:
         """六子链接顺序 = 概览、数据集、评估器、实验、结果、人工标注；
@@ -128,7 +258,7 @@ class TestIndexHtml:
 
 
 # ---------------------------------------------------------------------------
-# shell 路由（六菜单 + review 兼容页 = 七路径）
+# shell 路由（六菜单 + 执行任务/模型独立入口 + review 兼容页 = 十路径）
 # ---------------------------------------------------------------------------
 
 
@@ -179,11 +309,12 @@ def _shell_client(tmp_path):
 class TestShellRoutes:
     EVALUATION_SHELL_PATHS = (
         "/evaluations", "/evaluations/datasets", "/evaluations/evaluators",
-        "/evaluations/experiments", "/evaluations/results",
+        "/evaluations/capabilities", "/evaluations/judge-model",
+        "/evaluations/executions", "/evaluations/experiments", "/evaluations/results",
         "/evaluations/annotations", "/evaluations/review",
     )
 
-    def test_shell_200_for_seven_evaluation_paths(self, tmp_path) -> None:
+    def test_shell_200_for_ten_evaluation_paths(self, tmp_path) -> None:
         client = _shell_client(tmp_path)
         for path in self.EVALUATION_SHELL_PATHS:
             response = client.get(path)
@@ -262,13 +393,21 @@ class TestEvaluationJsContract:
         assert "providers-form__actions" in css
         assert "evaluations-form-actions" not in css
 
-    def test_toggle_groups_use_aria_pressed_not_tablist(self) -> None:
-        """spec-261112：筛选按钮组是查询过滤器，用 role=group +
-        aria-pressed，禁止不完整的 tablist 语义（含行内注释）。"""
+    def test_review_pressed_group_kept_annotation_filters_use_select(self) -> None:
+        """spec-261112：筛选组是查询过滤器，用 role=group，禁止不完整的
+        tablist 语义。人工标注两组筛选已改为原生 select 下拉同一筛选行，
+        aria-pressed 按钮组仅保留在 review 待复核视图。"""
         js = _code_lines("evaluation.js")
+        # review 保留 focusableChoiceGroup + aria-pressed
         assert "aria-pressed" in js
         assert "role', 'group'" in js
         assert "tablist" not in js
+        # 人工标注走 selectControl 下拉，不再出现按钮组/checkbox 组
+        assert "focusableChoiceGroup('annotation-state'" not in js
+        assert "focusableChoiceGroup('annotation-reason'" not in js
+        assert "checkboxGroup(" not in js
+        assert "selectControl('annotation_state'" in js
+        assert "selectControl('annotation_reason'" in js
 
     def test_no_native_title_tooltip(self) -> None:
         """spec-261112：标题补充说明统一走 panel-title-group 三件套，
@@ -294,9 +433,9 @@ class TestEvaluationJsContract:
         旧类 evaluations-review__tabs 的 CSS 定义不删除（静态合同不回归）。"""
         assert "evaluations-review__tabs" in _read("styles.css")
 
-    def test_human_evaluator_disabled_copy_present(self) -> None:
-        """spec-261112 S9：human 行常驻说明文案锁定。"""
-        assert "人工评估器不支持自动使用启停" in _read("evaluation.js")
+    def test_human_evaluator_operation_note_absent(self) -> None:
+        """human 行操作列不展示启停备注。"""
+        assert "人工评估器不支持自动使用启停" not in _read("evaluation.js")
 
     def test_enabled_field_uses_select_control(self) -> None:
         """spec-261112 S9：评估开关为 select 控件而非自由文本输入。"""
@@ -421,6 +560,89 @@ class TestManagementApi:
         ):
             assert path in content, f"缺少评估器端点: {path}"
 
+    def test_judge_model_endpoint_declared(self) -> None:
+        """plan-261115 T6：Judge 模型配置读取端点。"""
+        content = _read("management-api.js")
+        assert "'/chat/evaluations/judge-model'" in content
+
+
+class TestJudgeModelProviderPage:
+    """plan-261116 T6：评估-模型页重构为 Provider 列表形态（设为评估默认
+    + 编辑/新增/删除 modal + 供给精简区）。行为契约见
+    evaluation_workbench_harness.js Part I；不渲染"模型列表（当前Provider）"。
+    """
+
+    def test_provider_list_wired_to_registry_api(self) -> None:
+        """Provider 列表与 CRUD 复用主注册表 API，无新增端点。"""
+        js = _code_lines("evaluation.js")
+        for call in (
+            "api.listProviders(",
+            "api.createProvider(",
+            "api.updateProvider(",
+            "api.deleteProvider(",
+        ):
+            assert call in js, f"evaluation.js 缺少 Provider 注册表调用: {call}"
+
+    def test_eval_default_ops_never_activate_agent_provider(self) -> None:
+        """is_active 只读展示：评估页所有操作不得调用 Agent activate API。"""
+        js = _code_lines("evaluation.js")
+        assert "activateProvider" not in js, "评估页禁止调用 Agent activate API"
+
+    def test_provider_table_columns_and_default_column(self) -> None:
+        """表格列对齐左导模型页；"启用"列替换为"默认"（是/否）。"""
+        content = _read("evaluation.js")
+        for label in ("名称", "类型", "Base URL", "Model", "Key", "Vision",
+                      "默认", "操作"):
+            assert label in content, f"Provider 表格缺少列: {label}"
+
+    def test_eval_default_entry_in_edit_modal(self) -> None:
+        """设为评估默认入口在编辑 modal（勾选项），行内不再提供。"""
+        content = _read("evaluation.js")
+        assert "eval-provider-default" in content
+        assert "设为评估默认" in content
+        assert "judgeDefaultButton" not in content, "行内设默认按钮已移除"
+
+    def test_model_list_section_absent(self) -> None:
+        """评估-模型页不渲染"模型列表（当前Provider）"区。"""
+        assert "模型列表（当前Provider）" not in _read("evaluation.js")
+
+    def test_shared_provider_modal_note_and_ids(self) -> None:
+        """modal 明示与 Agent 共用；页内独立 DOM id（eval-provider-* 前缀）。"""
+        content = _read("evaluation.js")
+        assert ("Provider 配置与 Agent 共用，修改会影响共用该 Provider 的调用"
+                in content)
+        for dom_id in ("eval-provider-name", "eval-provider-type",
+                       "eval-provider-base-url", "eval-provider-model",
+                       "eval-provider-api-key", "eval-provider-vision",
+                       "eval-provider-default"):
+            assert dom_id in content, f"Provider modal 缺少独立 DOM id: {dom_id}"
+
+    def test_secret_never_persists_to_browser_storage(self) -> None:
+        """密钥不写浏览器存储；输入随 modal 关闭/成功清空。"""
+        js = _code_lines("evaluation.js")
+        assert "localStorage" not in js
+        assert "sessionStorage" not in js
+
+    def test_eval_default_patch_payload_uses_provider_id(self) -> None:
+        """设默认走既有 config CAS 通道：evaluation_judge_provider_id。"""
+        js = _code_lines("evaluation.js")
+        assert "evaluation_judge_provider_id" in js
+        assert "evaluation_judge_model" not in js, "旧默认模型字段已移除"
+
+    def test_supply_compact_sector_fields(self) -> None:
+        """供给精简区：就绪/来源/有效模型/env 基线/host/missing 警示/回落提示。"""
+        content = _read("evaluation.js")
+        for label in ("未设置默认 Provider，回落 env 基线", "supply_source",
+                      "effective_model", "env_baseline_model",
+                      "provider_base_url_host", "default_provider_missing"):
+            assert label in content, f"供给精简区缺少字段/文案: {label}"
+
+    def test_create_form_prefers_effective_model(self) -> None:
+        """创建表单预填优先有效供给模型 effective_model；无供给留空。"""
+        js = _code_lines("evaluation.js")
+        assert "effective_model" in js
+        assert "default_model" not in js, "旧投影字段 default_model 不得再消费"
+
 
 def test_evaluation_navigation_lifecycle():
     import shutil
@@ -467,13 +689,12 @@ class TestEvaluationWorkbenchView:
 
     def test_evaluator_status_copy_distinctions(self) -> None:
         """spec 4.2：可配置/执行已就绪/未配置 Judge 状态区分；新建注册
-        前提示自动使用默认关闭；同指标多版本启用提示不合并结果。"""
+        前提示自动使用默认关闭。"""
         content = _read("evaluation.js")
         for label in (
             "未配置 Judge",
             "执行已就绪",
             "自动使用默认关闭",
-            "会增加评估作业，结果不合并",
         ):
             assert label in content, f"evaluation.js 缺少状态文案: {label}"
 
@@ -531,6 +752,19 @@ class TestWorkbenchAnalyticsView:
         """spec 4.5：无值分组显示暂无有效评分，不显示 0% 成功/100% 质量。"""
         content = _read("evaluation.js")
         assert "暂无有效评分" in content
+
+    def test_overview_lists_paged_and_remarks_in_sectors(self) -> None:
+        """概览：评分趋势/Producer 心跳接入标准 slice pager，备注从列表
+        上方移到下方并按 Sector 分块（对齐安全-概览 sector 结构）。"""
+        content = _read("evaluation.js")
+        # 备注 Sector 标题
+        for label in ("运行配置", "容量与预算"):
+            assert label in content
+        # 两个概览列表各自持有独立 slice 分页状态
+        for state_name in ("trendPageIndex", "producerPageIndex"):
+            assert state_name in content
+        # 概览 Sector 复用 sectionPanel 壳，不再用 blockTitle 堆 kvRow
+        assert "overviewSector" in content
 
     def test_review_view_links_annotations(self) -> None:
         content = _read("evaluation.js")

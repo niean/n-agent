@@ -127,7 +127,7 @@ body.sidebar-expanded .topbar, body.sidebar-expanded .main-content { width: calc
 .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 48px; padding: 8px 16px; background: var(--color-bg-subtle); border-bottom: 1px solid var(--color-border-muted); font-size: 13px; font-weight: 600; }
 .panel-title-group { position: relative; display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; }
 .panel-title { font-weight: 600; border-bottom: 1px dashed var(--color-border-default); }
-.panel-tips { position: absolute; top: calc(100% + 8px); left: 0; width: max-content; max-width: 480px; padding: 10px 12px; background: var(--color-bg-white); color: var(--color-fg-muted); border: 1px solid var(--color-border-default); font-size: 12px; font-weight: 400; line-height: 1.4; border-radius: 4px; box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.08); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.15s ease; z-index: 20; white-space: normal; text-align: left; }
+.panel-tips { position: absolute; top: calc(100% + 8px); left: 0; width: max-content; max-width: 480px; padding: 10px 12px; background: var(--color-bg-white); color: var(--color-fg-muted); border: 1px solid var(--color-border-default); font-size: 12px; font-weight: 400; line-height: 1.4; border-radius: 4px; box-shadow: 0 2px 12px 0 rgba(0, 0, 0, 0.08); opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.15s ease; z-index: 20; white-space: pre-line; text-align: left; }
 .panel-tips::before { content: ''; position: absolute; top: -5px; left: 14px; width: 8px; height: 8px; background: var(--color-bg-white); border-top: 1px solid var(--color-border-default); border-left: 1px solid var(--color-border-default); transform: rotate(45deg); }
 .panel-title-group:hover .panel-tips,
 .panel-title-group:focus-within .panel-tips { opacity: 1; visibility: visible; }
@@ -146,6 +146,21 @@ body.sidebar-expanded .topbar, body.sidebar-expanded .main-content { width: calc
 label { display: flex; flex-direction: column; gap: 6px; color: var(--color-fg-muted); font-size: 13px; }
 input, textarea, select { width: 100%; padding: 8px 10px; color: var(--color-fg-default); background: var(--color-on-primary); border: 1px solid var(--color-border-default); border-radius: 4px; }
 textarea { min-height: 90px; resize: vertical; }
+/* 下拉列表共享外观：隐藏位置随浏览器且贴右边框的原生箭头，统一 chevron 背景图。
+   图标距右边 10px（--space-5），文字预留 32px 右内边距防止压住图标；
+   chevron 色值 #909399 对齐 --color-fg-subtle（data URI 无法引用 CSS 变量）。
+   .providers-form 内 select 的 background 简写会清掉背景图，需同组高优先级选择器补回。 */
+select.select-control,
+.providers-form select.select-control {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  padding: 8px 32px 8px 10px;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='%23909399' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--space-5) center;
+  background-size: 12px 12px;
+}
 .btn { padding: var(--space-4) var(--space-7); font-size: var(--font-size-md); color: var(--color-fg-muted); background: var(--color-on-primary); border: 1px solid var(--color-border-default); border-radius: var(--radius-sm); transition: all 0.2s; }
 .btn:hover { color: var(--color-on-primary); background: var(--color-primary); border-color: var(--color-primary); }
 .btn:disabled, .btn:disabled:hover { color: var(--color-fg-subtle); background: var(--color-bg-subtle); border-color: var(--color-border-muted); cursor: not-allowed; opacity: 0.6; }

@@ -10,7 +10,9 @@ from app.domain.evaluation.config import (
     EvaluationConfigStoreError,
     EvaluationConfigValidationError,
     merge_overrides,
+    overrides_from_payload,
     validate_evaluation_config,
+    validate_model_name_string,
 )
 
 
@@ -22,6 +24,7 @@ def test_field_set_is_stable():
         "evaluation_sampling_policy_version",
         "evaluation_worker_concurrency",
         "evaluation_daily_call_ceiling",
+        "evaluation_judge_provider_id",
     )
 
 
@@ -70,6 +73,17 @@ def test_validate_daily_call_ceiling_bounds():
         )
 
 
+def test_validate_zero_ceiling_rejected_when_judge_configured():
+    """env 侧 Judge 供给就绪（judge_configured=True）时 ceiling=0 必抛
+    （统一预算条件的 judge_configured 分支在 domain 层自证）。"""
+    with pytest.raises(EvaluationConfigValidationError):
+        validate_evaluation_config(
+            EvaluationConfig(evaluation_daily_call_ceiling=0),
+            worker_max_concurrency=4,
+            judge_configured=True,
+        )
+
+
 def test_overrides_roundtrip_and_strict_parse():
     overrides = EvaluationConfigOverrides(
         evaluation_enabled=True, evaluation_sampling_rate=0.5
@@ -106,3 +120,130 @@ def test_merge_overrides_prefers_override_values():
     assert merged.evaluation_worker_concurrency == 3
     merged = merge_overrides(base, EvaluationConfigOverrides())
     assert merged.evaluation_worker_concurrency == 2
+
+
+class TestEvaluationJudgeProviderIdField:
+    def test_default_empty_and_registered(self):
+        cfg = EvaluationConfig()
+        assert cfg.evaluation_judge_provider_id == ""
+        assert "evaluation_judge_provider_id" in EVALUATION_CONFIG_FIELDS
+
+    def test_overrides_field_none_default_and_registered(self):
+        ov = EvaluationConfigOverrides()
+        assert ov.evaluation_judge_provider_id is None
+        assert ov.to_dict() == {}  # None 不序列化
+
+    def test_from_dict_accepts_valid_id_and_normalizes_empty_to_none(self):
+        # 合法 id 保存
+        ov = EvaluationConfigOverrides.from_dict(
+            {"evaluation_judge_provider_id": "provider-a"}
+        )
+        assert ov.evaluation_judge_provider_id == "provider-a"
+        # 空串 = 清除覆盖：不写入 kwargs
+        ov2 = EvaluationConfigOverrides.from_dict(
+            {"evaluation_judge_provider_id": ""}
+        )
+        assert ov2.evaluation_judge_provider_id is None
+        assert ov2.to_dict() == {}
+
+    def test_from_dict_rejects_non_string(self):
+        for bad in (None, True, 1, 1.5, []):
+            with pytest.raises(EvaluationConfigStoreError):
+                EvaluationConfigOverrides.from_dict(
+                    {"evaluation_judge_provider_id": bad}
+                )
+
+    def test_from_dict_rejects_whitespace_with_message(self):
+        with pytest.raises(EvaluationConfigStoreError, match="首尾空白") as exc_info:
+            EvaluationConfigOverrides.from_dict(
+                {"evaluation_judge_provider_id": " x"}
+            )
+        assert "覆盖 evaluation_judge_provider_id" in str(exc_info.value)
+
+    def test_from_dict_rejects_control_chars(self):
+        for bad in ("a\u0000b", "a\nb", "a\u007fb", "a\u0085b", "a\u009fb"):
+            with pytest.raises(EvaluationConfigStoreError):
+                EvaluationConfigOverrides.from_dict(
+                    {"evaluation_judge_provider_id": bad}
+                )
+
+    def test_from_dict_rejects_over_200_codepoints(self):
+        for bad in ("x" * 201, "\U0001f600" * 201):
+            with pytest.raises(EvaluationConfigStoreError):
+                EvaluationConfigOverrides.from_dict(
+                    {"evaluation_judge_provider_id": bad}
+                )
+
+    def test_from_dict_rejects_legacy_judge_model_key(self):
+        # 旧键 evaluation_judge_model 作为 PATCH 载荷必须被拒绝
+        with pytest.raises(EvaluationConfigStoreError, match="未知覆盖键"):
+            EvaluationConfigOverrides.from_dict(
+                {"evaluation_judge_model": "m1"}
+            )
+
+    def test_overrides_from_payload_error_contract(self):
+        # 管理面载荷路径：StoreError 再转回 EvaluationConfigValidationError
+        with pytest.raises(EvaluationConfigValidationError):
+            overrides_from_payload({"evaluation_judge_provider_id": " x"})
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            " x",
+            "x ",
+            " x ",
+            "\tx",
+            " ",
+            "a\u0000b",
+            "a\nb",
+            "a\u007fb",
+            "a\u0085b",
+            "a\u009fb",
+            "　x",
+            "x　",
+            "x" * 201,
+            "\U0001f600" * 201,
+        ],
+    )
+    def test_validate_rejects_invalid(self, bad):
+        with pytest.raises(EvaluationConfigValidationError):
+            validate_model_name_string(bad, allow_empty=False)
+
+    @pytest.mark.parametrize("bad", [None, True, 1, 1.5, []])
+    def test_validate_rejects_non_string(self, bad):
+        with pytest.raises(EvaluationConfigValidationError):
+            validate_model_name_string(bad, allow_empty=False)
+        # 冻结 dataclass 注入路径：validate_evaluation_config 同样拒绝
+        cfg = EvaluationConfig()
+        object.__setattr__(cfg, "evaluation_judge_provider_id", bad)
+        with pytest.raises(EvaluationConfigValidationError):
+            validate_evaluation_config(cfg, worker_max_concurrency=4)
+
+    def test_validate_rejects_empty_when_not_allowed(self):
+        with pytest.raises(EvaluationConfigValidationError):
+            validate_model_name_string("", allow_empty=False)
+
+    @pytest.mark.parametrize(
+        "good",
+        ["", "x" * 200, "模型-A.1", "gpt 4o", "\U0001f600" * 200],
+    )
+    def test_validate_accepts_valid(self, good):
+        if good == "":
+            assert validate_model_name_string(good, allow_empty=True) == ""
+            return
+        assert validate_model_name_string(good, allow_empty=False) == good
+
+    def test_validate_model_name_string_returns_original_untrimmed(self):
+        assert validate_model_name_string("gpt", allow_empty=False) == "gpt"
+        merged = merge_overrides(
+            # 预算为正：统一预算条件只允许在 domain 单一来源触发，本测
+            # 试聚焦模型名不 trim，不与 ceiling=0 组合（任一 Judge 供给
+            # 来源存在时 ceiling 必须为正）
+            EvaluationConfig(evaluation_daily_call_ceiling=100),
+            EvaluationConfigOverrides.from_dict(
+                {"evaluation_judge_provider_id": "gpt 4o"}
+            ),
+        )
+        assert merged.evaluation_judge_provider_id == "gpt 4o"
+        validate_evaluation_config(merged, worker_max_concurrency=4)
+

@@ -6,6 +6,7 @@ import logging
 import shutil
 import sys
 import threading
+import urllib.parse
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
@@ -970,6 +971,14 @@ def _evaluation_judge_cfg(settings: Settings) -> tuple[str, str, str]:
     )
 
 
+def _evaluation_judge_env_ready(settings: Settings) -> bool:
+    """Judge env 三字段同时非空判定（不抛错版，单一来源）。
+
+    合并判定场景（admin 就绪 / execution readiness / 启动预算校验）使用
+    本函数；partial fail-fast 由 _evaluation_judge_ready 承担。"""
+    return all(_evaluation_judge_cfg(settings))
+
+
 def _evaluation_judge_ready(settings: Settings) -> bool:
     """Judge 是否已配置（对齐 _langfuse_sink_settings_ready 先例）。
 
@@ -981,7 +990,125 @@ def _evaluation_judge_ready(settings: Settings) -> bool:
             "evaluation_judge_provider_base_url/api_key/model 必须同时"
             "提供或同时为空（B 类启动期绑定）"
         )
-    return all(fields)
+    return _evaluation_judge_env_ready(settings)
+
+
+def _redact_base_url_host(raw: str | None) -> str | None:
+    """base_url 脱敏投影：仅 scheme://host，剥离 userinfo/端口/路径/
+    查询串/片段；IPv6 重建方括号（hostname 已去括号）。无法解析或不
+    完整返回 None，绝不回显原始 URL。"""
+    try:
+        parts = urllib.parse.urlsplit(raw or "")
+        if parts.scheme and parts.hostname:
+            host_name = parts.hostname
+            if ":" in host_name:  # IPv6 重建括号（hostname 已去括号）
+                host_name = f"[{host_name}]"
+            return f"{parts.scheme}://{host_name}"
+    except ValueError:
+        pass
+    return None
+
+
+async def _judge_provider_supply_snapshot(
+    provider_id: str,
+    provider_service: Any,
+    registry: Any,
+) -> tuple["Any | None", "JudgeSupplyOverride | None"]:
+    """Judge Provider 供给严格读取（T4 判定的单一来源，不吞错）。
+
+    读 provider_id -> 查 provider -> 验类型（openai-compatible）->
+    取 secret -> 构造 JudgeSupplyOverride；返回 (provider 记录 | None,
+    供给快照 | None)。读取异常向上传播：运行 resolver 在外层捕获回落
+    env，投影路径按既有系统错误映射（不伪装缺失）。"""
+    if not provider_id:
+        return None, None
+    from app.infrastructure.evaluation import JudgeSupplyOverride
+
+    provider = await provider_service.get_provider(provider_id)
+    if provider is None:
+        return None, None
+    supply = None
+    if (
+        provider.provider_type == "openai-compatible"
+        and provider.base_url
+        and provider.model
+    ):
+        api_key = await registry.get_secret(provider_id)
+        if api_key:
+            supply = JudgeSupplyOverride(
+                base_url=provider.base_url,
+                api_key=api_key,
+                model=provider.model,
+            )
+    return provider, supply
+
+
+async def _judge_supply_projection(
+    resolved: Any,
+    settings: Settings,
+    *,
+    provider_service: Any,
+    registry: Any,
+) -> dict[str, Any]:
+    """judge-model 供给投影（T5：GET /chat/evaluations/judge-model 的
+    投影函数；入参为路由端点单次严格读的 resolved 快照，同一响应内
+    default_provider_id 与 config_version 绑定一致）。
+
+    - 供给命中：复用 _judge_provider_supply_snapshot 严格读取（异常向
+      上传播，按既有系统错误响应，不伪装缺失）；命中时 host 取
+      provider.base_url，否则 env 基线就绪时取 env base_url，均无 ->
+      null（不一直展示 env host 误报当前目标）；
+    - judge_ready：env 就绪 OR Provider 完整供给；supply_source 取
+      "provider"/"env"/None，effective_model 为有效供给的默认模型
+      （partial env 不构成有效供给 -> None）；
+    - env_baseline_model：如实投影 env 配置的 model 名，不依赖就绪
+      状态（该字段保留不门控，供前端预填/回退显示）；
+    - default_provider_missing：仅非空 id 且记录不存在 -> True（缺
+      secret/类型不符/读取异常均不冒充"已删除"）；
+    - provider_base_url_host：脱敏投影（_redact_base_url_host），密钥
+      与原始 URL 绝不进入响应。"""
+    provider_id = resolved.config.evaluation_judge_provider_id
+    env_ready = _evaluation_judge_env_ready(settings)
+    provider: Any | None = None
+    supply: Any | None = None
+    if provider_id:
+        provider, supply = await _judge_provider_supply_snapshot(
+            provider_id, provider_service, registry
+        )
+    if supply is not None:
+        judge_ready = True
+        supply_source: str | None = "provider"
+        effective_model: str | None = supply.model
+        host = _redact_base_url_host(supply.base_url)
+    else:
+        judge_ready = env_ready
+        supply_source = "env" if env_ready else None
+        effective_model = (
+            (settings.evaluation_judge_provider_model or None)
+            if env_ready
+            else None
+        )
+        host = (
+            _redact_base_url_host(settings.evaluation_judge_provider_base_url)
+            if env_ready
+            else None
+        )
+    return {
+        "default_provider_id": provider_id,
+        "config_version": resolved.version,
+        "judge_ready": judge_ready,
+        "supply_source": supply_source,
+        "effective_model": effective_model,
+        "env_baseline_model": settings.evaluation_judge_provider_model or None,
+        "provider_base_url_host": host,
+        "default_provider_name": (
+            provider.name if provider is not None else None
+        ),
+        "default_provider_model": (
+            provider.model if provider is not None else None
+        ),
+        "default_provider_missing": bool(provider_id) and provider is None,
+    }
 
 
 class _EvaluationJudgeNotConfiguredError(Exception):
@@ -1350,6 +1477,9 @@ def build_application_services(
             EvaluationSnapshotHolder,
         )
         from app.application.evaluation_worker import EvaluationWorker
+        from app.domain.evaluation.config import (
+            EvaluationConfigValidationError,
+        )
         from app.infrastructure.evaluation.config_store import (
             SqliteEvaluationConfigStore,
         )
@@ -1376,10 +1506,18 @@ def build_application_services(
             settings, evaluation_config_store
         )
         # C 类当前解析配置（含 DB 覆盖）：worker 并发/预算在启动期读取
-        # 生效；sampling/enabled 由捕获点 per-capture 查询热重载
-        _resolved_eval_config = _run_sync(
-            evaluation_config_service.get_resolved()
-        ).config
+        # 生效；sampling/enabled 由捕获点 per-capture 查询热重载。
+        # 严格 get_resolved 校验（T4）：持久化覆盖非法（如 Provider 引用
+        # 非空但 ceiling 0）在启动期暴露为 ValueError——运行面 current
+        # 的 last-known-good 回退不得掩盖"有引用无预算"
+        try:
+            _resolved_eval_config = _run_sync(
+                evaluation_config_service.get_resolved()
+            ).config
+        except EvaluationConfigValidationError as exc:
+            raise ValueError(
+                f"evaluation C 类持久化配置非法: {exc}"
+            ) from exc
         evidence_store = EvaluationLocalEvidenceStore(
             Path(settings.evaluation_snapshots_root),
             evaluation_store,
@@ -1485,14 +1623,56 @@ def build_application_services(
             # M1/M3：待复核条目附样本真实 query（金标仍只来自审核人）
             evidence_reader=evidence_store,
         )
-        # Judge evaluator（B 类三字段同时为空 = Judge 未配置；部分设置
-        # fail-fast，由 _evaluation_judge_ready 统一判定）。dispatch 按
-        # definition.metric_name 路由到四个 LLMJudgeEvaluator 实例；
-        # 未配置时 evaluate 抛永久错误（worker 按 error_type 分类，不重试）。
-        _judge_ready = _evaluation_judge_ready(settings)
+        # Judge evaluator（B 类三字段同时为空 = Judge env 基线未配置；
+        # 部分设置 fail-fast，由 _evaluation_judge_ready 统一判定）。T4：
+        # 五个 LLMJudgeEvaluator 实例无条件装配（构造值允许空），每次
+        # evaluate 经注入的供给 resolver 逐次解析 C 类默认 Provider——
+        # Provider 未引用且 env 全空时 evaluate 抛永久错误（worker 按
+        # error_type 分类，不重试）。
+        _evaluation_judge_ready(settings)  # partial env 装配期 fail-fast
+        from app.infrastructure.evaluation import JudgeSupplyOverride
         from app.infrastructure.evaluation.judge_provider import (
             JUDGE_EVALUATOR_FACTORIES,
         )
+
+        # Judge 默认供给热解析（C 类）：读当前生效 Provider 引用
+        # （evaluation_judge_provider_id），经 provider_service/registry
+        # 解析 openai-compatible Provider 的 base_url/model/secret——
+        # 三者齐备才构造 JudgeSupplyOverride；否则 None（回落构造 env
+        # 基线）。判定逻辑复用 _judge_provider_supply_snapshot（与 T5
+        # 投影共享，不两处漂移）；仅本闭包外层捕获 Exception
+        # （CancelledError 等取消语义继续传播），异常返回 None 并输出
+        # 不含 Provider URL/密钥的固定诊断——投影路径不共享本吞错策略。
+        async def _evaluation_default_judge_supply() -> (
+            JudgeSupplyOverride | None
+        ):
+            try:
+                provider_id = (
+                    await evaluation_config_service.current()
+                ).evaluation_judge_provider_id
+                _provider, supply = await _judge_provider_supply_snapshot(
+                    provider_id, provider_service, registry
+                )
+                return supply
+            except Exception as exc:
+                # 仅追加异常类型名，不拼接异常消息（避免 URL/密钥类细节进日志）
+                logger.warning(
+                    "evaluation default judge supply resolution failed: "
+                    + type(exc).__name__
+                )
+                return None
+
+        # execution readiness 的 Judge 状态（合并判定）：供给快照就绪即
+        # ready（模型取供给模型）；否则回落 env 基线。每次调用重算，不
+        # 缓存——Dashboard 切换 Provider 引用后 readiness 即时跟随。
+        async def _evaluation_judge_state() -> dict[str, Any]:
+            supply = await _evaluation_default_judge_supply()
+            if supply is not None:
+                return {"ready": True, "model": supply.model}
+            return {
+                "ready": _evaluation_judge_env_ready(settings),
+                "model": settings.evaluation_judge_provider_model or None,
+            }
 
         _judge_evaluators = {
             metric: factory(
@@ -1500,16 +1680,22 @@ def build_application_services(
                 api_key=settings.evaluation_judge_provider_api_key,
                 model=settings.evaluation_judge_provider_model,
                 timeout_seconds=settings.evaluation_judge_timeout_seconds,
+                default_supply_resolver=_evaluation_default_judge_supply,
             )
-            for metric, factory in (
-                JUDGE_EVALUATOR_FACTORIES.items() if _judge_ready else []
-            )
+            for metric, factory in JUDGE_EVALUATOR_FACTORIES.items()
         }
-        # #12 fail-fast：Judge 已配置但日调用上限未设（C 类 0 = 不设上限）
-        # 时拒绝启动——无上限的自动 Judge 调用会让评估成本失控（spec 13
-        # 预算纪律）。显式关闭 Judge 请清空 provider 三字段。
-        if _judge_evaluators and (
-            (_resolved_eval_config.evaluation_daily_call_ceiling or 0) <= 0
+        # #12 fail-fast：存在任一 Judge 供给来源（env 三字段就绪或 C 类
+        # Provider 引用非空）但日调用上限未设（C 类 0 = 不设上限）时拒绝
+        # 启动——无上限的自动 Judge 调用会让评估成本失控（spec 13 预算
+        # 纪律；条件与 domain validate_evaluation_config 单一来源同口径，
+        # 此处是装配期第二层防线）。显式关闭 Judge 请清空 provider 三字段
+        # 与 Provider 引用。
+        if (
+            (
+                _evaluation_judge_env_ready(settings)
+                or _resolved_eval_config.evaluation_judge_provider_id
+            )
+            and _resolved_eval_config.evaluation_daily_call_ceiling <= 0
         ):
             raise ValueError(
                 "evaluation_daily_call_ceiling 必须为正整数（Judge 已配置，"
@@ -2203,8 +2389,9 @@ def build_application_services(
     agent_run_service = AgentRunService(SQLiteAgentRunRegistry(settings.sqlite_path))
     # 评估工作台管理面服务（T8 组合根装配）：admin/annotation/analytics。
     # 在 agent_run_service 构造后装配（agent_run_lookup 闭包延迟到调用期
-    # 解析真实 Run）；judge_ready 读 judge provider B 类配置状态（三字段
-    # 同时非空即就绪，与 worker judge evaluator 装配同一判定）。
+    # 解析真实 Run）；judge_ready 为 async callable（T4：合并判定 env 三
+    # 字段就绪 OR C 类 Provider 引用供给完整，secret 经 registry 异步
+    # 读取，与 worker 供给 resolver 同源）。
     evaluation_admin_service = None
     evaluation_annotation_service = None
     evaluation_analytics_service = None
@@ -2215,9 +2402,14 @@ def build_application_services(
         )
         from app.application.evaluation_annotation import AnnotationService
 
+        async def _evaluation_admin_judge_ready() -> bool:
+            if await _evaluation_default_judge_supply() is not None:
+                return True
+            return _evaluation_judge_env_ready(settings)
+
         evaluation_admin_service = EvaluationAdminService(
             evaluation_store,
-            judge_ready=lambda: _evaluation_judge_ready(settings),
+            judge_ready=_evaluation_admin_judge_ready,
             evaluation_service=evaluation_ledger_service,
         )
         evaluation_analytics_service = EvaluationAnalyticsService(evaluation_store)
@@ -3772,6 +3964,9 @@ def build_application_services(
             task_intent_unknown=_scenario_task_intent_unknown,
             workspace_resource_observer=_scenario_workspace_resource_observer,
             acp_runner=_scenario_acp_runner,
+            # T4：Judge 状态合并判定（供给快照就绪 OR env 基线），readiness
+            # 每次 await 当前有效供给，不再以 env-only judge_ready 阻断
+            judge_state=_evaluation_judge_state,
         )
     memory_store.migrate_session_id_prefixes()
     return ApplicationServices(
@@ -4302,6 +4497,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ledger_service = services.evaluation_ledger_service
                 try:
                     await ledger_service.register_feedback_helpful_definition()
+                    # T4：judge_model 传 env 基线模型（env 就绪时冻结进
+                    # 新预设 material）或 None（跟随组合根默认供给）——
+                    # None 也注册 llm_judge 预设（跟随默认供给，Provider
+                    # 就绪后即可执行），不再"env 未配置就没有 Judge 预设"
                     preset_model = (
                         services.settings.evaluation_judge_provider_model
                         if _evaluation_judge_ready(services.settings)
@@ -4682,6 +4881,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             register_evaluation_management_routes,
         )
 
+        # T5：judge-model 供给投影注入（async callable 接收路由端点单次
+        # 严格读的 resolved 快照；异常向上传播，端点按既有系统错误映射）
+        async def _evaluation_judge_supply_projection(
+            resolved: Any,
+        ) -> dict[str, Any]:
+            return await _judge_supply_projection(
+                resolved,
+                services.settings,
+                provider_service=services.provider_service,
+                registry=services.provider_registry,
+            )
+
         register_evaluation_management_routes(
             app,
             evaluation_service=services.evaluation_ledger_service,
@@ -4709,6 +4920,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             evaluation_analytics_service=(
                 services.evaluation_analytics_service
             ),
+            # T5：judge-model 供给投影（resolved 快照 -> 脱敏白名单字
+            # 段；路由层不读 env、不触碰凭据、不依赖 infrastructure 类
+            # 型。Provider 命中/missing/有效供给 host 均在组合根判定，
+            # registry 读取异常向上传播由端点按既有系统错误映射）
+            judge_supply=_evaluation_judge_supply_projection,
         )
     if services.evaluation_execution_service is not None:
         from app.interfaces.http.evaluation_execution_routes import register_evaluation_execution_routes

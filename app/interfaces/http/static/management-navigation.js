@@ -28,6 +28,16 @@
     { tab: 'evaluations-overview', path: '/evaluations', label: '概览', parentTab: 'evaluations' },
     { tab: 'evaluations-datasets', path: '/evaluations/datasets', label: '数据集', parentTab: 'evaluations' },
     { tab: 'evaluations-evaluators', path: '/evaluations/evaluators', label: '评估器', parentTab: 'evaluations' },
+    // 能力目录是评估器左导子域下的顶导入口：不进左导 children（与 review 兼容页同范式），
+    // 独立 path/tab，与评估器页共享 sidebarTab/topnavParent。
+    { tab: 'evaluations-capabilities', path: '/evaluations/capabilities', label: '能力目录', parentTab: 'evaluations' },
+    // 模型页是评估器左导子域下的顶导入口（管理默认评估模型）：不进左导
+    // children（与能力目录同范式），独立 path/tab，与评估器页共享
+    // sidebarTab/topnavParent。
+    { tab: 'evaluations-judge-model', path: '/evaluations/judge-model', label: '模型', parentTab: 'evaluations' },
+    // 执行任务是实验左导子域下的顶导入口：不进左导 children（与能力目录同范式），
+    // 独立 path/tab，与实验结果页共享 sidebarTab/topnavParent。
+    { tab: 'evaluations-executions', path: '/evaluations/executions', label: '执行任务', parentTab: 'evaluations' },
     { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验', parentTab: 'evaluations' },
     { tab: 'evaluations-results', path: '/evaluations/results', label: '结果', parentTab: 'evaluations' },
     { tab: 'evaluations-annotations', path: '/evaluations/annotations', label: '人工标注', parentTab: 'evaluations' },
@@ -78,10 +88,15 @@
       { tab: 'evaluations-datasets', path: '/evaluations/datasets', label: '数据集', concern: 'evaluation', scope: 'datasets', topnavParent: 'evaluations-datasets' },
     ],
     'evaluations-evaluators': [
+      { tab: 'evaluations-capabilities', path: '/evaluations/capabilities', label: '能力目录', concern: 'evaluation', scope: 'capabilities', topnavParent: 'evaluations-evaluators' },
       { tab: 'evaluations-evaluators', path: '/evaluations/evaluators', label: '评估器', concern: 'evaluation', scope: 'evaluators', topnavParent: 'evaluations-evaluators' },
+      // 模型页是评估器左导子域顶导第三入口：管理默认评估模型（C 类配置），
+      // 与能力目录同范式（独立 path/tab/scope，共享 topnavParent）。
+      { tab: 'evaluations-judge-model', path: '/evaluations/judge-model', label: '模型', concern: 'evaluation', scope: 'judge-model', topnavParent: 'evaluations-evaluators' },
     ],
     'evaluations-experiments': [
-      { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验', concern: 'evaluation', scope: 'experiments', topnavParent: 'evaluations-experiments' },
+      { tab: 'evaluations-executions', path: '/evaluations/executions', label: '执行任务', concern: 'evaluation', scope: 'executions', topnavParent: 'evaluations-experiments' },
+      { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验结果', concern: 'evaluation', scope: 'experiments', topnavParent: 'evaluations-experiments' },
     ],
     'evaluations-results': [
       { tab: 'evaluations-results', path: '/evaluations/results', label: '结果', concern: 'evaluation', scope: 'results', topnavParent: 'evaluations-results' },
@@ -121,7 +136,14 @@
     { paths: ['/observations/otel'], tab: 'observations-otel', renderTab: 'observations-otel', sidebarTab: 'observations-otel', topnavParent: 'observations-otel', scope: 'observations-otel' },
     { paths: ['/evaluations'], tab: 'evaluations-overview', renderTab: 'evaluations', sidebarTab: 'evaluations-overview', topnavParent: 'evaluations-overview', scope: 'overview' },
     { paths: ['/evaluations/datasets'], tab: 'evaluations-datasets', renderTab: 'evaluations', sidebarTab: 'evaluations-datasets', topnavParent: 'evaluations-datasets', scope: 'datasets' },
+    // 能力目录与评估器共用同一左导子域（sidebarTab/topnavParent 相同），
+    // 但各自独立 path/routeConfig entry，顶导双入口切换（同 /tasks/observations 范式）。
+    { paths: ['/evaluations/capabilities'], tab: 'evaluations-capabilities', renderTab: 'evaluations', sidebarTab: 'evaluations-evaluators', topnavParent: 'evaluations-evaluators', scope: 'capabilities' },
     { paths: ['/evaluations/evaluators'], tab: 'evaluations-evaluators', renderTab: 'evaluations', sidebarTab: 'evaluations-evaluators', topnavParent: 'evaluations-evaluators', scope: 'evaluators' },
+    // 模型页是评估器左导子域的独立 routeConfig entry：独立 path/tab/scope，
+    // sidebarTab/topnavParent 与评估器页相同（同能力目录范式）。
+    { paths: ['/evaluations/judge-model'], tab: 'evaluations-judge-model', renderTab: 'evaluations', sidebarTab: 'evaluations-evaluators', topnavParent: 'evaluations-evaluators', scope: 'judge-model' },
+    { paths: ['/evaluations/executions'], tab: 'evaluations-executions', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'executions' },
     { paths: ['/evaluations/experiments'], tab: 'evaluations-experiments', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'experiments' },
     { paths: ['/evaluations/results'], tab: 'evaluations-results', renderTab: 'evaluations', sidebarTab: 'evaluations-results', topnavParent: 'evaluations-results', scope: 'results' },
     { paths: ['/evaluations/annotations'], tab: 'evaluations-annotations', renderTab: 'evaluations', sidebarTab: 'evaluations-annotations', topnavParent: 'evaluations-annotations', scope: 'annotations' },
@@ -278,6 +300,17 @@
     return true;
   }
 
+  // 左导落地规则：从左导进入带顶导的子域时，固定落在该子域顶导最左侧第一个菜单
+  // （topnavConfig 首项 path）；无顶导的普通 tab 回落 pathByTab。
+  // 深链直达与顶导点击不走这里，仍可直达同子域其他 entry。
+  function sidebarLandingPath(name) {
+    const items = topnavConfig[name];
+    if (Array.isArray(items) && items.length && items[0] && items[0].path) {
+      return items[0].path;
+    }
+    return pathByTab[name];
+  }
+
   function navigateTo(name) {
     if (isParent(name)) {
       if (!document.body.classList.contains('sidebar-expanded')) return;
@@ -287,7 +320,7 @@
       writeSubmenuPref(name, open);
       return;
     }
-    const path = pathByTab[name];
+    const path = sidebarLandingPath(name);
     if (!path) return;
     navigatePath(path);
   }
@@ -387,6 +420,6 @@
   global.NAGENT.navigation = {
     initNavigation, navigateTo, switchTab: navigateTo, tabNames, pathByTab,
     resolveRoute, applyRoute, navigatePath, activeTopnavItem, buildRouteByPath,
-    topnavConfig, selectedTabFromPath, DEFAULT_CHILD, tabConfig,
+    topnavConfig, selectedTabFromPath, DEFAULT_CHILD, tabConfig, sidebarLandingPath,
   };
 }(window));

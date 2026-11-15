@@ -43,12 +43,68 @@
   // 仅靠 token 无法识别同路由旧响应；每视图递增，成功/失败分支双校验，
   // 防止旧响应覆盖新筛选、错误态或 Loading。deactivate 不重置，token 兜底。
   const viewRequestSeq = {
-    overview: 0, datasets: 0, evaluators: 0, experiments: 0,
-    results: 0, review: 0, annotations: 0,
+    overview: 0, datasets: 0, evaluators: 0, capabilities: 0, experiments: 0,
+    results: 0, review: 0, annotations: 0, judgeModel: 0,
   };
+  // Judge 供给共享缓存（plan-261116 T6）：providers 为 Provider 注册表
+  // 列表快照（模型页 GET /chat/providers 刷新），projection 为 GET
+  // /judge-model 投影快照，configVersion 为下一次 CAS 的 expected_version
+  //（GET config_version 起步，PATCH 响应 version 跟进）；usedModels 由
+  // 评估器列表合并（method=llm_judge 且 judge_model 非空，全串去重），
+  // 供建表单 datalist。声明见下方"模型页"章节（TDZ 安全：仅运行时访问）。
+  // datalist id 跨弹窗唯一序号
+  let judgeModelListSeq = 0;
   // 当前待复核筛选状态（reason + threshold；跨渲染保留用户选择）
   let reviewReason = 'low_score';
   let reviewThreshold = '0.5';
+
+  // 评估域列表分页状态（组件 2）：cursor 模式保存游标栈与页码，slice
+  // 模式保存最近一次全量响应快照与页码；视图间相互隔离，进入/刷新由
+  // resetViewPaging 统一回第 1 页，视图内翻页只改本闭包状态。
+  let evaluatorCursorStack = [''];
+  let evaluatorPageIndex = 0;
+  let annotationCursorStack = [''];
+  let annotationPageIndex = 0;
+  // 人工标注当前成功页 items 快照：导出闭包只允许引用当前页，新请求
+  // 发出前清空，catch/finally 不得恢复旧页（组件 4 导出合同）。
+  let annotationPageItems = [];
+  let datasetsItems = [];
+  let datasetsPageIndex = 0;
+  let experimentsItems = [];
+  let experimentsPageIndex = 0;
+  let capabilitiesItems = [];
+  let capabilitiesPageIndex = 0;
+  let reviewItems = [];
+  let reviewPageIndex = 0;
+  // 概览两个全量返回列表（评分趋势/Producer 心跳）的 slice 分页快照与
+  // 页码，视图间隔离，进入/刷新由 resetViewPaging 统一回第 1 页。
+  let trendItems = [];
+  let trendPageIndex = 0;
+  let producerItems = [];
+  let producerPageIndex = 0;
+
+  function resetEvaluatorPaging() {
+    evaluatorCursorStack = [''];
+    evaluatorPageIndex = 0;
+  }
+  function resetAnnotationPaging() {
+    annotationCursorStack = [''];
+    annotationPageIndex = 0;
+  }
+  function resetViewPaging(view) {
+    if (view === 'evaluators') resetEvaluatorPaging();
+    else if (view === 'annotations') resetAnnotationPaging();
+    else if (view === 'results') resetResultsPaging();
+    else if (view === 'datasets') datasetsPageIndex = 0;
+    else if (view === 'experiments') experimentsPageIndex = 0;
+    else if (view === 'capabilities') capabilitiesPageIndex = 0;
+    else if (view === 'review') reviewPageIndex = 0;
+    else if (view === 'judge-model') judgeSupplyProviderPageIndex = 0;
+    else if (view === 'overview') {
+      trendPageIndex = 0;
+      producerPageIndex = 0;
+    }
+  }
   // 模块内当前打开的弹窗（deactivate 时统一关闭）
   let openBackdrop = null;
 
@@ -295,6 +351,21 @@
     return block;
   }
 
+  // 概览 Sector 壳：复用 sectionPanel（status-panel + panel-header +
+  // panel-body），对齐安全-概览 security.js sector() 的分块结构；概览备注
+  // 按主题分 Sector 展示，禁止 kvRow 无边界堆叠。
+  function overviewSector(titleText, tipText) {
+    return sectionPanel(titleText, tipText ? { tip: tipText } : {});
+  }
+
+  // 概览备注网格：复用安全页 policy-cfg 双列网格 + policy-item kv 行，
+  // 入参为 [label, value] 二元组列表。
+  function overviewGrid(rows) {
+    const grid = el('div', 'policy-cfg');
+    rows.forEach(([label, value]) => grid.appendChild(kvRow(label, value)));
+    return grid;
+  }
+
   // 置灰但不隐藏的不可用操作：无 click handler，harness findButton 不可见。
   function disabledButton(label) {
     const btn = el('button', 'btn');
@@ -302,6 +373,39 @@
     btn.textContent = label;
     btn.disabled = true;
     return btn;
+  }
+
+  // 评估域列表统一每页数量，禁止各视图散落字面量。待复核的 50 是后端
+  // 窗口大小而非每页大小，使用独立常量 REVIEW_WINDOW_LIMIT，不得引用本常量。
+  const LIST_PAGE_SIZE = 20;
+  const REVIEW_WINDOW_LIMIT = 50;
+
+  // 统一翻页条：div.evaluations-pager + info + 上一页/下一页（始终占位、
+  // 边界 disabled 不隐藏，保持布局不跳动）。info 统一显「第 N/M 页」：
+  // slice 模式传 totalPages 直接使用；cursor 模式后端无总数，分母按已知
+  // 页数下界推断（hasNext 时至少还有一页取 pageNo+1，到底取 pageNo），
+  // 不编造或推算服务端总页数。
+  function pagerBar(options) {
+    const row = el('div', 'evaluations-pager');
+    const info = el('span', 'evaluations-pager__info');
+    const pageNo = options.pageIndex + 1;
+    const totalPages = options.totalPages !== undefined
+      ? options.totalPages
+      : pageNo + (options.hasNext ? 1 : 0);
+    info.textContent = '第 ' + pageNo + '/' + totalPages + ' 页';
+    row.appendChild(info);
+    if (options.hasPrev) row.appendChild(actionButton('上一页', options.onPrev));
+    else row.appendChild(disabledButton('上一页'));
+    if (options.hasNext) row.appendChild(actionButton('下一页', options.onNext));
+    else row.appendChild(disabledButton('下一页'));
+    return row;
+  }
+
+  // slice 模式通用切片与总页数：空数组总页数为 1，杜绝第 1/0 页。
+  function slicePage(items, pageIndex) {
+    const totalPages = Math.max(1, Math.ceil(items.length / LIST_PAGE_SIZE));
+    const start = pageIndex * LIST_PAGE_SIZE;
+    return { pageItems: items.slice(start, start + LIST_PAGE_SIZE), totalPages: totalPages };
   }
 
   // 筛选区：filterBar 弹性容器 + filterItem（Label+Control+HelpText）。
@@ -372,6 +476,7 @@
     const btn = el('button', 'btn');
     btn.type = 'button';
     btn.textContent = label;
+    btn.disabled = false;
     btn.addEventListener('click', onClick);
     return btn;
   }
@@ -544,124 +649,184 @@
     }
     if (token !== renderToken || seq !== viewRequestSeq.overview) return;
     wrap.textContent = '';
-    // 主动作入面板 header：重渲染先清空再挂，避免重复按钮
-    if (body.evaluationsHeaderActions) {
-      body.evaluationsHeaderActions.textContent = '';
-      body.evaluationsHeaderActions.appendChild(
-        actionButton('修订配置', () => openConfigModal(resolved, () => renderOverview(body, renderToken))));
-    }
     const cfg = resolved.config || {};
-    wrap.appendChild(kvRow('评估开关', cfg.evaluation_enabled ? '启用' : '停用'));
-    wrap.appendChild(kvRow('采样率', cfg.evaluation_sampling_rate));
-    wrap.appendChild(kvRow('Worker 并发', cfg.evaluation_worker_concurrency));
-    wrap.appendChild(kvRow('配置版本', resolved.version));
-    wrap.appendChild(kvRow('最近更新', formatTime(resolved.updated_at)));
-
     // M3a：容量积压与日预算用量
     const capacity = overview.capacity || {};
-    if (!capacity.probe_available) {
-      wrap.appendChild(kvRow('容量', '容量探针不可用'));
-    } else {
-      wrap.appendChild(kvRow(
-        '待处理作业（积压）',
-        capacity.pending_jobs + ' / ' + capacity.max_pending_jobs,
-      ));
-      wrap.appendChild(kvRow(
-        '证据正文占用',
-        capacity.evidence_bytes + ' / ' + capacity.max_evidence_bytes + ' 字节',
-      ));
-      const pendingRatio = capacity.max_pending_jobs
-        ? capacity.pending_jobs / capacity.max_pending_jobs : 0;
-      if (pendingRatio >= 0.8) {
-        // N1：长句提示不用状态徽章（徽章只承载封闭短状态）
-        wrap.appendChild(el('div', 'evaluations-hint',
-          '积压接近容量上限，请检查 worker'));
-      }
-    }
     const budget = overview.budget || {};
     const ceiling = budget.daily_call_ceiling;
-    wrap.appendChild(kvRow(
-      '当日 Judge 调用（预算）',
-      (budget.settled_calls || 0) + ' 结算 / ' + (budget.reserved_calls || 0)
-        + ' 预留' + (ceiling ? (' / 上限 ' + ceiling) : ' / 未设上限'),
-    ));
-
-    // M3e：观测后端证据保留边界（7 天到期清理，评分值不受影响）
-    wrap.appendChild(kvRow(
-      '证据快照保留',
-      (overview.evidence_retention_days || 7) + ' 天（到期清理快照正文；'
-        + '评分值与 Langfuse 历史投影不受影响）',
-    ));
-
     // M3b：低覆盖提示（实验尚无任何 current 结果）
     const counts = overview.experiment_results || {};
     const lowCoverage = (experiments.items || [])
       .filter((item) => !counts[item.experiment_id])
       .map((item) => item.experiment_id);
-    if (lowCoverage.length) {
-      const hint = el('div', 'evaluations-hint',
-        '低覆盖提示：以下实验尚无评估结果（0 条）—— ' + lowCoverage.join(', '));
-      wrap.appendChild(hint);
-    }
-
-    // 评分趋势卡（Task 13/spec 4.5）：按 (DefinitionKey, 版本, provenance)
+    // 评分趋势（Task 13/spec 4.5）：按 (DefinitionKey, 版本, provenance)
     // 分组展示样本数/时间窗/分布；时间窗 UTC 展示 UTC+8；覆盖率 unknown
     // 须解释"缺少应评估目标总数"，不宣称采样覆盖率
-    wrap.appendChild(blockTitle('评分趋势',
-      '覆盖率 unknown 表示缺少应评估目标总数；趋势按 UTC+8 自然日分桶。'));
     const trend = analytics || {};
     const trendWindow = trend.window || {};
-    wrap.appendChild(kvRow('统计时间窗',
-      formatTime(trendWindow.from) + ' ~ ' + formatTime(trendWindow.to)));
-    wrap.appendChild(kvRow('统计快照', formatTime(trend.snapshot_at)));
     const trendCoverage = trend.coverage || {};
-    wrap.appendChild(el('div', 'evaluations-note',
-      '覆盖率口径：' + (trendCoverage.status || 'unknown')
-        + '（' + (trendCoverage.reason || '缺少应评估目标总数') + '）；'
-        + '趋势按 UTC+8 自然日分桶。'));
     const trendGroups = Array.isArray(trend.groups) ? trend.groups : [];
-    if (!trendGroups.length) {
-      // 空态三要素：前缀事实 + 原因/下一步 + 筛选影响说明
-      wrap.appendChild(el('div', 'empty-state',
-        '暂无有效评分。当前统计时间窗内评估作业尚未产出有效值'
-          + '（结果可能仍在排队，或全部为异常/跳过）；请等待评估完成或检查 worker 作业状态。'
-          + '本概览为全局汇总，不受查询筛选条件影响。'));
-    } else {
-      wrap.appendChild(scrollTable(table(
-        ['指标', '版本', '来源', '输出类型', { label: '样本数', numeric: true }, '有效值统计', '异常/跳过'],
-        trendGroups.map((group) => [
-          group.definition_id,
-          group.definition_version,
-          group.provenance,
-          group.output_type,
-          group.total_count,
-          trendStatsText(group),
-          trendExecText(group),
-        ]),
-      )));
+    const states = overview.producer_states || [];
+
+    // 列表 Sector 1：评分趋势。全量返回接口走 slice 模式（LIST_PAGE_SIZE）。
+    // 统计时间窗/快照/覆盖率口径/低覆盖提示等备注收进标题 hover tips
+    //（PRD 161 行精调），列表下不再保留备注块。
+    trendItems = trendGroups;
+    trendPageIndex = 0;
+    // tips 分事项换行（.panel-tips white-space: pre-line），一条一行，
+    // 低覆盖实验 id 逐行列出
+    const trendTipLines = [
+      '统计时间窗：' + formatTime(trendWindow.from) + ' ~ ' + formatTime(trendWindow.to),
+      '统计快照：' + formatTime(trend.snapshot_at),
+      '覆盖率口径：' + (trendCoverage.status || 'unknown')
+        + '（' + (trendCoverage.reason || '缺少应评估目标总数') + '）',
+      '趋势按 UTC+8 自然日分桶',
+    ];
+    if (lowCoverage.length) {
+      trendTipLines.push('低覆盖（以下实验尚无评估结果 0 条）：');
+      lowCoverage.forEach((id) => trendTipLines.push('- ' + id));
+    }
+    const trendTip = trendTipLines.join('\n');
+    const trendSection = overviewSector('评分趋势', trendTip);
+    wrap.appendChild(trendSection.panel);
+    const drawTrend = () => {
+      trendSection.body.textContent = '';
+      const sliced = slicePage(trendItems, trendPageIndex);
+      if (!trendItems.length) {
+        // 空态三要素：前缀事实 + 原因/下一步 + 筛选影响说明
+        trendSection.body.appendChild(el('div', 'empty-state',
+          '暂无有效评分。当前统计时间窗内评估作业尚未产出有效值'
+            + '（结果可能仍在排队，或全部为异常/跳过）；请等待评估完成或检查 worker 作业状态。'
+            + '本概览为全局汇总，不受查询筛选条件影响。'));
+      } else {
+        trendSection.body.appendChild(scrollTable(table(
+          ['指标', '版本', '来源', '输出类型', { label: '样本数', numeric: true }, '有效值统计', '异常/跳过'],
+          sliced.pageItems.map((group) => [
+            group.definition_id,
+            group.definition_version,
+            group.provenance,
+            group.output_type,
+            group.total_count,
+            trendStatsText(group),
+            trendExecText(group),
+          ]),
+        )));
+      }
+      trendSection.body.appendChild(pagerBar({
+        pageIndex: trendPageIndex,
+        hasPrev: trendPageIndex > 0,
+        hasNext: trendPageIndex + 1 < sliced.totalPages,
+        totalPages: sliced.totalPages,
+        onPrev: () => {
+          trendPageIndex -= 1;
+          drawTrend();
+        },
+        onNext: () => {
+          trendPageIndex += 1;
+          drawTrend();
+        },
+      }));
+      // 统计时间窗/快照/覆盖率口径/低覆盖提示均已收进标题 hover tips
+      //（见 trendTip），列表下不再保留备注块
+    };
+    drawTrend();
+
+    // 列表 Sector 2：Producer 心跳（M3a，仅有心跳数据时渲染），同样走
+    // 标准 slice 分页。
+    if (states.length) {
+      producerItems = states;
+      producerPageIndex = 0;
+      const producerSection = overviewSector('Producer 心跳');
+      wrap.appendChild(producerSection.panel);
+      const drawProducer = () => {
+        producerSection.body.textContent = '';
+        const sliced = slicePage(producerItems, producerPageIndex);
+        producerSection.body.appendChild(scrollTable(table(
+          ['Producer',
+            { label: 'Epoch', numeric: true },
+            { label: '累计捕获', numeric: true },
+            { label: '捕获错误', numeric: true },
+            { label: '队列满', numeric: true },
+            '观测时间'],
+          sliced.pageItems.map((s) => [
+            s.producer_id,
+            s.counter_epoch,
+            s.captured_count,
+            s.capture_error_count,
+            s.queue_full_count,
+            formatTime(s.observed_at),
+          ]),
+        )));
+        producerSection.body.appendChild(pagerBar({
+          pageIndex: producerPageIndex,
+          hasPrev: producerPageIndex > 0,
+          hasNext: producerPageIndex + 1 < sliced.totalPages,
+          totalPages: sliced.totalPages,
+          onPrev: () => {
+            producerPageIndex -= 1;
+            drawProducer();
+          },
+          onNext: () => {
+            producerPageIndex += 1;
+            drawProducer();
+          },
+        }));
+      };
+      drawProducer();
     }
 
-    // producer 心跳（M3a）
-    const states = overview.producer_states || [];
-    if (states.length) {
-      wrap.appendChild(blockTitle('Producer 心跳'));
-      wrap.appendChild(scrollTable(table(
-        ['Producer',
-          { label: 'Epoch', numeric: true },
-          { label: '累计捕获', numeric: true },
-          { label: '捕获错误', numeric: true },
-          { label: '队列满', numeric: true },
-          '观测时间'],
-        states.map((s) => [
-          s.producer_id,
-          s.counter_epoch,
-          s.captured_count,
-          s.capture_error_count,
-          s.queue_full_count,
-          formatTime(s.observed_at),
-        ]),
-      )));
+    // 运行配置 Sector：修订配置入口挂本 Sector 右上角（PRD 160 行精调，
+    // 不再放在外层页壳 header）
+    const configSection = sectionPanel('运行配置', {
+      actions: [actionButton('修订配置',
+        () => openConfigModal(resolved, () => renderOverview(body, renderToken)))],
+    });
+    configSection.body.appendChild(overviewGrid([
+      ['评估开关', cfg.evaluation_enabled ? '启用' : '停用'],
+      ['采样率', cfg.evaluation_sampling_rate],
+      ['Worker 并发', cfg.evaluation_worker_concurrency],
+      ['配置版本', resolved.version],
+      ['最近更新', formatTime(resolved.updated_at)],
+    ]));
+    wrap.appendChild(configSection.panel);
+
+    // 容量与预算 Sector：M3a 容量积压/日预算 + M3e 证据保留边界
+    // （7 天到期清理，评分值不受影响）。
+    const capacitySection = overviewSector('容量与预算');
+    const capacityRows = [];
+    if (!capacity.probe_available) {
+      capacityRows.push(['容量', '容量探针不可用']);
+    } else {
+      capacityRows.push([
+        '待处理作业（积压）',
+        capacity.pending_jobs + ' / ' + capacity.max_pending_jobs,
+      ]);
+      capacityRows.push([
+        '证据正文占用',
+        capacity.evidence_bytes + ' / ' + capacity.max_evidence_bytes + ' 字节',
+      ]);
     }
+    capacityRows.push([
+      '当日 Judge 调用（预算）',
+      (budget.settled_calls || 0) + ' 结算 / ' + (budget.reserved_calls || 0)
+        + ' 预留' + (ceiling ? (' / 上限 ' + ceiling) : ' / 未设上限'),
+    ]);
+    capacityRows.push([
+      '证据快照保留',
+      (overview.evidence_retention_days || 7) + ' 天（到期清理快照正文；'
+        + '评分值与 Langfuse 历史投影不受影响）',
+    ]);
+    capacitySection.body.appendChild(overviewGrid(capacityRows));
+    if (capacity.probe_available) {
+      const pendingRatio = capacity.max_pending_jobs
+        ? capacity.pending_jobs / capacity.max_pending_jobs : 0;
+      if (pendingRatio >= 0.8) {
+        // N1：长句提示不用状态徽章（徽章只承载封闭短状态）
+        capacitySection.body.appendChild(el('div', 'evaluations-hint',
+          '积压接近容量上限，请检查 worker'));
+      }
+    }
+    wrap.appendChild(capacitySection.panel);
   }
 
   // C 类配置 CAS 修订弹窗（禁原生 alert/confirm；冲突 409 不自动重试）。
@@ -772,6 +937,66 @@
   // 实验列表与详情
   // ------------------------------------------------------------------
 
+  // 数据集版本名自然序比较：数字块按数值（去前导零后先比长度再比字符串，
+  // 禁止 Number 转换以防超出安全整数丢精度），非数字块按 UTF-16 码元序；
+  // 同位置类型不一致时数字块在前；前缀较短者在前；块比较相等而原串不同
+  // （如 v01/v1）时以完整原串 UTF-16 兜底，仅完全相同返回 0。
+  function compareDatasetVersions(left, right) {
+    const a = String(left === undefined || left === null ? '' : left);
+    const b = String(right === undefined || right === null ? '' : right);
+    if (a === b) return 0;
+    const tokenize = (value) => {
+      const chunks = [];
+      const re = /\d+|\D+/g;
+      let match;
+      while ((match = re.exec(value)) !== null) {
+        if (/\d/.test(match[0])) {
+          chunks.push({ numeric: true, text: match[0].replace(/^0+/, '') || '0' });
+        } else {
+          chunks.push({ numeric: false, text: match[0] });
+        }
+      }
+      return chunks;
+    };
+    const ca = tokenize(a);
+    const cb = tokenize(b);
+    const count = Math.min(ca.length, cb.length);
+    for (let i = 0; i < count; i++) {
+      const x = ca[i];
+      const y = cb[i];
+      if (x.numeric !== y.numeric) return x.numeric ? -1 : 1;
+      if (x.numeric) {
+        if (x.text.length !== y.text.length) return x.text.length < y.text.length ? -1 : 1;
+        if (x.text !== y.text) return x.text < y.text ? -1 : 1;
+      } else if (x.text !== y.text) {
+        return x.text < y.text ? -1 : 1;
+      }
+    }
+    if (ca.length !== cb.length) return ca.length < cb.length ? -1 : 1;
+    return a < b ? -1 : 1;
+  }
+
+  // 扁平 items 按 dataset_id 保序聚合（Map，区分大小写，规避 __proto__
+  // 原型键冲突）；组内按自然序升序复制排序，latest 取最大，history 为其余
+  // 版本新到旧；不修改输入数组与 item 字段，invalid 版本保留。
+  function groupDatasetItems(items) {
+    const groups = new Map();
+    items.forEach((item) => {
+      const key = item.dataset_id;
+      if (!groups.has(key)) groups.set(key, { dataset_id: key, versions: [] });
+      groups.get(key).versions.push(item);
+    });
+    return Array.from(groups.values()).map((group) => {
+      const sorted = group.versions.slice().sort(
+        (x, y) => compareDatasetVersions(x.dataset_version, y.dataset_version));
+      return {
+        dataset_id: group.dataset_id,
+        latest: sorted[sorted.length - 1],
+        history: sorted.slice(0, -1).reverse(),
+      };
+    });
+  }
+
   async function renderDatasets(body, token) {
     body.textContent = '';
     if (body.evaluationsHeaderActions) {
@@ -783,7 +1008,8 @@
     const wrap = el('div', 'evaluations-datasets');
     body.appendChild(wrap);
     wrap.appendChild(el('div', 'evaluations-note',
-      '展示已导入及待复核审核后导出的数据集。版本不可覆盖，修改内容请导入新版本。'));
+      '展示已导入及待复核审核后导出的数据集。版本不可覆盖，修改内容请导入新版本。'
+        + '同一数据集按版本号自然序默认仅展示最新版本，旧版本通过「历史」查看。'));
     const dataBody = el('div', 'evaluations-data-body');
     wrap.appendChild(dataBody);
     showLoading(dataBody, '数据集加载中...');
@@ -792,18 +1018,58 @@
       if (token !== renderToken || seq !== viewRequestSeq.datasets) return;
       dataBody.textContent = '';
       const items = data.items || [];
-      if (!items.length) {
-        dataBody.appendChild(el('div', 'empty-state',
-          '暂无数据集。当前尚未导入或导出任何数据集；可通过「导入标注 JSON」创建，'
-            + '或在待复核页面审核后导出。此列表为全量展示，不受筛选条件影响。'));
-        return;
-      }
-      dataBody.appendChild(scrollTable(table(['数据集 ID', '版本', '目标', { label: '用例数', numeric: true }, '校验', '操作'], items.map(item => [
-        item.dataset_id, item.dataset_version, item.target_kind || '-',
-        item.case_count,
-        item.status === 'valid' ? '通过' : '校验失败',
-        actionButton('详情', () => openDatasetDetail(item.dataset_id, item.dataset_version)),
-      ]))));
+      // 先按 dataset_id 聚合（分页单位是聚合后的数据集行，不是原始版本行），
+      // 再对聚合结果做内存切片
+      datasetsItems = groupDatasetItems(items);
+      datasetsPageIndex = 0;
+      const drawDatasets = () => {
+        const sliced = slicePage(datasetsItems, datasetsPageIndex);
+        if (!datasetsItems.length) {
+          dataBody.appendChild(el('div', 'empty-state',
+            '暂无数据集。当前尚未导入或导出任何数据集；可通过「导入标注 JSON」创建，'
+              + '或在待复核页面审核后导出。此列表为全量展示，不受筛选条件影响。'));
+        } else {
+          dataBody.appendChild(scrollTable(table(
+            ['数据集 ID', '版本', '目标', { label: '用例数', numeric: true }, '校验', '操作'],
+            sliced.pageItems.map((group) => {
+              const item = group.latest;
+              const actions = el('div', 'row-actions');
+              actions.appendChild(actionButton('详情',
+                () => openDatasetDetail(item.dataset_id, item.dataset_version)));
+              if (group.history.length) {
+                const history = group.history;
+                actions.appendChild(actionButton('历史',
+                  () => openDatasetHistory(item.dataset_id, history)));
+              } else {
+                actions.appendChild(disabledButton('历史'));
+              }
+              return [
+                item.dataset_id, item.dataset_version, item.target_kind || '-',
+                item.case_count,
+                item.status === 'valid' ? '通过' : '校验失败',
+                actions,
+              ];
+            }),
+          )));
+        }
+        dataBody.appendChild(pagerBar({
+          pageIndex: datasetsPageIndex,
+          hasPrev: datasetsPageIndex > 0,
+          hasNext: datasetsPageIndex + 1 < sliced.totalPages,
+          totalPages: sliced.totalPages,
+          onPrev: () => {
+            datasetsPageIndex -= 1;
+            dataBody.textContent = '';
+            drawDatasets();
+          },
+          onNext: () => {
+            datasetsPageIndex += 1;
+            dataBody.textContent = '';
+            drawDatasets();
+          },
+        }));
+      };
+      drawDatasets();
     } catch (err) {
       if (token !== renderToken || seq !== viewRequestSeq.datasets) return;
       renderErrorState(dataBody, '数据集加载失败：' + err.message, () => renderDatasets(body, renderToken));
@@ -840,6 +1106,30 @@
       if (token !== renderToken) return;
       alertMessage(err.message === 'dataset_invalid' ? '数据集校验失败，请检查内容及配对文件。' : '数据集详情加载失败：' + err.message);
     }
+  }
+
+  // 数据集历史 Modal：详情类弹窗（mountDetailModal，不响应 backdrop 点击），
+  // 数据为成功加载主表时的内存快照，无独立请求；行内详情先关弹窗再复用
+  // openDatasetDetail 的逐版本请求。
+  function openDatasetHistory(datasetId, historyItems) {
+    const frame = buildFrame('数据集历史 - ' + datasetId);
+    frame.form.appendChild(scrollTable(table(
+      ['版本', '目标', { label: '用例数', numeric: true }, '校验', '操作'],
+      historyItems.map((item) => {
+        const actions = el('div', 'row-actions');
+        actions.appendChild(actionButton('详情', () => {
+          closeBackdrop(frame.backdrop);
+          openDatasetDetail(datasetId, item.dataset_version);
+        }));
+        return [
+          item.dataset_version, item.target_kind || '-', item.case_count,
+          item.status === 'valid' ? '通过' : '校验失败',
+          actions,
+        ];
+      }),
+    )));
+    formActions(frame.form, '关闭');
+    mountDetailModal(frame);
   }
 
   function openDatasetImport() {
@@ -895,20 +1185,28 @@
     showBackdrop(frame.backdrop);
   }
 
+  // 执行任务视图（实验子域顶导首项）：发起实验入口挂 Sector Header，
+  // 执行列表占满 panel-body；控制器缺失时显式不可用提示，不解引用 null。
+  async function renderExecutions(body, token) {
+    body.textContent = '';
+    if (body.evaluationsHeaderActions) body.evaluationsHeaderActions.textContent = '';
+    if (!executions) {
+      body.appendChild(el('div', 'empty-state', '执行任务暂不可用：执行模块未加载，请刷新页面重试。'));
+      return;
+    }
+    if (body.evaluationsHeaderActions) {
+      body.evaluationsHeaderActions.appendChild(actionButton('发起实验',
+        () => executions.openCreate(null, token, () => executions.renderList(body, renderToken))));
+    }
+    await executions.renderList(body, token);
+  }
+
   async function renderExperiments(body, token) {
     body.textContent = '';
-    if (executions && body.evaluationsHeaderActions) {
-      body.evaluationsHeaderActions.textContent = '';
-      body.evaluationsHeaderActions.appendChild(actionButton('发起实验', () => executions.openCreate(null, token)));
-    }
+    if (body.evaluationsHeaderActions) body.evaluationsHeaderActions.textContent = '';
     const seq = ++viewRequestSeq.experiments;
     const wrap = el('div', 'evaluations-experiments');
     body.appendChild(wrap);
-    if (executions) {
-      const executionList = el('div', 'evaluations-block');
-      wrap.appendChild(executionList);
-      executions.renderList(executionList, token);
-    }
     const dataBody = el('div', 'evaluations-data-body');
     wrap.appendChild(dataBody);
     showLoading(dataBody, '实验列表加载中...');
@@ -922,26 +1220,47 @@
     }
     if (token !== renderToken || seq !== viewRequestSeq.experiments) return;
     dataBody.textContent = '';
-    const items = Array.isArray(data.items) ? data.items : [];
-    if (!items.length) {
-      dataBody.appendChild(el('div', 'empty-state',
-        '暂无实验。实验由 execute/replay 评估作业创建；可通过「发起实验」启动数据集测试，也可通过 CLI evaluate 发起。'
-          + '当前列表未设置筛选条件。'));
-      return;
-    }
-    const rows = items.map((item) => {
-      const detailBtn = actionButton('详情', () => openExperimentModal(item.experiment_id));
-      return [
-        item.experiment_id,
-        item.dataset_id + '/' + item.dataset_version,
-        item.mode,
-        statusBadge(item.status),
-        formatTime(item.created_at),
-        detailBtn,
-      ];
-    });
-    dataBody.appendChild(scrollTable(
-      table(['实验ID', '数据集', '模式', '状态', '创建时间', '操作'], rows)));
+    experimentsItems = Array.isArray(data.items) ? data.items : [];
+    experimentsPageIndex = 0;
+    const drawExperiments = () => {
+      const sliced = slicePage(experimentsItems, experimentsPageIndex);
+      if (!experimentsItems.length) {
+        dataBody.appendChild(el('div', 'empty-state',
+          '暂无实验。实验由 execute/replay 评估作业创建；可通过「发起实验」启动数据集测试，也可通过 CLI evaluate 发起。'
+            + '当前列表未设置筛选条件。'));
+      } else {
+        const rows = sliced.pageItems.map((item) => {
+          const detailBtn = actionButton('详情', () => openExperimentModal(item.experiment_id));
+          return [
+            item.experiment_id,
+            item.dataset_id + '/' + item.dataset_version,
+            item.mode,
+            statusBadge(item.status),
+            formatTime(item.created_at),
+            detailBtn,
+          ];
+        });
+        dataBody.appendChild(scrollTable(
+          table(['实验ID', '数据集', '模式', '状态', '创建时间', '操作'], rows)));
+      }
+      dataBody.appendChild(pagerBar({
+        pageIndex: experimentsPageIndex,
+        hasPrev: experimentsPageIndex > 0,
+        hasNext: experimentsPageIndex + 1 < sliced.totalPages,
+        totalPages: sliced.totalPages,
+        onPrev: () => {
+          experimentsPageIndex -= 1;
+          dataBody.textContent = '';
+          drawExperiments();
+        },
+        onNext: () => {
+          experimentsPageIndex += 1;
+          dataBody.textContent = '';
+          drawExperiments();
+        },
+      }));
+    };
+    drawExperiments();
   }
 
   async function openExperimentModal(experimentId) {
@@ -1295,7 +1614,7 @@
   }
 
   function resultsQueryParams() {
-    const params = { limit: 50 };
+    const params = { limit: LIST_PAGE_SIZE };
     const cursor = resultsCursorStack[resultsPageIndex];
     if (cursor) params.cursor = cursor;
     Object.keys(resultsFilters).forEach((key) => {
@@ -1399,32 +1718,25 @@
     dataBody.textContent = '';
     const items = Array.isArray(data.items) ? data.items : [];
     // 游标分页（spec 4.5）：上一页走历史游标栈回退，下一页携带响应
-    // next_cursor 入栈。pager 对齐项目标准（observations-pager）：右对齐、
-    // 页码 info、按钮始终占位、边界态禁用而非隐藏；pager 先于空态构建，
-    // 第 2+ 页返回空 items 时仍保留"上一页"入口，避免用户被卡死在空页
-    const pagerRow = el('div', 'evaluations-pager');
-    const pageInfo = el('span', 'evaluations-pager__info');
-    pageInfo.textContent = '第 ' + (resultsPageIndex + 1) + ' 页';
-    pagerRow.appendChild(pageInfo);
-    if (resultsPageIndex > 0) {
-      pagerRow.appendChild(actionButton('上一页', () => {
+    // next_cursor 入栈。统一 pagerBar：按钮始终占位、边界态禁用而非隐藏；
+    // pager 先于空态构建，第 2+ 页返回空 items 时仍保留"上一页"入口，
+    // 避免用户被卡死在空页。
+    const nextCursor = data.next_cursor ? String(data.next_cursor) : '';
+    const pagerRow = pagerBar({
+      pageIndex: resultsPageIndex,
+      hasPrev: resultsPageIndex > 0,
+      hasNext: !!nextCursor,
+      onPrev: () => {
         resultsPageIndex -= 1;
-        renderResults(body, renderToken);
-      }));
-    } else {
-      pagerRow.appendChild(disabledButton('上一页'));
-    }
-    if (data.next_cursor) {
-      const nextCursor = String(data.next_cursor);
-      pagerRow.appendChild(actionButton('下一页', () => {
+        return renderResults(body, renderToken);
+      },
+      onNext: () => {
         resultsCursorStack = resultsCursorStack.slice(0, resultsPageIndex + 1);
         resultsCursorStack.push(nextCursor);
         resultsPageIndex += 1;
-        renderResults(body, renderToken);
-      }));
-    } else {
-      pagerRow.appendChild(disabledButton('下一页'));
-    }
+        return renderResults(body, renderToken);
+      },
+    });
     if (!items.length) {
       // 空态三分支：空分页优先（保留上一页入口），其次按有无筛选给下一步
       if (resultsPageIndex > 0) {
@@ -1455,10 +1767,7 @@
       rows,
     )));
     dataBody.appendChild(pagerRow);
-    dataBody.appendChild(el('div', 'evaluations-note',
-      '状态口径：质量不通过/通过来自 boolean 或阈值判定；评估失败/跳过为'
-      + '执行态；投递等待与未关联在详情中展示（unlinked 为目标无真实身份，'
-      + '不创建悬空 Score）。'));
+    // 状态口径备注收进"结果"标题 hover tips（views.results shellTip）
   }
 
   async function openResultModal(resultId) {
@@ -1580,7 +1889,8 @@
     const listBody = el('div', 'evaluations-review__list');
     wrap.appendChild(listBody);
     showLoading(listBody, '待复核队列加载中...');
-    const params = { reason: reviewReason, threshold: reviewThreshold, limit: 50 };
+    // 50 是后端单次返回窗口大小而非每页大小；slice pager 只在窗口内翻页
+    const params = { reason: reviewReason, threshold: reviewThreshold, limit: REVIEW_WINDOW_LIMIT };
     let data;
     try {
       data = await api.evaluations.listReviewQueue(params);
@@ -1591,31 +1901,58 @@
     }
     if (token !== renderToken || seq !== viewRequestSeq.review) return;
     listBody.textContent = '';
-    const items = Array.isArray(data.items) ? data.items : [];
-    if (!items.length) {
-      const emptyText = reviewReason === 'low_score'
-        ? '当前筛选暂无待复核结果，当前低分原因及阈值下无匹配，可切换原因或调高低分阈值以扩大候选范围。'
-        : '当前筛选暂无待复核结果，可切换其他原因或等待符合条件的结果。';
-      listBody.appendChild(el('div', 'empty-state', emptyText));
-      wrap.appendChild(annotationEntryLink());
-      return;
-    }
-    const rows = items.map((item) => [
-      item.result_id,
-      item.metric_name,
-      item.provenance,
-      item.query ? item.query : '-',
-      item.typed_value === undefined || item.typed_value === null ? '-' : String(item.typed_value),
-      formatTime(item.created_at),
-    ]);
-    listBody.appendChild(scrollTable(table(
-      ['结果ID', '指标', '来源', '样本 Query', '值', '时间'],
-      rows,
-    )));
+    reviewItems = Array.isArray(data.items) ? data.items : [];
+    reviewPageIndex = 0;
+    const drawReview = () => {
+      const sliced = slicePage(reviewItems, reviewPageIndex);
+      if (!reviewItems.length) {
+        const emptyText = reviewReason === 'low_score'
+          ? '当前筛选暂无待复核结果，当前低分原因及阈值下无匹配，可切换原因或调高低分阈值以扩大候选范围。'
+          : '当前筛选暂无待复核结果，可切换其他原因或等待符合条件的结果。';
+        listBody.appendChild(el('div', 'empty-state', emptyText));
+      } else {
+        const rows = sliced.pageItems.map((item) => [
+          item.result_id,
+          item.metric_name,
+          item.provenance,
+          item.query ? item.query : '-',
+          item.typed_value === undefined || item.typed_value === null ? '-' : String(item.typed_value),
+          formatTime(item.created_at),
+        ]);
+        listBody.appendChild(scrollTable(table(
+          ['结果ID', '指标', '来源', '样本 Query', '值', '时间'],
+          rows,
+        )));
+      }
+      listBody.appendChild(pagerBar({
+        pageIndex: reviewPageIndex,
+        hasPrev: reviewPageIndex > 0,
+        hasNext: reviewPageIndex + 1 < sliced.totalPages,
+        totalPages: sliced.totalPages,
+        onPrev: () => {
+          reviewPageIndex -= 1;
+          listBody.textContent = '';
+          drawReview();
+        },
+        onNext: () => {
+          reviewPageIndex += 1;
+          listBody.textContent = '';
+          drawReview();
+        },
+      }));
+    };
+    drawReview();
+    // 窗口边界明示：不宣称已覆盖全部候选
+    wrap.appendChild(el('div', 'evaluations-note',
+      '仅对本次返回窗口分页，最多 ' + REVIEW_WINDOW_LIMIT + ' 条。'));
 
     // 审核后受控导出：金标由审核人逐 case 提供（禁止自动生成），导出经
-    // T12 校验并记录审批来源
-    wrap.appendChild(actionButton('审核后导出数据集', () => openExportModal(items, () => renderReviewQueue(body, renderToken))));
+    // T12 校验并记录审批来源；导出范围为当前展示页切片
+    if (reviewItems.length) {
+      const currentReviewPage = () => slicePage(reviewItems, reviewPageIndex).pageItems;
+      wrap.appendChild(actionButton('审核后导出数据集',
+        () => openExportModal(currentReviewPage(), () => renderReviewQueue(body, renderToken))));
+    }
     wrap.appendChild(annotationEntryLink());
   }
 
@@ -1827,8 +2164,78 @@
 
   function selectControl(name, options, current) {
     const select = document.createElement('select');
+    // 共享下拉外观：自定义 chevron 与右侧边距，禁止裸用原生箭头（见 styles.css .select-control）
+    select.className = 'select-control';
     select.name = name;
     return setOptions(select, options, current);
+  }
+
+  // 能力目录视图（独立顶导入口，只读）：展示服务端目录内可注册的指标组合。
+  // 新建评估器入口保留在"评估器"页，本页不放任何写操作。
+  async function renderCapabilities(body, token) {
+    body.textContent = '';
+    const seq = ++viewRequestSeq.capabilities;
+    const wrap = el('div', 'evaluators-view');
+    body.appendChild(wrap);
+    if (body.evaluationsHeaderActions) {
+      body.evaluationsHeaderActions.textContent = '';
+    }
+    const dataBody = el('div', 'evaluations-data-body');
+    wrap.appendChild(dataBody);
+    showLoading(dataBody, '能力目录加载中...');
+
+    let caps;
+    try {
+      caps = await api.evaluations.getCapabilities();
+    } catch (err) {
+      if (token !== renderToken || seq !== viewRequestSeq.capabilities) return;
+      renderErrorState(dataBody, '能力目录加载失败：' + (err && err.message ? err.message : ''),
+        () => renderCapabilities(body, renderToken));
+      return;
+    }
+    if (token !== renderToken || seq !== viewRequestSeq.capabilities) return;
+    dataBody.textContent = '';
+
+    const judgeConfigured = !!(caps && caps.judge_configured);
+    capabilitiesItems = (caps && Array.isArray(caps.entries)) ? caps.entries : [];
+    capabilitiesPageIndex = 0;
+    const drawCapabilities = () => {
+      const sliced = slicePage(capabilitiesItems, capabilitiesPageIndex);
+      if (!capabilitiesItems.length) {
+        dataBody.appendChild(el('div', 'empty-state',
+          '暂无能力目录。当前没有可注册的指标组合，请检查评估服务配置。'));
+      } else {
+        // spec 4.2：仅目录内组合可注册自动评估器
+        dataBody.appendChild(blockTitle('能力目录（仅目录内组合可注册自动评估器）'));
+        dataBody.appendChild(scrollTable(table(
+          ['方法', '指标', '目标类型', '输出类型', '状态'],
+          sliced.pageItems.map((entry) => [
+            EVALUATOR_METHOD_LABELS[entry.method] || entry.method,
+            entry.metric_name,
+            entry.target_kind,
+            entry.output_type,
+            evaluatorStatusText(entry, judgeConfigured),
+          ]),
+        )));
+      }
+      dataBody.appendChild(pagerBar({
+        pageIndex: capabilitiesPageIndex,
+        hasPrev: capabilitiesPageIndex > 0,
+        hasNext: capabilitiesPageIndex + 1 < sliced.totalPages,
+        totalPages: sliced.totalPages,
+        onPrev: () => {
+          capabilitiesPageIndex -= 1;
+          dataBody.textContent = '';
+          drawCapabilities();
+        },
+        onNext: () => {
+          capabilitiesPageIndex += 1;
+          dataBody.textContent = '';
+          drawCapabilities();
+        },
+      }));
+    };
+    drawCapabilities();
   }
 
   async function renderEvaluators(body, token) {
@@ -1857,10 +2264,12 @@
     ], evaluatorFilterMethod);
     kindSelect.addEventListener('change', () => {
       evaluatorFilterTargetKind = kindSelect.value;
+      resetEvaluatorPaging();
       renderEvaluators(body, renderToken);
     });
     methodSelect.addEventListener('change', () => {
       evaluatorFilterMethod = methodSelect.value;
+      resetEvaluatorPaging();
       renderEvaluators(body, renderToken);
     });
     filterRow.append(
@@ -1873,66 +2282,71 @@
     wrap.appendChild(dataBody);
     showLoading(dataBody, '评估器列表加载中...');
 
-    const params = { limit: 50 };
+    const params = { limit: LIST_PAGE_SIZE };
+    const evaluatorCursor = evaluatorCursorStack[evaluatorPageIndex];
+    if (evaluatorCursor) params.cursor = evaluatorCursor;
     if (evaluatorFilterTargetKind) params.target_kind = evaluatorFilterTargetKind;
     if (evaluatorFilterMethod) params.method = evaluatorFilterMethod;
 
     let data;
-    let caps;
     try {
-      [data, caps] = await Promise.all([
-        api.evaluations.listEvaluators(params),
-        api.evaluations.getCapabilities(),
-      ]);
+      // 能力目录已拆为独立顶导入口（renderCapabilities），列表页只拉注册评估器
+      data = await api.evaluations.listEvaluators(params);
     } catch (err) {
       if (token !== renderToken || seq !== viewRequestSeq.evaluators) return;
-      renderErrorState(dataBody, '评估器列表加载失败：' + (err && err.message ? err.message : ''),
+      const code = err && err.message ? err.message : '';
+      // protocol_invalid 在本接口也用于非游标参数校验，只有确认游标错误码
+      // 才走「重新查询」清栈分支；其余错误保留筛选并给出同页重试。
+      if (evaluatorCursor && code === 'cursor_invalid') {
+        dataBody.textContent = '';
+        dataBody.appendChild(el('div', 'error-state',
+          '游标已失效（过滤条件或查询快照不匹配），请重新查询'));
+        dataBody.appendChild(actionButton('重新查询', () => {
+          resetEvaluatorPaging();
+          renderEvaluators(body, renderToken);
+        }));
+        return;
+      }
+      renderErrorState(dataBody, '评估器列表加载失败：' + code,
         () => renderEvaluators(body, renderToken));
       return;
     }
     if (token !== renderToken || seq !== viewRequestSeq.evaluators) return;
     dataBody.textContent = '';
 
-    // 能力目录（spec 4.2：仅目录内组合可注册自动评估器）
-    const judgeConfigured = !!(caps && caps.judge_configured);
-    const entries = (caps && Array.isArray(caps.entries)) ? caps.entries : [];
-    if (entries.length) {
-      dataBody.appendChild(blockTitle('能力目录（仅目录内组合可注册自动评估器）'));
-      dataBody.appendChild(scrollTable(table(
-        ['方法', '指标', '目标类型', '输出类型', '状态'],
-        entries.map((entry) => [
-          EVALUATOR_METHOD_LABELS[entry.method] || entry.method,
-          entry.metric_name,
-          entry.target_kind,
-          entry.output_type,
-          evaluatorStatusText(entry, judgeConfigured),
-        ]),
-      )));
-    }
-
     const items = Array.isArray(data.items) ? data.items : [];
+    // 评估器列表兼作 Judge 模型候选来源：llm_judge 定义的非空 judge_model
+    // 全串去重合并进共享缓存，供建表单 datalist（过滤/分页只增不减）
+    mergeJudgeSupplyModels(items);
+    const evaluatorNextCursor = data.next_cursor ? String(data.next_cursor) : '';
+    // pager 先于空态构建：第 2+ 页空响应仍保留上一页出口
+    const evaluatorPager = pagerBar({
+      pageIndex: evaluatorPageIndex,
+      hasPrev: evaluatorPageIndex > 0,
+      hasNext: !!evaluatorNextCursor,
+      onPrev: () => {
+        evaluatorPageIndex -= 1;
+        return renderEvaluators(body, renderToken);
+      },
+      onNext: () => {
+        evaluatorCursorStack = evaluatorCursorStack.slice(0, evaluatorPageIndex + 1);
+        evaluatorCursorStack.push(evaluatorNextCursor);
+        evaluatorPageIndex += 1;
+        return renderEvaluators(body, renderToken);
+      },
+    });
     if (!items.length) {
       const hasEvaluatorFilter = !!(evaluatorFilterTargetKind || evaluatorFilterMethod);
-      dataBody.appendChild(el('div', 'empty-state', hasEvaluatorFilter
-        ? '暂无评估器。当前目标类型/方法筛选下无匹配注册项，可调整筛选条件，或点击「新建评估器」注册版本。'
-        : '暂无评估器。尚未注册任何评估器版本，可点击「新建评估器」新建；'
-          + '自动评估器仅能注册能力目录内的指标组合，注册后默认关闭，需显式启用。'));
-      return;
-    }
-
-    // spec 4.3：允许同指标多版本显式同时启用，页面提示会增加评估作业、
-    // 结果不合并
-    const enabledCountByMetric = {};
-    items.forEach((item) => {
-      if (item.method !== 'human' && item.usage && item.usage.online_enabled) {
-        enabledCountByMetric[item.metric_name] =
-          (enabledCountByMetric[item.metric_name] || 0) + 1;
+      if (evaluatorPageIndex > 0) {
+        dataBody.appendChild(el('div', 'empty-state', '当前分页无结果，请返回上一页'));
+      } else {
+        dataBody.appendChild(el('div', 'empty-state', hasEvaluatorFilter
+          ? '暂无评估器。当前目标类型/方法筛选下无匹配注册项，可调整筛选条件，或点击「新建评估器」注册版本。'
+          : '暂无评估器。尚未注册任何评估器版本，可点击「新建评估器」新建；'
+            + '自动评估器仅能注册能力目录内的指标组合（见顶导「能力目录」），注册后默认关闭，需显式启用。'));
       }
-    });
-    if (Object.keys(enabledCountByMetric)
-      .some((metric) => enabledCountByMetric[metric] > 1)) {
-      dataBody.appendChild(el('div', 'evaluations-hint',
-        '同一指标存在多个已启用版本：会增加评估作业，结果不合并。'));
+      dataBody.appendChild(evaluatorPager);
+      return;
     }
 
     dataBody.appendChild(scrollTable(table(
@@ -1941,14 +2355,11 @@
         '操作'],
       items.map((item) => {
         const usage = item.usage || {};
-        const actions = document.createElement('div');
+        const actions = el('div', 'row-actions');
         if (item.method === 'human') {
           // spec 4.3：human 禁线上启用（服务端 422）。置灰不隐藏：
-          // 无 click handler，同行常驻说明，不产生任何启停请求
+          // 无 click handler，不产生任何启停请求
           actions.appendChild(disabledButton('停用'));
-          const humanNote = el('small', 'evaluations-filter__help muted',
-            '人工评估器不支持自动使用启停');
-          actions.appendChild(humanNote);
           actions.appendChild(actionButton('详情',
             () => openEvaluatorDetail(item.definition_id, item.version)));
         } else {
@@ -1986,6 +2397,7 @@
         ];
       }),
       )));
+    dataBody.appendChild(evaluatorPager);
   }
 
   async function openEvaluatorDetail(definitionId, version) {
@@ -2071,6 +2483,48 @@
       return;
     }
 
+    // Judge 模型候选/有效供给模型（plan-261116 T6）：每次打开弹窗都刷新
+    // GET 投影（不要求先访问模型页）；失败仅提示并保留手输，不阻塞表单。
+    // per-modal 状态：touched（用户触碰过输入）/defaultApplied（异步默认
+    // 只回填一次）/draft（方法切换重建时保留已编辑草稿）。
+    let judgeModelTouched = false;
+    let judgeModelDefaultApplied = false;
+    let judgeModelDraft = source && source.method === 'llm_judge'
+      ? String(source.judge_model || '') : '';
+    const judgeModelListId = 'judge-model-options-' + (++judgeModelListSeq);
+    const applyJudgeModelDefault = () => {
+      // source（复制）冻结值永远优先，异步默认不覆盖；触碰过/已回填/弹窗已关/
+      // 已离开评估页/方法不是 llm_judge/无有效供给均不回填（无供给留空，
+      // 提交省略 judge_model 由后端归一为 None）
+      if (source || judgeModelTouched || judgeModelDefaultApplied) return;
+      if (openBackdrop !== frame.backdrop) return;
+      if (requestToken !== renderToken) return;
+      if (methodSelect.value !== 'llm_judge' || !judgeModelInput) return;
+      const projection = judgeSupply.projection;
+      const model = String((projection && projection.effective_model) || '');
+      if (!model) return;
+      judgeModelInput.value = model;
+      judgeModelDraft = model;
+      judgeModelDefaultApplied = true;
+    };
+    api.evaluations.getJudgeModel().then((projection) => {
+      if (requestToken !== renderToken) return;
+      judgeSupply.projection = projection || null;
+      if (projection && typeof projection.config_version === 'number') {
+        judgeSupply.configVersion = projection.config_version;
+      }
+      // 冷缓存缺口：表单已打开且 judge 字段在位时同步重建 datalist，
+      // 使异步回填的供给候选与预填值同批可见（方法切走时不重建，
+      // 切回时 rebuildDynamic 已按新缓存构建）
+      if (openBackdrop === frame.backdrop && judgeModelInput && judgeModelDatalist) {
+        fillJudgeModelDatalist(judgeModelDatalist);
+      }
+      applyJudgeModelDefault();
+    }).catch(() => {
+      if (requestToken !== renderToken) return;
+      alertMessage('默认评估模型候选加载失败，可手动输入 Judge 模型');
+    });
+
     const definitionIdInput = document.createElement('input');
     definitionIdInput.name = 'definition_id';
     definitionIdInput.value = source ? String(source.definition_id || '') : '';
@@ -2087,10 +2541,12 @@
     // 动态区：指标/输出类型/Judge 字段随 method 变化，选项由能力目录生成
     const dynamic = el('div', 'evaluations-export-cases');
     const kindSelect = document.createElement('select');
+    kindSelect.className = 'select-control';
     kindSelect.name = 'target_kind';
     let metricControl = null;
     let outputTypeSelect = null;
     let judgeModelInput = null;
+    let judgeModelDatalist = null;
     let rubricInput = null;
     let temperatureInput = null;
 
@@ -2117,6 +2573,7 @@
           if (!metrics.includes(entry.metric_name)) metrics.push(entry.metric_name);
         });
         metricControl = document.createElement('select');
+        metricControl.className = 'select-control';
         metricControl.name = 'metric_name';
         setOptions(metricControl, metrics.map((m) => [m, m]),
           source && source.method === method && metrics.includes(source.metric_name)
@@ -2130,6 +2587,7 @@
         if (!outputTypes.includes(entry.output_type)) outputTypes.push(entry.output_type);
       });
       outputTypeSelect = document.createElement('select');
+      outputTypeSelect.className = 'select-control';
       outputTypeSelect.name = 'output_type';
       setOptions(outputTypeSelect, outputTypes.map((o) => [o, o]),
         source && source.method === method && outputTypes.includes(source.output_type)
@@ -2138,9 +2596,20 @@
       if (method === 'llm_judge') {
         judgeModelInput = document.createElement('input');
         judgeModelInput.name = 'judge_model';
-        judgeModelInput.value = source && source.method === 'llm_judge'
-          ? String(source.judge_model || '') : '';
+        // 方法切走再切回保留已编辑草稿；datalist 候选 = 默认 Provider model
+        // + env 基线模型 + 已加载 llm_judge 定义 judge_model（全串去重），
+        // 经 input[list] 关联
+        judgeModelInput.value = judgeModelDraft;
+        judgeModelInput.setAttribute('list', judgeModelListId);
+        judgeModelInput.addEventListener('input', () => {
+          judgeModelTouched = true;
+          judgeModelDraft = judgeModelInput.value;
+        });
         fieldRow(dynamic, 'Judge 模型', judgeModelInput);
+        judgeModelDatalist = document.createElement('datalist');
+        judgeModelDatalist.setAttribute('id', judgeModelListId);
+        fillJudgeModelDatalist(judgeModelDatalist);
+        dynamic.appendChild(judgeModelDatalist);
         rubricInput = document.createElement('textarea');
         rubricInput.name = 'rubric';
         rubricInput.value = source && source.method === 'llm_judge' && source.judge_params
@@ -2154,6 +2623,7 @@
         fieldRow(dynamic, '采样温度 temperature（可选，0-2）', temperatureInput);
       } else {
         judgeModelInput = null;
+        judgeModelDatalist = null;
         rubricInput = null;
         temperatureInput = null;
       }
@@ -2163,13 +2633,20 @@
     fieldRow(form, '版本', versionInput);
     fieldRow(form, '方法', methodSelect);
     form.appendChild(dynamic);
-    methodSelect.addEventListener('change', () => rebuildDynamic());
+    methodSelect.addEventListener('change', () => {
+      rebuildDynamic();
+      // 切回 llm_judge 时热缓存即时预填（backdrop 已挂载，守卫放行）
+      applyJudgeModelDefault();
+    });
     rebuildDynamic();
     form.appendChild(errorLine);
     const actions = formActions(form, '取消', '注册版本');
     const submit = actions.querySelector('button[type="submit"]');
     showBackdrop(frame.backdrop);
     frame.closeBtn.addEventListener('click', () => closeBackdrop(frame.backdrop));
+    // 热缓存即时预填：rebuildDynamic 内不调 applyJudgeModelDefault（彼时
+    // backdrop 未挂载会被守卫拒绝），弹窗打开后补一次
+    applyJudgeModelDefault();
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -2197,12 +2674,25 @@
         output_type: String(outputTypeSelect.value || ''),
       };
       if (payload.method === 'llm_judge') {
-        payload.judge_model = judgeModelInput ? judgeModelInput.value.trim() : '';
-        // judge_model 为 llm_judge 必填项（服务端 422 同规则），缺失时不发请求
-        if (!payload.judge_model) {
-          errorLine.textContent = 'llm_judge 必须声明 Judge 模型（judge_model）';
-          errorLine.hidden = false;
-          return;
+        // T6：空输入不再强制拦截——未触碰且无有效供给（或显式清空）时
+        // 省略 judge_model 字段提交，后端归一为 None（跟随默认供给）；
+        // 显式输入仍严格校验：原始值不 trim 直接提交（服务端权威校验），
+        // 客户端只拦截首尾空白/控制字符/>200 码点（按 Array.from 码点计数）
+        const rawJudgeModel = judgeModelInput ? String(judgeModelInput.value) : '';
+        if (rawJudgeModel !== '') {
+          const judgeModelCodepoints = Array.from(rawJudgeModel);
+          const hasJudgeModelControlChar = judgeModelCodepoints.some((ch) => {
+            const cp = ch.codePointAt(0);
+            return cp <= 0x001f || (cp >= 0x007f && cp <= 0x009f);
+          });
+          if (rawJudgeModel !== rawJudgeModel.trim() || hasJudgeModelControlChar
+              || judgeModelCodepoints.length > 200) {
+            errorLine.textContent = 'Judge 模型不得含首尾空白或控制字符，'
+              + '且不超过 200 字符';
+            errorLine.hidden = false;
+            return;
+          }
+          payload.judge_model = rawJudgeModel;
         }
         const judgeParams = {};
         const rubric = rubricInput ? rubricInput.value.trim() : '';
@@ -2244,8 +2734,443 @@
   }
 
   // ------------------------------------------------------------------
-  // 人工标注视图（Task 12/spec 4.4）：标注队列（全部/待标注/已标注 +
-  // 低分/争议/异常）+ 详情（请求/回答证据并排 + 评分契约 + 原自动值/
+  // 模型页（plan-261116 T6）：Sector 1 Provider 列表（与 Agent 共用同一
+  // 注册表，/chat/providers 读取 + 页内编辑/新增/删除 modal；评估默认是
+  // C 类配置引用，走 PATCH /chat/evaluations/config CAS）+ Sector 2 评估
+  // 供给精简只读区。is_active 仅展示 Agent 当前启用状态，本页不调用
+  // activateProvider；设默认/取消默认成功后以服务端返回版本刷新 CAS 基线
+  // 并重载列表与供给投影（版本未变也刷新）；409 保留操作意图提示显式
+  // 刷新，禁止自动重放；列表/投影加载失败保留骨架可重试。Provider CRUD
+  // 成功后同时重拉列表与投影；modal 内密钥输入不落浏览器存储，关闭/成功
+  // 即清空。总闸关闭由 render() 的 status 探测拦截，不进入本视图。
+  // ------------------------------------------------------------------
+
+  // Judge 供给共享缓存（plan-261116 T6）：providers 为 Provider 注册表
+  // 列表快照，projection 为 GET /judge-model 投影快照，configVersion 为
+  // 下一次 CAS 的 expected_version（GET config_version 起步，PATCH 响应
+  // version 跟进）；usedModels 由评估器列表合并（method=llm_judge 且
+  // judge_model 非空，全串去重），供建表单 datalist。
+  const judgeSupply = { providers: [], projection: null, configVersion: null, usedModels: [] };
+  // Provider 列表 slice 分页页码（组件 2）：快照即 judgeSupply.providers，
+  // 进入/刷新/CRUD 成功由 renderJudgeModel 统一回第 1 页，翻页只改本状态。
+  let judgeSupplyProviderPageIndex = 0;
+
+  function mergeJudgeSupplyModels(items) {
+    const models = judgeSupply.usedModels.slice();
+    (Array.isArray(items) ? items : []).forEach((item) => {
+      if (!item || item.method !== 'llm_judge') return;
+      const model = String(item.judge_model || '');
+      if (model && !models.includes(model)) models.push(model);
+    });
+    judgeSupply.usedModels = models;
+  }
+
+  // 填充 datalist 选项（textContent 渲染）；调用方负责节点创建/挂载，
+  // 可重复调用以同步重建（异步投影回填后的冷缓存缺口修复）
+  function fillJudgeModelDatalist(datalist) {
+    datalist.textContent = '';
+    judgeModelCandidateValues().forEach((model) => {
+      const option = document.createElement('option');
+      option.value = model;
+      option.textContent = model;
+      datalist.appendChild(option);
+    });
+    return datalist;
+  }
+
+  // datalist 候选（plan-261116 T6）：默认 Provider model + env 基线模型 +
+  // 已加载 llm_judge 定义 judge_model（全串去重；textContent 渲染，
+  // 特殊字符天然安全）
+  function judgeModelCandidateValues() {
+    const projection = judgeSupply.projection || {};
+    const values = [];
+    [projection.default_provider_model, projection.env_baseline_model]
+      .forEach((model) => {
+        const value = String(model || '');
+        if (value && !values.includes(value)) values.push(value);
+      });
+    judgeSupply.usedModels.forEach((model) => {
+      const value = String(model || '');
+      if (value && !values.includes(value)) values.push(value);
+    });
+    return values;
+  }
+
+  // Provider 行操作列：编辑 + 删除（"设为评估默认"入口移至编辑 modal 勾选项）。
+  // is_active 行删除禁用（Agent 启用中的 Provider 不可删，后端 ProviderInUse
+  // 仍为权威）；评估默认但非 active 的行允许删除。
+  function judgeProviderActions(provider, body) {
+    const actions = el('div', 'row-actions');
+    actions.appendChild(actionButton('编辑',
+      () => openEvaluationProviderModal(provider, body)));
+    if (provider.is_active) {
+      actions.appendChild(disabledButton('删除'));
+    } else {
+      actions.appendChild(actionButton('删除', async () => {
+        const requestToken = renderToken;
+        if (!(await modal.confirm('确认删除 Provider「' + (provider.name || '') + '」？'
+            + '删除后评估默认引用将回落 env 基线。'))) return;
+        // 切页后（renderToken 失效）才返回的确认不再执行删除
+        if (requestToken !== renderToken) return;
+        try {
+          await api.deleteProvider(provider.id);
+          alertMessage('Provider 已删除');
+          if (requestToken === renderToken) await renderJudgeModel(body, requestToken);
+        } catch (err) {
+          const code = err && err.message ? err.message : '';
+          if (code === 'conflict') {
+            // 409：Provider 状态已被他人修改（如评估默认引用变化），删除未生效
+            alertMessage('删除冲突（409）：Provider 状态已被他人修改，删除未生效；'
+              + '请刷新页面核对后重试。');
+          } else {
+            // 兜底错误码不上屏（无操作指引价值），console 留诊断
+            console.error('evaluation provider delete failed:', code);
+            alertMessage('删除失败：操作失败，请稍后重试或刷新页面');
+          }
+        }
+      }));
+    }
+    return actions;
+  }
+
+  // 关闭即清空密钥输入（节点随 modal 移除，绝不写浏览器存储）
+  function closeEvaluationProviderModal(frame, apiKeyInput) {
+    apiKeyInput.value = '';
+    closeBackdrop(frame.backdrop);
+  }
+
+  // Provider 编辑/新增 modal（页内独立 DOM id，eval-provider-* 前缀；
+  // 结构对齐主模型页 providers-modal：字段名称置于控件上方，同构
+  // providers-form label 布局，不复用 policy-item 左侧标签）。密钥脱敏规则
+  // 同主页面：留空=不变（请求省略 api_key）、空格=清空（api_key=""）、
+  // 新增必填；"设为评估默认"勾选项在 Provider 保存成功后按需走 evaluations
+  // config CAS（openai-compatible 专用，anthropic 禁用并提示）；CRUD 失败
+  // 保留表单草稿。
+  function openEvaluationProviderModal(provider, body) {
+    const isEdit = !!provider;
+    const requestToken = renderToken;
+    const initialDefaultId = String(
+      (judgeSupply.projection || {}).default_provider_id || '');
+    const wasDefault = isEdit && String(provider.id) === initialDefaultId;
+    const frame = buildFrame(isEdit
+      ? '编辑 Provider：' + (provider.name || '') : '新增 Provider');
+    const form = frame.form;
+    form.appendChild(el('div', 'evaluations-note',
+      'Provider 配置与 Agent 共用，修改会影响共用该 Provider 的调用。'));
+    const nameInput = document.createElement('input');
+    nameInput.id = 'eval-provider-name';
+    nameInput.value = isEdit ? String(provider.name || '') : '';
+    const typeSelect = selectControl('eval-provider-type',
+      [['openai-compatible', 'openai-compatible'], ['anthropic', 'anthropic']],
+      isEdit ? String(provider.provider_type || 'openai-compatible')
+        : 'openai-compatible');
+    typeSelect.id = 'eval-provider-type';
+    const baseUrlInput = document.createElement('input');
+    baseUrlInput.id = 'eval-provider-base-url';
+    baseUrlInput.placeholder = 'http://...';
+    baseUrlInput.value = isEdit ? String(provider.base_url || '') : '';
+    const modelInput = document.createElement('input');
+    modelInput.id = 'eval-provider-model';
+    modelInput.value = isEdit ? String(provider.model || '') : '';
+    const apiKeyInput = document.createElement('input');
+    apiKeyInput.id = 'eval-provider-api-key';
+    apiKeyInput.type = 'password';
+    apiKeyInput.value = '';
+    apiKeyInput.placeholder = isEdit ? '留空保持不变；输入空格清空' : 'API Key（必填）';
+    const visionCheckbox = document.createElement('input');
+    visionCheckbox.id = 'eval-provider-vision';
+    visionCheckbox.type = 'checkbox';
+    visionCheckbox.checked = isEdit ? !!provider.supports_vision : true;
+    // 字段名称置于控件上方（对齐主模型页 providers-form 的 label 布局）
+    const fieldTop = (text, control) => {
+      const label = document.createElement('label');
+      label.appendChild(document.createTextNode(text));
+      label.appendChild(control);
+      form.appendChild(label);
+    };
+    fieldTop('名称', nameInput);
+    fieldTop('类型', typeSelect);
+    fieldTop('Base URL', baseUrlInput);
+    fieldTop('Model', modelInput);
+    fieldTop('API Key', apiKeyInput);
+    const visionLabel = el('label', 'providers-form__checkbox');
+    visionLabel.appendChild(visionCheckbox);
+    visionLabel.appendChild(document.createTextNode(' 支持 Vision（图片输入）'));
+    form.appendChild(visionLabel);
+    // "设为评估默认"勾选项：默认行勾选态跟随当前投影；openai-compatible
+    // 专用，类型切换为 anthropic 时禁用并清空，附原因提示
+    const defaultCheckbox = document.createElement('input');
+    defaultCheckbox.id = 'eval-provider-default';
+    defaultCheckbox.type = 'checkbox';
+    defaultCheckbox.checked = wasDefault;
+    const defaultLabel = el('label', 'providers-form__checkbox');
+    defaultLabel.appendChild(defaultCheckbox);
+    defaultLabel.appendChild(document.createTextNode(' 设为评估默认'));
+    form.appendChild(defaultLabel);
+    const defaultHint = el('div', 'providers-form__hint muted');
+    form.appendChild(defaultHint);
+    const syncDefaultAvailability = () => {
+      const supported = String(typeSelect.value || '') === 'openai-compatible';
+      defaultCheckbox.disabled = !supported;
+      if (!supported) defaultCheckbox.checked = false;
+      defaultHint.textContent = supported ? '' : 'anthropic 协议不支持作为评估默认';
+    };
+    typeSelect.addEventListener('change', syncDefaultAvailability);
+    syncDefaultAvailability();
+    form.appendChild(el('div', 'providers-form__hint muted', isEdit
+      ? 'API Key 状态: '
+        + (provider.api_key_present ? '已配置（脱敏不可见）' : '未配置')
+        + '。留空=不变；输入空格=清空。'
+      : '新增时 API Key 必填。'));
+    const errorLine = el('div', 'error-state');
+    errorLine.hidden = true;
+    form.appendChild(errorLine);
+    // 动作区按 formActions 同构手搭：取消路径同样走
+    // closeEvaluationProviderModal，与 × / 成功路径一致清空密钥输入
+    const actions = el('div', 'providers-form__actions');
+    actions.appendChild(actionButton('取消',
+      () => closeEvaluationProviderModal(frame, apiKeyInput)));
+    const submitBtn = el('button', 'btn btn--primary', '保存');
+    submitBtn.type = 'submit';
+    actions.appendChild(submitBtn);
+    form.appendChild(actions);
+    showBackdrop(frame.backdrop);
+    frame.closeBtn.addEventListener('click',
+      () => closeEvaluationProviderModal(frame, apiKeyInput));
+    // backdrop 空白点击关闭与 × 同路径：清空密钥输入后再关闭
+    //（showBackdrop 自带的空白关闭只做 closeBackdrop，不清密钥）
+    frame.backdrop.addEventListener('click', (event) => {
+      if (event.target === frame.backdrop) {
+        closeEvaluationProviderModal(frame, apiKeyInput);
+      }
+    });
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (submitBtn.disabled) return; // pending 防重复提交
+      const name = nameInput.value.trim();
+      const baseUrl = baseUrlInput.value.trim();
+      const model = modelInput.value.trim();
+      const rawKey = apiKeyInput.value;
+      if (!name || !baseUrl || !model) {
+        errorLine.textContent = '名称、Base URL 与 Model 必填';
+        errorLine.hidden = false;
+        return;
+      }
+      if (!isEdit && rawKey.trim() === '') {
+        errorLine.textContent = '新增 Provider 时 API Key 必填';
+        errorLine.hidden = false;
+        return;
+      }
+      const payload = {
+        name: name,
+        provider_type: String(typeSelect.value || ''),
+        base_url: baseUrl,
+        model: model,
+        supports_vision: !!visionCheckbox.checked,
+      };
+      if (isEdit) {
+        if (rawKey === '') {
+          // 留空 = 不变：请求省略 api_key
+        } else if (rawKey.trim() === '') {
+          payload.api_key = ''; // 纯空白 = 清空
+        } else {
+          payload.api_key = rawKey;
+        }
+      } else {
+        payload.api_key = rawKey;
+      }
+      // 勾选意图在 await 前捕获，避免请求期间表单状态漂移
+      const wantDefault = defaultCheckbox.checked;
+      errorLine.hidden = true;
+      submitBtn.disabled = true;
+      let savedId = isEdit ? String(provider.id) : '';
+      try {
+        if (isEdit) await api.updateProvider(provider.id, payload);
+        else {
+          const created = await api.createProvider(payload);
+          savedId = String((created && created.id) || '');
+        }
+      } catch (err) {
+        // 弹窗已关闭：迟到失败不回写（竞态隔离）
+        if (openBackdrop !== frame.backdrop) return;
+        const code = err && err.message ? err.message : '';
+        if (code === 'conflict') {
+          // 409：Provider 已被他人修改，本次保存未生效；提示显式刷新
+          errorLine.textContent = '保存冲突（409）：Provider 已被他人修改，本次未生效；'
+            + '请刷新页面核对后重试，不会自动重放。';
+        } else {
+          // 兜底错误码不上屏（无操作指引价值），console 留诊断
+          console.error('evaluation provider save failed:', code);
+          errorLine.textContent = '保存失败：操作失败，请稍后重试或刷新页面';
+        }
+        errorLine.hidden = false;
+        submitBtn.disabled = false;
+        return;
+      }
+      // Provider 已保存；评估默认勾选变化按需走 config CAS（失败不影响
+      // 已保存的 Provider，也不自动重放）
+      let defaultFailure = '';
+      if (wantDefault !== wasDefault) {
+        if (!savedId) {
+          defaultFailure = 'Provider 已保存，但设置评估默认失败：未取得 Provider 标识';
+        } else {
+          try {
+            const resp = await api.evaluations.patchConfig({
+              expected_version: judgeSupply.configVersion,
+              patch: { evaluation_judge_provider_id: wantDefault ? savedId : '' },
+            });
+            if (resp && typeof resp.version === 'number') {
+              judgeSupply.configVersion = resp.version;
+            }
+          } catch (err) {
+            const code = err && err.message ? err.message : '';
+            console.error('evaluation judge default failed:', code);
+            defaultFailure = 'Provider 已保存，但设置评估默认'
+              + (code === 'conflict'
+                ? '冲突（409）：评估配置已被他人修改，请刷新页面核对后重试'
+                : '失败：操作失败，请稍后重试或刷新页面');
+          }
+        }
+      }
+      closeEvaluationProviderModal(frame, apiKeyInput);
+      // 成功路径不弹提示 modal：modal 关闭 + 列表/默认列刷新即是反馈，
+      // 仅默认设置失败时提示
+      if (defaultFailure) alertMessage(defaultFailure);
+      // Provider CRUD/默认变更完成：重拉列表与供给投影（版本未变也刷新）
+      if (requestToken === renderToken) await renderJudgeModel(body, requestToken);
+    });
+  }
+
+  // Sector 渲染：Provider 列表表格 + 评估供给精简区（全部 textContent/value
+  // 渲染，不拼接 HTML；empty-state 复用共享样式类）。表格列与主模型页
+  // Provider 列表同构（名称/类型/Base URL/Model/Key/Vision/操作），"启用"
+  // 列替换为"默认"（是/否，当前评估默认）；不包滚动层，宽度与主模型页一致。
+  function renderJudgeSupplySectors(providerBody, supplyBody, body) {
+    const projection = judgeSupply.projection || {};
+    const defaultId = String(projection.default_provider_id || '');
+    providerBody.textContent = '';
+    // Provider 列表统一共享翻页（组件 2，slice 模式）：内存切片不重新取数，
+    // 空列表也显示 pagerBar（第 1/1 页、按钮禁用），保持布局一致。
+    const drawProviderList = () => {
+      const sliced = slicePage(judgeSupply.providers, judgeSupplyProviderPageIndex);
+      if (!judgeSupply.providers.length) {
+        providerBody.appendChild(el('div', 'empty-state',
+          '暂无 Provider。点击「新增」创建，或先在左导「模型」页配置 Agent Provider。'));
+      } else {
+        providerBody.appendChild(table(
+          ['名称', '类型', 'Base URL', 'Model', 'Key', 'Vision', '默认', '操作'],
+          sliced.pageItems.map((provider) => [
+            String(provider.name || '-'),
+            provider.provider_type || '-',
+            provider.base_url || '-',
+            provider.model || '-',
+            provider.api_key_present ? '已配置' : '未配置',
+            provider.supports_vision ? '✓' : '-',
+            String(provider.id) === defaultId ? '是' : '否',
+            judgeProviderActions(provider, body),
+          ]),
+        ));
+      }
+      providerBody.appendChild(pagerBar({
+        pageIndex: judgeSupplyProviderPageIndex,
+        hasPrev: judgeSupplyProviderPageIndex > 0,
+        hasNext: judgeSupplyProviderPageIndex + 1 < sliced.totalPages,
+        totalPages: sliced.totalPages,
+        onPrev: () => {
+          judgeSupplyProviderPageIndex -= 1;
+          providerBody.textContent = '';
+          drawProviderList();
+        },
+        onNext: () => {
+          judgeSupplyProviderPageIndex += 1;
+          providerBody.textContent = '';
+          drawProviderList();
+        },
+      }));
+    };
+    drawProviderList();
+    supplyBody.textContent = '';
+    const supplyGrid = el('div', 'policy-cfg');
+    supplyGrid.appendChild(kvRow('Judge 就绪状态',
+      projection.judge_ready ? '已就绪' : '未就绪'));
+    supplyGrid.appendChild(kvRow('供给来源', projection.supply_source === 'provider'
+      ? '默认 Provider' : (projection.supply_source === 'env' ? 'env 基线' : '')));
+    supplyGrid.appendChild(kvRow('有效模型', projection.effective_model));
+    supplyGrid.appendChild(kvRow('env 基线模型', projection.env_baseline_model));
+    supplyGrid.appendChild(kvRow('Provider 地址', projection.provider_base_url_host));
+    supplyBody.appendChild(supplyGrid);
+    if (!defaultId) {
+      supplyBody.appendChild(el('div', 'evaluations-note',
+        '未设置默认 Provider，回落 env 基线。'));
+    }
+    if (projection.default_provider_missing) {
+      supplyBody.appendChild(el('div', 'error-state',
+        '警示：默认 Provider 记录已不存在（可能已被删除），当前供给回落 env 基线；'
+        + '请重新设置默认或取消默认。'));
+    }
+    supplyBody.appendChild(el('div', 'evaluations-note',
+      'env 基线为 B 类 env-only，Dashboard 不可改；Provider 列表与 Agent 共用，'
+      + '评估默认仅为引用关系。'));
+    if (!projection.judge_ready) {
+      supplyBody.appendChild(el('div', 'error-state',
+        'Judge 未就绪：无完整供给（默认 Provider 缺失/不完整且 env 基线未配置），'
+        + '本次评估将返回未配置类错误。'));
+    }
+  }
+
+  async function renderJudgeModel(body, token) {
+    body.textContent = '';
+    const seq = ++viewRequestSeq.judgeModel;
+    const wrap = el('div', 'evaluators-view');
+    body.appendChild(wrap);
+    if (body.evaluationsHeaderActions) {
+      body.evaluationsHeaderActions.textContent = '';
+    }
+    // Sector 1：Provider 列表（新增入口挂 Sector header 右上角）；
+    // Sector 2：评估供给精简区（加载失败时保留骨架）
+    const providerPanel = sectionPanel('Provider 列表', {
+      actions: [actionButton('新增', () => openEvaluationProviderModal(null, body))],
+    });
+    wrap.appendChild(providerPanel.panel);
+    const providerBody = providerPanel.body;
+    showLoading(providerBody, 'Provider 列表加载中...');
+    const supplyPanel = sectionPanel('评估供给');
+    wrap.appendChild(supplyPanel.panel);
+    const supplyBody = supplyPanel.body;
+    showLoading(supplyBody, '评估供给加载中...');
+
+    let providers;
+    let projection;
+    try {
+      providers = await api.listProviders();
+      projection = await api.evaluations.getJudgeModel();
+    } catch (err) {
+      if (token !== renderToken || seq !== viewRequestSeq.judgeModel) return;
+      // 错误码不上屏（无操作指引价值），console 留诊断
+      console.error('evaluation provider list failed:',
+        err && err.message ? err.message : '');
+      renderErrorState(providerBody, 'Provider 列表加载失败：操作失败，请稍后重试或刷新页面',
+        () => renderJudgeModel(body, renderToken));
+      // 供给区保留加载骨架：重试成功后随视图整体恢复
+      return;
+    }
+    if (token !== renderToken || seq !== viewRequestSeq.judgeModel) return;
+
+    judgeSupply.providers = Array.isArray(providers) ? providers : [];
+    judgeSupply.projection = projection || null;
+    // 列表快照刷新即回第 1 页（首次进入/刷新/CRUD 成功都经此路径）
+    judgeSupplyProviderPageIndex = 0;
+    if (projection && typeof projection.config_version === 'number') {
+      judgeSupply.configVersion = projection.config_version;
+    }
+    renderJudgeSupplySectors(providerBody, supplyBody, body);
+  }
+
+  // ------------------------------------------------------------------
+  // 人工标注视图（Task 12/spec 4.4）：标注队列（状态/原因两个原生 select
+  // 同一筛选行，全部/待标注/已标注 + 低分/争议/异常，低分阈值固定 0.5）
+  // + 详情（请求/回答证据并排 + 评分契约 + 原自动值/
   // 当前人工值/修订号/证据状态）+ 受约束提交（request_key 重放 +
   // expected_revision CAS，409 显式重载不自动覆盖）+ 审核后导出集成
   // ------------------------------------------------------------------
@@ -2253,7 +3178,8 @@
   // 标注队列筛选状态（跨渲染保留用户选择，与 reviewReason 同模式）
   let annotationState = 'all';
   let annotationReason = 'low_score';
-  let annotationThreshold = '0.5';
+  // 低分阈值不再暴露用户配置，固定 0.5（与待复核队列默认值一致）
+  const ANNOTATION_LOW_SCORE_THRESHOLD = '0.5';
 
   const ANNOTATION_STATE_LABELS = {
     all: '全部',
@@ -2281,80 +3207,125 @@
 
   async function renderAnnotations(body, token) {
     body.textContent = '';
+    // Sector Header 操作区：导出按钮在加载/错误/空队列时禁用占位（不禁用隐藏，
+    // 保持操作区结构稳定），成功且当前页有数据时才可点；导出范围为当前页
+    // 切片，与表格/pager 展示严格一致，不跨页收集。
+    const mountAnnotationHeader = (canExport) => {
+      const actions = body.evaluationsHeaderActions;
+      if (!actions) return;
+      actions.textContent = '';
+      if (canExport) {
+        actions.appendChild(actionButton('审核后导出数据集',
+          () => openExportModal(slicePage(annotationPageItems, annotationPageIndex).pageItems)));
+      } else {
+        actions.appendChild(disabledButton('审核后导出数据集'));
+      }
+      actions.appendChild(actionButton('查看数据集列表',
+        () => init({ route: { scope: 'datasets' } })));
+    };
+    mountAnnotationHeader(false);
     const seq = ++viewRequestSeq.annotations;
     const wrap = el('div', 'evaluations-annotations');
     body.appendChild(wrap);
 
-    // 标注状态筛选（全部/待标注/已标注），role=group + aria-pressed
-    wrap.appendChild(focusableChoiceGroup('annotation-state', '标注状态',
+    // 筛选区：标注状态/标注原因两个原生 select 同一 filterBar 一行排布
+    // （共享 .select-control 外观，窄屏按 filterBar 合同 flex-wrap）。
+    // 状态组 all 项对应后端 all 枚举；原因枚举无 all（reason=all 会 422），
+    // 原因下拉不提供「全部」项，始终一项选中。低分阈值固定 0.5，不再暴露配置。
+    const filterRow = filterBar();
+    const stateSelect = selectControl('annotation_state',
       Object.keys(ANNOTATION_STATE_LABELS)
         .map(state => [state, ANNOTATION_STATE_LABELS[state]]),
-      annotationState,
-      (state) => {
-        annotationState = state;
-        renderAnnotations(body, renderToken);
-      }));
-
-    // 原因筛选（低分/争议/异常，与待复核队列同口径）
-    wrap.appendChild(focusableChoiceGroup('annotation-reason', '标注原因',
-      REVIEW_REASONS.map(reason => [reason, REVIEW_REASON_LABELS[reason]]),
-      annotationReason,
-      (reason) => {
-        annotationReason = reason;
-        renderAnnotations(body, renderToken);
-      }));
-
-    // 低分阈值（reason=low_score 时生效，与待复核队列同参数）
-    const thresholdInput = document.createElement('input');
-    thresholdInput.name = 'annotation_threshold';
-    thresholdInput.value = annotationThreshold;
-    thresholdInput.addEventListener('change', () => {
-      annotationThreshold = thresholdInput.value.trim() || '0.5';
+      annotationState);
+    stateSelect.addEventListener('change', () => {
+      annotationState = stateSelect.value;
+      resetAnnotationPaging();
       renderAnnotations(body, renderToken);
     });
-    const annotationThresholdHelp = annotationReason === 'low_score'
-      ? '仅 reason=低分 时生效，默认 0.5'
-      : '当前原因为「' + REVIEW_REASON_LABELS[annotationReason]
-        + '」，低分阈值不生效；切换回低分原因时恢复作用';
-    const filterRow = filterBar();
-    filterRow.appendChild(filterItem('低分阈值', thresholdInput, annotationThresholdHelp));
+    const reasonSelect = selectControl('annotation_reason',
+      REVIEW_REASONS.map(reason => [reason, REVIEW_REASON_LABELS[reason]]),
+      annotationReason);
+    reasonSelect.addEventListener('change', () => {
+      annotationReason = reasonSelect.value;
+      resetAnnotationPaging();
+      renderAnnotations(body, renderToken);
+    });
+    filterRow.append(
+      filterItem('标注状态', stateSelect),
+      filterItem('标注原因', reasonSelect),
+    );
     wrap.appendChild(filterRow);
 
     const listBody = el('div', 'evaluations-annotations__list');
     wrap.appendChild(listBody);
     showLoading(listBody, '标注队列加载中...');
+    // 新请求发出即清除旧成功页导出闭包，失败/迟到响应不得恢复
+    annotationPageItems = [];
     const params = {
       state: annotationState,
       reason: annotationReason,
-      threshold: annotationThreshold,
-      limit: 50,
+      threshold: ANNOTATION_LOW_SCORE_THRESHOLD,
+      limit: LIST_PAGE_SIZE,
     };
+    const annotationCursor = annotationCursorStack[annotationPageIndex];
+    if (annotationCursor) params.cursor = annotationCursor;
     let data;
     try {
       data = await api.evaluations.listAnnotations(params);
     } catch (err) {
       if (token !== renderToken || seq !== viewRequestSeq.annotations) return;
-      renderErrorState(listBody, '标注队列加载失败：' + (err && err.message ? err.message : ''),
+      const code = err && err.message ? err.message : '';
+      if (annotationCursor && code === 'cursor_invalid') {
+        listBody.textContent = '';
+        listBody.appendChild(el('div', 'error-state',
+          '游标已失效（过滤条件或查询快照不匹配），请重新查询'));
+        listBody.appendChild(actionButton('重新查询', () => {
+          resetAnnotationPaging();
+          renderAnnotations(body, renderToken);
+        }));
+        return;
+      }
+      renderErrorState(listBody, '标注队列加载失败：' + code,
         () => renderAnnotations(body, renderToken));
       return;
     }
     if (token !== renderToken || seq !== viewRequestSeq.annotations) return;
     listBody.textContent = '';
     const items = Array.isArray(data.items) ? data.items : [];
-    // T12 审查修复项 2：空队列对齐 renderReviewQueue 空态模式——early-
-    // return，不渲染导出/数据集入口（空队列无条目可审核导出）
+    const annotationNextCursor = data.next_cursor ? String(data.next_cursor) : '';
+    // pager 先于空态构建：第 2+ 页空响应仍保留上一页出口
+    const annotationPager = pagerBar({
+      pageIndex: annotationPageIndex,
+      hasPrev: annotationPageIndex > 0,
+      hasNext: !!annotationNextCursor,
+      onPrev: () => {
+        annotationPageIndex -= 1;
+        return renderAnnotations(body, renderToken);
+      },
+      onNext: () => {
+        annotationCursorStack = annotationCursorStack.slice(0, annotationPageIndex + 1);
+        annotationCursorStack.push(annotationNextCursor);
+        annotationPageIndex += 1;
+        return renderAnnotations(body, renderToken);
+      },
+    });
     if (!items.length) {
-      // 空态保留前缀，并展示当前状态/原因；low_score 才提示阈值手段
+      // 空态保留前缀，并展示当前状态/原因；阈值固定 0.5 不再作为用户手段提示
       const stateLabel = ANNOTATION_STATE_LABELS[annotationState] || annotationState;
       const reasonLabel = REVIEW_REASON_LABELS[annotationReason] || annotationReason;
-      const emptyText = annotationReason === 'low_score'
-        ? '当前筛选暂无待标注结果。当前标注状态「' + stateLabel + '」、原因「' + reasonLabel
-          + '」及阈值下无匹配，可切换状态/原因或调高低分阈值以扩大候选范围。'
-        : '当前筛选暂无待标注结果。当前标注状态「' + stateLabel + '」、原因「' + reasonLabel
-          + '」下无匹配，可切换状态/原因，或等待符合条件的结果。';
-      listBody.appendChild(el('div', 'empty-state', emptyText));
+      const emptyText = '当前筛选暂无待标注结果。当前标注状态「' + stateLabel + '」、原因「'
+        + reasonLabel + '」下无匹配，可切换状态/原因，或等待符合条件的结果。';
+      if (annotationPageIndex > 0) {
+        listBody.appendChild(el('div', 'empty-state', '当前分页无结果，请返回上一页'));
+      } else {
+        listBody.appendChild(el('div', 'empty-state', emptyText));
+      }
+      listBody.appendChild(annotationPager);
       return;
     }
+    annotationPageItems = items;
+    // 当前页有数据后启用 header 导出（入参为当前页切片，最多 20 条）
+    mountAnnotationHeader(items.length > 0);
     // 分列：原自动值 / 当前人工值 / 修订号（spec 4.4 已标注口径）
     listBody.appendChild(scrollTable(table(
       ['结果ID', '指标', '目标', '原自动值', '当前人工值',
@@ -2374,12 +3345,7 @@
         ];
       }),
     )));
-
-    // 审核导出集成（spec 4.4：逐 case 金标与审核来源沿用既有流程，
-    // 不把自动评分/已提交人评直接当 expected_output/qrels）；导出完成
-    // 可进入数据集列表（dataset_id/version/hash/audit_id 可关联）
-    wrap.appendChild(actionButton('审核后导出数据集', () => openExportModal(items)));
-    wrap.appendChild(actionButton('查看数据集列表', () => init({ route: { scope: 'datasets' } })));
+    listBody.appendChild(annotationPager);
   }
 
   async function openAnnotationDetail(item, viewBody) {
@@ -2562,11 +3528,20 @@
   // ------------------------------------------------------------------
 
   const views = {
-    overview: { title: '概览', render: renderOverview },
+    // bareShell：概览页不套"概览"标题外壳面板（与顶导标签重复的多余
+    // 一层），内容直达；其余视图维持标题外壳。
+    overview: { title: '概览', render: renderOverview, bareShell: true },
     datasets: { title: '数据集', render: renderDatasets },
+    capabilities: { title: '能力目录', render: renderCapabilities },
     evaluators: { title: '评估器', render: renderEvaluators },
-    experiments: { title: '实验', render: renderExperiments },
-    results: { title: '结果', render: renderResults },
+    'judge-model': { title: '模型', render: renderJudgeModel },
+    executions: { title: '执行任务', render: renderExecutions },
+    experiments: { title: '实验结果', render: renderExperiments },
+    results: { title: '结果', render: renderResults,
+      shellTip: '质量不通过/通过来自 boolean 或阈值判定\n'
+        + '评估失败/跳过为执行态\n'
+        + '投递等待与未关联在详情中展示\n'
+        + 'unlinked 为目标无真实身份，不创建悬空 Score' },
     annotations: { title: '人工标注', render: renderAnnotations },
     review: { title: '待复核', render: renderReviewQueue },
   };
@@ -2575,26 +3550,40 @@
     const node = root();
     if (!node) return;
     node.textContent = '';
-    const section = sectionPanel(views[view].title);
-    node.appendChild(section.panel);
-    showLoading(section.body, '评估状态加载中...');
+    // bareShell 视图（概览）：无标题外壳面板，状态探测/渲染共用裸挂载体；
+    // 其余视图维持 sectionPanel(title) 外壳并经其 header 挂主操作。
+    let shellBody;
+    if (views[view].bareShell) {
+      shellBody = document.createElement('div');
+      node.appendChild(shellBody);
+    } else {
+      // shellTip：视图标题 hover tips（分事项换行，见 views.results）
+      const section = sectionPanel(views[view].title,
+        views[view].shellTip ? { tip: views[view].shellTip } : {});
+      node.appendChild(section.panel);
+      shellBody = section.body;
+    }
+    showLoading(shellBody, '评估状态加载中...');
     let status;
     try {
       status = await api.evaluations.status();
     } catch (err) {
       if (token !== renderToken) return;
-      section.body.textContent = '';
-      renderErrorState(section.body, '评估状态加载失败：' + (err.message || ''), () => refresh());
+      shellBody.textContent = '';
+      renderErrorState(shellBody, '评估状态加载失败：' + (err.message || ''), () => refresh());
       return;
     }
     if (token !== renderToken) return;
-    section.body.textContent = '';
+    shellBody.textContent = '';
     if (!status.enabled) {
-      section.body.appendChild(el('div', 'empty-state',
+      shellBody.appendChild(el('div', 'empty-state',
         '评估功能未启用。请由管理员配置 N_AGENT_EVALUATION_ENABLED=true 并重启服务。'));
       return;
     }
-    await views[view].render(section.body, token);
+    // 入口路径（首次进入/离开后重进/显式 refresh）统一回第 1 页；
+    // 视图内翻页与筛选回调直接调 renderXxx，绕过本重置。
+    resetViewPaging(view);
+    await views[view].render(shellBody, token);
   }
 
   async function init(state) {
@@ -2626,8 +3615,9 @@
   }
 
   const executions = namespace.evaluationExecutions ? namespace.evaluationExecutions.createController({
-    api: api.evaluations, el, actionButton, buildFrame, formActions, mountDetailModal, closeBackdrop,
+    api: api.evaluations, el, actionButton, disabledButton, buildFrame, formActions, mountDetailModal, closeBackdrop,
     filterItem, kvRow, table, scrollTable, formatTime, blockTitle,
+    pagerBar, LIST_PAGE_SIZE,
     isCurrent: token => token === renderToken && isActive(), openExperimentModal,
   }) : null;
   namespace.evaluations = { init: init, refresh: refresh, activate: init, deactivate: deactivate };

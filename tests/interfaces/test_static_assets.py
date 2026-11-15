@@ -1139,7 +1139,7 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
         '/chat', '/sessions', '/scheduled-tasks', '/tasks', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/artifacts', '/models', '/platforms',
-        '/observations/sessions', '/observations/modules', '/observations/otel', '/evaluations', '/evaluations/datasets', '/evaluations/evaluators', '/evaluations/experiments', '/evaluations/results', '/evaluations/annotations',
+        '/observations/sessions', '/observations/modules', '/observations/otel', '/evaluations', '/evaluations/datasets', '/evaluations/capabilities', '/evaluations/executions', '/evaluations/results', '/evaluations/annotations',
         '/security',
         '/security/sessions', '/security/memory', '/security/sandbox',
     ]
@@ -2113,4 +2113,83 @@ def test_evaluation_config_modal_parses_numeric_fields():
     # 数值解析必须走 Number 解析而非字符串直传
     assert re.search(r'Number\.(parseFloat|parseInt)', body), (
         "evaluation.js config modal does not parse numeric fields with Number"
+    )
+
+
+def test_evaluation_table_action_cells_use_row_actions():
+    """表格操作列按钮组必须复用共享 .row-actions（flex + gap:10px），
+    裸 div 无 class 时 display:block、gap:normal，按钮实测零间距贴合。
+    覆盖数据集主表、数据集历史 Modal、评估器列表三处操作列。"""
+    body = (STATIC_DIR / 'evaluation.js').read_text()
+    assert body.count("el('div', 'row-actions')") >= 3, (
+        "evaluation.js 表格操作列必须使用 el('div', 'row-actions')"
+    )
+    assert "const actions = document.createElement('div')" not in body, (
+        "evaluation.js 操作列禁止裸 div，统一 .row-actions 共享类"
+    )
+    styles = (STATIC_DIR / 'styles.css').read_text()
+    assert '.row-actions { display: flex; gap: 10px' in styles, (
+        "styles.css .row-actions 间距合同缺失"
+    )
+
+
+def test_evaluation_pagination_and_annotation_filter_static_contract():
+    """plan-261115：统一分页与人工标注筛选的静态合同。
+    共享 LIST_PAGE_SIZE/pagerBar 双模式；annotations 状态/原因筛选统一为
+    原生 select（selectControl + .select-control）同一筛选行，低分阈值固定
+    0.5 不暴露配置，header 不再展示导出范围备注；review 保留
+    focusableChoiceGroup/aria-pressed；每页数量禁止回退 50 字面量。"""
+    body = (STATIC_DIR / 'evaluation.js').read_text()
+    assert 'const LIST_PAGE_SIZE = 20;' in body, '统一每页数量常量缺失'
+    assert 'function pagerBar(' in body, '共享分页组件 pagerBar 缺失'
+    assert 'function slicePage(' in body, 'slice 模式分页 helper 缺失'
+    # 人工标注两组筛选改为同 filterBar 一行的原生 select 下拉
+    assert "selectControl('annotation_state'" in body, '标注状态筛选须为 selectControl 下拉'
+    assert "selectControl('annotation_reason'" in body, '标注原因筛选须为 selectControl 下拉'
+    assert "function checkboxGroup(" not in body, 'checkbox 单选组 helper 已移除，不得残留'
+    assert 'annotation_threshold' not in body, '低分阈值输入已移除，固定 0.5'
+    assert '导出当前页' not in body, 'header 不得再渲染导出范围备注'
+    # review 视图保留按钮选择组，下拉改造不得收编 review
+    assert 'function focusableChoiceGroup(' in body
+    assert "aria-pressed" in body
+    assert 'REVIEW_WINDOW_LIMIT' in body, 'review 窗口常量须独立命名'
+    # 生产代码零原始 limit: 50；50 仅允许以 REVIEW_WINDOW_LIMIT 出现
+    for code_file in ('evaluation.js', 'evaluation-executions.js'):
+        source = (STATIC_DIR / code_file).read_text()
+        assert 'limit: 50' not in source, f'{code_file} 禁止回退 limit: 50 字面量'
+
+
+def test_select_control_shared_dropdown_contract():
+    """下拉列表统一共享 .select-control 外观：隐藏原生箭头（贴右边框且位置
+    随浏览器），自定义 chevron 右距 10px、右内边距 32px。评估子域全部
+    select 必须接入，禁止裸用原生下拉。"""
+    styles = (STATIC_DIR / 'styles.css').read_text()
+    assert 'select.select-control' in styles, 'styles.css 缺少 .select-control 共享下拉规则'
+    assert '.providers-form select.select-control' in styles, (
+        '.providers-form 内 select 的 background 简写会清掉 chevron，必须有同组高优先级规则'
+    )
+    for fragment in (
+        'appearance: none',
+        "url(\"data:image/svg+xml;charset=utf-8,%3Csvg",
+        'background-position: right var(--space-5) center',
+        'padding: 8px 32px 8px 10px',
+    ):
+        assert fragment in styles, f'styles.css .select-control 缺少合同片段: {fragment}'
+
+    evaluation = (STATIC_DIR / 'evaluation.js').read_text()
+    select_count = evaluation.count("document.createElement('select')")
+    assert select_count == 4, (
+        f'evaluation.js 现有 {select_count} 处 select 创建（selectControl helper + 3 处动态区），'
+        '新增下拉必须走 selectControl 或同步接入 .select-control'
+    )
+    assert evaluation.count("className = 'select-control'") == select_count, (
+        'evaluation.js 每个 select 创建点必须显式接入 .select-control'
+    )
+
+    executions = (STATIC_DIR / 'evaluation-executions.js').read_text()
+    assert executions.count("document.createElement('select')") == 1, (
+        'evaluation-executions.js 仅发起实验弹窗一个数据集下拉，变化时更新合同'
+    )
+    assert "dataset.className = 'select-control'" in executions, (
+        'evaluation-executions.js 数据集下拉必须接入 .select-control'
     )

@@ -1486,12 +1486,13 @@ async def test_preset_definitions_shapes(store):
         assert d.method == "llm_judge"
         assert d.target_kind == kind
         assert d.judge_model == "judge-model-a"
-    # Judge 未配置：只注册 deterministic 预设（llm_judge 定义必须声明
-    # judge_model，domain 不变量；注册即死条目，不注册）
+    # T4：judge_model=None（Judge 未配置）也注册 llm_judge 预设——
+    # 定义跟随组合根默认供给，Provider 就绪后即可执行（不再注册即死条目）
     no_judge = EvaluationService.preset_definitions(None)
-    # 6 deterministic 正式 + 3 个 agent_run deterministic 镜像 variant
-    assert len(no_judge) == 9
-    assert all(d.method == "deterministic" for d in no_judge)
+    assert len(no_judge) == 20
+    no_judge_judges = [d for d in no_judge if d.method == "llm_judge"]
+    assert no_judge_judges
+    assert all(d.judge_model is None for d in no_judge_judges)
 
 
 async def test_preset_model_change_registers_new_versions_without_overwrite(store):
@@ -1509,6 +1510,31 @@ async def test_preset_model_change_registers_new_versions_without_overwrite(stor
     before = len(await store.list_definitions())
     await service.register_preset_definitions("judge-new")
     assert len(await store.list_definitions()) == before
+
+
+async def test_register_preset_definitions_follow_default_then_provider(store):
+    """T4：env 全空（judge_model=None）注册的跟随默认预设，Provider 就绪
+    后（组合根传入显式模型）注册不覆盖旧版本——旧 material 保留，新内容
+    得到稳定版本（定义不可变约束）。"""
+    service = make_service(store)
+    await service.register_preset_definitions(None)
+    follow = await store.get_definition("agent.answer_correctness", "v1")
+    assert follow["definition"]["judge_model"] is None
+    # Provider 就绪：新模型注册为独立版本，旧定义原样保留
+    await service.register_preset_definitions("provider-model-1")
+    unchanged = await store.get_definition("agent.answer_correctness", "v1")
+    assert unchanged["definition"]["judge_model"] is None
+    definitions = await store.list_definitions(target_kind="agent_run")
+    candidates = [
+        row for row in definitions
+        if row["definition_id"] == "agent.answer_correctness"
+    ]
+    assert len(candidates) == 2
+    new = await store.get_definition(
+        "agent.answer_correctness",
+        next(row["version"] for row in candidates if row["version"] != "v1"),
+    )
+    assert new["definition"]["judge_model"] == "provider-model-1"
 
 
 async def test_register_preset_definitions_idempotent(store):

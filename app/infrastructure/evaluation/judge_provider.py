@@ -2,12 +2,14 @@
 """LLM Judge evaluator adapter（plan T7，spec 8 / 10）。
 
 四个 Judge 指标（agent.answer_correctness / agent.answer_relevance /
-rag.faithfulness / kb.context_relevance）的统一适配器：独立 Provider
-配置（构造注入 base_url / api_key / model），不读会话 active provider，
-不随用户会话静默变化（spec 10）。OpenAI-compatible
-``POST {base_url}/chat/completions``，直接使用 httpx.AsyncClient（独立
-客户端，不经 OpenAI SDK 与 active-provider 注册表；复用的是"显式配置 +
-零客户端重试"的 provider 模式）。
+rag.faithfulness / kb.context_relevance）的统一适配器：供给逐次解析——
+构造注入 env 基线（base_url / api_key / model，允许全空），组合根注入
+异步供给 resolver，每次 evaluate 恰调用一次返回供给快照
+（``JudgeSupplyOverride``，见下）；不读会话 active provider，不随用户
+会话静默变化（spec 10）。OpenAI-compatible
+``POST {base_url}/chat/completions``，httpx.AsyncClient 逐次构建
+（``async with`` 即用即关，不经 OpenAI SDK 与 active-provider 注册表；
+复用的是"显式配置 + 零客户端重试"的 provider 模式）。
 
 与 EvaluationWorker 的错误分类契约（app/application/evaluation_worker.py
 ``_evaluate_with_retries``）：异常携带 ``error_type`` 属性时按该分类计，
@@ -60,19 +62,21 @@ attempt 记录契约（``_record_call``）对齐；T8 起该 provenance 信息�
 EvaluationWorker 透传落库到结果行（self_judge → provenance=self_judge，
 见 app/application/evaluation_worker.py ``_resolve_provenance``）。
 
-客户端生命周期（T7 遗留判定记录）：本适配器惰性创建内部
-httpx.AsyncClient（``aclose()`` 供显式释放）；实例的所有权在组合根
-（T20 装配）——由创建它的组合根负责在服务停机时调用 ``aclose()``，
-worker / 校准模块等使用方绝不关闭注入或自建的适配器实例（与
-LangfuseScoreSink 的 owner 语义一致）。
+客户端生命周期：本适配器不为 Judge 请求持有共享 httpx.AsyncClient——
+每次网络调用逐次构建客户端（``async with`` 即用即关，见 ``_call_judge``），
+并发 evaluate 各自持有独立 transport，成功/错误/取消后均无共享 client
+残留。``aclose()`` 保留为幂等空操作（组合根 shutdown 兼容）；实例的
+所有权在组合根（T20 装配），worker / 校准模块等使用方绝不关闭注入或
+自建的适配器实例（与 LangfuseScoreSink 的 owner 语义一致）。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import math
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 import httpx
 
@@ -220,6 +224,35 @@ class JudgePermanentError(JudgeProviderError):
         super().__init__(message, error_type=error_type)
 
 
+@dataclass(frozen=True)
+class JudgeSupplyOverride:
+    """单次评估供给快照：本次 Judge 调用使用的 base_url / api_key / model，
+    由组合根注入的异步 resolver 逐次提供。frozen 保证快照不可变；repr 不
+    携带 api_key，避免凭据泄漏进日志。三字段必须为非空字符串（供给快照
+    即完整供给，不允许半空快照）。"""
+
+    base_url: str
+    api_key: str = field(repr=False)
+    model: str
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("base_url", self.base_url),
+            ("api_key", self.api_key),
+            ("model", self.model),
+        ):
+            if not isinstance(value, str) or not value:
+                # api_key 不回显原值（半截凭据不得进异常消息/日志），只给类型名
+                detail = (
+                    f"实际类型 {type(value).__name__}"
+                    if label == "api_key"
+                    else f"{value!r}"
+                )
+                raise ValueError(
+                    f"JudgeSupplyOverride.{label} 必须是非空字符串: {detail}"
+                )
+
+
 def _estimate_tokens(text: str) -> int:
     """确定性输入 token 估算（保守、无分词器依赖）：UTF-8 字节数 / 2 向上
     取整。对英文高估约 2 倍、对中文接近 1.5 倍——宁可提前 skipped 也不
@@ -298,35 +331,42 @@ class LLMJudgeEvaluator:
         self,
         *,
         metric_name: str,
-        base_url: str,
-        api_key: str,
-        model: str,
+        base_url: str = "",
+        api_key: str = "",
+        model: str = "",
         timeout_seconds: int = 60,
         transport: httpx.AsyncTransport | None = None,
-        client: httpx.AsyncClient | None = None,
+        transport_factory: Callable[[], httpx.AsyncBaseTransport] | None = None,
         input_token_limit: int = INPUT_TOKEN_LIMIT,
         output_token_limit: int = OUTPUT_TOKEN_LIMIT,
+        default_supply_resolver: Callable[
+            [], Awaitable[JudgeSupplyOverride | None]
+        ] | None = None,
     ) -> None:
         if metric_name not in _RUBRICS:
             raise ValueError(
                 f"未知 Judge 指标: {metric_name!r}，仅允许 {JUDGE_METRIC_NAMES}"
             )
-        for label, value in (
-            ("base_url", base_url),
-            ("api_key", api_key),
-            ("model", model),
-        ):
-            if not value:
-                raise ValueError(f"Judge {label} 必须显式提供（独立 Provider 配置）")
+        # env 基线允许三字段全空（env 未配置装配）：供给缺失不在构造期
+        # 校验，而在 evaluate 到达网络调用前判定（见供给完整性判定）——
+        # env 全空 + Provider 快照完整时必须可正常调用。
         self.metric_name = metric_name
         self._base_url = base_url
         self._api_key = api_key
         self._model = model
         self._timeout_seconds = timeout_seconds
+        # transport：单请求测试兼容缝；transport_factory：多请求/并发用例
+        # 的按请求注册缝——每次网络调用调用 factory 取得独立 transport，
+        # 禁止逐次客户端重复关闭共享 transport。
         self._transport = transport
-        self._client = client
+        self._transport_factory = transport_factory
         self._input_token_limit = input_token_limit
         self._output_token_limit = output_token_limit
+        # 组合根注入的异步供给 resolver（C 类配置）：每次 evaluate 恰调用
+        # 一次，返回本次调用的供给快照（JudgeSupplyOverride）或 None（回落
+        # 构造 env 基线）。解析结果只存局部变量，不写实例状态（并发
+        # evaluate 间隔离）；resolver 异常不在此捕获，由组合根统一包装。
+        self._default_supply_resolver = default_supply_resolver
 
     @property
     def _rubric(self) -> str:
@@ -336,20 +376,11 @@ class LLMJudgeEvaluator:
     def _schema_text(self) -> str:
         return _SCORE_SCHEMA_TEXTS[self.metric_name]
 
-    def _ensure_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self._base_url,
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                timeout=httpx.Timeout(self._timeout_seconds),
-                transport=self._transport,
-            )
-        return self._client
-
     async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        """幂等空操作（组合根 shutdown 兼容）：Judge 客户端已改为逐次请求
+        构建（``async with`` 即用即关，见 ``_call_judge``），实例不再持有
+        共享 client，无资源需要释放。"""
+        return None
 
     # ------------------------------------------------------------------
     # Domain Evaluator 端口
@@ -389,14 +420,35 @@ class LLMJudgeEvaluator:
                     SkipReason.evidence_missing,
                     f"capture evidence incomplete: drops={evidence_drops}",
                 )
+        # 供给解析（每 evaluate 恰一次，只存局部变量，避免遮蔽
+        # EvidenceSnapshot 参数命名为 supply_snapshot）：组合根注入的
+        # resolver 返回本次调用的供给快照（C 类默认 Provider），None 回落
+        # 构造值（env 基线）。resolver 在本地分支判定之前也会运行（供给
+        # 恰一次解析，位置在 _build_slots 短路之前）；本地 skipped/确定性
+        # 分支无需完整供给，此处不产生网络请求，供给是否完整在网络调用
+        # 前判定。
+        supply_snapshot = (
+            await self._default_supply_resolver()
+            if self._default_supply_resolver is not None
+            else None
+        )
+        # Judge 模型解析：冻结定义优先（spec 6.2），其次供给快照模型
+        # （C 类默认，Provider 已命中时不再回落 env model），最后回退适配
+        # 器构造值（env 基线）——评审请求遵循定义 material，不随部署环境漂移。
+        if supply_snapshot is not None:
+            resolved_model = definition.judge_model or supply_snapshot.model
+        else:
+            resolved_model = definition.judge_model or self._model
         self_judge = bool(definition.judge_params.get("self_judge")) or (
-            content.get("target_model") == (definition.judge_model or self._model)
+            content.get("target_model") == resolved_model
         )
         slots, local = self._build_slots(
             content, include_scenario_evidence="scenario_evidence" in definition.required_fields,
         )
         if isinstance(local, dict):
-            # 本地决定的 skipped / 值（缺 reference、空检索结果等），不调用 Judge
+            # 本地决定的 skipped / 值（缺 reference、空检索结果等），不调用
+            # Judge；保持既有 provenance（不标注 judge_supply_source——本地
+            # 结果未发起 Judge 请求，不把无供给伪称为 env 命中）
             if local.get("status") == "skipped":
                 return local
             return self._value_result(
@@ -406,11 +458,8 @@ class LLMJudgeEvaluator:
                 model=None,
                 usage=None,
                 self_judge=self_judge,
+                resolved_model=resolved_model,
             )
-        # 冻结定义优先（spec 6.2）：Judge 模型 / rubric / 温度以实验冻结
-        # 的定义为准，适配器 settings 值仅作缺省回退——评审请求必须遵循
-        # 定义 material，而不是跟随部署环境漂移。
-        judge_model = definition.judge_model or self._model
         judge_temperature = definition.judge_params.get("temperature", 0)
         if (
             isinstance(judge_temperature, bool)
@@ -451,10 +500,28 @@ class LLMJudgeEvaluator:
                 f"评估输入超出 Judge token 上限 {self._input_token_limit}，"
                 "不静默截断",
             )
+        # 供给完整性判定（到达网络调用才要求）：供给快照存在即完整；
+        # 否则要求 env 基线三字段齐备。注意不得写成"依赖构造值非空"的
+        # 公式——env 全空 + Provider 快照完整时必须可正常调用。
+        if supply_snapshot is None and not (
+            self._base_url and self._api_key and self._model
+        ):
+            raise JudgePermanentError(
+                "Judge 未配置（未设置默认 Provider 且 env 基线为空）"
+            )
+        # 供给对：优先供给快照，None 回落构造 env 基线
+        if supply_snapshot is not None:
+            call_base_url = supply_snapshot.base_url
+            call_api_key = supply_snapshot.api_key
+        else:
+            call_base_url = self._base_url
+            call_api_key = self._api_key
         usage, actual_model, payload = await self._call_judge(
             system_text, user_text,
-            model=judge_model,
+            model=resolved_model,
             temperature=float(judge_temperature),
+            base_url=call_base_url,
+            api_key=call_api_key,
         )
         valid_ids = {slot["evidence_id"] for slot in slots}
         try:
@@ -505,6 +572,10 @@ class LLMJudgeEvaluator:
             model=actual_model,
             usage=usage,
             self_judge=self_judge,
+            resolved_model=resolved_model,
+            judge_supply_source=(
+                "provider" if supply_snapshot is not None else "env"
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -667,12 +738,15 @@ class LLMJudgeEvaluator:
         *,
         model: str | None = None,
         temperature: float = 0,
+        base_url: str,
+        api_key: str,
     ) -> tuple[dict[str, Any] | None, str | None, dict[str, Any]]:
         """一次 Judge 调用。返回 (usage, 实际模型, {"content": 文本})；
         usage / 实际模型缺失时为 None（费用保守语义由 worker 结算处理）。
+        base_url / api_key 由 evaluate 传入本次供给快照值（逐次客户端）；
+        客户端以 ``async with`` 逐次构建、即用即关，不在实例上缓存。
         model/temperature 缺省回退适配器构造值（冻结定义优先由 evaluate
         传入）。"""
-        client = self._ensure_client()
         request_payload = {
             "model": model or self._model,
             "messages": [
@@ -683,16 +757,34 @@ class LLMJudgeEvaluator:
             "max_tokens": self._output_token_limit,
             "stream": False,
         }
-        try:
-            response = await client.post("chat/completions", json=request_payload)
-        except httpx.TimeoutException as exc:
-            raise JudgeTransientError(
-                f"Judge 请求超时: {exc}", error_type="timeout"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise JudgeTransientError(
-                f"Judge 网络错误: {exc}", error_type="network"
-            ) from exc
+        # 逐次客户端：每次请求独立构建 httpx.AsyncClient（即用即关），
+        # 不共享连接池与凭据状态；transport 优先取 transport_factory 的新
+        # 实例（多请求/并发用例按请求注册），否则用构造注入的 transport
+        # （单请求测试兼容缝）。transport_factory 自身抛出的异常不在此
+        # 分类，按未分类异常逃逸（worker 归类 network，消耗瞬态重试额度）。
+        transport = (
+            self._transport_factory()
+            if self._transport_factory is not None
+            else self._transport
+        )
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(self._timeout_seconds),
+            transport=transport,
+        ) as client:
+            try:
+                response = await client.post(
+                    "chat/completions", json=request_payload
+                )
+            except httpx.TimeoutException as exc:
+                raise JudgeTransientError(
+                    f"Judge 请求超时: {exc}", error_type="timeout"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise JudgeTransientError(
+                    f"Judge 网络错误: {exc}", error_type="network"
+                ) from exc
         if response.status_code == 429:
             raise JudgeTransientError(
                 "Judge 触发限流（HTTP 429）",
@@ -968,7 +1060,18 @@ class LLMJudgeEvaluator:
         model: str | None,
         usage: dict[str, Any] | None,
         self_judge: bool,
+        resolved_model: str,
+        judge_supply_source: str | None = None,
     ) -> dict[str, Any]:
+        provenance: dict[str, Any] = {
+            "self_judge": self_judge,
+            "judge_model": resolved_model,
+            "metric_name": self.metric_name,
+        }
+        # judge_supply_source 仅标注实际发起的 Judge 请求结果（"provider" |
+        # "env"）；本地 skipped/确定性 value 未发起请求，保持既有 provenance
+        if judge_supply_source is not None:
+            provenance["judge_supply_source"] = judge_supply_source
         return {
             "status": "value",
             "value": value,
@@ -977,11 +1080,7 @@ class LLMJudgeEvaluator:
             "model": model,
             "usage": usage or {},
             "cost_usd": None,
-            "provenance": {
-                "self_judge": self_judge,
-                "judge_model": self._model,
-                "metric_name": self.metric_name,
-            },
+            "provenance": provenance,
         }
 
 

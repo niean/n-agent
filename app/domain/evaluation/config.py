@@ -15,13 +15,17 @@ C 类 = 运行时调参旋钮（非安全边界）：Dashboard 可编辑 + 热�
   ``evaluation_worker_max_concurrency`` 部署上限，跨层约束在本文件
   ``validate_evaluation_config`` 单一来源；当前装配下取值在启动期
   生效，运行期改动的生效边界见组合根装配说明）；
-- ``evaluation_daily_call_ceiling``：Judge 日调用预算（0 = 不设上限）。
+- ``evaluation_daily_call_ceiling``：Judge 日调用预算（0 = 不设上限）；
+- ``evaluation_judge_provider_id``：Judge 默认评估 Provider id（空串 =
+  跟随 env 基线/清除覆盖；非空校验见 ``validate_model_name_string``
+  单一来源）。
 
 A 类安全不变量（tombstone 门禁/删除传播/Judge 只读/预算防超限语义）
 不在本配置内，不可被任何配置覆盖。
 """
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
@@ -38,6 +42,37 @@ class EvaluationConfigConflictError(Exception):
     """CAS 版本冲突（expected_version 与当前不符）。"""
 
 
+_MODEL_NAME_MAX_CODEPOINTS = 200
+
+
+def validate_model_name_string(value: Any, *, allow_empty: bool) -> str:
+    """模型名字符串校验（配置覆盖与评估器定义共用单一来源）。
+
+    空串仅在 allow_empty=True 时合法（= 跟随 env 基线）；非空原值
+    不 trim：长度 <= 200 codepoints、不含 Unicode Cc 控制字符、
+    不得有首尾空白（拒绝，不静默修正）。
+    """
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise EvaluationConfigValidationError(
+            f"模型名必须是字符串，收到 {type(value).__name__}"
+        )
+    if value == "":
+        if allow_empty:
+            return value
+        raise EvaluationConfigValidationError("模型名不能为空")
+    if len(value) > _MODEL_NAME_MAX_CODEPOINTS:
+        raise EvaluationConfigValidationError(
+            f"模型名长度不得超过 {_MODEL_NAME_MAX_CODEPOINTS} codepoints"
+        )
+    if any(unicodedata.category(ch) == "Cc" for ch in value):
+        raise EvaluationConfigValidationError("模型名不得包含控制字符")
+    if value != value.strip():
+        raise EvaluationConfigValidationError(
+            "模型名不得包含首尾空白（不静默 trim）"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class EvaluationConfig:
     """解析后的评估 C 类配置（全部字段为具体值）。"""
@@ -48,6 +83,7 @@ class EvaluationConfig:
     evaluation_sampling_policy_version: str = "capture-sampling-v1"
     evaluation_worker_concurrency: int = 1
     evaluation_daily_call_ceiling: int = 0
+    evaluation_judge_provider_id: str = ""
 
 
 EVALUATION_CONFIG_FIELDS: tuple[str, ...] = (
@@ -57,6 +93,7 @@ EVALUATION_CONFIG_FIELDS: tuple[str, ...] = (
     "evaluation_sampling_policy_version",
     "evaluation_worker_concurrency",
     "evaluation_daily_call_ceiling",
+    "evaluation_judge_provider_id",
 )
 
 
@@ -70,6 +107,7 @@ class EvaluationConfigOverrides:
     evaluation_sampling_policy_version: str | None = None
     evaluation_worker_concurrency: int | None = None
     evaluation_daily_call_ceiling: int | None = None
+    evaluation_judge_provider_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +134,17 @@ class EvaluationConfigOverrides:
                     raise EvaluationConfigStoreError(
                         f"覆盖 {key} 必须是非空字符串"
                     )
+            elif key == "evaluation_judge_provider_id":
+                if not isinstance(value, str):
+                    raise EvaluationConfigStoreError(
+                        f"覆盖 {key} 必须是字符串，收到 {type(value).__name__}"
+                    )
+                if value == "":
+                    continue  # 空串 = 清除覆盖：不写入 kwargs
+                try:
+                    validate_model_name_string(value, allow_empty=False)
+                except EvaluationConfigValidationError as exc:
+                    raise EvaluationConfigStoreError(f"覆盖 {key}: {exc}") from exc
             elif key in (
                 "evaluation_sampling_rate",
                 "evaluation_failure_sampling_rate",
@@ -163,9 +212,12 @@ def validate_evaluation_config(
     - C 并发不超过 B 类部署上限（worker_max_concurrency），且 >= 1；
     - 抽样率在 [0, 1]；
     - policy_version 非空；
-    - 日调用预算 >= 0（0 = 不设上限）；Judge Provider 已配置时预算必须
-      为正数（24 项三方审阅 #15：运行时把预算改 0 等于关闭 worker 预算
-      预留，绕过启动期 B 类保护——热读 0 投影 None 后调用无上限）。
+    - 日调用预算 >= 0（0 = 不设上限）；存在任一 Judge 供给来源时预算
+      必须为正数（24 项三方审阅 #15：运行时把预算改 0 等于关闭 worker
+      预算预留，绕过启动期 B 类保护——热读 0 投影 None 后调用无上限）。
+      Judge 供给来源判定单一来源在本条件：``judge_configured``（env 三
+      字段 base_url/api_key/model 就绪，由调用方传入布尔）或运行时覆盖
+      ``evaluation_judge_provider_id`` 非空。
     """
     if isinstance(cfg.evaluation_worker_concurrency, bool) or not isinstance(
         cfg.evaluation_worker_concurrency, int
@@ -210,7 +262,12 @@ def validate_evaluation_config(
         raise EvaluationConfigValidationError(
             "evaluation_daily_call_ceiling 必须 >= 0（0 = 不设上限）"
         )
-    if judge_configured and cfg.evaluation_daily_call_ceiling <= 0:
+    validate_model_name_string(
+        cfg.evaluation_judge_provider_id, allow_empty=True
+    )
+    if (
+        judge_configured or bool(cfg.evaluation_judge_provider_id)
+    ) and cfg.evaluation_daily_call_ceiling <= 0:
         # 24 项三方审阅 #15：运行时把预算改 0 等于关闭 worker 预算预留
         #（热读 0 投影 None 后调用无上限），绕过启动期 B 类保护
         raise EvaluationConfigValidationError(

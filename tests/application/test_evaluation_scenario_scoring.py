@@ -91,12 +91,16 @@ def test_new_definitions_default_offline():
 # ---------------------------------------------------------------------------
 
 
-def test_capability_catalog_lists_scenario_metrics():
+async def test_capability_catalog_lists_scenario_metrics():
     from app.application.evaluation_admin import EvaluationAdminService
 
-    admin = EvaluationAdminService(None, judge_ready=lambda: True)
+    async def _judge_ready() -> bool:
+        return True
+
+    admin = EvaluationAdminService(None, judge_ready=_judge_ready)
+    catalog = await admin.capabilities()
     entries = {
-        e["metric_name"]: e for e in admin.capabilities()["entries"]
+        e["metric_name"]: e for e in catalog["entries"]
     }
     assert entries["agent.scenario_assertions"]["method"] == "deterministic"
     assert entries["agent.scenario_assertions"]["output_type"] == "boolean"

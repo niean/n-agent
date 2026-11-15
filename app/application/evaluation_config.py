@@ -44,6 +44,8 @@ def evaluation_config_from_env(settings: Settings) -> EvaluationConfig:
         ),
         evaluation_worker_concurrency=settings.evaluation_worker_concurrency,
         evaluation_daily_call_ceiling=settings.evaluation_daily_call_ceiling,
+        # Judge Provider id 是纯运行时覆盖字段：env 基线恒为空串
+        evaluation_judge_provider_id="",
     )
 
 
@@ -57,8 +59,10 @@ class EvaluationConfigService:
     ) -> None:
         self._store = store
         self._worker_max_concurrency = settings.evaluation_worker_max_concurrency
-        # Judge Provider 是否已配置（B 类 env）：已配置时 C 类更新不得把
-        # 日调用预算改为 0（24 项三方审阅 #15，domain 校验单一来源）
+        # env 侧 Judge 供给是否就绪（三字段 base_url/api_key/model 同时
+        # 非空）：作为 domain 统一预算条件的布尔入参——任一供给来源
+        # （env 就绪或运行时 provider_id 覆盖非空）都要求日预算为正
+        #（24 项三方审阅 #15，条件单一来源在 domain，调用点只传布尔）
         self._judge_configured = bool(
             settings.evaluation_judge_provider_base_url
             and settings.evaluation_judge_provider_api_key
@@ -163,7 +167,9 @@ class EvaluationConfigService:
             )
         resolved = merge_overrides(self._env_config, stored.overrides)
         validate_evaluation_config(
-            resolved, worker_max_concurrency=self._worker_max_concurrency
+            resolved,
+            worker_max_concurrency=self._worker_max_concurrency,
+            judge_configured=self._judge_configured,
         )
         return ResolvedEvaluationConfig(
             config=resolved,

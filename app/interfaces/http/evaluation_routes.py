@@ -784,8 +784,14 @@ def register_evaluation_management_routes(
     evaluation_admin_service: Any = None,
     evaluation_annotation_service: Any = None,
     evaluation_analytics_service: Any = None,
+    judge_supply: Any = None,
 ) -> None:
     """注册 T21 管理面端点（组合根在 evaluation 配置服务就绪时调用）。
+
+    ``judge_supply``：async (resolved) -> Mapping，judge-model 供给投影
+    （T5：接收端点单次严格读的 resolved 快照，返回含 default_provider_id
+    /config_version 的全量白名单脱敏字段；路由层不读 env、不触碰凭据。
+    未注入时端点返回安全缺省，非空 id 不伪报 missing）。
 
     错误映射契约：EvaluationValidationError / EvaluationConfigValidationError
     / DatasetManifestError -> 422；EvaluationNotFoundError -> 404；
@@ -1256,6 +1262,46 @@ def register_evaluation_management_routes(
             return _err(409, "conflict", str(exc))
         return _json_ok(_config_payload(resolved))
 
+    @app.get("/chat/evaluations/judge-model")
+    @_guarded
+    async def get_judge_model() -> JSONResponse:
+        """judge-model 供给投影（T5，Dashboard 评估器表单消费）。
+
+        单次严格读 get_resolved()，resolved 快照整体传给组合根注入的
+        async judge_supply 投影（供给命中/missing/有效供给 host 判定，
+        路由层不读 env、不触碰凭据、不依赖 infrastructure 类型；投影
+        返回白名单脱敏字段全量，default_provider_id 与 config_version
+        取同一 resolved，绑定一致，不读 current()）。judge_supply 未
+        注入时返回安全缺省：供给字段全空/False，非空 id 不伪报
+        missing（缺少查表能力不能断言记录不存在）。registry/provider
+        查询异常在投影路径按既有系统错误响应（不伪装缺失）。
+
+        读路径映射例外（与 GET /config 一致）：get_resolved() 抛
+        EvaluationConfigValidationError 时由 _guarded 落入 500
+        internal_error，不映射 422——服务端持久化配置损坏属系统态，
+        非客户端载荷错误，本 GET 无请求体可校验。"""
+        resolved = await config_service.get_resolved()  # 单次严格读取
+        if callable(judge_supply):
+            payload = dict(await judge_supply(resolved))
+        else:
+            # judge_supply 未注入：安全缺省（judge 未配置语义）；
+            # 非空 id 不伪报 missing
+            payload = {
+                "default_provider_id": (
+                    resolved.config.evaluation_judge_provider_id
+                ),
+                "default_provider_name": None,
+                "default_provider_model": None,
+                "default_provider_missing": False,
+                "judge_ready": False,
+                "supply_source": None,
+                "effective_model": None,
+                "env_baseline_model": None,
+                "provider_base_url_host": None,
+                "config_version": resolved.version,
+            }
+        return _json_ok(payload)
+
     @app.post("/chat/evaluations/deliveries/retry")
     @_guarded
     async def post_delivery_retry(request: Request) -> JSONResponse:
@@ -1325,7 +1371,9 @@ def register_evaluation_management_routes(
         @_guarded
         async def get_evaluator_capabilities() -> JSONResponse:
             """能力目录（spec 4.2）：只宣称当前执行器真实支持的组合。"""
-            return _json_ok(evaluation_admin_service.capabilities())
+            # T4：capabilities async 化（judge_ready 供给判定含 Provider
+            # secret 异步读取）
+            return _json_ok(await evaluation_admin_service.capabilities())
 
         @app.get("/chat/evaluations/evaluators")
         @_guarded

@@ -26,7 +26,7 @@ import base64
 import hashlib
 import json
 from decimal import Decimal, InvalidOperation
-from typing import Any, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping
 
 from app.application.evaluation_calibration import (
     calibration_definition_hash,
@@ -37,6 +37,10 @@ from app.application.evaluation_service import (
     EvaluationLedgerStore,
     EvaluationService,
     definition_from_mapping,
+)
+from app.domain.evaluation.config import (
+    EvaluationConfigValidationError,
+    validate_model_name_string,
 )
 from app.domain.evaluation.models import (
     EVALUATOR_DIRECTIONS,
@@ -111,11 +115,13 @@ class EvaluationAdminService:
         self,
         store: EvaluationLedgerStore,
         *,
-        judge_ready: Callable[[], bool],
+        judge_ready: Callable[[], Awaitable[bool]],
         service: str = "n-agent",
         evaluation_service: EvaluationService | None = None,
     ) -> None:
         self._store = store
+        # T4：judge_ready 为 async callable——组合根供给判定含 Provider
+        # secret 异步读取（registry.get_secret 无同步变体）
         self._judge_ready = judge_ready
         # usage 审计身份（updated_by）；注册路径委托正式注册用例
         self._service = service
@@ -125,7 +131,7 @@ class EvaluationAdminService:
     # 能力目录
     # ------------------------------------------------------------------
 
-    def capabilities(self) -> dict[str, Any]:
+    async def capabilities(self) -> dict[str, Any]:
         """当前执行器真实支持的评估能力目录（spec 4.2）。
 
         - deterministic：六指标固定内置公式组合，始终可执行；
@@ -134,7 +140,7 @@ class EvaluationAdminService:
         - human：online_forbidden=True（人工评估不进在线统计，spec 6.2），
           不可执行（结果由人工提交）。
         未注册的组合不出现在目录中（禁止宣称可执行）。"""
-        judge_ready = bool(self._judge_ready())
+        judge_ready = bool(await self._judge_ready())
         entries: list[dict[str, Any]] = []
         for item in _DETERMINISTIC_CAPABILITIES:
             entries.append(
@@ -333,10 +339,23 @@ class EvaluationAdminService:
                     "输出 schema 固定 number，不接受外部取值范围）"
                 )
         judge_model = payload.get("judge_model")
-        if not isinstance(judge_model, str) or not judge_model.strip():
+        if judge_model is None:
+            # T4：None（载荷缺省）= 跟随组合根默认供给——定义材料不锁定
+            # 模型，后续 Provider 热切换不影响该定义（spec 未冻结语义）
+            pass
+        elif not isinstance(judge_model, str) or not judge_model.strip():
+            # 显式空串/空白/非字符串仍拒绝（空串 = 未声明，不是"跟随
+            # 默认"——只有 None 表示跟随默认供给）
             raise EvaluationValidationError(
-                "llm_judge 必须声明 judge_model"
+                "llm_judge judge_model 必须是非空字符串或 None（跟随默认）"
             )
+        else:
+            # 非空值经共用模型名校验（T5 单一来源，与 C 类配置覆盖同规则：
+            # 长度/控制字符/首尾空白，不静默 trim）；显式字符串冻结该模型
+            try:
+                validate_model_name_string(judge_model, allow_empty=False)
+            except EvaluationConfigValidationError as exc:
+                raise EvaluationValidationError(str(exc)) from exc
         judge_params = self._judge_params(payload.get("judge_params"))
         rubric = judge_params.get("rubric")
         material_hash: dict[str, str] = {}

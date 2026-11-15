@@ -337,3 +337,134 @@ async def test_judge_dispatch_rejects_changed_connection_before_call():
         await dispatch.evaluate(SimpleNamespace(metric_name="agent.answer_correctness"),
                                 EvidenceSnapshot(content={"execution_fingerprint":"old-configuration"}, redaction_version="test"))
     assert not calls
+
+
+async def test_readiness_uses_injected_judge_state_each_call(tmp_path):
+    """T4：组合根注入 async Judge 状态 callable——readiness 每次 await
+    当前有效供给状态；judge_model/self_judge 同用本次有效模型，不再以
+    env-only 判据阻断（env 全空 + Provider 供给就绪也 ready）。"""
+    from types import SimpleNamespace
+
+    from app.infrastructure.evaluation.execution_runtime import (
+        build_execution_service,
+    )
+
+    ledger = SQLiteEvaluationStore(str(tmp_path / "eval.db"))
+    settings = SimpleNamespace(
+        evaluation_judge_provider_base_url="",
+        evaluation_judge_provider_api_key="",
+        evaluation_judge_provider_model="",
+        evaluation_evidence_retention_days=7,
+        dashboard_base_url="",
+    )
+    holder = SimpleNamespace(current_config=None)
+
+    class ConfigService:
+        def current_sync(self):
+            return SimpleNamespace(evaluation_enabled=True)
+
+    class Worker:
+        is_running = True
+
+    states = [
+        {"ready": True, "model": "provider-model-a"},
+        {"ready": False, "model": None},
+    ]
+    state_calls = []
+
+    async def judge_state():
+        state_calls.append(1)
+        return states[min(len(state_calls) - 1, len(states) - 1)]
+
+    service = build_execution_service(
+        settings=settings, holder=holder,
+        registry=SimpleNamespace(get_secret=None),
+        chat=None, service=EvaluationService(ledger, enabled=True),
+        ledger=ledger,
+        review=EvaluationReviewService(store=ledger, datasets_root=tmp_path / "datasets"),
+        evidence=Evidence(), worker=Worker(), config_service=ConfigService(),
+        judge_state=judge_state,
+    )
+    first = await service.readiness()
+    assert state_calls == [1]
+    assert first["judge_ready"] is True
+    assert first["judge_model"] == "provider-model-a"
+    # self_judge 跟随本次有效模型（无 current_config 时恒 False）
+    assert first["self_judge"] is False
+
+    # 热切换：第二次 readiness 读到新状态（每次调用都 await）
+    second = await service.readiness()
+    assert len(state_calls) == 2
+    assert second["judge_ready"] is False
+    assert second["judge_model"] is None
+    assert second["self_judge"] is False
+
+    # 未注入 judge_state：回落 env-only 旧判据（env 全空 -> not ready）
+    fallback_service = build_execution_service(
+        settings=settings, holder=holder,
+        registry=SimpleNamespace(get_secret=None),
+        chat=None, service=EvaluationService(ledger, enabled=True),
+        ledger=ledger,
+        review=EvaluationReviewService(store=ledger, datasets_root=tmp_path / "datasets2"),
+        evidence=Evidence(), worker=Worker(), config_service=ConfigService(),
+    )
+    fallback = await fallback_service.readiness()
+    assert fallback["judge_ready"] is False
+    assert fallback["judge_model"] is None
+
+
+async def test_readiness_self_judge_uses_state_model_not_env(tmp_path):
+    """T4：self_judge 以本次有效 Judge 模型比对目标模型（Provider 供给
+    模型与 env 基线不同时不误标 self_judge）。"""
+    from types import SimpleNamespace
+
+    from app.infrastructure.evaluation.execution_runtime import (
+        build_execution_service,
+    )
+
+    ledger = SQLiteEvaluationStore(str(tmp_path / "eval.db"))
+    settings = SimpleNamespace(
+        evaluation_judge_provider_base_url="http://judge.test",
+        evaluation_judge_provider_api_key="key",
+        evaluation_judge_provider_model="env-judge",
+        evaluation_evidence_retention_days=7,
+        dashboard_base_url="",
+    )
+    holder = SimpleNamespace(
+        current_config=SimpleNamespace(
+            id="cfg-1",
+            base_url="http://target.test",
+            model="provider-model-a",
+            supports_vision=False,
+            extra_headers={},
+            updated_at="2026-01-01T00:00:00+00:00",
+        )
+    )
+
+    async def get_secret(config_id):
+        return "secret"
+
+    class ConfigService:
+        def current_sync(self):
+            return SimpleNamespace(evaluation_enabled=True)
+
+    class Worker:
+        is_running = True
+
+    async def judge_state():
+        return {"ready": True, "model": "provider-model-a"}
+
+    service = build_execution_service(
+        settings=settings, holder=holder,
+        registry=SimpleNamespace(get_secret=get_secret),
+        chat=None, service=EvaluationService(ledger, enabled=True),
+        ledger=ledger,
+        review=EvaluationReviewService(store=ledger, datasets_root=tmp_path / "datasets"),
+        evidence=Evidence(), worker=Worker(), config_service=ConfigService(),
+        judge_state=judge_state,
+    )
+    state = await service.readiness()
+    # env 基线模型是 env-judge，Provider 供给模型是 provider-model-a：
+    # 目标模型 == 供给模型 -> self_judge True（env-only 旧判据会误判 False）
+    assert state["judge_model"] == "provider-model-a"
+    assert state["self_judge"] is True

@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 
 import json
@@ -32,6 +33,7 @@ from app.infrastructure.evaluation.judge_provider import (
     JUDGE_EVALUATOR_FACTORIES,
     JudgeFormatError,
     JudgePermanentError,
+    JudgeSupplyOverride,
     JudgeTransientError,
     LLMJudgeEvaluator,
     make_answer_correctness_judge,
@@ -153,17 +155,32 @@ def _make_transport(recorder: list[httpx.Request], responder):
 
 
 def _make_judge(
-    metric_name: str, recorder: list[httpx.Request], responder, **overrides
+    metric_name: str, recorder: list[httpx.Request] | None, responder, **overrides
 ) -> LLMJudgeEvaluator:
     factory = JUDGE_EVALUATOR_FACTORIES[metric_name]
     kwargs = {
         "base_url": BASE_URL,
         "api_key": API_KEY,
         "model": CONFIG_MODEL,
-        "transport": _make_transport(recorder, responder),
         **overrides,
     }
+    # 供给逐次客户端语义：多请求/并发用例必须注入 transport_factory 取得
+    # 独立 transport，禁止复用同一实例（逐次 client aclose 会关闭 transport）
+    if "transport" not in kwargs and "transport_factory" not in kwargs:
+        kwargs["transport"] = _make_transport(recorder, responder)
     return factory(**kwargs)
+
+
+class _CloseCountingTransport(httpx.MockTransport):
+    """统计 aclose 次数的包装 transport：观察逐次客户端即用即关、无共享
+    client 残留。每个并发/多次用例各自独立实例，禁止共享。"""
+
+    def __init__(self, handler):
+        super().__init__(handler)
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
 
 
 def _body_of(request: httpx.Request) -> dict:
@@ -204,9 +221,11 @@ async def test_independent_provider_config_and_auth_header():
     assert str(request.url) == f"{BASE_URL}/chat/completions"
     assert request.headers["Authorization"] == f"Bearer {API_KEY}"
     assert _body_of(request)["model"] == CONFIG_MODEL
-    # 工厂不支持缺省配置：base_url/api_key/model 必须显式提供
-    with pytest.raises(TypeError):
-        make_answer_correctness_judge()
+    # env 全空构造允许（供给改由 resolver 逐次提供；供给缺失在网络调用前
+    # 按 JudgePermanentError 终结，见 TestDefaultSupplyResolver）
+    empty_judge = make_answer_correctness_judge()
+    assert empty_judge.metric_name == "agent.answer_correctness"
+    await empty_judge.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -975,9 +994,8 @@ def test_definition_model_overrides_adapter_model():
     )
     definition = _definition(judge_params={})
     definition.judge_model  # noqa: B018 - 形状自检（CONFIG_MODEL）
-    import asyncio as _asyncio
 
-    _asyncio.run(judge.evaluate(definition, _snapshot(_correctness_content())))
+    asyncio.run(judge.evaluate(definition, _snapshot(_correctness_content())))
     assert recorder, "Judge 请求未发出"
     payload = json.loads(recorder[0].content)
     assert payload["model"] == CONFIG_MODEL
@@ -998,9 +1016,8 @@ def test_definition_rubric_and_temperature_used():
     definition = _definition(
         judge_params={"rubric": "自定义冻结 RUBRIC-XYZ", "temperature": 1}
     )
-    import asyncio as _asyncio
 
-    _asyncio.run(judge.evaluate(definition, _snapshot(_correctness_content())))
+    asyncio.run(judge.evaluate(definition, _snapshot(_correctness_content())))
     payload = json.loads(recorder[0].content)
     assert payload["temperature"] == 1
     system_text = payload["messages"][0]["content"]
@@ -1022,10 +1039,9 @@ def test_rate_limit_carries_retry_after_seconds():
         model=CONFIG_MODEL,
         transport=_make_transport([], responder),
     )
-    import asyncio as _asyncio
 
     with pytest.raises(JudgeTransientError) as excinfo:
-        _asyncio.run(
+        asyncio.run(
             judge.evaluate(_definition(), _snapshot(_correctness_content()))
         )
     assert excinfo.value.error_type == "rate_limit"
@@ -1055,10 +1071,9 @@ def test_format_error_body_parse_carries_usage_and_model():
         model=CONFIG_MODEL,
         transport=_make_transport([], responder),
     )
-    import asyncio as _asyncio
 
     with pytest.raises(JudgeFormatError) as excinfo:
-        _asyncio.run(
+        asyncio.run(
             judge.evaluate(_definition(), _snapshot(_correctness_content()))
         )
     assert excinfo.value.usage is not None
@@ -1076,10 +1091,9 @@ def test_parse_stage_format_error_carries_usage_and_model():
             [], lambda _req: _chat_response("not-json-at-all")
         ),
     )
-    import asyncio as _asyncio
 
     with pytest.raises(JudgeFormatError) as excinfo:
-        _asyncio.run(
+        asyncio.run(
             judge.evaluate(_definition(), _snapshot(_correctness_content()))
         )
     assert excinfo.value.usage is not None
@@ -1097,3 +1111,552 @@ async def test_capture_evidence_drops_skip_scoring():
     result = await judge.evaluate(definition, _snapshot(content))
     assert result["status"] == "skipped"
     assert result["skip_reason"] == SkipReason.evidence_missing.value
+
+
+# ---------------------------------------------------------------------------
+# T3: default_supply_resolver 注入（供给快照与逐次客户端）
+# ---------------------------------------------------------------------------
+
+
+def _stub_definition_no_model(**kwargs) -> EvaluatorDefinition:
+    """adapter-test-only 桩定义：judge_model=None（生产定义必须声明 judge_model，
+    域校验禁止 None；此处绕过校验以测试适配器回退链，不作为构造范例）。"""
+    definition = _definition(**kwargs)
+    object.__setattr__(definition, "judge_model", None)
+    return definition
+
+
+class TestDefaultSupplyResolver:
+    """组合根注入的异步供给 resolver：每次 evaluate 恰调用一次，返回本次
+    调用的供给快照（JudgeSupplyOverride：base_url/api_key/model）或 None
+    （回落构造 env 基线）。解析结果只存局部变量，不写共享实例状态（并发
+    evaluate 间隔离）；Judge 客户端逐次构建（async with 即用即关），无共享
+    client 残留。"""
+
+    PROVIDER_URL = "http://provider.test/v1"
+    PROVIDER_KEY = "provider-secret"
+    PROVIDER_MODEL = "provider-model"
+
+    @staticmethod
+    def _override(
+        base_url: str = "http://provider.test/v1",
+        api_key: str = "provider-secret",
+        model: str = "provider-model",
+    ) -> JudgeSupplyOverride:
+        return JudgeSupplyOverride(
+            base_url=base_url, api_key=api_key, model=model
+        )
+
+    def _resolver(self, return_value):
+        calls = {"n": 0}
+
+        async def resolver():
+            calls["n"] += 1
+            return return_value
+
+        return resolver, calls
+
+    def _factory_transports(self, recorder, responder):
+        """按请求注册 mock transport 的测试缝：每次调用返回独立实例。"""
+        transports: list[_CloseCountingTransport] = []
+
+        def factory():
+            transport = _CloseCountingTransport(
+                _make_transport(recorder, responder).handler
+            )
+            transports.append(transport)
+            return transport
+
+        return factory, transports
+
+    # ------------------------------------------------------------------
+    # JudgeSupplyOverride 契约
+    # ------------------------------------------------------------------
+
+    def test_supply_override_contract(self):
+        override = self._override()
+        assert override.base_url == self.PROVIDER_URL
+        assert override.api_key == self.PROVIDER_KEY
+        assert override.model == self.PROVIDER_MODEL
+        # repr 不携带凭据，避免 api_key 泄漏进日志
+        assert self.PROVIDER_KEY not in repr(override)
+        # 三字段必须是非空字符串
+        for kwargs in (
+            {"base_url": "", "api_key": "k", "model": "m"},
+            {"base_url": "u", "api_key": "", "model": "m"},
+            {"base_url": "u", "api_key": "k", "model": ""},
+            {"base_url": None, "api_key": "k", "model": "m"},
+            {"base_url": "u", "api_key": 123, "model": "m"},
+        ):
+            with pytest.raises(ValueError):
+                JudgeSupplyOverride(**kwargs)
+
+    # ------------------------------------------------------------------
+    # resolver 返回 override：请求走 override 凭据与模型
+    # ------------------------------------------------------------------
+
+    async def test_provider_override_drives_request_and_model(self):
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, _calls = self._resolver(self._override())
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        try:
+            result = await judge.evaluate(
+                _stub_definition_no_model(), _snapshot(_correctness_content())
+            )
+        finally:
+            await judge.aclose()
+        assert len(recorder) == 1
+        request = recorder[0]
+        # 请求发往 override.base_url，Authorization 为 override 凭据
+        assert str(request.url) == f"{self.PROVIDER_URL}/chat/completions"
+        assert request.headers["Authorization"] == f"Bearer {self.PROVIDER_KEY}"
+        # Provider 已命中时不能再回落 env model（构造值是 CONFIG_MODEL）
+        assert _body_of(request)["model"] == self.PROVIDER_MODEL
+        assert result["provenance"]["judge_supply_source"] == "provider"
+        assert result["provenance"]["judge_model"] == self.PROVIDER_MODEL
+
+    async def test_frozen_model_wins_with_provider_supply(self):
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, _calls = self._resolver(self._override())
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        definition = replace(_definition(), judge_model="frozen-selected-model")
+        try:
+            result = await judge.evaluate(
+                definition, _snapshot(_correctness_content())
+            )
+        finally:
+            await judge.aclose()
+        # 冻结定义命中模型，供给仍走 override（凭据不回落 env）
+        assert _body_of(recorder[0])["model"] == "frozen-selected-model"
+        assert str(recorder[0].url) == f"{self.PROVIDER_URL}/chat/completions"
+        assert recorder[0].headers["Authorization"] == f"Bearer {self.PROVIDER_KEY}"
+        assert result["provenance"]["judge_supply_source"] == "provider"
+        assert result["provenance"]["judge_model"] == "frozen-selected-model"
+
+    async def test_provider_supply_with_empty_env_baseline(self):
+        # 构造值三字段全空 + resolver 提供 override → 正常调用（不得写成
+        # "依赖构造值非空"的供给判定）
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, _calls = self._resolver(self._override())
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            base_url="", api_key="", model="",
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        try:
+            result = await judge.evaluate(
+                _stub_definition_no_model(), _snapshot(_correctness_content())
+            )
+        finally:
+            await judge.aclose()
+        assert result["status"] == "value"
+        assert str(recorder[0].url) == f"{self.PROVIDER_URL}/chat/completions"
+        assert recorder[0].headers["Authorization"] == f"Bearer {self.PROVIDER_KEY}"
+        assert _body_of(recorder[0])["model"] == self.PROVIDER_MODEL
+        assert result["provenance"]["judge_supply_source"] == "provider"
+
+    # ------------------------------------------------------------------
+    # resolver 返回 None：回落构造 env 基线
+    # ------------------------------------------------------------------
+
+    async def test_env_fallback_when_resolver_none(self):
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, _calls = self._resolver(None)
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        try:
+            result = await judge.evaluate(
+                _stub_definition_no_model(), _snapshot(_correctness_content())
+            )
+        finally:
+            await judge.aclose()
+        assert str(recorder[0].url) == f"{BASE_URL}/chat/completions"
+        assert recorder[0].headers["Authorization"] == f"Bearer {API_KEY}"
+        assert _body_of(recorder[0])["model"] == CONFIG_MODEL
+        assert result["provenance"]["judge_supply_source"] == "env"
+        assert result["provenance"]["judge_model"] == CONFIG_MODEL
+
+        # 未注入 resolver → 同样回落 env 基线
+        recorder2: list[httpx.Request] = []
+        judge2 = _make_judge(
+            "agent.answer_correctness", recorder2,
+            lambda _req: _chat_response(_score_payload(1)),
+        )
+        try:
+            result2 = await judge2.evaluate(
+                _stub_definition_no_model(), _snapshot(_correctness_content())
+            )
+        finally:
+            await judge2.aclose()
+        assert _body_of(recorder2[0])["model"] == CONFIG_MODEL
+        assert result2["provenance"]["judge_supply_source"] == "env"
+
+    async def test_unconfigured_baseline_raises_permanent_without_network(self):
+        # 构造值三字段全空 + resolver None → evaluate 抛 JudgePermanentError
+        #（permanent_error，信息含"未配置"），零网络调用
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, _calls = self._resolver(None)
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            base_url="", api_key="", model="",
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        try:
+            with pytest.raises(JudgePermanentError) as exc_info:
+                await judge.evaluate(
+                    _definition(), _snapshot(_correctness_content())
+                )
+        finally:
+            await judge.aclose()
+        assert exc_info.value.error_type == "permanent_error"
+        assert "未配置" in str(exc_info.value)
+        assert recorder == []
+
+    # ------------------------------------------------------------------
+    # 本地 skipped / 确定性 value 路径：无需完整供给，不抛错、无网络调用
+    # ------------------------------------------------------------------
+
+    async def test_local_paths_work_without_supply(self):
+        def make_responder():
+            async def responder(_req: httpx.Request) -> httpx.Response:
+                raise AssertionError("本地路径不得调用 Judge")
+            return responder
+
+        # 本地 skipped（缺 reference）：构造全空 + resolver None 仍返回 skipped
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(recorder, make_responder())
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            base_url="", api_key="", model="",
+            transport_factory=factory,
+        )
+        content = _correctness_content()
+        del content["reference"]
+        try:
+            result = await judge.evaluate(_definition(), _snapshot(content))
+        finally:
+            await judge.aclose()
+        assert result["status"] == "skipped"
+        assert result["skip_reason"] == SkipReason.missing_reference.value
+        assert recorder == []
+        # 本地 skipped 不产出 provenance（不把无供给伪称为 env 命中）
+        assert "provenance" not in result
+
+        # 本地确定性 value（kb 空检索结果=0）：同样不抛错、无网络调用
+        judge2 = _make_judge(
+            "kb.context_relevance", None, None, base_url="", api_key="", model="",
+        )
+        try:
+            result2 = await judge2.evaluate(
+                _definition("kb.context_relevance"),
+                _snapshot({"query": "q", "chunks": []}),
+            )
+        finally:
+            await judge2.aclose()
+        assert result2["status"] == "value"
+        assert result2["value"] == 0
+        assert "judge_supply_source" not in result2["provenance"]
+
+    async def test_local_value_branch_provenance_uses_supply_model(self):
+        # kb.context_relevance 空结果 → 本地值 0，不联网；provenance 用
+        # 解析后的模型（供给快照模型），顶层 model 为 None
+        async def no_call_responder(_req: httpx.Request) -> httpx.Response:
+            raise AssertionError("本地路径不得调用 Judge")
+
+        resolver, _calls = self._resolver(self._override())
+        judge = _make_judge(
+            "kb.context_relevance", [], no_call_responder,
+            default_supply_resolver=resolver,
+        )
+        try:
+            result = await judge.evaluate(
+                _stub_definition_no_model(metric_name="kb.context_relevance"),
+                _snapshot({"query": "q", "chunks": []}),
+            )
+        finally:
+            await judge.aclose()
+        assert result["status"] == "value"
+        assert result["value"] == 0
+        assert result["model"] is None
+        assert result["provenance"]["judge_model"] == self.PROVIDER_MODEL
+
+    # ------------------------------------------------------------------
+    # resolver 调用次数与异常传播
+    # ------------------------------------------------------------------
+
+    async def test_supply_resolver_called_exactly_once_per_evaluate(self):
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, calls = self._resolver(self._override())
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        try:
+            await judge.evaluate(
+                _stub_definition_no_model(), _snapshot(_correctness_content())
+            )
+            assert calls["n"] == 1
+            # 冻结定义给出模型时供给仍需解析（base_url/api_key 依赖快照），
+            # 每次 evaluate 恰调用一次
+            await judge.evaluate(
+                replace(_definition(), judge_model="frozen"),
+                _snapshot(_correctness_content()),
+            )
+            assert calls["n"] == 2
+        finally:
+            await judge.aclose()
+        assert len(recorder) == 2
+
+    async def test_supply_resolver_failure_propagates(self):
+        async def broken_resolver():
+            raise RuntimeError("resolver unavailable")
+
+        judge = _make_judge(
+            "agent.answer_correctness", [], lambda _req: _chat_response(_score_payload(1)),
+            default_supply_resolver=broken_resolver,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="resolver unavailable"):
+                await judge.evaluate(
+                    _stub_definition_no_model(), _snapshot(_correctness_content())
+                )
+        finally:
+            await judge.aclose()
+
+    # ------------------------------------------------------------------
+    # self_judge 与顶层 model 记录
+    # ------------------------------------------------------------------
+
+    async def test_self_judge_uses_resolved_model(self):
+        # target_model == 供给快照模型（非 env 基线）→ self_judge True
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, _calls = self._resolver(self._override())
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        try:
+            result = await judge.evaluate(
+                _stub_definition_no_model(),
+                _snapshot(_correctness_content(target_model=self.PROVIDER_MODEL)),
+            )
+        finally:
+            await judge.aclose()
+        assert result["provenance"]["judge_model"] == self.PROVIDER_MODEL
+        assert result["provenance"]["self_judge"] is True
+
+        # target_model == env 基线而供给快照模型不同 → self_judge False
+        recorder2: list[httpx.Request] = []
+        factory2, _transports2 = self._factory_transports(
+            recorder2, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver2, _calls2 = self._resolver(self._override())
+        judge2 = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory2, default_supply_resolver=resolver2,
+        )
+        try:
+            result2 = await judge2.evaluate(
+                _stub_definition_no_model(),
+                _snapshot(_correctness_content(target_model=CONFIG_MODEL)),
+            )
+        finally:
+            await judge2.aclose()
+        assert result2["provenance"]["self_judge"] is False
+
+    async def test_actual_model_kept_top_level(self):
+        # 响应携带不同实际模型：顶层 model 用响应实际值，self_judge/
+        # provenance 用解析模型（不从 actual_model 重算身份）
+        recorder: list[httpx.Request] = []
+        factory, _transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        resolver, _calls = self._resolver(self._override())
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory, default_supply_resolver=resolver,
+        )
+        try:
+            result = await judge.evaluate(
+                _stub_definition_no_model(),
+                _snapshot(_correctness_content(target_model=self.PROVIDER_MODEL)),
+            )
+        finally:
+            await judge.aclose()
+        assert result["model"] == "judge-actual-model-2"
+        assert result["provenance"]["judge_model"] == self.PROVIDER_MODEL
+        assert result["provenance"]["self_judge"] is True
+
+    # ------------------------------------------------------------------
+    # 并发隔离：两个 evaluate 各用独立供给快照，互不串用凭据
+    # ------------------------------------------------------------------
+
+    async def test_concurrent_evaluates_supply_isolation(self):
+        recorder: list[httpx.Request] = []
+        first_arrived = asyncio.Event()
+        second_released = asyncio.Event()
+        picked: list[str] = []
+
+        async def interleaved_resolver():
+            # 强制两次并发 evaluate 的供给解析交错：第一次调用挂起等待
+            # 第二次取完快照后再返回不同凭据
+            if not first_arrived.is_set():
+                first_arrived.set()
+                await second_released.wait()
+                picked.append("ovr-a")
+                return self._override(
+                    base_url="http://ovr-a.test/v1",
+                    api_key="key-a",
+                    model="ovr-model-a",
+                )
+            picked.append("ovr-b")
+            second_released.set()
+            return self._override(
+                base_url="http://ovr-b.test/v1",
+                api_key="key-b",
+                model="ovr-model-b",
+            )
+
+        factory, transports = self._factory_transports(
+            recorder, lambda _req: _chat_response(_score_payload(1))
+        )
+        judge = _make_judge(
+            "agent.answer_correctness", None, None,
+            transport_factory=factory,
+            default_supply_resolver=interleaved_resolver,
+        )
+        snapshot_a = _snapshot(_correctness_content(target_model="ovr-model-a"))
+        snapshot_b = _snapshot(_correctness_content(target_model=None))
+        try:
+            result_a, result_b = await asyncio.gather(
+                judge.evaluate(_stub_definition_no_model(), snapshot_a),
+                judge.evaluate(_stub_definition_no_model(), snapshot_b),
+            )
+        finally:
+            await judge.aclose()
+
+        assert sorted(picked) == ["ovr-a", "ovr-b"]
+        # 每个请求各用各的供给快照：host、Authorization、模型一一对应，
+        # 不发生跨调用串扰
+        by_host = {req.url.host: req for req in recorder}
+        assert set(by_host) == {"ovr-a.test", "ovr-b.test"}
+        req_a = by_host["ovr-a.test"]
+        req_b = by_host["ovr-b.test"]
+        assert req_a.headers["Authorization"] == "Bearer key-a"
+        assert _body_of(req_a)["model"] == "ovr-model-a"
+        assert req_b.headers["Authorization"] == "Bearer key-b"
+        assert _body_of(req_b)["model"] == "ovr-model-b"
+        # provenance 与各自快照一一对应；a 的快照 target_model 是自己的
+        # 解析模型 → self_judge True；b 无 target_model → False
+        assert result_a["provenance"]["judge_model"] == "ovr-model-a"
+        assert result_a["provenance"]["self_judge"] is True
+        assert result_b["provenance"]["judge_model"] == "ovr-model-b"
+        assert result_b["provenance"]["self_judge"] is False
+        assert all(
+            result["provenance"]["judge_supply_source"] == "provider"
+            for result in (result_a, result_b)
+        )
+        # 并发 evaluate 各用独立 transport 实例（逐次客户端各自关闭）
+        assert len(transports) == 2
+        assert all(t.aclose_calls == 1 for t in transports)
+        # 实例 env 基线不受供给解析影响
+        assert judge._model == CONFIG_MODEL
+
+    # ------------------------------------------------------------------
+    # 逐次客户端：各结局后无共享 client 残留
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "scenario",
+        [
+            "success",
+            "http_error",
+            "rate_limit",
+            "network_error",
+            "format_error",
+            "timeout",
+            "cancelled",
+        ],
+    )
+    async def test_no_shared_client_residue_after_each_outcome(self, scenario):
+        recorder: list[httpx.Request] = []
+        in_flight = asyncio.Event()
+        release = asyncio.Event()
+
+        async def responder(request: httpx.Request) -> httpx.Response:
+            recorder.append(request)
+            if scenario == "success":
+                return _chat_response(_score_payload(1))
+            if scenario == "http_error":
+                return httpx.Response(500, json={"error": "boom"})
+            if scenario == "rate_limit":
+                return httpx.Response(429, json={"error": "rate limited"})
+            if scenario == "network_error":
+                raise httpx.ConnectError("connection refused")
+            if scenario == "format_error":
+                return _chat_response("not-json")
+            if scenario == "timeout":
+                raise httpx.ReadTimeout("read timed out")
+            # cancelled：挂起在请求中，等待测试方取消
+            in_flight.set()
+            await release.wait()
+            raise AssertionError("cancelled 用例不应到达这里")
+
+        factory, transports = self._factory_transports(recorder, responder)
+        judge = _make_judge(
+            "agent.answer_correctness", None, None, transport_factory=factory
+        )
+        if scenario == "cancelled":
+            task = asyncio.create_task(
+                judge.evaluate(_definition(), _snapshot(_correctness_content()))
+            )
+            await in_flight.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif scenario == "success":
+            await judge.evaluate(_definition(), _snapshot(_correctness_content()))
+        elif scenario == "format_error":
+            with pytest.raises(JudgeFormatError):
+                await judge.evaluate(
+                    _definition(), _snapshot(_correctness_content())
+                )
+        else:
+            with pytest.raises(JudgeTransientError):
+                await judge.evaluate(
+                    _definition(), _snapshot(_correctness_content())
+                )
+        # 每次 evaluate 恰构建一个 client（独立 transport），结束即关闭：
+        # 成功/HTTP 错误/网络错误/格式错误/超时/取消后均无共享 client 残留
+        assert len(transports) == 1
+        assert transports[0].aclose_calls == 1
+
