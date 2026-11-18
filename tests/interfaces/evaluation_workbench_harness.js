@@ -157,6 +157,16 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   // 加载时即创建，实验视图会调用 listExecutions；默认空首页夹具
   const execParamsHistory = [];
   let execListPage = { items: [], next_cursor: null };
+  // 来源会话列展示会话名称（fallback 会话ID）：会话列表 mock，按需在用例内覆写；
+  // evaluation.js 读取的是 NAGENT.api 顶层 listSessions（与 management-api.js 一致）
+  let sessionList = [
+    { id: 'source-session-1', title: '来源会话标题一' },
+    { id: 'detail-session', title: '详情会话标题' },
+  ];
+  const listSessionsApi = async () => {
+    calls.push(['listSessions']);
+    return sessionList;
+  };
   let submitBehavior = 'ok';
   // Part I（plan-261116 T6）：模型页 mock 状态——GET 投影按 T5 新字段形状
   // 模拟；置 null 模拟投影加载失败
@@ -350,7 +360,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       get activeElement() { return getActiveElement(); },
     },
     NAGENT: {
-      api: Object.assign({ evaluations: api }, providerApi),
+      api: Object.assign({ evaluations: api, listSessions: listSessionsApi }, providerApi),
       modal: {
         alert: message => { alerts.push(String(message)); },
         confirm: message => {
@@ -1083,12 +1093,14 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   await moduleApi.refresh(state('results'));
   assert.deepEqual(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))), { limit: 20 },
     '首页不得携带游标或过滤');
-  assert.match(root.textContent, /source-session-1/);
+  assert.match(root.textContent, /来源会话标题一/, '来源会话列展示会话名称');
+  assert.doesNotMatch(root.textContent, /source-session-1/, '有会话名称时不再展示会话ID');
   assert.doesNotMatch(root.textContent, /res-1/, '结果ID移到详情');
   const resultHeaders = () => findAll(root, node => node.tag === 'th').map(node => node.textContent);
   const onlineResultHeaders = resultHeaders();
   assert.ok(find(root, node => node.tag === 'a'
-    && node.href === '/observations/sessions/source-session-1'), '会话列提供直达链接');
+    && node.href === '/observations/sessions/source-session-1'
+    && node.textContent === '来源会话标题一'), '会话列展示会话名称并保留直达链接');
   // 状态口径备注收进"结果"标题 hover tips（多行），列表下不再有备注块
   assert.ok(find(root, node => typeof node.className === 'string'
     && node.className.split(/\s+/).includes('panel-tips')
@@ -1208,7 +1220,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   await flush();
   assert.equal(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))).cursor, undefined,
     '空页上一页回退到首页不携带游标');
-  assert.match(root.textContent, /source-session-1/, '回退后重新渲染结果列表');
+  assert.match(root.textContent, /来源会话标题一/, '回退后重新渲染结果列表');
 
   assert.equal(find(root, node => node.name === 'results_evaluation_scene'), undefined,
     '入口固定场景，不提供跨场景筛选');
@@ -2617,7 +2629,8 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     assert.match(body.textContent, /res-g8/, '结果ID保留在详情');
     assert.match(body.textContent, /detail-run/, '详情展示真实 Run ID');
     assert.ok(find(body, node => node.tag === 'a'
-      && node.href === '/observations/sessions/detail-session'), '详情提供来源会话链接');
+      && node.href === '/observations/sessions/detail-session'
+      && node.textContent === '详情会话标题'), '详情来源会话展示会话名称并保留直达链接');
     assert.ok(attemptTh && hasClass(attemptTh, 'document-table__numeric'), '投递尝试列 numeric');
     const attemptTds = findAll(body, node => node.tag === 'td' && hasClass(node, 'document-table__numeric'))
       .map(node => node.textContent);

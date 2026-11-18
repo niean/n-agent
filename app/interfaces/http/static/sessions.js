@@ -23,7 +23,8 @@
   let selectedSessionSources = loadSessionSourceFilter();
 
   function defaultSessionSourceFilter() {
-    return new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value).filter((value) => value !== 'delegation' && value !== 'experiment'));
+    // 默认展示所有类型的会话（含实验/委派），历史默认曾排除这两类
+    return new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value));
   }
 
   function loadSessionSourceFilter() {

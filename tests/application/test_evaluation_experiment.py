@@ -1427,6 +1427,8 @@ async def test_replay_online_agent_run_sample_rescores(tmp_path):
                 "service": "n-agent",
                 "kind": "agent_run",
                 "subject_id": "run-online-1",
+                "session_id": "online-session-one",
+                "run_id": "online-run-one",
                 "subject_revision": "rev-1",
                 "trace_id": source["target"]["trace_id"],
                 "span_id": source["target"]["span_id"],
@@ -1465,6 +1467,8 @@ async def test_replay_online_agent_run_sample_rescores(tmp_path):
     assert item.sample_ids
     replayed = await store.load_sample(item.sample_ids[0])
     assert replayed["snapshot_ref"] == source["snapshot_ref"]
+    assert replayed["target"]["session_id"] == "online-session-one"
+    assert replayed["target"]["run_id"] == "online-run-one"
     # 队列中包含 seed execute 产生的 job：领取直到命中 replay 样本的 job
     job = None
     for _ in range(16):
@@ -2062,3 +2066,46 @@ async def test_evidence_targets_include_consumed_documents(tmp_path):
 def test_session_namespace_uses_domain_prefix():
     from app.application.evaluation_experiment import session_namespace
     assert session_namespace("exp1", "case-1") == "eval-experiment-exp1-case-1"
+
+
+@pytest.mark.parametrize("session_id", ["actual-execute-session", None])
+async def test_execute_scoring_identity_uses_observed_session(tmp_path, session_id):
+    store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+    await _definitions(store, _definition("agent.task_success", "experiment_item"),
+                       _definition("kb.recall_at_5", "retrieval"))
+    output = {**_agent_output(), "session_id": session_id}
+    target = FakeTargetRunner([{"status": "succeeded", "output": output,
+                               "run_id": "observed-run", "side_effects": [],
+                               "retrievals": [_retrieval_entry()]}])
+    evidence = FakeEvidence()
+    evidence_targets = []
+    original_save = evidence.save_snapshot
+    async def save(target, snapshot):
+        evidence_targets.append(target)
+        return await original_save(target, snapshot)
+    evidence.save_snapshot = save
+    runner = _runner(store, target, evidence=evidence)
+    report = await runner.execute(ExecuteExperimentRequest(
+        dataset=_manifest(_agent_case("case-identity")), name="identity", target_config={},
+        evaluator_set=(("agent.task_success", "v1"), ("kb.recall_at_5", "v1")),
+    ))
+    assert report.items[0].sample_ids
+    for sample_id in report.items[0].sample_ids:
+        sample = await store.load_sample(sample_id)
+        assert sample["target"].get("session_id") == session_id
+        assert sample["target"]["run_id"] == "observed-run"
+    assert evidence_targets[0].session_id == session_id
+    assert evidence_targets[0].run_id == "observed-run"
+
+
+@pytest.mark.parametrize(('retrieval', 'expected'), [
+    ({'session_id': 'other-session'}, {'session_id': 'other-session', 'run_id': None}),
+    ({'run_id': 'other-run'}, {'session_id': None, 'run_id': 'other-run'}),
+    ({'session_id': 'root-session'}, {'session_id': 'root-session', 'run_id': 'root-run'}),
+    ({'run_id': 'root-run'}, {'session_id': 'root-session', 'run_id': 'root-run'}),
+    ({'session_id': 'other-session', 'run_id': 'other-run'},
+     {'session_id': 'other-session', 'run_id': 'other-run'}),
+])
+def test_retrieval_identity_does_not_mix_unrelated_owner(retrieval, expected):
+    result = {'output': {'session_id': 'root-session'}, 'run_id': 'root-run'}
+    assert EvaluationExperimentRunner._business_identity(result, retrieval) == expected

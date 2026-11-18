@@ -1798,8 +1798,9 @@
       dataBody.appendChild(pagerRow);
       return;
     }
+    const sessionTitles = await loadSessionTitles();
     const rows = items.map((item) => [
-      resultSessionCell(item),
+      resultSessionCell(item, sessionTitles),
       resultExperimentCell(item.experiment_id),
       item.metric_name,
       item.typed_value === undefined || item.typed_value === null ? '-' : String(item.typed_value),
@@ -1818,11 +1819,33 @@
     // 状态口径备注收进"结果"标题 hover tips（views.results shellTip）
   }
 
-  function resultSessionCell(item) {
+  // 会话标题映射：来源会话列/详情展示会话名称（fallback 会话ID），
+  // 链接仍按会话ID直达 observations 会话详情。api 无 listSessions（如
+  // harness 注入的最小 api 面）或加载失败时回落空映射，不阻塞结果渲染。
+  let sessionTitlesPromise = null;
+  function loadSessionTitles() {
+    if (!sessionTitlesPromise) {
+      const fetchSessions = typeof api.listSessions === 'function'
+        ? api.listSessions() : Promise.resolve([]);
+      sessionTitlesPromise = Promise.resolve(fetchSessions)
+        .then((sessions) => {
+          const map = {};
+          (Array.isArray(sessions) ? sessions : []).forEach((s) => {
+            if (s && s.id) map[s.id] = s.title || '';
+          });
+          return map;
+        })
+        .catch(() => ({}));
+    }
+    return sessionTitlesPromise;
+  }
+
+  function resultSessionCell(item, sessionTitles) {
     if (!item.session_id) return '未关联会话';
     if (item.target_service !== 'n-agent') return item.session_id;
-    const link = document.createElement('a');
-    link.textContent = item.session_id;
+    const link = el('a', 'otel-link');
+    const title = sessionTitles && sessionTitles[item.session_id];
+    link.textContent = title || item.session_id;
     link.href = '/observations/sessions/' + encodeURIComponent(item.session_id);
     return link;
   }
@@ -1850,7 +1873,8 @@
       || (detail.feedback && detail.feedback.target) || evidence.target || {};
     const kv = el('div', 'policy-list');
     kv.appendChild(kvRow('结果ID', result.result_id || resultId));
-    kv.appendChild(kvRow('来源会话', resultSessionCell({ session_id: target.session_id, target_service: target.service })));
+    const sessionTitles = await loadSessionTitles();
+    kv.appendChild(kvRow('来源会话', resultSessionCell({ session_id: target.session_id, target_service: target.service }, sessionTitles)));
     kv.appendChild(kvRow('Run ID', target.run_id || '—'));
     kv.appendChild(kvRow('实验', resultExperimentCell(detail.job && detail.job.experiment_id)));
     kv.appendChild(kvRow('指标', result.metric_name));

@@ -508,14 +508,21 @@ def test_chat_session_search_assets():
     assert "currentSessionSearch" in source
 
 
-def test_session_source_filter_includes_experiment_hidden_by_default():
-    """两处筛选器（sessions.js / chat.js）提供实验选项，但默认集合与 delegation 同款排除。"""
-    for source_path in (SESSIONS_JS, CHAT_JS):
-        source = source_path.read_text(encoding="utf-8")
-        assert "['experiment', '实验']" in source
-        # 默认集合排除：experiment 与 delegation 同款从默认集过滤
-        assert "value !== 'delegation'" in source
-        assert "value !== 'experiment'" in source
+def test_session_source_filter_includes_experiment():
+    """两处筛选器（sessions.js / chat.js）均提供实验选项。
+
+    sessions.js（会话页）默认展示所有类型（含实验/委派）；
+    chat.js（侧栏）默认仍排除 experiment 与 delegation。
+    """
+    sessions_source = SESSIONS_JS.read_text(encoding="utf-8")
+    assert "['experiment', '实验']" in sessions_source
+    # 会话页默认集合不再排除任何类型（默认展示所有类型的会话）
+    assert "value !== 'experiment'" not in sessions_source
+    assert "value !== 'delegation'" not in sessions_source
+    chat_source = CHAT_JS.read_text(encoding="utf-8")
+    assert "['experiment', '实验']" in chat_source
+    assert "value !== 'delegation'" in chat_source
+    assert "value !== 'experiment'" in chat_source
 
 
 def test_browser_result_link_uses_browser_session_path():

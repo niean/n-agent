@@ -984,6 +984,7 @@ class EvaluationExperimentRunner:
             "results": list(output.get("results") or []),
             "retrievals": retrievals,
             "business_run_id": result.get("run_id"),
+            "business_session_id": self._business_identity(result)["session_id"],
             # -- Judge 槽位派生字段（#6）--
             "request": request_text or None,
             "answer": str(answer_text) if answer_text else None,
@@ -1068,6 +1069,7 @@ class EvaluationExperimentRunner:
                 subject_revision=dataset.dataset_version,
                 trace_id=root.trace_id,
                 span_id=root.span_id,
+                **self._business_identity(result),
             ),
             snapshot,
         )
@@ -1102,6 +1104,7 @@ class EvaluationExperimentRunner:
                         subject_revision=dataset.dataset_version,
                         trace_id=root.trace_id,
                         span_id=root.span_id,
+                        **self._business_identity(result),
                     ),
                     evidence_targets=self._evidence_targets(result, dataset),
                     snapshot_ref=snapshot_ref,
@@ -1139,6 +1142,7 @@ class EvaluationExperimentRunner:
                         retrieval_id=retrieval_id,
                         trace_id=entry.get("trace_id"),
                         span_id=entry.get("span_id"),
+                        **self._business_identity(result, entry),
                     ),
                     # #8：retrieval 样本同登记真实消费的文档版本——纯 KB
                     # 实验没有根样本，缺登记会让文档删除无法撤销对应
@@ -1167,6 +1171,31 @@ class EvaluationExperimentRunner:
             )
             sample_ids.append(retrieval_result.sample_id)
         return sample_ids
+
+    @staticmethod
+    def _business_identity(
+        result: Mapping[str, Any], retrieval: Mapping[str, Any] | None = None,
+    ) -> dict[str, str | None]:
+        """仅传递观测到的业务身份，不把请求中预分配的会话当作执行证据。
+
+        检索没有独立身份时属于当前执行；显式身份只与相同已知归属补齐，
+        不把其他会话或 Run 的半组身份与当前根执行混搭。
+        """
+        output = result.get("output") or {}
+        retrieval = retrieval or {}
+        def identity(value: Any) -> str | None:
+            return value if isinstance(value, str) and value else None
+
+        session_id = identity(output.get("session_id"))
+        run_id = identity(result.get("run_id"))
+        entry_session = identity(retrieval.get("session_id"))
+        entry_run = identity(retrieval.get("run_id"))
+        if entry_session is None and entry_run is None:
+            return {"session_id": session_id, "run_id": run_id}
+        return {
+            "session_id": entry_session or (session_id if entry_run == run_id else None),
+            "run_id": entry_run or (run_id if entry_session == session_id else None),
+        }
 
     @staticmethod
     def _evidence_targets(
@@ -1469,6 +1498,8 @@ class EvaluationExperimentRunner:
                         ),
                         trace_id=root.trace_id,
                         span_id=root.span_id,
+                        session_id=original_target.get("session_id"),
+                        run_id=original_target.get("run_id"),
                     ),
                     evidence_targets=tuple(
                         dict(t) for t in source.get("evidence_targets") or ()

@@ -311,6 +311,7 @@ class ChatCompletionTargetRunner:
 
         session = request.get("session") or {}
         session_id = session.get("session_id")
+        observed_session_id: str | None = None
         namespace = session.get("namespace")
         turns = list(request.get("turns") or ())
         turn_outputs: list[dict[str, Any]] = []
@@ -332,6 +333,7 @@ class ChatCompletionTargetRunner:
                 message = getattr(result, "message", None) or {}
                 run_id = getattr(result, "run_id", None) or run_id
                 session_id = getattr(result, "session_id", None) or session_id
+                observed_session_id = getattr(result, "session_id", None) or observed_session_id
                 # finish_reason 缺失按未完成处理（保守口径，不默认成功）
                 completion_reported = (
                     getattr(result, "finish_reason", None) == "stop"
@@ -359,6 +361,7 @@ class ChatCompletionTargetRunner:
         return {
             "status": "succeeded",
             "output": {
+                "session_id": observed_session_id,
                 "completion_reported": bool(
                     last.get("completion_reported", False)
                 ),

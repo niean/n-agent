@@ -3728,7 +3728,7 @@ async function testSessionsPageSourceFilter() {
     return tbody._kids.map((r) => r._kids[0].textContent).join('|');
   };
 
-  // 1. 存储不存在/损坏 JSON/非数组/空数组/仅未知值：默认排除 experiment 与 delegation
+  // 1. 存储不存在/损坏 JSON/非数组/空数组/仅未知值：默认展示所有类型（含 experiment 与 delegation）
   let env = loadSessionsPage();
   for (const stored of [null, '{bad json', '{"a":1}', '[]', '["nope"]']) {
     env.clearLocalStorage();
@@ -3741,7 +3741,7 @@ async function testSessionsPageSourceFilter() {
     env.sessions.init();
     await env.waitMicro();
     ok(served && served.length === 3, 'sessions page api returns full array including experiment (stored=' + String(stored) + ')');
-    ok(rowTitlesOf(env) === '控制台会话', 'sessions page default filter hides experiment/delegation (stored=' + String(stored) + ')');
+    ok(rowTitlesOf(env) === '控制台会话|实验会话|委派会话', 'sessions page default filter shows all types (stored=' + String(stored) + ')');
   }
 
   // 2. 合法旧集合原样保留（不含 experiment 即隐藏）
@@ -3799,7 +3799,7 @@ async function testSessionsPageSourceFilter() {
   env.setList(data());
   env.sessions.init();
   await env.waitMicro();
-  ok(rowTitlesOf(env) === '控制台会话', 'sessions page storage read failure still applies default filter');
+  ok(rowTitlesOf(env) === '控制台会话|实验会话|委派会话', 'sessions page storage read failure still applies default filter');
   env.fireClick(env.byIdMap['sessions-filter-btn']);
   backdrop = env.document.getElementById('sessions-source-filter-modal');
   const expBox4 = findCheckboxIn(backdrop, 'experiment');

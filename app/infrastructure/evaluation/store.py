@@ -415,6 +415,15 @@ CREATE TABLE IF NOT EXISTS evaluation_samples (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_samples_service_event
     ON evaluation_samples(service, producer_event_id);
 
+CREATE TABLE IF NOT EXISTS evaluation_sample_identities (
+    sample_id TEXT PRIMARY KEY,
+    session_id TEXT,
+    run_id TEXT,
+    source TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS evaluation_definitions (
     definition_id TEXT NOT NULL,
     version TEXT NOT NULL,
@@ -1252,16 +1261,114 @@ class SQLiteEvaluationStore:
     async def load_sample(self, sample_id: str) -> Mapping[str, Any]:
         return await asyncio.to_thread(self._load_sample_sync, sample_id)
 
+    async def save_sample_identity(
+        self, sample_id: str, session_id: str | None, run_id: str | None,
+        source: str, evidence: Mapping[str, Any],
+    ) -> str:
+        """保存经证据恢复的身份旁表；不改写样本、快照或幂等 hash。"""
+        for key, value in (("sample_id", sample_id), ("source", source),
+                           ("session_id", session_id), ("run_id", run_id)):
+            if value is None and key in ("session_id", "run_id"):
+                continue
+            if not isinstance(value, str) or not value.strip():
+                raise EvaluationValidationError(f"{key} 必须为非空字符串")
+        if session_id is None and run_id is None:
+            raise EvaluationValidationError("恢复身份至少需要 session_id 或 run_id")
+        if not isinstance(evidence, Mapping):
+            raise EvaluationValidationError("evidence 必须为 Mapping")
+        try:
+            evidence_json = _json_dumps(dict(evidence))
+        except (TypeError, ValueError) as exc:
+            raise EvaluationValidationError("evidence 必须可序列化为 JSON") from exc
+        return await asyncio.to_thread(
+            self._save_sample_identity_sync, sample_id, session_id, run_id,
+            source, evidence_json,
+        )
+
+    def _sample_identity_revoked(
+        self, conn: sqlite3.Connection, sample_id: str,
+        session_id: str | None, run_id: str | None,
+    ) -> bool:
+        revoked = conn.execute(
+            "SELECT 1 FROM evaluation_deletion_tombstones WHERE "
+            "(subject_kind='sample' AND subject_id=?) OR "
+            "(subject_kind='session' AND subject_id=?) OR "
+            "(subject_kind='agent_run' AND subject_id=?) LIMIT 1",
+            (sample_id, session_id, run_id),
+        ).fetchone()
+        return revoked is not None or self._sample_id_blocked_by_tombstone(conn, sample_id)
+
+    def _save_sample_identity_sync(
+        self, sample_id: str, session_id: str | None, run_id: str | None,
+        source: str, evidence_json: str,
+    ) -> str:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            sample = conn.execute(
+                "SELECT target_json, service FROM evaluation_samples WHERE sample_id=?",
+                (sample_id,),
+            ).fetchone()
+            if sample is None:
+                raise EvaluationNotFoundError(f"sample not found: {sample_id}")
+            target = _json_loads(sample["target_json"], {})
+            for key, value in (("session_id", session_id), ("run_id", run_id)):
+                if value is not None and target.get(key) and target[key] != value:
+                    raise EvaluationConflictError(f"恢复 {key} 与原始样本冲突: {sample_id}")
+            if self._sample_identity_revoked(
+                conn, sample_id, session_id or target.get("session_id"),
+                run_id or target.get("run_id"),
+            ):
+                raise EvaluationDeletionConflictError("恢复身份命中删除 tombstone")
+            existing = conn.execute(
+                "SELECT session_id, run_id FROM evaluation_sample_identities WHERE sample_id=?",
+                (sample_id,),
+            ).fetchone()
+            if existing is not None:
+                if (existing["session_id"], existing["run_id"]) != (session_id, run_id):
+                    raise EvaluationConflictError(f"恢复身份与已有旁表冲突: {sample_id}")
+                return sample_id
+            now = _iso()
+            conn.execute(
+                "INSERT INTO evaluation_sample_identities "
+                "(sample_id, session_id, run_id, source, evidence_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sample_id, session_id, run_id, source, evidence_json, now),
+            )
+            for kind, identity in (("session", session_id), ("agent_run", run_id)):
+                if identity:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO evaluation_evidence_targets "
+                        "(sample_id, source_service, subject_kind, subject_id, subject_revision, created_at) "
+                        "VALUES (?, ?, ?, ?, '', ?)",
+                        (sample_id, sample["service"], kind, identity, now),
+                    )
+            return sample_id
+
     def _load_sample_sync(self, sample_id: str) -> Mapping[str, Any]:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM evaluation_samples WHERE sample_id = ?",
                 (sample_id,),
             ).fetchone()
+            identity = conn.execute(
+                "SELECT session_id, run_id FROM evaluation_sample_identities WHERE sample_id=?",
+                (sample_id,),
+            ).fetchone()
+            original_target = _json_loads(row["target_json"], {}) if row is not None else {}
+            if identity is not None and self._sample_identity_revoked(
+                conn, sample_id,
+                original_target.get("session_id") or identity["session_id"],
+                original_target.get("run_id") or identity["run_id"],
+            ):
+                identity = None
         if row is None:
             raise EvaluationNotFoundError(f"sample not found: {sample_id}")
         sample = _row_to_dict(row)
         sample["target"] = _json_loads(sample.pop("target_json"), {})
+        if identity is not None:
+            for key in ("session_id", "run_id"):
+                if not sample["target"].get(key) and identity[key]:
+                    sample["target"][key] = identity[key]
         sample.pop("payload_hash", None)
         return sample
 
@@ -4155,19 +4262,38 @@ class SQLiteEvaluationStore:
             params.extend(active_values)
         return where, params
 
+    # Shared by sample identity visibility and all deletion propagation gates.
+    _TOMBSTONE_MATCH_ON = (
+        "t.subject_id = et.subject_id "
+        "AND (t.subject_kind = et.subject_kind "
+        "     OR (t.subject_kind IN ('document', 'document_revision') "
+        "         AND et.subject_kind IN ('document', 'document_revision'))) "
+        "AND (t.subject_revision = '' "
+        "     OR (et.subject_revision = '' AND et.subject_kind IN ('document', 'document_revision')) "
+        "     OR t.subject_revision = et.subject_revision)"
+    )
+
     _RESULTS_PAGE_JOIN_SQL = (
         "FROM evaluation_results r "
         "LEFT JOIN evaluation_jobs j ON r.job_id = j.job_id "
         "LEFT JOIN evaluation_samples s ON j.sample_id = s.sample_id "
+        "LEFT JOIN evaluation_sample_identities si ON si.sample_id = s.sample_id "
+        "AND NOT EXISTS (SELECT 1 FROM evaluation_deletion_tombstones it WHERE "
+        "(it.subject_kind = 'sample' AND it.subject_id = si.sample_id) OR "
+        "(it.subject_kind = 'session' AND it.subject_id = COALESCE(NULLIF(json_extract(s.target_json, '$.session_id'), ''), si.session_id)) OR "
+        "(it.subject_kind = 'agent_run' AND it.subject_id = COALESCE(NULLIF(json_extract(s.target_json, '$.run_id'), ''), si.run_id))) "
+        "AND NOT EXISTS (SELECT 1 FROM evaluation_evidence_targets et "
+        "JOIN evaluation_deletion_tombstones t ON " + _TOMBSTONE_MATCH_ON +
+        " WHERE et.sample_id = s.sample_id) "
         "LEFT JOIN evaluation_feedback f ON r.feedback_id = f.feedback_id "
         "WHERE "
     )
     _RESULTS_PAGE_FROM_SQL = (
         "SELECT r.*, j.experiment_id AS experiment_id, "
         "CASE WHEN r.job_id IS NOT NULL THEN s.service ELSE f.target_service END AS target_service, "
-        "CASE WHEN r.job_id IS NOT NULL THEN json_extract(s.target_json, '$.session_id') "
+        "CASE WHEN r.job_id IS NOT NULL THEN COALESCE(NULLIF(json_extract(s.target_json, '$.session_id'), ''), si.session_id) "
         "ELSE json_extract(f.target_json, '$.session_id') END AS session_id, "
-        "CASE WHEN r.job_id IS NOT NULL THEN json_extract(s.target_json, '$.run_id') "
+        "CASE WHEN r.job_id IS NOT NULL THEN COALESCE(NULLIF(json_extract(s.target_json, '$.run_id'), ''), si.run_id) "
         "ELSE json_extract(f.target_json, '$.run_id') END AS run_id " + _RESULTS_PAGE_JOIN_SQL
     )
 
@@ -5184,18 +5310,6 @@ class SQLiteEvaluationStore:
     _DOCUMENT_KIND_VARIANTS: tuple[str, str] = (
         "document",
         "document_revision",
-    )
-
-    # evidence_targets -> tombstone 等值匹配条件（revision 空串 tombstone
-    # 表示整个主体被删，匹配任意 revision；document 类按变体集合等价）
-    _TOMBSTONE_MATCH_ON = (
-        "t.subject_id = et.subject_id "
-        "AND (t.subject_kind = et.subject_kind "
-        "     OR (t.subject_kind IN ('document', 'document_revision') "
-        "         AND et.subject_kind IN ('document', 'document_revision'))) "
-        "AND (t.subject_revision = '' "
-        "     OR (et.subject_revision = '' AND et.subject_kind IN ('document', 'document_revision')) "
-        "     OR t.subject_revision = et.subject_revision)"
     )
 
     async def has_deletion_tombstone(

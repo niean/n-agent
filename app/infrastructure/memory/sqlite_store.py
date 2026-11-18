@@ -994,18 +994,19 @@ def _migrate_session_id_prefixes(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_experiment_session_source(conn: sqlite3.Connection) -> None:
-    """存量评估实验会话来源迁移：api -> experiment。
+    """存量评估实验会话来源迁移：api/dashboard -> experiment。
 
-    仅修正历史缺省 api（与运行期显式来源优先一致）；大小写敏感匹配
+    修正历史缺省 api 和 Dashboard 预创建的实验会话；大小写敏感匹配
     与 Python startswith 对齐（不用 LIKE——SQLite LIKE 对 ASCII 大小写
     不敏感）。由连接上下文提交，失败回滚本次 UPDATE。"""
     conn.execute(
         "UPDATE sessions SET source=? "
-        "WHERE substr(id, 1, ?) COLLATE BINARY = ? AND source=?",
+        "WHERE substr(id, 1, ?) COLLATE BINARY = ? AND source IN (?, ?)",
         (
             SessionSource.EXPERIMENT.value,
             len(EXPERIMENT_SESSION_ID_PREFIX),
             EXPERIMENT_SESSION_ID_PREFIX,
             SessionSource.API.value,
+            SessionSource.DASHBOARD.value,
         ),
     )

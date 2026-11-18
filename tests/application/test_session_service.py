@@ -22,6 +22,18 @@ class StubTitleGenerator:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source,expected", [
+    ("dashboard", "experiment"), ("api", "experiment"), ("cli", "cli"), ("acp", "acp"),
+])
+async def test_precreated_experiment_session_has_correct_source(tmp_path, source, expected):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = SessionService(store)
+    created = await service.create_session("eval-experiment-case-r0-a0", source=source)
+    assert created.source == expected
+    assert (await store.get_session(created.id)).source == expected
+
+
+@pytest.mark.asyncio
 async def test_ensure_title_generates_for_default_session(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     await store.create_session(ConversationSession(id="s1"))

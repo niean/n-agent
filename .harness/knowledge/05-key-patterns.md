@@ -343,7 +343,7 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 
 ## 模式十六：会话来源与 ID 前缀命名规则
 
-会话 `source` 字段和 `session_id` 前缀必须一一对应，体现入口/触发方式。来源格式为单一一级，无二级；IM 平台直接作为一级来源，与其它入口同级。
+会话 `source` 字段和 `session_id` 前缀通常一一对应，体现入口/触发方式（唯一批准例外：experiment 沿用 eval-experiment- 前缀，见下方规则）。来源格式为单一一级，无二级；IM 平台直接作为一级来源，与其它入口同级。
 
 一级来源：
 
@@ -359,9 +359,11 @@ CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不�
 | schedule | 定时触发 | schedule | schedule- |
 | curator | Curator 周期维护 consolidation fork（内部触发，非平台/非外部 HTTP） | curator | curator- |
 | task | Task worker 进程内执行（Kanban/Manus Task，内部触发，非平台/非外部 HTTP） | task | task- |
+| delegation | 多 Agent 委派 child/aggregator 隔离执行（内部触发） | delegation | delegation- |
+| experiment | 评估实验业务执行（每 case×replicate×attempt 独立会话，进程内/HTTP 两条 runner 路径） | experiment | eval-experiment- |
 
 规则：
-- session_id 前缀严格等于一级名，UUID 跟在连字符后（如 `dashboard-{uuid}`、`feishu-{uuid}`）。
+- session_id 前缀严格等于一级名，UUID 跟在连字符后（如 `dashboard-{uuid}`、`feishu-{uuid}`）。唯一显式例外是 `experiment`：其前缀沿用评估子域既有 namespace 格式 `eval-experiment-`（`EXPERIMENT_SESSION_ID_PREFIX`，`app/domain/session.py`），已被评估子域 evidence_targets（`add_identity("session", ...)`）与删除传播反向索引（`handle_session_deleted`）消费，不可改名；因此来源归类按前缀匹配而非同名词缀。缺省派生顺序（`ChatCompletionService._derive_ingress_source`）：显式 `gateway.source` > `eval-experiment-` 前缀 > `api`；已有 ingress_facts 或 snapshot 来源保持权威、helper 不覆盖。HTTP 入口（`/v1/chat/completions`）按同一前缀权威分类 `describe(expected_source=...)` 与 `IngressFacts.source`；存量 api/dashboard 实验前缀行由启动迁移 `migrate_session_id_prefixes` 内的 `_migrate_experiment_session_source`（api/dashboard->experiment，大小写敏感；补齐 Dashboard 预创建路径，保留 cli/acp/IM 等明确来源）收敛。
 - CLI 入口虽然走 GatewayService，但单列为一级 `cli`（前缀 `cli-`、source `cli`），不归入 IM 平台一级。GatewayService 通过 GatewaySessionKey.platform 分流：source=`cli` → (`cli`, `cli`)，真实 IM 平台 → (`{platform.value}`, `{platform.value}`)。
 - `schedule` 是触发方式不是平台，独立成一级，不再写成 `http/schedule`。
 - `curator` 是 Curator 周期维护 consolidation fork 的内部触发来源，独立成一级（前缀 `curator-`、source `curator`）。session_id 用 `curator-{uuid4()}`（与 `schedule-{uuid4()}` 同，不用时间戳，遵守本模式 UUID 通用规则）。`SkillCuratorService._run_consolidation` 经 `SkillEvolutionService.run_background_review(ingress_source="curator")` 注入 `gateway.source`，由 `ChatCompletionService` 派生为会话 source；缺失时 `_build_policy_snapshot` 会回落 `api`，导致来源与前缀脱节。
@@ -1572,3 +1574,5 @@ Langfuse 实现见 docker/observability/langfuse-config.py 与 langfuse-collecto
 - 同视图视图级操作按钮统一进 Sector Header 的 `body.evaluationsHeaderActions`（span.panel-actions）：人工标注的「审核后导出数据集」在加载/错误/空队列时用 disabledButton 禁用占位（无 click handler，不隐藏），有当前页数据后才挂 actionButton；导出入参为 `slicePage(annotationPageItems, annotationPageIndex).pageItems`，与表格/pager 严格同一切片，新请求发出即清空 annotationPageItems 防旧闭包导出；「查看数据集列表」是纯导航动作始终可用；操作区不渲染「导出当前页」类 evaluations-hint 备注（块状 warning hint 与 Header 行内场景不匹配，导出范围由分页合同本身保证）。
 
 评估评分列表按场景拆入口：/evaluations/results 保留路径、左导改为“线上评估”，其顶导“评分明细”固定请求线上接口；/evaluations/experiment-results 是实验左导下的独立 routeConfig entry（独立 tab/scope/path，sidebarTab/topnavParent=evaluations-experiments），与线上共用 renderResults。实验顶导为执行任务/实验汇总/评分明细。两入口各自保留筛选，进入/刷新重置分页，不再显示场景筛选；实验评分增加实验下拉，实验汇总与详情链接携带 experiment_id，进入后自动选中。前端请求分别使用 listResults/listExperimentResults，后端固定场景并同步约束总数。
+
+实验会话预创建：SessionService.create_session 对保留前缀 eval-experiment- 且来源为 dashboard/api 的会话归类 experiment；DashboardScenarioAdapter 在首轮前创建会话时即正确标记，不能仅依赖后续 ChatCompletion 的 ingress 推导。存量迁移同步覆盖 dashboard/api 两类默认来源。

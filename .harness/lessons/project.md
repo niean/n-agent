@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：空态/加载/错误辅助文字字号须在共享状态类显式声明 token，禁止依赖 body 继承（P094）、bind-mount 配置的容器不随文件更新重载（collector 配置漂移致评估投影缺失，P093）、E2E会话清理与真实Run身份/进程中断（P091）、OpenAI缓存写已知零与命中率Counter准入漂移（P090）、观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：会话来源推断覆盖预创建入口（P098）、评分生产路径的会话身份传递与冻结证据恢复（P097）、空态/加载/错误辅助文字字号须在共享状态类显式声明 token，禁止依赖 body 继承（P094）、bind-mount 配置的容器不随文件更新重载（collector 配置漂移致评估投影缺失，P093）、E2E会话清理与真实Run身份/进程中断（P091）、OpenAI缓存写已知零与命中率Counter准入漂移（P090）、观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
 # 项目教训
 
 ### P094: 辅助文字字号必须在共享类显式声明，禁止依赖继承
@@ -874,3 +874,17 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：身份索引只登记末轮run；恢复释放范围扩大为整个execution且未检查未选中writer；测试将Unix时间与monotonic模拟成同一时间基准，掩盖截止换算错误。
 - 教训：删除依赖取正式session/AgentRun关系而非TaskRun数字ID；恢复操作显式限定收养集合，并按该执行所有writer状态决定存储清理。截止先算任务年龄再映射单调时钟，测试用现代epoch和独立小值monotonic；不要用会自动前进的假分页掩盖未传cursor。
 - 来源：2026-11-14扩展E2E代码审阅，新增反例先红后绿，1906项回归及两组独立复审通过。
+
+### P097: 评分来源展示必须贯通全部实验生产路径
+
+- 现象：线上评分能展示会话，实验评分批量显示未关联；最初只补列表投影仍无效。
+- 根因：execute/replay 评分 target 未传 session_id/run_id，实际身份散落于业务执行返回、冻结证据和源样本，展示层无法凭实验项ID还原。
+- 教训：增加来源字段时同时验证线上、execute、replay、命令型、CLI/ACP 等生产路径；区分预分配会话、实际会话与 conversation_id，身份对不可混搭。历史恢复只依赖校验后的证据与账本，使用独立审计补充记录保留原始幂等 hash，不直接改写冻结样本。
+- 来源：2026-11-19，实验评分会话关联修复及 52 个样本的恢复盘点，执行证据见 locals/harness_tmp/experiment-identities-inventory.json。
+
+### P098: 会话来源推断必须覆盖预创建入口
+
+- 现象：筛选实验时看不到多数真实实验会话，45 条历史会话被标成 dashboard。
+- 根因：场景适配器先通过 Dashboard 创建会话，缺省 source=dashboard 已持久化；后续对话入口的实验前缀推断不会覆盖既有来源，历史迁移又只处理 api。
+- 教训：来源分类必须在最早持久化入口统一生效，同时核对显式渠道与默认渠道。前端过滤异常先比较真实 source 分布，不只检查筛选控件；迁移覆盖所有默认创建路径且保留明确渠道。
+- 来源：2026-11-19，实验会话筛选修复；SessionService 与 SQLite 迁移回归 RED 3 failed，GREEN 113 passed。

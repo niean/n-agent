@@ -435,6 +435,8 @@ def test_migrate_experiment_session_source_idempotent(tmp_path):
 
     with store._connect() as conn:
         _insert_raw_session(conn, "eval-experiment-e1-c1-r0-a0", "Exp-Api-Migrates", "api")
+        _insert_raw_session(conn, "eval-experiment-dashboard-r0-a0", "Exp-Dashboard-Migrates", "dashboard")
+        _insert_raw_session(conn, "dashboard-normal", "Plain-Dashboard", "dashboard")
         _insert_raw_session(conn, "eval-experiment-e2-c1-r0-a0", "Exp-Cli-Stays", "cli")
         _insert_raw_session(conn, "Eval-Experiment-e3-c1-r0-a0", "Exp-CaseNoMatch", "api")
         _insert_raw_session(conn, "api-normal-1", "Plain-Api", "api")
@@ -444,6 +446,8 @@ def test_migrate_experiment_session_source_idempotent(tmp_path):
 
     sources = _sources_by_title(store)
     assert sources["Exp-Api-Migrates"] == "experiment"
+    assert sources["Exp-Dashboard-Migrates"] == "experiment"
+    assert sources["Plain-Dashboard"] == "dashboard"
     assert sources["Exp-Cli-Stays"] == "cli"
     assert sources["Exp-CaseNoMatch"] == "api"
     assert sources["Plain-Api"] == "api"

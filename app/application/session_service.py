@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from app.domain.memory import MemoryStore
 from app.domain.session import (
+    EXPERIMENT_SESSION_ID_PREFIX,
     ConversationMessage,
     ConversationSession,
     SessionNotFoundError,
@@ -100,6 +101,10 @@ class SessionService:
         self._on_session_deleting_handlers.append(handler)
 
     async def create_session(self, session_id: str, source: str = SessionSource.DASHBOARD.value) -> ConversationSession:
+        if session_id.startswith(EXPERIMENT_SESSION_ID_PREFIX) and source in (
+            SessionSource.DASHBOARD.value, SessionSource.API.value,
+        ):
+            source = SessionSource.EXPERIMENT.value
         existing = await self.memory_store.get_session(session_id)
         is_new = existing is None
         session = ConversationSession(id=session_id, source=source)

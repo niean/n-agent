@@ -334,6 +334,7 @@ def test_chat_completion_target_runner_shares_session_across_turns():
     assert result["status"] == "succeeded"
     assert result["output"]["final_answer"] == "answer-2"
     assert result["run_id"] == "run-2"
+    assert result["output"]["session_id"] == chat.calls[0].session_id
 
 
 def test_chat_completion_target_runner_transport_error():
