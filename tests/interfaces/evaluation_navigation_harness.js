@@ -37,7 +37,7 @@ const evaluationViews = [
   ['datasets', '/evaluations/datasets', '数据集'],
   ['evaluators', '/evaluations/evaluators', '评估器'],
   ['experiments', '/evaluations/experiments', '实验'],
-  ['results', '/evaluations/results', '结果'],
+  ['results', '/evaluations/results', '线上评估'],
   ['annotations', '/evaluations/annotations', '人工标注'],
 ];
 const nav = context.NAGENT.navigation;
@@ -72,24 +72,24 @@ for (const [view, path, label] of evaluationViews) {
     assert.equal(current.scope, 'evaluators');
   } else if (view === 'experiments') {
     // 实验左导子域顶导拆为双入口：执行任务 + 实验结果（顺序固定）
-    assert.equal(items.length, 2);
+    assert.equal(items.length, 3);
     assert.deepEqual(JSON.parse(JSON.stringify(items.map(i => i.tab))),
-      ['evaluations-executions', 'evaluations-experiments']);
+      ['evaluations-executions', 'evaluations-experiments', 'evaluations-experiment-results']);
     assert.deepEqual(JSON.parse(JSON.stringify(items.map(i => i.path))),
-      ['/evaluations/executions', '/evaluations/experiments']);
+      ['/evaluations/executions', '/evaluations/experiments', '/evaluations/experiment-results']);
     assert.deepEqual(JSON.parse(JSON.stringify(items.map(i => i.label))),
-      ['执行任务', '实验结果']);
+      ['执行任务', '实验汇总', '评分明细']);
     assert.ok(items.every(i => i.concern === 'evaluation'
       && i.topnavParent === 'evaluations-experiments'));
     const current = items.find(i => i.tab === route.activeTab);
     assert.equal(current.path, path);
-    assert.equal(current.label, '实验结果', '顶导标签与左导"实验"区分，实验结果页顶导称实验结果');
+    assert.equal(current.label, '实验汇总', '顶导标签与左导"实验"区分，实验结果页顶导称实验结果');
     assert.equal(current.scope, 'experiments');
   } else {
     assert.equal(items.length, 1);
     assert.equal(items[0].tab, route.activeTab);
     assert.equal(items[0].path, path);
-    assert.equal(items[0].label, label);
+    assert.equal(items[0].label, view === 'results' ? '评分明细' : label);
     assert.equal(items[0].concern, 'evaluation');
     assert.equal(items[0].scope, view);
   }
@@ -159,9 +159,9 @@ for (const [view, path, label] of evaluationViews) {
   assert.equal(route.currentSubdomain, 'evaluations-experiments');
   assert.equal(route.route.scope, 'executions');
   const items = nav.topnavConfig['evaluations-experiments'];
-  assert.deepEqual(JSON.parse(JSON.stringify(items.map(i => i.label))), ['执行任务', '实验结果']);
+  assert.deepEqual(JSON.parse(JSON.stringify(items.map(i => i.label))), ['执行任务', '实验汇总', '评分明细']);
   assert.deepEqual(JSON.parse(JSON.stringify(items.map(i => i.path))),
-    ['/evaluations/executions', '/evaluations/experiments']);
+    ['/evaluations/executions', '/evaluations/experiments', '/evaluations/experiment-results']);
   assert.equal(nav.sidebarLandingPath('evaluations-experiments'), '/evaluations/executions',
     '实验左导入口必须落在顶导首项执行任务');
 }
@@ -260,3 +260,12 @@ const state = view => ({ activeTab: 'evaluations-' + view, route: { scope: view 
     '旧默认模型编辑输入已移除');
   console.log('evaluation navigation and dataset management passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+{
+  const route = nav.resolveRoute('/evaluations/experiment-results');
+  assert.equal(route.activeTab, 'evaluations-experiment-results');
+  assert.equal(route.sidebarTab, 'evaluations-experiments');
+  assert.equal(route.currentSubdomain, 'evaluations-experiments');
+  assert.equal(route.route.scope, 'experiment-results');
+  assert.ok(!evaluationsParent.children.includes('evaluations-experiment-results'));
+}

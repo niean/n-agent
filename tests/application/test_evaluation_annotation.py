@@ -235,6 +235,16 @@ async def seed_agent_run_result(
 
 
 class TestListQueue:
+    async def test_list_queue_page_includes_filtered_totals(self, store, evaluation_service):
+        await seed_agent_run_result(store)
+        service = make_annotation_service(store, evaluation_service)
+        page = await service.list_queue_page(
+            state="all", reason="low_score", limit=1
+        )
+        assert (page["total_count"], page["total_pages"]) == (1, 1)
+        assert len(page["items"]) == 1
+        assert page["snapshot_at"].endswith("+00:00")
+
     async def test_list_queue_returns_pending_rows(self, store, evaluation_service):
         result_id = await seed_agent_run_result(store)
         service = make_annotation_service(store, evaluation_service)

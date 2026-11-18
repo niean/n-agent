@@ -273,6 +273,16 @@ class EvaluationLedgerStore(Protocol):
         limit: int = 50,
     ) -> tuple[list[Mapping[str, Any]], str | None, str | None]: ...
 
+    async def query_results_page_counted(
+        self, *, cursor: str | None = None, limit: int = 50,
+        legacy_compat: bool = False, **filters: Any,
+    ) -> Mapping[str, Any]: ...
+
+    async def list_annotation_queue_page(
+        self, *, state: str, reason: str, threshold: float = 0.5,
+        limit: int = 50, cursor: str | None = None,
+    ) -> Mapping[str, Any]: ...
+
     async def aggregate_metric_results(
         self,
         *,
@@ -1636,6 +1646,21 @@ class EvaluationService:
             cursor=cursor,
             limit=limit,
         )
+
+    async def list_results_page(
+        self, *, legacy_cursor: bool = False, **filters: Any,
+    ) -> dict[str, Any]:
+        """管理列表含真实总数；保留旧游标的编码兼容。"""
+        if legacy_cursor:
+            filters["cursor"] = _decode_result_cursor(filters.get("cursor"))
+        page = dict(await self._store.query_results_page_counted(
+            legacy_compat=legacy_cursor, **filters,
+        ))
+        if legacy_cursor:
+            token = page["next_cursor"]
+            page["next_cursor"] = _encode_result_cursor(*token.split("|", 1)) if token else None
+            page.pop("snapshot_at", None)
+        return page
 
     async def get_result_detail(self, result_id: str) -> ResultDetail:
         """结果详情：result + job/attempts（automatic）+ feedback（human）

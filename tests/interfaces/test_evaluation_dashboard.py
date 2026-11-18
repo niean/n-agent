@@ -252,7 +252,7 @@ class TestIndexHtml:
             "evaluations-experiments", "evaluations-results", "evaluations-annotations",
         ], f"评估左导子链接顺序不符: {tabs}"
         labels = re.findall(r'sidebar__item-label">([^<]*)</span>', submenu)
-        assert labels == ["概览", "数据集", "评估器", "实验", "结果", "人工标注"], labels
+        assert labels == ["概览", "数据集", "评估器", "实验", "线上评估", "人工标注"], labels
         assert 'data-tab="evaluations-review"' not in content
         assert 'href="/evaluations/review"' not in content
 

@@ -104,6 +104,7 @@ from app.domain.evaluation.models import (
     metric_applicable,
 )
 from app.domain.evaluation.state import SkipReason
+from app.domain.session import EXPERIMENT_SESSION_ID_PREFIX
 
 LOGGER_NAME = "nagent.application.evaluation_experiment"
 
@@ -1685,7 +1686,7 @@ def experiment_item_id(case_id: str, replicate: int) -> str:
 
 def session_namespace(experiment_id: str, case_id: str) -> str:
     """每 case 独立会话 namespace（含实验身份，跨实验隔离）。"""
-    return f"eval-experiment-{experiment_id}-{case_id}"
+    return f"{EXPERIMENT_SESSION_ID_PREFIX}{experiment_id}-{case_id}"
 
 
 def replay_experiment_name(name: str) -> str:

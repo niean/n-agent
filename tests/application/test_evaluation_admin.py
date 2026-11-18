@@ -444,6 +444,11 @@ class TestListDefinitions:
         assert {i["definition_id"] for i in judged["items"]} == {
             "rag.faithfulness"
         }
+        assert (page["total_count"], page["total_pages"]) == (3, 1)
+        assert (retrieval["total_count"], retrieval["total_pages"]) == (1, 1)
+        assert (judged["total_count"], judged["total_pages"]) == (1, 1)
+        empty = await admin.list_definitions(method="missing", limit=2)
+        assert (empty["total_count"], empty["total_pages"]) == (0, 1)
 
     async def test_invalid_cursor_rejected(self, admin):
         with pytest.raises(EvaluationValidationError):
@@ -466,6 +471,8 @@ class TestListDefinitions:
         second = await admin.list_definitions(limit=2, cursor=first["next_cursor"])
         assert len(second["items"]) == 1
         assert second["next_cursor"] is None
+        assert (first["total_count"], first["total_pages"]) == (3, 2)
+        assert (second["total_count"], second["total_pages"]) == (3, 2)
         all_ids = [i["definition_id"] for i in first["items"]] + [
             i["definition_id"] for i in second["items"]
         ]

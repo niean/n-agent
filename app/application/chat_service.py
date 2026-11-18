@@ -28,7 +28,11 @@ from app.domain.agent import AgentState
 from app.domain.agent_run import bind_run, current_run
 from app.domain.information_flow import ReleaseTarget, SecretCatalog
 from app.domain.memory import MemoryStore
-from app.domain.session import ConversationSession, SessionSource
+from app.domain.session import (
+    EXPERIMENT_SESSION_ID_PREFIX,
+    ConversationSession,
+    SessionSource,
+)
 from app.domain.tool import (
     ApprovalDecider,
     ConfirmToolGrant,
@@ -47,6 +51,19 @@ _PROCESS_MESSAGE_SOURCES = frozenset({
     SessionSource.SCHEDULE.value,
     SessionSource.CURATOR.value,
 })
+
+
+def _derive_ingress_source(request: ChatCompletionInput, session_id: str) -> str:
+    """缺省 ingress 来源派生：显式 gateway.source 优先 -> 实验前缀 -> api。
+
+    仅负责缺省事实构造；已有 ingress_facts 或 snapshot 来源保持权威，
+    helper 不覆盖（HTTP 入口必须先构造正确事实）。"""
+    explicit = str(request.trusted_metadata.get("gateway.source") or "")
+    if explicit:
+        return explicit
+    if session_id.startswith(EXPERIMENT_SESSION_ID_PREFIX):
+        return SessionSource.EXPERIMENT.value
+    return SessionSource.API.value
 
 # Upper bound on skills the chat composer may activate for a single run; keeps the
 # Activated Skills prompt section bounded regardless of client payload size.
@@ -150,7 +167,7 @@ class ChatCompletionService:
         session_id = request.session_id or f"api-{uuid4()}"
         ingress = request.ingress_facts or IngressFacts(
             run_id=str(uuid4()), session_id=session_id,
-            source=str(request.trusted_metadata.get("gateway.source") or "api"),
+            source=_derive_ingress_source(request, session_id),
             actor_id=str(request.trusted_metadata.get("actor_id") or "") or None,
             execution_mode=self._execution_mode_from_request(request),
             trusted_claims=dict(request.trusted_metadata),
@@ -204,7 +221,7 @@ class ChatCompletionService:
         elif request.ingress_facts is not None:
             session_source = request.ingress_facts.source
         else:
-            session_source = SessionSource.API.value
+            session_source = _derive_ingress_source(request, session_id)
         explicit_title = (
             request.session_title.strip()[:60]
             if isinstance(request.session_title, str) and request.session_title.strip()
@@ -448,7 +465,7 @@ class ChatCompletionService:
         ingress = request.ingress_facts or IngressFacts(
             run_id=str(uuid4()),
             session_id=session_id,
-            source=str(request.trusted_metadata.get("gateway.source") or "api"),
+            source=_derive_ingress_source(request, session_id),
             actor_id=str(request.trusted_metadata.get("actor_id") or "") or None,
             execution_mode=self._execution_mode_from_request(request),
             trusted_claims=dict(request.trusted_metadata),

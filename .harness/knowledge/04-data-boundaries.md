@@ -509,3 +509,11 @@ Collector 派生配置位于 locals/harness_tmp/langfuse-collector/，目录0700
 - producer 入口协议：POST 评估采集（Bearer compare_digest + 封闭 target_kind 白名单 + 413 增量限流），负载 schema_version=evaluation.sample.v1；producer 状态消息封闭三通道（sample/capture-state/target-deleted），重建计数必须换 counter_epoch。
 - 账本 schema v7（2026-11-12 三方审阅修正）：evaluation_results 增 evaluation_trace_id/evaluation_span_id（worker 在 evaluation_run_scope 作用域内提交 result 时冻结的 evaluation.run Trace hex 身份，OTel 投影 evaluation_trace 字段的数据来源；旧行 NULL，不回退目标业务身份——业务 Trace 与评估 Trace 经 Link 关联是两条 Trace）；evaluation_samples 增 cohort（抽样 cohort：random/failure，非捕获路径空串；capture 提交链 SubmitSampleRequest.cohort 贯通落列，纳入样本幂等 payload hash）。窗口快照 query_window_snapshot 按 sampling_cohort 分组返回新键 sampling_cohort，window.* Gauge 增 sampling_cohort 标签维度（random/failure，空串与未知收敛 other）——故障定向 cohort 偏置分布不与随机样本混算总体质量（spec 7.1/AC17）。
 - 线上采集快照内容新增槽位：tool_calls（tool_traces 的契约投影：tool/schema_valid/permission_granted/side_effects，权限拒绝调用照记不早退）与 allowed_tools（轨迹出现过的工具集）；contexts（与 chunks 同源同值的 faithfulness 槽位别名）；capture_completeness.evidence_drops > 0 时 Judge Provider 评分准入直接 skipped(evidence_missing)。
+
+## 评估列表分页元数据
+
+GET /chat/evaluations/results、experiment-results、evaluators、annotations、executions 的列表响应保留 items / next_cursor，并返回 total_count、total_pages。总数按完整筛选集统计，不随游标边界缩小；总页数按实际生效的 limit 向上取整，空集为 1。结果 v2 分页的计数沿用游标中的 snapshot_at 时间上界；评估器、标注和执行列表维持实时查询口径。SQLite 的计数和当前页使用同一读事务。原 tuple 存储端口继续兼容，带计数的管理列表经独立 page 用例返回元数据。
+
+评分列表按入口固定场景：GET /chat/evaluations/results 仅返回线上（关联 job.experiment_id 为空，无 job 人工评分归线上）；GET /chat/evaluations/experiment-results 仅返回实验（关联 job.experiment_id 非空）。接口强制限定查询和计数，显式 evaluation_scene 与入口冲突时返回 422，不能通过参数跨场景查询。底层存储仍支持省略 evaluation_scene 查询全部，供内部用例使用；场景纳入 v2 游标指纹，跨场景复用游标拒绝。experiment-results 支持 experiment_id 与其他筛选组合。单条评分详情继续共用 /chat/evaluations/results/{result_id}。
+
+评分列表条目附 session_id、run_id、target_service：自动评分来自 sample.target，人工评分来自 feedback.target，缺失为 null，不从 subject_id 推断。两个评分列表列结构完全一致：来源会话/实验/指标/评分/状态/评分来源/时间/操作；线上实验列显示“—”，结果ID移入详情。仅 target_service=n-agent 且存在 session_id 时链接 /observations/sessions/{session_id}；外部服务只展示会话ID，缺失显示未关联会话。评分详情保留结果ID、Run ID、来源会话及实验关联。

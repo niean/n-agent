@@ -65,6 +65,19 @@ async def test_submit_is_idempotent_and_projects_private_state(configured):
         await service.submit({**payload(), "name": "changed"})
 
 
+async def test_execution_list_preserves_pagination_totals(configured):
+    service, _, _, _ = configured
+    empty = await service.list(limit=2)
+    assert (empty["total_count"], empty["total_pages"]) == (0, 1)
+    for index in range(3):
+        await service.submit({**payload(), "request_key": f"total-{index}"})
+    first = await service.list(limit=2)
+    second = await service.list(limit=2, cursor=first["next_cursor"])
+    assert (first["total_count"], first["total_pages"]) == (3, 2)
+    assert (second["total_count"], second["total_pages"]) == (3, 2)
+    assert len(second["items"]) == 1
+
+
 @pytest.mark.parametrize("change", [{"replicates": True}, {"replicates": 11}, {"dataset_hash": "b" * 64},
                                     {"evaluator_set": []}, {"target_config": {"url": "evil"}}])
 async def test_invalid_admission_never_executes(configured, change):

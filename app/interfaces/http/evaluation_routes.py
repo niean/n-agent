@@ -1018,22 +1018,12 @@ def register_evaluation_management_routes(
             return _err(404, "not_found", "experiment not found")
         return _json_ok(overview)
 
-    @app.get("/chat/evaluations/results")
-    @_guarded
-    async def get_results(request: Request) -> JSONResponse:
-        """结果分页查询（Task 9 扩展）。
+    async def _get_results(request: Request, scene: str) -> JSONResponse:
+        """结果分页含完整过滤集的 total_count / total_pages。
 
-        - 保留既有过滤与旧 b64 ``{"c","r"}`` 两段式游标兼容（旧游标 +
-          无新增过滤走既有用例路径，响应保持 items/next_cursor 原形状，
-          不含 snapshot_at——兼容分支刻意维持旧形状，历史客户端不受
-          新字段影响）；
-        - 新增过滤 created_from/created_to/definition_version/provenance
-          或游标 v2 token 时走快照分页用例
-          ``evaluation_service.list_results_snapshot``（直通账本端口
-          ``query_results_page_snapshot`` 三元组返回形状，响应追加
-          snapshot_at，后续页固定复用首次 UTC 上界）；旧格式游标携带
-          新增过滤拒绝（422 cursor_invalid，store v2 分支同样拒绝，
-          路由层先行判定以输出专有错误码）。
+        v2 游标固定首次查询时间上界，计数与当前页使用同一读事务。
+        旧 b64 {c,r} 游标仍可使用，不返回 snapshot_at；旧游标携带
+        扩展过滤时返回 422 cursor_invalid。
         """
         params = request.query_params
         limit, limit_err = _parse_limit(params)
@@ -1043,6 +1033,9 @@ def register_evaluation_management_routes(
         created_to = params.get("created_to")
         definition_version = params.get("definition_version")
         provenance = params.get("provenance")
+        evaluation_scene = params.get("evaluation_scene")
+        if evaluation_scene is not None and evaluation_scene != scene:
+            return _err(422, "protocol_invalid", "evaluation_scene conflicts with this endpoint")
         cursor = params.get("cursor")
         cursor_kind, cursor_err = _classify_result_cursor(cursor)
         if cursor_err is not None:
@@ -1054,6 +1047,7 @@ def register_evaluation_management_routes(
                 created_to,
                 definition_version,
                 provenance,
+                evaluation_scene,
             )
         )
         if cursor_kind == "legacy" and has_new_filters:
@@ -1063,65 +1057,42 @@ def register_evaluation_management_routes(
                 "legacy results cursor is not allowed with extended filters",
             )
         try:
-            if cursor_kind == "legacy":
-                # 兼容路径：既有用例（旧两段式游标语义，无快照上界）
-                page = await evaluation_service.list_results(
-                    target_service=params.get("target_service"),
-                    target_kind=params.get("target_kind"),
-                    target_subject_id=params.get("target_subject_id"),
-                    target_subject_revision=params.get(
-                        "target_subject_revision"
-                    ),
-                    definition_id=params.get("definition_id"),
-                    experiment_id=params.get("experiment_id"),
-                    status=params.get("status"),
-                    cursor=cursor,
-                    limit=limit,
-                )
-                items = []
-                for row in page.items:
-                    item = dict(row)
-                    item.pop("explanation", None)
-                    items.append(item)
-                return _json_ok({
-                    "items": items,
-                    "next_cursor": page.next_cursor,
-                })
-            # 快照路径：Application 快照分页用例（直通账本端口游标 v2
-            # 分支：首次查询 UTC 上界编码进 token，后续页固定复用；
-            # 过滤变更后复用旧游标被拒绝）
-            rows, next_token, snapshot_at = (
-                await evaluation_service.list_results_snapshot(
-                    target_service=params.get("target_service"),
-                    target_kind=params.get("target_kind"),
-                    target_subject_id=params.get("target_subject_id"),
-                    target_subject_revision=params.get(
-                        "target_subject_revision"
-                    ),
-                    definition_id=params.get("definition_id"),
-                    created_from=created_from,
-                    created_to=created_to,
-                    definition_version=definition_version,
-                    experiment_id=params.get("experiment_id"),
-                    status=params.get("status"),
-                    provenance=provenance,
-                    cursor=cursor,
-                    limit=limit,
-                )
+            page = await evaluation_service.list_results_page(
+                legacy_cursor=cursor_kind == "legacy",
+                target_service=params.get("target_service"),
+                target_kind=params.get("target_kind"),
+                target_subject_id=params.get("target_subject_id"),
+                target_subject_revision=params.get("target_subject_revision"),
+                definition_id=params.get("definition_id"),
+                created_from=created_from,
+                created_to=created_to,
+                definition_version=definition_version,
+                experiment_id=params.get("experiment_id"),
+                status=params.get("status"),
+                provenance=provenance,
+                evaluation_scene=scene,
+                cursor=cursor,
+                limit=limit,
             )
         except EvaluationValidationError as exc:
             return _err(422, "protocol_invalid", str(exc))
-        # 不默认返回正文：列表条目剥离 Judge 解释正文（正文只在详情）
+        # Judge 解释正文只在详情返回。
         items = []
-        for row in rows:
+        for row in page["items"]:
             item = dict(row)
             item.pop("explanation", None)
             items.append(item)
-        return _json_ok({
-            "items": items,
-            "next_cursor": next_token,
-            "snapshot_at": snapshot_at,
-        })
+        return _json_ok({**page, "items": items})
+
+    @app.get("/chat/evaluations/results")
+    @_guarded
+    async def get_results(request: Request) -> JSONResponse:
+        return await _get_results(request, "online")
+
+    @app.get("/chat/evaluations/experiment-results")
+    @_guarded
+    async def get_experiment_results(request: Request) -> JSONResponse:
+        return await _get_results(request, "experiment")
 
     @app.get("/chat/evaluations/results/{result_id}")
     @_guarded
@@ -1474,10 +1445,8 @@ def register_evaluation_management_routes(
         @app.get("/chat/evaluations/annotations")
         @_guarded
         async def get_annotations(request: Request) -> JSONResponse:
-            """标注队列（spec 4.4）：经 AnnotationService.list_queue 用例
-            返回三元组 (rows, next_cursor, snapshot_at)；snapshot_at 口径
-            为"响应生成时刻"（用例层生成——标注队列为 keyset 分页，无
-            快照上界要求），Interfaces 不在路由层自造时间戳。"""
+            """标注队列含筛选集总数、总页数；snapshot_at 为响应生成
+            时刻（当前视图 keyset 分页，无历史快照上界要求）。"""
             params = request.query_params
             state = params.get("state") or "all"
             reason = params.get("reason") or "low_score"
@@ -1494,8 +1463,8 @@ def register_evaluation_management_routes(
             except ValueError:
                 return _err(422, "protocol_invalid", "threshold must be numeric")
             try:
-                rows, next_cursor, snapshot_at = (
-                    await evaluation_annotation_service.list_queue(
+                page = (
+                    await evaluation_annotation_service.list_queue_page(
                         state=state,
                         reason=reason,
                         threshold=threshold,
@@ -1506,9 +1475,11 @@ def register_evaluation_management_routes(
             except EvaluationValidationError as exc:
                 return _err(422, "protocol_invalid", str(exc))
             return _json_ok({
-                "items": [dict(row) for row in rows],
-                "next_cursor": next_cursor,
-                "snapshot_at": snapshot_at,
+                "items": [dict(row) for row in page["items"]],
+                "next_cursor": page["next_cursor"],
+                "snapshot_at": page["snapshot_at"],
+                "total_count": page["total_count"],
+                "total_pages": page["total_pages"],
             })
 
         @app.get("/chat/evaluations/annotations/{source_result_id}")

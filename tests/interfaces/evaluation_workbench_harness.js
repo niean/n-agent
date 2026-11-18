@@ -1076,13 +1076,19 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   };
   const resultRow = {
     result_id: 'res-1', metric_name: 'kb.recall_at_5', provenance: 'automatic',
+    session_id: 'source-session-1', target_service: 'n-agent', run_id: 'run-1',
     status: 'value', passed: true, typed_value: 0.8, created_at: '2026-11-12T00:00:00+00:00',
   };
-  resultsPage = { items: [resultRow], next_cursor: 'tok2' };
+  resultsPage = { items: [resultRow], next_cursor: 'tok2', total_pages: 9 };
   await moduleApi.refresh(state('results'));
   assert.deepEqual(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))), { limit: 20 },
     '首页不得携带游标或过滤');
-  assert.match(root.textContent, /res-1/);
+  assert.match(root.textContent, /source-session-1/);
+  assert.doesNotMatch(root.textContent, /res-1/, '结果ID移到详情');
+  const resultHeaders = () => findAll(root, node => node.tag === 'th').map(node => node.textContent);
+  const onlineResultHeaders = resultHeaders();
+  assert.ok(find(root, node => node.tag === 'a'
+    && node.href === '/observations/sessions/source-session-1'), '会话列提供直达链接');
   // 状态口径备注收进"结果"标题 hover tips（多行），列表下不再有备注块
   assert.ok(find(root, node => typeof node.className === 'string'
     && node.className.split(/\s+/).includes('panel-tips')
@@ -1097,11 +1103,12 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   assert.doesNotMatch(root.textContent, /暂无翻页/, '固定 50 条"暂无翻页"提示须移除');
   assertPagerState('上一页', false);
   assertPagerState('下一页', true);
-  assert.match(root.textContent, /第 1\/2 页/, 'pager 须展示统一页码 info');
-  resultsPage = { items: [resultRow], next_cursor: 'tok3' };
+  assert.match(root.textContent, /第 1\/9 页/, '使用后端总页数');
+  resultsPage = { items: [resultRow], next_cursor: 'tok3', total_pages: 9 };
   await findButton('下一页', root).handlers.click();
   await flush();
   assert.equal(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))).cursor, 'tok2', '下一页携带游标');
+  assert.match(root.textContent, /第 2\/9 页/, '总页数不随前进变化');
   resultsPage = { items: [resultRow], next_cursor: null };
   await findButton('下一页', root).handlers.click();
   await flush();
@@ -1201,7 +1208,54 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   await flush();
   assert.equal(JSON.parse(JSON.stringify(resultsParamsHistory.at(-1))).cursor, undefined,
     '空页上一页回退到首页不携带游标');
-  assert.match(root.textContent, /res-1/, '回退后重新渲染结果列表');
+  assert.match(root.textContent, /source-session-1/, '回退后重新渲染结果列表');
+
+  assert.equal(find(root, node => node.name === 'results_evaluation_scene'), undefined,
+    '入口固定场景，不提供跨场景筛选');
+  assert.equal(find(root, node => node.name === 'results_experiment_id'), undefined,
+    '线上页面不提供实验筛选');
+
+  // 实验评分使用独立接口，深链限定实验，筛选与线上页面隔离。
+  const experimentResultParams = [];
+  const oldExperimentList = api.listExperiments;
+  api.listExperiments = async () => ({ items: [
+    { experiment_id: 'exp-scoped', dataset_id: 'ds', dataset_version: 'v1' },
+  ] });
+  api.listExperimentResults = async params => {
+    experimentResultParams.push({ ...params });
+    return { items: [
+      { ...resultRow, experiment_id: 'exp-scoped' },
+      { ...resultRow, result_id: 'missing-identity', session_id: null },
+      { ...resultRow, result_id: 'external-identity', session_id: 'external-session', target_service: 'n-kb' },
+    ], next_cursor: 'exp-next', total_pages: 5 };
+  };
+  context.location = { search: '?experiment_id=exp-scoped' };
+  context.URLSearchParams = URLSearchParams;
+  const onlineCallCount = resultsParamsHistory.length;
+  await moduleApi.refresh(state('experiment-results'));
+  assert.deepEqual(resultHeaders(), onlineResultHeaders, '两个评分列表列结构与顺序完全一致');
+  assert.match(root.textContent, /未关联会话/);
+  assert.match(root.textContent, /external-session/);
+  assert.equal(find(root, node => node.tag === 'a'
+    && node.href === '/observations/sessions/external-session'), undefined, '外部服务会话不得误链本地');
+  assert.equal(resultsParamsHistory.length, onlineCallCount, '实验页面不得调用线上结果接口');
+  assert.deepEqual(experimentResultParams.at(-1), { limit: 20, experiment_id: 'exp-scoped' });
+  const experimentFilter = () => find(root, node => node.name === 'results_experiment_id');
+  assert.equal(experimentFilter().value, 'exp-scoped', '深链选中实验');
+  assert.equal(find(root, node => node.name === 'results_definition_id').value, '', '不继承线上筛选');
+  assert.match(root.textContent, /第 1\/5 页/);
+  await findButton('下一页', root).handlers.click();
+  await flush();
+  assert.equal(experimentResultParams.at(-1).cursor, 'exp-next');
+  experimentFilter().value = '';
+  await experimentFilter().handlers.change();
+  await flush();
+  assert.deepEqual(experimentResultParams.at(-1), { limit: 20 }, '改选全部实验清空游标和实验 ID');
+  context.location.search = '';
+  await moduleApi.refresh(state('results'));
+  assert.equal(resultsParamsHistory.at(-1).experiment_id, undefined);
+  assert.equal(find(root, node => node.name === 'results_definition_id').value, 'kb.recall_at_5', '线上保留自己的筛选');
+  api.listExperiments = oldExperimentList;
 
   // E3) review 兼容视图：含"前往人工标注"链接（href /evaluations/annotations）
   reviewQueuePage = {
@@ -1250,10 +1304,16 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
 
   await moduleApi.refresh(state('experiments'));
   assert.match(root.textContent, /exp-1/);
+  assert.ok(find(root, node => node.tag === 'a'
+    && node.href === '/evaluations/experiment-results?experiment_id=exp-1'),
+    '实验汇总提供限定实验的评分明细链接');
   calls.length = 0;
   await findButton('详情', root).handlers.click();
   await flush();
   assert.ok(calls.some(c => c[0] === 'getExperiment' && c[1] === 'exp-1'), '详情须调用 getExperiment');
+  assert.ok(find(body, node => node.tag === 'a'
+    && node.href === '/evaluations/experiment-results?experiment_id=exp-1'),
+    '实验详情提供限定实验的评分明细链接');
   const compareEntry = findButton('与基线对比', body);
   assert.ok(compareEntry, '实验详情须提供与基线对比入口');
   await compareEntry.handlers.click();
@@ -1407,14 +1467,19 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     assert.equal(sliceButtons[0].disabled, true, '首页上一页禁用');
     assert.equal(sliceButtons[0].handlers.click, undefined, '禁用按钮无 click handler');
     assert.equal(sliceButtons[1].disabled, false);
-    // cursor 模式：无 totalPages，分母按已知页数下界推断——
-    // hasNext=false 已到底，分母=当前页码；hasNext=true 分母=当前页码+1
+    // cursor 模式：无真实总页数时只展示当前页，不把页数下界当总数。
     const cursorBar = helpers.pagerBar({ pageIndex: 1, hasPrev: true, hasNext: false,
       onPrev() {}, onNext() {} });
-    assert.match(cursorBar.textContent, /第 2\/2 页/);
+    assert.equal(findAll(cursorBar, n => hasClassName(n, 'evaluations-pager__info'))[0].textContent, '第 2 页');
     const cursorMoreBar = helpers.pagerBar({ pageIndex: 0, hasPrev: false, hasNext: true,
       onPrev() {}, onNext() {} });
-    assert.match(cursorMoreBar.textContent, /第 1\/2 页/, '有下一页时分母表达已知至少两页');
+    assert.equal(findAll(cursorMoreBar, n => hasClassName(n, 'evaluations-pager__info'))[0].textContent, '第 1 页');
+    const sixthPage = helpers.pagerBar({ pageIndex: 5, hasPrev: true, hasNext: true,
+      onPrev() {}, onNext() {} });
+    assert.equal(findAll(sixthPage, n => hasClassName(n, 'evaluations-pager__info'))[0].textContent, '第 6 页');
+    const countedSixth = helpers.pagerBar({ pageIndex: 5, totalPages: 38,
+      hasPrev: true, hasNext: true, onPrev() {}, onNext() {} });
+    assert.equal(findAll(countedSixth, n => hasClassName(n, 'evaluations-pager__info'))[0].textContent, '第 6/38 页');
     const cursorButtons = findAll(cursorBar, n => n.tag === 'button');
     assert.equal(cursorButtons[1].disabled, true, '末页下一页禁用');
     assert.equal(cursorButtons[1].handlers.click, undefined);
@@ -2031,7 +2096,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   const realListAnnotations = api.listAnnotations;
   const realListEvaluators = api.listEvaluators;
   try {
-    const resultRows = id => ({ items: [{ result_id: id, metric_name: 'm', provenance: 'automatic',
+    const resultRows = id => ({ items: [{ result_id: id, session_id: 'source-' + id, metric_name: 'm', provenance: 'automatic',
       status: 'value', typed_value: 1, created_at: '' }], next_cursor: null });
     const resultsResolvers = [];
     api.listResults = () => new Promise((resolve, reject) => resultsResolvers.push({ resolve, reject }));
@@ -2539,7 +2604,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
         result_id: 'res-g8', metric_name: 'm-1', provenance: 'automatic',
         status: 'value', typed_value: 0.9, created_at: '',
       },
-      evidence_summary: {},
+      evidence_summary: { target: { service: 'n-agent', session_id: 'detail-session', run_id: 'detail-run' } },
       deliveries: [
         { sink: 'langfuse', projection_version: 'p1', status: 'verified', attempt_count: 0 },
         { sink: 'webhook', projection_version: 'p1', status: 'pending', attempt_count: null },
@@ -2549,6 +2614,10 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     await findButton('详情', root).handlers.click();
     await flush();
     const attemptTh = findTh(body, '尝试');
+    assert.match(body.textContent, /res-g8/, '结果ID保留在详情');
+    assert.match(body.textContent, /detail-run/, '详情展示真实 Run ID');
+    assert.ok(find(body, node => node.tag === 'a'
+      && node.href === '/observations/sessions/detail-session'), '详情提供来源会话链接');
     assert.ok(attemptTh && hasClass(attemptTh, 'document-table__numeric'), '投递尝试列 numeric');
     const attemptTds = findAll(body, node => node.tag === 'td' && hasClass(node, 'document-table__numeric'))
       .map(node => node.textContent);
@@ -2755,10 +2824,10 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     assert.equal(secondTipIds.some(id => firstTipIds.includes(id)), false, 'tooltip id 跨刷新无交集');
     assert.equal(secondHelpIds.some(id => firstHelpIds.includes(id)), false, 'help id 跨刷新无交集');
 
-    // results 视图六个 filterItem（三项带 HelpText），且无 tablist
+    // results 视图七个 filterItem（三项带 HelpText），且无 tablist
     await moduleApi.refresh(state('results'));
     const resultsItems = findAll(root, node => hasClass(node, 'evaluations-filter__item'));
-    assert.equal(resultsItems.length, 6, 'results 六个筛选项结构化为 filterItem');
+    assert.equal(resultsItems.length, 6, '线上六个筛选项结构化为 filterItem');
     const resultsHelps = findAll(root, node => hasClass(node, 'evaluations-filter__help'));
     assert.equal(resultsHelps.length, 3, 'results 时间/DefinitionKey 三项带 HelpText');
     assert.ok(!find(root, node => node.attributes && node.attributes.role === 'tablist'),
@@ -2890,12 +2959,11 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       evalKindFilter().value = '';
       await evalKindFilter().handlers.change();
       listParamsHistory.length = 0;
-      listResult = { items: [evalItem('eval-page1')], next_cursor: 'eval-c2' };
+      listResult = { items: [evalItem('eval-page1')], next_cursor: 'eval-c2', total_pages: 7 };
       await moduleApi.refresh(state('evaluators'));
       assert.deepEqual(JSON.parse(JSON.stringify(listParamsHistory.at(-1))), { limit: 20 },
         'evaluators 首页只发 limit=20');
-      assert.match(pagerOf().textContent, /第 1\/2 页/);
-      assert.match(pagerOf().textContent, /\//, 'cursor 模式统一带已知页数分母');
+      assert.match(pagerOf().textContent, /第 1\/7 页/, '评估器使用后端总页数');
       assert.equal(pagerBtn('上一页').disabled, true);
       assert.equal(pagerBtn('下一页').disabled, false);
       api.listEvaluators = async params => {
@@ -2910,7 +2978,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       assert.deepEqual(JSON.parse(JSON.stringify(listParamsHistory.at(-1))),
         { limit: 20, cursor: 'eval-c2' }, '下一页携带栈顶游标');
       assert.match(root.textContent, /eval-page2/);
-      assert.match(pagerOf().textContent, /第 2\/2 页/);
+      assert.match(pagerOf().textContent, /第 2 页/);
       assert.equal(pagerBtn('上一页').disabled, false);
       assert.equal(pagerBtn('下一页').disabled, true, '无 next_cursor 末页禁用占位');
       listResult = { items: [evalItem('eval-page1')], next_cursor: 'eval-c2' };
@@ -2927,7 +2995,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       await flush();
       assert.deepEqual(JSON.parse(JSON.stringify(listParamsHistory.at(-1))),
         { limit: 20, method: 'deterministic' }, '筛选变更清空游标栈');
-      assert.match(pagerOf().textContent, /第 1\/2 页/);
+      assert.match(pagerOf().textContent, /第 1 页/);
       // 视图重入重置
       await pagerBtn('下一页').handlers.click();
       await flush();
@@ -2966,9 +3034,10 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       await annFilter('annotation_reason', 'low_score');
       await flush();
       annParamsHistory.length = 0;
-      annQueue = { items: [annItem('ann-page1')], next_cursor: 'ann-c2' };
+      annQueue = { items: [annItem('ann-page1')], next_cursor: 'ann-c2', total_pages: 8 };
       await moduleApi.refresh(state('annotations'));
       assert.deepEqual(annParams(), { state: 'all', reason: 'low_score', threshold: '0.5', limit: 20 });
+      assert.match(pagerOf().textContent, /第 1\/8 页/, '人工标注使用后端总页数');
       assert.equal(pagerBtn('上一页').disabled, true);
       api.listAnnotations = async params => {
         annParamsHistory.push(params);
@@ -2994,7 +3063,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       await flush();
       assert.equal(annParams().cursor, undefined, '原因变更重置游标栈');
       assert.equal(annParams().reason, 'disputed');
-      assert.match(pagerOf().textContent, /第 1\/2 页/);
+      assert.match(pagerOf().textContent, /第 1 页/);
       // 状态筛选变更同样重置游标栈；低分阈值固定 0.5，页面无阈值控件
       await annFilter('annotation_reason', 'low_score');
       await flush();
@@ -3047,7 +3116,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
         assert.match(root.textContent, new RegExp('race-fresh-' + view));
         assert.doesNotMatch(root.textContent, new RegExp('race-stale-' + view),
           view + ' 迟到成功响应不得覆盖新页 DOM');
-        assert.match(pagerOf().textContent, /第 1\/1 页/, view + ' 迟到响应不得改变 pager 状态');
+        assert.match(pagerOf().textContent, /第 1 页/, view + ' 迟到响应不得改变 pager 状态');
         api[slot] = realApis[slot];
       };
       await pagingRace({
@@ -3242,7 +3311,7 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       assert.equal(execBlock, undefined, '执行任务视图不再渲染实验执行区块标题行');
       const execPager = () => find(root, node => node.className === 'evaluations-pager');
       assert.ok(execPager(), '执行区块使用共享 evaluations-pager');
-      assert.match(execPager().textContent, /第 1\/2 页/);
+      assert.match(execPager().textContent, /第 1 页/);
       assert.ok(!find(root, node => node.tag === 'th' && node.textContent === '实验ID'),
         '执行任务视图不渲染实验结果表列头');
       const execPagers = findAll(root, node => node.className === 'evaluations-pager');

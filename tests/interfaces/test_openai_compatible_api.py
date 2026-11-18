@@ -6,11 +6,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.application.agent_graph import AgentGraphRunner
+from app.application.agent_run_service import AgentRunService
 from app.application.chat_service import ChatCompletionResult, ChatCompletionService
 from app.application.events import ChatEvent, ChatEventType
 from app.application.model_service import ModelService
 from app.application.session_service import SessionService
 from app.application.tool_service import ToolService, builtin_tool_definitions, knowledge_tool_definitions
+from app.domain.session import ConversationSession
 from app.domain.provider import LLMResult, ModelInfo
 from app.domain.tool import (
     RiskLevel,
@@ -21,6 +23,7 @@ from app.domain.tool import (
 )
 from app.infrastructure.memory.heuristic_summarizer import HeuristicSummarizer
 from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
 from app.infrastructure.tools.builtin import build_builtin_tool_executor
 from app.infrastructure.tools.composite import CompositeToolExecutor
 from app.interfaces.http.openai_compatible import create_openai_compatible_router
@@ -90,13 +93,17 @@ def test_client_lifecycle():
 def build_client(tmp_path, provider=None, tool_service=None):
     provider = provider or FakeProvider()
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    # 注入实际 AgentRun service（chat 与 graph 共享同一实例）：AgentRun 落库
+    # 与来源断言依赖真实注册路径，graph 负责终态 finish。
+    agent_run_service = AgentRunService(SQLiteAgentRunRegistry(store.path))
     runner = AgentGraphRunner(
         provider,
         tool_service or ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
         store,
         HeuristicSummarizer(),
+        agent_run_service=agent_run_service,
     )
-    chat = ChatCompletionService(store, runner, SessionService(store))
+    chat = ChatCompletionService(store, runner, SessionService(store), agent_run_service=agent_run_service)
     models = ModelService(provider, "test-model")
     app = FastAPI()
     app.include_router(create_openai_compatible_router(chat, models, store))
@@ -827,3 +834,136 @@ def test_run_footer_stream_omits_run_id_without_identity(tmp_path):
     text_empty = _run_footer_stream_text(chat_service_empty)
     chunks_empty, _ = _parse_sse(text_empty)
     assert all("run_id" not in chunk for chunk in chunks_empty)
+
+
+# ---------------------------------------------------------------------------
+# T4: 入口前缀分类与 IngressFacts（实验会话 HTTP 通路）
+# ---------------------------------------------------------------------------
+
+_EXPERIMENT_SESSION_ID = "eval-experiment-x-c1-r0-a0"
+
+
+def _post_chat_round(client, session_id=None, stream=False, metadata=None):
+    """执行一轮对话；流式时消费完整 SSE 并断言 [DONE]。"""
+    headers = {"X-Session-ID": session_id} if session_id else {}
+    payload = {"model": "test-model", "stream": stream, "messages": [{"role": "user", "content": "hi"}]}
+    if metadata is not None:
+        payload["metadata"] = metadata
+    if stream:
+        with client.stream("POST", "/v1/chat/completions", headers=headers, json=payload) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            text = "".join(response.iter_text())
+        assert "[DONE]" in text
+        return 200
+    return client.post("/v1/chat/completions", headers=headers, json=payload)
+
+
+def _assert_experiment_session_source(client, store, session_id, expected_runs):
+    """断言落库会话与 AgentRun 来源均为 experiment。"""
+    assert client.portal is not None
+    session = client.portal.call(store.get_session, session_id)
+    assert session is not None
+    assert session.source == "experiment"
+    registry = SQLiteAgentRunRegistry(store.path)
+    runs = registry.list_for_session(session_id)
+    assert len(runs) == expected_runs
+    assert all(run["source"] == "experiment" for run in runs)
+
+
+@pytest.mark.parametrize("first_stream", [False, True])
+def test_experiment_session_header_classified_as_experiment(tmp_path, first_stream):
+    """实验前缀 header 首轮创建的会话 source 必须为 experiment，AgentRun 同源。"""
+    client, store = build_client(tmp_path)
+
+    _post_chat_round(client, session_id=_EXPERIMENT_SESSION_ID, stream=first_stream)
+
+    _assert_experiment_session_source(client, store, _EXPERIMENT_SESSION_ID, expected_runs=1)
+
+
+@pytest.mark.parametrize("first_stream", [False, True])
+@pytest.mark.parametrize("second_stream", [False, True])
+def test_experiment_session_second_round_not_409(tmp_path, first_stream, second_stream):
+    """同一实验 session_id 连续两轮（含流式）均成功，无 api_session_scope_mismatch。"""
+    client, store = build_client(tmp_path)
+
+    _post_chat_round(client, session_id=_EXPERIMENT_SESSION_ID, stream=first_stream)
+    _post_chat_round(client, session_id=_EXPERIMENT_SESSION_ID, stream=second_stream)
+
+    _assert_experiment_session_source(client, store, _EXPERIMENT_SESSION_ID, expected_runs=2)
+
+
+def test_existing_cli_session_with_experiment_prefix_conflicts(tmp_path):
+    """实验前缀 ID 命中 cli 来源存量会话：409、来源错误码、不登记 Run、不写消息。"""
+    client, store = build_client(tmp_path)
+    assert client.portal is not None
+    client.portal.call(store.create_session, ConversationSession(id=_EXPERIMENT_SESSION_ID, source="cli"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-ID": _EXPERIMENT_SESSION_ID},
+        json={"model": "test-model", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "api_session_scope_mismatch"
+    assert "expected experiment" in error["message"]
+    assert SQLiteAgentRunRegistry(store.path).list_for_session(_EXPERIMENT_SESSION_ID) == []
+    assert client.portal.call(store.list_messages, _EXPERIMENT_SESSION_ID) == []
+
+
+def test_body_metadata_cannot_override_source(tmp_path):
+    """伪造 body metadata（gateway.source/session_id）不得改变实验 header 的来源与选中会话。"""
+    client, store = build_client(tmp_path)
+
+    _post_chat_round(
+        client,
+        session_id=_EXPERIMENT_SESSION_ID,
+        stream=False,
+        metadata={"gateway.source": "dashboard", "session_id": "should-be-ignored"},
+    )
+
+    assert client.portal is not None
+    # 实验 header 的选中 ID 与来源不变
+    _assert_experiment_session_source(client, store, _EXPERIMENT_SESSION_ID, expected_runs=1)
+    # metadata.session_id 未被用于会话选择
+    assert client.portal.call(store.get_session, "should-be-ignored") is None
+
+
+@pytest.mark.parametrize(
+    ("session_id", "metadata"),
+    [
+        ("0f1e2d3c-4b5a-4978-8796-a5b4c3d2e1f0", None),
+        (None, {"gateway.source": "experiment", "session_id": _EXPERIMENT_SESSION_ID}),
+        ("Eval-Experiment-x-c1-r0-a0", None),
+    ],
+    ids=["plain-uuid-header", "no-header-with-experiment-metadata", "case-different-prefix"],
+)
+def test_plain_header_still_api(tmp_path, session_id, metadata):
+    """回归：普通 UUID header、无 header 携带实验 metadata、大小写相异前缀，来源仍为 api。"""
+    client, store = build_client(tmp_path)
+
+    response = _post_chat_round(client, session_id=session_id, stream=False, metadata=metadata)
+
+    assert response.status_code == 200
+    assert client.portal is not None
+    if session_id is not None:
+        session = client.portal.call(store.get_session, session_id)
+        assert session is not None
+        assert session.source == "api"
+    else:
+        sessions = client.portal.call(store.list_sessions)
+        assert len(sessions) == 1
+        assert sessions[0].source == "api"
+        # 无 header 时实验前缀 ID 不得被 metadata 选中
+        assert client.portal.call(store.get_session, _EXPERIMENT_SESSION_ID) is None
+    registry = SQLiteAgentRunRegistry(store.path)
+    if session_id is not None:
+        runs = registry.list_for_session(session_id)
+        assert len(runs) == 1
+        assert all(run["source"] == "api" for run in runs)
+    else:
+        runs = registry.list_for_session(sessions[0].id)
+        assert len(runs) == 1
+        assert all(run["source"] == "api" for run in runs)

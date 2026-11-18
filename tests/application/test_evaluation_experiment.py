@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -516,8 +517,16 @@ async def test_execute_isolates_session_per_case_and_replicate_shares_multi_turn
     # 每 case 独立 namespace；每 replicate 独立 session
     namespaces = {req["session"]["namespace"] for _, req in target.calls}
     assert len(namespaces) == 2  # 两个 case 两个隔离 namespace
+    for ns in namespaces:
+        # 完整 namespace 形态：eval-experiment-{experiment_id}-{case_id}
+        assert re.fullmatch(r"eval-experiment-.+-case-[12]", ns), ns
     for _, req in target.calls:
         assert req["session"]["namespace"] in req["session"]["session_id"]
+        # 完整 session_id 形态：namespace-r{replicate}-a{attempt_index}
+        assert re.fullmatch(
+            r"eval-experiment-.+-case-[12]-r\d+-a\d+",
+            req["session"]["session_id"],
+        ), req["session"]["session_id"]
     sessions = {req["session"]["session_id"] for _, req in target.calls}
     # 2 case x 2 replicate（多轮 case 同 replicate 共享一个 session）
     assert len(sessions) == 4
@@ -1339,6 +1348,13 @@ async def test_transport_retry_uses_fresh_session_per_attempt(tmp_path):
     sessions = [req["session"]["session_id"] for _, req in target.calls]
     assert len(sessions) == 2
     assert len(set(sessions)) == 2  # 每 attempt 独立会话
+    for sid in sessions:
+        # 完整 session_id 形态：eval-experiment-{eid}-{case_id}-r{rep}-a{attempt}
+        assert re.fullmatch(r"eval-experiment-.+-case-mt-r\d+-a\d+", sid), sid
+    for _, req in target.calls:
+        assert re.fullmatch(
+            r"eval-experiment-.+-case-mt", req["session"]["namespace"]
+        ), req["session"]["namespace"]
     # 重试在全新会话内完整重放全部轮次，不污染首次 attempt 会话
     for _, req in target.calls:
         assert [t["message"] for t in req["turns"]] == ["turn-1", "turn-2"]
@@ -2041,3 +2057,8 @@ async def test_evidence_targets_include_consumed_documents(tmp_path):
     assert ("agent_run", "run-17", dataset.dataset_version) in kinds
     assert ("document", "doc-a", "r1") in kinds
     assert ("document", "doc-b", "r2") in kinds
+
+
+def test_session_namespace_uses_domain_prefix():
+    from app.application.evaluation_experiment import session_namespace
+    assert session_namespace("exp1", "case-1") == "eval-experiment-exp1-case-1"

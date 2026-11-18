@@ -28,10 +28,8 @@ const pagerBar = (options) => {
   const row = el('div', 'evaluations-pager');
   const info = el('span', 'evaluations-pager__info');
   const pageNo = options.pageIndex + 1;
-  const totalPages = options.totalPages !== undefined
-    ? options.totalPages
-    : pageNo + (options.hasNext ? 1 : 0);
-  info.textContent = '第 ' + pageNo + '/' + totalPages + ' 页';
+  info.textContent = '第 ' + pageNo
+    + (options.totalPages !== undefined ? '/' + options.totalPages : '') + ' 页';
   row.appendChild(info);
   if (options.hasPrev) row.appendChild(actionButton('上一页', options.onPrev));
   else row.appendChild(disabledButton('上一页'));
@@ -53,7 +51,7 @@ const api = {
   listExecutions: async params => {
     listCalls.push(Object.assign({}, params));
     if (failList) throw new Error('network');
-    return { items: [{ execution_id: 'execution-one', name: 'vision test', dataset_id: 'agent-e2e-v1', dataset_version: '1', phase }], next_cursor: listCursor };
+    return { items: [{ execution_id: 'execution-one', name: 'vision test', dataset_id: 'agent-e2e-v1', dataset_version: '1', phase }], next_cursor: listCursor, total_pages: 7 };
   },
   preflightExecution: async body => { preflightCalls.push(JSON.parse(JSON.stringify(body)));
     return preflightRunnable
@@ -156,7 +154,7 @@ const controller = context.NAGENT.evaluationExecutions.createController({ api, e
   assert.equal(listCalls.at(-1).cursor, undefined, '首页请求无游标');
   const homePager = find(listBody, n => n.className === 'evaluations-pager');
   assert.ok(homePager, '首页仍渲染共享 evaluations-pager');
-  assert.match(homePager.textContent, /第 1\/1 页/, '无 next_cursor 时已知页数下界为 1');
+  assert.match(homePager.textContent, /第 1\/7 页/, '执行任务使用后端总页数');
   const homeNext = find(homePager, n => n.tag === 'button' && n.textContent === '下一页');
   const homePrev = find(homePager, n => n.tag === 'button' && n.textContent === '上一页');
   assert.equal(homeNext.disabled, true, '无 next_cursor 时下一页禁用占位');

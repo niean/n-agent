@@ -11,7 +11,7 @@ from uuid import uuid4
 from app.infrastructure.sqlite_support import open_sqlite
 from app.domain.context import CONTEXT_SUMMARY_PREFIX
 from app.domain.agent_run import current_run
-from app.domain.session import ConversationMessage, ConversationSession, SessionSource, Summary, TaskState, ToolCall
+from app.domain.session import ConversationMessage, ConversationSession, EXPERIMENT_SESSION_ID_PREFIX, SessionSource, Summary, TaskState, ToolCall
 from app.infrastructure.registry.sqlite_gateway_registry import _initialize_gateway_schema
 from app.infrastructure.registry.sqlite_mcp_registry import _initialize_mcp_schema
 from app.infrastructure.registry.sqlite_agent_run_registry import validate_run_session
@@ -859,6 +859,7 @@ class SQLiteMemoryStore:
         """
         with self._connect() as conn:
             _migrate_session_id_prefixes(conn)
+            _migrate_experiment_session_source(conn)
 
 
     @staticmethod
@@ -990,3 +991,21 @@ def _migrate_session_id_prefixes(conn: sqlite3.Connection) -> None:
         logger.info("session_id prefix migrated rows=%d", len(updates))
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_experiment_session_source(conn: sqlite3.Connection) -> None:
+    """存量评估实验会话来源迁移：api -> experiment。
+
+    仅修正历史缺省 api（与运行期显式来源优先一致）；大小写敏感匹配
+    与 Python startswith 对齐（不用 LIKE——SQLite LIKE 对 ASCII 大小写
+    不敏感）。由连接上下文提交，失败回滚本次 UPDATE。"""
+    conn.execute(
+        "UPDATE sessions SET source=? "
+        "WHERE substr(id, 1, ?) COLLATE BINARY = ? AND source=?",
+        (
+            SessionSource.EXPERIMENT.value,
+            len(EXPERIMENT_SESSION_ID_PREFIX),
+            EXPERIMENT_SESSION_ID_PREFIX,
+            SessionSource.API.value,
+        ),
+    )

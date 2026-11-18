@@ -780,6 +780,7 @@ _RESULTS_FILTER_KEYS: tuple[str, ...] = (
     "definition_id",
     "definition_version",
     "experiment_id",
+    "evaluation_scene",
     "status",
     "provenance",
     "created_from",
@@ -842,6 +843,9 @@ _LATEST_FEEDBACK_JSON_SUBQUERY = (
 
 def _results_filter_fingerprint(**filters: Any) -> str:
     """规范化过滤 dict（key 排序 canonical JSON）的 sha256 前 16 hex。"""
+    # 未设置新增场景筛选时，保持既有 v2 游标的指纹兼容。
+    if filters.get("evaluation_scene") is None:
+        filters.pop("evaluation_scene", None)
     payload = json.dumps(
         filters, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     )
@@ -3968,6 +3972,30 @@ class SQLiteEvaluationStore:
             False,
         )
 
+    async def query_results_page_counted(
+        self, *, cursor: str | None = None, limit: int = 50,
+        snapshot_at: str | None = None, legacy_compat: bool = False,
+        **filters: Any,
+    ) -> dict[str, Any]:
+        """按完整过滤计数；计数与当前页共享读事务及快照上界。"""
+        unknown = set(filters) - set(_RESULTS_FILTER_KEYS)
+        if unknown:
+            raise EvaluationValidationError(f"unknown results filters: {sorted(unknown)}")
+        normalized = self._results_filters(
+            **{key: filters.get(key) for key in _RESULTS_FILTER_KEYS}
+        )
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise EvaluationValidationError("limit 必须为正整数")
+        limit = min(limit, _RESULTS_PAGE_MAX_LIMIT)
+        totals: dict[str, int] = {}
+        rows, next_cursor, snap = await asyncio.to_thread(
+            self._query_results_page_sync, normalized, snapshot_at, cursor,
+            limit, legacy_compat, totals,
+        )
+        total = totals["total_count"]
+        return {"items": rows, "next_cursor": next_cursor, "snapshot_at": snap,
+                "total_count": total, "total_pages": max(1, (total + limit - 1) // limit)}
+
     @staticmethod
     def _results_filters(
         *,
@@ -3982,9 +4010,12 @@ class SQLiteEvaluationStore:
         experiment_id: str | None,
         status: str | None,
         provenance: str | None,
+        evaluation_scene: str | None = None,
     ) -> dict[str, Any]:
-        """结果分页过滤 dict（11 键与 _RESULTS_FILTER_KEYS 对齐，
+        """结果分页过滤 dict（与 _RESULTS_FILTER_KEYS 对齐，
         query_results_page / query_results_page_snapshot 共用）。"""
+        if evaluation_scene is not None and evaluation_scene not in ("online", "experiment"):
+            raise EvaluationValidationError("evaluation_scene must be online or experiment")
         return {
             "target_service": target_service,
             "target_kind": target_kind,
@@ -3995,6 +4026,7 @@ class SQLiteEvaluationStore:
             "created_to": created_to,
             "definition_version": definition_version,
             "experiment_id": experiment_id,
+            "evaluation_scene": evaluation_scene,
             "status": status,
             "provenance": provenance,
         }
@@ -4006,6 +4038,7 @@ class SQLiteEvaluationStore:
         cursor: str | None,
         limit: int,
         legacy_compat: bool,
+        totals: dict[str, int] | None = None,
     ) -> tuple[list[Mapping[str, Any]], str | None, str | None]:
         """结果分页调度：兼容分支（旧行为）与游标 v2 分支择一执行。"""
         if limit <= 0:
@@ -4027,11 +4060,11 @@ class SQLiteEvaluationStore:
                     "旧格式 results 游标仅允许原结果接口且不得携带新增"
                     f"过滤: {cursor!r}"
                 )
-            return self._query_results_page_legacy_sync(filters, parsed, limit)
+            return self._query_results_page_legacy_sync(filters, parsed, limit, totals)
         if legacy_compat and not new_filtering and parsed is None:
             # 无新增过滤且未携带 v2 游标：保持旧行为（旧两段式 token，
             # 无快照上界，不宣称完整快照保证）
-            return self._query_results_page_legacy_sync(filters, None, limit)
+            return self._query_results_page_legacy_sync(filters, None, limit, totals)
         fingerprint = _results_filter_fingerprint(
             **{key: filters[key] for key in _RESULTS_FILTER_KEYS}
         )
@@ -4051,7 +4084,7 @@ class SQLiteEvaluationStore:
         else:
             snap = snapshot_at if snapshot_at is not None else _iso()
         return self._query_results_page_v2_sync(
-            filters, fingerprint, snap, parsed, limit
+            filters, fingerprint, snap, parsed, limit, totals
         )
 
     @staticmethod
@@ -4078,6 +4111,10 @@ class SQLiteEvaluationStore:
         if filters["experiment_id"] is not None:
             where.append("j.experiment_id = ?")
             params.append(filters["experiment_id"])
+        if filters["evaluation_scene"] == "online":
+            where.append("j.experiment_id IS NULL")
+        elif filters["evaluation_scene"] == "experiment":
+            where.append("j.experiment_id IS NOT NULL")
         if filters["definition_id"] is not None:
             where.append(
                 "((r.job_id IS NOT NULL AND j.definition_id = ?) "
@@ -4118,12 +4155,20 @@ class SQLiteEvaluationStore:
             params.extend(active_values)
         return where, params
 
-    _RESULTS_PAGE_FROM_SQL = (
-        "SELECT r.* FROM evaluation_results r "
+    _RESULTS_PAGE_JOIN_SQL = (
+        "FROM evaluation_results r "
         "LEFT JOIN evaluation_jobs j ON r.job_id = j.job_id "
         "LEFT JOIN evaluation_samples s ON j.sample_id = s.sample_id "
         "LEFT JOIN evaluation_feedback f ON r.feedback_id = f.feedback_id "
         "WHERE "
+    )
+    _RESULTS_PAGE_FROM_SQL = (
+        "SELECT r.*, j.experiment_id AS experiment_id, "
+        "CASE WHEN r.job_id IS NOT NULL THEN s.service ELSE f.target_service END AS target_service, "
+        "CASE WHEN r.job_id IS NOT NULL THEN json_extract(s.target_json, '$.session_id') "
+        "ELSE json_extract(f.target_json, '$.session_id') END AS session_id, "
+        "CASE WHEN r.job_id IS NOT NULL THEN json_extract(s.target_json, '$.run_id') "
+        "ELSE json_extract(f.target_json, '$.run_id') END AS run_id " + _RESULTS_PAGE_JOIN_SQL
     )
 
     def _query_results_page_legacy_sync(
@@ -4131,6 +4176,7 @@ class SQLiteEvaluationStore:
         filters: Mapping[str, Any],
         parsed: Mapping[str, Any] | None,
         limit: int,
+        totals: dict[str, int] | None = None,
     ) -> tuple[list[Mapping[str, Any]], str | None, str | None]:
         """兼容分支：T5 旧行为（旧两段式游标，无快照上界）。
 
@@ -4138,6 +4184,7 @@ class SQLiteEvaluationStore:
         向更旧方向翻页；同时间戳以 result_id 倒序兜底保证稳定排序。
         """
         where, params = self._results_page_filter_conditions(filters)
+        count_where, count_params = list(where), list(params)
         if parsed is not None:
             where.append("(r.created_at, r.result_id) < (?, ?)")
             params.extend([parsed["created_at"], parsed["result_id"]])
@@ -4147,6 +4194,12 @@ class SQLiteEvaluationStore:
         )
         params.append(limit + 1)
         with self._connect() as conn:
+            if totals is not None:
+                conn.execute("BEGIN")
+                totals["total_count"] = conn.execute(
+                    "SELECT COUNT(*) " + self._RESULTS_PAGE_JOIN_SQL
+                    + " AND ".join(count_where), count_params,
+                ).fetchone()[0]
             rows = conn.execute(sql, params).fetchall()
         next_cursor: str | None = None
         if len(rows) > limit:
@@ -4162,6 +4215,7 @@ class SQLiteEvaluationStore:
         snap: str,
         parsed: Mapping[str, Any] | None,
         limit: int,
+        totals: dict[str, int] | None = None,
     ) -> tuple[list[Mapping[str, Any]], str | None, str | None]:
         """游标 v2 分支：完整过滤 + 快照上界 + fingerprint 绑定。
 
@@ -4191,6 +4245,7 @@ class SQLiteEvaluationStore:
         # 快照上界（半开）：绑定该次分页的 UTC 上界，后续页复用 token 内值
         where.append("r.created_at < ?")
         params.append(snap)
+        count_where, count_params = list(where), list(params)
         if parsed is not None:
             where.append("(r.created_at, r.result_id) < (?, ?)")
             params.extend([parsed["created_at"], parsed["result_id"]])
@@ -4200,6 +4255,12 @@ class SQLiteEvaluationStore:
         )
         params.append(limit + 1)
         with self._connect() as conn:
+            if totals is not None:
+                conn.execute("BEGIN")
+                totals["total_count"] = conn.execute(
+                    "SELECT COUNT(*) " + self._RESULTS_PAGE_JOIN_SQL
+                    + " AND ".join(count_where), count_params,
+                ).fetchone()[0]
             rows = conn.execute(sql, params).fetchall()
         next_cursor: str | None = None
         if len(rows) > limit:
@@ -4470,6 +4531,21 @@ class SQLiteEvaluationStore:
         limit: int = 50,
         cursor: str | None = None,
     ) -> tuple[list[Mapping[str, Any]], str | None]:
+        page = await self.list_annotation_queue_page(
+            state=state, reason=reason, threshold=threshold,
+            limit=limit, cursor=cursor,
+        )
+        return page["items"], page["next_cursor"]
+
+    async def list_annotation_queue_page(
+        self,
+        *,
+        state: str,
+        reason: str,
+        threshold: float = _ANNOTATION_DEFAULT_THRESHOLD,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         """标注队列表查询（Task 4）：state（all/pending/annotated）与
         reason（low_score/disputed/anomalous）必须在分页前应用（SQL 阶段
         完成，不以旧队列最近 50 条作候选集），按原结果 ``created_at DESC,
@@ -4525,7 +4601,7 @@ class SQLiteEvaluationStore:
         threshold: float,
         limit: int,
         cursor: str | None,
-    ) -> tuple[list[Mapping[str, Any]], str | None]:
+    ) -> dict[str, Any]:
         if state not in _ANNOTATION_STATES:
             raise EvaluationValidationError(
                 f"非法标注队列 state: {state!r}，仅允许 {_ANNOTATION_STATES}"
@@ -4612,6 +4688,11 @@ class SQLiteEvaluationStore:
         elif state == "pending":
             conditions.append("NOT " + annotated_exists)
             params.append(_ANNOTATION_DASHBOARD_ACTOR)
+        count_sql = (
+            "SELECT COUNT(*) FROM ( " + auto_sql + " UNION ALL " + human_sql
+            + " ) AS c WHERE " + " AND ".join(conditions)
+        )
+        count_params = tuple(params)
         if boundary is not None:
             conditions.append("(c.created_at, c.result_id) < (?, ?)")
             params.extend(boundary)
@@ -4625,6 +4706,10 @@ class SQLiteEvaluationStore:
         )
         params.append(limit + 1)
         with self._connect() as conn:
+            # Count the full filtered set, not the rows after the cursor.
+            # One read transaction keeps the count and rows consistent.
+            conn.execute("BEGIN")
+            total_count = conn.execute(count_sql, count_params).fetchone()[0]
             rows = conn.execute(sql, params).fetchall()
         next_cursor: str | None = None
         if len(rows) > limit:
@@ -4657,7 +4742,11 @@ class SQLiteEvaluationStore:
             }
             for row in rows
         ]
-        return items, next_cursor
+        return {
+            "items": items, "next_cursor": next_cursor,
+            "total_count": total_count,
+            "total_pages": max(1, (total_count + limit - 1) // limit),
+        }
 
     def _annotation_candidates_branch_sql(self, branch: str) -> str:
         """标注队列候选集分支（automatic/human），current 视图。"""

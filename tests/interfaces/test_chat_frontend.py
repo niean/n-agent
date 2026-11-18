@@ -11,6 +11,7 @@ from app.interfaces.http.dashboard import STATIC_DIR
 from _css_utils import _css_rule_bodies, _css_media_blocks
 
 CHAT_JS = STATIC_DIR / "chat.js"
+SESSIONS_JS = STATIC_DIR / "sessions.js"
 HARNESS_JS = Path(__file__).parent / "chat_frontend_harness.js"
 
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
@@ -505,6 +506,16 @@ def test_chat_session_search_assets():
     assert "chat-session-search-btn:focus-visible" in styles
     assert "function openSessionSearchModal()" in source
     assert "currentSessionSearch" in source
+
+
+def test_session_source_filter_includes_experiment_hidden_by_default():
+    """两处筛选器（sessions.js / chat.js）提供实验选项，但默认集合与 delegation 同款排除。"""
+    for source_path in (SESSIONS_JS, CHAT_JS):
+        source = source_path.read_text(encoding="utf-8")
+        assert "['experiment', '实验']" in source
+        # 默认集合排除：experiment 与 delegation 同款从默认集过滤
+        assert "value !== 'delegation'" in source
+        assert "value !== 'experiment'" in source
 
 
 def test_browser_result_link_uses_browser_session_path():

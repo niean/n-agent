@@ -582,7 +582,10 @@ class EvaluationAdminService:
                     "usage": row.get("usage"),
                 }
             )
-        return {"items": items, "next_cursor": next_cursor}
+        total_count = len(rows)
+        return {"items": items, "next_cursor": next_cursor,
+                "total_count": total_count,
+                "total_pages": max(1, (total_count + limit - 1) // limit)}
 
     @staticmethod
     def _encode_list_cursor(offset: int) -> str:

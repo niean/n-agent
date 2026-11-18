@@ -1593,3 +1593,299 @@ async def test_activated_skills_absent_key_yields_empty_list(tmp_path):
     assert runner.options.get("activated_skills") == []
     assert result.message["content"] == "ok"
     assert result.finish_reason == "stop"
+
+
+# ---------------------------------------------------------------------------
+# 缺省 ingress 来源派生：eval-experiment- 前缀 -> experiment（T2 评估实验来源）
+# ---------------------------------------------------------------------------
+
+
+class RecordingSnapshotFactory:
+    """记录 factory 接收的 ingress 与 descriptor，再委托真实工厂构造快照。"""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+        self.calls = []
+
+    def create(self, ingress, descriptor):
+        self.calls.append({"ingress": ingress, "descriptor": descriptor})
+        return self._wrapped.create(ingress, descriptor)
+
+
+def test_derive_ingress_source_branches():
+    """纯 helper 三分支直测：显式 gateway.source / 实验前缀 / 兜底 api。"""
+    from app.application.chat_service import _derive_ingress_source
+    from app.domain.session import EXPERIMENT_SESSION_ID_PREFIX
+
+    experiment_sid = f"{EXPERIMENT_SESSION_ID_PREFIX}exp-1-case-1"
+    normal_sid = "0f0e0d0c-1111-4222-8333-444455556666"
+
+    # 显式 gateway.source 优先（实验 ID 与普通 ID 均生效）
+    for sid in (experiment_sid, normal_sid):
+        assert _derive_ingress_source(
+            ChatCompletionInput(model="t", messages=[], trusted_metadata={"gateway.source": "curator"}),
+            sid,
+        ) == "curator"
+
+    # 前缀命中 -> experiment；普通 UUID -> api
+    assert _derive_ingress_source(ChatCompletionInput(model="t", messages=[]), experiment_sid) == "experiment"
+    assert _derive_ingress_source(ChatCompletionInput(model="t", messages=[]), normal_sid) == "api"
+
+    # falsy 值（缺键/None/""/0/False）不遮挡派生：实验 ID 回落 experiment，普通 ID 回落 api
+    falsy_values = ({}, {"gateway.source": None}, {"gateway.source": ""},
+                    {"gateway.source": 0}, {"gateway.source": False})
+    for metadata in falsy_values:
+        assert _derive_ingress_source(
+            ChatCompletionInput(model="t", messages=[], trusted_metadata=metadata), experiment_sid,
+        ) == "experiment"
+        assert _derive_ingress_source(
+            ChatCompletionInput(model="t", messages=[], trusted_metadata=metadata), normal_sid,
+        ) == "api"
+
+    # truthy 非字符串值原样转 str，不丢失
+    assert _derive_ingress_source(
+        ChatCompletionInput(model="t", messages=[], trusted_metadata={"gateway.source": 7}), normal_sid,
+    ) == "7"
+    assert _derive_ingress_source(
+        ChatCompletionInput(model="t", messages=[], trusted_metadata={"gateway.source": True}), normal_sid,
+    ) == "True"
+
+    # 大小写相异前缀不命中，按普通 ID 兜底 api
+    assert _derive_ingress_source(
+        ChatCompletionInput(model="t", messages=[]), "Eval-Experiment-exp-1-case-1",
+    ) == "api"
+
+
+@pytest.mark.asyncio
+async def test_complete_derives_experiment_source_from_session_id_prefix(tmp_path):
+    """eval-experiment- 前缀且无 ingress_facts/gateway.source 时派生 experiment。
+
+    进程内 ChatCompletionTargetRunner 路径：直接调 complete()，仅 metadata
+    携带 execution_kind；此前会话来源误落 api。"""
+    from app.application.agent_run_service import AgentRunService
+    from app.domain.session import EXPERIMENT_SESSION_ID_PREFIX
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    runs = AgentRunService(SQLiteAgentRunRegistry(store.path))
+    service = ChatCompletionService(store, runner, SessionService(store), agent_run_service=runs)
+    sid = f"{EXPERIMENT_SESSION_ID_PREFIX}exp-1-case-1"
+    try:
+        result = await service.complete(
+            ChatCompletionInput(
+                model="test",
+                messages=[{"role": "user", "content": "evaluate the answer"}],
+                stream=False,
+                session_id=sid,
+                metadata={"execution_kind": "evaluation_experiment"},
+            )
+        )
+
+        session = await store.get_session(sid)
+        assert session is not None
+        assert session.source == "experiment"
+
+        run_row = runs.get(result.run_id)
+        assert run_row is not None
+        assert run_row["source"] == "experiment"
+
+        # experiment 不在 _PROCESS_MESSAGE_SOURCES：最终 assistant 答复可正常渲染
+        assistant_msgs = [m for m in await store.list_messages(sid) if m.role == "assistant"]
+        assert assistant_msgs
+        assert assistant_msgs[0].source is None
+    finally:
+        await runs.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_gateway_source_overrides_experiment_prefix(tmp_path):
+    """显式 gateway.source 优先于前缀：实验前缀 session_id + gateway.source=curator
+    时来源仍为 curator（登记与建会话一致）。"""
+    from app.application.agent_run_service import AgentRunService
+    from app.domain.session import EXPERIMENT_SESSION_ID_PREFIX
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = AgentGraphRunner(
+        FakeProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    runs = AgentRunService(SQLiteAgentRunRegistry(store.path))
+    service = ChatCompletionService(store, runner, SessionService(store), agent_run_service=runs)
+    sid = f"{EXPERIMENT_SESSION_ID_PREFIX}exp-2-case-1"
+    try:
+        result = await service.complete(
+            ChatCompletionInput(
+                model="test",
+                messages=[{"role": "user", "content": "curator sweep"}],
+                stream=False,
+                session_id=sid,
+                trusted_metadata={"gateway.source": "curator"},
+            )
+        )
+
+        session = await store.get_session(sid)
+        assert session is not None
+        assert session.source == "curator"
+
+        run_row = runs.get(result.run_id)
+        assert run_row is not None
+        assert run_row["source"] == "curator"
+    finally:
+        await runs.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_snapshot_factory", [True, False], ids=["snapshot", "no-snapshot"])
+@pytest.mark.parametrize("use_run_service", [True, False], ids=["run-registered", "run-unregistered"])
+async def test_complete_experiment_source_matrix(tmp_path, use_run_service, use_snapshot_factory):
+    """agent_run_service 有/无 × policy_snapshot_factory 有/无 四种组合均按
+    eval-experiment- 前缀派生 experiment；登记与 snapshot 来源断言真实记录。"""
+    from app.application.agent_run_service import AgentRunService
+    from app.domain.session import EXPERIMENT_SESSION_ID_PREFIX
+    from app.infrastructure.registry.sqlite_agent_run_registry import SQLiteAgentRunRegistry
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    runs = AgentRunService(SQLiteAgentRunRegistry(store.path)) if use_run_service else None
+    snapshot_factory = None
+    if use_snapshot_factory:
+        snapshot_factory = RecordingSnapshotFactory(
+            RunPolicySnapshotFactory(SettingsPolicyProfileProvider(Settings()))
+        )
+    service = ChatCompletionService(
+        store,
+        runner,
+        SessionService(store),
+        policy_snapshot_factory=snapshot_factory,
+        agent_run_service=runs,
+    )
+    sid = f"{EXPERIMENT_SESSION_ID_PREFIX}exp-mtx-case-1"
+    try:
+        result = await service.complete(
+            ChatCompletionInput(
+                model="test",
+                messages=[{"role": "user", "content": "evaluate"}],
+                stream=False,
+                session_id=sid,
+                metadata={"execution_kind": "evaluation_experiment"},
+            )
+        )
+
+        session = await store.get_session(sid)
+        assert session is not None
+        assert session.source == "experiment"
+
+        if use_run_service:
+            run_row = runs.get(result.run_id)
+            assert run_row is not None
+            assert run_row["source"] == "experiment"
+
+        if use_snapshot_factory:
+            assert len(snapshot_factory.calls) == 1
+            assert snapshot_factory.calls[0]["ingress"].source == "experiment"
+            assert snapshot_factory.calls[0]["descriptor"].source == "experiment"
+    finally:
+        if runs is not None:
+            await runs.close()
+
+
+@pytest.mark.asyncio
+async def test_derive_ingress_source_yields_to_given_ingress_facts(tmp_path):
+    """已给 ingress_facts（cli）时 helper 不覆盖：会话来源保持 ingress 权威值。"""
+    from app.application.policy_snapshot import IngressFacts
+    from app.domain.policy import ExecutionMode
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+    sid = "cli-derived-1"
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id=sid,
+            ingress_facts=IngressFacts(
+                run_id="r-cli", session_id=sid, source="cli", actor_id=None,
+                execution_mode=ExecutionMode.REALTIME, trusted_claims={},
+            ),
+        )
+    )
+    session = await store.get_session(sid)
+    assert session is not None
+    assert session.source == "cli"
+
+
+@pytest.mark.asyncio
+async def test_derive_ingress_source_yields_to_snapshot_run_context(tmp_path):
+    """snapshot.run_context.source 优先于 ingress 派生值（既有顺序不变）。
+
+    受控 snapshot 返回 task 来源：即使 ingress_facts 已给 cli，会话来源仍为
+    snapshot 权威值，helper 不参与覆盖。"""
+    from types import SimpleNamespace
+
+    from app.application.policy_snapshot import IngressFacts
+    from app.domain.policy import ExecutionMode
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    runner = RecordingRunner()
+    sid = "snap-priority-1"
+    controlled_snapshot = SimpleNamespace(
+        run_context=SimpleNamespace(
+            run_id="r-snap",
+            session_id=sid,
+            source="task",
+            actor_id=None,
+            execution_mode=ExecutionMode.REALTIME,
+            trusted_claims={},
+        )
+    )
+
+    class FixedSnapshotFactory:
+        def create(self, ingress, descriptor):
+            return controlled_snapshot
+
+    service = ChatCompletionService(
+        store, runner, SessionService(store), policy_snapshot_factory=FixedSnapshotFactory(),
+    )
+    await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+            session_id=sid,
+            ingress_facts=IngressFacts(
+                run_id="r-cli", session_id=sid, source="cli", actor_id=None,
+                execution_mode=ExecutionMode.REALTIME, trusted_claims={},
+            ),
+        )
+    )
+    session = await store.get_session(sid)
+    assert session is not None
+    assert session.source == "task"
+
+
+@pytest.mark.asyncio
+async def test_complete_missing_session_id_derive_ingress_source_defaults_to_api(tmp_path):
+    """缺省 session_id 经 complete 生成 api-{uuid} ID，来源派生为 api。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    service = _build_service(store, tmp_path)
+    result = await service.complete(
+        ChatCompletionInput(
+            model="test",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=False,
+        )
+    )
+    session = await store.get_session(result.session_id)
+    assert session is not None
+    assert result.session_id.startswith("api-")
+    assert session.source == "api"

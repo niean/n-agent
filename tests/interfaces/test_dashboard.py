@@ -285,6 +285,23 @@ def test_chat_sessions_includes_feishu_gateway_sessions(tmp_path):
     assert {item["id"]: item["source"] for item in response.json()}["feishu-session"] == "feishu"
 
 
+def test_chat_sessions_includes_experiment_sessions(tmp_path):
+    """GET /chat/sessions 服务端不默认过滤：experiment 会话正常返回，前端筛选在客户端。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    import asyncio
+
+    async def seed():
+        await store.create_session(ConversationSession(id="eval-experiment-1", title="实验会话", source="experiment"))
+
+    asyncio.run(seed())
+    client = TestClient(_build_app(store))
+
+    response = client.get("/chat/sessions")
+
+    assert response.status_code == 200
+    assert {item["id"]: item["source"] for item in response.json()}["eval-experiment-1"] == "experiment"
+
+
 def test_scheduled_tasks_routes(tmp_path):
     store = SQLiteMemoryStore(tmp_path / "sessions.db")
     schedule = _FakeScheduleService()

@@ -94,7 +94,10 @@
   function resetViewPaging(view) {
     if (view === 'evaluators') resetEvaluatorPaging();
     else if (view === 'annotations') resetAnnotationPaging();
-    else if (view === 'results') resetResultsPaging();
+    else if (view === 'results' || view === 'experiment-results') {
+      resetResultsPaging();
+      if (view === 'experiment-results') experimentResultExperiments = null;
+    }
     else if (view === 'datasets') datasetsPageIndex = 0;
     else if (view === 'experiments') experimentsPageIndex = 0;
     else if (view === 'capabilities') capabilitiesPageIndex = 0;
@@ -249,7 +252,10 @@
   function kvRow(label, value) {
     const row = el('div', 'policy-item');
     row.appendChild(el('span', 'policy-k', label + '：'));
-    row.appendChild(el('span', 'policy-v', value === undefined || value === null || value === '' ? '-' : value));
+    const content = el('span', 'policy-v');
+    if (value instanceof Node) content.appendChild(value);
+    else content.textContent = value === undefined || value === null || value === '' ? '-' : String(value);
+    row.appendChild(content);
     return row;
   }
 
@@ -381,18 +387,14 @@
   const REVIEW_WINDOW_LIMIT = 50;
 
   // 统一翻页条：div.evaluations-pager + info + 上一页/下一页（始终占位、
-  // 边界 disabled 不隐藏，保持布局不跳动）。info 统一显「第 N/M 页」：
-  // slice 模式传 totalPages 直接使用；cursor 模式后端无总数，分母按已知
-  // 页数下界推断（hasNext 时至少还有一页取 pageNo+1，到底取 pageNo），
-  // 不编造或推算服务端总页数。
+  // 边界 disabled 不隐藏，保持布局不跳动）。有真实 totalPages 显示
+  // 「第 N/M 页」；cursor 模式后端无总数，只显示「第 N 页」。
   function pagerBar(options) {
     const row = el('div', 'evaluations-pager');
     const info = el('span', 'evaluations-pager__info');
     const pageNo = options.pageIndex + 1;
-    const totalPages = options.totalPages !== undefined
-      ? options.totalPages
-      : pageNo + (options.hasNext ? 1 : 0);
-    info.textContent = '第 ' + pageNo + '/' + totalPages + ' 页';
+    info.textContent = '第 ' + pageNo
+      + (options.totalPages !== undefined ? '/' + options.totalPages : '') + ' 页';
     row.appendChild(info);
     if (options.hasPrev) row.appendChild(actionButton('上一页', options.onPrev));
     else row.appendChild(disabledButton('上一页'));
@@ -1230,7 +1232,9 @@
             + '当前列表未设置筛选条件。'));
       } else {
         const rows = sliced.pageItems.map((item) => {
-          const detailBtn = actionButton('详情', () => openExperimentModal(item.experiment_id));
+          const detailBtn = el('div', 'row-actions');
+          detailBtn.appendChild(actionButton('详情', () => openExperimentModal(item.experiment_id)));
+          detailBtn.appendChild(experimentResultsLink(item.experiment_id));
           return [
             item.experiment_id,
             item.dataset_id + '/' + item.dataset_version,
@@ -1261,6 +1265,14 @@
       }));
     };
     drawExperiments();
+  }
+
+  function experimentResultsLink(experimentId) {
+    const link = document.createElement('a');
+    link.className = 'btn';
+    link.textContent = '查看评分明细';
+    link.href = '/evaluations/experiment-results?experiment_id=' + encodeURIComponent(experimentId);
+    return link;
   }
 
   async function openExperimentModal(experimentId) {
@@ -1369,6 +1381,7 @@
       + '列表为 current 视图）。'));
 
     const actions = el('div', 'providers-form__actions');
+    actions.appendChild(experimentResultsLink(experimentId));
     actions.appendChild(actionButton('与基线对比', () => {
       closeBackdrop(frame.backdrop);
       return openCompareModal(experiment);
@@ -1597,14 +1610,20 @@
 
   // 结果筛选与游标分页状态（Task 13/spec 4.5）：跨渲染保留用户选择；
   // 游标 v2 是不透明 token，上一页用历史游标栈回退，过滤变更重置栈
-  let resultsFilters = {
+  const defaultResultsFilters = () => ({
     created_from: '',
     created_to: '',
     target_kind: '',
     definition_id: '',
     provenance: '',
     status: '',
+  });
+  const resultFiltersByView = {
+    results: defaultResultsFilters(),
+    'experiment-results': { ...defaultResultsFilters(), experiment_id: '' },
   };
+  let resultsFilters = resultFiltersByView.results;
+  let experimentResultExperiments = null;
   let resultsCursorStack = [''];
   let resultsPageIndex = 0;
 
@@ -1626,11 +1645,26 @@
   async function renderResults(body, token) {
     body.textContent = '';
     const seq = ++viewRequestSeq.results;
+    const experimentView = currentView === 'experiment-results';
     const wrap = el('div', 'evaluations-results');
     body.appendChild(wrap);
 
+    if (experimentView && experimentResultExperiments === null) {
+      showLoading(wrap, '实验列表加载中...');
+      let experimentData;
+      try {
+        experimentData = await api.evaluations.listExperiments();
+      } catch (err) {
+        if (token !== renderToken || seq !== viewRequestSeq.results) return;
+        renderErrorState(wrap, '实验列表加载失败：' + err.message, () => renderResults(body, renderToken));
+        return;
+      }
+      if (token !== renderToken || seq !== viewRequestSeq.results) return;
+      experimentResultExperiments = experimentData.items || [];
+      wrap.textContent = '';
+    }
     // 筛选区（spec 4.5：时间范围/目标类型/DefinitionKey/provenance/状态；
-    // 变更任一过滤重置游标栈）。filterBar + 6 个 filterItem，name 合同不变。
+    // 变更任一过滤重置游标栈）。
     const filterRow = filterBar();
     // 统一接线：变更任一过滤重置游标栈并重渲染；文本输入做 trim，
     // 下拉选项值原样写入
@@ -1684,6 +1718,16 @@
       filterItem('来源', provenanceSelect),
       filterItem('状态', statusSelect),
     );
+    if (experimentView) {
+      const options = [['', '全部实验'], ...experimentResultExperiments.map(item =>
+        [item.experiment_id, item.experiment_id + ' · ' + item.dataset_id + '/' + item.dataset_version])];
+      if (resultsFilters.experiment_id && !options.some(option => option[0] === resultsFilters.experiment_id)) {
+        options.push([resultsFilters.experiment_id, resultsFilters.experiment_id]);
+      }
+      const experimentSelect = selectControl('results_experiment_id', options, resultsFilters.experiment_id);
+      bindResultsFilter(experimentSelect, 'experiment_id', false);
+      filterRow.appendChild(filterItem('实验', experimentSelect));
+    }
     wrap.appendChild(filterRow);
     // 数据容器独立于筛选区：Loading/错误/空态/重试只清 dataBody，
     // 不删除筛选控件与当前查询条件。
@@ -1695,7 +1739,9 @@
     const hadCursor = !!params.cursor;
     let data;
     try {
-      data = await api.evaluations.listResults(params);
+      data = await (experimentView
+        ? api.evaluations.listExperimentResults(params)
+        : api.evaluations.listResults(params));
     } catch (err) {
       if (token !== renderToken || seq !== viewRequestSeq.results) return;
       dataBody.textContent = '';
@@ -1724,6 +1770,7 @@
     const nextCursor = data.next_cursor ? String(data.next_cursor) : '';
     const pagerRow = pagerBar({
       pageIndex: resultsPageIndex,
+      totalPages: data.total_pages,
       hasPrev: resultsPageIndex > 0,
       hasNext: !!nextCursor,
       onPrev: () => {
@@ -1752,22 +1799,39 @@
       return;
     }
     const rows = items.map((item) => [
-      item.result_id,
+      resultSessionCell(item),
+      resultExperimentCell(item.experiment_id),
       item.metric_name,
-      item.provenance,
-      statusBadge(resultState(item)),
       item.typed_value === undefined || item.typed_value === null ? '-' : String(item.typed_value),
+      statusBadge(resultState(item)),
+      item.provenance,
       formatTime(item.created_at),
       actionButton('详情', () => openResultModal(item.result_id)),
     ]);
     dataBody.appendChild(scrollTable(table(
-      ['结果ID', '指标', '来源',
+      ['来源会话', '实验', '指标', '评分',
         { label: '状态', tip: '质量不通过/通过来自判定；评估失败/跳过为执行态；数值表示无门禁判定' },
-        '值', '时间', '操作'],
+        '评分来源', '时间', '操作'],
       rows,
     )));
     dataBody.appendChild(pagerRow);
     // 状态口径备注收进"结果"标题 hover tips（views.results shellTip）
+  }
+
+  function resultSessionCell(item) {
+    if (!item.session_id) return '未关联会话';
+    if (item.target_service !== 'n-agent') return item.session_id;
+    const link = document.createElement('a');
+    link.textContent = item.session_id;
+    link.href = '/observations/sessions/' + encodeURIComponent(item.session_id);
+    return link;
+  }
+
+  function resultExperimentCell(experimentId) {
+    if (!experimentId) return '—';
+    const link = experimentResultsLink(experimentId);
+    link.textContent = experimentId;
+    return link;
   }
 
   async function openResultModal(resultId) {
@@ -1778,16 +1842,22 @@
       alertMessage('结果详情加载失败：' + (err && err.message ? err.message : ''));
       return;
     }
-    const frame = buildFrame('结果详情 ' + resultId);
+    const frame = buildFrame('评分详情');
     const form = frame.form;
     const result = detail.result || {};
+    const evidence = detail.evidence_summary || {};
+    const target = (detail.sample && detail.sample.target)
+      || (detail.feedback && detail.feedback.target) || evidence.target || {};
     const kv = el('div', 'policy-list');
+    kv.appendChild(kvRow('结果ID', result.result_id || resultId));
+    kv.appendChild(kvRow('来源会话', resultSessionCell({ session_id: target.session_id, target_service: target.service })));
+    kv.appendChild(kvRow('Run ID', target.run_id || '—'));
+    kv.appendChild(kvRow('实验', resultExperimentCell(detail.job && detail.job.experiment_id)));
     kv.appendChild(kvRow('指标', result.metric_name));
     kv.appendChild(kvRow('来源', result.provenance));
     kv.appendChild(kvRow('状态', statusBadge(resultState(result))));
     kv.appendChild(kvRow('值', result.typed_value === null || result.typed_value === undefined ? '-' : result.typed_value));
     kv.appendChild(kvRow('时间', formatTime(result.created_at)));
-    const evidence = detail.evidence_summary || {};
     kv.appendChild(kvRow('证据快照 hash', evidence.snapshot_hash || '-'));
     kv.appendChild(kvRow('捕获时间', formatTime(evidence.captured_at)));
     form.appendChild(kv);
@@ -2322,6 +2392,7 @@
     // pager 先于空态构建：第 2+ 页空响应仍保留上一页出口
     const evaluatorPager = pagerBar({
       pageIndex: evaluatorPageIndex,
+      totalPages: data.total_pages,
       hasPrev: evaluatorPageIndex > 0,
       hasNext: !!evaluatorNextCursor,
       onPrev: () => {
@@ -3296,6 +3367,7 @@
     // pager 先于空态构建：第 2+ 页空响应仍保留上一页出口
     const annotationPager = pagerBar({
       pageIndex: annotationPageIndex,
+      totalPages: data.total_pages,
       hasPrev: annotationPageIndex > 0,
       hasNext: !!annotationNextCursor,
       onPrev: () => {
@@ -3536,8 +3608,9 @@
     evaluators: { title: '评估器', render: renderEvaluators },
     'judge-model': { title: '模型', render: renderJudgeModel },
     executions: { title: '执行任务', render: renderExecutions },
-    experiments: { title: '实验结果', render: renderExperiments },
-    results: { title: '结果', render: renderResults,
+    experiments: { title: '实验汇总', render: renderExperiments },
+    'experiment-results': { title: '评分明细', render: renderResults },
+    results: { title: '评分明细', render: renderResults,
       shellTip: '质量不通过/通过来自 boolean 或阈值判定\n'
         + '评估失败/跳过为执行态\n'
         + '投递等待与未关联在详情中展示\n'
@@ -3591,6 +3664,13 @@
     const view = views[requestedView] ? requestedView : (currentView || 'overview');
     if (inflight && view === currentView) return inflight;
     if (view !== currentView) deactivate();
+    if (resultFiltersByView[view]) {
+      resultsFilters = resultFiltersByView[view];
+      if (view !== currentView && view === 'experiment-results' && global.location && global.URLSearchParams) {
+        const query = new global.URLSearchParams(global.location.search || '');
+        if (query.has('experiment_id')) resultsFilters.experiment_id = query.get('experiment_id') || '';
+      }
+    }
     currentView = view;
     const token = ++renderToken;
     inflight = render(token, view).finally(() => {

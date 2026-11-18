@@ -39,7 +39,8 @@
     // 独立 path/tab，与实验结果页共享 sidebarTab/topnavParent。
     { tab: 'evaluations-executions', path: '/evaluations/executions', label: '执行任务', parentTab: 'evaluations' },
     { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验', parentTab: 'evaluations' },
-    { tab: 'evaluations-results', path: '/evaluations/results', label: '结果', parentTab: 'evaluations' },
+    { tab: 'evaluations-results', path: '/evaluations/results', label: '线上评估', parentTab: 'evaluations' },
+    { tab: 'evaluations-experiment-results', path: '/evaluations/experiment-results', label: '评分明细', parentTab: 'evaluations' },
     { tab: 'evaluations-annotations', path: '/evaluations/annotations', label: '人工标注', parentTab: 'evaluations' },
     { tab: 'evaluations-review', path: '/evaluations/review', label: '待复核', parentTab: 'evaluations' },
     { tab: 'security', label: '安全', parent: true, children: ['security-overview', 'security-sessions', 'security-memory', 'security-sandbox'] },
@@ -96,10 +97,11 @@
     ],
     'evaluations-experiments': [
       { tab: 'evaluations-executions', path: '/evaluations/executions', label: '执行任务', concern: 'evaluation', scope: 'executions', topnavParent: 'evaluations-experiments' },
-      { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验结果', concern: 'evaluation', scope: 'experiments', topnavParent: 'evaluations-experiments' },
+      { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验汇总', concern: 'evaluation', scope: 'experiments', topnavParent: 'evaluations-experiments' },
+      { tab: 'evaluations-experiment-results', path: '/evaluations/experiment-results', label: '评分明细', concern: 'evaluation', scope: 'experiment-results', topnavParent: 'evaluations-experiments' },
     ],
     'evaluations-results': [
-      { tab: 'evaluations-results', path: '/evaluations/results', label: '结果', concern: 'evaluation', scope: 'results', topnavParent: 'evaluations-results' },
+      { tab: 'evaluations-results', path: '/evaluations/results', label: '评分明细', concern: 'evaluation', scope: 'results', topnavParent: 'evaluations-results' },
     ],
     'evaluations-annotations': [
       { tab: 'evaluations-annotations', path: '/evaluations/annotations', label: '人工标注', concern: 'evaluation', scope: 'annotations', topnavParent: 'evaluations-annotations' },
@@ -146,6 +148,7 @@
     { paths: ['/evaluations/executions'], tab: 'evaluations-executions', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'executions' },
     { paths: ['/evaluations/experiments'], tab: 'evaluations-experiments', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'experiments' },
     { paths: ['/evaluations/results'], tab: 'evaluations-results', renderTab: 'evaluations', sidebarTab: 'evaluations-results', topnavParent: 'evaluations-results', scope: 'results' },
+    { paths: ['/evaluations/experiment-results'], tab: 'evaluations-experiment-results', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'experiment-results' },
     { paths: ['/evaluations/annotations'], tab: 'evaluations-annotations', renderTab: 'evaluations', sidebarTab: 'evaluations-annotations', topnavParent: 'evaluations-annotations', scope: 'annotations' },
     // /evaluations/review 是旧"待复核"兼容页：不在左导 children，但
     // routeConfig/topnav 保留，深链仍可解析（顶部跳转链接属视图改造）。

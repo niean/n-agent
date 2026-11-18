@@ -182,6 +182,10 @@ class SQLiteExecutionStore:
 
     def _list(self, limit, boundary):
         with self._connect() as conn:
+            # Count the complete list in the same read snapshot as the page,
+            # before applying the keyset boundary.
+            conn.execute("BEGIN")
+            total_count = conn.execute("SELECT COUNT(*) FROM evaluation_executions").fetchone()[0]
             where = "WHERE (created_at,execution_id)<(?,?)" if boundary else ""
             rows = conn.execute("SELECT * FROM evaluation_executions "+where+" ORDER BY created_at DESC,execution_id DESC LIMIT ?", (*boundary, limit+1) if boundary else (limit+1,)).fetchall()
             items = [_row(row) for row in rows[:limit]]
@@ -189,4 +193,6 @@ class SQLiteExecutionStore:
             if len(rows) > limit:
                 last = rows[limit-1]
                 cursor = base64.urlsafe_b64encode(json.dumps([last["created_at"], last["execution_id"]]).encode()).decode()
-            return {"items": items, "next_cursor": cursor}
+            return {"items": items, "next_cursor": cursor,
+                    "total_count": total_count,
+                    "total_pages": max(1, (total_count + limit - 1) // limit)}

@@ -276,6 +276,7 @@ def create_dashboard_router(
     @router.get("/evaluations/judge-model", response_class=HTMLResponse)
     @router.get("/evaluations/executions", response_class=HTMLResponse)
     @router.get("/evaluations/experiments", response_class=HTMLResponse)
+    @router.get("/evaluations/experiment-results", response_class=HTMLResponse)
     @router.get("/evaluations/results", response_class=HTMLResponse)
     @router.get("/evaluations/annotations", response_class=HTMLResponse)
     @router.get("/evaluations/review", response_class=HTMLResponse)

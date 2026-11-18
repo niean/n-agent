@@ -241,7 +241,7 @@ class EvaluationExecutionService:
 
     async def list(self, *, limit=50, cursor=None):
         page = await self.store.list_page(limit=limit, cursor=cursor)
-        return {"items": [self._public(row) for row in page["items"]], "next_cursor": page["next_cursor"]}
+        return {**page, "items": [self._public(row) for row in page["items"]]}
 
     async def _counts(self, experiment_id):
         jobs = await self.ledger.experiment_job_status_counts(experiment_id)

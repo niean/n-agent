@@ -819,8 +819,15 @@ function freshStubs(options) {
     crypto: { randomUUID: () => 'stub-uuid' },
     fetch: fetchStub,
     localStorage: {
-      getItem: (key) => (localStorageData.has(key) ? localStorageData.get(key) : null),
-      setItem: (key, value) => { localStorageData.set(key, String(value)); },
+      // options.storage.throwOnGet/throwOnSet: 模拟 localStorage 抛错（筛选仍须在内存中生效）
+      getItem: (key) => {
+        if (options.storage && options.storage.throwOnGet) throw new Error('storage read failed');
+        return localStorageData.has(key) ? localStorageData.get(key) : null;
+      },
+      setItem: (key, value) => {
+        if (options.storage && options.storage.throwOnSet) throw new Error('storage write failed');
+        localStorageData.set(key, String(value));
+      },
       removeItem: (key) => { localStorageData.delete(key); },
     },
     WebSocket: function () {},
@@ -929,6 +936,101 @@ function loadChat(options) {
   env.fireClick = (el) => { if (el) el.click(); };
   env.waitMicro = () => new Promise((res) => setTimeout(res, 0));
   return env;
+}
+
+// --- sessions.js 独立加载器 --------------------------------------------------
+// 会话表格页（sessions.js）运行在独立 vm 上下文：独立 ui/api stub、独立 document
+// 与共享 localStorage 视图（localStorageData）。脚本在加载时读取存储，测试须先
+// 通过 env.setLocalStorage 预置值再重新 loadSessionsPage。
+const SESSIONS_JS_PATH = path.join(__dirname, '..', '..', 'app', 'interfaces', 'http', 'static', 'sessions.js');
+const sessionsCode = fs.readFileSync(SESSIONS_JS_PATH, 'utf8');
+let sessionsPageList = [];
+let sessionsPageApiCalls = [];
+
+function loadSessionsPage(options) {
+  options = options || {};
+  const missingIds = new Set(options.missingIds || []);
+  sessionsPageList = [];
+  sessionsPageApiCalls = [];
+  const sessionsListEl = makeEl();
+  const filterBtn = makeEl();
+  filterBtn.tagName = 'BUTTON';
+  const byIdMap = { 'sessions-list': sessionsListEl, 'sessions-filter-btn': filterBtn };
+  const createdElements = [];
+  function findById(id) {
+    if (missingIds.has(id)) return null;
+    if (byIdMap[id] !== undefined) return byIdMap[id];
+    const visit = (node) => {
+      if (!node) return null;
+      if (node.id === id) return node;
+      for (const child of node._kids || []) {
+        const found = visit(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    return visit(document.body);
+  }
+  const document = {
+    _listeners: {},
+    activeElement: null,
+    createElement: (tagName) => { const el = makeEl(); el.tagName = String(tagName || 'div').toUpperCase(); createdElements.push(el); return el; },
+    getElementById: findById,
+    addEventListener: (type, fn) => { (document._listeners[type] = document._listeners[type] || []).push(fn); },
+    removeEventListener: (type, fn) => { document._listeners[type] = (document._listeners[type] || []).filter((l) => l !== fn); },
+    body: makeEl(),
+  };
+  _currentDoc = document;
+  const ui = {
+    byId: (id) => (missingIds.has(id) ? null : (byIdMap[id] !== undefined ? byIdMap[id] : makeEl())),
+    el: (tag, cls) => { const el = makeEl(); el.tagName = String(tag || 'div').toUpperCase(); el.className = cls || ''; return el; },
+    clear: (node) => { if (node && node._kids) { for (const k of node._kids) if (k) k.parentNode = null; node._kids.length = 0; } },
+    renderLoading: (node, text) => { const el = makeEl(); el.className = 'loading'; el.textContent = text; node.appendChild(el); },
+    renderEmpty: (node, text) => { const el = makeEl(); el.className = 'empty'; el.textContent = text; node.appendChild(el); },
+    renderError: (node, text) => { const el = makeEl(); el.className = 'error'; el.textContent = text; node.appendChild(el); },
+    appendText: (node, label, value) => { const row = makeEl(); row.textContent = label + ' ' + value; node.appendChild(row); },
+  };
+  const api = {
+    listSessions: () => {
+      sessionsPageApiCalls.push({ name: 'listSessions' });
+      // 完整返回数据（含 experiment 行）；来源筛选只发生在渲染层
+      return Promise.resolve(sessionsPageList.slice());
+    },
+    getSessionDetail: (id) => Promise.resolve({ session: { id }, messages: [], summary: null, task_state: null }),
+    getSessionToolCalls: () => Promise.resolve([]),
+    deleteSession: () => Promise.resolve({}),
+  };
+  const win = {
+    NAGENT: { ui, api, modal: { confirm: () => Promise.resolve(true), alert: () => {} } },
+    document,
+    localStorage: {
+      getItem: (key) => {
+        if (options.storage && options.storage.throwOnGet) throw new Error('storage read failed');
+        return localStorageData.has(key) ? localStorageData.get(key) : null;
+      },
+      setItem: (key, value) => {
+        if (options.storage && options.storage.throwOnSet) throw new Error('storage write failed');
+        localStorageData.set(key, String(value));
+      },
+      removeItem: (key) => { localStorageData.delete(key); },
+    },
+  };
+  const ctx = { window: win, document, console };
+  vm.createContext(ctx);
+  vm.runInContext(sessionsCode, ctx);
+  return {
+    win,
+    document,
+    byIdMap,
+    apiCalls: sessionsPageApiCalls,
+    setList: (items) => { sessionsPageList = items; },
+    clearLocalStorage: () => { localStorageData.clear(); },
+    setLocalStorage: (key, value) => { localStorageData.set(key, String(value)); },
+    getLocalStorage: (key) => (localStorageData.has(key) ? localStorageData.get(key) : null),
+    fireClick: (el) => { if (el) el.click(); },
+    waitMicro: () => new Promise((res) => setTimeout(res, 0)),
+    sessions: win.NAGENT.sessions,
+  };
 }
 
 function _lastMessageBubble(env) {
@@ -3491,6 +3593,224 @@ async function testSessionSourceFilter() {
 }
 
 // ===========================================================================
+// 实验来源：两处筛选器（chat.js 侧栏 + sessions.js 会话表格页）同构提供
+// 'experiment' 选项且默认排除；存储缺失/损坏/非数组/空/仅未知值时回退默认；
+// 合法旧集合原样保留；勾选-保存-复载生效，取消不修改选择；localStorage
+// 抛错时仍在内存中切换；API 始终返回完整数组（不在数据层删行制造隐藏）。
+// ===========================================================================
+function findCheckboxIn(root, value) {
+  const visit = (node) => {
+    if (!node) return null;
+    if (node.tagName === 'INPUT' && node.value === value) return node;
+    for (const child of node._kids || []) {
+      const found = visit(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  return visit(root);
+}
+
+function filterFormOf(backdrop) {
+  return backdrop._kids[0]._kids[0];
+}
+
+function filterCancelButtonOf(backdrop) {
+  const form = filterFormOf(backdrop);
+  return form._kids[form._kids.length - 1]._kids[0];
+}
+
+async function testChatSessionSourceExperiment() {
+  const KEY = 'nagent.chat.session-source-filter.v1';
+  const data = () => [
+    { id: 'dash', title: '控制台会话', source: 'dashboard' },
+    { id: 'exp', title: '实验会话', source: 'experiment' },
+    { id: 'delegated', title: '委派会话', source: 'delegation' },
+  ];
+  const titlesOf = (env) => env.byIdMap['chat-session-list']._kids.map((k) => k.textContent).join('|');
+  // 会话条目 textContent 含标题之外的信息，用包含/缺席判定
+  const chatShows = (env, title) => titlesOf(env).indexOf(title) !== -1;
+
+  // 1. 存储不存在/损坏 JSON/非数组/空数组/仅未知值：默认排除 experiment 与 delegation
+  let env = loadChat();
+  for (const stored of [null, '{bad json', '{"a":1}', '[]', '["nope"]']) {
+    env.clearLocalStorage();
+    if (stored !== null) env.setLocalStorage(KEY, stored);
+    env = loadChat();
+    sessionsList = data();
+    let served = null;
+    const baseList = env.win.NAGENT.api.listSessions;
+    env.win.NAGENT.api.listSessions = () => baseList().then((items) => { served = items; return items; });
+    env.chat.init();
+    await env.waitMicro();
+    ok(served && served.length === 3, 'chat api returns full array including experiment (stored=' + String(stored) + ')');
+    ok(chatShows(env, '控制台会话') && !chatShows(env, '实验会话') && !chatShows(env, '委派会话'), 'chat default filter hides experiment/delegation (stored=' + String(stored) + ')');
+  }
+
+  // 2. 合法旧集合原样保留（不含 experiment 即隐藏）
+  env.clearLocalStorage();
+  env.setLocalStorage(KEY, '["dashboard"]');
+  env = loadChat();
+  sessionsList = data();
+  env.chat.init();
+  await env.waitMicro();
+  ok(chatShows(env, '控制台会话') && !chatShows(env, '实验会话') && !chatShows(env, '委派会话'), 'chat valid stored set preserved (experiment hidden)');
+
+  // 3. 勾选实验 -> 列表出现；保存持久化；新上下文复载仍出现
+  env.fireClick(env.byIdMap['chat-session-filter-btn']);
+  let backdrop = env.document.getElementById('chat-session-source-filter-modal');
+  ok(!!backdrop, 'chat filter modal opens');
+  const expBox = findCheckboxIn(backdrop, 'experiment');
+  ok(!!expBox, 'chat filter modal renders experiment checkbox');
+  expBox.checked = true;
+  expBox.dispatchEvent({ type: 'change' });
+  filterFormOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(titlesOf(env).indexOf('实验会话') !== -1, 'chat checking experiment shows experiment session');
+  ok(JSON.parse(env.getLocalStorage(KEY)).indexOf('experiment') !== -1, 'chat saved filter persists experiment');
+  env = loadChat();
+  sessionsList = data();
+  env.chat.init();
+  await env.waitMicro();
+  ok(titlesOf(env).indexOf('实验会话') !== -1, 'chat experiment stays visible after reload in a new context');
+
+  // 4. 取消勾选并保存 -> 隐藏
+  env.fireClick(env.byIdMap['chat-session-filter-btn']);
+  backdrop = env.document.getElementById('chat-session-source-filter-modal');
+  const expBox2 = findCheckboxIn(backdrop, 'experiment');
+  ok(expBox2.checked === true, 'chat experiment checkbox reflects stored selection');
+  expBox2.checked = false;
+  expBox2.dispatchEvent({ type: 'change' });
+  filterFormOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(titlesOf(env).indexOf('实验会话') === -1, 'chat unchecking experiment hides experiment session again');
+
+  // 5. 取消弹框不修改选择
+  const before = env.getLocalStorage(KEY);
+  env.fireClick(env.byIdMap['chat-session-filter-btn']);
+  backdrop = env.document.getElementById('chat-session-source-filter-modal');
+  const expBox3 = findCheckboxIn(backdrop, 'experiment');
+  expBox3.checked = true;
+  expBox3.dispatchEvent({ type: 'change' });
+  filterCancelButtonOf(backdrop).click();
+  ok(!env.document.getElementById('chat-session-source-filter-modal'), 'chat cancel closes filter modal');
+  ok(titlesOf(env).indexOf('实验会话') === -1, 'chat cancel does not show experiment session');
+  ok(env.getLocalStorage(KEY) === before, 'chat cancel does not modify stored selection');
+
+  // 6. localStorage getItem/setItem 抛错：默认筛选仍生效，内存中切换仍生效
+  env = loadChat({ storage: { throwOnGet: true, throwOnSet: true } });
+  sessionsList = data();
+  env.chat.init();
+  await env.waitMicro();
+  ok(chatShows(env, '控制台会话') && !chatShows(env, '实验会话') && !chatShows(env, '委派会话'), 'chat storage read failure still applies default filter');
+  env.fireClick(env.byIdMap['chat-session-filter-btn']);
+  backdrop = env.document.getElementById('chat-session-source-filter-modal');
+  const expBox4 = findCheckboxIn(backdrop, 'experiment');
+  expBox4.checked = true;
+  expBox4.dispatchEvent({ type: 'change' });
+  filterFormOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(titlesOf(env).indexOf('实验会话') !== -1, 'chat storage write failure still switches filter in memory');
+}
+
+async function testSessionsPageSourceFilter() {
+  const KEY = 'nagent.sessions.source-filter.v1';
+  const data = () => [
+    { id: 'dash', title: '控制台会话', source: 'dashboard' },
+    { id: 'exp', title: '实验会话', source: 'experiment' },
+    { id: 'delegated', title: '委派会话', source: 'delegation' },
+  ];
+  const rowTitlesOf = (env) => {
+    const list = env.byIdMap['sessions-list'];
+    const table = list._kids.filter((k) => k.tagName === 'TABLE')[0];
+    if (!table) return '';
+    const tbody = table._kids.filter((k) => k.tagName === 'TBODY')[0];
+    return tbody._kids.map((r) => r._kids[0].textContent).join('|');
+  };
+
+  // 1. 存储不存在/损坏 JSON/非数组/空数组/仅未知值：默认排除 experiment 与 delegation
+  let env = loadSessionsPage();
+  for (const stored of [null, '{bad json', '{"a":1}', '[]', '["nope"]']) {
+    env.clearLocalStorage();
+    if (stored !== null) env.setLocalStorage(KEY, stored);
+    env = loadSessionsPage();
+    let served = null;
+    const baseList = env.win.NAGENT.api.listSessions;
+    env.win.NAGENT.api.listSessions = () => baseList().then((items) => { served = items; return items; });
+    env.setList(data());
+    env.sessions.init();
+    await env.waitMicro();
+    ok(served && served.length === 3, 'sessions page api returns full array including experiment (stored=' + String(stored) + ')');
+    ok(rowTitlesOf(env) === '控制台会话', 'sessions page default filter hides experiment/delegation (stored=' + String(stored) + ')');
+  }
+
+  // 2. 合法旧集合原样保留（不含 experiment 即隐藏）
+  env.clearLocalStorage();
+  env.setLocalStorage(KEY, '["dashboard"]');
+  env = loadSessionsPage();
+  env.setList(data());
+  env.sessions.init();
+  await env.waitMicro();
+  ok(rowTitlesOf(env) === '控制台会话', 'sessions page valid stored set preserved (experiment hidden)');
+
+  // 3. 勾选实验 -> 列表出现；保存持久化；新上下文复载仍出现
+  env.fireClick(env.byIdMap['sessions-filter-btn']);
+  let backdrop = env.document.getElementById('sessions-source-filter-modal');
+  ok(!!backdrop, 'sessions page filter modal opens');
+  const expBox = findCheckboxIn(backdrop, 'experiment');
+  ok(!!expBox, 'sessions page filter modal renders experiment checkbox');
+  expBox.checked = true;
+  expBox.dispatchEvent({ type: 'change' });
+  filterFormOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(rowTitlesOf(env).indexOf('实验会话') !== -1, 'sessions page checking experiment shows experiment session');
+  ok(JSON.parse(env.getLocalStorage(KEY)).indexOf('experiment') !== -1, 'sessions page saved filter persists experiment');
+  env = loadSessionsPage();
+  env.setList(data());
+  env.sessions.init();
+  await env.waitMicro();
+  ok(rowTitlesOf(env).indexOf('实验会话') !== -1, 'sessions page experiment stays visible after reload in a new context');
+
+  // 4. 取消勾选并保存 -> 隐藏
+  env.fireClick(env.byIdMap['sessions-filter-btn']);
+  backdrop = env.document.getElementById('sessions-source-filter-modal');
+  const expBox2 = findCheckboxIn(backdrop, 'experiment');
+  ok(expBox2.checked === true, 'sessions page experiment checkbox reflects stored selection');
+  expBox2.checked = false;
+  expBox2.dispatchEvent({ type: 'change' });
+  filterFormOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(rowTitlesOf(env).indexOf('实验会话') === -1, 'sessions page unchecking experiment hides experiment session again');
+
+  // 5. 取消弹框不修改选择
+  const before = env.getLocalStorage(KEY);
+  env.fireClick(env.byIdMap['sessions-filter-btn']);
+  backdrop = env.document.getElementById('sessions-source-filter-modal');
+  const expBox3 = findCheckboxIn(backdrop, 'experiment');
+  expBox3.checked = true;
+  expBox3.dispatchEvent({ type: 'change' });
+  filterCancelButtonOf(backdrop).click();
+  ok(!env.document.getElementById('sessions-source-filter-modal'), 'sessions page cancel closes filter modal');
+  ok(rowTitlesOf(env).indexOf('实验会话') === -1, 'sessions page cancel does not show experiment session');
+  ok(env.getLocalStorage(KEY) === before, 'sessions page cancel does not modify stored selection');
+
+  // 6. localStorage getItem/setItem 抛错：默认筛选仍生效，内存中切换仍生效
+  env = loadSessionsPage({ storage: { throwOnGet: true, throwOnSet: true } });
+  env.setList(data());
+  env.sessions.init();
+  await env.waitMicro();
+  ok(rowTitlesOf(env) === '控制台会话', 'sessions page storage read failure still applies default filter');
+  env.fireClick(env.byIdMap['sessions-filter-btn']);
+  backdrop = env.document.getElementById('sessions-source-filter-modal');
+  const expBox4 = findCheckboxIn(backdrop, 'experiment');
+  expBox4.checked = true;
+  expBox4.dispatchEvent({ type: 'change' });
+  filterFormOf(backdrop).dispatchEvent({ type: 'submit', preventDefault: () => {} });
+  await env.waitMicro();
+  ok(rowTitlesOf(env).indexOf('实验会话') !== -1, 'sessions page storage write failure still switches filter in memory');
+}
+
+// ===========================================================================
 // 会话搜索：独立 Modal、打开时来源快照、安全标题匹配和常规关闭。
 // ===========================================================================
 async function testSessionSearch() {
@@ -5682,6 +6002,8 @@ runIntegration().then(async () => {
   await testSessionsPanelCollapse();
   await testAutoRefreshPanels();
   await testSessionSourceFilter();
+  await testChatSessionSourceExperiment();
+  await testSessionsPageSourceFilter();
   await testSessionSearch();
   await testSkillPicker();
   await testRunFooterRenderAndFormat();

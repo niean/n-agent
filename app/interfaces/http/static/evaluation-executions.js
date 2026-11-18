@@ -233,6 +233,7 @@
         const nextCursor = data.next_cursor ? String(data.next_cursor) : '';
         body.appendChild(pagerBar({
           pageIndex: execPageIndex,
+          totalPages: data.total_pages,
           hasPrev: execPageIndex > 0,
           hasNext: !!nextCursor,
           onPrev: () => {

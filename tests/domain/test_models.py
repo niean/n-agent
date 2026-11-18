@@ -17,6 +17,8 @@ def test_session_sources_cover_entry_types():
     assert SessionSource.CURATOR.value == "curator"
     assert SessionSource.TASK.value == "task"
     assert SessionSource.DELEGATION.value == "delegation"
+    # experiment 是评估实验会话来源，沿用 eval-experiment- 前缀（模式十六显式例外）
+    assert SessionSource.EXPERIMENT.value == "experiment"
     assert {source.value for source in SessionSource} == {
         "dashboard",
         "api",
@@ -29,6 +31,7 @@ def test_session_sources_cover_entry_types():
         "curator",
         "task",
         "delegation",
+        "experiment",
     }
 
 

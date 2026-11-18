@@ -177,6 +177,22 @@ class AnnotationService:
         snapshot_at = datetime.now(timezone.utc).isoformat()
         return rows, next_cursor, snapshot_at
 
+    async def list_queue_page(
+        self,
+        *,
+        state: str,
+        reason: str,
+        threshold: float = 0.5,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """当前标注队列分页，附完整筛选集总数与响应生成时刻。"""
+        page = await self._store.list_annotation_queue_page(
+            state=state, reason=reason, threshold=threshold,
+            limit=limit, cursor=cursor,
+        )
+        return {**page, "snapshot_at": datetime.now(timezone.utc).isoformat()}
+
     # ------------------------------------------------------------------
     # 标注上下文
     # ------------------------------------------------------------------

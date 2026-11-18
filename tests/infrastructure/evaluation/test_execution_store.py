@@ -62,6 +62,24 @@ async def test_scoring_recovery_and_pagination(tmp_path):
     assert next_page["items"][0]["execution_id"] != page["items"][0]["execution_id"]
 
 
+async def test_pagination_totals_count_all_rows_before_cursor(tmp_path):
+    store = _store(tmp_path)
+    empty = await store.list_page(limit=2)
+    assert (empty["total_count"], empty["total_pages"]) == (0, 1)
+    for index in range(5):
+        await store.submit(_request(f"total-{index}"), now=10 + index)
+    cursor = None
+    pages = []
+    while True:
+        page = await store.list_page(limit=2, cursor=cursor)
+        assert (page["total_count"], page["total_pages"]) == (5, 3)
+        pages.append(len(page["items"]))
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert pages == [2, 2, 1]
+
+
 @pytest.mark.parametrize("schema", ["1", "2"])
 async def test_reopen_scrubs_only_legacy_schema2_answer_cache(tmp_path, schema):
     store = _store(tmp_path)

@@ -3918,6 +3918,26 @@ class TestAnnotationQueries:
         rows = await store.aggregate_metric_results()
         assert rows == []
 
+    async def test_annotation_queue_totals_cover_filtered_set_before_cursor(self, tmp_path):
+        store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
+        for _ in range(5):
+            await _seed_auto_result(store, typed_value=0.3)
+        await _seed_auto_result(store, typed_value=0.9)
+        first = await store.list_annotation_queue_page(
+            state="pending", reason="low_score", limit=2
+        )
+        assert (first["total_count"], first["total_pages"]) == (5, 3)
+        second = await store.list_annotation_queue_page(
+            state="pending", reason="low_score", limit=2,
+            cursor=first["next_cursor"],
+        )
+        assert (second["total_count"], second["total_pages"]) == (5, 3)
+        assert len(second["items"]) == 2
+        empty = await store.list_annotation_queue_page(
+            state="annotated", reason="low_score", limit=2
+        )
+        assert (empty["total_count"], empty["total_pages"]) == (0, 1)
+
     async def test_annotation_queue_low_score(self, tmp_path):
         store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
         low = await _seed_auto_result(store, typed_value=0.3)

@@ -95,6 +95,25 @@ def test_session_detail_response_includes_message_created_at(tmp_path):
     assert parsed is not None
 
 
+def test_experiment_session_detail_accessible_and_shows_final_answer(tmp_path):
+    """experiment 会话按既有权限直达详情：来源标识与最终答复正常返回（前端筛选在客户端）。"""
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+
+    async def seed():
+        await store.create_session(ConversationSession(id="eval-experiment-1", title="实验会话", source="experiment"))
+        await store.append_message("eval-experiment-1", ConversationMessage(role="user", content="跑一次评估"))
+        await store.append_message("eval-experiment-1", ConversationMessage(role="assistant", content="最终答复内容"))
+
+    asyncio.run(seed())
+    client = TestClient(_build_app(store))
+    resp = client.get("/chat/sessions/eval-experiment-1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["session"]["source"] == "experiment"
+    assistant = next(m for m in data["messages"] if m["role"] == "assistant")
+    assert assistant["content"] == "最终答复内容"
+
+
 def test_message_to_dict_includes_source():
     from app.interfaces.http.dashboard import _message_to_dict
 

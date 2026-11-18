@@ -2918,6 +2918,7 @@ class TestAnnotations:
         assert resp.headers["cache-control"] == "no-store"
         body = resp.json()
         assert body["snapshot_at"]
+        assert (body["total_count"], body["total_pages"]) == (1, 1)
         assert body["next_cursor"] is None
         item = body["items"][0]
         assert item["source_result_id"] == result_id
@@ -2926,6 +2927,7 @@ class TestAnnotations:
         assert item["latest_human_feedback"] is None
         _run(mgmt._seed_annotation_result(subject_id="run-2", event="evt-a2"))
         page1 = mgmt.get("/chat/evaluations/annotations?limit=1")
+        assert (page1.json()["total_count"], page1.json()["total_pages"]) == (2, 2)
         assert len(page1.json()["items"]) == 1
         assert page1.json()["next_cursor"]
         page2 = mgmt.get(
@@ -2933,6 +2935,7 @@ class TestAnnotations:
             + quote(page1.json()["next_cursor"])
         )
         assert page2.status_code == 200
+        assert (page2.json()["total_count"], page2.json()["total_pages"]) == (2, 2)
         assert len(page2.json()["items"]) == 1
         assert (
             page2.json()["items"][0]["source_result_id"]
@@ -3311,6 +3314,37 @@ class TestCompareRoute:
 class TestResultsExtended:
     """results 路由扩展（spec 7）：新过滤 + snapshot_at + 游标兼容。"""
 
+    def test_evaluation_scene_filter_and_totals(self, mgmt):
+        from tests.infrastructure.evaluation.test_evaluation_store import _seed_auto_result
+
+        online_id = _run(_seed_auto_result(mgmt.store))
+        for _ in range(3):
+            _run(_seed_auto_result(mgmt.store, experiment_id="scene-experiment"))
+        online = mgmt.get("/chat/evaluations/results?evaluation_scene=online&limit=2")
+        assert online.status_code == 200
+        assert [row["result_id"] for row in online.json()["items"]] == [online_id]
+        assert (online.json()["total_count"], online.json()["total_pages"]) == (1, 1)
+        experiment = mgmt.get("/chat/evaluations/experiment-results?limit=2")
+        assert experiment.status_code == 200
+        assert mgmt.get("/chat/evaluations/results?evaluation_scene=experiment").status_code == 422
+        assert mgmt.get("/chat/evaluations/experiment-results?evaluation_scene=online").status_code == 422
+        assert mgmt.get("/chat/evaluations/results").json()["total_count"] == 1
+        assert mgmt.get("/chat/evaluations/experiment-results?experiment_id=scene-experiment").json()["total_count"] == 3
+        missing = mgmt.get("/chat/evaluations/experiment-results?experiment_id=missing").json()
+        assert missing["items"] == []
+        assert (missing["total_count"], missing["total_pages"]) == (0, 1)
+        first = experiment.json()
+        assert (first["total_count"], first["total_pages"]) == (3, 2)
+        second = mgmt.get("/chat/evaluations/experiment-results?limit=2&cursor="
+                          + quote(first["next_cursor"]))
+        assert second.status_code == 200
+        assert len(second.json()["items"]) == 1
+        assert (second.json()["total_count"], second.json()["total_pages"]) == (3, 2)
+        assert mgmt.get("/chat/evaluations/results?evaluation_scene=invalid").status_code == 422
+        assert mgmt.get("/chat/evaluations/results?evaluation_scene=").status_code == 422
+        assert mgmt.get("/chat/evaluations/results?evaluation_scene=online&cursor="
+                        + quote(first["next_cursor"])).status_code == 422
+
     @staticmethod
     def _legacy_cursor(row: Any) -> str:
         raw = json.dumps(
@@ -3328,6 +3362,7 @@ class TestResultsExtended:
         body = resp.json()
         assert body["items"] == []
         assert body["snapshot_at"]
+        assert (body["total_count"], body["total_pages"]) == (0, 1)
         resp = mgmt.get(
             "/chat/evaluations/results?provenance=automatic&definition_version=v1"
         )
@@ -3369,6 +3404,7 @@ class TestResultsExtended:
         _run(mgmt._seed_sample_job(sample_id_suffix="-2"))
         first = mgmt.get("/chat/evaluations/results?limit=1")
         newest = first.json()["items"][0]
+        assert (first.json()["total_count"], first.json()["total_pages"]) == (2, 2)
         legacy = self._legacy_cursor({
             "created_at": newest["created_at"],
             "result_id": newest["result_id"],
@@ -3380,6 +3416,7 @@ class TestResultsExtended:
         body = resp.json()
         assert len(body["items"]) == 1
         assert body["items"][0]["result_id"] != newest["result_id"]
+        assert (body["total_count"], body["total_pages"]) == (2, 2)
 
     def test_results_new_filters_with_legacy_cursor_422_cursor_invalid(
         self, mgmt: _ManagementHarness

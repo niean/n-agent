@@ -17,12 +17,13 @@
     ['task', '任务'],
     ['curator', 'Curator'],
     ['delegation', '委派'],
+    ['experiment', '实验'],
   ];
   const SESSION_SOURCE_VALUES = new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value));
   let selectedSessionSources = loadSessionSourceFilter();
 
   function defaultSessionSourceFilter() {
-    return new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value).filter((value) => value !== 'delegation'));
+    return new Set(SESSION_SOURCE_OPTIONS.map(([value]) => value).filter((value) => value !== 'delegation' && value !== 'experiment'));
   }
 
   function loadSessionSourceFilter() {

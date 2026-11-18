@@ -11,7 +11,8 @@ DEFAULT_SESSION_TITLE = "New Session"
 
 
 class SessionSource(str, Enum):
-    # 会话来源（一级），与 session_id 前缀一一对应；详见 .harness/knowledge/05-key-patterns.md 模式十六
+    # 会话来源（一级），通常与 session_id 前缀对应；EXPERIMENT 沿用
+    # eval-experiment- 为显式例外。详见 .harness/knowledge/05-key-patterns.md 模式十六
     DASHBOARD = "dashboard"
     API = "api"
     CLI = "cli"
@@ -34,11 +35,22 @@ class SessionSource(str, Enum):
     # f"{delegation_id}/{member_id}")}`：从委派与成员确定性派生，跨 run 稳定、member
     # 重试复用同一 session。同 CURATOR/TASK，非 IM 平台，不进 im_platforms（模式十六）。
     DELEGATION = "delegation"
+    # Evaluation 实验业务执行来源（评估实验 target runner 分配的
+    # eval-experiment- 前缀会话，进程内/HTTP 两条路径）。非 IM 平台，
+    # 不进 im_platforms。模式十六显式例外：session_id 前缀沿用评估子域
+    # 既有 namespace 格式 eval-experiment-（evidence_targets 与删除传播
+    # 反向索引已消费该前缀，不可改名），非"前缀严格等于一级名"。
+    EXPERIMENT = "experiment"
 
     @classmethod
     def im_platforms(cls) -> set[str]:
         # IM 平台来源字符串集合，供 SQLite 迁移与边界判断复用
         return {cls.FEISHU.value, cls.DINGTALK.value, cls.WECOM.value}
+
+
+# 评估实验会话 session_id 前缀（模式十六显式例外，见 EXPERIMENT 注释）。
+# 评估子域 session_namespace 生成与来源派生、HTTP 入口分类、存量迁移共用。
+EXPERIMENT_SESSION_ID_PREFIX = "eval-experiment-"
 
 
 def utc_now() -> datetime:

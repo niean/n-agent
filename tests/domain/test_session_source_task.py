@@ -35,7 +35,7 @@ def test_session_source_task_enum_value():
     # 内部触发来源（schedule/curator/task/delegation）与 IM 平台同级
     members = list(SessionSource)
     assert SessionSource.TASK in members
-    assert len(members) == 11
+    assert len(members) == 12
 
 
 def test_session_source_task_not_in_im_platforms():

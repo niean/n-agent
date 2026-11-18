@@ -17,6 +17,7 @@ from app.application.policy_snapshot import IngressFacts
 from app.application.session_bootstrap import SessionBootstrapReader, SessionScopeMismatchError
 from app.domain.memory import MemoryStore
 from app.domain.policy import ExecutionMode
+from app.domain.session import EXPERIMENT_SESSION_ID_PREFIX, SessionSource
 from app.domain.provider import resolve_model
 from app.utils.content_utils import has_image_part, normalize_content
 
@@ -81,15 +82,22 @@ def create_openai_compatible_router(
     async def chat_completions(request: ChatCompletionRequest, x_session_id: str | None = Header(default=None)):
         # Resolve session_id from X-Session-ID header only (bearer selector).
         # metadata.session_id is intentionally NOT promoted to session selection.
+        # 入口权威来源分类：实验前缀 header -> experiment，其余 -> api；
+        # body metadata（含伪造 gateway.source/session_id）不参与来源判定。
+        expected_source = (
+            SessionSource.EXPERIMENT.value
+            if x_session_id and x_session_id.startswith(EXPERIMENT_SESSION_ID_PREFIX)
+            else SessionSource.API.value
+        )
         if x_session_id:
             descriptor = None
             if bootstrap_reader is not None:
                 try:
-                    descriptor = await bootstrap_reader.describe(x_session_id, expected_source="api")
+                    descriptor = await bootstrap_reader.describe(x_session_id, expected_source=expected_source)
                 except SessionScopeMismatchError:
                     return JSONResponse(
                         status_code=409,
-                        content={"error": {"code": "api_session_scope_mismatch", "message": "session scope mismatch: expected api"}},
+                        content={"error": {"code": "api_session_scope_mismatch", "message": f"session scope mismatch: expected {expected_source}"}},
                     )
             resolved_session_id = x_session_id
         else:
@@ -101,7 +109,7 @@ def create_openai_compatible_router(
         ingress = IngressFacts(
             run_id=str(uuid4()),
             session_id=resolved_session_id,
-            source="api",
+            source=expected_source,
             actor_id=None,
             execution_mode=ExecutionMode.REALTIME,
             trusted_claims={},

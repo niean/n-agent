@@ -2006,6 +2006,47 @@ class _MemoryEvidenceStore:
         return self._snapshots[snapshot_ref]
 
 
+def test_wiring_experiment_source_migration_precedes_services_ready(tmp_path: Path, monkeypatch):
+    """T5 启动装配回归：migrate_session_id_prefixes 在组合根装配期调用，
+    先于请求服务就绪（ApplicationServices 返回）。monkeypatch 受控构造，
+    不在宿主启动真实服务。"""
+    import app.infrastructure.memory.sqlite_store as sqlite_store_module
+
+    events: list[str] = []
+    original = sqlite_store_module.SQLiteMemoryStore.migrate_session_id_prefixes
+
+    def _recording(self):
+        events.append("migrate")
+        original(self)
+
+    monkeypatch.setattr(
+        sqlite_store_module.SQLiteMemoryStore,
+        "migrate_session_id_prefixes",
+        _recording,
+    )
+    services = build_application_services(_settings(tmp_path))
+    # 迁移在组合根装配期恰好执行一次，先于 ApplicationServices 返回
+    # （请求服务就绪）
+    assert events == ["migrate"]
+    assert services.memory_store is not None
+
+
+def test_wiring_experiment_source_migration_failure_fails_fast(tmp_path: Path, monkeypatch):
+    """T5 启动装配回归：迁移抛错 -> 组合根装配失败（fail-fast 启动）。"""
+    import app.infrastructure.memory.sqlite_store as sqlite_store_module
+
+    def _boom(self):
+        raise RuntimeError("experiment source migration failed")
+
+    monkeypatch.setattr(
+        sqlite_store_module.SQLiteMemoryStore,
+        "migrate_session_id_prefixes",
+        _boom,
+    )
+    with pytest.raises(RuntimeError, match="experiment source migration failed"):
+        build_application_services(_settings(tmp_path))
+
+
 async def test_worker_provider_supply_roundtrip_with_budget(tmp_path: Path):
     """T4 worker 集成：真实 dispatch + worker 跑 Provider 请求。
 
