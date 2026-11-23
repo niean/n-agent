@@ -923,6 +923,79 @@ def _parse_result_cursor(cursor: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# run-scores 分页游标（ns 绑定，与 results 游标互不通用）
+# ---------------------------------------------------------------------------
+
+_RUN_SCORES_CURSOR_NS = "run"
+_RUN_SCORES_FIXED_SCENE = "online"
+_RUN_SCORES_FIXED_TARGET_KIND = "agent_run"
+# run-scores 分页默认页大小（封顶复用 _RESULTS_PAGE_MAX_LIMIT）
+_RUN_SCORES_DEFAULT_LIMIT: int = 50
+
+
+def _run_scores_filter_fingerprint(filters: Mapping[str, Any]) -> str:
+    """run-scores 游标指纹：绑定命名空间与全部规范化过滤（含固定
+    scene/target_kind），与 results 游标互不通用。filters 须为
+    _results_filters 形状的完整规范化 dict。"""
+    payload = json.dumps(
+        {"ns": _RUN_SCORES_CURSOR_NS,
+         **{key: filters.get(key) for key in _RESULTS_FILTER_KEYS}},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _encode_run_scores_cursor(
+    fingerprint: str, snapshot_at: str,
+    created_at: str, service: str, run_id: str,
+) -> str:
+    """run-scores v2 游标：base64url(JSON(v/ns/fp/snap/cur 三元组边界))。
+
+    run-scores 游标始终绑定快照上界（snapshot_at 必为非空时区时间字符串，
+    解析端强制校验），与 results 游标允许 snap 为 null 的语义不同。
+    """
+    payload = {
+        "v": 2, "ns": _RUN_SCORES_CURSOR_NS, "fp": fingerprint,
+        "snap": snapshot_at,
+        "cur": [created_at, service, run_id],
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                     separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _parse_run_scores_cursor(cursor: str) -> dict[str, Any]:
+    """解析 run-scores 游标；结构/命名空间/边界形状不合均抛
+    EvaluationValidationError（不区分细节，统一 cursor_invalid 语义）。"""
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+        if not isinstance(raw, dict) or raw.get("v") != 2 \
+                or raw.get("ns") != _RUN_SCORES_CURSOR_NS:
+            raise ValueError("unsupported cursor version or namespace")
+        cur = raw.get("cur")
+        if (not isinstance(cur, list) or len(cur) != 3
+                or not all(isinstance(part, str) for part in cur)):
+            raise ValueError("boundary must be [created_at, service, run_id]")
+        snap = raw.get("snap")
+        fingerprint = raw.get("fp")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError("fingerprint missing")
+        if not isinstance(snap, str) or not snap.strip():
+            raise ValueError("snapshot_at must be a non-empty string")
+        if not all(part.strip() for part in cur):
+            raise ValueError("boundary fields must be non-empty")
+        for timestamp in (snap, cur[0]):
+            parsed_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed_time.utcoffset() is None:
+                raise ValueError("timezone required")
+    except Exception as exc:
+        raise EvaluationValidationError(
+            f"非法 run-scores 游标: {cursor!r}"
+        ) from exc
+    return {"fp": fingerprint, "snap": snap, "cur": cur}
+
+
+# ---------------------------------------------------------------------------
 # Store
 # ---------------------------------------------------------------------------
 
@@ -4103,6 +4176,100 @@ class SQLiteEvaluationStore:
         return {"items": rows, "next_cursor": next_cursor, "snapshot_at": snap,
                 "total_count": total, "total_pages": max(1, (total + limit - 1) // limit)}
 
+    async def query_run_scores_page_counted(
+        self, *, cursor: str | None = None,
+        limit: int = _RUN_SCORES_DEFAULT_LIMIT,
+        definition_id: str | None = None,
+        definition_version: str | None = None,
+        provenance: str | None = None,
+        status: str | None = None,
+        created_from: str | None = None,
+        created_to: str | None = None,
+    ) -> dict[str, Any]:
+        """run 粒度聚合分页（线上评估固定 scene/target_kind，不可覆盖）。
+
+        - 过滤复用结果列表完整过滤语义（current + 白名单过滤 + snap）；
+        - 按 (target_service, run_id) 分组，运行身份空（NULL/''）不进组；
+        - 计数与当前页同一连接同一读事务；LIMIT limit+1 探测后续组，
+          末组恰好页满且有后续组时才发 cursor（对齐既有 v2 语义）；
+        - 游标为 run-scores 专用 v2 token，fingerprint 绑定命名空间与
+          固定 scene/kind，过滤变更/跨端点 token 一律拒绝。
+        """
+        filters, limit = self._normalize_run_scores_page_inputs(
+            definition_id=definition_id,
+            definition_version=definition_version,
+            provenance=provenance,
+            status=status,
+            created_from=created_from,
+            created_to=created_to,
+            limit=limit,
+        )
+        totals: dict[str, int] = {}
+        items, next_cursor, snap = await asyncio.to_thread(
+            self._query_run_scores_page_sync, filters, cursor, limit, totals,
+        )
+        total = totals["total_count"]
+        return {"items": items, "next_cursor": next_cursor, "snapshot_at": snap,
+                "total_count": total,
+                "total_pages": max(1, (total + limit - 1) // limit)}
+
+    async def query_run_scores_page(
+        self, *, cursor: str | None = None,
+        limit: int = _RUN_SCORES_DEFAULT_LIMIT,
+        definition_id: str | None = None,
+        definition_version: str | None = None,
+        provenance: str | None = None,
+        status: str | None = None,
+        created_from: str | None = None,
+        created_to: str | None = None,
+    ) -> tuple[list[Mapping[str, Any]], str | None, str | None]:
+        """run 粒度聚合分页三元组入口（与 counted 同过滤/limit 规范化）。
+
+        返回 ``(items, next_cursor, snapshot_at)``；组与成员共享同一读
+        事务，其余语义与 ``query_run_scores_page_counted`` 一致。
+        """
+        filters, limit = self._normalize_run_scores_page_inputs(
+            definition_id=definition_id,
+            definition_version=definition_version,
+            provenance=provenance,
+            status=status,
+            created_from=created_from,
+            created_to=created_to,
+            limit=limit,
+        )
+        return await asyncio.to_thread(
+            self._query_run_scores_page_sync, filters, cursor, limit, None,
+        )
+
+    def _normalize_run_scores_page_inputs(
+        self, *, definition_id: str | None, definition_version: str | None,
+        provenance: str | None, status: str | None,
+        created_from: str | None, created_to: str | None, limit: int,
+    ) -> tuple[dict[str, Any], int]:
+        """run-scores 分页共用的 limit 校验/封顶与过滤规范化入口。"""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise EvaluationValidationError("limit 必须为正整数")
+        limit = min(limit, _RESULTS_PAGE_MAX_LIMIT)
+        # 完整规范化过滤 dict（形状对齐 _results_filters）：固定 scene/kind
+        # 写入 dict，其余 target_*/experiment_id 置 None —— 缺键会使
+        # _results_page_filter_conditions 直接 KeyError，且 scene 必须为
+        # "online" 才会生成 experiment 隔离条件
+        filters = self._results_filters(
+            target_service=None,
+            target_kind=_RUN_SCORES_FIXED_TARGET_KIND,
+            target_subject_id=None,
+            target_subject_revision=None,
+            definition_id=definition_id,
+            created_from=created_from,
+            created_to=created_to,
+            definition_version=definition_version,
+            experiment_id=None,
+            status=status,
+            provenance=provenance,
+            evaluation_scene=_RUN_SCORES_FIXED_SCENE,
+        )
+        return filters, limit
+
     @staticmethod
     def _results_filters(
         *,
@@ -4262,6 +4429,38 @@ class SQLiteEvaluationStore:
             params.extend(active_values)
         return where, params
 
+    @staticmethod
+    def _results_page_v2_conditions(
+        filters: Mapping[str, Any],
+    ) -> tuple[list[str], list[Any]]:
+        """游标 v2 完整过滤条件：基础过滤（status/experiment/definition_id/
+        target 四维/current）+ definition_version/provenance/created 区间。
+        结果列表与运行评分列表共用（单一权威）；不含快照上界与 keyset 边界。
+
+        definition_version 双侧匹配：automatic 经 jobs.definition_version，
+        human 经 feedback.definition_version。
+        """
+        where, params = SQLiteEvaluationStore._results_page_filter_conditions(
+            filters
+        )
+        if filters["definition_version"] is not None:
+            where.append(
+                "((r.job_id IS NOT NULL AND j.definition_version = ?) "
+                "OR (r.feedback_id IS NOT NULL "
+                "AND f.definition_version = ?))"
+            )
+            params.extend([filters["definition_version"]] * 2)
+        if filters["provenance"] is not None:
+            where.append("r.provenance = ?")
+            params.append(filters["provenance"])
+        if filters["created_from"] is not None:
+            where.append("r.created_at >= ?")
+            params.append(filters["created_from"])
+        if filters["created_to"] is not None:
+            where.append("r.created_at < ?")
+            params.append(filters["created_to"])
+        return where, params
+
     # Shared by sample identity visibility and all deletion propagation gates.
     _TOMBSTONE_MATCH_ON = (
         "t.subject_id = et.subject_id "
@@ -4349,25 +4548,7 @@ class SQLiteEvaluationStore:
         分页；游标记录本页最旧一行，下一页用 < 边界向更旧方向翻页。
         """
         limit = min(limit, _RESULTS_PAGE_MAX_LIMIT)
-        where, params = self._results_page_filter_conditions(filters)
-        if filters["definition_version"] is not None:
-            # 双侧匹配：automatic 经 jobs.definition_version，human 经
-            # feedback.definition_version
-            where.append(
-                "((r.job_id IS NOT NULL AND j.definition_version = ?) "
-                "OR (r.feedback_id IS NOT NULL "
-                "AND f.definition_version = ?))"
-            )
-            params.extend([filters["definition_version"]] * 2)
-        if filters["provenance"] is not None:
-            where.append("r.provenance = ?")
-            params.append(filters["provenance"])
-        if filters["created_from"] is not None:
-            where.append("r.created_at >= ?")
-            params.append(filters["created_from"])
-        if filters["created_to"] is not None:
-            where.append("r.created_at < ?")
-            params.append(filters["created_to"])
+        where, params = self._results_page_v2_conditions(filters)
         # 快照上界（半开）：绑定该次分页的 UTC 上界，后续页复用 token 内值
         where.append("r.created_at < ?")
         params.append(snap)
@@ -4396,6 +4577,132 @@ class SQLiteEvaluationStore:
                 fingerprint, snap, last["created_at"], last["result_id"]
             )
         return [self._row_to_result(row) for row in rows], next_cursor, snap
+
+    def _query_run_scores_page_sync(
+        self,
+        filters: Mapping[str, Any],
+        cursor: str | None,
+        limit: int,
+        totals: dict[str, int] | None = None,
+    ) -> tuple[list[Mapping[str, Any]], str | None, str | None]:
+        """run 粒度聚合分页（游标 v2）：过滤 + 快照上界 + (service, run)
+        分组 + keyset 边界；组、成员与计数（可选）同连接同读事务。"""
+        fingerprint = _run_scores_filter_fingerprint(filters)
+        # 空字符串 cursor 是显式非法游标：is not None 判断，不用 truthiness
+        parsed = _parse_run_scores_cursor(cursor) if cursor is not None else None
+        if parsed is not None and parsed["fp"] != fingerprint:
+            raise EvaluationValidationError(
+                "run-scores 游标与当前过滤条件不匹配（fingerprint 不一致），"
+                "请从首页重新分页"
+            )
+        # 首次 snap 仅在未携带游标时生成；翻页固定复用 token 内快照上界
+        snap = parsed["snap"] if parsed is not None else _iso()
+        where, params = self._results_page_v2_conditions(filters)
+        # 快照上界（半开）：晚于 snap 的结果（含翻页间追加）不进入本次分页
+        where.append("r.created_at < ?")
+        params.append(snap)
+        base_sql = (
+            "SELECT * FROM (" + self._RESULTS_PAGE_FROM_SQL
+            + " AND ".join(where) + ") "
+            "WHERE run_id IS NOT NULL AND run_id != '' "
+            "AND target_service IS NOT NULL AND target_service != ''"
+        )
+        grp_sql = (
+            "SELECT target_service, run_id, MAX(created_at) AS last_created_at, "
+            "COUNT(*) AS result_count FROM (" + base_sql + ") "
+            "GROUP BY target_service, run_id"
+        )
+        keyset_sql = (
+            "SELECT target_service, run_id, last_created_at, result_count "
+            "FROM (" + grp_sql + ") g "
+        )
+        # keyset 边界（row-value 元组，与 results v2 的
+        # "(r.created_at, r.result_id) < (?, ?)" 同一约定）：仅翻页时追加
+        keyset_params: list[Any] = [*params]
+        if parsed is not None:
+            created_at, service, run_id = parsed["cur"]
+            keyset_sql += (
+                "WHERE (g.last_created_at, g.target_service, g.run_id) "
+                "< (?, ?, ?) "
+            )
+            keyset_params.extend([created_at, service, run_id])
+        keyset_sql += (
+            "ORDER BY g.last_created_at DESC, g.target_service DESC, "
+            "g.run_id DESC LIMIT ?"
+        )
+        with self._connect() as conn:
+            # BEGIN 必须在 totals 判定之外：无论是否请求计数，分组、
+            # 成员查询共用同一读事务
+            conn.execute("BEGIN")
+            if totals is not None:
+                totals["total_count"] = conn.execute(
+                    "SELECT COUNT(*) FROM (" + grp_sql + ")", params,
+                ).fetchone()[0]
+            page_rows = conn.execute(
+                keyset_sql, [*keyset_params, limit + 1]
+            ).fetchall()
+            has_next = len(page_rows) > limit
+            if has_next:
+                page_rows = page_rows[:limit]
+            member_rows: list[sqlite3.Row] = []
+            if page_rows:
+                members_sql = (
+                    "SELECT target_service, run_id, session_id, result_id, "
+                    "metric_name, typed_value_json, passed, status, "
+                    "provenance, created_at FROM (" + base_sql + ") WHERE "
+                    + " OR ".join(
+                        "(target_service = ? AND run_id = ?)" for _ in page_rows
+                    )
+                    + " ORDER BY created_at DESC, result_id DESC"
+                )
+                member_params: list[Any] = []
+                for row in page_rows:
+                    member_params.extend([row["target_service"], row["run_id"]])
+                member_rows = conn.execute(
+                    members_sql, [*params, *member_params]
+                ).fetchall()
+        # Python 组装：保持 page_rows 组序；成员按 created_at/result_id 倒序
+        by_group: dict[tuple[str, str], dict[str, Any]] = {}
+        session_sets: dict[tuple[str, str], set[str]] = {}
+        for row in page_rows:
+            key = (row["target_service"], row["run_id"])
+            by_group[key] = {
+                "target_service": row["target_service"],
+                "run_id": row["run_id"],
+                "session_id": None,
+                "last_created_at": row["last_created_at"],
+                "result_count": row["result_count"],
+                "metrics": [],
+            }
+            session_sets[key] = set()
+        for row in member_rows:
+            key = (row["target_service"], row["run_id"])
+            by_group[key]["metrics"].append({
+                "result_id": row["result_id"],
+                "metric_name": row["metric_name"],
+                # 与 _row_to_result 同口径：typed_value JSON 反序列化、
+                # passed 归一为 bool/None
+                "typed_value": _json_loads(row["typed_value_json"], None),
+                "passed": None if row["passed"] is None else bool(row["passed"]),
+                "status": row["status"],
+                "provenance": row["provenance"],
+                "created_at": row["created_at"],
+            })
+            if row["session_id"]:
+                session_sets[key].add(row["session_id"])
+        # 会话归组：唯一非空 session_id 保留，冲突或全空为 None
+        for key, group in by_group.items():
+            sessions = session_sets[key]
+            if len(sessions) == 1:
+                group["session_id"] = next(iter(sessions))
+        next_cursor: str | None = None
+        if has_next:
+            last = page_rows[-1]
+            next_cursor = _encode_run_scores_cursor(
+                fingerprint, snap,
+                last["last_created_at"], last["target_service"], last["run_id"],
+            )
+        return list(by_group.values()), next_cursor, snap
 
     async def aggregate_metric_results(
         self,

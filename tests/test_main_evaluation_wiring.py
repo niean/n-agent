@@ -398,6 +398,66 @@ def test_enabled_review_service_and_management_routes(tmp_path: Path):
         assert disabled_client.get(path).status_code == 404
 
 
+def test_enabled_management_session_lookup_is_memory_store_get_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """spec-261124：生产组合根必须把 services.memory_store.get_session
+    注入为 evaluation 管理面路由的 session_lookup（路由层未注入时
+    session_feedback 503 拒绝，不允许静默跳过准入）。
+
+    - 捕获注册实参：session_lookup 是绑定在 SQLiteMemoryStore 实例上的
+      get_session 方法；
+    - 行为级验证：向该 memory_store 种入 cli 会话后，session_feedback
+      提交命中来源门禁 422 session_source_not_allowed（证明 lookup 实际
+      接线且 source 以服务端会话属性为准）。"""
+    import app.interfaces.http.evaluation_routes as evaluation_routes_module
+    from app.domain.session import ConversationSession
+    from app.infrastructure.memory.sqlite_store import SQLiteMemoryStore
+
+    captured: dict = {}
+    original = evaluation_routes_module.register_evaluation_management_routes
+
+    def spy(app_arg, **kwargs):
+        captured.update(kwargs)
+        return original(app_arg, **kwargs)
+
+    monkeypatch.setattr(
+        evaluation_routes_module,
+        "register_evaluation_management_routes",
+        spy,
+    )
+    settings = _settings(tmp_path, evaluation_enabled=True)
+    app = create_app(settings)
+    assert "session_lookup" in captured
+    lookup = captured["session_lookup"]
+    assert getattr(lookup, "__name__", "") == "get_session"
+    assert isinstance(getattr(lookup, "__self__", None), SQLiteMemoryStore)
+    assert lookup.__func__ is SQLiteMemoryStore.get_session
+
+    # 行为级验证：cli 会话不在默认白名单，提交被服务端来源门禁拒绝
+    store = lookup.__self__
+    asyncio.run(
+        store.create_session(
+            ConversationSession(id="sess-wire-1", source="cli")
+        )
+    )
+    client = TestClient(app)
+    with client:
+        resp = client.post("/chat/evaluations/feedback", json={
+            "target": {
+                "service": "n-agent",
+                "kind": "session_feedback",
+                "subject_id": "sess-wire-1",
+                "subject_revision": "v1",
+            },
+            "definition_id": "feedback.session_helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "session_source_not_allowed"
+
+
 def test_enabled_feedback_helpful_definition_registered_at_startup(tmp_path: Path):
     """C1（质量修复轮）：feedback.helpful 定义启动期注册接线。
 
@@ -436,6 +496,40 @@ def test_enabled_feedback_helpful_definition_registered_at_startup(tmp_path: Pat
     # 幂等重放：第二次启动不因同版本定义已存在而失败
     with TestClient(create_app(settings)):
         pass
+
+
+def test_enabled_session_feedback_definition_registered_at_startup(
+    tmp_path: Path,
+):
+    """会话人评定义（feedback.session_helpful@v1）启动期注册接线：
+    注册后 session_feedback 目标 submit_feedback 不再 404。"""
+    from app.application.evaluation_service import (
+        EvaluationTarget,
+        SubmitFeedbackRequest,
+    )
+
+    settings = _settings(tmp_path, evaluation_enabled=True)
+    app = create_app(settings)
+    with TestClient(app):
+        services = build_application_services(settings)
+        request = SubmitFeedbackRequest(
+            target=EvaluationTarget(
+                service="n-agent",
+                kind="session_feedback",
+                subject_id="sess-c1",
+                subject_revision="v1",
+                session_id="sess-c1",
+            ),
+            definition_id="feedback.session_helpful",
+            definition_version="v1",
+            value=True,
+        )
+        result = asyncio.run(
+            services.evaluation_ledger_service.submit_feedback(
+                "dashboard", request
+            )
+        )
+        assert result.revision == 1
 
 
 def test_enabled_producer_route_registered(tmp_path: Path):
@@ -1030,6 +1124,11 @@ def test_lifespan_evaluation_start_order(tmp_path: Path, monkeypatch):
     )
     monkeypatch.setattr(
         EvaluationService,
+        "register_session_feedback_helpful_definition",
+        _recorder("register.session_feedback_helpful"),
+    )
+    monkeypatch.setattr(
+        EvaluationService,
         "register_preset_definitions",
         _recorder("register.presets"),
     )
@@ -1072,6 +1171,7 @@ def test_lifespan_evaluation_start_order(tmp_path: Path, monkeypatch):
         "evaluation_worker.start",
         "deletion.start",
         "register.feedback_helpful",
+        "register.session_feedback_helpful",
         "register.presets",
         "usage.backfill",
         "capture.start",
@@ -1132,8 +1232,8 @@ def test_register_failure_skips_backfill_until_retry(tmp_path: Path, monkeypatch
 
 def test_startup_backfill_enables_automatic_definitions(tmp_path: Path):
     """T8（spec 4.3 回填时序，空库首次启动）：预设注册产生的 disabled
-    自动 usage 在本次一次性回填中启用；human（feedback.helpful）永不
-    启用；回填标记记录进 migrations 账本。"""
+    自动 usage 在本次一次性回填中启用；human（feedback.helpful、
+    feedback.session_helpful）永不启用；回填标记记录进 migrations 账本。"""
     import sqlite3
 
     settings = _settings(tmp_path, evaluation_enabled=True)
@@ -1142,13 +1242,15 @@ def test_startup_backfill_enables_automatic_definitions(tmp_path: Path):
     store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
     rows = asyncio.run(store.list_definitions_with_usage())
     assert rows, "启动注册应产生定义"
+    human_ids = set()
     for row in rows:
         if row["method"] == "human":
-            assert row["definition_id"] == "feedback.helpful"
+            human_ids.add(row["definition_id"])
             assert row["usage"]["online_enabled"] is False
         else:
             assert row["usage"] is not None
             assert row["usage"]["online_enabled"] is True
+    assert human_ids == {"feedback.helpful", "feedback.session_helpful"}
     conn = sqlite3.connect(tmp_path / "evaluations.db")
     try:
         marker = conn.execute(

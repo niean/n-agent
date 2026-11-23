@@ -5,6 +5,9 @@
   const modal = namespace.modal;
 
   let currentSessionId = null;
+  // 当前会话来源（spec-261124）：随会话详情载荷维护，供 Run 详情反馈区按
+  // 评估白名单显隐「会话反馈」组；切换/删除/新建会话时清空
+  let currentSessionSource = null;
   const SESSION_SOURCE_FILTER_STORAGE_KEY = 'nagent.chat.session-source-filter.v1';
   const SESSION_SOURCE_OPTIONS = [
     ['dashboard', 'Dashboard'],
@@ -169,6 +172,7 @@
       evictRunCachesForSession(sessionId);
       resetRunDetailPanel();
       currentSessionId = null;
+      currentSessionSource = null;
       renderArtifactPanel();
       renderedMessageVersion = null;
       setHeader(null);
@@ -2022,6 +2026,7 @@
       stopAutoRefresh();
       renderedMessageVersion = null;
       currentSessionId = null;
+      currentSessionSource = null;
       renderArtifactPanel();
       setHeader(null);
       showEmptyState();
@@ -2044,6 +2049,8 @@
     // T6: 切换会话即驱逐上一会话的 runs/详情快照，并清 Run 详情选中与占位
     if (currentSessionId && currentSessionId !== id) evictRunCachesForSession(currentSessionId);
     currentSessionId = id;
+    // 会话切换：清空来源，等待新会话详情载荷回填（切换瞬间来源未知不隐藏）
+    currentSessionSource = null;
     resetRunDetailPanel();
     renderArtifactPanel();
     draftExternalMemoryConfig = null;
@@ -2078,6 +2085,7 @@
     const id = 'dashboard-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
     await api.createSession(id);
     currentSessionId = id;
+    currentSessionSource = null;
     setHeader(id);
     renderArtifactPanel();
     if (draftExternalMemoryConfig?.modified === true) {
@@ -2272,6 +2280,14 @@
   // applyExternalMemoryState=false（轮询）：不周期覆盖用户正在操作的外部记忆选择。
   async function applySessionDetail(detail, options) {
     options = options || {};
+    // 会话来源（spec-261124）：调用方已完成归属校验，此处再以 session.id
+    // 复核后于渲染前应用，供 Run 详情反馈区按评估白名单显隐；字段缺失
+    // 视为来源未知（反馈组不隐藏，服务端兜底）
+    const detailSession = detail && detail.session;
+    if (detailSession && detailSession.id === currentSessionId) {
+      currentSessionSource = typeof detailSession.source === 'string'
+        ? detailSession.source : null;
+    }
     const el = ui.byId('chat-messages');
     const wasAtBottom = options.preserveScroll ? isAtScrollBottom() : false;
     const prevScrollTop = el ? el.scrollTop : 0;
@@ -3079,7 +3095,47 @@
   // 上报；request_key 幂等键防双击重复 revision（m4）。渲染
   // textContent-only，错误经 NAGENT.modal.alert（禁原生弹窗）。
   // Langfuse 会话 URL 单源引用 management-ui.js（m6），不复制字面量。
+  // 会话人评组（spec-261119）：definition feedback.session_helpful，
+  // target session_feedback/<sessionId>，服务端核验真实会话并派生
+  // session_id（P097），提交后进入线上评估-会话评分列表。
   const RUN_FEEDBACK_DEFINITION = 'feedback.helpful';
+  const SESSION_FEEDBACK_DEFINITION = 'feedback.session_helpful';
+
+  // 会话反馈准入（spec-261124）：按评估 C 类白名单显隐；配置未知
+  // 时不隐藏（服务端 422 兜底），并发渲染合并同一在途读取
+  let sessionAllowlistPromise = null;
+  function fetchSessionSourceAllowlist(evaluationApi) {
+    if (!sessionAllowlistPromise) {
+      sessionAllowlistPromise = Promise.resolve()
+        .then(() => evaluationApi.getConfig())
+        .then((data) => {
+          const raw = data && data.config
+            && data.config.evaluation_session_source_allowlist;
+          // 元素非字符串或含未知来源值的名单按读取失败处理（null）
+          return Array.isArray(raw) && raw.every((value) =>
+            typeof value === 'string' && SESSION_SOURCE_OPTIONS.some(([source]) => source === value))
+            ? raw.slice() : null;
+        })
+        .catch(() => null)
+        .then((value) => {
+          // 仅在途合并：settled 后无论成败都清除，成功结果不永久缓存，
+          // 每次重新打开详情重新校验（同页配置保存后重绘由此覆盖）
+          sessionAllowlistPromise = null;
+          return value;
+        });
+    }
+    return sessionAllowlistPromise;
+  }
+
+  function buildFeedbackGroup(labelText) {
+    const group = document.createElement('div');
+    group.className = 'run-detail__feedback-group';
+    const label = document.createElement('span');
+    label.className = 'run-detail__feedback-label';
+    label.textContent = labelText;
+    group.appendChild(label);
+    return group;
+  }
 
   function renderRunDetailFeedback(wrap, runId) {
     if (!runId || typeof runId !== 'string') return;
@@ -3106,61 +3162,124 @@
     }
     section.appendChild(header);
 
-    const statusEl = document.createElement('span');
-    statusEl.className = 'run-detail__feedback-status';
-    statusEl.textContent = '';
     let submitting = false;
 
-    async function submitFeedback(value, label) {
-      if (submitting) return;
-      submitting = true;
-      statusEl.textContent = '提交中...';
-      try {
-        const result = await evaluationApi.submitFeedback({
-          target: {
-            service: 'n-agent',
-            kind: 'agent_run',
-            subject_id: runId,
-            subject_revision: 'v1',
-          },
-          definition_id: RUN_FEEDBACK_DEFINITION,
-          definition_version: 'v1',
-          value: value,
-          // Mi9：幂等键带分钟级时间片——同一时间片内重复提交复用同 key
-          // （同 payload 复用，防双击重复 revision），跨时间片的再次反馈
-          // 产生新 key（永久 key 会让用户"改回另一侧"永远 409 冲突）；
-          // 双击主防线是 submitting 标志，时间片只是幂等兜底
-          request_key: 'run-feedback:' + runId + ':' + (value ? 'up' : 'down')
-            + ':' + Math.floor(Date.now() / 60000),
-        });
-        statusEl.textContent = '已反馈（' + label + '，revision ' + result.revision + '）';
-      } catch (err) {
-        statusEl.textContent = '';
-        const modal = global.NAGENT && global.NAGENT.modal;
-        if (modal && typeof modal.alert === 'function') {
-          modal.alert('反馈提交失败：' + (err && err.message ? err.message : '') + '（评估未启用或服务异常）');
+    const buildActionsRow = (group, definitionId, subjectId, kind, keyPrefix) => {
+      const statusEl = document.createElement('span');
+      statusEl.className = 'run-detail__feedback-status';
+      statusEl.textContent = '';
+
+      async function submitFeedback(value, label) {
+        if (submitting) return;
+        submitting = true;
+        statusEl.textContent = '提交中...';
+        try {
+          const result = await evaluationApi.submitFeedback({
+            target: {
+              service: 'n-agent',
+              kind: kind,
+              subject_id: subjectId,
+              subject_revision: 'v1',
+            },
+            definition_id: definitionId,
+            definition_version: 'v1',
+            value: value,
+            // Mi9：幂等键带分钟级时间片——同一时间片内重复提交复用同 key
+            // （同 payload 复用，防双击重复 revision），跨时间片的再次反馈
+            // 产生新 key（永久 key 会让用户"改回另一侧"永远 409 冲突）；
+            // 双击主防线是 submitting 标志，时间片只是幂等兜底
+            request_key: keyPrefix + ':' + subjectId + ':' + (value ? 'up' : 'down')
+              + ':' + Math.floor(Date.now() / 60000),
+          });
+          statusEl.textContent = '已反馈（' + label + '，revision ' + result.revision + '）';
+        } catch (err) {
+          statusEl.textContent = '';
+          const modal = global.NAGENT && global.NAGENT.modal;
+          if (modal && typeof modal.alert === 'function') {
+            modal.alert('反馈提交失败：' + (err && err.message ? err.message : '') + '（评估未启用或服务异常）');
+          }
+        } finally {
+          submitting = false;
         }
-      } finally {
-        submitting = false;
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'run-detail__feedback-actions';
+      const helpfulBtn = document.createElement('button');
+      helpfulBtn.type = 'button';
+      helpfulBtn.className = 'btn';
+      helpfulBtn.textContent = '有用';
+      helpfulBtn.addEventListener('click', () => submitFeedback(true, '有用'));
+      const unhelpfulBtn = document.createElement('button');
+      unhelpfulBtn.type = 'button';
+      unhelpfulBtn.className = 'btn';
+      unhelpfulBtn.textContent = '无用';
+      unhelpfulBtn.addEventListener('click', () => submitFeedback(false, '无用'));
+      actions.appendChild(helpfulBtn);
+      actions.appendChild(unhelpfulBtn);
+      actions.appendChild(statusEl);
+      group.appendChild(actions);
+      return group;
+    };
+
+    // 运行反馈：target agent_run/<runId>，definition feedback.helpful；
+    // 立即无条件构造，不等待配置读取
+    const runGroup = buildFeedbackGroup('运行反馈');
+    buildActionsRow(runGroup, RUN_FEEDBACK_DEFINITION, runId, 'agent_run', 'run-feedback');
+    section.appendChild(runGroup);
+
+    // 会话反馈（spec-261124）：target session_feedback/<sessionId>，definition
+    // feedback.session_helpful，按评估 C 类会话来源白名单异步显隐。同步契约
+    // 不变（本函数同步返回），会话组由内部异步刷新追加/替换。捕获本次
+    // sessionId/source/详情代次；异步返回时复核归属（会话、代次、选中 Run、
+    // 容器挂载），关闭再打开同 Run 的旧响应一律丢弃。配置未知（读取失败/
+    // 字段非法）或来源未知时不隐藏（服务端 422 兜底）；仅当白名单与来源
+    // 都明确且来源不在名单内时隐藏。
+    const detailSeq = runDetailRequestSeq;
+    const capturedSessionId = currentSessionId;
+    const capturedSource = currentSessionSource;
+    let sessionGroupEl = null;
+    const applySessionGroup = (allowlist) => {
+      if (currentSessionId !== capturedSessionId) return;
+      if (runDetailRequestSeq !== detailSeq) return;
+      if (!selectedRunDetail || selectedRunDetail.sessionId !== capturedSessionId
+        || selectedRunDetail.runId !== runId) return;
+      if (!wrap.parentNode || section.parentNode !== wrap) return;
+      if (!capturedSessionId) return;
+      const hide = Array.isArray(allowlist) && capturedSource != null
+        && allowlist.indexOf(capturedSource) === -1;
+      if (hide) {
+        if (sessionGroupEl && sessionGroupEl.parentNode === section) {
+          section.removeChild(sessionGroupEl);
+        }
+        sessionGroupEl = null;
+        return;
+      }
+      const group = buildFeedbackGroup('会话反馈');
+      buildActionsRow(group, SESSION_FEEDBACK_DEFINITION, capturedSessionId,
+        'session_feedback', 'session-feedback');
+      if (sessionGroupEl && sessionGroupEl.parentNode === section) {
+        section.replaceChild(group, sessionGroupEl);
+      } else {
+        section.appendChild(group);
+      }
+      sessionGroupEl = group;
+    };
+    if (typeof evaluationApi.getConfig === 'function') {
+      fetchSessionSourceAllowlist(evaluationApi)
+        .then((allowlist) => applySessionGroup(allowlist))
+        .catch(() => { /* 刷新异常保持现状，不中断详情渲染 */ });
+    } else {
+      // 无 getConfig 的旧调用环境：沿用旧行为，选中会话即渲染。
+      // 此分支同步执行时 wrap 尚未挂载，不能走 applySessionGroup 的
+      // 挂载校验，直接构造追加
+      if (capturedSessionId) {
+        const group = buildFeedbackGroup('会话反馈');
+        buildActionsRow(group, SESSION_FEEDBACK_DEFINITION, capturedSessionId,
+          'session_feedback', 'session-feedback');
+        section.appendChild(group);
       }
     }
-
-    const actions = document.createElement('div');
-    actions.className = 'run-detail__feedback-actions';
-    const helpfulBtn = document.createElement('button');
-    helpfulBtn.type = 'button';
-    helpfulBtn.className = 'btn';
-    helpfulBtn.textContent = '有用';
-    helpfulBtn.addEventListener('click', () => submitFeedback(true, '有用'));
-    const unhelpfulBtn = document.createElement('button');
-    unhelpfulBtn.type = 'button';
-    unhelpfulBtn.className = 'btn';
-    unhelpfulBtn.textContent = '无用';
-    unhelpfulBtn.addEventListener('click', () => submitFeedback(false, '无用'));
-    actions.appendChild(helpfulBtn);
-    actions.appendChild(unhelpfulBtn);
-    actions.appendChild(statusEl);
-    section.appendChild(actions);
     wrap.appendChild(section);
   }
 

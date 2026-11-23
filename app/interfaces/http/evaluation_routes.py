@@ -781,6 +781,7 @@ def register_evaluation_management_routes(
     review_service: Any,
     retention_days: int = 7,
     agent_run_lookup: Any = None,
+    session_lookup: Any = None,
     evaluation_admin_service: Any = None,
     evaluation_annotation_service: Any = None,
     evaluation_analytics_service: Any = None,
@@ -796,8 +797,12 @@ def register_evaluation_management_routes(
     错误映射契约：EvaluationValidationError / EvaluationConfigValidationError
     / DatasetManifestError -> 422；EvaluationNotFoundError -> 404；
     EvaluationConflictError / EvaluationRevisionConflictError /
-    EvaluationConfigConflictError -> 409（m1：管理面无容量判定，无
-    503 映射——503 仅 producer 入口容量拒绝语义）。
+    EvaluationConfigConflictError -> 409（m1：管理面无容量判定，无容量
+    类 503 映射——503 仅 session_lookup_unavailable：session_feedback
+    目标核验依赖未注入时返回，非容量拒绝语义）。
+    会话准入白名单（spec-261124）补充映射：session_lookup_unavailable ->
+    503；session_source_not_allowed -> 422（命中会话后 source 未准入
+    白名单）。
     Task 9（评估工作台）补充映射：UnsupportedCapabilityError ->
     422 unsupported_capability；EvaluationTargetDeletedError ->
     410 target_deleted；EvaluationTargetMissingError ->
@@ -809,6 +814,15 @@ def register_evaluation_management_routes(
     ``agent_run_lookup``：async (subject_id) -> Mapping | None，人评
     agent_run 目标的服务端核验（#15：目标必须对应真实 Run，None ->
     422 target_not_found）。未注入时跳过核验（组件未装配场景）。
+
+    ``session_lookup``：async (session_id) -> ConversationSession | None，
+    人评 session_feedback 目标的服务端核验（同 agent_run 语义：目标必须
+    对应真实会话，None -> 422 target_not_found；命中后服务端派生
+    session_id=subject_id，不信任客户端自报——P097）。命中后按会话类型
+    准入白名单（spec-261124）热读 config_service.current() 校验会话
+    source，未准入 -> 422 session_source_not_allowed。未注入时
+    session_feedback 返回 503 session_lookup_unavailable（组合根必须
+    注入，不静默跳过准入）；agent_run 不受影响。
 
     Task 9 新增注入（评估器/人工标注/分析路由，逐服务可选注册——
     组合根 gating 与管理面总闸一致）：
@@ -1094,6 +1108,61 @@ def register_evaluation_management_routes(
     async def get_experiment_results(request: Request) -> JSONResponse:
         return await _get_results(request, "experiment")
 
+    # run-scores 查询参数白名单：results 端点专有过滤（target_*/
+    # experiment_id/evaluation_scene/snapshot_at）与未知键一律拒绝，
+    # scene/target_kind 在 store 内固定，不作为入参暴露
+    _RUN_SCORES_PARAM_WHITELIST = (
+        "created_from", "created_to", "definition_id", "definition_version",
+        "provenance", "status", "cursor", "limit",
+    )
+
+    @app.get("/chat/evaluations/run-scores")
+    @_guarded
+    async def get_run_scores(request: Request) -> JSONResponse:
+        """run 粒度评分分页（线上评估固定 scene/target_kind）。
+
+        错误映射分阶段：白名单外参数/limit 非整数等普通参数错误始终
+        protocol_invalid；游标结构/指纹错误为 cursor_invalid（service
+        侧 EvaluationValidationError 在普通参数已验证后抛出：有 cursor
+        时按游标错误归类，无 cursor 仍为 protocol_invalid）。"""
+        params = dict(request.query_params)
+        unknown = set(params) - set(_RUN_SCORES_PARAM_WHITELIST)
+        if unknown:
+            return _err(
+                422, "protocol_invalid",
+                f"unknown parameters: {sorted(unknown)}",
+            )
+        limit, limit_err = _parse_limit(params)
+        if limit_err is not None:
+            return limit_err
+        # 正数校验与 store 冗余、刻意前置：limit 错误始终 protocol_invalid，
+        # 不因携带 cursor 在下方 catch 中被归类为游标错误（错误映射分阶段）
+        if limit < 1:
+            return _err(422, "protocol_invalid", "limit 必须为正整数")
+        cursor = params.get("cursor")
+        cursor_kind, cursor_err = _classify_run_scores_cursor(cursor)
+        if cursor_err is not None:
+            return cursor_err
+        try:
+            page = await evaluation_service.list_run_scores_page(
+                definition_id=params.get("definition_id"),
+                definition_version=params.get("definition_version"),
+                provenance=params.get("provenance"),
+                status=params.get("status"),
+                created_from=params.get("created_from"),
+                created_to=params.get("created_to"),
+                cursor=cursor,
+                limit=limit,
+            )
+        except EvaluationValidationError as exc:
+            return _err(
+                422,
+                "cursor_invalid" if cursor is not None else "protocol_invalid",
+                str(exc),
+            )
+        # run 行不含 explanation/raw JSON，无需投影裁剪
+        return _json_ok(page)
+
     @app.get("/chat/evaluations/results/{result_id}")
     @_guarded
     async def get_result_detail(result_id: str) -> JSONResponse:
@@ -1167,6 +1236,54 @@ def register_evaluation_management_routes(
             if session_id:
                 enriched["session_id"] = session_id
             target_body = enriched
+        elif target_kind == "session_feedback" and subject_id:
+            if session_lookup is None:
+                # 组合根必须注入 lookup（生产接线测试防遗漏）；兼容工厂
+                # 未注入时不得跳过准入继续写入
+                return _err(
+                    503,
+                    "session_lookup_unavailable",
+                    "session target verification unavailable",
+                )
+            # 会话人评目标核验（对齐 agent_run 分支语义与顺序：先 lookup
+            # 后 service 校验）：目标必须对应真实会话；命中后服务端派生
+            # session_id（P097：身份不信任客户端自报，声明不一致拒绝）。
+            try:
+                session = await session_lookup(subject_id)
+            except Exception:
+                logger.warning(
+                    "feedback session lookup failed", exc_info=True
+                )
+                session = None
+            if session is None:
+                return _err(
+                    422,
+                    "target_not_found",
+                    f"session not found: {subject_id}",
+                )
+            declared_session_service = str(target_body.get("service") or "")
+            if declared_session_service and declared_session_service != "n-agent":
+                return _err(
+                    422,
+                    "service_mismatch",
+                    "session_feedback target service must be 'n-agent': "
+                    f"{declared_session_service}",
+                )
+            enriched = dict(target_body)
+            enriched["service"] = "n-agent"
+            enriched["session_id"] = subject_id
+            target_body = enriched
+            # 会话类型准入（spec-261124）：请求时热读一次快照；
+            # source 以服务端 ConversationSession 属性为准，未知/缺失
+            # 按未准入处理，不信任客户端自报
+            allowlist = (await config_service.current()).evaluation_session_source_allowlist
+            session_source = getattr(session, "source", "")
+            if session_source not in allowlist:
+                return _err(
+                    422,
+                    "session_source_not_allowed",
+                    "该会话类型未开放评估",
+                )
         try:
             result = await evaluation_service.submit_feedback(
                 _MANAGEMENT_ACTOR,
@@ -1687,6 +1804,27 @@ def _classify_result_cursor(
     if isinstance(raw, dict) and set(raw.keys()) == {"c", "r"}:
         return "legacy", None
     return "", _err(422, "cursor_invalid", "results cursor is invalid")
+
+
+def _classify_run_scores_cursor(
+    cursor: str | None,
+) -> tuple[str, JSONResponse | None]:
+    """run-scores 游标分类：仅接受本端点 v2 token（ns=run）；legacy
+    两段式与 results v2 token 一律 422 cursor_invalid。
+
+    此处为快速失败的结构预检（版本/命名空间）；token 内 fp/snap/cur
+    的完整结构校验与过滤 fingerprint 绑定由 store 游标解析完成（与
+    ``_parse_run_scores_cursor`` 同一规则），完整结构错误经 service
+    透出后由端点统一归为 cursor_invalid。"""
+    if cursor is None:
+        return "", None
+    try:
+        raw = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+    except Exception:
+        return "", _err(422, "cursor_invalid", "run-scores cursor is invalid")
+    if isinstance(raw, dict) and raw.get("v") == 2 and raw.get("ns") == "run":
+        return "v2", None
+    return "", _err(422, "cursor_invalid", "run-scores cursor is invalid")
 
 
 def _json_ok(content: Mapping[str, Any]) -> JSONResponse:

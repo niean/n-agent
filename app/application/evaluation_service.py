@@ -278,6 +278,13 @@ class EvaluationLedgerStore(Protocol):
         legacy_compat: bool = False, **filters: Any,
     ) -> Mapping[str, Any]: ...
 
+    async def query_run_scores_page_counted(
+        self, *, cursor: str | None = None, limit: int = 50,
+        definition_id: str | None = None, definition_version: str | None = None,
+        provenance: str | None = None, status: str | None = None,
+        created_from: str | None = None, created_to: str | None = None,
+    ) -> Mapping[str, Any]: ...
+
     async def list_annotation_queue_page(
         self, *, state: str, reason: str, threshold: float = 0.5,
         limit: int = 50, cursor: str | None = None,
@@ -749,14 +756,15 @@ class EvaluationService:
 
     @staticmethod
     def helpful_definition_factory(
-        definition_id: str, version: str
+        definition_id: str, version: str, *, target_kind: str = "agent_run"
     ) -> EvaluatorDefinition:
-        """构造 human 方法定义 VO（feedback.helpful 及同形态定义复用）。"""
+        """构造 human 方法定义 VO（feedback.helpful 及同形态定义复用；
+        target_kind 区分运行人评与会话人评目标）。"""
         return EvaluatorDefinition(
             definition_id=definition_id,
             version=version,
             metric_name=definition_id,
-            target_kind="agent_run",
+            target_kind=target_kind,
             method="human",
             required_fields=(),
             evidence_policy="actor_submission",
@@ -779,6 +787,22 @@ class EvaluationService:
         """
         await self.register_definition(
             self.helpful_definition_factory("feedback.helpful", "v1")
+        )
+
+    async def register_session_feedback_helpful_definition(self) -> None:
+        """注册 ``feedback.session_helpful``（boolean 人评，目标是
+        Session）。
+
+        会话评分视图（/evaluations/session-scores，spec-261119）展示
+        target_kind=session_feedback 的结果；本定义是其唯一合法值来源
+        （human 方法不参与自动作业展开）。未反馈不计 false 口径与
+        feedback.helpful 一致。
+        """
+        await self.register_definition(
+            self.helpful_definition_factory(
+                "feedback.session_helpful", "v1",
+                target_kind="session_feedback",
+            )
         )
 
     # ------------------------------------------------------------------
@@ -1661,6 +1685,26 @@ class EvaluationService:
             page["next_cursor"] = _encode_result_cursor(*token.split("|", 1)) if token else None
             page.pop("snapshot_at", None)
         return page
+
+    async def list_run_scores_page(
+        self, *, definition_id: str | None = None,
+        definition_version: str | None = None, provenance: str | None = None,
+        status: str | None = None, created_from: str | None = None,
+        created_to: str | None = None, cursor: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """运行评分 run 粒度分页（管理面 GET /chat/evaluations/run-scores）。
+
+        scene=online 与 target_kind=agent_run 在 store 内固定，不作为
+        入参暴露，调用方不可覆盖；仅接受 run-scores 专用 v2 游标。
+        """
+        return dict(await self._store.query_run_scores_page_counted(
+            cursor=cursor, limit=limit,
+            definition_id=definition_id,
+            definition_version=definition_version,
+            provenance=provenance, status=status,
+            created_from=created_from, created_to=created_to,
+        ))
 
     async def get_result_detail(self, result_id: str) -> ResultDetail:
         """结果详情：result + job/attempts（automatic）+ feedback（human）

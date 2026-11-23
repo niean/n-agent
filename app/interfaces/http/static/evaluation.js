@@ -34,6 +34,36 @@
     passed: '通过',
   };
 
+  // 跳过原因中文标签（SkipReason 封闭枚举，domain/evaluation/state.py）；
+  // 未知值原样展示原始值，缺失显示"未记录"
+  const SKIP_REASON_LABELS = {
+    missing_reference: '缺少参考答案',
+    not_applicable: '指标不适用',
+    no_answer: '参考相关性标注中无相关项',
+    evidence_missing: '缺少可核实证据',
+    redacted_evidence: '证据已脱敏',
+    evidence_oversized: '证据超出大小上限',
+    budget_exhausted: '评估预算耗尽',
+    consistency: '一致性检查未通过',
+  };
+
+  // 作业失败分类中文标签（EVAL_ERROR_TYPES 封闭词汇，
+  // application/evaluation_telemetry.py）；未知值原样展示，缺失显示"未记录"
+  const JOB_ERROR_TYPE_LABELS = {
+    network: '网络错误',
+    rate_limit: '限流',
+    timeout: '超时',
+    format_error: '响应格式错误',
+    deadline_exceeded: '作业超期',
+    attempt_cap_exceeded: '尝试次数上限耗尽',
+    budget_exhausted: '预算耗尽',
+    auth: '认证失败',
+    conflict: '冲突',
+    judge_error: 'Judge 调用错误',
+    worker_error: 'worker 内部错误',
+    cancelled: '已取消',
+  };
+
   // Async guards: monotonic render token discards late responses; the
   // in-flight promise de-duplicates concurrent init/refresh calls.
   let renderToken = 0;
@@ -44,7 +74,8 @@
   // 防止旧响应覆盖新筛选、错误态或 Loading。deactivate 不重置，token 兜底。
   const viewRequestSeq = {
     overview: 0, datasets: 0, evaluators: 0, capabilities: 0, experiments: 0,
-    results: 0, review: 0, annotations: 0, judgeModel: 0,
+    results: 0, 'session-scores': 0, 'run-scores': 0,
+    review: 0, annotations: 0, judgeModel: 0,
   };
   // Judge 供给共享缓存（plan-261116 T6）：providers 为 Provider 注册表
   // 列表快照（模型页 GET /chat/providers 刷新），projection 为 GET
@@ -94,7 +125,8 @@
   function resetViewPaging(view) {
     if (view === 'evaluators') resetEvaluatorPaging();
     else if (view === 'annotations') resetAnnotationPaging();
-    else if (view === 'results' || view === 'experiment-results') {
+    else if (view === 'results' || view === 'experiment-results'
+      || view === 'session-scores' || view === 'run-scores') {
       resetResultsPaging();
       if (view === 'experiment-results') experimentResultExperiments = null;
     }
@@ -848,6 +880,61 @@
     return Number.isNaN(parsed) ? null : parsed;
   }
 
+  // 会话类型白名单复选框选项（顺序对齐 SessionSource 枚举，dashboard 在
+  // 首，与会话来源领域定义同源）。值集合与 chat.js SESSION_SOURCE_OPTIONS
+  // 一致；两文件模块独立禁止互引，有序值序列一致性由静态合同测试比对。
+  // 「评估配置」弹窗与概览页「修订配置」弹窗共用本数组。
+  const SESSION_EVAL_SOURCE_OPTIONS = [
+    ['dashboard', 'dashboard'], ['api', 'api'], ['cli', 'cli'],
+    ['feishu', 'feishu'], ['dingtalk', 'dingtalk'], ['wecom', 'wecom'],
+    ['acp', 'acp'], ['schedule', 'schedule'], ['curator', 'curator'],
+    ['task', 'task'], ['delegation', 'delegation'], ['experiment', 'experiment'],
+  ];
+
+  // 会话类型白名单解析：字段缺失（旧投影/无 DB 行前的桩数据）回落领域
+  // 默认（dashboard），与后端 EvaluationConfig.evaluation_session_source_
+  // allowlist 默认值一致；形状非法（非字符串数组）返回 null，由调用方
+  // 禁止保存。
+  function resolveSessionEvalAllowlist(raw) {
+    if (raw === undefined || raw === null) return ['dashboard'];
+    if (!Array.isArray(raw) || !raw.every((item) => typeof item === 'string')) {
+      return null;
+    }
+    return raw;
+  }
+
+  // 无序集合相等：勾选集与打开时快照比较用（后端会按枚举序归一输出，
+  // 顺序差异不算变更，避免无谓版本推进）
+  function sameStringValues(a, b) {
+    if (a.length !== b.length) return false;
+    const bSet = new Set(b);
+    return a.every((item) => bSet.has(item));
+  }
+
+  // 会话类型白名单复选框组：两列排布经内联 grid style（样式全部复用
+  // 共享类，不新增 CSS 文件）；标签文本复用 evaluations-filter__label
+  // （共享类显式声明字号 token，不依赖 body 继承）。
+  function buildSessionSourceCheckboxGroup(checkedValues) {
+    const group = el('div');
+    group.setAttribute('role', 'group');
+    group.setAttribute('aria-label', '会话类型白名单');
+    group.setAttribute('style',
+      'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px;row-gap:4px;');
+    const inputs = [];
+    SESSION_EVAL_SOURCE_OPTIONS.forEach(([value, label]) => {
+      const item = el('label');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.name = 'evaluation_session_source_allowlist';
+      input.value = value;
+      input.checked = checkedValues.includes(value);
+      item.append(input, el('span', 'evaluations-filter__label', label));
+      group.appendChild(item);
+      inputs.push(input);
+    });
+    return { group: group, inputs: inputs };
+  }
+
   function openConfigModal(resolved, onSaved) {
     const frame = buildFrame('修订评估配置（CAS）');
     const form = frame.form;
@@ -869,61 +956,99 @@
     fields.forEach(([key, label, current]) => {
       inputs[key] = inputRow(form, key, label, current);
     });
+    // 会话类型白名单复选框组（与 session-scores 视图「评估配置」弹窗共用
+    // SESSION_EVAL_SOURCE_OPTIONS）：勾选集与打开时 resolved 数组不一致才
+    // 把该字段混入 patch（清空时显式提交 []），数组直传、不经过
+    // parseConfigFieldValue。形状非法（非字符串数组）时契约返回 null：
+    // 与 session 弹窗同语义，渲染警示且不提供保存路径，禁止静默回落 []。
+    const baseAllowlist = resolveSessionEvalAllowlist(
+      base.evaluation_session_source_allowlist);
+    if (!baseAllowlist) {
+      form.appendChild(el('div', 'error-state', '配置数据形状非法，禁止保存'));
+      showBackdrop(frame.backdrop);
+      frame.closeBtn.addEventListener('click', () => closeBackdrop(frame.backdrop));
+      return;
+    }
+    const allowlistGroup = buildSessionSourceCheckboxGroup(baseAllowlist);
+    const allowlistRow = el('div', 'policy-item');
+    allowlistRow.appendChild(el('span', 'policy-k', '会话类型白名单：'));
+    allowlistRow.appendChild(allowlistGroup.group);
+    form.appendChild(allowlistRow);
     const errorLine = el('div', 'error-state');
     errorLine.hidden = true;
     form.appendChild(errorLine);
     formActions(form, '取消', '保存');
+    // 统一保存互斥锁（与会话评分「评估配置」弹窗同语义）：处理函数开始
+    // 先判断 saving，finally 恢复，不能只禁按钮却允许第二次 submit 事件
+    const configSaveBtn = form.querySelector('[type="submit"]');
+    configSaveBtn.disabled = false;
+    let configSaving = false;
     showBackdrop(frame.backdrop);
     frame.closeBtn.addEventListener('click', () => closeBackdrop(frame.backdrop));
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const patch = {};
-      let invalid = null;
-      // select 值恒为 'true'/'false'，变更时提交严格布尔
-      const enabledRaw = enabledControl.value;
-      if (enabledRaw !== String(!!base.evaluation_enabled)) {
-        patch.evaluation_enabled = normalizeBool(enabledRaw);
-      }
-      fields.forEach(([key]) => {
-        const raw = inputs[key].value.trim();
-        if (raw === '') return;
-        if (raw !== String(base[key])) {
-          const parsed = parseConfigFieldValue(key, raw);
-          if (parsed === null) {
-            invalid = invalid || {};
-            invalid[key] = raw;
-            return;
-          }
-          patch[key] = parsed;
-        }
-      });
-      if (invalid) {
-        errorLine.hidden = false;
-        errorLine.textContent = '数值字段格式无效：'
-          + Object.keys(invalid).join(', ') + '（需为有效数字）';
-        return;
-      }
-      if (Object.keys(patch).length === 0) {
-        closeBackdrop(frame.backdrop);
-        return;
-      }
+      if (configSaving) return;
+      configSaving = true;
+      configSaveBtn.disabled = true;
       try {
-        await api.evaluations.patchConfig({
-          patch: patch,
-          expected_version: resolved.version,
-        });
-        closeBackdrop(frame.backdrop);
-        alertMessage('评估配置已保存');
-        if (typeof onSaved === 'function') onSaved();
-      } catch (err) {
-        const code = err && err.message ? err.message : '';
-        if (code === 'conflict') {
-          errorLine.textContent = '配置已被他人修改（版本冲突），请关闭后重试';
-        } else {
-          errorLine.textContent = '保存失败：' + code;
+        const patch = {};
+        let invalid = null;
+        // select 值恒为 'true'/'false'，变更时提交严格布尔
+        const enabledRaw = enabledControl.value;
+        if (enabledRaw !== String(!!base.evaluation_enabled)) {
+          patch.evaluation_enabled = normalizeBool(enabledRaw);
         }
-        errorLine.hidden = false;
+        fields.forEach(([key]) => {
+          const raw = inputs[key].value.trim();
+          if (raw === '') return;
+          if (raw !== String(base[key])) {
+            const parsed = parseConfigFieldValue(key, raw);
+            if (parsed === null) {
+              invalid = invalid || {};
+              invalid[key] = raw;
+              return;
+            }
+            patch[key] = parsed;
+          }
+        });
+        // 白名单勾选集与打开时快照不一致才提交（数组直传，清空为 []）
+        const allowlistSelected = allowlistGroup.inputs
+          .filter((input) => input.checked)
+          .map((input) => input.value);
+        if (!sameStringValues(allowlistSelected, baseAllowlist)) {
+          patch.evaluation_session_source_allowlist = allowlistSelected;
+        }
+        if (invalid) {
+          errorLine.hidden = false;
+          errorLine.textContent = '数值字段格式无效：'
+            + Object.keys(invalid).join(', ') + '（需为有效数字）';
+          return;
+        }
+        if (Object.keys(patch).length === 0) {
+          closeBackdrop(frame.backdrop);
+          return;
+        }
+        try {
+          await api.evaluations.patchConfig({
+            patch: patch,
+            expected_version: resolved.version,
+          });
+          closeBackdrop(frame.backdrop);
+          alertMessage('评估配置已保存');
+          if (typeof onSaved === 'function') onSaved();
+        } catch (err) {
+          const code = err && err.message ? err.message : '';
+          if (code === 'conflict') {
+            errorLine.textContent = '配置已被他人修改（版本冲突），请关闭后重试';
+          } else {
+            errorLine.textContent = '保存失败：' + code;
+          }
+          errorLine.hidden = false;
+        }
+      } finally {
+        configSaving = false;
+        configSaveBtn.disabled = false;
       }
     });
   }
@@ -933,6 +1058,99 @@
     if (value === 'true') return true;
     if (value === 'false') return false;
     return value;
+  }
+
+  // 会话评分视图「评估配置」弹窗（spec-261119）：每次打开先 GET 最新
+  // resolved + version（CAS 快照），复选框勾选集取白名单数组；提交构造
+  // {patch: {evaluation_session_source_allowlist: 勾选数组}, expected_version}，
+  // 空名单显式提交 []（= 关闭会话评估），保存保持可用。与概览页修订配置
+  // 弹窗共用保存互斥锁语义：saving 期间重复 submit 直接忽略，409 后锁死
+  // 旧快照保存按钮（重新打开读取新版本后才允许提交），不自动重放。
+  async function openSessionEvalConfigModal(onSaved) {
+    const tokenAtOpen = renderToken;
+    const viewAtOpen = currentView;
+    let resolved;
+    try {
+      resolved = await api.evaluations.getConfig();
+    } catch (err) {
+      // GET 失败：提示且不渲染保存入口；切页后迟到的失败也不弹过期提示
+      if (tokenAtOpen === renderToken && viewAtOpen === currentView) {
+        alertMessage('评估配置加载失败：' + (err && err.message ? err.message : ''));
+      }
+      return;
+    }
+    // 打开期间切页/重渲染：过期响应不得弹出 Modal
+    if (tokenAtOpen !== renderToken || viewAtOpen !== currentView) return;
+    const config = (resolved && resolved.config) || {};
+    const version = resolved && typeof resolved.version === 'number'
+      && Number.isInteger(resolved.version) && resolved.version >= 0
+      ? resolved.version : null;
+    const baseAllowlist = resolveSessionEvalAllowlist(
+      config.evaluation_session_source_allowlist);
+    const frame = buildFrame('评估配置');
+    const form = frame.form;
+    const note = el('div', 'evaluations-note',
+      '勾选允许进入线上评估的会话类型；保存后立即生效。');
+    form.appendChild(note);
+    if (!baseAllowlist || version === null) {
+      // GET 成功但形状非法：展示警示、不渲染保存按钮，禁止保存
+      form.appendChild(el('div', 'error-state', '配置数据形状非法，禁止保存'));
+    } else {
+      const group = buildSessionSourceCheckboxGroup(baseAllowlist);
+      form.appendChild(group.group);
+      // 空名单警示：全空时显示，保存保持可用（空名单 = 关闭会话评估）
+      const warning = el('div', 'error-state', '空名单 = 关闭会话评估');
+      warning.hidden = baseAllowlist.length > 0;
+      group.inputs.forEach((input) => {
+        input.addEventListener('change', () => {
+          warning.hidden = group.inputs.some((item) => item.checked);
+        });
+      });
+      form.appendChild(warning);
+      const errorLine = el('div', 'error-state');
+      errorLine.hidden = true;
+      form.appendChild(errorLine);
+      formActions(form, '取消', '保存');
+      const saveBtn = form.querySelector('[type="submit"]');
+      saveBtn.disabled = false;
+      // 统一保存互斥锁：saving/冲突锁死期间重复 submit 事件直接忽略，
+      // 不能只禁按钮却允许第二次 submit
+      let saving = false;
+      let conflicted = false;
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (saving || conflicted) return;
+        const selected = group.inputs.filter((input) => input.checked)
+          .map((input) => input.value);
+        saving = true;
+        saveBtn.disabled = true;
+        try {
+          await api.evaluations.patchConfig({
+            patch: { evaluation_session_source_allowlist: selected },
+            expected_version: version,
+          });
+          // 保存期间切页/重渲染：不关旧弹窗、不弹提示、不重绘旧视图
+          if (tokenAtOpen !== renderToken || viewAtOpen !== currentView) return;
+          closeBackdrop(frame.backdrop);
+          alertMessage('评估配置已保存');
+          if (typeof onSaved === 'function') onSaved();
+        } catch (err) {
+          const code = err && err.message ? err.message : '';
+          if (code === 'conflict') {
+            conflicted = true;
+            errorLine.textContent = '配置已被他人修改，请关闭后重新打开核对';
+          } else {
+            errorLine.textContent = '保存失败：' + code;
+          }
+          errorLine.hidden = false;
+        } finally {
+          saving = false;
+          saveBtn.disabled = conflicted;
+        }
+      });
+    }
+    showBackdrop(frame.backdrop);
+    frame.closeBtn.addEventListener('click', () => closeBackdrop(frame.backdrop));
   }
 
   // ------------------------------------------------------------------
@@ -1608,6 +1826,98 @@
     return String(item.status || '-');
   }
 
+  // 详情可选字段安全文本化：字符串原样，对象/数组 JSON 化展示结构，
+  // 序列化失败降级，不抛错中断弹窗渲染（spec-261123）
+  function safeDetailText(value) {
+    try {
+      if (value === null || value === undefined) return '';
+      if (typeof value === 'string') return value;
+      if (typeof value === 'object') {
+        const serialized = JSON.stringify(value);
+        return typeof serialized === 'string' ? serialized : '无法展示';
+      }
+      return String(value);
+    } catch (_) { return '无法展示'; }
+  }
+
+  function isBlankDetailValue(value) {
+    return value === null || value === undefined
+      || (typeof value === 'string' && value.trim() === '');
+  }
+
+  // "结果"文字框多段文本（spec-261123）：各段以空行分隔，逐段按适用性
+  // 降级，不抛错。passed 用严格比较（不使用 truthiness）；attempt_count
+  // 是作业领取次数（领取时累加），不等同于 Judge 调用次数或重试次数，
+  // 禁止输出"已重试 N 次"。unknown 状态不映射四态。
+  function buildResultDetailText(result, job) {
+    const status = result.status;
+    const passed = result.passed;
+    let stateLabel;
+    let stateMeaning;
+    if (status === 'error') {
+      stateLabel = RESULT_STATE_LABELS.error;
+      stateMeaning = '本条结果未形成有效质量判定，可能来自执行异常或作业终止'
+        + '（不计入统计分母，单独计入异常）；不据此断言整个作业从未产生其它指标的判定';
+    } else if (status === 'skipped') {
+      stateLabel = RESULT_STATE_LABELS.skipped;
+      stateMeaning = '该指标对此样本未执行或不可评估，原因可来自评估器或调度'
+        + '预算等前置检查（不是 0 分也不是失败，统计分母不含它）';
+    } else if (status === 'value') {
+      if (passed === false) {
+        stateLabel = RESULT_STATE_LABELS.failed;
+        stateMeaning = '评估器产出了判定值，但未达到通过标准';
+      } else if (passed === true) {
+        stateLabel = RESULT_STATE_LABELS.passed;
+        stateMeaning = '评估器产出了判定值，质量判定通过';
+      } else {
+        stateLabel = '数值';
+        stateMeaning = '已产出判定值，未提供门禁判定，不推断通过或质量不通过';
+      }
+    } else {
+      stateLabel = isBlankDetailValue(status) ? '状态未知' : safeDetailText(status);
+      stateMeaning = '无法解释该结果状态，不映射为通过、跳过或失败';
+    }
+    const sections = [];
+    sections.push('状态：' + stateLabel + ' — ' + stateMeaning);
+    if (status === 'value') {
+      const gateText = passed === true ? '通过' : passed === false ? '不通过' : '无门禁判定';
+      const valueText = isBlankDetailValue(result.typed_value)
+        ? '-' : safeDetailText(result.typed_value);
+      sections.push('判定值：' + valueText + '；门禁判定：' + gateText);
+    }
+    if (!isBlankDetailValue(result.explanation)) {
+      sections.push('结果说明：' + safeDetailText(result.explanation));
+    }
+    if (status === 'skipped') {
+      const reason = result.skip_reason;
+      sections.push('跳过原因：' + (isBlankDetailValue(reason)
+        ? '未记录'
+        : (typeof reason === 'string' && Object.prototype.hasOwnProperty.call(SKIP_REASON_LABELS, reason)
+          ? reason + '（' + SKIP_REASON_LABELS[reason] + '）'
+          : safeDetailText(reason))));
+    }
+    if (status === 'error' && job) {
+      const errorType = job.error_type;
+      sections.push('失败分类：' + (isBlankDetailValue(errorType)
+        ? '未记录'
+        : (typeof errorType === 'string' && Object.prototype.hasOwnProperty.call(JOB_ERROR_TYPE_LABELS, errorType)
+          ? errorType + '（' + JOB_ERROR_TYPE_LABELS[errorType] + '）'
+          : safeDetailText(errorType))));
+    }
+    if (job) {
+      sections.push('作业状态：' + (isBlankDetailValue(job.status)
+        ? '未记录' : safeDetailText(job.status)));
+      const count = job.attempt_count;
+      sections.push('作业领取次数：'
+        + (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0
+          ? String(count) : '未记录'));
+    }
+    if (!isBlankDetailValue(result.evaluation_trace_id)) {
+      sections.push('评估 Trace：' + safeDetailText(result.evaluation_trace_id));
+    }
+    return sections.join('\n\n');
+  }
+
   // 结果筛选与游标分页状态（Task 13/spec 4.5）：跨渲染保留用户选择；
   // 游标 v2 是不透明 token，上一页用历史游标栈回退，过滤变更重置栈
   const defaultResultsFilters = () => ({
@@ -1618,9 +1928,19 @@
     provenance: '',
     status: '',
   });
+  // 专用视图固定 target_kind（spec-261119）：视图身份即类型，不计为用户
+  // 筛选；普通 results/experiment-results 不应用锁定
+  const LOCKED_RESULTS_TARGET_KIND = {
+    'session-scores': 'session_feedback',
+    'run-scores': 'agent_run',
+  };
   const resultFiltersByView = {
     results: defaultResultsFilters(),
     'experiment-results': { ...defaultResultsFilters(), experiment_id: '' },
+    'session-scores': { ...defaultResultsFilters(),
+      target_kind: LOCKED_RESULTS_TARGET_KIND['session-scores'] },
+    'run-scores': { ...defaultResultsFilters(),
+      target_kind: LOCKED_RESULTS_TARGET_KIND['run-scores'] },
   };
   let resultsFilters = resultFiltersByView.results;
   let experimentResultExperiments = null;
@@ -1644,8 +1964,23 @@
 
   async function renderResults(body, token) {
     body.textContent = '';
-    const seq = ++viewRequestSeq.results;
+    // 会话评分专用视图（spec-261119）按视图身份锁定 target_kind：
+    // seq 按视图独立递增，锁定类型在请求构造前强制覆盖，不依赖筛选状态。
+    // run-scores 已切换独立端点 renderRunScores（plan-261124 T7），不再
+    // 进入本函数。
+    const viewAtStart = currentView;
+    const seqKey = viewAtStart === 'session-scores' ? viewAtStart : 'results';
+    const seq = ++viewRequestSeq[seqKey];
+    const lockedKind = LOCKED_RESULTS_TARGET_KIND[viewAtStart] || '';
     const experimentView = currentView === 'experiment-results';
+    // 会话评分视图头部操作区挂「评估配置」入口（spec-261119）：renderResults
+    // 为 results/experiment-results/session-scores 共享 renderer，按钮只在
+    // session-scores 出现；先清空再追加，防筛选重绘重复叠加。
+    if (viewAtStart === 'session-scores' && body.evaluationsHeaderActions) {
+      body.evaluationsHeaderActions.textContent = '';
+      body.evaluationsHeaderActions.appendChild(actionButton('评估配置', () =>
+        openSessionEvalConfigModal(() => renderResults(body, renderToken))));
+    }
     const wrap = el('div', 'evaluations-results');
     body.appendChild(wrap);
 
@@ -1655,11 +1990,11 @@
       try {
         experimentData = await api.evaluations.listExperiments();
       } catch (err) {
-        if (token !== renderToken || seq !== viewRequestSeq.results) return;
+        if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
         renderErrorState(wrap, '实验列表加载失败：' + err.message, () => renderResults(body, renderToken));
         return;
       }
-      if (token !== renderToken || seq !== viewRequestSeq.results) return;
+      if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
       experimentResultExperiments = experimentData.items || [];
       wrap.textContent = '';
     }
@@ -1691,12 +2026,15 @@
     defIdInput.value = resultsFilters.definition_id;
     defIdInput.placeholder = 'DefinitionKey（如 kb.recall_at_5）';
     bindResultsFilter(defIdInput, 'definition_id', true);
-    const kindSelect = selectControl('results_target_kind', [
+    // 目标类型下拉仅在非锁定视图渲染；锁定视图的类型即视图身份，不提供
+    // 切换入口（spec-261119）。评分明细下拉补全 session_feedback。
+    const kindSelect = lockedKind ? null : selectControl('results_target_kind', [
       ['', '全部目标'],
       ['agent_run', 'agent_run'],
       ['retrieval', 'retrieval'],
+      ['session_feedback', 'session_feedback'],
     ], resultsFilters.target_kind);
-    bindResultsFilter(kindSelect, 'target_kind', false);
+    if (kindSelect) bindResultsFilter(kindSelect, 'target_kind', false);
     const provenanceSelect = selectControl('results_provenance', [
       ['', '全部来源'],
       ['automatic', 'automatic'],
@@ -1713,7 +2051,9 @@
     filterRow.append(
       filterItem('开始时间', createdFromInput, 'ISO 8601 UTC，如 2026-11-05T00:00:00Z'),
       filterItem('结束时间', createdToInput, 'ISO 8601 UTC，不含该时刻'),
-      filterItem('目标类型', kindSelect),
+    );
+    if (kindSelect) filterRow.append(filterItem('目标类型', kindSelect));
+    filterRow.append(
       filterItem('DefinitionKey', defIdInput, '指标键，如 kb.recall_at_5'),
       filterItem('来源', provenanceSelect),
       filterItem('状态', statusSelect),
@@ -1736,6 +2076,8 @@
     showLoading(dataBody, '评估结果加载中...');
 
     const params = resultsQueryParams();
+    // 锁定视图以映射覆盖请求类型：筛选状态被意外改写也不影响请求目标
+    if (lockedKind) params.target_kind = lockedKind;
     const hadCursor = !!params.cursor;
     let data;
     try {
@@ -1743,7 +2085,7 @@
         ? api.evaluations.listExperimentResults(params)
         : api.evaluations.listResults(params));
     } catch (err) {
-      if (token !== renderToken || seq !== viewRequestSeq.results) return;
+      if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
       dataBody.textContent = '';
       const code = err && err.message ? err.message : '';
       if (hadCursor && (code === 'cursor_invalid' || code === 'protocol_invalid')) {
@@ -1760,7 +2102,7 @@
       renderErrorState(dataBody, '结果加载失败：' + code, () => renderResults(body, renderToken));
       return;
     }
-    if (token !== renderToken || seq !== viewRequestSeq.results) return;
+    if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
     dataBody.textContent = '';
     const items = Array.isArray(data.items) ? data.items : [];
     // 游标分页（spec 4.5）：上一页走历史游标栈回退，下一页携带响应
@@ -1785,12 +2127,20 @@
       },
     });
     if (!items.length) {
-      // 空态三分支：空分页优先（保留上一页入口），其次按有无筛选给下一步
+      // 空态分支：空分页优先（保留上一页入口），其次按有无"用户筛选"给
+      // 下一步；锁定视图的固定 target_kind 是视图身份不计入用户筛选，
+      // 空数据给出类型语义提示（spec-261119）
+      const userFilterKeys = Object.keys(resultsFilters)
+        .filter((key) => !(lockedKind && key === 'target_kind'));
+      const hasUserFilter = userFilterKeys.some((key) => resultsFilters[key]);
       if (resultsPageIndex > 0) {
         dataBody.appendChild(el('div', 'empty-state', '当前分页无结果，请返回上一页'));
-      } else if (Object.values(resultsFilters).some(Boolean)) {
+      } else if (hasUserFilter) {
         dataBody.appendChild(el('div', 'empty-state',
           '暂无评估结果，可调整或清空筛选条件后重试。'));
+      } else if (lockedKind === 'session_feedback') {
+        dataBody.appendChild(el('div', 'empty-state',
+          '暂无会话评分，会话人评提交后将展示在此处。'));
       } else {
         dataBody.appendChild(el('div', 'empty-state',
           '暂无评估结果，评估作业完成后结果将展示在此处。'));
@@ -1799,6 +2149,9 @@
       return;
     }
     const sessionTitles = await loadSessionTitles();
+    // loadSessionTitles 跨模块缓存 Promise，解析晚于切换/重渲染时旧渲染
+    // 不得把旧 items 追加回 DOM（与列表响应同等的过期防护）
+    if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
     const rows = items.map((item) => [
       resultSessionCell(item, sessionTitles),
       resultExperimentCell(item.experiment_id),
@@ -1857,12 +2210,233 @@
     return link;
   }
 
+  // ------------------------------------------------------------------
+  // 运行评分视图（plan-261124 T7）：run 粒度独立端点 /chat/evaluations/
+  // run-scores。与 renderResults 同构（筛选/游标分页/过期防护/空态），
+  // 差异：无目标类型下拉（类型即视图身份）、八项白名单请求参数、5 列
+  // 表格 + run 级详情弹窗（复用列表已加载 sessionTitles，零额外请求）。
+  // ------------------------------------------------------------------
+
+  // run-scores 请求/空态判定白名单：不含 target_kind（端点固定 run 粒度，
+  // 锁定类型不得外发）；definition_version 预留给后续版本筛选。
+  const RUN_SCORES_FILTER_KEYS = [
+    'definition_id', 'definition_version', 'provenance', 'status',
+    'created_from', 'created_to',
+  ];
+
+  async function renderRunScores(body, token) {
+    body.textContent = '';
+    const seqKey = 'run-scores';
+    const seq = ++viewRequestSeq[seqKey];
+    const wrap = el('div', 'evaluations-results');
+    body.appendChild(wrap);
+    // 持久筛选对象清除锁定字段：resultFiltersByView 初始化播种时保留
+    // LOCKED_RESULTS_TARGET_KIND['run-scores']（锁定口径占位），本视图随后
+    // 剥离该字段——请求与 hasUserFilter 均不把 target_kind 当作筛选键。
+    const filters = resultFiltersByView['run-scores'];
+    delete filters.target_kind;
+
+    // 筛选区：时间范围/DefinitionKey/来源/状态（无目标类型下拉，与
+    // renderResults 锁定分支一致）；变更任一过滤重置游标栈并重渲染。
+    const filterRow = filterBar();
+    const bindRunFilter = (control, key, trim) => {
+      control.addEventListener('change', () => {
+        const raw = String(control.value || '');
+        filters[key] = trim ? raw.trim() : raw;
+        resetResultsPaging();
+        renderRunScores(body, renderToken);
+      });
+    };
+    const createdFromInput = document.createElement('input');
+    createdFromInput.name = 'results_created_from';
+    createdFromInput.value = filters.created_from;
+    createdFromInput.placeholder = '开始时间（ISO，如 2026-11-05T00:00:00Z）';
+    bindRunFilter(createdFromInput, 'created_from', true);
+    const createdToInput = document.createElement('input');
+    createdToInput.name = 'results_created_to';
+    createdToInput.value = filters.created_to;
+    createdToInput.placeholder = '结束时间（ISO，不含该时刻）';
+    bindRunFilter(createdToInput, 'created_to', true);
+    const defIdInput = document.createElement('input');
+    defIdInput.name = 'results_definition_id';
+    defIdInput.value = filters.definition_id;
+    defIdInput.placeholder = 'DefinitionKey（如 kb.recall_at_5）';
+    bindRunFilter(defIdInput, 'definition_id', true);
+    const provenanceSelect = selectControl('results_provenance', [
+      ['', '全部来源'],
+      ['automatic', 'automatic'],
+      ['human', 'human'],
+    ], filters.provenance);
+    bindRunFilter(provenanceSelect, 'provenance', false);
+    const statusSelect = selectControl('results_status', [
+      ['', '全部状态'],
+      ['value', '有值'],
+      ['error', '评估失败'],
+      ['skipped', '跳过'],
+    ], filters.status);
+    bindRunFilter(statusSelect, 'status', false);
+    filterRow.append(
+      filterItem('开始时间', createdFromInput, 'ISO 8601 UTC，如 2026-11-05T00:00:00Z'),
+      filterItem('结束时间', createdToInput, 'ISO 8601 UTC，不含该时刻'),
+      filterItem('DefinitionKey', defIdInput, '指标键，如 kb.recall_at_5'),
+      filterItem('来源', provenanceSelect),
+      filterItem('状态', statusSelect),
+    );
+    wrap.appendChild(filterRow);
+    // 数据容器独立于筛选区：Loading/错误/空态/重试只清 dataBody，
+    // 不删除筛选控件与当前查询条件。
+    const dataBody = el('div', 'evaluations-data-body');
+    wrap.appendChild(dataBody);
+    showLoading(dataBody, '评估结果加载中...');
+
+    // 请求参数：八项白名单逐个构造（limit/cursor + 筛选键），不透传
+    // target_* 或 experiment_id（run-scores 端点固定类型）
+    const params = { limit: LIST_PAGE_SIZE };
+    const cursor = resultsCursorStack[resultsPageIndex];
+    if (cursor) params.cursor = cursor;
+    RUN_SCORES_FILTER_KEYS.forEach((key) => {
+      if (filters[key]) params[key] = filters[key];
+    });
+    const hadCursor = !!params.cursor;
+    let data;
+    try {
+      data = await api.evaluations.listRunScores(params);
+    } catch (err) {
+      if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
+      dataBody.textContent = '';
+      const code = err && err.message ? err.message : '';
+      if (hadCursor && (code === 'cursor_invalid' || code === 'protocol_invalid')) {
+        // 游标 v2 绑定过滤与查询快照上界：过滤不匹配/游标非法时提示
+        // 失效并提供重新查询入口（重置游标、保留过滤），不静默重试
+        dataBody.appendChild(el('div', 'error-state',
+          '游标已失效（过滤条件或查询快照不匹配），请重新查询'));
+        dataBody.appendChild(actionButton('重新查询', () => {
+          resetResultsPaging();
+          renderRunScores(body, renderToken);
+        }));
+        return;
+      }
+      renderErrorState(dataBody, '结果加载失败：' + code, () => renderRunScores(body, renderToken));
+      return;
+    }
+    if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
+    dataBody.textContent = '';
+    const items = Array.isArray(data.items) ? data.items : [];
+    // 游标分页：上一页走历史游标栈回退，下一页携带响应 next_cursor 入栈；
+    // pager 先于空态构建，第 2+ 页返回空 items 时仍保留"上一页"入口。
+    const nextCursor = data.next_cursor ? String(data.next_cursor) : '';
+    const pagerRow = pagerBar({
+      pageIndex: resultsPageIndex,
+      totalPages: data.total_pages,
+      hasPrev: resultsPageIndex > 0,
+      hasNext: !!nextCursor,
+      onPrev: () => {
+        resultsPageIndex -= 1;
+        return renderRunScores(body, renderToken);
+      },
+      onNext: () => {
+        resultsCursorStack = resultsCursorStack.slice(0, resultsPageIndex + 1);
+        resultsCursorStack.push(nextCursor);
+        resultsPageIndex += 1;
+        return renderRunScores(body, renderToken);
+      },
+    });
+    if (!items.length) {
+      // 空态分支：空分页优先（保留上一页入口），其次按有无"用户筛选"
+      // 给下一步；target_kind 已从筛选对象清除，锁定类型不计入用户筛选
+      const hasUserFilter = RUN_SCORES_FILTER_KEYS.some((key) => filters[key]);
+      if (resultsPageIndex > 0) {
+        dataBody.appendChild(el('div', 'empty-state', '当前分页无结果，请返回上一页'));
+      } else if (hasUserFilter) {
+        dataBody.appendChild(el('div', 'empty-state',
+          '暂无评估结果，可调整或清空筛选条件后重试。'));
+      } else {
+        dataBody.appendChild(el('div', 'empty-state',
+          '暂无运行评分，运行人评提交后将展示在此处。'));
+      }
+      dataBody.appendChild(pagerRow);
+      return;
+    }
+    const sessionTitles = await loadSessionTitles();
+    // loadSessionTitles 跨模块缓存 Promise，解析晚于切换/重渲染时旧渲染
+    // 不得把旧 items 追加回 DOM（与列表响应同等的过期防护）
+    if (token !== renderToken || seq !== viewRequestSeq[seqKey]) return;
+    const rows = items.map((item) => [
+      resultSessionCell({ session_id: item.session_id, target_service: item.target_service }, sessionTitles),
+      item.run_id,
+      runScoreCell(item.metrics),
+      formatTime(item.last_created_at),
+      actionButton('详情', () => openRunModal(item, sessionTitles)),
+    ]);
+    dataBody.appendChild(scrollTable(table(
+      ['来源会话', 'AgentRun', '评分', '最近时间', '操作'], rows)));
+    dataBody.appendChild(pagerRow);
+  }
+
+  // 评分值文本化：undefined/null 显示 '-'，对象 JSON 文本，0/false 原样
+  // 字符串化（textContent 渲染，载荷不注入节点）
+  function runScoreValue(value) {
+    if (value === undefined || value === null) return '-';
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+  }
+
+  // 评分列：同 run 多指标逐行展示 指标名=值 + 状态徽标（passed 三态判定
+  // 复用 resultState 的 Mi-#19 口径）
+  function runScoreCell(metrics) {
+    const cell = el('div', 'evaluations-run-score-cell');
+    (Array.isArray(metrics) ? metrics : []).forEach((m) => {
+      const line = el('div', 'evaluations-run-score-line');
+      const label = el('span', 'evaluations-run-score-metric');
+      label.textContent = m.metric_name + '=' + runScoreValue(m.typed_value);
+      line.appendChild(label);
+      line.appendChild(statusBadge(resultState(m)));
+      cell.appendChild(line);
+    });
+    return cell;
+  }
+
+  // run 级详情弹窗：仅消费列表项已加载数据，复用列表 sessionTitles，
+  // 打开零额外请求；全部字段经 textContent/字符串参数渲染
+  function openRunModal(item, sessionTitles) {
+    const frame = buildFrame('运行详情');
+    const kv = el('div', 'policy-list');
+    kv.appendChild(kvRow('服务', item.target_service || '-'));
+    kv.appendChild(kvRow('Run ID', item.run_id));
+    kv.appendChild(kvRow('来源会话', resultSessionCell(
+      { session_id: item.session_id, target_service: item.target_service },
+      sessionTitles)));
+    frame.form.appendChild(kv);
+    frame.form.appendChild(el('div', 'evaluations-note',
+      '当前筛选下的评分结果（非该运行全量历史）。'));
+    frame.form.appendChild(scrollTable(table(
+      ['指标', '值', '状态', '评分来源', '时间'],
+      (Array.isArray(item.metrics) ? item.metrics : []).map((m) => [
+        m.metric_name,
+        runScoreValue(m.typed_value),
+        statusBadge(resultState(m)),
+        m.provenance,
+        formatTime(m.created_at),
+      ]),
+    )));
+    const actions = el('div', 'providers-form__actions');
+    actions.appendChild(actionButton('关闭', () => closeBackdrop(frame.backdrop)));
+    frame.form.appendChild(actions);
+    mountDetailModal(frame);
+  }
+
   async function openResultModal(resultId) {
     let detail;
     try {
       detail = await api.evaluations.getResult(resultId);
     } catch (err) {
       alertMessage('结果详情加载失败：' + (err && err.message ? err.message : ''));
+      return;
+    }
+    if (!detail || typeof detail !== 'object' || !detail.result
+      || Array.isArray(detail) || typeof detail.result !== 'object'
+      || Array.isArray(detail.result)) {
+      alertMessage('结果详情加载失败：非法响应');
       return;
     }
     const frame = buildFrame('评分详情');
@@ -1885,6 +2459,14 @@
     kv.appendChild(kvRow('证据快照 hash', evidence.snapshot_hash || '-'));
     kv.appendChild(kvRow('捕获时间', formatTime(evidence.captured_at)));
     form.appendChild(kv);
+
+    // spec-261123："结果"文字框：状态含义/判定值/结果说明/跳过原因/
+    // 失败分类/作业状态/领取次数/评估 Trace，段间空行，textContent 安全渲染
+    form.appendChild(blockTitle('结果',
+      '状态含义/判定值/结果说明/跳过原因/失败分类/作业状态与领取次数，来自评估器与作业账本'));
+    const resultDetailBox = el('pre', 'evaluations-result-detail');
+    resultDetailBox.textContent = buildResultDetailText(result, detail.job);
+    form.appendChild(resultDetailBox);
 
     const deliveries = detail.deliveries || [];
     if (deliveries.length) {
@@ -3623,6 +4205,13 @@
   // 生命周期
   // ------------------------------------------------------------------
 
+  // 评分明细族共享状态口径 hover tips：results 与会话/运行评分专用视图
+  // 同文案（专用视图定义在 results 之前，提取常量避免重复字面量）
+  const resultsShellTip = '质量不通过/通过来自 boolean 或阈值判定\n'
+    + '评估失败/跳过为执行态\n'
+    + '投递等待与未关联在详情中展示\n'
+    + 'unlinked 为目标无真实身份，不创建悬空 Score';
+
   const views = {
     // bareShell：概览页不套"概览"标题外壳面板（与顶导标签重复的多余
     // 一层），内容直达；其余视图维持标题外壳。
@@ -3634,11 +4223,13 @@
     executions: { title: '执行任务', render: renderExecutions },
     experiments: { title: '实验汇总', render: renderExperiments },
     'experiment-results': { title: '评分明细', render: renderResults },
-    results: { title: '评分明细', render: renderResults,
-      shellTip: '质量不通过/通过来自 boolean 或阈值判定\n'
-        + '评估失败/跳过为执行态\n'
-        + '投递等待与未关联在详情中展示\n'
-        + 'unlinked 为目标无真实身份，不创建悬空 Score' },
+    'session-scores': { title: '会话评分', render: renderResults, shellTip: resultsShellTip },
+    // run-scores 切换 run 粒度独立端点（plan-261124 T7）：不再走 renderResults
+    // 锁定分支；LOCKED_RESULTS_TARGET_KIND 保留 'run-scores' 条目仅作锁定
+    // 口径占位，供 resultFiltersByView 初始化播种筛选对象（renderRunScores
+    // 随后剥离其中锁定字段），视图身份/空态不读取该映射
+    'run-scores': { title: '运行评分', render: renderRunScores, shellTip: resultsShellTip },
+    results: { title: '评分明细', render: renderResults, shellTip: resultsShellTip },
     annotations: { title: '人工标注', render: renderAnnotations },
     review: { title: '待复核', render: renderReviewQueue },
   };
@@ -3690,6 +4281,11 @@
     if (view !== currentView) deactivate();
     if (resultFiltersByView[view]) {
       resultsFilters = resultFiltersByView[view];
+      // 锁定视图重进时强制回写固定类型，防止外部改写筛选状态；
+      // run-scores 已切换 run 粒度独立端点（plan-261124 T7）：端点固定
+      // 类型，target_kind 不进入请求参数，持久筛选对象保持无锁定字段
+      const lockedKind = LOCKED_RESULTS_TARGET_KIND[view];
+      if (lockedKind && view !== 'run-scores') resultsFilters.target_kind = lockedKind;
       if (view !== currentView && view === 'experiment-results' && global.location && global.URLSearchParams) {
         const query = new global.URLSearchParams(global.location.search || '');
         if (query.has('experiment_id')) resultsFilters.experiment_id = query.get('experiment_id') || '';

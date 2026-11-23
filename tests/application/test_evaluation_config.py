@@ -741,3 +741,326 @@ class TestJudgeReferenceBudgetSamePatch:
             await service.update(
                 {"evaluation_judge_provider_id": "provider-a"}, 0, "tester"
             )
+
+
+# ---------------------------------------------------------------------------
+# env 会话来源白名单（N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST）
+# ---------------------------------------------------------------------------
+
+
+def test_env_allowlist_default(monkeypatch):
+    from app.config import Settings
+    from app.application.evaluation_config import evaluation_config_from_env
+    monkeypatch.delenv("N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST", raising=False)
+    cfg = evaluation_config_from_env(Settings(_env_file=None))
+    assert cfg.evaluation_session_source_allowlist == ("dashboard",)
+
+
+def test_env_allowlist_parse_variants():
+    from app.config import Settings
+    from app.application.evaluation_config import (
+        evaluation_config_from_env, session_source_allowlist_from_env,
+    )
+    assert session_source_allowlist_from_env("") == ()          # 显式空串 = 空名单
+    assert session_source_allowlist_from_env("  ") == ()        # 纯空白 = 空名单
+    assert session_source_allowlist_from_env("cli, dashboard") == ("dashboard", "cli")
+    from app.domain.evaluation.config import EvaluationConfigValidationError
+    with pytest.raises(EvaluationConfigValidationError):
+        session_source_allowlist_from_env("dashboard,,api")     # 空项拒绝
+    with pytest.raises(EvaluationConfigValidationError):
+        session_source_allowlist_from_env("nope")               # 未知值拒绝
+
+
+def test_env_allowlist_service_startup_wiring(tmp_path, monkeypatch):
+    """启动接线（非仅 helper）：monkeypatch 真实 env 变量 +
+    Settings(_env_file=None) 构造服务，覆盖未设置、空串、纯空白、
+    合法 trim、重复归一。"""
+    from app.infrastructure.evaluation.config_store import (
+        SqliteEvaluationConfigStore,
+    )
+
+    def _service(raw_env):
+        if raw_env is None:
+            monkeypatch.delenv(
+                "N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST", raising=False
+            )
+        else:
+            monkeypatch.setenv(
+                "N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST", raw_env
+            )
+        store = SqliteEvaluationConfigStore(str(tmp_path / "evaluations.db"))
+        return EvaluationConfigService(Settings(_env_file=None), store)
+
+    assert _service(None).current_sync().evaluation_session_source_allowlist == (
+        "dashboard",
+    )
+    assert _service("").current_sync().evaluation_session_source_allowlist == ()
+    assert _service("   ").current_sync().evaluation_session_source_allowlist == ()
+    assert _service(
+        "cli, dashboard"
+    ).current_sync().evaluation_session_source_allowlist == ("dashboard", "cli")
+    assert _service(
+        "cli,cli,dashboard"
+    ).current_sync().evaluation_session_source_allowlist == ("dashboard", "cli")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "dashboard,",           # 尾逗号 = 空项
+        "dashboard,,api",       # 连续逗号 = 空项
+        "nope",                 # 未知值
+        " Dashboard ",          # 大小写变体（trim 后仍未知）
+        "cli,api, bogus",       # 混合未知值
+    ],
+)
+def test_env_allowlist_invalid_startup_fails_fast(tmp_path, monkeypatch, raw):
+    """非法 env 白名单：组合根启动即 fail-fast，异常含字段名。"""
+    from app.infrastructure.evaluation.config_store import (
+        SqliteEvaluationConfigStore,
+    )
+
+    monkeypatch.setenv("N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST", raw)
+    store = SqliteEvaluationConfigStore(str(tmp_path / "evaluations.db"))
+    with pytest.raises(ValueError, match="evaluation_session_source_allowlist"):
+        EvaluationConfigService(Settings(_env_file=None), store)
+
+
+class TestSessionSourceAllowlistOverride:
+    """evaluation_session_source_allowlist 覆盖流（patch 三态/落库/CAS/
+    回退/存量行兼容，真实 SqliteEvaluationConfigStore 写读）。"""
+
+    async def test_patch_sets_allowlist_persists_and_rebuilds(self, tmp_path):
+        service = _make_service(tmp_path)
+        resolved = await service.update(
+            {"evaluation_session_source_allowlist": ["cli", "dashboard", "cli"]},
+            0,
+            "tester",
+        )
+        assert resolved.config.evaluation_session_source_allowlist == (
+            "dashboard",
+            "cli",
+        )
+        assert resolved.overridden_fields == (
+            "evaluation_session_source_allowlist",
+        )
+
+        # 原始 JSON 行投影为数组
+        import json as _json
+        import sqlite3
+
+        with sqlite3.connect(tmp_path / "evaluations.db") as conn:
+            (config_json,) = conn.execute(
+                "SELECT config_json FROM evaluation_config WHERE id = 1"
+            ).fetchone()
+        assert _json.loads(config_json) == {
+            "evaluation_session_source_allowlist": ["dashboard", "cli"],
+        }
+
+        # 同库重建服务后值恢复
+        rebuilt = _make_service(tmp_path)
+        assert (
+            await rebuilt.current()
+        ).evaluation_session_source_allowlist == ("dashboard", "cli")
+        r2 = await rebuilt.get_resolved()
+        assert r2.config.evaluation_session_source_allowlist == (
+            "dashboard",
+            "cli",
+        )
+        assert r2.overridden_fields == ("evaluation_session_source_allowlist",)
+
+    async def test_patch_empty_list_keeps_empty_override(self, tmp_path):
+        service = _make_service(tmp_path)
+        resolved = await service.update(
+            {"evaluation_session_source_allowlist": []}, 0, "tester"
+        )
+        assert resolved.config.evaluation_session_source_allowlist == ()
+        assert resolved.overridden_fields == (
+            "evaluation_session_source_allowlist",
+        )
+
+    async def test_patch_invalid_values_rejected(self, tmp_path):
+        service = _make_service(tmp_path)
+        for bad in ("dashboard", ["nope"], ["dashboard", 1], True, [" Dashboard"]):
+            with pytest.raises(EvaluationConfigValidationError):
+                await service.update(
+                    {"evaluation_session_source_allowlist": bad}, 0, "tester"
+                )
+
+    async def test_patch_null_clears_override_restores_env(self, tmp_path, monkeypatch):
+        """null = 清除覆盖：恢复非默认 env 基线（归一为枚举序）。"""
+        from app.infrastructure.evaluation.config_store import (
+            SqliteEvaluationConfigStore,
+        )
+
+        monkeypatch.setenv(
+            "N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST", "api, cli"
+        )
+        store = SqliteEvaluationConfigStore(str(tmp_path / "evaluations.db"))
+        service = EvaluationConfigService(Settings(_env_file=None), store)
+        resolved = await service.update(
+            {"evaluation_session_source_allowlist": ["feishu"]}, 0, "tester"
+        )
+        assert resolved.config.evaluation_session_source_allowlist == ("feishu",)
+        cleared = await service.update(
+            {"evaluation_session_source_allowlist": None}, 1, "tester"
+        )
+        assert "evaluation_session_source_allowlist" not in cleared.overridden_fields
+        assert cleared.config.evaluation_session_source_allowlist == ("api", "cli")
+
+    async def test_omitted_key_keeps_override_other_fields_merge(self, tmp_path):
+        """patch 省略该键：保留已有覆盖，其它覆盖正常合并。"""
+        service = _make_service(tmp_path)
+        await service.update(
+            {
+                "evaluation_enabled": True,
+                "evaluation_session_source_allowlist": ["cli"],
+            },
+            0,
+            "tester",
+        )
+        resolved = await service.update(
+            {"evaluation_enabled": False}, 1, "tester"
+        )
+        assert resolved.config.evaluation_session_source_allowlist == ("cli",)
+        assert resolved.config.evaluation_enabled is False
+        assert resolved.overridden_fields == (
+            "evaluation_enabled",
+            "evaluation_session_source_allowlist",
+        )
+
+    async def test_legacy_row_missing_key_follows_env(self, tmp_path, monkeypatch):
+        """旧行缺 allowlist 键（升级存量）：该字段跟随 env 基线，其它
+        覆盖不变。"""
+        import json as _json
+        import sqlite3
+
+        from app.infrastructure.evaluation.config_store import (
+            SqliteEvaluationConfigStore,
+        )
+
+        monkeypatch.setenv(
+            "N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST", "api"
+        )
+        SqliteEvaluationConfigStore(str(tmp_path / "evaluations.db"))
+        with sqlite3.connect(tmp_path / "evaluations.db") as conn:
+            conn.execute(
+                "INSERT INTO evaluation_config (id, config_json, version, "
+                "updated_at, updated_by) VALUES (1, ?, 3, ?, ?)",
+                (
+                    _json.dumps(
+                        {"evaluation_enabled": True}, ensure_ascii=False
+                    ),
+                    "2026-01-01T00:00:00+00:00",
+                    "legacy-writer",
+                ),
+            )
+        service = EvaluationConfigService(
+            Settings(_env_file=None),
+            SqliteEvaluationConfigStore(str(tmp_path / "evaluations.db")),
+        )
+        cfg = await service.current()
+        assert cfg.evaluation_enabled is True
+        assert cfg.evaluation_session_source_allowlist == ("api",)
+        resolved = await service.get_resolved()
+        assert resolved.overridden_fields == ("evaluation_enabled",)
+        assert resolved.config.evaluation_session_source_allowlist == ("api",)
+
+    async def test_cas_same_version_only_one_side_wins(self, tmp_path):
+        a = _make_service(tmp_path)
+        b = _make_service(tmp_path)
+        first = await a.update(
+            {"evaluation_session_source_allowlist": ["cli"]}, 0, "a"
+        )
+        assert first.version == 1
+        with pytest.raises(EvaluationConfigConflictError):
+            await b.update(
+                {"evaluation_session_source_allowlist": ["api"]}, 0, "b"
+            )
+        # 冲突方提交不改变成功方值/版本
+        resolved = await b.get_resolved()
+        assert resolved.version == 1
+        assert resolved.config.evaluation_session_source_allowlist == ("cli",)
+
+    async def test_current_keeps_last_known_good_on_store_error(self, tmp_path):
+        """运行面读故障：current() 保留 last-known-good（含已生效覆盖）。"""
+        service = _make_service(tmp_path)
+        await service.update(
+            {"evaluation_session_source_allowlist": ["cli"]}, 0, "tester"
+        )
+        assert (
+            await service.current()
+        ).evaluation_session_source_allowlist == ("cli",)
+
+        async def _boom():
+            raise RuntimeError("db locked")
+
+        service._store.get = _boom  # type: ignore[method-assign]
+        cfg = await service.current()
+        assert cfg.evaluation_session_source_allowlist == ("cli",)
+
+    async def test_corrupt_json_strict_read_errors_runtime_falls_back(self, tmp_path):
+        """损坏 JSON：管理面 get_resolved() 显式报错（既有存储错误处理），
+        运行面 current() 回退 last-known-good（env 基线）。"""
+        import sqlite3
+
+        from app.domain.evaluation.config import EvaluationConfigStoreError
+        from app.infrastructure.evaluation.config_store import (
+            SqliteEvaluationConfigStore,
+        )
+
+        SqliteEvaluationConfigStore(str(tmp_path / "evaluations.db"))
+        with sqlite3.connect(tmp_path / "evaluations.db") as conn:
+            conn.execute(
+                "INSERT INTO evaluation_config (id, config_json, version, "
+                "updated_at, updated_by) VALUES (1, 'not json', 1, ?, ?)",
+                ("2026-01-01T00:00:00+00:00", "legacy-writer"),
+            )
+        service = EvaluationConfigService(
+            Settings(_env_file=None),
+            SqliteEvaluationConfigStore(
+                str(tmp_path / "evaluations.db"), initialize=False
+            ),
+        )
+        with pytest.raises(EvaluationConfigStoreError, match="不是合法 JSON"):
+            await service.get_resolved()
+        cfg = await service.current()
+        assert cfg.evaluation_session_source_allowlist == ("dashboard",)
+
+    async def test_stored_illegal_source_store_error_handling(self, tmp_path):
+        """存量行含非法来源：走既有存储错误处理——store 层抛
+        StoreError，运行面回退、管理面显式报错。"""
+        import json as _json
+        import sqlite3
+
+        from app.domain.evaluation.config import EvaluationConfigStoreError
+        from app.infrastructure.evaluation.config_store import (
+            SqliteEvaluationConfigStore,
+        )
+
+        SqliteEvaluationConfigStore(str(tmp_path / "evaluations.db"))
+        with sqlite3.connect(tmp_path / "evaluations.db") as conn:
+            conn.execute(
+                "INSERT INTO evaluation_config (id, config_json, version, "
+                "updated_at, updated_by) VALUES (1, ?, 1, ?, ?)",
+                (
+                    _json.dumps(
+                        {"evaluation_session_source_allowlist": ["nope"]},
+                        ensure_ascii=False,
+                    ),
+                    "2026-01-01T00:00:00+00:00",
+                    "legacy-writer",
+                ),
+            )
+        service = EvaluationConfigService(
+            Settings(_env_file=None),
+            SqliteEvaluationConfigStore(
+                str(tmp_path / "evaluations.db"), initialize=False
+            ),
+        )
+        with pytest.raises(
+            EvaluationConfigStoreError, match="evaluation_session_source_allowlist"
+        ):
+            await service.get_resolved()
+        cfg = await service.current()
+        assert cfg.evaluation_session_source_allowlist == ("dashboard",)

@@ -398,6 +398,7 @@
       listExecutions: (params) => fetchJson('/chat/evaluations/executions' + buildEvaluationQuery(params)),
       getExecution: (id) => fetchJson('/chat/evaluations/executions/' + encodeURIComponent(id)),
       listResults: (params) => fetchJson('/chat/evaluations/results' + buildEvaluationQuery(params)),
+      listRunScores: (params) => fetchJson('/chat/evaluations/run-scores' + buildEvaluationQuery(params)),
       listExperimentResults: (params) => fetchJson('/chat/evaluations/experiment-results' + buildEvaluationQuery(params)),
       getResult: (id) => fetchJson('/chat/evaluations/results/' + encodeURIComponent(id)),
       submitFeedback: (body) => fetchJson('/chat/evaluations/feedback', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }),

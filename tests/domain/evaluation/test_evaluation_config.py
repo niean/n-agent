@@ -10,6 +10,7 @@ from app.domain.evaluation.config import (
     EvaluationConfigStoreError,
     EvaluationConfigValidationError,
     merge_overrides,
+    normalize_session_source_allowlist,
     overrides_from_payload,
     validate_evaluation_config,
     validate_model_name_string,
@@ -25,6 +26,7 @@ def test_field_set_is_stable():
         "evaluation_worker_concurrency",
         "evaluation_daily_call_ceiling",
         "evaluation_judge_provider_id",
+        "evaluation_session_source_allowlist",
     )
 
 
@@ -246,4 +248,143 @@ class TestEvaluationJudgeProviderIdField:
         )
         assert merged.evaluation_judge_provider_id == "gpt 4o"
         validate_evaluation_config(merged, worker_max_concurrency=4)
+
+
+class TestEvaluationSessionSourceAllowlistField:
+    """evaluation_session_source_allowlist：归一/校验/覆盖往返/空名单语义。"""
+
+    def test_normalize_dedupes_and_orders_canonically(self):
+        # 输出严格按 SessionSource 枚举定义顺序（dashboard 在首位）
+        values = ["cli", "dashboard", "schedule", "dashboard"]
+        assert normalize_session_source_allowlist(values) == (
+            "dashboard",
+            "cli",
+            "schedule",
+        )
+
+    def test_normalize_rejects_non_list_and_bad_items(self):
+        for bad in (
+            "dashboard",
+            None,
+            1,
+            True,
+            ["Dashboard"],
+            [" dashboard "],
+            ["nope"],
+            [1],
+            [None],
+        ):
+            with pytest.raises(EvaluationConfigValidationError):
+                normalize_session_source_allowlist(bad)
+
+    def test_normalize_accepts_empty_list(self):
+        assert normalize_session_source_allowlist([]) == ()
+        assert normalize_session_source_allowlist(()) == ()
+        assert normalize_session_source_allowlist(("cli", "dashboard", "cli")) == (
+            "dashboard",
+            "cli",
+        )
+
+    def test_config_field_default_and_whitelist(self):
+        assert "evaluation_session_source_allowlist" in EVALUATION_CONFIG_FIELDS
+        assert EvaluationConfig().evaluation_session_source_allowlist == (
+            "dashboard",
+        )
+
+    def test_overrides_roundtrip_and_none_clear(self):
+        ov = EvaluationConfigOverrides.from_dict(
+            {"evaluation_session_source_allowlist": ["cli", "api"]}
+        )
+        assert ov.evaluation_session_source_allowlist == ("api", "cli")
+        # 空数组 = 关闭会话评估，是合法覆盖值（非清除）
+        assert (
+            EvaluationConfigOverrides.from_dict(
+                {"evaluation_session_source_allowlist": []}
+            ).evaluation_session_source_allowlist
+            == ()
+        )
+        # 显式 null = 清除覆盖（恢复 env 基线）
+        assert (
+            EvaluationConfigOverrides.from_dict(
+                {"evaluation_session_source_allowlist": None}
+            ).evaluation_session_source_allowlist
+            is None
+        )
+
+    def test_overrides_reject_bad_payload(self):
+        for bad in (["nope"], "dashboard", [True]):
+            with pytest.raises(EvaluationConfigStoreError):
+                EvaluationConfigOverrides.from_dict(
+                    {"evaluation_session_source_allowlist": bad}
+                )
+
+    def test_overrides_to_dict_projects_allowlist_as_list(self):
+        # to_dict 专用投影：元组 -> 数组（JSON 序列化友好）
+        ov = EvaluationConfigOverrides.from_dict(
+            {"evaluation_session_source_allowlist": ["cli", "api"]}
+        )
+        data = ov.to_dict()
+        assert data == {"evaluation_session_source_allowlist": ["api", "cli"]}
+        assert isinstance(data["evaluation_session_source_allowlist"], list)
+
+    def test_overrides_from_payload_rejects_non_array_and_maps_error(self):
+        # 管理面载荷路径：非数组 JSON 类型拒绝，StoreError 映射回领域校验异常
+        for bad in ("dashboard", {"dashboard": 1}, 1, True):
+            with pytest.raises(EvaluationConfigValidationError):
+                overrides_from_payload({"evaluation_session_source_allowlist": bad})
+
+    def test_merge_overrides_allowlist_semantics(self):
+        base = EvaluationConfig()
+        merged = merge_overrides(
+            base,
+            EvaluationConfigOverrides.from_dict(
+                {"evaluation_session_source_allowlist": ["cli"]}
+            ),
+        )
+        assert merged.evaluation_session_source_allowlist == ("cli",)
+        # None = 未覆盖，跟随 env 基线
+        merged2 = merge_overrides(base, EvaluationConfigOverrides())
+        assert merged2.evaluation_session_source_allowlist == ("dashboard",)
+        # 空元组覆盖 = 关闭（is not None 语义保留）
+        merged3 = merge_overrides(
+            base,
+            EvaluationConfigOverrides(evaluation_session_source_allowlist=()),
+        )
+        assert merged3.evaluation_session_source_allowlist == ()
+
+    def test_validate_evaluation_config_checks_allowlist_type(self):
+        import dataclasses
+
+        cfg = dataclasses.replace(
+            EvaluationConfig(), evaluation_session_source_allowlist=("nope",)
+        )
+        with pytest.raises(EvaluationConfigValidationError):
+            validate_evaluation_config(cfg, worker_max_concurrency=4)
+
+    def test_validate_rejects_non_tuple_and_unnormalized_values(self):
+        # 冻结 dataclass 注入路径：None/整数/字符串/bool/列表/非归一元组
+        # 均抛领域校验异常而非 TypeError
+        for bad in (None, 1, "dashboard", True, ["dashboard"], ["cli", "dashboard"]):
+            cfg = EvaluationConfig()
+            object.__setattr__(
+                cfg, "evaluation_session_source_allowlist", bad
+            )
+            with pytest.raises(EvaluationConfigValidationError):
+                validate_evaluation_config(cfg, worker_max_concurrency=4)
+
+    def test_validate_does_not_mutate_frozen_config(self):
+        cfg = EvaluationConfig()
+        object.__setattr__(
+            cfg, "evaluation_session_source_allowlist", ["dashboard"]
+        )
+        with pytest.raises(EvaluationConfigValidationError):
+            validate_evaluation_config(cfg, worker_max_concurrency=4)
+        # 校验失败不修正冻结对象（调用方可见原值，便于上层诊断）
+        assert cfg.evaluation_session_source_allowlist == ["dashboard"]
+
+    def test_validate_accepts_normalized_default(self):
+        # 默认基线（"dashboard",）必须通过整体校验（env 基线构造路径）
+        validate_evaluation_config(
+            EvaluationConfig(), worker_max_concurrency=4
+        )
 

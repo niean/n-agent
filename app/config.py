@@ -380,6 +380,10 @@ class Settings(BaseSettings):
     evaluation_judge_provider_api_key: str = Field(default="")
     evaluation_judge_provider_model: str = Field(default="")
     evaluation_judge_timeout_seconds: int = Field(default=60, ge=5, le=600)
+    # 线上评估会话类型准入白名单（C 类基线；逗号分隔 env 串，未设置走
+    # 默认 "dashboard"，显式空串 = 关闭会话评估；解析归一单一来源在
+    # application evaluation_config，非法值启动 fail-fast）
+    evaluation_session_source_allowlist: str = Field(default="dashboard")
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="N_AGENT_", extra="ignore")
 

@@ -986,6 +986,19 @@ def test_shared_state_classes_use_auxiliary_font_size(tmp_path):
         assert '16px' not in rules[0]
 
 
+def test_run_detail_feedback_auxiliary_text_uses_font_size_token(tmp_path):
+    """Run 详情评估反馈的分组标签与状态文字为辅助文字，字号必须在类上
+    显式声明 token，禁止依赖 body 继承（P094 同类问题防回归）。"""
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    for selector in ('.run-detail__feedback-label', '.run-detail__feedback-status'):
+        rules = _css_rule_bodies(css, selector)
+        assert rules, f'缺少辅助文字类 {selector} 规则'
+        assert 'font-size: var(--font-size-sm)' in rules[0], (
+            f'{selector} 必须显式使用辅助字号 token，不得依赖 body 继承'
+        )
+
+
 def test_static_assets_use_safe_text_rendering(tmp_path):
     client = _client(tmp_path)
     for path in ('/static/chat.js', '/static/sessions.js', '/static/tools.js',
@@ -1139,7 +1152,7 @@ def test_topbar_refactor_introduces_topnav_mount_and_scoped_tab(tmp_path):
         '/chat', '/sessions', '/scheduled-tasks', '/tasks', '/memory',
         '/tools/knowledge', '/tools/mcp', '/tools/skill', '/tools/plugin', '/tools/builtin',
         '/sandbox', '/executors/host', '/browser', '/artifacts', '/models', '/platforms',
-        '/observations/sessions', '/observations/modules', '/observations/otel', '/evaluations', '/evaluations/datasets', '/evaluations/capabilities', '/evaluations/executions', '/evaluations/results', '/evaluations/annotations',
+        '/observations/sessions', '/observations/modules', '/observations/otel', '/evaluations', '/evaluations/datasets', '/evaluations/capabilities', '/evaluations/executions', '/evaluations/session-scores', '/evaluations/annotations',
         '/security',
         '/security/sessions', '/security/memory', '/security/sandbox',
     ]

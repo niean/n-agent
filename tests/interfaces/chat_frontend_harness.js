@@ -5992,6 +5992,302 @@ async function testUnselectedSessionRunList() {
   ok(env.byIdMap['chat-run-detail'].textContent === '无法加载执行列表', 'list failure differs from empty ledger');
 }
 
+// ===========================================================================
+// 会话反馈准入（spec-261124）：Run 详情反馈区按评估 C 类会话来源白名单
+// 显隐「会话反馈」组；「运行反馈」组恒在且不等待配置读取。
+// ===========================================================================
+// evaluations API 桩：getConfig 可替换 handler + 调用记录；submitFeedback 记录载荷
+function _setEvaluationApi(env) {
+  const configCalls = [];
+  const submitCalls = [];
+  let configHandler = () => Promise.resolve({ config: {}, version: 1 });
+  env.win.NAGENT.api.evaluations = {
+    getConfig: () => { configCalls.push({}); return configHandler(); },
+    submitFeedback: (body) => { submitCalls.push(body); return Promise.resolve({ revision: 1 }); },
+  };
+  return {
+    configCalls,
+    submitCalls,
+    setConfigHandler: (fn) => { configHandler = fn; },
+  };
+}
+
+// 建会话并选中，载荷携带来源（会话反馈准入依赖 detail.session.source）
+async function _prepareFeedbackSession(env, sessionDefs) {
+  sessionsList = sessionDefs.map((s) => ({ id: s.id, title: s.id }));
+  env.win.NAGENT.api.getSessionDetail = (id) => {
+    const def = sessionDefs.find((s) => s.id === id) || {};
+    return Promise.resolve({
+      session: Object.assign({ id }, def.session || {}),
+      messages: def.messages || [],
+      summary: null, task_state: null,
+    });
+  };
+  await env.chat.init();
+  await _settle(env);
+  env.fireClick(env.findSessionItem(sessionDefs[0].id));
+  await _settle(env);
+}
+
+// 反馈区标签快照：null 表示反馈区未渲染
+function _feedbackLabels(env) {
+  const section = env.byIdMap['chat-run-detail'].querySelector('.run-detail__feedback');
+  if (!section) return null;
+  return Array.from(section.querySelectorAll('.run-detail__feedback-label'))
+    .map((label) => label.textContent);
+}
+
+async function testRunDetailSessionFeedbackAllowlist() {
+  const FEEDBACK_MSGS = (runIds) => runIds.map((rid, i) => ({
+    id: 'm' + i, role: 'assistant', content: '回答' + i, run_id: rid,
+  }));
+  const SET_RUNS = (env, runIds) => {
+    env.setListSessionRunsHandler(() => Promise.resolve(runIds.map((rid) => _runRow({ id: rid }))));
+    env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+  };
+  const CONFIG_OK = (allowlist) => () => Promise.resolve({
+    config: { evaluation_session_source_allowlist: allowlist }, version: 1,
+  });
+  const openDetail = (env, footer) => env.fireClick(_runFooterDetailLink(footer));
+
+  // A. 白名单含会话来源：会话组 + 运行组都在；运行组同步先渲染不等配置
+  let env = loadChat();
+  let cfg = _setEvaluationApi(env);
+  let resolveCfg = null;
+  cfg.setConfigHandler(() => new Promise((res) => { resolveCfg = res; }));
+  SET_RUNS(env, ['run-1']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  let labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1,
+    'run feedback group renders immediately without waiting for config GET');
+  ok(!!labels && labels.indexOf('会话反馈') === -1,
+    'session feedback group is absent before config GET settles');
+  ok(cfg.configCalls.length === 1,
+    'one config GET per detail open (got ' + cfg.configCalls.length + ')');
+  if (typeof resolveCfg === 'function') resolveCfg(CONFIG_OK(['dashboard'])());
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
+    'allowlist containing session source renders session group beside run group');
+  ok(cfg.configCalls.length === 1,
+    'resolved config GET is not re-issued for the same open (got ' + cfg.configCalls.length + ')');
+  // 会话组提交载荷走 session_feedback/<当前会话>
+  const sessionSection = env.byIdMap['chat-run-detail'].querySelector('.run-detail__feedback');
+  const sessionGroup = sessionSection.querySelectorAll('.run-detail__feedback-group')
+    .find((g) => {
+      const label = g.querySelector('.run-detail__feedback-label');
+      return !!label && label.textContent === '会话反馈';
+    });
+  ok(!!sessionGroup, 'session feedback group element exists');
+  const sessionUpBtn = sessionGroup
+    ? sessionGroup.querySelectorAll('button').find((b) => b.textContent === '有用')
+    : null;
+  ok(!!sessionUpBtn, 'session feedback group has upvote button');
+  if (sessionUpBtn) {
+    env.fireClick(sessionUpBtn);
+    await _settle(env);
+    const submitted = cfg.submitCalls[cfg.submitCalls.length - 1];
+    ok(!!submitted && submitted.definition_id === 'feedback.session_helpful'
+      && submitted.target.kind === 'session_feedback' && submitted.target.subject_id === 's1',
+      'session feedback submits session_feedback target bound to current session');
+  }
+
+  // B. 白名单不含会话来源：会话组隐藏，运行组恒在
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  cfg.setConfigHandler(CONFIG_OK(['dashboard']));
+  SET_RUNS(env, ['run-1']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'api' }, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+    'allowlist without session source hides session group and keeps run group');
+
+  // C. 白名单为 []：仅运行反馈组
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  cfg.setConfigHandler(CONFIG_OK([]));
+  SET_RUNS(env, ['run-1']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+    'empty allowlist renders only the run feedback group');
+
+  // D. getConfig 拒绝：会话组渲染（服务端兜底）
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  cfg.setConfigHandler(() => Promise.reject(new Error('boom')));
+  SET_RUNS(env, ['run-1']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
+    'config GET rejection keeps session group visible (server-side fallback)');
+
+  // E. 非法元素/未知值数组按读取失败处理：会话组渲染
+  for (const bad of [['bogus'], ['dashboard', 123], ['dashboard', 'weird-value'], 'dashboard']) {
+    env = loadChat();
+    cfg = _setEvaluationApi(env);
+    cfg.setConfigHandler(CONFIG_OK(bad));
+    SET_RUNS(env, ['run-1']);
+    await _prepareFeedbackSession(env, [
+      { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+    ]);
+    openDetail(env, _runFooters(env)[0]);
+    await _settle(env);
+    labels = _feedbackLabels(env);
+    ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
+      'invalid allowlist payload ' + JSON.stringify(bad) + ' keeps session group visible');
+  }
+
+  // F. 来源未知（载荷缺 source）：白名单为 [] 也不隐藏会话组
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  cfg.setConfigHandler(CONFIG_OK([]));
+  SET_RUNS(env, ['run-1']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: {}, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
+    'unknown session source keeps session group visible even with empty allowlist');
+
+  // G. 响应返回时会话已切换：旧判定不应用；重开详情发起新读取
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  resolveCfg = null;
+  cfg.setConfigHandler(() => new Promise((res) => { resolveCfg = res; }));
+  SET_RUNS(env, ['run-1', 'run-2']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+    { id: 's2', session: { source: 'api' }, messages: FEEDBACK_MSGS(['run-2']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(cfg.configCalls.length === 1, 'stale case: first detail issues one pending config GET');
+  env.fireClick(env.findSessionItem('s2'));
+  await _settle(env);
+  const s2HasLink = env.byIdMap['chat-run-detail'].querySelectorAll('.run-list__link')
+    .some((link) => link.dataset && link.dataset.runId === 'run-2');
+  ok(s2HasLink,
+    'stale case: session switch resets detail panel to new session run list');
+  if (typeof resolveCfg === 'function') {
+    resolveCfg({ config: { evaluation_session_source_allowlist: ['dashboard'] }, version: 1 });
+  }
+  await _settle(env);
+  ok(env.byIdMap['chat-run-detail'].querySelector('.run-detail__feedback') === null,
+    'stale case: late config response does not leak a feedback section into the reset panel');
+  cfg.setConfigHandler(CONFIG_OK(['api']));
+  const s2Footer = _runFooters(env)[0];
+  ok(!!s2Footer, 'stale case: s2 footer available');
+  openDetail(env, s2Footer);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
+    'stale case: reopening detail for s2 applies fresh allowlist');
+  ok(cfg.configCalls.length === 2,
+    'stale case: stale response is not reused, reopening issues a new GET (got '
+      + cfg.configCalls.length + ')');
+
+  // H. 同会话切运行：并发读取共享一个 GET；旧详情响应丢弃；重开按新白名单重绘
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  resolveCfg = null;
+  cfg.setConfigHandler(() => new Promise((res) => { resolveCfg = res; }));
+  SET_RUNS(env, ['run-1', 'run-2']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1', 'run-2']) },
+  ]);
+  const twoFooters = _runFooters(env);
+  ok(twoFooters.length === 2, 'switch-run case: two run footers');
+  openDetail(env, twoFooters[0]);
+  await _settle(env);
+  openDetail(env, twoFooters[1]);
+  await _settle(env);
+  ok(cfg.configCalls.length === 1,
+    'switch-run case: concurrent detail reads share one in-flight config GET (got '
+      + cfg.configCalls.length + ')');
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+    'switch-run case: current detail shows only run group while config pending');
+  if (typeof resolveCfg === 'function') resolveCfg(CONFIG_OK(['dashboard'])());
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('会话反馈') !== -1,
+    'switch-run case: shared response applies to the current detail only');
+  // 重开同一 Run：白名单已变空 -> 会话组隐藏（新 GET，不缓存旧结果）
+  cfg.setConfigHandler(CONFIG_OK([]));
+  openDetail(env, twoFooters[1]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+    'switch-run case: reopening same run applies the new empty allowlist');
+  ok(cfg.configCalls.length === 2,
+    'switch-run case: settled config GET is never reused (got ' + cfg.configCalls.length + ')');
+
+  // I. 第一次读取失败后下一次打开重试成功：失败不缓存
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  let rejectCfg = null;
+  cfg.setConfigHandler(() => new Promise((_, rej) => { rejectCfg = rej; }));
+  SET_RUNS(env, ['run-1']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  if (typeof rejectCfg === 'function') rejectCfg(new Error('boom'));
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('会话反馈') !== -1,
+    'retry case: failed first read keeps session group visible');
+  cfg.setConfigHandler(CONFIG_OK([]));
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+    'retry case: next open retries config and applies fresh allowlist');
+  ok(cfg.configCalls.length === 2,
+    'retry case: failed read is not cached, retry issues a new GET (got ' + cfg.configCalls.length + ')');
+
+  // J. 详情重开读取新白名单：成功结果同样不缓存
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  cfg.setConfigHandler(CONFIG_OK(['dashboard']));
+  SET_RUNS(env, ['run-1']);
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('会话反馈') !== -1,
+    'reopen case: first open with matching allowlist shows session group');
+  cfg.setConfigHandler(CONFIG_OK(['api']));
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  labels = _feedbackLabels(env);
+  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+    'reopen case: reopening re-reads config and hides session group under new allowlist');
+  ok(cfg.configCalls.length === 2,
+    'reopen case: successful read is not cached (got ' + cfg.configCalls.length + ')');
+}
 runIntegration().then(async () => {
   await testTaskCardInteraction();
   await testPartialMessageRefresh();
@@ -6018,6 +6314,7 @@ runIntegration().then(async () => {
   await testRunFooterDetailTrace();
   await testRunFooterDetailStaleRequests();
   await testUnselectedSessionRunList();
+  await testRunDetailSessionFeedbackAllowlist();
   if (failures) { console.error('\n' + failures + ' test(s) failed'); process.exit(1); }
   console.log('chat_frontend_harness: all tests passed');
   process.exit(0);

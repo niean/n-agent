@@ -25,6 +25,7 @@ from app.domain.evaluation.config import (
     ResolvedEvaluationConfig,
     StoredEvaluationConfig,
     merge_overrides,
+    normalize_session_source_allowlist,
     overrides_from_payload,
     validate_evaluation_config,
 )
@@ -32,9 +33,36 @@ from app.domain.evaluation.config import (
 logger = logging.getLogger(__name__)
 
 
+def session_source_allowlist_from_env(raw: str | None) -> tuple[str, ...]:
+    """env 逗号分隔串 -> 归一白名单元组（T2）。未设置走 Settings 默认
+    "dashboard"；显式空串/纯空白 = 空名单（关闭会话评估）；空项/
+    未知值抛 EvaluationConfigValidationError（调用方 fail-fast）。"""
+    if raw is None:
+        return normalize_session_source_allowlist(["dashboard"])
+    if raw.strip() == "":
+        return ()
+    items = [part.strip() for part in raw.split(",")]
+    if any(part == "" for part in items):
+        raise EvaluationConfigValidationError(
+            "evaluation_session_source_allowlist 含空项"
+        )
+    return normalize_session_source_allowlist(items)
+
+
 def evaluation_config_from_env(settings: Settings) -> EvaluationConfig:
     """B 类 env 基线 -> C 类解析基线（启动期投影；Dashboard 编辑落在
     DB 覆盖层，env 值永远只读）。"""
+    # 白名单 env 串解析（非法值在组合根启动即 fail-fast；_validate_env
+    # 只包装跨字段校验，解析路径在此处独立包装为 ValueError 且信息含
+    # 字段名）
+    try:
+        session_source_allowlist = session_source_allowlist_from_env(
+            settings.evaluation_session_source_allowlist
+        )
+    except EvaluationConfigValidationError as exc:
+        raise ValueError(
+            f"evaluation_session_source_allowlist env 基线非法: {exc}"
+        ) from exc
     return EvaluationConfig(
         evaluation_enabled=settings.evaluation_capture_enabled,
         evaluation_sampling_rate=settings.evaluation_sampling_rate,
@@ -46,6 +74,7 @@ def evaluation_config_from_env(settings: Settings) -> EvaluationConfig:
         evaluation_daily_call_ceiling=settings.evaluation_daily_call_ceiling,
         # Judge Provider id 是纯运行时覆盖字段：env 基线恒为空串
         evaluation_judge_provider_id="",
+        evaluation_session_source_allowlist=session_source_allowlist,
     )
 
 

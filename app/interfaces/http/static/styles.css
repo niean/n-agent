@@ -1125,10 +1125,13 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .evaluations-export-case { display: flex; flex-direction: column; gap: 6px; padding: 8px; border: 1px solid var(--color-border-muted, #e5e7eb); border-radius: 6px; }
 .evaluations-export-case__meta { font-size: var(--font-size-sm, 12px); color: var(--color-fg-muted); }
 .run-detail__feedback { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--color-border-muted, #e5e7eb); }
+.run-detail__feedback-group { margin-top: 8px; }
+.run-detail__feedback-label { display: block; font-size: var(--font-size-sm); color: var(--color-fg-muted); }
 .run-detail__feedback-actions { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
-.run-detail__feedback-status { font-size: var(--font-size-sm, 12px); color: var(--color-fg-muted); }
+.run-detail__feedback-status { font-size: var(--font-size-sm); color: var(--color-fg-muted); }
 
 .evaluations-dataset-content { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+.evaluations-result-detail { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; font-size: var(--font-size-sm, 12px); }
 
 /* 评估工作台 FE 规范对齐（spec-261112）：仅评测作用域的布局类，
    不覆盖全局 status-panel/panel-tips/document-table 行为，色值间距走 token。 */

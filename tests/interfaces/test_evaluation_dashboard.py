@@ -174,10 +174,14 @@ class TestNavigationRegistration:
         assert "evaluations-judge-model" not in parent.group(1)
 
     def test_sidebar_landing_uses_first_topnav_item(self) -> None:
-        """左导落地规则：navigateTo 经 sidebarLandingPath 收敛到子域顶导首项 path，
-        评估器子域首项为能力目录；无顶导 tab 回落 pathByTab。"""
+        """左导落地规范（无例外）：navigateTo 经 sidebarLandingPath 收敛到
+        子域顶导首项 path，评估器子域首项为能力目录；无顶导 tab 回落
+        pathByTab。禁止例外映射机制（SIDEBAR_LANDING_PATH_OVERRIDES 已删除）。"""
         content = _read("management-navigation.js")
         assert "function sidebarLandingPath(name)" in content
+        assert "SIDEBAR_LANDING_PATH_OVERRIDES" not in content, (
+            "左导落地规则为无例外 FE 规范，禁止引入落点特判/例外映射"
+        )
         landing_m = re.search(
             r"function sidebarLandingPath\(name\) \{(.*?)\n  \}", content, re.S
         )
@@ -252,7 +256,7 @@ class TestIndexHtml:
             "evaluations-experiments", "evaluations-results", "evaluations-annotations",
         ], f"评估左导子链接顺序不符: {tabs}"
         labels = re.findall(r'sidebar__item-label">([^<]*)</span>', submenu)
-        assert labels == ["概览", "数据集", "评估器", "实验", "线上评估", "人工标注"], labels
+        assert labels == ["概览", "数据集", "评估器", "实验评估", "线上评估", "人工标注"], labels
         assert 'data-tab="evaluations-review"' not in content
         assert 'href="/evaluations/review"' not in content
 
@@ -311,10 +315,11 @@ class TestShellRoutes:
         "/evaluations", "/evaluations/datasets", "/evaluations/evaluators",
         "/evaluations/capabilities", "/evaluations/judge-model",
         "/evaluations/executions", "/evaluations/experiments", "/evaluations/results",
+        "/evaluations/session-scores", "/evaluations/run-scores",
         "/evaluations/annotations", "/evaluations/review",
     )
 
-    def test_shell_200_for_ten_evaluation_paths(self, tmp_path) -> None:
+    def test_shell_200_for_twelve_evaluation_paths(self, tmp_path) -> None:
         client = _shell_client(tmp_path)
         for path in self.EVALUATION_SHELL_PATHS:
             response = client.get(path)
@@ -386,12 +391,34 @@ class TestEvaluationJsContract:
             "evaluations-pager",
             "evaluations-table-scroll",
             "evaluations-delivery-counts",
+            "evaluations-result-detail",
         ):
             assert cls in css, f"styles.css 缺少类: {cls}"
         # Phase 5 扫描修复（Warning）：详情/表单弹窗按钮容器统一标准类
         # providers-form__actions，自定义 evaluations-form-actions 已删除
         assert "providers-form__actions" in css
         assert "evaluations-form-actions" not in css
+
+    def test_result_detail_box_contract(self) -> None:
+        """spec-261123：评分详情"结果"文字框与原因标签映射。"""
+        js = _code_lines("evaluation.js")
+        assert "buildResultDetailText" in js
+        assert "evaluations-result-detail" in js
+        for label in ("缺少参考答案", "指标不适用", "参考相关性标注中无相关项",
+                      "缺少可核实证据", "证据已脱敏", "证据超出大小上限",
+                      "评估预算耗尽", "一致性检查未通过",
+                      "网络错误", "作业领取次数", "评估 Trace", "无门禁判定"):
+            assert label in js, f"缺少标签: {label}"
+        css = _read("styles.css")
+        rule = re.search(r"\.evaluations-result-detail\s*\{[^}]*\}", css)
+        assert rule, "styles.css 缺少 .evaluations-result-detail 规则"
+        # P094 同类约束：字号/换行/滚动声明必须在规则块内显式声明
+        for declaration in (
+            r"font-size\s*:\s*var\(\s*--font-size-sm\s*,\s*12px\s*\)",
+            r"white-space\s*:\s*pre-wrap", r"overflow-wrap\s*:\s*anywhere",
+            r"max-height\s*:\s*320px", r"overflow-y\s*:\s*auto",
+        ):
+            assert re.search(declaration + r"\s*(?:;|})", rule.group(0)), declaration
 
     def test_review_pressed_group_kept_annotation_filters_use_select(self) -> None:
         """spec-261112：筛选组是查询过滤器，用 role=group，禁止不完整的
@@ -531,6 +558,17 @@ class TestRunDetailFeedback:
         # m6：Langfuse URL 单源引用
         assert "LANGFUSE_SESSIONS_URL" in section
 
+    def test_session_feedback_entry_in_run_detail(self) -> None:
+        """会话人评入口（feedback.session_helpful）：与运行人评同区段，
+        目标 kind=session_feedback，subject 取当前会话 ID。"""
+        content = _read("chat.js")
+        assert "feedback.session_helpful" in content
+        start = content.index("function renderRunDetail(")
+        end = content.index("未选中执行时展示整个会话账本", start)
+        section = _strip_section_comments(content[start:end])
+        assert "session_feedback" in section
+        assert "currentSessionId" in section
+
 
 # ---------------------------------------------------------------------------
 # management-api.js 评估端点
@@ -642,6 +680,76 @@ class TestJudgeModelProviderPage:
         js = _code_lines("evaluation.js")
         assert "effective_model" in js
         assert "default_model" not in js, "旧投影字段 default_model 不得再消费"
+
+
+class TestSessionEvalConfigModal:
+    """plan-261124 T4：会话评分视图「评估配置」弹窗 + 概览页会话类型
+    白名单复选框。两入口共用 SESSION_EVAL_SOURCE_OPTIONS 选项数组，
+    有序值序列与 Python SessionSource 枚举一致。行为契约见
+    evaluation_workbench_harness.js Part K。"""
+
+    def _js_option_values(self, content: str, const_name: str) -> list[str]:
+        """解析 JS 顶部 [value, label] 二元组常量的有序值序列。"""
+        match = re.search(r"const " + const_name + r" = \[(.*?)\];", content, re.S)
+        assert match is not None, f"缺少常量 {const_name}"
+        values = re.findall(r"\[\s*'([^']+)',\s*'[^']*'\s*\]", match.group(1))
+        assert values, f"{const_name} 未解析出选项"
+        return values
+
+    def test_modal_function_button_and_shared_constant_exist(self) -> None:
+        js = _code_lines("evaluation.js")
+        assert "openSessionEvalConfigModal" in js, "缺少会话评估配置弹窗函数"
+        assert "SESSION_EVAL_SOURCE_OPTIONS" in js, "缺少复选框选项常量"
+        # 选项数组被两个入口共用（会话评分弹窗 + 概览修订配置弹窗）
+        assert js.count("SESSION_EVAL_SOURCE_OPTIONS") >= 2, (
+            "SESSION_EVAL_SOURCE_OPTIONS 必须被两个入口共用"
+        )
+        content = _read("evaluation.js")
+        assert "actionButton('评估配置'" in content, "缺少「评估配置」入口按钮"
+
+    def test_button_only_rendered_on_session_scores_view(self) -> None:
+        """renderResults 是多视图共享 renderer，按钮必须只在
+        session-scores 视图出现在头部操作区。"""
+        js = _code_lines("evaluation.js")
+        assert "viewAtStart === 'session-scores' && body.evaluationsHeaderActions" in js
+
+    def test_options_ordered_values_match_enum_and_chat(self) -> None:
+        """选项合同比较有序值序列与 Python SessionSource（不能只比集合
+        或固定数量）；值集合与 chat.js SESSION_SOURCE_OPTIONS 一致。"""
+        from app.domain.session import SessionSource
+
+        eval_values = self._js_option_values(
+            _read("evaluation.js"), "SESSION_EVAL_SOURCE_OPTIONS")
+        chat_values = self._js_option_values(
+            _read("chat.js"), "SESSION_SOURCE_OPTIONS")
+        enum_values = [item.value for item in SessionSource]
+        assert eval_values == enum_values, (
+            f"SESSION_EVAL_SOURCE_OPTIONS 有序值序列须与 SessionSource 一致: "
+            f"{eval_values} != {enum_values}"
+        )
+        assert sorted(eval_values) == sorted(chat_values), (
+            "SESSION_EVAL_SOURCE_OPTIONS 值集合须与 chat.js "
+            "SESSION_SOURCE_OPTIONS 一致"
+        )
+
+    def test_checkbox_group_payload_and_copy_contract(self) -> None:
+        js = _code_lines("evaluation.js")
+        assert "input.type = 'checkbox'" in js, "白名单须为复选框组"
+        assert "evaluation_session_source_allowlist" in js
+        assert "expected_version" in js
+        content = _read("evaluation.js")
+        assert "空名单 = 关闭会话评估" in content, "缺少空名单警示文案"
+        assert "配置已被他人修改，请关闭后重新打开核对" in content, (
+            "缺少 409 冲突文案"
+        )
+        assert "评估配置已保存" in content, "缺少保存成功提示"
+
+    def test_get_failure_and_invalid_shape_block_save(self) -> None:
+        js = _code_lines("evaluation.js")
+        assert "api.evaluations.getConfig(" in js, "弹窗打开须先 GET 最新配置"
+        content = _read("evaluation.js")
+        assert "评估配置加载失败" in content, "缺少 GET 失败提示文案"
+        assert "配置数据形状非法，禁止保存" in content, "缺少非法形状禁止保存文案"
 
 
 def test_evaluation_navigation_lifecycle():

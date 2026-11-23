@@ -38,7 +38,11 @@
     // 执行任务是实验左导子域下的顶导入口：不进左导 children（与能力目录同范式），
     // 独立 path/tab，与实验结果页共享 sidebarTab/topnavParent。
     { tab: 'evaluations-executions', path: '/evaluations/executions', label: '执行任务', parentTab: 'evaluations' },
-    { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验', parentTab: 'evaluations' },
+    { tab: 'evaluations-experiments', path: '/evaluations/experiments', label: '实验评估', parentTab: 'evaluations' },
+    // 会话评分/运行评分是线上评估左导子域下的顶导入口：不进左导 children
+    // （与执行任务同范式），独立 path/tab，与评分明细页共享 sidebarTab/topnavParent。
+    { tab: 'evaluations-session-scores', path: '/evaluations/session-scores', label: '会话评分', parentTab: 'evaluations' },
+    { tab: 'evaluations-run-scores', path: '/evaluations/run-scores', label: '运行评分', parentTab: 'evaluations' },
     { tab: 'evaluations-results', path: '/evaluations/results', label: '线上评估', parentTab: 'evaluations' },
     { tab: 'evaluations-experiment-results', path: '/evaluations/experiment-results', label: '评分明细', parentTab: 'evaluations' },
     { tab: 'evaluations-annotations', path: '/evaluations/annotations', label: '人工标注', parentTab: 'evaluations' },
@@ -101,6 +105,8 @@
       { tab: 'evaluations-experiment-results', path: '/evaluations/experiment-results', label: '评分明细', concern: 'evaluation', scope: 'experiment-results', topnavParent: 'evaluations-experiments' },
     ],
     'evaluations-results': [
+      { tab: 'evaluations-session-scores', path: '/evaluations/session-scores', label: '会话评分', concern: 'evaluation', scope: 'session-scores', topnavParent: 'evaluations-results' },
+      { tab: 'evaluations-run-scores', path: '/evaluations/run-scores', label: '运行评分', concern: 'evaluation', scope: 'run-scores', topnavParent: 'evaluations-results' },
       { tab: 'evaluations-results', path: '/evaluations/results', label: '评分明细', concern: 'evaluation', scope: 'results', topnavParent: 'evaluations-results' },
     ],
     'evaluations-annotations': [
@@ -148,6 +154,10 @@
     { paths: ['/evaluations/executions'], tab: 'evaluations-executions', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'executions' },
     { paths: ['/evaluations/experiments'], tab: 'evaluations-experiments', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'experiments' },
     { paths: ['/evaluations/results'], tab: 'evaluations-results', renderTab: 'evaluations', sidebarTab: 'evaluations-results', topnavParent: 'evaluations-results', scope: 'results' },
+    // 会话评分/运行评分是线上评估左导子域的独立 routeConfig entry：独立 path/tab/scope，
+    // sidebarTab/topnavParent 与评分明细页相同（同能力目录范式）。
+    { paths: ['/evaluations/session-scores'], tab: 'evaluations-session-scores', renderTab: 'evaluations', sidebarTab: 'evaluations-results', topnavParent: 'evaluations-results', scope: 'session-scores' },
+    { paths: ['/evaluations/run-scores'], tab: 'evaluations-run-scores', renderTab: 'evaluations', sidebarTab: 'evaluations-results', topnavParent: 'evaluations-results', scope: 'run-scores' },
     { paths: ['/evaluations/experiment-results'], tab: 'evaluations-experiment-results', renderTab: 'evaluations', sidebarTab: 'evaluations-experiments', topnavParent: 'evaluations-experiments', scope: 'experiment-results' },
     { paths: ['/evaluations/annotations'], tab: 'evaluations-annotations', renderTab: 'evaluations', sidebarTab: 'evaluations-annotations', topnavParent: 'evaluations-annotations', scope: 'annotations' },
     // /evaluations/review 是旧"待复核"兼容页：不在左导 children，但
@@ -303,9 +313,10 @@
     return true;
   }
 
-  // 左导落地规则：从左导进入带顶导的子域时，固定落在该子域顶导最左侧第一个菜单
-  // （topnavConfig 首项 path）；无顶导的普通 tab 回落 pathByTab。
-  // 深链直达与顶导点击不走这里，仍可直达同子域其他 entry。
+  // 左导落地规则（项目 FE 规范，无例外）：从左导进入带顶导的子域时，
+  // 固定落在该子域顶导最左侧第一个菜单（topnavConfig 首项 path）；
+  // 无顶导的普通 tab 回落 pathByTab。深链直达与顶导点击不走这里，
+  // 仍可直达同子域其他 entry。禁止引入左导落点特判或例外映射。
   function sidebarLandingPath(name) {
     const items = topnavConfig[name];
     if (Array.isArray(items) && items.length && items[0] && items[0].path) {

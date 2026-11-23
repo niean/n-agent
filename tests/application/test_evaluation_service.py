@@ -648,6 +648,59 @@ class TestFeedbackHelpfulDefinition:
         page = await service.list_results(definition_id="feedback.helpful")
         assert page.items == ()
 
+    async def test_session_feedback_definition_registered(self, store):
+        """会话人评定义（feedback.session_helpful）与运行人评定义分立：
+        目标种类 session_feedback，boolean human 方法，幂等注册。"""
+        service = make_service(store)
+        await service.register_session_feedback_helpful_definition()
+        await service.register_session_feedback_helpful_definition()
+
+        row = await store.get_definition("feedback.session_helpful", "v1")
+        assert row["metric_name"] == "feedback.session_helpful"
+        definition = definition_from_mapping(row["definition"])
+        assert definition.target_kind == "session_feedback"
+        assert definition.method == "human"
+        assert definition.output_type == "boolean"
+
+    async def test_session_feedback_submit_produces_session_target_result(
+        self, store
+    ):
+        """会话人评提交（session_feedback 目标）经 submit_feedback 落
+        human result，可在会话评分视图的 target_kind 过滤下检索。"""
+        service = make_service(store)
+        await service.register_session_feedback_helpful_definition()
+
+        outcome = await service.submit_feedback(
+            "user-1",
+            SubmitFeedbackRequest(
+                target=EvaluationTarget(
+                    service="n-agent",
+                    kind="session_feedback",
+                    subject_id="sess-1",
+                    subject_revision="v1",
+                    session_id="sess-1",
+                ),
+                definition_id="feedback.session_helpful",
+                definition_version="v1",
+                value=True,
+            ),
+        )
+
+        assert outcome.reused is False
+        feedback = await store.get_feedback(outcome.feedback_id)
+        assert feedback["target"]["kind"] == "session_feedback"
+        assert feedback["target"]["session_id"] == "sess-1"
+        result = await store.load_result(outcome.result_id)
+        assert result["provenance"] == "human"
+        assert result["metric_name"] == "feedback.session_helpful"
+        page = await service.list_results(
+            definition_id="feedback.session_helpful",
+            target_kind="session_feedback",
+        )
+        assert [item["result_id"] for item in page.items] == [
+            outcome.result_id
+        ]
+
 
 class TestDefinitionsForTarget:
     """T22 线上样本作业展开的定义解析（按目标种类；T5 新语义：usage 显式

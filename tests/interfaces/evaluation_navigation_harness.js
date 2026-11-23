@@ -36,8 +36,7 @@ const evaluationViews = [
   ['overview', '/evaluations', '概览'],
   ['datasets', '/evaluations/datasets', '数据集'],
   ['evaluators', '/evaluations/evaluators', '评估器'],
-  ['experiments', '/evaluations/experiments', '实验'],
-  ['results', '/evaluations/results', '线上评估'],
+  ['experiments', '/evaluations/experiments', '实验评估'],
   ['annotations', '/evaluations/annotations', '人工标注'],
 ];
 const nav = context.NAGENT.navigation;
@@ -45,7 +44,11 @@ const evaluationsParent = nav.tabConfig.find(c => c.tab === 'evaluations');
 assert.ok(evaluationsParent && evaluationsParent.parent === true, 'evaluations must stay an independent parent');
 // 跨 vm realm 数组原型不同，assert.deepEqual 直接比较必失败；
 // 先 JSON 归一成宿主 realm 普通数组再比较，勿删归一步骤。
-assert.deepEqual(JSON.parse(JSON.stringify(evaluationsParent.children)), evaluationViews.map(([view]) => 'evaluations-' + view), 'six-menu children order');
+// results 行移出循环数组：线上评估子域顶导拆为三项，由下方专属断言块覆盖。
+assert.deepEqual(JSON.parse(JSON.stringify(evaluationsParent.children)), [
+  'evaluations-overview', 'evaluations-datasets', 'evaluations-evaluators',
+  'evaluations-experiments', 'evaluations-results', 'evaluations-annotations',
+], 'six-menu children order');
 assert.ok(!evaluationsParent.children.includes('evaluations-review'), 'review must not be a sidebar child');
 for (const [view, path, label] of evaluationViews) {
   const route = nav.resolveRoute(path);
@@ -89,10 +92,60 @@ for (const [view, path, label] of evaluationViews) {
     assert.equal(items.length, 1);
     assert.equal(items[0].tab, route.activeTab);
     assert.equal(items[0].path, path);
-    assert.equal(items[0].label, view === 'results' ? '评分明细' : label);
+    assert.equal(items[0].label, label);
     assert.equal(items[0].concern, 'evaluation');
     assert.equal(items[0].scope, view);
   }
+}
+// 线上评估子域顶导三项：会话评分 -> 运行评分 -> 评分明细，归属 evaluations-results 子域
+{
+  const resultsTopnav = nav.topnavConfig['evaluations-results'];
+  assert.deepEqual(JSON.parse(JSON.stringify(resultsTopnav.map(i => [i.tab, i.path, i.label]))), [
+    ['evaluations-session-scores', '/evaluations/session-scores', '会话评分'],
+    ['evaluations-run-scores', '/evaluations/run-scores', '运行评分'],
+    ['evaluations-results', '/evaluations/results', '评分明细'],
+  ], '线上评估顶导三项顺序固定');
+  assert.ok(resultsTopnav.every(i => i.topnavParent === 'evaluations-results' && i.concern === 'evaluation'));
+  // 路由解析：两个新路径独立 scope，共享 sidebarTab/topnavParent/renderTab
+  for (const [path, scope] of [
+    ['/evaluations/session-scores', 'session-scores'],
+    ['/evaluations/run-scores', 'run-scores'],
+  ]) {
+    const route = nav.resolveRoute(path);
+    assert.ok(route && route.route, 'routeConfig 缺少 ' + path);
+    assert.equal(route.activeTab, path === '/evaluations/session-scores'
+      ? 'evaluations-session-scores' : 'evaluations-run-scores');
+    assert.equal(route.sidebarTab, 'evaluations-results');
+    assert.equal(route.currentSubdomain, 'evaluations-results');
+    assert.equal(route.route.topnavParent, 'evaluations-results');
+    assert.equal(route.renderTab, 'evaluations');
+    assert.equal(route.route.scope, scope);
+  }
+  // 顶导高亮互不串扰：同子域内每个 tab 仅出现一次
+  const seenTabs = resultsTopnav.map(i => i.tab);
+  assert.equal(new Set(seenTabs).size, seenTabs.length);
+  // tabConfig 两个新 tab 有元数据、不在评估父 children（左导不变）
+  for (const [tab, label] of [
+    ['evaluations-session-scores', '会话评分'],
+    ['evaluations-run-scores', '运行评分'],
+  ]) {
+    const item = nav.tabConfig.find(i => i.tab === tab);
+    assert.ok(item, 'tabConfig 缺少 ' + tab);
+    assert.equal(item.parentTab, 'evaluations');
+    assert.equal(item.label, label);
+    assert.ok(!evaluationsParent.children.includes(tab),
+      tab + ' 是顶导入口，不得成为左导 children');
+  }
+  // 左导落地规范（无例外）：顶导首项落地——线上评估落会话评分；
+  // 相邻子域落点规则不受影响
+  assert.equal(nav.sidebarLandingPath('evaluations-results'), '/evaluations/session-scores');
+  assert.equal(nav.sidebarLandingPath('evaluations-experiments'), '/evaluations/executions');
+  // 相邻子域不串扰：实验子域顶导与 results 子域顶导互不含对方 tab
+  assert.ok(!resultsTopnav.some(i => i.tab === 'evaluations-experiment-results'));
+  assert.ok(!nav.topnavConfig['evaluations-experiments']
+    .some(i => i.tab === 'evaluations-session-scores'));
+  // 左导评估 children 数量不变（6 项，无新 children）
+  assert.equal(evaluationsParent.children.length, 6);
 }
 // 能力目录：独立 routeConfig entry，与评估器共享左导/顶导子域，不进左导 children
 {

@@ -135,6 +135,21 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       { dataset_id: true }, '错误正文须挂 error.data 供展示差异维度');
   }
 
+  // Part A4（plan-261124 T6/T8）：run-scores 只读端点契约——run 粒度行
+  // 独立端点，白名单查询参数原样进入 URL
+  assert.equal(typeof evaluationsApi.listRunScores, 'function',
+    'evaluations API 缺少方法: listRunScores');
+  await evaluationsApi.listRunScores({
+    created_from: '2026-11-01T00:00:00+00:00', created_to: '2026-11-12T00:00:00+00:00',
+    definition_id: 'kb.recall_at_5', definition_version: 'v2',
+    provenance: 'automatic', status: 'value', cursor: 'run-tok-1', limit: 20,
+  });
+  assert.equal(fetchCalls.at(-1).url,
+    '/chat/evaluations/run-scores?created_from=2026-11-01T00%3A00%3A00%2B00%3A00'
+    + '&created_to=2026-11-12T00%3A00%3A00%2B00%3A00'
+    + '&definition_id=kb.recall_at_5&definition_version=v2'
+    + '&provenance=automatic&status=value&cursor=run-tok-1&limit=20');
+
   // -------------------------------------------------------------------------
   // Part B：evaluation.js evaluators 视图
   // -------------------------------------------------------------------------
@@ -953,6 +968,24 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     resultsParamsHistory.push(params);
     if (params.cursor && resultsBehavior === 'cursor_invalid') throw new Error('cursor_invalid');
     return resultsPage;
+  };
+  // Part J（plan-261124 T8）：run-scores 独立端点 stub——请求参数由
+  // runParamsHistory 独立断言（与 resultsParamsHistory 互不混用）；
+  // cursor_invalid 行为供 J12 使用
+  const runParamsHistory = [];
+  let runScoresPage = { items: [], next_cursor: null };
+  let runScoresBehavior = 'ok';
+  api.listRunScores = async params => {
+    calls.push(['listRunScores']);
+    runParamsHistory.push(params);
+    if (params.cursor && runScoresBehavior === 'cursor_invalid') throw new Error('cursor_invalid');
+    return runScoresPage;
+  };
+  // 结果详情默认桩：仅记录调用供“打开弹窗零新请求”计数；返回 null 走
+  // 既有非法响应告警路径。各弹窗场景按需覆写（G8c-2 等）。
+  api.getResult = async () => {
+    calls.push(['getResult']);
+    return null;
   };
   api.listReviewQueue = async params => {
     calls.push(['listReviewQueue']);
@@ -2446,7 +2479,8 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   // 数字列声明、空态三要素、投递去徽章、scrollTable、对比七列 numeric
   const g8Saved = {};
   ['getConfig', 'overview', 'listExperiments', 'getAnalytics', 'getExperiment',
-    'compareExperiments', 'listDatasets', 'listResults', 'getResult'].forEach((name) => {
+    'compareExperiments', 'listDatasets', 'listResults', 'getResult',
+    'listRunScores'].forEach((name) => {
     g8Saved[name] = api[name];
   });
   const hasClass = (node, token) => typeof node.className === 'string'
@@ -2614,7 +2648,8 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     api.getResult = async () => ({
       result: {
         result_id: 'res-g8', metric_name: 'm-1', provenance: 'automatic',
-        status: 'value', typed_value: 0.9, created_at: '',
+        status: 'value', passed: true, typed_value: 0.9,
+        explanation: 'tool contract satisfied', created_at: '',
       },
       evidence_summary: { target: { service: 'n-agent', session_id: 'detail-session', run_id: 'detail-run' } },
       deliveries: [
@@ -2636,6 +2671,519 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       .map(node => node.textContent);
     assert.ok(attemptTds.includes('0'), 'attempt_count=0 显示 0');
     assert.ok(attemptTds.includes('-'), 'attempt_count=null 回落 -');
+
+    // spec-261123："结果"文字框：状态含义/判定值/说明/跳过原因/失败分类/
+    // 作业状态/领取次数，段间空行，textContent 安全渲染
+    // T1：保存原始 mock 与 alerts 快照，try/finally 恢复，避免异常场景
+    // 污染后续用例；openResultModal 异常路径收尾后由既有 resultClose 关闭
+    const baseGetResult = api.getResult;
+    const baseAlerts = alerts.slice();
+    const createdTagsBeforeResultBox = createdTags.length;
+    let getResultCalls = 0;
+    const resultFrameCount = () => findAll(body, node => hasClass(node, 'modal-backdrop')
+      && hasClass(node, 'evaluations-modal')
+      && find(node, inner => inner.tag === 'h4'
+        && inner.textContent === '评分详情')).length;
+    const findResultBox = () => find(body,
+      node => node.tag === 'pre' && hasClass(node, 'evaluations-result-detail'));
+    try {
+      const reopenResultDetail = async () => {
+        const closeBtn = find(body, node => hasClass(node, 'modal-close') && node.handlers.click);
+        if (closeBtn) await closeBtn.handlers.click();
+        await flush();
+        assert.equal(resultFrameCount(), 0, '关闭后评分详情 frame 已移除');
+        await findButton('详情', root).handlers.click();
+        await flush();
+      };
+      const findResultBoxCount = () => findAll(body,
+        node => node.tag === 'pre' && hasClass(node, 'evaluations-result-detail')).length;
+
+      // 表驱动 runner：resultBoxCases 循环与下方独立用例共用同一套断言
+      // （一次性 getResult 计数、无错误提示、文字框存在、segments join
+      // 逐字核对）。options.light=true 供 resultBoxCases 循环保持既有
+      // 覆盖口径：跳过唯一文字框计数、关闭后 frame 移除与响应快照核对。
+      const runResultBoxCase = async (c, options) => {
+        const light = !!(options && options.light);
+        const response = {
+          result: Object.assign({
+            result_id: 'res-box', metric_name: 'm-1', provenance: 'automatic',
+            created_at: '',
+          }, c.result),
+          job: c.job === undefined ? null : c.job,
+          evidence_summary: {},
+          deliveries: c.deliveries || [],
+          attempts: c.attempts,
+        };
+        const responseSnapshot = (c.noSnapshot || light)
+          ? null : JSON.parse(JSON.stringify(response));
+        api.getResult = async () => response;
+        const runnerGetResult = api.getResult;
+        api.getResult = async () => { getResultCalls += 1; return runnerGetResult(); };
+        getResultCalls = 0;
+        const runnerAlertsBefore = alerts.length;
+        await reopenResultDetail();
+        assert.equal(getResultCalls, 1, '打开详情只调用一次 getResult: ' + c.name);
+        assert.equal(alerts.length, runnerAlertsBefore, '合法降级数据不新增错误提示: ' + c.name);
+        const box = findResultBox();
+        assert.ok(box, '结果文字框存在: ' + c.name);
+        if (!light) {
+          assert.equal(findResultBoxCount(), 1, '结果文字框恰为一个: ' + c.name);
+        }
+        assert.equal(box.children.length, 0, '结果文字框无子元素: ' + c.name);
+        for (const re of (c.expect || [])) {
+          assert.match(box.textContent, re, c.name);
+        }
+        for (const absentText of (c.absent || [])) {
+          assert.doesNotMatch(box.textContent, new RegExp(absentText),
+            c.name + ' 不应出现: ' + absentText);
+        }
+        assert.equal(box.textContent, c.segments.join('\n\n'),
+          '结果文字框段落顺序与空行分隔: ' + c.name);
+        if (!light) {
+          const runnerClose = find(body, node => hasClass(node, 'modal-close') && node.handlers.click);
+          if (runnerClose) await runnerClose.handlers.click();
+          await flush();
+          assert.equal(resultFrameCount(), 0, '关闭后评分详情 frame 已移除: ' + c.name);
+          if (!c.noSnapshot) {
+            assert.deepEqual(JSON.parse(JSON.stringify(response)), responseSnapshot,
+              '渲染不修改 getResult 响应: ' + c.name);
+          }
+        }
+      };
+
+      // 基准 value 用例（passed=true）
+      {
+        const resultBox = findResultBox();
+        assert.ok(resultBox, '结果详情须提供"结果"文字框（pre.evaluations-result-detail）');
+        assert.equal(resultBox.children.length, 0, '结果文字框 textContent 安全渲染，无子元素');
+        assert.ok(/\n\n/.test(resultBox.textContent), '结果文字框各段以空行分隔');
+        assert.match(resultBox.textContent, /状态：通过 — 评估器产出了判定值，质量判定通过/);
+        assert.match(resultBox.textContent, /判定值：0\.9；门禁判定：通过/);
+        assert.match(resultBox.textContent, /结果说明：tool contract satisfied/);
+        assert.equal(resultFrameCount(), 1, '评分详情 frame 打开时恰好挂载一个');
+        assert.equal(findResultBoxCount(), 1, '结果文字框在详情弹窗内恰为一个');
+        // 区块顺序：kv 区 -> "结果"标题 -> pre 文字框 -> 投递标题（基准
+        // fixture 含两条投递，顺序必须在有投递数据时成立）
+        const detailKids = resultBox.parentElement.children;
+        const kvBlock = detailKids.find(node => hasClass(node, 'policy-list'));
+        const resultTitle = detailKids.find(node => hasClass(node, 'evaluations-block-title')
+          && find(node, inner => hasClass(inner, 'panel-title') && inner.textContent === '结果'));
+        const deliveryTitle = detailKids.find(node => hasClass(node, 'evaluations-block-title')
+          && find(node, inner => hasClass(inner, 'panel-title') && inner.textContent === '投递'));
+        assert.ok(kvBlock && resultTitle && deliveryTitle, 'kv 区、结果标题与投递标题均在弹窗内');
+        assert.equal(detailKids.indexOf(resultTitle), detailKids.indexOf(kvBlock) + 1,
+          '结果区块紧跟 kv 区');
+        assert.equal(detailKids.indexOf(resultBox), detailKids.indexOf(resultTitle) + 1,
+          '结果文字框紧跟结果区块标题');
+        assert.equal(detailKids.indexOf(deliveryTitle), detailKids.indexOf(resultBox) + 1,
+          '投递区块紧跟结果文字框');
+        // 按预期段落数组核对顺序与 join('\n\n')（基准 fixture 全段确定）
+        assert.equal(resultBox.textContent, [
+          '状态：通过 — 评估器产出了判定值，质量判定通过',
+          '判定值：0.9；门禁判定：通过',
+          '结果说明：tool contract satisfied',
+        ].join('\n\n'), '基准用例段落顺序与空行分隔');
+      }
+
+      // 分状态/降级用例表（segments 为按 spec 构造的预期段落数组，逐字固定）
+      const skipStatusText = '状态：跳过 — 该指标对此样本未执行或不可评估，'
+        + '原因可来自评估器或调度预算等前置检查（不是 0 分也不是失败，统计分母不含它）';
+      const errorStatusText = '状态：评估失败 — 本条结果未形成有效质量判定，'
+        + '可能来自执行异常或作业终止（不计入统计分母，单独计入异常）；'
+        + '不据此断言整个作业从未产生其它指标的判定';
+      const valueNeutralText = '状态：数值 — 已产出判定值，未提供门禁判定，不推断通过或质量不通过';
+      const resultBoxCases = [
+        { name: 'value-passed-false',
+          result: { status: 'value', passed: false, typed_value: false }, job: null,
+          segments: ['状态：质量不通过 — 评估器产出了判定值，但未达到通过标准',
+            '判定值：false；门禁判定：不通过'],
+          expect: [/状态：质量不通过 — 评估器产出了判定值，但未达到通过标准/, /判定值：false；门禁判定：不通过/] },
+        { name: 'value-passed-null-zero',
+          result: { status: 'value', passed: null, typed_value: 0 }, job: null,
+          segments: [valueNeutralText, '判定值：0；门禁判定：无门禁判定'],
+          expect: [/状态：数值 — 已产出判定值，未提供门禁判定，不推断通过或质量不通过/, /判定值：0；门禁判定：无门禁判定/] },
+        { name: 'value-passed-undefined-dash',
+          result: { status: 'value', passed: undefined, typed_value: null }, job: null,
+          segments: [valueNeutralText, '判定值：-；门禁判定：无门禁判定'],
+          expect: [/状态：数值 — /, /判定值：-；门禁判定：无门禁判定/] },
+        { name: 'skipped-full',
+          result: { status: 'skipped', skip_reason: 'evidence_missing', passed: null, typed_value: null, explanation: '缺少可核实的副作用证据，不能仅凭完成自述判定', evaluation_trace_id: 'trace-abc-0000' },
+          job: { status: 'skipped', error_type: null, attempt_count: 1 },
+          segments: [skipStatusText,
+            '结果说明：缺少可核实的副作用证据，不能仅凭完成自述判定',
+            '跳过原因：evidence_missing（缺少可核实证据）',
+            '作业状态：skipped', '作业领取次数：1', '评估 Trace：trace-abc-0000'],
+          expect: [/状态：跳过 — /, /跳过原因：evidence_missing（缺少可核实证据）/, /结果说明：缺少可核实的副作用证据，不能仅凭完成自述判定/, /作业状态：skipped/, /作业领取次数：1/, /评估 Trace：trace-abc-0000/],
+          absent: ['判定值', '失败分类'] },
+        { name: 'error-network',
+          result: { status: 'error', passed: null, typed_value: null, explanation: 'job failed: network' },
+          job: { status: 'error', error_type: 'network', attempt_count: 4 },
+          segments: [errorStatusText, '结果说明：job failed: network',
+            '失败分类：network（网络错误）', '作业状态：error', '作业领取次数：4'],
+          expect: [/状态：评估失败 — /, /失败分类：network（网络错误）/, /作业状态：error/, /作业领取次数：4/],
+          absent: ['已重试', '判定值', '跳过原因'] },
+        { name: 'skipped-missing-reason-and-explanation',
+          result: { status: 'skipped', skip_reason: undefined, passed: null, typed_value: null },
+          job: { status: 'error', error_type: '', attempt_count: 0 },
+          segments: [skipStatusText, '跳过原因：未记录', '作业状态：error', '作业领取次数：0'],
+          expect: [/跳过原因：未记录/, /作业领取次数：0/],
+          absent: ['结果说明', '失败分类'] },
+        { name: 'error-unknown-type-bad-count',
+          result: { status: 'error', passed: null, typed_value: null, explanation: 'job failed: unknown_kind' },
+          job: { status: 'error', error_type: 'unknown_kind', attempt_count: 'x' },
+          segments: [errorStatusText, '结果说明：job failed: unknown_kind',
+            '失败分类：unknown_kind', '作业状态：error', '作业领取次数：未记录'],
+          expect: [/失败分类：unknown_kind/, /作业领取次数：未记录/, /作业状态：error/] },
+        { name: 'error-non-integer-count-html-explanation',
+          result: { status: 'error', passed: null, typed_value: null, explanation: '<img src=x onerror=alert(1)>' },
+          job: { status: 'error', error_type: 'network', attempt_count: 1.5 },
+          segments: [errorStatusText, '结果说明：<img src=x onerror=alert(1)>',
+            '失败分类：network（网络错误）', '作业状态：error', '作业领取次数：未记录'],
+          expect: [/结果说明：<img src=x onerror=alert\(1\)>/, /作业领取次数：未记录/] },
+        { name: 'error-negative-count',
+          result: { status: 'error', passed: null, typed_value: null, explanation: 'job failed: network' },
+          job: { status: 'error', error_type: 'timeout', attempt_count: -1 },
+          segments: [errorStatusText, '结果说明：job failed: network',
+            '失败分类：timeout（超时）', '作业状态：error', '作业领取次数：未记录'],
+          expect: [/失败分类：timeout（超时）/, /作业领取次数：未记录/] },
+        { name: 'human-provenance-no-job',
+          result: { status: 'value', passed: true, typed_value: true, provenance: 'human', explanation: '人工复核通过' },
+          job: null,
+          segments: ['状态：通过 — 评估器产出了判定值，质量判定通过',
+            '判定值：true；门禁判定：通过', '结果说明：人工复核通过'],
+          expect: [/状态：通过 — /, /结果说明：人工复核通过/],
+          absent: ['失败分类', '作业状态', '作业领取次数'] },
+        { name: 'skipped-unknown-reason-injection-fields',
+          result: { status: 'skipped', skip_reason: '<script>alert(1)</script>', passed: null, typed_value: null, explanation: '长'.repeat(500), evaluation_trace_id: '<img src=x>' },
+          job: { status: 'skipped', error_type: null, attempt_count: 2 },
+          segments: [skipStatusText, '结果说明：' + '长'.repeat(500),
+            '跳过原因：<script>alert(1)</script>', '作业状态：skipped',
+            '作业领取次数：2', '评估 Trace：<img src=x>'],
+          expect: [/跳过原因：<script>alert\(1\)<\/script>/, /评估 Trace：<img src=x>/, /作业领取次数：2/],
+          absent: ['失败分类'] },
+        { name: 'error-unknown-type-injection',
+          result: { status: 'error', passed: null, typed_value: null, explanation: 'job failed: <b>x</b>' },
+          job: { status: 'error', error_type: '<b>x</b>', attempt_count: 2 },
+          segments: [errorStatusText, '结果说明：job failed: <b>x</b>',
+            '失败分类：<b>x</b>', '作业状态：error', '作业领取次数：2'],
+          expect: [/失败分类：<b>x<\/b>/, /结果说明：job failed: <b>x<\/b>/] },
+        { name: 'unknown-status-no-job',
+          result: { status: 'weird', passed: undefined, typed_value: false }, job: null,
+          segments: ['状态：weird — 无法解释该结果状态，不映射为通过、跳过或失败'],
+          expect: [/状态：weird — 无法解释该结果状态，不映射为通过、跳过或失败/],
+          absent: ['判定值', '失败分类', '作业状态', '作业领取次数', 'undefined'] },
+      ];
+      for (const c of resultBoxCases) {
+        await runResultBoxCase(c, { light: true });
+      }
+
+      // 全部八个 skip_reason 已知标签 + 未知/原型名/缺失降级（期望文案
+      // 固定字面量，不从被测映射生成）
+      const skipReasonCopies = [
+        ['missing_reference', '缺少参考答案'],
+        ['not_applicable', '指标不适用'],
+        ['no_answer', '参考相关性标注中无相关项'],
+        ['evidence_missing', '缺少可核实证据'],
+        ['redacted_evidence', '证据已脱敏'],
+        ['evidence_oversized', '证据超出大小上限'],
+        ['budget_exhausted', '评估预算耗尽'],
+        ['consistency', '一致性检查未通过'],
+      ];
+      for (const [reason, label] of skipReasonCopies) {
+        await runResultBoxCase({
+          name: 'skip-reason-' + reason,
+          result: { status: 'skipped', skip_reason: reason },
+          segments: [skipStatusText, '跳过原因：' + reason + '（' + label + '）'],
+        });
+      }
+      for (const rawReason of ['toString', 'constructor', '__proto__', 'unknown_kind']) {
+        await runResultBoxCase({
+          name: 'skip-reason-raw-' + rawReason,
+          result: { status: 'skipped', skip_reason: rawReason },
+          segments: [skipStatusText, '跳过原因：' + rawReason],
+        });
+      }
+      await runResultBoxCase({
+        name: 'skip-reason-null', result: { status: 'skipped', skip_reason: null },
+        segments: [skipStatusText, '跳过原因：未记录'],
+      });
+      await runResultBoxCase({
+        name: 'skip-reason-blank', result: { status: 'skipped', skip_reason: '   ' },
+        segments: [skipStatusText, '跳过原因：未记录'],
+      });
+
+      // 全部十二个 error_type 已知标签 + other/未知/缺失降级 + 投递冲突字段
+      const errorTypeCopies = [
+        ['network', '网络错误'], ['rate_limit', '限流'], ['timeout', '超时'],
+        ['format_error', '响应格式错误'], ['deadline_exceeded', '作业超期'],
+        ['attempt_cap_exceeded', '尝试次数上限耗尽'], ['budget_exhausted', '预算耗尽'],
+        ['auth', '认证失败'], ['conflict', '冲突'], ['judge_error', 'Judge 调用错误'],
+        ['worker_error', 'worker 内部错误'], ['cancelled', '已取消'],
+      ];
+      for (const [type, label] of errorTypeCopies) {
+        await runResultBoxCase({
+          name: 'error-type-' + type,
+          result: { status: 'error' },
+          job: { status: 'error', error_type: type, attempt_count: 2 },
+          segments: [errorStatusText, '失败分类：' + type + '（' + label + '）',
+            '作业状态：error', '作业领取次数：2'],
+        });
+      }
+      await runResultBoxCase({
+        name: 'error-type-other', result: { status: 'error' },
+        job: { status: 'error', error_type: 'other', attempt_count: 2 },
+        segments: [errorStatusText, '失败分类：other', '作业状态：error', '作业领取次数：2'],
+      });
+      await runResultBoxCase({
+        name: 'error-type-blank', result: { status: 'error' },
+        job: { status: 'error', error_type: '   ', attempt_count: 0 },
+        segments: [errorStatusText, '失败分类：未记录', '作业状态：error', '作业领取次数：0'],
+      });
+      await runResultBoxCase({
+        name: 'error-type-null', result: { status: 'error' },
+        job: { status: 'error', error_type: null, attempt_count: 3 },
+        segments: [errorStatusText, '失败分类：未记录', '作业状态：error', '作业领取次数：3'],
+      });
+      await runResultBoxCase({
+        name: 'error-type-missing', result: { status: 'error' },
+        job: { status: 'error', attempt_count: 1 },
+        segments: [errorStatusText, '失败分类：未记录', '作业状态：error', '作业领取次数：1'],
+      });
+      // deliveries 上的 last_error_type/dead_letter 与 job.error_type 冲突时，
+      // 文本只允许使用 job.error_type（投递状态仅在投递区展示）
+      await runResultBoxCase({
+        name: 'error-type-delivery-conflict', result: { status: 'error' },
+        job: { status: 'error', error_type: 'auth', attempt_count: 1 },
+        deliveries: [{ sink: 'langfuse', projection_version: 'p1', status: 'dead_letter',
+          last_error_type: 'timeout', dead_letter: true }],
+        segments: [errorStatusText, '失败分类：auth（认证失败）',
+          '作业状态：error', '作业领取次数：1'],
+        absent: ['timeout', '超时'],
+      });
+
+      // passed 意外类型走中性"数值"与"无门禁判定"；typed_value 对象/数组 JSON
+      await runResultBoxCase({
+        name: 'value-passed-string-true',
+        result: { status: 'value', passed: 'true', typed_value: 1 },
+        segments: [valueNeutralText, '判定值：1；门禁判定：无门禁判定'],
+      });
+      await runResultBoxCase({
+        name: 'value-passed-number-1',
+        result: { status: 'value', passed: 1, typed_value: 2.5 },
+        segments: [valueNeutralText, '判定值：2.5；门禁判定：无门禁判定'],
+      });
+      await runResultBoxCase({
+        name: 'value-passed-object-typed-object',
+        result: { status: 'value', passed: {}, typed_value: { a: 1 } },
+        segments: [valueNeutralText, '判定值：{"a":1}；门禁判定：无门禁判定'],
+      });
+      await runResultBoxCase({
+        name: 'value-typed-array',
+        result: { status: 'value', passed: null, typed_value: [1, 'x'] },
+        segments: [valueNeutralText, '判定值：[1,"x"]；门禁判定：无门禁判定'],
+      });
+
+      // 缺失/空白结果状态显示"状态未知"，且不显示判定值段
+      const unknownStatusText = '状态：状态未知 — 无法解释该结果状态，不映射为通过、跳过或失败';
+      await runResultBoxCase({
+        name: 'status-missing', result: { typed_value: false },
+        segments: [unknownStatusText], absent: ['判定值'],
+      });
+      await runResultBoxCase({
+        name: 'status-blank', result: { status: '   ', typed_value: false },
+        segments: [unknownStatusText], absent: ['判定值'],
+      });
+
+      // job.status 缺失/空白/未知/进行中原值；成功结果有 job 时同样展示
+      await runResultBoxCase({
+        name: 'job-status-missing', result: { status: 'error' },
+        job: { error_type: 'network', attempt_count: 1 },
+        segments: [errorStatusText, '失败分类：network（网络错误）',
+          '作业状态：未记录', '作业领取次数：1'],
+      });
+      await runResultBoxCase({
+        name: 'job-status-blank', result: { status: 'error' },
+        job: { status: '', error_type: 'network', attempt_count: 1 },
+        segments: [errorStatusText, '失败分类：network（网络错误）',
+          '作业状态：未记录', '作业领取次数：1'],
+      });
+      await runResultBoxCase({
+        name: 'job-status-unknown', result: { status: 'error' },
+        job: { status: 'weird-job', error_type: 'network', attempt_count: 1 },
+        segments: [errorStatusText, '失败分类：network（网络错误）',
+          '作业状态：weird-job', '作业领取次数：1'],
+      });
+      await runResultBoxCase({
+        name: 'job-status-running', result: { status: 'error' },
+        job: { status: 'running', error_type: 'network', attempt_count: 1 },
+        segments: [errorStatusText, '失败分类：network（网络错误）',
+          '作业状态：running', '作业领取次数：1'],
+      });
+      await runResultBoxCase({
+        name: 'value-with-succeeded-job-attempts',
+        result: { status: 'value', passed: true, typed_value: true },
+        job: { status: 'succeeded', attempt_count: 0 },
+        attempts: [{ attempt_no: 1 }, { attempt_no: 2 }, { attempt_no: 3 },
+          { attempt_no: 4 }, { attempt_no: 5 }],
+        segments: ['状态：通过 — 评估器产出了判定值，质量判定通过',
+          '判定值：true；门禁判定：通过', '作业状态：succeeded', '作业领取次数：0'],
+        absent: ['作业领取次数：5'],
+      });
+
+      // attempt_count 缺失/null/数字字符串/超出安全整数 -> 未记录
+      // （0/1/2/负数/小数/'x' 已由上方用例覆盖）
+      const attemptCountCases = [
+        ['missing', undefined], ['null', null], ['string-2', '2'],
+        ['above-max-safe', Number.MAX_SAFE_INTEGER + 1],
+      ];
+      for (const [countName, countValue] of attemptCountCases) {
+        await runResultBoxCase({
+          name: 'attempt-count-' + countName, result: { status: 'error' },
+          job: { status: 'error', error_type: 'network', attempt_count: countValue },
+          segments: [errorStatusText, '失败分类：network（网络错误）',
+            '作业状态：error', '作业领取次数：未记录'],
+        });
+      }
+
+      // Trace 缺失/null/空白时整段省略（非空原样已由 skipped-full 覆盖）
+      const traceAbsentSegments = [skipStatusText,
+        '跳过原因：evidence_missing（缺少可核实证据）'];
+      await runResultBoxCase({
+        name: 'trace-missing', result: { status: 'skipped', skip_reason: 'evidence_missing' },
+        segments: traceAbsentSegments, absent: ['评估 Trace'],
+      });
+      await runResultBoxCase({
+        name: 'trace-null',
+        result: { status: 'skipped', skip_reason: 'evidence_missing', evaluation_trace_id: null },
+        segments: traceAbsentSegments, absent: ['评估 Trace'],
+      });
+      await runResultBoxCase({
+        name: 'trace-blank',
+        result: { status: 'skipped', skip_reason: 'evidence_missing', evaluation_trace_id: '   ' },
+        segments: traceAbsentSegments, absent: ['评估 Trace'],
+      });
+
+      // 可选文本字段意外类型：标量转 String，对象/数组 JSON，循环引用与
+      // 抛错 toJSON 落"无法展示"；异常序列化 fixture 放在 explanation，
+      // 避免无意要求重构既有 kvRow
+      const circularExplanation = {};
+      circularExplanation.self = circularExplanation;
+      const explanationCases = [
+        ['boolean-true', true, '结果说明：true', false],
+        ['number', 42, '结果说明：42', false],
+        ['object-json', { a: 1 }, '结果说明：{"a":1}', false],
+        ['array-json', [1, 'x'], '结果说明：[1,"x"]', false],
+        // 循环引用与抛错 toJSON 无法 JSON 快照，跳过响应不可变比较
+        ['circular', circularExplanation, '结果说明：无法展示', true],
+        ['tojson-throws', { toJSON: () => { throw new Error('nope'); } }, '结果说明：无法展示', true],
+      ];
+      for (const [explainName, explainValue, explainExpected, explainNoSnapshot] of explanationCases) {
+        await runResultBoxCase({
+          name: 'explanation-' + explainName,
+          result: { status: 'error', explanation: explainValue },
+          segments: [errorStatusText, explainExpected],
+          noSnapshot: explainNoSnapshot,
+        });
+      }
+      await runResultBoxCase({
+        name: 'explanation-blank', result: { status: 'error', explanation: '   ' },
+        segments: [errorStatusText], absent: ['结果说明'],
+      });
+
+      // status=error 且无 job（human 来源兜底）：失败分类与作业段省略
+      await runResultBoxCase({
+        name: 'error-no-job', result: { status: 'error', explanation: 'x' },
+        segments: [errorStatusText, '结果说明：x'],
+        absent: ['失败分类', '作业状态', '作业领取次数'],
+      });
+
+      // 长说明断言须放在独立 fixture；上一循环最后一项不含长说明。
+      {
+        // 此处先重开指定长说明 fixture，再断言，不能读取上一轮未知状态 fixture。
+        api.getResult = async () => ({
+          result: { status: 'value', passed: null, typed_value: 0,
+            explanation: '首行\n' + '长'.repeat(500) + '\n末行' },
+          job: null, evidence_summary: {}, deliveries: [],
+        });
+        await reopenResultDetail();
+        assert.ok(findResultBox().textContent.includes('结果说明：首行\n' + '长'.repeat(500) + '\n末行'),
+          '长说明和原始换行完整保留不截断');
+        assert.equal(findResultBox().textContent, [
+          valueNeutralText,
+          '判定值：0；门禁判定：无门禁判定',
+          '结果说明：首行\n' + '长'.repeat(500) + '\n末行',
+        ].join('\n\n'), '长说明段落顺序与空行分隔完整');
+      }
+      // 注入字符串不得创建 img/script 元素（复检错误路径 mock）
+      api.getResult = async () => ({
+        result: { result_id: 'res-box', metric_name: 'm-1', provenance: 'automatic',
+          status: 'error', passed: null, typed_value: null,
+          explanation: '<img src=x onerror=alert(1)>', created_at: '' },
+        job: { status: 'error', error_type: 'network', attempt_count: 1.5 },
+        evidence_summary: {}, deliveries: [],
+      });
+      await reopenResultDetail();
+      {
+        const injectedBox = findResultBox();
+        assert.ok(injectedBox, '注入复检用例结果文字框存在');
+        assert.ok(!find(injectedBox, node => node.tag === 'img' || node.tag === 'script'),
+          '注入 HTML 字符串不得创建 img/script 元素');
+      }
+
+      // 请求失败：沿用既有提示，不挂载弹窗
+      alerts.length = 0;
+      api.getResult = async () => { throw new Error('boom'); };
+      await reopenResultDetail();
+      assert.match(alerts.join('\n'), /结果详情加载失败/, '请求失败沿用既有提示');
+      assert.ok(!findResultBox(), '请求失败不挂载结果文字框');
+
+      // 非法响应（null）：同样提示加载失败并返回
+      alerts.length = 0;
+      api.getResult = async () => null;
+      await reopenResultDetail();
+      assert.match(alerts.join('\n'), /结果详情加载失败/, '非法响应提示加载失败');
+      assert.equal(alerts.length, 1, '非法响应只提示一次加载失败');
+      assert.equal(resultFrameCount(), 0, '非法响应不挂载评分详情 frame');
+      assert.ok(!findResultBox(), '非法响应不挂载结果文字框');
+
+      // 非法响应逐项覆盖（null 由上方用例覆盖）：标量/数组/空对象与
+      // result 字段非法；每次记录评分详情 frame 数量与 alerts 长度，
+      // 断言仅追加一次加载失败提示且未挂载评分详情 frame
+      const invalidResultResponses = [
+        ['标量数字', 42], ['标量字符串', 'nope'],
+        ['数组', [{ result: { status: 'value' } }]], ['空对象', {}],
+        ['result-null', { result: null }], ['result-数字', { result: 42 }],
+        ['result-数组', { result: [] }], ['result-字符串', { result: 'x' }],
+      ];
+      for (const [badName, bad] of invalidResultResponses) {
+        alerts.length = 0;
+        api.getResult = async () => bad;
+        await reopenResultDetail();
+        assert.match(alerts.join('\n'), /结果详情加载失败/, '非法响应提示加载失败: ' + badName);
+        assert.equal(alerts.length, 1, '非法响应只提示一次加载失败: ' + badName);
+        assert.equal(resultFrameCount(), 0, '非法响应不挂载评分详情 frame: ' + badName);
+        assert.ok(!findResultBox(), '非法响应不挂载结果文字框: ' + badName);
+      }
+
+      // 收尾：恢复合法详情并验证关闭，交由下方既有 resultClose 再次打开收尾
+      api.getResult = baseGetResult;
+      await reopenResultDetail();
+      assert.ok(findResultBox(), '恢复合法 mock 后结果文字框正常渲染');
+      const preCloseBtn = find(body, node => hasClass(node, 'modal-close') && node.handlers.click);
+      if (preCloseBtn) await preCloseBtn.handlers.click();
+      await flush();
+      assert.equal(resultFrameCount(), 0, '收尾关闭后评分详情 frame 已移除');
+      // 打开详情全过程不新增 Trace 请求类元素（img/script/iframe）
+      const newCreatedTags = createdTags.slice(createdTagsBeforeResultBox);
+      assert.ok(!newCreatedTags.some(tag => tag === 'img' || tag === 'script' || tag === 'iframe'),
+        '打开详情未新增 Trace 请求类元素');
+      await reopenResultDetail();
+    } finally {
+      api.getResult = baseGetResult;
+      alerts.length = 0;
+      for (const baseAlert of baseAlerts) alerts.push(baseAlert);
+    }
+
     const resultClose = find(body, node => hasClass(node, 'modal-close') && node.handlers.click);
     if (resultClose) await resultClose.handlers.click();
 
@@ -3996,6 +4544,1164 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       '评估页所有操作不得调用 Agent activate API');
     // 还原 mock 状态，避免污染后续（Part I 为最后一个 Part）
   }
+
+  // -------------------------------------------------------------------------
+  // Part J（spec-261119 + plan-261124 T8）：会话评分锁定 target_kind；
+  // 运行评分切换 run 粒度独立端点 + 视图隔离
+  // J1：init(state.route={scope:'session-scores'}) 后 calls 含 listResults，
+  //     params.target_kind === 'session_feedback'；筛选区不含
+  //     results_target_kind 下拉；页面标题外壳为“会话评分”
+  // J2：run-scores 走独立端点 listRunScores（calls 含 listRunScores、
+  //     runParamsHistory 参数无 target_kind），标题“运行评分”，5 列表头
+  //     [来源会话, AgentRun, 评分, 最近时间, 操作]、每行 5 单元格，
+  //     AgentRun 列显示 run_id，评分列 指标名=值 + 状态徽标
+  // J2b：同一会话两个 run 各自成行，行序与接口返回一致
+  // J2c：同 run 多指标逐条（0/false/null/对象值原样 + passed 三态徽标）
+  // J2d：session 冲突/缺失行回退“未关联会话”，不生成 observations 链接
+  // J2e：XSS（metrics/run_id 含 <img onerror>/&）在列表与弹窗均文本渲染，
+  //      仅保留合法 observations 直达链接；打开弹窗零新请求
+  // J3：会话页变更状态筛选 -> listResults 仍带 target_kind=session_feedback
+  //     且游标重置（不带旧 cursor）
+  // J4：会话页下一页 -> listResults 携带游标且 target_kind 不变；返回第 1 页同理
+  // J5：会话页 -> run-scores -> 再切回：会话页筛选保留、两视图游标各自
+  //     重置；runParams 不含 target_kind，会话参数不含运行类型
+  // J6：乱序防护——listResults 可控延迟返回，后发请求先渲染时，迟到的
+  //     成功响应不落 DOM（旧数据区不被旧 items 覆盖）
+  // J7：空态——锁定类型不计为用户筛选：空数据且无其它筛选 -> “暂无会话
+  //     评分...”/“暂无运行评分...”分支；有用户筛选 -> 提示调整筛选
+  // J8：评分明细视图（scope:'results'）不受影响：可渲染 results_target_kind
+  //     下拉且 options 含 session_feedback，target_kind 默认空（全部目标）
+  // J9：experiment-results 视图不受影响：仍请求 listExperimentResults、
+  //     不请求 listResults/listRunScores
+  // J11：B 类总闸关闭（api.status 返回 {enabled:false}）进入锁定视图：
+  //      仅显示停用提示，不发起 listResults/listRunScores
+  // J12：run-scores 带游标请求返回 cursor_invalid：显示“重新查询”，点击后
+  //      仍调 listRunScores、游标清空、筛选保留、不外发 target_kind
+  // J13：results/session-scores/experiment-results 三视图列集合不变（8 列）
+  // -------------------------------------------------------------------------
+  const lockedRow = (metricName, sessionId) => ({
+    result_id: 'res-lock-' + metricName, metric_name: metricName, provenance: 'human',
+    session_id: sessionId || 'source-session-1', target_service: 'n-agent', run_id: 'run-1',
+    status: 'value', passed: true, typed_value: 0.9, created_at: '2026-11-19T00:00:00+00:00',
+  });
+  const lockedViewTitles = () => findAll(root, node => node.tag === 'span'
+    && hasClassName(node, 'panel-title')).map(node => node.textContent);
+  const lastResultsParams = () => JSON.parse(JSON.stringify(resultsParamsHistory.at(-1) || {}));
+  // run 粒度行（plan-261124 T3 后端聚合形状）：{target_service, run_id,
+  // session_id, metrics[], result_count, last_created_at}，metrics 逐条含
+  // result_id/metric_name/typed_value/status/passed/provenance/created_at
+  const runMetric = (name, typedValue, status, passed) => ({
+    result_id: 'res-run-' + name + '-' + String(status) + '-' + String(passed),
+    metric_name: name, typed_value: typedValue, status: status, passed: passed,
+    provenance: 'automatic', created_at: '2026-11-19T00:00:00+00:00',
+  });
+  const runRow = (metricName, runId, overrides) => Object.assign({
+    target_service: 'n-agent', run_id: runId || 'run-1',
+    session_id: 'source-session-1',
+    metrics: [runMetric(metricName, 0.9, 'value', true)],
+    result_count: 1, last_created_at: '2026-11-19T00:00:00+00:00',
+  }, overrides || {});
+  const lastRunParams = () => JSON.parse(JSON.stringify(runParamsHistory.at(-1) || {}));
+  const runBodyRows = () => findAll(root, node => node.tag === 'tr'
+    && node.children.some(c => c.tag === 'td'));
+
+  // J1) session-scores：锁定 session_feedback + 无目标类型下拉 + 标题外壳
+  resultsPage = { items: [lockedRow('j1.session.metric')], next_cursor: null };
+  resultsParamsHistory.length = 0;
+  calls.length = 0;
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  assert.equal(resultsParamsHistory.length, 1, 'session-scores 发起 listResults');
+  assert.equal(lastResultsParams().target_kind, 'session_feedback',
+    '会话评分锁定 target_kind=session_feedback');
+  assert.equal(find(root, node => node.name === 'results_target_kind'), undefined,
+    '锁定视图不渲染目标类型下拉');
+  assert.ok(lockedViewTitles().includes('会话评分'), '页面标题外壳为会话评分');
+  assert.match(root.textContent, /j1\.session\.metric/);
+  assert.ok(calls.some(c => c[0] === 'listResults'));
+
+  // J2) run-scores：独立 run 粒度端点 listRunScores + 5 列渲染
+  runScoresPage = { items: [runRow('j2.run.metric', 'run-j2-1')],
+    next_cursor: null, total_pages: 1 };
+  runParamsHistory.length = 0;
+  calls.length = 0;
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.ok(calls.some(c => c[0] === 'listRunScores'), 'run-scores 须调用 listRunScores');
+  assert.ok(!calls.some(c => c[0] === 'listResults'), 'run-scores 不得再走 listResults');
+  assert.equal(runParamsHistory.length, 1, 'run-scores 发起一次 listRunScores');
+  assert.ok(!('target_kind' in lastRunParams()), 'run-scores 不外发锁定 target_kind');
+  assert.equal(find(root, node => node.name === 'results_target_kind'), undefined,
+    '锁定视图不渲染目标类型下拉');
+  assert.ok(lockedViewTitles().includes('运行评分'), '页面标题外壳为运行评分');
+  const runHeaderLabels = () => findAll(root, node => node.tag === 'th')
+    .map(node => node.textContent);
+  assert.deepEqual(runHeaderLabels(), ['来源会话', 'AgentRun', '评分', '最近时间', '操作'],
+    'run-scores 5 列表头');
+  assert.equal(runBodyRows().length, 1, '一个 run 一行');
+  assert.ok(runBodyRows().every(row => row.children.filter(c => c.tag === 'td').length === 5),
+    '每行 5 单元格');
+  assert.match(root.textContent, /run-j2-1/, 'AgentRun 列显示 run_id');
+  assert.match(root.textContent, /j2\.run\.metric=0\.9/, '评分列展示 指标名=值');
+  assert.ok(findAll(root, node => hasClassName(node, 'badge'))
+    .some(node => node.textContent === '通过'), '评分列附状态徽标');
+  assert.ok(find(root, node => node.tag === 'a'
+    && node.href === '/observations/sessions/source-session-1'),
+    '来源会话列保留 observations 直达链接');
+
+  // J2b) 同一会话两个 run 各自成行，行序与接口返回一致
+  runScoresPage = { items: [
+    runRow('j2b.run.metricA', 'run-j2b-1'),
+    runRow('j2b.run.metricB', 'run-j2b-2'),
+  ], next_cursor: null, total_pages: 1 };
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(runBodyRows().length, 2, '同会话两 run 各自成行');
+  assert.match(root.textContent, /run-j2b-1/);
+  assert.match(root.textContent, /run-j2b-2/);
+  assert.ok(root.textContent.indexOf('run-j2b-1') < root.textContent.indexOf('run-j2b-2'),
+    '行序与接口返回一致');
+
+  // J2c) 同 run 多指标逐条：0/false/null/对象值原样文本 + passed 三态徽标
+  runScoresPage = { items: [Object.assign(runRow('', 'run-j2c'), {
+    metrics: [
+      runMetric('j2c.zero', 0, 'value', true),
+      runMetric('j2c.false', false, 'value', false),
+      runMetric('j2c.null', null, 'value', null),
+      runMetric('j2c.object', { k: 'v' }, 'value', true),
+      runMetric('j2c.skipped', 0.5, 'skipped', null),
+    ],
+    result_count: 5,
+  })], next_cursor: null, total_pages: 1 };
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.match(root.textContent, /j2c\.zero=0/, '数值 0 原样显示');
+  assert.match(root.textContent, /j2c\.false=false/, '布尔 false 原样显示');
+  assert.match(root.textContent, /j2c\.null=-/, 'null 显示 -');
+  assert.match(root.textContent, /j2c\.object=\{"k":"v"\}/, '对象值 JSON 文本');
+  const j2cBadges = findAll(root, node => hasClassName(node, 'badge'))
+    .map(node => node.textContent);
+  for (const label of ['通过', '质量不通过', '数值', '跳过']) {
+    assert.ok(j2cBadges.includes(label), 'passed/状态三态徽标: ' + label);
+  }
+
+  // J2d) session 冲突/缺失回退：session_id=null 行显示 未关联会话，
+  //      不生成 observations 链接
+  runScoresPage = { items: [runRow('j2d.run.metric', 'run-j2d', { session_id: null })],
+    next_cursor: null, total_pages: 1 };
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.match(root.textContent, /未关联会话/, 'session 冲突（null）回退未关联会话');
+  assert.equal(findAll(root, node => node.tag === 'a'
+    && String(node.href || '').indexOf('/observations/sessions/') === 0).length, 0,
+    '未关联会话不生成 observations 链接');
+
+  // J2e) XSS：metrics/run_id 含 <img onerror>/& 载荷在列表与弹窗均文本渲染；
+  //       打开弹窗零新请求；仅保留合法 observations 直达链接
+  const xssPayload = '<img src=x onerror=alert(1)>';
+  runScoresPage = { items: [{
+    target_service: 'n-agent',
+    run_id: 'run-xss&' + xssPayload,
+    session_id: 'source-session-1',
+    metrics: [runMetric('xss&' + xssPayload, xssPayload + '&amp;', 'value', true)],
+    result_count: 1, last_created_at: '2026-11-19T00:00:00+00:00',
+  }], next_cursor: null, total_pages: 1 };
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.ok(root.textContent.includes('run-xss&' + xssPayload), 'run_id 载荷文本渲染');
+  assert.ok(root.textContent.includes('xss&' + xssPayload), '指标名载荷文本渲染');
+  assert.ok(root.textContent.includes(xssPayload + '&amp;'), '指标值载荷文本渲染');
+  assert.equal(findAll(root, node => node.tag === 'img' || node.tag === 'script').length, 0,
+    '载荷不得注入 img/script 子节点');
+  const xssLinks = findAll(root, node => node.tag === 'a').map(node => node.href);
+  assert.ok(xssLinks.length >= 1 && xssLinks.every(href =>
+    href === '/observations/sessions/' + encodeURIComponent('source-session-1')),
+    '仅保留合法 observations 直达链接（session_id 经 encodeURIComponent）');
+  const xssBackdropsBefore = findAll(body, node => hasClassName(node, 'modal-backdrop')).length;
+  const xssCallsBefore = calls.length;
+  await findButton('详情', root).handlers.click();
+  await flush();
+  const xssBackdrops = findAll(body, node => hasClassName(node, 'modal-backdrop'));
+  assert.equal(xssBackdrops.length, xssBackdropsBefore + 1, '详情弹窗已打开');
+  assert.equal(calls.length, xssCallsBefore, '打开弹窗零新请求');
+  const xssModal = xssBackdrops[xssBackdrops.length - 1];
+  assert.match(xssModal.textContent, /运行详情/, 'run 级弹窗标题');
+  assert.ok(xssModal.textContent.includes('run-xss&' + xssPayload), '弹窗 run_id 文本渲染');
+  assert.ok(xssModal.textContent.includes('xss&' + xssPayload), '弹窗指标文本渲染');
+  assert.equal(findAll(xssModal, node => node.tag === 'img' || node.tag === 'script').length, 0,
+    '弹窗载荷不得注入 img/script 子节点');
+  assert.deepEqual(findAll(xssModal, node => node.tag === 'th').map(node => node.textContent),
+    ['指标', '值', '状态', '评分来源', '时间'], '弹窗结果表 5 列');
+  find(xssModal, node => node.tag === 'button' && node.textContent === '关闭').handlers.click();
+  await flush();
+  assert.equal(findAll(body, node => hasClassName(node, 'modal-backdrop')).length,
+    xssBackdropsBefore, '弹窗关闭还原');
+
+  // J3) 会话页筛选变更：锁定类型保留 + 游标重置
+  resultsPage = { items: [lockedRow('j3.session.metric')], next_cursor: 'tok-j3' };
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  await findButton('下一页').handlers.click();
+  await flush();
+  assert.equal(lastResultsParams().cursor, 'tok-j3', 'J3 前置：已带游标翻页');
+  resultsPage = { items: [lockedRow('j3.session.metric2')], next_cursor: null };
+  const j3Status = find(root, node => node.name === 'results_status' && node.handlers.change);
+  assert.ok(j3Status, '锁定视图保留状态筛选控件');
+  j3Status.value = 'value';
+  await j3Status.handlers.change();
+  await flush();
+  const j3Params = lastResultsParams();
+  assert.equal(j3Params.target_kind, 'session_feedback', '筛选变更后锁定类型保留');
+  assert.equal(j3Params.cursor, undefined, '筛选变更重置游标');
+  assert.equal(j3Params.status, 'value', '用户筛选进入查询');
+
+  // J4) 会话页双向翻页：游标进出 + 锁定类型不变
+  resultsPage = { items: [lockedRow('j4.session.metric')], next_cursor: 'tok-j4' };
+  const j4Status = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j4Status.value = '';
+  await j4Status.handlers.change();
+  await flush();
+  await findButton('下一页').handlers.click();
+  await flush();
+  const j4NextParams = lastResultsParams();
+  assert.equal(j4NextParams.cursor, 'tok-j4', '下一页携带游标');
+  assert.equal(j4NextParams.target_kind, 'session_feedback', '翻页后锁定类型不变');
+  resultsPage = { items: [lockedRow('j4.session.metric2')], next_cursor: null };
+  await findButton('上一页').handlers.click();
+  await flush();
+  const j4PrevParams = lastResultsParams();
+  assert.equal(j4PrevParams.cursor, undefined, '上一页回到首页不带游标');
+  assert.equal(j4PrevParams.target_kind, 'session_feedback', '回退后锁定类型不变');
+
+  // J5) 视图隔离：会话页筛选保留、游标重置、参数互不含对方类型
+  const j5Status = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j5Status.value = 'error';
+  await j5Status.handlers.change();
+  await flush();
+  assert.equal(lastResultsParams().status, 'error');
+  runScoresPage = { items: [runRow('j5.run.metric', 'run-j5')],
+    next_cursor: null, total_pages: 1 };
+  runParamsHistory.length = 0;
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  const j5RunParams = lastRunParams();
+  assert.equal(runParamsHistory.length, 1, 'run-scores 仍走 listRunScores');
+  assert.ok(!('target_kind' in j5RunParams) && !('agent_run' in j5RunParams)
+    && !('session_feedback' in j5RunParams), 'run 参数不含任何锁定类型');
+  assert.equal(j5RunParams.status, undefined, 'run-scores 不继承会话页用户筛选');
+  assert.equal(j5RunParams.cursor, undefined, 'run-scores 游标重置回第 1 页');
+  resultsPage = { items: [], next_cursor: null };
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  const j5BackParams = lastResultsParams();
+  assert.equal(j5BackParams.target_kind, 'session_feedback', '切回会话页锁定类型不变');
+  assert.equal(j5BackParams.status, 'error', 'session-scores 保留自己的筛选');
+  assert.equal(j5BackParams.cursor, undefined, '重进 session-scores 游标重置');
+  assert.ok(!('agent_run' in j5BackParams), '会话参数不含运行类型');
+  assert.equal(find(root, node => node.name === 'results_status').value, 'error',
+    '筛选控件回显保留值');
+
+  // J12) run-scores cursor_invalid：重新查询仍调 listRunScores、清空游标、
+  //      保留筛选、不外发 target_kind
+  runScoresPage = { items: [runRow('j12.run.metric', 'run-j12')],
+    next_cursor: 'tok-j12', total_pages: 2 };
+  runParamsHistory.length = 0;
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  const j12RunStatus = find(root, node => node.name === 'results_status' && node.handlers.change);
+  assert.ok(j12RunStatus, 'run-scores 保留状态筛选控件');
+  j12RunStatus.value = 'value';
+  await j12RunStatus.handlers.change();
+  await flush();
+  assert.ok(!('target_kind' in lastRunParams()), '筛选变更不外发 target_kind');
+  await findButton('下一页').handlers.click();
+  await flush();
+  assert.equal(lastRunParams().cursor, 'tok-j12', 'J12 前置：run-scores 已带游标翻页');
+  runScoresBehavior = 'cursor_invalid';
+  await findButton('下一页').handlers.click();
+  await flush();
+  runScoresBehavior = 'ok';
+  assert.match(root.textContent, /游标已失效/);
+  assert.match(root.textContent, /重新查询/);
+  runScoresPage = { items: [runRow('j12.run.retry', 'run-j12')],
+    next_cursor: null, total_pages: 1 };
+  await findButton('重新查询').handlers.click();
+  await flush();
+  const j12RunParams = lastRunParams();
+  assert.equal(j12RunParams.cursor, undefined, '重新查询清空游标');
+  assert.equal(j12RunParams.status, 'value', '重新查询保留用户筛选');
+  assert.ok(!('target_kind' in j12RunParams), '重新查询仍不外发锁定类型');
+  assert.match(root.textContent, /j12\.run\.retry/, '重新查询渲染 run 粒度行');
+
+  // J6) 乱序防护：后发请求先渲染，迟到的成功响应不落 DOM
+  const j6Resolvers = [];
+  const realListResultsJ = api.listResults;
+  api.listResults = params => {
+    calls.push(['listResults']);
+    resultsParamsHistory.push(params);
+    return new Promise(resolve => j6Resolvers.push(resolve));
+  };
+  resultsPage = { items: [lockedRow('j6.late.item')], next_cursor: null };
+  const j6First = moduleApi.refresh(state('session-scores'));
+  await flush();
+  assert.equal(j6Resolvers.length, 1, 'J6 首请求已发出');
+  const j6OldDataBody = find(root, node => hasClassName(node, 'evaluations-data-body'));
+  assert.ok(j6OldDataBody, 'J6 首渲染已构建数据区');
+  // 用户变更状态筛选：同视图第二个请求（新 seq）
+  resultsPage = { items: [lockedRow('j6.fresh.item')], next_cursor: null };
+  const j6Status = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j6Status.value = 'skipped';
+  j6Status.handlers.change();
+  await flush();
+  assert.equal(j6Resolvers.length, 2, 'J6 第二请求已发出');
+  // 后发请求先完成并渲染
+  j6Resolvers[1]({ items: [lockedRow('j6.fresh.item')], next_cursor: null });
+  await flush();
+  assert.match(root.textContent, /j6\.fresh\.item/, '新请求先渲染');
+  // 老请求迟到完成：不得把旧 items 追加回任何存活 DOM
+  j6Resolvers[0]({ items: [lockedRow('j6.late.item')], next_cursor: null });
+  await flush();
+  assert.doesNotMatch(j6OldDataBody.textContent, /j6\.late\.item/,
+    '迟到成功响应不得落入旧数据区');
+  assert.equal(findAll(j6OldDataBody, node => node.tag === 'table').length, 0,
+    '迟到成功响应不得向旧数据区追加表格');
+  assert.match(root.textContent, /j6\.fresh\.item/, '迟到响应不得覆盖新渲染');
+  api.listResults = realListResultsJ;
+  await j6First;
+
+  // J7) 空态：锁定类型不计为用户筛选
+  resultsPage = { items: [], next_cursor: null };
+  const j7Clear = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j7Clear.value = '';
+  await j7Clear.handlers.change();
+  await flush();
+  assert.match(root.textContent, /暂无会话评分/, '锁定视图空数据用类型语义空态');
+  assert.doesNotMatch(root.textContent, /暂无评估结果，评估作业完成后/,
+    '固定类型不得被视为用户筛选以外的默认空态口径');
+  const j7Status = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j7Status.value = 'error';
+  await j7Status.handlers.change();
+  await flush();
+  assert.match(root.textContent, /调整或清空筛选条件/,
+    '有用户筛选时提示调整筛选');
+  // run-scores 空态分支：先清掉 J12 遗留的运行页状态筛选（会话页/运行页
+  // 筛选状态互不继承），空数据且无用户筛选 -> “暂无运行评分”
+  runScoresPage = { items: [], next_cursor: null };
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  const j7RunClear = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j7RunClear.value = '';
+  await j7RunClear.handlers.change();
+  await flush();
+  assert.match(root.textContent, /暂无运行评分/, '运行评分空态语义');
+  assert.doesNotMatch(root.textContent, /暂无会话评分/);
+
+  // J11) B 类总闸关闭：仅停用提示，不发起 listResults/listRunScores
+  const realStatusJ = api.status;
+  api.status = async () => ({ enabled: false });
+  calls.length = 0;
+  await moduleApi.refresh(state('session-scores'));
+  assert.match(root.textContent, /评估功能未启用/);
+  assert.ok(!calls.some(c => c[0] === 'listResults'),
+    '总闸关闭不发起 listResults（session-scores）');
+  await moduleApi.refresh(state('run-scores'));
+  assert.match(root.textContent, /评估功能未启用/);
+  assert.ok(!calls.some(c => c[0] === 'listResults'),
+    '总闸关闭不发起 listResults（run-scores）');
+  assert.ok(!calls.some(c => c[0] === 'listRunScores'),
+    '总闸关闭不发起 listRunScores（run-scores）');
+  api.status = realStatusJ;
+
+  // J8) 评分明细视图不受影响：目标类型下拉保留且补全 session_feedback
+  await moduleApi.refresh(state('results'));
+  await flush();
+  // Part E 遗留 target_kind=agent_run 筛选，先清空还原默认态再断言
+  const j8KindPreset = find(root, node => node.name === 'results_target_kind'
+    && node.handlers.change);
+  j8KindPreset.value = '';
+  await j8KindPreset.handlers.change();
+  await flush();
+  const j8KindSelect = find(root, node => node.name === 'results_target_kind'
+    && node.handlers.change);
+  assert.ok(j8KindSelect, '评分明细视图保留目标类型下拉');
+  assert.deepEqual(j8KindSelect.children.map(node => node.value),
+    ['', 'agent_run', 'retrieval', 'session_feedback'],
+    '目标类型下拉补全 session_feedback');
+  assert.equal(j8KindSelect.value, '', 'target_kind 默认空（全部目标）');
+  assert.ok(j8KindSelect.children.some(node => node.textContent === '全部目标'));
+
+  // J9) experiment-results 不受影响：仍走 listExperimentResults
+  const j9ListResultsCount = calls.filter(c => c[0] === 'listResults').length;
+  const j9RunScoresCount = calls.filter(c => c[0] === 'listRunScores').length;
+  const j9ExperimentCount = experimentResultParams.length;
+  await moduleApi.refresh(state('experiment-results'));
+  await flush();
+  assert.equal(calls.filter(c => c[0] === 'listResults').length, j9ListResultsCount,
+    'experiment-results 不调用 listResults');
+  assert.equal(calls.filter(c => c[0] === 'listRunScores').length, j9RunScoresCount,
+    'experiment-results 不调用 listRunScores');
+  assert.ok(experimentResultParams.length > j9ExperimentCount,
+    'experiment-results 仍请求 listExperimentResults');
+
+  // J13) 既有三视图列集合不变：results/session-scores/experiment-results
+  //      均为 8 列且集合一致（run-scores 改 5 列不回归旧视图）。
+  //      先播种非空 resultsPage：三视图空态不渲染表格，无表头可比；
+  //      results 视图沿用 Part E 遗留筛选，不影响列集合。
+  resultsPage = { items: [lockedRow('j13.legacy.metric')], next_cursor: null };
+  await moduleApi.refresh(state('results'));
+  await flush();
+  const j13ResultsHeaders = findAll(root, node => node.tag === 'th')
+    .map(node => node.textContent);
+  assert.equal(j13ResultsHeaders.length, 8, '评分明细 8 列');
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  assert.deepEqual(findAll(root, node => node.tag === 'th').map(node => node.textContent),
+    j13ResultsHeaders, 'session-scores 列集合不变（8 列）');
+  await moduleApi.refresh(state('experiment-results'));
+  await flush();
+  assert.deepEqual(findAll(root, node => node.tag === 'th').map(node => node.textContent),
+    j13ResultsHeaders, 'experiment-results 列集合不变（8 列）');
+
+  // J10) loadSessionTitles 延迟解析：迟到标题不得把旧 items 追加回已废弃
+  //      页面。sessionTitlesPromise 为模块级永久缓存（成功/失败均缓存），
+  //      主上下文已缓存 resolved promise，无法构造延迟场景——独立 vm 上下文
+  //      运行（复用 Part G helperContext 先例：完整源码 + 最小 api 面）。
+  {
+    const j10Root = new Element();
+    let resolveSessions;
+    const j10Context = {
+      Node: Element,
+      document: {
+        getElementById: () => j10Root,
+        createElement: tag => new Element(tag),
+        body: new Element(),
+      },
+      NAGENT: {
+        api: {
+          evaluations: {
+            status: async () => ({ enabled: true }),
+            listResults: async () =>
+              ({ items: [lockedRow('j10.session.metric')], next_cursor: null }),
+            listRunScores: async () =>
+              ({ items: [runRow('j10.run.metric', 'run-j10')], next_cursor: null }),
+          },
+          listSessions: () => new Promise(resolve => { resolveSessions = resolve; }),
+        },
+      },
+    };
+    j10Context.window = j10Context;
+    // 执行控制器在 evaluation.js 模块加载时即 createController，须先加载
+    vm.runInNewContext(
+      fs.readFileSync('app/interfaces/http/static/evaluation-executions.js', 'utf8'),
+      j10Context);
+    vm.runInNewContext(
+      fs.readFileSync('app/interfaces/http/static/evaluation.js', 'utf8'), j10Context);
+    const j10Api = j10Context.NAGENT.evaluations;
+    // 首渲染：listResults 立即成功，渲染停挂在 loadSessionTitles
+    const j10FirstRender = j10Api.init({ route: { scope: 'session-scores' } });
+    await flush();
+    await flush();
+    const j10OldDataBody = find(j10Root, node => hasClassName(node, 'evaluations-data-body'));
+    assert.ok(j10OldDataBody, 'J10 首渲染已构建数据区');
+    assert.equal(findAll(j10OldDataBody, node => node.tag === 'table').length, 0,
+      '会话标题未解析前表格尚未渲染');
+    // 切到 run-scores：旧 token 废弃，新视图也停挂在同一 loadSessionTitles
+    const j10SecondRender = j10Api.init({ route: { scope: 'run-scores' } });
+    await flush();
+    // 迟到解析会话标题：两个挂起渲染同时恢复
+    resolveSessions([{ id: 'source-session-1', title: 'J10 会话标题' }]);
+    await j10FirstRender;
+    await j10SecondRender;
+    await flush();
+    assert.match(j10Root.textContent, /j10\.run\.metric/,
+      '新视图（run-scores）正常渲染 run 粒度列表');
+    assert.equal(findAll(j10OldDataBody, node => node.tag === 'table').length, 0,
+      '迟到的会话标题解析不得把旧 items 追加回已废弃页面');
+    assert.doesNotMatch(j10OldDataBody.textContent, /j10\.session\.metric/);
+  }
+
+  // -------------------------------------------------------------------------
+  // J14（plan-261124 T8 S5）：补充前端契约——接口行数及顺序、空 metrics
+  // 防御、其他服务会话纯文本 + n-agent encodeURIComponent 编码链接、
+  // 下一页/上一页/筛选重置/普通重试仍走 listRunScores、延迟 Promise
+  // 覆盖旧列表成功/异常在切换视图及同视图重查后的失效。
+  // 弹窗零请求计数沿用 J2e 口径：仅围绕点击前后，列表允许已有标题加载。
+  // -------------------------------------------------------------------------
+
+  // J14a) 行数与顺序：3 个 run 三行，行序与接口返回一致
+  runScoresPage = { items: [
+    runRow('j14.metricA', 'run-j14-a'),
+    runRow('j14.metricB', 'run-j14-b'),
+    runRow('j14.metricC', 'run-j14-c'),
+  ], next_cursor: null, total_pages: 1 };
+  runParamsHistory.length = 0;
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(runBodyRows().length, 3, 'J14a 行数与接口 items 数一致');
+  let j14LastPos = -1;
+  for (const runId of ['run-j14-a', 'run-j14-b', 'run-j14-c']) {
+    const pos = root.textContent.indexOf(runId);
+    assert.ok(pos > j14LastPos, 'J14a 行序与接口返回一致: ' + runId);
+    j14LastPos = pos;
+  }
+  // J14a-2) 弹窗零请求计数仅围绕点击前后（列表标题走已有缓存，允许）
+  const j14aCallsBefore = calls.length;
+  await findButton('详情', root).handlers.click();
+  await flush();
+  assert.equal(calls.length, j14aCallsBefore, 'J14a 打开详情弹窗零新请求');
+  find(findAll(body, node => hasClassName(node, 'modal-backdrop')).at(-1),
+    node => node.tag === 'button' && node.textContent === '关闭').handlers.click();
+  await flush();
+
+  // J14b) 空 metrics 防御：metrics 空数组/缺失不崩溃，行仍 5 单元格，
+  //       评分列不产生指标行
+  runScoresPage = { items: [
+    runRow('', 'run-j14-empty', { metrics: [], result_count: 0 }),
+    runRow('', 'run-j14-missing', { metrics: null, result_count: 0 }),
+  ], next_cursor: null, total_pages: 1 };
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(runBodyRows().length, 2, 'J14b 空 metrics 行数不丢');
+  assert.ok(runBodyRows().every(row => row.children.filter(c => c.tag === 'td').length === 5),
+    'J14b 空 metrics 每行仍 5 单元格');
+  const j14ScoreCells = runBodyRows().map(row => row.children.filter(c => c.tag === 'td')[2]);
+  assert.ok(j14ScoreCells.every(cell =>
+    findAll(cell, node => hasClassName(node, 'evaluations-run-score-line')).length === 0),
+    'J14b 空 metrics 评分列无指标行');
+
+  // J14c) 其他服务会话纯文本 + n-agent 会话链接经 encodeURIComponent
+  runScoresPage = { items: [
+    runRow('j14.other.metric', 'run-j14-other',
+      { target_service: 'other-svc', session_id: 'sess-other&<x>' }),
+    runRow('j14.encoded.metric', 'run-j14-enc', { session_id: 'sess a&b/c' }),
+  ], next_cursor: null, total_pages: 1 };
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.ok(root.textContent.includes('sess-other&<x>'),
+    'J14c 其他服务会话 ID 纯文本渲染');
+  assert.equal(findAll(runBodyRows()[0], node => node.tag === 'a').length, 0,
+    'J14c 其他服务会话不生成链接');
+  assert.ok(find(root, node => node.tag === 'a'
+    && node.href === '/observations/sessions/' + encodeURIComponent('sess a&b/c')),
+    'J14c n-agent 会话链接经 encodeURIComponent 编码');
+
+  // J14d) 下一页/上一页/筛选重置/普通重试回调仍走 listRunScores
+  runScoresPage = { items: [runRow('j14.p1.metric', 'run-j14-p1')],
+    next_cursor: 'tok-j14', total_pages: 2 };
+  runParamsHistory.length = 0;
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(runParamsHistory.length, 1, 'J14d 首次加载一次 listRunScores');
+  runScoresPage = { items: [runRow('j14.p2.metric', 'run-j14-p2')],
+    next_cursor: null, total_pages: 2 };
+  await findButton('下一页').handlers.click();
+  await flush();
+  assert.equal(runParamsHistory.length, 2, 'J14d 下一页仍走 listRunScores');
+  assert.equal(lastRunParams().cursor, 'tok-j14', 'J14d 下一页携带游标');
+  runScoresPage = { items: [runRow('j14.p1b.metric', 'run-j14-p1b')],
+    next_cursor: 'tok-j14', total_pages: 2 };
+  await findButton('上一页').handlers.click();
+  await flush();
+  assert.equal(runParamsHistory.length, 3, 'J14d 上一页仍走 listRunScores');
+  assert.ok(!('cursor' in lastRunParams()), 'J14d 上一页回首页不带游标');
+  runScoresPage = { items: [runRow('j14.filter.metric', 'run-j14-filter')],
+    next_cursor: null, total_pages: 1 };
+  const j14Status = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j14Status.value = 'error';
+  await j14Status.handlers.change();
+  await flush();
+  assert.equal(runParamsHistory.length, 4, 'J14d 筛选重置仍走 listRunScores');
+  assert.ok(!('cursor' in lastRunParams()), 'J14d 筛选变更重置游标');
+  assert.equal(lastRunParams().status, 'error', 'J14d 筛选进入查询');
+  // 普通重试（非游标类错误）：错误态重试回调仍走 listRunScores
+  runScoresPage = { items: [runRow('j14.retry.metric', 'run-j14-retry')],
+    next_cursor: null, total_pages: 1 };
+  const realRunScoresJ14 = api.listRunScores;
+  let j14RetryArmed = true;
+  api.listRunScores = async params => {
+    calls.push(['listRunScores']);
+    runParamsHistory.push(params);
+    if (j14RetryArmed) throw new Error('boom');
+    return runScoresPage;
+  };
+  const j14FailRender = moduleApi.refresh(state('run-scores'));
+  await flush();
+  await j14FailRender;
+  assert.match(root.textContent, /结果加载失败：boom/, 'J14d 普通错误进入错误态');
+  j14RetryArmed = false;
+  await findButton('重试', root).handlers.click();
+  await flush();
+  assert.match(root.textContent, /j14\.retry\.metric/, 'J14d 普通重试渲染 run 粒度行');
+  api.listRunScores = realRunScoresJ14;
+
+  // J14e) 延迟 Promise：旧列表成功/异常在切换视图后的失效
+  const j14eResolvers = [];
+  const realRunScoresOriginal = api.listRunScores;
+  api.listRunScores = params => {
+    calls.push(['listRunScores']);
+    runParamsHistory.push(params);
+    return new Promise((resolve, reject) => j14eResolvers.push({ resolve, reject }));
+  };
+  resultsPage = { items: [lockedRow('j14.fresh.session')], next_cursor: null };
+  const j14eStaleRender = moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(j14eResolvers.length, 1, 'J14e 旧视图请求已挂起');
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  assert.match(root.textContent, /j14\.fresh\.session/, 'J14e 切换后新视图已渲染');
+  // 迟到的旧视图成功响应：不落 DOM
+  j14eResolvers[0].resolve({ items: [runRow('j14.stale.metric', 'run-j14-stale')],
+    next_cursor: null, total_pages: 1 });
+  await flush();
+  await j14eStaleRender;
+  assert.doesNotMatch(root.textContent, /j14\.stale\.metric/, 'J14e 迟到成功响应不落 DOM');
+  assert.match(root.textContent, /j14\.fresh\.session/, 'J14e 成功失效后新视图保留');
+  // 迟到的旧视图异常：不产生错误态
+  const j14eStaleErrRender = moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(j14eResolvers.length, 2, 'J14e 第二次挂起请求已发出');
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  j14eResolvers[1].reject(new Error('late-error'));
+  await flush();
+  await j14eStaleErrRender;
+  assert.doesNotMatch(root.textContent, /结果加载失败：late-error/,
+    'J14e 迟到异常不产生错误态');
+  assert.match(root.textContent, /j14\.fresh\.session/, 'J14e 异常失效后新视图保留');
+  api.listRunScores = realRunScoresOriginal;
+
+  // J14f) 延迟 Promise：旧列表成功/异常在同视图重查后的失效
+  //       （refresh 对同视图 inflight 去重，重查经筛选变更触发）
+  const j14fResolvers = [];
+  api.listRunScores = params => {
+    calls.push(['listRunScores']);
+    runParamsHistory.push(params);
+    return new Promise((resolve, reject) => j14fResolvers.push({ resolve, reject }));
+  };
+  const j14fFirstRender = moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(j14fResolvers.length, 1, 'J14f 首请求已挂起');
+  const j14fOldDataBody = find(root, node => hasClassName(node, 'evaluations-data-body'));
+  assert.ok(j14fOldDataBody, 'J14f 首渲染已构建数据区');
+  // 旧成功失效：新请求先渲染，旧请求迟到成功不落 DOM
+  const j14fStatus = find(root, node => node.name === 'results_status' && node.handlers.change);
+  j14fStatus.value = 'skipped';
+  j14fStatus.handlers.change();
+  await flush();
+  assert.equal(j14fResolvers.length, 2, 'J14f 重查请求已挂起');
+  j14fResolvers[1].resolve({ items: [runRow('j14f.fresh.metric', 'run-j14f-fresh')],
+    next_cursor: null, total_pages: 1 });
+  await flush();
+  assert.match(root.textContent, /j14f\.fresh\.metric/, 'J14f 新响应先渲染');
+  j14fResolvers[0].resolve({ items: [runRow('j14f.stale.metric', 'run-j14f-stale')],
+    next_cursor: null, total_pages: 1 });
+  await flush();
+  await j14fFirstRender;
+  assert.doesNotMatch(j14fOldDataBody.textContent, /j14f\.stale\.metric/,
+    'J14f 迟到成功响应不得落入旧数据区');
+  assert.equal(findAll(j14fOldDataBody, node => node.tag === 'table').length, 0,
+    'J14f 迟到成功响应不得向旧数据区追加表格');
+  assert.match(root.textContent, /j14f\.fresh\.metric/, 'J14f 迟到成功不覆盖新渲染');
+  // 旧异常失效：新请求成功渲染后，旧请求迟到异常不产生错误态
+  j14fStatus.value = '';
+  j14fStatus.handlers.change();
+  await flush();
+  j14fStatus.value = 'value';
+  j14fStatus.handlers.change();
+  await flush();
+  assert.equal(j14fResolvers.length, 4, 'J14f 异常场景两请求已挂起');
+  j14fResolvers[3].resolve({ items: [runRow('j14f.errfresh.metric', 'run-j14f-errfresh')],
+    next_cursor: null, total_pages: 1 });
+  await flush();
+  assert.match(root.textContent, /j14f\.errfresh\.metric/, 'J14f 异常场景新响应先渲染');
+  j14fResolvers[2].reject(new Error('stale-boom'));
+  await flush();
+  assert.doesNotMatch(root.textContent, /结果加载失败：stale-boom/,
+    'J14f 迟到异常不产生错误态');
+  assert.match(root.textContent, /j14f\.errfresh\.metric/, 'J14f 迟到异常不覆盖成功渲染');
+  api.listRunScores = realRunScoresOriginal;
+
+  // -------------------------------------------------------------------------
+  // J15（plan-261124 T8 S5）：会话标题 XSS。sessionTitlesPromise 为模块级
+  // 永久缓存，主上下文无法重置——独立 vm 上下文运行（复用 J10 先例）。
+  // 断言：载荷文本渲染、无载荷注入 img/script/a 子节点、合法 observations
+  // 链接单独断言（href 经 encodeURIComponent）、弹窗同样安全且零请求。
+  // -------------------------------------------------------------------------
+  {
+    const j15Root = new Element();
+    const j15Calls = [];
+    const j15TitlePayload = '<img src=x onerror=alert(1)>';
+    const j15SessionId = 'a b&c/d';
+    const j15Context = {
+      Node: Element,
+      document: {
+        getElementById: () => j15Root,
+        createElement: tag => new Element(tag),
+        body: new Element(),
+      },
+      NAGENT: {
+        api: {
+          evaluations: {
+            status: async () => ({ enabled: true }),
+            listRunScores: async () => {
+              j15Calls.push(['listRunScores']);
+              return { items: [Object.assign(runRow('j15.metric', 'run-j15'),
+                { session_id: j15SessionId })], next_cursor: null, total_pages: 1 };
+            },
+          },
+          listSessions: async () => {
+            j15Calls.push(['listSessions']);
+            return [{ id: j15SessionId, title: j15TitlePayload + '&amp;' }];
+          },
+        },
+      },
+    };
+    j15Context.window = j15Context;
+    vm.runInNewContext(
+      fs.readFileSync('app/interfaces/http/static/evaluation-executions.js', 'utf8'),
+      j15Context);
+    vm.runInNewContext(
+      fs.readFileSync('app/interfaces/http/static/evaluation.js', 'utf8'), j15Context);
+    const j15Api = j15Context.NAGENT.evaluations;
+    await j15Api.init({ route: { scope: 'run-scores' } });
+    await flush();
+    await flush();
+    // 文本渲染：载荷与 HTML 实体均为纯文本
+    assert.ok(j15Root.textContent.includes(j15TitlePayload), 'J15 会话标题载荷文本渲染');
+    assert.ok(j15Root.textContent.includes(j15TitlePayload + '&amp;'),
+      'J15 会话标题实体文本渲染');
+    assert.equal(findAll(j15Root, node => node.tag === 'img' || node.tag === 'script').length, 0,
+      'J15 载荷不得注入 img/script 子节点');
+    // 合法 observations 链接单独断言：href 编码正确，链接内无 img/script/a 子节点
+    const j15Link = find(j15Root, node => node.tag === 'a'
+      && node.href === '/observations/sessions/' + encodeURIComponent(j15SessionId));
+    assert.ok(j15Link, 'J15 合法 observations 链接单独断言（encodeURIComponent）');
+    assert.equal(findAll(j15Link, node => node.tag === 'img' || node.tag === 'script'
+      || node.tag === 'a').filter(node => node !== j15Link).length, 0,
+      'J15 链接内无载荷注入 img/script/a 子节点');
+    // 弹窗零请求计数仅围绕点击前后（列表标题允许已加载）；弹窗同样文本渲染
+    const j15CallsBefore = j15Calls.length;
+    await findButton('详情', j15Root).handlers.click();
+    await flush();
+    assert.equal(j15Calls.length, j15CallsBefore, 'J15 打开弹窗零新请求');
+    const j15Modal = findAll(j15Context.document.body,
+      node => hasClassName(node, 'modal-backdrop')).at(-1);
+    assert.ok(j15Modal, 'J15 详情弹窗已打开');
+    assert.ok(j15Modal.textContent.includes(j15TitlePayload), 'J15 弹窗标题载荷文本渲染');
+    assert.equal(findAll(j15Modal, node => node.tag === 'img' || node.tag === 'script').length, 0,
+      'J15 弹窗载荷不得注入 img/script 子节点');
+    assert.ok(find(j15Modal, node => node.tag === 'a'
+      && node.href === '/observations/sessions/' + encodeURIComponent(j15SessionId)),
+      'J15 弹窗保留合法 observations 链接');
+    find(j15Modal, node => node.tag === 'button' && node.textContent === '关闭').handlers.click();
+    await flush();
+  }
+
+  // -------------------------------------------------------------------------
+  // J16（plan-261124 T8 S5）：标题回调在同视图重查后的失效——延迟解析的
+  // 会话标题恢复时，旧渲染（重查前的 seq）不得把旧 items 追加回旧数据区。
+  // -------------------------------------------------------------------------
+  {
+    const j16Root = new Element();
+    let resolveSessions16;
+    let j16RunPage = { items: [Object.assign(runRow('j16.stale.metric', 'run-j16-a'),
+      { session_id: 'j16-sess' })], next_cursor: null, total_pages: 1 };
+    const j16Context = {
+      Node: Element,
+      document: {
+        getElementById: () => j16Root,
+        createElement: tag => new Element(tag),
+        body: new Element(),
+      },
+      NAGENT: {
+        api: {
+          evaluations: {
+            status: async () => ({ enabled: true }),
+            listRunScores: async () => j16RunPage,
+          },
+          listSessions: () => new Promise(resolve => { resolveSessions16 = resolve; }),
+        },
+      },
+    };
+    j16Context.window = j16Context;
+    vm.runInNewContext(
+      fs.readFileSync('app/interfaces/http/static/evaluation-executions.js', 'utf8'),
+      j16Context);
+    vm.runInNewContext(
+      fs.readFileSync('app/interfaces/http/static/evaluation.js', 'utf8'), j16Context);
+    const j16Api = j16Context.NAGENT.evaluations;
+    // 首渲染：listRunScores 立即成功，渲染停挂在 loadSessionTitles
+    const j16FirstRender = j16Api.init({ route: { scope: 'run-scores' } });
+    await flush();
+    await flush();
+    const j16OldDataBody = find(j16Root, node => hasClassName(node, 'evaluations-data-body'));
+    assert.ok(j16OldDataBody, 'J16 首渲染已构建数据区');
+    assert.equal(findAll(j16OldDataBody, node => node.tag === 'table').length, 0,
+      'J16 会话标题未解析前表格尚未渲染');
+    // 同视图重查：筛选变更触发第二次渲染，同样停挂在缓存的标题 Promise
+    j16RunPage = { items: [Object.assign(runRow('j16.fresh.metric', 'run-j16-b'),
+      { session_id: 'j16-sess' })], next_cursor: null, total_pages: 1 };
+    const j16Status = find(j16Root, node => node.name === 'results_status' && node.handlers.change);
+    j16Status.value = 'value';
+    j16Status.handlers.change();
+    await flush();
+    await flush();
+    const j16NewDataBody = find(j16Root, node => hasClassName(node, 'evaluations-data-body'));
+    assert.ok(j16NewDataBody && j16NewDataBody !== j16OldDataBody, 'J16 重查构建新数据区');
+    // 迟到解析会话标题：旧渲染 seq 已过期，不得落 DOM；新渲染带标题出表格
+    resolveSessions16([{ id: 'j16-sess', title: 'J16 会话标题' }]);
+    await j16FirstRender;
+    await flush();
+    await flush();
+    assert.match(j16Root.textContent, /j16\.fresh\.metric/, 'J16 重查渲染新 items');
+    assert.match(j16Root.textContent, /J16 会话标题/, 'J16 标题解析后渲染会话标题');
+    assert.equal(findAll(j16OldDataBody, node => node.tag === 'table').length, 0,
+      'J16 迟到标题解析不得把旧 items 追加回旧数据区');
+    assert.doesNotMatch(j16OldDataBody.textContent, /j16\.stale\.metric/);
+  }
+
+  // -------------------------------------------------------------------------
+  // Part K（plan-261124 T4）：会话评分视图「评估配置」弹窗 + 概览页
+  // 会话类型白名单复选框。两入口共用 SESSION_EVAL_SOURCE_OPTIONS；
+  // K1 按钮视图门控；K2 弹窗渲染（12 复选框/resolved 默认/两列/共享
+  // modal 类/底部右对齐/显式字号）；K3 保存载荷 + onSaved 重绘；
+  // K4 取消/ESC 不发 PATCH；K5 version=0；K6 GET 失败不渲染；
+  // K7 非法形状禁止保存；K8 保存中重复 submit 互斥；K9 失败保留草稿；
+  // K10 409 禁止旧版本重提 + 重新打开核对新版本；K11 概览页两入口
+  // 共用选项 + 未修改字段不进 patch + 清空显式 []；K12 切页过期防护；
+  // K13 概览页非法形状警示 + 禁保存（不静默回落 []）。
+  // -------------------------------------------------------------------------
+  const EXPECTED_SOURCE_ORDER = ['dashboard', 'api', 'cli', 'feishu', 'dingtalk',
+    'wecom', 'acp', 'schedule', 'curator', 'task', 'delegation', 'experiment'];
+  const configSaveCalls = [];
+  let configSaveBehavior = 'ok';
+  let configSaveResolve = null;
+  const realKPatchConfig = api.patchConfig;
+  const realKGetConfig = api.getConfig;
+  api.patchConfig = async payload => {
+    calls.push(['patchConfig']);
+    configSaveCalls.push(payload);
+    if (configSaveBehavior === 'conflict') throw new Error('conflict');
+    if (configSaveBehavior === 'error') throw new Error('request_failed');
+    if (configSaveBehavior === 'pending') {
+      return new Promise(resolve => { configSaveResolve = resolve; });
+    }
+    return { config: payload.patch, version: 99, overridden_fields: [], updated_at: '', updated_by: 'n-agent' };
+  };
+  const kModalForm = () => find(body, node => node.tag === 'form');
+  const kCheckboxValues = formEl => findAll(formEl,
+    node => node.tag === 'input' && node.type === 'checkbox').map(node => node.value);
+  const kCheckboxes = formEl => findAll(formEl,
+    node => node.tag === 'input' && node.type === 'checkbox');
+  const kCheck = (formEl, value, checked) => {
+    const input = kCheckboxes(formEl).find(node => node.value === value);
+    assert.ok(input, 'K 前置：存在值 ' + value + ' 的复选框');
+    input.checked = checked;
+  };
+  const kSubmit = async formEl => { await formEl.handlers.submit({ preventDefault() {} }); };
+  const kCloseModal = () => {
+    const closeBtn = find(body, node => node.textContent === '×' && node.handlers.click);
+    if (closeBtn) closeBtn.handlers.click();
+  };
+  // 显式字号合同：空名单警示（error-state）与说明文字（evaluations-note）
+  // 的字号必须在共享类显式声明 token（P094 同类约束）
+  const kCss = fs.readFileSync('app/interfaces/http/static/styles.css', 'utf8');
+  assert.match(kCss, /\.empty-state,\s*\.loading-state,\s*\.error-state\s*\{[^}]*font-size:\s*var\(--font-size-sm/,
+    'error-state 共享类必须显式声明辅助字号 token');
+  assert.match(kCss, /\.evaluations-note\s*\{[^}]*font-size:\s*var\(--font-size-sm/,
+    'evaluations-note 共享类必须显式声明辅助字号 token');
+
+  // K1) 按钮只在 session-scores 视图出现（renderResults 多视图共享）
+  resultsPage = { items: [lockedRow('k1.session.metric')], next_cursor: null };
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  const kConfigButton = findButton('评估配置');
+  assert.ok(kConfigButton, 'session-scores 头部操作区挂「评估配置」按钮');
+  await moduleApi.refresh(state('results'));
+  await flush();
+  assert.equal(findButton('评估配置'), undefined, '评分明细视图不渲染评估配置按钮');
+  await moduleApi.refresh(state('run-scores'));
+  await flush();
+  assert.equal(findButton('评估配置'), undefined, '运行评分视图不渲染评估配置按钮');
+
+  // K2) 打开弹窗：先 GET 最新配置；12 个复选框（枚举序）、dashboard
+  // 勾选（resolved 默认，config 缺失该字段时回落）、两列排布、共享
+  // modal 类、底部右对齐 actions
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  calls.length = 0;
+  await findButton('评估配置').handlers.click();
+  await flush();
+  assert.ok(calls.some(c => c[0] === 'getConfig'), '打开弹窗先 GET 最新配置');
+  let kForm = kModalForm();
+  assert.ok(kForm, '评估配置弹窗已打开');
+  const kBackdrop = find(body, node => hasClassName(node, 'modal-backdrop'));
+  assert.ok(find(kBackdrop, node => hasClassName(node, 'modal-dialog')), '共享 modal-dialog 帧');
+  assert.ok(find(kBackdrop, node => hasClassName(node, 'providers-form')), '共享 providers-form 表单');
+  assert.match(kBackdrop.textContent, /评估配置/, '弹窗标题为评估配置');
+  assert.deepEqual(kCheckboxValues(kForm), EXPECTED_SOURCE_ORDER,
+    '12 个复选框按 SessionSource 枚举序渲染');
+  assert.equal(kCheckboxValues(kForm).length, 12);
+  const kChecked = kCheckboxes(kForm).filter(node => node.checked).map(node => node.value);
+  assert.deepEqual(kChecked, ['dashboard'], 'resolved 默认仅 dashboard 勾选');
+  const kGroup = find(kForm, node => node.getAttribute('aria-label') === '会话类型白名单');
+  assert.ok(kGroup, '复选框组带 aria-label');
+  assert.match(String(kGroup.getAttribute('style')), /grid-template-columns/,
+    '两列排布经内联 grid style');
+  assert.match(String(kGroup.getAttribute('style')), /repeat\(2/,
+    '两列排布为 repeat(2, ...)');
+  assert.ok(find(kForm, node => hasClassName(node, 'providers-form__actions')),
+    '底部操作区复用共享右对齐类');
+  assert.match(kForm.textContent, /勾选允许进入线上评估的会话类型/, '弹窗含说明文案');
+  // 复选框组内 label 文本复用带显式字号的共享类
+  assert.ok(find(kGroup, node => hasClassName(node, 'evaluations-filter__label')),
+    '复选框标签复用显式字号共享类');
+
+  // K3) 保存：发出 patchConfig({patch:{...allowlist}, expected_version})，
+  // 成功后关弹窗 + alertMessage + onSaved 重绘当前视图
+  kCheck(kForm, 'cli', true);
+  await kSubmit(kForm);
+  assert.deepEqual(JSON.parse(JSON.stringify(configSaveCalls.at(-1))),
+    { patch: { evaluation_session_source_allowlist: ['dashboard', 'cli'] }, expected_version: 3 },
+    '保存载荷为勾选数组 + expected_version');
+  assert.equal(kModalForm(), undefined, '保存成功后弹窗关闭');
+  assert.match(alerts.join('\n'), /评估配置已保存/);
+  await flush();
+  assert.match(root.textContent, /k1\.session\.metric/, 'onSaved 重绘会话评分视图');
+  assert.ok(findButton('评估配置'), '重绘后入口按钮仍在');
+
+  // K4) 取消与 ESC（全局 ESC 走 .modal-close 同一关闭路径）不发 PATCH
+  configSaveCalls.length = 0;
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  findButton('取消', kForm).handlers.click();
+  assert.equal(kModalForm(), undefined, '取消关闭弹窗');
+  assert.equal(configSaveCalls.length, 0, '取消不发 PATCH');
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  find(kForm, node => node.textContent === '×' && node.handlers.click).handlers.click();
+  assert.equal(kModalForm(), undefined, 'ESC 等价关闭路径（modal-close）关闭弹窗');
+  assert.equal(configSaveCalls.length, 0, 'ESC 关闭不发 PATCH');
+
+  // K5) version=0（无 DB 行）合法：expected_version 提交 0
+  api.getConfig = async () => ({
+    config: { evaluation_session_source_allowlist: ['dashboard'] }, version: 0,
+  });
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  await kSubmit(kForm);
+  assert.equal(configSaveCalls.at(-1).expected_version, 0, 'version=0 合法提交');
+  assert.equal(kModalForm(), undefined, 'version=0 保存成功关弹窗');
+
+  // K6) GET 失败：alertMessage 提示且不渲染弹窗
+  configSaveCalls.length = 0;
+  alerts.length = 0;
+  api.getConfig = async () => { throw new Error('request_failed'); };
+  await findButton('评估配置').handlers.click();
+  await flush();
+  assert.match(alerts.join('\n'), /评估配置加载失败/, 'GET 失败给出提示');
+  assert.equal(kModalForm(), undefined, 'GET 失败不渲染弹窗');
+  assert.equal(configSaveCalls.length, 0, 'GET 失败不触发保存');
+
+  // K7) 非法形状（非字符串数组）禁止保存：弹窗警示、无保存按钮
+  api.getConfig = async () => ({
+    config: { evaluation_session_source_allowlist: 'dashboard' }, version: 3,
+  });
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  assert.ok(kForm, '非法形状仍渲染弹窗供用户感知');
+  assert.match(kForm.textContent, /配置数据形状非法，禁止保存/, '非法形状警示文案');
+  assert.equal(find(kForm, node => node.type === 'submit'), undefined,
+    '非法形状不渲染保存按钮');
+  assert.equal(configSaveCalls.length, 0);
+  kCloseModal();
+
+  // K8) 保存中重复 submit 互斥：按钮禁用 + saving 锁只发一次 PATCH
+  api.getConfig = realKGetConfig;
+  configSaveBehavior = 'pending';
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  kCheck(kForm, 'api', true);
+  const kSaveBtn = find(kForm, node => node.type === 'submit');
+  // pending 行为下 submit handler 停挂在 patchConfig：不 await（等待完成
+  // 会挂起整个 harness），同步阶段已推进 saving 锁与禁用态
+  kForm.handlers.submit({ preventDefault() {} });
+  assert.equal(configSaveCalls.length, 1, '首次 submit 发出 PATCH');
+  assert.equal(kSaveBtn.disabled, true, '保存期间保存按钮禁用');
+  await kForm.handlers.submit({ preventDefault() {} });
+  assert.equal(configSaveCalls.length, 1, '保存中重复 submit 不重复发 PATCH');
+  configSaveResolve({ config: {}, version: 4, overridden_fields: [] });
+  await flush();
+  assert.equal(kModalForm(), undefined, '挂起保存完成后关弹窗');
+  configSaveBehavior = 'ok';
+
+  // K9) 保存失败：弹窗保留、草稿保留，恢复后可再次提交
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  kCheck(kForm, 'dashboard', false);
+  kCheck(kForm, 'cli', true);
+  configSaveBehavior = 'error';
+  await kSubmit(kForm);
+  assert.ok(kModalForm(), '保存失败弹窗保留');
+  assert.match(kModalForm().textContent, /保存失败：request_failed/, '失败提示文案');
+  const kDraft = kCheckboxes(kModalForm()).filter(node => node.checked).map(node => node.value);
+  assert.deepEqual(kDraft, ['cli'], '失败后复选框草稿保留');
+  configSaveBehavior = 'ok';
+  await kSubmit(kModalForm());
+  assert.deepEqual(JSON.parse(JSON.stringify(configSaveCalls.at(-1))),
+    { patch: { evaluation_session_source_allowlist: ['cli'] }, expected_version: 3 },
+    '恢复后按草稿再次提交');
+  assert.equal(kModalForm(), undefined, '重提成功关弹窗');
+
+  // K10) 409 冲突：提示重新打开核对、保存按钮禁用、旧快照禁止重提；
+  // 重新打开读取（同版本）后才允许提交
+  configSaveCalls.length = 0;
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  kCheck(kForm, 'cli', true);
+  configSaveBehavior = 'conflict';
+  await kSubmit(kForm);
+  assert.match(kModalForm().textContent, /配置已被他人修改，请关闭后重新打开核对/,
+    '409 冲突文案');
+  assert.equal(find(kModalForm(), node => node.type === 'submit').disabled, true,
+    '409 后保存按钮禁用（旧快照锁死）');
+  await kSubmit(kModalForm());
+  assert.equal(configSaveCalls.length, 1, '409 后旧版本重提不再发 PATCH');
+  configSaveBehavior = 'ok';
+  findButton('取消', kModalForm()).handlers.click();
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  assert.equal(find(kForm, node => node.type === 'submit').disabled, false,
+    '重新打开（读取新快照）后保存恢复可用');
+  kCheck(kForm, 'cli', true);
+  await kSubmit(kForm);
+  assert.equal(configSaveCalls.length, 2, '重新打开后可提交');
+  assert.equal(kModalForm(), undefined, '重新提交成功关弹窗');
+
+  // K11) 概览页「修订配置」追加会话类型白名单：同一选项数组、未修改
+  // 字段不进 patch、清空显式提交 []
+  api.getConfig = async () => ({
+    config: {
+      evaluation_enabled: true,
+      evaluation_session_source_allowlist: ['dashboard'],
+    },
+    version: 5, updated_at: '', updated_by: 'n-agent',
+  });
+  await moduleApi.refresh(state('overview'));
+  await flush();
+  await findButton('修订配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  assert.deepEqual(kCheckboxValues(kForm), EXPECTED_SOURCE_ORDER,
+    '概览页复用同一选项数组（12 个复选框，枚举序）');
+  // 未修改：勾选集与打开时一致 -> patch 不含 allowlist
+  kCheck(kForm, 'dashboard', true);
+  find(kForm, node => node.name === 'evaluation_enabled').value = 'false';
+  await kSubmit(kForm);
+  assert.equal(configSaveCalls.at(-1).patch.evaluation_enabled, false);
+  assert.equal(configSaveCalls.at(-1).patch.evaluation_session_source_allowlist, undefined,
+    '白名单未修改不进入 patch');
+  assert.equal(configSaveCalls.at(-1).expected_version, 5);
+  // 清空：显式提交 []（非省略）
+  await moduleApi.refresh(state('overview'));
+  await flush();
+  await findButton('修订配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  kCheck(kForm, 'dashboard', false);
+  await kSubmit(kForm);
+  assert.deepEqual(JSON.parse(JSON.stringify(configSaveCalls.at(-1))),
+    { patch: { evaluation_session_source_allowlist: [] }, expected_version: 5 },
+    '清空白名单显式提交 []');
+  // 勾选后又还原：不产生 patch（弹窗直接关闭，零 PATCH）
+  await moduleApi.refresh(state('overview'));
+  await flush();
+  await findButton('修订配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  kCheck(kForm, 'dashboard', false);
+  kCheck(kForm, 'dashboard', true);
+  const kCallsBeforeRestore = configSaveCalls.length;
+  await kSubmit(kForm);
+  assert.equal(configSaveCalls.length, kCallsBeforeRestore,
+    '勾选集还原后零 PATCH');
+  assert.equal(kModalForm(), undefined, '无变更提交直接关弹窗');
+  kCloseModal();
+  api.getConfig = realKGetConfig;
+
+  // K12) 切页过期防护：GET 迟到时已切页 -> 不弹过期 Modal；
+  // 保存回调迟到时已切页 -> 不 alert、不重绘旧视图
+  const kStaleGetResolvers = [];
+  api.getConfig = () => new Promise(resolve => kStaleGetResolvers.push(resolve));
+  resultsPage = { items: [lockedRow('k12.session.metric')], next_cursor: null };
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  // click() 返回弹窗打开 Promise（内部 await GET）：GET 桩挂起时不得
+  // await（等待会挂起整个 harness），打开流程由后续 flush 推进
+  findButton('评估配置').handlers.click();
+  await flush();
+  assert.equal(kStaleGetResolvers.length, 1, 'GET 已挂起');
+  await moduleApi.refresh(state('datasets'));
+  await flush();
+  kStaleGetResolvers[0]({
+    config: { evaluation_session_source_allowlist: ['dashboard'] }, version: 3,
+  });
+  await flush();
+  assert.equal(kModalForm(), undefined, '切页后迟到的 GET 不弹过期 Modal');
+  api.getConfig = realKGetConfig;
+  alerts.length = 0;
+  await moduleApi.refresh(state('session-scores'));
+  await flush();
+  await findButton('评估配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  configSaveBehavior = 'pending';
+  // pending 保存不 await（handler 停挂在 patchConfig，等待会挂起 harness）
+  kForm.handlers.submit({ preventDefault() {} });
+  await moduleApi.refresh(state('datasets'));
+  await flush();
+  configSaveResolve({ config: {}, version: 4, overridden_fields: [] });
+  await flush();
+  assert.doesNotMatch(alerts.join('\n'), /评估配置已保存/,
+    '切页后保存成功不再弹提示');
+  assert.doesNotMatch(root.textContent, /k12\.session\.metric/,
+    '切页后保存回调不重绘旧视图');
+  configSaveBehavior = 'ok';
+  await flush();
+  api.patchConfig = realKPatchConfig;
+  api.getConfig = realKGetConfig;
+
+  // K13) 概览页「修订配置」非法形状（非字符串数组）：警示文案 + 不渲染
+  // 保存按钮，复选框组不静默回落 []（对齐 session 弹窗 K7 行为）
+  configSaveCalls.length = 0;
+  api.getConfig = async () => ({
+    config: {
+      evaluation_enabled: true,
+      evaluation_session_source_allowlist: 'dashboard',
+    },
+    version: 6, updated_at: '', updated_by: 'n-agent',
+  });
+  await moduleApi.refresh(state('overview'));
+  await flush();
+  await findButton('修订配置').handlers.click();
+  await flush();
+  kForm = kModalForm();
+  assert.ok(kForm, '非法形状仍渲染弹窗供用户感知');
+  assert.match(kForm.textContent, /配置数据形状非法，禁止保存/, '概览页非法形状警示文案');
+  assert.equal(find(kForm, node => node.type === 'submit'), undefined,
+    '非法形状不渲染保存按钮');
+  assert.equal(kCheckboxValues(kForm).length, 0, '非法形状不静默回落复选框组');
+  assert.equal(configSaveCalls.length, 0, '非法形状不触发保存');
+  kCloseModal();
+  api.getConfig = realKGetConfig;
 
   console.log('evaluation workbench harness passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

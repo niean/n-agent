@@ -56,7 +56,16 @@ DELETED_TYPE = TARGET_DELETED_MESSAGE_TYPE
 
 
 class _FakeConfigService:
-    """管理面路由 config_service stub（本组测试不触达配置端点）。"""
+    """管理面路由 config_service stub（本组测试不触达配置端点）。
+
+    ``current()`` 返回 EvaluationConfig 默认值：session_feedback 会话
+    类型准入（spec-261124）在路由层热读 current()，lookup 命中路径
+    会触达，不能以 AssertionError 充当未实现。"""
+
+    async def current(self):
+        from app.domain.evaluation.config import EvaluationConfig
+
+        return EvaluationConfig()
 
     async def get_resolved(self):  # pragma: no cover - 未触达
         raise AssertionError("unexpected config access")
@@ -995,6 +1004,7 @@ from app.domain.evaluation.models import EvaluatorDefinition
 from app.infrastructure.evaluation.config_store import (
     SqliteEvaluationConfigStore,
 )
+from app.domain.session import ConversationSession, SessionSource
 from app.interfaces.http.evaluation_routes import (
     register_evaluation_management_routes,
 )
@@ -1021,7 +1031,8 @@ class _ManagementHarness:
     producer 端点不注册（管理面独立注册函数），凭据同源保护沿用
     Dashboard 约束（无 CORS、同文件错误契约）。"""
 
-    def __init__(self, tmp_path: Any, *, judge_supply: Any = None) -> None:
+    def __init__(self, tmp_path: Any, *, judge_supply: Any = None,
+                 session_lookup: Any = None) -> None:
         self.store = SQLiteEvaluationStore(str(tmp_path / "evaluations.db"))
         self.evidence_store = LocalEvidenceStore(
             tmp_path / "evidence", self.store
@@ -1079,6 +1090,7 @@ class _ManagementHarness:
             evaluation_annotation_service=self.annotation_service,
             evaluation_analytics_service=self.analytics_service,
             judge_supply=judge_supply,
+            session_lookup=session_lookup,
         )
         self.client = TestClient(self.app)
         self.tmp_path = tmp_path
@@ -1569,6 +1581,115 @@ class TestManagementConfig:
             "expected_version": 1,
         })
         assert over.status_code == 422
+
+
+class TestManagementConfigSessionAllowlist:
+    """T2：evaluation_session_source_allowlist 配置协议 HTTP 用例。"""
+
+    def test_get_config_allowlist_is_array_with_version_zero(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        resp = mgmt.get("/chat/evaluations/config")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["version"] == 0
+        assert body["config"]["evaluation_session_source_allowlist"] == [
+            "dashboard"
+        ]
+
+    def test_patch_invalid_type_422_not_written(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        for bad in ("dashboard", ["nope"], [1], True):
+            resp = mgmt.patch("/chat/evaluations/config", {
+                "patch": {"evaluation_session_source_allowlist": bad},
+                "expected_version": 0,
+            })
+            assert resp.status_code == 422, (bad, resp.text)
+            assert resp.json()["error"]["code"] == "config_invalid"
+        # 非法 patch 不写入：version 仍 0、无覆盖
+        body = mgmt.get("/chat/evaluations/config").json()
+        assert body["version"] == 0
+        assert body["overridden_fields"] == []
+
+    def test_patch_set_normalizes_and_cas_same_version_one_side_wins(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        ok = mgmt.patch("/chat/evaluations/config", {
+            "patch": {
+                "evaluation_session_source_allowlist": [
+                    "cli", "dashboard", "cli",
+                ],
+            },
+            "expected_version": 0,
+        })
+        assert ok.status_code == 200
+        body = ok.json()
+        assert body["version"] == 1
+        assert body["config"]["evaluation_session_source_allowlist"] == [
+            "dashboard", "cli"
+        ]
+        # 同版本 CAS 第二方提交：409，冲突不改变成功方值/版本
+        conflict = mgmt.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_session_source_allowlist": ["api"]},
+            "expected_version": 0,
+        })
+        assert conflict.status_code == 409
+        after = mgmt.get("/chat/evaluations/config").json()
+        assert after["version"] == 1
+        assert after["config"]["evaluation_session_source_allowlist"] == [
+            "dashboard", "cli"
+        ]
+
+    def test_patch_empty_list_enters_overridden_fields(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        ok = mgmt.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_session_source_allowlist": []},
+            "expected_version": 0,
+        })
+        assert ok.status_code == 200
+        body = ok.json()
+        assert body["config"]["evaluation_session_source_allowlist"] == []
+        assert "evaluation_session_source_allowlist" in body["overridden_fields"]
+        # 后续 patch 省略该键：保留空覆盖，其它覆盖不变
+        follow = mgmt.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_enabled": True},
+            "expected_version": 1,
+        })
+        assert follow.status_code == 200
+        body = follow.json()
+        assert body["config"]["evaluation_session_source_allowlist"] == []
+        assert set(body["overridden_fields"]) == {
+            "evaluation_enabled",
+            "evaluation_session_source_allowlist",
+        }
+
+    def test_patch_null_restores_non_default_env_baseline(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "N_AGENT_EVALUATION_SESSION_SOURCE_ALLOWLIST", "api, cli"
+        )
+        harness = _ManagementHarness(tmp_path)
+        ok = harness.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_session_source_allowlist": ["feishu"]},
+            "expected_version": 0,
+        })
+        assert ok.status_code == 200
+        cleared = harness.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_session_source_allowlist": None},
+            "expected_version": 1,
+        })
+        assert cleared.status_code == 200
+        body = cleared.json()
+        assert (
+            "evaluation_session_source_allowlist" not in body["overridden_fields"]
+        )
+        # null = 清除覆盖：恢复非默认 env 基线（归一为枚举序）
+        assert body["config"]["evaluation_session_source_allowlist"] == [
+            "api", "cli"
+        ]
 
 
 class TestJudgeModelEndpoint:
@@ -2393,7 +2514,7 @@ class TestProducerSampleDefinitionsResolution:
 
 
 class TestFeedbackTargetVerification:
-    def _management_harness(self, tmp_path: Any, lookup: Any) -> Any:
+    def _management_harness(self, tmp_path: Any, lookup: Any, session_lookup: Any = None) -> Any:
         from fastapi import FastAPI as _FastAPI
         from app.interfaces.http.evaluation_routes import (
             register_evaluation_management_routes,
@@ -2408,10 +2529,12 @@ class TestFeedbackTargetVerification:
             config_service=_FakeConfigService(),
             review_service=None,
             agent_run_lookup=lookup,
+            session_lookup=session_lookup,
         )
         import asyncio as _asyncio
 
         _asyncio.run(service.register_feedback_helpful_definition())
+        _asyncio.run(service.register_session_feedback_helpful_definition())
         return TestClient(app), service
 
     def test_agent_run_target_not_found_rejected(self, tmp_path: Any) -> None:
@@ -2487,6 +2610,108 @@ class TestFeedbackTargetVerification:
         assert target["run_id"] == "run-real"
         assert target["service"] == "n-agent"
 
+    def test_session_feedback_target_not_found_rejected(self, tmp_path: Any) -> None:
+        """会话人评目标必须对应真实会话——session lookup 未命中返回
+        422 target_not_found，不落悬空 Score。"""
+        async def session_lookup(session_id: str) -> dict | None:
+            return None
+
+        client, _ = self._management_harness(tmp_path, None, session_lookup)
+        resp = client.post("/chat/evaluations/feedback", json={
+            "target": {
+                "service": "n-agent",
+                "kind": "session_feedback",
+                "subject_id": "sess-missing",
+                "subject_revision": "v1",
+            },
+            "definition_id": "feedback.session_helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "target_not_found"
+
+    def test_session_feedback_target_with_real_session_accepted(
+        self, tmp_path: Any
+    ) -> None:
+        async def session_lookup(session_id: str) -> object | None:
+            # spec-261124：会话来源以服务端对象属性为准，lookup 返回
+            # ConversationSession（dashboard 默认准入）
+            return ConversationSession(id=session_id, source="dashboard")
+
+        client, _ = self._management_harness(tmp_path, None, session_lookup)
+        resp = client.post("/chat/evaluations/feedback", json={
+            "target": {
+                "service": "n-agent",
+                "kind": "session_feedback",
+                "subject_id": "sess-real-1",
+                "subject_revision": "v1",
+            },
+            "definition_id": "feedback.session_helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+        assert resp.status_code == 200, resp.text
+
+    def test_real_session_enriches_target_identity(self, tmp_path: Any) -> None:
+        """P097：会话身份服务端派生——session_id 取核验通过的真实会话
+        subject_id，不信任客户端自报；target_json 落库可投影。"""
+        async def session_lookup(session_id: str) -> object | None:
+            # spec-261124：会话来源以服务端对象属性为准，lookup 返回
+            # ConversationSession（dashboard 默认准入）
+            return ConversationSession(id=session_id, source="dashboard")
+
+        client, _ = self._management_harness(tmp_path, None, session_lookup)
+        resp = client.post("/chat/evaluations/feedback", json={
+            "target": {
+                "service": "n-agent",
+                "kind": "session_feedback",
+                "subject_id": "sess-real-1",
+                "subject_revision": "v1",
+            },
+            "definition_id": "feedback.session_helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+        assert resp.status_code == 200, resp.text
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(tmp_path / "mgmt.db"))
+        conn.row_factory = _sqlite3.Row
+        row = conn.execute(
+            "SELECT target_json FROM evaluation_feedback "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        target = json.loads(row["target_json"])
+        assert target["kind"] == "session_feedback"
+        assert target["session_id"] == "sess-real-1"
+        assert target["service"] == "n-agent"
+
+    def test_session_feedback_service_mismatch_rejected(
+        self, tmp_path: Any
+    ) -> None:
+        """session_feedback 目标声明 service 与真实归属不一致 -> 422。"""
+        async def session_lookup(session_id: str) -> object | None:
+            # spec-261124：会话来源以服务端对象属性为准，lookup 返回
+            # ConversationSession（dashboard 默认准入）
+            return ConversationSession(id=session_id, source="dashboard")
+
+        client, _ = self._management_harness(tmp_path, None, session_lookup)
+        resp = client.post("/chat/evaluations/feedback", json={
+            "target": {
+                "service": "n-kb",
+                "kind": "session_feedback",
+                "subject_id": "sess-real-1",
+                "subject_revision": "v1",
+            },
+            "definition_id": "feedback.session_helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "service_mismatch"
+
     def test_agent_run_service_mismatch_rejected(self, tmp_path: Any) -> None:
         """#21：agent_run 目标声明 service 与真实归属不一致 -> 422。"""
         async def lookup(subject_id: str) -> dict | None:
@@ -2554,6 +2779,260 @@ class TestFeedbackTargetVerification:
         })
         assert resp.status_code == 200
         assert captured["comment_ref"] == "comment-store:abc123"
+
+
+class TestSessionFeedbackSourceAllowlist:
+    """spec-261124：session_feedback 会话类型准入（服务端封口）。
+
+    - 全 12 个 SessionSource 参数化：仅 dashboard 默认准入，其余 422
+      session_source_not_allowed；
+    - 白名单经 config PATCH 热改（同一服务实例不重启）、空名单全拒绝；
+    - lookup 未注入 503 session_lookup_unavailable（不静默跳过准入）；
+    - source 以服务端会话对象属性为准（拒绝 Mapping 载体），客户端
+      伪造 source/session_id 无效；
+    - 错误优先级 target_not_found -> service_mismatch -> 来源门禁；
+    - 拒绝场景零写入：账本计数不变且 submit_feedback 未被调用。"""
+
+    def _harness(self, tmp_path: Any, session_lookup: Any) -> Any:
+        harness = _ManagementHarness(tmp_path, session_lookup=session_lookup)
+        _run(harness.evaluation_service.register_feedback_helpful_definition())
+        _run(harness.evaluation_service.register_session_feedback_helpful_definition())
+        return harness
+
+    def _post(self, harness: Any, subject_id: str = "sess-src-1",
+              **target_overrides: Any) -> Any:
+        target = {
+            "service": "n-agent",
+            "kind": "session_feedback",
+            "subject_id": subject_id,
+            "subject_revision": "v1",
+        }
+        target.update(target_overrides)
+        return harness.post("/chat/evaluations/feedback", {
+            "target": target,
+            "definition_id": "feedback.session_helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+
+    def _spy_submit(self, harness: Any) -> list:
+        calls: list = []
+        original = harness.evaluation_service.submit_feedback
+
+        async def spy(actor: Any, request: Any) -> Any:
+            calls.append(request)
+            return await original(actor, request)
+
+        harness.evaluation_service.submit_feedback = spy  # type: ignore[method-assign]
+        return calls
+
+    def _ledger_counts(self, harness: Any) -> dict[str, int]:
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(str(harness.tmp_path / "evaluations.db"))
+        try:
+            return {
+                table: conn.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0]
+                for table in (
+                    "evaluation_feedback",
+                    "evaluation_results",
+                    "evaluation_deliveries",
+                )
+            }
+        finally:
+            conn.close()
+
+    @pytest.mark.parametrize(
+        "source", [s.value for s in SessionSource]
+    )
+    def test_source_allowlist_matrix(
+        self, tmp_path: Any, source: str
+    ) -> None:
+        async def lookup(session_id: str) -> ConversationSession | None:
+            return ConversationSession(id=session_id, source=source)
+
+        harness = self._harness(tmp_path, lookup)
+        calls = self._spy_submit(harness)
+        before = self._ledger_counts(harness)
+        resp = self._post(harness)
+        if source == "dashboard":
+            assert resp.status_code == 200, resp.text
+            assert len(calls) == 1
+            after = self._ledger_counts(harness)
+            assert after["evaluation_feedback"] == (
+                before["evaluation_feedback"] + 1
+            )
+        else:
+            assert resp.status_code == 422, (source, resp.text)
+            assert resp.json()["error"]["code"] == "session_source_not_allowed"
+            assert calls == []
+            assert self._ledger_counts(harness) == before
+
+    def test_hot_patch_admits_cli_without_restart(self, tmp_path: Any) -> None:
+        async def lookup(session_id: str) -> ConversationSession | None:
+            return ConversationSession(id=session_id, source="cli")
+
+        harness = self._harness(tmp_path, lookup)
+        calls = self._spy_submit(harness)
+        before = self._ledger_counts(harness)
+        resp = self._post(harness)
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "session_source_not_allowed"
+        assert calls == []
+        assert self._ledger_counts(harness) == before
+        patched = harness.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_session_source_allowlist": ["cli"]},
+            "expected_version": 0,
+        })
+        assert patched.status_code == 200, patched.text
+        # 同一服务实例热读白名单：cli 会话由 422 变 200，不重启
+        resp_after = self._post(harness)
+        assert resp_after.status_code == 200, resp_after.text
+        assert len(calls) == 1
+
+    def test_empty_allowlist_rejects_dashboard_too(self, tmp_path: Any) -> None:
+        async def lookup(session_id: str) -> ConversationSession | None:
+            return ConversationSession(id=session_id, source="dashboard")
+
+        harness = self._harness(tmp_path, lookup)
+        assert self._post(harness).status_code == 200
+        calls = self._spy_submit(harness)
+        patched = harness.patch("/chat/evaluations/config", {
+            "patch": {"evaluation_session_source_allowlist": []},
+            "expected_version": 0,
+        })
+        assert patched.status_code == 200, patched.text
+        before = self._ledger_counts(harness)
+        resp = self._post(harness, subject_id="sess-empty-2")
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "session_source_not_allowed"
+        assert calls == []
+        assert self._ledger_counts(harness) == before
+
+    def test_lookup_not_injected_503_and_agent_run_unaffected(
+        self, tmp_path: Any
+    ) -> None:
+        harness = self._harness(tmp_path, None)
+        calls = self._spy_submit(harness)
+        before = self._ledger_counts(harness)
+        resp = self._post(harness)
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == "session_lookup_unavailable"
+        assert calls == []
+        assert self._ledger_counts(harness) == before
+        # agent_run 无 lookup 保留既有跳过核验语义：提交不受影响
+        resp_run = harness.post("/chat/evaluations/feedback", {
+            "target": {
+                "service": "n-agent",
+                "kind": "agent_run",
+                "subject_id": "run-1",
+                "subject_revision": "v1",
+            },
+            "definition_id": "feedback.helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+        assert resp_run.status_code == 200, resp_run.text
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize(
+        "carrier",
+        ["unknown", "missing", "non_string", "unhashable", "mapping"],
+    )
+    def test_invalid_session_source_carriers_rejected(
+        self, tmp_path: Any, carrier: str
+    ) -> None:
+        if carrier == "unknown":
+            session: Any = ConversationSession(id="sess-x", source="alien")
+        elif carrier == "missing":
+            from types import SimpleNamespace
+
+            session = SimpleNamespace(id="sess-x")
+        elif carrier == "non_string":
+            session = ConversationSession(id="sess-x", source=123)
+        elif carrier == "unhashable":
+            session = ConversationSession(id="sess-x", source=["cli"])
+        else:
+            # 拒绝 Mapping 载体：dict 即便带 source 键也不视为合法来源
+            session = {"session_id": "sess-x", "source": "dashboard"}
+
+        async def lookup(session_id: str) -> Any:
+            return session
+
+        harness = self._harness(tmp_path, lookup)
+        calls = self._spy_submit(harness)
+        before = self._ledger_counts(harness)
+        resp = self._post(harness)
+        assert resp.status_code == 422, (carrier, resp.text)
+        assert resp.json()["error"]["code"] == "session_source_not_allowed", (
+            carrier
+        )
+        assert calls == []
+        assert self._ledger_counts(harness) == before
+
+    def test_client_forged_source_and_session_id_ignored(
+        self, tmp_path: Any
+    ) -> None:
+        async def lookup(session_id: str) -> ConversationSession | None:
+            return ConversationSession(id=session_id, source="cli")
+
+        harness = self._harness(tmp_path, lookup)
+        calls = self._spy_submit(harness)
+        before = self._ledger_counts(harness)
+        # 客户端自报 source=dashboard / session_id=sess-forged 均无效：
+        # source 以服务端会话属性为准，session_id 服务端派生为 subject_id
+        resp = self._post(harness, source="dashboard", session_id="sess-forged")
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "session_source_not_allowed"
+        assert calls == []
+        assert self._ledger_counts(harness) == before
+
+    def test_priority_not_found_precedes_service_and_source(
+        self, tmp_path: Any
+    ) -> None:
+        async def miss(session_id: str) -> None:
+            return None
+
+        harness = self._harness(tmp_path, miss)
+        calls = self._spy_submit(harness)
+        before = self._ledger_counts(harness)
+        # 未命中 + service 不匹配：target_not_found 优先
+        resp = self._post(harness, service="n-kb")
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "target_not_found"
+        assert calls == []
+        assert self._ledger_counts(harness) == before
+
+    def test_priority_lookup_error_maps_to_not_found(
+        self, tmp_path: Any
+    ) -> None:
+        async def boom(session_id: str) -> ConversationSession | None:
+            raise RuntimeError("session store unavailable")
+
+        harness = self._harness(tmp_path, boom)
+        calls = self._spy_submit(harness)
+        resp = self._post(harness)
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "target_not_found"
+        assert calls == []
+
+    def test_priority_service_mismatch_precedes_source_gate(
+        self, tmp_path: Any
+    ) -> None:
+        async def hit(session_id: str) -> ConversationSession | None:
+            return ConversationSession(id=session_id, source="cli")
+
+        harness = self._harness(tmp_path, hit)
+        calls = self._spy_submit(harness)
+        before = self._ledger_counts(harness)
+        # 命中 + service 不匹配 + 来源未准入：service_mismatch 优先
+        resp = self._post(harness, service="n-kb")
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "service_mismatch"
+        assert calls == []
+        assert self._ledger_counts(harness) == before
 
 
 class TestDatasetManagement:
@@ -3436,3 +3915,237 @@ class TestResultsExtended:
         bad = base64.urlsafe_b64encode(b"not-json").decode("ascii")
         resp = mgmt.get(f"/chat/evaluations/results?cursor={quote(bad)}")
         assert resp.status_code == 422
+
+
+from tests.infrastructure.evaluation.test_run_scores_page import _ts
+
+
+class TestRunScoresRoute:
+    """run-scores 路由（GET /chat/evaluations/run-scores）：形状/白名单/
+    游标分类/错误映射（普通参数 protocol_invalid，游标 cursor_invalid）。"""
+
+    @staticmethod
+    def _seed_group(
+        mgmt: _ManagementHarness,
+        *,
+        step: int,
+        run_id: str,
+        session_id: str | None = None,
+        definition_id: str = "def-rs",
+        metric_name: str = "answer_relevance",
+        definition_version: str = "v1",
+        status: str = "value",
+        typed_value: float = 0.9,
+        service: str = "n-agent",
+    ) -> str:
+        from tests.infrastructure.evaluation.test_run_scores_page import (
+            _seed_auto_raw,
+        )
+
+        return _run(_seed_auto_raw(
+            mgmt.store, ts=_ts(step), run_id=run_id,
+            session_id=session_id, definition_id=definition_id,
+            metric_name=metric_name, definition_version=definition_version,
+            status=status, typed_value=typed_value, service=service,
+        ))
+
+    def test_run_scores_endpoint_shape_and_whitelist(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        # 空列表：顶层形状（行级断言在 test_run_scores_rows_shape_...）
+        resp = mgmt.get("/chat/evaluations/run-scores")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) >= {
+            "items", "next_cursor", "snapshot_at", "total_count",
+            "total_pages",
+        }
+        assert body["items"] == []
+        assert body["next_cursor"] is None
+        assert body["snapshot_at"]
+        assert (body["total_count"], body["total_pages"]) == (0, 1)
+        # 白名单外参数显式 422 protocol_invalid（含 results 端点专有过滤
+        # 与未知键，防止调用方误把 run-scores 当 results 用）
+        for bad in (
+            "target_kind=agent_run",
+            "evaluation_scene=online",
+            "experiment_id=x",
+            "target_service=n-agent",
+            "target_subject_id=r",
+            "target_subject_revision=r",
+            "snapshot_at=2026-01-01T00:00:00Z",
+            "bogus=1",
+        ):
+            resp = mgmt.get("/chat/evaluations/run-scores?" + bad)
+            assert resp.status_code == 422, bad
+            assert resp.json()["error"]["code"] == "protocol_invalid", bad
+
+    def test_run_scores_rows_shape_and_pagination_groups(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        ts1 = self._seed_group(mgmt, step=1, run_id="run-1",
+                               session_id="sess-1",
+                               definition_id="def-faith",
+                               metric_name="faithfulness")
+        ts2 = self._seed_group(mgmt, step=2, run_id="run-1",
+                               session_id="sess-1",
+                               definition_id="def-rel",
+                               metric_name="answer_relevance",
+                               typed_value=0.5)
+        self._seed_group(mgmt, step=3, run_id="run-2")
+        self._seed_group(mgmt, step=4, run_id="run-3")  # 无 session_id
+
+        first = mgmt.get("/chat/evaluations/run-scores?limit=2")
+        assert first.status_code == 200
+        body = first.json()
+        assert (body["total_count"], body["total_pages"]) == (3, 2)
+        assert body["snapshot_at"]
+        assert body["next_cursor"]
+        # 时间倒序：run-3（ts4）、run-2（ts3）
+        assert [row["run_id"] for row in body["items"]] == ["run-3", "run-2"]
+        for row in body["items"]:
+            assert set(row) == {
+                "target_service", "run_id", "session_id",
+                "last_created_at", "result_count", "metrics",
+            }
+            # run 行不含 explanation/raw JSON（解释正文只在详情返回）
+            assert "explanation" not in row
+            assert isinstance(row["target_service"], str)
+            assert isinstance(row["run_id"], str)
+            assert isinstance(row["result_count"], int)
+            assert isinstance(row["metrics"], list)
+            assert row["result_count"] == len(row["metrics"])
+        assert body["items"][0]["session_id"] is None  # run-3 无会话
+        assert body["items"][1]["session_id"] is None
+
+        second = mgmt.get(
+            "/chat/evaluations/run-scores?limit=2&cursor="
+            + quote(body["next_cursor"])
+        )
+        assert second.status_code == 200
+        second_body = second.json()
+        assert (second_body["total_count"], second_body["total_pages"]) == (3, 2)
+        assert second_body["next_cursor"] is None
+        assert len(second_body["items"]) == 1
+        run1 = second_body["items"][0]
+        assert run1["run_id"] == "run-1"
+        assert run1["target_service"] == "n-agent"
+        assert run1["session_id"] == "sess-1"
+        assert run1["result_count"] == 2 == len(run1["metrics"])
+        assert run1["last_created_at"] == _ts(2)
+        # metrics 按 created_at DESC
+        assert [m["result_id"] for m in run1["metrics"]] == [ts2, ts1]
+        for metric in run1["metrics"]:
+            assert set(metric) == {
+                "result_id", "metric_name", "typed_value", "passed",
+                "status", "provenance", "created_at",
+            }
+            assert isinstance(metric["result_id"], str)
+            assert isinstance(metric["metric_name"], str)
+            assert isinstance(metric["typed_value"], float)
+            assert isinstance(metric["passed"], bool)
+            assert metric["status"] == "value"
+            assert metric["provenance"] == "automatic"
+
+    def test_run_scores_time_window_and_limit_errors(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        self._seed_group(mgmt, step=1, run_id="run-1")
+        self._seed_group(mgmt, step=2, run_id="run-2")
+        # 时间区间沿用 results 语义：created_from 半开下界过滤
+        windowed = mgmt.get(
+            "/chat/evaluations/run-scores?created_from=" + quote(_ts(2))
+        )
+        assert windowed.status_code == 200
+        assert [row["run_id"] for row in windowed.json()["items"]] == ["run-2"]
+        # limit 非整数 / 非正数：protocol_invalid（不因无 cursor 降级）
+        for bad_limit in ("limit=abc", "limit=0", "limit=-1"):
+            resp = mgmt.get("/chat/evaluations/run-scores?" + bad_limit)
+            assert resp.status_code == 422, bad_limit
+            assert resp.json()["error"]["code"] == "protocol_invalid", bad_limit
+        # 携带合法 cursor 时 limit 非正数仍是 protocol_invalid（错误映射
+        # 分阶段：普通参数错误优先于游标归类）
+        cursor = mgmt.get("/chat/evaluations/run-scores?limit=1").json()[
+            "next_cursor"
+        ]
+        assert cursor
+        with_cursor = mgmt.get(
+            "/chat/evaluations/run-scores?limit=0&cursor=" + quote(cursor)
+        )
+        assert with_cursor.status_code == 422
+        assert with_cursor.json()["error"]["code"] == "protocol_invalid"
+
+    def test_run_scores_cursor_rejects_foreign_and_malformed(
+        self, mgmt: _ManagementHarness
+    ) -> None:
+        from tests.infrastructure.evaluation.test_run_scores_page import (
+            _MISSING,
+            _run_token,
+        )
+
+        self._seed_group(mgmt, step=1, run_id="run-1")
+        self._seed_group(mgmt, step=2, run_id="run-2")
+        page = mgmt.get("/chat/evaluations/run-scores?limit=1").json()
+        cursor = page["next_cursor"]
+        assert cursor
+
+        # 过滤变化：fingerprint 不一致 -> cursor_invalid
+        changed = mgmt.get(
+            "/chat/evaluations/run-scores?limit=1&status=value&cursor="
+            + quote(cursor)
+        )
+        assert changed.status_code == 422
+        assert changed.json()["error"]["code"] == "cursor_invalid"
+
+        # 跨端点双向：results v2 token -> run-scores 拒绝
+        results_v2 = mgmt.get(
+            "/chat/evaluations/results?provenance=automatic&limit=1"
+        ).json()["next_cursor"]
+        assert results_v2
+        cross = mgmt.get(
+            "/chat/evaluations/run-scores?cursor=" + quote(results_v2)
+        )
+        assert cross.status_code == 422
+        assert cross.json()["error"]["code"] == "cursor_invalid"
+
+        # 跨端点双向：run token -> results 也拒绝（既有 results parser
+        # 的二元 cur 校验拒绝三元 token，不放宽旧端点兼容规则）
+        reverse = mgmt.get(
+            "/chat/evaluations/results?provenance=automatic&cursor="
+            + quote(cursor)
+        )
+        assert reverse.status_code == 422
+        assert reverse.json()["error"]["code"] == "protocol_invalid"
+
+        # legacy 两段式与旧 b64 {"c","r"} token 一律 cursor_invalid
+        legacy_two_part = mgmt.get(
+            "/chat/evaluations/results?limit=1"
+        ).json()["next_cursor"]
+        assert legacy_two_part
+        legacy_b64 = base64.urlsafe_b64encode(
+            json.dumps({"c": "t", "r": "rid"}).encode("utf-8")
+        ).decode("ascii")
+        for legacy in (legacy_two_part, legacy_b64):
+            resp = mgmt.get(
+                "/chat/evaluations/run-scores?cursor=" + quote(legacy)
+            )
+            assert resp.status_code == 422, legacy
+            assert resp.json()["error"]["code"] == "cursor_invalid", legacy
+
+        # 缺失/非法 snap 与非法边界：完整结构校验（路由快速失败或
+        # store 校验拒绝，对外统一 cursor_invalid）
+        for bad_token in (
+            _run_token(snap=None),
+            _run_token(snap=_MISSING),
+            _run_token(snap="2026-11-20T10:00:00"),  # 无时区
+            _run_token(cur=["a", "b"]),  # results 形状边界
+            _run_token(cur=[123, "svc", "r"]),
+            _run_token(ns="other"),
+            "",
+            "not-base64!!",
+        ):
+            resp = mgmt.get(
+                "/chat/evaluations/run-scores?cursor=" + quote(bad_token)
+            )
+            assert resp.status_code == 422, bad_token
+            assert resp.json()["error"]["code"] == "cursor_invalid", bad_token

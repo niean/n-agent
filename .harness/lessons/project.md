@@ -1,4 +1,4 @@
-<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：会话来源推断覆盖预创建入口（P098）、评分生产路径的会话身份传递与冻结证据恢复（P097）、空态/加载/错误辅助文字字号须在共享状态类显式声明 token，禁止依赖 body 继承（P094）、bind-mount 配置的容器不随文件更新重载（collector 配置漂移致评估投影缺失，P093）、E2E会话清理与真实Run身份/进程中断（P091）、OpenAI缓存写已知零与命中率Counter准入漂移（P090）、观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
+<!-- SUMMARY: N-Agent 开发中的经验教训，AI自主维护。近期主题：评估视图上线前必须验证目标类型生产环存在（P099）、会话来源推断覆盖预创建入口（P098）、评分生产路径的会话身份传递与冻结证据恢复（P097）、空态/加载/错误辅助文字字号须在共享状态类显式声明 token，禁止依赖 body 继承（P094）、bind-mount 配置的容器不随文件更新重载（collector 配置漂移致评估投影缺失，P093）、E2E会话清理与真实Run身份/进程中断（P091）、OpenAI缓存写已知零与命中率Counter准入漂移（P090）、观测脱敏正则回溯阻塞事件循环与 multipart 文件隔离（P086）、Collector Link属性白名单与分支副本隔离（P087）、实例指标增量验收（P088）、工具循环内回合记忆快照保留、记忆工具可见性与执行权限共享会话选择、文件项目名与 adapter 名区分、mem0 正常云端延迟超过短等待预算、过程消息按 tool_calls 结构过滤且保留模型上下文、共享观测迁移与Pyroscope有效保留策略、unknown 日志治理（固定模板审计、空上下文占位降噪）、加载态重建 select options 被浏览器 value 回落语义吞掉选中值（Node 桩须模拟浏览器 value 语义）、E2E 清理 RUNNING 任务的三层叠加失效（CLI cancel 进程边界、.task.status 响应包装、容器重启孤儿 900s 租约）、派生资源的级联删除与中断恢复对称覆盖（task-{uuid5} 会话泄漏、cli intent 窗口）、级联删除领域异常路由映射、acp SDK spawn env 白名单 scrub 与子进程配置透传、会话开关 create/send 两段式生效时机、SSE 断连的 GeneratorExit/CancelledError 双路径与 detach 语义、跨层契约漂移与前端实测、夹具与真实产物的形态差、退出码契约与提交后失败的阶段划界、宿主 TUN 断流与 Docker 构建排障、OTel span 生命周期与 SDK 真实 API 参数陷阱（start_span+use_span/bucket kwargs/remote_write_queue）、敏感属性前缀过滤被命名空间搭车（枚举键白名单+全出口哨兵）、全局 Provider 重复 configure 泄漏（发布缓存+幂等 shutdown）、单一动作跨多份存储的语义对齐与 usage 对账自愈 fail-fast（P085） -->
 # 项目教训
 
 ### P094: 辅助文字字号必须在共享类显式声明，禁止依赖继承
@@ -888,3 +888,17 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：场景适配器先通过 Dashboard 创建会话，缺省 source=dashboard 已持久化；后续对话入口的实验前缀推断不会覆盖既有来源，历史迁移又只处理 api。
 - 教训：来源分类必须在最早持久化入口统一生效，同时核对显式渠道与默认渠道。前端过滤异常先比较真实 source 分布，不只检查筛选控件；迁移覆盖所有默认创建路径且保留明确渠道。
 - 来源：2026-11-19，实验会话筛选修复；SessionService 与 SQLite 迁移回归 RED 3 failed，GREEN 113 passed。
+
+### P099: 评估视图上线前必须验证目标类型的生产环存在
+
+- 现象：线上评估-会话评分页（target_kind=session_feedback 锁定视图）恒为空，而运行评分同构查询正常返回 885 条。
+- 根因：spec-261119 把会话评分实现为纯前端入口拆分（明确不改业务层），但 target_kind=session_feedback 在部署中没有任何生产路径——人评 UI 只覆盖 agent_run（Run 详情反馈），无 session_feedback 定义、无提交入口，账本 0 条 human 结果；查询层、JOIN、双分支过滤全部正确，空态是生产环缺失而非查询缺陷。
+- 教训：新增按目标类型/场景拆分的评估视图时，先核对账本中该目标类型的真实分布（GROUP BY target_json kind、provenance），生产端与消费端必须同批落地或明确声明"数据来源 TBD"；排除查询缺陷的证据链是"存储零行 + API 过滤复现 + 全局 provenance 分布"，不要在确认数据存在性之前先怀疑查询层。
+- 来源：2026-11-23，会话评分无数据修复（补 feedback.session_helpful 定义 + session_lookup 核验 + chat.js 会话反馈入口）；回归 12101 passed。
+
+### P100: Langfuse摄取静默失效先查collector exporter与MinIO磁盘
+
+- 现象：会话 dashboard-a2f0d2d5 未上报 Langfuse；实为 Langfuse 摄取对所有会话全部失效——collector `otlphttp/langfuse` exporter 报 langfuse-web 500 并 Dropping data，Tempo 管线正常，应用与 collector 主进程均无异常。
+- 根因：Docker Desktop 虚拟磁盘（Docker.raw 128G）内部空间耗尽，MinIO 触发 minimum free drive threshold 对事件 blob 上传返回 507，langfuse-web 转 500，collector 判定 permanent error 直接丢弃；宿主机 df 有余量不反映 VM 内部。次生：otel-collector.yaml 被重新生成（新 inode）使单文件 bind-mount 失效、健康检查崩溃循环，主进程持旧内存配置仍可用（呼应 P093，须 force-recreate）。
+- 教训：Langfuse 静默失效的排查入口是 collector exporter 错误日志与 langfuse-web 的 S3/XMinioStorageFull 错误，按"应用采样->collector->langfuse-web->MinIO"逐层取证据；磁盘满只看 Docker VM（`docker system df`、Docker.raw），4.76.0 events_only 合同下 legacy traces/observations 表恒空，验收查 default.events_core；被 500/permanent drop 的数据不可补报，Tempo 副本不受影响。
+- 来源：2026-11-24 会话 Langfuse 上报缺失修复；builder prune -a + image prune 回收 76.75GB 构建缓存与 dangling 镜像，实测新会话 trace 恢复入库 events_core。

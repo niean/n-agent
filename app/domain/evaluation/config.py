@@ -18,7 +18,10 @@ C 类 = 运行时调参旋钮（非安全边界）：Dashboard 可编辑 + 热�
 - ``evaluation_daily_call_ceiling``：Judge 日调用预算（0 = 不设上限）；
 - ``evaluation_judge_provider_id``：Judge 默认评估 Provider id（空串 =
   跟随 env 基线/清除覆盖；非空校验见 ``validate_model_name_string``
-  单一来源）。
+  单一来源）；
+- ``evaluation_session_source_allowlist``：线上评估会话类型准入白名单
+  （按 SessionSource 枚举序归一的元组；空元组 = 关闭会话评估；归一
+  单一来源在 ``normalize_session_source_allowlist``）。
 
 A 类安全不变量（tombstone 门禁/删除传播/Judge 只读/预算防超限语义）
 不在本配置内，不可被任何配置覆盖。
@@ -28,6 +31,8 @@ from __future__ import annotations
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
+
+from app.domain.session import SessionSource
 
 
 class EvaluationConfigStoreError(Exception):
@@ -43,6 +48,32 @@ class EvaluationConfigConflictError(Exception):
 
 
 _MODEL_NAME_MAX_CODEPOINTS = 200
+
+# 会话来源枚举顺序（归一输出的规范顺序，dashboard 在首位）
+_SESSION_SOURCE_VALUES: tuple[str, ...] = tuple(s.value for s in SessionSource)
+
+
+def normalize_session_source_allowlist(value: Any) -> tuple[str, ...]:
+    """会话类型白名单归一（单一来源）：list/tuple -> 去重并按
+    SessionSource 枚举定义顺序输出元组；非序列、bool/非字符串元素、
+    未知值、大小写变体、带首尾空白的元素均拒绝。空序列合法（= 关闭
+    会话评估）。"""
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise EvaluationConfigValidationError(
+            "evaluation_session_source_allowlist 必须是字符串数组"
+        )
+    seen: set[str] = set()
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, str):
+            raise EvaluationConfigValidationError(
+                f"evaluation_session_source_allowlist 元素必须是字符串: {item!r}"
+            )
+        if item != item.strip() or item not in _SESSION_SOURCE_VALUES:
+            raise EvaluationConfigValidationError(
+                f"evaluation_session_source_allowlist 含非法会话类型: {item!r}"
+            )
+        seen.add(item)
+    return tuple(s for s in _SESSION_SOURCE_VALUES if s in seen)
 
 
 def validate_model_name_string(value: Any, *, allow_empty: bool) -> str:
@@ -84,6 +115,7 @@ class EvaluationConfig:
     evaluation_worker_concurrency: int = 1
     evaluation_daily_call_ceiling: int = 0
     evaluation_judge_provider_id: str = ""
+    evaluation_session_source_allowlist: tuple[str, ...] = ("dashboard",)
 
 
 EVALUATION_CONFIG_FIELDS: tuple[str, ...] = (
@@ -94,6 +126,7 @@ EVALUATION_CONFIG_FIELDS: tuple[str, ...] = (
     "evaluation_worker_concurrency",
     "evaluation_daily_call_ceiling",
     "evaluation_judge_provider_id",
+    "evaluation_session_source_allowlist",
 )
 
 
@@ -108,13 +141,19 @@ class EvaluationConfigOverrides:
     evaluation_worker_concurrency: int | None = None
     evaluation_daily_call_ceiling: int | None = None
     evaluation_judge_provider_id: str | None = None
+    evaluation_session_source_allowlist: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            f: getattr(self, f)
-            for f in EVALUATION_CONFIG_FIELDS
-            if getattr(self, f) is not None
-        }
+        data: dict[str, Any] = {}
+        for f in EVALUATION_CONFIG_FIELDS:
+            value = getattr(self, f)
+            if value is None:
+                continue
+            if f == "evaluation_session_source_allowlist":
+                data[f] = list(value)  # 元组投影为 JSON 数组
+            else:
+                data[f] = value
+        return data
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "EvaluationConfigOverrides":
@@ -145,6 +184,14 @@ class EvaluationConfigOverrides:
                     validate_model_name_string(value, allow_empty=False)
                 except EvaluationConfigValidationError as exc:
                     raise EvaluationConfigStoreError(f"覆盖 {key}: {exc}") from exc
+            elif key == "evaluation_session_source_allowlist":
+                if value is None:
+                    continue  # 显式 null = 清除覆盖（恢复 env 基线）
+                try:
+                    kwargs[key] = normalize_session_source_allowlist(value)
+                except EvaluationConfigValidationError as exc:
+                    raise EvaluationConfigStoreError(f"覆盖 {key}: {exc}") from exc
+                continue
             elif key in (
                 "evaluation_sampling_rate",
                 "evaluation_failure_sampling_rate",
@@ -274,6 +321,23 @@ def validate_evaluation_config(
             "Judge Provider 已配置时 evaluation_daily_call_ceiling 必须"
             f"为正数（0 = 无上限会关闭预算预留）: "
             f"收到 {cfg.evaluation_daily_call_ceiling}"
+        )
+    # 冻结 dataclass 注入路径防御：None/列表/非归一元组等均在此拒绝
+    #（归一函数已拒绝非法类型/元素，此处补充元组形态与归一等价性检查）
+    try:
+        normalized = normalize_session_source_allowlist(
+            cfg.evaluation_session_source_allowlist
+        )
+    except EvaluationConfigValidationError as exc:
+        raise EvaluationConfigValidationError(
+            f"evaluation_session_source_allowlist: {exc}"
+        ) from exc
+    if (
+        not isinstance(cfg.evaluation_session_source_allowlist, tuple)
+        or cfg.evaluation_session_source_allowlist != normalized
+    ):
+        raise EvaluationConfigValidationError(
+            "evaluation_session_source_allowlist 必须为归一元组（去重 + 枚举序）"
         )
 
 

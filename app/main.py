@@ -4497,6 +4497,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ledger_service = services.evaluation_ledger_service
                 try:
                     await ledger_service.register_feedback_helpful_definition()
+                    await (
+                        ledger_service.register_session_feedback_helpful_definition()
+                    )
                     # T4：judge_model 传 env 基线模型（env 就绪时冻结进
                     # 新预设 material）或 None（跟随组合根默认供给）——
                     # None 也注册 llm_judge 预设（跟随默认供给，Provider
@@ -4909,6 +4912,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if services.agent_run_service is not None
                 else None
             ),
+            # 会话人评目标服务端核验（真实会话才接受 session_feedback
+            # 反馈；命中后服务端派生 session_id——P097）
+            session_lookup=services.memory_store.get_session,
             # Task 9：评估工作台管理面（评估器/人工标注/分析）——只读
             # 投影（标注队列列表、结果快照分页）同样经 Application 用例
             # 编排（AnnotationService.list_queue /

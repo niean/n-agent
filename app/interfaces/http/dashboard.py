@@ -278,6 +278,8 @@ def create_dashboard_router(
     @router.get("/evaluations/experiments", response_class=HTMLResponse)
     @router.get("/evaluations/experiment-results", response_class=HTMLResponse)
     @router.get("/evaluations/results", response_class=HTMLResponse)
+    @router.get("/evaluations/session-scores", response_class=HTMLResponse)
+    @router.get("/evaluations/run-scores", response_class=HTMLResponse)
     @router.get("/evaluations/annotations", response_class=HTMLResponse)
     @router.get("/evaluations/review", response_class=HTMLResponse)
     @router.get("/sessions", response_class=HTMLResponse)
