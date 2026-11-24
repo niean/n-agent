@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Mapping
 
@@ -61,6 +62,7 @@ _DETERMINISTIC_CAPABILITIES: tuple[dict[str, str], ...] = tuple(
         "metric_name": item["definition_id"],
         "target_kind": item["target_kind"],
         "output_type": item["output_type"],
+        "description": item["description"],
     }
     for item in EvaluationService._PRESET_DETERMINISTIC
 )
@@ -71,6 +73,7 @@ _LLM_JUDGE_CAPABILITIES: tuple[dict[str, str], ...] = tuple(
     {
         "metric_name": item["definition_id"],
         "target_kind": item["target_kind"],
+        "description": item["description"],
     }
     for item in EvaluationService._PRESET_JUDGE
 )
@@ -106,6 +109,45 @@ _PAYLOAD_KEYS: tuple[str, ...] = (
 
 # list_definitions 分页上限（与 results 分页封顶共用同一常量，单一权威源）
 _LIST_LIMIT_CAP = RESULTS_PAGE_LIMIT_CAP
+
+# 能力目录展示排序权重：①方法（LLM Judge > 确定性公式 > 人工评分）
+# ②指标语义维度（正确 > 完整 > 相关 > 忠实），未收录 metric 归"其它"
+_CAPABILITY_METHOD_ORDER: dict[str, int] = {
+    "llm_judge": 0,
+    "deterministic": 1,
+    "human": 2,
+}
+_CAPABILITY_METRIC_ORDER: dict[str, int] = {
+    # 正确：任务是否做成、回答是否正确
+    "agent.task_success": 0,
+    "agent.answer_correctness": 0,
+    # 完整：回答要点齐全、契约/断言全部满足、相关项是否找全
+    "agent.answer_completeness": 1,
+    "agent.tool_contract": 1,
+    "agent.scenario_assertions": 1,
+    "kb.recall_at_5": 1,
+    # 相关：内容与请求的相关程度、相关项排序质量
+    "agent.answer_relevance": 2,
+    "kb.ndcg_at_5": 2,
+    "kb.mrr_at_5": 2,
+    # 忠实：回答是否忠于证据
+    "agent.answer_faithfulness": 3,
+    # kb.context_relevance 固定置于 LLM Judge 组末尾（产品排序要求，
+    # 权重排在"其它"之后）
+    "kb.context_relevance": 5,
+}
+
+
+def _version_natural_key(version: str) -> tuple[tuple[int, int, str], ...]:
+    """版本号自然序排序键：数字段按数值比较（v10 > v2），文本段按字典
+    序（experiment-v* 排在 v* 之前）；与前端数据集版本比较同规则。"""
+    key: list[tuple[int, int, str]] = []
+    for token in re.findall(r"\d+|\D+", version):
+        if token.isdigit():
+            key.append((1, int(token), ""))
+        else:
+            key.append((0, 0, token))
+    return tuple(key)
 
 
 class EvaluationAdminService:
@@ -149,6 +191,7 @@ class EvaluationAdminService:
                     "method": "deterministic",
                     "target_kind": item["target_kind"],
                     "output_type": item["output_type"],
+                    "description": item["description"],
                     "executable": True,
                     "judge_required": False,
                     "online_forbidden": False,
@@ -161,6 +204,7 @@ class EvaluationAdminService:
                     "method": "llm_judge",
                     "target_kind": item["target_kind"],
                     "output_type": "number",
+                    "description": item["description"],
                     "executable": judge_ready,
                     "judge_required": True,
                     "online_forbidden": False,
@@ -175,11 +219,23 @@ class EvaluationAdminService:
                         "method": "human",
                         "target_kind": target_kind,
                         "output_type": output_type,
+                        "description": "自行定义指标，由人工打分",
                         "executable": False,
                         "judge_required": False,
                         "online_forbidden": True,
                     }
                 )
+        # 目录列表展示排序（①方法 ②指标语义维度，未收录指标归入"其它"）：
+        # 方法 LLM Judge > 确定性公式 > 人工评分；
+        # 指标维度 正确 > 完整 > 相关 > 忠实 > 其它。维度按指标实际判定
+        # 语义划分：recall@5 是"找全了没"归完整，ndcg/mrr 衡量相关项的
+        # 排序质量归相关。同维度内按指标名 asc、目标类型 asc 保持确定性
+        entries.sort(key=lambda e: (
+            _CAPABILITY_METHOD_ORDER.get(str(e.get("method") or ""), 99),
+            _CAPABILITY_METRIC_ORDER.get(str(e.get("metric_name") or ""), 4),
+            str(e.get("metric_name") or ""),
+            str(e.get("target_kind") or ""),
+        ))
         return {"entries": entries, "judge_configured": judge_ready}
 
     # ------------------------------------------------------------------
@@ -547,45 +603,99 @@ class EvaluationAdminService:
         *,
         target_kind: str | None = None,
         method: str | None = None,
+        definition_id: str | None = None,
         limit: int = 50,
         cursor: str | None = None,
     ) -> dict[str, Any]:
         """定义 + usage 联合投影（脱敏：最小投影，不含连接密钥/内部路径）。
 
-        按 target_kind / method 过滤；cursor 为不透明偏移分页标记。"""
+        默认按 (definition_id, target_kind) 聚合：每个评估器只返回版本
+        自然序最新一行，附 version_count 供前端展示「历史」入口（实验
+        镜像 variant 与线上定义同 ID 不同 target_kind，聚合键必须含
+        target_kind，避免 variant 被并成线上版本历史）。definition_id
+        给定时返回该评估器全部版本（自然序新到旧，不分页），供历史
+        modal 使用。按 target_kind / method / definition_id 过滤；cursor
+        为不透明偏移分页标记（按聚合后行数偏移）。"""
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise EvaluationValidationError(
                 f"limit 必须是正整数: {limit!r}"
             )
         limit = min(limit, _LIST_LIMIT_CAP)
+        if definition_id is not None:
+            if not isinstance(definition_id, str) or not definition_id.strip():
+                raise EvaluationValidationError(
+                    f"definition_id 必须是非空字符串: {definition_id!r}"
+                )
+            rows = await self._store.list_definitions_with_usage(
+                target_kind=target_kind
+            )
+            rows = [
+                row for row in rows
+                if row.get("definition_id") == definition_id
+            ]
+            if method is not None:
+                rows = [
+                    row for row in rows if row.get("method") == method
+                ]
+            # 历史 modal 展示顺序：版本自然序新到旧（对齐数据集历史）
+            rows.sort(
+                key=lambda row: _version_natural_key(
+                    str(row.get("version") or "")
+                ),
+                reverse=True,
+            )
+            items = [self._definition_list_item(row) for row in rows]
+            return {"items": items, "next_cursor": None,
+                    "total_count": len(items),
+                    "total_pages": max(1, (len(items) + limit - 1) // limit)}
         offset = self._decode_list_cursor(cursor)
         rows = await self._store.list_definitions_with_usage(
             target_kind=target_kind
         )
         if method is not None:
             rows = [row for row in rows if row.get("method") == method]
-        window = rows[offset : offset + limit]
+        # 聚合：组内按版本自然序升序取最新；实验镜像 variant 因
+        # target_kind 不同自成一组，不参与线上评估器的版本历史
+        grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+        for row in rows:
+            key = (
+                str(row.get("definition_id") or ""),
+                str(row.get("target_kind") or ""),
+            )
+            grouped.setdefault(key, []).append(row)
+        grouped_rows: list[dict[str, Any]] = []
+        for versions in grouped.values():
+            versions.sort(
+                key=lambda row: _version_natural_key(
+                    str(row.get("version") or "")
+                )
+            )
+            grouped_rows.append(
+                {**self._definition_list_item(versions[-1]),
+                 "version_count": len(versions)}
+            )
+        window = grouped_rows[offset : offset + limit]
         next_cursor = (
             self._encode_list_cursor(offset + limit)
-            if offset + limit < len(rows)
+            if offset + limit < len(grouped_rows)
             else None
         )
-        items = []
-        for row in window:
-            items.append(
-                {
-                    "definition_id": row.get("definition_id"),
-                    "version": row.get("version"),
-                    "metric_name": row.get("metric_name"),
-                    "target_kind": row.get("target_kind"),
-                    "method": row.get("method"),
-                    "usage": row.get("usage"),
-                }
-            )
-        total_count = len(rows)
-        return {"items": items, "next_cursor": next_cursor,
+        total_count = len(grouped_rows)
+        return {"items": window, "next_cursor": next_cursor,
                 "total_count": total_count,
                 "total_pages": max(1, (total_count + limit - 1) // limit)}
+
+    @staticmethod
+    def _definition_list_item(row: Mapping[str, Any]) -> dict[str, Any]:
+        """列表最小投影（不含连接密钥/内部路径）。"""
+        return {
+            "definition_id": row.get("definition_id"),
+            "version": row.get("version"),
+            "metric_name": row.get("metric_name"),
+            "target_kind": row.get("target_kind"),
+            "method": row.get("method"),
+            "usage": row.get("usage"),
+        }
 
     @staticmethod
     def _encode_list_cursor(offset: int) -> str:

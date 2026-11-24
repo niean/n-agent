@@ -6005,8 +6005,7 @@ async function testUnselectedSessionRunList() {
 }
 
 // ===========================================================================
-// 会话反馈准入（spec-261124）：Run 详情反馈区按评估 C 类会话来源白名单
-// 显隐「会话反馈」组；「运行反馈」组恒在且不等待配置读取。
+// 详情按各目标的来源白名单显示运行反馈和会话反馈。
 // ===========================================================================
 // evaluations API 桩：getConfig 可替换 handler + 调用记录；submitFeedback 记录载荷
 function _setEvaluationApi(env) {
@@ -6053,16 +6052,16 @@ async function testRunDetailSessionFeedbackAllowlist() {
   const FEEDBACK_MSGS = (runIds) => runIds.map((rid, i) => ({
     id: 'm' + i, role: 'assistant', content: '回答' + i, run_id: rid,
   }));
-  const SET_RUNS = (env, runIds) => {
+  const SET_RUNS = (env, runIds, source = 'dashboard') => {
     env.setListSessionRunsHandler(() => Promise.resolve(runIds.map((rid) => _runRow({ id: rid }))));
-    env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, trace_links: [] })));
+    env.setGetSessionRunHandler((id, runId) => Promise.resolve(_runRow({ id: runId, source, trace_links: [] })));
   };
   const CONFIG_OK = (allowlist) => () => Promise.resolve({
     config: { evaluation_session_source_allowlist: allowlist }, version: 1,
   });
   const openDetail = (env, footer) => env.fireClick(_runFooterDetailLink(footer));
 
-  // A. 白名单含会话来源：会话组 + 运行组都在；运行组同步先渲染不等配置
+  // A. 白名单含会话来源：配置确认后渲染会话组和运行组
   let env = loadChat();
   let cfg = _setEvaluationApi(env);
   let resolveCfg = null;
@@ -6074,10 +6073,7 @@ async function testRunDetailSessionFeedbackAllowlist() {
   openDetail(env, _runFooters(env)[0]);
   await _settle(env);
   let labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1,
-    'run feedback group renders immediately without waiting for config GET');
-  ok(!!labels && labels.indexOf('会话反馈') === -1,
-    'session feedback group is absent before config GET settles');
+  ok(labels === null, 'feedback waits for the config GET');
   ok(cfg.configCalls.length === 1,
     'one config GET per detail open (got ' + cfg.configCalls.length + ')');
   if (typeof resolveCfg === 'function') resolveCfg(CONFIG_OK(['dashboard'])());
@@ -6122,7 +6118,7 @@ async function testRunDetailSessionFeedbackAllowlist() {
       'session feedback submits session_feedback target bound to current session');
   }
 
-  // B. 白名单不含会话来源：会话组隐藏，运行组恒在
+  // B. 只允许运行来源：仅运行反馈组
   env = loadChat();
   cfg = _setEvaluationApi(env);
   cfg.setConfigHandler(CONFIG_OK(['dashboard']));
@@ -6136,7 +6132,7 @@ async function testRunDetailSessionFeedbackAllowlist() {
   ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
     'allowlist without session source hides session group and keeps run group');
 
-  // C. 白名单为 []：仅运行反馈组
+  // C. 白名单为 []：隐藏两组反馈
   env = loadChat();
   cfg = _setEvaluationApi(env);
   cfg.setConfigHandler(CONFIG_OK([]));
@@ -6147,10 +6143,10 @@ async function testRunDetailSessionFeedbackAllowlist() {
   openDetail(env, _runFooters(env)[0]);
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
-    'empty allowlist renders only the run feedback group');
+  ok(labels === null,
+    'empty allowlist hides both feedback groups');
 
-  // D. getConfig 拒绝：会话组渲染（服务端兜底）
+  // D. getConfig 拒绝：隐藏两组反馈
   env = loadChat();
   cfg = _setEvaluationApi(env);
   cfg.setConfigHandler(() => Promise.reject(new Error('boom')));
@@ -6161,10 +6157,10 @@ async function testRunDetailSessionFeedbackAllowlist() {
   openDetail(env, _runFooters(env)[0]);
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
-    'config GET rejection keeps session group visible (server-side fallback)');
+  ok(labels === null,
+    'config GET rejection hides both groups');
 
-  // E. 非法元素/未知值数组按读取失败处理：会话组渲染
+  // E. 非法名单按读取失败处理
   for (const bad of [['bogus'], ['dashboard', 123], ['dashboard', 'weird-value'], 'dashboard']) {
     env = loadChat();
     cfg = _setEvaluationApi(env);
@@ -6176,11 +6172,11 @@ async function testRunDetailSessionFeedbackAllowlist() {
     openDetail(env, _runFooters(env)[0]);
     await _settle(env);
     labels = _feedbackLabels(env);
-    ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
-      'invalid allowlist payload ' + JSON.stringify(bad) + ' keeps session group visible');
+    ok(labels === null,
+      'invalid allowlist payload ' + JSON.stringify(bad) + ' hides both groups');
   }
 
-  // F. 来源未知（载荷缺 source）：白名单为 [] 也不隐藏会话组
+  // F. 来源未知且名单为空：隐藏两组反馈
   env = loadChat();
   cfg = _setEvaluationApi(env);
   cfg.setConfigHandler(CONFIG_OK([]));
@@ -6191,8 +6187,8 @@ async function testRunDetailSessionFeedbackAllowlist() {
   openDetail(env, _runFooters(env)[0]);
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
-    'unknown session source keeps session group visible even with empty allowlist');
+  ok(labels === null,
+    'unknown session source is ineligible');
 
   // G. 响应返回时会话已切换：旧判定不应用；重开详情发起新读取
   env = loadChat();
@@ -6225,8 +6221,8 @@ async function testRunDetailSessionFeedbackAllowlist() {
   openDetail(env, s2Footer);
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') !== -1,
-    'stale case: reopening detail for s2 applies fresh allowlist');
+  ok(!!labels && labels.indexOf('运行反馈') === -1 && labels.indexOf('会话反馈') !== -1,
+    'stale case: reopening detail applies the allowlist to the session source');
   ok(cfg.configCalls.length === 2,
     'stale case: stale response is not reused, reopening issues a new GET (got '
       + cfg.configCalls.length + ')');
@@ -6250,19 +6246,19 @@ async function testRunDetailSessionFeedbackAllowlist() {
     'switch-run case: concurrent detail reads share one in-flight config GET (got '
       + cfg.configCalls.length + ')');
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
-    'switch-run case: current detail shows only run group while config pending');
+  ok(labels === null,
+    'switch-run case: feedback waits for config');
   if (typeof resolveCfg === 'function') resolveCfg(CONFIG_OK(['dashboard'])());
   await _settle(env);
   labels = _feedbackLabels(env);
   ok(!!labels && labels.indexOf('会话反馈') !== -1,
     'switch-run case: shared response applies to the current detail only');
-  // 重开同一 Run：白名单已变空 -> 会话组隐藏（新 GET，不缓存旧结果）
+  // 重开同一 Run：读取新的空名单后隐藏两组反馈
   cfg.setConfigHandler(CONFIG_OK([]));
   openDetail(env, twoFooters[1]);
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+  ok(labels === null,
     'switch-run case: reopening same run applies the new empty allowlist');
   ok(cfg.configCalls.length === 2,
     'switch-run case: settled config GET is never reused (got ' + cfg.configCalls.length + ')');
@@ -6281,16 +6277,28 @@ async function testRunDetailSessionFeedbackAllowlist() {
   if (typeof rejectCfg === 'function') rejectCfg(new Error('boom'));
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('会话反馈') !== -1,
-    'retry case: failed first read keeps session group visible');
+  ok(labels === null,
+    'retry case: failed first read hides both groups');
   cfg.setConfigHandler(CONFIG_OK([]));
   openDetail(env, _runFooters(env)[0]);
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
+  ok(labels === null,
     'retry case: next open retries config and applies fresh allowlist');
   ok(cfg.configCalls.length === 2,
     'retry case: failed read is not cached, retry issues a new GET (got ' + cfg.configCalls.length + ')');
+
+  env = loadChat();
+  cfg = _setEvaluationApi(env);
+  cfg.setConfigHandler(CONFIG_OK(['dashboard']));
+  SET_RUNS(env, ['run-1'], 'schedule');
+  await _prepareFeedbackSession(env, [
+    { id: 's1', session: { source: 'dashboard' }, messages: FEEDBACK_MSGS(['run-1']) },
+  ]);
+  openDetail(env, _runFooters(env)[0]);
+  await _settle(env);
+  ok(JSON.stringify(_feedbackLabels(env)) === JSON.stringify(['会话反馈']),
+    'scheduled run is ineligible inside an eligible dashboard session');
 
   // J. 详情重开读取新白名单：成功结果同样不缓存
   env = loadChat();
@@ -6309,8 +6317,8 @@ async function testRunDetailSessionFeedbackAllowlist() {
   openDetail(env, _runFooters(env)[0]);
   await _settle(env);
   labels = _feedbackLabels(env);
-  ok(!!labels && labels.indexOf('运行反馈') !== -1 && labels.indexOf('会话反馈') === -1,
-    'reopen case: reopening re-reads config and hides session group under new allowlist');
+  ok(labels === null,
+    'reopen case: reopening re-reads config and hides both groups');
   ok(cfg.configCalls.length === 2,
     'reopen case: successful read is not cached (got ' + cfg.configCalls.length + ')');
 }

@@ -395,8 +395,8 @@ async def test_score_name_suffix_semantics():
     ) == ("kb.recall_at_5.v1")
     # llm_judge -> {metric}.judge-v{major}
     assert build_score_name(
-        "rag.faithfulness", "llm_judge", "automatic", "v1"
-    ) == ("rag.faithfulness.judge-v1")
+        "agent.answer_faithfulness", "llm_judge", "automatic", "v1"
+    ) == ("agent.answer_faithfulness.judge-v1")
     # human -> {metric}.human-v{major}
     assert build_score_name(
         "feedback.helpful", "human", "human", "v1"
@@ -412,17 +412,17 @@ async def test_judge_score_name_in_request():
     sink = _make_sink(api)
     context = _context(
         result=_result(
-            metric_name="rag.faithfulness", metric_version="v1", typed_value=0.5
+            metric_name="agent.answer_faithfulness", metric_version="v1", typed_value=0.5
         ),
         definition=_definition_row(
-            metric_name="rag.faithfulness",
+            metric_name="agent.answer_faithfulness",
             method="llm_judge",
             definition_id="def-faith",
         ),
     )
     projection = await _project_deliverable(sink, context)
     await sink.send(projection["payload"])
-    assert api.score_posts()[-1]["name"] == "rag.faithfulness.judge-v1"
+    assert api.score_posts()[-1]["name"] == "agent.answer_faithfulness.judge-v1"
 
 
 async def test_human_score_name_in_request():

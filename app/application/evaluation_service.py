@@ -814,31 +814,37 @@ class EvaluationService:
             "definition_id": "agent.task_success",
             "target_kind": "agent_run",
             "output_type": "boolean",
+            "description": "任务执行是否成功",
         },
         {
             "definition_id": "agent.tool_contract",
             "target_kind": "agent_run",
             "output_type": "boolean",
+            "description": "工具调用是否符合契约，如入参是否符合Schema",
         },
         {
             "definition_id": "agent.scenario_assertions",
             "target_kind": "agent_run",
             "output_type": "boolean",
+            "description": "Agent的实际表现是否满足测试用例的每项要求(场景测试)",
         },
         {
             "definition_id": "kb.recall_at_5",
             "target_kind": "retrieval",
             "output_type": "number",
+            "description": "前5个检索结果找到了多少比例的相关内容",
         },
         {
             "definition_id": "kb.ndcg_at_5",
             "target_kind": "retrieval",
             "output_type": "number",
+            "description": "前5个检索结果是否把更相关的内容排在前面",
         },
         {
             "definition_id": "kb.mrr_at_5",
             "target_kind": "retrieval",
             "output_type": "number",
+            "description": "前5个检索结果中，第1个相关结果排第几",
         },
     )
 
@@ -847,21 +853,31 @@ class EvaluationService:
             "definition_id": "agent.answer_correctness",
             "target_kind": "agent_run",
             "required_fields": ("request", "answer", "reference"),
+            "description": "回答是否正确(对照参考答案)",
         },
         {
             "definition_id": "agent.answer_relevance",
             "target_kind": "agent_run",
             "required_fields": ("request", "answer"),
+            "description": "回答是否相关(切题)",
         },
         {
-            "definition_id": "rag.faithfulness",
+            "definition_id": "agent.answer_completeness",
+            "target_kind": "agent_run",
+            "required_fields": ("request", "answer", "reference"),
+            "description": "回答是否完整(关键要点无遗漏)",
+        },
+        {
+            "definition_id": "agent.answer_faithfulness",
             "target_kind": "agent_run",
             "required_fields": ("answer", "contexts"),
+            "description": "回答是否有检索资料依据(忠实性)",
         },
         {
             "definition_id": "kb.context_relevance",
             "target_kind": "retrieval",
             "required_fields": ("query", "chunks"),
+            "description": "检索到的内容是否与查询相关(切题)",
         },
         {
             # plan T3：场景语义质量（逐轮 0/0.5/1，最终分取最低档）；
@@ -869,6 +885,7 @@ class EvaluationService:
             "definition_id": "agent.scenario_quality",
             "target_kind": "agent_run",
             "required_fields": ("turns", "scenario_evidence"),
+            "description": "按测试用例的要求给Agent每轮表现打分，取最低分(场景测试)",
         },
     )
 
@@ -885,8 +902,8 @@ class EvaluationService:
     ) -> tuple[EvaluatorDefinition, ...]:
         """spec 8 正式指标目录的预设定义（v1，不可变；启动期幂等注册）。
 
-        - deterministic 五个：worker 内建 handler 执行；
-        - llm_judge 四个：judge_model 取组合根 Judge 供给（env 基线或
+        - deterministic：worker 内建 handler 执行；
+        - llm_judge：judge_model 取组合根 Judge 供给（env 基线或
           None = 跟随组合根默认供给）；T4 起 Judge 未配置（None）也注册
           llm_judge 预设——定义跟随默认供给，Provider 就绪后即可执行
           （不再"注册即死条目"）；

@@ -222,6 +222,7 @@ class EvaluationSamplingPolicy:
     policy_version: str = SAMPLING_POLICY_VERSION
     rate: float = 0.0
     failure_rate: float = 0.0
+    session_source_allowlist: tuple[str, ...] | None = None
 
     def _hash(self, service: str, subject_id: str) -> int:
         digest = hashlib.sha256(
@@ -793,6 +794,7 @@ class EvaluationCaptureService:
         session_id: str,
         query: str,
         final_answer: str,
+        source: str | None = None,
         model: str | None = None,
         target_versions: Mapping[str, Any] | None = None,
         truth_refs: Mapping[str, Any] | None = None,
@@ -814,6 +816,10 @@ class EvaluationCaptureService:
             if policy is None:
                 # C 类 enabled=False：捕获总闸关闭，静默跳过（eligible 已
                 # 计数反映探针活性，不产生 selected/captured）
+                return
+            if (policy.session_source_allowlist is not None
+                    and source not in policy.session_source_allowlist):
+                self.buffer.drain(session_id)
                 return
             cohort = policy.cohort_for(
                 self._service, subject_id, failed=failed,

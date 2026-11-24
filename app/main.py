@@ -8,7 +8,7 @@ import sys
 import threading
 import urllib.parse
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, localcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
@@ -770,6 +770,7 @@ def _evaluation_capture_policy(config_service: Any):
         policy_version=cfg.evaluation_sampling_policy_version,
         rate=cfg.evaluation_sampling_rate,
         failure_rate=cfg.evaluation_failure_sampling_rate,
+        session_source_allowlist=cfg.evaluation_session_source_allowlist,
     )
 
 
@@ -1312,12 +1313,18 @@ class _EvaluationJudgeDispatch:
         if expected and self._configuration_fingerprint is not None:
             if expected != await self._configuration_fingerprint():
                 raise _EvaluationJudgeNotConfiguredError("experiment configuration changed")
-        evaluator = self._by_metric.get(definition.metric_name)
+        # Stored definitions and queued jobs can still reference the old name.
+        metric_name = definition.metric_name
+        if metric_name == "rag.faithfulness":
+            metric_name = "agent.answer_faithfulness"
+        evaluator = self._by_metric.get(metric_name)
         if evaluator is None:
             raise _EvaluationJudgeNotConfiguredError(
                 "judge provider 未配置或指标无对应 Judge: "
                 f"{definition.metric_name!r}"
             )
+        if metric_name != definition.metric_name:
+            definition = replace(definition, metric_name=metric_name)
         return await evaluator.evaluate(definition, snapshot)
 
     async def aclose(self) -> None:
@@ -1627,7 +1634,7 @@ def build_application_services(
         )
         # Judge evaluator（B 类三字段同时为空 = Judge env 基线未配置；
         # 部分设置 fail-fast，由 _evaluation_judge_ready 统一判定）。T4：
-        # 五个 LLMJudgeEvaluator 实例无条件装配（构造值允许空），每次
+        # LLMJudgeEvaluator 实例无条件装配（构造值允许空），每次
         # evaluate 经注入的供给 resolver 逐次解析 C 类默认 Provider——
         # Provider 未引用且 env 全空时 evaluate 抛永久错误（worker 按
         # error_type 分类，不重试）。

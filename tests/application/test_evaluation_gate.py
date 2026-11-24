@@ -79,13 +79,13 @@ def _policy_content(**overrides) -> dict:
             "agent.task_success": 0.90,
             "kb.recall_at_5": 0.80,
             "kb.ndcg_at_5": 0.75,
-            "rag.faithfulness": 0.90,
+            "agent.answer_faithfulness": 0.90,
         },
         "coverage_metrics": [
             "agent.task_success",
             "kb.recall_at_5",
             "kb.ndcg_at_5",
-            "rag.faithfulness",
+            "agent.answer_faithfulness",
         ],
         "safety_slices": [],
         "key_slices": [],
@@ -243,7 +243,7 @@ class TestGatePolicyLoading:
         assert policy.required_metrics["agent.task_success"] == 0.90
         assert policy.required_metrics["kb.recall_at_5"] == 0.80
         assert policy.required_metrics["kb.ndcg_at_5"] == 0.75
-        assert policy.required_metrics["rag.faithfulness"] == 0.90
+        assert policy.required_metrics["agent.answer_faithfulness"] == 0.90
         assert policy.non_inferiority_margin == -0.02
         assert policy.min_cases == 100
         assert policy.min_paired_cases == 100
@@ -255,7 +255,7 @@ class TestGatePolicyLoading:
             "agent.task_success": 0.90,
             "kb.recall_at_5": 0.80,
             "kb.ndcg_at_5": 0.75,
-            "rag.faithfulness": 0.90,
+            "agent.answer_faithfulness": 0.90,
         }
         assert content["non_inferiority_margin"] == -0.02
 
@@ -557,11 +557,11 @@ class TestThresholdGate:
         items = []
         for i in range(100):
             sample_id = f"s{i:03d}"
-            scores[sample_id] = {"rag.faithfulness": _score("rag.faithfulness", 0.91)}
+            scores[sample_id] = {"agent.answer_faithfulness": _score("agent.answer_faithfulness", 0.91)}
             items.append(_item(f"c{i:03d}", sample_ids=(sample_id,)))
-        report = _report(tuple(items), ("rag.faithfulness",))
+        report = _report(tuple(items), ("agent.answer_faithfulness",))
         conclusion = _evaluate(
-            report, _manifest(cases), scores, policy=_narrow_policy("rag.faithfulness")
+            report, _manifest(cases), scores, policy=_narrow_policy("agent.answer_faithfulness")
         )
         assert conclusion.state == GATE_PASS
 
@@ -831,7 +831,7 @@ class TestInsufficientData:
         # 指标规模达标且全部通过，也不得 gate_pass（fail-open 禁止），
         # 结论为 inconclusive（no_applicable_cases，默认阻断）
         cases = tuple(
-            _case(f"c{i:03d}", applicability={"rag.faithfulness": False})
+            _case(f"c{i:03d}", applicability={"agent.answer_faithfulness": False})
             for i in range(100)
         )
         scores: dict[str, dict] = {}
@@ -843,17 +843,17 @@ class TestInsufficientData:
             }
             items.append(_item(f"c{i:03d}", sample_ids=(sample_id,)))
         report = _report(
-            tuple(items), ("agent.task_success", "rag.faithfulness")
+            tuple(items), ("agent.task_success", "agent.answer_faithfulness")
         )
         conclusion = _evaluate(report, _manifest(cases), scores)
         assert conclusion.state == INCONCLUSIVE
         assert conclusion.state != GATE_PASS
         assert conclusion.state != GATE_FAIL
-        assert "no_applicable_cases:rag.faithfulness" in conclusion.reasons
+        assert "no_applicable_cases:agent.answer_faithfulness" in conclusion.reasons
         assert conclusion.insufficient_data is False
         rag_report = next(
             m for m in conclusion.metrics
-            if m.metric_name == "rag.faithfulness"
+            if m.metric_name == "agent.answer_faithfulness"
         )
         assert rag_report.denominator == 0
 
@@ -1387,7 +1387,7 @@ class TestDenominatorBasis:
                         {
                             "result_id": "r1",
                             "job_id": "j1",
-                            "metric_name": "rag.faithfulness",
+                            "metric_name": "agent.answer_faithfulness",
                             "status": "value",
                             "typed_value": 0.95,
                             "passed": None,
@@ -1400,7 +1400,7 @@ class TestDenominatorBasis:
             async def get_job(self, job_id):
                 return {
                     "sample_id": "s1",
-                    "definition_id": "rag.faithfulness",
+                    "definition_id": "agent.answer_faithfulness",
                     "definition_version": "v1",
                 }
 
@@ -1427,12 +1427,12 @@ class TestDenominatorBasis:
         data = _run_gate(collect_gate_data(FakeCompareLedger(), "exp-1"))
         assert data.denominator_basis == "observed"
         assert data.case_slices == {}
-        assert data.applicable_cases["rag.faithfulness"] == ("c000",)
+        assert data.applicable_cases["agent.answer_faithfulness"] == ("c000",)
         expected_judge_hash = hashlib.sha256(
             canonical_json_bytes(
                 [
                     {
-                        "definition_id": "rag.faithfulness",
+                        "definition_id": "agent.answer_faithfulness",
                         "version": "v1",
                         "judge_model": "judge-model",
                         "judge_params": {"temperature": 0},
@@ -1482,9 +1482,9 @@ async def _real_path_scores(tmp_path: Path, provenance: str):
     service = EvaluationService(store, enabled=True)
     definition = await store.save_definition(
         {
-            "definition_id": "rag.faithfulness",
+            "definition_id": "agent.answer_faithfulness",
             "version": "v1",
-            "metric_name": "rag.faithfulness",
+            "metric_name": "agent.answer_faithfulness",
             "target_kind": "experiment_item",
             "method": "llm_judge",
             "required_fields": [],
@@ -1519,7 +1519,7 @@ async def _real_path_scores(tmp_path: Path, provenance: str):
                 ),
                 definitions=(
                     DefinitionKey(
-                        definition_id="rag.faithfulness", definition_version="v1"
+                        definition_id="agent.answer_faithfulness", definition_version="v1"
                     ),
                 ),
                 experiment_id="exp-1",
@@ -1532,7 +1532,7 @@ async def _real_path_scores(tmp_path: Path, provenance: str):
             {
                 "job_id": submitted.job_ids[0],
                 "provenance": provenance,
-                "metric_name": "rag.faithfulness",
+                "metric_name": "agent.answer_faithfulness",
                 "metric_version": "v1",
                 "status": "value",
                 "skip_reason": None,
@@ -1550,7 +1550,7 @@ def _real_path_report(sample_ids: tuple[str, ...]) -> ExperimentRunReport:
         _item(f"c{i:03d}", sample_ids=(sample_id,))
         for i, sample_id in enumerate(sample_ids)
     )
-    return _report(items, ("rag.faithfulness",))
+    return _report(items, ("agent.answer_faithfulness",))
 
 
 class TestAdvisoryIntegrationRealServicePath:
@@ -1579,7 +1579,7 @@ class TestAdvisoryIntegrationRealServicePath:
         cases = tuple(_case(f"c{i:03d}") for i in range(100))
         conclusion = _evaluate(
             report, _manifest(cases), scores_by_sample,
-            policy=_narrow_policy("rag.faithfulness"),
+            policy=_narrow_policy("agent.answer_faithfulness"),
         )
         assert conclusion.state == GATE_PASS
         metric = conclusion.metrics[0]
@@ -1593,7 +1593,7 @@ class TestAdvisoryIntegrationRealServicePath:
         store, sample_ids = await _real_path_scores(tmp_path, "automatic")
         scores_by_sample = await collect_experiment_scores(store, "exp-1")
         assert len(scores_by_sample) == 100
-        score = scores_by_sample[sample_ids[0]]["rag.faithfulness"]
+        score = scores_by_sample[sample_ids[0]]["agent.answer_faithfulness"]
         assert score.status == "value"
         assert score.value == pytest.approx(0.95)
         assert score.provenance == "automatic"
@@ -1613,7 +1613,7 @@ class _FailingLoadSampleLedger:
                 {
                     "result_id": "r1",
                     "job_id": "j1",
-                    "metric_name": "rag.faithfulness",
+                    "metric_name": "agent.answer_faithfulness",
                     "status": "value",
                     "typed_value": 0.95,
                     "passed": None,
@@ -1626,7 +1626,7 @@ class _FailingLoadSampleLedger:
     async def get_job(self, job_id):
         return {
             "sample_id": "s1",
-            "definition_id": "rag.faithfulness",
+            "definition_id": "agent.answer_faithfulness",
             "definition_version": "v1",
         }
 

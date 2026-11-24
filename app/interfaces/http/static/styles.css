@@ -1148,9 +1148,12 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
    input 字号一并归一。 */
 .evaluations-filter__label { font-size: var(--font-size-sm); color: var(--color-fg-muted); }
 /* 复选框选项 label：覆盖全局 label 与 .providers-form label 的
-   flex-direction:column，checkbox 与文本行内排布并垂直居中（对齐
-   .external-memory__checkbox-label 既有约定；双类选择器保证特异性胜出）。 */
+   flex-direction:column，名称在左、checkbox 在右并垂直居中（对齐
+   .external-memory__checkbox-label 既有约定；双类选择器保证特异性胜出）。
+   名称 span 撑满剩余宽度，grid 两列等宽下名称左缘与 checkbox 右缘各自成线。 */
 .providers-form .evaluations-checkbox-label { display: flex; flex-direction: row; align-items: center; gap: 6px; margin: 0; }
+.providers-form .evaluations-checkbox-label > .evaluations-filter__label { flex: 1 1 auto; min-width: 0; }
+.providers-form .evaluations-checkbox-label > input[type="checkbox"] { flex: 0 0 auto; width: auto; }
 .evaluations-filter__help { font-size: var(--font-size-xs); color: var(--color-fg-subtle); }
 .evaluations-filter-group { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-bottom: var(--space-6); min-width: 0; }
 .evaluations-pager { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: var(--space-4); margin-top: var(--space-6); }

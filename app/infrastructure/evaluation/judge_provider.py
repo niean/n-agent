@@ -1,8 +1,7 @@
 # app/infrastructure/evaluation/judge_provider.py
 """LLM Judge evaluator adapter（plan T7，spec 8 / 10）。
 
-四个 Judge 指标（agent.answer_correctness / agent.answer_relevance /
-rag.faithfulness / kb.context_relevance）的统一适配器：供给逐次解析——
+内置 Judge 指标的统一适配器，逐次解析供给：
 构造注入 env 基线（base_url / api_key / model，允许全空），组合根注入
 异步供给 resolver，每次 evaluate 恰调用一次返回供给快照
 （``JudgeSupplyOverride``，见下）；不读会话 active provider，不随用户
@@ -34,10 +33,11 @@ prompt 边界（spec 10）：system 消息仅包含固定 rubric、JSON schema �
 - 公共：``redacted: True`` → skipped(redacted_evidence)，不输出完整性
   确定分数（脱敏后内容即实际评估输入，spec 6.3/10）；缺失必填字段 →
   skipped(evidence_missing)，不伪造分数。
-- agent.answer_correctness：request / answer / reference（缺 reference
+- agent.answer_correctness / agent.answer_completeness：
+  request / answer / reference（缺 reference
   → skipped(missing_reference)，本地决定，不调用 Judge）。
 - agent.answer_relevance：request / answer / rubric（可选）。
-- rag.faithfulness：answer / contexts（回答实际使用的上下文列表）。
+- agent.answer_faithfulness：answer / contexts（回答实际使用的上下文列表）。
 - kb.context_relevance：query / chunks（返回片段列表）/
   retrieval_error（存在且非空 → 检索失败，永久 error）。
 - 可选 ``target_model``：与 Judge 模型相同 → self_judge（也可经
@@ -49,7 +49,7 @@ token 上限：输入 12000 / 输出 1000。输入超限按定义 skipped
 format_error 拒绝，不接受残缺输出。
 
 结构化输出：值型指标只接受 ``value / reason / evidence_refs`` 三键，
-value 仅允许 0 / 0.5 / 1；rag.faithfulness 用声明 schema（逐声明
+value 仅允许 0 / 0.5 / 1；agent.answer_faithfulness 用声明 schema（逐声明
 supported 布尔，分母为全部声明，无法核实计不支持）；kb.context_relevance
 用逐片段 schema（每个证据槽恰一次评分）。所有引用必须回指快照证据
 evidence_id，悬空引用拒绝。无声明 → skipped(not_applicable)；空检索
@@ -140,7 +140,13 @@ _RUBRICS: dict[str, str] = {
         "0 偏题、0.5 部分相关、1 直接解决请求。rubric（如存在）是判定"
         "标准的权威来源。"
     ),
-    "rag.faithfulness": (
+    "agent.answer_completeness": (
+        "rubric：根据请求（role=request）和参考答案（role=reference）"
+        "确定回答应覆盖的关键要点，逐项检查回答（role=answer）是否覆盖。"
+        "0 未覆盖任何关键要点、0.5 覆盖部分关键要点、1 覆盖全部关键要点。"
+        "只对覆盖情况评分，允许同义表达；与要点矛盾的陈述不算覆盖。"
+    ),
+    "agent.answer_faithfulness": (
         "rubric：从回答中抽取全部声明，逐条判断给定上下文（role=context）"
         "是否支持该声明；上下文无法核实的声明一律计为不支持（supported="
         "false）。不要引入上下文之外的知识。"
@@ -159,7 +165,8 @@ _RUBRICS: dict[str, str] = {
 _SCORE_SCHEMA_TEXTS: dict[str, str] = {
     "agent.answer_correctness": _SCORE_SCHEMA_TEXT,
     "agent.answer_relevance": _SCORE_SCHEMA_TEXT,
-    "rag.faithfulness": _FAITHFULNESS_SCHEMA_TEXT,
+    "agent.answer_completeness": _SCORE_SCHEMA_TEXT,
+    "agent.answer_faithfulness": _FAITHFULNESS_SCHEMA_TEXT,
     "kb.context_relevance": _CONTEXT_SCHEMA_TEXT,
     "agent.scenario_quality": _TURNS_SCHEMA_TEXT,
 }
@@ -525,7 +532,7 @@ class LLMJudgeEvaluator:
         )
         valid_ids = {slot["evidence_id"] for slot in slots}
         try:
-            if self.metric_name == "rag.faithfulness":
+            if self.metric_name == "agent.answer_faithfulness":
                 value, reason, refs = self._parse_claims(
                     payload["content"], valid_ids
                 )
@@ -678,7 +685,7 @@ class LLMJudgeEvaluator:
                 for i, c in enumerate(chunks)
             ]
             return slots, None
-        if self.metric_name == "rag.faithfulness":
+        if self.metric_name == "agent.answer_faithfulness":
             contexts = content.get("contexts")
             if not isinstance(contexts, list) or not contexts:
                 return [], _skip(
@@ -695,7 +702,7 @@ class LLMJudgeEvaluator:
                 for i, c in enumerate(contexts)
             ]
             return slots, None
-        # 值型双指标：correctness / relevance
+        # 回答质量值型指标共用请求与回答证据。
         request = content.get("request")
         answer = content.get("answer")
         if not isinstance(request, str) or not request or not isinstance(
@@ -704,7 +711,7 @@ class LLMJudgeEvaluator:
             return [], _skip(
                 SkipReason.evidence_missing, "snapshot 缺少 request/answer 证据"
             )
-        if self.metric_name == "agent.answer_correctness":
+        if self.metric_name in ("agent.answer_correctness", "agent.answer_completeness"):
             reference = content.get("reference")
             if not isinstance(reference, str) or not reference:
                 # reference-dependent 指标缺参考答案本地跳过，不调用 Judge
@@ -1106,14 +1113,16 @@ def _make_judge_evaluator(metric_name: str) -> Callable[..., LLMJudgeEvaluator]:
 
 make_answer_correctness_judge = _make_judge_evaluator("agent.answer_correctness")
 make_answer_relevance_judge = _make_judge_evaluator("agent.answer_relevance")
-make_faithfulness_judge = _make_judge_evaluator("rag.faithfulness")
+make_answer_completeness_judge = _make_judge_evaluator("agent.answer_completeness")
+make_faithfulness_judge = _make_judge_evaluator("agent.answer_faithfulness")
 make_context_relevance_judge = _make_judge_evaluator("kb.context_relevance")
 make_scenario_quality_judge = _make_judge_evaluator("agent.scenario_quality")
 
 JUDGE_EVALUATOR_FACTORIES: dict[str, Callable[..., LLMJudgeEvaluator]] = {
     "agent.answer_correctness": make_answer_correctness_judge,
     "agent.answer_relevance": make_answer_relevance_judge,
-    "rag.faithfulness": make_faithfulness_judge,
+    "agent.answer_completeness": make_answer_completeness_judge,
+    "agent.answer_faithfulness": make_faithfulness_judge,
     "kb.context_relevance": make_context_relevance_judge,
     "agent.scenario_quality": make_scenario_quality_judge,
 }

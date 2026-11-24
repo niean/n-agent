@@ -1488,15 +1488,11 @@ class TestRecordProducerStateContract:
 
 
 async def test_preset_definitions_shapes(store):
-    """#1：spec 8 正式指标预设定义形状——11 个（6 deterministic + 5
-    judge，plan T3 新增 agent.scenario_assertions/scenario_quality），
-    target_kind / method / judge 字段与目录一致。"""
+    """预设定义及实验版本的目标类型、方法和 Judge 配置与目录一致。"""
     defs = EvaluationService.preset_definitions("judge-model-a")
-    # 11 正式 + 7 experiment_item variant（agent_run 预设镜像，同 metric
-    # 名、版本域 experiment-v1；24 项三方审阅 #1）
-    assert len(defs) == 20
+    assert len(defs) == 22
     by_id = {(d.definition_id, d.version): d for d in defs}
-    assert len(by_id) == 20
+    assert len(by_id) == 22
     defs_v1 = {d.definition_id: d for d in defs if d.version == "v1"}
     variants = [d for d in defs if d.version == "experiment-v1"]
     assert {d.definition_id for d in variants} == {
@@ -1505,7 +1501,8 @@ async def test_preset_definitions_shapes(store):
         "agent.scenario_assertions",
         "agent.answer_correctness",
         "agent.answer_relevance",
-        "rag.faithfulness",
+        "agent.answer_completeness",
+        "agent.answer_faithfulness",
         "agent.scenario_quality",
     }
     for variant in variants:
@@ -1530,7 +1527,8 @@ async def test_preset_definitions_shapes(store):
     judges = {
         "agent.answer_correctness": "agent_run",
         "agent.answer_relevance": "agent_run",
-        "rag.faithfulness": "agent_run",
+        "agent.answer_completeness": "agent_run",
+        "agent.answer_faithfulness": "agent_run",
         "agent.scenario_quality": "agent_run",
         "kb.context_relevance": "retrieval",
     }
@@ -1542,7 +1540,7 @@ async def test_preset_definitions_shapes(store):
     # T4：judge_model=None（Judge 未配置）也注册 llm_judge 预设——
     # 定义跟随组合根默认供给，Provider 就绪后即可执行（不再注册即死条目）
     no_judge = EvaluationService.preset_definitions(None)
-    assert len(no_judge) == 20
+    assert len(no_judge) == 22
     no_judge_judges = [d for d in no_judge if d.method == "llm_judge"]
     assert no_judge_judges
     assert all(d.judge_model is None for d in no_judge_judges)
@@ -1607,7 +1605,7 @@ async def test_register_preset_definitions_idempotent(store):
     # 显式启用后按目标种类展开
     for def_id, version in (
         ("agent.answer_relevance", "v1"),
-        ("rag.faithfulness", "v1"),
+        ("agent.answer_faithfulness", "v1"),
         ("agent.task_success", "experiment-v1"),
     ):
         usage = await store.get_definition_usage(def_id, version)
@@ -1619,7 +1617,7 @@ async def test_register_preset_definitions_idempotent(store):
     agent_ids = {
         k.definition_id for k in await service.definitions_for_target("agent_run")
     }
-    assert {"agent.answer_relevance", "rag.faithfulness"} <= agent_ids
+    assert {"agent.answer_relevance", "agent.answer_faithfulness"} <= agent_ids
     assert "feedback.helpful" not in agent_ids  # human 不展开作业
     experiment_ids = {
         (k.definition_id, k.definition_version)

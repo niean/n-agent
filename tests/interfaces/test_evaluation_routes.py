@@ -21,6 +21,7 @@ producer state 高水位 store UPSERT）。
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1080,6 +1081,9 @@ class _ManagementHarness:
             ),
         )
         self.analytics_service = EvaluationAnalyticsService(self.store)
+        async def run_lookup(run_id: str) -> dict:
+            return {"run_id": run_id, "source": "dashboard"}
+
         self.app = FastAPI()
         register_evaluation_management_routes(
             self.app,
@@ -1090,6 +1094,7 @@ class _ManagementHarness:
             evaluation_annotation_service=self.annotation_service,
             evaluation_analytics_service=self.analytics_service,
             judge_supply=judge_supply,
+            agent_run_lookup=run_lookup,
             session_lookup=session_lookup,
         )
         self.client = TestClient(self.app)
@@ -2558,9 +2563,39 @@ class TestFeedbackTargetVerification:
         assert resp.status_code == 422
         assert resp.json()["error"]["code"] == "target_not_found"
 
+    @pytest.mark.parametrize("source", ["schedule", "feishu", None])
+    def test_agent_run_feedback_rejects_non_allowlisted_source(
+        self, tmp_path: Any, source: str | None,
+    ) -> None:
+        async def lookup(subject_id: str) -> dict:
+            return {"run_id": subject_id, "session_id": "sess-1", "source": source}
+
+        client, _ = self._management_harness(tmp_path, lookup)
+        resp = client.post("/chat/evaluations/feedback", json={
+            "target": {
+                "kind": "agent_run", "subject_id": "run-real",
+                "subject_revision": "v1", "source": "dashboard",
+            },
+            "definition_id": "feedback.helpful",
+            "definition_version": "v1",
+            "value": True,
+        })
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "session_source_not_allowed"
+        with sqlite3.connect(str(tmp_path / "mgmt.db")) as conn:
+            assert conn.execute("SELECT count(*) FROM evaluation_feedback").fetchone() == (0,)
+
+    def test_agent_run_feedback_requires_lookup(self, tmp_path: Any) -> None:
+        client, _ = self._management_harness(tmp_path, None)
+        resp = client.post("/chat/evaluations/feedback", json={
+            "target": {"kind": "agent_run", "subject_id": "run-real"},
+        })
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "agent_run_lookup_unavailable"
+
     def test_agent_run_target_with_real_run_accepted(self, tmp_path: Any) -> None:
         async def lookup(subject_id: str) -> dict | None:
-            return {"run_id": subject_id}
+            return {"run_id": subject_id, "source": "dashboard"}
 
         client, _ = self._management_harness(tmp_path, lookup)
         resp = client.post("/chat/evaluations/feedback", json={
@@ -2580,7 +2615,7 @@ class TestFeedbackTargetVerification:
         """24 项三方审阅 #21：lookup 命中时从真实 Run 恢复身份
         （session_id/run_id/service 归一），人评不再恒 unlinked。"""
         async def lookup(subject_id: str) -> dict | None:
-            return {"run_id": subject_id, "session_id": "sess-real-1"}
+            return {"run_id": subject_id, "session_id": "sess-real-1", "source": "dashboard"}
 
         client, service = self._management_harness(tmp_path, lookup)
         resp = client.post("/chat/evaluations/feedback", json={
@@ -2755,7 +2790,7 @@ class TestFeedbackTargetVerification:
         captured: dict = {}
 
         async def lookup(subject_id: str) -> dict | None:
-            return {"run_id": subject_id}
+            return {"run_id": subject_id, "source": "dashboard"}
 
         client, service = self._management_harness(tmp_path, lookup)
         original = service.submit_feedback
@@ -2922,7 +2957,7 @@ class TestSessionFeedbackSourceAllowlist:
         assert resp.json()["error"]["code"] == "session_lookup_unavailable"
         assert calls == []
         assert self._ledger_counts(harness) == before
-        # agent_run 无 lookup 保留既有跳过核验语义：提交不受影响
+        # 运行反馈以独立的 Run 核验为准。
         resp_run = harness.post("/chat/evaluations/feedback", {
             "target": {
                 "service": "n-agent",

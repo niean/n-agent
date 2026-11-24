@@ -3085,7 +3085,7 @@
 
     renderRunDetailTools(wrap, calls, runId);
     renderRunDetailTrace(wrap, row);
-    renderRunDetailFeedback(wrap, runId, sessionId);
+    renderRunDetailFeedback(wrap, runId, sessionId, row.source);
     target.appendChild(wrap);
   }
 
@@ -3101,8 +3101,7 @@
   const RUN_FEEDBACK_DEFINITION = 'feedback.helpful';
   const SESSION_FEEDBACK_DEFINITION = 'feedback.session_helpful';
 
-  // 会话反馈准入（spec-261124）：按评估 C 类白名单显隐；配置未知
-  // 时不隐藏（服务端 422 兜底），并发渲染合并同一在途读取
+  // 反馈入口按评估来源白名单显示，并发渲染合并同一在途读取。
   let sessionAllowlistPromise = null;
   function fetchSessionSourceAllowlist(evaluationApi) {
     if (!sessionAllowlistPromise) {
@@ -3137,11 +3136,11 @@
     return group;
   }
 
-  function renderRunDetailFeedback(wrap, runId, sessionId) {
+  function renderRunDetailFeedback(wrap, runId, sessionId, runSource) {
     if (!runId || typeof runId !== 'string') return;
     const evaluationApi = (global.NAGENT && global.NAGENT.api
       && global.NAGENT.api.evaluations) || null;
-    if (!evaluationApi) return;
+    if (!evaluationApi || typeof evaluationApi.getConfig !== 'function') return;
     // Langfuse 会话详情直达：sessionId 与 Langfuse sessionId 同源，经
     // management-ui.js 单源 helper 拼接；无有效会话 id 时不渲染入口，
     // 禁止回落会话 List 制造误导。
@@ -3156,14 +3155,13 @@
     titleEl.className = 'run-detail__title';
     titleEl.textContent = '评估反馈';
     header.appendChild(titleEl);
-    if (langfuseUrl) {
-      const langfuseLink = document.createElement('a');
+    const langfuseLink = langfuseUrl ? document.createElement('a') : null;
+    if (langfuseLink) {
       langfuseLink.className = 'otel-link';
       langfuseLink.href = langfuseUrl;
       langfuseLink.target = '_blank';
       langfuseLink.rel = 'noopener noreferrer';
       langfuseLink.textContent = 'Langfuse 会话';
-      header.appendChild(langfuseLink);
     }
     section.appendChild(header);
 
@@ -3227,65 +3225,31 @@
       return group;
     };
 
-    // 运行反馈：target agent_run/<runId>，definition feedback.helpful；
-    // 立即无条件构造，不等待配置读取
-    const runGroup = buildFeedbackGroup('运行反馈');
-    buildActionsRow(runGroup, RUN_FEEDBACK_DEFINITION, runId, 'agent_run', 'run-feedback');
-    section.appendChild(runGroup);
-
-    // 会话反馈（spec-261124）：target session_feedback/<sessionId>，definition
-    // feedback.session_helpful，按评估 C 类会话来源白名单异步显隐。同步契约
-    // 不变（本函数同步返回），会话组由内部异步刷新追加/替换。捕获本次
-    // sessionId/source/详情代次；异步返回时复核归属（会话、代次、选中 Run、
-    // 容器挂载），关闭再打开同 Run 的旧响应一律丢弃。配置未知（读取失败/
-    // 字段非法）或来源未知时不隐藏（服务端 422 兜底）；仅当白名单与来源
-    // 都明确且来源不在名单内时隐藏。
     const detailSeq = runDetailRequestSeq;
-    const capturedSessionId = currentSessionId;
-    const capturedSource = currentSessionSource;
-    let sessionGroupEl = null;
-    const applySessionGroup = (allowlist) => {
-      if (currentSessionId !== capturedSessionId) return;
-      if (runDetailRequestSeq !== detailSeq) return;
-      if (!selectedRunDetail || selectedRunDetail.sessionId !== capturedSessionId
-        || selectedRunDetail.runId !== runId) return;
-      if (!wrap.parentNode || section.parentNode !== wrap) return;
-      if (!capturedSessionId) return;
-      const hide = Array.isArray(allowlist) && capturedSource != null
-        && allowlist.indexOf(capturedSource) === -1;
-      if (hide) {
-        if (sessionGroupEl && sessionGroupEl.parentNode === section) {
-          section.removeChild(sessionGroupEl);
-        }
-        sessionGroupEl = null;
+    const sessionSource = currentSessionSource;
+    fetchSessionSourceAllowlist(evaluationApi).then((allowlist) => {
+      if (!wrap.parentNode || currentSessionId !== sessionId
+        || runDetailRequestSeq !== detailSeq || !selectedRunDetail
+        || selectedRunDetail.sessionId !== sessionId || selectedRunDetail.runId !== runId) return;
+      const allowRun = allowlist?.includes(runSource);
+      const allowSession = !!sessionId && allowlist?.includes(sessionSource);
+      if (!allowRun && !allowSession) {
+        if (langfuseLink) wrap.appendChild(langfuseLink);
         return;
       }
-      const group = buildFeedbackGroup('会话反馈');
-      buildActionsRow(group, SESSION_FEEDBACK_DEFINITION, capturedSessionId,
-        'session_feedback', 'session-feedback');
-      if (sessionGroupEl && sessionGroupEl.parentNode === section) {
-        section.replaceChild(group, sessionGroupEl);
-      } else {
-        section.appendChild(group);
+      if (langfuseLink) header.appendChild(langfuseLink);
+      if (allowRun) {
+        const group = buildFeedbackGroup('运行反馈');
+        section.appendChild(buildActionsRow(group, RUN_FEEDBACK_DEFINITION, runId,
+          'agent_run', 'run-feedback'));
       }
-      sessionGroupEl = group;
-    };
-    if (typeof evaluationApi.getConfig === 'function') {
-      fetchSessionSourceAllowlist(evaluationApi)
-        .then((allowlist) => applySessionGroup(allowlist))
-        .catch(() => { /* 刷新异常保持现状，不中断详情渲染 */ });
-    } else {
-      // 无 getConfig 的旧调用环境：沿用旧行为，选中会话即渲染。
-      // 此分支同步执行时 wrap 尚未挂载，不能走 applySessionGroup 的
-      // 挂载校验，直接构造追加
-      if (capturedSessionId) {
+      if (allowSession) {
         const group = buildFeedbackGroup('会话反馈');
-        buildActionsRow(group, SESSION_FEEDBACK_DEFINITION, capturedSessionId,
-          'session_feedback', 'session-feedback');
-        section.appendChild(group);
+        section.appendChild(buildActionsRow(group, SESSION_FEEDBACK_DEFINITION, sessionId,
+          'session_feedback', 'session-feedback'));
       }
-    }
-    wrap.appendChild(section);
+      wrap.appendChild(section);
+    });
   }
 
   // 未选中执行时展示整个会话账本，不依赖消息是否携带 run_id。

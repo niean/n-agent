@@ -242,21 +242,21 @@ class TestOverviewAnalyticsShape:
 class TestOverviewAnalyticsGrouping:
     async def test_groups_by_definition_provenance_output_type(self, store, evaluation_service):
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_definition(
             store, "agent.task_success", output_type="boolean"
         )
         # number：2 个有效值 + 1 skipped + 1 error（error/skipped 分列）
-        await _seed_auto_result(store, evaluation_service, "rag.faithfulness", 1.0, seq=0)
-        await _seed_auto_result(store, evaluation_service, "rag.faithfulness", 0.5, seq=1)
+        await _seed_auto_result(store, evaluation_service, "agent.answer_faithfulness", 1.0, seq=0)
+        await _seed_auto_result(store, evaluation_service, "agent.answer_faithfulness", 0.5, seq=1)
         await _seed_auto_result(
-            store, evaluation_service, "rag.faithfulness", None,
+            store, evaluation_service, "agent.answer_faithfulness", None,
             status="skipped", seq=2,
         )
         await _seed_auto_result(
-            store, evaluation_service, "rag.faithfulness", None,
+            store, evaluation_service, "agent.answer_faithfulness", None,
             status="error", seq=3,
         )
         # boolean：2 true + 1 false
@@ -276,10 +276,10 @@ class TestOverviewAnalyticsGrouping:
         groups = {(g["definition_id"], g["provenance"], g["output_type"]): g for g in result["groups"]}
         assert set(groups) == {
             ("agent.task_success", "automatic", "boolean"),
-            ("rag.faithfulness", "automatic", "number"),
+            ("agent.answer_faithfulness", "automatic", "number"),
         }
 
-        number = groups[("rag.faithfulness", "automatic", "number")]
+        number = groups[("agent.answer_faithfulness", "automatic", "number")]
         assert number["definition_version"] == "v1"
         assert number["total_count"] == 4
         assert number["status_counts"] == {"value": 2, "skipped": 1, "error": 1}
@@ -300,15 +300,15 @@ class TestOverviewAnalyticsGrouping:
     async def test_empty_value_group_stats_are_null(self, store, evaluation_service):
         """仅 skipped/error 行的分组：count=0，其余统计为 null。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_auto_result(
-            store, evaluation_service, "rag.faithfulness", None,
+            store, evaluation_service, "agent.answer_faithfulness", None,
             status="skipped", seq=0,
         )
         await _seed_auto_result(
-            store, evaluation_service, "rag.faithfulness", None,
+            store, evaluation_service, "agent.answer_faithfulness", None,
             status="error", seq=1,
         )
         service = EvaluationAnalyticsService(store)
@@ -323,9 +323,9 @@ class TestOverviewAnalyticsGrouping:
 
     async def test_buckets_count_today_and_zero_days(self, store, evaluation_service):
         """当日记录进当日 UTC+8 桶；其余日期 total=0 且逐日连续。"""
-        await _seed_definition(store, "rag.faithfulness", output_type="number")
-        await _seed_auto_result(store, evaluation_service, "rag.faithfulness", 1.0, seq=0)
-        await _seed_auto_result(store, evaluation_service, "rag.faithfulness", 0.5, seq=1)
+        await _seed_definition(store, "agent.answer_faithfulness", output_type="number")
+        await _seed_auto_result(store, evaluation_service, "agent.answer_faithfulness", 1.0, seq=0)
+        await _seed_auto_result(store, evaluation_service, "agent.answer_faithfulness", 0.5, seq=1)
 
         now = datetime.now(timezone.utc)
         service = EvaluationAnalyticsService(store)
@@ -362,7 +362,7 @@ class TestCompareNotFound:
     async def test_baseline_not_found(self, store, evaluation_service):
         """baseline 实验不存在 -> EvaluationNotFoundError（404）。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -407,7 +407,7 @@ async def _seed_experiment(
     exp_id,
     *,
     values,
-    metric: str = "rag.faithfulness",
+    metric: str = "agent.answer_faithfulness",
     dataset_id: str = "ds-1",
     dataset_version: str = "v1",
     dataset_hash: str = DATASET_HASH_A,
@@ -448,8 +448,8 @@ def _policy_content(**overrides) -> dict:
     content = {
         "schema_version": "1",
         "policy_version": "compare-v1",
-        "required_metrics": {"rag.faithfulness": 0.9},
-        "coverage_metrics": ["rag.faithfulness"],
+        "required_metrics": {"agent.answer_faithfulness": 0.9},
+        "coverage_metrics": ["agent.answer_faithfulness"],
         "safety_slices": [],
         "key_slices": [],
         "non_inferiority_margin": -0.02,
@@ -497,7 +497,7 @@ class TestCompareIncomparable:
         """无 policy 的描述性对比同样执行数据集身份核验（spec 4.6：
         不同数据集返回明确错误，不能只凭名称强行对比）。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -520,7 +520,7 @@ class TestCompareIncomparable:
         self, store, evaluation_service
     ):
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -545,7 +545,7 @@ class TestCompareIncomparable:
         """DefinitionKey 集不一致 -> 不可比（正式只读校验入口，无 policy
         同样执行）。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_definition(
@@ -553,7 +553,7 @@ class TestCompareIncomparable:
         )
         await _seed_experiment(
             store, evaluation_service, "exp-c", values=[1.0, 1.0],
-            metric="rag.faithfulness",
+            metric="agent.answer_faithfulness",
         )
         await _seed_experiment(
             store, evaluation_service, "exp-b", values=[True, True],
@@ -566,7 +566,7 @@ class TestCompareIncomparable:
 
     async def test_invalid_policy_rejected(self, store, evaluation_service):
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -590,7 +590,7 @@ class TestCompareDescriptive:
         self, store, evaluation_service
     ):
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -619,7 +619,7 @@ class TestCompareDescriptive:
 
         assert len(result["metrics"]) == 1
         row = result["metrics"][0]
-        assert row["metric_name"] == "rag.faithfulness"
+        assert row["metric_name"] == "agent.answer_faithfulness"
         assert row["candidate"]["value_count"] == 4
         assert row["candidate"]["macro_value"] == pytest.approx(0.925)
         assert row["candidate"]["missing_count"] == 0
@@ -638,7 +638,7 @@ class TestCompareDescriptive:
         EvaluationGate._case_value 的 isfinite 口径一致），diff /
         macro_value 不被 NaN 污染，置信区间不静默降级为 None。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -713,7 +713,7 @@ class TestCompareGate:
         即使分母口径标 pre_declared，gate_pass 也必须降为 inconclusive
         （analytics 层新增保护，不改原门禁算法）。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -746,7 +746,7 @@ class TestCompareGate:
     async def test_policy_gate_fail_preserved(self, store, evaluation_service):
         """原 gate_fail 保留：analytics 保护只降 gate_pass，不改门禁失败。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -767,7 +767,7 @@ class TestCompareGate:
         """无 manifest 冻结（denominator_basis=observed）：结论至多
         inconclusive。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(
@@ -794,7 +794,7 @@ class TestCompareReadOnly:
     async def test_compare_never_invokes_runner(self, store, evaluation_service):
         """只读断言（spec 4.6）：compare 过程零 execute/replay/judge 调用。"""
         await _seed_definition(
-            store, "rag.faithfulness", output_type="number",
+            store, "agent.answer_faithfulness", output_type="number",
             range_or_categories=[0.0, 1.0],
         )
         await _seed_experiment(

@@ -16,9 +16,11 @@ import datetime
 import json
 import logging
 import uuid
+from dataclasses import replace
 from datetime import timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -32,10 +34,28 @@ from app.application.evaluation_worker import EvaluationWorker
 from app.config import Settings
 from app.infrastructure.evaluation.store import SQLiteEvaluationStore
 from app.main import (
+    _EvaluationJudgeDispatch,
     build_application_services,
     build_evaluation_services,
     create_app,
 )
+
+
+async def test_judge_dispatch_accepts_legacy_faithfulness_definition():
+    metric = "agent.answer_faithfulness"
+    current = next(
+        definition
+        for definition in EvaluationService.preset_definitions(None)
+        if definition.metric_name == metric and definition.target_kind == "agent_run"
+    )
+    legacy = replace(
+        current, definition_id="rag.faithfulness", metric_name="rag.faithfulness"
+    )
+    evaluator = AsyncMock()
+    dispatch = _EvaluationJudgeDispatch({metric: evaluator})
+
+    assert await dispatch.evaluate(legacy, None) == evaluator.evaluate.return_value
+    evaluator.evaluate.assert_awaited_once_with(replace(legacy, metric_name=metric), None)
 
 
 def _settings(
@@ -212,6 +232,45 @@ def test_enabled_policy_provider_reads_c_config(tmp_path: Path):
         _settings(disabled_dir, evaluation_enabled=True)
     )
     assert disabled.evaluation_capture._current_policy() is None
+
+
+def test_online_capture_respects_session_source_allowlist(tmp_path: Path, monkeypatch):
+    services = build_application_services(
+        _settings(
+            tmp_path,
+            evaluation_enabled=True,
+            evaluation_capture_enabled=True,
+            evaluation_sampling_rate=1.0,
+            evaluation_failure_sampling_rate=1.0,
+        )
+    )
+    capture = services.evaluation_capture
+    queued = []
+    monkeypatch.setattr(capture.queue, "put_nowait", lambda item: queued.append(item) or True)
+    for source in ("schedule", "feishu", None, "dashboard"):
+        capture.capture_agent_run(
+            subject_id=f"run-{source}",
+            session_id=f"session-{source}",
+            source=source,
+            query="test",
+            final_answer="test",
+            failed=source == "schedule",
+        )
+    assert [item.target.subject_id for item in queued] == ["run-dashboard"]
+
+    asyncio.run(services.evaluation_config_service.update(
+        {"evaluation_session_source_allowlist": ["schedule"]},
+        expected_version=0,
+        updated_by="test",
+    ))
+    capture.capture_agent_run(
+        subject_id="run-schedule-after-update",
+        session_id="session-schedule",
+        source="schedule",
+        query="test",
+        final_answer="test",
+    )
+    assert queued[-1].target.subject_id == "run-schedule-after-update"
 
 
 def test_enabled_worker_concurrency_from_settings(tmp_path: Path):
@@ -837,7 +896,7 @@ def test_judge_without_call_ceiling_fails_fast(tmp_path: Path):
 
 
 async def test_enabled_judge_injects_default_supply_resolver(tmp_path, monkeypatch, caplog):
-    """T4 组合根：5 个 LLMJudgeEvaluator 注入 default_supply_resolver。
+    """组合根为内置 LLMJudgeEvaluator 注入 default_supply_resolver。
 
     resolver 热读 evaluation_judge_provider_id（C 类 DB 覆盖）：
     - 无引用 -> None（回落构造 env 基线）；
@@ -857,7 +916,6 @@ async def test_enabled_judge_injects_default_supply_resolver(tmp_path, monkeypat
 
     by_metric = services.evaluation_worker._evaluator._by_metric
     assert set(by_metric) == set(JUDGE_EVALUATOR_FACTORIES)
-    assert len(by_metric) == 5
     assert all(isinstance(e, LLMJudgeEvaluator) for e in by_metric.values())
     resolvers = [e._default_supply_resolver for e in by_metric.values()]
     assert all(r is not None for r in resolvers)

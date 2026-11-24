@@ -492,15 +492,16 @@ async def test_records_actual_response_model_and_usage():
 
 
 # ---------------------------------------------------------------------------
-# 指标工厂：四个 Judge 指标
+# 内置 Judge 指标工厂
 # ---------------------------------------------------------------------------
 
 
-def test_factories_cover_five_judge_metrics():
+def test_factories_cover_builtin_judge_metrics():
     assert set(JUDGE_EVALUATOR_FACTORIES) == {
         "agent.answer_correctness",
         "agent.answer_relevance",
-        "rag.faithfulness",
+        "agent.answer_completeness",
+        "agent.answer_faithfulness",
         "kb.context_relevance",
         "agent.scenario_quality",
     }
@@ -535,15 +536,16 @@ async def test_definition_metric_mismatch_fails_fast():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("metric", ["agent.answer_correctness", "agent.answer_completeness"])
 @pytest.mark.parametrize("value", [0, 0.5, 1])
-async def test_correctness_accepts_tri_state_values(value):
+async def test_reference_dependent_judge_accepts_tri_state_values(metric, value):
     recorder: list[httpx.Request] = []
 
     async def responder(request: httpx.Request) -> httpx.Response:
         return _chat_response(_score_payload(value))
 
-    judge = _make_judge("agent.answer_correctness", recorder, responder)
-    output = await judge.evaluate(_definition(), _snapshot(_correctness_content()))
+    judge = _make_judge(metric, recorder, responder)
+    output = await judge.evaluate(_definition(metric), _snapshot(_correctness_content()))
     assert output["status"] == "value"
     assert output["value"] == value
 
@@ -560,16 +562,17 @@ async def test_correctness_rejects_non_tri_state_values(value):
         await judge.evaluate(_definition(), _snapshot(_correctness_content()))
 
 
-async def test_correctness_without_reference_skips_locally_without_call():
+@pytest.mark.parametrize("metric", ["agent.answer_correctness", "agent.answer_completeness"])
+async def test_reference_dependent_judge_skips_without_reference(metric):
     recorder: list[httpx.Request] = []
 
     async def responder(request: httpx.Request) -> httpx.Response:
         raise AssertionError("缺 reference 不得调用 Judge")
 
-    judge = _make_judge("agent.answer_correctness", recorder, responder)
+    judge = _make_judge(metric, recorder, responder)
     content = _correctness_content()
     del content["reference"]
-    output = await judge.evaluate(_definition(), _snapshot(content))
+    output = await judge.evaluate(_definition(metric), _snapshot(content))
     assert output["status"] == "skipped"
     assert output["skip_reason"] == SkipReason.missing_reference.value
     assert recorder == []
@@ -631,7 +634,7 @@ async def test_answer_relevance_rejects_non_tri_state_value():
 
 
 # ---------------------------------------------------------------------------
-# rag.faithfulness：声明抽取/支持计数；分母为全部声明；无声明 skipped
+# agent.answer_faithfulness：声明抽取/支持计数；分母为全部声明；无声明 skipped
 # ---------------------------------------------------------------------------
 
 
@@ -653,9 +656,9 @@ async def test_faithfulness_counts_supported_over_all_claims():
     async def responder(request: httpx.Request) -> httpx.Response:
         return _chat_response(slots_json)
 
-    judge = _make_judge("rag.faithfulness", recorder, responder)
+    judge = _make_judge("agent.answer_faithfulness", recorder, responder)
     output = await judge.evaluate(
-        _definition("rag.faithfulness"),
+        _definition("agent.answer_faithfulness"),
         _snapshot({"answer": "A 是 B。C 是 D。E 是 F。",
                    "contexts": ["上下文一", "上下文二"]}),
     )
@@ -673,9 +676,9 @@ async def test_faithfulness_no_claims_skipped():
     async def responder(request: httpx.Request) -> httpx.Response:
         return _chat_response(_claims_payload([], reason="回答未作出可评估声明"))
 
-    judge = _make_judge("rag.faithfulness", recorder, responder)
+    judge = _make_judge("agent.answer_faithfulness", recorder, responder)
     output = await judge.evaluate(
-        _definition("rag.faithfulness"),
+        _definition("agent.answer_faithfulness"),
         _snapshot({"answer": "好的。", "contexts": ["ctx"]}),
     )
     assert output["status"] == "skipped"
@@ -690,10 +693,10 @@ async def test_faithfulness_dangling_claim_ref_rejected():
             {"claim": "c1", "supported": True, "evidence_refs": ["ev-unknown"]},
         ]))
 
-    judge = _make_judge("rag.faithfulness", recorder, responder)
+    judge = _make_judge("agent.answer_faithfulness", recorder, responder)
     with pytest.raises(JudgeFormatError):
         await judge.evaluate(
-            _definition("rag.faithfulness"),
+            _definition("agent.answer_faithfulness"),
             _snapshot({"answer": "A 是 B。", "contexts": ["ctx"]}),
         )
 
@@ -811,7 +814,7 @@ async def test_context_relevance_must_score_every_presented_chunk():
     [
         "agent.answer_correctness",
         "agent.answer_relevance",
-        "rag.faithfulness",
+        "agent.answer_faithfulness",
         "kb.context_relevance",
     ],
 )

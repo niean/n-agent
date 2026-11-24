@@ -291,8 +291,8 @@ def _num_definition(**overrides) -> EvaluatorDefinition:
     fields_override = dict(
         output_type="number",
         range_or_categories=(0.0, 1.0),
-        definition_id="rag.faithfulness",
-        metric_name="rag.faithfulness",
+        definition_id="agent.answer_faithfulness",
+        metric_name="agent.answer_faithfulness",
     )
     fields_override.update(overrides)
     base = _bool_definition()

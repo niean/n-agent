@@ -928,8 +928,8 @@
   // 共享类，不新增 CSS 文件）；标签文本复用 evaluations-filter__label
   // （共享类显式声明字号 token，不依赖 body 继承）。label 挂
   // evaluations-checkbox-label：覆盖全局 label 的 flex-direction:column
-  // （styles.css 全局规则会把 checkbox 与文本压成上下两行），恢复行内
-  // 水平居中对齐。
+  // （styles.css 全局规则会把 checkbox 与文本压成上下两行），名称在左、
+  // checkbox 在右，文本 span 撑满剩余宽度使同列 checkbox 右缘垂直对齐。
   function buildSessionSourceCheckboxGroup(checkedValues) {
     const group = el('div');
     group.setAttribute('role', 'group');
@@ -944,7 +944,8 @@
       input.name = 'evaluation_session_source_allowlist';
       input.value = value;
       input.checked = checkedValues.includes(value);
-      item.append(input, el('span', 'evaluations-filter__label', label));
+      // 名称在前、checkbox 在后；点击 label 文本仍可切换勾选
+      item.append(el('span', 'evaluations-filter__label', label), input);
       group.appendChild(item);
       inputs.push(input);
     });
@@ -2902,13 +2903,13 @@
         dataBody.appendChild(el('div', 'empty-state',
           '暂无能力目录。当前没有可注册的指标组合，请检查评估服务配置。'));
       } else {
-        // spec 4.2：仅目录内组合可注册自动评估器
-        dataBody.appendChild(blockTitle('能力目录（仅目录内组合可注册自动评估器）'));
+        // spec 4.2：仅目录内组合可注册自动评估器（页面即目录，不再重复标题）
         dataBody.appendChild(scrollTable(table(
-          ['方法', '指标', '目标类型', '输出类型', '状态'],
+          ['方法', '指标', '描述', '目标类型', '输出类型', '状态'],
           sliced.pageItems.map((entry) => [
             EVALUATOR_METHOD_LABELS[entry.method] || entry.method,
             entry.metric_name,
+            entry.description || '-',
             entry.target_kind,
             entry.output_type,
             evaluatorStatusText(entry, judgeConfigured),
@@ -3084,6 +3085,14 @@
           actions.appendChild(actionButton('详情',
             () => openEvaluatorDetail(item.definition_id, item.version)));
         }
+        // 历史：多版本评估器展示旧版本列表（modal 风格对齐数据集历史）
+        if (item.version_count > 1) {
+          actions.appendChild(actionButton('历史',
+            () => openEvaluatorHistory(
+              item.definition_id, item.target_kind, item.version)));
+        } else {
+          actions.appendChild(disabledButton('历史'));
+        }
         return [
           item.definition_id,
           item.version,
@@ -3096,6 +3105,51 @@
       }),
       )));
     dataBody.appendChild(evaluatorPager);
+  }
+
+  // 评估器历史 Modal：详情类弹窗（mountDetailModal，不响应 backdrop 点击），
+  // 风格对齐数据集历史。数据按评估器 ID + 目标类型实时拉取全部版本（新到
+  // 旧），过滤掉列表已展示的最新版本；行内详情先关弹窗再复用
+  // openEvaluatorDetail 的逐版本请求。
+  async function openEvaluatorHistory(definitionId, targetKind, latestVersion) {
+    const requestToken = renderToken;
+    let data;
+    try {
+      const params = { definition_id: definitionId };
+      if (targetKind) params.target_kind = targetKind;
+      data = await api.evaluations.listEvaluators(params);
+    } catch (err) {
+      alertMessage('评估器历史加载失败：' + (err && err.message ? err.message : ''));
+      return;
+    }
+    if (requestToken !== renderToken) return;
+    const items = (Array.isArray(data.items) ? data.items : [])
+      .filter((item) => item.version !== latestVersion);
+    const frame = buildFrame('评估器历史 - ' + definitionId);
+    if (!items.length) {
+      frame.form.appendChild(el('div', 'empty-state', '该评估器没有历史版本。'));
+    } else {
+      frame.form.appendChild(scrollTable(table(
+        ['版本', '目标类型', '方法', '在线状态', '操作'],
+        items.map((item) => {
+          const usage = item.usage || {};
+          const actions = el('div', 'row-actions');
+          actions.appendChild(actionButton('详情', () => {
+            closeBackdrop(frame.backdrop);
+            openEvaluatorDetail(item.definition_id, item.version);
+          }));
+          return [
+            item.version,
+            item.target_kind || '-',
+            EVALUATOR_METHOD_LABELS[item.method] || item.method,
+            statusBadge(usage.online_enabled ? '已启用' : '未启用'),
+            actions,
+          ];
+        }),
+      )));
+    }
+    formActions(frame.form, '关闭');
+    mountDetailModal(frame);
   }
 
   async function openEvaluatorDetail(definitionId, version) {
@@ -3743,7 +3797,8 @@
   // Sector 渲染：Provider 列表表格 + 评估供给精简区（全部 textContent/value
   // 渲染，不拼接 HTML；empty-state 复用共享样式类）。表格列与主模型页
   // Provider 列表同构（名称/类型/Base URL/Model/Key/Vision/操作），"启用"
-  // 列替换为"默认"（是/否，当前评估默认）；不包滚动层，宽度与主模型页一致。
+  // 列替换为"默认"（badge 徽章：是/否，当前评估默认，渲染效果与主模型页
+  // "启用"列一致）；不包滚动层，宽度与主模型页一致。
   function renderJudgeSupplySectors(providerBody, supplyBody, body) {
     const projection = judgeSupply.projection || {};
     const defaultId = String(projection.default_provider_id || '');
@@ -3765,7 +3820,10 @@
             provider.model || '-',
             provider.api_key_present ? '已配置' : '未配置',
             provider.supports_vision ? '✓' : '-',
-            String(provider.id) === defaultId ? '是' : '否',
+            // 默认列渲染效果与主模型页"启用"列一致：badge 徽章（是=success，否=warning）
+            String(provider.id) === defaultId
+              ? el('span', 'badge badge--success', '是')
+              : el('span', 'badge badge--warning', '否'),
             judgeProviderActions(provider, body),
           ]),
         ));

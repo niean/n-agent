@@ -797,12 +797,10 @@ def register_evaluation_management_routes(
     错误映射契约：EvaluationValidationError / EvaluationConfigValidationError
     / DatasetManifestError -> 422；EvaluationNotFoundError -> 404；
     EvaluationConflictError / EvaluationRevisionConflictError /
-    EvaluationConfigConflictError -> 409（m1：管理面无容量判定，无容量
-    类 503 映射——503 仅 session_lookup_unavailable：session_feedback
-    目标核验依赖未注入时返回，非容量拒绝语义）。
-    会话准入白名单（spec-261124）补充映射：session_lookup_unavailable ->
-    503；session_source_not_allowed -> 422（命中会话后 source 未准入
-    白名单）。
+    EvaluationConfigConflictError -> 409。
+    人评目标核验依赖未注入时返回 503（agent_run_lookup_unavailable 或
+    session_lookup_unavailable）；来源未获准时返回 422
+    session_source_not_allowed。
     Task 9（评估工作台）补充映射：UnsupportedCapabilityError ->
     422 unsupported_capability；EvaluationTargetDeletedError ->
     410 target_deleted；EvaluationTargetMissingError ->
@@ -811,18 +809,9 @@ def register_evaluation_management_routes(
     422 incomparable_experiments（附可公开差异维度）。
     统一经 _err 输出，不泄漏内部细节（堆栈/SQL/绝对路径/sha 不进响应）。
 
-    ``agent_run_lookup``：async (subject_id) -> Mapping | None，人评
-    agent_run 目标的服务端核验（#15：目标必须对应真实 Run，None ->
-    422 target_not_found）。未注入时跳过核验（组件未装配场景）。
-
-    ``session_lookup``：async (session_id) -> ConversationSession | None，
-    人评 session_feedback 目标的服务端核验（同 agent_run 语义：目标必须
-    对应真实会话，None -> 422 target_not_found；命中后服务端派生
-    session_id=subject_id，不信任客户端自报——P097）。命中后按会话类型
-    准入白名单（spec-261124）热读 config_service.current() 校验会话
-    source，未准入 -> 422 session_source_not_allowed。未注入时
-    session_feedback 返回 503 session_lookup_unavailable（组合根必须
-    注入，不静默跳过准入）；agent_run 不受影响。
+    ``agent_run_lookup`` 和 ``session_lookup`` 分别查询真实 Run 和会话。
+    查无目标返回 422 target_not_found；命中后从服务端记录派生目标身份，
+    并按对应的 Run 或会话来源校验当前评估白名单。
 
     Task 9 新增注入（评估器/人工标注/分析路由，逐服务可选注册——
     组合根 gating 与管理面总闸一致）：
@@ -1193,17 +1182,15 @@ def register_evaluation_management_routes(
         target_body = body.get("target")
         if not isinstance(target_body, dict):
             return _err(422, "protocol_invalid", "target must be an object")
-        # #15 服务端目标核验：agent_run 目标必须对应真实 Run——客户端
-        # 自报 subject_id 不校验会让人评挂在不存在的运行上（Score 无从
-        # 关联，观测栈死数据）。lookup 未接线（组件未装配）时跳过核验，
-        # 保持向后兼容。
         subject_id = str(target_body.get("subject_id") or "")
         target_kind = str(target_body.get("kind") or "")
-        if (
-            target_kind == "agent_run"
-            and agent_run_lookup is not None
-            and subject_id
-        ):
+        feedback_source = None
+        if target_kind == "agent_run" and subject_id:
+            if agent_run_lookup is None:
+                return _err(
+                    503, "agent_run_lookup_unavailable",
+                    "agent run target verification unavailable",
+                )
             try:
                 run = await agent_run_lookup(subject_id)
             except Exception:
@@ -1236,6 +1223,7 @@ def register_evaluation_management_routes(
             if session_id:
                 enriched["session_id"] = session_id
             target_body = enriched
+            feedback_source = run.get("source")
         elif target_kind == "session_feedback" and subject_id:
             if session_lookup is None:
                 # 组合根必须注入 lookup（生产接线测试防遗漏）；兼容工厂
@@ -1273,12 +1261,10 @@ def register_evaluation_management_routes(
             enriched["service"] = "n-agent"
             enriched["session_id"] = subject_id
             target_body = enriched
-            # 会话类型准入（spec-261124）：请求时热读一次快照；
-            # source 以服务端 ConversationSession 属性为准，未知/缺失
-            # 按未准入处理，不信任客户端自报
+            feedback_source = getattr(session, "source", None)
+        if target_kind in ("agent_run", "session_feedback") and subject_id:
             allowlist = (await config_service.current()).evaluation_session_source_allowlist
-            session_source = getattr(session, "source", "")
-            if session_source not in allowlist:
+            if feedback_source not in allowlist:
                 return _err(
                     422,
                     "session_source_not_allowed",
@@ -1474,6 +1460,7 @@ def register_evaluation_management_routes(
                 page = await evaluation_admin_service.list_definitions(
                     target_kind=params.get("target_kind"),
                     method=params.get("method"),
+                    definition_id=params.get("definition_id"),
                     limit=limit,
                     cursor=params.get("cursor"),
                 )

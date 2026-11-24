@@ -2035,12 +2035,15 @@ class AgentGraphRunner:
         # put_nowait，持久化由生命周期托管的后台消费者执行）。
         if self.evaluation_capture is not None:
             try:
+                snapshot = self._policy_snapshot(state)
                 self.evaluation_capture.capture_agent_run(
                     subject_id=derive_agent_run_subject(
                         state.session_id, state.input_messages,
                     ),
                     session_id=state.session_id,
                     run_id=state.run_id,
+                    source=(snapshot.run_context.source if snapshot is not None
+                            else state.message_source),
                     query=self._extract_user_content(state.input_messages),
                     final_answer=(
                         extract_text(state.final_message.get("content", ""))

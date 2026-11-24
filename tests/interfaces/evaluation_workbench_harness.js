@@ -5508,6 +5508,19 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     '每个复选框 label 挂 evaluations-checkbox-label 对齐类');
   assert.match(kCss, /\.providers-form\s+\.evaluations-checkbox-label\s*\{[^}]*flex-direction:\s*row[^}]*align-items:\s*center/,
     'evaluations-checkbox-label 必须声明 row 方向 + align-items:center，且特异性覆盖 .providers-form label');
+  // 顺序合同：名称 span 在左、checkbox input 在右；点击 label 文本仍可切换
+  assert.ok(kItemLabels.every((node) => {
+    const kids = node.children;
+    return kids.length === 2
+      && kids[0].tag === 'span' && hasClassName(kids[0], 'evaluations-filter__label')
+      && kids[1].tag === 'input' && kids[1].type === 'checkbox';
+  }), '每个复选框项必须按「名称 span -> checkbox input」顺序渲染');
+  // 垂直对齐合同：名称撑满、checkbox 固定不伸缩且覆盖全局 input width:100%，
+  // grid 等宽两列下名称左缘与 checkbox 右缘各自成垂直线
+  assert.match(kCss, /\.evaluations-checkbox-label\s*>\s*\.evaluations-filter__label\s*\{[^}]*flex:\s*1\s+1\s+auto/,
+    '复选框名称 span 必须 flex:1 1 auto 撑满剩余宽度');
+  assert.match(kCss, /\.evaluations-checkbox-label\s*>\s*input\[type="checkbox"\]\s*\{[^}]*flex:\s*0\s+0\s+auto[^}]*width:\s*auto/,
+    'checkbox 必须固定不伸缩且 width:auto 覆盖全局 input width:100%');
 
   // K3) 保存：发出 patchConfig({patch:{...allowlist}, expected_version})，
   // 成功后关弹窗 + alertMessage + onSaved 重绘当前视图

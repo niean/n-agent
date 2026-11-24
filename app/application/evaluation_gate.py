@@ -15,7 +15,7 @@ GATE_STATE_EXIT_CODES 映射退出码 0 / 1 / 3 / 2。
   一律留在分母内（skipped 不补齐），只降覆盖率、不降分母；
 - 必需指标阈值按适用 case 宏平均比较（agent.task_success>=0.90 业务
   error 计失败、kb.recall_at_5>=0.80、kb.ndcg_at_5>=0.75、
-  rag.faithfulness>=0.90 为默认策略；缺失证据按失败保守计）；
+  agent.answer_faithfulness>=0.90 为默认策略；缺失证据按失败保守计）；
 - 策略必需指标分母为 0（预声明全部不适用 / 账本重建无 case 行）->
   inconclusive（no_applicable_cases，默认阻断——不得因其他指标达标
   而对未评估的必需指标宣称质量已证明）；
@@ -105,7 +105,7 @@ DEFAULT_REQUIRED_METRICS: Mapping[str, float] = {
     "agent.task_success": 0.90,
     "kb.recall_at_5": 0.80,
     "kb.ndcg_at_5": 0.75,
-    "rag.faithfulness": 0.90,
+    "agent.answer_faithfulness": 0.90,
 }
 DEFAULT_NON_INFERIORITY_MARGIN: float = -0.02
 DEFAULT_MIN_CASES: int = 100

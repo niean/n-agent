@@ -422,8 +422,8 @@ class TestListDefinitions:
         await admin.create_definition(deterministic_payload())
         await admin.create_definition(
             judge_payload(
-                definition_id="rag.faithfulness",
-                metric_name="rag.faithfulness",
+                definition_id="agent.answer_faithfulness",
+                metric_name="agent.answer_faithfulness",
             )
         )
         await admin.create_definition(human_payload())
@@ -442,7 +442,7 @@ class TestListDefinitions:
         }
         judged = await admin.list_definitions(method="llm_judge")
         assert {i["definition_id"] for i in judged["items"]} == {
-            "rag.faithfulness"
+            "agent.answer_faithfulness"
         }
         assert (page["total_count"], page["total_pages"]) == (3, 1)
         assert (retrieval["total_count"], retrieval["total_pages"]) == (1, 1)
@@ -489,6 +489,7 @@ class TestListDefinitions:
             "target_kind",
             "method",
             "usage",
+            "version_count",
         }
         assert set(item.keys()) <= allowed_keys
         assert set(item["usage"].keys()) == {
@@ -497,6 +498,72 @@ class TestListDefinitions:
             "updated_at",
             "updated_by",
         }
+
+    async def test_versions_grouped_to_latest_only(self, admin):
+        # 同 definition_id 多版本：列表默认仅展示自然序最新版本，
+        # 附 version_count；实验镜像 variant（不同 target_kind）自成一组
+        await admin.create_definition(deterministic_payload(version="v2"))
+        await admin.create_definition(deterministic_payload(version="v10"))
+        await admin.create_definition(deterministic_payload(version="v1"))
+        page = await admin.list_definitions()
+        assert len(page["items"]) == 1
+        item = page["items"][0]
+        assert item["version"] == "v10"
+        assert item["version_count"] == 3
+        assert (page["total_count"], page["total_pages"]) == (1, 1)
+
+        # definition_id 参数：返回全部版本，自然序新到旧，不分页
+        history = await admin.list_definitions(
+            definition_id="kb.recall_at_5")
+        assert [i["version"] for i in history["items"]] == [
+            "v10", "v2", "v1",
+        ]
+        assert history["next_cursor"] is None
+        assert history["total_count"] == 3
+
+    async def test_target_kind_keeps_variant_out_of_online_history(self, admin):
+        # 实验镜像 variant 与线上定义同 definition_id、不同 target_kind：
+        # 聚合键含 target_kind，variant 不并成线上评估器的版本历史。
+        # experiment_item 仅能经领域注册路径产生（create_definition 白名单
+        # 拒绝），与预设 _with_experiment_variants 同构
+        from app.application.evaluation_service import EvaluationService
+        from app.domain.evaluation.models import EvaluatorDefinition
+
+        await admin.create_definition(deterministic_payload())
+        variant = EvaluatorDefinition(
+            definition_id="kb.recall_at_5",
+            version="experiment-v1",
+            metric_name="kb.recall_at_5",
+            target_kind="experiment_item",
+            method="deterministic",
+            required_fields=(),
+            evidence_policy="snapshot",
+            output_type="number",
+            range_or_categories=(0.0, 1.0),
+            direction="higher_is_better",
+            material_hash={},
+            judge_model=None,
+            judge_params={},
+            timeout_seconds=30,
+            budget=None,
+            ci_admissible=True,
+        )
+        await EvaluationService(
+            admin._store
+        ).register_definition(variant)
+        page = await admin.list_definitions()
+        assert len(page["items"]) == 2
+        by_kind = {i["target_kind"]: i for i in page["items"]}
+        assert by_kind["retrieval"]["version"] == "v1"
+        assert by_kind["retrieval"]["version_count"] == 1
+        assert by_kind["experiment_item"]["version"] == "experiment-v1"
+        history = await admin.list_definitions(
+            definition_id="kb.recall_at_5", target_kind="retrieval")
+        assert [i["version"] for i in history["items"]] == ["v1"]
+
+    async def test_invalid_definition_id_rejected(self, admin):
+        with pytest.raises(EvaluationValidationError):
+            await admin.list_definitions(definition_id="   ")
 
 
 # ---------------------------------------------------------------------------
