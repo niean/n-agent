@@ -182,6 +182,8 @@ class ContextCompressor(ContextEngine):
         current_tokens: int | None = None,
         force: bool = False,
         existing_summary: str = "",
+        provider_override: LLMProvider | None = None,
+        model_override: str = "",
     ) -> ContextCompressionResult:
         original_tokens = current_tokens if current_tokens is not None else self._estimate_tokens(messages)
         # Cooldown check (only when not forced)
@@ -257,7 +259,11 @@ class ContextCompressor(ContextEngine):
             head = messages[:head_end]
             tail = messages[tail_start:]
             middle_indices = list(range(head_end, tail_start))
-            summary = await self._generate_summary(middle, existing_summary=previous_summary)
+            provider_args = (
+                {"provider_override": provider_override, "model_override": model_override}
+                if provider_override is not None else {}
+            )
+            summary = await self._generate_summary(middle, existing_summary=previous_summary, **provider_args)
             if summary is None:
                 summary = await self._build_fallback_summary(middle, existing_summary=previous_summary)
             if not summary:
@@ -462,6 +468,7 @@ class ContextCompressor(ContextEngine):
 
     async def _generate_summary(
         self, turns_to_summarize: list[dict[str, Any]], existing_summary: str = "",
+        *, provider_override: LLMProvider | None = None, model_override: str = "",
     ) -> str | None:
         try:
             turns_text = "\n".join(
@@ -477,11 +484,12 @@ class ContextCompressor(ContextEngine):
                 prompt = _SUMMARY_PROMPT_TEMPLATE_FIRST.format(
                     turns_to_summarize=turns_text,
                 )
-            result = await self.llm_provider.chat(
+            provider = provider_override if provider_override is not None else self.llm_provider
+            result = await provider.chat(
                 messages=[{"role": "user", "content": prompt}],
                 tools=[],
                 stream=False,
-                model=self._resolve_model(),
+                model=model_override if provider_override is not None else self._resolve_model(),
                 options={},
             )
             if not isinstance(result, LLMResult):
@@ -490,7 +498,7 @@ class ContextCompressor(ContextEngine):
             content = result.message.get("content", "")
             return content if isinstance(content, str) else str(content)
         except Exception as exc:
-            logger.warning("context_compressor: _generate_summary failed: %s", exc)
+            logger.warning("context_compressor: summary generation failed (%s)", type(exc).__name__)
             return None
 
     def _extract_text(self, content: Any) -> str:

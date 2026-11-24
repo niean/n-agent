@@ -491,7 +491,7 @@ class TestEvaluationJsContract:
 
     def test_langfuse_url_single_source(self) -> None:
         """m6：Langfuse 会话 URL 常量单源（management-ui.js），其余文件
-        只引用 ui.LANGFUSE_SESSIONS_URL，不复制字面量。"""
+        只引用单源常量/helper，不复制字面量。"""
         literal = (
             "http://langfuse.localhost/project/n-agent-local-project/sessions"
         )
@@ -502,8 +502,11 @@ class TestEvaluationJsContract:
                 "management-ui.js）"
             )
         assert "LANGFUSE_SESSIONS_URL" in _read("evaluation.js")
-        assert "LANGFUSE_SESSIONS_URL" in _read("chat.js")
         assert "LANGFUSE_SESSIONS_URL" in _read("observations-otel.js")
+        # 对话-执行详情与评分详情走会话详情直达 helper，不再引用 List 常量
+        assert "langfuseSessionUrl" in _read("chat.js")
+        assert "LANGFUSE_SESSIONS_URL" not in _read("chat.js")
+        assert "langfuseSessionUrl" in _read("evaluation.js")
 
     def test_export_modal_per_case_truth_and_inline_content(self) -> None:
         """M1：导出闭环——UI 内联 fixture/rubric 内容、逐 case 金标。"""
@@ -555,8 +558,10 @@ class TestRunDetailFeedback:
         assert "innerHTML" not in section
         # m4：幂等键防双击重复 revision
         assert "request_key" in section
-        # m6：Langfuse URL 单源引用
-        assert "LANGFUSE_SESSIONS_URL" in section
+        # m6：Langfuse 会话详情经单源 helper 直达具体会话
+        assert "langfuseSessionUrl" in section
+        assert "buildLangfuseSessionUrl(sessionId)" in section
+        assert "LANGFUSE_SESSIONS_URL" not in section
 
     def test_session_feedback_entry_in_run_detail(self) -> None:
         """会话人评入口（feedback.session_helpful）：与运行人评同区段，

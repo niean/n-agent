@@ -234,3 +234,36 @@ async def test_conversation_pagination_breaks_timestamp_ties_by_id(tmp_path, pla
     all_rows = await registry.list_conversations(platform)
     pages = [await registry.list_conversations(platform, limit=1, offset=i) for i in range(3)]
     assert [page[0].id for page in pages] == sorted([row.id for row in all_rows], reverse=True)
+
+
+@pytest.mark.asyncio
+async def test_llm_selection_persists_as_pair_on_gateway_link(tmp_path):
+    from app.domain.gateway import GatewayLLMSelection
+
+    path = tmp_path / "sessions.db"
+    registry = SQLiteGatewaySessionRegistry(path)
+    key = GatewaySessionKey(Platform.FEISHU, "chat-1")
+    first = await registry.create_session_link(key, "session-1")
+    second = await registry.create_session_link(key, "session-2")
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE gateway_session_links DROP COLUMN provider_id")
+        conn.execute("ALTER TABLE gateway_session_links DROP COLUMN model_id")
+    registry = SQLiteGatewaySessionRegistry(path)
+    active = await registry.get_active_session(key)
+    assert active.id == second.id
+    assert active.llm_selection is None
+
+    selected = GatewayLLMSelection("provider-1", "model-1")
+    await registry.set_llm_selection(first.id, selected, expected=None)
+    registry = SQLiteGatewaySessionRegistry(path)
+    links = {link.id: link for link in await registry.list_session_links(key)}
+    assert links[first.id].llm_selection == selected
+    with pytest.raises(LookupError):
+        await registry.set_llm_selection(first.id, GatewayLLMSelection("provider-2"), expected=None)
+    await registry.set_llm_selection(first.id, GatewayLLMSelection("provider-2"), expected=selected)
+    links = {link.id: link for link in await registry.list_session_links(key)}
+    assert links[first.id].llm_selection == GatewayLLMSelection("provider-2")
+    assert links[second.id].llm_selection is None
+    await registry.delete_session_link("session-1")
+    with pytest.raises(LookupError):
+        await registry.set_llm_selection(first.id, GatewayLLMSelection("provider-1"), expected=None)

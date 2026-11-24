@@ -985,7 +985,8 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 /* kv 行复用共享 policy-item/policy-k/policy-v，列表复用 document-table，
    状态复用 badge；此处仅补充本页私有的链接列表与强调文本样式。 */
 .otel-links { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: var(--font-size-md); }
-.otel-link { color: var(--color-primary-strong); text-decoration: none; }
+/* 显式声明普通正文字号：裸 div/无字号容器内的链接不得继承 body 16px（P094 同类问题） */
+.otel-link { color: var(--color-primary-strong); text-decoration: none; font-size: var(--font-size-md); }
 .otel-link:hover { text-decoration: underline; }
 .otel-strong { font-weight: 600; color: var(--color-fg-default); }
 
@@ -1141,8 +1142,15 @@ body:not(.sidebar-expanded) .sidebar__item--child.sidebar__item--active { border
 .evaluations-filter { display: flex; flex-wrap: wrap; gap: var(--space-4) var(--space-6); margin-bottom: var(--space-6); min-width: 0; }
 .evaluations-filter__item { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; max-width: 100%; }
 .evaluations-filter__item > input,
-.evaluations-filter__item > select { max-width: 100%; min-width: 0; }
+.evaluations-filter__item > select { max-width: 100%; min-width: 0; font-size: var(--font-size-md); }
+/* 筛选 input/placeholder/select 显式普通正文字号：全局 font:inherit 会使控件
+   继承 body 16px，比面板正文 13px 大一圈（P094 同根因），placeholder 随
+   input 字号一并归一。 */
 .evaluations-filter__label { font-size: var(--font-size-sm); color: var(--color-fg-muted); }
+/* 复选框选项 label：覆盖全局 label 与 .providers-form label 的
+   flex-direction:column，checkbox 与文本行内排布并垂直居中（对齐
+   .external-memory__checkbox-label 既有约定；双类选择器保证特异性胜出）。 */
+.providers-form .evaluations-checkbox-label { display: flex; flex-direction: row; align-items: center; gap: 6px; margin: 0; }
 .evaluations-filter__help { font-size: var(--font-size-xs); color: var(--color-fg-subtle); }
 .evaluations-filter-group { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-bottom: var(--space-6); min-width: 0; }
 .evaluations-pager { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: var(--space-4); margin-top: var(--space-6); }

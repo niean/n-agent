@@ -2096,3 +2096,62 @@ async def test_execute_tools_non_json_content_does_not_raise(tmp_path):
     )
     await runner.execute_tools(state)  # must not raise
     assert _ui_artifact_cards(await store.list_messages("s-art")) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_provider_override_is_request_scoped(tmp_path):
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    for session_id in ("default", "override"):
+        await store.create_session(ConversationSession(id=session_id))
+    default = DirectProvider()
+    override = DirectProvider()
+    runner = AgentGraphRunner(
+        default,
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    await asyncio.gather(
+        runner.run(
+            AgentState(session_id="override", input_messages=[{"role": "user", "content": "override input"}]),
+            "test",
+            provider_override=override,
+        ),
+        runner.run(
+            AgentState(session_id="default", input_messages=[{"role": "user", "content": "default input"}]),
+            "test",
+        ),
+    )
+    assert default.calls == override.calls == 1
+    assert override.last_messages[-1]["content"] == "override input"
+    assert default.last_messages[-1]["content"] == "default input"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_model", [True, False])
+async def test_provider_override_errors_return_public_guidance(tmp_path, unknown_model):
+    from app.domain.provider import ModelUnavailableError
+
+    secret = "private upstream detail"
+
+    class BrokenProvider(DirectProvider):
+        async def chat(self, messages, tools, stream, model, options):
+            error = ModelUnavailableError if unknown_model else RuntimeError
+            raise error(secret)
+
+    store = SQLiteMemoryStore(tmp_path / "sessions.db")
+    await store.create_session(ConversationSession(id="feishu-1"))
+    runner = AgentGraphRunner(
+        DirectProvider(),
+        ToolService(build_builtin_tool_executor(tmp_path), builtin_tool_definitions()),
+        store,
+        HeuristicSummarizer(),
+    )
+    result = await runner.run(
+        AgentState(session_id="feishu-1", input_messages=[{"role": "user", "content": "hi"}]),
+        "test",
+        provider_override=BrokenProvider(),
+    )
+    assert result.finish_reason == "error"
+    assert secret not in result.error
+    assert ("/models" if unknown_model else "/providers") in result.error

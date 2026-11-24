@@ -70,6 +70,12 @@ class InteractionResponse:
 
 
 @dataclass(frozen=True)
+class GatewayLLMSelection:
+    provider_id: str
+    model_id: str | None = None
+
+
+@dataclass(frozen=True)
 class GatewaySessionLink:
     conversation_id: str
     session_id: str
@@ -77,6 +83,7 @@ class GatewaySessionLink:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     id: str = field(default_factory=lambda: str(uuid4()))
+    llm_selection: GatewayLLMSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -136,7 +143,17 @@ class GatewaySessionRegistry(Protocol):
     async def set_active_session(self, key: GatewaySessionKey, session_id: str) -> GatewaySessionLink:
         ...
 
+    async def activate_existing_session(
+        self, key: GatewaySessionKey, session_id: str,
+    ) -> GatewaySessionLink | None:
+        ...
+
     async def list_session_links(self, key: GatewaySessionKey) -> list[GatewaySessionLink]:
+        ...
+
+    async def set_llm_selection(
+        self, link_id: str, selection: GatewayLLMSelection, *, expected: GatewayLLMSelection | None,
+    ) -> None:
         ...
 
     async def delete_session_link(self, session_id: str) -> None:

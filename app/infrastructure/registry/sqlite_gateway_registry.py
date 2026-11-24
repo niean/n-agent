@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from app.domain.gateway import GatewayConversation, GatewayHomeTarget, GatewaySessionKey, GatewaySessionLink
+from app.domain.gateway import (
+    GatewayConversation, GatewayHomeTarget, GatewayLLMSelection, GatewaySessionKey, GatewaySessionLink,
+)
 from app.domain.platform import Platform
 from app.infrastructure.sqlite_support import open_sqlite
 
@@ -75,22 +77,31 @@ class SQLiteGatewaySessionRegistry:
         return _link_from_row(row)
 
     async def set_active_session(self, key: GatewaySessionKey, session_id: str) -> GatewaySessionLink:
+        link = await self.activate_existing_session(key, session_id)
+        if link is not None:
+            return link
+        return await self.create_session_link(key, session_id)
+
+    async def activate_existing_session(
+        self, key: GatewaySessionKey, session_id: str,
+    ) -> GatewaySessionLink | None:
         now = _now()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conversation = _get_conversation(conn, key)
             if conversation is None:
-                return await self.create_session_link(key, session_id)
+                return None
             row = _get_link(conn, conversation["id"], session_id)
             if row is None:
-                return await self.create_session_link(key, session_id)
+                return None
             conn.execute(
                 "UPDATE gateway_conversations SET active_session_id = ?, updated_at = ? WHERE id = ?",
                 (session_id, now, conversation["id"]),
             )
             conn.execute("UPDATE gateway_session_links SET updated_at = ? WHERE id = ?", (now, row["id"]))
-            row = _get_link(conn, conversation["id"], session_id)
-        assert row is not None
-        return _link_from_row(row)
+            updated = _get_link(conn, conversation["id"], session_id)
+            assert updated is not None
+            return _link_from_row(updated)
 
     async def list_session_links(self, key: GatewaySessionKey) -> list[GatewaySessionLink]:
         with self._connect() as conn:
@@ -108,6 +119,24 @@ class SQLiteGatewaySessionRegistry:
                 (conversation["id"],),
             ).fetchall()
         return [_link_from_row(row) for row in rows]
+
+    async def set_llm_selection(
+        self, link_id: str, selection: GatewayLLMSelection, *, expected: GatewayLLMSelection | None,
+    ) -> None:
+        with self._connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE gateway_session_links SET provider_id = ?, model_id = ?
+                WHERE id = ? AND provider_id IS ? AND model_id IS ?
+                """,
+                (
+                    selection.provider_id, selection.model_id, link_id,
+                    expected.provider_id if expected else None,
+                    expected.model_id if expected else None,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise LookupError("gateway session selection changed or link no longer exists")
 
     async def delete_session_link(self, session_id: str) -> None:
         with self._connect() as conn:
@@ -284,6 +313,11 @@ def _initialize_gateway_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    link_columns = {row["name"] for row in conn.execute("PRAGMA table_info(gateway_session_links)")}
+    if "provider_id" not in link_columns:
+        conn.execute("ALTER TABLE gateway_session_links ADD COLUMN provider_id TEXT")
+    if "model_id" not in link_columns:
+        conn.execute("ALTER TABLE gateway_session_links ADD COLUMN model_id TEXT")
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(gateway_conversations)").fetchall()}
     if "receive_id_type" not in columns:
         conn.execute("ALTER TABLE gateway_conversations ADD COLUMN receive_id_type TEXT")
@@ -384,6 +418,10 @@ def _get_link(conn: sqlite3.Connection, conversation_id: str, session_id: str) -
 def _link_from_row(row: sqlite3.Row) -> GatewaySessionLink:
     return GatewaySessionLink(
         id=row["id"],
+        llm_selection=(
+            GatewayLLMSelection(row["provider_id"], row["model_id"])
+            if row["provider_id"] is not None else None
+        ),
         conversation_id=row["conversation_id"],
         session_id=row["session_id"],
         display_name=row["display_name"],

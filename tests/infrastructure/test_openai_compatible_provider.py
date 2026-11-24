@@ -203,3 +203,25 @@ def test_tool_call_to_dict_normalizes_unicode_escapes_in_arguments():
     # 非法 JSON 原样返回（best-effort）
     d3 = _tool_call_to_dict({"id": "c3", "type": "function", "function": {"name": "x", "arguments": "not json"}})
     assert d3["function"]["arguments"] == "not json"
+
+
+@pytest.mark.asyncio
+async def test_model_not_found_is_classified_without_reclassifying_other_errors():
+    from unittest.mock import AsyncMock
+
+    import httpx
+    from openai import NotFoundError
+
+    from app.domain.provider import ModelUnavailableError
+
+    client = FakeClient()
+    provider = OpenAICompatibleProvider("http://test", "key", "default", client=client)
+    response = httpx.Response(404, request=httpx.Request("POST", "http://test/chat/completions"))
+    missing_model = NotFoundError("model missing", response=response, body={"code": "model_not_found"})
+    missing_endpoint = NotFoundError("route missing", response=response, body={"code": "not_found"})
+    client.completions.create = AsyncMock(side_effect=[missing_model, missing_endpoint])
+
+    with pytest.raises(ModelUnavailableError):
+        await provider.chat([], [], False, "removed", {})
+    with pytest.raises(NotFoundError, match="route missing"):
+        await provider.chat([], [], False, "removed", {})

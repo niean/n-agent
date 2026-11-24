@@ -7,6 +7,8 @@
 - 根因：`body` 未声明 font-size，浏览器默认 16px；共享状态类 `.empty-state, .loading-state, .error-state` 只设了颜色/间距/边框，没有字号声明，所有挂载点继承 16px，而面板正文与辅助文字口径是 12-13px。右边栏那次只在两个容器上补了 `font-size: var(--font-size-sm)`（见 test_static_assets.py::test_chat_side_panel_empty_hints_use_auxiliary_font_size），没有治共享类，其他页面继续踩坑。
 - 教训：空态、加载、错误、hint/note 等辅助性文字的字号必须在共享类（而非逐个消费容器）显式使用 `var(--font-size-sm)` 等 token，禁止依赖继承；新增状态类先查共享类是否已覆盖视觉属性。修复同类问题时先判断根因在共享类还是消费方，能上收就不只补当前容器，并补静态合同锁共享类，防止第三次复发。
 - 来源：2026-11-12 评测 FE 规范对齐后续精调；styles.css 共享状态类加 `font-size: var(--font-size-sm); line-height: 1.5`，新增 test_static_assets.py::test_shared_state_classes_use_auxiliary_font_size（RED→GREEN，125 passed）；规范回填 knowledge/03-conventions.md Dashboard 前端章节。
+- 复发记录（2026-11-24，第三次同根因）：评分详情 modal 的 `.otel-link` 外链挂在无字号声明的裸 div 内，再次继承 body 16px，比正文（13px）大一圈。修在共享类 `.otel-link { font-size: var(--font-size-md) }`（与 `.otel-links` 容器既有 md 口径统一），而非补消费容器；合同 test_static_assets.py::test_langfuse_session_link_single_source_and_otel_link_font_contract 锁定。教训补充：链接/徽标/徽章等非纯文本元素同样受继承影响，共享视觉类必须自带字号 token，无字号容器是高发场景，评审新增外链时先查类是否声明字号。
+- 复发记录（2026-11-24，第四次同根因）：评估筛选区 input/select/placeholder 整体 16px。全局 `button,input,textarea,select { font: inherit }` 使表单控件继承 body 字号，而筛选共享规则只约束宽度未声明字号；用户感知为“筛选器提示字体过大”。修在 `.evaluations-filter__item > input/select` 共享规则加 `font-size: var(--font-size-md)`，placeholder 随 input 自动归一，六个评估视图一次覆盖；合同 test_evaluation_filter_controls_use_normal_font_size 锁定。教训补充：表单控件（input/select/text area）与纯文本一样受继承支配，新增筛选区先确认共享控件规则自带字号 token，不能只看 label/help 文本类。
 
 ### P082: 本次输入的历史副本须按消息身份排除
 
@@ -902,3 +904,10 @@ AI 自主维护，人工可通过提示或建议触发新增/修正。
 - 根因：Docker Desktop 虚拟磁盘（Docker.raw 128G）内部空间耗尽，MinIO 触发 minimum free drive threshold 对事件 blob 上传返回 507，langfuse-web 转 500，collector 判定 permanent error 直接丢弃；宿主机 df 有余量不反映 VM 内部。次生：otel-collector.yaml 被重新生成（新 inode）使单文件 bind-mount 失效、健康检查崩溃循环，主进程持旧内存配置仍可用（呼应 P093，须 force-recreate）。
 - 教训：Langfuse 静默失效的排查入口是 collector exporter 错误日志与 langfuse-web 的 S3/XMinioStorageFull 错误，按"应用采样->collector->langfuse-web->MinIO"逐层取证据；磁盘满只看 Docker VM（`docker system df`、Docker.raw），4.76.0 events_only 合同下 legacy traces/observations 表恒空，验收查 default.events_core；被 500/permanent drop 的数据不可补报，Tempo 副本不受影响。
 - 来源：2026-11-24 会话 Langfuse 上报缺失修复；builder prune -a + image prune 回收 76.75GB 构建缓存与 dangling 镜像，实测新会话 trace 恢复入库 events_core。
+
+### P101: 会话模型的请求级路由应覆盖自动压缩
+
+- 现象：对话主调用切换到会话所选 Provider 后，自动上下文压缩仍会把历史发给全局 Provider。
+- 根因：聊天 Graph 主节点与上下文压缩器各自持有模型调用入口，只有主节点消费了本轮覆盖。
+- 教训：变更会话模型路由时，核对同轮处理中的全部模型调用。用运行级配置把同一 Provider 和模型传给主节点与压缩，并分别验证两条路径。
+- 来源：飞书会话 Provider 与模型切换。

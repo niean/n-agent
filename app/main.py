@@ -30,6 +30,7 @@ from app.application.browser_tool_executor import (
     browser_tool_definitions,
 )
 from app.application.chat_service import ChatCompletionService
+from app.application.feishu_session_llm import FeishuSessionLLM
 from app.application.gateway_service import GatewayService
 from app.application.gateway_tool_approval_service import GatewayToolApprovalService
 from app.application.host_terminal_tool_executor import (
@@ -480,6 +481,7 @@ def _make_provider_factory(settings: Settings, telemetry: Any,
             return OpenAICompatibleProvider(
                 cfg.base_url, api_key, cfg.model,
                 telemetry_callback=instance_callback,
+                extra_headers=cfg.extra_headers,
             )
         if cfg.provider_type == "anthropic":
             return AnthropicProvider(
@@ -3414,6 +3416,7 @@ def build_application_services(
         require_actor_for_managed_actions=settings.gateway_require_actor_for_managed_actions,
         confirmation_ttl_seconds=settings.gateway_confirmation_ttl_seconds,
         tool_approval_service=tool_approval_service,
+        feishu_session_llm=FeishuSessionLLM(registry, holder),
     )
     feishu_im_adapter = (
         FeishuImAdapter(gateway_service, feishu_client) if feishu_client is not None else None

@@ -1279,3 +1279,26 @@ async def test_on_pre_compress_does_not_fire_without_dispatcher():
     new_state = await runner.context_service.compress_prepared_context(state)
     assert fake_engine.compress_calls == 1
     assert new_state.summary == "summary"
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_passes_bound_provider_to_compression():
+    class CapturingEngine(FakeContextEngine):
+        async def compress(self, messages, *, force, existing_summary, provider_override, model_override):
+            self.selected = (provider_override, model_override)
+            return self._result
+
+    result = ContextCompressionResult([], "", False, "test", None, None)
+    engine = CapturingEngine(result)
+    runner = AgentGraphRunner(
+        llm_provider=FakeLLMProvider(),
+        tool_service=None,
+        memory_store=FakeMemoryStore(),
+        summarizer=None,
+        context_engine=engine,
+    )
+    selected = FakeLLMProvider()
+    state = AgentState(session_id="s1", input_messages=[{"role": "user", "content": "long history"}])
+    state.run_options = {"force_compress": True}
+    await runner.prepare_context(state, {"configurable": {"provider_override": selected, "model": "different"}})
+    assert engine.selected == (selected, "different")

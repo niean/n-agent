@@ -376,6 +376,15 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     },
     NAGENT: {
       api: Object.assign({ evaluations: api, listSessions: listSessionsApi }, providerApi),
+      // 镜像生产 management-ui.js 的 Langfuse URL 单源与会话详情 helper；
+      // 本文件另以静态合同锁定生产 helper 的编码与空 id 边界。
+      ui: {
+        LANGFUSE_SESSIONS_URL: 'http://langfuse.localhost/project/n-agent-local-project/sessions',
+        langfuseSessionUrl: sessionId => {
+          const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+          return id ? 'http://langfuse.localhost/project/n-agent-local-project/sessions/' + encodeURIComponent(id) : '';
+        },
+      },
       modal: {
         alert: message => { alerts.push(String(message)); },
         confirm: message => {
@@ -2671,6 +2680,39 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
       .map(node => node.textContent);
     assert.ok(attemptTds.includes('0'), 'attempt_count=0 显示 0');
     assert.ok(attemptTds.includes('-'), 'attempt_count=null 回落 -');
+    // Langfuse 入口直达当前评分的来源会话，不再落到会话 List
+    const langfuseSessionLink = find(body, node => node.tag === 'a'
+      && node.textContent === '查看 Langfuse 会话');
+    assert.ok(langfuseSessionLink, '有来源会话时展示 Langfuse 会话入口');
+    assert.equal(langfuseSessionLink.href,
+      'http://langfuse.localhost/project/n-agent-local-project/sessions/detail-session',
+      'Langfuse 链接携带具体 session_id');
+    assert.equal(langfuseSessionLink.target, '_blank', 'Langfuse 会话新标签页打开');
+    assert.equal(langfuseSessionLink.rel, 'noopener noreferrer', 'Langfuse 外链保持 noopener');
+    // run 粒度等无 session_id 的评分不渲染误导性 List 入口
+    const langfuseBaseGetResult = api.getResult;
+    api.getResult = async () => ({
+      result: { result_id: 'res-run', metric_name: 'm-1', provenance: 'automatic',
+        status: 'value', passed: true, typed_value: 0.9, created_at: '' },
+      evidence_summary: { target: { service: 'n-agent', run_id: 'run-only' } },
+      deliveries: [
+        { sink: 'langfuse', projection_version: 'p1', status: 'verified', attempt_count: 1 },
+      ],
+    });
+    const noSessionClose = find(body, node => hasClass(node, 'modal-close') && node.handlers.click);
+    if (noSessionClose) await noSessionClose.handlers.click();
+    await flush();
+    await findButton('详情', root).handlers.click();
+    await flush();
+    assert.equal(find(body, node => node.tag === 'a' && node.textContent === '查看 Langfuse 会话'), undefined,
+      '无 session_id 时不渲染 Langfuse 会话入口');
+    // 恢复 G8c-2 fixture 并重开详情，后续基准 value 用例依赖该 modal 处于打开态
+    api.getResult = langfuseBaseGetResult;
+    const restoreSessionClose = find(body, node => hasClass(node, 'modal-close') && node.handlers.click);
+    if (restoreSessionClose) await restoreSessionClose.handlers.click();
+    await flush();
+    await findButton('详情', root).handlers.click();
+    await flush();
 
     // spec-261123："结果"文字框：状态含义/判定值/说明/跳过原因/失败分类/
     // 作业状态/领取次数，段间空行，textContent 安全渲染
@@ -3385,12 +3427,14 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
     assert.equal(secondTipIds.some(id => firstTipIds.includes(id)), false, 'tooltip id 跨刷新无交集');
     assert.equal(secondHelpIds.some(id => firstHelpIds.includes(id)), false, 'help id 跨刷新无交集');
 
-    // results 视图七个 filterItem（三项带 HelpText），且无 tablist
+    // results 视图六个筛选项：无标题（aria-label 承载）、不带 HelpText，且无 tablist
     await moduleApi.refresh(state('results'));
     const resultsItems = findAll(root, node => hasClass(node, 'evaluations-filter__item'));
     assert.equal(resultsItems.length, 6, '线上六个筛选项结构化为 filterItem');
     const resultsHelps = findAll(root, node => hasClass(node, 'evaluations-filter__help'));
-    assert.equal(resultsHelps.length, 3, 'results 时间/DefinitionKey 三项带 HelpText');
+    assert.equal(resultsHelps.length, 0, 'results 筛选项不带 HelpText 备注');
+    assert.equal(findAll(root, node => hasClass(node, 'evaluations-filter__label')).length, 0,
+      'results 筛选项不渲染上方标题');
     assert.ok(!find(root, node => node.attributes && node.attributes.role === 'tablist'),
       '禁止 tablist 角色');
 
@@ -5456,6 +5500,14 @@ for (const method of ['listEvaluators', 'getEvaluator', 'createEvaluator', 'setE
   // 复选框组内 label 文本复用带显式字号的共享类
   assert.ok(find(kGroup, node => hasClassName(node, 'evaluations-filter__label')),
     '复选框标签复用显式字号共享类');
+  // 对齐合同：全局 label 为 flex-direction:column，复选框项必须显式覆盖为
+  // 行内水平对齐，防止 checkbox 与选项文本上下堆叠错位
+  const kItemLabels = findAll(kGroup, node => node.tag === 'label');
+  assert.equal(kItemLabels.length, 12, '复选框组渲染 12 个 label 项');
+  assert.ok(kItemLabels.every(node => hasClassName(node, 'evaluations-checkbox-label')),
+    '每个复选框 label 挂 evaluations-checkbox-label 对齐类');
+  assert.match(kCss, /\.providers-form\s+\.evaluations-checkbox-label\s*\{[^}]*flex-direction:\s*row[^}]*align-items:\s*center/,
+    'evaluations-checkbox-label 必须声明 row 方向 + align-items:center，且特异性覆盖 .providers-form label');
 
   // K3) 保存：发出 patchConfig({patch:{...allowlist}, expected_version})，
   // 成功后关弹窗 + alertMessage + onSaved 重绘当前视图

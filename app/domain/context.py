@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from app.domain.provider import LLMProvider
+
 
 CONTEXT_SUMMARY_PREFIX = "[CONTEXT SUMMARY]: "
 
@@ -40,4 +42,6 @@ class ContextEngine(Protocol):
         current_tokens: int | None = None,
         force: bool = False,
         existing_summary: str = "",
+        provider_override: LLMProvider | None = None,
+        model_override: str = "",
     ) -> ContextCompressionResult: ...

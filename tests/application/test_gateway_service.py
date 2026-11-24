@@ -1198,3 +1198,99 @@ async def test_resolve_session_records_only_matching_chat_address_even_on_reuse(
     assert calls == ([(key, "chat_id")] if expected else [])
     assert await service._resolve_session_id(InteractionMessage("event2", key, "hello")) == first
     assert calls == ([(key, "chat_id")] if expected else [])
+
+
+@pytest.mark.asyncio
+async def test_feishu_llm_commands_and_session_routing(tmp_path):
+    import asyncio
+    from datetime import datetime, timezone
+    from itertools import count
+    from unittest.mock import AsyncMock
+
+    from app.application.feishu_session_llm import FeishuSessionLLM
+    from app.application.runtime_provider import ActiveProviderHolder
+    from app.domain.provider import ProviderConfig
+    from app.infrastructure.registry.sqlite_gateway_registry import SQLiteGatewaySessionRegistry
+
+    now = datetime.now(timezone.utc)
+    configs = {
+        key: ProviderConfig(key, name, "openai-compatible", "https://example.com", model,
+                            True, key == "a", None, now, now)
+        for key, name, model in (("a", "Provider A", "a-default"), ("b", "Provider B", "b-default"))
+    }
+    providers = AsyncMock()
+    providers.list_providers.side_effect = lambda: list(configs.values())
+    providers.get_provider.side_effect = configs.get
+    providers.get_secret.return_value = "secret"
+
+    def factory(config, secret):
+        backend = AsyncMock()
+        if config.id == "b":
+            backend.list_models_strict.return_value = [
+                ModelInfo("shared", "Shared", config.id), ModelInfo("model", "Literal", config.id),
+            ]
+        else:
+            backend.list_models_strict.side_effect = RuntimeError("directory unavailable")
+        return backend
+
+    holder = ActiveProviderHolder(factory)
+    await holder.swap(configs["a"], "secret")
+    registry = SQLiteGatewaySessionRegistry(tmp_path / "gateway.db")
+    chat = FakeChatService()
+    sessions = FakeSessionService()
+    gateway = GatewayService(
+        registry, chat, sessions, FakeToolService(), FakeModelService(), lambda: {},
+        feishu_session_llm=FeishuSessionLLM(providers, holder),
+    )
+    ids = count()
+
+    async def send(text, chat_id="chat-1", platform=Platform.FEISHU):
+        return await gateway.handle_message(
+            InteractionMessage(str(next(ids)), GatewaySessionKey(platform, chat_id), text)
+        )
+
+    def content(reply):
+        return reply.messages[0].content
+
+    assert "Provider A" in content(await send("/providers"))
+    assert "未找到" in content(await send("/provider absent"))
+    assert "a-default" in content(await send("/models"))
+    assert "目录不可用" in content(await send("/models"))
+    assert "用法" in content(await send("/provider"))
+    assert "用法" in content(await send("/model"))
+    assert not sessions.created
+    first = await send("/provider Provider B")
+    assert "b-default" in content(first)
+    await send("first message")
+    assert chat.requests[-1].model == "b-default"
+    assert chat.requests[-1].provider_override.current_config.id == "b"
+    assert "shared" in content(await send("/models"))
+    assert "shared" in content(await send("/model shared"))
+    assert "未找到" in content(await send("/model a-default"))
+    assert "shared" in content(await send("/provider b"))
+
+    await asyncio.gather(send("one"), send("two", "chat-2"))
+    requests = {r.messages[0]["content"]: r for r in chat.requests[-2:]}
+    assert requests["one"].model == "shared"
+    assert requests["one"].provider_override.current_config.id == "b"
+    assert requests["two"].model == "a-default"
+    assert requests["two"].provider_override.current_config.id == "a"
+    assert holder.current_config.id == "a"
+
+    assert "找不到" in content(await send(f"/switch {first.session_id}", "chat-2"))
+    await send("/new")
+    assert "a-default" in content(await send("/models"))
+    await send(f"/switch {first.session_id}")
+    assert "shared（当前）" in content(await send("/models"))
+    await send("/model model")
+    await send("literal alias")
+    assert chat.requests[-1].model == "model"
+    assert chat.requests[-1].provider_override.current_model == "model"
+    configs.pop("b")
+    assert "重新选择" in content(await send("missing provider"))
+    assert "Provider A" in content(await send("/providers"))
+    assert "a-default" in content(await send("/provider a"))
+    assert "a-default" in content(await send("/model a-default"))
+    assert "model-a" in content(await send("/models", platform="cli"))
+    help_text = content(await send("/help"))
+    assert all(command in help_text for command in ("/providers", "/provider <provider>", "/models", "/model <model>"))

@@ -5,7 +5,9 @@ import math
 from collections.abc import AsyncIterator
 from typing import Any
 
-from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
+from anthropic import NotFoundError
+
+from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, ModelUnavailableError, resolve_model
 from app.infrastructure.llm.telemetry_hook import (
     report_model_parameters,
     NOOP_CHAT_ATTEMPT as _NOOP_CHAT_ATTEMPT,
@@ -71,18 +73,24 @@ class AnthropicProvider:
 
     async def list_models(self) -> list[ModelInfo]:
         try:
-            models = await self.client.models.list()
-            data = getattr(models, "data", models)
-            return [
-                ModelInfo(
-                    id=getattr(model, "id"),
-                    display_name=getattr(model, "display_name", getattr(model, "id")),
-                    provider="anthropic",
-                )
-                for model in data
-            ]
+            return await self._list_models(all_pages=False)
         except Exception:
             return [ModelInfo(self.default_model, self.default_model, "anthropic")]
+
+    async def list_models_strict(self) -> list[ModelInfo]:
+        return await self._list_models(all_pages=True)
+
+    async def _list_models(self, *, all_pages: bool) -> list[ModelInfo]:
+        models = await self.client.models.list()
+        data = [item async for item in models] if all_pages and hasattr(models, "__aiter__") else getattr(models, "data", models)
+        return [
+            ModelInfo(
+                id=getattr(model, "id"),
+                display_name=getattr(model, "display_name", getattr(model, "id")),
+                provider="anthropic",
+            )
+            for model in data
+        ]
 
     async def supports_tools(self, model: str) -> bool:
         return True
@@ -132,7 +140,19 @@ class AnthropicProvider:
             optional_hook(attempt, "set_input", kwargs["messages"],
                           tools=kwargs.get("tools"), system=kwargs.get("system"))
             report_model_parameters(attempt, kwargs)
-            response = await self.client.messages.create(**kwargs)
+            try:
+                response = await self.client.messages.create(**kwargs)
+            except NotFoundError as exc:
+                body = exc.body if isinstance(exc.body, dict) else {}
+                error = body.get("error", body)
+                if isinstance(error, dict) and error.get("type") == "not_found_error":
+                    message = error.get("message")
+                    model_reference = f"model: {selected_model}"
+                    if isinstance(message, str) and (
+                        message == model_reference or message.startswith(f"{model_reference} ")
+                    ):
+                        raise ModelUnavailableError(str(exc)) from exc
+                raise
             if _get(response, "model"):
                 optional_hook(attempt, "set_response_model", _get(response, "model"))
             usage = getattr(response, "usage", None)

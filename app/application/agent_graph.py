@@ -57,7 +57,7 @@ from app.domain.llm_policy import (
 )
 from app.domain.memory import MemoryStore, Summarizer
 from app.domain.policy import ExecutionMode, PolicyOutcome
-from app.domain.provider import LLMEventType, LLMProvider, LLMResult, resolve_model
+from app.domain.provider import LLMEventType, LLMProvider, LLMResult, ModelUnavailableError, resolve_model
 from app.domain.session import TaskState, ToolCall
 from app.domain.tool import (
     ApprovalDecision,
@@ -359,11 +359,14 @@ class AgentGraphRunner:
         graph.add_edge("finalize", END)
         return graph.compile()
 
-    async def run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
+    async def run(
+        self, state: AgentState, model: str, options: dict[str, Any] | None = None,
+        *, provider_override: LLMProvider | None = None,
+    ) -> AgentState:
         options = dict(options or {})
         execution = options.pop("_agent_run_execution", None)
         if self.agent_run_service is None:
-            return await self._run(state, model, options)
+            return await self._run(state, model, options, provider_override=provider_override)
         if not isinstance(execution, RunExecution):
             raise RuntimeError("agent_run_registration_required")
         binding = execution.binding
@@ -375,7 +378,7 @@ class AgentGraphRunner:
                     raise ValueError("agent_run_identity_mismatch")
                 await self.agent_run_service.activate(binding, asyncio.current_task())
                 activated = True
-                result = await self._run(state, model, options)
+                result = await self._run(state, model, options, provider_override=provider_override)
             except RunCancelledError as exc:
                 # Activation can report an already-persisted pending cancel.
                 # Do not replace that known terminal with a failed write.
@@ -417,7 +420,10 @@ class AgentGraphRunner:
                 binding.run_id, type(cleanup_error).__name__,
             )
 
-    async def _run(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AgentState:
+    async def _run(
+        self, state: AgentState, model: str, options: dict[str, Any] | None = None,
+        *, provider_override: LLMProvider | None = None,
+    ) -> AgentState:
         state.run_options = dict(options or {})
         # T16: 记录本次 run 的模型名供 finalize 捕获快照使用（异常路径未
         # 被 finalize 清除的残留条目按插入序淘汰最旧，不误伤并发在途 run）
@@ -473,7 +479,10 @@ class AgentGraphRunner:
                 pass
             try:
                 cfg: dict[str, Any] = {
-                    "configurable": {"model": model, "options": state.run_options},
+                    "configurable": {
+                        "model": model, "options": state.run_options,
+                        "provider_override": provider_override,
+                    },
                 }
                 max_iter_opt = (
                     state.run_options.get("max_iterations") if state.run_options else None
@@ -631,7 +640,10 @@ class AgentGraphRunner:
             chunks.append("".join(current))
         return chunks
 
-    async def stream_events(self, state: AgentState, model: str, options: dict[str, Any] | None = None) -> AsyncIterator[ChatEvent]:
+    async def stream_events(
+        self, state: AgentState, model: str, options: dict[str, Any] | None = None,
+        *, provider_override: LLMProvider | None = None,
+    ) -> AsyncIterator[ChatEvent]:
         from app.utils.memory_scrubber import StreamingContextScrubber
         yield ChatEvent(ChatEventType.MESSAGE_START)
         scrubber = StreamingContextScrubber()
@@ -647,7 +659,8 @@ class AgentGraphRunner:
         # reach run()/state.run_options/LLM provider/executor. Belt-and-suspenders:
         # also listed in _INTERNAL_OPTION_KEYS so gen_params filters it if it leaks.
         approval_queue = stream_options.pop("dashboard_approval_event_queue", None)
-        run_task = asyncio.create_task(self.run(state, model, stream_options))
+        provider_args = {"provider_override": provider_override} if provider_override is not None else {}
+        run_task = asyncio.create_task(self.run(state, model, stream_options, **provider_args))
         self.register_run(state.session_id, run_task)
         result = None
         detached = False
@@ -782,7 +795,9 @@ class AgentGraphRunner:
                 yield ChatEvent(ChatEventType.MESSAGE_DONE, finish_reason=result.finish_reason or "stop")
         yield ChatEvent(ChatEventType.DONE)
 
-    async def prepare_context(self, state: AgentState) -> AgentState:
+    async def prepare_context(
+        self, state: AgentState, config: Optional[RunnableConfig] = None,
+    ) -> AgentState:
         state = await self.context_service.build_context_state(state)
         # T10: on_pre_compress -- only when ContextEngine.should_compress is True
         # AND actually compressing. Check the ContextPlan from build_context_state;
@@ -807,10 +822,13 @@ class AgentGraphRunner:
                 estimated_tokens=estimated_tokens,
                 metadata={},
             )
-        state = await self.context_service.compress_prepared_context(state)
-        return state
+        configurable = (config or {}).get("configurable", {})
+        return await self.context_service.compress_prepared_context(
+            state, provider_override=configurable.get("provider_override"),
+            model_override=configurable.get("model", ""),
+        )
 
-    def _resolve_usage_meta(self, model: str) -> tuple[str, str | None, str | None, str | None]:
+    def _resolve_usage_meta(self, model: str, provider: LLMProvider) -> tuple[str, str | None, str | None, str | None]:
         """Derive (provider_kind, provider_name, real_model, requested_model) for usage recording.
 
         ActiveProviderHolder exposes current_config (ProviderConfig with
@@ -824,14 +842,14 @@ class AgentGraphRunner:
         default_model attr or the local `model` arg.
         """
         requested_model = model or None
-        config = getattr(self.llm_provider, "current_config", None)
+        config = getattr(provider, "current_config", None)
         if config is not None:
             provider_type = getattr(config, "provider_type", None)
             provider_kind = "anthropic" if provider_type == "anthropic" else "openai"
             config_model = getattr(config, "model", None) or ""
             real_model = resolve_model(model, config_model) or None
             return provider_kind, provider_type, real_model, requested_model
-        default_model = getattr(self.llm_provider, "default_model", None) or ""
+        default_model = getattr(provider, "default_model", None) or ""
         real_model = resolve_model(model, default_model) or None
         return "openai", None, real_model, requested_model
 
@@ -847,21 +865,22 @@ class AgentGraphRunner:
                 return "user"
         return "user"
 
-    def _build_provider_capabilities(self) -> tuple[ProviderCapability, ...]:
+    def _build_provider_capabilities(self, provider_override: LLMProvider | None) -> tuple[ProviderCapability, ...]:
         """Use active configuration without remote model discovery.
 
         OpenAI-compatible adapters assume tool support; model-list responses
         do not add capability information. Vision remains configuration-owned.
         """
-        config = getattr(self.llm_provider, "current_config", None)
+        provider = provider_override if provider_override is not None else self.llm_provider
+        config = getattr(provider, "current_config", None)
         supports_vision = getattr(config, "supports_vision", False)
-        if self.vision_capability is not None:
+        if provider_override is None and self.vision_capability is not None:
             supports_vision = self.vision_capability()
         return (
             ProviderCapability(
                 provider_id=getattr(config, "id", "default"),
                 model_id=(getattr(config, "model", "") if config is not None
-                          else getattr(self.llm_provider, "default_model", None) or ""),
+                          else getattr(provider, "default_model", None) or ""),
                 supports_tools=True,
                 supports_vision=supports_vision,
             ),
@@ -936,6 +955,8 @@ class AgentGraphRunner:
             raise asyncio.CancelledError()
         configurable = (config or {}).get("configurable", {})
         model = configurable.get("model", "")
+        provider_override = configurable.get("provider_override")
+        provider = provider_override if provider_override is not None else self.llm_provider
         options = configurable.get("options") or state.run_options
         call_start = time.monotonic()
         try:
@@ -973,7 +994,7 @@ class AgentGraphRunner:
             # 3. ModelSelection via LLMPolicy
             # LLMPolicy checks placeholder resolution, tool/vision/context-window
             # capabilities, and ProviderConstraints (from InformationFlow decision).
-            provider_caps = self._build_provider_capabilities()
+            provider_caps = self._build_provider_capabilities(provider_override)
             requirements = self._build_model_requirements(
                 working_messages_for_call, tools, state,
             )
@@ -1060,7 +1081,7 @@ class AgentGraphRunner:
             try:
                 chat_iteration = state.iteration_count
                 with self._telemetry.iteration(chat_iteration, message_count=len(working_messages_for_call)):
-                    result = await self.llm_provider.chat(
+                    result = await provider.chat(
                         working_messages_for_call,
                         tools,
                         False,
@@ -1148,7 +1169,7 @@ class AgentGraphRunner:
             # ----- T3: usage recording -----
             if state.persist_messages and self.usage_service is not None and result.usage:
                 latency_ms = int((time.monotonic() - call_start) * 1000)
-                provider_kind, provider_name, real_model, requested_model = self._resolve_usage_meta(model)
+                provider_kind, provider_name, real_model, requested_model = self._resolve_usage_meta(model, provider)
                 trigger_type = self._resolve_trigger_type(state)
                 usage_req = self._information_flow_service.release(
                     request_json_cache, ReleaseTarget.USAGE_RETENTION, origin="llm_request",
@@ -1186,7 +1207,12 @@ class AgentGraphRunner:
                     )
             # ----- end usage recording -----
         except Exception as exc:
-            state.error = str(exc)
+            if provider_override is None:
+                state.error = str(exc)
+            elif isinstance(exc, ModelUnavailableError):
+                state.error = "当前模型不可用。请用 /models 查看模型，再用 /model <model> 切换。"
+            else:
+                state.error = "当前 Provider 请求失败，请稍后重试，或用 /providers 查看其他选项。"
             state.finish_reason = "error"
         return state
 

@@ -19,6 +19,7 @@
   const modal = global.NAGENT.modal;
   // m6：Langfuse 会话 URL 单源（management-ui.js）
   const LANGFUSE_URL = ui.LANGFUSE_SESSIONS_URL;
+  const langfuseSessionUrl = ui.langfuseSessionUrl;
   const CONTAINER_ID = 'tab-evaluations';
   const REVIEW_REASONS = ['low_score', 'disputed', 'anomalous'];
   const REVIEW_REASON_LABELS = {
@@ -449,6 +450,18 @@
     const item = el('label', 'evaluations-filter__item');
     item.appendChild(el('span', 'evaluations-filter__label', labelText));
     item.appendChild(control);
+    return appendFilterHelp(item, control, helpText);
+  }
+
+  // 无标题筛选项：控件自描述（placeholder/首项文本），标题仅进 aria-label
+  function filterControl(labelText, control, helpText) {
+    const item = el('span', 'evaluations-filter__item');
+    control.setAttribute('aria-label', labelText);
+    item.appendChild(control);
+    return appendFilterHelp(item, control, helpText);
+  }
+
+  function appendFilterHelp(item, control, helpText) {
     if (helpText) {
       const help = el('small', 'evaluations-filter__help muted', helpText);
       help.id = 'evaluations-help-' + (++evaluationsTipSeq);
@@ -913,7 +926,10 @@
 
   // 会话类型白名单复选框组：两列排布经内联 grid style（样式全部复用
   // 共享类，不新增 CSS 文件）；标签文本复用 evaluations-filter__label
-  // （共享类显式声明字号 token，不依赖 body 继承）。
+  // （共享类显式声明字号 token，不依赖 body 继承）。label 挂
+  // evaluations-checkbox-label：覆盖全局 label 的 flex-direction:column
+  // （styles.css 全局规则会把 checkbox 与文本压成上下两行），恢复行内
+  // 水平居中对齐。
   function buildSessionSourceCheckboxGroup(checkedValues) {
     const group = el('div');
     group.setAttribute('role', 'group');
@@ -922,7 +938,7 @@
       'display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px;row-gap:4px;');
     const inputs = [];
     SESSION_EVAL_SOURCE_OPTIONS.forEach(([value, label]) => {
-      const item = el('label');
+      const item = el('label', 'evaluations-checkbox-label');
       const input = document.createElement('input');
       input.type = 'checkbox';
       input.name = 'evaluation_session_source_allowlist';
@@ -2049,14 +2065,14 @@
     ], resultsFilters.status);
     bindResultsFilter(statusSelect, 'status', false);
     filterRow.append(
-      filterItem('开始时间', createdFromInput, 'ISO 8601 UTC，如 2026-11-05T00:00:00Z'),
-      filterItem('结束时间', createdToInput, 'ISO 8601 UTC，不含该时刻'),
+      filterControl('开始时间', createdFromInput),
+      filterControl('结束时间', createdToInput),
     );
-    if (kindSelect) filterRow.append(filterItem('目标类型', kindSelect));
+    if (kindSelect) filterRow.append(filterControl('目标类型', kindSelect));
     filterRow.append(
-      filterItem('DefinitionKey', defIdInput, '指标键，如 kb.recall_at_5'),
-      filterItem('来源', provenanceSelect),
-      filterItem('状态', statusSelect),
+      filterControl('DefinitionKey', defIdInput),
+      filterControl('来源', provenanceSelect),
+      filterControl('状态', statusSelect),
     );
     if (experimentView) {
       const options = [['', '全部实验'], ...experimentResultExperiments.map(item =>
@@ -2066,7 +2082,7 @@
       }
       const experimentSelect = selectControl('results_experiment_id', options, resultsFilters.experiment_id);
       bindResultsFilter(experimentSelect, 'experiment_id', false);
-      filterRow.appendChild(filterItem('实验', experimentSelect));
+      filterRow.appendChild(filterControl('实验', experimentSelect));
     }
     wrap.appendChild(filterRow);
     // 数据容器独立于筛选区：Loading/错误/空态/重试只清 dataBody，
@@ -2276,11 +2292,11 @@
     ], filters.status);
     bindRunFilter(statusSelect, 'status', false);
     filterRow.append(
-      filterItem('开始时间', createdFromInput, 'ISO 8601 UTC，如 2026-11-05T00:00:00Z'),
-      filterItem('结束时间', createdToInput, 'ISO 8601 UTC，不含该时刻'),
-      filterItem('DefinitionKey', defIdInput, '指标键，如 kb.recall_at_5'),
-      filterItem('来源', provenanceSelect),
-      filterItem('状态', statusSelect),
+      filterControl('开始时间', createdFromInput),
+      filterControl('结束时间', createdToInput),
+      filterControl('DefinitionKey', defIdInput),
+      filterControl('来源', provenanceSelect),
+      filterControl('状态', statusSelect),
     );
     wrap.appendChild(filterRow);
     // 数据容器独立于筛选区：Loading/错误/空态/重试只清 dataBody，
@@ -2480,11 +2496,16 @@
           d.attempt_count,
         ]),
       )));
-      const langfuseRow = document.createElement('div');
-      if (LANGFUSE_URL) {
-        langfuseRow.appendChild(externalLink(LANGFUSE_URL, '查看 Langfuse 会话'));
+      // Langfuse 会话详情直达：session_id 与 Langfuse sessionId 同源
+      // （langfuse_sink target_fields.sessionId），经单源 helper 拼接；
+      // run 粒度等无 session_id 的评分不渲染入口，禁止回落 List 误导。
+      const sessionLangfuseUrl = typeof langfuseSessionUrl === 'function'
+        ? langfuseSessionUrl(target.session_id) : '';
+      if (sessionLangfuseUrl) {
+        const langfuseRow = document.createElement('div');
+        langfuseRow.appendChild(externalLink(sessionLangfuseUrl, '查看 Langfuse 会话'));
+        form.appendChild(langfuseRow);
       }
-      form.appendChild(langfuseRow);
       // M3c：不可变历史 vs 本地 latest 口径
       form.appendChild(el('div', 'evaluations-note',
         'Langfuse Score 为不可变历史投影；本地 latest 以 supersedes 链为准。'
@@ -2559,7 +2580,7 @@
       : '当前原因为「' + REVIEW_REASON_LABELS[reviewReason]
         + '」，低分阈值不生效；切换回低分原因时恢复作用';
     const filterRow = filterBar();
-    filterRow.appendChild(filterItem('低分阈值', thresholdInput, thresholdHelp));
+    filterRow.appendChild(filterControl('低分阈值', thresholdInput, thresholdHelp));
     wrap.appendChild(filterRow);
 
     const listBody = el('div', 'evaluations-review__list');
@@ -2949,8 +2970,8 @@
       renderEvaluators(body, renderToken);
     });
     filterRow.append(
-      filterItem('目标类型', kindSelect),
-      filterItem('方法', methodSelect),
+      filterControl('目标类型', kindSelect),
+      filterControl('方法', methodSelect),
     );
     wrap.appendChild(filterRow);
     // 数据容器独立于筛选区：Loading/错误/重试只清 dataBody，筛选不被删除
@@ -3928,8 +3949,8 @@
       renderAnnotations(body, renderToken);
     });
     filterRow.append(
-      filterItem('标注状态', stateSelect),
-      filterItem('标注原因', reasonSelect),
+      filterControl('标注状态', stateSelect),
+      filterControl('标注原因', reasonSelect),
     );
     wrap.appendChild(filterRow);
 

@@ -93,6 +93,10 @@ class ProviderConfig:
     supports_vision: bool = False
 
 
+class ModelUnavailableError(Exception):
+    """The selected model was rejected by its provider."""
+
+
 class ProviderNotFoundError(Exception):
     """Provider 不存在"""
 

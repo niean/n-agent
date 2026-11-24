@@ -2206,3 +2206,64 @@ def test_select_control_shared_dropdown_contract():
     assert "dataset.className = 'select-control'" in executions, (
         'evaluation-executions.js 数据集下拉必须接入 .select-control'
     )
+
+
+def test_langfuse_session_link_single_source_and_otel_link_font_contract():
+    """Langfuse 会话入口合同：
+    1. 详情直达 helper 定义在 management-ui.js 单源处，encodeURIComponent
+       编码且空 id 返回空串；evaluation.js 只允许引用单源，禁止复制字面量。
+    2. 评分详情 modal 用 helper 拼具体 session 详情，无 id 时不渲染入口。
+    3. .otel-link 显式声明普通正文字号 token，禁止继承 body 16px。
+    """
+    management_ui = (STATIC_DIR / 'management-ui.js').read_text()
+    assert 'langfuseSessionUrl' in management_ui, 'management-ui.js 必须提供 langfuseSessionUrl 单源 helper'
+    assert 'LANGFUSE_SESSIONS_URL' in management_ui, 'Langfuse 会话 List 常量保持单源'
+    assert re.search(r'langfuseSessionUrl\s*=\s*function', management_ui), (
+        'langfuseSessionUrl 必须为函数定义'
+    )
+    assert 'encodeURIComponent(id)' in management_ui, 'session_id 必须经 encodeURIComponent 编码'
+    assert "LANGFUSE_SESSIONS_URL + '/' + encodeURIComponent(id)" in management_ui, (
+        '详情 URL 必须拼接在 List 单源常量之后'
+    )
+    assert ": ''" in management_ui, '空白 id 必须回落空串，由调用方不渲染入口'
+
+    evaluation = (STATIC_DIR / 'evaluation.js').read_text()
+    assert 'http://langfuse.localhost' not in evaluation, 'evaluation.js 禁止复制 Langfuse 字面量，只引用单源'
+    assert 'langfuseSessionUrl(target.session_id)' in evaluation, (
+        '评分详情 modal 必须以 target.session_id 构造 Langfuse 会话详情直达'
+    )
+
+    # 对话-执行详情的 Langfuse 入口同样走单源 helper 直达具体会话
+    chat = (STATIC_DIR / 'chat.js').read_text()
+    assert 'http://langfuse.localhost' not in chat, 'chat.js 禁止复制 Langfuse 字面量，只引用单源'
+    assert 'global.NAGENT.ui.langfuseSessionUrl' in chat, (
+        '执行详情必须经 management-ui.js 单源 helper 构造 Langfuse 会话详情直达'
+    )
+    assert 'buildLangfuseSessionUrl(sessionId)' in chat, (
+        '执行详情必须以当前 sessionId 构造 Langfuse 会话详情直达'
+    )
+    assert 'LANGFUSE_SESSIONS_URL' not in chat, (
+        'chat.js 禁止再直接引用 List 常量构造会话入口'
+    )
+
+    styles = (STATIC_DIR / 'styles.css').read_text()
+    otel_link_rule = re.search(r'\.otel-link\s*\{[^}]*\}', styles)
+    assert otel_link_rule, 'styles.css 必须定义 .otel-link 规则'
+    assert 'font-size: var(--font-size-md)' in otel_link_rule.group(0), (
+        '.otel-link 必须显式声明普通正文字号 token，禁止继承 body 16px'
+    )
+
+
+def test_evaluation_filter_controls_use_normal_font_size(tmp_path):
+    """评估筛选区 input/select（含 placeholder）必须显式声明普通正文字号
+    token：全局 button,input,textarea,select { font: inherit } 使控件继承
+    body 16px，实测比 13px 面板正文大一圈（P094 同根因，第三次复发模式）。"""
+    client = _client(tmp_path)
+    css = client.get('/static/styles.css').text
+    for selector in ('.evaluations-filter__item > input', '.evaluations-filter__item > select'):
+        rules = _css_rule_bodies(css, selector)
+        assert rules, f'缺少筛选控件规则 {selector}'
+        assert 'font-size: var(--font-size-md)' in rules[0], (
+            f'{selector} 必须显式声明普通正文字号 token，禁止继承 body 16px'
+        )
+        assert '16px' not in rules[0]

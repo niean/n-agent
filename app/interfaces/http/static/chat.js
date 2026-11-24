@@ -3037,7 +3037,7 @@
     target.appendChild(section);
   }
 
-  function renderRunDetail(target, row, calls, runId) {
+  function renderRunDetail(target, row, calls, runId, sessionId) {
     clearNode(target);
     const wrap = document.createElement('div');
     wrap.className = 'run-detail';
@@ -3085,7 +3085,7 @@
 
     renderRunDetailTools(wrap, calls, runId);
     renderRunDetailTrace(wrap, row);
-    renderRunDetailFeedback(wrap, runId);
+    renderRunDetailFeedback(wrap, runId, sessionId);
     target.appendChild(wrap);
   }
 
@@ -3137,12 +3137,17 @@
     return group;
   }
 
-  function renderRunDetailFeedback(wrap, runId) {
+  function renderRunDetailFeedback(wrap, runId, sessionId) {
     if (!runId || typeof runId !== 'string') return;
     const evaluationApi = (global.NAGENT && global.NAGENT.api
       && global.NAGENT.api.evaluations) || null;
     if (!evaluationApi) return;
-    const langfuseUrl = (global.NAGENT.ui && global.NAGENT.ui.LANGFUSE_SESSIONS_URL) || '';
+    // Langfuse 会话详情直达：sessionId 与 Langfuse sessionId 同源，经
+    // management-ui.js 单源 helper 拼接；无有效会话 id 时不渲染入口，
+    // 禁止回落会话 List 制造误导。
+    const buildLangfuseSessionUrl = global.NAGENT.ui && global.NAGENT.ui.langfuseSessionUrl;
+    const langfuseUrl = typeof buildLangfuseSessionUrl === 'function'
+      ? buildLangfuseSessionUrl(sessionId) : '';
     const section = document.createElement('section');
     section.className = 'run-detail__feedback';
     const header = document.createElement('div');
@@ -3151,9 +3156,9 @@
     titleEl.className = 'run-detail__title';
     titleEl.textContent = '评估反馈';
     header.appendChild(titleEl);
-    const langfuseLink = document.createElement('a');
-    langfuseLink.className = 'otel-link';
     if (langfuseUrl) {
+      const langfuseLink = document.createElement('a');
+      langfuseLink.className = 'otel-link';
       langfuseLink.href = langfuseUrl;
       langfuseLink.target = '_blank';
       langfuseLink.rel = 'noopener noreferrer';
@@ -3386,7 +3391,7 @@
     }
     // 详情成功：同分区缓存已由 getRunDetail 提交，对账 footer 保持一致
     try { reconcileRunFooters(); } catch (error) { /* 渲染异常不影响详情展示 */ }
-    renderRunDetail(target, row, (toolsRes && toolsRes.status === 'fulfilled') ? toolsRes.value : null, runId);
+    renderRunDetail(target, row, (toolsRes && toolsRes.status === 'fulfilled') ? toolsRes.value : null, runId, sessionId);
   }
 
   // 会话切换/删除：清选中与占位，旧请求经四重校验自然丢弃

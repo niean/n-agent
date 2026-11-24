@@ -22,6 +22,7 @@ from app.domain.agent import AgentState, RunStatus
 from app.domain.context import CONTEXT_SUMMARY_PREFIX, ContextEngine, ProviderContext
 from app.domain.context_policy import ContextPlan, ContextPolicy, DefaultContextPolicy
 from app.domain.memory import MemoryStore
+from app.domain.provider import LLMProvider
 from app.domain.session import ConversationMessage, Summary
 from app.domain.tool_policy import ToolExposurePolicy
 from app.utils.content_utils import extract_text, prepend_text_part
@@ -280,7 +281,10 @@ class ContextService:
         state.run_status = RunStatus.RUNNING
         return state
 
-    async def compress_prepared_context(self, state: AgentState) -> AgentState:
+    async def compress_prepared_context(
+        self, state: AgentState, *, provider_override: LLMProvider | None = None,
+        model_override: str = "",
+    ) -> AgentState:
         if self._is_cancelled(state.session_id):
             raise asyncio.CancelledError()
         if self.context_engine is None:
@@ -321,11 +325,16 @@ class ContextService:
                 enabled_override=enabled_override,
             )
 
+        provider_args = (
+            {"provider_override": provider_override, "model_override": model_override}
+            if provider_override is not None else {}
+        )
         with self._telemetry.compression() as comp_tel:
             result = await self.context_engine.compress(
                 non_system,
                 existing_summary=state.summary,
                 force=force,
+                **provider_args,
             )
             if not result.compressed:
                 comp_tel["outcome"] = "skipped"

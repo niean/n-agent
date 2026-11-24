@@ -891,3 +891,17 @@ def test_insert_summary_message_removes_existing_summary_in_head_tail():
     summaries = [m for m in combined if m.get("content", "").startswith(CONTEXT_SUMMARY_PREFIX)]
     assert len(summaries) == 1
     assert summaries[0]["content"] == f"{CONTEXT_SUMMARY_PREFIX}S1"
+
+
+@pytest.mark.asyncio
+async def test_compression_inherits_the_request_provider_and_model():
+    default = FakeLLMProvider(_make_llm_result("default summary"))
+    selected = FakeLLMProvider(_make_llm_result("selected summary"))
+    compressor = make_compressor(llm_provider=default, tail_budget_enabled=False)
+    messages = [{"role": "user", "content": f"Message {i}"} for i in range(10)]
+    result = await compressor.compress(
+        messages, force=True, provider_override=selected, model_override="selected-model",
+    )
+    assert result.compressed
+    assert selected.last_kwargs["model"] == "selected-model"
+    assert default.call_count == 0

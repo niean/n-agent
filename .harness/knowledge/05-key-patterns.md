@@ -263,6 +263,8 @@ Dashboard 用于本地演示和观察 Agent 运行，不替代 Open-WebUI，也�
 
 ## 模式十一：Interaction Gateway 统一多入口交互
 
+飞书会话的模型路由由服务端 `ChatCompletionInput.provider_override` 传入 Graph 的 RunnableConfig 独立字段。覆盖对象不进入模型请求参数、消息、会话状态或其他入口。
+
 CLI、飞书 IM 等非 Dashboard 入口通过 GatewayService 接入 Agent，不各自实现聊天和管理业务。
 
 规则：

@@ -59,11 +59,30 @@ class ActiveProviderHolder:
 
     async def swap(self, config: ProviderConfig, api_key: str) -> None:
         async with self._lock:
+            provider = self._factory(config, api_key or "")
             self._config = config
-            self._provider = self._factory(config, api_key or "")
+            self._provider = provider
+
+    def snapshot(self) -> ActiveProviderHolder | None:
+        if self._config is None:
+            return None
+        holder = ActiveProviderHolder(self._factory, self._billing_identity_map)
+        holder._config = self._config
+        holder._provider = self._provider
+        return holder
+
+    async def bind(self, config: ProviderConfig, api_key: str) -> ActiveProviderHolder:
+        holder = ActiveProviderHolder(self._factory, self._billing_identity_map)
+        await holder.swap(config, api_key)
+        return holder
 
     async def list_models(self) -> list[ModelInfo]:
         return await self._require().list_models()
+
+    async def list_models_strict(self) -> list[ModelInfo]:
+        provider = self._require()
+        lookup = getattr(provider, "list_models_strict", provider.list_models)
+        return await lookup()
 
     async def supports_tools(self, model: str) -> bool:
         return await self._require().supports_tools(model)

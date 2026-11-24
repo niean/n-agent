@@ -4,9 +4,9 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import APIStatusError, AsyncOpenAI
 
-from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, resolve_model
+from app.domain.provider import LLMEvent, LLMEventType, LLMResult, ModelInfo, ModelUnavailableError, resolve_model
 
 _INTERNAL_OPTION_KEYS = {
     "tool_execution_context",
@@ -39,9 +39,14 @@ class OpenAICompatibleProvider:
         default_model: str,
         client: Any | None = None,
         telemetry_callback: ProviderTelemetryCallback | None = None,
+        *,
+        extra_headers: dict[str, str] | None = None,
     ):
         self.default_model = default_model
         self._telemetry_callback = telemetry_callback
+        headers = {"User-Agent": "N-Agent"}
+        for name, value in (extra_headers or {}).items():
+            headers["User-Agent" if name.lower() == "user-agent" else name] = value
         # SDK transparent retry is disabled DELIBERATELY and unconditionally
         # (telemetry on or off): a retry is a new LLM round-trip that spends
         # real tokens, so it must surface as its own chat attempt / its own
@@ -49,23 +54,15 @@ class OpenAICompatibleProvider:
         # SDK (spec lifecycle rules). Retrying, when wanted, belongs to the
         # caller (the agent loop), not the transport client.
         self.client = client or AsyncOpenAI(
-            base_url=base_url, api_key=api_key or "not-needed", max_retries=0
+            base_url=base_url,
+            api_key=api_key or "not-needed",
+            max_retries=0,
+            default_headers=headers,
         )
 
     async def list_models(self) -> list[ModelInfo]:
         try:
-            response = await self.client.models.list()
-            models = getattr(response, "data", response)
-            return [
-                ModelInfo(
-                    id=getattr(model, "id", str(model)),
-                    display_name=getattr(model, "id", str(model)),
-                    provider="openai-compatible",
-                    supports_tools=True,
-                    supports_streaming=True,
-                )
-                for model in models
-            ]
+            return await self._list_models(all_pages=False)
         except Exception:
             return [
                 ModelInfo(
@@ -76,6 +73,23 @@ class OpenAICompatibleProvider:
                     supports_streaming=True,
                 )
             ]
+
+    async def list_models_strict(self) -> list[ModelInfo]:
+        return await self._list_models(all_pages=True)
+
+    async def _list_models(self, *, all_pages: bool) -> list[ModelInfo]:
+        response = await self.client.models.list()
+        models = [model async for model in response] if all_pages and hasattr(response, "__aiter__") else getattr(response, "data", response)
+        return [
+            ModelInfo(
+                id=getattr(model, "id", str(model)),
+                display_name=getattr(model, "id", str(model)),
+                provider="openai-compatible",
+                supports_tools=True,
+                supports_streaming=True,
+            )
+            for model in models
+        ]
 
     async def supports_tools(self, model: str) -> bool:
         models = await self.list_models()
@@ -120,7 +134,12 @@ class OpenAICompatibleProvider:
             optional_hook(attempt, "set_input", kwargs["messages"],
                           tools=kwargs.get("tools"), system=kwargs.get("system"))
             report_model_parameters(attempt, kwargs)
-            response = await self.client.chat.completions.create(**kwargs)
+            try:
+                response = await self.client.chat.completions.create(**kwargs)
+            except APIStatusError as exc:
+                if exc.code in ("model_not_found", "model_not_available"):
+                    raise ModelUnavailableError(str(exc)) from exc
+                raise
             if _get(response, "model"):
                 optional_hook(attempt, "set_response_model", _get(response, "model"))
             choice = response.choices[0]

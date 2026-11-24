@@ -28,6 +28,7 @@ from app.domain.agent import AgentState
 from app.domain.agent_run import bind_run, current_run
 from app.domain.information_flow import ReleaseTarget, SecretCatalog
 from app.domain.memory import MemoryStore
+from app.domain.provider import LLMProvider
 from app.domain.session import (
     EXPERIMENT_SESSION_ID_PREFIX,
     ConversationSession,
@@ -104,6 +105,7 @@ class ChatCompletionInput:
     schedule_execution_id: str | None = None
     delegation_member_id: str | None = None
     execution_kind: str | None = None
+    provider_override: LLMProvider | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -415,9 +417,13 @@ class ChatCompletionService:
                 },
             )
         options["tool_execution_context"] = ctx
+        provider_args = (
+            {"provider_override": request.provider_override}
+            if request.provider_override is not None else {}
+        )
         if request.stream:
-            return self.graph_runner.stream_events(state, request.model, options)
-        final_state = await self.graph_runner.run(state, request.model, options)
+            return self.graph_runner.stream_events(state, request.model, options, **provider_args)
+        final_state = await self.graph_runner.run(state, request.model, options, **provider_args)
         if final_state.error:
             # Even error messages go through release -- secrets in error
             # text must not leak to the client.

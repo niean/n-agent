@@ -603,6 +603,12 @@ function freshStubs(options) {
     clear: (node) => { if (node && node._kids) { for (const k of node._kids) if (k) k.parentNode = null; node._kids.length = 0; } },
     renderEmpty: () => {},
     renderError: () => {},
+    // 镜像生产 management-ui.js 的 Langfuse 会话详情单源 helper
+    LANGFUSE_SESSIONS_URL: 'http://langfuse.localhost/project/n-agent-local-project/sessions',
+    langfuseSessionUrl: (sessionId) => {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+      return id ? 'http://langfuse.localhost/project/n-agent-local-project/sessions/' + encodeURIComponent(id) : '';
+    },
   };
   const api = {
     task: taskApi(),
@@ -989,6 +995,12 @@ function loadSessionsPage(options) {
     renderEmpty: (node, text) => { const el = makeEl(); el.className = 'empty'; el.textContent = text; node.appendChild(el); },
     renderError: (node, text) => { const el = makeEl(); el.className = 'error'; el.textContent = text; node.appendChild(el); },
     appendText: (node, label, value) => { const row = makeEl(); row.textContent = label + ' ' + value; node.appendChild(row); },
+    // 镜像生产 management-ui.js 的 Langfuse 会话详情单源 helper
+    LANGFUSE_SESSIONS_URL: 'http://langfuse.localhost/project/n-agent-local-project/sessions',
+    langfuseSessionUrl: (sessionId) => {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+      return id ? 'http://langfuse.localhost/project/n-agent-local-project/sessions/' + encodeURIComponent(id) : '';
+    },
   };
   const api = {
     listSessions: () => {
@@ -6075,6 +6087,20 @@ async function testRunDetailSessionFeedbackAllowlist() {
     'allowlist containing session source renders session group beside run group');
   ok(cfg.configCalls.length === 1,
     'resolved config GET is not re-issued for the same open (got ' + cfg.configCalls.length + ')');
+  // Langfuse 入口直达当前会话详情，不再落到会话 List
+  const feedbackSection = env.byIdMap['chat-run-detail'].querySelector('.run-detail__feedback');
+  const langfuseLink = feedbackSection
+    ? Array.from(feedbackSection.querySelectorAll('a.otel-link'))
+      .find((a) => a.textContent === 'Langfuse 会话')
+    : null;
+  ok(!!langfuseLink, 'run detail renders Langfuse session link');
+  ok(!!langfuseLink && langfuseLink.href
+    === 'http://langfuse.localhost/project/n-agent-local-project/sessions/s1',
+    'Langfuse link points to the concrete session detail (got: '
+    + (langfuseLink && langfuseLink.href) + ')');
+  ok(!!langfuseLink && langfuseLink.target === '_blank'
+    && langfuseLink.rel === 'noopener noreferrer',
+    'Langfuse link keeps new-tab noopener contract');
   // 会话组提交载荷走 session_feedback/<当前会话>
   const sessionSection = env.byIdMap['chat-run-detail'].querySelector('.run-detail__feedback');
   const sessionGroup = sessionSection.querySelectorAll('.run-detail__feedback-group')

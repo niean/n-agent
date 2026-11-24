@@ -152,6 +152,13 @@
   // evaluation.js / chat.js / observations-otel.js 一律引用本值，禁止
   // 复制字面量。docker 域名变更时同步此常量。
   global.NAGENT.ui.LANGFUSE_SESSIONS_URL = 'http://langfuse.localhost/project/n-agent-local-project/sessions';
+  // Langfuse 会话详情直达：sessionId 与 N-Agent session_id 同源
+  // （langfuse_sink 以 target.session_id 作为 sessionId 写入），拼接到
+  // 会话 List 单源常量之后；无有效 id 返回空串，由调用方决定不渲染入口。
+  global.NAGENT.ui.langfuseSessionUrl = function langfuseSessionUrl(sessionId) {
+    const id = typeof sessionId === 'string' ? sessionId.trim() : '';
+    return id ? global.NAGENT.ui.LANGFUSE_SESSIONS_URL + '/' + encodeURIComponent(id) : '';
+  };
 
   function openModalBackdrops() {
     return Array.from(document.querySelectorAll('.modal-backdrop')).filter(

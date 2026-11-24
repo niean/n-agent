@@ -8,6 +8,9 @@ from uuid import uuid4
 
 from app.application.chat_service import ChatCompletionInput, ChatCompletionResult, ChatCompletionService
 from app.application.events import ChatEvent, ChatEventType
+from app.application.feishu_session_llm import (
+    FEISHU_LLM_COMMANDS, FeishuLLMRoute, FeishuLLMSelectionError, FeishuSessionLLM,
+)
 from app.application.gateway_tool_approval_service import GatewayToolApprovalService
 from app.application.model_service import ModelService
 from app.application.policy_snapshot import IngressFacts
@@ -23,6 +26,7 @@ from app.domain.gateway import (
     GatewayHomeTarget,
     GatewayOutboundMessage,
     GatewaySessionKey,
+    GatewaySessionLink,
     GatewaySessionRegistry,
     InteractionMessage,
     InteractionResponse,
@@ -411,8 +415,10 @@ class GatewayService:
         gateway_policy: GatewayPolicy | None = None,
         require_actor_for_managed_actions: bool = True,
         confirmation_ttl_seconds: int = 900,
+        feishu_session_llm: FeishuSessionLLM | None = None,
     ):
         self.registry = registry
+        self.feishu_session_llm = feishu_session_llm
         self.chat_service = chat_service
         self.session_service = session_service
         self.tool_approval_service = tool_approval_service or GatewayToolApprovalService()
@@ -485,14 +491,14 @@ class GatewayService:
         if preflight is not None:
             return preflight
 
-        session_id = await self._resolve_session_id(event)
-        command_response = await self.command_service.handle(event, session_id)
+        session_id, command_response, route = await self._prepare_chat(event)
         if command_response is not None:
             return command_response
 
         result = await self.chat_service.complete(
             ChatCompletionInput(
-                model=self.command_service.model_service.default_model,
+                model=route.model if route else self.command_service.model_service.default_model,
+                provider_override=route.provider if route else None,
                 messages=[{"role": "user", "content": _content_from_interaction(event)}],
                 stream=False,
                 metadata={
@@ -626,8 +632,7 @@ class GatewayService:
             yield ChatEvent(ChatEventType.DONE)
             return
 
-        session_id = await self._resolve_session_id(event)
-        command_response = await self.command_service.handle(event, session_id)
+        session_id, command_response, route = await self._prepare_chat(event)
         if command_response is not None:
             for msg in command_response.messages:
                 yield ChatEvent(
@@ -644,7 +649,8 @@ class GatewayService:
             trusted_metadata.update(trusted_metadata_override)
         stream = await self.chat_service.complete(
             ChatCompletionInput(
-                model=model_override or self.command_service.model_service.default_model,
+                model=route.model if route else (model_override or self.command_service.model_service.default_model),
+                provider_override=route.provider if route else None,
                 messages=[{"role": "user", "content": _content_from_interaction(event)}],
                 stream=True,
                 metadata={
@@ -697,15 +703,56 @@ class GatewayService:
     ) -> bool:
         return self.tool_approval_service.is_granted(session_id, actor_id, tool_name)
 
+    async def _prepare_chat(
+        self, event: InteractionMessage,
+    ) -> tuple[str, InteractionResponse | None, FeishuLLMRoute | None]:
+        feishu_llm = self.feishu_session_llm if event.session_key.platform is Platform.FEISHU else None
+        if feishu_llm is None:
+            session_id = await self._resolve_session_id(event)
+            return session_id, await self.command_service.handle(event, session_id), None
+
+        parts = event.text.strip().split(maxsplit=1)
+        command = parts[0] if parts else ""
+        argument = parts[1] if len(parts) == 2 else ""
+        if command in FEISHU_LLM_COMMANDS or (command == "/switch" and argument):
+            link = await self.registry.get_active_session(event.session_key)
+            session_id = link.session_id if link else ""
+            if command in FEISHU_LLM_COMMANDS:
+                try:
+                    session_id, content = await feishu_llm.command(
+                        command, argument, link, lambda: self._resolve_session_link(event), self.registry,
+                    )
+                except FeishuLLMSelectionError as exc:
+                    content = str(exc)
+                return session_id, _response(session_id, content), None
+            switched = await self.registry.activate_existing_session(event.session_key, argument)
+            if switched is None:
+                return session_id, _response(session_id, "当前聊天找不到此会话，请用 /sessions 查看。"), None
+            return switched.session_id, _response(switched.session_id, f"已切换到会话 {switched.session_id}"), None
+        link = await self._resolve_session_link(event)
+        session_id = link.session_id
+        response = await self.command_service.handle(event, session_id)
+        if response is not None:
+            if command == "/help":
+                content = _first_message_content(response)
+                response = _response(session_id, content + "\n模型选择: /providers, /provider <provider>, /model <model>")
+            return session_id, response, None
+        try:
+            route = await feishu_llm.resolve(link)
+        except FeishuLLMSelectionError as exc:
+            return session_id, _response(session_id, str(exc)), None
+        return session_id, None, route
+
     async def _resolve_session_id(self, event: InteractionMessage) -> str:
+        return (await self._resolve_session_link(event)).session_id
+
+    async def _resolve_session_link(self, event: InteractionMessage) -> GatewaySessionLink:
         link = await self.registry.get_active_session(event.session_key)
-        if link is not None:
-            session_id = link.session_id
-        else:
+        if link is None:
             prefix, source = _session_id_prefix_and_source(event.session_key)
             session_id = f"{prefix}-{uuid4()}"
             await self.session_service.create_session(session_id, source=source)
-            await self.registry.create_session_link(event.session_key, session_id)
+            link = await self.registry.create_session_link(event.session_key, session_id)
         key = event.session_key
         if (
             key.platform is Platform.FEISHU
@@ -715,7 +762,7 @@ class GatewayService:
             and event.metadata.get("receive_id_type") == "chat_id"
         ):
             await self.registry.record_delivery_address(key, "chat_id")
-        return session_id
+        return link
 
 
 def _parse_schedule_add(rest: str) -> tuple[str, str, tuple[str, ...]] | None:

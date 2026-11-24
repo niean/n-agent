@@ -201,7 +201,7 @@ task_states(session_id, status, iteration_count, last_error, updated_at)
 summaries(session_id, summary, source_message_id, updated_at)
 providers(id, name UNIQUE, provider_type, base_url, model, api_key, extra_headers_json, is_active, supports_vision, created_at, updated_at)
 gateway_conversations(id, platform, platform_session_id, thread_id, display_name, active_session_id, created_at, updated_at, receive_id_type)
-gateway_session_links(id, conversation_id, session_id, created_at, updated_at)
+gateway_session_links(id, conversation_id, session_id, created_at, updated_at, provider_id, model_id)
 gateway_processed_events(id, platform, event_id, message_id, created_at)
 gateway_home_targets(platform, receive_id, receive_id_type, thread_id, display_name, updated_at)
 mcp_sites(id, name UNIQUE, transport_type, url, command, args_json, env_json, enabled, last_probe_status, last_probe_error, last_probed_at, created_at, updated_at)
@@ -284,6 +284,8 @@ JSON 边界：
 - `plugins.config_json` 存储非敏感配置（明文），`plugins.capabilities_json` 存储 provides_tools/unsupported 能力声明，`plugins.manifest_json` 存储 plugin.yaml 完整 manifest；`plugin_secrets.secret_value` 存储 secret 明文（与 providers.api_key 同等保护级别，依赖文件系统隔离，不通过 HTTP 暴露、不写入日志）；`Plugin.to_public_view().secret_refs` 仅返回 `{field: bool}` 占位标记，由 registry 查询 plugin_secrets 表填充
 - `external_memory_global_config.enabled_providers` 存储全局启用的外部记忆 provider 名称列表
 - SQLite JSON 字段在 Infrastructure 内部序列化/反序列化，不泄漏到 Domain 端口外
+
+飞书会话 Provider 和模型覆盖存储在 `gateway_session_links.provider_id/model_id` 两个可空列。无 Provider 覆盖时继承系统当前启用项；有 Provider 且模型为空时继承该 Provider 配置默认模型。更新校验原组合并在单条写入中保存新组合。凭据由 Provider 注册表在服务端读取。
 
 会话级联删除：`MemoryStore.delete_session` 在 SQLiteMemoryStore 内单连接顺序清理 gateway_session_links、gateway_conversations.active_session_id、messages、tool_calls、task_states、summaries、sessions，返回 sessions 受影响行数 > 0；缺失 session 返回 False，由 Application 层（SessionService.delete_session）映射为 `SessionNotFoundError`。沙盒审计数据不属于 Chat Session 级联删除范围：`sandbox_released_history` 与 `sandbox_execution_history` 由沙盒 Dashboard 显式删除动作或运维清理策略处理，释放沙盒和删除会话均不应自动删除这些长期历史。
 
